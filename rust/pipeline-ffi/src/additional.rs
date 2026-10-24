@@ -20024,3 +20024,1650 @@ mod wave27_auth_passkey_password_controllers_tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 28 Slice 28.6: LoginController, RegisterController, AdminUserController,
+// AdminRoleController, and DeletedUsersController pure-CPU helpers
+// ---------------------------------------------------------------------------
+
+pub mod auth_admin_user_role_controllers {
+    use super::{ADD23_MAX_SEG_LEN, add23_valid_out_buf, add23_valid_slice, add23_write_slices};
+
+    #[inline]
+    fn is_php_trim_ws(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\0' | 0x0B)
+    }
+
+    #[inline]
+    fn trim_php_bytes(s: &[u8]) -> &[u8] {
+        let mut start = 0usize;
+        let mut end = s.len();
+        while start < end && is_php_trim_ws(s[start]) {
+            start += 1;
+        }
+        while end > start && is_php_trim_ws(s[end - 1]) {
+            end -= 1;
+        }
+        &s[start..end]
+    }
+
+    #[inline]
+    fn is_rfc5322_atext(b: u8) -> bool {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'!' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'/'
+                    | b'='
+                    | b'?'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'{'
+                    | b'|'
+                    | b'}'
+                    | b'~'
+            )
+    }
+
+    #[inline]
+    fn validate_ascii_email(input: &[u8]) -> Option<bool> {
+        if input.is_empty() || input.len() > 320 {
+            return Some(false);
+        }
+        for &b in input {
+            if b == b'"' || b == b'[' || b == b']' || b == b'\\' || b >= 0x80 {
+                return None;
+            }
+        }
+        let mut at_pos = None;
+        for (idx, &b) in input.iter().enumerate() {
+            if b == b'@' {
+                if at_pos.is_some() {
+                    return Some(false);
+                }
+                at_pos = Some(idx);
+            }
+        }
+        let Some(at_idx) = at_pos else {
+            return Some(false);
+        };
+        let local = &input[..at_idx];
+        let domain = &input[at_idx + 1..];
+        if local.is_empty() || local.len() > 64 || domain.is_empty() || domain.len() > 255 {
+            return Some(false);
+        }
+        if local[0] == b'.' || local[local.len() - 1] == b'.' {
+            return Some(false);
+        }
+        let mut prev_dot = false;
+        for &b in local {
+            if b == b'.' {
+                if prev_dot {
+                    return Some(false);
+                }
+                prev_dot = true;
+            } else {
+                if !is_rfc5322_atext(b) {
+                    return Some(false);
+                }
+                prev_dot = false;
+            }
+        }
+
+        if domain[0] == b'.' || domain[domain.len() - 1] == b'.' {
+            return Some(false);
+        }
+        let mut label_count = 0usize;
+        let mut last_label: &[u8] = b"";
+        for label in domain.split(|&b| b == b'.') {
+            if label.is_empty() || label.len() > 63 {
+                return Some(false);
+            }
+            if !label[0].is_ascii_alphanumeric() || !label[label.len() - 1].is_ascii_alphanumeric()
+            {
+                return Some(false);
+            }
+            for &b in label {
+                if !b.is_ascii_alphanumeric() && b != b'-' {
+                    return Some(false);
+                }
+            }
+            label_count += 1;
+            last_label = label;
+        }
+        if label_count < 2 || !last_label[0].is_ascii_alphabetic() {
+            return Some(false);
+        }
+        Some(true)
+    }
+
+    #[inline]
+    pub unsafe fn login_detect_field_type_nul(
+        is_string_input: u8,
+        input_ptr: *const u8,
+        input_len: usize,
+        out_is_email: *mut i32,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if is_string_input > 1 || out_is_email.is_null() || !out_is_email.is_aligned() {
+            return -1;
+        }
+        let Some(input) = (unsafe { add23_valid_slice(input_ptr, input_len, ADD23_MAX_SEG_LEN) })
+        else {
+            return -1;
+        };
+
+        let is_email = if is_string_input == 1 {
+            let Some(valid) = validate_ascii_email(input) else {
+                return -2;
+            };
+            valid
+        } else {
+            false
+        };
+
+        let field: &[u8] = if is_email { b"email" } else { b"username" };
+        let written = unsafe { add23_write_slices(out_buf, out_cap, &[field], 1) };
+        if written < 0 {
+            return written;
+        }
+        unsafe {
+            *out_is_email = i32::from(is_email);
+        }
+        written
+    }
+
+    #[inline]
+    pub unsafe fn login_trusted_device_remaining(
+        expires_at: i64,
+        now_ts: i64,
+        out_scalars: *mut i64,
+    ) -> i32 {
+        if out_scalars.is_null()
+            || !out_scalars.is_aligned()
+            || (out_scalars as usize)
+                .checked_add(3 * std::mem::size_of::<i64>())
+                .is_none()
+        {
+            return -1;
+        }
+        let remaining_seconds = if expires_at > now_ts {
+            expires_at.saturating_sub(now_ts)
+        } else {
+            0
+        };
+        let remaining_minutes = if remaining_seconds == 0 {
+            0
+        } else {
+            1 + (remaining_seconds - 1) / 60
+        };
+        let should_preserve = i64::from(remaining_minutes > 0);
+        unsafe {
+            *out_scalars.add(0) = remaining_seconds;
+            *out_scalars.add(1) = remaining_minutes;
+            *out_scalars.add(2) = should_preserve;
+        }
+        1
+    }
+
+    #[inline]
+    pub unsafe fn login_requires_two_factor(
+        has_password_security: u8,
+        google2fa_enable_true: u8,
+        secret_is_string: u8,
+        secret_ptr: *const u8,
+        secret_len: usize,
+        out_requires: *mut i32,
+    ) -> i32 {
+        if has_password_security > 1
+            || google2fa_enable_true > 1
+            || secret_is_string > 1
+            || out_requires.is_null()
+            || !out_requires.is_aligned()
+        {
+            return -1;
+        }
+        let Some(secret) =
+            (unsafe { add23_valid_slice(secret_ptr, secret_len, ADD23_MAX_SEG_LEN) })
+        else {
+            return -1;
+        };
+        let requires = has_password_security == 1
+            && google2fa_enable_true == 1
+            && secret_is_string == 1
+            && !secret.is_empty();
+        unsafe {
+            *out_requires = i32::from(requires);
+        }
+        1
+    }
+
+    #[inline]
+    pub unsafe fn register_extract_invite_code_nul(
+        has_invitecode: u8,
+        invitecode_ptr: *const u8,
+        invitecode_len: usize,
+        has_token: u8,
+        token_ptr: *const u8,
+        token_len: usize,
+        has_invitation: u8,
+        invitation_ptr: *const u8,
+        invitation_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if has_invitecode > 1 || has_token > 1 || has_invitation > 1 {
+            return -1;
+        }
+        let (Some(invitecode), Some(token), Some(invitation)) = (
+            unsafe { add23_valid_slice(invitecode_ptr, invitecode_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(token_ptr, token_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(invitation_ptr, invitation_len, ADD23_MAX_SEG_LEN) },
+        ) else {
+            return -1;
+        };
+
+        let (param, code): (&[u8], &[u8]) =
+            if has_invitecode == 1 && !trim_php_bytes(invitecode).is_empty() {
+                (b"invitecode", invitecode)
+            } else if has_token == 1 && !trim_php_bytes(token).is_empty() {
+                (b"token", token)
+            } else if has_invitation == 1 && !trim_php_bytes(invitation).is_empty() {
+                (b"invitation", invitation)
+            } else {
+                (b"", b"")
+            };
+
+        if code.contains(&0) {
+            return -2;
+        }
+
+        if param.is_empty() {
+            unsafe { add23_write_slices(out_buf, out_cap, &[b"\0\0"], 2) }
+        } else {
+            unsafe {
+                add23_write_slices(
+                    out_buf,
+                    out_cap,
+                    &[code, b"\0&", param, b"=", code, b"\0", param],
+                    2,
+                )
+            }
+        }
+    }
+
+    #[inline]
+    pub unsafe fn register_emails_match(
+        first_ptr: *const u8,
+        first_len: usize,
+        second_ptr: *const u8,
+        second_len: usize,
+        out_matches: *mut i32,
+    ) -> i32 {
+        if out_matches.is_null() || !out_matches.is_aligned() {
+            return -1;
+        }
+        let (Some(first), Some(second)) = (
+            unsafe { add23_valid_slice(first_ptr, first_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(second_ptr, second_len, ADD23_MAX_SEG_LEN) },
+        ) else {
+            return -1;
+        };
+        let matches = trim_php_bytes(first).eq_ignore_ascii_case(trim_php_bytes(second));
+        unsafe {
+            *out_matches = i32::from(matches);
+        }
+        1
+    }
+
+    #[inline]
+    pub unsafe fn register_evaluate_form_state_nul(
+        is_open: u8,
+        is_invite_only: u8,
+        scheduled_override_active: u8,
+        status_msg_ptr: *const u8,
+        status_msg_len: usize,
+        invite_code_ptr: *const u8,
+        invite_code_len: usize,
+        invitation_token_valid: u8,
+        has_invitation_email: u8,
+        invitation_email_ptr: *const u8,
+        invitation_email_len: usize,
+        initial_error_ptr: *const u8,
+        initial_error_len: usize,
+        initial_show_register: i32,
+        out_show_register: *mut i32,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if is_open > 1
+            || is_invite_only > 1
+            || scheduled_override_active > 1
+            || invitation_token_valid > 1
+            || has_invitation_email > 1
+            || out_show_register.is_null()
+            || !out_show_register.is_aligned()
+        {
+            return -1;
+        }
+        let (Some(status_msg), Some(invite_code), Some(invitation_email), Some(initial_error)) = (
+            unsafe { add23_valid_slice(status_msg_ptr, status_msg_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(invite_code_ptr, invite_code_len, ADD23_MAX_SEG_LEN) },
+            unsafe {
+                add23_valid_slice(
+                    invitation_email_ptr,
+                    invitation_email_len,
+                    ADD23_MAX_SEG_LEN,
+                )
+            },
+            unsafe { add23_valid_slice(initial_error_ptr, initial_error_len, ADD23_MAX_SEG_LEN) },
+        ) else {
+            return -1;
+        };
+
+        if status_msg.contains(&0) || invitation_email.contains(&0) || initial_error.contains(&0) {
+            return -2;
+        }
+
+        let has_invite = !invite_code.is_empty() && invite_code != b"0";
+        let has_inv_email = has_invitation_email == 1
+            && !invitation_email.is_empty()
+            && invitation_email != b"0";
+
+        let _ = initial_show_register;
+        let show_register: i32;
+        let mut error: &[u8] = initial_error;
+        let mut notice: &[u8] = b"";
+        let mut email_from_invite: &[u8] = b"";
+
+        if is_open == 1 {
+            show_register = 1;
+            if has_invite {
+                if invitation_token_valid == 1 && has_inv_email {
+                    email_from_invite = invitation_email;
+                } else if invitation_token_valid == 0 {
+                    notice = b"Registration is currently open, so you can register without a valid invitation.";
+                }
+            }
+            if scheduled_override_active == 1 {
+                notice = status_msg;
+            }
+        } else if is_invite_only == 1 {
+            if has_invite && invitation_token_valid == 1 {
+                show_register = 1;
+                if has_inv_email {
+                    email_from_invite = invitation_email;
+                }
+            } else if has_invite {
+                error = b"Invalid or expired invitation token!";
+                show_register = 0;
+            } else {
+                error = status_msg;
+                show_register = 0;
+            }
+        } else {
+            error = status_msg;
+            show_register = 0;
+        }
+
+        let written = unsafe {
+            add23_write_slices(
+                out_buf,
+                out_cap,
+                &[error, b"\0", notice, b"\0", email_from_invite],
+                2,
+            )
+        };
+        if written < 0 {
+            return written;
+        }
+        unsafe {
+            *out_show_register = show_register;
+        }
+        written
+    }
+
+    #[inline]
+    pub unsafe fn admin_user_signup_error_message(
+        code: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        let msg: &[u8] = match code {
+            -1 => b"Bad username. Try a better one.",
+            -2 => b"Bad password. Try a longer one.",
+            -3 => b"Bad email.",
+            -4 => b"Username in use.",
+            -5 => b"Email in use.",
+            _ => b"Unknown save error.",
+        };
+        unsafe { add23_write_slices(out_buf, out_cap, &[msg], 1) }
+    }
+
+    #[inline]
+    pub unsafe fn admin_user_build_order_urls_nul(
+        order_types_nul_ptr: *const u8,
+        order_types_nul_len: usize,
+        count: usize,
+        base_url_ptr: *const u8,
+        base_url_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if count > ADD23_MAX_SEG_LEN || !add23_valid_out_buf(out_buf, out_cap) {
+            return -1;
+        }
+        let (Some(order_types_nul), Some(base_url)) = (
+            unsafe {
+                add23_valid_slice(order_types_nul_ptr, order_types_nul_len, ADD23_MAX_SEG_LEN)
+            },
+            unsafe { add23_valid_slice(base_url_ptr, base_url_len, ADD23_MAX_SEG_LEN) },
+        ) else {
+            return -1;
+        };
+        if base_url.contains(&0) {
+            return -2;
+        }
+        if count == 0 {
+            return 0;
+        }
+
+        let segments: Vec<&[u8]> = order_types_nul.split(|&b| b == 0).collect();
+        if segments.len() != count {
+            return -1;
+        }
+
+        let mut needed = 0usize;
+        for (idx, seg) in segments.iter().enumerate() {
+            // "orderby" (7) + seg + "\0" (1) + base_url + "?ob=" (4) + seg + optional "\0"
+            let pair_len = 7usize
+                .checked_add(seg.len())
+                .and_then(|v| v.checked_add(1))
+                .and_then(|v| v.checked_add(base_url.len()))
+                .and_then(|v| v.checked_add(4))
+                .and_then(|v| v.checked_add(seg.len()))
+                .and_then(|v| v.checked_add(usize::from(idx + 1 < count)));
+            let Some(p_len) = pair_len else {
+                return -1;
+            };
+            let Some(next) = needed.checked_add(p_len) else {
+                return -1;
+            };
+            if next > isize::MAX as usize {
+                return -1;
+            }
+            needed = next;
+        }
+
+        if needed > out_cap {
+            return -(needed.max(1) as isize);
+        }
+
+        let mut offset = 0usize;
+        let mut push = |bytes: &[u8]| {
+            if !bytes.is_empty() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf.add(offset), bytes.len());
+                }
+                offset += bytes.len();
+            }
+        };
+
+        for (idx, seg) in segments.iter().enumerate() {
+            if idx > 0 {
+                push(b"\0");
+            }
+            push(b"orderby");
+            push(seg);
+            push(b"\0");
+            push(base_url);
+            push(b"?ob=");
+            push(seg);
+        }
+
+        needed as isize
+    }
+
+    #[inline]
+    pub unsafe fn admin_user_normalize_bulk_ids(
+        in_ids: *const i64,
+        count: usize,
+        out_ids: *mut i64,
+        out_cap: usize,
+        out_unique_count: *mut usize,
+    ) -> i32 {
+        if count > ADD23_MAX_SEG_LEN
+            || out_cap > ADD23_MAX_SEG_LEN
+            || out_unique_count.is_null()
+            || !out_unique_count.is_aligned()
+        {
+            return -1;
+        }
+        if count > 0 {
+            let Some(in_bytes) = count.checked_mul(std::mem::size_of::<i64>()) else {
+                return -1;
+            };
+            if in_ids.is_null()
+                || !in_ids.is_aligned()
+                || (in_ids as usize).checked_add(in_bytes).is_none()
+            {
+                return -1;
+            }
+        }
+        if out_cap > 0 {
+            let Some(out_bytes) = out_cap.checked_mul(std::mem::size_of::<i64>()) else {
+                return -1;
+            };
+            if out_ids.is_null()
+                || !out_ids.is_aligned()
+                || (out_ids as usize).checked_add(out_bytes).is_none()
+            {
+                return -1;
+            }
+        } else if out_ids.is_null() || !out_ids.is_aligned() {
+            return -1;
+        }
+
+        let slice = if count == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(in_ids, count) }
+        };
+
+        let mut unique: Vec<i64> = Vec::with_capacity(count);
+        for &id in slice {
+            if !unique.contains(&id) {
+                unique.push(id);
+            }
+        }
+
+        if unique.len() > out_cap {
+            return -(unique.len().min(i32::MAX as usize) as i32);
+        }
+
+        for (i, &id) in unique.iter().enumerate() {
+            unsafe {
+                *out_ids.add(i) = id;
+            }
+        }
+        unsafe {
+            *out_unique_count = unique.len();
+        }
+        1
+    }
+
+    #[inline]
+    pub unsafe fn admin_user_format_passkey_wipe_nul(
+        target_user_id: i64,
+        target_username_ptr: *const u8,
+        target_username_len: usize,
+        wiped_count: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        let Some(username) = (unsafe {
+            add23_valid_slice(
+                target_username_ptr,
+                target_username_len,
+                ADD23_MAX_SEG_LEN,
+            )
+        }) else {
+            return -1;
+        };
+        if username.contains(&0) {
+            return -2;
+        }
+        let count_str = wiped_count.to_string();
+        let id_str = target_user_id.to_string();
+        unsafe {
+            add23_write_slices(
+                out_buf,
+                out_cap,
+                &[
+                    b"Admin wiped user passkeys\0",
+                    count_str.as_bytes(),
+                    b" passkeys removed from ",
+                    username,
+                    b". They can now regain access with their password or an admin-issued reset.\0admin/user-edit?id=",
+                    id_str.as_bytes(),
+                ],
+                2,
+            )
+        }
+    }
+
+    #[inline]
+    pub unsafe fn admin_role_normalize_state_nul(
+        mode_ptr: *const u8,
+        mode_len: usize,
+        action_ptr: *const u8,
+        action_len: usize,
+        has_id: u8,
+        has_donation: u8,
+        donation_val: i64,
+        has_addyears: u8,
+        addyears_val: i64,
+        out_scalars: *mut i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if has_id > 1
+            || has_donation > 1
+            || has_addyears > 1
+            || out_scalars.is_null()
+            || !out_scalars.is_aligned()
+            || (out_scalars as usize)
+                .checked_add(4 * std::mem::size_of::<i64>())
+                .is_none()
+        {
+            return -1;
+        }
+        let (Some(mode), Some(action)) = (
+            unsafe { add23_valid_slice(mode_ptr, mode_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(action_ptr, action_len, ADD23_MAX_SEG_LEN) },
+        ) else {
+            return -1;
+        };
+
+        let is_submit = action == b"submit";
+        let (title, should_load_role): (&[u8], bool) = if mode == b"index" {
+            (b"User Role List", false)
+        } else if mode == b"create" {
+            (b"Add User Role", false)
+        } else if is_submit {
+            (b"Update User Role", false)
+        } else if has_id == 1 {
+            (b"User Roles Edit", true)
+        } else {
+            (b"User Roles", false)
+        };
+
+        let coerced_donation = if has_donation == 1 { donation_val } else { 0 };
+        let coerced_addyears = if has_addyears == 1 { addyears_val } else { 0 };
+
+        let written = unsafe {
+            add23_write_slices(
+                out_buf,
+                out_cap,
+                &[title, b"\0", title, b"\0admin/role-list"],
+                2,
+            )
+        };
+        if written < 0 {
+            return written;
+        }
+        unsafe {
+            *out_scalars.add(0) = i64::from(is_submit);
+            *out_scalars.add(1) = i64::from(should_load_role);
+            *out_scalars.add(2) = coerced_donation;
+            *out_scalars.add(3) = coerced_addyears;
+        }
+        written
+    }
+
+    #[inline]
+    pub unsafe fn deleted_users_resolve_sort_order_nul(
+        order_by_ptr: *const u8,
+        order_by_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        let Some(raw) =
+            (unsafe { add23_valid_slice(order_by_ptr, order_by_len, ADD23_MAX_SEG_LEN) })
+        else {
+            return -1;
+        };
+        let trimmed = trim_php_bytes(raw);
+        let mut order_field: &[u8] = b"users.deleted_at";
+        let mut order_sort: &[u8] = b"desc";
+
+        if !trimmed.is_empty()
+            && trimmed
+                .iter()
+                .all(|&b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            let lower: Vec<u8> = trimmed.iter().map(|b| b.to_ascii_lowercase()).collect();
+            let (field_slice, dir_opt): (&[u8], Option<&[u8]>) =
+                if lower.len() > 4 && lower.ends_with(b"_asc") {
+                    (&lower[..lower.len() - 4], Some(b"asc"))
+                } else if lower.len() > 5 && lower.ends_with(b"_desc") {
+                    (&lower[..lower.len() - 5], Some(b"desc"))
+                } else {
+                    (&lower[..], None)
+                };
+
+            let normalized: Vec<u8> = field_slice
+                .iter()
+                .copied()
+                .filter(|&b| b != b'_' && b != b'-')
+                .collect();
+
+            order_field = match normalized.as_slice() {
+                b"username" => b"users.username",
+                b"email" => b"users.email",
+                b"host" => b"users.host",
+                b"createdat" => b"users.created_at",
+                b"deletedat" => b"users.deleted_at",
+                b"lastlogin" => b"users.lastlogin",
+                b"apiaccess" => b"users.apiaccess",
+                b"grabs" => b"users.grabs",
+                b"role" | b"rolename" => b"rolename",
+                _ => b"users.deleted_at",
+            };
+            if let Some(d) = dir_opt {
+                order_sort = d;
+            }
+        }
+
+        unsafe { add23_write_slices(out_buf, out_cap, &[order_field, b"\0", order_sort], 1) }
+    }
+
+    #[inline]
+    fn rfc1738_encode_append(dst: &mut Vec<u8>, bytes: &[u8]) {
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        for &b in bytes {
+            if b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.' {
+                dst.push(b);
+            } else if b == b' ' {
+                dst.push(b'+');
+            } else {
+                dst.push(b'%');
+                dst.push(HEX[(b >> 4) as usize]);
+                dst.push(HEX[(b & 0x0F) as usize]);
+            }
+        }
+    }
+
+    #[inline]
+    pub unsafe fn deleted_users_filter_query_string(
+        keys_nul_ptr: *const u8,
+        keys_nul_len: usize,
+        vals_nul_ptr: *const u8,
+        vals_nul_len: usize,
+        null_mask_ptr: *const u8,
+        count: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if count > ADD23_MAX_SEG_LEN || !add23_valid_out_buf(out_buf, out_cap) {
+            return -1;
+        }
+        let (Some(keys_nul), Some(vals_nul), Some(null_mask)) = (
+            unsafe { add23_valid_slice(keys_nul_ptr, keys_nul_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(vals_nul_ptr, vals_nul_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(null_mask_ptr, count, ADD23_MAX_SEG_LEN) },
+        ) else {
+            return -1;
+        };
+        if count == 0 {
+            return 0;
+        }
+
+        let keys: Vec<&[u8]> = keys_nul.split(|&b| b == 0).collect();
+        let vals: Vec<&[u8]> = vals_nul.split(|&b| b == 0).collect();
+        if keys.len() != count || vals.len() != count {
+            return -1;
+        }
+
+        let mut encoded = Vec::with_capacity(keys_nul_len + vals_nul_len);
+        for i in 0..count {
+            if null_mask[i] > 1 {
+                return -1;
+            }
+            let k = keys[i];
+            let v = vals[i];
+            if k == b"ob" || k == b"page" || null_mask[i] == 1 || v.is_empty() {
+                continue;
+            }
+            if !encoded.is_empty() {
+                encoded.push(b'&');
+            }
+            rfc1738_encode_append(&mut encoded, k);
+            encoded.push(b'=');
+            rfc1738_encode_append(&mut encoded, v);
+        }
+
+        unsafe { add23_write_slices(out_buf, out_cap, &[&encoded], 1) }
+    }
+
+    #[inline]
+    pub unsafe fn deleted_users_validate_bulk_action_nul(
+        action_is_string: u8,
+        action_ptr: *const u8,
+        action_len: usize,
+        ids_is_array: u8,
+        in_ids_ptr: *const i64,
+        ids_count: usize,
+        out_valid_ids_ptr: *mut i64,
+        out_ids_cap: usize,
+        out_scalars: *mut i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if action_is_string > 1
+            || ids_is_array > 1
+            || ids_count > ADD23_MAX_SEG_LEN
+            || out_ids_cap > ADD23_MAX_SEG_LEN
+            || out_scalars.is_null()
+            || !out_scalars.is_aligned()
+            || (out_scalars as usize)
+                .checked_add(2 * std::mem::size_of::<i64>())
+                .is_none()
+        {
+            return -1;
+        }
+        if ids_count > 0 {
+            let Some(in_bytes) = ids_count.checked_mul(std::mem::size_of::<i64>()) else {
+                return -1;
+            };
+            if in_ids_ptr.is_null()
+                || !in_ids_ptr.is_aligned()
+                || (in_ids_ptr as usize).checked_add(in_bytes).is_none()
+            {
+                return -1;
+            }
+        }
+        if out_ids_cap > 0 {
+            let Some(out_bytes) = out_ids_cap.checked_mul(std::mem::size_of::<i64>()) else {
+                return -1;
+            };
+            if out_valid_ids_ptr.is_null()
+                || !out_valid_ids_ptr.is_aligned()
+                || (out_valid_ids_ptr as usize).checked_add(out_bytes).is_none()
+            {
+                return -1;
+            }
+        } else if out_valid_ids_ptr.is_null() || !out_valid_ids_ptr.is_aligned() {
+            return -1;
+        }
+
+        let Some(action) =
+            (unsafe { add23_valid_slice(action_ptr, action_len, ADD23_MAX_SEG_LEN) })
+        else {
+            return -1;
+        };
+        let eff_action: &[u8] = if action_is_string == 1 { action } else { b"" };
+        if eff_action.contains(&0) {
+            return -2;
+        }
+
+        let ids_slice = if ids_count == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(in_ids_ptr, ids_count) }
+        };
+
+        let mut valid_ids: Vec<i64> = Vec::new();
+        let (is_valid, err_msg): (i64, &[u8]) =
+            if action_is_string == 0 || (eff_action != b"restore" && eff_action != b"delete") {
+                (0, b"Please select a valid action.")
+            } else if ids_is_array == 0 {
+                (0, b"Invalid user selection format.")
+            } else {
+                for &id in ids_slice {
+                    if id > 0 {
+                        valid_ids.push(id);
+                    }
+                }
+                if valid_ids.is_empty() {
+                    (0, b"Please select at least one user.")
+                } else {
+                    (1, b"")
+                }
+            };
+
+        if valid_ids.len() > out_ids_cap {
+            return -(valid_ids.len().max(1) as isize);
+        }
+
+        let written = unsafe {
+            add23_write_slices(
+                out_buf,
+                out_cap,
+                &[eff_action, b"\0admin.deleted.users.index\0", err_msg],
+                2,
+            )
+        };
+        if written < 0 {
+            return written;
+        }
+
+        for (i, &id) in valid_ids.iter().enumerate() {
+            unsafe {
+                *out_valid_ids_ptr.add(i) = id;
+            }
+        }
+        unsafe {
+            *out_scalars.add(0) = is_valid;
+            *out_scalars.add(1) = valid_ids.len() as i64;
+        }
+        written
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_login_detect_field_type_nul(
+    is_string_input: u8,
+    input_ptr: *const u8,
+    input_len: usize,
+    out_is_email: *mut i32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        auth_admin_user_role_controllers::login_detect_field_type_nul(
+            is_string_input,
+            input_ptr,
+            input_len,
+            out_is_email,
+            out_buf,
+            out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_login_trusted_device_remaining(
+    expires_at: i64,
+    now_ts: i64,
+    out_scalars: *mut i64,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        auth_admin_user_role_controllers::login_trusted_device_remaining(
+            expires_at,
+            now_ts,
+            out_scalars,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_login_requires_two_factor(
+    has_password_security: u8,
+    google2fa_enable_true: u8,
+    secret_is_string: u8,
+    secret_ptr: *const u8,
+    secret_len: usize,
+    out_requires: *mut i32,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        auth_admin_user_role_controllers::login_requires_two_factor(
+            has_password_security,
+            google2fa_enable_true,
+            secret_is_string,
+            secret_ptr,
+            secret_len,
+            out_requires,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_register_extract_invite_code_nul(
+    has_invitecode: u8,
+    invitecode_ptr: *const u8,
+    invitecode_len: usize,
+    has_token: u8,
+    token_ptr: *const u8,
+    token_len: usize,
+    has_invitation: u8,
+    invitation_ptr: *const u8,
+    invitation_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        auth_admin_user_role_controllers::register_extract_invite_code_nul(
+            has_invitecode,
+            invitecode_ptr,
+            invitecode_len,
+            has_token,
+            token_ptr,
+            token_len,
+            has_invitation,
+            invitation_ptr,
+            invitation_len,
+            out_buf,
+            out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_register_emails_match(
+    first_ptr: *const u8,
+    first_len: usize,
+    second_ptr: *const u8,
+    second_len: usize,
+    out_matches: *mut i32,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        auth_admin_user_role_controllers::register_emails_match(
+            first_ptr,
+            first_len,
+            second_ptr,
+            second_len,
+            out_matches,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_register_evaluate_form_state_nul(
+    is_open: u8,
+    is_invite_only: u8,
+    scheduled_override_active: u8,
+    status_msg_ptr: *const u8,
+    status_msg_len: usize,
+    invite_code_ptr: *const u8,
+    invite_code_len: usize,
+    invitation_token_valid: u8,
+    has_invitation_email: u8,
+    invitation_email_ptr: *const u8,
+    invitation_email_len: usize,
+    initial_error_ptr: *const u8,
+    initial_error_len: usize,
+    initial_show_register: i32,
+    out_show_register: *mut i32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        auth_admin_user_role_controllers::register_evaluate_form_state_nul(
+            is_open,
+            is_invite_only,
+            scheduled_override_active,
+            status_msg_ptr,
+            status_msg_len,
+            invite_code_ptr,
+            invite_code_len,
+            invitation_token_valid,
+            has_invitation_email,
+            invitation_email_ptr,
+            invitation_email_len,
+            initial_error_ptr,
+            initial_error_len,
+            initial_show_register,
+            out_show_register,
+            out_buf,
+            out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_admin_user_signup_error_message(
+    code: i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        auth_admin_user_role_controllers::admin_user_signup_error_message(code, out_buf, out_cap)
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_admin_user_build_order_urls_nul(
+    order_types_nul_ptr: *const u8,
+    order_types_nul_len: usize,
+    count: usize,
+    base_url_ptr: *const u8,
+    base_url_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        auth_admin_user_role_controllers::admin_user_build_order_urls_nul(
+            order_types_nul_ptr,
+            order_types_nul_len,
+            count,
+            base_url_ptr,
+            base_url_len,
+            out_buf,
+            out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_admin_user_normalize_bulk_ids(
+    in_ids: *const i64,
+    count: usize,
+    out_ids: *mut i64,
+    out_cap: usize,
+    out_unique_count: *mut usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        auth_admin_user_role_controllers::admin_user_normalize_bulk_ids(
+            in_ids,
+            count,
+            out_ids,
+            out_cap,
+            out_unique_count,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_admin_user_format_passkey_wipe_nul(
+    target_user_id: i64,
+    target_username_ptr: *const u8,
+    target_username_len: usize,
+    wiped_count: i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        auth_admin_user_role_controllers::admin_user_format_passkey_wipe_nul(
+            target_user_id,
+            target_username_ptr,
+            target_username_len,
+            wiped_count,
+            out_buf,
+            out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_admin_role_normalize_state_nul(
+    mode_ptr: *const u8,
+    mode_len: usize,
+    action_ptr: *const u8,
+    action_len: usize,
+    has_id: u8,
+    has_donation: u8,
+    donation_val: i64,
+    has_addyears: u8,
+    addyears_val: i64,
+    out_scalars: *mut i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        auth_admin_user_role_controllers::admin_role_normalize_state_nul(
+            mode_ptr,
+            mode_len,
+            action_ptr,
+            action_len,
+            has_id,
+            has_donation,
+            donation_val,
+            has_addyears,
+            addyears_val,
+            out_scalars,
+            out_buf,
+            out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_deleted_users_resolve_sort_order_nul(
+    order_by_ptr: *const u8,
+    order_by_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        auth_admin_user_role_controllers::deleted_users_resolve_sort_order_nul(
+            order_by_ptr,
+            order_by_len,
+            out_buf,
+            out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_deleted_users_filter_query_string(
+    keys_nul_ptr: *const u8,
+    keys_nul_len: usize,
+    vals_nul_ptr: *const u8,
+    vals_nul_len: usize,
+    null_mask_ptr: *const u8,
+    count: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        auth_admin_user_role_controllers::deleted_users_filter_query_string(
+            keys_nul_ptr,
+            keys_nul_len,
+            vals_nul_ptr,
+            vals_nul_len,
+            null_mask_ptr,
+            count,
+            out_buf,
+            out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_deleted_users_validate_bulk_action_nul(
+    action_is_string: u8,
+    action_ptr: *const u8,
+    action_len: usize,
+    ids_is_array: u8,
+    in_ids_ptr: *const i64,
+    ids_count: usize,
+    out_valid_ids_ptr: *mut i64,
+    out_ids_cap: usize,
+    out_scalars: *mut i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        auth_admin_user_role_controllers::deleted_users_validate_bulk_action_nul(
+            action_is_string,
+            action_ptr,
+            action_len,
+            ids_is_array,
+            in_ids_ptr,
+            ids_count,
+            out_valid_ids_ptr,
+            out_ids_cap,
+            out_scalars,
+            out_buf,
+            out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod wave28_auth_admin_user_role_controllers_tests {
+    use super::*;
+
+    #[test]
+    fn login_and_register_controller_helpers_match_php_contracts() {
+        let mut buf = [0u8; 256];
+        let mut is_email = 0i32;
+
+        let w1 = unsafe {
+            nntmux_login_detect_field_type_nul(
+                1,
+                b"user@example.com".as_ptr(),
+                16,
+                &mut is_email,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(w1, 5);
+        assert_eq!(is_email, 1);
+        assert_eq!(&buf[..w1 as usize], b"email");
+
+        let w2 = unsafe {
+            nntmux_login_detect_field_type_nul(
+                1,
+                b"plain_user".as_ptr(),
+                10,
+                &mut is_email,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(w2, 8);
+        assert_eq!(is_email, 0);
+        assert_eq!(&buf[..w2 as usize], b"username");
+
+        let mut scalars = [0i64; 3];
+        assert_eq!(
+            unsafe { nntmux_login_trusted_device_remaining(1061, 1000, scalars.as_mut_ptr()) },
+            1
+        );
+        assert_eq!(scalars, [61, 2, 1]);
+
+        let mut req_2fa = 0i32;
+        assert_eq!(
+            unsafe {
+                nntmux_login_requires_two_factor(
+                    1,
+                    1,
+                    1,
+                    b"JBSWY3DPEHPK3PXP".as_ptr(),
+                    16,
+                    &mut req_2fa,
+                )
+            },
+            1
+        );
+        assert_eq!(req_2fa, 1);
+
+        let inv_w = unsafe {
+            nntmux_register_extract_invite_code_nul(
+                0,
+                b"".as_ptr(),
+                0,
+                1,
+                b"tok-abc".as_ptr(),
+                7,
+                1,
+                b"inv-xyz".as_ptr(),
+                7,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert!(inv_w > 0);
+        assert_eq!(&buf[..inv_w as usize], b"tok-abc\0&token=tok-abc\0token");
+
+        let mut em_match = 0i32;
+        assert_eq!(
+            unsafe {
+                nntmux_register_emails_match(
+                    b"  User@Example.COM \n".as_ptr(),
+                    20,
+                    b"user@example.com".as_ptr(),
+                    16,
+                    &mut em_match,
+                )
+            },
+            1
+        );
+        assert_eq!(em_match, 1);
+
+        let mut show_reg = 0i32;
+        let state_w = unsafe {
+            nntmux_register_evaluate_form_state_nul(
+                0,
+                1,
+                0,
+                b"Invite only".as_ptr(),
+                11,
+                b"bad-tok".as_ptr(),
+                7,
+                0,
+                0,
+                b"".as_ptr(),
+                0,
+                b"".as_ptr(),
+                0,
+                1,
+                &mut show_reg,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert!(state_w > 0);
+        assert_eq!(show_reg, 0);
+        assert_eq!(
+            &buf[..state_w as usize],
+            b"Invalid or expired invitation token!\0\0"
+        );
+    }
+
+    #[test]
+    fn admin_user_role_and_deleted_users_helpers_match_php_contracts() {
+        let mut buf = [0u8; 256];
+        let err_w =
+            unsafe { nntmux_admin_user_signup_error_message(-4, buf.as_mut_ptr(), buf.len()) };
+        assert_eq!(&buf[..err_w as usize], b"Username in use.");
+
+        let urls_w = unsafe {
+            nntmux_admin_user_build_order_urls_nul(
+                b"username_asc\0email_desc".as_ptr(),
+                23,
+                2,
+                b"http://localhost/admin/user-list".as_ptr(),
+                32,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert!(urls_w > 0);
+        assert_eq!(
+            &buf[..urls_w as usize],
+            b"orderbyusername_asc\0http://localhost/admin/user-list?ob=username_asc\0orderbyemail_desc\0http://localhost/admin/user-list?ob=email_desc"
+        );
+
+        let in_ids = [7i64, 3, 7, 9, 3];
+        let mut out_ids = [0i64; 5];
+        let mut unique_count = 0usize;
+        assert_eq!(
+            unsafe {
+                nntmux_admin_user_normalize_bulk_ids(
+                    in_ids.as_ptr(),
+                    in_ids.len(),
+                    out_ids.as_mut_ptr(),
+                    out_ids.len(),
+                    &mut unique_count,
+                )
+            },
+            1
+        );
+        assert_eq!(unique_count, 3);
+        assert_eq!(&out_ids[..3], &[7, 3, 9]);
+
+        let wipe_w = unsafe {
+            nntmux_admin_user_format_passkey_wipe_nul(
+                42,
+                b"alice".as_ptr(),
+                5,
+                3,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert!(wipe_w > 0);
+        assert_eq!(
+            &buf[..wipe_w as usize],
+            b"Admin wiped user passkeys\03 passkeys removed from alice. They can now regain access with their password or an admin-issued reset.\0admin/user-edit?id=42"
+        );
+
+        let mut role_scalars = [0i64; 4];
+        let role_w = unsafe {
+            nntmux_admin_role_normalize_state_nul(
+                b"create".as_ptr(),
+                6,
+                b"submit".as_ptr(),
+                6,
+                0,
+                0,
+                0,
+                0,
+                0,
+                role_scalars.as_mut_ptr(),
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert!(role_w > 0);
+        assert_eq!(role_scalars, [1, 0, 0, 0]);
+        assert_eq!(
+            &buf[..role_w as usize],
+            b"Add User Role\0Add User Role\0admin/role-list"
+        );
+
+        let sort_w = unsafe {
+            nntmux_deleted_users_resolve_sort_order_nul(
+                b"  Created_At_ASC ".as_ptr(),
+                17,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert!(sort_w > 0);
+        assert_eq!(&buf[..sort_w as usize], b"users.created_at\0asc");
+
+        let qs_w = unsafe {
+            nntmux_deleted_users_filter_query_string(
+                b"username\0ob\0empty\0host".as_ptr(),
+                22,
+                b"john doe\0username_asc\0\010.0.0.1".as_ptr(),
+                31,
+                [0u8, 0, 0, 0].as_ptr(),
+                4,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert!(qs_w > 0);
+        assert_eq!(&buf[..qs_w as usize], b"username=john+doe&host=10.0.0.1");
+
+        let bulk_in = [0i64, -2, 5, 11];
+        let mut bulk_out = [0i64; 4];
+        let mut bulk_scalars = [0i64; 2];
+        let bulk_w = unsafe {
+            nntmux_deleted_users_validate_bulk_action_nul(
+                1,
+                b"restore".as_ptr(),
+                7,
+                1,
+                bulk_in.as_ptr(),
+                bulk_in.len(),
+                bulk_out.as_mut_ptr(),
+                bulk_out.len(),
+                bulk_scalars.as_mut_ptr(),
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert!(bulk_w > 0);
+        assert_eq!(bulk_scalars, [1, 2]);
+        assert_eq!(&bulk_out[..2], &[5, 11]);
+    }
+
+    #[test]
+    fn wave28_slice6_entrypoints_reject_null_unaligned_and_undersized_buffers() {
+        let mut raw = [0xA5u8; 64];
+        let unaligned_i32 = unsafe { raw.as_mut_ptr().add(1).cast::<i32>() };
+        let unaligned_i64 = unsafe { raw.as_mut_ptr().add(1).cast::<i64>() };
+        let unaligned_usize = unsafe { raw.as_mut_ptr().add(1).cast::<usize>() };
+
+        assert_eq!(
+            unsafe {
+                nntmux_login_detect_field_type_nul(
+                    1,
+                    b"a@b.c".as_ptr(),
+                    5,
+                    unaligned_i32,
+                    raw.as_mut_ptr(),
+                    64,
+                )
+            },
+            -1
+        );
+
+        assert_eq!(
+            unsafe { nntmux_login_trusted_device_remaining(100, 50, unaligned_i64) },
+            -1
+        );
+
+        assert_eq!(
+            unsafe {
+                nntmux_login_requires_two_factor(1, 1, 1, b"sec".as_ptr(), 3, unaligned_i32)
+            },
+            -1
+        );
+
+        let mut small = [0x5Au8; 4];
+        assert!(
+            unsafe {
+                nntmux_register_extract_invite_code_nul(
+                    1,
+                    b"code123".as_ptr(),
+                    7,
+                    0,
+                    b"".as_ptr(),
+                    0,
+                    0,
+                    b"".as_ptr(),
+                    0,
+                    small.as_mut_ptr(),
+                    small.len(),
+                )
+            } < -4
+        );
+        assert_eq!(small, [0x5Au8; 4]);
+
+        assert_eq!(
+            unsafe {
+                nntmux_register_emails_match(
+                    b"a@b.c".as_ptr(),
+                    5,
+                    b"a@b.c".as_ptr(),
+                    5,
+                    unaligned_i32,
+                )
+            },
+            -1
+        );
+
+        assert_eq!(
+            unsafe {
+                nntmux_admin_user_normalize_bulk_ids(
+                    [1i64].as_ptr(),
+                    1,
+                    unaligned_i64,
+                    1,
+                    unaligned_usize,
+                )
+            },
+            -1
+        );
+
+        assert_eq!(
+            unsafe {
+                nntmux_admin_role_normalize_state_nul(
+                    b"create".as_ptr(),
+                    6,
+                    b"view".as_ptr(),
+                    4,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    unaligned_i64,
+                    raw.as_mut_ptr(),
+                    64,
+                )
+            },
+            -1
+        );
+
+        assert_eq!(
+            unsafe {
+                nntmux_deleted_users_validate_bulk_action_nul(
+                    1,
+                    b"restore".as_ptr(),
+                    7,
+                    1,
+                    [1i64].as_ptr(),
+                    1,
+                    unaligned_i64,
+                    1,
+                    unaligned_i64,
+                    raw.as_mut_ptr(),
+                    64,
+                )
+            },
+            -1
+        );
+    }
+}
