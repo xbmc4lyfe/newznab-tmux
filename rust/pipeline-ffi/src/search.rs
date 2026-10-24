@@ -14938,3 +14938,669 @@ pub mod email_captcha_turnstile_trusted_device {
         }
     }
 }
+/// Wave 23 Slice 23.4: `Google2FAAuthenticator`, `PermissionSyncHelper`,
+/// `CategoryTreeBuilder`, `ThrottlesLogins`, and `TrustedDevice2FAMiddleware` helpers.
+///
+/// Every buffer-returning export writes nothing and returns `-(needed)` when `cap` is too
+/// small, and returns [`DECLINE`](security_forum_support::DECLINE) for invalid pointers,
+/// lengths, or inputs the PHP implementation must handle itself.
+pub mod security_forum_support {
+    use std::mem::size_of;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    /// Invalid arguments, or an input that only the PHP implementation handles.
+    pub const DECLINE: i32 = i32::MIN;
+    /// `nntmux_2fa_secret_otp`: the secret is PHP-`empty()` (`''` or `'0'`).
+    pub const SECRET_EMPTY: i32 = i32::MIN + 1;
+    /// `nntmux_trusted_device_cookie_json`: `json_encode()` fails on invalid UTF-8.
+    pub const JSON_INVALID_UTF8: i32 = i32::MIN + 1;
+
+    const MAX_INPUT: usize = 1 << 20;
+    const MAX_NODES: usize = 1 << 20;
+    /// Permission masks keep grants in bits 0..15 and revocations in bits 16..31.
+    const MAX_PERMISSIONS: usize = 15;
+
+    #[inline]
+    fn range_ok(addr: usize, bytes: usize) -> bool {
+        bytes <= isize::MAX as usize && addr.checked_add(bytes).is_some()
+    }
+
+    #[inline]
+    unsafe fn input<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null() || len > MAX_INPUT || !range_ok(ptr as usize, len) {
+            return None;
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    unsafe fn typed<'a, T>(ptr: *const T, count: usize, max: usize) -> Option<&'a [T]> {
+        if count == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null() || !ptr.is_aligned() || count > max {
+            return None;
+        }
+        let bytes = count.checked_mul(size_of::<T>())?;
+        if !range_ok(ptr as usize, bytes) {
+            return None;
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, count) })
+    }
+
+    /// Copies `data` into `out` only when it fits entirely.
+    #[inline]
+    unsafe fn write_out(data: &[u8], out: *mut u8, cap: usize) -> i32 {
+        let needed = data.len();
+        if needed > i32::MAX as usize {
+            return DECLINE;
+        }
+        if cap < needed {
+            return -(needed as i32);
+        }
+        if needed == 0 {
+            return 0;
+        }
+        if out.is_null() || !range_ok(out as usize, cap) {
+            return DECLINE;
+        }
+        unsafe { slice::from_raw_parts_mut(out, needed) }.copy_from_slice(data);
+        needed as i32
+    }
+
+    /// PHP `trim()` default characters: `" \t\n\r\0\x0B"`.
+    #[inline]
+    fn is_php_trim(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B)
+    }
+
+    // -------------------------------------------------------------------------
+    // 1. Google2FAAuthenticator
+    // -------------------------------------------------------------------------
+
+    /// `Google2FAAuthenticator::validateSecretAndNormalizeOtp()` for a string secret and
+    /// OTP: [`SECRET_EMPTY`] when the secret is `''` or `'0'`, otherwise the OTP with every
+    /// PHP `trim()` whitespace byte removed.
+    ///
+    /// # Safety
+    /// `secret`/`otp` must be readable for their lengths and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_2fa_secret_otp(
+        secret: *const u8,
+        secret_len: usize,
+        otp: *const u8,
+        otp_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let (Some(secret), Some(otp)) = (unsafe { input(secret, secret_len) }, unsafe {
+                input(otp, otp_len)
+            }) else {
+                return DECLINE;
+            };
+            if secret.is_empty() || secret == b"0" {
+                return SECRET_EMPTY;
+            }
+            let normalized: Vec<u8> = otp.iter().copied().filter(|&b| !is_php_trim(b)).collect();
+            unsafe { write_out(&normalized, out, cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    // -------------------------------------------------------------------------
+    // 2. PermissionSyncHelper
+    // -------------------------------------------------------------------------
+
+    #[inline]
+    fn pack_diff(grant: u32, revoke: u32) -> i32 {
+        (grant | (revoke << 16)) as i32
+    }
+
+    /// `PermissionSyncHelper::computeUserPermissionDiff()` over `count` permissions as bit
+    /// masks: grant present permissions that are not direct, revoke absent permissions that
+    /// are effective. Returns `grant | revoke << 16`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn nntmux_permission_user_diff(
+        present: u32,
+        direct: u32,
+        effective: u32,
+        count: u32,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if count as usize > MAX_PERMISSIONS {
+                return DECLINE;
+            }
+            let all = (1u32 << count) - 1;
+            if (present | direct | effective) & !all != 0 {
+                return DECLINE;
+            }
+            pack_diff(present & !direct, !present & effective & all)
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `PermissionSyncHelper::computeRolePermissionDiff()` over `count` integer input values:
+    /// grant a value of 1 that is not current; when `revoke_zero` is 1, revoke a value of 0
+    /// that is current. Returns `grant | revoke << 16`.
+    ///
+    /// # Safety
+    /// `values` must be readable for `count` aligned `i64` elements.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_permission_role_diff(
+        values: *const i64,
+        count: usize,
+        current: u32,
+        revoke_zero: u32,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if revoke_zero > 1 {
+                return DECLINE;
+            }
+            let Some(values) = (unsafe { typed(values, count, MAX_PERMISSIONS) }) else {
+                return DECLINE;
+            };
+            let all = (1u32 << values.len()) - 1;
+            if current & !all != 0 {
+                return DECLINE;
+            }
+            let (mut grant, mut revoke) = (0u32, 0u32);
+            for (i, &value) in values.iter().enumerate() {
+                let bit = 1u32 << i;
+                let held = current & bit != 0;
+                if value == 1 && !held {
+                    grant |= bit;
+                } else if value == 0 && held && revoke_zero == 1 {
+                    revoke |= bit;
+                }
+            }
+            pack_diff(grant, revoke)
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    // -------------------------------------------------------------------------
+    // 3. CategoryTreeBuilder
+    // -------------------------------------------------------------------------
+
+    /// `CategoryTreeBuilder::resolveRootParentIdFromNodes()`: the index of the node whose
+    /// parent is the root parent, or -1 for no nodes. A node replaces the candidate while the
+    /// candidate `_lft` is null, or when its own `_lft` is lower. `present[i]` is 1 when
+    /// `lefts[i]` holds a value and 0 for a null `_lft`.
+    ///
+    /// # Safety
+    /// `lefts` must be readable for `count` aligned `i64` elements and `present` for `count`
+    /// bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_category_root_index(
+        lefts: *const i64,
+        present: *const u8,
+        count: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let (Some(lefts), Some(present)) =
+                (unsafe { typed(lefts, count, MAX_NODES) }, unsafe {
+                    typed(present, count, MAX_NODES)
+                })
+            else {
+                return DECLINE;
+            };
+            if present.iter().any(|&p| p > 1) {
+                return DECLINE;
+            }
+            let mut index = -1i32;
+            let mut lowest: Option<i64> = None;
+            for (i, (&left, &has)) in lefts.iter().zip(present).enumerate() {
+                let left = (has == 1).then_some(left);
+                let replace = match (lowest, left) {
+                    (None, _) => true,
+                    (Some(low), Some(left)) => left < low,
+                    (Some(_), None) => false,
+                };
+                if replace {
+                    lowest = left;
+                    index = i as i32;
+                }
+            }
+            index
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    // -------------------------------------------------------------------------
+    // 4. ThrottlesLogins
+    // -------------------------------------------------------------------------
+
+    /// Bytes `voku\helper\ASCII::to_transliterate()` returns unchanged (its `$REGEX_ASCII`
+    /// complement): `\x09 \x0A \x0D \x10 \x13` and printable ASCII.
+    #[inline]
+    fn is_transliteration_identity(b: u8) -> bool {
+        matches!(b, 0x09 | 0x0A | 0x0D | 0x10 | 0x13 | 0x20..=0x7E)
+    }
+
+    /// `ThrottlesLogins::buildThrottleKey()`:
+    /// `Str::transliterate(Str::lower($username.'|'.$ip))` for inputs that transliteration
+    /// leaves unchanged; [`DECLINE`] for any other byte, which PHP must handle.
+    ///
+    /// # Safety
+    /// `username`/`ip` must be readable for their lengths and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_throttle_key(
+        username: *const u8,
+        username_len: usize,
+        ip: *const u8,
+        ip_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let (Some(username), Some(ip)) = (unsafe { input(username, username_len) }, unsafe {
+                input(ip, ip_len)
+            }) else {
+                return DECLINE;
+            };
+            if !username
+                .iter()
+                .chain(ip)
+                .all(|&b| is_transliteration_identity(b))
+            {
+                return DECLINE;
+            }
+            let mut key = Vec::with_capacity(username.len() + 1 + ip.len());
+            key.extend(username.iter().map(u8::to_ascii_lowercase));
+            key.push(b'|');
+            key.extend(ip.iter().map(u8::to_ascii_lowercase));
+            unsafe { write_out(&key, out, cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `ThrottlesLogins::computeLockoutMinutes()`: PHP `(int) ceil($seconds / 60)`. PHP divides
+    /// exactly when 60 divides `$seconds` and in `double` otherwise; `ceil()` always returns a
+    /// `float`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn nntmux_throttle_lockout_minutes(seconds: i64) -> i64 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if seconds % 60 == 0 {
+                (seconds / 60) as f64 as i64
+            } else {
+                (seconds as f64 / 60.0).ceil() as i64
+            }
+        }))
+        .unwrap_or(0)
+    }
+
+    // -------------------------------------------------------------------------
+    // 5. TrustedDevice2FAMiddleware
+    // -------------------------------------------------------------------------
+
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    #[inline]
+    fn push_u16_escape(buf: &mut Vec<u8>, unit: u16) {
+        buf.extend_from_slice(b"\\u");
+        for shift in [12, 8, 4, 0] {
+            buf.push(HEX[((unit >> shift) & 0xF) as usize]);
+        }
+    }
+
+    /// Appends `s` as a PHP `json_encode(..., JSON_UNESCAPED_SLASHES)` string literal.
+    fn push_json_string(buf: &mut Vec<u8>, s: &str) {
+        buf.push(b'"');
+        for c in s.chars() {
+            match c {
+                '"' => buf.extend_from_slice(b"\\\""),
+                '\\' => buf.extend_from_slice(b"\\\\"),
+                '\u{08}' => buf.extend_from_slice(b"\\b"),
+                '\u{0C}' => buf.extend_from_slice(b"\\f"),
+                '\n' => buf.extend_from_slice(b"\\n"),
+                '\r' => buf.extend_from_slice(b"\\r"),
+                '\t' => buf.extend_from_slice(b"\\t"),
+                c if (c as u32) < 0x20 => push_u16_escape(buf, c as u16),
+                c if c.is_ascii() => buf.push(c as u8),
+                c => {
+                    let mut units = [0u16; 2];
+                    for &unit in c.encode_utf16(&mut units).iter() {
+                        push_u16_escape(buf, unit);
+                    }
+                }
+            }
+        }
+        buf.push(b'"');
+    }
+
+    /// `TrustedDevice2FAMiddleware::serializeTrustedDeviceCookie()` value for the canonical
+    /// `['user_id' => int, 'token' => string, 'expires_at' => int]` payload:
+    /// `json_encode($cookieData, JSON_UNESCAPED_SLASHES)`, or [`JSON_INVALID_UTF8`] when the
+    /// token is not valid UTF-8 (`json_encode()` returns `false`).
+    ///
+    /// # Safety
+    /// `token` must be readable for `token_len` bytes and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_trusted_device_cookie_json(
+        user_id: i64,
+        token: *const u8,
+        token_len: usize,
+        expires_at: i64,
+        out: *mut u8,
+        cap: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(token) = (unsafe { input(token, token_len) }) else {
+                return DECLINE;
+            };
+            let Ok(token) = std::str::from_utf8(token) else {
+                return JSON_INVALID_UTF8;
+            };
+            let mut json = Vec::with_capacity(token.len() + 64);
+            json.extend_from_slice(b"{\"user_id\":");
+            json.extend_from_slice(user_id.to_string().as_bytes());
+            json.extend_from_slice(b",\"token\":");
+            push_json_string(&mut json, token);
+            json.extend_from_slice(b",\"expires_at\":");
+            json.extend_from_slice(expires_at.to_string().as_bytes());
+            json.push(b'}');
+            unsafe { write_out(&json, out, cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn buf_call(f: impl Fn(*mut u8, usize) -> i32) -> Result<Vec<u8>, i32> {
+            let mut buf = vec![0u8; 4096];
+            let n = f(buf.as_mut_ptr(), buf.len());
+            if n < 0 {
+                return Err(n);
+            }
+            buf.truncate(n as usize);
+            Ok(buf)
+        }
+
+        fn otp(secret: &[u8], otp: &[u8]) -> Result<Vec<u8>, i32> {
+            buf_call(|o, c| unsafe {
+                nntmux_2fa_secret_otp(secret.as_ptr(), secret.len(), otp.as_ptr(), otp.len(), o, c)
+            })
+        }
+
+        #[test]
+        fn secret_otp() {
+            assert_eq!(otp(b"JBSWY3DPEHPK3PXP", b" 123 456\t").unwrap(), b"123456");
+            assert_eq!(otp(b"x", b"\0\x0b\r\n12").unwrap(), b"12");
+            assert_eq!(otp(b"x", b"\x0c1").unwrap(), b"\x0c1");
+            assert_eq!(otp(b"x", b"").unwrap(), b"");
+            assert_eq!(otp(b"00", b"").unwrap(), b"");
+            assert_eq!(otp(b" ", b"1").unwrap(), b"1");
+            assert_eq!(otp(b"", b"123456"), Err(SECRET_EMPTY));
+            assert_eq!(otp(b"0", b"123456"), Err(SECRET_EMPTY));
+            assert_eq!(
+                unsafe {
+                    nntmux_2fa_secret_otp(
+                        std::ptr::null(),
+                        1,
+                        b"1".as_ptr(),
+                        1,
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_2fa_secret_otp(
+                        b"s".as_ptr(),
+                        1,
+                        b"1".as_ptr(),
+                        usize::MAX,
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                },
+                DECLINE
+            );
+            let mut small = [0xAAu8; 3];
+            let n = unsafe {
+                nntmux_2fa_secret_otp(
+                    b"s".as_ptr(),
+                    1,
+                    b"1 2 3 4".as_ptr(),
+                    7,
+                    small.as_mut_ptr(),
+                    3,
+                )
+            };
+            assert_eq!(n, -4);
+            assert_eq!(small, [0xAA; 3]);
+            assert_eq!(
+                unsafe {
+                    nntmux_2fa_secret_otp(
+                        b"s".as_ptr(),
+                        1,
+                        b"12".as_ptr(),
+                        2,
+                        std::ptr::null_mut(),
+                        8,
+                    )
+                },
+                DECLINE
+            );
+        }
+
+        #[test]
+        fn permission_user_diff() {
+            assert_eq!(
+                nntmux_permission_user_diff(0b0011, 0b0001, 0b1100, 4),
+                0b0010 | (0b1100 << 16)
+            );
+            assert_eq!(nntmux_permission_user_diff(0, 0, 0, 0), 0);
+            assert_eq!(nntmux_permission_user_diff(0xFF, 0xFF, 0xFF, 8), 0);
+            assert_eq!(nntmux_permission_user_diff(0, 0, 0x7FFF, 15), 0x7FFF << 16);
+            assert_eq!(nntmux_permission_user_diff(0, 0, 0, 16), DECLINE);
+            assert_eq!(nntmux_permission_user_diff(0b100, 0, 0, 2), DECLINE);
+        }
+
+        #[test]
+        fn permission_role_diff() {
+            let values = [1i64, 0, 1, 0, 2, -1];
+            let diff = |current, revoke| unsafe {
+                nntmux_permission_role_diff(values.as_ptr(), values.len(), current, revoke)
+            };
+            assert_eq!(diff(0b000110, 1), 0b000001 | (0b000010 << 16));
+            assert_eq!(diff(0b111111, 1), 0b001010 << 16);
+            assert_eq!(diff(0b111111, 0), 0);
+            assert_eq!(diff(0, 0), 0b000101);
+            assert_eq!(diff(0, 2), DECLINE);
+            assert_eq!(diff(0b1000000, 1), DECLINE);
+            assert_eq!(
+                unsafe { nntmux_permission_role_diff(std::ptr::null(), 0, 0, 1) },
+                0
+            );
+            assert_eq!(
+                unsafe { nntmux_permission_role_diff(std::ptr::null(), 1, 0, 1) },
+                DECLINE
+            );
+            let many = [0i64; 16];
+            assert_eq!(
+                unsafe { nntmux_permission_role_diff(many.as_ptr(), 16, 0, 1) },
+                DECLINE
+            );
+            let raw = [0u64; 4];
+            let misaligned = unsafe { (raw.as_ptr() as *const u8).add(1) } as *const i64;
+            assert_eq!(
+                unsafe { nntmux_permission_role_diff(misaligned, 2, 0, 1) },
+                DECLINE
+            );
+        }
+
+        fn root(nodes: &[Option<i64>]) -> i32 {
+            let lefts: Vec<i64> = nodes.iter().map(|n| n.unwrap_or(0)).collect();
+            let present: Vec<u8> = nodes.iter().map(|n| n.is_some() as u8).collect();
+            unsafe { nntmux_category_root_index(lefts.as_ptr(), present.as_ptr(), nodes.len()) }
+        }
+
+        #[test]
+        fn category_root_index() {
+            assert_eq!(root(&[]), -1);
+            assert_eq!(root(&[Some(5)]), 0);
+            assert_eq!(root(&[Some(5), Some(3), Some(3), Some(4)]), 1);
+            assert_eq!(root(&[Some(5), None, Some(3)]), 2);
+            assert_eq!(root(&[None, None, Some(4), None]), 2);
+            assert_eq!(root(&[None, Some(9), Some(1)]), 2);
+            assert_eq!(root(&[Some(i64::MIN), Some(i64::MAX)]), 0);
+            assert_eq!(root(&[None]), 0);
+            let present = [2u8];
+            assert_eq!(
+                unsafe { nntmux_category_root_index([1i64].as_ptr(), present.as_ptr(), 1) },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe { nntmux_category_root_index(std::ptr::null(), present.as_ptr(), 1) },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe { nntmux_category_root_index([1i64].as_ptr(), std::ptr::null(), 1) },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe { nntmux_category_root_index(std::ptr::null(), std::ptr::null(), 0) },
+                -1
+            );
+            let raw = [0u64; 4];
+            let misaligned = unsafe { (raw.as_ptr() as *const u8).add(4) } as *const i64;
+            assert_eq!(
+                unsafe { nntmux_category_root_index(misaligned, [1u8, 1].as_ptr(), 2) },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_category_root_index(
+                        std::ptr::dangling::<i64>(),
+                        std::ptr::dangling::<u8>(),
+                        usize::MAX,
+                    )
+                },
+                DECLINE
+            );
+        }
+
+        fn key(u: &[u8], ip: &[u8]) -> Result<Vec<u8>, i32> {
+            buf_call(|o, c| unsafe {
+                nntmux_throttle_key(u.as_ptr(), u.len(), ip.as_ptr(), ip.len(), o, c)
+            })
+        }
+
+        #[test]
+        fn throttle_key() {
+            assert_eq!(
+                key(b"Alice@Example.COM", b"127.0.0.1").unwrap(),
+                b"alice@example.com|127.0.0.1"
+            );
+            assert_eq!(key(b"", b"").unwrap(), b"|");
+            assert_eq!(
+                key(b"A\tB\x10\x13\r\n~", b"::1").unwrap(),
+                b"a\tb\x10\x13\r\n~|::1"
+            );
+            assert_eq!(key(b"\x01", b""), Err(DECLINE));
+            assert_eq!(key(b"\x7f", b""), Err(DECLINE));
+            assert_eq!(key(b"", b"\x0b"), Err(DECLINE));
+            assert_eq!(key("Ä".as_bytes(), b""), Err(DECLINE));
+            let mut small = [0xAAu8; 2];
+            let n = unsafe {
+                nntmux_throttle_key(b"ab".as_ptr(), 2, b"c".as_ptr(), 1, small.as_mut_ptr(), 2)
+            };
+            assert_eq!(n, -4);
+            assert_eq!(small, [0xAA; 2]);
+            assert_eq!(
+                unsafe {
+                    nntmux_throttle_key(
+                        std::ptr::null(),
+                        1,
+                        b"c".as_ptr(),
+                        1,
+                        small.as_mut_ptr(),
+                        2,
+                    )
+                },
+                DECLINE
+            );
+        }
+
+        #[test]
+        fn throttle_lockout_minutes() {
+            let m = nntmux_throttle_lockout_minutes;
+            assert_eq!(m(0), 0);
+            assert_eq!(m(1), 1);
+            assert_eq!(m(59), 1);
+            assert_eq!(m(60), 1);
+            assert_eq!(m(61), 2);
+            assert_eq!(m(-30), 0);
+            assert_eq!(m(-90), -1);
+            assert_eq!(m(-120), -2);
+            assert_eq!(m(i64::MAX), 153_722_867_280_912_928);
+            assert_eq!(m(i64::MIN), -153_722_867_280_912_928);
+            // 60 * (2^53 + 1): exact integer quotient, rounded by PHP's ceil() float.
+            assert_eq!(m(60 * 9_007_199_254_740_993), 9_007_199_254_740_992);
+        }
+
+        fn cookie(uid: i64, token: &[u8], exp: i64) -> Result<Vec<u8>, i32> {
+            buf_call(|o, c| unsafe {
+                nntmux_trusted_device_cookie_json(uid, token.as_ptr(), token.len(), exp, o, c)
+            })
+        }
+
+        #[test]
+        fn trusted_device_cookie_json() {
+            assert_eq!(
+                cookie(7, b"abc", 1_893_456_000).unwrap(),
+                br#"{"user_id":7,"token":"abc","expires_at":1893456000}"#
+            );
+            let expected = [
+                &br#"{"user_id":-1,"token":"a/b\"c\\d\b\f\n\r\t\u0001\u001f"#[..],
+                b"\x7f",
+                br#"\u00e9\ud83d\ude00<>&'","expires_at":-9223372036854775808}"#,
+            ]
+            .concat();
+            assert_eq!(
+                cookie(
+                    -1,
+                    "a/b\"c\\d\u{8}\u{c}\n\r\t\u{1}\u{1f}\u{7f}é😀<>&'".as_bytes(),
+                    i64::MIN
+                )
+                .unwrap(),
+                expected
+            );
+            assert_eq!(
+                cookie(1, b"", 2).unwrap(),
+                br#"{"user_id":1,"token":"","expires_at":2}"#
+            );
+            assert_eq!(cookie(1, b"\xff", 2), Err(JSON_INVALID_UTF8));
+            assert_eq!(cookie(1, b"\xed\xa0\x80", 2), Err(JSON_INVALID_UTF8));
+            let mut small = [0xAAu8; 4];
+            let n = unsafe {
+                nntmux_trusted_device_cookie_json(1, b"t".as_ptr(), 1, 2, small.as_mut_ptr(), 4)
+            };
+            assert_eq!(n, -40);
+            assert_eq!(small, [0xAA; 4]);
+            assert_eq!(
+                unsafe {
+                    nntmux_trusted_device_cookie_json(
+                        1,
+                        std::ptr::null(),
+                        1,
+                        2,
+                        small.as_mut_ptr(),
+                        4,
+                    )
+                },
+                DECLINE
+            );
+        }
+    }
+}
