@@ -28296,3 +28296,1020 @@ pub mod tv_processing_pipes_provider {
 
 
 
+// ---------------------------------------------------------------------------
+// Wave 28 Slice 28.4: AdminMovieController, AdminShowsController,
+// AdminMusicController, AdminConsoleController, and AdminGameController helpers
+// ---------------------------------------------------------------------------
+
+pub mod admin_media_catalog_controllers {
+    use std::mem::size_of;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    const DECLINE: isize = -1;
+    const MAX_INPUT: usize = (isize::MAX as usize) / 8;
+
+    const MOVIE_COVER_SUFFIX: &[u8] = b"-cover";
+    const MOVIE_BACKDROP_SUFFIX: &[u8] = b"-backdrop";
+
+    const FLASH_KEY_WARNING: &[u8] = b"warning";
+    const FLASH_KEY_SUCCESS: &[u8] = b"success";
+    const FLASH_EXISTED_PREFIX: &[u8] = b"Show \"";
+    const FLASH_EXISTED_SUFFIX: &[u8] = "\" already exists — opened existing record.".as_bytes();
+    const FLASH_ADDED_PREFIX: &[u8] = b"TV show \"";
+    const FLASH_ADDED_SUFFIX: &[u8] = b"\" added successfully.";
+
+    #[inline]
+    unsafe fn valid_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null()
+            || !ptr.is_aligned()
+            || len > MAX_INPUT
+            || len > isize::MAX as usize
+            || (ptr as usize).checked_add(len).is_none()
+        {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn valid_out_buf(out_buf: *mut u8, out_cap: usize) -> bool {
+        !out_buf.is_null()
+            && out_buf.is_aligned()
+            && out_cap <= isize::MAX as usize
+            && (out_buf as usize).checked_add(out_cap).is_some()
+    }
+
+    #[inline]
+    fn valid_mut_slice<T>(ptr: *mut T, count: usize) -> bool {
+        if ptr.is_null() || !ptr.is_aligned() {
+            return false;
+        }
+        let Some(byte_len) = count.checked_mul(size_of::<T>()) else {
+            return false;
+        };
+        byte_len <= isize::MAX as usize && (ptr as usize).checked_add(byte_len).is_some()
+    }
+
+    #[inline]
+    fn is_php_numeric_ws(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\x0b' | b'\x0c')
+    }
+
+    #[inline]
+    fn trim_php_numeric_ws(mut slice: &[u8]) -> &[u8] {
+        while let Some((&first, rest)) = slice.split_first() {
+            if is_php_numeric_ws(first) {
+                slice = rest;
+            } else {
+                break;
+            }
+        }
+        while let Some((&last, rest)) = slice.split_last() {
+            if is_php_numeric_ws(last) {
+                slice = rest;
+            } else {
+                break;
+            }
+        }
+        slice
+    }
+
+    #[inline]
+    fn parse_ascii_u32(bytes: &[u8]) -> Option<u32> {
+        if bytes.is_empty() {
+            return None;
+        }
+        let mut acc = 0u32;
+        for &b in bytes {
+            if !b.is_ascii_digit() {
+                return None;
+            }
+            acc = acc.checked_mul(10)?.checked_add(u32::from(b - b'0'))?;
+        }
+        Some(acc)
+    }
+
+    #[inline]
+    fn parse_ascii_i64_digits(bytes: &[u8]) -> Option<i64> {
+        if bytes.is_empty() {
+            return None;
+        }
+        let mut acc = 0i64;
+        for &b in bytes {
+            if !b.is_ascii_digit() {
+                return None;
+            }
+            acc = acc.checked_mul(10)?.checked_add(i64::from(b - b'0'))?;
+        }
+        Some(acc)
+    }
+
+    #[inline]
+    fn parse_signed_ascii_i64(bytes: &[u8]) -> Option<i64> {
+        if bytes.is_empty() {
+            return None;
+        }
+        let (neg, digits) = if let Some(rest) = bytes.strip_prefix(b"-") {
+            (true, rest)
+        } else if let Some(rest) = bytes.strip_prefix(b"+") {
+            (false, rest)
+        } else {
+            (false, bytes)
+        };
+        if digits.is_empty() || !digits.iter().all(|&b| b.is_ascii_digit()) {
+            return None;
+        }
+        let s = std::str::from_utf8(bytes).ok()?;
+        let _ = neg;
+        s.parse::<i64>().ok()
+    }
+
+    #[inline]
+    fn is_leap_year(year: u32) -> bool {
+        (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
+    }
+
+    #[inline]
+    fn days_in_month(year: u32, month: u32) -> u32 {
+        match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 => {
+                if is_leap_year(year) {
+                    29
+                } else {
+                    28
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    #[inline]
+    fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+        let y = year - i64::from(month <= 2);
+        let era = if y >= 0 { y } else { y - 399 } / 400;
+        let yoe = (y - era * 400) as u32;
+        let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146_097 + (doe as i64) - 719_468
+    }
+
+    /// Parses a strict ISO date (`YYYY-MM-DD`) or datetime (`YYYY-MM-DD[ T]HH:MM:SS`)
+    /// in UTC into `(epoch_seconds, canonical_19_byte_datetime)`.
+    #[inline]
+    fn parse_iso_datetime_utc(input: &[u8]) -> Option<(i64, [u8; 19])> {
+        let s = trim_php_numeric_ws(input);
+        if s.len() != 10 && s.len() != 19 {
+            return None;
+        }
+        if s[4] != b'-' || s[7] != b'-' {
+            return None;
+        }
+        let year = parse_ascii_u32(&s[0..4])?;
+        if !(1902..=2199).contains(&year) {
+            return None;
+        }
+        let month = parse_ascii_u32(&s[5..7])?;
+        if !(1..=12).contains(&month) {
+            return None;
+        }
+        let day = parse_ascii_u32(&s[8..10])?;
+        let max_day = days_in_month(year, month);
+        if day < 1 || day > max_day {
+            return None;
+        }
+
+        let (hour, min, sec) = if s.len() == 10 {
+            (0u32, 0u32, 0u32)
+        } else {
+            if !matches!(s[10], b' ' | b'T') || s[13] != b':' || s[16] != b':' {
+                return None;
+            }
+            let h = parse_ascii_u32(&s[11..13])?;
+            let m = parse_ascii_u32(&s[14..16])?;
+            let sec = parse_ascii_u32(&s[17..19])?;
+            if h > 23 || m > 59 || sec > 59 {
+                return None;
+            }
+            (h, m, sec)
+        };
+
+        let days = days_from_civil(i64::from(year), month, day);
+        let ts = days * 86_400 + i64::from(hour) * 3_600 + i64::from(min) * 60 + i64::from(sec);
+
+        let mut canonical = [0u8; 19];
+        canonical[0..10].copy_from_slice(&s[0..10]);
+        canonical[10] = b' ';
+        if s.len() == 10 {
+            canonical[11..19].copy_from_slice(b"00:00:00");
+        } else {
+            canonical[11..19].copy_from_slice(&s[11..19]);
+        }
+
+        Some((ts, canonical))
+    }
+
+    /// Evaluates whether `id` is a numeric IMDB ID for `AdminMovieController::create()`.
+    /// Returns `1` if valid numeric, `0` if invalid, or `-1` on invalid slice or
+    /// non-trivial scientific/signed numeric candidates that should fall back to PHP.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_admin_movie_is_numeric_imdb_id(
+        id_ptr: *const u8,
+        id_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(id) = (unsafe { valid_slice(id_ptr, id_len) }) else {
+                return DECLINE as i32;
+            };
+            let trimmed = trim_php_numeric_ws(id);
+            if trimmed.is_empty() {
+                return 0;
+            }
+            if trimmed.iter().all(|&b| b.is_ascii_digit()) {
+                return 1;
+            }
+            if trimmed
+                .iter()
+                .all(|&b| b.is_ascii_digit() || matches!(b, b'+' | b'-' | b'.' | b'e' | b'E'))
+            {
+                return DECLINE as i32;
+            }
+            0
+        }))
+        .unwrap_or(DECLINE as i32)
+    }
+
+    /// Builds the `{id}-cover` and `{id}-backdrop` image keys for `AdminMovieController::edit()`.
+    /// Writes `[cover_len, backdrop_len]` to `out_lens` (`usize[2]`) and the concatenated
+    /// strings to `out_buf`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_admin_movie_build_image_keys(
+        id_ptr: *const u8,
+        id_len: usize,
+        out_lens: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_mut_slice(out_lens, 2) || !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(id) = (unsafe { valid_slice(id_ptr, id_len) }) else {
+                return DECLINE;
+            };
+
+            let Some(cover_len) = id.len().checked_add(MOVIE_COVER_SUFFIX.len()) else {
+                return DECLINE;
+            };
+            let Some(backdrop_len) = id.len().checked_add(MOVIE_BACKDROP_SUFFIX.len()) else {
+                return DECLINE;
+            };
+            let Some(required) = cover_len.checked_add(backdrop_len) else {
+                return DECLINE;
+            };
+            if required > isize::MAX as usize {
+                return DECLINE;
+            }
+
+            let lens = unsafe { slice::from_raw_parts_mut(out_lens, 2) };
+            lens[0] = cover_len;
+            lens[1] = backdrop_len;
+
+            if required > out_cap {
+                return -(required as isize);
+            }
+
+            let dst = unsafe { slice::from_raw_parts_mut(out_buf, required) };
+            let mut offset = 0usize;
+            dst[offset..offset + id.len()].copy_from_slice(id);
+            offset += id.len();
+            dst[offset..offset + MOVIE_COVER_SUFFIX.len()].copy_from_slice(MOVIE_COVER_SUFFIX);
+            offset += MOVIE_COVER_SUFFIX.len();
+            dst[offset..offset + id.len()].copy_from_slice(id);
+            offset += id.len();
+            dst[offset..offset + MOVIE_BACKDROP_SUFFIX.len()]
+                .copy_from_slice(MOVIE_BACKDROP_SUFFIX);
+
+            required as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Normalizes `(has_cover, has_backdrop)` into `out_flags` (`i64[2]`: `[cover, backdrop]`)
+    /// for `AdminMovieController::buildMovieUpdatePayload()`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_admin_movie_normalize_update_flags(
+        has_cover: i64,
+        has_backdrop: i64,
+        out_flags: *mut i64,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_mut_slice(out_flags, 2) {
+                return DECLINE as i32;
+            }
+            let flags = unsafe { slice::from_raw_parts_mut(out_flags, 2) };
+            flags[0] = i64::from(has_cover != 0);
+            flags[1] = i64::from(has_backdrop != 0);
+            0
+        }))
+        .unwrap_or(DECLINE as i32)
+    }
+
+    /// Normalizes the external `ids` map for `AdminShowsController::lookup()`.
+    /// Writes `[tvdb, tvmaze, tmdb, trakt, tvrage]` (defaulting to `0`) into `out_ids` (`i64[5]`)
+    /// and `imdb` (defaulting to `""`) into `out_buf`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_admin_shows_normalize_preview_ids(
+        has_tvdb: u32,
+        tvdb: i64,
+        has_tvmaze: u32,
+        tvmaze: i64,
+        has_tmdb: u32,
+        tmdb: i64,
+        has_trakt: u32,
+        trakt: i64,
+        has_tvrage: u32,
+        tvrage: i64,
+        has_imdb: u32,
+        imdb_ptr: *const u8,
+        imdb_len: usize,
+        out_ids: *mut i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if has_tvdb > 1
+                || has_tvmaze > 1
+                || has_tmdb > 1
+                || has_trakt > 1
+                || has_tvrage > 1
+                || has_imdb > 1
+                || !valid_mut_slice(out_ids, 5)
+                || !valid_out_buf(out_buf, out_cap)
+            {
+                return DECLINE;
+            }
+            let Some(imdb) = (unsafe { valid_slice(imdb_ptr, imdb_len) }) else {
+                return DECLINE;
+            };
+
+            let ids = unsafe { slice::from_raw_parts_mut(out_ids, 5) };
+            ids[0] = if has_tvdb == 1 { tvdb } else { 0 };
+            ids[1] = if has_tvmaze == 1 { tvmaze } else { 0 };
+            ids[2] = if has_tmdb == 1 { tmdb } else { 0 };
+            ids[3] = if has_trakt == 1 { trakt } else { 0 };
+            ids[4] = if has_tvrage == 1 { tvrage } else { 0 };
+
+            let eff_imdb: &[u8] = if has_imdb == 1 { imdb } else { b"" };
+            if eff_imdb.len() > out_cap {
+                return -(eff_imdb.len() as isize);
+            }
+            if !eff_imdb.is_empty() {
+                let dst = unsafe { slice::from_raw_parts_mut(out_buf, eff_imdb.len()) };
+                dst.copy_from_slice(eff_imdb);
+            }
+
+            eff_imdb.len() as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Formats the flash key (`warning` vs `success`) and message for
+    /// `AdminShowsController::create()`.
+    /// Writes `[key_len, msg_len]` to `out_lens` (`usize[2]`) and `key || message` to `out_buf`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_admin_shows_format_create_flash(
+        existed: u32,
+        title_ptr: *const u8,
+        title_len: usize,
+        out_lens: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if existed > 1 || !valid_mut_slice(out_lens, 2) || !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(title) = (unsafe { valid_slice(title_ptr, title_len) }) else {
+                return DECLINE;
+            };
+
+            let (key, prefix, suffix) = if existed == 1 {
+                (FLASH_KEY_WARNING, FLASH_EXISTED_PREFIX, FLASH_EXISTED_SUFFIX)
+            } else {
+                (FLASH_KEY_SUCCESS, FLASH_ADDED_PREFIX, FLASH_ADDED_SUFFIX)
+            };
+
+            let Some(msg_len) = prefix
+                .len()
+                .checked_add(title.len())
+                .and_then(|v| v.checked_add(suffix.len()))
+            else {
+                return DECLINE;
+            };
+            let Some(required) = key.len().checked_add(msg_len) else {
+                return DECLINE;
+            };
+            if required > isize::MAX as usize {
+                return DECLINE;
+            }
+
+            let lens = unsafe { slice::from_raw_parts_mut(out_lens, 2) };
+            lens[0] = key.len();
+            lens[1] = msg_len;
+
+            if required > out_cap {
+                return -(required as isize);
+            }
+
+            let dst = unsafe { slice::from_raw_parts_mut(out_buf, required) };
+            let mut offset = 0usize;
+            dst[offset..offset + key.len()].copy_from_slice(key);
+            offset += key.len();
+            dst[offset..offset + prefix.len()].copy_from_slice(prefix);
+            offset += prefix.len();
+            dst[offset..offset + title.len()].copy_from_slice(title);
+            offset += title.len();
+            dst[offset..offset + suffix.len()].copy_from_slice(suffix);
+
+            required as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Normalizes `(salesrank, releasedate, genre)` for `AdminMusicController::edit()`.
+    ///
+    /// Writes `[has_salesrank, salesrank, use_fallback_date, has_genre, genre_id]` into
+    /// `out_scalars` (`i64[5]`). When `use_fallback_date == 0`, writes the 19-byte canonical
+    /// `YYYY-MM-DD HH:MM:SS` string into `out_buf` and returns `19`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_admin_music_normalize_edit_fields(
+        salesrank_ptr: *const u8,
+        salesrank_len: usize,
+        releasedate_ptr: *const u8,
+        releasedate_len: usize,
+        is_utc: u32,
+        genre_ptr: *const u8,
+        genre_len: usize,
+        out_scalars: *mut i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if is_utc > 1 || !valid_mut_slice(out_scalars, 5) || !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(salesrank) = (unsafe { valid_slice(salesrank_ptr, salesrank_len) }) else {
+                return DECLINE;
+            };
+            let Some(releasedate) = (unsafe { valid_slice(releasedate_ptr, releasedate_len) })
+            else {
+                return DECLINE;
+            };
+            let Some(genre) = (unsafe { valid_slice(genre_ptr, genre_len) }) else {
+                return DECLINE;
+            };
+
+            let (has_salesrank, salesrank_val) = if salesrank.is_empty()
+                || salesrank == b"0"
+                || !salesrank.iter().all(|&b| b.is_ascii_digit())
+            {
+                (0i64, 0i64)
+            } else {
+                let Some(val) = parse_ascii_i64_digits(salesrank) else {
+                    return DECLINE;
+                };
+                (1i64, val)
+            };
+
+            let (has_genre, genre_val) = if genre.is_empty() || genre == b"0" {
+                (0i64, 0i64)
+            } else {
+                let Some(val) = parse_signed_ascii_i64(genre) else {
+                    return DECLINE;
+                };
+                (1i64, val)
+            };
+
+            let (use_fallback_date, formatted_date) =
+                if releasedate.is_empty() || releasedate == b"0" {
+                    (1i64, None)
+                } else if is_utc == 1 {
+                    let Some((ts, canonical)) = parse_iso_datetime_utc(releasedate) else {
+                        return DECLINE;
+                    };
+                    if ts == 0 {
+                        (1i64, None)
+                    } else {
+                        (0i64, Some(canonical))
+                    }
+                } else {
+                    return DECLINE;
+                };
+
+            let scalars = unsafe { slice::from_raw_parts_mut(out_scalars, 5) };
+            scalars[0] = has_salesrank;
+            scalars[1] = salesrank_val;
+            scalars[2] = use_fallback_date;
+            scalars[3] = has_genre;
+            scalars[4] = genre_val;
+
+            if let Some(canonical) = formatted_date {
+                if canonical.len() > out_cap {
+                    return -(canonical.len() as isize);
+                }
+                let dst = unsafe { slice::from_raw_parts_mut(out_buf, canonical.len()) };
+                dst.copy_from_slice(&canonical);
+                canonical.len() as isize
+            } else {
+                0
+            }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Normalizes `(salesrank, releasedate, has_cover)` for `AdminConsoleController::edit()`.
+    ///
+    /// Writes `[has_salesrank, use_fallback_date, timestamp, has_cover]` into `out_scalars`
+    /// (`i64[4]`). When `has_salesrank == 1`, copies the validated digit string into `out_buf`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_admin_console_normalize_edit_fields(
+        salesrank_ptr: *const u8,
+        salesrank_len: usize,
+        releasedate_ptr: *const u8,
+        releasedate_len: usize,
+        is_utc: u32,
+        has_cover: i64,
+        out_scalars: *mut i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if is_utc > 1 || !valid_mut_slice(out_scalars, 4) || !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(salesrank) = (unsafe { valid_slice(salesrank_ptr, salesrank_len) }) else {
+                return DECLINE;
+            };
+            let Some(releasedate) = (unsafe { valid_slice(releasedate_ptr, releasedate_len) })
+            else {
+                return DECLINE;
+            };
+
+            let salesrank_valid = !salesrank.is_empty()
+                && salesrank != b"0"
+                && salesrank.iter().all(|&b| b.is_ascii_digit());
+
+            let (use_fallback_date, timestamp) = if releasedate.is_empty() || releasedate == b"0" {
+                (1i64, 0i64)
+            } else if is_utc == 1 {
+                let Some((ts, _)) = parse_iso_datetime_utc(releasedate) else {
+                    return DECLINE;
+                };
+                if ts == 0 { (1i64, 0i64) } else { (0i64, ts) }
+            } else {
+                return DECLINE;
+            };
+
+            let scalars = unsafe { slice::from_raw_parts_mut(out_scalars, 4) };
+            scalars[0] = i64::from(salesrank_valid);
+            scalars[1] = use_fallback_date;
+            scalars[2] = timestamp;
+            scalars[3] = i64::from(has_cover != 0);
+
+            if salesrank_valid {
+                let required = salesrank.len();
+                if required > out_cap {
+                    return -(required as isize);
+                }
+                let dst = unsafe { slice::from_raw_parts_mut(out_buf, required) };
+                dst.copy_from_slice(salesrank);
+                required as isize
+            } else {
+                0
+            }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Normalizes the `gamesearch` term for `AdminGameController::index()`.
+    /// Returns `0` for PHP-falsy strings (`""` and `"0"`), or writes the search string
+    /// to `out_buf` and returns its byte length.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_admin_game_normalize_search_term(
+        search_ptr: *const u8,
+        search_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(search) = (unsafe { valid_slice(search_ptr, search_len) }) else {
+                return DECLINE;
+            };
+            if search.is_empty() || search == b"0" {
+                return 0;
+            }
+            let required = search.len();
+            if required > out_cap {
+                return -(required as isize);
+            }
+            let dst = unsafe { slice::from_raw_parts_mut(out_buf, required) };
+            dst.copy_from_slice(search);
+            required as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Parses the `releasedate` epoch timestamp for `AdminGameController::edit()` into
+    /// `out_scalars` (`i64[2]`: `[use_fallback_date, timestamp]`).
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_admin_game_parse_release_timestamp(
+        releasedate_ptr: *const u8,
+        releasedate_len: usize,
+        is_utc: u32,
+        out_scalars: *mut i64,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if is_utc > 1 || !valid_mut_slice(out_scalars, 2) {
+                return DECLINE as i32;
+            }
+            let Some(releasedate) = (unsafe { valid_slice(releasedate_ptr, releasedate_len) })
+            else {
+                return DECLINE as i32;
+            };
+
+            let scalars = unsafe { slice::from_raw_parts_mut(out_scalars, 2) };
+            if releasedate.is_empty() || releasedate == b"0" {
+                scalars[0] = 1;
+                scalars[1] = 0;
+                return 0;
+            }
+            if is_utc == 0 {
+                return DECLINE as i32;
+            }
+            let Some((ts, _)) = parse_iso_datetime_utc(releasedate) else {
+                return DECLINE as i32;
+            };
+            if ts == 0 {
+                scalars[0] = 1;
+                scalars[1] = 0;
+            } else {
+                scalars[0] = 0;
+                scalars[1] = ts;
+            }
+            0
+        }))
+        .unwrap_or(DECLINE as i32)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn admin_movie_helpers_contract() {
+            assert_eq!(
+                unsafe { nntmux_admin_movie_is_numeric_imdb_id(b"0133093".as_ptr(), 7) },
+                1
+            );
+            assert_eq!(
+                unsafe { nntmux_admin_movie_is_numeric_imdb_id(b" 1234567\n".as_ptr(), 9) },
+                1
+            );
+            assert_eq!(
+                unsafe { nntmux_admin_movie_is_numeric_imdb_id(b"tt0133093".as_ptr(), 9) },
+                0
+            );
+            assert_eq!(
+                unsafe { nntmux_admin_movie_is_numeric_imdb_id(b"".as_ptr(), 0) },
+                0
+            );
+
+            let mut lens = [0usize; 2];
+            let mut buf = [0u8; 64];
+            let rc = unsafe {
+                nntmux_admin_movie_build_image_keys(
+                    b"0133093".as_ptr(),
+                    7,
+                    lens.as_mut_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(rc, 29);
+            assert_eq!(lens, [13, 16]);
+            assert_eq!(&buf[..rc as usize], b"0133093-cover0133093-backdrop");
+
+            let mut flags = [0i64; 2];
+            assert_eq!(
+                unsafe { nntmux_admin_movie_normalize_update_flags(2, 0, flags.as_mut_ptr()) },
+                0
+            );
+            assert_eq!(flags, [1, 0]);
+        }
+
+        #[test]
+        fn admin_shows_helpers_contract() {
+            let mut ids = [0i64; 5];
+            let mut buf = [0u8; 128];
+            let rc = unsafe {
+                nntmux_admin_shows_normalize_preview_ids(
+                    1,
+                    121361,
+                    0,
+                    999,
+                    1,
+                    1399,
+                    1,
+                    1390,
+                    0,
+                    888,
+                    1,
+                    b"0944947".as_ptr(),
+                    7,
+                    ids.as_mut_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(rc, 7);
+            assert_eq!(ids, [121361, 0, 1399, 1390, 0]);
+            assert_eq!(&buf[..rc as usize], b"0944947");
+
+            let mut lens = [0usize; 2];
+            let rc_flash = unsafe {
+                nntmux_admin_shows_format_create_flash(
+                    1,
+                    b"Severance".as_ptr(),
+                    9,
+                    lens.as_mut_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            let expected_msg = "Show \"Severance\" already exists — opened existing record.";
+            assert_eq!(lens, [7, expected_msg.len()]);
+            assert_eq!(rc_flash, (7 + expected_msg.len()) as isize);
+            assert_eq!(&buf[..7], b"warning");
+            assert_eq!(&buf[7..rc_flash as usize], expected_msg.as_bytes());
+        }
+
+        #[test]
+        fn admin_music_console_game_helpers_contract() {
+            let mut music_scalars = [0i64; 5];
+            let mut buf = [0u8; 64];
+            let rc_music = unsafe {
+                nntmux_admin_music_normalize_edit_fields(
+                    b"42".as_ptr(),
+                    2,
+                    b"2024-02-29".as_ptr(),
+                    10,
+                    1,
+                    b"7".as_ptr(),
+                    1,
+                    music_scalars.as_mut_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(rc_music, 19);
+            assert_eq!(music_scalars, [1, 42, 0, 1, 7]);
+            assert_eq!(&buf[..19], b"2024-02-29 00:00:00");
+
+            let mut console_scalars = [0i64; 4];
+            let rc_console = unsafe {
+                nntmux_admin_console_normalize_edit_fields(
+                    b"0015".as_ptr(),
+                    4,
+                    b"2024-02-29 00:00:00".as_ptr(),
+                    19,
+                    1,
+                    1,
+                    console_scalars.as_mut_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(rc_console, 4);
+            assert_eq!(console_scalars, [1, 0, 1_709_164_800, 1]);
+            assert_eq!(&buf[..4], b"0015");
+
+            assert_eq!(
+                unsafe {
+                    nntmux_admin_game_normalize_search_term(
+                        b"0".as_ptr(),
+                        1,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                0
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_admin_game_normalize_search_term(
+                        b"Halo".as_ptr(),
+                        4,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                4
+            );
+            assert_eq!(&buf[..4], b"Halo");
+
+            let mut game_scalars = [0i64; 2];
+            assert_eq!(
+                unsafe {
+                    nntmux_admin_game_parse_release_timestamp(
+                        b"2024-02-29".as_ptr(),
+                        10,
+                        1,
+                        game_scalars.as_mut_ptr(),
+                    )
+                },
+                0
+            );
+            assert_eq!(game_scalars, [0, 1_709_164_800]);
+        }
+
+        #[test]
+        fn abi_safety_null_unaligned_invalid_flags_and_undersized_buffers() {
+            let mut raw = [0u8; 64];
+            let unaligned_usize = unsafe { raw.as_mut_ptr().add(1) as *mut usize };
+            let unaligned_i64 = unsafe { raw.as_mut_ptr().add(1) as *mut i64 };
+            let mut small = [b'Z'; 4];
+            let mut lens2 = [0usize; 2];
+            let mut ids5 = [0i64; 5];
+            let mut scalars4 = [0i64; 4];
+
+            assert_eq!(
+                unsafe { nntmux_admin_movie_is_numeric_imdb_id(std::ptr::null(), 5) },
+                DECLINE as i32
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_admin_movie_build_image_keys(
+                        b"123".as_ptr(),
+                        3,
+                        unaligned_usize,
+                        small.as_mut_ptr(),
+                        small.len(),
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_admin_movie_build_image_keys(
+                        b"123".as_ptr(),
+                        3,
+                        lens2.as_mut_ptr(),
+                        small.as_mut_ptr(),
+                        small.len(),
+                    )
+                },
+                -21
+            );
+            assert_eq!(small, [b'Z'; 4]);
+
+            assert_eq!(
+                unsafe { nntmux_admin_movie_normalize_update_flags(1, 1, unaligned_i64) },
+                DECLINE as i32
+            );
+
+            assert_eq!(
+                unsafe {
+                    nntmux_admin_shows_normalize_preview_ids(
+                        2,
+                        1,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        1,
+                        b"0944947".as_ptr(),
+                        7,
+                        ids5.as_mut_ptr(),
+                        small.as_mut_ptr(),
+                        small.len(),
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_admin_shows_normalize_preview_ids(
+                        1,
+                        1,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        1,
+                        b"0944947".as_ptr(),
+                        7,
+                        ids5.as_mut_ptr(),
+                        small.as_mut_ptr(),
+                        small.len(),
+                    )
+                },
+                -7
+            );
+            assert_eq!(small, [b'Z'; 4]);
+
+            assert_eq!(
+                unsafe {
+                    nntmux_admin_shows_format_create_flash(
+                        0,
+                        b"Lost".as_ptr(),
+                        4,
+                        lens2.as_mut_ptr(),
+                        small.as_mut_ptr(),
+                        small.len(),
+                    )
+                },
+                -41
+            );
+            assert_eq!(small, [b'Z'; 4]);
+
+            assert_eq!(
+                unsafe {
+                    nntmux_admin_music_normalize_edit_fields(
+                        b"10".as_ptr(),
+                        2,
+                        b"2024-01-02".as_ptr(),
+                        10,
+                        1,
+                        b"3".as_ptr(),
+                        1,
+                        ids5.as_mut_ptr(),
+                        small.as_mut_ptr(),
+                        small.len(),
+                    )
+                },
+                -19
+            );
+            assert_eq!(small, [b'Z'; 4]);
+
+            assert_eq!(
+                unsafe {
+                    nntmux_admin_console_normalize_edit_fields(
+                        b"12345".as_ptr(),
+                        5,
+                        b"".as_ptr(),
+                        0,
+                        1,
+                        1,
+                        scalars4.as_mut_ptr(),
+                        small.as_mut_ptr(),
+                        small.len(),
+                    )
+                },
+                -5
+            );
+            assert_eq!(small, [b'Z'; 4]);
+
+            assert_eq!(
+                unsafe {
+                    nntmux_admin_game_normalize_search_term(
+                        b"Quake".as_ptr(),
+                        5,
+                        small.as_mut_ptr(),
+                        small.len(),
+                    )
+                },
+                -5
+            );
+            assert_eq!(small, [b'Z'; 4]);
+
+            assert_eq!(
+                unsafe {
+                    nntmux_admin_game_parse_release_timestamp(
+                        b"2024-01-02".as_ptr(),
+                        10,
+                        2,
+                        unaligned_i64,
+                    )
+                },
+                DECLINE as i32
+            );
+        }
+    }
+}
