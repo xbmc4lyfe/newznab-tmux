@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Http\Controllers\Admin;
 
 use App\Http\Controllers\BasePageController;
+use App\Http\Controllers\GetNzbController;
 use App\Http\Requests\Admin\AdminLogFacetsRequest;
 use App\Http\Requests\Admin\AdminLogFileRequest;
 use App\Http\Requests\Admin\AdminLogSearchRequest;
@@ -26,6 +27,58 @@ use Symfony\Component\HttpFoundation\BinaryFileResponse;
 
 class AdminLogViewerController extends BasePageController
 {
+    // Keep PHP as the production default until the Rust performance gate passes.
+    private static bool $useRustFfi = false;
+
+    public const string FFI_CDEF = GetNzbController::FFI_CDEF;
+
+    public static function setUseRustFfi(?bool $useRustFfi): void
+    {
+        self::$useRustFfi = $useRustFfi ?? false;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    /** @return array{initialFile: string, delete_guard_minutes: int, max_results_per_file: int} */
+    public static function logViewerState(string $selected, string $firstPath, int $guard, int $max): array
+    {
+        return self::$useRustFfi ? self::logViewerStateNative($selected, $firstPath, $guard, $max) : self::logViewerStatePhp($selected, $firstPath, $guard, $max);
+    }
+
+    /** @return array{initialFile: string, delete_guard_minutes: int, max_results_per_file: int} */
+    public static function logViewerStatePhp(string $selected, string $firstPath, int $guard, int $max): array
+    {
+        return ['initialFile' => $selected !== '' ? $selected : $firstPath, 'delete_guard_minutes' => max(0, $guard), 'max_results_per_file' => max(1, $max)];
+    }
+
+    /** @return array{initialFile: string, delete_guard_minutes: int, max_results_per_file: int} */
+    public static function logViewerStateNative(string $selected, string $firstPath, int $guard, int $max): array
+    {
+        $result = GetNzbController::transformNative(9, [$selected, $firstPath, $guard, $max]);
+
+        return is_array($result) ? $result : self::logViewerStatePhp($selected, $firstPath, $guard, $max);
+    }
+
+    public static function deleteConflictMessage(int $guardMinutes): string
+    {
+        return self::$useRustFfi ? self::deleteConflictMessageNative($guardMinutes) : self::deleteConflictMessagePhp($guardMinutes);
+    }
+
+    public static function deleteConflictMessagePhp(int $guardMinutes): string
+    {
+        return "This log was written to in the last {$guardMinutes} minutes and is probably still open by a running process. Truncate it instead.";
+    }
+
+    public static function deleteConflictMessageNative(int $guardMinutes): string
+    {
+        $result = GetNzbController::transformNative(10, [$guardMinutes]);
+
+        return is_string($result) ? $result : self::deleteConflictMessagePhp($guardMinutes);
+    }
+
     private const int JSON_OPTIONS = JSON_INVALID_UTF8_SUBSTITUTE | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE;
 
     public function index(AdminLogViewerRequest $request, LogFileRepository $logs, LogSearchCoordinator $searcher): View|RedirectResponse
@@ -44,7 +97,7 @@ class AdminLogViewerController extends BasePageController
 
         return view('admin.logs.index', [
             'files' => $files,
-            'initialFile' => $selectedPath !== '' ? $selectedPath : ($files[0]['path'] ?? ''),
+            'initialFile' => self::logViewerState($selectedPath, $files[0]['path'] ?? '', 0, 1)['initialFile'],
             'initialQuery' => (string) ($request->validated('q') ?? ''),
             'engine' => $searcher->engine(),
             'levels' => LogEntryParser::LEVELS,
@@ -118,7 +171,7 @@ class AdminLogViewerController extends BasePageController
             $request->searchQuery(),
             $this->requestedFiles($request, $logs),
             $before === null ? null : (int) $before,
-            max(1, (int) config('nntmux.log_viewer.max_results_per_file', 100)),
+            self::logViewerState('', '', 0, (int) config('nntmux.log_viewer.max_results_per_file', 100))['max_results_per_file'],
         ));
     }
 
@@ -164,7 +217,7 @@ class AdminLogViewerController extends BasePageController
 
         if ($file->isActive($guardMinutes)) {
             return $this->json([
-                'message' => "This log was written to in the last {$guardMinutes} minutes and is probably still open by a running process. Truncate it instead.",
+                'message' => self::deleteConflictMessage($guardMinutes),
             ], 409);
         }
 
@@ -217,7 +270,7 @@ class AdminLogViewerController extends BasePageController
 
     private function guardMinutes(): int
     {
-        return max(0, (int) config('nntmux.log_viewer.delete_guard_minutes', 10));
+        return self::logViewerState('', '', (int) config('nntmux.log_viewer.delete_guard_minutes', 10), 1)['delete_guard_minutes'];
     }
 
     private function audit(Request $request, string $message, LogFile $file): void

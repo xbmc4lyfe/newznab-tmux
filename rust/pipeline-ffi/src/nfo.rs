@@ -20175,3 +20175,508 @@ pub unsafe extern "C" fn nntmux_w27_browse_nfo_contact_status_controllers(
     }))
     .unwrap_or(-1)
 }
+
+/// Wave 28.2 pure controller assembly. PHP owns models, URLs, escaping and dates.
+pub mod wave28_nzb_movie_log_dashboard_controllers {
+    use super::*;
+    use VerificationOutboxValue as V;
+    const MAX_BYTES: usize = 67_108_864;
+
+    fn project(row: &V, fields: &[&str]) -> Option<V> {
+        Some(w16_map(
+            fields
+                .iter()
+                .map(|name| Some((*name, row.field(name.as_bytes())?.clone())))
+                .collect::<Option<Vec<_>>>()?,
+        ))
+    }
+
+    fn rows(value: &V, fields: &[&str], reindex: bool) -> Option<V> {
+        let entries = w16_entries(value)?;
+        Some(V::Array(
+            entries
+                .iter()
+                .enumerate()
+                .map(|(i, (key, row))| {
+                    Some((
+                        if reindex {
+                            V::Int(i as i64)
+                        } else {
+                            key.clone()
+                        },
+                        project(row, fields)?,
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()?,
+        ))
+    }
+
+    fn bytes(value: &V) -> Option<&[u8]> {
+        if let V::Bytes(bytes) = value {
+            Some(bytes)
+        } else {
+            None
+        }
+    }
+
+    fn replace(input: &[u8], needle: &[u8], replacement: &[u8], insensitive: bool) -> Option<V> {
+        let mut out = Vec::with_capacity(input.len());
+        let mut i = 0;
+        while i < input.len() {
+            let found = input.get(i..i + needle.len()).is_some_and(|part| {
+                if insensitive {
+                    part.eq_ignore_ascii_case(needle)
+                } else {
+                    part == needle
+                }
+            });
+            let part = if found { replacement } else { &input[i..i + 1] };
+            if out.len().checked_add(part.len())? > MAX_BYTES {
+                return None;
+            }
+            out.extend_from_slice(part);
+            i += if found { needle.len() } else { 1 };
+        }
+        Some(w16_string(&out))
+    }
+
+    fn stripslashes(input: &[u8]) -> V {
+        let mut out = Vec::with_capacity(input.len());
+        let mut i = 0;
+        while i < input.len() {
+            if input[i] == b'\\' {
+                i += 1;
+                if i == input.len() {
+                    break;
+                }
+                out.push(if input[i] == b'0' { 0 } else { input[i] });
+            } else {
+                out.push(input[i]);
+            }
+            i += 1;
+        }
+        w16_string(&out)
+    }
+
+    fn percent_encode(input: &[u8]) -> Vec<u8> {
+        let mut output = Vec::new();
+        const HEX: &[u8] = b"0123456789ABCDEF";
+        for byte in input {
+            if byte.is_ascii_alphanumeric() || b"-._~".contains(byte) {
+                output.push(*byte);
+            } else {
+                output.extend_from_slice(&[
+                    b'%',
+                    HEX[(byte >> 4) as usize],
+                    HEX[(byte & 15) as usize],
+                ]);
+            }
+        }
+        output
+    }
+
+    fn compute(operation: u32, args: &[V]) -> Option<V> {
+        Some(match (operation, args) {
+            (0, [V::Bytes(id)]) => replace(id, b".nzb", b"", true)?,
+            (1, [V::Bytes(id), V::Int(requests), V::Int(maximum)]) => {
+                let guids: Vec<_> = id.split(|b| *b == b',').map(w16_string).collect();
+                let count = i64::try_from(guids.len()).ok()?;
+                // PHP promotes overflowing integer addition to double before comparison.
+                let exceeded = requests.checked_add(count).map_or_else(
+                    || (*requests as f64 + count as f64) > *maximum as f64,
+                    |sum| sum > *maximum,
+                );
+                w16_map(vec![("guids", w16_list(guids)), ("count", V::Int(count)), ("exceeded", V::Bool(exceeded))])
+            }
+            (2, [V::Bytes(contents), V::Int(uid)]) => {
+                let prefix = format!("file poster=\"{uid}-");
+                replace(contents, b"file poster=\"", prefix.as_bytes(), false)?
+            }
+            (3, [values]) => {
+                let mut fields = vec![
+                    ("Content-Type", w16_string(b"application/x-nzb")),
+                    ("Expires", w16_string(bytes(values.field(b"expires")?)?)),
+                    ("X-DNZB-Failure", w16_string(bytes(values.field(b"failure_url")?)?)),
+                    ("X-DNZB-Category", w16_string(bytes(values.field(b"category")?)?)),
+                    ("X-DNZB-Details", w16_string(bytes(values.field(b"details_url")?)?)),
+                ];
+                let imdb = values.field(b"imdb_url")?;
+                let tvdb = values.field(b"tvdb_url")?;
+                let more = if matches!(imdb, V::Null) { tvdb } else { imdb };
+                if !matches!(more, V::Null) { fields.push(("X-DNZB-MoreInfo", w16_string(bytes(more)?))); }
+                let nfo = values.field(b"nfo_url")?;
+                if !matches!(nfo, V::Null) { fields.push(("X-DNZB-NFO", w16_string(bytes(nfo)?))); }
+                fields.extend([("X-DNZB-RCode", w16_string(b"200")), ("X-DNZB-RText", w16_string(b"OK, NZB content follows."))]);
+                w16_map(fields)
+            }
+            (4, [V::Int(category), V::Bytes(title), V::Bytes(actors), V::Bytes(director), V::Int(rating), V::Bytes(genre), V::Int(year), genres, V::Int(next_year)]) => {
+                let genre_entries = w16_entries(genres)?;
+                let span = next_year.abs_diff(1903);
+                if span > 65_000 { return None; }
+                // PHP range also descends if its endpoint precedes 1903; rsort always descends.
+                let lo = (*next_year).min(1903);
+                let hi = (*next_year).max(1903);
+                let years = w16_list((lo..=hi).rev().map(V::Int).collect());
+                w16_map(vec![
+                    ("categories", w16_list(if *category == -1 { vec![] } else { vec![V::Int(*category)] })),
+                    ("title", stripslashes(title)), ("actors", stripslashes(actors)), ("director", stripslashes(director)),
+                    ("ratings", w16_list((1..=9).map(V::Int).collect())),
+                    ("rating", if (1..=9).contains(rating) { V::Int(*rating) } else { w16_string(b"") }),
+                    ("genres", genres.clone()),
+                    ("genre", if genre_entries.iter().any(|(_, v)| matches!(v, V::Bytes(b) if b == genre)) { w16_string(genre) } else { w16_string(b"") }),
+                    ("years", years), ("year", if (lo..=hi).contains(year) { V::Int(*year) } else { w16_string(b"") }),
+                ])
+            }
+            (5, [movie, V::Bytes(imdbid)]) => {
+                let mut fields = w16_entries(movie)?.to_vec();
+                for (name, fallback) in [("title", b"Unknown Title".as_slice()), ("imdbid", imdbid.as_slice())] {
+                    let key = w16_string(name.as_bytes());
+                    if let Some((_, value)) = fields.iter_mut().find(|(k, _)| w16_equal(k, &key)) {
+                        if !w18_php_bool(value)? { *value = w16_string(fallback); }
+                    } else { fields.push((key, w16_string(fallback))); }
+                }
+                V::Array(fields)
+            }
+            (6, [movie]) => {
+                w16_entries(movie)?;
+                w16_map(["imdbid", "videos_id", "musicinfo_id", "consoleinfo_id", "bookinfo_id", "gamesinfo_id", "anidbid"].iter().filter_map(|name| movie.field(name.as_bytes()).map(|v| (*name, v.clone()))).collect())
+            }
+            (7, [V::Bytes(id)]) => V::Bool(!id.is_empty() && id.iter().all(u8::is_ascii_digit)),
+            (8, [V::Bytes(guid), V::Bytes(name), files]) => w16_map(vec![
+                ("release", w16_map(vec![("guid", w16_string(guid)), ("searchname", w16_string(name))])),
+                ("files", files.clone()), ("total", V::Int(w16_entries(files)?.len() as i64)),
+            ]),
+            (9, [V::Bytes(selected), V::Bytes(first), V::Int(guard), V::Int(max)]) => w16_map(vec![
+                ("initialFile", w16_string(if selected.is_empty() { first } else { selected })),
+                ("delete_guard_minutes", V::Int((*guard).max(0))), ("max_results_per_file", V::Int((*max).max(1))),
+            ]),
+            (10, [V::Int(guard)]) => w16_string(format!("This log was written to in the last {guard} minutes and is probably still open by a running process. Truncate it instead.").as_bytes()),
+            (11, [input]) => rows(input, &["name", "slug", "check_type", "status", "status_label", "uptime_percentage"], true)?,
+            (12, [input]) => rows(input, &["id", "title", "impact", "impact_label", "started_at", "started_at_human", "is_auto", "services"], true)?,
+            (13, [input, V::Bool(human_only)]) => {
+                let mut result = rows(input, &["type", "message", "icon", "icon_bg", "icon_color", "created_at", "created_at_human", "username", "metadata"], false)?;
+                if *human_only {
+                    if let V::Array(entries) = &mut result {
+                        for (_, row) in entries {
+                            let human = row.field(b"created_at_human")?.clone();
+                            if let V::Array(fields) = row {
+                                for (key, value) in fields.iter_mut() {
+                                    if matches!(key, V::Bytes(b) if b == b"created_at") { *value = human.clone(); }
+                                }
+                                fields.retain(|(key, _)| !matches!(key, V::Bytes(b) if b == b"created_at_human"));
+                            }
+                        }
+                    }
+                }
+                result
+            }
+            (14, [V::Null]) => V::Null,
+            (14, [period]) => project(period, &["id", "name", "starts_at", "ends_at"])?,
+            (15, [V::Bytes(range)]) => {
+                let daily = range == b"30d";
+                w16_map(vec![("daily", V::Bool(daily)), ("count", V::Int(if daily { 30 } else { 24 }))])
+            }
+            (16, [V::Bytes(id), V::Int(uid), token @ (V::Null | V::Bytes(_))]) => {
+                let mut query = b"guid=".to_vec();
+                query.extend_from_slice(&percent_encode(id));
+                query.extend_from_slice(format!("&userid={uid}").as_bytes());
+                if let V::Bytes(token) = token {
+                    if !token.is_empty() {
+                        query.extend_from_slice(b"&api_token=");
+                        query.extend_from_slice(&percent_encode(token));
+                    }
+                }
+                if query.len() > MAX_BYTES { return None; }
+                w16_string(&query)
+            }
+            _ => return None,
+        })
+    }
+
+    pub(super) unsafe fn evaluate(
+        operation: u32,
+        input: *const u8,
+        length: usize,
+        output: *mut u8,
+        capacity: usize,
+    ) -> i32 {
+        if !nfo_abi_range(input, length, false)
+            || !nfo_abi_range(output, capacity, false)
+            || length > MAX_BYTES
+            || capacity > MAX_BYTES
+            || yenc_ranges_overlap(input as usize, length, output as usize, capacity)
+        {
+            return -1;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, length) };
+        let mut parser = VerificationOutboxParser {
+            bytes,
+            pos: 0,
+            remaining: 65_536,
+        };
+        let Some(value) = parser.value(480) else {
+            return -1;
+        };
+        if parser.pos != length || !w19_list(&value) || !w20_canonical(&value) {
+            return -1;
+        }
+        let mut canonical = Vec::new();
+        value.serialize(&mut canonical);
+        if canonical != bytes {
+            return -1;
+        }
+        let Some(entries) = w16_entries(&value) else {
+            return -1;
+        };
+        let args: Vec<_> = entries.iter().map(|(_, v)| v.clone()).collect();
+        let Some(result) = compute(operation, &args) else {
+            return -1;
+        };
+        let mut wire = Vec::new();
+        result.serialize(&mut wire);
+        if wire.len() > MAX_BYTES {
+            return -1;
+        }
+        let Ok(needed) = i32::try_from(wire.len()) else {
+            return -1;
+        };
+        if wire.len() > capacity {
+            return -needed;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(wire.as_ptr(), output, wire.len()) };
+        needed
+    }
+
+    #[cfg(test)]
+    mod w28_nzb_movie_log_dashboard_controllers_tests {
+        use super::*;
+
+        fn parity(op: u32, args: Vec<V>, expected: V) {
+            let mut input = vec![0x5a];
+            w16_list(args).serialize(&mut input);
+            input.push(0x5a);
+            let mut wire = Vec::new();
+            expected.serialize(&mut wire);
+            let mut out = vec![0xa5; wire.len() + 3];
+            for cap in [0, 1, wire.len() - 1, wire.len(), wire.len() + 1] {
+                out.fill(0xa5);
+                let result = unsafe {
+                    nntmux_w28_nzb_movie_log_dashboard_controllers(
+                        op,
+                        input.as_ptr().add(1),
+                        input.len() - 2,
+                        out.as_mut_ptr().add(1),
+                        cap,
+                    )
+                };
+                if cap < wire.len() {
+                    assert_eq!(result, -(wire.len() as i32));
+                    assert!(out.iter().all(|b| *b == 0xa5));
+                } else {
+                    assert_eq!(result, wire.len() as i32);
+                    assert_eq!(&out[1..1 + wire.len()], &wire);
+                    assert_eq!(out[0], 0xa5);
+                    assert!(out[1 + wire.len()..].iter().all(|b| *b == 0xa5));
+                }
+            }
+            assert_eq!(input[0], 0x5a);
+            assert_eq!(input[input.len() - 1], 0x5a);
+        }
+
+        #[test]
+        fn w28_nzb_movie_log_dashboard_controllers_nzb_and_movie_boundaries() {
+            parity(
+                0,
+                vec![w16_string(b"a.NzB.nzb\0\xff")],
+                w16_string(b"a\0\xff"),
+            );
+            for (requests, maximum, exceeded) in
+                [(2, 5, false), (3, 5, true), (i64::MAX, i64::MAX, false)]
+            {
+                parity(
+                    1,
+                    vec![w16_string(b"a,,"), V::Int(requests), V::Int(maximum)],
+                    w16_map(vec![
+                        (
+                            "guids",
+                            w16_list(vec![w16_string(b"a"), w16_string(b""), w16_string(b"")]),
+                        ),
+                        ("count", V::Int(3)),
+                        ("exceeded", V::Bool(exceeded)),
+                    ]),
+                );
+            }
+            parity(
+                2,
+                vec![
+                    w16_string(b"file poster=\"a\0\xff file poster=\"b"),
+                    V::Int(-3),
+                ],
+                w16_string(b"file poster=\"-3-a\0\xff file poster=\"-3-b"),
+            );
+            parity(
+                5,
+                vec![
+                    w16_map(vec![
+                        ("title", w16_string(b"0")),
+                        ("imdbid", V::Int(0)),
+                        ("keep", V::Bool(false)),
+                    ]),
+                    w16_string(b"0012345"),
+                ],
+                w16_map(vec![
+                    ("title", w16_string(b"Unknown Title")),
+                    ("imdbid", w16_string(b"0012345")),
+                    ("keep", V::Bool(false)),
+                ]),
+            );
+            parity(
+                6,
+                vec![w16_map(vec![
+                    ("cover", V::Int(1)),
+                    ("imdbid", V::Null),
+                    ("videos_id", V::Int(5)),
+                ])],
+                w16_map(vec![("imdbid", V::Null), ("videos_id", V::Int(5))]),
+            );
+            for (id, valid) in [
+                (b"123".as_slice(), true),
+                (b"", false),
+                (b"1e3", false),
+                (b" 1", false),
+                (b"-1", false),
+                (b"\xff", false),
+            ] {
+                parity(7, vec![w16_string(id)], V::Bool(valid));
+            }
+            assert!(matches!(stripslashes(b"a\\q\\0\\\\\\"), V::Bytes(v) if v == b"aq\0\\"));
+        }
+
+        #[test]
+        fn w28_nzb_movie_log_dashboard_controllers_rows_and_windows() {
+            parity(
+                8,
+                vec![
+                    w16_string(b"guid"),
+                    w16_string(b"name"),
+                    w16_list(vec![w16_map(vec![("name", w16_string(b"a\0\xff"))])]),
+                ],
+                w16_map(vec![
+                    (
+                        "release",
+                        w16_map(vec![
+                            ("guid", w16_string(b"guid")),
+                            ("searchname", w16_string(b"name")),
+                        ]),
+                    ),
+                    (
+                        "files",
+                        w16_list(vec![w16_map(vec![("name", w16_string(b"a\0\xff"))])]),
+                    ),
+                    ("total", V::Int(1)),
+                ]),
+            );
+            parity(
+                9,
+                vec![w16_string(b""), w16_string(b"first"), V::Int(-1), V::Int(0)],
+                w16_map(vec![
+                    ("initialFile", w16_string(b"first")),
+                    ("delete_guard_minutes", V::Int(0)),
+                    ("max_results_per_file", V::Int(1)),
+                ]),
+            );
+            parity(14, vec![V::Null], V::Null);
+            for op in [11, 12] {
+                parity(op, vec![w16_list(vec![])], w16_list(vec![]));
+            }
+            parity(13, vec![w16_list(vec![]), V::Bool(true)], w16_list(vec![]));
+            for range in [b"24h".as_slice(), b"30d", b"30D", b"", b"\0\xff"] {
+                let daily = range == b"30d";
+                parity(
+                    15,
+                    vec![w16_string(range)],
+                    w16_map(vec![
+                        ("daily", V::Bool(daily)),
+                        ("count", V::Int(if daily { 30 } else { 24 })),
+                    ]),
+                );
+            }
+        }
+
+        #[test]
+        fn w28_nzb_movie_log_dashboard_controllers_malformed_and_range_rejection() {
+            let mut out = [0xa5; 256];
+            for input in [
+                b"a:0:{}x".as_slice(),
+                b"a:00:{}",
+                b"a:1:{i:0;O:8:\"stdClass\":0:{}}",
+                b"a:1:{i:0;R:1;}",
+                b"a:1:{i:0;i:9223372036854775808;}",
+                b"a:1:{i:0;i:+1;}",
+            ] {
+                assert_eq!(
+                    unsafe {
+                        nntmux_w28_nzb_movie_log_dashboard_controllers(
+                            7,
+                            input.as_ptr(),
+                            input.len(),
+                            out.as_mut_ptr(),
+                            out.len(),
+                        )
+                    },
+                    -1
+                );
+                assert!(out.iter().all(|b| *b == 0xa5));
+            }
+            let input = b"a:0:{}";
+            let run = |p, len, o, cap| unsafe {
+                nntmux_w28_nzb_movie_log_dashboard_controllers(15, p, len, o, cap)
+            };
+            for len in [0, 1] {
+                assert_eq!(run(std::ptr::null(), len, out.as_mut_ptr(), out.len()), -1);
+                assert_eq!(
+                    run(input.as_ptr(), input.len(), std::ptr::null_mut(), len),
+                    -1
+                );
+            }
+            for len in [usize::MAX, MAX_BYTES + 1] {
+                assert_eq!(run(input.as_ptr(), len, out.as_mut_ptr(), out.len()), -1);
+                assert_eq!(run(input.as_ptr(), input.len(), out.as_mut_ptr(), len), -1);
+            }
+            assert_eq!(
+                run(usize::MAX as *const u8, 2, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), input.len(), usize::MAX as *mut u8, 2),
+                -1
+            );
+            let p = out.as_mut_ptr();
+            assert_eq!(run(p, 6, p, out.len()), -1);
+            assert_eq!(run(unsafe { p.add(1) }, 6, p, out.len()), -1);
+            assert_eq!(run(p, 6, unsafe { p.add(1) }, out.len() - 1), -1);
+            assert!(out.iter().all(|b| *b == 0xa5));
+        }
+    }
+}
+
+/// Evaluate canonical PHP list arguments. Negative required size never writes output.
+///
+/// # Safety
+/// Both ranges must be live, disjoint readable/writable allocations. Pointers must
+/// be non-null even for zero lengths; arithmetic checks cannot prove provenance.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w28_nzb_movie_log_dashboard_controllers(
+    operation: u32,
+    input: *const u8,
+    length: usize,
+    output: *mut u8,
+    capacity: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        wave28_nzb_movie_log_dashboard_controllers::evaluate(
+            operation, input, length, output, capacity,
+        )
+    }))
+    .unwrap_or(-1)
+}
