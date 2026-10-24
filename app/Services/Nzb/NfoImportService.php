@@ -7,6 +7,8 @@ namespace App\Services\Nzb;
 use App\Exceptions\NfoPayloadRejected;
 use App\Models\Release;
 use App\Services\NfoService;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Support\Facades\Log;
 use RuntimeException;
@@ -14,6 +16,145 @@ use Throwable;
 
 final class NfoImportService
 {
+    public const string FFI_CDEF = <<<'C'
+        intptr_t nntmux_w17_nzb_xml_verification_timing(uint32_t operation, const char *input, size_t length, char *output, size_t capacity);
+        C;
+
+    // Paired common/uncommon mean and p99 must all pass before adoption.
+    private static bool $useRustFfi = false;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    /** Reject objects before serialization can invoke user code; bound cycles. */
+    private static function nativeValueSupported(mixed $value, int &$remaining, int $depth): bool
+    {
+        if (--$remaining < 0 || $depth > 24) {
+            return false;
+        }
+        if (is_array($value)) {
+            foreach ($value as $item) {
+                if (! self::nativeValueSupported($item, $remaining, $depth + 1)) {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        return $value === null || is_scalar($value);
+    }
+
+    /** @param list<mixed> $arguments */
+    private static function computeNative(int $operation, array $arguments): mixed
+    {
+        if (! self::$useRustFfi) {
+            return null;
+        }
+        try {
+            $remaining = 100000;
+            if (! self::nativeValueSupported($arguments, $remaining, 0)) {
+                return null;
+            }
+            $ffi = RustPipelineLibrary::resolveDomain('nfo', self::FFI_CDEF);
+            if ($ffi === null) {
+                return null;
+            }
+            $input = serialize($arguments);
+            $capacity = 0;
+            $output = RustPipelineLibrary::obtainScratch($ffi, max(4096, strlen($input) + 512), $capacity);
+            if ($output === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w17_nzb_xml_verification_timing($operation, $input, strlen($input), $output, $capacity);
+            if (! is_int($written) || $written < 0 || $written > $capacity) {
+                return null;
+            }
+
+            return unserialize(FFI::string($output, $written), ['allowed_classes' => false]);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** @param array<string, mixed> $manifest
+     * @return array{release_id: int, release_guid: string}|null */
+    public static function normalizeManifestEntry(array $manifest): ?array
+    {
+        return self::normalizeManifestEntryNative($manifest) ?? self::normalizeManifestEntryPhp($manifest);
+    }
+
+    /** @param array<string, mixed> $manifest
+     * @return array{release_id: int, release_guid: string}|null */
+    public static function normalizeManifestEntryPhp(array $manifest): ?array
+    {
+        $id = $manifest['release_id'] ?? null;
+        $guid = $manifest['release_guid'] ?? null;
+
+        return is_int($id) && $id > 0 && self::validGuidPhp($guid)
+            ? ['release_id' => $id, 'release_guid' => $guid] : null;
+    }
+
+    /** @param array<string, mixed> $manifest
+     * @return array{release_id: int, release_guid: string}|null */
+    public static function normalizeManifestEntryNative(array $manifest): ?array
+    {
+        $result = self::computeNative(3, [$manifest]);
+
+        return is_array($result) ? $result : null;
+    }
+
+    public static function validGuid(mixed $guid): bool
+    {
+        return self::validGuidNative($guid) ?? self::validGuidPhp($guid);
+    }
+
+    public static function validGuidPhp(mixed $guid): bool
+    {
+        return is_string($guid) && $guid !== '';
+    }
+
+    public static function validGuidNative(mixed $guid): ?bool
+    {
+        $result = self::computeNative(4, [$guid]);
+
+        return is_bool($result) ? $result : null;
+    }
+
+    /** @param array<array-key, mixed> $entries
+     * @return array{imported: int, failed: int, skipped: int} */
+    public static function importSummary(array $entries): array
+    {
+        return self::importSummaryNative($entries) ?? self::importSummaryPhp($entries);
+    }
+
+    /** @param array<array-key, mixed> $entries
+     * @return array{imported: int, failed: int, skipped: int} */
+    public static function importSummaryPhp(array $entries): array
+    {
+        $summary = ['imported' => 0, 'failed' => 0, 'skipped' => 0];
+        foreach ($entries as $entry) {
+            $status = is_array($entry) ? ($entry['status'] ?? null) : null;
+            if (is_string($status) && array_key_exists($status, $summary)) {
+                $summary[$status]++;
+            }
+        }
+
+        return $summary;
+    }
+
+    /** @param array<array-key, mixed> $entries
+     * @return array{imported: int, failed: int, skipped: int}|null */
+    public static function importSummaryNative(array $entries): ?array
+    {
+        $result = self::computeNative(5, [$entries]);
+
+        return is_array($result) ? $result : null;
+    }
+
     public function __construct(
         private readonly Filesystem $filesystem,
         private readonly NzbUploadManifestService $manifests,
@@ -84,12 +225,13 @@ final class NfoImportService
                 throw new RuntimeException('Companion input is missing');
             }
 
-            $releaseId = $manifest['release_id'] ?? null;
-            $releaseGuid = $manifest['release_guid'] ?? null;
-            if (! is_int($releaseId) || $releaseId <= 0 || ! is_string($releaseGuid) || $releaseGuid === '') {
+            $identity = self::normalizeManifestEntry($manifest);
+            if ($identity === null) {
                 throw new RuntimeException('Upload manifest has no valid release identity');
             }
 
+            $releaseId = $identity['release_id'];
+            $releaseGuid = $identity['release_guid'];
             $releaseExists = Release::query()
                 ->whereKey($releaseId)
                 ->where('guid', $releaseGuid)

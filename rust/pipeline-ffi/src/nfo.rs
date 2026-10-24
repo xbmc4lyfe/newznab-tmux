@@ -14240,3 +14240,304 @@ mod wave16_publish_tests {
         );
     }
 }
+
+// Wave 17 worker 2: pure XML policy, import identity, batch arithmetic and timing.
+// PHP retains DOM traversal, clocks, leases, persistence and diagnostic emission.
+fn w17_number(value: &VerificationOutboxValue) -> Option<f64> {
+    match value {
+        VerificationOutboxValue::Int(n) => Some(*n as f64),
+        VerificationOutboxValue::Float(bytes) => {
+            let n: f64 = std::str::from_utf8(bytes).ok()?.parse().ok()?;
+            n.is_finite().then_some(n)
+        }
+        _ => None,
+    }
+}
+
+fn w17_compute(op: u32, args: &[VerificationOutboxValue]) -> Option<VerificationOutboxValue> {
+    use VerificationOutboxValue as V;
+    let arity = match op {
+        0 | 7 | 12 | 13 | 14 => 2,
+        1 | 8 | 10 => 3,
+        2..=6 | 11 => 1,
+        9 => 4,
+        _ => return None,
+    };
+    if args.len() != arity {
+        return None;
+    }
+    let a = |i: usize| args.get(i);
+    let int = |i| w16_int(a(i)?);
+    let bytes = |i| w16_bytes(a(i)?);
+    let boolean = |i| w16_bool(a(i)?);
+    Some(match op {
+        0 => V::Bool(
+            bytes(0)? == b"nzb"
+                && matches!(bytes(1)?, b"" | b"http://www.newzbin.com/DTD/2003/nzb"),
+        ),
+        1 => V::Bool(!boolean(2)? && (int(0)? <= 1 || !boolean(1)?)),
+        2 => V::Bool(bytes(0)? == b"password"),
+        3 => {
+            w16_entries(a(0)?)?;
+            let id = a(0)?.field(b"release_id").and_then(w16_int);
+            let guid = a(0)?.field(b"release_guid").and_then(w16_bytes);
+            match (id, guid) {
+                (Some(id), Some(guid)) if id > 0 && !guid.is_empty() => w16_map(vec![
+                    ("release_id", V::Int(id)),
+                    ("release_guid", w16_string(guid)),
+                ]),
+                _ => V::Null,
+            }
+        }
+        4 => V::Bool(matches!(a(0)?, V::Bytes(guid) if !guid.is_empty())),
+        5 => {
+            let mut counts = [0_i64; 3];
+            for (_, entry) in w16_entries(a(0)?)? {
+                let index = match entry.field(b"status").and_then(w16_bytes) {
+                    Some(b"imported") => 0,
+                    Some(b"failed") => 1,
+                    Some(b"skipped") => 2,
+                    _ => continue,
+                };
+                counts[index] = counts[index].checked_add(1)?;
+            }
+            w16_map(vec![
+                ("imported", V::Int(counts[0])),
+                ("failed", V::Int(counts[1])),
+                ("skipped", V::Int(counts[2])),
+            ])
+        }
+        6 => V::Bool(int(0)? > 0),
+        7 => V::Bool(int(0)? >= int(1)?),
+        8 => {
+            let now = w17_number(a(1)?)?;
+            let start = w17_number(a(2)?)?;
+            let elapsed = now - start;
+            if !elapsed.is_finite() {
+                return None;
+            }
+            let rate = (int(0)? as f64) / elapsed.max(0.001);
+            if !rate.is_finite() {
+                return None;
+            }
+            V::Float(rate.to_string().into_bytes())
+        }
+        9 => {
+            // Wider subtraction preserves PHP's positive overflow case without wrapping.
+            let remaining = (int(0)? as i128) - (int(1)? as i128);
+            V::Int(if remaining < 1 {
+                0
+            } else {
+                remaining
+                    .min(int(2)?.clamp(1, 16) as i128)
+                    .min(int(3)?.max(1) as i128) as i64
+            })
+        }
+        10 => V::Int(int(0)?.checked_add(int(1)?)?.checked_sub(int(2)?)?),
+        11 => {
+            let mut total = 0_i64;
+            for (_, value) in w16_entries(a(0)?)? {
+                total = total.checked_add(w16_int(value)?)?;
+            }
+            let lock = match a(0)?.field(b"state_lock_acquisition") {
+                Some(v) => w16_int(v)?,
+                None => 0,
+            };
+            w16_map(vec![
+                ("total_ns", V::Int(total)),
+                (
+                    "callback_after_state_lock_ns",
+                    V::Int(total.checked_sub(lock)?),
+                ),
+            ])
+        }
+        12 => {
+            let phase = bytes(0)?;
+            match a(1)? {
+                V::Null => w16_string(phase),
+                V::Bytes(parent) if parent.is_empty() => w16_string(phase),
+                V::Bytes(parent) => {
+                    let capacity = parent.len().checked_add(1)?.checked_add(phase.len())?;
+                    if capacity > isize::MAX as usize {
+                        return None;
+                    }
+                    let mut key = Vec::with_capacity(capacity);
+                    key.extend_from_slice(parent);
+                    key.push(b'.');
+                    key.extend_from_slice(phase);
+                    V::Bytes(key)
+                }
+                _ => return None,
+            }
+        }
+        13 => {
+            let success = boolean(0)?;
+            let failure = bytes(1)?;
+            w16_string(if success { b"success" } else { failure })
+        }
+        14 => V::Bool(bytes(0)? == bytes(1)?),
+        _ => return None,
+    })
+}
+
+/// PHP scalar/array wire protocol. Returns -1 on invalid input, -required on a
+/// short output (no writes), or the positive number of output bytes written.
+/// A null output with zero capacity is a size query. Objects/references decline.
+/// # Safety
+/// Non-null ranges must refer to live readable/writable allocations respectively.
+/// Allocation ownership cannot be established from an arbitrary raw pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w17_nzb_xml_verification_timing(
+    operation: u32,
+    input: *const u8,
+    length: usize,
+    output: *mut u8,
+    capacity: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        // Validate length/address arithmetic and disjointness before any slice.
+        if length > 64 * 1024 * 1024
+            || !yenc_valid_range(input as usize, length)
+            || !(output.is_null() && capacity == 0 || yenc_valid_range(output as usize, capacity))
+            || yenc_ranges_overlap(input as usize, length, output as usize, capacity)
+        {
+            return -1;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, length) };
+        let mut parser = VerificationOutboxParser {
+            bytes,
+            pos: 0,
+            remaining: 200_000,
+        };
+        // Reuse the scalar wire parser with at most 32 levels of nesting.
+        let Some(value) = parser.value(480) else {
+            return -1;
+        };
+        if parser.pos != length {
+            return -1;
+        }
+        let Some(entries) = w16_entries(&value) else {
+            return -1;
+        };
+        if entries
+            .iter()
+            .enumerate()
+            .any(|(i, (key, _))| !matches!(key, VerificationOutboxValue::Int(n) if *n == i as i64))
+        {
+            return -1;
+        }
+        let args: Vec<_> = entries.iter().map(|(_, v)| v.clone()).collect();
+        let Some(result) = w17_compute(operation, &args) else {
+            return -1;
+        };
+        let mut wire = Vec::new();
+        result.serialize(&mut wire);
+        let Ok(required) = isize::try_from(wire.len()) else {
+            return -1;
+        };
+        if wire.len() > capacity {
+            return -required;
+        }
+        // Capacity was checked before constructing any writable view. Copy only
+        // from our distinct allocation, and leave the remainder untouched.
+        unsafe {
+            std::ptr::copy_nonoverlapping(wire.as_ptr(), output, wire.len());
+        }
+        required
+    })
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod wave17_xml_verification_timing_tests {
+    use super::*;
+
+    #[test]
+    fn abi_rejects_bad_ranges_and_preserves_short_outputs() {
+        let input = b"a:2:{i:0;s:3:\"nzb\";i:1;s:0:\"\";}";
+        let mut out = [88_u8; 32];
+        unsafe {
+            let call = nntmux_w17_nzb_xml_verification_timing;
+            assert_eq!(
+                call(0, std::ptr::null(), 1, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            assert_eq!(
+                call(0, input.as_ptr(), usize::MAX, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            assert_eq!(
+                call(0, input.as_ptr(), input.len(), out.as_mut_ptr(), usize::MAX),
+                -1
+            );
+            assert_eq!(
+                call(0, usize::MAX as *const u8, 1, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            assert_eq!(
+                call(0, input.as_ptr(), input.len(), usize::MAX as *mut u8, 1),
+                -1
+            );
+            assert_eq!(
+                call(0, input.as_ptr(), input.len(), std::ptr::null_mut(), 1),
+                -1
+            );
+            assert_eq!(call(0, out.as_ptr(), 1, out.as_mut_ptr(), out.len()), -1);
+            assert_eq!(call(0, out.as_ptr(), 8, out.as_mut_ptr().add(4), 8), -1);
+            assert_eq!(
+                call(0, input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                -4
+            );
+            assert_eq!(
+                call(0, input.as_ptr(), input.len(), out.as_mut_ptr(), 3),
+                -4
+            );
+            assert_eq!(out, [88; 32]);
+            assert_eq!(call(0, input.as_ptr(), input.len(), out.as_mut_ptr(), 4), 4);
+            assert_eq!(&out[..4], b"b:1;");
+            assert_eq!(&out[4..], &[88; 28]);
+        }
+    }
+
+    #[test]
+    fn malformed_wire_arity_unknown_operations_and_overflow_decline() {
+        for input in [
+            b"N;".as_slice(),
+            b"a:0:{}junk",
+            b"a:1:{i:0;R:1;}",
+            b"a:999999999999999999999:{}",
+            b"a:0:{}",
+        ] {
+            assert_eq!(
+                unsafe {
+                    nntmux_w17_nzb_xml_verification_timing(
+                        0,
+                        input.as_ptr(),
+                        input.len(),
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                },
+                -1
+            );
+        }
+        use VerificationOutboxValue as V;
+        for args in [
+            vec![V::Int(i64::MAX), V::Int(1), V::Int(0)],
+            vec![V::Int(i64::MIN), V::Int(0), V::Int(1)],
+        ] {
+            assert!(w17_compute(10, &args).is_none());
+        }
+        let args = [w16_map(vec![
+            ("write", V::Int(i64::MAX)),
+            ("state_lock_acquisition", V::Int(1)),
+        ])];
+        assert!(w17_compute(11, &args).is_none());
+        assert!(w17_compute(999, &[]).is_none());
+        let budget = w17_compute(
+            9,
+            &[V::Int(i64::MAX), V::Int(i64::MIN), V::Int(99), V::Int(99)],
+        );
+        assert!(matches!(budget, Some(V::Int(16))));
+    }
+}

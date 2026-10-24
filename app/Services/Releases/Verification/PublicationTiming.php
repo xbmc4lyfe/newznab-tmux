@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Verification;
 
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use PDO;
@@ -20,6 +22,141 @@ use Throwable;
  */
 final class PublicationTiming
 {
+    public const string FFI_CDEF = <<<'C'
+        intptr_t nntmux_w17_nzb_xml_verification_timing(uint32_t operation, const char *input, size_t length, char *output, size_t capacity);
+        C;
+
+    // Paired common/uncommon mean and p99 must all pass before adoption.
+    private static bool $useRustFfi = false;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    /** Reject objects before serialization can invoke user code; bound cycles. */
+    private static function nativeValueSupported(mixed $value, int &$remaining, int $depth): bool
+    {
+        if (--$remaining < 0 || $depth > 24) {
+            return false;
+        }
+        if (is_array($value)) {
+            foreach ($value as $item) {
+                if (! self::nativeValueSupported($item, $remaining, $depth + 1)) {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        return $value === null || is_scalar($value);
+    }
+
+    /** @param list<mixed> $arguments */
+    private static function computeNative(int $operation, array $arguments): mixed
+    {
+        if (! self::$useRustFfi) {
+            return null;
+        }
+        try {
+            $remaining = 100000;
+            if (! self::nativeValueSupported($arguments, $remaining, 0)) {
+                return null;
+            }
+            $ffi = RustPipelineLibrary::resolveDomain('nfo', self::FFI_CDEF);
+            if ($ffi === null) {
+                return null;
+            }
+            $input = serialize($arguments);
+            $capacity = 0;
+            $output = RustPipelineLibrary::obtainScratch($ffi, max(4096, strlen($input) + 512), $capacity);
+            if ($output === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w17_nzb_xml_verification_timing($operation, $input, strlen($input), $output, $capacity);
+            if (! is_int($written) || $written < 0 || $written > $capacity) {
+                return null;
+            }
+
+            return unserialize(FFI::string($output, $written), ['allowed_classes' => false]);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    public static function accumulateDuration(int $current, int $now, int $boundary): int|float
+    {
+        return self::accumulateDurationNative($current, $now, $boundary) ?? self::accumulateDurationPhp($current, $now, $boundary);
+    }
+
+    public static function accumulateDurationPhp(int $current, int $now, int $boundary): int|float
+    {
+        // PHP promotes overflowing integer arithmetic to float; retain that
+        // behavior when the checked Rust candidate declines the operation.
+        if (($now > 0 && $current > PHP_INT_MAX - $now)
+            || ($now < 0 && $current < PHP_INT_MIN - $now)) {
+            return (float) $current + $now - $boundary;
+        }
+        $sum = $current + $now;
+        if (($boundary < 0 && $sum > PHP_INT_MAX + $boundary)
+            || ($boundary > 0 && $sum < PHP_INT_MIN + $boundary)) {
+            return (float) $sum - $boundary;
+        }
+
+        return $sum - $boundary;
+    }
+
+    public static function accumulateDurationNative(int $current, int $now, int $boundary): int|float|null
+    {
+        $result = self::computeNative(10, [$current, $now, $boundary]);
+
+        return (is_int($result) || is_float($result)) ? $result : null;
+    }
+
+    /** @param array<string, int> $phases
+     * @return array{total_ns: int|float, callback_after_state_lock_ns: int|float} */
+    public static function attemptSummary(array $phases): array
+    {
+        return self::attemptSummaryNative($phases) ?? self::attemptSummaryPhp($phases);
+    }
+
+    /** @param array<string, int> $phases
+     * @return array{total_ns: int|float, callback_after_state_lock_ns: int|float} */
+    public static function attemptSummaryPhp(array $phases): array
+    {
+        $total = array_sum($phases);
+
+        return ['total_ns' => $total, 'callback_after_state_lock_ns' => $total - ($phases['state_lock_acquisition'] ?? 0)];
+    }
+
+    /** @param array<string, int> $phases
+     * @return array{total_ns: int|float, callback_after_state_lock_ns: int|float}|null */
+    public static function attemptSummaryNative(array $phases): ?array
+    {
+        $result = self::computeNative(11, [$phases]);
+
+        return is_array($result) ? $result : null;
+    }
+
+    public static function phaseKey(string $phase, ?string $parent = null): string
+    {
+        return self::phaseKeyNative($phase, $parent) ?? self::phaseKeyPhp($phase, $parent);
+    }
+
+    public static function phaseKeyPhp(string $phase, ?string $parent = null): string
+    {
+        return $parent === null || $parent === '' ? $phase : $parent.'.'.$phase;
+    }
+
+    public static function phaseKeyNative(string $phase, ?string $parent = null): ?string
+    {
+        $result = self::computeNative(12, [$phase, $parent]);
+
+        return is_string($result) ? $result : null;
+    }
+
     private static int $sampleCounter = 0;
 
     /**
@@ -91,13 +228,13 @@ final class PublicationTiming
     /** Close the span since the previous mark as a controller-side phase (before publish()). */
     public function requestPhase(string $name): void
     {
-        $this->requestPhases[$name] = ($this->requestPhases[$name] ?? 0) + $this->lapNs();
+        $this->requestPhases[$name] = self::accumulateDuration($this->requestPhases[$name] ?? 0, $this->lapNs(), 0);
     }
 
     /** Close the span since the previous mark as a pre-lock phase (before the first attempt). */
     public function preLockPhase(string $name): void
     {
-        $this->preLockPhases[$name] = ($this->preLockPhases[$name] ?? 0) + $this->lapNs();
+        $this->preLockPhases[$name] = self::accumulateDuration($this->preLockPhases[$name] ?? 0, $this->lapNs(), 0);
     }
 
     public function setSource(string $source): void
@@ -147,7 +284,7 @@ final class PublicationTiming
     private function lapNs(): int
     {
         $now = hrtime(true);
-        $elapsed = $now - $this->boundary;
+        $elapsed = self::accumulateDuration(0, $now, $this->boundary);
         $this->boundary = $now;
 
         return $elapsed;
@@ -166,7 +303,7 @@ final class PublicationTiming
     public function nextPhase(string $phase): void
     {
         $this->recordPhase(hrtime(true));
-        $this->phase = $phase;
+        $this->phase = self::phaseKey($phase);
     }
 
     public function endAttempt(bool $returned): void
@@ -176,7 +313,7 @@ final class PublicationTiming
         $index = array_key_last($this->attempts);
         $this->attempts[$index]['callback_status'] = $returned ? 'returned' : 'threw';
         $phases = $this->attempts[$index]['phases_ns'];
-        $this->attempts[$index]['callback_after_state_lock_ns'] = array_sum($phases) - $phases['state_lock_acquisition'];
+        $this->attempts[$index]['callback_after_state_lock_ns'] = self::attemptSummary($phases)['callback_after_state_lock_ns'];
         $this->callbackEndedAt = $now;
     }
 
@@ -194,10 +331,10 @@ final class PublicationTiming
             $this->finalizeAttempt($now);
             $report = ['status' => $status, 'total_ns' => $now - $this->startedAt] + $this->facts + ($this->batch ?? []);
             if ($this->requestPhases !== []) {
-                $report['request_ns'] = array_sum($this->requestPhases);
+                $report['request_ns'] = self::attemptSummary($this->requestPhases)['total_ns'];
                 $report['request_phases_ns'] = $this->requestPhases;
             }
-            $report['pre_lock_ns'] = array_sum($this->preLockPhases);
+            $report['pre_lock_ns'] = self::attemptSummary($this->preLockPhases)['total_ns'];
             $report['pre_lock_phases_ns'] = $this->preLockPhases;
             $report['attempts'] = $this->attempts;
             Log::info('Verified release publication timing.', $report);
@@ -209,7 +346,7 @@ final class PublicationTiming
     private function recordPhase(int $now): void
     {
         $index = array_key_last($this->attempts);
-        $this->attempts[$index]['phases_ns'][$this->phase] = ($this->attempts[$index]['phases_ns'][$this->phase] ?? 0) + $now - $this->boundary;
+        $this->attempts[$index]['phases_ns'][$this->phase] = self::accumulateDuration($this->attempts[$index]['phases_ns'][$this->phase] ?? 0, $now, $this->boundary);
         $this->boundary = $now;
     }
 
@@ -217,7 +354,7 @@ final class PublicationTiming
     {
         if ($this->callbackEndedAt !== null) {
             // Includes commit/afterCommit or rollback/retry setup; it is not lock hold time.
-            $this->attempts[array_key_last($this->attempts)]['transaction_finalization_ns'] = $now - $this->callbackEndedAt;
+            $this->attempts[array_key_last($this->attempts)]['transaction_finalization_ns'] = self::accumulateDuration(0, $now, $this->callbackEndedAt);
             $this->callbackEndedAt = null;
         }
     }
