@@ -6490,3 +6490,648 @@ mod wave7_episode_archive_rank_tests {
         assert_eq!(classify_pretty_codec(b"AV1"), 0);
     }
 }
+
+// ---------------------------------------------------------------------------
+// ReleaseFileManager / MediaExtractionService / UsenetDownloadService helpers
+// ---------------------------------------------------------------------------
+
+/// Upper bound for fused release-name extraction; longer inputs decline to PHP so the
+/// memoized PREDB matcher never diverges from PCRE backtrack-limit behaviour.
+const RFM_MAX_RELEASE_NAME_INPUT: usize = 1024;
+
+/// Backtracking steps allowed for the PREDB matcher before declining to PHP. PCRE's
+/// default `pcre.backtrack_limit` (1,000,000) is far above this, so any input the matcher
+/// completes is one PCRE also completes without a match-limit error.
+const RFM_PREDB_STEP_BUDGET: u32 = 20_000;
+
+#[inline]
+unsafe fn rfm_input<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+    if len == 0 {
+        return Some(&[]);
+    }
+    if ptr.is_null() {
+        return None;
+    }
+    Some(unsafe { slice::from_raw_parts(ptr, len) })
+}
+
+/// Strip the single trailing `\n` that a non-`D` PCRE `$` may match before.
+#[inline]
+fn rfm_without_final_newline(s: &[u8]) -> &[u8] {
+    match s.last() {
+        Some(b'\n') => &s[..s.len() - 1],
+        _ => s,
+    }
+}
+
+#[inline]
+fn rfm_ends_with_ci(s: &[u8], suffix_lower: &[u8]) -> bool {
+    s.len() >= suffix_lower.len()
+        && s[s.len() - suffix_lower.len()..].eq_ignore_ascii_case(suffix_lower)
+}
+
+/// `ReleaseFileManager::isNfoFilename()` for C/POSIX byte semantics.
+pub(crate) fn rfm_is_nfo_filename(filename: &[u8]) -> bool {
+    // `/\.(?:nfo|diz|info?)$/i` on the full filename.
+    let full = rfm_without_final_newline(filename);
+    if rfm_ends_with_ci(full, b".nfo")
+        || rfm_ends_with_ci(full, b".diz")
+        || rfm_ends_with_ci(full, b".inf")
+        || rfm_ends_with_ci(full, b".info")
+    {
+        return true;
+    }
+
+    let base = rfm_without_final_newline(posix_basename(filename));
+
+    // `/^(?:file[_-]?id|readme|release|info(?:rmation)?|about|notes?)\.(?:txt|diz)$/i`
+    if base.len() >= 4 && base[base.len() - 4] == b'.' {
+        let ext = &base[base.len() - 3..];
+        if ext.eq_ignore_ascii_case(b"txt") || ext.eq_ignore_ascii_case(b"diz") {
+            let stem = &base[..base.len() - 4];
+            if stem.len() <= 11 {
+                let mut buf = [0u8; 11];
+                for (i, &b) in stem.iter().enumerate() {
+                    buf[i] = b.to_ascii_lowercase();
+                }
+                if matches!(
+                    &buf[..stem.len()],
+                    b"fileid"
+                        | b"file_id"
+                        | b"file-id"
+                        | b"readme"
+                        | b"release"
+                        | b"info"
+                        | b"information"
+                        | b"about"
+                        | b"note"
+                        | b"notes"
+                ) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // `/^00-[a-z0-9_-]+\.nfo$/i`, `/^0+-[a-z0-9_-]+\.nfo$/i` and
+    // `/^[a-z0-9_-]+-[a-z0-9_.-]+\.nfo$/i`; the first two are subsets of the third.
+    if rfm_ends_with_ci(base, b".nfo") {
+        let stem = &base[..base.len() - 4];
+        if stem
+            .iter()
+            .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        {
+            let first_dot = stem.iter().position(|&b| b == b'.').unwrap_or(stem.len());
+            let limit = first_dot.min(stem.len().saturating_sub(1));
+            if (1..limit).any(|i| stem[i] == b'-') {
+                return true;
+            }
+        }
+    }
+
+    // `/info\.txt$/i`
+    rfm_ends_with_ci(base, b"info.txt")
+}
+
+/// # Safety
+///
+/// `ptr` must be valid for reads of `len` bytes when non-null and `len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_rfm_is_nfo_filename(ptr: *const u8, len: usize) -> i32 {
+    match unsafe { rfm_input(ptr, len) } {
+        Some(filename) => i32::from(rfm_is_nfo_filename(filename)),
+        None => -1,
+    }
+}
+
+/// `/\.(mkv|avi|...|r\d{2,3}|pkg|exe|msi)$/i` removal. Extensions contain no dot, so a
+/// match can only start at the final dot.
+fn rfm_strip_release_extension(s: &[u8]) -> &[u8] {
+    let Some(dot) = s.iter().rposition(|&b| b == b'.') else {
+        return s;
+    };
+    let ext = &s[dot + 1..];
+    if ext.is_empty() || ext.len() > 4 {
+        return s;
+    }
+    let mut buf = [0u8; 4];
+    for (i, &b) in ext.iter().enumerate() {
+        buf[i] = b.to_ascii_lowercase();
+    }
+    let lower = &buf[..ext.len()];
+    let known = matches!(
+        lower,
+        b"mkv"
+            | b"avi"
+            | b"mp4"
+            | b"m4v"
+            | b"mpg"
+            | b"mpeg"
+            | b"wmv"
+            | b"flv"
+            | b"mov"
+            | b"ts"
+            | b"vob"
+            | b"iso"
+            | b"divx"
+            | b"par"
+            | b"par2"
+            | b"nfo"
+            | b"sfv"
+            | b"nzb"
+            | b"rar"
+            | b"zip"
+            | b"pkg"
+            | b"exe"
+            | b"msi"
+    ) || (lower[0] == b'r'
+        && (lower.len() == 3 || lower.len() == 4)
+        && lower[1..].iter().all(u8::is_ascii_digit));
+    if known { &s[..dot] } else { s }
+}
+
+#[inline]
+fn rfm_ucwords_into(s: &[u8], delimiters: &[u8], out: &mut Vec<u8>) {
+    out.reserve(s.len());
+    let mut upper_next = true;
+    for &b in s {
+        out.push(if upper_next {
+            b.to_ascii_uppercase()
+        } else {
+            b
+        });
+        upper_next = delimiters.contains(&b);
+    }
+}
+
+#[inline]
+fn rfm_predb_t(b: u8) -> bool {
+    is_word_char(b) || matches!(b, b'.' | b'\'' | b'(' | b')' | b'[' | b']' | b'-')
+}
+
+#[inline]
+fn rfm_predb_s(b: u8) -> bool {
+    matches!(
+        b,
+        b' ' | b'\t' | b'\n' | 0x0B | 0x0C | b'\r' | b'.' | b'_' | b'-'
+    )
+}
+
+/// Leftmost-first span of `ReleaseUpdateService::PREDB_REGEX`
+/// (`[\w.'()\[\]-]+(?:[\s._-]+[\w.'()\[\]-]+)+[-.][\w]+`) over ASCII input, explored in
+/// PCRE's greedy backtracking order. `Err(())` means the step budget ran out.
+struct RfmPredbMatcher<'a> {
+    s: &'a [u8],
+    steps: u32,
+}
+
+type RfmPredbStep = Result<Option<usize>, ()>;
+
+impl RfmPredbMatcher<'_> {
+    fn find(s: &[u8]) -> Result<Option<(usize, usize)>, ()> {
+        let mut matcher = RfmPredbMatcher { s, steps: 0 };
+        for (start, &b) in s.iter().enumerate() {
+            if rfm_predb_t(b)
+                && let Some(end) = matcher.a_loop(start + 1)?
+            {
+                return Ok(Some((start, end)));
+            }
+        }
+        Ok(None)
+    }
+
+    #[inline]
+    fn at(&self, pos: usize) -> Option<u8> {
+        self.s.get(pos).copied()
+    }
+
+    #[inline]
+    fn tick(&mut self) -> Result<(), ()> {
+        self.steps += 1;
+        if self.steps > RFM_PREDB_STEP_BUDGET {
+            Err(())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Inside the leading `T+`, at least one byte consumed.
+    fn a_loop(&mut self, pos: usize) -> RfmPredbStep {
+        self.tick()?;
+        if self.at(pos).is_some_and(rfm_predb_t)
+            && let Some(end) = self.a_loop(pos + 1)?
+        {
+            return Ok(Some(end));
+        }
+        self.s_first(pos)
+    }
+
+    /// Start of a `(?:S+ T+)` iteration.
+    fn s_first(&mut self, pos: usize) -> RfmPredbStep {
+        if self.at(pos).is_some_and(rfm_predb_s) {
+            self.s_loop(pos + 1)
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn s_loop(&mut self, pos: usize) -> RfmPredbStep {
+        self.tick()?;
+        if self.at(pos).is_some_and(rfm_predb_s)
+            && let Some(end) = self.s_loop(pos + 1)?
+        {
+            return Ok(Some(end));
+        }
+        if self.at(pos).is_some_and(rfm_predb_t) {
+            return self.t_loop(pos + 1);
+        }
+        Ok(None)
+    }
+
+    /// Inside an iteration's `T+`; then another iteration, then `[-.]\w+`.
+    fn t_loop(&mut self, pos: usize) -> RfmPredbStep {
+        self.tick()?;
+        if self.at(pos).is_some_and(rfm_predb_t)
+            && let Some(end) = self.t_loop(pos + 1)?
+        {
+            return Ok(Some(end));
+        }
+        if let Some(end) = self.s_first(pos)? {
+            return Ok(Some(end));
+        }
+        if matches!(self.at(pos), Some(b'-' | b'.')) && self.at(pos + 1).is_some_and(is_word_char) {
+            let mut end = pos + 2;
+            while self.at(end).is_some_and(is_word_char) {
+                end += 1;
+            }
+            return Ok(Some(end));
+        }
+        Ok(None)
+    }
+}
+
+/// `ReleaseFileManager::extractReleaseNameFromFile()` with the default `FileNameCleaner`.
+/// Returns `None` to decline to PHP, `Some(false)` for a PHP `null`, or `Some(true)` with
+/// the extracted name written into `out`.
+pub(crate) fn rfm_extract_release_name(filename: &[u8], out: &mut Vec<u8>) -> Option<bool> {
+    if filename.len() > RFM_MAX_RELEASE_NAME_INPUT
+        || filename.iter().any(|&b| b >= 0x80 || b == b'\n' || b == 0)
+    {
+        return None;
+    }
+    let base = posix_basename(filename);
+
+    if find_ascii_ci(base, b"__nzbsplit__").is_some() {
+        match crate::cleaning::nzbsplit_unwrap_vec(base, out) {
+            None => return None,
+            Some(true) => return Some(true),
+            Some(false) => out.clear(),
+        }
+    }
+
+    let cleaned = rfm_strip_release_extension(base);
+
+    // `/^(.+[-.][A-Za-z0-9_]{2,})$/i`
+    let run = cleaned
+        .iter()
+        .rev()
+        .take_while(|&&b| is_word_char(b))
+        .count();
+    if run >= 2
+        && cleaned.len() >= run + 2
+        && matches!(cleaned[cleaned.len() - run - 1], b'-' | b'.')
+    {
+        rfm_ucwords_into(cleaned, b".-_ ", out);
+        return Some(true);
+    }
+
+    match RfmPredbMatcher::find(cleaned) {
+        Ok(Some((start, end))) => {
+            rfm_ucwords_into(&cleaned[start..end], b".", out);
+            Some(true)
+        }
+        Ok(None) => Some(false),
+        Err(()) => None,
+    }
+}
+
+/// Returns the written length, `-3` for a PHP `null`, `-2` when declined to PHP, or
+/// `-(required)` when `out_cap` is too small.
+///
+/// # Safety
+///
+/// `ptr` must be valid for reads of `len` bytes when non-null and `len > 0`; `out_ptr`
+/// must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_rfm_extract_release_name(
+    ptr: *const u8,
+    len: usize,
+    out_ptr: *mut u8,
+    out_cap: usize,
+) -> isize {
+    let Some(filename) = (unsafe { rfm_input(ptr, len) }) else {
+        return -2;
+    };
+    let mut out = Vec::new();
+    match rfm_extract_release_name(filename, &mut out) {
+        None => -2,
+        Some(false) => -3,
+        Some(true) => {
+            if out.len() > out_cap {
+                return -((out.len().max(4)) as isize);
+            }
+            if !out.is_empty() {
+                unsafe { std::ptr::copy_nonoverlapping(out.as_ptr(), out_ptr, out.len()) };
+            }
+            out.len() as isize
+        }
+    }
+}
+
+/// `ReleaseFileManager::normalizeFileSize()` for strings: `1` with `*out` set, `0` for
+/// `null`, `-1` on invalid pointers.
+///
+/// # Safety
+///
+/// `ptr` must be valid for reads of `len` bytes when non-null and `len > 0`; `out` must be
+/// valid for one `i64` write.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_rfm_normalize_file_size(
+    ptr: *const u8,
+    len: usize,
+    out: *mut i64,
+) -> i32 {
+    if out.is_null() {
+        return -1;
+    }
+    let Some(size) = (unsafe { rfm_input(ptr, len) }) else {
+        return -1;
+    };
+    if size.is_empty() {
+        return 0;
+    }
+    let mut value: i64 = 0;
+    for &b in size {
+        if !b.is_ascii_digit() {
+            return 0;
+        }
+        match value
+            .checked_mul(10)
+            .and_then(|v| v.checked_add(i64::from(b - b'0')))
+        {
+            Some(next) => value = next,
+            None => return 0,
+        }
+    }
+    unsafe { *out = value };
+    1
+}
+
+/// `MediaExtractionService::audioTagText()` for strings: `1` with the trimmed span written
+/// to `out[0..2]` (start, length), `0` for `null`, `-1` on invalid pointers.
+///
+/// # Safety
+///
+/// `ptr` must be valid for reads of `len` bytes when non-null and `len > 0`; `out` must be
+/// valid for two `usize` writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_rfm_audio_tag_span(
+    ptr: *const u8,
+    len: usize,
+    out: *mut usize,
+) -> i32 {
+    if out.is_null() {
+        return -1;
+    }
+    let Some(value) = (unsafe { rfm_input(ptr, len) }) else {
+        return -1;
+    };
+    let trimmed = trim_php(value);
+    if trimmed.is_empty()
+        || trimmed.iter().any(|&b| b < 0x20 || b == 0x7F)
+        || std::str::from_utf8(trimmed).is_err()
+    {
+        return 0;
+    }
+    let start = trimmed.as_ptr() as usize - value.as_ptr() as usize;
+    unsafe {
+        *out = start;
+        *out.add(1) = trimmed.len();
+    }
+    1
+}
+
+/// `MediaExtractionService::audioReleaseTitle()` over ASCII inputs. Returns the written
+/// length, `-3` for a PHP `null`, `-2` when declined to PHP, or `-(required)` when
+/// `out_cap` is too small.
+///
+/// # Safety
+///
+/// Each input pointer must be valid for reads of its length when non-null and the length
+/// is positive; `out_ptr` must be valid for writes of `out_cap` bytes.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_rfm_audio_release_title(
+    performer_ptr: *const u8,
+    performer_len: usize,
+    album_ptr: *const u8,
+    album_len: usize,
+    date_ptr: *const u8,
+    date_len: usize,
+    has_date: i32,
+    ext_ptr: *const u8,
+    ext_len: usize,
+    out_ptr: *mut u8,
+    out_cap: usize,
+) -> isize {
+    let (Some(performer), Some(album), Some(date), Some(ext)) = (unsafe {
+        (
+            rfm_input(performer_ptr, performer_len),
+            rfm_input(album_ptr, album_len),
+            rfm_input(date_ptr, date_len),
+            rfm_input(ext_ptr, ext_len),
+        )
+    }) else {
+        return -2;
+    };
+    if !performer.is_ascii() || !album.is_ascii() || !date.is_ascii() || !ext.is_ascii() {
+        return -2;
+    }
+    let mut title = Vec::with_capacity(performer.len() + album.len() + ext.len() + 12);
+    title.extend_from_slice(performer);
+    title.extend_from_slice(b" - ");
+    title.extend_from_slice(album);
+    if has_date != 0 {
+        // `/(?:19|20)\d\d/`
+        if let Some(year) = date.windows(4).find(|w| {
+            (w[0..2] == *b"19" || w[0..2] == *b"20")
+                && w[2].is_ascii_digit()
+                && w[3].is_ascii_digit()
+        }) {
+            title.extend_from_slice(b" (");
+            title.extend_from_slice(year);
+            title.push(b')');
+        }
+    }
+    title.push(b' ');
+    title.extend(ext.iter().map(u8::to_ascii_uppercase));
+    // ASCII `\p{C}` is exactly the Cc range.
+    if title.len() > 255 || title.iter().any(|&b| b < 0x20 || b == 0x7F) {
+        return -3;
+    }
+    if title.len() > out_cap {
+        return -((title.len().max(4)) as isize);
+    }
+    unsafe { std::ptr::copy_nonoverlapping(title.as_ptr(), out_ptr, title.len()) };
+    title.len() as isize
+}
+
+/// `UsenetDownloadService::isGroupUnavailableMessage()`.
+///
+/// # Safety
+///
+/// `ptr` must be valid for reads of `len` bytes when non-null and `len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_rfm_is_group_unavailable(ptr: *const u8, len: usize) -> i32 {
+    match unsafe { rfm_input(ptr, len) } {
+        Some(message) => i32::from(
+            find_ascii_ci(message, b"no such news group").is_some()
+                || find_ascii_ci(message, b"group not found").is_some(),
+        ),
+        None => -1,
+    }
+}
+
+/// `/\.(?:rar|7z(?:\.\d+)?|zip|\d{3})$/i`
+pub(crate) fn rfm_is_mapped_archive_name(name: &[u8]) -> bool {
+    let n = rfm_without_final_newline(name);
+    if rfm_ends_with_ci(n, b".rar") || rfm_ends_with_ci(n, b".zip") || rfm_ends_with_ci(n, b".7z") {
+        return true;
+    }
+    let digits = n.iter().rev().take_while(|b| b.is_ascii_digit()).count();
+    if digits == 0 || n.len() <= digits || n[n.len() - digits - 1] != b'.' {
+        return false;
+    }
+    if digits == 3 {
+        return true;
+    }
+    rfm_ends_with_ci(&n[..n.len() - digits - 1], b".7z")
+}
+
+/// `stripos($name, 'sample') === false` and the default video-file regex anchored at `$`.
+pub(crate) fn rfm_is_mapped_video_name(name: &[u8]) -> bool {
+    if find_ascii_ci(name, b"sample").is_some() {
+        return false;
+    }
+    let n = rfm_without_final_newline(name);
+    let Some(dot) = n.iter().rposition(|&b| b == b'.') else {
+        return false;
+    };
+    let ext = &n[dot + 1..];
+    if ext.is_empty() || ext.len() > 4 {
+        return false;
+    }
+    let mut buf = [0u8; 4];
+    for (i, &b) in ext.iter().enumerate() {
+        buf[i] = b.to_ascii_uppercase();
+    }
+    matches!(
+        &buf[..ext.len()],
+        b"AVI"
+            | b"F4V"
+            | b"IFO"
+            | b"M1V"
+            | b"M2V"
+            | b"M4V"
+            | b"MKV"
+            | b"MOV"
+            | b"MP4"
+            | b"MPEG"
+            | b"MPG"
+            | b"MPGV"
+            | b"MPV"
+            | b"OGV"
+            | b"QT"
+            | b"RM"
+            | b"RMVB"
+            | b"TS"
+            | b"VOB"
+            | b"WMV"
+    )
+}
+
+/// Bit `1`: mapped archive name; bit `2`: default-regex main-video name. `-1` on invalid
+/// pointers.
+///
+/// # Safety
+///
+/// `ptr` must be valid for reads of `len` bytes when non-null and `len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_rfm_mapped_article_kind(ptr: *const u8, len: usize) -> i32 {
+    match unsafe { rfm_input(ptr, len) } {
+        Some(name) => {
+            i32::from(rfm_is_mapped_archive_name(name))
+                | (i32::from(rfm_is_mapped_video_name(name)) << 1)
+        }
+        None => -1,
+    }
+}
+
+#[cfg(test)]
+mod wave10_release_file_manager_audio_tag_tests {
+    use super::*;
+
+    fn extract(s: &[u8]) -> Option<Option<Vec<u8>>> {
+        let mut out = Vec::new();
+        rfm_extract_release_name(s, &mut out).map(|hit| hit.then_some(out))
+    }
+
+    #[test]
+    fn nfo_filename_patterns() {
+        assert!(rfm_is_nfo_filename(b"Movie.2026-GRP.nfo"));
+        assert!(rfm_is_nfo_filename(b"dir/FILE_ID.DIZ"));
+        assert!(rfm_is_nfo_filename(b"x.info\n"));
+        assert!(rfm_is_nfo_filename(b"a/00-grp.nfo/"));
+        assert!(rfm_is_nfo_filename(b"README.txt"));
+        assert!(rfm_is_nfo_filename(b"myinfo.txt"));
+        assert!(!rfm_is_nfo_filename(b"a/grp.nfo/"));
+        assert!(!rfm_is_nfo_filename(b"a/.x-y.nfo/"));
+        assert!(!rfm_is_nfo_filename(b"movie.mkv"));
+        assert!(!rfm_is_nfo_filename(b""));
+    }
+
+    #[test]
+    fn release_name_extraction() {
+        assert_eq!(
+            extract(b"dir/movie.2026.1080p.bluray-grp.mkv"),
+            Some(Some(b"Movie.2026.1080p.Bluray-Grp".to_vec()))
+        );
+        assert_eq!(
+            extract(b"show.name.s01e01.720p-grp (1)"),
+            Some(Some(b"Show.Name.S01e01.720p-grp".to_vec()))
+        );
+        assert_eq!(extract(b"track 01"), Some(None));
+        assert_eq!(extract(b"x.r00"), Some(None));
+        assert_eq!(extract("caf\u{e9}.mkv".as_bytes()), None);
+        assert_eq!(extract(b"a\nb"), None);
+        let mut pathological = b".".repeat(40);
+        pathological.extend_from_slice(b"!ab.cd-ef (");
+        assert_eq!(extract(&pathological), None);
+    }
+
+    #[test]
+    fn mapped_article_and_group_helpers() {
+        assert!(rfm_is_mapped_archive_name(b"a.part01.RAR"));
+        assert!(rfm_is_mapped_archive_name(b"a.7z.0001"));
+        assert!(rfm_is_mapped_archive_name(b"a.001\n"));
+        assert!(!rfm_is_mapped_archive_name(b"a.0001"));
+        assert!(rfm_is_mapped_video_name(b"Movie.MKV"));
+        assert!(!rfm_is_mapped_video_name(b"Movie.Sample.mkv"));
+        assert!(!rfm_is_mapped_video_name(b"Movie.mkv.par2"));
+        let msg = b"411 NO SUCH NEWS GROUP";
+        assert_eq!(
+            unsafe { nntmux_rfm_is_group_unavailable(msg.as_ptr(), msg.len()) },
+            1
+        );
+    }
+}
