@@ -5067,3 +5067,439 @@ mod tests {
         assert_eq!((from, spacing), (0.0, 0.0));
     }
 }
+
+
+// IMDb search: -1 declines to PHP, <= -4 requests a larger caller-owned buffer.
+// The strict subset deliberately leaves Unicode escapes, coercions and unusual HTML
+// to json_decode / PCRE / DOM. Search rows retain the PHP id/title/year contract;
+// qid and i.imageUrl are validated as JSON but do not filter or extend that contract.
+fn imdb_trim(s: &[u8]) -> &[u8] {
+    let ws = |b: &u8| matches!(*b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 11);
+    let start = s.iter().position(|b| !ws(b)).unwrap_or(s.len());
+    let end = s.iter().rposition(|b| !ws(b)).map_or(start, |i| i + 1);
+    &s[start..end]
+}
+
+fn imdb_year(s: &[u8]) -> &[u8] {
+    s.windows(4).find(|w| (w.starts_with(b"19") || w.starts_with(b"20")) && w[2..].iter().all(u8::is_ascii_digit)).unwrap_or(b"")
+}
+
+/// CPU candidates share one ABI to keep scratch allocation and fallback identical.
+/// Modes: year, image URL, slug, loose pattern, trailing year, and/&, er/re.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_imdb_search_text(
+    input: *const u8, input_len: usize, mode: u32, out_buf: *mut u8, out_cap: usize,
+) -> isize {
+    if input.is_null() { return -1; }
+    let s = unsafe { slice::from_raw_parts(input, input_len) };
+    let mut out = OutCursor::new(out_buf, out_cap);
+    match mode {
+        0 => out.push_slice(imdb_year(s)),
+        1 => {
+            // PCRE dot excludes LF, and the final dot on each line wins greedily.
+            let s = imdb_trim(s);
+            let mut pos = 0;
+            while pos < s.len() {
+                if s[pos..].starts_with(b"._V1_") {
+                    let end = s[pos + 5..].iter().position(|&b| b == b'\n').map_or(s.len(), |i| pos + 5 + i);
+                    if let Some(dot) = s[pos + 5..end].iter().rposition(|&b| b == b'.') {
+                        out.push_byte(b'.');
+                        pos += 5 + dot + 1;
+                        continue;
+                    }
+                }
+                out.push_byte(s[pos]);
+                pos += 1;
+            }
+        }
+        2 => {
+            if !s.is_ascii() { return -1; }
+            let mut started = false;
+            let mut pending_space = false;
+            for &b in s {
+                if b.is_ascii_alphanumeric() {
+                    if started && pending_space {
+                        out.push_byte(b'_');
+                    }
+                    out.push_byte(b.to_ascii_lowercase());
+                    started = true;
+                    pending_space = false;
+                } else if b == b' ' && started {
+                    pending_space = true;
+                }
+            }
+        }
+        3 => {
+            out.push_byte(b'%');
+            for &b in s {
+                match b {
+                    b' ' => out.push_byte(b'%'),
+                    b'\'' | b'!' => (),
+                    _ => out.push_byte(b),
+                }
+            }
+            out.push_byte(b'%');
+        }
+        4 => {
+            if s.contains(&b'\n') { return -1; }
+            let mut result = s;
+            if s.len() >= 7 && s.last() == Some(&b')') {
+                let open = s.len() - 6;
+                if s[open] == b'(' && s[open + 1..open + 5].iter().all(u8::is_ascii_digit) && open > 0 {
+                    // Lazy (.+?) retains at least one byte; PCRE's following
+                    // \s* consumes formfeed too, unlike PHP trim().
+                    let mut capture_end = open;
+                    while capture_end > 1 && matches!(s[capture_end - 1], b' ' | b'\t' | b'\r' | 11 | 12) {
+                        capture_end -= 1;
+                    }
+                    result = imdb_trim(&s[..capture_end]);
+                }
+            }
+            out.push_slice(result);
+        }
+        5 | 6 => {
+            let (from, to): (&[u8], &[u8]) = if mode == 5 { (b" and ", b" & ") } else { (b"er", b"re") };
+            let mut pos = 0;
+            while pos < s.len() {
+                if s.get(pos..pos + from.len()).is_some_and(|w| w.eq_ignore_ascii_case(from)) {
+                    out.push_slice(to);
+                    pos += from.len();
+                } else {
+                    out.push_byte(s[pos]);
+                    pos += 1;
+                }
+            }
+        }
+        _ => return -1,
+    }
+    out.finish()
+}
+
+struct ImdbSearchJson<'a> { s: &'a [u8], pos: usize }
+
+impl<'a> ImdbSearchJson<'a> {
+    fn ws(&mut self) {
+        while self.s.get(self.pos).is_some_and(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n')) { self.pos += 1; }
+    }
+
+    fn eat(&mut self, b: u8) -> bool {
+        self.ws();
+        if self.s.get(self.pos) == Some(&b) { self.pos += 1; true } else { false }
+    }
+
+    fn string(&mut self) -> Option<std::borrow::Cow<'a, [u8]>> {
+        if !self.eat(b'"') { return None; }
+        let start = self.pos;
+        let mut decoded: Option<Vec<u8>> = None;
+        loop {
+            let b = *self.s.get(self.pos)?;
+            self.pos += 1;
+            match b {
+                b'"' => return Some(decoded.map_or_else(|| std::borrow::Cow::Borrowed(&self.s[start..self.pos - 1]), std::borrow::Cow::Owned)),
+                0..=31 => return None,
+                b'\\' => {
+                    let out = decoded.get_or_insert_with(|| self.s[start..self.pos - 1].to_vec());
+                    let b = *self.s.get(self.pos)?;
+                    self.pos += 1;
+                    out.push(match b {
+                        b'"' | b'\\' | b'/' => b,
+                        b'b' => 8, b'f' => 12, b'n' => 10, b'r' => 13, b't' => 9,
+                        _ => return None, // Unicode escapes (including NUL/surrogates) need PHP.
+                    });
+                }
+                _ => if let Some(out) = &mut decoded { out.push(b); },
+            }
+        }
+    }
+
+    fn number(&mut self) -> Option<&'a [u8]> {
+        self.ws();
+        let start = self.pos;
+        if self.s.get(self.pos) == Some(&b'-') { self.pos += 1; }
+        match self.s.get(self.pos)? {
+            b'0' => self.pos += 1,
+            b'1'..=b'9' => while self.s.get(self.pos).is_some_and(u8::is_ascii_digit) { self.pos += 1; },
+            _ => return None,
+        }
+        if self.s.get(self.pos) == Some(&b'.') {
+            self.pos += 1;
+            let from = self.pos;
+            while self.s.get(self.pos).is_some_and(u8::is_ascii_digit) { self.pos += 1; }
+            if self.pos == from { return None; }
+        }
+        if self.s.get(self.pos).is_some_and(|b| matches!(b, b'e' | b'E')) {
+            self.pos += 1;
+            if self.s.get(self.pos).is_some_and(|b| matches!(b, b'+' | b'-')) { self.pos += 1; }
+            let from = self.pos;
+            while self.s.get(self.pos).is_some_and(u8::is_ascii_digit) { self.pos += 1; }
+            if self.pos == from { return None; }
+        }
+        Some(&self.s[start..self.pos])
+    }
+
+    fn literal(&mut self, value: &[u8]) -> Option<()> {
+        self.ws();
+        if !self.s[self.pos..].starts_with(value) { return None; }
+        self.pos += value.len();
+        Some(())
+    }
+
+    fn skip(&mut self, depth: usize) -> Option<()> {
+        if depth > 128 { return None; }
+        self.ws();
+        match self.s.get(self.pos)? {
+            b'"' => { self.string()?; }
+            b'{' => {
+                self.pos += 1;
+                if self.eat(b'}') { return Some(()); }
+                loop {
+                    self.string()?;
+                    if !self.eat(b':') { return None; }
+                    self.skip(depth + 1)?;
+                    if self.eat(b'}') { break; }
+                    if !self.eat(b',') { return None; }
+                }
+            }
+            b'[' => {
+                self.pos += 1;
+                if self.eat(b']') { return Some(()); }
+                loop {
+                    self.skip(depth + 1)?;
+                    if self.eat(b']') { break; }
+                    if !self.eat(b',') { return None; }
+                }
+            }
+            b't' => self.literal(b"true")?, b'f' => self.literal(b"false")?, b'n' => self.literal(b"null")?,
+            _ => { self.number()?; }
+        }
+        Some(())
+    }
+
+    fn row(&mut self, out: &mut OutCursor, count: &mut usize) -> Option<()> {
+        if !self.eat(b'{') { return None; }
+        let (mut id, mut title, mut year) = (None, None, None);
+        let mut seen = 0;
+        if !self.eat(b'}') {
+            loop {
+                let key = self.string()?;
+                if !self.eat(b':') { return None; }
+                let bit = match key.as_ref() { b"id" => 1, b"l" => 2, b"y" => 4, _ => 0 };
+                if bit != 0 {
+                    if seen & bit != 0 { return None; }
+                    seen |= bit;
+                    self.ws();
+                    let value = match self.s.get(self.pos)? {
+                        b'"' => self.string()?,
+                        b'n' => { self.literal(b"null")?; std::borrow::Cow::Borrowed(&b""[..]) }
+                        b'0'..=b'9' if bit == 4 => {
+                            let n = self.number()?;
+                            if n.len() > 15 || !n.iter().all(u8::is_ascii_digit) { return None; }
+                            std::borrow::Cow::Borrowed(n)
+                        }
+                        _ => return None,
+                    };
+                    match bit { 1 => id = Some(value), 2 => title = Some(value), _ => year = Some(value) }
+                } else { self.skip(2)?; }
+                if self.eat(b'}') { break; }
+                if !self.eat(b',') { return None; }
+            }
+        }
+        if let (Some(id), Some(title)) = (id, title) {
+            let title = imdb_trim(&title);
+            if id.starts_with(b"tt") && !title.is_empty() && *count < 25 {
+                for field in [&id[2..], title, imdb_trim(year.as_deref().unwrap_or(b""))] {
+                    out.push_slice(field);
+                    out.push_byte(0);
+                }
+                *count += 1;
+            }
+        }
+        Some(())
+    }
+
+    fn suggestions(&mut self, out: &mut OutCursor) -> Option<()> {
+        if !self.eat(b'{') { return None; }
+        let mut seen = false;
+        let mut count = 0;
+        if !self.eat(b'}') {
+            loop {
+                let key = self.string()?;
+                if !self.eat(b':') { return None; }
+                if key.as_ref() == b"d" {
+                    if seen || !self.eat(b'[') { return None; }
+                    seen = true;
+                    if !self.eat(b']') {
+                        loop {
+                            self.row(out, &mut count)?;
+                            if self.eat(b']') { break; }
+                            if !self.eat(b',') { return None; }
+                        }
+                    }
+                } else { self.skip(1)?; }
+                if self.eat(b'}') { break; }
+                if !self.eat(b',') { return None; }
+            }
+        }
+        self.ws();
+        (self.pos == self.s.len()).then_some(())
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_imdb_suggestion_rows(
+    input: *const u8, input_len: usize, out_buf: *mut u8, out_cap: usize,
+) -> isize {
+    if input.is_null() { return -1; }
+    let s = unsafe { slice::from_raw_parts(input, input_len) };
+    if std::str::from_utf8(s).is_err() { return -1; }
+    let mut out = OutCursor::new(out_buf, out_cap);
+    if (ImdbSearchJson { s, pos: 0 }).suggestions(&mut out).is_none() { return -1; }
+    out.finish()
+}
+
+// A deliberately conservative strip_tags subset, including a tag truncated by
+// PHP's 200-byte context window. Nested angle brackets defer to PHP.
+fn imdb_search_plain_context(s: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut pos = 0;
+    while pos < s.len() {
+        if s[pos] == b'<' {
+            let mut name = pos + 1;
+            if s.get(name) == Some(&b'/') { name += 1; }
+            if !s.get(name)?.is_ascii_alphabetic() { return None; }
+            pos = name;
+            let mut quote = 0;
+            while pos < s.len() {
+                let b = s[pos];
+                if b == b'<' { return None; }
+                if quote != 0 {
+                    if b == quote { quote = 0; }
+                } else if b == b'>' { break; }
+                else if b == b'\'' || b == b'"' { quote = b; }
+                pos += 1;
+            }
+            pos = (pos + 1).min(s.len());
+        } else {
+            out.push(s[pos]);
+            pos += 1;
+        }
+    }
+    Some(out)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_imdb_search_html_rows(
+    input: *const u8, input_len: usize, out_buf: *mut u8, out_cap: usize,
+) -> isize {
+    if input.is_null() { return -1; }
+    let s = unsafe { slice::from_raw_parts(input, input_len) };
+    if s.contains(&0) || std::str::from_utf8(s).is_err() { return -1; }
+    let mut out = OutCursor::new(out_buf, out_cap);
+    let mut pos = 0;
+    let mut count = 0;
+    while pos + 2 <= s.len() && count < 25 {
+        if !s[pos..pos + 2].eq_ignore_ascii_case(b"<a") { pos += 1; continue; }
+        // PCRE also accepts tag-name prefixes; let it handle those and malformed attributes.
+        if !s.get(pos + 2).is_some_and(u8::is_ascii_whitespace) { return -1; }
+        let Some(end_rel) = s[pos..].iter().position(|&b| b == b'>') else { return -1; };
+        let end = pos + end_rel;
+        let attrs = &s[pos + 2..end];
+        let hits: Vec<_> = attrs.windows(5).enumerate().filter(|(_, w)| w.eq_ignore_ascii_case(b"href=")).map(|(i, _)| i).collect();
+        if hits.is_empty() { pos = end + 1; continue; }
+        if hits.len() != 1 || attrs.contains(&b'<') { return -1; }
+        let h = hits[0];
+        if h == 0 || !attrs[h - 1].is_ascii_whitespace() { return -1; }
+        let Some(&quote) = attrs.get(h + 5) else { return -1; };
+        if quote != b'\'' && quote != b'"' { return -1; }
+        let from = h + 6;
+        let Some(close) = attrs[from..].iter().position(|&b| b == quote) else { return -1; };
+        let href = &attrs[from..from + close];
+        if href.contains(&b'&') { return -1; }
+        if !href.get(..9).is_some_and(|w| w.eq_ignore_ascii_case(b"/title/tt")) { pos = end + 1; continue; }
+        let id_end = href.len().saturating_sub(1);
+        if !(15..=18).contains(&href.len()) || href.last() != Some(&b'/') || !href[9..id_end].iter().all(u8::is_ascii_digit) { return -1; }
+        let title_start = end + 1;
+        let Some(close) = s[title_start..].windows(4).position(|w| w.eq_ignore_ascii_case(b"</a>")) else { return -1; };
+        let title_end = title_start + close;
+        let title = &s[title_start..title_end];
+        if title.contains(&b'<') || title.contains(&b'&') { return -1; }
+        let title = imdb_trim(title);
+        pos = title_end + 4;
+        if title.is_empty() { continue; }
+        let Some(context) = imdb_search_plain_context(&s[pos..(pos + 200).min(s.len())]) else { return -1; };
+        for field in [&href[9..id_end], title, imdb_year(&context)] {
+            out.push_slice(field);
+            out.push_byte(0);
+        }
+        count += 1;
+    }
+    if count == 0 { return -1; } // The DOM fallback can still find looser hrefs.
+    out.finish()
+}
+
+
+#[cfg(test)]
+mod imdb_search_tests {
+    use super::*;
+
+    #[test]
+    fn search_text_byte_semantics_and_size_contract() {
+        let mut buf = [0u8; 128];
+        for (mode, input, expected) in [
+            (0, &b"x19001 2020"[..], &b"1900"[..]),
+            (1, b" x._V1_a.b.jpg?x.y ", b"x.y"),
+            (1, b"x._V1_a\nb.jpg", b"x._V1_a\nb.jpg"),
+            (2, b" Tom & Jerry (2020) ", b"tom_jerry_2020"),
+            (2, b"!!! ---", b""),
+            (2, b"(500) Days of Summer", b"500_days_of_summer"),
+            (3, b" Peter's  Show!\tX ", b"%%Peters%%Show\tX%%"),
+            (4, b"The Show (2020)", b"The Show"),
+            (4, b"(2020)", b"(2020)"),
+            (4, b"A\x0c(2020)", b"A"),
+            (4, b" \x0c(2020)", b""),
+            (4, b"\x0c(2020)", b"\x0c"),
+            (5, b"a AND b and c", b"a & b & c"),
+            (6, b"Peter Theater", b"Petre Theatre"),
+        ] {
+            let n = unsafe { nntmux_imdb_search_text(input.as_ptr(), input.len(), mode, buf.as_mut_ptr(), buf.len()) };
+            assert_eq!(&buf[..n as usize], expected);
+            let n = unsafe { nntmux_imdb_search_text(input.as_ptr(), input.len(), mode, buf.as_mut_ptr(), 0) };
+            if expected.is_empty() { assert_eq!(n, 0); } else { assert!(n <= -4); }
+        }
+        assert_eq!(unsafe { nntmux_imdb_search_text("É".as_ptr(), 2, 2, buf.as_mut_ptr(), buf.len()) }, -1);
+        assert_eq!(unsafe { nntmux_imdb_search_text(std::ptr::null(), 0, 0, buf.as_mut_ptr(), buf.len()) }, -1);
+    }
+
+    #[test]
+    fn suggestion_subset_validates_the_whole_document() {
+        let mut buf = [0u8; 1024];
+        let json = br#"{"d":[{"id":"tt01234567","l":" Name ","y":2024,"qid":"tvSeries","i":{"imageUrl":"https:\/\/x\/a.jpg"}}],"q":"Name"}"#;
+        let n = unsafe { nntmux_imdb_suggestion_rows(json.as_ptr(), json.len(), buf.as_mut_ptr(), buf.len()) };
+        assert_eq!(&buf[..n as usize], b"01234567\0Name\x002024\0");
+        for bad in [
+            &br#"{"d":[{"id":"tt1","l":"\u00e9"}]}"#[..],
+            br#"{"d":[{"id":"tt1","l":"A"}],"x":01}"#,
+            br#"{"d":[{"id":"tt1","l":"A"}],"x":[true,]}"#,
+            br#"{"d":[{"id":"tt1","l":"A","y":1e3}]}"#,
+            br#"{"d":[],"d":[]}"#,
+            br#"{"d":[{"id":"tt1","l":"A"}]} garbage"#,
+        ] {
+            assert_eq!(unsafe { nntmux_imdb_suggestion_rows(bad.as_ptr(), bad.len(), buf.as_mut_ptr(), buf.len()) }, -1);
+        }
+    }
+
+    #[test]
+    fn html_subset_preserves_order_and_defers_complex_titles() {
+        let mut buf = [0u8; 1024];
+        let html = br#"<a href="/title/tt01234567/"> Name </a><span class="year">2024</span>"#;
+        let n = unsafe { nntmux_imdb_search_html_rows(html.as_ptr(), html.len(), buf.as_mut_ptr(), buf.len()) };
+        assert_eq!(&buf[..n as usize], b"01234567\0Name\x002024\0");
+        for html in [
+            &br#"<a href="/title/tt01234567/?ref=x"> Name </a>2024"#[..],
+            br#"<a href="/title/tt01234567/">Tom &amp; Jerry</a>2024"#,
+            br#"<a href="/title/tt01234567/"><b>Title</b></a>2024"#,
+        ] {
+            assert_eq!(unsafe { nntmux_imdb_search_html_rows(html.as_ptr(), html.len(), buf.as_mut_ptr(), buf.len()) }, -1);
+        }
+    }
+}

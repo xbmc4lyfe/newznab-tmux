@@ -52,6 +52,18 @@ class ImdbScraper
         ssize_t nntmux_imdb_extract_jsonld_and_languages(const char *html, size_t html_len, char *out_buf, size_t out_cap);
         C;
 
+    // Search candidates are exposed through *Native for parity/benchmarks.
+    // Production stays PHP: the paired mean/p99 gate failed (see the parity test).
+    private const string SEARCH_CDEF = <<<'C'
+        ssize_t nntmux_imdb_search_text(const char *input, size_t input_len, uint32_t mode, char *out_buf, size_t out_cap);
+        ssize_t nntmux_imdb_suggestion_rows(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+        ssize_t nntmux_imdb_search_html_rows(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+        C;
+
+    private ?FFI $searchNative = null;
+
+    private bool $searchNativeResolved = false;
+
     private ?FFI $native = null;
 
     private bool $nativeResolved = false;
@@ -61,7 +73,7 @@ class ImdbScraper
 
     private bool $wafCheckedResult = false;
 
-    public function __construct(?Client $client = null, private readonly bool $useNative = true)
+    public function __construct(?Client $client = null, private readonly bool $useNative = true, private readonly bool $useRustFfi = true)
     {
         $this->imdbApiDevBaseUrl = rtrim((string) config('nntmux_api.imdbapi_dev_base_url', 'https://api.imdbapi.dev'), '/');
         $this->client = $client ?? new Client([
@@ -255,8 +267,7 @@ class ImdbScraper
             return [];
         }
 
-        $norm = strtolower(preg_replace('/[^a-z0-9 ]/i', '', $query) ?? '');
-        $slug = preg_replace('/\s+/', '_', trim($norm)) ?? '';
+        $slug = $this->normalizeSearchSlug($query);
         if ($slug === '') {
             return [];
         }
@@ -1083,6 +1094,109 @@ class ImdbScraper
             'tvseries', 'tv_series', 'tv mini series', 'tv_mini_series', 'tvminiseries', 'tvspecial', 'tv_special', 'tvmovie', 'tv_movie', 'tvepisode', 'tv_episode' => 'tv',
             default => 'movie',
         };
+    }
+
+    private function searchLibrary(): ?FFI
+    {
+        if (! $this->useRustFfi) {
+            return null;
+        }
+        if (! $this->searchNativeResolved) {
+            $this->searchNative = RustPipelineLibrary::resolveDomain('media', self::SEARCH_CDEF);
+            $this->searchNativeResolved = true;
+        }
+
+        return $this->searchNative;
+    }
+
+    private function searchNativeOutput(string $input, string $symbol, ?int $mode = null): ?string
+    {
+        $ffi = $this->searchLibrary();
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            $capacity = 0;
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, max(256, strlen($input) + 16), $capacity);
+            if ($scratch === null) {
+                return null;
+            }
+            $args = $mode === null ? [$input, strlen($input)] : [$input, strlen($input), $mode];
+            $written = $ffi->$symbol(...[...$args, $scratch, $capacity]);
+            if ($written <= -4) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($scratch === null) {
+                    return null;
+                }
+                $written = $ffi->$symbol(...[...$args, $scratch, $capacity]);
+            }
+
+            return $written < 0 ? null : ($written === 0 ? '' : FFI::string($scratch, $written));
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    public function extractYearFromTextNative(string $text): string
+    {
+        return $this->searchNativeOutput($text, 'nntmux_imdb_search_text', 0) ?? $this->extractYearFromText($text);
+    }
+
+    public function normalizeImageUrlNative(mixed $image): string
+    {
+        if (! is_string($image)) {
+            return $this->normalizeImageUrl($image);
+        }
+
+        return $this->searchNativeOutput($image, 'nntmux_imdb_search_text', 1) ?? $this->normalizeImageUrl($image);
+    }
+
+    private function normalizeSearchSlug(string $query): string
+    {
+        $norm = strtolower(preg_replace('/[^a-z0-9 ]/i', '', $query) ?? '');
+
+        return preg_replace('/\s+/', '_', trim($norm)) ?? '';
+    }
+
+    public function normalizeSearchSlugNative(string $query): string
+    {
+        return $this->searchNativeOutput($query, 'nntmux_imdb_search_text', 2) ?? $this->normalizeSearchSlug($query);
+    }
+
+    /** @return list<array{imdbid: string, title: string, year: string}>|null */
+    private function nativeSearchRows(string $input, string $symbol, bool $unique = false): ?array
+    {
+        $raw = $this->searchNativeOutput($input, $symbol);
+        if ($raw === null) {
+            return null;
+        }
+        if ($raw === '') {
+            return [];
+        }
+        $fields = explode("\0", substr($raw, 0, -1));
+        $results = [];
+        for ($i = 0, $count = count($fields); $i < $count; $i += 3) {
+            $row = ['imdbid' => $fields[$i], 'title' => $fields[$i + 1], 'year' => $fields[$i + 2]];
+            if ($unique) {
+                $results[$row['imdbid']] = $row;
+            } else {
+                $results[] = $row;
+            }
+        }
+
+        return array_values($results);
+    }
+
+    /** @return list<array{imdbid: string, title: string, year: string}> */
+    public function parseSuggestionJsonNative(string $body): array
+    {
+        return $this->nativeSearchRows($body, 'nntmux_imdb_suggestion_rows') ?? $this->parseSuggestionJson($body);
+    }
+
+    /** @return list<array{imdbid: string, title: string, year: string}> */
+    public function parseSearchHtmlNative(string $html): array
+    {
+        return $this->nativeSearchRows($html, 'nntmux_imdb_search_html_rows', true) ?? $this->parseSearchHtml($html);
     }
 
     private function extractYearFromText(string $text): string
