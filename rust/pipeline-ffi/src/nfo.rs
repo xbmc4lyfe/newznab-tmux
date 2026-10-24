@@ -17338,3 +17338,312 @@ pub unsafe extern "C" fn nntmux_w21_nfo_fingerprint_failures_queue(
     }))
     .unwrap_or(-1)
 }
+
+// Wave 22 Slice 22.2. Pure article sizing, enum text and log input helpers.
+// Transport, validation, warnings/coercions and all I/O remain owned by PHP.
+fn w22_log_trim(value: &VerificationOutboxValue) -> Option<VerificationOutboxValue> {
+    use VerificationOutboxValue as V;
+    match value {
+        V::Bytes(bytes) => {
+            let trim = |b: &u8| matches!(b, 0 | b' ' | b'\t' | b'\n' | b'\r' | 11);
+            let start = bytes.iter().position(|b| !trim(b)).unwrap_or(bytes.len());
+            let end = bytes
+                .iter()
+                .rposition(|b| !trim(b))
+                .map_or(start, |i| i + 1);
+            Some(w16_string(&bytes[start..end]))
+        }
+        V::Null | V::Bool(_) | V::Int(_) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn w22_article_source_compute(
+    operation: u32,
+    args: &[VerificationOutboxValue],
+) -> Option<VerificationOutboxValue> {
+    use VerificationOutboxValue as V;
+    Some(match (operation, args) {
+        (
+            0,
+            [
+                V::Int(buffer),
+                V::Int(article),
+                V::Int(connections),
+                V::Int(window),
+            ],
+        ) => {
+            let frames = (buffer.max(&1) / article.max(&1)).max(1);
+            let connections = frames.min((*connections).clamp(1, 8));
+            let window = (frames / connections).max(1).min((*window).clamp(1, 16));
+            V::Int(connections * window)
+        }
+        (1, [V::Int(count), V::Int(connections)]) => {
+            // Above the exact f64 range PHP's division/ceil/cast is ambiguous.
+            if !(1..=9_007_199_254_740_991).contains(count) {
+                return None;
+            }
+            let connections = (*count).min((*connections).clamp(1, 8));
+            let window = ((*count as f64) / (connections as f64)).ceil() as i64;
+            w16_map(vec![
+                ("connections", V::Int(connections)),
+                ("window", V::Int(window)),
+            ])
+        }
+        (2, [V::Int(article), V::Null]) => V::Int(*article),
+        (2, [V::Int(article), V::Int(maximum)]) => V::Int((*article).min(*maximum)),
+        (10, [V::Int(maximum), V::Int(buffer)]) => V::Int((*maximum).max(*buffer)),
+        (3..=6, [V::Bytes(value)]) => {
+            let labels: &[(&[u8], &[u8])] = if operation <= 4 {
+                &[
+                    (b"inserted", b"Inserted"),
+                    (b"queued", b"Queued"),
+                    (b"metadata_ignored", b"Metadata Ignored"),
+                    (b"metadata_deferred", b"Metadata Deferred"),
+                    (b"duplicate", b"Duplicate"),
+                    (b"blacklisted", b"Blacklisted"),
+                    (b"nogroup", b"No Group"),
+                    (b"failed", b"Failed"),
+                ]
+            } else {
+                &[
+                    (b"renamed", b"Renamed"),
+                    (b"no_match", b"No Match"),
+                    (b"retryable", b"Retryable"),
+                    (b"deferred", b"Deferred"),
+                ]
+            };
+            match labels.iter().find(|(key, _)| *key == value.as_slice()) {
+                Some((key, label)) => w16_string(if operation % 2 == 1 { key } else { label }),
+                None => V::Null,
+            }
+        }
+        (7, [file]) => w16_map(vec![("file", w22_log_trim(file)?)]),
+        (8, [levels]) => {
+            if !w19_list(levels) {
+                return None;
+            }
+            let mut seen = std::collections::HashSet::new();
+            let mut unique = Vec::new();
+            for (_, value) in w16_entries(levels)? {
+                let bytes = w16_bytes(value)?;
+                if seen.insert(bytes) {
+                    unique.push(w16_string(bytes));
+                }
+            }
+            w16_list(unique)
+        }
+        (9, [file, query]) => w16_map(vec![
+            ("file", w22_log_trim(file)?),
+            ("q", w22_log_trim(query)?),
+        ]),
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod w22_article_source_nfo_tests {
+    use super::*;
+
+    fn call(operation: u32, args: Vec<VerificationOutboxValue>, output: &mut [u8]) -> isize {
+        let mut input = Vec::new();
+        w16_list(args).serialize(&mut input);
+        unsafe {
+            nntmux_w22_article_source_enums_log_requests(
+                operation,
+                input.as_ptr(),
+                input.len(),
+                output.as_mut_ptr(),
+                output.len(),
+            )
+        }
+    }
+
+    #[test]
+    fn nfo_w22_parity_and_atomic_capacity() {
+        use VerificationOutboxValue as V;
+        for (op, args, result) in [
+            (
+                0,
+                vec![V::Int(64), V::Int(10), V::Int(8), V::Int(16)],
+                V::Int(6),
+            ),
+            (
+                0,
+                vec![V::Int(i64::MIN), V::Int(0), V::Int(0), V::Int(-2)],
+                V::Int(1),
+            ),
+            (
+                1,
+                vec![V::Int(17), V::Int(8)],
+                w16_map(vec![("connections", V::Int(8)), ("window", V::Int(3))]),
+            ),
+            (2, vec![V::Int(-3), V::Null], V::Int(-3)),
+            (10, vec![V::Int(99), V::Int(100)], V::Int(100)),
+            (3, vec![w16_string(b"inserted")], w16_string(b"inserted")),
+            (4, vec![w16_string(b"nogroup")], w16_string(b"No Group")),
+            (5, vec![w16_string(b"bad")], V::Null),
+            (6, vec![w16_string(b"no_match")], w16_string(b"No Match")),
+            (
+                7,
+                vec![w16_string(b" \0\x0ba\xff\x0c\n")],
+                w16_map(vec![("file", w16_string(b"a\xff\x0c"))]),
+            ),
+            (
+                8,
+                vec![w16_list(vec![
+                    w16_string(b"01"),
+                    w16_string(b"1"),
+                    w16_string(b"01"),
+                ])],
+                w16_list(vec![w16_string(b"01"), w16_string(b"1")]),
+            ),
+            (
+                9,
+                vec![V::Null, V::Bool(false)],
+                w16_map(vec![("file", V::Null), ("q", V::Bool(false))]),
+            ),
+        ] {
+            let mut expected = Vec::new();
+            result.serialize(&mut expected);
+            let mut output = [0xa5; 1024];
+            assert_eq!(call(op, args.clone(), &mut output), expected.len() as isize);
+            assert_eq!(&output[..expected.len()], expected);
+            assert!(output[expected.len()..].iter().all(|b| *b == 0xa5));
+            let mut short = vec![0xa5; expected.len() - 1];
+            assert_eq!(call(op, args, &mut short), -(expected.len() as isize));
+            assert!(short.iter().all(|b| *b == 0xa5));
+        }
+    }
+
+    #[test]
+    fn nfo_w22_declines_noncanonical_and_unsafe_ranges() {
+        let mut out = [0xa5; 256];
+        for input in [
+            &b""[..],
+            b"a:1:{i:00;s:1:\"x\";}",
+            b"a:1:{i:0;R:1;}",
+            b"a:1:{i:0;O:8:\"stdClass\":0:{}}",
+            b"a:1:{i:0;s:01:\"x\";}",
+            b"a:1:{i:0;s:1:\"x\";}junk",
+            b"a:2:{i:0;N;i:0;N;}",
+            b"a:1:{s:1:\"0\";N;}",
+            b"a:1:{i:0;d:1.0;}",
+        ] {
+            assert_eq!(
+                unsafe {
+                    nntmux_w22_article_source_enums_log_requests(
+                        7,
+                        input.as_ptr(),
+                        input.len(),
+                        out.as_mut_ptr(),
+                        out.len(),
+                    )
+                },
+                -1
+            );
+        }
+        assert_eq!(call(999, vec![], &mut out), -1);
+        assert_eq!(
+            call(
+                1,
+                vec![
+                    VerificationOutboxValue::Int(i64::MAX),
+                    VerificationOutboxValue::Int(1)
+                ],
+                &mut out
+            ),
+            -1
+        );
+        unsafe {
+            let input = b"a:1:{i:0;N;}";
+            let run =
+                |p, len, o, cap| nntmux_w22_article_source_enums_log_requests(7, p, len, o, cap);
+            assert_eq!(run(std::ptr::null(), 0, out.as_mut_ptr(), 256), -1);
+            assert_eq!(
+                run(input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                -1
+            );
+            assert_eq!(run(input.as_ptr(), usize::MAX, out.as_mut_ptr(), 256), -1);
+            assert_eq!(run(usize::MAX as *const u8, 2, out.as_mut_ptr(), 256), -1);
+            assert_eq!(
+                run(input.as_ptr(), input.len(), usize::MAX as *mut u8, 2),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), input.len(), out.as_mut_ptr(), usize::MAX),
+                -1
+            );
+            assert_eq!(run(out.as_ptr(), 6, out.as_mut_ptr(), 256), -1);
+        }
+        assert!(out.iter().all(|b| *b == 0xa5));
+    }
+}
+
+/// Evaluate canonical, scalar/array PHP serialization. A decline returns -1;
+/// insufficient capacity returns -required without touching the output.
+///
+/// # Safety
+/// Pointers must designate live disjoint readable/writable allocations for the
+/// declared lengths (non-null even for zero lengths), bounded to 64 MiB.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w22_article_source_enums_log_requests(
+    operation: u32,
+    input: *const u8,
+    length: usize,
+    output: *mut u8,
+    capacity: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        const MAX_BYTES: usize = 64 * 1024 * 1024;
+        if !nfo_abi_range(input, length, false)
+            || !nfo_abi_range(output, capacity, false)
+            || length > MAX_BYTES
+            || capacity > MAX_BYTES
+            || yenc_ranges_overlap(input as usize, length, output as usize, capacity)
+        {
+            return -1;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, length) };
+        let mut parser = VerificationOutboxParser {
+            bytes,
+            pos: 0,
+            remaining: 32768,
+        };
+        let Some(value) = parser.value(510) else {
+            return -1;
+        };
+        if parser.pos != length || !w19_list(&value) || !w20_canonical(&value) {
+            return -1;
+        }
+        let mut canonical = Vec::new();
+        value.serialize(&mut canonical);
+        if canonical != bytes {
+            return -1;
+        }
+        let args: Vec<_> = w16_entries(&value)
+            .unwrap()
+            .iter()
+            .map(|(_, v)| v.clone())
+            .collect();
+        let Some(result) = w22_article_source_compute(operation, &args) else {
+            return -1;
+        };
+        let mut wire = Vec::new();
+        result.serialize(&mut wire);
+        if wire.len() > MAX_BYTES {
+            return -1;
+        }
+        let Ok(required) = isize::try_from(wire.len()) else {
+            return -1;
+        };
+        if wire.len() > capacity {
+            return -required;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(wire.as_ptr(), output, wire.len());
+        }
+        required
+    }))
+    .unwrap_or(-1)
+}
