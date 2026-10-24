@@ -17107,3 +17107,234 @@ pub unsafe extern "C" fn nntmux_w20_verification_helpers(
     }))
     .unwrap_or(-1)
 }
+
+// Wave 21 Slice 21.2: model/query/update projections and fingerprint queue state.
+// No SQL, clocks, locks, model casts or persistence cross the ABI boundary.
+fn w21_nfo_fingerprint_compute(
+    operation: u32,
+    args: &[VerificationOutboxValue],
+) -> Option<VerificationOutboxValue> {
+    use VerificationOutboxValue as V;
+    Some(match (operation, args) {
+        (0, [V::Bool(include_nfo)]) => w16_map(vec![
+            ("columns", w16_list(vec![w16_string(b"releases_id")])),
+            (
+                "raw",
+                if *include_nfo {
+                    w16_string(b"UNCOMPRESS(nfo) AS nfo")
+                } else {
+                    V::Null
+                },
+            ),
+        ]),
+        (1, []) => w16_map(vec![
+            ("metadata", w16_string(b"array")),
+            ("collected_at", w16_string(b"datetime")),
+        ]),
+        (2, []) => w16_map(vec![("attempts", w16_string(b"integer"))]),
+        (3, [V::Null]) => w16_map(vec![]),
+        (3, [V::Bytes(fingerprint)]) => {
+            w16_map(vec![("article_fingerprint", w16_string(fingerprint))])
+        }
+        (4, [V::Null, V::Null, V::Bytes(_), V::Bool(_)]) => V::Bool(false),
+        (
+            4,
+            [
+                V::Bytes(stored),
+                V::Bytes(status),
+                V::Bytes(incoming),
+                V::Bool(force),
+            ],
+        ) => {
+            // Match hash_equals' length check and content-independent comparison.
+            let equal = stored.len() == incoming.len()
+                && stored
+                    .iter()
+                    .zip(incoming)
+                    .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+                    == 0;
+            V::Bool(equal && (!force || matches!(status.as_slice(), b"pending" | b"processing")))
+        }
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod w21_nfo_fingerprint_tests {
+    use super::*;
+
+    fn call(operation: u32, input: &[u8], output: &mut [u8]) -> isize {
+        unsafe {
+            nntmux_w21_nfo_fingerprint_failures_queue(
+                operation,
+                input.as_ptr(),
+                input.len(),
+                output.as_mut_ptr(),
+                output.len(),
+            )
+        }
+    }
+
+    #[test]
+    fn nfo_w21_projections_and_queue_parity() {
+        for (operation, input, expected) in [
+            (
+                0,
+                &b"a:1:{i:0;b:0;}"[..],
+                &b"a:2:{s:7:\"columns\";a:1:{i:0;s:11:\"releases_id\";}s:3:\"raw\";N;}"[..],
+            ),
+            (
+                1,
+                b"a:0:{}",
+                b"a:2:{s:8:\"metadata\";s:5:\"array\";s:12:\"collected_at\";s:8:\"datetime\";}",
+            ),
+            (2, b"a:0:{}", b"a:1:{s:8:\"attempts\";s:7:\"integer\";}"),
+            (3, b"a:1:{i:0;N;}", b"a:0:{}"),
+            (
+                3,
+                b"a:1:{i:0;s:2:\"\0\xff\";}",
+                b"a:1:{s:19:\"article_fingerprint\";s:2:\"\0\xff\";}",
+            ),
+            (
+                4,
+                b"a:4:{i:0;s:1:\"a\";i:1;s:7:\"pending\";i:2;s:1:\"a\";i:3;b:1;}",
+                b"b:1;",
+            ),
+            (
+                4,
+                b"a:4:{i:0;s:1:\"a\";i:1;s:6:\"failed\";i:2;s:1:\"a\";i:3;b:1;}",
+                b"b:0;",
+            ),
+        ] {
+            let mut output = vec![0xa5; 1024];
+            let written = call(operation, input, &mut output);
+            assert_eq!(written, expected.len() as isize);
+            assert_eq!(&output[..expected.len()], expected);
+            assert!(output[expected.len()..].iter().all(|b| *b == 0xa5));
+            let mut short = vec![0xa5; expected.len() - 1];
+            assert_eq!(
+                call(operation, input, &mut short),
+                -(expected.len() as isize)
+            );
+            assert!(short.iter().all(|b| *b == 0xa5));
+        }
+    }
+
+    #[test]
+    fn nfo_w21_declines_malformed_noncanonical_and_unsafe_ranges() {
+        let mut output = [0xa5; 256];
+        for input in [
+            &b""[..],
+            b"a:1:{i:0;b:2;}",
+            b"a:1:{i:00;b:1;}",
+            b"a:1:{i:0;b:1;}junk",
+            b"a:2:{i:0;b:1;i:0;b:0;}",
+            b"a:1:{s:1:\"0\";b:1;}",
+            b"a:1:{i:0;R:1;}",
+            b"a:1:{i:0;O:8:\"stdClass\":0:{}}",
+            b"a:1:{i:0;i:1;}",
+        ] {
+            assert_eq!(call(0, input, &mut output), -1);
+            assert!(output.iter().all(|b| *b == 0xa5));
+        }
+        assert_eq!(call(999, b"a:0:{}", &mut output), -1);
+        unsafe {
+            let input = b"a:0:{}";
+            let run = |ptr, length, out, capacity| {
+                nntmux_w21_nfo_fingerprint_failures_queue(1, ptr, length, out, capacity)
+            };
+            assert_eq!(run(std::ptr::null(), 0, output.as_mut_ptr(), 256), -1);
+            assert_eq!(
+                run(input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), usize::MAX, output.as_mut_ptr(), 256),
+                -1
+            );
+            assert_eq!(
+                run(usize::MAX as *const u8, 2, output.as_mut_ptr(), 256),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), input.len(), usize::MAX as *mut u8, 2),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), input.len(), output.as_mut_ptr(), usize::MAX),
+                -1
+            );
+            assert_eq!(run(output.as_ptr(), 6, output.as_mut_ptr(), 256), -1);
+        }
+        assert!(output.iter().all(|b| *b == 0xa5));
+    }
+}
+
+/// Evaluate the scalar-only PHP helper protocol. Invalid/noncanonical inputs
+/// return -1. Insufficient capacity returns -required with no output writes.
+///
+/// # Safety
+/// Both pointers must address live readable/writable allocations of the declared
+/// lengths, even for zero length; ranges must be disjoint and at most 64 MiB.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w21_nfo_fingerprint_failures_queue(
+    operation: u32,
+    input: *const u8,
+    length: usize,
+    output: *mut u8,
+    capacity: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        const MAX_BYTES: usize = 64 * 1024 * 1024;
+        if !nfo_abi_range(input, length, false)
+            || !nfo_abi_range(output, capacity, false)
+            || length > MAX_BYTES
+            || capacity > MAX_BYTES
+            || yenc_ranges_overlap(input as usize, length, output as usize, capacity)
+        {
+            return -1;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, length) };
+        let mut parser = VerificationOutboxParser {
+            bytes,
+            pos: 0,
+            remaining: 32,
+        };
+        let Some(value) = parser.value(510) else {
+            return -1;
+        };
+        if parser.pos != length || !w19_list(&value) || !w20_canonical(&value) {
+            return -1;
+        }
+        // Enforce canonical serialization too (no padded integers/lengths).
+        let mut canonical = Vec::new();
+        value.serialize(&mut canonical);
+        if canonical != bytes {
+            return -1;
+        }
+        let args: Vec<_> = w16_entries(&value)
+            .unwrap()
+            .iter()
+            .map(|(_, v)| v.clone())
+            .collect();
+        let Some(result) = w21_nfo_fingerprint_compute(operation, &args) else {
+            return -1;
+        };
+        let mut wire = Vec::new();
+        result.serialize(&mut wire);
+        if wire.len() > MAX_BYTES {
+            return -1;
+        }
+        let Ok(required) = isize::try_from(wire.len()) else {
+            return -1;
+        };
+        if wire.len() > capacity {
+            return -required;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(wire.as_ptr(), output, wire.len());
+        }
+        required
+    }))
+    .unwrap_or(-1)
+}

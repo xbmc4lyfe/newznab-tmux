@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Fingerprint;
 
+use App\Models\ReleaseNfo;
 use App\Services\Nzb\DatabaseNzbStore;
 use App\Services\Nzb\NzbService;
 use App\Services\Nzb\NzbSourceGuard;
@@ -13,6 +14,29 @@ use RuntimeException;
 /** Producers only enqueue; standalone Rust processes own all fingerprint execution. */
 final class DatabaseFingerprintQueue
 {
+    // Paired common/uncommon mean and p99 must all reach 1.5x before adoption.
+    private static bool $useRustFfi = false;
+
+    public static function enableRustFfi(): void
+    {
+        self::$useRustFfi = true;
+    }
+
+    public static function disableRustFfi(): void
+    {
+        self::$useRustFfi = false;
+    }
+
+    public static function resetRustFfi(): void
+    {
+        self::$useRustFfi = false;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
     public function enqueue(int $releaseId, bool $force = false, bool $importLegacy = false): bool
     {
         return DB::transaction(function () use ($releaseId, $force, $importLegacy): bool {
@@ -50,8 +74,7 @@ final class DatabaseFingerprintQueue
             throw new RuntimeException('Fingerprint enqueue requires the source transaction.');
         }
         $job = DB::table('release_fingerprint_jobs')->where('release_id', $release->id)->lockForUpdate()->first();
-        if ($job !== null && hash_equals($job->source_digest, $digest)
-            && (! $force || in_array($job->status, ['pending', 'processing'], true))) {
+        if (self::shouldSkip($job, $digest, $force)) {
             return;
         }
         // Replacing the source fences even an in-flight claim immediately in the same transaction.
@@ -63,5 +86,32 @@ final class DatabaseFingerprintQueue
             DB::table('release_fingerprint_jobs')->where('release_id', $release->id)->update($values);
         }
         DB::table('release_fingerprint_metadata')->where('releases_id', $release->id)->update(['status' => 'stale', 'run_token' => null, 'updated_at' => now('UTC')]);
+    }
+
+    public static function shouldSkip(?object $job, string $digest, bool $force): bool
+    {
+        return (self::$useRustFfi ? self::shouldSkipNative($job, $digest, $force) : null) ?? self::shouldSkipPhp($job, $digest, $force);
+    }
+
+    public static function shouldSkipPhp(?object $job, string $digest, bool $force): bool
+    {
+        return $job !== null && hash_equals($job->source_digest, $digest)
+            && (! $force || in_array($job->status, ['pending', 'processing'], true));
+    }
+
+    public static function shouldSkipNative(?object $job, string $digest, bool $force): ?bool
+    {
+        // Never serialize or evaluate a model/magic object's properties speculatively.
+        if ($job !== null && get_class($job) !== \stdClass::class) {
+            return null;
+        }
+        $fields = $job === null ? [] : get_object_vars($job);
+        if ($job !== null && (! isset($fields['source_digest'], $fields['status'])
+            || ! is_string($fields['source_digest']) || ! is_string($fields['status']))) {
+            return null;
+        }
+        $result = ReleaseNfo::computeNative(4, [$fields['source_digest'] ?? null, $fields['status'] ?? null, $digest, $force]);
+
+        return is_bool($result) ? $result : null;
     }
 }
