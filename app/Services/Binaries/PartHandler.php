@@ -4,8 +4,11 @@ declare(strict_types=1);
 
 namespace App\Services\Binaries;
 
+use App\Support\RustPipelineLibrary;
 use App\Support\SqlError;
+use FFI;
 use Illuminate\Support\Facades\DB;
+use Throwable;
 
 /**
  * Handles part record creation during header storage.
@@ -14,6 +17,36 @@ use Illuminate\Support\Facades\DB;
  */
 final class PartHandler
 {
+    public const string FFI_CDEF = <<<'C'
+        int32_t nntmux_part_validation_error(int64_t part_number, const char *msg_id_ptr, size_t msg_id_len);
+        int32_t nntmux_part_should_prefer(const char *cand_msg_ptr, size_t cand_msg_len, int64_t cand_size, int64_t cand_num, const char *curr_msg_ptr, size_t curr_msg_len, int64_t curr_size, int64_t curr_num);
+        ssize_t nntmux_part_deduplicate(const char *input_ptr, size_t input_len, size_t count, uint32_t sort_by_pk, char *out_ptr, size_t out_cap);
+        ssize_t nntmux_part_sort_primary_key(const char *input_ptr, size_t input_len, size_t count, char *out_ptr, size_t out_cap);
+        C;
+
+    private static FFI|false|null $ffi = null;
+
+    private static bool $useRustFfi = true;
+
+    public static function setUseRustFfi(bool $use): void
+    {
+        self::$useRustFfi = $use;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    private static function resolveFfi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('additional', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
+
     /** @var list<PartRow> Pending parts to insert */
     private array $parts = [];
 
@@ -28,7 +61,7 @@ final class PartHandler
 
     private int $chunkSize;
 
-    private ?\Throwable $lastException = null;
+    private ?Throwable $lastException = null;
 
     /** @phpstan-ignore property.onlyWritten */
     private bool $addToPartRepair;
@@ -96,6 +129,12 @@ final class PartHandler
     /** @param array<string, mixed> $header */
     public static function validationError(array $header): ?string
     {
+        return self::validationErrorPhp($header);
+    }
+
+    /** @param array<string, mixed> $header */
+    public static function validationErrorPhp(array $header): ?string
+    {
         if ((int) ($header['matches'][2] ?? 0) <= 0) {
             return 'Invalid part number';
         }
@@ -106,6 +145,39 @@ final class PartHandler
         }
 
         return null;
+    }
+
+    /** @param array<string, mixed> $header */
+    public static function validationErrorNative(array $header, bool &$supported = false): ?string
+    {
+        $supported = false;
+        if (! self::$useRustFfi) {
+            return null;
+        }
+        $ffi = self::$ffi ?? self::resolveFfi();
+        if ($ffi === null || $ffi === false) {
+            return null;
+        }
+
+        $partNumber = (int) ($header['matches'][2] ?? 0);
+        $rawMessageId = (string) ($header['Message-ID'] ?? '');
+
+        try {
+            // @phpstan-ignore method.notFound
+            $code = $ffi->nntmux_part_validation_error($partNumber, $rawMessageId, \strlen($rawMessageId));
+            if (! \is_int($code) || $code < 0) {
+                return null;
+            }
+            $supported = true;
+
+            return match ($code) {
+                1 => 'Invalid part number',
+                2 => 'Invalid message ID',
+                default => null,
+            };
+        } catch (Throwable) {
+            return null;
+        }
     }
 
     /**
@@ -166,7 +238,7 @@ final class PartHandler
         $driver = DB::getDriverName();
         $totalInserted = 0;
         // Primary-key order (binaries_id, partnumber), so concurrent workers lock shared rows in the same sequence.
-        usort($parts, static fn (array $a, array $b): int => [(int) $a['binaries_id'], (int) $a['partnumber']] <=> [(int) $b['binaries_id'], (int) $b['partnumber']]);
+        $parts = $this->sortPartsByPrimaryKey($parts);
 
         try {
             foreach (array_chunk($parts, $this->chunkSize) as $chunk) {
@@ -190,7 +262,7 @@ final class PartHandler
             }
 
             return $totalInserted;
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             $this->lastException = $e;
             if (config('app.debug') === true) {
                 SqlError::logFailure('Parts chunk insert failed', $e);
@@ -250,6 +322,104 @@ final class PartHandler
     }
 
     /**
+     * Sort parts in primary-key order (binaries_id ASC, partnumber ASC).
+     *
+     * @param  list<PartRow>  $parts
+     * @return list<PartRow>
+     */
+    public function sortPartsByPrimaryKey(array $parts): array
+    {
+        if (self::$useRustFfi) {
+            $native = $this->sortPartsByPrimaryKeyNative($parts);
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
+        return $this->sortPartsByPrimaryKeyPhp($parts);
+    }
+
+    /**
+     * @param  list<PartRow>  $parts
+     * @return list<PartRow>
+     */
+    public function sortPartsByPrimaryKeyPhp(array $parts): array
+    {
+        usort($parts, static fn (array $a, array $b): int => [(int) $a['binaries_id'], (int) $a['partnumber']] <=> [(int) $b['binaries_id'], (int) $b['partnumber']]);
+
+        return $parts;
+    }
+
+    /**
+     * @param  list<PartRow>  $parts
+     * @return list<PartRow>|null
+     */
+    public function sortPartsByPrimaryKeyNative(array $parts): ?array
+    {
+        if (! self::$useRustFfi) {
+            return null;
+        }
+        $count = \count($parts);
+        if ($count <= 1) {
+            return array_values($parts);
+        }
+        $ffi = self::$ffi ?? self::resolveFfi();
+        if ($ffi === null || $ffi === false) {
+            return null;
+        }
+
+        $reindexed = array_values($parts);
+        $buf = '';
+        foreach ($reindexed as $part) {
+            $buf .= \pack('q2', (int) $part['binaries_id'], (int) $part['partnumber']);
+        }
+
+        $needed = $count * 4;
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(256, $needed), $cap);
+        if ($scratch === null) {
+            return null;
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_part_sort_primary_key($buf, \strlen($buf), $count, $scratch, $cap);
+            if (! \is_int($written) || $written === -1) {
+                return null;
+            }
+            if ($written < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_part_sort_primary_key($buf, \strlen($buf), $count, $scratch, $cap);
+                if (! \is_int($written) || $written < 0) {
+                    return null;
+                }
+            }
+            if ($written !== $needed) {
+                return null;
+            }
+
+            /** @var array<int, int>|false $indices */
+            $indices = \unpack('L*', FFI::string($scratch, $written));
+            if ($indices === false) {
+                return null;
+            }
+
+            $sorted = [];
+            foreach ($indices as $idx) {
+                $sorted[] = $reindexed[$idx];
+            }
+
+            return $sorted;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
      * Choose one deterministic segment for each (binary, part number).
      * Prefer a non-empty message id, then the larger payload, then the lower
      * article number. This matches the storage migration's duplicate policy.
@@ -257,12 +427,21 @@ final class PartHandler
      * @param  list<PartRow>  $parts
      * @return list<PartRow>
      */
-    private function deduplicateParts(array $parts): array
+    public function deduplicateParts(array $parts): array
+    {
+        return $this->deduplicatePartsPhp($parts);
+    }
+
+    /**
+     * @param  list<PartRow>  $parts
+     * @return list<PartRow>
+     */
+    public function deduplicatePartsPhp(array $parts): array
     {
         $deduplicated = [];
         foreach ($parts as $part) {
             $key = $this->partKey((int) $part['binaries_id'], (int) $part['partnumber']);
-            if (! isset($deduplicated[$key]) || $this->shouldPrefer($part, $deduplicated[$key])) {
+            if (! isset($deduplicated[$key]) || $this->shouldPreferPhp($part, $deduplicated[$key])) {
                 $deduplicated[$key] = $part;
             }
         }
@@ -271,10 +450,95 @@ final class PartHandler
     }
 
     /**
+     * @param  list<PartRow>  $parts
+     * @return list<PartRow>|null
+     */
+    public function deduplicatePartsNative(array $parts, bool $sortByPrimaryKey = false): ?array
+    {
+        if (! self::$useRustFfi) {
+            return null;
+        }
+        $count = \count($parts);
+        if ($count === 0) {
+            return [];
+        }
+        $ffi = self::$ffi ?? self::resolveFfi();
+        if ($ffi === null || $ffi === false) {
+            return null;
+        }
+
+        $reindexed = array_values($parts);
+        $buf = '';
+        foreach ($reindexed as $part) {
+            $msg = (string) $part['messageid'];
+            $buf .= \pack(
+                'q4L',
+                (int) $part['binaries_id'],
+                (int) $part['partnumber'],
+                (int) $part['size'],
+                (int) $part['number'],
+                \strlen($msg)
+            ).$msg;
+        }
+
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(256, $count * 4), $cap);
+        if ($scratch === null) {
+            return null;
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_part_deduplicate($buf, \strlen($buf), $count, $sortByPrimaryKey ? 1 : 0, $scratch, $cap);
+            if (! \is_int($written) || $written === -1) {
+                return null;
+            }
+            if ($written < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_part_deduplicate($buf, \strlen($buf), $count, $sortByPrimaryKey ? 1 : 0, $scratch, $cap);
+                if (! \is_int($written) || $written < 0) {
+                    return null;
+                }
+            }
+            if ($written === 0) {
+                return [];
+            }
+
+            /** @var array<int, int>|false $indices */
+            $indices = \unpack('L*', FFI::string($scratch, $written));
+            if ($indices === false) {
+                return null;
+            }
+
+            $out = [];
+            foreach ($indices as $idx) {
+                $out[] = $reindexed[$idx];
+            }
+
+            return $out;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
      * @param  PartRow  $candidate
      * @param  PartRow  $current
      */
-    private function shouldPrefer(array $candidate, array $current): bool
+    public function shouldPrefer(array $candidate, array $current): bool
+    {
+        return $this->shouldPreferPhp($candidate, $current);
+    }
+
+    /**
+     * @param  PartRow  $candidate
+     * @param  PartRow  $current
+     */
+    public function shouldPreferPhp(array $candidate, array $current): bool
     {
         $candidateHasMessageId = trim((string) $candidate['messageid']) !== '';
         $currentHasMessageId = trim((string) $current['messageid']) !== '';
@@ -287,6 +551,45 @@ final class PartHandler
         }
 
         return (int) $candidate['number'] < (int) $current['number'];
+    }
+
+    /**
+     * @param  PartRow  $candidate
+     * @param  PartRow  $current
+     */
+    public function shouldPreferNative(array $candidate, array $current): ?bool
+    {
+        if (! self::$useRustFfi) {
+            return null;
+        }
+        $ffi = self::$ffi ?? self::resolveFfi();
+        if ($ffi === null || $ffi === false) {
+            return null;
+        }
+
+        $candMsg = (string) $candidate['messageid'];
+        $currMsg = (string) $current['messageid'];
+
+        try {
+            // @phpstan-ignore method.notFound
+            $res = $ffi->nntmux_part_should_prefer(
+                $candMsg,
+                \strlen($candMsg),
+                (int) $candidate['size'],
+                (int) $candidate['number'],
+                $currMsg,
+                \strlen($currMsg),
+                (int) $current['size'],
+                (int) $current['number']
+            );
+            if (! \is_int($res) || $res < 0) {
+                return null;
+            }
+
+            return $res === 1;
+        } catch (Throwable) {
+            return null;
+        }
     }
 
     /** @return list<int> */
@@ -315,7 +618,7 @@ final class PartHandler
         return $this->failedPartNumbers;
     }
 
-    public function getLastException(): ?\Throwable
+    public function getLastException(): ?Throwable
     {
         return $this->lastException;
     }
