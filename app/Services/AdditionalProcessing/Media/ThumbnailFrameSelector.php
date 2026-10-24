@@ -8,6 +8,10 @@ use App\Services\AdditionalProcessing\Config\ProcessingConfiguration;
 use App\Services\AdditionalProcessing\DTO\MediaSourceHints;
 use App\Services\AdditionalProcessing\Enums\SourcePosition;
 use App\Services\AdditionalProcessing\Enums\VideoContainer;
+use App\Support\RustPipelineLibrary;
+use FFI;
+use FFI\CData;
+use Throwable;
 
 /**
  * Chooses the preview frame of a video, which is often only the start of the file.
@@ -15,6 +19,12 @@ use App\Services\AdditionalProcessing\Enums\VideoContainer;
  * Openings tend to be black or show logos, so frames are taken a quarter of the
  * way into the part that was downloaded, estimated from the container's
  * duration and the file's real size or the stream's bit rate.
+ *
+ * looksLikeText() and window() stay on native PHP: on 4 KiB playlist heads ltrim + stripos
+ * finishes in ~89 ns (matching a bare FFI call), and window() is three float operations
+ * (~100 ns), so the Rust candidates (looksLikeTextNative(), windowNative(), selectNative())
+ * measure below the 1.5x adoption threshold across all required workloads
+ * (see tests/Unit/RustImageInspectorFrameScorerParityTest.php).
  */
 class ThumbnailFrameSelector
 {
@@ -23,6 +33,21 @@ class ThumbnailFrameSelector
 
     /** Margin for bytes that hold headers or decode to less than the average. */
     private const float PLAYABLE_MARGIN = 0.85;
+
+    private const string FFI_CDEF = <<<'C'
+        int32_t nntmux_thumbnail_looks_like_text(const char *head_ptr, size_t head_len);
+        int32_t nntmux_thumbnail_window(uint32_t position_is_mid, double duration, uint32_t has_duration, int64_t bit_rate, uint32_t has_bit_rate, int64_t available_bytes, int64_t total_bytes, uint32_t has_hints, int32_t attempts, double *out_from, double *out_spacing);
+        C;
+
+    private static ?FFI $ffi = null;
+
+    private static bool $ffiResolved = false;
+
+    private static ?CData $windowOut = null;
+
+    private static ?CData $fromOut = null;
+
+    private static ?CData $spacingOut = null;
 
     public function __construct(
         private readonly ProcessingConfiguration $config,
@@ -56,6 +81,39 @@ class ThumbnailFrameSelector
         return null;
     }
 
+    public function selectNative(string $videoPath, string $workDirectory, ?MediaSourceHints $hints = null, bool &$supported = false): ?string
+    {
+        $supported = false;
+        $head = (string) @file_get_contents($videoPath, false, null, 0, 4096);
+        $container = VideoContainer::detect($head);
+        if ($container === null) {
+            $textSupported = false;
+            if (self::looksLikeTextNative($head, $textSupported)) {
+                $supported = $textSupported;
+
+                return null;
+            }
+        }
+
+        $windowSupported = false;
+        [$from, $spacing] = $this->windowNative($videoPath, $container, $hints, $windowSupported);
+        $windows = $from > 0.0 ? [[$from, $spacing], [0.0, 0.0]] : [[$from, $spacing]];
+        $supported = $windowSupported;
+        foreach ($windows as [$start, $gap]) {
+            $scorerSupported = false;
+            $best = $this->scorer->bestNative(
+                $this->grabber->grab($videoPath, $container, $start, $gap, $this->config->thumbnailFrameAttempts, $workDirectory),
+                $scorerSupported,
+            );
+            $supported = $supported && $scorerSupported;
+            if ($best !== null) {
+                return $best;
+            }
+        }
+
+        return null;
+    }
+
     /**
      * When to take the first frame, and how far apart the candidates should be so they
      * cover the rest of the downloaded playing time.
@@ -63,6 +121,14 @@ class ThumbnailFrameSelector
      * @return array{0: float, 1: float} seconds
      */
     public function window(string $videoPath, ?VideoContainer $container, ?MediaSourceHints $hints): array
+    {
+        return $this->windowPhp($videoPath, $container, $hints);
+    }
+
+    /**
+     * @return array{0: float, 1: float} seconds
+     */
+    public function windowPhp(string $videoPath, ?VideoContainer $container, ?MediaSourceHints $hints): array
     {
         if ($hints?->position === SourcePosition::Mid) {
             return [0.0, 0.0];
@@ -74,9 +140,103 @@ class ThumbnailFrameSelector
         return [$from, round(($playable - $from) / $this->config->thumbnailFrameAttempts, 3)];
     }
 
+    /**
+     * @return array{0: float, 1: float} seconds
+     */
+    public function windowNative(string $videoPath, ?VideoContainer $container, ?MediaSourceHints $hints, bool &$supported = false): array
+    {
+        $supported = false;
+        $ffi = self::ffi();
+        if ($ffi === null || self::$fromOut === null || self::$spacingOut === null || self::$windowOut === null || $this->config->thumbnailFrameAttempts <= 0) {
+            return $this->windowPhp($videoPath, $container, $hints);
+        }
+
+        if ($hints?->position === SourcePosition::Mid) {
+            try {
+                // @phpstan-ignore method.notFound
+                $status = $ffi->nntmux_thumbnail_window(1, 0.0, 0, 0, 0, 0, 0, 1, $this->config->thumbnailFrameAttempts, self::$fromOut, self::$spacingOut);
+            } catch (Throwable) {
+                return $this->windowPhp($videoPath, $container, $hints);
+            }
+            if (! is_int($status) || $status !== 1) {
+                return $this->windowPhp($videoPath, $container, $hints);
+            }
+            $supported = true;
+
+            return [(float) self::$windowOut[0], (float) self::$windowOut[1]];
+        }
+
+        ['duration' => $duration, 'bitRate' => $bitRate] = $this->grabber->probe($videoPath, $container);
+        $available = $hints !== null && $hints->availableBytes > 0 ? $hints->availableBytes : (int) @filesize($videoPath);
+        $hasHints = match (true) {
+            $hints === null => 0,
+            $hints->position === SourcePosition::Complete => 2,
+            default => 1,
+        };
+        $totalBytes = $hints?->realSize !== null && $hints->realSize > 0 ? $hints->realSize : 0;
+
+        try {
+            // @phpstan-ignore method.notFound
+            $status = $ffi->nntmux_thumbnail_window(
+                0,
+                $duration ?? 0.0,
+                $duration !== null ? 1 : 0,
+                $bitRate ?? 0,
+                $bitRate !== null ? 1 : 0,
+                $available,
+                $totalBytes,
+                $hasHints,
+                $this->config->thumbnailFrameAttempts,
+                self::$fromOut,
+                self::$spacingOut,
+            );
+        } catch (Throwable) {
+            return $this->windowPhp($videoPath, $container, $hints);
+        }
+        if (! is_int($status) || $status !== 1) {
+            return $this->windowPhp($videoPath, $container, $hints);
+        }
+        $supported = true;
+
+        return [(float) self::$windowOut[0], (float) self::$windowOut[1]];
+    }
+
+    public static function looksLikeText(string $head): bool
+    {
+        return self::looksLikeTextPhp($head);
+    }
+
+    public static function looksLikeTextNative(string $head, bool &$supported = false): bool
+    {
+        $supported = false;
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return self::looksLikeTextPhp($head);
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $status = $ffi->nntmux_thumbnail_looks_like_text($head, strlen($head));
+        } catch (Throwable) {
+            return self::looksLikeTextPhp($head);
+        }
+        if (! is_int($status) || $status < 0) {
+            return self::looksLikeTextPhp($head);
+        }
+        $supported = true;
+
+        return $status === 1;
+    }
+
+    public static function looksLikeTextPhp(string $head): bool
+    {
+        $start = ltrim($head, "\xEF\xBB\xBF \t\r\n");
+
+        return strncasecmp($start, '#EXTM3U', 7) === 0 || strncasecmp($start, 'ffconcat', 8) === 0;
+    }
+
     private function playableSeconds(string $videoPath, ?VideoContainer $container, ?MediaSourceHints $hints): float
     {
-
         ['duration' => $duration, 'bitRate' => $bitRate] = $this->grabber->probe($videoPath, $container);
         $available = $hints !== null && $hints->availableBytes > 0 ? $hints->availableBytes : (int) @filesize($videoPath);
         $fraction = $hints?->availableFraction();
@@ -89,10 +249,24 @@ class ThumbnailFrameSelector
         };
     }
 
-    private static function looksLikeText(string $head): bool
+    private static function ffi(): ?FFI
     {
-        $start = ltrim($head, "\xEF\xBB\xBF \t\r\n");
+        if (! self::$ffiResolved) {
+            self::$ffiResolved = true;
+            $ffi = RustPipelineLibrary::resolveDomain('thumbnail_frame_selector', self::FFI_CDEF);
+            if ($ffi !== null) {
+                try {
+                    $window = $ffi->new('double[2]');
+                    self::$fromOut = FFI::addr($window[0]);
+                    self::$spacingOut = FFI::addr($window[1]);
+                    self::$windowOut = $window;
+                    self::$ffi = $ffi;
+                } catch (Throwable) {
+                    self::$ffi = null;
+                }
+            }
+        }
 
-        return stripos($start, '#EXTM3U') === 0 || stripos($start, 'ffconcat') === 0;
+        return self::$ffi;
     }
 }
