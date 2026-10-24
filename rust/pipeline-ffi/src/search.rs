@@ -10515,3 +10515,870 @@ mod wave17_tests {
         );
     }
 }
+
+// Wave 18 `SearchPage`, `ElasticsearchResponseHelper`, `ProxyRequestContext`,
+// `ProxyVerdict` and `SortDropdown` candidates. Every export catches panics and
+// validates pointers, alignment, lengths and output capacity before building slices.
+// Status -1 means invalid input (the PHP adapter falls back), -2 a caught panic, and
+// `-(required + 3)` a short output buffer.
+
+/// Splits `buf` into consecutive fields of `lens[i]` bytes; a length of -1 marks a
+/// null/non-string field (empty slice, `None`). The lengths must cover `buf` exactly.
+type W18Field<'a> = Option<(usize, &'a [u8])>;
+
+fn w18_split_fields<'a>(buf: &'a [u8], lens: &[i64]) -> Option<Vec<W18Field<'a>>> {
+    let mut fields = Vec::with_capacity(lens.len());
+    let mut at = 0usize;
+    for &len in lens {
+        if len == -1 {
+            fields.push(None);
+            continue;
+        }
+        let len = usize::try_from(len).ok()?;
+        let end = at.checked_add(len)?;
+        fields.push(Some((at, buf.get(at..end)?)));
+        at = end;
+    }
+    (at == buf.len()).then_some(fields)
+}
+
+fn w18_short(required: usize) -> isize {
+    isize::try_from(required)
+        .ok()
+        .and_then(|r| r.checked_add(3))
+        .map_or(-1, |r| -r)
+}
+
+/// `SearchPage::legacy()`: copies the release IDs into `out_ids` and writes the
+/// normalized `[total, fuzzy]` pair into `out_meta`. Returns the ID count, -1 for
+/// invalid input (including `fuzzy` outside 0/1), or `-(count + 3)` when `out_cap`
+/// is too small.
+/// # Safety
+/// `ids` holds `count` aligned `int64_t`, `out_ids` holds `out_cap`, `out_meta` two.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_search_page_legacy(
+    ids: *const i64,
+    count: usize,
+    total: i64,
+    fuzzy: i32,
+    out_ids: *mut i64,
+    out_cap: usize,
+    out_meta: *mut i64,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        if !(0..=1).contains(&fuzzy) {
+            return -1;
+        }
+        // Validate every region with shared views only, then write through raw pointers:
+        // callers may legally pass overlapping input and output buffers.
+        let valid = unsafe {
+            w15_slice(ids, count).is_some()
+                && w15_slice(out_ids.cast_const(), out_cap).is_some()
+                && w15_slice(out_meta.cast_const(), 2).is_some()
+        };
+        if !valid {
+            return -1;
+        }
+        if out_cap < count {
+            return w18_short(count);
+        }
+        unsafe {
+            if count != 0 {
+                std::ptr::copy(ids, out_ids, count);
+            }
+            out_meta.write(total);
+            out_meta.add(1).write(i64::from(fuzzy));
+        }
+        isize::try_from(count).unwrap_or(-1)
+    })
+    .unwrap_or(-2)
+}
+
+/// `ElasticsearchResponseHelper::asArray()` routing: 0 when the response is already an
+/// array (returned as-is), 1 when the response object must be decoded with
+/// `asArray()`, -1 when `is_array` is not 0/1.
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_es_response_as_array_mode(is_array: i32) -> i32 {
+    std::panic::catch_unwind(|| match is_array {
+        1 => 0,
+        0 => 1,
+        _ => -1,
+    })
+    .unwrap_or(-2)
+}
+
+/// `ElasticsearchResponseHelper::isNotFound()`: 1 for a `ClientResponseException`
+/// with HTTP code 404, 0 otherwise, -1 when `is_client_response` is not 0/1.
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_es_is_not_found(is_client_response: i32, code: i64) -> i32 {
+    std::panic::catch_unwind(|| match is_client_response {
+        1 => i32::from(code == 404),
+        0 => 0,
+        _ => -1,
+    })
+    .unwrap_or(-2)
+}
+
+fn w18_first_token(fields: &[W18Field<'_>]) -> Option<usize> {
+    fields
+        .iter()
+        .position(|f| matches!(f, Some((_, bytes)) if !bytes.is_empty()))
+}
+
+/// `ProxyRequestContext::extractApiToken()`: `buf` holds the candidate values
+/// (`api_token`, `apikey`, `apiToken`, `r`, in order) concatenated, `lens[i]` their
+/// byte lengths or -1 for non-string inputs. Returns the index of the first non-empty
+/// string, `count` when there is none, or -1 for invalid input.
+/// # Safety
+/// `buf` holds `buf_len` bytes; `lens` holds `count` aligned `int64_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_proxy_resolve_token(
+    buf: *const u8,
+    buf_len: usize,
+    lens: *const i64,
+    count: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        let (Some(buf), Some(lens)) = (unsafe { w14_input(buf, buf_len) }, unsafe {
+            w15_slice(lens, count)
+        }) else {
+            return -1;
+        };
+        let Some(fields) = w18_split_fields(buf, lens) else {
+            return -1;
+        };
+        let index = w18_first_token(&fields).unwrap_or(count);
+        isize::try_from(index).unwrap_or(-1)
+    })
+    .unwrap_or(-2)
+}
+
+/// Output slots written by [`nntmux_proxy_context_normalize`].
+const W18_CONTEXT_SLOTS: usize = 9;
+
+/// `ProxyRequestContext::fromRequest()` normalization. `buf` holds the client IP,
+/// user agent, referer and then the token candidates concatenated; `lens[i]` is each
+/// byte length or -1 for null/non-string values (`count >= 3`). `flags` bit 0 is
+/// `isDownload` and bit 1 `isSearch`. Writes nine `int64_t`:
+/// `[ip_off, ip_len, ua_off, ua_len, token_off, token_len, referer_off, referer_len,
+/// flags]`, where a length of -1 means null (a null IP or UA normalizes to `""`).
+/// Returns 0, -1 for invalid input, or -12 when `out_cap < 9`.
+/// # Safety
+/// `buf` holds `buf_len` bytes; `lens` holds `count` and `out` `out_cap` aligned
+/// `int64_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_proxy_context_normalize(
+    buf: *const u8,
+    buf_len: usize,
+    lens: *const i64,
+    count: usize,
+    flags: i32,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        if count < 3 || flags & !3 != 0 {
+            return -1;
+        }
+        let (Some(buf), Some(lens), Some(out)) = (
+            unsafe { w14_input(buf, buf_len) },
+            unsafe { w15_slice(lens, count) },
+            unsafe { w15_slice_mut(out, out_cap) },
+        ) else {
+            return -1;
+        };
+        if out_cap < W18_CONTEXT_SLOTS {
+            return i32::try_from(w18_short(W18_CONTEXT_SLOTS)).unwrap_or(-1);
+        }
+        let Some(fields) = w18_split_fields(buf, lens) else {
+            return -1;
+        };
+        let span = |field: Option<(usize, &[u8])>, empty_when_null: bool| -> Option<(i64, i64)> {
+            match field {
+                Some((at, bytes)) => {
+                    Some((i64::try_from(at).ok()?, i64::try_from(bytes.len()).ok()?))
+                }
+                None if empty_when_null => Some((0, 0)),
+                None => Some((0, -1)),
+            }
+        };
+        let token = w18_first_token(&fields[3..]).and_then(|i| fields[3 + i]);
+        let (Some(ip), Some(ua), Some(tok), Some(referer)) = (
+            span(fields[0], true),
+            span(fields[1], true),
+            span(token, false),
+            span(fields[2], false),
+        ) else {
+            return -1;
+        };
+        out[..W18_CONTEXT_SLOTS].copy_from_slice(&[
+            ip.0,
+            ip.1,
+            ua.0,
+            ua.1,
+            tok.0,
+            tok.1,
+            referer.0,
+            referer.1,
+            i64::from(flags),
+        ]);
+        0
+    })
+    .unwrap_or(-2)
+}
+
+/// `ProxyVerdict::allow()`: writes the non-blocking state (`shouldBlock = 0`,
+/// `score = 0`) and returns its reason count (0), or -1 for invalid pointers.
+/// # Safety
+/// `out_block` is one aligned `int32_t`, `out_score` one aligned `int64_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_proxy_verdict_allow(
+    out_block: *mut i32,
+    out_score: *mut i64,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        let (Some(block), Some(score)) = (unsafe { w15_slice_mut(out_block, 1) }, unsafe {
+            w15_slice_mut(out_score, 1)
+        }) else {
+            return -1;
+        };
+        block[0] = 0;
+        score[0] = 0;
+        0
+    })
+    .unwrap_or(-2)
+}
+
+/// `ProxyVerdict::fromScore()` state normalization: 1 when `score >= threshold`
+/// (the request is blocked), 0 otherwise.
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_proxy_verdict_should_block(score: i64, threshold: i64) -> i32 {
+    std::panic::catch_unwind(|| i32::from(score >= threshold)).unwrap_or(-2)
+}
+
+/// PHP `urlencode()` (RFC 1738): alphanumerics and `-_.` stay, space becomes `+`.
+fn w18_urlencode(bytes: &[u8], out: &mut Vec<u8>) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for &b in bytes {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.') {
+            out.push(b);
+        } else if b == b' ' {
+            out.push(b'+');
+        } else {
+            out.extend_from_slice(&[b'%', HEX[usize::from(b >> 4)], HEX[usize::from(b & 15)]]);
+        }
+    }
+}
+
+/// Query-parameter tag bits for [`nntmux_sort_dropdown_resolve`].
+const W18_PARAM_SCALAR: i32 = 1;
+const W18_PARAM_INT_KEY: i32 = 2;
+const W18_PARAM_FLOAT: i32 = 4;
+
+/// `SortDropdown` sort-state resolution.
+///
+/// * `sort`: the requested sort; `sort_is_string = 0` means non-string (uses
+///   `posted_desc`).
+/// * `keys`/`key_lens`: the `option_count` sort option keys as PHP strings.
+/// * `params`/`param_lens`: per query parameter its key bytes then its value bytes
+///   (`2 * param_count` lengths; ints as decimal, bools as `1`/`0`).
+/// * `param_tags`: bit 0 scalar value, bit 1 integer key, bit 2 float value.
+///
+/// Writes `param_keep[i]` (1 when the parameter is a scalar other than `ob`/`page`),
+/// `current[0]` (the resolved option index, -1 for no options), `url_lens[i]`, and the
+/// concatenated `base?http_build_query(params + ob)` URLs into `out`. Integer keys
+/// are renumbered as `array_merge()` does. Returns the bytes written, -1 for invalid
+/// input or a retained float parameter (PHP formats those), or `-(required + 3)`.
+/// # Safety
+/// Byte pointers hold their lengths; `key_lens` and `url_lens` hold `option_count`,
+/// `param_tags`/`param_keep` `param_count`, `param_lens` `2 * param_count` aligned
+/// elements, and `current` one.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_sort_dropdown_resolve(
+    sort: *const u8,
+    sort_len: usize,
+    sort_is_string: i32,
+    keys: *const u8,
+    keys_len: usize,
+    key_lens: *const i64,
+    option_count: usize,
+    base: *const u8,
+    base_len: usize,
+    params: *const u8,
+    params_len: usize,
+    param_tags: *const i32,
+    param_lens: *const i64,
+    param_count: usize,
+    param_keep: *mut i32,
+    out: *mut u8,
+    cap: usize,
+    url_lens: *mut i64,
+    current: *mut i64,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        if !(0..=1).contains(&sort_is_string) {
+            return -1;
+        }
+        let Some(param_len_count) = param_count.checked_mul(2) else {
+            return -1;
+        };
+        let (Some(sort), Some(keys), Some(key_lens), Some(base), Some(params)) = (
+            unsafe { w14_input(sort, sort_len) },
+            unsafe { w14_input(keys, keys_len) },
+            unsafe { w15_slice(key_lens, option_count) },
+            unsafe { w14_input(base, base_len) },
+            unsafe { w14_input(params, params_len) },
+        ) else {
+            return -1;
+        };
+        let (Some(tags), Some(param_lens), Some(keep), Some(url_lens), Some(current)) = (
+            unsafe { w15_slice(param_tags, param_count) },
+            unsafe { w15_slice(param_lens, param_len_count) },
+            unsafe { w15_slice_mut(param_keep, param_count) },
+            unsafe { w15_slice_mut(url_lens, option_count) },
+            unsafe { w15_slice_mut(current, 1) },
+        ) else {
+            return -1;
+        };
+        if key_lens.contains(&-1) || param_lens.contains(&-1) {
+            return -1;
+        }
+        let (Some(option_keys), Some(param_fields)) = (
+            w18_split_fields(keys, key_lens),
+            w18_split_fields(params, param_lens),
+        ) else {
+            return -1;
+        };
+        let option_keys: Vec<&[u8]> = option_keys.into_iter().flatten().map(|(_, k)| k).collect();
+        let param_fields: Vec<&[u8]> = param_fields.into_iter().flatten().map(|(_, f)| f).collect();
+
+        let requested: &[u8] = if sort_is_string == 1 {
+            sort
+        } else {
+            b"posted_desc"
+        };
+        let resolved = option_keys
+            .iter()
+            .position(|k| *k == requested)
+            .or_else(|| option_keys.iter().position(|k| *k == b"posted_desc"))
+            .or(if option_keys.is_empty() {
+                None
+            } else {
+                Some(0)
+            });
+
+        // `array_filter(is_scalar)` minus `ob`/`page`, then `array_merge()` renumbering.
+        let mut query = Vec::with_capacity(params_len + param_count * 4);
+        let mut next_int_key = 0u64;
+        for (i, &tag) in tags.iter().enumerate() {
+            if tag & !(W18_PARAM_SCALAR | W18_PARAM_INT_KEY | W18_PARAM_FLOAT) != 0 {
+                return -1;
+            }
+            let (key, value) = (param_fields[2 * i], param_fields[2 * i + 1]);
+            let kept = tag & W18_PARAM_SCALAR != 0
+                && (tag & W18_PARAM_INT_KEY != 0 || (key != b"ob" && key != b"page"));
+            keep[i] = i32::from(kept);
+            if !kept {
+                continue;
+            }
+            if tag & W18_PARAM_FLOAT != 0 {
+                return -1;
+            }
+            if tag & W18_PARAM_INT_KEY != 0 {
+                query.extend_from_slice(next_int_key.to_string().as_bytes());
+                next_int_key += 1;
+            } else {
+                w18_urlencode(key, &mut query);
+            }
+            query.push(b'=');
+            w18_urlencode(value, &mut query);
+            query.push(b'&');
+        }
+
+        let mut urls = Vec::with_capacity(option_keys.len() * (base.len() + query.len() + 24));
+        for (i, key) in option_keys.iter().enumerate() {
+            let start = urls.len();
+            urls.extend_from_slice(base);
+            urls.push(b'?');
+            urls.extend_from_slice(&query);
+            urls.extend_from_slice(b"ob=");
+            w18_urlencode(key, &mut urls);
+            let Ok(len) = i64::try_from(urls.len() - start) else {
+                return -1;
+            };
+            url_lens[i] = len;
+        }
+        current[0] = match resolved.map(i64::try_from) {
+            Some(Ok(i)) => i,
+            Some(Err(_)) => return -1,
+            None => -1,
+        };
+        if cap < urls.len() {
+            return w18_short(urls.len());
+        }
+        w14_output(&urls, out, cap)
+    })
+    .unwrap_or(-2)
+}
+
+#[cfg(test)]
+mod wave18_tests {
+    use super::*;
+
+    #[test]
+    fn search_page_legacy_copies_ids_and_normalizes_meta() {
+        let ids = [7i64, 3, 3, -1];
+        let mut out = [0i64; 4];
+        let mut meta = [0i64; 2];
+        let n = unsafe {
+            nntmux_search_page_legacy(
+                ids.as_ptr(),
+                4,
+                42,
+                1,
+                out.as_mut_ptr(),
+                4,
+                meta.as_mut_ptr(),
+            )
+        };
+        assert_eq!(n, 4);
+        assert_eq!(out, ids);
+        assert_eq!(meta, [42, 1]);
+        let mut small = [0i64; 2];
+        assert_eq!(
+            unsafe {
+                nntmux_search_page_legacy(
+                    ids.as_ptr(),
+                    4,
+                    0,
+                    0,
+                    small.as_mut_ptr(),
+                    2,
+                    meta.as_mut_ptr(),
+                )
+            },
+            -7
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_search_page_legacy(
+                    ids.as_ptr(),
+                    4,
+                    0,
+                    2,
+                    out.as_mut_ptr(),
+                    4,
+                    meta.as_mut_ptr(),
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_search_page_legacy(
+                    std::ptr::null(),
+                    0,
+                    5,
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    meta.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        assert_eq!(meta, [5, 0]);
+        assert_eq!(
+            unsafe {
+                nntmux_search_page_legacy(
+                    std::ptr::null(),
+                    2,
+                    5,
+                    0,
+                    out.as_mut_ptr(),
+                    4,
+                    meta.as_mut_ptr(),
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_search_page_legacy(
+                    ids.as_ptr(),
+                    4,
+                    5,
+                    0,
+                    out.as_mut_ptr(),
+                    4,
+                    std::ptr::null_mut(),
+                )
+            },
+            -1
+        );
+        // Misaligned input pointers are rejected before building a slice.
+        let raw = [0u8; 64];
+        let misaligned = unsafe { raw.as_ptr().add(1) } as *const i64;
+        assert_eq!(
+            unsafe {
+                nntmux_search_page_legacy(
+                    misaligned,
+                    1,
+                    5,
+                    0,
+                    out.as_mut_ptr(),
+                    4,
+                    meta.as_mut_ptr(),
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_search_page_legacy(
+                    ids.as_ptr(),
+                    usize::MAX,
+                    0,
+                    0,
+                    out.as_mut_ptr(),
+                    4,
+                    meta.as_mut_ptr(),
+                )
+            },
+            -1
+        );
+    }
+
+    #[test]
+    fn elasticsearch_helpers_classify() {
+        assert_eq!(nntmux_es_response_as_array_mode(1), 0);
+        assert_eq!(nntmux_es_response_as_array_mode(0), 1);
+        assert_eq!(nntmux_es_response_as_array_mode(7), -1);
+        assert_eq!(nntmux_es_is_not_found(1, 404), 1);
+        assert_eq!(nntmux_es_is_not_found(1, 500), 0);
+        assert_eq!(nntmux_es_is_not_found(0, 404), 0);
+        assert_eq!(nntmux_es_is_not_found(-1, 404), -1);
+    }
+
+    #[test]
+    fn proxy_token_and_context_normalization() {
+        let buf = b"abc";
+        let lens = [-1i64, 0, 3, -1];
+        assert_eq!(
+            unsafe { nntmux_proxy_resolve_token(buf.as_ptr(), 3, lens.as_ptr(), 4) },
+            2
+        );
+        let none = [-1i64, 0, -1, 0];
+        assert_eq!(
+            unsafe { nntmux_proxy_resolve_token(std::ptr::null(), 0, none.as_ptr(), 4) },
+            4
+        );
+        assert_eq!(
+            unsafe { nntmux_proxy_resolve_token(buf.as_ptr(), 3, none.as_ptr(), 4) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_proxy_resolve_token(buf.as_ptr(), 3, [-2i64].as_ptr(), 1) },
+            -1
+        );
+
+        let buf = b"1.2.3.4curlKEY";
+        let lens = [7i64, 4, -1, -1, 0, 3, -1];
+        let mut out = [0i64; 9];
+        assert_eq!(
+            unsafe {
+                nntmux_proxy_context_normalize(
+                    buf.as_ptr(),
+                    buf.len(),
+                    lens.as_ptr(),
+                    7,
+                    2,
+                    out.as_mut_ptr(),
+                    9,
+                )
+            },
+            0
+        );
+        assert_eq!(out, [0, 7, 7, 4, 11, 3, 0, -1, 2]);
+        let lens = [-1i64, -1, 0];
+        assert_eq!(
+            unsafe {
+                nntmux_proxy_context_normalize(
+                    std::ptr::null(),
+                    0,
+                    lens.as_ptr(),
+                    3,
+                    3,
+                    out.as_mut_ptr(),
+                    9,
+                )
+            },
+            0
+        );
+        assert_eq!(out, [0, 0, 0, 0, 0, -1, 0, 0, 3]);
+        assert_eq!(
+            unsafe {
+                nntmux_proxy_context_normalize(
+                    std::ptr::null(),
+                    0,
+                    lens.as_ptr(),
+                    3,
+                    4,
+                    out.as_mut_ptr(),
+                    9,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_proxy_context_normalize(
+                    std::ptr::null(),
+                    0,
+                    lens.as_ptr(),
+                    3,
+                    0,
+                    out.as_mut_ptr(),
+                    8,
+                )
+            },
+            -12
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_proxy_context_normalize(
+                    std::ptr::null(),
+                    0,
+                    lens.as_ptr(),
+                    2,
+                    0,
+                    out.as_mut_ptr(),
+                    9,
+                )
+            },
+            -1
+        );
+    }
+
+    #[test]
+    fn proxy_verdict_state() {
+        let (mut block, mut score) = (9i32, 9i64);
+        assert_eq!(
+            unsafe { nntmux_proxy_verdict_allow(&mut block, &mut score) },
+            0
+        );
+        assert_eq!((block, score), (0, 0));
+        assert_eq!(
+            unsafe { nntmux_proxy_verdict_allow(std::ptr::null_mut(), &mut score) },
+            -1
+        );
+        assert_eq!(nntmux_proxy_verdict_should_block(50, 50), 1);
+        assert_eq!(nntmux_proxy_verdict_should_block(49, 50), 0);
+        assert_eq!(nntmux_proxy_verdict_should_block(i64::MIN, i64::MAX), 0);
+    }
+
+    fn resolve(
+        sort: Option<&[u8]>,
+        keys: &[&[u8]],
+        base: &[u8],
+        params: &[(i32, &[u8], &[u8])],
+    ) -> Result<(i64, Vec<i32>, Vec<Vec<u8>>), isize> {
+        let key_buf: Vec<u8> = keys.concat();
+        let key_lens: Vec<i64> = keys.iter().map(|k| k.len() as i64).collect();
+        let mut param_buf = Vec::new();
+        let mut param_lens = Vec::new();
+        let mut tags = Vec::new();
+        for (tag, k, v) in params {
+            tags.push(*tag);
+            param_buf.extend_from_slice(k);
+            param_buf.extend_from_slice(v);
+            param_lens.extend_from_slice(&[k.len() as i64, v.len() as i64]);
+        }
+        let mut keep = vec![0i32; params.len()];
+        let mut url_lens = vec![0i64; keys.len()];
+        let mut current = 0i64;
+        let mut out = vec![0u8; 4096];
+        let sort_bytes = sort.unwrap_or(b"");
+        let n = unsafe {
+            nntmux_sort_dropdown_resolve(
+                sort_bytes.as_ptr(),
+                sort_bytes.len(),
+                i32::from(sort.is_some()),
+                key_buf.as_ptr(),
+                key_buf.len(),
+                key_lens.as_ptr(),
+                keys.len(),
+                base.as_ptr(),
+                base.len(),
+                param_buf.as_ptr(),
+                param_buf.len(),
+                tags.as_ptr(),
+                param_lens.as_ptr(),
+                params.len(),
+                keep.as_mut_ptr(),
+                out.as_mut_ptr(),
+                out.len(),
+                url_lens.as_mut_ptr(),
+                &mut current,
+            )
+        };
+        if n < 0 {
+            return Err(n);
+        }
+        let mut urls = Vec::new();
+        let mut at = 0usize;
+        for len in url_lens {
+            urls.push(out[at..at + len as usize].to_vec());
+            at += len as usize;
+        }
+        assert_eq!(at, n as usize);
+        Ok((current, keep, urls))
+    }
+
+    #[test]
+    fn sort_dropdown_resolves_state_and_urls() {
+        let keys: &[&[u8]] = &[b"name_asc", b"posted_desc"];
+        let (current, keep, urls) = resolve(
+            Some(b"bogus"),
+            keys,
+            b"https://x/browse",
+            &[
+                (1, b"t", b"a b~/\xc3\xa9"),
+                (1, b"ob", b"name_asc"),
+                (1, b"page", b"2"),
+                (0, b"arr", b""),
+                (3, b"9", b"y"),
+                (1 | 4, b"page", b""),
+            ],
+        )
+        .unwrap();
+        assert_eq!(current, 1);
+        assert_eq!(keep, [1, 0, 0, 0, 1, 0]);
+        assert_eq!(
+            urls[0],
+            b"https://x/browse?t=a+b%7E%2F%C3%A9&0=y&ob=name_asc"
+        );
+        assert_eq!(
+            urls[1],
+            b"https://x/browse?t=a+b%7E%2F%C3%A9&0=y&ob=posted_desc"
+        );
+
+        let (current, _, urls) = resolve(None, &[b"a b", b"c"], b"", &[]).unwrap();
+        assert_eq!(current, 0);
+        assert_eq!(urls, [b"?ob=a+b".to_vec(), b"?ob=c".to_vec()]);
+        let (current, _, urls) = resolve(Some(b"c"), &[b"a", b"c"], b"/", &[]).unwrap();
+        assert_eq!((current, urls.len()), (1, 2));
+        let (current, _, urls) = resolve(Some(b"x"), &[], b"/", &[]).unwrap();
+        assert_eq!((current, urls.len()), (-1, 0));
+        // A retained float defers to PHP; an unknown tag bit is rejected.
+        assert_eq!(resolve(None, &[b"a"], b"/", &[(5, b"f", b"")]), Err(-1));
+        assert_eq!(resolve(None, &[b"a"], b"/", &[(8, b"f", b"")]), Err(-1));
+    }
+
+    #[test]
+    fn sort_dropdown_rejects_invalid_buffers() {
+        let mut keep = [0i32; 1];
+        let mut url_lens = [0i64; 1];
+        let mut current = 0i64;
+        let mut small = [0u8; 2];
+        let key_lens = [1i64];
+        let n = unsafe {
+            nntmux_sort_dropdown_resolve(
+                std::ptr::null(),
+                0,
+                0,
+                b"a".as_ptr(),
+                1,
+                key_lens.as_ptr(),
+                1,
+                b"/".as_ptr(),
+                1,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                keep.as_mut_ptr(),
+                small.as_mut_ptr(),
+                2,
+                url_lens.as_mut_ptr(),
+                &mut current,
+            )
+        };
+        assert_eq!(n, -(b"/?ob=a".len() as isize + 3));
+        let bad = [2i64];
+        let n = unsafe {
+            nntmux_sort_dropdown_resolve(
+                std::ptr::null(),
+                0,
+                0,
+                b"a".as_ptr(),
+                1,
+                bad.as_ptr(),
+                1,
+                b"/".as_ptr(),
+                1,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                keep.as_mut_ptr(),
+                small.as_mut_ptr(),
+                2,
+                url_lens.as_mut_ptr(),
+                &mut current,
+            )
+        };
+        assert_eq!(n, -1);
+        let n = unsafe {
+            nntmux_sort_dropdown_resolve(
+                std::ptr::null(),
+                0,
+                3,
+                b"a".as_ptr(),
+                1,
+                key_lens.as_ptr(),
+                1,
+                b"/".as_ptr(),
+                1,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                keep.as_mut_ptr(),
+                small.as_mut_ptr(),
+                2,
+                url_lens.as_mut_ptr(),
+                &mut current,
+            )
+        };
+        assert_eq!(n, -1);
+        let n = unsafe {
+            nntmux_sort_dropdown_resolve(
+                std::ptr::null(),
+                0,
+                0,
+                b"a".as_ptr(),
+                1,
+                key_lens.as_ptr(),
+                1,
+                b"/".as_ptr(),
+                1,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                usize::MAX,
+                keep.as_mut_ptr(),
+                small.as_mut_ptr(),
+                2,
+                url_lens.as_mut_ptr(),
+                &mut current,
+            )
+        };
+        assert_eq!(n, -1);
+    }
+}
