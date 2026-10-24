@@ -9687,3 +9687,831 @@ mod wave16_tests {
         assert_eq!(cond(b"   "), b"");
     }
 }
+
+// Wave 17 SearchService/MediaSearchService/ApiCapabilitiesService/ApiV1Presenter/
+// ApproximateRowCount candidates. Exports validate pointers, lengths, alignment and
+// capacity before building slices and catch panics. Buffer results follow wave 14:
+// -1 unsupported input (PHP decides), -2 panic, -(required + 3) insufficient space.
+// Element results (i64 lists) use -(required + 3) in elements.
+
+/// A PHP value passed as (tag, int, bytes): 0 null/absent, 1 bool, 2 int, 3 string,
+/// 5 array (int holds its count). Floats and objects stay in PHP.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum W17Value<'a> {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Str(&'a [u8]),
+    Array(i64),
+}
+
+fn w17_value<'a>(tag: i32, ival: i64, bytes: &'a [u8]) -> Option<W17Value<'a>> {
+    if tag != 3 && !bytes.is_empty() {
+        return None;
+    }
+    match tag {
+        0 => Some(W17Value::Null),
+        1 => match ival {
+            0 => Some(W17Value::Bool(false)),
+            1 => Some(W17Value::Bool(true)),
+            _ => None,
+        },
+        2 => Some(W17Value::Int(ival)),
+        3 => Some(W17Value::Str(bytes)),
+        5 if ival >= 0 => Some(W17Value::Array(ival)),
+        _ => None,
+    }
+}
+
+/// Decode `count` PHP values: `tags`/`ints` per value, string bytes back to back in
+/// `input` with each length in `lens` (0 for non-strings).
+unsafe fn w17_values<'a>(
+    tags: *const i32,
+    ints: *const i64,
+    input: *const u8,
+    len: usize,
+    lens: *const i64,
+    count: usize,
+) -> Option<Vec<W17Value<'a>>> {
+    let tags = unsafe { w15_slice(tags, count) }?;
+    let ints = unsafe { w15_slice(ints, count) }?;
+    let lens = unsafe { w15_slice(lens, count) }?;
+    let input = unsafe { w14_input(input, len) }?;
+    let fields = w16_fields(input, lens)?;
+    let mut values = Vec::with_capacity(count);
+    for i in 0..count {
+        values.push(w17_value(tags[i], ints[i], fields[i])?);
+    }
+    Some(values)
+}
+
+/// PHP `(int)` for the decimal integer strings `-?[0-9]+` (and ''); None for any
+/// other string, whose PHP conversion (whitespace, exponents, saturation) stays in PHP.
+fn w17_php_int_string(s: &[u8]) -> Option<i64> {
+    if s.is_empty() {
+        return Some(0);
+    }
+    let (neg, digits) = match s[0] {
+        b'-' => (true, &s[1..]),
+        _ => (false, s),
+    };
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let mut v: i64 = 0;
+    for &d in digits {
+        let d = i64::from(d - b'0');
+        v = v.checked_mul(10).and_then(|v| {
+            if neg {
+                v.checked_sub(d)
+            } else {
+                v.checked_add(d)
+            }
+        })?;
+    }
+    Some(v)
+}
+
+fn w17_php_int(v: W17Value<'_>) -> Option<i64> {
+    match v {
+        W17Value::Null => Some(0),
+        W17Value::Bool(b) => Some(i64::from(b)),
+        W17Value::Int(i) => Some(i),
+        W17Value::Str(s) => w17_php_int_string(s),
+        W17Value::Array(n) => Some(i64::from(n > 0)),
+    }
+}
+
+/// PHP `(bool)`, i.e. `! empty($value)` for a present value.
+fn w17_php_bool(v: W17Value<'_>) -> bool {
+    match v {
+        W17Value::Null => false,
+        W17Value::Bool(b) => b,
+        W17Value::Int(i) => i != 0,
+        W17Value::Str(s) => !(s.is_empty() || s == b"0"),
+        W17Value::Array(n) => n > 0,
+    }
+}
+
+fn w17_write_i64s(values: &[i64], out: *mut i64, cap: usize) -> isize {
+    if values.len() > (isize::MAX as usize) - 3 {
+        return -1;
+    }
+    if cap < values.len() {
+        return -(values.len() as isize + 3);
+    }
+    let Some(out) = (unsafe { w15_slice_mut(out, values.len()) }) else {
+        return -1;
+    };
+    out.copy_from_slice(values);
+    values.len() as isize
+}
+
+/// `SearchService::escapeString()` for the driver selected by `kind` (0 Manticore).
+/// Other drivers return -1 so PHP delegates to their own escaping.
+/// # Safety
+/// `input` holds `len` bytes; `out` holds `cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_search_service_escape_string(
+    kind: i32,
+    input: *const u8,
+    len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        if kind != 0 {
+            return -1;
+        }
+        let Some(s) = (unsafe { w14_input(input, len) }) else {
+            return -1;
+        };
+        let mut escaped = SmallBytes::new();
+        manticore_escape_string_into(s, &mut escaped);
+        w14_output(escaped.as_slice(), out, cap)
+    })
+    .unwrap_or(-2)
+}
+
+/// `SearchService::normalizeFuzzyConfig()`: the four values are `enabled`,
+/// `max_distance`, `prefix_length` and `max_expansions` with PHP `?? default` then
+/// `(bool)`/`(int)` casts. Writes four `int64_t` (enabled as 0/1); returns 0, or -1
+/// for invalid pointers and values outside the supported subset.
+/// # Safety
+/// `tags`, `ints` and `lens` hold four aligned values; `input` holds `len` bytes;
+/// `out` holds four aligned `int64_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_search_fuzzy_config_normalize(
+    tags: *const i32,
+    ints: *const i64,
+    input: *const u8,
+    len: usize,
+    lens: *const i64,
+    out: *mut i64,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        let Some(values) = (unsafe { w17_values(tags, ints, input, len, lens, 4) }) else {
+            return -1;
+        };
+        let Some(out) = (unsafe { w15_slice_mut(out, 4) }) else {
+            return -1;
+        };
+        let enabled = match values[0] {
+            W17Value::Null => true,
+            v => w17_php_bool(v),
+        };
+        let mut result = [i64::from(enabled), 0, 0, 0];
+        for (slot, (value, default)) in result[1..]
+            .iter_mut()
+            .zip(values[1..].iter().zip([2i64, 2, 50]))
+        {
+            *slot = match *value {
+                W17Value::Null => default,
+                v => match w17_php_int(v) {
+                    Some(i) => i,
+                    None => return -1,
+                },
+            };
+        }
+        out.copy_from_slice(&result);
+        0
+    })
+    .unwrap_or(-2)
+}
+
+/// `array_values(array_diff($releaseIds, $failed))` for integer lists: keeps the order
+/// and duplicates of `ids` that do not occur in `failed`. Returns the count written.
+/// # Safety
+/// `ids` holds `count` aligned `int64_t`, `failed` holds `failed_count`, `out` holds
+/// `cap`; `out` must not overlap the inputs.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_search_release_ids_diff(
+    ids: *const i64,
+    count: usize,
+    failed: *const i64,
+    failed_count: usize,
+    out: *mut i64,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        let (Some(ids), Some(failed)) = (unsafe { w15_slice(ids, count) }, unsafe {
+            w15_slice(failed, failed_count)
+        }) else {
+            return -1;
+        };
+        let kept: Vec<i64> = if failed.is_empty() {
+            ids.to_vec()
+        } else if failed.len() <= 16 {
+            ids.iter()
+                .copied()
+                .filter(|id| !failed.contains(id))
+                .collect()
+        } else {
+            let mut sorted = failed.to_vec();
+            sorted.sort_unstable();
+            ids.iter()
+                .copied()
+                .filter(|id| sorted.binary_search(id).is_err())
+                .collect()
+        };
+        w17_write_i64s(&kept, out, cap)
+    })
+    .unwrap_or(-2)
+}
+
+/// `array_slice(array_unique($ids), 0, $limit)` for an integer list: first
+/// occurrences in order, then PHP's length rule (a negative limit drops that many
+/// from the end). Returns the count written.
+/// # Safety
+/// `ids` holds `count` aligned `int64_t`; `out` holds `cap`; no overlap.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_search_release_ids_unique_limit(
+    ids: *const i64,
+    count: usize,
+    limit: i64,
+    out: *mut i64,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        let Some(ids) = (unsafe { w15_slice(ids, count) }) else {
+            return -1;
+        };
+        let mut unique = Vec::with_capacity(ids.len());
+        if ids.len() <= 32 {
+            for &id in ids {
+                if !unique.contains(&id) {
+                    unique.push(id);
+                }
+            }
+        } else {
+            let mut seen = std::collections::HashSet::with_capacity(ids.len());
+            unique.extend(ids.iter().copied().filter(|id| seen.insert(*id)));
+        }
+        let n = unique.len();
+        let take = if limit >= 0 {
+            usize::try_from(limit).map_or(n, |l| l.min(n))
+        } else {
+            let drop = usize::try_from(limit.unsigned_abs()).unwrap_or(usize::MAX);
+            n.saturating_sub(drop)
+        };
+        w17_write_i64s(&unique[..take], out, cap)
+    })
+    .unwrap_or(-2)
+}
+
+/// `MediaSearchService::collectExternalIds()`: sets bit `i` of `out_mask` when value
+/// `i` is not PHP-`empty()`. Returns 0, or -1 for invalid pointers, more than 64
+/// values or unsupported value types.
+/// # Safety
+/// `tags`, `ints` and `lens` hold `count` aligned values; `input` holds `len` bytes;
+/// `out_mask` is one aligned `uint64_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_media_external_id_presence(
+    tags: *const i32,
+    ints: *const i64,
+    input: *const u8,
+    len: usize,
+    lens: *const i64,
+    count: usize,
+    out_mask: *mut u64,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        if count > 64 {
+            return -1;
+        }
+        let Some(values) = (unsafe { w17_values(tags, ints, input, len, lens, count) }) else {
+            return -1;
+        };
+        let Some(out) = (unsafe { w15_slice_mut(out_mask, 1) }) else {
+            return -1;
+        };
+        out[0] = values
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| w17_php_bool(**v))
+            .fold(0u64, |mask, (i, _)| mask | (1u64 << i));
+        0
+    })
+    .unwrap_or(-2)
+}
+
+/// `MediaSearchService::searchMediaRoute()`: 0 external-ID search, 1 movie title
+/// fallback (`$type === 'movie'`), 2 TV title fallback; -1 invalid input.
+/// # Safety
+/// `kind` holds `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_media_search_route(
+    has_external_ids: i32,
+    kind: *const u8,
+    len: usize,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        let Some(kind) = (unsafe { w14_input(kind, len) }) else {
+            return -1;
+        };
+        match has_external_ids {
+            1 => 0,
+            0 if kind == b"movie" => 1,
+            0 => 2,
+            _ => -1,
+        }
+    })
+    .unwrap_or(-2)
+}
+
+/// `ApiCapabilitiesService::registration()`: writes `available` and `open` as
+/// `yes`/`no` separated by a tab.
+/// # Safety
+/// `out` holds `cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_api_capabilities_registration(
+    available: i32,
+    is_open: i32,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        let word = |flag: i32| match flag {
+            0 => Some(b"no".as_slice()),
+            1 => Some(b"yes".as_slice()),
+            _ => None,
+        };
+        let (Some(a), Some(o)) = (word(available), word(is_open)) else {
+            return -1;
+        };
+        let mut buf = [0u8; 7];
+        let n = a.len() + 1 + o.len();
+        buf[..a.len()].copy_from_slice(a);
+        buf[a.len()] = b'\t';
+        buf[a.len() + 1..n].copy_from_slice(o);
+        w14_output(&buf[..n], out, cap)
+    })
+    .unwrap_or(-2)
+}
+
+/// `ApiCapabilitiesService::limits()`: writes `[max, default]`. Both come from
+/// `ApiQueryParameters`, which already clamps them to at least 1 (and default to max);
+/// values below 1 or a default above max return -1 so PHP keeps them verbatim.
+/// # Safety
+/// `out` holds two aligned `int64_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_api_capabilities_limits(
+    max: i64,
+    default: i64,
+    out: *mut i64,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        if max < 1 || default < 1 || default > max {
+            return -1;
+        }
+        let Some(out) = (unsafe { w15_slice_mut(out, 2) }) else {
+            return -1;
+        };
+        out[0] = max;
+        out[1] = default;
+        0
+    })
+    .unwrap_or(-2)
+}
+
+const W17_SEARCHING_V1: &[(&[u8], &[u8])] = &[
+    (b"search", b"q,group,minsize,maxsize,maxage,cat,limit,offset,attrs,extended,del,sort"),
+    (b"tv-search", b"q,vid,tvdbid,traktid,rid,tvmazeid,imdbid,tmdbid,season,ep,cat,minsize,maxsize,maxage,limit,offset,attrs,extended,del,sort"),
+    (b"movie-search", b"q,imdbid,tmdbid,traktid,genre,cat,minsize,maxsize,maxage,limit,offset,attrs,extended,del,sort"),
+    (b"audio-search", b"q,cat,minsize,maxsize,maxage,group,limit,offset,attrs,extended,del,sort"),
+    (b"book-search", b"q,title,author,cat,minsize,maxsize,maxage,group,limit,offset,attrs,extended,del,sort"),
+    (b"anime-search", b"q,anidbid,anilistid,cat,minsize,maxsize,maxage,limit,offset,attrs,extended,del,sort"),
+];
+
+const W17_SEARCHING_V2: &[(&[u8], &[u8])] = &[
+    (b"search", b"id,group,minsize,maxage,cat,limit,offset,cursor,sort"),
+    (b"tv-search", b"id,vid,tvdbid,traktid,rid,tvmazeid,imdbid,tmdbid,season,ep,cat,minsize,maxage,limit,offset,cursor,sort"),
+    (b"movie-search", b"id,imdbid,tmdbid,traktid,cat,minsize,maxage,limit,offset,cursor,sort"),
+    (b"audio-search", b"id,cat,minsize,maxage,group,limit,offset,cursor,sort"),
+    (b"book-search", b"id,cat,minsize,maxage,group,limit,offset,cursor,sort"),
+    (b"anime-search", b"id,anidbid,anilistid,cat,minsize,maxage,limit,offset,cursor,sort"),
+];
+
+/// `ApiCapabilitiesService::searching()`: the advertised search functions for API
+/// `version` 1 or 2 as `name\tsupportedParams` lines joined by `\n`.
+/// # Safety
+/// `out` holds `cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_api_capabilities_searching(
+    version: i32,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        let table = match version {
+            1 => W17_SEARCHING_V1,
+            2 => W17_SEARCHING_V2,
+            _ => return -1,
+        };
+        let mut buf = Vec::with_capacity(768);
+        for (i, (name, params)) in table.iter().enumerate() {
+            if i > 0 {
+                buf.push(b'\n');
+            }
+            buf.extend_from_slice(name);
+            buf.push(b'\t');
+            buf.extend_from_slice(params);
+        }
+        w14_output(&buf, out, cap)
+    })
+    .unwrap_or(-2)
+}
+
+/// `ApiV1Presenter::isCapsRequest()`: 1 when `$type === 'caps'`, 0 otherwise, -1 for
+/// invalid pointers.
+/// # Safety
+/// `kind` holds `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_api_v1_is_caps(kind: *const u8, len: usize) -> i32 {
+    std::panic::catch_unwind(|| match unsafe { w14_input(kind, len) } {
+        Some(kind) => i32::from(kind == b"caps"),
+        None => -1,
+    })
+    .unwrap_or(-2)
+}
+
+/// `ApiV1Presenter::responseHeaders()` base: writes the content type (`text/xml` when
+/// `xml` is 1, `application/json` when 0) and the decimal body length, tab-separated.
+/// # Safety
+/// `out` holds `cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_api_v1_response_headers(
+    xml: i32,
+    body_len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        let content_type: &[u8] = match xml {
+            1 => b"text/xml",
+            0 => b"application/json",
+            _ => return -1,
+        };
+        if body_len > isize::MAX as usize {
+            return -1;
+        }
+        let mut digits = [0u8; 20];
+        let mut at = digits.len();
+        let mut n = body_len;
+        loop {
+            at -= 1;
+            digits[at] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        let mut buf = [0u8; 40];
+        let digits = &digits[at..];
+        let total = content_type.len() + 1 + digits.len();
+        buf[..content_type.len()].copy_from_slice(content_type);
+        buf[content_type.len()] = b'\t';
+        buf[content_type.len() + 1..total].copy_from_slice(digits);
+        w14_output(&buf[..total], out, cap)
+    })
+    .unwrap_or(-2)
+}
+
+/// `ApproximateRowCount::supportsInformationSchema()`: 1 for the `mysql` and
+/// `mariadb` driver names (strict, case-sensitive), 0 otherwise, -1 invalid input.
+/// # Safety
+/// `driver` holds `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_db_supports_information_schema(
+    driver: *const u8,
+    len: usize,
+) -> i32 {
+    std::panic::catch_unwind(|| match unsafe { w14_input(driver, len) } {
+        Some(d) => i32::from(d == b"mysql" || d == b"mariadb"),
+        None => -1,
+    })
+    .unwrap_or(-2)
+}
+
+/// `ApproximateRowCount::normalizeApproximateRows()`: 1 and writes `(int) $approx`
+/// when it is positive, 0 when the caller must fall back to an exact COUNT(*)
+/// (`null` or `(int) $approx <= 0`), -1 for invalid pointers or unsupported values.
+/// # Safety
+/// `input` holds `len` bytes; `out` is one aligned `int64_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_db_normalize_approx_rows(
+    tag: i32,
+    ival: i64,
+    input: *const u8,
+    len: usize,
+    out: *mut i64,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        let (Some(bytes), Some(out)) = (unsafe { w14_input(input, len) }, unsafe {
+            w15_slice_mut(out, 1)
+        }) else {
+            return -1;
+        };
+        let Some(value) = w17_value(tag, ival, bytes) else {
+            return -1;
+        };
+        if value == W17Value::Null {
+            return 0;
+        }
+        match w17_php_int(value) {
+            Some(rows) if rows > 0 => {
+                out[0] = rows;
+                1
+            }
+            Some(_) => 0,
+            None => -1,
+        }
+    })
+    .unwrap_or(-2)
+}
+
+#[cfg(test)]
+mod wave17_tests {
+    use super::*;
+
+    fn escape(s: &[u8]) -> Vec<u8> {
+        let mut out = vec![0u8; s.len() * 3 + 8];
+        let n = unsafe {
+            nntmux_search_service_escape_string(0, s.as_ptr(), s.len(), out.as_mut_ptr(), out.len())
+        };
+        assert!(n >= 0);
+        out.truncate(n as usize);
+        out
+    }
+
+    #[test]
+    fn escape_matches_manticore_contract() {
+        assert_eq!(escape(b""), b"");
+        assert_eq!(escape(b"0"), b"");
+        assert_eq!(escape(b"*"), b"");
+        assert_eq!(escape(b"a--b"), b"a\\\\-\\-b");
+        assert_eq!(escape(b" foo(bar)!- "), b"foo\\(bar\\)\\!\\-");
+        let mut small = [0u8; 2];
+        assert_eq!(
+            unsafe {
+                nntmux_search_service_escape_string(0, b"abcd".as_ptr(), 4, small.as_mut_ptr(), 2)
+            },
+            -7
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_search_service_escape_string(1, b"x".as_ptr(), 1, small.as_mut_ptr(), 2)
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_search_service_escape_string(0, std::ptr::null(), 3, small.as_mut_ptr(), 2)
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_search_service_escape_string(
+                    0,
+                    b"x".as_ptr(),
+                    usize::MAX,
+                    small.as_mut_ptr(),
+                    2,
+                )
+            },
+            -1
+        );
+    }
+
+    fn fuzzy(tags: [i32; 4], ints: [i64; 4], strs: [&[u8]; 4]) -> (i32, [i64; 4]) {
+        let mut input = Vec::new();
+        let mut lens = [0i64; 4];
+        for (i, s) in strs.iter().enumerate() {
+            input.extend_from_slice(s);
+            lens[i] = s.len() as i64;
+        }
+        let mut out = [0i64; 4];
+        let rc = unsafe {
+            nntmux_search_fuzzy_config_normalize(
+                tags.as_ptr(),
+                ints.as_ptr(),
+                input.as_ptr(),
+                input.len(),
+                lens.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        (rc, out)
+    }
+
+    #[test]
+    fn fuzzy_config_defaults_and_casts() {
+        assert_eq!(fuzzy([0; 4], [0; 4], [b""; 4]), (0, [1, 2, 2, 50]));
+        assert_eq!(
+            fuzzy([1, 3, 2, 3], [0, 0, 5, 0], [b"", b"3", b"", b"-7"]),
+            (0, [0, 3, 5, -7])
+        );
+        assert_eq!(fuzzy([3, 0, 0, 0], [0; 4], [b"0", b"", b"", b""]).1[0], 0);
+        assert_eq!(
+            fuzzy([3, 0, 0, 0], [0; 4], [b"false", b"", b"", b""]).1[0],
+            1
+        );
+        assert_eq!(fuzzy([0, 3, 0, 0], [0; 4], [b"", b" 3", b"", b""]).0, -1);
+        assert_eq!(fuzzy([0, 4, 0, 0], [0; 4], [b""; 4]).0, -1);
+        assert_eq!(
+            fuzzy(
+                [0, 3, 0, 0],
+                [0; 4],
+                [b"", b"99999999999999999999", b"", b""]
+            )
+            .0,
+            -1
+        );
+        assert_eq!(
+            fuzzy([5, 5, 0, 0], [0, 2, 0, 0], [b""; 4]),
+            (0, [0, 1, 2, 50])
+        );
+    }
+
+    #[test]
+    fn release_id_diff_and_unique_limit() {
+        let ids = [5i64, 3, 5, 9, 1];
+        let mut out = [0i64; 8];
+        let n = unsafe {
+            nntmux_search_release_ids_diff(ids.as_ptr(), 5, [5i64].as_ptr(), 1, out.as_mut_ptr(), 8)
+        };
+        assert_eq!(&out[..n as usize], &[3, 9, 1]);
+        let failed: Vec<i64> = (100..140).chain([9]).collect();
+        let n = unsafe {
+            nntmux_search_release_ids_diff(
+                ids.as_ptr(),
+                5,
+                failed.as_ptr(),
+                failed.len(),
+                out.as_mut_ptr(),
+                8,
+            )
+        };
+        assert_eq!(&out[..n as usize], &[5, 3, 5, 1]);
+        assert_eq!(
+            unsafe {
+                nntmux_search_release_ids_diff(
+                    ids.as_ptr(),
+                    5,
+                    std::ptr::null(),
+                    0,
+                    out.as_mut_ptr(),
+                    2,
+                )
+            },
+            -8
+        );
+        let unaligned = unsafe { (ids.as_ptr() as *const u8).add(1) as *const i64 };
+        assert_eq!(
+            unsafe {
+                nntmux_search_release_ids_diff(
+                    unaligned,
+                    1,
+                    std::ptr::null(),
+                    0,
+                    out.as_mut_ptr(),
+                    8,
+                )
+            },
+            -1
+        );
+
+        let mut uniq = |limit: i64| {
+            let n = unsafe {
+                nntmux_search_release_ids_unique_limit(ids.as_ptr(), 5, limit, out.as_mut_ptr(), 8)
+            };
+            out[..n as usize].to_vec()
+        };
+        assert_eq!(uniq(10), vec![5, 3, 9, 1]);
+        assert_eq!(uniq(2), vec![5, 3]);
+        assert_eq!(uniq(0), Vec::<i64>::new());
+        assert_eq!(uniq(-1), vec![5, 3, 9]);
+        assert_eq!(uniq(-10), Vec::<i64>::new());
+        assert_eq!(uniq(i64::MIN), Vec::<i64>::new());
+        let many: Vec<i64> = (0..100).map(|i| i % 37).collect();
+        let n = unsafe {
+            nntmux_search_release_ids_unique_limit(
+                many.as_ptr(),
+                many.len(),
+                i64::MAX,
+                out.as_mut_ptr(),
+                8,
+            )
+        };
+        assert_eq!(n, -40);
+    }
+
+    #[test]
+    fn media_presence_route_and_api_helpers() {
+        let tags = [2i32, 3, 3, 0, 1, 5];
+        let ints = [7i64, 0, 0, 0, 1, 0];
+        let input = b"0tt1";
+        let lens = [0i64, 1, 3, 0, 0, 0];
+        let mut mask = 0u64;
+        assert_eq!(
+            unsafe {
+                nntmux_media_external_id_presence(
+                    tags.as_ptr(),
+                    ints.as_ptr(),
+                    input.as_ptr(),
+                    input.len(),
+                    lens.as_ptr(),
+                    6,
+                    &mut mask,
+                )
+            },
+            0
+        );
+        assert_eq!(mask, 0b10101);
+        assert_eq!(
+            unsafe { nntmux_media_search_route(1, b"tv".as_ptr(), 2) },
+            0
+        );
+        assert_eq!(
+            unsafe { nntmux_media_search_route(0, b"movie".as_ptr(), 5) },
+            1
+        );
+        assert_eq!(
+            unsafe { nntmux_media_search_route(0, b"Movie".as_ptr(), 5) },
+            2
+        );
+        assert_eq!(unsafe { nntmux_media_search_route(2, b"".as_ptr(), 0) }, -1);
+
+        let mut buf = [0u8; 64];
+        let n = unsafe { nntmux_api_capabilities_registration(1, 0, buf.as_mut_ptr(), 64) };
+        assert_eq!(&buf[..n as usize], b"yes\tno");
+        assert_eq!(
+            unsafe { nntmux_api_capabilities_registration(2, 0, buf.as_mut_ptr(), 64) },
+            -1
+        );
+        let mut limits = [0i64; 2];
+        assert_eq!(
+            unsafe { nntmux_api_capabilities_limits(500, 250, limits.as_mut_ptr()) },
+            0
+        );
+        assert_eq!(limits, [500, 250]);
+        assert_eq!(
+            unsafe { nntmux_api_capabilities_limits(5, 6, limits.as_mut_ptr()) },
+            -1
+        );
+        assert!(unsafe { nntmux_api_capabilities_searching(1, buf.as_mut_ptr(), 64) } < -64);
+        assert_eq!(
+            unsafe { nntmux_api_capabilities_searching(3, buf.as_mut_ptr(), 64) },
+            -1
+        );
+
+        assert_eq!(unsafe { nntmux_api_v1_is_caps(b"caps".as_ptr(), 4) }, 1);
+        assert_eq!(unsafe { nntmux_api_v1_is_caps(b"search".as_ptr(), 6) }, 0);
+        let n = unsafe { nntmux_api_v1_response_headers(0, 1234, buf.as_mut_ptr(), 64) };
+        assert_eq!(&buf[..n as usize], b"application/json\t1234");
+        let n = unsafe { nntmux_api_v1_response_headers(1, 0, buf.as_mut_ptr(), 64) };
+        assert_eq!(&buf[..n as usize], b"text/xml\t0");
+        assert_eq!(
+            unsafe { nntmux_api_v1_response_headers(0, 1, buf.as_mut_ptr(), 4) },
+            -21
+        );
+
+        assert_eq!(
+            unsafe { nntmux_db_supports_information_schema(b"mariadb".as_ptr(), 7) },
+            1
+        );
+        assert_eq!(
+            unsafe { nntmux_db_supports_information_schema(b"MySQL".as_ptr(), 5) },
+            0
+        );
+        let mut rows = 0i64;
+        assert_eq!(
+            unsafe { nntmux_db_normalize_approx_rows(3, 0, b"42".as_ptr(), 2, &mut rows) },
+            1
+        );
+        assert_eq!(rows, 42);
+        assert_eq!(
+            unsafe { nntmux_db_normalize_approx_rows(3, 0, b"0".as_ptr(), 1, &mut rows) },
+            0
+        );
+        assert_eq!(
+            unsafe { nntmux_db_normalize_approx_rows(0, 0, std::ptr::null(), 0, &mut rows) },
+            0
+        );
+        assert_eq!(
+            unsafe { nntmux_db_normalize_approx_rows(2, -5, std::ptr::null(), 0, &mut rows) },
+            0
+        );
+        assert_eq!(
+            unsafe { nntmux_db_normalize_approx_rows(3, 0, b"1e3".as_ptr(), 3, &mut rows) },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_db_normalize_approx_rows(2, 1, std::ptr::null(), 0, std::ptr::null_mut())
+            },
+            -1
+        );
+    }
+}

@@ -8,6 +8,8 @@ use App\Facades\Search;
 use App\Models\MovieInfo;
 use App\Models\Release;
 use App\Models\Video;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Facades\Cache;
 
 /**
@@ -23,6 +25,44 @@ class MediaSearchService
      * Cache TTL for media search results (minutes).
      */
     private const CACHE_TTL = 5;
+
+    /**
+     * Rust candidates for the pure helpers below. They stay opt-in: none beat PHP by
+     * 1.5x in the paired benchmark (tests/Unit/RustSearchMediaApiCapabilitiesParityTest.php).
+     */
+    public const string FFI_CDEF = <<<'C'
+        int32_t nntmux_media_external_id_presence(const int32_t *tags, const int64_t *ints, const char *input, size_t len, const int64_t *lens, size_t count, uint64_t *out_mask);
+        ssize_t nntmux_search_release_ids_unique_limit(const int64_t *ids, size_t count, int64_t limit, int64_t *out, size_t cap);
+        int32_t nntmux_media_search_route(int32_t has_external_ids, const char *kind, size_t len);
+        C;
+
+    /**
+     * Movie index fields, in lookup priority order, mapped to release external-ID fields.
+     */
+    public const array MOVIE_EXTERNAL_ID_FIELDS = ['imdbid' => 'imdbid', 'tmdbid' => 'tmdbid', 'traktid' => 'traktid'];
+
+    /**
+     * TV show index fields, in lookup priority order, mapped to release external-ID fields.
+     */
+    public const array TV_EXTERNAL_ID_FIELDS = ['tvdb' => 'tvdb', 'trakt' => 'traktid', 'tvmaze' => 'tvmaze', 'tvrage' => 'tvrage'];
+
+    public static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
+
+    public static function setUseRustFfi(bool $useRustFfi): void
+    {
+        self::$useRustFfi = $useRustFfi;
+    }
+
+    public static function searchFfi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('search', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
 
     /**
      * Find movie by any external ID and return cached movie data from index.
@@ -75,17 +115,7 @@ class MediaSearchService
         $externalIdSets = [];
 
         foreach ($movieResults['data'] ?? [] as $movie) {
-            $externalIds = [];
-
-            if (! empty($movie['imdbid'])) {
-                $externalIds['imdbid'] = $movie['imdbid'];
-            }
-            if (! empty($movie['tmdbid'])) {
-                $externalIds['tmdbid'] = $movie['tmdbid'];
-            }
-            if (! empty($movie['traktid'])) {
-                $externalIds['traktid'] = $movie['traktid'];
-            }
+            $externalIds = \is_array($movie) ? self::collectExternalIds($movie, self::MOVIE_EXTERNAL_ID_FIELDS) : [];
 
             if (! empty($externalIds)) {
                 $externalIdSets[] = $externalIds;
@@ -95,8 +125,7 @@ class MediaSearchService
         $allReleaseIds = Search::searchReleasesByMultipleExternalIds($externalIdSets, $limit);
 
         // Remove duplicates and limit results
-        $allReleaseIds = array_unique($allReleaseIds);
-        $allReleaseIds = array_slice($allReleaseIds, 0, $limit);
+        $allReleaseIds = self::uniqueLimitedReleaseIds($allReleaseIds, $limit);
 
         if (! empty($allReleaseIds)) {
             Cache::put($cacheKey, $allReleaseIds, now()->addMinutes(self::CACHE_TTL));
@@ -134,20 +163,7 @@ class MediaSearchService
         $externalIdSets = [];
 
         foreach ($tvResults['data'] ?? [] as $tvShow) {
-            $externalIds = [];
-
-            if (! empty($tvShow['tvdb'])) {
-                $externalIds['tvdb'] = $tvShow['tvdb'];
-            }
-            if (! empty($tvShow['trakt'])) {
-                $externalIds['traktid'] = $tvShow['trakt'];
-            }
-            if (! empty($tvShow['tvmaze'])) {
-                $externalIds['tvmaze'] = $tvShow['tvmaze'];
-            }
-            if (! empty($tvShow['tvrage'])) {
-                $externalIds['tvrage'] = $tvShow['tvrage'];
-            }
+            $externalIds = \is_array($tvShow) ? self::collectExternalIds($tvShow, self::TV_EXTERNAL_ID_FIELDS) : [];
 
             if (! empty($externalIds)) {
                 $externalIdSets[] = $externalIds;
@@ -157,8 +173,7 @@ class MediaSearchService
         $allReleaseIds = Search::searchReleasesByMultipleExternalIds($externalIdSets, $limit);
 
         // Remove duplicates and limit results
-        $allReleaseIds = array_unique($allReleaseIds);
-        $allReleaseIds = array_slice($allReleaseIds, 0, $limit);
+        $allReleaseIds = self::uniqueLimitedReleaseIds($allReleaseIds, $limit);
 
         if (! empty($allReleaseIds)) {
             Cache::put($cacheKey, $allReleaseIds, now()->addMinutes(self::CACHE_TTL));
@@ -226,17 +241,198 @@ class MediaSearchService
      */
     public function searchMedia(string $title, array $externalIds = [], string $type = 'movie', int $limit = 1000): array
     {
-        // If we have external IDs, use them directly
+        // External IDs are used directly; otherwise fall back to a title search.
+        return match (self::searchMediaRoute($externalIds, $type)) {
+            'external' => Search::searchReleasesByExternalId($externalIds, $limit),
+            'movie' => $this->searchMovieReleases($title, $limit),
+            default => $this->searchTvShowReleases($title, $limit),
+        };
+    }
+
+    /**
+     * The non-empty external IDs of an index row, in `$fields` priority order and
+     * renamed to the release fields.
+     *
+     * @param  array<array-key, mixed>  $row
+     * @param  array<string, string>  $fields
+     * @return array<string, mixed>
+     */
+    public static function collectExternalIds(array $row, array $fields): array
+    {
+        return self::$useRustFfi ? self::collectExternalIdsNative($row, $fields) : self::collectExternalIdsPhp($row, $fields);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $row
+     * @param  array<string, string>  $fields
+     * @return array<string, mixed>
+     */
+    public static function collectExternalIdsPhp(array $row, array $fields): array
+    {
+        $externalIds = [];
+        foreach ($fields as $source => $target) {
+            if (! empty($row[$source])) {
+                $externalIds[$target] = $row[$source];
+            }
+        }
+
+        return $externalIds;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $row
+     * @param  array<string, string>  $fields
+     * @return array<string, mixed>
+     */
+    public static function collectExternalIdsNative(array $row, array $fields): array
+    {
+        $ffi = self::searchFfi();
+        $values = [];
+        foreach ($fields as $source => $target) {
+            $values[] = $row[$source] ?? null;
+        }
+        $count = \count($values);
+        $encoded = $ffi === null || $count === 0 || $count > 63 ? null : SearchService::encodeFfiValues($values);
+        if ($ffi === null || $encoded === null) {
+            return self::collectExternalIdsPhp($row, $fields);
+        }
+
+        $mask = $ffi->new('uint64_t[1]');
+        // @phpstan-ignore method.notFound
+        $rc = $ffi->nntmux_media_external_id_presence(
+            SearchService::ffiInt32Array($ffi, $encoded['tags']),
+            SearchService::ffiInt64Array($ffi, $encoded['ints']),
+            $encoded['bytes'],
+            \strlen($encoded['bytes']),
+            SearchService::ffiInt64Array($ffi, $encoded['lens']),
+            $count,
+            $mask,
+        );
+        if ($rc !== 0) {
+            return self::collectExternalIdsPhp($row, $fields);
+        }
+
+        $present = (int) $mask[0];
+        $externalIds = [];
+        $i = 0;
+        foreach ($fields as $source => $target) {
+            if (($present >> $i) & 1) {
+                $externalIds[$target] = $row[$source];
+            }
+            $i++;
+        }
+
+        return $externalIds;
+    }
+
+    /**
+     * Release IDs without duplicates (first occurrence wins), cut to `$limit` with
+     * `array_slice()` length rules.
+     *
+     * @param  array<array-key, mixed>  $releaseIds
+     * @return array<array-key, mixed>
+     */
+    public static function uniqueLimitedReleaseIds(array $releaseIds, int $limit): array
+    {
+        return self::$useRustFfi
+            ? self::uniqueLimitedReleaseIdsNative($releaseIds, $limit)
+            : self::uniqueLimitedReleaseIdsPhp($releaseIds, $limit);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $releaseIds
+     * @return array<array-key, mixed>
+     */
+    public static function uniqueLimitedReleaseIdsPhp(array $releaseIds, int $limit): array
+    {
+        return array_slice(array_unique($releaseIds), 0, $limit);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $releaseIds
+     * @return array<array-key, mixed>
+     */
+    public static function uniqueLimitedReleaseIdsNative(array $releaseIds, int $limit): array
+    {
+        $ffi = self::searchFfi();
+        if ($ffi === null || $releaseIds === [] || ! array_is_list($releaseIds)) {
+            return self::uniqueLimitedReleaseIdsPhp($releaseIds, $limit);
+        }
+        $ids = [];
+        foreach ($releaseIds as $id) {
+            if (! \is_int($id)) {
+                return self::uniqueLimitedReleaseIdsPhp($releaseIds, $limit);
+            }
+            $ids[] = $id;
+        }
+
+        $count = \count($ids);
+        $out = $ffi->new("int64_t[{$count}]");
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_search_release_ids_unique_limit(
+            SearchService::ffiInt64Array($ffi, $ids),
+            $count,
+            $limit,
+            $out,
+            $count,
+        );
+        if (! \is_int($written) || $written < 0) {
+            return self::uniqueLimitedReleaseIdsPhp($releaseIds, $limit);
+        }
+
+        $unique = [];
+        for ($i = 0; $i < $written; $i++) {
+            $unique[] = (int) $out[$i];
+        }
+
+        return $unique;
+    }
+
+    /**
+     * How searchMedia() looks releases up: 'external' when external IDs are given,
+     * otherwise a title search, 'movie' for `$type === 'movie'` and 'tv' for any other type.
+     *
+     * @param  array<string, mixed>  $externalIds
+     * @return 'external'|'movie'|'tv'
+     */
+    public static function searchMediaRoute(array $externalIds, string $type): string
+    {
+        return self::$useRustFfi ? self::searchMediaRouteNative($externalIds, $type) : self::searchMediaRoutePhp($externalIds, $type);
+    }
+
+    /**
+     * @param  array<string, mixed>  $externalIds
+     * @return 'external'|'movie'|'tv'
+     */
+    public static function searchMediaRoutePhp(array $externalIds, string $type): string
+    {
         if (! empty($externalIds)) {
-            return Search::searchReleasesByExternalId($externalIds, $limit);
+            return 'external';
         }
 
-        // Otherwise search by title
-        if ($type === 'movie') {
-            return $this->searchMovieReleases($title, $limit);
+        return $type === 'movie' ? 'movie' : 'tv';
+    }
+
+    /**
+     * @param  array<string, mixed>  $externalIds
+     * @return 'external'|'movie'|'tv'
+     */
+    public static function searchMediaRouteNative(array $externalIds, string $type): string
+    {
+        $ffi = self::searchFfi();
+        if ($ffi === null) {
+            return self::searchMediaRoutePhp($externalIds, $type);
         }
 
-        return $this->searchTvShowReleases($title, $limit);
+        // @phpstan-ignore method.notFound
+        $route = $ffi->nntmux_media_search_route($externalIds === [] ? 0 : 1, $type, \strlen($type));
+
+        return match ($route) {
+            0 => 'external',
+            1 => 'movie',
+            2 => 'tv',
+            default => self::searchMediaRoutePhp($externalIds, $type),
+        };
     }
 
     /**
