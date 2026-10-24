@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Verification;
 
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Throwable;
 
 /**
@@ -12,6 +14,59 @@ use Throwable;
  */
 final class VerificationRunDiagnostics
 {
+    public const string FFI_CDEF = <<<'C'
+        int32_t nntmux_verification_diagnostics_stop(const char *reason, size_t reason_len, int64_t stopped, int64_t claims_admitted, int64_t limit, uint8_t has_loop_started, int64_t loop_started, int64_t max_seconds);
+        ssize_t nntmux_verification_diagnostics_round_metrics(const char *input, size_t input_len, int64_t started, int64_t finished, uint8_t has_loop_started, int64_t loop_started, uint8_t has_stopped, int64_t stopped, char *out, size_t out_cap);
+        C;
+
+    private const array STOP_REASONS = [
+        'limit',
+        'deadline',
+        'no_claim',
+        'draining',
+        'worker_unavailable',
+        'initialization_unavailable',
+        'initialization_error',
+        'unsafe_scratch_root',
+        'error',
+    ];
+
+    private static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
+
+    private static ?FFI\CData $scratch = null;
+
+    private static int $scratchCap = 0;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi && self::ffi() !== null;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
+
+    private static function scratch(FFI $ffi, int $minBytes): ?FFI\CData
+    {
+        if (self::$scratch === null || self::$scratchCap < $minBytes) {
+            self::$scratch = RustPipelineLibrary::obtainScratch($ffi, $minBytes, self::$scratchCap);
+        }
+
+        return self::$scratch;
+    }
+
     private bool $workerAcquired = false;
 
     private ?int $loopStarted = null;
@@ -188,15 +243,57 @@ final class VerificationRunDiagnostics
     /** Capture the admission decision before cleanup or a slow log sink can change threshold evidence. */
     public function stop(string $reason, int $stopped): void
     {
+        if (self::$useRustFfi && $this->stopNative($reason, $stopped)) {
+            return;
+        }
+        $this->stopPhp($reason, $stopped);
+    }
+
+    public function stopPhp(string $reason, int $stopped): void
+    {
         if ($this->stopReason !== null) {
             return;
         }
-        $this->stopReason = in_array($reason, ['limit', 'deadline', 'no_claim', 'draining', 'worker_unavailable',
-            'initialization_unavailable', 'initialization_error', 'unsafe_scratch_root', 'error'], true) ? $reason : 'error';
+        $this->stopReason = in_array($reason, self::STOP_REASONS, true) ? $reason : 'error';
         $this->stopped = $stopped;
         $this->limitReached = $this->claimsAdmitted >= $this->limit;
         $this->deadlineReached = $this->loopStarted !== null && $this->maxSeconds > 0
             && ($stopped - $this->loopStarted) / 1e9 >= $this->maxSeconds;
+    }
+
+    public function stopNative(string $reason, int $stopped): bool
+    {
+        if ($this->stopReason !== null) {
+            return true;
+        }
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return false;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $flags = $ffi->nntmux_verification_diagnostics_stop(
+                $reason,
+                strlen($reason),
+                $stopped,
+                $this->claimsAdmitted,
+                $this->limit,
+                $this->loopStarted !== null ? 1 : 0,
+                $this->loopStarted ?? 0,
+                $this->maxSeconds
+            );
+            if (! is_int($flags) || $flags < 0) {
+                return false;
+            }
+            $this->stopReason = self::STOP_REASONS[$flags & 0x0F] ?? 'error';
+            $this->stopped = $stopped;
+            $this->limitReached = ($flags & 0x10) !== 0;
+            $this->deadlineReached = ($flags & 0x20) !== 0;
+
+            return true;
+        } catch (Throwable) {
+            return false;
+        }
     }
 
     public function returned(int $exitCode): void
@@ -218,6 +315,13 @@ final class VerificationRunDiagnostics
 
     /** @return array<string, mixed> */
     public function report(int $finished): array
+    {
+        return (self::$useRustFfi ? $this->reportNative($finished) : null)
+            ?? $this->reportPhp($finished);
+    }
+
+    /** @return array<string, mixed> */
+    public function reportPhp(int $finished): array
     {
         return [
             'schema_version' => 4,
@@ -256,6 +360,101 @@ final class VerificationRunDiagnostics
                 'ms' => round($this->phases[$phase]['ms'] ?? 0.0, 3), 'count' => $this->phases[$phase]['count'] ?? 0,
             ], self::PHASES)),
         ];
+    }
+
+    /** @return array<string, mixed>|null */
+    public function reportNative(int $finished): ?array
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $input = pack(
+            'd10',
+            $this->outboxWaitMilliseconds,
+            $this->phases['claim']['ms'] ?? 0.0,
+            $this->phases['prefetch']['ms'] ?? 0.0,
+            $this->phases['bookkeeping']['ms'] ?? 0.0,
+            $this->phases['manifest_read']['ms'] ?? 0.0,
+            $this->phases['verify_passed']['ms'] ?? 0.0,
+            $this->phases['verify_other']['ms'] ?? 0.0,
+            $this->phases['publish']['ms'] ?? 0.0,
+            $this->phases['finish']['ms'] ?? 0.0,
+            $this->phases['status_write']['ms'] ?? 0.0
+        );
+        try {
+            $scratch = self::scratch($ffi, 128);
+            if ($scratch === null) {
+                return null;
+            }
+            $cap = self::$scratchCap;
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_verification_diagnostics_round_metrics(
+                $input,
+                80,
+                $this->started,
+                $finished,
+                $this->loopStarted !== null ? 1 : 0,
+                $this->loopStarted ?? 0,
+                $this->stopped !== null ? 1 : 0,
+                $this->stopped ?? 0,
+                $scratch,
+                $cap
+            );
+            if ($written !== 96) {
+                return null;
+            }
+            /** @var array<int, float>|false $vals */
+            $vals = unpack('d12', FFI::string($scratch, 96));
+            if ($vals === false) {
+                return null;
+            }
+            $phases = [];
+            foreach (self::PHASES as $idx => $phase) {
+                $phases[$phase] = [
+                    'ms' => $vals[4 + $idx],
+                    'count' => $this->phases[$phase]['count'] ?? 0,
+                ];
+            }
+
+            return [
+                'schema_version' => 4,
+                'started_at' => $this->startedAt,
+                'requested_slot' => $this->requestedSlot,
+                'limit' => $this->limit,
+                'max_seconds' => $this->maxSeconds,
+                'worker_acquired' => $this->workerAcquired,
+                'loop_started' => $this->loopStarted !== null,
+                'claim_calls' => $this->claimCalls,
+                'claims_admitted' => $this->claimsAdmitted,
+                'queued_returned' => $this->queuedReturned,
+                'queued_lost' => $this->queuedLost,
+                'queued_return_failed' => $this->queuedReturnFailed,
+                'stop_reason' => $this->stopReason,
+                'limit_reached' => $this->limitReached,
+                'deadline_reached_at_stop' => $this->deadlineReached,
+                'verifier_verdicts' => $this->verdicts,
+                'publish_returned' => $this->publishReturned,
+                'handed_off' => $this->handedOff,
+                'outbox_fallbacks' => $this->outboxFallbacks,
+                'outbox_wait_ms' => $vals[1],
+                'finish_returned' => $this->finishReturned,
+                'filtered_recoveries' => $this->filteredRecoveries,
+                'candidate_errors' => $this->candidateErrors,
+                'fatal_error' => $this->fatalError,
+                'command_result' => $this->commandResult,
+                'exit_code' => $this->exitCode,
+                'maintenance_state' => $this->maintenanceState,
+                'durations_ms' => [
+                    'total' => $vals[2],
+                    'maintenance' => $this->maintenanceMilliseconds,
+                    'claim_loop' => $this->loopStarted === null ? null : $vals[3],
+                ],
+                'phases' => $phases,
+            ];
+        } catch (Throwable) {
+            return null;
+        }
     }
 
     /** @param callable(array<string, mixed>): void $observer */

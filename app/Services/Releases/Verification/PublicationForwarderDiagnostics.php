@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Verification;
 
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Throwable;
 
 /**
@@ -13,10 +15,53 @@ use Throwable;
  */
 final class PublicationForwarderDiagnostics
 {
+    public const string FFI_CDEF = <<<'C'
+        int32_t nntmux_publication_forwarder_classify(const char *label, size_t label_len, uint32_t mode);
+        ssize_t nntmux_publication_forwarder_metrics(int64_t batches, int64_t items, double linger_ms, double round_trip_ms, double slowest_round_trip_ms, int64_t started, int64_t finished, char *out, size_t out_cap);
+        C;
+
     public const int SCHEMA_VERSION = 1;
+
+    private const array STOP_REASONS = ['deadline', 'passes', 'terminated', 'locks_lost', 'worker_unavailable', 'disabled', 'slot_unavailable', 'error'];
 
     /** Outcome labels counted per item; anything else is "other". */
     private const array OUTCOMES = ['published', 'filtered', 'metadata_review', 'deferred', 'stale', 'invalid', 'error', 'paused', 'retry', 'transport', 'no_release'];
+
+    private static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
+
+    private static ?FFI\CData $scratch = null;
+
+    private static int $scratchCap = 0;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi && self::ffi() !== null;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
+
+    private static function scratch(FFI $ffi, int $minBytes): ?FFI\CData
+    {
+        if (self::$scratch === null || self::$scratchCap < $minBytes) {
+            self::$scratch = RustPipelineLibrary::obtainScratch($ffi, $minBytes, self::$scratchCap);
+        }
+
+        return self::$scratch;
+    }
 
     private ?string $stopReason = null;
 
@@ -72,8 +117,39 @@ final class PublicationForwarderDiagnostics
 
     public function stop(string $reason): void
     {
-        $this->stopReason ??= in_array($reason, ['deadline', 'passes', 'terminated', 'locks_lost', 'worker_unavailable', 'disabled', 'slot_unavailable', 'error'], true)
+        if (self::$useRustFfi && $this->stopNative($reason)) {
+            return;
+        }
+        $this->stopPhp($reason);
+    }
+
+    public function stopPhp(string $reason): void
+    {
+        $this->stopReason ??= in_array($reason, self::STOP_REASONS, true)
             ? $reason : 'error';
+    }
+
+    public function stopNative(string $reason): bool
+    {
+        if ($this->stopReason !== null) {
+            return true;
+        }
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return false;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $idx = $ffi->nntmux_publication_forwarder_classify($reason, strlen($reason), 0);
+            if (! is_int($idx) || $idx < 0) {
+                return false;
+            }
+            $this->stopReason = self::STOP_REASONS[$idx] ?? 'error';
+
+            return true;
+        } catch (Throwable) {
+            return false;
+        }
     }
 
     public function returned(int $exitCode): void
@@ -109,8 +185,37 @@ final class PublicationForwarderDiagnostics
 
     public function outcome(string $status): void
     {
+        if (self::$useRustFfi && $this->outcomeNative($status)) {
+            return;
+        }
+        $this->outcomePhp($status);
+    }
+
+    public function outcomePhp(string $status): void
+    {
         $label = in_array($status, self::OUTCOMES, true) ? $status : 'other';
         $this->outcomes[$label] = ($this->outcomes[$label] ?? 0) + 1;
+    }
+
+    public function outcomeNative(string $status): bool
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return false;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $idx = $ffi->nntmux_publication_forwarder_classify($status, strlen($status), 1);
+            if (! is_int($idx) || $idx < 0) {
+                return false;
+            }
+            $label = self::OUTCOMES[$idx] ?? 'other';
+            $this->outcomes[$label] = ($this->outcomes[$label] ?? 0) + 1;
+
+            return true;
+        } catch (Throwable) {
+            return false;
+        }
     }
 
     public function requeued(): void
@@ -180,6 +285,13 @@ final class PublicationForwarderDiagnostics
     /** @return array<string, mixed> */
     public function report(int $finished): array
     {
+        return (self::$useRustFfi ? $this->reportNative($finished) : null)
+            ?? $this->reportPhp($finished);
+    }
+
+    /** @return array<string, mixed> */
+    public function reportPhp(int $finished): array
+    {
         $outcomes = [];
         foreach ([...self::OUTCOMES, 'other'] as $label) {
             $outcomes[$label] = $this->outcomes[$label] ?? 0;
@@ -215,6 +327,89 @@ final class PublicationForwarderDiagnostics
                 'mean' => $this->batches === 0 ? 0.0 : round($this->roundTripMilliseconds / $this->batches, 3)],
             'duration_ms' => round(($finished - $this->started) / 1_000_000.0, 3),
         ];
+    }
+
+    /** @return array<string, mixed>|null */
+    public function reportNative(int $finished): ?array
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            $scratch = self::scratch($ffi, 64);
+            if ($scratch === null) {
+                return null;
+            }
+            $cap = self::$scratchCap;
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_publication_forwarder_metrics(
+                $this->batches,
+                $this->items,
+                $this->lingerMilliseconds,
+                $this->roundTripMilliseconds,
+                $this->slowestRoundTripMilliseconds,
+                $this->started,
+                $finished,
+                $scratch,
+                $cap
+            );
+            if ($written !== 48) {
+                return null;
+            }
+            /** @var array<int, float>|false $vals */
+            $vals = unpack('d6', FFI::string($scratch, 48));
+            if ($vals === false) {
+                return null;
+            }
+            $outcomes = [];
+            foreach ([...self::OUTCOMES, 'other'] as $label) {
+                $outcomes[$label] = $this->outcomes[$label] ?? 0;
+            }
+
+            return [
+                'schema_version' => self::SCHEMA_VERSION,
+                'kind' => 'publication_forwarder',
+                'started_at' => $this->startedAt,
+                'slot' => $this->slot,
+                'max_seconds' => $this->maxSeconds,
+                'stop_reason' => $this->stopReason,
+                'command_result' => $this->commandResult,
+                'adopted' => $this->adopted,
+                'batches_sent' => $this->batches,
+                'items_sent' => $this->items,
+                'items_per_batch' => [
+                    'min' => $this->smallestBatch,
+                    'max' => $this->largestBatch,
+                    'mean' => $vals[1],
+                ],
+                'outcomes' => $outcomes,
+                'transport_failures' => $this->transportFailures,
+                'requeued' => $this->requeued,
+                'expired' => $this->expired,
+                'lease_lost' => $this->leaseLost,
+                'lock_blocked' => $this->lockBlocked,
+                'quarantined' => $this->quarantined,
+                'advertised_item_limit' => $this->itemLimit,
+                'orphans_adopted' => $this->orphansAdopted,
+                'finish_failures' => $this->finishFailures,
+                'linger' => [
+                    'waits_started' => $this->lingersStarted,
+                    'ended_by_fill' => $this->lingersFilled,
+                    'ended_by_timeout' => $this->lingersTimedOut,
+                    'interrupted' => $this->lingersInterrupted,
+                    'total_ms' => $vals[2],
+                ],
+                'round_trip_ms' => [
+                    'total' => $vals[3],
+                    'max' => $vals[4],
+                    'mean' => $vals[5],
+                ],
+                'duration_ms' => $vals[6],
+            ];
+        } catch (Throwable) {
+            return null;
+        }
     }
 
     /** @param callable(array<string, mixed>): void $observer */

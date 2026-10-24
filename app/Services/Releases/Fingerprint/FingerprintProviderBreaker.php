@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace App\Services\Releases\Fingerprint;
 
 use App\Jobs\CollectReleaseFingerprintMetadata;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Facades\Cache;
 use Throwable;
 
@@ -13,6 +15,47 @@ use Throwable;
  */
 final class FingerprintProviderBreaker
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_fingerprint_breaker_key(const char *name, size_t name_len, const char *port, size_t port_len, uint8_t tls, const char *state, size_t state_len, const char *generation, size_t generation_len, char *out, size_t out_cap);
+        int64_t nntmux_fingerprint_breaker_suspect_seconds(int64_t window_seconds, int64_t cooldown_seconds);
+        C;
+
+    private static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
+
+    private static ?FFI\CData $scratch = null;
+
+    private static int $scratchCap = 0;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi && self::ffi() !== null;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
+
+    private static function scratch(FFI $ffi, int $minBytes): ?FFI\CData
+    {
+        if (self::$scratch === null || self::$scratchCap < $minBytes) {
+            self::$scratch = RustPipelineLibrary::obtainScratch($ffi, $minBytes, self::$scratchCap);
+        }
+
+        return self::$scratch;
+    }
+
     /** @var array<string, string> Failure generations whose re-probe this instance claimed, keyed by provider. */
     private array $claims = [];
 
@@ -100,7 +143,38 @@ final class FingerprintProviderBreaker
 
     private static function suspectSeconds(): int
     {
-        return max(3600, self::windowSeconds() * 4);
+        return (self::$useRustFfi ? self::suspectSecondsNative() : null)
+            ?? self::suspectSecondsPhp();
+    }
+
+    public static function suspectSecondsPhp(?int $windowSeconds = null, int $cooldownSeconds = 0): int
+    {
+        $window = $windowSeconds ?? self::windowSeconds();
+        if ($cooldownSeconds > 0) {
+            return min($cooldownSeconds, max(30, $window));
+        }
+
+        return max(3600, $window * 4);
+    }
+
+    public static function suspectSecondsNative(?int $windowSeconds = null, int $cooldownSeconds = 0): ?int
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $window = $windowSeconds ?? self::windowSeconds();
+        try {
+            // @phpstan-ignore method.notFound
+            $seconds = $ffi->nntmux_fingerprint_breaker_suspect_seconds($window, $cooldownSeconds);
+            if (! is_int($seconds) || $seconds < 0) {
+                return null;
+            }
+
+            return $seconds;
+        } catch (Throwable) {
+            return null;
+        }
     }
 
     private static function windowSeconds(): int
@@ -120,7 +194,54 @@ final class FingerprintProviderBreaker
     /** @param array{name: string, port: string, tls: bool} $server */
     private static function key(array $server, string $state = 'generation', string $generation = ''): string
     {
+        return (self::$useRustFfi ? self::keyNative($server, $state, $generation) : null)
+            ?? self::keyPhp($server, $state, $generation);
+    }
+
+    /** @param array{name: string, port: string, tls: bool} $server */
+    public static function keyPhp(array $server, string $state = 'generation', string $generation = ''): string
+    {
         return 'release-fingerprint:provider-breaker:'.sha1(strtolower($server['name']).'|'.$server['port'].'|'.($server['tls'] ? 'tls' : 'plain'))
             .':'.$state.($generation === '' ? '' : ':'.$generation);
+    }
+
+    /** @param array{name: string, port: string, tls: bool} $server */
+    public static function keyNative(array $server, string $state = 'generation', string $generation = ''): ?string
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $name = $server['name'];
+        $port = $server['port'];
+        $tls = $server['tls'] ? 1 : 0;
+        try {
+            $scratch = self::scratch($ffi, max(256, strlen($state) + strlen($generation) + 128));
+            if ($scratch === null) {
+                return null;
+            }
+            $cap = self::$scratchCap;
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_fingerprint_breaker_key(
+                $name,
+                strlen($name),
+                $port,
+                strlen($port),
+                $tls,
+                $state,
+                strlen($state),
+                $generation,
+                strlen($generation),
+                $scratch,
+                $cap
+            );
+            if (! is_int($written) || $written <= 0 || $written > $cap) {
+                return null;
+            }
+
+            return FFI::string($scratch, $written);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }

@@ -3045,34 +3045,120 @@ fn collections_pre_normalize(subject: &[u8], music: bool, output: &mut [u8]) -> 
     collections_normalize(&stage[..cursor], output)
 }
 
-fn collections_special_music(subject: &[u8]) -> bool {
-    let subject = subject.strip_suffix(b"\n").unwrap_or(subject);
+fn collections_special_music_capture(subject: &[u8]) -> Option<&[u8]> {
+    let stripped = subject.strip_suffix(b"\n").unwrap_or(subject);
     let mut pos = 0;
-    while subject.get(pos).is_some_and(|&b| is_pcre_word(b)) {
+    while stripped.get(pos).is_some_and(|&b| is_pcre_word(b)) {
         pos += 1;
     }
-    if pos < 10 || subject.get(pos) != Some(&b'-') {
-        return false;
+    if pos < 10 || stripped.get(pos) != Some(&b'-') {
+        return None;
     }
     pos += 1;
     let album = pos;
-    while subject.get(pos).is_some_and(u8::is_ascii_alphanumeric) {
+    while stripped.get(pos).is_some_and(u8::is_ascii_alphanumeric) {
         pos += 1;
     }
-    if pos == album || !subject[pos..].starts_with(b" \"") {
-        return false;
+    if pos == album || !stripped[pos..].starts_with(b" \"") {
+        return None;
     }
     pos += 2;
-    if !subject.get(pos).is_some_and(u8::is_ascii_digit)
-        || !subject.get(pos + 1).is_some_and(u8::is_ascii_digit)
-        || subject.get(pos + 2) != Some(&b'-')
+    let capture_end = pos;
+    if !stripped.get(pos).is_some_and(u8::is_ascii_digit)
+        || !stripped.get(pos + 1).is_some_and(u8::is_ascii_digit)
+        || stripped.get(pos + 2) != Some(&b'-')
     {
-        return false;
+        return None;
     }
     pos += 3;
-    subject.len() >= pos + 7
-        && subject.ends_with(b"\" yEnc")
-        && !subject[pos..subject.len() - 6].contains(&b'\n')
+    if stripped.len() >= pos + 7
+        && stripped.ends_with(b"\" yEnc")
+        && !stripped[pos..stripped.len() - 6].contains(&b'\n')
+    {
+        Some(&stripped[..capture_end])
+    } else {
+        None
+    }
+}
+
+fn collections_special_music(subject: &[u8]) -> bool {
+    collections_special_music_capture(subject).is_some()
+}
+
+fn collections_is_music_group_bytes(group: &[u8]) -> bool {
+    [
+        b".flac".as_slice(),
+        b".lossless",
+        b".mp3",
+        b".music",
+        b".sounds",
+    ]
+    .iter()
+    .any(|needle| group.windows(needle.len()).any(|v| v == *needle))
+}
+
+/// Check whether `group` matches `/\.(flac|lossless|mp3|music|sounds)/`.
+/// Returns 1 on match, 0 on non-match, or -1 on invalid pointer/length.
+///
+/// # Safety
+/// Non-null `group` must be readable for `group_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_collections_is_music_group(
+    group: *const u8,
+    group_len: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if group_len > isize::MAX as usize || (group.is_null() && group_len != 0) {
+            return -1;
+        }
+        let group_slice = if group_len == 0 {
+            &[][..]
+        } else {
+            unsafe { slice::from_raw_parts(group, group_len) }
+        };
+        i32::from(collections_is_music_group_bytes(group_slice))
+    }))
+    .unwrap_or(-1)
+}
+
+/// Extract `$hit[1]` for `CollectionsCleaningService::musicSubject()`
+/// (`/^(\w{10,}-[a-zA-Z0-9]+ ")\d\d-.+?" yEnc$/`).
+/// Returns bytes written (`>= 14`) on match, `0` when unmatched (`false`),
+/// `-(needed as isize)` when `out_cap` is too small, or `-1` on invalid arguments.
+///
+/// # Safety
+/// Non-null pointers must be valid for their stated lengths and must not overlap.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_collections_extract_music_subject(
+    input: *const u8,
+    input_len: usize,
+    out: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if input_len > isize::MAX as usize
+            || out_cap > isize::MAX as usize
+            || (input.is_null() && input_len != 0)
+            || (out.is_null() && out_cap != 0)
+        {
+            return -1;
+        }
+        let subject = if input_len == 0 {
+            &[][..]
+        } else {
+            unsafe { slice::from_raw_parts(input, input_len) }
+        };
+        let Some(captured) = collections_special_music_capture(subject) else {
+            return 0;
+        };
+        if captured.len() > out_cap {
+            return -(captured.len() as isize);
+        }
+        let output = unsafe { slice::from_raw_parts_mut(out, out_cap) };
+        output[..captured.len()].copy_from_slice(captured);
+        captured.len() as isize
+    }))
+    .unwrap_or(-1)
 }
 
 /// Return collapsed and PHP-trimmed bytes before mbstring encoding detection,
@@ -3088,19 +3174,22 @@ pub unsafe extern "C" fn nntmux_collections_clean_generic_pre_normalize(
     out: *mut u8,
     out_cap: usize,
 ) -> isize {
-    if input.is_null()
-        || out.is_null()
-        || out_cap > isize::MAX as usize
-        || input_len > COLLECTIONS_MAX_SUBJECT
-    {
-        return -1;
-    }
-    collections_pre_normalize(
-        unsafe { slice::from_raw_parts(input, input_len) },
-        false,
-        unsafe { slice::from_raw_parts_mut(out, out_cap) },
-    )
-    .map_or(-1, |len| len as isize)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if input.is_null()
+            || out.is_null()
+            || out_cap > isize::MAX as usize
+            || input_len > COLLECTIONS_MAX_SUBJECT
+        {
+            return -1;
+        }
+        collections_pre_normalize(
+            unsafe { slice::from_raw_parts(input, input_len) },
+            false,
+            unsafe { slice::from_raw_parts_mut(out, out_cap) },
+        )
+        .map_or(-1, |len| len as isize)
+    }))
+    .unwrap_or(-1)
 }
 
 /// Music route: -2 means a nonmusic group, -3 delegates the exact musicSubject
@@ -3118,36 +3207,30 @@ pub unsafe extern "C" fn nntmux_collections_music_subject(
     out: *mut u8,
     out_cap: usize,
 ) -> isize {
-    if input.is_null()
-        || group.is_null()
-        || out.is_null()
-        || input_len > COLLECTIONS_MAX_SUBJECT
-        || group_len > isize::MAX as usize
-        || out_cap > isize::MAX as usize
-    {
-        return -1;
-    }
-    let group = unsafe { slice::from_raw_parts(group, group_len) };
-    if ![
-        b".flac".as_slice(),
-        b".lossless",
-        b".mp3",
-        b".music",
-        b".sounds",
-    ]
-    .iter()
-    .any(|needle| group.windows(needle.len()).any(|v| v == *needle))
-    {
-        return -2;
-    }
-    let subject = unsafe { slice::from_raw_parts(input, input_len) };
-    if collections_special_music(subject) {
-        return -3;
-    }
-    collections_pre_normalize(subject, true, unsafe {
-        slice::from_raw_parts_mut(out, out_cap)
-    })
-    .map_or(-1, |len| len as isize)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if input.is_null()
+            || group.is_null()
+            || out.is_null()
+            || input_len > COLLECTIONS_MAX_SUBJECT
+            || group_len > isize::MAX as usize
+            || out_cap > isize::MAX as usize
+        {
+            return -1;
+        }
+        let group = unsafe { slice::from_raw_parts(group, group_len) };
+        if !collections_is_music_group_bytes(group) {
+            return -2;
+        }
+        let subject = unsafe { slice::from_raw_parts(input, input_len) };
+        if collections_special_music(subject) {
+            return -3;
+        }
+        collections_pre_normalize(subject, true, unsafe {
+            slice::from_raw_parts_mut(out, out_cap)
+        })
+        .map_or(-1, |len| len as isize)
+    }))
+    .unwrap_or(-1)
 }
 
 /// Exact short-name enhancement for no-LF subjects with balanced, nonempty quote
@@ -3164,83 +3247,86 @@ pub unsafe extern "C" fn nntmux_collections_enhance_short_subject(
     out: *mut u8,
     out_cap: usize,
 ) -> isize {
-    if input.is_null()
-        || clean.is_null()
-        || out.is_null()
-        || input_len > COLLECTIONS_MAX_SUBJECT
-        || clean_len > isize::MAX as usize
-        || out_cap > isize::MAX as usize
-    {
-        return -1;
-    }
-    let subject = unsafe { slice::from_raw_parts(input, input_len) };
-    let clean = unsafe { slice::from_raw_parts(clean, clean_len) };
-    if subject.contains(&b'\n') {
-        return -1;
-    }
-    let mut inside = false;
-    let mut open = 0;
-    let mut capture = None;
-    let mut first_non_alnum = [0u8; 3];
-    let mut first_count = 0;
-    let mut punctuation = [0u8; COLLECTIONS_MAX_SUBJECT];
-    let mut punctuation_len = 0;
-    for (pos, &byte) in subject.iter().enumerate() {
-        if !byte.is_ascii_alphanumeric() && first_count < 3 {
-            first_non_alnum[first_count] = byte;
-            first_count += 1;
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if input.is_null()
+            || clean.is_null()
+            || out.is_null()
+            || input_len > COLLECTIONS_MAX_SUBJECT
+            || clean_len > isize::MAX as usize
+            || out_cap > isize::MAX as usize
+        {
+            return -1;
         }
-        if byte == b'"' {
-            if inside {
-                if pos == open + 1 {
-                    return -1;
-                }
-                inside = false;
-            } else {
-                inside = true;
-                open = pos;
-            }
-            if subject.get(pos + 1).is_some_and(u8::is_ascii_alphanumeric)
-                && subject[pos + 1..].contains(&b'"')
-            {
-                let mut end = pos + 1;
-                while subject.get(end).is_some_and(u8::is_ascii_alphanumeric) {
-                    end += 1;
-                }
-                capture = Some(&subject[pos..end]);
-            }
-        } else if !inside && !byte.is_ascii_alphanumeric() {
-            punctuation[punctuation_len] = byte;
-            punctuation_len += 1;
+        let subject = unsafe { slice::from_raw_parts(input, input_len) };
+        let clean = unsafe { slice::from_raw_parts(clean, clean_len) };
+        if subject.contains(&b'\n') {
+            return -1;
         }
-    }
-    if inside {
-        return -1;
-    }
-    let capture = capture.unwrap_or(b"");
-    let Some(needed) = clean
-        .len()
-        .checked_add(punctuation_len)
-        .and_then(|n| n.checked_add(capture.len()))
-        .and_then(|n| n.checked_add(first_count))
-    else {
-        return -1;
-    };
-    if needed > out_cap || needed > isize::MAX as usize {
-        return -1;
-    }
-    let output = unsafe { slice::from_raw_parts_mut(out, out_cap) };
-    let mut pos = 0;
-    for piece in [
-        clean,
-        &punctuation[..punctuation_len],
-        capture,
-        &first_non_alnum[..first_count],
-    ] {
-        output[pos..pos + piece.len()].copy_from_slice(piece);
-        pos += piece.len();
-    }
-    needed as isize
+        let mut inside = false;
+        let mut open = 0;
+        let mut capture = None;
+        let mut first_non_alnum = [0u8; 3];
+        let mut first_count = 0;
+        let mut punctuation = [0u8; COLLECTIONS_MAX_SUBJECT];
+        let mut punctuation_len = 0;
+        for (pos, &byte) in subject.iter().enumerate() {
+            if !byte.is_ascii_alphanumeric() && first_count < 3 {
+                first_non_alnum[first_count] = byte;
+                first_count += 1;
+            }
+            if byte == b'"' {
+                if inside {
+                    if pos == open + 1 {
+                        return -1;
+                    }
+                    inside = false;
+                } else {
+                    inside = true;
+                    open = pos;
+                }
+                if subject.get(pos + 1).is_some_and(u8::is_ascii_alphanumeric)
+                    && subject[pos + 1..].contains(&b'"')
+                {
+                    let mut end = pos + 1;
+                    while subject.get(end).is_some_and(u8::is_ascii_alphanumeric) {
+                        end += 1;
+                    }
+                    capture = Some(&subject[pos..end]);
+                }
+            } else if !inside && !byte.is_ascii_alphanumeric() {
+                punctuation[punctuation_len] = byte;
+                punctuation_len += 1;
+            }
+        }
+        if inside {
+            return -1;
+        }
+        let capture = capture.unwrap_or(b"");
+        let Some(needed) = clean
+            .len()
+            .checked_add(punctuation_len)
+            .and_then(|n| n.checked_add(capture.len()))
+            .and_then(|n| n.checked_add(first_count))
+        else {
+            return -1;
+        };
+        if needed > out_cap || needed > isize::MAX as usize {
+            return -1;
+        }
+        let output = unsafe { slice::from_raw_parts_mut(out, out_cap) };
+        let mut pos = 0;
+        for piece in [
+            clean,
+            &punctuation[..punctuation_len],
+            capture,
+            &first_non_alnum[..first_count],
+        ] {
+            output[pos..pos + piece.len()].copy_from_slice(piece);
+            pos += piece.len();
+        }
+        needed as isize
+    }))
+    .unwrap_or(-1)
 }
 
 #[cfg(test)]
@@ -9889,4 +9975,917 @@ pub unsafe extern "C" fn nntmux_maintenance_verification(
         Err(code) => return code,
     };
     unsafe { wave9_write_output(&output, out, cap) }
+}
+
+// ============================================================================
+// Wave 14 Slice 6: Fingerprint Breaker, Verification/Forwarder Diagnostics,
+// SizeUnit, SqlError, and Passkey RelyingPartyIdResolver
+// ============================================================================
+
+#[inline]
+fn php_round_half_up_to_int(value: f64) -> f64 {
+    if value >= 0.0 {
+        (value + 0.5).floor()
+    } else {
+        (value - 0.5).ceil()
+    }
+}
+
+/// Exact implementation of PHP's `_php_math_round(value, places, PHP_ROUND_HALF_UP)`.
+#[inline]
+fn php_math_round(value: f64, places: i32) -> f64 {
+    if !value.is_finite() || value == 0.0 {
+        return value;
+    }
+    let places = places.clamp(-308, 308);
+    let f1 = 10f64.powi(places.abs());
+    let mut tmp = if places >= 0 { value * f1 } else { value / f1 };
+    let precision_places = 14 - (value.abs().log10().floor() as i32);
+    if precision_places > places && precision_places - 15 < places {
+        let f2 = 10f64.powi((precision_places - places).abs());
+        tmp = if precision_places >= places {
+            tmp * f2
+        } else {
+            tmp / f2
+        };
+        tmp = php_round_half_up_to_int(tmp);
+        tmp = if precision_places >= places {
+            tmp / f2
+        } else {
+            tmp * f2
+        };
+    }
+    tmp = php_round_half_up_to_int(tmp);
+    if tmp.abs() < 1e300 {
+        if places >= 0 { tmp / f1 } else { tmp * f1 }
+    } else {
+        value
+    }
+}
+
+/// Format `FingerprintProviderBreaker::key`:
+/// - `tls == 0` / `tls == 1`: `'release-fingerprint:provider-breaker:'.sha1(strtolower($name).'|'.$port.'|'.($tls ? 'tls' : 'plain')).':'.$state.($generation === '' ? '' : ':'.$generation)`
+/// - `tls == 2`: `'releases:fingerprint:provider:'.sha1($name).':'.$state.($generation === '' ? '' : ':'.$generation)`
+///
+/// Returns bytes written, `-1` on invalid arguments, or `-(required + 3)` when `out_cap` is too small.
+///
+/// # Safety
+/// Non-null pointers must be valid for their stated lengths and must not overlap `out`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_fingerprint_breaker_key(
+    name: *const u8,
+    name_len: usize,
+    port: *const u8,
+    port_len: usize,
+    tls: u8,
+    state: *const u8,
+    state_len: usize,
+    generation: *const u8,
+    generation_len: usize,
+    out: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if out_cap > isize::MAX as usize || (out.is_null() && out_cap != 0) || tls > 2 {
+            return -1;
+        }
+        let (Some(name), Some(port), Some(state), Some(generation)) = (unsafe {
+            (
+                wave9_input(name, name_len),
+                wave9_input(port, port_len),
+                wave9_input(state, state_len),
+                wave9_input(generation, generation_len),
+            )
+        }) else {
+            return -1;
+        };
+        let (prefix, digest) = if tls == 2 {
+            (
+                b"releases:fingerprint:provider:".as_slice(),
+                regex_release_sha1_hex(name),
+            )
+        } else {
+            let tls_label: &[u8] = if tls != 0 { b"tls" } else { b"plain" };
+            let mut raw = Vec::with_capacity(name.len() + 1 + port.len() + 1 + tls_label.len());
+            raw.extend(name.iter().map(u8::to_ascii_lowercase));
+            raw.push(b'|');
+            raw.extend_from_slice(port);
+            raw.push(b'|');
+            raw.extend_from_slice(tls_label);
+            (
+                b"release-fingerprint:provider-breaker:".as_slice(),
+                regex_release_sha1_hex(&raw),
+            )
+        };
+        let extra_gen = if generation.is_empty() {
+            0
+        } else {
+            1 + generation.len()
+        };
+        let total_len = prefix.len() + 40 + 1 + state.len() + extra_gen;
+        let mut output = Vec::with_capacity(total_len);
+        output.extend_from_slice(prefix);
+        output.extend_from_slice(&digest);
+        output.push(b':');
+        output.extend_from_slice(state);
+        if !generation.is_empty() {
+            output.push(b':');
+            output.extend_from_slice(generation);
+        }
+        unsafe { wave9_write_output(&output, out, out_cap) }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Compute `FingerprintProviderBreaker::suspectSeconds`:
+/// - When `cooldown_seconds <= 0`: `max(3600, window_seconds * 4)`
+/// - When `cooldown_seconds > 0`: `min(cooldown_seconds, max(30, window_seconds))`
+///
+/// Returns `-1` on arithmetic overflow.
+///
+/// # Safety
+/// Safe for any integer arguments.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_fingerprint_breaker_suspect_seconds(
+    window_seconds: i64,
+    cooldown_seconds: i64,
+) -> i64 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if cooldown_seconds > 0 {
+            cooldown_seconds.min(window_seconds.max(30))
+        } else {
+            window_seconds
+                .checked_mul(4)
+                .map_or(-1, |scaled| scaled.max(3600))
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Evaluate `VerificationRunDiagnostics::stop(reason, stopped)`.
+/// Returns a packed bitmask (`>= 0`):
+/// - bits `0..=3`: canonical reason index (`0..=8`)
+/// - bit `4` (`0x10`): `limitReached` (`claims_admitted >= limit`)
+/// - bit `5` (`0x20`): `deadlineReached` (`has_loop_started != 0 && max_seconds > 0 && (stopped - loop_started) / 1e9 >= max_seconds`)
+///
+/// Returns `-1` on invalid pointer/length.
+///
+/// # Safety
+/// Non-null `reason` must be readable for `reason_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_verification_diagnostics_stop(
+    reason: *const u8,
+    reason_len: usize,
+    stopped: i64,
+    claims_admitted: i64,
+    limit: i64,
+    has_loop_started: u8,
+    loop_started: i64,
+    max_seconds: i64,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(reason_bytes) = (unsafe { wave9_input(reason, reason_len) }) else {
+            return -1;
+        };
+        let reason_idx: i32 = match reason_bytes {
+            b"limit" => 0,
+            b"deadline" => 1,
+            b"no_claim" => 2,
+            b"draining" => 3,
+            b"worker_unavailable" => 4,
+            b"initialization_unavailable" => 5,
+            b"initialization_error" => 6,
+            b"unsafe_scratch_root" => 7,
+            b"error" => 8,
+            _ => 8,
+        };
+        let limit_reached = claims_admitted >= limit;
+        let deadline_reached = has_loop_started != 0
+            && max_seconds > 0
+            && ((stopped.wrapping_sub(loop_started) as f64) / 1e9) >= (max_seconds as f64);
+        reason_idx | (i32::from(limit_reached) << 4) | (i32::from(deadline_reached) << 5)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Compute `VerificationRunDiagnostics::report` durations and 3-decimal rounded phase milliseconds.
+/// `input` must be 80 bytes (10 native-endian `f64` values: `outbox_wait_ms` followed by 9 phase `ms` values).
+/// Writes 96 bytes (12 native-endian `f64` values: `rounded_outbox_wait_ms`, `total_ms`, `claim_loop_ms`,
+/// and 9 rounded phase `ms` values) into `out`.
+///
+/// # Safety
+/// `input` must be readable for `input_len` bytes and `out` writable for `out_cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_verification_diagnostics_round_metrics(
+    input: *const u8,
+    input_len: usize,
+    started: i64,
+    finished: i64,
+    has_loop_started: u8,
+    loop_started: i64,
+    has_stopped: u8,
+    stopped: i64,
+    out: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if input_len != 80 || out_cap > isize::MAX as usize || (out.is_null() && out_cap != 0) {
+            return -1;
+        }
+        let Some(in_bytes) = (unsafe { wave9_input(input, input_len) }) else {
+            return -1;
+        };
+        let mut vals = [0.0f64; 10];
+        for (i, &chunk) in in_bytes.as_chunks::<8>().0.iter().enumerate() {
+            vals[i] = f64::from_ne_bytes(chunk);
+        }
+        let end_tick = if has_stopped != 0 { stopped } else { finished };
+        let claim_loop_ms = if has_loop_started != 0 {
+            (end_tick.wrapping_sub(loop_started) as f64) / 1_000_000.0
+        } else {
+            0.0
+        };
+        let mut out_vals = [0.0f64; 12];
+        out_vals[0] = php_math_round(vals[0], 3);
+        out_vals[1] = (finished.wrapping_sub(started) as f64) / 1_000_000.0;
+        out_vals[2] = claim_loop_ms;
+        for i in 0..9 {
+            out_vals[3 + i] = php_math_round(vals[1 + i], 3);
+        }
+        let mut out_bytes = [0u8; 96];
+        for (i, v) in out_vals.iter().enumerate() {
+            out_bytes[i * 8..(i + 1) * 8].copy_from_slice(&v.to_ne_bytes());
+        }
+        unsafe { wave9_write_output(&out_bytes, out, out_cap) }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Classify `PublicationForwarderDiagnostics::stop` (`mode == 0`) or `outcome` (`mode == 1`).
+/// Returns canonical index (`0..=7` for `mode == 0`, `0..=11` for `mode == 1`), or `-1` on invalid input.
+///
+/// # Safety
+/// Non-null `label` must be readable for `label_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_publication_forwarder_classify(
+    label: *const u8,
+    label_len: usize,
+    mode: u32,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(bytes) = (unsafe { wave9_input(label, label_len) }) else {
+            return -1;
+        };
+        match mode {
+            0 => match bytes {
+                b"deadline" => 0,
+                b"passes" => 1,
+                b"terminated" => 2,
+                b"locks_lost" => 3,
+                b"worker_unavailable" => 4,
+                b"disabled" => 5,
+                b"slot_unavailable" => 6,
+                b"error" => 7,
+                _ => 7,
+            },
+            1 => match bytes {
+                b"published" => 0,
+                b"filtered" => 1,
+                b"metadata_review" => 2,
+                b"deferred" => 3,
+                b"stale" => 4,
+                b"invalid" => 5,
+                b"error" => 6,
+                b"paused" => 7,
+                b"retry" => 8,
+                b"transport" => 9,
+                b"no_release" => 10,
+                _ => 11,
+            },
+            _ => -1,
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Compute `PublicationForwarderDiagnostics::report` rounded float metrics.
+/// Writes 48 bytes (6 native-endian `f64` values: `items_per_batch_mean`, `linger_total_ms`,
+/// `round_trip_total_ms`, `round_trip_max_ms`, `round_trip_mean_ms`, `duration_ms`) into `out`.
+///
+/// # Safety
+/// `out` must be writable for `out_cap` bytes when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_publication_forwarder_metrics(
+    batches: i64,
+    items: i64,
+    linger_ms: f64,
+    round_trip_ms: f64,
+    slowest_round_trip_ms: f64,
+    started: i64,
+    finished: i64,
+    out: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if out_cap > isize::MAX as usize || (out.is_null() && out_cap != 0) {
+            return -1;
+        }
+        let items_mean = if batches == 0 {
+            0.0
+        } else {
+            php_math_round((items as f64) / (batches as f64), 2)
+        };
+        let rt_mean = if batches == 0 {
+            0.0
+        } else {
+            php_math_round(round_trip_ms / (batches as f64), 3)
+        };
+        let vals = [
+            items_mean,
+            php_math_round(linger_ms, 3),
+            php_math_round(round_trip_ms, 3),
+            php_math_round(slowest_round_trip_ms, 3),
+            rt_mean,
+            php_math_round((finished.wrapping_sub(started) as f64) / 1_000_000.0, 3),
+        ];
+        let mut out_bytes = [0u8; 48];
+        for (i, v) in vals.iter().enumerate() {
+            out_bytes[i * 8..(i + 1) * 8].copy_from_slice(&v.to_ne_bytes());
+        }
+        unsafe { wave9_write_output(&out_bytes, out, out_cap) }
+    }))
+    .unwrap_or(-1)
+}
+
+fn size_unit_multiplier(unit: &[u8], allow_extended: bool) -> Option<i64> {
+    if unit.is_empty() || unit.len() > 2 {
+        return None;
+    }
+    let mut upper = [0u8; 2];
+    for (i, &b) in unit.iter().enumerate() {
+        upper[i] = b.to_ascii_uppercase();
+    }
+    match &upper[..unit.len()] {
+        b"MB" => Some(1_048_576),
+        b"GB" => Some(1_073_741_824),
+        b"B" if allow_extended => Some(1),
+        b"K" | b"KB" if allow_extended => Some(1_024),
+        b"M" if allow_extended => Some(1_048_576),
+        b"G" if allow_extended => Some(1_073_741_824),
+        b"T" | b"TB" if allow_extended => Some(1_099_511_627_776),
+        _ => None,
+    }
+}
+
+fn parse_trimmed_ascii_f64(mut value: &[u8]) -> Option<f64> {
+    while value.first().is_some_and(|b| is_pcre_space(*b)) {
+        value = &value[1..];
+    }
+    while value.last().is_some_and(|b| is_pcre_space(*b)) {
+        value = &value[..value.len() - 1];
+    }
+    let s = std::str::from_utf8(value).ok()?;
+    let parsed = s.parse::<f64>().ok()?;
+    if parsed.is_finite() {
+        Some(parsed)
+    } else {
+        None
+    }
+}
+
+/// Binary power-of-1024 conversions for `SizeUnit`:
+/// - `mode == 0`: `SizeUnit::toBytes` (`MB` / `GB` strict; returns `-2` for unsupported units, decimal bytes in `out`)
+/// - `mode == 1`: `SizeUnit::fromBytes` (writes `"I:<int>:<unit>"` or `"F:<8-byte-f64>:MB"` into `out`)
+/// - `mode == 2`: Extended binary unit `toBytes` for `B|K|KB|M|MB|G|GB|T|TB` (returns `-2` for unsupported units)
+///
+/// Returns bytes written (`> 0`), `-2` for unsupported unit, `-1` to decline to PHP, or `-(required + 3)` for capacity.
+///
+/// # Safety
+/// Non-null pointers must cover their stated lengths and must not overlap `out`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_size_unit_convert(
+    value_str: *const u8,
+    value_len: usize,
+    unit_str: *const u8,
+    unit_len: usize,
+    mode: u32,
+    out: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if out_cap > isize::MAX as usize || (out.is_null() && out_cap != 0) {
+            return -1;
+        }
+        let (Some(value), Some(unit)) = (unsafe {
+            (
+                wave9_input(value_str, value_len),
+                wave9_input(unit_str, unit_len),
+            )
+        }) else {
+            return -1;
+        };
+        match mode {
+            0 | 2 => {
+                let Some(multiplier) = size_unit_multiplier(unit, mode == 2) else {
+                    return -2;
+                };
+                if value.is_empty() || !remover_is_numeric(value) {
+                    return unsafe { wave9_write_output(b"0", out, out_cap) };
+                }
+                let Some(num) = parse_trimmed_ascii_f64(value) else {
+                    return -1;
+                };
+                let rounded = php_math_round(num * (multiplier as f64), 0);
+                if !rounded.is_finite() || rounded >= (i64::MAX as f64) {
+                    return -1;
+                }
+                let bytes = if rounded <= 0.0 { 0i64 } else { rounded as i64 };
+                let formatted = bytes.to_string();
+                unsafe { wave9_write_output(formatted.as_bytes(), out, out_cap) }
+            }
+            1 => {
+                if value.is_empty() || !remover_is_numeric(value) {
+                    return unsafe { wave9_write_output(b"I:0:MB", out, out_cap) };
+                }
+                let mut trimmed = value;
+                while trimmed.first().is_some_and(|b| is_pcre_space(*b)) {
+                    trimmed = &trimmed[1..];
+                }
+                while trimmed.last().is_some_and(|b| is_pcre_space(*b)) {
+                    trimmed = &trimmed[..trimmed.len() - 1];
+                }
+                let bytes: i64 =
+                    if let Ok(exact) = std::str::from_utf8(trimmed).unwrap_or("").parse::<i64>() {
+                        exact
+                    } else {
+                        let Some(num) = parse_trimmed_ascii_f64(trimmed) else {
+                            return -1;
+                        };
+                        if num >= (i64::MAX as f64) || num < (i64::MIN as f64) {
+                            return -1;
+                        }
+                        num.trunc() as i64
+                    };
+                if bytes <= 0 {
+                    return unsafe { wave9_write_output(b"I:0:MB", out, out_cap) };
+                }
+                if bytes % 1_073_741_824 == 0 {
+                    let s = format!("I:{}:GB", bytes / 1_073_741_824);
+                    return unsafe { wave9_write_output(s.as_bytes(), out, out_cap) };
+                }
+                if bytes % 1_048_576 == 0 {
+                    let s = format!("I:{}:MB", bytes / 1_048_576);
+                    return unsafe { wave9_write_output(s.as_bytes(), out, out_cap) };
+                }
+                let mb_float = php_math_round((bytes as f64) / 1_048_576.0, 2);
+                let mut buf = [0u8; 13];
+                buf[0] = b'F';
+                buf[1] = b':';
+                buf[2..10].copy_from_slice(&mb_float.to_ne_bytes());
+                buf[10] = b':';
+                buf[11] = b'M';
+                buf[12] = b'B';
+                unsafe { wave9_write_output(&buf, out, out_cap) }
+            }
+            _ => -1,
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+fn sql_error_truncate_utf8(message: &[u8], out: &mut Vec<u8>) -> bool {
+    let Ok(s) = std::str::from_utf8(message) else {
+        return false;
+    };
+    let mut char_count = 0usize;
+    let mut cut_byte = s.len();
+    for (byte_idx, _) in s.char_indices() {
+        if char_count == 500 {
+            cut_byte = byte_idx;
+        }
+        char_count += 1;
+        if char_count > 500 {
+            break;
+        }
+    }
+    if char_count > 500 {
+        out.extend_from_slice(&message[..cut_byte]);
+        out.extend_from_slice("…".as_bytes());
+    } else {
+        out.extend_from_slice(message);
+    }
+    true
+}
+
+/// Classify transient SQL locks and format concise error descriptions matching `SqlError::describe`
+/// and `SqlError::isTransientLock`.
+/// - `is_query_exception == 0` / `1`: `SqlError::describe` (strips `' (Connection:'`, truncates > 500 UTF-8 chars with `'…'`)
+/// - `is_query_exception == 2`: Formats `sqlstate=<state> driver_code=<code>: <single-line collapsed message>`
+///
+/// Writes `1` or `0` to `*is_transient_out` when non-null.
+/// If `out_buf` is null and `out_cap == 0` while `is_transient_out` is non-null, returns `0` after setting `*is_transient_out`.
+///
+/// # Safety
+/// Non-null pointers must be valid for their stated lengths and must not overlap `out_buf`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_sql_error_describe(
+    is_query_exception: u8,
+    sqlstate: *const u8,
+    sqlstate_len: usize,
+    driver_code: i64,
+    message: *const u8,
+    message_len: usize,
+    is_transient_out: *mut u8,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if out_cap > isize::MAX as usize
+            || (out_buf.is_null() && out_cap != 0)
+            || is_query_exception > 2
+        {
+            return -1;
+        }
+        let (Some(sqlstate), Some(message)) = (unsafe {
+            (
+                wave9_input(sqlstate, sqlstate_len),
+                wave9_input(message, message_len),
+            )
+        }) else {
+            return -1;
+        };
+        let is_transient = (is_query_exception != 0
+            && (sqlstate == b"40001" || matches!(driver_code, 1020 | 1205 | 1213)))
+            || find_subslice(message, b"Deadlock found").is_some()
+            || find_subslice(message, b"Lock wait timeout exceeded").is_some()
+            || find_subslice(message, b"Record has changed since last read").is_some()
+            || find_subslice(message, b"database is locked").is_some();
+        if !is_transient_out.is_null() {
+            unsafe {
+                *is_transient_out = u8::from(is_transient);
+            }
+        }
+        if out_buf.is_null() && out_cap == 0 && !is_transient_out.is_null() {
+            return 0;
+        }
+        let stripped = match find_subslice(message, b" (Connection:") {
+            Some(pos) => &message[..pos],
+            None => message,
+        };
+        let mut output = Vec::new();
+        if is_query_exception == 2 {
+            let mut collapsed = Vec::with_capacity(stripped.len());
+            let mut in_space = false;
+            for &b in php_trim_ascii(stripped) {
+                if is_pcre_space(b) {
+                    if !in_space {
+                        collapsed.push(b' ');
+                        in_space = true;
+                    }
+                } else {
+                    collapsed.push(b);
+                    in_space = false;
+                }
+            }
+            output.extend_from_slice(b"sqlstate=");
+            output.extend_from_slice(sqlstate);
+            output.extend_from_slice(b" driver_code=");
+            output.extend_from_slice(driver_code.to_string().as_bytes());
+            output.extend_from_slice(b": ");
+            if !sql_error_truncate_utf8(&collapsed, &mut output) {
+                return -1;
+            }
+        } else if !sql_error_truncate_utf8(stripped, &mut output) {
+            return -1;
+        }
+        unsafe { wave9_write_output(&output, out_buf, out_cap) }
+    }))
+    .unwrap_or(-1)
+}
+
+fn passkey_first_host(value: &[u8]) -> &[u8] {
+    let first = value.split(|&b| b == b',').next().unwrap_or(b"");
+    let host = php_trim_ascii(first);
+    if host.is_empty() {
+        return b"";
+    }
+    let mut end = host.len();
+    while end > 0 && host[end - 1].is_ascii_digit() {
+        end -= 1;
+    }
+    let stripped = if end < host.len() && end > 0 && host[end - 1] == b':' {
+        &host[..end - 1]
+    } else {
+        host
+    };
+    php_trim_ascii(stripped)
+}
+
+fn passkey_is_valid_rp_id(value: &[u8]) -> bool {
+    let trimmed = php_trim_ascii(value);
+    if trimmed.is_empty() {
+        return false;
+    }
+    if std::str::from_utf8(trimmed)
+        .ok()
+        .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+        .is_some()
+    {
+        return false;
+    }
+    if trimmed == b"localhost" {
+        return true;
+    }
+    trimmed.contains(&b'.')
+}
+
+fn passkey_is_strict_rfc1123_multi_label(host: &[u8]) -> bool {
+    if host.is_empty() || host.len() > 253 || host.eq_ignore_ascii_case(b"localhost") {
+        return false;
+    }
+    if host.starts_with(b"[") || host.ends_with(b"]") || host.contains(&b':') {
+        return false;
+    }
+    if std::str::from_utf8(host)
+        .ok()
+        .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+        .is_some()
+    {
+        return false;
+    }
+    let mut label_count = 0usize;
+    let mut all_numeric = true;
+    for label in host.split(|&b| b == b'.') {
+        if label.is_empty() || label.len() > 63 {
+            return false;
+        }
+        if label.first() == Some(&b'-') || label.last() == Some(&b'-') {
+            return false;
+        }
+        for &b in label {
+            let lower = b.to_ascii_lowercase();
+            if !lower.is_ascii_lowercase() && !lower.is_ascii_digit() && lower != b'-' {
+                return false;
+            }
+            if !lower.is_ascii_digit() {
+                all_numeric = false;
+            }
+        }
+        label_count += 1;
+    }
+    label_count >= 2 && !all_numeric
+}
+
+/// Resolve and validate Passkey relying party hostnames:
+/// - `mode == 0`: `RelyingPartyIdResolver::firstHost` (writes extracted host into `out_buf`, returns length `>= 0`)
+/// - `mode == 1`: `RelyingPartyIdResolver::isValidRelyingPartyId` (returns `1` when valid, `0` when invalid)
+/// - `mode == 2`: `RelyingPartyIdResolver::resolve` over 4 u32-LE length-prefixed frames `[x_forwarded_host, x_original_host, config_id, request_host]`
+/// - `mode == 3`: Strict RFC 1123 multi-label hostname resolver (extracts first host, strips `:port`, rejects IPs/`localhost`, validates RFC 1123 `<= 253` chars & labels `1..63` chars `[a-z0-9-]`)
+///
+/// # Safety
+/// Non-null pointers must be valid for their stated lengths and must not overlap `out_buf`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_passkey_resolve_rp_host(
+    input: *const u8,
+    input_len: usize,
+    mode: u32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if out_cap > isize::MAX as usize || (out_buf.is_null() && out_cap != 0) {
+            return -1;
+        }
+        let Some(bytes) = (unsafe { wave9_input(input, input_len) }) else {
+            return -1;
+        };
+        match mode {
+            0 => {
+                let host = passkey_first_host(bytes);
+                unsafe { wave9_write_output(host, out_buf, out_cap) }
+            }
+            1 => isize::from(passkey_is_valid_rp_id(bytes)),
+            2 => {
+                let Some(frames) = regex_release_frames(bytes) else {
+                    return -1;
+                };
+                if frames.len() != 4 {
+                    return -1;
+                }
+                let candidates = [
+                    passkey_first_host(frames[0]),
+                    passkey_first_host(frames[1]),
+                    frames[2],
+                    frames[3],
+                ];
+                let mut resolved: &[u8] = b"localhost";
+                for cand in candidates {
+                    if passkey_is_valid_rp_id(cand) {
+                        resolved = cand;
+                        break;
+                    }
+                }
+                unsafe { wave9_write_output(resolved, out_buf, out_cap) }
+            }
+            3 => {
+                let host = passkey_first_host(bytes);
+                if !passkey_is_strict_rfc1123_multi_label(host) {
+                    return 0;
+                }
+                let lowered: Vec<u8> = host.iter().map(u8::to_ascii_lowercase).collect();
+                unsafe { wave9_write_output(&lowered, out_buf, out_cap) }
+            }
+            _ => -1,
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod wave14_slice6_support_tests {
+    use super::*;
+
+    #[test]
+    fn collections_is_music_group_and_extract_music_subject() {
+        unsafe {
+            assert_eq!(
+                nntmux_collections_is_music_group(b"alt.binaries.flac".as_ptr(), 17),
+                1
+            );
+            assert_eq!(
+                nntmux_collections_is_music_group(b"alt.binaries.FLAC".as_ptr(), 17),
+                0
+            );
+            assert_eq!(nntmux_collections_is_music_group(std::ptr::null(), 1), -1);
+
+            let subject = br#"Broderick_Smith-Unknown "00-broderick.sfv" yEnc"#;
+            let mut out = [0u8; 64];
+            let n = nntmux_collections_extract_music_subject(
+                subject.as_ptr(),
+                subject.len(),
+                out.as_mut_ptr(),
+                out.len(),
+            );
+            assert_eq!(n, 25);
+            assert_eq!(&out[..n as usize], br#"Broderick_Smith-Unknown ""#);
+
+            let non_match = b"Plain subject";
+            assert_eq!(
+                nntmux_collections_extract_music_subject(
+                    non_match.as_ptr(),
+                    non_match.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                ),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn fingerprint_breaker_key_and_suspect_seconds() {
+        unsafe {
+            let mut out = [0u8; 256];
+            let len = nntmux_fingerprint_breaker_key(
+                b"News.Alternate.Invalid".as_ptr(),
+                22,
+                b"".as_ptr(),
+                0,
+                0,
+                b"generation".as_ptr(),
+                10,
+                b"".as_ptr(),
+                0,
+                out.as_mut_ptr(),
+                out.len(),
+            );
+            assert!(len > 0);
+            let s = std::str::from_utf8(&out[..len as usize]).unwrap();
+            assert!(s.starts_with("release-fingerprint:provider-breaker:"));
+            assert!(s.ends_with(":generation"));
+
+            assert_eq!(nntmux_fingerprint_breaker_suspect_seconds(900, 0), 3600);
+            assert_eq!(nntmux_fingerprint_breaker_suspect_seconds(1200, 0), 4800);
+            assert_eq!(nntmux_fingerprint_breaker_suspect_seconds(10, 120), 30);
+            assert_eq!(nntmux_fingerprint_breaker_suspect_seconds(60, 120), 60);
+        }
+    }
+
+    #[test]
+    fn verification_and_forwarder_diagnostics() {
+        unsafe {
+            let flags = nntmux_verification_diagnostics_stop(
+                b"limit".as_ptr(),
+                5,
+                7_100_000_000,
+                1,
+                1,
+                1,
+                6_000_000_000,
+                1,
+            );
+            assert_eq!(flags & 0x0f, 0);
+            assert_ne!(flags & 0x10, 0);
+            assert_ne!(flags & 0x20, 0);
+
+            assert_eq!(
+                nntmux_publication_forwarder_classify(b"published".as_ptr(), 9, 1),
+                0
+            );
+            assert_eq!(
+                nntmux_publication_forwarder_classify(b"unknown_status".as_ptr(), 14, 1),
+                11
+            );
+        }
+    }
+
+    #[test]
+    fn size_unit_sql_error_and_passkey_resolver() {
+        unsafe {
+            let mut out = [0u8; 256];
+            let n = nntmux_size_unit_convert(
+                b"1.5".as_ptr(),
+                3,
+                b"GB".as_ptr(),
+                2,
+                0,
+                out.as_mut_ptr(),
+                out.len(),
+            );
+            assert!(n > 0);
+            assert_eq!(&out[..n as usize], b"1610612736");
+            assert_eq!(
+                nntmux_size_unit_convert(
+                    b"1".as_ptr(),
+                    1,
+                    b"TB".as_ptr(),
+                    2,
+                    0,
+                    out.as_mut_ptr(),
+                    out.len(),
+                ),
+                -2
+            );
+            let n_tb = nntmux_size_unit_convert(
+                b"1".as_ptr(),
+                1,
+                b"TB".as_ptr(),
+                2,
+                2,
+                out.as_mut_ptr(),
+                out.len(),
+            );
+            assert!(n_tb > 0);
+            assert_eq!(&out[..n_tb as usize], b"1099511627776");
+
+            let mut is_transient = 0u8;
+            let msg = b"SQLSTATE[40001]: Deadlock found (Connection: mariadb, SQL: INSERT ...)";
+            let desc_len = nntmux_sql_error_describe(
+                1,
+                b"40001".as_ptr(),
+                5,
+                1213,
+                msg.as_ptr(),
+                msg.len(),
+                &mut is_transient,
+                out.as_mut_ptr(),
+                out.len(),
+            );
+            assert_eq!(is_transient, 1);
+            assert_eq!(
+                &out[..desc_len as usize],
+                b"SQLSTATE[40001]: Deadlock found"
+            );
+
+            let host_in = b" auth.example.com:8443 , proxy.example.com ";
+            let host_len = nntmux_passkey_resolve_rp_host(
+                host_in.as_ptr(),
+                host_in.len(),
+                0,
+                out.as_mut_ptr(),
+                out.len(),
+            );
+            assert_eq!(&out[..host_len as usize], b"auth.example.com");
+            assert_eq!(
+                nntmux_passkey_resolve_rp_host(
+                    b"127.0.0.1".as_ptr(),
+                    9,
+                    1,
+                    std::ptr::null_mut(),
+                    0
+                ),
+                0
+            );
+            assert_eq!(
+                nntmux_passkey_resolve_rp_host(
+                    b"localhost".as_ptr(),
+                    9,
+                    1,
+                    std::ptr::null_mut(),
+                    0
+                ),
+                1
+            );
+        }
+    }
 }
