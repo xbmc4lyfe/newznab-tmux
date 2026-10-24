@@ -6,9 +6,11 @@ namespace App\Services\Categorization\Pipes;
 
 use App\Models\Category;
 use App\Services\Categorization\CategorizationResult;
+use App\Services\Categorization\CategorizationService;
 use App\Services\Categorization\Categorizers\MiscCategorizer;
 use App\Services\Categorization\ReleaseContext;
 use Closure;
+use FFI;
 
 /**
  * Pipe for miscellaneous content and hash detection.
@@ -20,6 +22,8 @@ use Closure;
  */
 class MiscPipe extends AbstractCategorizationPipe
 {
+    public static bool $useRustFfi = false;
+
     protected int $priority = 1; // Run first to catch hashes early
 
     private MiscCategorizer $categorizer;
@@ -33,6 +37,16 @@ class MiscPipe extends AbstractCategorizationPipe
         'obfuscated_',
         'gibberish_',
     ];
+
+    public static function setUseRustFfi(bool $useRustFfi): void
+    {
+        self::$useRustFfi = $useRustFfi;
+    }
+
+    public static function categorizeFfi(): ?FFI
+    {
+        return CategorizationService::categorizeFfi();
+    }
 
     public function __construct()
     {
@@ -72,7 +86,14 @@ class MiscPipe extends AbstractCategorizationPipe
     /**
      * Determine if a result should trigger the misc lock.
      */
-    private function shouldLock(CategorizationResult $result): bool
+    public function shouldLock(CategorizationResult $result): bool
+    {
+        return self::$useRustFfi
+            ? $this->shouldLockNative($result)
+            : $this->shouldLockPhp($result);
+    }
+
+    public function shouldLockPhp(CategorizationResult $result): bool
     {
         // Always lock OTHER_HASHED results
         if ($result->categoryId === Category::OTHER_HASHED) {
@@ -87,5 +108,25 @@ class MiscPipe extends AbstractCategorizationPipe
         }
 
         return false;
+    }
+
+    public function shouldLockNative(CategorizationResult $result): bool
+    {
+        $ffi = self::categorizeFfi();
+        if ($ffi === null) {
+            return $this->shouldLockPhp($result);
+        }
+
+        // @phpstan-ignore method.notFound
+        $res = $ffi->nntmux_categorize_misc_pipe_should_lock(
+            $result->categoryId,
+            $result->matchedBy,
+            \strlen($result->matchedBy)
+        );
+        if (! \is_int($res) || $res < 0) {
+            return $this->shouldLockPhp($result);
+        }
+
+        return $res === 1;
     }
 }

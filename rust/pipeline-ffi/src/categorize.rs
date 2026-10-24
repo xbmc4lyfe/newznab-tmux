@@ -10478,3 +10478,793 @@ pub mod api_query_and_page_params {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// CategorizationService, CategorizationPassable, MiscPipe, MiscSafetyNetPipe,
+// Category, and UsenetGroup helpers
+// ---------------------------------------------------------------------------
+
+pub mod categorization_pipes_and_groups {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    use super::{php_trim_ascii, strip_trailing_pcre_newline};
+    use crate::OutCursor;
+
+    pub const DECLINED: isize = -1;
+    pub const CATEGORY_OTHER_MISC: i64 = 10;
+    pub const CATEGORY_OTHER_HASHED: i64 = 20;
+    pub const OTHERS_GROUP_CSV: &[u8] = b"7999,1999,2999,3999,4040,5999,20,6999,10";
+
+    #[inline]
+    unsafe fn input<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            Some(&[])
+        } else if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { slice::from_raw_parts(ptr, len) })
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_successful_result(category_id: i64, confidence: f64, matched_by: &[u8]) -> bool {
+        if !(confidence > 0.0) {
+            return false;
+        }
+        if category_id == CATEGORY_OTHER_MISC && matched_by == b"no_match" {
+            return false;
+        }
+        true
+    }
+
+    #[inline]
+    pub(crate) fn is_protected_misc_result(category_id: i64, matched_by: &[u8]) -> bool {
+        if category_id == CATEGORY_OTHER_HASHED {
+            return true;
+        }
+        if category_id != CATEGORY_OTHER_MISC {
+            return false;
+        }
+        matched_by.starts_with(b"hash_")
+            || matched_by.starts_with(b"obfuscated_")
+            || matched_by.starts_with(b"gibberish_")
+            || matched_by == b"group_only_low_signal"
+    }
+
+    #[inline]
+    pub(crate) fn should_override_result(
+        cand_cat_id: i64,
+        cand_conf: f64,
+        best_cat_id: i64,
+        best_conf: f64,
+        best_matched_by: &[u8],
+    ) -> bool {
+        if cand_cat_id != CATEGORY_OTHER_MISC
+            && cand_cat_id != CATEGORY_OTHER_HASHED
+            && is_protected_misc_result(best_cat_id, best_matched_by)
+            && cand_conf < 0.6
+        {
+            return false;
+        }
+        if cand_conf > best_conf {
+            return true;
+        }
+        if cand_conf == best_conf {
+            return cand_cat_id != CATEGORY_OTHER_MISC && best_cat_id == CATEGORY_OTHER_MISC;
+        }
+        false
+    }
+
+    #[inline]
+    pub(crate) fn misc_pipe_should_lock(category_id: i64, matched_by: &[u8]) -> bool {
+        if category_id == CATEGORY_OTHER_HASHED {
+            return true;
+        }
+        matched_by.starts_with(b"hash_")
+            || matched_by.starts_with(b"obfuscated_")
+            || matched_by.starts_with(b"gibberish_")
+    }
+
+    #[inline]
+    pub(crate) fn safety_net_should_downgrade(
+        locked_to_misc: bool,
+        low_signal: bool,
+        matched_by: &[u8],
+    ) -> bool {
+        !locked_to_misc && low_signal && matched_by.starts_with(b"group_name_")
+    }
+
+    #[inline]
+    pub(crate) fn is_parent_category_id(cid: i64) -> bool {
+        matches!(cid, 1 | 1000 | 2000 | 3000 | 4000 | 5000 | 6000 | 7000)
+    }
+
+    #[inline]
+    pub(crate) fn is_parent_category_str(raw: &[u8]) -> bool {
+        let mut trimmed = php_trim_ascii(raw);
+        if let Some(rest) = trimmed.strip_prefix(b"+") {
+            trimmed = rest;
+        }
+        if trimmed.is_empty() || !trimmed.iter().all(u8::is_ascii_digit) {
+            return false;
+        }
+        while let Some(rest) = trimmed.strip_prefix(b"0") {
+            trimmed = rest;
+        }
+        matches!(
+            trimmed,
+            b"1" | b"1000" | b"2000" | b"3000" | b"4000" | b"5000" | b"6000" | b"7000"
+        )
+    }
+
+    #[inline]
+    pub(crate) fn category_constant_value(name: &[u8]) -> Option<i32> {
+        match name {
+            b"OTHER_MISC" => Some(10),
+            b"OTHER_HASHED" => Some(20),
+            b"GAME_NDS" => Some(1010),
+            b"GAME_PSP" => Some(1020),
+            b"GAME_WII" => Some(1030),
+            b"GAME_XBOX" => Some(1040),
+            b"GAME_XBOX360" => Some(1050),
+            b"GAME_WIIWARE" => Some(1060),
+            b"GAME_XBOX360DLC" => Some(1070),
+            b"GAME_PS3" => Some(1080),
+            b"GAME_OTHER" => Some(1999),
+            b"GAME_3DS" => Some(1110),
+            b"GAME_PSVITA" => Some(1120),
+            b"GAME_WIIU" => Some(1130),
+            b"GAME_XBOXONE" => Some(1140),
+            b"GAME_PS4" => Some(1180),
+            b"MOVIE_FOREIGN" => Some(2010),
+            b"MOVIE_OTHER" => Some(2999),
+            b"MOVIE_SD" => Some(2030),
+            b"MOVIE_HD" => Some(2040),
+            b"MOVIE_UHD" => Some(2045),
+            b"MOVIE_3D" => Some(2050),
+            b"MOVIE_BLURAY" => Some(2060),
+            b"MOVIE_DVD" => Some(2070),
+            b"MOVIE_WEBDL" => Some(2080),
+            b"MOVIE_X265" => Some(2090),
+            b"MUSIC_MP3" => Some(3010),
+            b"MUSIC_VIDEO" => Some(3020),
+            b"MUSIC_AUDIOBOOK" => Some(3030),
+            b"MUSIC_LOSSLESS" => Some(3040),
+            b"MUSIC_PODCAST" => Some(3050),
+            b"MUSIC_OTHER" => Some(3999),
+            b"MUSIC_FOREIGN" => Some(3060),
+            b"PC_0DAY" => Some(4010),
+            b"PC_ISO" => Some(4020),
+            b"PC_MAC" => Some(4030),
+            b"PC_PHONE_OTHER" => Some(4040),
+            b"PC_GAMES" => Some(4050),
+            b"PC_PHONE_IOS" => Some(4060),
+            b"PC_PHONE_ANDROID" => Some(4070),
+            b"TV_WEBDL" => Some(5010),
+            b"TV_FOREIGN" => Some(5020),
+            b"TV_SD" => Some(5030),
+            b"TV_HD" => Some(5040),
+            b"TV_UHD" => Some(5045),
+            b"TV_OTHER" => Some(5999),
+            b"TV_SPORT" => Some(5060),
+            b"TV_ANIME" => Some(5070),
+            b"TV_DOCU" => Some(5080),
+            b"TV_X265" => Some(5090),
+            b"XXX_DVD" => Some(6010),
+            b"XXX_WMV" => Some(6020),
+            b"XXX_XVID" => Some(6030),
+            b"XXX_X264" => Some(6040),
+            b"XXX_CLIPHD" => Some(6041),
+            b"XXX_CLIPSD" => Some(6042),
+            b"XXX_UHD" => Some(6045),
+            b"XXX_VR" => Some(6046),
+            b"XXX_ONLYFANS" => Some(6047),
+            b"XXX_PACK" => Some(6050),
+            b"XXX_IMAGESET" => Some(6060),
+            b"XXX_OTHER" => Some(6999),
+            b"XXX_SD" => Some(6080),
+            b"XXX_WEBDL" => Some(6090),
+            b"BOOKS_MAGAZINES" => Some(7010),
+            b"BOOKS_EBOOK" => Some(7020),
+            b"BOOKS_COMICS" => Some(7030),
+            b"BOOKS_TECHNICAL" => Some(7040),
+            b"BOOKS_FOREIGN" => Some(7060),
+            b"BOOKS_UNKNOWN" => Some(7999),
+            b"OTHER_ROOT" => Some(1),
+            b"GAME_ROOT" => Some(1000),
+            b"MOVIE_ROOT" => Some(2000),
+            b"MUSIC_ROOT" => Some(3000),
+            b"PC_ROOT" => Some(4000),
+            b"TV_ROOT" => Some(5000),
+            b"XXX_ROOT" => Some(6000),
+            b"BOOKS_ROOT" => Some(7000),
+            b"STATUS_INACTIVE" => Some(0),
+            b"STATUS_ACTIVE" => Some(1),
+            b"STATUS_DISABLED" => Some(2),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn is_group_segment_char(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+    }
+
+    /// Validate and normalize `UsenetGroup::isValidGroup()`.
+    /// Returns `0` when invalid (`false`), `> 0` written byte length on valid group, or `< -1` when `out_cap` is too small.
+    pub(crate) fn normalize_valid_group(group_name: &[u8], out: &mut OutCursor<'_>) -> isize {
+        let body = strip_trailing_pcre_newline(group_name);
+        if body.is_empty() {
+            return 0;
+        }
+        let mut seg_count = 0usize;
+        for seg in body.split(|&b| b == b'.') {
+            if seg.is_empty() || !seg.iter().all(|&b| is_group_segment_char(b)) {
+                return 0;
+            }
+            seg_count += 1;
+        }
+        if seg_count < 2 {
+            return 0;
+        }
+
+        if group_name.len() >= 4 && group_name[..4].eq_ignore_ascii_case(b"a.b.") {
+            out.extend(b"alt.binaries.");
+            out.extend(&group_name[4..]);
+        } else {
+            out.extend(group_name);
+        }
+
+        match out.pos {
+            n if n <= out.buf.len() => n as isize,
+            n => -(n.max(4) as isize),
+        }
+    }
+
+    #[inline]
+    fn push_i64_decimal(val: i64, out: &mut OutCursor<'_>) {
+        if val == 0 {
+            out.push(b'0');
+            return;
+        }
+        let mut n: u64 = if val < 0 {
+            out.push(b'-');
+            val.wrapping_neg() as u64
+        } else {
+            val as u64
+        };
+        let mut digits = [0u8; 20];
+        let mut pos = digits.len();
+        while n > 0 {
+            pos -= 1;
+            digits[pos] = b'0' + (n % 10) as u8;
+            n /= 10;
+        }
+        out.extend(&digits[pos..]);
+    }
+
+    pub(crate) fn format_group_status_message(
+        id: i64,
+        status: i64,
+        out: &mut OutCursor<'_>,
+    ) -> isize {
+        out.extend(b"Group ");
+        push_i64_decimal(id, out);
+        out.extend(b" has been ");
+        if status == 0 {
+            out.extend(b"deactivated.");
+        } else {
+            out.extend(b"activated.");
+        }
+        match out.pos {
+            n if n <= out.buf.len() => n as isize,
+            n => -(n.max(4) as isize),
+        }
+    }
+
+    // -- C ABI -------------------------------------------------------------------------------
+
+    /// Check `CategorizationPassable::shouldStopProcessing()`.
+    ///
+    /// # Safety
+    ///
+    /// Scalar arguments only; safe to call from C.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_categorize_passable_should_stop(
+        locked_to_misc: u32,
+        confidence: f64,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if locked_to_misc > 1 {
+                return -1;
+            }
+            i32::from(locked_to_misc == 1 || confidence >= 0.95)
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Evaluate whether `CategorizationPassable::updateBestResult()` should replace `bestResult`.
+    ///
+    /// # Safety
+    ///
+    /// `cand_matched_ptr` and `best_matched_ptr` must be valid for reads of their lengths when non-null.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_categorize_passable_should_update_best(
+        cand_cat_id: i64,
+        cand_conf: f64,
+        cand_matched_ptr: *const u8,
+        cand_matched_len: usize,
+        best_cat_id: i64,
+        best_conf: f64,
+        best_matched_ptr: *const u8,
+        best_matched_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let (Some(cand_matched), Some(best_matched)) = (unsafe {
+                (
+                    input(cand_matched_ptr, cand_matched_len),
+                    input(best_matched_ptr, best_matched_len),
+                )
+            }) else {
+                return -1;
+            };
+            let update = is_successful_result(cand_cat_id, cand_conf, cand_matched)
+                && should_override_result(
+                    cand_cat_id,
+                    cand_conf,
+                    best_cat_id,
+                    best_conf,
+                    best_matched,
+                );
+            i32::from(update)
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Pack scalar/string summary fields for `CategorizationPassable::toArray()`.
+    /// Returns `0` when `debug == 0`, `>= 2` written byte length (`matched_by\0release_name\0group_name`)
+    /// when `debug == 1`, `< -1` when `out_cap` is too small, or `DECLINED` (`-1`) on invalid inputs.
+    ///
+    /// # Safety
+    ///
+    /// All string pointers must be valid for their respective lengths when non-null, and `out_buf` for `out_cap` writes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_categorize_passable_pack_summary(
+        debug: u32,
+        matched_by_ptr: *const u8,
+        matched_by_len: usize,
+        release_name_ptr: *const u8,
+        release_name_len: usize,
+        group_name_ptr: *const u8,
+        group_name_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if debug > 1 || (out_cap > 0 && out_buf.is_null()) {
+                return DECLINED;
+            }
+            let (Some(matched_by), Some(release_name), Some(group_name)) = (unsafe {
+                (
+                    input(matched_by_ptr, matched_by_len),
+                    input(release_name_ptr, release_name_len),
+                    input(group_name_ptr, group_name_len),
+                )
+            }) else {
+                return DECLINED;
+            };
+            if debug == 0 {
+                return 0;
+            }
+            if matched_by.contains(&0) || release_name.contains(&0) || group_name.contains(&0) {
+                return DECLINED;
+            }
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.extend(matched_by);
+            cursor.push(0);
+            cursor.extend(release_name);
+            cursor.push(0);
+            cursor.extend(group_name);
+            match cursor.pos {
+                n if n <= cursor.buf.len() => n as isize,
+                n => -(n.max(2) as isize),
+            }
+        }))
+        .unwrap_or(DECLINED)
+    }
+
+    /// Evaluate `MiscPipe::shouldLock()`.
+    ///
+    /// # Safety
+    ///
+    /// `matched_by_ptr` must be valid for `matched_by_len` reads when non-null.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_categorize_misc_pipe_should_lock(
+        category_id: i64,
+        matched_by_ptr: *const u8,
+        matched_by_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(matched_by) = (unsafe { input(matched_by_ptr, matched_by_len) }) else {
+                return -1;
+            };
+            i32::from(misc_pipe_should_lock(category_id, matched_by))
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Evaluate `MiscSafetyNetPipe::shouldDowngradeToMisc()`.
+    ///
+    /// # Safety
+    ///
+    /// `matched_by_ptr` must be valid for `matched_by_len` reads when non-null.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_categorize_safety_net_should_downgrade(
+        locked_to_misc: u32,
+        low_signal: u32,
+        matched_by_ptr: *const u8,
+        matched_by_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if locked_to_misc > 1 || low_signal > 1 {
+                return -1;
+            }
+            let Some(matched_by) = (unsafe { input(matched_by_ptr, matched_by_len) }) else {
+                return -1;
+            };
+            i32::from(safety_net_should_downgrade(
+                locked_to_misc == 1,
+                low_signal == 1,
+                matched_by,
+            ))
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Build the category comparison summary for `CategorizationService::compare()`.
+    /// Writes `<match_byte><pipeline_name>\0<legacy_name>` into `out_buf`.
+    ///
+    /// # Safety
+    ///
+    /// `pipeline_title_ptr` and `legacy_title_ptr` must be valid for their lengths when non-null,
+    /// and `out_buf` for `out_cap` writes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_categorize_service_compare_summary(
+        pipeline_cat_id: i64,
+        has_pipeline_title: u32,
+        pipeline_title_ptr: *const u8,
+        pipeline_title_len: usize,
+        legacy_cat_id: i64,
+        has_legacy_title: u32,
+        legacy_title_ptr: *const u8,
+        legacy_title_len: usize,
+        legacy_state: u32,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if has_pipeline_title > 1
+                || has_legacy_title > 1
+                || legacy_state > 2
+                || (out_cap > 0 && out_buf.is_null())
+            {
+                return DECLINED;
+            }
+            let (Some(pipeline_title), Some(legacy_title)) = (unsafe {
+                (
+                    input(pipeline_title_ptr, pipeline_title_len),
+                    input(legacy_title_ptr, legacy_title_len),
+                )
+            }) else {
+                return DECLINED;
+            };
+            if pipeline_title.contains(&0) || legacy_title.contains(&0) {
+                return DECLINED;
+            }
+
+            let pipeline_name: &[u8] = if has_pipeline_title == 1 {
+                pipeline_title
+            } else {
+                b"Unknown"
+            };
+            let legacy_name: &[u8] = match legacy_state {
+                0 => {
+                    if has_legacy_title == 1 {
+                        legacy_title
+                    } else {
+                        b"Unknown"
+                    }
+                }
+                1 => b"Legacy error",
+                2 => b"Legacy unavailable",
+                _ => unreachable!(),
+            };
+
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.push(if pipeline_cat_id == legacy_cat_id {
+                b'1'
+            } else {
+                b'0'
+            });
+            cursor.extend(pipeline_name);
+            cursor.push(0);
+            cursor.extend(legacy_name);
+            match cursor.pos {
+                n if n <= cursor.buf.len() => n as isize,
+                n => -(n.max(2) as isize),
+            }
+        }))
+        .unwrap_or(DECLINED)
+    }
+
+    /// Check whether a numeric category ID is a root/parent category (`Category::isParent()`).
+    ///
+    /// # Safety
+    ///
+    /// Scalar argument only; safe to call from C.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_category_is_parent_id(cid: i64) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| i32::from(is_parent_category_id(cid)))).unwrap_or(-1)
+    }
+
+    /// Check whether a string category ID is a root/parent category (`Category::isParent()`).
+    ///
+    /// # Safety
+    ///
+    /// `input_ptr` must be valid for `input_len` reads when non-null.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_category_is_parent_str(
+        input_ptr: *const u8,
+        input_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(raw) = (unsafe { input(input_ptr, input_len) }) else {
+                return -1;
+            };
+            i32::from(is_parent_category_str(raw))
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Write `Category::getCategoryOthersGroup()` into `out_buf`.
+    ///
+    /// # Safety
+    ///
+    /// `out_buf` must be valid for `out_cap` writes when non-null.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_category_others_group(
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out_cap > 0 && out_buf.is_null() {
+                return DECLINED;
+            }
+            if OTHERS_GROUP_CSV.len() > out_cap {
+                return -(OTHERS_GROUP_CSV.len() as isize);
+            }
+            unsafe {
+                slice::from_raw_parts_mut(out_buf, OTHERS_GROUP_CSV.len())
+                    .copy_from_slice(OTHERS_GROUP_CSV);
+            }
+            OTHERS_GROUP_CSV.len() as isize
+        }))
+        .unwrap_or(DECLINED)
+    }
+
+    /// Resolve a `Category::getCategoryValue()` integer constant by name, or `-1` if unknown/declined.
+    ///
+    /// # Safety
+    ///
+    /// `name_ptr` must be valid for `name_len` reads when non-null.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_category_value(
+        name_ptr: *const u8,
+        name_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(name) = (unsafe { input(name_ptr, name_len) }) else {
+                return -1;
+            };
+            category_constant_value(name).unwrap_or(-1)
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Validate and normalize `UsenetGroup::isValidGroup()`.
+    ///
+    /// # Safety
+    ///
+    /// `name_ptr` must be valid for `name_len` reads when non-null, and `out_buf` for `out_cap` writes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_usenet_group_normalize_valid(
+        name_ptr: *const u8,
+        name_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out_cap > 0 && out_buf.is_null() {
+                return DECLINED;
+            }
+            let Some(name) = (unsafe { input(name_ptr, name_len) }) else {
+                return DECLINED;
+            };
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            normalize_valid_group(name, &mut cursor)
+        }))
+        .unwrap_or(DECLINED)
+    }
+
+    /// Format the status message in `UsenetGroup::updateGroupStatus()`.
+    ///
+    /// # Safety
+    ///
+    /// `out_buf` must be valid for `out_cap` writes when non-null.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_usenet_group_format_status_message(
+        id: i64,
+        status: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out_cap > 0 && out_buf.is_null() {
+                return DECLINED;
+            }
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            format_group_status_message(id, status, &mut cursor)
+        }))
+        .unwrap_or(DECLINED)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn passable_and_pipe_predicates_match_php_contracts() {
+            assert_eq!(
+                unsafe { nntmux_categorize_passable_should_stop(0, 0.9499) },
+                0
+            );
+            assert_eq!(
+                unsafe { nntmux_categorize_passable_should_stop(0, 0.95) },
+                1
+            );
+            assert_eq!(unsafe { nntmux_categorize_passable_should_stop(1, 0.0) }, 1);
+            assert_eq!(
+                unsafe { nntmux_categorize_passable_should_stop(2, 0.5) },
+                -1
+            );
+
+            assert_eq!(
+                unsafe {
+                    nntmux_categorize_passable_should_update_best(
+                        5040,
+                        0.85,
+                        b"tv_hd".as_ptr(),
+                        5,
+                        10,
+                        0.0,
+                        b"no_match".as_ptr(),
+                        8,
+                    )
+                },
+                1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_categorize_passable_should_update_best(
+                        5040,
+                        0.55,
+                        b"tv_hd".as_ptr(),
+                        5,
+                        10,
+                        0.5,
+                        b"hash_md5".as_ptr(),
+                        8,
+                    )
+                },
+                0
+            );
+
+            assert_eq!(
+                unsafe { nntmux_categorize_misc_pipe_should_lock(20, b"any".as_ptr(), 3) },
+                1
+            );
+            assert_eq!(
+                unsafe { nntmux_categorize_misc_pipe_should_lock(10, b"hash_md5".as_ptr(), 8) },
+                1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_categorize_misc_pipe_should_lock(10, b"archive_ext".as_ptr(), 11)
+                },
+                0
+            );
+
+            assert_eq!(
+                unsafe {
+                    nntmux_categorize_safety_net_should_downgrade(
+                        0,
+                        1,
+                        b"group_name_tv".as_ptr(),
+                        13,
+                    )
+                },
+                1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_categorize_safety_net_should_downgrade(
+                        1,
+                        1,
+                        b"group_name_tv".as_ptr(),
+                        13,
+                    )
+                },
+                0
+            );
+        }
+
+        #[test]
+        fn category_and_usenet_group_helpers_match_php_contracts() {
+            assert_eq!(unsafe { nntmux_category_is_parent_id(2000) }, 1);
+            assert_eq!(unsafe { nntmux_category_is_parent_id(2040) }, 0);
+            assert_eq!(
+                unsafe { nntmux_category_is_parent_str(b" 5000 ".as_ptr(), 6) },
+                1
+            );
+            assert_eq!(
+                unsafe { nntmux_category_is_parent_str(b"5040".as_ptr(), 4) },
+                0
+            );
+
+            let mut buf = [0u8; 128];
+            let n = unsafe { nntmux_category_others_group(buf.as_mut_ptr(), buf.len()) } as usize;
+            assert_eq!(&buf[..n], b"7999,1999,2999,3999,4040,5999,20,6999,10");
+
+            assert_eq!(unsafe { nntmux_category_value(b"TV_HD".as_ptr(), 5) }, 5040);
+            assert_eq!(
+                unsafe { nntmux_category_value(b"STATUS_INACTIVE".as_ptr(), 15) },
+                0
+            );
+            assert_eq!(
+                unsafe { nntmux_category_value(b"UNKNOWN_CONST".as_ptr(), 13) },
+                -1
+            );
+
+            let n = unsafe {
+                nntmux_usenet_group_normalize_valid(
+                    b"A.B.TeeVee".as_ptr(),
+                    10,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            } as usize;
+            assert_eq!(&buf[..n], b"alt.binaries.TeeVee");
+            assert_eq!(
+                unsafe {
+                    nntmux_usenet_group_normalize_valid(
+                        b"invalid..group".as_ptr(),
+                        14,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                0
+            );
+
+            let n = unsafe {
+                nntmux_usenet_group_format_status_message(42, 0, buf.as_mut_ptr(), buf.len())
+            } as usize;
+            assert_eq!(&buf[..n], b"Group 42 has been deactivated.");
+            let n = unsafe {
+                nntmux_usenet_group_format_status_message(42, 1, buf.as_mut_ptr(), buf.len())
+            } as usize;
+            assert_eq!(&buf[..n], b"Group 42 has been activated.");
+        }
+    }
+}

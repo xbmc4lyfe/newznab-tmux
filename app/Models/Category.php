@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace App\Models;
 
+use App\Services\Categorization\CategorizationService;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
@@ -253,6 +256,30 @@ class Category extends Model
             self::TV_X265,
         ];
 
+    public const array ROOT_CATEGORIES =
+        [
+            self::OTHER_ROOT,
+            self::GAME_ROOT,
+            self::MOVIE_ROOT,
+            self::MUSIC_ROOT,
+            self::PC_ROOT,
+            self::TV_ROOT,
+            self::XXX_ROOT,
+            self::BOOKS_ROOT,
+        ];
+
+    public static bool $useRustFfi = false;
+
+    public static function setUseRustFfi(bool $useRustFfi): void
+    {
+        self::$useRustFfi = $useRustFfi;
+    }
+
+    public static function categorizeFfi(): ?FFI
+    {
+        return CategorizationService::categorizeFfi();
+    }
+
     /**
      * @var bool
      */
@@ -389,10 +416,47 @@ class Category extends Model
      */
     public static function getCategoryOthersGroup(): string
     {
+        return self::$useRustFfi
+            ? self::getCategoryOthersGroupNative()
+            : self::getCategoryOthersGroupPhp();
+    }
+
+    public static function getCategoryOthersGroupPhp(): string
+    {
         return implode(
             ',',
             self::OTHERS_GROUP
         );
+    }
+
+    public static function getCategoryOthersGroupNative(): string
+    {
+        $ffi = self::categorizeFfi();
+        if ($ffi === null) {
+            return self::getCategoryOthersGroupPhp();
+        }
+
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, 64, $cap);
+        if ($scratch === null) {
+            return self::getCategoryOthersGroupPhp();
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_category_others_group($scratch, $cap);
+        if (\is_int($written) && $written < -1) {
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+            if ($scratch === null) {
+                return self::getCategoryOthersGroupPhp();
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_category_others_group($scratch, $cap);
+        }
+        if (! \is_int($written) || $written <= 0) {
+            return self::getCategoryOthersGroupPhp();
+        }
+
+        return FFI::string($scratch, $written);
     }
 
     /**
@@ -400,7 +464,40 @@ class Category extends Model
      */
     public static function getCategoryValue(mixed $category)
     {
+        return self::$useRustFfi
+            ? self::getCategoryValueNative($category)
+            : self::getCategoryValuePhp($category);
+    }
+
+    /**
+     * @return mixed
+     */
+    public static function getCategoryValuePhp(mixed $category)
+    {
         return \constant('self::'.$category);
+    }
+
+    /**
+     * @return mixed
+     */
+    public static function getCategoryValueNative(mixed $category)
+    {
+        if (! \is_string($category)) {
+            return self::getCategoryValuePhp($category);
+        }
+
+        $ffi = self::categorizeFfi();
+        if ($ffi === null) {
+            return self::getCategoryValuePhp($category);
+        }
+
+        // @phpstan-ignore method.notFound
+        $res = $ffi->nntmux_category_value($category, \strlen($category));
+        if (\is_int($res) && $res >= 0) {
+            return $res;
+        }
+
+        return self::getCategoryValuePhp($category);
     }
 
     /**
@@ -408,11 +505,22 @@ class Category extends Model
      */
     public static function isParent(mixed $cid): bool
     {
+        return self::$useRustFfi
+            ? self::isParentNative($cid)
+            : self::isParentPhp($cid);
+    }
+
+    public static function isParentPhp(mixed $cid): bool
+    {
+        if (Cache::getFacadeRoot() === null) {
+            return self::isParentCategoryIdPhp($cid);
+        }
+
         // Cache the parent category check to avoid repeated DB queries
         $cacheKey = 'cat_is_parent_'.$cid;
         $cached = Cache::get($cacheKey);
         if ($cached !== null) {
-            return $cached;
+            return (bool) $cached;
         }
 
         $ret = RootCategory::query()->where(['id' => $cid])->first();
@@ -422,6 +530,84 @@ class Category extends Model
         Cache::put($cacheKey, $isParent, now()->addHours(24));
 
         return $isParent;
+    }
+
+    public static function isParentNative(mixed $cid): bool
+    {
+        if (Cache::getFacadeRoot() === null) {
+            return self::isParentCategoryIdNative($cid);
+        }
+
+        $cacheKey = 'cat_is_parent_'.$cid;
+        $cached = Cache::get($cacheKey);
+        if ($cached !== null) {
+            return (bool) $cached;
+        }
+
+        $ret = RootCategory::query()->where(['id' => $cid])->first();
+        $isParent = $ret !== null;
+
+        Cache::put($cacheKey, $isParent, now()->addHours(24));
+
+        return $isParent;
+    }
+
+    public static function isParentCategoryId(mixed $cid): bool
+    {
+        return self::$useRustFfi
+            ? self::isParentCategoryIdNative($cid)
+            : self::isParentCategoryIdPhp($cid);
+    }
+
+    public static function isParentCategoryIdPhp(mixed $cid): bool
+    {
+        if (\is_int($cid)) {
+            return \in_array($cid, self::ROOT_CATEGORIES, true);
+        }
+        if (\is_string($cid)) {
+            $trimmed = trim($cid);
+            if ($trimmed !== '' && $trimmed[0] === '+') {
+                $trimmed = substr($trimmed, 1);
+            }
+            if ($trimmed === '' || ! ctype_digit($trimmed)) {
+                return false;
+            }
+            $normalized = ltrim($trimmed, '0');
+
+            return \in_array($normalized, ['1', '1000', '2000', '3000', '4000', '5000', '6000', '7000'], true);
+        }
+
+        return false;
+    }
+
+    public static function isParentCategoryIdNative(mixed $cid): bool
+    {
+        $ffi = self::categorizeFfi();
+        if ($ffi === null) {
+            return self::isParentCategoryIdPhp($cid);
+        }
+
+        if (\is_int($cid)) {
+            // @phpstan-ignore method.notFound
+            $res = $ffi->nntmux_category_is_parent_id($cid);
+            if (! \is_int($res) || $res < 0) {
+                return self::isParentCategoryIdPhp($cid);
+            }
+
+            return $res === 1;
+        }
+
+        if (\is_string($cid)) {
+            // @phpstan-ignore method.notFound
+            $res = $ffi->nntmux_category_is_parent_str($cid, \strlen($cid));
+            if (! \is_int($res) || $res < 0) {
+                return self::isParentCategoryIdPhp($cid);
+            }
+
+            return $res === 1;
+        }
+
+        return false;
     }
 
     public static function getFlat(): mixed
