@@ -17769,3 +17769,1072 @@ pub mod search_sync_observers_history {
         }
     }
 }
+/// Wave 27.5 search, content and watchlist controller helpers: `SearchController` poster
+/// reconciliation and search field maps, `ContentController` admin role, page mode and
+/// page meta resolution, `MyMoviesController`/`MyShowsController` POST-only action gates
+/// and watchlist selected categories, and `ReleaseReportController` report attributes and
+/// JSON response payloads. No dependencies.
+///
+/// Every export returns DECLINE for an invalid flag, mode or pointer range and writes
+/// nothing on a negative or DECLINE result; a negative non-DECLINE result is the required
+/// capacity. Strings are compared as exact bytes, like PHP `===`.
+pub mod search_content_watchlist_controllers {
+    use std::mem::{align_of, size_of};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    pub const DECLINE: i32 = i32::MIN;
+    const MAX_INPUT: usize = 1 << 20;
+
+    /// Poster source in bits 0-1 of `nntmux_search_poster_reconcile`.
+    pub const POSTER_FROM_EXACT: i32 = 0;
+    pub const POSTER_FROM_ADVANCED: i32 = 1;
+    pub const POSTER_EMPTY: i32 = 2;
+    /// `listQuery['poster']` operation in bits 2-3.
+    pub const POSTER_KEY_UNSET: i32 = 1 << 2;
+    pub const POSTER_KEY_SET: i32 = 2 << 2;
+    /// Bit 4: set `listQuery['searchadvposter']` to the resolved poster.
+    pub const ADVANCED_KEY_SET: i32 = 1 << 4;
+
+    /// Content page modes.
+    pub const PAGE_LISTING: i32 = 0;
+    pub const PAGE_BY_ID: i32 = 1;
+    pub const PAGE_FRONT: i32 = 2;
+
+    const CONTENT_TITLE: &[u8] = b"Contents page";
+    const CONTENT_KEYWORDS: &[u8] = b"contents";
+    const CONTENT_DESCRIPTION: &[u8] = b"This is the contents page.";
+    const META_MASK: u32 = 0b111;
+
+    const POST_ONLY_ACTIONS: &[&[u8]] = &[b"delete", b"doadd", b"doedit"];
+
+    /// Watchlist selected-category modes.
+    pub const SELECTED_NONE: u32 = 0;
+    pub const SELECTED_SPLIT: u32 = 1;
+    pub const SELECTED_SPLIT_UNLESS_EMPTY: u32 = 2;
+
+    const REPORT_STATUS: &[u8] = b"pending";
+    const REPORT_RESPONSES: &[(i32, i32, &[u8])] = &[
+        (404, 0, b"Release not found."),
+        (409, 0, b"You have already reported this release."),
+        (
+            200,
+            1,
+            b"Report submitted successfully. Thank you for helping improve our content.",
+        ),
+    ];
+
+    fn range_ok(address: usize, length: usize) -> bool {
+        length <= isize::MAX as usize && address.checked_add(length).is_some()
+    }
+
+    fn aligned<T>(pointer: *const T, count: usize) -> bool {
+        let Some(length) = size_of::<T>().checked_mul(count) else {
+            return false;
+        };
+        !pointer.is_null()
+            && (pointer as usize).is_multiple_of(align_of::<T>())
+            && range_ok(pointer as usize, length)
+    }
+
+    /// A zero-capacity output may be any pointer; otherwise it must be aligned and in range.
+    fn output_ok<T>(pointer: *mut T, capacity: usize) -> bool {
+        capacity == 0 || aligned(pointer as *const T, capacity)
+    }
+
+    fn flag(value: u8) -> Option<bool> {
+        match value {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+
+    unsafe fn bytes<'a>(pointer: *const u8, length: usize) -> Option<&'a [u8]> {
+        if length > MAX_INPUT || !range_ok(pointer as usize, length) {
+            return None;
+        }
+        if length == 0 {
+            return Some(&[]);
+        }
+        if pointer.is_null() {
+            return None;
+        }
+        // u8 alignment is one; the range was checked above.
+        Some(unsafe { slice::from_raw_parts(pointer, length) })
+    }
+
+    /// PHP `trim()` default character set.
+    fn php_trim_is_empty(value: &[u8]) -> bool {
+        value
+            .iter()
+            .all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\0' | 0x0b))
+    }
+
+    /// Copies `parts` into `out` and their lengths into `out_lens`; the caller validated
+    /// `out_lens` for `parts.len()` values. Returns the total, or a negative capacity.
+    unsafe fn write_parts(parts: &[&[u8]], out_lens: *mut usize, out: *mut u8, cap: usize) -> i32 {
+        let mut total = 0usize;
+        for part in parts {
+            let Some(next) = total.checked_add(part.len()) else {
+                return DECLINE;
+            };
+            total = next;
+        }
+        if total > i32::MAX as usize {
+            return DECLINE;
+        }
+        if cap < total {
+            return -(total as i32);
+        }
+        // Copy first: the inputs may alias the outputs.
+        let mut payload = Vec::with_capacity(total);
+        let mut lens = Vec::with_capacity(parts.len());
+        for part in parts {
+            payload.extend_from_slice(part);
+            lens.push(part.len());
+        }
+        unsafe {
+            if total != 0 {
+                std::ptr::copy_nonoverlapping(payload.as_ptr(), out, total);
+            }
+            std::ptr::copy_nonoverlapping(lens.as_ptr(), out_lens, lens.len());
+        }
+        total as i32
+    }
+
+    /// `SearchController::reconcilePosterQuery()`: returns the poster source (bits 0-1),
+    /// the `poster` list-query key operation (bits 2-3) and whether `searchadvposter`
+    /// must be set (bit 4). Flags must be 0 or 1.
+    ///
+    /// # Safety
+    /// `exact`/`advanced` must be readable for their lengths.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_search_poster_reconcile(
+        has_poster: u8,
+        has_advanced_poster: u8,
+        list_has_advanced_key: u8,
+        exact: *const u8,
+        exact_len: usize,
+        advanced: *const u8,
+        advanced_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let (Some(has_poster), Some(has_advanced), Some(list_has_advanced)) = (
+                flag(has_poster),
+                flag(has_advanced_poster),
+                flag(list_has_advanced_key),
+            ) else {
+                return DECLINE;
+            };
+            let (Some(exact), Some(advanced)) = (unsafe { bytes(exact, exact_len) }, unsafe {
+                bytes(advanced, advanced_len)
+            }) else {
+                return DECLINE;
+            };
+            let (mut state, resolved) = if has_poster && has_advanced && advanced != exact {
+                let op = if advanced.is_empty() {
+                    POSTER_KEY_UNSET
+                } else {
+                    POSTER_KEY_SET
+                };
+                (POSTER_FROM_ADVANCED | op, advanced)
+            } else if !has_poster {
+                (POSTER_EMPTY, &[][..])
+            } else {
+                (POSTER_FROM_EXACT, exact)
+            };
+            if !resolved.is_empty() && !list_has_advanced {
+                state |= ADVANCED_KEY_SET;
+            }
+            state
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `SearchController::searchFieldMap()`: writes `searchname`, `name`, `fromname` and
+    /// `filename` into `out` (returning their total length) and their lengths into
+    /// `out_lens`. `fromname` is `advanced` only when `exact_poster_empty` is 1.
+    ///
+    /// # Safety
+    /// Every input must be readable for its length, `out_lens` an aligned writable
+    /// `size_t[4]` and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_search_field_map(
+        search: *const u8,
+        search_len: usize,
+        subject: *const u8,
+        subject_len: usize,
+        exact_poster_empty: u8,
+        advanced: *const u8,
+        advanced_len: usize,
+        filename: *const u8,
+        filename_len: usize,
+        out_lens: *mut usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(exact_empty) = flag(exact_poster_empty) else {
+                return DECLINE;
+            };
+            if !aligned(out_lens as *const usize, 4) || !output_ok(out, cap) {
+                return DECLINE;
+            }
+            let (Some(search), Some(subject), Some(advanced), Some(filename)) = (
+                unsafe { bytes(search, search_len) },
+                unsafe { bytes(subject, subject_len) },
+                unsafe { bytes(advanced, advanced_len) },
+                unsafe { bytes(filename, filename_len) },
+            ) else {
+                return DECLINE;
+            };
+            let fromname = if exact_empty { advanced } else { &[][..] };
+            unsafe { write_parts(&[search, subject, fromname, filename], out_lens, out, cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `ContentController::isAdminRole()`: 1 when `role` is `admin` or `moderator`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn nntmux_content_controller_is_admin(
+        role: i64,
+        admin: i64,
+        moderator: i64,
+    ) -> i32 {
+        catch_unwind(|| i32::from(role == admin || role == moderator)).unwrap_or(DECLINE)
+    }
+
+    /// `ContentController::pageMode()`: 0 = content listing, 1 = one page by id,
+    /// 2 = front page.
+    ///
+    /// # Safety
+    /// `page` must be readable for `page_len` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_content_controller_page_mode(
+        content_id: i64,
+        page: *const u8,
+        page_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(page) = (unsafe { bytes(page, page_len) }) else {
+                return DECLINE;
+            };
+            if content_id == 0 && page == b"content" {
+                PAGE_LISTING
+            } else if content_id != 0 && !page.is_empty() {
+                PAGE_BY_ID
+            } else {
+                PAGE_FRONT
+            }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `ContentController::pageMeta()`: writes `meta_title`, `meta_keywords` and
+    /// `meta_description` into `out` and their lengths into `out_lens`. Bits 0-2 of
+    /// `present_mask` mark the index title, keywords and description as non-null; they
+    /// apply only to the front page, where a title that PHP `trim()`s to empty falls back.
+    ///
+    /// # Safety
+    /// Every input must be readable for its length, `out_lens` an aligned writable
+    /// `size_t[3]` and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_content_controller_page_meta(
+        mode: u32,
+        present_mask: u32,
+        title: *const u8,
+        title_len: usize,
+        keywords: *const u8,
+        keywords_len: usize,
+        description: *const u8,
+        description_len: usize,
+        out_lens: *mut usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if mode > PAGE_FRONT as u32 || present_mask & !META_MASK != 0 {
+                return DECLINE;
+            }
+            if !aligned(out_lens as *const usize, 3) || !output_ok(out, cap) {
+                return DECLINE;
+            }
+            let (Some(title), Some(keywords), Some(description)) = (
+                unsafe { bytes(title, title_len) },
+                unsafe { bytes(keywords, keywords_len) },
+                unsafe { bytes(description, description_len) },
+            ) else {
+                return DECLINE;
+            };
+            let front = mode == PAGE_FRONT as u32;
+            let present = |bit: u32| front && present_mask & (1 << bit) != 0;
+            let title = if present(0) && !php_trim_is_empty(title) {
+                title
+            } else {
+                CONTENT_TITLE
+            };
+            let keywords = if present(1) {
+                keywords
+            } else {
+                CONTENT_KEYWORDS
+            };
+            let description = if present(2) {
+                description
+            } else {
+                CONTENT_DESCRIPTION
+            };
+            unsafe { write_parts(&[title, keywords, description], out_lens, out, cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `MyMoviesController`/`MyShowsController::postGateBlocked()`: 1 when a POST-only
+    /// action (`delete`, `doadd`, `doedit`) arrives without POST. `is_post` must be 0 or 1.
+    ///
+    /// # Safety
+    /// `action` must be readable for `action_len` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_watchlist_post_gate(
+        action: *const u8,
+        action_len: usize,
+        is_post: u8,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(is_post) = flag(is_post) else {
+                return DECLINE;
+            };
+            let Some(action) = (unsafe { bytes(action, action_len) }) else {
+                return DECLINE;
+            };
+            i32::from(!is_post && POST_ONLY_ACTIONS.contains(&action))
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Watchlist `cat_selected`: writes the byte length of each `|`-separated segment of
+    /// `field` into `out_lens` and returns the segment count. Mode 0 selects nothing,
+    /// 1 always splits like `explode()`, and 2 splits unless the field is PHP-empty
+    /// (`""` or `"0"`).
+    ///
+    /// # Safety
+    /// `field` must be readable for `field_len` bytes and `out_lens` writable for
+    /// `lens_cap` aligned `size_t` values.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_watchlist_selected_categories(
+        mode: u32,
+        field: *const u8,
+        field_len: usize,
+        out_lens: *mut usize,
+        lens_cap: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if mode > SELECTED_SPLIT_UNLESS_EMPTY || !output_ok(out_lens, lens_cap) {
+                return DECLINE;
+            }
+            let Some(field) = (unsafe { bytes(field, field_len) }) else {
+                return DECLINE;
+            };
+            let none = mode == SELECTED_NONE
+                || (mode == SELECTED_SPLIT_UNLESS_EMPTY && (field.is_empty() || field == b"0"));
+            if none {
+                return 0;
+            }
+            let lens: Vec<usize> = field.split(|b| *b == b'|').map(<[u8]>::len).collect();
+            // At most MAX_INPUT + 1 segments, so the count fits in i32.
+            if lens_cap < lens.len() {
+                return -(lens.len() as i32);
+            }
+            unsafe { std::ptr::copy_nonoverlapping(lens.as_ptr(), out_lens, lens.len()) };
+            lens.len() as i32
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `ReleaseReportController::reportAttributes()`: writes `reason`, `description`
+    /// (empty when `has_description` is 0) and the `pending` status into `out` and their
+    /// lengths into `out_lens`.
+    ///
+    /// # Safety
+    /// `reason`/`description` must be readable for their lengths, `out_lens` an aligned
+    /// writable `size_t[3]` and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_release_report_attributes(
+        reason: *const u8,
+        reason_len: usize,
+        has_description: u8,
+        description: *const u8,
+        description_len: usize,
+        out_lens: *mut usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(has_description) = flag(has_description) else {
+                return DECLINE;
+            };
+            if !aligned(out_lens as *const usize, 3) || !output_ok(out, cap) {
+                return DECLINE;
+            }
+            let (Some(reason), Some(description)) =
+                (unsafe { bytes(reason, reason_len) }, unsafe {
+                    bytes(description, description_len)
+                })
+            else {
+                return DECLINE;
+            };
+            let description = if has_description {
+                description
+            } else {
+                &[][..]
+            };
+            unsafe { write_parts(&[reason, description, REPORT_STATUS], out_lens, out, cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `ReleaseReportController::reportResponse()`: for outcome 0 (not found),
+    /// 1 (duplicate) or 2 (created) writes `[http_status, success]` into `out_meta`,
+    /// copies the message into `out` and returns its length.
+    ///
+    /// # Safety
+    /// `out_meta` must be an aligned writable `int32_t[2]` and `out` writable for `cap`
+    /// bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_release_report_response(
+        outcome: u32,
+        out_meta: *mut i32,
+        out: *mut u8,
+        cap: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(&(status, success, message)) = REPORT_RESPONSES.get(outcome as usize) else {
+                return DECLINE;
+            };
+            if !aligned(out_meta as *const i32, 2) || !output_ok(out, cap) {
+                return DECLINE;
+            }
+            if cap < message.len() {
+                return -(message.len() as i32);
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(message.as_ptr(), out, message.len());
+                out_meta.write(status);
+                out_meta.add(1).write(success);
+            }
+            message.len() as i32
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn reconcile(
+            has_poster: u8,
+            has_advanced: u8,
+            list_has: u8,
+            exact: &[u8],
+            advanced: &[u8],
+        ) -> i32 {
+            unsafe {
+                nntmux_search_poster_reconcile(
+                    has_poster,
+                    has_advanced,
+                    list_has,
+                    exact.as_ptr(),
+                    exact.len(),
+                    advanced.as_ptr(),
+                    advanced.len(),
+                )
+            }
+        }
+
+        /// Reference model of the PHP controller branch.
+        fn reconcile_reference(
+            has_poster: bool,
+            has_advanced: bool,
+            list_has: bool,
+            exact: &[u8],
+            advanced: &[u8],
+        ) -> i32 {
+            let mut state;
+            let resolved: &[u8];
+            if has_poster && has_advanced && advanced != exact {
+                resolved = advanced;
+                state = POSTER_FROM_ADVANCED
+                    | if advanced.is_empty() {
+                        POSTER_KEY_UNSET
+                    } else {
+                        POSTER_KEY_SET
+                    };
+            } else if !has_poster {
+                resolved = b"";
+                state = POSTER_EMPTY;
+            } else {
+                resolved = exact;
+                state = POSTER_FROM_EXACT;
+            }
+            if !resolved.is_empty() && !list_has {
+                state |= ADVANCED_KEY_SET;
+            }
+            state
+        }
+
+        #[test]
+        fn wave27_5_poster_reconcile_matrix() {
+            let values: [&[u8]; 4] = [b"", b"alice", b"bob", b"alice "];
+            for has_poster in 0..=1u8 {
+                for has_advanced in 0..=1u8 {
+                    for list_has in 0..=1u8 {
+                        for exact in values {
+                            for advanced in values {
+                                assert_eq!(
+                                    reconcile(has_poster, has_advanced, list_has, exact, advanced),
+                                    reconcile_reference(
+                                        has_poster == 1,
+                                        has_advanced == 1,
+                                        list_has == 1,
+                                        exact,
+                                        advanced
+                                    )
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                reconcile(1, 1, 0, b"a", b"b"),
+                1 | POSTER_KEY_SET | ADVANCED_KEY_SET
+            );
+            assert_eq!(reconcile(1, 1, 0, b"a", b""), 1 | POSTER_KEY_UNSET);
+            assert_eq!(reconcile(0, 1, 0, b"a", b"b"), POSTER_EMPTY);
+            assert_eq!(reconcile(1, 0, 1, b"a", b"b"), POSTER_FROM_EXACT);
+            for bad in [2u8, u8::MAX] {
+                assert_eq!(reconcile(bad, 0, 0, b"", b""), DECLINE);
+                assert_eq!(reconcile(0, bad, 0, b"", b""), DECLINE);
+                assert_eq!(reconcile(0, 0, bad, b"", b""), DECLINE);
+            }
+        }
+
+        #[test]
+        fn wave27_5_poster_reconcile_pointer_contract() {
+            let call = |exact: *const u8, el, advanced: *const u8, al| unsafe {
+                nntmux_search_poster_reconcile(1, 1, 0, exact, el, advanced, al)
+            };
+            assert_eq!(call(std::ptr::null(), 0, std::ptr::null(), 0), 0);
+            assert_eq!(call(std::ptr::null(), 1, b"a".as_ptr(), 1), DECLINE);
+            assert_eq!(call(b"a".as_ptr(), 1, std::ptr::null(), 1), DECLINE);
+            assert_eq!(call(b"a".as_ptr(), usize::MAX, b"a".as_ptr(), 1), DECLINE);
+            assert_eq!(
+                call(b"a".as_ptr(), MAX_INPUT + 1, b"a".as_ptr(), 1),
+                DECLINE
+            );
+            assert_eq!(call(usize::MAX as *const u8, 2, b"a".as_ptr(), 1), DECLINE);
+        }
+
+        fn field_map(parts: [&[u8]; 4], exact_empty: u8, cap: usize) -> (i32, [usize; 4], Vec<u8>) {
+            let mut lens = [7usize; 4];
+            let mut out = vec![0x5a; cap.max(1)];
+            let rc = unsafe {
+                nntmux_search_field_map(
+                    parts[0].as_ptr(),
+                    parts[0].len(),
+                    parts[1].as_ptr(),
+                    parts[1].len(),
+                    exact_empty,
+                    parts[2].as_ptr(),
+                    parts[2].len(),
+                    parts[3].as_ptr(),
+                    parts[3].len(),
+                    lens.as_mut_ptr(),
+                    out.as_mut_ptr(),
+                    cap,
+                )
+            };
+            (rc, lens, out)
+        }
+
+        #[test]
+        fn wave27_5_search_field_map() {
+            let parts: [&[u8]; 4] = [b"ubuntu", b"iso", b"poster\xff", b"file\0.nzb"];
+            let (rc, lens, out) = field_map(parts, 1, 32);
+            assert_eq!(rc, 25);
+            assert_eq!(lens, [6, 3, 7, 9]);
+            assert_eq!(&out[..25], b"ubuntuisoposter\xfffile\0.nzb");
+            let (rc, lens, out) = field_map(parts, 0, 32);
+            assert_eq!(rc, 18);
+            assert_eq!(lens, [6, 3, 0, 9]);
+            assert_eq!(&out[..18], b"ubuntuisofile\0.nzb");
+            let (rc, lens, _) = field_map([b"", b"", b"", b""], 1, 0);
+            assert_eq!((rc, lens), (0, [0; 4]));
+            let (rc, lens, out) = field_map(parts, 1, 24);
+            assert_eq!((rc, lens), (-25, [7; 4]));
+            assert!(out.iter().all(|b| *b == 0x5a));
+            let (rc, lens, out) = field_map(parts, 2, 32);
+            assert_eq!((rc, lens), (DECLINE, [7; 4]));
+            assert!(out.iter().all(|b| *b == 0x5a));
+        }
+
+        #[test]
+        fn wave27_5_search_field_map_pointer_contract_and_aliasing() {
+            let mut lens = [7usize; 5];
+            let mut out = [0x5au8; 16];
+            let bad_lens = unsafe { (lens.as_mut_ptr() as *mut u8).add(1) } as *mut usize;
+            let call = |s: *const u8, sl, ol: *mut usize, o: *mut u8, cap| unsafe {
+                nntmux_search_field_map(
+                    s,
+                    sl,
+                    b"x".as_ptr(),
+                    1,
+                    1,
+                    b"y".as_ptr(),
+                    1,
+                    b"z".as_ptr(),
+                    1,
+                    ol,
+                    o,
+                    cap,
+                )
+            };
+            let l = lens.as_mut_ptr();
+            let o = out.as_mut_ptr();
+            assert_eq!(call(std::ptr::null(), 1, l, o, 16), DECLINE);
+            assert_eq!(call(b"a".as_ptr(), usize::MAX, l, o, 16), DECLINE);
+            assert_eq!(call(usize::MAX as *const u8, 2, l, o, 16), DECLINE);
+            assert_eq!(call(b"a".as_ptr(), 1, std::ptr::null_mut(), o, 16), DECLINE);
+            assert_eq!(call(b"a".as_ptr(), 1, bad_lens, o, 16), DECLINE);
+            assert_eq!(
+                call(b"a".as_ptr(), 1, (usize::MAX - 7) as *mut usize, o, 16),
+                DECLINE
+            );
+            assert_eq!(call(b"a".as_ptr(), 1, l, std::ptr::null_mut(), 16), DECLINE);
+            assert_eq!(call(b"a".as_ptr(), 1, l, o, usize::MAX), DECLINE);
+            assert_eq!(lens, [7; 5]);
+            assert_eq!(out, [0x5a; 16]);
+            assert_eq!(call(b"a".as_ptr(), 1, l, std::ptr::null_mut(), 0), -4);
+            let mut alias = *b"searchXXXXXXXXXX";
+            let rc = unsafe {
+                nntmux_search_field_map(
+                    alias.as_ptr().add(3),
+                    3,
+                    alias.as_ptr(),
+                    3,
+                    1,
+                    b"".as_ptr(),
+                    0,
+                    b"!".as_ptr(),
+                    1,
+                    lens.as_mut_ptr(),
+                    alias.as_mut_ptr(),
+                    alias.len(),
+                )
+            };
+            assert_eq!(rc, 7);
+            assert_eq!(&alias, b"rchsea!XXXXXXXXX");
+            assert_eq!(&lens[..4], &[3, 3, 0, 1]);
+        }
+
+        #[test]
+        fn wave27_5_content_admin_and_page_mode() {
+            for role in [-1i64, 0, 1, 2, 3, 4, 5, i64::MIN, i64::MAX] {
+                assert_eq!(
+                    nntmux_content_controller_is_admin(role, 2, 4),
+                    i32::from(role == 2 || role == 4)
+                );
+            }
+            let mode = |id: i64, page: &[u8]| unsafe {
+                nntmux_content_controller_page_mode(id, page.as_ptr(), page.len())
+            };
+            assert_eq!(mode(0, b"content"), PAGE_LISTING);
+            assert_eq!(mode(0, b"Content"), PAGE_FRONT);
+            assert_eq!(mode(0, b""), PAGE_FRONT);
+            assert_eq!(mode(0, b"content "), PAGE_FRONT);
+            assert_eq!(mode(5, b"content"), PAGE_BY_ID);
+            assert_eq!(mode(-5, b"x"), PAGE_BY_ID);
+            assert_eq!(mode(i64::MIN, b"0"), PAGE_BY_ID);
+            assert_eq!(mode(5, b""), PAGE_FRONT);
+            assert_eq!(
+                unsafe { nntmux_content_controller_page_mode(0, std::ptr::null(), 0) },
+                PAGE_FRONT
+            );
+            assert_eq!(
+                unsafe { nntmux_content_controller_page_mode(0, std::ptr::null(), 1) },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe { nntmux_content_controller_page_mode(0, b"x".as_ptr(), usize::MAX) },
+                DECLINE
+            );
+        }
+
+        fn meta(mode: u32, mask: u32, parts: [&[u8]; 3], cap: usize) -> (i32, [usize; 3], Vec<u8>) {
+            let mut lens = [7usize; 3];
+            let mut out = vec![0x5a; cap.max(1)];
+            let rc = unsafe {
+                nntmux_content_controller_page_meta(
+                    mode,
+                    mask,
+                    parts[0].as_ptr(),
+                    parts[0].len(),
+                    parts[1].as_ptr(),
+                    parts[1].len(),
+                    parts[2].as_ptr(),
+                    parts[2].len(),
+                    lens.as_mut_ptr(),
+                    out.as_mut_ptr(),
+                    cap,
+                )
+            };
+            (rc, lens, out)
+        }
+
+        #[test]
+        fn wave27_5_content_page_meta() {
+            let defaults = b"Contents pagecontentsThis is the contents page.";
+            for mode in [0, 1] {
+                let (rc, lens, out) = meta(mode, 7, [b"T", b"K", b"D"], 64);
+                assert_eq!(rc, 47);
+                assert_eq!(lens, [13, 8, 26]);
+                assert_eq!(&out[..47], defaults);
+            }
+            let (rc, lens, out) = meta(2, 0, [b"T", b"K", b"D"], 64);
+            assert_eq!((rc, lens), (47, [13, 8, 26]));
+            assert_eq!(&out[..47], defaults);
+            let (rc, lens, out) = meta(2, 7, [b" Home ", b"", b"desc"], 64);
+            assert_eq!((rc, lens), (10, [6, 0, 4]));
+            assert_eq!(&out[..10], b" Home desc");
+            for blank in [&b""[..], b" ", b"\t\n\r\0\x0b "] {
+                let (rc, lens, _) = meta(2, 1, [blank, b"", b""], 64);
+                assert_eq!((rc, lens), (47, [13, 8, 26]));
+            }
+            let (_, lens, _) = meta(2, 1, [b"\x0c", b"", b""], 64);
+            assert_eq!(lens[0], 1);
+            let (rc, lens, out) = meta(2, 7, [b"abc", b"de", b"f"], 5);
+            assert_eq!((rc, lens), (-6, [7; 3]));
+            assert!(out.iter().all(|b| *b == 0x5a));
+            for (mode, mask) in [(3, 0), (u32::MAX, 0), (2, 8), (0, u32::MAX)] {
+                let (rc, lens, out) = meta(mode, mask, [b"", b"", b""], 64);
+                assert_eq!((rc, lens), (DECLINE, [7; 3]));
+                assert!(out.iter().all(|b| *b == 0x5a));
+            }
+            let mut lens = [7usize; 4];
+            let bad_lens = unsafe { (lens.as_mut_ptr() as *mut u8).add(1) } as *mut usize;
+            let mut out = [0u8; 64];
+            let call = |t: *const u8, tl, ol: *mut usize, o: *mut u8, cap| unsafe {
+                nntmux_content_controller_page_meta(
+                    2,
+                    7,
+                    t,
+                    tl,
+                    b"k".as_ptr(),
+                    1,
+                    b"d".as_ptr(),
+                    1,
+                    ol,
+                    o,
+                    cap,
+                )
+            };
+            assert_eq!(
+                call(std::ptr::null(), 1, lens.as_mut_ptr(), out.as_mut_ptr(), 64),
+                DECLINE
+            );
+            assert_eq!(
+                call(
+                    b"t".as_ptr(),
+                    usize::MAX,
+                    lens.as_mut_ptr(),
+                    out.as_mut_ptr(),
+                    64
+                ),
+                DECLINE
+            );
+            assert_eq!(
+                call(b"t".as_ptr(), 1, bad_lens, out.as_mut_ptr(), 64),
+                DECLINE
+            );
+            assert_eq!(
+                call(b"t".as_ptr(), 1, std::ptr::null_mut(), out.as_mut_ptr(), 64),
+                DECLINE
+            );
+            assert_eq!(
+                call(
+                    b"t".as_ptr(),
+                    1,
+                    lens.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                    64
+                ),
+                DECLINE
+            );
+            assert_eq!(
+                call(
+                    b"t".as_ptr(),
+                    1,
+                    lens.as_mut_ptr(),
+                    out.as_mut_ptr(),
+                    usize::MAX
+                ),
+                DECLINE
+            );
+            assert_eq!(lens, [7; 4]);
+            assert_eq!(
+                call(b"t".as_ptr(), 1, lens.as_mut_ptr(), std::ptr::null_mut(), 0),
+                -3
+            );
+        }
+
+        #[test]
+        fn wave27_5_watchlist_post_gate() {
+            let gate = |action: &[u8], is_post: u8| unsafe {
+                nntmux_watchlist_post_gate(action.as_ptr(), action.len(), is_post)
+            };
+            for action in [&b"delete"[..], b"doadd", b"doedit"] {
+                assert_eq!(gate(action, 0), 1);
+                assert_eq!(gate(action, 1), 0);
+            }
+            for action in [
+                &b""[..],
+                b"add",
+                b"edit",
+                b"browse",
+                b"Delete",
+                b"delete ",
+                b"doadd\0",
+            ] {
+                assert_eq!(gate(action, 0), 0);
+                assert_eq!(gate(action, 1), 0);
+            }
+            assert_eq!(gate(b"delete", 2), DECLINE);
+            assert_eq!(
+                unsafe { nntmux_watchlist_post_gate(std::ptr::null(), 0, 0) },
+                0
+            );
+            assert_eq!(
+                unsafe { nntmux_watchlist_post_gate(std::ptr::null(), 6, 0) },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe { nntmux_watchlist_post_gate(b"x".as_ptr(), usize::MAX, 0) },
+                DECLINE
+            );
+        }
+
+        fn selected(mode: u32, field: &[u8], cap: usize) -> (i32, Vec<usize>) {
+            let mut lens = vec![7usize; cap.max(1)];
+            let rc = unsafe {
+                nntmux_watchlist_selected_categories(
+                    mode,
+                    field.as_ptr(),
+                    field.len(),
+                    lens.as_mut_ptr(),
+                    cap,
+                )
+            };
+            (rc, lens)
+        }
+
+        #[test]
+        fn wave27_5_watchlist_selected_categories() {
+            assert_eq!(selected(0, b"5010|5020", 4), (0, vec![7; 4]));
+            assert_eq!(selected(1, b"5010|5020", 4).0, 2);
+            assert_eq!(&selected(1, b"5010|5020", 4).1[..2], &[4, 4]);
+            assert_eq!(selected(1, b"", 1), (1, vec![0]));
+            assert_eq!(selected(1, b"0", 1), (1, vec![1]));
+            assert_eq!(selected(2, b"", 1), (0, vec![7]));
+            assert_eq!(selected(2, b"0", 1), (0, vec![7]));
+            assert_eq!(selected(2, b"00", 1), (1, vec![2]));
+            assert_eq!(&selected(2, b"|a||bc|", 5).1[..], &[0, 1, 0, 2, 0]);
+            assert_eq!(selected(1, b"a|b|c", 2), (-3, vec![7, 7]));
+            assert_eq!(selected(1, b"a|b|c", 0).0, -3);
+            assert_eq!(selected(3, b"a", 1), (DECLINE, vec![7]));
+            let mut raw = [0u64; 3];
+            let bad = unsafe { (raw.as_mut_ptr() as *mut u8).add(1) } as *mut usize;
+            let mut lens = [7usize; 2];
+            let call = |f: *const u8, fl, l: *mut usize, cap| unsafe {
+                nntmux_watchlist_selected_categories(1, f, fl, l, cap)
+            };
+            assert_eq!(call(b"a".as_ptr(), 1, bad, 1), DECLINE);
+            assert_eq!(call(b"a".as_ptr(), 1, std::ptr::null_mut(), 1), DECLINE);
+            assert_eq!(
+                call(b"a".as_ptr(), 1, lens.as_mut_ptr(), usize::MAX),
+                DECLINE
+            );
+            assert_eq!(
+                call(b"a".as_ptr(), 1, (usize::MAX - 7) as *mut usize, 1),
+                DECLINE
+            );
+            assert_eq!(call(std::ptr::null(), 1, lens.as_mut_ptr(), 2), DECLINE);
+            assert_eq!(
+                call(b"a".as_ptr(), usize::MAX, lens.as_mut_ptr(), 2),
+                DECLINE
+            );
+            assert_eq!(
+                call(b"a".as_ptr(), MAX_INPUT + 1, lens.as_mut_ptr(), 2),
+                DECLINE
+            );
+            assert_eq!(raw, [0; 3]);
+            assert_eq!(lens, [7; 2]);
+            assert_eq!(call(std::ptr::null(), 0, lens.as_mut_ptr(), 2), 1);
+            assert_eq!(lens, [0, 7]);
+        }
+
+        #[test]
+        fn wave27_5_release_report_attributes() {
+            let attrs = |reason: &[u8], has: u8, description: &[u8], cap: usize| {
+                let mut lens = [7usize; 3];
+                let mut out = vec![0x5a; cap.max(1)];
+                let rc = unsafe {
+                    nntmux_release_report_attributes(
+                        reason.as_ptr(),
+                        reason.len(),
+                        has,
+                        description.as_ptr(),
+                        description.len(),
+                        lens.as_mut_ptr(),
+                        out.as_mut_ptr(),
+                        cap,
+                    )
+                };
+                (rc, lens, out)
+            };
+            let (rc, lens, out) = attrs(b"spam", 1, b"d\xff\0", 32);
+            assert_eq!((rc, lens), (14, [4, 3, 7]));
+            assert_eq!(&out[..14], b"spamd\xff\0pending");
+            let (rc, lens, out) = attrs(b"spam", 0, b"ignored", 32);
+            assert_eq!((rc, lens), (11, [4, 0, 7]));
+            assert_eq!(&out[..11], b"spampending");
+            let (rc, lens, out) = attrs(b"spam", 1, b"", 10);
+            assert_eq!((rc, lens), (-11, [7; 3]));
+            assert!(out.iter().all(|b| *b == 0x5a));
+            let (rc, lens, _) = attrs(b"spam", 2, b"", 32);
+            assert_eq!((rc, lens), (DECLINE, [7; 3]));
+            let mut lens = [7usize; 4];
+            let bad = unsafe { (lens.as_mut_ptr() as *mut u8).add(1) } as *mut usize;
+            let mut out = [0u8; 32];
+            let call = |r: *const u8, rl, d: *const u8, dl, l: *mut usize, o: *mut u8, cap| unsafe {
+                nntmux_release_report_attributes(r, rl, 1, d, dl, l, o, cap)
+            };
+            let (l, o) = (lens.as_mut_ptr(), out.as_mut_ptr());
+            assert_eq!(
+                call(std::ptr::null(), 1, b"d".as_ptr(), 1, l, o, 32),
+                DECLINE
+            );
+            assert_eq!(
+                call(b"r".as_ptr(), 1, std::ptr::null(), 1, l, o, 32),
+                DECLINE
+            );
+            assert_eq!(
+                call(b"r".as_ptr(), usize::MAX, b"d".as_ptr(), 1, l, o, 32),
+                DECLINE
+            );
+            assert_eq!(
+                call(b"r".as_ptr(), 1, usize::MAX as *const u8, 2, l, o, 32),
+                DECLINE
+            );
+            assert_eq!(
+                call(b"r".as_ptr(), 1, b"d".as_ptr(), 1, bad, o, 32),
+                DECLINE
+            );
+            assert_eq!(
+                call(
+                    b"r".as_ptr(),
+                    1,
+                    b"d".as_ptr(),
+                    1,
+                    std::ptr::null_mut(),
+                    o,
+                    32
+                ),
+                DECLINE
+            );
+            assert_eq!(
+                call(
+                    b"r".as_ptr(),
+                    1,
+                    b"d".as_ptr(),
+                    1,
+                    l,
+                    std::ptr::null_mut(),
+                    32
+                ),
+                DECLINE
+            );
+            assert_eq!(
+                call(b"r".as_ptr(), 1, b"d".as_ptr(), 1, l, o, usize::MAX),
+                DECLINE
+            );
+            assert_eq!(lens, [7; 4]);
+            assert_eq!(out, [0; 32]);
+            let mut alias = *b"reasondescXXXXXXXXXX";
+            let rc = unsafe {
+                nntmux_release_report_attributes(
+                    alias.as_ptr().add(6),
+                    4,
+                    1,
+                    alias.as_ptr(),
+                    6,
+                    lens.as_mut_ptr(),
+                    alias.as_mut_ptr(),
+                    alias.len(),
+                )
+            };
+            assert_eq!(rc, 17);
+            assert_eq!(&alias, b"descreasonpendingXXX");
+            assert_eq!(&lens[..3], &[4, 6, 7]);
+        }
+
+        #[test]
+        fn wave27_5_release_report_response() {
+            for (outcome, (status, success, message)) in REPORT_RESPONSES.iter().enumerate() {
+                let mut meta = [7i32; 2];
+                let mut out = [0x5au8; 96];
+                let rc = unsafe {
+                    nntmux_release_report_response(
+                        outcome as u32,
+                        meta.as_mut_ptr(),
+                        out.as_mut_ptr(),
+                        out.len(),
+                    )
+                };
+                assert_eq!(rc, message.len() as i32);
+                assert_eq!(meta, [*status, *success]);
+                assert_eq!(&out[..message.len()], *message);
+                let mut small = [0x5au8; 4];
+                let rc = unsafe {
+                    nntmux_release_report_response(
+                        outcome as u32,
+                        meta.as_mut_ptr(),
+                        small.as_mut_ptr(),
+                        4,
+                    )
+                };
+                assert_eq!(rc, -(message.len() as i32));
+                assert_eq!(small, [0x5a; 4]);
+            }
+            let mut meta = [7i32; 3];
+            let mut out = [0x5au8; 96];
+            let bad = unsafe { (meta.as_mut_ptr() as *mut u8).add(1) } as *mut i32;
+            let call = |outcome, m: *mut i32, o: *mut u8, cap| unsafe {
+                nntmux_release_report_response(outcome, m, o, cap)
+            };
+            let (m, o) = (meta.as_mut_ptr(), out.as_mut_ptr());
+            assert_eq!(call(3, m, o, 96), DECLINE);
+            assert_eq!(call(u32::MAX, m, o, 96), DECLINE);
+            assert_eq!(call(0, std::ptr::null_mut(), o, 96), DECLINE);
+            assert_eq!(call(0, bad, o, 96), DECLINE);
+            assert_eq!(call(0, (usize::MAX - 3) as *mut i32, o, 96), DECLINE);
+            assert_eq!(call(0, m, std::ptr::null_mut(), 96), DECLINE);
+            assert_eq!(call(0, m, o, usize::MAX), DECLINE);
+            assert_eq!(meta, [7; 3]);
+            assert_eq!(out, [0x5a; 96]);
+            assert_eq!(call(1, m, std::ptr::null_mut(), 0), -39);
+        }
+    }
+}
