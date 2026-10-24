@@ -5076,6 +5076,110 @@ fn root_xxx(name: &[u8], poster: &[u8], flags: u32) -> i64 {
     categorize_xxx(&Subject::new(name), &Subject::aux(poster), flags)
 }
 
+/// Pipeline additions to the individual categorizer encoding: bits 48..55 identify the pipe
+/// in priority order (Misc=0, GroupName=1, XXX=2, TV=3, Movie=4, PC=5, Console=6,
+/// Music=7, Book=8, MiscSafetyNet=9); bit 56 records the misc lock. Zero is no match.
+const PIPELINE_MISC_LOCK: i64 = 1 << 56;
+
+fn pipeline_update(best: &mut i64, result: i64, pipe: u8) {
+    let confidence = (result >> 16) & 0xffff;
+    if result <= 0 || confidence == 0 {
+        return;
+    }
+    let category = result & 0xffff;
+    let best_category = if *best == 0 { 10 } else { *best & 0xffff };
+    let best_confidence = (*best >> 16) & 0xffff;
+    // CategorizationResult::shouldOverride: protected misc resists weak non-misc results.
+    if category != 10 && category != 20 && (*best & PIPELINE_MISC_LOCK != 0) && confidence < 600 {
+        return;
+    }
+    if confidence > best_confidence
+        || (confidence == best_confidence && category != 10 && best_category == 10)
+    {
+        *best = result | (i64::from(pipe) << 48);
+    }
+}
+
+fn root_pipeline(name: &[u8], group: &[u8], poster: &[u8], flags: u32) -> i64 {
+    // MiscPipe always runs first, before any DFA work. Hash/gibberish locks are final even
+    // below the usual 0.95 confidence threshold, including OTHER_MISC obfuscated_pattern.
+    let (category, centi, rule, _, low_signal, _) = misc_inspect_and_categorize(name);
+    let mut best = if centi == 0 {
+        NO_MATCH
+    } else {
+        hit(u16::from(rule), category, u16::from(centi) * 10)
+    };
+    if centi > 0 && (category == 20 || (1..=16).contains(&rule)) {
+        return best | PIPELINE_MISC_LOCK;
+    }
+
+    // One subject/ScanCache lookup per input, shared by all skip checks and categorizers.
+    let n = Subject::new(name);
+    let g = Subject::aux(group);
+    let p = Subject::aux(poster);
+    // This is the actual createDefault() order, not the individual domain ABI numbering.
+    for pipe in 1..=8 {
+        if (best >> 16) & 0xffff >= 950 {
+            break;
+        }
+        let result = match pipe {
+            1 => categorize_group_name(&g),
+            2 => categorize_xxx(&n, &p, flags),
+            3 if !has_adult_markers(&n) => categorize_tv(&n, &g, &p, flags),
+            4 if !movie_should_skip(&n) => categorize_movie(&n, flags),
+            5 if !pc_should_skip(&n) => categorize_pc(&n, &p),
+            6 if !console_should_skip(&n) => categorize_console(&n),
+            7 if !music_should_skip(&n) => categorize_music(&n, flags),
+            8 if !book_should_skip(&n) => categorize_book(&n),
+            _ => NO_MATCH,
+        };
+        if result < 0 {
+            return -1;
+        }
+        pipeline_update(&mut best, result, pipe);
+    }
+    // MiscSafetyNetPipe runs even when ordinary pipes would stop processing. Only a
+    // group-based winner can be downgraded; a higher-confidence content result survives.
+    if low_signal && best != 0 && ((best >> 48) & 0xff) == 1 {
+        return hit(0, 10, 650) | (9 << 48) | PIPELINE_MISC_LOCK;
+    }
+    best
+}
+
+/// Fused default CategorizationPipeline dispatcher. The last argument uses the existing
+/// categorizer flags: bit 0 = categorizeForeign, bit 1 = catWebDL. No database/custom rules
+/// are used by the default pipes; callers with modified pipes must use their PHP pipeline.
+/// Returns the packed winner described above, zero for no match, or -1 on any engine decline.
+///
+/// # Safety
+/// Every non-null pointer must be valid for its length. Null with nonzero length is declined.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_categorize_pipeline(
+    release_name: *const u8,
+    release_len: usize,
+    group_name: *const u8,
+    group_len: usize,
+    poster: *const u8,
+    poster_len: usize,
+    flags: u32,
+) -> i64 {
+    if (release_name.is_null() && release_len != 0)
+        || (group_name.is_null() && group_len != 0)
+        || (poster.is_null() && poster_len != 0)
+        || flags & !(FLAG_FOREIGN | FLAG_WEBDL) != 0
+    {
+        return -1;
+    }
+    let (name, group, poster) = unsafe {
+        (
+            raw_bytes(release_name, release_len),
+            raw_bytes(group_name, group_len),
+            raw_bytes(poster, poster_len),
+        )
+    };
+    guarded(|| root_pipeline(name, group, poster, flags))
+}
+
 /// `GroupNameCategorizer::categorize`.
 ///
 /// # Safety
@@ -5273,6 +5377,63 @@ pub unsafe extern "C" fn nntmux_categorize_rule_name(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pipeline_confidence_ties_and_early_exit() {
+        let mut best = hit(17, 10, 500);
+        pipeline_update(&mut best, hit(0, cat::BOOKS_EBOOK, 500), 8);
+        assert_eq!(best, hit(0, cat::BOOKS_EBOOK, 500) | (8 << 48));
+        pipeline_update(&mut best, hit(0, cat::TV_OTHER, 500), 3);
+        assert_eq!(best & 0xffff, i64::from(cat::BOOKS_EBOOK));
+        pipeline_update(&mut best, NO_MATCH, 1);
+        assert_eq!(best & 0xffff, i64::from(cat::BOOKS_EBOOK));
+
+        let result = guarded(|| {
+            root_pipeline(
+                b"PC.Game.Audiobook.Unabridged.M4B",
+                b"",
+                b"",
+                FLAG_FOREIGN | FLAG_WEBDL,
+            )
+        });
+        assert_eq!(result & 0xffff, i64::from(cat::MUSIC_AUDIOBOOK));
+        assert_eq!((result >> 48) & 0xff, 7, "0.9 must not stop Music");
+        let result = guarded(|| {
+            root_pipeline(
+                b"PC.Game.Audiobook.Unabridged.M4B",
+                b"",
+                b"poster@animetosho.org",
+                FLAG_FOREIGN | FLAG_WEBDL,
+            )
+        });
+        assert_eq!(result & 0xffff, i64::from(cat::TV_ANIME));
+        assert_eq!((result >> 16) & 0xffff, 980);
+    }
+
+    #[test]
+    fn pipeline_misc_lock_safety_net_and_engine_decline() {
+        let result =
+            guarded(|| root_pipeline(b"ABCDEFGH1234567890XY", b"alt.binaries.anime", b"", 3));
+        assert_eq!(result & 0xffff, 20);
+        assert_eq!((result >> 16) & 0xffff, 700);
+        assert_ne!(result & PIPELINE_MISC_LOCK, 0);
+        let result = guarded(|| root_pipeline(b"abcdefghijklm", b"alt.binaries.movies", b"", 3));
+        assert_eq!(result & 0xffff, 10);
+        assert_eq!((result >> 48) & 0xff, 9);
+        assert_eq!((result >> 16) & 0xffff, 650);
+        assert_ne!(result & PIPELINE_MISC_LOCK, 0);
+
+        // No partial winner may escape when any shared regex engine aborts.
+        let result = guarded(|| {
+            MATCH_ABORTED.with(|c| c.set(true));
+            root_pipeline(b"Ordinary Release Title", b"alt.binaries.movies", b"", 3)
+        });
+        assert_eq!(result, -1);
+        assert!(
+            guarded(|| root_pipeline(b"Ordinary Release Title", b"alt.binaries.movies", b"", 3))
+                > 0
+        );
+    }
 
     #[test]
     fn test_hashed_names_detection() {
