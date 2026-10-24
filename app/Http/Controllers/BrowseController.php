@@ -7,11 +7,118 @@ namespace App\Http\Controllers;
 use App\Models\Category;
 use App\Models\RootCategory;
 use App\Services\Releases\ReleaseBrowseService;
+use App\Support\RustPipelineLibrary;
 use Illuminate\Http\Request;
 use Illuminate\Pagination\LengthAwarePaginator;
 
 class BrowseController extends BasePageController
 {
+    // Keep PHP as the production default until the Rust performance gate passes.
+    private static bool $useRustFfi = false;
+
+    public static function setUseRustFfi(?bool $useRustFfi): void
+    {
+        self::$useRustFfi = $useRustFfi ?? false;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    public const string FFI_CDEF = 'int32_t nntmux_w27_browse_nfo_contact_status_controllers(uint32_t operation,const char *input,size_t length,char *output,size_t capacity);';
+
+    public static function resolveCategoryId(string $id, ?int $parentId, ?int $categoryId): int
+    {
+        return self::$useRustFfi ? self::resolveCategoryIdNative($id, $parentId, $categoryId) : self::resolveCategoryIdPhp($id, $parentId, $categoryId);
+    }
+
+    public static function resolveCategoryIdPhp(string $id, ?int $parentId, ?int $categoryId): int
+    {
+        return $id === 'All' ? ($parentId ?? -1) : ($categoryId ?? -1);
+    }
+
+    public static function resolveCategoryIdNative(string $id, ?int $parentId, ?int $categoryId): int
+    {
+        $result = self::transformNative(0, [$id, $parentId, $categoryId]);
+
+        return is_int($result) ? $result : self::resolveCategoryIdPhp($id, $parentId, $categoryId);
+    }
+
+    /** @param list<mixed> $args */
+    public static function transformNative(int $operation, array $args): mixed
+    {
+        try {
+            $budget = 67108864;
+            $nodes = 100000;
+            if (! array_is_list($args) || ! self::validWireValue($args, 0, $budget, $nodes)) {
+                return null;
+            }
+            $input = serialize($args);
+            if (strlen($input) > 67108864) {
+                return null;
+            }
+            $ffi = RustPipelineLibrary::resolveDomain('w27-browse-nfo-contact-status-controllers', self::FFI_CDEF, getenv('NNTMUX_PIPELINE_FFI_LIB') ?: null);
+            if ($ffi === null) {
+                return null;
+            }
+            $capacity = 0;
+            $output = RustPipelineLibrary::obtainScratch($ffi, min(67108864, max(256, strlen($input) + 256)), $capacity);
+            if ($output === null) {
+                return null;
+            }
+            $capacity = min($capacity, 67108864);
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w27_browse_nfo_contact_status_controllers($operation, $input, strlen($input), $output, $capacity);
+            if (is_int($written) && $written < -1 && -$written > $capacity && -$written <= 67108864) {
+                $output = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($output === null) {
+                    return null;
+                }
+                $capacity = min($capacity, 67108864);
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w27_browse_nfo_contact_status_controllers($operation, $input, strlen($input), $output, $capacity);
+            }
+            if (! is_int($written) || $written <= 0 || $written > $capacity) {
+                return null;
+            }
+            $wire = \FFI::string($output, $written);
+            $result = @unserialize($wire, ['allowed_classes' => false, 'max_depth' => 32]);
+            $budget = 67108864;
+            $nodes = 100000;
+            if (! self::validWireValue($result, 0, $budget, $nodes) || serialize($result) !== $wire) {
+                return null;
+            }
+
+            return $result;
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    private static function validWireValue(mixed $value, int $depth, int &$budget, int &$nodes): bool
+    {
+        if ($depth > 32 || --$nodes < 0) {
+            return false;
+        }
+        if (is_array($value)) {
+            foreach ($value as $key => $item) {
+                if (\ReflectionReference::fromArrayElement($value, $key) !== null || ! self::validWireValue($key, $depth + 1, $budget, $nodes) || ! self::validWireValue($item, $depth + 1, $budget, $nodes)) {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+        if (is_string($value)) {
+            $budget -= strlen($value);
+
+            return $budget >= 0;
+        }
+
+        return $value === null || is_int($value) || is_bool($value);
+    }
+
     private ReleaseBrowseService $releaseBrowseService;
 
     public function __construct(ReleaseBrowseService $releaseBrowseService)
@@ -55,13 +162,12 @@ class BrowseController extends BasePageController
         $parentIdValue = RootCategory::query()->where('title', $parentCategory)->value('id');
         $parentId = $parentIdValue === null ? null : (int) $parentIdValue;
 
-        $query = Category::query()->where('title', $id)->where('root_categories_id', $parentId);
+        $categoryId = null;
         if ($id !== 'All') {
-            $cat = $query->first();
-            $category = $cat !== null ? (int) $cat->id : -1;
-        } else {
-            $category = $parentId ?? -1;
+            $cat = Category::query()->where('title', $id)->where('root_categories_id', $parentId)->first();
+            $categoryId = $cat !== null ? (int) $cat->id : null;
         }
+        $category = self::resolveCategoryId($id, $parentId, $categoryId);
 
         $grp = -1;
 
