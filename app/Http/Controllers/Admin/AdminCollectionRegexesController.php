@@ -45,28 +45,19 @@ class AdminCollectionRegexesController extends BasePageController
     {
         $this->setAdminPrefs();
         $regexes = new RegexService('collection_regexes');
-        $error = '';
-        $regex = ['id' => '', 'regex' => '', 'description' => '', 'group_regex' => '', 'ordinal' => '', 'status' => 1];
+        $regex = self::defaultRegex();
         $meta_title = $title = 'Collections Regex';
 
-        switch ($this->formAction($request)) {
+        $action = $this->formAction($request);
+        $state = self::validateForm($action, $request->all());
+        $error = $state['error'];
+
+        switch ($action) {
             case 'submit':
-                if (empty($request->input('group_regex'))) {
-                    $error = 'Group regex must not be empty!';
-                    break;
+                if (array_key_exists('description', $state['input'])) {
+                    $request->merge(['description' => $state['input']['description']]);
                 }
-
-                if (empty($request->input('regex'))) {
-                    $error = 'Regex cannot be empty';
-                    break;
-                }
-
-                if (empty($request->input('description'))) {
-                    $request->merge(['description' => '']);
-                }
-
-                if (! is_numeric($request->input('ordinal')) || $request->input('ordinal') < 0) {
-                    $error = 'Ordinal must be a number, 0 or higher.';
+                if ($error !== '') {
                     break;
                 }
 
@@ -82,7 +73,7 @@ class AdminCollectionRegexesController extends BasePageController
             default:
                 if ($request->has('id')) {
                     $meta_title = $title = 'Collections Regex Edit';
-                    $id = filter_var($request->input('id'), FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+                    $id = $state['id'];
                     if ($id === false) {
                         abort(404);
                     }
@@ -115,9 +106,10 @@ class AdminCollectionRegexesController extends BasePageController
         $this->setAdminPrefs();
         $meta_title = $title = 'Collections Regex Test';
 
-        $group = trim($request->has('group') && ! empty($request->input('group')) ? $request->input('group') : '');
-        $regex = trim($request->has('regex') && ! empty($request->input('regex')) ? $request->input('regex') : '');
-        $limit = ($request->has('limit') && is_numeric($request->input('limit')) ? $request->input('limit') : 50);
+        $parameters = self::normalizeTestParameters($request->all());
+        $group = $parameters['group'];
+        $regex = $parameters['regex'];
+        $limit = $parameters['limit'];
 
         $data = null;
         if ($group && $regex) {
@@ -134,5 +126,107 @@ class AdminCollectionRegexesController extends BasePageController
         ]);
 
         return view('admin.regexes.collection-test', $this->viewData);
+    }
+
+    // PHP stays the default until every paired common/p99 benchmark clears 1.5x.
+    private static ?bool $useRustFfi = null;
+
+    public static function setUseRustFfi(?bool $useRustFfi): void
+    {
+        self::$useRustFfi = $useRustFfi;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? false;
+    }
+
+    /** @param array<string, mixed> $input
+     * @return array<string, mixed>
+     */
+    public static function validateForm(string $action, array $input): array
+    {
+        return self::usesRustFfi() ? self::validateFormNative($action, $input) : self::validateFormPhp($action, $input);
+    }
+
+    /** @param array<string, mixed> $input
+     * @return array<string, mixed>
+     */
+    public static function validateFormPhp(string $action, array $input): array
+    {
+        $error = '';
+        $id = null;
+        if ($action === 'submit') {
+            if (empty($input['group_regex'])) {
+                $error = 'Group regex must not be empty!';
+            } elseif (empty($input['regex'])) {
+                $error = 'Regex cannot be empty';
+            } else {
+                if (empty($input['description'])) {
+                    $input['description'] = '';
+                }
+                if (! is_numeric($input['ordinal'] ?? null) || $input['ordinal'] < 0) {
+                    $error = 'Ordinal must be a number, 0 or higher.';
+                }
+            }
+        } elseif (array_key_exists('id', $input)) {
+            $id = filter_var($input['id'], FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+        }
+
+        return ['error' => $error, 'input' => $input, 'id' => $id];
+    }
+
+    /** @param array<string, mixed> $input
+     * @return array<string, mixed>
+     */
+    public static function validateFormNative(string $action, array $input): array
+    {
+        return AdminBlacklistController::wave28Native(4, ['action' => $action, 'input' => $input]) ?? self::validateFormPhp($action, $input);
+    }
+
+    /** @return array<string, mixed> */
+    public static function defaultRegex(): array
+    {
+        return self::usesRustFfi() ? self::defaultRegexNative() : self::defaultRegexPhp();
+    }
+
+    /** @return array<string, mixed> */
+    public static function defaultRegexPhp(): array
+    {
+        return ['id' => '', 'regex' => '', 'description' => '', 'group_regex' => '', 'ordinal' => '', 'status' => 1];
+    }
+
+    /** @return array<string, mixed> */
+    public static function defaultRegexNative(): array
+    {
+        return AdminBlacklistController::wave28Native(5, []) ?? self::defaultRegexPhp();
+    }
+
+    /** @param array<string, mixed> $input
+     * @return array<string, mixed>
+     */
+    public static function normalizeTestParameters(array $input): array
+    {
+        return self::usesRustFfi() ? self::normalizeTestParametersNative($input) : self::normalizeTestParametersPhp($input);
+    }
+
+    /** @param array<string, mixed> $input
+     * @return array<string, mixed>
+     */
+    public static function normalizeTestParametersPhp(array $input): array
+    {
+        return [
+            'group' => trim(! empty($input['group']) ? $input['group'] : ''),
+            'regex' => trim(! empty($input['regex']) ? $input['regex'] : ''),
+            'limit' => is_numeric($input['limit'] ?? null) ? $input['limit'] : 50,
+        ];
+    }
+
+    /** @param array<string, mixed> $input
+     * @return array<string, mixed>
+     */
+    public static function normalizeTestParametersNative(array $input): array
+    {
+        return AdminBlacklistController::wave28Native(6, ['input' => $input]) ?? self::normalizeTestParametersPhp($input);
     }
 }
