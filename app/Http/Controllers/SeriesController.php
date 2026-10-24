@@ -7,14 +7,31 @@ namespace App\Http\Controllers;
 use App\Models\TvEpisode;
 use App\Models\UserSerie;
 use App\Models\Video;
+use App\Services\Api\ApiQueryParameters;
 use App\Services\SeriesReleaseService;
+use App\Support\RustPipelineLibrary;
 use Carbon\Carbon;
+use FFI;
+use FFI\CData;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use Throwable;
 
 class SeriesController extends BasePageController
 {
+    private static FFI|false|null $seriesFfi = null;
+
+    private static ?CData $seriesOutBuf1024 = null;
+
+    private static ?bool $useSeriesRustFfi = null;
+
+    private static bool $adoptGroupSeriesByBucketFfi = true;
+
+    private static bool $adoptClassifyTitleBucketFfi = false;
+
+    private static bool $adoptResolveSeasonFfi = false;
+
     private SeriesReleaseService $seriesReleaseService;
 
     public function __construct(SeriesReleaseService $seriesReleaseService)
@@ -197,20 +214,7 @@ class SeriesController extends BasePageController
             }
 
             $masterserieslist = Video::getSeriesList($this->userdata->id, $letter, $showname);
-
-            $serieslist = [];
-            foreach ($masterserieslist as $s) {
-                if (preg_match('/^[0-9]/', $s['title'])) {
-                    $thisrange = '0-9';
-                } elseif (preg_match('/([A-Z]).*/i', $s['title'], $hits)) {
-                    $thisrange = strtoupper($hits[1]);
-                } else {
-                    // Handle titles that don't start with a letter or number
-                    $thisrange = '#';
-                }
-                $serieslist[$thisrange][] = $s;
-            }
-            ksort($serieslist);
+            $serieslist = $this->groupSeriesByBucket($masterserieslist);
 
             $this->viewData = array_merge($this->viewData, [
                 'serieslist' => $serieslist,
@@ -226,7 +230,235 @@ class SeriesController extends BasePageController
         }
     }
 
-    private function resolveSeason(Request $request): ?int
+    public static function setUseRustFfi(?bool $enabled): void
+    {
+        self::$useSeriesRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useSeriesRustFfi ?? self::$adoptGroupSeriesByBucketFfi;
+    }
+
+    public static function seriesFfi(): ?FFI
+    {
+        return self::$seriesFfi !== null ? (self::$seriesFfi === false ? null : self::$seriesFfi) : self::resolveSeriesFfi();
+    }
+
+    public function classifyTitleBucket(string $title): string
+    {
+        if (self::$useSeriesRustFfi ?? self::$adoptClassifyTitleBucketFfi) {
+            $supported = false;
+            $native = $this->classifyTitleBucketNative($title, $supported);
+            if ($supported && $native !== null) {
+                return $native;
+            }
+        }
+
+        return $this->classifyTitleBucketPhp($title);
+    }
+
+    /**
+     * @param-out bool $supported
+     */
+    public function classifyTitleBucketNative(string $title, bool &$supported = false): ?string
+    {
+        $supported = false;
+        if (self::$useSeriesRustFfi === false) {
+            return null;
+        }
+        $ffi = self::$seriesFfi ?? self::resolveSeriesFfi();
+        if ($ffi === null || $ffi === false) {
+            return null;
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $code = $ffi->nntmux_series_classify_title_bucket($title, \strlen($title));
+            if (! \is_int($code) || $code < 0) {
+                return null;
+            }
+            $supported = true;
+
+            return $code === 48 ? '0-9' : \chr($code);
+        } catch (Throwable) {
+            $supported = false;
+
+            return null;
+        }
+    }
+
+    public function classifyTitleBucketPhp(string $title): string
+    {
+        if (preg_match('/^[0-9]/', $title)) {
+            return '0-9';
+        }
+        if (preg_match('/([A-Z]).*/i', $title, $hits)) {
+            return strtoupper($hits[1]);
+        }
+
+        return '#';
+    }
+
+    /**
+     * @param  array<int|string, mixed>  $masterserieslist
+     * @return array<string, list<mixed>>
+     */
+    public function groupSeriesByBucket(array $masterserieslist): array
+    {
+        if (self::$useSeriesRustFfi ?? self::$adoptGroupSeriesByBucketFfi) {
+            $supported = false;
+            $native = $this->groupSeriesByBucketNative($masterserieslist, $supported);
+            if ($supported && $native !== null) {
+                return $native;
+            }
+        }
+
+        return $this->groupSeriesByBucketPhp($masterserieslist);
+    }
+
+    /**
+     * @param  array<int|string, mixed>  $masterserieslist
+     *
+     * @param-out bool $supported
+     *
+     * @return array<string, list<mixed>>|null
+     */
+    public function groupSeriesByBucketNative(array $masterserieslist, bool &$supported = false): ?array
+    {
+        $supported = false;
+        if (self::$useSeriesRustFfi === false) {
+            return null;
+        }
+        $count = \count($masterserieslist);
+        if ($count === 0) {
+            $supported = true;
+
+            return [];
+        }
+
+        $ffi = self::$seriesFfi ?? self::resolveSeriesFfi();
+        if ($ffi === null || $ffi === false) {
+            return null;
+        }
+
+        $titles = \array_column($masterserieslist, 'title');
+        if (\count($titles) !== $count) {
+            return null;
+        }
+        $joined = \implode("\0", $titles);
+
+        $cap = 1024;
+        $scratch = $count <= 1024 ? self::$seriesOutBuf1024 : RustPipelineLibrary::obtainScratch($ffi, $count, $cap);
+        if ($scratch === null) {
+            return null;
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_series_classify_titles_nul($joined, \strlen($joined), $count, $scratch, $cap);
+            if (! \is_int($written) || $written !== $count) {
+                return null;
+            }
+
+            $codes = FFI::string($scratch, $count);
+            /** @var array<int|string, list<mixed>> $serieslist */
+            $serieslist = [];
+            $idx = 0;
+            foreach ($masterserieslist as $s) {
+                $serieslist[$codes[$idx++]][] = $s;
+            }
+            if (isset($serieslist[0])) {
+                $serieslist['0-9'] = $serieslist[0];
+                unset($serieslist[0]);
+            }
+            /** @var array<string, list<mixed>> $serieslist */
+            \ksort($serieslist);
+            $supported = true;
+
+            return $serieslist;
+        } catch (Throwable) {
+            $supported = false;
+
+            return null;
+        }
+    }
+
+    /**
+     * @param  array<int|string, mixed>  $masterserieslist
+     * @return array<string, list<mixed>>
+     */
+    public function groupSeriesByBucketPhp(array $masterserieslist): array
+    {
+        $serieslist = [];
+        foreach ($masterserieslist as $s) {
+            if (preg_match('/^[0-9]/', $s['title'])) {
+                $thisrange = '0-9';
+            } elseif (preg_match('/([A-Z]).*/i', $s['title'], $hits)) {
+                $thisrange = strtoupper($hits[1]);
+            } else {
+                // Handle titles that don't start with a letter or number
+                $thisrange = '#';
+            }
+            $serieslist[$thisrange][] = $s;
+        }
+        ksort($serieslist);
+
+        return $serieslist;
+    }
+
+    public function resolveSeason(Request $request): ?int
+    {
+        if (self::$useSeriesRustFfi ?? self::$adoptResolveSeasonFfi) {
+            $supported = false;
+            $native = $this->resolveSeasonNative($request, $supported);
+            if ($supported) {
+                return $native;
+            }
+        }
+
+        return $this->resolveSeasonPhp($request);
+    }
+
+    /**
+     * @param-out bool $supported
+     */
+    public function resolveSeasonNative(Request $request, bool &$supported = false): ?int
+    {
+        $supported = false;
+        if (self::$useSeriesRustFfi === false) {
+            return null;
+        }
+
+        $seasonInput = $this->scalarInput($request, 'season');
+        if ($seasonInput === '') {
+            $supported = true;
+
+            return null;
+        }
+
+        $ffi = self::$seriesFfi ?? self::resolveSeriesFfi();
+        if ($ffi === null || $ffi === false) {
+            return null;
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $res = $ffi->nntmux_series_resolve_season($seasonInput, \strlen($seasonInput));
+            if (! \is_int($res) || $res === -1) {
+                return null;
+            }
+            $supported = true;
+
+            return $res === -2 ? null : $res;
+        } catch (Throwable) {
+            $supported = false;
+
+            return null;
+        }
+    }
+
+    public function resolveSeasonPhp(Request $request): ?int
     {
         $seasonInput = $this->scalarInput($request, 'season');
         if ($seasonInput === '' || preg_match('/^\d+$/', $seasonInput) !== 1) {
@@ -234,6 +466,29 @@ class SeriesController extends BasePageController
         }
 
         return (int) $seasonInput;
+    }
+
+    private static function resolveSeriesFfi(): ?FFI
+    {
+        if (self::$seriesFfi !== null) {
+            return self::$seriesFfi === false ? null : self::$seriesFfi;
+        }
+        $ffi = RustPipelineLibrary::resolveDomain('categorize', ApiQueryParameters::FFI_CDEF);
+        if ($ffi === null) {
+            self::$seriesFfi = false;
+
+            return null;
+        }
+        try {
+            self::$seriesOutBuf1024 = $ffi->new('char[1024]');
+            self::$seriesFfi = $ffi;
+
+            return $ffi;
+        } catch (Throwable) {
+            self::$seriesFfi = false;
+
+            return null;
+        }
     }
 
     /**
