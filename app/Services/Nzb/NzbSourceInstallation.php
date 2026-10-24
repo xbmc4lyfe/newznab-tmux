@@ -12,6 +12,13 @@ use Throwable;
 /** A retained descriptor prevents the installed inode being reused before cleanup. */
 final class NzbSourceInstallation
 {
+    public const string FFI_CDEF = DirectorySyncBridge::FFI_CDEF;
+
+    /** Rust stays opt-in: the JSON FFI round trip is slower than this PHP helper (< 1.5x). */
+    private const bool RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useRustFfi = null;
+
     /** @var resource|null */
     private mixed $handle;
 
@@ -38,8 +45,62 @@ final class NzbSourceInstallation
     ) {
         $this->handle = $handle;
         if ($staged !== null) {
-            self::$pendingStaged[$staged] = $pdo;
+            self::$pendingStaged[self::normalizeSourcePathPair($path, $staged)['destination']] = $pdo;
         }
+    }
+
+    public static function setUseRustFfi(?bool $use): void
+    {
+        self::$useRustFfi = $use;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? self::RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * An installation's canonical source and the path its new generation waits at: staged when they differ,
+     * sibling when both name entries of the same directory (as an in-place upgrade's generation must).
+     *
+     * @return array{source: string, destination: string, staged: bool, sibling: bool}
+     */
+    public static function normalizeSourcePathPair(string $sourcePath, string $destinationPath): array
+    {
+        return self::usesRustFfi()
+            ? self::normalizeSourcePathPairNative($sourcePath, $destinationPath)
+            : self::normalizeSourcePathPairPhp($sourcePath, $destinationPath);
+    }
+
+    /** @return array{source: string, destination: string, staged: bool, sibling: bool} */
+    public static function normalizeSourcePathPairPhp(string $sourcePath, string $destinationPath): array
+    {
+        $parent = static function (string $path): string {
+            $slash = strrpos($path, '/');
+
+            return $slash === false ? '' : substr($path, 0, $slash + 1);
+        };
+
+        return [
+            'source' => $sourcePath,
+            'destination' => $destinationPath,
+            'staged' => $destinationPath !== $sourcePath,
+            'sibling' => $sourcePath !== '' && $destinationPath !== '' && $parent($sourcePath) === $parent($destinationPath),
+        ];
+    }
+
+    /** @return array{source: string, destination: string, staged: bool, sibling: bool} */
+    public static function normalizeSourcePathPairNative(string $sourcePath, string $destinationPath): array
+    {
+        if (DirectorySyncBridge::transformNative(1, [$sourcePath, $destinationPath], $result) && \is_array($result)
+            && array_keys($result) === ['source', 'destination', 'staged', 'sibling']
+            && $result['source'] === $sourcePath && $result['destination'] === $destinationPath
+            && \is_bool($result['staged']) && \is_bool($result['sibling'])) {
+            /** @var array{source: string, destination: string, staged: bool, sibling: bool} $result */
+            return $result;
+        }
+
+        return self::normalizeSourcePathPairPhp($sourcePath, $destinationPath);
     }
 
     /**

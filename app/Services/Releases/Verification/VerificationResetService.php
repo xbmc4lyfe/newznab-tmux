@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services\Releases\Verification;
 
 use App\Models\Release;
+use App\Services\Nzb\DirectorySyncBridge;
 use App\Services\Nzb\NzbSourceGuard;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
@@ -13,6 +14,101 @@ use RuntimeException;
 
 final class VerificationResetService
 {
+    public const string FFI_CDEF = DirectorySyncBridge::FFI_CDEF;
+
+    /** Rust stays opt-in: the JSON FFI round trip is slower than these PHP helpers (< 1.5x). */
+    private const bool RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useRustFfi = null;
+
+    public static function setUseRustFfi(?bool $use): void
+    {
+        self::$useRustFfi = $use;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? self::RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * The shape of a scratch record a reset retains for another host, marked terminal: an audit record names
+     * no candidate, the unsigned version never goes negative, and an empty delete GUID names nothing.
+     *
+     * @return array{host: string, candidate_id: ?int, version: int, audit_release_id: ?int, terminal: true, delete_guid: ?string}
+     */
+    public static function buildTerminalScratchRecord(int $candidateId, int $version, string $host, ?int $auditReleaseId, ?string $deleteGuid): array
+    {
+        return self::usesRustFfi()
+            ? self::buildTerminalScratchRecordNative($candidateId, $version, $host, $auditReleaseId, $deleteGuid)
+            : self::buildTerminalScratchRecordPhp($candidateId, $version, $host, $auditReleaseId, $deleteGuid);
+    }
+
+    /** @return array{host: string, candidate_id: ?int, version: int, audit_release_id: ?int, terminal: true, delete_guid: ?string} */
+    public static function buildTerminalScratchRecordPhp(int $candidateId, int $version, string $host, ?int $auditReleaseId, ?string $deleteGuid): array
+    {
+        return [
+            'host' => $host,
+            'candidate_id' => $auditReleaseId === null ? $candidateId : null,
+            'version' => max(0, $version),
+            'audit_release_id' => $auditReleaseId,
+            'terminal' => true,
+            'delete_guid' => $deleteGuid === '' ? null : $deleteGuid,
+        ];
+    }
+
+    /** @return array{host: string, candidate_id: ?int, version: int, audit_release_id: ?int, terminal: true, delete_guid: ?string} */
+    public static function buildTerminalScratchRecordNative(int $candidateId, int $version, string $host, ?int $auditReleaseId, ?string $deleteGuid): array
+    {
+        if (DirectorySyncBridge::transformNative(2, [$candidateId, $version, $host, $auditReleaseId, $deleteGuid], $result) && \is_array($result)
+            && array_keys($result) === ['host', 'candidate_id', 'version', 'audit_release_id', 'terminal', 'delete_guid']
+            && \is_string($result['host']) && ($result['candidate_id'] === null || \is_int($result['candidate_id']))
+            && \is_int($result['version']) && ($result['audit_release_id'] === null || \is_int($result['audit_release_id']))
+            && $result['terminal'] === true && ($result['delete_guid'] === null || \is_string($result['delete_guid']))) {
+            /** @var array{host: string, candidate_id: ?int, version: int, audit_release_id: ?int, terminal: true, delete_guid: ?string} $result */
+            return $result;
+        }
+
+        return self::buildTerminalScratchRecordPhp($candidateId, $version, $host, $auditReleaseId, $deleteGuid);
+    }
+
+    /** Whether $candidatePath names an entry strictly below $rootPath, with no `.` or `..` segment after it. */
+    public static function isSafeSubpath(string $rootPath, string $candidatePath): bool
+    {
+        return self::usesRustFfi() ? self::isSafeSubpathNative($rootPath, $candidatePath) : self::isSafeSubpathPhp($rootPath, $candidatePath);
+    }
+
+    public static function isSafeSubpathPhp(string $rootPath, string $candidatePath): bool
+    {
+        if ($rootPath === '' || str_contains($rootPath, "\0") || str_contains($candidatePath, "\0")) {
+            return false;
+        }
+        $prefix = rtrim($rootPath, '/').'/';
+        if (! str_starts_with($candidatePath, $prefix)) {
+            return false;
+        }
+        $named = false;
+        // FilesystemIterator keeps a root's repeated trailing slashes, so empty segments are skipped.
+        foreach (explode('/', substr($candidatePath, \strlen($prefix))) as $segment) {
+            if ($segment === '') {
+                continue;
+            }
+            if ($segment === '.' || $segment === '..') {
+                return false;
+            }
+            $named = true;
+        }
+
+        return $named;
+    }
+
+    public static function isSafeSubpathNative(string $rootPath, string $candidatePath): bool
+    {
+        return DirectorySyncBridge::transformNative(3, [$rootPath, $candidatePath], $result) && \is_bool($result)
+            ? $result
+            : self::isSafeSubpathPhp($rootPath, $candidatePath);
+    }
+
     /** Hold both locks across legacy TRUNCATE statements, which implicitly commit on MySQL. */
     public function run(callable $reset): void
     {
@@ -93,7 +189,8 @@ final class VerificationResetService
             // can remove their directories.
             $hosts = Schema::hasTable('release_verification_scratch') && Schema::hasColumn('release_verification_scratch', 'host');
             if ($hosts) {
-                DB::table('release_verification_scratch')->where('host', '<>', ScratchInventory::host())->update(['terminal' => true]);
+                $terminal = array_intersect_key(self::buildTerminalScratchRecord(0, 0, '', null, null), ['terminal' => true]);
+                DB::table('release_verification_scratch')->where('host', '<>', ScratchInventory::host())->update($terminal);
             }
             if (Release::hasLateArticleFlag()) {
                 // Partials keep no inventory once candidates are gone; let NZB-reading workers process them. One whose
@@ -139,6 +236,10 @@ final class VerificationResetService
                 continue;
             }
             $path = $entry->getPathname();
+            // Never delete outside the scratch root, whatever the iterator returned.
+            if (! self::isSafeSubpath($root, $path)) {
+                throw new RuntimeException('Cannot remove verification reset artifacts.');
+            }
             $directory = $entry->isDir() && ! $entry->isLink();
             $deleted = $directory ? File::deleteDirectory($path) : File::delete($path);
             // A folder that something refilled meanwhile gets one more pass; one that is already gone is gone.
