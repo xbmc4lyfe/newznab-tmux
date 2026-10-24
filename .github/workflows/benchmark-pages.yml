@@ -3,36 +3,6 @@ name: Benchmark Pages
 on:
   push:
     branches: [master]
-  pull_request:
-    paths:
-      - '.github/workflows/benchmark-pages.yml'
-      - '.github/workflows/yenc-performance.yml'
-      - '.github/workflows/release-presentation.yml'
-      - 'scripts/*benchmark*'
-      - 'docker/app/nzb-yenc-ffi/**'
-      - 'rust/pipeline-ffi/**'
-      - 'rust/fingerprint-worker/**'
-      - 'tests/Unit/test_benchmark*'
-      - 'tests/Unit/test_verify_benchmark_pages.py'
-      - 'github-pages/docs/**'
-      - 'scripts/build-docs.py'
-      - 'tests/Unit/test_docs_site.py'
-      - 'scripts/check-docs.py'
-      - 'tests/Unit/test_docs_links.py'
-      - '.github/workflows/native-utilities-performance.yml'
-      - '.github/workflows/archive-sample-performance.yml'
-      - '.github/workflows/fingerprint-worker.yml'
-      - 'scripts/benchmark_callers_summary.py'
-      - 'scripts/benchmark-resource-limits.py'
-      - 'tests/Unit/test_benchmark_callers_export.py'
-      - 'tests/Unit/test_benchmark_utility_extended.py'
-      - 'tests/Unit/test_benchmark_resource_limits.py'
-      - '.gitattributes'
-  workflow_run:
-    workflows: ['Paired native yEnc performance', 'Rust release presentation', 'Run tests', 'rust-clippy analyze', 'Native utility performance', 'Archive and sample planning performance', 'Database Rust fingerprint worker']
-    types: [completed]
-    branches: [master]
-  workflow_dispatch:
 
 permissions:
   contents: read
