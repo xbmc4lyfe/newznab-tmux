@@ -4,9 +4,12 @@ declare(strict_types=1);
 
 namespace App\Services;
 
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Throwable;
 
 /**
  * FanartTV Service
@@ -18,9 +21,42 @@ use Illuminate\Support\Facades\Log;
  */
 class FanartTvService
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_fanart_normalize_imdb_id(const char *ptr, size_t len, char *out, size_t cap);
+        ssize_t nntmux_fanart_parse_movie_properties(const char *ser_ptr, size_t ser_len, const char *imdb_ptr, size_t imdb_len, char *out, size_t cap);
+        ssize_t nntmux_fanart_select_best_poster(const char *ser_ptr, size_t ser_len, char *out, size_t cap);
+        C;
+
     protected const BASE_URL = 'https://webservice.fanart.tv/v3';
 
     protected const CACHE_TTL_HOURS = 24;
+
+    /** Null selects the benchmark-qualified production default. */
+    private static ?bool $useRustFfi = null;
+
+    private static FFI|false|null $ffi = null;
+
+    public static function setUseRustFfi(?bool $use = true): void
+    {
+        self::$useRustFfi = $use;
+        if ($use === null) {
+            self::$ffi = null;
+        }
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? false;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('metadata', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
 
     protected string $apiKey;
 
@@ -96,7 +132,7 @@ class FanartTvService
             ]);
 
             return null;
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             Log::warning('FanartTV API request exception', [
                 'endpoint' => $endpoint,
                 'message' => $e->getMessage(),
@@ -164,6 +200,85 @@ class FanartTvService
     {
         $art = $this->getMovieFanArt($imdbId);
 
+        if (empty($art)) {
+            return null;
+        }
+
+        return $this->parseMovieProperties($art, $imdbId);
+    }
+
+    /**
+     * @param  array<string, mixed>  $art
+     * @return array<string, mixed>|null
+     */
+    public function parseMovieProperties(array $art, string $imdbId = ''): ?array
+    {
+        return (self::$useRustFfi ?? false)
+            ? $this->parseMoviePropertiesNative($art, $imdbId)
+            : $this->parseMoviePropertiesPhp($art, $imdbId);
+    }
+
+    /**
+     * @param  array<string, mixed>  $art
+     * @return array<string, mixed>|null
+     */
+    public function parseMoviePropertiesNative(array $art, string $imdbId = ''): ?array
+    {
+        if (empty($art)) {
+            return null;
+        }
+        if (($ffi = self::ffi()) === null) {
+            return $this->parseMoviePropertiesPhp($art, $imdbId);
+        }
+        try {
+            $ser = @serialize($art);
+            $serLen = strlen($ser);
+            $imdbLen = strlen($imdbId);
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, max(512, $serLen + $imdbLen + 64), $capacity);
+            if ($buffer === null) {
+                return $this->parseMoviePropertiesPhp($art, $imdbId);
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_fanart_parse_movie_properties($ser, $serLen, $imdbId, $imdbLen, $buffer, $capacity);
+            if (is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return $this->parseMoviePropertiesPhp($art, $imdbId);
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_fanart_parse_movie_properties($ser, $serLen, $imdbId, $imdbLen, $buffer, $capacity);
+            }
+            if (is_int($written) && $written >= 0 && $written <= $capacity) {
+                if ($written === 0) {
+                    return null;
+                }
+                $parts = explode("\0", FFI::string($buffer, $written));
+                if (count($parts) >= 5) {
+                    $result = [
+                        'backdrop' => $parts[0],
+                        'cover' => $parts[1],
+                    ];
+                    if ($parts[2] === '1') {
+                        $result['banner'] = $parts[3];
+                    }
+                    $result['title'] = $parts[4];
+
+                    return $result;
+                }
+            }
+        } catch (Throwable) {
+        }
+
+        return $this->parseMoviePropertiesPhp($art, $imdbId);
+    }
+
+    /**
+     * @param  array<string, mixed>  $art
+     * @return array<string, mixed>|null
+     */
+    public function parseMoviePropertiesPhp(array $art, string $imdbId = ''): ?array
+    {
         if (empty($art)) {
             return null;
         }
@@ -272,6 +387,10 @@ class FanartTvService
             return null;
         }
 
+        if ((self::$useRustFfi ?? false) && is_array($art['tvposter'])) {
+            return $this->selectBestPosterUrlNative($art['tvposter']);
+        }
+
         /** @phpstan-ignore argument.templateType */
         $best = collect($art['tvposter'])->sortByDesc('likes')->first();
 
@@ -292,6 +411,10 @@ class FanartTvService
             return null;
         }
 
+        if ((self::$useRustFfi ?? false) && is_array($art['movieposter'])) {
+            return $this->selectBestPosterUrlNative($art['movieposter']);
+        }
+
         /** @phpstan-ignore argument.templateType */
         $best = collect($art['movieposter'])->sortByDesc('likes')->first();
 
@@ -299,9 +422,124 @@ class FanartTvService
     }
 
     /**
+     * Select the poster URL with the highest like count from a list of Fanart.TV poster entries.
+     *
+     * @param  array<int|string, mixed>  $posters
+     */
+    public function selectBestPosterUrl(array $posters): ?string
+    {
+        return (self::$useRustFfi ?? false)
+            ? $this->selectBestPosterUrlNative($posters)
+            : $this->selectBestPosterUrlPhp($posters);
+    }
+
+    /**
+     * @param  array<int|string, mixed>  $posters
+     */
+    public function selectBestPosterUrlNative(array $posters): ?string
+    {
+        if (empty($posters)) {
+            return null;
+        }
+        if (($ffi = self::ffi()) === null) {
+            return $this->selectBestPosterUrlPhp($posters);
+        }
+        try {
+            $ser = @serialize($posters);
+            $serLen = strlen($ser);
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, max(256, $serLen + 32), $capacity);
+            if ($buffer === null) {
+                return $this->selectBestPosterUrlPhp($posters);
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_fanart_select_best_poster($ser, $serLen, $buffer, $capacity);
+            if (is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return $this->selectBestPosterUrlPhp($posters);
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_fanart_select_best_poster($ser, $serLen, $buffer, $capacity);
+            }
+            if (is_int($written) && $written >= 0 && $written <= $capacity) {
+                if ($written === 0) {
+                    return null;
+                }
+                $raw = FFI::string($buffer, $written);
+                if ($raw[0] === '1') {
+                    return substr($raw, 1);
+                }
+            }
+        } catch (Throwable) {
+        }
+
+        return $this->selectBestPosterUrlPhp($posters);
+    }
+
+    /**
+     * @param  array<int|string, mixed>  $posters
+     */
+    public function selectBestPosterUrlPhp(array $posters): ?string
+    {
+        if (empty($posters)) {
+            return null;
+        }
+
+        usort($posters, static function (mixed $a, mixed $b): int {
+            $likesA = is_array($a) ? (int) ($a['likes'] ?? 0) : 0;
+            $likesB = is_array($b) ? (int) ($b['likes'] ?? 0) : 0;
+
+            return $likesB <=> $likesA;
+        });
+
+        $best = reset($posters);
+
+        return is_array($best) && isset($best['url']) && is_string($best['url']) ? $best['url'] : null;
+    }
+
+    /**
      * Normalize IMDB ID to include 'tt' prefix.
      */
-    protected function normalizeImdbId(string $imdbId): string
+    public function normalizeImdbId(string $imdbId): string
+    {
+        return (self::$useRustFfi ?? false)
+            ? $this->normalizeImdbIdNative($imdbId)
+            : $this->normalizeImdbIdPhp($imdbId);
+    }
+
+    public function normalizeImdbIdNative(string $imdbId): string
+    {
+        if (($ffi = self::ffi()) === null) {
+            return $this->normalizeImdbIdPhp($imdbId);
+        }
+        try {
+            $len = strlen($imdbId);
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, max(256, $len + 16), $capacity);
+            if ($buffer === null) {
+                return $this->normalizeImdbIdPhp($imdbId);
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_fanart_normalize_imdb_id($imdbId, $len, $buffer, $capacity);
+            if (is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return $this->normalizeImdbIdPhp($imdbId);
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_fanart_normalize_imdb_id($imdbId, $len, $buffer, $capacity);
+            }
+            if (is_int($written) && $written >= 0 && $written <= $capacity) {
+                return $written === 0 ? '' : FFI::string($buffer, $written);
+            }
+        } catch (Throwable) {
+        }
+
+        return $this->normalizeImdbIdPhp($imdbId);
+    }
+
+    public function normalizeImdbIdPhp(string $imdbId): string
     {
         if (str_starts_with(strtolower($imdbId), 'tt')) {
             return $imdbId;
