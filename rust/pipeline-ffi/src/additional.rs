@@ -5786,6 +5786,542 @@ pub unsafe extern "C" fn nntmux_media_source_rank_wanted_files_nul(
     out.pos as isize
 }
 
+// ---------------------------------------------------------------------------
+// 14. Wave 9 Slice 9.5: ReleaseProcessor helpers, ArchivedMediaSlicer range,
+//     FfmpegFrameGrabber::clockSeconds, ReleaseExtraService::makeCodecPretty
+// ---------------------------------------------------------------------------
+
+const DEFAULT_SUPPORT_REGEX_BYTES: &[u8] =
+    b"\\.(?:vol\\d{1,3}\\+\\d{1,3}|par2|srs|sfv|nzb)";
+
+fn parse_release_files_into(raw: &[u8], out: &mut OutCursor<'_>) -> isize {
+    let trimmed = trim_php(raw);
+    if trimmed.is_empty() {
+        return 0;
+    }
+
+    let mut wrote_any = false;
+    for part in trimmed.split(|&b| b == b'|') {
+        let entry = trim_php(part);
+        if entry.is_empty() {
+            continue;
+        }
+        let Some(star_pos) = entry.iter().rposition(|&b| b == b'*') else {
+            continue;
+        };
+        let name = trim_php(&entry[..star_pos]);
+        let size_bytes = &entry[star_pos + 1..];
+        if name.is_empty() || size_bytes.is_empty() || !size_bytes.iter().all(u8::is_ascii_digit) {
+            continue;
+        }
+        if name.contains(&0) {
+            return -1;
+        }
+
+        let mut size_val: i64 = 0;
+        for &b in size_bytes {
+            let d = (b - b'0') as i64;
+            let Some(next) = size_val.checked_mul(10).and_then(|v| v.checked_add(d)) else {
+                return -1;
+            };
+            size_val = next;
+        }
+
+        if wrote_any {
+            out.push(0);
+        }
+        out.extend(name);
+        out.push(0);
+        push_i64_dec(out, size_val);
+        wrote_any = true;
+    }
+
+    if !wrote_any {
+        return 0;
+    }
+    if out.pos <= out.buf.len() {
+        out.pos as isize
+    } else {
+        -((out.pos + 16) as isize)
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_release_parse_release_files_nul(
+    raw_ptr: *const u8,
+    raw_len: usize,
+    out_ptr: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if (raw_ptr.is_null() && raw_len > 0) || (out_ptr.is_null() && out_cap > 0) {
+        return -1;
+    }
+    let raw = if raw_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(raw_ptr, raw_len) }
+    };
+    let mut out = unsafe { OutCursor::new(out_ptr, out_cap) };
+    parse_release_files_into(raw, &mut out)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_release_normalize_subject(
+    ptr: *const u8,
+    len: usize,
+    out_ptr: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if (ptr.is_null() && len > 0) || (out_ptr.is_null() && out_cap > 0) {
+        return -1;
+    }
+    let subject = if len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(ptr, len) }
+    };
+    let mut out = unsafe { OutCursor::new(out_ptr, out_cap) };
+    archive_candidate_file_name_into(subject, &mut out);
+    if out.pos <= out.buf.len() {
+        out.pos as isize
+    } else {
+        -(out.pos.max(4) as isize)
+    }
+}
+
+fn subject_contains_video_pattern(subject: &[u8], video_cfg: &VideoExtConfig<'_>) -> bool {
+    let is_bracket_or_end = |pos: usize| -> bool {
+        pos == subject.len()
+            || (pos + 1 == subject.len() && subject[pos] == b'\n')
+            || matches!(subject[pos], b'.' | b' ' | b'"' | b')' | b']')
+    };
+
+    let mut cur = 0usize;
+    while cur < subject.len() {
+        let ptr = unsafe { memchr(subject[cur..].as_ptr(), b'.' as i32, subject.len() - cur) };
+        if ptr.is_null() {
+            break;
+        }
+        let i = cur + (ptr as usize - subject[cur..].as_ptr() as usize);
+        cur = i + 1;
+        let rest = &subject[i + 1..];
+        match video_cfg {
+            VideoExtConfig::Default => {
+                for elen in [4usize, 3, 2] {
+                    if rest.len() >= elen
+                        && is_video_ext_ci(&rest[..elen])
+                        && is_bracket_or_end(i + 1 + elen)
+                    {
+                        return true;
+                    }
+                }
+            }
+            VideoExtConfig::Custom(exts) => {
+                for cand in exts {
+                    let elen = cand.len();
+                    if rest.len() >= elen
+                        && rest[..elen].eq_ignore_ascii_case(cand)
+                        && is_bracket_or_end(i + 1 + elen)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_release_contains_video_pattern(
+    subject_ptr: *const u8,
+    subject_len: usize,
+    video_regex_ptr: *const u8,
+    video_regex_len: usize,
+) -> i32 {
+    if (subject_ptr.is_null() && subject_len > 0)
+        || (video_regex_ptr.is_null() && video_regex_len > 0)
+    {
+        return -1;
+    }
+    let subject = if subject_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(subject_ptr, subject_len) }
+    };
+    let video_regex = if video_regex_len == 0 {
+        DEFAULT_VIDEO_REGEX_BYTES
+    } else {
+        unsafe { slice::from_raw_parts(video_regex_ptr, video_regex_len) }
+    };
+    let Some(video_cfg) = VideoExtConfig::parse(video_regex) else {
+        return -1;
+    };
+    i32::from(subject_contains_video_pattern(subject, &video_cfg))
+}
+
+#[inline]
+fn subject_has_usable_sample_filename(subject: &[u8]) -> bool {
+    if find_ascii_ci(subject, b"sample").is_none() {
+        return false;
+    }
+    let (_, has_image_ext_token, _, _, _, _, _) = check_image_and_media_exts(subject);
+    if has_image_ext_token {
+        return false;
+    }
+    !matches_archive_pattern(subject)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_release_has_usable_sample_filename(
+    ptr: *const u8,
+    len: usize,
+) -> i32 {
+    if ptr.is_null() && len > 0 {
+        return -1;
+    }
+    let subject = if len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(ptr, len) }
+    };
+    i32::from(subject_has_usable_sample_filename(subject))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_release_is_auxiliary_nzb_subject(
+    subject_ptr: *const u8,
+    subject_len: usize,
+    support_regex_ptr: *const u8,
+    support_regex_len: usize,
+) -> i32 {
+    if (subject_ptr.is_null() && subject_len > 0)
+        || (support_regex_ptr.is_null() && support_regex_len > 0)
+    {
+        return -1;
+    }
+    let support_regex = if support_regex_len == 0 {
+        DEFAULT_SUPPORT_REGEX_BYTES
+    } else {
+        unsafe { slice::from_raw_parts(support_regex_ptr, support_regex_len) }
+    };
+    if support_regex != DEFAULT_SUPPORT_REGEX_BYTES {
+        return -1;
+    }
+    let subject = if subject_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(subject_ptr, subject_len) }
+    };
+    i32::from(is_support_file(subject))
+}
+
+fn collapse_alnum_dots_into(input: &[u8], out: &mut OutCursor<'_>) {
+    let mut pending_dot = false;
+    let mut has_any = false;
+    for &b in input {
+        if b.is_ascii_alphanumeric() {
+            if pending_dot && has_any {
+                out.push(b'.');
+            }
+            pending_dot = false;
+            has_any = true;
+            out.push(b.to_ascii_lowercase());
+        } else {
+            pending_dot = true;
+        }
+    }
+}
+
+fn subject_matches_release(subject: &[u8], release_name: &[u8]) -> bool {
+    let mut norm_subject_raw = [0u8; 512];
+    let subject_vec;
+    let norm_subject: &[u8] = if subject.len() <= 512 {
+        let mut cur = OutCursor {
+            buf: &mut norm_subject_raw,
+            pos: 0,
+        };
+        archive_candidate_file_name_into(subject, &mut cur);
+        let len = cur.pos;
+        &norm_subject_raw[..len]
+    } else {
+        subject_vec = archive_candidate_file_name_vec(subject);
+        &subject_vec
+    };
+
+    let mut sub_stack = [0u8; 512];
+    let mut sub_vec;
+    let sub_tokens: &[u8] = if norm_subject.len() <= 512 {
+        let mut cur = OutCursor {
+            buf: &mut sub_stack,
+            pos: 0,
+        };
+        collapse_alnum_dots_into(norm_subject, &mut cur);
+        let len = cur.pos;
+        &sub_stack[..len]
+    } else {
+        sub_vec = vec![0u8; norm_subject.len()];
+        let mut cur = OutCursor {
+            buf: &mut sub_vec,
+            pos: 0,
+        };
+        collapse_alnum_dots_into(norm_subject, &mut cur);
+        let len = cur.pos;
+        &sub_vec[..len]
+    };
+
+    if sub_tokens.is_empty() {
+        return false;
+    }
+
+    let mut rel_stack = [0u8; 512];
+    let mut rel_vec;
+    let rel_tokens: &[u8] = if release_name.len() <= 512 {
+        let mut cur = OutCursor {
+            buf: &mut rel_stack,
+            pos: 0,
+        };
+        collapse_alnum_dots_into(release_name, &mut cur);
+        let len = cur.pos;
+        &rel_stack[..len]
+    } else {
+        rel_vec = vec![0u8; release_name.len()];
+        let mut cur = OutCursor {
+            buf: &mut rel_vec,
+            pos: 0,
+        };
+        collapse_alnum_dots_into(release_name, &mut cur);
+        let len = cur.pos;
+        &rel_vec[..len]
+    };
+
+    if rel_tokens.is_empty() {
+        return false;
+    }
+
+    find_ascii_ci(sub_tokens, rel_tokens).is_some()
+        || find_ascii_ci(rel_tokens, sub_tokens).is_some()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_release_subject_matches_release(
+    subject_ptr: *const u8,
+    subject_len: usize,
+    release_ptr: *const u8,
+    release_len: usize,
+) -> i32 {
+    if (subject_ptr.is_null() && subject_len > 0) || (release_ptr.is_null() && release_len > 0) {
+        return -1;
+    }
+    let subject = if subject_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(subject_ptr, subject_len) }
+    };
+    let release_name = if release_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(release_ptr, release_len) }
+    };
+    i32::from(subject_matches_release(subject, release_name))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_archived_media_range(
+    range_ptr: *const u8,
+    range_len: usize,
+    name_ptr: *const u8,
+    name_len: usize,
+    file_size: i64,
+    next_offset: i64,
+    has_next_offset: u32,
+    data_len: i64,
+    max_sample_bytes: i64,
+    min_main_video_bytes: i64,
+    out_bounds: *mut i64,
+) -> i32 {
+    if (range_ptr.is_null() && range_len > 0)
+        || (name_ptr.is_null() && name_len > 0)
+        || out_bounds.is_null()
+    {
+        return -1;
+    }
+    let range_bytes = if range_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(range_ptr, range_len) }
+    };
+    let name_bytes = if name_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(name_ptr, name_len) }
+    };
+
+    let (start, end) = if let Some(dash) = range_bytes.iter().position(|&b| b == b'-') {
+        (
+            parse_php_int(&range_bytes[..dash]),
+            parse_php_int(&range_bytes[dash + 1..]),
+        )
+    } else {
+        (parse_php_int(range_bytes), -1)
+    };
+
+    let in_volume_end = if has_next_offset != 0 && next_offset > start {
+        next_offset.saturating_sub(1)
+    } else {
+        start.saturating_add(file_size).saturating_sub(1)
+    };
+    let available = if data_len > 0 {
+        in_volume_end
+            .min(data_len - 1)
+            .saturating_sub(start)
+            .saturating_add(1)
+    } else {
+        0
+    };
+    let head_len = available.min(max_sample_bytes).max(0);
+    let is_sample = (name_len > 0 && has_sample_token(name_bytes)) || file_size < min_main_video_bytes;
+
+    unsafe {
+        *out_bounds.add(0) = start;
+        *out_bounds.add(1) = end;
+        *out_bounds.add(2) = in_volume_end;
+        *out_bounds.add(3) = available;
+        *out_bounds.add(4) = head_len;
+        *out_bounds.add(5) = i64::from(is_sample);
+    }
+
+    i32::from(start >= 0 && start < data_len)
+}
+
+fn parse_ffmpeg_clock_seconds(value: &[u8]) -> f64 {
+    let s = if value.ends_with(b"\n") {
+        &value[..value.len() - 1]
+    } else {
+        value
+    };
+    let Some(c1) = s.iter().position(|&b| b == b':') else {
+        return -1.0;
+    };
+    let hours_bytes = &s[..c1];
+    if hours_bytes.is_empty() || !hours_bytes.iter().all(u8::is_ascii_digit) {
+        return -1.0;
+    }
+    if hours_bytes.len() > 15 {
+        return -2.0;
+    }
+    let rest = &s[c1 + 1..];
+    if rest.len() < 5
+        || !rest[0].is_ascii_digit()
+        || !rest[1].is_ascii_digit()
+        || rest[2] != b':'
+        || !rest[3].is_ascii_digit()
+        || !rest[4].is_ascii_digit()
+    {
+        return -1.0;
+    }
+    let sec_bytes = &rest[3..];
+    if sec_bytes.len() > 2 {
+        if sec_bytes[2] != b'.'
+            || sec_bytes.len() == 3
+            || !sec_bytes[3..].iter().all(u8::is_ascii_digit)
+        {
+            return -1.0;
+        }
+    }
+
+    let mut hours: i64 = 0;
+    for &b in hours_bytes {
+        hours = hours * 10 + (b - b'0') as i64;
+    }
+    let minutes: i64 = ((rest[0] - b'0') as i64) * 10 + ((rest[1] - b'0') as i64);
+    let sec_str = unsafe { core::str::from_utf8_unchecked(sec_bytes) };
+    let Ok(seconds) = sec_str.parse::<f64>() else {
+        return -1.0;
+    };
+    let total = (hours * 3600 + minutes * 60) as f64 + seconds;
+    if total.is_finite() && total > 0.0 {
+        total
+    } else {
+        -1.0
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_ffmpeg_clock_seconds(ptr: *const u8, len: usize) -> f64 {
+    if ptr.is_null() && len > 0 {
+        return -2.0;
+    }
+    let value = if len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(ptr, len) }
+    };
+    parse_ffmpeg_clock_seconds(value)
+}
+
+/// Codec pretty-print code:
+/// 0 = unchanged, 1 = HEVC, 2 = h.264, 3 = MPEG-4, 4 = MPEG-2,
+/// 5 = MPEG-1, 6 = DivX, 7 = XviD, 8 = wmv
+pub(crate) fn classify_pretty_codec(codec: &[u8]) -> i32 {
+    let s = if codec.ends_with(b"\n") {
+        &codec[..codec.len() - 1]
+    } else {
+        codec
+    };
+    if s == b"36" || find_ascii_ci(codec, b"hevc").is_some() {
+        return 1;
+    }
+    if s == b"7"
+        || s == b"27"
+        || s.eq_ignore_ascii_case(b"h264")
+        || find_ascii_ci(codec, b"avc").is_some()
+    {
+        return 2;
+    }
+    if s == b"20"
+        || s.eq_ignore_ascii_case(b"fmp4")
+        || s.eq_ignore_ascii_case(b"mp42")
+        || s.eq_ignore_ascii_case(b"mp43")
+        || s.eq_ignore_ascii_case(b"mpg4")
+        || find_ascii_ci(codec, b"asp").is_some()
+    {
+        return 3;
+    }
+    if s == b"2" {
+        return 4;
+    }
+    if codec == b"MPEG" {
+        return 5;
+    }
+    if find_ascii_ci(codec, b"dx50").is_some()
+        || find_ascii_ci(codec, b"divx").is_some()
+        || find_ascii_ci(codec, b"div3").is_some()
+    {
+        return 6;
+    }
+    if find_ascii_ci(codec, b"xvid").is_some() {
+        return 7;
+    }
+    if find_ascii_ci(codec, b"wmv").is_some() || find_ascii_ci(codec, b"wvc1").is_some() {
+        return 8;
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_codec_make_pretty(ptr: *const u8, len: usize) -> i32 {
+    if ptr.is_null() && len > 0 {
+        return -1;
+    }
+    let codec = if len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(ptr, len) }
+    };
+    classify_pretty_codec(codec)
+}
+
 #[cfg(test)]
 mod wave7_episode_archive_rank_tests {
     use super::*;
@@ -5865,5 +6401,92 @@ mod wave7_episode_archive_rank_tests {
         assert_eq!(classify_wanted_file(b"Movie.sample.mkv", &cfg), Some(1));
         assert_eq!(classify_wanted_file(b"Movie.1080p.mkv", &cfg), Some(2));
         assert_eq!(classify_wanted_file(b"poster.jpg", &cfg), Some(3));
+    }
+
+    #[test]
+    fn wave9_release_and_media_helpers() {
+        let mut buf = [0u8; 256];
+        let mut cur = OutCursor {
+            buf: &mut buf,
+            pos: 0,
+        };
+        let written = parse_release_files_into(
+            b"Movie.2026.1080p.mkv*1073741824|Sample/sample.mkv*52428800|invalid|bad*abc",
+            &mut cur,
+        );
+        assert!(written > 0);
+        let parts: Vec<&[u8]> = buf[..written as usize].split(|&b| b == 0).collect();
+        assert_eq!(
+            parts,
+            vec![
+                &b"Movie.2026.1080p.mkv"[..],
+                &b"1073741824"[..],
+                &b"Sample/sample.mkv"[..],
+                &b"52428800"[..],
+            ]
+        );
+
+        let cfg = VideoExtConfig::parse(DEFAULT_VIDEO_REGEX_BYTES).unwrap();
+        assert!(subject_contains_video_pattern(
+            b"[01/20] - \"Movie.2026.1080p.mkv\" yEnc (1/50)",
+            &cfg
+        ));
+        assert!(!subject_contains_video_pattern(
+            b"[01/20] - \"Movie.2026.1080p.rar\" yEnc (1/50)",
+            &cfg
+        ));
+
+        assert!(subject_has_usable_sample_filename(
+            b"\"Movie.2026.sample.mkv\" yEnc (1/10)"
+        ));
+        assert!(!subject_has_usable_sample_filename(
+            b"\"Movie.2026.sample.jpg\""
+        ));
+        assert!(!subject_has_usable_sample_filename(
+            b"\"Movie.2026.sample.rar\" yEnc (1/10)"
+        ));
+
+        assert!(subject_matches_release(
+            b"[01/50] - \"The.Matrix.1999.1080p.BluRay.x264-GROUP.mkv\" yEnc (1/90)",
+            b"The Matrix 1999 1080p BluRay x264-GROUP"
+        ));
+        assert!(!subject_matches_release(
+            b"\"Unrelated.Show.S01E01.mkv\" yEnc (1/10)",
+            b"The Matrix 1999 1080p BluRay x264-GROUP"
+        ));
+
+        let mut bounds = [0i64; 6];
+        let status = unsafe {
+            nntmux_archived_media_range(
+                b"128-65663".as_ptr(),
+                9,
+                b"Sample/movie-sample.mkv".as_ptr(),
+                23,
+                65536,
+                65664,
+                1,
+                32768,
+                16384,
+                1048576,
+                bounds.as_mut_ptr(),
+            )
+        };
+        assert_eq!(status, 1);
+        assert_eq!(bounds, [128, 65663, 65663, 32640, 16384, 1]);
+
+        assert!((parse_ffmpeg_clock_seconds(b"01:30:15.500") - 5415.5).abs() < 1e-6);
+        assert_eq!(parse_ffmpeg_clock_seconds(b"00:00:00.000"), -1.0);
+        assert_eq!(parse_ffmpeg_clock_seconds(b"invalid"), -1.0);
+
+        assert_eq!(classify_pretty_codec(b"36"), 1);
+        assert_eq!(classify_pretty_codec(b"V_MPEGH/ISO/HEVC"), 1);
+        assert_eq!(classify_pretty_codec(b"V_MPEG4/ISO/AVC"), 2);
+        assert_eq!(classify_pretty_codec(b"FMP4"), 3);
+        assert_eq!(classify_pretty_codec(b"2"), 4);
+        assert_eq!(classify_pretty_codec(b"MPEG"), 5);
+        assert_eq!(classify_pretty_codec(b"DX50"), 6);
+        assert_eq!(classify_pretty_codec(b"XVID"), 7);
+        assert_eq!(classify_pretty_codec(b"WVC1"), 8);
+        assert_eq!(classify_pretty_codec(b"AV1"), 0);
     }
 }
