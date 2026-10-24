@@ -14304,3 +14304,1037 @@ pub mod bounded_metric_exporter_disk_and_incident {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Wave 22 Slice 22.6: DatabaseProbe, ReleaseVerificationCollector,
+// ServiceStatusCollector, UserInactivityEvaluator, and GdprErasureService
+// pure-CPU helpers
+// ---------------------------------------------------------------------------
+
+pub mod probes_collectors_inactivity_and_gdpr_erasure {
+    use std::slice;
+
+    const CAT22_MAX_SEG_LEN: usize = (isize::MAX as usize) / 8;
+    const CAT22_MAX_EXACT_ELAPSED_NS: u64 = 1_000_000_000_000_000;
+    const CAT22_HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
+
+    #[inline]
+    unsafe fn cat22_valid_slice<'a>(
+        ptr: *const u8,
+        len: usize,
+        max_len: usize,
+    ) -> Option<&'a [u8]> {
+        if ptr.is_null()
+            || len > max_len
+            || len > isize::MAX as usize
+            || (ptr as usize).checked_add(len).is_none()
+        {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn cat22_valid_out_buf(out_buf: *mut u8, out_cap: usize) -> bool {
+        !out_buf.is_null()
+            && out_cap <= isize::MAX as usize
+            && (out_buf as usize).checked_add(out_cap).is_some()
+    }
+
+    #[inline]
+    unsafe fn cat22_write_slices(out_buf: *mut u8, out_cap: usize, parts: &[&[u8]]) -> isize {
+        if !cat22_valid_out_buf(out_buf, out_cap) {
+            return -1;
+        }
+        let mut needed = 0usize;
+        for part in parts {
+            let Some(next) = needed.checked_add(part.len()) else {
+                return -1;
+            };
+            if next > isize::MAX as usize {
+                return -1;
+            }
+            needed = next;
+        }
+        if needed > out_cap {
+            return -(needed.max(4) as isize);
+        }
+        let mut offset = 0usize;
+        for part in parts {
+            if !part.is_empty() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(part.as_ptr(), out_buf.add(offset), part.len());
+                }
+                offset += part.len();
+            }
+        }
+        needed as isize
+    }
+
+    #[inline]
+    fn cat22_rtrim_php_default(mut s: &[u8]) -> &[u8] {
+        while let Some(&last) = s.last() {
+            if matches!(last, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B) {
+                s = &s[..s.len() - 1];
+            } else {
+                break;
+            }
+        }
+        s
+    }
+
+    #[inline]
+    fn cat22_is_activity_stale(
+        has_activity_at: u8,
+        activity_at_us: i64,
+        has_fallback_at: u8,
+        fallback_at_us: i64,
+        threshold_us: i64,
+    ) -> Option<bool> {
+        if has_activity_at > 1 || has_fallback_at > 1 {
+            return None;
+        }
+        let cmp_us = if has_activity_at == 1 {
+            Some(activity_at_us)
+        } else if has_fallback_at == 1 {
+            Some(fallback_at_us)
+        } else {
+            None
+        };
+        Some(matches!(cmp_us, Some(ts) if ts < threshold_us))
+    }
+
+    #[inline]
+    fn cat22_is_download_stale(
+        has_created_at: u8,
+        created_at_us: i64,
+        has_updated_at: u8,
+        updated_at_us: i64,
+        has_last_download_at: u8,
+        last_download_at_us: i64,
+        grabs: i64,
+        threshold_us: i64,
+    ) -> Option<bool> {
+        if has_created_at > 1 || has_updated_at > 1 || has_last_download_at > 1 {
+            return None;
+        }
+        if has_last_download_at == 1 {
+            return Some(last_download_at_us < threshold_us);
+        }
+        if grabs > 0 {
+            return Some(has_updated_at == 1 && updated_at_us < threshold_us);
+        }
+        Some(has_created_at == 1 && created_at_us < threshold_us)
+    }
+
+    /// Evaluates a successful `DatabaseProbe::probe()` latency in milliseconds
+    /// (`(int) (($endNs - $startNs) / 1_000_000)`) and writes `"Connected"` to `out_buf`.
+    ///
+    /// Returns written byte length (`9`), `< -1` (`-needed`) when `out_cap` is too small,
+    /// or `-1` on null/unaligned pointers or out-of-range nanosecond delta.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_database_probe_evaluate_connected(
+        start_ns: i64,
+        end_ns: i64,
+        out_elapsed_ms: *mut i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if out_elapsed_ms.is_null() || !out_elapsed_ms.is_aligned() {
+                return -1;
+            }
+            let Some(diff) = end_ns.checked_sub(start_ns) else {
+                return -1;
+            };
+            if diff.unsigned_abs() > CAT22_MAX_EXACT_ELAPSED_NS {
+                return -1;
+            }
+            let written = unsafe { cat22_write_slices(out_buf, out_cap, &[b"Connected"]) };
+            if written < 0 {
+                return written;
+            }
+            unsafe {
+                *out_elapsed_ms = diff / 1_000_000;
+            }
+            written
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Formats a failure `ProbeResult` reason for `DatabaseProbe::probe()`:
+    /// `'Database unreachable: ' . Str::limit($errorMessage, 120)`.
+    ///
+    /// Returns written byte length (`> 0`), `-2` when `error_ptr` contains non-ASCII bytes
+    /// (so PHP `mb_strwidth`/`mb_strimwidth` handles multibyte width), `< -2` (`-needed`)
+    /// when `out_cap` is too small, or `-1` on invalid arguments.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_database_probe_format_unreachable(
+        error_ptr: *const u8,
+        error_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if !cat22_valid_out_buf(out_buf, out_cap) {
+                return -1;
+            }
+            let Some(error) =
+                (unsafe { cat22_valid_slice(error_ptr, error_len, CAT22_MAX_SEG_LEN) })
+            else {
+                return -1;
+            };
+            if !error.is_ascii() {
+                return -2;
+            }
+
+            let (body, suffix): (&[u8], &[u8]) = if error.len() <= 120 {
+                (error, b"")
+            } else {
+                (cat22_rtrim_php_default(&error[..120]), b"...")
+            };
+
+            unsafe { cat22_write_slices(out_buf, out_cap, &[b"Database unreachable: ", body, suffix]) }
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Evaluates whether a MySQL/MariaDB driver error code (`1969` or `3024`) indicates a
+    /// statement execution time limit cancellation in `ReleaseVerificationCollector::measure()`.
+    ///
+    /// Returns `1` when `driver_error_code` is `1969` or `3024`, `0` otherwise.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_release_verification_collector_is_timeout_code(
+        driver_error_code: i64,
+    ) -> i32 {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            i32::from(driver_error_code == 1969 || driver_error_code == 3024)
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Evaluates cached `status.json` snapshot metrics for `ReleaseVerificationCollector::collect()`.
+    ///
+    /// Writes:
+    /// - `*out_scratch_known`: `1` if `has_measured_at == 1 && status_is_unknown == 0 && has_numeric_scratch == 1 && scratch_bytes >= 0.0`, else `0`
+    /// - `*out_scratch_bytes`: `scratch_bytes` when known, else `0.0`
+    /// - `*out_scratch_age_seconds`: `max(0, now_ts - measured_at)` when known, else `0`
+    /// - `*out_verified_is_float`: `1` if `has_numeric_verified == 1`, else `0`
+    /// - `*out_verified_bps`: `verified_bps` when `has_numeric_verified == 1`, else `0.0`
+    ///
+    /// Returns `1` on success, or `-1` on invalid flags, non-finite floats, overflow, or null/unaligned pointers.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_release_verification_collector_evaluate_snapshot(
+        has_measured_at: u8,
+        measured_at: i64,
+        now_ts: i64,
+        status_is_unknown: u8,
+        has_numeric_scratch: u8,
+        scratch_bytes: f64,
+        has_numeric_verified: u8,
+        verified_bps: f64,
+        out_scratch_known: *mut i32,
+        out_scratch_bytes: *mut f64,
+        out_scratch_age_seconds: *mut i64,
+        out_verified_is_float: *mut i32,
+        out_verified_bps: *mut f64,
+    ) -> i32 {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if has_measured_at > 1
+                || status_is_unknown > 1
+                || has_numeric_scratch > 1
+                || has_numeric_verified > 1
+                || out_scratch_known.is_null()
+                || !out_scratch_known.is_aligned()
+                || out_scratch_bytes.is_null()
+                || !out_scratch_bytes.is_aligned()
+                || out_scratch_age_seconds.is_null()
+                || !out_scratch_age_seconds.is_aligned()
+                || out_verified_is_float.is_null()
+                || !out_verified_is_float.is_aligned()
+                || out_verified_bps.is_null()
+                || !out_verified_bps.is_aligned()
+            {
+                return -1;
+            }
+            if (has_numeric_scratch == 1 && !scratch_bytes.is_finite())
+                || (has_numeric_verified == 1 && !verified_bps.is_finite())
+            {
+                return -1;
+            }
+
+            let scratch_known = has_measured_at == 1
+                && status_is_unknown == 0
+                && has_numeric_scratch == 1
+                && scratch_bytes >= 0.0;
+
+            let scratch_age = if scratch_known {
+                let Some(diff) = now_ts.checked_sub(measured_at) else {
+                    return -1;
+                };
+                diff.max(0)
+            } else {
+                0
+            };
+
+            unsafe {
+                *out_scratch_known = i32::from(scratch_known);
+                *out_scratch_bytes = if scratch_known { scratch_bytes } else { 0.0 };
+                *out_scratch_age_seconds = scratch_age;
+                *out_verified_is_float = i32::from(has_numeric_verified == 1);
+                *out_verified_bps = if has_numeric_verified == 1 {
+                    verified_bps
+                } else {
+                    0.0
+                };
+            }
+            1
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Computes `$oldest === null ? 0 : max(0, $nowTimestamp - $oldestTimestamp)` for
+    /// `ReleaseVerificationCollector::collect()`.
+    ///
+    /// Returns `1` on success, or `-1` on invalid flags, signed overflow, or null/unaligned pointer.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_release_verification_collector_backlog_age(
+        has_oldest: u8,
+        oldest_ts: i64,
+        now_ts: i64,
+        out_age_seconds: *mut i64,
+    ) -> i32 {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if has_oldest > 1 || out_age_seconds.is_null() || !out_age_seconds.is_aligned() {
+                return -1;
+            }
+            let age = if has_oldest == 0 {
+                0
+            } else {
+                let Some(diff) = now_ts.checked_sub(oldest_ts) else {
+                    return -1;
+                };
+                diff.max(0)
+            };
+            unsafe {
+                *out_age_seconds = age;
+            }
+            1
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Evaluates `ServiceStatusCollector` gauge values for a single monitored service row:
+    /// - `*out_up`: `1` when `severity <= 1` (`operational` or `degraded`), else `0`
+    /// - `*out_severity`: `0..=4`
+    /// - `*out_rt_mode`: `-1` when `has_response_time_ms == 0`, `1` when `response_time_ms % 1000 == 0`
+    ///   (exact integer seconds in `*out_rt_int_seconds`), or `0` when fractional float seconds
+    ///   in `*out_rt_float_seconds`.
+    ///
+    /// Returns `1` on success, `-2` for an unknown status value, or `-1` on invalid pointers/args.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_service_status_collector_evaluate(
+        status_ptr: *const u8,
+        status_len: usize,
+        has_response_time_ms: u8,
+        response_time_ms: i64,
+        out_up: *mut i32,
+        out_severity: *mut i32,
+        out_rt_mode: *mut i32,
+        out_rt_int_seconds: *mut i64,
+        out_rt_float_seconds: *mut f64,
+    ) -> i32 {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if has_response_time_ms > 1
+                || out_up.is_null()
+                || !out_up.is_aligned()
+                || out_severity.is_null()
+                || !out_severity.is_aligned()
+                || out_rt_mode.is_null()
+                || !out_rt_mode.is_aligned()
+                || out_rt_int_seconds.is_null()
+                || !out_rt_int_seconds.is_aligned()
+                || out_rt_float_seconds.is_null()
+                || !out_rt_float_seconds.is_aligned()
+            {
+                return -1;
+            }
+            if has_response_time_ms == 1 && response_time_ms == i64::MIN {
+                return -1;
+            }
+            let Some(status) =
+                (unsafe { cat22_valid_slice(status_ptr, status_len, CAT22_MAX_SEG_LEN) })
+            else {
+                return -1;
+            };
+
+            let severity: i32 = match status {
+                b"operational" => 0,
+                b"degraded" => 1,
+                b"maintenance" => 2,
+                b"partial_outage" => 3,
+                b"major_outage" => 4,
+                _ => return -2,
+            };
+            let up = i32::from(severity <= 1);
+
+            let (rt_mode, rt_int, rt_float) = if has_response_time_ms == 0 {
+                (-1, 0i64, 0.0f64)
+            } else if response_time_ms % 1000 == 0 {
+                (1, response_time_ms / 1000, 0.0f64)
+            } else {
+                (0, 0i64, (response_time_ms as f64) / 1000.0)
+            };
+
+            unsafe {
+                *out_up = up;
+                *out_severity = severity;
+                *out_rt_mode = rt_mode;
+                *out_rt_int_seconds = rt_int;
+                *out_rt_float_seconds = rt_float;
+            }
+            1
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Evaluates `UserInactivityEvaluator::isActivityStale()` on UTC microsecond timestamps.
+    /// Returns `1` when stale, `0` when not stale, or `-1` on invalid flags (`> 1`).
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_user_inactivity_is_activity_stale(
+        has_activity_at: u8,
+        activity_at_us: i64,
+        has_fallback_at: u8,
+        fallback_at_us: i64,
+        threshold_us: i64,
+    ) -> i32 {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match cat22_is_activity_stale(
+                has_activity_at,
+                activity_at_us,
+                has_fallback_at,
+                fallback_at_us,
+                threshold_us,
+            ) {
+                Some(stale) => i32::from(stale),
+                None => -1,
+            }
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Evaluates `UserInactivityEvaluator::isDownloadActivityStale()` on UTC microsecond timestamps.
+    /// Returns `1` when stale, `0` when not stale, or `-1` on invalid flags (`> 1`).
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_user_inactivity_is_download_stale(
+        has_created_at: u8,
+        created_at_us: i64,
+        has_updated_at: u8,
+        updated_at_us: i64,
+        has_last_download_at: u8,
+        last_download_at_us: i64,
+        grabs: i64,
+        threshold_us: i64,
+    ) -> i32 {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match cat22_is_download_stale(
+                has_created_at,
+                created_at_us,
+                has_updated_at,
+                updated_at_us,
+                has_last_download_at,
+                last_download_at_us,
+                grabs,
+                threshold_us,
+            ) {
+                Some(stale) => i32::from(stale),
+                None => -1,
+            }
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Evaluates `UserInactivityEvaluator::shouldPurge()` on UTC microsecond timestamps.
+    /// Returns `1` when the account should be purged, `0` when it should be retained,
+    /// or `-1` on invalid flags (`> 1`).
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_user_inactivity_should_purge(
+        has_created_at: u8,
+        created_at_us: i64,
+        has_updated_at: u8,
+        updated_at_us: i64,
+        has_last_login_at: u8,
+        last_login_at_us: i64,
+        has_api_access_at: u8,
+        api_access_at_us: i64,
+        has_last_download_at: u8,
+        last_download_at_us: i64,
+        grabs: i64,
+        threshold_us: i64,
+    ) -> i32 {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let Some(login_stale) = cat22_is_activity_stale(
+                has_last_login_at,
+                last_login_at_us,
+                has_created_at,
+                created_at_us,
+                threshold_us,
+            ) else {
+                return -1;
+            };
+            let Some(api_stale) = cat22_is_activity_stale(
+                has_api_access_at,
+                api_access_at_us,
+                has_created_at,
+                created_at_us,
+                threshold_us,
+            ) else {
+                return -1;
+            };
+            let Some(download_stale) = cat22_is_download_stale(
+                has_created_at,
+                created_at_us,
+                has_updated_at,
+                updated_at_us,
+                has_last_download_at,
+                last_download_at_us,
+                grabs,
+                threshold_us,
+            ) else {
+                return -1;
+            };
+
+            i32::from(login_stale && api_stale && download_stale)
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Formats NUL-separated anonymous identity fields (`username\0email\0name`) for
+    /// `GdprErasureService::anonymousIdentity(int $userId)`:
+    /// - `deleted_user_{user_id}`
+    /// - `deleted-user-{user_id}@deleted.invalid`
+    /// - `Deleted user {user_id}`
+    ///
+    /// Returns written byte length (`> 0`), `< -1` (`-needed`) when `out_cap` is too small,
+    /// or `-1` on invalid output buffer arguments.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_gdpr_erasure_anonymous_identity_nul(
+        user_id: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let id_str = user_id.to_string();
+            let id_bytes = id_str.as_bytes();
+            unsafe {
+                cat22_write_slices(
+                    out_buf,
+                    out_cap,
+                    &[
+                        b"deleted_user_",
+                        id_bytes,
+                        b"\0deleted-user-",
+                        id_bytes,
+                        b"@deleted.invalid\0Deleted user ",
+                        id_bytes,
+                    ],
+                )
+            }
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Resolves the GDPR audit event name (`'erasure_force_delete'` or `'erasure_soft_delete'`)
+    /// for `GdprErasureService::eraseForAccountDeletion()`.
+    ///
+    /// Returns written byte length (`20`), `< -1` (`-needed`) when `out_cap` is too small,
+    /// or `-1` on invalid `force_delete` (`> 1`) or invalid output buffer arguments.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_gdpr_erasure_event_name(
+        force_delete: u8,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let name: &[u8] = match force_delete {
+                1 => b"erasure_force_delete",
+                0 => b"erasure_soft_delete",
+                _ => return -1,
+            };
+            unsafe { cat22_write_slices(out_buf, out_cap, &[name]) }
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Formats `json_encode(['subject' => $anonymousUsername], JSON_UNESCAPED_SLASHES)` for
+    /// `GdprErasureService::anonymizeRetainedAuditRecords()`.
+    ///
+    /// Returns written byte length (`> 0`), `-2` when `username_ptr` contains non-ASCII bytes,
+    /// `< -2` (`-needed`) when `out_cap` is too small, or `-1` on invalid arguments.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_gdpr_erasure_audit_subject_json(
+        username_ptr: *const u8,
+        username_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if !cat22_valid_out_buf(out_buf, out_cap) {
+                return -1;
+            }
+            let Some(username) =
+                (unsafe { cat22_valid_slice(username_ptr, username_len, CAT22_MAX_SEG_LEN) })
+            else {
+                return -1;
+            };
+            if !username.is_ascii() {
+                return -2;
+            }
+
+            let mut escaped = Vec::with_capacity(username.len() + 16);
+            escaped.extend_from_slice(b"{\"subject\":\"");
+            for &b in username {
+                match b {
+                    b'"' => escaped.extend_from_slice(b"\\\""),
+                    b'\\' => escaped.extend_from_slice(b"\\\\"),
+                    0x08 => escaped.extend_from_slice(b"\\b"),
+                    0x09 => escaped.extend_from_slice(b"\\t"),
+                    0x0A => escaped.extend_from_slice(b"\\n"),
+                    0x0C => escaped.extend_from_slice(b"\\f"),
+                    0x0D => escaped.extend_from_slice(b"\\r"),
+                    0x00..=0x1F => {
+                        escaped.extend_from_slice(b"\\u00");
+                        escaped.push(CAT22_HEX_LOWER[(b >> 4) as usize]);
+                        escaped.push(CAT22_HEX_LOWER[(b & 0x0f) as usize]);
+                    }
+                    _ => escaped.push(b),
+                }
+            }
+            escaped.extend_from_slice(b"\"}");
+
+            unsafe { cat22_write_slices(out_buf, out_cap, &[&escaped]) }
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Classifies top-level metadata keys for `GdprErasureService::sanitizeMetadata()`.
+    ///
+    /// For each NUL-separated key in `keys_nul_ptr` (`0..key_count`), writes a action byte to
+    /// `out_keep_mask[i]`:
+    /// - `0`: redact/unset (`email`, `ip_address`, `host`)
+    /// - `1`: retain original key/value
+    /// - `2`: existing `gdpr_minimized` key (overwrite in-place with `true`)
+    ///
+    /// Sets `*out_has_gdpr_minimized` to `1` if `gdpr_minimized` was already present, else `0`.
+    /// Returns the number of retained keys (`>= 0`), `< -1` (`-needed`) when `out_mask_cap < key_count`,
+    /// or `-1` on invalid arguments.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_gdpr_erasure_filter_metadata_keys_nul(
+        keys_nul_ptr: *const u8,
+        keys_nul_len: usize,
+        key_count: usize,
+        out_keep_mask: *mut u8,
+        out_mask_cap: usize,
+        out_has_gdpr_minimized: *mut i32,
+    ) -> isize {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if key_count > CAT22_MAX_SEG_LEN
+                || !cat22_valid_out_buf(out_keep_mask, out_mask_cap)
+                || out_has_gdpr_minimized.is_null()
+                || !out_has_gdpr_minimized.is_aligned()
+            {
+                return -1;
+            }
+            let Some(keys_nul) =
+                (unsafe { cat22_valid_slice(keys_nul_ptr, keys_nul_len, CAT22_MAX_SEG_LEN) })
+            else {
+                return -1;
+            };
+
+            if key_count == 0 {
+                if !keys_nul.is_empty() {
+                    return -1;
+                }
+                unsafe {
+                    *out_has_gdpr_minimized = 0;
+                }
+                return 0;
+            }
+
+            let nul_count = keys_nul.iter().filter(|&&b| b == 0).count();
+            if nul_count + 1 != key_count {
+                return -1;
+            }
+            if out_mask_cap < key_count {
+                return -(key_count.max(4) as isize);
+            }
+
+            let mut kept = 0usize;
+            let mut has_gdpr_minimized = 0i32;
+            for (idx, key) in keys_nul.split(|&b| b == 0).enumerate() {
+                let code = if matches!(key, b"email" | b"ip_address" | b"host") {
+                    0u8
+                } else if key == b"gdpr_minimized" {
+                    has_gdpr_minimized = 1;
+                    kept += 1;
+                    2u8
+                } else {
+                    kept += 1;
+                    1u8
+                };
+                unsafe {
+                    *out_keep_mask.add(idx) = code;
+                }
+            }
+
+            unsafe {
+                *out_has_gdpr_minimized = has_gdpr_minimized;
+            }
+            kept as isize
+        }))
+        .unwrap_or(-1)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn database_probe_helpers_match_php_contracts() {
+            let mut elapsed = -1i64;
+            let mut buf = [0u8; 256];
+
+            let n = unsafe {
+                nntmux_database_probe_evaluate_connected(
+                    1_000_000_000,
+                    1_004_750_000,
+                    &mut elapsed,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            } as usize;
+            assert_eq!(elapsed, 4);
+            assert_eq!(&buf[..n], b"Connected");
+
+            let err = b"SQLSTATE[HY000] [2002] Connection refused";
+            let n = unsafe {
+                nntmux_database_probe_format_unreachable(
+                    err.as_ptr(),
+                    err.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            } as usize;
+            assert_eq!(
+                &buf[..n],
+                b"Database unreachable: SQLSTATE[HY000] [2002] Connection refused"
+            );
+
+            let long_err = [b'x'; 130];
+            let n = unsafe {
+                nntmux_database_probe_format_unreachable(
+                    long_err.as_ptr(),
+                    long_err.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            } as usize;
+            assert_eq!(n, 22 + 120 + 3);
+            assert!(buf[..n].ends_with(b"..."));
+
+            let non_ascii = "é".as_bytes();
+            assert_eq!(
+                unsafe {
+                    nntmux_database_probe_format_unreachable(
+                        non_ascii.as_ptr(),
+                        non_ascii.len(),
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                -2
+            );
+        }
+
+        #[test]
+        fn collectors_inactivity_and_gdpr_erasure_helpers_match_php_contracts() {
+            assert_eq!(
+                unsafe { nntmux_release_verification_collector_is_timeout_code(1969) },
+                1
+            );
+            assert_eq!(
+                unsafe { nntmux_release_verification_collector_is_timeout_code(3024) },
+                1
+            );
+            assert_eq!(
+                unsafe { nntmux_release_verification_collector_is_timeout_code(1045) },
+                0
+            );
+
+            let mut scratch_known = 0i32;
+            let mut scratch_bytes = 0.0f64;
+            let mut scratch_age = 0i64;
+            let mut verified_is_float = 0i32;
+            let mut verified_bps = 0.0f64;
+            assert_eq!(
+                unsafe {
+                    nntmux_release_verification_collector_evaluate_snapshot(
+                        1,
+                        1_700_000_000,
+                        1_700_000_600,
+                        0,
+                        1,
+                        1234.5,
+                        1,
+                        5678.0,
+                        &mut scratch_known,
+                        &mut scratch_bytes,
+                        &mut scratch_age,
+                        &mut verified_is_float,
+                        &mut verified_bps,
+                    )
+                },
+                1
+            );
+            assert_eq!(scratch_known, 1);
+            assert_eq!(scratch_bytes, 1234.5);
+            assert_eq!(scratch_age, 600);
+            assert_eq!(verified_is_float, 1);
+            assert_eq!(verified_bps, 5678.0);
+
+            let mut backlog_age = -1i64;
+            assert_eq!(
+                unsafe {
+                    nntmux_release_verification_collector_backlog_age(
+                        1,
+                        1_700_000_000,
+                        1_700_007_200,
+                        &mut backlog_age,
+                    )
+                },
+                1
+            );
+            assert_eq!(backlog_age, 7200);
+
+            let mut up = -1i32;
+            let mut sev = -1i32;
+            let mut rt_mode = -99i32;
+            let mut rt_int = -1i64;
+            let mut rt_float = -1.0f64;
+            assert_eq!(
+                unsafe {
+                    nntmux_service_status_collector_evaluate(
+                        b"degraded".as_ptr(),
+                        8,
+                        1,
+                        250,
+                        &mut up,
+                        &mut sev,
+                        &mut rt_mode,
+                        &mut rt_int,
+                        &mut rt_float,
+                    )
+                },
+                1
+            );
+            assert_eq!(up, 1);
+            assert_eq!(sev, 1);
+            assert_eq!(rt_mode, 0);
+            assert_eq!(rt_float, 0.25);
+
+            assert_eq!(
+                unsafe {
+                    nntmux_user_inactivity_should_purge(
+                        1, 100, 1, 100, 0, 0, 0, 0, 0, 0, 0, 200,
+                    )
+                },
+                1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_user_inactivity_should_purge(
+                        1, 100, 1, 300, 1, 100, 1, 100, 0, 0, 15, 200,
+                    )
+                },
+                0
+            );
+
+            let mut buf = [0u8; 256];
+            let n = unsafe {
+                nntmux_gdpr_erasure_anonymous_identity_nul(42, buf.as_mut_ptr(), buf.len())
+            } as usize;
+            assert_eq!(
+                &buf[..n],
+                b"deleted_user_42\0deleted-user-42@deleted.invalid\0Deleted user 42"
+            );
+
+            let n = unsafe { nntmux_gdpr_erasure_event_name(1, buf.as_mut_ptr(), buf.len()) }
+                as usize;
+            assert_eq!(&buf[..n], b"erasure_force_delete");
+
+            let n = unsafe {
+                nntmux_gdpr_erasure_audit_subject_json(
+                    b"deleted_user_42".as_ptr(),
+                    15,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            } as usize;
+            assert_eq!(&buf[..n], br#"{"subject":"deleted_user_42"}"#);
+
+            let keys = b"email\0ip_address\0browser\0host\0gdpr_minimized";
+            let mut mask = [0u8; 8];
+            let mut has_gdpr = -1i32;
+            let kept = unsafe {
+                nntmux_gdpr_erasure_filter_metadata_keys_nul(
+                    keys.as_ptr(),
+                    keys.len(),
+                    5,
+                    mask.as_mut_ptr(),
+                    mask.len(),
+                    &mut has_gdpr,
+                )
+            };
+            assert_eq!(kept, 2);
+            assert_eq!(&mask[..5], &[0, 0, 1, 0, 2]);
+            assert_eq!(has_gdpr, 1);
+        }
+
+        #[test]
+        fn wave22_slice6_entrypoints_reject_null_unaligned_and_undersized_buffers() {
+            let mut raw = [0u8; 128];
+            let unaligned_i64 = unsafe { raw.as_mut_ptr().add(1).cast::<i64>() };
+            let unaligned_i32 = unsafe { raw.as_mut_ptr().add(1).cast::<i32>() };
+            let unaligned_f64 = unsafe { raw.as_mut_ptr().add(1).cast::<f64>() };
+            let mut buf = [0u8; 64];
+            let mut small = [0u8; 4];
+
+            assert_eq!(
+                unsafe {
+                    nntmux_database_probe_evaluate_connected(
+                        0,
+                        1_000_000,
+                        unaligned_i64,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                -1
+            );
+            assert!(
+                unsafe {
+                    nntmux_database_probe_evaluate_connected(
+                        0,
+                        1_000_000,
+                        &mut 0i64,
+                        small.as_mut_ptr(),
+                        small.len(),
+                    )
+                } < -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_database_probe_format_unreachable(
+                        std::ptr::null(),
+                        5,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_release_verification_collector_evaluate_snapshot(
+                        1,
+                        100,
+                        200,
+                        0,
+                        1,
+                        10.0,
+                        1,
+                        20.0,
+                        unaligned_i32,
+                        &mut 0.0,
+                        &mut 0,
+                        &mut 0,
+                        &mut 0.0,
+                    )
+                },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_release_verification_collector_backlog_age(1, 100, 200, unaligned_i64)
+                },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_service_status_collector_evaluate(
+                        b"operational".as_ptr(),
+                        11,
+                        1,
+                        100,
+                        &mut 0,
+                        &mut 0,
+                        &mut 0,
+                        &mut 0,
+                        unaligned_f64,
+                    )
+                },
+                -1
+            );
+            assert_eq!(
+                unsafe { nntmux_user_inactivity_is_activity_stale(2, 0, 0, 0, 0) },
+                -1
+            );
+            assert_eq!(
+                unsafe { nntmux_user_inactivity_is_download_stale(0, 0, 0, 0, 2, 0, 0, 0) },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_user_inactivity_should_purge(0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0)
+                },
+                -1
+            );
+            assert!(
+                unsafe {
+                    nntmux_gdpr_erasure_anonymous_identity_nul(1, small.as_mut_ptr(), small.len())
+                } < -1
+            );
+            assert_eq!(
+                unsafe { nntmux_gdpr_erasure_event_name(2, buf.as_mut_ptr(), buf.len()) },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_gdpr_erasure_audit_subject_json(
+                        std::ptr::null(),
+                        4,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_gdpr_erasure_filter_metadata_keys_nul(
+                        b"a".as_ptr(),
+                        1,
+                        1,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                        unaligned_i32,
+                    )
+                },
+                -1
+            );
+        }
+    }
+}
