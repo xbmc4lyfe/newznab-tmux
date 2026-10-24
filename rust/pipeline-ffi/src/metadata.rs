@@ -26903,4 +26903,956 @@ pub mod role_payment_genre_metric_model {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Wave 26 Slice 26.4: CoverController, CartController,
+// FailedReleasesController, CategoryData, and ServiceIncident helpers
+// ---------------------------------------------------------------------------
+
+pub mod cover_cart_failed_controllers {
+    use std::mem::size_of;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    const DECLINE: isize = -1;
+    const MAX_INPUT: usize = (isize::MAX as usize) / 8;
+    const MAX_I64_LEN: usize = (isize::MAX as usize) / size_of::<i64>();
+
+    const MSG_ALREADY_IN_CART: &[u8] = b"Items already in cart";
+    const MSG_ADDED_SUFFIX: &[u8] = b" item(s) added to cart";
+
+    const DNZB_400_BODY: &[u8] = b"Bad request, please supply all parameters!";
+    const DNZB_400_RTEXT: &[u8] = b"Bad request, please supply all parameters!";
+    const DNZB_401_BODY: &[u8] = b"Unauthorised, wrong rss key!";
+    const DNZB_401_RTEXT: &[u8] = b"Unauthorised, wrong rss key!";
+    const DNZB_404_BODY: &[u8] = b"No NZB found for alternate match!";
+    const DNZB_404_RTEXT: &[u8] = b"No NZB found for alternate match.";
+
+    const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
+
+    #[inline]
+    unsafe fn valid_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null()
+            || !ptr.is_aligned()
+            || len > MAX_INPUT
+            || len > isize::MAX as usize
+            || (ptr as usize).checked_add(len).is_none()
+        {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    unsafe fn valid_i64_slice<'a>(ptr: *const i64, len: usize) -> Option<&'a [i64]> {
+        if ptr.is_null() || !ptr.is_aligned() || len > MAX_I64_LEN {
+            return None;
+        }
+        let byte_len = len.checked_mul(size_of::<i64>())?;
+        if byte_len > isize::MAX as usize || (ptr as usize).checked_add(byte_len).is_none() {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn valid_out_buf(out_buf: *mut u8, out_cap: usize) -> bool {
+        !out_buf.is_null()
+            && out_buf.is_aligned()
+            && out_cap <= isize::MAX as usize
+            && (out_buf as usize).checked_add(out_cap).is_some()
+    }
+
+    #[inline]
+    fn valid_mut_slice<T>(ptr: *mut T, count: usize) -> bool {
+        if ptr.is_null() || !ptr.is_aligned() {
+            return false;
+        }
+        let Some(byte_len) = count.checked_mul(size_of::<T>()) else {
+            return false;
+        };
+        byte_len <= isize::MAX as usize && (ptr as usize).checked_add(byte_len).is_some()
+    }
+
+    #[inline]
+    fn is_valid_cover_type(cover_type: &[u8]) -> bool {
+        matches!(
+            cover_type,
+            b"anime"
+                | b"audio"
+                | b"audiosample"
+                | b"book"
+                | b"console"
+                | b"games"
+                | b"movies"
+                | b"music"
+                | b"preview"
+                | b"sample"
+                | b"tvrage"
+                | b"video"
+                | b"tvshows"
+        )
+    }
+
+    #[inline]
+    fn is_numeric_id_cover_type(cover_type: &[u8]) -> bool {
+        matches!(
+            cover_type,
+            b"anime" | b"book" | b"console" | b"games" | b"music" | b"tvshows"
+        )
+    }
+
+    #[inline]
+    fn normalize_cover_extension(ext: &[u8]) -> Option<&'static [u8]> {
+        if ext.eq_ignore_ascii_case(b"webp") {
+            Some(b"webp")
+        } else if ext.eq_ignore_ascii_case(b"jpg") {
+            Some(b"jpg")
+        } else if ext.eq_ignore_ascii_case(b"jpeg") {
+            Some(b"jpeg")
+        } else if ext.eq_ignore_ascii_case(b"png") {
+            Some(b"png")
+        } else if ext.eq_ignore_ascii_case(b"gif") {
+            Some(b"gif")
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn split_valid_cover_filename(filename: &[u8]) -> Option<(&[u8], &'static [u8])> {
+        let dot_pos = filename.iter().position(|&b| b == b'.')?;
+        if dot_pos == 0 {
+            return None;
+        }
+        let base = &filename[..dot_pos];
+        let ext = &filename[dot_pos + 1..];
+        if !base[0].is_ascii_alphanumeric() {
+            return None;
+        }
+        if !base[1..]
+            .iter()
+            .all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return None;
+        }
+        let norm_ext = normalize_cover_extension(ext)?;
+        Some((base, norm_ext))
+    }
+
+    #[inline]
+    fn is_invalid_numeric_cover_filename(base: &[u8], norm_ext: &[u8]) -> bool {
+        if !matches!(norm_ext, b"webp" | b"jpg" | b"jpeg") {
+            return false;
+        }
+        let digits_part = if base.len() > 6 && base[base.len() - 6..].eq_ignore_ascii_case(b"-cover")
+        {
+            &base[..base.len() - 6]
+        } else {
+            base
+        };
+        let (negative, digits) = if let Some(rest) = digits_part.strip_prefix(b"-") {
+            (true, rest)
+        } else {
+            (false, digits_part)
+        };
+        if digits.is_empty() || !digits.iter().all(|&b| b.is_ascii_digit()) {
+            return false;
+        }
+        negative || digits.iter().all(|&b| b == b'0')
+    }
+
+    #[inline]
+    fn is_php_trim_byte(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\0' | b'\x0b')
+    }
+
+    #[inline]
+    fn trim_php_ascii(mut slice: &[u8]) -> &[u8] {
+        while let Some((&first, rest)) = slice.split_first() {
+            if is_php_trim_byte(first) {
+                slice = rest;
+            } else {
+                break;
+            }
+        }
+        while let Some((&last, rest)) = slice.split_last() {
+            if is_php_trim_byte(last) {
+                slice = rest;
+            } else {
+                break;
+            }
+        }
+        slice
+    }
+
+    #[inline]
+    fn is_non_canonical_numeric_candidate(s: &[u8]) -> bool {
+        !s.is_empty()
+            && s.iter()
+                .all(|&b| b.is_ascii_digit() || matches!(b, b'+' | b'-' | b'.' | b'e' | b'E'))
+            && (s[0] == b'0'
+                || matches!(s[0], b'+' | b'-' | b'.')
+                || s.iter().any(|&b| matches!(b, b'.' | b'e' | b'E')))
+    }
+
+    #[inline]
+    fn is_rfc3986_unreserved(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~')
+    }
+
+    #[inline]
+    fn rfc3986_encoded_len(input: &[u8]) -> Option<usize> {
+        let mut total = 0usize;
+        for &b in input {
+            let add = if is_rfc3986_unreserved(b) { 1 } else { 3 };
+            total = total.checked_add(add)?;
+        }
+        Some(total)
+    }
+
+    #[inline]
+    fn write_rfc3986_encoded(input: &[u8], out: &mut Vec<u8>) {
+        for &b in input {
+            if is_rfc3986_unreserved(b) {
+                out.push(b);
+            } else {
+                out.push(b'%');
+                out.push(HEX_UPPER[(b >> 4) as usize]);
+                out.push(HEX_UPPER[(b & 0x0F) as usize]);
+            }
+        }
+    }
+
+    /// Validates a cover request `(type, filename)` and expands candidate basenames
+    /// and extensions for `CoverController::show()` and `resolveImagePath()`.
+    ///
+    /// Writes 4 `usize` values to `out_meta`:
+    /// - `out_meta[0]`: `valid` (`1` if valid type and filename, `0` otherwise)
+    /// - `out_meta[1]`: `placeholder` (`1` if numeric-ID cover filename is `<= 0`, `0` otherwise)
+    /// - `out_meta[2]`: number of candidate basenames (`0..=2`)
+    /// - `out_meta[3]`: number of candidate extensions (`0`, `3`, or `4`)
+    ///
+    /// When `valid == 1` and `placeholder == 0`, writes the NUL-separated candidate
+    /// basenames followed by NUL-separated candidate extensions into `out_buf` and
+    /// returns the byte length written. Returns negative required length without
+    /// modifying `out_buf` if `out_cap` is too small, or `-1` on invalid arguments.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_cover_validate_and_expand(
+        type_ptr: *const u8,
+        type_len: usize,
+        filename_ptr: *const u8,
+        filename_len: usize,
+        out_meta: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_mut_slice(out_meta, 4) || !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(cover_type) = (unsafe { valid_slice(type_ptr, type_len) }) else {
+                return DECLINE;
+            };
+            let Some(filename) = (unsafe { valid_slice(filename_ptr, filename_len) }) else {
+                return DECLINE;
+            };
+
+            if !is_valid_cover_type(cover_type) {
+                let meta = unsafe { slice::from_raw_parts_mut(out_meta, 4) };
+                meta[0] = 0;
+                meta[1] = 0;
+                meta[2] = 0;
+                meta[3] = 0;
+                return 0;
+            }
+
+            let Some((base, norm_ext)) = split_valid_cover_filename(filename) else {
+                let meta = unsafe { slice::from_raw_parts_mut(out_meta, 4) };
+                meta[0] = 0;
+                meta[1] = 0;
+                meta[2] = 0;
+                meta[3] = 0;
+                return 0;
+            };
+
+            if is_numeric_id_cover_type(cover_type) && is_invalid_numeric_cover_filename(base, norm_ext)
+            {
+                let meta = unsafe { slice::from_raw_parts_mut(out_meta, 4) };
+                meta[0] = 1;
+                meta[1] = 1;
+                meta[2] = 0;
+                meta[3] = 0;
+                return 0;
+            }
+
+            let mut basenames: Vec<Vec<u8>> = Vec::with_capacity(2);
+            if (cover_type == b"preview" || cover_type == b"sample") && !base.ends_with(b"_thumb") {
+                let mut thumb = Vec::with_capacity(base.len() + 6);
+                thumb.extend_from_slice(base);
+                thumb.extend_from_slice(b"_thumb");
+                basenames.push(thumb);
+            }
+            basenames.push(base.to_vec());
+
+            if cover_type == b"anime"
+                && let Some(digits) = base.strip_suffix(b"-cover")
+                && !digits.is_empty()
+                && digits.iter().all(|&b| b.is_ascii_digit())
+            {
+                basenames.push(digits.to_vec());
+            }
+
+            let extensions: &[&[u8]] = match norm_ext {
+                b"webp" => &[b"webp", b"jpg", b"jpeg"],
+                b"jpg" => &[b"jpg", b"webp", b"jpeg"],
+                b"jpeg" => &[b"jpeg", b"webp", b"jpg"],
+                b"png" => &[b"png", b"webp", b"jpg", b"jpeg"],
+                b"gif" => &[b"gif", b"webp", b"jpg", b"jpeg"],
+                _ => return DECLINE,
+            };
+
+            let total_items = basenames.len() + extensions.len();
+            let mut required = total_items.saturating_sub(1);
+            for b in &basenames {
+                let Some(next) = required.checked_add(b.len()) else {
+                    return DECLINE;
+                };
+                required = next;
+            }
+            for e in extensions {
+                let Some(next) = required.checked_add(e.len()) else {
+                    return DECLINE;
+                };
+                required = next;
+            }
+            if required > isize::MAX as usize {
+                return DECLINE;
+            }
+
+            let meta = unsafe { slice::from_raw_parts_mut(out_meta, 4) };
+            meta[0] = 1;
+            meta[1] = 0;
+            meta[2] = basenames.len();
+            meta[3] = extensions.len();
+
+            if required > out_cap {
+                return -(required as isize);
+            }
+
+            let dst = unsafe { slice::from_raw_parts_mut(out_buf, required) };
+            let mut offset = 0usize;
+            for (idx, b) in basenames.iter().enumerate() {
+                if idx > 0 {
+                    dst[offset] = 0;
+                    offset += 1;
+                }
+                dst[offset..offset + b.len()].copy_from_slice(b);
+                offset += b.len();
+            }
+            for e in extensions {
+                dst[offset] = 0;
+                offset += 1;
+                dst[offset..offset + e.len()].copy_from_slice(e);
+                offset += e.len();
+            }
+
+            required as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Returns `1` if `mime` is an allowed cover image MIME type
+    /// (`image/jpeg`, `image/png`, `image/gif`, `image/webp`), `0` otherwise,
+    /// or `-1` if the input slice is invalid.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_cover_is_allowed_mime(
+        mime_ptr: *const u8,
+        mime_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(mime) = (unsafe { valid_slice(mime_ptr, mime_len) }) else {
+                return DECLINE as i32;
+            };
+            i32::from(matches!(
+                mime,
+                b"image/jpeg" | b"image/png" | b"image/gif" | b"image/webp"
+            ))
+        }))
+        .unwrap_or(DECLINE as i32)
+    }
+
+    /// Splits a comma-separated GUID list, trims PHP ASCII whitespace, drops
+    /// PHP-falsy tokens (`""` and `"0"`), deduplicates preserving first-seen
+    /// order, and writes NUL-separated tokens into `out_buf`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_cart_parse_guids_csv(
+        csv_ptr: *const u8,
+        csv_len: usize,
+        out_count: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_mut_slice(out_count, 1) || !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(csv) = (unsafe { valid_slice(csv_ptr, csv_len) }) else {
+                return DECLINE;
+            };
+
+            let mut unique: Vec<&[u8]> = Vec::new();
+            for part in csv.split(|&b| b == b',') {
+                let trimmed = trim_php_ascii(part);
+                if trimmed.is_empty() || trimmed == b"0" {
+                    continue;
+                }
+                if trimmed.contains(&0) || is_non_canonical_numeric_candidate(trimmed) {
+                    return DECLINE;
+                }
+                if !unique.iter().any(|&seen| seen == trimmed) {
+                    unique.push(trimmed);
+                }
+            }
+
+            if unique.is_empty() {
+                unsafe {
+                    *out_count = 0;
+                }
+                return 0;
+            }
+
+            let mut required = unique.len() - 1;
+            for item in &unique {
+                let Some(next) = required.checked_add(item.len()) else {
+                    return DECLINE;
+                };
+                required = next;
+            }
+            if required > isize::MAX as usize {
+                return DECLINE;
+            }
+
+            unsafe {
+                *out_count = unique.len();
+            }
+
+            if required > out_cap {
+                return -(required as isize);
+            }
+
+            let dst = unsafe { slice::from_raw_parts_mut(out_buf, required) };
+            let mut offset = 0usize;
+            for (idx, item) in unique.iter().enumerate() {
+                if idx > 0 {
+                    dst[offset] = 0;
+                    offset += 1;
+                }
+                dst[offset..offset + item.len()].copy_from_slice(item);
+                offset += item.len();
+            }
+
+            required as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Computes `array_values(array_diff(release_ids, existing_ids))` into `out_ids`.
+    /// Returns the number of missing IDs written, negative required capacity if
+    /// `out_cap` is too small (without modifying `out_ids`), or `-1` on invalid input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_cart_diff_release_ids(
+        release_ids_ptr: *const i64,
+        release_len: usize,
+        existing_ids_ptr: *const i64,
+        existing_len: usize,
+        out_ids: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out_cap > MAX_I64_LEN || !valid_mut_slice(out_ids, out_cap) {
+                return DECLINE;
+            }
+            let Some(release_ids) = (unsafe { valid_i64_slice(release_ids_ptr, release_len) }) else {
+                return DECLINE;
+            };
+            let Some(existing_ids) = (unsafe { valid_i64_slice(existing_ids_ptr, existing_len) })
+            else {
+                return DECLINE;
+            };
+
+            let mut missing: Vec<i64> = Vec::with_capacity(release_ids.len());
+            for &id in release_ids {
+                if !existing_ids.contains(&id) {
+                    missing.push(id);
+                }
+            }
+
+            let needed = missing.len();
+            if needed > isize::MAX as usize {
+                return DECLINE;
+            }
+            if needed > out_cap {
+                return -(needed as isize);
+            }
+            if needed > 0 {
+                let dst = unsafe { slice::from_raw_parts_mut(out_ids, needed) };
+                dst.copy_from_slice(&missing);
+            }
+
+            needed as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Formats the cart JSON response message for `CartController::store()`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_cart_format_added_message(
+        added_count: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+
+            let mut buf = Vec::with_capacity(40);
+            if added_count > 0 {
+                buf.extend_from_slice(added_count.to_string().as_bytes());
+                buf.extend_from_slice(MSG_ADDED_SUFFIX);
+            } else {
+                buf.extend_from_slice(MSG_ALREADY_IN_CART);
+            }
+
+            let needed = buf.len();
+            if needed > out_cap {
+                return -(needed as isize);
+            }
+            let dst = unsafe { slice::from_raw_parts_mut(out_buf, needed) };
+            dst.copy_from_slice(&buf);
+            needed as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Writes the DNZB error response body and `X-DNZB-RText` header for status
+    /// codes `400`, `401`, and `404`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_failed_release_dnzb_error_spec(
+        code: i32,
+        out_lens: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_mut_slice(out_lens, 2) || !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+
+            let (body, rtext) = match code {
+                400 => (DNZB_400_BODY, DNZB_400_RTEXT),
+                401 => (DNZB_401_BODY, DNZB_401_RTEXT),
+                404 => (DNZB_404_BODY, DNZB_404_RTEXT),
+                _ => return DECLINE,
+            };
+
+            let required = body.len() + rtext.len();
+            let lens = unsafe { slice::from_raw_parts_mut(out_lens, 2) };
+            lens[0] = body.len();
+            lens[1] = rtext.len();
+
+            if required > out_cap {
+                return -(required as isize);
+            }
+
+            let dst = unsafe { slice::from_raw_parts_mut(out_buf, required) };
+            dst[..body.len()].copy_from_slice(body);
+            dst[body.len()..].copy_from_slice(rtext);
+            required as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Builds the RFC 3986 query string `id=<guid>[&r=<token>]` for
+    /// `FailedReleasesController::failed()`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_failed_release_build_location_query(
+        guid_ptr: *const u8,
+        guid_len: usize,
+        has_token: u32,
+        token_ptr: *const u8,
+        token_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if has_token > 1 || !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(guid) = (unsafe { valid_slice(guid_ptr, guid_len) }) else {
+                return DECLINE;
+            };
+            let Some(token) = (unsafe { valid_slice(token_ptr, token_len) }) else {
+                return DECLINE;
+            };
+
+            let Some(enc_guid_len) = rfc3986_encoded_len(guid) else {
+                return DECLINE;
+            };
+            let mut required = 3usize.checked_add(enc_guid_len).unwrap_or(usize::MAX);
+            if has_token == 1 {
+                let Some(enc_token_len) = rfc3986_encoded_len(token) else {
+                    return DECLINE;
+                };
+                required = required
+                    .checked_add(3)
+                    .and_then(|v| v.checked_add(enc_token_len))
+                    .unwrap_or(usize::MAX);
+            }
+            if required > isize::MAX as usize {
+                return DECLINE;
+            }
+            if required > out_cap {
+                return -(required as isize);
+            }
+
+            let mut out = Vec::with_capacity(required);
+            out.extend_from_slice(b"id=");
+            write_rfc3986_encoded(guid, &mut out);
+            if has_token == 1 {
+                out.extend_from_slice(b"&r=");
+                write_rfc3986_encoded(token, &mut out);
+            }
+
+            let dst = unsafe { slice::from_raw_parts_mut(out_buf, required) };
+            dst.copy_from_slice(&out);
+            required as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Normalizes the scalar `(id, name)` fields of `CategoryData::fromCategory()`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_category_data_normalize_payload(
+        id: i64,
+        title_ptr: *const u8,
+        title_len: usize,
+        out_id: *mut i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_mut_slice(out_id, 1) || !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(title) = (unsafe { valid_slice(title_ptr, title_len) }) else {
+                return DECLINE;
+            };
+
+            unsafe {
+                *out_id = id;
+            }
+
+            if title.len() > out_cap {
+                return -(title.len() as isize);
+            }
+            if !title.is_empty() {
+                let dst = unsafe { slice::from_raw_parts_mut(out_buf, title.len()) };
+                dst.copy_from_slice(title);
+            }
+            title.len() as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Evaluates `ServiceIncident::isResolved()` (`status === 'resolved'`).
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_service_incident_is_resolved(
+        has_status: u32,
+        status_ptr: *const u8,
+        status_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if has_status > 1 {
+                return DECLINE as i32;
+            }
+            let Some(status) = (unsafe { valid_slice(status_ptr, status_len) }) else {
+                return DECLINE as i32;
+            };
+            if has_status == 0 {
+                return 0;
+            }
+            i32::from(status == b"resolved")
+        }))
+        .unwrap_or(DECLINE as i32)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn cover_validate_and_expand_contract() {
+            let mut meta = [0usize; 4];
+            let mut buf = [0u8; 256];
+
+            // Anime cover with <digits>-cover.jpg -> basenames ["12345-cover", "12345"], extensions ["jpg", "webp", "jpeg"]
+            let rc = unsafe {
+                nntmux_cover_validate_and_expand(
+                    b"anime".as_ptr(),
+                    5,
+                    b"12345-cover.JPG".as_ptr(),
+                    15,
+                    meta.as_mut_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(rc > 0);
+            assert_eq!(meta, [1, 0, 2, 3]);
+            assert_eq!(
+                &buf[..rc as usize],
+                b"12345-cover\012345\0jpg\0webp\0jpeg"
+            );
+
+            // Preview cover without _thumb -> prepends _thumb
+            let rc = unsafe {
+                nntmux_cover_validate_and_expand(
+                    b"preview".as_ptr(),
+                    7,
+                    b"abc_123.png".as_ptr(),
+                    11,
+                    meta.as_mut_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(rc > 0);
+            assert_eq!(meta, [1, 0, 2, 4]);
+            assert_eq!(
+                &buf[..rc as usize],
+                b"abc_123_thumb\0abc_123\0png\0webp\0jpg\0jpeg"
+            );
+
+            // Invalid numeric cover (0-cover.jpg on numeric type) -> valid=1, placeholder=1
+            let rc = unsafe {
+                nntmux_cover_validate_and_expand(
+                    b"movies".as_ptr(),
+                    6,
+                    b"0-cover.jpg".as_ptr(),
+                    11,
+                    meta.as_mut_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(rc > 0);
+            assert_eq!(meta, [1, 0, 1, 3]);
+
+            let rc = unsafe {
+                nntmux_cover_validate_and_expand(
+                    b"music".as_ptr(),
+                    5,
+                    b"0-cover.jpg".as_ptr(),
+                    11,
+                    meta.as_mut_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(rc, 0);
+            assert_eq!(meta, [1, 1, 0, 0]);
+
+            // Invalid type or filename -> valid=0, placeholder=0
+            let rc = unsafe {
+                nntmux_cover_validate_and_expand(
+                    b"invalid".as_ptr(),
+                    7,
+                    b"123.jpg".as_ptr(),
+                    7,
+                    meta.as_mut_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(rc, 0);
+            assert_eq!(meta, [0, 0, 0, 0]);
+
+            // MIME check
+            assert_eq!(
+                unsafe { nntmux_cover_is_allowed_mime(b"image/webp".as_ptr(), 10) },
+                1
+            );
+            assert_eq!(
+                unsafe { nntmux_cover_is_allowed_mime(b"image/svg+xml".as_ptr(), 13) },
+                0
+            );
+        }
+
+        #[test]
+        fn cart_failed_category_and_incident_contracts() {
+            // Cart CSV parsing
+            let mut count = 0usize;
+            let mut buf = [0u8; 256];
+            let csv = b"  alpha , , 0 , beta , alpha , \tgamma\n ";
+            let rc = unsafe {
+                nntmux_cart_parse_guids_csv(
+                    csv.as_ptr(),
+                    csv.len(),
+                    &mut count,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(count, 3);
+            assert_eq!(&buf[..rc as usize], b"alpha\0beta\0gamma");
+
+            // Cart release ID diffing
+            let rel = [10i64, 20, 30, 40];
+            let ex = [20i64, 40];
+            let mut out_ids = [0i64; 4];
+            let rc = unsafe {
+                nntmux_cart_diff_release_ids(
+                    rel.as_ptr(),
+                    rel.len(),
+                    ex.as_ptr(),
+                    ex.len(),
+                    out_ids.as_mut_ptr(),
+                    out_ids.len(),
+                )
+            };
+            assert_eq!(rc, 2);
+            assert_eq!(&out_ids[..2], &[10, 30]);
+
+            // Cart message formatting
+            let rc =
+                unsafe { nntmux_cart_format_added_message(3, buf.as_mut_ptr(), buf.len()) };
+            assert_eq!(&buf[..rc as usize], b"3 item(s) added to cart");
+            let rc =
+                unsafe { nntmux_cart_format_added_message(0, buf.as_mut_ptr(), buf.len()) };
+            assert_eq!(&buf[..rc as usize], b"Items already in cart");
+
+            // FailedReleasesController DNZB error spec
+            let mut lens = [0usize; 2];
+            let rc = unsafe {
+                nntmux_failed_release_dnzb_error_spec(
+                    404,
+                    lens.as_mut_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(lens, [33, 33]);
+            assert_eq!(
+                &buf[..rc as usize],
+                b"No NZB found for alternate match!No NZB found for alternate match."
+            );
+
+            // FailedReleasesController location query
+            let rc = unsafe {
+                nntmux_failed_release_build_location_query(
+                    b"guid 1/2".as_ptr(),
+                    8,
+                    1,
+                    b"tok+en".as_ptr(),
+                    6,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(&buf[..rc as usize], b"id=guid%201%2F2&r=tok%2Ben");
+
+            // CategoryData normalize payload
+            let mut out_id = 0i64;
+            let rc = unsafe {
+                nntmux_category_data_normalize_payload(
+                    2000,
+                    b"Movies".as_ptr(),
+                    6,
+                    &mut out_id,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(out_id, 2000);
+            assert_eq!(&buf[..rc as usize], b"Movies");
+
+            // ServiceIncident isResolved
+            assert_eq!(
+                unsafe { nntmux_service_incident_is_resolved(1, b"resolved".as_ptr(), 8) },
+                1
+            );
+            assert_eq!(
+                unsafe { nntmux_service_incident_is_resolved(1, b"investigating".as_ptr(), 13) },
+                0
+            );
+            assert_eq!(
+                unsafe { nntmux_service_incident_is_resolved(0, b"".as_ptr(), 0) },
+                0
+            );
+        }
+
+        #[test]
+        fn abi_safety_null_unaligned_and_undersized_buffers() {
+            let mut raw = [0u8; 64];
+            let unaligned_usize = unsafe { raw.as_mut_ptr().add(1) as *mut usize };
+            let unaligned_i64 = unsafe { raw.as_mut_ptr().add(1) as *mut i64 };
+            let unaligned_const_i64 = unsafe { raw.as_ptr().add(1) as *const i64 };
+            let mut small = [b'Z'; 4];
+            let mut meta = [0usize; 4];
+
+            assert_eq!(
+                unsafe {
+                    nntmux_cover_validate_and_expand(
+                        b"anime".as_ptr(),
+                        5,
+                        b"123-cover.jpg".as_ptr(),
+                        13,
+                        unaligned_usize,
+                        small.as_mut_ptr(),
+                        small.len(),
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_cover_validate_and_expand(
+                        b"anime".as_ptr(),
+                        5,
+                        b"123-cover.jpg".as_ptr(),
+                        13,
+                        meta.as_mut_ptr(),
+                        small.as_mut_ptr(),
+                        small.len(),
+                    )
+                },
+                -27
+            );
+            assert_eq!(small, [b'Z'; 4]);
+
+            assert_eq!(
+                unsafe {
+                    nntmux_cart_diff_release_ids(
+                        unaligned_const_i64,
+                        1,
+                        unaligned_const_i64,
+                        1,
+                        unaligned_i64,
+                        1,
+                    )
+                },
+                DECLINE
+            );
+        }
+    }
+}
+
+
 
