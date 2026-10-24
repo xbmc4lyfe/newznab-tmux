@@ -4731,6 +4731,353 @@ pub unsafe extern "C" fn nntmux_manticore_schema_missing_settings_nul(
     cur.finish()
 }
 
+// ---------------------------------------------------------------------------
+// Wave 10 Worker 5: API v2 RSS Date Batch, SecondaryIndexDocuments Timestamp,
+// Manticore Fuzzy Phrase Normalizer, and Elasticsearch Escape String FFI
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn parse_utc_datetime_for_rss(raw: &[u8]) -> Option<i64> {
+    if raw.contains(&0) {
+        return None;
+    }
+    let s = trim_php_ws(raw);
+    if s.len() < 10 || s[4] != b'-' || s[7] != b'-' {
+        return None;
+    }
+    let year = parse_4digits(&s[0..4])?;
+    let month = parse_2digits(&s[5..7])?;
+    let day = parse_2digits(&s[8..10])?;
+    if !(1902..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || day == 0
+        || day > days_in_month(year, month)
+    {
+        return None;
+    }
+
+    let (hour, min, sec) = if s.len() == 10 {
+        (0u32, 0u32, 0u32)
+    } else {
+        if s.len() < 19 || !matches!(s[10], b' ' | b'T' | b't') || s[13] != b':' || s[16] != b':' {
+            return None;
+        }
+        let h = parse_2digits(&s[11..13])?;
+        let m = parse_2digits(&s[14..16])?;
+        let sc = parse_2digits(&s[17..19])?;
+        if h > 23 || m > 59 || sc > 59 {
+            return None;
+        }
+        let mut rest = &s[19..];
+        if rest.first() == Some(&b'.') {
+            let frac_end = rest[1..]
+                .iter()
+                .position(|b| !b.is_ascii_digit())
+                .map_or(rest.len(), |p| 1 + p);
+            let frac_digits = frac_end - 1;
+            if !(1..=6).contains(&frac_digits) {
+                return None;
+            }
+            rest = &rest[frac_end..];
+        }
+        if !matches!(
+            rest,
+            b"" | b"Z" | b"z" | b"+00:00" | b"-00:00" | b"+0000" | b"-0000"
+        ) {
+            return None;
+        }
+        (h, m, sc)
+    };
+
+    Some(
+        days_from_civil(year, month, day) * 86_400
+            + i64::from(hour) * 3_600
+            + i64::from(min) * 60
+            + i64::from(sec),
+    )
+}
+
+/// Formats 1, 2, or 3 UTC datetime strings (`d1`, `d2`, `d3`) into `\n`-separated 31-byte
+/// `DATE_RSS` / `DATE_RFC2822` strings (`31`, `63`, or `95` bytes) for `ReleaseData`,
+/// `DetailsData`, and `ApiV2Presenter`.
+/// Returns `31` / `63` / `95` on success, `-1` on invalid count or null pointer,
+/// `-2` when declined to PHP `Carbon::parse` (non-UTC timezone or non-standard date string),
+/// or `-(required)` when `out_cap` is too small.
+///
+/// # Safety
+///
+/// Each active pointer (`1..=count`) with non-zero length must be valid for reads of its length.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_api_v2_rss_dates_batch(
+    d1_ptr: *const u8,
+    d1_len: usize,
+    d2_ptr: *const u8,
+    d2_len: usize,
+    d3_ptr: *const u8,
+    d3_len: usize,
+    count: usize,
+    tz_is_utc: u32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if !(1..=3).contains(&count) {
+        return -1;
+    }
+    if (d1_len > 0 && d1_ptr.is_null())
+        || (count >= 2 && d2_len > 0 && d2_ptr.is_null())
+        || (count >= 3 && d3_len > 0 && d3_ptr.is_null())
+    {
+        return -1;
+    }
+    if tz_is_utc == 0 {
+        return -2;
+    }
+    if d1_len == 0 || (count >= 2 && d2_len == 0) || (count >= 3 && d3_len == 0) {
+        return -2;
+    }
+
+    let s1 = unsafe { slice::from_raw_parts(d1_ptr, d1_len) };
+    let Some(ts1) = parse_utc_datetime_for_rss(s1) else {
+        return -2;
+    };
+    let Some(rss1) = rfc2822_from_unix_utc_bytes(ts1) else {
+        return -2;
+    };
+
+    let mut cur = OutCursor::new(out_buf, out_cap);
+    cur.push_slice(&rss1);
+    if count == 1 {
+        return cur.finish();
+    }
+
+    let s2 = unsafe { slice::from_raw_parts(d2_ptr, d2_len) };
+    let rss2 = if s2 == s1 {
+        rss1
+    } else {
+        let Some(ts2) = parse_utc_datetime_for_rss(s2) else {
+            return -2;
+        };
+        let Some(r2) = rfc2822_from_unix_utc_bytes(ts2) else {
+            return -2;
+        };
+        r2
+    };
+    cur.push_byte(b'\n');
+    cur.push_slice(&rss2);
+    if count == 2 {
+        return cur.finish();
+    }
+
+    let s3 = unsafe { slice::from_raw_parts(d3_ptr, d3_len) };
+    let rss3 = if s3 == s1 {
+        rss1
+    } else if s3 == s2 {
+        rss2
+    } else {
+        let Some(ts3) = parse_utc_datetime_for_rss(s3) else {
+            return -2;
+        };
+        let Some(r3) = rfc2822_from_unix_utc_bytes(ts3) else {
+            return -2;
+        };
+        r3
+    };
+    cur.push_byte(b'\n');
+    cur.push_slice(&rss3);
+    cur.finish()
+}
+
+/// Accelerates `SecondaryIndexDocuments::releasedateToTimestamp(mixed $value): int`.
+/// Returns `0` for empty input, a Unix timestamp (`i64`) for standard UTC date/datetime strings,
+/// or `i64::MIN` when declined to PHP `Carbon::parse` (non-UTC timezone, null pointer, or non-standard string).
+///
+/// # Safety
+///
+/// `input_ptr` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_secondary_index_releasedate_to_ts(
+    input_ptr: *const u8,
+    input_len: usize,
+    tz_is_utc: u32,
+) -> i64 {
+    if input_len == 0 {
+        return 0;
+    }
+    if input_ptr.is_null() || tz_is_utc == 0 {
+        return i64::MIN;
+    }
+    let slice = unsafe { slice::from_raw_parts(input_ptr, input_len) };
+    parse_utc_datetime_for_rss(slice).unwrap_or(i64::MIN)
+}
+
+#[inline]
+fn is_fuzzy_word_or_ff(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == 0x0C
+}
+
+#[inline]
+fn fuzzy_clean_segment_into(seg: &[u8], cur: &mut OutCursor, has_any: &mut bool) {
+    if seg.is_empty() || seg == b"0" {
+        return;
+    }
+    let mut start = 0usize;
+    while start < seg.len() && !is_fuzzy_word_or_ff(seg[start]) {
+        start += 1;
+    }
+    if start >= seg.len() {
+        return;
+    }
+    let mut end = seg.len();
+    while end > start && !is_fuzzy_word_or_ff(seg[end - 1]) {
+        end -= 1;
+    }
+    if *has_any {
+        cur.push_byte(b' ');
+    }
+    *has_any = true;
+    let mut in_ws = false;
+    for &b in &seg[start..end] {
+        if b.is_ascii_alphanumeric() || b == b'_' {
+            cur.push_byte(b);
+            in_ws = false;
+        } else if !in_ws {
+            cur.push_byte(b' ');
+            in_ws = true;
+        }
+    }
+}
+
+/// Accelerates `ManticoreSearchDriver::phrasesToFuzzyString(array|string $phrases): string`.
+/// When `segment_count == 1`, `input_ptr[..input_len]` is cleaned as a single phrase (preserving
+/// internal NUL byte handling as `[^\w\s]`). When `segment_count > 1`, `input_ptr[..input_len]`
+/// is split into `segment_count` NUL-separated phrase segments.
+///
+/// # Safety
+///
+/// `input_ptr` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_manticore_phrases_to_fuzzy(
+    input_ptr: *const u8,
+    input_len: usize,
+    segment_count: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if input_len > 0 && input_ptr.is_null() {
+        return -1;
+    }
+    if segment_count == 0 {
+        return if input_len == 0 { 0 } else { -1 };
+    }
+    if input_len == 0 {
+        return if segment_count == 1 { 0 } else { -1 };
+    }
+    let slice = unsafe { slice::from_raw_parts(input_ptr, input_len) };
+    let mut cur = OutCursor::new(out_buf, out_cap);
+    let mut has_any = false;
+    if segment_count == 1 {
+        fuzzy_clean_segment_into(slice, &mut cur, &mut has_any);
+        return cur.finish();
+    }
+    let mut iter = slice.split(|&b| b == 0);
+    for _ in 0..segment_count {
+        let Some(seg) = iter.next() else {
+            return -1;
+        };
+        fuzzy_clean_segment_into(seg, &mut cur, &mut has_any);
+    }
+    if iter.next().is_some() {
+        return -1;
+    }
+    cur.finish()
+}
+
+/// Accelerates `ElasticSearchDriver::escapeString(string $string): string`.
+///
+/// # Safety
+///
+/// `input_ptr` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_elastic_escape_string(
+    input_ptr: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if input_len == 0 {
+        return 0;
+    }
+    if input_ptr.is_null() {
+        return -1;
+    }
+    let slice = unsafe { slice::from_raw_parts(input_ptr, input_len) };
+    if slice == b"0" || slice == b"*" {
+        return 0;
+    }
+    let mut start = 0usize;
+    while start < slice.len()
+        && matches!(
+            slice[start],
+            b'.' | b' ' | b'\t' | b'\n' | b'\r' | 0x00 | 0x0B
+        )
+    {
+        start += 1;
+    }
+    if start >= slice.len() {
+        return 0;
+    }
+    let mut end = slice.len();
+    while end > start
+        && matches!(
+            slice[end - 1],
+            b'.' | b' ' | b'\t' | b'\n' | b'\r' | 0x00 | 0x0B
+        )
+    {
+        end -= 1;
+    }
+    let trimmed = &slice[start..end];
+    if !out_buf.is_null() && out_cap >= trimmed.len() {
+        let mut out_len = 0usize;
+        let mut in_ws = false;
+        for &b in trimmed {
+            if matches!(b, b'.' | b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C) {
+                if !in_ws {
+                    unsafe {
+                        *out_buf.add(out_len) = b' ';
+                    }
+                    out_len += 1;
+                    in_ws = true;
+                }
+            } else {
+                unsafe {
+                    *out_buf.add(out_len) = b;
+                }
+                out_len += 1;
+                in_ws = false;
+            }
+        }
+        return out_len as isize;
+    }
+    let mut cur = OutCursor::new(out_buf, out_cap);
+    let mut in_ws = false;
+    for &b in trimmed {
+        if matches!(b, b'.' | b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C) {
+            if !in_ws {
+                cur.push_byte(b' ');
+                in_ws = true;
+            }
+        } else {
+            cur.push_byte(b);
+            in_ws = false;
+        }
+    }
+    cur.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5245,5 +5592,129 @@ mod tests {
         };
         assert_eq!(n_blob, n_set);
         assert_eq!(&buf[..n_blob as usize], b"exact_words");
+    }
+
+    #[test]
+    fn wave10_api_v2_rss_dates_secondary_index_fuzzy_and_escape() {
+        let mut buf = [0u8; 256];
+
+        // 1. nntmux_api_v2_rss_dates_batch (1, 2, and 3 dates)
+        let d1 = b"2026-03-14 01:02:03";
+        let d2 = b"2026-03-14 04:05:06";
+        let d3 = b"2026-03-13 23:59:59";
+        let n1 = unsafe {
+            nntmux_api_v2_rss_dates_batch(
+                d1.as_ptr(),
+                d1.len(),
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                1,
+                1,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(n1, 31);
+        assert_eq!(&buf[..31], b"Sat, 14 Mar 2026 01:02:03 +0000");
+
+        let n2 = unsafe {
+            nntmux_api_v2_rss_dates_batch(
+                d1.as_ptr(),
+                d1.len(),
+                d2.as_ptr(),
+                d2.len(),
+                std::ptr::null(),
+                0,
+                2,
+                1,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(n2, 63);
+        assert_eq!(
+            &buf[..63],
+            b"Sat, 14 Mar 2026 01:02:03 +0000\nSat, 14 Mar 2026 04:05:06 +0000"
+        );
+
+        let n3 = unsafe {
+            nntmux_api_v2_rss_dates_batch(
+                d1.as_ptr(),
+                d1.len(),
+                d2.as_ptr(),
+                d2.len(),
+                d3.as_ptr(),
+                d3.len(),
+                3,
+                1,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(n3, 95);
+        assert_eq!(
+            &buf[..95],
+            b"Sat, 14 Mar 2026 01:02:03 +0000\nSat, 14 Mar 2026 04:05:06 +0000\nFri, 13 Mar 2026 23:59:59 +0000"
+        );
+
+        // Decline on non-UTC or empty date
+        let dec = unsafe {
+            nntmux_api_v2_rss_dates_batch(
+                d1.as_ptr(),
+                d1.len(),
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                1,
+                0,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(dec, -2);
+
+        // 2. nntmux_secondary_index_releasedate_to_ts
+        let ts_empty = unsafe { nntmux_secondary_index_releasedate_to_ts(std::ptr::null(), 0, 1) };
+        assert_eq!(ts_empty, 0);
+        let ts_date =
+            unsafe { nntmux_secondary_index_releasedate_to_ts(b"2023-11-14".as_ptr(), 10, 1) };
+        assert_eq!(ts_date, 1_699_920_000);
+        let ts_declined =
+            unsafe { nntmux_secondary_index_releasedate_to_ts(b"   ".as_ptr(), 3, 1) };
+        assert_eq!(ts_declined, i64::MIN);
+
+        // 3. nntmux_manticore_phrases_to_fuzzy
+        let fz_in = b"Hello...World!\0\x0cTest_123\x0c\00\0   ";
+        let n_fz = unsafe {
+            nntmux_manticore_phrases_to_fuzzy(
+                fz_in.as_ptr(),
+                fz_in.len(),
+                4,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert!(n_fz > 0);
+        assert_eq!(&buf[..n_fz as usize], b"Hello World  Test_123 ");
+
+        // 4. nntmux_elastic_escape_string
+        let esc_in = b" ..Show.Name\t\nS01E02.. ";
+        let n_esc = unsafe {
+            nntmux_elastic_escape_string(
+                esc_in.as_ptr(),
+                esc_in.len(),
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert!(n_esc > 0);
+        assert_eq!(&buf[..n_esc as usize], b"Show Name S01E02");
+        assert_eq!(
+            unsafe { nntmux_elastic_escape_string(b"*".as_ptr(), 1, buf.as_mut_ptr(), buf.len()) },
+            0
+        );
     }
 }
