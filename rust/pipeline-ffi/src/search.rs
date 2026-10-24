@@ -6681,3 +6681,771 @@ mod wave12_tests {
         assert_eq!(needed, -24);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 13 Slice 4: RSS parameters, search reconcile, check-index and Manticore
+// client configuration helpers.
+// ---------------------------------------------------------------------------
+
+/// PHP `trim()` default character mask: `" \t\n\r\0\x0B"` (no form feed).
+#[inline]
+fn w13_is_php_trim(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B)
+}
+
+#[inline]
+fn w13_trim(mut s: &[u8]) -> &[u8] {
+    while let Some((&b, rest)) = s.split_first() {
+        if !w13_is_php_trim(b) {
+            break;
+        }
+        s = rest;
+    }
+    while let Some((&b, rest)) = s.split_last() {
+        if !w13_is_php_trim(b) {
+            break;
+        }
+        s = rest;
+    }
+    s
+}
+
+/// Whitespace accepted around PHP 8 numeric strings: `" \t\n\r\v\f"`.
+#[inline]
+fn w13_is_numeric_ws(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C)
+}
+
+/// Shape of a PHP 8 string under `is_numeric()` and integer casts.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum W13Numeric {
+    /// Whole string is `ws* [+-]? digits ws*` and fits in `i64`.
+    Int(i64),
+    /// Numeric (`is_numeric() === true`) but not a plain in-range integer.
+    OtherNumeric,
+    /// Not numeric and `(int)` yields `0` (no leading numeric prefix).
+    NonNumericZero,
+    /// Not numeric but has a leading numeric prefix (`"5abc"`, `"1.5x"`).
+    LeadingNumeric,
+}
+
+fn w13_classify_numeric(input: &[u8]) -> W13Numeric {
+    let mut i = 0;
+    let n = input.len();
+    while i < n && w13_is_numeric_ws(input[i]) {
+        i += 1;
+    }
+    let mut negative = false;
+    if i < n && (input[i] == b'+' || input[i] == b'-') {
+        negative = input[i] == b'-';
+        i += 1;
+    }
+    let int_start = i;
+    while i < n && input[i].is_ascii_digit() {
+        i += 1;
+    }
+    let int_digits = i - int_start;
+    let mut frac_digits = 0;
+    let mut has_dot = false;
+    if i < n && input[i] == b'.' {
+        has_dot = true;
+        i += 1;
+        let frac_start = i;
+        while i < n && input[i].is_ascii_digit() {
+            i += 1;
+        }
+        frac_digits = i - frac_start;
+    }
+    if int_digits == 0 && frac_digits == 0 {
+        // No numeric prefix at all: `(int)` is 0 and `is_numeric()` is false.
+        return W13Numeric::NonNumericZero;
+    }
+    let mantissa_end = i;
+    let mut has_exp = false;
+    if i < n && (input[i] == b'e' || input[i] == b'E') {
+        let mut j = i + 1;
+        if j < n && (input[j] == b'+' || input[j] == b'-') {
+            j += 1;
+        }
+        let exp_start = j;
+        while j < n && input[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j > exp_start {
+            has_exp = true;
+            i = j;
+        }
+    }
+    let mut k = i;
+    while k < n && w13_is_numeric_ws(input[k]) {
+        k += 1;
+    }
+    if k != n {
+        return W13Numeric::LeadingNumeric;
+    }
+    if has_dot || has_exp {
+        return W13Numeric::OtherNumeric;
+    }
+    let digits = &input[int_start..mantissa_end];
+    let mut value: i64 = 0;
+    for &d in digits {
+        let Some(next) = value.checked_mul(10).and_then(|v| {
+            if negative {
+                v.checked_sub((d - b'0') as i64)
+            } else {
+                v.checked_add((d - b'0') as i64)
+            }
+        }) else {
+            return W13Numeric::OtherNumeric;
+        };
+        value = next;
+    }
+    W13Numeric::Int(value)
+}
+
+/// `RssController::categoryFeedRss()` id list: `explode(',')`, `trim()`, keep `^-?\d+$`.
+/// Writes kept tokens joined by `,`; returns the byte length (`0` for none), `-1` for an invalid
+/// pointer, or `-(needed)` (at most `-4`) when `out_cap` is too small.
+///
+/// # Safety
+/// `input` must reference `len` readable bytes and `out` must reference `out_cap` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_rss_parse_category_ids(
+    input: *const u8,
+    len: usize,
+    out: *mut u8,
+    out_cap: usize,
+) -> isize {
+    let Some(input) = (unsafe { w12_input(input, len) }) else {
+        return -1;
+    };
+    let mut cursor = OutCursor::new(out, out_cap);
+    let mut first = true;
+    for piece in input.split(|&b| b == b',') {
+        let token = w13_trim(piece);
+        let digits = token.strip_prefix(b"-").unwrap_or(token);
+        if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+            continue;
+        }
+        if !first {
+            cursor.push_byte(b',');
+        }
+        first = false;
+        cursor.push_slice(token);
+    }
+    cursor.finish()
+}
+
+/// `RssController` `show`/`anidb` value: `(int) $v === 0 ? -1 : $v + 0` for string inputs.
+/// Returns `1` with `*out` set, `0` when PHP must decide (decimal, exponent, overflow, or leading
+/// numeric garbage that emits a warning), or `-1` for invalid pointers.
+///
+/// # Safety
+/// `input` must reference `len` readable bytes and `out` must be a valid `int64_t` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_rss_show_id(input: *const u8, len: usize, out: *mut i64) -> i32 {
+    let Some(input) = (unsafe { w12_input(input, len) }) else {
+        return -1;
+    };
+    if out.is_null() {
+        return -1;
+    }
+    let value = match w13_classify_numeric(input) {
+        W13Numeric::NonNumericZero | W13Numeric::Int(0) => -1,
+        W13Numeric::Int(v) => v,
+        W13Numeric::OtherNumeric | W13Numeric::LeadingNumeric => return 0,
+    };
+    unsafe { *out = value };
+    1
+}
+
+/// `RssController` `airdate`/`num`: `is_numeric($v) ? abs((int) $v) : default` for strings.
+/// Returns `1` (numeric, `*out = abs(int)`), `2` (not numeric; caller uses its default), `0` when PHP
+/// must decide (decimal, exponent, overflow, or `PHP_INT_MIN`), or `-1` for invalid pointers.
+///
+/// # Safety
+/// `input` must reference `len` readable bytes and `out` must be a valid `int64_t` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_rss_abs_numeric_int(
+    input: *const u8,
+    len: usize,
+    out: *mut i64,
+) -> i32 {
+    let Some(input) = (unsafe { w12_input(input, len) }) else {
+        return -1;
+    };
+    if out.is_null() {
+        return -1;
+    }
+    match w13_classify_numeric(input) {
+        W13Numeric::Int(v) => match v.checked_abs() {
+            Some(abs) => {
+                unsafe { *out = abs };
+                1
+            }
+            None => 0,
+        },
+        W13Numeric::NonNumericZero | W13Numeric::LeadingNumeric => 2,
+        W13Numeric::OtherNumeric => 0,
+    }
+}
+
+#[inline]
+fn w13_push_i64(cursor: &mut OutCursor, value: i64) {
+    let mut buf = [0u8; 20];
+    let mut pos = buf.len();
+    let negative = value < 0;
+    let mut v = value.unsigned_abs();
+    loop {
+        pos -= 1;
+        buf[pos] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    if negative {
+        cursor.push_byte(b'-');
+    }
+    cursor.push_slice(&buf[pos..]);
+}
+
+/// `RSS::getRss()` filter fragments for integer inputs, separated by NUL:
+/// videos, anidb, airdate and limit/offset. Returns bytes written, `-(needed)` when `out_cap` is too
+/// small, or `-1` for an invalid output pointer.
+///
+/// # Safety
+/// `out` must reference `out_cap` writable bytes.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_rss_filter_fragments(
+    videos_id: i64,
+    anidb_id: i64,
+    air_date: i64,
+    cat_search_empty: i32,
+    limit: i64,
+    offset: i64,
+    tv_root: i64,
+    tv_other: i64,
+    out: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if out.is_null() && out_cap > 0 {
+        return -1;
+    }
+    let mut cursor = OutCursor::new(out, out_cap);
+    let cat_limit = |cursor: &mut OutCursor| {
+        if cat_search_empty != 0 {
+            cursor.push_slice(b"AND r.categories_id BETWEEN ");
+            w13_push_i64(cursor, tv_root);
+            cursor.push_slice(b" AND ");
+            w13_push_i64(cursor, tv_other);
+        }
+    };
+    if videos_id > 0 {
+        cursor.push_slice(b"AND r.videos_id = ");
+        w13_push_i64(&mut cursor, videos_id);
+        cursor.push_byte(b' ');
+        cat_limit(&mut cursor);
+    }
+    cursor.push_byte(0);
+    if anidb_id > 0 {
+        cursor.push_slice(b"AND r.anidbid = ");
+        w13_push_i64(&mut cursor, anidb_id);
+        cursor.push_byte(b' ');
+        cat_limit(&mut cursor);
+    }
+    cursor.push_byte(0);
+    if air_date > -1 {
+        cursor.push_slice(b"AND tve.firstaired >= DATE_SUB(CURDATE(), INTERVAL ");
+        w13_push_i64(&mut cursor, air_date);
+        cursor.push_slice(b" DAY)");
+    }
+    cursor.push_byte(0);
+    if limit != -1 {
+        cursor.push_slice(b" LIMIT ");
+        w13_push_i64(&mut cursor, limit);
+        cursor.push_slice(b" OFFSET ");
+        w13_push_i64(&mut cursor, offset);
+    }
+    cursor.finish()
+}
+
+/// `NntmuxSearchReconcile::parseSinceCutoff()` window: `trim()` then `^(\d+)h$` / `^(\d+)d$`
+/// (case-insensitive). Returns `1` (hours) or `2` (days) with `*amount` set using PHP's saturating
+/// integer-string cast, `0` when neither matches, or `-1` for invalid pointers.
+///
+/// # Safety
+/// `input` must reference `len` readable bytes and `amount` must be a valid `int64_t` pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_reconcile_parse_since(
+    input: *const u8,
+    len: usize,
+    amount: *mut i64,
+) -> i32 {
+    let Some(input) = (unsafe { w12_input(input, len) }) else {
+        return -1;
+    };
+    if amount.is_null() {
+        return -1;
+    }
+    let trimmed = w13_trim(input);
+    // PCRE `$` also matches before one final newline, which `trim()` already removed.
+    let Some((&unit, digits)) = trimmed.split_last() else {
+        return 0;
+    };
+    let kind = match unit {
+        b'h' | b'H' => 1,
+        b'd' | b'D' => 2,
+        _ => return 0,
+    };
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return 0;
+    }
+    let mut value: i64 = 0;
+    for &d in digits {
+        value = value.saturating_mul(10).saturating_add((d - b'0') as i64);
+    }
+    unsafe { *amount = value };
+    kind
+}
+
+#[inline]
+unsafe fn w13_read_i64s<'a>(ptr: *const u8, count: usize) -> Option<&'a [u8]> {
+    let bytes = count.checked_mul(8)?;
+    unsafe { w12_input(ptr, bytes) }
+}
+
+#[inline]
+fn w13_i64_at(bytes: &[u8], index: usize) -> i64 {
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(&bytes[index * 8..index * 8 + 8]);
+    i64::from_ne_bytes(raw)
+}
+
+/// `array_values(array_diff($batch, $indexed))` for packed native-endian `int64` lists.
+/// Writes the kept ids (packed `int64`, batch order, duplicates retained) to `out` and returns the
+/// byte length, `-(needed)` when `out_cap` is too small, or `-1` for invalid pointers.
+///
+/// # Safety
+/// `batch`/`indexed` must reference `count * 8` readable bytes; `out` must reference `out_cap`
+/// writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_reconcile_missing_ids(
+    batch: *const u8,
+    batch_count: usize,
+    indexed: *const u8,
+    indexed_count: usize,
+    out: *mut u8,
+    out_cap: usize,
+) -> isize {
+    let (Some(batch), Some(indexed)) = (unsafe { w13_read_i64s(batch, batch_count) }, unsafe {
+        w13_read_i64s(indexed, indexed_count)
+    }) else {
+        return -1;
+    };
+    let mut cursor = OutCursor::new(out, out_cap);
+    if indexed_count == 0 {
+        cursor.push_slice(batch);
+        return cursor.finish();
+    }
+    let mut seen: Vec<i64> = (0..indexed_count).map(|i| w13_i64_at(indexed, i)).collect();
+    seen.sort_unstable();
+    for i in 0..batch_count {
+        let id = w13_i64_at(batch, i);
+        if seen.binary_search(&id).is_err() {
+            cursor.push_slice(&id.to_ne_bytes());
+        }
+    }
+    cursor.finish()
+}
+
+/// `NntmuxSearchReconcile` id probe:
+/// ``SELECT id FROM `index` WHERE id IN (ids) LIMIT n OPTION max_matches=n`` with backticks doubled
+/// and `n = max(count, 1)`. Returns bytes written, `-(needed)` when `out_cap` is too small, or `-1`
+/// for invalid pointers.
+///
+/// # Safety
+/// `index` must reference `index_len` readable bytes, `ids` `count * 8` readable bytes, and `out`
+/// `out_cap` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_reconcile_probe_sql(
+    index: *const u8,
+    index_len: usize,
+    ids: *const u8,
+    count: usize,
+    out: *mut u8,
+    out_cap: usize,
+) -> isize {
+    let (Some(index), Some(ids)) = (unsafe { w12_input(index, index_len) }, unsafe {
+        w13_read_i64s(ids, count)
+    }) else {
+        return -1;
+    };
+    let mut cursor = OutCursor::new(out, out_cap);
+    cursor.push_slice(b"SELECT id FROM `");
+    for chunk in index.split_inclusive(|&b| b == b'`') {
+        cursor.push_slice(chunk);
+        if chunk.last() == Some(&b'`') {
+            cursor.push_byte(b'`');
+        }
+    }
+    cursor.push_slice(b"` WHERE id IN (");
+    for i in 0..count {
+        if i > 0 {
+            cursor.push_byte(b',');
+        }
+        w13_push_i64(&mut cursor, w13_i64_at(ids, i));
+    }
+    let limit = count.max(1) as i64;
+    cursor.push_slice(b") LIMIT ");
+    w13_push_i64(&mut cursor, limit);
+    cursor.push_slice(b" OPTION max_matches=");
+    w13_push_i64(&mut cursor, limit);
+    cursor.finish()
+}
+
+/// PHP 8.4+ `round($value, 2)` (`PHP_ROUND_HALF_UP`) for finite non-negative values.
+fn w13_php_round2(value: f64) -> f64 {
+    if !value.is_finite() || value == 0.0 {
+        return value;
+    }
+    let exponent = 100.0f64;
+    let mut tmp = (value * exponent).floor();
+    if (tmp + 1.0) / exponent == value {
+        tmp += 1.0;
+    }
+    if tmp.abs() >= 1e16 {
+        return value;
+    }
+    let edge = (tmp + 0.5) / exponent;
+    if value >= edge {
+        tmp += 1.0;
+    }
+    tmp / exponent
+}
+
+/// `NntmuxCheckIndex::formatBytes()`: `round($bytes / 1024 ** $pow, 2).' '.$unit`.
+/// Returns bytes written, `-(needed)` when `out_cap` is too small, `-1` for an invalid pointer, or
+/// `-2` when PHP must format the value (non-plain float output).
+///
+/// # Safety
+/// `out` must reference `out_cap` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_checkindex_format_bytes(
+    bytes: i64,
+    out: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if out.is_null() && out_cap > 0 {
+        return -1;
+    }
+    const UNITS: [&[u8]; 5] = [b"B", b"KB", b"MB", b"GB", b"TB"];
+    let bytes = bytes.max(0);
+    let pow = if bytes != 0 {
+        ((bytes as f64).ln() / 1024f64.ln()).floor()
+    } else {
+        0.0
+    };
+    let pow = pow.min(4.0).max(0.0);
+    let scaled = bytes as f64 / 1024f64.powf(pow);
+    let rounded = w13_php_round2(scaled);
+    if !(0.0..1e15).contains(&rounded) {
+        return -2;
+    }
+    let text = format!("{rounded}");
+    let mut cursor = OutCursor::new(out, out_cap);
+    cursor.push_slice(text.as_bytes());
+    cursor.push_byte(b' ');
+    cursor.push_slice(UNITS[pow as usize]);
+    cursor.finish()
+}
+
+/// `NntmuxCheckIndex` Manticore table code for an index option (0 = `releases`/default .. 9).
+///
+/// # Safety
+/// `input` must reference `len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_checkindex_table_code(input: *const u8, len: usize) -> i32 {
+    let Some(input) = (unsafe { w12_input(input, len) }) else {
+        return -1;
+    };
+    match input {
+        b"predb" => 1,
+        b"movies" => 2,
+        b"tvshows" => 3,
+        b"music" => 4,
+        b"books" => 5,
+        b"games" => 6,
+        b"console" => 7,
+        b"steam" => 8,
+        b"anime" => 9,
+        _ => 0,
+    }
+}
+
+/// `ManticoreClientFactory::normalizeHosts()` for strings: `explode(',')`, `trim()`, then
+/// `array_filter()` (drops `''` and `'0'`). Writes kept hosts joined by `,`; returns the byte length
+/// (`0` for none), `-1` for invalid pointers, or `-(needed)` when `out_cap` is too small.
+///
+/// # Safety
+/// `input` must reference `len` readable bytes and `out` must reference `out_cap` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_manticore_cfg_normalize_hosts(
+    input: *const u8,
+    len: usize,
+    out: *mut u8,
+    out_cap: usize,
+) -> isize {
+    let Some(input) = (unsafe { w12_input(input, len) }) else {
+        return -1;
+    };
+    let mut cursor = OutCursor::new(out, out_cap);
+    if w13_trim(input).is_empty() {
+        return cursor.finish();
+    }
+    let mut first = true;
+    for piece in input.split(|&b| b == b',') {
+        let host = w13_trim(piece);
+        if host.is_empty() || host == b"0" {
+            continue;
+        }
+        if !first {
+            cursor.push_byte(b',');
+        }
+        first = false;
+        cursor.push_slice(host);
+    }
+    cursor.finish()
+}
+
+/// Conservative `parse_url()` subset for `ManticoreClientFactory::parseHost()` strings:
+/// `[scheme://]host[:port][/path]` with `host` in `[A-Za-z0-9._-]+`, a 1-5 digit port without a
+/// leading zero (<= 65535) and a path in `[A-Za-z0-9._/-]*`. On success returns `1` and fills
+/// `out[0..7]` = scheme off/len (len `-1` when absent), host off/len, port (`-1` when absent),
+/// path off/len (len `-1` when absent). Returns `0` to defer to PHP and `-1` for invalid pointers.
+///
+/// # Safety
+/// `input` must reference `len` readable bytes and `out` must reference 7 writable `int64_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_manticore_cfg_parse_host(
+    input: *const u8,
+    len: usize,
+    out: *mut i64,
+) -> i32 {
+    let Some(input) = (unsafe { w12_input(input, len) }) else {
+        return -1;
+    };
+    if out.is_null() {
+        return -1;
+    }
+    let mut fields = [0i64, -1, 0, 0, -1, 0, -1];
+    let mut pos = 0usize;
+    if let Some(sep) = input.windows(3).position(|w| w == b"://") {
+        let scheme = &input[..sep];
+        let valid = scheme.first().is_some_and(u8::is_ascii_alphabetic)
+            && scheme
+                .iter()
+                .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'.' | b'-'));
+        if !valid {
+            return 0;
+        }
+        fields[0] = 0;
+        fields[1] = sep as i64;
+        pos = sep + 3;
+    }
+    let host_start = pos;
+    while pos < input.len()
+        && (input[pos].is_ascii_alphanumeric() || matches!(input[pos], b'.' | b'_' | b'-'))
+    {
+        pos += 1;
+    }
+    // `empty($parts['host'])` also rejects the host `"0"`.
+    if pos == host_start || &input[host_start..pos] == b"0" {
+        return 0;
+    }
+    fields[2] = host_start as i64;
+    fields[3] = (pos - host_start) as i64;
+    if pos < input.len() && input[pos] == b':' {
+        pos += 1;
+        let port_start = pos;
+        while pos < input.len() && input[pos].is_ascii_digit() {
+            pos += 1;
+        }
+        let digits = &input[port_start..pos];
+        if digits.is_empty() || digits.len() > 5 || (digits.len() > 1 && digits[0] == b'0') {
+            return 0;
+        }
+        let port = digits
+            .iter()
+            .fold(0i64, |acc, &d| acc * 10 + (d - b'0') as i64);
+        if port > 65535 {
+            return 0;
+        }
+        fields[4] = port;
+    }
+    if pos < input.len() {
+        if input[pos] != b'/' {
+            return 0;
+        }
+        let path = &input[pos..];
+        if !path
+            .iter()
+            .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b'-'))
+        {
+            return 0;
+        }
+        // `//host//x` style paths and `:` in later segments are left to PHP's parser.
+        if path.starts_with(b"//") {
+            return 0;
+        }
+        fields[5] = pos as i64;
+        fields[6] = path.len() as i64;
+    }
+    unsafe { std::ptr::copy_nonoverlapping(fields.as_ptr(), out, fields.len()) };
+    1
+}
+
+#[cfg(test)]
+mod wave13_rss_reconcile_tests {
+    use super::*;
+
+    fn buf_call(f: impl Fn(*mut u8, usize) -> isize) -> Result<Vec<u8>, isize> {
+        let mut out = vec![0u8; 4096];
+        let n = f(out.as_mut_ptr(), out.len());
+        if n < 0 {
+            return Err(n);
+        }
+        out.truncate(n as usize);
+        Ok(out)
+    }
+
+    #[test]
+    fn category_ids_filter_and_resize() {
+        let parse = |s: &[u8]| {
+            buf_call(|o, c| unsafe { nntmux_rss_parse_category_ids(s.as_ptr(), s.len(), o, c) })
+        };
+        assert_eq!(
+            parse(b" 5000, -2 ,abc,,5040\n,\x0c7").unwrap(),
+            b"5000,-2,5040"
+        );
+        assert_eq!(parse(b"").unwrap(), b"");
+        assert_eq!(parse(b"-,--1,1-").unwrap(), b"");
+        let mut tiny = [0u8; 2];
+        let s = b"5000,5040";
+        assert_eq!(
+            unsafe { nntmux_rss_parse_category_ids(s.as_ptr(), s.len(), tiny.as_mut_ptr(), 2) },
+            -9
+        );
+        assert_eq!(
+            unsafe { nntmux_rss_parse_category_ids(std::ptr::null(), 3, tiny.as_mut_ptr(), 2) },
+            -1
+        );
+    }
+
+    #[test]
+    fn numeric_classification() {
+        let show = |s: &[u8]| {
+            let mut v = 0i64;
+            let rc = unsafe { nntmux_rss_show_id(s.as_ptr(), s.len(), &mut v) };
+            (rc, v)
+        };
+        assert_eq!(show(b"42"), (1, 42));
+        assert_eq!(show(b"-7"), (1, -7));
+        assert_eq!(show(b"0"), (1, -1));
+        assert_eq!(show(b"abc"), (1, -1));
+        assert_eq!(show(b""), (1, -1));
+        assert_eq!(show(b"1.5").0, 0);
+        assert_eq!(show(b"5abc").0, 0);
+        assert_eq!(show(b"99999999999999999999").0, 0);
+        let abs = |s: &[u8]| {
+            let mut v = 0i64;
+            let rc = unsafe { nntmux_rss_abs_numeric_int(s.as_ptr(), s.len(), &mut v) };
+            (rc, v)
+        };
+        assert_eq!(abs(b" -12 "), (1, 12));
+        assert_eq!(abs(b"x"), (2, 0));
+        assert_eq!(abs(b"1e3").0, 0);
+        assert_eq!(abs(b"-9223372036854775808").0, 0);
+        assert_eq!(abs(b"1e").0, 2);
+    }
+
+    #[test]
+    fn since_window() {
+        let since = |s: &[u8]| {
+            let mut v = 0i64;
+            let rc = unsafe { nntmux_reconcile_parse_since(s.as_ptr(), s.len(), &mut v) };
+            (rc, v)
+        };
+        assert_eq!(since(b" 24h\n"), (1, 24));
+        assert_eq!(since(b"7D"), (2, 7));
+        assert_eq!(since(b"h"), (0, 0));
+        assert_eq!(since(b"2w"), (0, 0));
+        assert_eq!(since(b"99999999999999999999h"), (1, i64::MAX));
+    }
+
+    #[test]
+    fn missing_ids_and_probe_sql() {
+        let pack = |v: &[i64]| v.iter().flat_map(|x| x.to_ne_bytes()).collect::<Vec<u8>>();
+        let batch = pack(&[5, 3, 9, 3, 1]);
+        let indexed = pack(&[9, 1, 42]);
+        let got = buf_call(|o, c| unsafe {
+            nntmux_reconcile_missing_ids(batch.as_ptr(), 5, indexed.as_ptr(), 3, o, c)
+        })
+        .unwrap();
+        assert_eq!(got, pack(&[5, 3, 3]));
+        let ids = pack(&[1, 22, -3]);
+        let sql = buf_call(|o, c| unsafe {
+            nntmux_reconcile_probe_sql(b"rel`x".as_ptr(), 5, ids.as_ptr(), 3, o, c)
+        })
+        .unwrap();
+        assert_eq!(
+            sql,
+            b"SELECT id FROM `rel``x` WHERE id IN (1,22,-3) LIMIT 3 OPTION max_matches=3"
+        );
+    }
+
+    #[test]
+    fn format_bytes_and_round() {
+        let fmt = |b: i64| {
+            String::from_utf8(
+                buf_call(|o, c| unsafe { nntmux_checkindex_format_bytes(b, o, c) }).unwrap(),
+            )
+            .unwrap()
+        };
+        assert_eq!(fmt(0), "0 B");
+        assert_eq!(fmt(-5), "0 B");
+        assert_eq!(fmt(1536), "1.5 KB");
+        assert_eq!(fmt(1024 * 1024), "1 MB");
+        assert_eq!(w13_php_round2(1.005), 1.01);
+        assert_eq!(w13_php_round2(0.285), 0.29);
+    }
+
+    #[test]
+    fn hosts_and_parse_host() {
+        let hosts = |s: &[u8]| {
+            buf_call(|o, c| unsafe {
+                nntmux_manticore_cfg_normalize_hosts(s.as_ptr(), s.len(), o, c)
+            })
+            .unwrap()
+        };
+        assert_eq!(hosts(b" a:1 , 0 ,,b "), b"a:1,b");
+        assert_eq!(hosts(b"  "), b"");
+        let parse = |s: &[u8]| {
+            let mut out = [0i64; 7];
+            let rc =
+                unsafe { nntmux_manticore_cfg_parse_host(s.as_ptr(), s.len(), out.as_mut_ptr()) };
+            (rc, out)
+        };
+        assert_eq!(
+            parse(b"https://m.local:9443/api").1,
+            [0, 5, 8, 7, 9443, 20, 4]
+        );
+        assert_eq!(parse(b"h").1, [0, -1, 0, 1, -1, 0, -1]);
+        assert_eq!(parse(b"h:009").0, 0);
+        assert_eq!(parse(b"h:65536").0, 0);
+        assert_eq!(parse(b"[::1]:9308").0, 0);
+        assert_eq!(parse(b"1x://h").0, 0);
+        assert_eq!(parse(b"0:9308").0, 0);
+    }
+}
