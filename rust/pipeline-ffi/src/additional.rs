@@ -9051,3 +9051,684 @@ mod wave12_nzb_custody_par2_recovery_tests {
         assert_eq!(validate_part_code(Some(&part), 5, 2, 2, 5, Some(&max)), 4);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Par2FileList / Par2Processor / ReleaseFilesArchiveFallback / MediaSourceStage /
+// AdditionalProcessing DTO helpers
+// ---------------------------------------------------------------------------
+
+const PAR2FL_MARKER: &[u8] = b"PAR2\0PKT";
+const PAR2FL_MAIN: &[u8] = b"PAR 2.0\0Main\0\0\0\0";
+const PAR2FL_FILEDESC: &[u8] = b"PAR 2.0\0FileDesc";
+const PAR2FL_FILEVER: &[u8] = b"PAR 2.0\0IFSC\0\0\0\0";
+const PAR2FL_RECOVERY: &[u8] = b"PAR 2.0\0RecvSlic";
+const PAR2FL_CREATOR: &[u8] = b"PAR 2.0\0Creator\0";
+/// `ArchiveReader::$maxFilenameLength`.
+const PAR2FL_MAX_FILENAME: usize = 256;
+
+#[derive(Clone, Copy)]
+enum Par2FlLength {
+    Int(i64),
+    Float(f64),
+}
+
+struct Par2FlDesc<'a> {
+    file_id: &'a [u8],
+    hash: &'a [u8],
+    hash16k: &'a [u8],
+    length: Par2FlLength,
+    name: &'a [u8],
+    next_offset: u64,
+}
+
+enum Par2FlBody<'a> {
+    Main(Vec<&'a [u8]>),
+    Desc(Par2FlDesc<'a>),
+    Ver(&'a [u8], usize),
+    Other,
+}
+
+struct Par2FlPacket<'a> {
+    set: &'a [u8],
+    body: Par2FlBody<'a>,
+}
+
+#[inline]
+fn par2fl_u32(data: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]])
+}
+
+#[inline]
+fn par2fl_rtrim(mut s: &[u8]) -> &[u8] {
+    while let Some(&last) = s.last() {
+        if is_php_trim_byte(last) {
+            s = &s[..s.len() - 1];
+        } else {
+            break;
+        }
+    }
+    s
+}
+
+#[inline]
+fn par2fl_truncated_name(name: &[u8]) -> &[u8] {
+    &name[..name.len().min(PAR2FL_MAX_FILENAME)]
+}
+
+/// `Par2Info::setData()` packet analysis over already-truncated data. `None` is a parser
+/// error (`$par2Info->error` set); a read past the data ends the packet list as PHP does.
+fn par2fl_parse(data: &[u8]) -> Option<Vec<Par2FlPacket<'_>>> {
+    if data.is_empty() {
+        return None;
+    }
+    let length = data.len() as u64;
+    let mut offset = data.windows(PAR2FL_MARKER.len()).position(|w| w == PAR2FL_MARKER)? as u64;
+    let mut packets = Vec::new();
+
+    'packets: while offset < length {
+        if offset + 64 > length {
+            break;
+        }
+        let at = offset as usize;
+        let high = par2fl_u32(data, at + 12);
+        if high > 0x7FFF_FFFF {
+            // A float head_length can never be read back for verification.
+            break;
+        }
+        let head_length = (u64::from(high) << 32) | u64::from(par2fl_u32(data, at + 8));
+        if head_length < 32 {
+            break;
+        }
+        let next = offset + head_length;
+        if head_length > 32 && next > length {
+            break;
+        }
+        let hashed = if head_length == 32 { &[][..] } else { &data[at + 32..next as usize] };
+        if crate::md5_raw_slice(hashed)[..] != data[at + 16..at + 32] {
+            return None;
+        }
+        let set = &data[at + 32..at + 48];
+        let kind = &data[at + 48..at + 64];
+        let mut cur = offset + 64;
+
+        macro_rules! read {
+            ($n:expr) => {{
+                let n = $n as u64;
+                if cur + n > length {
+                    break 'packets;
+                }
+                let start = cur as usize;
+                cur += n;
+                &data[start..cur as usize]
+            }};
+        }
+
+        let body = if kind == PAR2FL_MAIN {
+            let head = read!(12);
+            let count = par2fl_u32(head, 8);
+            let mut ids = Vec::new();
+            for _ in 0..count {
+                ids.push(read!(16));
+            }
+            while cur < next {
+                ids.push(read!(16));
+            }
+            Par2FlBody::Main(ids)
+        } else if kind == PAR2FL_FILEDESC {
+            let head = read!(56);
+            let low = par2fl_u32(head, 48);
+            let high = par2fl_u32(head, 52);
+            let length_value = if high <= 0x7FFF_FFFF {
+                Par2FlLength::Int(((u64::from(high) << 32) | u64::from(low)) as i64)
+            } else {
+                Par2FlLength::Float(f64::from(low) + f64::from(high) * 4_294_967_296.0)
+            };
+            if cur > next {
+                break;
+            }
+            let name = if cur == next { &[][..] } else { read!(next - cur) };
+            Par2FlBody::Desc(Par2FlDesc {
+                file_id: &head[0..16],
+                hash: &head[16..32],
+                hash16k: &head[32..48],
+                length: length_value,
+                name: par2fl_rtrim(name),
+                next_offset: next,
+            })
+        } else if kind == PAR2FL_FILEVER {
+            let file_id = read!(16);
+            let mut blocks = 0usize;
+            while cur < next {
+                let _ = read!(20);
+                blocks += 1;
+            }
+            Par2FlBody::Ver(file_id, blocks)
+        } else if kind == PAR2FL_RECOVERY {
+            let _ = read!(4);
+            Par2FlBody::Other
+        } else if kind == PAR2FL_CREATOR {
+            if cur > next {
+                break;
+            }
+            if cur < next {
+                let _ = read!(next - cur);
+            }
+            Par2FlBody::Other
+        } else {
+            Par2FlBody::Other
+        };
+        packets.push(Par2FlPacket { set, body });
+
+        cur = next;
+        if offset == cur {
+            return None;
+        }
+        offset = cur;
+    }
+
+    if packets.is_empty() { None } else { Some(packets) }
+}
+
+struct Par2FlFile<'p, 'a> {
+    file_id: &'a [u8],
+    desc: Option<&'p Par2FlDesc<'a>>,
+    blocks: usize,
+}
+
+/// `Par2FileList::getFiles()` entries in key order and `! hasUnresolvedDescriptors()`.
+fn par2fl_files<'p, 'a>(packets: &'p [Par2FlPacket<'a>]) -> (Vec<Par2FlFile<'p, 'a>>, bool) {
+    use std::collections::HashMap;
+
+    let mut files: Vec<Par2FlFile<'p, 'a>> = Vec::new();
+    let mut index: HashMap<&'a [u8], usize> = HashMap::new();
+    let mut required: Vec<(&'a [u8], &'a [u8])> = Vec::new();
+    let mut described: HashMap<(&'a [u8], &'a [u8]), bool> = HashMap::new();
+
+    for packet in packets {
+        match &packet.body {
+            Par2FlBody::Main(ids) => {
+                for &id in ids {
+                    required.push((packet.set, id));
+                }
+            }
+            Par2FlBody::Desc(desc) => {
+                let slot = *index.entry(desc.file_id).or_insert_with(|| {
+                    files.push(Par2FlFile { file_id: desc.file_id, desc: None, blocks: 0 });
+                    files.len() - 1
+                });
+                if files[slot].desc.is_none() {
+                    files[slot].desc = Some(desc);
+                }
+                required.push((packet.set, desc.file_id));
+                described
+                    .entry((packet.set, desc.file_id))
+                    .or_insert_with(|| !trim_php(par2fl_truncated_name(desc.name)).is_empty());
+            }
+            Par2FlBody::Ver(file_id, blocks) => {
+                let slot = *index.entry(file_id).or_insert_with(|| {
+                    files.push(Par2FlFile { file_id, desc: None, blocks: 0 });
+                    files.len() - 1
+                });
+                if files[slot].blocks == 0 {
+                    files[slot].blocks = *blocks;
+                }
+                required.push((packet.set, file_id));
+            }
+            Par2FlBody::Other => {}
+        }
+    }
+
+    let complete = !described.is_empty()
+        && required.iter().all(|key| described.get(key).copied().unwrap_or(false));
+
+    (files, complete)
+}
+
+#[inline]
+fn par2fl_hex(out: &mut OutCursor<'_>, raw: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for &b in raw {
+        out.push(HEX[(b >> 4) as usize]);
+        out.push(HEX[(b & 0x0f) as usize]);
+    }
+}
+
+/// `Par2FileList::extractFiles()` over the first `len` bytes of PAR2 data.
+///
+/// Output: `[status u8][complete u8][count u32 LE]`, then per file
+/// `[flags u8][file_id hex 32][blocks u64 LE]` and, when flag bit 0 is set,
+/// `[size: i64 LE, or f64 LE when bit 1 is set][next_offset u64 LE][hash hex 32]`
+/// `[hash_16K hex 32][name_len u32 LE][name]`. Status 0 is a parser error.
+/// Returns the byte count, `-needed` when `out_cap` is too small, or `-1` on bad input.
+///
+/// # Safety
+///
+/// `data` must be valid for `len` bytes when `len > 0`; `out` must be valid for `out_cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_par2fl_extract_files(
+    data: *const u8,
+    len: usize,
+    out: *mut u8,
+    out_cap: usize,
+) -> isize {
+    let Some(data) = (unsafe { rfm_input(data, len) }) else {
+        return -1;
+    };
+    let mut cursor = unsafe { OutCursor::new(out, out_cap) };
+    let Some(packets) = par2fl_parse(data) else {
+        cursor.extend(&[0, 0, 0, 0, 0, 0]);
+        return cursor.finish();
+    };
+    let (files, complete) = par2fl_files(&packets);
+    cursor.push(1);
+    cursor.push(u8::from(complete));
+    cursor.extend(&(files.len() as u32).to_le_bytes());
+    for file in &files {
+        let flags = match file.desc {
+            None => 0u8,
+            Some(desc) => 1 | if matches!(desc.length, Par2FlLength::Float(_)) { 2 } else { 0 },
+        };
+        cursor.push(flags);
+        par2fl_hex(&mut cursor, file.file_id);
+        cursor.extend(&(file.blocks as u64).to_le_bytes());
+        if let Some(desc) = file.desc {
+            match desc.length {
+                Par2FlLength::Int(v) => cursor.extend(&v.to_le_bytes()),
+                Par2FlLength::Float(v) => cursor.extend(&v.to_le_bytes()),
+            }
+            cursor.extend(&desc.next_offset.to_le_bytes());
+            par2fl_hex(&mut cursor, desc.hash);
+            par2fl_hex(&mut cursor, desc.hash16k);
+            let name = par2fl_truncated_name(desc.name);
+            let name: &[u8] = if name.is_empty() || name == b"0" { b"Unknown" } else { name };
+            cursor.extend(&(name.len() as u32).to_le_bytes());
+            cursor.extend(name);
+        }
+    }
+    cursor.finish()
+}
+
+/// `Par2FileHashEvidence::sizeDecimal()` validity followed by the `PHP_INT_MAX` bound of
+/// `Par2Processor::setFitsPayloadBudget()`.
+fn par2_budget_decimal(s: &[u8]) -> Option<u64> {
+    if s.is_empty() || s.len() > 19 || !s.iter().all(u8::is_ascii_digit) || (s.len() > 1 && s[0] == b'0') {
+        return None;
+    }
+    let mut value = 0u64;
+    for &b in s {
+        value = value * 10 + u64::from(b - b'0');
+    }
+    (value <= i64::MAX as u64).then_some(value)
+}
+
+/// `Par2Processor::setFitsPayloadBudget()` over `count` newline-joined size candidates.
+/// Returns 1/0, or -1 on bad input.
+///
+/// # Safety
+///
+/// `sizes` must be valid for `len` bytes when `len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_par2_set_fits_payload_budget(
+    sizes: *const u8,
+    len: usize,
+    count: usize,
+    max_payload_bytes: i64,
+) -> i32 {
+    let Some(sizes) = (unsafe { rfm_input(sizes, len) }) else {
+        return -1;
+    };
+    if max_payload_bytes <= 0 {
+        return 0;
+    }
+    if count == 0 {
+        return i32::from(sizes.is_empty());
+    }
+    let mut remaining = max_payload_bytes as u64;
+    let mut seen = 0usize;
+    for line in sizes.split(|&b| b == b'\n') {
+        seen += 1;
+        let Some(bytes) = par2_budget_decimal(line) else {
+            return 0;
+        };
+        if bytes > remaining {
+            return 0;
+        }
+        remaining -= bytes;
+    }
+    // A candidate holding a newline is not a decimal size.
+    i32::from(seen == count)
+}
+
+#[inline]
+fn nat_at(s: &[u8], i: usize) -> u8 {
+    s.get(i).copied().unwrap_or(0)
+}
+
+#[inline]
+fn c_isspace(b: u8) -> bool {
+    b == b' ' || (0x09..=0x0D).contains(&b)
+}
+
+fn nat_compare_right(a: &[u8], ap: &mut usize, b: &[u8], bp: &mut usize) -> i32 {
+    let mut bias = 0;
+    loop {
+        let a_done = *ap == a.len() || !a[*ap].is_ascii_digit();
+        let b_done = *bp == b.len() || !b[*bp].is_ascii_digit();
+        if a_done && b_done {
+            return bias;
+        } else if a_done {
+            return -1;
+        } else if b_done {
+            return 1;
+        } else if a[*ap] < b[*bp] {
+            if bias == 0 {
+                bias = -1;
+            }
+        } else if a[*ap] > b[*bp] && bias == 0 {
+            bias = 1;
+        }
+        *ap += 1;
+        *bp += 1;
+    }
+}
+
+fn nat_compare_left(a: &[u8], ap: &mut usize, b: &[u8], bp: &mut usize) -> i32 {
+    loop {
+        let a_done = *ap == a.len() || !a[*ap].is_ascii_digit();
+        let b_done = *bp == b.len() || !b[*bp].is_ascii_digit();
+        if a_done && b_done {
+            return 0;
+        } else if a_done {
+            return -1;
+        } else if b_done {
+            return 1;
+        } else if a[*ap] < b[*bp] {
+            return -1;
+        } else if a[*ap] > b[*bp] {
+            return 1;
+        }
+        *ap += 1;
+        *bp += 1;
+    }
+}
+
+/// PHP `strnatcmp_ex()` under the C locale; bytes past the end read as the zend_string NUL.
+pub(crate) fn php_strnatcmp(a: &[u8], b: &[u8], fold_case: bool) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    if a.is_empty() || b.is_empty() {
+        return a.len().cmp(&b.len());
+    }
+    let (aend, bend) = (a.len(), b.len());
+    let (mut ap, mut bp) = (0usize, 0usize);
+    let mut leading = true;
+    loop {
+        let mut ca = nat_at(a, ap);
+        let mut cb = nat_at(b, bp);
+
+        while leading && ca == b'0' && ap + 1 < aend && a[ap + 1].is_ascii_digit() {
+            ap += 1;
+            ca = a[ap];
+        }
+        while leading && cb == b'0' && bp + 1 < bend && b[bp + 1].is_ascii_digit() {
+            bp += 1;
+            cb = b[bp];
+        }
+        leading = false;
+
+        while c_isspace(ca) {
+            ap += 1;
+            ca = nat_at(a, ap);
+        }
+        while c_isspace(cb) {
+            bp += 1;
+            cb = nat_at(b, bp);
+        }
+
+        if ca.is_ascii_digit() && cb.is_ascii_digit() {
+            let result = if ca == b'0' || cb == b'0' {
+                nat_compare_left(a, &mut ap, b, &mut bp)
+            } else {
+                nat_compare_right(a, &mut ap, b, &mut bp)
+            };
+            if result != 0 {
+                return result.cmp(&0);
+            } else if ap == aend && bp == bend {
+                return Ordering::Equal;
+            } else if ap == aend {
+                return Ordering::Less;
+            } else if bp == bend {
+                return Ordering::Greater;
+            }
+            ca = a[ap];
+            cb = b[bp];
+        }
+
+        if fold_case {
+            ca = ca.to_ascii_uppercase();
+            cb = cb.to_ascii_uppercase();
+        }
+        match ca.cmp(&cb) {
+            Ordering::Equal => {}
+            other => return other,
+        }
+
+        ap += 1;
+        bp += 1;
+        if ap >= aend && bp >= bend {
+            return Ordering::Equal;
+        } else if ap >= aend {
+            return Ordering::Less;
+        } else if bp >= bend {
+            return Ordering::Greater;
+        }
+    }
+}
+
+/// `MediaSourceStage::middleVolumeIndex()`: input position of the middle title after a stable
+/// `strnatcasecmp()` sort of `count` NUL-joined titles. Returns the index, `-2` when the
+/// titles do not split into `count` parts (a title holds NUL), or `-1` on bad input.
+///
+/// # Safety
+///
+/// `titles` must be valid for `len` bytes when `len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_media_middle_volume_index(titles: *const u8, len: usize, count: usize) -> i64 {
+    let Some(titles) = (unsafe { rfm_input(titles, len) }) else {
+        return -1;
+    };
+    if count == 0 {
+        return -1;
+    }
+    let parts: Vec<&[u8]> = titles.split(|&b| b == 0).collect();
+    if parts.len() != count {
+        return -2;
+    }
+    let mut order: Vec<usize> = (0..count).collect();
+    order.sort_by(|&x, &y| php_strnatcmp(parts[x], parts[y], true));
+    order[count / 2] as i64
+}
+
+/// `ReleaseFilesArchiveFallback::isArchiveImageName()`: `/\.(jpe?g|png|webp)$/i`.
+pub(crate) fn rfaf_is_archive_image_name(name: &[u8]) -> bool {
+    let name = rfm_without_final_newline(name);
+    rfm_ends_with_ci(name, b".jpg")
+        || rfm_ends_with_ci(name, b".jpeg")
+        || rfm_ends_with_ci(name, b".png")
+        || rfm_ends_with_ci(name, b".webp")
+}
+
+/// # Safety
+///
+/// `ptr` must be valid for reads of `len` bytes when non-null and `len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_rfaf_is_archive_image_name(ptr: *const u8, len: usize) -> i32 {
+    match unsafe { rfm_input(ptr, len) } {
+        Some(name) => i32::from(rfaf_is_archive_image_name(name)),
+        None => -1,
+    }
+}
+
+/// `ReleaseFilesArchiveFallback::extractedFileSuffix()`: `'.'.strtolower(pathinfo(ext))` or `''`.
+///
+/// # Safety
+///
+/// `ptr` must be valid for `len` bytes when `len > 0`; `out` must be valid for `out_cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_rfaf_extracted_file_suffix(
+    ptr: *const u8,
+    len: usize,
+    out: *mut u8,
+    out_cap: usize,
+) -> isize {
+    let Some(name) = (unsafe { rfm_input(ptr, len) }) else {
+        return -1;
+    };
+    let base = posix_basename(name);
+    let Some(dot) = base.iter().rposition(|&b| b == b'.') else {
+        return 0;
+    };
+    let ext = &base[dot + 1..];
+    if ext.is_empty() {
+        return 0;
+    }
+    let mut cursor = unsafe { OutCursor::new(out, out_cap) };
+    cursor.push(b'.');
+    for &b in ext {
+        cursor.push(b.to_ascii_lowercase());
+    }
+    cursor.finish()
+}
+
+/// `ArchivedMediaEntry::continuationBytes()`. Returns the byte count, or `-1` when PHP
+/// integer arithmetic would overflow and the caller must use the PHP path.
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_media_continuation_bytes(
+    range_start: i64,
+    head_length: i64,
+    volume_bytes_downloaded: i64,
+    in_volume_end: i64,
+    real_size: i64,
+    target: i64,
+) -> i64 {
+    let Some(head_end) = range_start.checked_add(head_length) else {
+        return -1;
+    };
+    if head_end != volume_bytes_downloaded {
+        return 0;
+    }
+    let Some(wanted) = target.min(real_size).checked_sub(head_length) else {
+        return -1;
+    };
+    let Some(left) = in_volume_end
+        .checked_add(1)
+        .and_then(|end| end.checked_sub(volume_bytes_downloaded))
+    else {
+        return -1;
+    };
+    wanted.min(left).max(0)
+}
+
+#[cfg(test)]
+mod wave13_par2_archive_fallback_tests {
+    use super::*;
+    use std::cmp::Ordering;
+
+    fn packet(kind: &[u8], set: &[u8; 16], body: &[u8]) -> Vec<u8> {
+        let mut hashed = set.to_vec();
+        hashed.extend_from_slice(kind);
+        hashed.extend_from_slice(body);
+        let mut out = PAR2FL_MARKER.to_vec();
+        out.extend_from_slice(&((64 + body.len()) as u64).to_le_bytes());
+        out.extend_from_slice(&crate::md5_raw_slice(&hashed));
+        out.extend_from_slice(&hashed);
+        out
+    }
+
+    fn desc_body(id: u8, name: &[u8]) -> Vec<u8> {
+        let mut body = vec![id; 16];
+        body.extend_from_slice(&[0xAB; 16]);
+        body.extend_from_slice(&[0xCD; 16]);
+        body.extend_from_slice(&1234u64.to_le_bytes());
+        body.extend_from_slice(name);
+        body
+    }
+
+    #[test]
+    fn par2_files_follow_descriptor_and_verification_order() {
+        let set = [7u8; 16];
+        let mut ifsc = vec![2u8; 16];
+        ifsc.extend_from_slice(&[0u8; 40]);
+        let mut main = 0u64.to_le_bytes().to_vec();
+        main.extend_from_slice(&2u32.to_le_bytes());
+        main.extend_from_slice(&[1u8; 16]);
+        main.extend_from_slice(&[2u8; 16]);
+        let mut data = b"junk".to_vec();
+        data.extend(packet(PAR2FL_MAIN, &set, &main));
+        data.extend(packet(PAR2FL_FILEVER, &set, &ifsc));
+        data.extend(packet(PAR2FL_FILEDESC, &set, &desc_body(1, b"a.mkv\0\0\0")));
+        data.extend(packet(PAR2FL_FILEDESC, &set, &desc_body(2, b"0\0\0\0")));
+        let packets = par2fl_parse(&data).expect("valid PAR2");
+        let (files, complete) = par2fl_files(&packets);
+        assert!(complete);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].file_id, &[2u8; 16]);
+        assert_eq!(files[0].blocks, 2);
+        assert_eq!(files[0].desc.map(|d| d.name), Some(&b"0"[..]));
+        assert_eq!(files[1].desc.map(|d| d.name), Some(&b"a.mkv"[..]));
+
+        let mut corrupt = data.clone();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 1;
+        assert!(par2fl_parse(&corrupt).is_none());
+        assert!(par2fl_parse(b"no marker").is_none());
+        assert!(par2fl_parse(b"").is_none());
+    }
+
+    #[test]
+    fn payload_budget_decimals() {
+        assert_eq!(par2_budget_decimal(b"0"), Some(0));
+        assert_eq!(par2_budget_decimal(b"9223372036854775807"), Some(i64::MAX as u64));
+        assert_eq!(par2_budget_decimal(b"9223372036854775808"), None);
+        assert_eq!(par2_budget_decimal(b"01"), None);
+        assert_eq!(par2_budget_decimal(b""), None);
+        let sizes = b"10\n20";
+        assert_eq!(unsafe { nntmux_par2_set_fits_payload_budget(sizes.as_ptr(), sizes.len(), 2, 30) }, 1);
+        assert_eq!(unsafe { nntmux_par2_set_fits_payload_budget(sizes.as_ptr(), sizes.len(), 2, 29) }, 0);
+        assert_eq!(unsafe { nntmux_par2_set_fits_payload_budget(sizes.as_ptr(), sizes.len(), 1, 30) }, 0);
+    }
+
+    #[test]
+    fn natural_compare_matches_php() {
+        assert_eq!(php_strnatcmp(b"img12.png", b"img10.png", true), Ordering::Greater);
+        assert_eq!(php_strnatcmp(b"x01", b"x1", true), Ordering::Less);
+        assert_eq!(php_strnatcmp(b"a b", b"ab", true), Ordering::Equal);
+        assert_eq!(php_strnatcmp(b"a ", b"a", true), Ordering::Greater);
+        assert_eq!(php_strnatcmp(b"007", b"7", true), Ordering::Equal);
+        assert_eq!(php_strnatcmp(b"A", b"a", true), Ordering::Equal);
+        assert_eq!(php_strnatcmp(b"", b"a", true), Ordering::Less);
+        let titles = b"r.part3.rar\0r.part10.rar\0r.part1.rar";
+        assert_eq!(unsafe { nntmux_media_middle_volume_index(titles.as_ptr(), titles.len(), 3) }, 0);
+        assert_eq!(unsafe { nntmux_media_middle_volume_index(titles.as_ptr(), titles.len(), 2) }, -2);
+    }
+
+    #[test]
+    fn archive_image_names_and_suffixes() {
+        assert!(rfaf_is_archive_image_name(b"a/Cover.JPEG"));
+        assert!(rfaf_is_archive_image_name(b"x.webp\n"));
+        assert!(!rfaf_is_archive_image_name(b"x.jpg.nfo"));
+        let mut out = [0u8; 8];
+        let n = unsafe { nntmux_rfaf_extracted_file_suffix(b"dir.d/F.JPG".as_ptr(), 11, out.as_mut_ptr(), out.len()) };
+        assert_eq!(&out[..n as usize], b".jpg");
+        assert_eq!(unsafe { nntmux_rfaf_extracted_file_suffix(b"x.d/".as_ptr(), 4, out.as_mut_ptr(), out.len()) }, 2);
+        assert_eq!(unsafe { nntmux_rfaf_extracted_file_suffix(b"noext".as_ptr(), 5, out.as_mut_ptr(), out.len()) }, 0);
+    }
+
+    #[test]
+    fn continuation_bytes() {
+        assert_eq!(nntmux_media_continuation_bytes(10, 90, 100, 999, 5000, 400), 310);
+        assert_eq!(nntmux_media_continuation_bytes(10, 80, 100, 999, 5000, 400), 0);
+        assert_eq!(nntmux_media_continuation_bytes(0, 100, 100, 149, 5000, 400), 50);
+        assert_eq!(nntmux_media_continuation_bytes(i64::MAX, 1, 0, 0, 0, 0), -1);
+    }
+}
