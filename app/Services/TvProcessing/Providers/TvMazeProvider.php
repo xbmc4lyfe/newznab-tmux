@@ -17,6 +17,12 @@ class TvMazeProvider extends AbstractTvProvider
 {
     public TvMazeClient $client;
 
+    /**
+     * Candidate selection through Rust; null selects the benchmark-qualified production default
+     * (PHP: the batch call misses the 1.5x gate, see tests/Unit/RustTvProvidersTraktMatchingParityTest.php).
+     */
+    public ?bool $useRustMatchFfi = null;
+
     public function __construct(?TvMazeClient $client = null)
     {
         parent::__construct();
@@ -60,6 +66,20 @@ class TvMazeProvider extends AbstractTvProvider
      */
     private function matchShowInfo(array $shows, string $cleanName, ?int $year, string $country): array|false
     {
+        $highest = ($this->useRustMatchFfi ?? false)
+            ? $this->selectBestShowNative($shows, $cleanName, $year, $country)
+            : $this->selectBestShowPhp($shows, $cleanName, $year, $country);
+
+        return $highest !== null ? $this->formatShowInfo($highest) : false;
+    }
+
+    /**
+     * The first show whose name or an AKA scores strictly highest above zero.
+     *
+     * @param  list<TVShow>  $shows
+     */
+    public function selectBestShowPhp(array $shows, string $cleanName, ?int $year, string $country): ?TVShow
+    {
         $highestScore = 0.0;
         $highest = null;
 
@@ -84,7 +104,48 @@ class TvMazeProvider extends AbstractTvProvider
             }
         }
 
-        return $highest !== null ? $this->formatShowInfo($highest) : false;
+        return $highest;
+    }
+
+    /**
+     * selectBestShowPhp() scored in one Rust call; falls back to PHP when Rust declines.
+     *
+     * @param  list<TVShow>  $shows
+     */
+    public function selectBestShowNative(array $shows, string $cleanName, ?int $year, string $country): ?TVShow
+    {
+        $titles = $starteds = $countries = $owners = [];
+        foreach ($shows as $key => $show) {
+            if (! $this->checkRequiredAttr($show, 'tvmazeS')) {
+                continue;
+            }
+
+            $started = TmdbProvider::encodeCandidateStarted($show->premiered);
+            $candidateCountry = (string) $show->country;
+            $titles[] = (string) $show->name;
+            $starteds[] = $started;
+            $countries[] = $candidateCountry;
+            $owners[] = $key;
+            foreach (\is_array($show->akas) ? $show->akas : [] as $aka) {
+                if (\is_array($aka) && ! empty($aka['name'])) {
+                    $titles[] = (string) $aka['name'];
+                    $starteds[] = $started;
+                    $countries[] = $candidateCountry;
+                    $owners[] = $key;
+                }
+            }
+        }
+
+        if ($titles === []) {
+            return null;
+        }
+
+        $index = TmdbProvider::bestCandidateIndexNative($cleanName, $year, $country, $titles, $starteds, $countries);
+        if ($index === null) {
+            return $this->selectBestShowPhp($shows, $cleanName, $year, $country);
+        }
+
+        return $index >= 0 ? $shows[$owners[$index]] : null;
     }
 
     public function fetchAllEpisodes(int $siteId, int $videoId): int
