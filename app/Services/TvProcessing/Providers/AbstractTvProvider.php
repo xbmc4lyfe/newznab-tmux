@@ -13,12 +13,15 @@ use App\Services\ReleaseImageService;
 use App\Services\TmdbClient;
 use App\Services\TraktService;
 use App\Support\RustPipelineLibrary;
+use FFI;
+use FFI\CData;
 use Illuminate\Contracts\Cache\LockTimeoutException;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use Throwable;
 
 /**
  * Class AbstractTvProvider -- abstract extension of BaseVideoProvider
@@ -48,6 +51,30 @@ abstract class AbstractTvProvider extends BaseVideoProvider
     /** Seconds to wait for the per-show episode insert lock. */
     private const EPISODE_LOCK_SECONDS = 120;
 
+    private const string FFI_CDEF = <<<'C'
+        double nntmux_tv_check_match(const char *ours, size_t ours_len, const char *scrape, size_t scrape_len, double probability);
+        double nntmux_tv_score_candidate(const char *ours, size_t ours_len, int64_t our_year, const char *title, size_t title_len, const char *started, size_t started_len, int64_t started_int, const char *our_country, size_t our_country_len, const char *candidate_country, size_t candidate_country_len, uint32_t flags);
+        ssize_t nntmux_tv_score_candidates_batch_nul(const char *ours, size_t ours_len, int64_t our_year, uint32_t flags, const char *our_country, size_t our_country_len, const char *titles, size_t titles_len, const char *starteds, size_t starteds_len, const char *countries, size_t countries_len, size_t count, double *out_scores);
+        const char *nntmux_tv_normalize_show_title(const char *name, size_t name_len);
+        C;
+
+    /** `nntmux_tv_score_candidate` flags (see `rust/pipeline-ffi/src/categorize.rs`). */
+    private const int FFI_OUR_YEAR = 1;
+
+    private const int FFI_STARTED_INT = 2;
+
+    private const int FFI_STARTED_STRING = 4;
+
+    private static ?FFI $ffi = null;
+
+    private static bool $ffiResolved = false;
+
+    private static bool $useRustFfi = true;
+
+    private static ?CData $scoreBuf = null;
+
+    private static int $scoreCap = 0;
+
     /**
      * @string Path to Save Images
      */
@@ -68,6 +95,11 @@ abstract class AbstractTvProvider extends BaseVideoProvider
         parent::__construct();
         $this->imgSavePath = storage_path('covers/tvshows/');
         $this->siteColumns = ['tvdb', 'trakt', 'tvrage', 'tvmaze', 'imdb', 'tmdb'];
+    }
+
+    public static function setUseRustFfi(bool $use): void
+    {
+        self::$useRustFfi = $use;
     }
 
     /**
@@ -507,7 +539,7 @@ abstract class AbstractTvProvider extends BaseVideoProvider
     }
 
     /**
-     * @throws \Throwable
+     * @throws Throwable
      */
     public function delete(int $id): void
     {
@@ -778,6 +810,26 @@ abstract class AbstractTvProvider extends BaseVideoProvider
     }
 
     /**
+     * Rust `nntmux_tv_normalize_show_title` for parity testing; `null` when the library is unavailable.
+     * Production keeps the PHP lookup: the FFI call costs more than the hash lookup (0.63-0.82x).
+     */
+    public static function normalizeShowTitleNative(string $cleanName): ?string
+    {
+        $ffi = self::$ffi ?? (self::$ffiResolved ? null : self::ffi());
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $alias = $ffi->nntmux_tv_normalize_show_title($cleanName, strlen($cleanName));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return is_string($alias) ? $alias : $cleanName;
+    }
+
+    /**
      * Parses the release searchname for the season/episode/airdate information.
      *
      * @return array<string, mixed>
@@ -995,6 +1047,31 @@ abstract class AbstractTvProvider extends BaseVideoProvider
     }
 
     /**
+     * Rust `nntmux_tv_check_match` for parity testing; `null` when the library is unavailable.
+     * Production keeps PHP `similar_text()` (1.05-1.27x mean).
+     */
+    public function checkMatchNative(mixed $ourName, mixed $scrapeName, mixed $probability): ?float
+    {
+        $normalizedOurName = $this->normalizeComparableValue($ourName);
+        $normalizedScrapeName = $this->normalizeComparableValue($scrapeName);
+        if ($normalizedOurName === null || $normalizedScrapeName === null) {
+            return 0.0;
+        }
+        $ffi = self::$ffi ?? (self::$ffiResolved ? null : self::ffi());
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $pct = $ffi->nntmux_tv_check_match($normalizedOurName, strlen($normalizedOurName), $normalizedScrapeName, strlen($normalizedScrapeName), is_numeric($probability) ? (float) $probability : 0.0);
+        } catch (Throwable) {
+            return null;
+        }
+
+        return is_float($pct) && $pct >= 0.0 ? $pct : null;
+    }
+
+    /**
      * Score a search result against the parsed release; 0 means "not a candidate".
      *
      * Title similarity (exact match = 100) plus a bonus when the start year agrees. A year
@@ -1002,6 +1079,128 @@ abstract class AbstractTvProvider extends BaseVideoProvider
      * prefers the 2005 series over the 1963 one. A matching country breaks remaining ties.
      */
     public function scoreCandidate(
+        string $ourName,
+        ?int $ourYear,
+        string $candidateTitle,
+        mixed $candidateStarted = null,
+        string $ourCountry = '',
+        string $candidateCountry = '',
+    ): float {
+        // scoreCandidateNative() inlined: the extra PHP call frame costs ~0.1x on the common path.
+        if (self::$useRustFfi && ($ffi = self::$ffi ?? (self::$ffiResolved ? null : self::ffi())) !== null) {
+            $flags = $ourYear !== null ? self::FFI_OUR_YEAR : 0;
+            $started = '';
+            $startedInt = 0;
+            if (is_int($candidateStarted)) {
+                $flags |= self::FFI_STARTED_INT;
+                $startedInt = $candidateStarted;
+            } elseif (is_string($candidateStarted)) {
+                $flags |= self::FFI_STARTED_STRING;
+                $started = $candidateStarted;
+            }
+            try {
+                // @phpstan-ignore method.notFound
+                $score = $ffi->nntmux_tv_score_candidate($ourName, strlen($ourName), $ourYear ?? 0, $candidateTitle, strlen($candidateTitle), $started, strlen($started), $startedInt, $ourCountry, strlen($ourCountry), $candidateCountry, strlen($candidateCountry), $flags);
+                if (is_float($score) && $score >= 0.0) {
+                    return $score;
+                }
+            } catch (Throwable) {
+            }
+        }
+
+        return $this->scoreCandidatePhp($ourName, $ourYear, $candidateTitle, $candidateStarted, $ourCountry, $candidateCountry);
+    }
+
+    /**
+     * Rust `nntmux_tv_score_candidate`; `null` when the library is unavailable or declines the input
+     * (titles outside ASCII/Latin-1 or invalid UTF-8, where `mb_strtolower()` could diverge).
+     */
+    public static function scoreCandidateNative(
+        string $ourName,
+        ?int $ourYear,
+        string $candidateTitle,
+        mixed $candidateStarted = null,
+        string $ourCountry = '',
+        string $candidateCountry = '',
+    ): ?float {
+        $ffi = self::$ffi ?? (self::$ffiResolved ? null : self::ffi());
+        if ($ffi === null) {
+            return null;
+        }
+        $flags = $ourYear !== null ? self::FFI_OUR_YEAR : 0;
+        $started = '';
+        $startedInt = 0;
+        if (is_int($candidateStarted)) {
+            $flags |= self::FFI_STARTED_INT;
+            $startedInt = $candidateStarted;
+        } elseif (is_string($candidateStarted)) {
+            $flags |= self::FFI_STARTED_STRING;
+            $started = $candidateStarted;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $score = $ffi->nntmux_tv_score_candidate($ourName, strlen($ourName), $ourYear ?? 0, $candidateTitle, strlen($candidateTitle), $started, strlen($started), $startedInt, $ourCountry, strlen($ourCountry), $candidateCountry, strlen($candidateCountry), $flags);
+        } catch (Throwable) {
+            return null;
+        }
+
+        return is_float($score) && $score >= 0.0 ? $score : null;
+    }
+
+    /**
+     * Rust `nntmux_tv_score_candidates_batch_nul` for parity testing: `scoreCandidate()` per
+     * `[title, started, country]` candidate, `null` per declined candidate, or `null` when the
+     * library is unavailable or declines the batch.
+     *
+     * @param  array<int, array{0: string, 1: mixed, 2: string}>  $candidates
+     * @return array<int, float|null>|null
+     */
+    public static function scoreCandidatesNative(string $ourName, ?int $ourYear, array $candidates, string $ourCountry = ''): ?array
+    {
+        $ffi = self::$ffi ?? (self::$ffiResolved ? null : self::ffi());
+        $count = count($candidates);
+        if ($ffi === null || $count === 0) {
+            return null;
+        }
+        $titles = [];
+        $starteds = [];
+        $countries = [];
+        foreach ($candidates as [$title, $started, $country]) {
+            $titles[] = $title;
+            $countries[] = $country;
+            $starteds[] = is_int($started) ? 'i'.$started : (is_string($started) ? 's'.$started : 'n');
+        }
+        $titles = implode("\0", $titles);
+        $starteds = implode("\0", $starteds);
+        $countries = implode("\0", $countries);
+        try {
+            if (self::$scoreBuf === null || self::$scoreCap < $count) {
+                $cap = max(64, $count * 2);
+                self::$scoreBuf = $ffi->new("double[{$cap}]");
+                self::$scoreCap = $cap;
+            }
+            $buf = self::$scoreBuf;
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_tv_score_candidates_batch_nul($ourName, strlen($ourName), $ourYear ?? 0, $ourYear !== null ? self::FFI_OUR_YEAR : 0, $ourCountry, strlen($ourCountry), $titles, strlen($titles), $starteds, strlen($starteds), $countries, strlen($countries), $count, $buf);
+            if ($written !== $count) {
+                return null;
+            }
+            $scores = [];
+            for ($i = 0; $i < $count; $i++) {
+                $score = (float) $buf[$i];
+                $scores[] = $score >= 0.0 ? $score : null;
+            }
+
+            return $scores;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Native PHP `scoreCandidate()` implementation and fallback for inputs the Rust path declines.
+     */
+    public function scoreCandidatePhp(
         string $ourName,
         ?int $ourYear,
         string $candidateTitle,
@@ -1063,6 +1262,16 @@ abstract class AbstractTvProvider extends BaseVideoProvider
         $code = strtoupper(trim($country));
 
         return $code === 'UK' ? 'GB' : $code;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (! self::$ffiResolved) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('tv_candidate_scoring', self::FFI_CDEF);
+            self::$ffiResolved = true;
+        }
+
+        return self::$ffi;
     }
 
     protected function normalizeComparableValue(mixed $value): ?string
@@ -1155,7 +1364,7 @@ abstract class AbstractTvProvider extends BaseVideoProvider
                     }
                 }
             }
-        } catch (\Throwable) {
+        } catch (Throwable) {
             // External ID lookup is optional enrichment.
         }
 
