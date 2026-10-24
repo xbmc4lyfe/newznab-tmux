@@ -17502,3 +17502,1082 @@ pub mod profile_theme_admin_request {
         }
     }
 }
+/// Wave 26.3: media browse controller helpers.
+///
+/// Backs the `*Native()` helpers on `AdultController`, `BooksController`,
+/// `ConsoleController`, `GamesController` and `MusicController`: order-by URL path maps,
+/// category display-name fallback, word-count excerpt truncation, PC game filter validation
+/// and `stripslashes()` input normalization. Byte-producing exports return the number of
+/// bytes written, `-1` for invalid arguments or a caught panic, and `-(required capacity)`
+/// (never `-1`) without writing when `out_cap` is too small.
+pub mod media_browse_controllers {
+    use std::mem::size_of;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::ptr;
+    use std::slice;
+
+    pub const DECLINE: isize = -1;
+
+    pub const KIND_XXX: u8 = 0;
+    pub const KIND_BOOKS: u8 = 1;
+    pub const KIND_GAMES: u8 = 2;
+    pub const KIND_MUSIC: u8 = 3;
+
+    /// `[category, year_valid, year, genre_valid]`.
+    pub const GAME_FILTER_FIELDS: usize = 4;
+    /// `[artist, title]`.
+    pub const STRIP_INPUT_FIELDS: usize = 2;
+
+    #[inline]
+    unsafe fn valid_in<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null() || len > isize::MAX as usize || (ptr as usize).checked_add(len).is_none() {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    unsafe fn valid_in_i64<'a>(ptr: *const i64, count: usize) -> Option<&'a [i64]> {
+        if ptr.is_null() || !ptr.is_aligned() {
+            return None;
+        }
+        let byte_len = count.checked_mul(size_of::<i64>())?;
+        if byte_len > isize::MAX as usize || (ptr as usize).checked_add(byte_len).is_none() {
+            return None;
+        }
+        if count == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, count) })
+    }
+
+    #[inline]
+    fn valid_out<T>(ptr: *mut T, len: usize) -> bool {
+        if ptr.is_null() || !ptr.is_aligned() {
+            return false;
+        }
+        let Some(byte_len) = len.checked_mul(size_of::<T>()) else {
+            return false;
+        };
+        byte_len <= isize::MAX as usize && (ptr as usize).checked_add(byte_len).is_some()
+    }
+
+    #[inline]
+    fn required(total: usize) -> isize {
+        // `-1` is reserved for DECLINE, so a one-byte requirement reports `-2`.
+        if total <= 1 { -2 } else { -(total as isize) }
+    }
+
+    /// Writes `bytes` into `out_buf` when it fits.
+    unsafe fn emit_bytes(bytes: &[u8], out_buf: *mut u8, out_cap: usize) -> isize {
+        if !valid_out(out_buf, out_cap) || bytes.len() > isize::MAX as usize {
+            return DECLINE;
+        }
+        if bytes.len() > out_cap {
+            return required(bytes.len());
+        }
+        unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len()) };
+        bytes.len() as isize
+    }
+
+    /// Writes `parts` back to back into `out_buf`, recording each length in `out_lens`.
+    unsafe fn emit_fields(
+        parts: &[Vec<u8>],
+        out_lens: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if !valid_out(out_lens, parts.len()) || !valid_out(out_buf, out_cap) {
+            return DECLINE;
+        }
+        let mut total = 0usize;
+        for part in parts {
+            let Some(next) = total.checked_add(part.len()) else {
+                return DECLINE;
+            };
+            total = next;
+        }
+        if total > isize::MAX as usize {
+            return DECLINE;
+        }
+        if total > out_cap {
+            return required(total);
+        }
+        let lens = unsafe { slice::from_raw_parts_mut(out_lens, parts.len()) };
+        let mut offset = 0usize;
+        for (slot, part) in lens.iter_mut().zip(parts) {
+            unsafe { ptr::copy_nonoverlapping(part.as_ptr(), out_buf.add(offset), part.len()) };
+            offset += part.len();
+            *slot = part.len();
+        }
+        total as isize
+    }
+
+    /// Splits a NUL-packed list of exactly `count` entries (`count == 0` requires empty input).
+    pub fn unpack(packed: &[u8], count: usize) -> Option<Vec<&[u8]>> {
+        if count == 0 {
+            return packed.is_empty().then(Vec::new);
+        }
+        let items: Vec<&[u8]> = packed.split(|&b| b == 0).collect();
+        (items.len() == count).then_some(items)
+    }
+
+    /// PHP `$id ?: 'All'` for a string id (`''` and `'0'` are falsy).
+    pub fn id_or_all(id: &[u8]) -> &[u8] {
+        if id.is_empty() || id == b"0" {
+            b"All"
+        } else {
+            id
+        }
+    }
+
+    /// Builds the order-by path (before `url()`) for one ordering of a browse page kind.
+    pub fn order_by_path(
+        kind: u8,
+        id: &[u8],
+        category: &[u8],
+        extra: &[u8],
+        ordering: &[u8],
+    ) -> Option<Vec<u8>> {
+        let id = id_or_all(id);
+        let mut path =
+            Vec::with_capacity(32 + id.len() + category.len() + extra.len() + ordering.len());
+        match kind {
+            KIND_XXX => {
+                path.extend_from_slice(b"/XXX/");
+                path.extend_from_slice(id);
+                path.extend_from_slice(b"?t=");
+                path.extend_from_slice(category);
+                path.extend_from_slice(b"&ob=");
+                path.extend_from_slice(ordering);
+            }
+            KIND_BOOKS => {
+                path.extend_from_slice(b"/Books/");
+                path.extend_from_slice(id);
+                path.extend_from_slice(b"?t=");
+                path.extend_from_slice(category);
+                path.extend_from_slice(extra);
+                path.extend_from_slice(b"&ob=");
+                path.extend_from_slice(ordering);
+                path.extend_from_slice(b"&offset=0");
+            }
+            KIND_GAMES => {
+                path.extend_from_slice(b"Games?ob=");
+                path.extend_from_slice(ordering);
+            }
+            KIND_MUSIC => {
+                path.extend_from_slice(b"music/");
+                path.extend_from_slice(id);
+                path.extend_from_slice(b"?ob=");
+                path.extend_from_slice(ordering);
+            }
+            _ => return None,
+        }
+        Some(path)
+    }
+
+    /// PHP word excerpt: `explode(' ')`, and when there are more than `max_words` words keep
+    /// the first `max_words` joined by `' '` followed by `'...'`.
+    pub fn truncate_words(text: &[u8], max_words: usize) -> Vec<u8> {
+        let mut seen = 0usize;
+        for (index, &byte) in text.iter().enumerate() {
+            if byte == b' ' {
+                seen += 1;
+                // `seen` separators means `seen + 1` words; truncate once a word beyond
+                // `max_words` exists, cutting before the separator that starts it.
+                if max_words > 0 && seen >= max_words {
+                    let mut out = Vec::with_capacity(index + 3);
+                    out.extend_from_slice(&text[..index]);
+                    out.extend_from_slice(b"...");
+                    return out;
+                }
+            }
+        }
+        if max_words == 0 {
+            // `array_slice($words, 0, 0)` is empty, and `explode` always yields one word.
+            return b"...".to_vec();
+        }
+        text.to_vec()
+    }
+
+    /// PHP `stripslashes()`: drops each backslash and keeps the following byte, except that
+    /// `\0` becomes a NUL byte and a trailing lone backslash is dropped.
+    pub fn strip_slashes(input: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(input.len());
+        let mut iter = input.iter();
+        while let Some(&byte) = iter.next() {
+            if byte == b'\\' {
+                match iter.next() {
+                    Some(b'0') => out.push(0),
+                    Some(&next) => out.push(next),
+                    None => {}
+                }
+            } else {
+                out.push(byte);
+            }
+        }
+        out
+    }
+
+    /// PHP array-key normalization: `/^(0|-?[1-9][0-9]*)$/` within `i64` becomes an int key.
+    pub fn canonical_int_key(input: &[u8]) -> Option<i64> {
+        let digits = input.strip_prefix(b"-").unwrap_or(input);
+        if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        if digits[0] == b'0' && (digits.len() > 1 || digits.len() != input.len()) {
+            return None;
+        }
+        std::str::from_utf8(input).ok()?.parse::<i64>().ok()
+    }
+
+    #[inline]
+    fn is_php_numeric_ws(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C)
+    }
+
+    /// PHP 8 `is_numeric()` followed by an `(int)` cast. Returns `None` when not numeric.
+    ///
+    /// Integer strings that overflow and float strings are converted through `f64` and
+    /// truncated toward zero, saturating like `zend_dval_to_lval_cap()` (NaN/inf map to 0).
+    pub fn php_numeric_to_int(input: &[u8]) -> Option<i64> {
+        let start = input.iter().position(|&b| !is_php_numeric_ws(b))?;
+        let end = input.iter().rposition(|&b| !is_php_numeric_ws(b))? + 1;
+        let body = &input[start..end];
+        let mut i = 0usize;
+        if matches!(body.first(), Some(b'+' | b'-')) {
+            i += 1;
+        }
+        let int_start = i;
+        while i < body.len() && body[i].is_ascii_digit() {
+            i += 1;
+        }
+        let int_digits = i - int_start;
+        let mut frac_digits = 0usize;
+        let mut is_float = false;
+        if i < body.len() && body[i] == b'.' {
+            is_float = true;
+            i += 1;
+            let frac_start = i;
+            while i < body.len() && body[i].is_ascii_digit() {
+                i += 1;
+            }
+            frac_digits = i - frac_start;
+        }
+        if int_digits == 0 && frac_digits == 0 {
+            return None;
+        }
+        if i < body.len() && matches!(body[i], b'e' | b'E') {
+            let mut j = i + 1;
+            if j < body.len() && matches!(body[j], b'+' | b'-') {
+                j += 1;
+            }
+            let exp_start = j;
+            while j < body.len() && body[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > exp_start {
+                is_float = true;
+                i = j;
+            }
+        }
+        if i != body.len() {
+            return None;
+        }
+        let text = std::str::from_utf8(body).ok()?;
+        if !is_float && let Ok(value) = text.parse::<i64>() {
+            return Some(value);
+        }
+        let value: f64 = text.parse().ok()?;
+        if !value.is_finite() {
+            return Some(0);
+        }
+        // `as` saturates toward i64::MIN/MAX, matching the capped conversion.
+        Some(value.trunc() as i64)
+    }
+
+    /// Mirrors the `GamesController` category/year/genre filter validation.
+    ///
+    /// Returns `[category, year_valid, year, genre_valid]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn game_filters(
+        category_input: &[u8],
+        category_ids: &[i64],
+        default_category: i64,
+        year_input: &[u8],
+        min_year: i64,
+        max_year: i64,
+        genre_input: &[u8],
+        genre_ids: &[i64],
+    ) -> [i64; GAME_FILTER_FIELDS] {
+        let category = canonical_int_key(category_input)
+            .filter(|id| category_ids.contains(id))
+            .unwrap_or(default_category);
+        let year = php_numeric_to_int(year_input).filter(|y| (min_year..=max_year).contains(y));
+        let genre_valid = canonical_int_key(genre_input).is_some_and(|id| genre_ids.contains(&id));
+        [
+            category,
+            i64::from(year.is_some()),
+            year.unwrap_or(0),
+            i64::from(genre_valid),
+        ]
+    }
+
+    /// Backs the order-by URL helpers on Adult/Books/Games/Music controllers.
+    ///
+    /// `orderings` is a NUL-packed list of `ordering_count` values. Writes one path per
+    /// ordering back to back with lengths in `out_lens[0..ordering_count]`.
+    ///
+    /// # Safety
+    ///
+    /// Input pointers must be readable for their lengths, `out_lens` an aligned, writable
+    /// `size_t[ordering_count]` and `out_buf` writable for `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_media_browse_order_by_paths(
+        kind: u8,
+        id_ptr: *const u8,
+        id_len: usize,
+        category_ptr: *const u8,
+        category_len: usize,
+        extra_ptr: *const u8,
+        extra_len: usize,
+        orderings_ptr: *const u8,
+        orderings_len: usize,
+        ordering_count: usize,
+        out_lens: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            let (Some(id), Some(category), Some(extra), Some(packed)) = (
+                unsafe { valid_in(id_ptr, id_len) },
+                unsafe { valid_in(category_ptr, category_len) },
+                unsafe { valid_in(extra_ptr, extra_len) },
+                unsafe { valid_in(orderings_ptr, orderings_len) },
+            ) else {
+                return DECLINE;
+            };
+            if !valid_out(out_lens, ordering_count) {
+                return DECLINE;
+            }
+            let Some(orderings) = unpack(packed, ordering_count) else {
+                return DECLINE;
+            };
+            let mut paths = Vec::with_capacity(orderings.len());
+            for ordering in orderings {
+                let Some(path) = order_by_path(kind, id, category, extra, ordering) else {
+                    return DECLINE;
+                };
+                paths.push(path);
+            }
+            unsafe { emit_fields(&paths, out_lens, out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Backs the category display-name fallback helpers.
+    ///
+    /// Writes `All` when `is_all` is non-zero or `has_title` is zero, otherwise the title.
+    ///
+    /// # Safety
+    ///
+    /// When `has_title` is non-zero `title_ptr` must be readable for `title_len` bytes;
+    /// `out_buf` must be writable for `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_media_browse_category_display_name(
+        is_all: u8,
+        has_title: u8,
+        title_ptr: *const u8,
+        title_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            let name: &[u8] = if is_all != 0 || has_title == 0 {
+                b"All"
+            } else {
+                match unsafe { valid_in(title_ptr, title_len) } {
+                    Some(title) => title,
+                    None => return DECLINE,
+                }
+            };
+            unsafe { emit_bytes(name, out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Backs the Books/Console overview/review excerpt helpers.
+    ///
+    /// # Safety
+    ///
+    /// `text_ptr` must be readable for `text_len` bytes and `out_buf` writable for
+    /// `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_media_browse_truncate_words(
+        text_ptr: *const u8,
+        text_len: usize,
+        max_words: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(text) = (unsafe { valid_in(text_ptr, text_len) }) else {
+                return DECLINE;
+            };
+            if !valid_out(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let excerpt = truncate_words(text, max_words);
+            unsafe { emit_bytes(&excerpt, out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Backs `GamesController::gameFiltersNative()`.
+    ///
+    /// Writes `[category, year_valid, year, genre_valid]` into `out_fields` and returns `0`,
+    /// or `-1` without writing on invalid arguments.
+    ///
+    /// # Safety
+    ///
+    /// Byte inputs must be readable for their lengths, the id arrays aligned and readable
+    /// for their counts, and `out_fields` an aligned, writable `int64_t[4]`.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_media_browse_game_filters(
+        category_ptr: *const u8,
+        category_len: usize,
+        category_ids: *const i64,
+        category_count: usize,
+        default_category: i64,
+        year_ptr: *const u8,
+        year_len: usize,
+        min_year: i64,
+        max_year: i64,
+        genre_ptr: *const u8,
+        genre_len: usize,
+        genre_ids: *const i64,
+        genre_count: usize,
+        out_fields: *mut i64,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            let (Some(category), Some(year), Some(genre)) = (
+                unsafe { valid_in(category_ptr, category_len) },
+                unsafe { valid_in(year_ptr, year_len) },
+                unsafe { valid_in(genre_ptr, genre_len) },
+            ) else {
+                return DECLINE;
+            };
+            let (Some(cat_ids), Some(gen_ids)) = (
+                unsafe { valid_in_i64(category_ids, category_count) },
+                unsafe { valid_in_i64(genre_ids, genre_count) },
+            ) else {
+                return DECLINE;
+            };
+            if !valid_out(out_fields, GAME_FILTER_FIELDS) || min_year > max_year {
+                return DECLINE;
+            }
+            let fields = game_filters(
+                category,
+                cat_ids,
+                default_category,
+                year,
+                min_year,
+                max_year,
+                genre,
+                gen_ids,
+            );
+            let out = unsafe { slice::from_raw_parts_mut(out_fields, GAME_FILTER_FIELDS) };
+            out.copy_from_slice(&fields);
+            0
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Backs `MusicController::browseInputsNative()`.
+    ///
+    /// Writes `stripslashes(artist)` and `stripslashes(title)` back to back with lengths in
+    /// `out_lens[0..2]`.
+    ///
+    /// # Safety
+    ///
+    /// Input pointers must be readable for their lengths, `out_lens` an aligned, writable
+    /// `size_t[2]` and `out_buf` writable for `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_media_browse_strip_inputs(
+        artist_ptr: *const u8,
+        artist_len: usize,
+        title_ptr: *const u8,
+        title_len: usize,
+        out_lens: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            let (Some(artist), Some(title)) =
+                (unsafe { valid_in(artist_ptr, artist_len) }, unsafe {
+                    valid_in(title_ptr, title_len)
+                })
+            else {
+                return DECLINE;
+            };
+            let parts = [strip_slashes(artist), strip_slashes(title)];
+            unsafe { emit_fields(&parts, out_lens, out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn order_paths(
+            kind: u8,
+            id: &[u8],
+            cat: &[u8],
+            extra: &[u8],
+            packed: &[u8],
+            count: usize,
+            cap: usize,
+        ) -> (isize, Vec<usize>, Vec<u8>) {
+            let mut lens = vec![usize::MAX; count.max(1)];
+            let mut buf = vec![b'Z'; cap.max(1)];
+            let rc = unsafe {
+                nntmux_media_browse_order_by_paths(
+                    kind,
+                    id.as_ptr(),
+                    id.len(),
+                    cat.as_ptr(),
+                    cat.len(),
+                    extra.as_ptr(),
+                    extra.len(),
+                    packed.as_ptr(),
+                    packed.len(),
+                    count,
+                    lens.as_mut_ptr(),
+                    buf.as_mut_ptr(),
+                    cap,
+                )
+            };
+            (rc, lens, buf)
+        }
+
+        fn split_fields<'a>(buf: &'a [u8], lens: &[usize]) -> Vec<&'a [u8]> {
+            let mut offset = 0;
+            lens.iter()
+                .map(|&len| {
+                    let part = &buf[offset..offset + len];
+                    offset += len;
+                    part
+                })
+                .collect()
+        }
+
+        #[test]
+        fn order_by_paths_for_each_kind() {
+            let packed = b"name_asc\0size_desc";
+            let (rc, lens, buf) = order_paths(KIND_XXX, b"", b"6000", b"", packed, 2, 256);
+            assert!(rc > 0);
+            assert_eq!(
+                split_fields(&buf, &lens),
+                [
+                    &b"/XXX/All?t=6000&ob=name_asc"[..],
+                    b"/XXX/All?t=6000&ob=size_desc"
+                ]
+            );
+            let (_, lens, buf) = order_paths(
+                KIND_BOOKS,
+                b"Ebook",
+                b"7020",
+                b"&title=a&author=b",
+                b"title_asc",
+                1,
+                256,
+            );
+            assert_eq!(
+                split_fields(&buf, &lens)[0],
+                b"/Books/Ebook?t=7020&title=a&author=b&ob=title_asc&offset=0"
+            );
+            let (_, lens, buf) = order_paths(KIND_GAMES, b"x", b"y", b"z", b"posted_desc", 1, 256);
+            assert_eq!(split_fields(&buf, &lens)[0], b"Games?ob=posted_desc");
+            let (_, lens, buf) = order_paths(KIND_MUSIC, b"0", b"", b"", b"artist_asc", 1, 256);
+            assert_eq!(split_fields(&buf, &lens)[0], b"music/All?ob=artist_asc");
+            assert_eq!(order_paths(9, b"", b"", b"", b"a", 1, 256).0, DECLINE);
+            assert_eq!(
+                order_paths(KIND_XXX, b"", b"", b"", b"a\0b", 3, 256).0,
+                DECLINE
+            );
+            assert_eq!(order_paths(KIND_XXX, b"", b"", b"", b"", 0, 256).0, 0);
+        }
+
+        #[test]
+        fn order_by_paths_reports_capacity_without_writing() {
+            let (full, _, _) = order_paths(KIND_MUSIC, b"", b"", b"", b"a\0b", 2, 256);
+            let (rc, lens, buf) = order_paths(KIND_MUSIC, b"", b"", b"", b"a\0b", 2, 4);
+            assert_eq!(rc, -full);
+            assert!(lens.iter().all(|&l| l == usize::MAX));
+            assert!(buf.iter().all(|&b| b == b'Z'));
+        }
+
+        #[test]
+        fn rejects_null_unaligned_and_oversized_pointers() {
+            let mut buf = [0u8; 64];
+            let mut lens = [0usize; 2];
+            let mut raw = [0u8; 64];
+            unsafe {
+                let unaligned = raw.as_mut_ptr().add(1).cast::<usize>();
+                assert_eq!(
+                    nntmux_media_browse_order_by_paths(
+                        0,
+                        ptr::null(),
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        b"a".as_ptr(),
+                        1,
+                        1,
+                        lens.as_mut_ptr(),
+                        buf.as_mut_ptr(),
+                        64
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_media_browse_order_by_paths(
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        b"a".as_ptr(),
+                        usize::MAX,
+                        1,
+                        lens.as_mut_ptr(),
+                        buf.as_mut_ptr(),
+                        64
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_media_browse_order_by_paths(
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        b"a".as_ptr(),
+                        1,
+                        1,
+                        unaligned,
+                        buf.as_mut_ptr(),
+                        64
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_media_browse_order_by_paths(
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        b"a".as_ptr(),
+                        1,
+                        1,
+                        lens.as_mut_ptr(),
+                        ptr::null_mut(),
+                        64
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_media_browse_order_by_paths(
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        b"a".as_ptr(),
+                        1,
+                        1,
+                        lens.as_mut_ptr(),
+                        buf.as_mut_ptr(),
+                        usize::MAX
+                    ),
+                    DECLINE
+                );
+                assert_eq!(raw, [0u8; 64]);
+
+                assert_eq!(
+                    nntmux_media_browse_category_display_name(
+                        0,
+                        1,
+                        ptr::null(),
+                        0,
+                        buf.as_mut_ptr(),
+                        64
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_media_browse_category_display_name(
+                        0,
+                        1,
+                        b"x".as_ptr(),
+                        1,
+                        ptr::null_mut(),
+                        64
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_media_browse_truncate_words(ptr::null(), 0, 50, buf.as_mut_ptr(), 64),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_media_browse_truncate_words(
+                        b"a".as_ptr(),
+                        1,
+                        50,
+                        buf.as_mut_ptr(),
+                        usize::MAX
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_media_browse_strip_inputs(
+                        b"a".as_ptr(),
+                        1,
+                        ptr::null(),
+                        0,
+                        lens.as_mut_ptr(),
+                        buf.as_mut_ptr(),
+                        64
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_media_browse_strip_inputs(
+                        b"a".as_ptr(),
+                        1,
+                        b"".as_ptr(),
+                        0,
+                        unaligned,
+                        buf.as_mut_ptr(),
+                        64
+                    ),
+                    DECLINE
+                );
+
+                let ids = [1i64, 2];
+                let mut out = [7i64; 4];
+                let mut raw_ids = [0u8; 40];
+                let unaligned_ids = raw_ids.as_mut_ptr().add(1).cast::<i64>();
+                assert_eq!(
+                    nntmux_media_browse_game_filters(
+                        ptr::null(),
+                        0,
+                        ids.as_ptr(),
+                        2,
+                        4050,
+                        b"".as_ptr(),
+                        0,
+                        1903,
+                        2027,
+                        b"".as_ptr(),
+                        0,
+                        ids.as_ptr(),
+                        2,
+                        out.as_mut_ptr()
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_media_browse_game_filters(
+                        b"".as_ptr(),
+                        0,
+                        unaligned_ids,
+                        2,
+                        4050,
+                        b"".as_ptr(),
+                        0,
+                        1903,
+                        2027,
+                        b"".as_ptr(),
+                        0,
+                        ids.as_ptr(),
+                        2,
+                        out.as_mut_ptr()
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_media_browse_game_filters(
+                        b"".as_ptr(),
+                        0,
+                        ids.as_ptr(),
+                        usize::MAX,
+                        4050,
+                        b"".as_ptr(),
+                        0,
+                        1903,
+                        2027,
+                        b"".as_ptr(),
+                        0,
+                        ids.as_ptr(),
+                        2,
+                        out.as_mut_ptr()
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_media_browse_game_filters(
+                        b"".as_ptr(),
+                        0,
+                        ids.as_ptr(),
+                        2,
+                        4050,
+                        b"".as_ptr(),
+                        0,
+                        1903,
+                        2027,
+                        b"".as_ptr(),
+                        0,
+                        ids.as_ptr(),
+                        2,
+                        unaligned_ids
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_media_browse_game_filters(
+                        b"".as_ptr(),
+                        0,
+                        ids.as_ptr(),
+                        2,
+                        4050,
+                        b"".as_ptr(),
+                        0,
+                        2027,
+                        1903,
+                        b"".as_ptr(),
+                        0,
+                        ids.as_ptr(),
+                        2,
+                        out.as_mut_ptr()
+                    ),
+                    DECLINE
+                );
+                assert_eq!(out, [7i64; 4]);
+                assert_eq!(raw_ids, [0u8; 40]);
+            }
+        }
+
+        #[test]
+        fn category_display_name_fallbacks() {
+            let mut buf = [b'Z'; 16];
+            let rc = unsafe {
+                nntmux_media_browse_category_display_name(
+                    1,
+                    1,
+                    b"Ebook".as_ptr(),
+                    5,
+                    buf.as_mut_ptr(),
+                    16,
+                )
+            };
+            assert_eq!(&buf[..rc as usize], b"All");
+            let rc = unsafe {
+                nntmux_media_browse_category_display_name(
+                    0,
+                    0,
+                    ptr::null(),
+                    0,
+                    buf.as_mut_ptr(),
+                    16,
+                )
+            };
+            assert_eq!(&buf[..rc as usize], b"All");
+            let rc = unsafe {
+                nntmux_media_browse_category_display_name(
+                    0,
+                    1,
+                    b"Ebook".as_ptr(),
+                    5,
+                    buf.as_mut_ptr(),
+                    16,
+                )
+            };
+            assert_eq!(&buf[..rc as usize], b"Ebook");
+            let mut small = [b'Z'; 2];
+            assert_eq!(
+                unsafe {
+                    nntmux_media_browse_category_display_name(
+                        0,
+                        1,
+                        b"Ebook".as_ptr(),
+                        5,
+                        small.as_mut_ptr(),
+                        2,
+                    )
+                },
+                -5
+            );
+            assert_eq!(small, [b'Z'; 2]);
+            assert_eq!(
+                unsafe {
+                    nntmux_media_browse_category_display_name(
+                        0,
+                        1,
+                        b"E".as_ptr(),
+                        1,
+                        small.as_mut_ptr(),
+                        0,
+                    )
+                },
+                -2
+            );
+        }
+
+        #[test]
+        fn truncate_words_matches_php_explode_semantics() {
+            assert_eq!(truncate_words(b"a b c", 3), b"a b c");
+            assert_eq!(truncate_words(b"a b c d", 3), b"a b c...");
+            assert_eq!(truncate_words(b"a  b", 2), b"a ...");
+            assert_eq!(truncate_words(b" a", 1), b"...");
+            assert_eq!(truncate_words(b"abc", 0), b"...");
+            assert_eq!(truncate_words(b"", 0), b"...");
+            assert_eq!(truncate_words(b"a\tb\nc", 1), b"a\tb\nc");
+            assert_eq!(truncate_words(b"a b ", 2), b"a b...");
+        }
+
+        #[test]
+        fn strip_slashes_matches_php() {
+            assert_eq!(strip_slashes(b"O\\'Brien"), b"O'Brien");
+            assert_eq!(strip_slashes(b"a\\\\b"), b"a\\b");
+            assert_eq!(strip_slashes(b"x\\0y"), b"x\0y");
+            assert_eq!(strip_slashes(b"end\\"), b"end");
+            assert_eq!(strip_slashes(b"\\n"), b"n");
+        }
+
+        #[test]
+        fn numeric_and_key_parsing_match_php() {
+            assert_eq!(canonical_int_key(b"0"), Some(0));
+            assert_eq!(canonical_int_key(b"4050"), Some(4050));
+            assert_eq!(canonical_int_key(b"-5"), Some(-5));
+            for bad in [
+                &b"-0"[..],
+                b"05",
+                b" 5",
+                b"5 ",
+                b"",
+                b"-",
+                b"+5",
+                b"9223372036854775808",
+            ] {
+                assert_eq!(canonical_int_key(bad), None);
+            }
+            assert_eq!(php_numeric_to_int(b"2020"), Some(2020));
+            assert_eq!(php_numeric_to_int(b" 2020 "), Some(2020));
+            assert_eq!(php_numeric_to_int(b"2020.9"), Some(2020));
+            assert_eq!(php_numeric_to_int(b"2.02e3"), Some(2020));
+            assert_eq!(php_numeric_to_int(b".5"), Some(0));
+            assert_eq!(php_numeric_to_int(b"-1."), Some(-1));
+            assert_eq!(php_numeric_to_int(b"1e"), None);
+            assert_eq!(php_numeric_to_int(b"0x1A"), None);
+            assert_eq!(php_numeric_to_int(b"."), None);
+            assert_eq!(php_numeric_to_int(b""), None);
+            assert_eq!(php_numeric_to_int(b"99999999999999999999"), Some(i64::MAX));
+            assert_eq!(php_numeric_to_int(b"1e999"), Some(0));
+        }
+
+        #[test]
+        fn game_filters_validate_each_field() {
+            let cats = [4050i64, 4060];
+            let genres = [1i64, 7];
+            assert_eq!(
+                game_filters(b"4060", &cats, 4050, b"2020", 1903, 2027, b"7", &genres),
+                [4060, 1, 2020, 1]
+            );
+            assert_eq!(
+                game_filters(b"04060", &cats, 4050, b"1902", 1903, 2027, b"07", &genres),
+                [4050, 0, 0, 0]
+            );
+            assert_eq!(
+                game_filters(b"", &cats, 4050, b"abc", 1903, 2027, b"", &genres),
+                [4050, 0, 0, 0]
+            );
+            let mut out = [0i64; 4];
+            let rc = unsafe {
+                nntmux_media_browse_game_filters(
+                    b"4060".as_ptr(),
+                    4,
+                    cats.as_ptr(),
+                    2,
+                    4050,
+                    b" 2027".as_ptr(),
+                    5,
+                    1903,
+                    2027,
+                    b"1".as_ptr(),
+                    1,
+                    genres.as_ptr(),
+                    2,
+                    out.as_mut_ptr(),
+                )
+            };
+            assert_eq!(rc, 0);
+            assert_eq!(out, [4060, 1, 2027, 1]);
+        }
+
+        #[test]
+        fn strip_inputs_round_trip_and_capacity() {
+            let mut lens = [9usize; 2];
+            let mut buf = [b'Z'; 32];
+            let rc = unsafe {
+                nntmux_media_browse_strip_inputs(
+                    b"A\\'B".as_ptr(),
+                    4,
+                    b"T".as_ptr(),
+                    1,
+                    lens.as_mut_ptr(),
+                    buf.as_mut_ptr(),
+                    32,
+                )
+            };
+            assert_eq!(rc, 4);
+            assert_eq!(split_fields(&buf, &lens), [&b"A'B"[..], b"T"]);
+            let mut small_lens = [9usize; 2];
+            let mut small = [b'Z'; 2];
+            assert_eq!(
+                unsafe {
+                    nntmux_media_browse_strip_inputs(
+                        b"A\\'B".as_ptr(),
+                        4,
+                        b"T".as_ptr(),
+                        1,
+                        small_lens.as_mut_ptr(),
+                        small.as_mut_ptr(),
+                        2,
+                    )
+                },
+                -4
+            );
+            assert_eq!((small, small_lens), ([b'Z'; 2], [9usize; 2]));
+        }
+    }
+}
