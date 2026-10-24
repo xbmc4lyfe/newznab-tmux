@@ -10,7 +10,12 @@ use App\Services\Configuration\ConfigurationProvider;
 use App\Services\NameFixing\NameFixingService;
 use App\Services\NNTP\NNTPService;
 use App\Services\TvProcessing\TvProcessingPipeline;
+use App\Support\RustPipelineLibrary;
+use Closure;
 use dariusiii\rarinfo\Par2Info;
+use FFI;
+use FFI\CData;
+use Throwable;
 
 /**
  * Orchestrates post-processing of releases.
@@ -23,6 +28,17 @@ use dariusiii\rarinfo\Par2Info;
  */
 final class PostProcessService
 {
+    public const string FFI_CDEF = <<<'C'
+        int32_t nntmux_pps_tv_lookup(int32_t kind, int64_t int_value, const char *ptr, size_t len, int64_t default_value, int32_t has_default, int64_t *out_resolved);
+        C;
+
+    // PHP remains the production default until benchmarks qualify Rust.
+    private static ?bool $useRustFfi = null;
+
+    private static FFI|false|null $ffi = null;
+
+    private static ?CData $resolvedBuffer = null;
+
     private readonly bool $echoOutput;
 
     private readonly bool $alternateNNTP;
@@ -91,6 +107,86 @@ final class PostProcessService
         $this->consolesProcessor = $consolesProcessor ?? new ConsolesProcessor($this->echoOutput);
         $this->gamesProcessor = $gamesProcessor ?? new GamesProcessor($this->echoOutput);
         $this->animeProcessor = $animeProcessor ?? new AnimeProcessor($this->echoOutput);
+    }
+
+    public static function setUseRustFfi(?bool $use = true): void
+    {
+        self::$useRustFfi = $use;
+        if ($use === null) {
+            self::$ffi = null;
+            self::$resolvedBuffer = null;
+        }
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? false;
+    }
+
+    public static function setFfiForTesting(FFI|false|null $override = null): void
+    {
+        self::$ffi = $override;
+        self::$resolvedBuffer = null;
+    }
+
+    /**
+     * Resolve the TV lookup mode: a numeric `$processTV` wins, otherwise the configured
+     * default (a closure is only invoked when needed); mode 2 means renamed releases only.
+     *
+     * @param  int|Closure(): int  $defaultLookupValue
+     * @return array{resolved: int, renamedOnly: bool}
+     */
+    public static function resolveTvLookupMode(int|string|null $processTV, int|Closure $defaultLookupValue): array
+    {
+        return self::usesRustFfi()
+            ? self::resolveTvLookupModeNative($processTV, $defaultLookupValue)
+            : self::resolveTvLookupModePhp($processTV, $defaultLookupValue);
+    }
+
+    /**
+     * @param  int|Closure(): int  $defaultLookupValue
+     * @return array{resolved: int, renamedOnly: bool}
+     */
+    public static function resolveTvLookupModePhp(int|string|null $processTV, int|Closure $defaultLookupValue): array
+    {
+        $resolved = is_numeric($processTV)
+            ? (int) $processTV
+            : (int) ($defaultLookupValue instanceof Closure ? $defaultLookupValue() : $defaultLookupValue);
+
+        return ['resolved' => $resolved, 'renamedOnly' => $resolved === 2];
+    }
+
+    /**
+     * @param  int|Closure(): int  $defaultLookupValue
+     * @return array{resolved: int, renamedOnly: bool}
+     */
+    public static function resolveTvLookupModeNative(int|string|null $processTV, int|Closure $defaultLookupValue): array
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return self::resolveTvLookupModePhp($processTV, $defaultLookupValue);
+        }
+        $kind = match (true) {
+            $processTV === null => 0,
+            \is_int($processTV) => 1,
+            default => 2,
+        };
+        $intValue = \is_int($processTV) ? $processTV : 0;
+        $text = \is_string($processTV) ? $processTV : '';
+        $default = \is_int($defaultLookupValue) ? $defaultLookupValue : null;
+
+        $flags = self::tvLookupNative($ffi, $kind, $intValue, $text, $default);
+        if ($flags === -2 && $default === null && $defaultLookupValue instanceof Closure) {
+            $default = (int) $defaultLookupValue();
+            $flags = self::tvLookupNative($ffi, 0, 0, '', $default);
+        }
+        if ($flags === null || $flags < 0 || self::$resolvedBuffer === null) {
+            return self::resolveTvLookupModePhp($processTV, $default ?? $defaultLookupValue);
+        }
+        /** @var int $resolved */
+        $resolved = self::$resolvedBuffer[0];
+
+        return ['resolved' => $resolved, 'renamedOnly' => ($flags & 1) !== 0];
     }
 
     /**
@@ -214,10 +310,10 @@ final class PostProcessService
     ): void {
         if ($guidChar === '') {
             $forkingService = new ForkingService;
-            $processTV = is_numeric($processTV)
-                ? $processTV
-                : app(ConfigurationProvider::class)->metadata()->tvLookup->value;
-            $renamedOnly = ((int) $processTV === 2);
+            $renamedOnly = self::resolveTvLookupMode(
+                $processTV,
+                static fn (): int => app(ConfigurationProvider::class)->metadata()->tvLookup->value,
+            )['renamedOnly'];
 
             $forkingService->processTv($renamedOnly);
         } else {
@@ -281,5 +377,28 @@ final class PostProcessService
     public function applyPAR2InventoryForRename(Par2PacketAccumulator $inventory, int $relID, int $groupID, int $show, ?callable $canPersist = null, bool $allowTerminalMetadata = true, ?array $expectedSnapshot = null): Par2RenameOutcome
     {
         return $this->par2Processor->applyInventoryForRename($inventory, $relID, $groupID, $show, $canPersist, $allowTerminalMetadata, $expectedSnapshot);
+    }
+
+    /** Flags from `nntmux_pps_tv_lookup`, or null when the call fails. */
+    private static function tvLookupNative(FFI $ffi, int $kind, int $intValue, string $text, ?int $default): ?int
+    {
+        try {
+            self::$resolvedBuffer ??= $ffi->new('int64_t[1]');
+            // @phpstan-ignore method.notFound
+            $flags = $ffi->nntmux_pps_tv_lookup($kind, $intValue, $text, \strlen($text), $default ?? 0, $default === null ? 0 : 1, self::$resolvedBuffer);
+        } catch (Throwable) {
+            return null;
+        }
+
+        return \is_int($flags) ? $flags : null;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('additional', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
     }
 }
