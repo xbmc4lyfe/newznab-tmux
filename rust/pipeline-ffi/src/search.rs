@@ -21602,3 +21602,545 @@ pub mod apiv1_manticore_media_index_commands {
         }
     }
 }
+
+
+#[cfg(test)]
+mod wave30_5_schema_log_steam_tests {
+    use super::wave30_5_schema_log_steam::nntmux_search_schema_log_steam;
+
+    fn packet(parts: &[&[u8]]) -> Vec<u8> {
+        let mut bytes = (parts.len() as u32).to_le_bytes().to_vec();
+        for part in parts {
+            bytes.extend_from_slice(&(part.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(part);
+        }
+        bytes
+    }
+
+    fn call(mode: u32, parts: &[&[u8]]) -> Vec<u8> {
+        let input = packet(parts);
+        let mut out = vec![0x5a; input.len() + 1024];
+        let rc = unsafe {
+            nntmux_search_schema_log_steam(
+                mode,
+                input.as_ptr(),
+                input.len(),
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert!(rc >= 0, "unexpected result {rc} for mode {mode}");
+        out.truncate(rc as usize);
+        out
+    }
+
+    #[test]
+    fn binary_identity_and_byte_truncated_steam_name() {
+        assert_eq!(
+            call(1, &[b"a\0\xff", b"", b"42"]),
+            packet(&[b"a\0\xff", b"", b"42"])
+        );
+        let mut name = vec![b'a'; 59];
+        name.extend_from_slice(&[0xc3, 0xa9, 0, 0xff]);
+        let score = (-12.25_f64).to_le_bytes();
+        assert_eq!(
+            call(3, &[b"-9223372036854775808", &name, &score]),
+            packet(&[
+                b"-9223372036854775808",
+                &name[..60],
+                b"-12.3%",
+                b"https://store.steampowered.com/app/-9223372036854775808"
+            ])
+        );
+        assert_eq!(
+            call(3, &[b"001", b"Game", &999.96_f64.to_le_bytes()]),
+            packet(&[
+                b"1",
+                b"Game",
+                b"1,000.0%",
+                b"https://store.steampowered.com/app/1"
+            ])
+        );
+        assert_eq!(
+            call(3, &[b"1", b"", &(-0.0_f64).to_le_bytes()]),
+            packet(&[b"1", b"", b"0.0%", b"https://store.steampowered.com/app/1"])
+        );
+    }
+
+    #[test]
+    fn summaries_headers_and_options_preserve_bytes_and_order() {
+        assert_eq!(call(2, &[b"-1", b"2\0\xff GiB", b"9223372036854775807", b"-3"]), packet(&[
+            b"Indexed -1 entries (2\0\xff GiB) from 9223372036854775807 file(s); -3 file(s) purged."
+        ]));
+        assert_eq!(call(4, &[b"-42"]), packet(&[b"Found -42 result(s):"]));
+        assert_eq!(
+            call(5, &[b"GET", b"\0\xff", b"GET", b"", b""]),
+            packet(&[b"GET, \0\xff, "])
+        );
+        assert_eq!(call(5, &[]), packet(&[b""]));
+        assert_eq!(
+            call(6, &[b"application/json", b"GET", b"QUERY", b"GET"]),
+            packet(&[b"GET, QUERY", b"application/json"])
+        );
+        assert_eq!(call(6, &[b""]), packet(&[b"", b""]));
+    }
+
+    #[test]
+    fn manticore_rows_missing_fields_and_sql() {
+        assert_eq!(
+            call(
+                7,
+                &[
+                    b"title", b"text", b"2", b"indexed", b"stored", b"id", b"bigint", b"0"
+                ]
+            ),
+            packet(&[b"title", b"text", b"indexed, stored", b"id", b"bigint", b""])
+        );
+        let fields: &[&[u8]] = &[
+            b"id", b"0", b"0", b"name", b"1", b"1", b"\0\xff", b"0", b"02",
+        ];
+        assert_eq!(call(8, fields), packet(&[b"2"]));
+        assert_eq!(call(11, fields), packet(&[b"0", b"2"]));
+        for (kind, sql_kind) in [
+            (b"text".as_slice(), b"text".as_slice()),
+            (b"int", b"uint"),
+            (b"bigint", b"bigint"),
+            (b"string", b"string"),
+        ] {
+            let mut sql = b"ALTER TABLE t\0 ADD COLUMN f\xff ".to_vec();
+            sql.extend_from_slice(sql_kind);
+            assert_eq!(call(9, &[b"t\0", b"f\xff", kind]), packet(&[&sql]));
+        }
+        assert_eq!(call(9, &[b"t", b"f", b"unsupported"]), packet(&[]));
+    }
+
+    #[test]
+    fn elasticsearch_details_and_media_ids() {
+        assert_eq!(
+            call(10, &[b"title", b"text", b"1", b"std\0\xff", b"1", b"1"]),
+            packet(&[
+                b"title",
+                b"text",
+                b"analyzer: std\0\xff, not indexed, multi-field"
+            ])
+        );
+        assert_eq!(
+            call(10, &[b"id", b"keyword", b"0", b"ignored", b"0", b"0"]),
+            packet(&[b"id", b"keyword", b""])
+        );
+        assert_eq!(
+            call(12, &[b"tt\0\xff", b"-9223372036854775808", b"+00042"]),
+            packet(&[b"tt\0\xff", b"-9223372036854775808", b"42"])
+        );
+    }
+
+    #[test]
+    fn declines_malformed_packets_and_invalid_mode_arguments_without_writes() {
+        let mut cases = vec![
+            (1, vec![]),
+            (1, vec![0, 0, 0]),
+            (1, vec![1, 0, 0, 0]),
+            (1, vec![1, 0, 0, 0, 255, 255, 255, 255]),
+            (1, vec![0, 0, 0, 0, 1]),
+            (1, 100_001_u32.to_le_bytes().to_vec()),
+            (0, packet(&[])),
+            (13, packet(&[])),
+        ];
+        for (mode, parts) in [
+            (2, vec![b"1".as_slice()]),
+            (2, vec![b"9223372036854775808", b"x", b"1", b"1"]),
+            (3, vec![b"1", b"x", b"score"]),
+            (4, vec![b" 1"]),
+            (4, vec![b"1.0"]),
+            (6, vec![]),
+            (7, vec![b"f", b"text", b"2", b"one"]),
+            (7, vec![b"f", b"text", b"-1"]),
+            (8, vec![b"f", b"2", b"0"]),
+            (8, vec![b"f", b"0", b"-1"]),
+            (9, vec![b"t", b"f"]),
+            (10, vec![b"f", b"t", b"2", b"a", b"0", b"0"]),
+            (11, vec![b"f", b"0"]),
+            (12, vec![b"tt", b"1", b"9223372036854775808"]),
+        ] {
+            cases.push((mode, packet(&parts)));
+        }
+        for score in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX] {
+            cases.push((3, packet(&[b"1", b"game", &score.to_le_bytes()])));
+        }
+        for (mode, input) in cases {
+            let mut out = [0x5a; 256];
+            let rc = unsafe {
+                nntmux_search_schema_log_steam(
+                    mode,
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert_eq!(
+                rc,
+                isize::MIN,
+                "accepted malformed mode {mode} packet {input:?}"
+            );
+            assert_eq!(out, [0x5a; 256]);
+        }
+    }
+
+    #[test]
+    fn buffer_bounds_nulls_sizing_and_overlapping_buffers() {
+        let input = packet(&[b"binary\0\xff"]);
+        for cap in [0, 1, input.len() - 1] {
+            let mut out = [0x5a; 64];
+            assert_eq!(
+                unsafe {
+                    nntmux_search_schema_log_steam(
+                        1,
+                        input.as_ptr(),
+                        input.len(),
+                        out.as_mut_ptr(),
+                        cap,
+                    )
+                },
+                -(input.len() as isize)
+            );
+            assert_eq!(out, [0x5a; 64]);
+        }
+        assert_eq!(
+            unsafe {
+                nntmux_search_schema_log_steam(
+                    1,
+                    input.as_ptr(),
+                    input.len(),
+                    std::ptr::null_mut(),
+                    0,
+                )
+            },
+            -(input.len() as isize)
+        );
+        let mut out = [0x5a; 64];
+        for (ptr, len, dst, cap) in [
+            (std::ptr::null(), 1, out.as_mut_ptr(), out.len()),
+            (std::ptr::null(), 0, out.as_mut_ptr(), out.len()),
+            (input.as_ptr(), input.len(), std::ptr::null_mut(), 1),
+            (input.as_ptr(), usize::MAX, out.as_mut_ptr(), out.len()),
+            (
+                input.as_ptr(),
+                16 * 1024 * 1024 + 1,
+                out.as_mut_ptr(),
+                out.len(),
+            ),
+            (input.as_ptr(), input.len(), out.as_mut_ptr(), usize::MAX),
+        ] {
+            assert_eq!(
+                unsafe { nntmux_search_schema_log_steam(1, ptr, len, dst, cap) },
+                isize::MIN
+            );
+            assert_eq!(out, [0x5a; 64]);
+        }
+        let mut overlapping = input.clone();
+        let rc = unsafe {
+            nntmux_search_schema_log_steam(
+                1,
+                overlapping.as_ptr(),
+                overlapping.len(),
+                overlapping.as_mut_ptr(),
+                overlapping.len(),
+            )
+        };
+        assert_eq!(rc, input.len() as isize);
+        assert_eq!(overlapping, input);
+    }
+}
+
+/// Byte-packet helpers for search schema, log summary and Steam command output.
+mod wave30_5_schema_log_steam {
+    use std::collections::HashSet;
+
+    const DECLINE: isize = isize::MIN;
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+    const MAX_PARTS: usize = 100_000;
+
+    fn unpack(input: &[u8]) -> Option<Vec<&[u8]>> {
+        let count = u32::from_le_bytes(input.get(..4)?.try_into().ok()?) as usize;
+        if count > MAX_PARTS || count > (input.len() - 4) / 4 {
+            return None;
+        }
+        let mut cursor = 4usize;
+        let mut parts = Vec::with_capacity(count);
+        for _ in 0..count {
+            let length_end = cursor.checked_add(4)?;
+            let length =
+                u32::from_le_bytes(input.get(cursor..length_end)?.try_into().ok()?) as usize;
+            let end = length_end.checked_add(length)?;
+            parts.push(input.get(length_end..end)?);
+            cursor = end;
+        }
+        (cursor == input.len()).then_some(parts)
+    }
+
+    fn integer(bytes: &[u8]) -> Option<i64> {
+        std::str::from_utf8(bytes).ok()?.parse().ok()
+    }
+
+    fn ordinal(bytes: &[u8]) -> Option<i64> {
+        let value = integer(bytes)?;
+        (value >= 0).then_some(value)
+    }
+
+    fn flag(bytes: &[u8]) -> Option<bool> {
+        match bytes {
+            b"0" => Some(false),
+            b"1" => Some(true),
+            _ => None,
+        }
+    }
+
+    fn join(parts: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (index, part) in parts.iter().enumerate() {
+            if index > 0 {
+                out.extend_from_slice(b", ");
+            }
+            out.extend_from_slice(part);
+        }
+        out
+    }
+
+    fn dedup_join(parts: &[&[u8]]) -> Vec<u8> {
+        let mut seen = HashSet::with_capacity(parts.len());
+        let unique: Vec<&[u8]> = parts
+            .iter()
+            .copied()
+            .filter(|part| seen.insert(*part))
+            .collect();
+        join(&unique)
+    }
+
+    fn score(bytes: &[u8]) -> Option<Vec<u8>> {
+        let score = f64::from_le_bytes(bytes.try_into().ok()?);
+        let scaled = score * 10.0;
+        // Leave room for rounding and conversion without saturating an integer.
+        if !scaled.is_finite() || scaled.abs() >= i64::MAX as f64 {
+            return None;
+        }
+        let rounded = scaled.round() as i64;
+        let magnitude = rounded.unsigned_abs();
+        let whole = (magnitude / 10).to_string();
+        let mut out = Vec::with_capacity(whole.len() + whole.len() / 3 + 4);
+        if rounded < 0 {
+            out.push(b'-');
+        }
+        for (index, byte) in whole.bytes().enumerate() {
+            if index > 0 && (whole.len() - index).is_multiple_of(3) {
+                out.push(b',');
+            }
+            out.push(byte);
+        }
+        out.extend_from_slice(&[b'.', b'0' + (magnitude % 10) as u8, b'%']);
+        Some(out)
+    }
+
+    fn transform(mode: u32, parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        let output = match mode {
+            1 => parts.iter().map(|part| part.to_vec()).collect(),
+            2 => {
+                let [entries, formatted_bytes, files, purged] = parts else {
+                    return None;
+                };
+                let entries = integer(entries)?;
+                let files = integer(files)?;
+                let purged = integer(purged)?;
+                let mut summary = format!("Indexed {entries} entries (").into_bytes();
+                summary.extend_from_slice(formatted_bytes);
+                summary.extend_from_slice(
+                    format!(") from {files} file(s); {purged} file(s) purged.").as_bytes(),
+                );
+                vec![summary]
+            }
+            3 => {
+                let [appid, name, raw_score] = parts else {
+                    return None;
+                };
+                let appid = integer(appid)?;
+                vec![
+                    appid.to_string().into_bytes(),
+                    name[..name.len().min(60)].to_vec(),
+                    score(raw_score)?,
+                    format!("https://store.steampowered.com/app/{appid}").into_bytes(),
+                ]
+            }
+            4 => {
+                let [count] = parts else {
+                    return None;
+                };
+                vec![format!("Found {} result(s):", integer(count)?).into_bytes()]
+            }
+            5 => vec![dedup_join(parts)],
+            6 => {
+                let (accept_query, methods) = parts.split_first()?;
+                vec![dedup_join(methods), accept_query.to_vec()]
+            }
+            7 => {
+                let mut rows = Vec::new();
+                let mut cursor = 0usize;
+                while cursor < parts.len() {
+                    let header_end = cursor.checked_add(3)?;
+                    let header = parts.get(cursor..header_end)?;
+                    let count = usize::try_from(ordinal(header[2])?).ok()?;
+                    let end = header_end.checked_add(count)?;
+                    let properties = parts.get(header_end..end)?;
+                    rows.extend([header[0].to_vec(), header[1].to_vec(), join(properties)]);
+                    cursor = end;
+                }
+                rows
+            }
+            8 | 11 => {
+                if !parts.len().is_multiple_of(3) {
+                    return None;
+                }
+                let mut missing = Vec::new();
+                for row in parts.chunks_exact(3) {
+                    let present = flag(row[1])?;
+                    let index = ordinal(row[2])?;
+                    if !present && (mode == 11 || row[0] != b"id") {
+                        missing.push(index.to_string().into_bytes());
+                    }
+                }
+                missing
+            }
+            9 => {
+                let [table, field, kind] = parts else {
+                    return None;
+                };
+                let sql_kind: &[u8] = match *kind {
+                    b"text" => b"text",
+                    b"int" => b"uint",
+                    b"bigint" => b"bigint",
+                    b"string" => b"string",
+                    _ => return Some(Vec::new()),
+                };
+                let mut sql = b"ALTER TABLE ".to_vec();
+                sql.extend_from_slice(table);
+                sql.extend_from_slice(b" ADD COLUMN ");
+                sql.extend_from_slice(field);
+                sql.push(b' ');
+                sql.extend_from_slice(sql_kind);
+                vec![sql]
+            }
+            10 => {
+                let [
+                    field,
+                    kind,
+                    has_analyzer,
+                    analyzer,
+                    not_indexed,
+                    multi_field,
+                ] = parts
+                else {
+                    return None;
+                };
+                let has_analyzer = flag(has_analyzer)?;
+                let not_indexed = flag(not_indexed)?;
+                let multi_field = flag(multi_field)?;
+                let mut details = Vec::new();
+                if has_analyzer {
+                    let mut detail = b"analyzer: ".to_vec();
+                    detail.extend_from_slice(analyzer);
+                    details.push(detail);
+                }
+                if not_indexed {
+                    details.push(b"not indexed".to_vec());
+                }
+                if multi_field {
+                    details.push(b"multi-field".to_vec());
+                }
+                let slices: Vec<&[u8]> = details.iter().map(Vec::as_slice).collect();
+                vec![field.to_vec(), kind.to_vec(), join(&slices)]
+            }
+            12 => {
+                let [imdbid, tmdbid, traktid] = parts else {
+                    return None;
+                };
+                vec![
+                    imdbid.to_vec(),
+                    integer(tmdbid)?.to_string().into_bytes(),
+                    integer(traktid)?.to_string().into_bytes(),
+                ]
+            }
+            _ => return None,
+        };
+        Some(output)
+    }
+
+    fn pack(parts: &[Vec<u8>]) -> Option<Vec<u8>> {
+        let count = u32::try_from(parts.len()).ok()?;
+        let size = parts.iter().try_fold(4usize, |size, part| {
+            u32::try_from(part.len()).ok()?;
+            size.checked_add(4)?.checked_add(part.len())
+        })?;
+        if size > isize::MAX as usize {
+            return None;
+        }
+        let mut out = Vec::with_capacity(size);
+        out.extend_from_slice(&count.to_le_bytes());
+        for part in parts {
+            out.extend_from_slice(&(part.len() as u32).to_le_bytes());
+            out.extend_from_slice(part);
+        }
+        Some(out)
+    }
+
+    /// Dispatch a count-prefixed packet of length-prefixed raw byte strings.
+    /// Returns bytes written, negative required capacity, or `isize::MIN` to
+    /// decline invalid input. Every failure leaves the output buffer untouched.
+    ///
+    /// # Safety
+    /// Non-null `input` and `out` must be readable/writable respectively for
+    /// their declared lengths. They may overlap. A null pointer requires zero
+    /// length/capacity. Raw pointers cannot be checked for actual allocation size.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_search_schema_log_steam(
+        mode: u32,
+        input: *const u8,
+        input_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        std::panic::catch_unwind(|| {
+            if input_len > MAX_INPUT
+                || input_len > isize::MAX as usize
+                || cap > isize::MAX as usize
+                || (input.is_null() && input_len > 0)
+                || (out.is_null() && cap > 0)
+            {
+                return DECLINE;
+            }
+            let input = if input_len == 0 {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(input, input_len) }
+            };
+            let Some(parts) = unpack(input) else {
+                return DECLINE;
+            };
+            let Some(parts) = transform(mode, &parts) else {
+                return DECLINE;
+            };
+            let Some(bytes) = pack(&parts) else {
+                return DECLINE;
+            };
+            let required = bytes.len();
+            if cap < required {
+                return -(required as isize);
+            }
+            // All validation, allocations and formatting have completed. The
+            // owned result also permits callers to reuse the input allocation.
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, required);
+            }
+            required as isize
+        })
+        .unwrap_or(DECLINE)
+    }
+}
