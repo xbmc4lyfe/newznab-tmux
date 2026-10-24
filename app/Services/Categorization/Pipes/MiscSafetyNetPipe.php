@@ -6,8 +6,10 @@ namespace App\Services\Categorization\Pipes;
 
 use App\Models\Category;
 use App\Services\Categorization\CategorizationResult;
+use App\Services\Categorization\CategorizationService;
 use App\Services\Categorization\ReleaseContext;
 use Closure;
+use FFI;
 
 /**
  * Final guardrail for low-signal names.
@@ -17,7 +19,19 @@ use Closure;
  */
 class MiscSafetyNetPipe extends AbstractCategorizationPipe
 {
+    public static bool $useRustFfi = false;
+
     protected int $priority = 100;
+
+    public static function setUseRustFfi(bool $useRustFfi): void
+    {
+        self::$useRustFfi = $useRustFfi;
+    }
+
+    public static function categorizeFfi(): ?FFI
+    {
+        return CategorizationService::categorizeFfi();
+    }
 
     public function getName(): string
     {
@@ -57,10 +71,40 @@ class MiscSafetyNetPipe extends AbstractCategorizationPipe
         return $this->noMatch();
     }
 
-    private function shouldDowngradeToMisc(CategorizationPassable $passable): bool
+    public function shouldDowngradeToMisc(CategorizationPassable $passable): bool
+    {
+        return self::$useRustFfi
+            ? $this->shouldDowngradeToMiscNative($passable)
+            : $this->shouldDowngradeToMiscPhp($passable);
+    }
+
+    public function shouldDowngradeToMiscPhp(CategorizationPassable $passable): bool
     {
         return ! $passable->lockedToMisc
             && ($passable->miscAnalysis['lowSignal'] ?? false) === true
             && str_starts_with($passable->bestResult->matchedBy, 'group_name_');
+    }
+
+    public function shouldDowngradeToMiscNative(CategorizationPassable $passable): bool
+    {
+        $ffi = self::categorizeFfi();
+        if ($ffi === null) {
+            return $this->shouldDowngradeToMiscPhp($passable);
+        }
+
+        $lowSignal = ($passable->miscAnalysis['lowSignal'] ?? false) === true;
+
+        // @phpstan-ignore method.notFound
+        $res = $ffi->nntmux_categorize_safety_net_should_downgrade(
+            $passable->lockedToMisc ? 1 : 0,
+            $lowSignal ? 1 : 0,
+            $passable->bestResult->matchedBy,
+            \strlen($passable->bestResult->matchedBy)
+        );
+        if (! \is_int($res) || $res < 0) {
+            return $this->shouldDowngradeToMiscPhp($passable);
+        }
+
+        return $res === 1;
     }
 }

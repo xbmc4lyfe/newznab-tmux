@@ -7,7 +7,10 @@ namespace App\Services\TvProcessing\Pipes;
 use App\Services\TvProcessing\ParsedTvRelease;
 use App\Services\TvProcessing\TvProcessingPassable;
 use App\Services\TvProcessing\TvProcessingResult;
+use App\Support\RustPipelineLibrary;
 use Closure;
+use FFI;
+use Throwable;
 
 /**
  * Base class for TV processing pipe handlers.
@@ -17,6 +20,37 @@ use Closure;
  */
 abstract class AbstractTvProviderPipe
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_tv_pipe_truncate_title(const char *title, size_t len, int64_t max_length);
+        C;
+
+    /** Null selects the benchmark-qualified production default (PHP; see RustTvShowAdderAndMetadataParityTest). */
+    private static ?bool $useRustFfi = null;
+
+    private static FFI|false|null $ffi = null;
+
+    public static function setUseRustFfi(?bool $use = true): void
+    {
+        self::$useRustFfi = $use;
+        if ($use === null) {
+            self::$ffi = null;
+        }
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? false;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('metadata', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
+
     protected int $priority = 50;
 
     protected bool $echoOutput = true;
@@ -61,6 +95,34 @@ abstract class AbstractTvProviderPipe
     }
 
     protected function truncateTitle(string $title, int $maxLength = 45): string
+    {
+        return self::usesRustFfi()
+            ? self::truncateTitleNative($title, $maxLength)
+            : self::truncateTitlePhp($title, $maxLength);
+    }
+
+    public static function truncateTitleNative(string $title, int $maxLength = 45): string
+    {
+        if (($ffi = self::ffi()) === null) {
+            return self::truncateTitlePhp($title, $maxLength);
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $prefix = $ffi->nntmux_tv_pipe_truncate_title($title, \strlen($title), $maxLength);
+        } catch (Throwable) {
+            return self::truncateTitlePhp($title, $maxLength);
+        }
+        if ($prefix === -2) {
+            return $title;
+        }
+        if (! \is_int($prefix) || $prefix < 0 || $prefix > \strlen($title)) {
+            return self::truncateTitlePhp($title, $maxLength);
+        }
+
+        return substr($title, 0, $prefix).'...';
+    }
+
+    public static function truncateTitlePhp(string $title, int $maxLength = 45): string
     {
         if (mb_strlen($title) <= $maxLength) {
             return $title;

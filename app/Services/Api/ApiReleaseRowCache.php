@@ -6,8 +6,11 @@ namespace App\Services\Api;
 
 use App\Exceptions\SearchUnavailableException;
 use App\Facades\Search;
+use App\Services\ReleaseImageService;
 use App\Services\Search\Support\SearchFailureTracker;
+use App\Support\RustPipelineLibrary;
 use Countable;
+use FFI;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 
@@ -16,6 +19,10 @@ class ApiReleaseRowCache
     private const CACHE_MISS = '__nntmux_api_release_row_cache_miss__';
 
     private const NULL_SENTINEL = ['__nntmux_api_release_row_cache_null' => true];
+
+    public static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
 
     /**
      * Cache release rows only. User-specific response fields should be built after this returns.
@@ -161,15 +168,27 @@ class ApiReleaseRowCache
         Cache::put($cacheKey.':stale', $cached, $staleTtl);
     }
 
-    /** @param array<string, mixed> $parameters
+    /**
+     * @param  array<string, mixed>  $parameters
      * @return array<string, mixed>
      */
-    private function normalize(array $parameters): array
+    public function normalize(array $parameters): array
+    {
+        return self::$useRustFfi
+            ? $this->normalizeNative($parameters)
+            : $this->normalizePhp($parameters);
+    }
+
+    /**
+     * @param  array<string, mixed>  $parameters
+     * @return array<string, mixed>
+     */
+    public function normalizePhp(array $parameters): array
     {
         ksort($parameters);
         foreach ($parameters as &$value) {
             if (is_array($value)) {
-                $value = array_is_list($value) ? array_values(array_unique($value, SORT_REGULAR)) : $this->normalize($value);
+                $value = array_is_list($value) ? array_values(array_unique($value, SORT_REGULAR)) : $this->normalizePhp($value);
                 if (array_is_list($value)) {
                     sort($value);
                 }
@@ -179,6 +198,85 @@ class ApiReleaseRowCache
         }
 
         return $parameters;
+    }
+
+    /**
+     * @param  array<string, mixed>  $parameters
+     * @return array<string, mixed>
+     */
+    public function normalizeNative(array $parameters): array
+    {
+        if ($parameters === []) {
+            return [];
+        }
+
+        $encoded = json_encode($parameters, JSON_PRESERVE_ZERO_FRACTION | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        if (! \is_string($encoded)) {
+            return $this->normalizePhp($parameters);
+        }
+
+        $normalizedJson = $this->normalizeJsonNative($encoded);
+        if ($normalizedJson === null) {
+            return $this->normalizePhp($parameters);
+        }
+
+        $decoded = json_decode($normalizedJson, true);
+
+        return \is_array($decoded) ? $decoded : $this->normalizePhp($parameters);
+    }
+
+    public function normalizeJsonNative(string $json): ?string
+    {
+        if ($json === '') {
+            return null;
+        }
+
+        $ffi = self::mediaFfi();
+        if ($ffi === null) {
+            return null;
+        }
+
+        $len = \strlen($json);
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(256, $len * 2 + 32), $cap);
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_api_release_cache_normalize_json($json, $len, $scratch, $cap);
+        if (! \is_int($written) || $written === -1) {
+            return null;
+        }
+        if ($written < -1) {
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_api_release_cache_normalize_json($json, $len, $scratch, $cap);
+            if (! \is_int($written) || $written <= 0) {
+                return null;
+            }
+        }
+
+        return $written <= 0 ? null : FFI::string($scratch, $written);
+    }
+
+    public static function setUseRustFfi(bool $useRustFfi): void
+    {
+        self::$useRustFfi = $useRustFfi;
+    }
+
+    public static function mediaFfi(): ?FFI
+    {
+        if (self::$ffi !== null) {
+            return self::$ffi === false ? null : self::$ffi;
+        }
+
+        self::$ffi = RustPipelineLibrary::resolveDomain('media', ReleaseImageService::FFI_CDEF) ?? false;
+
+        return self::$ffi === false ? null : self::$ffi;
     }
 
     private function logCacheEvent(string $event, string $apiVersion, string $scope): void

@@ -4,6 +4,10 @@ declare(strict_types=1);
 
 namespace App\Services;
 
+use App\Support\RustPipelineLibrary;
+use FFI;
+use Throwable;
+
 /**
  * Cleans names for collections/imports/namefixer.
  *
@@ -12,6 +16,50 @@ namespace App\Services;
  */
 class CollectionsCleaningService
 {
+    public const string FFI_CDEF = <<<'C'
+        int32_t nntmux_collections_is_music_group(const char *group, size_t group_len);
+        ssize_t nntmux_collections_extract_music_subject(const char *input, size_t input_len, char *out, size_t out_cap);
+        ssize_t nntmux_collections_clean_generic_pre_normalize(const char *input, size_t len, char *out, size_t cap);
+        ssize_t nntmux_collections_music_subject(const char *input, size_t len, const char *group, size_t group_len, char *out, size_t cap);
+        ssize_t nntmux_collections_enhance_short_subject(const char *input, size_t len, const char *clean, size_t clean_len, char *out, size_t cap);
+        C;
+
+    private static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
+
+    private static ?FFI\CData $scratch = null;
+
+    private static int $scratchCap = 0;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi && self::ffi() !== null;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
+
+    private static function scratch(FFI $ffi, int $minBytes): ?FFI\CData
+    {
+        if (self::$scratch === null || self::$scratchCap < $minBytes) {
+            self::$scratch = RustPipelineLibrary::obtainScratch($ffi, $minBytes, self::$scratchCap);
+        }
+
+        return self::$scratch;
+    }
+
     /**
      * Used for matching endings in article subjects.
      */
@@ -162,6 +210,15 @@ class CollectionsCleaningService
      */
     protected function cleanGenericSubject(): array
     {
+        return (self::$useRustFfi ? $this->cleanGenericSubjectNative() : null)
+            ?? $this->cleanGenericSubjectPhp();
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public function cleanGenericSubjectPhp(): array
+    {
         // Remove common patterns:
         // - File/part count indicators
         // - File extensions
@@ -187,11 +244,57 @@ class CollectionsCleaningService
     }
 
     /**
+     * @return array<string, mixed>|null
+     */
+    public function cleanGenericSubjectNative(): ?array
+    {
+        if (! $this->canUsePcreFastPath()) {
+            return $this->cleanGenericSubjectPhp();
+        }
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $len = \strlen($this->subject);
+        $scratch = self::scratch($ffi, max(256, $len * 2 + 32));
+        if ($scratch === null) {
+            return null;
+        }
+        $cap = self::$scratchCap;
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_collections_clean_generic_pre_normalize($this->subject, $len, $scratch, $cap);
+            if (! \is_int($written) || $written < 0 || $written > $cap) {
+                return $this->cleanGenericSubjectPhp();
+            }
+            $preNormalized = $written === 0 ? '' : FFI::string($scratch, $written);
+
+            return [
+                'id' => self::REGEX_GENERIC_MATCH,
+                'name' => static::class === self::class
+                    ? $this->memoizeNormalizedEncoding($preNormalized)
+                    : $this->normalizeString($preNormalized),
+            ];
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
      * Clean music group subjects with generic patterns.
      *
      * @return array<string, mixed> Returns ['id' => match_type, 'name' => cleaned_name]
      */
     protected function cleanMusicSubject(): array
+    {
+        return (self::$useRustFfi ? $this->cleanMusicSubjectNative() : null)
+            ?? $this->cleanMusicSubjectPhp();
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    public function cleanMusicSubjectPhp(): array
     {
         // Generic music cleaning patterns
         $cleanSubject = preg_replace([
@@ -221,12 +324,60 @@ class CollectionsCleaningService
     }
 
     /**
+     * @return array<string, mixed>|null
+     */
+    public function cleanMusicSubjectNative(): ?array
+    {
+        if (! $this->canUsePcreFastPath()) {
+            return $this->cleanMusicSubjectPhp();
+        }
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $len = \strlen($this->subject);
+        $scratch = self::scratch($ffi, max(256, $len * 2 + 32));
+        if ($scratch === null) {
+            return null;
+        }
+        $cap = self::$scratchCap;
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_collections_music_subject($this->subject, $len, '.music', 6, $scratch, $cap);
+            if (! \is_int($written) || $written < 0 || $written > $cap) {
+                return $this->cleanMusicSubjectPhp();
+            }
+            $preNormalized = $written === 0 ? '' : FFI::string($scratch, $written);
+            $cleanSubject = static::class === self::class
+                ? $this->memoizeNormalizedEncoding($preNormalized)
+                : $this->normalizeString($preNormalized);
+            if (\strlen($cleanSubject) <= 10 || preg_match('/^[\-a-z0-9$ ]{1,7}yEnc$/i', $cleanSubject)) {
+                $cleanSubject = $this->enhanceShortSubjectNative($cleanSubject)
+                    ?? $this->enhanceShortSubjectPhp($cleanSubject);
+            }
+
+            return [
+                'id' => self::REGEX_MUSIC_MATCH,
+                'name' => $cleanSubject,
+            ];
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
      * Enhance short or generic subjects by extracting additional information.
      *
      * @param  string  $cleanSubject  The cleaned subject that is too short
      * @return string Enhanced subject string
      */
     protected function enhanceShortSubject(string $cleanSubject): string
+    {
+        return (self::$useRustFfi ? $this->enhanceShortSubjectNative($cleanSubject) : null)
+            ?? $this->enhanceShortSubjectPhp($cleanSubject);
+    }
+
+    public function enhanceShortSubjectPhp(string $cleanSubject): string
     {
         $x = '';
         if (preg_match('/.*("[A-Z0-9]+).*?"/i', $this->subject, $hit)) {
@@ -249,6 +400,35 @@ class CollectionsCleaningService
         return $cleanSubject.$newName.$x;
     }
 
+    public function enhanceShortSubjectNative(string $cleanSubject): ?string
+    {
+        if (! $this->canUsePcreFastPath()) {
+            return $this->enhanceShortSubjectPhp($cleanSubject);
+        }
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $len = \strlen($this->subject);
+        $cleanLen = \strlen($cleanSubject);
+        $scratch = self::scratch($ffi, max(256, $len * 2 + $cleanLen + 32));
+        if ($scratch === null) {
+            return null;
+        }
+        $cap = self::$scratchCap;
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_collections_enhance_short_subject($this->subject, $len, $cleanSubject, $cleanLen, $scratch, $cap);
+            if (! \is_int($written) || $written < 0 || $written > $cap) {
+                return $this->enhanceShortSubjectPhp($cleanSubject);
+            }
+
+            return $written === 0 ? '' : FFI::string($scratch, $written);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
     /**
      * Process music-specific subject patterns.
      *
@@ -259,12 +439,52 @@ class CollectionsCleaningService
      */
     protected function musicSubject(): bool|string
     {
+        if (self::$useRustFfi) {
+            $native = $this->musicSubjectNative();
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
+        return $this->musicSubjectPhp();
+    }
+
+    public function musicSubjectPhp(): bool|string
+    {
         // Pattern: Broderick_Smith-Unknown_Country-2009-404 "00-broderick_smith-unknown_country-2009.sfv" yEnc
         if (preg_match('/^(\w{10,}-[a-zA-Z0-9]+ ")\d\d-.+?" yEnc$/', $this->subject, $hit)) {
             return $hit[1];
         }
 
         return false;
+    }
+
+    public function musicSubjectNative(): bool|string|null
+    {
+        if (! $this->canUsePcreFastPath()) {
+            return $this->musicSubjectPhp();
+        }
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $len = \strlen($this->subject);
+        $scratch = self::scratch($ffi, max(256, $len + 32));
+        if ($scratch === null) {
+            return null;
+        }
+        $cap = self::$scratchCap;
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_collections_extract_music_subject($this->subject, $len, $scratch, $cap);
+            if (! \is_int($written) || $written < 0 || $written > $cap) {
+                return null;
+            }
+
+            return $written === 0 ? false : FFI::string($scratch, $written);
+        } catch (Throwable) {
+            return null;
+        }
     }
 
     /**
@@ -278,6 +498,11 @@ class CollectionsCleaningService
         // Collapse multiple spaces into one
         $normalized = trim(preg_replace('/\s\s+/', ' ', $subject));
 
+        return $this->memoizeNormalizedEncoding($normalized);
+    }
+
+    private function memoizeNormalizedEncoding(string $normalized): string
+    {
         // Ensure UTF-8 encoding. Collection hashes depend on this output, so it must be
         // detection over every encoding: mbstring's choice depends on the whole candidate
         // set, so even a reduced list that decodes each byte the same can pick another
@@ -304,6 +529,39 @@ class CollectionsCleaningService
      */
     protected function isMusicGroup(): bool
     {
+        return (self::$useRustFfi ? $this->isMusicGroupNative() : null)
+            ?? $this->isMusicGroupPhp();
+    }
+
+    public function isMusicGroupPhp(): bool
+    {
         return preg_match('/\.(flac|lossless|mp3|music|sounds)/', $this->groupName) === 1;
+    }
+
+    public function isMusicGroupNative(): ?bool
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $status = $ffi->nntmux_collections_is_music_group($this->groupName, \strlen($this->groupName));
+            if (! \is_int($status) || $status < 0) {
+                return null;
+            }
+
+            return $status === 1;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private function canUsePcreFastPath(): bool
+    {
+        return $this->e0 === self::REGEX_FILE_EXTENSIONS
+            && ini_get('pcre.backtrack_limit') === '1000000'
+            && ini_get('pcre.recursion_limit') === '100000'
+            && \in_array(setlocale(LC_CTYPE, '0'), ['C', 'POSIX', 'C.UTF-8'], true);
     }
 }

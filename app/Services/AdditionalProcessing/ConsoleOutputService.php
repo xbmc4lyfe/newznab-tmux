@@ -4,15 +4,109 @@ declare(strict_types=1);
 
 namespace App\Services\AdditionalProcessing;
 
+use App\Support\RustPipelineLibrary;
+use FFI;
+use Throwable;
+
 /**
  * Service for CLI output during additional processing.
  * Centralizes all echo/output functionality.
  */
 class ConsoleOutputService
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_console_status_format(uint32_t kind, int64_t a, int64_t b, const char *text, size_t text_len, char *out, size_t cap);
+        C;
+
+    public const int STATUS_RELEASE_START = 0;
+
+    public const int STATUS_COMPRESSED_FAILURE = 1;
+
+    public const int STATUS_PAR2_MAPPED = 2;
+
+    public const int STATUS_MEDIA_SOURCE = 3;
+
+    public const int STATUS_RELEASE_TIMEOUT = 4;
+
+    public const int STATUS_RELEASE_TIMEOUT_DELETED = 5;
+
+    public const int STATUS_RELEASE_DELETED = 6;
+
+    // PHP remains the production default: FFI marshaling stays below the 1.5x gate.
+    private static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
+
     public function __construct(
         private readonly bool $echoCLI = false
     ) {}
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('additional', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
+
+    /**
+     * Status label for one of the STATUS_* kinds. `$a` is the release id or count, `$b` the
+     * size, elapsed seconds or timeout count, and `$text` the media source kind.
+     */
+    public static function formatStatus(int $kind, int $a = 0, int $b = 0, string $text = ''): string
+    {
+        return (self::$useRustFfi ? self::formatStatusNative($kind, $a, $b, $text) : null) ?? self::formatStatusPhp($kind, $a, $b, $text);
+    }
+
+    public static function formatStatusPhp(int $kind, int $a = 0, int $b = 0, string $text = ''): string
+    {
+        return match ($kind) {
+            self::STATUS_RELEASE_START => PHP_EOL.'['.$a.']['.human_filesize($b, 1).']',
+            self::STATUS_COMPRESSED_FAILURE => 'fC'.$a,
+            self::STATUS_PAR2_MAPPED => '(p2n:'.$a.')',
+            self::STATUS_MEDIA_SOURCE => '(src:'.$text.')',
+            self::STATUS_RELEASE_TIMEOUT => ' Release '.$a.' timed out after '.$b.'s',
+            self::STATUS_RELEASE_TIMEOUT_DELETED => ' Release '.$a.' deleted after '.$b.' timeout(s)',
+            self::STATUS_RELEASE_DELETED => 'Deleted broken release ID '.$a,
+            default => throw new \InvalidArgumentException("Unknown console status kind [{$kind}]."),
+        };
+    }
+
+    public static function formatStatusNative(int $kind, int $a = 0, int $b = 0, string $text = ''): ?string
+    {
+        // The Rust labels hard-code the Unix line ending.
+        if (PHP_EOL !== "\n") {
+            return null;
+        }
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            $cap = 0;
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, 96 + \strlen($text), $cap);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_console_status_format($kind, $a, $b, $text, \strlen($text), $scratch, $cap);
+
+            return $written > 0 ? FFI::string($scratch, $written) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
 
     public function echo(string $message, string $type = 'primary'): void
     {
@@ -53,7 +147,7 @@ class ConsoleOutputService
 
     public function echoReleaseStart(int $releaseId, int $size): void
     {
-        $this->echo(PHP_EOL.'['.$releaseId.']['.human_filesize($size, 1).']', 'primaryOver');
+        $this->echo(self::formatStatus(self::STATUS_RELEASE_START, $releaseId, $size), 'primaryOver');
     }
 
     public function setProcessTitle(int $releaseId): void
@@ -70,7 +164,7 @@ class ConsoleOutputService
 
     public function echoCompressedFailure(int $failCount): void
     {
-        $this->echo('fC'.$failCount, 'warningOver');
+        $this->echo(self::formatStatus(self::STATUS_COMPRESSED_FAILURE, $failCount), 'warningOver');
     }
 
     public function echoGroupUnavailable(): void
@@ -170,24 +264,24 @@ class ConsoleOutputService
 
     public function echoPar2Mapped(int $files): void
     {
-        $this->echo('(p2n:'.$files.')', 'primaryOver');
+        $this->echo(self::formatStatus(self::STATUS_PAR2_MAPPED, $files), 'primaryOver');
     }
 
     public function echoMediaSource(string $kind): void
     {
-        $this->echo('(src:'.$kind.')', 'primaryOver');
+        $this->echo(self::formatStatus(self::STATUS_MEDIA_SOURCE, text: $kind), 'primaryOver');
     }
 
     public function echoReleaseTimeout(int $releaseId, int $elapsedSeconds): void
     {
         $this->echo('T', 'warningOver');
-        $this->echo(' Release '.$releaseId.' timed out after '.$elapsedSeconds.'s', 'warning');
+        $this->echo(self::formatStatus(self::STATUS_RELEASE_TIMEOUT, $releaseId, $elapsedSeconds), 'warning');
     }
 
     public function echoReleaseTimeoutDeleted(int $releaseId, int $timeoutCount): void
     {
         $this->echo('T', 'warningOver');
-        $this->echo(' Release '.$releaseId.' deleted after '.$timeoutCount.' timeout(s)', 'warning');
+        $this->echo(self::formatStatus(self::STATUS_RELEASE_TIMEOUT_DELETED, $releaseId, $timeoutCount), 'warning');
     }
 
     public function warning(string $message): void
@@ -197,7 +291,7 @@ class ConsoleOutputService
 
     public function echoReleaseDeleted(int $releaseId): void
     {
-        $this->echo('Deleted broken release ID '.$releaseId, 'warningOver');
+        $this->echo(self::formatStatus(self::STATUS_RELEASE_DELETED, $releaseId), 'warningOver');
     }
 
     public function endOutput(): void

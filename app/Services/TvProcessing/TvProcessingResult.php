@@ -4,11 +4,46 @@ declare(strict_types=1);
 
 namespace App\Services\TvProcessing;
 
+use App\Support\RustPipelineLibrary;
+use FFI;
+use Throwable;
+
 /**
  * Result returned by a pipe, and the final outcome of a release passing through the pipeline.
  */
 class TvProcessingResult
 {
+    public const string FFI_CDEF = <<<'C'
+        int32_t nntmux_tv_result_is_matched(const char *status, size_t len);
+        C;
+
+    /** Null selects the benchmark-qualified production default (PHP; see RustTvPipelineAndIgdbDataNodeParityTest). */
+    private static ?bool $useRustFfi = null;
+
+    private static FFI|false|null $ffi = null;
+
+    public static function setUseRustFfi(?bool $use = true): void
+    {
+        self::$useRustFfi = $use;
+        if ($use === null) {
+            self::$ffi = null;
+        }
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? false;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('metadata', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
+
     public const STATUS_MATCHED = 'matched';
 
     public const STATUS_SEASON_PACK = 'season_pack';
@@ -98,6 +133,47 @@ class TvProcessingResult
 
     public function isMatched(): bool
     {
-        return $this->status === self::STATUS_MATCHED;
+        return self::usesRustFfi() ? $this->isMatchedNative() : $this->isMatchedPhp();
+    }
+
+    public function isMatchedNative(): bool
+    {
+        return self::isMatchedStatusNative($this->status);
+    }
+
+    public function isMatchedPhp(): bool
+    {
+        return self::isMatchedStatusPhp($this->status);
+    }
+
+    public static function isMatchedStatus(string $status): bool
+    {
+        return self::usesRustFfi()
+            ? self::isMatchedStatusNative($status)
+            : self::isMatchedStatusPhp($status);
+    }
+
+    public static function isMatchedStatusNative(string $status): bool
+    {
+        if (($ffi = self::ffi()) === null) {
+            return self::isMatchedStatusPhp($status);
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $res = $ffi->nntmux_tv_result_is_matched($status, \strlen($status));
+        } catch (Throwable) {
+            return self::isMatchedStatusPhp($status);
+        }
+
+        return match ($res) {
+            1 => true,
+            0 => false,
+            default => self::isMatchedStatusPhp($status),
+        };
+    }
+
+    public static function isMatchedStatusPhp(string $status): bool
+    {
+        return $status === self::STATUS_MATCHED;
     }
 }

@@ -4,13 +4,52 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Verification;
 
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\DB;
 use RuntimeException;
+use Throwable;
 
 /** Stable locks outlive database leases and manifest generations. */
 final class VerificationWorkerLocks
 {
+    public const string FFI_CDEF = <<<'C'
+        intptr_t nntmux_verification_forwarder_lock_name(const char *host, size_t host_len, int64_t number, char *out, size_t cap);
+        int64_t nntmux_verification_slots(int64_t configured);
+        int64_t nntmux_verification_first_slot(int64_t slots, int64_t offset);
+        int64_t nntmux_verification_last_slot(int64_t first_slot, int64_t slots);
+        int nntmux_verification_protects(int exclusive, int global_present, int candidate_present, int held);
+        C;
+
+    private static bool $useRustFfi = false;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi && RustPipelineLibrary::resolveDomain('nfo', self::FFI_CDEF) !== null;
+    }
+
+    private static function nativeInteger(string $function, int ...$arguments): ?int
+    {
+        try {
+            $ffi = RustPipelineLibrary::resolveDomain('nfo', self::FFI_CDEF);
+            if ($ffi !== null) {
+                $result = $ffi->{$function}(...$arguments);
+
+                return is_int($result) ? $result : null;
+            }
+        } catch (Throwable) {
+            // The explicit native candidate retains the PHP result when the ABI is unavailable.
+        }
+
+        return null;
+    }
+
     /** Ceiling on scheduled candidate worker slots per host, whatever the configured count. */
     public const int MAX_SLOTS = 64;
 
@@ -79,6 +118,34 @@ final class VerificationWorkerLocks
 
     private static function forwarderLockName(int $number): string
     {
+        return self::$useRustFfi ? self::forwarderLockNameNative($number) : self::forwarderLockNamePhp($number);
+    }
+
+    public static function forwarderLockNameNative(int $number): string
+    {
+        $host = ScratchInventory::host();
+        try {
+            $ffi = RustPipelineLibrary::resolveDomain('nfo', self::FFI_CDEF);
+            if ($ffi !== null) {
+                $capacity = 0;
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, 128, $capacity);
+                if ($scratch !== null) {
+                    // @phpstan-ignore method.notFound
+                    $written = $ffi->nntmux_verification_forwarder_lock_name($host, strlen($host), $number, $scratch, $capacity);
+                    if (is_int($written) && $written >= 0 && $written <= $capacity) {
+                        return $written === 0 ? '' : FFI::string($scratch, $written);
+                    }
+                }
+            }
+        } catch (Throwable) {
+            // Compute the same host name below without repeating the host lookup.
+        }
+
+        return 'publication-forwarder-'.substr(sha1($host), 0, 12).'-'.$number;
+    }
+
+    public static function forwarderLockNamePhp(int $number): string
+    {
         return 'publication-forwarder-'.substr(sha1(ScratchInventory::host()), 0, 12).'-'.$number;
     }
 
@@ -137,18 +204,58 @@ final class VerificationWorkerLocks
     /** Configured candidate worker slots on this host, from 1 to MAX_SLOTS. */
     public static function slots(): int
     {
+        return self::$useRustFfi ? self::slotsNative() : self::slotsPhp();
+    }
+
+    public static function slotsNative(): int
+    {
+        $configured = (int) config('release_verification.candidate_workers', 2);
+
+        return self::nativeInteger('nntmux_verification_slots', $configured)
+            ?? max(1, min(self::MAX_SLOTS, $configured));
+    }
+
+    public static function slotsPhp(): int
+    {
         return max(1, min(self::MAX_SLOTS, (int) config('release_verification.candidate_workers', 2)));
     }
 
     /** This host's first slot number; hosts sharing a database configure disjoint ranges. */
     public static function firstSlot(): int
     {
-        return max(0, min(self::MAX_SLOT_NUMBER - self::slots(), (int) config('release_verification.slot_offset', 0))) + 1;
+        return self::$useRustFfi ? self::firstSlotNative() : self::firstSlotPhp();
+    }
+
+    public static function firstSlotNative(): int
+    {
+        $slots = self::slotsNative();
+        $offset = (int) config('release_verification.slot_offset', 0);
+
+        return self::nativeInteger('nntmux_verification_first_slot', $slots, $offset)
+            ?? max(0, min(self::MAX_SLOT_NUMBER - $slots, $offset)) + 1;
+    }
+
+    public static function firstSlotPhp(): int
+    {
+        return max(0, min(self::MAX_SLOT_NUMBER - self::slotsPhp(), (int) config('release_verification.slot_offset', 0))) + 1;
     }
 
     public static function lastSlot(): int
     {
-        return self::firstSlot() + self::slots() - 1;
+        return self::$useRustFfi ? self::lastSlotNative() : self::lastSlotPhp();
+    }
+
+    public static function lastSlotNative(): int
+    {
+        $first = self::firstSlotNative();
+        $slots = self::slotsNative();
+
+        return self::nativeInteger('nntmux_verification_last_slot', $first, $slots) ?? $first + $slots - 1;
+    }
+
+    public static function lastSlotPhp(): int
+    {
+        return self::firstSlotPhp() + self::slotsPhp() - 1;
     }
 
     public function startPreparation(): bool
@@ -269,7 +376,7 @@ final class VerificationWorkerLocks
                 $table->string('reason', 64);
                 $table->timestamp('created_at')->useCurrent();
             });
-        } catch (\Throwable $error) {
+        } catch (Throwable $error) {
             // Another process may have created it first.
             if (! self::pauseTableCreated()) {
                 throw $error;
@@ -347,6 +454,21 @@ final class VerificationWorkerLocks
 
     /** A database lock is lost with its session, so protection is proved at each use. */
     public function protects(int $id): bool
+    {
+        return self::$useRustFfi ? $this->protectsNative($id) : $this->protectsPhp($id);
+    }
+
+    public function protectsNative(int $id): bool
+    {
+        $lock = $this->exclusive ? $this->global : ($this->candidates[$id] ?? null);
+        $held = $lock !== null && $this->store()->holds($lock);
+        $result = self::nativeInteger('nntmux_verification_protects', (int) $this->exclusive,
+            (int) ($this->global !== null), (int) isset($this->candidates[$id]), (int) $held);
+
+        return $result !== null ? $result !== 0 : $held;
+    }
+
+    public function protectsPhp(int $id): bool
     {
         if ($this->exclusive) {
             return $this->global !== null && $this->store()->holds($this->global);

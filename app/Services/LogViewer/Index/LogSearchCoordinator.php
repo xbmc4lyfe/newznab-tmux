@@ -8,6 +8,8 @@ use App\Models\LogIndexFile;
 use App\Services\LogViewer\LogFile;
 use App\Services\LogViewer\LogSearcher;
 use App\Services\LogViewer\SearchQuery;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Facades\Log;
 use Throwable;
 
@@ -76,13 +78,57 @@ class LogSearchCoordinator
             }
         }
 
-        $engines = array_values(array_unique(array_column($ordered, 'engine')));
-
         return [
-            'engine' => count($engines) === 1 ? (string) $engines[0] : 'mixed',
+            'engine' => self::combinedEngine(array_column($ordered, 'engine')),
             'elapsed_ms' => (int) ((hrtime(true) - $startedAt) / 1_000_000),
             'results' => $ordered,
         ];
+    }
+
+    /**
+     * The single engine that produced every result, otherwise `mixed`. Rust is opt-in.
+     *
+     * @param  list<mixed>  $engines
+     */
+    public static function combinedEngine(array $engines, bool $useRustFfi = false): string
+    {
+        return ($useRustFfi ? self::combinedEngineNative($engines) : null) ?? self::combinedEnginePhp($engines);
+    }
+
+    /** @param  list<mixed>  $engines */
+    public static function combinedEnginePhp(array $engines): string
+    {
+        $engines = array_values(array_unique($engines));
+
+        return count($engines) === 1 ? (string) $engines[0] : 'mixed';
+    }
+
+    /** @param  list<mixed>  $engines */
+    public static function combinedEngineNative(array $engines): ?string
+    {
+        foreach ($engines as $engine) {
+            if (! is_string($engine) || str_contains($engine, "\0")) {
+                return null;
+            }
+        }
+        static $ffi;
+        $ffi ??= RustPipelineLibrary::resolveDomain('search', 'ssize_t nntmux_log_search_combined_engine(const char *engines, size_t len, size_t count, char *out, size_t cap);') ?? false;
+        if ($ffi === false) {
+            return null;
+        }
+        try {
+            $joined = implode("\0", $engines);
+            $cap = 0;
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, strlen($joined) + 8, $cap);
+            if ($scratch === null) {
+                return null;
+            }
+            $written = $ffi->nntmux_log_search_combined_engine($joined, strlen($joined), count($engines), $scratch, $cap);
+
+            return is_int($written) && $written >= 0 && $written <= $cap ? FFI::string($scratch, $written) : null;
+        } catch (Throwable) {
+            return null;
+        }
     }
 
     /**

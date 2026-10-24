@@ -4,6 +4,10 @@ declare(strict_types=1);
 
 namespace App\Services\TvProcessing;
 
+use App\Support\RustPipelineLibrary;
+use FFI;
+use Throwable;
+
 /**
  * State carried through the TV processing pipeline for one release.
  *
@@ -11,6 +15,39 @@ namespace App\Services\TvProcessing;
  */
 class TvProcessingPassable
 {
+    public const string FFI_CDEF = <<<'C'
+        int32_t nntmux_tv_passable_is_resolved(uint32_t parse_failed, int64_t episode_id, uint32_t season_pack);
+        int32_t nntmux_tv_passable_resolve_final_status(uint32_t parse_failed, uint32_t has_parsed, int64_t video_id, int64_t episode_id, uint32_t season_pack, uint32_t has_transient);
+        ssize_t nntmux_tv_passable_dedup_transient_providers_nul(const char *input, size_t input_len, size_t count, char *out, size_t cap);
+        C;
+
+    /** Null selects the benchmark-qualified production default (PHP; see RustTvPipelineAndIgdbDataNodeParityTest). */
+    private static ?bool $useRustFfi = null;
+
+    private static FFI|false|null $ffi = null;
+
+    public static function setUseRustFfi(?bool $use = true): void
+    {
+        self::$useRustFfi = $use;
+        if ($use === null) {
+            self::$ffi = null;
+        }
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? false;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('metadata', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
+
     public ?ParsedTvRelease $parsed = null;
 
     public bool $parseFailed = false;
@@ -91,6 +128,34 @@ class TvProcessingPassable
     /** True once nothing further down the pipeline can improve the outcome. */
     public function isResolved(): bool
     {
+        return self::usesRustFfi() ? $this->isResolvedNative() : $this->isResolvedPhp();
+    }
+
+    public function isResolvedNative(): bool
+    {
+        if (($ffi = self::ffi()) === null) {
+            return $this->isResolvedPhp();
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $res = $ffi->nntmux_tv_passable_is_resolved(
+                $this->parseFailed ? 1 : 0,
+                $this->episodeId,
+                $this->seasonPack ? 1 : 0,
+            );
+        } catch (Throwable) {
+            return $this->isResolvedPhp();
+        }
+
+        return match ($res) {
+            1 => true,
+            0 => false,
+            default => $this->isResolvedPhp(),
+        };
+    }
+
+    public function isResolvedPhp(): bool
+    {
         return $this->parseFailed || $this->episodeId > 0 || $this->seasonPack;
     }
 
@@ -110,6 +175,41 @@ class TvProcessingPassable
 
     /** The outcome to persist for this release. */
     public function finalResult(): TvProcessingResult
+    {
+        return self::usesRustFfi() ? $this->finalResultNative() : $this->finalResultPhp();
+    }
+
+    public function finalResultNative(): TvProcessingResult
+    {
+        $outcome = self::resolveFinalOutcomeNative(
+            $this->parseFailed,
+            $this->parsed !== null,
+            $this->videoId,
+            $this->episodeId,
+            $this->seasonPack,
+            $this->transientProviders !== [],
+        );
+
+        return match ($outcome) {
+            0 => TvProcessingResult::parseFailed(['search_name' => $this->context->searchName]),
+            1 => TvProcessingResult::matched($this->videoId, $this->episodeId, (string) $this->matchedBy),
+            2 => TvProcessingResult::seasonPack($this->videoId, (string) $this->matchedBy),
+            3 => TvProcessingResult::episodeMissing(
+                $this->videoId,
+                $this->showProvider,
+                ['transient_providers' => $this->transientProviders],
+                $this->transientProviders !== [],
+                $this->maxRetryAfter,
+            ),
+            4 => TvProcessingResult::transient(
+                self::deduplicateTransientProvidersNative($this->transientProviders),
+                $this->maxRetryAfter,
+            ),
+            default => TvProcessingResult::notFound(),
+        };
+    }
+
+    public function finalResultPhp(): TvProcessingResult
     {
         if ($this->parseFailed || $this->parsed === null) {
             return TvProcessingResult::parseFailed(['search_name' => $this->context->searchName]);
@@ -137,12 +237,148 @@ class TvProcessingPassable
 
         if ($transient) {
             return TvProcessingResult::transient(
-                implode(',', array_unique($this->transientProviders)),
+                self::deduplicateTransientProvidersPhp($this->transientProviders),
                 $this->maxRetryAfter,
             );
         }
 
         return TvProcessingResult::notFound();
+    }
+
+    public static function resolveFinalOutcome(
+        bool $parseFailed,
+        bool $hasParsed,
+        int $videoId,
+        int $episodeId,
+        bool $seasonPack,
+        bool $hasTransient,
+    ): int {
+        return self::usesRustFfi()
+            ? self::resolveFinalOutcomeNative($parseFailed, $hasParsed, $videoId, $episodeId, $seasonPack, $hasTransient)
+            : self::resolveFinalOutcomePhp($parseFailed, $hasParsed, $videoId, $episodeId, $seasonPack, $hasTransient);
+    }
+
+    public static function resolveFinalOutcomeNative(
+        bool $parseFailed,
+        bool $hasParsed,
+        int $videoId,
+        int $episodeId,
+        bool $seasonPack,
+        bool $hasTransient,
+    ): int {
+        if (($ffi = self::ffi()) === null) {
+            return self::resolveFinalOutcomePhp($parseFailed, $hasParsed, $videoId, $episodeId, $seasonPack, $hasTransient);
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $code = $ffi->nntmux_tv_passable_resolve_final_status(
+                $parseFailed ? 1 : 0,
+                $hasParsed ? 1 : 0,
+                $videoId,
+                $episodeId,
+                $seasonPack ? 1 : 0,
+                $hasTransient ? 1 : 0,
+            );
+        } catch (Throwable) {
+            return self::resolveFinalOutcomePhp($parseFailed, $hasParsed, $videoId, $episodeId, $seasonPack, $hasTransient);
+        }
+
+        return \is_int($code) && $code >= 0 && $code <= 5
+            ? $code
+            : self::resolveFinalOutcomePhp($parseFailed, $hasParsed, $videoId, $episodeId, $seasonPack, $hasTransient);
+    }
+
+    public static function resolveFinalOutcomePhp(
+        bool $parseFailed,
+        bool $hasParsed,
+        int $videoId,
+        int $episodeId,
+        bool $seasonPack,
+        bool $hasTransient,
+    ): int {
+        if ($parseFailed || ! $hasParsed) {
+            return 0;
+        }
+        if ($episodeId > 0) {
+            return 1;
+        }
+        if ($seasonPack && $videoId > 0) {
+            return 2;
+        }
+        if ($videoId > 0) {
+            return 3;
+        }
+        if ($hasTransient) {
+            return 4;
+        }
+
+        return 5;
+    }
+
+    /**
+     * @param  list<string>  $providers
+     */
+    public static function deduplicateTransientProviders(array $providers): string
+    {
+        return self::usesRustFfi()
+            ? self::deduplicateTransientProvidersNative($providers)
+            : self::deduplicateTransientProvidersPhp($providers);
+    }
+
+    /**
+     * @param  list<string>  $providers
+     */
+    public static function deduplicateTransientProvidersNative(array $providers): string
+    {
+        $count = \count($providers);
+        if ($count === 0) {
+            return '';
+        }
+        if (($ffi = self::ffi()) === null) {
+            return self::deduplicateTransientProvidersPhp($providers);
+        }
+        foreach ($providers as $provider) {
+            if (! \is_string($provider) || str_contains($provider, "\0")) {
+                return self::deduplicateTransientProvidersPhp($providers);
+            }
+        }
+        $joined = implode("\0", $providers);
+        $len = \strlen($joined);
+        $capacity = 0;
+        $buffer = RustPipelineLibrary::obtainScratch($ffi, max(64, $len + 16), $capacity);
+        if ($buffer === null) {
+            return self::deduplicateTransientProvidersPhp($providers);
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_tv_passable_dedup_transient_providers_nul($joined, $len, $count, $buffer, $capacity);
+            if (\is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return self::deduplicateTransientProvidersPhp($providers);
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_tv_passable_dedup_transient_providers_nul($joined, $len, $count, $buffer, $capacity);
+            }
+            if ($written === 0) {
+                return '';
+            }
+            if (! \is_int($written) || $written < 0 || $written > $capacity) {
+                return self::deduplicateTransientProvidersPhp($providers);
+            }
+
+            return FFI::string($buffer, $written);
+        } catch (Throwable) {
+            return self::deduplicateTransientProvidersPhp($providers);
+        }
+    }
+
+    /**
+     * @param  list<string>  $providers
+     */
+    public static function deduplicateTransientProvidersPhp(array $providers): string
+    {
+        return implode(',', array_unique($providers));
     }
 
     /**

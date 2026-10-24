@@ -8,6 +8,7 @@ use App\Enums\TmuxMode;
 use App\Enums\TmuxPaneRole;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Services\Configuration\ProcessingRuntimeStateRepository;
+use App\Services\Runners\BaseRunner;
 use App\Services\Tmux\TmuxCommand;
 use App\Services\Tmux\TmuxPaneManager;
 use App\Services\Tmux\TmuxSessionManager;
@@ -17,6 +18,18 @@ use RuntimeException;
 
 class TmuxStop extends Command
 {
+    private static ?bool $useRustFfi = null;
+
+    public static function setUseRustFfi(?bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? false;
+    }
+
     /**
      * The name and signature of the console command.
      *
@@ -134,19 +147,40 @@ class TmuxStop extends Command
     private function confirmSessionAbsent(string $sessionName): void
     {
         $result = Process::timeout(10)->run(TmuxCommand::arguments(['list-sessions', '-F', '#{session_name}']));
-        if ($result->successful()) {
-            if (in_array($sessionName, explode("\n", trim($result->output())), true)) {
-                throw new RuntimeException('The tmux session still exists; keeping the stop request.');
-            }
-
-            return;
+        $successful = $result->successful();
+        $output = $successful ? $result->output() : '';
+        $error = $successful ? '' : $result->errorOutput();
+        $exitCode = $successful ? null : $result->exitCode();
+        $status = (self::usesRustFfi() ? self::sessionAbsenceNative($sessionName, $successful, $output, $error, $exitCode) : null)
+            ?? self::sessionAbsencePhp($sessionName, $successful, $output, $error, $exitCode);
+        if ($status === 1) {
+            throw new RuntimeException('The tmux session still exists; keeping the stop request.');
         }
-        $error = trim($result->errorOutput());
-        if ($result->exitCode() === 1 && (str_starts_with($error, 'no server running on ')
+        if ($status === 2) {
+            throw new RuntimeException('Unable to confirm the tmux session is absent; keeping the stop request.');
+        }
+    }
+
+    /** 0 means absent, 1 means still present, 2 means the check failed. */
+    public static function sessionAbsenceNative(string $sessionName, bool $successful, string $output, string $error, ?int $exitCode): ?int
+    {
+        $result = BaseRunner::runnerTransformNative(11, [$sessionName, $successful ? '1' : '0', $output, $error, $exitCode === null ? '' : (string) $exitCode]);
+
+        return in_array($result, ['0', '1', '2'], true) ? (int) $result : null;
+    }
+
+    /** 0 means absent, 1 means still present, 2 means the check failed. */
+    public static function sessionAbsencePhp(string $sessionName, bool $successful, string $output, string $error, ?int $exitCode): int
+    {
+        if ($successful) {
+            return in_array($sessionName, explode("\n", trim($output)), true) ? 1 : 0;
+        }
+        $error = trim($error);
+        if ($exitCode === 1 && (str_starts_with($error, 'no server running on ')
             || (str_starts_with($error, 'error connecting to ') && str_ends_with($error, '(No such file or directory)')))) {
-            return;
+            return 0;
         }
 
-        throw new RuntimeException('Unable to confirm the tmux session is absent; keeping the stop request.');
+        return 2;
     }
 }

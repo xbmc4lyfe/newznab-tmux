@@ -5,6 +5,9 @@ declare(strict_types=1);
 namespace App\Services\Search\Support;
 
 use App\Enums\SecondarySearchIndex;
+use App\Support\RustPipelineLibrary;
+use FFI;
+use Throwable;
 
 final class ManticoreIndexRegistry
 {
@@ -111,7 +114,42 @@ final class ManticoreIndexRegistry
     }
 
     /** @param array<string, string> $configuredIndexes */
-    public static function logicalName(string $table, array $configuredIndexes = []): ?string
+    public static function logicalName(string $table, array $configuredIndexes = [], bool $useRustFfi = false): ?string
+    {
+        // Null is a valid result as well as the unavailable-native sentinel.
+        return ($useRustFfi ? self::logicalNameNative($table, $configuredIndexes) : null)
+            ?? self::logicalNamePhp($table, $configuredIndexes);
+    }
+
+    /** @param array<string, string> $configuredIndexes */
+    public static function logicalNameNative(string $table, array $configuredIndexes = []): ?string
+    {
+        foreach ($configuredIndexes as $logical => $configuredTable) {
+            if ($configuredTable === $table) {
+                return (string) $logical;
+            }
+        }
+        static $ffi;
+        $ffi ??= RustPipelineLibrary::resolveDomain('search', 'ssize_t nntmux_manticore_registry_logical_name(const char *input, size_t len, char *out, size_t cap);') ?? false;
+        if ($ffi === false) {
+            return null;
+        }
+        try {
+            $cap = 0;
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, 32, $cap);
+            if ($scratch === null) {
+                return null;
+            }
+            $written = $ffi->nntmux_manticore_registry_logical_name($table, strlen($table), $scratch, $cap);
+
+            return is_int($written) && $written > 0 && $written <= $cap ? FFI::string($scratch, $written) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** @param array<string, string> $configuredIndexes */
+    public static function logicalNamePhp(string $table, array $configuredIndexes = []): ?string
     {
         foreach ($configuredIndexes as $logical => $configuredTable) {
             if ($configuredTable === $table) {
