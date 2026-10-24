@@ -26177,3 +26177,730 @@ pub mod monitoring_probe_composer {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Wave 25 Slice 25.4: RolePromotionStat, UserRoleHistory, Payment, Genre,
+// and SystemMetric model pure-CPU helpers
+// ---------------------------------------------------------------------------
+
+pub mod role_payment_genre_metric_model {
+    use std::collections::HashSet;
+    use std::mem::size_of;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    const DECLINE: isize = -1;
+    const MAX_INPUT: usize = (isize::MAX as usize) / 8;
+    const SECONDS_PER_HOUR: i64 = 3600;
+    const SECONDS_PER_DAY: i64 = 86_400;
+
+    #[inline]
+    unsafe fn valid_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null()
+            || !ptr.is_aligned()
+            || len > MAX_INPUT
+            || len > isize::MAX as usize
+            || (ptr as usize).checked_add(len).is_none()
+        {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn valid_out_buf(out_buf: *mut u8, out_cap: usize) -> bool {
+        !out_buf.is_null()
+            && out_buf.is_aligned()
+            && out_cap <= isize::MAX as usize
+            && (out_buf as usize).checked_add(out_cap).is_some()
+    }
+
+    #[inline]
+    fn valid_mut_ptr<T>(ptr: *mut T) -> bool {
+        !ptr.is_null()
+            && ptr.is_aligned()
+            && (ptr as usize).checked_add(size_of::<T>()).is_some()
+    }
+
+    #[inline]
+    fn valid_mut_slice<T>(ptr: *mut T, len: usize) -> bool {
+        if ptr.is_null() || !ptr.is_aligned() {
+            return false;
+        }
+        let Some(byte_len) = len.checked_mul(size_of::<T>()) else {
+            return false;
+        };
+        byte_len <= isize::MAX as usize && (ptr as usize).checked_add(byte_len).is_some()
+    }
+
+    #[inline]
+    fn valid_const_slice<T>(ptr: *const T, len: usize) -> bool {
+        if ptr.is_null() || !ptr.is_aligned() {
+            return false;
+        }
+        let Some(byte_len) = len.checked_mul(size_of::<T>()) else {
+            return false;
+        };
+        byte_len <= isize::MAX as usize && (ptr as usize).checked_add(byte_len).is_some()
+    }
+
+    #[inline]
+    unsafe fn write_bytes(out_buf: *mut u8, out_cap: usize, bytes: &[u8]) -> isize {
+        if !valid_out_buf(out_buf, out_cap) {
+            return DECLINE;
+        }
+        let needed = bytes.len();
+        if needed > isize::MAX as usize {
+            return DECLINE;
+        }
+        if needed > out_cap {
+            let neg = -(needed as isize);
+            return if neg == -1 { -2 } else { neg };
+        }
+        if needed > 0 {
+            let dst = unsafe { slice::from_raw_parts_mut(out_buf, needed) };
+            dst.copy_from_slice(bytes);
+        }
+        needed as isize
+    }
+
+    #[inline]
+    fn format_i64_dec(v: i64, buf: &mut [u8; 24]) -> &[u8] {
+        let mut n = v.unsigned_abs();
+        let mut i = buf.len();
+        loop {
+            i -= 1;
+            buf[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        if v < 0 {
+            i -= 1;
+            buf[i] = b'-';
+        }
+        &buf[i..]
+    }
+
+    #[inline]
+    fn is_php_trim_byte(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B)
+    }
+
+    #[inline]
+    fn php_trim_bytes(bytes: &[u8]) -> &[u8] {
+        let mut start = 0usize;
+        let mut end = bytes.len();
+        while start < end && is_php_trim_byte(bytes[start]) {
+            start += 1;
+        }
+        while end > start && is_php_trim_byte(bytes[end - 1]) {
+            end -= 1;
+        }
+        &bytes[start..end]
+    }
+
+    // -------------------------------------------------------------------------
+    // 1. RolePromotionStat helpers
+    // -------------------------------------------------------------------------
+
+    /// Aggregates `count` promotion stat rows (`user_ids`, `role_ids`, `days_added`) into
+    /// `out_summary[0..4]` = `[total_upgrades, total_days_added, unique_users, roles_affected]`.
+    /// Returns `1` on success, or `-1` on invalid/unaligned pointers or arithmetic overflow.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_role_promotion_stat_summarize(
+        count: usize,
+        user_ids_ptr: *const i64,
+        role_ids_ptr: *const i64,
+        days_added_ptr: *const i64,
+        out_summary: *mut i64,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if count > MAX_INPUT
+                || !valid_const_slice(user_ids_ptr, count)
+                || !valid_const_slice(role_ids_ptr, count)
+                || !valid_const_slice(days_added_ptr, count)
+                || !valid_mut_slice(out_summary, 4)
+            {
+                return -1;
+            }
+
+            if count == 0 {
+                let out = unsafe { slice::from_raw_parts_mut(out_summary, 4) };
+                out.copy_from_slice(&[0, 0, 0, 0]);
+                return 1;
+            }
+
+            let users = unsafe { slice::from_raw_parts(user_ids_ptr, count) };
+            let roles = unsafe { slice::from_raw_parts(role_ids_ptr, count) };
+            let days = unsafe { slice::from_raw_parts(days_added_ptr, count) };
+
+            let mut total_days: i64 = 0;
+            let mut unique_users: HashSet<i64> = HashSet::with_capacity(count);
+            let mut unique_roles: HashSet<i64> = HashSet::with_capacity(count);
+
+            for i in 0..count {
+                let Some(next_days) = total_days.checked_add(days[i]) else {
+                    return -1;
+                };
+                total_days = next_days;
+                unique_users.insert(users[i]);
+                unique_roles.insert(roles[i]);
+            }
+
+            let out = unsafe { slice::from_raw_parts_mut(out_summary, 4) };
+            out[0] = count as i64;
+            out[1] = total_days;
+            out[2] = unique_users.len() as i64;
+            out[3] = unique_roles.len() as i64;
+            1
+        }))
+        .unwrap_or(-1)
+    }
+
+    // -------------------------------------------------------------------------
+    // 2. UserRoleHistory helpers
+    // -------------------------------------------------------------------------
+
+    /// Validates and packs scalar/string fields for `UserRoleHistory::buildRoleChangeAttributes`.
+    /// Writes `[user_id, has_old_role_id, old_role_id, new_role_id, is_stacked, has_changed_by, changed_by, has_reason]`
+    /// into `out_scalars[0..8]` and copies `reason` bytes into `out_buf` when `has_reason == 1`.
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_user_role_history_pack_scalar_fields(
+        user_id: i64,
+        has_old_role_id: i32,
+        old_role_id: i64,
+        new_role_id: i64,
+        is_stacked: i32,
+        has_changed_by: i32,
+        changed_by: i64,
+        has_reason: i32,
+        reason_ptr: *const u8,
+        reason_len: usize,
+        out_scalars: *mut i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !(0..=1).contains(&has_old_role_id)
+                || !(0..=1).contains(&is_stacked)
+                || !(0..=1).contains(&has_changed_by)
+                || !(0..=1).contains(&has_reason)
+                || !valid_mut_slice(out_scalars, 8)
+                || !valid_out_buf(out_buf, out_cap)
+            {
+                return DECLINE;
+            }
+            let Some(reason_bytes) = (unsafe { valid_slice(reason_ptr, reason_len) }) else {
+                return DECLINE;
+            };
+
+            let payload = if has_reason == 1 {
+                reason_bytes
+            } else {
+                &[][..]
+            };
+            let written = unsafe { write_bytes(out_buf, out_cap, payload) };
+            if written >= 0 {
+                let scalars = unsafe { slice::from_raw_parts_mut(out_scalars, 8) };
+                scalars[0] = user_id;
+                scalars[1] = i64::from(has_old_role_id);
+                scalars[2] = if has_old_role_id == 1 { old_role_id } else { 0 };
+                scalars[3] = new_role_id;
+                scalars[4] = i64::from(is_stacked);
+                scalars[5] = i64::from(has_changed_by);
+                scalars[6] = if has_changed_by == 1 { changed_by } else { 0 };
+                scalars[7] = i64::from(has_reason);
+            }
+            written
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    // -------------------------------------------------------------------------
+    // 3. Payment helpers
+    // -------------------------------------------------------------------------
+
+    /// Normalizes `Payment::scopeFilter` filter parameters.
+    /// Writes `[has_username, username_like_len, has_email, email_like_len, has_payment_status, payment_status_len, invoice_mode, invoice_status_len, has_start_date, has_end_date]`
+    /// into `out_meta[0..10]` and the 4 formatted string slices into `out_buf`.
+    /// `invoice_mode`: `0` = none, `1` = pending_or_null (`invoice_status == "Pending"`), `2` = exact.
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_payment_normalize_filter_spec(
+        has_username: u32,
+        username_ptr: *const u8,
+        username_len: usize,
+        has_email: u32,
+        email_ptr: *const u8,
+        email_len: usize,
+        has_payment_status: u32,
+        payment_status_ptr: *const u8,
+        payment_status_len: usize,
+        has_invoice_status: u32,
+        invoice_status_ptr: *const u8,
+        invoice_status_len: usize,
+        has_start_date: u32,
+        has_end_date: u32,
+        out_meta: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if has_username > 1
+                || has_email > 1
+                || has_payment_status > 1
+                || has_invoice_status > 1
+                || has_start_date > 1
+                || has_end_date > 1
+                || !valid_mut_slice(out_meta, 10)
+                || !valid_out_buf(out_buf, out_cap)
+            {
+                return DECLINE;
+            }
+            let Some(u_bytes) = (unsafe { valid_slice(username_ptr, username_len) }) else {
+                return DECLINE;
+            };
+            let Some(e_bytes) = (unsafe { valid_slice(email_ptr, email_len) }) else {
+                return DECLINE;
+            };
+            let Some(p_bytes) = (unsafe { valid_slice(payment_status_ptr, payment_status_len) })
+            else {
+                return DECLINE;
+            };
+            let Some(i_bytes) = (unsafe { valid_slice(invoice_status_ptr, invoice_status_len) })
+            else {
+                return DECLINE;
+            };
+
+            let u_active = has_username == 1 && !u_bytes.is_empty() && u_bytes != b"0";
+            let e_active = has_email == 1 && !e_bytes.is_empty() && e_bytes != b"0";
+            let p_active = has_payment_status == 1 && !p_bytes.is_empty() && p_bytes != b"0";
+            let i_active = has_invoice_status == 1 && !i_bytes.is_empty() && i_bytes != b"0";
+
+            let u_len = if u_active { u_bytes.len() + 2 } else { 0 };
+            let e_len = if e_active { e_bytes.len() + 2 } else { 0 };
+            let p_len = if p_active { p_bytes.len() } else { 0 };
+            let i_len = if i_active { i_bytes.len() } else { 0 };
+
+            let invoice_mode = if !i_active {
+                0usize
+            } else if i_bytes == b"Pending" {
+                1usize
+            } else {
+                2usize
+            };
+
+            let Some(needed) = u_len
+                .checked_add(e_len)
+                .and_then(|n| n.checked_add(p_len))
+                .and_then(|n| n.checked_add(i_len))
+            else {
+                return DECLINE;
+            };
+            if needed > isize::MAX as usize {
+                return DECLINE;
+            }
+            if needed > out_cap {
+                let neg = -(needed as isize);
+                return if neg == -1 { -2 } else { neg };
+            }
+
+            if needed > 0 {
+                let dst = unsafe { slice::from_raw_parts_mut(out_buf, needed) };
+                let mut pos = 0usize;
+                if u_active {
+                    dst[pos] = b'%';
+                    dst[pos + 1..pos + 1 + u_bytes.len()].copy_from_slice(u_bytes);
+                    dst[pos + 1 + u_bytes.len()] = b'%';
+                    pos += u_len;
+                }
+                if e_active {
+                    dst[pos] = b'%';
+                    dst[pos + 1..pos + 1 + e_bytes.len()].copy_from_slice(e_bytes);
+                    dst[pos + 1 + e_bytes.len()] = b'%';
+                    pos += e_len;
+                }
+                if p_active {
+                    dst[pos..pos + p_len].copy_from_slice(p_bytes);
+                    pos += p_len;
+                }
+                if i_active {
+                    dst[pos..pos + i_len].copy_from_slice(i_bytes);
+                }
+            }
+
+            let meta = unsafe { slice::from_raw_parts_mut(out_meta, 10) };
+            meta[0] = usize::from(u_active);
+            meta[1] = u_len;
+            meta[2] = usize::from(e_active);
+            meta[3] = e_len;
+            meta[4] = usize::from(p_active);
+            meta[5] = p_len;
+            meta[6] = invoice_mode;
+            meta[7] = i_len;
+            meta[8] = usize::from(has_start_date == 1);
+            meta[9] = usize::from(has_end_date == 1);
+            needed as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    // -------------------------------------------------------------------------
+    // 4. Genre helpers
+    // -------------------------------------------------------------------------
+
+    /// Evaluates PHP `! empty(string $type)` (`$type !== '' && $type !== '0'`).
+    /// Returns `1` when non-empty, `0` when empty, or `-1` on invalid pointer/length.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_genre_has_type_filter(
+        type_ptr: *const u8,
+        type_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(type_bytes) = (unsafe { valid_slice(type_ptr, type_len) }) else {
+                return -1;
+            };
+            i32::from(!type_bytes.is_empty() && type_bytes != b"0")
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Formats the 3-branch `UNION` query for `Genre::getActiveGenres(string $type)`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_genre_build_active_sql(
+        has_type: u32,
+        type_int: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if has_type > 1 || !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+
+            const P1: &[u8] = b"SELECT g.*\n            FROM genres g\n            INNER JOIN (SELECT DISTINCT genres_id FROM musicinfo) x ON x.genres_id = g.id WHERE 1=1 ";
+            const P2: &[u8] = b"\n            UNION\n            SELECT g.*\n            FROM genres g\n            INNER JOIN (SELECT DISTINCT genres_id FROM consoleinfo) x ON x.genres_id = g.id WHERE 1=1 ";
+            const P3: &[u8] = b"\n            UNION\n            SELECT g.*\n            FROM genres g\n            INNER JOIN (SELECT DISTINCT genres_id FROM gamesinfo) x ON x.genres_id = g.id WHERE 1=1 ";
+            const P4: &[u8] = b"\n            ORDER BY title";
+            const TYPE_PREFIX: &[u8] = b" AND g.type = ";
+
+            let mut dec_buf = [0u8; 24];
+            let mut clause = Vec::with_capacity(32);
+            if has_type == 1 {
+                clause.extend_from_slice(TYPE_PREFIX);
+                clause.extend_from_slice(format_i64_dec(type_int, &mut dec_buf));
+            }
+
+            let needed = P1.len() + P2.len() + P3.len() + P4.len() + clause.len() * 3;
+            if needed > out_cap {
+                let neg = -(needed as isize);
+                return if neg == -1 { -2 } else { neg };
+            }
+
+            let dst = unsafe { slice::from_raw_parts_mut(out_buf, needed) };
+            let mut pos = 0usize;
+            for prefix in [P1, P2, P3] {
+                dst[pos..pos + prefix.len()].copy_from_slice(prefix);
+                pos += prefix.len();
+                if !clause.is_empty() {
+                    dst[pos..pos + clause.len()].copy_from_slice(&clause);
+                    pos += clause.len();
+                }
+            }
+            dst[pos..pos + P4.len()].copy_from_slice(P4);
+            needed as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    // -------------------------------------------------------------------------
+    // 5. SystemMetric helpers
+    // -------------------------------------------------------------------------
+
+    /// Computes `now_ts - (hours * 3600)` with checked `i64` arithmetic for `SystemMetric::scopeForPeriod`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_system_metric_period_cutoff_ts(
+        now_ts: i64,
+        hours: i64,
+        out_ts: *mut i64,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_mut_ptr(out_ts) {
+                return -1;
+            }
+            let Some(delta) = hours.checked_mul(SECONDS_PER_HOUR) else {
+                return -1;
+            };
+            let Some(cutoff) = now_ts.checked_sub(delta) else {
+                return -1;
+            };
+            unsafe {
+                *out_ts = cutoff;
+            }
+            1
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Computes `now_ts - (days * 86400)` with checked `i64` arithmetic for `SystemMetric::cleanupOldMetrics`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_system_metric_cleanup_cutoff_ts(
+        now_ts: i64,
+        days: i64,
+        out_ts: *mut i64,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_mut_ptr(out_ts) {
+                return -1;
+            }
+            let Some(delta) = days.checked_mul(SECONDS_PER_DAY) else {
+                return -1;
+            };
+            let Some(cutoff) = now_ts.checked_sub(delta) else {
+                return -1;
+            };
+            unsafe {
+                *out_ts = cutoff;
+            }
+            1
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Trims PHP whitespace and ASCII-lowercases `metric_type` into `out_buf`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_system_metric_normalize_type(
+        type_ptr: *const u8,
+        type_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(raw) = (unsafe { valid_slice(type_ptr, type_len) }) else {
+                return DECLINE;
+            };
+            let trimmed = php_trim_bytes(raw);
+            let needed = trimmed.len();
+            if needed > isize::MAX as usize {
+                return DECLINE;
+            }
+            if needed > out_cap {
+                let neg = -(needed as isize);
+                return if neg == -1 { -2 } else { neg };
+            }
+            if needed > 0 {
+                let dst = unsafe { slice::from_raw_parts_mut(out_buf, needed) };
+                for (d, &b) in dst.iter_mut().zip(trimmed.iter()) {
+                    *d = b.to_ascii_lowercase();
+                }
+            }
+            needed as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn role_stat_history_and_payment_helpers() {
+            let users = [10i64, 20, 10, 30];
+            let roles = [2i64, 3, 2, 2];
+            let days = [7i64, 14, 30, 5];
+            let mut summary = [0i64; 4];
+            assert_eq!(
+                unsafe {
+                    nntmux_role_promotion_stat_summarize(
+                        4,
+                        users.as_ptr(),
+                        roles.as_ptr(),
+                        days.as_ptr(),
+                        summary.as_mut_ptr(),
+                    )
+                },
+                1
+            );
+            assert_eq!(summary, [4, 56, 3, 2]);
+
+            let mut scalars = [0i64; 8];
+            let mut buf = [0u8; 256];
+            let nr = unsafe {
+                nntmux_user_role_history_pack_scalar_fields(
+                    42,
+                    1,
+                    2,
+                    3,
+                    1,
+                    1,
+                    99,
+                    1,
+                    b"promotion upgrade".as_ptr(),
+                    17,
+                    scalars.as_mut_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(nr, 17);
+            assert_eq!(scalars, [42, 1, 2, 3, 1, 1, 99, 1]);
+            assert_eq!(&buf[..17], b"promotion upgrade");
+
+            let mut meta = [0usize; 10];
+            let np = unsafe {
+                nntmux_payment_normalize_filter_spec(
+                    1,
+                    b"alice".as_ptr(),
+                    5,
+                    1,
+                    b"a@b.c".as_ptr(),
+                    5,
+                    1,
+                    b"Settled".as_ptr(),
+                    7,
+                    1,
+                    b"Pending".as_ptr(),
+                    7,
+                    1,
+                    0,
+                    meta.as_mut_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(np, 28);
+            assert_eq!(meta, [1, 7, 1, 7, 1, 7, 1, 7, 1, 0]);
+            assert_eq!(&buf[..28], b"%alice%%a@b.c%SettledPending");
+        }
+
+        #[test]
+        fn genre_system_metric_and_abi_safety() {
+            assert_eq!(
+                unsafe { nntmux_genre_has_type_filter(b"3000".as_ptr(), 4) },
+                1
+            );
+            assert_eq!(unsafe { nntmux_genre_has_type_filter(b"".as_ptr(), 0) }, 0);
+            assert_eq!(unsafe { nntmux_genre_has_type_filter(b"0".as_ptr(), 1) }, 0);
+
+            let mut buf = [0u8; 1024];
+            let nsql =
+                unsafe { nntmux_genre_build_active_sql(1, 3000, buf.as_mut_ptr(), buf.len()) };
+            assert!(nsql > 0);
+            let sql_str = std::str::from_utf8(&buf[..nsql as usize]).unwrap();
+            assert_eq!(sql_str.matches(" AND g.type = 3000").count(), 3);
+
+            let mut cutoff = 0i64;
+            assert_eq!(
+                unsafe { nntmux_system_metric_period_cutoff_ts(100_000, 2, &mut cutoff) },
+                1
+            );
+            assert_eq!(cutoff, 100_000 - 7_200);
+
+            assert_eq!(
+                unsafe { nntmux_system_metric_cleanup_cutoff_ts(1_000_000, 10, &mut cutoff) },
+                1
+            );
+            assert_eq!(cutoff, 1_000_000 - 864_000);
+
+            let nm = unsafe {
+                nntmux_system_metric_normalize_type(
+                    b"  CPU \n".as_ptr(),
+                    7,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(&buf[..nm as usize], b"cpu");
+
+            let mut raw = [0u8; 64];
+            let unaligned_i64 = unsafe { raw.as_mut_ptr().add(1).cast::<i64>() };
+            let unaligned_usize = unsafe { raw.as_mut_ptr().add(1).cast::<usize>() };
+            let mut small = [b'Z'; 4];
+
+            assert_eq!(
+                unsafe {
+                    nntmux_role_promotion_stat_summarize(
+                        1,
+                        [1i64].as_ptr(),
+                        [1i64].as_ptr(),
+                        [1i64].as_ptr(),
+                        unaligned_i64,
+                    )
+                },
+                -1
+            );
+            assert_eq!(
+                unsafe { nntmux_system_metric_period_cutoff_ts(100, 1, unaligned_i64) },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_genre_build_active_sql(0, 0, small.as_mut_ptr(), small.len())
+                } < -1,
+                true
+            );
+            assert_eq!(small, [b'Z'; 4]);
+
+            let mut meta = [0usize; 10];
+            assert_eq!(
+                unsafe {
+                    nntmux_payment_normalize_filter_spec(
+                        1,
+                        b"alice".as_ptr(),
+                        5,
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        0,
+                        0,
+                        unaligned_usize,
+                        small.as_mut_ptr(),
+                        small.len(),
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_payment_normalize_filter_spec(
+                        1,
+                        b"alice".as_ptr(),
+                        5,
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        0,
+                        0,
+                        meta.as_mut_ptr(),
+                        small.as_mut_ptr(),
+                        small.len(),
+                    )
+                },
+                -7
+            );
+            assert_eq!(small, [b'Z'; 4]);
+        }
+    }
+}
+
+
