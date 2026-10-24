@@ -2,6 +2,17 @@ use std::slice;
 
 use crate::OutCursor;
 
+/// Validate range arithmetic before dereferencing any C pointer. Empty null
+/// byte ranges remain valid for legacy empty-input and output-query ABIs;
+/// typed pointers always require a live, aligned address. Allocation ownership
+/// itself remains the caller's safety obligation.
+fn nfo_abi_range<T>(ptr: *const T, bytes: usize, allow_empty_null: bool) -> bool {
+    if ptr.is_null() {
+        return allow_empty_null && bytes == 0;
+    }
+    ptr.is_aligned() && bytes <= isize::MAX as usize && (ptr as usize).checked_add(bytes).is_some()
+}
+
 unsafe extern "C" {
     fn memchr(s: *const u8, c: i32, n: usize) -> *const u8;
 }
@@ -799,12 +810,26 @@ pub unsafe extern "C" fn nntmux_cp437_to_utf8(
     out_ptr: *mut u8,
     out_capacity: usize,
 ) -> isize {
-    if input_ptr.is_null() {
-        return -1;
-    }
-    let src = unsafe { slice::from_raw_parts(input_ptr, input_len) };
-    let mut out = unsafe { OutCursor::new(out_ptr, out_capacity) };
-    cp437_to_utf8_or_passthrough(src, &mut out)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(input_ptr, input_len, true)
+            || !nfo_abi_range(out_ptr, out_capacity, true)
+            || yenc_ranges_overlap(
+                input_ptr as usize,
+                input_len,
+                out_ptr as usize,
+                out_capacity,
+            )
+        {
+            return -1;
+        }
+        if input_ptr.is_null() {
+            return -1;
+        }
+        let src = unsafe { slice::from_raw_parts(input_ptr, input_len) };
+        let mut out = unsafe { OutCursor::new(out_ptr, out_capacity) };
+        cp437_to_utf8_or_passthrough(src, &mut out)
+    }))
+    .unwrap_or(-1)
 }
 
 #[unsafe(no_mangle)]
@@ -814,12 +839,26 @@ pub unsafe extern "C" fn nntmux_normalize_nfo_encoding(
     out_ptr: *mut u8,
     out_capacity: usize,
 ) -> isize {
-    if input_ptr.is_null() {
-        return -1;
-    }
-    let src = unsafe { slice::from_raw_parts(input_ptr, input_len) };
-    let mut out = unsafe { OutCursor::new(out_ptr, out_capacity) };
-    normalize_nfo_encoding_into(src, &mut out)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(input_ptr, input_len, true)
+            || !nfo_abi_range(out_ptr, out_capacity, true)
+            || yenc_ranges_overlap(
+                input_ptr as usize,
+                input_len,
+                out_ptr as usize,
+                out_capacity,
+            )
+        {
+            return -1;
+        }
+        if input_ptr.is_null() {
+            return -1;
+        }
+        let src = unsafe { slice::from_raw_parts(input_ptr, input_len) };
+        let mut out = unsafe { OutCursor::new(out_ptr, out_capacity) };
+        normalize_nfo_encoding_into(src, &mut out)
+    }))
+    .unwrap_or(-1)
 }
 
 #[unsafe(no_mangle)]
@@ -829,16 +868,30 @@ pub unsafe extern "C" fn nntmux_nfo_clean_content(
     out_ptr: *mut u8,
     out_capacity: usize,
 ) -> isize {
-    if input_ptr.is_null() {
-        return -1;
-    }
-    if input_len == 0 {
-        return 0;
-    }
-    let src = unsafe { slice::from_raw_parts(input_ptr, input_len) };
-    let mut out = unsafe { OutCursor::new(out_ptr, out_capacity) };
-    clean_nfo_content_into(src, &mut out);
-    finish_cursor(out)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(input_ptr, input_len, true)
+            || !nfo_abi_range(out_ptr, out_capacity, true)
+            || yenc_ranges_overlap(
+                input_ptr as usize,
+                input_len,
+                out_ptr as usize,
+                out_capacity,
+            )
+        {
+            return -1;
+        }
+        if input_ptr.is_null() {
+            return -1;
+        }
+        if input_len == 0 {
+            return 0;
+        }
+        let src = unsafe { slice::from_raw_parts(input_ptr, input_len) };
+        let mut out = unsafe { OutCursor::new(out_ptr, out_capacity) };
+        clean_nfo_content_into(src, &mut out);
+        finish_cursor(out)
+    }))
+    .unwrap_or(-1)
 }
 
 #[unsafe(no_mangle)]
@@ -848,16 +901,30 @@ pub unsafe extern "C" fn nntmux_nfo_identity_text(
     out_ptr: *mut u8,
     out_capacity: usize,
 ) -> isize {
-    if input_ptr.is_null() {
-        return -1;
-    }
-    if input_len == 0 {
-        return 0;
-    }
-    let src = unsafe { slice::from_raw_parts(input_ptr, input_len) };
-    let mut out = unsafe { OutCursor::new(out_ptr, out_capacity) };
-    nfo_identity_text_into(src, &mut out);
-    finish_cursor(out)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(input_ptr, input_len, true)
+            || !nfo_abi_range(out_ptr, out_capacity, true)
+            || yenc_ranges_overlap(
+                input_ptr as usize,
+                input_len,
+                out_ptr as usize,
+                out_capacity,
+            )
+        {
+            return -1;
+        }
+        if input_ptr.is_null() {
+            return -1;
+        }
+        if input_len == 0 {
+            return 0;
+        }
+        let src = unsafe { slice::from_raw_parts(input_ptr, input_len) };
+        let mut out = unsafe { OutCursor::new(out_ptr, out_capacity) };
+        nfo_identity_text_into(src, &mut out);
+        finish_cursor(out)
+    }))
+    .unwrap_or(-1)
 }
 
 #[unsafe(no_mangle)]
@@ -865,21 +932,27 @@ pub unsafe extern "C" fn nntmux_nfo_check_preconditions(
     input_ptr: *const u8,
     input_len: usize,
 ) -> i32 {
-    if input_ptr.is_null() {
-        return -1;
-    }
-    let src = unsafe { slice::from_raw_parts(input_ptr, input_len) };
-    let mut flags = 0i32;
-    if matches_non_nfo_header(src) {
-        flags |= 1;
-    }
-    if detect_binary_format(src) {
-        flags |= 2;
-    }
-    if has_binary_control_chars(src) {
-        flags |= 4;
-    }
-    flags
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(input_ptr, input_len, true) {
+            return -1;
+        }
+        if input_ptr.is_null() {
+            return -1;
+        }
+        let src = unsafe { slice::from_raw_parts(input_ptr, input_len) };
+        let mut flags = 0i32;
+        if matches_non_nfo_header(src) {
+            flags |= 1;
+        }
+        if detect_binary_format(src) {
+            flags |= 2;
+        }
+        if has_binary_control_chars(src) {
+            flags |= 4;
+        }
+        flags
+    }))
+    .unwrap_or(-1)
 }
 
 #[unsafe(no_mangle)]
@@ -887,11 +960,17 @@ pub unsafe extern "C" fn nntmux_nfo_validate_content(
     input_ptr: *const u8,
     input_len: usize,
 ) -> i32 {
-    if input_ptr.is_null() {
-        return -1;
-    }
-    let src = unsafe { slice::from_raw_parts(input_ptr, input_len) };
-    validate_nfo_content(src)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(input_ptr, input_len, true) {
+            return -1;
+        }
+        if input_ptr.is_null() {
+            return -1;
+        }
+        let src = unsafe { slice::from_raw_parts(input_ptr, input_len) };
+        validate_nfo_content(src)
+    }))
+    .unwrap_or(-1)
 }
 
 // ============================================================================
@@ -1471,6 +1550,9 @@ pub(crate) fn nfo_predb_candidates_into(src: &[u8], out: &mut OutCursor<'_>) -> 
         let ptr = stack_ident.as_mut_ptr().cast::<u8>();
         let mut cur = unsafe { OutCursor::new(ptr, 16384) };
         nfo_identity_text_into(src, &mut cur);
+        if cur.pos > 16384 || !nfo_abi_range(ptr, cur.pos, false) {
+            return -1;
+        }
         unsafe { slice::from_raw_parts(ptr, cur.pos) }
     } else {
         heap_ident.resize(src.len(), 0);
@@ -3212,6 +3294,9 @@ pub(crate) fn nfo_extract_pattern_mode_into(
         let ptr = stack_ident.as_mut_ptr().cast::<u8>();
         let mut cur = unsafe { OutCursor::new(ptr, 16384) };
         nfo_identity_text_into(src, &mut cur);
+        if cur.pos > 16384 || !nfo_abi_range(ptr, cur.pos, false) {
+            return -1;
+        }
         unsafe { slice::from_raw_parts(ptr, cur.pos) }
     } else {
         heap_ident.resize(src.len(), 0);
@@ -5039,15 +5124,24 @@ pub unsafe extern "C" fn nntmux_nfo_predb_candidates(
     out_buf: *mut u8,
     out_cap: usize,
 ) -> isize {
-    if text_len == 0 {
-        return 0;
-    }
-    if text.is_null() || (out_buf.is_null() && out_cap > 0) {
-        return -1;
-    }
-    let src = unsafe { slice::from_raw_parts(text, text_len) };
-    let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
-    nfo_predb_candidates_into(src, &mut cursor)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(text, text_len, true)
+            || !nfo_abi_range(out_buf, out_cap, true)
+            || yenc_ranges_overlap(text as usize, text_len, out_buf as usize, out_cap)
+        {
+            return -1;
+        }
+        if text_len == 0 {
+            return 0;
+        }
+        if text.is_null() || (out_buf.is_null() && out_cap > 0) {
+            return -1;
+        }
+        let src = unsafe { slice::from_raw_parts(text, text_len) };
+        let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+        nfo_predb_candidates_into(src, &mut cursor)
+    }))
+    .unwrap_or(-1)
 }
 
 /// Evaluates `NfoNameExtractor::extractFromNfo` pattern matching on `text[..text_len]`, writing `newName\0method` into `out_buf`.
@@ -5069,15 +5163,24 @@ pub unsafe extern "C" fn nntmux_nfo_extract_pattern_match(
     out_buf: *mut u8,
     out_cap: usize,
 ) -> isize {
-    if text_len == 0 {
-        return 0;
-    }
-    if text.is_null() || (out_buf.is_null() && out_cap > 0) {
-        return -1;
-    }
-    let src = unsafe { slice::from_raw_parts(text, text_len) };
-    let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
-    nfo_extract_pattern_mode_into(src, 0, &mut cursor)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(text, text_len, true)
+            || !nfo_abi_range(out_buf, out_cap, true)
+            || yenc_ranges_overlap(text as usize, text_len, out_buf as usize, out_cap)
+        {
+            return -1;
+        }
+        if text_len == 0 {
+            return 0;
+        }
+        if text.is_null() || (out_buf.is_null() && out_cap > 0) {
+            return -1;
+        }
+        let src = unsafe { slice::from_raw_parts(text, text_len) };
+        let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+        nfo_extract_pattern_mode_into(src, 0, &mut cursor)
+    }))
+    .unwrap_or(-1)
 }
 
 /// Evaluates `NfoNameExtractor` pattern matching for a specific `mode` (`0` = `extractFromNfo`, `1..=6` = individual `checkFor*` methods).
@@ -5094,15 +5197,24 @@ pub unsafe extern "C" fn nntmux_nfo_extract_pattern_mode(
     out_buf: *mut u8,
     out_cap: usize,
 ) -> isize {
-    if text_len == 0 {
-        return 0;
-    }
-    if text.is_null() || (out_buf.is_null() && out_cap > 0) {
-        return -1;
-    }
-    let src = unsafe { slice::from_raw_parts(text, text_len) };
-    let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
-    nfo_extract_pattern_mode_into(src, mode, &mut cursor)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(text, text_len, true)
+            || !nfo_abi_range(out_buf, out_cap, true)
+            || yenc_ranges_overlap(text as usize, text_len, out_buf as usize, out_cap)
+        {
+            return -1;
+        }
+        if text_len == 0 {
+            return 0;
+        }
+        if text.is_null() || (out_buf.is_null() && out_cap > 0) {
+            return -1;
+        }
+        let src = unsafe { slice::from_raw_parts(text, text_len) };
+        let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+        nfo_extract_pattern_mode_into(src, mode, &mut cursor)
+    }))
+    .unwrap_or(-1)
 }
 
 /// Evaluates `FileNameExtractor::extractFromFile` on `filename[..filename_len]`, writing `newName\0method` into `out_buf`.
@@ -5124,15 +5236,24 @@ pub unsafe extern "C" fn nntmux_filename_extract_candidate(
     out_buf: *mut u8,
     out_cap: usize,
 ) -> isize {
-    if filename_len == 0 {
-        return 0;
-    }
-    if filename.is_null() || (out_buf.is_null() && out_cap > 0) {
-        return -1;
-    }
-    let src = unsafe { slice::from_raw_parts(filename, filename_len) };
-    let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
-    filename_extract_candidate_into(src, &mut cursor)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(filename, filename_len, true)
+            || !nfo_abi_range(out_buf, out_cap, true)
+            || yenc_ranges_overlap(filename as usize, filename_len, out_buf as usize, out_cap)
+        {
+            return -1;
+        }
+        if filename_len == 0 {
+            return 0;
+        }
+        if filename.is_null() || (out_buf.is_null() && out_cap > 0) {
+            return -1;
+        }
+        let src = unsafe { slice::from_raw_parts(filename, filename_len) };
+        let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+        filename_extract_candidate_into(src, &mut cursor)
+    }))
+    .unwrap_or(-1)
 }
 
 /// Alias for `nntmux_filename_extract_candidate`.
@@ -5147,7 +5268,16 @@ pub unsafe extern "C" fn nntmux_file_extract_candidate(
     out_buf: *mut u8,
     out_cap: usize,
 ) -> isize {
-    unsafe { nntmux_filename_extract_candidate(filename, filename_len, out_buf, out_cap) }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(filename, filename_len, true)
+            || !nfo_abi_range(out_buf, out_cap, true)
+            || yenc_ranges_overlap(filename as usize, filename_len, out_buf as usize, out_cap)
+        {
+            return -1;
+        }
+        unsafe { nntmux_filename_extract_candidate(filename, filename_len, out_buf, out_cap) }
+    }))
+    .unwrap_or(-1)
 }
 
 // ============================================================================
@@ -5910,7 +6040,10 @@ pub(crate) fn nzb_analyze_manifest_into(bytes: &[u8], out: &mut OutCursor<'_>) -
             return -1;
         };
         pos = next_pos;
-        if bytes.get(pos..pos + 9).is_some_and(|s| s.eq_ignore_ascii_case(b"<!doctype")) {
+        if bytes
+            .get(pos..pos + 9)
+            .is_some_and(|s| s.eq_ignore_ascii_case(b"<!doctype"))
+        {
             if doctype_span.is_some() {
                 return -1;
             }
@@ -6139,10 +6272,15 @@ pub(crate) fn nzb_analyze_manifest_into(bytes: &[u8], out: &mut OutCursor<'_>) -
                                 return -1;
                             };
                             let Some((after_group_open, group_self_closing)) =
-                                parse_nzb_xml_attributes(bytes, group_attr_start, false, |_k, v| {
-                                    tmp_attr.clear();
-                                    unescape_nzb_xml_utf8(v, true, &mut tmp_attr)
-                                })
+                                parse_nzb_xml_attributes(
+                                    bytes,
+                                    group_attr_start,
+                                    false,
+                                    |_k, v| {
+                                        tmp_attr.clear();
+                                        unescape_nzb_xml_utf8(v, true, &mut tmp_attr)
+                                    },
+                                )
                             else {
                                 return -1;
                             };
@@ -6203,11 +6341,8 @@ pub(crate) fn nzb_analyze_manifest_into(bytes: &[u8], out: &mut OutCursor<'_>) -
                             attr_buf1.clear(); // number
                             attr_buf2.clear(); // bytes
                             let Some((after_seg_open, seg_self_closing)) =
-                                parse_nzb_xml_attributes(
-                                    bytes,
-                                    seg_attr_start,
-                                    false,
-                                    |k, v| match k {
+                                parse_nzb_xml_attributes(bytes, seg_attr_start, false, |k, v| {
+                                    match k {
                                         b"number" => {
                                             attr_buf1.clear();
                                             unescape_nzb_xml_utf8(v, true, &mut attr_buf1)
@@ -6220,8 +6355,8 @@ pub(crate) fn nzb_analyze_manifest_into(bytes: &[u8], out: &mut OutCursor<'_>) -
                                             tmp_attr.clear();
                                             unescape_nzb_xml_utf8(v, true, &mut tmp_attr)
                                         }
-                                    },
-                                )
+                                    }
+                                })
                             else {
                                 return -1;
                             };
@@ -6286,8 +6421,7 @@ pub(crate) fn nzb_analyze_manifest_into(bytes: &[u8], out: &mut OutCursor<'_>) -
                             if (parsed_bytes.is_none() && bytes_is_digits)
                                 || (advertised_bytes.is_some()
                                     && parsed_bytes.is_some()
-                                    && parsed_bytes.unwrap()
-                                        > i64::MAX - advertised_bytes.unwrap())
+                                    && parsed_bytes.unwrap() > i64::MAX - advertised_bytes.unwrap())
                             {
                                 advertised_bytes_overflow = true;
                             }
@@ -6427,11 +6561,16 @@ pub(crate) fn nzb_analyze_manifest_into(bytes: &[u8], out: &mut OutCursor<'_>) -
             write_u64_decimal(out, ab as u64);
         }
         out.push(0);
-        out.push(if total_adv_overflow[k_idx] { b'1' } else { b'0' });
+        out.push(if total_adv_overflow[k_idx] {
+            b'1'
+        } else {
+            b'0'
+        });
     }
 
-    let adv_totals_valid =
-        total_adv_bytes[0].is_some() && total_adv_bytes[1].is_some() && total_adv_bytes[2].is_some();
+    let adv_totals_valid = total_adv_bytes[0].is_some()
+        && total_adv_bytes[1].is_some()
+        && total_adv_bytes[2].is_some();
     out.push(0);
     out.push(if adv_totals_valid { b'1' } else { b'0' });
 
@@ -6732,9 +6871,8 @@ fn check_fallback_yenc_control_line(
                 break;
             }
             if critical.contains(&name) {
-                if let Some(&(_, _, prev_val)) = seen_critical
-                    .iter()
-                    .find(|&&(k, kl, _)| &k[..kl] == name)
+                if let Some(&(_, _, prev_val)) =
+                    seen_critical.iter().find(|&&(k, kl, _)| &k[..kl] == name)
                 {
                     if prev_val != val {
                         return true;
@@ -7069,65 +7207,81 @@ pub unsafe extern "C" fn nntmux_yenc_encode(
     out_ptr: *mut u8,
     out_cap: usize,
 ) -> isize {
-    if line_len == 0
-        || !yenc_valid_range(input_ptr as usize, input_len)
-        || !yenc_valid_range(filename_ptr as usize, filename_len)
-        || (out_cap != 0 && !yenc_valid_range(out_ptr as usize, out_cap))
-        || input_len
-            .checked_mul(4)
-            .and_then(|n| n.checked_add(filename_len))
-            .and_then(|n| n.checked_add(128))
-            .is_none_or(|n| n > isize::MAX as usize)
-        || yenc_ranges_overlap(input_ptr as usize, input_len, out_ptr as usize, out_cap)
-        || yenc_ranges_overlap(
-            filename_ptr as usize,
-            filename_len,
-            out_ptr as usize,
-            out_cap,
-        )
-    {
-        return -1;
-    }
-    let input = unsafe { slice::from_raw_parts(input_ptr, input_len) };
-    let filename = unsafe { slice::from_raw_parts(filename_ptr, filename_len) };
-    if filename.iter().any(|b| matches!(b, b'\r' | b'\n')) {
-        return -1;
-    }
-    let line_len = line_len.min(254);
-    let mut out = unsafe { OutCursor::new(out_ptr, out_cap) };
-    out.extend(b"=ybegin line=");
-    write_usize_decimal(&mut out, line_len);
-    out.extend(b" size=");
-    write_usize_decimal(&mut out, input_len);
-    out.extend(b" name=");
-    out.extend(php_trim(filename));
-    out.extend(b"\r\n");
-    let mut column = 0usize;
-    for &raw in input {
-        if column >= line_len {
-            out.extend(b"\r\n");
-            column = 0;
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(input_ptr, input_len, true)
+            || !nfo_abi_range(filename_ptr, filename_len, true)
+            || !nfo_abi_range(out_ptr, out_cap, true)
+            || yenc_ranges_overlap(input_ptr as usize, input_len, out_ptr as usize, out_cap)
+            || yenc_ranges_overlap(
+                filename_ptr as usize,
+                filename_len,
+                out_ptr as usize,
+                out_cap,
+            )
+        {
+            return -1;
         }
-        let byte = raw.wrapping_add(42);
-        if matches!(byte, 0 | 9 | 10 | 13 | 32 | 46 | 61) {
-            out.push(b'=');
-            out.push(byte.wrapping_add(64));
-            column += 2;
-        } else {
-            out.push(byte);
-            column += 1;
+        if line_len == 0
+            || !yenc_valid_range(input_ptr as usize, input_len)
+            || !yenc_valid_range(filename_ptr as usize, filename_len)
+            || (out_cap != 0 && !yenc_valid_range(out_ptr as usize, out_cap))
+            || input_len
+                .checked_mul(4)
+                .and_then(|n| n.checked_add(filename_len))
+                .and_then(|n| n.checked_add(128))
+                .is_none_or(|n| n > isize::MAX as usize)
+            || yenc_ranges_overlap(input_ptr as usize, input_len, out_ptr as usize, out_cap)
+            || yenc_ranges_overlap(
+                filename_ptr as usize,
+                filename_len,
+                out_ptr as usize,
+                out_cap,
+            )
+        {
+            return -1;
         }
-    }
-    out.extend(b"\r\n=yend size=");
-    write_usize_decimal(&mut out, input_len);
-    if crc32_flag != 0 {
-        out.extend(b" crc32=");
-        let crc = crc32_ieee(input);
-        for shift in (0..8).rev() {
-            out.push(b"0123456789abcdef"[((crc >> (shift * 4)) & 15) as usize]);
+        let input = unsafe { slice::from_raw_parts(input_ptr, input_len) };
+        let filename = unsafe { slice::from_raw_parts(filename_ptr, filename_len) };
+        if filename.iter().any(|b| matches!(b, b'\r' | b'\n')) {
+            return -1;
         }
-    }
-    out.finish()
+        let line_len = line_len.min(254);
+        let mut out = unsafe { OutCursor::new(out_ptr, out_cap) };
+        out.extend(b"=ybegin line=");
+        write_usize_decimal(&mut out, line_len);
+        out.extend(b" size=");
+        write_usize_decimal(&mut out, input_len);
+        out.extend(b" name=");
+        out.extend(php_trim(filename));
+        out.extend(b"\r\n");
+        let mut column = 0usize;
+        for &raw in input {
+            if column >= line_len {
+                out.extend(b"\r\n");
+                column = 0;
+            }
+            let byte = raw.wrapping_add(42);
+            if matches!(byte, 0 | 9 | 10 | 13 | 32 | 46 | 61) {
+                out.push(b'=');
+                out.push(byte.wrapping_add(64));
+                column += 2;
+            } else {
+                out.push(byte);
+                column += 1;
+            }
+        }
+        out.extend(b"\r\n=yend size=");
+        write_usize_decimal(&mut out, input_len);
+        if crc32_flag != 0 {
+            out.extend(b" crc32=");
+            let crc = crc32_ieee(input);
+            for shift in (0..8).rev() {
+                out.push(b"0123456789abcdef"[((crc >> (shift * 4)) & 15) as usize]);
+            }
+        }
+        out.finish()
+    }))
+    .unwrap_or(-1)
 }
 
 /// Locate a frame without copying its payload. Six output words contain the
@@ -7144,22 +7298,36 @@ pub unsafe extern "C" fn nntmux_yenc_frame_spans(
     input_len: usize,
     out_spans: *mut usize,
 ) -> i32 {
-    let out_len = 6 * size_of::<usize>();
-    if !yenc_valid_range(input_ptr as usize, input_len)
-        || !yenc_valid_range(out_spans as usize, out_len)
-        || !out_spans.is_aligned()
-        || yenc_ranges_overlap(input_ptr as usize, input_len, out_spans as usize, out_len)
-    {
-        return -1;
-    }
-    let input = unsafe { slice::from_raw_parts(input_ptr, input_len) };
-    let Some(frame) = locate_yenc_article_frame(input, false) else {
-        return 0;
-    };
-    unsafe {
-        std::ptr::copy_nonoverlapping(frame.spans.as_ptr(), out_spans, 6);
-    }
-    1
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(input_ptr, input_len, true)
+            || !nfo_abi_range(out_spans, 6 * size_of::<usize>(), false)
+            || yenc_ranges_overlap(
+                input_ptr as usize,
+                input_len,
+                out_spans as usize,
+                6 * size_of::<usize>(),
+            )
+        {
+            return -1;
+        }
+        let out_len = 6 * size_of::<usize>();
+        if !yenc_valid_range(input_ptr as usize, input_len)
+            || !yenc_valid_range(out_spans as usize, out_len)
+            || !out_spans.is_aligned()
+            || yenc_ranges_overlap(input_ptr as usize, input_len, out_spans as usize, out_len)
+        {
+            return -1;
+        }
+        let input = unsafe { slice::from_raw_parts(input_ptr, input_len) };
+        let Some(frame) = locate_yenc_article_frame(input, false) else {
+            return 0;
+        };
+        unsafe {
+            std::ptr::copy_nonoverlapping(frame.spans.as_ptr(), out_spans, 6);
+        }
+        1
+    }))
+    .unwrap_or(-1)
 }
 
 /// Visit raw matches of ArticleFrame::fields. Duplicate keys are deliberately
@@ -7294,54 +7462,63 @@ pub unsafe extern "C" fn nntmux_yenc_frame_record(
     out_ptr: *mut u8,
     out_cap: usize,
 ) -> isize {
-    if !yenc_valid_range(input_ptr as usize, input_len)
-        || (out_cap != 0 && !yenc_valid_range(out_ptr as usize, out_cap))
-        || input_len
-            .checked_mul(64)
-            .and_then(|length| length.checked_add(256))
-            .is_none_or(|length| length > isize::MAX as usize)
-        || yenc_ranges_overlap(input_ptr as usize, input_len, out_ptr as usize, out_cap)
-    {
-        return -1;
-    }
-    let input = unsafe { slice::from_raw_parts(input_ptr, input_len) };
-    let Some(frame) = locate_yenc_article_frame(input, false) else {
-        return 0;
-    };
-    let [
-        begin,
-        header_end,
-        part_end,
-        payload_start,
-        trailer_start,
-        trailer_end,
-    ] = frame.spans;
-    let mut out = unsafe { OutCursor::new(out_ptr, out_cap) };
-    let class = b"App\\Services\\Yenc\\ArticleFrame";
-    out.extend(b"O:");
-    write_usize_decimal(&mut out, class.len());
-    out.extend(b":\"");
-    out.extend(class);
-    out.extend(b"\":5:{s:6:\"header\";");
-    write_yenc_serialized_fields(&mut out, &input[begin + 7..header_end], true);
-    out.extend(b"s:4:\"part\";");
-    if part_end == usize::MAX {
-        out.extend(b"N;");
-    } else {
-        write_yenc_serialized_fields(&mut out, &input[header_end + 7..part_end], false);
-    }
-    out.extend(b"s:7:\"trailer\";");
-    if parse_trailer_fields != 0 {
-        write_yenc_serialized_fields(&mut out, &input[trailer_start + 5..trailer_end], false);
-    } else {
-        out.extend(b"a:0:{}");
-    }
-    out.extend(b"s:13:\"payloadOffset\";i:");
-    write_usize_decimal(&mut out, payload_start);
-    out.extend(b";s:13:\"payloadLength\";i:");
-    write_usize_decimal(&mut out, trailer_start - payload_start);
-    out.extend(b";}");
-    out.finish()
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(input_ptr, input_len, true)
+            || !nfo_abi_range(out_ptr, out_cap, true)
+            || yenc_ranges_overlap(input_ptr as usize, input_len, out_ptr as usize, out_cap)
+        {
+            return -1;
+        }
+        if !yenc_valid_range(input_ptr as usize, input_len)
+            || (out_cap != 0 && !yenc_valid_range(out_ptr as usize, out_cap))
+            || input_len
+                .checked_mul(64)
+                .and_then(|length| length.checked_add(256))
+                .is_none_or(|length| length > isize::MAX as usize)
+            || yenc_ranges_overlap(input_ptr as usize, input_len, out_ptr as usize, out_cap)
+        {
+            return -1;
+        }
+        let input = unsafe { slice::from_raw_parts(input_ptr, input_len) };
+        let Some(frame) = locate_yenc_article_frame(input, false) else {
+            return 0;
+        };
+        let [
+            begin,
+            header_end,
+            part_end,
+            payload_start,
+            trailer_start,
+            trailer_end,
+        ] = frame.spans;
+        let mut out = unsafe { OutCursor::new(out_ptr, out_cap) };
+        let class = b"App\\Services\\Yenc\\ArticleFrame";
+        out.extend(b"O:");
+        write_usize_decimal(&mut out, class.len());
+        out.extend(b":\"");
+        out.extend(class);
+        out.extend(b"\":5:{s:6:\"header\";");
+        write_yenc_serialized_fields(&mut out, &input[begin + 7..header_end], true);
+        out.extend(b"s:4:\"part\";");
+        if part_end == usize::MAX {
+            out.extend(b"N;");
+        } else {
+            write_yenc_serialized_fields(&mut out, &input[header_end + 7..part_end], false);
+        }
+        out.extend(b"s:7:\"trailer\";");
+        if parse_trailer_fields != 0 {
+            write_yenc_serialized_fields(&mut out, &input[trailer_start + 5..trailer_end], false);
+        } else {
+            out.extend(b"a:0:{}");
+        }
+        out.extend(b"s:13:\"payloadOffset\";i:");
+        write_usize_decimal(&mut out, payload_start);
+        out.extend(b";s:13:\"payloadLength\";i:");
+        write_usize_decimal(&mut out, trailer_start - payload_start);
+        out.extend(b";}");
+        out.finish()
+    }))
+    .unwrap_or(-1)
 }
 
 fn yenc_field<'a>(fields: &'a [(Vec<u8>, Vec<u8>)], key: &[u8]) -> Option<&'a [u8]> {
@@ -7370,71 +7547,109 @@ pub unsafe extern "C" fn nntmux_yenc_parse_frame(
     out_expected_crc: *mut u8,
     out_crc_len: *mut usize,
 ) -> i32 {
-    let outputs = [
-        (out_payload_start as usize, size_of::<usize>()),
-        (out_payload_len as usize, size_of::<usize>()),
-        (out_expected_size as usize, size_of::<i64>()),
-        (out_expected_crc as usize, 8),
-        (out_crc_len as usize, size_of::<usize>()),
-    ];
-    if !yenc_valid_range(input_ptr as usize, input_len)
-        || !out_payload_start.is_aligned()
-        || !out_payload_len.is_aligned()
-        || !out_expected_size.is_aligned()
-        || !out_crc_len.is_aligned()
-        || outputs
-            .iter()
-            .any(|&(address, length)| !yenc_valid_range(address, length))
-    {
-        return -1;
-    }
-    for (i, &(address, length)) in outputs.iter().enumerate() {
-        if yenc_ranges_overlap(input_ptr as usize, input_len, address, length)
-            || outputs[..i]
-                .iter()
-                .any(|&(other, other_len)| yenc_ranges_overlap(address, length, other, other_len))
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(input_ptr, input_len, true)
+            || !nfo_abi_range(out_payload_start, size_of::<usize>(), false)
+            || !nfo_abi_range(out_payload_len, size_of::<usize>(), false)
+            || !nfo_abi_range(out_expected_size, size_of::<i64>(), false)
+            || !nfo_abi_range(out_expected_crc, 8, false)
+            || !nfo_abi_range(out_crc_len, size_of::<usize>(), false)
+            || yenc_ranges_overlap(
+                input_ptr as usize,
+                input_len,
+                out_payload_start as usize,
+                size_of::<usize>(),
+            )
+            || yenc_ranges_overlap(
+                input_ptr as usize,
+                input_len,
+                out_payload_len as usize,
+                size_of::<usize>(),
+            )
+            || yenc_ranges_overlap(
+                input_ptr as usize,
+                input_len,
+                out_expected_size as usize,
+                size_of::<i64>(),
+            )
+            || yenc_ranges_overlap(input_ptr as usize, input_len, out_expected_crc as usize, 8)
+            || yenc_ranges_overlap(
+                input_ptr as usize,
+                input_len,
+                out_crc_len as usize,
+                size_of::<usize>(),
+            )
         {
             return -1;
         }
-    }
-    let input = unsafe { slice::from_raw_parts(input_ptr, input_len) };
-    let Some(frame) = parse_yenc_article_frame(input) else {
-        return 0;
-    };
-    let number = |fields: &[(Vec<u8>, Vec<u8>)], key: &[u8]| {
-        yenc_field(fields, key).and_then(nzb_metadata_number)
-    };
-    let part_size = frame.part.as_ref().and_then(|part| {
-        let begin = number(part, b"begin")?;
-        let end = number(part, b"end")?;
-        (begin >= 1 && end >= begin).then(|| end - begin + 1)
-    });
-    let size = number(&frame.trailer, b"size")
-        .or(part_size)
-        .or_else(|| number(&frame.header, b"size"))
-        .unwrap_or(-1);
-    let multipart = frame.part.is_some()
-        || yenc_field(&frame.header, b"part").is_some()
-        || yenc_field(&frame.trailer, b"part").is_some();
-    let mut crc = [0u8; 8];
-    let mut crc_len = 0;
-    if let Some(raw) = yenc_field(&frame.trailer, if multipart { b"pcrc32" } else { b"crc32" }) {
-        if !raw.is_empty() && raw.len() <= 8 && raw.iter().all(u8::is_ascii_hexdigit) {
-            crc.fill(b'0');
-            for (target, source) in crc[8 - raw.len()..].iter_mut().zip(raw) {
-                *target = source.to_ascii_lowercase();
-            }
-            crc_len = 8;
+        let outputs = [
+            (out_payload_start as usize, size_of::<usize>()),
+            (out_payload_len as usize, size_of::<usize>()),
+            (out_expected_size as usize, size_of::<i64>()),
+            (out_expected_crc as usize, 8),
+            (out_crc_len as usize, size_of::<usize>()),
+        ];
+        if !yenc_valid_range(input_ptr as usize, input_len)
+            || !out_payload_start.is_aligned()
+            || !out_payload_len.is_aligned()
+            || !out_expected_size.is_aligned()
+            || !out_crc_len.is_aligned()
+            || outputs
+                .iter()
+                .any(|&(address, length)| !yenc_valid_range(address, length))
+        {
+            return -1;
         }
-    }
-    unsafe {
-        out_payload_start.write(frame.payload_offset);
-        out_payload_len.write(frame.payload_length);
-        out_expected_size.write(size);
-        std::ptr::copy_nonoverlapping(crc.as_ptr(), out_expected_crc, 8);
-        out_crc_len.write(crc_len);
-    }
-    1
+        for (i, &(address, length)) in outputs.iter().enumerate() {
+            if yenc_ranges_overlap(input_ptr as usize, input_len, address, length)
+                || outputs[..i].iter().any(|&(other, other_len)| {
+                    yenc_ranges_overlap(address, length, other, other_len)
+                })
+            {
+                return -1;
+            }
+        }
+        let input = unsafe { slice::from_raw_parts(input_ptr, input_len) };
+        let Some(frame) = parse_yenc_article_frame(input) else {
+            return 0;
+        };
+        let number = |fields: &[(Vec<u8>, Vec<u8>)], key: &[u8]| {
+            yenc_field(fields, key).and_then(nzb_metadata_number)
+        };
+        let part_size = frame.part.as_ref().and_then(|part| {
+            let begin = number(part, b"begin")?;
+            let end = number(part, b"end")?;
+            (begin >= 1 && end >= begin).then(|| end - begin + 1)
+        });
+        let size = number(&frame.trailer, b"size")
+            .or(part_size)
+            .or_else(|| number(&frame.header, b"size"))
+            .unwrap_or(-1);
+        let multipart = frame.part.is_some()
+            || yenc_field(&frame.header, b"part").is_some()
+            || yenc_field(&frame.trailer, b"part").is_some();
+        let mut crc = [0u8; 8];
+        let mut crc_len = 0;
+        if let Some(raw) = yenc_field(&frame.trailer, if multipart { b"pcrc32" } else { b"crc32" })
+        {
+            if !raw.is_empty() && raw.len() <= 8 && raw.iter().all(u8::is_ascii_hexdigit) {
+                crc.fill(b'0');
+                for (target, source) in crc[8 - raw.len()..].iter_mut().zip(raw) {
+                    *target = source.to_ascii_lowercase();
+                }
+                crc_len = 8;
+            }
+        }
+        unsafe {
+            out_payload_start.write(frame.payload_offset);
+            out_payload_len.write(frame.payload_length);
+            out_expected_size.write(size);
+            std::ptr::copy_nonoverlapping(crc.as_ptr(), out_expected_crc, 8);
+            out_crc_len.write(crc_len);
+        }
+        1
+    }))
+    .unwrap_or(-1)
 }
 
 pub(crate) fn nzb_analyze_article_body_into(
@@ -7527,17 +7742,16 @@ pub(crate) fn nzb_analyze_article_body_into(
                 && line_raw.first() == Some(&b'=')
                 && line_raw.get(1).is_some_and(|&b| b == b'y' || b == b'Y')
             {
-                let ctrl_kind_and_len = if line_raw.len() >= 7
-                    && line_raw[..7].eq_ignore_ascii_case(b"=ybegin")
-                {
-                    Some((YencControlKind::Ybegin, 7usize))
-                } else if line_raw.len() >= 6 && line_raw[..6].eq_ignore_ascii_case(b"=ypart") {
-                    Some((YencControlKind::Ypart, 6usize))
-                } else if line_raw.len() >= 5 && line_raw[..5].eq_ignore_ascii_case(b"=yend") {
-                    Some((YencControlKind::Yend, 5usize))
-                } else {
-                    None
-                };
+                let ctrl_kind_and_len =
+                    if line_raw.len() >= 7 && line_raw[..7].eq_ignore_ascii_case(b"=ybegin") {
+                        Some((YencControlKind::Ybegin, 7usize))
+                    } else if line_raw.len() >= 6 && line_raw[..6].eq_ignore_ascii_case(b"=ypart") {
+                        Some((YencControlKind::Ypart, 6usize))
+                    } else if line_raw.len() >= 5 && line_raw[..5].eq_ignore_ascii_case(b"=yend") {
+                        Some((YencControlKind::Yend, 5usize))
+                    } else {
+                        None
+                    };
 
                 if let Some((kind, kw_len)) = ctrl_kind_and_len {
                     if need_frame {
@@ -7621,8 +7835,7 @@ pub(crate) fn nzb_analyze_article_body_into(
             payload_offset = frame.payload_offset as u32;
             payload_length = frame.payload_length as u32;
 
-            let payload =
-                &body[frame.payload_offset..frame.payload_offset + frame.payload_length];
+            let payload = &body[frame.payload_offset..frame.payload_offset + frame.payload_length];
             let payload_sha256 = sha256_fast_hex(payload);
             out.push(b'\n');
             out.extend(&payload_sha256);
@@ -7734,10 +7947,7 @@ pub(crate) fn nzb_analyze_article_body_into(
                         if !escaped {
                             while i + 16 <= plen {
                                 let chunk = &payload[i..i + 16];
-                                if chunk
-                                    .iter()
-                                    .all(|&b| b != b'\r' && b != b'\n' && b != b'=')
-                                {
+                                if chunk.iter().all(|&b| b != b'\r' && b != b'\n' && b != b'=') {
                                     let dst = &mut out.buf[write_pos..write_pos + 16];
                                     for k in 0..16 {
                                         dst[k] = chunk[k].wrapping_sub(42);
@@ -7970,7 +8180,15 @@ pub(crate) fn nzb_select_article_samples_into(
                 if samples.len() >= maximum_samples {
                     omitted_count += 1;
                 } else {
-                    samples.push((file_idx_raw, kind, subject, seg_num, msg_id, seg_bytes, role));
+                    samples.push((
+                        file_idx_raw,
+                        kind,
+                        subject,
+                        seg_num,
+                        msg_id,
+                        seg_bytes,
+                        role,
+                    ));
                 }
             }
         }
@@ -8006,15 +8224,21 @@ pub(crate) fn nzb_select_article_samples_into(
 /// `subject` must be valid for reads of `subject_len` bytes when non-null and `subject_len > 0`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nntmux_nzb_file_kind(subject: *const u8, subject_len: usize) -> i32 {
-    if subject.is_null() && subject_len > 0 {
-        return -1;
-    }
-    let bytes = if subject_len == 0 {
-        &[]
-    } else {
-        unsafe { slice::from_raw_parts(subject, subject_len) }
-    };
-    i32::from(nzb_file_kind_code(bytes))
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(subject, subject_len, true) {
+            return -1;
+        }
+        if subject.is_null() && subject_len > 0 {
+            return -1;
+        }
+        let bytes = if subject_len == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(subject, subject_len) }
+        };
+        i32::from(nzb_file_kind_code(bytes))
+    }))
+    .unwrap_or(-1)
 }
 
 /// Extracts `NzbFingerprintAnalyzer::formatHint` into `out_buf`.
@@ -8031,25 +8255,34 @@ pub unsafe extern "C" fn nntmux_nzb_format_hint(
     out_buf: *mut u8,
     out_cap: usize,
 ) -> isize {
-    if (subject.is_null() && subject_len > 0) || (out_buf.is_null() && out_cap > 0) {
-        return -1;
-    }
-    if out_cap < 8 {
-        return -8;
-    }
-    let bytes = if subject_len == 0 {
-        &[]
-    } else {
-        unsafe { slice::from_raw_parts(subject, subject_len) }
-    };
-    let mut hint = [0u8; 8];
-    let len = nzb_format_hint_slice(bytes, &mut hint);
-    if len > 0 {
-        unsafe {
-            std::ptr::copy_nonoverlapping(hint.as_ptr(), out_buf, len);
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(subject, subject_len, true)
+            || !nfo_abi_range(out_buf, out_cap, true)
+            || yenc_ranges_overlap(subject as usize, subject_len, out_buf as usize, out_cap)
+        {
+            return -1;
         }
-    }
-    len as isize
+        if (subject.is_null() && subject_len > 0) || (out_buf.is_null() && out_cap > 0) {
+            return -1;
+        }
+        if out_cap < 8 {
+            return -8;
+        }
+        let bytes = if subject_len == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(subject, subject_len) }
+        };
+        let mut hint = [0u8; 8];
+        let len = nzb_format_hint_slice(bytes, &mut hint);
+        if len > 0 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(hint.as_ptr(), out_buf, len);
+            }
+        }
+        len as isize
+    }))
+    .unwrap_or(-1)
 }
 
 /// Detects format signatures on a decoded article prefix (`NzbFingerprintAnalyzer::detectFormatSignatures`).
@@ -8058,19 +8291,22 @@ pub unsafe extern "C" fn nntmux_nzb_format_hint(
 ///
 /// `bytes` must be valid for reads of `len` bytes when non-null and `len > 0`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn nntmux_nzb_detect_format_signatures(
-    bytes: *const u8,
-    len: usize,
-) -> i32 {
-    if bytes.is_null() && len > 0 {
-        return -1;
-    }
-    let slice = if len == 0 {
-        &[]
-    } else {
-        unsafe { slice::from_raw_parts(bytes, len) }
-    };
-    detect_format_signatures_mask(slice) as i32
+pub unsafe extern "C" fn nntmux_nzb_detect_format_signatures(bytes: *const u8, len: usize) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(bytes, len, true) {
+            return -1;
+        }
+        if bytes.is_null() && len > 0 {
+            return -1;
+        }
+        let slice = if len == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(bytes, len) }
+        };
+        detect_format_signatures_mask(slice) as i32
+    }))
+    .unwrap_or(-1)
 }
 
 /// Single-pass NZB XML manifest analyzer (`NzbFingerprintAnalyzer::analyzeManifest`).
@@ -8086,12 +8322,21 @@ pub unsafe extern "C" fn nntmux_nzb_analyze_manifest(
     out_buf: *mut u8,
     out_cap: usize,
 ) -> isize {
-    if xml_len == 0 || xml.is_null() || (out_buf.is_null() && out_cap > 0) {
-        return -1;
-    }
-    let src = unsafe { slice::from_raw_parts(xml, xml_len) };
-    let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
-    nzb_analyze_manifest_into(src, &mut cursor)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(xml, xml_len, true)
+            || !nfo_abi_range(out_buf, out_cap, true)
+            || yenc_ranges_overlap(xml as usize, xml_len, out_buf as usize, out_cap)
+        {
+            return -1;
+        }
+        if xml_len == 0 || xml.is_null() || (out_buf.is_null() && out_cap > 0) {
+            return -1;
+        }
+        let src = unsafe { slice::from_raw_parts(xml, xml_len) };
+        let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+        nzb_analyze_manifest_into(src, &mut cursor)
+    }))
+    .unwrap_or(-1)
 }
 
 /// Unfolds RFC 5322 article headers and detects uploader software candidates.
@@ -8108,19 +8353,28 @@ pub unsafe extern "C" fn nntmux_nzb_unfold_headers(
     out_buf: *mut u8,
     out_cap: usize,
 ) -> isize {
-    if count == 0 {
-        return 0;
-    }
-    if (input.is_null() && input_len > 0) || (out_buf.is_null() && out_cap > 0) {
-        return -1;
-    }
-    let src = if input_len == 0 {
-        &[]
-    } else {
-        unsafe { slice::from_raw_parts(input, input_len) }
-    };
-    let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
-    nzb_unfold_headers_into(src, count, &mut cursor)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(input, input_len, true)
+            || !nfo_abi_range(out_buf, out_cap, true)
+            || yenc_ranges_overlap(input as usize, input_len, out_buf as usize, out_cap)
+        {
+            return -1;
+        }
+        if count == 0 {
+            return 0;
+        }
+        if (input.is_null() && input_len > 0) || (out_buf.is_null() && out_cap > 0) {
+            return -1;
+        }
+        let src = if input_len == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(input, input_len) }
+        };
+        let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+        nzb_unfold_headers_into(src, count, &mut cursor)
+    }))
+    .unwrap_or(-1)
 }
 
 /// Analyzes NNTP article body framing, yEnc control lines, payload line statistics, and optional yEnc payload decoding.
@@ -8137,16 +8391,25 @@ pub unsafe extern "C" fn nntmux_nzb_analyze_article_body(
     out_buf: *mut u8,
     out_cap: usize,
 ) -> isize {
-    if (body.is_null() && body_len > 0) || (out_buf.is_null() && out_cap > 0) {
-        return -1;
-    }
-    let src = if body_len == 0 {
-        &[]
-    } else {
-        unsafe { slice::from_raw_parts(body, body_len) }
-    };
-    let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
-    nzb_analyze_article_body_into(src, flags, &mut cursor)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(body, body_len, true)
+            || !nfo_abi_range(out_buf, out_cap, true)
+            || yenc_ranges_overlap(body as usize, body_len, out_buf as usize, out_cap)
+        {
+            return -1;
+        }
+        if (body.is_null() && body_len > 0) || (out_buf.is_null() && out_cap > 0) {
+            return -1;
+        }
+        let src = if body_len == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(body, body_len) }
+        };
+        let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+        nzb_analyze_article_body_into(src, flags, &mut cursor)
+    }))
+    .unwrap_or(-1)
 }
 
 /// Selects bounded article samples from packed NZB manifest file records (`NzbFingerprintAnalyzer::selectArticleSamples`).
@@ -8164,16 +8427,25 @@ pub unsafe extern "C" fn nntmux_nzb_select_article_samples(
     out_buf: *mut u8,
     out_cap: usize,
 ) -> isize {
-    if (input.is_null() && input_len > 0) || (out_buf.is_null() && out_cap > 0) {
-        return -1;
-    }
-    let src = if input_len == 0 {
-        &[]
-    } else {
-        unsafe { slice::from_raw_parts(input, input_len) }
-    };
-    let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
-    nzb_select_article_samples_into(src, file_count, max_samples, &mut cursor)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(input, input_len, true)
+            || !nfo_abi_range(out_buf, out_cap, true)
+            || yenc_ranges_overlap(input as usize, input_len, out_buf as usize, out_cap)
+        {
+            return -1;
+        }
+        if (input.is_null() && input_len > 0) || (out_buf.is_null() && out_cap > 0) {
+            return -1;
+        }
+        let src = if input_len == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(input, input_len) }
+        };
+        let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+        nzb_select_article_samples_into(src, file_count, max_samples, &mut cursor)
+    }))
+    .unwrap_or(-1)
 }
 
 #[cfg(test)]
@@ -8297,7 +8569,10 @@ mod tests {
 
     #[test]
     fn test_nzb_detect_format_signatures() {
-        assert_eq!(detect_format_signatures_mask(b"Rar!\x1a\x07\x01\x00extra"), 1);
+        assert_eq!(
+            detect_format_signatures_mask(b"Rar!\x1a\x07\x01\x00extra"),
+            1
+        );
         assert_eq!(detect_format_signatures_mask(b"Rar!\x1a\x07\x00"), 2);
         assert_eq!(detect_format_signatures_mask(b"7z\xbc\xaf\x27\x1c"), 4);
         assert_eq!(detect_format_signatures_mask(b"PK\x03\x04"), 8);
@@ -8349,7 +8624,8 @@ mod tests {
         let written = nzb_unfold_headers_into(headers, 4, &mut out);
         assert!(written > 0);
 
-        let body = b"=ybegin line=128 size=4 name=test.bin\r\n*+,-\r\n=yend size=4 crc32=9b0d08f1\r\n";
+        let body =
+            b"=ybegin line=128 size=4 name=test.bin\r\n*+,-\r\n=yend size=4 crc32=9b0d08f1\r\n";
         let mut body_buf = vec![0u8; 2048];
         let mut body_out = unsafe { OutCursor::new(body_buf.as_mut_ptr(), body_buf.len()) };
         let body_written = nzb_analyze_article_body_into(body, 0x0F, &mut body_out);
@@ -9166,9 +9442,12 @@ mod nfo_metadata_pcre {
             if rc <= 0 || rc > 4 {
                 return Err(());
             }
-            let offsets = unsafe {
-                std::slice::from_raw_parts((self.api.ovector)(self.data), rc as usize * 2)
-            };
+            let offsets_ptr = unsafe { (self.api.ovector)(self.data) };
+            let count = rc as usize * 2;
+            if !super::nfo_abi_range(offsets_ptr, count * size_of::<usize>(), false) {
+                return Err(());
+            }
+            let offsets = unsafe { std::slice::from_raw_parts(offsets_ptr, count) };
             let mut copied = [usize::MAX; 8];
             copied[..offsets.len()].copy_from_slice(offsets);
             Ok(Some(Captures {
@@ -10353,25 +10632,34 @@ macro_rules! nfo_metadata_export {
             out: *mut u8,
             cap: usize,
         ) -> isize {
-            let Some(input) = nfo_meta_range(text, len) else {
-                return -1;
-            };
-            let Some(output) = nfo_meta_range(out.cast_const(), cap) else {
-                return -1;
-            };
-            if nfo_meta_overlaps(input, output) {
-                return -1;
-            }
-            std::panic::catch_unwind(|| {
-                let bytes = unsafe { nfo_meta_slice(text, len) }.ok_or(())?;
-                let value =
-                    nfo_metadata_pcre::with_matcher(|matcher| $implementation(matcher, bytes))?;
-                let mut serialized = Vec::new();
-                value.serialize(&mut serialized);
-                Ok::<isize, ()>(unsafe { nfo_meta_output(&serialized, out, cap) })
-            })
-            .ok()
-            .and_then(Result::ok)
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if !nfo_abi_range(text, len, true)
+                    || !nfo_abi_range(out, cap, true)
+                    || yenc_ranges_overlap(text as usize, len, out as usize, cap)
+                {
+                    return -1;
+                }
+                let Some(input) = nfo_meta_range(text, len) else {
+                    return -1;
+                };
+                let Some(output) = nfo_meta_range(out.cast_const(), cap) else {
+                    return -1;
+                };
+                if nfo_meta_overlaps(input, output) {
+                    return -1;
+                }
+                std::panic::catch_unwind(|| {
+                    let bytes = unsafe { nfo_meta_slice(text, len) }.ok_or(())?;
+                    let value =
+                        nfo_metadata_pcre::with_matcher(|matcher| $implementation(matcher, bytes))?;
+                    let mut serialized = Vec::new();
+                    value.serialize(&mut serialized);
+                    Ok::<isize, ()>(unsafe { nfo_meta_output(&serialized, out, cap) })
+                })
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or(-1)
+            }))
             .unwrap_or(-1)
         }
     };
@@ -10396,12 +10684,18 @@ macro_rules! nfo_scalar_export {
         /// Input must be readable for its declared length.
         #[unsafe(no_mangle)]
         pub unsafe extern "C" fn $export(text: *const u8, len: usize) -> i32 {
-            std::panic::catch_unwind(|| {
-                let bytes = unsafe { nfo_meta_slice(text, len) }.ok_or(())?;
-                nfo_metadata_pcre::with_matcher(|matcher| $implementation(matcher, bytes))
-            })
-            .ok()
-            .and_then(Result::ok)
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if !nfo_abi_range(text, len, true) {
+                    return -1;
+                }
+                std::panic::catch_unwind(|| {
+                    let bytes = unsafe { nfo_meta_slice(text, len) }.ok_or(())?;
+                    nfo_metadata_pcre::with_matcher(|matcher| $implementation(matcher, bytes))
+                })
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or(-1)
+            }))
             .unwrap_or(-1)
         }
     };
@@ -10471,7 +10765,18 @@ macro_rules! nfo_append_export {
             out: *mut u8,
             cap: usize,
         ) -> isize {
-            unsafe { nfo_append_tags(name, name_len, text, len, out, cap, $mode) }
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if !nfo_abi_range(name, name_len, true)
+                    || !nfo_abi_range(text, len, true)
+                    || !nfo_abi_range(out, cap, true)
+                    || yenc_ranges_overlap(name as usize, name_len, out as usize, cap)
+                    || yenc_ranges_overlap(text as usize, len, out as usize, cap)
+                {
+                    return -1;
+                }
+                unsafe { nfo_append_tags(name, name_len, text, len, out, cap, $mode) }
+            }))
+            .unwrap_or(-1)
         }
     };
 }
@@ -11911,18 +12216,27 @@ pub unsafe extern "C" fn nntmux_nzb_detect_nfo_file(
     out_buf: *mut u8,
     out_cap: usize,
 ) -> isize {
-    let Some(s) = (unsafe { nzbc_input(title, len) }) else {
-        return -1;
-    };
-    if out_buf.is_null() || out_cap == 0 {
-        return -1;
-    }
-    let priority = nzb_nfo_priority(s);
-    if priority == 0 {
-        return 0;
-    }
-    unsafe { *out_buf = priority };
-    1
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(title, len, true)
+            || !nfo_abi_range(out_buf, out_cap, true)
+            || yenc_ranges_overlap(title as usize, len, out_buf as usize, out_cap)
+        {
+            return -1;
+        }
+        let Some(s) = (unsafe { nzbc_input(title, len) }) else {
+            return -1;
+        };
+        if out_buf.is_null() || out_cap == 0 {
+            return -1;
+        }
+        let priority = nzb_nfo_priority(s);
+        if priority == 0 {
+            return 0;
+        }
+        unsafe { *out_buf = priority };
+        1
+    }))
+    .unwrap_or(-1)
 }
 
 /// Pattern bits of `NzbParserService::detectHiddenNfoFile` (see [`nzb_hidden_nfo_patterns`]) plus
@@ -11933,10 +12247,16 @@ pub unsafe extern "C" fn nntmux_nzb_detect_nfo_file(
 /// `title` must be valid for reads of `len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nntmux_nzb_detect_hidden_nfo_file(title: *const u8, len: usize) -> i32 {
-    let Some(s) = (unsafe { nzbc_input(title, len) }) else {
-        return -1;
-    };
-    (nzb_hidden_nfo_patterns(s) | (u32::from(nzbc_hidden_excluded(s)) << 4)) as i32
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(title, len, true) {
+            return -1;
+        }
+        let Some(s) = (unsafe { nzbc_input(title, len) }) else {
+            return -1;
+        };
+        (nzb_hidden_nfo_patterns(s) | (u32::from(nzbc_hidden_excluded(s)) << 4)) as i32
+    }))
+    .unwrap_or(-1)
 }
 
 /// `NzbParserService::detectPar2IndexFile`: `1`/`0`, or `-1` on invalid pointers.
@@ -11946,10 +12266,16 @@ pub unsafe extern "C" fn nntmux_nzb_detect_hidden_nfo_file(title: *const u8, len
 /// `title` must be valid for reads of `len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nntmux_nzb_detect_par2_index_file(title: *const u8, len: usize) -> i32 {
-    let Some(s) = (unsafe { nzbc_input(title, len) }) else {
-        return -1;
-    };
-    i32::from(nzb_is_par2_index(s))
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(title, len, true) {
+            return -1;
+        }
+        let Some(s) = (unsafe { nzbc_input(title, len) }) else {
+            return -1;
+        };
+        i32::from(nzb_is_par2_index(s))
+    }))
+    .unwrap_or(-1)
 }
 
 /// `NzbParserService::extractPartsTotal`: `0..=i32::MAX`, `-1` on invalid pointers, or `-2`
@@ -11960,12 +12286,18 @@ pub unsafe extern "C" fn nntmux_nzb_detect_par2_index_file(title: *const u8, len
 /// `title` must be valid for reads of `len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nntmux_nzb_extract_parts_total(title: *const u8, len: usize) -> i32 {
-    let Some(s) = (unsafe { nzbc_input(title, len) }) else {
-        return -1;
-    };
-    nzb_parts_total(s)
-        .and_then(|v| i32::try_from(v).ok())
-        .unwrap_or(-2)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(title, len, true) {
+            return -1;
+        }
+        let Some(s) = (unsafe { nzbc_input(title, len) }) else {
+            return -1;
+        };
+        nzb_parts_total(s)
+            .and_then(|v| i32::try_from(v).ok())
+            .unwrap_or(-2)
+    }))
+    .unwrap_or(-1)
 }
 
 /// Classifies `subject\0segment_count\0` records (the `parseNzb` loop without XML access).
@@ -11984,33 +12316,42 @@ pub unsafe extern "C" fn nntmux_nzb_classify_nfo_par2_batch_nul(
     out_buf: *mut u8,
     out_cap: usize,
 ) -> isize {
-    let Some(input) = (unsafe { nzbc_input(records, records_len) }) else {
-        return -1;
-    };
-    if out_buf.is_null() && out_cap > 0 {
-        return -1;
-    }
-    let mut scan = NzbcScan::new(flags);
-    let mut pos = 0;
-    while pos < input.len() {
-        let Some(subject_end) = nzbc_find(input, pos, 0) else {
-            return -1;
-        };
-        let Some(count_end) = nzbc_find(input, subject_end + 1, 0) else {
-            return -1;
-        };
-        let digits = &input[subject_end + 1..count_end];
-        if digits.is_empty() || digits.len() > 18 || !digits.iter().all(u8::is_ascii_digit) {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(records, records_len, true)
+            || !nfo_abi_range(out_buf, out_cap, true)
+            || yenc_ranges_overlap(records as usize, records_len, out_buf as usize, out_cap)
+        {
             return -1;
         }
-        let segments = nzbc_digits(digits).unwrap_or(0) as u64;
-        if !scan.file(&input[pos..subject_end], segments, Some(&[])) {
+        let Some(input) = (unsafe { nzbc_input(records, records_len) }) else {
+            return -1;
+        };
+        if out_buf.is_null() && out_cap > 0 {
             return -1;
         }
-        pos = count_end + 1;
-    }
-    let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
-    scan.write(&mut out)
+        let mut scan = NzbcScan::new(flags);
+        let mut pos = 0;
+        while pos < input.len() {
+            let Some(subject_end) = nzbc_find(input, pos, 0) else {
+                return -1;
+            };
+            let Some(count_end) = nzbc_find(input, subject_end + 1, 0) else {
+                return -1;
+            };
+            let digits = &input[subject_end + 1..count_end];
+            if digits.is_empty() || digits.len() > 18 || !digits.iter().all(u8::is_ascii_digit) {
+                return -1;
+            }
+            let segments = nzbc_digits(digits).unwrap_or(0) as u64;
+            if !scan.file(&input[pos..subject_end], segments, Some(&[])) {
+                return -1;
+            }
+            pos = count_end + 1;
+        }
+        let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+        scan.write(&mut out)
+    }))
+    .unwrap_or(-1)
 }
 
 /// One-call `parseNzb` classification over the NZB source: file and segment totals, completion,
@@ -12029,18 +12370,27 @@ pub unsafe extern "C" fn nntmux_nzb_classify_nfo_par2_packed(
     out_buf: *mut u8,
     out_cap: usize,
 ) -> isize {
-    let Some(bytes) = (unsafe { nzbc_input(xml, xml_len) }) else {
-        return -1;
-    };
-    if out_buf.is_null() && out_cap > 0 {
-        return -1;
-    }
-    let mut scan = NzbcScan::new(flags);
-    if !nzbc_scan_document(bytes, &mut scan) {
-        return -1;
-    }
-    let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
-    scan.write(&mut out)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(xml, xml_len, true)
+            || !nfo_abi_range(out_buf, out_cap, true)
+            || yenc_ranges_overlap(xml as usize, xml_len, out_buf as usize, out_cap)
+        {
+            return -1;
+        }
+        let Some(bytes) = (unsafe { nzbc_input(xml, xml_len) }) else {
+            return -1;
+        };
+        if out_buf.is_null() && out_cap > 0 {
+            return -1;
+        }
+        let mut scan = NzbcScan::new(flags);
+        if !nzbc_scan_document(bytes, &mut scan) {
+            return -1;
+        }
+        let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+        scan.write(&mut out)
+    }))
+    .unwrap_or(-1)
 }
 
 #[cfg(test)]
@@ -12172,26 +12522,41 @@ pub unsafe extern "C" fn nntmux_verification_manifest_identity(
     out: *mut u8,
     cap: usize,
 ) -> isize {
-    let Some(data) = (unsafe { verification_input(input, len) }) else {
-        return -1;
-    };
-    if !(out.is_null() && cap == 0 || yenc_valid_range(out as usize, cap))
-        || yenc_ranges_overlap(input as usize, len, out as usize, cap)
-    {
-        return -1;
-    }
-    let mut cursor = unsafe { OutCursor::new(out, cap) };
-    cursor.extend(&sha256_fast_hex(data));
-    cursor.finish()
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(input, len, true)
+            || !nfo_abi_range(out, cap, true)
+            || yenc_ranges_overlap(input as usize, len, out as usize, cap)
+        {
+            return -1;
+        }
+        let Some(data) = (unsafe { verification_input(input, len) }) else {
+            return -1;
+        };
+        if !(out.is_null() && cap == 0 || yenc_valid_range(out as usize, cap))
+            || yenc_ranges_overlap(input as usize, len, out as usize, cap)
+        {
+            return -1;
+        }
+        let mut cursor = unsafe { OutCursor::new(out, cap) };
+        cursor.extend(&sha256_fast_hex(data));
+        cursor.finish()
+    }))
+    .unwrap_or(-1)
 }
 
 /// # Safety
 /// The input must be readable for `len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nntmux_verification_manifest_name(input: *const u8, len: usize) -> i32 {
-    unsafe { verification_input(input, len) }
-        .map(|name| i32::from(verification_manifest_name(name)))
-        .unwrap_or(-1)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(input, len, true) {
+            return -1;
+        }
+        unsafe { verification_input(input, len) }
+            .map(|name| i32::from(verification_manifest_name(name)))
+            .unwrap_or(-1)
+    }))
+    .unwrap_or(-1)
 }
 
 /// Gzip inflation stays in PHP's zlib; Rust checks the header and decoded digest.
@@ -12206,20 +12571,29 @@ pub unsafe extern "C" fn nntmux_verification_manifest_body(
     json: *const u8,
     json_len: usize,
 ) -> i32 {
-    let (Some(name), Some(body), Some(json)) = (unsafe {
-        (
-            verification_input(name, name_len),
-            verification_input(body, body_len),
-            verification_input(json, json_len),
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(name, name_len, true)
+            || !nfo_abi_range(body, body_len, true)
+            || !nfo_abi_range(json, json_len, true)
+        {
+            return -1;
+        }
+        let (Some(name), Some(body), Some(json)) = (unsafe {
+            (
+                verification_input(name, name_len),
+                verification_input(body, body_len),
+                verification_input(json, json_len),
+            )
+        }) else {
+            return -1;
+        };
+        i32::from(
+            verification_manifest_name(name)
+                && body.starts_with(b"\x1f\x8b")
+                && sha256_fast_hex(json) == name[..64],
         )
-    }) else {
-        return -1;
-    };
-    i32::from(
-        verification_manifest_name(name)
-            && body.starts_with(b"\x1f\x8b")
-            && sha256_fast_hex(json) == name[..64],
-    )
+    }))
+    .unwrap_or(-1)
 }
 
 /// Compare the actual inflater output and complete-member accounting. A trailer
@@ -12236,15 +12610,21 @@ pub unsafe extern "C" fn nntmux_verification_manifest_consumes(
     consumed: usize,
     status: i32,
 ) -> i32 {
-    let (Some(json), Some(inflated)) = (unsafe {
-        (
-            verification_input(json, json_len),
-            verification_input(inflated, inflated_len),
-        )
-    }) else {
-        return -1;
-    };
-    i32::from(status == 1 && consumed == body_len && json == inflated)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(json, json_len, true) || !nfo_abi_range(inflated, inflated_len, true) {
+            return -1;
+        }
+        let (Some(json), Some(inflated)) = (unsafe {
+            (
+                verification_input(json, json_len),
+                verification_input(inflated, inflated_len),
+            )
+        }) else {
+            return -1;
+        };
+        i32::from(status == 1 && consumed == body_len && json == inflated)
+    }))
+    .unwrap_or(-1)
 }
 
 /// Emit the existing ordered PHP key list, including duplicates and the size
@@ -12267,56 +12647,69 @@ pub unsafe extern "C" fn nntmux_verification_publication_keys(
     out: *mut u8,
     cap: usize,
 ) -> isize {
-    let (Some(fp), Some(name_data), Some(search_data)) = (unsafe {
-        (
-            verification_input(fingerprint, fingerprint_len),
-            verification_input(name, name_len),
-            verification_input(search, search_len),
-        )
-    }) else {
-        return -1;
-    };
-    if !(out.is_null() && cap == 0 || yenc_valid_range(out as usize, cap))
-        || [
-            (fingerprint, fingerprint_len),
-            (name, name_len),
-            (search, search_len),
-        ]
-        .iter()
-        .any(|&(ptr, len)| yenc_ranges_overlap(ptr as usize, len, out as usize, cap))
-    {
-        return -1;
-    }
-    let mut keys = Vec::with_capacity(5);
-    if !fp.is_empty() {
-        let mut key = b"fingerprint:".to_vec();
-        key.extend(fp.iter().map(u8::to_ascii_lowercase));
-        keys.push(key);
-    }
-    if predb > 0 {
-        keys.push(format!("predb:{predb}").into_bytes());
-    }
-    if has_search != 0 {
-        keys.push([b"name:", search_data].concat());
-    }
-    if has_name != 0 {
-        keys.push([b"name:", name_data].concat());
-    }
-    if size > 0 {
-        keys.push(format!("size:{size}").into_bytes());
-    }
-    let mut cursor = unsafe { OutCursor::new(out, cap) };
-    cursor.extend(b"a:");
-    write_usize_decimal(&mut cursor, keys.len());
-    cursor.extend(b":{");
-    for (index, key) in keys.iter().enumerate() {
-        cursor.extend(b"i:");
-        write_usize_decimal(&mut cursor, index);
-        cursor.extend(b";");
-        write_yenc_serialized_string(&mut cursor, key, false);
-    }
-    cursor.push(b'}');
-    cursor.finish()
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(fingerprint, fingerprint_len, true)
+            || !nfo_abi_range(name, name_len, true)
+            || !nfo_abi_range(search, search_len, true)
+            || !nfo_abi_range(out, cap, true)
+            || yenc_ranges_overlap(fingerprint as usize, fingerprint_len, out as usize, cap)
+            || yenc_ranges_overlap(name as usize, name_len, out as usize, cap)
+            || yenc_ranges_overlap(search as usize, search_len, out as usize, cap)
+        {
+            return -1;
+        }
+        let (Some(fp), Some(name_data), Some(search_data)) = (unsafe {
+            (
+                verification_input(fingerprint, fingerprint_len),
+                verification_input(name, name_len),
+                verification_input(search, search_len),
+            )
+        }) else {
+            return -1;
+        };
+        if !(out.is_null() && cap == 0 || yenc_valid_range(out as usize, cap))
+            || [
+                (fingerprint, fingerprint_len),
+                (name, name_len),
+                (search, search_len),
+            ]
+            .iter()
+            .any(|&(ptr, len)| yenc_ranges_overlap(ptr as usize, len, out as usize, cap))
+        {
+            return -1;
+        }
+        let mut keys = Vec::with_capacity(5);
+        if !fp.is_empty() {
+            let mut key = b"fingerprint:".to_vec();
+            key.extend(fp.iter().map(u8::to_ascii_lowercase));
+            keys.push(key);
+        }
+        if predb > 0 {
+            keys.push(format!("predb:{predb}").into_bytes());
+        }
+        if has_search != 0 {
+            keys.push([b"name:", search_data].concat());
+        }
+        if has_name != 0 {
+            keys.push([b"name:", name_data].concat());
+        }
+        if size > 0 {
+            keys.push(format!("size:{size}").into_bytes());
+        }
+        let mut cursor = unsafe { OutCursor::new(out, cap) };
+        cursor.extend(b"a:");
+        write_usize_decimal(&mut cursor, keys.len());
+        cursor.extend(b":{");
+        for (index, key) in keys.iter().enumerate() {
+            cursor.extend(b"i:");
+            write_usize_decimal(&mut cursor, index);
+            cursor.extend(b";");
+            write_yenc_serialized_string(&mut cursor, key, false);
+        }
+        cursor.push(b'}');
+        cursor.finish()
+    }))
+    .unwrap_or(-1)
 }
 
 /// # Safety
@@ -12326,9 +12719,15 @@ pub unsafe extern "C" fn nntmux_verification_publication_stripe(
     input: *const u8,
     len: usize,
 ) -> i32 {
-    unsafe { verification_input(input, len) }
-        .map(|key| (crc32_ieee(key) % 1024) as i32)
-        .unwrap_or(-1)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(input, len, true) {
+            return -1;
+        }
+        unsafe { verification_input(input, len) }
+            .map(|key| (crc32_ieee(key) % 1024) as i32)
+            .unwrap_or(-1)
+    }))
+    .unwrap_or(-1)
 }
 
 fn verification_article_framing(raw: &[u8]) -> i32 {
@@ -12395,9 +12794,15 @@ fn verification_article_framing(raw: &[u8]) -> i32 {
 /// Input must be readable for `len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nntmux_verification_article_framing(input: *const u8, len: usize) -> i32 {
-    unsafe { verification_input(input, len) }
-        .map(verification_article_framing)
-        .unwrap_or(-1)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(input, len, true) {
+            return -1;
+        }
+        unsafe { verification_input(input, len) }
+            .map(verification_article_framing)
+            .unwrap_or(-1)
+    }))
+    .unwrap_or(-1)
 }
 
 fn verification_subject_par2(subject: &[u8]) -> bool {
@@ -12419,40 +12824,46 @@ pub unsafe extern "C" fn nntmux_verification_collection_inspect(
     len: usize,
     mode: u8,
 ) -> i32 {
-    let Some(mut packed) = (unsafe { verification_input(input, len) }) else {
-        return -1;
-    };
-    if mode > 1 {
-        return -1;
-    }
-    let mut result = mode == 0;
-    while !packed.is_empty() {
-        let Some(length) = packed.get(..4) else {
-            return -1;
-        };
-        let length = u32::from_le_bytes(length.try_into().unwrap()) as usize;
-        packed = &packed[4..];
-        let Some(value) = packed.get(..length) else {
-            return -1;
-        };
-        // Locale-specific PCRE tables may recognize non-ASCII whitespace. Let
-        // PHP retain that contract instead of guessing a table in Rust.
-        if mode == 1 && !value.is_ascii() {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(input, len, true) {
             return -1;
         }
-        let parity = if mode == 0 {
-            value.len() >= 5 && value[value.len() - 5..].eq_ignore_ascii_case(b".par2")
-        } else {
-            verification_subject_par2(value)
+        let Some(mut packed) = (unsafe { verification_input(input, len) }) else {
+            return -1;
         };
-        if mode == 0 {
-            result &= parity;
-        } else {
-            result |= !parity;
+        if mode > 1 {
+            return -1;
         }
-        packed = &packed[length..];
-    }
-    i32::from(result)
+        let mut result = mode == 0;
+        while !packed.is_empty() {
+            let Some(length) = packed.get(..4) else {
+                return -1;
+            };
+            let length = u32::from_le_bytes(length.try_into().unwrap()) as usize;
+            packed = &packed[4..];
+            let Some(value) = packed.get(..length) else {
+                return -1;
+            };
+            // Locale-specific PCRE tables may recognize non-ASCII whitespace. Let
+            // PHP retain that contract instead of guessing a table in Rust.
+            if mode == 1 && !value.is_ascii() {
+                return -1;
+            }
+            let parity = if mode == 0 {
+                value.len() >= 5 && value[value.len() - 5..].eq_ignore_ascii_case(b".par2")
+            } else {
+                verification_subject_par2(value)
+            };
+            if mode == 0 {
+                result &= parity;
+            } else {
+                result |= !parity;
+            }
+            packed = &packed[length..];
+        }
+        i32::from(result)
+    }))
+    .unwrap_or(-1)
 }
 
 #[cfg(test)]
@@ -12547,29 +12958,32 @@ pub extern "C" fn nntmux_payload_article_identity(
     body_total: i64,
     identity_matches: u8,
 ) -> i32 {
-    if part != number {
-        return 1;
-    }
-    let mut total = total;
-    if has_article_total != 0 {
-        if has_body_total != 0 && article_total != body_total {
-            return 2;
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if part != number {
+            return 1;
         }
-        if inferred == 0 && article_total != total {
-            return 3;
+        let mut total = total;
+        if has_article_total != 0 {
+            if has_body_total != 0 && article_total != body_total {
+                return 2;
+            }
+            if inferred == 0 && article_total != total {
+                return 3;
+            }
+            if inferred != 0 && article_total < observed {
+                return 4;
+            }
+            total = article_total;
         }
-        if inferred != 0 && article_total < observed {
-            return 4;
+        if part > total {
+            return 5;
         }
-        total = article_total;
-    }
-    if part > total {
-        return 5;
-    }
-    if identity_matches == 0 {
-        return 6;
-    }
-    0
+        if identity_matches == 0 {
+            return 6;
+        }
+        0
+    }))
+    .unwrap_or(-1)
 }
 
 fn payload_subject_name(subject: &[u8]) -> Option<&[u8]> {
@@ -12610,41 +13024,56 @@ pub unsafe extern "C" fn nntmux_payload_subject_name(
     out: *mut u8,
     cap: usize,
 ) -> isize {
-    let Some(subject) = (unsafe { verification_input(input, len) }) else {
-        return -1;
-    };
-    if !subject.is_ascii()
-        || !(out.is_null() && cap == 0 || yenc_valid_range(out as usize, cap))
-        || yenc_ranges_overlap(input as usize, len, out as usize, cap)
-    {
-        return -1;
-    }
-    let Some(name) = payload_subject_name(subject) else {
-        return 0;
-    };
-    let mut cursor = unsafe { OutCursor::new(out, cap) };
-    cursor.extend(name);
-    cursor.finish()
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(input, len, true)
+            || !nfo_abi_range(out, cap, true)
+            || yenc_ranges_overlap(input as usize, len, out as usize, cap)
+        {
+            return -1;
+        }
+        let Some(subject) = (unsafe { verification_input(input, len) }) else {
+            return -1;
+        };
+        if !subject.is_ascii()
+            || !(out.is_null() && cap == 0 || yenc_valid_range(out as usize, cap))
+            || yenc_ranges_overlap(input as usize, len, out as usize, cap)
+        {
+            return -1;
+        }
+        let Some(name) = payload_subject_name(subject) else {
+            return 0;
+        };
+        let mut cursor = unsafe { OutCursor::new(out, cap) };
+        cursor.extend(name);
+        cursor.finish()
+    }))
+    .unwrap_or(-1)
 }
 
 /// # Safety
 /// Input must be readable for len bytes. High bytes defer basename locale rules to PHP.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nntmux_payload_par2_filename(input: *const u8, len: usize) -> i32 {
-    let Some(name) = (unsafe { verification_input(input, len) }) else {
-        return -1;
-    };
-    if !name.is_ascii() {
-        return -1;
-    }
-    i32::from(
-        !name.is_empty()
-            && name.len() <= 200
-            && !matches!(name[0], b'.' | b'-')
-            && !name
-                .iter()
-                .any(|b| *b < 32 || matches!(b, 127 | b'/' | b'\\')),
-    )
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(input, len, true) {
+            return -1;
+        }
+        let Some(name) = (unsafe { verification_input(input, len) }) else {
+            return -1;
+        };
+        if !name.is_ascii() {
+            return -1;
+        }
+        i32::from(
+            !name.is_empty()
+                && name.len() <= 200
+                && !matches!(name[0], b'.' | b'-')
+                && !name
+                    .iter()
+                    .any(|b| *b < 32 || matches!(b, 127 | b'/' | b'\\')),
+        )
+    }))
+    .unwrap_or(-1)
 }
 
 /// # Safety
@@ -12659,17 +13088,20 @@ pub extern "C" fn nntmux_spot_article_dimensions(
     header_bytes: i64,
     total: i64,
 ) -> i32 {
-    let Some(end) = offset.checked_add(length) else {
-        return -1;
-    };
-    i32::from(
-        part == number
-            && size >= 1
-            && length <= header_bytes
-            && end <= size
-            && (part != 1 || offset == 0)
-            && (part != total || end == size),
-    )
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(end) = offset.checked_add(length) else {
+            return -1;
+        };
+        i32::from(
+            part == number
+                && size >= 1
+                && length <= header_bytes
+                && end <= size
+                && (part != 1 || offset == 0)
+                && (part != total || end == size),
+        )
+    }))
+    .unwrap_or(-1)
 }
 
 /// Reuse the established deterministic planner and strengthen its ABI pointer checks.
@@ -12687,27 +13119,38 @@ pub unsafe extern "C" fn nntmux_verification_sample_plan(
     out: *mut u8,
     cap: usize,
 ) -> isize {
-    if !(yenc_valid_range(input as usize, len)
-        && yenc_valid_range(identity as usize, identity_len)
-        && (out.is_null() && cap == 0 || yenc_valid_range(out as usize, cap)))
-        || yenc_ranges_overlap(input as usize, len, out as usize, cap)
-        || yenc_ranges_overlap(identity as usize, identity_len, out as usize, cap)
-    {
-        return -1;
-    }
-    unsafe {
-        crate::metadata::candidate_inventory::nntmux_spot_check_plan_packed(
-            input,
-            len,
-            identity,
-            identity_len,
-            maximum_articles,
-            maximum_bytes,
-            article_limit,
-            out,
-            cap,
-        )
-    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(input, len, true)
+            || !nfo_abi_range(identity, identity_len, true)
+            || !nfo_abi_range(out, cap, true)
+            || yenc_ranges_overlap(input as usize, len, out as usize, cap)
+            || yenc_ranges_overlap(identity as usize, identity_len, out as usize, cap)
+        {
+            return -1;
+        }
+        if !(yenc_valid_range(input as usize, len)
+            && yenc_valid_range(identity as usize, identity_len)
+            && (out.is_null() && cap == 0 || yenc_valid_range(out as usize, cap)))
+            || yenc_ranges_overlap(input as usize, len, out as usize, cap)
+            || yenc_ranges_overlap(identity as usize, identity_len, out as usize, cap)
+        {
+            return -1;
+        }
+        unsafe {
+            crate::metadata::candidate_inventory::nntmux_spot_check_plan_packed(
+                input,
+                len,
+                identity,
+                identity_len,
+                maximum_articles,
+                maximum_bytes,
+                article_limit,
+                out,
+                cap,
+            )
+        }
+    }))
+    .unwrap_or(-1)
 }
 
 #[cfg(test)]
@@ -12793,44 +13236,50 @@ pub unsafe extern "C" fn nntmux_upload_staging_filename(
     extension: *const u8,
     extension_len: usize,
 ) -> i32 {
-    let (Some(name), Some(extension)) = (unsafe {
-        (
-            verification_input(name, name_len),
-            verification_input(extension, extension_len),
-        )
-    }) else {
-        return -1;
-    };
-    if name.is_empty()
-        || name == b"."
-        || name == b".."
-        || name.iter().any(|b| matches!(b, 0 | b'/' | b'\\'))
-    {
-        return 1;
-    }
-    // PHP's pathinfo is locale-aware. Decline this case rather than assuming
-    // how the active locale handles non-ASCII or malformed multibyte bytes.
-    if !name.is_ascii() || !extension.is_ascii() {
-        return -1;
-    }
-    let (basename, actual_extension) = match name.iter().rposition(|b| *b == b'.') {
-        Some(dot) => (&name[..dot], &name[dot + 1..]),
-        None => (name, &b""[..]),
-    };
-    let blank = basename
-        .iter()
-        .all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 11));
-    if blank
-        || actual_extension.len() != extension.len()
-        || !actual_extension
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(name, name_len, true) || !nfo_abi_range(extension, extension_len, true) {
+            return -1;
+        }
+        let (Some(name), Some(extension)) = (unsafe {
+            (
+                verification_input(name, name_len),
+                verification_input(extension, extension_len),
+            )
+        }) else {
+            return -1;
+        };
+        if name.is_empty()
+            || name == b"."
+            || name == b".."
+            || name.iter().any(|b| matches!(b, 0 | b'/' | b'\\'))
+        {
+            return 1;
+        }
+        // PHP's pathinfo is locale-aware. Decline this case rather than assuming
+        // how the active locale handles non-ASCII or malformed multibyte bytes.
+        if !name.is_ascii() || !extension.is_ascii() {
+            return -1;
+        }
+        let (basename, actual_extension) = match name.iter().rposition(|b| *b == b'.') {
+            Some(dot) => (&name[..dot], &name[dot + 1..]),
+            None => (name, &b""[..]),
+        };
+        let blank = basename
             .iter()
-            .zip(extension)
-            .all(|(a, b)| a.to_ascii_lowercase() == *b)
-    {
-        2
-    } else {
-        0
-    }
+            .all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 11));
+        if blank
+            || actual_extension.len() != extension.len()
+            || !actual_extension
+                .iter()
+                .zip(extension)
+                .all(|(a, b)| a.to_ascii_lowercase() == *b)
+        {
+            2
+        } else {
+            0
+        }
+    }))
+    .unwrap_or(-1)
 }
 
 /// Match only the existing bytes: no gzip inflation or BOM removal is implied.
@@ -12843,14 +13292,20 @@ pub unsafe extern "C" fn nntmux_upload_staging_prefix(
     data_len: usize,
     kind: u32,
 ) -> i32 {
-    let Some(data) = (unsafe { verification_input(data, data_len) }) else {
-        return -1;
-    };
-    match kind {
-        0 => i32::from(data.starts_with(b"\x1f\x8b")),
-        1 => i32::from(data.starts_with(b"\xef\xbb\xbf")),
-        _ => -1,
-    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(data, data_len, true) {
+            return -1;
+        }
+        let Some(data) = (unsafe { verification_input(data, data_len) }) else {
+            return -1;
+        };
+        match kind {
+            0 => i32::from(data.starts_with(b"\x1f\x8b")),
+            1 => i32::from(data.starts_with(b"\xef\xbb\xbf")),
+            _ => -1,
+        }
+    }))
+    .unwrap_or(-1)
 }
 
 #[cfg(test)]
@@ -13180,20 +13635,29 @@ pub unsafe extern "C" fn nntmux_verification_outbox_normalize(
     out: *mut u8,
     cap: usize,
 ) -> isize {
-    let Some(input_bytes) = (unsafe { verification_input(input, len) }) else {
-        return -1;
-    };
-    if !(out.is_null() && cap == 0 || yenc_valid_range(out as usize, cap))
-        || yenc_ranges_overlap(input as usize, len, out as usize, cap)
-    {
-        return -1;
-    }
-    let Some(bytes) = verification_outbox_normalize(input_bytes) else {
-        return -1;
-    };
-    let mut cursor = unsafe { OutCursor::new(out, cap) };
-    cursor.extend(&bytes);
-    cursor.finish()
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(input, len, true)
+            || !nfo_abi_range(out, cap, true)
+            || yenc_ranges_overlap(input as usize, len, out as usize, cap)
+        {
+            return -1;
+        }
+        let Some(input_bytes) = (unsafe { verification_input(input, len) }) else {
+            return -1;
+        };
+        if !(out.is_null() && cap == 0 || yenc_valid_range(out as usize, cap))
+            || yenc_ranges_overlap(input as usize, len, out as usize, cap)
+        {
+            return -1;
+        }
+        let Some(bytes) = verification_outbox_normalize(input_bytes) else {
+            return -1;
+        };
+        let mut cursor = unsafe { OutCursor::new(out, cap) };
+        cursor.extend(&bytes);
+        cursor.finish()
+    }))
+    .unwrap_or(-1)
 }
 
 /// Fixed 88-byte native-endian record: two i64 counters, total/max f64, seven
@@ -13210,74 +13674,86 @@ pub unsafe extern "C" fn nntmux_verification_diagnostic_phase(
     out: *mut u8,
     cap: usize,
 ) -> isize {
-    let Some(bytes) = (unsafe { verification_input(input, len) }) else {
-        return -1;
-    };
-    if len != 88
-        || failed > 1
-        || !(out.is_null() && cap == 0 || yenc_valid_range(out as usize, cap))
-        || yenc_ranges_overlap(input as usize, len, out as usize, cap)
-    {
-        return -1;
-    }
-    let mut result = [0u8; 88];
-    result.copy_from_slice(bytes);
-    let mut counts = [0i64; 9];
-    for (index, count) in counts.iter_mut().enumerate() {
-        let offset = if index < 2 {
-            index * 8
-        } else {
-            (index + 2) * 8
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(input, len, true)
+            || !nfo_abi_range(out, cap, true)
+            || yenc_ranges_overlap(input as usize, len, out as usize, cap)
+        {
+            return -1;
+        }
+        let Some(bytes) = (unsafe { verification_input(input, len) }) else {
+            return -1;
         };
-        *count = i64::from_ne_bytes(bytes[offset..offset + 8].try_into().unwrap());
-    }
-    let bucket = [0.1, 1.0, 10.0, 100.0, 1000.0, 10000.0]
-        .iter()
-        .position(|bound| milliseconds <= *bound)
-        .unwrap_or(6);
-    let Some(count) = counts[0].checked_add(1) else {
-        return -1;
-    };
-    counts[0] = count;
-    let Some(count) = counts[1].checked_add(i64::from(failed)) else {
-        return -1;
-    };
-    counts[1] = count;
-    let Some(count) = counts[bucket + 2].checked_add(1) else {
-        return -1;
-    };
-    counts[bucket + 2] = count;
-    for (index, count) in counts.iter().enumerate() {
-        let offset = if index < 2 {
-            index * 8
-        } else {
-            (index + 2) * 8
+        if len != 88
+            || failed > 1
+            || !(out.is_null() && cap == 0 || yenc_valid_range(out as usize, cap))
+            || yenc_ranges_overlap(input as usize, len, out as usize, cap)
+        {
+            return -1;
+        }
+        let mut result = [0u8; 88];
+        result.copy_from_slice(bytes);
+        let mut counts = [0i64; 9];
+        for (index, count) in counts.iter_mut().enumerate() {
+            let offset = if index < 2 {
+                index * 8
+            } else {
+                (index + 2) * 8
+            };
+            *count = i64::from_ne_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        }
+        let bucket = [0.1, 1.0, 10.0, 100.0, 1000.0, 10000.0]
+            .iter()
+            .position(|bound| milliseconds <= *bound)
+            .unwrap_or(6);
+        let Some(count) = counts[0].checked_add(1) else {
+            return -1;
         };
-        result[offset..offset + 8].copy_from_slice(&count.to_ne_bytes());
-    }
-    let total = f64::from_ne_bytes(bytes[16..24].try_into().unwrap()) + milliseconds;
-    let old_max = f64::from_ne_bytes(bytes[24..32].try_into().unwrap());
-    // PHP max keeps the first equal value, but selects the second for NaN.
-    let maximum = if old_max >= milliseconds {
-        old_max
-    } else {
-        milliseconds
-    };
-    result[16..24].copy_from_slice(&total.to_ne_bytes());
-    result[24..32].copy_from_slice(&maximum.to_ne_bytes());
-    let mut cursor = unsafe { OutCursor::new(out, cap) };
-    cursor.extend(&result);
-    cursor.finish()
+        counts[0] = count;
+        let Some(count) = counts[1].checked_add(i64::from(failed)) else {
+            return -1;
+        };
+        counts[1] = count;
+        let Some(count) = counts[bucket + 2].checked_add(1) else {
+            return -1;
+        };
+        counts[bucket + 2] = count;
+        for (index, count) in counts.iter().enumerate() {
+            let offset = if index < 2 {
+                index * 8
+            } else {
+                (index + 2) * 8
+            };
+            result[offset..offset + 8].copy_from_slice(&count.to_ne_bytes());
+        }
+        let total = f64::from_ne_bytes(bytes[16..24].try_into().unwrap()) + milliseconds;
+        let old_max = f64::from_ne_bytes(bytes[24..32].try_into().unwrap());
+        // PHP max keeps the first equal value, but selects the second for NaN.
+        let maximum = if old_max >= milliseconds {
+            old_max
+        } else {
+            milliseconds
+        };
+        result[16..24].copy_from_slice(&total.to_ne_bytes());
+        result[24..32].copy_from_slice(&maximum.to_ne_bytes());
+        let mut cursor = unsafe { OutCursor::new(out, cap) };
+        cursor.extend(&result);
+        cursor.finish()
+    }))
+    .unwrap_or(-1)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nntmux_verification_diagnostic_size(files: u8, size: i64) -> i32 {
-    let bounds = match files {
-        0 => [4096, 65536, 1048576, 16777216],
-        1 => [1, 10, 100, 1000],
-        _ => return -1,
-    };
-    bounds.iter().position(|bound| size <= *bound).unwrap_or(4) as i32
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let bounds = match files {
+            0 => [4096, 65536, 1048576, 16777216],
+            1 => [1, 10, 100, 1000],
+            _ => return -1,
+        };
+        bounds.iter().position(|bound| size <= *bound).unwrap_or(4) as i32
+    }))
+    .unwrap_or(-1)
 }
 
 #[unsafe(no_mangle)]
@@ -13290,13 +13766,16 @@ pub extern "C" fn nntmux_verification_diagnostic_projection(
     exhausted: u8,
     error: u8,
 ) -> i32 {
-    if exhausted > 1 || error > 1 {
-        return -1;
-    }
-    i32::from(inspected >= limit)
-        | (i32::from(finished >= deadline) << 1)
-        | (i32::from(exhausted != 0 && uninspected == 0) << 2)
-        | (i32::from(error != 0) << 3)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if exhausted > 1 || error > 1 {
+            return -1;
+        }
+        i32::from(inspected >= limit)
+            | (i32::from(finished >= deadline) << 1)
+            | (i32::from(exhausted != 0 && uninspected == 0) << 2)
+            | (i32::from(error != 0) << 3)
+    }))
+    .unwrap_or(-1)
 }
 
 // Wave 15: computations only. PHP retains filesystem fencing and DB session ownership.
@@ -13398,7 +13877,15 @@ pub unsafe extern "C" fn nntmux_verification_lock_key(
     out: *mut u8,
     cap: usize,
 ) -> isize {
-    std::panic::catch_unwind(|| {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(scope, scope_len, true)
+            || !nfo_abi_range(name, name_len, true)
+            || !nfo_abi_range(out, cap, true)
+            || yenc_ranges_overlap(scope as usize, scope_len, out as usize, cap)
+            || yenc_ranges_overlap(name as usize, name_len, out as usize, cap)
+        {
+            return -1;
+        }
         let Some(scope_bytes) = (unsafe { wave15_input(scope, scope_len) }) else {
             return -1;
         };
@@ -13418,7 +13905,7 @@ pub unsafe extern "C" fn nntmux_verification_lock_key(
                 cap,
             )
         }
-    })
+    }))
     .unwrap_or(-1)
 }
 
@@ -13426,11 +13913,16 @@ pub unsafe extern "C" fn nntmux_verification_lock_key(
 /// Input must be readable for len bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nntmux_verification_members(group: *const u8, len: usize) -> i64 {
-    std::panic::catch_unwind(|| match unsafe { wave15_input(group, len) } {
-        Some(b"worker") => 512,
-        Some(b"reset") => 64,
-        _ => -1,
-    })
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(group, len, true) {
+            return -1;
+        }
+        match unsafe { wave15_input(group, len) } {
+            Some(b"worker") => 512,
+            Some(b"reset") => 64,
+            _ => -1,
+        }
+    }))
     .unwrap_or(-1)
 }
 
@@ -13444,7 +13936,13 @@ pub unsafe extern "C" fn nntmux_verification_forwarder_lock_name(
     out: *mut u8,
     cap: usize,
 ) -> isize {
-    std::panic::catch_unwind(|| {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(host, len, true)
+            || !nfo_abi_range(out, cap, true)
+            || yenc_ranges_overlap(host as usize, len, out as usize, cap)
+        {
+            return -1;
+        }
         let Some(bytes) = (unsafe { wave15_input(host, len) }) else {
             return -1;
         };
@@ -13453,26 +13951,29 @@ pub unsafe extern "C" fn nntmux_verification_forwarder_lock_name(
             wave15_digest_prefix(bytes)
         );
         unsafe { wave15_output(&[(host as usize, len)], result.as_bytes(), out, cap) }
-    })
+    }))
     .unwrap_or(-1)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nntmux_verification_slots(configured: i64) -> i64 {
-    std::panic::catch_unwind(|| configured.clamp(1, 64)).unwrap_or(-1)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| configured.clamp(1, 64))).unwrap_or(-1)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn nntmux_verification_first_slot(slots: i64, offset: i64) -> i64 {
-    std::panic::catch_unwind(|| offset.clamp(0, 256 - slots.clamp(1, 64)) + 1).unwrap_or(-1)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        offset.clamp(0, 256 - slots.clamp(1, 64)) + 1
+    }))
+    .unwrap_or(-1)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn nntmux_verification_last_slot(first: i64, slots: i64) -> i64 {
-    std::panic::catch_unwind(|| {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         first
             .checked_add(slots)
             .and_then(|v| v.checked_sub(1))
             .unwrap_or(-1)
-    })
+    }))
     .unwrap_or(-1)
 }
 #[unsafe(no_mangle)]
@@ -13482,7 +13983,7 @@ pub extern "C" fn nntmux_verification_protects(
     candidate: i32,
     held: i32,
 ) -> i32 {
-    std::panic::catch_unwind(|| {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if [exclusive, global, candidate, held]
             .iter()
             .any(|v| ![0, 1].contains(v))
@@ -13497,18 +13998,18 @@ pub extern "C" fn nntmux_verification_protects(
                     candidate == 1
                 },
         )
-    })
+    }))
     .unwrap_or(-1)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn nntmux_nzb_claim_ttl(timeout: i64) -> i64 {
-    std::panic::catch_unwind(|| {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if timeout <= 150 {
             300
         } else {
             timeout.checked_mul(2).unwrap_or(-1)
         }
-    })
+    }))
     .unwrap_or(-1)
 }
 
@@ -13522,7 +14023,13 @@ pub unsafe extern "C" fn nntmux_nzb_selectable_columns(
     out: *mut u8,
     cap: usize,
 ) -> isize {
-    std::panic::catch_unwind(|| {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(input, len, true)
+            || !nfo_abi_range(out, cap, true)
+            || yenc_ranges_overlap(input as usize, len, out as usize, cap)
+        {
+            return -1;
+        }
         let Some(bytes) = (unsafe { wave15_input(input, len) }) else {
             return -1;
         };
@@ -13554,7 +14061,7 @@ pub unsafe extern "C" fn nntmux_nzb_selectable_columns(
             }
         }
         unsafe { wave15_output(&[(input as usize, len)], &result, out, cap) }
-    })
+    }))
     .unwrap_or(-1)
 }
 
@@ -13568,37 +14075,46 @@ pub unsafe extern "C" fn nntmux_nzb_id_order(
     out: *mut u8,
     cap: usize,
 ) -> isize {
-    use std::fmt::Write;
-    std::panic::catch_unwind(|| {
-        let Some(bytes) = (unsafe { wave15_input(input, len) }) else {
-            return -1;
-        };
-        if len % 8 != 0 || ![0, 1].contains(&sqlite) {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(input, len, true)
+            || !nfo_abi_range(out, cap, true)
+            || yenc_ranges_overlap(input as usize, len, out as usize, cap)
+        {
             return -1;
         }
-        let mut result = if sqlite == 1 {
-            "CASE id ".to_string()
-        } else {
-            "FIELD(id, ".to_string()
-        };
-        for (position, part) in bytes.chunks_exact(8).enumerate() {
-            let id = i64::from_ne_bytes(part.try_into().unwrap());
-            if position > 0 {
-                result.push(if sqlite == 1 { ' ' } else { ',' });
+        use std::fmt::Write;
+        std::panic::catch_unwind(|| {
+            let Some(bytes) = (unsafe { wave15_input(input, len) }) else {
+                return -1;
+            };
+            if len % 8 != 0 || ![0, 1].contains(&sqlite) {
+                return -1;
+            }
+            let mut result = if sqlite == 1 {
+                "CASE id ".to_string()
+            } else {
+                "FIELD(id, ".to_string()
+            };
+            for (position, part) in bytes.chunks_exact(8).enumerate() {
+                let id = i64::from_ne_bytes(part.try_into().unwrap());
+                if position > 0 {
+                    result.push(if sqlite == 1 { ' ' } else { ',' });
+                }
+                if sqlite == 1 {
+                    let _ = write!(result, "WHEN {id} THEN {position}");
+                } else {
+                    let _ = write!(result, "{id}");
+                }
             }
             if sqlite == 1 {
-                let _ = write!(result, "WHEN {id} THEN {position}");
+                let _ = write!(result, " ELSE {} END", len / 8);
             } else {
-                let _ = write!(result, "{id}");
+                result.push(')');
             }
-        }
-        if sqlite == 1 {
-            let _ = write!(result, " ELSE {} END", len / 8);
-        } else {
-            result.push(')');
-        }
-        unsafe { wave15_output(&[(input as usize, len)], result.as_bytes(), out, cap) }
-    })
+            unsafe { wave15_output(&[(input as usize, len)], result.as_bytes(), out, cap) }
+        })
+        .unwrap_or(-1)
+    }))
     .unwrap_or(-1)
 }
 
@@ -13611,7 +14127,10 @@ pub unsafe extern "C" fn nntmux_wave15_outbox_folder(
     mode: u32,
     except: i64,
 ) -> i32 {
-    std::panic::catch_unwind(|| {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(input, len, true) {
+            return -1;
+        }
         let Some(bytes) = (unsafe { wave15_input(input, len) }) else {
             return -1;
         };
@@ -13631,7 +14150,7 @@ pub unsafe extern "C" fn nntmux_wave15_outbox_folder(
             }
             _ => -1,
         }
-    })
+    }))
     .unwrap_or(-1)
 }
 #[unsafe(no_mangle)]
@@ -13643,11 +14162,11 @@ pub extern "C" fn nntmux_wave15_outbox_state(
     now: f64,
     max_age: f64,
 ) -> i32 {
-    std::panic::catch_unwind(|| {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         i32::from(not_before <= now)
             | (i32::from(now - enqueued > max_age) << 1)
             | (i32::from(attempts > 0 || deferrals > 0) << 2)
-    })
+    }))
     .unwrap_or(-1)
 }
 
@@ -13660,7 +14179,13 @@ pub unsafe extern "C" fn nntmux_wave15_outbox_normalize(
     out: *mut u8,
     cap: usize,
 ) -> isize {
-    std::panic::catch_unwind(|| {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(input, len, true)
+            || !nfo_abi_range(out, cap, true)
+            || yenc_ranges_overlap(input as usize, len, out as usize, cap)
+        {
+            return -1;
+        }
         let Some(bytes) = (unsafe { wave15_input(input, len) }) else {
             return -1;
         };
@@ -13668,12 +14193,12 @@ pub unsafe extern "C" fn nntmux_wave15_outbox_normalize(
             return -1;
         };
         unsafe { wave15_output(&[(input as usize, len)], &result, out, cap) }
-    })
+    }))
     .unwrap_or(-1)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn nntmux_wave15_metadata_budget(budget: i64) -> i64 {
-    std::panic::catch_unwind(|| budget.max(1)).unwrap_or(-1)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| budget.max(1))).unwrap_or(-1)
 }
 /// # Safety
 /// Both hash ranges must be readable for their lengths.
@@ -13686,7 +14211,10 @@ pub unsafe extern "C" fn nntmux_wave15_raised_budget(
     old: i64,
     budget: i64,
 ) -> i32 {
-    std::panic::catch_unwind(|| {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(stored, stored_len, true) || !nfo_abi_range(current, current_len, true) {
+            return -1;
+        }
         let Some(left) = (unsafe { wave15_input(stored, stored_len) }) else {
             return -1;
         };
@@ -13694,7 +14222,7 @@ pub unsafe extern "C" fn nntmux_wave15_raised_budget(
             return -1;
         };
         i32::from(left == right && old < budget)
-    })
+    }))
     .unwrap_or(-1)
 }
 
@@ -14147,9 +14675,15 @@ macro_rules! w16_export {
             output: *mut u8,
             capacity: usize,
         ) -> isize {
-            std::panic::catch_unwind(|| unsafe {
-                w16_call($domain, operation, input, length, output, capacity)
-            })
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if !nfo_abi_range(input, length, true)
+                    || !nfo_abi_range(output, capacity, true)
+                    || yenc_ranges_overlap(input as usize, length, output as usize, capacity)
+                {
+                    return -1;
+                }
+                unsafe { w16_call($domain, operation, input, length, output, capacity) }
+            }))
             .unwrap_or(-1)
         }
     };
@@ -14394,7 +14928,13 @@ pub unsafe extern "C" fn nntmux_w17_nzb_xml_verification_timing(
     output: *mut u8,
     capacity: usize,
 ) -> isize {
-    std::panic::catch_unwind(|| {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(input, length, true)
+            || !nfo_abi_range(output, capacity, true)
+            || yenc_ranges_overlap(input as usize, length, output as usize, capacity)
+        {
+            return -1;
+        }
         // Validate length/address arithmetic and disjointness before any slice.
         if length > 64 * 1024 * 1024
             || !yenc_valid_range(input as usize, length)
@@ -14444,7 +14984,7 @@ pub unsafe extern "C" fn nntmux_w17_nzb_xml_verification_timing(
             std::ptr::copy_nonoverlapping(wire.as_ptr(), output, wire.len());
         }
         required
-    })
+    }))
     .unwrap_or(-1)
 }
 
@@ -14875,7 +15415,13 @@ pub unsafe extern "C" fn nntmux_w18_verification_metadata_fingerprint(
     output: *mut u8,
     capacity: usize,
 ) -> isize {
-    std::panic::catch_unwind(|| {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(input, length, true)
+            || !nfo_abi_range(output, capacity, true)
+            || yenc_ranges_overlap(input as usize, length, output as usize, capacity)
+        {
+            return -1;
+        }
         // Check alignment, lengths, address ends and disjointness before making
         // any slice. u8 alignment is one, so word-unaligned byte buffers work.
         if input.is_null()
@@ -14942,7 +15488,7 @@ pub unsafe extern "C" fn nntmux_w18_verification_metadata_fingerprint(
             std::ptr::copy_nonoverlapping(wire.as_ptr(), output, wire.len());
         }
         required
-    })
+    }))
     .unwrap_or(-1)
 }
 
@@ -15345,5 +15891,567 @@ mod wave18_verification_metadata_fingerprint_tests {
             assert_eq!(w18_php_bool(&V::Float(value.to_vec())), Some(true));
         }
     }
+}
 
+// Wave 19 slice 19.2: pure value helpers. PHP owns I/O and lifecycle decisions.
+fn w19_nullable_int(value: &VerificationOutboxValue) -> Option<Option<i64>> {
+    match value {
+        VerificationOutboxValue::Null => Some(None),
+        VerificationOutboxValue::Int(n) => Some(Some(*n)),
+        _ => None,
+    }
+}
+
+fn w19_valid_span(begin: Option<i64>, end: Option<i64>, size: i64) -> bool {
+    matches!((begin, end), (Some(a), Some(b)) if a >= 1 && b >= a && b <= size)
+}
+
+fn w19_list(value: &VerificationOutboxValue) -> bool {
+    w16_entries(value).is_some_and(|entries| {
+        entries
+            .iter()
+            .enumerate()
+            .all(|(i, (key, _))| matches!(key, VerificationOutboxValue::Int(n) if *n == i as i64))
+    })
+}
+
+fn w19_field<'a>(
+    value: &'a VerificationOutboxValue,
+    key: &[u8],
+) -> Option<&'a VerificationOutboxValue> {
+    if let Ok(s) = std::str::from_utf8(key)
+        && let Ok(n) = s.parse::<i64>()
+        && n.to_string().as_bytes() == key
+    {
+        return w16_entries(value)?.iter().find_map(|(k, v)| match k {
+            VerificationOutboxValue::Int(k) if *k == n => Some(v),
+            _ => None,
+        });
+    }
+    value.field(key)
+}
+
+fn w19_cursor_id(value: &VerificationOutboxValue) -> Option<Option<i64>> {
+    use VerificationOutboxValue as V;
+    match value {
+        V::Int(n) => Some(Some(*n)),
+        V::Float(_) => {
+            let n = w17_number(value)?;
+            // Decline non-finite or out-of-range casts; PHP's conversion owns that behavior.
+            if n.is_finite() && n >= i64::MIN as f64 && n < -(i64::MIN as f64) {
+                Some(Some(n as i64))
+            } else {
+                None
+            }
+        }
+        V::Bytes(bytes) => {
+            let trim_ws = |b: &u8| matches!(*b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c);
+            let start = bytes.iter().position(|b| !trim_ws(b)).unwrap_or(bytes.len());
+            let end = bytes
+                .iter()
+                .rposition(|b| !trim_ws(b))
+                .map_or(start, |i| i + 1);
+            let trimmed = &bytes[start..end];
+            if trimmed.is_empty()
+                || !trimmed.iter().any(u8::is_ascii_digit)
+                || trimmed
+                    .iter()
+                    .any(|c| !c.is_ascii_digit() && !matches!(c, b'+' | b'-' | b'.' | b'e' | b'E'))
+            {
+                return Some(None);
+            }
+            let text = std::str::from_utf8(trimmed).ok()?;
+            if !trimmed.iter().any(|c| matches!(c, b'.' | b'e' | b'E')) {
+                let digits_slice = trimmed
+                    .strip_prefix(b"+")
+                    .or_else(|| trimmed.strip_prefix(b"-"))
+                    .unwrap_or(trimmed);
+                if digits_slice.is_empty() || !digits_slice.iter().all(u8::is_ascii_digit) {
+                    return Some(None);
+                }
+                // Valid integer string: if it fits in i64, return Some(Some(n)); if it overflows i64, decline to PHP.
+                return text.parse::<i64>().ok().map(Some);
+            }
+            let Ok(n) = text.parse::<f64>() else {
+                return Some(None);
+            };
+            let max_exact = (1i64 << 53) as f64;
+            if n.is_finite() && (-max_exact..=max_exact).contains(&n) {
+                Some(Some(n as i64))
+            } else {
+                None
+            }
+        }
+        _ => Some(None),
+    }
+}
+
+fn w19_compute(op: u32, args: &[VerificationOutboxValue]) -> Option<VerificationOutboxValue> {
+    use VerificationOutboxValue as V;
+    let arity = match op {
+        0 | 2 | 4 | 13 | 20 | 32 => 1,
+        1 | 11 | 12 | 40 | 41 => 2,
+        3 | 10 | 30 | 31 | 42 => 3,
+        5 => 4,
+        6 => 5,
+        _ => return None,
+    };
+    if args.len() != arity {
+        return None;
+    }
+    let int = |i: usize| w16_int(&args[i]);
+    let bytes = |i: usize| w16_bytes(&args[i]);
+    let boolean = |i: usize| match args[i] {
+        V::Bool(b) => Some(b),
+        _ => None,
+    };
+    Some(match op {
+        0 => V::Int(match w19_nullable_int(&args[0])? {
+            None => 0,
+            Some(n) => n.checked_sub(1)?,
+        }),
+        1 => match (w19_nullable_int(&args[0])?, w19_nullable_int(&args[1])?) {
+            (Some(a), Some(b)) => V::Int(b.checked_sub(a)?.checked_add(1)?),
+            _ => V::Null,
+        },
+        2 => V::Int(i64::try_from(bytes(0)?.len()).ok()?),
+        3 => V::Bool(w19_valid_span(
+            w19_nullable_int(&args[0])?,
+            w19_nullable_int(&args[1])?,
+            int(2)?,
+        )),
+        4 => {
+            if matches!(args[0], V::Null) {
+                V::Null
+            } else {
+                let crc = bytes(0)?;
+                if crc.is_empty() || crc.len() > 8 || !crc.iter().all(u8::is_ascii_hexdigit) {
+                    V::Null
+                } else {
+                    let mut normalized = vec![b'0'; 8 - crc.len()];
+                    normalized.extend(crc.iter().map(u8::to_ascii_lowercase));
+                    V::Bytes(normalized)
+                }
+            }
+        }
+        5 => {
+            let length = int(0)?;
+            let begin = w19_nullable_int(&args[1])?;
+            let end = w19_nullable_int(&args[2])?;
+            let size = int(3)?;
+            V::Bool(if begin.is_none() && end.is_none() {
+                size >= 0 && length == size
+            } else {
+                w19_valid_span(begin, end, size)
+                    && length == end?.checked_sub(begin?)?.checked_add(1)?
+            })
+        }
+        6 => {
+            bytes(0)?;
+            int(1)?;
+            for v in &args[2..] {
+                w19_nullable_int(v)?;
+            }
+            w16_map(vec![
+                ("name", args[0].clone()),
+                ("size", args[1].clone()),
+                ("part", args[2].clone()),
+                ("begin", args[3].clone()),
+                ("end", args[4].clone()),
+            ])
+        }
+        10 | 12 => {
+            if !matches!(args[1], V::Null | V::Bytes(_)) {
+                return None;
+            }
+            let success = boolean(0)? && matches!(args[1], V::Null);
+            if op == 12 {
+                V::Bool(success)
+            } else {
+                let oversized = boolean(2)?;
+                w16_string(if success {
+                    b"success"
+                } else if oversized {
+                    b"oversized"
+                } else {
+                    b"failure"
+                })
+            }
+        }
+        11 => V::Bool(int(0)? > int(1)?),
+        13 => V::Bool(boolean(0)?),
+        20 => V::Bool(bytes(0)?.iter().any(|b| matches!(b, b'/' | b'\\'))),
+        30 => {
+            let seconds = w17_number(&args[1])?;
+            let now = w17_number(&args[2])?;
+            let deadline = now + seconds.max(0.0);
+            if !deadline.is_finite() {
+                return None;
+            }
+            w16_map(vec![
+                ("limit", V::Int(int(0)?.max(1))),
+                ("deadline", V::Float(deadline.to_string().into_bytes())),
+            ])
+        }
+        31 => {
+            let at_key = bytes(1)?;
+            let id_key = bytes(2)?;
+            let at = w19_field(&args[0], at_key).and_then(w16_bytes);
+            let id = match w19_field(&args[0], id_key) {
+                Some(v) => w19_cursor_id(v)?,
+                None => None,
+            };
+            match (at, id) {
+                (Some(at), Some(id)) => w16_map(vec![("at", w16_string(at)), ("id", V::Int(id))]),
+                _ => V::Null,
+            }
+        }
+        32 => match bytes(0) {
+            Some(value) if value.len() == 40 && value.iter().all(u8::is_ascii_hexdigit) => {
+                let digit = |b: u8| {
+                    if b.is_ascii_digit() {
+                        b - b'0'
+                    } else {
+                        b.to_ascii_lowercase() - b'a' + 10
+                    }
+                };
+                V::Bytes(
+                    value
+                        .chunks_exact(2)
+                        .map(|p| digit(p[0]) * 16 + digit(p[1]))
+                        .collect(),
+                )
+            }
+            _ => V::Null,
+        },
+        40 => {
+            w16_entries(&args[0])?;
+            w16_entries(&args[1])?;
+            w16_map(vec![
+                ("version", V::Int(1)),
+                ("nzb_receipt", args[0].clone()),
+                ("paths", args[1].clone()),
+            ])
+        }
+        41 => {
+            let inventory = &args[0];
+            let guid = bytes(1)?;
+            let paths = inventory.field(b"paths");
+            let receipt = inventory.field(b"nzb_receipt");
+            if w19_list(inventory) {
+                w16_string(
+                    b"Legacy audit artifact ownership is unqualified; retaining it for review.",
+                )
+            } else if w16_entries(inventory).is_none()
+                || inventory.field(b"version").and_then(w16_int) != Some(1)
+                || receipt.and_then(w16_entries).is_none()
+                || !paths.is_some_and(w19_list)
+                || paths.and_then(w16_entries).map(|p| p.len()) != Some(9)
+            {
+                w16_string(b"Audit artifact inventory is unavailable.")
+            } else {
+                let receipt = receipt?;
+                let first = &w16_entries(paths?)?[0].1;
+                let receipt_path = receipt.field(b"path").unwrap_or(&V::Null);
+                if matches!(first, V::Float(_)) || matches!(receipt_path, V::Float(_)) {
+                    return None;
+                }
+                if receipt.field(b"guid").and_then(w16_bytes) != Some(guid)
+                    || !w16_equal(receipt_path, first)
+                {
+                    w16_string(b"Audit NZB receipt does not match its retained inventory.")
+                } else if w16_bytes(first).is_none_or(|p| p.is_empty()) {
+                    w16_string(b"Audit NZB artifact path is invalid.")
+                } else {
+                    V::Null
+                }
+            }
+        }
+        42 => V::Bool(
+            w18_php_bool(&args[0])?
+                && !matches!(args[1], V::Null)
+                && w16_bytes(&args[2]) == Some(b"unrepairable"),
+        ),
+        _ => return None,
+    })
+}
+
+/// Bounded PHP list arguments and scalar/array result. -1 declines; -required
+/// is a size query/short output with no writes. Null output is valid only at 0.
+/// # Safety
+/// Supplied nonempty ranges must be live and disjoint for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w19_verification_prereqs(
+    operation: u32,
+    input: *const u8,
+    length: usize,
+    output: *mut u8,
+    capacity: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !nfo_abi_range(input, length, true)
+            || !nfo_abi_range(output, capacity, true)
+            || yenc_ranges_overlap(input as usize, length, output as usize, capacity)
+        {
+            return -1;
+        }
+        if length > 64 * 1024 * 1024
+            || !yenc_valid_range(input as usize, length)
+            || !(output.is_null() && capacity == 0 || yenc_valid_range(output as usize, capacity))
+            || yenc_ranges_overlap(input as usize, length, output as usize, capacity)
+        {
+            return -1;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, length) };
+        let mut parser = VerificationOutboxParser {
+            bytes,
+            pos: 0,
+            remaining: 100_000,
+        };
+        let Some(value) = parser.value(488) else {
+            return -1;
+        };
+        if parser.pos != length || !w19_list(&value) {
+            return -1;
+        }
+        let args: Vec<_> = w16_entries(&value)
+            .unwrap()
+            .iter()
+            .map(|(_, v)| v.clone())
+            .collect();
+        let Some(result) = w19_compute(operation, &args) else {
+            return -1;
+        };
+        let mut wire = Vec::new();
+        result.serialize(&mut wire);
+        let Ok(required) = isize::try_from(wire.len()) else {
+            return -1;
+        };
+        if wire.len() > capacity {
+            return -required;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(wire.as_ptr(), output, wire.len());
+        }
+        required
+    }))
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod wave19_yenc_article_prereqs_tests {
+    use super::*;
+    use VerificationOutboxValue as V;
+
+    fn call(op: u32, args: Vec<V>) -> Option<V> {
+        let mut input = Vec::new();
+        w16_list(args).serialize(&mut input);
+        let mut output = [88_u8; 4096];
+        let written = unsafe {
+            nntmux_w19_verification_prereqs(
+                op,
+                input.as_ptr(),
+                input.len(),
+                output.as_mut_ptr(),
+                output.len(),
+            )
+        };
+        if written < 0 {
+            return None;
+        }
+        let mut parser = VerificationOutboxParser {
+            bytes: &output[..written as usize],
+            pos: 0,
+            remaining: 1000,
+        };
+        parser.value(0)
+    }
+
+    #[test]
+    fn values_cross_the_real_abi_with_binary_null_and_integer_boundaries() {
+        assert!(matches!(call(0, vec![V::Null]), Some(V::Int(0))));
+        assert!(call(0, vec![V::Int(i64::MIN)]).is_none());
+        assert!(matches!(
+            call(1, vec![V::Int(9), V::Int(3)]),
+            Some(V::Int(-5))
+        ));
+        assert!(matches!(
+            call(2, vec![w16_string(b"\0\xff")]),
+            Some(V::Int(2))
+        ));
+        assert!(matches!(
+            call(
+                3,
+                vec![V::Int(i64::MAX), V::Int(i64::MAX), V::Int(i64::MAX)]
+            ),
+            Some(V::Bool(true))
+        ));
+        assert!(w16_equal(
+            &call(4, vec![w16_string(b"AbC")]).unwrap(),
+            &w16_string(b"00000abc")
+        ));
+        assert!(matches!(call(4, vec![w16_string(b"a\0")]), Some(V::Null)));
+        assert!(matches!(
+            call(5, vec![V::Int(0), V::Null, V::Null, V::Int(0)]),
+            Some(V::Bool(true))
+        ));
+        assert!(matches!(
+            call(12, vec![V::Bool(true), V::Null]),
+            Some(V::Bool(true))
+        ));
+        assert!(matches!(
+            call(20, vec![w16_string(b"C:\\par2")]),
+            Some(V::Bool(true))
+        ));
+        assert!(
+            matches!(call(32, vec![w16_string(&[b'A'; 40])]), Some(V::Bytes(v)) if v == vec![0xaa; 20])
+        );
+        assert!(matches!(
+            call(
+                42,
+                vec![w16_string(b"0"), V::Int(0), w16_string(b"unrepairable")]
+            ),
+            Some(V::Bool(false))
+        ));
+        assert!(
+            call(
+                30,
+                vec![
+                    V::Int(0),
+                    V::Float(b"INF".to_vec()),
+                    V::Float(b"1".to_vec())
+                ]
+            )
+            .is_none()
+        );
+        for op in [
+            0, 1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 20, 30, 31, 32, 40, 41, 42, 999,
+        ] {
+            assert!(w19_compute(op, &[]).is_none());
+        }
+    }
+
+    #[test]
+    fn unaligned_word_outputs_are_rejected_without_writing() {
+        let input = b"=ybegin size=1 name=a\n+\n=yend size=1\n";
+        let mut words = [0usize; 8];
+        let before = words;
+        let ptr = unsafe { words.as_mut_ptr().cast::<u8>().add(1).cast::<usize>() };
+        assert_eq!(
+            unsafe { nntmux_yenc_frame_spans(input.as_ptr(), input.len(), ptr) },
+            -1
+        );
+        let mut start = 0usize;
+        let mut len = 0usize;
+        let mut expected = 0i64;
+        let mut crc = [0u8; 8];
+        assert_eq!(
+            unsafe {
+                nntmux_yenc_parse_frame(
+                    input.as_ptr(),
+                    input.len(),
+                    &mut start,
+                    &mut len,
+                    &mut expected,
+                    crc.as_mut_ptr(),
+                    ptr,
+                )
+            },
+            -1
+        );
+        assert_eq!(words, before);
+    }
+
+    #[test]
+    fn legacy_ranges_are_bounded_before_reading_or_writing() {
+        let input = b"hello";
+        let mut output = [88_u8; 64];
+        unsafe {
+            assert_eq!(
+                nntmux_cp437_to_utf8(input.as_ptr(), usize::MAX, output.as_mut_ptr(), 64),
+                -1
+            );
+            assert_eq!(nntmux_nfo_validate_content(usize::MAX as *const u8, 1), -1);
+            assert_eq!(
+                nntmux_nzb_format_hint(
+                    input.as_ptr(),
+                    input.len(),
+                    output.as_mut_ptr(),
+                    usize::MAX
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_nfo_clean_content(input.as_ptr(), input.len(), std::ptr::null_mut(), 1),
+                -1
+            );
+            assert_eq!(
+                nntmux_nfo_predb_candidates(output.as_ptr(), 5, output.as_mut_ptr(), 64),
+                -1
+            );
+        }
+        assert_eq!(output, [88; 64]);
+    }
+
+    #[test]
+    fn new_abi_rejects_bad_ranges_wire_and_short_buffers_without_partial_writes() {
+        let input = b"a:1:{i:0;s:1:\"a\";}";
+        let mut output = [88_u8; 64];
+        unsafe {
+            let call = nntmux_w19_verification_prereqs;
+            assert_eq!(call(2, std::ptr::null(), 0, output.as_mut_ptr(), 64), -1);
+            assert_eq!(
+                call(2, input.as_ptr(), usize::MAX, output.as_mut_ptr(), 64),
+                -1
+            );
+            assert_eq!(
+                call(
+                    2,
+                    input.as_ptr(),
+                    input.len(),
+                    output.as_mut_ptr(),
+                    usize::MAX
+                ),
+                -1
+            );
+            assert_eq!(
+                call(2, input.as_ptr(), input.len(), std::ptr::null_mut(), 1),
+                -1
+            );
+            assert_eq!(call(2, output.as_ptr(), 8, output.as_mut_ptr(), 64), -1);
+            assert_eq!(
+                call(2, input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                -4
+            );
+            assert_eq!(
+                call(2, input.as_ptr(), input.len(), output.as_mut_ptr(), 3),
+                -4
+            );
+            assert_eq!(output, [88; 64]);
+            assert_eq!(
+                call(2, input.as_ptr(), input.len(), output.as_mut_ptr(), 4),
+                4
+            );
+        }
+        for bad in [
+            b"N;".as_slice(),
+            b"a:0:{}junk",
+            b"a:1:{i:1;s:1:\"a\";}",
+            b"a:1:{i:0;R:1;}",
+            b"a:1:{i:0;O:1:\"X\":0:{}}",
+        ] {
+            assert_eq!(
+                unsafe {
+                    nntmux_w19_verification_prereqs(
+                        2,
+                        bad.as_ptr(),
+                        bad.len(),
+                        output.as_mut_ptr(),
+                        64,
+                    )
+                },
+                -1
+            );
+        }
+    }
 }
