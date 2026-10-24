@@ -21671,3 +21671,1356 @@ mod wave28_auth_admin_user_role_controllers_tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 29 Slice 29.6: TmuxHealthCheck, TmuxMonitor, TmuxStart,
+// ManageRoleStacking, and MailPreview console command pure-CPU helpers
+// ---------------------------------------------------------------------------
+
+pub mod tmux_role_stacking_mail_preview_commands {
+    use super::{ADD23_MAX_SEG_LEN, add23_valid_out_buf, add23_valid_slice, add23_write_slices};
+
+    #[inline]
+    fn is_php_numeric_ws(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C)
+    }
+
+    #[inline]
+    fn is_php_numeric_bytes(raw: &[u8]) -> Option<bool> {
+        let mut start = 0usize;
+        let mut end = raw.len();
+        while start < end && is_php_numeric_ws(raw[start]) {
+            start += 1;
+        }
+        while end > start && is_php_numeric_ws(raw[end - 1]) {
+            end -= 1;
+        }
+        let s = &raw[start..end];
+        if s.is_empty() {
+            return Some(false);
+        }
+        let mut idx = 0usize;
+        if s[idx] == b'+' || s[idx] == b'-' {
+            idx += 1;
+            if idx == s.len() {
+                return Some(false);
+            }
+        }
+        let mut int_digits = 0usize;
+        while idx < s.len() && s[idx].is_ascii_digit() {
+            int_digits += 1;
+            idx += 1;
+        }
+        let mut frac_digits = 0usize;
+        if idx < s.len() && s[idx] == b'.' {
+            idx += 1;
+            while idx < s.len() && s[idx].is_ascii_digit() {
+                frac_digits += 1;
+                idx += 1;
+            }
+        }
+        if int_digits == 0 && frac_digits == 0 {
+            return Some(false);
+        }
+        if idx < s.len() && (s[idx] == b'e' || s[idx] == b'E') {
+            idx += 1;
+            if idx < s.len() && (s[idx] == b'+' || s[idx] == b'-') {
+                idx += 1;
+            }
+            let mut exp_digits = 0usize;
+            while idx < s.len() && s[idx].is_ascii_digit() {
+                exp_digits += 1;
+                idx += 1;
+            }
+            if exp_digits == 0 {
+                return Some(false);
+            }
+        }
+        if idx != s.len() {
+            return Some(false);
+        }
+        if s.len() > 64 {
+            return None;
+        }
+        Some(true)
+    }
+
+    #[inline]
+    fn format_i64_with_commas(n: i64) -> String {
+        let neg = n < 0;
+        let digits = n.unsigned_abs().to_string();
+        let bytes = digits.as_bytes();
+        let len = bytes.len();
+        let mut out = String::with_capacity(len + len / 3 + usize::from(neg));
+        if neg {
+            out.push('-');
+        }
+        for (i, &b) in bytes.iter().enumerate() {
+            if i > 0 && (len - i) % 3 == 0 {
+                out.push(',');
+            }
+            out.push(b as char);
+        }
+        out
+    }
+
+    #[inline]
+    pub unsafe fn tmux_health_check_evaluate_heartbeat(
+        has_heartbeat: u8,
+        heartbeat: i64,
+        now_ts: i64,
+        heartbeat_max_age: i64,
+        delay: i64,
+        out_scalars: *mut i64,
+    ) -> i32 {
+        if has_heartbeat > 1
+            || out_scalars.is_null()
+            || !out_scalars.is_aligned()
+            || (out_scalars as usize)
+                .checked_add(2 * std::mem::size_of::<i64>())
+                .is_none()
+        {
+            return -1;
+        }
+        let Some(delay_plus_15) = delay.checked_add(15) else {
+            return -2;
+        };
+        let max_age = 1i64.max(heartbeat_max_age).max(delay_plus_15);
+        let is_stale = if has_heartbeat == 1 {
+            let Some(age) = now_ts.checked_sub(heartbeat) else {
+                return -2;
+            };
+            age > max_age
+        } else {
+            false
+        };
+        unsafe {
+            *out_scalars.add(0) = max_age;
+            *out_scalars.add(1) = i64::from(is_stale);
+        }
+        1
+    }
+
+    #[inline]
+    pub unsafe fn tmux_health_check_resolve_log_context_nul(
+        level_ptr: *const u8,
+        level_len: usize,
+        outcome_ptr: *const u8,
+        outcome_len: usize,
+        session_ptr: *const u8,
+        session_len: usize,
+        auto_restart: u8,
+        should_be_running: u8,
+        has_exit_code: u8,
+        exit_code: i64,
+        out_scalars: *mut i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if auto_restart > 1
+            || should_be_running > 1
+            || has_exit_code > 1
+            || out_scalars.is_null()
+            || !out_scalars.is_aligned()
+            || (out_scalars as usize)
+                .checked_add(4 * std::mem::size_of::<i64>())
+                .is_none()
+        {
+            return -1;
+        }
+        let (Some(level), Some(outcome), Some(session)) = (
+            unsafe { add23_valid_slice(level_ptr, level_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(outcome_ptr, outcome_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(session_ptr, session_len, ADD23_MAX_SEG_LEN) },
+        ) else {
+            return -1;
+        };
+        if level.contains(&0) || outcome.contains(&0) || session.contains(&0) {
+            return -2;
+        }
+        let written = unsafe {
+            add23_write_slices(
+                out_buf,
+                out_cap,
+                &[
+                    level,
+                    b"\0Tmux health check result\0",
+                    session,
+                    b"\0",
+                    outcome,
+                ],
+                3,
+            )
+        };
+        if written < 0 {
+            return written;
+        }
+        unsafe {
+            *out_scalars.add(0) = i64::from(auto_restart);
+            *out_scalars.add(1) = i64::from(should_be_running);
+            *out_scalars.add(2) = i64::from(has_exit_code);
+            *out_scalars.add(3) = if has_exit_code == 1 { exit_code } else { 0 };
+        }
+        written
+    }
+
+    #[inline]
+    pub unsafe fn tmux_monitor_format_compensation_message(
+        count: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if count > 0 {
+            let count_str = count.to_string();
+            unsafe {
+                add23_write_slices(
+                    out_buf,
+                    out_cap,
+                    &[
+                        "✅ Gave ".as_bytes(),
+                        count_str.as_bytes(),
+                        b" waiting collections back the time lost while the indexer was down",
+                    ],
+                    1,
+                )
+            }
+        } else {
+            unsafe {
+                add23_write_slices(
+                    out_buf,
+                    out_cap,
+                    &["✅ No collections needed more time".as_bytes()],
+                    1,
+                )
+            }
+        }
+    }
+
+    #[inline]
+    pub unsafe fn tmux_monitor_evaluate_loop_step(
+        delay: i64,
+        iteration: i64,
+        out_scalars: *mut i64,
+    ) -> i32 {
+        if out_scalars.is_null()
+            || !out_scalars.is_aligned()
+            || (out_scalars as usize)
+                .checked_add(2 * std::mem::size_of::<i64>())
+                .is_none()
+        {
+            return -1;
+        }
+        let clamped_delay = delay.max(1);
+        let should_log_idle = i64::from(iteration.wrapping_rem(60) == 0);
+        unsafe {
+            *out_scalars.add(0) = clamped_delay;
+            *out_scalars.add(1) = should_log_idle;
+        }
+        1
+    }
+
+    #[inline]
+    pub unsafe fn tmux_start_verify_which_output(
+        successful: u8,
+        output_ptr: *const u8,
+        output_len: usize,
+        out_installed: *mut i32,
+    ) -> i32 {
+        if successful > 1
+            || out_installed.is_null()
+            || !out_installed.is_aligned()
+            || (out_installed as usize)
+                .checked_add(std::mem::size_of::<i32>())
+                .is_none()
+        {
+            return -1;
+        }
+        let Some(output) =
+            (unsafe { add23_valid_slice(output_ptr, output_len, ADD23_MAX_SEG_LEN) })
+        else {
+            return -1;
+        };
+        let installed = successful == 1 && output.windows(4).any(|w| w == b"tmux");
+        unsafe {
+            *out_installed = i32::from(installed);
+        }
+        1
+    }
+
+    #[inline]
+    pub unsafe fn tmux_start_format_ready_channel(
+        hex_ptr: *const u8,
+        hex_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        let Some(hex) = (unsafe { add23_valid_slice(hex_ptr, hex_len, ADD23_MAX_SEG_LEN) }) else {
+            return -1;
+        };
+        unsafe { add23_write_slices(out_buf, out_cap, &[b"nntmux-ready-", hex], 1) }
+    }
+
+    #[inline]
+    pub unsafe fn tmux_start_format_attach_hint(
+        session_ptr: *const u8,
+        session_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if !add23_valid_out_buf(out_buf, out_cap) {
+            return -1;
+        }
+        let Some(session) =
+            (unsafe { add23_valid_slice(session_ptr, session_len, ADD23_MAX_SEG_LEN) })
+        else {
+            return -1;
+        };
+        if session.contains(&0) {
+            return -2;
+        }
+        let prefix = "💡 To attach, run: php artisan tmux:attach --session='".as_bytes();
+        let suffix = b"'";
+        let mut escaped = Vec::with_capacity(session.len() + 8);
+        for &b in session {
+            if b == b'\'' {
+                escaped.extend_from_slice(b"'\\''");
+            } else {
+                escaped.push(b);
+            }
+        }
+        unsafe { add23_write_slices(out_buf, out_cap, &[prefix, &escaped, suffix], 1) }
+    }
+
+    #[inline]
+    pub unsafe fn role_stacking_resolve_action_nul(
+        action_ptr: *const u8,
+        action_len: usize,
+        out_is_valid: *mut i32,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if out_is_valid.is_null()
+            || !out_is_valid.is_aligned()
+            || (out_is_valid as usize)
+                .checked_add(std::mem::size_of::<i32>())
+                .is_none()
+        {
+            return -1;
+        }
+        let Some(action) =
+            (unsafe { add23_valid_slice(action_ptr, action_len, ADD23_MAX_SEG_LEN) })
+        else {
+            return -1;
+        };
+        if action.contains(&0) {
+            return -2;
+        }
+        let (is_valid, written): (i32, isize) = match action {
+            b"list-pending" | b"cancel-pending" | b"history" | b"activate-pending" => {
+                let w = unsafe { add23_write_slices(out_buf, out_cap, &[action, b"\0"], 1) };
+                (1, w)
+            }
+            _ => {
+                let w = unsafe {
+                    add23_write_slices(
+                        out_buf,
+                        out_cap,
+                        &[b"unknown\0Unknown action: ", action],
+                        1,
+                    )
+                };
+                (0, w)
+            }
+        };
+        if written < 0 {
+            return written;
+        }
+        unsafe {
+            *out_is_valid = is_valid;
+        }
+        written
+    }
+
+    #[inline]
+    pub unsafe fn role_stacking_format_pending_row_nul(
+        user_id: i64,
+        username_ptr: *const u8,
+        username_len: usize,
+        has_current_role: u8,
+        current_role_ptr: *const u8,
+        current_role_len: usize,
+        has_pending_role: u8,
+        pending_role_ptr: *const u8,
+        pending_role_len: usize,
+        formatted_date_ptr: *const u8,
+        formatted_date_len: usize,
+        time_until_ptr: *const u8,
+        time_until_len: usize,
+        out_user_id: *mut i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if has_current_role > 1
+            || has_pending_role > 1
+            || out_user_id.is_null()
+            || !out_user_id.is_aligned()
+            || (out_user_id as usize)
+                .checked_add(std::mem::size_of::<i64>())
+                .is_none()
+        {
+            return -1;
+        }
+        let (
+            Some(username),
+            Some(current_role),
+            Some(pending_role),
+            Some(formatted_date),
+            Some(time_until),
+        ) = (
+            unsafe { add23_valid_slice(username_ptr, username_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(current_role_ptr, current_role_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(pending_role_ptr, pending_role_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(formatted_date_ptr, formatted_date_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(time_until_ptr, time_until_len, ADD23_MAX_SEG_LEN) },
+        ) else {
+            return -1;
+        };
+        let curr: &[u8] = if has_current_role == 1 {
+            current_role
+        } else {
+            b"None"
+        };
+        let pend: &[u8] = if has_pending_role == 1 {
+            pending_role
+        } else {
+            b"Unknown"
+        };
+        if username.contains(&0)
+            || curr.contains(&0)
+            || pend.contains(&0)
+            || formatted_date.contains(&0)
+            || time_until.contains(&0)
+        {
+            return -2;
+        }
+        let written = unsafe {
+            add23_write_slices(
+                out_buf,
+                out_cap,
+                &[
+                    username,
+                    b"\0",
+                    curr,
+                    b"\0",
+                    pend,
+                    b"\0",
+                    formatted_date,
+                    b"\0",
+                    time_until,
+                ],
+                4,
+            )
+        };
+        if written < 0 {
+            return written;
+        }
+        unsafe {
+            *out_user_id = user_id;
+        }
+        written
+    }
+
+    #[inline]
+    pub unsafe fn role_stacking_format_history_row_nul(
+        formatted_date_ptr: *const u8,
+        formatted_date_len: usize,
+        has_old_role: u8,
+        old_role_ptr: *const u8,
+        old_role_len: usize,
+        has_new_role: u8,
+        new_role_ptr: *const u8,
+        new_role_len: usize,
+        is_stacked: u8,
+        has_change_reason: u8,
+        change_reason_ptr: *const u8,
+        change_reason_len: usize,
+        has_changed_by: u8,
+        changed_by_ptr: *const u8,
+        changed_by_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if has_old_role > 1
+            || has_new_role > 1
+            || is_stacked > 1
+            || has_change_reason > 1
+            || has_changed_by > 1
+        {
+            return -1;
+        }
+        let (
+            Some(formatted_date),
+            Some(old_role),
+            Some(new_role),
+            Some(change_reason),
+            Some(changed_by),
+        ) = (
+            unsafe { add23_valid_slice(formatted_date_ptr, formatted_date_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(old_role_ptr, old_role_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(new_role_ptr, new_role_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(change_reason_ptr, change_reason_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(changed_by_ptr, changed_by_len, ADD23_MAX_SEG_LEN) },
+        ) else {
+            return -1;
+        };
+        let old_r: &[u8] = if has_old_role == 1 { old_role } else { b"None" };
+        let new_r: &[u8] = if has_new_role == 1 {
+            new_role
+        } else {
+            b"Unknown"
+        };
+        let change_type: &[u8] = if is_stacked == 1 {
+            b"Stacked"
+        } else {
+            b"Immediate"
+        };
+        let reason: &[u8] = if has_change_reason == 1 {
+            change_reason
+        } else {
+            b"N/A"
+        };
+        let by: &[u8] = if has_changed_by == 1 {
+            changed_by
+        } else {
+            b"System"
+        };
+        if formatted_date.contains(&0)
+            || old_r.contains(&0)
+            || new_r.contains(&0)
+            || reason.contains(&0)
+            || by.contains(&0)
+        {
+            return -2;
+        }
+        unsafe {
+            add23_write_slices(
+                out_buf,
+                out_cap,
+                &[
+                    formatted_date,
+                    b"\0",
+                    old_r,
+                    b"\0",
+                    new_r,
+                    b"\0",
+                    change_type,
+                    b"\0",
+                    reason,
+                    b"\0",
+                    by,
+                ],
+                5,
+            )
+        }
+    }
+
+    #[inline]
+    pub unsafe fn role_stacking_classify_identifier_nul(
+        is_int_input: u8,
+        int_val: i64,
+        str_ptr: *const u8,
+        str_len: usize,
+        out_is_numeric: *mut i32,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if is_int_input > 1
+            || out_is_numeric.is_null()
+            || !out_is_numeric.is_aligned()
+            || (out_is_numeric as usize)
+                .checked_add(std::mem::size_of::<i32>())
+                .is_none()
+        {
+            return -1;
+        }
+        let Some(str_slice) =
+            (unsafe { add23_valid_slice(str_ptr, str_len, ADD23_MAX_SEG_LEN) })
+        else {
+            return -1;
+        };
+        if is_int_input == 1 {
+            let id_str = int_val.to_string();
+            let written = unsafe {
+                add23_write_slices(
+                    out_buf,
+                    out_cap,
+                    &[b"id\0User not found: ", id_str.as_bytes()],
+                    1,
+                )
+            };
+            if written < 0 {
+                return written;
+            }
+            unsafe {
+                *out_is_numeric = 1;
+            }
+            return written;
+        }
+
+        if str_slice.contains(&0) {
+            return -2;
+        }
+        let Some(is_num) = is_php_numeric_bytes(str_slice) else {
+            return -2;
+        };
+        let lookup_field: &[u8] = if is_num { b"id" } else { b"username" };
+        let written = unsafe {
+            add23_write_slices(
+                out_buf,
+                out_cap,
+                &[lookup_field, b"\0User not found: ", str_slice],
+                1,
+            )
+        };
+        if written < 0 {
+            return written;
+        }
+        unsafe {
+            *out_is_numeric = i32::from(is_num);
+        }
+        written
+    }
+
+    #[inline]
+    pub unsafe fn mail_preview_resolve_output_dir(
+        has_out: u8,
+        out_ptr: *const u8,
+        out_len: usize,
+        default_ptr: *const u8,
+        default_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if has_out > 1 {
+            return -1;
+        }
+        let (Some(out_dir), Some(default_dir)) = (
+            unsafe { add23_valid_slice(out_ptr, out_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(default_ptr, default_len, ADD23_MAX_SEG_LEN) },
+        ) else {
+            return -1;
+        };
+        let chosen = if has_out == 1 && !out_dir.is_empty() && out_dir != b"0" {
+            out_dir
+        } else {
+            default_dir
+        };
+        unsafe { add23_write_slices(out_buf, out_cap, &[chosen], 1) }
+    }
+
+    #[inline]
+    pub unsafe fn mail_preview_format_byte_summary(
+        name_ptr: *const u8,
+        name_len: usize,
+        byte_count: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        let Some(name) = (unsafe { add23_valid_slice(name_ptr, name_len, ADD23_MAX_SEG_LEN) })
+        else {
+            return -1;
+        };
+        if byte_count.unsigned_abs() >= (1u64 << 53) {
+            return -2;
+        }
+        let formatted = format_i64_with_commas(byte_count);
+        unsafe {
+            add23_write_slices(
+                out_buf,
+                out_cap,
+                &[
+                    b"Wrote ",
+                    name,
+                    b".html (",
+                    formatted.as_bytes(),
+                    b" bytes)",
+                ],
+                1,
+            )
+        }
+    }
+
+    #[inline]
+    pub unsafe fn mail_preview_fixture_attributes_nul(
+        out_scalars: *mut i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if out_scalars.is_null()
+            || !out_scalars.is_aligned()
+            || (out_scalars as usize)
+                .checked_add(5 * std::mem::size_of::<i64>())
+                .is_none()
+        {
+            return -1;
+        }
+        const PAYLOAD: &[u8] = b"tester\0tester@example.test\0Silver\0tester\0tester@example.test\0mod_alice\0preview-token-abc123\0newuser@example.test\0API latency spike\0p99 latency exceeded thresholds.\nFollow status page for updates.\0NZB Search\0API";
+        let written = unsafe { add23_write_slices(out_buf, out_cap, &[PAYLOAD], 11) };
+        if written < 0 {
+            return written;
+        }
+        unsafe {
+            *out_scalars.add(0) = 99;
+            *out_scalars.add(1) = 7;
+            *out_scalars.add(2) = 1;
+            *out_scalars.add(3) = 7;
+            *out_scalars.add(4) = 15;
+        }
+        written
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_tmux_health_check_evaluate_heartbeat(
+    has_heartbeat: u8,
+    heartbeat: i64,
+    now_ts: i64,
+    heartbeat_max_age: i64,
+    delay: i64,
+    out_scalars: *mut i64,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        tmux_role_stacking_mail_preview_commands::tmux_health_check_evaluate_heartbeat(
+            has_heartbeat,
+            heartbeat,
+            now_ts,
+            heartbeat_max_age,
+            delay,
+            out_scalars,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_tmux_health_check_resolve_log_context_nul(
+    level_ptr: *const u8,
+    level_len: usize,
+    outcome_ptr: *const u8,
+    outcome_len: usize,
+    session_ptr: *const u8,
+    session_len: usize,
+    auto_restart: u8,
+    should_be_running: u8,
+    has_exit_code: u8,
+    exit_code: i64,
+    out_scalars: *mut i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        tmux_role_stacking_mail_preview_commands::tmux_health_check_resolve_log_context_nul(
+            level_ptr,
+            level_len,
+            outcome_ptr,
+            outcome_len,
+            session_ptr,
+            session_len,
+            auto_restart,
+            should_be_running,
+            has_exit_code,
+            exit_code,
+            out_scalars,
+            out_buf,
+            out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_tmux_monitor_format_compensation_message(
+    count: i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        tmux_role_stacking_mail_preview_commands::tmux_monitor_format_compensation_message(
+            count, out_buf, out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_tmux_monitor_evaluate_loop_step(
+    delay: i64,
+    iteration: i64,
+    out_scalars: *mut i64,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        tmux_role_stacking_mail_preview_commands::tmux_monitor_evaluate_loop_step(
+            delay,
+            iteration,
+            out_scalars,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_tmux_start_verify_which_output(
+    successful: u8,
+    output_ptr: *const u8,
+    output_len: usize,
+    out_installed: *mut i32,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        tmux_role_stacking_mail_preview_commands::tmux_start_verify_which_output(
+            successful,
+            output_ptr,
+            output_len,
+            out_installed,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_tmux_start_format_ready_channel(
+    hex_ptr: *const u8,
+    hex_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        tmux_role_stacking_mail_preview_commands::tmux_start_format_ready_channel(
+            hex_ptr, hex_len, out_buf, out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_tmux_start_format_attach_hint(
+    session_ptr: *const u8,
+    session_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        tmux_role_stacking_mail_preview_commands::tmux_start_format_attach_hint(
+            session_ptr,
+            session_len,
+            out_buf,
+            out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_role_stacking_resolve_action_nul(
+    action_ptr: *const u8,
+    action_len: usize,
+    out_is_valid: *mut i32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        tmux_role_stacking_mail_preview_commands::role_stacking_resolve_action_nul(
+            action_ptr,
+            action_len,
+            out_is_valid,
+            out_buf,
+            out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_role_stacking_format_pending_row_nul(
+    user_id: i64,
+    username_ptr: *const u8,
+    username_len: usize,
+    has_current_role: u8,
+    current_role_ptr: *const u8,
+    current_role_len: usize,
+    has_pending_role: u8,
+    pending_role_ptr: *const u8,
+    pending_role_len: usize,
+    formatted_date_ptr: *const u8,
+    formatted_date_len: usize,
+    time_until_ptr: *const u8,
+    time_until_len: usize,
+    out_user_id: *mut i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        tmux_role_stacking_mail_preview_commands::role_stacking_format_pending_row_nul(
+            user_id,
+            username_ptr,
+            username_len,
+            has_current_role,
+            current_role_ptr,
+            current_role_len,
+            has_pending_role,
+            pending_role_ptr,
+            pending_role_len,
+            formatted_date_ptr,
+            formatted_date_len,
+            time_until_ptr,
+            time_until_len,
+            out_user_id,
+            out_buf,
+            out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_role_stacking_format_history_row_nul(
+    formatted_date_ptr: *const u8,
+    formatted_date_len: usize,
+    has_old_role: u8,
+    old_role_ptr: *const u8,
+    old_role_len: usize,
+    has_new_role: u8,
+    new_role_ptr: *const u8,
+    new_role_len: usize,
+    is_stacked: u8,
+    has_change_reason: u8,
+    change_reason_ptr: *const u8,
+    change_reason_len: usize,
+    has_changed_by: u8,
+    changed_by_ptr: *const u8,
+    changed_by_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        tmux_role_stacking_mail_preview_commands::role_stacking_format_history_row_nul(
+            formatted_date_ptr,
+            formatted_date_len,
+            has_old_role,
+            old_role_ptr,
+            old_role_len,
+            has_new_role,
+            new_role_ptr,
+            new_role_len,
+            is_stacked,
+            has_change_reason,
+            change_reason_ptr,
+            change_reason_len,
+            has_changed_by,
+            changed_by_ptr,
+            changed_by_len,
+            out_buf,
+            out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_role_stacking_classify_identifier_nul(
+    is_int_input: u8,
+    int_val: i64,
+    str_ptr: *const u8,
+    str_len: usize,
+    out_is_numeric: *mut i32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        tmux_role_stacking_mail_preview_commands::role_stacking_classify_identifier_nul(
+            is_int_input,
+            int_val,
+            str_ptr,
+            str_len,
+            out_is_numeric,
+            out_buf,
+            out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_mail_preview_resolve_output_dir(
+    has_out: u8,
+    out_ptr: *const u8,
+    out_len: usize,
+    default_ptr: *const u8,
+    default_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        tmux_role_stacking_mail_preview_commands::mail_preview_resolve_output_dir(
+            has_out,
+            out_ptr,
+            out_len,
+            default_ptr,
+            default_len,
+            out_buf,
+            out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_mail_preview_format_byte_summary(
+    name_ptr: *const u8,
+    name_len: usize,
+    byte_count: i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        tmux_role_stacking_mail_preview_commands::mail_preview_format_byte_summary(
+            name_ptr, name_len, byte_count, out_buf, out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_mail_preview_fixture_attributes_nul(
+    out_scalars: *mut i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        tmux_role_stacking_mail_preview_commands::mail_preview_fixture_attributes_nul(
+            out_scalars,
+            out_buf,
+            out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod wave29_tmux_role_stacking_mail_preview_commands_tests {
+    use super::*;
+
+    #[test]
+    fn tmux_health_check_monitor_and_start_helpers_match_php_contracts() {
+        let mut scalars = [0i64; 4];
+        assert_eq!(
+            unsafe {
+                nntmux_tmux_health_check_evaluate_heartbeat(
+                    1,
+                    1000,
+                    1200,
+                    180,
+                    10,
+                    scalars.as_mut_ptr(),
+                )
+            },
+            1
+        );
+        assert_eq!(&scalars[..2], &[180, 1]);
+
+        let mut buf = [0u8; 256];
+        let log_w = unsafe {
+            nntmux_tmux_health_check_resolve_log_context_nul(
+                b"warning".as_ptr(),
+                7,
+                b"monitor_heartbeat_stale".as_ptr(),
+                23,
+                b"nntmux".as_ptr(),
+                6,
+                1,
+                1,
+                0,
+                0,
+                scalars.as_mut_ptr(),
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert!(log_w > 0);
+        assert_eq!(scalars, [1, 1, 0, 0]);
+        assert_eq!(
+            &buf[..log_w as usize],
+            b"warning\0Tmux health check result\0nntmux\0monitor_heartbeat_stale"
+        );
+
+        let comp_w = unsafe {
+            nntmux_tmux_monitor_format_compensation_message(5, buf.as_mut_ptr(), buf.len())
+        };
+        assert!(comp_w > 0);
+        assert_eq!(
+            &buf[..comp_w as usize],
+            "✅ Gave 5 waiting collections back the time lost while the indexer was down"
+                .as_bytes()
+        );
+
+        assert_eq!(
+            unsafe { nntmux_tmux_monitor_evaluate_loop_step(-5, 120, scalars.as_mut_ptr()) },
+            1
+        );
+        assert_eq!(&scalars[..2], &[1, 1]);
+
+        let mut installed = 0i32;
+        assert_eq!(
+            unsafe {
+                nntmux_tmux_start_verify_which_output(
+                    1,
+                    b"/opt/homebrew/bin/tmux\n".as_ptr(),
+                    23,
+                    &mut installed,
+                )
+            },
+            1
+        );
+        assert_eq!(installed, 1);
+
+        let chan_w = unsafe {
+            nntmux_tmux_start_format_ready_channel(
+                b"deadbeef1234".as_ptr(),
+                12,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(&buf[..chan_w as usize], b"nntmux-ready-deadbeef1234");
+
+        let hint_w = unsafe {
+            nntmux_tmux_start_format_attach_hint(
+                b"my'sess".as_ptr(),
+                7,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(
+            &buf[..hint_w as usize],
+            "💡 To attach, run: php artisan tmux:attach --session='my'\\''sess'".as_bytes()
+        );
+    }
+
+    #[test]
+    fn role_stacking_and_mail_preview_helpers_match_php_contracts() {
+        let mut buf = [0u8; 512];
+        let mut valid = 0i32;
+        let act_w = unsafe {
+            nntmux_role_stacking_resolve_action_nul(
+                b"list-pending".as_ptr(),
+                12,
+                &mut valid,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(valid, 1);
+        assert_eq!(&buf[..act_w as usize], b"list-pending\0");
+
+        let mut out_uid = 0i64;
+        let pend_w = unsafe {
+            nntmux_role_stacking_format_pending_row_nul(
+                42,
+                b"alice".as_ptr(),
+                5,
+                0,
+                b"".as_ptr(),
+                0,
+                1,
+                b"VIP".as_ptr(),
+                3,
+                b"2026-10-25 12:00".as_ptr(),
+                16,
+                b"in 1 day".as_ptr(),
+                8,
+                &mut out_uid,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(out_uid, 42);
+        assert_eq!(
+            &buf[..pend_w as usize],
+            b"alice\0None\0VIP\02026-10-25 12:00\0in 1 day"
+        );
+
+        let hist_w = unsafe {
+            nntmux_role_stacking_format_history_row_nul(
+                b"2026-10-24 08:00".as_ptr(),
+                16,
+                1,
+                b"User".as_ptr(),
+                4,
+                1,
+                b"Gold".as_ptr(),
+                4,
+                1,
+                0,
+                b"".as_ptr(),
+                0,
+                0,
+                b"".as_ptr(),
+                0,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(
+            &buf[..hist_w as usize],
+            b"2026-10-24 08:00\0User\0Gold\0Stacked\0N/A\0System"
+        );
+
+        let mut is_num = 0i32;
+        let cls_w = unsafe {
+            nntmux_role_stacking_classify_identifier_nul(
+                0,
+                0,
+                b"12345".as_ptr(),
+                5,
+                &mut is_num,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(is_num, 1);
+        assert_eq!(&buf[..cls_w as usize], b"id\0User not found: 12345");
+
+        let dir_w = unsafe {
+            nntmux_mail_preview_resolve_output_dir(
+                0,
+                b"".as_ptr(),
+                0,
+                b"/var/mail-previews".as_ptr(),
+                18,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(&buf[..dir_w as usize], b"/var/mail-previews");
+
+        let sum_w = unsafe {
+            nntmux_mail_preview_format_byte_summary(
+                b"welcome".as_ptr(),
+                7,
+                12345,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(
+            &buf[..sum_w as usize],
+            b"Wrote welcome.html (12,345 bytes)"
+        );
+
+        let mut f_scalars = [0i64; 5];
+        let fix_w = unsafe {
+            nntmux_mail_preview_fixture_attributes_nul(
+                f_scalars.as_mut_ptr(),
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert!(fix_w > 0);
+        assert_eq!(f_scalars, [99, 7, 1, 7, 15]);
+    }
+
+    #[test]
+    fn wave29_slice6_entrypoints_reject_null_unaligned_and_undersized_buffers() {
+        let mut raw = [0xA5u8; 64];
+        let unaligned_i32 = unsafe { raw.as_mut_ptr().add(1).cast::<i32>() };
+        let unaligned_i64 = unsafe { raw.as_mut_ptr().add(1).cast::<i64>() };
+
+        assert_eq!(
+            unsafe {
+                nntmux_tmux_health_check_evaluate_heartbeat(1, 10, 20, 180, 10, unaligned_i64)
+            },
+            -1
+        );
+
+        assert_eq!(
+            unsafe {
+                nntmux_tmux_health_check_resolve_log_context_nul(
+                    b"info".as_ptr(),
+                    4,
+                    b"healthy".as_ptr(),
+                    7,
+                    b"nntmux".as_ptr(),
+                    6,
+                    0,
+                    1,
+                    0,
+                    0,
+                    unaligned_i64,
+                    raw.as_mut_ptr(),
+                    64,
+                )
+            },
+            -1
+        );
+
+        assert_eq!(
+            unsafe { nntmux_tmux_monitor_evaluate_loop_step(10, 1, unaligned_i64) },
+            -1
+        );
+
+        assert_eq!(
+            unsafe {
+                nntmux_tmux_start_verify_which_output(1, b"tmux".as_ptr(), 4, unaligned_i32)
+            },
+            -1
+        );
+
+        let mut small = [0x5Au8; 4];
+        assert!(
+            unsafe {
+                nntmux_tmux_start_format_ready_channel(
+                    b"abcdef".as_ptr(),
+                    6,
+                    small.as_mut_ptr(),
+                    small.len(),
+                )
+            } < -4
+        );
+        assert_eq!(small, [0x5Au8; 4]);
+
+        assert_eq!(
+            unsafe {
+                nntmux_role_stacking_resolve_action_nul(
+                    b"history".as_ptr(),
+                    7,
+                    unaligned_i32,
+                    raw.as_mut_ptr(),
+                    64,
+                )
+            },
+            -1
+        );
+
+        assert_eq!(
+            unsafe {
+                nntmux_role_stacking_classify_identifier_nul(
+                    0,
+                    0,
+                    b"alice".as_ptr(),
+                    5,
+                    unaligned_i32,
+                    raw.as_mut_ptr(),
+                    64,
+                )
+            },
+            -1
+        );
+
+        assert_eq!(
+            unsafe {
+                nntmux_mail_preview_fixture_attributes_nul(unaligned_i64, raw.as_mut_ptr(), 64)
+            },
+            -1
+        );
+    }
+}
