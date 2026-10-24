@@ -15,7 +15,19 @@ use Illuminate\View\View;
 
 class AdminInvitationController extends BasePageController
 {
+    private static ?bool $useWave29RustFfi = null;
+
     protected InvitationService $invitationService;
+
+    public static function setUseRustFfi(?bool $useRustFfi): void
+    {
+        self::$useWave29RustFfi = $useRustFfi;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useWave29RustFfi ?? false;
+    }
 
     public function __construct(InvitationService $invitationService)
     {
@@ -33,10 +45,11 @@ class AdminInvitationController extends BasePageController
         $meta_title = $title = 'Invitation Management';
 
         // Get filter parameters
-        $status = $this->scalarInput($request, 'status');
-        $invited_by = $this->scalarInput($request, 'invited_by');
-        $email = $this->scalarInput($request, 'email');
-        $orderBy = $this->scalarInput($request, 'ob', 'created_at_desc');
+        $filters = self::invitationFilters($request->all());
+        $status = $filters['status'];
+        $invited_by = $filters['invited_by'];
+        $email = $filters['email'];
+        $orderBy = $filters['orderBy'];
 
         // Build query
         $query = Invitation::with(['invitedBy', 'usedBy']);
@@ -72,28 +85,7 @@ class AdminInvitationController extends BasePageController
         }
 
         // Apply ordering
-        switch ($orderBy) {
-            case 'created_at_asc':
-                $query->orderBy('created_at', 'asc');
-                break;
-            case 'created_at_desc':
-                $query->orderBy('created_at', 'desc');
-                break;
-            case 'expires_at_asc':
-                $query->orderBy('expires_at', 'asc');
-                break;
-            case 'expires_at_desc':
-                $query->orderBy('expires_at', 'desc');
-                break;
-            case 'email_asc':
-                $query->orderBy('email', 'asc');
-                break;
-            case 'email_desc':
-                $query->orderBy('email', 'desc');
-                break;
-            default:
-                $query->orderBy('created_at', 'desc');
-        }
+        $query->orderBy($filters['column'], $filters['direction']);
 
         // Paginate results
         $invitations = $query->paginate(config('nntmux.items_per_page', 25))->withQueryString();
@@ -104,13 +96,7 @@ class AdminInvitationController extends BasePageController
         // Get user statistics (top inviters)
         $topInviters = $this->getTopInviters();
 
-        $statusOptions = [
-            '' => 'All',
-            'pending' => 'Pending',
-            'used' => 'Used',
-            'expired' => 'Expired',
-            'cancelled' => 'Cancelled',
-        ];
+        $statusOptions = self::statusOptions();
 
         return view('admin.invitations.index', compact(
             'invitations',
@@ -240,8 +226,9 @@ class AdminInvitationController extends BasePageController
         $action = $request->get('bulk_action');
         $invitationIds = $request->get('invitation_ids', []);
 
-        if (empty($invitationIds)) {
-            return redirect()->back()->with('error', 'No invitations selected');
+        $state = self::bulkActionState($action, $invitationIds);
+        if ($state['error'] !== null) {
+            return redirect()->back()->with('error', $state['error']);
         }
 
         try {
@@ -253,7 +240,7 @@ class AdminInvitationController extends BasePageController
                         $count++;
                     }
 
-                    return redirect()->back()->with('success', "Cancelled {$count} invitations");
+                    return redirect()->back()->with('success', self::bulkActionState($action, $invitationIds, $count)['message']);
 
                 case 'resend':
                     foreach ($invitationIds as $id) {
@@ -261,13 +248,13 @@ class AdminInvitationController extends BasePageController
                         $count++;
                     }
 
-                    return redirect()->back()->with('success', "Resent {$count} invitations");
+                    return redirect()->back()->with('success', self::bulkActionState($action, $invitationIds, $count)['message']);
 
                 case 'delete':
                     Invitation::whereIn('id', $invitationIds)->delete();
                     $count = count($invitationIds);
 
-                    return redirect()->back()->with('success', "Deleted {$count} invitations");
+                    return redirect()->back()->with('success', self::bulkActionState($action, $invitationIds, $count)['message']);
 
                 default:
                     return redirect()->back()->with('error', 'Invalid bulk action');
@@ -275,5 +262,115 @@ class AdminInvitationController extends BasePageController
         } catch (\Exception $e) {
             return redirect()->back()->with('error', 'Bulk action failed: '.$e->getMessage());
         }
+    }
+
+    /**
+     * @param  array<int|string, mixed>  $input
+     * @return array{status: string, invited_by: string, email: string, orderBy: string, column: string, direction: string}
+     */
+    public static function invitationFilters(array $input): array
+    {
+        return self::usesRustFfi() ? self::invitationFiltersNative($input) : self::invitationFiltersPhp($input);
+    }
+
+    /**
+     * @param  array<int|string, mixed>  $input
+     * @return array{status: string, invited_by: string, email: string, orderBy: string, column: string, direction: string}
+     */
+    public static function invitationFiltersPhp(array $input): array
+    {
+        $filters = [];
+        foreach (['status', 'invited_by', 'email', 'ob'] as $key) {
+            $default = $key === 'ob' ? 'created_at_desc' : '';
+            $value = $input[$key] ?? $default;
+            $filters[$key === 'ob' ? 'orderBy' : $key] = is_scalar($value) ? (string) $value : $default;
+        }
+        $ordering = [
+            'created_at_asc' => ['created_at', 'asc'],
+            'created_at_desc' => ['created_at', 'desc'],
+            'expires_at_asc' => ['expires_at', 'asc'],
+            'expires_at_desc' => ['expires_at', 'desc'],
+            'email_asc' => ['email', 'asc'],
+            'email_desc' => ['email', 'desc'],
+        ];
+        [$filters['column'], $filters['direction']] = $ordering[$filters['orderBy']] ?? ['created_at', 'desc'];
+
+        return $filters;
+    }
+
+    /**
+     * @param  array<int|string, mixed>  $input
+     * @return array{status: string, invited_by: string, email: string, orderBy: string, column: string, direction: string}
+     */
+    public static function invitationFiltersNative(array $input): array
+    {
+        return GdprRequestController::wave29Native(11, ['input' => $input]) ?? self::invitationFiltersPhp($input);
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    public static function statusOptions(): array
+    {
+        return self::usesRustFfi() ? self::statusOptionsNative() : self::statusOptionsPhp();
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    public static function statusOptionsPhp(): array
+    {
+        return ['' => 'All', 'pending' => 'Pending', 'used' => 'Used', 'expired' => 'Expired', 'cancelled' => 'Cancelled'];
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    public static function statusOptionsNative(): array
+    {
+        return GdprRequestController::wave29Native(12, []) ?? self::statusOptionsPhp();
+    }
+
+    /**
+     * @return array{error: string|null, message: string|null}
+     */
+    public static function bulkActionState(mixed $action, mixed $ids, int $count = 0): array
+    {
+        return self::usesRustFfi() ? self::bulkActionStateNative($action, $ids, $count) : self::bulkActionStatePhp($action, $ids, $count);
+    }
+
+    /**
+     * @return array{error: string|null, message: string|null}
+     */
+    public static function bulkActionStatePhp(mixed $action, mixed $ids, int $count = 0): array
+    {
+        if (empty($ids)) {
+            return ['error' => 'No invitations selected', 'message' => null];
+        }
+        switch ($action) {
+            case 'cancel':
+                $verb = 'Cancelled';
+                break;
+            case 'resend':
+                $verb = 'Resent';
+                break;
+            case 'delete':
+                $verb = 'Deleted';
+                break;
+            default:
+                $verb = null;
+        }
+
+        return $verb === null
+            ? ['error' => 'Invalid bulk action', 'message' => null]
+            : ['error' => null, 'message' => "{$verb} {$count} invitations"];
+    }
+
+    /**
+     * @return array{error: string|null, message: string|null}
+     */
+    public static function bulkActionStateNative(mixed $action, mixed $ids, int $count = 0): array
+    {
+        return GdprRequestController::wave29Native(13, ['action' => $action, 'ids' => $ids, 'count' => $count]) ?? self::bulkActionStatePhp($action, $ids, $count);
     }
 }
