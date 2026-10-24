@@ -15779,3 +15779,494 @@ mod w23_gdpr_tests {
         }
     }
 }
+// Wave 24.4: transactional mail copy and verification URL pure helpers. Append-only slice.
+// Input and output reuse the Wave 22 LE-u32 frames (u32::MAX = PHP null). PHP owns
+// models, configuration, routing, clocks and the final mail objects.
+const W24_MAIL_OPERATIONS: u32 = 7;
+
+fn w24_flag(value: &[u8]) -> Result<bool, isize> {
+    match value {
+        b"1" => Ok(true),
+        b"0" => Ok(false),
+        _ => Err(-1),
+    }
+}
+
+/// PHP 8.2+ `ucfirst()`: locale-insensitive ASCII uppercasing of the first byte.
+fn w24_ucfirst(value: &[u8]) -> Vec<u8> {
+    let mut output = value.to_vec();
+    if let Some(first) = output.first_mut() {
+        first.make_ascii_uppercase();
+    }
+    output
+}
+
+fn w24_hmac_sha256_hex(key: &[u8], message: &[u8]) -> [u8; 64] {
+    use crate::metadata::candidate_inventory::sha256;
+    let mut block = [0u8; 64];
+    if key.len() > 64 {
+        block[..32].copy_from_slice(&sha256(key));
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+    let mut inner = Vec::with_capacity(64 + message.len());
+    inner.extend(block.iter().map(|byte| byte ^ 0x36));
+    inner.extend_from_slice(message);
+    let inner_hash = sha256(&inner);
+    let mut outer = [0u8; 96];
+    for (slot, byte) in outer.iter_mut().zip(block) {
+        *slot = byte ^ 0x5c;
+    }
+    outer[64..].copy_from_slice(&inner_hash);
+    let digest = sha256(&outer);
+    let mut hex = [0u8; 64];
+    for (index, byte) in digest.iter().enumerate() {
+        hex[index * 2] = b"0123456789abcdef"[usize::from(byte >> 4)];
+        hex[index * 2 + 1] = b"0123456789abcdef"[usize::from(byte & 15)];
+    }
+    hex
+}
+
+fn w24_mail_output(operation: u32, input: &[u8]) -> Result<Vec<u8>, isize> {
+    if operation >= W24_MAIL_OPERATIONS {
+        return Err(-1);
+    }
+    let frames = wave22_frames(input)?;
+    let expected = match operation {
+        0 => 5,
+        3 => 3,
+        5 => 1,
+        _ => 2,
+    };
+    if frames.len() != expected {
+        return Err(-1);
+    }
+    let mut output = Vec::new();
+    match operation {
+        // AccountWillExpire: [account, days, flag, pendingName?, pendingStart?]
+        // -> [hasPending, pendingName?, pendingStart?, preheader].
+        0 => {
+            let account = w23_frame(&frames, 0)?;
+            let days = w23_frame(&frames, 1)?;
+            w23_i64(days)?;
+            let flag = w24_flag(w23_frame(&frames, 2)?)?;
+            let pending = flag && frames[3].is_some() && frames[4].is_some();
+            let mut preheader = [
+                b"Your ".as_slice(),
+                account,
+                b" role expires in ",
+                days,
+                b" day(s)",
+            ]
+            .concat();
+            if pending {
+                preheader.extend_from_slice(b", then ");
+                preheader.extend_from_slice(w23_frame(&frames, 3)?);
+                preheader.extend_from_slice(b" is scheduled");
+            }
+            preheader.push(b'.');
+            wave22_append_frame(&mut output, Some(if pending { b"1" } else { b"0" }))?;
+            wave22_append_frame(&mut output, if pending { frames[3] } else { None })?;
+            wave22_append_frame(&mut output, if pending { frames[4] } else { None })?;
+            wave22_append_frame(&mut output, Some(&preheader))?;
+        }
+        // InvitationMail subject: prefix . "You're invited to join " . site (raw bytes).
+        1 => {
+            output = [
+                w23_frame(&frames, 0)?,
+                b"You're invited to join ",
+                w23_frame(&frames, 1)?,
+            ]
+            .concat();
+        }
+        // InvitationMail content: [inviter?, site] -> [invitedByName, preheader].
+        2 => {
+            let name = frames[0].unwrap_or(b"A member");
+            let site = w23_frame(&frames, 1)?;
+            let preheader = [name, b" has invited you to join ", site, b"."].concat();
+            wave22_append_frame(&mut output, Some(name))?;
+            wave22_append_frame(&mut output, Some(&preheader))?;
+        }
+        // IncidentDetected: [resolved, impact, services] -> [status, impact, subject, preheader].
+        3 => {
+            let resolved = w24_flag(w23_frame(&frames, 0)?)?;
+            let impact = w24_ucfirst(w23_frame(&frames, 1)?);
+            let services = w23_frame(&frames, 2)?;
+            let status: &[u8] = if resolved { b"Resolved" } else { b"Detected" };
+            let subject = [b"Service incident ".as_slice(), status, b": ", services].concat();
+            let preheader = if resolved {
+                [
+                    impact.as_slice(),
+                    b" incident on ",
+                    services,
+                    b" has been resolved.",
+                ]
+                .concat()
+            } else {
+                [
+                    impact.as_slice(),
+                    b" impact incident detected on ",
+                    services,
+                    b".",
+                ]
+                .concat()
+            };
+            for field in [
+                status,
+                impact.as_slice(),
+                subject.as_slice(),
+                preheader.as_slice(),
+            ] {
+                wave22_append_frame(&mut output, Some(field))?;
+            }
+        }
+        // AccountChange: [site, role?] -> [account, preheader].
+        4 => {
+            let site = w23_frame(&frames, 0)?;
+            let account = frames[1].unwrap_or(b"User");
+            let preheader = [
+                b"Your ".as_slice(),
+                site,
+                b" account level was updated to ",
+                account,
+                b".",
+            ]
+            .concat();
+            wave22_append_frame(&mut output, Some(account))?;
+            wave22_append_frame(&mut output, Some(&preheader))?;
+        }
+        // VerifyEmailBranded origin: trim, null when empty, default https://, rtrim '/'.
+        5 => {
+            let url = wave22_php_trim(w23_frame(&frames, 0)?);
+            if url.is_empty() {
+                wave22_append_frame(&mut output, None)?;
+            } else {
+                let lower: Vec<u8> = url.iter().take(8).map(u8::to_ascii_lowercase).collect();
+                let mut origin = if lower.starts_with(b"http://") || lower.starts_with(b"https://")
+                {
+                    url.to_vec()
+                } else {
+                    [b"https://".as_slice(), url].concat()
+                };
+                let end = origin
+                    .iter()
+                    .rposition(|byte| *byte != b'/')
+                    .map_or(0, |index| index + 1);
+                origin.truncate(end);
+                wave22_append_frame(&mut output, Some(&origin))?;
+            }
+        }
+        // VerifyEmailBranded signature: url . ('?'|'&') . "signature=" . hmac_sha256_hex(url, key).
+        6 => {
+            let url = w23_frame(&frames, 0)?;
+            let key = w23_frame(&frames, 1)?;
+            output.reserve(url.len() + 75);
+            output.extend_from_slice(url);
+            output.push(if url.contains(&b'?') { b'&' } else { b'?' });
+            output.extend_from_slice(b"signature=");
+            output.extend_from_slice(&w24_hmac_sha256_hex(key, url));
+        }
+        _ => return Err(-1),
+    }
+    Ok(output)
+}
+
+/// Transactional mail and verification URL helpers. Input/output byte regions
+/// must be non-null (also when empty), allocated for their stated extents, and
+/// fit isize without address overflow. Byte alignment is sufficient; there are
+/// no typed output pointers. Returns bytes written, -1 on invalid input or
+/// panic, or the negated required length on insufficient capacity. Errors never
+/// modify output. Input and output may overlap: output is built before copying.
+///
+/// # Safety
+/// Caller guarantees allocation validity for every region that passes the
+/// structural checks; arbitrary non-null addresses cannot be proven allocated.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w24_transactional_mail_verify(
+    operation: u32,
+    input: *const u8,
+    len: usize,
+    out: *mut u8,
+    out_cap: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, len) || !cleaning_ffi_region_valid(out, out_cap) {
+            return -1;
+        }
+        let output = {
+            let input = unsafe { slice::from_raw_parts(input, len) };
+            match w24_mail_output(operation, input) {
+                Ok(output) => output,
+                Err(_) => return -1,
+            }
+        };
+        let Ok(needed) = i32::try_from(output.len()) else {
+            return -1;
+        };
+        if output.len() > out_cap {
+            return -needed;
+        }
+        if !output.is_empty() {
+            unsafe { std::ptr::copy_nonoverlapping(output.as_ptr(), out, output.len()) };
+        }
+        needed
+    }))
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod w24_transactional_mail_tests {
+    use super::*;
+
+    fn wire(values: &[Option<&[u8]>]) -> Vec<u8> {
+        let mut output = Vec::new();
+        for value in values {
+            wave22_append_frame(&mut output, *value).unwrap();
+        }
+        output
+    }
+
+    #[test]
+    fn mail_copy_matches_php_interpolation_and_null_semantics() {
+        assert_eq!(
+            w24_mail_output(
+                0,
+                &wire(&[
+                    Some(b"Gold"),
+                    Some(b"-3"),
+                    Some(b"1"),
+                    Some(b"VIP"),
+                    Some(b"Oct 1, 2026")
+                ])
+            )
+            .unwrap(),
+            wire(&[
+                Some(b"1"),
+                Some(b"VIP"),
+                Some(b"Oct 1, 2026"),
+                Some(b"Your Gold role expires in -3 day(s), then VIP is scheduled.")
+            ])
+        );
+        assert_eq!(
+            w24_mail_output(
+                0,
+                &wire(&[Some(b"\0\xff"), Some(b"5"), Some(b"1"), Some(b"VIP"), None])
+            )
+            .unwrap(),
+            wire(&[
+                Some(b"0"),
+                None,
+                None,
+                Some(b"Your \0\xff role expires in 5 day(s).")
+            ])
+        );
+        assert_eq!(
+            w24_mail_output(1, &wire(&[Some(b"[S] "), Some(b"")])).unwrap(),
+            b"[S] You're invited to join "
+        );
+        assert_eq!(
+            w24_mail_output(2, &wire(&[None, Some(b"Site")])).unwrap(),
+            wire(&[
+                Some(b"A member"),
+                Some(b"A member has invited you to join Site.")
+            ])
+        );
+        assert_eq!(
+            w24_mail_output(2, &wire(&[Some(b""), Some(b"Site")])).unwrap(),
+            wire(&[Some(b""), Some(b" has invited you to join Site.")])
+        );
+        assert_eq!(
+            w24_mail_output(3, &wire(&[Some(b"1"), Some(b"major"), Some(b"Web, API")])).unwrap(),
+            wire(&[
+                Some(b"Resolved"),
+                Some(b"Major"),
+                Some(b"Service incident Resolved: Web, API"),
+                Some(b"Major incident on Web, API has been resolved.")
+            ])
+        );
+        assert_eq!(
+            w24_mail_output(3, &wire(&[Some(b"0"), Some(b"\xe9x"), Some(b"")])).unwrap(),
+            wire(&[
+                Some(b"Detected"),
+                Some(b"\xe9x"),
+                Some(b"Service incident Detected: "),
+                Some(b"\xe9x impact incident detected on .")
+            ])
+        );
+        assert_eq!(
+            w24_mail_output(4, &wire(&[Some(b"Site"), None])).unwrap(),
+            wire(&[
+                Some(b"User"),
+                Some(b"Your Site account level was updated to User.")
+            ])
+        );
+        for (raw, expected) in [
+            (b"".as_slice(), None),
+            (b" \t\0\x0b\r\n", None),
+            (
+                b" HTTPS://Example.test/// ",
+                Some(b"HTTPS://Example.test".as_slice()),
+            ),
+            (b"example.test/", Some(b"https://example.test")),
+            (b"/", Some(b"https:")),
+            (b"ftp://x", Some(b"https://ftp://x")),
+            (b"http:/x", Some(b"https://http:/x")),
+        ] {
+            assert_eq!(
+                w24_mail_output(5, &wire(&[Some(raw)])).unwrap(),
+                wire(&[expected])
+            );
+        }
+        // RFC 4231 test case 2.
+        assert_eq!(
+            &w24_hmac_sha256_hex(b"Jefe", b"what do ya want for nothing?"),
+            b"5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        let long_key = [0xaau8; 131];
+        assert_eq!(
+            &w24_hmac_sha256_hex(
+                &long_key,
+                b"Test Using Larger Than Block-Size Key - Hash Key First"
+            ),
+            b"60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+        let signed = w24_mail_output(6, &wire(&[Some(b"https://x/v?a=1"), Some(b"k")])).unwrap();
+        assert!(signed.starts_with(b"https://x/v?a=1&signature="));
+        assert_eq!(signed.len(), 15 + 11 + 64);
+        assert!(
+            w24_mail_output(6, &wire(&[Some(b"https://x/v"), Some(b"")]))
+                .unwrap()
+                .starts_with(b"https://x/v?signature=")
+        );
+    }
+
+    #[test]
+    fn mail_copy_rejects_malformed_frames() {
+        for (operation, input) in [
+            (7, wire(&[Some(b"x")])),
+            (0, wire(&[Some(b"a"), Some(b"05"), Some(b"0"), None, None])),
+            (0, wire(&[Some(b"a"), Some(b"5"), Some(b"2"), None, None])),
+            (0, wire(&[None, Some(b"5"), Some(b"0"), None, None])),
+            (0, wire(&[Some(b"a"), Some(b"5"), Some(b"0"), None])),
+            (1, wire(&[None, Some(b"s")])),
+            (2, wire(&[Some(b"a"), None])),
+            (3, wire(&[Some(b"true"), Some(b"minor"), Some(b"s")])),
+            (4, wire(&[None, Some(b"r")])),
+            (5, wire(&[None])),
+            (5, Vec::new()),
+            (6, wire(&[Some(b"u"), None])),
+            (6, vec![1, 0, 0]),
+        ] {
+            assert!(
+                w24_mail_output(operation, &input).is_err(),
+                "operation {operation}"
+            );
+        }
+    }
+
+    #[test]
+    fn mail_abi_checks_regions_and_reports_required_capacity_without_writes() {
+        let input = wire(&[Some(b"P "), Some(b"S")]);
+        let expected = b"P You're invited to join S";
+        let mut output = [0x7bu8; 64];
+        unsafe {
+            assert_eq!(
+                nntmux_w24_transactional_mail_verify(
+                    1,
+                    input.as_ptr(),
+                    input.len(),
+                    output.as_mut_ptr(),
+                    3
+                ),
+                -(expected.len() as i32)
+            );
+            assert_eq!(output, [0x7b; 64]);
+            assert_eq!(
+                nntmux_w24_transactional_mail_verify(
+                    1,
+                    std::ptr::null(),
+                    0,
+                    output.as_mut_ptr(),
+                    64
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_w24_transactional_mail_verify(
+                    1,
+                    input.as_ptr(),
+                    input.len(),
+                    std::ptr::null_mut(),
+                    0
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_w24_transactional_mail_verify(
+                    1,
+                    usize::MAX as *const u8,
+                    1,
+                    output.as_mut_ptr(),
+                    64
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_w24_transactional_mail_verify(
+                    1,
+                    input.as_ptr(),
+                    input.len(),
+                    usize::MAX as *mut u8,
+                    1
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_w24_transactional_mail_verify(
+                    1,
+                    input.as_ptr(),
+                    usize::MAX,
+                    output.as_mut_ptr(),
+                    64
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_w24_transactional_mail_verify(
+                    1,
+                    input.as_ptr(),
+                    input.len(),
+                    output.as_mut_ptr(),
+                    usize::MAX
+                ),
+                -1
+            );
+            assert_eq!(output, [0x7b; 64]);
+            assert_eq!(
+                nntmux_w24_transactional_mail_verify(
+                    1,
+                    input.as_ptr(),
+                    input.len(),
+                    output.as_mut_ptr().add(1),
+                    expected.len()
+                ),
+                expected.len() as i32
+            );
+            assert_eq!(&output[1..=expected.len()], expected);
+            assert_eq!(output[0], 0x7b);
+            assert_eq!(output[expected.len() + 1], 0x7b);
+            let mut overlap = [input.clone(), vec![0; 32]].concat();
+            assert_eq!(
+                nntmux_w24_transactional_mail_verify(
+                    1,
+                    overlap.as_ptr(),
+                    input.len(),
+                    overlap.as_mut_ptr(),
+                    overlap.len()
+                ),
+                expected.len() as i32
+            );
+            assert_eq!(&overlap[..expected.len()], expected);
+        }
+    }
+}
