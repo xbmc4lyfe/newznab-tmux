@@ -21,6 +21,8 @@ use App\Services\Nzb\NzbUploadStagingService;
 use App\Services\Releases\ReleaseBrowseService;
 use App\Services\Releases\ReleaseSearchService;
 use App\Support\FilenameSanitizer;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Contracts\Foundation\Application;
 use Illuminate\Contracts\Routing\ResponseFactory;
 use Illuminate\Http\RedirectResponse;
@@ -34,6 +36,7 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use Symfony\Component\HttpFoundation\HeaderUtils;
 use Symfony\Component\HttpFoundation\StreamedResponse;
+use Throwable;
 
 class ApiController extends BasePageController
 {
@@ -41,7 +44,50 @@ class ApiController extends BasePageController
      * Functions reachable over HTTP QUERY, which RFC 10008 defines as safe.
      * `g` (download accounting, cart deletion with del=1) and `nzbAdd` are excluded.
      */
+    public const string FFI_CDEF = <<<'CDEF'
+    int32_t nntmux_api_function_alias(const char *t, size_t t_len, char *out, size_t cap);
+    int32_t nntmux_api_query_safe_function(const char *function, size_t function_len);
+    int32_t nntmux_api_sort_normalize(const char *sort, size_t sort_len, char *out, size_t cap);
+    int32_t nntmux_api_max_age(const char *value, size_t value_len, int64_t *out_value);
+    int32_t nntmux_api_tv_air_date(
+        const char *series,
+        size_t series_len,
+        const char *episode,
+        size_t episode_len,
+        char *out,
+        size_t cap
+    );
+    CDEF;
+
+    public const int SORT_VALID = 0;
+
+    public const int SORT_EMPTY = 1;
+
+    public const int SORT_INVALID = 2;
+
+    public const int MAX_AGE_OK = 0;
+
+    public const int MAX_AGE_EMPTY = 1;
+
+    public const int MAX_AGE_NOT_NUMERIC = 2;
+
     private const QUERY_SAFE_FUNCTIONS = ['s', 'tv', 'm', 'music', 'book', 'anime', 'd', 'c', 'n'];
+
+    private const int FFI_UNKNOWN_FUNCTION = -2147483647;
+
+    private const int FFI_SORT_EMPTY = -2147483647;
+
+    private const int FFI_SORT_INVALID = -2147483646;
+
+    private const int FFI_MAX_AGE_DEFER = 3;
+
+    /**
+     * Production default stays false until benchmark/parity sign-off; see
+     * tests/Unit/RustApiV1ManticoreMediaIndexCommandsParityTest.php.
+     */
+    private static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
 
     private string $type;
 
@@ -89,65 +135,21 @@ class ApiController extends BasePageController
     /**
      * @return Application|\Illuminate\Foundation\Application|RedirectResponse|Redirector|Response|StreamedResponse|void
      *
-     * @throws \Throwable
+     * @throws Throwable
      */
     public function api(Request $request)
     {
         // API functions.
-        $function = 's';
         if ($request->has('t')) {
-            switch ($request->input('t')) {
-                case 'd':
-                case 'details':
-                    $function = 'd';
-                    break;
-                case 'g':
-                case 'get':
-                    $function = 'g';
-                    break;
-                case 's':
-                case 'search':
-                    break;
-                case 'c':
-                case 'caps':
-                    $function = 'c';
-                    break;
-                case 'tv':
-                case 'tvsearch':
-                    $function = 'tv';
-                    break;
-                case 'm':
-                case 'movie':
-                    $function = 'm';
-                    break;
-                case 'music':
-                case 'audio':
-                    $function = 'music';
-                    break;
-                case 'b':
-                case 'book':
-                    $function = 'book';
-                    break;
-                case 'anime':
-                    $function = 'anime';
-                    break;
-                case 'gn':
-                case 'n':
-                case 'nfo':
-                case 'info':
-                    $function = 'n';
-                    break;
-                case 'nzbadd':
-                    $function = 'nzbAdd';
-                    break;
-                default:
-                    return showApiError(202, 'No such function ('.$request->input('t').')');
+            $function = self::apiFunctionName($request->input('t'));
+            if ($function === null) {
+                return showApiError(202, 'No such function ('.$request->input('t').')');
             }
         } else {
             return showApiError(200, 'Missing parameter (t)');
         }
 
-        if ($request->isMethod('QUERY') && ! in_array($function, self::QUERY_SAFE_FUNCTIONS, true)) {
+        if ($request->isMethod('QUERY') && ! self::isQuerySafeFunction($function)) {
             return showApiError(203, 'Function not available via QUERY');
         }
 
@@ -157,7 +159,7 @@ class ApiController extends BasePageController
 
         // Page is accessible only by the apikey
 
-        if ($function !== 'c' && $function !== 'r') { // @phpstan-ignore notIdentical.alwaysTrue
+        if ($function !== 'c' && $function !== 'r') {
             if ($request->missing('apikey') || ($request->has('apikey') && empty($request->input('apikey')))) {
                 return showApiError(200, 'Missing parameter (apikey)');
             }
@@ -339,11 +341,7 @@ class ApiController extends BasePageController
                 $series = $request->input('season') ?? '';
                 $episode = $request->input('ep') ?? '';
 
-                if (preg_match('#^(19|20)\d{2}$#', $series, $year) && str_contains($episode, '/')) {
-                    $airDate = str_replace('/', '-', $year[0].'-'.$episode);
-                }
-
-                $airDate = $airDate ?? '';
+                $airDate = self::tvAirDate($series, $episode);
                 $searchName = $request->input('q') ?? '';
                 $relData = $this->releaseRowCache->remember('v1', 'tv', [
                     'has_search' => true,
@@ -804,18 +802,13 @@ class ApiController extends BasePageController
      */
     public function maxAge(Request $request)
     {
-        $maxAge = -1;
-        if ($request->has('maxage')) {
-            if (! $request->filled('maxage')) {
-                return showApiError(201, 'Incorrect parameter (maxage must not be empty)');
-            } elseif (! is_numeric($request->input('maxage'))) {
-                return showApiError(201, 'Incorrect parameter (maxage must be numeric)');
-            } else {
-                $maxAge = (int) $request->input('maxage');
-            }
-        }
+        $maxAge = self::maxAgeValue($request->has('maxage'), $request->input('maxage'));
 
-        return $maxAge;
+        return match ($maxAge['status']) {
+            self::MAX_AGE_EMPTY => showApiError(201, 'Incorrect parameter (maxage must not be empty)'),
+            self::MAX_AGE_NOT_NUMERIC => showApiError(201, 'Incorrect parameter (maxage must be numeric)'),
+            default => $maxAge['value'],
+        };
     }
 
     /**
@@ -866,16 +859,13 @@ class ApiController extends BasePageController
             return $defaultSort;
         }
 
-        $sort = strtolower(trim((string) $request->input('sort')));
-        if ($sort === '') {
-            return showApiError(201, 'Incorrect parameter (sort must not be empty)');
-        }
+        $sort = self::normalizeSortValue((string) $request->input('sort'));
 
-        if (! preg_match('/^(cat|name|size|files|stats|posted)_(asc|desc)$/', $sort)) {
-            return showApiError(201, 'Incorrect parameter (sort must be one of: cat_asc/desc, name_asc/desc, size_asc/desc, files_asc/desc, stats_asc/desc, posted_asc/desc)');
-        }
-
-        return $sort;
+        return match ($sort['status']) {
+            self::SORT_EMPTY => showApiError(201, 'Incorrect parameter (sort must not be empty)'),
+            self::SORT_INVALID => showApiError(201, 'Incorrect parameter (sort must be one of: cat_asc/desc, name_asc/desc, size_asc/desc, files_asc/desc, stats_asc/desc, posted_asc/desc)'),
+            default => $sort['sort'],
+        };
     }
 
     /**
@@ -888,6 +878,312 @@ class ApiController extends BasePageController
         if ($request->has($parameter) && $request->isNotFilled($parameter)) {
             return showApiError(201, 'Incorrect parameter ('.$parameter.' must not be empty)');
         }
+    }
+
+    /**
+     * Overrides the base page toggle for this controller's helpers; `null` restores the PHP default.
+     */
+    public static function setUseRustFfi(?bool $useRustFfi): void
+    {
+        self::$useRustFfi = $useRustFfi ?? false;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    public static function setFfiForTesting(FFI|false|null $ffi): void
+    {
+        self::$ffi = $ffi;
+    }
+
+    /**
+     * Canonical API function for a `t` alias, or null for an unknown function.
+     */
+    public static function apiFunctionName(mixed $t): ?string
+    {
+        return self::$useRustFfi ? self::apiFunctionNameNative($t) : self::apiFunctionNamePhp($t);
+    }
+
+    public static function apiFunctionNamePhp(mixed $t): ?string
+    {
+        // Loose `switch` comparison, as the request dispatcher has always used.
+        switch ($t) {
+            case 'd':
+            case 'details':
+                return 'd';
+            case 'g':
+            case 'get':
+                return 'g';
+            case 's':
+            case 'search':
+                return 's';
+            case 'c':
+            case 'caps':
+                return 'c';
+            case 'tv':
+            case 'tvsearch':
+                return 'tv';
+            case 'm':
+            case 'movie':
+                return 'm';
+            case 'music':
+            case 'audio':
+                return 'music';
+            case 'b':
+            case 'book':
+                return 'book';
+            case 'anime':
+                return 'anime';
+            case 'gn':
+            case 'n':
+            case 'nfo':
+            case 'info':
+                return 'n';
+            case 'nzbadd':
+                return 'nzbAdd';
+            default:
+                return null;
+        }
+    }
+
+    /**
+     * Strings are matched natively; other types keep PHP loose comparison.
+     */
+    public static function apiFunctionNameNative(mixed $t): ?string
+    {
+        $ffi = self::ffi();
+        if ($ffi === null || ! \is_string($t)) {
+            return self::apiFunctionNamePhp($t);
+        }
+
+        try {
+            $capacity = 0;
+            $out = RustPipelineLibrary::obtainScratch($ffi, 16, $capacity);
+            if ($out === null) {
+                return self::apiFunctionNamePhp($t);
+            }
+            $written = self::callFfi($ffi, 'nntmux_api_function_alias', $t, \strlen($t), $out, $capacity);
+            if ($written === self::FFI_UNKNOWN_FUNCTION) {
+                return null;
+            }
+            if (! \is_int($written) || $written <= 0 || $written > $capacity) {
+                return self::apiFunctionNamePhp($t);
+            }
+
+            return FFI::string($out, $written);
+        } catch (Throwable) {
+            return self::apiFunctionNamePhp($t);
+        }
+    }
+
+    /**
+     * Whether a canonical function may be served over HTTP QUERY.
+     */
+    public static function isQuerySafeFunction(string $function): bool
+    {
+        return self::$useRustFfi ? self::isQuerySafeFunctionNative($function) : self::isQuerySafeFunctionPhp($function);
+    }
+
+    public static function isQuerySafeFunctionPhp(string $function): bool
+    {
+        return \in_array($function, self::QUERY_SAFE_FUNCTIONS, true);
+    }
+
+    public static function isQuerySafeFunctionNative(string $function): bool
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return self::isQuerySafeFunctionPhp($function);
+        }
+
+        try {
+            return match (self::callFfi($ffi, 'nntmux_api_query_safe_function', $function, \strlen($function))) {
+                0 => false,
+                1 => true,
+                default => self::isQuerySafeFunctionPhp($function),
+            };
+        } catch (Throwable) {
+            return self::isQuerySafeFunctionPhp($function);
+        }
+    }
+
+    /**
+     * `strtolower(trim($sort))` validated against `{cat|name|size|files|stats|posted}_{asc|desc}`.
+     *
+     * @return array{status: int, sort: string}
+     */
+    public static function normalizeSortValue(string $sort): array
+    {
+        return self::$useRustFfi ? self::normalizeSortValueNative($sort) : self::normalizeSortValuePhp($sort);
+    }
+
+    /**
+     * @return array{status: int, sort: string}
+     */
+    public static function normalizeSortValuePhp(string $sort): array
+    {
+        $sort = strtolower(trim($sort));
+        if ($sort === '') {
+            return ['status' => self::SORT_EMPTY, 'sort' => ''];
+        }
+
+        if (! preg_match('/^(cat|name|size|files|stats|posted)_(asc|desc)$/', $sort)) {
+            return ['status' => self::SORT_INVALID, 'sort' => ''];
+        }
+
+        return ['status' => self::SORT_VALID, 'sort' => $sort];
+    }
+
+    /**
+     * @return array{status: int, sort: string}
+     */
+    public static function normalizeSortValueNative(string $sort): array
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return self::normalizeSortValuePhp($sort);
+        }
+
+        try {
+            $capacity = 0;
+            $out = RustPipelineLibrary::obtainScratch($ffi, 16, $capacity);
+            if ($out === null) {
+                return self::normalizeSortValuePhp($sort);
+            }
+            $written = self::callFfi($ffi, 'nntmux_api_sort_normalize', $sort, \strlen($sort), $out, $capacity);
+
+            return match (true) {
+                $written === self::FFI_SORT_EMPTY => ['status' => self::SORT_EMPTY, 'sort' => ''],
+                $written === self::FFI_SORT_INVALID => ['status' => self::SORT_INVALID, 'sort' => ''],
+                \is_int($written) && $written > 0 && $written <= $capacity => ['status' => self::SORT_VALID, 'sort' => FFI::string($out, $written)],
+                default => self::normalizeSortValuePhp($sort),
+            };
+        } catch (Throwable) {
+            return self::normalizeSortValuePhp($sort);
+        }
+    }
+
+    /**
+     * `maxage` validation: absent is -1; present values must be filled and numeric.
+     *
+     * @return array{status: int, value: int}
+     */
+    public static function maxAgeValue(bool $present, mixed $value): array
+    {
+        return self::$useRustFfi ? self::maxAgeValueNative($present, $value) : self::maxAgeValuePhp($present, $value);
+    }
+
+    /**
+     * @return array{status: int, value: int}
+     */
+    public static function maxAgeValuePhp(bool $present, mixed $value): array
+    {
+        if (! $present) {
+            return ['status' => self::MAX_AGE_OK, 'value' => -1];
+        }
+        // Laravel `Request::filled()`.
+        if (! \is_bool($value) && ! \is_array($value) && trim((string) $value) === '') {
+            return ['status' => self::MAX_AGE_EMPTY, 'value' => -1];
+        }
+        if (! is_numeric($value)) {
+            return ['status' => self::MAX_AGE_NOT_NUMERIC, 'value' => -1];
+        }
+
+        return ['status' => self::MAX_AGE_OK, 'value' => (int) $value];
+    }
+
+    /**
+     * Present strings are validated natively; float forms and long integers are cast by PHP.
+     *
+     * @return array{status: int, value: int}
+     */
+    public static function maxAgeValueNative(bool $present, mixed $value): array
+    {
+        $ffi = self::ffi();
+        if ($ffi === null || ! $present || ! \is_string($value)) {
+            return self::maxAgeValuePhp($present, $value);
+        }
+
+        try {
+            $out = $ffi->new('int64_t[1]');
+            $status = self::callFfi($ffi, 'nntmux_api_max_age', $value, \strlen($value), $out);
+
+            return match ($status) {
+                self::MAX_AGE_OK => ['status' => self::MAX_AGE_OK, 'value' => (int) $out[0]],
+                self::FFI_MAX_AGE_DEFER => ['status' => self::MAX_AGE_OK, 'value' => (int) $value],
+                self::MAX_AGE_EMPTY, self::MAX_AGE_NOT_NUMERIC => ['status' => $status, 'value' => -1],
+                default => self::maxAgeValuePhp($present, $value),
+            };
+        } catch (Throwable) {
+            return self::maxAgeValuePhp($present, $value);
+        }
+    }
+
+    /**
+     * TV airdate: a `19xx`/`20xx` season and an episode containing `/` become `YYYY-MM-DD` style; otherwise empty.
+     */
+    public static function tvAirDate(mixed $series, mixed $episode): string
+    {
+        return self::$useRustFfi ? self::tvAirDateNative($series, $episode) : self::tvAirDatePhp($series, $episode);
+    }
+
+    public static function tvAirDatePhp(mixed $series, mixed $episode): string
+    {
+        if (preg_match('#^(19|20)\d{2}$#', $series, $year) && str_contains($episode, '/')) {
+            return str_replace('/', '-', $year[0].'-'.$episode);
+        }
+
+        return '';
+    }
+
+    /**
+     * Strings are handled natively; other types keep the PHP behavior, including its type errors.
+     */
+    public static function tvAirDateNative(mixed $series, mixed $episode): string
+    {
+        $ffi = self::ffi();
+        if ($ffi === null || ! \is_string($series) || ! \is_string($episode)) {
+            return self::tvAirDatePhp($series, $episode);
+        }
+
+        try {
+            $capacity = 0;
+            $out = RustPipelineLibrary::obtainScratch($ffi, \strlen($episode) + 5, $capacity);
+            if ($out === null) {
+                return self::tvAirDatePhp($series, $episode);
+            }
+            $written = self::callFfi($ffi, 'nntmux_api_tv_air_date', $series, \strlen($series), $episode, \strlen($episode), $out, $capacity);
+            if (! \is_int($written) || $written < 0 || $written > $capacity) {
+                return self::tvAirDatePhp($series, $episode);
+            }
+
+            return $written === 0 ? '' : FFI::string($out, $written);
+        } catch (Throwable) {
+            return self::tvAirDatePhp($series, $episode);
+        }
+    }
+
+    private static function callFfi(FFI $ffi, string $symbol, mixed ...$args): mixed
+    {
+        return $ffi->$symbol(...$args);
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (self::$ffi === false) {
+            return null;
+        }
+
+        if (self::$ffi instanceof FFI) {
+            return self::$ffi;
+        }
+
+        $ffi = RustPipelineLibrary::resolveDomain('search', self::FFI_CDEF);
+        self::$ffi = $ffi ?? false;
+
+        return $ffi;
     }
 
     private function hasMovieSearchParameters(Request $request): bool

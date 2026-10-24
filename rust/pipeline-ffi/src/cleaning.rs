@@ -18667,3 +18667,1383 @@ pub unsafe extern "C" fn nntmux_w28_admin_regex_group_controllers(
     }))
     .unwrap_or(-1)
 }
+
+pub mod wave29_admin_gdpr_reg_promo_invite_history {
+    use super::{remover_is_numeric, wave22_append_frame, wave22_canonical_i64, wave22_frames};
+    use std::collections::HashSet;
+
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+    enum Key {
+        Int(i64),
+        String(Vec<u8>),
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Node {
+        Null,
+        Bool(bool),
+        Int(i64),
+        Float(Vec<u8>),
+        String(Vec<u8>),
+        Array(Vec<(Key, Node)>),
+    }
+
+    fn string(value: impl AsRef<[u8]>) -> Node {
+        Node::String(value.as_ref().to_vec())
+    }
+
+    fn map(values: Vec<(&str, Node)>) -> Node {
+        Node::Array(
+            values
+                .into_iter()
+                .map(|(key, value)| (Key::String(key.as_bytes().to_vec()), value))
+                .collect(),
+        )
+    }
+
+    fn list(values: Vec<Node>) -> Node {
+        Node::Array(
+            values
+                .into_iter()
+                .enumerate()
+                .map(|(key, value)| (Key::Int(key as i64), value))
+                .collect(),
+        )
+    }
+
+    fn array(node: &Node) -> Result<&[(Key, Node)], isize> {
+        match node {
+            Node::Array(values) => Ok(values),
+            _ => Err(-1),
+        }
+    }
+
+    fn field<'a>(values: &'a [(Key, Node)], name: &str) -> &'a Node {
+        values
+            .iter()
+            .find_map(|(key, value)| match key {
+                Key::String(key) if key == name.as_bytes() => Some(value),
+                _ => None,
+            })
+            .unwrap_or(&Node::Null)
+    }
+
+    fn has(values: &[(Key, Node)], name: &str) -> bool {
+        values
+            .iter()
+            .any(|(key, _)| matches!(key, Key::String(key) if key == name.as_bytes()))
+    }
+
+    fn set(values: &mut Vec<(Key, Node)>, name: &str, value: Node) {
+        if let Some((_, current)) = values
+            .iter_mut()
+            .find(|(key, _)| matches!(key, Key::String(key) if key == name.as_bytes()))
+        {
+            *current = value;
+        } else {
+            values.push((Key::String(name.as_bytes().to_vec()), value));
+        }
+    }
+
+    fn bytes(node: &Node) -> Result<&[u8], isize> {
+        match node {
+            Node::String(value) => Ok(value),
+            _ => Err(-1),
+        }
+    }
+
+    fn canonical_count(value: &[u8]) -> Result<usize, isize> {
+        let text = std::str::from_utf8(value).map_err(|_| -1isize)?;
+        let count = text.parse::<usize>().map_err(|_| -1isize)?;
+        if count.to_string().as_bytes() != value {
+            return Err(-1);
+        }
+        Ok(count)
+    }
+
+    fn key_identity(key: &Key) -> Key {
+        match key {
+            Key::String(value) => wave22_canonical_i64(value)
+                .map(Key::Int)
+                .unwrap_or_else(|_| key.clone()),
+            _ => key.clone(),
+        }
+    }
+
+    fn parse_node(
+        frames: &[Option<&[u8]>],
+        cursor: &mut usize,
+        depth: usize,
+    ) -> Result<Node, isize> {
+        if depth > 64 {
+            return Err(-1);
+        }
+        let frame = frames
+            .get(*cursor)
+            .and_then(|value| *value)
+            .ok_or(-1isize)?;
+        *cursor += 1;
+        let (&kind, value) = frame.split_first().ok_or(-1isize)?;
+        match kind {
+            b'n' if value.is_empty() => Ok(Node::Null),
+            b'b' if value == b"0" => Ok(Node::Bool(false)),
+            b'b' if value == b"1" => Ok(Node::Bool(true)),
+            b'i' => Ok(Node::Int(wave22_canonical_i64(value)?)),
+            b'f' if !value.is_empty()
+                && remover_is_numeric(value)
+                && !value
+                    .iter()
+                    .any(|byte| byte.is_ascii_whitespace() || *byte == 0x0b) =>
+            {
+                let text = std::str::from_utf8(value).map_err(|_| -1isize)?;
+                // Non-finite values use the PHP fallback, including overflowing decimals.
+                if !text.parse::<f64>().map_err(|_| -1isize)?.is_finite() {
+                    return Err(-1);
+                }
+                Ok(Node::Float(value.to_vec()))
+            }
+            b's' => Ok(Node::String(value.to_vec())),
+            b'a' => {
+                let count = canonical_count(value)?;
+                if count > frames.len().saturating_sub(*cursor) / 2 {
+                    return Err(-1);
+                }
+                let mut values = Vec::with_capacity(count);
+                let mut keys = HashSet::with_capacity(count);
+                for _ in 0..count {
+                    let key = match parse_node(frames, cursor, depth + 1)? {
+                        Node::Int(value) => Key::Int(value),
+                        Node::String(value) => Key::String(value),
+                        _ => return Err(-1),
+                    };
+                    if !keys.insert(key_identity(&key)) {
+                        return Err(-1);
+                    }
+                    let value = parse_node(frames, cursor, depth + 1)?;
+                    values.push((key, value));
+                }
+                Ok(Node::Array(values))
+            }
+            _ => Err(-1),
+        }
+    }
+
+    fn decode(input: &[u8]) -> Result<Node, isize> {
+        let frames = wave22_frames(input)?;
+        if frames.iter().any(Option::is_none) {
+            return Err(-1);
+        }
+        let mut cursor = 0;
+        let root = parse_node(&frames, &mut cursor, 0)?;
+        array(&root)?;
+        if cursor != frames.len() {
+            return Err(-1);
+        }
+        Ok(root)
+    }
+
+    fn encode_node(node: &Node, output: &mut Vec<u8>) -> Result<(), isize> {
+        let frame = match node {
+            Node::Null => b"n".to_vec(),
+            Node::Bool(false) => b"b0".to_vec(),
+            Node::Bool(true) => b"b1".to_vec(),
+            Node::Int(value) => [b"i".as_slice(), value.to_string().as_bytes()].concat(),
+            Node::Float(value) => [b"f".as_slice(), value].concat(),
+            Node::String(value) => [b"s".as_slice(), value].concat(),
+            Node::Array(values) => [b"a".as_slice(), values.len().to_string().as_bytes()].concat(),
+        };
+        wave22_append_frame(output, Some(&frame))?;
+        if let Node::Array(values) = node {
+            for (key, value) in values {
+                match key {
+                    Key::Int(value) => encode_node(&Node::Int(*value), output)?,
+                    Key::String(value) => encode_node(&Node::String(value.clone()), output)?,
+                }
+                encode_node(value, output)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn empty(node: &Node) -> bool {
+        match node {
+            Node::Null | Node::Bool(false) | Node::Int(0) => true,
+            Node::Float(value) => std::str::from_utf8(value)
+                .ok()
+                .and_then(|text| text.parse::<f64>().ok())
+                .is_some_and(|value| value == 0.0),
+            Node::String(value) => value.is_empty() || value == b"0",
+            Node::Array(value) => value.is_empty(),
+            _ => false,
+        }
+    }
+
+    fn boolean(node: &Node) -> Result<bool, isize> {
+        match node {
+            Node::Bool(value) => Ok(*value),
+            _ => Err(-1),
+        }
+    }
+
+    fn integer(node: &Node) -> Result<i64, isize> {
+        match node {
+            Node::Int(value) => Ok(*value),
+            _ => Err(-1),
+        }
+    }
+
+    fn optional_integer(node: &Node) -> Result<Option<i64>, isize> {
+        match node {
+            Node::Null => Ok(None),
+            _ => integer(node).map(Some),
+        }
+    }
+
+    fn sequence(node: &Node) -> Result<Vec<&Node>, isize> {
+        let values = array(node)?;
+        values
+            .iter()
+            .enumerate()
+            .map(|(position, (key, value))| {
+                if key == &Key::Int(position as i64) {
+                    Ok(value)
+                } else {
+                    Err(-1)
+                }
+            })
+            .collect()
+    }
+
+    fn trim(value: &[u8]) -> &[u8] {
+        let is_trim = |byte: &u8| matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b);
+        let start = value
+            .iter()
+            .position(|byte| !is_trim(byte))
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|byte| !is_trim(byte))
+            .map_or(start, |index| index + 1);
+        &value[start..end]
+    }
+
+    fn scalar(values: &[(Key, Node)], name: &str, default: &[u8]) -> Result<Node, isize> {
+        Ok(match field(values, name) {
+            Node::String(value) => string(value),
+            Node::Int(value) => string(value.to_string()),
+            Node::Bool(value) => string(if *value { b"1".as_slice() } else { b"" }),
+            Node::Null | Node::Array(_) => string(default),
+            // PHP casts floats using its configurable precision; retain its fallback.
+            Node::Float(_) => return Err(-1),
+        })
+    }
+
+    fn status_label(node: &Node) -> Result<Node, isize> {
+        Ok(match optional_integer(node)? {
+            Some(0) => string(b"Open"),
+            Some(1) => string(b"Invite"),
+            Some(2) => string(b"Closed"),
+            Some(_) => string(b"Unknown"),
+            None => Node::Null,
+        })
+    }
+
+    pub(super) fn output(operation: u32, input: &[u8]) -> Result<Vec<u8>, isize> {
+        let root = decode(input)?;
+        let values = array(&root)?;
+        let result = match operation {
+            0 => {
+                let kind = trim(bytes(field(values, "type"))?);
+                let status = trim(bytes(field(values, "status"))?);
+                map(vec![
+                    (
+                        "type",
+                        string(
+                            if [
+                                b"export".as_slice(),
+                                b"erasure",
+                                b"rectification",
+                                b"restriction",
+                            ]
+                            .contains(&kind)
+                            {
+                                kind
+                            } else {
+                                b""
+                            },
+                        ),
+                    ),
+                    (
+                        "status",
+                        string(
+                            if [
+                                b"pending".as_slice(),
+                                b"processing",
+                                b"completed",
+                                b"rejected",
+                                b"cancelled",
+                            ]
+                            .contains(&status)
+                            {
+                                status
+                            } else {
+                                b""
+                            },
+                        ),
+                    ),
+                ])
+            }
+            1 => map(vec![(
+                "open",
+                Node::Bool(matches!(
+                    bytes(field(values, "status"))?,
+                    b"pending" | b"processing"
+                )),
+            )]),
+            2 => {
+                let kind = bytes(field(values, "type"))?;
+                let status = bytes(field(values, "status"))?;
+                let action = bytes(field(values, "action"))?;
+                let subject_exists = boolean(field(values, "subject_exists"))?;
+                let is_admin = boolean(field(values, "is_admin"))?;
+                let invalid = match action {
+                    b"export" => b"This request cannot be exported.".as_slice(),
+                    b"erasure" => b"This erasure request cannot be completed.".as_slice(),
+                    _ => return Err(-1),
+                };
+                let error = if kind != action || !matches!(status, b"pending" | b"processing") {
+                    string(invalid)
+                } else if !subject_exists {
+                    string(b"The subject user could not be found.")
+                } else if action == b"erasure" && is_admin {
+                    string(b"Admin accounts cannot be erased from the GDPR request queue.")
+                } else {
+                    Node::Null
+                };
+                map(vec![("error", error)])
+            }
+            3 => {
+                if !has(values, "reason") {
+                    return Err(-1);
+                }
+                map(vec![
+                    ("rejected", Node::Bool(true)),
+                    ("reason", field(values, "reason").clone()),
+                ])
+            }
+            4 => {
+                let mut current = Vec::new();
+                let mut past = Vec::new();
+                for (index, row) in sequence(field(values, "periods"))?.into_iter().enumerate() {
+                    let row = array(row)?;
+                    if !has(row, "starts_at") || !has(row, "ends_at") {
+                        return Err(-1);
+                    }
+                    let starts = optional_integer(field(row, "starts_at"))?.unwrap_or(i64::MAX);
+                    let ends = optional_integer(field(row, "ends_at"))?.unwrap_or(0);
+                    let index = i64::try_from(index).map_err(|_| -1isize)?;
+                    if boolean(field(row, "ended"))? {
+                        past.push((ends, index));
+                    } else {
+                        current.push((starts, index));
+                    }
+                }
+                current.sort_by_key(|(date, _)| *date);
+                past.sort_by(|left, right| right.0.cmp(&left.0));
+                map(vec![
+                    (
+                        "current",
+                        list(
+                            current
+                                .into_iter()
+                                .map(|(_, index)| Node::Int(index))
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        "past",
+                        list(
+                            past.into_iter()
+                                .map(|(_, index)| Node::Int(index))
+                                .collect(),
+                        ),
+                    ),
+                ])
+            }
+            5 => {
+                if !has(values, "metadata") {
+                    return Err(-1);
+                }
+                let valid = if let Node::Array(metadata) = field(values, "metadata") {
+                    !matches!(field(metadata, "email"), Node::Null)
+                        && !matches!(field(metadata, "ip_address"), Node::Null)
+                } else {
+                    false
+                };
+                map(vec![("valid", Node::Bool(valid))])
+            }
+            6 => {
+                let mut entry = array(field(values, "entry"))?.to_vec();
+                let statuses = sequence(field(values, "statuses"))?;
+                if statuses.len() != 2 {
+                    return Err(-1);
+                }
+                set(
+                    &mut entry,
+                    "registration_status_label",
+                    status_label(statuses[0])?,
+                );
+                set(
+                    &mut entry,
+                    "manual_registration_status_label",
+                    status_label(statuses[1])?,
+                );
+                Node::Array(entry)
+            }
+            7 => map(vec![(
+                "message",
+                string(
+                    if integer(field(values, "old_status"))?
+                        == integer(field(values, "new_status"))?
+                    {
+                        b"Registration status note saved without changing the manual mode."
+                            .as_slice()
+                    } else {
+                        b"Manual registration status updated successfully."
+                    },
+                ),
+            )]),
+            8 => {
+                let input = array(field(values, "input"))?;
+                let mut fields: Vec<(&str, Node)> = [
+                    "name",
+                    "description",
+                    "applicable_roles",
+                    "additional_days",
+                    "start_date",
+                    "end_date",
+                ]
+                .into_iter()
+                .map(|name| {
+                    (
+                        name,
+                        if name == "applicable_roles" && !has(input, name) {
+                            list(Vec::new())
+                        } else {
+                            field(input, name).clone()
+                        },
+                    )
+                })
+                .collect();
+                fields.push((
+                    "is_active",
+                    Node::Bool(boolean(field(values, "is_active"))?),
+                ));
+                map(fields)
+            }
+            9 => map(vec![(
+                "label",
+                string(if boolean(field(values, "active"))? {
+                    b"activated".as_slice()
+                } else {
+                    b"deactivated"
+                }),
+            )]),
+            10 => {
+                let promotions = sequence(field(values, "promotions"))?;
+                let total = i64::try_from(promotions.len()).map_err(|_| -1isize)?;
+                let mut active = 0i64;
+                let mut applications = 0i64;
+                for row in promotions {
+                    let row = array(row)?;
+                    active = active
+                        .checked_add(i64::from(boolean(field(row, "is_active"))?))
+                        .ok_or(-1isize)?;
+                    applications = applications
+                        .checked_add(integer(field(row, "statistics_count"))?)
+                        .ok_or(-1isize)?;
+                }
+                map(vec![
+                    ("total_promotions", Node::Int(total)),
+                    ("active_promotions", Node::Int(active)),
+                    ("total_applications", Node::Int(applications)),
+                ])
+            }
+            11 => {
+                let input = array(field(values, "input"))?;
+                let order = scalar(input, "ob", b"created_at_desc")?;
+                let (column, direction) = match bytes(&order)? {
+                    b"created_at_asc" => (b"created_at".as_slice(), b"asc".as_slice()),
+                    b"expires_at_asc" => (b"expires_at".as_slice(), b"asc".as_slice()),
+                    b"expires_at_desc" => (b"expires_at".as_slice(), b"desc".as_slice()),
+                    b"email_asc" => (b"email".as_slice(), b"asc".as_slice()),
+                    b"email_desc" => (b"email".as_slice(), b"desc".as_slice()),
+                    _ => (b"created_at".as_slice(), b"desc".as_slice()),
+                };
+                // Preserve the requested scalar order key; only SQL ordering defaults.
+                map(vec![
+                    ("status", scalar(input, "status", b"")?),
+                    ("invited_by", scalar(input, "invited_by", b"")?),
+                    ("email", scalar(input, "email", b"")?),
+                    ("orderBy", order),
+                    ("column", string(column)),
+                    ("direction", string(direction)),
+                ])
+            }
+            12 => map(vec![
+                ("", string(b"All")),
+                ("pending", string(b"Pending")),
+                ("used", string(b"Used")),
+                ("expired", string(b"Expired")),
+                ("cancelled", string(b"Cancelled")),
+            ]),
+            13 => {
+                if !has(values, "ids") || !has(values, "action") {
+                    return Err(-1);
+                }
+                let count = integer(field(values, "count"))?;
+                let (error, message) = if empty(field(values, "ids")) {
+                    (string(b"No invitations selected"), Node::Null)
+                } else {
+                    let verb = match bytes(field(values, "action"))? {
+                        b"cancel" => Some("Cancelled"),
+                        b"resend" => Some("Resent"),
+                        b"delete" => Some("Deleted"),
+                        _ => None,
+                    };
+                    match verb {
+                        Some(verb) => (Node::Null, string(format!("{verb} {count} invitations"))),
+                        None => (string(b"Invalid bulk action"), Node::Null),
+                    }
+                };
+                map(vec![("error", error), ("message", message)])
+            }
+            14 => {
+                let input = array(field(values, "input"))?;
+                map([
+                    "user_id",
+                    "username",
+                    "role_id",
+                    "change_reason",
+                    "date_from",
+                    "date_to",
+                ]
+                .into_iter()
+                .map(|name| Ok((name, scalar(input, name, b"")?)))
+                .collect::<Result<Vec<_>, isize>>()?)
+            }
+            15 => {
+                let from = bytes(field(values, "date_from"))?;
+                let to = bytes(field(values, "date_to"))?;
+                map(vec![
+                    (
+                        "date_from",
+                        if from.is_empty() {
+                            Node::Null
+                        } else {
+                            string([from, b" 00:00:00"].concat())
+                        },
+                    ),
+                    (
+                        "date_to",
+                        if to.is_empty() {
+                            Node::Null
+                        } else {
+                            string([to, b" 23:59:59"].concat())
+                        },
+                    ),
+                ])
+            }
+            _ => return Err(-1),
+        };
+        let mut output = Vec::new();
+        encode_node(&result, &mut output)?;
+        Ok(output)
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::cleaning::nntmux_w29_admin_gdpr_reg_promo_invite_history as ffi;
+
+        fn wire(node: &Node) -> Vec<u8> {
+            let mut result = Vec::new();
+            encode_node(node, &mut result).unwrap();
+            result
+        }
+        fn run(operation: u32, node: Node) -> Node {
+            decode(&output(operation, &wire(&node)).unwrap()).unwrap()
+        }
+        fn get<'a>(node: &'a Node, name: &str) -> &'a Node {
+            field(array(node).unwrap(), name)
+        }
+        fn fixture(operation: u32) -> Node {
+            match operation {
+                0 => map(vec![
+                    ("type", string(b"export")),
+                    ("status", string(b"pending")),
+                ]),
+                1 => map(vec![("status", string(b"pending"))]),
+                2 => map(vec![
+                    ("type", string(b"export")),
+                    ("status", string(b"pending")),
+                    ("action", string(b"export")),
+                    ("subject_exists", Node::Bool(true)),
+                    ("is_admin", Node::Bool(false)),
+                ]),
+                3 => map(vec![("reason", Node::Null)]),
+                4 => map(vec![("periods", list(Vec::new()))]),
+                5 => map(vec![("metadata", Node::Null)]),
+                6 => map(vec![
+                    ("entry", map(Vec::new())),
+                    ("statuses", list(vec![Node::Int(0), Node::Null])),
+                ]),
+                7 => map(vec![
+                    ("old_status", Node::Int(0)),
+                    ("new_status", Node::Int(1)),
+                ]),
+                8 => map(vec![
+                    ("input", map(Vec::new())),
+                    ("is_active", Node::Bool(true)),
+                ]),
+                9 => map(vec![("active", Node::Bool(false))]),
+                10 => map(vec![("promotions", list(Vec::new()))]),
+                11 | 14 => map(vec![("input", map(Vec::new()))]),
+                12 => map(Vec::new()),
+                13 => map(vec![
+                    ("action", string(b"cancel")),
+                    ("ids", list(vec![Node::Int(1)])),
+                    ("count", Node::Int(1)),
+                ]),
+                15 => map(vec![
+                    ("date_from", string(b"")),
+                    ("date_to", string(b"2026-10-24")),
+                ]),
+                _ => unreachable!(),
+            }
+        }
+
+        #[test]
+        fn w29_admin_gdpr_reg_promo_invite_history_gdpr_decisions() {
+            assert_eq!(
+                run(
+                    0,
+                    map(vec![
+                        ("type", string(b" \t\0export\r\n")),
+                        ("status", string(b" processing\x0b"))
+                    ])
+                ),
+                map(vec![
+                    ("type", string(b"export")),
+                    ("status", string(b"processing"))
+                ])
+            );
+            assert_eq!(
+                run(
+                    0,
+                    map(vec![
+                        ("type", string(b"\x0cexport")),
+                        ("status", string(b"Pending"))
+                    ])
+                ),
+                map(vec![("type", string(b"")), ("status", string(b""))])
+            );
+            for kind in [
+                b"export".as_slice(),
+                b"erasure",
+                b"rectification",
+                b"restriction",
+            ] {
+                assert_eq!(
+                    get(
+                        &run(
+                            0,
+                            map(vec![
+                                ("type", string(kind)),
+                                ("status", string(b"cancelled"))
+                            ])
+                        ),
+                        "type"
+                    ),
+                    &string(kind)
+                );
+            }
+            for status in [
+                b"pending".as_slice(),
+                b"processing",
+                b"completed",
+                b"rejected",
+                b"cancelled",
+                b"",
+            ] {
+                assert_eq!(
+                    get(&run(1, map(vec![("status", string(status))])), "open"),
+                    &Node::Bool(matches!(status, b"pending" | b"processing"))
+                );
+            }
+            for action in [b"export".as_slice(), b"erasure"] {
+                for (kind, status, subject, admin, expected) in [
+                    (
+                        b"other".as_slice(),
+                        b"pending".as_slice(),
+                        false,
+                        true,
+                        Some(if action == b"export" {
+                            b"This request cannot be exported.".as_slice()
+                        } else {
+                            b"This erasure request cannot be completed."
+                        }),
+                    ),
+                    (
+                        action,
+                        b"completed",
+                        false,
+                        true,
+                        Some(if action == b"export" {
+                            b"This request cannot be exported.".as_slice()
+                        } else {
+                            b"This erasure request cannot be completed."
+                        }),
+                    ),
+                    (
+                        action,
+                        b"processing",
+                        false,
+                        true,
+                        Some(b"The subject user could not be found.".as_slice()),
+                    ),
+                    (
+                        action,
+                        b"pending",
+                        true,
+                        true,
+                        if action == b"erasure" {
+                            Some(
+                                b"Admin accounts cannot be erased from the GDPR request queue."
+                                    .as_slice(),
+                            )
+                        } else {
+                            None
+                        },
+                    ),
+                    (action, b"pending", true, false, None),
+                ] {
+                    let result = run(
+                        2,
+                        map(vec![
+                            ("type", string(kind)),
+                            ("status", string(status)),
+                            ("action", string(action)),
+                            ("subject_exists", Node::Bool(subject)),
+                            ("is_admin", Node::Bool(admin)),
+                        ]),
+                    );
+                    assert_eq!(
+                        get(&result, "error"),
+                        &expected.map(string).unwrap_or(Node::Null)
+                    );
+                }
+            }
+            let reason = Node::Array(vec![(
+                Key::Int(-2),
+                list(vec![Node::Float(b"1.25".to_vec()), string(b"\0\xff")]),
+            )]);
+            assert_eq!(
+                run(3, map(vec![("reason", reason.clone())])),
+                map(vec![("rejected", Node::Bool(true)), ("reason", reason)])
+            );
+        }
+
+        #[test]
+        fn w29_admin_gdpr_reg_promo_invite_history_registration_and_promotions() {
+            let period = |ended, starts, ends| {
+                map(vec![
+                    ("ended", Node::Bool(ended)),
+                    ("starts_at", starts),
+                    ("ends_at", ends),
+                ])
+            };
+            let result = run(
+                4,
+                map(vec![(
+                    "periods",
+                    list(vec![
+                        period(false, Node::Null, Node::Null),
+                        period(false, Node::Int(3), Node::Null),
+                        period(false, Node::Int(3), Node::Null),
+                        period(false, Node::Int(-1), Node::Null),
+                        period(true, Node::Null, Node::Null),
+                        period(true, Node::Null, Node::Int(-1)),
+                        period(true, Node::Null, Node::Int(8)),
+                        period(true, Node::Null, Node::Int(8)),
+                    ]),
+                )]),
+            );
+            assert_eq!(
+                get(&result, "current"),
+                &list(vec![Node::Int(3), Node::Int(1), Node::Int(2), Node::Int(0)])
+            );
+            assert_eq!(
+                get(&result, "past"),
+                &list(vec![Node::Int(6), Node::Int(7), Node::Int(4), Node::Int(5)])
+            );
+            for (metadata, valid) in [
+                (Node::Null, false),
+                (string(b"x"), false),
+                (
+                    map(vec![("email", Node::Null), ("ip_address", string(b""))]),
+                    false,
+                ),
+                (
+                    map(vec![
+                        ("email", Node::Bool(false)),
+                        ("ip_address", list(Vec::new())),
+                    ]),
+                    true,
+                ),
+            ] {
+                assert_eq!(
+                    run(5, map(vec![("metadata", metadata)])),
+                    map(vec![("valid", Node::Bool(valid))])
+                );
+            }
+            for (status, label) in [
+                (Node::Int(0), string(b"Open")),
+                (Node::Int(1), string(b"Invite")),
+                (Node::Int(2), string(b"Closed")),
+                (Node::Int(-1), string(b"Unknown")),
+                (Node::Null, Node::Null),
+            ] {
+                let entry = Node::Array(vec![
+                    (Key::Int(5), string(b"\0\xff")),
+                    (
+                        Key::String(b"registration_status_label".to_vec()),
+                        Node::Bool(false),
+                    ),
+                ]);
+                let result = run(
+                    6,
+                    map(vec![
+                        ("entry", entry.clone()),
+                        ("statuses", list(vec![status.clone(), status])),
+                    ]),
+                );
+                let mut expected = array(&entry).unwrap().to_vec();
+                set(&mut expected, "registration_status_label", label.clone());
+                set(&mut expected, "manual_registration_status_label", label);
+                assert_eq!(result, Node::Array(expected));
+            }
+            assert_eq!(
+                get(
+                    &run(
+                        7,
+                        map(vec![
+                            ("old_status", Node::Int(1)),
+                            ("new_status", Node::Int(1))
+                        ])
+                    ),
+                    "message"
+                ),
+                &string(b"Registration status note saved without changing the manual mode.")
+            );
+            assert_eq!(
+                get(&run(7, fixture(7)), "message"),
+                &string(b"Manual registration status updated successfully.")
+            );
+            assert_eq!(
+                run(8, fixture(8)),
+                map(vec![
+                    ("name", Node::Null),
+                    ("description", Node::Null),
+                    ("applicable_roles", list(Vec::new())),
+                    ("additional_days", Node::Null),
+                    ("start_date", Node::Null),
+                    ("end_date", Node::Null),
+                    ("is_active", Node::Bool(true))
+                ])
+            );
+            let result = run(
+                8,
+                map(vec![
+                    (
+                        "input",
+                        map(vec![
+                            ("applicable_roles", Node::Null),
+                            ("name", Node::Bool(false)),
+                            ("additional_days", Node::Int(0)),
+                        ]),
+                    ),
+                    ("is_active", Node::Bool(false)),
+                ]),
+            );
+            assert_eq!(get(&result, "applicable_roles"), &Node::Null);
+            assert_eq!(get(&result, "name"), &Node::Bool(false));
+            assert_eq!(get(&result, "additional_days"), &Node::Int(0));
+            for active in [true, false] {
+                assert_eq!(
+                    get(&run(9, map(vec![("active", Node::Bool(active))])), "label"),
+                    &string(if active {
+                        b"activated".as_slice()
+                    } else {
+                        b"deactivated"
+                    })
+                );
+            }
+            assert_eq!(
+                run(
+                    10,
+                    map(vec![(
+                        "promotions",
+                        list(vec![
+                            map(vec![
+                                ("is_active", Node::Bool(true)),
+                                ("statistics_count", Node::Int(3))
+                            ]),
+                            map(vec![
+                                ("is_active", Node::Bool(false)),
+                                ("statistics_count", Node::Int(4))
+                            ])
+                        ])
+                    )])
+                ),
+                map(vec![
+                    ("total_promotions", Node::Int(2)),
+                    ("active_promotions", Node::Int(1)),
+                    ("total_applications", Node::Int(7))
+                ])
+            );
+            let overflow = map(vec![(
+                "promotions",
+                list(vec![
+                    map(vec![
+                        ("is_active", Node::Bool(true)),
+                        ("statistics_count", Node::Int(i64::MAX)),
+                    ]),
+                    map(vec![
+                        ("is_active", Node::Bool(false)),
+                        ("statistics_count", Node::Int(1)),
+                    ]),
+                ]),
+            )]);
+            assert!(output(10, &wire(&overflow)).is_err());
+        }
+
+        #[test]
+        fn w29_admin_gdpr_reg_promo_invite_history_invitation_and_history() {
+            for (order, column, direction) in [
+                ("created_at_asc", "created_at", "asc"),
+                ("created_at_desc", "created_at", "desc"),
+                ("expires_at_asc", "expires_at", "asc"),
+                ("expires_at_desc", "expires_at", "desc"),
+                ("email_asc", "email", "asc"),
+                ("email_desc", "email", "desc"),
+                ("bad", "created_at", "desc"),
+            ] {
+                let result = run(
+                    11,
+                    map(vec![(
+                        "input",
+                        map(vec![
+                            ("ob", string(order)),
+                            ("status", Node::Bool(true)),
+                            ("invited_by", Node::Int(i64::MIN)),
+                            ("email", list(Vec::new())),
+                        ]),
+                    )]),
+                );
+                assert_eq!(get(&result, "orderBy"), &string(order));
+                assert_eq!(get(&result, "column"), &string(column));
+                assert_eq!(get(&result, "direction"), &string(direction));
+                assert_eq!(get(&result, "status"), &string(b"1"));
+                assert_eq!(get(&result, "invited_by"), &string(i64::MIN.to_string()));
+                assert_eq!(get(&result, "email"), &string(b""));
+            }
+            assert_eq!(
+                get(&run(11, fixture(11)), "orderBy"),
+                &string(b"created_at_desc")
+            );
+            assert_eq!(
+                run(12, fixture(12)),
+                map(vec![
+                    ("", string(b"All")),
+                    ("pending", string(b"Pending")),
+                    ("used", string(b"Used")),
+                    ("expired", string(b"Expired")),
+                    ("cancelled", string(b"Cancelled"))
+                ])
+            );
+            for (action, verb) in [
+                ("cancel", "Cancelled"),
+                ("resend", "Resent"),
+                ("delete", "Deleted"),
+            ] {
+                assert_eq!(
+                    run(
+                        13,
+                        map(vec![
+                            ("action", string(action)),
+                            ("ids", list(vec![Node::Int(1)])),
+                            ("count", Node::Int(3))
+                        ])
+                    ),
+                    map(vec![
+                        ("error", Node::Null),
+                        ("message", string(format!("{verb} 3 invitations")))
+                    ])
+                );
+            }
+            for ids in [
+                Node::Null,
+                Node::Bool(false),
+                Node::Int(0),
+                Node::Float(b"0.0".to_vec()),
+                string(b"0"),
+                list(Vec::new()),
+            ] {
+                assert_eq!(
+                    get(
+                        &run(
+                            13,
+                            map(vec![
+                                ("action", Node::Bool(true)),
+                                ("ids", ids),
+                                ("count", Node::Int(0))
+                            ])
+                        ),
+                        "error"
+                    ),
+                    &string(b"No invitations selected")
+                );
+            }
+            assert_eq!(
+                get(
+                    &run(
+                        13,
+                        map(vec![
+                            ("action", string(b"invalid")),
+                            ("ids", string(b"ids")),
+                            ("count", Node::Int(0))
+                        ])
+                    ),
+                    "error"
+                ),
+                &string(b"Invalid bulk action")
+            );
+            assert!(
+                output(
+                    13,
+                    &wire(&map(vec![
+                        ("action", Node::Bool(true)),
+                        ("ids", string(b"ids")),
+                        ("count", Node::Int(0))
+                    ]))
+                )
+                .is_err()
+            );
+            assert_eq!(
+                run(
+                    14,
+                    map(vec![(
+                        "input",
+                        map(vec![
+                            ("user_id", Node::Int(1)),
+                            ("username", Node::Bool(false)),
+                            ("role_id", Node::Bool(true)),
+                            ("change_reason", string(b"\0\xff")),
+                            ("date_from", Node::Null),
+                            ("date_to", list(vec![Node::Int(1)]))
+                        ])
+                    )])
+                ),
+                map(vec![
+                    ("user_id", string(b"1")),
+                    ("username", string(b"")),
+                    ("role_id", string(b"1")),
+                    ("change_reason", string(b"\0\xff")),
+                    ("date_from", string(b"")),
+                    ("date_to", string(b""))
+                ])
+            );
+            assert_eq!(
+                run(15, fixture(15)),
+                map(vec![
+                    ("date_from", Node::Null),
+                    ("date_to", string(b"2026-10-24 23:59:59"))
+                ])
+            );
+            assert_eq!(
+                get(
+                    &run(
+                        15,
+                        map(vec![
+                            ("date_from", string(b"\0\xff")),
+                            ("date_to", string(b""))
+                        ])
+                    ),
+                    "date_from"
+                ),
+                &string(b"\0\xff 00:00:00")
+            );
+        }
+        #[test]
+        fn w29_admin_gdpr_reg_promo_invite_history_malformed_frames_and_types() {
+            let mut invalid = vec![Vec::new(), vec![0], vec![0; 4], vec![4, 0, 0, 0, b'a']];
+            for raw in [
+                b"".as_slice(),
+                b"n0",
+                b"b2",
+                b"i01",
+                b"i+1",
+                b"i-0",
+                b"i9223372036854775808",
+                b"fNaN",
+                b"fINF",
+                b"f1e999",
+                b"f 1",
+                b"a01",
+                b"a-1",
+                b"a18446744073709551616",
+                b"a2",
+                b"x",
+            ] {
+                let mut frame = Vec::new();
+                wave22_append_frame(&mut frame, Some(raw)).unwrap();
+                invalid.push(frame);
+            }
+            for frames in [
+                vec![None],
+                vec![Some(b"a0".as_slice()), None],
+                vec![Some(b"a0".as_slice()), Some(b"n".as_slice())],
+                vec![
+                    Some(b"a1".as_slice()),
+                    Some(b"n".as_slice()),
+                    Some(b"n".as_slice()),
+                ],
+                vec![
+                    Some(b"a2".as_slice()),
+                    Some(b"i1".as_slice()),
+                    Some(b"n".as_slice()),
+                    Some(b"s1".as_slice()),
+                    Some(b"n".as_slice()),
+                ],
+            ] {
+                let mut input = Vec::new();
+                for frame in frames {
+                    wave22_append_frame(&mut input, frame).unwrap();
+                }
+                invalid.push(input);
+            }
+            let mut deep = map(Vec::new());
+            for _ in 0..65 {
+                deep = map(vec![("deep", deep)]);
+            }
+            invalid.push(wire(&deep));
+            for input in invalid {
+                for operation in 0..=15 {
+                    assert!(output(operation, &input).is_err());
+                    let mut target = [0xab; 128];
+                    assert_eq!(
+                        unsafe {
+                            ffi(
+                                operation,
+                                input.as_ptr(),
+                                input.len(),
+                                target.as_mut_ptr(),
+                                target.len(),
+                            )
+                        },
+                        -1
+                    );
+                    assert_eq!(target, [0xab; 128]);
+                }
+            }
+            for operation in [16, 100, u32::MAX] {
+                assert!(output(operation, &wire(&fixture(12))).is_err());
+            }
+            for (operation, name, value) in [
+                (0, "type", Node::Int(1)),
+                (1, "status", Node::Null),
+                (2, "subject_exists", Node::Int(1)),
+                (2, "is_admin", Node::Null),
+                (2, "action", string(b"other")),
+                (4, "periods", map(vec![("x", Node::Null)])),
+                (6, "entry", Node::Null),
+                (6, "statuses", list(vec![string(b"0"), Node::Null])),
+                (7, "new_status", Node::Bool(true)),
+                (8, "input", Node::Null),
+                (8, "is_active", Node::Int(1)),
+                (9, "active", Node::Null),
+                (10, "promotions", list(vec![Node::Null])),
+                (
+                    11,
+                    "input",
+                    map(vec![("status", Node::Float(b"1.5".to_vec()))]),
+                ),
+                (13, "count", string(b"1")),
+                (
+                    14,
+                    "input",
+                    map(vec![("user_id", Node::Float(b"1.5".to_vec()))]),
+                ),
+                (15, "date_to", Node::Null),
+            ] {
+                let mut input = array(&fixture(operation)).unwrap().to_vec();
+                set(&mut input, name, value);
+                assert!(
+                    output(operation, &wire(&Node::Array(input))).is_err(),
+                    "accepted operation {operation} field {name}"
+                );
+            }
+        }
+        #[test]
+        fn w29_admin_gdpr_reg_promo_invite_history_regions_capacities_unaligned_and_aliasing() {
+            for operation in 0..=15 {
+                let input = wire(&fixture(operation));
+                let expected = output(operation, &input).unwrap();
+                let mut target = vec![0xab; expected.len() + 8];
+                unsafe {
+                    for capacity in [0, 1, expected.len() - 1] {
+                        assert_eq!(
+                            ffi(
+                                operation,
+                                input.as_ptr(),
+                                input.len(),
+                                target.as_mut_ptr(),
+                                capacity
+                            ),
+                            -(expected.len() as i32)
+                        );
+                        assert!(target.iter().all(|byte| *byte == 0xab));
+                    }
+                    for (source, length, out, capacity) in [
+                        (std::ptr::null(), 0, target.as_mut_ptr(), target.len()),
+                        (
+                            std::ptr::null(),
+                            input.len(),
+                            target.as_mut_ptr(),
+                            target.len(),
+                        ),
+                        (input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                        (input.as_ptr(), input.len(), std::ptr::null_mut(), 10),
+                        (
+                            usize::MAX as *const u8,
+                            1,
+                            target.as_mut_ptr(),
+                            target.len(),
+                        ),
+                        (input.as_ptr(), input.len(), usize::MAX as *mut u8, 1),
+                        (
+                            input.as_ptr(),
+                            usize::MAX,
+                            target.as_mut_ptr(),
+                            target.len(),
+                        ),
+                        (input.as_ptr(), input.len(), target.as_mut_ptr(), usize::MAX),
+                        (
+                            input.as_ptr(),
+                            isize::MAX as usize + 1,
+                            target.as_mut_ptr(),
+                            target.len(),
+                        ),
+                        (
+                            input.as_ptr(),
+                            input.len(),
+                            target.as_mut_ptr(),
+                            isize::MAX as usize + 1,
+                        ),
+                    ] {
+                        assert_eq!(ffi(operation, source, length, out, capacity), -1);
+                        assert!(target.iter().all(|byte| *byte == 0xab));
+                    }
+                    let unaligned = [vec![0xab], input.clone()].concat();
+                    assert_eq!(
+                        ffi(
+                            operation,
+                            unaligned.as_ptr().add(1),
+                            input.len(),
+                            target.as_mut_ptr().add(1),
+                            expected.len()
+                        ),
+                        expected.len() as i32
+                    );
+                    assert_eq!(&target[1..1 + expected.len()], expected);
+                    assert_eq!(target[0], 0xab);
+                    assert!(
+                        target[1 + expected.len()..]
+                            .iter()
+                            .all(|byte| *byte == 0xab)
+                    );
+                    for (source_offset, target_offset) in [(0, 0), (0, 1), (3, 0)] {
+                        for capacity in
+                            [0, 1, expected.len() - 1, expected.len(), expected.len() + 1]
+                        {
+                            let mut buffer = vec![0xab; expected.len() + input.len() + 16];
+                            buffer[source_offset..source_offset + input.len()]
+                                .copy_from_slice(&input);
+                            let before = buffer.clone();
+                            let actual = ffi(
+                                operation,
+                                buffer.as_ptr().add(source_offset),
+                                input.len(),
+                                buffer.as_mut_ptr().add(target_offset),
+                                capacity,
+                            );
+                            if capacity < expected.len() {
+                                assert_eq!(actual, -(expected.len() as i32));
+                                assert_eq!(buffer, before);
+                            } else {
+                                assert_eq!(actual, expected.len() as i32);
+                                assert_eq!(
+                                    &buffer[target_offset..target_offset + expected.len()],
+                                    expected
+                                );
+                                assert_eq!(&buffer[..target_offset], &before[..target_offset]);
+                                assert_eq!(
+                                    &buffer[target_offset + expected.len()..],
+                                    &before[target_offset + expected.len()..]
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Render typed admin GDPR, registration, promotion, invitation and role-history decision frames without partially writing output.
+/// Returns bytes written, -1 on invalid input/panic, or negated required size.
+/// Input and output may overlap; every output is built before touching the caller buffer.
+///
+/// # Safety
+/// Both regions must be non-null and allocated for their stated extents, with
+/// lengths fitting isize and no address overflow. Only byte alignment is needed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w29_admin_gdpr_reg_promo_invite_history(
+    operation: u32,
+    input: *const u8,
+    len: usize,
+    out: *mut u8,
+    out_cap: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, len) || !cleaning_ffi_region_valid(out, out_cap) {
+            return -1;
+        }
+        let output = {
+            let input = unsafe { slice::from_raw_parts(input, len) };
+            match wave29_admin_gdpr_reg_promo_invite_history::output(operation, input) {
+                Ok(output) => output,
+                Err(_) => return -1,
+            }
+        };
+        let Ok(needed) = i32::try_from(output.len()) else {
+            return -1;
+        };
+        if output.len() > out_cap {
+            return -needed;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(output.as_ptr(), out, output.len()) };
+        needed
+    }))
+    .unwrap_or(-1)
+}

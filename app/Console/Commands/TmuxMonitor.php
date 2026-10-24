@@ -16,11 +16,31 @@ use App\Services\Tmux\TmuxPaneManager;
 use App\Services\Tmux\TmuxSessionManager;
 use App\Services\Tmux\TmuxTaskRunner;
 use App\Support\MetadataSources;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Process;
+use Throwable;
 
 class TmuxMonitor extends Command
 {
+    private const FFI_CDEF = <<<'CDEF'
+ssize_t nntmux_tmux_monitor_format_compensation_message(
+    int64_t count,
+    uint8_t *out_buf,
+    size_t out_cap
+);
+int32_t nntmux_tmux_monitor_evaluate_loop_step(
+    int64_t delay,
+    int64_t iteration,
+    int64_t *out_scalars
+);
+CDEF;
+
+    private static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
+
     /**
      * The name and signature of the console command.
      *
@@ -45,6 +65,147 @@ class TmuxMonitor extends Command
     private TmuxTaskRunner $taskRunner;
 
     private TmuxOutput $tmuxOutput;
+
+    public static function enableRustFfi(): void
+    {
+        self::$useRustFfi = true;
+    }
+
+    public static function disableRustFfi(): void
+    {
+        self::$useRustFfi = false;
+    }
+
+    public static function resetRustFfi(): void
+    {
+        self::$useRustFfi = false;
+        self::$ffi = null;
+    }
+
+    public static function setUseRustFfi(?bool $useRustFfi): void
+    {
+        self::$useRustFfi = (bool) $useRustFfi;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    public static function setFfiForTesting(FFI|false|null $ffi = null): void
+    {
+        self::$ffi = $ffi;
+    }
+
+    public static function formatCollectionDelayCompensationMessage(int $count): string
+    {
+        if (self::$useRustFfi) {
+            return self::formatCollectionDelayCompensationMessageNative($count);
+        }
+
+        return self::formatCollectionDelayCompensationMessagePhp($count);
+    }
+
+    public static function formatCollectionDelayCompensationMessagePhp(int $count): string
+    {
+        return $count > 0
+            ? "✅ Gave {$count} waiting collections back the time lost while the indexer was down"
+            : '✅ No collections needed more time';
+    }
+
+    public static function formatCollectionDelayCompensationMessageNative(int $count): string
+    {
+        $ffi = self::additionalFfi();
+        if (! $ffi instanceof FFI) {
+            return self::formatCollectionDelayCompensationMessagePhp($count);
+        }
+
+        try {
+            $cap = 160;
+            $outBuf = $ffi->new("uint8_t[{$cap}]");
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_tmux_monitor_format_compensation_message($count, $outBuf, $cap);
+            if (! is_int($written) || $written <= 0) {
+                return self::formatCollectionDelayCompensationMessagePhp($count);
+            }
+
+            return FFI::string($outBuf, $written);
+        } catch (Throwable) {
+            return self::formatCollectionDelayCompensationMessagePhp($count);
+        }
+    }
+
+    public static function clampMonitorLoopSleep(int $delay): int
+    {
+        if (self::$useRustFfi) {
+            return self::clampMonitorLoopSleepNative($delay);
+        }
+
+        return self::clampMonitorLoopSleepPhp($delay);
+    }
+
+    public static function clampMonitorLoopSleepPhp(int $delay): int
+    {
+        return max(1, $delay);
+    }
+
+    public static function clampMonitorLoopSleepNative(int $delay): int
+    {
+        $ffi = self::additionalFfi();
+        if (! $ffi instanceof FFI) {
+            return self::clampMonitorLoopSleepPhp($delay);
+        }
+
+        try {
+            $outScalars = $ffi->new('int64_t[2]');
+            // @phpstan-ignore method.notFound
+            $rc = $ffi->nntmux_tmux_monitor_evaluate_loop_step($delay, 1, $outScalars);
+            $clamped = $outScalars[0];
+            if ($rc !== 1 || ! is_int($clamped)) {
+                return self::clampMonitorLoopSleepPhp($delay);
+            }
+
+            return $clamped;
+        } catch (Throwable) {
+            return self::clampMonitorLoopSleepPhp($delay);
+        }
+    }
+
+    public static function shouldLogIdleWaiting(int $iteration): bool
+    {
+        if (self::$useRustFfi) {
+            return self::shouldLogIdleWaitingNative($iteration);
+        }
+
+        return self::shouldLogIdleWaitingPhp($iteration);
+    }
+
+    public static function shouldLogIdleWaitingPhp(int $iteration): bool
+    {
+        return $iteration % 60 === 0;
+    }
+
+    public static function shouldLogIdleWaitingNative(int $iteration): bool
+    {
+        $ffi = self::additionalFfi();
+        if (! $ffi instanceof FFI) {
+            return self::shouldLogIdleWaitingPhp($iteration);
+        }
+
+        try {
+            $outScalars = $ffi->new('int64_t[2]');
+            // @phpstan-ignore method.notFound
+            $rc = $ffi->nntmux_tmux_monitor_evaluate_loop_step(10, $iteration, $outScalars);
+            $shouldLog = $outScalars[1];
+            if ($rc !== 1 || ! is_int($shouldLog)) {
+                return self::shouldLogIdleWaitingPhp($iteration);
+            }
+
+            return $shouldLog === 1;
+        } catch (Throwable) {
+            return self::shouldLogIdleWaitingPhp($iteration);
+        }
+    }
 
     /**
      * Execute the console command.
@@ -115,14 +276,14 @@ class TmuxMonitor extends Command
                 if ((int) ($runVar['settings']['is_running'] ?? 0) === 1) {
                     $this->runPaneTasks($runVar);
                 } else {
-                    if ($iteration % 60 === 0) { // Log every 10 minutes
+                    if (self::shouldLogIdleWaiting($iteration)) { // Log every 10 minutes
                         $this->info('⏸️  Tmux is not running. Waiting...');
                     }
                 }
 
                 // Increment iteration and sleep
                 $this->monitor->incrementIteration();
-                $panes->waitForExit(max(1, (int) config('tmux.monitor.delay', 10)));
+                $panes->waitForExit(self::clampMonitorLoopSleep((int) config('tmux.monitor.delay', 10)));
             }
 
             $this->info('🛑 Monitor stopped by exit flag');
@@ -150,7 +311,7 @@ class TmuxMonitor extends Command
     {
         try {
             app(CollectionDowntimeCompensator::class)->recordActivity();
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             logger()->warning('Unable to record tmux ingestion activity: '.$e->getMessage());
         }
     }
@@ -162,9 +323,7 @@ class TmuxMonitor extends Command
         cli()->header('Adjusting collection delays...');
 
         $count = app(CollectionDowntimeCompensator::class)->compensate($delayTime);
-        $this->info($count > 0
-            ? "✅ Gave {$count} waiting collections back the time lost while the indexer was down"
-            : '✅ No collections needed more time');
+        $this->info(self::formatCollectionDelayCompensationMessage($count));
     }
 
     /**
@@ -181,7 +340,7 @@ class TmuxMonitor extends Command
 
         try {
             app(TmuxMetricsSnapshot::class)->publish($runVar);
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             report($e);
         }
     }
@@ -198,5 +357,21 @@ class TmuxMonitor extends Command
         foreach ($mode->tasks() as $task => $role) {
             $this->taskRunner->runPaneTask($task, ['role' => $role], $runVar);
         }
+    }
+
+    private static function additionalFfi(): ?FFI
+    {
+        if (self::$ffi === false) {
+            return null;
+        }
+
+        if (self::$ffi instanceof FFI) {
+            return self::$ffi;
+        }
+
+        $ffi = RustPipelineLibrary::resolveDomain('additional', self::FFI_CDEF);
+        self::$ffi = $ffi ?? false;
+
+        return $ffi;
     }
 }
