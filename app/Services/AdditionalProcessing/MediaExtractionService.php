@@ -22,6 +22,9 @@ use App\Services\NameFixing\ReleaseUpdateService;
 use App\Services\ReleaseExtraService;
 use App\Services\ReleaseImageService;
 use App\Support\Par2FileHashEvidence;
+use App\Support\RustPipelineLibrary;
+use FFI;
+use FFI\CData;
 use FFMpeg\Coordinate\Dimension;
 use FFMpeg\Coordinate\TimeCode;
 use FFMpeg\FFMpeg;
@@ -40,6 +43,19 @@ use Mhor\MediaInfo\MediaInfo;
  */
 class MediaExtractionService
 {
+    public const string FFI_CDEF = <<<'C'
+        int32_t nntmux_rfm_audio_tag_span(const char *ptr, size_t len, size_t *out);
+        ssize_t nntmux_rfm_audio_release_title(const char *performer_ptr, size_t performer_len, const char *album_ptr, size_t album_len, const char *date_ptr, size_t date_len, int32_t has_date, const char *ext_ptr, size_t ext_len, char *out_ptr, size_t out_cap);
+        C;
+
+    private static ?FFI $ffi = null;
+
+    private static bool $ffiResolved = false;
+
+    private static bool $useRustFfi = true;
+
+    private static ?CData $audioTagSpan = null;
+
     private readonly MediaToolFactory $tools;
 
     private readonly ThumbnailFrameSelector $frameSelector;
@@ -321,14 +337,8 @@ class MediaExtractionService
                         $renamed = false;
                         if ((int) $current->predb_id === 0 && $this->config->renameMusicMediaInfo) {
                             $ext = strtoupper($fileExtension);
-                            $title = $performer.' - '.$album;
-                            $date = $this->audioTagText($track->get('recorded_date'));
-                            if ($date !== null && preg_match('/(?:19|20)\d\d/', $date, $year)) {
-                                $title .= ' ('.$year[0].')';
-                            }
-                            $title .= ' '.$ext;
-                            if (mb_check_encoding($title, 'UTF-8') && mb_strlen($title, 'UTF-8') <= 255
-                                && preg_match('/\p{C}/u', $title) === 0) {
+                            $title = self::audioReleaseTitle($performer, $album, $this->audioTagText($track->get('recorded_date')), $fileExtension);
+                            if ($title !== null) {
                                 $category = match ($ext) {
                                     'MP3' => Category::MUSIC_MP3,
                                     'FLAC' => Category::MUSIC_LOSSLESS,
@@ -409,7 +419,16 @@ class MediaExtractionService
         return $result;
     }
 
+    /**
+     * Retains the native PHP path in production (~0.50x-0.61x mean in paired benchmarks);
+     * see audioTagTextNative().
+     */
     private function audioTagText(mixed $value): ?string
+    {
+        return self::audioTagTextPhp($value);
+    }
+
+    public static function audioTagTextPhp(mixed $value): ?string
     {
         if (! is_string($value) && ! is_int($value) && ! is_float($value) && ! $value instanceof \Stringable) {
             return null;
@@ -417,6 +436,133 @@ class MediaExtractionService
         $text = trim((string) $value);
 
         return $text !== '' && mb_check_encoding($text, 'UTF-8') && ! preg_match('/[\x00-\x1f\x7f]/', $text) ? $text : null;
+    }
+
+    public static function audioTagTextNative(mixed $value, bool &$supported = false, ?string $libraryPath = null): ?string
+    {
+        $supported = false;
+        if (! is_string($value)) {
+            return self::audioTagTextPhp($value);
+        }
+        $ffi = self::rustFfi($libraryPath);
+        if ($ffi === null) {
+            return self::audioTagTextPhp($value);
+        }
+
+        try {
+            $span = self::$audioTagSpan ??= $ffi->new('size_t[2]');
+            // @phpstan-ignore method.notFound
+            $status = $ffi->nntmux_rfm_audio_tag_span($value, strlen($value), $span);
+        } catch (\Throwable) {
+            return self::audioTagTextPhp($value);
+        }
+
+        if (! is_int($status) || $status < 0) {
+            return self::audioTagTextPhp($value);
+        }
+        $supported = true;
+
+        return $status === 1 ? substr($value, (int) $span[0], (int) $span[1]) : null;
+    }
+
+    /**
+     * Build the MediaInfo music title, or null when it is not a valid searchname.
+     *
+     * Retains the native PHP path in production (~0.73x-0.76x mean in paired benchmarks);
+     * see audioReleaseTitleNative().
+     */
+    public static function audioReleaseTitle(string $performer, string $album, ?string $date, string $fileExtension): ?string
+    {
+        return self::audioReleaseTitlePhp($performer, $album, $date, $fileExtension);
+    }
+
+    public static function audioReleaseTitlePhp(string $performer, string $album, ?string $date, string $fileExtension): ?string
+    {
+        $title = $performer.' - '.$album;
+        if ($date !== null && preg_match('/(?:19|20)\d\d/', $date, $year)) {
+            $title .= ' ('.$year[0].')';
+        }
+        $title .= ' '.strtoupper($fileExtension);
+
+        return mb_check_encoding($title, 'UTF-8') && mb_strlen($title, 'UTF-8') <= 255
+            && preg_match('/\p{C}/u', $title) === 0 ? $title : null;
+    }
+
+    public static function audioReleaseTitleNative(
+        string $performer,
+        string $album,
+        ?string $date,
+        string $fileExtension,
+        bool &$supported = false,
+        ?string $libraryPath = null,
+    ): ?string {
+        $supported = false;
+        $ffi = self::rustFfi($libraryPath);
+        if ($ffi === null) {
+            return self::audioReleaseTitlePhp($performer, $album, $date, $fileExtension);
+        }
+
+        $dateText = $date ?? '';
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, 256, $cap);
+        if ($scratch === null) {
+            return self::audioReleaseTitlePhp($performer, $album, $date, $fileExtension);
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_rfm_audio_release_title(
+                $performer,
+                strlen($performer),
+                $album,
+                strlen($album),
+                $dateText,
+                strlen($dateText),
+                $date === null ? 0 : 1,
+                $fileExtension,
+                strlen($fileExtension),
+                $scratch,
+                $cap,
+            );
+        } catch (\Throwable) {
+            return self::audioReleaseTitlePhp($performer, $album, $date, $fileExtension);
+        }
+
+        if ($written === -3) {
+            $supported = true;
+
+            return null;
+        }
+        if (! is_int($written) || $written < 0) {
+            return self::audioReleaseTitlePhp($performer, $album, $date, $fileExtension);
+        }
+        $supported = true;
+
+        return FFI::string($scratch, $written);
+    }
+
+    /**
+     * Toggle the Rust helpers; disabled, every *Native method falls back to PHP.
+     */
+    public static function useRustFfi(bool $use): void
+    {
+        self::$useRustFfi = $use;
+    }
+
+    private static function rustFfi(?string $libraryPath = null): ?FFI
+    {
+        if (! self::$useRustFfi) {
+            return null;
+        }
+        if ($libraryPath !== null) {
+            return RustPipelineLibrary::resolveDomain('media_extraction', self::FFI_CDEF, $libraryPath);
+        }
+        if (! self::$ffiResolved) {
+            self::$ffiResolved = true;
+            self::$ffi = RustPipelineLibrary::resolveDomain('media_extraction', self::FFI_CDEF);
+        }
+
+        return self::$ffi;
     }
 
     /**
