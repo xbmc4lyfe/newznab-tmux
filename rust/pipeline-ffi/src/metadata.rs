@@ -3667,3 +3667,1695 @@ mod tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// PAR2 metadata / proof identity accelerators.
+//
+// PHP passes `serialize()`d inputs and receives `serialize()`-format output, so both
+// marshaling directions run in PHP's C runtime. Any shape whose PHP semantics are not
+// reproduced exactly (references, objects, warnings, numeric-string keys, float identity)
+// returns `PAR2_FALLBACK` and the caller runs the native PHP implementation.
+// ---------------------------------------------------------------------------
+
+const PAR2_FALLBACK: isize = -1;
+const PHP_SER_MAX_DEPTH: usize = 128;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PhpKey<'a> {
+    Int(i64),
+    Str(&'a [u8]),
+}
+
+enum PhpVal<'a> {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float,
+    Str(&'a [u8]),
+    Arr(Vec<(PhpKey<'a>, PhpNode<'a>)>),
+}
+
+struct PhpNode<'a> {
+    val: PhpVal<'a>,
+    raw: &'a [u8],
+    has_float: bool,
+}
+
+const PHP_NULL_RAW: &[u8] = b"N;";
+const PHP_EMPTY_ARR_RAW: &[u8] = b"a:0:{}";
+
+impl<'a> PhpNode<'a> {
+    #[inline]
+    fn get(&self, key: &[u8]) -> Option<&PhpNode<'a>> {
+        match &self.val {
+            PhpVal::Arr(items) => items.iter().find_map(|(k, v)| match k {
+                PhpKey::Str(s) if *s == key => Some(v),
+                _ => None,
+            }),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn get_int_key(&self, key: i64) -> Option<&PhpNode<'a>> {
+        match &self.val {
+            PhpVal::Arr(items) => items.iter().find_map(|(k, v)| match k {
+                PhpKey::Int(i) if *i == key => Some(v),
+                _ => None,
+            }),
+            _ => None,
+        }
+    }
+
+    /// `$arr[$key] ?? null` with a missing key or `null` value collapsed to `None`.
+    #[inline]
+    fn coalesce(&self, key: &[u8]) -> Option<&PhpNode<'a>> {
+        self.get(key).filter(|n| !matches!(n.val, PhpVal::Null))
+    }
+
+    #[inline]
+    fn as_str(&self) -> Option<&'a [u8]> {
+        match self.val {
+            PhpVal::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn as_int(&self) -> Option<i64> {
+        match self.val {
+            PhpVal::Int(i) => Some(i),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn is_true(&self) -> bool {
+        matches!(self.val, PhpVal::Bool(true))
+    }
+
+    #[inline]
+    fn is_false(&self) -> bool {
+        matches!(self.val, PhpVal::Bool(false))
+    }
+
+    #[inline]
+    fn is_arr(&self) -> bool {
+        matches!(self.val, PhpVal::Arr(_))
+    }
+
+    #[inline]
+    fn items(&self) -> &[(PhpKey<'a>, PhpNode<'a>)] {
+        match &self.val {
+            PhpVal::Arr(items) => items,
+            _ => &[],
+        }
+    }
+}
+
+#[inline]
+fn opt_raw<'a>(node: Option<&PhpNode<'a>>) -> &'a [u8] {
+    node.map_or(PHP_NULL_RAW, |n| n.raw)
+}
+
+#[inline]
+fn opt_is_true(node: Option<&PhpNode<'_>>) -> bool {
+    node.is_some_and(PhpNode::is_true)
+}
+
+#[inline]
+fn opt_is_false(node: Option<&PhpNode<'_>>) -> bool {
+    node.is_some_and(PhpNode::is_false)
+}
+
+#[inline]
+fn opt_str<'a>(node: Option<&PhpNode<'a>>) -> Option<&'a [u8]> {
+    node.and_then(PhpNode::as_str)
+}
+
+#[inline]
+fn opt_int(node: Option<&PhpNode<'_>>) -> Option<i64> {
+    node.and_then(PhpNode::as_int)
+}
+
+/// `($a ?? null) === ($b ?? null)`; `None` when float identity would be required.
+#[inline]
+fn php_identical(a: Option<&PhpNode<'_>>, b: Option<&PhpNode<'_>>) -> Option<bool> {
+    if a.is_some_and(|n| n.has_float) || b.is_some_and(|n| n.has_float) {
+        return None;
+    }
+    Some(opt_raw(a) == opt_raw(b))
+}
+
+struct PhpSerParser<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> PhpSerParser<'a> {
+    fn parse_document(data: &'a [u8]) -> Option<PhpNode<'a>> {
+        let mut parser = Self { data, pos: 0 };
+        let node = parser.value(0)?;
+        (parser.pos == data.len()).then_some(node)
+    }
+
+    #[inline]
+    fn expect(&mut self, byte: u8) -> Option<()> {
+        (self.data.get(self.pos) == Some(&byte)).then(|| self.pos += 1)
+    }
+
+    fn int_until(&mut self, term: u8) -> Option<i64> {
+        let start = self.pos;
+        let mut neg = false;
+        if self.data.get(self.pos) == Some(&b'-') {
+            neg = true;
+            self.pos += 1;
+        }
+        let digits_start = self.pos;
+        let mut value: i64 = 0;
+        while let Some(&b) = self.data.get(self.pos) {
+            if !b.is_ascii_digit() {
+                break;
+            }
+            let digit = i64::from(b - b'0');
+            value = if neg {
+                value.checked_mul(10)?.checked_sub(digit)?
+            } else {
+                value.checked_mul(10)?.checked_add(digit)?
+            };
+            self.pos += 1;
+        }
+        if self.pos == digits_start || self.pos - start > 21 {
+            return None;
+        }
+        self.expect(term)?;
+        Some(value)
+    }
+
+    fn string_body(&mut self) -> Option<&'a [u8]> {
+        let len = usize::try_from(self.int_until(b':')?).ok()?;
+        self.expect(b'"')?;
+        let end = self.pos.checked_add(len)?;
+        let s = self.data.get(self.pos..end)?;
+        self.pos = end;
+        self.expect(b'"')?;
+        self.expect(b';')?;
+        Some(s)
+    }
+
+    fn value(&mut self, depth: usize) -> Option<PhpNode<'a>> {
+        if depth > PHP_SER_MAX_DEPTH {
+            return None;
+        }
+        let start = self.pos;
+        let tag = *self.data.get(self.pos)?;
+        self.pos += 1;
+        let (val, has_float) = match tag {
+            b'N' => {
+                self.expect(b';')?;
+                (PhpVal::Null, false)
+            }
+            b'b' => {
+                self.expect(b':')?;
+                let v = match self.data.get(self.pos)? {
+                    b'0' => false,
+                    b'1' => true,
+                    _ => return None,
+                };
+                self.pos += 1;
+                self.expect(b';')?;
+                (PhpVal::Bool(v), false)
+            }
+            b'i' => {
+                self.expect(b':')?;
+                (PhpVal::Int(self.int_until(b';')?), false)
+            }
+            b'd' => {
+                self.expect(b':')?;
+                let rel = self.data[self.pos..].iter().position(|&b| b == b';')?;
+                self.pos += rel + 1;
+                (PhpVal::Float, true)
+            }
+            b's' => {
+                self.expect(b':')?;
+                (PhpVal::Str(self.string_body()?), false)
+            }
+            b'a' => {
+                self.expect(b':')?;
+                let count = usize::try_from(self.int_until(b':')?).ok()?;
+                self.expect(b'{')?;
+                let mut items = Vec::with_capacity(count.min(4096));
+                let mut has_float = false;
+                for _ in 0..count {
+                    let key_tag = *self.data.get(self.pos)?;
+                    self.pos += 1;
+                    self.expect(b':')?;
+                    let key = match key_tag {
+                        b'i' => PhpKey::Int(self.int_until(b';')?),
+                        b's' => PhpKey::Str(self.string_body()?),
+                        _ => return None,
+                    };
+                    let child = self.value(depth + 1)?;
+                    has_float |= child.has_float;
+                    items.push((key, child));
+                }
+                self.expect(b'}')?;
+                (PhpVal::Arr(items), has_float)
+            }
+            // Objects, enums, custom serializers and references are not reproduced.
+            _ => return None,
+        };
+        Some(PhpNode {
+            val,
+            raw: &self.data[start..self.pos],
+            has_float,
+        })
+    }
+}
+
+/// Builds PHP `serialize()` output.
+struct PhpSerWriter {
+    buf: Vec<u8>,
+}
+
+impl PhpSerWriter {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            buf: Vec::with_capacity(1024),
+        }
+    }
+
+    #[inline]
+    fn usize_dec(&mut self, mut n: usize) {
+        let mut tmp = [0u8; 20];
+        let mut i = tmp.len();
+        loop {
+            i -= 1;
+            tmp[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        self.buf.extend_from_slice(&tmp[i..]);
+    }
+
+    #[inline]
+    fn int(&mut self, v: i64) {
+        self.buf.extend_from_slice(b"i:");
+        if v < 0 {
+            self.buf.push(b'-');
+        }
+        self.usize_dec(v.unsigned_abs() as usize);
+        self.buf.push(b';');
+    }
+
+    #[inline]
+    fn opt_int(&mut self, v: Option<i64>) {
+        match v {
+            Some(v) => self.int(v),
+            None => self.null(),
+        }
+    }
+
+    #[inline]
+    fn null(&mut self) {
+        self.buf.extend_from_slice(PHP_NULL_RAW);
+    }
+
+    #[inline]
+    fn bool(&mut self, v: bool) {
+        self.buf
+            .extend_from_slice(if v { b"b:1;" } else { b"b:0;" });
+    }
+
+    #[inline]
+    fn str(&mut self, s: &[u8]) {
+        self.buf.extend_from_slice(b"s:");
+        self.usize_dec(s.len());
+        self.buf.extend_from_slice(b":\"");
+        self.buf.extend_from_slice(s);
+        self.buf.extend_from_slice(b"\";");
+    }
+
+    #[inline]
+    fn lower_str(&mut self, s: &[u8]) {
+        self.buf.extend_from_slice(b"s:");
+        self.usize_dec(s.len());
+        self.buf.extend_from_slice(b":\"");
+        self.buf.extend(s.iter().map(u8::to_ascii_lowercase));
+        self.buf.extend_from_slice(b"\";");
+    }
+
+    #[inline]
+    fn opt_str(&mut self, s: Option<&[u8]>) {
+        match s {
+            Some(s) => self.str(s),
+            None => self.null(),
+        }
+    }
+
+    #[inline]
+    fn raw(&mut self, raw: &[u8]) {
+        self.buf.extend_from_slice(raw);
+    }
+
+    #[inline]
+    fn arr_open(&mut self, count: usize) {
+        self.buf.extend_from_slice(b"a:");
+        self.usize_dec(count);
+        self.buf.extend_from_slice(b":{");
+    }
+
+    #[inline]
+    fn arr_close(&mut self) {
+        self.buf.push(b'}');
+    }
+
+    #[inline]
+    fn key(&mut self, k: &[u8]) {
+        self.str(k);
+    }
+
+    #[inline]
+    fn idx(&mut self, i: usize) {
+        self.buf.extend_from_slice(b"i:");
+        self.usize_dec(i);
+        self.buf.push(b';');
+    }
+
+    fn str_list(&mut self, items: &[Vec<u8>]) {
+        self.arr_open(items.len());
+        for (i, item) in items.iter().enumerate() {
+            self.idx(i);
+            self.str(item);
+        }
+        self.arr_close();
+    }
+}
+
+#[inline]
+fn is_hex_len(s: &[u8], len: usize) -> bool {
+    s.len() == len && s.iter().all(u8::is_ascii_hexdigit)
+}
+
+/// Conservative superset of PHP numeric strings (leading/trailing whitespace, sign, digits,
+/// decimal point, exponent). Used to bail out wherever PHP would coerce or compare numerically.
+#[inline]
+fn php_maybe_numeric(s: &[u8]) -> bool {
+    s.iter().any(u8::is_ascii_digit)
+        && s.iter().all(|&b| {
+            b.is_ascii_digit()
+                || matches!(
+                    b,
+                    b'.' | b'e' | b'E' | b'+' | b'-' | b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C
+                )
+        })
+}
+
+/// `Par2MetadataParser::boundedNonNegativeInt`.
+fn php_bounded_non_negative_int(node: Option<&PhpNode<'_>>) -> Option<i64> {
+    let node = node?;
+    match node.val {
+        PhpVal::Int(i) => (i >= 0).then_some(i),
+        PhpVal::Str(s) => {
+            if s.is_empty() || !s.iter().all(u8::is_ascii_digit) {
+                return None;
+            }
+            let trimmed = &s[s.iter().position(|&b| b != b'0').unwrap_or(s.len())..];
+            if trimmed.is_empty() {
+                return Some(0);
+            }
+            if trimmed.len() > 19 {
+                return None;
+            }
+            let mut value: i64 = 0;
+            for &b in trimmed {
+                value = value.checked_mul(10)?.checked_add(i64::from(b - b'0'))?;
+            }
+            Some(value)
+        }
+        _ => None,
+    }
+}
+
+/// Removes duplicates (first occurrence wins) and sorts with PHP `sort()` semantics.
+/// Returns `None` when two entries could compare numerically.
+fn php_unique_sorted(items: Vec<Vec<u8>>) -> Option<Vec<Vec<u8>>> {
+    let mut unique: Vec<Vec<u8>> = Vec::with_capacity(items.len());
+    for item in items {
+        if !unique.contains(&item) {
+            unique.push(item);
+        }
+    }
+    if unique.iter().filter(|s| php_maybe_numeric(s)).count() > 1 {
+        return None;
+    }
+    unique.sort_unstable();
+    Some(unique)
+}
+
+#[inline]
+unsafe fn par2_input<'a>(input: *const u8, input_len: usize) -> Option<&'a [u8]> {
+    if input.is_null() || input_len == 0 {
+        return None;
+    }
+    Some(unsafe { slice::from_raw_parts(input, input_len) })
+}
+
+#[inline]
+unsafe fn par2_emit(out_buf: *mut u8, out_cap: usize, bytes: &[u8]) -> isize {
+    let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+    out.extend(bytes);
+    out.finish()
+}
+
+// ---- Par2ProofIdentity::fromPackets ----------------------------------------
+
+const PAR2_HEAD_MAIN: &[u8] = b"PAR 2.0\x00Main\x00\x00\x00\x00";
+const PAR2_HEAD_FILEDESC: &[u8] = b"PAR 2.0\x00FileDesc";
+const PAR2_HEAD_FILEVER: &[u8] = b"PAR 2.0\x00IFSC\x00\x00\x00\x00";
+const PAR2_HEAD_RECOVERY: &[u8] = b"PAR 2.0\x00RecvSlic";
+const PAR2_HEAD_CREATOR: &[u8] = b"PAR 2.0\x00Creator\x00";
+
+/// Canonical `[file ID => serialized value]` entries in first-seen order.
+type ProofEntries<'a> = Vec<(&'a [u8], Vec<u8>)>;
+
+struct ProofMain<'n, 'a> {
+    raw: Vec<u8>,
+    block_size: &'n PhpNode<'a>,
+    rec_count: &'n PhpNode<'a>,
+    rec_ids: &'n PhpNode<'a>,
+    other: Option<&'n PhpNode<'a>>,
+}
+
+enum ProofOutcome {
+    Identity([u8; 64]),
+    Ineligible,
+    Fallback,
+}
+
+/// String array key usable verbatim (PHP would not coerce it to an integer key).
+#[inline]
+fn proof_string_key<'a>(node: &PhpNode<'a>) -> Option<&'a [u8]> {
+    node.as_str().filter(|s| !php_maybe_numeric(s))
+}
+
+fn write_value_list(w: &mut PhpSerWriter, values: &[&[u8]]) {
+    w.arr_open(values.len());
+    for (i, v) in values.iter().enumerate() {
+        w.idx(i);
+        w.raw(v);
+    }
+    w.arr_close();
+}
+
+fn par2_proof_identity(doc: &PhpNode<'_>) -> ProofOutcome {
+    use ProofOutcome::{Fallback, Identity, Ineligible};
+    let PhpVal::Arr(packets) = &doc.val else {
+        return Fallback;
+    };
+    let mut set: Option<&PhpNode<'_>> = None;
+    let mut main: Option<ProofMain<'_, '_>> = None;
+    let mut descriptors: ProofEntries<'_> = Vec::new();
+    let mut checksums: ProofEntries<'_> = Vec::new();
+
+    for (_, packet) in packets {
+        if !packet.is_arr() {
+            return Fallback;
+        }
+        let Some(packet_set) = packet.get(b"head_set_id") else {
+            return Fallback;
+        };
+        if let Some(previous) = set {
+            match php_identical(Some(previous), Some(packet_set)) {
+                None => return Fallback,
+                Some(false) => return Ineligible,
+                Some(true) => {}
+            }
+        }
+        set = Some(packet_set);
+        let Some(head_type) = packet.get(b"head_type").and_then(PhpNode::as_str) else {
+            return Fallback;
+        };
+        let fields: &[&[u8]] = match head_type {
+            PAR2_HEAD_MAIN => &[b"block_size", b"rec_file_count", b"rec_file_ids"],
+            PAR2_HEAD_FILEDESC => &[
+                b"file_id",
+                b"file_name",
+                b"file_length",
+                b"file_hash",
+                b"file_hash_16K",
+                b"head_hash",
+            ],
+            PAR2_HEAD_FILEVER => &[b"file_id", b"block_checksums", b"head_hash"],
+            PAR2_HEAD_RECOVERY | PAR2_HEAD_CREATOR => continue,
+            _ => return Ineligible,
+        };
+        let mut nodes: Vec<&PhpNode<'_>> = Vec::with_capacity(fields.len());
+        for field in fields {
+            let Some(node) = packet.get(field) else {
+                return Fallback;
+            };
+            if node.has_float {
+                return Fallback;
+            }
+            nodes.push(node);
+        }
+        let mut w = PhpSerWriter::new();
+        if head_type == PAR2_HEAD_MAIN {
+            let other = packet.get(b"other_file_ids");
+            let Some(head_hash) = packet.get(b"head_hash") else {
+                return Fallback;
+            };
+            if other.is_some_and(|n| n.has_float) || head_hash.has_float {
+                return Fallback;
+            }
+            let other_raw = other
+                .filter(|n| !matches!(n.val, PhpVal::Null))
+                .map_or(PHP_EMPTY_ARR_RAW, |n| n.raw);
+            write_value_list(
+                &mut w,
+                &[
+                    nodes[0].raw,
+                    nodes[1].raw,
+                    nodes[2].raw,
+                    other_raw,
+                    head_hash.raw,
+                ],
+            );
+            match &main {
+                Some(previous) if previous.raw != w.buf => return Ineligible,
+                Some(_) => {}
+                None => {
+                    main = Some(ProofMain {
+                        raw: w.buf,
+                        block_size: nodes[0],
+                        rec_count: nodes[1],
+                        rec_ids: nodes[2],
+                        other: other.filter(|n| !matches!(n.val, PhpVal::Null)),
+                    });
+                }
+            }
+            continue;
+        }
+        let Some(id) = proof_string_key(nodes[0]) else {
+            return Fallback;
+        };
+        let (target, values): (&mut ProofEntries<'_>, &[&[u8]]) = if head_type == PAR2_HEAD_FILEDESC
+        {
+            (
+                &mut descriptors,
+                &[
+                    nodes[1].raw,
+                    nodes[2].raw,
+                    nodes[3].raw,
+                    nodes[4].raw,
+                    nodes[5].raw,
+                ],
+            )
+        } else {
+            (&mut checksums, &[nodes[1].raw, nodes[2].raw])
+        };
+        write_value_list(&mut w, values);
+        match target.iter().find(|(k, _)| *k == id) {
+            Some((_, existing)) if *existing != w.buf => return Ineligible,
+            Some(_) => {}
+            None => target.push((id, w.buf)),
+        }
+    }
+
+    let Some(ProofMain {
+        raw: main_raw,
+        block_size,
+        rec_count,
+        rec_ids,
+        other,
+    }) = main
+    else {
+        return Ineligible;
+    };
+    let Some(block_size) = block_size.as_int() else {
+        return Fallback;
+    };
+    if block_size < 1 {
+        return Ineligible;
+    }
+    let Some(rec_count) = rec_count.as_int() else {
+        return Fallback;
+    };
+    if rec_count < 1 {
+        return Ineligible;
+    }
+    if !rec_ids.is_arr() {
+        return Fallback;
+    }
+    if rec_ids.items().len() as i64 != rec_count {
+        return Ineligible;
+    }
+    let other_items: &[(PhpKey<'_>, PhpNode<'_>)] = match other {
+        None => &[],
+        Some(node) if node.is_arr() => node.items(),
+        Some(_) => return Fallback,
+    };
+    let mut ids: Vec<&[u8]> = Vec::with_capacity(rec_ids.items().len() + other_items.len());
+    for (_, entry) in rec_ids.items().iter().chain(other_items.iter()) {
+        if !entry.is_arr() {
+            return Fallback;
+        }
+        let Some(id) = entry.get_int_key(1).and_then(proof_string_key) else {
+            return Fallback;
+        };
+        if ids.contains(&id) {
+            return Ineligible;
+        }
+        ids.push(id);
+    }
+    ids.sort_unstable();
+    descriptors.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    checksums.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    if ids.len() != descriptors.len()
+        || ids.len() != checksums.len()
+        || ids.iter().zip(&descriptors).any(|(a, (b, _))| a != b)
+        || ids.iter().zip(&checksums).any(|(a, (b, _))| a != b)
+    {
+        return Ineligible;
+    }
+
+    let mut w = PhpSerWriter::new();
+    w.arr_open(5);
+    w.idx(0);
+    w.str(b"par2-source-proof-v1");
+    w.idx(1);
+    w.raw(opt_raw(set));
+    w.idx(2);
+    w.raw(&main_raw);
+    for (index, map) in [(3usize, &descriptors), (4, &checksums)] {
+        w.idx(index);
+        w.arr_open(map.len());
+        for (key, value) in map {
+            w.key(key);
+            w.raw(value);
+        }
+        w.arr_close();
+    }
+    w.arr_close();
+    Identity(crate::predb::sha256_hex_slice(&w.buf))
+}
+
+/// Accelerates `Par2ProofIdentity::fromPackets` over `serialize($packets)`.
+///
+/// Returns `64` with the lowercase hex SHA-256 identity written to `out_buf`, `0` when the
+/// metadata is ineligible (`null`), or `-1` when PHP must evaluate the input itself.
+///
+/// # Safety
+///
+/// `input` must be valid for `input_len` bytes; `out_buf` must be valid for `out_cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_par2_proof_identity(
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    let Some(data) = (unsafe { par2_input(input, input_len) }) else {
+        return PAR2_FALLBACK;
+    };
+    let Some(doc) = PhpSerParser::parse_document(data) else {
+        return PAR2_FALLBACK;
+    };
+    match par2_proof_identity(&doc) {
+        ProofOutcome::Identity(hex) => {
+            if out_cap < 64 || out_buf.is_null() {
+                return PAR2_FALLBACK;
+            }
+            unsafe { par2_emit(out_buf, out_cap, &hex) }
+        }
+        ProofOutcome::Ineligible => 0,
+        ProofOutcome::Fallback => PAR2_FALLBACK,
+    }
+}
+
+// ---- Par2MetadataParser::findCrossVolumeRecoveryConflicts -------------------
+
+fn par2_cross_volume_recovery_conflicts(doc: &PhpNode<'_>) -> Option<Vec<u8>> {
+    struct First<'n, 'a> {
+        set_id: &'a [u8],
+        exponent: i64,
+        volume: &'n PhpNode<'a>,
+        packet: &'n PhpNode<'a>,
+    }
+    if !doc.is_arr() {
+        return None;
+    }
+    let mut firsts: Vec<First<'_, '_>> = Vec::new();
+    let mut index: std::collections::HashMap<(&[u8], i64), usize> =
+        std::collections::HashMap::new();
+    let mut conflicting: std::collections::HashSet<(&[u8], i64)> = std::collections::HashSet::new();
+    let mut body = PhpSerWriter::new();
+    let mut count = 0usize;
+
+    for (_, volume) in doc.items() {
+        if !volume.is_arr() {
+            continue;
+        }
+        let packets = match volume.coalesce(b"recovery_packets") {
+            None => continue,
+            Some(node) if node.is_arr() => node,
+            Some(_) => return None,
+        };
+        for (_, packet) in packets.items() {
+            if !packet.is_arr() {
+                continue;
+            }
+            let Some(set_id) = opt_str(packet.get(b"recovery_set_id")) else {
+                continue;
+            };
+            let Some(exponent) = opt_int(packet.get(b"exponent")) else {
+                continue;
+            };
+            let Some(slice_hash) = opt_str(packet.get(b"slice_sha256")) else {
+                continue;
+            };
+            let Some(offset) = packet.get(b"packet_offset") else {
+                continue;
+            };
+            let Some(offset_value) = offset.as_int() else {
+                continue;
+            };
+            if !(0..=65535).contains(&exponent) || !is_hex_len(slice_hash, 64) || offset_value < 0 {
+                continue;
+            }
+            let exponent = if exponent == 65535 { 0 } else { exponent };
+            let key = (set_id, exponent);
+            let Some(&first_index) = index.get(&key) else {
+                index.insert(key, firsts.len());
+                firsts.push(First {
+                    set_id,
+                    exponent,
+                    volume,
+                    packet,
+                });
+                continue;
+            };
+            let first = &firsts[first_index];
+            let first_file_index = first.volume.get(b"file_index");
+            let file_index = volume.get(b"file_index");
+            if php_identical(first_file_index, file_index)? {
+                continue;
+            }
+            let first_hash = opt_str(first.packet.get(b"slice_sha256")).unwrap_or_default();
+            if first_hash.eq_ignore_ascii_case(slice_hash) || conflicting.contains(&key) {
+                continue;
+            }
+            conflicting.insert(key);
+            let segments_raw = |node: &PhpNode<'_>| -> Vec<u8> {
+                node.coalesce(b"article_segments")
+                    .map_or(PHP_EMPTY_ARR_RAW, |n| n.raw)
+                    .to_vec()
+            };
+            body.idx(count);
+            body.arr_open(12);
+            body.key(b"recovery_set_id");
+            body.str(first.set_id);
+            body.key(b"exponent");
+            body.int(first.exponent);
+            body.key(b"first_file_index");
+            body.raw(opt_raw(
+                first_file_index.filter(|n| !matches!(n.val, PhpVal::Null)),
+            ));
+            body.key(b"first_subject");
+            body.raw(opt_raw(first.volume.coalesce(b"subject")));
+            body.key(b"first_packet_offset");
+            body.raw(opt_raw(first.packet.get(b"packet_offset")));
+            body.key(b"first_slice_sha256");
+            body.str(first_hash);
+            body.key(b"first_article_segments");
+            body.raw(&segments_raw(first.packet));
+            body.key(b"conflicting_file_index");
+            body.raw(opt_raw(
+                file_index.filter(|n| !matches!(n.val, PhpVal::Null)),
+            ));
+            body.key(b"conflicting_subject");
+            body.raw(opt_raw(volume.coalesce(b"subject")));
+            body.key(b"conflicting_packet_offset");
+            body.raw(offset.raw);
+            body.key(b"conflicting_slice_sha256");
+            body.str(slice_hash);
+            body.key(b"conflicting_article_segments");
+            body.raw(&segments_raw(packet));
+            body.arr_close();
+            count += 1;
+        }
+    }
+
+    let mut w = PhpSerWriter::new();
+    w.arr_open(count);
+    w.raw(&body.buf);
+    w.arr_close();
+    Some(w.buf)
+}
+
+/// Accelerates `Par2MetadataParser::findCrossVolumeRecoveryConflicts` over `serialize($volumes)`.
+///
+/// Returns the serialized conflict list length, `-(required)` when `out_cap` is too small,
+/// or `-1` when PHP must evaluate the input itself.
+///
+/// # Safety
+///
+/// `input` must be valid for `input_len` bytes; `out_buf` must be valid for `out_cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_par2_cross_volume_recovery_conflicts(
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    let Some(data) = (unsafe { par2_input(input, input_len) }) else {
+        return PAR2_FALLBACK;
+    };
+    let Some(out) = PhpSerParser::parse_document(data)
+        .as_ref()
+        .and_then(par2_cross_volume_recovery_conflicts)
+    else {
+        return PAR2_FALLBACK;
+    };
+    unsafe { par2_emit(out_buf, out_cap, &out) }
+}
+
+// ---- Par2MetadataParser::validateCrossVolumeIfscRelationships ---------------
+
+fn par2_validate_cross_volume_ifsc(doc: &PhpNode<'_>) -> Option<Vec<u8>> {
+    let [
+        (_, main_ids),
+        (_, sources),
+        (_, block_size),
+        (_, checksums),
+        (_, main_present),
+    ] = doc.items()
+    else {
+        return None;
+    };
+    if !main_ids.is_arr() || !sources.is_arr() || !checksums.is_arr() {
+        return None;
+    }
+    let main_present = main_present.is_true();
+    let main_ids: Vec<&[u8]> = main_ids
+        .items()
+        .iter()
+        .filter_map(|(_, n)| n.as_str())
+        .collect();
+    let block_size = block_size.as_int().filter(|&b| b > 0);
+
+    let mut seen: std::collections::HashMap<Vec<u8>, (Vec<u8>, i64)> =
+        std::collections::HashMap::new();
+    let mut conflicting = Vec::new();
+    let mut membership = Vec::new();
+    let mut slice_mismatch = Vec::new();
+    let mut invalid = Vec::new();
+    let mut unresolved = Vec::new();
+
+    for (_, checksum) in checksums.items() {
+        let file_id = checksum.get(b"file_id").and_then(PhpNode::as_str);
+        let slice_count = opt_int(checksum.get(b"slice_count")).filter(|&c| c >= 0);
+        let records_hash = opt_str(checksum.get(b"checksum_records_sha256"));
+        let (Some(file_id), Some(slice_count), Some(records_hash)) = (
+            file_id.filter(|id| is_hex_len(id, 32)),
+            slice_count,
+            records_hash.filter(|h| is_hex_len(h, 64)),
+        ) else {
+            invalid.push(file_id.unwrap_or_default().to_vec());
+            continue;
+        };
+        let file_id = file_id.to_ascii_lowercase();
+        let records_hash = records_hash.to_ascii_lowercase();
+        if opt_is_true(checksum.get(b"duplicate_conflict")) {
+            conflicting.push(file_id.clone());
+        }
+        match seen.get(&file_id) {
+            Some((hash, count)) if *hash != records_hash || *count != slice_count => {
+                conflicting.push(file_id.clone());
+            }
+            _ => {
+                seen.insert(file_id.clone(), (records_hash, slice_count));
+            }
+        }
+        if main_present && !main_ids.contains(&file_id.as_slice()) {
+            membership.push(file_id.clone());
+        }
+        let source = sources.coalesce(&file_id);
+        let file_length = source
+            .and_then(|s| opt_int(s.get(b"file_length")))
+            .filter(|&l| l >= 0);
+        match (source.filter(|s| s.is_arr()), file_length, block_size) {
+            (Some(_), Some(length), Some(block)) => {
+                let expected = length / block + i64::from(length % block != 0);
+                if expected != slice_count
+                    || opt_is_false(checksum.get(b"slice_count_matches_file_length"))
+                {
+                    slice_mismatch.push(file_id);
+                }
+            }
+            _ => unresolved.push(file_id),
+        }
+    }
+
+    let conflicting = php_unique_sorted(conflicting)?;
+    let membership = php_unique_sorted(membership)?;
+    let slice_mismatch = php_unique_sorted(slice_mismatch)?;
+    let invalid = php_unique_sorted(invalid)?;
+    let unresolved = php_unique_sorted(unresolved)?;
+    let valid = conflicting.is_empty()
+        && membership.is_empty()
+        && slice_mismatch.is_empty()
+        && invalid.is_empty();
+    let status: &[u8] = if !valid {
+        b"invalid"
+    } else if checksums.items().is_empty() {
+        b"no_ifsc_packets"
+    } else if !unresolved.is_empty() {
+        b"pending_source_metadata"
+    } else {
+        b"valid"
+    };
+
+    let mut w = PhpSerWriter::new();
+    w.arr_open(7);
+    w.key(b"valid");
+    w.bool(valid);
+    w.key(b"status");
+    w.str(status);
+    for (key, list) in [
+        (&b"conflicting_checksum_file_ids"[..], &conflicting),
+        (b"main_membership_mismatch_file_ids", &membership),
+        (b"slice_count_mismatch_file_ids", &slice_mismatch),
+        (b"invalid_file_ids", &invalid),
+        (b"unresolved_file_ids", &unresolved),
+    ] {
+        w.key(key);
+        w.str_list(list);
+    }
+    w.arr_close();
+    Some(w.buf)
+}
+
+/// Accelerates `Par2MetadataParser::validateCrossVolumeIfscRelationships` over
+/// `serialize([$mainFileIds, $sourceFiles, $blockSize, $checksums, $mainPacket !== null])`.
+///
+/// Returns the serialized result length, `-(required)` when `out_cap` is too small,
+/// or `-1` when PHP must evaluate the input itself.
+///
+/// # Safety
+///
+/// `input` must be valid for `input_len` bytes; `out_buf` must be valid for `out_cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_par2_validate_cross_volume_ifsc(
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    let Some(data) = (unsafe { par2_input(input, input_len) }) else {
+        return PAR2_FALLBACK;
+    };
+    let Some(out) = PhpSerParser::parse_document(data)
+        .as_ref()
+        .and_then(par2_validate_cross_volume_ifsc)
+    else {
+        return PAR2_FALLBACK;
+    };
+    unsafe { par2_emit(out_buf, out_cap, &out) }
+}
+
+// ---- Par2MetadataParser::relateNzbFilePrefixesToSources ---------------------
+
+const PAR2_RELATE_COMPARISON_BASIS: &[u8] = b"A primary-provider first article whose decoded yEnc range begins at byte 1 and passes size, segment, and CRC checks; exact decoded-prefix length and MD5 are compared with each non-conflicting PAR2 source descriptor file length and md5_first_16k.";
+
+struct VerifiedPrefix {
+    file_length: i64,
+    bytes_hashed: i64,
+    md5: Vec<u8>,
+}
+
+/// `Par2MetadataParser::declaredYencCrc32Valid`.
+fn par2_declared_yenc_crc32_valid(yenc: &PhpNode<'_>) -> bool {
+    let basis = yenc.coalesce(b"segment_crc32_basis");
+    let basis_str = opt_str(basis);
+    if matches!(
+        basis_str,
+        Some(b"unavailable-conflicting-yenc-field" | b"unavailable-multipart-structure")
+    ) {
+        return false;
+    }
+    let field: Option<&[u8]> = match basis_str {
+        Some(b @ (b"crc32" | b"pcrc32")) => Some(b),
+        _ if yenc.coalesce(b"crc32").is_some() => Some(b"crc32"),
+        _ if yenc.coalesce(b"pcrc32").is_some() => Some(b"pcrc32"),
+        _ => None,
+    };
+    let Some(field) = field else {
+        return basis.is_none() || matches!(basis_str, Some(b"missing-crc32" | b"missing-pcrc32"));
+    };
+    opt_str(yenc.get(field))
+        .is_some_and(|d| (1..=8).contains(&d.len()) && d.iter().all(u8::is_ascii_hexdigit))
+        && opt_is_true(yenc.get(b"declared_crc32_is_hex"))
+        && opt_is_true(yenc.get(b"declared_crc32_matches"))
+}
+
+/// `Par2MetadataParser::bodyResponseIdentityVerified`.
+fn par2_body_response_identity_verified(metadata: &PhpNode<'_>) -> bool {
+    let identity = metadata.get(b"article_identity").filter(|n| n.is_arr());
+    let relations = identity
+        .and_then(|i| i.get(b"relations"))
+        .filter(|n| n.is_arr());
+    identity.is_some_and(|i| {
+        opt_str(i.get(b"parser_engine")) == Some(b"nntmux-rust-article-identity")
+            && opt_int(i.get(b"schema_version")) == Some(3)
+    }) && relations.is_some_and(|r| opt_is_true(r.get(b"body_response_matches_request")))
+}
+
+/// `Par2MetadataParser::verifiedFirstSegmentPrefix`; `Err(())` requests PHP fallback.
+fn par2_verified_first_segment_prefix(
+    file: &PhpNode<'_>,
+    sample: Option<&PhpNode<'_>>,
+) -> Result<Result<VerifiedPrefix, &'static [u8]>, ()> {
+    let zero = |key: &[u8]| opt_int(file.get(key)) == Some(0);
+    if !opt_is_true(file.get(b"segment_number_sequence_valid"))
+        || !zero(b"invalid_segment_record_count")
+        || !zero(b"invalid_segment_metadata_count")
+        || !zero(b"duplicate_message_id_count")
+        || !zero(b"duplicate_segment_number_count")
+    {
+        return Ok(Err(b"nzb_file_segment_inventory_invalid"));
+    }
+    let Some(sample) = sample else {
+        return Ok(Err(b"first_primary_sample_missing_or_ambiguous"));
+    };
+    let metadata = sample.get(b"metadata").filter(|n| n.is_arr());
+    let yenc = metadata.and_then(|m| m.get(b"yenc")).filter(|n| n.is_arr());
+    let identity = metadata
+        .and_then(|m| m.get(b"decoded_format_metadata"))
+        .filter(|n| n.is_arr())
+        .and_then(|d| d.get(b"sample_prefix_identity"))
+        .filter(|n| n.is_arr());
+    let (Some(metadata), Some(yenc), Some(identity)) = (metadata, yenc, identity) else {
+        return Ok(Err(b"prefix_or_yenc_metadata_unavailable"));
+    };
+    if !par2_body_response_identity_verified(metadata) {
+        return Ok(Err(b"article_response_identity_unverified"));
+    }
+    if !opt_is_true(yenc.get(b"header_numeric_fields_valid"))
+        || !opt_is_false(yenc.get(b"integrity_checks_ambiguous"))
+        || !opt_is_true(yenc.get(b"decoded_size_matches_yenc"))
+        || !opt_is_true(yenc.get(b"decoded_size_matches_yend_size"))
+    {
+        return Ok(Err(b"yenc_integrity_failed"));
+    }
+    let file_length = match php_bounded_non_negative_int(yenc.get(b"file_size")) {
+        None | Some(0) => return Ok(Err(b"yenc_file_length_unavailable")),
+        Some(length) => length,
+    };
+    let expected = file_length.min(16_384);
+    let bytes_hashed = php_bounded_non_negative_int(identity.get(b"bytes_hashed"));
+    let prefix_md5 = opt_str(identity.get(b"md5"));
+    let file_offset_known = identity.coalesce(b"file_offset_known");
+    if bytes_hashed != Some(expected)
+        || !prefix_md5.is_some_and(|m| is_hex_len(m, 32))
+        || !opt_is_true(identity.get(b"parser_input_offset_zero"))
+        || !file_offset_known.is_some_and(PhpNode::is_false)
+    {
+        return Ok(Err(b"decoded_prefix_identity_incomplete"));
+    }
+    let decoded_size = php_bounded_non_negative_int(yenc.get(b"decoded_segment_size"));
+    let Some(decoded_size) = decoded_size.filter(|&d| d >= expected) else {
+        return Ok(Err(b"decoded_prefix_too_short"));
+    };
+
+    let multipart = yenc.coalesce(b"multipart");
+    if multipart.is_some_and(PhpNode::is_true) {
+        let part = php_bounded_non_negative_int(yenc.get(b"part"));
+        let total_parts = php_bounded_non_negative_int(yenc.get(b"total_parts"));
+        let begin = php_bounded_non_negative_int(yenc.get(b"begin"));
+        let end = php_bounded_non_negative_int(yenc.get(b"end"));
+        let crc_valid = opt_str(yenc.get(b"pcrc32")).is_some()
+            && opt_is_true(yenc.get(b"declared_crc32_is_hex"))
+            && opt_is_true(yenc.get(b"declared_crc32_matches"));
+        let trailer = yenc.get(b"trailer_fields").filter(|n| n.is_arr());
+        let trailer_part = php_bounded_non_negative_int(trailer.and_then(|t| t.get(b"part")));
+        let trailer_total = php_bounded_non_negative_int(trailer.and_then(|t| t.get(b"total")));
+        let framing = metadata
+            .get(b"yenc_framing_metadata")
+            .filter(|n| n.is_arr());
+        let frames = framing
+            .and_then(|f| f.get(b"frames"))
+            .filter(|n| n.is_arr());
+        let frame = match frames {
+            Some(frames) if frames.items().len() == 1 => {
+                // `$nativeFrames[0]` on a missing key raises a warning in PHP.
+                let first = frames.get_int_key(0).ok_or(())?;
+                first.is_arr().then_some(first)
+            }
+            _ => None,
+        };
+        let contradicts = framing.is_some_and(|f| {
+            opt_is_true(f.get(b"frames_truncated"))
+                || opt_int(f.get(b"frame_count")) != Some(1)
+                || frame.is_none_or(|fr| {
+                    opt_is_false(fr.get(b"part_number_matches"))
+                        || opt_is_false(fr.get(b"total_parts_match"))
+                })
+        });
+        if part != Some(1)
+            || total_parts.is_none_or(|t| t < 1)
+            || trailer_part != part
+            || trailer_total.is_some_and(|t| Some(t) != total_parts)
+            || contradicts
+            || !opt_is_true(metadata.get(b"yenc_nzb_part_number_matches"))
+            || !opt_is_true(metadata.get(b"yenc_nzb_total_parts_matches"))
+        {
+            return Ok(Err(b"yenc_integrity_failed"));
+        }
+        if begin != Some(1) {
+            return Ok(Err(b"yenc_start_offset_not_zero"));
+        }
+        if !opt_is_true(yenc.get(b"ypart_range_valid"))
+            || !opt_is_true(yenc.get(b"decoded_size_matches_ypart_range"))
+            || end.is_none_or(|e| e < expected || e > file_length)
+            || !crc_valid
+        {
+            return Ok(Err(b"yenc_integrity_failed"));
+        }
+    } else if multipart.is_some_and(PhpNode::is_false) {
+        if yenc.coalesce(b"part").is_some()
+            || decoded_size != file_length
+            || !opt_is_true(yenc.get(b"decoded_size_matches_header_size"))
+        {
+            return Ok(Err(b"yenc_file_coverage_unverified"));
+        }
+        if !par2_declared_yenc_crc32_valid(yenc) {
+            return Ok(Err(b"yenc_integrity_failed"));
+        }
+    } else {
+        return Ok(Err(b"yenc_multipart_status_unavailable"));
+    }
+
+    Ok(Ok(VerifiedPrefix {
+        file_length,
+        bytes_hashed: expected,
+        md5: prefix_md5.unwrap_or_default().to_ascii_lowercase(),
+    }))
+}
+
+fn par2_relate_nzb_file_prefixes(doc: &PhpNode<'_>) -> Option<Vec<u8>> {
+    let [
+        (_, nzb_files),
+        (_, observations),
+        (_, sources),
+        (_, conflict_keys),
+    ] = doc.items()
+    else {
+        return None;
+    };
+    if !nzb_files.is_arr() || !observations.is_arr() || !sources.is_arr() || !conflict_keys.is_arr()
+    {
+        return None;
+    }
+    // `array_fill_keys()` coerces numeric strings and non-strings into other key types.
+    let mut conflicts: Vec<&[u8]> = Vec::new();
+    for (_, key) in conflict_keys.items() {
+        let key = key.as_str().filter(|k| !php_maybe_numeric(k))?;
+        if !conflicts.contains(&key) {
+            conflicts.push(key);
+        }
+    }
+    let conflict_set: std::collections::HashSet<&[u8]> = conflicts.iter().copied().collect();
+
+    let mut eligible: Vec<&PhpNode<'_>> = Vec::with_capacity(nzb_files.items().len());
+    for (_, file) in nzb_files.items() {
+        if !file.is_arr() {
+            return None;
+        }
+        if opt_str(file.get(b"kind")) != Some(b"par2") {
+            eligible.push(file);
+        }
+    }
+    let carrier_count = nzb_files.items().len() - eligible.len();
+
+    // Pre-bucket first/primary segment-one observations by their `file_index` identity.
+    let mut first_samples: std::collections::HashMap<&[u8], Vec<&PhpNode<'_>>> =
+        std::collections::HashMap::new();
+    if !eligible.is_empty() {
+        for (_, observation) in observations.items() {
+            if !observation.is_arr() {
+                return None;
+            }
+            if opt_int(observation.get(b"segment_number")) != Some(1)
+                || opt_str(observation.get(b"sample_role")) != Some(b"first")
+                || opt_str(observation.get(b"server_role")) != Some(b"primary")
+            {
+                continue;
+            }
+            let index = observation.coalesce(b"file_index");
+            if index.is_some_and(|n| n.has_float) {
+                return None;
+            }
+            first_samples
+                .entry(opt_raw(index))
+                .or_default()
+                .push(observation);
+        }
+    }
+
+    struct SourceView<'a> {
+        node_set: Option<&'a [u8]>,
+        file_id: Option<&'a [u8]>,
+        length: Option<i64>,
+        filename_raw: &'a [u8],
+        filename_str: Option<&'a [u8]>,
+        md5_16k: Option<&'a [u8]>,
+    }
+    let mut source_views: Vec<SourceView<'_>> = Vec::new();
+
+    let mut qualified = 0usize;
+    let mut candidate_matches = 0usize;
+    let mut ambiguous = 0usize;
+    let mut no_match = 0usize;
+    let mut insufficient = 0usize;
+    let mut conflicting_definitions = 0usize;
+    let mut files = PhpSerWriter::new();
+
+    for (position, file) in eligible.iter().enumerate() {
+        let file_index = file.coalesce(b"index");
+        if file_index.is_some_and(|n| n.has_float) {
+            return None;
+        }
+        let sample = first_samples
+            .get(opt_raw(file_index))
+            .filter(|bucket| bucket.len() == 1)
+            .map(|bucket| bucket[0]);
+        let verdict = par2_verified_first_segment_prefix(file, sample).ok()?;
+        let prefix = verdict.as_ref().ok();
+
+        let mut matches = PhpSerWriter::new();
+        let mut match_count = 0usize;
+        let mut conflicted = PhpSerWriter::new();
+        let mut conflicted_count = 0usize;
+        if let Some(prefix) = prefix {
+            qualified += 1;
+            if source_views.is_empty() && !sources.items().is_empty() {
+                for (_, source) in sources.items() {
+                    if !source.is_arr() {
+                        return None;
+                    }
+                    source_views.push(SourceView {
+                        node_set: opt_str(source.get(b"recovery_set_id")),
+                        file_id: opt_str(source.get(b"file_id")),
+                        length: php_bounded_non_negative_int(source.get(b"file_length")),
+                        filename_raw: opt_raw(source.coalesce(b"filename")),
+                        filename_str: opt_str(source.get(b"filename")),
+                        md5_16k: opt_str(source.get(b"md5_first_16k")),
+                    });
+                }
+            }
+            for view in &source_views {
+                if view.length != Some(prefix.file_length) {
+                    continue;
+                }
+                let length = prefix.file_length;
+                if let (Some(set), Some(file_id)) = (view.node_set, view.file_id) {
+                    let mut key = set.to_ascii_lowercase();
+                    key.push(b':');
+                    let set_len = key.len();
+                    key.extend(file_id.iter().map(u8::to_ascii_lowercase));
+                    let hit = conflict_set.contains(key.as_slice()) || {
+                        key.truncate(set_len);
+                        key.push(b'*');
+                        conflict_set.contains(key.as_slice())
+                    };
+                    if hit {
+                        conflicted.idx(conflicted_count);
+                        conflicted.arr_open(5);
+                        conflicted.key(b"recovery_set_id");
+                        conflicted.str(set);
+                        conflicted.key(b"file_id");
+                        conflicted.lower_str(file_id);
+                        conflicted.key(b"par2_filename");
+                        conflicted.raw(view.filename_raw);
+                        conflicted.key(b"par2_file_length");
+                        conflicted.int(length);
+                        conflicted.key(b"comparison_status");
+                        conflicted.str(b"source_definition_conflict");
+                        conflicted.arr_close();
+                        conflicted_count += 1;
+                        continue;
+                    }
+                }
+                let (Some(hash), Some(set), Some(file_id)) =
+                    (view.md5_16k, view.node_set, view.file_id)
+                else {
+                    continue;
+                };
+                if !is_hex_len(hash, 32) || !is_hex_len(file_id, 32) {
+                    continue;
+                }
+                if !hash.eq_ignore_ascii_case(&prefix.md5) {
+                    continue;
+                }
+                matches.idx(match_count);
+                matches.arr_open(9);
+                matches.key(b"recovery_set_id");
+                matches.lower_str(set);
+                matches.key(b"file_id");
+                matches.lower_str(file_id);
+                matches.key(b"par2_filename");
+                matches.opt_str(view.filename_str);
+                matches.key(b"par2_file_length");
+                matches.int(length);
+                matches.key(b"par2_md5_first_16k");
+                matches.lower_str(hash);
+                matches.key(b"file_length_matches");
+                matches.bool(true);
+                matches.key(b"prefix_md5_matches");
+                matches.bool(true);
+                matches.key(b"match_basis");
+                matches.str(b"exact_file_length_and_par2_md5_first_16k");
+                matches.key(b"whole_file_identity_established");
+                matches.bool(false);
+                matches.arr_close();
+                match_count += 1;
+            }
+        }
+
+        let status: &[u8] = if prefix.is_none() {
+            insufficient += 1;
+            b"insufficient_evidence"
+        } else if match_count + conflicted_count > 1 {
+            ambiguous += 1;
+            b"ambiguous"
+        } else if conflicted_count > 0 {
+            conflicting_definitions += 1;
+            b"conflicting_source_definition"
+        } else if match_count == 1 {
+            candidate_matches += 1;
+            b"candidate_match"
+        } else {
+            no_match += 1;
+            b"no_match"
+        };
+
+        files.idx(position);
+        files.arr_open(9);
+        files.key(b"file_index");
+        files.opt_int(file_index.and_then(PhpNode::as_int));
+        files.key(b"kind");
+        files.opt_str(opt_str(file.get(b"kind")));
+        files.key(b"nzb_subject");
+        files.opt_str(opt_str(file.get(b"subject")));
+        files.key(b"status");
+        files.str(status);
+        files.key(b"evidence_status");
+        match &verdict {
+            Ok(_) => files.str(b"verified_yenc_prefix"),
+            Err(evidence) => files.str(evidence),
+        }
+        files.key(b"sample");
+        match sample {
+            None => files.null(),
+            Some(sample) => {
+                files.arr_open(12);
+                for key in [&b"message_id"[..], b"server", b"provider_label"] {
+                    files.key(key);
+                    files.opt_str(opt_str(sample.get(key)));
+                }
+                files.key(b"server_role");
+                files.raw(opt_raw(sample.get(b"server_role")));
+                files.key(b"server_port");
+                files.opt_int(php_bounded_non_negative_int(sample.get(b"server_port")));
+                files.key(b"server_tls");
+                match sample.get(b"server_tls").map(|n| &n.val) {
+                    Some(PhpVal::Bool(b)) => files.bool(*b),
+                    _ => files.null(),
+                }
+                files.key(b"queried_at_utc");
+                files.opt_str(opt_str(sample.get(b"queried_at_utc")));
+                files.key(b"segment_number");
+                files.int(1);
+                files.key(b"file_offset_start");
+                files.int(0);
+                files.key(b"file_length");
+                files.opt_int(prefix.map(|p| p.file_length));
+                files.key(b"prefix_bytes_hashed");
+                files.opt_int(prefix.map(|p| p.bytes_hashed));
+                files.key(b"prefix_md5");
+                files.opt_str(prefix.map(|p| p.md5.as_slice()));
+                files.arr_close();
+            }
+        }
+        files.key(b"candidate_count");
+        files.int((match_count + conflicted_count) as i64);
+        files.key(b"matches");
+        files.arr_open(match_count);
+        files.raw(&matches.buf);
+        files.arr_close();
+        files.key(b"conflicted_candidates");
+        files.arr_open(conflicted_count);
+        files.raw(&conflicted.buf);
+        files.arr_close();
+        files.arr_close();
+    }
+
+    let status: &[u8] = if sources.items().is_empty() {
+        b"no_par2_sources"
+    } else if !conflicts.is_empty() || insufficient > 0 {
+        b"partial"
+    } else {
+        b"complete"
+    };
+    let mut w = PhpSerWriter::new();
+    w.buf.reserve(files.buf.len() + 1024);
+    w.arr_open(15);
+    w.key(b"status");
+    w.str(status);
+    w.key(b"comparison_basis");
+    w.str(PAR2_RELATE_COMPARISON_BASIS);
+    w.key(b"prefix_limit_bytes");
+    w.int(16_384);
+    w.key(b"whole_file_identity_established");
+    w.bool(false);
+    for (key, value) in [
+        (&b"nzb_file_count"[..], nzb_files.items().len()),
+        (b"source_file_count", eligible.len()),
+        (b"par2_carrier_file_count", carrier_count),
+        (b"qualified_prefix_count", qualified),
+        (b"candidate_match_count", candidate_matches),
+        (b"ambiguous_count", ambiguous),
+        (b"no_match_count", no_match),
+        (b"insufficient_evidence_count", insufficient),
+        (
+            b"conflicting_source_definition_count",
+            conflicting_definitions,
+        ),
+    ] {
+        w.key(key);
+        w.int(value as i64);
+    }
+    w.key(b"conflicting_source_keys");
+    w.arr_open(conflicts.len());
+    for (i, key) in conflicts.iter().enumerate() {
+        w.idx(i);
+        w.str(key);
+    }
+    w.arr_close();
+    w.key(b"files");
+    w.arr_open(eligible.len());
+    w.raw(&files.buf);
+    w.arr_close();
+    w.arr_close();
+    Some(w.buf)
+}
+
+/// Accelerates `Par2MetadataParser::relateNzbFilePrefixesToSources` over
+/// `serialize([$nzbFiles, $observations, $sources, $conflictingSourceKeys])`.
+///
+/// Returns the serialized result length, `-(required)` when `out_cap` is too small,
+/// or `-1` when PHP must evaluate the input itself.
+///
+/// # Safety
+///
+/// `input` must be valid for `input_len` bytes; `out_buf` must be valid for `out_cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_par2_relate_nzb_file_prefixes(
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    let Some(data) = (unsafe { par2_input(input, input_len) }) else {
+        return PAR2_FALLBACK;
+    };
+    let Some(out) = PhpSerParser::parse_document(data)
+        .as_ref()
+        .and_then(par2_relate_nzb_file_prefixes)
+    else {
+        return PAR2_FALLBACK;
+    };
+    unsafe { par2_emit(out_buf, out_cap, &out) }
+}
+
+#[cfg(test)]
+mod par2_metadata_proof_tests {
+    use super::*;
+
+    fn s(bytes: &[u8]) -> Vec<u8> {
+        let mut w = PhpSerWriter::new();
+        w.str(bytes);
+        w.buf
+    }
+
+    fn proof_fixture(other_ids: &[u8]) -> Vec<u8> {
+        let set = s(&[b'a'; 32]);
+        let id = s(&[b'b'; 32]);
+        let mut out = b"a:3:{i:0;a:7:{s:9:\"head_type\";".to_vec();
+        out.extend(s(PAR2_HEAD_MAIN));
+        out.extend(b"s:11:\"head_set_id\";");
+        out.extend(&set);
+        out.extend(b"s:9:\"head_hash\";");
+        out.extend(s(&[b'1'; 32]));
+        out.extend(b"s:10:\"block_size\";i:64;s:14:\"rec_file_count\";i:1;s:12:\"rec_file_ids\";a:1:{i:0;a:1:{i:1;");
+        out.extend(&id);
+        out.extend(b"}}s:14:\"other_file_ids\";");
+        out.extend(other_ids);
+        out.extend(b"}i:1;a:8:{s:9:\"head_type\";");
+        out.extend(s(PAR2_HEAD_FILEDESC));
+        out.extend(b"s:11:\"head_set_id\";");
+        out.extend(&set);
+        out.extend(b"s:9:\"head_hash\";");
+        out.extend(s(&[b'2'; 32]));
+        out.extend(b"s:7:\"file_id\";");
+        out.extend(&id);
+        out.extend(
+            b"s:9:\"file_name\";s:11:\"payload.bin\";s:11:\"file_length\";i:64;s:9:\"file_hash\";",
+        );
+        out.extend(s(&[b'c'; 32]));
+        out.extend(b"s:13:\"file_hash_16K\";");
+        out.extend(s(&[b'c'; 32]));
+        out.extend(b"}i:2;a:5:{s:9:\"head_type\";");
+        out.extend(s(PAR2_HEAD_FILEVER));
+        out.extend(b"s:11:\"head_set_id\";");
+        out.extend(&set);
+        out.extend(b"s:9:\"head_hash\";");
+        out.extend(s(&[b'3'; 32]));
+        out.extend(b"s:7:\"file_id\";");
+        out.extend(&id);
+        out.extend(b"s:15:\"block_checksums\";a:1:{i:0;a:2:{s:3:\"md5\";");
+        out.extend(s(&[b'c'; 32]));
+        out.extend(b"s:5:\"crc32\";i:123;}}}}");
+        out
+    }
+
+    fn proof(input: &[u8]) -> (isize, Vec<u8>) {
+        let mut out = [0u8; 64];
+        let rc = unsafe {
+            nntmux_par2_proof_identity(input.as_ptr(), input.len(), out.as_mut_ptr(), out.len())
+        };
+        (rc, out.to_vec())
+    }
+
+    #[test]
+    fn php_serialize_parser_accepts_scalars_and_rejects_objects() {
+        let doc =
+            PhpSerParser::parse_document(b"a:4:{i:0;N;s:1:\"k\";b:1;i:-5;d:0.5;i:7;s:3:\"a\"b\";}")
+                .expect("valid document");
+        assert_eq!(doc.items().len(), 4);
+        assert!(doc.has_float);
+        assert_eq!(doc.get(b"k").map(PhpNode::is_true), Some(true));
+        assert_eq!(opt_str(doc.get_int_key(7)), Some(&b"a\"b"[..]));
+        assert!(PhpSerParser::parse_document(b"O:8:\"stdClass\":0:{}").is_none());
+        assert!(PhpSerParser::parse_document(b"a:1:{i:0;R:1;}").is_none());
+        assert!(PhpSerParser::parse_document(b"s:5:\"abc\";").is_none());
+        assert!(PhpSerParser::parse_document(b"i:1;trailing").is_none());
+    }
+
+    #[test]
+    fn proof_identity_matches_php_vector() {
+        // PHP: Par2ProofIdentity::fromPackets() for the Par2ProofIdentityTest fixture.
+        let (rc, hex) = proof(&proof_fixture(b"N;"));
+        assert_eq!(rc, 64);
+        assert_eq!(
+            hex,
+            b"1d88979305e21fc576ccb1fcced3947606a8214efd52588afba857939b8fc83c".to_vec()
+        );
+        let (rc_empty_other, hex_empty_other) = proof(&proof_fixture(b"a:0:{}"));
+        assert_eq!((rc_empty_other, hex_empty_other), (rc, hex));
+    }
+
+    #[test]
+    fn proof_identity_defers_unsupported_shapes() {
+        assert_eq!(proof(b"a:0:{}").0, 0);
+        assert_eq!(proof(&proof_fixture(b"d:1.5;")).0, PAR2_FALLBACK);
+        assert_eq!(proof(b"a:1:{i:0;a:0:{}}").0, PAR2_FALLBACK);
+        assert_eq!(proof(b"not serialized").0, PAR2_FALLBACK);
+    }
+
+    #[test]
+    fn cross_volume_conflicts_match_php_vector() {
+        let a = [b'a'; 64];
+        let b = [b'b'; 64];
+        let mut input = b"a:2:{i:0;a:3:{s:10:\"file_index\";i:0;s:7:\"subject\";s:1:\"a\";s:16:\"recovery_packets\";a:1:{i:0;a:4:{s:15:\"recovery_set_id\";s:1:\"s\";s:8:\"exponent\";i:65535;s:12:\"slice_sha256\";".to_vec();
+        input.extend(s(&a));
+        input.extend(b"s:13:\"packet_offset\";i:0;}}}i:1;a:3:{s:10:\"file_index\";i:1;s:7:\"subject\";s:1:\"b\";s:16:\"recovery_packets\";a:1:{i:0;a:4:{s:15:\"recovery_set_id\";s:1:\"s\";s:8:\"exponent\";i:0;s:12:\"slice_sha256\";");
+        input.extend(s(&b));
+        input.extend(b"s:13:\"packet_offset\";i:8;}}}}");
+        let doc = PhpSerParser::parse_document(&input).expect("valid document");
+        let mut expected = b"a:1:{i:0;a:12:{s:15:\"recovery_set_id\";s:1:\"s\";s:8:\"exponent\";i:0;s:16:\"first_file_index\";i:0;s:13:\"first_subject\";s:1:\"a\";s:19:\"first_packet_offset\";i:0;s:18:\"first_slice_sha256\";".to_vec();
+        expected.extend(s(&a));
+        expected.extend(b"s:22:\"first_article_segments\";a:0:{}s:22:\"conflicting_file_index\";i:1;s:19:\"conflicting_subject\";s:1:\"b\";s:25:\"conflicting_packet_offset\";i:8;s:24:\"conflicting_slice_sha256\";");
+        expected.extend(s(&b));
+        expected.extend(b"s:28:\"conflicting_article_segments\";a:0:{}}}");
+        assert_eq!(par2_cross_volume_recovery_conflicts(&doc), Some(expected));
+
+        let mut small = [0u8; 8];
+        let rc = unsafe {
+            nntmux_par2_cross_volume_recovery_conflicts(
+                input.as_ptr(),
+                input.len(),
+                small.as_mut_ptr(),
+                small.len(),
+            )
+        };
+        assert!(rc < -8);
+    }
+
+    #[test]
+    fn ifsc_validation_defers_numeric_sort_and_reports_status() {
+        let doc =
+            PhpSerParser::parse_document(b"a:5:{i:0;a:0:{}i:1;a:0:{}i:2;N;i:3;a:0:{}i:4;b:0;}")
+                .expect("valid document");
+        let out = par2_validate_cross_volume_ifsc(&doc).expect("handled");
+        assert!(
+            out.starts_with(b"a:7:{s:5:\"valid\";b:1;s:6:\"status\";s:15:\"no_ifsc_packets\";")
+        );
+
+        let numeric = b"a:5:{i:0;a:0:{}i:1;a:0:{}i:2;N;i:3;a:2:{i:0;a:1:{s:7:\"file_id\";s:2:\"12\";}i:1;a:1:{s:7:\"file_id\";s:1:\"9\";}}i:4;b:0;}";
+        let doc = PhpSerParser::parse_document(numeric).expect("valid document");
+        assert!(par2_validate_cross_volume_ifsc(&doc).is_none());
+    }
+
+    #[test]
+    fn bounded_non_negative_int_matches_php() {
+        let parse = |raw: &[u8]| {
+            let doc = PhpSerParser::parse_document(raw).expect("valid");
+            php_bounded_non_negative_int(Some(&doc))
+        };
+        assert_eq!(parse(b"i:5;"), Some(5));
+        assert_eq!(parse(b"i:-1;"), None);
+        assert_eq!(parse(b"s:4:\"0012\";"), Some(12));
+        assert_eq!(parse(b"s:3:\"000\";"), Some(0));
+        assert_eq!(parse(b"s:19:\"9223372036854775807\";"), Some(i64::MAX));
+        assert_eq!(parse(b"s:19:\"9223372036854775808\";"), None);
+        assert_eq!(parse(b"s:2:\"1a\";"), None);
+        assert_eq!(parse(b"s:0:\"\";"), None);
+        assert_eq!(parse(b"b:1;"), None);
+    }
+}

@@ -4,6 +4,14 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Fingerprint;
 
+/**
+ * `findCrossVolumeRecoveryConflicts`, `validateCrossVolumeIfscRelationships` and
+ * `relateNzbFilePrefixesToSources` retain PHP under the < 1.5x FFI bailout rule: the Rust
+ * candidates (`nntmux_par2_cross_volume_recovery_conflicts`, `nntmux_par2_validate_cross_volume_ifsc`,
+ * `nntmux_par2_relate_nzb_file_prefixes` in `rust/pipeline-ffi/src/metadata.rs`) are output-identical
+ * but `serialize()`/`unserialize()` marshaling of the caller's arrays (NZB files carry full segment
+ * lists) measured 0.23x-0.91x on common paths. Raw packet parsing in `parse()` is already native.
+ */
 final class Par2MetadataParser
 {
     private const MAX_MAIN_FILE_IDS = 32_768;
