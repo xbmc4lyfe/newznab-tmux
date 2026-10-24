@@ -24638,3 +24638,407 @@ mod wave31_monitoring_metrics_deploy_tmux_attach_commands_tests {
         );
     }
 }
+
+// Wave 32 Slice 32.6: installer/updater command planning. All strings are PHP
+// byte strings; no UTF-8 decoding, trimming, or new branch policy is applied.
+
+/// Echo five big-endian u32-length-prefixed database fields after validating
+/// the complete frame. The caller retains the original integer/string port type.
+/// Returns -1 for invalid input, -needed without writing for insufficient space.
+/// # Safety
+/// Non-null pointers must name readable/writable allocations of the given sizes.
+/// Input and output allocations must not overlap.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_installer_database_config(
+    config: *const u8,
+    config_len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(bytes) = (unsafe { add23_valid_slice(config, config_len, ADD23_MAX_SEG_LEN) })
+        else {
+            return -1;
+        };
+        let mut offset = 0usize;
+        for _ in 0..5 {
+            let Some(header) = bytes.get(offset..).and_then(|tail| tail.get(..4)) else {
+                return -1;
+            };
+            let length = u32::from_be_bytes(header.try_into().unwrap()) as usize;
+            let Some(end) = offset
+                .checked_add(4)
+                .and_then(|start| start.checked_add(length))
+            else {
+                return -1;
+            };
+            if end > bytes.len() {
+                return -1;
+            }
+            offset = end;
+        }
+        if offset != bytes.len() {
+            return -1;
+        }
+        unsafe { add23_write_slices(out, cap, &[bytes], 1) }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Plan only the named update subcommands. The caller retains skip options,
+/// process execution, npm operations, error handling, and maintenance ownership.
+/// # Safety
+/// `out` must name a writable allocation of `cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_installer_update_sequence(
+    maintenance_down: u8,
+    seed: u8,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if maintenance_down > 1 || seed > 1 {
+            return -1;
+        }
+        let prefix: &[u8] = if maintenance_down == 0 {
+            b"down\n"
+        } else {
+            b""
+        };
+        let suffix: &[u8] = if maintenance_down == 0 { b"\nup" } else { b"" };
+        let seed_command: &[u8] = if seed == 1 { b"\ndb:seed" } else { b"" };
+        unsafe {
+            add23_write_slices(
+                out,
+                cap,
+                &[
+                    prefix,
+                    b"nntmux:git\nnntmux:composer\nnntmux:db",
+                    seed_command,
+                    suffix,
+                ],
+                1,
+            )
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Build the existing install command, preserving command bytes verbatim.
+/// # Safety
+/// Input/output allocations must be valid for their lengths and not overlap.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_installer_composer_command(
+    env: *const u8,
+    env_len: usize,
+    command: *const u8,
+    command_len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(env) = (unsafe { add23_valid_slice(env, env_len, ADD23_MAX_SEG_LEN) }) else {
+            return -1;
+        };
+        let Some(command) = (unsafe { add23_valid_slice(command, command_len, ADD23_MAX_SEG_LEN) })
+        else {
+            return -1;
+        };
+        let optimization: &[u8] = if env == b"production" {
+            b" --optimize-autoloader --classmap-authoritative"
+        } else {
+            b""
+        };
+        unsafe {
+            add23_write_slices(
+                out,
+                cap,
+                &[
+                    command,
+                    b" install --no-interaction --no-progress",
+                    optimization,
+                ],
+                1,
+            )
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Bit 0 means force migration/seeding, bit 1 means seed was requested.
+/// # Safety
+/// `env` must name a readable allocation of `env_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_installer_migration_mode(
+    env: *const u8,
+    env_len: usize,
+    seed: u8,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(env) = (unsafe { add23_valid_slice(env, env_len, ADD23_MAX_SEG_LEN) }) else {
+            return -1;
+        };
+        if seed > 1 {
+            return -1;
+        }
+        i32::from(env == b"production") | (i32::from(seed) << 1)
+    }))
+    .unwrap_or(-1)
+}
+
+/// The updater accepts arbitrary nonempty branches; Git validates ref syntax.
+/// # Safety
+/// `branch` must name a readable allocation of `branch_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_installer_managed_branch(
+    branch: *const u8,
+    branch_len: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(branch) = (unsafe { add23_valid_slice(branch, branch_len, ADD23_MAX_SEG_LEN) })
+        else {
+            return -1;
+        };
+        i32::from(!branch.is_empty())
+    }))
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod w326_installer_tests {
+    use super::*;
+
+    fn frame(fields: &[&[u8]]) -> Vec<u8> {
+        let mut result = Vec::new();
+        for field in fields {
+            result.extend_from_slice(&(field.len() as u32).to_be_bytes());
+            result.extend_from_slice(field);
+        }
+        result
+    }
+
+    #[test]
+    fn database_frames_preserve_bytes_and_reject_malformed_input() {
+        for fields in [
+            [&b"mysql"[..], b"localhost", b"3306", b"nntmux", b"root"],
+            [b"", b"\xff\0", b"03306", b" a\n", b""],
+        ] {
+            let input = frame(&fields);
+            let mut out = vec![0x5a; input.len()];
+            assert_eq!(
+                unsafe {
+                    nntmux_installer_database_config(
+                        input.as_ptr(),
+                        input.len(),
+                        out.as_mut_ptr(),
+                        out.len(),
+                    )
+                },
+                input.len() as isize
+            );
+            assert_eq!(out, input);
+            out.fill(0x5a);
+            assert_eq!(
+                unsafe {
+                    nntmux_installer_database_config(
+                        input.as_ptr(),
+                        input.len(),
+                        out.as_mut_ptr(),
+                        input.len() - 1,
+                    )
+                },
+                -(input.len() as isize)
+            );
+            assert!(out.iter().all(|&byte| byte == 0x5a));
+            for length in 0..input.len() {
+                assert_eq!(
+                    unsafe {
+                        nntmux_installer_database_config(
+                            input.as_ptr(),
+                            length,
+                            out.as_mut_ptr(),
+                            out.len(),
+                        )
+                    },
+                    -1
+                );
+            }
+            let mut trailing = input.clone();
+            trailing.push(0);
+            assert_eq!(
+                unsafe {
+                    nntmux_installer_database_config(
+                        trailing.as_ptr(),
+                        trailing.len(),
+                        out.as_mut_ptr(),
+                        out.len(),
+                    )
+                },
+                -1
+            );
+        }
+        let huge_field = [0xff; 20];
+        let mut out = [0x5a; 128];
+        assert_eq!(
+            unsafe {
+                nntmux_installer_database_config(
+                    huge_field.as_ptr(),
+                    huge_field.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            },
+            -1
+        );
+        assert_eq!(out, [0x5a; 128]);
+    }
+
+    #[test]
+    fn commands_and_modes_match_php() {
+        let mut out = [0u8; 256];
+        for (env, flags) in [
+            (&b"production"[..], 1),
+            (b"Production", 0),
+            (b"production\0", 0),
+            (b"\xff", 0),
+            (b"", 0),
+        ] {
+            for seed in 0..=1 {
+                assert_eq!(
+                    unsafe { nntmux_installer_migration_mode(env.as_ptr(), env.len(), seed) },
+                    flags | (i32::from(seed) << 1)
+                );
+            }
+            let command = b"php composer.phar\0";
+            let written = unsafe {
+                nntmux_installer_composer_command(
+                    env.as_ptr(),
+                    env.len(),
+                    command.as_ptr(),
+                    command.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            let mut expected = command.to_vec();
+            expected.extend_from_slice(b" install --no-interaction --no-progress");
+            if flags == 1 {
+                expected.extend_from_slice(b" --optimize-autoloader --classmap-authoritative");
+            }
+            assert_eq!(&out[..written as usize], expected);
+        }
+        for down in 0..=1 {
+            for seed in 0..=1 {
+                let written = unsafe {
+                    nntmux_installer_update_sequence(down, seed, out.as_mut_ptr(), out.len())
+                };
+                let mut expected = Vec::new();
+                if down == 0 {
+                    expected.extend_from_slice(b"down\n");
+                }
+                expected.extend_from_slice(b"nntmux:git\nnntmux:composer\nnntmux:db");
+                if seed == 1 {
+                    expected.extend_from_slice(b"\ndb:seed");
+                }
+                if down == 0 {
+                    expected.extend_from_slice(b"\nup");
+                }
+                assert_eq!(&out[..written as usize], expected);
+            }
+        }
+        for branch in [&b""[..], b"master", b"feature/x", b" ", b"\xff\0"] {
+            assert_eq!(
+                unsafe { nntmux_installer_managed_branch(branch.as_ptr(), branch.len()) },
+                i32::from(!branch.is_empty())
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_ffi_arguments_and_short_buffers_do_not_write() {
+        let null = std::ptr::null();
+        let null_out = std::ptr::null_mut();
+        let empty = b"".as_ptr();
+        let mut out = [0x5a; 128];
+        assert_eq!(
+            unsafe { nntmux_installer_database_config(null, 0, out.as_mut_ptr(), out.len()) },
+            -1
+        );
+        let valid = frame(&[b"", b"", b"", b"", b""]);
+        assert_eq!(
+            unsafe { nntmux_installer_database_config(valid.as_ptr(), valid.len(), null_out, 128) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_installer_update_sequence(0, 0, null_out, 128) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_installer_update_sequence(2, 0, out.as_mut_ptr(), out.len()) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_installer_update_sequence(0, 2, out.as_mut_ptr(), out.len()) },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_installer_composer_command(null, 0, empty, 0, out.as_mut_ptr(), out.len())
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_installer_composer_command(empty, 0, null, 0, out.as_mut_ptr(), out.len())
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_installer_composer_command(empty, 0, empty, 0, null_out, 0) },
+            -1
+        );
+        assert_eq!(unsafe { nntmux_installer_migration_mode(null, 0, 0) }, -1);
+        assert_eq!(unsafe { nntmux_installer_migration_mode(empty, 0, 2) }, -1);
+        assert_eq!(unsafe { nntmux_installer_managed_branch(null, 0) }, -1);
+        assert_eq!(
+            unsafe { nntmux_installer_managed_branch(empty, usize::MAX) },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_installer_database_config(empty, usize::MAX, out.as_mut_ptr(), out.len())
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_installer_composer_command(
+                    empty,
+                    usize::MAX,
+                    empty,
+                    0,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_installer_migration_mode(empty, usize::MAX, 0) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_installer_update_sequence(0, 0, out.as_mut_ptr(), usize::MAX) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_installer_update_sequence(0, 0, out.as_mut_ptr(), 1) },
+            -44
+        );
+        assert_eq!(
+            unsafe { nntmux_installer_composer_command(empty, 0, empty, 0, out.as_mut_ptr(), 1) },
+            -39
+        );
+        assert_eq!(out, [0x5a; 128]);
+    }
+}
