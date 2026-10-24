@@ -19075,5 +19075,1229 @@ pub mod tv_igdb_book_metadata {
     }
 }
 
+/// Wave 18 Worker 5: GenreService, AnidbResource, BookResource, MovieResource,
+/// and MetadataConfigurationData C-ABI helpers.
+///
+/// Every export validates raw pointers, alignment, input lengths, and output
+/// capacities before constructing slices, guards against integer overflow, and
+/// wraps its body in `std::panic::catch_unwind`, returning `-1` on panic or
+/// decline so the PHP caller falls back to its pure-PHP implementation.
+pub mod genre_resources_metadata_config {
+    use super::{OutCursor, PhpKey, PhpNode, PhpSerParser, PhpSerWriter, PhpVal, opt_raw};
+    use std::mem::size_of;
+    use std::panic::{UnwindSafe, catch_unwind};
+    use std::slice;
+    use std::str;
+
+    const DECLINE: isize = -1;
+    const MAX_INPUT: usize = 4 << 20;
+
+    #[inline]
+    unsafe fn input<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null() || len > MAX_INPUT || len > isize::MAX as usize {
+            return None;
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn valid_out_cap(out: *mut u8, cap: usize) -> bool {
+        (!out.is_null() || cap == 0) && cap <= isize::MAX as usize
+    }
+
+    #[inline]
+    fn finish_cursor(cursor: OutCursor<'_>) -> isize {
+        let res = cursor.finish();
+        if res == -1 { -2 } else { res }
+    }
+
+    #[inline]
+    fn guard<F: FnOnce() -> isize + UnwindSafe>(f: F) -> isize {
+        catch_unwind(f).unwrap_or(DECLINE)
+    }
+
+    #[inline]
+    fn is_ascii_space_no_nul(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\x0B' | b'\x0C')
+    }
+
+    #[inline]
+    fn parse_cast_int_bytes(bytes: &[u8]) -> Option<i64> {
+        if bytes.contains(&0) {
+            return None;
+        }
+        let mut start = 0;
+        let mut end = bytes.len();
+        while start < end && is_ascii_space_no_nul(bytes[start]) {
+            start += 1;
+        }
+        while end > start && is_ascii_space_no_nul(bytes[end - 1]) {
+            end -= 1;
+        }
+        let trimmed = &bytes[start..end];
+        if trimmed.is_empty() {
+            return Some(0);
+        }
+        let (neg, digits) = match trimmed.first()? {
+            b'+' => (false, &trimmed[1..]),
+            b'-' => (true, &trimmed[1..]),
+            _ => (false, trimmed),
+        };
+        if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let mut val: i64 = 0;
+        if neg {
+            for &b in digits {
+                val = val.checked_mul(10)?.checked_sub(i64::from(b - b'0'))?;
+            }
+        } else {
+            for &b in digits {
+                val = val.checked_mul(10)?.checked_add(i64::from(b - b'0'))?;
+            }
+        }
+        Some(val)
+    }
+
+    #[inline]
+    fn canonical_php_int_key(key: &[u8]) -> Option<i64> {
+        if key == b"0" {
+            return Some(0);
+        }
+        let digits = if key.first() == Some(&b'-') {
+            &key[1..]
+        } else {
+            key
+        };
+        if !matches!(digits.first(), Some(b'1'..=b'9')) || !digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        str::from_utf8(key).ok()?.parse::<i64>().ok()
+    }
+
+    #[inline]
+    fn lookup_php_key<'a>(node: &'a PhpNode<'a>, key: &[u8]) -> Option<&'a PhpNode<'a>> {
+        node.get(key).or_else(|| {
+            let int_key = canonical_php_int_key(key)?;
+            node.get_int_key(int_key)
+        })
+    }
+
+    #[inline]
+    fn node_is_empty(node: Option<&PhpNode<'_>>) -> Option<bool> {
+        let Some(n) = node else {
+            return Some(true);
+        };
+        match &n.val {
+            PhpVal::Null | PhpVal::Bool(false) | PhpVal::Int(0) => Some(true),
+            PhpVal::Bool(true) | PhpVal::Int(_) => Some(false),
+            PhpVal::Str(s) => Some(s.is_empty() || *s == b"0"),
+            PhpVal::Arr(items) => Some(items.is_empty()),
+            PhpVal::Float => None,
+        }
+    }
+
+    #[inline]
+    fn node_to_bool(node: Option<&PhpNode<'_>>) -> Option<bool> {
+        Some(!node_is_empty(node)?)
+    }
+
+    #[inline]
+    fn write_i64_dec(cursor: &mut OutCursor<'_>, v: i64) {
+        if v < 0 {
+            cursor.push(b'-');
+        }
+        let mut n = v.unsigned_abs();
+        let mut tmp = [0u8; 20];
+        let mut i = tmp.len();
+        loop {
+            i -= 1;
+            tmp[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        cursor.extend(&tmp[i..]);
+    }
+
+    // -------------------------------------------------------------------------
+    // 1. GenreService helpers
+    // -------------------------------------------------------------------------
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum GenreMapKey<'a> {
+        Int(i64),
+        Str(&'a [u8]),
+    }
+
+    #[inline]
+    fn node_to_genre_key<'a>(node: &'a PhpNode<'a>) -> Option<GenreMapKey<'a>> {
+        match &node.val {
+            PhpVal::Int(i) => Some(GenreMapKey::Int(*i)),
+            PhpVal::Bool(b) => Some(GenreMapKey::Int(i64::from(*b))),
+            PhpVal::Null => Some(GenreMapKey::Str(b"")),
+            PhpVal::Str(s) => Some(
+                canonical_php_int_key(s).map_or(GenreMapKey::Str(s), GenreMapKey::Int),
+            ),
+            _ => None,
+        }
+    }
+
+    /// Computes `'genres_' . md5($type . '_' . ($activeOnly ? '1' : '0'))` (39 bytes).
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_genre_service_cache_key(
+        type_ptr: *const u8,
+        type_len: usize,
+        active_only: u32,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        guard(|| {
+            if !valid_out_cap(out, cap) {
+                return DECLINE;
+            }
+            let Some(type_bytes) = (unsafe { input(type_ptr, type_len) }) else {
+                return DECLINE;
+            };
+            let mut md5_input = Vec::with_capacity(type_bytes.len() + 2);
+            md5_input.extend_from_slice(type_bytes);
+            md5_input.push(b'_');
+            md5_input.push(if active_only != 0 { b'1' } else { b'0' });
+            let digest = crate::md5_hex_slice(&md5_input);
+
+            let mut cursor = unsafe { OutCursor::new(out, cap) };
+            cursor.extend(b"genres_");
+            cursor.extend(&digest);
+            finish_cursor(cursor)
+        })
+    }
+
+    /// Normalizes a PHP-serialized genre list (`[['id' => ..., 'title' => ...], ...]`)
+    /// or map (`[id => title, ...]`) into a PHP-serialized associative array `id => strtolower(title)`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_genre_service_normalize_map(
+        ser_ptr: *const u8,
+        ser_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        guard(|| {
+            if !valid_out_cap(out, cap) {
+                return DECLINE;
+            }
+            let Some(ser_bytes) = (unsafe { input(ser_ptr, ser_len) }) else {
+                return DECLINE;
+            };
+            let Some(doc) = PhpSerParser::parse_document(ser_bytes) else {
+                return DECLINE;
+            };
+            if !doc.is_arr() || doc.has_float {
+                return DECLINE;
+            }
+
+            let items = doc.items();
+            let mut entries: Vec<(GenreMapKey<'_>, &[u8])> = Vec::with_capacity(items.len());
+            for (k, item) in items {
+                let (map_key, title_bytes) = match &item.val {
+                    PhpVal::Arr(_) => {
+                        let Some(id_node) = lookup_php_key(item, b"id").or_else(|| item.get_int_key(0)) else {
+                            return DECLINE;
+                        };
+                        let Some(mk) = node_to_genre_key(id_node) else {
+                            return DECLINE;
+                        };
+                        let Some(PhpNode {
+                            val: PhpVal::Str(t),
+                            ..
+                        }) = lookup_php_key(item, b"title").or_else(|| item.get_int_key(1))
+                        else {
+                            return DECLINE;
+                        };
+                        (mk, *t)
+                    }
+                    PhpVal::Str(t) => {
+                        let mk = match k {
+                            PhpKey::Int(i) => GenreMapKey::Int(*i),
+                            PhpKey::Str(s) => {
+                                canonical_php_int_key(s).map_or(GenreMapKey::Str(s), GenreMapKey::Int)
+                            }
+                        };
+                        (mk, *t)
+                    }
+                    _ => return DECLINE,
+                };
+
+                if let Some(existing) = entries.iter_mut().find(|(ek, _)| *ek == map_key) {
+                    existing.1 = title_bytes;
+                } else {
+                    entries.push((map_key, title_bytes));
+                }
+            }
+
+            let mut w = PhpSerWriter::new();
+            w.arr_open(entries.len());
+            for (mk, title) in entries {
+                match mk {
+                    GenreMapKey::Int(i) => w.int(i),
+                    GenreMapKey::Str(s) => w.str(s),
+                }
+                w.lower_str(title);
+            }
+            w.arr_close();
+
+            let mut cursor = unsafe { OutCursor::new(out, cap) };
+            cursor.extend(&w.buf);
+            finish_cursor(cursor)
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // 2. AnidbResource helpers
+    // -------------------------------------------------------------------------
+
+    #[inline]
+    fn is_valid_hostname_domain(host: &[u8]) -> bool {
+        if host.is_empty() || host.len() > 253 {
+            return false;
+        }
+        let host = host.strip_suffix(b".").unwrap_or(host);
+        if host.is_empty() {
+            return false;
+        }
+        for label in host.split(|&b| b == b'.') {
+            if label.is_empty() || label.len() > 63 {
+                return false;
+            }
+            if !label.first().is_some_and(u8::is_ascii_alphanumeric)
+                || !label.last().is_some_and(u8::is_ascii_alphanumeric)
+            {
+                return false;
+            }
+            if !label
+                .iter()
+                .all(|&b| b.is_ascii_alphanumeric() || b == b'-')
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Evaluates `filter_var($picture, FILTER_VALIDATE_URL) !== false` for common URLs and filenames.
+    /// Returns `None` on exotic URL forms (`mailto:`, `news:`, `file:`, userinfo `@`, IPv6 `[...]`, or unusual port syntax)
+    /// so the caller falls back to PHP's `filter_var`.
+    fn php_validate_url_bytes(bytes: &[u8]) -> Option<bool> {
+        if bytes.is_empty() || !bytes.iter().all(|&b| (0x21..=0x7e).contains(&b)) {
+            return Some(false);
+        }
+        let Some(colon_pos) = bytes.iter().position(|&b| b == b':') else {
+            return Some(false);
+        };
+        if colon_pos == 0 {
+            return Some(false);
+        }
+        let scheme = &bytes[..colon_pos];
+        if !scheme
+            .iter()
+            .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+        {
+            return Some(false);
+        }
+        if scheme.eq_ignore_ascii_case(b"mailto")
+            || scheme.eq_ignore_ascii_case(b"news")
+            || scheme.eq_ignore_ascii_case(b"file")
+        {
+            return None;
+        }
+        let after_colon = &bytes[colon_pos + 1..];
+        let Some(after_slashes) = after_colon.strip_prefix(b"//") else {
+            return Some(false);
+        };
+        let auth_end = after_slashes
+            .iter()
+            .position(|&b| matches!(b, b'/' | b'?' | b'#'))
+            .unwrap_or(after_slashes.len());
+        let authority = &after_slashes[..auth_end];
+        if authority.is_empty() {
+            return Some(false);
+        }
+        if authority
+            .iter()
+            .any(|&b| matches!(b, b'@' | b'[' | b']'))
+        {
+            return None;
+        }
+        let host = if let Some(port_sep) = authority.iter().position(|&b| b == b':') {
+            let port_bytes = &authority[port_sep + 1..];
+            if port_bytes.contains(&b':') {
+                return Some(false);
+            }
+            if !matches!(port_bytes.first(), Some(b'1'..=b'9'))
+                || !port_bytes.iter().all(u8::is_ascii_digit)
+            {
+                return None;
+            }
+            if port_bytes.len() > 5 {
+                return Some(false);
+            }
+            let mut port: u32 = 0;
+            for &b in port_bytes {
+                port = port * 10 + u32::from(b - b'0');
+            }
+            if !(1..=65535).contains(&port) {
+                return Some(false);
+            }
+            &authority[..port_sep]
+        } else {
+            authority
+        };
+
+        Some(is_valid_hostname_domain(host))
+    }
+
+    const ANIDB_RESOURCE_KEYS: &[&[u8]] = &[
+        b"anidbid",
+        b"anilist_id",
+        b"mal_id",
+        b"title",
+        b"english_title",
+        b"original_title",
+        b"romaji_title",
+        b"type",
+        b"media_type",
+        b"country",
+        b"startdate",
+        b"enddate",
+        b"episodes",
+        b"duration",
+        b"status",
+        b"source",
+        b"rating",
+        b"description",
+        b"picture",
+        b"categories",
+        b"characters",
+        b"creators",
+        b"related",
+        b"similar",
+        b"hashtag",
+        b"updated",
+    ];
+
+    /// Resolves `AnidbResource::getPictureUrl()` target:
+    /// `*out_mode`:
+    /// - `0` = empty `picture` (`null` URL, `0` bytes written)
+    /// - `1` = direct URL (`picture` written to `out_buf`)
+    /// - `2` = local asset key (`<anidbid>-cover\0<anidbid>` written to `out_buf`)
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_anidb_resource_resolve_picture(
+        picture_ptr: *const u8,
+        picture_len: usize,
+        has_picture: u32,
+        anidbid_ptr: *const u8,
+        anidbid_len: usize,
+        out_mode: *mut i32,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        guard(|| {
+            if out_mode.is_null() || !out_mode.is_aligned() || !valid_out_cap(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let (Some(picture), Some(anidbid)) = (
+                unsafe { input(picture_ptr, picture_len) },
+                unsafe { input(anidbid_ptr, anidbid_len) },
+            ) else {
+                return DECLINE;
+            };
+
+            if has_picture == 0 || picture.is_empty() || picture == b"0" {
+                unsafe {
+                    *out_mode = 0;
+                }
+                return 0;
+            }
+
+            let Some(is_url) = php_validate_url_bytes(picture) else {
+                return DECLINE;
+            };
+
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            let mode = if is_url {
+                cursor.extend(picture);
+                1
+            } else {
+                if anidbid.contains(&0) {
+                    return DECLINE;
+                }
+                cursor.extend(anidbid);
+                cursor.extend(b"-cover\0");
+                cursor.extend(anidbid);
+                2
+            };
+
+            let written = finish_cursor(cursor);
+            if written >= 0 {
+                unsafe {
+                    *out_mode = mode;
+                }
+            }
+            written
+        })
+    }
+
+    /// Normalizes a PHP-serialized `AnidbResource` attributes array and resolved `picture_url`
+    /// into the 27-key `AnidbResource::toArray()` structure.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_anidb_resource_normalize_payload(
+        ser_ptr: *const u8,
+        ser_len: usize,
+        has_picture_url: u32,
+        picture_url_ptr: *const u8,
+        picture_url_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        guard(|| {
+            if !valid_out_cap(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let (Some(ser_bytes), Some(picture_url)) = (
+                unsafe { input(ser_ptr, ser_len) },
+                unsafe { input(picture_url_ptr, picture_url_len) },
+            ) else {
+                return DECLINE;
+            };
+            let Some(doc) = PhpSerParser::parse_document(ser_bytes) else {
+                return DECLINE;
+            };
+            if !doc.is_arr() || doc.has_float {
+                return DECLINE;
+            }
+
+            let mut w = PhpSerWriter::new();
+            w.arr_open(ANIDB_RESOURCE_KEYS.len() + 1);
+            for &key in ANIDB_RESOURCE_KEYS {
+                w.key(key);
+                w.raw(opt_raw(lookup_php_key(&doc, key)));
+            }
+            w.key(b"picture_url");
+            if has_picture_url != 0 {
+                w.str(picture_url);
+            } else {
+                w.null();
+            }
+            w.arr_close();
+
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.extend(&w.buf);
+            finish_cursor(cursor)
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // 3. BookResource helpers
+    // -------------------------------------------------------------------------
+
+    const BOOK_RESOURCE_LEADING_KEYS: &[&[u8]] = &[
+        b"id",
+        b"title",
+        b"author",
+        b"asin",
+        b"isbn",
+        b"ean",
+        b"url",
+        b"salesrank",
+        b"publisher",
+        b"publishdate",
+        b"pages",
+        b"overview",
+        b"genre",
+    ];
+
+    /// Resolves the book cover asset basename (`(string) $id`) when `(int) $id > 0 && $cover`.
+    /// `id_kind`: `0` = null/bool/empty, `1` = `int` (`id_int`), `2` = `string` (`id_ptr[..id_len]`).
+    /// Returns `0` when no cover URL should be resolved, `> 0` bytes written, `< -1` on short buffer, or `-1` on decline.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_book_resource_resolve_cover_key(
+        id_kind: i32,
+        id_int: i64,
+        id_ptr: *const u8,
+        id_len: usize,
+        has_cover: u32,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        guard(|| {
+            if !valid_out_cap(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(id_bytes) = (unsafe { input(id_ptr, id_len) }) else {
+                return DECLINE;
+            };
+            match id_kind {
+                0 => 0,
+                1 => {
+                    if has_cover == 0 || id_int <= 0 {
+                        return 0;
+                    }
+                    let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+                    write_i64_dec(&mut cursor, id_int);
+                    finish_cursor(cursor)
+                }
+                2 => {
+                    let Some(parsed) = parse_cast_int_bytes(id_bytes) else {
+                        return DECLINE;
+                    };
+                    if has_cover == 0 || parsed <= 0 {
+                        return 0;
+                    }
+                    let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+                    cursor.extend(id_bytes);
+                    finish_cursor(cursor)
+                }
+                _ => DECLINE,
+            }
+        })
+    }
+
+    /// Normalizes a PHP-serialized `BookResource` attributes array and resolved `cover_url`
+    /// into the 17-key `BookResource::toArray()` structure.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_book_resource_normalize_payload(
+        ser_ptr: *const u8,
+        ser_len: usize,
+        has_cover_url: u32,
+        cover_url_ptr: *const u8,
+        cover_url_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        guard(|| {
+            if !valid_out_cap(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let (Some(ser_bytes), Some(cover_url)) = (
+                unsafe { input(ser_ptr, ser_len) },
+                unsafe { input(cover_url_ptr, cover_url_len) },
+            ) else {
+                return DECLINE;
+            };
+            let Some(doc) = PhpSerParser::parse_document(ser_bytes) else {
+                return DECLINE;
+            };
+            if !doc.is_arr() || doc.has_float {
+                return DECLINE;
+            }
+            let Some(cover_bool) = node_to_bool(lookup_php_key(&doc, b"cover")) else {
+                return DECLINE;
+            };
+
+            let mut w = PhpSerWriter::new();
+            w.arr_open(17);
+            for &key in BOOK_RESOURCE_LEADING_KEYS {
+                w.key(key);
+                w.raw(opt_raw(lookup_php_key(&doc, key)));
+            }
+            w.key(b"cover");
+            w.bool(cover_bool);
+            w.key(b"cover_url");
+            if has_cover_url != 0 {
+                w.str(cover_url);
+            } else {
+                w.null();
+            }
+            w.key(b"created_at");
+            w.raw(opt_raw(lookup_php_key(&doc, b"created_at")));
+            w.key(b"updated_at");
+            w.raw(opt_raw(lookup_php_key(&doc, b"updated_at")));
+            w.arr_close();
+
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.extend(&w.buf);
+            finish_cursor(cursor)
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // 4. MovieResource helpers
+    // -------------------------------------------------------------------------
+
+    const MOVIE_RESOURCE_LEADING_KEYS: &[&[u8]] = &[
+        b"id",
+        b"imdbid",
+        b"tmdbid",
+        b"traktid",
+        b"title",
+        b"year",
+        b"rating",
+        b"rtrating",
+        b"tagline",
+        b"plot",
+        b"genre",
+        b"type",
+        b"director",
+        b"actors",
+        b"language",
+    ];
+
+    /// Formats a `MovieResource` asset key or IMDb URL:
+    /// `kind`:
+    /// - `0` = cover asset key `<imdbid>-cover` (gated by `flag != 0` and truthy `imdb`)
+    /// - `1` = backdrop asset key `<imdbid>-backdrop` (gated by `flag != 0` and truthy `imdb`)
+    /// - `2` = IMDb URL `https://www.imdb.com/title/tt<imdbid>/` (gated by truthy `imdb`)
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_movie_resource_format_asset_or_url(
+        imdb_ptr: *const u8,
+        imdb_len: usize,
+        has_imdb: u32,
+        flag: u32,
+        kind: i32,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        guard(|| {
+            if !valid_out_cap(out_buf, out_cap) || !matches!(kind, 0..=2) {
+                return DECLINE;
+            }
+            let Some(imdb) = (unsafe { input(imdb_ptr, imdb_len) }) else {
+                return DECLINE;
+            };
+            let imdb_truthy = has_imdb != 0 && !imdb.is_empty() && imdb != b"0";
+            if !imdb_truthy || (kind != 2 && flag == 0) {
+                return 0;
+            }
+
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            match kind {
+                0 => {
+                    cursor.extend(imdb);
+                    cursor.extend(b"-cover");
+                }
+                1 => {
+                    cursor.extend(imdb);
+                    cursor.extend(b"-backdrop");
+                }
+                2 => {
+                    cursor.extend(b"https://www.imdb.com/title/tt");
+                    cursor.extend(imdb);
+                    cursor.push(b'/');
+                }
+                _ => return DECLINE,
+            }
+            finish_cursor(cursor)
+        })
+    }
+
+    #[inline]
+    fn extract_imdb_url_bytes(node: Option<&PhpNode<'_>>) -> Option<Option<Vec<u8>>> {
+        let Some(n) = node else {
+            return Some(None);
+        };
+        match &n.val {
+            PhpVal::Null | PhpVal::Bool(false) | PhpVal::Int(0) => Some(None),
+            PhpVal::Bool(true) => Some(Some(b"https://www.imdb.com/title/tt1/".to_vec())),
+            PhpVal::Int(i) => {
+                let mut out = Vec::with_capacity(48);
+                out.extend_from_slice(b"https://www.imdb.com/title/tt");
+                out.extend_from_slice(i.to_string().as_bytes());
+                out.push(b'/');
+                Some(Some(out))
+            }
+            PhpVal::Str(s) => {
+                if s.is_empty() || *s == b"0" {
+                    Some(None)
+                } else {
+                    let mut out = Vec::with_capacity(30 + s.len());
+                    out.extend_from_slice(b"https://www.imdb.com/title/tt");
+                    out.extend_from_slice(s);
+                    out.push(b'/');
+                    Some(Some(out))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Normalizes a PHP-serialized `MovieResource` attributes array and resolved `cover_url` / `backdrop_url`
+    /// into the 23-key `MovieResource::toArray()` structure.
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_movie_resource_normalize_payload(
+        ser_ptr: *const u8,
+        ser_len: usize,
+        has_cover_url: u32,
+        cover_url_ptr: *const u8,
+        cover_url_len: usize,
+        has_backdrop_url: u32,
+        backdrop_url_ptr: *const u8,
+        backdrop_url_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        guard(|| {
+            if !valid_out_cap(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let (Some(ser_bytes), Some(cover_url), Some(backdrop_url)) = (
+                unsafe { input(ser_ptr, ser_len) },
+                unsafe { input(cover_url_ptr, cover_url_len) },
+                unsafe { input(backdrop_url_ptr, backdrop_url_len) },
+            ) else {
+                return DECLINE;
+            };
+            let Some(doc) = PhpSerParser::parse_document(ser_bytes) else {
+                return DECLINE;
+            };
+            if !doc.is_arr() || doc.has_float {
+                return DECLINE;
+            }
+            let Some(cover_bool) = node_to_bool(lookup_php_key(&doc, b"cover")) else {
+                return DECLINE;
+            };
+            let Some(backdrop_bool) = node_to_bool(lookup_php_key(&doc, b"backdrop")) else {
+                return DECLINE;
+            };
+            let Some(imdb_url_opt) = extract_imdb_url_bytes(lookup_php_key(&doc, b"imdbid")) else {
+                return DECLINE;
+            };
+
+            let mut w = PhpSerWriter::new();
+            w.arr_open(23);
+            for &key in MOVIE_RESOURCE_LEADING_KEYS {
+                w.key(key);
+                w.raw(opt_raw(lookup_php_key(&doc, key)));
+            }
+            w.key(b"cover");
+            w.bool(cover_bool);
+            w.key(b"backdrop");
+            w.bool(backdrop_bool);
+            w.key(b"trailer");
+            w.raw(opt_raw(lookup_php_key(&doc, b"trailer")));
+            w.key(b"cover_url");
+            if has_cover_url != 0 {
+                w.str(cover_url);
+            } else {
+                w.null();
+            }
+            w.key(b"backdrop_url");
+            if has_backdrop_url != 0 {
+                w.str(backdrop_url);
+            } else {
+                w.null();
+            }
+            w.key(b"imdb_url");
+            w.opt_str(imdb_url_opt.as_deref());
+            w.key(b"created_at");
+            w.raw(opt_raw(lookup_php_key(&doc, b"created_at")));
+            w.key(b"updated_at");
+            w.raw(opt_raw(lookup_php_key(&doc, b"updated_at")));
+            w.arr_close();
+
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.extend(&w.buf);
+            finish_cursor(cursor)
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // 5. MetadataConfigurationData helpers
+    // -------------------------------------------------------------------------
+
+    const METADATA_CONFIG_DEFAULTS: [i64; 14] = [
+        0,    // animeLookup: LookupMode::Disabled
+        1,    // bookLookup: LookupMode::All
+        1,    // gameLookup: LookupMode::All
+        1,    // movieLookup: LookupMode::All
+        1,    // musicLookup: LookupMode::All
+        1,    // tvLookup: LookupMode::All
+        0,    // imdbAlternateUrl: false
+        100,  // maxAnimeProcessed
+        300,  // maxBooksProcessed
+        150,  // maxGamesProcessed
+        100,  // maxMoviesProcessed
+        150,  // maxMusicProcessed
+        75,   // maxTvProcessed
+        1000, // amazonSleepMilliseconds
+    ];
+
+    /// Populates the 14 integer/boolean defaults for `MetadataConfigurationData::defaults()`
+    /// into `out_ints[..14]` and writes the default `movieLanguage` (`"en"`) into `out_lang`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_metadata_config_defaults(
+        out_ints: *mut i64,
+        ints_cap: usize,
+        out_lang: *mut u8,
+        lang_cap: usize,
+    ) -> isize {
+        guard(|| {
+            let max_elems = (isize::MAX as usize) / size_of::<i64>();
+            if out_ints.is_null()
+                || !out_ints.is_aligned()
+                || ints_cap < METADATA_CONFIG_DEFAULTS.len()
+                || ints_cap > max_elems
+                || !valid_out_cap(out_lang, lang_cap)
+            {
+                return DECLINE;
+            }
+            let mut cursor = unsafe { OutCursor::new(out_lang, lang_cap) };
+            cursor.extend(b"en");
+            let written = finish_cursor(cursor);
+            if written >= 0 {
+                let slice_out =
+                    unsafe { slice::from_raw_parts_mut(out_ints, METADATA_CONFIG_DEFAULTS.len()) };
+                slice_out.copy_from_slice(&METADATA_CONFIG_DEFAULTS);
+            }
+            written
+        })
+    }
+
+    #[inline]
+    fn valid_lookup_mode(v: i64) -> bool {
+        matches!(v, 0..=2)
+    }
+
+    /// Serializes `MetadataConfigurationData::toArray()` into a 15-element PHP associative array
+    /// with `LookupMode` enums normalized to their backing integer values (`0..=2`).
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_metadata_config_to_array(
+        anime_lookup: i64,
+        book_lookup: i64,
+        game_lookup: i64,
+        movie_lookup: i64,
+        music_lookup: i64,
+        tv_lookup: i64,
+        lang_ptr: *const u8,
+        lang_len: usize,
+        imdb_alt_url: u32,
+        max_anime: i64,
+        max_books: i64,
+        max_games: i64,
+        max_movies: i64,
+        max_music: i64,
+        max_tv: i64,
+        amazon_sleep_ms: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        guard(|| {
+            if !valid_out_cap(out_buf, out_cap)
+                || !valid_lookup_mode(anime_lookup)
+                || !valid_lookup_mode(book_lookup)
+                || !valid_lookup_mode(game_lookup)
+                || !valid_lookup_mode(movie_lookup)
+                || !valid_lookup_mode(music_lookup)
+                || !valid_lookup_mode(tv_lookup)
+            {
+                return DECLINE;
+            }
+            let Some(lang) = (unsafe { input(lang_ptr, lang_len) }) else {
+                return DECLINE;
+            };
+
+            let mut w = PhpSerWriter::new();
+            w.arr_open(15);
+            w.key(b"animeLookup");
+            w.int(anime_lookup);
+            w.key(b"bookLookup");
+            w.int(book_lookup);
+            w.key(b"gameLookup");
+            w.int(game_lookup);
+            w.key(b"movieLookup");
+            w.int(movie_lookup);
+            w.key(b"musicLookup");
+            w.int(music_lookup);
+            w.key(b"tvLookup");
+            w.int(tv_lookup);
+            w.key(b"movieLanguage");
+            w.str(lang);
+            w.key(b"imdbAlternateUrl");
+            w.bool(imdb_alt_url != 0);
+            w.key(b"maxAnimeProcessed");
+            w.int(max_anime);
+            w.key(b"maxBooksProcessed");
+            w.int(max_books);
+            w.key(b"maxGamesProcessed");
+            w.int(max_games);
+            w.key(b"maxMoviesProcessed");
+            w.int(max_movies);
+            w.key(b"maxMusicProcessed");
+            w.int(max_music);
+            w.key(b"maxTvProcessed");
+            w.int(max_tv);
+            w.key(b"amazonSleepMilliseconds");
+            w.int(amazon_sleep_ms);
+            w.arr_close();
+
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.extend(&w.buf);
+            finish_cursor(cursor)
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn genre_service_cache_key_and_normalize_map() {
+            let mut buf = [0u8; 256];
+            let n = unsafe {
+                nntmux_genre_service_cache_key(
+                    b"3000".as_ptr(),
+                    4,
+                    1,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(n, 39);
+            assert_eq!(
+                &buf[..39],
+                b"genres_aaaf6afb08949fed86c7ad0bee8e00df"
+            );
+
+            // Short buffer returns -39
+            assert_eq!(
+                unsafe {
+                    nntmux_genre_service_cache_key(b"3000".as_ptr(), 4, 1, buf.as_mut_ptr(), 10)
+                },
+                -39
+            );
+
+            let rows_ser = br#"a:3:{i:0;a:2:{s:2:"id";i:1;s:5:"title";s:4:"Rock";}i:1;a:2:{s:2:"id";i:2;s:5:"title";s:9:"SynthWave";}i:2;a:2:{s:2:"id";s:1:"1";s:5:"title";s:9:"Hard Rock";}}"#;
+            let m = unsafe {
+                nntmux_genre_service_normalize_map(
+                    rows_ser.as_ptr(),
+                    rows_ser.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(m > 0);
+            assert_eq!(
+                &buf[..m as usize],
+                br#"a:2:{i:1;s:9:"hard rock";i:2;s:9:"synthwave";}"#
+            );
+        }
+
+        #[test]
+        fn anidb_book_movie_resources_and_metadata_config() {
+            let mut buf = [0u8; 512];
+            let mut mode = -1i32;
+
+            // Empty picture -> mode 0, 0 bytes
+            let n0 = unsafe {
+                nntmux_anidb_resource_resolve_picture(
+                    b"".as_ptr(),
+                    0,
+                    1,
+                    b"42".as_ptr(),
+                    2,
+                    &mut mode,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!((n0, mode), (0, 0));
+
+            // Direct URL -> mode 1
+            let url = b"https://cdn.anidb.net/images/main/12345.jpg";
+            let n1 = unsafe {
+                nntmux_anidb_resource_resolve_picture(
+                    url.as_ptr(),
+                    url.len(),
+                    1,
+                    b"42".as_ptr(),
+                    2,
+                    &mut mode,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(mode, 1);
+            assert_eq!(&buf[..n1 as usize], url);
+
+            // Local filename -> mode 2 (<anidbid>-cover\0<anidbid>)
+            let pic = b"12345.jpg";
+            let n2 = unsafe {
+                nntmux_anidb_resource_resolve_picture(
+                    pic.as_ptr(),
+                    pic.len(),
+                    1,
+                    b"42".as_ptr(),
+                    2,
+                    &mut mode,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(mode, 2);
+            assert_eq!(&buf[..n2 as usize], b"42-cover\042");
+
+            // BookResource cover key
+            let bk = unsafe {
+                nntmux_book_resource_resolve_cover_key(
+                    1,
+                    7,
+                    std::ptr::null(),
+                    0,
+                    1,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(&buf[..bk as usize], b"7");
+            assert_eq!(
+                unsafe {
+                    nntmux_book_resource_resolve_cover_key(
+                        1,
+                        7,
+                        std::ptr::null(),
+                        0,
+                        1,
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                },
+                -2
+            );
+            // 19-digit i64::MAX succeeds, i64::MAX + 1 declines (-1)
+            let max_i64 = b"9223372036854775807";
+            let over_i64 = b"9223372036854775808";
+            assert_eq!(
+                unsafe {
+                    nntmux_book_resource_resolve_cover_key(
+                        2,
+                        0,
+                        max_i64.as_ptr(),
+                        max_i64.len(),
+                        1,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                19
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_book_resource_resolve_cover_key(
+                        2,
+                        0,
+                        over_i64.as_ptr(),
+                        over_i64.len(),
+                        1,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                -1
+            );
+
+            // MovieResource asset keys and IMDb URL
+            let mv_cov = unsafe {
+                nntmux_movie_resource_format_asset_or_url(
+                    b"0133093".as_ptr(),
+                    7,
+                    1,
+                    1,
+                    0,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(&buf[..mv_cov as usize], b"0133093-cover");
+            let mv_url = unsafe {
+                nntmux_movie_resource_format_asset_or_url(
+                    b"0133093".as_ptr(),
+                    7,
+                    1,
+                    0,
+                    2,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(
+                &buf[..mv_url as usize],
+                b"https://www.imdb.com/title/tt0133093/"
+            );
+
+            // MetadataConfigurationData defaults and toArray
+            let mut ints = [0i64; 14];
+            let lang_n = unsafe {
+                nntmux_metadata_config_defaults(
+                    ints.as_mut_ptr(),
+                    ints.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(lang_n, 2);
+            assert_eq!(&buf[..2], b"en");
+            assert_eq!(
+                ints,
+                [0, 1, 1, 1, 1, 1, 0, 100, 300, 150, 100, 150, 75, 1000]
+            );
+
+            let cfg_ser = unsafe {
+                nntmux_metadata_config_to_array(
+                    0,
+                    1,
+                    2,
+                    1,
+                    1,
+                    1,
+                    b"en".as_ptr(),
+                    2,
+                    0,
+                    100,
+                    300,
+                    150,
+                    100,
+                    150,
+                    75,
+                    1000,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(cfg_ser > 0);
+            assert_eq!(
+                unsafe {
+                    nntmux_metadata_config_to_array(
+                        99,
+                        1,
+                        1,
+                        1,
+                        1,
+                        1,
+                        b"en".as_ptr(),
+                        2,
+                        0,
+                        100,
+                        300,
+                        150,
+                        100,
+                        150,
+                        75,
+                        1000,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                -1
+            );
+        }
+    }
+}
+
+
 
 
