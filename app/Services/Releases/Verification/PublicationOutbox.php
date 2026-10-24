@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Verification;
 
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Facades\File;
 use RuntimeException;
 
@@ -23,6 +25,20 @@ use RuntimeException;
  */
 final class PublicationOutbox
 {
+    // No candidate is admitted without all four paired caller metrics >= 1.5x.
+    private static bool $useRustFfi = false;
+
+    private const string FFI_CDEF = <<<'C'
+        int32_t nntmux_wave15_outbox_folder(const char *, size_t, uint32_t, int64_t);
+        int32_t nntmux_wave15_outbox_state(double, double, int64_t, int64_t, double, double);
+        ssize_t nntmux_wave15_outbox_normalize(const char *, size_t, char *, size_t);
+        C;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
     /**
      * The least the configured alive window can be: it must outlast the seconds between a forwarder's
      * scheduled exit (10 s before a tick) and its replacement's first touch, with a margin.
@@ -173,13 +189,31 @@ final class PublicationOutbox
      */
     private function slotDirectories(): array
     {
+        return self::$useRustFfi ? $this->slotDirectoriesNative() : $this->slotDirectoriesPhp();
+    }
+
+    /** @return list<string> */
+    public function slotDirectoriesPhp(): array
+    {
+        return $this->slotDirectoriesUsing(false);
+    }
+
+    /** @return list<string> */
+    public function slotDirectoriesNative(): array
+    {
+        return $this->slotDirectoriesUsing(true);
+    }
+
+    /** @return list<string> */
+    private function slotDirectoriesUsing(bool $native): array
+    {
         $directories = [];
         if ($this->linked($this->root.'/inflight')) {
             return [];
         }
         foreach (@scandir($this->root.'/inflight') ?: [] as $slot) {
             $path = $this->root.'/inflight/'.$slot;
-            if ($slot !== '.' && $slot !== '..' && ! is_link($path) && is_dir($path)) {
+            if (($native ? self::folderNative($slot, 0, 0) : $slot !== '.' && $slot !== '..') && ! is_link($path) && is_dir($path)) {
                 $directories[] = $path;
             }
         }
@@ -276,13 +310,19 @@ final class PublicationOutbox
      */
     public function entries(string $directory): array
     {
+        return $this->entriesUsing($directory, self::$useRustFfi);
+    }
+
+    /** @return list<PublicationOutboxEntry> */
+    private function entriesUsing(string $directory, bool $native): array
+    {
         $entries = [];
         clearstatcache();
         foreach ($this->names($directory) as $name) {
             if (isset($this->stuck[$directory.'/'.$name])) {
                 continue;
             }
-            $entry = $this->read($directory.'/'.$name);
+            $entry = $this->read($directory.'/'.$name, $native);
             if ($entry !== null) {
                 $entries[] = $entry;
             }
@@ -310,12 +350,32 @@ final class PublicationOutbox
      */
     public function hasDue(int $slot, float $now): bool
     {
-        if ($this->inflight($slot) !== []) {
+        return self::$useRustFfi ? $this->hasDueNative($slot, $now) : $this->hasDuePhp($slot, $now);
+    }
+
+    public function hasDuePhp(int $slot, float $now): bool
+    {
+        if ($this->entriesUsing($this->inflightDirectory($slot), false) !== []) {
             return true;
         }
         $maxAge = self::maxAgeSeconds();
-        foreach ($this->pending() as $entry) {
+        foreach ($this->entriesUsing($this->root.'/pending', false) as $entry) {
             if ($entry->notBefore <= $now || $entry->olderThan($maxAge, $now)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    public function hasDueNative(int $slot, float $now): bool
+    {
+        if ($this->entriesUsing($this->inflightDirectory($slot), true) !== []) {
+            return true;
+        }
+        $maxAge = self::maxAgeSeconds();
+        foreach ($this->entriesUsing($this->root.'/pending', true) as $entry) {
+            if ((self::entryStateNative($entry, $now, $maxAge) & 3) !== 0) {
                 return true;
             }
         }
@@ -339,11 +399,29 @@ final class PublicationOutbox
      */
     public function survey(float $now, int $slot, int $cap, float $margin = 0.0): array
     {
+        return self::$useRustFfi ? $this->surveyNative($now, $slot, $cap, $margin) : $this->surveyPhp($now, $slot, $cap, $margin);
+    }
+
+    /** @return array{fresh: int, urgent: bool, retried: bool, oldest: ?float, wake: ?float} */
+    public function surveyPhp(float $now, int $slot, int $cap, float $margin = 0.0): array
+    {
+        return $this->surveyUsing($now, $slot, $cap, $margin, false);
+    }
+
+    /** @return array{fresh: int, urgent: bool, retried: bool, oldest: ?float, wake: ?float} */
+    public function surveyNative(float $now, int $slot, int $cap, float $margin = 0.0): array
+    {
+        return $this->surveyUsing($now, $slot, $cap, $margin, true);
+    }
+
+    /** @return array{fresh: int, urgent: bool, retried: bool, oldest: ?float, wake: ?float} */
+    private function surveyUsing(float $now, int $slot, int $cap, float $margin, bool $native): array
+    {
         $result = ['fresh' => 0, 'urgent' => false, 'retried' => false, 'oldest' => null, 'wake' => null];
         clearstatcache();
         $owned = $this->inflightDirectory($slot);
         foreach ($this->names($owned) as $name) {
-            if (! isset($this->stuck[$owned.'/'.$name]) && $this->read($owned.'/'.$name) !== null) {
+            if (! isset($this->stuck[$owned.'/'.$name]) && $this->read($owned.'/'.$name, $native) !== null) {
                 $result['urgent'] = true;
 
                 return $result;
@@ -355,11 +433,12 @@ final class PublicationOutbox
             if (isset($this->stuck[$directory.'/'.$name])) {
                 continue;
             }
-            $entry = $this->read($directory.'/'.$name);
+            $entry = $this->read($directory.'/'.$name, $native);
             if ($entry === null) {
                 continue;
             }
-            if ($entry->olderThan($maxAge, $now)) {
+            $state = $native ? self::entryStateNative($entry, $now, $maxAge) : self::entryStatePhp($entry, $now, $maxAge);
+            if (($state & 2) !== 0) {
                 $result['urgent'] = true;
 
                 return $result;
@@ -368,7 +447,7 @@ final class PublicationOutbox
             if ($entry->notBefore > $now) {
                 $needs = min($needs, $entry->notBefore);
             } else {
-                if ($entry->attempts > 0 || $entry->deferrals > 0) {
+                if (($state & 4) !== 0) {
                     $result['retried'] = true;
 
                     return $result;
@@ -463,12 +542,30 @@ final class PublicationOutbox
      */
     public function foreignSlots(int $except): array
     {
+        return self::$useRustFfi ? $this->foreignSlotsNative($except) : $this->foreignSlotsPhp($except);
+    }
+
+    /** @return list<int> */
+    public function foreignSlotsPhp(int $except): array
+    {
+        return $this->foreignSlotsUsing($except, false);
+    }
+
+    /** @return list<int> */
+    public function foreignSlotsNative(int $except): array
+    {
+        return $this->foreignSlotsUsing($except, true);
+    }
+
+    /** @return list<int> */
+    private function foreignSlotsUsing(int $except, bool $native): array
+    {
         $slots = [];
         if ($this->linked($this->root.'/inflight')) {
             return [];
         }
         foreach (@scandir($this->root.'/inflight') ?: [] as $folder) {
-            if (preg_match('/\A[1-9]\d*\z/D', $folder) === 1 && (int) $folder !== $except && ! is_link($this->root.'/inflight/'.$folder)
+            if (($native ? self::folderNative($folder, 1, $except) : preg_match('/\A[1-9]\d*\z/D', $folder) === 1 && (int) $folder !== $except) && ! is_link($this->root.'/inflight/'.$folder)
                 && $this->names($this->root.'/inflight/'.$folder) !== []) {
                 $slots[] = (int) $folder;
             }
@@ -620,7 +717,7 @@ final class PublicationOutbox
         return $names;
     }
 
-    private function read(string $path): ?PublicationOutboxEntry
+    private function read(string $path, ?bool $native = null): ?PublicationOutboxEntry
     {
         if (is_link($path)) {
             $this->invalid[$path] = true;
@@ -632,12 +729,83 @@ final class PublicationOutbox
             // Claimed by another forwarder between listing and reading.
             return null;
         }
-        $entry = PublicationOutboxEntry::decode(basename($path), $path, $json, (int) @filemtime($path));
+        $entry = ($native ?? self::$useRustFfi)
+            ? self::decodeEntryNative(basename($path), $path, $json, (int) @filemtime($path))
+            : self::decodeEntryPhp(basename($path), $path, $json, (int) @filemtime($path));
         if ($entry === null) {
             $this->invalid[$path] = true;
         }
 
         return $entry;
+    }
+
+    public static function decodeEntryPhp(string $name, string $path, string $json, int $modifiedAt): ?PublicationOutboxEntry
+    {
+        return PublicationOutboxEntry::decodePhp($name, $path, $json, $modifiedAt);
+    }
+
+    public static function decodeEntryNative(string $name, string $path, string $json, int $modifiedAt): ?PublicationOutboxEntry
+    {
+        $ffi = RustPipelineLibrary::resolveDomain('nfo', self::FFI_CDEF);
+        $data = json_decode($json, true);
+        if ($ffi === null || ! is_array($data)) {
+            return self::decodeEntryPhp($name, $path, $json, $modifiedAt);
+        }
+        // Preserve PHP JSON parsing, duplicate keys and number classification.
+        $input = serialize($data);
+        $capacity = 0;
+        $buffer = RustPipelineLibrary::obtainScratch($ffi, strlen($input) + 512, $capacity);
+        if ($buffer !== null) {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_wave15_outbox_normalize($input, strlen($input), $buffer, $capacity);
+            if ($written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer !== null) {
+                    // @phpstan-ignore method.notFound
+                    $written = $ffi->nntmux_wave15_outbox_normalize($input, strlen($input), $buffer, $capacity);
+                }
+            }
+            if ($buffer !== null && $written > 0 && $written <= $capacity) {
+                $row = unserialize(FFI::string($buffer, $written), ['allowed_classes' => false]);
+                if (is_array($row) && count($row) === 8) {
+                    return new PublicationOutboxEntry($name, $path, $row[0], $row[1], $row[2], $row[3], $row[4], $row[5], $modifiedAt, $row[6], $row[7]);
+                }
+            }
+        }
+
+        return self::decodeEntryPhp($name, $path, $json, $modifiedAt);
+    }
+
+    private static function folderNative(string $folder, int $mode, int $except): bool
+    {
+        $ffi = RustPipelineLibrary::resolveDomain('nfo', self::FFI_CDEF);
+        if ($ffi !== null) {
+            // @phpstan-ignore method.notFound
+            $result = $ffi->nntmux_wave15_outbox_folder($folder, strlen($folder), $mode, $except);
+            if ($result >= 0) {
+                return $result === 1;
+            }
+        }
+
+        return $mode === 0 ? $folder !== '.' && $folder !== '..'
+            : preg_match('/\A[1-9]\d*\z/D', $folder) === 1 && (int) $folder !== $except;
+    }
+
+    private static function entryStatePhp(PublicationOutboxEntry $entry, float $now, float $maxAge): int
+    {
+        return (int) ($entry->notBefore <= $now) | ((int) $entry->olderThan($maxAge, $now) << 1)
+            | ((int) ($entry->attempts > 0 || $entry->deferrals > 0) << 2);
+    }
+
+    private static function entryStateNative(PublicationOutboxEntry $entry, float $now, float $maxAge): int
+    {
+        $ffi = RustPipelineLibrary::resolveDomain('nfo', self::FFI_CDEF);
+        if ($ffi === null) {
+            return self::entryStatePhp($entry, $now, $maxAge);
+        }
+
+        // @phpstan-ignore method.notFound
+        return $ffi->nntmux_wave15_outbox_state($entry->enqueuedAt, $entry->notBefore, $entry->attempts, $entry->deferrals, $now, $maxAge);
     }
 
     private function write(PublicationOutboxEntry $entry, string $directory): void
