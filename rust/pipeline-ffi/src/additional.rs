@@ -9732,3 +9732,917 @@ mod wave13_par2_archive_fallback_tests {
         assert_eq!(nntmux_media_continuation_bytes(i64::MAX, 1, 0, 0, 0, 0), -1);
     }
 }
+
+#[cfg(test)]
+mod wave14_context_diagnostics_tests {
+    use super::*;
+
+    type JsonHelper = unsafe extern "C" fn(*const u8, usize, *mut u8, usize) -> isize;
+
+    fn call(helper: JsonHelper, input: &str) -> String {
+        let required = unsafe { helper(input.as_ptr(), input.len(), std::ptr::null_mut(), 0) };
+        assert!(required <= -2, "unexpected sizing result {required}");
+        let mut out = vec![0u8; (-required) as usize];
+        let size = unsafe { helper(input.as_ptr(), input.len(), out.as_mut_ptr(), out.len()) };
+        assert_eq!(size, out.len() as isize);
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn naming_witness_utf8_and_exact_limits() {
+        let name = "é";
+        assert_eq!(
+            unsafe {
+                nntmux_additional_validate_naming_witness(name.as_ptr(), name.len(), 255, 32766)
+            },
+            1
+        );
+        assert_eq!(
+            unsafe { nntmux_additional_validate_naming_witness(name.as_ptr(), name.len(), 256, 0) },
+            0
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_additional_validate_naming_witness(name.as_ptr(), name.len(), 0, usize::MAX)
+            },
+            0
+        );
+        assert_eq!(
+            unsafe { nntmux_additional_validate_naming_witness([0xff].as_ptr(), 1, 0, 0) },
+            0
+        );
+        assert_eq!(
+            unsafe { nntmux_additional_validate_naming_witness(std::ptr::null(), 1, 0, 0) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_additional_validate_naming_witness(std::ptr::null(), 0, 0, 0) },
+            0
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_additional_validate_naming_witness(1usize as *const u8, usize::MAX, 0, 0)
+            },
+            -1
+        );
+    }
+
+    #[test]
+    fn json_abi_rejects_bad_pointers_and_short_output_is_untouched() {
+        let input = br#"{"ids":[1],"driver":"mysql"}"#;
+        let helper = nntmux_additional_id_order_expression_json;
+        assert_eq!(
+            unsafe { helper(std::ptr::null(), 1, std::ptr::null_mut(), 0) },
+            -1
+        );
+        assert_eq!(
+            unsafe { helper(1usize as *const u8, usize::MAX, std::ptr::null_mut(), 0) },
+            -1
+        );
+        assert_eq!(
+            unsafe { helper(input.as_ptr(), input.len(), std::ptr::null_mut(), 1) },
+            -1
+        );
+        let mut out = [0xAAu8; 2];
+        let required = unsafe { helper(input.as_ptr(), input.len(), out.as_mut_ptr(), 2) };
+        assert!(required <= -2);
+        assert_eq!(out, [0xAA; 2]);
+        assert_eq!(
+            unsafe { helper(input.as_ptr(), input.len(), out.as_mut_ptr(), usize::MAX) },
+            -1
+        );
+    }
+
+    #[test]
+    fn id_order_is_json_and_preserves_signed_integer_extremes() {
+        assert_eq!(
+            call(
+                nntmux_additional_id_order_expression_json,
+                r#"{"ids":[1,-2,9223372036854775807,-9223372036854775808],"driver":"mysql"}"#
+            ),
+            r#""FIELD(id, 1,-2,9223372036854775807,-9223372036854775808)""#
+        );
+        assert_eq!(
+            call(
+                nntmux_additional_id_order_expression_json,
+                r#"{"ids":[2,2,0],"driver":"sqlite"}"#
+            ),
+            r#""CASE id WHEN 2 THEN 0 WHEN 2 THEN 1 WHEN 0 THEN 2 ELSE 3 END""#
+        );
+        assert_eq!(
+            call(
+                nntmux_additional_id_order_expression_json,
+                r#"{"ids":[],"driver":"sqlite"}"#
+            ),
+            r#""CASE id  ELSE 0 END""#
+        );
+    }
+
+    #[test]
+    fn strict_json_declines_malformed_or_unbounded_values() {
+        for input in [
+            "",
+            "[",
+            r#"{"ids":[01],"driver":"mysql"}"#,
+            r#"{"ids":[1.0],"driver":"mysql"}"#,
+            r#"{"ids":[9223372036854775808],"driver":"mysql"}"#,
+            r#"{"ids":[],"driver":"\uD800"}"#,
+            r#"{"ids":[],"driver":"\uDC00"}"#,
+            r#"{"ids":[],"driver":"mysql","driver":"sqlite"}"#,
+            r#"{"ids":[],"driver":"mysql"}x"#,
+        ] {
+            assert_eq!(
+                unsafe {
+                    nntmux_additional_id_order_expression_json(
+                        input.as_ptr(),
+                        input.len(),
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                },
+                -1,
+                "{input}"
+            );
+        }
+        let deep = format!("{}0{}", "[".repeat(70), "]".repeat(70));
+        assert!(AdditionalJsonParser::parse(deep.as_bytes()).is_none());
+        assert!(AdditionalJsonParser::parse(b"[1e999]").is_none());
+        assert!(AdditionalJsonParser::parse(b"[\"\xff\"]").is_none());
+    }
+
+    #[test]
+    fn compressed_media_uses_php_truthiness() {
+        assert_eq!(
+            call(nntmux_additional_compressed_files_are_media_json, "[]"),
+            "false"
+        );
+        for value in ["false", "null", "0", "-0.0", "\"\"", "\"0\"", "[]"] {
+            let input = format!("[{{\"is_media\":{value}}}]");
+            assert_eq!(
+                call(nntmux_additional_compressed_files_are_media_json, &input),
+                "false"
+            );
+        }
+        for input in [
+            "[null]", "[false]", "[0]", "[\"x\"]", "[[]]", "[[1]]", "[{}]",
+        ] {
+            assert_eq!(
+                call(nntmux_additional_compressed_files_are_media_json, input),
+                "false"
+            );
+        }
+        assert_eq!(
+            call(
+                nntmux_additional_compressed_files_are_media_json,
+                r#"[{"is_media":{}}]"#
+            ),
+            "true"
+        );
+        assert_eq!(
+            call(
+                nntmux_additional_compressed_files_are_media_json,
+                r#"[{"is_media":true},{"is_media":"false"},{"is_media":[0]}]"#
+            ),
+            "true"
+        );
+    }
+
+    #[test]
+    fn diagnostics_requires_exact_order_and_checked_products() {
+        let input = r#"{"columns":["passwordstatus","haspreview","nzbstatus","leftguid","postdate","id","additional_pp_claimed_at"],"childTimeout":1800,"releaseTimeout":300,"batchSize":10,"threads":4}"#;
+        assert_eq!(
+            call(nntmux_additional_claim_index_matches_json, input),
+            r#"{"matches":true,"maximumClaimLifetime":1800,"maxInFlight":40}"#
+        );
+        assert_eq!(
+            call(
+                nntmux_additional_claim_index_matches_json,
+                r#"{"columns":[],"childTimeout":-1,"releaseTimeout":0,"batchSize":0,"threads":-1}"#
+            ),
+            r#"{"matches":false,"maximumClaimLifetime":1,"maxInFlight":1}"#
+        );
+        let overflow = r#"{"columns":[],"childTimeout":1,"releaseTimeout":9223372036854775807,"batchSize":2,"threads":1}"#;
+        assert_eq!(
+            unsafe {
+                nntmux_additional_claim_index_matches_json(
+                    overflow.as_ptr(),
+                    overflow.len(),
+                    std::ptr::null_mut(),
+                    0,
+                )
+            },
+            -1
+        );
+    }
+
+    #[test]
+    fn metrics_keep_map_order_unicode_and_ieee_bits() {
+        let input = r#"[{"outcome":"ok","successful":true,"artifactsCreated":true,"unsupportedReasons":["\uD83D\uDE00","x","x"],"stageDurations":{"z":0.1,"a":-0.2},"downloadMetrics":{"logicalRequests":1,"networkRequests":2,"cacheHits":3,"bytesDownloaded":4,"bytesReused":5,"mediaBytesDownloaded":6},"persistenceMetrics":{"databaseStatements":2,"databaseMilliseconds":0.1,"searchSyncRequests":3,"searchSyncExecutions":4}},{"outcome":"bad","successful":true,"artifactsCreated":false,"unsupportedReasons":["x"],"stageDurations":{"z":0.2,"新":1},"downloadMetrics":null,"persistenceMetrics":null}]"#;
+        let expected = format!(
+            "{{\"outcomeCounts\":{{\"ok\":1,\"bad\":1}},\"unsupportedReasonCounts\":{{\"😀\":1,\"x\":3}},\"stageDurationTotals\":{{\"z\":\"{}\",\"a\":\"{}\",\"新\":\"{}\"}},\"downloadMetrics\":{{\"logicalRequests\":1,\"networkRequests\":2,\"cacheHits\":3,\"bytesDownloaded\":4,\"bytesReused\":5,\"mediaBytesDownloaded\":6}},\"persistenceMetrics\":{{\"databaseStatements\":2,\"databaseMilliseconds\":\"{}\",\"searchSyncRequests\":3,\"searchSyncExecutions\":4}},\"artifactYieldPercent\":\"{}\"}}",
+            (0.1f64 + 0.2).to_bits() as i64,
+            (-0.2f64).to_bits() as i64,
+            1.0f64.to_bits() as i64,
+            0.1f64.to_bits() as i64,
+            50.0f64.to_bits() as i64
+        );
+        assert_eq!(
+            call(nntmux_additional_batch_result_metrics_json, input),
+            expected
+        );
+        let empty = call(nntmux_additional_batch_result_metrics_json, "[]");
+        assert!(empty.contains(r#""stageDurationTotals":{}"#));
+        assert!(empty.ends_with(r#""artifactYieldPercent":"0"}"#));
+    }
+}
+
+// Wave 14: bounded JSON wire helpers. Objects retain source insertion order. The
+// parser deliberately declines duplicate keys, excessive nesting and non-finite
+// numbers so the caller can fall back without accepting ambiguous input.
+const ADDITIONAL_JSON_MAX_BYTES: usize = 16 * 1024 * 1024;
+const ADDITIONAL_JSON_MAX_VALUES: usize = 1_000_000;
+const ADDITIONAL_JSON_MAX_DEPTH: usize = 64;
+
+#[derive(Debug)]
+enum AdditionalJson {
+    Null,
+    Bool(bool),
+    Number(String),
+    String(String),
+    Array(Vec<AdditionalJson>),
+    Object(Vec<(String, AdditionalJson)>),
+}
+
+impl AdditionalJson {
+    fn field(&self, key: &str) -> Option<&Self> {
+        self.object()?
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value)
+    }
+
+    fn object(&self) -> Option<&[(String, Self)]> {
+        match self {
+            Self::Object(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    fn array(&self) -> Option<&[Self]> {
+        match self {
+            Self::Array(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    fn string(&self) -> Option<&str> {
+        match self {
+            Self::String(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    fn integer(&self) -> Option<i64> {
+        match self {
+            Self::Number(value) => value.parse().ok(),
+            _ => None,
+        }
+    }
+
+    fn number(&self) -> Option<f64> {
+        match self {
+            Self::Number(value) => value.parse::<f64>().ok().filter(|value| value.is_finite()),
+            _ => None,
+        }
+    }
+
+    fn boolean(&self) -> Option<bool> {
+        match self {
+            Self::Bool(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    // An is_media object represents a PHP object, which is always truthy.
+    fn php_truthy(&self) -> bool {
+        match self {
+            Self::Null => false,
+            Self::Bool(value) => *value,
+            Self::Number(_) => self.number().is_some_and(|value| value != 0.0),
+            Self::String(value) => !value.is_empty() && value != "0",
+            Self::Array(value) => !value.is_empty(),
+            Self::Object(_) => true,
+        }
+    }
+}
+
+struct AdditionalJsonParser<'a> {
+    input: &'a [u8],
+    position: usize,
+    remaining: usize,
+}
+
+impl<'a> AdditionalJsonParser<'a> {
+    fn parse(input: &'a [u8]) -> Option<AdditionalJson> {
+        if input.len() > ADDITIONAL_JSON_MAX_BYTES || std::str::from_utf8(input).is_err() {
+            return None;
+        }
+        let mut parser = Self {
+            input,
+            position: 0,
+            remaining: ADDITIONAL_JSON_MAX_VALUES,
+        };
+        let result = parser.value(0)?;
+        parser.space();
+        (parser.position == input.len()).then_some(result)
+    }
+
+    fn space(&mut self) {
+        while self
+            .input
+            .get(self.position)
+            .is_some_and(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+        {
+            self.position += 1;
+        }
+    }
+
+    fn take(&mut self, expected: u8) -> bool {
+        if self.input.get(self.position) == Some(&expected) {
+            self.position += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn literal(&mut self, text: &[u8]) -> Option<()> {
+        if !self.input.get(self.position..)?.starts_with(text) {
+            return None;
+        }
+        self.position += text.len();
+        Some(())
+    }
+
+    fn value(&mut self, depth: usize) -> Option<AdditionalJson> {
+        if depth > ADDITIONAL_JSON_MAX_DEPTH || self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+        self.space();
+        match *self.input.get(self.position)? {
+            b'n' => {
+                self.literal(b"null")?;
+                Some(AdditionalJson::Null)
+            }
+            b't' => {
+                self.literal(b"true")?;
+                Some(AdditionalJson::Bool(true))
+            }
+            b'f' => {
+                self.literal(b"false")?;
+                Some(AdditionalJson::Bool(false))
+            }
+            b'"' => self.text().map(AdditionalJson::String),
+            b'[' => {
+                self.position += 1;
+                self.space();
+                let mut values = Vec::new();
+                if self.take(b']') {
+                    return Some(AdditionalJson::Array(values));
+                }
+                loop {
+                    values.push(self.value(depth + 1)?);
+                    self.space();
+                    if self.take(b']') {
+                        break;
+                    }
+                    if !self.take(b',') {
+                        return None;
+                    }
+                }
+                Some(AdditionalJson::Array(values))
+            }
+            b'{' => {
+                self.position += 1;
+                self.space();
+                let mut values = Vec::new();
+                let mut keys = std::collections::HashSet::new();
+                if self.take(b'}') {
+                    return Some(AdditionalJson::Object(values));
+                }
+                loop {
+                    self.space();
+                    let key = self.text()?;
+                    if !keys.insert(key.clone()) {
+                        return None;
+                    }
+                    self.space();
+                    if !self.take(b':') {
+                        return None;
+                    }
+                    values.push((key, self.value(depth + 1)?));
+                    self.space();
+                    if self.take(b'}') {
+                        break;
+                    }
+                    if !self.take(b',') {
+                        return None;
+                    }
+                }
+                Some(AdditionalJson::Object(values))
+            }
+            b'-' | b'0'..=b'9' => self.numeric().map(AdditionalJson::Number),
+            _ => None,
+        }
+    }
+
+    fn numeric(&mut self) -> Option<String> {
+        let start = self.position;
+        self.take(b'-');
+        if !self.take(b'0') {
+            if !self
+                .input
+                .get(self.position)
+                .is_some_and(|b| matches!(b, b'1'..=b'9'))
+            {
+                return None;
+            }
+            self.position += 1;
+            while self
+                .input
+                .get(self.position)
+                .is_some_and(u8::is_ascii_digit)
+            {
+                self.position += 1;
+            }
+        }
+        if self.take(b'.') {
+            let digits = self.position;
+            while self
+                .input
+                .get(self.position)
+                .is_some_and(u8::is_ascii_digit)
+            {
+                self.position += 1;
+            }
+            if digits == self.position {
+                return None;
+            }
+        }
+        if self.take(b'e') || self.take(b'E') {
+            if !self.take(b'+') {
+                self.take(b'-');
+            }
+            let digits = self.position;
+            while self
+                .input
+                .get(self.position)
+                .is_some_and(u8::is_ascii_digit)
+            {
+                self.position += 1;
+            }
+            if digits == self.position {
+                return None;
+            }
+        }
+        let text = std::str::from_utf8(&self.input[start..self.position]).ok()?;
+        if !text.parse::<f64>().ok()?.is_finite() {
+            return None;
+        }
+        Some(text.to_owned())
+    }
+
+    fn hex4(&mut self) -> Option<u32> {
+        let mut code = 0u32;
+        for _ in 0..4 {
+            let digit = (*self.input.get(self.position)? as char).to_digit(16)?;
+            self.position += 1;
+            code = code * 16 + digit;
+        }
+        Some(code)
+    }
+
+    fn text(&mut self) -> Option<String> {
+        if !self.take(b'"') {
+            return None;
+        }
+        let mut text = String::new();
+        let mut start = self.position;
+        loop {
+            let byte = *self.input.get(self.position)?;
+            if byte == b'"' || byte == b'\\' {
+                text.push_str(std::str::from_utf8(&self.input[start..self.position]).ok()?);
+                self.position += 1;
+                if byte == b'"' {
+                    return Some(text);
+                }
+                let escaped = *self.input.get(self.position)?;
+                self.position += 1;
+                match escaped {
+                    b'"' => text.push('"'),
+                    b'\\' => text.push('\\'),
+                    b'/' => text.push('/'),
+                    b'b' => text.push('\x08'),
+                    b'f' => text.push('\x0c'),
+                    b'n' => text.push('\n'),
+                    b'r' => text.push('\r'),
+                    b't' => text.push('\t'),
+                    b'u' => {
+                        let mut code = self.hex4()?;
+                        if (0xd800..=0xdbff).contains(&code) {
+                            self.literal(b"\\u")?;
+                            let low = self.hex4()?;
+                            if !(0xdc00..=0xdfff).contains(&low) {
+                                return None;
+                            }
+                            code = 0x10000 + ((code - 0xd800) << 10) + low - 0xdc00;
+                        }
+                        text.push(char::from_u32(code)?);
+                    }
+                    _ => return None,
+                }
+                start = self.position;
+            } else {
+                if byte < 0x20 {
+                    return None;
+                }
+                self.position += 1;
+            }
+        }
+    }
+}
+
+fn additional_json_quote(out: &mut String, value: &str) {
+    use std::fmt::Write;
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch < '\x20' => {
+                let _ = write!(out, "\\u{:04x}", ch as u32);
+            }
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+}
+
+fn additional_pointer_valid(ptr: *const u8, len: usize) -> bool {
+    len <= isize::MAX as usize
+        && (len == 0 || (!ptr.is_null() && (ptr as usize).checked_add(len).is_some()))
+}
+
+/// # Safety
+/// A non-null `ptr` must point to a readable allocation of at least `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_additional_validate_naming_witness(
+    ptr: *const u8,
+    len: usize,
+    count: usize,
+    total: usize,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        if !additional_pointer_valid(ptr, len) {
+            return -1;
+        }
+        if len == 0 || len > 4096 || count >= 256 || total > 32768 - len {
+            return 0;
+        }
+        let bytes = unsafe { slice::from_raw_parts(ptr, len) };
+        i32::from(std::str::from_utf8(bytes).is_ok())
+    })
+    .unwrap_or(-1)
+}
+
+// Validate both pointer/length pairs before constructing a slice. No output is
+// touched until parsing and computation succeed and the complete output fits.
+unsafe fn additional_json_ffi(
+    ptr: *const u8,
+    len: usize,
+    out: *mut u8,
+    cap: usize,
+    operation: fn(&AdditionalJson) -> Option<String>,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        if !additional_pointer_valid(ptr, len)
+            || !additional_pointer_valid(out.cast_const(), cap)
+            || len > ADDITIONAL_JSON_MAX_BYTES
+        {
+            return -1;
+        }
+        let bytes = if len == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(ptr, len) }
+        };
+        let Some(value) = AdditionalJsonParser::parse(bytes) else {
+            return -1;
+        };
+        let Some(result) = operation(&value) else {
+            return -1;
+        };
+        if result.len() > isize::MAX as usize {
+            return -1;
+        }
+        if result.len() > cap {
+            return -(result.len().max(2) as isize);
+        }
+        if !result.is_empty() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(result.as_ptr(), out, result.len());
+            }
+        }
+        result.len() as isize
+    })
+    .unwrap_or(-1)
+}
+
+fn additional_compressed_media(value: &AdditionalJson) -> Option<String> {
+    let entries = value.array()?;
+    let mut all_media = !entries.is_empty();
+    for entry in entries {
+        if !entry
+            .field("is_media")
+            .is_some_and(AdditionalJson::php_truthy)
+        {
+            all_media = false;
+        }
+    }
+    Some(if all_media { "true" } else { "false" }.to_owned())
+}
+
+fn additional_id_order(value: &AdditionalJson) -> Option<String> {
+    use std::fmt::Write;
+    let ids = value.field("ids")?.array()?;
+    let sqlite = value.field("driver")?.string()? == "sqlite";
+    let mut expression = if sqlite {
+        "CASE id ".to_owned()
+    } else {
+        "FIELD(id, ".to_owned()
+    };
+    for (position, id) in ids.iter().enumerate() {
+        let id = id.integer()?;
+        if sqlite {
+            if position != 0 {
+                expression.push(' ');
+            }
+            write!(expression, "WHEN {id} THEN {position}").ok()?;
+        } else {
+            if position != 0 {
+                expression.push(',');
+            }
+            write!(expression, "{id}").ok()?;
+        }
+    }
+    if sqlite {
+        write!(expression, " ELSE {} END", ids.len()).ok()?;
+    } else {
+        expression.push(')');
+    }
+    let mut out = String::new();
+    additional_json_quote(&mut out, &expression);
+    Some(out)
+}
+
+fn additional_claim_index(value: &AdditionalJson) -> Option<String> {
+    const REQUIRED: [&str; 7] = [
+        "passwordstatus",
+        "haspreview",
+        "nzbstatus",
+        "leftguid",
+        "postdate",
+        "id",
+        "additional_pp_claimed_at",
+    ];
+    let columns = value.field("columns")?.array()?;
+    let column_names: Vec<&str> = columns
+        .iter()
+        .map(AdditionalJson::string)
+        .collect::<Option<_>>()?;
+    let matches = column_names == REQUIRED;
+    let child = value.field("childTimeout")?.integer()?.max(1);
+    let release = value.field("releaseTimeout")?.integer()?.max(1);
+    let batch = value.field("batchSize")?.integer()?.max(1);
+    let threads = value.field("threads")?.integer()?.max(1);
+    let maximum_lifetime = child.min(release.checked_mul(batch)?);
+    let in_flight = threads.checked_mul(batch)?;
+    Some(format!(
+        "{{\"matches\":{matches},\"maximumClaimLifetime\":{maximum_lifetime},\"maxInFlight\":{in_flight}}}"
+    ))
+}
+
+#[derive(Default)]
+struct AdditionalOrderedTotals<T> {
+    values: Vec<(String, T)>,
+    positions: std::collections::HashMap<String, usize>,
+}
+
+impl<T: Default + Copy> AdditionalOrderedTotals<T> {
+    fn slot(&mut self, key: &str) -> &mut T {
+        let position = *self.positions.entry(key.to_owned()).or_insert_with(|| {
+            let position = self.values.len();
+            self.values.push((key.to_owned(), T::default()));
+            position
+        });
+        &mut self.values[position].1
+    }
+}
+
+fn additional_integer_map(out: &mut String, values: &[(String, i64)]) {
+    use std::fmt::Write;
+    out.push('{');
+    for (position, (name, value)) in values.iter().enumerate() {
+        if position != 0 {
+            out.push(',');
+        }
+        additional_json_quote(out, name);
+        let _ = write!(out, ":{value}");
+    }
+    out.push('}');
+}
+
+fn additional_float_bits(out: &mut String, value: f64) {
+    additional_json_quote(out, &(value.to_bits() as i64).to_string());
+}
+
+fn additional_add_integer(target: &mut i64, value: &AdditionalJson) -> Option<()> {
+    *target = target.checked_add(value.integer()?)?;
+    Some(())
+}
+
+fn additional_add_float(target: &mut f64, value: &AdditionalJson) -> Option<()> {
+    *target += value.number()?;
+    target.is_finite().then_some(())
+}
+
+fn additional_batch_metrics(value: &AdditionalJson) -> Option<String> {
+    use std::fmt::Write;
+    const DOWNLOAD: [&str; 6] = [
+        "logicalRequests",
+        "networkRequests",
+        "cacheHits",
+        "bytesDownloaded",
+        "bytesReused",
+        "mediaBytesDownloaded",
+    ];
+    const PERSISTENCE: [&str; 4] = [
+        "databaseStatements",
+        "databaseMilliseconds",
+        "searchSyncRequests",
+        "searchSyncExecutions",
+    ];
+    let mut outcomes = AdditionalOrderedTotals::<i64>::default();
+    let mut unsupported = AdditionalOrderedTotals::<i64>::default();
+    let mut stages = AdditionalOrderedTotals::<f64>::default();
+    let mut download = [0i64; 6];
+    let mut persistence = [0i64; 4];
+    let mut milliseconds = 0.0f64;
+    let mut successful = 0i64;
+    let mut artifacts = 0i64;
+    for row in value.array()? {
+        let outcome = row.field("outcome")?.string()?;
+        let count = outcomes.slot(outcome);
+        *count = count.checked_add(1)?;
+        if row.field("successful")?.boolean()? {
+            successful = successful.checked_add(1)?;
+            if row.field("artifactsCreated")?.boolean()? {
+                artifacts = artifacts.checked_add(1)?;
+            }
+        } else {
+            row.field("artifactsCreated")?.boolean()?;
+        }
+        for reason in row.field("unsupportedReasons")?.array()? {
+            let count = unsupported.slot(reason.string()?);
+            *count = count.checked_add(1)?;
+        }
+        let stage_values = row.field("stageDurations")?;
+        if let Some(entries) = stage_values.object() {
+            for (name, duration) in entries {
+                additional_add_float(stages.slot(name), duration)?;
+            }
+        } else if !stage_values.array()?.is_empty() {
+            return None;
+        }
+        let metric = row.field("downloadMetrics")?;
+        if !matches!(metric, AdditionalJson::Null) {
+            metric.object()?;
+            for (position, name) in DOWNLOAD.iter().enumerate() {
+                additional_add_integer(&mut download[position], metric.field(name)?)?;
+            }
+        }
+        let metric = row.field("persistenceMetrics")?;
+        if !matches!(metric, AdditionalJson::Null) {
+            metric.object()?;
+            for (position, name) in PERSISTENCE.iter().enumerate() {
+                if position == 1 {
+                    additional_add_float(&mut milliseconds, metric.field(name)?)?;
+                } else {
+                    additional_add_integer(&mut persistence[position], metric.field(name)?)?;
+                }
+            }
+        }
+    }
+    let mut out = "{\"outcomeCounts\":".to_owned();
+    additional_integer_map(&mut out, &outcomes.values);
+    out.push_str(",\"unsupportedReasonCounts\":");
+    additional_integer_map(&mut out, &unsupported.values);
+    out.push_str(",\"stageDurationTotals\":{");
+    for (position, (name, total)) in stages.values.iter().enumerate() {
+        if position != 0 {
+            out.push(',');
+        }
+        additional_json_quote(&mut out, name);
+        out.push(':');
+        additional_float_bits(&mut out, *total);
+    }
+    out.push_str("},\"downloadMetrics\":{");
+    for (position, name) in DOWNLOAD.iter().enumerate() {
+        if position != 0 {
+            out.push(',');
+        }
+        additional_json_quote(&mut out, name);
+        write!(out, ":{}", download[position]).ok()?;
+    }
+    out.push_str("},\"persistenceMetrics\":{");
+    for (position, name) in PERSISTENCE.iter().enumerate() {
+        if position != 0 {
+            out.push(',');
+        }
+        additional_json_quote(&mut out, name);
+        out.push(':');
+        if position == 1 {
+            additional_float_bits(&mut out, milliseconds);
+        } else {
+            write!(out, "{}", persistence[position]).ok()?;
+        }
+    }
+    out.push_str("},\"artifactYieldPercent\":");
+    additional_float_bits(
+        &mut out,
+        if successful == 0 {
+            0.0
+        } else {
+            (artifacts as f64 / successful as f64) * 100.0
+        },
+    );
+    out.push('}');
+    Some(out)
+}
+
+/// JSON helpers return bytes written, `-1` on invalid input, or `-required`
+/// (at most `-2`) when the output buffer is too small; they never partially write.
+///
+/// # Safety
+/// Non-null input/output pointers must be valid for their declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_additional_compressed_files_are_media_json(
+    ptr: *const u8,
+    len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    unsafe { additional_json_ffi(ptr, len, out, cap, additional_compressed_media) }
+}
+
+/// # Safety
+/// Non-null input/output pointers must be valid for their declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_additional_id_order_expression_json(
+    ptr: *const u8,
+    len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    unsafe { additional_json_ffi(ptr, len, out, cap, additional_id_order) }
+}
+
+/// Float outputs are signed-i64 decimal strings containing IEEE-754 bits.
+///
+/// # Safety
+/// Non-null input/output pointers must be valid for their declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_additional_batch_result_metrics_json(
+    ptr: *const u8,
+    len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    unsafe { additional_json_ffi(ptr, len, out, cap, additional_batch_metrics) }
+}
+
+/// # Safety
+/// Non-null input/output pointers must be valid for their declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_additional_claim_index_matches_json(
+    ptr: *const u8,
+    len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    unsafe { additional_json_ffi(ptr, len, out, cap, additional_claim_index) }
+}
