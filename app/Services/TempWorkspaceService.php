@@ -4,13 +4,72 @@ declare(strict_types=1);
 
 namespace App\Services;
 
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Facades\File;
-use Illuminate\Support\Str;
 use RuntimeException;
 use Throwable;
 
 class TempWorkspaceService
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_maintenance_verification(const char *input, size_t len, uint32_t mode, char *out, size_t cap);
+        C;
+
+    // Single-call candidates remain opt-in until both performance gates pass.
+    private static bool $useRustFfi = false;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi && RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF) !== null;
+    }
+
+    private static function transformNative(int $mode, string $input): string|false|null
+    {
+        if (! self::$useRustFfi || strlen($input) > 1_048_576) {
+            return null;
+        }
+        $ffi = RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF);
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            $cap = 0;
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, max(256, strlen($input) * 4 + 256), $cap);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_maintenance_verification($input, strlen($input), $mode, $scratch, $cap);
+            if ($written === -3) {
+                return false;
+            }
+            if (! is_int($written) || $written < 0 || $written > $cap) {
+                return null;
+            }
+
+            return $written === 0 ? '' : FFI::string($scratch, $written);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** @param list<string> $values */
+    private static function encodeFrames(array $values): string
+    {
+        $input = '';
+        foreach ($values as $value) {
+            $input .= pack('V', strlen($value)).$value;
+        }
+
+        return $input;
+    }
+
     /**
      * Ensure the main temp path exists and is namespaced by groupID or guidChar.
      * Returns the resolved main temp path.
@@ -21,20 +80,8 @@ class TempWorkspaceService
         string $groupID = '',
         string $workerToken = ''
     ): string {
-        // Normalize separator at end
-        if (! Str::endsWith($basePath, ['/', '\\'])) {
-            $basePath .= '/';
-        }
-
-        if ($groupID !== '') {
-            $basePath .= $groupID.'/';
-        } elseif ($guidChar !== '') {
-            $basePath .= $guidChar.'/';
-        }
-
-        if ($workerToken !== '') {
-            $basePath .= hash('sha256', $workerToken).'/';
-        }
+        $basePath = (self::$useRustFfi ? self::mainTempPathNative($basePath, $guidChar, $groupID, $workerToken) : null)
+            ?? self::mainTempPathPhp($basePath, $guidChar, $groupID, $workerToken);
 
         $this->ensureWritableDirectory($basePath, 'Additional post-processing temp path');
 
@@ -195,5 +242,29 @@ class TempWorkspaceService
                 $path
             ));
         }
+    }
+
+    public static function mainTempPathPhp(string $basePath, string $guidChar = '', string $groupID = '', string $workerToken = ''): string
+    {
+        if (! str_ends_with($basePath, '/') && ! str_ends_with($basePath, '\\')) {
+            $basePath .= '/';
+        }
+        if ($groupID !== '') {
+            $basePath .= $groupID.'/';
+        } elseif ($guidChar !== '') {
+            $basePath .= $guidChar.'/';
+        }
+        if ($workerToken !== '') {
+            $basePath .= hash('sha256', $workerToken).'/';
+        }
+
+        return $basePath;
+    }
+
+    public static function mainTempPathNative(string $basePath, string $guidChar = '', string $groupID = '', string $workerToken = ''): ?string
+    {
+        $output = self::transformNative(9, self::encodeFrames([$basePath, $guidChar, $groupID, $workerToken]));
+
+        return is_string($output) ? $output : null;
     }
 }

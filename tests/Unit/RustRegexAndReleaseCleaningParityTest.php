@@ -178,6 +178,7 @@ final class RustRegexAndReleaseCleaningParityTest extends TestCase
             }
             self::assertSame($outcomes[0], $outcomes[1]);
         }
+        $startupAsciiTables = preg_match('/^\s$/', "\xa0") === 0;
         $previous = setlocale(LC_CTYPE, '0');
         try {
             foreach (['C', 'en_US.ISO8859-1', 'en_US.UTF-8', 'C.UTF-8'] as $locale) {
@@ -196,6 +197,9 @@ final class RustRegexAndReleaseCleaningParityTest extends TestCase
             setlocale(LC_CTYPE, 'C');
             if ($previous !== false) {
                 setlocale(LC_CTYPE, $previous);
+            }
+            if ($startupAsciiTables) {
+                setlocale(LC_CTYPE, 'C');
             }
         }
     }
