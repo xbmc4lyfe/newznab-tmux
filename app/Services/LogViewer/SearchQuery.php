@@ -4,13 +4,19 @@ declare(strict_types=1);
 
 namespace App\Services\LogViewer;
 
+use App\Support\RustPipelineLibrary;
 use Carbon\CarbonImmutable;
+use FFI;
+use Throwable;
 
 /**
  * A log search: an optional term (plain or PCRE), case sensitivity, and level / channel / time filters.
  *
  * Matching is byte-wise (no `/u`), mirroring `grep` under `LC_ALL=C`, so both search engines
  * agree on what matches and case folding is ASCII-only.
+ *
+ * Highlighting stays in PHP: {@see plainRangesNative()} (Rust `nntmux_log_plain_ranges`) is kept for parity
+ * tests only, because per-entry FFI calls did not reach the 1.5x speedup gate over `strpos` / `stripos`.
  */
 final readonly class SearchQuery
 {
@@ -24,6 +30,10 @@ final readonly class SearchQuery
     private const string LEVEL_HEADER_ERE = '^\[[^]]*\][[:space:]]+[[:alnum:]_.-]+\.(%s):';
 
     private const int MAX_HIGHLIGHTS = 200;
+
+    private const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_log_plain_ranges(const char *text, size_t text_len, const char *term, size_t term_len, uint32_t case_sensitive, size_t max_ranges, char *out_buf, size_t out_cap);
+        C;
 
     /**
      * @param  list<string>  $levels  lowercase Monolog level names
@@ -186,6 +196,49 @@ final readonly class SearchQuery
         }
 
         return $ranges;
+    }
+
+    /**
+     * Rust equivalent of {@see plainRanges()} for parity tests and benchmarks; null when the library is unavailable.
+     *
+     * @return list<array{int, int}>|null
+     */
+    public function plainRangesNative(string $text): ?array
+    {
+        static $ffi = null;
+        $ffi ??= RustPipelineLibrary::resolveDomain('log_search_query', self::FFI_CDEF) ?? false;
+
+        if (! $ffi instanceof FFI || ! $this->hasTerm()) {
+            return null;
+        }
+
+        $capacity = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, self::MAX_HIGHLIGHTS * 16, $capacity);
+
+        if ($scratch === null) {
+            return null;
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_log_plain_ranges($text, strlen($text), $this->term, strlen($this->term), $this->caseSensitive ? 1 : 0, self::MAX_HIGHLIGHTS, $scratch, $capacity);
+        } catch (Throwable) {
+            return null;
+        }
+
+        if ($written < 0) {
+            return null;
+        }
+
+        if ($written === 0) {
+            return [];
+        }
+
+        /** @var list<int> $flat */
+        $flat = array_values((array) unpack('q*', FFI::string($scratch, $written)));
+
+        /** @var list<array{int, int}> */
+        return array_chunk($flat, 2);
     }
 
     /**

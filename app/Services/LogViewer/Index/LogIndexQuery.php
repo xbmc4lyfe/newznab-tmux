@@ -5,6 +5,9 @@ declare(strict_types=1);
 namespace App\Services\LogViewer\Index;
 
 use App\Services\LogViewer\SearchQuery;
+use App\Support\RustPipelineLibrary;
+use FFI;
+use Throwable;
 
 /**
  * Translates a log viewer search into Manticore JSON query clauses.
@@ -13,12 +16,21 @@ use App\Services\LogViewer\SearchQuery;
  * a phrase of its word tokens with infix wildcards on the edge tokens (which may be cut-off words):
  * `Jobs\ReindexRel` → `"*jobs reindexrel*"`. That only selects candidates; {@see ManticoreLogSearcher}
  * re-checks each one with {@see SearchQuery::matches()} so results stay exactly what grep would return.
+ *
+ * {@see matchExpressionNative()} (Rust `nntmux_log_index_match_expression`) is kept for parity tests only: one
+ * call per search did not reach the 1.5x speedup gate once FFI overhead is included.
  */
 final class LogIndexQuery
 {
     public const int MIN_INFIX_LENGTH = 3;
 
     private const string WORD_CHARACTER = '[\p{L}\p{N}_]';
+
+    private const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_log_index_match_expression(const char *term, size_t term_len, size_t min_infix, char *out_buf, size_t out_cap);
+        C;
+
+    private static FFI|false|null $ffi = null;
 
     /**
      * Whether Manticore can answer this search: regular expressions and terms without a usable token cannot.
@@ -59,6 +71,42 @@ final class LogIndexQuery
         }
 
         return count($parts) === 1 ? $parts[0] : '"'.implode(' ', $parts).'"';
+    }
+
+    /**
+     * Rust equivalent of {@see matchExpression()} for ASCII terms; $supported is false when Rust declined the term
+     * (non-ASCII) or the library is unavailable.
+     */
+    public static function matchExpressionNative(string $term, bool &$supported = false): ?string
+    {
+        $supported = false;
+        self::$ffi ??= RustPipelineLibrary::resolveDomain('log_index_query', self::FFI_CDEF) ?? false;
+
+        if (self::$ffi === false) {
+            return null;
+        }
+
+        $capacity = 0;
+        $scratch = RustPipelineLibrary::obtainScratch(self::$ffi, max(64, strlen($term) * 2 + 8), $capacity);
+
+        if ($scratch === null) {
+            return null;
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $written = self::$ffi->nntmux_log_index_match_expression($term, strlen($term), self::MIN_INFIX_LENGTH, $scratch, $capacity);
+        } catch (Throwable) {
+            return null;
+        }
+
+        if ($written < 0) {
+            return null;
+        }
+
+        $supported = true;
+
+        return $written === 0 ? null : FFI::string($scratch, $written);
     }
 
     /**

@@ -3509,6 +3509,564 @@ pub unsafe extern "C" fn nntmux_book_isbn_normalize_batch_nul(
     cur.finish()
 }
 
+// ---------------------------------------------------------------------------
+// Log viewer search (`LogSearcher`, `SearchQuery`, `LogIndexQuery`)
+// ---------------------------------------------------------------------------
+
+const LOG_SEARCH_DECLINED: isize = -2;
+
+/// Lines whose level-header token is longer than this are handed back to PHP so PCRE's
+/// backtrack-limit error (reported to the user) stays authoritative for pathological lines.
+const LOG_LEVEL_TOKEN_DEFER_BYTES: usize = 4096;
+
+const LOG_SCAN_CASE_SENSITIVE: u32 = 0;
+const LOG_SCAN_CASE_INSENSITIVE: u32 = 1;
+const LOG_SCAN_LEVEL_HEADER: u32 = 2;
+
+/// Upper-case Monolog level names, indexed like `LogEntryParser::LEVELS` (bit `i` of a level mask).
+const LOG_LEVEL_NAMES: [&[u8]; 8] = [
+    b"DEBUG",
+    b"INFO",
+    b"NOTICE",
+    b"WARNING",
+    b"ERROR",
+    b"CRITICAL",
+    b"ALERT",
+    b"EMERGENCY",
+];
+
+const SWAR_LO: u64 = 0x0101_0101_0101_0101;
+const SWAR_HI: u64 = 0x8080_8080_8080_8080;
+
+/// Index of the first byte equal to `needle` in `hay[from..]`; with `fold`, `needle` must be an ASCII
+/// lower-case letter and the upper-case letter matches too (`b | 0x20` only maps that pair onto it).
+#[inline]
+fn log_find_byte(hay: &[u8], from: usize, needle: u8, fold: bool) -> Option<usize> {
+    let mask = if fold { 0x2020_2020_2020_2020u64 } else { 0 };
+    let pattern = SWAR_LO.wrapping_mul(needle as u64);
+    let mut i = from;
+    while i + 8 <= hay.len() {
+        let word = u64::from_le_bytes(hay[i..i + 8].try_into().unwrap()) | mask;
+        let x = word ^ pattern;
+        let t = x.wrapping_sub(SWAR_LO) & !x & SWAR_HI;
+        if t != 0 {
+            return Some(i + (t.trailing_zeros() / 8) as usize);
+        }
+        i += 8;
+    }
+    while i < hay.len() {
+        let b = if fold { hay[i] | 0x20 } else { hay[i] };
+        if b == needle {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+#[inline]
+fn log_count_newlines(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|&&b| b == b'\n').count()
+}
+
+/// Byte-wise substring finder matching PHP `strpos` (exact) or `stripos` (ASCII case folding).
+struct LogTermFinder<'a> {
+    term: &'a [u8],
+    folded: Vec<u8>,
+    insensitive: bool,
+    first: u8,
+    first_fold: bool,
+}
+
+impl<'a> LogTermFinder<'a> {
+    fn new(term: &'a [u8], insensitive: bool) -> Self {
+        let folded: Vec<u8> = if insensitive {
+            term.iter().map(|b| b.to_ascii_lowercase()).collect()
+        } else {
+            Vec::new()
+        };
+        let first = if insensitive { folded[0] } else { term[0] };
+        Self {
+            term,
+            insensitive,
+            first,
+            first_fold: insensitive && first.is_ascii_lowercase(),
+            folded,
+        }
+    }
+
+    #[inline]
+    fn matches_at(&self, hay: &[u8], at: usize) -> bool {
+        let candidate = &hay[at..at + self.term.len()];
+        if self.insensitive {
+            candidate
+                .iter()
+                .zip(self.folded.iter())
+                .all(|(&h, &n)| h.to_ascii_lowercase() == n)
+        } else {
+            candidate == self.term
+        }
+    }
+
+    /// First match starting in `hay[from..end]` and ending at or before `end`.
+    #[inline]
+    fn find(&self, hay: &[u8], from: usize, end: usize) -> Option<usize> {
+        let n = self.term.len();
+        if end < n {
+            return None;
+        }
+        let last_start = end - n;
+        let window = &hay[..end];
+        let mut at = from;
+        while at <= last_start {
+            let candidate = log_find_byte(&window[..last_start + 1], at, self.first, self.first_fold)?;
+            if self.matches_at(hay, candidate) {
+                return Some(candidate);
+            }
+            at = candidate + 1;
+        }
+        None
+    }
+}
+
+/// Header slots of a hit window: oldest kept slot, kept hits, total hits, eligible hits.
+const LOG_WINDOW_HEADER: usize = 4;
+
+/// The caller-owned hit window `int64_t[4 + 2 * keep]` that persists across chunk calls, mirroring
+/// `LogSearcher::searchFile`: hits at or past the `before` cursor (`i64::MAX` for none) only count toward the total,
+/// and only the newest `keep` eligible `[offset, line]` hits are kept (a ring starting at slot `header[0]`).
+struct LogHitRing<'a> {
+    slots: &'a mut [i64],
+    keep: usize,
+    before: i64,
+}
+
+impl<'a> LogHitRing<'a> {
+    /// # Safety
+    ///
+    /// `window` must be valid for reads and writes of `4 + 2 * keep` `int64_t` values.
+    unsafe fn from_raw(window: *mut i64, keep: usize, before: i64) -> Option<Self> {
+        if window.is_null() {
+            return None;
+        }
+        let len = keep.checked_mul(2)?.checked_add(LOG_WINDOW_HEADER)?;
+        let slots = unsafe { slice::from_raw_parts_mut(window, len) };
+        let (head, kept) = (slots[0], slots[1]);
+        if head < 0 || kept < 0 || kept as usize > keep || (kept as usize) < keep && head != 0 || head as usize >= keep.max(1) {
+            return None;
+        }
+        Some(Self { slots, keep, before })
+    }
+
+    #[inline]
+    fn push(&mut self, offset: i64, line: i64) {
+        self.slots[2] += 1;
+        if offset >= self.before {
+            return;
+        }
+        self.slots[3] += 1;
+        self.keep_hit(offset, line);
+    }
+
+    #[inline]
+    fn keep_hit(&mut self, offset: i64, line: i64) {
+        if self.keep == 0 {
+            return;
+        }
+        let kept = self.slots[1] as usize;
+        let slot = if kept < self.keep {
+            self.slots[1] += 1;
+            kept
+        } else {
+            let head = self.slots[0] as usize;
+            self.slots[0] = ((head + 1) % self.keep) as i64;
+            head
+        };
+        let at = LOG_WINDOW_HEADER + slot * 2;
+        self.slots[at] = offset;
+        self.slots[at + 1] = line;
+    }
+}
+
+/// Parses a `grep -b -n` field: 1..=18 ASCII digits, so PHP's `(int)` cast agrees without overflow.
+#[inline]
+fn log_parse_grep_field(field: &[u8]) -> Option<i64> {
+    if field.is_empty() || field.len() > 18 {
+        return None;
+    }
+    let mut value = 0i64;
+    for &b in field {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        value = value * 10 + (b - b'0') as i64;
+    }
+    Some(value)
+}
+
+/// Whether `content` matches `SearchQuery::LEVEL_HEADER_PCRE` (`^\[[^\]]*\]\s+[\w.\-]+\.(?:LEVELS):`)
+/// for the levels in `mask`; `None` defers the line to PHP.
+#[inline]
+fn log_level_header_matches(content: &[u8], mask: u32) -> Option<bool> {
+    if content.first() != Some(&b'[') {
+        return Some(false);
+    }
+    let Some(close) = content[1..].iter().position(|&b| b == b']') else {
+        return Some(false);
+    };
+    let mut p = close + 2;
+    let ws_start = p;
+    while p < content.len() && is_ascii_ws(content[p]) {
+        p += 1;
+    }
+    if p == ws_start {
+        return Some(false);
+    }
+    let token_start = p;
+    while p < content.len() && (is_word_byte(content[p]) || matches!(content[p], b'.' | b'-')) {
+        p += 1;
+    }
+    if p - token_start > LOG_LEVEL_TOKEN_DEFER_BYTES {
+        return None;
+    }
+    if content.get(p) != Some(&b':') {
+        return Some(false);
+    }
+    let token = &content[token_start..p];
+    for (index, level) in LOG_LEVEL_NAMES.iter().enumerate() {
+        if mask & (1 << index) == 0 || token.len() < level.len() + 2 {
+            continue;
+        }
+        let dot = token.len() - level.len() - 1;
+        if token[dot] == b'.' && &token[dot + 1..] == *level {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+/// `rtrim($line, "\r\n")` for a line already cut at its `\n`.
+#[inline]
+fn log_trim_cr(line: &[u8]) -> &[u8] {
+    let mut end = line.len();
+    while end > 0 && matches!(line[end - 1], b'\r' | b'\n') {
+        end -= 1;
+    }
+    &line[..end]
+}
+
+/// Parses `grep -a -b -n` output exactly like `LogSearcher::parseGrepLines`: every `\n`-separated line with
+/// two colons is a hit `LINE:OFFSET:text`, collected into the caller's hit window (see `LogHitRing`).
+///
+/// Returns the number of hits parsed, `-1` for invalid arguments, or `-2` when a field is not a plain digit
+/// run (PHP's `(int)` cast then decides); the window is left untouched on any negative return.
+///
+/// # Safety
+///
+/// `input` must be valid for reads of `input_len` bytes and `window` for reads and writes of `4 + 2 * keep`
+/// `int64_t` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_log_parse_grep_lines(
+    input: *const u8,
+    input_len: usize,
+    before: i64,
+    keep: usize,
+    window: *mut i64,
+) -> isize {
+    if input.is_null() && input_len > 0 {
+        return -1;
+    }
+    let Some(mut ring) = (unsafe { LogHitRing::from_raw(window, keep, before) }) else {
+        return -1;
+    };
+    let bytes = if input_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(input, input_len) }
+    };
+
+    // Hits are staged so a declined field leaves the window as it was.
+    let mut staged: Vec<[i64; 2]> = Vec::with_capacity(input_len / 64 + 1);
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        let end = log_find_byte(bytes, pos, b'\n', false).unwrap_or(bytes.len());
+        let line = &bytes[pos..end];
+        pos = end + 1;
+        let Some(first) = line.iter().position(|&b| b == b':') else {
+            continue;
+        };
+        let Some(second) = line[first + 1..].iter().position(|&b| b == b':') else {
+            continue;
+        };
+        let (Some(line_number), Some(offset)) = (
+            log_parse_grep_field(&line[..first]),
+            log_parse_grep_field(&line[first + 1..first + 1 + second]),
+        ) else {
+            return LOG_SEARCH_DECLINED;
+        };
+        staged.push([offset, line_number]);
+    }
+
+    for &[offset, line_number] in &staged {
+        ring.push(offset, line_number);
+    }
+    staged.len() as isize
+}
+
+/// Scans a chunk of a log file for `LogSearcher::phpHits` without splitting it into PHP strings.
+///
+/// `chunk[start..]` is scanned line by line (`\n`-terminated, trailing `\r`/`\n` trimmed as `rtrim($line,
+/// "\r\n")`); without `is_final` the trailing partial line is left unconsumed for the next read. `mode` selects
+/// a case-sensitive (`0`, `str_contains`) or ASCII case-insensitive (`1`, `stripos`) term, or the level header
+/// pattern (`2`) for the levels in `level_mask` (bit `i` = `LogEntryParser::LEVELS[i]`). Hit offsets are
+/// `base_offset` plus the line start; `line_number` counts the lines before `chunk[start]`.
+///
+/// Hits are collected into the caller's hit window (see `LogHitRing`). `state_out[0..3]` receives the chunk
+/// position where scanning stopped, the line count before it, and `1` when the line at that position must be
+/// evaluated by PHP (`0` otherwise).
+///
+/// Returns the number of hits found, `-1` for invalid arguments, or `-2` when the term cannot be matched
+/// line-wise in Rust (empty, or containing `\r`/`\n`).
+///
+/// # Safety
+///
+/// `chunk` must be valid for reads of `chunk_len` bytes, `term` for `term_len` bytes, `window` for reads and
+/// writes of `4 + 2 * keep` `int64_t` values, and `state_out` for writes of three `int64_t` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_log_scan_chunk_hits(
+    chunk: *const u8,
+    chunk_len: usize,
+    start: usize,
+    is_final: u32,
+    mode: u32,
+    term: *const u8,
+    term_len: usize,
+    level_mask: u32,
+    base_offset: i64,
+    line_number: i64,
+    before: i64,
+    keep: usize,
+    window: *mut i64,
+    state_out: *mut i64,
+) -> isize {
+    if state_out.is_null()
+        || (chunk.is_null() && chunk_len > 0)
+        || (term.is_null() && term_len > 0)
+        || start > chunk_len
+        || mode > LOG_SCAN_LEVEL_HEADER
+    {
+        return -1;
+    }
+    let bytes = if chunk_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(chunk, chunk_len) }
+    };
+    let term = if term_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(term, term_len) }
+    };
+    if mode != LOG_SCAN_LEVEL_HEADER && (term.is_empty() || term.iter().any(|&b| b == b'\n' || b == b'\r')) {
+        return LOG_SEARCH_DECLINED;
+    }
+
+    // Complete lines end at `limit`; a final chunk also owns its unterminated last line.
+    let limit = if is_final != 0 {
+        bytes.len()
+    } else {
+        bytes[start..]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(start, |p| start + p + 1)
+    };
+
+    let Some(mut window) = (unsafe { LogHitRing::from_raw(window, keep, before) }) else {
+        return -1;
+    };
+    let hits_before = window.slots[2];
+    let mut lines = line_number;
+    let mut stop = limit;
+    let mut deferred = 0i64;
+
+    if mode == LOG_SCAN_LEVEL_HEADER {
+        let mut pos = start;
+        while pos < limit {
+            let end = log_find_byte(&bytes[..limit], pos, b'\n', false).unwrap_or(limit);
+            match log_level_header_matches(log_trim_cr(&bytes[pos..end]), level_mask) {
+                None => {
+                    stop = pos;
+                    deferred = 1;
+                    break;
+                }
+                Some(true) => window.push(base_offset + pos as i64, lines + 1),
+                Some(false) => {}
+            }
+            lines += 1;
+            pos = end + 1;
+        }
+    } else {
+        let insensitive = match mode {
+            LOG_SCAN_CASE_SENSITIVE => false,
+            LOG_SCAN_CASE_INSENSITIVE => true,
+            _ => return -1,
+        };
+        let finder = LogTermFinder::new(term, insensitive);
+        let mut line_start = start;
+        let mut cursor = start;
+        while let Some(hit) = finder.find(bytes, cursor, limit) {
+            if let Some(last) = bytes[line_start..hit].iter().rposition(|&b| b == b'\n') {
+                lines += log_count_newlines(&bytes[line_start..line_start + last + 1]) as i64;
+                line_start += last + 1;
+            }
+            window.push(base_offset + line_start as i64, lines + 1);
+            let end = log_find_byte(&bytes[..limit], hit, b'\n', false).unwrap_or(limit);
+            lines += 1;
+            line_start = (end + 1).min(limit);
+            cursor = line_start;
+            if end >= limit {
+                break;
+            }
+        }
+        if line_start < limit {
+            let rest = &bytes[line_start..limit];
+            lines += log_count_newlines(rest) as i64;
+            if rest.last() != Some(&b'\n') {
+                lines += 1;
+            }
+        }
+    }
+
+    unsafe {
+        *state_out = stop as i64;
+        *state_out.add(1) = lines;
+        *state_out.add(2) = deferred;
+    }
+    (window.slots[2] - hits_before) as isize
+}
+
+/// `SearchQuery::plainRanges`: up to `max_ranges` non-overlapping `[start, length]` matches of `term` in `text`
+/// (`strpos` or ASCII `stripos`), written as native-endian `int64` pairs.
+///
+/// Returns the bytes written, `-needed` when `out_buf` is too small, or `-1` for invalid arguments.
+///
+/// # Safety
+///
+/// `text` must be valid for reads of `text_len` bytes, `term` for `term_len` bytes, and `out_buf` for writes
+/// of `out_cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_log_plain_ranges(
+    text: *const u8,
+    text_len: usize,
+    term: *const u8,
+    term_len: usize,
+    case_sensitive: u32,
+    max_ranges: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if term.is_null() || term_len == 0 || (text.is_null() && text_len > 0) {
+        return -1;
+    }
+    let text = if text_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(text, text_len) }
+    };
+    let term = unsafe { slice::from_raw_parts(term, term_len) };
+    let finder = LogTermFinder::new(term, case_sensitive == 0);
+    let mut out = OutCursor::new(out_buf, out_cap);
+    let mut cursor = 0usize;
+    let mut found = 0usize;
+    while found < max_ranges {
+        let Some(hit) = finder.find(text, cursor, text.len()) else {
+            break;
+        };
+        out.push_slice(&(hit as i64).to_ne_bytes());
+        out.push_slice(&(term_len as i64).to_ne_bytes());
+        found += 1;
+        cursor = hit + term_len;
+    }
+    out.finish()
+}
+
+/// `LogIndexQuery::matchExpression` for ASCII terms: word tokens (`[A-Za-z0-9_]+`) lowered, edge tokens that
+/// may be cut-off words get infix wildcards (or are dropped below `min_infix` bytes), and several tokens form a
+/// quoted phrase.
+///
+/// Returns the bytes written (`0` for no expression, PHP `null`), `-needed` when `out_buf` is too small, `-1`
+/// for invalid arguments, or `-2` for a non-ASCII term (Unicode classes and `mb_strtolower` stay in PHP).
+///
+/// # Safety
+///
+/// `term` must be valid for reads of `term_len` bytes and `out_buf` for writes of `out_cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_log_index_match_expression(
+    term: *const u8,
+    term_len: usize,
+    min_infix: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if term.is_null() && term_len > 0 {
+        return -1;
+    }
+    let term = if term_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(term, term_len) }
+    };
+    if !term.is_ascii() {
+        return LOG_SEARCH_DECLINED;
+    }
+    let tokens: Vec<&[u8]> = term
+        .split(|&b| !is_word_byte(b))
+        .filter(|token| !token.is_empty())
+        .collect();
+    if tokens.is_empty() {
+        return 0;
+    }
+    let starts_in_word = is_word_byte(term[0]);
+    let ends_in_word = is_word_byte(term[term.len() - 1]);
+    let last = tokens.len() - 1;
+    let mut parts: Vec<(bool, &[u8], bool)> = Vec::with_capacity(tokens.len());
+    for (index, token) in tokens.iter().enumerate() {
+        let prefix = index == 0 && starts_in_word;
+        let suffix = index == last && ends_in_word;
+        if (prefix || suffix) && token.len() < min_infix {
+            continue;
+        }
+        parts.push((prefix, token, suffix));
+    }
+    if parts.is_empty() {
+        return 0;
+    }
+
+    let mut out = OutCursor::new(out_buf, out_cap);
+    let quoted = parts.len() > 1;
+    if quoted {
+        out.push_byte(b'"');
+    }
+    for (index, (prefix, token, suffix)) in parts.iter().enumerate() {
+        if index > 0 {
+            out.push_byte(b' ');
+        }
+        if *prefix {
+            out.push_byte(b'*');
+        }
+        for &b in token.iter() {
+            out.push_byte(b.to_ascii_lowercase());
+        }
+        if *suffix {
+            out.push_byte(b'*');
+        }
+    }
+    if quoted {
+        out.push_byte(b'"');
+    }
+    out.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3607,5 +4165,291 @@ mod tests {
             nntmux_book_isbn_equivalent(raw10.as_ptr(), raw10.len(), raw13.as_ptr(), raw13.len())
         };
         assert_eq!(eq, 1);
+    }
+
+    fn log_decode_pairs(buf: &[u8], written: isize) -> Vec<[i64; 2]> {
+        assert!(written >= 0 && written % 16 == 0, "written {written}");
+        buf[..written as usize]
+            .chunks(16)
+            .map(|c| {
+                [
+                    i64::from_ne_bytes(c[..8].try_into().unwrap()),
+                    i64::from_ne_bytes(c[8..].try_into().unwrap()),
+                ]
+            })
+            .collect()
+    }
+
+    /// Kept hits of a `LogHitRing` window, oldest first, plus the total and eligible counts.
+    fn log_window_hits(window: &[i64], keep: usize) -> (Vec<[i64; 2]>, i64, i64) {
+        let (head, kept) = (window[0] as usize, window[1] as usize);
+        let hits = (0..kept)
+            .map(|i| {
+                let at = LOG_WINDOW_HEADER + ((head + i) % keep.max(1)) * 2;
+                [window[at], window[at + 1]]
+            })
+            .collect();
+        (hits, window[2], window[3])
+    }
+
+    struct LogLcg(u64);
+
+    impl LogLcg {
+        fn next(&mut self, bound: usize) -> usize {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((self.0 >> 33) as usize) % bound
+        }
+    }
+
+    /// Reference for `LogSearcher::phpHits`: fgets lines, `rtrim("\r\n")`, then the line predicate.
+    fn log_reference_hits(data: &[u8], matches: &dyn Fn(&[u8]) -> bool) -> (Vec<[i64; 2]>, i64) {
+        let mut hits = Vec::new();
+        let mut offset = 0usize;
+        let mut line = 0i64;
+        while offset < data.len() {
+            let end = data[offset..].iter().position(|&b| b == b'\n').map_or(data.len(), |p| offset + p + 1);
+            line += 1;
+            let mut content = &data[offset..end];
+            while let Some((&last, rest)) = content.split_last() {
+                if last == b'\r' || last == b'\n' {
+                    content = rest;
+                } else {
+                    break;
+                }
+            }
+            if matches(content) {
+                hits.push([offset as i64, line]);
+            }
+            offset = end;
+        }
+        (hits, line)
+    }
+
+    /// Brute-force `^\[[^\]]*\]\s+[\w.\-]+\.(?:LEVELS):` trying every split, independent of the fast path.
+    fn log_reference_level(content: &[u8], mask: u32) -> bool {
+        if content.first() != Some(&b'[') {
+            return false;
+        }
+        let Some(close) = content.iter().position(|&b| b == b']') else {
+            return false;
+        };
+        let mut p = close + 1;
+        let ws = p;
+        while p < content.len() && is_ascii_ws(content[p]) {
+            p += 1;
+        }
+        if p == ws {
+            return false;
+        }
+        for split in p + 1..content.len() {
+            if !content[p..split].iter().all(|&b| is_word_byte(b) || b == b'.' || b == b'-') {
+                break;
+            }
+            if content[split] != b'.' {
+                continue;
+            }
+            for (i, level) in LOG_LEVEL_NAMES.iter().enumerate() {
+                let end = split + 1 + level.len();
+                if mask & (1 << i) != 0 && content.get(split + 1..end) == Some(level) && content.get(end) == Some(&b':') {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Drives `nntmux_log_scan_chunk_hits` like `LogSearcher::nativeHits`, with random chunk sizes.
+    fn log_scan_all(data: &[u8], mode: u32, term: &[u8], mask: u32, rng: &mut LogLcg) -> (Vec<[i64; 2]>, i64) {
+        let mut hits = Vec::new();
+        let mut offset = 0usize;
+        let mut line = 0i64;
+        let keep = 1 << 14;
+        let mut window = vec![0i64; LOG_WINDOW_HEADER + 2 * keep];
+        let mut state = [0i64; 3];
+        let mut read = 1 + rng.next(64);
+        loop {
+            let chunk = &data[offset..(offset + read).min(data.len())];
+            if chunk.is_empty() {
+                break;
+            }
+            let is_final = chunk.len() < read;
+            let mut start = 0usize;
+            let stop;
+            loop {
+                let found = unsafe {
+                    nntmux_log_scan_chunk_hits(
+                        chunk.as_ptr(), chunk.len(), start, is_final as u32, mode, term.as_ptr(), term.len(),
+                        mask, offset as i64, line, i64::MAX, keep, window.as_mut_ptr(), state.as_mut_ptr(),
+                    )
+                };
+                assert!(found >= 0);
+                // Hits PHP collects itself (deferred lines) follow the native ones, as `LogSearcher` flushes first.
+                let (kept, total, eligible) = log_window_hits(&window, keep);
+                assert_eq!((total, eligible), (kept.len() as i64, kept.len() as i64));
+                hits.extend(kept);
+                window.fill(0);
+                line = state[1];
+                if state[2] != 1 {
+                    stop = state[0] as usize;
+                    break;
+                }
+                let at = state[0] as usize;
+                let end = chunk[at..].iter().position(|&b| b == b'\n').map_or(chunk.len(), |p| at + p + 1);
+                line += 1;
+                if log_reference_level(log_trim_cr(&chunk[at..end]), mask) {
+                    hits.push([(offset + at) as i64, line]);
+                }
+                start = end;
+            }
+            if is_final {
+                break;
+            }
+            if stop == 0 {
+                read *= 2;
+                continue;
+            }
+            offset += stop;
+            read = 1 + rng.next(64);
+        }
+        (hits, line)
+    }
+
+    #[test]
+    fn test_log_parse_grep_lines_window_cursor_and_decline() {
+        let input = b"3:120:needle one\n\n7:400:a:b\nnoise\n9:512:x\n12:900:tail";
+        let mut window = vec![0i64; LOG_WINDOW_HEADER + 2 * 16];
+        let parsed = unsafe { nntmux_log_parse_grep_lines(input.as_ptr(), input.len(), i64::MAX, 16, window.as_mut_ptr()) };
+        assert_eq!(parsed, 4);
+        assert_eq!(log_window_hits(&window, 16), (vec![[120, 3], [400, 7], [512, 9], [900, 12]], 4, 4));
+
+        // The window persists across calls: the cursor drops 900, and only the newest two eligible hits stay.
+        let mut window = vec![0i64; LOG_WINDOW_HEADER + 2 * 2];
+        for _ in 0..2 {
+            let parsed = unsafe { nntmux_log_parse_grep_lines(input.as_ptr(), input.len(), 600, 2, window.as_mut_ptr()) };
+            assert_eq!(parsed, 4);
+        }
+        assert_eq!(log_window_hits(&window, 2), (vec![[400, 7], [512, 9]], 8, 6));
+
+        let snapshot = window.clone();
+        for odd in [&b" 3:120:x"[..], b"3:1e3:x", b":5:x", b"3:-1:x", b"1234567890123456789:1:x", b"1:2:ok\n3:x:no"] {
+            let parsed = unsafe { nntmux_log_parse_grep_lines(odd.as_ptr(), odd.len(), i64::MAX, 2, window.as_mut_ptr()) };
+            assert_eq!(parsed, LOG_SEARCH_DECLINED);
+            assert_eq!(window, snapshot);
+        }
+
+        let mut corrupt = vec![0i64, 3, 0, 0, 0, 0, 0, 0];
+        let parsed = unsafe { nntmux_log_parse_grep_lines(input.as_ptr(), input.len(), i64::MAX, 2, corrupt.as_mut_ptr()) };
+        assert_eq!(parsed, -1);
+    }
+
+    #[test]
+    fn test_log_scan_chunk_hits_matches_line_reference() {
+        let pieces: [&[u8]; 14] = [
+            b"[2026-10-01 10:00:00] local.INFO: needle one",
+            b"[2026-10-01 10:01:00] app.jobs.ERROR: Boom NEEDLE",
+            b"#0 needle in trace\r",
+            b"[x]\t\x0blocal.WARNING:",
+            b"[x] .WARNING:",
+            b"[x] local.WARNINGS:",
+            b"[x]local.INFO:",
+            b"",
+            b"\r\r",
+            b"nee\rdle",
+            b"[] a-b.c.DEBUG: x",
+            b"\xc3\xa9needle\xff",
+            b"[x] local.EMERGENCY: neeDle",
+            b"needl",
+        ];
+        let mut rng = LogLcg(20261024);
+        for round in 0..400 {
+            let mut data = Vec::new();
+            for _ in 0..rng.next(30) {
+                data.extend_from_slice(pieces[rng.next(pieces.len())]);
+                if rng.next(10) > 0 {
+                    data.push(b'\n');
+                }
+            }
+            let mask = if round % 3 == 0 { 0xFF } else { rng.next(256) as u32 };
+            let level = log_reference_hits(&data, &|c| log_reference_level(c, mask));
+            assert_eq!(log_scan_all(&data, LOG_SCAN_LEVEL_HEADER, b"", mask, &mut rng), level, "level {mask}");
+
+            for term in [&b"needle"[..], b"NEEDLE", b"e", b"ne", b"\xc3\xa9N", b"]", b"needle\xff"] {
+                let exact = log_reference_hits(&data, &|c| c.windows(term.len()).any(|w| w == term));
+                assert_eq!(log_scan_all(&data, LOG_SCAN_CASE_SENSITIVE, term, 0, &mut rng), exact);
+                let folded = log_reference_hits(&data, &|c| c.windows(term.len()).any(|w| w.eq_ignore_ascii_case(term)));
+                assert_eq!(log_scan_all(&data, LOG_SCAN_CASE_INSENSITIVE, term, 0, &mut rng), folded);
+            }
+        }
+    }
+
+    #[test]
+    fn test_log_scan_chunk_hits_defers_long_level_tokens_and_rejects_line_breaking_terms() {
+        let mut data = b"[x] ".to_vec();
+        data.extend(std::iter::repeat_n(b'a', LOG_LEVEL_TOKEN_DEFER_BYTES + 1));
+        data.extend_from_slice(b".INFO: x\n[x] local.INFO: y\n");
+        let mut window = vec![0i64; LOG_WINDOW_HEADER + 2 * 8];
+        let mut state = [0i64; 3];
+        let found = unsafe {
+            nntmux_log_scan_chunk_hits(
+                data.as_ptr(), data.len(), 0, 1, LOG_SCAN_LEVEL_HEADER, std::ptr::null(), 0, 0xFF, 0, 0, i64::MAX, 8,
+                window.as_mut_ptr(), state.as_mut_ptr(),
+            )
+        };
+        assert_eq!(found, 0);
+        assert_eq!(state, [0, 0, 1]);
+
+        let resume = data.iter().position(|&b| b == b'\n').unwrap() + 1;
+        let found = unsafe {
+            nntmux_log_scan_chunk_hits(
+                data.as_ptr(), data.len(), resume, 1, LOG_SCAN_LEVEL_HEADER, std::ptr::null(), 0, 0xFF, 1000, 1,
+                i64::MAX, 8, window.as_mut_ptr(), state.as_mut_ptr(),
+            )
+        };
+        assert_eq!(found, 1);
+        assert_eq!(state, [data.len() as i64, 2, 0]);
+        assert_eq!(log_window_hits(&window, 8), (vec![[1000 + resume as i64, 2]], 1, 1));
+
+        for term in [&b"a\nb"[..], b"a\r", b""] {
+            let found = unsafe {
+                nntmux_log_scan_chunk_hits(
+                    data.as_ptr(), data.len(), 0, 1, LOG_SCAN_CASE_SENSITIVE, term.as_ptr(), term.len(), 0, 0, 0,
+                    i64::MAX, 8, window.as_mut_ptr(), state.as_mut_ptr(),
+                )
+            };
+            assert_eq!(found, LOG_SEARCH_DECLINED);
+        }
+    }
+
+    #[test]
+    fn test_log_plain_ranges_and_index_match_expression() {
+        let text = b"Needle needleneedle NEEDLE";
+        let mut out = [0u8; 256];
+        let written = unsafe {
+            nntmux_log_plain_ranges(text.as_ptr(), text.len(), b"needle".as_ptr(), 6, 0, 3, out.as_mut_ptr(), out.len())
+        };
+        assert_eq!(log_decode_pairs(&out, written), vec![[0, 6], [7, 6], [13, 6]]);
+        let written = unsafe {
+            nntmux_log_plain_ranges(text.as_ptr(), text.len(), b"aa".as_ptr(), 2, 1, 3, out.as_mut_ptr(), out.len())
+        };
+        assert_eq!(written, 0);
+
+        let cases: [(&[u8], &[u8]); 6] = [
+            (b"Jobs\\ReindexRel", b"\"*jobs reindexrel*\""),
+            (b"Error", b"*error*"),
+            (b" ab cd ", b"\"ab cd\""),
+            (b"ab:", b""),
+            (b"!!", b""),
+            (b"x.ReindexRel", b"reindexrel*"),
+        ];
+        for (term, expected) in cases {
+            let written = unsafe {
+                nntmux_log_index_match_expression(term.as_ptr(), term.len(), 3, out.as_mut_ptr(), out.len())
+            };
+            assert_eq!(&out[..written as usize], expected);
+        }
+        let written = unsafe {
+            nntmux_log_index_match_expression("é".as_ptr(), 2, 3, out.as_mut_ptr(), out.len())
+        };
+        assert_eq!(written, LOG_SEARCH_DECLINED);
     }
 }
