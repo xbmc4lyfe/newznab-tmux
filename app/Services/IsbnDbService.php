@@ -6,6 +6,7 @@ namespace App\Services;
 
 use App\Exceptions\BookProviderException;
 use App\Support\BookIsbn;
+use App\Support\BookMatchScorer;
 use Carbon\Carbon;
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\GuzzleException;
@@ -16,6 +17,9 @@ use Psr\Http\Message\ResponseInterface;
 
 class IsbnDbService
 {
+    /** Null selects the benchmark-qualified production default. */
+    public ?bool $useRustFfi = null;
+
     public const COOLDOWN_CACHE_KEY = 'isbndb_provider_cooldown';
 
     protected const API_URL = 'https://api2.isbndb.com';
@@ -242,6 +246,54 @@ class IsbnDbService
      */
     private function normalizeBookResult(array $book): array
     {
+        return ($this->useRustFfi ?? false) ? $this->normalizeBookResultNative($book) : $this->normalizeBookResultPhp($book);
+    }
+
+    /**
+     * @param  array<string, mixed>  $book
+     * @return array<string, mixed>
+     */
+    public function normalizeBookResultNative(array $book): array
+    {
+        $date = $book['date_published'] ?? null;
+        $authors = is_array($book['authors'] ?? null) ? $book['authors'] : [];
+        $subjects = is_array($book['subjects'] ?? null) ? $book['subjects'] : [];
+        foreach ([$authors, $subjects] as $items) {
+            foreach ($items as $value) {
+                if (! is_scalar($value) && $value !== null) {
+                    return $this->normalizeBookResultPhp($book);
+                }
+            }
+        }
+        $fields = [is_string($date) ? '1' : '0', is_string($date) ? $date : '', (string) count($authors), (string) count($subjects)];
+        foreach ([$authors, $subjects] as $items) {
+            foreach ($items as $value) {
+                $fields[] = (string) $value;
+            }
+        }
+        $input = implode("\0", $fields)."\0";
+        if (substr_count($input, "\0") !== count($fields)) {
+            return $this->normalizeBookResultPhp($book);
+        }
+        $result = BookMatchScorer::rankingString('nntmux_isbndb_fields_nul', $input);
+        $parts = $result === null ? [] : explode("\0", $result);
+        if (count($parts) !== 5 || $parts[4] !== '') {
+            return $this->normalizeBookResultPhp($book);
+        }
+
+        return $this->normalizeBookResultPhp($book, [
+            'author' => $parts[2], 'genre' => $parts[3],
+            'publishdate' => $parts[0] === '1' ? ($parts[1] === '' ? null : $parts[1]) : $this->normalizePublishDate($date),
+        ]);
+    }
+
+    /**
+     * @param  array<string, mixed>  $book
+     * @param  array{author: string, genre: string, publishdate: ?string}|null  $nativeFields
+     * @return array<string, mixed>
+     */
+    public function normalizeBookResultPhp(array $book, ?array $nativeFields = null): array
+    {
         $isbn13 = isset($book['isbn13']) ? BookIsbn::normalize((string) $book['isbn13']) : null;
         if ($isbn13 === null && isset($book['isbn'])) {
             $isbn13 = BookIsbn::normalize((string) $book['isbn']);
@@ -255,10 +307,10 @@ class IsbnDbService
             $isbn10 = BookIsbn::toIsbn10($isbn10);
         }
 
-        $authors = is_array($book['authors'] ?? null)
+        $authors = $nativeFields === null && is_array($book['authors'] ?? null)
             ? array_values(array_filter(array_map('strval', $book['authors'])))
             : [];
-        $subjects = is_array($book['subjects'] ?? null)
+        $subjects = $nativeFields === null && is_array($book['subjects'] ?? null)
             ? array_values(array_filter(array_map('strval', $book['subjects'])))
             : [];
 
@@ -268,17 +320,17 @@ class IsbnDbService
 
         return [
             'title' => (string) ($book['title'] ?? ''),
-            'author' => implode(', ', $authors),
+            'author' => $nativeFields['author'] ?? implode(', ', $authors),
             'asin' => 'isbndb:'.$identifier,
             'isbn' => $isbn13,
             'ean' => $isbn10,
             'url' => '',
             'salesrank' => '',
             'publisher' => (string) ($book['publisher'] ?? ''),
-            'publishdate' => $this->normalizePublishDate($book['date_published'] ?? null),
+            'publishdate' => $nativeFields !== null ? $nativeFields['publishdate'] : $this->normalizePublishDate($book['date_published'] ?? null),
             'pages' => isset($book['pages']) && is_numeric($book['pages']) ? (string) ((int) $book['pages']) : '',
             'overview' => strip_tags($overview),
-            'genre' => implode(', ', $subjects),
+            'genre' => $nativeFields['genre'] ?? implode(', ', $subjects),
             'coverurl' => $coverUrl,
             'cover' => $coverUrl !== '' ? 1 : 0,
         ];
