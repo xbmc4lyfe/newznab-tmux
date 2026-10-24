@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Verification;
 
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 use RuntimeException;
@@ -18,6 +20,13 @@ use RuntimeException;
  */
 final class VerificationLedger
 {
+    private static bool $useRustFfi = true;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
     public const string LOCKS_TABLE = 'release_verification_locks';
 
     public const string PUBLICATION_LOCK = 'publication';
@@ -53,6 +62,12 @@ final class VerificationLedger
      */
     public static function publicationKeys(int $size, ?string $fingerprint, string $name, string $searchName, int $predbId): array
     {
+        return self::publicationKeysPhp($size, $fingerprint, $name, $searchName, $predbId);
+    }
+
+    /** @return list<string> */
+    public static function publicationKeysPhp(int $size, ?string $fingerprint, string $name, string $searchName, int $predbId): array
+    {
         $fold = static fn (string $value): string => (string) preg_replace('/[^a-z0-9]+/', '', strtolower(Str::ascii($value)));
 
         return array_values(array_filter([
@@ -66,7 +81,50 @@ final class VerificationLedger
 
     public static function publicationStripe(string $key): string
     {
+        return self::publicationStripePhp($key);
+    }
+
+    public static function publicationStripePhp(string $key): string
+    {
         return self::PUBLICATION_LOCK.':'.(crc32($key) % self::PUBLICATION_STRIPES);
+    }
+
+    /** @return list<string>|null */
+    public static function publicationKeysNative(int $size, ?string $fingerprint, string $name, string $searchName, int $predbId): ?array
+    {
+        if (! self::$useRustFfi || ($ffi = PreparedManifest::nativeLibrary()) === null) {
+            return null;
+        }
+        // Str::ascii's language tables remain the collation contract; include their cost in FFI timing.
+        $fold = static fn (string $value): string => (string) preg_replace('/[^a-z0-9]+/', '', strtolower(Str::ascii($value)));
+        $foldedName = $name === '' ? '' : $fold($name);
+        $foldedSearch = $searchName === '' ? '' : $fold($searchName);
+        $fingerprint ??= '';
+        $capacity = 0;
+        $buffer = RustPipelineLibrary::obtainScratch($ffi, strlen($fingerprint) + strlen($foldedName) + strlen($foldedSearch) + 256, $capacity);
+        if ($buffer === null) {
+            return null;
+        }
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_verification_publication_keys($size, $predbId, $fingerprint, strlen($fingerprint), $foldedName, strlen($foldedName), $foldedSearch, strlen($foldedSearch), (int) ($name !== ''), (int) ($searchName !== ''), $buffer, $capacity);
+        if (! is_int($written) || $written < 0 || $written > $capacity) {
+            return null;
+        }
+        // Length-delimited serialization preserves embedded NULs and newlines in fingerprints.
+        $keys = unserialize(FFI::string($buffer, $written), ['allowed_classes' => false]);
+
+        return is_array($keys) ? $keys : null;
+    }
+
+    public static function publicationStripeNative(string $key): ?string
+    {
+        if (! self::$useRustFfi || ($ffi = PreparedManifest::nativeLibrary()) === null) {
+            return null;
+        }
+        // @phpstan-ignore method.notFound
+        $stripe = $ffi->nntmux_verification_publication_stripe($key, strlen($key));
+
+        return $stripe >= 0 ? self::PUBLICATION_LOCK.':'.$stripe : null;
     }
 
     /**
