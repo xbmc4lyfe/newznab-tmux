@@ -4,9 +4,12 @@ declare(strict_types=1);
 
 namespace App\Services\LogViewer;
 
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Generator;
 use RuntimeException;
 use SplDoublyLinkedList;
+use Throwable;
 
 /**
  * Reads log entries without loading whole files: the latest entries are collected by reading
@@ -19,6 +22,21 @@ class LogReader
     private const int HEADER_SEARCH_BYTES = 262_144;
 
     private const int TRAILING_SCAN_FACTOR = 8;
+
+    /**
+     * Rust parity exports; the split and cap helpers stay in PHP (below the 1.5x adoption gate, see
+     * `tests/Unit/RustLogViewerAndAuditParserParityTest.php`).
+     */
+    public const string FFI_CDEF = <<<'C'
+        int64_t nntmux_logviewer_cap_len(size_t line_len, int64_t max_bytes);
+        ssize_t nntmux_logviewer_split_backward(const char *buf, size_t len, char *out_buf, size_t out_cap);
+        C;
+
+    private static bool $useRustFfi = true;
+
+    private static ?FFI $ffi = null;
+
+    private static bool $ffiResolved = false;
 
     public function __construct(
         private readonly LogEntryParser $parser,
@@ -292,17 +310,8 @@ class LogReader
                 continue;
             }
 
-            $parts = explode("\n", $chunk.implode('', $carry));
-            $head = array_shift($parts);
+            [$head, $parts, $offsets] = self::splitBackwardChunk($chunk.implode('', $carry), $position);
             $carry = [$head];
-
-            $offsets = [];
-            $cursor = $position + strlen($head) + 1;
-
-            foreach ($parts as $index => $part) {
-                $offsets[$index] = $cursor;
-                $cursor += strlen($part) + 1;
-            }
 
             for ($index = count($parts) - 1; $index >= 0; $index--) {
                 if ($atRegionEnd) {
@@ -324,6 +333,138 @@ class LogReader
         }
 
         return false;
+    }
+
+    /**
+     * Split a backward chunk (read at byte `$position`) on `\n`: the leading partial line, the complete
+     * lines after it, and each line's absolute byte offset.
+     *
+     * @return array{string, list<string>, list<int>}
+     */
+    public static function splitBackwardChunk(string $buffer, int $position): array
+    {
+        $parts = explode("\n", $buffer);
+        $head = (string) array_shift($parts);
+
+        $offsets = [];
+        $cursor = $position + strlen($head) + 1;
+
+        foreach ($parts as $index => $part) {
+            $offsets[$index] = $cursor;
+            $cursor += strlen($part) + 1;
+        }
+
+        return [$head, $parts, $offsets];
+    }
+
+    /**
+     * Rust parity helper for {@see splitBackwardChunk()}; null when the library is unavailable or disabled.
+     *
+     * @return array{string, list<string>, list<int>}|null
+     */
+    public static function splitBackwardChunkNative(string $buffer, int $position): ?array
+    {
+        $ffi = self::ffi();
+
+        if ($ffi === null) {
+            return null;
+        }
+
+        $length = strlen($buffer);
+        $capacity = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(256, $length), $capacity);
+
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $scratch === null ? null : $ffi->nntmux_logviewer_split_backward($buffer, $length, $scratch, $capacity);
+
+            if (is_int($written) && $written < 0) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                // @phpstan-ignore method.notFound
+                $written = $scratch === null ? null : $ffi->nntmux_logviewer_split_backward($buffer, $length, $scratch, $capacity);
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        if ($scratch === null || ! is_int($written) || $written < 0) {
+            return null;
+        }
+
+        /** @var list<int> $newlines */
+        $newlines = $written === 0 ? [] : array_values((array) unpack('q*', FFI::string($scratch, $written)));
+        $start = 0;
+        $head = $buffer;
+        $parts = [];
+        $offsets = [];
+
+        foreach ($newlines as $index => $newline) {
+            if ($index === 0) {
+                $head = substr($buffer, 0, $newline);
+            } else {
+                $parts[] = substr($buffer, $start, $newline - $start);
+            }
+
+            $offsets[] = $position + $newline + 1;
+            $start = $newline + 1;
+        }
+
+        if ($newlines !== []) {
+            $parts[] = substr($buffer, $start);
+        }
+
+        return [$head, $parts, $offsets];
+    }
+
+    /**
+     * Rust parity helper for {@see cap()}; null when the library is unavailable or disabled.
+     *
+     * @return array{string, bool}|null
+     */
+    public static function capNative(string $line, int $maxBytes): ?array
+    {
+        $ffi = self::ffi();
+
+        if ($ffi === null) {
+            return null;
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $kept = $ffi->nntmux_logviewer_cap_len(strlen($line), $maxBytes);
+        } catch (Throwable) {
+            return null;
+        }
+
+        if (! is_int($kept)) {
+            return null;
+        }
+
+        return $kept < 0 ? [substr($line, 0, -$kept - 1), true] : [$line, false];
+    }
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (! self::$useRustFfi) {
+            return null;
+        }
+
+        if (! self::$ffiResolved) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('search', self::FFI_CDEF);
+            self::$ffiResolved = true;
+        }
+
+        return self::$ffi;
     }
 
     /**

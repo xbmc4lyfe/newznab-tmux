@@ -6229,3 +6229,455 @@ mod wave11_tests {
         }
     }
 }
+// ---------------------------------------------------------------------------
+// Wave 12: log viewer backward scanner, log index documents, registration audit parser and
+// admin log search boundaries. Each export mirrors the PHP reference byte-for-byte.
+// ---------------------------------------------------------------------------
+
+/// PCRE's `\s` in the C locale (space, `\t`, `\n`, `\v`, `\f`, `\r`).
+#[inline]
+fn w12_pcre_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | 0x0B | 0x0C | b'\r')
+}
+
+#[inline]
+fn w12_channel_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-')
+}
+
+#[inline]
+unsafe fn w12_input<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+    if len == 0 {
+        Some(&[])
+    } else if ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+}
+
+/// `LogReader::cap()`: `strlen($line) > $maxBytes ? substr($line, 0, $maxBytes) : $line`.
+/// Returns the kept length when the line is not truncated and `-(kept + 1)` when it is.
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_logviewer_cap_len(line_len: usize, max_bytes: i64) -> i64 {
+    let len = line_len as i64;
+    if len > max_bytes {
+        let kept = if max_bytes >= 0 {
+            max_bytes
+        } else {
+            (len + max_bytes).max(0)
+        };
+        -(kept + 1)
+    } else {
+        len
+    }
+}
+
+/// Newline positions of a backward chunk (`explode("\n", $buffer)` in `LogReader::linesBackward()`).
+/// Writes each `\n` index as a native-endian `i64` into `out_buf` and returns the number of bytes
+/// written, `-(required)` when `out_cap` is too small, or `-1` for an invalid pointer.
+///
+/// # Safety
+/// `buf` must reference `len` readable bytes and `out_buf` `out_cap` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_logviewer_split_backward(
+    buf: *const u8,
+    len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    let Some(input) = (unsafe { w12_input(buf, len) }) else {
+        return -1;
+    };
+    if out_buf.is_null() && out_cap != 0 {
+        return -1;
+    }
+    let mut cursor = OutCursor::new(out_buf, out_cap);
+    let mut start = 0usize;
+    while let Some(found) = input[start..].iter().position(|&b| b == b'\n') {
+        let index = start + found;
+        cursor.push_slice(&(index as i64).to_ne_bytes());
+        start = index + 1;
+    }
+    if cursor.overflow {
+        -(cursor.len as isize)
+    } else {
+        cursor.len as isize
+    }
+}
+
+/// `LogIndex::documentId()`: `($fileId << 40) | $offset` with PHP's wrapping integer shift.
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_logviewer_document_id(file_id: i64, offset: i64) -> i64 {
+    (((file_id as u64) << 40) as i64) | offset
+}
+
+/// `preg_match('/^[A-Za-z0-9_]+$/', $table) === 1`, including `$` before one trailing newline.
+///
+/// # Safety
+/// `name` must reference `len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_logviewer_valid_table_name(name: *const u8, len: usize) -> i32 {
+    let Some(input) = (unsafe { w12_input(name, len) }) else {
+        return -1;
+    };
+    let body = input.strip_suffix(b"\n").unwrap_or(input);
+    i32::from(!body.is_empty() && body.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_'))
+}
+
+/// `mb_scrub($input, 'UTF-8')`: every maximal invalid subpart becomes one `?`.
+/// Returns `-1` when the input is already valid (nothing written), the written length otherwise,
+/// `-(required + 1)` when `out_cap` is too small, or `isize::MIN` for an invalid pointer.
+///
+/// # Safety
+/// `input` must reference `len` readable bytes and `out_buf` `out_cap` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_logviewer_scrub_utf8(
+    input: *const u8,
+    len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    let Some(mut rest) = (unsafe { w12_input(input, len) }) else {
+        return isize::MIN;
+    };
+    if std::str::from_utf8(rest).is_ok() {
+        return -1;
+    }
+    let mut cursor = OutCursor::new(out_buf, out_cap);
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(valid) => {
+                cursor.push_slice(valid.as_bytes());
+                break;
+            }
+            Err(error) => {
+                let good = error.valid_up_to();
+                cursor.push_slice(&rest[..good]);
+                cursor.push_byte(b'?');
+                match error.error_len() {
+                    Some(bad) => rest = &rest[good + bad..],
+                    None => break,
+                }
+            }
+        }
+    }
+    if cursor.overflow {
+        -(cursor.len as isize) - 1
+    } else {
+        cursor.len as isize
+    }
+}
+
+const W12_REGISTRATION_MAX_LINE: usize = 262_144;
+
+/// Byte ranges of `RegistrationFailureLogService::parseLine()`'s two Monolog patterns.
+///
+/// Writes `[ts_start, ts_len, level_start, level_len, message_start, message_len, context_start,
+/// context_len]` into `out` (context_start is `-1` for the context-less pattern). Returns `1` for the
+/// context pattern, `2` for the plain pattern, `0` when neither matches, and `-1` for input the PHP
+/// reference must handle (newlines, oversized lines, invalid pointers).
+///
+/// # Safety
+/// `line` must reference `len` readable bytes and `out` eight writable `i64` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_registration_parse_line(
+    line: *const u8,
+    len: usize,
+    out: *mut i64,
+) -> i32 {
+    if out.is_null() || len > W12_REGISTRATION_MAX_LINE {
+        return -1;
+    }
+    let Some(l) = (unsafe { w12_input(line, len) }) else {
+        return -1;
+    };
+    if l.contains(&b'\n') {
+        return -1;
+    }
+    let Some(found) = w12_registration_match(l) else {
+        return 0;
+    };
+    let (kind, values) = found;
+    let target = unsafe { slice::from_raw_parts_mut(out, 8) };
+    for (slot, value) in target.iter_mut().zip(values) {
+        *slot = value as i64;
+    }
+    kind
+}
+
+fn w12_registration_match(l: &[u8]) -> Option<(i32, [isize; 8])> {
+    let n = l.len();
+    if l.first() != Some(&b'[') {
+        return None;
+    }
+    let close = l[1..].iter().position(|&b| b == b']')? + 1;
+    if close == 1 {
+        return None;
+    }
+    let mut i = close + 1;
+    let ws_start = i;
+    while i < n && w12_pcre_space(l[i]) {
+        i += 1;
+    }
+    if i == ws_start {
+        return None;
+    }
+    let run_start = i;
+    while i < n && w12_channel_byte(l[i]) {
+        i += 1;
+    }
+    let run_end = i;
+    if run_end >= n || l[run_end] != b':' {
+        return None;
+    }
+    let dot = l[run_start..run_end].iter().rposition(|&b| b == b'.')? + run_start;
+    if dot == run_start || dot + 1 == run_end {
+        return None;
+    }
+    if !l[dot + 1..run_end].iter().all(u8::is_ascii_uppercase) {
+        return None;
+    }
+    let colon = run_end;
+    let mut w_end = colon + 1;
+    while w_end < n && w12_pcre_space(l[w_end]) {
+        w_end += 1;
+    }
+    let w_len = w_end - (colon + 1);
+    if w_len == 0 {
+        return None;
+    }
+    let head = [
+        1,
+        (close - 1) as isize,
+        (dot + 1) as isize,
+        (run_end - dot - 1) as isize,
+    ];
+
+    // Pattern 1: `(?<message>.*?)\s+(?<context>\{.*\})(?:\s+\[\])?$`.
+    let context_end = if l[n - 1] == b'}' {
+        Some(n - 1)
+    } else if l.ends_with(b"[]") {
+        let mut j = n - 2;
+        while j > 0 && w12_pcre_space(l[j - 1]) {
+            j -= 1;
+        }
+        (j < n - 2 && j > 0 && l[j - 1] == b'}').then(|| j - 1)
+    } else {
+        None
+    };
+    if let Some(e) = context_end {
+        let mut message_end = None;
+        let mut p = w_end;
+        while p < e {
+            if w12_pcre_space(l[p]) {
+                let mut q = p;
+                while q < n && w12_pcre_space(l[q]) {
+                    q += 1;
+                }
+                if q < e && l[q] == b'{' {
+                    message_end = Some((p, q));
+                    break;
+                }
+                p = q;
+            } else {
+                p += 1;
+            }
+        }
+        let resolved = match message_end {
+            Some((p, q)) => Some((w_end, p, q)),
+            // `:\s+` gives one whitespace back so an empty message can precede the context.
+            None if w_len >= 2 && w_end < e && l[w_end] == b'{' => {
+                Some((w_end - 1, w_end - 1, w_end))
+            }
+            None => None,
+        };
+        if let Some((message_start, p, q)) = resolved {
+            return Some((
+                1,
+                [
+                    head[0],
+                    head[1],
+                    head[2],
+                    head[3],
+                    message_start as isize,
+                    (p - message_start) as isize,
+                    q as isize,
+                    (e + 1 - q) as isize,
+                ],
+            ));
+        }
+    }
+
+    // Pattern 2: `(?<message>.+)$`.
+    let (message_start, message_len) = if w_end < n {
+        (w_end, n - w_end)
+    } else if w_len >= 2 {
+        (n - 1, 1)
+    } else {
+        return None;
+    };
+    Some((
+        2,
+        [
+            head[0],
+            head[1],
+            head[2],
+            head[3],
+            message_start as isize,
+            message_len as isize,
+            -1,
+            0,
+        ],
+    ))
+}
+
+#[inline]
+fn w12_strip_final_newline(value: &[u8]) -> Option<&[u8]> {
+    value.strip_suffix(b"\n")
+}
+
+#[inline]
+fn w12_is_date(value: &[u8]) -> bool {
+    value.len() == 10
+        && value.iter().enumerate().all(|(index, &b)| {
+            if index == 4 || index == 7 {
+                b == b'-'
+            } else {
+                b.is_ascii_digit()
+            }
+        })
+}
+
+#[inline]
+fn w12_ends_minute(value: &[u8]) -> bool {
+    let n = value.len();
+    n >= 6 && {
+        let tail = &value[n - 6..];
+        matches!(tail[0], b'T' | b' ')
+            && tail[1].is_ascii_digit()
+            && tail[2].is_ascii_digit()
+            && tail[3] == b':'
+            && tail[4].is_ascii_digit()
+            && tail[5].is_ascii_digit()
+    }
+}
+
+/// `AdminLogSearchRequest` boundary shape: `1` for `^\d{4}-\d{2}-\d{2}$`, `2` for `[T ]\d{2}:\d{2}$`,
+/// `0` otherwise (PCRE's `$` also matches before one final newline). `-1` for an invalid pointer.
+///
+/// # Safety
+/// `value` must reference `len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_admin_log_boundary_shape(value: *const u8, len: usize) -> i32 {
+    let Some(input) = (unsafe { w12_input(value, len) }) else {
+        return -1;
+    };
+    let stripped = w12_strip_final_newline(input);
+    if w12_is_date(input) || stripped.is_some_and(w12_is_date) {
+        return 1;
+    }
+    if w12_ends_minute(input) || stripped.is_some_and(w12_ends_minute) {
+        return 2;
+    }
+    0
+}
+
+#[cfg(test)]
+mod wave12_tests {
+    use super::*;
+
+    fn parse(line: &[u8]) -> (i32, [i64; 8]) {
+        let mut out = [0i64; 8];
+        let kind =
+            unsafe { nntmux_registration_parse_line(line.as_ptr(), line.len(), out.as_mut_ptr()) };
+        (kind, out)
+    }
+
+    fn range(line: &[u8], start: i64, len: i64) -> &[u8] {
+        &line[start as usize..(start + len) as usize]
+    }
+
+    #[test]
+    fn registration_context_line() {
+        let line = br#"[2026-10-24 10:00:00] production.WARNING: Registration attempt failed: {"reason":"x","ip":"1.2.3.4"} []"#;
+        let (kind, out) = parse(line);
+        assert_eq!(kind, 1);
+        assert_eq!(range(line, out[0], out[1]), b"2026-10-24 10:00:00");
+        assert_eq!(range(line, out[2], out[3]), b"WARNING");
+        assert_eq!(range(line, out[4], out[5]), b"Registration attempt failed:");
+        assert_eq!(
+            range(line, out[6], out[7]),
+            br#"{"reason":"x","ip":"1.2.3.4"}"#
+        );
+    }
+
+    #[test]
+    fn registration_plain_and_empty_message() {
+        let line = b"[ts] a.b.ERROR: plain message";
+        let (kind, out) = parse(line);
+        assert_eq!(kind, 2);
+        assert_eq!(range(line, out[2], out[3]), b"ERROR");
+        assert_eq!(range(line, out[4], out[5]), b"plain message");
+
+        let line = b"[ts] a.ERROR:  {}";
+        let (kind, out) = parse(line);
+        assert_eq!(kind, 1);
+        assert_eq!(out[5], 0);
+        assert_eq!(range(line, out[6], out[7]), b"{}");
+
+        assert_eq!(parse(b"[ts] a.ERROR: ").0, 0);
+        assert_eq!(parse(b"[ts] a.Error: x").0, 0);
+        assert_eq!(parse(b"[ts] a.ERROR: x\ny").0, -1);
+    }
+
+    #[test]
+    fn boundary_and_table_shapes() {
+        let shape = |v: &[u8]| unsafe { nntmux_admin_log_boundary_shape(v.as_ptr(), v.len()) };
+        assert_eq!(shape(b"2026-10-24"), 1);
+        assert_eq!(shape(b"2026-10-24\n"), 1);
+        assert_eq!(shape(b"2026-10-24T10:30"), 2);
+        assert_eq!(shape(b"2026-10-24 10:30\n"), 2);
+        assert_eq!(shape(b"2026-10-24T10:30:15"), 0);
+        let table = |v: &[u8]| unsafe { nntmux_logviewer_valid_table_name(v.as_ptr(), v.len()) };
+        assert_eq!(table(b"log_entries"), 1);
+        assert_eq!(table(b"log_entries\n"), 1);
+        assert_eq!(table(b"\n"), 0);
+        assert_eq!(table(b"bad-name"), 0);
+        assert_eq!(table(b""), 0);
+    }
+
+    #[test]
+    fn scrub_document_cap_and_split() {
+        let mut out = [0u8; 32];
+        let scrub = |v: &[u8], out: &mut [u8]| unsafe {
+            nntmux_logviewer_scrub_utf8(v.as_ptr(), v.len(), out.as_mut_ptr(), out.len())
+        };
+        assert_eq!(scrub("é ok".as_bytes(), &mut out), -1);
+        let written = scrub(b"a\xed\xa0\x80b\xf0\x9f\x98", &mut out);
+        assert_eq!(&out[..written as usize], b"a???b?");
+        assert_eq!(scrub(b"\xff\xff", &mut out[..1]), -3);
+
+        assert_eq!(nntmux_logviewer_document_id(3, 17), (3 << 40) | 17);
+        assert_eq!(nntmux_logviewer_document_id(-1, 0), -1i64 << 40);
+        assert_eq!(nntmux_logviewer_cap_len(10, 20), 10);
+        assert_eq!(nntmux_logviewer_cap_len(10, 4), -5);
+        assert_eq!(nntmux_logviewer_cap_len(3, -5), -1);
+
+        let mut buf = [0u8; 64];
+        let data = b"ab\n\ncd\n";
+        let written = unsafe {
+            nntmux_logviewer_split_backward(data.as_ptr(), data.len(), buf.as_mut_ptr(), buf.len())
+        };
+        assert_eq!(written, 24);
+        let indices: Vec<i64> = buf[..24]
+            .chunks_exact(8)
+            .map(|c| i64::from_ne_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(indices, vec![2, 3, 6]);
+        let needed = unsafe {
+            nntmux_logviewer_split_backward(data.as_ptr(), data.len(), buf.as_mut_ptr(), 8)
+        };
+        assert_eq!(needed, -24);
+    }
+}
