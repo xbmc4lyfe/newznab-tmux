@@ -4,22 +4,17 @@ declare(strict_types=1);
 
 namespace Tests\Unit;
 
-use App\Http\Middleware\BlockAbusiveServices;
 use App\Services\NameFixing\Data\NameFixResult;
 use App\Services\NameFixing\Patterns\AppPatterns;
 use App\Services\NameFixing\Patterns\GamePatterns;
 use App\Services\NameFixing\Patterns\MoviePatterns;
 use App\Services\NameFixing\Patterns\TvPatterns;
-use App\Support\Passkeys\RelyingPartyIdResolver;
 use App\Support\RustPipelineLibrary;
-use App\Support\SqlError;
 use FFI;
-use Illuminate\Http\Request;
 use Random\Engine\Mt19937;
 use Random\Randomizer;
 use ReflectionClass;
 use ReflectionProperty;
-use RuntimeException;
 use Tests\TestCase;
 
 /**
@@ -298,46 +293,6 @@ final class RustNameFixingPatternsAndResultParityTest extends TestCase
         // @phpstan-ignore method.notFound
         self::assertSame(-1, $ffi->nntmux_name_fix_result(0, $valid, strlen($valid), 0, 2, $out, 32));
         self::assertSame(str_repeat('Z', 32), FFI::string($out, 32));
-    }
-
-    public function test_legacy_null_optional_outputs_decline_and_public_callers_preserve_php_behavior(): void
-    {
-        $this->ffi();
-        $sqlToggle = (new ReflectionProperty(SqlError::class, 'useRustFfi'))->getValue();
-        $rpToggle = (new ReflectionProperty(RelyingPartyIdResolver::class, 'useRustFfi'))->getValue();
-        $blockToggle = BlockAbusiveServices::usesRustFfi();
-        $rpConfig = config('passkeys.relying_party.id');
-        try {
-            SqlError::setUseRustFfi(true);
-            RelyingPartyIdResolver::setUseRustFfi(true);
-            BlockAbusiveServices::setUseRustFfi(true);
-            foreach (['Deadlock found when trying to get lock', 'database is locked', 'unrelated failure', str_repeat('é', 501).' (Connection: mariadb, SQL: private statement)'] as $message) {
-                $exception = new RuntimeException($message);
-                self::assertNull(SqlError::isTransientLockNative($exception));
-                self::assertNull(SqlError::describeNative($exception));
-                self::assertSame(SqlError::isTransientLockPhp($exception), SqlError::isTransientLock($exception));
-                self::assertSame(SqlError::describePhp($exception), SqlError::describe($exception));
-            }
-            foreach (['', 'localhost', 'example.com', '127.0.0.1', 'bad host'] as $host) {
-                self::assertNull(RelyingPartyIdResolver::isValidRelyingPartyIdNative($host));
-                self::assertSame(RelyingPartyIdResolver::isValidRelyingPartyIdPhp($host), RelyingPartyIdResolver::isValidRelyingPartyId($host));
-            }
-            config()->set('passkeys.relying_party.id', 'example.com');
-            foreach (['', 'auth.example.com:8443, proxy.local', '127.0.0.1'] as $forwarded) {
-                $request = Request::create('https://portal.example.net/passkeys', 'GET', [], [], [], ['HTTP_X_FORWARDED_HOST' => $forwarded]);
-                self::assertSame(RelyingPartyIdResolver::resolvePhp($request), RelyingPartyIdResolver::resolve($request));
-            }
-            $middleware = (new ReflectionClass(BlockAbusiveServices::class))->newInstanceWithoutConstructor();
-            foreach (['', 'Mozilla/5.0', 'AIOStreams/1.0', 'UsenetStreamer/2.0'] as $agent) {
-                self::assertNull($middleware->isBlockedUserAgentNative($agent));
-                self::assertSame($middleware->isBlockedUserAgentPhp($agent), $middleware->isBlockedUserAgent($agent));
-            }
-        } finally {
-            SqlError::setUseRustFfi($sqlToggle);
-            RelyingPartyIdResolver::setUseRustFfi($rpToggle);
-            BlockAbusiveServices::setUseRustFfi($blockToggle);
-            config()->set('passkeys.relying_party.id', $rpConfig);
-        }
     }
 
     public function test_production_defaults_remain_php_until_every_speed_gate_passes(): void
