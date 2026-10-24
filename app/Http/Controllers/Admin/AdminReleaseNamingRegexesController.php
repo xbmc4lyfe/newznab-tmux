@@ -48,28 +48,18 @@ class AdminReleaseNamingRegexesController extends BasePageController
 
         // Set the current action.
         $action = $this->formAction($request);
-        $error = '';
         $regex = ['id' => '', 'group_regex' => '', 'regex' => '', 'description' => '', 'ordinal' => '', 'status' => 1];
         $meta_title = $title = 'Release Naming Regex';
 
+        $state = self::validateForm($action, $request->all());
+        $error = $state['error'];
+
         switch ($action) {
             case 'submit':
-                if (empty($request->input('group_regex'))) {
-                    $error = 'Group regex must not be empty!';
-                    break;
+                if (array_key_exists('description', $state['input'])) {
+                    $request->merge(['description' => $state['input']['description']]);
                 }
-
-                if (empty($request->input('regex'))) {
-                    $error = 'Regex cannot be empty';
-                    break;
-                }
-
-                if (empty($request->input('description'))) {
-                    $request->merge(['description' => '']);
-                }
-
-                if (! is_numeric($request->input('ordinal')) || $request->input('ordinal') < 0) {
-                    $error = 'Ordinal must be a number, 0 or higher.';
+                if ($error !== '') {
                     break;
                 }
 
@@ -85,7 +75,7 @@ class AdminReleaseNamingRegexesController extends BasePageController
             default:
                 if ($request->has('id')) {
                     $meta_title = $title = 'Release Naming Regex Edit';
-                    $id = filter_var($request->input('id'), FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+                    $id = $state['id'];
                     if ($id === false) {
                         abort(404);
                     }
@@ -118,10 +108,11 @@ class AdminReleaseNamingRegexesController extends BasePageController
         $this->setAdminPrefs();
         $meta_title = $title = 'Release Naming Regex Test';
 
-        $group = trim($request->has('group') && ! empty($request->input('group')) ? $request->input('group') : '');
-        $regex = trim($request->has('regex') && ! empty($request->input('regex')) ? $request->input('regex') : '');
-        $showLimit = ($request->has('showlimit') && is_numeric($request->input('showlimit')) ? $request->input('showlimit') : 250);
-        $queryLimit = ($request->has('querylimit') && is_numeric($request->input('querylimit')) ? $request->input('querylimit') : 100000);
+        $parameters = self::normalizeTestParameters($request->all());
+        $group = $parameters['group'];
+        $regex = $parameters['regex'];
+        $showLimit = $parameters['showlimit'];
+        $queryLimit = $parameters['querylimit'];
 
         $data = null;
         if ($group && $regex) {
@@ -139,5 +130,90 @@ class AdminReleaseNamingRegexesController extends BasePageController
         ]);
 
         return view('admin.regexes.release-naming-test', $this->viewData);
+    }
+
+    // PHP stays the default until every paired common/p99 benchmark clears 1.5x.
+    private static ?bool $useRustFfi = null;
+
+    public static function setUseRustFfi(?bool $useRustFfi): void
+    {
+        self::$useRustFfi = $useRustFfi;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? false;
+    }
+
+    /** @param array<string, mixed> $input
+     * @return array<string, mixed>
+     */
+    public static function validateForm(string $action, array $input): array
+    {
+        return self::usesRustFfi() ? self::validateFormNative($action, $input) : self::validateFormPhp($action, $input);
+    }
+
+    /** @param array<string, mixed> $input
+     * @return array<string, mixed>
+     */
+    public static function validateFormPhp(string $action, array $input): array
+    {
+        $error = '';
+        $id = null;
+        if ($action === 'submit') {
+            if (empty($input['group_regex'])) {
+                $error = 'Group regex must not be empty!';
+            } elseif (empty($input['regex'])) {
+                $error = 'Regex cannot be empty';
+            } else {
+                if (empty($input['description'])) {
+                    $input['description'] = '';
+                }
+                if (! is_numeric($input['ordinal'] ?? null) || $input['ordinal'] < 0) {
+                    $error = 'Ordinal must be a number, 0 or higher.';
+                }
+            }
+        } elseif (array_key_exists('id', $input)) {
+            $id = filter_var($input['id'], FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+        }
+
+        return ['error' => $error, 'input' => $input, 'id' => $id];
+    }
+
+    /** @param array<string, mixed> $input
+     * @return array<string, mixed>
+     */
+    public static function validateFormNative(string $action, array $input): array
+    {
+        return AdminBlacklistController::wave28Native(7, ['action' => $action, 'input' => $input]) ?? self::validateFormPhp($action, $input);
+    }
+
+    /** @param array<string, mixed> $input
+     * @return array<string, mixed>
+     */
+    public static function normalizeTestParameters(array $input): array
+    {
+        return self::usesRustFfi() ? self::normalizeTestParametersNative($input) : self::normalizeTestParametersPhp($input);
+    }
+
+    /** @param array<string, mixed> $input
+     * @return array<string, mixed>
+     */
+    public static function normalizeTestParametersPhp(array $input): array
+    {
+        return [
+            'group' => trim(! empty($input['group']) ? $input['group'] : ''),
+            'regex' => trim(! empty($input['regex']) ? $input['regex'] : ''),
+            'showlimit' => is_numeric($input['showlimit'] ?? null) ? $input['showlimit'] : 250,
+            'querylimit' => is_numeric($input['querylimit'] ?? null) ? $input['querylimit'] : 100000,
+        ];
+    }
+
+    /** @param array<string, mixed> $input
+     * @return array<string, mixed>
+     */
+    public static function normalizeTestParametersNative(array $input): array
+    {
+        return AdminBlacklistController::wave28Native(8, ['input' => $input]) ?? self::normalizeTestParametersPhp($input);
     }
 }

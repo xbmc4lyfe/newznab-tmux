@@ -17361,3 +17361,1309 @@ pub unsafe extern "C" fn nntmux_w27_account_mail_dispatch_jobs(
     }))
     .unwrap_or(-1)
 }
+/// Pure decisions used by the Wave 28.1 admin regex and group controllers.
+pub mod wave28_admin_regex_group_controllers {
+    use super::{remover_is_numeric, wave22_append_frame, wave22_canonical_i64, wave22_frames};
+    use std::collections::HashSet;
+
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+    enum Key {
+        Int(i64),
+        String(Vec<u8>),
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Node {
+        Null,
+        Bool(bool),
+        Int(i64),
+        Float(Vec<u8>),
+        String(Vec<u8>),
+        Array(Vec<(Key, Node)>),
+    }
+
+    fn string(value: impl AsRef<[u8]>) -> Node {
+        Node::String(value.as_ref().to_vec())
+    }
+
+    fn map(values: Vec<(&str, Node)>) -> Node {
+        Node::Array(
+            values
+                .into_iter()
+                .map(|(key, value)| (Key::String(key.as_bytes().to_vec()), value))
+                .collect(),
+        )
+    }
+
+    fn list(values: Vec<Node>) -> Node {
+        Node::Array(
+            values
+                .into_iter()
+                .enumerate()
+                .map(|(key, value)| (Key::Int(key as i64), value))
+                .collect(),
+        )
+    }
+
+    fn array(node: &Node) -> Result<&[(Key, Node)], isize> {
+        match node {
+            Node::Array(values) => Ok(values),
+            _ => Err(-1),
+        }
+    }
+
+    fn field<'a>(values: &'a [(Key, Node)], name: &str) -> &'a Node {
+        values
+            .iter()
+            .find_map(|(key, value)| match key {
+                Key::String(key) if key == name.as_bytes() => Some(value),
+                _ => None,
+            })
+            .unwrap_or(&Node::Null)
+    }
+
+    fn has(values: &[(Key, Node)], name: &str) -> bool {
+        values
+            .iter()
+            .any(|(key, _)| matches!(key, Key::String(key) if key == name.as_bytes()))
+    }
+
+    fn set(values: &mut Vec<(Key, Node)>, name: &str, value: Node) {
+        if let Some((_, current)) = values
+            .iter_mut()
+            .find(|(key, _)| matches!(key, Key::String(key) if key == name.as_bytes()))
+        {
+            *current = value;
+        } else {
+            values.push((Key::String(name.as_bytes().to_vec()), value));
+        }
+    }
+
+    fn bytes(node: &Node) -> Result<&[u8], isize> {
+        match node {
+            Node::String(value) => Ok(value),
+            _ => Err(-1),
+        }
+    }
+
+    fn action(values: &[(Key, Node)]) -> Result<&[u8], isize> {
+        match field(values, "action") {
+            Node::Null => Ok(b""),
+            value => bytes(value),
+        }
+    }
+
+    fn request(values: &[(Key, Node)]) -> Result<Vec<(Key, Node)>, isize> {
+        match field(values, "input") {
+            Node::Null => Ok(Vec::new()),
+            value => Ok(array(value)?.to_vec()),
+        }
+    }
+
+    fn canonical_count(value: &[u8]) -> Result<usize, isize> {
+        let text = std::str::from_utf8(value).map_err(|_| -1isize)?;
+        let count = text.parse::<usize>().map_err(|_| -1isize)?;
+        if count.to_string().as_bytes() != value {
+            return Err(-1);
+        }
+        Ok(count)
+    }
+
+    fn key_identity(key: &Key) -> Key {
+        match key {
+            Key::String(value) => wave22_canonical_i64(value)
+                .map(Key::Int)
+                .unwrap_or_else(|_| key.clone()),
+            _ => key.clone(),
+        }
+    }
+
+    fn parse_node(
+        frames: &[Option<&[u8]>],
+        cursor: &mut usize,
+        depth: usize,
+    ) -> Result<Node, isize> {
+        if depth > 64 {
+            return Err(-1);
+        }
+        let frame = frames
+            .get(*cursor)
+            .and_then(|value| *value)
+            .ok_or(-1isize)?;
+        *cursor += 1;
+        let (&kind, value) = frame.split_first().ok_or(-1isize)?;
+        match kind {
+            b'n' if value.is_empty() => Ok(Node::Null),
+            b'b' if value == b"0" => Ok(Node::Bool(false)),
+            b'b' if value == b"1" => Ok(Node::Bool(true)),
+            b'i' => Ok(Node::Int(wave22_canonical_i64(value)?)),
+            b'f' if !value.is_empty()
+                && remover_is_numeric(value)
+                && !value
+                    .iter()
+                    .any(|byte| byte.is_ascii_whitespace() || *byte == 0x0b) =>
+            {
+                let text = std::str::from_utf8(value).map_err(|_| -1isize)?;
+                // Non-finite values use the PHP fallback, including overflowing decimals.
+                if !text.parse::<f64>().map_err(|_| -1isize)?.is_finite() {
+                    return Err(-1);
+                }
+                Ok(Node::Float(value.to_vec()))
+            }
+            b's' => Ok(Node::String(value.to_vec())),
+            b'a' => {
+                let count = canonical_count(value)?;
+                if count > frames.len().saturating_sub(*cursor) / 2 {
+                    return Err(-1);
+                }
+                let mut values = Vec::with_capacity(count);
+                let mut keys = HashSet::with_capacity(count);
+                for _ in 0..count {
+                    let key = match parse_node(frames, cursor, depth + 1)? {
+                        Node::Int(value) => Key::Int(value),
+                        Node::String(value) => Key::String(value),
+                        _ => return Err(-1),
+                    };
+                    if !keys.insert(key_identity(&key)) {
+                        return Err(-1);
+                    }
+                    let value = parse_node(frames, cursor, depth + 1)?;
+                    values.push((key, value));
+                }
+                Ok(Node::Array(values))
+            }
+            _ => Err(-1),
+        }
+    }
+
+    fn decode(input: &[u8]) -> Result<Node, isize> {
+        let frames = wave22_frames(input)?;
+        if frames.iter().any(Option::is_none) {
+            return Err(-1);
+        }
+        let mut cursor = 0;
+        let root = parse_node(&frames, &mut cursor, 0)?;
+        array(&root)?;
+        if cursor != frames.len() {
+            return Err(-1);
+        }
+        Ok(root)
+    }
+
+    fn encode_node(node: &Node, output: &mut Vec<u8>) -> Result<(), isize> {
+        let frame = match node {
+            Node::Null => b"n".to_vec(),
+            Node::Bool(false) => b"b0".to_vec(),
+            Node::Bool(true) => b"b1".to_vec(),
+            Node::Int(value) => [b"i".as_slice(), value.to_string().as_bytes()].concat(),
+            Node::Float(value) => [b"f".as_slice(), value].concat(),
+            Node::String(value) => [b"s".as_slice(), value].concat(),
+            Node::Array(values) => [b"a".as_slice(), values.len().to_string().as_bytes()].concat(),
+        };
+        wave22_append_frame(output, Some(&frame))?;
+        if let Node::Array(values) = node {
+            for (key, value) in values {
+                match key {
+                    Key::Int(value) => encode_node(&Node::Int(*value), output)?,
+                    Key::String(value) => encode_node(&Node::String(value.clone()), output)?,
+                }
+                encode_node(value, output)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn empty(node: &Node) -> bool {
+        match node {
+            Node::Null | Node::Bool(false) | Node::Int(0) => true,
+            Node::Float(value) => std::str::from_utf8(value)
+                .ok()
+                .and_then(|text| text.parse::<f64>().ok())
+                .is_some_and(|value| value == 0.0),
+            Node::String(value) => value.is_empty() || value == b"0",
+            Node::Array(value) => value.is_empty(),
+            _ => false,
+        }
+    }
+
+    fn numeric(node: &Node) -> bool {
+        match node {
+            Node::Int(_) | Node::Float(_) => true,
+            Node::String(value) => remover_is_numeric(value),
+            _ => false,
+        }
+    }
+
+    fn trim_numeric(value: &[u8]) -> &[u8] {
+        let is_space = |byte: &u8| matches!(byte, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r');
+        let start = value
+            .iter()
+            .position(|byte| !is_space(byte))
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|byte| !is_space(byte))
+            .map_or(start, |index| index + 1);
+        &value[start..end]
+    }
+
+    fn nonnegative_numeric(node: &Node) -> bool {
+        match node {
+            Node::Int(value) => *value >= 0,
+            Node::Float(value) | Node::String(value) if numeric(node) => {
+                let trimmed = trim_numeric(value);
+                std::str::from_utf8(trimmed)
+                    .ok()
+                    .and_then(|text| text.parse::<f64>().ok())
+                    .is_some_and(|value| value >= 0.0)
+            }
+            _ => false,
+        }
+    }
+
+    fn validate_id(node: &Node) -> Result<Node, isize> {
+        let parsed = match node {
+            Node::Bool(true) => Some(1),
+            Node::Int(value) => Some(*value),
+            Node::Float(value) => {
+                let value = std::str::from_utf8(value)
+                    .map_err(|_| -1isize)?
+                    .parse::<f64>()
+                    .map_err(|_| -1isize)?;
+                // PHP's float string cast uses configured precision. Decline cases
+                // where rounding or scientific notation can affect FILTER_VALIDATE_INT.
+                if value.fract() != 0.0 || value.abs() >= 1e14 {
+                    return Err(-1);
+                }
+                Some(value as i64)
+            }
+            Node::String(value) => {
+                // FILTER_VALIDATE_INT trims SP/HT/LF/CR/VT, but not form feed.
+                if value.contains(&0x0c) {
+                    return Ok(Node::Bool(false));
+                }
+                let trimmed = trim_numeric(value);
+                let value = trimmed.strip_prefix(b"+").unwrap_or(trimmed);
+                wave22_canonical_i64(value).ok()
+            }
+            _ => None,
+        };
+        Ok(parsed
+            .filter(|value| *value >= 1)
+            .map(Node::Int)
+            .unwrap_or(Node::Bool(false)))
+    }
+
+    fn blacklist_defaults() -> Node {
+        map(vec![
+            ("id", string(b"")),
+            ("groupname", string(b"")),
+            ("regex", string(b"")),
+            ("description", string(b"")),
+            ("msgcol", Node::Int(1)),
+            ("status", Node::Int(1)),
+            ("optype", Node::Int(1)),
+        ])
+    }
+
+    fn blacklist(values: &[(Key, Node)]) -> Result<Node, isize> {
+        let request = request(values)?;
+        let action = action(values)?;
+        let mut regex = blacklist_defaults();
+        let mut error = b"".as_slice();
+        let mut title = b"Binary Black/White list".as_slice();
+        let mut save = Node::Null;
+        let mut load = false;
+        match action {
+            b"submit" => {
+                if matches!(field(&request, "groupname"), Node::String(value) if value.is_empty()) {
+                    error = b"Group must be a valid usenet group";
+                } else if matches!(field(&request, "regex"), Node::String(value) if value.is_empty())
+                {
+                    error = b"Regex cannot be empty";
+                } else {
+                    save = string(if empty(field(&request, "id")) {
+                        b"add".as_slice()
+                    } else {
+                        b"update".as_slice()
+                    });
+                }
+            }
+            b"addtest" => {
+                if has(&request, "regex") && has(&request, "groupname") {
+                    if let Node::Array(values) = &mut regex {
+                        set(values, "ordinal", Node::Int(1));
+                    }
+                }
+            }
+            _ if has(&request, "id") => {
+                title = b"Binary Black/Whitelist Edit";
+                load = true;
+            }
+            _ => title = b"Binary Black/Whitelist Add",
+        }
+        Ok(map(vec![
+            ("error", string(error)),
+            ("regex", regex),
+            ("title", string(title)),
+            ("meta_title", string(b"Binary Black/White list")),
+            ("save", save),
+            ("load", Node::Bool(load)),
+        ]))
+    }
+
+    fn metadata() -> Node {
+        map(vec![
+            ("status_ids", list(vec![Node::Int(1), Node::Int(0)])),
+            ("status_names", list(vec![string(b"Yes"), string(b"No")])),
+            ("optype_ids", list(vec![Node::Int(1), Node::Int(2)])),
+            (
+                "optype_names",
+                list(vec![string(b"Black"), string(b"White")]),
+            ),
+            (
+                "msgcol_ids",
+                list(vec![Node::Int(1), Node::Int(2), Node::Int(3)]),
+            ),
+            (
+                "msgcol_names",
+                list(vec![
+                    string(b"Subject"),
+                    string(b"Poster"),
+                    string(b"MessageId"),
+                ]),
+            ),
+        ])
+    }
+
+    fn validate(values: &[(Key, Node)], normalize_description: bool) -> Result<Node, isize> {
+        let mut request = request(values)?;
+        let mut error = b"".as_slice();
+        let mut id = Node::Null;
+        if action(values)? == b"submit" {
+            if empty(field(&request, "group_regex")) {
+                error = b"Group regex must not be empty!";
+            } else if empty(field(&request, "regex")) {
+                error = b"Regex cannot be empty";
+            } else {
+                if normalize_description && empty(field(&request, "description")) {
+                    set(&mut request, "description", string(b""));
+                }
+                if !nonnegative_numeric(field(&request, "ordinal")) {
+                    error = b"Ordinal must be a number, 0 or higher.";
+                }
+            }
+        } else if has(&request, "id") {
+            id = validate_id(field(&request, "id"))?;
+        }
+        Ok(map(vec![
+            ("error", string(error)),
+            ("input", Node::Array(request)),
+            ("id", id),
+        ]))
+    }
+
+    fn category_labels(values: &[(Key, Node)]) -> Result<Node, isize> {
+        let rows = match field(values, "categories") {
+            Node::Null => &[][..],
+            value => array(value)?,
+        };
+        let mut ids = Vec::with_capacity(rows.len());
+        let mut names = Vec::with_capacity(rows.len());
+        for (position, (key, row)) in rows.iter().enumerate() {
+            if key != &Key::Int(position as i64) {
+                return Err(-1);
+            }
+            let row = array(row)?;
+            let id = field(row, "id");
+            let id_text = match id {
+                Node::Int(value) => value.to_string().into_bytes(),
+                Node::String(value) => value.clone(),
+                _ => return Err(-1),
+            };
+            let name = [
+                bytes(field(row, "parent_title"))?,
+                b" ",
+                bytes(field(row, "title"))?,
+                b": ",
+                &id_text,
+            ]
+            .concat();
+            ids.push(id.clone());
+            names.push(string(name));
+        }
+        Ok(map(vec![
+            ("category_ids", list(ids)),
+            ("category_names", list(names)),
+        ]))
+    }
+
+    fn collection_defaults() -> Node {
+        map(vec![
+            ("id", string(b"")),
+            ("regex", string(b"")),
+            ("description", string(b"")),
+            ("group_regex", string(b"")),
+            ("ordinal", string(b"")),
+            ("status", Node::Int(1)),
+        ])
+    }
+
+    fn trim_parameter(value: &Node) -> Result<Node, isize> {
+        if empty(value) {
+            return Ok(string(b""));
+        }
+        let value = match value {
+            Node::String(value) => value.clone(),
+            // The controllers use strict_types: nonempty non-strings must let
+            // PHP raise trim()'s TypeError instead of coercing the value.
+            _ => return Err(-1),
+        };
+        let is_trim = |byte: &u8| matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b);
+        let start = value
+            .iter()
+            .position(|byte| !is_trim(byte))
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|byte| !is_trim(byte))
+            .map_or(start, |index| index + 1);
+        Ok(string(&value[start..end]))
+    }
+
+    fn parameters(values: &[(Key, Node)], release: bool) -> Result<Node, isize> {
+        let request = request(values)?;
+        let mut result = vec![
+            ("group", trim_parameter(field(&request, "group"))?),
+            ("regex", trim_parameter(field(&request, "regex"))?),
+        ];
+        for (name, default) in if release {
+            vec![("showlimit", 250), ("querylimit", 100000)]
+        } else {
+            vec![("limit", 50)]
+        } {
+            let value = field(&request, name);
+            result.push((
+                name,
+                if numeric(value) {
+                    value.clone()
+                } else {
+                    Node::Int(default)
+                },
+            ));
+        }
+        Ok(map(result))
+    }
+
+    fn group_defaults() -> Node {
+        map(vec![
+            ("id", string(b"")),
+            ("name", string(b"")),
+            ("description", string(b"")),
+            ("minfilestoformrelease", Node::Int(0)),
+            ("active", Node::Int(0)),
+            ("backfill", Node::Int(0)),
+            ("minsizetoformrelease", Node::Int(0)),
+            ("first_record", Node::Int(0)),
+            ("last_record", Node::Int(0)),
+            ("backfill_target", Node::Int(0)),
+        ])
+    }
+
+    fn group_query(values: &[(Key, Node)]) -> Result<Node, isize> {
+        let group = match field(values, "groupname") {
+            Node::Null => string(b""),
+            value => {
+                bytes(value)?;
+                value.clone()
+            }
+        };
+        let mut filters = match field(values, "filters") {
+            Node::Null => Vec::new(),
+            value => array(value)?.to_vec(),
+        };
+        match field(values, "active") {
+            Node::Null => {}
+            Node::Bool(value) => set(
+                &mut filters,
+                "active",
+                string(if *value { b"1" } else { b"0" }),
+            ),
+            _ => return Err(-1),
+        }
+        let mut query = vec![(Key::String(b"groupname".to_vec()), group)];
+        query.extend(
+            filters
+                .iter()
+                .filter(|(key, _)| key != &Key::String(b"groupname".to_vec()))
+                .cloned(),
+        );
+        Ok(map(vec![
+            ("filters", Node::Array(filters)),
+            ("listQuery", Node::Array(query)),
+        ]))
+    }
+
+    fn group_title(values: &[(Key, Node)]) -> Result<Node, isize> {
+        let has_id = match field(values, "has_id") {
+            Node::Null => false,
+            Node::Bool(value) => *value,
+            _ => return Err(-1),
+        };
+        Ok(map(vec![(
+            "title",
+            string(if action(values)? == b"submit" {
+                b"Group Edit".as_slice()
+            } else if has_id {
+                b"Newsgroup Edit".as_slice()
+            } else {
+                b"Newsgroup Add".as_slice()
+            }),
+        )]))
+    }
+
+    pub(super) fn output(operation: u32, input: &[u8]) -> Result<Vec<u8>, isize> {
+        let root = decode(input)?;
+        let values = array(&root)?;
+        let result = match operation {
+            0 => blacklist(values)?,
+            1 => metadata(),
+            2 => validate(values, false)?,
+            3 => category_labels(values)?,
+            4 | 7 => validate(values, true)?,
+            5 => collection_defaults(),
+            6 => parameters(values, false)?,
+            8 => parameters(values, true)?,
+            9 => group_defaults(),
+            10 => group_query(values)?,
+            11 => group_title(values)?,
+            _ => return Err(-1),
+        };
+        let mut output = Vec::new();
+        encode_node(&result, &mut output)?;
+        Ok(output)
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::cleaning::nntmux_w28_admin_regex_group_controllers;
+
+        fn wire(node: &Node) -> Vec<u8> {
+            let mut input = Vec::new();
+            encode_node(node, &mut input).unwrap();
+            input
+        }
+
+        fn frames(values: &[Option<&[u8]>]) -> Vec<u8> {
+            let mut input = Vec::new();
+            for value in values {
+                wave22_append_frame(&mut input, *value).unwrap();
+            }
+            input
+        }
+
+        fn run(operation: u32, input: Node) -> Node {
+            decode(&output(operation, &wire(&input)).unwrap()).unwrap()
+        }
+
+        fn get<'a>(node: &'a Node, name: &str) -> &'a Node {
+            field(array(node).unwrap(), name)
+        }
+
+        fn submit(input: Node) -> Node {
+            map(vec![("action", string(b"submit")), ("input", input)])
+        }
+
+        #[test]
+        fn w28_admin_regex_group_controllers_blacklist_actions_and_metadata() {
+            let defaults = blacklist_defaults();
+            let result = run(0, map(Vec::new()));
+            assert_eq!(
+                get(&result, "title"),
+                &string(b"Binary Black/Whitelist Add")
+            );
+            assert_eq!(get(&result, "regex"), &defaults);
+            assert_eq!(
+                get(&result, "meta_title"),
+                &string(b"Binary Black/White list")
+            );
+            assert_eq!(get(&result, "load"), &Node::Bool(false));
+            let result = run(0, map(vec![("input", map(vec![("id", Node::Null)]))]));
+            assert_eq!(get(&result, "load"), &Node::Bool(true));
+            assert_eq!(
+                get(&result, "title"),
+                &string(b"Binary Black/Whitelist Edit")
+            );
+            for (input, error, save) in [
+                (
+                    map(vec![("groupname", string(b"")), ("regex", string(b""))]),
+                    string(b"Group must be a valid usenet group"),
+                    Node::Null,
+                ),
+                (
+                    map(vec![("groupname", string(b"0")), ("regex", string(b""))]),
+                    string(b"Regex cannot be empty"),
+                    Node::Null,
+                ),
+                (map(Vec::new()), string(b""), string(b"add")),
+                (map(vec![("id", string(b"0"))]), string(b""), string(b"add")),
+                (
+                    map(vec![("id", string(b"5"))]),
+                    string(b""),
+                    string(b"update"),
+                ),
+            ] {
+                let result = run(0, submit(input));
+                assert_eq!(get(&result, "error"), &error);
+                assert_eq!(get(&result, "save"), &save);
+                assert_eq!(get(&result, "title"), &string(b"Binary Black/White list"));
+            }
+            let result = run(
+                0,
+                map(vec![
+                    ("action", string(b"addtest")),
+                    (
+                        "input",
+                        map(vec![
+                            ("groupname", string(b"real.group")),
+                            ("regex", string(b"pattern")),
+                        ]),
+                    ),
+                ]),
+            );
+            let mut expected = array(&defaults).unwrap().to_vec();
+            set(&mut expected, "ordinal", Node::Int(1));
+            assert_eq!(get(&result, "regex"), &Node::Array(expected));
+            let result = run(
+                0,
+                map(vec![
+                    ("action", string(b"addtest")),
+                    ("input", map(vec![("regex", string(b"pattern"))])),
+                ]),
+            );
+            assert_eq!(get(&result, "regex"), &defaults);
+            let result = run(1, map(Vec::new()));
+            assert_eq!(
+                get(&result, "status_ids"),
+                &list(vec![Node::Int(1), Node::Int(0)])
+            );
+            assert_eq!(
+                get(&result, "optype_ids"),
+                &list(vec![Node::Int(1), Node::Int(2)])
+            );
+            assert_eq!(
+                get(&result, "msgcol_ids"),
+                &list(vec![Node::Int(1), Node::Int(2), Node::Int(3)])
+            );
+            assert_eq!(
+                get(&result, "status_names"),
+                &list(vec![string(b"Yes"), string(b"No")])
+            );
+            assert_eq!(
+                get(&result, "optype_names"),
+                &list(vec![string(b"Black"), string(b"White")])
+            );
+            assert_eq!(
+                get(&result, "msgcol_names"),
+                &list(vec![
+                    string(b"Subject"),
+                    string(b"Poster"),
+                    string(b"MessageId")
+                ])
+            );
+        }
+
+        #[test]
+        fn w28_admin_regex_group_controllers_form_validation_order_and_php_numeric() {
+            for operation in [2, 4, 7] {
+                for empty_value in [
+                    Node::Null,
+                    Node::Bool(false),
+                    Node::Int(0),
+                    Node::Float(b"-0.0".to_vec()),
+                    string(b""),
+                    string(b"0"),
+                    list(Vec::new()),
+                ] {
+                    let result = run(
+                        operation,
+                        submit(map(vec![
+                            ("group_regex", empty_value.clone()),
+                            ("regex", string(b"")),
+                        ])),
+                    );
+                    assert_eq!(
+                        get(&result, "error"),
+                        &string(b"Group regex must not be empty!")
+                    );
+                    let result = run(
+                        operation,
+                        submit(map(vec![
+                            ("group_regex", string(b"g")),
+                            ("regex", empty_value),
+                        ])),
+                    );
+                    assert_eq!(get(&result, "error"), &string(b"Regex cannot be empty"));
+                }
+                for (ordinal, accepted) in [
+                    (Node::Int(0), true),
+                    (Node::Int(i64::MAX), true),
+                    (Node::Int(-1), false),
+                    (Node::Float(b"0.5".to_vec()), true),
+                    (Node::Float(b"-0.0".to_vec()), true),
+                    (string(b"\t\n\x0b\x0c\r +.5e2 \t"), true),
+                    (string(b"-1e-999"), true),
+                    (string(b"1e999"), true),
+                    (string(b"-1e999"), false),
+                    (string(b"-0.0001"), false),
+                    (string(b"1e"), false),
+                    (string(b"0x10"), false),
+                    (string(b"\0 1"), false),
+                    (Node::Bool(true), false),
+                    (Node::Null, false),
+                    (list(Vec::new()), false),
+                ] {
+                    let input = map(vec![
+                        ("extra", string(b"\0\xff")),
+                        ("group_regex", string(b"g")),
+                        ("regex", string(b"r")),
+                        ("description", string(b"0")),
+                        ("ordinal", ordinal),
+                    ]);
+                    let result = run(operation, submit(input.clone()));
+                    assert_eq!(
+                        get(&result, "error"),
+                        &string(if accepted {
+                            b"".as_slice()
+                        } else {
+                            b"Ordinal must be a number, 0 or higher.".as_slice()
+                        })
+                    );
+                    assert_eq!(get(&result, "id"), &Node::Null);
+                    let mut expected = array(&input).unwrap().to_vec();
+                    if operation != 2 {
+                        set(&mut expected, "description", string(b""));
+                    }
+                    assert_eq!(get(&result, "input"), &Node::Array(expected));
+                }
+                let result = run(
+                    operation,
+                    submit(map(vec![
+                        ("group_regex", string(b"g")),
+                        ("regex", string(b"r")),
+                        ("ordinal", Node::Bool(false)),
+                    ])),
+                );
+                assert_eq!(
+                    has(array(get(&result, "input")).unwrap(), "description"),
+                    operation != 2
+                );
+            }
+        }
+
+        #[test]
+        fn w28_admin_regex_group_controllers_filter_validate_int() {
+            for operation in [2, 4, 7] {
+                for (id, expected) in [
+                    (Node::Int(1), Node::Int(1)),
+                    (Node::Int(i64::MAX), Node::Int(i64::MAX)),
+                    (Node::Bool(true), Node::Int(1)),
+                    (Node::Float(b"12.0".to_vec()), Node::Int(12)),
+                    (string(b" \t\n\x0b\r+123 \t"), Node::Int(123)),
+                    (string(b"\x0c1\x0c"), Node::Bool(false)),
+                    (string(b"9223372036854775807"), Node::Int(i64::MAX)),
+                    (string(b"9223372036854775808"), Node::Bool(false)),
+                    (string(b"01"), Node::Bool(false)),
+                    (string(b"+01"), Node::Bool(false)),
+                    (string(b"1.0"), Node::Bool(false)),
+                    (string(b"1e2"), Node::Bool(false)),
+                    (string(b"\0"), Node::Bool(false)),
+                    (string(b"0"), Node::Bool(false)),
+                    (string(b"-1"), Node::Bool(false)),
+                    (Node::Bool(false), Node::Bool(false)),
+                    (Node::Null, Node::Bool(false)),
+                    (list(Vec::new()), Node::Bool(false)),
+                ] {
+                    let input = map(vec![("id", id)]);
+                    let result = run(operation, map(vec![("input", input.clone())]));
+                    assert_eq!(get(&result, "id"), &expected);
+                    assert_eq!(get(&result, "input"), &input);
+                }
+                assert_eq!(get(&run(operation, map(Vec::new())), "id"), &Node::Null);
+                for value in [b"1.5".as_slice(), b"100000000000000.0"] {
+                    assert!(
+                        output(
+                            operation,
+                            &wire(&map(vec![(
+                                "input",
+                                map(vec![("id", Node::Float(value.to_vec()))])
+                            )]))
+                        )
+                        .is_err()
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn w28_admin_regex_group_controllers_labels_defaults_and_test_parameters() {
+            let ids = vec![Node::Int(123), string(b"004\0\xff")];
+            let result = run(
+                3,
+                map(vec![(
+                    "categories",
+                    list(vec![
+                        map(vec![
+                            ("id", ids[0].clone()),
+                            ("parent_title", string(b"Parent")),
+                            ("title", string(b"Title")),
+                        ]),
+                        map(vec![
+                            ("id", ids[1].clone()),
+                            ("parent_title", string(b"\xff\0")),
+                            ("title", string(b"")),
+                        ]),
+                    ]),
+                )]),
+            );
+            assert_eq!(get(&result, "category_ids"), &list(ids));
+            assert_eq!(
+                get(&result, "category_names"),
+                &list(vec![
+                    string(b"Parent Title: 123"),
+                    string(b"\xff\0 : 004\0\xff")
+                ])
+            );
+            assert_eq!(
+                run(5, map(Vec::new())),
+                map(vec![
+                    ("id", string(b"")),
+                    ("regex", string(b"")),
+                    ("description", string(b"")),
+                    ("group_regex", string(b"")),
+                    ("ordinal", string(b"")),
+                    ("status", Node::Int(1))
+                ])
+            );
+            assert_eq!(run(9, map(Vec::new())), group_defaults());
+            for operation in [6, 8] {
+                let result = run(
+                    operation,
+                    map(vec![(
+                        "input",
+                        map(vec![
+                            ("group", string(b"\0 \t\x0bgroup\r\n")),
+                            ("regex", string(b" \x0cpattern\x0c ")),
+                        ]),
+                    )]),
+                );
+                assert_eq!(get(&result, "group"), &string(b"group"));
+                assert_eq!(get(&result, "regex"), &string(b"\x0cpattern\x0c"));
+                for value in [
+                    Node::Null,
+                    Node::Bool(false),
+                    Node::Int(0),
+                    string(b"0"),
+                    list(Vec::new()),
+                ] {
+                    let result = run(
+                        operation,
+                        map(vec![(
+                            "input",
+                            map(vec![("group", value.clone()), ("regex", value)]),
+                        )]),
+                    );
+                    assert_eq!(get(&result, "group"), &string(b""));
+                    assert_eq!(get(&result, "regex"), &string(b""));
+                }
+            }
+            for operation in [6, 8] {
+                for value in [Node::Bool(true), Node::Int(1), Node::Float(b"1.5".to_vec())] {
+                    assert!(
+                        output(
+                            operation,
+                            &wire(&map(vec![("input", map(vec![("group", value)]))]))
+                        )
+                        .is_err()
+                    );
+                }
+            }
+            for value in [
+                Node::Int(-1),
+                Node::Float(b"1.5".to_vec()),
+                string(b" 1e999\t"),
+                string(b"0"),
+            ] {
+                let result = run(6, map(vec![("input", map(vec![("limit", value.clone())]))]));
+                assert_eq!(get(&result, "limit"), &value);
+                let result = run(
+                    8,
+                    map(vec![(
+                        "input",
+                        map(vec![
+                            ("showlimit", value.clone()),
+                            ("querylimit", value.clone()),
+                        ]),
+                    )]),
+                );
+                assert_eq!(get(&result, "showlimit"), &value);
+                assert_eq!(get(&result, "querylimit"), &value);
+            }
+            assert_eq!(get(&run(6, map(Vec::new())), "limit"), &Node::Int(50));
+            assert_eq!(get(&run(8, map(Vec::new())), "showlimit"), &Node::Int(250));
+            assert_eq!(
+                get(&run(8, map(Vec::new())), "querylimit"),
+                &Node::Int(100000)
+            );
+            for value in [
+                Node::Bool(true),
+                Node::Null,
+                list(Vec::new()),
+                string(b"NaN"),
+            ] {
+                assert_eq!(
+                    get(
+                        &run(6, map(vec![("input", map(vec![("limit", value)]))])),
+                        "limit"
+                    ),
+                    &Node::Int(50)
+                );
+            }
+        }
+
+        #[test]
+        fn w28_admin_regex_group_controllers_group_query_union_and_titles() {
+            let filters = Node::Array(vec![
+                (Key::Int(7), string(b"numeric")),
+                (Key::String(b"groupname".to_vec()), string(b"ignored")),
+                (Key::String(b"active".to_vec()), Node::Int(4)),
+                (Key::String(b"tail".to_vec()), Node::Null),
+            ]);
+            for active in [Node::Null, Node::Bool(true), Node::Bool(false)] {
+                let result = run(
+                    10,
+                    map(vec![
+                        ("groupname", string(b"group\0\xff")),
+                        ("filters", filters.clone()),
+                        ("active", active.clone()),
+                    ]),
+                );
+                let mut expected = array(&filters).unwrap().to_vec();
+                if let Node::Bool(active) = active {
+                    set(
+                        &mut expected,
+                        "active",
+                        string(if active { b"1" } else { b"0" }),
+                    );
+                }
+                assert_eq!(get(&result, "filters"), &Node::Array(expected.clone()));
+                let mut query = vec![(Key::String(b"groupname".to_vec()), string(b"group\0\xff"))];
+                query.extend(
+                    expected
+                        .into_iter()
+                        .filter(|(key, _)| key != &Key::String(b"groupname".to_vec())),
+                );
+                assert_eq!(get(&result, "listQuery"), &Node::Array(query));
+            }
+            let result = run(
+                10,
+                map(vec![
+                    ("filters", map(vec![("x", Node::Int(1))])),
+                    ("active", Node::Bool(false)),
+                ]),
+            );
+            assert_eq!(
+                get(&result, "filters"),
+                &map(vec![("x", Node::Int(1)), ("active", string(b"0"))])
+            );
+            for (action, has_id, title) in [
+                (b"submit".as_slice(), false, b"Group Edit".as_slice()),
+                (b"submit", true, b"Group Edit"),
+                (b"view", true, b"Newsgroup Edit"),
+                (b"", false, b"Newsgroup Add"),
+            ] {
+                assert_eq!(
+                    run(
+                        11,
+                        map(vec![
+                            ("action", string(action)),
+                            ("has_id", Node::Bool(has_id))
+                        ])
+                    ),
+                    map(vec![("title", string(title))])
+                );
+            }
+        }
+
+        #[test]
+        fn w28_admin_regex_group_controllers_malformed_types_framing_and_depth() {
+            let mut invalid = vec![Vec::new(), vec![0], vec![0; 4], vec![4, 0, 0, 0, b'a']];
+            for raw in [
+                b"".as_slice(),
+                b"n0",
+                b"b2",
+                b"b",
+                b"i01",
+                b"i+1",
+                b"i-0",
+                b"i9223372036854775808",
+                b"f",
+                b"fNaN",
+                b"fINF",
+                b"f1e999",
+                b"f 1",
+                b"f\x0b1",
+                b"a01",
+                b"a-1",
+                b"a18446744073709551616",
+                b"a2",
+                b"x",
+            ] {
+                invalid.push(frames(&[Some(raw)]));
+            }
+            invalid.extend([
+                frames(&[None]),
+                frames(&[Some(b"a0"), None]),
+                frames(&[Some(b"a0"), Some(b"n")]),
+                frames(&[Some(b"n")]),
+                frames(&[Some(b"sroot")]),
+                frames(&[Some(b"a1"), Some(b"n"), Some(b"n")]),
+                frames(&[Some(b"a1"), Some(b"b1"), Some(b"n")]),
+                frames(&[Some(b"a1"), Some(b"fx"), Some(b"n")]),
+                frames(&[
+                    Some(b"a2"),
+                    Some(b"sx"),
+                    Some(b"n"),
+                    Some(b"sx"),
+                    Some(b"n"),
+                ]),
+                frames(&[
+                    Some(b"a2"),
+                    Some(b"i1"),
+                    Some(b"n"),
+                    Some(b"s1"),
+                    Some(b"n"),
+                ]),
+            ]);
+            let mut deep = map(Vec::new());
+            for _ in 0..65 {
+                deep = map(vec![("deep", deep)]);
+            }
+            invalid.push(wire(&deep));
+            for input in invalid {
+                assert!(output(1, &input).is_err(), "accepted malformed {input:?}");
+                let mut target = [0xab; 32];
+                assert_eq!(
+                    unsafe {
+                        nntmux_w28_admin_regex_group_controllers(
+                            1,
+                            input.as_ptr(),
+                            input.len(),
+                            target.as_mut_ptr(),
+                            target.len(),
+                        )
+                    },
+                    -1
+                );
+                assert_eq!(target, [0xab; 32]);
+            }
+            let valid = wire(&map(Vec::new()));
+            for operation in [12, 100, u32::MAX] {
+                assert!(output(operation, &valid).is_err());
+            }
+            for (operation, value) in [
+                (0, map(vec![("action", Node::Int(1))])),
+                (2, map(vec![("input", string(b"bad"))])),
+                (
+                    3,
+                    map(vec![(
+                        "categories",
+                        list(vec![map(vec![("id", Node::Null)])]),
+                    )]),
+                ),
+                (
+                    6,
+                    map(vec![(
+                        "input",
+                        map(vec![("group", list(vec![Node::Int(1)]))]),
+                    )]),
+                ),
+                (
+                    8,
+                    map(vec![(
+                        "input",
+                        map(vec![("regex", Node::Float(b"1.5".to_vec()))]),
+                    )]),
+                ),
+                (10, map(vec![("groupname", Node::Bool(true))])),
+                (10, map(vec![("filters", Node::Int(0))])),
+                (10, map(vec![("active", string(b"1"))])),
+                (11, map(vec![("has_id", Node::Int(1))])),
+            ] {
+                assert!(output(operation, &wire(&value)).is_err());
+            }
+            let mut accepted_depth = map(Vec::new());
+            for _ in 0..64 {
+                accepted_depth = map(vec![("deep", accepted_depth)]);
+            }
+            assert!(output(1, &wire(&accepted_depth)).is_ok());
+        }
+
+        #[test]
+        fn w28_admin_regex_group_controllers_regions_capacities_unaligned_and_aliasing() {
+            for operation in 0..=11 {
+                let input = wire(&map(Vec::new()));
+                let expected = output(operation, &input).unwrap();
+                let mut target = vec![0xab; expected.len() + 8];
+                unsafe {
+                    for capacity in [0, 1, expected.len() - 1] {
+                        assert_eq!(
+                            nntmux_w28_admin_regex_group_controllers(
+                                operation,
+                                input.as_ptr(),
+                                input.len(),
+                                target.as_mut_ptr(),
+                                capacity
+                            ),
+                            -(expected.len() as i32)
+                        );
+                        assert!(target.iter().all(|byte| *byte == 0xab));
+                    }
+                    for (source, length, out, capacity) in [
+                        (std::ptr::null(), 0, target.as_mut_ptr(), target.len()),
+                        (
+                            std::ptr::null(),
+                            input.len(),
+                            target.as_mut_ptr(),
+                            target.len(),
+                        ),
+                        (input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                        (input.as_ptr(), input.len(), std::ptr::null_mut(), 10),
+                        (
+                            usize::MAX as *const u8,
+                            1,
+                            target.as_mut_ptr(),
+                            target.len(),
+                        ),
+                        (input.as_ptr(), input.len(), usize::MAX as *mut u8, 1),
+                        (
+                            input.as_ptr(),
+                            usize::MAX,
+                            target.as_mut_ptr(),
+                            target.len(),
+                        ),
+                        (input.as_ptr(), input.len(), target.as_mut_ptr(), usize::MAX),
+                        (
+                            input.as_ptr(),
+                            isize::MAX as usize + 1,
+                            target.as_mut_ptr(),
+                            target.len(),
+                        ),
+                        (
+                            input.as_ptr(),
+                            input.len(),
+                            target.as_mut_ptr(),
+                            isize::MAX as usize + 1,
+                        ),
+                    ] {
+                        assert_eq!(
+                            nntmux_w28_admin_regex_group_controllers(
+                                operation, source, length, out, capacity
+                            ),
+                            -1
+                        );
+                        assert!(target.iter().all(|byte| *byte == 0xab));
+                    }
+                    let unaligned = [vec![0xab], input.clone()].concat();
+                    assert_eq!(
+                        nntmux_w28_admin_regex_group_controllers(
+                            operation,
+                            unaligned.as_ptr().add(1),
+                            input.len(),
+                            target.as_mut_ptr().add(1),
+                            expected.len()
+                        ),
+                        expected.len() as i32
+                    );
+                    assert_eq!(&target[1..1 + expected.len()], expected);
+                    assert_eq!(target[0], 0xab);
+                    assert!(
+                        target[1 + expected.len()..]
+                            .iter()
+                            .all(|byte| *byte == 0xab)
+                    );
+                    for (source_offset, target_offset) in [(0, 0), (0, 1), (3, 0)] {
+                        for capacity in
+                            [0, 1, expected.len() - 1, expected.len(), expected.len() + 1]
+                        {
+                            let mut buffer = vec![0xab; expected.len() + input.len() + 16];
+                            buffer[source_offset..source_offset + input.len()]
+                                .copy_from_slice(&input);
+                            let before = buffer.clone();
+                            let actual = nntmux_w28_admin_regex_group_controllers(
+                                operation,
+                                buffer.as_ptr().add(source_offset),
+                                input.len(),
+                                buffer.as_mut_ptr().add(target_offset),
+                                capacity,
+                            );
+                            if capacity < expected.len() {
+                                assert_eq!(actual, -(expected.len() as i32));
+                                assert_eq!(buffer, before);
+                            } else {
+                                assert_eq!(actual, expected.len() as i32);
+                                assert_eq!(
+                                    &buffer[target_offset..target_offset + expected.len()],
+                                    expected
+                                );
+                                assert_eq!(&buffer[..target_offset], &before[..target_offset]);
+                                assert_eq!(
+                                    &buffer[target_offset + expected.len()..],
+                                    &before[target_offset + expected.len()..]
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Render typed admin regex/group decision frames without partially writing output.
+/// Returns bytes written, -1 on invalid input/panic, or negated required size.
+/// Input and output may overlap; every output is built before touching the caller buffer.
+///
+/// # Safety
+/// Both regions must be non-null and allocated for their stated extents, with
+/// lengths fitting isize and no address overflow. Only byte alignment is needed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w28_admin_regex_group_controllers(
+    operation: u32,
+    input: *const u8,
+    len: usize,
+    out: *mut u8,
+    out_cap: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, len) || !cleaning_ffi_region_valid(out, out_cap) {
+            return -1;
+        }
+        let output = {
+            let input = unsafe { slice::from_raw_parts(input, len) };
+            match wave28_admin_regex_group_controllers::output(operation, input) {
+                Ok(output) => output,
+                Err(_) => return -1,
+            }
+        };
+        let Ok(needed) = i32::try_from(output.len()) else {
+            return -1;
+        };
+        if output.len() > out_cap {
+            return -needed;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(output.as_ptr(), out, output.len()) };
+        needed
+    }))
+    .unwrap_or(-1)
+}

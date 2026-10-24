@@ -57,18 +57,8 @@ class AdminGroupController extends BasePageController
         // Set the current action.
         $action = $this->formAction($request);
 
-        $group = [
-            'id' => '',
-            'name' => '',
-            'description' => '',
-            'minfilestoformrelease' => 0,
-            'active' => 0,
-            'backfill' => 0,
-            'minsizetoformrelease' => 0,
-            'first_record' => 0,
-            'last_record' => 0,
-            'backfill_target' => 0,
-        ];
+        $group = self::defaultGroup();
+        $title = self::editTitle($action, $request->has('id'));
 
         switch ($action) {
             case 'submit':
@@ -97,13 +87,9 @@ class AdminGroupController extends BasePageController
 
             case 'view':
             default:
-                $title = 'Group Edit';
                 if ($request->has('id')) {
-                    $title = 'Newsgroup Edit';
                     $id = $request->input('id');
                     $group = UsenetGroup::getGroupByID($id);
-                } else {
-                    $title = 'Newsgroup Add';
                 }
                 break;
         }
@@ -133,12 +119,87 @@ class AdminGroupController extends BasePageController
     {
         $groupname = $request->groupName();
         $filters = $request->listOptions();
-        if ($active !== null) {
-            $filters['active'] = $active ? '1' : '0';
-        }
-        $listQuery = ['groupname' => $groupname] + $filters;
+        $query = self::filterQuery($groupname, $filters, $active);
+        $filters = $query['filters'];
+        $listQuery = $query['listQuery'];
         $grouplist = UsenetGroup::getGroupsRange($groupname, $active, true, $filters)->appends($listQuery);
 
         return view('admin.groups.index', compact('title', 'groupname', 'grouplist', 'filters', 'listQuery'));
+    }
+
+    // PHP stays the default until every paired common/p99 benchmark clears 1.5x.
+    private static ?bool $useRustFfi = null;
+
+    public static function setUseRustFfi(?bool $useRustFfi): void
+    {
+        self::$useRustFfi = $useRustFfi;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? false;
+    }
+
+    /** @return array<string, mixed> */
+    public static function defaultGroup(): array
+    {
+        return self::usesRustFfi() ? self::defaultGroupNative() : self::defaultGroupPhp();
+    }
+
+    /** @return array<string, mixed> */
+    public static function defaultGroupPhp(): array
+    {
+        return ['id' => '', 'name' => '', 'description' => '', 'minfilestoformrelease' => 0, 'active' => 0, 'backfill' => 0, 'minsizetoformrelease' => 0, 'first_record' => 0, 'last_record' => 0, 'backfill_target' => 0];
+    }
+
+    /** @return array<string, mixed> */
+    public static function defaultGroupNative(): array
+    {
+        return AdminBlacklistController::wave28Native(9, []) ?? self::defaultGroupPhp();
+    }
+
+    /** @param array<array-key, mixed> $filters
+     * @return array{filters: array<array-key, mixed>, listQuery: array<array-key, mixed>}
+     */
+    public static function filterQuery(string $groupname, array $filters, ?bool $active): array
+    {
+        return self::usesRustFfi() ? self::filterQueryNative($groupname, $filters, $active) : self::filterQueryPhp($groupname, $filters, $active);
+    }
+
+    /** @param array<array-key, mixed> $filters
+     * @return array{filters: array<array-key, mixed>, listQuery: array<array-key, mixed>}
+     */
+    public static function filterQueryPhp(string $groupname, array $filters, ?bool $active): array
+    {
+        if ($active !== null) {
+            $filters['active'] = $active ? '1' : '0';
+        }
+
+        return ['filters' => $filters, 'listQuery' => ['groupname' => $groupname] + $filters];
+    }
+
+    /** @param array<array-key, mixed> $filters
+     * @return array{filters: array<array-key, mixed>, listQuery: array<array-key, mixed>}
+     */
+    public static function filterQueryNative(string $groupname, array $filters, ?bool $active): array
+    {
+        return AdminBlacklistController::wave28Native(10, ['groupname' => $groupname, 'filters' => $filters, 'active' => $active]) ?? self::filterQueryPhp($groupname, $filters, $active);
+    }
+
+    public static function editTitle(string $action, bool $hasId): string
+    {
+        return self::usesRustFfi() ? self::editTitleNative($action, $hasId) : self::editTitlePhp($action, $hasId);
+    }
+
+    public static function editTitlePhp(string $action, bool $hasId): string
+    {
+        return $action === 'submit' ? 'Group Edit' : ($hasId ? 'Newsgroup Edit' : 'Newsgroup Add');
+    }
+
+    public static function editTitleNative(string $action, bool $hasId): string
+    {
+        $result = AdminBlacklistController::wave28Native(11, ['action' => $action, 'has_id' => $hasId]);
+
+        return $result !== null && is_string($result['title'] ?? null) ? $result['title'] : self::editTitlePhp($action, $hasId);
     }
 }
