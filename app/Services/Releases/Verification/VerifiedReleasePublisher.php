@@ -18,6 +18,8 @@ use App\Services\Releases\ReleaseDuplicateFinder;
 use App\Services\Releases\ReleaseGroupResolver;
 use App\Services\TvProcessing\TvProcessingCandidateQuery;
 use App\Support\NzbPasswordMetadata;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Schema;
@@ -27,6 +29,150 @@ use Throwable;
 
 final class VerifiedReleasePublisher
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_w16_verified(uint32_t operation, const char *input, size_t length, char *output, size_t capacity);
+        C;
+
+    // Candidate helpers retain PHP defaults until every paired mean/p99 gate passes.
+    private static bool $useRustFfi = false;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    /** Reject objects before serialize() can invoke user code; bound cycles and nesting. */
+    private static function nativeValueSupported(mixed $value, int &$remaining, int $depth): bool
+    {
+        if (--$remaining < 0 || $depth > 24) {
+            return false;
+        }
+        if (is_array($value)) {
+            foreach ($value as $item) {
+                if (! self::nativeValueSupported($item, $remaining, $depth + 1)) {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        return $value === null || is_scalar($value);
+    }
+
+    /** @param list<mixed> $arguments */
+    private static function computeNative(int $operation, array $arguments): mixed
+    {
+        if (! self::$useRustFfi) {
+            return null;
+        }
+        try {
+            $ffi = RustPipelineLibrary::resolveDomain('nfo', self::FFI_CDEF);
+            if ($ffi === null) {
+                return null;
+            }
+            $remaining = 100000;
+            if (! self::nativeValueSupported($arguments, $remaining, 0)) {
+                return null;
+            }
+            $input = serialize($arguments);
+            $capacity = 0;
+            $output = RustPipelineLibrary::obtainScratch($ffi, max(4096, strlen($input) + 512), $capacity);
+            if ($output === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w16_verified($operation, $input, strlen($input), $output, $capacity);
+            if (! is_int($written) || $written < 0 || $written > $capacity) {
+                return null;
+            }
+
+            return unserialize(FFI::string($output, $written), ['allowed_classes' => false]);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $metadata
+     * @param  array<array-key, mixed>  $defaults
+     * @return array<array-key, mixed>
+     */
+    public static function releaseAttributes(array $metadata, array $defaults): array
+    {
+        return self::releaseAttributesNative($metadata, $defaults) ?? self::releaseAttributesPhp($metadata, $defaults);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $metadata
+     * @param  array<array-key, mixed>  $defaults
+     * @return array<array-key, mixed>
+     */
+    public static function releaseAttributesPhp(array $metadata, array $defaults): array
+    {
+        return $metadata + $defaults;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $metadata
+     * @param  array<array-key, mixed>  $defaults
+     * @return array<array-key, mixed>|null
+     */
+    public static function releaseAttributesNative(array $metadata, array $defaults): ?array
+    {
+        $result = self::computeNative(0, [$metadata, $defaults]);
+
+        return is_array($result) ? $result : null;
+    }
+
+    public static function completionPercentage(int $found, int $expected): float
+    {
+        return self::completionPercentageNative($found, $expected) ?? self::completionPercentagePhp($found, $expected);
+    }
+
+    public static function completionPercentagePhp(int $found, int $expected): float
+    {
+        return $expected <= 0 ? 0.0 : min(100.0, max(0.0, $found / $expected * 100.0));
+    }
+
+    public static function completionPercentageNative(int $found, int $expected): ?float
+    {
+        $result = self::computeNative(1, [$found, $expected]);
+
+        return is_float($result) ? $result : null;
+    }
+
+    /**
+     * @param  array<string, mixed>|null  $candidate
+     * @param  array<string, mixed>  $claim
+     */
+    public static function publicationGuard(?array $candidate, array $claim, string $now): bool
+    {
+        return self::publicationGuardNative($candidate, $claim, $now) ?? self::publicationGuardPhp($candidate, $claim, $now);
+    }
+
+    /**
+     * @param  array<string, mixed>|null  $candidate
+     * @param  array<string, mixed>  $claim
+     */
+    public static function publicationGuardPhp(?array $candidate, array $claim, string $now): bool
+    {
+        return $candidate !== null && $candidate['version'] === $claim['version']
+            && $candidate['manifest_hash'] === $claim['manifest_hash'] && $candidate['lease_token'] === $claim['lease_token']
+            && $candidate['lease_until'] !== null && $candidate['lease_until'] >= $now;
+    }
+
+    /**
+     * @param  array<string, mixed>|null  $candidate
+     * @param  array<string, mixed>  $claim
+     */
+    public static function publicationGuardNative(?array $candidate, array $claim, string $now): ?bool
+    {
+        $result = self::computeNative(2, [$candidate, $claim, $now]);
+
+        return is_bool($result) ? $result : null;
+    }
+
     public function __construct(private readonly VerifiedNzbWriter $writer,
         private readonly ReleaseMetadataResolver $metadata,
         private readonly ReleaseDuplicateFinder $duplicates) {}
@@ -116,9 +262,7 @@ final class VerifiedReleasePublisher
                     app(VerificationLedger::class)->enterPublication($keys, timing: $timing);
                     $timing?->nextPhase('candidate_policy');
                     $candidate = DB::table('release_verification_candidates')->where('id', $claim->id)->lockForUpdate()->first();
-                    if ($candidate === null || $candidate->version !== $claim->version
-                        || $candidate->manifest_hash !== $claim->manifest_hash || $candidate->lease_token !== $claim->lease_token
-                        || $candidate->lease_until === null || $candidate->lease_until < now()->format('Y-m-d H:i:s')) {
+                    if (! self::publicationGuard($candidate === null ? null : (array) $candidate, (array) $claim, now()->format('Y-m-d H:i:s'))) {
                         $outcome = 'stale';
 
                         throw new RuntimeException('Stale verification result cannot publish.');
@@ -262,10 +406,10 @@ final class VerifiedReleasePublisher
                         return $duplicateId;
                     }
                     $guid = $legacy === null ? (string) Str::uuid() : (string) $legacy->guid;
-                    $parameters = $metadata + [
+                    $parameters = self::releaseAttributes($metadata, [
                         'totalpart' => $totalParts,
                         'groups_id' => (int) $manifest['groups_id'], 'guid' => $guid, 'postdate' => $manifest['date'],
-                        'size' => $size, 'nzbstatus' => NzbService::NZB_ADDED];
+                        'size' => $size, 'nzbstatus' => NzbService::NZB_ADDED]);
                     $timing?->nextPhase('release_identity_sql');
                     if ($legacy === null) {
                         $id = Release::insertRelease($parameters);
@@ -716,7 +860,7 @@ final class VerifiedReleasePublisher
         DB::table('release_verification_candidates')->where('id', $candidateId)->update($values + ['manifest_bytes' => 0, 'manifest_path' => '']);
         // Release capacity last so the shared ledger row is held only until commit.
         $previous = $timing?->enterNestedPhase('ledger_adjust');
-        app(VerificationLedger::class)->adjust(-(int) $candidate->manifest_bytes);
+        app(VerificationLedger::class)->adjust(RemotePublicationService::ledgerAdjustment((int) $candidate->manifest_bytes, false));
         $timing?->nextPhase((string) $previous);
         DB::afterCommit(function () use ($candidate): void {
             app(ManifestStore::class)->deleteIfUnreferenced($candidate->manifest_path);
