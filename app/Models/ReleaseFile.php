@@ -7,12 +7,15 @@ namespace App\Models;
 use App\Facades\Search;
 use App\Models\Concerns\HasCompositePrimaryKey;
 use App\Support\Par2FileHashEvidence;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Throwable;
 
 /**
  * App\Models\ReleaseFile.
@@ -144,7 +147,7 @@ class ReleaseFile extends Model
                         throw $aborted;
                     }
                     $afterSnapshot = $expectedSnapshot;
-                    if (array_key_exists('proc_hash16k', $afterSnapshot) && (int) ($current->predb_id ?? 0) === 0 && in_array((int) ($current->isrenamed ?? 0), [0, 1], true)) {
+                    if (self::shouldRefreshHashSnapshot($afterSnapshot, (int) ($current->predb_id ?? 0), (int) ($current->isrenamed ?? 0))) {
                         $afterSnapshot['proc_hash16k'] = (int) DB::table('releases')->where('id', $id)->value('proc_hash16k');
                     }
                     $inserted = self::addReleaseFiles($id, $name, $size, $createdTime, $hasPassword, $hash, $crc);
@@ -198,12 +201,88 @@ class ReleaseFile extends Model
             });
         }
 
-        if ($releaseCheck !== null && strlen($hash) === 32 && ctype_xdigit($hash)
+        $normalizedHash = self::normalizeParHash($hash);
+        if ($releaseCheck !== null && $normalizedHash !== null
             && ($duplicateCheck !== null || ($insert ?? 0) > 0 || self::query()->where('releases_id', $id)->where('name', $name)->exists())
         ) {
-            ParHash::insertOrIgnore(['releases_id' => $id, 'hash' => strtolower($hash)]);
+            ParHash::insertOrIgnore(['releases_id' => $id, 'hash' => $normalizedHash]);
         }
 
         return $insert ?? 0;
+    }
+
+    public static function normalizeParHash(string $hash): ?string
+    {
+        if (self::$useRustFfi && ($native = self::normalizeParHashNative($hash)) !== null) {
+            return $native === '' ? null : $native;
+        }
+
+        return strlen($hash) === 32 && ctype_xdigit($hash) ? strtolower($hash) : null;
+    }
+
+    /** Empty means invalid; null means the ABI declined. */
+    public static function normalizeParHashNative(string $hash): ?string
+    {
+        return self::nativeCall(0, $hash);
+    }
+
+    /** @param array<string, mixed> $snapshot */
+    public static function shouldRefreshHashSnapshot(array $snapshot, int $predbId, int $isRenamed): bool
+    {
+        return (self::$useRustFfi ? self::shouldRefreshHashSnapshotNative($snapshot, $predbId, $isRenamed) : null)
+            ?? (array_key_exists('proc_hash16k', $snapshot) && $predbId === 0 && in_array($isRenamed, [0, 1], true));
+    }
+
+    /** @param array<string, mixed> $snapshot */
+    public static function shouldRefreshHashSnapshotNative(array $snapshot, int $predbId, int $isRenamed): ?bool
+    {
+        $input = self::packFrames([array_key_exists('proc_hash16k', $snapshot) ? '1' : '0', (string) $predbId, (string) $isRenamed]);
+        $result = $input === null ? null : self::nativeCall(1, $input);
+
+        return $result === null ? null : $result === '1';
+    }
+
+    private static function nativeCall(int $mode, string $input): ?string
+    {
+        $ffi = RustPipelineLibrary::resolveDomain('wave20-file', 'intptr_t nntmux_wave20_file(uint32_t mode, const char *input, size_t input_len, char *out, size_t out_cap);');
+        if ($ffi === null) {
+            return null;
+        }
+        $capacity = 0;
+        $buffer = RustPipelineLibrary::obtainScratch($ffi, max(256, strlen($input) * 2 + 256), $capacity);
+        if ($buffer === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_wave20_file($mode, $input, strlen($input), $buffer, $capacity);
+
+            return is_int($written) && $written >= 0 && $written <= $capacity
+                ? ($written === 0 ? '' : FFI::string($buffer, $written)) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** @param list<string> $values */
+    private static function packFrames(array $values): ?string
+    {
+        $input = '';
+        foreach ($values as $value) {
+            if (strlen($value) > 0xFFFFFFFF) {
+                return null;
+            }
+            $input .= pack('V', strlen($value)).$value;
+        }
+
+        return $input;
+    }
+
+    // Single-call FFI must qualify on all four benchmark metrics before adoption.
+    private static bool $useRustFfi = false;
+
+    public static function useRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
     }
 }
