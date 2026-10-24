@@ -8,7 +8,9 @@
 //! Adoption status: the nZEDb archive reader and Knaben duplicate-member scan are wired into PHP
 //! (5-8x on parseCsv/parseJson, >20x on the isolated scan). The IRC announce matcher is exported and
 //! parity-tested but deliberately not wired into `PreAnnounceParser`: PCRE's JIT already matches a
-//! short announce in under a microsecond, so end-to-end `parse()` measured only 1.0-1.2x.
+//! short announce in under a microsecond, so end-to-end `parse()` measured only 1.0-1.2x. The JSON
+//! feed sources (predataba.se, xREL, srrDB, predb.ovh/club/net/org, apibay) decode their response
+//! bodies through `nntmux_predb_json_feed_parse` instead of `json_decode` plus per-row PHP.
 use crate::OutCursor;
 use std::slice;
 
@@ -4089,5 +4091,1397 @@ mod xml_tests {
             b"Show.S01E01.720p.WEB-GRP"
         );
         assert_eq!(rss_dotted(b"EZTV"), b"EZTV");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// JSON PreDB feed sources (predataba.se, xREL, srrDB, predb.ovh/club/net/org, apibay)
+// ---------------------------------------------------------------------------------------------
+//
+// One strict validating pass reproduces `json_decode($body, true)` acceptance (RFC 8259 grammar,
+// UTF-8, escapes, depth); extraction then walks the validated bytes without re-validating.
+// Object lookups keep the last duplicate member, as PHP arrays do. Every value whose PHP
+// conversion is not reproduced exactly (numeric strings other than plain integers, array-to-string
+// casts, out-of-range floats, error envelopes, object-shaped lists) declines the whole document.
+
+const JSON_PREDATABASE: u32 = 1;
+const JSON_XREL: u32 = 2;
+const JSON_XREL_P2P: u32 = 3;
+const JSON_SRRDB: u32 = 4;
+const JSON_PREDB_OVH: u32 = 5;
+const JSON_PREDB_CLUB: u32 = 6;
+const JSON_PREDB_NET: u32 = 7;
+const JSON_PREDB_ORG: u32 = 8;
+const JSON_APIBAY: u32 = 9;
+
+const REC_SEP: u8 = 0x1e;
+/// Separates header fields and precedes every record field.
+const FIELD_SEP: u8 = 0x1f;
+
+const PRE_NONUKE: u8 = 0;
+const PRE_UNNUKED: u8 = 1;
+const PRE_NUKED: u8 = 2;
+const PRE_MODNUKE: u8 = 3;
+const PRE_RENUKED: u8 = 4;
+const PRE_OLDNUKE: u8 = 5;
+
+#[inline]
+fn json_ws(s: &[u8], mut p: usize) -> usize {
+    while p < s.len() && matches!(s[p], b' ' | b'\t' | b'\r' | b'\n') {
+        p += 1;
+    }
+    p
+}
+
+/// First index at or after `p` holding `"`, `\\` or a control byte (eight bytes per step).
+#[inline]
+fn json_string_stop(s: &[u8], mut p: usize) -> usize {
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    while p + 8 <= s.len() {
+        let x = u64::from_le_bytes(s[p..p + 8].try_into().unwrap());
+        let quote = x ^ (LO * u64::from(b'"'));
+        let slash = x ^ (LO * u64::from(b'\\'));
+        // The lowest flagged byte of each zero/less-than test is exact.
+        let hit = ((quote.wrapping_sub(LO) & !quote)
+            | (slash.wrapping_sub(LO) & !slash)
+            | (x.wrapping_sub(LO * 0x20) & !x))
+            & HI;
+        if hit != 0 {
+            return p + (hit.trailing_zeros() / 8) as usize;
+        }
+        p += 8;
+    }
+    while p < s.len() && !matches!(s[p], b'"' | b'\\' | 0..=0x1f) {
+        p += 1;
+    }
+    p
+}
+
+#[inline]
+fn hex_digit(b: u8) -> Option<u32> {
+    match b {
+        b'0'..=b'9' => Some(u32::from(b - b'0')),
+        b'a'..=b'f' => Some(u32::from(b - b'a' + 10)),
+        b'A'..=b'F' => Some(u32::from(b - b'A' + 10)),
+        _ => None,
+    }
+}
+
+#[inline]
+fn json_hex4(s: &[u8]) -> Option<u32> {
+    let h = s.get(..4)?;
+    Some(hex_digit(h[0])? << 12 | hex_digit(h[1])? << 8 | hex_digit(h[2])? << 4 | hex_digit(h[3])?)
+}
+
+/// `decode_json_key()` copying unescaped runs at once: appends the decoded bytes to `out` when
+/// given and returns `false` for escapes `json_decode` rejects.
+fn json_unescape(raw: &[u8], mut out: Option<&mut Vec<u8>>) -> bool {
+    let mut i = 0;
+    while let Some(run) = raw[i..].iter().position(|&b| b == b'\\') {
+        if let Some(o) = out.as_deref_mut() {
+            o.extend_from_slice(&raw[i..i + run]);
+        }
+        i += run;
+        let Some(&e) = raw.get(i + 1) else {
+            return false;
+        };
+        i += 2;
+        let byte = match e {
+            b'"' => b'"',
+            b'\\' => b'\\',
+            b'/' => b'/',
+            b'b' => 0x08,
+            b'f' => 0x0c,
+            b'n' => b'\n',
+            b'r' => b'\r',
+            b't' => b'\t',
+            b'u' => {
+                let Some(hi) = json_hex4(&raw[i..]) else {
+                    return false;
+                };
+                i += 4;
+                let cp = if (0xD800..0xDC00).contains(&hi) {
+                    if raw.get(i) != Some(&b'\\') || raw.get(i + 1) != Some(&b'u') {
+                        return false;
+                    }
+                    let Some(lo) = json_hex4(&raw[i + 2..]) else {
+                        return false;
+                    };
+                    if !(0xDC00..0xE000).contains(&lo) {
+                        return false;
+                    }
+                    i += 6;
+                    0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
+                } else if (0xDC00..0xE000).contains(&hi) {
+                    return false;
+                } else {
+                    hi
+                };
+                if let Some(o) = out.as_deref_mut() {
+                    let Some(ch) = char::from_u32(cp) else {
+                        return false;
+                    };
+                    let mut buf = [0u8; 4];
+                    o.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                }
+                continue;
+            }
+            _ => return false,
+        };
+        if let Some(o) = out.as_deref_mut() {
+            o.push(byte);
+        }
+    }
+    if let Some(o) = out {
+        o.extend_from_slice(&raw[i..]);
+    }
+    true
+}
+
+/// Validates one JSON string starting at the opening quote (escapes as `json_unescape()` accepts
+/// them); returns the index after the closing quote.
+fn jv_string(s: &[u8], mut p: usize) -> Option<usize> {
+    p += 1;
+    loop {
+        p = json_string_stop(s, p);
+        match *s.get(p)? {
+            b'"' => return Some(p + 1),
+            b'\\' => match *s.get(p + 1)? {
+                b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => p += 2,
+                b'u' => {
+                    let unit = json_hex4(s.get(p + 2..)?)?;
+                    p += 6;
+                    if (0xD800..0xDC00).contains(&unit) {
+                        if s.get(p) != Some(&b'\\') || s.get(p + 1) != Some(&b'u') {
+                            return None;
+                        }
+                        let low = json_hex4(s.get(p + 2..)?)?;
+                        if !(0xDC00..0xE000).contains(&low) {
+                            return None;
+                        }
+                        p += 6;
+                    } else if (0xDC00..0xE000).contains(&unit) {
+                        return None;
+                    }
+                }
+                _ => return None,
+            },
+            _ => return None,
+        }
+    }
+}
+
+fn jv_number(s: &[u8], mut p: usize) -> Option<usize> {
+    if s.get(p) == Some(&b'-') {
+        p += 1;
+    }
+    match s.get(p) {
+        Some(b'0') => p += 1,
+        Some(b'1'..=b'9') => p = skip_digits(s, p),
+        _ => return None,
+    }
+    if s.get(p) == Some(&b'.') {
+        let q = skip_digits(s, p + 1);
+        if q == p + 1 {
+            return None;
+        }
+        p = q;
+    }
+    if matches!(s.get(p), Some(b'e' | b'E')) {
+        p += 1;
+        if matches!(s.get(p), Some(b'+' | b'-')) {
+            p += 1;
+        }
+        let q = skip_digits(s, p);
+        if q == p {
+            return None;
+        }
+        p = q;
+    }
+    Some(p)
+}
+
+fn jv_value(s: &[u8], p: usize, depth: usize, ends: &mut Vec<(u32, u32)>) -> Option<usize> {
+    let mut p = json_ws(s, p);
+    match *s.get(p)? {
+        b'{' => {
+            if depth >= MAX_JSON_DEPTH {
+                return None;
+            }
+            let slot = ends.len();
+            ends.push((p as u32, 0));
+            p = json_ws(s, p + 1);
+            if s.get(p) == Some(&b'}') {
+                ends[slot].1 = (p + 1) as u32;
+                return Some(p + 1);
+            }
+            loop {
+                if s.get(p) != Some(&b'"') {
+                    return None;
+                }
+                p = json_ws(s, jv_string(s, p)?);
+                if s.get(p) != Some(&b':') {
+                    return None;
+                }
+                p = json_ws(s, jv_value(s, p + 1, depth + 1, ends)?);
+                match s.get(p) {
+                    Some(b',') => p = json_ws(s, p + 1),
+                    Some(b'}') => {
+                        ends[slot].1 = (p + 1) as u32;
+                        return Some(p + 1);
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        b'[' => {
+            if depth >= MAX_JSON_DEPTH {
+                return None;
+            }
+            let slot = ends.len();
+            ends.push((p as u32, 0));
+            p = json_ws(s, p + 1);
+            if s.get(p) == Some(&b']') {
+                ends[slot].1 = (p + 1) as u32;
+                return Some(p + 1);
+            }
+            loop {
+                p = json_ws(s, jv_value(s, p, depth + 1, ends)?);
+                match s.get(p) {
+                    Some(b',') => p += 1,
+                    Some(b']') => {
+                        ends[slot].1 = (p + 1) as u32;
+                        return Some(p + 1);
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        b'"' => jv_string(s, p),
+        b't' => lit(s, p, b"true"),
+        b'f' => lit(s, p, b"false"),
+        b'n' => lit(s, p, b"null"),
+        _ => jv_number(s, p),
+    }
+}
+
+/// The validated document and the `(start, end)` offsets of every container in document order.
+struct JDoc<'a> {
+    s: &'a [u8],
+    ends: Vec<(u32, u32)>,
+}
+
+impl JDoc<'_> {
+    /// End (exclusive) of the container opening at `p` within `span`, a slice of this document.
+    #[inline]
+    fn container_end(&self, span: &[u8], p: usize) -> usize {
+        let base = span.as_ptr() as usize - self.s.as_ptr() as usize;
+        let at = (base + p) as u32;
+        let slot = self
+            .ends
+            .binary_search_by_key(&at, |e| e.0)
+            .expect("validated container");
+        self.ends[slot].1 as usize - base
+    }
+}
+
+/// `json_decode($s, true)` succeeds (within the depth this reader supports).
+fn json_document(s: &[u8]) -> Option<JDoc<'_>> {
+    if s.len() >= u32::MAX as usize || std::str::from_utf8(s).is_err() {
+        return None;
+    }
+    let mut ends = Vec::with_capacity(s.len() / 64);
+    let end = jv_value(s, 0, 0, &mut ends)?;
+    (json_ws(s, end) == s.len()).then_some(JDoc { s, ends })
+}
+
+#[cfg(test)]
+fn json_document_valid(s: &[u8]) -> bool {
+    json_document(s).is_some()
+}
+
+/// A value inside an already validated document.
+#[derive(Clone, Copy)]
+enum JVal<'a> {
+    Null,
+    Bool(bool),
+    Num(&'a [u8]),
+    /// Raw string content between the quotes, escapes still encoded.
+    Str(&'a [u8]),
+    /// Whole span including the brackets.
+    Arr(&'a [u8]),
+    Obj(&'a [u8]),
+}
+
+#[derive(Clone, Copy)]
+enum Num {
+    I(i64),
+    F(f64),
+}
+
+#[inline]
+fn jskip_string(s: &[u8], mut p: usize) -> usize {
+    loop {
+        p = json_string_stop(s, p);
+        if s[p] == b'"' {
+            return p;
+        }
+        p += 2;
+    }
+}
+
+/// Reads the value at `*p` (no leading whitespace) of a validated document and advances past it.
+fn jread<'a>(d: &JDoc<'_>, s: &'a [u8], p: &mut usize) -> JVal<'a> {
+    let start = *p;
+    match s[start] {
+        b'"' => {
+            let end = jskip_string(s, start + 1);
+            *p = end + 1;
+            JVal::Str(&s[start + 1..end])
+        }
+        b'{' => {
+            *p = d.container_end(s, start);
+            JVal::Obj(&s[start..*p])
+        }
+        b'[' => {
+            *p = d.container_end(s, start);
+            JVal::Arr(&s[start..*p])
+        }
+        b't' => {
+            *p += 4;
+            JVal::Bool(true)
+        }
+        b'f' => {
+            *p += 5;
+            JVal::Bool(false)
+        }
+        b'n' => {
+            *p += 4;
+            JVal::Null
+        }
+        _ => {
+            let mut end = start;
+            while end < s.len() && matches!(s[end], b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
+            {
+                end += 1;
+            }
+            *p = end;
+            JVal::Num(&s[start..end])
+        }
+    }
+}
+
+/// Calls `f` for each element of a validated array span.
+fn jelements<'a>(
+    d: &JDoc<'_>,
+    span: &'a [u8],
+    mut f: impl FnMut(JVal<'a>) -> Option<bool>,
+) -> Option<()> {
+    let mut p = json_ws(span, 1);
+    if span[p] == b']' {
+        return Some(());
+    }
+    loop {
+        let v = jread(d, span, &mut p);
+        if !f(v)? {
+            return Some(());
+        }
+        p = json_ws(span, p);
+        if span[p] == b']' {
+            return Some(());
+        }
+        p = json_ws(span, p + 1);
+    }
+}
+
+#[inline]
+fn container_empty(span: &[u8]) -> bool {
+    json_ws(span, 1) == span.len() - 1
+}
+
+/// The decoded bytes of a raw JSON string token.
+fn jdecode(raw: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    if raw.contains(&b'\\') {
+        let mut out = Vec::with_capacity(raw.len());
+        json_unescape(raw, Some(&mut out));
+        std::borrow::Cow::Owned(out)
+    } else {
+        std::borrow::Cow::Borrowed(raw)
+    }
+}
+
+/// Last-wins lookups (PHP array semantics) of `names` in a validated object span.
+fn jlookup<'a, const N: usize>(
+    d: &JDoc<'_>,
+    span: &'a [u8],
+    names: [&[u8]; N],
+) -> [Option<JVal<'a>>; N] {
+    let mut found = [None; N];
+    let mut p = json_ws(span, 1);
+    if span[p] == b'}' {
+        return found;
+    }
+    loop {
+        let key_end = jskip_string(span, p + 1);
+        let raw_key = &span[p + 1..key_end];
+        p = json_ws(span, key_end + 1);
+        p = json_ws(span, p + 1);
+        let v = jread(d, span, &mut p);
+        // Unescaped keys (the norm) compare raw; length and first byte reject most members.
+        let slot = if raw_key.contains(&b'\\') {
+            let key = jdecode(raw_key);
+            names.iter().position(|n| *n == &key[..])
+        } else {
+            names.iter().position(|n| {
+                n.len() == raw_key.len() && n.first() == raw_key.first() && *n == raw_key
+            })
+        };
+        if let Some(k) = slot {
+            found[k] = Some(v);
+        }
+        p = json_ws(span, p);
+        if span[p] == b'}' {
+            return found;
+        }
+        p = json_ws(span, p + 1);
+    }
+}
+
+#[inline]
+fn jobject(v: Option<JVal<'_>>) -> Option<&[u8]> {
+    match v {
+        Some(JVal::Obj(span)) => Some(span),
+        _ => None,
+    }
+}
+
+/// `is_string($v) && $v !== ''` → the decoded string.
+fn jnonempty_string(v: Option<JVal<'_>>) -> Option<std::borrow::Cow<'_, [u8]>> {
+    match v {
+        Some(JVal::Str(raw)) if !raw.is_empty() => Some(jdecode(raw)),
+        _ => None,
+    }
+}
+
+fn plain_integer(s: &[u8]) -> bool {
+    let digits = s.strip_prefix(b"-").unwrap_or(s);
+    !digits.is_empty() && digits.iter().all(u8::is_ascii_digit)
+}
+
+fn parse_i64(s: &[u8]) -> Option<i64> {
+    std::str::from_utf8(s).ok()?.parse().ok()
+}
+
+/// `is_numeric($v) ? <number> : null`; `Err` declines (numeric strings other than plain integers).
+fn jnumeric(v: Option<JVal<'_>>) -> Result<Option<Num>, ()> {
+    match v {
+        Some(JVal::Num(raw)) => {
+            if !raw.iter().any(|b| matches!(b, b'.' | b'e' | b'E'))
+                && let Some(i) = parse_i64(raw)
+            {
+                return Ok(Some(Num::I(i)));
+            }
+            let f: f64 = std::str::from_utf8(raw)
+                .ok()
+                .and_then(|t| t.parse().ok())
+                .ok_or(())?;
+            Ok(Some(Num::F(f)))
+        }
+        Some(JVal::Str(raw)) => {
+            let s = jdecode(raw);
+            if plain_integer(&s) {
+                parse_i64(&s).map(|i| Some(Num::I(i))).ok_or(())
+            } else if s.iter().any(u8::is_ascii_digit) {
+                Err(())
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+/// `(float) $numeric`.
+#[inline]
+fn num_float(n: Num) -> f64 {
+    match n {
+        Num::I(i) => i as f64,
+        Num::F(f) => f,
+    }
+}
+
+/// `(int) $numeric`; `Err` declines floats PHP cannot narrow exactly.
+fn num_int(n: Num) -> Result<i64, ()> {
+    match n {
+        Num::I(i) => Ok(i),
+        Num::F(f) if f.is_finite() && f > -9.2e18 && f < 9.2e18 => Ok(f.trunc() as i64),
+        Num::F(_) => Err(()),
+    }
+}
+
+/// `(int) ($v ?? 0)` for any JSON value.
+fn jint_cast(v: Option<JVal<'_>>) -> Result<i64, ()> {
+    match v {
+        None | Some(JVal::Null) | Some(JVal::Bool(false)) => Ok(0),
+        Some(JVal::Bool(true)) => Ok(1),
+        Some(JVal::Arr(span) | JVal::Obj(span)) => Ok(i64::from(!container_empty(span))),
+        Some(JVal::Num(_)) => num_int(jnumeric(v)?.ok_or(())?),
+        Some(JVal::Str(raw)) => {
+            let s = jdecode(raw);
+            if plain_integer(&s) {
+                parse_i64(&s).ok_or(())
+            } else if s.iter().any(u8::is_ascii_digit) {
+                Err(())
+            } else {
+                Ok(0)
+            }
+        }
+    }
+}
+
+/// `! empty($v)`.
+fn jtruthy(v: Option<JVal<'_>>) -> Result<bool, ()> {
+    Ok(match v {
+        None | Some(JVal::Null) => false,
+        Some(JVal::Bool(b)) => b,
+        Some(JVal::Num(_)) => match jnumeric(v)?.ok_or(())? {
+            Num::I(i) => i != 0,
+            Num::F(f) => f != 0.0,
+        },
+        Some(JVal::Str(raw)) => {
+            let s = jdecode(raw);
+            !(s.is_empty() || &s[..] == b"0")
+        }
+        Some(JVal::Arr(span) | JVal::Obj(span)) => !container_empty(span),
+    })
+}
+
+/// `(string) $v` for a scalar, `None` meaning "not a string" for non-string scalars that can
+/// never equal the compared keywords; `Err` for arrays (PHP warns on array-to-string).
+fn jscalar_string(v: JVal<'_>) -> Result<Option<std::borrow::Cow<'_, [u8]>>, ()> {
+    match v {
+        JVal::Str(raw) => Ok(Some(jdecode(raw))),
+        JVal::Arr(_) | JVal::Obj(_) => Err(()),
+        _ => Ok(None),
+    }
+}
+
+/// Appends the decimal form of `v`.
+fn push_i64(out: &mut Vec<u8>, v: i64) {
+    let mut buf = [0u8; 20];
+    let mut n = v.unsigned_abs();
+    let mut at = buf.len();
+    loop {
+        at -= 1;
+        buf[at] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    if v < 0 {
+        out.push(b'-');
+    }
+    out.extend_from_slice(&buf[at..]);
+}
+
+/// Appends decoded field bytes; `None` when they contain a record or field separator.
+fn push_field(out: &mut Vec<u8>, bytes: &[u8]) -> Option<()> {
+    if bytes.iter().any(|&b| b == REC_SEP || b == FIELD_SEP) {
+        return None;
+    }
+    out.extend_from_slice(bytes);
+    Some(())
+}
+
+/// `PredbFeedEntry::sizeFromMegabytes($mb)`. Values that are not clearly away from a rounding
+/// tie (or large) are written as `~<float>` so PHP formats them; non-finite values decline.
+fn push_size(out: &mut Vec<u8>, mb: f64) -> Option<()> {
+    if !mb.is_finite() {
+        return None;
+    }
+    if mb <= 0.0 {
+        return Some(());
+    }
+    let (value, unit): (f64, &[u8]) = if mb < 1.0 {
+        (mb * 1024.0, b"KB")
+    } else {
+        (mb, b"MB")
+    };
+    let scaled = value * 100.0;
+    let frac = scaled - scaled.floor();
+    if value < 1e6 && (frac - 0.5).abs() > 1e-6 {
+        // rtrim(rtrim(number_format($value, 2, '.', ''), '0'), '.')
+        let cents = scaled.round() as i64;
+        push_i64(out, cents / 100);
+        let fraction = cents % 100;
+        if fraction != 0 {
+            out.push(b'.');
+            out.push(b'0' + (fraction / 10) as u8);
+            if fraction % 10 != 0 {
+                out.push(b'0' + (fraction % 10) as u8);
+            }
+        }
+        out.extend_from_slice(unit);
+    } else {
+        out.push(b'~');
+        out.extend_from_slice(format!("{mb:?}").as_bytes());
+    }
+    Some(())
+}
+
+/// `PredbFeedEntry::filesFromCount(is_numeric($v) ? (int) $v : null)`.
+fn push_files(out: &mut Vec<u8>, v: Option<JVal<'_>>) -> Option<()> {
+    if let Some(n) = jnumeric(v).ok()? {
+        let count = num_int(n).ok()?;
+        if count > 0 {
+            push_i64(out, count);
+        }
+    }
+    Some(())
+}
+
+/// `is_numeric($v) ? (float) $v * $scale : null` passed to `sizeFromMegabytes`.
+fn push_numeric_size(out: &mut Vec<u8>, v: Option<JVal<'_>>, divisor: f64) -> Option<()> {
+    match jnumeric(v).ok()? {
+        Some(n) => push_size(out, num_float(n) / divisor),
+        None => Some(()),
+    }
+}
+
+/// `is_numeric($v) ? (int) $v : null` as a decimal timestamp field.
+fn push_timestamp(out: &mut Vec<u8>, v: Option<JVal<'_>>) -> Option<()> {
+    if let Some(n) = jnumeric(v).ok()? {
+        push_i64(out, num_int(n).ok()?);
+    }
+    Some(())
+}
+
+/// The trimmed, non-empty title from `is_string($v) && trim($v) !== ''`, or `None` to skip the row.
+fn row_title(v: Option<JVal<'_>>) -> Option<std::borrow::Cow<'_, [u8]>> {
+    let JVal::Str(raw) = v? else {
+        return None;
+    };
+    let title = match jdecode(raw) {
+        std::borrow::Cow::Borrowed(b) => std::borrow::Cow::Borrowed(php_trim(b)),
+        std::borrow::Cow::Owned(mut o) => {
+            let end = o.len() - o.iter().rev().take_while(|&&b| is_php_trim(b)).count();
+            o.truncate(end);
+            let start = o.iter().take_while(|&&b| is_php_trim(b)).count();
+            o.drain(..start);
+            std::borrow::Cow::Owned(o)
+        }
+    };
+    (!title.is_empty()).then_some(title)
+}
+
+/// Starts a record: title and category fields.
+fn begin_record(out: &mut Vec<u8>, title: &[u8], category: Option<&[u8]>) -> Option<()> {
+    out.push(FIELD_SEP);
+    push_field(out, title)?;
+    out.push(FIELD_SEP);
+    if let Some(c) = category {
+        push_field(out, c)?;
+    }
+    out.push(FIELD_SEP);
+    Some(())
+}
+
+/// Ends a record after its timestamp field: nuke status and reason.
+fn end_record(out: &mut Vec<u8>, nuked: u8, reason: Option<&[u8]>) -> Option<()> {
+    out.push(FIELD_SEP);
+    out.push(b'0' + nuked);
+    out.push(FIELD_SEP);
+    if let Some(r) = reason {
+        push_field(out, r)?;
+    }
+    Some(())
+}
+
+/// `PredbOvhSource::preId()`: canonical positive uint64 string.
+fn ovh_pre_id(v: Option<JVal<'_>>) -> Result<Option<Vec<u8>>, ()> {
+    match v {
+        Some(JVal::Num(_)) => match jnumeric(v)? {
+            Some(Num::I(i)) => Ok((i > 0).then(|| i.to_string().into_bytes())),
+            _ => Ok(None),
+        },
+        Some(JVal::Str(raw)) => {
+            let s = jdecode(raw);
+            if s.is_empty() || !s.iter().all(u8::is_ascii_digit) {
+                return Ok(None);
+            }
+            let start = s.iter().position(|&b| b != b'0').unwrap_or(s.len());
+            let id = &s[start..];
+            if id.is_empty()
+                || id.len() > 20
+                || (id.len() == 20 && id > &b"18446744073709551615"[..])
+            {
+                return Ok(None);
+            }
+            Ok(Some(id.to_vec()))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// The envelope check shared by the predb.ovh-style APIs: `status === 'error'` declines.
+fn status_is_error(d: &JDoc<'_>, top: &[u8]) -> bool {
+    let [status] = jlookup(d, top, [b"status"]);
+    matches!(status, Some(JVal::Str(raw)) if &jdecode(raw)[..] == b"error")
+}
+
+fn json_rows<'a>(d: &JDoc<'_>, top: Option<&'a [u8]>, key: &[u8]) -> Option<&'a [u8]> {
+    let [rows] = jlookup(d, top?, [key]);
+    match rows {
+        Some(JVal::Arr(span)) => Some(span),
+        _ => None,
+    }
+}
+
+fn json_feed(d: &JDoc<'_>, source: u32, limit: usize, out: &mut Vec<u8>) -> Option<()> {
+    let s = d.s;
+    let mut p = json_ws(s, 0);
+    let root = jread(d, s, &mut p);
+    let top = match root {
+        JVal::Obj(span) => Some(span),
+        _ => None,
+    };
+    match source {
+        JSON_PREDATABASE => {
+            let [results, next] = jlookup(d, top?, [b"results", b"next_page_id"]);
+            let Some(JVal::Arr(rows)) = results else {
+                return None;
+            };
+            match next {
+                None | Some(JVal::Null) => {}
+                Some(JVal::Str(raw)) => push_field(out, &jdecode(raw))?,
+                Some(_) => return None,
+            }
+            let mut first: Option<i64> = None;
+            let mut last: Option<i64> = None;
+            let mut body = Vec::with_capacity(rows.len() / 2);
+            jelements(d, rows, |row| {
+                let JVal::Obj(row) = row else {
+                    return Some(true);
+                };
+                let [name, section, size, files, ctime] = jlookup(
+                    d,
+                    row,
+                    [b"rlsname", b"section", b"size", b"files", b"ctime"],
+                );
+                let time = match jnumeric(ctime).ok()? {
+                    Some(n) => num_int(n).ok()?,
+                    None => 0,
+                };
+                if time > 0 {
+                    if last.is_some_and(|l| time > l) {
+                        return None;
+                    }
+                    first.get_or_insert(time);
+                    last = Some(time);
+                }
+                let Some(title) = row_title(name) else {
+                    return Some(true);
+                };
+                begin_record(&mut body, &title, jnonempty_string(section).as_deref())?;
+                push_numeric_size(&mut body, size, 1.0)?;
+                body.push(FIELD_SEP);
+                push_files(&mut body, files)?;
+                body.push(FIELD_SEP);
+                if time > 0 {
+                    push_i64(&mut body, time);
+                }
+                end_record(&mut body, PRE_NONUKE, None)?;
+                Some(true)
+            })?;
+            out.push(FIELD_SEP);
+            if let (Some(f), Some(l)) = (first, last) {
+                push_i64(out, f);
+                out.push(FIELD_SEP);
+                push_i64(out, l);
+            } else {
+                out.push(FIELD_SEP);
+            }
+            out.extend_from_slice(&body);
+        }
+        JSON_XREL | JSON_XREL_P2P => {
+            let [pagination, list] = jlookup(d, top?, [b"pagination", b"list"]);
+            let Some(JVal::Arr(rows)) = list else {
+                return None;
+            };
+            let total = match jobject(pagination) {
+                Some(span) => match jlookup(d, span, [b"total_pages"]) {
+                    [None] => -1,
+                    [v] => jint_cast(v).ok()?,
+                },
+                None => -1,
+            };
+            push_i64(out, total);
+            let p2p = source == JSON_XREL_P2P;
+            jelements(d, rows, |row| {
+                let JVal::Obj(row) = row else {
+                    return Some(true);
+                };
+                let [
+                    dirname,
+                    time,
+                    size,
+                    ext_info,
+                    flags,
+                    pub_time,
+                    size_mb,
+                    category,
+                ] = jlookup(
+                    d,
+                    row,
+                    [
+                        b"dirname",
+                        b"time",
+                        b"size",
+                        b"ext_info",
+                        b"flags",
+                        b"pub_time",
+                        b"size_mb",
+                        b"category",
+                    ],
+                );
+                let Some(title) = row_title(dirname) else {
+                    return Some(true);
+                };
+                if p2p {
+                    let (mut meta, mut sub) = (Vec::new(), Vec::new());
+                    if let Some(span) = category.and_then(|c| match c {
+                        JVal::Obj(s) => Some(s),
+                        _ => None,
+                    }) {
+                        let [m, s] = jlookup(d, span, [b"meta_cat", b"sub_cat"]);
+                        if let Some(JVal::Str(raw)) = m {
+                            meta = jdecode(raw).to_ascii_uppercase();
+                        }
+                        if let Some(JVal::Str(raw)) = s {
+                            sub = jdecode(raw).into_owned();
+                        }
+                    }
+                    let label = if meta.is_empty() {
+                        None
+                    } else if sub.is_empty() {
+                        Some(meta)
+                    } else {
+                        meta.push(b'-');
+                        meta.extend_from_slice(&sub);
+                        Some(meta)
+                    };
+                    begin_record(out, &title, label.as_deref())?;
+                    push_numeric_size(out, size_mb, 1.0)?;
+                    out.push(FIELD_SEP);
+                    out.push(FIELD_SEP);
+                    push_timestamp(out, pub_time)?;
+                    end_record(out, PRE_NONUKE, None)?;
+                } else {
+                    let kind = jobject(ext_info)
+                        .and_then(|span| jnonempty_string(jlookup(d, span, [b"type"])[0]))
+                        .map(|t| t.to_ascii_uppercase());
+                    begin_record(out, &title, kind.as_deref())?;
+                    if let Some(span) = jobject(size) {
+                        let [number, unit] = jlookup(d, span, [b"number", b"unit"]);
+                        if let Some(n) = jnumeric(number).ok()? {
+                            let unit = match unit {
+                                None => None,
+                                Some(u) => jscalar_string(u).ok()?,
+                            };
+                            let n = num_float(n);
+                            let mb = match unit.as_deref().map(<[u8]>::to_ascii_uppercase) {
+                                Some(u) if u == b"KB" => Some(n / 1024.0),
+                                Some(u) if u == b"MB" => Some(n),
+                                Some(u) if u == b"GB" => Some(n * 1024.0),
+                                Some(u) if u == b"TB" => Some(n * 1_048_576.0),
+                                _ => None,
+                            };
+                            if let Some(mb) = mb {
+                                push_size(out, mb)?;
+                            }
+                        }
+                    }
+                    out.push(FIELD_SEP);
+                    out.push(FIELD_SEP);
+                    push_timestamp(out, time)?;
+                    let nuked = match jobject(flags) {
+                        Some(span) => jtruthy(jlookup(d, span, [b"nuke_rls"])[0]).ok()?,
+                        None => false,
+                    };
+                    end_record(out, if nuked { PRE_NUKED } else { PRE_NONUKE }, None)?;
+                }
+                Some(true)
+            })?;
+        }
+        JSON_SRRDB => {
+            let rows = json_rows(d, top, b"results")?;
+            jelements(d, rows, |row| {
+                let JVal::Obj(row) = row else {
+                    return Some(true);
+                };
+                let [release, date] = jlookup(d, row, [b"release", b"date"]);
+                let Some(title) = row_title(release) else {
+                    return Some(true);
+                };
+                begin_record(out, &title, None)?;
+                out.push(FIELD_SEP);
+                out.push(FIELD_SEP);
+                if let Some(JVal::Str(raw)) = date {
+                    let decoded = jdecode(raw);
+                    let value = php_trim(&decoded);
+                    if !value.is_empty() {
+                        let canonical = value.len() == 19
+                            && value.iter().enumerate().all(|(i, &b)| match i {
+                                4 | 7 => b == b'-',
+                                10 => b == b' ',
+                                13 | 16 => b == b':',
+                                _ => b.is_ascii_digit(),
+                            });
+                        out.push(if canonical { b'!' } else { b'~' });
+                        push_field(out, value)?;
+                    }
+                }
+                end_record(out, PRE_NONUKE, None)?;
+                Some(true)
+            })?;
+        }
+        JSON_PREDB_OVH | JSON_PREDB_CLUB => {
+            if status_is_error(d, top?) {
+                return None;
+            }
+            let [data] = jlookup(d, top?, [b"data"]);
+            let rows = json_rows(d, jobject(data), b"rows")?;
+            let ovh = source == JSON_PREDB_OVH;
+            jelements(d, rows, |row| {
+                let JVal::Obj(row) = row else {
+                    return Some(true);
+                };
+                let [name, id, cat, size, files, pre_at, nuke] = jlookup(
+                    d,
+                    row,
+                    [b"name", b"id", b"cat", b"size", b"files", b"preAt", b"nuke"],
+                );
+                let Some(title) = row_title(name) else {
+                    return Some(true);
+                };
+                let nuke_value = match nuke {
+                    Some(v @ (JVal::Obj(_) | JVal::Arr(_))) => Some(v),
+                    _ => None,
+                };
+                let nuke_span = nuke_value.and_then(|v| match v {
+                    JVal::Obj(s) => Some(s),
+                    _ => None,
+                });
+                let [type_id, kind, reason_value, pre_id] = match nuke_span {
+                    Some(span) => jlookup(d, span, [b"typeId", b"type", b"reason", b"preId"]),
+                    None => [None; 4],
+                };
+                let (nuked, reason) = if ovh {
+                    let row_id = ovh_pre_id(id).ok()?;
+                    let nuke_pre_id = ovh_pre_id(pre_id).ok()?;
+                    let same = match (&row_id, &nuke_pre_id) {
+                        (Some(a), Some(b)) => a == b,
+                        _ => true,
+                    };
+                    let type_id = if nuke_value.is_some() && same {
+                        jint_cast(type_id).ok()?
+                    } else {
+                        0
+                    };
+                    let reason = if same {
+                        jnonempty_string(reason_value)
+                    } else {
+                        None
+                    };
+                    let nuked = match type_id {
+                        0 => PRE_NONUKE,
+                        1 => PRE_NUKED,
+                        2 | 5 => PRE_UNNUKED,
+                        3 => PRE_MODNUKE,
+                        _ => PRE_NUKED,
+                    };
+                    (nuked, if type_id == 0 { None } else { reason })
+                } else if nuke_value.is_none() {
+                    (PRE_NONUKE, None)
+                } else {
+                    let kind = match kind {
+                        None | Some(JVal::Null) => Some(std::borrow::Cow::Borrowed(&b"nuke"[..])),
+                        Some(v) => jscalar_string(v).ok()?,
+                    };
+                    let nuked = match kind.map(|k| k.to_ascii_lowercase()).as_deref() {
+                        Some(b"unnuke" | b"undelpre") => PRE_UNNUKED,
+                        Some(b"modnuke") => PRE_MODNUKE,
+                        Some(b"renuke") => PRE_RENUKED,
+                        Some(b"oldnuke") => PRE_OLDNUKE,
+                        _ => PRE_NUKED,
+                    };
+                    (nuked, jnonempty_string(reason_value))
+                };
+                begin_record(out, &title, jnonempty_string(cat).as_deref())?;
+                push_numeric_size(out, size, if ovh { 1024.0 } else { 1.0 })?;
+                out.push(FIELD_SEP);
+                push_files(out, files)?;
+                out.push(FIELD_SEP);
+                push_timestamp(out, pre_at)?;
+                end_record(out, nuked, reason.as_deref())?;
+                Some(true)
+            })?;
+        }
+        JSON_PREDB_NET => {
+            if status_is_error(d, top?) {
+                return None;
+            }
+            let rows = json_rows(d, top, b"data")?;
+            jelements(d, rows, |row| {
+                let JVal::Obj(row) = row else {
+                    return Some(true);
+                };
+                let [release, section, size, files, pretime, status, reason] = jlookup(
+                    d,
+                    row,
+                    [
+                        b"release", b"section", b"size", b"files", b"pretime", b"status", b"reason",
+                    ],
+                );
+                let Some(title) = row_title(release) else {
+                    return Some(true);
+                };
+                let status = jint_cast(status).ok()?;
+                let nuked = match status {
+                    0 => PRE_NONUKE,
+                    2 | 4 => PRE_UNNUKED,
+                    _ => PRE_NUKED,
+                };
+                let reason = if status == 0 {
+                    None
+                } else {
+                    jnonempty_string(reason)
+                };
+                begin_record(out, &title, jnonempty_string(section).as_deref())?;
+                push_numeric_size(out, size, 1.0)?;
+                out.push(FIELD_SEP);
+                push_files(out, files)?;
+                out.push(FIELD_SEP);
+                push_timestamp(out, pretime)?;
+                end_record(out, nuked, reason.as_deref())?;
+                Some(true)
+            })?;
+        }
+        JSON_PREDB_ORG => {
+            let rows = json_rows(d, top, b"values")?;
+            jelements(d, rows, |row| {
+                let JVal::Obj(row) = row else {
+                    return Some(true);
+                };
+                let [rlsname, section, size, files, ctime, status, reason] = jlookup(
+                    d,
+                    row,
+                    [
+                        b"rlsname",
+                        b"section",
+                        b"size",
+                        b"files",
+                        b"ctime",
+                        b"status",
+                        b"nukereason",
+                    ],
+                );
+                let Some(title) = row_title(rlsname) else {
+                    return Some(true);
+                };
+                let reason = jnonempty_string(reason);
+                // (string) ($status ?? '0') === '1'
+                let status_one = match status {
+                    None | Some(JVal::Null) | Some(JVal::Bool(false)) => false,
+                    Some(JVal::Bool(true)) => true,
+                    Some(JVal::Str(raw)) => &jdecode(raw)[..] == b"1",
+                    Some(JVal::Num(_)) => match jnumeric(status).ok()?? {
+                        Num::I(i) => i == 1,
+                        Num::F(f) => f == 1.0,
+                    },
+                    Some(JVal::Arr(_) | JVal::Obj(_)) => return None,
+                };
+                let nuked = if status_one || reason.is_some() {
+                    PRE_NUKED
+                } else {
+                    PRE_NONUKE
+                };
+                begin_record(out, &title, jnonempty_string(section).as_deref())?;
+                push_numeric_size(out, size, 1.0)?;
+                out.push(FIELD_SEP);
+                push_files(out, files)?;
+                out.push(FIELD_SEP);
+                push_timestamp(out, ctime)?;
+                end_record(out, nuked, reason.as_deref())?;
+                Some(true)
+            })?;
+        }
+        JSON_APIBAY => {
+            let JVal::Arr(rows) = root else {
+                return None;
+            };
+            let mut count = 0usize;
+            jelements(d, rows, |row| {
+                let JVal::Obj(row) = row else {
+                    return Some(true);
+                };
+                let [name, category, size, num_files, added] = jlookup(
+                    d,
+                    row,
+                    [b"name", b"category", b"size", b"num_files", b"added"],
+                );
+                let Some(title) = row_title(name) else {
+                    return Some(true);
+                };
+                let label: &[u8] = match jint_cast(category).ok()? {
+                    201 => b"MOVIE",
+                    207 => b"MOVIE-HD",
+                    205 => b"TV",
+                    208 => b"TV-HD",
+                    _ => return Some(true),
+                };
+                begin_record(out, &title, Some(label))?;
+                push_numeric_size(out, size, 1_048_576.0)?;
+                out.push(FIELD_SEP);
+                push_files(out, num_files)?;
+                out.push(FIELD_SEP);
+                push_timestamp(out, added)?;
+                end_record(out, PRE_NONUKE, None)?;
+                count += 1;
+                Some(count < limit)
+            })?;
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+/// Parses a PreDB JSON feed response body for `source` (1 predataba.se, 2 xREL, 3 xREL P2P,
+/// 4 srrDB, 5 predb.ovh, 6 predb.club, 7 predb.net, 8 predb.org, 9 apibay; `limit` caps apibay
+/// entries). Output: `K`, the header (predataba.se: next cursor, newest and oldest positive
+/// `ctime`; xREL: `(int)` total pages; otherwise empty) and seven fields per entry, every field
+/// after the first header field preceded by `\x1f`: title, category, size (`~<float>` asks PHP
+/// to format), files, time (Unix seconds, or srrDB's trimmed date prefixed `!` when canonical,
+/// `~` otherwise), nuke status and reason. Strings containing `\x1e` or `\x1f` decline. Returns `-1` when PHP must decode (any invalid or out-of-subset input)
+/// and `-(needed)` when `out_cap` is too small.
+///
+/// # Safety
+/// `json` must be readable for `json_len` bytes and `out_buf` writable for `out_cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_predb_json_feed_parse(
+    json: *const u8,
+    json_len: usize,
+    source: u32,
+    limit: u64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if json.is_null() || json_len == 0 {
+        return -1;
+    }
+    let s = unsafe { slice::from_raw_parts(json, json_len) };
+    let Some(doc) = json_document(s) else {
+        return -1;
+    };
+    let mut body = Vec::with_capacity(json_len / 2);
+    body.push(b'K');
+    let limit = usize::try_from(limit.max(1)).unwrap_or(usize::MAX);
+    if json_feed(&doc, source, limit, &mut body).is_none() {
+        return -1;
+    }
+    let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+    out.extend(&body);
+    xml_out_finish(out)
+}
+
+#[cfg(test)]
+mod json_source_tests {
+    use super::*;
+
+    fn parse(json: &str, source: u32, limit: u64) -> Option<String> {
+        let mut buf = vec![0u8; json.len() + 64];
+        let n = unsafe {
+            nntmux_predb_json_feed_parse(
+                json.as_ptr(),
+                json.len(),
+                source,
+                limit,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert!(n == -1 || n > 0, "unexpected status {n}");
+        (n > 0).then(|| String::from_utf8(buf[..n as usize].to_vec()).unwrap())
+    }
+
+    /// The header fields followed by one seven-field record per entry.
+    fn records(out: &str, header: usize) -> Vec<Vec<&str>> {
+        let fields: Vec<&str> = out[1..].split('\x1f').collect();
+        let mut rows = vec![fields[..header].to_vec()];
+        rows.extend(fields[header..].chunks(7).map(<[&str]>::to_vec));
+        rows
+    }
+
+    #[test]
+    fn validator_matches_json_decode_acceptance() {
+        for ok in [
+            "{}",
+            "[]",
+            " [1, -0, 0.5, 1e3, -1E-2, true, false, null, \"\\u00e9\\ud83d\\ude00\"] ",
+            "{\"a\":{\"b\":[{}]}}",
+            "\"x\"",
+            "123",
+        ] {
+            assert!(json_document_valid(ok.as_bytes()), "{ok}");
+        }
+        for bad in [
+            "",
+            " ",
+            "[1,]",
+            "{\"a\":1,}",
+            "[01]",
+            "[1.]",
+            "[.5]",
+            "[+1]",
+            "[1e]",
+            "[\"\\x\"]",
+            "[\"\\ud800\"]",
+            "[\"\\udc00\"]",
+            "[\"a\tb\"]",
+            "{'a':1}",
+            "[1] 2",
+            "\u{feff}[]",
+            "[tru]",
+            "[NaN]",
+        ] {
+            assert!(!json_document_valid(bad.as_bytes()), "{bad}");
+        }
+        assert!(!json_document_valid(b"[\"\xc3(\"]"));
+        let deep = "[".repeat(MAX_JSON_DEPTH + 1) + &"]".repeat(MAX_JSON_DEPTH + 1);
+        assert!(!json_document_valid(deep.as_bytes()));
+    }
+
+    #[test]
+    fn sizes_match_size_from_megabytes_or_defer() {
+        let size = |mb: f64| {
+            let mut out = Vec::new();
+            push_size(&mut out, mb).map(|()| String::from_utf8(out).unwrap())
+        };
+        assert_eq!(size(274.0).unwrap(), "274MB");
+        assert_eq!(size(1234.5).unwrap(), "1234.5MB");
+        assert_eq!(size(0.5).unwrap(), "512KB");
+        assert_eq!(size(0.0001).unwrap(), "0.1KB");
+        assert_eq!(size(2000.0 / 1024.0).unwrap(), "1.95MB");
+        assert_eq!(size(0.0).unwrap(), "");
+        assert_eq!(size(-3.0).unwrap(), "");
+        assert_eq!(size(1.125).unwrap(), "~1.125");
+        assert_eq!(size(2e6).unwrap(), "~2000000.0");
+        assert!(size(f64::INFINITY).is_none());
+    }
+
+    #[test]
+    fn rows_use_last_duplicate_members_and_php_casts() {
+        let out = parse(
+            r#"{"status":"success","data":{"rows":[
+                {"name":"x","name":" A.B-GRP ","cat":"","size":"2048","files":"0","preAt":1.9,"nuke":{"type":"UnNuke","reason":"r"}},
+                {"name":"   "},
+                {"n\u0061me":"C-GRP","nuke":[1],"size":0.0001,"files":3.7}
+            ]}}"#,
+            JSON_PREDB_CLUB,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            records(&out, 1),
+            vec![
+                vec![""],
+                vec!["A.B-GRP", "", "2048MB", "", "1", "1", "r"],
+                vec!["C-GRP", "", "0.1KB", "3", "", "2", ""],
+            ]
+        );
+    }
+
+    #[test]
+    fn envelopes_and_out_of_subset_values_decline() {
+        let row = r#"{"name":"A-GRP","rlsname":"A-GRP","release":"A-GRP","dirname":"A-GRP"}"#;
+        for source in 1..=9 {
+            assert!(parse("{\"0\":1}", source, 1).is_none());
+            assert!(parse("[1,", source, 1).is_none());
+        }
+        assert!(
+            parse(
+                &format!(r#"{{"status":"error","data":{{"rows":[{row}]}}}}"#),
+                JSON_PREDB_OVH,
+                1
+            )
+            .is_none()
+        );
+        assert!(parse(r#"{"data":{"rows":[{"name":"A","size":"1.5"}]}}"#, 6, 1).is_none());
+        assert!(parse(r#"{"data":[{"release":"A","status":" 1"}]}"#, 7, 1).is_none());
+        assert!(parse(r#"{"values":[{"rlsname":"A","status":[]}]}"#, 8, 1).is_none());
+        assert!(parse(r#"{"results":[{"rlsname":"A","ctime":1e300}]}"#, 1, 1).is_none());
+        assert!(parse(r#"{"results":[{"rlsname":"A\u001fB"}]}"#, 1, 1).is_none());
+        assert!(parse(r#"{"results":[{"ctime":5},{"ctime":6}]}"#, 1, 1).is_none());
+        assert!(parse(r#"{"results":[],"next_page_id":1}"#, 1, 1).is_none());
+        assert!(parse(&format!("[{row}]"), 10, 1).is_none());
+    }
+
+    #[test]
+    fn source_headers_and_limits() {
+        let out = parse(
+            r#"{"results":[{"rlsname":"A","ctime":9},{"ctime":0},{"rlsname":"B","ctime":"7"}],"next_page_id":"cur"}"#,
+            JSON_PREDATABASE,
+            1,
+        )
+        .unwrap();
+        let r = records(&out, 3);
+        assert_eq!(r[0], vec!["cur", "9", "7"]);
+        assert_eq!(r[2], vec!["B", "", "", "", "7", "0", ""]);
+
+        let out = parse(
+            r#"{"pagination":{"total_pages":"3"},"list":[{"dirname":"A","size":{"number":2,"unit":"gb"},"ext_info":{"type":"tv"},"flags":{"nuke_rls":"0"}}]}"#,
+            JSON_XREL,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            records(&out, 1),
+            vec![vec!["3"], vec!["A", "TV", "2048MB", "", "", "0", ""]]
+        );
+
+        let rows = r#"[{"name":"A","category":"201"},{"name":"B","category":"300"},{"name":"C","category":208},{"name":"D","category":205}]"#;
+        let out = parse(rows, JSON_APIBAY, 2).unwrap();
+        let titles: Vec<&str> = records(&out, 1)[1..].iter().map(|r| r[0]).collect();
+        assert_eq!(titles, vec!["A", "C"]);
+
+        let out = parse(
+            r#"{"results":[{"release":"A","date":" 2026-10-09 22:13:12 "},{"release":"B","date":"2026-1-9 2:3:4"}]}"#,
+            JSON_SRRDB,
+            1,
+        )
+        .unwrap();
+        assert_eq!(records(&out, 1)[1][4], "!2026-10-09 22:13:12");
+        assert_eq!(records(&out, 1)[2][4], "~2026-1-9 2:3:4");
+    }
+
+    #[test]
+    fn small_buffers_report_the_needed_size() {
+        let json = r#"{"values":[{"rlsname":"Some.Release-GRP","size":10}]}"#;
+        let mut buf = [0u8; 4];
+        let n = unsafe {
+            nntmux_predb_json_feed_parse(
+                json.as_ptr(),
+                json.len(),
+                JSON_PREDB_ORG,
+                1,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert!(n < -1);
+        let full = parse(json, JSON_PREDB_ORG, 1).unwrap();
+        assert_eq!(-n as usize, full.len());
     }
 }
