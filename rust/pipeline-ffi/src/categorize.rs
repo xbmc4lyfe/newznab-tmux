@@ -20188,3 +20188,800 @@ pub mod admin_category_release_content_controllers {
         }
     }
 }
+// ---------------------------------------------------------------------------
+// GroupNamePipe, XxxPipe and PcPipe plus categorization console command helpers
+// ---------------------------------------------------------------------------
+
+/// Wave 29.3: categorization pipe and console command helpers.
+///
+/// Backs the `*Native()` helpers on `GroupNamePipe`, `XxxPipe`, `PcPipe`,
+/// `TestCategorization` and `RecategorizeOnlyFans`. Byte-output exports return the number
+/// of bytes written, `-1` for invalid arguments or a caught panic, and
+/// `-(required capacity)` (never `-1`) without writing when `out_cap` is too small. Code
+/// exports return `-1` for invalid arguments.
+pub mod categorization_pipes_commands {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::ptr;
+    use std::slice;
+
+    pub const DECLINE: isize = -1;
+
+    pub const KIND_GROUP_NAME: u8 = 0;
+    pub const KIND_XXX: u8 = 1;
+    pub const KIND_PC: u8 = 2;
+
+    /// The result passes `CategorizationResult::isSuccessful()`.
+    pub const RESULT_SUCCESSFUL: i32 = 1;
+    /// GroupName: matched by a `group_name_*` rule; XXX/PC: in the pipe's category family.
+    pub const RESULT_IN_DOMAIN: i32 = 2;
+    /// The confidence reaches the `CategorizationPassable` stop threshold (`>= 0.95`).
+    pub const RESULT_TERMINAL: i32 = 4;
+    /// XXX only: the category is `XXX > OnlyFans`.
+    pub const RESULT_ONLYFANS: i32 = 8;
+
+    /// `AbstractCategorizationPipe::handle()` decision states.
+    pub const DECISION_PASS_THROUGH: i32 = 0;
+    pub const DECISION_SKIP: i32 = 1;
+    pub const DECISION_CATEGORIZE: i32 = 2;
+
+    pub const CATEGORY_OTHER_MISC: i64 = 10;
+    pub const CATEGORY_PC_ROOT: i64 = 4000;
+    pub const CATEGORY_XXX_ROOT: i64 = 6000;
+    pub const CATEGORY_XXX_ONLYFANS: i64 = 6047;
+    pub const STOP_CONFIDENCE: f64 = 0.95;
+
+    /// `TestCategorization` truncates sample release names to this many bytes.
+    pub const SAMPLE_WIDTH: usize = 50;
+    pub const MATCH_MARK: &[u8] = "\u{2713}".as_bytes();
+    pub const MISMATCH_MARK: &[u8] = "\u{2717}".as_bytes();
+
+    /// `(name, priority)` for a pipe kind.
+    #[inline]
+    pub fn spec(kind: u8) -> Option<(&'static [u8], i64)> {
+        match kind {
+            KIND_GROUP_NAME => Some((b"GroupName", 5)),
+            KIND_XXX => Some((b"XXX", 10)),
+            KIND_PC => Some((b"PC", 30)),
+            _ => None,
+        }
+    }
+
+    /// Mirrors `CategorizationResult::isSuccessfulPhp()`, including NaN handling
+    /// (`NAN <= 0` is false in PHP and Rust).
+    #[inline]
+    pub fn is_successful(category_id: i64, confidence: f64, matched_by: &[u8]) -> bool {
+        #[allow(clippy::neg_cmp_op_on_partial_ord)]
+        let positive = !(confidence <= 0.0);
+        positive && !(category_id == CATEGORY_OTHER_MISC && matched_by == b"no_match")
+    }
+
+    /// Mirrors the pipes' `evaluateResultPhp()` masks.
+    pub fn evaluate_result(
+        kind: u8,
+        category_id: i64,
+        confidence: f64,
+        matched_by: &[u8],
+    ) -> Option<i32> {
+        spec(kind)?;
+        let mut mask = 0;
+        if is_successful(category_id, confidence, matched_by) {
+            mask |= RESULT_SUCCESSFUL;
+        }
+        let in_domain = match kind {
+            KIND_GROUP_NAME => matched_by.starts_with(b"group_name_"),
+            KIND_XXX => (CATEGORY_XXX_ROOT..=CATEGORY_XXX_ROOT + 999).contains(&category_id),
+            _ => (CATEGORY_PC_ROOT..=CATEGORY_PC_ROOT + 999).contains(&category_id),
+        };
+        if in_domain {
+            mask |= RESULT_IN_DOMAIN;
+        }
+        if confidence >= STOP_CONFIDENCE {
+            mask |= RESULT_TERMINAL;
+        }
+        if kind == KIND_XXX && category_id == CATEGORY_XXX_ONLYFANS {
+            mask |= RESULT_ONLYFANS;
+        }
+        Some(mask)
+    }
+
+    /// `GroupNamePipe::resultSummaryPhp()`.
+    pub fn group_name_summary(category_id: i64, confidence: f64, matched_by: &[u8]) -> Vec<u8> {
+        if !is_successful(category_id, confidence, matched_by) {
+            return b"GroupName -> no match".to_vec();
+        }
+        let mut summary = format!("GroupName -> {category_id} (").into_bytes();
+        summary.extend_from_slice(matched_by);
+        summary.push(b')');
+        summary
+    }
+
+    #[inline]
+    pub fn decision_state(stop_processing: bool, skip: bool) -> i32 {
+        if stop_processing {
+            DECISION_PASS_THROUGH
+        } else if skip {
+            DECISION_SKIP
+        } else {
+            DECISION_CATEGORIZE
+        }
+    }
+
+    /// `[name, class]` of a categorizer stats row, concatenated; the caller splits at the
+    /// name length it supplied.
+    pub fn stats_row(name: &[u8], class: &[u8]) -> Vec<u8> {
+        [name, class].concat()
+    }
+
+    /// The truncated sample release followed by the three-byte match mark.
+    pub fn sample_row(sample: &[u8], matched: bool) -> Vec<u8> {
+        let truncated = &sample[..sample.len().min(SAMPLE_WIDTH)];
+        let ellipsis: &[u8] = if sample.len() > SAMPLE_WIDTH {
+            b"..."
+        } else {
+            b""
+        };
+        let mark = if matched { MATCH_MARK } else { MISMATCH_MARK };
+        [truncated, ellipsis, mark].concat()
+    }
+
+    #[inline]
+    pub fn comparison_status(matched: bool) -> &'static [u8] {
+        if matched {
+            b"<fg=green>MATCH</>"
+        } else {
+            b"<fg=red>MISMATCH</>"
+        }
+    }
+
+    /// The categorizer chose `XXX > OnlyFans` for a searchname with an ASCII
+    /// case-insensitive `of.` prefix (PHP 8.2+ `strtolower()` is ASCII-only).
+    #[inline]
+    pub fn onlyfans_eligible(category_id: i64, searchname: &[u8]) -> bool {
+        category_id == CATEGORY_XXX_ONLYFANS
+            && searchname.len() >= 3
+            && searchname[..3].eq_ignore_ascii_case(b"of.")
+    }
+
+    pub fn onlyfans_preview(
+        id: i64,
+        searchname: &[u8],
+        old_title: &[u8],
+        old_id: i64,
+        new_title: &[u8],
+        new_id: i64,
+    ) -> Vec<u8> {
+        let mut line = format!("#{id} ").into_bytes();
+        line.extend_from_slice(searchname);
+        line.extend_from_slice(b": XXX > ");
+        line.extend_from_slice(old_title);
+        line.extend_from_slice(format!(" ({old_id}) -> XXX > ").as_bytes());
+        line.extend_from_slice(new_title);
+        line.extend_from_slice(format!(" ({new_id})").as_bytes());
+        line
+    }
+
+    /// Both summary lines separated by `\n` (neither line contains one).
+    #[allow(clippy::too_many_arguments)]
+    pub fn onlyfans_summary(
+        apply: bool,
+        inspected: i64,
+        eligible: i64,
+        updated: i64,
+        refresh_confirmed: i64,
+        unconfirmed: i64,
+        skipped: i64,
+        failed: i64,
+    ) -> Vec<u8> {
+        let first = format!(
+            "Inspected: {inspected}; Eligible: {eligible}; Skipped: {skipped}; Failed: {failed}."
+        );
+        let second = if apply {
+            format!(
+                "Database categories updated: {updated}; Search refreshes confirmed: {refresh_confirmed}; Unconfirmed: {unconfirmed}."
+            )
+        } else {
+            format!("Would update: {eligible}. No releases were changed.")
+        };
+        format!("{first}\n{second}").into_bytes()
+    }
+
+    #[inline]
+    unsafe fn valid_in<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null() || len > isize::MAX as usize || (ptr as usize).checked_add(len).is_none() {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn valid_out(ptr: *mut u8, len: usize) -> bool {
+        !ptr.is_null()
+            && ptr.is_aligned()
+            && len <= isize::MAX as usize
+            && (ptr as usize).checked_add(len).is_some()
+    }
+
+    #[inline]
+    fn flag(value: u8) -> Option<bool> {
+        match value {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn required(total: usize) -> isize {
+        // `-1` is reserved for DECLINE, so a one-byte requirement reports `-2`.
+        if total <= 1 { -2 } else { -(total as isize) }
+    }
+
+    /// Copies `bytes` to a validated output buffer, or reports the required capacity.
+    #[inline]
+    unsafe fn write_bytes(out_buf: *mut u8, out_cap: usize, bytes: &[u8]) -> isize {
+        if bytes.len() > isize::MAX as usize {
+            return DECLINE;
+        }
+        if bytes.len() > out_cap {
+            return required(bytes.len());
+        }
+        if !bytes.is_empty() {
+            unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len()) };
+        }
+        bytes.len() as isize
+    }
+
+    /// Backs `<Pipe>::pipeNameNative()` for `GroupNamePipe`, `XxxPipe` and `PcPipe`.
+    ///
+    /// # Safety
+    ///
+    /// `out_buf` must be writable for `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_cat_pipe_cmd_pipe_name(
+        kind: u8,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out(out_buf, out_cap) {
+                return DECLINE;
+            }
+            spec(kind).map_or(DECLINE, |(name, _)| unsafe {
+                write_bytes(out_buf, out_cap, name)
+            })
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Backs `<Pipe>::pipePriorityNative()`; returns `-1` for an unknown kind.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn nntmux_cat_pipe_cmd_pipe_priority(kind: u8) -> i64 {
+        catch_unwind(AssertUnwindSafe(|| {
+            spec(kind).map_or(-1, |(_, priority)| priority)
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Backs `<Pipe>::evaluateResultNative()`.
+    ///
+    /// Returns the `RESULT_*` bit mask, or `-1` for an unknown kind or invalid input.
+    ///
+    /// # Safety
+    ///
+    /// `matched_by_ptr` must be readable for `matched_by_len` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_cat_pipe_cmd_evaluate_result(
+        kind: u8,
+        category_id: i64,
+        confidence: f64,
+        matched_by_ptr: *const u8,
+        matched_by_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(matched_by) = (unsafe { valid_in(matched_by_ptr, matched_by_len) }) else {
+                return -1;
+            };
+            evaluate_result(kind, category_id, confidence, matched_by).unwrap_or(-1)
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Backs `GroupNamePipe::resultSummaryNative()`.
+    ///
+    /// # Safety
+    ///
+    /// `matched_by_ptr` must be readable for `matched_by_len` bytes and `out_buf` writable
+    /// for `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_cat_pipe_cmd_group_name_summary(
+        category_id: i64,
+        confidence: f64,
+        matched_by_ptr: *const u8,
+        matched_by_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(matched_by) = (unsafe { valid_in(matched_by_ptr, matched_by_len) }) else {
+                return DECLINE;
+            };
+            if !valid_out(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let summary = group_name_summary(category_id, confidence, matched_by);
+            unsafe { write_bytes(out_buf, out_cap, &summary) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Backs `PcPipe::decisionStateNative()`.
+    ///
+    /// Returns a `DECISION_*` state, or `-1` when a flag is not `0` or `1`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn nntmux_cat_pipe_cmd_decision_state(stop_processing: u8, skip: u8) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            match (flag(stop_processing), flag(skip)) {
+                (Some(stop_processing), Some(skip)) => decision_state(stop_processing, skip),
+                _ => -1,
+            }
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Backs `TestCategorization::categorizerRowNative()`.
+    ///
+    /// # Safety
+    ///
+    /// `name_ptr`/`class_ptr` must be readable for their lengths and `out_buf` writable for
+    /// `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_cat_pipe_cmd_stats_row(
+        name_ptr: *const u8,
+        name_len: usize,
+        class_ptr: *const u8,
+        class_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            let (Some(name), Some(class)) = (unsafe { valid_in(name_ptr, name_len) }, unsafe {
+                valid_in(class_ptr, class_len)
+            }) else {
+                return DECLINE;
+            };
+            if !valid_out(out_buf, out_cap) || name_len.checked_add(class_len).is_none() {
+                return DECLINE;
+            }
+            unsafe { write_bytes(out_buf, out_cap, &stats_row(name, class)) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Backs `TestCategorization::sampleRowNative()`: the truncated release name followed
+    /// by the three-byte UTF-8 match mark.
+    ///
+    /// # Safety
+    ///
+    /// `sample_ptr` must be readable for `sample_len` bytes and `out_buf` writable for
+    /// `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_cat_pipe_cmd_sample_row(
+        sample_ptr: *const u8,
+        sample_len: usize,
+        matched: u8,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(sample) = (unsafe { valid_in(sample_ptr, sample_len) }) else {
+                return DECLINE;
+            };
+            let Some(matched) = flag(matched) else {
+                return DECLINE;
+            };
+            if !valid_out(out_buf, out_cap) {
+                return DECLINE;
+            }
+            unsafe { write_bytes(out_buf, out_cap, &sample_row(sample, matched)) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Backs `TestCategorization::comparisonStatusNative()`.
+    ///
+    /// # Safety
+    ///
+    /// `out_buf` must be writable for `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_cat_pipe_cmd_comparison_status(
+        matched: u8,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(matched) = flag(matched) else {
+                return DECLINE;
+            };
+            if !valid_out(out_buf, out_cap) {
+                return DECLINE;
+            }
+            unsafe { write_bytes(out_buf, out_cap, comparison_status(matched)) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Backs `RecategorizeOnlyFans::isEligibleNative()`.
+    ///
+    /// Returns `1` when eligible, `0` otherwise, `-1` for invalid input.
+    ///
+    /// # Safety
+    ///
+    /// `searchname_ptr` must be readable for `searchname_len` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_cat_pipe_cmd_onlyfans_eligible(
+        category_id: i64,
+        searchname_ptr: *const u8,
+        searchname_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            unsafe { valid_in(searchname_ptr, searchname_len) }.map_or(-1, |searchname| {
+                i32::from(onlyfans_eligible(category_id, searchname))
+            })
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Backs `RecategorizeOnlyFans::previewLineNative()`.
+    ///
+    /// # Safety
+    ///
+    /// Each input pointer must be readable for its length and `out_buf` writable for
+    /// `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_cat_pipe_cmd_onlyfans_preview(
+        id: i64,
+        searchname_ptr: *const u8,
+        searchname_len: usize,
+        old_title_ptr: *const u8,
+        old_title_len: usize,
+        old_id: i64,
+        new_title_ptr: *const u8,
+        new_title_len: usize,
+        new_id: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            let (Some(searchname), Some(old_title), Some(new_title)) = (
+                unsafe { valid_in(searchname_ptr, searchname_len) },
+                unsafe { valid_in(old_title_ptr, old_title_len) },
+                unsafe { valid_in(new_title_ptr, new_title_len) },
+            ) else {
+                return DECLINE;
+            };
+            let total = searchname_len
+                .checked_add(old_title_len)
+                .and_then(|total| total.checked_add(new_title_len));
+            if !valid_out(out_buf, out_cap) || total.is_none() {
+                return DECLINE;
+            }
+            let line = onlyfans_preview(id, searchname, old_title, old_id, new_title, new_id);
+            unsafe { write_bytes(out_buf, out_cap, &line) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Backs `RecategorizeOnlyFans::summaryLinesNative()`: both lines joined by `\n`.
+    ///
+    /// # Safety
+    ///
+    /// `out_buf` must be writable for `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_cat_pipe_cmd_onlyfans_summary(
+        apply: u8,
+        inspected: i64,
+        eligible: i64,
+        updated: i64,
+        refresh_confirmed: i64,
+        unconfirmed: i64,
+        skipped: i64,
+        failed: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(apply) = flag(apply) else {
+                return DECLINE;
+            };
+            if !valid_out(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let summary = onlyfans_summary(
+                apply,
+                inspected,
+                eligible,
+                updated,
+                refresh_confirmed,
+                unconfirmed,
+                skipped,
+                failed,
+            );
+            unsafe { write_bytes(out_buf, out_cap, &summary) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn call(cap: usize, f: impl FnOnce(*mut u8, usize) -> isize) -> (isize, Vec<u8>) {
+            let mut buf = vec![b'Z'; cap.max(1)];
+            let rc = f(buf.as_mut_ptr(), cap);
+            (rc, buf)
+        }
+
+        fn written(f: impl Fn(*mut u8, usize) -> isize) -> Vec<u8> {
+            let (rc, buf) = call(4096, &f);
+            assert!(rc >= 0, "unexpected rc {rc}");
+            buf[..rc as usize].to_vec()
+        }
+
+        fn evaluate(kind: u8, category_id: i64, confidence: f64, matched_by: &[u8]) -> i32 {
+            unsafe {
+                nntmux_cat_pipe_cmd_evaluate_result(
+                    kind,
+                    category_id,
+                    confidence,
+                    matched_by.as_ptr(),
+                    matched_by.len(),
+                )
+            }
+        }
+
+        #[test]
+        fn names_and_priorities_match_the_php_pipes() {
+            let expected: [(u8, &[u8], i64); 3] = [
+                (KIND_GROUP_NAME, b"GroupName", 5),
+                (KIND_XXX, b"XXX", 10),
+                (KIND_PC, b"PC", 30),
+            ];
+            for (kind, label, priority) in expected {
+                assert_eq!(
+                    written(|out, cap| unsafe { nntmux_cat_pipe_cmd_pipe_name(kind, out, cap) }),
+                    label
+                );
+                assert_eq!(nntmux_cat_pipe_cmd_pipe_priority(kind), priority);
+            }
+            assert_eq!(nntmux_cat_pipe_cmd_pipe_priority(3), -1);
+            let (rc, _) = call(16, |out, cap| unsafe {
+                nntmux_cat_pipe_cmd_pipe_name(3, out, cap)
+            });
+            assert_eq!(rc, DECLINE);
+        }
+
+        #[test]
+        fn short_buffers_report_capacity_without_writing() {
+            let (rc, buf) = call(4, |out, cap| unsafe {
+                nntmux_cat_pipe_cmd_pipe_name(KIND_GROUP_NAME, out, cap)
+            });
+            assert_eq!((rc, buf), (-9, b"ZZZZ".to_vec()));
+            let (rc, buf) = call(1, |out, cap| unsafe {
+                nntmux_cat_pipe_cmd_pipe_name(KIND_PC, out, cap)
+            });
+            assert_eq!((rc, buf), (-2, b"Z".to_vec()));
+            let (rc, _) = call(0, |out, cap| unsafe {
+                nntmux_cat_pipe_cmd_comparison_status(1, out, cap)
+            });
+            assert_eq!(rc, -18);
+        }
+
+        #[test]
+        fn evaluation_masks() {
+            assert_eq!(
+                evaluate(KIND_GROUP_NAME, 5070, 0.8, b"group_name_anime"),
+                RESULT_SUCCESSFUL | RESULT_IN_DOMAIN
+            );
+            assert_eq!(
+                evaluate(KIND_GROUP_NAME, 5070, 0.8, b"group_name"),
+                RESULT_SUCCESSFUL
+            );
+            assert_eq!(evaluate(KIND_GROUP_NAME, 10, 0.0, b"no_match"), 0);
+            assert_eq!(
+                evaluate(KIND_GROUP_NAME, 10, 1.0, b"no_match"),
+                RESULT_TERMINAL
+            );
+            assert_eq!(
+                evaluate(KIND_XXX, 6047, 0.95, b"x"),
+                RESULT_SUCCESSFUL | RESULT_IN_DOMAIN | RESULT_TERMINAL | RESULT_ONLYFANS
+            );
+            assert_eq!(evaluate(KIND_XXX, 7000, 0.5, b"x"), RESULT_SUCCESSFUL);
+            assert_eq!(evaluate(KIND_PC, 6047, 0.5, b"x"), RESULT_SUCCESSFUL);
+            assert_eq!(
+                evaluate(KIND_PC, 4999, f64::NAN, b""),
+                RESULT_SUCCESSFUL | RESULT_IN_DOMAIN
+            );
+            assert_eq!(evaluate(KIND_PC, i64::MIN, f64::NEG_INFINITY, b""), 0);
+            assert_eq!(evaluate(9, 4000, 1.0, b""), -1);
+            unsafe {
+                assert_eq!(
+                    nntmux_cat_pipe_cmd_evaluate_result(KIND_PC, 4000, 1.0, ptr::null(), 0),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_cat_pipe_cmd_evaluate_result(
+                        KIND_PC,
+                        4000,
+                        1.0,
+                        b"x".as_ptr(),
+                        isize::MAX as usize + 1
+                    ),
+                    -1
+                );
+            }
+        }
+
+        #[test]
+        fn summaries_decisions_and_rows() {
+            let summary = |category_id, confidence, matched_by: &[u8]| {
+                written(|out, cap| unsafe {
+                    nntmux_cat_pipe_cmd_group_name_summary(
+                        category_id,
+                        confidence,
+                        matched_by.as_ptr(),
+                        matched_by.len(),
+                        out,
+                        cap,
+                    )
+                })
+            };
+            assert_eq!(
+                summary(5070, 0.8, b"group_name_anime"),
+                b"GroupName -> 5070 (group_name_anime)"
+            );
+            assert_eq!(summary(10, 0.0, b"no_match"), b"GroupName -> no match");
+            assert_eq!(summary(-1, 0.1, b"\0\xff"), b"GroupName -> -1 (\0\xff)");
+
+            assert_eq!(
+                nntmux_cat_pipe_cmd_decision_state(1, 1),
+                DECISION_PASS_THROUGH
+            );
+            assert_eq!(nntmux_cat_pipe_cmd_decision_state(0, 1), DECISION_SKIP);
+            assert_eq!(
+                nntmux_cat_pipe_cmd_decision_state(0, 0),
+                DECISION_CATEGORIZE
+            );
+            assert_eq!(nntmux_cat_pipe_cmd_decision_state(2, 0), -1);
+
+            let stats = written(|out, cap| unsafe {
+                nntmux_cat_pipe_cmd_stats_row(
+                    b"PC".as_ptr(),
+                    2,
+                    b"App\\PcPipe".as_ptr(),
+                    10,
+                    out,
+                    cap,
+                )
+            });
+            assert_eq!(stats, b"PCApp\\PcPipe");
+
+            let long = [b'a'; 51];
+            let row = written(|out, cap| unsafe {
+                nntmux_cat_pipe_cmd_sample_row(long.as_ptr(), long.len(), 1, out, cap)
+            });
+            assert_eq!(row, [&long[..50], b"...", MATCH_MARK].concat());
+            let row = written(|out, cap| unsafe {
+                nntmux_cat_pipe_cmd_sample_row(long.as_ptr(), 50, 0, out, cap)
+            });
+            assert_eq!(row, [&long[..50], MISMATCH_MARK].concat());
+            let (rc, _) = call(64, |out, cap| unsafe {
+                nntmux_cat_pipe_cmd_sample_row(long.as_ptr(), 1, 2, out, cap)
+            });
+            assert_eq!(rc, DECLINE);
+            assert_eq!(
+                written(|out, cap| unsafe { nntmux_cat_pipe_cmd_comparison_status(0, out, cap) }),
+                b"<fg=red>MISMATCH</>"
+            );
+        }
+
+        #[test]
+        fn onlyfans_helpers() {
+            let eligible = |category_id, name: &[u8]| unsafe {
+                nntmux_cat_pipe_cmd_onlyfans_eligible(category_id, name.as_ptr(), name.len())
+            };
+            assert_eq!(eligible(6047, b"OF.Model.Name"), 1);
+            assert_eq!(eligible(6047, b"of."), 1);
+            assert_eq!(eligible(6047, b"of"), 0);
+            assert_eq!(eligible(6047, b"\xc3\x96F.x"), 0);
+            assert_eq!(eligible(6046, b"of.x"), 0);
+            assert_eq!(
+                unsafe { nntmux_cat_pipe_cmd_onlyfans_eligible(6047, ptr::null(), 0) },
+                -1
+            );
+
+            let line = written(|out, cap| unsafe {
+                nntmux_cat_pipe_cmd_onlyfans_preview(
+                    12,
+                    b"OF.x".as_ptr(),
+                    4,
+                    b"Other".as_ptr(),
+                    5,
+                    6999,
+                    b"OnlyFans".as_ptr(),
+                    8,
+                    6047,
+                    out,
+                    cap,
+                )
+            });
+            assert_eq!(
+                line,
+                b"#12 OF.x: XXX > Other (6999) -> XXX > OnlyFans (6047)"
+            );
+
+            let summary = written(|out, cap| unsafe {
+                nntmux_cat_pipe_cmd_onlyfans_summary(0, 5, 3, 0, 0, 0, 2, 0, out, cap)
+            });
+            assert_eq!(
+                summary,
+                b"Inspected: 5; Eligible: 3; Skipped: 2; Failed: 0.\nWould update: 3. No releases were changed."
+            );
+            let summary = written(|out, cap| unsafe {
+                nntmux_cat_pipe_cmd_onlyfans_summary(1, 5, 3, 2, 1, 1, 1, i64::MIN, out, cap)
+            });
+            assert_eq!(
+                summary,
+                format!("Inspected: 5; Eligible: 3; Skipped: 1; Failed: {}.\nDatabase categories updated: 2; Search refreshes confirmed: 1; Unconfirmed: 1.", i64::MIN).as_bytes()
+            );
+            let (rc, _) = call(256, |out, cap| unsafe {
+                nntmux_cat_pipe_cmd_onlyfans_summary(2, 0, 0, 0, 0, 0, 0, 0, out, cap)
+            });
+            assert_eq!(rc, DECLINE);
+        }
+
+        #[test]
+        fn invalid_output_buffers_decline() {
+            let mut buf = [0u8; 8];
+            unsafe {
+                assert_eq!(
+                    nntmux_cat_pipe_cmd_pipe_name(KIND_PC, ptr::null_mut(), 8),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_cat_pipe_cmd_pipe_name(KIND_PC, buf.as_mut_ptr(), usize::MAX),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_cat_pipe_cmd_comparison_status(
+                        1,
+                        buf.as_mut_ptr(),
+                        isize::MAX as usize + 1
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_cat_pipe_cmd_onlyfans_preview(
+                        1,
+                        b"x".as_ptr(),
+                        1,
+                        ptr::null(),
+                        0,
+                        1,
+                        b"y".as_ptr(),
+                        1,
+                        1,
+                        buf.as_mut_ptr(),
+                        8,
+                    ),
+                    DECLINE
+                );
+            }
+            assert_eq!(buf, [0u8; 8]);
+        }
+    }
+}
