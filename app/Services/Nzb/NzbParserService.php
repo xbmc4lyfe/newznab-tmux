@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services\Nzb;
 
 use App\Support\RustPipelineLibrary;
+use FFI;
 
 /**
  * Service for parsing and extracting information from NZB file contents.
@@ -12,6 +13,21 @@ use App\Support\RustPipelineLibrary;
  */
 class NzbParserService
 {
+    /**
+     * Rust NFO/PAR2 candidate scanner (`rust/pipeline-ffi/src/nfo.rs`), shared with
+     * {@see NzbContentsService::parseNzb()}.
+     */
+    public const string NFO_FFI_CDEF = <<<'C'
+        ssize_t nntmux_nzb_detect_nfo_file(const char *title, size_t len, char *out_buf, size_t out_cap);
+        int32_t nntmux_nzb_detect_hidden_nfo_file(const char *title, size_t len);
+        int32_t nntmux_nzb_detect_par2_index_file(const char *title, size_t len);
+        int32_t nntmux_nzb_extract_parts_total(const char *title, size_t len);
+        ssize_t nntmux_nzb_classify_nfo_par2_batch_nul(const char *records, size_t records_len, uint32_t flags, char *out_buf, size_t out_cap);
+        ssize_t nntmux_nzb_classify_nfo_par2_packed(const char *xml, size_t xml_len, uint32_t flags, char *out_buf, size_t out_cap);
+        C;
+
+    private static FFI|false|null $nfoFfi = null;
+
     /**
      * Retrieve various information on an NZB file (the subject, # of pars,
      * file extensions, file sizes, file completion, group names, # of parts).
@@ -408,5 +424,98 @@ class NzbParserService
         }
 
         return 0;
+    }
+
+    /**
+     * The candidate scanner library, or null when it is unavailable or `LC_CTYPE` makes PCRE's
+     * character classes differ from the C locale the Rust matchers reproduce.
+     */
+    public static function nfoCandidateFfi(): ?FFI
+    {
+        if (! \in_array(setlocale(LC_CTYPE, '0'), ['C', 'POSIX', 'C.UTF-8', 'C.utf8'], true)) {
+            return null;
+        }
+        $ffi = self::$nfoFfi ??= RustPipelineLibrary::resolveDomain('nzb_nfo_candidates', self::NFO_FFI_CDEF) ?? false;
+
+        return $ffi === false ? null : $ffi;
+    }
+
+    /*
+     * Rust equivalents of the subject detectors, kept for parity tests: one FFI call per subject
+     * does not reach the 1.5x gate (see tests/Unit/RustNzbNfoCandidateScannerParityTest.php), so
+     * production keeps the PCRE implementations above. $supported is false when Rust did not run.
+     */
+
+    /** @return array<string, mixed>|false */
+    public function detectNfoFileNative(string $subject, bool &$supported = false): array|false
+    {
+        $supported = false;
+        $ffi = self::nfoCandidateFfi();
+        if ($ffi === null) {
+            return false;
+        }
+        $capacity = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, 16, $capacity);
+        if ($scratch === null) {
+            return false;
+        }
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_nzb_detect_nfo_file($subject, \strlen($subject), $scratch, $capacity);
+        if ($written !== 0 && $written !== 1) {
+            return false;
+        }
+        $supported = true;
+
+        return $written === 0 ? false : ['hidden' => false, 'priority' => \ord($scratch[0])];
+    }
+
+    /** @return array<string, mixed>|false */
+    public function detectHiddenNfoFileNative(string $subject, int $segmentCount, bool &$supported = false): array|false
+    {
+        $supported = false;
+        $ffi = self::nfoCandidateFfi();
+        if ($ffi === null) {
+            return false;
+        }
+        // @phpstan-ignore method.notFound
+        $mask = $ffi->nntmux_nzb_detect_hidden_nfo_file($subject, \strlen($subject));
+        if (! \is_int($mask) || $mask < 0) {
+            return false;
+        }
+        $supported = true;
+        $candidate = ($segmentCount === 1 && ($mask & 0b1101) !== 0) || ($segmentCount <= 2 && ($mask & 0b10) !== 0);
+
+        return $candidate && ($mask & 0b10000) === 0 ? ['hidden' => true, 'priority' => 10] : false;
+    }
+
+    public function detectPar2IndexFileNative(string $subject, bool &$supported = false): bool
+    {
+        $supported = false;
+        $ffi = self::nfoCandidateFfi();
+        if ($ffi === null) {
+            return false;
+        }
+        // @phpstan-ignore method.notFound
+        $result = $ffi->nntmux_nzb_detect_par2_index_file($subject, \strlen($subject));
+        $supported = $result === 0 || $result === 1;
+
+        return $result === 1;
+    }
+
+    public function extractPartsTotalNative(string $subject, bool &$supported = false): int
+    {
+        $supported = false;
+        $ffi = self::nfoCandidateFfi();
+        if ($ffi === null) {
+            return 0;
+        }
+        // @phpstan-ignore method.notFound
+        $total = $ffi->nntmux_nzb_extract_parts_total($subject, \strlen($subject));
+        if (! \is_int($total) || $total < 0) {
+            return 0;
+        }
+        $supported = true;
+
+        return $total;
     }
 }
