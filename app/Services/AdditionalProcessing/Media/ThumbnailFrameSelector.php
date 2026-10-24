@@ -173,7 +173,9 @@ class ThumbnailFrameSelector
             $hints->position === SourcePosition::Complete => 2,
             default => 1,
         };
-        $totalBytes = $hints?->realSize !== null && $hints->realSize > 0 ? $hints->realSize : 0;
+        $totalBytes = $hints !== null && $hints->availableBytes > 0 && $hints->realSize !== null && $hints->realSize > 0
+            ? $hints->realSize
+            : 0;
 
         try {
             // @phpstan-ignore method.notFound

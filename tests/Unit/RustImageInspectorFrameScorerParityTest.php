@@ -28,16 +28,15 @@ use Tests\Unit\AdditionalProcessing\CreatesProcessingConfiguration;
  *
  * Paired randomized benchmark (`WAVE8_IMAGE_FRAME_BENCHMARK=1 php artisan test --compact
  * tests/Unit/RustImageInspectorFrameScorerParityTest.php --filter=benchmark`):
- * - `ThumbnailFrameSelector::looksLikeText`: 7.7x mean / 2.8x p99 (4 KiB binary head common) and
- *   3.1x mean / 4.1x p99 (4 KiB playlist head uncommon) -> ADOPTED in production.
  * - `FrameQualityScorer::measureRgb`: ~32x mean / ~25x p99 (64x36 common and 64x64 uncommon)
  *   -> ADOPTED in production.
  * - `FrameQualityScorer::measureSample`: ~4.5x mean / ~3.4x p99 (64x36 common) and ~6.4x mean /
  *   ~19x p99 (64x64 uncommon) -> ADOPTED in production.
  * - `FrameQualityScorer::measure` (full JPEG decode + scale + sample score),
- *   `ImageInspector::isComplete` / `isCompleteTail`, and `ThumbnailFrameSelector::window` measure
- *   below 1.5x on common workloads because libgd decode/scale, kernel VFS syscalls, or 3-op float
- *   math dominate; they retain native PHP in production and expose `*Native` helpers for parity.
+ *   `ImageInspector::isComplete` / `isCompleteTail`, `ThumbnailFrameSelector::looksLikeText`, and
+ *   `ThumbnailFrameSelector::window` measure below 1.5x on common workloads because libgd
+ *   decode/scale, kernel VFS syscalls, `strncasecmp`, or 3-op float math dominate; they retain
+ *   native PHP in production and expose `*Native` helpers for parity.
  */
 final class RustImageInspectorFrameScorerParityTest extends TestCase
 {
@@ -256,7 +255,7 @@ final class RustImageInspectorFrameScorerParityTest extends TestCase
                 0 => null,
                 1 => MediaSourceHints::complete(),
                 2 => MediaSourceHints::mid($random->getInt(0, 5_000_000)),
-                3 => MediaSourceHints::head($random->getInt(10_000, 100_000_000), $random->getInt(1, 50_000_000)),
+                3 => MediaSourceHints::head($random->getInt(10_000, 100_000_000), $random->getInt(0, 50_000_000)),
                 default => MediaSourceHints::head(null, $random->getInt(0, 50_000_000)),
             };
 
@@ -269,6 +268,22 @@ final class RustImageInspectorFrameScorerParityTest extends TestCase
             $actual = $selector->windowNative($video, VideoContainer::Matroska, $hints, $supported);
             self::assertTrue($supported, "window case #{$case}");
             self::assertSame($expected, $actual, "window case #{$case}");
+        }
+
+        // Explicit regression for head(realSize > 0, availableBytes <= 0) with non-empty file on disk
+        foreach ([null, 8000] as $bitRate) {
+            $selector = new ThumbnailFrameSelector(
+                $this->makeConfig(['thumbnailFrameAttempts' => 4]),
+                new ParityFakeFrameGrabber(120.0, $bitRate),
+                new FrameQualityScorer(12, 24, 232),
+            );
+            $hints = MediaSourceHints::head(100_000, 0);
+            $supported = false;
+            self::assertSame(
+                $selector->windowPhp($video, VideoContainer::Matroska, $hints),
+                $selector->windowNative($video, VideoContainer::Matroska, $hints, $supported),
+            );
+            self::assertTrue($supported);
         }
 
         // Verify select() vs selectNative() with fallback retry window
