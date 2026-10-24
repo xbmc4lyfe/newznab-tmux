@@ -290,6 +290,14 @@ final class RustNzbNfoCandidateScannerParityTest extends TestCase
             'no_segments_element' => self::nzb(self::files(['x.nfo', 'abc-def (1/1)', 'z.par2', 'y.rar (2/2)'], [-1, 1], ['i@x'])),
             'self_closing_file' => "<nzb>\n<file subject=\"x.nfo (1/2)\"/><file subject=\"y.rar\"><segments><segment>id@1</segment></segments></file></nzb>",
             'child_namespace' => '<nzb><file xmlns="urn:other" subject="a.nfo"><segments><segment>i@x</segment></segments></file></nzb>',
+            'uppercase_hex_char_ref_attr' => $file('<segments><segment>id@x</segment></segments>', 'a&#X41;.nfo (1/1)'),
+            'uppercase_hex_char_ref_text' => $file('<segments><segment>id&#X41;@x</segment></segments>'),
+            'lowercase_doctype_keyword' => '<!doctype nzb PUBLIC "-//newzBin//DTD NZB 1.1//EN" "http://www.newzbin.com/DTD/nzb/nzb-1.1.dtd">'.$file('<segments><segment>id@x</segment></segments>'),
+            'uppercase_doctype_root' => '<!DOCTYPE NZB PUBLIC "-//newzBin//DTD NZB 1.1//EN" "http://www.newzbin.com/DTD/nzb/nzb-1.1.dtd">'.$file('<segments><segment>id@x</segment></segments>'),
+            'lowercase_doctype_public' => '<!DOCTYPE nzb public "-//newzBin//DTD NZB 1.1//EN" "http://www.newzbin.com/DTD/nzb/nzb-1.1.dtd">'.$file('<segments><segment>id@x</segment></segments>'),
+            'reserved_xml_namespace' => '<nzb xmlns="http://www.w3.org/XML/1998/namespace"><file subject="a.nfo (1/1)"><segments><segment>id@x</segment></segments></file></nzb>',
+            'reserved_xmlns_namespace' => '<nzb xmlns="http://www.w3.org/2000/xmlns/"><file subject="a.nfo (1/1)"><segments><segment>id@x</segment></segments></file></nzb>',
+            'entity_in_xmlns' => '<nzb xmlns="http://www.w3.org/XML/1998/&#110;amespace"><file subject="a.nfo (1/1)"><segments><segment>id@x</segment></segments></file></nzb>',
         ];
         $service = self::contents();
         foreach ($declined as $name => $source) {

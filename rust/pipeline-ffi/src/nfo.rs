@@ -11474,8 +11474,15 @@ impl NzbcScan {
         let Ok(index) = u32::try_from(self.files) else {
             return false;
         };
+        let Some(actual) = self
+            .actual
+            .checked_add(segments)
+            .filter(|&v| v <= i64::MAX as u64)
+        else {
+            return false;
+        };
         self.files += 1;
-        self.actual += segments;
+        self.actual = actual;
         let Some(total) = nzb_parts_total(subject) else {
             return false;
         };
@@ -11586,6 +11593,9 @@ fn nzbc_has_invalid_control(bytes: &[u8]) -> bool {
 /// Decodes references in a validated value (rare: only values containing `&`).
 #[inline]
 fn nzbc_decode(raw: &[u8], is_attr: bool, out: &mut Vec<u8>) -> bool {
+    if raw.windows(3).any(|w| w == b"&#X") {
+        return false;
+    }
     out.clear();
     unescape_nzb_xml_utf8(raw, is_attr, out) && !nzbc_has_nonchar(out, 0)
 }
@@ -11654,6 +11664,13 @@ impl<'a> NzbcReader<'a> {
         let (after, self_closing) =
             parse_nzb_xml_attributes(self.bytes, attr_start, allow_xmlns, |k, v| {
                 if k.len() > 1000 {
+                    return false;
+                }
+                if k == b"xmlns"
+                    && (v.contains(&b'&')
+                        || v == b"http://www.w3.org/XML/1998/namespace"
+                        || v == b"http://www.w3.org/2000/xmlns/")
+                {
                     return false;
                 }
                 match subject.as_deref_mut() {
@@ -11784,7 +11801,13 @@ fn nzbc_scan_document(bytes: &[u8], scan: &mut NzbcScan) -> bool {
         {
             break;
         }
-        if doctype {
+        let name_pos = skip_nzb_xml_ws(bytes, r.pos + 9);
+        let pub_pos = skip_nzb_xml_ws(bytes, name_pos + 3);
+        if doctype
+            || bytes.get(r.pos..r.pos + 9) != Some(b"<!DOCTYPE")
+            || bytes.get(name_pos..name_pos + 3) != Some(b"nzb")
+            || bytes.get(pub_pos..pub_pos + 6) != Some(b"PUBLIC")
+        {
             return false;
         }
         let Some(after) = match_standard_nzb_doctype(bytes, r.pos) else {
@@ -11864,7 +11887,9 @@ fn nzbc_scan_document(bytes: &[u8], scan: &mut NzbcScan) -> bool {
 
 #[inline]
 unsafe fn nzbc_input<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
-    if ptr.is_null() {
+    if len > isize::MAX as usize {
+        None
+    } else if ptr.is_null() {
         if len > 0 { None } else { Some(&[]) }
     } else if len == 0 {
         Some(&[])
