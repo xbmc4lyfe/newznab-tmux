@@ -6,6 +6,8 @@ namespace App\Services\Tmux;
 
 use App\Enums\CollectionFileCheckStatus;
 use App\Services\Configuration\ConfigurationProvider;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 
@@ -22,6 +24,20 @@ use Illuminate\Support\Facades\DB;
  */
 final class CollectionDowntimeCompensator implements CollectionReconciliationBarrier
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_downtime_format_at(int64_t timestamp, int64_t utc_offset_seconds, char *out_buf, size_t out_cap);
+        int32_t nntmux_downtime_parse_civil_datetime(const char *input_ptr, size_t input_len, int64_t *out_civil_epoch);
+        int64_t nntmux_downtime_largest_offset_change(const int64_t *offsets_ptr, size_t count);
+        int32_t nntmux_downtime_crosses_offset_change(ssize_t transition_count);
+        int32_t nntmux_downtime_select_timestamp_not_after(int64_t first, int64_t not_after, const int64_t *candidates_ptr, size_t count, int64_t *out_timestamp);
+        int32_t nntmux_downtime_verify_marker_dir(const char *temp_dir_ptr, size_t temp_dir_len, const char *real_dir_ptr, size_t real_dir_len);
+        int32_t nntmux_downtime_verify_marker_write(size_t expected_len, ssize_t written_bytes, uint32_t flushed, uint32_t synced);
+        C;
+
+    public static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
+
     /**
      * Restarts shorter than this (deploys, crash recovery) need no compensation.
      */
@@ -52,6 +68,22 @@ final class CollectionDowntimeCompensator implements CollectionReconciliationBar
      * the Cache::flush() that the updater runs while tmux is stopped.
      */
     private readonly string $markerPath;
+
+    public static function setUseRustFfi(bool $useRustFfi): void
+    {
+        self::$useRustFfi = $useRustFfi;
+    }
+
+    public static function categorizeFfi(): ?FFI
+    {
+        if (self::$ffi !== null) {
+            return self::$ffi === false ? null : self::$ffi;
+        }
+
+        self::$ffi = RustPipelineLibrary::resolveDomain('categorize', self::FFI_CDEF) ?? false;
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
 
     public function __construct(?string $markerPath = null)
     {
@@ -264,9 +296,16 @@ final class CollectionDowntimeCompensator implements CollectionReconciliationBar
      * A wall-clock value from a repeated fall-back hour names two instants; take the
      * later one unless it is after $notAfter (the restart: no row was added after it).
      */
-    private function timestampNotAfter(string $dateTime, int $notAfter): int
+    public function timestampNotAfter(string $dateTime, int $notAfter): int
     {
-        $first = $this->timestamp($dateTime);
+        return self::$useRustFfi
+            ? $this->timestampNotAfterNative($dateTime, $notAfter)
+            : $this->timestampNotAfterPhp($dateTime, $notAfter);
+    }
+
+    public function timestampNotAfterPhp(string $dateTime, int $notAfter): int
+    {
+        $first = $this->timestampPhp($dateTime);
         $value = substr($dateTime, 0, 19);
         $zone = new \DateTimeZone(date_default_timezone_get());
         $candidates = [$first];
@@ -287,11 +326,67 @@ final class CollectionDowntimeCompensator implements CollectionReconciliationBar
         return $beforeRestart === [] ? $first : max($beforeRestart);
     }
 
+    public function timestampNotAfterNative(string $dateTime, int $notAfter): int
+    {
+        $ffi = self::categorizeFfi();
+        if ($ffi === null) {
+            return $this->timestampNotAfterPhp($dateTime, $notAfter);
+        }
+
+        $first = $this->timestampNative($dateTime);
+        $value = substr($dateTime, 0, 19);
+        $zone = new \DateTimeZone(date_default_timezone_get());
+        $candidates = [$first];
+        $transitions = $zone->getTransitions($first - 7 * 86400, $first + 7 * 86400) ?: [];
+        for ($i = 1, $count = \count($transitions); $i < $count; $i++) {
+            $fold = $transitions[$i - 1]['offset'] - $transitions[$i]['offset'];
+            if ($fold <= 0) {
+                continue;
+            }
+            foreach ([$first - $fold, $first + $fold] as $candidate) {
+                if ((new \DateTimeImmutable('@'.$candidate))->setTimezone($zone)->format('Y-m-d H:i:s') === $value) {
+                    $candidates[] = $candidate;
+                }
+            }
+        }
+
+        $candCount = \count($candidates);
+        $cCands = $ffi->new("int64_t[{$candCount}]");
+        $outTs = $ffi->new('int64_t[1]');
+        for ($i = 0; $i < $candCount; $i++) {
+            $cCands[$i] = $candidates[$i];
+        }
+
+        // @phpstan-ignore method.notFound
+        $rc = $ffi->nntmux_downtime_select_timestamp_not_after(
+            $first,
+            $notAfter,
+            $cCands,
+            $candCount,
+            $outTs
+        );
+        if (! \is_int($rc) || $rc !== 1) {
+            return $this->timestampNotAfterPhp($dateTime, $notAfter);
+        }
+
+        /** @var int $resolved */
+        $resolved = $outTs[0];
+
+        return $resolved;
+    }
+
     /**
      * The largest backward UTC-offset change (a fall-back, which repeats wall-clock
      * times), in seconds, in the span. Spring-forward changes repeat nothing.
      */
-    private function largestOffsetChange(int ...$timestamps): int
+    public function largestOffsetChange(int ...$timestamps): int
+    {
+        return self::$useRustFfi
+            ? $this->largestOffsetChangeNative(...$timestamps)
+            : $this->largestOffsetChangePhp(...$timestamps);
+    }
+
+    public function largestOffsetChangePhp(int ...$timestamps): int
     {
         $zone = new \DateTimeZone(date_default_timezone_get());
         $offsets = array_column($zone->getTransitions(min($timestamps), max($timestamps)) ?: [], 'offset');
@@ -303,16 +398,74 @@ final class CollectionDowntimeCompensator implements CollectionReconciliationBar
         return $largest;
     }
 
+    public function largestOffsetChangeNative(int ...$timestamps): int
+    {
+        $ffi = self::categorizeFfi();
+        if ($ffi === null) {
+            return $this->largestOffsetChangePhp(...$timestamps);
+        }
+
+        $zone = new \DateTimeZone(date_default_timezone_get());
+        $offsets = array_column($zone->getTransitions(min($timestamps), max($timestamps)) ?: [], 'offset');
+        $count = \count($offsets);
+        if ($count < 2) {
+            // @phpstan-ignore method.notFound
+            $res = $ffi->nntmux_downtime_largest_offset_change(null, 0);
+
+            return \is_int($res) && $res >= 0 ? $res : $this->largestOffsetChangePhp(...$timestamps);
+        }
+
+        $cOffsets = $ffi->new("int64_t[{$count}]");
+        for ($i = 0; $i < $count; $i++) {
+            $cOffsets[$i] = (int) $offsets[$i];
+        }
+
+        // @phpstan-ignore method.notFound
+        $res = $ffi->nntmux_downtime_largest_offset_change($cOffsets, $count);
+        if (! \is_int($res) || $res < 0) {
+            return $this->largestOffsetChangePhp(...$timestamps);
+        }
+
+        return $res;
+    }
+
     /**
      * Whether the application timezone changes its UTC offset anywhere in the span.
      */
-    private function crossesOffsetChange(int ...$timestamps): bool
+    public function crossesOffsetChange(int ...$timestamps): bool
+    {
+        return self::$useRustFfi
+            ? $this->crossesOffsetChangeNative(...$timestamps)
+            : $this->crossesOffsetChangePhp(...$timestamps);
+    }
+
+    public function crossesOffsetChangePhp(int ...$timestamps): bool
     {
         $zone = new \DateTimeZone(date_default_timezone_get());
         $transitions = $zone->getTransitions(min($timestamps), max($timestamps));
 
         // The first entry describes the offset at the start; any more are changes.
         return \is_array($transitions) && \count($transitions) > 1;
+    }
+
+    public function crossesOffsetChangeNative(int ...$timestamps): bool
+    {
+        $ffi = self::categorizeFfi();
+        if ($ffi === null) {
+            return $this->crossesOffsetChangePhp(...$timestamps);
+        }
+
+        $zone = new \DateTimeZone(date_default_timezone_get());
+        $transitions = $zone->getTransitions(min($timestamps), max($timestamps));
+        $transitionCount = \is_array($transitions) ? \count($transitions) : -1;
+
+        // @phpstan-ignore method.notFound
+        $res = $ffi->nntmux_downtime_crosses_offset_change($transitionCount);
+        if (! \is_int($res) || $res < 0) {
+            return $this->crossesOffsetChangePhp(...$timestamps);
+        }
+
+        return $res === 1;
     }
 
     /**
@@ -336,14 +489,86 @@ final class CollectionDowntimeCompensator implements CollectionReconciliationBar
      * Datetime columns hold application-timezone wall-clock values, so convert both ways
      * in that timezone.
      */
-    private function at(int $timestamp): string
+    public function at(int $timestamp): string
+    {
+        return self::$useRustFfi
+            ? $this->atNative($timestamp)
+            : $this->atPhp($timestamp);
+    }
+
+    public function atPhp(int $timestamp): string
     {
         return Carbon::createFromTimestamp($timestamp, date_default_timezone_get())->format('Y-m-d H:i:s');
     }
 
-    private function timestamp(string $dateTime): int
+    public function atNative(int $timestamp): string
+    {
+        $ffi = self::categorizeFfi();
+        if ($ffi === null) {
+            return $this->atPhp($timestamp);
+        }
+
+        $tzName = date_default_timezone_get();
+        $offset = ($tzName === 'UTC' || $tzName === 'Etc/UTC')
+            ? 0
+            : (new \DateTimeZone($tzName))->getOffset(new \DateTimeImmutable('@'.$timestamp));
+
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, 32, $cap);
+        if ($scratch === null) {
+            return $this->atPhp($timestamp);
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_downtime_format_at($timestamp, $offset, $scratch, $cap);
+        if (! \is_int($written) || $written !== 19) {
+            return $this->atPhp($timestamp);
+        }
+
+        return FFI::string($scratch, 19);
+    }
+
+    public function timestamp(string $dateTime): int
+    {
+        return self::$useRustFfi
+            ? $this->timestampNative($dateTime)
+            : $this->timestampPhp($dateTime);
+    }
+
+    public function timestampPhp(string $dateTime): int
     {
         return Carbon::createFromFormat('Y-m-d H:i:s', substr($dateTime, 0, 19), date_default_timezone_get())->getTimestamp();
+    }
+
+    public function timestampNative(string $dateTime): int
+    {
+        $ffi = self::categorizeFfi();
+        if ($ffi === null) {
+            return $this->timestampPhp($dateTime);
+        }
+
+        $outCivil = $ffi->new('int64_t[1]');
+
+        // @phpstan-ignore method.notFound
+        $rc = $ffi->nntmux_downtime_parse_civil_datetime($dateTime, \strlen($dateTime), $outCivil);
+        if (! \is_int($rc) || $rc !== 1) {
+            return $this->timestampPhp($dateTime);
+        }
+
+        /** @var int $civilEpoch */
+        $civilEpoch = $outCivil[0];
+        $tzName = date_default_timezone_get();
+        if ($tzName === 'UTC' || $tzName === 'Etc/UTC') {
+            return $civilEpoch;
+        }
+
+        $zone = new \DateTimeZone($tzName);
+        $transitions = $zone->getTransitions($civilEpoch - 86400, $civilEpoch + 86400);
+        if (\is_array($transitions) && \count($transitions) === 1) {
+            return $civilEpoch - (int) $transitions[0]['offset'];
+        }
+
+        return $this->timestampPhp($dateTime);
     }
 
     /**
@@ -566,7 +791,14 @@ final class CollectionDowntimeCompensator implements CollectionReconciliationBar
     /**
      * Prepare a complete file before either publication or rollback changes the marker.
      */
-    private function prepareMarker(string $value): string
+    public function prepareMarker(string $value): string
+    {
+        return self::$useRustFfi
+            ? $this->prepareMarkerNative($value)
+            : $this->prepareMarkerPhp($value);
+    }
+
+    public function prepareMarkerPhp(string $value): string
     {
         $directory = \dirname($this->markerPath);
         $temporary = tempnam($directory, 'activity-');
@@ -583,6 +815,66 @@ final class CollectionDowntimeCompensator implements CollectionReconciliationBar
             }
             try {
                 if (fwrite($stream, $value) !== \strlen($value) || ! fflush($stream) || ! fsync($stream)) {
+                    throw new \RuntimeException("Unable to write {$this->markerPath}.");
+                }
+            } finally {
+                fclose($stream);
+            }
+
+            return $temporary;
+        } catch (\Throwable $exception) {
+            unlink($temporary);
+            throw $exception;
+        }
+    }
+
+    public function prepareMarkerNative(string $value): string
+    {
+        $ffi = self::categorizeFfi();
+        if ($ffi === null) {
+            return $this->prepareMarkerPhp($value);
+        }
+
+        $directory = \dirname($this->markerPath);
+        $temporary = tempnam($directory, 'activity-');
+        if ($temporary === false) {
+            throw new \RuntimeException("Unable to write {$this->markerPath}.");
+        }
+        try {
+            $tempDir = \dirname($temporary);
+            $realDir = realpath($directory);
+            $realDirStr = $realDir === false ? '' : $realDir;
+
+            // @phpstan-ignore method.notFound
+            $dirOk = $ffi->nntmux_downtime_verify_marker_dir(
+                $tempDir,
+                \strlen($tempDir),
+                $realDirStr,
+                \strlen($realDirStr)
+            );
+            if ($dirOk !== 1) {
+                throw new \RuntimeException("Unable to write {$this->markerPath} in its directory.");
+            }
+
+            $stream = fopen($temporary, 'wb');
+            if ($stream === false) {
+                throw new \RuntimeException("Unable to write {$this->markerPath}.");
+            }
+            try {
+                $expectedLen = \strlen($value);
+                $written = fwrite($stream, $value);
+                $writtenBytes = $written === false ? -1 : $written;
+                $flushed = ($writtenBytes === $expectedLen) && fflush($stream);
+                $synced = $flushed && fsync($stream);
+
+                // @phpstan-ignore method.notFound
+                $writeOk = $ffi->nntmux_downtime_verify_marker_write(
+                    $expectedLen,
+                    $writtenBytes,
+                    $flushed ? 1 : 0,
+                    $synced ? 1 : 0
+                );
+                if ($writeOk !== 1) {
                     throw new \RuntimeException("Unable to write {$this->markerPath}.");
                 }
             } finally {

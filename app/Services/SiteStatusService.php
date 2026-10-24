@@ -12,6 +12,8 @@ use App\Models\ServiceIncident;
 use App\Models\ServiceStatus;
 use App\Services\StatusProbes\ProbeResult;
 use App\Services\StatusProbes\ServiceProbeRegistry;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
@@ -21,6 +23,16 @@ use Illuminate\Support\Facades\Mail;
 
 class SiteStatusService
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_site_status_merge_intervals(const int64_t *flat_pairs_ptr, size_t pair_count, int64_t *out_pairs_ptr, size_t out_pair_cap);
+        int32_t nntmux_site_status_aggregate_worst_nul(const char *input_ptr, size_t input_len, size_t count);
+        int32_t nntmux_site_status_map_incident_impact(const char *impact_ptr, size_t impact_len);
+        C;
+
+    public static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
+
     public const CACHE_KEY_ENABLED_SERVICES = 'admin:site-status:enabled-services';
 
     public const CACHE_KEY_ACTIVE_INCIDENTS = 'admin:site-status:active-incidents';
@@ -33,6 +45,22 @@ class SiteStatusService
      * @var array{0: int, 1: int}
      */
     private const CACHE_TTL = [60, 600];
+
+    public static function setUseRustFfi(bool $useRustFfi): void
+    {
+        self::$useRustFfi = $useRustFfi;
+    }
+
+    public static function categorizeFfi(): ?FFI
+    {
+        if (self::$ffi !== null) {
+            return self::$ffi === false ? null : self::$ffi;
+        }
+
+        self::$ffi = RustPipelineLibrary::resolveDomain('categorize', self::FFI_CDEF) ?? false;
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
 
     public function __construct(
         private readonly ServiceProbeRegistry $probeRegistry,
@@ -95,24 +123,69 @@ class SiteStatusService
     }
 
     /**
-     * @param  \Illuminate\Database\Eloquent\Collection<int, ServiceStatus>  $services
+     * @param  iterable<int, ServiceStatus|ServiceStatusEnum>  $services
      */
-    private function aggregateWorstStatus(\Illuminate\Database\Eloquent\Collection $services): ServiceStatusEnum
+    public function aggregateWorstStatus(iterable $services): ServiceStatusEnum
     {
-        if ($services->isEmpty()) {
-            return ServiceStatusEnum::Operational;
-        }
+        return self::$useRustFfi
+            ? $this->aggregateWorstStatusNative($services)
+            : $this->aggregateWorstStatusPhp($services);
+    }
 
+    /**
+     * @param  iterable<int, ServiceStatus|ServiceStatusEnum>  $services
+     */
+    public function aggregateWorstStatusPhp(iterable $services): ServiceStatusEnum
+    {
         $worst = ServiceStatusEnum::Operational;
 
         foreach ($services as $service) {
-            $current = $service->status;
+            $current = $service instanceof ServiceStatusEnum ? $service : $service->status;
             if ($current->severity() > $worst->severity()) {
                 $worst = $current;
             }
         }
 
         return $worst;
+    }
+
+    /**
+     * @param  iterable<int, ServiceStatus|ServiceStatusEnum>  $services
+     */
+    public function aggregateWorstStatusNative(iterable $services): ServiceStatusEnum
+    {
+        $ffi = self::categorizeFfi();
+        if ($ffi === null) {
+            return $this->aggregateWorstStatusPhp($services);
+        }
+
+        $tokens = [];
+        foreach ($services as $service) {
+            $status = $service instanceof ServiceStatusEnum ? $service : $service->status;
+            $tokens[] = $status->value;
+        }
+
+        $count = \count($tokens);
+        if ($count === 0) {
+            return ServiceStatusEnum::Operational;
+        }
+
+        $joined = implode("\0", $tokens);
+
+        // @phpstan-ignore method.notFound
+        $code = $ffi->nntmux_site_status_aggregate_worst_nul($joined, \strlen($joined), $count);
+        if (! \is_int($code)) {
+            return $this->aggregateWorstStatusPhp($services);
+        }
+
+        return match ($code) {
+            0 => ServiceStatusEnum::Operational,
+            1 => ServiceStatusEnum::Degraded,
+            2 => ServiceStatusEnum::Maintenance,
+            3 => ServiceStatusEnum::PartialOutage,
+            4 => ServiceStatusEnum::MajorOutage,
+            default => $this->aggregateWorstStatusPhp($services),
+        };
     }
 
     /**
@@ -273,7 +346,18 @@ class SiteStatusService
      * @param  list<array{0: int, 1: int}>  $intervals  [[start, end], ...]
      * @return list<array{0: int, 1: int}>
      */
-    private function mergeIntervals(array $intervals): array
+    public function mergeIntervals(array $intervals): array
+    {
+        return self::$useRustFfi
+            ? $this->mergeIntervalsNative($intervals)
+            : $this->mergeIntervalsPhp($intervals);
+    }
+
+    /**
+     * @param  list<array{0: int, 1: int}>  $intervals
+     * @return list<array{0: int, 1: int}>
+     */
+    public function mergeIntervalsPhp(array $intervals): array
     {
         if ($intervals === []) {
             return [];
@@ -290,6 +374,49 @@ class SiteStatusService
             } else {
                 $merged[] = $intervals[$i];
             }
+        }
+
+        return $merged;
+    }
+
+    /**
+     * @param  list<array{0: int, 1: int}>  $intervals
+     * @return list<array{0: int, 1: int}>
+     */
+    public function mergeIntervalsNative(array $intervals): array
+    {
+        if ($intervals === []) {
+            return [];
+        }
+
+        $ffi = self::categorizeFfi();
+        if ($ffi === null) {
+            return $this->mergeIntervalsPhp($intervals);
+        }
+
+        $pairCount = \count($intervals);
+        $elemCount = $pairCount * 2;
+        $inPairs = $ffi->new("int64_t[{$elemCount}]");
+        $outPairs = $ffi->new("int64_t[{$elemCount}]");
+
+        foreach ($intervals as $idx => $pair) {
+            $inPairs[$idx * 2] = $pair[0];
+            $inPairs[$idx * 2 + 1] = $pair[1];
+        }
+
+        // @phpstan-ignore method.notFound
+        $mergedCount = $ffi->nntmux_site_status_merge_intervals($inPairs, $pairCount, $outPairs, $pairCount);
+        if (! \is_int($mergedCount) || $mergedCount < 0) {
+            return $this->mergeIntervalsPhp($intervals);
+        }
+
+        $merged = [];
+        for ($i = 0; $i < $mergedCount; $i++) {
+            /** @var int $s */
+            $s = $outPairs[$i * 2];
+            /** @var int $e */
+            $e = $outPairs[$i * 2 + 1];
+            $merged[] = [$s, $e];
         }
 
         return $merged;
@@ -623,13 +750,43 @@ class SiteStatusService
         }
     }
 
-    private function mapIncidentImpactToServiceHealth(IncidentImpactEnum $impact): ServiceStatusEnum
+    public function mapIncidentImpactToServiceHealth(IncidentImpactEnum $impact): ServiceStatusEnum
+    {
+        return self::$useRustFfi
+            ? $this->mapIncidentImpactToServiceHealthNative($impact)
+            : $this->mapIncidentImpactToServiceHealthPhp($impact);
+    }
+
+    public function mapIncidentImpactToServiceHealthPhp(IncidentImpactEnum $impact): ServiceStatusEnum
     {
         return match ($impact) {
             IncidentImpactEnum::None => ServiceStatusEnum::Degraded,
             IncidentImpactEnum::Minor => ServiceStatusEnum::Degraded,
             IncidentImpactEnum::Major => ServiceStatusEnum::PartialOutage,
             IncidentImpactEnum::Critical => ServiceStatusEnum::MajorOutage,
+        };
+    }
+
+    public function mapIncidentImpactToServiceHealthNative(IncidentImpactEnum $impact): ServiceStatusEnum
+    {
+        $ffi = self::categorizeFfi();
+        if ($ffi === null) {
+            return $this->mapIncidentImpactToServiceHealthPhp($impact);
+        }
+
+        $raw = $impact->value;
+
+        // @phpstan-ignore method.notFound
+        $code = $ffi->nntmux_site_status_map_incident_impact($raw, \strlen($raw));
+        if (! \is_int($code)) {
+            return $this->mapIncidentImpactToServiceHealthPhp($impact);
+        }
+
+        return match ($code) {
+            1 => ServiceStatusEnum::Degraded,
+            3 => ServiceStatusEnum::PartialOutage,
+            4 => ServiceStatusEnum::MajorOutage,
+            default => $this->mapIncidentImpactToServiceHealthPhp($impact),
         };
     }
 }
