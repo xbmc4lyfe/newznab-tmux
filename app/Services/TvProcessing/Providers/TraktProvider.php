@@ -6,7 +6,10 @@ namespace App\Services\TvProcessing\Providers;
 
 use App\Services\TraktService;
 use App\Services\TvMazeClient;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Carbon;
+use Throwable;
 
 /**
  * Class TraktProvider.
@@ -26,6 +29,12 @@ class TraktProvider extends AbstractTvProvider
      * The localized (network airing) timezone of the show being processed.
      */
     private string $localizedTZ = '';
+
+    /**
+     * Candidate selection and imageUrl() through Rust; null selects the benchmark-qualified
+     * production default (PHP: both miss the 1.5x gate, see tests/Unit/RustTvProvidersTraktMatchingParityTest.php).
+     */
+    public ?bool $useRustFfi = null;
 
     public function __construct(?TraktService $client = null)
     {
@@ -48,9 +57,33 @@ class TraktProvider extends AbstractTvProvider
         // Trakt does NOT like shows with the year in them even without the parentheses
         $name = (string) preg_replace('# \((19|20)\d{2}\)$#', '', $name);
 
+        $results = (array) $client->searchShows($name);
+        $highest = ($this->useRustFfi ?? false)
+            ? $this->selectBestShowNative($results, $name, $year)
+            : $this->selectBestShowPhp($results, $name, $year);
+
+        if ($highest === null || empty($highest['ids']['trakt'])) {
+            return false;
+        }
+
+        $fullShow = $client->getShowSummary($highest['ids']['trakt']);
+
+        return \is_array($fullShow) && $this->checkRequiredAttr($fullShow, 'traktS')
+            ? $this->formatShowInfo($fullShow)
+            : false;
+    }
+
+    /**
+     * The first search result whose title scores strictly highest above zero.
+     *
+     * @param  array<int|string, mixed>  $results
+     * @return array<int|string, mixed>|null
+     */
+    public function selectBestShowPhp(array $results, string $name, ?int $year): ?array
+    {
         $highestScore = 0.0;
         $highest = null;
-        foreach ((array) $client->searchShows($name) as $result) {
+        foreach ($results as $result) {
             $show = \is_array($result) ? ($result['show'] ?? null) : null;
             if (! \is_array($show) || empty($show['title'])) {
                 continue;
@@ -63,15 +96,40 @@ class TraktProvider extends AbstractTvProvider
             }
         }
 
-        if ($highest === null || empty($highest['ids']['trakt'])) {
-            return false;
+        return $highest;
+    }
+
+    /**
+     * selectBestShowPhp() scored in one Rust call; falls back to PHP when Rust declines.
+     *
+     * @param  array<int|string, mixed>  $results
+     * @return array<int|string, mixed>|null
+     */
+    public function selectBestShowNative(array $results, string $name, ?int $year): ?array
+    {
+        $titles = $starteds = $countries = $shows = [];
+        foreach ($results as $result) {
+            $show = \is_array($result) ? ($result['show'] ?? null) : null;
+            if (! \is_array($show) || empty($show['title'])) {
+                continue;
+            }
+
+            $titles[] = (string) $show['title'];
+            $starteds[] = isset($show['year']) ? 'i'.(int) $show['year'] : 'n';
+            $countries[] = '';
+            $shows[] = $show;
         }
 
-        $fullShow = $client->getShowSummary($highest['ids']['trakt']);
+        if ($titles === []) {
+            return null;
+        }
 
-        return \is_array($fullShow) && $this->checkRequiredAttr($fullShow, 'traktS')
-            ? $this->formatShowInfo($fullShow)
-            : false;
+        $index = TmdbProvider::bestCandidateIndexNative($name, $year, '', $titles, $starteds, $countries);
+        if ($index === null) {
+            return $this->selectBestShowPhp($results, $name, $year);
+        }
+
+        return $index >= 0 ? $shows[$index] : null;
     }
 
     public function fetchAllEpisodes(int $siteId, int $videoId): int
@@ -197,11 +255,50 @@ class TraktProvider extends AbstractTvProvider
      */
     private function imageUrl(mixed $image): string
     {
+        return ($this->useRustFfi ?? false) ? $this->imageUrlNative($image) : $this->imageUrlPhp($image);
+    }
+
+    public function imageUrlPhp(mixed $image): string
+    {
         if (! \is_array($image)) {
             return '';
         }
 
         $url = (string) ($image['full'] ?? $image['medium'] ?? $image['thumb'] ?? (\is_string($image[0] ?? null) ? $image[0] : ''));
+
+        if ($url !== '' && ! str_starts_with($url, 'http')) {
+            $url = 'https://'.ltrim($url, '/');
+        }
+
+        return $url;
+    }
+
+    /**
+     * imageUrlPhp() with the scheme normalisation in Rust `nntmux_trakt_image_url`.
+     */
+    public function imageUrlNative(mixed $image): string
+    {
+        if (! \is_array($image)) {
+            return '';
+        }
+
+        $url = (string) ($image['full'] ?? $image['medium'] ?? $image['thumb'] ?? (\is_string($image[0] ?? null) ? $image[0] : ''));
+        if (($ffi = TraktService::traktFfi()) !== null) {
+            $len = \strlen($url);
+            $cap = 0;
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, $len + 16, $cap);
+            if ($scratch !== null) {
+                try {
+                    // @phpstan-ignore method.notFound
+                    $written = $ffi->nntmux_trakt_image_url($url, $len, $scratch, $cap);
+                    if (\is_int($written) && $written >= 0) {
+                        return $written === 0 ? '' : FFI::string($scratch, $written);
+                    }
+                } catch (Throwable) {
+                    // Older native libraries retain the PHP implementation.
+                }
+            }
+        }
 
         if ($url !== '' && ! str_starts_with($url, 'http')) {
             $url = 'https://'.ltrim($url, '/');
@@ -227,7 +324,7 @@ class TraktProvider extends AbstractTvProvider
             }
 
             return (int) ($show->id ?? 0);
-        } catch (\Throwable) {
+        } catch (Throwable) {
             // TVMaze ID lookup is optional enrichment.
             return 0;
         }
@@ -267,10 +364,10 @@ class TraktProvider extends AbstractTvProvider
             return Carbon::parse((string) $date)
                 ->setTimezone($this->localizedTZ !== '' ? $this->localizedTZ : 'UTC')
                 ->format('Y-m-d');
-        } catch (\Throwable) {
+        } catch (Throwable) {
             try {
                 return Carbon::parse((string) $date)->format('Y-m-d');
-            } catch (\Throwable) {
+            } catch (Throwable) {
                 return '';
             }
         }

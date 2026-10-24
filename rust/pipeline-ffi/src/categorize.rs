@@ -9168,3 +9168,547 @@ pub mod release_context_language_flag {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// TV provider candidate selection / TraktService id helpers
+// ---------------------------------------------------------------------------
+
+/// Rust mirrors of the TMDB/TVMaze/TVDB/Trakt provider candidate-selection loops (the first
+/// candidate with the strictly highest `scoreCandidate()` above `0.0` wins), `TraktProvider::imageUrl()`
+/// URL normalisation and `TraktService::formatImdbId()/formatMediaId()/isUsableExternalId()`.
+pub mod tv_providers_trakt_matching {
+    use std::cell::RefCell;
+    use std::slice;
+
+    use super::candidate_scoring::{
+        TV_FLAG_OUR_YEAR, mb_lower_latin1_into, tv_score_with_lower, tv_year_of_int, tv_year_of_str,
+    };
+    use super::php_trim_ascii;
+    use crate::OutCursor;
+
+    /// Decline to PHP (invalid input, unsupported bytes or a too-small output buffer).
+    pub const DECLINED: isize = -1;
+    /// Valid input with no accepted candidate, or a PHP `null` return value.
+    pub const NONE: isize = -2;
+
+    thread_local! {
+        static LOWER: RefCell<(Vec<u8>, Vec<u8>)> = RefCell::new((Vec::with_capacity(128), Vec::with_capacity(128)));
+    }
+
+    #[inline]
+    unsafe fn input<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            Some(&[])
+        } else if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { slice::from_raw_parts(ptr, len) })
+        }
+    }
+
+    /// One `'n'` (null), `'s'`+string or `'i'`+decimal int `$candidateStarted` segment.
+    fn started_year(seg: &[u8]) -> Result<Option<i64>, ()> {
+        match seg.split_first() {
+            Some((b'n', [])) => Ok(None),
+            Some((b's', rest)) => Ok(tv_year_of_str(rest)),
+            Some((b'i', digits)) => std::str::from_utf8(digits)
+                .ok()
+                .and_then(|d| d.parse::<i64>().ok())
+                .map(tv_year_of_int)
+                .ok_or(()),
+            _ => Err(()),
+        }
+    }
+
+    /// Index of the first candidate whose score is strictly the highest above `0.0`, `None` when
+    /// no candidate scores above `0.0`, or `Err` to decline (malformed framing, or a candidate
+    /// `scoreCandidate()` declines).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn best_candidate(
+        ours: &[u8],
+        our_year: Option<i64>,
+        our_country: &[u8],
+        titles: &[u8],
+        starteds: &[u8],
+        countries: &[u8],
+        count: usize,
+    ) -> Result<Option<usize>, ()> {
+        if count == 0 {
+            return Err(());
+        }
+        let nuls = |s: &[u8]| s.iter().filter(|&&b| b == 0).count();
+        if nuls(titles) != count - 1 || nuls(starteds) != count - 1 || nuls(countries) != count - 1
+        {
+            return Err(());
+        }
+        LOWER.with(|cell| {
+            let (ours_lower, buf) = &mut *cell.borrow_mut();
+            if !mb_lower_latin1_into(php_trim_ascii(ours), ours_lower) {
+                return Err(());
+            }
+            let mut highest_score = 0.0f64;
+            let mut highest = None;
+            for (i, ((title, started), country)) in titles
+                .split(|&b| b == 0)
+                .zip(starteds.split(|&b| b == 0))
+                .zip(countries.split(|&b| b == 0))
+                .enumerate()
+            {
+                let score = tv_score_with_lower(
+                    ours_lower,
+                    our_year,
+                    title,
+                    started_year(started)?,
+                    our_country,
+                    country,
+                    buf,
+                )
+                .ok_or(())?;
+                if score > highest_score {
+                    highest_score = score;
+                    highest = Some(i);
+                }
+            }
+            Ok(highest)
+        })
+    }
+
+    /// `TraktProvider::imageUrl()` after the URL string has been picked from the image field:
+    /// unchanged when empty or starting with `http`, else `https://` + `ltrim($url, '/')`.
+    pub(crate) fn image_url(url: &[u8], out: &mut OutCursor<'_>) {
+        if url.is_empty() || url.starts_with(b"http") {
+            out.extend(url);
+        } else {
+            let start = url.iter().position(|&b| b != b'/').unwrap_or(url.len());
+            out.extend(b"https://");
+            out.extend(&url[start..]);
+        }
+    }
+
+    /// `TraktService::formatImdbId()`; `false` for PHP `null`.
+    pub(crate) fn format_imdb_id(id: &[u8], out: &mut OutCursor<'_>) -> bool {
+        // `/^tt\d{6,}$/i`: `$` also matches before one final "\n".
+        let body = id.strip_suffix(b"\n").unwrap_or(id);
+        if body.len() >= 8
+            && body[..2].eq_ignore_ascii_case(b"tt")
+            && body[2..].iter().all(u8::is_ascii_digit)
+        {
+            out.extend(id);
+            return true;
+        }
+        // `preg_replace('/\D/', '', $id)` then `/^\d{6,}$/`.
+        let digits = id.iter().filter(|b| b.is_ascii_digit()).count();
+        if digits < 6 {
+            return false;
+        }
+        out.extend(b"tt");
+        for &b in id.iter().filter(|b| b.is_ascii_digit()) {
+            out.push(b);
+        }
+        true
+    }
+
+    /// `Str::slug($id)` (separator `-`, language `en`, dictionary `['@' => 'at']`) for printable
+    /// ASCII; `false` declines any other byte (transliteration and `\pL`/`\s` stay in PHP).
+    pub(crate) fn slug_ascii(id: &[u8], out: &mut OutCursor<'_>) -> bool {
+        if !id.iter().all(|&b| (0x20..=0x7e).contains(&b)) {
+            return false;
+        }
+        // After `_` → `-`, `@` → `-at-`, lowercasing and dropping every byte that is not `-`,
+        // an ASCII letter/digit or a space, runs of `-`/space collapse to one `-`, trimmed.
+        let mut pending_sep = false;
+        let mut started = false;
+        let emit = |b: u8, out: &mut OutCursor<'_>, pending: &mut bool, started: &mut bool| {
+            if b == b'-' || b == b' ' {
+                *pending = true;
+            } else {
+                if *pending && *started {
+                    out.push(b'-');
+                }
+                *pending = false;
+                *started = true;
+                out.push(b);
+            }
+        };
+        for &b in id {
+            match b {
+                b'_' | b'-' | b' ' => emit(b'-', out, &mut pending_sep, &mut started),
+                b'@' => {
+                    emit(b'-', out, &mut pending_sep, &mut started);
+                    emit(b'a', out, &mut pending_sep, &mut started);
+                    emit(b't', out, &mut pending_sep, &mut started);
+                    emit(b'-', out, &mut pending_sep, &mut started);
+                }
+                b'A'..=b'Z' => emit(b + 32, out, &mut pending_sep, &mut started),
+                b'a'..=b'z' | b'0'..=b'9' => emit(b, out, &mut pending_sep, &mut started),
+                _ => {}
+            }
+        }
+        true
+    }
+
+    /// `TraktService::formatMediaId()` for a string id: `Ok(false)` for PHP `null`.
+    pub(crate) fn format_media_id(id: &[u8], out: &mut OutCursor<'_>) -> Result<bool, ()> {
+        let id = php_trim_ascii(id);
+        if id.is_empty() {
+            return Ok(false);
+        }
+        if id.len() >= 2 && id[..2].eq_ignore_ascii_case(b"tt") {
+            return Ok(format_imdb_id(id, out));
+        }
+        if slug_ascii(id, out) {
+            Ok(true)
+        } else {
+            Err(())
+        }
+    }
+
+    #[inline]
+    fn is_numeric_ws(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
+    }
+
+    /// PHP 8 `is_numeric()` for a string: `None` when not numeric, `Some(true)` for an integer
+    /// form (`[ws][+-]digits[ws]`), `Some(false)` for a float form (fraction or exponent).
+    fn numeric_form(s: &[u8]) -> Option<bool> {
+        let mut i = 0;
+        while i < s.len() && is_numeric_ws(s[i]) {
+            i += 1;
+        }
+        if i < s.len() && (s[i] == b'+' || s[i] == b'-') {
+            i += 1;
+        }
+        let int_start = i;
+        while i < s.len() && s[i].is_ascii_digit() {
+            i += 1;
+        }
+        let mut digits = i - int_start;
+        let mut integer = true;
+        if i < s.len() && s[i] == b'.' {
+            integer = false;
+            i += 1;
+            let frac_start = i;
+            while i < s.len() && s[i].is_ascii_digit() {
+                i += 1;
+            }
+            digits += i - frac_start;
+        }
+        if digits == 0 {
+            return None;
+        }
+        if i < s.len() && (s[i] == b'e' || s[i] == b'E') {
+            let mut j = i + 1;
+            if j < s.len() && (s[j] == b'+' || s[j] == b'-') {
+                j += 1;
+            }
+            let exp_start = j;
+            while j < s.len() && s[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > exp_start {
+                integer = false;
+                i = j;
+            }
+        }
+        while i < s.len() && is_numeric_ws(s[i]) {
+            i += 1;
+        }
+        (i == s.len()).then_some(integer)
+    }
+
+    /// `TraktService::isUsableExternalId()` for a string id; `None` declines float-form numeric
+    /// strings, whose `(int)` cast stays in PHP.
+    pub(crate) fn usable_external_id(id: &[u8], imdb: bool) -> Option<bool> {
+        if id.is_empty() {
+            return Some(false);
+        }
+        if imdb {
+            return Some(format_imdb_id(id, &mut unsafe {
+                OutCursor::new(std::ptr::null_mut(), 0)
+            }));
+        }
+        match numeric_form(id) {
+            // 19+ digits overflow to a double in PHP (INF, cast to 0, past 308): stay in PHP.
+            Some(true) if id.iter().filter(|b| b.is_ascii_digit()).count() > 18 => None,
+            // `(int)` of a shorter integer string is positive exactly when it is unsigned or `+`
+            // and carries a non-zero digit.
+            Some(true) => {
+                let t = id.iter().skip_while(|&&b| is_numeric_ws(b));
+                let mut t = t.peekable();
+                if t.peek() == Some(&&b'-') {
+                    return Some(false);
+                }
+                Some(t.any(|&b| (b'1'..=b'9').contains(&b)))
+            }
+            Some(false) => None,
+            None => Some(!php_trim_ascii(id).is_empty()),
+        }
+    }
+
+    // -- C ABI -------------------------------------------------------------------------------
+
+    /// Provider candidate selection over `count` NUL-separated `titles`, `starteds` (`'n'`,
+    /// `'s'`+string or `'i'`+int) and `countries`. Returns the winning index, [`NONE`] when no
+    /// candidate scores above `0.0`, or [`DECLINED`].
+    ///
+    /// # Safety
+    ///
+    /// Every pointer must be valid for reads of its length when non-null.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_tv_provider_best_candidate_nul(
+        ours: *const u8,
+        ours_len: usize,
+        our_year: i64,
+        flags: u32,
+        our_country: *const u8,
+        our_country_len: usize,
+        titles: *const u8,
+        titles_len: usize,
+        starteds: *const u8,
+        starteds_len: usize,
+        countries: *const u8,
+        countries_len: usize,
+        count: usize,
+    ) -> isize {
+        if count > isize::MAX as usize {
+            return DECLINED;
+        }
+        let (Some(ours), Some(oc), Some(titles), Some(starteds), Some(countries)) = (unsafe {
+            (
+                input(ours, ours_len),
+                input(our_country, our_country_len),
+                input(titles, titles_len),
+                input(starteds, starteds_len),
+                input(countries, countries_len),
+            )
+        }) else {
+            return DECLINED;
+        };
+        let our_year = (flags & TV_FLAG_OUR_YEAR != 0).then_some(our_year);
+        match best_candidate(ours, our_year, oc, titles, starteds, countries, count) {
+            Ok(Some(i)) => i as isize,
+            Ok(None) => NONE,
+            Err(()) => DECLINED,
+        }
+    }
+
+    fn written(out: OutCursor<'_>) -> isize {
+        match out.finish() {
+            n if n >= 0 => n,
+            _ => DECLINED,
+        }
+    }
+
+    /// `TraktProvider::imageUrl()` normalisation of the picked URL into `out`; the written length,
+    /// or [`DECLINED`].
+    ///
+    /// # Safety
+    ///
+    /// `url` must be valid for `url_len` reads when non-null and `out` for `cap` writes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_trakt_image_url(
+        url: *const u8,
+        url_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let Some(url) = (unsafe { input(url, url_len) }) else {
+            return DECLINED;
+        };
+        let mut cursor = unsafe { OutCursor::new(out, cap) };
+        image_url(url, &mut cursor);
+        written(cursor)
+    }
+
+    /// `TraktService::formatImdbId()` into `out`: the written length, [`NONE`] for `null`, or
+    /// [`DECLINED`].
+    ///
+    /// # Safety
+    ///
+    /// `id` must be valid for `id_len` reads when non-null and `out` for `cap` writes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_trakt_format_imdb_id(
+        id: *const u8,
+        id_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let Some(id) = (unsafe { input(id, id_len) }) else {
+            return DECLINED;
+        };
+        let mut cursor = unsafe { OutCursor::new(out, cap) };
+        if !format_imdb_id(id, &mut cursor) {
+            return NONE;
+        }
+        written(cursor)
+    }
+
+    /// `TraktService::formatMediaId()` for a string id into `out`: the written length, [`NONE`]
+    /// for `null`, or [`DECLINED`].
+    ///
+    /// # Safety
+    ///
+    /// `id` must be valid for `id_len` reads when non-null and `out` for `cap` writes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_trakt_format_media_id(
+        id: *const u8,
+        id_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let Some(id) = (unsafe { input(id, id_len) }) else {
+            return DECLINED;
+        };
+        let mut cursor = unsafe { OutCursor::new(out, cap) };
+        match format_media_id(id, &mut cursor) {
+            Ok(true) => written(cursor),
+            Ok(false) => NONE,
+            Err(()) => DECLINED,
+        }
+    }
+
+    /// `TraktService::isUsableExternalId()` for a string id (`imdb` non-zero for the `imdb` id
+    /// type): `1`/`0`, or `-1` to decline.
+    ///
+    /// # Safety
+    ///
+    /// `id` must be valid for `id_len` reads when non-null.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_trakt_usable_external_id(
+        id: *const u8,
+        id_len: usize,
+        imdb: u32,
+    ) -> i32 {
+        match unsafe { input(id, id_len) }.and_then(|id| usable_external_id(id, imdb != 0)) {
+            Some(usable) => i32::from(usable),
+            None => -1,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn run(f: impl Fn(&mut OutCursor<'_>) -> bool) -> Option<String> {
+            let mut buf = [0u8; 256];
+            let mut out = unsafe { OutCursor::new(buf.as_mut_ptr(), buf.len()) };
+            if !f(&mut out) {
+                return None;
+            }
+            let n = out.finish() as usize;
+            Some(String::from_utf8(buf[..n].to_vec()).unwrap())
+        }
+
+        #[test]
+        fn best_candidate_picks_first_strict_maximum() {
+            let titles = b"The Office\0The Office (US)\0The Office";
+            let starteds = b"s2001-07-09\0i2005\0s2005-03-24";
+            let countries = b"GB\0US\0US";
+            let best = best_candidate(
+                b"The Office",
+                Some(2005),
+                b"US",
+                titles,
+                starteds,
+                countries,
+                3,
+            );
+            assert!(matches!(best, Ok(Some(_))));
+            assert_eq!(
+                best_candidate(b"Zzz", None, b"", b"Qqq", b"n", b"", 1),
+                Ok(None)
+            );
+            assert_eq!(
+                best_candidate(b"A", None, b"", b"A\0B", b"n", b"\0", 2),
+                Err(())
+            );
+            assert_eq!(best_candidate(b"A", None, b"", b"A", b"x", b"", 1), Err(()));
+            assert_eq!(
+                best_candidate(b"A", None, b"", b"\xe2\x82\xac", b"n", b"", 1),
+                Err(())
+            );
+        }
+
+        #[test]
+        fn trakt_helpers_match_php_examples() {
+            assert_eq!(
+                run(|o| {
+                    image_url(b"//walter.trakt.tv/a.jpg", o);
+                    true
+                })
+                .unwrap(),
+                "https://walter.trakt.tv/a.jpg"
+            );
+            assert_eq!(
+                run(|o| {
+                    image_url(b"https://x/a.jpg", o);
+                    true
+                })
+                .unwrap(),
+                "https://x/a.jpg"
+            );
+            assert_eq!(
+                run(|o| {
+                    image_url(b"httpx", o);
+                    true
+                })
+                .unwrap(),
+                "httpx"
+            );
+            assert_eq!(
+                run(|o| {
+                    image_url(b"///", o);
+                    true
+                })
+                .unwrap(),
+                "https://"
+            );
+            assert_eq!(
+                run(|o| format_imdb_id(b"tt0137523", o)).unwrap(),
+                "tt0137523"
+            );
+            assert_eq!(
+                run(|o| format_imdb_id(b"TT0137523\n", o)).unwrap(),
+                "TT0137523\n"
+            );
+            assert_eq!(run(|o| format_imdb_id(b"137523", o)).unwrap(), "tt137523");
+            assert_eq!(
+                run(|o| format_imdb_id(b"tt-01-37-523", o)).unwrap(),
+                "tt0137523"
+            );
+            assert_eq!(run(|o| format_imdb_id(b"tt12345", o)), None);
+            assert_eq!(
+                run(|o| format_media_id(b"  Breaking_Bad @ Home!! ", o).unwrap()).unwrap(),
+                "breaking-bad-at-home"
+            );
+            assert_eq!(run(|o| format_media_id(b"--__--", o).unwrap()).unwrap(), "");
+            assert_eq!(
+                run(|o| format_media_id(b" tt0903747 ", o).unwrap()).unwrap(),
+                "tt0903747"
+            );
+            assert_eq!(
+                format_media_id(b"\0\t ", &mut unsafe {
+                    OutCursor::new(std::ptr::null_mut(), 0)
+                }),
+                Ok(false)
+            );
+            assert_eq!(
+                format_media_id(b"caf\xc3\xa9", &mut unsafe {
+                    OutCursor::new(std::ptr::null_mut(), 0)
+                }),
+                Err(())
+            );
+            assert_eq!(usable_external_id(b"0", false), Some(false));
+            assert_eq!(usable_external_id(b" +12 ", false), Some(true));
+            assert_eq!(usable_external_id(b"-3", false), Some(false));
+            assert_eq!(usable_external_id(&[b'9'; 19], false), None);
+            assert_eq!(usable_external_id(b"1.5", false), None);
+            assert_eq!(usable_external_id(b"1e", false), Some(true));
+            assert_eq!(usable_external_id(b" \0", false), Some(false));
+            assert_eq!(usable_external_id(b"slug", false), Some(true));
+            assert_eq!(usable_external_id(b"12345", true), Some(false));
+            assert_eq!(usable_external_id(b"tt0137523", true), Some(true));
+        }
+    }
+}
