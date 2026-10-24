@@ -17040,3 +17040,324 @@ pub unsafe extern "C" fn nntmux_w26_email_dispatch_jobs_mail(
     }))
     .unwrap_or(-1)
 }
+
+pub mod wave27_account_mail_dispatch_jobs {
+    use super::{wave22_append_frame, wave22_frames};
+
+    pub(super) fn output(operation: u32, input: &[u8]) -> Result<Vec<u8>, isize> {
+        let count = match operation {
+            0 | 1 | 2 | 4 => 1,
+            3 => 2,
+            _ => return Err(-1),
+        };
+        let frames = wave22_frames(input)?;
+        if frames.len() != count || (operation == 3 && frames[1].is_none()) {
+            return Err(-1);
+        }
+        let mut output = Vec::new();
+        for frame in frames {
+            wave22_append_frame(&mut output, frame)?;
+        }
+        // The original account-mail handlers always dispatch, even for null recipients.
+        wave22_append_frame(&mut output, Some(b"1"))?;
+        Ok(output)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::output;
+        use crate::cleaning::nntmux_w27_account_mail_dispatch_jobs;
+
+        fn wire(values: &[Option<&[u8]>]) -> Vec<u8> {
+            let mut result = Vec::new();
+            for value in values {
+                match value {
+                    Some(bytes) => {
+                        result.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                        result.extend_from_slice(bytes);
+                    }
+                    None => result.extend_from_slice(&u32::MAX.to_le_bytes()),
+                }
+            }
+            result
+        }
+
+        #[test]
+        fn w27_account_mail_dispatch_jobs_protocol_literals_bytes_null_and_large() {
+            let large = vec![0xfe; 131_073];
+            let values: [Option<&[u8]>; 7] = [
+                None,
+                Some(b""),
+                Some(b"0"),
+                Some(b"user@example.test"),
+                Some(b"\0\xff\x80\r\n"),
+                Some(b" null \0"),
+                Some(&large),
+            ];
+            for operation in 0..=4 {
+                for recipient in values {
+                    let links: &[&[u8]] = if operation == 3 {
+                        &[b"", b"0", b"\0\xff\x80", &large]
+                    } else {
+                        &[b"unused"]
+                    };
+                    for link in links {
+                        let fields = if operation == 3 {
+                            vec![recipient, Some(*link)]
+                        } else {
+                            vec![recipient]
+                        };
+                        let input = wire(&fields);
+                        let mut expected = input.clone();
+                        expected.extend_from_slice(&[1, 0, 0, 0, b'1']);
+                        assert_eq!(output(operation, &input).unwrap(), expected);
+                        let mut target = vec![0xab; expected.len() + 1];
+                        assert_eq!(
+                            unsafe {
+                                nntmux_w27_account_mail_dispatch_jobs(
+                                    operation,
+                                    input.as_ptr(),
+                                    input.len(),
+                                    target.as_mut_ptr(),
+                                    expected.len(),
+                                )
+                            },
+                            expected.len() as i32
+                        );
+                        assert_eq!(&target[..expected.len()], expected);
+                        assert_eq!(target[expected.len()], 0xab);
+                    }
+                }
+            }
+            assert_eq!(
+                output(0, &[255, 255, 255, 255]).unwrap(),
+                [255, 255, 255, 255, 1, 0, 0, 0, b'1']
+            );
+            assert_eq!(
+                output(3, &[0, 0, 0, 0, 0, 0, 0, 0]).unwrap(),
+                [0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, b'1']
+            );
+        }
+
+        #[test]
+        fn w27_account_mail_dispatch_jobs_rejects_frames_and_unknown_operations() {
+            for operation in 0..=4 {
+                let valid = if operation == 3 {
+                    wire(&[None, Some(b"reset")])
+                } else {
+                    wire(&[None])
+                };
+                let mut invalid = vec![
+                    Vec::new(),
+                    vec![0],
+                    vec![0, 0, 0],
+                    vec![2, 0, 0, 0, b'x'],
+                    vec![254, 255, 255, 255],
+                ];
+                for end in 0..valid.len() {
+                    invalid.push(valid[..end].to_vec());
+                }
+                invalid.push([valid.clone(), wire(&[None])].concat());
+                invalid.push([valid.clone(), vec![0]].concat());
+                if operation == 3 {
+                    invalid.push(wire(&[None, None]));
+                    invalid.push(wire(&[Some(b"x"), None]));
+                }
+                for input in invalid {
+                    assert!(output(operation, &input).is_err());
+                    let mut target = [0xab; 64];
+                    assert_eq!(
+                        unsafe {
+                            nntmux_w27_account_mail_dispatch_jobs(
+                                operation,
+                                input.as_ptr(),
+                                input.len(),
+                                target.as_mut_ptr(),
+                                target.len(),
+                            )
+                        },
+                        -1
+                    );
+                    assert_eq!(target, [0xab; 64]);
+                }
+            }
+            for operation in [5, 6, u32::MAX] {
+                let input = wire(&[None]);
+                assert!(output(operation, &input).is_err());
+                let mut target = [0xab; 64];
+                assert_eq!(
+                    unsafe {
+                        nntmux_w27_account_mail_dispatch_jobs(
+                            operation,
+                            input.as_ptr(),
+                            input.len(),
+                            target.as_mut_ptr(),
+                            target.len(),
+                        )
+                    },
+                    -1
+                );
+                assert_eq!(target, [0xab; 64]);
+            }
+        }
+
+        #[test]
+        fn w27_account_mail_dispatch_jobs_regions_capacity_unaligned_and_overlap() {
+            for operation in 0..=4 {
+                let input = if operation == 3 {
+                    wire(&[None, Some(b"reset\0\xff")])
+                } else {
+                    wire(&[Some(b"0\0\xff")])
+                };
+                let expected = output(operation, &input).unwrap();
+                let mut target = [0xab; 128];
+                unsafe {
+                    for capacity in [0, 1, expected.len() - 1] {
+                        assert_eq!(
+                            nntmux_w27_account_mail_dispatch_jobs(
+                                operation,
+                                input.as_ptr(),
+                                input.len(),
+                                target.as_mut_ptr(),
+                                capacity
+                            ),
+                            -(expected.len() as i32)
+                        );
+                        assert_eq!(target, [0xab; 128]);
+                    }
+                    for (source, length, out, capacity) in [
+                        (std::ptr::null(), 0, target.as_mut_ptr(), target.len()),
+                        (
+                            std::ptr::null(),
+                            input.len(),
+                            target.as_mut_ptr(),
+                            target.len(),
+                        ),
+                        (input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                        (input.as_ptr(), input.len(), std::ptr::null_mut(), 10),
+                        (
+                            usize::MAX as *const u8,
+                            1,
+                            target.as_mut_ptr(),
+                            target.len(),
+                        ),
+                        (input.as_ptr(), input.len(), usize::MAX as *mut u8, 1),
+                        (
+                            input.as_ptr(),
+                            usize::MAX,
+                            target.as_mut_ptr(),
+                            target.len(),
+                        ),
+                        (input.as_ptr(), input.len(), target.as_mut_ptr(), usize::MAX),
+                        (
+                            input.as_ptr(),
+                            isize::MAX as usize + 1,
+                            target.as_mut_ptr(),
+                            target.len(),
+                        ),
+                        (
+                            input.as_ptr(),
+                            input.len(),
+                            target.as_mut_ptr(),
+                            isize::MAX as usize + 1,
+                        ),
+                    ] {
+                        assert_eq!(
+                            nntmux_w27_account_mail_dispatch_jobs(
+                                operation, source, length, out, capacity
+                            ),
+                            -1
+                        );
+                        assert_eq!(target, [0xab; 128]);
+                    }
+                    let unaligned = [vec![0xab], input.clone()].concat();
+                    assert_eq!(
+                        nntmux_w27_account_mail_dispatch_jobs(
+                            operation,
+                            unaligned.as_ptr().add(1),
+                            input.len(),
+                            target.as_mut_ptr().add(1),
+                            expected.len()
+                        ),
+                        expected.len() as i32
+                    );
+                    assert_eq!(&target[1..1 + expected.len()], expected);
+                    assert_eq!(target[0], 0xab);
+                    assert!(
+                        target[1 + expected.len()..]
+                            .iter()
+                            .all(|byte| *byte == 0xab)
+                    );
+                    for (source_offset, target_offset) in [(0, 0), (0, 1), (3, 0)] {
+                        for capacity in [0, 1, expected.len() - 1, expected.len()] {
+                            let mut buffer = [0xab; 128];
+                            buffer[source_offset..source_offset + input.len()]
+                                .copy_from_slice(&input);
+                            let before = buffer;
+                            let actual = nntmux_w27_account_mail_dispatch_jobs(
+                                operation,
+                                buffer.as_ptr().add(source_offset),
+                                input.len(),
+                                buffer.as_mut_ptr().add(target_offset),
+                                capacity,
+                            );
+                            if capacity < expected.len() {
+                                assert_eq!(actual, -(expected.len() as i32));
+                                assert_eq!(buffer, before);
+                            } else {
+                                assert_eq!(actual, expected.len() as i32);
+                                assert_eq!(
+                                    &buffer[target_offset..target_offset + expected.len()],
+                                    expected
+                                );
+                                assert_eq!(&buffer[..target_offset], &before[..target_offset]);
+                                assert_eq!(
+                                    &buffer[target_offset + expected.len()..],
+                                    &before[target_offset + expected.len()..]
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Render account-mail dispatch frames, preserving every recipient and reset-link byte.
+/// Returns bytes written, -1 on invalid input/panic, or negated required size.
+/// Errors leave output untouched; input and output may overlap.
+///
+/// # Safety
+/// Both regions must be non-null and allocated for their stated extents, with
+/// lengths fitting isize and no address overflow. Only byte alignment is needed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w27_account_mail_dispatch_jobs(
+    operation: u32,
+    input: *const u8,
+    len: usize,
+    out: *mut u8,
+    out_cap: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, len) || !cleaning_ffi_region_valid(out, out_cap) {
+            return -1;
+        }
+        let output = {
+            let input = unsafe { slice::from_raw_parts(input, len) };
+            match wave27_account_mail_dispatch_jobs::output(operation, input) {
+                Ok(output) => output,
+                Err(_) => return -1,
+            }
+        };
+        let Ok(needed) = i32::try_from(output.len()) else {
+            return -1;
+        };
+        if output.len() > out_cap {
+            return -needed;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(output.as_ptr(), out, output.len()) };
+        needed
+    }))
+    .unwrap_or(-1)
+}
