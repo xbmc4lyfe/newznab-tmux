@@ -10,7 +10,9 @@ use App\Services\Configuration\ConfigurationProvider;
 use App\Services\Nzb\NzbService;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\OversizedCollectionDeferrals;
+use App\Support\RustPipelineLibrary;
 use DateTimeInterface;
+use FFI;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Carbon;
@@ -23,6 +25,64 @@ use Throwable;
 
 class CollectionCleanupService
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_cleanup_calculate(uint32_t mode, const int64_t *input, size_t len, int64_t *out, size_t cap);
+        C;
+
+    // PHP remains the default unless every paired common/uncommon mean and p99 gains 1.5x.
+    private static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
+
+    public static function setUseRustFfi(bool $use): void
+    {
+        self::$useRustFfi = $use;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        self::$ffi ??= RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF) ?? false;
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
+
+    /**
+     * @param  list<int>  $values
+     * @return list<int>|null
+     */
+    private static function calculateNative(int $mode, array $values, int $size): ?array
+    {
+        try {
+            $ffi = self::ffi();
+            if ($ffi === null || count($values) > 1024) {
+                return null;
+            }
+            $input = $ffi->new('int64_t['.max(1, count($values)).']');
+            foreach ($values as $i => $value) {
+                $input[$i] = $value;
+            }
+            $out = $ffi->new('int64_t['.$size.']');
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_cleanup_calculate($mode, $input, count($values), $out, $size);
+            if ($written !== $size) {
+                return null;
+            }
+            $result = [];
+            for ($i = 0; $i < $size; $i++) {
+                $result[] = (int) $out[$i];
+            }
+
+            return $result;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
     /**
      * Maximum number of retries for a lock-related DB error before giving up.
      */
@@ -107,7 +167,7 @@ class CollectionCleanupService
         // explicitly remove parts/binaries/collections even when FK cascades
         // are not present in the runtime schema.
         $retentionHours = app(ConfigurationProvider::class)->ingestion()->partRetentionHours;
-        $cutoff = now()->subHours($retentionHours);
+        $cutoff = self::cutoffDate(now(), $retentionHours);
         $batchDeleted = 0;
         $verificationRequired = (bool) config('release_verification.required', true);
         if ($verificationRequired) {
@@ -115,7 +175,7 @@ class CollectionCleanupService
         } else {
             // Collections still waiting for reconciliation or release creation are owed an attempt
             // that a capped release pass may not have reached yet, so they get one more retention period.
-            $readyCutoff = now()->subHours(2 * $retentionHours);
+            $readyCutoff = self::cutoffDate(now(), 2 * $retentionHours);
             do {
                 $ids = DB::table('collections')
                     ->where(static fn ($age) => $age->where('dateadded', '<', $readyCutoff)
@@ -141,7 +201,7 @@ class CollectionCleanupService
             $batchDeleted += $this->deleteRetentionBandExceptReady($readyCutoff, $cutoff, $echoCLI);
         }
 
-        $deletedCount += $batchDeleted;
+        $deletedCount = self::cleanupTotal([$deletedCount, $batchDeleted]);
 
         if ($echoCLI) {
             $elapsed = now()->diffInSeconds($startTime, true);
@@ -161,7 +221,7 @@ class CollectionCleanupService
         }
 
         $orphanDeleted = $this->deleteOrphanCollections($echoCLI);
-        $deletedCount += $orphanDeleted;
+        $deletedCount = self::cleanupTotal([$deletedCount, $orphanDeleted]);
 
         if ($echoCLI) {
             $totalTime = now()->diffInSeconds($startTime, true);
@@ -181,7 +241,7 @@ class CollectionCleanupService
         }
 
         $missedDeleted = $this->deleteCollectionsMissedAfterNzb($echoCLI);
-        $deletedCount += $missedDeleted;
+        $deletedCount = self::cleanupTotal([$deletedCount, $missedDeleted]);
 
         $totalTime = now()->diffInSeconds($startTime, true);
 
@@ -279,7 +339,7 @@ class CollectionCleanupService
                 $lastId = 0;
                 $maxId = (int) DB::table('collections')->max('id');
             }
-            $archiveBudget = min(self::VERIFICATION_OLD_SWEEP_MAX_CANDIDATES, $this->sqlChunkSize());
+            $archiveBudget = self::batchBound($this->sqlChunkSize(), PHP_INT_MIN, self::VERIFICATION_OLD_SWEEP_MAX_CANDIDATES);
             $deadline = microtime(true) + $this->verificationSweepSeconds();
             $deleted = 0;
             do {
@@ -373,7 +433,7 @@ class CollectionCleanupService
             return [];
         }
         sort($ids);
-        $expiresBefore = now()->subHours((int) config('release_verification.expiry_hours'))->format('Y-m-d H:i:s');
+        $expiresBefore = self::cutoffDate(now(), (int) config('release_verification.expiry_hours'))->format('Y-m-d H:i:s');
         $rows = DB::table('collections')
             ->when($lock && in_array(DB::getDriverName(), ['mysql', 'mariadb'], true), fn ($query) => $query->forceIndex('PRIMARY'))
             ->whereIn('id', $ids)->orderBy('id')->when($lock, fn ($query) => $query->lockForUpdate())->get();
@@ -426,7 +486,7 @@ class CollectionCleanupService
     private function verificationSweepSeconds(): int
     {
         // Archival after the last page starts is not timed, so stay well inside the sweep lock's lifetime.
-        return max(0, min(120, (int) config('nntmux.cbp.verification_sweep_seconds', 60)));
+        return self::batchBound((int) config('nntmux.cbp.verification_sweep_seconds', 60), 0, 120);
     }
 
     /**
@@ -513,7 +573,7 @@ class CollectionCleanupService
         if ($cursor >= $maxId) {
             $cursor = 0;
         }
-        $windowEnd = min($cursor + $this->orphanScanWindow(), $maxId);
+        $windowEnd = self::batchEnd($cursor, $this->orphanScanWindow(), $maxId);
         $batchSize = $this->sqlChunkSize();
         $deleted = 0;
 
@@ -830,5 +890,78 @@ class CollectionCleanupService
         }
 
         return false;
+    }
+
+    public static function cutoffTimestamp(int $timestamp, int $hours): int
+    {
+        return self::$useRustFfi ? self::cutoffTimestampNative($timestamp, $hours) : self::cutoffTimestampPhp($timestamp, $hours);
+    }
+
+    public static function cutoffTimestampNative(int $timestamp, int $hours): int
+    {
+        return self::calculateNative(0, [$timestamp, $hours], 1)[0] ?? self::cutoffTimestampPhp($timestamp, $hours);
+    }
+
+    public static function cutoffTimestampPhp(int $timestamp, int $hours): int
+    {
+        return $timestamp - $hours * 3600;
+    }
+
+    // Carbon subHours uses elapsed hours across DST transitions. Preserve timezone and microseconds.
+    public static function cutoffDate(Carbon $now, int $hours): Carbon
+    {
+        $cutoff = $now->copy();
+        $cutoff->setTimestamp(self::cutoffTimestamp($now->timestamp, $hours));
+        $cutoff->setMicrosecond($now->micro);
+
+        return $cutoff;
+    }
+
+    public static function batchEnd(int $cursor, int $window, int $maximum): int
+    {
+        return self::$useRustFfi ? self::batchEndNative($cursor, $window, $maximum) : self::batchEndPhp($cursor, $window, $maximum);
+    }
+
+    public static function batchEndNative(int $cursor, int $window, int $maximum): int
+    {
+        return self::calculateNative(1, [$cursor, $window, $maximum], 1)[0] ?? self::batchEndPhp($cursor, $window, $maximum);
+    }
+
+    public static function batchEndPhp(int $cursor, int $window, int $maximum): int
+    {
+        return min($cursor + $window, $maximum);
+    }
+
+    public static function batchBound(int $value, int $minimum, int $maximum): int
+    {
+        return self::$useRustFfi ? self::batchBoundNative($value, $minimum, $maximum) : self::batchBoundPhp($value, $minimum, $maximum);
+    }
+
+    public static function batchBoundNative(int $value, int $minimum, int $maximum): int
+    {
+        return self::calculateNative(2, [$value, $minimum, $maximum], 1)[0] ?? self::batchBoundPhp($value, $minimum, $maximum);
+    }
+
+    public static function batchBoundPhp(int $value, int $minimum, int $maximum): int
+    {
+        return max($minimum, min($maximum, $value));
+    }
+
+    /** @param list<int> $counts */
+    public static function cleanupTotal(array $counts): int
+    {
+        return self::$useRustFfi ? self::cleanupTotalNative($counts) : self::cleanupTotalPhp($counts);
+    }
+
+    /** @param list<int> $counts */
+    public static function cleanupTotalNative(array $counts): int
+    {
+        return self::calculateNative(3, $counts, 1)[0] ?? self::cleanupTotalPhp($counts);
+    }
+
+    /** @param list<int> $counts */
+    public static function cleanupTotalPhp(array $counts): int
+    {
+        return array_sum($counts);
     }
 }

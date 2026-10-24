@@ -10889,3 +10889,547 @@ mod wave14_slice6_support_tests {
         }
     }
 }
+
+
+// Wave 16: pure arithmetic/reporting candidates. PHP owns NNTP, clocks and database effects.
+// Status: nonnegative = elements/bytes written; -1 = invalid argument, -2 = capacity,
+// -3 = unsupported/overflow, -4 = caught panic. Failures never partially write output.
+fn wave16_region<T>(ptr: *const T, len: usize) -> bool {
+    let Some(bytes) = len.checked_mul(std::mem::size_of::<T>()) else {
+        return false;
+    };
+    bytes <= isize::MAX as usize
+        && (len == 0
+            || (!ptr.is_null() && ptr.is_aligned() && (ptr as usize).checked_add(bytes).is_some()))
+}
+
+fn wave16_sum(values: &[i128]) -> Result<i128, isize> {
+    let mut total = 0i64;
+    for &value in values {
+        let value = i64::try_from(value).map_err(|_| -3isize)?;
+        total = total.checked_add(value).ok_or(-3isize)?;
+    }
+    Ok(i128::from(total))
+}
+
+fn wave16_values(domain: u32, mode: u32, a: &[i64]) -> Result<Vec<i64>, isize> {
+    let a: Vec<i128> = a.iter().map(|&v| i128::from(v)).collect();
+    let values = match (domain, mode) {
+        // Existing group header range: PHP intentionally excludes the local watermark.
+        (0, 0) => {
+            let [first, newest, buffer, limit] = a[..] else {
+                return Err(-1);
+            };
+            if buffer <= 0 {
+                return Err(-3);
+            }
+            let count = newest - first;
+            // PHP's round(count / 2, HALF_DOWN) uses a double. Decline outside its exact range.
+            if count.abs() > (1i128 << 53) {
+                return Err(-3);
+            }
+            let leave = if count > buffer * 2 {
+                count % buffer + buffer
+            } else {
+                count / 2
+            };
+            let mut last = (newest - leave).max(first);
+            if limit > 0 && limit < last - first {
+                last = first + limit;
+            }
+            vec![first, last, last, last - first, count, leave]
+        }
+        (0, 1) => {
+            let [oldest, newest, messages, buffer, by_date, date_first] = a[..] else {
+                return Err(-1);
+            };
+            if !(0..=1).contains(&by_date) {
+                return Err(-1);
+            }
+            let span = i64::try_from(messages + buffer).map_err(|_| -3isize)?;
+            let from_end = i64::try_from(newest - i128::from(span)).map_err(|_| -3isize)?;
+            let first = if by_date == 1 {
+                date_first
+            } else {
+                oldest.max(i128::from(from_end))
+            };
+            let last = (newest - buffer).max(first);
+            vec![first, last, last, last - first, newest - first, buffer]
+        }
+        (0, 2) => {
+            let [first, last, group_last, total, buffer] = a[..] else {
+                return Err(-1);
+            };
+            let end = if total > buffer {
+                i128::from(i64::try_from(first + buffer).map_err(|_| -3isize)?).min(group_last)
+            } else {
+                last
+            };
+            vec![first + 1, end]
+        }
+        (0, 3) => {
+            let [minimum, maximum] = a[..] else {
+                return Err(-1);
+            };
+            if minimum < 0 || maximum < minimum {
+                return Err(-3);
+            }
+            let distance = maximum - minimum;
+            vec![minimum + distance / 2 + distance % 2]
+        }
+        (0, 4) => {
+            let [current, first, last, factor] = a[..] else {
+                return Err(-1);
+            };
+            if !(1005..=1012).contains(&factor)
+                || first < 0
+                || current < first
+                || current > last
+                || last > (1i128 << 52)
+            {
+                return Err(-3);
+            }
+            let ratio = factor as f64 / 1000.0;
+            let downward = (current - first).abs() > (last - current).abs();
+            let raw = if downward {
+                current as f64 / ratio
+            } else {
+                ratio * current as f64
+            };
+            // PHP corrects near-half floating point products before rounding. Decline ambiguous ties.
+            if (raw.fract() - 0.5).abs() <= 4.0 * f64::EPSILON * raw.abs().max(1.0) {
+                return Err(-3);
+            }
+            let probe = if downward {
+                (raw.round() as i128).max(first)
+            } else {
+                (raw.round() as i128).min(last)
+            };
+            vec![probe]
+        }
+        (1, 0) => {
+            let [first, articles, oldest] = a[..] else {
+                return Err(-1);
+            };
+            let target = first - articles;
+            // The PHP baseline calls round() even for integral inputs.
+            if target.abs() > (1i128 << 53) {
+                return Err(-3);
+            }
+            vec![target.max(oldest)]
+        }
+        (1, 1) => {
+            let [target, oldest] = a[..] else {
+                return Err(-1);
+            };
+            vec![target.max(oldest)]
+        }
+        (1, 2) => {
+            let [previous_first, target, buffer] = a[..] else {
+                return Err(-1);
+            };
+            let last = i128::from(i64::try_from(previous_first - 1).map_err(|_| -3isize)?);
+            let start = i128::from(i64::try_from(last - buffer).map_err(|_| -3isize)?) + 1;
+            vec![start.max(target), last]
+        }
+        (2, 0) => {
+            let [timestamp, hours] = a[..] else {
+                return Err(-1);
+            };
+            let offset = i64::try_from(hours * 3600).map_err(|_| -3isize)?;
+            vec![timestamp - i128::from(offset)]
+        }
+        (2, 1) => {
+            let [cursor, window, maximum] = a[..] else {
+                return Err(-1);
+            };
+            let sum = i64::try_from(cursor + window).map_err(|_| -3isize)?;
+            vec![i128::from(sum).min(maximum)]
+        }
+        (2, 2) => {
+            let [value, minimum, maximum] = a[..] else {
+                return Err(-1);
+            };
+            vec![value.min(maximum).max(minimum)]
+        }
+        (2, 3) => vec![wave16_sum(&a)?],
+        (3, 0) => {
+            if a.len() % 2 != 0 {
+                return Err(-1);
+            }
+            let n = a.len() / 2;
+            a[..n].iter().zip(&a[n..]).map(|(a, b)| a + b).collect()
+        }
+        (3, 1) => vec![wave16_sum(&a)?],
+        (4, 0) => a[..9].iter().zip(&a[9..]).map(|(a, b)| a + b).collect(),
+        (4, 1) => vec![wave16_sum(&a)?],
+        (4, 2) => {
+            let mut v = a.clone();
+            v.push(wave16_sum(&a)?);
+            v
+        }
+        (4, 3) => vec![i128::from(wave16_sum(&a)? > 0)],
+        _ => return Err(-1),
+    };
+    values
+        .into_iter()
+        .map(|v| i64::try_from(v).map_err(|_| -3))
+        .collect()
+}
+
+unsafe fn wave16_math(
+    domain: u32,
+    mode: u32,
+    input: *const i64,
+    len: usize,
+    out: *mut i64,
+    cap: usize,
+) -> isize {
+    let (expected, needed) = match (domain, mode) {
+        (0, 0) => (4, 6),
+        (0, 1) => (6, 6),
+        (0, 2) => (5, 2),
+        (0, 3) => (2, 1),
+        (0, 4) => (4, 1),
+        (1, 0) => (3, 1),
+        (1, 1) => (2, 1),
+        (1, 2) => (3, 2),
+        (2, 0) => (2, 1),
+        (2, 1) => (3, 1),
+        (2, 2) => (3, 1),
+        (2, 3) | (3, 1) if len <= 1024 => (len, 1),
+        (3, 0) => (8, 4),
+        (4, 0) => (18, 9),
+        (4, 1) | (4, 3) => (9, 1),
+        (4, 2) => (9, 10),
+        _ => return -1,
+    };
+    if len != expected || !wave16_region(input, len) || !wave16_region(out, cap) {
+        return -1;
+    }
+    if cap < needed {
+        return -2;
+    }
+    let input = if len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(input, len) }
+    };
+    let values = match wave16_values(domain, mode, input) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    // All input reads finish before writing; source is owned, so callers may reuse an input buffer.
+    unsafe {
+        std::ptr::copy_nonoverlapping(values.as_ptr(), out, values.len());
+    }
+    values.len() as isize
+}
+
+/// # Safety
+/// Nonempty pointers must name aligned readable/writable regions of the declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_binaries_calculate(
+    mode: u32,
+    input: *const i64,
+    len: usize,
+    out: *mut i64,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| unsafe { wave16_math(0, mode, input, len, out, cap) }).unwrap_or(-4)
+}
+/// # Safety
+/// Nonempty pointers must name aligned readable/writable regions of the declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_backfill_calculate(
+    mode: u32,
+    input: *const i64,
+    len: usize,
+    out: *mut i64,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| unsafe { wave16_math(1, mode, input, len, out, cap) }).unwrap_or(-4)
+}
+/// # Safety
+/// Nonempty pointers must name aligned readable/writable regions of the declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_cleanup_calculate(
+    mode: u32,
+    input: *const i64,
+    len: usize,
+    out: *mut i64,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| unsafe { wave16_math(2, mode, input, len, out, cap) }).unwrap_or(-4)
+}
+/// # Safety
+/// Nonempty pointers must name aligned readable/writable regions of the declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_release_counts(
+    mode: u32,
+    input: *const i64,
+    len: usize,
+    out: *mut i64,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| unsafe { wave16_math(3, mode, input, len, out, cap) }).unwrap_or(-4)
+}
+/// # Safety
+/// Nonempty pointers must name aligned readable/writable regions of the declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_release_delete_stats(
+    mode: u32,
+    input: *const i64,
+    len: usize,
+    out: *mut i64,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| unsafe { wave16_math(4, mode, input, len, out, cap) }).unwrap_or(-4)
+}
+
+fn wave16_grouped(value: i64) -> Result<String, isize> {
+    if value.unsigned_abs() > (1u64 << 53) {
+        return Err(-3);
+    }
+    let raw = value.unsigned_abs().to_string();
+    let mut out = String::new();
+    if value < 0 {
+        out.push('-');
+    }
+    for (index, c) in raw.chars().enumerate() {
+        if index > 0 && (raw.len() - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    Ok(out)
+}
+
+unsafe fn wave16_text_write(value: &[u8], out: *mut u8, cap: usize) -> isize {
+    if value.len() > cap {
+        return -2;
+    }
+    if !value.is_empty() {
+        unsafe {
+            std::ptr::copy_nonoverlapping(value.as_ptr(), out, value.len());
+        }
+    }
+    value.len() as isize
+}
+
+/// Formats the scan chunk diagnostic. Output is raw bytes, without a trailing NUL.
+/// # Safety
+/// Input/output pointers must name readable/writable regions of the declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_scan_diagnostic(
+    first: i64,
+    last: i64,
+    group_last: i64,
+    name: *const u8,
+    len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        if !wave16_region(name, len) || !wave16_region(out, cap) || len > 1_048_576 {
+            return -1;
+        }
+        // Output always includes the complete name, so this is also a pre-slice capacity check.
+        if cap < len {
+            return -2;
+        }
+        let build = || -> Result<Vec<u8>, isize> {
+            let count =
+                i64::try_from(i128::from(last) - i128::from(first) + 1).map_err(|_| -3isize)?;
+            let queued = group_last.checked_sub(last).ok_or(-3isize)?;
+            let mut bytes = format!(
+                "\nGetting {} articles ({} to {}) from ",
+                wave16_grouped(count)?,
+                wave16_grouped(first)?,
+                wave16_grouped(last)?
+            )
+            .into_bytes();
+            if len > 0 {
+                bytes.extend_from_slice(unsafe { slice::from_raw_parts(name, len) });
+            }
+            bytes.extend_from_slice(
+                format!(" - ({} articles in queue).", wave16_grouped(queued)?).as_bytes(),
+            );
+            Ok(bytes)
+        };
+        match build() {
+            Ok(v) => unsafe { wave16_text_write(&v, out, cap) },
+            Err(e) => e,
+        }
+    })
+    .unwrap_or(-4)
+}
+
+fn wave16_elapsed(seconds: f64) -> Result<String, isize> {
+    if !seconds.is_finite() || seconds.abs() > 9_000_000_000_000.0 {
+        return Err(-3);
+    }
+    Ok(if seconds < 1.0 {
+        format!("{}ms", (seconds * 1000.0) as i64)
+    } else if seconds < 60.0 {
+        if ((seconds * 10.0).fract().abs() - 0.5).abs() <= 1e-9 {
+            return Err(-3);
+        }
+        format!("{seconds:.1}s")
+    } else {
+        let minutes = (seconds / 60.0).floor() as i64;
+        if minutes < 60 {
+            format!("{}m {}s", minutes, seconds as i64 % 60)
+        } else {
+            format!("{}h {}m", minutes / 60, minutes % 60)
+        }
+    })
+}
+
+/// # Safety
+/// Output must name a writable region of cap bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_release_elapsed(seconds: f64, out: *mut u8, cap: usize) -> isize {
+    std::panic::catch_unwind(|| {
+        if !wave16_region(out, cap) {
+            return -1;
+        }
+        match wave16_elapsed(seconds) {
+            Ok(v) => unsafe { wave16_text_write(v.as_bytes(), out, cap) },
+            Err(e) => e,
+        }
+    })
+    .unwrap_or(-4)
+}
+
+/// mode 0: four NUL-separated release summary lines; mode 1: nonzero deletion fields.
+/// # Safety
+/// Input/output pointers must name aligned readable/writable regions of the declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_release_summary(
+    mode: u32,
+    input: *const i64,
+    len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        let expected = match mode {
+            0 => 4,
+            1 => 9,
+            _ => return -1,
+        };
+        if len != expected || !wave16_region(input, len) || !wave16_region(out, cap) {
+            return -1;
+        }
+        if cap == 0 {
+            return -2;
+        }
+        let input = unsafe { slice::from_raw_parts(input, len) };
+        let build = || -> Result<String, isize> {
+            if mode == 0 {
+                let duplicates = if input[2] > 0 {
+                    format!("  Duplicates skipped: {}", wave16_grouped(input[2])?)
+                } else {
+                    String::new()
+                };
+                Ok(format!(
+                    "  Releases added: {}\0  NZBs created: {}\0{}\0  Processing cycles: {}",
+                    wave16_grouped(input[0])?,
+                    wave16_grouped(input[1])?,
+                    duplicates,
+                    wave16_grouped(input[3])?
+                ))
+            } else {
+                let keys = [
+                    "retention",
+                    "password",
+                    "duplicate",
+                    "completion",
+                    "disabledCategory",
+                    "categoryMinSize",
+                    "disabledGenre",
+                    "miscOther",
+                    "miscHashed",
+                ];
+                let fields: Vec<String> = input
+                    .iter()
+                    .zip(keys)
+                    .filter(|(v, _)| **v != 0)
+                    .map(|(v, k)| format!("{k}: {v}"))
+                    .collect();
+                Ok(if fields.is_empty() {
+                    "No releases deleted.".to_owned()
+                } else {
+                    fields.join(", ")
+                })
+            }
+        };
+        match build() {
+            Ok(v) => unsafe { wave16_text_write(v.as_bytes(), out, cap) },
+            Err(e) => e,
+        }
+    })
+    .unwrap_or(-4)
+}
+
+#[cfg(test)]
+mod wave16_tests {
+    use super::*;
+
+    #[test]
+    fn arithmetic_contract_and_overflow() {
+        unsafe {
+            let mut out = [777i64; 10];
+            let input = [100, 1000, 100, 250];
+            assert_eq!(
+                nntmux_binaries_calculate(0, input.as_ptr(), 4, out.as_mut_ptr(), 6),
+                6
+            );
+            assert_eq!(&out[..6], &[100, 350, 350, 250, 900, 100]);
+            out.fill(777);
+            assert_eq!(
+                nntmux_binaries_calculate(0, input.as_ptr(), 4, out.as_mut_ptr(), 5),
+                -2
+            );
+            assert!(out.iter().all(|v| *v == 777));
+            assert_eq!(
+                nntmux_binaries_calculate(0, std::ptr::null(), 4, out.as_mut_ptr(), 6),
+                -1
+            );
+            assert_eq!(
+                nntmux_binaries_calculate(0, input.as_ptr(), usize::MAX, out.as_mut_ptr(), 6),
+                -1
+            );
+            assert_eq!(
+                nntmux_binaries_calculate(0, input.as_ptr(), 4, out.as_mut_ptr(), usize::MAX),
+                -1
+            );
+            let overflow = [i64::MAX; 18];
+            assert_eq!(
+                nntmux_release_delete_stats(0, overflow.as_ptr(), 18, out.as_mut_ptr(), 9),
+                -3
+            );
+            let cutoff = [i64::MIN, 1];
+            assert_eq!(
+                nntmux_cleanup_calculate(0, cutoff.as_ptr(), 2, out.as_mut_ptr(), 1),
+                -3
+            );
+            let midpoint = [1, i64::MAX];
+            assert_eq!(
+                nntmux_binaries_calculate(3, midpoint.as_ptr(), 2, out.as_mut_ptr(), 1),
+                1
+            );
+            assert_eq!(out[0], 4611686018427387904);
+        }
+    }
+
+    #[test]
+    fn text_contracts() {
+        unsafe {
+            let mut out = [42u8; 256];
+            assert_eq!(nntmux_release_elapsed(60.5, out.as_mut_ptr(), 256), 5);
+            assert_eq!(&out[..5], b"1m 0s");
+        }
+    }
+}
