@@ -11,6 +11,9 @@ use Illuminate\Support\Facades\DB;
 
 final class BackfillReleaseFingerprintMetadata extends Command
 {
+    // Keep PHP as the production default: the JSON FFI round trip is slower than these helpers (< 1.5x).
+    private static ?bool $useRustFfi = null;
+
     protected $signature = 'releases:fingerprint-backfill
                             {--limit=100 : Maximum number of releases to queue}
                             {--after-id=0 : Resume after this release ID}
@@ -20,16 +23,107 @@ final class BackfillReleaseFingerprintMetadata extends Command
 
     protected $description = 'Queue resumable collection of public release format and NNTP metadata';
 
+    public static function setUseRustFfi(?bool $useRustFfi): void
+    {
+        self::$useRustFfi = $useRustFfi;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::useRustFfi();
+    }
+
+    /** @return array{limit: int, after_id: int, delay_ms: int} */
+    public static function normalizeBackfillOptions(mixed $limit, mixed $afterId, mixed $delayMs): array
+    {
+        return self::useRustFfi() ? self::normalizeBackfillOptionsNative($limit, $afterId, $delayMs) : self::normalizeBackfillOptionsPhp($limit, $afterId, $delayMs);
+    }
+
+    /** @return array{limit: int, after_id: int, delay_ms: int} */
+    public static function normalizeBackfillOptionsPhp(mixed $limit, mixed $afterId, mixed $delayMs): array
+    {
+        return ['limit' => max(1, min(10_000, (int) $limit)), 'after_id' => max(0, (int) $afterId), 'delay_ms' => max(0, min(60_000, (int) $delayMs))];
+    }
+
+    /** @return array{limit: int, after_id: int, delay_ms: int} */
+    public static function normalizeBackfillOptionsNative(mixed $limit, mixed $afterId, mixed $delayMs): array
+    {
+        if (GetArticleRange::transformNative(12, [$limit, $afterId, $delayMs], $result) && \is_array($result)
+            && array_keys($result) === ['limit', 'after_id', 'delay_ms']
+            && \is_int($result['limit']) && \is_int($result['after_id']) && \is_int($result['delay_ms'])) {
+            return ['limit' => $result['limit'], 'after_id' => $result['after_id'], 'delay_ms' => $result['delay_ms']];
+        }
+
+        return self::normalizeBackfillOptionsPhp($limit, $afterId, $delayMs);
+    }
+
+    /**
+     * The job's exact currency rule over each marker's JSON type and textual value. The legacy full
+     * collector writes no format marker, so a null expected format requires the marker to be absent.
+     */
+    public static function markersAreCurrent(?string $versionValue, ?string $versionType, ?string $formatValue, ?string $formatType, int $expectedVersion, ?string $expectedFormat): bool
+    {
+        return self::useRustFfi()
+            ? self::markersAreCurrentNative($versionValue, $versionType, $formatValue, $formatType, $expectedVersion, $expectedFormat)
+            : self::markersAreCurrentPhp($versionValue, $versionType, $formatValue, $formatType, $expectedVersion, $expectedFormat);
+    }
+
+    public static function markersAreCurrentPhp(?string $versionValue, ?string $versionType, ?string $formatValue, ?string $formatType, int $expectedVersion, ?string $expectedFormat): bool
+    {
+        $metadata = [];
+        $versionType = strtolower((string) $versionType);
+        if ($versionType === 'integer' && preg_match('/\A-?[0-9]+\z/', (string) $versionValue) === 1) {
+            $metadata['schema_version'] = (int) $versionValue;
+        } elseif ($versionType !== '') {
+            $metadata['schema_version'] = (string) $versionValue;
+        }
+        $formatType = strtolower((string) $formatType);
+        if (in_array($formatType, ['string', 'text'], true)) {
+            $metadata['format'] = (string) $formatValue;
+        } elseif ($formatType !== '' && $formatType !== 'null') {
+            // Arrays, objects, numbers and booleans are never a valid format marker.
+            $metadata['format'] = [$formatType];
+        }
+
+        return ($metadata['format'] ?? null) === $expectedFormat && ($metadata['schema_version'] ?? null) === $expectedVersion;
+    }
+
+    public static function markersAreCurrentNative(?string $versionValue, ?string $versionType, ?string $formatValue, ?string $formatType, int $expectedVersion, ?string $expectedFormat): bool
+    {
+        return GetArticleRange::transformNative(13, [$versionValue, $versionType, $formatValue, $formatType, $expectedVersion, $expectedFormat], $result)
+            && \is_bool($result)
+            ? $result
+            : self::markersAreCurrentPhp($versionValue, $versionType, $formatValue, $formatType, $expectedVersion, $expectedFormat);
+    }
+
+    public static function formatSummaryLine(bool $dryRun, int $queued, int $resumeAfterId = 0): string
+    {
+        return self::useRustFfi() ? self::formatSummaryLineNative($dryRun, $queued, $resumeAfterId) : self::formatSummaryLinePhp($dryRun, $queued, $resumeAfterId);
+    }
+
+    public static function formatSummaryLinePhp(bool $dryRun, int $queued, int $resumeAfterId = 0): string
+    {
+        return $dryRun
+            ? 'Dry run: '.$queued.' matching releases; nothing was queued.'
+            : 'Queued '.$queued.' releases. Resume with --after-id='.$resumeAfterId.'.';
+    }
+
+    public static function formatSummaryLineNative(bool $dryRun, int $queued, int $resumeAfterId = 0): string
+    {
+        return GetArticleRange::transformNative(14, [$dryRun, $queued, $resumeAfterId], $result) && \is_string($result)
+            ? $result
+            : self::formatSummaryLinePhp($dryRun, $queued, $resumeAfterId);
+    }
+
     public function handle(): int
     {
-        $limit = max(1, min(10_000, (int) $this->option('limit')));
-        $afterId = max(0, (int) $this->option('after-id'));
-        $delayMs = max(0, min(60_000, (int) $this->option('delay-ms')));
+        ['limit' => $limit, 'after_id' => $afterId, 'delay_ms' => $delayMs] = self::normalizeBackfillOptions(
+            $this->option('limit'), $this->option('after-id'), $this->option('delay-ms'));
         $releaseIds = collect($this->option('stale') ? $this->interruptedReleaseIds($afterId, $limit) : $this->staleReleaseIds($afterId, $limit));
 
         if ($this->option('dry-run')) {
             $this->table(['release_id'], $releaseIds->map(static fn (int|string $id): array => [(string) $id])->all());
-            $this->info('Dry run: '.$releaseIds->count().' matching releases; nothing was queued.');
+            $this->info(self::formatSummaryLine(true, $releaseIds->count()));
 
             return self::SUCCESS;
         }
@@ -42,7 +136,7 @@ final class BackfillReleaseFingerprintMetadata extends Command
             }
         }
 
-        $this->info('Queued '.$releaseIds->count().' releases. Resume with --after-id='.($releaseIds->last() ?? $afterId).'.');
+        $this->info(self::formatSummaryLine(false, $releaseIds->count(), (int) ($releaseIds->last() ?? $afterId)));
 
         return self::SUCCESS;
     }
@@ -78,7 +172,7 @@ final class BackfillReleaseFingerprintMetadata extends Command
             }
             foreach ($rows as $row) {
                 $cursor = (int) $row->id;
-                if (! self::markersAreCurrent($row)) {
+                if (! self::rowIsCurrent($row)) {
                     $ids[] = $cursor;
                     if (count($ids) >= $limit) {
                         break;
@@ -108,26 +202,25 @@ final class BackfillReleaseFingerprintMetadata extends Command
             ->pluck('releases_id')->map(static fn (mixed $id): int => (int) $id)->all();
     }
 
-    private static function markersAreCurrent(object $row): bool
+    private static function rowIsCurrent(object $row): bool
     {
         if (($row->status ?? null) !== 'complete') {
             return false;
         }
-        $metadata = [];
-        $versionType = strtolower((string) ($row->version_type ?? ''));
-        if ($versionType === 'integer' && preg_match('/\A-?[0-9]+\z/', (string) $row->version_value) === 1) {
-            $metadata['schema_version'] = (int) $row->version_value;
-        } elseif ($versionType !== '') {
-            $metadata['schema_version'] = (string) $row->version_value;
-        }
-        $formatType = strtolower((string) ($row->format_type ?? ''));
-        if (in_array($formatType, ['string', 'text'], true)) {
-            $metadata['format'] = (string) $row->format_value;
-        } elseif ($formatType !== '' && $formatType !== 'null') {
-            // Arrays, objects, numbers and booleans are never a valid format marker.
-            $metadata['format'] = [$formatType];
-        }
 
-        return CollectReleaseFingerprintMetadata::isCurrent($metadata);
+        return self::markersAreCurrent(self::markerText($row->version_value ?? null), self::markerText($row->version_type ?? null),
+            self::markerText($row->format_value ?? null), self::markerText($row->format_type ?? null),
+            CollectReleaseFingerprintMetadata::currentSchemaVersion(), CollectReleaseFingerprintMetadata::currentFormat());
+    }
+
+    /** Drivers return markers as strings or numbers; compare their PHP string form, as the job's JSON would. */
+    private static function markerText(mixed $value): ?string
+    {
+        return $value === null ? null : (string) $value;
+    }
+
+    private static function useRustFfi(): bool
+    {
+        return self::$useRustFfi ?? false;
     }
 }
