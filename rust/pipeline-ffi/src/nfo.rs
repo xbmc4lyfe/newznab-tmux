@@ -19305,3 +19305,439 @@ pub unsafe extern "C" fn nntmux_w25_api_audit_account_job(
     }))
     .unwrap_or(-1)
 }
+
+// Wave 26 Slice 2: pure stat payload/display helpers. SQL aggregation and all
+// storage effects stay in PHP; caller-inclusive performance gates control opt-in.
+pub mod wave26_stat_aggregation_models {
+    use super::*;
+
+    const MAX_BYTES: usize = 67_108_864;
+
+    fn scalar(value: &VerificationOutboxValue) -> Option<VerificationOutboxValue> {
+        (!matches!(value, VerificationOutboxValue::Array(_))).then(|| value.clone())
+    }
+
+    fn compute(
+        operation: u32,
+        args: &[VerificationOutboxValue],
+    ) -> Option<VerificationOutboxValue> {
+        use VerificationOutboxValue as V;
+        // Preserve scalar types and bytes, including PDO numeric strings and
+        // the original float wire spelling. Objects/arrays belong to PHP.
+        for value in args {
+            scalar(value)?;
+        }
+        Some(match (operation, args) {
+            (0, [searchname, guid, adddate, grabs]) => w16_map(vec![
+                ("searchname", scalar(searchname)?),
+                ("guid", scalar(guid)?),
+                ("adddate", scalar(adddate)?),
+                ("grabs", scalar(grabs)?),
+            ]),
+            (1, [username, grabs]) => w16_map(vec![
+                ("attributes", w16_map(vec![("username", scalar(username)?)])),
+                ("values", w16_map(vec![("grabs", scalar(grabs)?)])),
+            ]),
+            (2, [title, parent_title, V::Bool(has_parent)]) => {
+                if *has_parent {
+                    // PHP normalizes string conversions before crossing FFI.
+                    // Parent presence, rather than title truthiness, adds prefix.
+                    let mut name = w16_bytes(parent_title)?.to_vec();
+                    name.extend_from_slice(b" > ");
+                    name.extend_from_slice(w16_bytes(title)?);
+                    w16_string(&name)
+                } else {
+                    scalar(title)?
+                }
+            }
+            (3, []) => w16_list(vec![V::Int(10), V::Int(20)]),
+            (4, [category, count]) => w16_map(vec![
+                ("category", scalar(category)?),
+                ("count", scalar(count)?),
+            ]),
+            (5, [role, users]) => w16_map(vec![("role", scalar(role)?), ("users", scalar(users)?)]),
+            (6, [month, signups, sort_date]) => w16_map(vec![
+                ("attributes", w16_map(vec![("month", scalar(month)?)])),
+                (
+                    "values",
+                    w16_map(vec![
+                        ("signups", scalar(signups)?),
+                        ("sort_date", scalar(sort_date)?),
+                    ]),
+                ),
+            ]),
+            _ => return None,
+        })
+    }
+
+    pub(super) unsafe fn evaluate(
+        operation: u32,
+        input: *const u8,
+        length: usize,
+        output: *mut u8,
+        capacity: usize,
+    ) -> i32 {
+        if !nfo_abi_range(input, length, false)
+            || !nfo_abi_range(output, capacity, false)
+            || length > MAX_BYTES
+            || capacity > MAX_BYTES
+            || yenc_ranges_overlap(input as usize, length, output as usize, capacity)
+        {
+            return -1;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, length) };
+        let mut parser = VerificationOutboxParser {
+            bytes,
+            pos: 0,
+            remaining: 128,
+        };
+        let Some(value) = parser.value(448) else {
+            return -1;
+        };
+        if parser.pos != length || !w19_list(&value) || !w20_canonical(&value) {
+            return -1;
+        }
+        let mut canonical = Vec::new();
+        value.serialize(&mut canonical);
+        if canonical != bytes {
+            return -1;
+        }
+        let Some(entries) = w16_entries(&value) else {
+            return -1;
+        };
+        let args: Vec<_> = entries.iter().map(|(_, value)| value.clone()).collect();
+        let Some(result) = compute(operation, &args) else {
+            return -1;
+        };
+        let mut wire = Vec::new();
+        result.serialize(&mut wire);
+        if wire.len() > MAX_BYTES {
+            return -1;
+        }
+        let Ok(needed) = i32::try_from(wire.len()) else {
+            return -1;
+        };
+        if wire.len() > capacity {
+            return -needed;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(wire.as_ptr(), output, wire.len()) };
+        needed
+    }
+
+    #[cfg(test)]
+    mod w26_stat_aggregation_models_tests {
+        use super::*;
+        use VerificationOutboxValue as V;
+
+        fn wire(args: Vec<V>) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            w16_list(args).serialize(&mut bytes);
+            bytes
+        }
+
+        fn parity(operation: u32, args: Vec<V>, expected: V) {
+            let input = wire(args);
+            let mut expected_wire = Vec::new();
+            expected.serialize(&mut expected_wire);
+            let mut out = vec![0xa5; expected_wire.len() + 2];
+            for capacity in [0, 1, expected_wire.len() - 1] {
+                assert_eq!(
+                    unsafe {
+                        nntmux_w26_stat_aggregation_models(
+                            operation,
+                            input.as_ptr(),
+                            input.len(),
+                            out.as_mut_ptr(),
+                            capacity,
+                        )
+                    },
+                    -(expected_wire.len() as i32),
+                );
+                assert!(out.iter().all(|byte| *byte == 0xa5));
+            }
+            let mut unaligned = vec![0x5a; input.len() + 2];
+            unaligned[1..1 + input.len()].copy_from_slice(&input);
+            for capacity in [expected_wire.len(), expected_wire.len() + 1] {
+                out.fill(0xa5);
+                assert_eq!(
+                    unsafe {
+                        nntmux_w26_stat_aggregation_models(
+                            operation,
+                            unaligned.as_ptr().add(1),
+                            input.len(),
+                            out.as_mut_ptr().add(1),
+                            capacity,
+                        )
+                    },
+                    expected_wire.len() as i32,
+                );
+                assert_eq!(&out[1..1 + expected_wire.len()], &expected_wire);
+                assert_eq!(out[0], 0xa5);
+                assert_eq!(out[out.len() - 1], 0xa5);
+                assert_eq!(unaligned[0], 0x5a);
+                assert_eq!(unaligned[unaligned.len() - 1], 0x5a);
+                assert_eq!(&unaligned[1..1 + input.len()], &input);
+            }
+        }
+
+        fn rejected(operation: u32, args: Vec<V>) {
+            let input = wire(args);
+            let mut out = [0xa5; 512];
+            assert_eq!(
+                unsafe {
+                    nntmux_w26_stat_aggregation_models(
+                        operation,
+                        input.as_ptr(),
+                        input.len(),
+                        out.as_mut_ptr(),
+                        out.len(),
+                    )
+                },
+                -1,
+            );
+            assert!(out.iter().all(|byte| *byte == 0xa5));
+        }
+
+        #[test]
+        fn w26_stat_aggregation_models_rows_and_payloads_preserve_scalar_types_and_bytes() {
+            for value in [
+                V::Null,
+                V::Bool(false),
+                V::Bool(true),
+                V::Int(i64::MIN),
+                V::Int(i64::MAX),
+                V::Float(b"-0".to_vec()),
+                V::Float(b"1.25".to_vec()),
+                V::Float(b"NAN".to_vec()),
+                V::Float(b"INF".to_vec()),
+                V::Float(b"-INF".to_vec()),
+                w16_string(b""),
+                w16_string(b"00042"),
+                w16_string(b"\xff\0\xc3\xa9"),
+            ] {
+                parity(
+                    0,
+                    vec![value.clone(); 4],
+                    w16_map(vec![
+                        ("searchname", value.clone()),
+                        ("guid", value.clone()),
+                        ("adddate", value.clone()),
+                        ("grabs", value.clone()),
+                    ]),
+                );
+                parity(
+                    1,
+                    vec![value.clone(); 2],
+                    w16_map(vec![
+                        ("attributes", w16_map(vec![("username", value.clone())])),
+                        ("values", w16_map(vec![("grabs", value.clone())])),
+                    ]),
+                );
+                parity(
+                    4,
+                    vec![value.clone(); 2],
+                    w16_map(vec![("category", value.clone()), ("count", value.clone())]),
+                );
+                parity(
+                    5,
+                    vec![value.clone(); 2],
+                    w16_map(vec![("role", value.clone()), ("users", value.clone())]),
+                );
+                parity(
+                    6,
+                    vec![value.clone(); 3],
+                    w16_map(vec![
+                        ("attributes", w16_map(vec![("month", value.clone())])),
+                        (
+                            "values",
+                            w16_map(vec![
+                                ("signups", value.clone()),
+                                ("sort_date", value.clone()),
+                            ]),
+                        ),
+                    ]),
+                );
+                parity(2, vec![value.clone(), V::Null, V::Bool(false)], value);
+            }
+        }
+
+        #[test]
+        fn w26_stat_aggregation_models_display_parent_presence_and_exclusions() {
+            parity(3, vec![], w16_list(vec![V::Int(10), V::Int(20)]));
+            for (title, parent, expected) in [
+                (
+                    b"HD".as_slice(),
+                    b"Movies".as_slice(),
+                    b"Movies > HD".as_slice(),
+                ),
+                (b"HD", b"", b" > HD"),
+                (b"", b"0", b"0 > "),
+                (b"\xff\0", b"\0\xff", b"\0\xff > \xff\0"),
+            ] {
+                parity(
+                    2,
+                    vec![w16_string(title), w16_string(parent), V::Bool(true)],
+                    w16_string(expected),
+                );
+                parity(
+                    2,
+                    vec![w16_string(title), w16_string(parent), V::Bool(false)],
+                    w16_string(title),
+                );
+            }
+        }
+
+        #[test]
+        fn w26_stat_aggregation_models_wrong_operations_types_and_arities_are_atomic() {
+            for (op, args) in [
+                (0, vec![V::Null; 4]),
+                (1, vec![V::Null; 2]),
+                (
+                    2,
+                    vec![w16_string(b"title"), w16_string(b"root"), V::Bool(true)],
+                ),
+                (3, vec![]),
+                (4, vec![V::Null; 2]),
+                (5, vec![V::Null; 2]),
+                (6, vec![V::Null; 3]),
+            ] {
+                let mut too_many = args.clone();
+                too_many.push(V::Null);
+                rejected(op, too_many);
+                if !args.is_empty() {
+                    rejected(op, args[..args.len() - 1].to_vec());
+                }
+                for index in 0..args.len() {
+                    let mut invalid = args.clone();
+                    invalid[index] = w16_list(vec![]);
+                    rejected(op, invalid);
+                }
+            }
+            rejected(7, vec![]);
+            rejected(u32::MAX, vec![]);
+            rejected(2, vec![V::Null, V::Null, V::Bool(true)]);
+            rejected(2, vec![w16_string(b"title"), V::Null, V::Bool(true)]);
+            rejected(
+                2,
+                vec![w16_string(b"title"), w16_string(b"root"), V::Int(1)],
+            );
+        }
+
+        #[test]
+        fn w26_stat_aggregation_models_malformed_and_noncanonical_wire_is_atomic() {
+            let mut out = [0xa5; 256];
+            for malformed in [
+                b"".as_slice(),
+                b"N;",
+                b"i:1;",
+                b"a:0:{}}",
+                b"a:0:{}junk",
+                b"a:01:{i:0;i:1;}",
+                b"a:1:{i:00;i:1;}",
+                b"a:1:{i:0;i:+1;}",
+                b"a:1:{i:0;i:01;}",
+                b"a:1:{i:0;i:-0;}",
+                b"a:1:{i:0;i:9223372036854775808;}",
+                b"a:1:{i:1;i:1;}",
+                b"a:1:{s:1:\"0\";i:1;}",
+                b"a:2:{i:0;i:1;i:0;i:2;}",
+                b"a:1:{i:0;O:8:\"stdClass\":0:{}}",
+                b"a:1:{i:0;R:1;}",
+                b"a:1:{i:0;s:99999999999999999999999:\"x\";}",
+                b"a:1:{i:0;s:1:\"\";}",
+            ] {
+                assert_eq!(
+                    unsafe {
+                        nntmux_w26_stat_aggregation_models(
+                            0,
+                            malformed.as_ptr(),
+                            malformed.len(),
+                            out.as_mut_ptr(),
+                            out.len(),
+                        )
+                    },
+                    -1,
+                    "malformed wire: {malformed:?}",
+                );
+                assert!(out.iter().all(|byte| *byte == 0xa5));
+            }
+        }
+
+        #[test]
+        fn w26_stat_aggregation_models_null_overflow_oversized_and_overlapping_ranges() {
+            let input = wire(vec![]);
+            let mut out = [0xa5; 256];
+            let run =
+                |p, len, o, cap| unsafe { nntmux_w26_stat_aggregation_models(3, p, len, o, cap) };
+            for len in [0, 1] {
+                assert_eq!(run(std::ptr::null(), len, out.as_mut_ptr(), out.len()), -1);
+                assert_eq!(
+                    run(input.as_ptr(), input.len(), std::ptr::null_mut(), len),
+                    -1
+                );
+            }
+            assert_eq!(
+                run(input.as_ptr(), usize::MAX, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            assert_eq!(
+                run(usize::MAX as *const u8, 2, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), input.len(), usize::MAX as *mut u8, 2),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), input.len(), out.as_mut_ptr(), usize::MAX),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), MAX_BYTES + 1, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), input.len(), out.as_mut_ptr(), MAX_BYTES + 1),
+                -1
+            );
+            let pointer = out.as_mut_ptr();
+            assert_eq!(run(pointer, input.len(), pointer, out.len()), -1);
+            assert_eq!(
+                run(unsafe { pointer.add(1) }, input.len(), pointer, out.len()),
+                -1
+            );
+            assert_eq!(
+                run(
+                    pointer,
+                    input.len(),
+                    unsafe { pointer.add(1) },
+                    out.len() - 1
+                ),
+                -1
+            );
+            assert!(out.iter().all(|byte| *byte == 0xa5));
+        }
+    }
+}
+
+/// Evaluate canonical serialized PHP list arguments for the Wave 26.2 stat helpers.
+/// Returns -1 for unsupported/invalid input, -required without any write for
+/// insufficient capacity, or the exact positive byte count without a terminator.
+///
+/// # Safety
+/// Callers must provide live, disjoint readable/writable allocations covering
+/// the declared byte ranges, with non-null pointers even for zero-byte ranges.
+/// Byte alignment is one. Arithmetic checks cannot prove allocation provenance.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w26_stat_aggregation_models(
+    operation: u32,
+    input: *const u8,
+    length: usize,
+    output: *mut u8,
+    capacity: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        wave26_stat_aggregation_models::evaluate(operation, input, length, output, capacity)
+    }))
+    .unwrap_or(-1)
+}
