@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Console\Commands;
 
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Console\Attributes\Description;
 use Illuminate\Console\Attributes\Signature;
 use Illuminate\Console\Command;
@@ -36,6 +38,90 @@ use Illuminate\Support\Str;
 #[Description('Report release guid problems and resync leftguid so the releases normalization migration can run')]
 class ReleasesNormalizeGuids extends Command
 {
+    private static bool $useRustFfi = false;
+
+    private const string GUID_CDEF = 'int32_t nntmux_guid_classify(const char *input, size_t input_len); ssize_t nntmux_guid_classify_batch(const char *input, size_t input_len, size_t count, char *out_buf, size_t out_cap);';
+
+    public static function useRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public function isUnsupportedGuidNative(mixed $guid): ?bool
+    {
+        if (! is_string($guid)) {
+            return true;
+        }
+        $ffi = RustPipelineLibrary::resolveDomain('cleaning', self::GUID_CDEF);
+        if ($ffi === null) {
+            return null;
+        }
+        // @phpstan-ignore method.notFound
+        $result = $ffi->nntmux_guid_classify($guid, strlen($guid));
+
+        return is_int($result) && $result >= 0 ? ($result & 1) !== 0 : null;
+    }
+
+    /**
+     * Hex identity is informational; printable legacy names and UUIDs remain supported.
+     *
+     * @param  list<mixed>  $guids
+     * @return list<array{unsupported: bool, hex: bool}>
+     */
+    public function classifyGuids(array $guids): array
+    {
+        if (self::$useRustFfi && ($native = $this->classifyGuidsNative($guids)) !== null) {
+            return $native;
+        }
+
+        return array_map(static fn (mixed $guid): array => [
+            'unsupported' => ! is_string($guid) || preg_match(self::SUPPORTED_PATTERN, $guid) !== 1,
+            'hex' => is_string($guid) && preg_match('/\A[0-9a-fA-F]{32,40}\z/', $guid) === 1,
+        ], $guids);
+    }
+
+    /**
+     * @param  list<mixed>  $guids
+     * @return list<array{unsupported: bool, hex: bool}>|null
+     */
+    public function classifyGuidsNative(array $guids): ?array
+    {
+        if ($guids === []) {
+            return [];
+        }
+        $ffi = RustPipelineLibrary::resolveDomain('cleaning', self::GUID_CDEF);
+        if ($ffi === null) {
+            return null;
+        }
+        $input = '';
+        foreach ($guids as $guid) {
+            // Empty strings and non-strings have the same two classification flags.
+            $value = is_string($guid) ? $guid : '';
+            if (strlen($value) > 0xFFFFFFFF) {
+                return null;
+            }
+            $input .= pack('V', strlen($value)).$value;
+        }
+        $capacity = 0;
+        $buffer = RustPipelineLibrary::obtainScratch($ffi, count($guids), $capacity);
+        if ($buffer === null) {
+            return null;
+        }
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_guid_classify_batch($input, strlen($input), count($guids), $buffer, $capacity);
+        if ($written !== count($guids)) {
+            return null;
+        }
+        $flags = FFI::string($buffer, $written);
+        $result = [];
+        for ($i = 0; $i < $written; $i++) {
+            $flag = ord($flags[$i]);
+            $result[] = ['unsupported' => ($flag & 1) !== 0, 'hex' => ($flag & 2) !== 0];
+        }
+
+        return $result;
+    }
+
     /** Values that survive the narrowing to `CHAR(40) ascii`. */
     private const string SUPPORTED_PATTERN = '/^[\x20-\x7E]{1,40}$/D';
 
@@ -312,6 +398,10 @@ class ReleasesNormalizeGuids extends Command
 
     private function isUnsupportedGuid(mixed $guid): bool
     {
+        if (self::$useRustFfi && ($native = $this->isUnsupportedGuidNative($guid)) !== null) {
+            return $native;
+        }
+
         return ! is_string($guid) || preg_match(self::SUPPORTED_PATTERN, $guid) !== 1;
     }
 
