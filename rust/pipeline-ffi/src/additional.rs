@@ -19011,3 +19011,1016 @@ mod wave26_auth_traits_composite_key_models_tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 27 Slice 27.6: PasskeyLoginController, PasskeyManagementController,
+// EmailVerificationController, ForgotPasswordController, and
+// ResetPasswordController pure-CPU helpers
+// ---------------------------------------------------------------------------
+
+pub mod auth_passkey_password_controllers {
+    use super::{ADD23_MAX_SEG_LEN, add23_valid_out_buf, add23_valid_slice, add23_write_slices};
+
+    pub const PASSKEY_MISSING_OPTIONS_MSG: &[u8] = b"Your passkey sign-in session expired or was interrupted. Please try signing in with a passkey again.";
+    pub const PASSKEY_MISSING_OPTIONS_REASON: &[u8] = b"missing_auth_options";
+    pub const PASSKEY_LOGIN_FLASH_KEY: &[u8] = b"info";
+    pub const PASSKEY_LOGIN_FLASH_MSG: &[u8] = b"You have been logged in";
+
+    #[inline]
+    fn is_php_trim_ws(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\0' | 0x0B)
+    }
+
+    #[inline]
+    fn trim_php_bytes(s: &[u8]) -> &[u8] {
+        let mut start = 0usize;
+        let mut end = s.len();
+        while start < end && is_php_trim_ws(s[start]) {
+            start += 1;
+        }
+        while end > start && is_php_trim_ws(s[end - 1]) {
+            end -= 1;
+        }
+        &s[start..end]
+    }
+
+    #[inline]
+    pub fn sha1_hex_lower(input: &[u8]) -> [u8; 40] {
+        let mut h0: u32 = 0x6745_2301;
+        let mut h1: u32 = 0xEFCD_AB89;
+        let mut h2: u32 = 0x98BA_DCFE;
+        let mut h3: u32 = 0x1032_5476;
+        let mut h4: u32 = 0xC3D2_E1F0;
+
+        let process_block = |block: &[u8; 64],
+                             h0: &mut u32,
+                             h1: &mut u32,
+                             h2: &mut u32,
+                             h3: &mut u32,
+                             h4: &mut u32| {
+            let mut w = [0u32; 80];
+            for i in 0..16 {
+                let off = i * 4;
+                w[i] = u32::from_be_bytes([
+                    block[off],
+                    block[off + 1],
+                    block[off + 2],
+                    block[off + 3],
+                ]);
+            }
+            for i in 16..80 {
+                w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+            }
+
+            let mut a = *h0;
+            let mut b = *h1;
+            let mut c = *h2;
+            let mut d = *h3;
+            let mut e = *h4;
+
+            for (i, &wi) in w.iter().enumerate() {
+                let (f, k) = match i {
+                    0..=19 => ((b & c) | ((!b) & d), 0x5A82_7999u32),
+                    20..=39 => (b ^ c ^ d, 0x6ED9_EBA1u32),
+                    40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1B_BCDCu32),
+                    _ => (b ^ c ^ d, 0xCA62_C1D6u32),
+                };
+                let temp = a
+                    .rotate_left(5)
+                    .wrapping_add(f)
+                    .wrapping_add(e)
+                    .wrapping_add(k)
+                    .wrapping_add(wi);
+                e = d;
+                d = c;
+                c = b.rotate_left(30);
+                b = a;
+                a = temp;
+            }
+
+            *h0 = h0.wrapping_add(a);
+            *h1 = h1.wrapping_add(b);
+            *h2 = h2.wrapping_add(c);
+            *h3 = h3.wrapping_add(d);
+            *h4 = h4.wrapping_add(e);
+        };
+
+        let mut chunks = input.chunks_exact(64);
+        for chunk in &mut chunks {
+            let block: &[u8; 64] = chunk.try_into().unwrap();
+            process_block(block, &mut h0, &mut h1, &mut h2, &mut h3, &mut h4);
+        }
+
+        let rem = chunks.remainder();
+        let mut last = [0u8; 128];
+        last[..rem.len()].copy_from_slice(rem);
+        last[rem.len()] = 0x80;
+
+        let bit_len = (input.len() as u64).wrapping_mul(8);
+        let total_blocks = if rem.len() < 56 { 1usize } else { 2usize };
+        let len_offset = total_blocks * 64 - 8;
+        last[len_offset..len_offset + 8].copy_from_slice(&bit_len.to_be_bytes());
+
+        for b_idx in 0..total_blocks {
+            let off = b_idx * 64;
+            let block: &[u8; 64] = last[off..off + 64].try_into().unwrap();
+            process_block(block, &mut h0, &mut h1, &mut h2, &mut h3, &mut h4);
+        }
+
+        let mut digest = [0u8; 20];
+        digest[0..4].copy_from_slice(&h0.to_be_bytes());
+        digest[4..8].copy_from_slice(&h1.to_be_bytes());
+        digest[8..12].copy_from_slice(&h2.to_be_bytes());
+        digest[12..16].copy_from_slice(&h3.to_be_bytes());
+        digest[16..20].copy_from_slice(&h4.to_be_bytes());
+
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = [0u8; 40];
+        for (i, &byte) in digest.iter().enumerate() {
+            out[i * 2] = HEX[(byte >> 4) as usize];
+            out[i * 2 + 1] = HEX[(byte & 0x0F) as usize];
+        }
+        out
+    }
+
+    #[inline]
+    pub unsafe fn passkey_login_preflight_nul(
+        has_captcha_rules: u8,
+        has_captcha_val: u8,
+        captcha_ptr: *const u8,
+        captcha_len: usize,
+        has_options: u8,
+        options_len: usize,
+        out_flags: *mut i32,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if has_captcha_rules > 1
+            || has_captcha_val > 1
+            || has_options > 1
+            || options_len > ADD23_MAX_SEG_LEN
+            || out_flags.is_null()
+            || !out_flags.is_aligned()
+        {
+            return -1;
+        }
+        let Some(captcha_val) =
+            (unsafe { add23_valid_slice(captcha_ptr, captcha_len, ADD23_MAX_SEG_LEN) })
+        else {
+            return -1;
+        };
+
+        let should_validate_captcha = has_captcha_rules == 1
+            && has_captcha_val == 1
+            && !trim_php_bytes(captcha_val).is_empty();
+        let has_valid_options = has_options == 1 && options_len > 0;
+
+        let written = unsafe {
+            add23_write_slices(
+                out_buf,
+                out_cap,
+                &[
+                    PASSKEY_MISSING_OPTIONS_MSG,
+                    b"\0",
+                    PASSKEY_MISSING_OPTIONS_REASON,
+                ],
+                2,
+            )
+        };
+        if written < 0 {
+            return written;
+        }
+
+        let mut flags = 0i32;
+        if should_validate_captcha {
+            flags |= 1;
+        }
+        if has_valid_options {
+            flags |= 2;
+        }
+        unsafe {
+            *out_flags = flags;
+        }
+        written
+    }
+
+    #[inline]
+    pub unsafe fn passkey_login_resolve_redirect_nul(
+        store_user_ip: u8,
+        has_req_ip: u8,
+        req_ip_ptr: *const u8,
+        req_ip_len: usize,
+        has_client_ip: u8,
+        client_ip_ptr: *const u8,
+        client_ip_len: usize,
+        has_sess_redirect: u8,
+        sess_redirect_ptr: *const u8,
+        sess_redirect_len: usize,
+        has_cfg_redirect: u8,
+        cfg_redirect_ptr: *const u8,
+        cfg_redirect_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if store_user_ip > 1 || has_req_ip > 1 || has_client_ip > 1 || has_sess_redirect > 1 || has_cfg_redirect > 1 {
+            return -1;
+        }
+        let (Some(req_ip), Some(client_ip), Some(sess_redir), Some(cfg_redir)) = (
+            unsafe { add23_valid_slice(req_ip_ptr, req_ip_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(client_ip_ptr, client_ip_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(sess_redirect_ptr, sess_redirect_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(cfg_redirect_ptr, cfg_redirect_len, ADD23_MAX_SEG_LEN) },
+        ) else {
+            return -1;
+        };
+
+        let user_ip: &[u8] = if store_user_ip == 1 {
+            if has_req_ip == 1 {
+                req_ip
+            } else if has_client_ip == 1 {
+                client_ip
+            } else {
+                b""
+            }
+        } else {
+            b""
+        };
+
+        let redirect_url: &[u8] = if has_sess_redirect == 1 {
+            sess_redir
+        } else if has_cfg_redirect == 1 {
+            cfg_redir
+        } else {
+            b"/"
+        };
+
+        if user_ip.contains(&0) || redirect_url.contains(&0) {
+            return -2;
+        }
+
+        unsafe {
+            add23_write_slices(
+                out_buf,
+                out_cap,
+                &[
+                    user_ip,
+                    b"\0",
+                    redirect_url,
+                    b"\0",
+                    PASSKEY_LOGIN_FLASH_KEY,
+                    b"\0",
+                    PASSKEY_LOGIN_FLASH_MSG,
+                ],
+                3,
+            )
+        }
+    }
+
+    #[inline]
+    pub unsafe fn passkey_management_normalize_metadata_nul(
+        has_id: u8,
+        id: i64,
+        has_name: u8,
+        name_ptr: *const u8,
+        name_len: usize,
+        has_last_used: u8,
+        last_used_ptr: *const u8,
+        last_used_len: usize,
+        has_created: u8,
+        created_ptr: *const u8,
+        created_len: usize,
+        deleted_count: i64,
+        out_scalars: *mut i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if has_id > 1
+            || has_name > 1
+            || has_last_used > 1
+            || has_created > 1
+            || out_scalars.is_null()
+            || !out_scalars.is_aligned()
+            || (out_scalars as usize)
+                .checked_add(3 * std::mem::size_of::<i64>())
+                .is_none()
+        {
+            return -1;
+        }
+        let (Some(name), Some(last_used), Some(created)) = (
+            unsafe { add23_valid_slice(name_ptr, name_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(last_used_ptr, last_used_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(created_ptr, created_len, ADD23_MAX_SEG_LEN) },
+        ) else {
+            return -1;
+        };
+
+        let eff_name: &[u8] = if has_name == 1 { name } else { b"" };
+        let eff_last_used: &[u8] = if has_last_used == 1 { last_used } else { b"" };
+        let eff_created: &[u8] = if has_created == 1 { created } else { b"" };
+
+        if eff_name.contains(&0) || eff_last_used.contains(&0) || eff_created.contains(&0) {
+            return -2;
+        }
+
+        let destroy_ok = deleted_count > 0;
+        let (flash_key, flash_msg): (&[u8], &[u8]) = if destroy_ok {
+            (b"success", b"Passkey deleted.")
+        } else {
+            (b"error", b"Passkey not found.")
+        };
+
+        let written = unsafe {
+            add23_write_slices(
+                out_buf,
+                out_cap,
+                &[
+                    eff_name,
+                    b"\0",
+                    eff_last_used,
+                    b"\0",
+                    eff_created,
+                    b"\0",
+                    flash_key,
+                    b"\0",
+                    flash_msg,
+                ],
+                3,
+            )
+        };
+        if written < 0 {
+            return written;
+        }
+
+        let mut mask = 0i64;
+        if has_id == 1 {
+            mask |= 1;
+        }
+        if has_name == 1 {
+            mask |= 2;
+        }
+        if has_last_used == 1 {
+            mask |= 4;
+        }
+        if has_created == 1 {
+            mask |= 8;
+        }
+
+        unsafe {
+            *out_scalars.add(0) = mask;
+            *out_scalars.add(1) = if has_id == 1 { id } else { 0 };
+            *out_scalars.add(2) = i64::from(destroy_ok);
+        }
+        written
+    }
+
+    #[inline]
+    pub unsafe fn email_verification_verify_sha1(
+        hash_ptr: *const u8,
+        hash_len: usize,
+        email_ptr: *const u8,
+        email_len: usize,
+        out_matches: *mut i32,
+        out_hex40: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if out_matches.is_null()
+            || !out_matches.is_aligned()
+            || !add23_valid_out_buf(out_hex40, out_cap)
+        {
+            return -1;
+        }
+        let (Some(provided_hash), Some(email)) = (
+            unsafe { add23_valid_slice(hash_ptr, hash_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(email_ptr, email_len, ADD23_MAX_SEG_LEN) },
+        ) else {
+            return -1;
+        };
+
+        let digest_hex = sha1_hex_lower(email);
+        if out_cap < 40 {
+            return -40;
+        }
+
+        let matches = if provided_hash.len() == 40 {
+            let mut diff = 0u8;
+            for i in 0..40 {
+                diff |= provided_hash[i] ^ digest_hex[i];
+            }
+            i32::from(diff == 0)
+        } else {
+            0
+        };
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(digest_hex.as_ptr(), out_hex40, 40);
+            *out_matches = matches;
+        }
+        40
+    }
+
+    #[inline]
+    pub unsafe fn forgot_password_evaluate_nul(
+        email_ptr: *const u8,
+        email_len: usize,
+        captcha_enabled: u8,
+        captcha_failed: u8,
+        user_exists: u8,
+        user_trashed: u8,
+        out_flags: *mut i32,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if captcha_enabled > 1
+            || captcha_failed > 1
+            || user_exists > 1
+            || user_trashed > 1
+            || out_flags.is_null()
+            || !out_flags.is_aligned()
+        {
+            return -1;
+        }
+        let Some(email) = (unsafe { add23_valid_slice(email_ptr, email_len, ADD23_MAX_SEG_LEN) })
+        else {
+            return -1;
+        };
+
+        let (status, err_field, err_msg, success_msg, flags): (
+            &[u8],
+            &[u8],
+            &[u8],
+            &[u8],
+            i32,
+        ) = if email.is_empty() {
+            (
+                b"missing_email",
+                b"email",
+                b"Please enter your email address to send a password reset link.",
+                b"",
+                2,
+            )
+        } else if captcha_enabled == 1 && captcha_failed == 1 {
+            (
+                b"captcha_failed",
+                b"error",
+                b"Captcha validation failed.",
+                b"",
+                2,
+            )
+        } else if user_exists == 0 || user_trashed == 1 {
+            (
+                b"enumerated_noop",
+                b"",
+                b"",
+                b"Password reset email has been sent!",
+                4,
+            )
+        } else {
+            (
+                b"send_reset",
+                b"",
+                b"",
+                b"Password reset email has been sent!",
+                1 | 4,
+            )
+        };
+
+        let written = unsafe {
+            add23_write_slices(
+                out_buf,
+                out_cap,
+                &[
+                    status,
+                    b"\0forgottenpassword\0",
+                    err_field,
+                    b"\0",
+                    err_msg,
+                    b"\0",
+                    success_msg,
+                ],
+                2,
+            )
+        };
+        if written < 0 {
+            return written;
+        }
+        unsafe {
+            *out_flags = flags;
+        }
+        written
+    }
+
+    #[inline]
+    pub unsafe fn reset_password_evaluate_legacy_guid_nul(
+        has_guid_param: u8,
+        user_found: u8,
+        user_trashed: u8,
+        out_is_valid: *mut i32,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if has_guid_param > 1
+            || user_found > 1
+            || user_trashed > 1
+            || out_is_valid.is_null()
+            || !out_is_valid.is_aligned()
+        {
+            return -1;
+        }
+
+        let (is_valid, status, route, err_msg): (i32, &[u8], &[u8], &[u8]) =
+            if has_guid_param == 0 {
+                (
+                    0,
+                    b"missing_guid",
+                    b"password.request",
+                    b"No reset code provided.",
+                )
+            } else if user_found == 0 {
+                (
+                    0,
+                    b"bad_guid",
+                    b"password.request",
+                    b"Bad reset code provided.",
+                )
+            } else if user_trashed == 1 {
+                (
+                    0,
+                    b"deactivated",
+                    b"password.request",
+                    b"This account has been deactivated.",
+                )
+            } else {
+                (1, b"issue_token", b"password.reset", b"")
+            };
+
+        let written = unsafe {
+            add23_write_slices(
+                out_buf,
+                out_cap,
+                &[status, b"\0", route, b"\0", err_msg],
+                2,
+            )
+        };
+        if written < 0 {
+            return written;
+        }
+        unsafe {
+            *out_is_valid = is_valid;
+        }
+        written
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_passkey_login_preflight_nul(
+    has_captcha_rules: u8,
+    has_captcha_val: u8,
+    captcha_ptr: *const u8,
+    captcha_len: usize,
+    has_options: u8,
+    options_len: usize,
+    out_flags: *mut i32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        auth_passkey_password_controllers::passkey_login_preflight_nul(
+            has_captcha_rules,
+            has_captcha_val,
+            captcha_ptr,
+            captcha_len,
+            has_options,
+            options_len,
+            out_flags,
+            out_buf,
+            out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_passkey_login_resolve_redirect_nul(
+    store_user_ip: u8,
+    has_req_ip: u8,
+    req_ip_ptr: *const u8,
+    req_ip_len: usize,
+    has_client_ip: u8,
+    client_ip_ptr: *const u8,
+    client_ip_len: usize,
+    has_sess_redirect: u8,
+    sess_redirect_ptr: *const u8,
+    sess_redirect_len: usize,
+    has_cfg_redirect: u8,
+    cfg_redirect_ptr: *const u8,
+    cfg_redirect_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        auth_passkey_password_controllers::passkey_login_resolve_redirect_nul(
+            store_user_ip,
+            has_req_ip,
+            req_ip_ptr,
+            req_ip_len,
+            has_client_ip,
+            client_ip_ptr,
+            client_ip_len,
+            has_sess_redirect,
+            sess_redirect_ptr,
+            sess_redirect_len,
+            has_cfg_redirect,
+            cfg_redirect_ptr,
+            cfg_redirect_len,
+            out_buf,
+            out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_passkey_management_normalize_metadata_nul(
+    has_id: u8,
+    id: i64,
+    has_name: u8,
+    name_ptr: *const u8,
+    name_len: usize,
+    has_last_used: u8,
+    last_used_ptr: *const u8,
+    last_used_len: usize,
+    has_created: u8,
+    created_ptr: *const u8,
+    created_len: usize,
+    deleted_count: i64,
+    out_scalars: *mut i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        auth_passkey_password_controllers::passkey_management_normalize_metadata_nul(
+            has_id,
+            id,
+            has_name,
+            name_ptr,
+            name_len,
+            has_last_used,
+            last_used_ptr,
+            last_used_len,
+            has_created,
+            created_ptr,
+            created_len,
+            deleted_count,
+            out_scalars,
+            out_buf,
+            out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_email_verification_verify_sha1(
+    hash_ptr: *const u8,
+    hash_len: usize,
+    email_ptr: *const u8,
+    email_len: usize,
+    out_matches: *mut i32,
+    out_hex40: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        auth_passkey_password_controllers::email_verification_verify_sha1(
+            hash_ptr,
+            hash_len,
+            email_ptr,
+            email_len,
+            out_matches,
+            out_hex40,
+            out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_forgot_password_evaluate_nul(
+    email_ptr: *const u8,
+    email_len: usize,
+    captcha_enabled: u8,
+    captcha_failed: u8,
+    user_exists: u8,
+    user_trashed: u8,
+    out_flags: *mut i32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        auth_passkey_password_controllers::forgot_password_evaluate_nul(
+            email_ptr,
+            email_len,
+            captcha_enabled,
+            captcha_failed,
+            user_exists,
+            user_trashed,
+            out_flags,
+            out_buf,
+            out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_reset_password_evaluate_legacy_guid_nul(
+    has_guid_param: u8,
+    user_found: u8,
+    user_trashed: u8,
+    out_is_valid: *mut i32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        auth_passkey_password_controllers::reset_password_evaluate_legacy_guid_nul(
+            has_guid_param,
+            user_found,
+            user_trashed,
+            out_is_valid,
+            out_buf,
+            out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod wave27_auth_passkey_password_controllers_tests {
+    use super::*;
+
+    #[test]
+    fn passkey_login_and_management_helpers_match_php_contracts() {
+        let mut buf = [0u8; 256];
+        let mut flags = 0i32;
+        let written = unsafe {
+            nntmux_passkey_login_preflight_nul(
+                1,
+                1,
+                b"  tok-123  ".as_ptr(),
+                11,
+                1,
+                64,
+                &mut flags,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert!(written > 0);
+        assert_eq!(flags, 3);
+
+        let r_written = unsafe {
+            nntmux_passkey_login_resolve_redirect_nul(
+                1,
+                0,
+                b"".as_ptr(),
+                0,
+                1,
+                b"10.0.0.5".as_ptr(),
+                8,
+                1,
+                b"/profile".as_ptr(),
+                8,
+                1,
+                b"/".as_ptr(),
+                1,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert!(r_written > 0);
+        assert_eq!(
+            &buf[..r_written as usize],
+            b"10.0.0.5\0/profile\0info\0You have been logged in"
+        );
+
+        let mut scalars = [0i64; 3];
+        let m_written = unsafe {
+            nntmux_passkey_management_normalize_metadata_nul(
+                1,
+                77,
+                1,
+                b"MacBook TouchID".as_ptr(),
+                15,
+                0,
+                b"".as_ptr(),
+                0,
+                1,
+                b"2026-10-24T12:00:00+00:00".as_ptr(),
+                25,
+                1,
+                scalars.as_mut_ptr(),
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert!(m_written > 0);
+        assert_eq!(scalars, [1 | 2 | 8, 77, 1]);
+        assert_eq!(
+            &buf[..m_written as usize],
+            b"MacBook TouchID\0\02026-10-24T12:00:00+00:00\0success\0Passkey deleted."
+        );
+    }
+
+    #[test]
+    fn email_verification_sha1_and_password_controllers_match_php_contracts() {
+        assert_eq!(
+            &auth_passkey_password_controllers::sha1_hex_lower(b""),
+            b"da39a3ee5e6b4b0d3255bfef95601890afd80709"
+        );
+        assert_eq!(
+            &auth_passkey_password_controllers::sha1_hex_lower(b"abc"),
+            b"a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
+        assert_eq!(
+            &auth_passkey_password_controllers::sha1_hex_lower(
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+            ),
+            b"84983e441c3bd26ebaae4aa1f95129e5e54670f1"
+        );
+
+        let mut hex_out = [0u8; 40];
+        let mut matches = 0i32;
+        let s_len = unsafe {
+            nntmux_email_verification_verify_sha1(
+                b"a9993e364706816aba3e25717850c26c9cd0d89d".as_ptr(),
+                40,
+                b"abc".as_ptr(),
+                3,
+                &mut matches,
+                hex_out.as_mut_ptr(),
+                40,
+            )
+        };
+        assert_eq!(s_len, 40);
+        assert_eq!(matches, 1);
+
+        let mut buf = [0u8; 256];
+        let mut fp_flags = 0i32;
+        let fp_len = unsafe {
+            nntmux_forgot_password_evaluate_nul(
+                b"user@example.com".as_ptr(),
+                16,
+                1,
+                0,
+                1,
+                0,
+                &mut fp_flags,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert!(fp_len > 0);
+        assert_eq!(fp_flags, 5);
+        assert_eq!(
+            &buf[..fp_len as usize],
+            b"send_reset\0forgottenpassword\0\0\0Password reset email has been sent!"
+        );
+
+        let mut is_valid = 0i32;
+        let rp_len = unsafe {
+            nntmux_reset_password_evaluate_legacy_guid_nul(
+                1,
+                1,
+                1,
+                &mut is_valid,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert!(rp_len > 0);
+        assert_eq!(is_valid, 0);
+        assert_eq!(
+            &buf[..rp_len as usize],
+            b"deactivated\0password.request\0This account has been deactivated."
+        );
+    }
+
+    #[test]
+    fn wave27_slice6_entrypoints_reject_null_unaligned_and_undersized_buffers() {
+        let mut raw = [0xA5u8; 64];
+        let unaligned_i32 = unsafe { raw.as_mut_ptr().add(1).cast::<i32>() };
+        let unaligned_i64 = unsafe { raw.as_mut_ptr().add(1).cast::<i64>() };
+
+        assert_eq!(
+            unsafe {
+                nntmux_passkey_login_preflight_nul(
+                    1,
+                    1,
+                    b"tok".as_ptr(),
+                    3,
+                    1,
+                    10,
+                    unaligned_i32,
+                    raw.as_mut_ptr(),
+                    64,
+                )
+            },
+            -1
+        );
+
+        assert_eq!(
+            unsafe {
+                nntmux_passkey_login_resolve_redirect_nul(
+                    1,
+                    1,
+                    b"1.2\0.3.4".as_ptr(),
+                    8,
+                    0,
+                    b"".as_ptr(),
+                    0,
+                    0,
+                    b"".as_ptr(),
+                    0,
+                    1,
+                    b"/".as_ptr(),
+                    1,
+                    raw.as_mut_ptr(),
+                    64,
+                )
+            },
+            -2
+        );
+
+        assert_eq!(
+            unsafe {
+                nntmux_passkey_management_normalize_metadata_nul(
+                    1,
+                    1,
+                    1,
+                    b"Key".as_ptr(),
+                    3,
+                    0,
+                    b"".as_ptr(),
+                    0,
+                    0,
+                    b"".as_ptr(),
+                    0,
+                    1,
+                    unaligned_i64,
+                    raw.as_mut_ptr(),
+                    64,
+                )
+            },
+            -1
+        );
+
+        let mut small = [0x5Au8; 8];
+        let mut matches = 99i32;
+        assert_eq!(
+            unsafe {
+                nntmux_email_verification_verify_sha1(
+                    b"a9993e364706816aba3e25717850c26c9cd0d89d".as_ptr(),
+                    40,
+                    b"abc".as_ptr(),
+                    3,
+                    &mut matches,
+                    small.as_mut_ptr(),
+                    small.len(),
+                )
+            },
+            -40
+        );
+        assert_eq!(small, [0x5Au8; 8]);
+        assert_eq!(matches, 99);
+
+        assert_eq!(
+            unsafe {
+                nntmux_forgot_password_evaluate_nul(
+                    b"a@b.c".as_ptr(),
+                    5,
+                    0,
+                    0,
+                    1,
+                    0,
+                    unaligned_i32,
+                    raw.as_mut_ptr(),
+                    64,
+                )
+            },
+            -1
+        );
+
+        assert_eq!(
+            unsafe {
+                nntmux_reset_password_evaluate_legacy_guid_nul(
+                    1,
+                    1,
+                    0,
+                    unaligned_i32,
+                    raw.as_mut_ptr(),
+                    64,
+                )
+            },
+            -1
+        );
+    }
+}
