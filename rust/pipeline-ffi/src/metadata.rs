@@ -21491,7 +21491,971 @@ pub mod anidb_book_games_igdb_movie {
     }
 }
 
+/// Wave 20 Slice 20.5: TvProviderException, LookupMode, Video, MovieInfoObserver, and VideoObserver C-ABI helpers.
+///
+/// Every export wraps its body in `std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ...)).unwrap_or(-1)`,
+/// validates raw pointers for non-null and `.is_aligned()`, bounds all slice lengths with `<= isize::MAX as usize`
+/// before `std::slice::from_raw_parts*`, and returns `-1` on panic or decline so PHP callers fall back safely.
+pub mod tv_provider_lookup_video_observers {
+    use super::{OutCursor, PhpNode, PhpSerParser, PhpSerWriter, PhpVal};
+    use std::mem::size_of;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+    use std::str;
 
+    const DECLINE: isize = -1;
+    const MAX_INPUT: usize = 4 << 20;
 
+    #[inline]
+    unsafe fn input<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null() || len > MAX_INPUT || len > isize::MAX as usize {
+            return None;
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
 
+    #[inline]
+    fn valid_out_cap(out: *mut u8, cap: usize) -> bool {
+        (!out.is_null() || cap == 0) && cap <= isize::MAX as usize
+    }
+
+    #[inline]
+    fn finish_cursor(cursor: OutCursor<'_>) -> isize {
+        let res = cursor.finish();
+        if res == -1 { -2 } else { res }
+    }
+
+    #[inline]
+    fn is_php_trim_byte(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\0' | b'\x0B')
+    }
+
+    #[inline]
+    fn is_ascii_space_no_nul(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\x0B' | b'\x0C')
+    }
+
+    #[inline]
+    fn php_trim_bytes(bytes: &[u8]) -> &[u8] {
+        let mut start = 0;
+        let mut end = bytes.len();
+        while start < end && is_php_trim_byte(bytes[start]) {
+            start += 1;
+        }
+        while end > start && is_php_trim_byte(bytes[end - 1]) {
+            end -= 1;
+        }
+        &bytes[start..end]
+    }
+
+    #[inline]
+    fn parse_integer_header_bytes(bytes: &[u8]) -> Option<i64> {
+        if bytes.contains(&0) {
+            return None;
+        }
+        let mut start = 0;
+        let mut end = bytes.len();
+        while start < end && is_ascii_space_no_nul(bytes[start]) {
+            start += 1;
+        }
+        while end > start && is_ascii_space_no_nul(bytes[end - 1]) {
+            end -= 1;
+        }
+        let trimmed = &bytes[start..end];
+        if trimmed.is_empty() {
+            return None;
+        }
+        let (neg, digits) = match trimmed.first()? {
+            b'+' => (false, &trimmed[1..]),
+            b'-' => (true, &trimmed[1..]),
+            _ => (false, trimmed),
+        };
+        if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let mut val: i64 = 0;
+        if neg {
+            for &b in digits {
+                val = val.checked_mul(10)?.checked_sub(i64::from(b - b'0'))?;
+            }
+        } else {
+            for &b in digits {
+                val = val.checked_mul(10)?.checked_add(i64::from(b - b'0'))?;
+            }
+        }
+        Some(val)
+    }
+
+    #[inline]
+    fn parse_digits_i64(bytes: &[u8]) -> Option<i64> {
+        if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let mut val: i64 = 0;
+        for &b in bytes {
+            val = val.checked_mul(10)?.checked_add(i64::from(b - b'0'))?;
+        }
+        Some(val)
+    }
+
+    #[inline]
+    fn is_leap_year(year: i64) -> bool {
+        (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+    }
+
+    #[inline]
+    fn days_in_month(year: i64, month: i64) -> i64 {
+        match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if is_leap_year(year) => 29,
+            2 => 28,
+            _ => 0,
+        }
+    }
+
+    #[inline]
+    fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+        let y = y - i64::from(m <= 2);
+        let era = if y >= 0 { y } else { y - 399 } / 400;
+        let yoe = y - era * 400;
+        let mp = m + if m > 2 { -3 } else { 9 };
+        let doy = (153 * mp + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146_097 + doe - 719_468
+    }
+
+    /// Parses a weekday-consistent IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`) into Unix epoch seconds.
+    /// Declines other date layouts so PHP `strtotime()` handles them identically.
+    fn parse_imf_fixdate(s: &[u8]) -> Option<i64> {
+        const DAYS: [&[u8; 3]; 7] = [b"Sun", b"Mon", b"Tue", b"Wed", b"Thu", b"Fri", b"Sat"];
+        const MONTHS: [&[u8; 3]; 12] = [
+            b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov",
+            b"Dec",
+        ];
+        if s.len() != 29
+            || &s[3..5] != b", "
+            || s[7] != b' '
+            || s[11] != b' '
+            || s[16] != b' '
+            || s[19] != b':'
+            || s[22] != b':'
+            || (&s[25..] != b" GMT" && &s[25..] != b" UTC")
+        {
+            return None;
+        }
+        let weekday = DAYS.iter().position(|d| &s[0..3] == *d)? as i64;
+        let month = MONTHS.iter().position(|m| &s[8..11] == *m)? as i64 + 1;
+        let day = parse_digits_i64(&s[5..7])?;
+        let year = parse_digits_i64(&s[12..16])?;
+        let h = parse_digits_i64(&s[17..19])?;
+        let mi = parse_digits_i64(&s[20..22])?;
+        let sec = parse_digits_i64(&s[23..25])?;
+        if !(1970..=9999).contains(&year)
+            || day < 1
+            || day > days_in_month(year, month)
+            || h > 23
+            || mi > 59
+            || sec > 59
+        {
+            return None;
+        }
+        let days = days_from_civil(year, month, day);
+        if (days + 4).rem_euclid(7) != weekday {
+            return None;
+        }
+        Some(days * 86_400 + h * 3600 + mi * 60 + sec)
+    }
+
+    #[inline]
+    fn write_i64_dec(cursor: &mut OutCursor<'_>, v: i64) {
+        if v < 0 {
+            cursor.push(b'-');
+        }
+        let mut n = v.unsigned_abs();
+        let mut tmp = [0u8; 20];
+        let mut i = tmp.len();
+        loop {
+            i -= 1;
+            tmp[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        cursor.extend(&tmp[i..]);
+    }
+
+    #[inline]
+    fn canonical_php_int_key(key: &[u8]) -> Option<i64> {
+        if key == b"0" {
+            return Some(0);
+        }
+        let digits = if key.first() == Some(&b'-') {
+            &key[1..]
+        } else {
+            key
+        };
+        if !matches!(digits.first(), Some(b'1'..=b'9')) || !digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        str::from_utf8(key).ok()?.parse::<i64>().ok()
+    }
+
+    #[inline]
+    fn lookup_php_key<'a>(node: &'a PhpNode<'a>, key: &[u8]) -> Option<&'a PhpNode<'a>> {
+        node.get(key).or_else(|| {
+            let int_key = canonical_php_int_key(key)?;
+            node.get_int_key(int_key)
+        })
+    }
+
+    #[inline]
+    fn write_coalesced_str(w: &mut PhpSerWriter, doc: &PhpNode<'_>, key: &[u8]) {
+        w.key(key);
+        match lookup_php_key(doc, key) {
+            Some(n) if !matches!(n.val, PhpVal::Null) => w.raw(n.raw),
+            _ => w.str(b""),
+        }
+    }
+
+    #[inline]
+    fn write_coalesced_zero(w: &mut PhpSerWriter, doc: &PhpNode<'_>, key: &[u8]) {
+        w.key(key);
+        match lookup_php_key(doc, key) {
+            Some(n) if !matches!(n.val, PhpVal::Null) => w.raw(n.raw),
+            _ => w.int(0),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 1. TvProviderException helpers
+    // -------------------------------------------------------------------------
+
+    /// Evaluates `TvProviderException::isTransientStatus(int $status): bool` (`$status === 429 || $status >= 500`).
+    /// Returns `1` when transient, `0` when non-transient, or `-1` on panic.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tv_provider_is_transient_status(status: i64) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if status == 429 || status >= 500 {
+                1
+            } else {
+                0
+            }
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Evaluates `TvProviderException::parseRetryAfter(?string $header): ?int`.
+    /// Returns:
+    /// - `0` when the result is `null` (setting `*out_seconds = 0`)
+    /// - `1` when resolved into `*out_seconds` (`>= 0`)
+    /// - `-1` (`DECLINE`) when declined to PHP (`strtotime` / non-integer numeric fallback) or invalid pointer.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tv_provider_parse_retry_after(
+        has_header: u32,
+        header_ptr: *const u8,
+        header_len: usize,
+        now_epoch: i64,
+        out_seconds: *mut i64,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out_seconds.is_null() || !out_seconds.is_aligned() {
+                return DECLINE;
+            }
+            let Some(header) = (unsafe { input(header_ptr, header_len) }) else {
+                return DECLINE;
+            };
+            if has_header == 0 {
+                unsafe {
+                    *out_seconds = 0;
+                }
+                return 0;
+            }
+            let trimmed = php_trim_bytes(header);
+            if trimmed.is_empty() {
+                unsafe {
+                    *out_seconds = 0;
+                }
+                return 0;
+            }
+            if header.contains(&0) {
+                return DECLINE;
+            }
+            if let Some(val) = parse_integer_header_bytes(header) {
+                unsafe {
+                    *out_seconds = val.max(0);
+                }
+                return 1;
+            }
+            if let Some(ts) = parse_imf_fixdate(trimmed) {
+                let Some(diff) = ts.checked_sub(now_epoch) else {
+                    return DECLINE;
+                };
+                unsafe {
+                    *out_seconds = diff.max(0);
+                }
+                return 1;
+            }
+            DECLINE
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    // -------------------------------------------------------------------------
+    // 2. LookupMode helpers
+    // -------------------------------------------------------------------------
+
+    /// Resolves `LookupMode::label()` for backing value `mode` (`0` = `'Disabled'`,
+    /// `1` = `'All releases'`, `2` = `'Renamed releases only'`).
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_lookup_mode_label(
+        mode: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_cap(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let label: &[u8] = match mode {
+                0 => b"Disabled",
+                1 => b"All releases",
+                2 => b"Renamed releases only",
+                _ => return DECLINE,
+            };
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.extend(label);
+            finish_cursor(cursor)
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    // -------------------------------------------------------------------------
+    // 3. Video helpers
+    // -------------------------------------------------------------------------
+
+    /// Computes `'video_series_list:' . md5(serialize([(string) $uid, $letter, $showname]))` (50 bytes).
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_video_series_list_cache_key(
+        uid_ptr: *const u8,
+        uid_len: usize,
+        letter_ptr: *const u8,
+        letter_len: usize,
+        showname_ptr: *const u8,
+        showname_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_cap(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let (Some(uid), Some(letter), Some(showname)) = (
+                unsafe { input(uid_ptr, uid_len) },
+                unsafe { input(letter_ptr, letter_len) },
+                unsafe { input(showname_ptr, showname_len) },
+            ) else {
+                return DECLINE;
+            };
+
+            let mut w = PhpSerWriter::new();
+            w.arr_open(3);
+            w.idx(0);
+            w.str(uid);
+            w.idx(1);
+            w.str(letter);
+            w.idx(2);
+            w.str(showname);
+            w.arr_close();
+
+            let digest = crate::md5_hex_slice(&w.buf);
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.extend(b"video_series_list:");
+            cursor.extend(&digest);
+            finish_cursor(cursor)
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Formats the `letterCondition` SQL fragment and optional `:letter` binding for `Video::getSeriesListUncached()`.
+    /// Writes `sql` (`*out_sql_len` bytes) followed by `binding` (remaining bytes when `*out_has_binding == 1`) into `out_buf`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_video_series_letter_filter(
+        letter_ptr: *const u8,
+        letter_len: usize,
+        out_sql_len: *mut usize,
+        out_has_binding: *mut u32,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out_sql_len.is_null()
+                || !out_sql_len.is_aligned()
+                || out_has_binding.is_null()
+                || !out_has_binding.is_aligned()
+                || !valid_out_cap(out_buf, out_cap)
+            {
+                return DECLINE;
+            }
+            let Some(letter) = (unsafe { input(letter_ptr, letter_len) }) else {
+                return DECLINE;
+            };
+            if letter.is_empty() {
+                unsafe {
+                    *out_sql_len = 0;
+                    *out_has_binding = 0;
+                }
+                return 0;
+            }
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            if letter == b"0-9" || letter == b"[0-9]" {
+                let sql = b"AND videos.title REGEXP '^[0-9]'";
+                cursor.extend(sql);
+                let written = finish_cursor(cursor);
+                if written >= 0 {
+                    unsafe {
+                        *out_sql_len = sql.len();
+                        *out_has_binding = 0;
+                    }
+                }
+                return written;
+            }
+
+            let sql = b"AND videos.title LIKE :letter";
+            cursor.extend(sql);
+            cursor.extend(letter);
+            cursor.push(b'%');
+            let written = finish_cursor(cursor);
+            if written >= 0 {
+                unsafe {
+                    *out_sql_len = sql.len();
+                    *out_has_binding = 1;
+                }
+            }
+            written
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Formats the `shownameCondition` SQL fragment and optional `:showname` binding for `Video::getSeriesListUncached()`.
+    /// When `search_available != 0` and all IDs in `ids_ptr[..ids_len]` are zero (or `ids_len == 0`),
+    /// sets `*out_empty_hits = 1` and returns `0` so the caller returns `[]` immediately.
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_video_series_showname_filter(
+        showname_ptr: *const u8,
+        showname_len: usize,
+        search_available: u32,
+        ids_ptr: *const i64,
+        ids_len: usize,
+        out_sql_len: *mut usize,
+        out_has_binding: *mut u32,
+        out_empty_hits: *mut u32,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out_sql_len.is_null()
+                || !out_sql_len.is_aligned()
+                || out_has_binding.is_null()
+                || !out_has_binding.is_aligned()
+                || out_empty_hits.is_null()
+                || !out_empty_hits.is_aligned()
+                || (!ids_ptr.is_null() && !ids_ptr.is_aligned())
+                || !valid_out_cap(out_buf, out_cap)
+            {
+                return DECLINE;
+            }
+            let Some(showname) = (unsafe { input(showname_ptr, showname_len) }) else {
+                return DECLINE;
+            };
+            let max_ids = (isize::MAX as usize) / size_of::<i64>();
+            let ids: &[i64] = if ids_len == 0 {
+                &[]
+            } else {
+                if ids_ptr.is_null()
+                    || ids_len > MAX_INPUT
+                    || ids_len > max_ids
+                    || ids_len > isize::MAX as usize
+                {
+                    return DECLINE;
+                }
+                unsafe { slice::from_raw_parts(ids_ptr, ids_len) }
+            };
+
+            if showname.is_empty() {
+                unsafe {
+                    *out_sql_len = 0;
+                    *out_has_binding = 0;
+                    *out_empty_hits = 0;
+                }
+                return 0;
+            }
+
+            if search_available == 0 {
+                let sql = b"AND videos.title LIKE :showname";
+                let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+                cursor.extend(sql);
+                cursor.push(b'%');
+                cursor.extend(showname);
+                cursor.push(b'%');
+                let written = finish_cursor(cursor);
+                if written >= 0 {
+                    unsafe {
+                        *out_sql_len = sql.len();
+                        *out_has_binding = 1;
+                        *out_empty_hits = 0;
+                    }
+                }
+                return written;
+            }
+
+            if !ids.iter().any(|&id| id != 0) {
+                unsafe {
+                    *out_sql_len = 0;
+                    *out_has_binding = 0;
+                    *out_empty_hits = 1;
+                }
+                return 0;
+            }
+
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.extend(b"AND videos.id IN (");
+            let mut first = true;
+            for &id in ids {
+                if id == 0 {
+                    continue;
+                }
+                if !first {
+                    cursor.push(b',');
+                }
+                first = false;
+                write_i64_dec(&mut cursor, id);
+            }
+            cursor.push(b')');
+            let sql_len = cursor.pos;
+            let written = finish_cursor(cursor);
+            if written >= 0 {
+                unsafe {
+                    *out_sql_len = sql_len;
+                    *out_has_binding = 0;
+                    *out_empty_hits = 0;
+                }
+            }
+            written
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    // -------------------------------------------------------------------------
+    // 4. MovieInfoObserver helpers
+    // -------------------------------------------------------------------------
+
+    /// Normalizes a PHP-serialized `MovieInfo` attribute map into the 11-key search document
+    /// passed to `Search::insertMovie()` by `MovieInfoObserver::syncToSearchIndex()`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_movie_info_observer_search_doc(
+        ser_ptr: *const u8,
+        ser_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_cap(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(ser_bytes) = (unsafe { input(ser_ptr, ser_len) }) else {
+                return DECLINE;
+            };
+            let Some(doc) = PhpSerParser::parse_document(ser_bytes) else {
+                return DECLINE;
+            };
+            if !doc.is_arr() || doc.has_float {
+                return DECLINE;
+            }
+
+            let mut w = PhpSerWriter::new();
+            w.arr_open(11);
+            w.key(b"id");
+            match lookup_php_key(&doc, b"id") {
+                Some(n) => w.raw(n.raw),
+                None => w.null(),
+            }
+            write_coalesced_str(&mut w, &doc, b"imdbid");
+            write_coalesced_zero(&mut w, &doc, b"tmdbid");
+            write_coalesced_zero(&mut w, &doc, b"traktid");
+            write_coalesced_str(&mut w, &doc, b"title");
+            write_coalesced_str(&mut w, &doc, b"year");
+            write_coalesced_str(&mut w, &doc, b"genre");
+            write_coalesced_str(&mut w, &doc, b"actors");
+            write_coalesced_str(&mut w, &doc, b"director");
+            write_coalesced_str(&mut w, &doc, b"rating");
+            write_coalesced_str(&mut w, &doc, b"plot");
+            w.arr_close();
+
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.extend(&w.buf);
+            finish_cursor(cursor)
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    // -------------------------------------------------------------------------
+    // 5. VideoObserver helpers
+    // -------------------------------------------------------------------------
+
+    /// Normalizes a PHP-serialized `Video` attribute map into the 10-key search document
+    /// passed to `Search::insertTvShow()` by `VideoObserver::syncToSearchIndex()`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_video_observer_search_doc(
+        ser_ptr: *const u8,
+        ser_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_cap(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(ser_bytes) = (unsafe { input(ser_ptr, ser_len) }) else {
+                return DECLINE;
+            };
+            let Some(doc) = PhpSerParser::parse_document(ser_bytes) else {
+                return DECLINE;
+            };
+            if !doc.is_arr() || doc.has_float {
+                return DECLINE;
+            }
+
+            let mut w = PhpSerWriter::new();
+            w.arr_open(10);
+            w.key(b"id");
+            match lookup_php_key(&doc, b"id") {
+                Some(n) => w.raw(n.raw),
+                None => w.null(),
+            }
+            write_coalesced_str(&mut w, &doc, b"title");
+            write_coalesced_zero(&mut w, &doc, b"tvdb");
+            write_coalesced_zero(&mut w, &doc, b"trakt");
+            write_coalesced_zero(&mut w, &doc, b"tvmaze");
+            write_coalesced_zero(&mut w, &doc, b"tvrage");
+            write_coalesced_zero(&mut w, &doc, b"imdb");
+            write_coalesced_zero(&mut w, &doc, b"tmdb");
+            write_coalesced_str(&mut w, &doc, b"started");
+            write_coalesced_zero(&mut w, &doc, b"type");
+            w.arr_close();
+
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.extend(&w.buf);
+            finish_cursor(cursor)
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn tv_provider_exception_and_lookup_mode() {
+            assert_eq!(unsafe { nntmux_tv_provider_is_transient_status(429) }, 1);
+            assert_eq!(unsafe { nntmux_tv_provider_is_transient_status(500) }, 1);
+            assert_eq!(unsafe { nntmux_tv_provider_is_transient_status(503) }, 1);
+            assert_eq!(unsafe { nntmux_tv_provider_is_transient_status(404) }, 0);
+            assert_eq!(unsafe { nntmux_tv_provider_is_transient_status(200) }, 0);
+
+            let mut secs = -1i64;
+            assert_eq!(
+                unsafe {
+                    nntmux_tv_provider_parse_retry_after(0, std::ptr::null(), 0, 1000, &mut secs)
+                },
+                0
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_tv_provider_parse_retry_after(1, b"   ".as_ptr(), 3, 1000, &mut secs)
+                },
+                0
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_tv_provider_parse_retry_after(1, b" 45 ".as_ptr(), 4, 1000, &mut secs)
+                },
+                1
+            );
+            assert_eq!(secs, 45);
+            assert_eq!(
+                unsafe {
+                    nntmux_tv_provider_parse_retry_after(1, b"-12".as_ptr(), 3, 1000, &mut secs)
+                },
+                1
+            );
+            assert_eq!(secs, 0);
+
+            // Sun, 06 Nov 1994 08:49:37 GMT == 784_111_777
+            let http_date = b"Sun, 06 Nov 1994 08:49:37 GMT";
+            assert_eq!(
+                unsafe {
+                    nntmux_tv_provider_parse_retry_after(
+                        1,
+                        http_date.as_ptr(),
+                        http_date.len(),
+                        784_111_700,
+                        &mut secs,
+                    )
+                },
+                1
+            );
+            assert_eq!(secs, 77);
+
+            // LookupMode labels
+            let mut buf = [0u8; 64];
+            let l0 = unsafe { nntmux_lookup_mode_label(0, buf.as_mut_ptr(), buf.len()) };
+            assert_eq!(&buf[..l0 as usize], b"Disabled");
+            let l1 = unsafe { nntmux_lookup_mode_label(1, buf.as_mut_ptr(), buf.len()) };
+            assert_eq!(&buf[..l1 as usize], b"All releases");
+            let l2 = unsafe { nntmux_lookup_mode_label(2, buf.as_mut_ptr(), buf.len()) };
+            assert_eq!(&buf[..l2 as usize], b"Renamed releases only");
+            assert_eq!(
+                unsafe { nntmux_lookup_mode_label(99, buf.as_mut_ptr(), buf.len()) },
+                DECLINE
+            );
+        }
+
+        #[test]
+        fn video_series_helpers_and_observer_search_docs() {
+            let mut buf = [0u8; 512];
+            let ck = unsafe {
+                nntmux_video_series_list_cache_key(
+                    b"42".as_ptr(),
+                    2,
+                    b"A".as_ptr(),
+                    1,
+                    b"Severance".as_ptr(),
+                    9,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(ck, 50);
+            assert!(buf[..50].starts_with(b"video_series_list:"));
+
+            let mut sql_len = 0usize;
+            let mut has_binding = 0u32;
+            let mut empty_hits = 0u32;
+
+            let lf0 = unsafe {
+                nntmux_video_series_letter_filter(
+                    b"0-9".as_ptr(),
+                    3,
+                    &mut sql_len,
+                    &mut has_binding,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(
+                (&buf[..lf0 as usize], sql_len, has_binding),
+                (&b"AND videos.title REGEXP '^[0-9]'"[..], 32, 0)
+            );
+
+            let lf1 = unsafe {
+                nntmux_video_series_letter_filter(
+                    b"S".as_ptr(),
+                    1,
+                    &mut sql_len,
+                    &mut has_binding,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(&buf[..sql_len], b"AND videos.title LIKE :letter");
+            assert_eq!(&buf[sql_len..lf1 as usize], b"S%");
+            assert_eq!(has_binding, 1);
+
+            let ids = [10i64, 0, 25];
+            let sf = unsafe {
+                nntmux_video_series_showname_filter(
+                    b"Severance".as_ptr(),
+                    9,
+                    1,
+                    ids.as_ptr(),
+                    ids.len(),
+                    &mut sql_len,
+                    &mut has_binding,
+                    &mut empty_hits,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(&buf[..sf as usize], b"AND videos.id IN (10,25)");
+            assert_eq!((sql_len, has_binding, empty_hits), (24, 0, 0));
+
+            let zero_ids = [0i64, 0];
+            let sf_empty = unsafe {
+                nntmux_video_series_showname_filter(
+                    b"Missing".as_ptr(),
+                    7,
+                    1,
+                    zero_ids.as_ptr(),
+                    zero_ids.len(),
+                    &mut sql_len,
+                    &mut has_binding,
+                    &mut empty_hits,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!((sf_empty, empty_hits), (0, 1));
+
+            let mv_ser = br#"a:3:{s:2:"id";i:7;s:6:"imdbid";s:7:"0133093";s:5:"title";s:10:"The Matrix";}"#;
+            let mv_n = unsafe {
+                nntmux_movie_info_observer_search_doc(
+                    mv_ser.as_ptr(),
+                    mv_ser.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(mv_n > 0);
+
+            let vd_ser = br#"a:3:{s:2:"id";i:9;s:5:"title";s:9:"Severance";s:4:"tvdb";i:371980;}"#;
+            let vd_n = unsafe {
+                nntmux_video_observer_search_doc(
+                    vd_ser.as_ptr(),
+                    vd_ser.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(vd_n > 0);
+        }
+
+        #[test]
+        fn unaligned_and_null_pointers_rejected() {
+            let mut raw = [0u64; 8];
+            let mut buf = [0u8; 128];
+            let unaligned_usize =
+                unsafe { (raw.as_mut_ptr() as *mut u8).add(1) as *mut usize };
+            let unaligned_u32 = unsafe { (raw.as_mut_ptr() as *mut u8).add(1) as *mut u32 };
+            let unaligned_i64 = unsafe { (raw.as_mut_ptr() as *mut u8).add(1) as *mut i64 };
+            let unaligned_const_i64 =
+                unsafe { (raw.as_ptr() as *const u8).add(1) as *const i64 };
+            let mut aligned_usize = 0usize;
+            let mut aligned_u32 = 0u32;
+
+            assert_eq!(
+                unsafe {
+                    nntmux_tv_provider_parse_retry_after(
+                        1,
+                        b"30".as_ptr(),
+                        2,
+                        1000,
+                        unaligned_i64,
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_video_series_letter_filter(
+                        b"A".as_ptr(),
+                        1,
+                        unaligned_usize,
+                        &mut aligned_u32,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_video_series_letter_filter(
+                        b"A".as_ptr(),
+                        1,
+                        &mut aligned_usize,
+                        unaligned_u32,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_video_series_showname_filter(
+                        b"Show".as_ptr(),
+                        4,
+                        1,
+                        unaligned_const_i64,
+                        1,
+                        &mut aligned_usize,
+                        &mut aligned_u32,
+                        &mut aligned_u32,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_video_series_showname_filter(
+                        b"Show".as_ptr(),
+                        4,
+                        0,
+                        std::ptr::null(),
+                        0,
+                        unaligned_usize,
+                        &mut aligned_u32,
+                        &mut aligned_u32,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_video_series_showname_filter(
+                        b"Show".as_ptr(),
+                        4,
+                        0,
+                        std::ptr::null(),
+                        0,
+                        &mut aligned_usize,
+                        unaligned_u32,
+                        &mut aligned_u32,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_video_series_showname_filter(
+                        b"Show".as_ptr(),
+                        4,
+                        0,
+                        std::ptr::null(),
+                        0,
+                        &mut aligned_usize,
+                        &mut aligned_u32,
+                        unaligned_u32,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                DECLINE
+            );
+        }
+    }
+}
 
