@@ -6,11 +6,21 @@ namespace App\Services\AdditionalProcessing;
 
 use App\Services\Configuration\ConfigurationProvider;
 use App\Services\Runners\PostProcessRunner;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use Throwable;
 
 final class AdditionalProcessingDiagnostics
 {
+    private static bool $useRustFfi = false;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
     private const int OVERSIZED_IN_FLIGHT_THRESHOLD = 500;
 
     private const int OVERSIZED_THREAD_THRESHOLD = 32;
@@ -44,10 +54,8 @@ final class AdditionalProcessingDiagnostics
         $backlog = $this->backlog($warnings);
         $indexes = $this->indexes($warnings);
         $tempPath = $this->tempPath($warnings);
-        $maximumClaimLifetime = min(
-            max(1, $childTimeout),
-            max(1, $releaseTimeout) * $batchSize,
-        );
+        $capacity = self::claimIndexMatches([], $childTimeout, $releaseTimeout, $batchSize, $threads);
+        $maximumClaimLifetime = $capacity['maximumClaimLifetime'];
 
         if ($backlog['stale_claims'] > 0) {
             $warnings[] = $this->warning(
@@ -64,7 +72,7 @@ final class AdditionalProcessingDiagnostics
             );
         }
 
-        $maxInFlight = $threads * $batchSize;
+        $maxInFlight = $capacity['maxInFlight'];
         if ($threads > self::OVERSIZED_THREAD_THRESHOLD || $maxInFlight > self::OVERSIZED_IN_FLIGHT_THRESHOLD) {
             $warnings[] = $this->warning(
                 'oversized-capacity',
@@ -170,7 +178,7 @@ final class AdditionalProcessingDiagnostics
                 if ($name !== '') {
                     $present[] = $name;
                 }
-                if ($columns === self::REQUIRED_CLAIM_INDEX_COLUMNS) {
+                if (self::claimIndexMatches($columns)['matches']) {
                     $claimQueueIndex = $name;
                 }
             }
@@ -241,5 +249,73 @@ final class AdditionalProcessingDiagnostics
     private function warning(string $code, string $message): array
     {
         return ['code' => $code, 'message' => $message];
+    }
+
+    /**
+     * @param  list<string>  $columns  Already normalized by the schema inspector.
+     * @return array{matches: bool, maximumClaimLifetime: int, maxInFlight: int}
+     */
+    public static function claimIndexMatches(array $columns, int $childTimeout = 1, int $releaseTimeout = 1, int $batchSize = 1, int $threads = 1): array
+    {
+        return self::$useRustFfi ? (self::claimIndexMatchesNative($columns, $childTimeout, $releaseTimeout, $batchSize, $threads) ?? self::claimIndexMatchesPhp($columns, $childTimeout, $releaseTimeout, $batchSize, $threads)) : self::claimIndexMatchesPhp($columns, $childTimeout, $releaseTimeout, $batchSize, $threads);
+    }
+
+    /**
+     * @param  list<string>  $columns
+     * @return array{matches: bool, maximumClaimLifetime: int, maxInFlight: int}
+     */
+    public static function claimIndexMatchesPhp(array $columns, int $childTimeout = 1, int $releaseTimeout = 1, int $batchSize = 1, int $threads = 1): array
+    {
+        return [
+            'matches' => $columns === self::REQUIRED_CLAIM_INDEX_COLUMNS,
+            'maximumClaimLifetime' => min(max(1, $childTimeout), max(1, $releaseTimeout) * max(1, $batchSize)),
+            'maxInFlight' => max(1, $threads) * max(1, $batchSize),
+        ];
+    }
+
+    /**
+     * @param  list<string>  $columns
+     * @return array{matches: bool, maximumClaimLifetime: int, maxInFlight: int}|null
+     */
+    public static function claimIndexMatchesNative(array $columns, int $childTimeout = 1, int $releaseTimeout = 1, int $batchSize = 1, int $threads = 1): ?array
+    {
+        $value = self::nativeJson(compact('columns', 'childTimeout', 'releaseTimeout', 'batchSize', 'threads'));
+
+        return is_array($value) ? $value : null;
+    }
+
+    /** @param array<mixed> $input */
+    private static function nativeJson(array $input): mixed
+    {
+        try {
+            $ffi = RustPipelineLibrary::resolveDomain('additional',
+                'ssize_t nntmux_additional_claim_index_matches_json(const char *input, size_t len, char *out, size_t cap);');
+            if ($ffi === null) {
+                return null;
+            }
+            $json = json_encode($input, JSON_THROW_ON_ERROR | JSON_PRESERVE_ZERO_FRACTION);
+            $cap = 0;
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, max(256, strlen($json)), $cap);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound (domain C ABI)
+            $written = $ffi->nntmux_additional_claim_index_matches_json($json, strlen($json), $scratch, $cap);
+            if ($written < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound (domain C ABI)
+                $written = $ffi->nntmux_additional_claim_index_matches_json($json, strlen($json), $scratch, $cap);
+            }
+            if ($written < 0 || $written > $cap) {
+                return null;
+            }
+
+            return json_decode(FFI::string($scratch, $written), true, flags: JSON_THROW_ON_ERROR);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }

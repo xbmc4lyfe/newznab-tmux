@@ -7,12 +7,15 @@ namespace App\Services\AdditionalProcessing;
 use App\Models\Release;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Services\Runners\PostProcessRunner;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection as EloquentCollection;
 use Illuminate\Database\Query\Builder as QueryBuilder;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use Throwable;
 
 /**
  * Single source of truth for "needs additional postprocessing" release selection.
@@ -30,6 +33,13 @@ use Illuminate\Support\Facades\Schema;
  */
 final class AdditionalCandidateQuery
 {
+    private static bool $useRustFfi = false;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
     /** Default size lower bound when the setting is empty/unset (bytes, 1 MB). */
     public const int DEFAULT_MIN_SIZE_BYTES = 1048576;
 
@@ -559,9 +569,25 @@ final class AdditionalCandidateQuery
     /**
      * @param  list<int>  $ids
      */
-    private static function idOrderExpression(array $ids): string
+    public static function idOrderExpression(array $ids, ?string $driver = null): string
     {
-        if (DB::getDriverName() !== 'sqlite') {
+        $driver ??= DB::getDriverName();
+
+        return self::$useRustFfi ? (self::idOrderExpressionNative($ids, $driver) ?? self::idOrderExpressionPhp($ids, $driver)) : self::idOrderExpressionPhp($ids, $driver);
+    }
+
+    /** @param list<int> $ids */
+    public static function idOrderExpressionNative(array $ids, string $driver): ?string
+    {
+        $value = self::nativeJson(['ids' => $ids, 'driver' => $driver]);
+
+        return is_string($value) ? $value : null;
+    }
+
+    /** @param list<int> $ids */
+    public static function idOrderExpressionPhp(array $ids, string $driver): string
+    {
+        if ($driver !== 'sqlite') {
             return 'FIELD(id, '.implode(',', $ids).')';
         }
 
@@ -571,5 +597,40 @@ final class AdditionalCandidateQuery
         }
 
         return 'CASE id '.implode(' ', $cases).' ELSE '.count($ids).' END';
+    }
+
+    /** @param array<mixed> $input */
+    private static function nativeJson(array $input): mixed
+    {
+        try {
+            $ffi = RustPipelineLibrary::resolveDomain('additional',
+                'ssize_t nntmux_additional_id_order_expression_json(const char *input, size_t len, char *out, size_t cap);');
+            if ($ffi === null) {
+                return null;
+            }
+            $json = json_encode($input, JSON_THROW_ON_ERROR | JSON_PRESERVE_ZERO_FRACTION);
+            $cap = 0;
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, max(256, strlen($json)), $cap);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound (domain C ABI)
+            $written = $ffi->nntmux_additional_id_order_expression_json($json, strlen($json), $scratch, $cap);
+            if ($written < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound (domain C ABI)
+                $written = $ffi->nntmux_additional_id_order_expression_json($json, strlen($json), $scratch, $cap);
+            }
+            if ($written < 0 || $written > $cap) {
+                return null;
+            }
+
+            return json_decode(FFI::string($scratch, $written), true, flags: JSON_THROW_ON_ERROR);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }
