@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Verification;
 
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Validator;
 use Throwable;
@@ -16,6 +18,170 @@ use Throwable;
  */
 final class RemotePublicationService
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_w16_publication(uint32_t operation, const char *input, size_t length, char *output, size_t capacity);
+        C;
+
+    // Candidate helpers retain PHP defaults until every paired mean/p99 gate passes.
+    private static bool $useRustFfi = false;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    /** Reject objects before serialize() can invoke user code; bound cycles and nesting. */
+    private static function nativeValueSupported(mixed $value, int &$remaining, int $depth): bool
+    {
+        if (--$remaining < 0 || $depth > 24) {
+            return false;
+        }
+        if (is_array($value)) {
+            foreach ($value as $item) {
+                if (! self::nativeValueSupported($item, $remaining, $depth + 1)) {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        return $value === null || is_scalar($value);
+    }
+
+    /** @param list<mixed> $arguments */
+    private static function computeNative(int $operation, array $arguments): mixed
+    {
+        if (! self::$useRustFfi) {
+            return null;
+        }
+        try {
+            $ffi = RustPipelineLibrary::resolveDomain('nfo', self::FFI_CDEF);
+            if ($ffi === null) {
+                return null;
+            }
+            $remaining = 100000;
+            if (! self::nativeValueSupported($arguments, $remaining, 0)) {
+                return null;
+            }
+            $input = serialize($arguments);
+            $capacity = 0;
+            $output = RustPipelineLibrary::obtainScratch($ffi, max(4096, strlen($input) + 512), $capacity);
+            if ($output === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w16_publication($operation, $input, strlen($input), $output, $capacity);
+            if (! is_int($written) || $written < 0 || $written > $capacity) {
+                return null;
+            }
+
+            return unserialize(FFI::string($output, $written), ['allowed_classes' => false]);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * @param  array<int, int>  $singleSizes
+     * @return list<array{batch: bool, positions: list<int>}>
+     */
+    public static function batchPartition(array $singleSizes, int $emptySize, int $limit): array
+    {
+        return self::batchPartitionNative($singleSizes, $emptySize, $limit) ?? self::batchPartitionPhp($singleSizes, $emptySize, $limit);
+    }
+
+    /**
+     * @param  array<int, int>  $singleSizes
+     * @return list<array{batch: bool, positions: list<int>}>
+     */
+    public static function batchPartitionPhp(array $singleSizes, int $emptySize, int $limit): array
+    {
+        $groups = [];
+        $current = [];
+        $bytes = $emptySize;
+        foreach ($singleSizes as $position => $size) {
+            if ($size > $limit) {
+                if ($current !== []) {
+                    $groups[] = ['batch' => true, 'positions' => $current];
+                    $current = [];
+                    $bytes = $emptySize;
+                }
+                $groups[] = ['batch' => false, 'positions' => [$position]];
+
+                continue;
+            }
+            $extra = $size - $emptySize + ($current === [] ? 0 : 1);
+            if ($current !== [] && $bytes + $extra > $limit) {
+                $groups[] = ['batch' => true, 'positions' => $current];
+                $current = [];
+                $bytes = $emptySize;
+                $extra = $size - $emptySize;
+            }
+            $current[] = $position;
+            $bytes += $extra;
+        }
+        if ($current !== []) {
+            $groups[] = ['batch' => true, 'positions' => $current];
+        }
+
+        return $groups;
+    }
+
+    /**
+     * @param  array<int, int>  $singleSizes
+     * @return list<array{batch: bool, positions: list<int>}>|null
+     */
+    public static function batchPartitionNative(array $singleSizes, int $emptySize, int $limit): ?array
+    {
+        $result = self::computeNative(0, [$singleSizes, $emptySize, $limit]);
+
+        return is_array($result) ? $result : null;
+    }
+
+    /**
+     * @return array{status: ?string, release_id: ?int}
+     */
+    public static function settledOutcome(?int $releaseId, ?string $resolved, bool $replay): array
+    {
+        return self::settledOutcomeNative($releaseId, $resolved, $replay) ?? self::settledOutcomePhp($releaseId, $resolved, $replay);
+    }
+
+    /**
+     * @return array{status: ?string, release_id: ?int}
+     */
+    public static function settledOutcomePhp(?int $releaseId, ?string $resolved, bool $replay): array
+    {
+        return ['status' => $releaseId !== null ? PublicationOutcome::PUBLISHED : ($replay ? $resolved : null), 'release_id' => $releaseId];
+    }
+
+    /**
+     * @return array{status: ?string, release_id: ?int}|null
+     */
+    public static function settledOutcomeNative(?int $releaseId, ?string $resolved, bool $replay): ?array
+    {
+        $result = self::computeNative(1, [$releaseId, $resolved, $replay]);
+
+        return is_array($result) ? $result : null;
+    }
+
+    public static function ledgerAdjustment(int $bytes, bool $retain): int
+    {
+        return self::ledgerAdjustmentNative($bytes, $retain) ?? self::ledgerAdjustmentPhp($bytes, $retain);
+    }
+
+    public static function ledgerAdjustmentPhp(int $bytes, bool $retain): int
+    {
+        return $retain ? 0 : -$bytes;
+    }
+
+    public static function ledgerAdjustmentNative(int $bytes, bool $retain): ?int
+    {
+        $result = self::computeNative(2, [$bytes, $retain]);
+
+        return is_int($result) ? $result : null;
+    }
+
     public const string STALE_MESSAGE = 'Stale verification result cannot publish.';
 
     /** Version of the batch request and response; a mismatch makes the worker fall back to single requests. */
@@ -127,7 +293,7 @@ final class RemotePublicationService
                 ? new PublicationOutcome(PublicationOutcome::ERROR, null, $outcome->error ?? 'Publication produced no release.') : $outcome;
         } catch (Throwable $error) {
             // Even the recovery lookup failed; the item may or may not have published, and a resend decides.
-            return new PublicationOutcome(PublicationOutcome::ERROR, null, mb_strcut($error->getMessage(), 0, 500, 'UTF-8'));
+            return new PublicationOutcome(PublicationOutcome::ERROR, null, RemoteReleasePublisher::errorMessage($error->getMessage()));
         }
     }
 
@@ -226,7 +392,7 @@ final class RemotePublicationService
             if ($settled !== null) {
                 return $settled;
             }
-            $message = mb_strcut($error->getMessage(), 0, 500, 'UTF-8');
+            $message = RemoteReleasePublisher::errorMessage($error->getMessage());
 
             return new PublicationOutcome(str_starts_with($message, 'Stale verification result cannot')
                 ? PublicationOutcome::STALE : PublicationOutcome::ERROR, null, $message);
@@ -237,12 +403,10 @@ final class RemotePublicationService
     private function settled(object $claim, bool $replayResolved): ?PublicationOutcome
     {
         $published = $this->publishedRelease($claim);
-        if ($published !== null) {
-            return new PublicationOutcome(PublicationOutcome::PUBLISHED, $published);
-        }
-        $status = $replayResolved ? $this->resolvedStatus($claim) : null;
+        $status = $published === null && $replayResolved ? $this->resolvedStatus($claim) : null;
+        $settled = self::settledOutcome($published, $status, $replayResolved);
 
-        return $status === null ? null : new PublicationOutcome($status);
+        return $settled['status'] === null ? null : new PublicationOutcome($settled['status'], $settled['release_id']);
     }
 
     /** The release already published for this exact candidate generation. */

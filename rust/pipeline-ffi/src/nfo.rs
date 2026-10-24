@@ -13749,3 +13749,494 @@ mod wave15_tests {
         }
     }
 }
+
+// Wave 16 worker 2. Pure publication/NZB/scratch candidates; PHP owns all I/O,
+// transactions, leases, gzip inflation and outbox mutation. The bounded wire
+// format is PHP's scalar/array serialization, never objects or references.
+fn w16_int(value: &VerificationOutboxValue) -> Option<i64> {
+    if let VerificationOutboxValue::Int(n) = value {
+        Some(*n)
+    } else {
+        None
+    }
+}
+fn w16_bytes(value: &VerificationOutboxValue) -> Option<&[u8]> {
+    if let VerificationOutboxValue::Bytes(bytes) = value {
+        Some(bytes)
+    } else {
+        None
+    }
+}
+fn w16_bool(value: &VerificationOutboxValue) -> Option<bool> {
+    if let VerificationOutboxValue::Bool(v) = value {
+        Some(*v)
+    } else {
+        None
+    }
+}
+fn w16_entries(
+    value: &VerificationOutboxValue,
+) -> Option<&[(VerificationOutboxValue, VerificationOutboxValue)]> {
+    if let VerificationOutboxValue::Array(entries) = value {
+        Some(entries)
+    } else {
+        None
+    }
+}
+fn w16_string(bytes: &[u8]) -> VerificationOutboxValue {
+    VerificationOutboxValue::Bytes(bytes.to_vec())
+}
+fn w16_map(entries: Vec<(&str, VerificationOutboxValue)>) -> VerificationOutboxValue {
+    VerificationOutboxValue::Array(
+        entries
+            .into_iter()
+            .map(|(k, v)| (w16_string(k.as_bytes()), v))
+            .collect(),
+    )
+}
+fn w16_list(values: Vec<VerificationOutboxValue>) -> VerificationOutboxValue {
+    VerificationOutboxValue::Array(
+        values
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| (VerificationOutboxValue::Int(i as i64), v))
+            .collect(),
+    )
+}
+fn w16_equal(a: &VerificationOutboxValue, b: &VerificationOutboxValue) -> bool {
+    let (mut x, mut y) = (Vec::new(), Vec::new());
+    a.serialize(&mut x);
+    b.serialize(&mut y);
+    x == y
+}
+fn w16_date(bytes: &[u8]) -> bool {
+    bytes.len() == 19
+        && bytes.iter().enumerate().all(|(i, b)| match i {
+            4 | 7 => *b == b'-',
+            10 => *b == b' ',
+            13 | 16 => *b == b':',
+            _ => b.is_ascii_digit(),
+        })
+}
+fn w16_display(value: &VerificationOutboxValue) -> Option<String> {
+    match value {
+        VerificationOutboxValue::Int(v) => Some(v.to_string()),
+        VerificationOutboxValue::Bytes(v) => String::from_utf8(v.clone()).ok(),
+        _ => None,
+    }
+}
+fn w16_compute(
+    domain: u32,
+    op: u32,
+    args: &[VerificationOutboxValue],
+) -> Option<VerificationOutboxValue> {
+    use VerificationOutboxValue as V;
+    let arity = match (domain, op) {
+        (0, 0 | 1) | (1, 1 | 3) | (4, 1 | 3) => 1,
+        (1, 0) | (2, 2) | (3, 0 | 1) => 2,
+        (0, 2 | 3) | (1, 2) | (2, 0 | 1) | (3, 2) | (4, 2) => 3,
+        (4, 0) => 4,
+        _ => return None,
+    };
+    if args.len() != arity {
+        return None;
+    }
+    let a = |i: usize| args.get(i);
+    let integer = |i| w16_int(a(i)?);
+    let bytes = |i| w16_bytes(a(i)?);
+    let boolean = |i| w16_bool(a(i)?);
+    Some(match (domain, op) {
+        (0, 0) => {
+            let xml = bytes(0)?;
+            let mut source = b"nntmux:nzb-archive-naming:1\0".to_vec();
+            source.extend_from_slice(xml);
+            w16_map(vec![
+                ("source_digest", w16_string(&sha256_fast_hex(&source))),
+                ("decoded_bytes", V::Int(i64::try_from(xml.len()).ok()?)),
+            ])
+        }
+        (0, 1) => V::Bool(bytes(0)?.starts_with(b"\x1f\x8b")),
+        (0, 2) => {
+            let (decoded, chunk, maximum) = (integer(0)?, integer(1)?, integer(2)?);
+            V::Bool(decoded >= 0 && chunk >= 0 && decoded <= maximum && chunk <= maximum - decoded)
+        }
+        (0, 3) => {
+            let xml = bytes(0)?;
+            let expected = bytes(1)?;
+            let maximum = integer(2)?;
+            let mut source = b"nntmux:nzb-archive-naming:1\0".to_vec();
+            source.extend_from_slice(xml);
+            let digest = sha256_fast_hex(&source);
+            // Fixed-length constant-work digest comparison, matching hash_equals.
+            let different = if expected.len() == digest.len() {
+                expected
+                    .iter()
+                    .zip(digest)
+                    .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+            } else {
+                1
+            };
+            V::Bool(maximum >= 0 && xml.len() as u64 <= maximum as u64 && different == 0)
+        }
+        (1, 0) => V::Int(if !boolean(0)? {
+            0
+        } else if bytes(1)? == b"sampled" {
+            1
+        } else {
+            2
+        }),
+        (1, 1) => {
+            let mut url = bytes(0)?;
+            let trim = |b: u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 11);
+            while url.first().is_some_and(|b| trim(*b)) {
+                url = &url[1..];
+            }
+            while url.last().is_some_and(|b| trim(*b)) {
+                url = &url[..url.len() - 1];
+            }
+            w16_string(url)
+        }
+        (1, 2) => V::Bool(
+            matches!(integer(0)?, 404 | 405 | 413)
+                || (integer(0)? == 422 && (boolean(1)? || boolean(2)?)),
+        ),
+        (1, 3) => {
+            let text = std::str::from_utf8(bytes(0)?).ok()?;
+            let mut end = text.len().min(500);
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            w16_string(&text.as_bytes()[..end])
+        }
+        (2, 0) => {
+            let sizes = w16_entries(a(0)?)?;
+            let (empty, limit) = (integer(1)?, integer(2)?);
+            if empty < 0 || limit < 0 {
+                return None;
+            }
+            let mut groups = Vec::new();
+            let mut current = Vec::new();
+            let mut count = empty;
+            let group = |batch, positions| {
+                w16_map(vec![
+                    ("batch", V::Bool(batch)),
+                    ("positions", w16_list(positions)),
+                ])
+            };
+            for (key, size) in sizes {
+                w16_int(key)?;
+                let size = w16_int(size)?;
+                if size < empty {
+                    return None;
+                }
+                if size > limit {
+                    if !current.is_empty() {
+                        groups.push(group(true, std::mem::take(&mut current)));
+                        count = empty;
+                    }
+                    groups.push(group(false, vec![key.clone()]));
+                    continue;
+                }
+                let mut extra = size
+                    .checked_sub(empty)?
+                    .checked_add(i64::from(!current.is_empty()))?;
+                if !current.is_empty() && count.checked_add(extra)? > limit {
+                    groups.push(group(true, std::mem::take(&mut current)));
+                    count = empty;
+                    extra = size - empty;
+                }
+                current.push(key.clone());
+                count = count.checked_add(extra)?;
+            }
+            if !current.is_empty() {
+                groups.push(group(true, current));
+            }
+            w16_list(groups)
+        }
+        (2, 1) => {
+            let id = a(0)?;
+            if !matches!(id, V::Null | V::Int(_)) {
+                return None;
+            }
+            let status = if matches!(id, V::Int(_)) {
+                w16_string(b"published")
+            } else if boolean(2)? {
+                a(1)?.clone()
+            } else {
+                V::Null
+            };
+            w16_map(vec![("status", status), ("release_id", id.clone())])
+        }
+        (2, 2) => V::Int(if boolean(1)? {
+            0
+        } else {
+            integer(0)?.checked_neg()?
+        }),
+        (3, 0) => {
+            let mut result = w16_entries(a(0)?)?.to_vec();
+            let mut keys = std::collections::HashSet::new();
+            for (key, _) in &result {
+                let mut encoded = Vec::new();
+                key.serialize(&mut encoded);
+                keys.insert(encoded);
+            }
+            for (key, value) in w16_entries(a(1)?)? {
+                let mut encoded = Vec::new();
+                key.serialize(&mut encoded);
+                if keys.insert(encoded) {
+                    result.push((key.clone(), value.clone()));
+                }
+            }
+            V::Array(result)
+        }
+        (3, 1) => {
+            let (found, expected) = (integer(0)?, integer(1)?);
+            let percent = if expected <= 0 {
+                0.0
+            } else {
+                (found as f64 / expected as f64 * 100.0).clamp(0.0, 100.0)
+            };
+            V::Float(percent.to_string().into_bytes())
+        }
+        (3, 2) => {
+            let candidate = a(0)?;
+            if matches!(candidate, V::Null) {
+                return Some(V::Bool(false));
+            }
+            let claim = a(1)?;
+            for key in [b"version".as_slice(), b"manifest_hash", b"lease_token"] {
+                if !w16_equal(candidate.field(key)?, claim.field(key)?) {
+                    return Some(V::Bool(false));
+                }
+            }
+            let lease = candidate.field(b"lease_until")?;
+            if matches!(lease, V::Null) {
+                return Some(V::Bool(false));
+            }
+            let lease = w16_bytes(lease)?;
+            let now = bytes(2)?;
+            // Non-datetime PHP comparison semantics stay in the fallback.
+            if !w16_date(lease) || !w16_date(now) {
+                return None;
+            }
+            V::Bool(lease >= now)
+        }
+        (4, 0) => {
+            let name = match a(0)? {
+                V::Null => format!("{}-{}", w16_display(a(1)?)?, w16_display(a(2)?)?),
+                id @ (V::Int(_) | V::Bytes(_)) => {
+                    format!("audit-{}-{}", w16_display(id)?, w16_display(a(3)?)?)
+                }
+                _ => return None,
+            };
+            w16_string(name.as_bytes())
+        }
+        (4, 1) => {
+            let name = bytes(0)?;
+            let (audit, name) = match name.strip_prefix(b"audit-") {
+                Some(n) => (true, n),
+                None => (false, name),
+            };
+            let parts: Vec<_> = name.split(|b| *b == b'-').collect();
+            let valid = parts.len() == 2
+                && parts
+                    .iter()
+                    .all(|p| !p.is_empty() && p.iter().all(u8::is_ascii_digit));
+            w16_string(if !valid {
+                b"unknown"
+            } else if audit {
+                b"audit"
+            } else {
+                b"candidate"
+            })
+        }
+        (4, 2) => V::Bool(integer(1)?.checked_sub(integer(0)?)? > integer(2)?.max(0)),
+        (4, 3) => {
+            let entries = w16_entries(a(0)?)?;
+            let (mut candidate, mut audit, mut terminal) = (0i64, 0i64, 0i64);
+            for (_, entry) in entries {
+                if matches!(entry.field(b"audit_release_id")?, V::Null) {
+                    candidate = candidate.checked_add(1)?;
+                } else {
+                    audit = audit.checked_add(1)?;
+                }
+                terminal = terminal.checked_add(i64::from(w16_bool(entry.field(b"terminal")?)?))?;
+            }
+            w16_map(vec![
+                ("total", V::Int(i64::try_from(entries.len()).ok()?)),
+                ("candidate", V::Int(candidate)),
+                ("audit", V::Int(audit)),
+                ("terminal", V::Int(terminal)),
+            ])
+        }
+        _ => return None,
+    })
+}
+
+unsafe fn w16_call(
+    domain: u32,
+    op: u32,
+    input: *const u8,
+    len: usize,
+    output: *mut u8,
+    capacity: usize,
+) -> isize {
+    // Validate every range and overlap before creating any input or output slice.
+    // Zero-capacity null output is the required-size query; empty null input is invalid.
+    if len > 64 * 1024 * 1024
+        || !yenc_valid_range(input as usize, len)
+        || !(output.is_null() && capacity == 0 || yenc_valid_range(output as usize, capacity))
+        || yenc_ranges_overlap(input as usize, len, output as usize, capacity)
+    {
+        return -1;
+    }
+    let bytes = unsafe { slice::from_raw_parts(input, len) };
+    // Cap recursion and element budget independently of the wire length.
+    let mut parser = VerificationOutboxParser {
+        bytes,
+        pos: 0,
+        remaining: 1_000_000,
+    };
+    let Some(value) = parser.value(480) else {
+        return -1;
+    };
+    if parser.pos != len {
+        return -1;
+    }
+    let Some(entries) = w16_entries(&value) else {
+        return -1;
+    };
+    if entries
+        .iter()
+        .enumerate()
+        .any(|(i, (k, _))| !matches!(k, VerificationOutboxValue::Int(n) if *n == i as i64))
+    {
+        return -1;
+    }
+    let args: Vec<_> = entries.iter().map(|(_, v)| v.clone()).collect();
+    let Some(value) = w16_compute(domain, op, &args) else {
+        return -1;
+    };
+    let mut result = Vec::new();
+    value.serialize(&mut result);
+    let Ok(required) = isize::try_from(result.len()) else {
+        return -1;
+    };
+    if result.len() > capacity {
+        return -required;
+    }
+    // No partial writes on short buffers and no slice from an unchecked range.
+    unsafe {
+        std::ptr::copy_nonoverlapping(result.as_ptr(), output, result.len());
+    }
+    required
+}
+
+macro_rules! w16_export {
+    ($symbol:ident, $domain:expr) => {
+        /// Scalar/array PHP serialization in and out. -1 declines invalid input;
+        /// -required reports a short output without writing; positive is bytes written.
+        /// # Safety
+        /// Caller provides live readable/writable allocations for all non-null ranges.
+        /// Ranges must not overlap; pointers cannot be verified for allocation ownership.
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn $symbol(
+            operation: u32,
+            input: *const u8,
+            length: usize,
+            output: *mut u8,
+            capacity: usize,
+        ) -> isize {
+            std::panic::catch_unwind(|| unsafe {
+                w16_call($domain, operation, input, length, output, capacity)
+            })
+            .unwrap_or(-1)
+        }
+    };
+}
+w16_export!(nntmux_w16_nzb, 0);
+w16_export!(nntmux_w16_remote, 1);
+w16_export!(nntmux_w16_publication, 2);
+w16_export!(nntmux_w16_verified, 3);
+w16_export!(nntmux_w16_scratch, 4);
+
+#[cfg(test)]
+mod wave16_publish_tests {
+    use super::*;
+    #[test]
+    fn invalid_ranges_and_short_buffers_never_write() {
+        let input = b"a:1:{i:0;s:3:\"abc\";}";
+        let mut out = [88u8; 256];
+        unsafe {
+            assert_eq!(
+                nntmux_w16_nzb(0, std::ptr::null(), 1, out.as_mut_ptr(), 256),
+                -1
+            );
+            assert_eq!(
+                nntmux_w16_nzb(0, input.as_ptr(), usize::MAX, out.as_mut_ptr(), 256),
+                -1
+            );
+            assert_eq!(
+                nntmux_w16_nzb(0, input.as_ptr(), input.len(), out.as_mut_ptr(), usize::MAX),
+                -1
+            );
+            assert_eq!(
+                nntmux_w16_nzb(0, usize::MAX as *const u8, 1, out.as_mut_ptr(), 256),
+                -1
+            );
+            assert_eq!(
+                nntmux_w16_nzb(0, out.as_ptr(), 2, out.as_mut_ptr(), 256),
+                -1
+            );
+            let required = nntmux_w16_nzb(0, input.as_ptr(), input.len(), std::ptr::null_mut(), 0);
+            assert!(required < -1);
+            assert_eq!(
+                nntmux_w16_nzb(
+                    0,
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    (-required - 1) as usize
+                ),
+                required
+            );
+            assert_eq!(out, [88; 256]);
+            assert_eq!(
+                nntmux_w16_nzb(
+                    0,
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    (-required) as usize
+                ),
+                -required
+            );
+        }
+    }
+    #[test]
+    fn malformed_wire_unknown_operations_and_overflow_decline() {
+        for input in [
+            b"N;".as_slice(),
+            b"a:0:{}junk",
+            b"a:1:{i:0;R:1;}",
+            b"a:9999999999999999999999999999999:{}",
+        ] {
+            assert_eq!(
+                unsafe { nntmux_w16_nzb(0, input.as_ptr(), input.len(), std::ptr::null_mut(), 0) },
+                -1
+            );
+        }
+        let bytes = b"a:2:{i:0;i:-9223372036854775808;i:1;b:0;}";
+        assert_eq!(
+            unsafe {
+                nntmux_w16_publication(2, bytes.as_ptr(), bytes.len(), std::ptr::null_mut(), 0)
+            },
+            -1
+        );
+        let bytes = b"a:0:{}";
+        assert_eq!(
+            unsafe { nntmux_w16_remote(999, bytes.as_ptr(), bytes.len(), std::ptr::null_mut(), 0) },
+            -1
+        );
+    }
+}
