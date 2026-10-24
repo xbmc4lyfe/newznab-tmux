@@ -11386,3 +11386,476 @@ pub mod release_fingerprint_reconcile {
         }
     }
 }
+
+// Wave 10 book ranking. NUL-framed fields avoid per-candidate FFI crossings.
+// These entry points deliberately decline non-ASCII text: PHP's mbstring/PCRE
+// Unicode and locale tables remain the authority for those inputs.
+mod book_candidate_ranking {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn fields(input: &str) -> Option<Vec<&str>> {
+        if !input.is_ascii() || input.len() > 1_048_576 || !input.ends_with('\0') {
+            return None;
+        }
+        Some(input[..input.len() - 1].split('\0').collect())
+    }
+
+    fn markers(value: &str) -> (Option<i32>, Option<i32>) {
+        let value = if value.contains('\u{000b}') {
+            Cow::Owned(value.replace('\u{000b}', " "))
+        } else {
+            Cow::Borrowed(value)
+        };
+        (
+            extract_volume_marker(&value),
+            extract_edition_marker(&value),
+        )
+    }
+
+    fn meaningful(value: &str) -> usize {
+        let norm = book_normalize_text(value);
+        collect_unique_words(&norm)
+            .iter()
+            .filter(|w| {
+                w.len() > 1
+                    && ![
+                        "a", "an", "and", "by", "for", "in", "of", "on", "or", "the", "to", "with",
+                    ]
+                    .contains(w)
+            })
+            .count()
+    }
+
+    fn work_key(title: &str, author: &str) -> String {
+        let norm = book_normalize_text(author);
+        let mut words = collect_unique_words(&norm);
+        // PHP sort() uses SORT_REGULAR, including numeric comparison. Decline
+        // numeric author tokens at the ABI boundary rather than changing order.
+        words.sort_unstable();
+        format!("{}|{}", book_normalize_text(title), words.join(" "))
+    }
+
+    fn safe_author(author: &str) -> bool {
+        let norm = book_normalize_text(author);
+        !norm
+            .split(' ')
+            .any(|w| !w.is_empty() && w.parse::<f64>().is_ok())
+    }
+
+    fn year_tie(date: &str, year: i64) -> i64 {
+        let bytes = date.as_bytes();
+        for pos in 0..bytes.len().saturating_sub(3) {
+            let end = pos + 4;
+            if (pos == 0 || !is_ascii_word(bytes[pos - 1]))
+                && matches!(&bytes[pos..pos + 2], b"19" | b"20")
+                && bytes[pos + 2..end].iter().all(u8::is_ascii_digit)
+                && (end == bytes.len() || !is_ascii_word(bytes[end]))
+            {
+                let found = date[pos..end].parse::<i64>().unwrap_or(0);
+                return (100_i128 - (year as i128 - found as i128).abs()).max(0) as i64;
+            }
+        }
+        0
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_book_rank_helper(
+        op: u32,
+        ptr: *const u8,
+        len: usize,
+        year: i64,
+    ) -> i64 {
+        if len > 1_048_576 {
+            return -1;
+        }
+        let Some(input) = (unsafe { slice_as_str(ptr, len) }) else {
+            return -1;
+        };
+        if !input.is_ascii() || input.len() > 1_048_576 {
+            return -1;
+        }
+        match op {
+            0 => {
+                let (vol, ed) = markers(input);
+                (vol.map_or(0, |v| v as i64 + 1)) | (ed.map_or(0, |v| v as i64 + 1) << 10)
+            }
+            1 => meaningful(input) as i64,
+            2 => {
+                let Some(node) = PhpSerParser::parse_document(input.as_bytes()) else {
+                    return -1;
+                };
+                if !matches!(node.val, PhpVal::Arr(_)) {
+                    return -1;
+                }
+                [
+                    "isbn",
+                    "ean",
+                    "publisher",
+                    "publishdate",
+                    "pages",
+                    "overview",
+                    "genre",
+                    "coverurl",
+                ]
+                .iter()
+                .filter(|key| {
+                    node.get(key.as_bytes())
+                        .is_some_and(|v| !matches!(v.val, PhpVal::Null | PhpVal::Str(b"")))
+                })
+                .count() as i64
+            }
+            3 => year_tie(input, year),
+            4 => {
+                let Some(f) = fields(input) else {
+                    return -1;
+                };
+                if f.len() != 2 {
+                    return -1;
+                }
+                let (pv, pe) = markers(f[0]);
+                let (cv, ce) = markers(f[1]);
+                i64::from(
+                    pv.zip(cv).is_some_and(|(p, c)| p != c)
+                        || pe.zip(ce).is_some_and(|(p, c)| p != c),
+                )
+            }
+            _ => -1,
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_book_work_key_nul(
+        ptr: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        if len > 1_048_576 {
+            return -1;
+        }
+        let Some(input) = (unsafe { slice_as_str(ptr, len) }) else {
+            return -1;
+        };
+        let Some(f) = fields(input) else {
+            return -1;
+        };
+        if f.len() != 2 || !safe_author(f[1]) {
+            return -1;
+        }
+        let value = work_key(f[0], f[1]);
+        let mut cursor = unsafe { OutCursor::new(out, cap) };
+        cursor.extend(value.as_bytes());
+        cursor.finish()
+    }
+
+    fn identity(
+        title: &str,
+        author: &str,
+        candidate_title: &str,
+        candidate_author: &str,
+        has_isbn: bool,
+        score: f64,
+        runner: Option<f64>,
+    ) -> bool {
+        if score == 1.0 && has_isbn {
+            return true;
+        }
+        let title_score = book_title_score(title, candidate_title);
+        if !author.is_empty() {
+            let author_score = book_author_score(author, candidate_author);
+            if title_score < 0.78 || author_score < 0.75 || score < 0.82 {
+                return false;
+            }
+            return runner.is_none_or(|r| score - r >= 0.08);
+        }
+        if meaningful(title) < 3 || title_score < 0.92 {
+            return false;
+        }
+        runner.is_none_or(|r| score - r >= 0.12)
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_book_identity_nul(
+        ptr: *const u8,
+        len: usize,
+        flags: u32,
+        score: f64,
+        runner: f64,
+    ) -> i32 {
+        if len > 1_048_576 {
+            return -1;
+        }
+        let Some(input) = (unsafe { slice_as_str(ptr, len) }) else {
+            return -1;
+        };
+        let Some(f) = fields(input) else {
+            return -1;
+        };
+        if f.len() != 4 || f.iter().any(|v| v.len() > 4096) {
+            return -1;
+        }
+        i32::from(identity(
+            f[0],
+            f[1],
+            f[2],
+            f[3],
+            flags & 1 != 0,
+            score,
+            if flags & 2 != 0 { Some(runner) } else { None },
+        ))
+    }
+
+    #[derive(Clone)]
+    struct Ranked {
+        index: usize,
+        score: f64,
+        year: i64,
+        completeness: usize,
+    }
+
+    fn better(a: &Ranked, b: &Ranked) -> bool {
+        a.score > b.score
+            || (a.score == b.score
+                && (a.year > b.year || (a.year == b.year && a.completeness > b.completeness)))
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_book_rank_candidates_nul(ptr: *const u8, len: usize) -> i64 {
+        if len > 1_048_576 {
+            return -1;
+        }
+        let Some(input) = (unsafe { slice_as_str(ptr, len) }) else {
+            return -1;
+        };
+        let Some(f) = fields(input) else {
+            return -1;
+        };
+        if f.len() < 7 {
+            return -1;
+        }
+        let Ok(count) = f[6].parse::<usize>() else {
+            return -1;
+        };
+        if !matches!(f[4], "0" | "1")
+            || count > 512
+            || f.len() != 7 + count * 7
+            || f.iter().any(|v| v.len() > 4096)
+        {
+            return -1;
+        }
+        let year = if f[5].is_empty() {
+            None
+        } else {
+            let Ok(year) = f[5].parse::<i64>() else {
+                return -1;
+            };
+            Some(year)
+        };
+        let combined = format!("{} {}", f[0], f[1]);
+        let raw_markers = markers(f[0]);
+        let title_markers = markers(f[1]);
+        // The older scorer crosses FFI separately and extracts raw/title
+        // markers independently. Keep both that caller and the PHP reference
+        // equivalent; ambiguous boundary-spanning markers stay in PHP.
+        if f.iter().any(|v| v.contains('\u{000b}'))
+            || markers(&combined)
+                != (
+                    raw_markers.0.or(title_markers.0),
+                    raw_markers.1.or(title_markers.1),
+                )
+        {
+            return -1;
+        }
+        let mut by_work: Vec<Ranked> = Vec::with_capacity(count);
+        let mut positions: HashMap<String, usize> = HashMap::with_capacity(count);
+        for index in 0..count {
+            let c = &f[7 + index * 7..7 + (index + 1) * 7];
+            if !safe_author(c[1])
+                || c[5].len() != 8
+                || !c[5].bytes().all(|b| matches!(b, b'0' | b'1'))
+            {
+                return -1;
+            }
+            let mut key = work_key(c[0], c[1]);
+            if key == "|" {
+                let Some(asin) = c[4].strip_prefix('1') else {
+                    return -1;
+                };
+                key = asin.to_owned();
+            }
+            let candidate = Ranked {
+                index,
+                score: book_score_candidate(
+                    f[0],
+                    f[1],
+                    if f[2].is_empty() { None } else { Some(f[2]) },
+                    if f[4] == "1" { Some(f[3]) } else { None },
+                    c[0],
+                    c[1],
+                    Some(c[2]),
+                    Some(c[3]),
+                ),
+                year: year.map_or(0, |y| year_tie(c[6], y)),
+                completeness: c[5].bytes().filter(|b| *b == b'1').count(),
+            };
+            if let Some(&slot) = positions.get(&key) {
+                if better(&candidate, &by_work[slot]) {
+                    by_work[slot] = candidate;
+                }
+            } else {
+                positions.insert(key, by_work.len());
+                by_work.push(candidate);
+            }
+        }
+        // Stable sorting preserves first work occurrence on a complete tie,
+        // including when a later edition replaced that work's representative.
+        by_work.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| b.year.cmp(&a.year))
+                .then_with(|| b.completeness.cmp(&a.completeness))
+        });
+        let Some(best) = by_work.first() else {
+            return -2;
+        };
+        let c = &f[7 + best.index * 7..7 + (best.index + 1) * 7];
+        if identity(
+            f[1],
+            f[2],
+            c[0],
+            c[1],
+            f[4] == "1",
+            best.score,
+            by_work.get(1).map(|r| r.score),
+        ) {
+            best.index as i64
+        } else {
+            -2
+        }
+    }
+
+    fn iso_date(value: &str) -> bool {
+        let b = value.as_bytes();
+        if b.len() != 10
+            || b[4] != b'-'
+            || b[7] != b'-'
+            || !b
+                .iter()
+                .enumerate()
+                .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
+        {
+            return false;
+        }
+        let year = value[..4].parse::<u32>().unwrap_or(0);
+        let month = value[5..7].parse::<usize>().unwrap_or(0);
+        let day = value[8..].parse::<u32>().unwrap_or(0);
+        if year == 0 || !(1..=12).contains(&month) {
+            return false;
+        }
+        let leap =
+            year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+        let days = [
+            31,
+            if leap { 29 } else { 28 },
+            31,
+            30,
+            31,
+            30,
+            31,
+            31,
+            30,
+            31,
+            30,
+            31,
+        ][month - 1];
+        day > 0 && day <= days
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_isbndb_fields_nul(
+        ptr: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        // Author/subject strings are opaque UTF-8 bytes; no case or word rules.
+        if len > 1_048_576 {
+            return -1;
+        }
+        let Some(input) = (unsafe { slice_as_str(ptr, len) }) else {
+            return -1;
+        };
+        if len > 1_048_576 || !input.ends_with('\0') {
+            return -1;
+        }
+        let f: Vec<&str> = input[..input.len() - 1].split('\0').collect();
+        if f.len() < 4 {
+            return -1;
+        }
+        let (Ok(authors), Ok(subjects)) = (f[2].parse::<usize>(), f[3].parse::<usize>()) else {
+            return -1;
+        };
+        if authors > f.len() - 4 || subjects != f.len() - 4 - authors {
+            return -1;
+        }
+        let date = if f[0] == "0" || php_trim(f[1]).is_empty() {
+            Some("")
+        } else if iso_date(f[1]) {
+            Some(f[1])
+        } else {
+            None
+        };
+        let join = |items: &[&str]| {
+            items
+                .iter()
+                .copied()
+                .filter(|v| !v.is_empty() && *v != "0")
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let result = format!(
+            "{}\0{}\0{}\0{}\0",
+            if date.is_some() { "1" } else { "0" },
+            date.unwrap_or(""),
+            join(&f[4..4 + authors]),
+            join(&f[4 + authors..])
+        );
+        let mut cursor = unsafe { OutCursor::new(out, cap) };
+        cursor.extend(result.as_bytes());
+        cursor.finish()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn book_ranking_markers_and_boundaries() {
+            assert_eq!(markers("Vol. #002 3rd Edition"), (Some(2), Some(3)));
+            assert_eq!(markers("Book 1234 1234th Edition"), (None, None));
+            assert_eq!(markers("2 ed.x"), (None, Some(2)));
+            assert_eq!(meaningful("The Art of War"), 2);
+            assert_eq!(year_tie("_2000 1999-07-08", 1999), 100);
+            assert_eq!(year_tie("1999", i64::MIN), 0);
+            assert_eq!(work_key("The.Book", "Doe, Jane"), "the book|doe jane");
+            assert!(iso_date("2000-02-29"));
+            assert!(!iso_date("1900-02-29"));
+        }
+        #[test]
+        fn book_ranking_rejects_malformed_frames() {
+            unsafe {
+                assert_eq!(nntmux_book_rank_candidates_nul(std::ptr::null(), 0), -1);
+                let input = "a\0b\0\0\00\0\0513\0";
+                assert_eq!(
+                    nntmux_book_rank_candidates_nul(input.as_ptr(), input.len()),
+                    -1
+                );
+                let input = "one\0two\0";
+                assert_eq!(
+                    nntmux_book_work_key_nul(input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                    -7
+                );
+            }
+        }
+    }
+}

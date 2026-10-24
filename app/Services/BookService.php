@@ -60,6 +60,9 @@ class BookService
         return self::$bookFfi;
     }
 
+    /** Null selects the benchmark-qualified production defaults. */
+    public ?bool $useRustFfi = null;
+
     private const FAILURE_CACHE_VERSION = 2;
 
     private int $providerRetryAfter = 300;
@@ -1230,6 +1233,20 @@ class BookService
         BookParseResult $parsed,
         BookMatchScorer $scorer,
     ): ?array {
+        return ($this->useRustFfi ?? false)
+            ? $this->pickBestCandidateForParseNative($candidates, $parsed, $scorer)
+            : $this->pickBestCandidateForParsePhp($candidates, $parsed, $scorer);
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>>  $candidates
+     * @return array<string, mixed>|null
+     */
+    public function pickBestCandidateForParsePhp(
+        array $candidates,
+        BookParseResult $parsed,
+        BookMatchScorer $scorer,
+    ): ?array {
 
         /** @var array<string, array{candidate: array<string, mixed>, score: float, year_tie: int, completeness: int}> $byWork */
         $byWork = [];
@@ -1282,6 +1299,121 @@ class BookService
     }
 
     /**
+     * Rank the whole batch in a single FFI call, returning the original PHP
+     * candidate (including provider-specific keys and value types).
+     *
+     * @param  array<int, array<string, mixed>>  $candidates
+     * @return array<string, mixed>|null
+     */
+    public function pickBestCandidateForParseNative(array $candidates, BookParseResult $parsed, BookMatchScorer $scorer): ?array
+    {
+        if ($candidates === []) {
+            return null;
+        }
+        if (! BookMatchScorer::rankingEnvironmentSupported() || get_class($scorer) !== BookMatchScorer::class
+            || count($candidates) > 512 || ($ffi = BookMatchScorer::rankingFfi()) === null) {
+            return $this->pickBestCandidateForParsePhp($candidates, $parsed, $scorer);
+        }
+        $fields = [$parsed->rawName, $parsed->title, $parsed->author ?? '', $parsed->isbn ?? '',
+            $parsed->isbn !== null ? '1' : '0', $parsed->year === null ? '' : (string) $parsed->year, (string) count($candidates)];
+        foreach ($candidates as $candidate) {
+            foreach (['title', 'author', 'isbn', 'ean', 'asin', 'publishdate'] as $field) {
+                if (isset($candidate[$field]) && ! is_scalar($candidate[$field])) {
+                    return $this->pickBestCandidateForParsePhp($candidates, $parsed, $scorer);
+                }
+            }
+            $fields[] = (string) ($candidate['title'] ?? '');
+            $fields[] = (string) ($candidate['author'] ?? '');
+            $fields[] = (string) ($candidate['isbn'] ?? '');
+            $fields[] = (string) ($candidate['ean'] ?? '');
+            $fields[] = isset($candidate['asin']) ? '1'.(string) $candidate['asin'] : '0';
+            $presence = '';
+            foreach (['isbn', 'ean', 'publisher', 'publishdate', 'pages', 'overview', 'genre', 'coverurl'] as $field) {
+                $presence .= isset($candidate[$field]) && $candidate[$field] !== '' ? '1' : '0';
+            }
+            $fields[] = $presence;
+            $fields[] = empty($candidate['publishdate']) ? '' : (string) $candidate['publishdate'];
+        }
+        $input = implode("\0", $fields)."\0";
+        if (substr_count($input, "\0") !== count($fields)) {
+            return $this->pickBestCandidateForParsePhp($candidates, $parsed, $scorer);
+        }
+        try {
+            // -2 means a valid batch with no accepted candidate; -1 declines.
+            // @phpstan-ignore method.notFound
+            $index = $ffi->nntmux_book_rank_candidates_nul($input, strlen($input));
+            if ($index === -2) {
+                return null;
+            }
+            if (is_int($index) && $index >= 0 && $index < count($candidates)) {
+                return array_values($candidates)[$index];
+            }
+        } catch (Throwable) {
+            // Missing or older native libraries retain the PHP implementation.
+        }
+
+        return $this->pickBestCandidateForParsePhp($candidates, $parsed, $scorer);
+    }
+
+    /** @param array<string, mixed> $candidate */
+    public function candidatePassesIdentityRulesNative(array $candidate, float $score, ?float $runnerUpScore, BookParseResult $parsed, BookMatchScorer $scorer): bool
+    {
+        foreach (['title', 'author'] as $field) {
+            if (isset($candidate[$field]) && ! is_scalar($candidate[$field])) {
+                return $this->candidatePassesIdentityRulesPhp($candidate, $score, $runnerUpScore, $parsed, $scorer);
+            }
+        }
+        if (BookMatchScorer::rankingEnvironmentSupported() && get_class($scorer) === BookMatchScorer::class
+            && ($ffi = BookMatchScorer::rankingFfi()) !== null) {
+            $fields = [$parsed->title, $parsed->author ?? '', (string) ($candidate['title'] ?? ''), (string) ($candidate['author'] ?? '')];
+            $input = implode("\0", $fields)."\0";
+            if (substr_count($input, "\0") === 4) {
+                try {
+                    $flags = ($parsed->isbn !== null ? 1 : 0) | ($runnerUpScore !== null ? 2 : 0);
+                    // @phpstan-ignore method.notFound
+                    $result = $ffi->nntmux_book_identity_nul($input, strlen($input), $flags, $score, $runnerUpScore ?? 0.0);
+                    if ($result === 0 || $result === 1) {
+                        return $result === 1;
+                    }
+                } catch (Throwable) {
+                    // Use the same comparisons and thresholds on fallback.
+                }
+            }
+        }
+
+        return $this->candidatePassesIdentityRulesPhp($candidate, $score, $runnerUpScore, $parsed, $scorer);
+    }
+
+    /** @param array<string, mixed> $candidate */
+    public function candidateCompletenessNative(array $candidate): int
+    {
+        // Restrict serialization to the inspected fields and avoid object hooks.
+        $fields = array_intersect_key($candidate, array_flip(['isbn', 'ean', 'publisher', 'publishdate', 'pages', 'overview', 'genre', 'coverurl']));
+        foreach ($fields as $value) {
+            if (! is_scalar($value) && $value !== null) {
+                return $this->candidateCompletenessPhp($candidate);
+            }
+        }
+
+        return BookMatchScorer::rankingInteger(2, serialize($fields)) ?? $this->candidateCompletenessPhp($candidate);
+    }
+
+    /** @param array<string, mixed> $candidate */
+    public function candidateYearTieNative(array $candidate, BookParseResult $parsed): int
+    {
+        if ($parsed->year === null || empty($candidate['publishdate'])) {
+            return 0;
+        }
+
+        if (! is_scalar($candidate['publishdate'])) {
+            return $this->candidateYearTiePhp($candidate, $parsed);
+        }
+
+        return BookMatchScorer::rankingInteger(3, (string) $candidate['publishdate'], $parsed->year)
+            ?? $this->candidateYearTiePhp($candidate, $parsed);
+    }
+
+    /**
      * @return list<BookParseResult>
      */
     private function matchingHypotheses(BookParseResult $parsed): array
@@ -1317,6 +1449,21 @@ class BookService
      * @param  array<string, mixed>  $candidate
      */
     private function candidatePassesIdentityRules(
+        array $candidate,
+        float $score,
+        ?float $runnerUpScore,
+        BookParseResult $parsed,
+        BookMatchScorer $scorer,
+    ): bool {
+        return ($this->useRustFfi ?? false)
+            ? $this->candidatePassesIdentityRulesNative($candidate, $score, $runnerUpScore, $parsed, $scorer)
+            : $this->candidatePassesIdentityRulesPhp($candidate, $score, $runnerUpScore, $parsed, $scorer);
+    }
+
+    /**
+     * @param  array<string, mixed>  $candidate
+     */
+    public function candidatePassesIdentityRulesPhp(
         array $candidate,
         float $score,
         ?float $runnerUpScore,
@@ -1361,6 +1508,12 @@ class BookService
      */
     private function candidateCompleteness(array $candidate): int
     {
+        return ($this->useRustFfi ?? false) ? $this->candidateCompletenessNative($candidate) : $this->candidateCompletenessPhp($candidate);
+    }
+
+    /** @param array<string, mixed> $candidate */
+    public function candidateCompletenessPhp(array $candidate): int
+    {
         $score = 0;
         foreach (['isbn', 'ean', 'publisher', 'publishdate', 'pages', 'overview', 'genre', 'coverurl'] as $field) {
             if (isset($candidate[$field]) && $candidate[$field] !== '') {
@@ -1375,6 +1528,12 @@ class BookService
      * @param  array<string, mixed>  $candidate
      */
     private function candidateYearTie(array $candidate, BookParseResult $parsed): int
+    {
+        return ($this->useRustFfi ?? false) ? $this->candidateYearTieNative($candidate, $parsed) : $this->candidateYearTiePhp($candidate, $parsed);
+    }
+
+    /** @param array<string, mixed> $candidate */
+    public function candidateYearTiePhp(array $candidate, BookParseResult $parsed): int
     {
         if ($parsed->year === null || empty($candidate['publishdate'])) {
             return 0;
