@@ -10,7 +10,10 @@ use App\Services\Yenc\PayloadDecoder;
 use App\Services\Yenc\PhpPayloadDecoder;
 use App\Services\Yenc\RawPayloadDecoder;
 use App\Services\Yenc\YencPart;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use RuntimeException;
+use Throwable;
 
 class YencService
 {
@@ -138,6 +141,35 @@ class YencService
     }
 
     public function encode(string $data, string $filename, int $lineLength = 128, bool $includeCrc32 = true): string
+    {
+        // Preserve PHP validation (including negative lengths) before crossing the unsigned ABI.
+        if (strlen($data) >= 256 && $lineLength > 0 && strpbrk($filename, "\r\n") === false) {
+            static $ffi = null;
+            $ffi ??= RustPipelineLibrary::resolveDomain('yenc_encode', <<<'C'
+                ssize_t nntmux_yenc_encode(const char *data, size_t data_len, const char *filename, size_t filename_len, size_t line_len, uint8_t crc32_flag, char *out, size_t out_cap);
+                C) ?? false;
+            if ($ffi !== false) {
+                try {
+                    $size = strlen($data);
+                    // Each input byte takes at most two bytes plus a CRLF at line length one.
+                    $capacity = 0;
+                    $buffer = RustPipelineLibrary::obtainScratch($ffi, $size * 4 + strlen($filename) + 128, $capacity);
+                    if ($buffer !== null) {
+                        $written = $ffi->nntmux_yenc_encode($data, $size, $filename, strlen($filename), min($lineLength, 254), (int) $includeCrc32, $buffer, $capacity);
+                        if (is_int($written) && $written >= 0 && $written <= $capacity) {
+                            return FFI::string($buffer, $written);
+                        }
+                    }
+                } catch (Throwable) {
+                    // Older libraries or unavailable FFI retain the portable implementation.
+                }
+            }
+        }
+
+        return $this->encodePhp($data, $filename, $lineLength, $includeCrc32);
+    }
+
+    private function encodePhp(string $data, string $filename, int $lineLength = 128, bool $includeCrc32 = true): string
     {
         $lineLength = min($lineLength, 254);
         if ($lineLength < 1) {
