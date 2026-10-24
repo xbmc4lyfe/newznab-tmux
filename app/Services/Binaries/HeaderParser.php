@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace App\Services\Binaries;
 
 use App\Services\BlacklistService;
+use App\Support\RustPipelineLibrary;
+use FFI;
 
 /**
  * Parses and filters raw NNTP headers.
@@ -20,6 +22,13 @@ final class HeaderParser
      * File counter inside a subject base name, such as `[03/62]` or `(3 of 62)`.
      */
     public const string FILE_COUNTER_PATTERN = '/[[(\s](\d{1,5})(\/|[\s_]of[\s_]|-)(\d{1,5})[])[\s$:]/i';
+
+    private const string FFI_CDEF = <<<'C'
+        int64_t nntmux_header_parse_subject(const char *input, size_t len);
+        int64_t nntmux_header_parse_batch(const char *input, size_t len, size_t count, char *out, size_t cap);
+        C;
+
+    private FFI|false|null $subjectFfi = null;
 
     private BlacklistService $blacklistService;
 
@@ -41,8 +50,12 @@ final class HeaderParser
     /** Rust port of markPerArticleObfuscated(); false keeps the PHP rule only, null builds it on first need. */
     private NativePerArticleObfuscation|false|null $native;
 
-    public function __construct(?BlacklistService $blacklistService = null, NativePerArticleObfuscation|false|null $native = null)
-    {
+    public function __construct(
+        ?BlacklistService $blacklistService = null,
+        NativePerArticleObfuscation|false|null $native = null,
+        private readonly ?string $libraryPath = null,
+        private readonly bool $useRust = true
+    ) {
         $this->blacklistService = $blacklistService ?? new BlacklistService;
         $this->native = $native;
     }
@@ -164,6 +177,123 @@ final class HeaderParser
     }
 
     /**
+     * Preserve the original PCRE captures, including raw digit strings and yEnc normalization.
+     *
+     * @return array<int, string>|null
+     */
+    public function parseSubject(string $subject): ?array
+    {
+        // Paired caller benchmarks keep short subjects and negative tail probes on PCRE.
+        $ffi = $this->useRust && self::worthNativeSubject($subject) ? $this->subjectLibrary() : null;
+        if ($ffi !== null) {
+            // @phpstan-ignore method.notFound
+            $packed = $ffi->nntmux_header_parse_subject($subject, \strlen($subject));
+            if (\is_int($packed) && $packed >= 0) {
+                return self::subjectCaptures($subject, $packed);
+            }
+        }
+        if (! preg_match(self::SUBJECT_PATTERN, $subject, $matches)) {
+            return null;
+        }
+        if (stripos($subject, 'yEnc') === false) {
+            $matches[1] .= ' yEnc';
+        }
+
+        return $matches;
+    }
+
+    private static function worthNativeSubject(string $subject): bool
+    {
+        return self::nativeSubjectShape($subject)
+            && (int) ini_get('pcre.backtrack_limit') >= 1000000
+            && (int) ini_get('pcre.recursion_limit') >= 100000
+            && \in_array(setlocale(LC_CTYPE, '0'), ['C', 'POSIX', 'C.UTF-8', 'C.utf8'], true);
+    }
+
+    private static function nativeSubjectShape(string $subject): bool
+    {
+        $length = \strlen($subject);
+
+        return $length >= 768 && $length <= 2048 && $subject[$length - 1] === ')'
+            && preg_match('/\\([0-9]+\\/[0-9]+\\)$/D', $subject) === 1;
+    }
+
+    private function subjectLibrary(): ?FFI
+    {
+        if (! $this->useRust) {
+            return null;
+        }
+        if ($this->subjectFfi === null) {
+            $this->subjectFfi = RustPipelineLibrary::resolveDomain('header_parser', self::FFI_CDEF, $this->libraryPath) ?? false;
+        }
+
+        return $this->subjectFfi === false ? null : $this->subjectFfi;
+    }
+
+    /** @return array<int, string>|null */
+    private static function subjectCaptures(string $subject, int $packed): ?array
+    {
+        if ($packed === 0) {
+            return null;
+        }
+        $start = $packed & 255;
+        $length = ($packed >> 8) & 65535;
+        $partLength = ($packed >> 32) & 255;
+        $totalLength = ($packed >> 40) & 255;
+        $partStart = $start + $length + (($packed >> 24) & 255) + 1;
+        $totalStart = $partStart + $partLength + 1;
+
+        return [
+            substr($subject, 0, $totalStart + $totalLength + 1),
+            substr($subject, $start, $length).(($packed >> 48) === 1 ? ' yEnc' : ''),
+            substr($subject, $partStart, $partLength),
+            substr($subject, $totalStart, $totalLength),
+        ];
+    }
+
+    /**
+     * Copy results before returning: blacklist calls may reuse the shared scratch buffer.
+     *
+     * @param  array<int, array<string, mixed>>  $headers
+     * @return array<int, int>|null
+     */
+    private function batchSubjects(array $headers): ?array
+    {
+        if (\count($headers) < 32) {
+            return null;
+        }
+        $first = reset($headers);
+        if (! isset($first['Subject']) || ! \is_string($first['Subject']) || ! self::worthNativeSubject($first['Subject'])) {
+            return null;
+        }
+        $ffi = $this->subjectLibrary();
+        if ($ffi === null) {
+            return null;
+        }
+        $framed = '';
+        foreach ($headers as $header) {
+            if (! isset($header['Subject']) || ! \is_string($header['Subject']) || ! self::nativeSubjectShape($header['Subject'])) {
+                return null;
+            }
+            $framed .= pack('V', \strlen($header['Subject'])).$header['Subject'];
+        }
+        $needed = \count($headers) * 8;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, $needed);
+        if ($scratch === null) {
+            return null;
+        }
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_header_parse_batch($framed, \strlen($framed), \count($headers), $scratch, $needed);
+        if ($written !== $needed) {
+            return null;
+        }
+        /** @var array<int, int> $packed */
+        $packed = unpack('q*', FFI::string($scratch, $needed));
+
+        return $packed;
+    }
+
+    /**
      * Parse and filter raw headers from NNTP.
      *
      * @param  array<int, array<string, mixed>>  $headers  Raw headers from NNTP
@@ -187,7 +317,11 @@ final class HeaderParser
                 ? array_fill_keys(array_map('intval', $missingParts), true)
                 : $missingParts);
 
+        $nativeSubjects = $this->useRust && ! $partRepair && $this->perArticleObfuscated === []
+            ? $this->batchSubjects($headers) : null;
+        $subjectIndex = 0;
         foreach ($headers as $header) {
+            $subjectIndex++;
             // Check if we got the article
             if (! isset($header['Number'])) {
                 continue;
@@ -210,15 +344,22 @@ final class HeaderParser
             }
 
             // Parse subject to get base name and part/total like "(12/45)"
-            if (! preg_match(self::SUBJECT_PATTERN, $header['Subject'], $matches)) {
-                $this->notYEnc++;
+            if ($nativeSubjects !== null && $nativeSubjects[$subjectIndex] >= 0) {
+                $matches = self::subjectCaptures($header['Subject'], $nativeSubjects[$subjectIndex]);
+                if ($matches === null) {
+                    $this->notYEnc++;
 
-                continue;
-            }
+                    continue;
+                }
+            } else {
+                if (! preg_match(self::SUBJECT_PATTERN, $header['Subject'], $matches)) {
+                    $this->notYEnc++;
 
-            // Normalize to include yEnc if missing
-            if (stripos($header['Subject'], 'yEnc') === false) {
-                $matches[1] .= ' yEnc';
+                    continue;
+                }
+                if (stripos($header['Subject'], 'yEnc') === false) {
+                    $matches[1] .= ' yEnc';
+                }
             }
 
             $header['matches'] = $matches;

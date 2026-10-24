@@ -6,10 +6,32 @@ namespace App\Services;
 
 use App\Enums\BlacklistConstants;
 use App\Models\BinaryBlacklist;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Facades\DB;
 
 class BlacklistService
 {
+    private const string FFI_CDEF = <<<'C'
+        int64_t nntmux_blacklist_compile(const char *input, size_t len, char *out, size_t cap);
+        int32_t nntmux_blacklist_match(const char *rules, size_t rules_len, const char *subject, size_t subject_len, const char *poster, size_t poster_len, const char *message_id, size_t message_id_len);
+        C;
+
+    private FFI|false|null $ffi = null;
+
+    /** @var array<string, string|false> */
+    private array $nativeRules = [];
+
+    private ?string $libraryPath = null;
+
+    private bool $useRust = true;
+
+    public function __construct(?string $libraryPath = null, bool $useRust = true)
+    {
+        $this->libraryPath = $libraryPath;
+        $this->useRust = $useRust;
+    }
+
     /**
      * Cache of lists per group name.
      *
@@ -58,7 +80,20 @@ class BlacklistService
         // Whitelist first: if any whitelist matches, allow; otherwise treat as blacklisted.
         if ($this->whiteList[$groupName]) {
             $blackListed = true;
-            foreach ($this->whiteList[$groupName] as $whiteList) {
+            foreach ($this->whiteList[$groupName] as $index => $whiteList) {
+                // First four rules stay on PHP: early matches do not repay an FFI call.
+                if ($index === 4 && $this->useRust && \count($this->whiteList[$groupName]) >= 32
+                    && ($this->nativeRules[$groupName.':white'] ?? null) !== false) {
+                    $matched = $this->nativeMatch($groupName.':white', $this->whiteList[$groupName], $field);
+                    if ($matched !== null) {
+                        if ($matched > 0) {
+                            $rule = $this->whiteList[$groupName][$matched - 1];
+                            $blackListed = false;
+                            $this->idsToUpdate[$rule->id] = $rule->id;
+                        }
+                        break;
+                    }
+                }
                 if (@preg_match('/'.$whiteList->regex.'/i', $field[$whiteList->msgcol])) {
                     $blackListed = false;
                     $this->idsToUpdate[$whiteList->id] = $whiteList->id;
@@ -68,7 +103,19 @@ class BlacklistService
         }
 
         if (! $blackListed && $this->blackList[$groupName]) {
-            foreach ($this->blackList[$groupName] as $blackList) {
+            foreach ($this->blackList[$groupName] as $index => $blackList) {
+                if ($index === 4 && $this->useRust && \count($this->blackList[$groupName]) >= 32
+                    && ($this->nativeRules[$groupName.':black'] ?? null) !== false) {
+                    $matched = $this->nativeMatch($groupName.':black', $this->blackList[$groupName], $field);
+                    if ($matched !== null) {
+                        if ($matched > 0) {
+                            $rule = $this->blackList[$groupName][$matched - 1];
+                            $blackListed = true;
+                            $this->idsToUpdate[$rule->id] = $rule->id;
+                        }
+                        break;
+                    }
+                }
                 if (@preg_match('/'.$blackList->regex.'/i', $field[$blackList->msgcol])) {
                     $blackListed = true;
                     $this->idsToUpdate[$blackList->id] = $blackList->id;
@@ -78,6 +125,53 @@ class BlacklistService
         }
 
         return $blackListed;
+    }
+
+    /**
+     * Fuse large literal rule lists into one FFI call; arbitrary PCRE stays on PHP.
+     *
+     * @param  list<object>  $rules
+     * @param  array<int, mixed>  $fields
+     */
+    private function nativeMatch(string $key, array $rules, array $fields): ?int
+    {
+        if ((int) ini_get('pcre.backtrack_limit') < 1000000
+            || (int) ini_get('pcre.recursion_limit') < 100000
+            || ! \in_array(setlocale(LC_CTYPE, '0'), ['C', 'POSIX', 'C.UTF-8', 'C.utf8'], true)) {
+            return null;
+        }
+        if ($this->ffi === null) {
+            $this->ffi = RustPipelineLibrary::resolveDomain('header_parser', self::FFI_CDEF, $this->libraryPath) ?? false;
+        }
+        if ($this->ffi === false) {
+            return null;
+        }
+        if (! isset($this->nativeRules[$key])) {
+            $framed = '';
+            foreach ($rules as $rule) {
+                if (! \is_string($rule->regex) || ! \in_array($rule->msgcol, [1, 2, 3, '1', '2', '3'], true)) {
+                    $this->nativeRules[$key] = false;
+
+                    return null;
+                }
+                $framed .= chr((int) $rule->msgcol).pack('V', \strlen($rule->regex)).$rule->regex;
+            }
+            $scratch = RustPipelineLibrary::obtainScratch($this->ffi, \strlen($framed));
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $this->ffi->nntmux_blacklist_compile($framed, \strlen($framed), $scratch, \strlen($framed));
+            $this->nativeRules[$key] = \is_int($written) && $written >= 0 ? FFI::string($scratch, $written) : false;
+        }
+        $plan = $this->nativeRules[$key];
+        if ($plan === false || ! \is_string($fields[1]) || ! \is_string($fields[2]) || ! \is_string($fields[3])) {
+            return null;
+        }
+        // @phpstan-ignore method.notFound
+        $matched = $this->ffi->nntmux_blacklist_match($plan, \strlen($plan), $fields[1], \strlen($fields[1]), $fields[2], \strlen($fields[2]), $fields[3], \strlen($fields[3]));
+
+        return \is_int($matched) && $matched >= 0 ? $matched : null;
     }
 
     /**
@@ -109,7 +203,7 @@ class BlacklistService
     /**
      * Query blacklists from DB.
      *
-     * @return array<string, mixed>
+     * @return list<object>
      */
     public function getBlacklist(bool $activeOnly = true, int|string $opType = -1, string $groupName = '', bool $groupRegex = false): array
     {
