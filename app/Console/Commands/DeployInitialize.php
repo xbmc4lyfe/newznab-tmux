@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace App\Console\Commands;
 
 use App\Models\User;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Console\Command;
 use Illuminate\Encryption\Encrypter;
 use Illuminate\Support\Facades\DB;
@@ -15,9 +17,152 @@ use Throwable;
 
 class DeployInitialize extends Command
 {
+    private const FFI_CDEF = <<<'CDEF'
+int32_t nntmux_deploy_initialize_is_valid_search_driver(const char *driver_ptr, size_t driver_len);
+ssize_t nntmux_deploy_initialize_decode_app_key(
+    const char *key_ptr,
+    size_t key_len,
+    uint8_t *out_buf,
+    size_t out_cap
+);
+int32_t nntmux_deploy_initialize_search_index_command(
+    const char *driver_ptr,
+    size_t driver_len,
+    uint8_t recreate
+);
+CDEF;
+
+    /** Rust stays opt-in: one-time initialization checks are too small for FFI to beat PHP by 1.5x. */
+    private const RUST_FFI_DEFAULT = false;
+
+    private static bool $useRustFfi = self::RUST_FFI_DEFAULT;
+
+    private static FFI|false|null $ffi = null;
+
     protected $signature = 'nntmux:deploy-init';
 
     protected $description = 'Initialize an empty deployment database without replacing data or the application key';
+
+    public static function useRustFfi(bool $enabled = true): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function setUseRustFfi(?bool $useRustFfi): void
+    {
+        self::$useRustFfi = $useRustFfi ?? self::RUST_FFI_DEFAULT;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    public static function resetRustFfi(): void
+    {
+        self::$useRustFfi = self::RUST_FFI_DEFAULT;
+        self::$ffi = null;
+    }
+
+    public static function setFfiForTesting(FFI|false|null $ffi = null): void
+    {
+        self::$ffi = $ffi;
+    }
+
+    public static function isValidSearchDriver(string $driver): bool
+    {
+        return self::$useRustFfi ? self::isValidSearchDriverNative($driver) : self::isValidSearchDriverPhp($driver);
+    }
+
+    public static function isValidSearchDriverPhp(string $driver): bool
+    {
+        return in_array($driver, ['manticore', 'elasticsearch'], true);
+    }
+
+    public static function isValidSearchDriverNative(string $driver): bool
+    {
+        // @phpstan-ignore method.notFound
+        $result = self::callNative(static fn (FFI $ffi): mixed => $ffi->nntmux_deploy_initialize_is_valid_search_driver($driver, strlen($driver)));
+
+        return match ($result) {
+            1 => true,
+            0 => false,
+            default => self::isValidSearchDriverPhp($driver),
+        };
+    }
+
+    /**
+     * Returns the raw key bytes; an invalid `base64:` payload decodes to an empty string.
+     */
+    public static function decodeAppKeyValue(string $key): string
+    {
+        return self::$useRustFfi ? self::decodeAppKeyValueNative($key) : self::decodeAppKeyValuePhp($key);
+    }
+
+    public static function decodeAppKeyValuePhp(string $key): string
+    {
+        return str_starts_with($key, 'base64:') ? (string) base64_decode(substr($key, 7), true) : $key;
+    }
+
+    public static function decodeAppKeyValueNative(string $key): string
+    {
+        $cap = strlen($key) + 1;
+        $result = self::callNative(static function (FFI $ffi) use ($key, $cap): ?string {
+            $out = $ffi->new("uint8_t[{$cap}]");
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_deploy_initialize_decode_app_key($key, strlen($key), $out, $cap);
+
+            return is_int($written) && $written >= 0 && $written <= $cap ? FFI::string($out, $written) : null;
+        });
+
+        return is_string($result) ? $result : self::decodeAppKeyValuePhp($key);
+    }
+
+    /**
+     * @return array{string, array<string, bool>} The search index command and its options.
+     */
+    public static function resolveSearchIndexCommand(string $driver, bool $recreate): array
+    {
+        return self::$useRustFfi ? self::resolveSearchIndexCommandNative($driver, $recreate) : self::resolveSearchIndexCommandPhp($driver, $recreate);
+    }
+
+    /**
+     * @return array{string, array<string, bool>}
+     */
+    public static function resolveSearchIndexCommandPhp(string $driver, bool $recreate): array
+    {
+        $options = ['--no-interaction' => true];
+        if ($driver === 'elasticsearch') {
+            if (! $recreate) {
+                $options['--create-missing'] = true;
+            }
+
+            return ['nntmux:create-es-indexes', $options];
+        }
+
+        if ($recreate) {
+            $options['--drop'] = true;
+        }
+
+        return ['manticore:create-indexes', $options];
+    }
+
+    /**
+     * @return array{string, array<string, bool>}
+     */
+    public static function resolveSearchIndexCommandNative(string $driver, bool $recreate): array
+    {
+        // @phpstan-ignore method.notFound
+        $code = self::callNative(static fn (FFI $ffi): mixed => $ffi->nntmux_deploy_initialize_search_index_command($driver, strlen($driver), $recreate ? 1 : 0));
+
+        return match ($code) {
+            0 => ['manticore:create-indexes', ['--no-interaction' => true]],
+            1 => ['manticore:create-indexes', ['--no-interaction' => true, '--drop' => true]],
+            2 => ['nntmux:create-es-indexes', ['--no-interaction' => true, '--create-missing' => true]],
+            3 => ['nntmux:create-es-indexes', ['--no-interaction' => true]],
+            default => self::resolveSearchIndexCommandPhp($driver, $recreate),
+        };
+    }
 
     public function handle(): int
     {
@@ -60,11 +205,8 @@ class DeployInitialize extends Command
                 throw new RuntimeException('Administrator or configuration verification failed.');
             }
 
-            $searchCommand = config('search.default') === 'elasticsearch' ? 'nntmux:create-es-indexes' : 'manticore:create-indexes';
-            $searchOptions = ['--no-interaction' => true];
-            if (config('search.default') === 'elasticsearch') {
-                $searchOptions['--create-missing'] = true;
-            }
+            // validateConfiguration() guarantees a supported string driver.
+            [$searchCommand, $searchOptions] = self::resolveSearchIndexCommand((string) config('search.default'), false);
             if ($this->call($searchCommand, $searchOptions) !== self::SUCCESS) {
                 throw new RuntimeException('Search initialization failed; initialization remains incomplete.');
             }
@@ -94,7 +236,8 @@ class DeployInitialize extends Command
 
     private function validateConfiguration(): void
     {
-        if (! in_array(config('search.default'), ['manticore', 'elasticsearch'], true)) {
+        $driver = config('search.default');
+        if (! is_string($driver) || ! self::isValidSearchDriver($driver)) {
             throw new RuntimeException('Unsupported deployment search driver.');
         }
 
@@ -102,8 +245,9 @@ class DeployInitialize extends Command
         if (! is_string($key)) {
             throw new RuntimeException('A valid APP_KEY must be supplied before initialization.');
         }
-        $decoded = str_starts_with($key, 'base64:') ? base64_decode(substr($key, 7), true) : $key;
-        if ($decoded === false || ! Encrypter::supported($decoded, config('app.cipher'))) {
+        // An invalid base64 payload decodes to '', which no cipher supports.
+        $decoded = self::decodeAppKeyValue($key);
+        if ($decoded === '' || ! Encrypter::supported($decoded, config('app.cipher'))) {
             throw new RuntimeException('A valid APP_KEY must be supplied before initialization.');
         }
 
@@ -121,5 +265,38 @@ class DeployInitialize extends Command
             $id = User::add(config('nntmux.admin_username'), config('nntmux.admin_password'), config('nntmux.admin_email'), 2);
             User::findOrFail($id)->markEmailAsVerified();
         });
+    }
+
+    /**
+     * @param  callable(FFI): mixed  $call
+     */
+    private static function callNative(callable $call): mixed
+    {
+        $ffi = self::additionalFfi();
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+
+        try {
+            return $call($ffi);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private static function additionalFfi(): ?FFI
+    {
+        if (self::$ffi === false) {
+            return null;
+        }
+
+        if (self::$ffi instanceof FFI) {
+            return self::$ffi;
+        }
+
+        $ffi = RustPipelineLibrary::resolveDomain('additional', self::FFI_CDEF);
+        self::$ffi = $ffi ?? false;
+
+        return $ffi;
     }
 }

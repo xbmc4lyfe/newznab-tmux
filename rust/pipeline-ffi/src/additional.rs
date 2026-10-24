@@ -23989,3 +23989,652 @@ mod wave30_additional_postprocess_health_commands_tests {
         );
     }
 }
+// ---------------------------------------------------------------------------
+// Wave 31 Slice 31.6: InstallMonitoring, CollectSystemMetrics,
+// ExportMonitoringMetrics, DeployInitialize, and TmuxAttach command helpers
+// ---------------------------------------------------------------------------
+
+const W316_WEB_SERVERS: [&[u8]; 2] = [b"nginx", b"apache"];
+const W316_SUPPORTED_UBUNTU: [&[u8]; 2] = [b"22.04", b"24.04"];
+const W316_SEARCH_DRIVERS: [&[u8]; 2] = [b"manticore", b"elasticsearch"];
+const W316_APP_KEY_BASE64_PREFIX: &[u8] = b"base64:";
+
+const W316_EXPORT_MODE_PRINT: i32 = 0;
+const W316_EXPORT_MODE_DISABLED: i32 = 1;
+const W316_EXPORT_MODE_PUSH: i32 = 2;
+const W316_EXPORT_MODE_PUSH_WITH_ALARM: i32 = 3;
+
+const W316_SEARCH_MANTICORE: i32 = 0;
+const W316_SEARCH_MANTICORE_DROP: i32 = 1;
+const W316_SEARCH_ES_CREATE_MISSING: i32 = 2;
+const W316_SEARCH_ES_RECREATE: i32 = 3;
+
+/// Runs `body` with a validated input slice, returning `-1` for invalid pointers or panics.
+#[inline]
+unsafe fn w316_with_slice<T>(
+    ptr: *const u8,
+    len: usize,
+    invalid: T,
+    body: impl FnOnce(&[u8]) -> T,
+) -> T {
+    match unsafe { add23_valid_slice(ptr, len, ADD23_MAX_SEG_LEN) } {
+        Some(bytes) => body(bytes),
+        None => invalid,
+    }
+}
+
+#[inline]
+unsafe fn w316_membership(ptr: *const u8, len: usize, set: &[&[u8]]) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        w316_with_slice(ptr, len, -1, |value| i32::from(set.contains(&value)))
+    }))
+    .unwrap_or(-1)
+}
+
+#[inline]
+unsafe fn w316_prefixed_message(
+    prefix: &[u8],
+    value_ptr: *const u8,
+    value_len: usize,
+    suffix: &[u8],
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        w316_with_slice(value_ptr, value_len, -1, |value| {
+            add23_write_slices(out_buf, out_cap, &[prefix, value, suffix], 1)
+        })
+    }))
+    .unwrap_or(-1)
+}
+
+/// PHP's strict `base64_decode($value, true)`: skips `\t \n \r` and spaces, fails on any other
+/// non-alphabet byte, data after padding, a dangling single sextet, or a wrong padding length.
+/// Trailing bits of a partial group are discarded without validation, as in PHP.
+fn w316_php_base64_decode_strict(input: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len() / 4 * 3 + 3);
+    let mut padding = 0usize;
+    let mut sextets = 0usize;
+    let mut pending = 0u8;
+    for &byte in input {
+        if byte == b'=' {
+            padding += 1;
+            continue;
+        }
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'\t' | b'\n' | b'\r' | b' ' => continue,
+            _ => return None,
+        };
+        if padding > 0 {
+            return None;
+        }
+        match sextets % 4 {
+            0 => pending = value << 2,
+            1 => {
+                out.push(pending | (value >> 4));
+                pending = (value & 0x0f) << 4;
+            }
+            2 => {
+                out.push(pending | (value >> 2));
+                pending = (value & 0x03) << 6;
+            }
+            _ => out.push(pending | value),
+        }
+        sextets += 1;
+    }
+    if sextets % 4 == 1 {
+        return None;
+    }
+    if padding > 0 && (padding > 2 || !(sextets + padding).is_multiple_of(4)) {
+        return None;
+    }
+    Some(out)
+}
+
+/// `InstallMonitoring::isValidWebServer()`: `in_array($webServer, ['nginx', 'apache'], true)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_install_monitoring_is_valid_web_server(
+    value_ptr: *const u8,
+    value_len: usize,
+) -> i32 {
+    unsafe { w316_membership(value_ptr, value_len, &W316_WEB_SERVERS) }
+}
+
+/// `InstallMonitoring::isSupportedUbuntuVersion()`: `in_array($version, SUPPORTED_UBUNTU, true)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_install_monitoring_is_supported_ubuntu_version(
+    value_ptr: *const u8,
+    value_len: usize,
+) -> i32 {
+    unsafe { w316_membership(value_ptr, value_len, &W316_SUPPORTED_UBUNTU) }
+}
+
+/// `InstallMonitoring::formatProjectRelativePath()`: strips `rtrim($basePath, '/').'/'` from the
+/// start of `$path` when present, otherwise returns `$path` unchanged.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_install_monitoring_project_relative_path(
+    base_ptr: *const u8,
+    base_len: usize,
+    path_ptr: *const u8,
+    path_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (Some(base), Some(path)) = (unsafe {
+            (
+                add23_valid_slice(base_ptr, base_len, ADD23_MAX_SEG_LEN),
+                add23_valid_slice(path_ptr, path_len, ADD23_MAX_SEG_LEN),
+            )
+        }) else {
+            return -1;
+        };
+        let mut end = base.len();
+        while end > 0 && base[end - 1] == b'/' {
+            end -= 1;
+        }
+        let trimmed = &base[..end];
+        let relative = if path.len() > trimmed.len()
+            && path.starts_with(trimmed)
+            && path[trimmed.len()] == b'/'
+        {
+            &path[trimmed.len() + 1..]
+        } else {
+            path
+        };
+        unsafe { add23_write_slices(out_buf, out_cap, &[relative], 1) }
+    }))
+    .unwrap_or(-1)
+}
+
+/// `CollectSystemMetrics::formatDeletedMetricsMessage()`: `"Deleted {$deleted} old metric records."`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_collect_system_metrics_format_deleted_message(
+    deleted: i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let deleted = deleted.to_string();
+        unsafe {
+            add23_write_slices(
+                out_buf,
+                out_cap,
+                &[b"Deleted ", deleted.as_bytes(), b" old metric records."],
+                1,
+            )
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// `CollectSystemMetrics::formatErrorMessage()`: `"Failed to collect system metrics: {$message}"`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_collect_system_metrics_format_error_message(
+    message_ptr: *const u8,
+    message_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    unsafe {
+        w316_prefixed_message(
+            b"Failed to collect system metrics: ",
+            message_ptr,
+            message_len,
+            b"",
+            out_buf,
+            out_cap,
+        )
+    }
+}
+
+/// `ExportMonitoringMetrics::resolveExportMode()`: `0` print, `1` disabled (monitoring off or a
+/// PHP-`trim()`-blank Pushgateway URL), `2` push, `3` push with the PCNTL alarm; `-1` on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_export_monitoring_metrics_resolve_export_mode(
+    print_only: u8,
+    enabled: u8,
+    url_ptr: *const u8,
+    url_len: usize,
+    has_pcntl: u8,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        w316_with_slice(url_ptr, url_len, -1, |url| {
+            if print_only != 0 {
+                W316_EXPORT_MODE_PRINT
+            } else if enabled == 0 || w306_php_trim(url).is_empty() {
+                W316_EXPORT_MODE_DISABLED
+            } else if has_pcntl != 0 {
+                W316_EXPORT_MODE_PUSH_WITH_ALARM
+            } else {
+                W316_EXPORT_MODE_PUSH
+            }
+        })
+    }))
+    .unwrap_or(-1)
+}
+
+/// `ExportMonitoringMetrics::formatExportFailureMessage()`: `"Monitoring metrics export failed: {$message}"`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_export_monitoring_metrics_format_failure_message(
+    message_ptr: *const u8,
+    message_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    unsafe {
+        w316_prefixed_message(
+            b"Monitoring metrics export failed: ",
+            message_ptr,
+            message_len,
+            b"",
+            out_buf,
+            out_cap,
+        )
+    }
+}
+
+/// `DeployInitialize::isValidSearchDriver()`: `in_array($driver, ['manticore', 'elasticsearch'], true)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_deploy_initialize_is_valid_search_driver(
+    driver_ptr: *const u8,
+    driver_len: usize,
+) -> i32 {
+    unsafe { w316_membership(driver_ptr, driver_len, &W316_SEARCH_DRIVERS) }
+}
+
+/// `DeployInitialize::decodeAppKeyValue()`: strict base64 decoding of a `base64:` key (an invalid
+/// payload yields an empty string, like `(string) false`); other keys are returned unchanged.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_deploy_initialize_decode_app_key(
+    key_ptr: *const u8,
+    key_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        w316_with_slice(key_ptr, key_len, -1, |key| {
+            match key.strip_prefix(W316_APP_KEY_BASE64_PREFIX) {
+                Some(payload) => {
+                    let decoded = w316_php_base64_decode_strict(payload).unwrap_or_default();
+                    add23_write_slices(out_buf, out_cap, &[&decoded], 1)
+                }
+                None => add23_write_slices(out_buf, out_cap, &[key], 1),
+            }
+        })
+    }))
+    .unwrap_or(-1)
+}
+
+/// `DeployInitialize::resolveSearchIndexCommand()`: `0` manticore, `1` manticore with `--drop`,
+/// `2` Elasticsearch with `--create-missing`, `3` Elasticsearch recreate; `-1` on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_deploy_initialize_search_index_command(
+    driver_ptr: *const u8,
+    driver_len: usize,
+    recreate: u8,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        w316_with_slice(driver_ptr, driver_len, -1, |driver| {
+            match (driver == b"elasticsearch", recreate != 0) {
+                (true, false) => W316_SEARCH_ES_CREATE_MISSING,
+                (true, true) => W316_SEARCH_ES_RECREATE,
+                (false, false) => W316_SEARCH_MANTICORE,
+                (false, true) => W316_SEARCH_MANTICORE_DROP,
+            }
+        })
+    }))
+    .unwrap_or(-1)
+}
+
+/// `TmuxAttach::resolveSessionName()`: `$optionSession ?? $defaultSession`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_tmux_attach_resolve_session_name(
+    has_option: u8,
+    option_ptr: *const u8,
+    option_len: usize,
+    default_ptr: *const u8,
+    default_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (ptr, len) = if has_option != 0 {
+            (option_ptr, option_len)
+        } else {
+            (default_ptr, default_len)
+        };
+        unsafe {
+            w316_with_slice(ptr, len, -1, |name| {
+                add23_write_slices(out_buf, out_cap, &[name], 1)
+            })
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// `TmuxAttach::formatAttachingMessage()`: `"Attaching to tmux session: {$sessionName}"`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_tmux_attach_format_attaching_message(
+    name_ptr: *const u8,
+    name_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    unsafe {
+        w316_prefixed_message(
+            b"Attaching to tmux session: ",
+            name_ptr,
+            name_len,
+            b"",
+            out_buf,
+            out_cap,
+        )
+    }
+}
+
+/// `TmuxAttach::formatSessionNotFoundMessage()`: `"Tmux session \"{$sessionName}\" does not exist."`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_tmux_attach_format_session_not_found_message(
+    name_ptr: *const u8,
+    name_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    unsafe {
+        w316_prefixed_message(
+            b"Tmux session \"",
+            name_ptr,
+            name_len,
+            b"\" does not exist.",
+            out_buf,
+            out_cap,
+        )
+    }
+}
+
+#[cfg(test)]
+mod wave31_monitoring_metrics_deploy_tmux_attach_commands_tests {
+    use super::*;
+
+    fn call_out(f: impl FnOnce(*mut u8, usize) -> isize) -> Option<Vec<u8>> {
+        let mut buf = vec![0u8; 512];
+        let written = f(buf.as_mut_ptr(), buf.len());
+        (written >= 0).then(|| buf[..written as usize].to_vec())
+    }
+
+    #[test]
+    fn install_monitoring_helpers_match_php_contracts() {
+        for (value, web, ubuntu) in [
+            (&b"nginx"[..], 1, 0),
+            (b"apache", 1, 0),
+            (b"Nginx", 0, 0),
+            (b"nginx ", 0, 0),
+            (b"nginx\0", 0, 0),
+            (b"22.04", 0, 1),
+            (b"24.04", 0, 1),
+            (b"20.04", 0, 0),
+            (b"", 0, 0),
+        ] {
+            assert_eq!(
+                unsafe {
+                    nntmux_install_monitoring_is_valid_web_server(value.as_ptr(), value.len())
+                },
+                web
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_install_monitoring_is_supported_ubuntu_version(
+                        value.as_ptr(),
+                        value.len(),
+                    )
+                },
+                ubuntu
+            );
+        }
+        for (base, path, expected) in [
+            (&b"/app"[..], &b"/app/storage/key"[..], &b"storage/key"[..]),
+            (b"/app///", b"/app/storage", b"storage"),
+            (b"/app", b"/app/", b""),
+            (b"/app", b"/app", b"/app"),
+            (b"/app", b"/application/x", b"/application/x"),
+            (b"", b"/abs", b"abs"),
+            (b"/", b"rel", b"rel"),
+            ("/é\0".as_bytes(), "/é\0/ü".as_bytes(), "ü".as_bytes()),
+        ] {
+            let got = call_out(|out, cap| unsafe {
+                nntmux_install_monitoring_project_relative_path(
+                    base.as_ptr(),
+                    base.len(),
+                    path.as_ptr(),
+                    path.len(),
+                    out,
+                    cap,
+                )
+            });
+            assert_eq!(got.as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn metrics_and_export_helpers_match_php_contracts() {
+        for (deleted, expected) in [
+            (0i64, &b"Deleted 0 old metric records."[..]),
+            (-3, b"Deleted -3 old metric records."),
+            (
+                i64::MIN,
+                b"Deleted -9223372036854775808 old metric records.",
+            ),
+        ] {
+            let got = call_out(|out, cap| unsafe {
+                nntmux_collect_system_metrics_format_deleted_message(deleted, out, cap)
+            });
+            assert_eq!(got.as_deref(), Some(expected));
+        }
+        let message = "é\0x".as_bytes();
+        let got = call_out(|out, cap| unsafe {
+            nntmux_collect_system_metrics_format_error_message(
+                message.as_ptr(),
+                message.len(),
+                out,
+                cap,
+            )
+        });
+        assert_eq!(
+            got.as_deref(),
+            Some("Failed to collect system metrics: é\0x".as_bytes())
+        );
+        let got = call_out(|out, cap| unsafe {
+            nntmux_export_monitoring_metrics_format_failure_message(b"".as_ptr(), 0, out, cap)
+        });
+        assert_eq!(
+            got.as_deref(),
+            Some(&b"Monitoring metrics export failed: "[..])
+        );
+
+        for (print, enabled, url, pcntl, expected) in [
+            (1u8, 0u8, &b""[..], 0u8, W316_EXPORT_MODE_PRINT),
+            (0, 0, b"http://x", 1, W316_EXPORT_MODE_DISABLED),
+            (0, 1, b" \t\n\r\0\x0b", 1, W316_EXPORT_MODE_DISABLED),
+            (0, 1, b"\x0c", 0, W316_EXPORT_MODE_PUSH),
+            (0, 1, b"http://x", 0, W316_EXPORT_MODE_PUSH),
+            (0, 1, b"http://x", 1, W316_EXPORT_MODE_PUSH_WITH_ALARM),
+        ] {
+            assert_eq!(
+                unsafe {
+                    nntmux_export_monitoring_metrics_resolve_export_mode(
+                        print,
+                        enabled,
+                        url.as_ptr(),
+                        url.len(),
+                        pcntl,
+                    )
+                },
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn deploy_initialize_helpers_match_php_contracts() {
+        for (driver, valid, plain, recreate) in [
+            (
+                &b"manticore"[..],
+                1,
+                W316_SEARCH_MANTICORE,
+                W316_SEARCH_MANTICORE_DROP,
+            ),
+            (
+                b"elasticsearch",
+                1,
+                W316_SEARCH_ES_CREATE_MISSING,
+                W316_SEARCH_ES_RECREATE,
+            ),
+            (
+                b"Elasticsearch",
+                0,
+                W316_SEARCH_MANTICORE,
+                W316_SEARCH_MANTICORE_DROP,
+            ),
+            (b"", 0, W316_SEARCH_MANTICORE, W316_SEARCH_MANTICORE_DROP),
+        ] {
+            assert_eq!(
+                unsafe {
+                    nntmux_deploy_initialize_is_valid_search_driver(driver.as_ptr(), driver.len())
+                },
+                valid
+            );
+            for (flag, expected) in [(0u8, plain), (1u8, recreate)] {
+                assert_eq!(
+                    unsafe {
+                        nntmux_deploy_initialize_search_index_command(
+                            driver.as_ptr(),
+                            driver.len(),
+                            flag,
+                        )
+                    },
+                    expected
+                );
+            }
+        }
+
+        for (key, expected) in [
+            (&b"plain-key"[..], &b"plain-key"[..]),
+            (b"base64:", b""),
+            (b"base64:QUJD", b"ABC"),
+            (b"base64:QUI=", b"AB"),
+            (b"base64:QQ==", b"A"),
+            (b"base64:QQ", b"A"),
+            (b"base64:QR==", b"A"),
+            (b"base64: Q Q\t=\n=\r", b"A"),
+            (b"base64:QQ==QQ", b""),
+            (b"base64:QQ=", b""),
+            (b"base64:Q", b""),
+            (b"base64:QQ===", b""),
+            (b"base64:=", b""),
+            (b"base64:QQ\x0b", b""),
+            (b"base64:QQ-_", b""),
+            (b"base64:AA==", b"\0"),
+            (b"Base64:QUJD", b"Base64:QUJD"),
+        ] {
+            let got = call_out(|out, cap| unsafe {
+                nntmux_deploy_initialize_decode_app_key(key.as_ptr(), key.len(), out, cap)
+            });
+            assert_eq!(got.as_deref(), Some(expected), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn tmux_attach_helpers_match_php_contracts() {
+        let option = "sé\0s".as_bytes();
+        let default = b"nntmux";
+        for (has_option, expected) in [(1u8, option), (0u8, &default[..])] {
+            let got = call_out(|out, cap| unsafe {
+                nntmux_tmux_attach_resolve_session_name(
+                    has_option,
+                    option.as_ptr(),
+                    option.len(),
+                    default.as_ptr(),
+                    default.len(),
+                    out,
+                    cap,
+                )
+            });
+            assert_eq!(got.as_deref(), Some(expected));
+        }
+        let got = call_out(|out, cap| unsafe {
+            nntmux_tmux_attach_resolve_session_name(
+                1,
+                b"".as_ptr(),
+                0,
+                std::ptr::null(),
+                0,
+                out,
+                cap,
+            )
+        });
+        assert_eq!(got.as_deref(), Some(&b""[..]));
+        let got = call_out(|out, cap| unsafe {
+            nntmux_tmux_attach_format_attaching_message(option.as_ptr(), option.len(), out, cap)
+        });
+        assert_eq!(
+            got.as_deref(),
+            Some("Attaching to tmux session: sé\0s".as_bytes())
+        );
+        let got = call_out(|out, cap| unsafe {
+            nntmux_tmux_attach_format_session_not_found_message(b"a\"b".as_ptr(), 3, out, cap)
+        });
+        assert_eq!(
+            got.as_deref(),
+            Some(&b"Tmux session \"a\"b\" does not exist."[..])
+        );
+    }
+
+    #[test]
+    fn entrypoints_reject_null_and_undersized_buffers() {
+        assert_eq!(
+            unsafe { nntmux_install_monitoring_is_valid_web_server(std::ptr::null(), 0) },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_export_monitoring_metrics_resolve_export_mode(1, 1, std::ptr::null(), 0, 1)
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_deploy_initialize_search_index_command(std::ptr::null(), 0, 0) },
+            -1
+        );
+        let mut small = [0x5Au8; 4];
+        assert_eq!(
+            unsafe {
+                nntmux_tmux_attach_format_attaching_message(
+                    b"x".as_ptr(),
+                    1,
+                    small.as_mut_ptr(),
+                    small.len(),
+                )
+            },
+            -28
+        );
+        assert_eq!(small, [0x5Au8; 4]);
+        assert_eq!(
+            unsafe {
+                nntmux_collect_system_metrics_format_deleted_message(1, std::ptr::null_mut(), 64)
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_deploy_initialize_decode_app_key(b"k".as_ptr(), 1, std::ptr::null_mut(), 8)
+            },
+            -1
+        );
+    }
+}
