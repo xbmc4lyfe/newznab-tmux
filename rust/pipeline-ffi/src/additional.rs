@@ -15406,3 +15406,897 @@ mod wave21_forking_mediainfo_enum_tests {
         assert_eq!(unsafe { nntmux_aenum_rank(-1, 0) }, -1);
     }
 }
+// ---------------------------------------------------------------------------
+// Wave 22: UpdateDomainConfigurationRequest, RegistrationStatusService,
+// RegistrationPeriod, Content and SiteLogoService helpers.
+// ---------------------------------------------------------------------------
+
+/// `preg_split('/[\s,]+/')` separators: PCRE2 `\s` (including VT) and comma.
+#[inline]
+fn w22_is_color_separator(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | 0x0B | 0x0C | b'\r' | b',')
+}
+
+/// `preg_split('/[\s,]+/', trim($raw), -1, PREG_SPLIT_NO_EMPTY)` tokens.
+fn w22_color_tokens(raw: &[u8]) -> impl Iterator<Item = &[u8]> {
+    trim_php(raw)
+        .split(|&byte| w22_is_color_separator(byte))
+        .filter(|token| !token.is_empty())
+}
+
+/// PHP `(int) $token` for a separator-free token, or `None` when the token has a fraction or
+/// exponent part (PHP would parse it as a float; the caller falls back to PHP).
+fn w22_php_int(token: &[u8]) -> Option<i64> {
+    let (negative, digits) = match token.first() {
+        Some(b'-') => (true, &token[1..]),
+        Some(b'+') => (false, &token[1..]),
+        _ => (false, token),
+    };
+    let count = digits
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if matches!(digits.get(count), Some(b'.' | b'e' | b'E')) {
+        return None;
+    }
+    let mut value: i64 = 0;
+    for &byte in &digits[..count] {
+        let digit = i64::from(byte - b'0');
+        // Out-of-range integers become floats that `(int)` caps at the integer bounds.
+        value = match value.checked_mul(10).and_then(|scaled| {
+            if negative {
+                scaled.checked_sub(digit)
+            } else {
+                scaled.checked_add(digit)
+            }
+        }) {
+            Some(next) => next,
+            None => return Some(if negative { i64::MIN } else { i64::MAX }),
+        };
+    }
+    Some(value)
+}
+
+/// `UpdateDomainConfigurationRequest::colorExclusions`: the unique `(int)` values in first-seen
+/// order. Returns the count written to `out`, -2 when a token needs PHP float parsing, -3 when
+/// `cap` is too small (nothing is written), or -1 for invalid input.
+///
+/// # Safety
+/// A non-null `raw` must be readable for `raw_len` bytes; a non-null `out` must be aligned
+/// and writable for `cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_domcfg_color_exclusions(
+    raw: *const u8,
+    raw_len: usize,
+    out: *mut i64,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: forwarded caller contract.
+        let Some(raw) = (unsafe { w19pc_bytes(raw, raw_len) }) else {
+            return -1;
+        };
+        if !w19pc_slice_ok(out.cast_const(), cap) {
+            return -1;
+        }
+        let mut values: Vec<i64> = Vec::new();
+        let mut seen: Option<std::collections::HashSet<i64>> = None;
+        for token in w22_color_tokens(raw) {
+            let Some(value) = w22_php_int(token) else {
+                return -2;
+            };
+            let duplicate = match seen.as_mut() {
+                Some(set) => !set.insert(value),
+                None => values.contains(&value),
+            };
+            if duplicate {
+                continue;
+            }
+            values.push(value);
+            if seen.is_none() && values.len() > 32 {
+                seen = Some(values.iter().copied().collect());
+            }
+        }
+        if values.len() > cap {
+            return -3;
+        }
+        // SAFETY: `out` is non-null, aligned and writable for `cap >= values.len()` values.
+        unsafe { std::slice::from_raw_parts_mut(out, values.len()) }.copy_from_slice(&values);
+        values.len() as isize
+    }))
+    .unwrap_or(-1)
+}
+
+/// Tmux `color_exclusions` validation messages joined by `\n` (tokens never contain one).
+fn w22_color_exclusion_errors(raw: &[u8], start: i64, end: i64) -> Vec<u8> {
+    let mut text = Vec::new();
+    for token in w22_color_tokens(raw) {
+        let digits_only = token.iter().all(u8::is_ascii_digit);
+        let color = if digits_only {
+            w22_php_int(token)
+        } else {
+            None
+        };
+        if color.is_some_and(|color| color <= 255 && color >= start && color <= end) {
+            continue;
+        }
+        if !text.is_empty() {
+            text.push(b'\n');
+        }
+        text.extend_from_slice(b"Excluded color ");
+        match color {
+            Some(color) if color <= 255 => {
+                text.extend_from_slice(color.to_string().as_bytes());
+                text.extend_from_slice(b" must be inside the configured color range.");
+            }
+            _ => {
+                text.extend_from_slice(token);
+                text.extend_from_slice(b" must be an integer from 0 through 255.");
+            }
+        }
+    }
+    text
+}
+
+/// `UpdateDomainConfigurationRequest::colorExclusionErrors`: every `color_exclusions` message
+/// in order, joined by `\n`. Returns the length (0 when valid), `-(needed)` when `cap` is too
+/// small (nothing is written), or -1 for invalid input.
+///
+/// # Safety
+/// A non-null `raw` must be readable for `raw_len` bytes; a non-null `out` must be writable
+/// for `cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_domcfg_color_exclusion_errors(
+    raw: *const u8,
+    raw_len: usize,
+    start: i64,
+    end: i64,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: forwarded caller contract.
+        let Some(raw) = (unsafe { w19pc_bytes(raw, raw_len) }) else {
+            return -1;
+        };
+        let text = w22_color_exclusion_errors(raw, start, end);
+        // SAFETY: `out` validity is checked by `w19pc_write`; the caller guarantees `cap`
+        // writable bytes.
+        unsafe { w19pc_write(out, cap, &text) }
+    }))
+    .unwrap_or(-1)
+}
+
+/// `UpdateDomainConfigurationRequest` range checks: kind 0 is the tmux color range (`a` start,
+/// `b` end; invalid when `start >= end`), kind 1 a byte size pair (`a` minimum, `b` maximum;
+/// invalid when the maximum is positive and below the minimum). Returns 1 when invalid, 0
+/// when valid, or -1 for an unknown kind.
+///
+/// # Safety
+/// Takes no pointers; any argument values are accepted.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_domcfg_range_invalid(kind: i32, a: i64, b: i64) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match kind {
+        0 => i32::from(a >= b),
+        1 => i32::from(b > 0 && a > b),
+        _ => -1,
+    }))
+    .unwrap_or(-1)
+}
+
+/// `RegistrationStatus::label()` by backing value, `Unknown` otherwise.
+fn w22_registration_label(status: i64) -> &'static [u8] {
+    match status {
+        0 => b"Open",
+        1 => b"Invite",
+        2 => b"Closed",
+        _ => b"Unknown",
+    }
+}
+
+/// `RegistrationStatusService` decision bits written to `out[1]`.
+const W22_REG_OVERRIDE: i64 = 1;
+const W22_REG_AVAILABLE: i64 = 2;
+const W22_REG_OPEN: i64 = 4;
+const W22_REG_INVITE: i64 = 8;
+const W22_REG_CLOSED: i64 = 16;
+
+/// `RegistrationStatusService::decide`: writes `[effective status, flag bits, reason index]`
+/// to `out` (reasons: scheduled_open_period, manual_open, manual_invite, manual_closed).
+/// Returns 0, or -1 for invalid input.
+///
+/// # Safety
+/// A non-null `out` must be aligned and writable for three values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_regstatus_decide(
+    manual_status: i64,
+    has_active_period: i32,
+    out: *mut i64,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !w19pc_slice_ok(out.cast_const(), 3) {
+            return -1;
+        }
+        let active = has_active_period != 0;
+        let scheduled_override = active && manual_status != 0;
+        let effective = if active { 0 } else { manual_status };
+        let reason = match effective {
+            _ if scheduled_override => 0,
+            0 => 1,
+            1 => 2,
+            _ => 3,
+        };
+        let mut flags = 0;
+        if scheduled_override {
+            flags |= W22_REG_OVERRIDE;
+        }
+        if effective != 2 {
+            flags |= W22_REG_AVAILABLE;
+        }
+        flags |= match effective {
+            0 => W22_REG_OPEN,
+            1 => W22_REG_INVITE,
+            2 => W22_REG_CLOSED,
+            _ => 0,
+        };
+        // SAFETY: `out` is non-null, aligned and writable for three values.
+        unsafe { std::slice::from_raw_parts_mut(out, 3) }
+            .copy_from_slice(&[effective, flags, reason]);
+        0
+    }))
+    .unwrap_or(-1)
+}
+
+/// `RegistrationStatusService::normalizeManualStatus`: a known status, otherwise Open (0).
+/// Returns -1 only on an internal failure.
+///
+/// # Safety
+/// Takes no pointers; any argument values are accepted.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_regstatus_normalize_manual(status: i64) -> i64 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if (0..=2).contains(&status) { status } else { 0 }
+    }))
+    .unwrap_or(-1)
+}
+
+/// `RegistrationStatusService` text kinds for `nntmux_regstatus_text`.
+const W22_REG_TEXT_LABEL: i32 = 0;
+const W22_REG_TEXT_MESSAGE: i32 = 1;
+const W22_REG_TEXT_MANUAL_CHANGE: i32 = 2;
+const W22_REG_TEXT_PERIOD: i32 = 3;
+
+/// Scheduled period audit description suffixes, indexed by `RegistrationStatusService`
+/// period event.
+const W22_PERIOD_EVENTS: [&[u8]; 6] = [
+    b"\" created.",
+    b"\" updated.",
+    b"\" enabled.",
+    b"\" disabled.",
+    b"\" completed after reaching its end time.",
+    b"\" deleted.",
+];
+
+fn w22_registration_text(
+    kind: i32,
+    a: i64,
+    b: i64,
+    first: &[u8],
+    second: &[u8],
+) -> Option<Vec<u8>> {
+    let mut text = Vec::with_capacity(96 + first.len() + second.len());
+    match kind {
+        W22_REG_TEXT_LABEL => text.extend_from_slice(w22_registration_label(a)),
+        W22_REG_TEXT_MESSAGE => {
+            if b != 0 {
+                text.extend_from_slice(b"Registrations are temporarily open until ");
+                text.extend_from_slice(first);
+                text.extend_from_slice(b" because of the scheduled period \"");
+                text.extend_from_slice(second);
+                text.extend_from_slice(b"\".");
+            } else {
+                text.extend_from_slice(match a {
+                    0 => b"Registrations are currently open.".as_slice(),
+                    1 => b"Registrations are currently invite only.",
+                    _ => b"Registrations are currently closed.",
+                });
+            }
+        }
+        W22_REG_TEXT_MANUAL_CHANGE => {
+            if a == b {
+                text.extend_from_slice(
+                    b"Manual registration status note added while status remained ",
+                );
+                text.extend_from_slice(w22_registration_label(b));
+            } else {
+                text.extend_from_slice(b"Manual registration status changed from ");
+                text.extend_from_slice(w22_registration_label(a));
+                text.extend_from_slice(b" to ");
+                text.extend_from_slice(w22_registration_label(b));
+            }
+            text.push(b'.');
+        }
+        W22_REG_TEXT_PERIOD => {
+            let suffix = W22_PERIOD_EVENTS.get(usize::try_from(a).ok()?)?;
+            text.extend_from_slice(b"Scheduled open period \"");
+            text.extend_from_slice(first);
+            text.extend_from_slice(suffix);
+        }
+        _ => return None,
+    }
+    Some(text)
+}
+
+/// `RegistrationStatusService` status text. Kinds: 0 `statusLabel(a)`; 1 `statusMessage`
+/// (`a` effective status, `b` non-zero for a scheduled override, `first` the formatted end
+/// time, `second` the period name); 2 manual status audit description (`a` old, `b` new);
+/// 3 period audit description (`a` event index, `first` the period name). Returns the
+/// length, `-(needed)` when `cap` is too small (nothing is written), or -1 for invalid input.
+///
+/// # Safety
+/// Non-null `first`/`second` must be readable for their lengths; a non-null `out` must be
+/// writable for `cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_regstatus_text(
+    kind: i32,
+    a: i64,
+    b: i64,
+    first: *const u8,
+    first_len: usize,
+    second: *const u8,
+    second_len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: forwarded caller contract.
+        let (Some(first), Some(second)) = (unsafe { w19pc_bytes(first, first_len) }, unsafe {
+            w19pc_bytes(second, second_len)
+        }) else {
+            return -1;
+        };
+        let Some(text) = w22_registration_text(kind, a, b, first, second) else {
+            return -1;
+        };
+        // SAFETY: `out` validity is checked by `w19pc_write`; the caller guarantees `cap`
+        // writable bytes.
+        unsafe { w19pc_write(out, cap, &text) }
+    }))
+    .unwrap_or(-1)
+}
+
+/// `RegistrationPeriod` window bits: 1 when active at `at`, 2 when ended before `at`.
+/// Instants are epoch microseconds; `has_start`/`has_end` are zero for a null bound.
+/// Returns the bits, or -1 only on an internal failure.
+///
+/// # Safety
+/// Takes no pointers; any argument values are accepted.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_regperiod_window(
+    enabled: i32,
+    has_start: i32,
+    starts_at: i64,
+    has_end: i32,
+    ends_at: i64,
+    at: i64,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let has_end = has_end != 0;
+        let active = enabled != 0 && has_start != 0 && has_end && starts_at <= at && ends_at >= at;
+        let ended = has_end && ends_at < at;
+        i32::from(active) | (i32::from(ended) << 1)
+    }))
+    .unwrap_or(-1)
+}
+
+/// `Content` label text: kind 0 content type, kind 1 role; `has_value` zero for null.
+fn w22_content_label(kind: i32, has_value: bool, value: i64) -> Option<&'static [u8]> {
+    let value = has_value.then_some(value);
+    Some(match (kind, value) {
+        (0, Some(1)) => b"Useful Link",
+        (0, Some(3)) => b"Homepage",
+        (1, Some(0)) => b"Everyone",
+        (1, Some(1)) => b"Logged in Users",
+        (1, Some(2)) => b"Admins",
+        (0 | 1, _) => b"Unknown",
+        _ => return None,
+    })
+}
+
+/// `Content::contentTypeLabelFor` (kind 0) / `roleLabelFor` (kind 1). Returns the length,
+/// `-(needed)` when `cap` is too small (nothing is written), or -1 for invalid input.
+///
+/// # Safety
+/// A non-null `out` must be writable for `cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_content_label(
+    kind: i32,
+    has_value: i32,
+    value: i64,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(label) = w22_content_label(kind, has_value != 0, value) else {
+            return -1;
+        };
+        // SAFETY: `out` validity is checked by `w19pc_write`; the caller guarantees `cap`
+        // writable bytes.
+        unsafe { w19pc_write(out, cap, label) }
+    }))
+    .unwrap_or(-1)
+}
+
+/// `/^[a-zA-Z0-9][a-zA-Z0-9-]*\.[a-zA-Z]{2,}/` prefix match. The run class excludes `.`, so
+/// the dot must directly follow the longest run and backtracking cannot find another match.
+fn w22_bare_domain(url: &[u8]) -> bool {
+    if !url.first().is_some_and(u8::is_ascii_alphanumeric) {
+        return false;
+    }
+    let run = 1 + url[1..]
+        .iter()
+        .take_while(|&&byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        .count();
+    url.get(run) == Some(&b'.')
+        && url.len() >= run + 3
+        && url[run + 1..run + 3].iter().all(u8::is_ascii_alphabetic)
+}
+
+/// `Content::classifyUrl`: 0 empty (`empty()`), 1 absolute http(s), 2 bare domain, 3 internal
+/// path; -1 for invalid input.
+///
+/// # Safety
+/// A non-null `ptr` must be readable for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_content_url_kind(ptr: *const u8, len: usize) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: forwarded caller contract.
+        let Some(url) = (unsafe { w19pc_bytes(ptr, len) }) else {
+            return -1;
+        };
+        if url.is_empty() || url == b"0" {
+            0
+        } else if url.starts_with(b"http://") || url.starts_with(b"https://") {
+            1
+        } else if !url.starts_with(b"/") && w22_bare_domain(url) {
+            2
+        } else {
+            3
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// `SiteLogoService::DIRECTORY` plus its separator.
+const W22_LOGO_PREFIX: &[u8] = b"site-logos/";
+
+/// `SiteLogoService::isManagedPath`.
+fn w22_logo_managed(path: &[u8]) -> bool {
+    path.starts_with(W22_LOGO_PREFIX) && !path.windows(2).any(|pair| pair == b"..")
+}
+
+/// `SiteLogoService::urlFor`: writes `/storage/{path}` for a managed path. Returns the length,
+/// 0 when the path is not managed, `-(needed)` when `cap` is too small (nothing is written),
+/// or -1 for invalid input.
+///
+/// # Safety
+/// A non-null `ptr` must be readable for `len` bytes; a non-null `out` must be writable for
+/// `cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_site_logo_url(
+    ptr: *const u8,
+    len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: forwarded caller contract.
+        let Some(path) = (unsafe { w19pc_bytes(ptr, len) }) else {
+            return -1;
+        };
+        if !w22_logo_managed(path) {
+            return 0;
+        }
+        let mut url = Vec::with_capacity(9 + path.len());
+        url.extend_from_slice(b"/storage/");
+        url.extend_from_slice(path);
+        // SAFETY: `out` validity is checked by `w19pc_write`; the caller guarantees `cap`
+        // writable bytes.
+        unsafe { w19pc_write(out, cap, &url) }
+    }))
+    .unwrap_or(-1)
+}
+
+/// `SiteLogoService::isManagedPath`: 1 managed, 0 not managed, -1 for invalid input.
+///
+/// # Safety
+/// A non-null `ptr` must be readable for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_site_logo_is_managed(ptr: *const u8, len: usize) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: forwarded caller contract.
+        unsafe { w19pc_bytes(ptr, len) }.map_or(-1, |path| i32::from(w22_logo_managed(path)))
+    }))
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod wave22_domain_config_registration_content_tests {
+    use super::*;
+
+    fn exclusions(raw: &[u8]) -> Result<Vec<i64>, isize> {
+        let mut out = [i64::MIN; 64];
+        let code = unsafe {
+            nntmux_domcfg_color_exclusions(raw.as_ptr(), raw.len(), out.as_mut_ptr(), out.len())
+        };
+        if code < 0 {
+            return Err(code);
+        }
+        Ok(out[..code as usize].to_vec())
+    }
+
+    fn errors(raw: &[u8], start: i64, end: i64) -> Vec<u8> {
+        let mut out = [0u8; 1024];
+        let code = unsafe {
+            nntmux_domcfg_color_exclusion_errors(
+                raw.as_ptr(),
+                raw.len(),
+                start,
+                end,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert!(code >= 0, "{code}");
+        out[..code as usize].to_vec()
+    }
+
+    fn text(kind: i32, a: i64, b: i64, first: &[u8], second: &[u8]) -> isize {
+        let mut out = [0u8; 256];
+        unsafe {
+            nntmux_regstatus_text(
+                kind,
+                a,
+                b,
+                first.as_ptr(),
+                first.len(),
+                second.as_ptr(),
+                second.len(),
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        }
+    }
+
+    fn text_bytes(kind: i32, a: i64, b: i64, first: &[u8], second: &[u8]) -> Vec<u8> {
+        w22_registration_text(kind, a, b, first, second).unwrap()
+    }
+
+    #[test]
+    fn color_exclusions_match_php_intval_and_unique() {
+        assert_eq!(
+            exclusions(b" 3, 1 3,,2\x0b4\x0c5\r\n1 "),
+            Ok(vec![3, 1, 2, 4, 5])
+        );
+        assert_eq!(exclusions(b"\0 7 \0"), Ok(vec![7]));
+        assert_eq!(
+            exclusions(b"12abc abc +5 -0 0x1A 00300 5\0"),
+            Ok(vec![12, 0, 5, 300])
+        );
+        assert_eq!(
+            exclusions(b"99999999999999999999 -99999999999999999999x 9223372036854775807"),
+            Ok(vec![i64::MAX, i64::MIN])
+        );
+        assert_eq!(exclusions(b""), Ok(vec![]));
+        assert_eq!(exclusions(b" , \t"), Ok(vec![]));
+        for float in [&b"1e3"[..], b"1.9", b".5", b"5E1", b"-.5"] {
+            assert_eq!(exclusions(float), Err(-2), "{float:?}");
+        }
+        let many: Vec<u8> = (0..100)
+            .flat_map(|n| format!("{} ", n % 50).into_bytes())
+            .collect();
+        assert_eq!(exclusions(&many), Ok((0..50).collect()));
+
+        let mut small = [9i64; 2];
+        assert_eq!(
+            unsafe { nntmux_domcfg_color_exclusions(b"1 2 3".as_ptr(), 5, small.as_mut_ptr(), 2) },
+            -3
+        );
+        assert_eq!(small, [9, 9]);
+        let mut buffer = [0i64; 4];
+        let bad = unsafe { buffer.as_mut_ptr().cast::<u8>().add(1) }.cast::<i64>();
+        assert_eq!(
+            unsafe { nntmux_domcfg_color_exclusions(b"1".as_ptr(), 1, bad, 2) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_domcfg_color_exclusions(b"1".as_ptr(), 1, std::ptr::null_mut(), 2) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_domcfg_color_exclusions(std::ptr::null(), 1, buffer.as_mut_ptr(), 4) },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_domcfg_color_exclusions(b"1".as_ptr(), usize::MAX, buffer.as_mut_ptr(), 4)
+            },
+            -1
+        );
+        assert_eq!(buffer, [0; 4]);
+    }
+
+    #[test]
+    fn color_exclusion_errors_match_php_messages() {
+        assert_eq!(errors(b"1 2 3", 0, 255), b"");
+        assert_eq!(
+            errors(b"300 abc 0 1e3 -1 12\0 0007 999999999999999999999", 5, 10),
+            b"Excluded color 300 must be an integer from 0 through 255.\n\
+Excluded color abc must be an integer from 0 through 255.\n\
+Excluded color 0 must be inside the configured color range.\n\
+Excluded color 1e3 must be an integer from 0 through 255.\n\
+Excluded color -1 must be an integer from 0 through 255.\n\
+Excluded color 12\0 must be an integer from 0 through 255.\n\
+Excluded color 999999999999999999999 must be an integer from 0 through 255."
+                .as_slice()
+        );
+        assert_eq!(
+            errors(b"0255", 0, 100),
+            b"Excluded color 255 must be inside the configured color range."
+        );
+        let raw = b"300";
+        let mut small = [7u8; 8];
+        let code = unsafe {
+            nntmux_domcfg_color_exclusion_errors(
+                raw.as_ptr(),
+                raw.len(),
+                0,
+                1,
+                small.as_mut_ptr(),
+                small.len(),
+            )
+        };
+        assert_eq!(code, -57);
+        assert_eq!(small, [7u8; 8]);
+        assert_eq!(
+            unsafe {
+                nntmux_domcfg_color_exclusion_errors(raw.as_ptr(), 3, 0, 1, std::ptr::null_mut(), 8)
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_domcfg_color_exclusion_errors(
+                    std::ptr::null(),
+                    3,
+                    0,
+                    1,
+                    small.as_mut_ptr(),
+                    8,
+                )
+            },
+            -1
+        );
+    }
+
+    #[test]
+    fn range_checks() {
+        assert_eq!(unsafe { nntmux_domcfg_range_invalid(0, 5, 5) }, 1);
+        assert_eq!(unsafe { nntmux_domcfg_range_invalid(0, 6, 5) }, 1);
+        assert_eq!(unsafe { nntmux_domcfg_range_invalid(0, 4, 5) }, 0);
+        assert_eq!(unsafe { nntmux_domcfg_range_invalid(1, 10, 0) }, 0);
+        assert_eq!(unsafe { nntmux_domcfg_range_invalid(1, 10, 5) }, 1);
+        assert_eq!(unsafe { nntmux_domcfg_range_invalid(1, 5, 5) }, 0);
+        assert_eq!(unsafe { nntmux_domcfg_range_invalid(1, 5, -1) }, 0);
+        assert_eq!(unsafe { nntmux_domcfg_range_invalid(2, 0, 0) }, -1);
+    }
+
+    #[test]
+    fn registration_decision_and_text() {
+        let decide = |manual: i64, active: i32| {
+            let mut out = [0i64; 3];
+            assert_eq!(
+                unsafe { nntmux_regstatus_decide(manual, active, out.as_mut_ptr()) },
+                0
+            );
+            out
+        };
+        assert_eq!(decide(0, 0), [0, W22_REG_AVAILABLE | W22_REG_OPEN, 1]);
+        assert_eq!(decide(1, 0), [1, W22_REG_AVAILABLE | W22_REG_INVITE, 2]);
+        assert_eq!(decide(2, 0), [2, W22_REG_CLOSED, 3]);
+        assert_eq!(decide(0, 1), [0, W22_REG_AVAILABLE | W22_REG_OPEN, 1]);
+        assert_eq!(
+            decide(2, 1),
+            [0, W22_REG_OVERRIDE | W22_REG_AVAILABLE | W22_REG_OPEN, 0]
+        );
+        assert_eq!(decide(99, 0), [99, W22_REG_AVAILABLE, 3]);
+        let mut buffer = [0i64; 4];
+        let bad = unsafe { buffer.as_mut_ptr().cast::<u8>().add(1) }.cast::<i64>();
+        assert_eq!(unsafe { nntmux_regstatus_decide(0, 0, bad) }, -1);
+        assert_eq!(
+            unsafe { nntmux_regstatus_decide(0, 0, std::ptr::null_mut()) },
+            -1
+        );
+        assert_eq!(buffer, [0; 4]);
+
+        assert_eq!(unsafe { nntmux_regstatus_normalize_manual(2) }, 2);
+        assert_eq!(unsafe { nntmux_regstatus_normalize_manual(3) }, 0);
+        assert_eq!(unsafe { nntmux_regstatus_normalize_manual(-1) }, 0);
+
+        assert_eq!(text_bytes(0, 1, 0, b"", b""), b"Invite");
+        assert_eq!(text_bytes(0, -7, 0, b"", b""), b"Unknown");
+        assert_eq!(
+            text_bytes(1, 2, 0, b"", b""),
+            b"Registrations are currently closed."
+        );
+        assert_eq!(
+            text_bytes(1, 9, 0, b"", b""),
+            b"Registrations are currently closed."
+        );
+        assert_eq!(
+            text_bytes(1, 0, 1, b"2026-10-24 12:00", b"Launch"),
+            b"Registrations are temporarily open until 2026-10-24 12:00 because of the scheduled period \"Launch\"."
+        );
+        assert_eq!(
+            text_bytes(2, 1, 1, b"", b""),
+            b"Manual registration status note added while status remained Invite."
+        );
+        assert_eq!(
+            text_bytes(2, 0, 7, b"", b""),
+            b"Manual registration status changed from Open to Unknown."
+        );
+        assert_eq!(
+            text_bytes(3, 4, 0, b"Q", b""),
+            b"Scheduled open period \"Q\" completed after reaching its end time."
+        );
+        assert_eq!(text(3, 6, 0, b"Q", b""), -1);
+        assert_eq!(text(3, -1, 0, b"Q", b""), -1);
+        assert_eq!(text(4, 0, 0, b"", b""), -1);
+        assert_eq!(text(0, 0, 0, b"", b""), 4);
+        let mut small = [5u8; 3];
+        assert_eq!(
+            unsafe {
+                nntmux_regstatus_text(
+                    0,
+                    2,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    small.as_mut_ptr(),
+                    3,
+                )
+            },
+            -6
+        );
+        assert_eq!(small, [5u8; 3]);
+        assert_eq!(
+            unsafe {
+                nntmux_regstatus_text(
+                    3,
+                    0,
+                    0,
+                    std::ptr::null(),
+                    2,
+                    std::ptr::null(),
+                    0,
+                    small.as_mut_ptr(),
+                    3,
+                )
+            },
+            -1
+        );
+    }
+
+    #[test]
+    fn registration_period_window() {
+        let window = |enabled, has_start, start, has_end, end, at| unsafe {
+            nntmux_regperiod_window(enabled, has_start, start, has_end, end, at)
+        };
+        assert_eq!(window(1, 1, 10, 1, 20, 10), 1);
+        assert_eq!(window(1, 1, 10, 1, 20, 20), 1);
+        assert_eq!(window(1, 1, 10, 1, 20, 21), 2);
+        assert_eq!(window(1, 1, 10, 1, 20, 9), 0);
+        assert_eq!(window(0, 1, 10, 1, 20, 15), 0);
+        assert_eq!(window(0, 1, 10, 1, 20, 25), 2);
+        assert_eq!(window(1, 0, 10, 1, 20, 15), 0);
+        assert_eq!(window(1, 1, 10, 0, 20, 25), 0);
+        assert_eq!(window(1, 1, i64::MIN, 1, i64::MAX, 0), 1);
+    }
+
+    #[test]
+    fn content_labels_and_url_kind() {
+        let label = |kind, has, value| w22_content_label(kind, has, value);
+        assert_eq!(label(0, true, 1), Some(&b"Useful Link"[..]));
+        assert_eq!(label(0, true, 3), Some(&b"Homepage"[..]));
+        assert_eq!(label(0, true, 2), Some(&b"Unknown"[..]));
+        assert_eq!(label(0, false, 1), Some(&b"Unknown"[..]));
+        assert_eq!(label(1, true, 0), Some(&b"Everyone"[..]));
+        assert_eq!(label(1, true, 1), Some(&b"Logged in Users"[..]));
+        assert_eq!(label(1, true, 2), Some(&b"Admins"[..]));
+        assert_eq!(label(1, false, 0), Some(&b"Unknown"[..]));
+        assert_eq!(label(2, true, 0), None);
+        let mut small = [1u8; 2];
+        assert_eq!(
+            unsafe { nntmux_content_label(1, 1, 2, small.as_mut_ptr(), 2) },
+            -6
+        );
+        assert_eq!(small, [1u8; 2]);
+        assert_eq!(
+            unsafe { nntmux_content_label(5, 1, 2, small.as_mut_ptr(), 2) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_content_label(0, 1, 1, std::ptr::null_mut(), 32) },
+            -1
+        );
+
+        let kind = |url: &[u8]| unsafe { nntmux_content_url_kind(url.as_ptr(), url.len()) };
+        for (url, expected) in [
+            (&b""[..], 0),
+            (b"0", 0),
+            (b"00", 3),
+            (b"http://x", 1),
+            (b"https://x", 1),
+            (b"HTTP://x", 3),
+            (b"google.com", 2),
+            (b"a-.co/path", 2),
+            (b"-a.co", 3),
+            (b"a.c", 3),
+            (b"a.c1", 3),
+            (b"a..com", 3),
+            (b"a_b.com", 3),
+            (b"/google.com", 3),
+            (b"contact-us", 3),
+            (b"sub.example.org", 2),
+        ] {
+            assert_eq!(kind(url), expected, "{url:?}");
+        }
+        assert_eq!(unsafe { nntmux_content_url_kind(std::ptr::null(), 0) }, 0);
+        assert_eq!(unsafe { nntmux_content_url_kind(std::ptr::null(), 2) }, -1);
+    }
+
+    #[test]
+    fn site_logo_paths() {
+        let mut out = [0u8; 64];
+        let url = |path: &[u8], out: &mut [u8]| unsafe {
+            nntmux_site_logo_url(path.as_ptr(), path.len(), out.as_mut_ptr(), out.len())
+        };
+        let written = url(b"site-logos/a.png", &mut out);
+        assert_eq!(&out[..written as usize], b"/storage/site-logos/a.png");
+        for path in [
+            &b""[..],
+            b"site-logos",
+            b"site-logos/../x",
+            b"x/site-logos/a",
+            b"Site-logos/a",
+            b"site-logos/a..b",
+        ] {
+            assert_eq!(url(path, &mut out), 0, "{path:?}");
+            assert_eq!(
+                unsafe { nntmux_site_logo_is_managed(path.as_ptr(), path.len()) },
+                0
+            );
+        }
+        assert_eq!(
+            unsafe { nntmux_site_logo_is_managed(b"site-logos/".as_ptr(), 11) },
+            1
+        );
+        let mut small = [3u8; 4];
+        assert_eq!(url(b"site-logos/a.png", &mut small), -25);
+        assert_eq!(small, [3u8; 4]);
+        assert_eq!(
+            unsafe { nntmux_site_logo_url(std::ptr::null(), 3, out.as_mut_ptr(), 64) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_site_logo_url(b"site-logos/a".as_ptr(), 12, std::ptr::null_mut(), 64) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_site_logo_is_managed(std::ptr::null(), 1) },
+            -1
+        );
+    }
+}
