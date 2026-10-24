@@ -3086,18 +3086,31 @@ pub unsafe extern "C" fn nntmux_tmux_pane_build_respawn_argv_nul(
     if find_byte(target_bytes, 0).is_some() || find_byte(dir_bytes, 0).is_some() {
         return -1;
     }
-    if base_bytes.iter().filter(|&&b| b == 0).count() + 1 != base_count {
+    if base_bytes.iter().filter(|&&b| b == 0).count().checked_add(1) != Some(base_count) {
         return -1;
     }
-    if worker_bytes.iter().filter(|&&b| b == 0).count() + 1 != worker_count {
+    if worker_bytes
+        .iter()
+        .filter(|&&b| b == 0)
+        .count()
+        .checked_add(1)
+        != Some(worker_count)
+    {
         return -1;
     }
     if env_pair_count == 0 {
         if !env_bytes.is_empty() {
             return -1;
         }
-    } else if env_bytes.iter().filter(|&&b| b == 0).count() + 1 != env_pair_count * 2 {
-        return -1;
+    } else {
+        let Some(expected_env_items) = env_pair_count.checked_mul(2) else {
+            return -1;
+        };
+        if env_bytes.iter().filter(|&&b| b == 0).count().checked_add(1)
+            != Some(expected_env_items)
+        {
+            return -1;
+        }
     }
 
     let mut out = unsafe { OutCursor::new(out_buf.cast::<u8>(), out_cap) };
@@ -3596,20 +3609,32 @@ pub unsafe extern "C" fn nntmux_tmux_session_build_window_cmd_nul(
         || out_cap > isize::MAX as usize
         || cmd_kind > 1
         || base_count == 0
+        || base_args_len == 0
         || session_target_len == 0
         || window_len == 0
     {
         return -1;
     }
-    let base_bytes = unsafe { slice::from_raw_parts(base_args.cast::<u8>(), base_args_len) };
-    let session_bytes =
-        unsafe { slice::from_raw_parts(session_target.cast::<u8>(), session_target_len) };
-    let window_bytes = unsafe { slice::from_raw_parts(window.cast::<u8>(), window_len) };
+    let base_bytes = if base_args_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(base_args.cast::<u8>(), base_args_len) }
+    };
+    let session_bytes = if session_target_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(session_target.cast::<u8>(), session_target_len) }
+    };
+    let window_bytes = if window_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(window.cast::<u8>(), window_len) }
+    };
 
     if find_byte(session_bytes, 0).is_some() || find_byte(window_bytes, 0).is_some() {
         return -1;
     }
-    if base_bytes.iter().filter(|&&b| b == 0).count() + 1 != base_count {
+    if base_bytes.iter().filter(|&&b| b == 0).count().checked_add(1) != Some(base_count) {
         return -1;
     }
 
@@ -4376,6 +4401,43 @@ mod tests {
 
             let dur_len = nntmux_redis_format_duration(90_061, out.as_mut_ptr().cast(), out.len());
             assert_eq!(&out[..dur_len as usize], b"1d 1h 1m 1s");
+
+            assert_eq!(
+                nntmux_tmux_session_build_window_cmd_nul(
+                    std::ptr::null(),
+                    0,
+                    1,
+                    0,
+                    b"$1".as_ptr().cast(),
+                    2,
+                    b"2".as_ptr().cast(),
+                    1,
+                    out.as_mut_ptr().cast(),
+                    out.len(),
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_tmux_pane_build_respawn_argv_nul(
+                    b"tmux".as_ptr().cast(),
+                    4,
+                    1,
+                    0,
+                    b"%1".as_ptr().cast(),
+                    2,
+                    b"/app".as_ptr().cast(),
+                    4,
+                    b"A\0B".as_ptr().cast(),
+                    3,
+                    usize::MAX,
+                    b"sh".as_ptr().cast(),
+                    2,
+                    1,
+                    out.as_mut_ptr().cast(),
+                    out.len(),
+                ),
+                -1
+            );
         }
     }
 }

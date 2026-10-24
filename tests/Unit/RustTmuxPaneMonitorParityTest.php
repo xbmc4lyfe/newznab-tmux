@@ -143,6 +143,8 @@ final class RustTmuxPaneMonitorParityTest extends TestCase
         self::assertSame(-strlen("tmux\0kill-window\0-t\0\$1:2"), $this->ffi->nntmux_tmux_session_build_window_cmd_nul('tmux', 4, 1, 1, '$1', 2, '2', 1, $tiny, 2));
         // @phpstan-ignore method.notFound
         self::assertSame(-1, $this->ffi->nntmux_tmux_session_build_window_cmd_nul('tmux', 4, 2, 1, '$1', 2, '2', 1, $tiny, 2));
+        // @phpstan-ignore method.notFound
+        self::assertSame(-1, $this->ffi->nntmux_tmux_session_build_window_cmd_nul(null, 0, 1, 1, '$1', 2, '2', 1, $tiny, 2));
 
         // @phpstan-ignore method.notFound
         self::assertSame(-strlen("0\th\tmonitor\t67\tsequential\n1\th\tfix_names\t50\tpost_metadata"), $this->ffi->nntmux_tmux_session_get_split_setup(2, $tiny, 2));
