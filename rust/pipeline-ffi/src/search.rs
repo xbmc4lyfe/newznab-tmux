@@ -9027,3 +9027,663 @@ mod wave15_tests {
         assert_eq!(sql.rsplit('\0').next(), Some("cp.title || ' > ' || c.title"));
     }
 }
+
+// Wave 16 search-client/API-audit/index-sync candidates. Exports validate pointers,
+// lengths, alignment and capacity before building slices and catch panics. Buffer
+// results follow wave 14: -1 unsupported input (PHP decides), -2 panic,
+// -(required + 3) insufficient output space.
+
+/// PHP `trim()` default characters: space, \t, \n, \r, \0 and \x0B.
+#[inline]
+fn w16_trim_char(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B)
+}
+
+fn w16_trim(s: &[u8]) -> &[u8] {
+    let lead = s.iter().take_while(|&&b| w16_trim_char(b)).count();
+    let trail = s[lead..]
+        .iter()
+        .rev()
+        .take_while(|&&b| w16_trim_char(b))
+        .count();
+    &s[lead..s.len() - trail]
+}
+
+/// Split `input` into consecutive fields described by `lens`; None when the
+/// lengths are negative or do not cover `input` exactly.
+fn w16_fields<'a>(input: &'a [u8], lens: &[i64]) -> Option<Vec<&'a [u8]>> {
+    let mut fields = Vec::with_capacity(lens.len());
+    let mut start = 0usize;
+    for &n in lens {
+        let n = usize::try_from(n).ok()?;
+        let end = start.checked_add(n).filter(|&e| e <= input.len())?;
+        fields.push(&input[start..end]);
+        start = end;
+    }
+    (start == input.len()).then_some(fields)
+}
+
+/// PHP `rawurlencode()`: RFC 3986 unreserved bytes stay, the rest become `%XX`.
+fn w16_rawurlencode(bytes: &[u8], out: &mut Vec<u8>) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for &b in bytes {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b);
+        } else {
+            out.extend_from_slice(&[b'%', HEX[usize::from(b >> 4)], HEX[usize::from(b & 15)]]);
+        }
+    }
+}
+
+/// First `chars` code points of valid UTF-8, as `mb_substr($s, 0, $chars)`.
+fn w16_utf8_prefix(s: &[u8], chars: usize) -> Option<&[u8]> {
+    let text = std::str::from_utf8(s).ok()?;
+    Some(match text.char_indices().nth(chars) {
+        Some((at, _)) => &s[..at],
+        None => s,
+    })
+}
+
+/// `ElasticsearchClientFactory::buildHosts()`. Each entry supplies five fields
+/// (host, scheme, port, user, pass) already cast with PHP `(string)`; flags bit 0
+/// marks a configured port, bit 1 non-empty credentials and bit 2 a plain string
+/// host (field 0 is used verbatim when its trimmed value is non-empty). Writes the
+/// URLs back to back with each length in `out_lens` (-1 for a skipped entry).
+/// # Safety
+/// `lens` holds `5 * count` aligned `int64_t`; `flags` holds `count` aligned
+/// `uint32_t`; `out_lens` holds `count` aligned `int64_t`; `out` holds `cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_es_build_hosts(
+    input: *const u8,
+    len: usize,
+    lens: *const i64,
+    flags: *const u32,
+    count: usize,
+    out: *mut u8,
+    cap: usize,
+    out_lens: *mut i64,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        let Some(field_count) = count.checked_mul(5) else {
+            return -1;
+        };
+        let (Some(s), Some(lens), Some(flags), Some(out_lens)) = (
+            unsafe { w14_input(input, len) },
+            unsafe { w15_slice(lens, field_count) },
+            unsafe { w15_slice(flags, count) },
+            unsafe { w15_slice_mut(out_lens, count) },
+        ) else {
+            return -1;
+        };
+        let Some(fields) = w16_fields(s, lens) else {
+            return -1;
+        };
+        let mut urls = Vec::with_capacity(s.len() + count * 16);
+        for (i, entry) in fields.as_chunks::<5>().0.iter().enumerate() {
+            let before = urls.len();
+            let flag = flags[i];
+            if flag & 4 != 0 {
+                if w16_trim(entry[0]).is_empty() {
+                    out_lens[i] = -1;
+                    continue;
+                }
+                urls.extend_from_slice(entry[0]);
+            } else {
+                let host = w16_trim(entry[0]);
+                if host.is_empty() {
+                    out_lens[i] = -1;
+                    continue;
+                }
+                // `trim($scheme) ?: 'http'`: both '' and '0' are falsy.
+                let scheme = match w16_trim(entry[1]) {
+                    b"" | b"0" => b"http".as_slice(),
+                    scheme => scheme,
+                };
+                urls.extend_from_slice(scheme);
+                urls.extend_from_slice(b"://");
+                if flag & 2 != 0 {
+                    w16_rawurlencode(entry[3], &mut urls);
+                    urls.push(b':');
+                    w16_rawurlencode(entry[4], &mut urls);
+                    urls.push(b'@');
+                }
+                urls.extend_from_slice(host);
+                if flag & 1 != 0 {
+                    urls.push(b':');
+                    urls.extend_from_slice(entry[2]);
+                }
+            }
+            let Ok(written) = i64::try_from(urls.len() - before) else {
+                return -1;
+            };
+            out_lens[i] = written;
+        }
+        w14_output(&urls, out, cap)
+    })
+    .unwrap_or(-2)
+}
+
+/// `is_numeric($v) && (float) $v > 0` for a string timeout. Returns 1 and writes
+/// the seconds for a positive numeric string, 0 when the option is omitted and -1
+/// for invalid pointers.
+/// # Safety
+/// `input` holds `len` bytes; `out` is one aligned `double`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_es_positive_seconds(
+    input: *const u8,
+    len: usize,
+    out: *mut f64,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        let (Some(s), Some(out)) = (unsafe { w14_input(input, len) }, unsafe {
+            w15_slice_mut(out, 1)
+        }) else {
+            return -1;
+        };
+        // PHP 8 numeric strings allow leading and trailing " \t\n\r\v\f".
+        let ws = |b: &u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C);
+        let lead = s.iter().take_while(|b| ws(b)).count();
+        let trail = s[lead..].iter().rev().take_while(|b| ws(b)).count();
+        match w15_decimal(&s[lead..s.len() - trail]) {
+            Some(seconds) if seconds > 0.0 => {
+                out[0] = seconds;
+                1
+            }
+            _ => 0,
+        }
+    })
+    .unwrap_or(-2)
+}
+
+/// `ApiUsageService::auditEntry()` after canonicalization. Field 0 is the request
+/// path, followed by key/value pairs (null values passed as ''). Values keep 64
+/// code points, pairs use `http_build_query(..., PHP_QUERY_RFC3986)` and the entry
+/// keeps 255 code points. Invalid UTF-8 in the path or a value returns -1.
+/// # Safety
+/// `input` holds `len` bytes; `lens` holds `count` aligned `int64_t`; `out` holds
+/// `cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_api_audit_entry(
+    input: *const u8,
+    len: usize,
+    lens: *const i64,
+    count: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        let (Some(s), Some(lens)) = (unsafe { w14_input(input, len) }, unsafe {
+            w15_slice(lens, count)
+        }) else {
+            return -1;
+        };
+        if count.is_multiple_of(2) {
+            return -1;
+        }
+        let Some(fields) = w16_fields(s, lens) else {
+            return -1;
+        };
+        let path = fields[0];
+        if std::str::from_utf8(path).is_err() {
+            return -1;
+        }
+        let mut entry = Vec::with_capacity(s.len() * 3 + 2);
+        entry.push(b'/');
+        entry.extend_from_slice(&path[path.iter().take_while(|&&b| b == b'/').count()..]);
+        for (i, pair) in fields[1..].as_chunks::<2>().0.iter().enumerate() {
+            let Some(value) = w16_utf8_prefix(pair[1], 64) else {
+                return -1;
+            };
+            entry.push(if i == 0 { b'?' } else { b'&' });
+            w16_rawurlencode(pair[0], &mut entry);
+            entry.push(b'=');
+            w16_rawurlencode(value, &mut entry);
+        }
+        // The query is ASCII and the path was validated, so the entry is UTF-8.
+        let Some(entry) = w16_utf8_prefix(&entry, 255) else {
+            return -1;
+        };
+        w14_output(entry, out, cap)
+    })
+    .unwrap_or(-2)
+}
+
+/// `ApiUsageService::reserve()` decision: `$used >= $max ? null : $used + 1`, with
+/// `INT64_MIN` standing for null (exhausted).
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_api_quota_reservation(used: i64, max: i64) -> i64 {
+    std::panic::catch_unwind(|| {
+        if used >= max {
+            i64::MIN
+        } else {
+            used.checked_add(1).unwrap_or(i64::MIN)
+        }
+    })
+    .unwrap_or(i64::MIN)
+}
+
+/// PHP `(int)` cast of a string `_totalrows` value for plain leading integers
+/// (optional " \t\n\r\v\f" and sign, at most 18 digits, not followed by `.`/`e`).
+/// Returns `INT64_MIN` when PHP must decide (no digits, float forms, overflow).
+/// # Safety
+/// `input` holds `len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_api_release_rows_total(input: *const u8, len: usize) -> i64 {
+    std::panic::catch_unwind(|| {
+        let Some(s) = (unsafe { w14_input(input, len) }) else {
+            return i64::MIN;
+        };
+        let mut p = s
+            .iter()
+            .take_while(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C))
+            .count();
+        let negative = s.get(p) == Some(&b'-');
+        p += usize::from(matches!(s.get(p), Some(b'+' | b'-')));
+        let digits = s[p..].iter().take_while(|b| b.is_ascii_digit()).count();
+        if digits == 0 || digits > 18 || matches!(s.get(p + digits), Some(b'.' | b'e' | b'E')) {
+            return i64::MIN;
+        }
+        let value = s[p..p + digits]
+            .iter()
+            .fold(0i64, |acc, &b| acc * 10 + i64::from(b - b'0'));
+        if negative { -value } else { value }
+    })
+    .unwrap_or(i64::MIN)
+}
+
+/// `XmlResponseContext::fromLegacyOptions()` slot selection. `tags` holds two bits
+/// per slot (Parameters, Data, Server, Offset, Type): 0 missing, 1 null, 2 array,
+/// 3 other scalar/object. Returns bit i set when slot i keeps the option value;
+/// cleared bits use the default (`[]` for Parameters/Server, null otherwise).
+/// Returns -1 for tags outside the ten defined bits.
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_api_xml_context_mask(tags: u32) -> i32 {
+    std::panic::catch_unwind(|| {
+        if tags >> 10 != 0 {
+            return -1;
+        }
+        let mut mask = 0;
+        for slot in 0..5 {
+            let tag = (tags >> (2 * slot)) & 3;
+            let keep = match slot {
+                0 | 2 => tag == 2,
+                _ => tag >= 2,
+            };
+            if keep {
+                mask |= 1 << slot;
+            }
+        }
+        mask
+    })
+    .unwrap_or(-1)
+}
+
+/// `ReleaseSearchIndexSync::forIds()` filter: copy positive ids in order (duplicates
+/// are kept, as each id triggers its own index update). Returns the kept count.
+/// # Safety
+/// `ids` holds `count` and `out` holds `cap` aligned, non-overlapping `int64_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_search_sync_positive_ids(
+    ids: *const i64,
+    count: usize,
+    out: *mut i64,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        let Some(ids) = (unsafe { w15_slice(ids, count) }) else {
+            return -1;
+        };
+        let Some(out_bytes) = cap.checked_mul(size_of::<i64>()) else {
+            return -1;
+        };
+        let (ids_start, out_start) = (ids.as_ptr() as usize, out as usize);
+        if cap != 0
+            && count != 0
+            && out_start < ids_start.saturating_add(count * size_of::<i64>())
+            && ids_start < out_start.saturating_add(out_bytes)
+        {
+            return -1;
+        }
+        let Some(out) = (unsafe { w15_slice_mut(out, cap) }) else {
+            return -1;
+        };
+        let kept = ids.iter().filter(|&&id| id > 0).count();
+        if kept > isize::MAX as usize - 3 {
+            return -1;
+        }
+        if kept > out.len() {
+            return -(kept as isize + 3);
+        }
+        for (slot, &id) in out.iter_mut().zip(ids.iter().filter(|&&id| id > 0)) {
+            *slot = id;
+        }
+        kept as isize
+    })
+    .unwrap_or(-2)
+}
+
+/// `ReleaseSearchIndexSync::reindexMatchingWhere()` condition: `trim()` then strip
+/// `/^\s*AND\s+/i` (ASCII `\s` = \t \n \v \f \r and space). Writes the condition's
+/// `[start, length]` span within `input`; length 0 means no condition.
+/// # Safety
+/// `input` holds `len` bytes; `out` holds two aligned `int64_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_search_sync_where_condition(
+    input: *const u8,
+    len: usize,
+    out: *mut i64,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        let (Some(s), Some(out)) = (unsafe { w14_input(input, len) }, unsafe {
+            w15_slice_mut(out, 2)
+        }) else {
+            return -1;
+        };
+        let lead = s.iter().take_while(|&&b| w16_trim_char(b)).count();
+        let trimmed = w16_trim(s);
+        let pcre_ws = |b: &u8| matches!(b, b'\t'..=b'\r' | b' ');
+        let mut start = lead;
+        let ws = trimmed.iter().take_while(|b| pcre_ws(b)).count();
+        if trimmed.len() >= ws + 3 && trimmed[ws..ws + 3].eq_ignore_ascii_case(b"AND") {
+            let gap = trimmed[ws + 3..].iter().take_while(|b| pcre_ws(b)).count();
+            if gap > 0 {
+                start += ws + 3 + gap;
+            }
+        }
+        let end = lead + trimmed.len();
+        let (Ok(start_i), Ok(len_i)) = (i64::try_from(start), i64::try_from(end - start)) else {
+            return -1;
+        };
+        out[0] = start_i;
+        out[1] = len_i;
+        0
+    })
+    .unwrap_or(-2)
+}
+
+#[cfg(test)]
+mod wave16_tests {
+    use super::*;
+
+    fn hosts(entries: &[([&[u8]; 5], u32)]) -> Vec<Option<Vec<u8>>> {
+        let mut joined = Vec::new();
+        let mut lens = Vec::new();
+        let flags: Vec<u32> = entries.iter().map(|e| e.1).collect();
+        for (fields, _) in entries {
+            for f in fields {
+                joined.extend_from_slice(f);
+                lens.push(f.len() as i64);
+            }
+        }
+        let mut out_lens = vec![0i64; entries.len()];
+        let mut out = vec![0u8; 1];
+        let mut rc = unsafe {
+            nntmux_es_build_hosts(
+                joined.as_ptr(),
+                joined.len(),
+                lens.as_ptr(),
+                flags.as_ptr(),
+                entries.len(),
+                out.as_mut_ptr(),
+                out.len(),
+                out_lens.as_mut_ptr(),
+            )
+        };
+        if rc < -2 {
+            out = vec![0u8; (-rc - 3) as usize];
+            rc = unsafe {
+                nntmux_es_build_hosts(
+                    joined.as_ptr(),
+                    joined.len(),
+                    lens.as_ptr(),
+                    flags.as_ptr(),
+                    entries.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                    out_lens.as_mut_ptr(),
+                )
+            };
+        }
+        assert!(rc >= 0);
+        let mut at = 0usize;
+        out_lens
+            .iter()
+            .map(|&n| {
+                (n >= 0).then(|| {
+                    let url = out[at..at + n as usize].to_vec();
+                    at += n as usize;
+                    url
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn build_hosts_matches_php_formatting() {
+        let got = hosts(&[
+            ([b" es1 ", b"", b"9200", b"", b""], 1),
+            ([b"es2", b" https ", b"", b"us er", b"p@ss/~"], 2),
+            ([b"   ", b"https", b"", b"", b""], 0),
+            ([b"es3", b"0", b"", b"", b""], 0),
+            ([b"http://raw:9200", b"", b"", b"", b""], 4),
+            ([b" \t", b"", b"", b"", b""], 4),
+        ]);
+        assert_eq!(
+            got,
+            vec![
+                Some(b"http://es1:9200".to_vec()),
+                Some(b"https://us%20er:p%40ss%2F~@es2".to_vec()),
+                None,
+                Some(b"http://es3".to_vec()),
+                Some(b"http://raw:9200".to_vec()),
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn build_hosts_rejects_bad_contracts() {
+        let lens = [1i64, 0, 0, 0, 0];
+        let flags = [0u32];
+        let mut out_lens = [0i64];
+        let mut out = [0u8; 16];
+        // Lengths overrun the input.
+        assert_eq!(
+            unsafe {
+                nntmux_es_build_hosts(
+                    b"".as_ptr(),
+                    0,
+                    lens.as_ptr(),
+                    flags.as_ptr(),
+                    1,
+                    out.as_mut_ptr(),
+                    16,
+                    out_lens.as_mut_ptr(),
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_es_build_hosts(
+                    std::ptr::null(),
+                    1,
+                    lens.as_ptr(),
+                    flags.as_ptr(),
+                    1,
+                    out.as_mut_ptr(),
+                    16,
+                    out_lens.as_mut_ptr(),
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_es_build_hosts(
+                    b"a".as_ptr(),
+                    1,
+                    lens.as_ptr(),
+                    flags.as_ptr(),
+                    usize::MAX,
+                    out.as_mut_ptr(),
+                    16,
+                    out_lens.as_mut_ptr(),
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_es_build_hosts(
+                    b"a".as_ptr(),
+                    1,
+                    lens.as_ptr(),
+                    flags.as_ptr(),
+                    1,
+                    out.as_mut_ptr(),
+                    2,
+                    out_lens.as_mut_ptr(),
+                )
+            },
+            -(8 + 3)
+        );
+    }
+
+    #[test]
+    fn positive_seconds_follow_is_numeric() {
+        let mut out = [0f64];
+        let mut check = |s: &[u8]| unsafe {
+            let rc = nntmux_es_positive_seconds(s.as_ptr(), s.len(), out.as_mut_ptr());
+            (rc, out[0])
+        };
+        assert_eq!(check(b" 2.5\x0c"), (1, 2.5));
+        assert_eq!(check(b".5").0, 1);
+        assert_eq!(check(b"0").0, 0);
+        assert_eq!(check(b"-1").0, 0);
+        assert_eq!(check(b"1e").0, 0);
+        assert_eq!(check(b"inf").0, 0);
+        assert_eq!(check(b"0x1A").0, 0);
+        assert_eq!(check(b"1e400"), (1, f64::INFINITY));
+        assert_eq!(
+            unsafe { nntmux_es_positive_seconds(b"1".as_ptr(), 1, std::ptr::null_mut()) },
+            -1
+        );
+    }
+
+    fn audit(fields: &[&[u8]]) -> isize {
+        let joined: Vec<u8> = fields.concat();
+        let lens: Vec<i64> = fields.iter().map(|f| f.len() as i64).collect();
+        let mut out = [0u8; 4];
+        unsafe {
+            nntmux_api_audit_entry(
+                joined.as_ptr(),
+                joined.len(),
+                lens.as_ptr(),
+                lens.len(),
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        }
+    }
+
+    #[test]
+    fn audit_entry_matches_http_build_query() {
+        let fields: [&[u8]; 5] = [b"api/v2/search", b"cat", b"5030", b"q", b"a b/\xc3\xa9~"];
+        let joined: Vec<u8> = fields.concat();
+        let lens: Vec<i64> = fields.iter().map(|f| f.len() as i64).collect();
+        let mut out = vec![0u8; 256];
+        let n = unsafe {
+            nntmux_api_audit_entry(
+                joined.as_ptr(),
+                joined.len(),
+                lens.as_ptr(),
+                5,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(
+            &out[..n as usize],
+            b"/api/v2/search?cat=5030&q=a%20b%2F%C3%A9~"
+        );
+        assert_eq!(audit(&[b"//api"]), 4);
+        assert_eq!(audit(&[b"//api/x"]), -(6 + 3));
+        assert_eq!(audit(&[b"api", b"q", b"\xff"]), -1);
+        assert_eq!(audit(&[b"api", b"q"]), -1);
+        let long = "é".repeat(70);
+        assert_eq!(audit(&[b"x", b"q", long.as_bytes()]), -(255 + 3));
+        let ascii = "a".repeat(70);
+        assert_eq!(audit(&[b"x", b"q", ascii.as_bytes()]), -(5 + 64 + 3));
+        let path = "é".repeat(300);
+        assert_eq!(audit(&[path.as_bytes()]), -((1 + 254 * 2) as isize + 3));
+    }
+
+    #[test]
+    fn scalar_helpers_match_php() {
+        assert_eq!(nntmux_api_quota_reservation(4, 5), 5);
+        assert_eq!(nntmux_api_quota_reservation(5, 5), i64::MIN);
+        assert_eq!(nntmux_api_quota_reservation(i64::MAX, i64::MAX), i64::MIN);
+        let total = |s: &[u8]| unsafe { nntmux_api_release_rows_total(s.as_ptr(), s.len()) };
+        assert_eq!(total(b" 12abc"), 12);
+        assert_eq!(total(b"-5"), -5);
+        assert_eq!(total(b"\x0c0012 "), 12);
+        assert_eq!(total(b"12e"), i64::MIN);
+        assert_eq!(total(b"1.9"), i64::MIN);
+        assert_eq!(total(b"1e2"), i64::MIN);
+        assert_eq!(total(b"abc"), i64::MIN);
+        assert_eq!(total(b"9223372036854775808"), i64::MIN);
+        assert_eq!(
+            unsafe { nntmux_api_release_rows_total(std::ptr::null(), 1) },
+            i64::MIN
+        );
+        assert_eq!(nntmux_api_xml_context_mask(0), 0);
+        assert_eq!(
+            nntmux_api_xml_context_mask(2 | 3 << 2 | 3 << 4 | 1 << 6 | 2 << 8),
+            0b10011
+        );
+        assert_eq!(nntmux_api_xml_context_mask(1 << 10), -1);
+    }
+
+    #[test]
+    fn positive_ids_and_where_condition() {
+        let ids = [3i64, 0, -1, 3, 9];
+        let mut out = [0i64; 3];
+        assert_eq!(
+            unsafe { nntmux_search_sync_positive_ids(ids.as_ptr(), 5, out.as_mut_ptr(), 3) },
+            3
+        );
+        assert_eq!(out, [3, 3, 9]);
+        assert_eq!(
+            unsafe { nntmux_search_sync_positive_ids(ids.as_ptr(), 5, out.as_mut_ptr(), 2) },
+            -6
+        );
+        let mut same = [1i64, 2];
+        assert_eq!(
+            unsafe { nntmux_search_sync_positive_ids(same.as_ptr(), 2, same.as_mut_ptr(), 2) },
+            -1
+        );
+        let unaligned = unsafe { (ids.as_ptr() as *const u8).add(1) as *const i64 };
+        assert_eq!(
+            unsafe { nntmux_search_sync_positive_ids(unaligned, 1, out.as_mut_ptr(), 3) },
+            -1
+        );
+        let mut span = [0i64; 2];
+        let mut cond = |s: &[u8]| {
+            assert_eq!(
+                unsafe {
+                    nntmux_search_sync_where_condition(s.as_ptr(), s.len(), span.as_mut_ptr())
+                },
+                0
+            );
+            s[span[0] as usize..(span[0] + span[1]) as usize].to_vec()
+        };
+        assert_eq!(cond(b"  AND x = 1 "), b"x = 1");
+        assert_eq!(cond(b"and\x0c\ty"), b"y");
+        assert_eq!(cond(b"\x0c AND z"), b"z");
+        assert_eq!(cond(b"ANDx"), b"ANDx");
+        assert_eq!(cond(b" AND "), b"AND");
+        assert_eq!(cond(b"AND \x0c"), b"");
+        assert_eq!(cond(b"   "), b"");
+    }
+}
