@@ -18,6 +18,14 @@ class MovieBrowseService
 {
     protected string $showPasswords;
 
+    // Scalar FFI overhead failed the 1.5x gates; PHP remains the production default.
+    private static bool $useRustFfi = false;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
     public function __construct()
     {
         $this->showPasswords = app(ReleaseBrowseService::class)->showPasswords();
@@ -240,6 +248,20 @@ class MovieBrowseService
      * @return array{0: string, 1: string}
      */
     protected function getMovieOrder(string $orderBy): array
+    {
+        return self::$useRustFfi ? $this->getMovieOrderNative($orderBy) : $this->getMovieOrderPhp($orderBy);
+    }
+
+    /** @return array{0: string, 1: string} */
+    public function getMovieOrderNative(string $orderBy): array
+    {
+        $result = ReleaseBrowseService::searchSqlTransformNative(5, $orderBy);
+
+        return $result === null ? $this->getMovieOrderPhp($orderBy) : explode("\0", $result, 2);
+    }
+
+    /** @return array{0: string, 1: string} */
+    public function getMovieOrderPhp(string $orderBy): array
     {
         $orderArr = explode('_', (($orderBy === '') ? 'MAX(r.postdate)' : $orderBy));
         $orderField = match ($orderArr[0]) {

@@ -10,10 +10,14 @@ use App\Models\Release;
 use App\Models\UsenetGroup;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Support\ReleaseSearchIndexDocument;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Throwable;
 
 /**
  * Service for browsing and ordering releases on the frontend.
@@ -35,6 +39,44 @@ class ReleaseBrowseService
     public const PASSWD_NONE = 0; // No password.
 
     public const PASSWD_RAR = 1; // Definitely passworded.
+
+    // Every candidate missed at least one 1.5x workload gate; see the parity benchmark.
+    private static bool $useRustFfi = false;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    /** Shared search-domain byte transform; null means unavailable or declined. */
+    public static function searchSqlTransformNative(int $mode, string $input): ?string
+    {
+        $ffi = RustPipelineLibrary::resolveDomain('search', 'ssize_t nntmux_search_outbox_browse_sql(uint32_t mode, const char *input, size_t input_len, char *output, size_t output_cap);');
+        if ($ffi === null) {
+            return null;
+        }
+        $cap = 0;
+        $out = RustPipelineLibrary::obtainScratch($ffi, max(64, strlen($input) + 128), $cap);
+        if ($out === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $n = $ffi->nntmux_search_outbox_browse_sql($mode, $input, strlen($input), $out, $cap);
+            if (is_int($n) && $n < -2) {
+                $out = RustPipelineLibrary::obtainScratch($ffi, -$n, $cap);
+                if ($out === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $n = $ffi->nntmux_search_outbox_browse_sql($mode, $input, strlen($input), $out, $cap);
+            }
+
+            return is_int($n) && $n >= 0 ? FFI::string($out, $n) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
 
     public function __construct() {}
 
@@ -593,6 +635,30 @@ class ReleaseBrowseService
      */
     public function getBrowseOrder(array|string $orderBy): array
     {
+        // Scalar FFI candidates remain opt-in until both workload gates pass.
+        return self::$useRustFfi ? $this->getBrowseOrderNative($orderBy) : $this->getBrowseOrderPhp($orderBy);
+    }
+
+    /**
+     * @param  array<string, mixed>|string  $orderBy
+     * @return array{0: string, 1: string}
+     */
+    public function getBrowseOrderNative(array|string $orderBy): array
+    {
+        if (is_array($orderBy)) {
+            return $this->getBrowseOrderPhp($orderBy);
+        }
+        $result = self::searchSqlTransformNative(4, $orderBy);
+
+        return $result === null ? $this->getBrowseOrderPhp($orderBy) : explode("\0", $result, 2);
+    }
+
+    /**
+     * @param  array<string, mixed>|string  $orderBy
+     * @return array{0: string, 1: string}
+     */
+    public function getBrowseOrderPhp(array|string $orderBy): array
+    {
         $orderArr = explode('_', ($orderBy === '' ? 'posted_desc' : $orderBy));
         $orderField = match ($orderArr[0]) {
             'cat' => 'categories_id',
@@ -705,6 +771,33 @@ class ReleaseBrowseService
      */
     public function uSQL(Collection|array $userQuery, string $type): string // @phpstan-ignore missingType.generics
     {
+        return self::$useRustFfi ? $this->uSQLNative($userQuery, $type) : $this->uSQLPhp($userQuery, $type);
+    }
+
+    /** @param Collection<int, Model>|array<array-key, object> $userQuery */
+    public function uSQLNative(Collection|array $userQuery, string $type): string
+    {
+        $field = static fn (string $value): string => pack('V', strlen($value)).$value;
+        $input = $field($type);
+        foreach ($userQuery as $query) {
+            $input .= $field(sprintf('%d', $query->$type));
+            if (empty($query->categories)) {
+                $input .= $field('0').$field('');
+            } else {
+                $categories = $query->categories;
+                $cats = explode('|', $categories);
+                $input .= count($cats) > 1
+                    ? $field('2').$field($categories)
+                    : $field('1').$field(sprintf('%d', $cats[0]));
+            }
+        }
+
+        return self::searchSqlTransformNative(6, $input) ?? $this->uSQLPhp($userQuery, $type);
+    }
+
+    /** @param Collection<int, Model>|array<array-key, object> $userQuery */
+    public function uSQLPhp(Collection|array $userQuery, string $type): string
+    {
         $sql = '(1=2 ';
         foreach ($userQuery as $query) {
             $sql .= sprintf('OR (r.%s = %d', $type, $query->$type);
@@ -789,14 +882,72 @@ class ReleaseBrowseService
         return Search::searchReleasesByExternalId($externalIds, $limit);
     }
 
+    public function rewritePagerCountQuery(string $query, bool $fallback = false): ?string
+    {
+        return self::$useRustFfi ? $this->rewritePagerCountQueryNative($query, $fallback) : $this->rewritePagerCountQueryPhp($query, $fallback);
+    }
+
+    public function rewritePagerCountQueryNative(string $query, bool $fallback = false): ?string
+    {
+        return self::searchSqlTransformNative($fallback ? 8 : 7, $query) ?? $this->rewritePagerCountQueryPhp($query, $fallback);
+    }
+
+    public function rewritePagerCountQueryPhp(string $query, bool $fallback = false): ?string
+    {
+        if ($fallback) {
+            if (! preg_match('/FROM\s+releases\s+r\s+(.+?)(?:ORDER\s+BY|LIMIT|$)/is', $query, $matches)) {
+                return null;
+            }
+            $conditions = preg_replace('/(?:LEFT\s+|INNER\s+)?(?:OUTER\s+)?JOIN\s+.+?(?=WHERE|LEFT|INNER|JOIN|$)/is', '', $matches[1]);
+
+            return sprintf('SELECT COUNT(*) as count FROM releases r %s', trim($conditions));
+        }
+        if (preg_match('/SELECT\s+COUNT\s*\(/is', $query)) {
+            return $query;
+        }
+        // For regular SELECT queries, optimize for counting
+        $countQuery = $query;
+
+        // Remove ORDER BY clause (not needed for COUNT)
+        $countQuery = preg_replace('/ORDER\s+BY\s+[^)]+$/is', '', $countQuery);
+
+        // Remove GROUP BY if it's only grouping by r.id
+        $countQuery = preg_replace('/GROUP\s+BY\s+r\.id\s*$/is', '', $countQuery);
+
+        // Check if query has DISTINCT in SELECT
+        $hasDistinct = preg_match('/SELECT\s+DISTINCT/is', $countQuery);
+
+        // Replace SELECT clause with COUNT
+        if ($hasDistinct || preg_match('/GROUP\s+BY/is', $countQuery)) {
+            // For queries with DISTINCT or GROUP BY, count distinct r.id
+            $countQuery = preg_replace(
+                '/SELECT\s+.+?\s+FROM/is',
+                'SELECT COUNT(DISTINCT r.id) as count FROM',
+                $countQuery
+            );
+        } else {
+            // For simple queries, use COUNT(*)
+            $countQuery = preg_replace(
+                '/SELECT\s+.+?\s+FROM/is',
+                'SELECT COUNT(*) as count FROM',
+                $countQuery
+            );
+        }
+
+        // Remove LIMIT/OFFSET from the count query
+        $countQuery = preg_replace('/LIMIT\s+\d+(\s+OFFSET\s+\d+)?$/is', '', $countQuery);
+
+        return $countQuery;
+    }
+
     /**
      * Get the count of releases for pager.
      *
      * @param  string  $query  The query to get the count from.
      */
-    private function getPagerCount(string $query): int
+    private function getPagerCount(string $query, ?int $maxResults = null): int
     {
-        $maxResults = (int) config('nntmux.max_pager_results');
+        $maxResults ??= (int) config('nntmux.max_pager_results');
         $cacheExpiry = config('nntmux.cache_expiry_short');
 
         // Generate cache key from original query
@@ -841,37 +992,7 @@ class ReleaseBrowseService
             }
         }
 
-        // For regular SELECT queries, optimize for counting
-        $countQuery = $query;
-
-        // Remove ORDER BY clause (not needed for COUNT)
-        $countQuery = preg_replace('/ORDER\s+BY\s+[^)]+$/is', '', $countQuery);
-
-        // Remove GROUP BY if it's only grouping by r.id
-        $countQuery = preg_replace('/GROUP\s+BY\s+r\.id\s*$/is', '', $countQuery);
-
-        // Check if query has DISTINCT in SELECT
-        $hasDistinct = preg_match('/SELECT\s+DISTINCT/is', $countQuery);
-
-        // Replace SELECT clause with COUNT
-        if ($hasDistinct || preg_match('/GROUP\s+BY/is', $countQuery)) {
-            // For queries with DISTINCT or GROUP BY, count distinct r.id
-            $countQuery = preg_replace(
-                '/SELECT\s+.+?\s+FROM/is',
-                'SELECT COUNT(DISTINCT r.id) as count FROM',
-                $countQuery
-            );
-        } else {
-            // For simple queries, use COUNT(*)
-            $countQuery = preg_replace(
-                '/SELECT\s+.+?\s+FROM/is',
-                'SELECT COUNT(*) as count FROM',
-                $countQuery
-            );
-        }
-
-        // Remove LIMIT/OFFSET from the count query
-        $countQuery = preg_replace('/LIMIT\s+\d+(\s+OFFSET\s+\d+)?$/is', '', $countQuery);
+        $countQuery = $this->rewritePagerCountQuery($query);
 
         try {
             // Execute the count query
@@ -891,13 +1012,8 @@ class ReleaseBrowseService
             // If optimization fails, try a simpler approach
             try {
                 // Extract the core table and WHERE conditions
-                if (preg_match('/FROM\s+releases\s+r\s+(.+?)(?:ORDER\s+BY|LIMIT|$)/is', $query, $matches)) {
-                    $conditions = $matches[1];
-                    // Remove JOINs but keep WHERE
-                    $conditions = preg_replace('/(?:LEFT\s+|INNER\s+)?(?:OUTER\s+)?JOIN\s+.+?(?=WHERE|LEFT|INNER|JOIN|$)/is', '', $conditions);
-
-                    $fallbackQuery = sprintf('SELECT COUNT(*) as count FROM releases r %s', trim($conditions));
-
+                $fallbackQuery = $this->rewritePagerCountQuery($query, true);
+                if ($fallbackQuery !== null) {
                     $result = DB::select($fallbackQuery);
                     $count = isset($result[0]) ? (int) $result[0]->count : 0;
 

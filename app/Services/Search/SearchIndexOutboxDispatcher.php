@@ -6,9 +6,12 @@ namespace App\Services\Search;
 
 use App\Enums\SecondarySearchIndex;
 use App\Facades\Search;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Facades\Log;
 use JsonException;
 use stdClass;
+use Throwable;
 
 /**
  * Dispatches compacted search outbox rows to the active search driver.
@@ -19,6 +22,44 @@ use stdClass;
  */
 final class SearchIndexOutboxDispatcher
 {
+    // Every candidate missed at least one 1.5x workload gate; see the parity benchmark.
+    private static bool $useRustFfi = false;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    /** Shared search-domain byte transform; null means unavailable or declined. */
+    private static function searchSqlTransformNative(int $mode, string $input): ?string
+    {
+        $ffi = RustPipelineLibrary::resolveDomain('search', 'ssize_t nntmux_search_outbox_browse_sql(uint32_t mode, const char *input, size_t input_len, char *output, size_t output_cap);');
+        if ($ffi === null) {
+            return null;
+        }
+        $cap = 0;
+        $out = RustPipelineLibrary::obtainScratch($ffi, max(64, strlen($input) + 128), $cap);
+        if ($out === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $n = $ffi->nntmux_search_outbox_browse_sql($mode, $input, strlen($input), $out, $cap);
+            if (is_int($n) && $n < -2) {
+                $out = RustPipelineLibrary::obtainScratch($ffi, -$n, $cap);
+                if ($out === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $n = $ffi->nntmux_search_outbox_browse_sql($mode, $input, strlen($input), $out, $cap);
+            }
+
+            return is_int($n) && $n >= 0 ? FFI::string($out, $n) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
     /**
      * Keep only the latest row for each logical search document in a batch.
      *
@@ -26,6 +67,40 @@ final class SearchIndexOutboxDispatcher
      * @return array<int, object>
      */
     public static function compactRows(array $rows): array
+    {
+        return self::$useRustFfi ? self::compactRowsNative($rows) : self::compactRowsPhp($rows);
+    }
+
+    /** @param array<int, object> $rows
+     * @return array<int, object>
+     */
+    public static function compactRowsNative(array $rows): array
+    {
+        // Decline before parsing payloads so fallback does not duplicate or reorder warnings.
+        foreach ($rows as $row) {
+            if (! self::supportsDocumentRow($row)) {
+                return self::compactRowsPhp($rows);
+            }
+        }
+        $input = '';
+        $rows = array_values($rows);
+        foreach ($rows as $row) {
+            $input .= self::packDocumentRow($row);
+            $id = pack('q', self::rowId($row));
+            $input .= pack('V', strlen($id)).$id;
+        }
+        $result = self::searchSqlTransformNative(3, $input);
+        if ($result === null) {
+            return self::compactRowsPhp($rows);
+        }
+
+        return $result === '' ? [] : array_map(static fn (string $index): object => $rows[(int) $index], explode(',', $result));
+    }
+
+    /** @param array<int, object> $rows
+     * @return array<int, object>
+     */
+    public static function compactRowsPhp(array $rows): array
     {
         usort(
             $rows,
@@ -36,7 +111,7 @@ final class SearchIndexOutboxDispatcher
         $compacted = [];
 
         foreach ($rows as $row) {
-            $compacted[self::documentKey($row)] = $row;
+            $compacted[self::documentKeyPhp($row)] = $row;
         }
 
         $latestRows = array_values($compacted);
@@ -271,10 +346,55 @@ final class SearchIndexOutboxDispatcher
         return is_numeric($id) ? (int) $id : 0;
     }
 
-    private static function documentKey(object $row): string
+    public static function documentKey(object $row): string
+    {
+        return self::$useRustFfi ? self::documentKeyNative($row) : self::documentKeyPhp($row);
+    }
+
+    private static function supportsDocumentRow(object $row): bool
+    {
+        if ($row::class !== stdClass::class) {
+            return false;
+        }
+        $rawType = $row->entity_type ?? '';
+        if (! is_scalar($rawType)) {
+            return false;
+        }
+        $type = (string) $rawType;
+        $payload = $row->payload ?? null;
+
+        return ! preg_match('/[\x80-\xff]/', $type)
+            && (! is_string($payload) || $payload === '' || json_validate($payload));
+    }
+
+    private static function packDocumentRow(object $row): string
     {
         $payload = self::payload($row);
-        $entityType = self::normalizeEntityType($row->entity_type ?? '');
+        $type = (string) ($row->entity_type ?? '');
+        $secondary = self::normalizeEntityTypePhp($type) === 'secondary'
+            ? (self::secondaryIndexFromPayload($payload)->value ?? '') : '';
+        $fields = [$type, (string) self::entityId($row, $payload), $secondary];
+        $input = '';
+        foreach ($fields as $field) {
+            $input .= pack('V', strlen($field)).$field;
+        }
+
+        return $input;
+    }
+
+    public static function documentKeyNative(object $row): string
+    {
+        if (! self::supportsDocumentRow($row)) {
+            return self::documentKeyPhp($row);
+        }
+
+        return self::searchSqlTransformNative(2, self::packDocumentRow($row)) ?? self::documentKeyPhp($row);
+    }
+
+    public static function documentKeyPhp(object $row): string
+    {
+        $payload = self::payload($row);
+        $entityType = self::normalizeEntityTypePhp($row->entity_type ?? '');
         $entityId = self::entityId($row, $payload);
         $secondaryIndex = $entityType === 'secondary'
             ? self::secondaryIndexFromPayload($payload)
@@ -288,6 +408,18 @@ final class SearchIndexOutboxDispatcher
     }
 
     private static function normalizeEntityType(mixed $entityType): string
+    {
+        return self::$useRustFfi ? self::normalizeEntityTypeNative($entityType) : self::normalizeEntityTypePhp($entityType);
+    }
+
+    public static function normalizeEntityTypeNative(mixed $entityType): string
+    {
+        $entityType = (string) $entityType;
+
+        return self::searchSqlTransformNative(0, $entityType) ?? self::normalizeEntityTypePhp($entityType);
+    }
+
+    public static function normalizeEntityTypePhp(mixed $entityType): string
     {
         $type = strtolower((string) $entityType);
         $type = str_replace('\\', '/', $type);
@@ -305,6 +437,18 @@ final class SearchIndexOutboxDispatcher
     }
 
     private static function normalizeAction(mixed $action): string
+    {
+        return self::$useRustFfi ? self::normalizeActionNative($action) : self::normalizeActionPhp($action);
+    }
+
+    public static function normalizeActionNative(mixed $action): string
+    {
+        $action = (string) $action;
+
+        return self::searchSqlTransformNative(1, $action) ?? self::normalizeActionPhp($action);
+    }
+
+    public static function normalizeActionPhp(mixed $action): string
     {
         $value = strtolower((string) $action);
         $value = str_replace(['-', ' '], '_', $value);
