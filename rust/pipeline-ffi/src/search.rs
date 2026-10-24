@@ -22623,3 +22623,558 @@ mod wave31_5_activity_captcha_cloudflare_expiry {
         }
     }
 }
+/// Wave 32.5: WebAuthn RP origins, trusted proxy lists, account purge
+/// summaries, reindex job payloads and MCP envelope metadata. Every mode
+/// mirrors a PHP `*Php` helper byte for byte; anything outside the exact
+/// subset handled here declines so PHP falls back.
+mod wave32_5_passkey_reindex_proxy_mcp {
+    use std::collections::HashSet;
+
+    const DECLINE: isize = -1;
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+    const MAX_PARTS: usize = 100_000;
+    /// Bytes stripped by PHP's default `trim()`.
+    const PHP_TRIM: &[u8] = b" \t\n\r\0\x0B";
+    const ENVELOPE_REQUIRED: [&[u8]; 4] =
+        [b"schema_version", b"summary", b"warnings", b"truncated"];
+    const ENVELOPE_KNOWN: [&[u8]; 6] = [
+        b"schema_version",
+        b"summary",
+        b"evidence",
+        b"results",
+        b"warnings",
+        b"truncated",
+    ];
+
+    fn unpack(input: &[u8]) -> Option<Vec<&[u8]>> {
+        let count = u32::from_le_bytes(input.get(..4)?.try_into().ok()?) as usize;
+        if count > MAX_PARTS || count > (input.len() - 4) / 4 {
+            return None;
+        }
+        let mut cursor = 4usize;
+        let mut parts = Vec::with_capacity(count);
+        for _ in 0..count {
+            let length_end = cursor.checked_add(4)?;
+            let length =
+                u32::from_le_bytes(input.get(cursor..length_end)?.try_into().ok()?) as usize;
+            let end = length_end.checked_add(length)?;
+            parts.push(input.get(length_end..end)?);
+            cursor = end;
+        }
+        (cursor == input.len()).then_some(parts)
+    }
+
+    fn pack(parts: &[Vec<u8>]) -> Option<Vec<u8>> {
+        let count = u32::try_from(parts.len()).ok()?;
+        let size = parts.iter().try_fold(4usize, |size, part| {
+            u32::try_from(part.len()).ok()?;
+            size.checked_add(4)?.checked_add(part.len())
+        })?;
+        if size > isize::MAX as usize {
+            return None;
+        }
+        let mut out = Vec::with_capacity(size);
+        out.extend_from_slice(&count.to_le_bytes());
+        for part in parts {
+            out.extend_from_slice(&(part.len() as u32).to_le_bytes());
+            out.extend_from_slice(part);
+        }
+        Some(out)
+    }
+
+    /// Canonical decimal produced by PHP `(string) $int`.
+    fn integer(bytes: &[u8]) -> Option<i64> {
+        let value: i64 = std::str::from_utf8(bytes).ok()?.parse().ok()?;
+        (value.to_string().as_bytes() == bytes).then_some(value)
+    }
+
+    /// Subset of PHP `(int) $string` that is exact without float semantics:
+    /// an optional `-` followed by 1..=18 ASCII digits.
+    fn php_int_cast(bytes: &[u8]) -> Option<i64> {
+        let digits = bytes.strip_prefix(b"-").unwrap_or(bytes);
+        if digits.is_empty() || digits.len() > 18 || !digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        std::str::from_utf8(bytes).ok()?.parse().ok()
+    }
+
+    fn flag(bytes: &[u8]) -> Option<bool> {
+        match bytes {
+            b"0" => Some(false),
+            b"1" => Some(true),
+            _ => None,
+        }
+    }
+
+    fn bool_bytes(value: bool) -> Vec<u8> {
+        if value { b"1" } else { b"0" }.to_vec()
+    }
+
+    fn php_trim(bytes: &[u8]) -> &[u8] {
+        let start = bytes
+            .iter()
+            .position(|b| !PHP_TRIM.contains(b))
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|b| !PHP_TRIM.contains(b))
+            .map_or(start, |i| i + 1);
+        &bytes[start..end]
+    }
+
+    fn unique(items: impl IntoIterator<Item = Vec<u8>>) -> Vec<Vec<u8>> {
+        let mut seen = HashSet::new();
+        items
+            .into_iter()
+            .filter(|item| seen.insert(item.clone()))
+            .collect()
+    }
+
+    fn transform(mode: u32, parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        Some(match mode {
+            // [has_app_url, app_url, has_rp_id, rp_id] -> unique origins.
+            1 => {
+                let [has_app, app, has_rp, rp] = parts else {
+                    return None;
+                };
+                let (has_app, has_rp) = (flag(has_app)?, flag(has_rp)?);
+                if (!has_app && !app.is_empty()) || (!has_rp && !rp.is_empty()) {
+                    return None;
+                }
+                let mut origins = Vec::with_capacity(3);
+                if has_app {
+                    origins.push(app.to_vec());
+                }
+                if has_rp {
+                    let mut https = b"https://".to_vec();
+                    https.extend_from_slice(rp);
+                    origins.push(https);
+                    if *rp == b"localhost" {
+                        origins.push(b"http://localhost".to_vec());
+                    }
+                }
+                unique(origins)
+            }
+            // [kind, items...] with kind n(ull) / s(tring) / a(rray).
+            2 => {
+                let (kind, items) = parts.split_first()?;
+                match (*kind, items) {
+                    (b"n", []) => vec![b"n".to_vec()],
+                    (b"s", [value]) => vec![b"s".to_vec(), value.to_vec()],
+                    (b"a", []) => vec![b"n".to_vec()],
+                    (b"a", items) => std::iter::once(b"a".to_vec())
+                        .chain(items.iter().map(|item| item.to_vec()))
+                        .collect(),
+                    _ => return None,
+                }
+            }
+            // [purged, failed] -> [purged, failed, total, status, message].
+            3 => {
+                let [purged, failed] = parts else {
+                    return None;
+                };
+                let purged = integer(purged)?.max(0);
+                let failed = integer(failed)?.max(0);
+                let status: &[u8] = match (purged, failed) {
+                    (0, 0) => b"noop",
+                    (_, 0) => b"complete",
+                    (0, _) => b"failed",
+                    _ => b"partial",
+                };
+                let message = if failed == 0 {
+                    format!("Purged {purged} deleted account(s).")
+                } else {
+                    format!("Purged {purged} deleted account(s); {failed} failed.")
+                };
+                vec![
+                    purged.to_string().into_bytes(),
+                    failed.to_string().into_bytes(),
+                    purged.saturating_add(failed).to_string().into_bytes(),
+                    status.to_vec(),
+                    message.into_bytes(),
+                ]
+            }
+            // [release_id, attempts, max_tries, fields...] ->
+            // [release_id, attempt, max_tries, remaining, backoff, retry, fields...].
+            4 => {
+                let [release_id, attempts, max_tries, fields @ ..] = parts else {
+                    return None;
+                };
+                let release_id = integer(release_id)?;
+                let attempt = integer(attempts)?.max(1);
+                let max_tries = integer(max_tries)?.max(1);
+                let backoff = (10i64 << (attempt - 1).min(5)).min(300);
+                let mut out = vec![
+                    release_id.to_string().into_bytes(),
+                    attempt.to_string().into_bytes(),
+                    max_tries.to_string().into_bytes(),
+                    (max_tries - attempt).max(0).to_string().into_bytes(),
+                    backoff.to_string().into_bytes(),
+                    bool_bytes(attempt < max_tries),
+                ];
+                out.extend(unique(
+                    fields
+                        .iter()
+                        .map(|field| php_trim(field))
+                        .filter(|field| !field.is_empty())
+                        .map(<[u8]>::to_vec),
+                ));
+                out
+            }
+            // [schema_version, keys...] ->
+            // [version, complete, missing_count, missing..., unknown...].
+            5 => {
+                let (version, keys) = parts.split_first()?;
+                let version = php_int_cast(version)?;
+                let present: HashSet<&[u8]> = keys.iter().copied().collect();
+                let missing: Vec<Vec<u8>> = ENVELOPE_REQUIRED
+                    .iter()
+                    .filter(|key| !present.contains(**key))
+                    .map(|key| key.to_vec())
+                    .collect();
+                let unknown = unique(
+                    keys.iter()
+                        .filter(|key| !ENVELOPE_KNOWN.contains(*key))
+                        .map(|key| key.to_vec()),
+                );
+                let mut out = vec![
+                    version.to_string().into_bytes(),
+                    bool_bytes(missing.is_empty()),
+                    missing.len().to_string().into_bytes(),
+                ];
+                out.extend(missing);
+                out.extend(unknown);
+                out
+            }
+            _ => return None,
+        })
+    }
+
+    /// Dispatch count-prefixed, length-prefixed byte strings (little-endian
+    /// u32). Returns written bytes, `-needed` when `cap` is too small, or `-1`
+    /// for invalid input. Failure never writes to the output buffer. Results
+    /// are at least four bytes, so `-1` never means "one byte needed".
+    ///
+    /// # Safety
+    /// Non-null pointers must refer to readable/writable allocations of the
+    /// declared lengths. Null pointers require zero length/capacity. Input and
+    /// output may overlap; the result is fully owned before any output write.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w32_passkey_reindex_proxy_mcp(
+        mode: u32,
+        input: *const u8,
+        input_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        std::panic::catch_unwind(|| {
+            if input_len > MAX_INPUT
+                || cap > isize::MAX as usize
+                || (input.is_null() && input_len != 0)
+                || (out.is_null() && cap != 0)
+            {
+                return DECLINE;
+            }
+            let input = if input_len == 0 {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(input, input_len) }
+            };
+            let Some(parts) = unpack(input) else {
+                return DECLINE;
+            };
+            let Some(result) = transform(mode, &parts).and_then(|parts| pack(&parts)) else {
+                return DECLINE;
+            };
+            if cap < result.len() || out.is_null() {
+                return -(result.len() as isize);
+            }
+            unsafe { std::ptr::copy(result.as_ptr(), out, result.len()) };
+            result.len() as isize
+        })
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn packet(parts: &[&[u8]]) -> Vec<u8> {
+            pack(&parts.iter().map(|part| part.to_vec()).collect::<Vec<_>>()).unwrap()
+        }
+
+        fn call(mode: u32, parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+            let input = packet(parts);
+            let mut out = vec![0u8; input.len() + 512];
+            let written = unsafe {
+                nntmux_w32_passkey_reindex_proxy_mcp(
+                    mode,
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            if written < 0 {
+                return None;
+            }
+            out.truncate(written as usize);
+            Some(unpack(&out)?.into_iter().map(<[u8]>::to_vec).collect())
+        }
+
+        fn strings(items: &[&str]) -> Vec<Vec<u8>> {
+            items.iter().map(|item| item.as_bytes().to_vec()).collect()
+        }
+
+        #[test]
+        fn origins_dedupe_and_localhost() {
+            assert_eq!(
+                call(1, &[b"1", b"https://nn.test", b"1", b"nn.test"]).unwrap(),
+                strings(&["https://nn.test"])
+            );
+            assert_eq!(
+                call(1, &[b"1", b"http://localhost:8000", b"1", b"localhost"]).unwrap(),
+                strings(&[
+                    "http://localhost:8000",
+                    "https://localhost",
+                    "http://localhost"
+                ])
+            );
+            assert_eq!(
+                call(1, &[b"1", b"http://localhost", b"1", b"localhost"]).unwrap(),
+                strings(&["http://localhost", "https://localhost"])
+            );
+            assert_eq!(
+                call(1, &[b"0", b"", b"1", b""]).unwrap(),
+                strings(&["https://"])
+            );
+            assert_eq!(
+                call(1, &[b"0", b"", b"0", b""]).unwrap(),
+                Vec::<Vec<u8>>::new()
+            );
+            assert_eq!(call(1, &[b"0", b"x", b"0", b""]), None);
+            assert_eq!(call(1, &[b"2", b"", b"0", b""]), None);
+            assert_eq!(call(1, &[b"1", b"a"]), None);
+        }
+
+        #[test]
+        fn proxies_identity_and_empty_to_null() {
+            assert_eq!(call(2, &[b"n"]).unwrap(), strings(&["n"]));
+            assert_eq!(call(2, &[b"a"]).unwrap(), strings(&["n"]));
+            assert_eq!(call(2, &[b"s", b""]).unwrap(), strings(&["s", ""]));
+            assert_eq!(call(2, &[b"s", b"*"]).unwrap(), strings(&["s", "*"]));
+            assert_eq!(
+                call(2, &[b"a", b"10.0.0.0/8", b"10.0.0.0/8", b""]).unwrap(),
+                strings(&["a", "10.0.0.0/8", "10.0.0.0/8", ""])
+            );
+            assert_eq!(call(2, &[b"n", b"x"]), None);
+            assert_eq!(call(2, &[b"s"]), None);
+            assert_eq!(call(2, &[b"x"]), None);
+            assert_eq!(call(2, &[]), None);
+        }
+
+        #[test]
+        fn purge_summary_statuses_and_clamps() {
+            assert_eq!(
+                call(3, &[b"0", b"0"]).unwrap(),
+                strings(&["0", "0", "0", "noop", "Purged 0 deleted account(s)."])
+            );
+            assert_eq!(
+                call(3, &[b"3", b"0"]).unwrap(),
+                strings(&["3", "0", "3", "complete", "Purged 3 deleted account(s)."])
+            );
+            assert_eq!(
+                call(3, &[b"0", b"2"]).unwrap(),
+                strings(&[
+                    "0",
+                    "2",
+                    "2",
+                    "failed",
+                    "Purged 0 deleted account(s); 2 failed."
+                ])
+            );
+            assert_eq!(
+                call(3, &[b"-5", b"9223372036854775807"]).unwrap()[..3],
+                strings(&["0", "9223372036854775807", "9223372036854775807"])[..]
+            );
+            assert_eq!(
+                call(3, &[b"9223372036854775807", b"1"]).unwrap()[2],
+                b"9223372036854775807".to_vec()
+            );
+            assert_eq!(call(3, &[b"+1", b"0"]), None);
+            assert_eq!(call(3, &[b"01", b"0"]), None);
+            assert_eq!(call(3, &[b"1"]), None);
+        }
+
+        #[test]
+        fn reindex_payload_backoff_and_fields() {
+            assert_eq!(
+                call(
+                    4,
+                    &[
+                        b"42", b"1", b"3", b" title ", b"", b"title", b"\0\x0b", b"guid"
+                    ]
+                )
+                .unwrap(),
+                strings(&["42", "1", "3", "2", "10", "1", "title", "guid"])
+            );
+            assert_eq!(
+                call(4, &[b"-7", b"0", b"0"]).unwrap(),
+                strings(&["-7", "1", "1", "0", "10", "0"])
+            );
+            let backoffs: Vec<Vec<u8>> = (1..=8)
+                .map(|attempt| {
+                    let attempt = attempt.to_string();
+                    call(4, &[b"1", attempt.as_bytes(), b"100"]).unwrap()[4].clone()
+                })
+                .collect();
+            assert_eq!(
+                backoffs,
+                strings(&["10", "20", "40", "80", "160", "300", "300", "300"])
+            );
+            assert_eq!(
+                call(4, &[b"1", b"9223372036854775807", b"9223372036854775807"]).unwrap()[3..6],
+                strings(&["0", "300", "0"])[..]
+            );
+            assert_eq!(call(4, &[b"1", b"1"]), None);
+            assert_eq!(call(4, &[b"x", b"1", b"3"]), None);
+        }
+
+        #[test]
+        fn envelope_meta_missing_and_unknown() {
+            assert_eq!(
+                call(
+                    5,
+                    &[
+                        b"1",
+                        b"schema_version",
+                        b"summary",
+                        b"warnings",
+                        b"truncated"
+                    ]
+                )
+                .unwrap(),
+                strings(&["1", "1", "0"])
+            );
+            assert_eq!(
+                call(
+                    5,
+                    &[b"007", b"summary", b"extra", b"extra", b"evidence", b"0"]
+                )
+                .unwrap(),
+                strings(&[
+                    "7",
+                    "0",
+                    "3",
+                    "schema_version",
+                    "warnings",
+                    "truncated",
+                    "extra",
+                    "0"
+                ])
+            );
+            assert_eq!(
+                call(5, &[b"-0"]).unwrap()[..3],
+                strings(&["0", "0", "4"])[..]
+            );
+            for version in [
+                &b""[..],
+                b" 1",
+                b"1 ",
+                b"+1",
+                b"1e3",
+                b"1.5",
+                b"0x1",
+                b"-",
+                b"1234567890123456789",
+            ] {
+                assert_eq!(call(5, &[version]), None, "{version:?}");
+            }
+            assert_eq!(call(5, &[]), None);
+        }
+
+        #[test]
+        fn malformed_null_and_capacity() {
+            let input = packet(&[b"0", b"0"]);
+            let mut out = [0x5a_u8; 128];
+            for (ptr, len, dst, cap) in [
+                (std::ptr::null(), 1, out.as_mut_ptr(), out.len()),
+                (input.as_ptr(), input.len(), std::ptr::null_mut(), 8),
+                (input.as_ptr(), MAX_INPUT + 1, out.as_mut_ptr(), out.len()),
+                (input.as_ptr(), input.len(), out.as_mut_ptr(), usize::MAX),
+            ] {
+                assert_eq!(
+                    unsafe { nntmux_w32_passkey_reindex_proxy_mcp(3, ptr, len, dst, cap) },
+                    DECLINE
+                );
+            }
+            for bad in [
+                vec![],
+                vec![1, 0, 0],
+                vec![1, 0, 0, 0, 9, 0, 0, 0],
+                vec![0, 0, 0, 0, 0],
+            ] {
+                assert_eq!(
+                    unsafe {
+                        nntmux_w32_passkey_reindex_proxy_mcp(
+                            3,
+                            bad.as_ptr(),
+                            bad.len(),
+                            out.as_mut_ptr(),
+                            out.len(),
+                        )
+                    },
+                    DECLINE
+                );
+            }
+            assert_eq!(
+                unsafe {
+                    nntmux_w32_passkey_reindex_proxy_mcp(
+                        99,
+                        input.as_ptr(),
+                        input.len(),
+                        out.as_mut_ptr(),
+                        out.len(),
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(out, [0x5a; 128]);
+            let full = call(3, &[b"0", b"0"])
+                .map(|parts| pack(&parts).unwrap().len())
+                .unwrap();
+            for cap in [0usize, 1, full - 1] {
+                let dst = if cap == 0 {
+                    std::ptr::null_mut()
+                } else {
+                    out.as_mut_ptr()
+                };
+                assert_eq!(
+                    unsafe {
+                        nntmux_w32_passkey_reindex_proxy_mcp(
+                            3,
+                            input.as_ptr(),
+                            input.len(),
+                            dst,
+                            cap,
+                        )
+                    },
+                    -(full as isize)
+                );
+            }
+            assert_eq!(out, [0x5a; 128]);
+            let mut alias = input.clone();
+            alias.resize(full.max(input.len()), 0);
+            let written = unsafe {
+                nntmux_w32_passkey_reindex_proxy_mcp(
+                    3,
+                    alias.as_ptr(),
+                    input.len(),
+                    alias.as_mut_ptr(),
+                    alias.len(),
+                )
+            };
+            assert_eq!(written, full as isize);
+        }
+    }
+}
