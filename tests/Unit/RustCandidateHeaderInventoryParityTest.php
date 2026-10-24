@@ -289,6 +289,25 @@ class RustCandidateHeaderInventoryParityTest extends TestCase
         }
         $this->assertNull(SpotCheckPlanner::selectPackedNative(['identity' => new \stdClass, 'files' => []], 1, 100));
         $this->assertSame([], (new SpotCheckPlanner)->select(['identity' => new \stdClass, 'files' => []], 1, 100));
+
+        // PHP_INT_MAX byte addition overflow declines in selectPackedNative and falls back to PHP float coercion.
+        $overflow = [
+            'identity' => 'overflow',
+            'files' => [[
+                'key' => 'file',
+                'totalparts' => 4,
+                'totalparts_inferred' => true,
+                'segments' => [
+                    ['number' => 4, 'messageid' => 'first', 'bytes' => PHP_INT_MAX],
+                    ['number' => 1, 'messageid' => 'second', 'bytes' => 2],
+                ],
+            ]],
+        ];
+        $this->assertNull(SpotCheckPlanner::selectPackedNative($overflow, 2, PHP_INT_MAX));
+        $this->assertSame(
+            SpotCheckPlanner::selectPhp($overflow, 2, PHP_INT_MAX),
+            (new SpotCheckPlanner)->select($overflow, 2, PHP_INT_MAX),
+        );
     }
 
     public function test_spot_check_abi_reports_required_capacity_and_declines_invalid_input(): void

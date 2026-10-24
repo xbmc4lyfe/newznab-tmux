@@ -9975,7 +9975,7 @@ pub mod candidate_inventory {
 
         let mut selected: Vec<(usize, usize)> = Vec::new();
         let mut seen: HashSet<&[u8], Seeded> = HashSet::with_hasher(Seeded::new());
-        let mut used: i128 = 0;
+        let mut used: i64 = 0;
         let mut round = 0;
         while (selected.len() as i64) < maximum_articles {
             let mut added = false;
@@ -9983,14 +9983,16 @@ pub mod candidate_inventory {
                 let Some(candidate) = files[slot].candidates.get(round) else {
                     continue;
                 };
-                if seen.contains(candidate.messageid)
-                    || used + i128::from(candidate.bytes) > i128::from(maximum_header_bytes)
-                {
+                if seen.contains(candidate.messageid) {
+                    continue;
+                }
+                let next_used = used.checked_add(candidate.bytes)?;
+                if next_used > maximum_header_bytes {
                     continue;
                 }
                 selected.push((slot, round));
                 seen.insert(candidate.messageid);
-                used += i128::from(candidate.bytes);
+                used = next_used;
                 added = true;
                 if selected.len() as i64 >= maximum_articles {
                     break;
