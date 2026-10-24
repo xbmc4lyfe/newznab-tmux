@@ -16,7 +16,10 @@ use App\Services\Releases\ReleaseDuplicateFinder;
 use App\Services\Releases\ReleaseGroupResolver;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\OversizedCollectionDeferrals;
+use App\Support\Data\ReleaseCreationResult;
+use App\Support\RustPipelineLibrary;
 use App\Support\Utf8;
+use FFI;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Schema;
@@ -24,6 +27,76 @@ use Illuminate\Support\Str;
 
 class ReleaseCreationService
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_runner_release_transform(uint32_t mode, const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    // Retain PHP until common/uncommon mean and p99 all demonstrate a 1.5x gain.
+    private static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
+
+    public static function setUseRustFfi(?bool $enabled): void
+    {
+        self::$useRustFfi = $enabled ?? false;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    /** @param list<string> $fields
+     * @return list<string>|null
+     */
+    private static function cleaningNative(int $mode, array $fields): ?array
+    {
+        try {
+            self::$ffi ??= RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF) ?? false;
+            if (self::$ffi === false) {
+                return null;
+            }
+            $input = '';
+            foreach ($fields as $field) {
+                if (strlen($field) > 0xFFFFFFFF) {
+                    return null;
+                }
+                $input .= pack('V', strlen($field)).$field;
+            }
+            for ($cap = max(256, strlen($input) * 2); $cap <= 16777216; $cap *= 2) {
+                $out = self::$ffi->new('char['.$cap.']');
+                // @phpstan-ignore method.notFound
+                $written = self::$ffi->nntmux_runner_release_transform($mode, $input, strlen($input), $out, $cap);
+                if ($written === -2) {
+                    continue;
+                }
+                if (! is_int($written) || $written < 0 || $written > $cap) {
+                    return null;
+                }
+                $bytes = $written === 0 ? '' : FFI::string($out, $written);
+                $result = [];
+                for ($offset = 0; $offset < $written;) {
+                    if ($written - $offset < 4) {
+                        return null;
+                    }
+                    $length = unpack('Vlength', substr($bytes, $offset, 4))['length'];
+                    $offset += 4;
+                    if ($length > $written - $offset) {
+                        return null;
+                    }
+                    $result[] = substr($bytes, $offset, $length);
+                    $offset += $length;
+                }
+
+                return $result;
+            }
+        } catch (\Throwable) {
+            // Missing symbols, unavailable FFI and declined inputs retain PHP behavior.
+        }
+
+        return null;
+    }
+
     public function __construct(
         private readonly ReleaseCleaningService $releaseCleaning,
         private readonly CollectionCleanupService $collectionCleanupService,
@@ -94,29 +167,17 @@ class ReleaseCreationService
         }
 
         foreach ($collections as $collection) {
-            $cleanRelName = Utf8::clean(str_replace(['#', '@', '$', '%', '^', '§', '¨', '©', 'Ö'], '', $collection->subject));
-            $fromName = Utf8::clean(trim($collection->fromname, "'"));
-
+            [$cleanRelName, $fromName] = $this->sanitizeCollectionNames((string) $collection->subject, (string) $collection->fromname);
             $cleanedMeta = $this->releaseCleaning->releaseCleaner(
                 $collection->subject,
                 $collection->fromname,
                 $collection->gname
             );
-
-            $namingRegexId = 0;
-            if (\is_array($cleanedMeta)) {
-                $namingRegexId = isset($cleanedMeta['id']) ? (int) $cleanedMeta['id'] : 0;
-            }
-
-            if (\is_array($cleanedMeta)) {
-                $properName = $cleanedMeta['properlynamed'] ?? false;
-                $preID = max(0, (int) ($cleanedMeta['predb'] ?? 0));
-                $cleanedName = $cleanedMeta['cleansubject'] ?? $cleanRelName;
-            } else {
-                $properName = true;
-                $preID = 0;
-                $cleanedName = $cleanRelName;
-            }
+            $meta = $this->normalizeCollectionReleaseMeta($cleanedMeta, $cleanRelName);
+            $namingRegexId = $meta['namingRegexId'];
+            $properName = $meta['properName'];
+            $preID = $meta['preID'];
+            $cleanedName = $meta['cleanedName'];
 
             if ($preID === 0 && $cleanedName !== '') {
                 $preMatch = Predb::matchPre($cleanedName);
@@ -219,7 +280,7 @@ class ReleaseCreationService
             );
         }
 
-        return ['added' => $returnCount, 'dupes' => $duplicate];
+        return ReleaseCreationResult::normalizeResultArray(['added' => $returnCount, 'dupes' => $duplicate]);
     }
 
     /**
@@ -260,6 +321,70 @@ class ReleaseCreationService
         }
         $idsByName = app(ReleaseGroupResolver::class)->idsByName(array_keys($allNames));
 
+        return $this->resolveCollectionGroupIds($namesByCollection, $idsByName);
+    }
+
+    /** @return array{string, string} */
+    public function sanitizeCollectionNames(string $subject, string $poster): array
+    {
+        return self::usesRustFfi() ? $this->sanitizeCollectionNamesNative($subject, $poster) : $this->sanitizeCollectionNamesPhp($subject, $poster);
+    }
+
+    /** @return array{string, string} */
+    public function sanitizeCollectionNamesPhp(string $subject, string $poster): array
+    {
+        return [Utf8::clean(str_replace(['#', '@', '$', '%', '^', '§', '¨', '©', 'Ö'], '', $subject)), Utf8::clean(trim($poster, "'"))];
+    }
+
+    /** @return array{string, string} */
+    public function sanitizeCollectionNamesNative(string $subject, string $poster): array
+    {
+        $result = self::cleaningNative(5, [$subject, $poster]);
+
+        return $result === null || count($result) !== 2 ? $this->sanitizeCollectionNamesPhp($subject, $poster) : [Utf8::clean($result[0]), Utf8::clean($result[1])];
+    }
+
+    /** @return array{namingRegexId:int, properName:mixed, preID:int, cleanedName:mixed} */
+    public function normalizeCollectionReleaseMeta(mixed $cleanedMeta, string $cleanRelName): array
+    {
+        return self::usesRustFfi() ? $this->normalizeCollectionReleaseMetaNative($cleanedMeta, $cleanRelName) : $this->normalizeCollectionReleaseMetaPhp($cleanedMeta, $cleanRelName);
+    }
+
+    /** @return array{namingRegexId:int, properName:mixed, preID:int, cleanedName:mixed} */
+    public function normalizeCollectionReleaseMetaPhp(mixed $cleanedMeta, string $cleanRelName): array
+    {
+        return is_array($cleanedMeta)
+            ? ['namingRegexId' => (int) ($cleanedMeta['id'] ?? 0), 'properName' => $cleanedMeta['properlynamed'] ?? false, 'preID' => max(0, (int) ($cleanedMeta['predb'] ?? 0)), 'cleanedName' => $cleanedMeta['cleansubject'] ?? $cleanRelName]
+            : ['namingRegexId' => 0, 'properName' => true, 'preID' => 0, 'cleanedName' => $cleanRelName];
+    }
+
+    /** @return array{namingRegexId:int, properName:mixed, preID:int, cleanedName:mixed} */
+    public function normalizeCollectionReleaseMetaNative(mixed $cleanedMeta, string $cleanRelName): array
+    {
+        $isArray = is_array($cleanedMeta);
+        $result = self::cleaningNative(8, [(string) (int) $isArray, (string) ($isArray ? (int) ($cleanedMeta['id'] ?? 0) : 0), (string) ($isArray ? (int) ($cleanedMeta['predb'] ?? 0) : 0)]);
+        if ($result === null || count($result) !== 3) {
+            return $this->normalizeCollectionReleaseMetaPhp($cleanedMeta, $cleanRelName);
+        }
+
+        return ['namingRegexId' => (int) $result[0], 'properName' => $result[2] === '1' ? ($cleanedMeta['properlynamed'] ?? false) : true, 'preID' => (int) $result[1], 'cleanedName' => $result[2] === '1' ? ($cleanedMeta['cleansubject'] ?? $cleanRelName) : $cleanRelName];
+    }
+
+    /** @param array<int, array<string|int, bool>> $namesByCollection
+     * @param  array<string|int, int>  $idsByName
+     * @return array<int, list<int>>
+     */
+    public function resolveCollectionGroupIds(array $namesByCollection, array $idsByName): array
+    {
+        return self::usesRustFfi() ? $this->resolveCollectionGroupIdsNative($namesByCollection, $idsByName) : $this->resolveCollectionGroupIdsPhp($namesByCollection, $idsByName);
+    }
+
+    /** @param array<int, array<string|int, bool>> $namesByCollection
+     * @param  array<string|int, int>  $idsByName
+     * @return array<int, list<int>>
+     */
+    public function resolveCollectionGroupIdsPhp(array $namesByCollection, array $idsByName): array
+    {
         $resolved = [];
         foreach ($namesByCollection as $collectionId => $names) {
             foreach (array_keys($names) as $name) {
@@ -268,11 +393,38 @@ class ReleaseCreationService
                 }
             }
         }
-
         foreach ($resolved as &$ids) {
             $ids = array_values(array_unique($ids));
         }
         unset($ids);
+
+        return $resolved;
+    }
+
+    /** @param array<int, array<string|int, bool>> $namesByCollection
+     * @param  array<string|int, int>  $idsByName
+     * @return array<int, list<int>>
+     */
+    public function resolveCollectionGroupIdsNative(array $namesByCollection, array $idsByName): array
+    {
+        $fields = [(string) count($idsByName)];
+        foreach ($idsByName as $name => $id) {
+            array_push($fields, (string) $name, (string) $id);
+        }
+        foreach ($namesByCollection as $id => $names) {
+            array_push($fields, (string) $id, (string) count($names));
+            foreach (array_keys($names) as $name) {
+                $fields[] = (string) $name;
+            }
+        }
+        $result = self::cleaningNative(7, $fields);
+        if ($result === null || count($result) % 2 !== 0) {
+            return $this->resolveCollectionGroupIdsPhp($namesByCollection, $idsByName);
+        }
+        $resolved = [];
+        foreach (array_chunk($result, 2) as [$id, $groupId]) {
+            $resolved[(int) $id][] = (int) $groupId;
+        }
 
         return $resolved;
     }
