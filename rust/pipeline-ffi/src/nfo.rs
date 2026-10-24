@@ -23102,3 +23102,451 @@ pub unsafe extern "C" fn nntmux_w31_article_candidate_barrier_fingerprint_comman
     }))
     .unwrap_or(-1)
 }
+
+/// Wave 32.2 pure helpers for directory-sync probes, NZB source path pairs,
+/// verification reset scratch records and path safety, and the publication
+/// endpoints' response classification. Shares the Wave 30 JSON wire.
+mod wave32_nzb_sync_verification_publication {
+    use super::wave30_nfo_nzb_manifest_import_yenc_commands::{J, MAX_BYTES, parse, write};
+    use super::{nfo_abi_range, yenc_ranges_overlap};
+    use std::slice;
+
+    fn obj(entries: Vec<(&[u8], J)>) -> J {
+        J::Obj(entries.into_iter().map(|(k, v)| (k.to_vec(), v)).collect())
+    }
+
+    fn opt_str(value: &J) -> Option<Option<&[u8]>> {
+        match value {
+            J::Null => Some(None),
+            J::Str(s) => Some(Some(s)),
+            _ => None,
+        }
+    }
+
+    fn opt_int(value: &J) -> Option<Option<i64>> {
+        match value {
+            J::Null => Some(None),
+            J::Int(i) => Some(Some(*i)),
+            _ => None,
+        }
+    }
+
+    fn opt_bool(value: &J) -> Option<Option<bool>> {
+        match value {
+            J::Null => Some(None),
+            J::Bool(b) => Some(Some(*b)),
+            _ => None,
+        }
+    }
+
+    fn str_or_null(value: Option<&[u8]>) -> J {
+        value.map_or(J::Null, |s| J::Str(s.to_vec()))
+    }
+
+    /// Everything up to and including the last `/`, or empty without one.
+    fn parent(path: &[u8]) -> &[u8] {
+        path.iter()
+            .rposition(|b| *b == b'/')
+            .map_or(&[][..], |i| &path[..=i])
+    }
+
+    fn probe(function: Option<&[u8]>, supported: bool, synced: Option<bool>) -> J {
+        if function.is_none_or(<[u8]>::is_empty) || !supported {
+            return obj(vec![
+                (b"ok", J::Bool(false)),
+                (b"failure", J::Str(b"unsupported".to_vec())),
+            ]);
+        }
+        obj(vec![(b"ok", J::Bool(synced == Some(true)))])
+    }
+
+    fn path_pair(source: &[u8], destination: &[u8]) -> J {
+        let sibling =
+            !source.is_empty() && !destination.is_empty() && parent(source) == parent(destination);
+        obj(vec![
+            (b"source", J::Str(source.to_vec())),
+            (b"destination", J::Str(destination.to_vec())),
+            (b"staged", J::Bool(destination != source)),
+            (b"sibling", J::Bool(sibling)),
+        ])
+    }
+
+    fn terminal_record(
+        candidate: i64,
+        version: i64,
+        host: &[u8],
+        audit: Option<i64>,
+        guid: Option<&[u8]>,
+    ) -> J {
+        obj(vec![
+            (b"host", J::Str(host.to_vec())),
+            (
+                b"candidate_id",
+                if audit.is_none() {
+                    J::Int(candidate)
+                } else {
+                    J::Null
+                },
+            ),
+            (b"version", J::Int(version.max(0))),
+            (b"audit_release_id", audit.map_or(J::Null, J::Int)),
+            (b"terminal", J::Bool(true)),
+            (
+                b"delete_guid",
+                str_or_null(guid.filter(|g| !g.is_empty())),
+            ),
+        ])
+    }
+
+    /// `$candidate` names something strictly below `$root` without `.`/`..` segments.
+    fn safe_subpath(root: &[u8], candidate: &[u8]) -> bool {
+        if root.is_empty() || root.contains(&0) || candidate.contains(&0) {
+            return false;
+        }
+        let end = root.iter().rposition(|b| *b != b'/').map_or(0, |i| i + 1);
+        let Some(rest) = candidate
+            .strip_prefix(&root[..end])
+            .and_then(|r| r.strip_prefix(b"/"))
+        else {
+            return false;
+        };
+        let mut named = false;
+        for segment in rest.split(|b| *b == b'/') {
+            if segment.is_empty() {
+                continue;
+            }
+            if segment == b"." || segment == b".." {
+                return false;
+            }
+            named = true;
+        }
+        named
+    }
+
+    fn batch_status(paused: bool, count: i64, max: i64) -> J {
+        let (status, error, paused) = if count <= 0 {
+            (422, J::Str(b"items must be a non-empty list.".to_vec()), false)
+        } else if count > max {
+            (
+                422,
+                J::Str(format!("A batch holds at most {max} items.").into_bytes()),
+                false,
+            )
+        } else {
+            (200, J::Null, paused)
+        };
+        obj(vec![
+            (b"status", J::Int(status)),
+            (b"error", error),
+            (b"max_items", J::Int(max)),
+            (b"paused", J::Bool(paused)),
+        ])
+    }
+
+    fn single_response(release: Option<i64>, kind: Option<&[u8]>, message: Option<&[u8]>) -> J {
+        let (status, key, value): (i64, &[u8], J) = match kind {
+            Some(b"published") => (200, b"release_id", release.map_or(J::Null, J::Int)),
+            Some(b"deferred") => (409, b"deferred", str_or_null(message)),
+            Some(b"filtered" | b"metadata_review" | b"unresolved") => (200, b"release_id", J::Null),
+            _ => (409, b"error", str_or_null(message)),
+        };
+        obj(vec![
+            (b"status", J::Int(status)),
+            (b"body", obj(vec![(key, value)])),
+        ])
+    }
+
+    fn compute(operation: u32, args: &[J]) -> Option<J> {
+        match (operation, args) {
+            (0, [function, J::Bool(supported), synced]) => {
+                Some(probe(opt_str(function)?, *supported, opt_bool(synced)?))
+            }
+            (1, [J::Str(source), J::Str(destination)]) => Some(path_pair(source, destination)),
+            (2, [J::Int(candidate), J::Int(version), J::Str(host), audit, guid]) => Some(
+                terminal_record(*candidate, *version, host, opt_int(audit)?, opt_str(guid)?),
+            ),
+            (3, [J::Str(root), J::Str(candidate)]) => Some(J::Bool(safe_subpath(root, candidate))),
+            (4, [J::Bool(paused), J::Int(count), J::Int(max)]) => {
+                Some(batch_status(*paused, *count, *max))
+            }
+            (5, [release, kind, message]) => Some(single_response(
+                opt_int(release)?,
+                opt_str(kind)?,
+                opt_str(message)?,
+            )),
+            _ => None,
+        }
+    }
+
+    /// # Safety
+    /// See [`super::nntmux_w32_nzb_sync_verification_publication`].
+    pub(super) unsafe fn evaluate(
+        operation: u32,
+        input: *const u8,
+        length: usize,
+        output: *mut u8,
+        capacity: usize,
+    ) -> i64 {
+        if !nfo_abi_range(input, length, false)
+            || !nfo_abi_range(output, capacity, false)
+            || length > MAX_BYTES
+            || capacity > MAX_BYTES
+            || yenc_ranges_overlap(input as usize, length, output as usize, capacity)
+        {
+            return -1;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, length) };
+        let Some(J::Arr(args)) = parse(bytes) else {
+            return -1;
+        };
+        let Some(result) = compute(operation, &args) else {
+            return -1;
+        };
+        let mut wire = Vec::new();
+        write(&mut wire, &J::Arr(vec![result]));
+        if wire.len() > MAX_BYTES {
+            return -1;
+        }
+        let needed = wire.len() as i64;
+        if wire.len() > capacity {
+            return -needed;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(wire.as_ptr(), output, wire.len()) };
+        needed
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn run(operation: u32, input: &str) -> Option<String> {
+            let mut out = vec![0xa5u8; 4096];
+            let written = unsafe {
+                evaluate(
+                    operation,
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            if written < 0 {
+                assert_eq!(written, -1);
+                return None;
+            }
+            Some(String::from_utf8(out[..written as usize].to_vec()).unwrap())
+        }
+
+        fn ok(operation: u32, input: &str) -> String {
+            run(operation, input).unwrap_or_else(|| panic!("{operation} {input} declined"))
+        }
+
+        #[test]
+        fn w32_2_probe_results() {
+            let unsupported = r#"[{"ok":false,"failure":"unsupported"}]"#;
+            for (input, expected) in [
+                (r#"["fsync",true,true]"#, r#"[{"ok":true}]"#),
+                (r#"["fsync",true,false]"#, r#"[{"ok":false}]"#),
+                (r#"["fsync",true,null]"#, r#"[{"ok":false}]"#),
+                (r#"["fsync",false,true]"#, unsupported),
+                (r#"[null,true,true]"#, unsupported),
+                (r#"["",true,true]"#, unsupported),
+                (r#"["\u0000",true,true]"#, r#"[{"ok":true}]"#),
+            ] {
+                assert_eq!(ok(0, input), expected, "{input}");
+            }
+            for bad in [r#"[1,true,true]"#, r#"["fsync",1,true]"#, r#"["fsync",true,0]"#] {
+                assert_eq!(run(0, bad), None, "{bad}");
+            }
+        }
+
+        #[test]
+        fn w32_2_source_path_pairs() {
+            for (input, expected) in [
+                (
+                    r#"["/n/a/guid.nzb.gz","/n/a/.guid.nzb.gz.1"]"#,
+                    r#"[{"source":"/n/a/guid.nzb.gz","destination":"/n/a/.guid.nzb.gz.1","staged":true,"sibling":true}]"#,
+                ),
+                (
+                    r#"["/n/a/x","/n/a/x"]"#,
+                    r#"[{"source":"/n/a/x","destination":"/n/a/x","staged":false,"sibling":true}]"#,
+                ),
+                (
+                    r#"["/n/a/x","/n/b/x"]"#,
+                    r#"[{"source":"/n/a/x","destination":"/n/b/x","staged":true,"sibling":false}]"#,
+                ),
+                (
+                    r#"["a","b"]"#,
+                    r#"[{"source":"a","destination":"b","staged":true,"sibling":true}]"#,
+                ),
+                (
+                    r#"["/a","a"]"#,
+                    r#"[{"source":"/a","destination":"a","staged":true,"sibling":false}]"#,
+                ),
+                (
+                    r#"["",""]"#,
+                    r#"[{"source":"","destination":"","staged":false,"sibling":false}]"#,
+                ),
+            ] {
+                assert_eq!(ok(1, input), expected, "{input}");
+            }
+            assert_eq!(run(1, r#"["a",null]"#), None);
+        }
+
+        #[test]
+        fn w32_2_terminal_records() {
+            assert_eq!(
+                ok(2, r#"[7,3,"w1",null,"g"]"#),
+                r#"[{"host":"w1","candidate_id":7,"version":3,"audit_release_id":null,"terminal":true,"delete_guid":"g"}]"#
+            );
+            assert_eq!(
+                ok(2, r#"[7,-3,"",9,""]"#),
+                r#"[{"host":"","candidate_id":null,"version":0,"audit_release_id":9,"terminal":true,"delete_guid":null}]"#
+            );
+            assert_eq!(
+                ok(2, r#"[-9223372036854775808,9223372036854775807,"é",null,null]"#),
+                r#"[{"host":"é","candidate_id":-9223372036854775808,"version":9223372036854775807,"audit_release_id":null,"terminal":true,"delete_guid":null}]"#
+            );
+            assert_eq!(run(2, r#"[7,3,"w1",null]"#), None);
+            assert_eq!(run(2, r#"[7,3,"w1","9",null]"#), None);
+        }
+
+        #[test]
+        fn w32_2_safe_subpaths() {
+            for (root, candidate, expected) in [
+                ("/s", "/s/a", true),
+                ("/s/", "/s/a", true),
+                ("/s//", "/s//a", true),
+                ("/s/.", "/s/./a", true),
+                ("/", "/a", true),
+                ("s", "s/a/b", true),
+                ("/s", "/s", false),
+                ("/s", "/s/", false),
+                ("/s", "/sa", false),
+                ("/s", "/s/..", false),
+                ("/s", "/s/a/../b", false),
+                ("/s", "/s/./a", false),
+                ("/s", "/s/...", true),
+                ("", "/a", false),
+                ("/s", "/s/a\u{0}", false),
+            ] {
+                let input = format!(
+                    "[\"{}\",\"{}\"]",
+                    root.replace('\0', "\\u0000"),
+                    candidate.replace('\0', "\\u0000")
+                );
+                assert_eq!(ok(3, &input), format!("[{expected}]"), "{input}");
+            }
+        }
+
+        #[test]
+        fn w32_2_batch_and_single_classification() {
+            for (input, expected) in [
+                (
+                    "[false,1,64]",
+                    r#"[{"status":200,"error":null,"max_items":64,"paused":false}]"#,
+                ),
+                (
+                    "[true,64,64]",
+                    r#"[{"status":200,"error":null,"max_items":64,"paused":true}]"#,
+                ),
+                (
+                    "[true,0,64]",
+                    r#"[{"status":422,"error":"items must be a non-empty list.","max_items":64,"paused":false}]"#,
+                ),
+                (
+                    "[true,65,64]",
+                    r#"[{"status":422,"error":"A batch holds at most 64 items.","max_items":64,"paused":false}]"#,
+                ),
+                (
+                    "[false,1,-9223372036854775808]",
+                    r#"[{"status":422,"error":"A batch holds at most -9223372036854775808 items.","max_items":-9223372036854775808,"paused":false}]"#,
+                ),
+            ] {
+                assert_eq!(ok(4, input), expected, "{input}");
+            }
+            for (input, expected) in [
+                (
+                    r#"[5,"published",null]"#,
+                    r#"[{"status":200,"body":{"release_id":5}}]"#,
+                ),
+                (
+                    r#"[null,"published",null]"#,
+                    r#"[{"status":200,"body":{"release_id":null}}]"#,
+                ),
+                (
+                    r#"[5,"deferred","wait"]"#,
+                    r#"[{"status":409,"body":{"deferred":"wait"}}]"#,
+                ),
+                (
+                    r#"[5,"metadata_review","x"]"#,
+                    r#"[{"status":200,"body":{"release_id":null}}]"#,
+                ),
+                (
+                    r#"[null,"stale","gone"]"#,
+                    r#"[{"status":409,"body":{"error":"gone"}}]"#,
+                ),
+                (
+                    r#"[null,null,null]"#,
+                    r#"[{"status":409,"body":{"error":null}}]"#,
+                ),
+                (
+                    r#"[null,"PUBLISHED","\"q\""]"#,
+                    r#"[{"status":409,"body":{"error":"\"q\""}}]"#,
+                ),
+            ] {
+                assert_eq!(ok(5, input), expected, "{input}");
+            }
+            assert_eq!(run(4, "[0,1,64]"), None);
+            assert_eq!(run(5, r#"["5","published",null]"#), None);
+        }
+
+        #[test]
+        fn w32_2_abi_sentinels() {
+            for (op, bad) in [(0, "[\"a\""), (1, "{}"), (3, "[\"a\"]"), (6, "[]"), (4, "[1.0]")] {
+                assert_eq!(run(op, bad), None, "{op} {bad}");
+            }
+            let input = b"[\"/s\",\"/s/a\"]";
+            let mut out = [0x5au8; 16];
+            let call = |p: *const u8, len: usize, o: *mut u8, cap: usize| unsafe {
+                evaluate(3, p, len, o, cap)
+            };
+            assert_eq!(call(std::ptr::null(), 0, out.as_mut_ptr(), out.len()), -1);
+            assert_eq!(call(input.as_ptr(), input.len(), std::ptr::null_mut(), 0), -1);
+            assert_eq!(
+                call(input.as_ptr(), MAX_BYTES + 1, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            assert_eq!(call(input.as_ptr(), input.len(), out.as_mut_ptr(), 5), -6);
+            assert!(out.iter().all(|b| *b == 0x5a));
+            assert_eq!(call(input.as_ptr(), input.len(), out.as_mut_ptr(), 6), 6);
+            assert_eq!(&out[..6], b"[true]");
+            let p = out.as_mut_ptr();
+            assert_eq!(call(p, 4, unsafe { p.add(2) }, 4), -1);
+        }
+    }
+}
+
+/// Evaluate one Wave 32.2 helper. `input` is a `json_encode()`d argument list;
+/// the one-element JSON array result is copied to `output`. Returns the byte
+/// count written, the negated required capacity when `output` is too small
+/// (nothing written), or -1 when the input is malformed or outside the contract.
+///
+/// # Safety
+/// Both ranges must be live, disjoint readable/writable allocations. Pointers must
+/// be non-null even for zero lengths; arithmetic checks cannot prove provenance.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w32_nzb_sync_verification_publication(
+    operation: u32,
+    input: *const u8,
+    length: usize,
+    output: *mut u8,
+    capacity: usize,
+) -> i64 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        wave32_nzb_sync_verification_publication::evaluate(
+            operation, input, length, output, capacity,
+        )
+    }))
+    .unwrap_or(-1)
+}
