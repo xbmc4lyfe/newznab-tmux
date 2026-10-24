@@ -11,6 +11,8 @@
 //! short announce in under a microsecond, so end-to-end `parse()` measured only 1.0-1.2x. The JSON
 //! feed sources (predataba.se, xREL, srrDB, predb.ovh/club/net/org, apibay) decode their response
 //! bodies through `nntmux_predb_json_feed_parse` instead of `json_decode` plus per-row PHP.
+//! `Nima4kSource::parseHtml` takes `nntmux_predb_nima4k_parse_html` for strict, unambiguous listings
+//! (40-70x on 25/100-card pages) and keeps its dual-DOM PHP parser for everything else.
 use crate::OutCursor;
 use std::slice;
 
@@ -5483,5 +5485,689 @@ mod json_source_tests {
         assert!(n < -1);
         let full = parse(json, JSON_PREDB_ORG, 1).unwrap();
         assert_eq!(-n as usize, full.len());
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// NIMA4K release listing HTML (`Nima4kSource::parseHtml`)
+// ---------------------------------------------------------------------------------------------
+//
+// A strict single-pass tokenizer and tree builder for the subset of HTML on which libxml's legacy
+// HTML parser and the HTML5 `Dom\HTMLDocument` parser provably build the same element tree with no
+// error that `parseHtmlPhp` rejects or must investigate: an explicit html/head/body skeleton,
+// lowercase whitelisted elements that are closed in order, no implied end tags, no raw text other
+// than a plain head `<title>`, simple comments, and only the five basic named references, valid
+// numeric references or a bare `&` before whitespace. Anything else returns -1 so PHP performs the
+// full dual-DOM verification and raises the exact diagnostic. Accepted documents must also satisfy
+// every release-card rule; cards with non-ASCII or otherwise unusual names decline as well.
+
+use std::ffi::c_char;
+
+const NIMA_MAX_BYTES: usize = 8 << 20;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NimaTag {
+    Div,
+    Flow,
+    Anchor,
+    Phrasing,
+    Paragraph,
+    Heading,
+    H2,
+    Span,
+    List,
+    Li,
+}
+
+struct NimaFrame {
+    name: Vec<u8>,
+    tag: NimaTag,
+    phrasing: bool,
+    cover_box: bool,
+    article_right: bool,
+}
+
+#[derive(Default)]
+struct NimaCard {
+    depth: usize,
+    subtitles: usize,
+    subtitle_depth: Option<usize>,
+    text: Vec<u8>,
+    covers: usize,
+    alt: Vec<u8>,
+    cover_boxes: usize,
+}
+
+#[inline]
+fn nima_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+fn nima_skip_space(s: &[u8], mut i: usize) -> usize {
+    while i < s.len() && nima_space(s[i]) {
+        i += 1;
+    }
+    i
+}
+
+/// Valid UTF-8 without `Nima4kSource::FORBIDDEN_CHARACTERS` or a leading byte order mark.
+fn nima_prescan(s: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(s) else {
+        return false;
+    };
+    if s.starts_with(b"\xEF\xBB\xBF") {
+        return false;
+    }
+    for &b in s {
+        if b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r') || b == 0x7f {
+            return false;
+        }
+    }
+    if s.is_ascii() {
+        return true;
+    }
+    text.chars().all(|c| !nima_forbidden(c as u32))
+}
+
+#[inline]
+fn nima_forbidden(cp: u32) -> bool {
+    cp < 0x09
+        || cp == 0x0b
+        || cp == 0x0c
+        || (0x0e..=0x1f).contains(&cp)
+        || (0x7f..=0x9f).contains(&cp)
+        || (0xfdd0..=0xfdef).contains(&cp)
+        || cp & 0xfffe == 0xfffe
+}
+
+/// Numeric references that neither parser repairs, replaces or reports.
+#[inline]
+fn nima_reference_allowed(cp: u32) -> bool {
+    matches!(cp, 0x09 | 0x0a)
+        || (0x20..=0x7e).contains(&cp)
+        || ((0xa0..=0x10ffff).contains(&cp)
+            && !(0xd800..=0xdfff).contains(&cp)
+            && !nima_forbidden(cp))
+}
+
+/// Decodes one reference at `s[i] == b'&'`; returns the index after it, or `None` to decline.
+fn nima_reference(s: &[u8], i: usize, out: &mut Vec<u8>) -> Option<usize> {
+    let next = *s.get(i + 1)?;
+    if nima_space(next) {
+        // Both parsers keep a bare ampersand before whitespace as literal text.
+        out.push(b'&');
+        return Some(i + 1);
+    }
+    if next == b'#' {
+        let (hex, mut p) = match s.get(i + 2) {
+            Some(b'x' | b'X') => (true, i + 3),
+            _ => (false, i + 2),
+        };
+        let start = p;
+        let mut cp: u32 = 0;
+        while p < s.len() && p - start < 8 {
+            let digit = match s[p] {
+                b'0'..=b'9' => u32::from(s[p] - b'0'),
+                b'a'..=b'f' if hex => u32::from(s[p] - b'a' + 10),
+                b'A'..=b'F' if hex => u32::from(s[p] - b'A' + 10),
+                _ => break,
+            };
+            cp = cp * if hex { 16 } else { 10 } + digit;
+            p += 1;
+        }
+        if p == start || s.get(p) != Some(&b';') || !nima_reference_allowed(cp) {
+            return None;
+        }
+        let c = char::from_u32(cp)?;
+        let mut buf = [0u8; 4];
+        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+        return Some(p + 1);
+    }
+    for (name, value) in [
+        (&b"amp;"[..], b'&'),
+        (b"lt;", b'<'),
+        (b"gt;", b'>'),
+        (b"quot;", b'"'),
+    ] {
+        if s[i + 1..].starts_with(name) {
+            out.push(value);
+            return Some(i + 1 + name.len());
+        }
+    }
+    None
+}
+
+struct NimaAttr<'a> {
+    name: &'a [u8],
+    value: Vec<u8>,
+}
+
+/// A start tag at `s[i] == b'<'`: `(lowercase name, attributes, self-closing, index after '>')`.
+#[allow(clippy::type_complexity)]
+fn nima_start_tag(s: &[u8], i: usize) -> Option<(&[u8], Vec<NimaAttr<'_>>, bool, usize)> {
+    let mut p = i + 1;
+    let name_start = p;
+    while p < s.len() && (s[p].is_ascii_lowercase() || (p > name_start && s[p].is_ascii_digit())) {
+        p += 1;
+    }
+    if p == name_start {
+        return None;
+    }
+    let name = &s[name_start..p];
+    let mut attrs: Vec<NimaAttr<'_>> = Vec::new();
+    loop {
+        let q = nima_skip_space(s, p);
+        match s.get(q)? {
+            b'>' => return Some((name, attrs, false, q + 1)),
+            b'/' => return (s.get(q + 1) == Some(&b'>')).then_some((name, attrs, true, q + 2)),
+            _ => {}
+        }
+        if q == p {
+            return None;
+        }
+        p = q;
+        let attr_start = p;
+        while p < s.len()
+            && (s[p].is_ascii_lowercase()
+                || (p > attr_start && (s[p].is_ascii_digit() || s[p] == b'-' || s[p] == b'_')))
+        {
+            p += 1;
+        }
+        if p == attr_start {
+            return None;
+        }
+        let attr = &s[attr_start..p];
+        if attrs.iter().any(|a| a.name == attr) {
+            return None;
+        }
+        let mut value = Vec::new();
+        if s.get(p) == Some(&b'=') {
+            p += 1;
+            match *s.get(p)? {
+                quote @ (b'"' | b'\'') => {
+                    p += 1;
+                    loop {
+                        match *s.get(p)? {
+                            b if b == quote => break,
+                            b'<' => return None,
+                            b'&' => p = nima_reference(s, p, &mut value)?,
+                            b => {
+                                value.push(b);
+                                p += 1;
+                            }
+                        }
+                    }
+                    p += 1;
+                }
+                _ => {
+                    let start = p;
+                    while p < s.len() && !nima_space(s[p]) && s[p] != b'>' {
+                        if !(s[p].is_ascii_alphanumeric()
+                            || matches!(s[p], b'.' | b'_' | b'-' | b':'))
+                        {
+                            return None;
+                        }
+                        p += 1;
+                    }
+                    if p == start {
+                        return None;
+                    }
+                    value.extend_from_slice(&s[start..p]);
+                }
+            }
+        }
+        attrs.push(NimaAttr { name: attr, value });
+    }
+}
+
+/// `</name>` at `s[i] == b'<'` for the expected lowercase `name`.
+fn nima_end_tag(s: &[u8], i: usize, name: &[u8]) -> Option<usize> {
+    let p = i + 2;
+    (s.get(i + 1) == Some(&b'/')
+        && s[p..].starts_with(name)
+        && s.get(p + name.len()) == Some(&b'>'))
+    .then_some(p + name.len() + 1)
+}
+
+/// A comment both parsers end at the first `-->`, at `s[i] == b'<'`.
+fn nima_comment(s: &[u8], i: usize) -> Option<usize> {
+    if !s[i..].starts_with(b"<!--") {
+        return None;
+    }
+    let body = i + 4;
+    let end = find(s, body, b"--")?;
+    let content = &s[body..end];
+    if s.get(end + 2) != Some(&b'>')
+        || content.first().is_some_and(|&b| b == b'>' || b == b'-')
+        || content.last() == Some(&b'-')
+        || content.windows(2).any(|w| w == b"<!")
+    {
+        return None;
+    }
+    Some(end + 3)
+}
+
+fn nima_class_has(value: &[u8], token: &[u8]) -> bool {
+    value.split(|&b| nima_space(b)).any(|t| t == token)
+}
+
+fn nima_attr<'a>(attrs: &'a [NimaAttr<'_>], name: &[u8]) -> Option<&'a [u8]> {
+    attrs
+        .iter()
+        .find(|a| a.name == name)
+        .map(|a| a.value.as_slice())
+}
+
+fn nima_classify(name: &[u8]) -> Option<(NimaTag, bool)> {
+    // (kind, phrasing content model)
+    Some(match name {
+        b"div" => (NimaTag::Div, false),
+        b"section" | b"article" | b"nav" | b"header" | b"footer" | b"main" | b"aside"
+        | b"figure" | b"figcaption" => (NimaTag::Flow, false),
+        b"a" => (NimaTag::Anchor, false),
+        b"p" => (NimaTag::Paragraph, true),
+        b"h1" | b"h3" | b"h4" | b"h5" | b"h6" => (NimaTag::Heading, true),
+        b"h2" => (NimaTag::H2, true),
+        b"span" => (NimaTag::Span, true),
+        b"strong" | b"em" | b"b" | b"i" | b"u" | b"small" | b"time" | b"abbr" | b"code"
+        | b"sup" | b"sub" | b"label" => (NimaTag::Phrasing, true),
+        b"ul" | b"ol" => (NimaTag::List, false),
+        b"li" => (NimaTag::Li, false),
+        _ => return None,
+    })
+}
+
+/// Head: whitespace, simple comments, `<meta charset="utf-8">`, `<link>` and one plain `<title>`.
+fn nima_head(s: &[u8], mut p: usize) -> Option<usize> {
+    let mut titled = false;
+    loop {
+        p = nima_skip_space(s, p);
+        if *s.get(p)? != b'<' {
+            return None;
+        }
+        if let Some(end) = nima_end_tag(s, p, b"head") {
+            return Some(end);
+        }
+        if s[p..].starts_with(b"<!--") {
+            p = nima_comment(s, p)?;
+            continue;
+        }
+        let (name, attrs, closed, end) = nima_start_tag(s, p)?;
+        match name {
+            b"meta" => {
+                if nima_attr(&attrs, b"http-equiv").is_some() {
+                    return None;
+                }
+                if let Some(charset) = nima_attr(&attrs, b"charset")
+                    && !charset.eq_ignore_ascii_case(b"utf-8")
+                {
+                    return None;
+                }
+                p = end;
+            }
+            b"link" => p = end,
+            b"title" if !titled && !closed && attrs.is_empty() => {
+                titled = true;
+                let close = find(s, end, b"</")?;
+                if s[end..close].iter().any(|&b| b == b'<' || b == b'&') {
+                    return None;
+                }
+                p = nima_end_tag(s, close, b"title")?;
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn nima_parse(s: &[u8], page_size: usize, out: &mut Vec<u8>) -> Option<usize> {
+    let mut p = nima_skip_space(s, 0);
+    if s.len() >= p + 15 && s[p..p + 15].eq_ignore_ascii_case(b"<!DOCTYPE html>") {
+        p = nima_skip_space(s, p + 15);
+    }
+    let (name, _, closed, end) = nima_start_tag(s, p)?;
+    if name != b"html" || closed {
+        return None;
+    }
+    p = nima_skip_space(s, end);
+    let (name, _, closed, end) = nima_start_tag(s, p)?;
+    if name != b"head" || closed {
+        return None;
+    }
+    p = nima_skip_space(s, nima_head(s, end)?);
+    let (name, _, closed, end) = nima_start_tag(s, p)?;
+    if name != b"body" || closed {
+        return None;
+    }
+    p = end;
+
+    let mut stack: Vec<NimaFrame> = Vec::with_capacity(32);
+    let mut card: Option<NimaCard> = None;
+    let mut cards = 0usize;
+    let mut text = Vec::new();
+    loop {
+        let b = *s.get(p)?;
+        if b != b'<' {
+            // Character data up to the next tag; lists hold only whitespace between items.
+            if stack.last().is_some_and(|f| f.tag == NimaTag::List) {
+                p = nima_skip_space(s, p);
+                if s.get(p) != Some(&b'<') {
+                    return None;
+                }
+                continue;
+            }
+            let capture = card.as_ref().is_some_and(|c| c.subtitle_depth.is_some());
+            while p < s.len() && s[p] != b'<' {
+                if s[p] == b'&' {
+                    text.clear();
+                    p = nima_reference(s, p, &mut text)?;
+                    if capture && let Some(c) = card.as_mut() {
+                        c.text.extend_from_slice(&text);
+                    }
+                } else {
+                    let run = p;
+                    while p < s.len() && s[p] != b'<' && s[p] != b'&' {
+                        p += 1;
+                    }
+                    if capture && let Some(c) = card.as_mut() {
+                        c.text.extend_from_slice(&s[run..p]);
+                    }
+                }
+            }
+            continue;
+        }
+        let next = *s.get(p + 1)?;
+        if next == b'!' {
+            if card.as_ref().is_some_and(|c| c.subtitle_depth.is_some()) {
+                return None;
+            }
+            p = nima_comment(s, p)?;
+            continue;
+        }
+        if next == b'/' {
+            let Some(frame) = stack.last() else {
+                // </body>, whitespace, </html>, whitespace, end of input.
+                p = nima_end_tag(s, p, b"body")?;
+                p = nima_skip_space(s, p);
+                p = nima_skip_space(s, nima_end_tag(s, p, b"html")?);
+                return (p == s.len() && cards > 0).then_some(cards);
+            };
+            p = nima_end_tag(s, p, &frame.name)?;
+            let frame = stack.pop()?;
+            let depth = stack.len();
+            if let Some(c) = card.as_mut() {
+                if c.subtitle_depth == Some(depth) {
+                    c.subtitle_depth = None;
+                }
+                if frame.cover_box {
+                    c.cover_boxes -= 1;
+                }
+                if c.depth == depth {
+                    let c = card.take()?;
+                    let title = php_trim(&c.text);
+                    if c.subtitles != 1
+                        || c.covers != 1
+                        || title.is_empty()
+                        || !title.iter().all(|&b| (0x21..=0x7e).contains(&b))
+                        || c.alt != title
+                    {
+                        return None;
+                    }
+                    if cards < page_size {
+                        out.extend_from_slice(title);
+                        out.push(0);
+                    }
+                    cards += 1;
+                }
+            }
+            continue;
+        }
+        let (name, attrs, self_closing, end) = nima_start_tag(s, p)?;
+        p = end;
+        let parent = stack.last();
+        let parent_phrasing = parent.is_some_and(|f| f.phrasing);
+        if let Some(c) = card.as_ref()
+            && c.subtitle_depth.is_some()
+        {
+            return None;
+        }
+        let class = nima_attr(&attrs, b"class");
+        let has_class = |token: &[u8]| class.is_some_and(|v| nima_class_has(v, token));
+        if name == b"img" || name == b"br" || name == b"hr" {
+            if parent.is_some_and(|f| f.tag == NimaTag::List) || (name == b"hr" && parent_phrasing)
+            {
+                return None;
+            }
+            if name == b"img"
+                && let Some(c) = card.as_mut()
+                && c.cover_boxes > 0
+                && let Some(alt) = nima_attr(&attrs, b"alt")
+            {
+                c.covers += 1;
+                if c.covers > 1 {
+                    return None;
+                }
+                c.alt = alt.to_vec();
+            }
+            continue;
+        }
+        if self_closing {
+            return None;
+        }
+        let (tag, phrasing_model) = nima_classify(name)?;
+        let inside_list = parent.is_some_and(|f| f.tag == NimaTag::List);
+        if inside_list != (tag == NimaTag::Li) {
+            return None;
+        }
+        let phrasing_tag = matches!(tag, NimaTag::Anchor | NimaTag::Span | NimaTag::Phrasing);
+        if parent_phrasing && !phrasing_tag {
+            return None;
+        }
+        if tag == NimaTag::Anchor && stack.iter().any(|f| f.tag == NimaTag::Anchor) {
+            return None;
+        }
+        let depth = stack.len();
+        let mut cover_box = false;
+        if tag == NimaTag::Div && has_class(b"article") {
+            if card.is_some() {
+                return None;
+            }
+            card = Some(NimaCard {
+                depth,
+                ..NimaCard::default()
+            });
+        } else if let Some(c) = card.as_mut() {
+            if tag == NimaTag::Span && has_class(b"subtitle") {
+                c.subtitles += 1;
+                // Only ./div[article-right]/h2/span[subtitle] is accepted; any other one declines.
+                if c.subtitles > 1
+                    || depth != c.depth + 3
+                    || stack[c.depth + 2].tag != NimaTag::H2
+                    || !stack[c.depth + 1].article_right
+                {
+                    return None;
+                }
+                c.subtitle_depth = Some(depth);
+            }
+            if tag == NimaTag::Div && has_class(b"cover-box") {
+                cover_box = true;
+                c.cover_boxes += 1;
+            }
+        }
+        stack.push(NimaFrame {
+            name: name.to_vec(),
+            tag,
+            phrasing: phrasing_model || parent_phrasing,
+            cover_box,
+            article_right: tag == NimaTag::Div && has_class(b"article-right"),
+        });
+        if stack.len() > 128 {
+            return None;
+        }
+    }
+}
+
+/// Validates a NIMA4K listing and writes up to `page_size` release names, each NUL-terminated.
+///
+/// Returns the written length, `-1` when PHP must parse the document (any input outside the
+/// reproduced subset, including every invalid one), or `-(needed + 16)` when `out_cap` is too small.
+///
+/// # Safety
+/// `html` must be valid for `html_len` bytes and `out_buf` for `out_cap` writable bytes (or null).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_predb_nima4k_parse_html(
+    html: *const c_char,
+    html_len: usize,
+    page_size: usize,
+    max_body_bytes: usize,
+    out_buf: *mut c_char,
+    out_cap: usize,
+) -> isize {
+    // libxml's default text-node limit is 10 MB; larger bodies stay with the PHP diagnostics.
+    if html.is_null()
+        || html_len == 0
+        || html_len > max_body_bytes
+        || html_len > NIMA_MAX_BYTES
+        || page_size == 0
+    {
+        return -1;
+    }
+    let s = unsafe { slice::from_raw_parts(html.cast::<u8>(), html_len) };
+    if !nima_prescan(s) {
+        return -1;
+    }
+    let mut titles = Vec::with_capacity(4096);
+    if nima_parse(s, page_size, &mut titles).is_none() {
+        return -1;
+    }
+    if titles.len() > out_cap || out_buf.is_null() {
+        return -((titles.len() + 16) as isize);
+    }
+    unsafe { std::ptr::copy_nonoverlapping(titles.as_ptr(), out_buf.cast::<u8>(), titles.len()) };
+    titles.len() as isize
+}
+
+#[cfg(test)]
+mod nima4k_tests {
+    use super::*;
+
+    fn parse(html: &str, page: usize) -> Option<Vec<String>> {
+        let mut buf = vec![0 as c_char; html.len() + 16];
+        let n = unsafe {
+            nntmux_predb_nima4k_parse_html(
+                html.as_ptr().cast(),
+                html.len(),
+                page,
+                1 << 20,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        if n == -1 {
+            return None;
+        }
+        assert!(n > 0);
+        let bytes: Vec<u8> = buf[..n as usize].iter().map(|&b| b as u8).collect();
+        let mut parts: Vec<String> = bytes
+            .split(|&b| b == 0)
+            .map(|p| String::from_utf8(p.to_vec()).unwrap())
+            .collect();
+        assert_eq!(parts.pop().as_deref(), Some(""));
+        Some(parts)
+    }
+
+    fn card(title: &str) -> String {
+        format!(
+            "<div class=\"article uk-clearfix\"><div class=\"article-left\"><div class=\"cover-box\">\n<a href=\"/r/1\"><img src=\"/c.jpg\" alt=\"{title}\"></a></div></div><div class=\"article-right\"><h2 class=\"x\"><a href=\"/r/1\">Human & Title</a> <span class=\"subtitle uk-visible-large\">{title}</span></h2><p class=\"meta\">Am <span>11.10.2026</span></p></div></div>\n"
+        )
+    }
+
+    fn page(body: &str) -> String {
+        format!(
+            "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><title>NIMA4K</title></head><body>\n<!-- listing -->\n{body}</body></html>\n"
+        )
+    }
+
+    #[test]
+    fn extracts_clean_cards_in_order_with_limit() {
+        let html = page(&(card("A.Release-GRP") + &card("B.Rel&#46;ease-GRP")));
+        assert_eq!(
+            parse(&html, 10).unwrap(),
+            vec!["A.Release-GRP", "B.Rel.ease-GRP"]
+        );
+        assert_eq!(parse(&html, 1).unwrap(), vec!["A.Release-GRP"]);
+    }
+
+    #[test]
+    fn declines_ambiguous_or_invalid_documents() {
+        let good = page(&card("A.Release-GRP"));
+        assert!(parse(&good, 10).is_some());
+        for (from, to) in [
+            ("<title>NIMA4K</title>", "<title>a&amp;b</title>"),
+            ("<title>NIMA4K</title>", "<title/>NIMA4K</title>"),
+            ("<title>NIMA4K</title>", "<script>x</script>"),
+            ("<!-- listing -->", "<!-- a -- b -->"),
+            ("<!-- listing -->", "<?php ?>"),
+            ("<!-- listing -->", "<svg></svg>"),
+            ("<!-- listing -->", "<template></template>"),
+            ("charset=\"UTF-8\"", "charset=\"latin1\""),
+            (
+                "charset=\"UTF-8\"",
+                "http-equiv=\"content-type\" content=\"text/html; charset=utf-8\"",
+            ),
+            ("Human & Title", "Human &nbsp; Title"),
+            ("Human & Title", "Human &apos; Title"),
+            ("Human & Title", "Human &#x80; Title"),
+            ("Human & Title", "Human &#13; Title"),
+            ("Human & Title", "Human &amp Title"),
+            ("Human & Title", "1 < 2"),
+            ("class=\"x\"", "class=\"x\" class=\"y\""),
+            ("</h2>", "</span></h2>"),
+            ("<p class=\"meta\">", "<p class=\"meta\"><div></div>"),
+            ("alt=\"A.Release-GRP\"", "alt=\"B.Release-GRP\""),
+            ("alt=\"A.Release-GRP\"", "title=\"x\""),
+            (">A.Release-GRP</span>", "><b>A.Release-GRP</b></span>"),
+            (">A.Release-GRP</span>", ">A Release</span>"),
+            ("</body></html>", "</body>"),
+            (
+                "<div class=\"article-left\">",
+                "<div class=\"article-left\"><div/>",
+            ),
+            ("Am <span>", "Am <span class=\"subtitle\">"),
+        ] {
+            let html = good.replacen(from, to, 1);
+            assert_ne!(html, good, "{from}");
+            assert!(parse(&html, 10).is_none(), "{to}");
+        }
+        assert!(parse("<html><head></head><body></body></html>", 10).is_none());
+        assert!(parse(&page(&card("Léon.1994-GRP")), 10).is_none());
+        assert!(parse(&page(&card("A\u{FDD0}B")), 10).is_none());
+    }
+
+    #[test]
+    fn small_buffers_report_the_needed_size() {
+        let html = page(&card("A.Release-GRP"));
+        let mut buf = [0 as c_char; 4];
+        let n = unsafe {
+            nntmux_predb_nima4k_parse_html(
+                html.as_ptr().cast(),
+                html.len(),
+                10,
+                1 << 20,
+                buf.as_mut_ptr(),
+                4,
+            )
+        };
+        assert_eq!(n, -(("A.Release-GRP".len() + 1 + 16) as isize));
+        let n = unsafe {
+            nntmux_predb_nima4k_parse_html(
+                html.as_ptr().cast(),
+                html.len(),
+                10,
+                10,
+                buf.as_mut_ptr(),
+                4,
+            )
+        };
+        assert_eq!(n, -1);
     }
 }
