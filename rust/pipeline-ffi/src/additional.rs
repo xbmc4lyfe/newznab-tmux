@@ -14127,3 +14127,728 @@ mod wave19_postprocess_config_outcomes_assets_tests {
         assert_eq!(aligned, [0i64; 28]);
     }
 }
+// ---------------------------------------------------------------------------
+// Wave 20: ConfigurationDomain, ConfigurationProvider, DomainConfigurationRepository,
+// ProcessingRuntimeStateRepository and PostProcessService helpers.
+// ---------------------------------------------------------------------------
+
+/// `ConfigurationDomain` backing values in declaration order.
+const W20CD_DOMAINS: [&[u8]; 6] = [
+    b"site",
+    b"registration",
+    b"ingestion",
+    b"post-processing",
+    b"metadata",
+    b"tmux",
+];
+
+/// `ConfigurationDomain::label()` per case.
+const W20CD_LABELS: [&[u8]; 6] = [
+    b"Site",
+    b"Registration",
+    b"Ingestion",
+    b"Post Processing",
+    b"Metadata",
+    b"Tmux",
+];
+
+/// `ConfigurationDomain::table()` per case.
+const W20CD_TABLES: [&[u8]; 6] = [
+    b"site_configurations",
+    b"registration_configurations",
+    b"ingestion_configurations",
+    b"post_processing_configurations",
+    b"metadata_configurations",
+    b"tmux_configurations",
+];
+
+/// `DomainConfigurationRepository::modelClass()` per case.
+const W20CD_MODELS: [&[u8]; 6] = [
+    b"App\\Models\\SiteConfiguration",
+    b"App\\Models\\RegistrationConfiguration",
+    b"App\\Models\\IngestionConfiguration",
+    b"App\\Models\\PostProcessingConfiguration",
+    b"App\\Models\\MetadataConfiguration",
+    b"App\\Models\\TmuxConfiguration",
+];
+
+/// `ConfigurationProvider::cacheKey()` prefix.
+const W20CD_CACHE_PREFIX: &[u8] = b"configuration:";
+
+/// Text field selectors for `nntmux_cfgd_text`.
+const W20CD_FIELD_LABEL: i32 = 0;
+const W20CD_FIELD_TABLE: i32 = 1;
+const W20CD_FIELD_CACHE_KEY: i32 = 2;
+const W20CD_FIELD_MODEL: i32 = 3;
+
+/// Case index for a backing value, or `None` when it names no domain.
+fn w20cd_index(value: &[u8]) -> Option<usize> {
+    W20CD_DOMAINS.iter().position(|case| *case == value)
+}
+
+/// `ConfigurationDomain::tryFrom`: the case index, or -1 for an unknown value or invalid
+/// input.
+///
+/// # Safety
+/// A non-null `ptr` must be readable for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_cfgd_resolve(ptr: *const u8, len: usize) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: forwarded caller contract.
+        unsafe { w19pc_bytes(ptr, len) }
+            .and_then(w20cd_index)
+            .map_or(-1, |index| index as i32)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Write `field` (0 label, 1 table, 2 cache key, 3 model class) of the domain whose backing
+/// value is `ptr[..len]`; returns the length, `-(needed)` when `cap` is too small, or -1 for an
+/// unknown value/field or invalid input.
+///
+/// # Safety
+/// A non-null `ptr` must be readable for `len` bytes; a non-null `out` must be writable for
+/// `cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_cfgd_text(
+    ptr: *const u8,
+    len: usize,
+    field: i32,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: forwarded caller contract.
+        let Some(index) = (unsafe { w19pc_bytes(ptr, len) }).and_then(w20cd_index) else {
+            return -1;
+        };
+        let mut key = [0u8; 64];
+        let text: &[u8] = match field {
+            W20CD_FIELD_LABEL => W20CD_LABELS[index],
+            W20CD_FIELD_TABLE => W20CD_TABLES[index],
+            W20CD_FIELD_MODEL => W20CD_MODELS[index],
+            W20CD_FIELD_CACHE_KEY => {
+                let value = W20CD_DOMAINS[index];
+                let total = W20CD_CACHE_PREFIX.len() + value.len();
+                key[..W20CD_CACHE_PREFIX.len()].copy_from_slice(W20CD_CACHE_PREFIX);
+                key[W20CD_CACHE_PREFIX.len()..total].copy_from_slice(value);
+                &key[..total]
+            }
+            _ => return -1,
+        };
+        // SAFETY: `out` validity is checked by `w19pc_write`; the caller guarantees `cap`
+        // writable bytes.
+        unsafe { w19pc_write(out, cap, text) }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Positions of the first occurrence of each distinct entry (PHP `array_unique` with
+/// `SORT_STRING` keeps the first of equal strings).
+fn w20cd_unique_positions<T: std::hash::Hash + Eq>(items: &[T]) -> Vec<usize> {
+    let mut seen = std::collections::HashSet::with_capacity(items.len());
+    items
+        .iter()
+        .enumerate()
+        .filter_map(|(position, item)| seen.insert(item).then_some(position))
+        .collect()
+}
+
+/// Deduplicate `count` strings packed in `buf` with byte lengths `lens` (which must sum to
+/// `buf_len`), writing the input index of each first occurrence to `out`. Returns the number
+/// of unique entries or -1 for invalid input.
+///
+/// # Safety
+/// A non-null `buf` must be readable for `buf_len` bytes; non-null `lens`/`out` must be
+/// aligned and valid for `count`/`out_count` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_dcr_unique_strings(
+    buf: *const u8,
+    buf_len: usize,
+    lens: *const i64,
+    count: usize,
+    out: *mut i64,
+    out_count: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if count == 0
+            || out_count < count
+            || !w19pc_slice_ok(lens, count)
+            || !w19pc_slice_ok(out.cast_const(), out_count)
+        {
+            return -1;
+        }
+        // SAFETY: forwarded caller contract.
+        let Some(bytes) = (unsafe { w19pc_bytes(buf, buf_len) }) else {
+            return -1;
+        };
+        // SAFETY: `lens` is non-null, aligned and readable for `count` values.
+        let lens = unsafe { std::slice::from_raw_parts(lens, count) };
+        let mut items = Vec::with_capacity(count);
+        let mut offset = 0usize;
+        for &length in lens {
+            let Ok(length) = usize::try_from(length) else {
+                return -1;
+            };
+            let Some(end) = offset.checked_add(length).filter(|end| *end <= bytes.len()) else {
+                return -1;
+            };
+            items.push(&bytes[offset..end]);
+            offset = end;
+        }
+        if offset != bytes.len() {
+            return -1;
+        }
+        let unique = w20cd_unique_positions(&items);
+        // SAFETY: `out` is non-null, aligned and writable for `out_count >= count` values.
+        let out = unsafe { std::slice::from_raw_parts_mut(out, out_count) };
+        for (slot, position) in out.iter_mut().zip(&unique) {
+            *slot = *position as i64;
+        }
+        unique.len() as isize
+    }))
+    .unwrap_or(-1)
+}
+
+/// Deduplicate `count` integers in first-occurrence order into `out`; `values` and `out` may
+/// alias. Returns the number of unique values or -1 for invalid input.
+///
+/// # Safety
+/// Non-null pointers must be aligned and valid for their declared counts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_dcr_unique_ints(
+    values: *const i64,
+    count: usize,
+    out: *mut i64,
+    out_count: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if count == 0
+            || out_count < count
+            || !w19pc_slice_ok(values, count)
+            || !w19pc_slice_ok(out.cast_const(), out_count)
+        {
+            return -1;
+        }
+        let mut input = vec![0i64; count];
+        // SAFETY: `values` is non-null, aligned and readable for `count` values; `input` is a
+        // distinct allocation.
+        unsafe { std::ptr::copy_nonoverlapping(values, input.as_mut_ptr(), count) };
+        let unique = w20cd_unique_positions(&input);
+        // SAFETY: `out` is non-null, aligned and writable for `out_count >= count` values;
+        // `input` was copied out first so aliasing is harmless.
+        let out = unsafe { std::slice::from_raw_parts_mut(out, out_count) };
+        for (slot, position) in out.iter_mut().zip(&unique) {
+            *slot = input[*position];
+        }
+        unique.len() as isize
+    }))
+    .unwrap_or(-1)
+}
+
+/// `ProcessingRuntimeStateRepository::monitorPaths()` presence mask: bit `i` is set when
+/// `lens[i] >= 0` (-1 marks a null path). Requires exactly 3 lengths; -1 for invalid input.
+///
+/// # Safety
+/// A non-null `lens` must be aligned and readable for `count` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_prs_monitor_mask(lens: *const i64, count: usize) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if count != 3 || !w19pc_slice_ok(lens, count) {
+            return -1;
+        }
+        // SAFETY: `lens` is non-null, aligned and readable for 3 values.
+        let lens = unsafe { std::slice::from_raw_parts(lens, count) };
+        let mut mask = 0i32;
+        for (bit, &length) in lens.iter().enumerate() {
+            match length {
+                -1 => {}
+                0.. => mask |= 1 << bit,
+                _ => return -1,
+            }
+        }
+        mask
+    }))
+    .unwrap_or(-1)
+}
+
+/// Fallback runtime state integers: `[id, tmux_running, stop_requested]`.
+const W20CD_RUNTIME_DEFAULTS: [i64; 3] = [1, 0, 0];
+
+/// Write the fallback runtime state integers to `out`; returns 3 or -1 for invalid input.
+///
+/// # Safety
+/// A non-null `out` must be aligned and writable for `out_count` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_prs_defaults(out: *mut i64, out_count: usize) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if out_count < W20CD_RUNTIME_DEFAULTS.len() || !w19pc_slice_ok(out.cast_const(), out_count)
+        {
+            return -1;
+        }
+        // SAFETY: `out` is non-null, aligned and writable for at least 3 values.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                W20CD_RUNTIME_DEFAULTS.as_ptr(),
+                out,
+                W20CD_RUNTIME_DEFAULTS.len(),
+            )
+        };
+        W20CD_RUNTIME_DEFAULTS.len() as i32
+    }))
+    .unwrap_or(-1)
+}
+
+/// PHP whitespace accepted around numeric strings.
+fn w20cd_is_php_space(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
+}
+
+/// PHP `is_numeric($string) ? (int) $string : null` for 64-bit PHP 8.
+fn w20cd_php_numeric_int(value: &[u8]) -> Option<i64> {
+    let start = value.iter().position(|byte| !w20cd_is_php_space(*byte))?;
+    let end = value.iter().rposition(|byte| !w20cd_is_php_space(*byte))? + 1;
+    let body = &value[start..end];
+    let unsigned = match body.first() {
+        Some(b'+' | b'-') => &body[1..],
+        _ => body,
+    };
+    let int_digits = unsigned
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    let mut cursor = int_digits;
+    let mut fraction_digits = 0;
+    let mut is_integer = true;
+    if unsigned.get(cursor) == Some(&b'.') {
+        is_integer = false;
+        cursor += 1;
+        fraction_digits = unsigned[cursor..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        cursor += fraction_digits;
+    }
+    if int_digits == 0 && fraction_digits == 0 {
+        return None;
+    }
+    if matches!(unsigned.get(cursor), Some(b'e' | b'E')) {
+        is_integer = false;
+        cursor += 1;
+        if matches!(unsigned.get(cursor), Some(b'+' | b'-')) {
+            cursor += 1;
+        }
+        let exponent_digits = unsigned[cursor..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        if exponent_digits == 0 {
+            return None;
+        }
+        cursor += exponent_digits;
+    }
+    if cursor != unsigned.len() {
+        return None;
+    }
+    // The grammar above is ASCII-only, so the body is valid UTF-8.
+    let text = std::str::from_utf8(body).ok()?;
+    if is_integer && let Ok(parsed) = text.parse::<i64>() {
+        return Some(parsed);
+    }
+    // Float strings and overflowing integers go through a double; `as` saturates and maps
+    // NaN to 0 like `zend_dval_to_lval_cap`.
+    text.parse::<f64>().ok().map(|parsed| parsed as i64)
+}
+
+/// `PostProcessService::processTv()` lookup mode: `kind` 0 = null, 1 = int (`int_value`),
+/// 2 = string (`ptr[..len]`). A numeric input resolves to `(int) $processTV`; otherwise
+/// `default_value` is used when `has_default != 0`. Writes the resolved mode to
+/// `out_resolved` and returns bit 0 = renamed only (`resolved === 2`) and bit 1 = resolved
+/// from the input; -2 when the default is needed but absent; -1 for invalid input.
+///
+/// # Safety
+/// A non-null `ptr` must be readable for `len` bytes; a non-null `out_resolved` must be
+/// aligned and writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_pps_tv_lookup(
+    kind: i32,
+    int_value: i64,
+    ptr: *const u8,
+    len: usize,
+    default_value: i64,
+    has_default: i32,
+    out_resolved: *mut i64,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !w19pc_slice_ok(out_resolved.cast_const(), 1) {
+            return -1;
+        }
+        let numeric = match kind {
+            0 => None,
+            1 => Some(int_value),
+            2 => {
+                // SAFETY: forwarded caller contract.
+                let Some(bytes) = (unsafe { w19pc_bytes(ptr, len) }) else {
+                    return -1;
+                };
+                w20cd_php_numeric_int(bytes)
+            }
+            _ => return -1,
+        };
+        let (resolved, from_input) = match numeric {
+            Some(value) => (value, true),
+            None if has_default != 0 => (default_value, false),
+            None => return -2,
+        };
+        // SAFETY: `out_resolved` is non-null, aligned and writable for one value.
+        unsafe { out_resolved.write(resolved) };
+        i32::from(resolved == 2) | (i32::from(from_input) << 1)
+    }))
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod wave20_additional_config_domain_runtime_postprocess_tests {
+    use super::*;
+
+    fn misaligned(buffer: &mut [i64]) -> *mut i64 {
+        buffer
+            .as_mut_ptr()
+            .cast::<u8>()
+            .wrapping_add(1)
+            .cast::<i64>()
+    }
+
+    fn text(value: &[u8], field: i32) -> Option<String> {
+        let mut out = [0u8; 64];
+        let written =
+            unsafe { nntmux_cfgd_text(value.as_ptr(), value.len(), field, out.as_mut_ptr(), 64) };
+        (written > 0).then(|| String::from_utf8(out[..written as usize].to_vec()).unwrap())
+    }
+
+    #[test]
+    fn domains_resolve_and_map_every_text_field() {
+        for (index, value) in W20CD_DOMAINS.iter().enumerate() {
+            assert_eq!(
+                unsafe { nntmux_cfgd_resolve(value.as_ptr(), value.len()) },
+                index as i32
+            );
+        }
+        assert_eq!(text(b"site", 0).as_deref(), Some("Site"));
+        assert_eq!(
+            text(b"post-processing", 0).as_deref(),
+            Some("Post Processing")
+        );
+        assert_eq!(
+            text(b"post-processing", 1).as_deref(),
+            Some("post_processing_configurations")
+        );
+        assert_eq!(text(b"tmux", 1).as_deref(), Some("tmux_configurations"));
+        assert_eq!(
+            text(b"metadata", 2).as_deref(),
+            Some("configuration:metadata")
+        );
+        assert_eq!(
+            text(b"registration", 3).as_deref(),
+            Some("App\\Models\\RegistrationConfiguration")
+        );
+        for unknown in [&b""[..], b"Site", b"site ", b"post_processing", b"tmux\0"] {
+            assert_eq!(
+                unsafe { nntmux_cfgd_resolve(unknown.as_ptr(), unknown.len()) },
+                -1
+            );
+            assert_eq!(text(unknown, 0), None);
+        }
+        assert_eq!(text(b"site", 4), None);
+        assert_eq!(text(b"site", -1), None);
+    }
+
+    #[test]
+    fn text_reports_needed_capacity_and_rejects_null() {
+        let mut small = [0u8; 4];
+        assert_eq!(
+            unsafe { nntmux_cfgd_text(b"tmux".as_ptr(), 4, 1, small.as_mut_ptr(), 4) },
+            -19
+        );
+        assert_eq!(
+            unsafe { nntmux_cfgd_text(std::ptr::null(), 4, 0, small.as_mut_ptr(), 4) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_cfgd_text(b"tmux".as_ptr(), 4, 0, std::ptr::null_mut(), 4) },
+            -1
+        );
+        assert_eq!(unsafe { nntmux_cfgd_resolve(std::ptr::null(), 0) }, -1);
+        assert_eq!(
+            unsafe { nntmux_cfgd_resolve(b"site".as_ptr(), isize::MAX as usize + 1) },
+            -1
+        );
+    }
+
+    #[test]
+    fn unique_strings_keep_first_occurrence() {
+        let parts: [&[u8]; 6] = [b"a", b"bb", b"a", b"", b"bb", b""];
+        let buf: Vec<u8> = parts.concat();
+        let lens: Vec<i64> = parts.iter().map(|part| part.len() as i64).collect();
+        let mut out = [0i64; 6];
+        let unique = unsafe {
+            nntmux_dcr_unique_strings(
+                buf.as_ptr(),
+                buf.len(),
+                lens.as_ptr(),
+                6,
+                out.as_mut_ptr(),
+                6,
+            )
+        };
+        assert_eq!(unique, 3);
+        assert_eq!(&out[..3], &[0, 1, 3]);
+        // Lengths must sum to the buffer length and be non-negative.
+        let bad = [1i64, 2, 1, 0, 2, 1];
+        assert_eq!(
+            unsafe {
+                nntmux_dcr_unique_strings(
+                    buf.as_ptr(),
+                    buf.len(),
+                    bad.as_ptr(),
+                    6,
+                    out.as_mut_ptr(),
+                    6,
+                )
+            },
+            -1
+        );
+        let negative = [-1i64, 7, 0, 0, 0, 0];
+        assert_eq!(
+            unsafe {
+                nntmux_dcr_unique_strings(
+                    buf.as_ptr(),
+                    buf.len(),
+                    negative.as_ptr(),
+                    6,
+                    out.as_mut_ptr(),
+                    6,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_dcr_unique_strings(
+                    buf.as_ptr(),
+                    buf.len(),
+                    lens.as_ptr(),
+                    6,
+                    out.as_mut_ptr(),
+                    5,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_dcr_unique_strings(
+                    buf.as_ptr(),
+                    buf.len(),
+                    lens.as_ptr(),
+                    0,
+                    out.as_mut_ptr(),
+                    6,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_dcr_unique_strings(
+                    std::ptr::null(),
+                    buf.len(),
+                    lens.as_ptr(),
+                    6,
+                    out.as_mut_ptr(),
+                    6,
+                )
+            },
+            -1
+        );
+    }
+
+    #[test]
+    fn unique_ints_dedupe_in_place() {
+        let mut values = [3i64, 1, 3, -7, 1, i64::MIN, -7];
+        let pointer = values.as_mut_ptr();
+        let unique = unsafe { nntmux_dcr_unique_ints(pointer.cast_const(), 7, pointer, 7) };
+        assert_eq!(unique, 4);
+        assert_eq!(&values[..4], &[3, 1, -7, i64::MIN]);
+        assert_eq!(
+            unsafe { nntmux_dcr_unique_ints(std::ptr::null(), 1, pointer, 7) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_dcr_unique_ints(pointer.cast_const(), 7, pointer, 6) },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_dcr_unique_ints(
+                    pointer.cast_const(),
+                    usize::MAX / 4,
+                    pointer,
+                    usize::MAX / 4,
+                )
+            },
+            -1
+        );
+    }
+
+    #[test]
+    fn runtime_state_mask_and_defaults() {
+        let lens = [-1i64, 0, 12];
+        assert_eq!(unsafe { nntmux_prs_monitor_mask(lens.as_ptr(), 3) }, 0b110);
+        assert_eq!(
+            unsafe { nntmux_prs_monitor_mask([-1i64; 3].as_ptr(), 3) },
+            0
+        );
+        assert_eq!(unsafe { nntmux_prs_monitor_mask(lens.as_ptr(), 2) }, -1);
+        assert_eq!(
+            unsafe { nntmux_prs_monitor_mask([-2i64, 0, 0].as_ptr(), 3) },
+            -1
+        );
+        assert_eq!(unsafe { nntmux_prs_monitor_mask(std::ptr::null(), 3) }, -1);
+        let mut out = [9i64; 3];
+        assert_eq!(unsafe { nntmux_prs_defaults(out.as_mut_ptr(), 3) }, 3);
+        assert_eq!(out, [1, 0, 0]);
+        assert_eq!(unsafe { nntmux_prs_defaults(out.as_mut_ptr(), 2) }, -1);
+        assert_eq!(unsafe { nntmux_prs_defaults(std::ptr::null_mut(), 3) }, -1);
+    }
+
+    fn tv(kind: i32, int_value: i64, value: &[u8], default: Option<i64>) -> (i32, i64) {
+        let mut resolved = i64::MIN + 7;
+        let flags = unsafe {
+            nntmux_pps_tv_lookup(
+                kind,
+                int_value,
+                value.as_ptr(),
+                value.len(),
+                default.unwrap_or(0),
+                i32::from(default.is_some()),
+                &mut resolved,
+            )
+        };
+        (flags, resolved)
+    }
+
+    #[test]
+    fn tv_lookup_matches_php_is_numeric_and_int_cast() {
+        let cases: [(&[u8], Option<i64>); 34] = [
+            (b"2", Some(2)),
+            (b" 2", Some(2)),
+            (b"2 ", Some(2)),
+            (b"\n2\t", Some(2)),
+            (b"\x0b2\x0c", Some(2)),
+            (b"+2", Some(2)),
+            (b"-2", Some(-2)),
+            (b"2.9", Some(2)),
+            (b"2.9999999999999999999", Some(3)),
+            (b"2e0", Some(2)),
+            (b"0.2e1", Some(2)),
+            (b".2e1", Some(2)),
+            (b"2.", Some(2)),
+            (b"200E-2", Some(2)),
+            (b"+.5", Some(0)),
+            (b"00002", Some(2)),
+            (b"-0", Some(0)),
+            (b"1e100", Some(i64::MAX)),
+            (b"-1e100", Some(i64::MIN)),
+            (b"99999999999999999999", Some(i64::MAX)),
+            (b"9223372036854775807", Some(i64::MAX)),
+            (b"-9223372036854775809", Some(i64::MIN)),
+            (b"1e-400", Some(0)),
+            (b"", None),
+            (b" ", None),
+            (b".", None),
+            (b"1e", None),
+            (b"1e+", None),
+            (b"-.e1", None),
+            (b"0x2", None),
+            (b"2abc", None),
+            (b"5 .", None),
+            (b"NAN", None),
+            (b"INF", None),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(w20cd_php_numeric_int(value), expected, "{value:?}");
+        }
+        for value in [
+            &b"1_0"[..],
+            b"2\0",
+            "\u{0662}".as_bytes(),
+            b"inf",
+            b"infinity",
+        ] {
+            assert_eq!(w20cd_php_numeric_int(value), None, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn tv_lookup_flags_and_default() {
+        assert_eq!(tv(1, 2, b"", None), (0b11, 2));
+        assert_eq!(tv(1, 1, b"", Some(2)), (0b10, 1));
+        assert_eq!(tv(2, 0, b" 2.5 ", None), (0b11, 2));
+        assert_eq!(tv(2, 0, b"abc", Some(2)), (0b01, 2));
+        assert_eq!(tv(0, 0, b"", Some(1)), (0b00, 1));
+        assert_eq!(tv(0, 0, b"", None).0, -2);
+        assert_eq!(tv(2, 0, b"", None).0, -2);
+        assert_eq!(tv(3, 0, b"", Some(1)).0, -1);
+        let mut resolved = 0i64;
+        assert_eq!(
+            unsafe { nntmux_pps_tv_lookup(2, 0, std::ptr::null(), 3, 1, 1, &mut resolved) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_pps_tv_lookup(1, 2, std::ptr::null(), 0, 1, 1, std::ptr::null_mut()) },
+            -1
+        );
+    }
+
+    #[test]
+    fn unaligned_pointers_are_rejected() {
+        let mut buffer = [0i64; 16];
+        let bad = misaligned(&mut buffer);
+        let mut aligned = [0i64; 8];
+        let buf = b"ab";
+        assert_eq!(
+            unsafe {
+                nntmux_dcr_unique_strings(
+                    buf.as_ptr(),
+                    2,
+                    bad.cast_const(),
+                    2,
+                    aligned.as_mut_ptr(),
+                    2,
+                )
+            },
+            -1
+        );
+        let lens = [1i64, 1];
+        assert_eq!(
+            unsafe { nntmux_dcr_unique_strings(buf.as_ptr(), 2, lens.as_ptr(), 2, bad, 2) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_dcr_unique_ints(bad.cast_const(), 2, aligned.as_mut_ptr(), 2) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_dcr_unique_ints(aligned.as_ptr(), 2, bad, 2) },
+            -1
+        );
+        assert_eq!(unsafe { nntmux_prs_monitor_mask(bad.cast_const(), 3) }, -1);
+        assert_eq!(unsafe { nntmux_prs_defaults(bad, 3) }, -1);
+        assert_eq!(
+            unsafe { nntmux_pps_tv_lookup(1, 2, std::ptr::null(), 0, 1, 1, bad) },
+            -1
+        );
+        assert_eq!(aligned, [0i64; 8]);
+    }
+}
