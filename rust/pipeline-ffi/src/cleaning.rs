@@ -11433,3 +11433,911 @@ mod wave16_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod wave17_query_pass_tests {
+    use super::*;
+
+    fn fields(values: &[&[u8]]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for value in values {
+            bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(value);
+        }
+        bytes
+    }
+
+    fn invoke(mode: u32, input: &[u8], first: i64, second: i64) -> (isize, Vec<u8>) {
+        let mut out = vec![0xa5; 8192];
+        let result = unsafe {
+            nntmux_name_fixing_query_pass(
+                mode,
+                input.as_ptr(),
+                input.len(),
+                first,
+                second,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        if result >= 0 {
+            out.truncate(result as usize);
+        }
+        (result, out)
+    }
+
+    #[test]
+    fn raw_operations_and_declines() {
+        assert_eq!(invoke(0, b"Show.S01", 0, 0).1, b"1");
+        assert_eq!(invoke(0, b"Show.S01\n", 0, 0).0, -2);
+        assert_eq!(invoke(1, b"nfo", 0, 0).1, b"nfo");
+        assert!(invoke(1, b"bad\x7f", 0, 0).1.is_empty());
+        assert_eq!(invoke(1, b"\xff", 0, 0).0, -2);
+        assert_eq!(invoke(2, b"", 3, 0).1, b"?,?,?");
+        assert!(invoke(2, b"", 0, 0).1.is_empty());
+        assert_eq!(invoke(2, b"", -1, 0).0, -2);
+        assert_eq!(invoke(3, b"a\\b%c_d", 0, 0).1, b"a\\\\b\\%c\\_d");
+        assert_eq!(invoke(4, b"HELLO_\xff", 0, 0).1, b"hello \xff");
+        assert_eq!(invoke(9, &[1, 3], 0, 0).1, b"1");
+        assert_eq!(invoke(9, &[1, 2], 0, 0).1, b"0");
+        assert_eq!(invoke(10, &[1, 3], 0, 0).1, b"1");
+        assert_eq!(invoke(10, &[], 0, 0).1, b"0");
+        assert_eq!(invoke(9, &[], 0, 0).1, b"1");
+    }
+
+    #[test]
+    fn field_operations_and_order() {
+        assert_eq!(
+            invoke(5, &fields(&[b"unknown", b"tItLe MaTcH source"]), 0, 0).1,
+            b"1"
+        );
+        assert_eq!(invoke(5, &fields(&[b"UID, ", b""]), 0, 0).1, b"1");
+        assert_eq!(invoke(5, &fields(&[b"UID,", b""]), 0, 0).1, b"0");
+        assert_eq!(
+            invoke(6, b"NFO, ", 0, 0).1,
+            b"isrenamed\0iscategorized\0proc_nfo"
+        );
+        assert_eq!(invoke(6, b"sorter, ", 0, 0).1, b"isrenamed\0iscategorized");
+        assert!(invoke(6, b"unknown", 0, 0).1.is_empty());
+        assert_eq!(
+            invoke(7, &fields(&[b"Show.S01", b"Show.S01E01"]), 0, 0).1,
+            b"1"
+        );
+        assert_eq!(
+            invoke(8, &fields(&[b"12", b"guid", b"", b"old", b"new"]), 7, 7).1,
+            fields(&[b"12", b"guid", b"1", b"", b"0", b"new"])
+        );
+        assert!(
+            invoke(8, &fields(&[b"12", b"guid", b"", b"old", b"new"]), 3, 0)
+                .1
+                .is_empty()
+        );
+        assert_eq!(
+            invoke(
+                11,
+                &fields(&[b"1", b"7:title", b"1", b"", b"1", b"7:title"]),
+                0,
+                0
+            )
+            .1,
+            b"0,2"
+        );
+        assert!(
+            invoke(11, &fields(&[b"1", b"7:title", b"0", b"7:title"]), 0, 0)
+                .1
+                .is_empty()
+        );
+        assert!(
+            invoke(11, &fields(&[b"1", b"7:title", b"1", b"8:title"]), 0, 0)
+                .1
+                .is_empty()
+        );
+        assert_eq!(
+            invoke(12, &fields(&[b"a", b"b", b"a", b"", b""]), 0, 0).1,
+            b"0,1,0,3,3"
+        );
+        assert_eq!(invoke(15, b"Mediainfo, ", 0, 0).1, b"proc_uid");
+        assert!(invoke(15, b"Filenames, ", 0, 0).1.is_empty());
+        assert_eq!(
+            invoke(18, &fields(&[b"a", b"", b"a", b"b", b"\xff"]), 0, 0).1,
+            fields(&[b"a", b"b", b"\xff"])
+        );
+    }
+
+    #[test]
+    fn page_validation_and_literal_regex() {
+        assert!(invoke(16, &fields(&[b"11", b"12"]), 10, 0).1.is_empty());
+        assert_eq!(invoke(16, &fields(&[b"11", b"11"]), 10, 0).1, b"order");
+        assert_eq!(invoke(16, &fields(&[b"11"]), 10, 1).1, b"boundaries");
+        assert_eq!(invoke(16, &fields(&[b"not-int"]), 0, 0).0, -2);
+        assert_eq!(
+            invoke(17, &fields(&[b"/hello/i", b"well HELLO!"]), 0, 0).1,
+            fields(&[b"1", b"HELLO"])
+        );
+        assert_eq!(
+            invoke(17, &fields(&[b"/^hello$/", b"hello"]), 0, 0).1,
+            fields(&[b"1", b"hello"])
+        );
+        assert_eq!(
+            invoke(17, &fields(&[b"/literal/", b"literal bytes"]), 0, 0).1,
+            fields(&[b"1", b"literal"])
+        );
+        assert_eq!(
+            invoke(17, &fields(&[b"/^hello$/", b"well hello"]), 0, 0).1,
+            fields(&[b"0", b""])
+        );
+        assert_eq!(
+            invoke(17, &fields(&[b"/a\\.b/", b"a.b"]), 0, 0).1,
+            fields(&[b"1", b"a.b"])
+        );
+        for pattern in [
+            b"/h.llo/".as_slice(),
+            b"/[a]/",
+            b"/hello/u",
+            b"//",
+            b"/\\d/",
+            b"/(hello)/",
+            b"/hello/iD",
+            b"#hello#",
+        ] {
+            assert_eq!(
+                invoke(17, &fields(&[pattern, b"hello"]), 0, 0).0,
+                -2,
+                "{pattern:?}"
+            );
+        }
+        assert_eq!(invoke(17, &fields(&[b"/hello$/", b"hello\n"]), 0, 0).0, -2);
+    }
+
+    #[test]
+    fn abi_rejects_bad_contracts_without_partial_writes() {
+        unsafe {
+            let mut out = [0xa5; 16];
+            let ptr = out.as_mut_ptr();
+            assert_eq!(
+                nntmux_name_fixing_query_pass(2, std::ptr::null(), 0, 9, 0, ptr, 16),
+                -3
+            );
+            assert_eq!(out, [0xa5; 16]);
+            assert_eq!(
+                nntmux_name_fixing_query_pass(2, std::ptr::null(), 0, i64::MAX, 0, ptr, 16),
+                -1
+            );
+            assert_eq!(
+                nntmux_name_fixing_query_pass(
+                    2,
+                    std::ptr::null(),
+                    0,
+                    0,
+                    0,
+                    std::ptr::null_mut(),
+                    0
+                ),
+                0
+            );
+            assert_eq!(
+                nntmux_name_fixing_query_pass(0, std::ptr::null(), 1, 0, 0, ptr, 16),
+                -1
+            );
+            assert_eq!(
+                nntmux_name_fixing_query_pass(0, b"".as_ptr(), 0, 0, 0, std::ptr::null_mut(), 1),
+                -1
+            );
+            assert_eq!(
+                nntmux_name_fixing_query_pass(0, usize::MAX as *const u8, 1, 0, 0, ptr, 16),
+                -1
+            );
+            assert_eq!(
+                nntmux_name_fixing_query_pass(0, b"".as_ptr(), 0, 0, 0, usize::MAX as *mut u8, 1),
+                -1
+            );
+            assert_eq!(
+                nntmux_name_fixing_query_pass(
+                    0,
+                    b"".as_ptr(),
+                    isize::MAX as usize + 1,
+                    0,
+                    0,
+                    ptr,
+                    16
+                ),
+                -1
+            );
+            assert_eq!(invoke(99, b"", 0, 0).0, -2);
+            assert_eq!(invoke(5, &[1, 0], 0, 0).0, -1);
+            assert_eq!(invoke(5, &fields(&[b"only one"]), 0, 0).0, -1);
+            assert_eq!(
+                nntmux_name_fixing_query_pass(3, b"%_".as_ptr(), 2, 0, 0, ptr, 3),
+                -3
+            );
+            assert_eq!(out, [0xa5; 16]);
+        }
+    }
+
+    #[test]
+    fn sql_matches_native_whitespace_and_branch_order() {
+        let candidate = fields(&[
+            b"hash",
+            b"proc_hash16k",
+            b"HASH_EXISTS",
+            b"7010",
+            b"7020",
+            b"7010,7020",
+            b"SETTLED",
+        ]);
+        let expected = b"r.predb_id = 0 AND (HASH_EXISTS) AND (r.isrenamed = 0 OR r.categories_id IN (?, ?)) AND r.proc_hash16k = 0 AND r.adddate > ? AND r.categories_id IN (7010,7020) AND SETTLED AND NOT EXISTS (SELECT 1 FROM par2_hash_retry hr WHERE hr.releases_id = r.id\n                AND HEX(hr.release_guid) = HEX(r.guid) AND hr.retry_at > ?)";
+        assert_eq!(invoke(13, &candidate, 1, 1).1, expected);
+        assert_eq!(
+            invoke(
+                13,
+                &fields(&[
+                    b"nfo",
+                    b"proc_nfo",
+                    b"NFO_EXISTS",
+                    b"7010",
+                    b"7020",
+                    b"7010,7020",
+                    b"SETTLED"
+                ]),
+                0,
+                3
+            )
+            .1,
+            b"r.predb_id = 0 AND (NFO_EXISTS) AND SETTLED"
+        );
+        assert_eq!(
+            invoke(
+                13,
+                &fields(&[b"unknown", b"column", b"exists", b"", b"", b"", b"settled"]),
+                0,
+                0
+            )
+            .0,
+            -2
+        );
+        let pending = fields(&[
+            b"7010",
+            b"7020",
+            b"7010,7020",
+            b"SETTLED",
+            b"CUTOFF",
+            b"nfo",
+            b"proc_nfo",
+            b"NFO_EXISTS",
+            b"files",
+            b"proc_files",
+            b"FILES_EXISTS",
+            b"srr",
+            b"proc_srr",
+            b"SRR_EXISTS",
+            b"crc",
+            b"proc_crc32",
+            b"CRC_EXISTS",
+            b"uid",
+            b"proc_uid",
+            b"UID_EXISTS",
+            b"hash",
+            b"proc_hash16k",
+            b"HASH_EXISTS",
+            b"xxx",
+            b"proc_files",
+            b"XXX_EXISTS",
+            b"media_movie",
+            b"proc_uid",
+            b"MOVIE_EXISTS",
+        ]);
+        let expected = b"r.predb_id = 0 AND (r.isrenamed = 0 OR r.categories_id IN (7010, 7020)) AND r.categories_id IN (7010,7020) AND (CASE WHEN r.proc_par2 = 0 AND (r.nzbstatus = 1) AND SETTLED THEN 1 WHEN (r.proc_nfo = 0 AND (NFO_EXISTS)) OR (r.proc_files = 0 AND (FILES_EXISTS)) OR (r.proc_srr = 0 AND (SRR_EXISTS)) OR (r.proc_crc32 = 0 AND (CRC_EXISTS)) OR (r.proc_uid = 0 AND (UID_EXISTS)) OR (r.proc_hash16k = 0 AND (HASH_EXISTS AND NOT EXISTS (SELECT 1 FROM par2_hash_retry hr WHERE hr.releases_id = r.id AND HEX(hr.release_guid) = HEX(r.guid) AND hr.retry_at > CURRENT_TIMESTAMP))) OR (r.proc_files = 0 AND (XXX_EXISTS)) OR (r.proc_uid = 0 AND (MOVIE_EXISTS)) THEN 1 ELSE 0 END = 1) AND SETTLED AND r.adddate > CUTOFF";
+        assert_eq!(invoke(14, &pending, 0, 0).1, expected);
+        let all_backlog = invoke(14, &pending, 1, 1).1;
+        assert!(
+            !all_backlog
+                .windows(b"AND r.categories_id IN".len())
+                .any(|w| w == b"AND r.categories_id IN")
+        );
+        assert!(all_backlog.ends_with(b"AND SETTLED"));
+    }
+
+    #[test]
+    fn exact_capacity_and_all_mode_errors_are_atomic() {
+        let cases = [
+            (0, b"show".to_vec(), 0, 0),
+            (2, vec![], 5, 0),
+            (3, b"a_b%".to_vec(), 0, 0),
+            (
+                8,
+                fields(&[b"7", b"guid", b"name", b"search", b"new"]),
+                7,
+                0,
+            ),
+            (12, fields(&[b"a", b"b", b"a"]), 0, 0),
+            (17, fields(&[b"/literal/", b"literal"]), 0, 0),
+            (18, fields(&[b"a", b"b", b"a"]), 0, 0),
+        ];
+        for (mode, input, first, second) in cases {
+            let (size, expected) = invoke(mode, &input, first, second);
+            assert!(size > 0);
+            let mut out = vec![0xa5; size as usize];
+            unsafe {
+                assert_eq!(
+                    nntmux_name_fixing_query_pass(
+                        mode,
+                        input.as_ptr(),
+                        input.len(),
+                        first,
+                        second,
+                        out.as_mut_ptr(),
+                        out.len() - 1
+                    ),
+                    -3
+                );
+                assert!(out.iter().all(|&b| b == 0xa5));
+                assert_eq!(
+                    nntmux_name_fixing_query_pass(
+                        mode,
+                        input.as_ptr(),
+                        input.len(),
+                        first,
+                        second,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    size
+                );
+            }
+            assert_eq!(out, expected);
+        }
+        let ids: Vec<Vec<u8>> = (1..=21).map(|i| i.to_string().into_bytes()).collect();
+        let ids: Vec<&[u8]> = ids.iter().map(Vec::as_slice).collect();
+        assert!(invoke(16, &fields(&ids), 0, 1).1.is_empty());
+        assert_eq!(invoke(16, &fields(&ids), 1, 1).1, b"order");
+        assert_eq!(invoke(17, &fields(&[b"/hello/", b"h\xffllo"]), 0, 0).0, -2);
+    }
+}
+
+// Wave 17 name-fixing query/pass helpers. Frames are repeated LE-u32 byte lengths
+// followed by their payloads, with no leading field count.
+fn name_query_region<T>(ptr: *const T, len: usize) -> bool {
+    len <= isize::MAX as usize
+        && (len == 0 || !ptr.is_null())
+        && (ptr as usize).checked_add(len).is_some()
+}
+
+fn name_query_fields(mut input: &[u8]) -> Result<Vec<&[u8]>, isize> {
+    let mut fields = Vec::new();
+    while !input.is_empty() {
+        let prefix = input.get(..4).ok_or(-1isize)?;
+        let len = u32::from_le_bytes(prefix.try_into().map_err(|_| -1isize)?) as usize;
+        input = &input[4..];
+        let field = input.get(..len).ok_or(-1isize)?;
+        fields.push(field);
+        input = &input[len..];
+    }
+    Ok(fields)
+}
+
+struct NameQueryOutput {
+    bytes: Vec<u8>,
+    cap: usize,
+}
+
+impl NameQueryOutput {
+    fn new(cap: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            cap,
+        }
+    }
+
+    fn extend(&mut self, value: &[u8]) -> Result<(), isize> {
+        let total = self.bytes.len().checked_add(value.len()).ok_or(-3isize)?;
+        if total > self.cap || total > isize::MAX as usize {
+            return Err(-3);
+        }
+        self.bytes.try_reserve(value.len()).map_err(|_| -3isize)?;
+        self.bytes.extend_from_slice(value);
+        Ok(())
+    }
+
+    fn field(&mut self, value: &[u8]) -> Result<(), isize> {
+        let len = u32::try_from(value.len()).map_err(|_| -1isize)?;
+        self.extend(&len.to_le_bytes())?;
+        self.extend(value)
+    }
+
+    fn index(&mut self, value: usize, comma: bool) -> Result<(), isize> {
+        if comma {
+            self.extend(b",")?;
+        }
+        self.extend(value.to_string().as_bytes())
+    }
+}
+
+fn name_query_processing_column(kind: &[u8]) -> Option<&'static [u8]> {
+    match kind {
+        b"NFO, " => Some(b"proc_nfo"),
+        b"PAR2, " => Some(b"proc_par2"),
+        b"PAR2 hash, " => Some(b"proc_hash16k"),
+        b"SRR, " => Some(b"proc_srr"),
+        b"UID, " | b"Mediainfo, " => Some(b"proc_uid"),
+        b"CRC32, " => Some(b"proc_crc32"),
+        _ => None,
+    }
+}
+
+fn name_query_source(source: &[u8]) -> Option<usize> {
+    [
+        b"nfo".as_slice(),
+        b"files",
+        b"srr",
+        b"crc",
+        b"uid",
+        b"hash",
+        b"par2",
+        b"xxx",
+        b"media_movie",
+    ]
+    .iter()
+    .position(|s| *s == source)
+}
+
+fn name_query_contains_ascii(value: &[u8], needle: &[u8]) -> bool {
+    value
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
+fn name_query_literal_match<'a>(
+    pattern: &[u8],
+    subject: &'a [u8],
+) -> Result<Option<&'a [u8]>, isize> {
+    if !pattern.is_ascii()
+        || !subject.is_ascii()
+        || subject.contains(&b'\n')
+        || pattern.len() < 3
+        || pattern[0] != b'/'
+        || pattern.contains(&0)
+    {
+        return Err(-2);
+    }
+    let end = pattern.iter().rposition(|&b| b == b'/').ok_or(-2isize)?;
+    if end == 0 {
+        return Err(-2);
+    }
+    let insensitive = match &pattern[end + 1..] {
+        b"" => false,
+        b"i" => true,
+        _ => return Err(-2),
+    };
+    let mut body = &pattern[1..end];
+    let anchored_start = body.first() == Some(&b'^');
+    if anchored_start {
+        body = &body[1..];
+    }
+    // An escaped final dollar is a literal, not an anchor.
+    let slash_run = body
+        .iter()
+        .rev()
+        .skip(1)
+        .take_while(|&&b| b == b'\\')
+        .count();
+    let anchored_end = body.last() == Some(&b'$') && slash_run % 2 == 0;
+    if anchored_end {
+        body = &body[..body.len() - 1];
+    }
+    let mut literal = Vec::with_capacity(body.len());
+    let mut cursor = 0;
+    while cursor < body.len() {
+        let b = body[cursor];
+        if b == b'\\' {
+            cursor += 1;
+            let escaped = *body.get(cursor).ok_or(-2isize)?;
+            if !escaped.is_ascii_punctuation() {
+                return Err(-2);
+            }
+            literal.push(escaped);
+        } else {
+            if matches!(
+                b,
+                b'.' | b'+'
+                    | b'*'
+                    | b'?'
+                    | b'['
+                    | b']'
+                    | b'('
+                    | b')'
+                    | b'{'
+                    | b'}'
+                    | b'|'
+                    | b'^'
+                    | b'$'
+                    | b'/'
+            ) {
+                return Err(-2);
+            }
+            literal.push(b);
+        }
+        cursor += 1;
+    }
+    if literal.is_empty() {
+        return Err(-2);
+    }
+    let matches = |bytes: &[u8]| {
+        if insensitive {
+            bytes.eq_ignore_ascii_case(&literal)
+        } else {
+            bytes == literal
+        }
+    };
+    if subject.len() < literal.len() {
+        return Ok(None);
+    }
+    let index = if anchored_start {
+        if (!anchored_end || subject.len() == literal.len()) && matches(&subject[..literal.len()]) {
+            Some(0)
+        } else {
+            None
+        }
+    } else if anchored_end {
+        let start = subject.len() - literal.len();
+        if matches(&subject[start..]) {
+            Some(start)
+        } else {
+            None
+        }
+    } else {
+        subject.windows(literal.len()).position(matches)
+    };
+    Ok(index.map(|start| &subject[start..start + literal.len()]))
+}
+
+fn name_query_build(
+    mode: u32,
+    input: &[u8],
+    first: i64,
+    second: i64,
+    cap: usize,
+) -> Result<Vec<u8>, isize> {
+    let mut out = NameQueryOutput::new(cap);
+    match mode {
+        0 => {
+            if input.contains(&b'\n') {
+                return Err(-2);
+            }
+            out.extend(if crate::filename::is_season_pack_bytes(input) {
+                b"1"
+            } else {
+                b"0"
+            })?;
+        }
+        1 => {
+            if !input.is_ascii() {
+                return Err(-2);
+            }
+            if input.len() <= 50 && !input.iter().any(u8::is_ascii_control) {
+                out.extend(input)?;
+            }
+        }
+        2 => {
+            if first < 0 {
+                return Err(-2);
+            }
+            let count = usize::try_from(first).map_err(|_| -1isize)?;
+            let required = if count == 0 {
+                0
+            } else {
+                count
+                    .checked_mul(2)
+                    .and_then(|n| n.checked_sub(1))
+                    .ok_or(-1isize)?
+            };
+            if required > isize::MAX as usize {
+                return Err(-1);
+            }
+            if required > cap {
+                return Err(-3);
+            }
+            out.bytes.try_reserve(required).map_err(|_| -3isize)?;
+            for i in 0..required {
+                out.bytes.push(if i % 2 == 0 { b'?' } else { b',' });
+            }
+        }
+        3 => {
+            for &b in input {
+                if matches!(b, b'\\' | b'%' | b'_') {
+                    out.extend(b"\\")?;
+                }
+                out.extend(&[b])?;
+            }
+        }
+        4 => {
+            for &b in input {
+                out.extend(&[if b == b'_' {
+                    b' '
+                } else {
+                    b.to_ascii_lowercase()
+                }])?;
+            }
+        }
+        5 => {
+            let fields = name_query_fields(input)?;
+            if fields.len() != 2 {
+                return Err(-1);
+            }
+            let trusted = first > 0
+                || fields[0].starts_with(b"PreDB")
+                || fields[0].starts_with(b"PreDb")
+                || matches!(fields[0], b"UID, " | b"PAR2 hash, " | b"CRC32, " | b"SRR, ")
+                || [b"Title Match".as_slice(), b"file matched source", b"PreDb"]
+                    .iter()
+                    .any(|needle| name_query_contains_ascii(fields[1], needle));
+            out.extend(if trusted { b"1" } else { b"0" })?;
+        }
+        6 => {
+            let proc = match input {
+                b"Filenames, " | b"file matched source: " => Some(b"proc_files".as_slice()),
+                _ => name_query_processing_column(input),
+            };
+            if proc.is_some() || matches!(input, b"PreDB FT Exact, " | b"sorter, ") {
+                out.extend(b"isrenamed\0iscategorized")?;
+                if let Some(proc) = proc {
+                    out.extend(b"\0")?;
+                    out.extend(proc)?;
+                }
+            }
+        }
+        7 => {
+            let fields = name_query_fields(input)?;
+            if fields.len() != 2 {
+                return Err(-1);
+            }
+            if fields.iter().any(|f| f.contains(&b'\n')) {
+                return Err(-2);
+            }
+            let is_episode = crate::filename::is_season_pack_bytes(fields[0])
+                && crate::filename::is_episode_name(fields[1])
+                && !crate::filename::is_season_pack_bytes(fields[1]);
+            out.extend(if is_episode { b"1" } else { b"0" })?;
+        }
+        8 => {
+            let fields = name_query_fields(input)?;
+            if fields.len() != 5 {
+                return Err(-1);
+            }
+            if first == 7 {
+                out.field(fields[0])?;
+                out.field(fields[1])?;
+                out.field(if second & 1 != 0 { b"1" } else { b"0" })?;
+                out.field(fields[2])?;
+                out.field(if second & 2 != 0 && second & 4 == 0 {
+                    b"1"
+                } else {
+                    b"0"
+                })?;
+                out.field(if second & 4 != 0 {
+                    fields[4]
+                } else {
+                    fields[3]
+                })?;
+            }
+        }
+        9 | 10 => {
+            if input.iter().any(|&b| b > 3) {
+                return Err(-1);
+            }
+            let value = if mode == 9 {
+                input.iter().all(|b| b & 1 != 0)
+            } else {
+                input.iter().any(|b| b & 2 != 0)
+            };
+            out.extend(if value { b"1" } else { b"0" })?;
+        }
+        11 => {
+            let fields = name_query_fields(input)?;
+            if fields.len() % 2 != 0 {
+                return Err(-1);
+            }
+            if fields
+                .chunks_exact(2)
+                .any(|row| !matches!(row[0], b"0" | b"1"))
+            {
+                return Err(-1);
+            }
+            if fields.chunks_exact(2).any(|row| row[0] == b"0") {
+                return Ok(out.bytes);
+            }
+            let mut identity = None;
+            for row in fields.chunks_exact(2) {
+                if !row[1].is_empty() {
+                    if identity.is_some_and(|value| value != row[1]) {
+                        return Ok(out.bytes);
+                    }
+                    identity = Some(row[1]);
+                }
+            }
+            let mut comma = false;
+            for (i, row) in fields.chunks_exact(2).enumerate() {
+                if !row[1].is_empty() {
+                    out.index(i, comma)?;
+                    comma = true;
+                }
+            }
+        }
+        12 => {
+            let fields = name_query_fields(input)?;
+            let mut first_seen = std::collections::HashMap::new();
+            for (i, field) in fields.into_iter().enumerate() {
+                let original = *first_seen.entry(field).or_insert(i);
+                out.index(original, i != 0)?;
+            }
+        }
+        13 => {
+            let f = name_query_fields(input)?;
+            if f.len() != 7 {
+                return Err(-1);
+            }
+            let source = name_query_source(f[0]).ok_or(-2isize)?;
+            out.extend(b"r.predb_id = 0 AND (")?;
+            out.extend(f[2])?;
+            out.extend(b")")?;
+            if second != 3 {
+                out.extend(b" AND (r.isrenamed = 0 OR r.categories_id IN (?, ?)) AND r.")?;
+                out.extend(f[1])?;
+                out.extend(b" = 0")?;
+            }
+            if first == 1 {
+                out.extend(b" AND r.adddate > ?")?;
+            }
+            if second == 1 {
+                out.extend(b" AND r.categories_id IN (")?;
+                out.extend(f[5])?;
+                out.extend(b")")?;
+            }
+            out.extend(b" AND ")?;
+            out.extend(f[6])?;
+            if source == 5 {
+                out.extend(b" AND NOT EXISTS (SELECT 1 FROM par2_hash_retry hr WHERE hr.releases_id = r.id\n                AND HEX(hr.release_guid) = HEX(r.guid) AND hr.retry_at > ?)")?;
+            }
+        }
+        14 => {
+            let f = name_query_fields(input)?;
+            if f.len() != 29 {
+                return Err(-1);
+            }
+            let mut seen = [false; 9];
+            for tuple in f[5..].chunks_exact(3) {
+                let source = name_query_source(tuple[0]).ok_or(-2isize)?;
+                if source == 6 || seen[source] {
+                    return Err(-2);
+                }
+                seen[source] = true;
+            }
+            out.extend(b"r.predb_id = 0 AND (r.isrenamed = 0 OR r.categories_id IN (")?;
+            out.extend(f[0])?;
+            out.extend(b", ")?;
+            out.extend(f[1])?;
+            out.extend(b"))")?;
+            if first == 0 {
+                out.extend(b" AND r.categories_id IN (")?;
+                out.extend(f[2])?;
+                out.extend(b")")?;
+            }
+            out.extend(b" AND (CASE WHEN r.proc_par2 = 0 AND (r.nzbstatus = 1) AND ")?;
+            out.extend(f[3])?;
+            out.extend(b" THEN 1 WHEN ")?;
+            for (i, tuple) in f[5..].chunks_exact(3).enumerate() {
+                if i != 0 {
+                    out.extend(b" OR ")?;
+                }
+                out.extend(b"(r.")?;
+                out.extend(tuple[1])?;
+                out.extend(b" = 0 AND (")?;
+                out.extend(tuple[2])?;
+                if tuple[0] == b"hash" {
+                    out.extend(b" AND NOT EXISTS (SELECT 1 FROM par2_hash_retry hr WHERE hr.releases_id = r.id AND HEX(hr.release_guid) = HEX(r.guid) AND hr.retry_at > CURRENT_TIMESTAMP)")?;
+                }
+                out.extend(b"))")?;
+            }
+            out.extend(b" THEN 1 ELSE 0 END = 1) AND ")?;
+            out.extend(f[3])?;
+            if second == 0 {
+                out.extend(b" AND r.adddate > ")?;
+                out.extend(f[4])?;
+            }
+        }
+        15 => {
+            if let Some(proc) = name_query_processing_column(input) {
+                out.extend(proc)?;
+            }
+        }
+        16 => {
+            let fields = name_query_fields(input)?;
+            let mut ids = Vec::with_capacity(fields.len());
+            for field in fields {
+                ids.push(
+                    std::str::from_utf8(field)
+                        .ok()
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .ok_or(-2isize)?,
+                );
+            }
+            if ids.len() > 21 || second != 0 && ids.len() < 21 {
+                out.extend(b"boundaries")?;
+            } else {
+                let mut previous = first;
+                for id in ids {
+                    if id <= previous {
+                        out.extend(b"order")?;
+                        break;
+                    }
+                    previous = id;
+                }
+            }
+        }
+        17 => {
+            let fields = name_query_fields(input)?;
+            if fields.len() != 2 {
+                return Err(-1);
+            }
+            if let Some(matched) = name_query_literal_match(fields[0], fields[1])? {
+                out.field(b"1")?;
+                out.field(matched)?;
+            } else {
+                out.field(b"0")?;
+                out.field(b"")?;
+            }
+        }
+        18 => {
+            let fields = name_query_fields(input)?;
+            let mut seen = std::collections::HashSet::new();
+            for field in fields {
+                if !field.is_empty() && seen.insert(field) {
+                    out.field(field)?;
+                }
+            }
+        }
+        _ => return Err(-2),
+    }
+    Ok(out.bytes)
+}
+
+/// Name-fixing helpers with an atomic output contract. Returns bytes written,
+/// -1 for an invalid frame/region, -2 to decline to native PHP, -3 when capacity
+/// is insufficient, and -4 after a caught panic. No error writes output bytes.
+///
+/// # Safety
+/// Nonempty input/output regions must be valid for reads/writes respectively.
+/// Null is accepted only for a zero-length region. Regions must fit in isize and
+/// their addresses must not wrap. No output slice is formed before validation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_name_fixing_query_pass(
+    mode: u32,
+    input: *const u8,
+    len: usize,
+    first: i64,
+    second: i64,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        if !name_query_region(input, len) || !name_query_region(out, cap) {
+            return -1;
+        }
+        let input = if len == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(input, len) }
+        };
+        match name_query_build(mode, input, first, second, cap) {
+            Ok(bytes) => {
+                if !bytes.is_empty() {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len());
+                    }
+                }
+                bytes.len() as isize
+            }
+            Err(code) => code,
+        }
+    })
+    .unwrap_or(-4)
+}
