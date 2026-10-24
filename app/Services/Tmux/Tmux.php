@@ -13,14 +13,31 @@ use App\Services\Configuration\ProcessingRuntimeStateRepository;
 use App\Services\NameFixing\NameFixingQueryService;
 use App\Services\NfoService;
 use App\Services\TvProcessing\TvProcessingCandidateQuery;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
+use Throwable;
 
 /**
  * Class Tmux.
  */
 class Tmux
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_tmux_extract_peer_endpoint(const char *line, size_t line_len, char *out_buf, size_t out_cap);
+        int32_t nntmux_tmux_socket_line_has_peer_port(const char *line, size_t line_len, const char *port, size_t port_len);
+        int32_t nntmux_tmux_socket_line_matches_any_address_nul(const char *line, size_t line_len, const char *addresses, size_t addresses_len, size_t addr_count, const char *port, size_t port_len);
+        int64_t nntmux_tmux_count_usp_connections(uint8_t is_alternate, const char *port, size_t port_len, const char *other_port, size_t other_port_len, const char *ips, size_t ips_len, size_t ips_count, const char *other_ips, size_t other_ips_len, size_t other_ips_count, const char *snapshot, size_t snapshot_len);
+        ssize_t nntmux_tmux_decode_size(double bytes, char *out_buf, size_t out_cap);
+        C;
+
+    private static bool $useRustFfi = true;
+
+    private static ?FFI $ffi = null;
+
+    private static bool $ffiResolved = false;
+
     private readonly ConfigurationProvider $configuration;
 
     private readonly ProcessingRuntimeStateRepository $runtimeState;
@@ -43,7 +60,7 @@ class Tmux
         $this->runtimeState = $runtimeState ?? app(ProcessingRuntimeStateRepository::class);
         try {
             $this->pdo = DB::connection()->getPdo();
-        } catch (\Throwable) {
+        } catch (Throwable) {
             $this->pdo = null;
         }
     }
@@ -71,6 +88,26 @@ class Tmux
         return $runVar['connections'];
     }
 
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (! self::$ffiResolved) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('irc', self::FFI_CDEF);
+            self::$ffiResolved = true;
+        }
+
+        return self::$ffi;
+    }
+
     /**
      * @param  array<string, mixed>  $connections
      * @return array<string, array{active: int, total: int}>
@@ -85,10 +122,99 @@ class Tmux
         $otherPort = trim((string) ($connections[$otherPortKey] ?? ''));
         $ips = $this->extractConnectionAddresses($connections, $ipKey, $ipsKey, $hostKey);
         $otherIps = $this->extractConnectionAddresses($connections, $otherIpKey, $otherIpsKey, $otherHostKey);
+        $snapshot = $socketSnapshot ?? $this->getSocketSnapshot();
+
+        if (self::$useRustFfi) {
+            $native = self::countUSPConnectionsNative(
+                $which === 'alternate',
+                $port,
+                $otherPort,
+                $ips,
+                $otherIps,
+                $snapshot,
+            );
+            if ($native !== null) {
+                return [$which => $native];
+            }
+        }
+
+        return $this->countUSPConnectionsPhp($which, $port, $otherPort, $ips, $otherIps, $snapshot);
+    }
+
+    /**
+     * @param  list<string>  $ips
+     * @param  list<string>  $otherIps
+     * @return array{active: int, total: int}|null
+     */
+    public static function countUSPConnectionsNative(
+        bool $isAlternate,
+        string $port,
+        string $otherPort,
+        array $ips,
+        array $otherIps,
+        string $snapshot,
+    ): ?array {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $ipsCount = count($ips);
+        $ipsJoined = $ipsCount === 0 ? '' : implode("\0", $ips);
+        if ($ipsCount > 0 && substr_count($ipsJoined, "\0") !== $ipsCount - 1) {
+            return null;
+        }
+        $otherIpsCount = count($otherIps);
+        $otherIpsJoined = $otherIpsCount === 0 ? '' : implode("\0", $otherIps);
+        if ($otherIpsCount > 0 && substr_count($otherIpsJoined, "\0") !== $otherIpsCount - 1) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $packed = $ffi->nntmux_tmux_count_usp_connections(
+                $isAlternate ? 1 : 0,
+                $port,
+                strlen($port),
+                $otherPort,
+                strlen($otherPort),
+                $ipsJoined,
+                strlen($ipsJoined),
+                $ipsCount,
+                $otherIpsJoined,
+                strlen($otherIpsJoined),
+                $otherIpsCount,
+                $snapshot,
+                strlen($snapshot),
+            );
+            if (! is_int($packed) || $packed < 0) {
+                return null;
+            }
+
+            return [
+                'active' => $packed & 0xFFFFFFFF,
+                'total' => $packed >> 32,
+            ];
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * @param  list<string>  $ips
+     * @param  list<string>  $otherIps
+     * @return array<string, array{active: int, total: int}>
+     */
+    private function countUSPConnectionsPhp(
+        string $which,
+        string $port,
+        string $otherPort,
+        array $ips,
+        array $otherIps,
+        string $snapshot,
+    ): array {
         $samePortAsOther = $port !== '' && $port === $otherPort;
 
         $lines = array_values(array_filter(
-            preg_split('/\R/', $socketSnapshot ?? $this->getSocketSnapshot()) ?: [],
+            preg_split('/\R/', $snapshot) ?: [],
             static fn (string $line): bool => trim($line) !== '',
         ));
 
@@ -217,6 +343,27 @@ class Tmux
 
     private function socketLineHasPeerPort(string $line, string $port): bool
     {
+        return $this->socketLineHasPeerPortPhp($line, $port);
+    }
+
+    public static function socketLineHasPeerPortNative(string $line, string $port): ?bool
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $res = $ffi->nntmux_tmux_socket_line_has_peer_port($line, strlen($line), $port, strlen($port));
+
+            return is_int($res) && $res >= 0 ? ($res === 1) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private function socketLineHasPeerPortPhp(string $line, string $port): bool
+    {
         $peer = $this->extractPeerEndpoint($line);
         if ($peer !== null) {
             $colonPos = strrpos($peer, ':');
@@ -234,6 +381,49 @@ class Tmux
      * @param  list<string>  $addresses
      */
     private function socketLineMatchesAnyAddress(string $line, array $addresses, string $port): bool
+    {
+        return $this->socketLineMatchesAnyAddressPhp($line, $addresses, $port);
+    }
+
+    /**
+     * @param  list<string>  $addresses
+     */
+    public static function socketLineMatchesAnyAddressNative(string $line, array $addresses, string $port): ?bool
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $count = count($addresses);
+        if ($count === 0) {
+            return false;
+        }
+        $joined = implode("\0", $addresses);
+        if (substr_count($joined, "\0") !== $count - 1) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $res = $ffi->nntmux_tmux_socket_line_matches_any_address_nul(
+                $line,
+                strlen($line),
+                $joined,
+                strlen($joined),
+                $count,
+                $port,
+                strlen($port),
+            );
+
+            return is_int($res) && $res >= 0 ? ($res === 1) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * @param  list<string>  $addresses
+     */
+    private function socketLineMatchesAnyAddressPhp(string $line, array $addresses, string $port): bool
     {
         $peer = $this->extractPeerEndpoint($line);
 
@@ -265,6 +455,54 @@ class Tmux
     }
 
     private function extractPeerEndpoint(string $line): ?string
+    {
+        return $this->extractPeerEndpointPhp($line);
+    }
+
+    public static function extractPeerEndpointNative(string $line, bool &$supported = false): ?string
+    {
+        $supported = false;
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $len = strlen($line);
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(128, $len + 16), $cap);
+        if ($scratch === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_tmux_extract_peer_endpoint($line, $len, $scratch, $cap);
+            if (! is_int($written)) {
+                return null;
+            }
+            if ($written === -1) {
+                $supported = true;
+
+                return null;
+            }
+            if ($written < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_tmux_extract_peer_endpoint($line, $len, $scratch, $cap);
+                if (! is_int($written) || $written < 0) {
+                    return null;
+                }
+            }
+            $supported = true;
+
+            return $written === 0 ? '' : FFI::string($scratch, $written);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private function extractPeerEndpointPhp(string $line): ?string
     {
         $columns = preg_split('/\s+/', trim($line)) ?: [];
 
@@ -374,6 +612,35 @@ class Tmux
 
     public function decodeSize(int|float $bytes): string
     {
+        return $this->decodeSizePhp($bytes);
+    }
+
+    public static function decodeSizeNative(int|float $bytes): ?string
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, 64, $cap);
+        if ($scratch === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_tmux_decode_size((float) $bytes, $scratch, $cap);
+            if (! is_int($written) || $written <= 0) {
+                return null;
+            }
+
+            return FFI::string($scratch, $written);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private function decodeSizePhp(int|float $bytes): string
+    {
         // Handle zero case
         if ($bytes === 0) {
             return '0 B';
@@ -381,7 +648,7 @@ class Tmux
 
         // Handle negative values
         if ($bytes < 0) {
-            return '-'.$this->decodeSize(abs($bytes));
+            return '-'.$this->decodeSizePhp(abs($bytes));
         }
 
         // Add more size units (PB, EB)

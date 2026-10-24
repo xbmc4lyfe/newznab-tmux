@@ -4,7 +4,10 @@ declare(strict_types=1);
 
 namespace App\Services;
 
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Facades\Redis;
+use Throwable;
 
 /**
  * Service for monitoring Redis server status and performance metrics.
@@ -14,6 +17,35 @@ use Illuminate\Support\Facades\Redis;
  */
 class RedisMonitorService
 {
+    public const string FFI_CDEF = <<<'C'
+        int64_t nntmux_redis_sum_db_keys_nul(const char *input, size_t input_len, size_t count);
+        double nntmux_redis_hit_rate(int64_t hits, int64_t misses);
+        ssize_t nntmux_redis_format_bytes(int64_t bytes, char *out_buf, size_t out_cap);
+        C;
+
+    private const array DB_KEY_MAP = [
+        'db0' => true, 'db1' => true, 'db2' => true, 'db3' => true,
+        'db4' => true, 'db5' => true, 'db6' => true, 'db7' => true,
+        'db8' => true, 'db9' => true, 'db10' => true, 'db11' => true,
+        'db12' => true, 'db13' => true, 'db14' => true, 'db15' => true,
+    ];
+
+    private static bool $useRustFfi = true;
+
+    private static ?FFI $ffi = null;
+
+    private static bool $ffiResolved = false;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
     // ANSI color codes
     private const RED = "\033[0;31m";
 
@@ -232,6 +264,16 @@ class RedisMonitorService
         return $this->parseRedisInfo($info);
     }
 
+    private static function ffi(): ?FFI
+    {
+        if (! self::$ffiResolved) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('irc', self::FFI_CDEF);
+            self::$ffiResolved = true;
+        }
+
+        return self::$ffi;
+    }
+
     /**
      * Parse Redis INFO into structured data.
      *
@@ -239,6 +281,193 @@ class RedisMonitorService
      * @return array<string, mixed>
      */
     protected function parseRedisInfo(array $info): array
+    {
+        if (! self::$useRustFfi) {
+            return $this->parseRedisInfoPhp($info);
+        }
+
+        $dbs = null;
+        if (isset($info['redis_version']) && ! is_array(end($info))) {
+            $flatInfo = $info;
+        } elseif ($info !== [] && is_array(reset($info)) && is_array(end($info))) {
+            try {
+                if (isset($info['Keyspace']) && is_array($info['Keyspace'])) {
+                    $ks = $info['Keyspace'];
+                    $copy = $info;
+                    unset($copy['Keyspace']);
+                    /** @var array<int, array<string, mixed>> $sections */
+                    $sections = array_values($copy);
+                    $flatInfo = $sections === [] ? [] : array_replace(...$sections);
+                    $dbs = array_intersect_key($ks, self::DB_KEY_MAP) + array_intersect_key($flatInfo, self::DB_KEY_MAP);
+                } else {
+                    /** @var array<int, array<string, mixed>> $sections */
+                    $sections = array_values($info);
+                    $flatInfo = array_replace(...$sections);
+                }
+            } catch (\TypeError) {
+                $dbs = null;
+                $flatInfo = [];
+                foreach ($info as $k => $v) {
+                    if (is_array($v)) {
+                        $flatInfo = $v + $flatInfo;
+                    } else {
+                        $flatInfo[$k] = $v;
+                    }
+                }
+            }
+        } else {
+            $flatInfo = $info;
+            foreach ($info as $value) {
+                if (is_array($value)) {
+                    $flatInfo = [];
+                    foreach ($info as $k => $v) {
+                        if (is_array($v)) {
+                            $flatInfo = $v + $flatInfo;
+                        } else {
+                            $flatInfo[$k] = $v;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        $hits = (int) ($flatInfo['keyspace_hits'] ?? 0);
+        $misses = (int) ($flatInfo['keyspace_misses'] ?? 0);
+        $totalOps = $hits + $misses;
+        $hitRate = $totalOps > 0 ? round(($hits * 100) / $totalOps, 2) : 0;
+
+        $dbs ??= array_intersect_key($flatInfo, self::DB_KEY_MAP);
+        $dbKeys = 0;
+        if ($dbs !== []) {
+            $allStrings = is_string(reset($dbs)) && is_string(end($dbs)) && (count($dbs) <= 2 || is_string(next($dbs)));
+            if ($allStrings) {
+                $ffi = self::$ffiResolved ? self::$ffi : self::ffi();
+                $nativeSum = null;
+                if ($ffi !== null) {
+                    $joined = implode("\0", $dbs);
+                    // @phpstan-ignore method.notFound
+                    $sum = $ffi->nntmux_redis_sum_db_keys_nul($joined, strlen($joined), count($dbs));
+                    if (is_int($sum) && $sum >= 0) {
+                        $nativeSum = $sum;
+                    }
+                }
+                if ($nativeSum !== null) {
+                    $dbKeys = $nativeSum;
+                } else {
+                    foreach ($dbs as $spec) {
+                        if (preg_match('/keys=(\d+)/', $spec, $matches)) {
+                            $dbKeys += (int) $matches[1];
+                        }
+                    }
+                }
+            } else {
+                $stringSpecs = [];
+                foreach ($dbs as $dbValue) {
+                    if (is_string($dbValue)) {
+                        $stringSpecs[] = $dbValue;
+                    } elseif (is_array($dbValue)) {
+                        $dbKeys += (int) ($dbValue['keys'] ?? 0);
+                    }
+                }
+                if ($stringSpecs !== []) {
+                    $nativeSum = self::sumDbKeysNative($stringSpecs);
+                    if ($nativeSum !== null) {
+                        $dbKeys += $nativeSum;
+                    } else {
+                        foreach ($stringSpecs as $spec) {
+                            if (preg_match('/keys=(\d+)/', $spec, $matches)) {
+                                $dbKeys += (int) $matches[1];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return [
+            'connected' => true,
+            'host' => $this->host,
+            'port' => $this->port,
+            'version' => $flatInfo['redis_version'] ?? 'unknown',
+            'uptime_days' => (int) ($flatInfo['uptime_in_days'] ?? 0),
+            'uptime_seconds' => (int) ($flatInfo['uptime_in_seconds'] ?? 0),
+            'role' => $flatInfo['role'] ?? 'standalone',
+            'connected_clients' => (int) ($flatInfo['connected_clients'] ?? 0),
+            'blocked_clients' => (int) ($flatInfo['blocked_clients'] ?? 0),
+            'total_connections' => (int) ($flatInfo['total_connections_received'] ?? 0),
+            'connected_slaves' => (int) ($flatInfo['connected_slaves'] ?? 0),
+            'used_memory' => (int) ($flatInfo['used_memory'] ?? 0),
+            'used_memory_peak' => (int) ($flatInfo['used_memory_peak'] ?? 0),
+            'used_memory_rss' => (int) ($flatInfo['used_memory_rss'] ?? 0),
+            'maxmemory' => (int) ($flatInfo['maxmemory'] ?? 0),
+            'mem_fragmentation_ratio' => $flatInfo['mem_fragmentation_ratio'] ?? 'N/A',
+            'total_commands' => (int) ($flatInfo['total_commands_processed'] ?? 0),
+            'ops_per_sec' => (int) ($flatInfo['instantaneous_ops_per_sec'] ?? 0),
+            'input_kbps' => (float) ($flatInfo['instantaneous_input_kbps'] ?? 0),
+            'output_kbps' => (float) ($flatInfo['instantaneous_output_kbps'] ?? 0),
+            'db_keys' => $dbKeys,
+            'keyspace_hits' => $hits,
+            'keyspace_misses' => $misses,
+            'hit_rate' => $hitRate,
+            'expired_keys' => (int) ($flatInfo['expired_keys'] ?? 0),
+            'evicted_keys' => (int) ($flatInfo['evicted_keys'] ?? 0),
+            'rdb_changes' => (int) ($flatInfo['rdb_changes_since_last_save'] ?? 0),
+            'rdb_last_save' => (int) ($flatInfo['rdb_last_save_time'] ?? 0),
+        ];
+    }
+
+    /**
+     * @param  list<string>  $specs
+     */
+    public static function sumDbKeysNative(array $specs): ?int
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $count = count($specs);
+        if ($count === 0) {
+            return 0;
+        }
+        $joined = implode("\0", $specs);
+        if (substr_count($joined, "\0") !== $count - 1) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $sum = $ffi->nntmux_redis_sum_db_keys_nul($joined, strlen($joined), $count);
+
+            return is_int($sum) && $sum >= 0 ? $sum : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    public static function hitRateNative(int $hits, int $misses): int|float|null
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        if ($hits + $misses <= 0) {
+            return 0;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $rate = $ffi->nntmux_redis_hit_rate($hits, $misses);
+
+            return is_float($rate) && $rate >= 0.0 ? $rate : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * @param  array<string, mixed>  $info
+     * @return array<string, mixed>
+     */
+    private function parseRedisInfoPhp(array $info): array
     {
         // Flatten nested arrays if present
         $flatInfo = [];
@@ -498,6 +727,35 @@ class RedisMonitorService
      * Format bytes into human-readable string.
      */
     protected function formatBytes(int $bytes): string
+    {
+        return $this->formatBytesPhp($bytes);
+    }
+
+    public static function formatBytesNative(int $bytes): ?string
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, 64, $cap);
+        if ($scratch === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_redis_format_bytes($bytes, $scratch, $cap);
+            if (! is_int($written) || $written <= 0) {
+                return null;
+            }
+
+            return FFI::string($scratch, $written);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private function formatBytesPhp(int $bytes): string
     {
         if ($bytes >= 1073741824) {
             return sprintf('%.2f GB', $bytes / 1073741824);
