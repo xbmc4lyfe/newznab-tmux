@@ -11,6 +11,14 @@ use RuntimeException;
 /** Durable reservations count retained files and in-flight growth across each host's workers. */
 final class ScratchBudget
 {
+    // Single-call FFI remains opt-in until every paired mean/p99 gate reaches 1.5x.
+    private static bool $useRustFfi = false;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
     public function __construct(private readonly ?int $entryId = null) {}
 
     public function forEntry(int $entryId): self
@@ -81,12 +89,12 @@ final class ScratchBudget
         if ($free === false) {
             throw new RuntimeException('Verification is waiting for shared scratch capacity.');
         }
-        $limit = min((int) config('release_verification.scratch_bytes'), (int) floor($free) - (int) config('release_verification.free_bytes'));
+        $limit = self::reservationCap((int) config('release_verification.scratch_bytes'), $free, (int) config('release_verification.free_bytes'));
         DB::transaction(function () use ($entryId, $bytes, $limit): void {
             // Lock the entry, then change the shared budget with one conditional delta as the last
             // lock request, so concurrent workers hold the budget row only until commit.
             $entry = DB::table('release_verification_scratch')->where('id', $entryId)->lockForUpdate()->sole();
-            $delta = $bytes - (int) $entry->reserved_bytes;
+            $delta = self::reservationDelta($bytes, (int) $entry->reserved_bytes);
             $changed = DB::table('release_verification_scratch_budget')->where('host', $entry->host)->where('initialized', true)
                 ->whereRaw('reserved_bytes + ? <= ?', [$delta, $limit])
                 ->update(['reserved_bytes' => DB::raw('reserved_bytes + ('.$delta.')')]);
@@ -96,7 +104,7 @@ final class ScratchBudget
                     throw new RuntimeException('Shared scratch budget is not initialized.');
                 }
                 // An unchanged total within the limit changes no row.
-                if ($delta !== 0 || (int) $state->reserved_bytes > $limit) {
+                if (self::rejectUnchanged($delta, (int) $state->reserved_bytes, $limit)) {
                     throw new RuntimeException('Verification is waiting for shared scratch capacity.');
                 }
             }
@@ -114,7 +122,7 @@ final class ScratchBudget
         $bytes = $this->directoryBytes((string) config('release_verification.storage_path').'/scratch/'.app(ScratchInventory::class)->directoryName($entry), $heartbeat);
         DB::transaction(function () use ($entryId, $bytes): void {
             $entry = DB::table('release_verification_scratch')->where('id', $entryId)->lockForUpdate()->sole();
-            $this->adjust((string) $entry->host, $bytes - (int) $entry->reserved_bytes);
+            $this->adjust((string) $entry->host, self::reservationDelta($bytes, (int) $entry->reserved_bytes));
             DB::table('release_verification_scratch')->where('id', $entryId)->update(['reserved_bytes' => $bytes]);
         }, 5);
     }
@@ -212,5 +220,76 @@ final class ScratchBudget
         }
 
         return $bytes;
+    }
+
+    public static function reservationCap(int $scratchBytes, float $freeBytes, int $freeReserveBytes): int|float
+    {
+        return self::$useRustFfi ? (self::reservationCapNative($scratchBytes, $freeBytes, $freeReserveBytes) ?? self::reservationCapPhp($scratchBytes, $freeBytes, $freeReserveBytes)) : self::reservationCapPhp($scratchBytes, $freeBytes, $freeReserveBytes);
+    }
+
+    // @phpstan-ignore return.unusedType (PHP promotes integer overflow to float; exercised by parity tests.)
+    public static function reservationCapPhp(int $scratchBytes, float $freeBytes, int $freeReserveBytes): int|float
+    {
+        return min($scratchBytes, (int) floor($freeBytes) - $freeReserveBytes);
+    }
+
+    public static function reservationCapNative(int $scratchBytes, float $freeBytes, int $freeReserveBytes): int|float|null
+    {
+        $result = LeaseHeartbeat::computeNative(4, [$scratchBytes, $freeBytes, $freeReserveBytes])['value'] ?? null;
+
+        return is_int($result) || is_float($result) ? $result : null;
+    }
+
+    public static function reservationDelta(int $bytes, int $reservedBytes): int|float
+    {
+        return self::$useRustFfi ? (self::reservationDeltaNative($bytes, $reservedBytes) ?? self::reservationDeltaPhp($bytes, $reservedBytes)) : self::reservationDeltaPhp($bytes, $reservedBytes);
+    }
+
+    // @phpstan-ignore return.unusedType (PHP promotes integer overflow to float; exercised by parity tests.)
+    public static function reservationDeltaPhp(int $bytes, int $reservedBytes): int|float
+    {
+        return $bytes - $reservedBytes;
+    }
+
+    public static function reservationDeltaNative(int $bytes, int $reservedBytes): int|float|null
+    {
+        $result = LeaseHeartbeat::computeNative(5, [$bytes, $reservedBytes])['value'] ?? null;
+
+        return is_int($result) || is_float($result) ? $result : null;
+    }
+
+    public static function adjustedBudget(int $reservedBytes, int $delta): int|float
+    {
+        return self::$useRustFfi ? (self::adjustedBudgetNative($reservedBytes, $delta) ?? self::adjustedBudgetPhp($reservedBytes, $delta)) : self::adjustedBudgetPhp($reservedBytes, $delta);
+    }
+
+    // @phpstan-ignore return.unusedType (PHP promotes integer overflow to float; exercised by parity tests.)
+    public static function adjustedBudgetPhp(int $reservedBytes, int $delta): int|float
+    {
+        return max(0, $reservedBytes + $delta);
+    }
+
+    public static function adjustedBudgetNative(int $reservedBytes, int $delta): int|float|null
+    {
+        $result = LeaseHeartbeat::computeNative(6, [$reservedBytes, $delta])['value'] ?? null;
+
+        return is_int($result) || is_float($result) ? $result : null;
+    }
+
+    public static function rejectUnchanged(int|float $delta, int $reservedBytes, int|float $limit): bool
+    {
+        return self::$useRustFfi ? (self::rejectUnchangedNative($delta, $reservedBytes, $limit) ?? self::rejectUnchangedPhp($delta, $reservedBytes, $limit)) : self::rejectUnchangedPhp($delta, $reservedBytes, $limit);
+    }
+
+    public static function rejectUnchangedPhp(int|float $delta, int $reservedBytes, int|float $limit): bool
+    {
+        return $delta !== 0 || $reservedBytes > $limit;
+    }
+
+    public static function rejectUnchangedNative(int|float $delta, int $reservedBytes, int|float $limit): ?bool
+    {
+        $result = LeaseHeartbeat::computeNative(7, [$delta, $reservedBytes, $limit])['value'] ?? null;
+
+        return is_bool($result) ? $result : null;
     }
 }
