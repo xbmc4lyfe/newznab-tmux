@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Mcp\Resources;
 
+use App\Mcp\Tools\InspectChangeImpactTool;
+use App\Support\RustPipelineLibrary;
 use Laravel\Mcp\Request;
 use Laravel\Mcp\Response;
 use Laravel\Mcp\Server\Attributes\Description;
@@ -18,10 +20,36 @@ use Laravel\Mcp\Server\Resource;
 #[MimeType('application/json')]
 class ProjectOverviewResource extends Resource
 {
+    // Opt-in only until correctness and end-to-end performance gates pass.
+    private static bool $useRustFfi = false;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi && RustPipelineLibrary::resolveDomain('mcp-inspect-prompt', InspectChangeImpactTool::FFI_CDEF) !== null;
+    }
+
     public function handle(Request $request): Response
     {
-        return Response::json([
-            'schema_version' => (int) config('nntmux-mcp.schema_version', 1),
+        return Response::json(self::buildProjectOverviewPayload((int) config('nntmux-mcp.schema_version', 1)));
+    }
+
+    /** @return array<string, mixed> */
+    public static function buildProjectOverviewPayload(int $schemaVersion): array
+    {
+        return (self::$useRustFfi ? self::buildProjectOverviewPayloadNative($schemaVersion) : null)
+            ?? self::buildProjectOverviewPayloadPhp($schemaVersion);
+    }
+
+    /** @return array<string, mixed> */
+    public static function buildProjectOverviewPayloadPhp(int $schemaVersion): array
+    {
+        return [
+            'schema_version' => $schemaVersion,
             'summary' => 'NNTmux is a Laravel Usenet indexer with local host tooling and an optional tmux processing engine.',
             'architecture' => [
                 'processing_flow' => 'NNTP -> NNTPService -> BinariesRunner -> ReleaseCreationService -> ReleaseProcessingService -> SearchService -> API/Web',
@@ -46,6 +74,14 @@ class ProjectOverviewResource extends Resource
             'companion' => 'Use Laravel Boost for generic Laravel documentation, schema and read-only queries, logs, browser logs, and Tinker.',
             'warnings' => ['Runtime probes may be unavailable. NNTP is never probed unless explicitly requested.'],
             'truncated' => false,
-        ]);
+        ];
+    }
+
+    /** @return array<string, mixed>|null */
+    public static function buildProjectOverviewPayloadNative(int $schemaVersion): ?array
+    {
+        $result = InspectChangeImpactTool::transformNative(7, [$schemaVersion]);
+
+        return is_array($result) ? $result : null;
     }
 }
