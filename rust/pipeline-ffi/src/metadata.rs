@@ -23800,4 +23800,990 @@ pub mod console_movie_tv_status_collections {
     }
 }
 
+/// Wave 22 Slice 22.5: AnidbTitleObserver, BookInfoObserver, ConsoleInfoObserver, GamesInfoObserver,
+/// and MusicInfoObserver secondary search index document and ID C-ABI helpers.
+///
+/// Every export wraps its body in `std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ...)).unwrap_or(-1)`,
+/// validates raw pointers for non-null, `.is_aligned()`, `<= isize::MAX as usize`, and checked address addition,
+/// never writes partial outputs when capacity is insufficient, and returns `-1` on panic or decline so PHP callers fall back safely.
+pub mod metadata_secondary_index_observers {
+    use super::{PhpNode, PhpSerParser, PhpSerWriter, PhpVal};
+    use std::mem::size_of;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    const DECLINE: isize = -1;
+    const MAX_INPUT: usize = 4 << 20;
+
+    #[inline]
+    unsafe fn input<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null()
+            || !ptr.is_aligned()
+            || len > MAX_INPUT
+            || len > isize::MAX as usize
+            || (ptr as usize).checked_add(len).is_none()
+        {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn valid_out_cap(out: *mut u8, cap: usize) -> bool {
+        !out.is_null()
+            && out.is_aligned()
+            && cap <= isize::MAX as usize
+            && (out as usize).checked_add(cap).is_some()
+    }
+
+    #[inline]
+    fn valid_mut_ptr<T>(ptr: *mut T) -> bool {
+        !ptr.is_null()
+            && ptr.is_aligned()
+            && (ptr as usize).checked_add(size_of::<T>()).is_some()
+    }
+
+    #[inline]
+    unsafe fn write_bytes(out_buf: *mut u8, out_cap: usize, bytes: &[u8]) -> isize {
+        let needed = bytes.len();
+        if needed == 0 {
+            return 0;
+        }
+        if needed > isize::MAX as usize {
+            return DECLINE;
+        }
+        if needed > out_cap {
+            let neg = -(needed as isize);
+            return if neg == -1 { -2 } else { neg };
+        }
+        let dst = unsafe { slice::from_raw_parts_mut(out_buf, needed) };
+        dst.copy_from_slice(bytes);
+        needed as isize
+    }
+
+    #[inline]
+    fn is_php_trim_byte(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\0' | b'\x0B')
+    }
+
+    #[inline]
+    fn is_ascii_space_no_nul(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\x0B' | b'\x0C')
+    }
+
+    #[inline]
+    fn php_trim_bytes(bytes: &[u8]) -> &[u8] {
+        let mut start = 0;
+        let mut end = bytes.len();
+        while start < end && is_php_trim_byte(bytes[start]) {
+            start += 1;
+        }
+        while end > start && is_php_trim_byte(bytes[end - 1]) {
+            end -= 1;
+        }
+        &bytes[start..end]
+    }
+
+    #[inline]
+    fn parse_cast_int_bytes(bytes: &[u8]) -> Option<i64> {
+        if bytes.contains(&0) {
+            return None;
+        }
+        let mut start = 0;
+        let mut end = bytes.len();
+        while start < end && is_ascii_space_no_nul(bytes[start]) {
+            start += 1;
+        }
+        while end > start && is_ascii_space_no_nul(bytes[end - 1]) {
+            end -= 1;
+        }
+        let trimmed = &bytes[start..end];
+        if trimmed.is_empty() {
+            return Some(0);
+        }
+        let (neg, digits) = match trimmed.first()? {
+            b'+' => (false, &trimmed[1..]),
+            b'-' => (true, &trimmed[1..]),
+            _ => (false, trimmed),
+        };
+        if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let mut val: i64 = 0;
+        if neg {
+            for &b in digits {
+                val = val.checked_mul(10)?.checked_sub(i64::from(b - b'0'))?;
+            }
+        } else {
+            for &b in digits {
+                val = val.checked_mul(10)?.checked_add(i64::from(b - b'0'))?;
+            }
+        }
+        Some(val)
+    }
+
+    #[inline]
+    fn format_i64_dec(v: i64, buf: &mut [u8; 24]) -> &[u8] {
+        let mut n = v.unsigned_abs();
+        let mut i = buf.len();
+        loop {
+            i -= 1;
+            buf[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        if v < 0 {
+            i -= 1;
+            buf[i] = b'-';
+        }
+        &buf[i..]
+    }
+
+    #[inline]
+    fn crc32_update(mut crc: u32, bytes: &[u8]) -> u32 {
+        for &b in bytes {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(crc & 1));
+            }
+        }
+        crc
+    }
+
+    #[inline]
+    fn parse_2digits(s: &[u8]) -> Option<u32> {
+        if s.len() != 2 || !s[0].is_ascii_digit() || !s[1].is_ascii_digit() {
+            return None;
+        }
+        Some(u32::from(s[0] - b'0') * 10 + u32::from(s[1] - b'0'))
+    }
+
+    #[inline]
+    fn parse_4digits(s: &[u8]) -> Option<u32> {
+        if s.len() != 4 || !s.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        Some(
+            u32::from(s[0] - b'0') * 1000
+                + u32::from(s[1] - b'0') * 100
+                + u32::from(s[2] - b'0') * 10
+                + u32::from(s[3] - b'0'),
+        )
+    }
+
+    #[inline]
+    fn is_leap_year(year: u32) -> bool {
+        (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
+    }
+
+    #[inline]
+    fn days_in_month(year: u32, month: u32) -> u32 {
+        match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if is_leap_year(year) => 29,
+            2 => 28,
+            _ => 0,
+        }
+    }
+
+    #[inline]
+    fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+        let y = y - i64::from(m <= 2);
+        let era = if y >= 0 { y } else { y - 399 } / 400;
+        let yoe = y - era * 400;
+        let mp = m + if m > 2 { -3 } else { 9 };
+        let doy = (153 * mp + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146_097 + doe - 719_468
+    }
+
+    #[inline]
+    fn parse_utc_datetime(raw: &[u8]) -> Option<i64> {
+        if raw.contains(&0) {
+            return None;
+        }
+        let s = php_trim_bytes(raw);
+        if s.len() < 10 || s[4] != b'-' || s[7] != b'-' {
+            return None;
+        }
+        let year = parse_4digits(&s[0..4])?;
+        let month = parse_2digits(&s[5..7])?;
+        let day = parse_2digits(&s[8..10])?;
+        if !(1902..=9999).contains(&year)
+            || !(1..=12).contains(&month)
+            || day == 0
+            || day > days_in_month(year, month)
+        {
+            return None;
+        }
+
+        let (hour, min, sec) = if s.len() == 10 {
+            (0u32, 0u32, 0u32)
+        } else {
+            if s.len() < 19 || !matches!(s[10], b' ' | b'T' | b't') || s[13] != b':' || s[16] != b':'
+            {
+                return None;
+            }
+            let h = parse_2digits(&s[11..13])?;
+            let m = parse_2digits(&s[14..16])?;
+            let sc = parse_2digits(&s[17..19])?;
+            if h > 23 || m > 59 || sc > 59 {
+                return None;
+            }
+            let mut rest = &s[19..];
+            if rest.first() == Some(&b'.') {
+                let frac_end = rest[1..]
+                    .iter()
+                    .position(|b| !b.is_ascii_digit())
+                    .map_or(rest.len(), |p| 1 + p);
+                let frac_digits = frac_end - 1;
+                if !(1..=6).contains(&frac_digits) {
+                    return None;
+                }
+                rest = &rest[frac_end..];
+            }
+            if !matches!(
+                rest,
+                b"" | b"Z" | b"z" | b"+00:00" | b"-00:00" | b"+0000" | b"-0000"
+            ) {
+                return None;
+            }
+            (h, m, sc)
+        };
+
+        Some(
+            days_from_civil(i64::from(year), i64::from(month), i64::from(day)) * 86_400
+                + i64::from(hour) * 3_600
+                + i64::from(min) * 60
+                + i64::from(sec),
+        )
+    }
+
+    #[inline]
+    fn php_node_to_int(node: Option<&PhpNode<'_>>) -> Option<i64> {
+        let Some(n) = node else {
+            return Some(0);
+        };
+        match n.val {
+            PhpVal::Null => Some(0),
+            PhpVal::Bool(b) => Some(i64::from(b)),
+            PhpVal::Int(i) => Some(i),
+            PhpVal::Str(s) => parse_cast_int_bytes(s),
+            PhpVal::Float | PhpVal::Arr(_) => None,
+        }
+    }
+
+    #[inline]
+    fn write_cast_str(
+        w: &mut PhpSerWriter,
+        doc: Option<&PhpNode<'_>>,
+        out_key: &[u8],
+        src_key: &[u8],
+    ) -> Option<()> {
+        w.key(out_key);
+        let Some(node) = doc.and_then(|d| d.get(src_key)) else {
+            w.str(b"");
+            return Some(());
+        };
+        match node.val {
+            PhpVal::Null | PhpVal::Bool(false) => w.str(b""),
+            PhpVal::Bool(true) => w.str(b"1"),
+            PhpVal::Int(i) => {
+                let mut dec = [0u8; 24];
+                w.str(format_i64_dec(i, &mut dec));
+            }
+            PhpVal::Str(s) => w.str(s),
+            PhpVal::Float | PhpVal::Arr(_) => return None,
+        }
+        Some(())
+    }
+
+    #[inline]
+    fn write_cast_int(
+        w: &mut PhpSerWriter,
+        doc: Option<&PhpNode<'_>>,
+        out_key: &[u8],
+        src_key: &[u8],
+    ) -> Option<()> {
+        let v = php_node_to_int(doc.and_then(|d| d.get(src_key)))?;
+        w.key(out_key);
+        w.int(v);
+        Some(())
+    }
+
+    #[inline]
+    fn resolve_releasedate_ts_node(node: Option<&PhpNode<'_>>, tz_is_utc: u32) -> Option<i64> {
+        let Some(n) = node else {
+            return Some(0);
+        };
+        match n.val {
+            PhpVal::Null => Some(0),
+            PhpVal::Str(b"") => Some(0),
+            PhpVal::Str(s) if tz_is_utc == 1 => parse_utc_datetime(s),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    unsafe fn observer_resolve_doc_id(
+        id_kind: i32,
+        id_int: i64,
+        id_ptr: *const u8,
+        id_len: usize,
+        out_doc_id: *mut i64,
+    ) -> i32 {
+        if !valid_mut_ptr(out_doc_id) || (!id_ptr.is_null() && !id_ptr.is_aligned()) {
+            return -1;
+        }
+        let resolved = match id_kind {
+            0 => 0,
+            1 => id_int,
+            2 => {
+                let Some(bytes) = (unsafe { input(id_ptr, id_len) }) else {
+                    return -1;
+                };
+                let Some(val) = parse_cast_int_bytes(bytes) else {
+                    return -1;
+                };
+                val
+            }
+            _ => return -1,
+        };
+        unsafe {
+            *out_doc_id = resolved;
+        }
+        1
+    }
+
+    #[inline]
+    unsafe fn observer_releasedate_to_ts(
+        input_ptr: *const u8,
+        input_len: usize,
+        has_input: u32,
+        tz_is_utc: u32,
+        out_ts: *mut i64,
+    ) -> i32 {
+        if !valid_mut_ptr(out_ts) || has_input > 1 || tz_is_utc > 1 {
+            return -1;
+        }
+        let Some(bytes) = (unsafe { input(input_ptr, input_len) }) else {
+            return -1;
+        };
+        if has_input == 0 || bytes.is_empty() {
+            unsafe {
+                *out_ts = 0;
+            }
+            return 1;
+        }
+        if tz_is_utc == 0 {
+            return -1;
+        }
+        let Some(ts) = parse_utc_datetime(bytes) else {
+            return -1;
+        };
+        unsafe {
+            *out_ts = ts;
+        }
+        1
+    }
+
+    // -------------------------------------------------------------------------
+    // 1. AnidbTitleObserver helpers
+    // -------------------------------------------------------------------------
+
+    /// Computes the unsigned 32-bit CRC32 document ID for `AnidbTitleObserver`
+    /// (`crc32("{$anidbid}|{$type}|{$lang}|{$title}")` as a non-negative `i64`),
+    /// returning `-1` on invalid pointer/length or panic.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_anidb_title_observer_doc_id(
+        anidbid: i64,
+        type_ptr: *const u8,
+        type_len: usize,
+        lang_ptr: *const u8,
+        lang_len: usize,
+        title_ptr: *const u8,
+        title_len: usize,
+    ) -> i64 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(type_bytes) = (unsafe { input(type_ptr, type_len) }) else {
+                return -1;
+            };
+            let Some(lang_bytes) = (unsafe { input(lang_ptr, lang_len) }) else {
+                return -1;
+            };
+            let Some(title_bytes) = (unsafe { input(title_ptr, title_len) }) else {
+                return -1;
+            };
+            let mut dec = [0u8; 24];
+            let id_bytes = format_i64_dec(anidbid, &mut dec);
+            let mut crc = !0u32;
+            crc = crc32_update(crc, id_bytes);
+            crc = crc32_update(crc, b"|");
+            crc = crc32_update(crc, type_bytes);
+            crc = crc32_update(crc, b"|");
+            crc = crc32_update(crc, lang_bytes);
+            crc = crc32_update(crc, b"|");
+            crc = crc32_update(crc, title_bytes);
+            i64::from(!crc)
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Normalizes PHP-serialized `AnidbTitle` and optional `AnidbInfo` attribute maps into the
+    /// 8-key secondary search document passed to `Search::insertSecondary(SecondarySearchIndex::Anime, ...)`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_anidb_title_observer_search_doc(
+        title_ser_ptr: *const u8,
+        title_ser_len: usize,
+        info_ser_ptr: *const u8,
+        info_ser_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_cap(out_buf, out_cap) || title_ser_len == 0 {
+                return DECLINE;
+            }
+            let Some(title_bytes) = (unsafe { input(title_ser_ptr, title_ser_len) }) else {
+                return DECLINE;
+            };
+            let Some(title_doc) = PhpSerParser::parse_document(title_bytes) else {
+                return DECLINE;
+            };
+            if !title_doc.is_arr() || title_doc.has_float {
+                return DECLINE;
+            }
+
+            let info_doc = if info_ser_len == 0 {
+                if !info_ser_ptr.is_null() && !info_ser_ptr.is_aligned() {
+                    return DECLINE;
+                }
+                None
+            } else {
+                let Some(info_bytes) = (unsafe { input(info_ser_ptr, info_ser_len) }) else {
+                    return DECLINE;
+                };
+                let Some(parsed) = PhpSerParser::parse_document(info_bytes) else {
+                    return DECLINE;
+                };
+                if !parsed.is_arr() || parsed.has_float {
+                    return DECLINE;
+                }
+                Some(parsed)
+            };
+
+            let mut w = PhpSerWriter::new();
+            w.arr_open(8);
+            if write_cast_str(&mut w, Some(&title_doc), b"title", b"title").is_none()
+                || write_cast_int(&mut w, Some(&title_doc), b"anidbid", b"anidbid").is_none()
+                || write_cast_int(&mut w, info_doc.as_ref(), b"anilist_id", b"anilist_id").is_none()
+                || write_cast_int(&mut w, info_doc.as_ref(), b"mal_id", b"mal_id").is_none()
+                || write_cast_str(&mut w, Some(&title_doc), b"lang", b"lang").is_none()
+                || write_cast_str(&mut w, Some(&title_doc), b"title_type", b"type").is_none()
+                || write_cast_str(&mut w, info_doc.as_ref(), b"media_type", b"media_type").is_none()
+                || write_cast_str(&mut w, info_doc.as_ref(), b"status", b"status").is_none()
+            {
+                return DECLINE;
+            }
+            w.arr_close();
+
+            unsafe { write_bytes(out_buf, out_cap, &w.buf) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    // -------------------------------------------------------------------------
+    // 2. BookInfoObserver helpers
+    // -------------------------------------------------------------------------
+
+    /// Resolves the integer secondary index document ID for `BookInfoObserver`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_book_info_observer_doc_id(
+        id_kind: i32,
+        id_int: i64,
+        id_ptr: *const u8,
+        id_len: usize,
+        out_doc_id: *mut i64,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| unsafe {
+            observer_resolve_doc_id(id_kind, id_int, id_ptr, id_len, out_doc_id)
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Normalizes a PHP-serialized `BookInfo` attribute map into the 4-key search document
+    /// passed to `Search::insertSecondary(SecondarySearchIndex::Books, ...)`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_book_info_observer_search_doc(
+        ser_ptr: *const u8,
+        ser_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_cap(out_buf, out_cap) || ser_len == 0 {
+                return DECLINE;
+            }
+            let Some(ser_bytes) = (unsafe { input(ser_ptr, ser_len) }) else {
+                return DECLINE;
+            };
+            let Some(doc) = PhpSerParser::parse_document(ser_bytes) else {
+                return DECLINE;
+            };
+            if !doc.is_arr() || doc.has_float {
+                return DECLINE;
+            }
+
+            let mut w = PhpSerWriter::new();
+            w.arr_open(4);
+            if write_cast_str(&mut w, Some(&doc), b"title", b"title").is_none()
+                || write_cast_str(&mut w, Some(&doc), b"author", b"author").is_none()
+                || write_cast_str(&mut w, Some(&doc), b"publishdate", b"publishdate").is_none()
+                || write_cast_int(&mut w, Some(&doc), b"cover", b"cover").is_none()
+            {
+                return DECLINE;
+            }
+            w.arr_close();
+
+            unsafe { write_bytes(out_buf, out_cap, &w.buf) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    // -------------------------------------------------------------------------
+    // 3. ConsoleInfoObserver helpers
+    // -------------------------------------------------------------------------
+
+    /// Resolves the integer secondary index document ID for `ConsoleInfoObserver`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_console_info_observer_doc_id(
+        id_kind: i32,
+        id_int: i64,
+        id_ptr: *const u8,
+        id_len: usize,
+        out_doc_id: *mut i64,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| unsafe {
+            observer_resolve_doc_id(id_kind, id_int, id_ptr, id_len, out_doc_id)
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Parses a standard UTC `releasedate` string into a Unix timestamp for `ConsoleInfoObserver`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_console_info_observer_releasedate_ts(
+        input_ptr: *const u8,
+        input_len: usize,
+        has_input: u32,
+        tz_is_utc: u32,
+        out_ts: *mut i64,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| unsafe {
+            observer_releasedate_to_ts(input_ptr, input_len, has_input, tz_is_utc, out_ts)
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Normalizes a PHP-serialized `ConsoleInfo` attribute map into the 5-key search document
+    /// passed to `Search::insertSecondary(SecondarySearchIndex::Console, ...)`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_console_info_observer_search_doc(
+        ser_ptr: *const u8,
+        ser_len: usize,
+        tz_is_utc: u32,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_cap(out_buf, out_cap) || ser_len == 0 || tz_is_utc > 1 {
+                return DECLINE;
+            }
+            let Some(ser_bytes) = (unsafe { input(ser_ptr, ser_len) }) else {
+                return DECLINE;
+            };
+            let Some(doc) = PhpSerParser::parse_document(ser_bytes) else {
+                return DECLINE;
+            };
+            if !doc.is_arr() || doc.has_float {
+                return DECLINE;
+            }
+            let Some(releasedate_ts) =
+                resolve_releasedate_ts_node(doc.get(b"releasedate"), tz_is_utc)
+            else {
+                return DECLINE;
+            };
+
+            let mut w = PhpSerWriter::new();
+            w.arr_open(5);
+            if write_cast_str(&mut w, Some(&doc), b"title", b"title").is_none()
+                || write_cast_str(&mut w, Some(&doc), b"platform", b"platform").is_none()
+                || write_cast_int(&mut w, Some(&doc), b"genres_id", b"genres_id").is_none()
+            {
+                return DECLINE;
+            }
+            w.key(b"releasedate_ts");
+            w.int(releasedate_ts);
+            if write_cast_int(&mut w, Some(&doc), b"cover", b"cover").is_none() {
+                return DECLINE;
+            }
+            w.arr_close();
+
+            unsafe { write_bytes(out_buf, out_cap, &w.buf) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    // -------------------------------------------------------------------------
+    // 4. GamesInfoObserver helpers
+    // -------------------------------------------------------------------------
+
+    /// Resolves the integer secondary index document ID for `GamesInfoObserver`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_games_info_observer_doc_id(
+        id_kind: i32,
+        id_int: i64,
+        id_ptr: *const u8,
+        id_len: usize,
+        out_doc_id: *mut i64,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| unsafe {
+            observer_resolve_doc_id(id_kind, id_int, id_ptr, id_len, out_doc_id)
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Parses a standard UTC `releasedate` string into a Unix timestamp for `GamesInfoObserver`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_games_info_observer_releasedate_ts(
+        input_ptr: *const u8,
+        input_len: usize,
+        has_input: u32,
+        tz_is_utc: u32,
+        out_ts: *mut i64,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| unsafe {
+            observer_releasedate_to_ts(input_ptr, input_len, has_input, tz_is_utc, out_ts)
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Normalizes a PHP-serialized `GamesInfo` attribute map into the 4-key search document
+    /// passed to `Search::insertSecondary(SecondarySearchIndex::Games, ...)`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_games_info_observer_search_doc(
+        ser_ptr: *const u8,
+        ser_len: usize,
+        tz_is_utc: u32,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_cap(out_buf, out_cap) || ser_len == 0 || tz_is_utc > 1 {
+                return DECLINE;
+            }
+            let Some(ser_bytes) = (unsafe { input(ser_ptr, ser_len) }) else {
+                return DECLINE;
+            };
+            let Some(doc) = PhpSerParser::parse_document(ser_bytes) else {
+                return DECLINE;
+            };
+            if !doc.is_arr() || doc.has_float {
+                return DECLINE;
+            }
+            let Some(releasedate_ts) =
+                resolve_releasedate_ts_node(doc.get(b"releasedate"), tz_is_utc)
+            else {
+                return DECLINE;
+            };
+
+            let mut w = PhpSerWriter::new();
+            w.arr_open(4);
+            if write_cast_str(&mut w, Some(&doc), b"title", b"title").is_none()
+                || write_cast_int(&mut w, Some(&doc), b"genres_id", b"genres_id").is_none()
+            {
+                return DECLINE;
+            }
+            w.key(b"releasedate_ts");
+            w.int(releasedate_ts);
+            if write_cast_int(&mut w, Some(&doc), b"cover", b"cover").is_none() {
+                return DECLINE;
+            }
+            w.arr_close();
+
+            unsafe { write_bytes(out_buf, out_cap, &w.buf) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    // -------------------------------------------------------------------------
+    // 5. MusicInfoObserver helpers
+    // -------------------------------------------------------------------------
+
+    /// Resolves the integer secondary index document ID for `MusicInfoObserver`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_music_info_observer_doc_id(
+        id_kind: i32,
+        id_int: i64,
+        id_ptr: *const u8,
+        id_len: usize,
+        out_doc_id: *mut i64,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| unsafe {
+            observer_resolve_doc_id(id_kind, id_int, id_ptr, id_len, out_doc_id)
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Normalizes a PHP-serialized `MusicInfo` attribute map into the 5-key search document
+    /// passed to `Search::insertSecondary(SecondarySearchIndex::Music, ...)`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_music_info_observer_search_doc(
+        ser_ptr: *const u8,
+        ser_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_cap(out_buf, out_cap) || ser_len == 0 {
+                return DECLINE;
+            }
+            let Some(ser_bytes) = (unsafe { input(ser_ptr, ser_len) }) else {
+                return DECLINE;
+            };
+            let Some(doc) = PhpSerParser::parse_document(ser_bytes) else {
+                return DECLINE;
+            };
+            if !doc.is_arr() || doc.has_float {
+                return DECLINE;
+            }
+
+            let mut w = PhpSerWriter::new();
+            w.arr_open(5);
+            if write_cast_str(&mut w, Some(&doc), b"title", b"title").is_none()
+                || write_cast_str(&mut w, Some(&doc), b"artist", b"artist").is_none()
+                || write_cast_str(&mut w, Some(&doc), b"year", b"year").is_none()
+                || write_cast_int(&mut w, Some(&doc), b"genres_id", b"genres_id").is_none()
+                || write_cast_int(&mut w, Some(&doc), b"cover", b"cover").is_none()
+            {
+                return DECLINE;
+            }
+            w.arr_close();
+
+            unsafe { write_bytes(out_buf, out_cap, &w.buf) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn anidb_title_observer_helpers() {
+            let doc_id = unsafe {
+                nntmux_anidb_title_observer_doc_id(
+                    12345,
+                    b"official".as_ptr(),
+                    8,
+                    b"en".as_ptr(),
+                    2,
+                    b"Cowboy Bebop".as_ptr(),
+                    12,
+                )
+            };
+            assert!(doc_id > 0);
+
+            let title_ser = br#"a:4:{s:7:"anidbid";i:12345;s:4:"type";s:8:"official";s:4:"lang";s:2:"en";s:5:"title";s:12:"Cowboy Bebop";}"#;
+            let info_ser = br#"a:4:{s:10:"anilist_id";i:1;s:6:"mal_id";i:1;s:10:"media_type";s:5:"ANIME";s:6:"status";s:8:"FINISHED";}"#;
+            let mut buf = [0u8; 512];
+            let written = unsafe {
+                nntmux_anidb_title_observer_search_doc(
+                    title_ser.as_ptr(),
+                    title_ser.len(),
+                    info_ser.as_ptr(),
+                    info_ser.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(written > 0);
+            let out = &buf[..written as usize];
+            assert!(out.starts_with(b"a:8:{"));
+
+            let written_no_info = unsafe {
+                nntmux_anidb_title_observer_search_doc(
+                    title_ser.as_ptr(),
+                    title_ser.len(),
+                    std::ptr::null(),
+                    0,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(written_no_info > 0);
+        }
+
+        #[test]
+        fn book_console_games_music_observer_helpers() {
+            let mut doc_id = -99i64;
+            assert_eq!(
+                unsafe {
+                    nntmux_book_info_observer_doc_id(1, 42, std::ptr::null(), 0, &mut doc_id)
+                },
+                1
+            );
+            assert_eq!(doc_id, 42);
+            assert_eq!(
+                unsafe {
+                    nntmux_console_info_observer_doc_id(2, 0, b" 77 ".as_ptr(), 4, &mut doc_id)
+                },
+                1
+            );
+            assert_eq!(doc_id, 77);
+            assert_eq!(
+                unsafe {
+                    nntmux_games_info_observer_doc_id(0, 0, std::ptr::null(), 0, &mut doc_id)
+                },
+                1
+            );
+            assert_eq!(doc_id, 0);
+            assert_eq!(
+                unsafe {
+                    nntmux_music_info_observer_doc_id(1, -5, std::ptr::null(), 0, &mut doc_id)
+                },
+                1
+            );
+            assert_eq!(doc_id, -5);
+
+            let mut ts = -1i64;
+            assert_eq!(
+                unsafe {
+                    nntmux_console_info_observer_releasedate_ts(
+                        b"2023-11-14".as_ptr(),
+                        10,
+                        1,
+                        1,
+                        &mut ts,
+                    )
+                },
+                1
+            );
+            assert_eq!(ts, 1_699_920_000);
+            assert_eq!(
+                unsafe {
+                    nntmux_games_info_observer_releasedate_ts(b"".as_ptr(), 0, 0, 1, &mut ts)
+                },
+                1
+            );
+            assert_eq!(ts, 0);
+
+            let mut buf = [0u8; 512];
+            let book_ser = br#"a:4:{s:5:"title";s:4:"Dune";s:6:"author";s:13:"Frank Herbert";s:11:"publishdate";s:10:"1965-08-01";s:5:"cover";b:1;}"#;
+            let bn = unsafe {
+                nntmux_book_info_observer_search_doc(
+                    book_ser.as_ptr(),
+                    book_ser.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(bn > 0);
+
+            let console_ser = br#"a:5:{s:5:"title";s:4:"Halo";s:8:"platform";s:4:"Xbox";s:9:"genres_id";s:1:"3";s:11:"releasedate";s:10:"2023-11-14";s:5:"cover";i:1;}"#;
+            let cn = unsafe {
+                nntmux_console_info_observer_search_doc(
+                    console_ser.as_ptr(),
+                    console_ser.len(),
+                    1,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(cn > 0);
+
+            let games_ser = br#"a:4:{s:5:"title";s:4:"Doom";s:9:"genres_id";i:2;s:11:"releasedate";s:19:"2024-02-29 00:00:00";s:5:"cover";b:0;}"#;
+            let gn = unsafe {
+                nntmux_games_info_observer_search_doc(
+                    games_ser.as_ptr(),
+                    games_ser.len(),
+                    1,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(gn > 0);
+
+            let music_ser = br#"a:5:{s:5:"title";s:9:"Discovery";s:6:"artist";s:9:"Daft Punk";s:4:"year";i:2001;s:9:"genres_id";i:5;s:5:"cover";i:1;}"#;
+            let mn = unsafe {
+                nntmux_music_info_observer_search_doc(
+                    music_ser.as_ptr(),
+                    music_ser.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(mn > 0);
+        }
+
+        #[test]
+        fn unaligned_null_and_insufficient_capacity_preserve_outputs() {
+            let mut raw = [0u64; 8];
+            let mut buf = [b'Z'; 8];
+            let unaligned_i64 = unsafe { (raw.as_mut_ptr() as *mut u8).add(1) as *mut i64 };
+
+            assert_eq!(
+                unsafe {
+                    nntmux_anidb_title_observer_doc_id(
+                        1,
+                        std::ptr::null(),
+                        2,
+                        b"en".as_ptr(),
+                        2,
+                        b"x".as_ptr(),
+                        1,
+                    )
+                },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_book_info_observer_doc_id(1, 10, std::ptr::null(), 0, unaligned_i64)
+                },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_console_info_observer_releasedate_ts(
+                        b"2023-11-14".as_ptr(),
+                        10,
+                        1,
+                        1,
+                        unaligned_i64,
+                    )
+                },
+                -1
+            );
+
+            let book_ser = br#"a:1:{s:5:"title";s:4:"Dune";}"#;
+            let short = unsafe {
+                nntmux_book_info_observer_search_doc(
+                    book_ser.as_ptr(),
+                    book_ser.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(short < -1);
+            assert_eq!(&buf, &[b'Z'; 8]);
+        }
+    }
+}
+
+
 
