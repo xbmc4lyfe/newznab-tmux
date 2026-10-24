@@ -4067,6 +4067,429 @@ pub unsafe extern "C" fn nntmux_log_index_match_expression(
     out.finish()
 }
 
+// ---------------------------------------------------------------------------
+// Image completeness, frame quality scoring & thumbnail frame selection
+// (`ImageInspector`, `FrameQualityScorer`, `ThumbnailFrameSelector`)
+// ---------------------------------------------------------------------------
+
+const PHP_IMAGETYPE_JPEG: u32 = 2;
+const PHP_IMAGETYPE_PNG: u32 = 3;
+const PHP_IMAGETYPE_WEBP: u32 = 18;
+
+#[inline]
+fn image_is_complete_tail_slice(type_code: u32, file_size: u64, head_or_tail: &[u8]) -> i32 {
+    if !matches!(
+        type_code,
+        PHP_IMAGETYPE_JPEG | PHP_IMAGETYPE_PNG | PHP_IMAGETYPE_WEBP
+    ) {
+        return -1;
+    }
+    if file_size < 16 {
+        return 0;
+    }
+
+    if type_code == PHP_IMAGETYPE_WEBP {
+        if head_or_tail.len() < 8 {
+            return 0;
+        }
+        let declared = u32::from_le_bytes([
+            head_or_tail[4],
+            head_or_tail[5],
+            head_or_tail[6],
+            head_or_tail[7],
+        ]) as u64;
+        return i32::from(file_size >= declared + 8);
+    }
+
+    let tail_raw = if head_or_tail.len() > 4096 {
+        &head_or_tail[head_or_tail.len() - 4096..]
+    } else {
+        head_or_tail
+    };
+    let mut end = tail_raw.len();
+    while end > 0 && matches!(tail_raw[end - 1], 0 | b'\r' | b'\n' | b' ') {
+        end -= 1;
+    }
+    let tail = &tail_raw[..end];
+
+    if type_code == PHP_IMAGETYPE_PNG {
+        let window = if tail.len() > 64 {
+            &tail[tail.len() - 64..]
+        } else {
+            tail
+        };
+        i32::from(window.windows(4).any(|w| w == b"IEND"))
+    } else {
+        let window = if tail.len() > 1024 {
+            &tail[tail.len() - 1024..]
+        } else {
+            tail
+        };
+        i32::from(window.windows(2).any(|w| w == b"\xFF\xD9"))
+    }
+}
+
+/// Checks `ImageInspector::isComplete` given `type_code` (`2` = JPEG, `3` = PNG, `18` = WebP),
+/// `file_size`, and either the first >=8 bytes (for WebP) or the last <=4096 bytes (for PNG/JPEG).
+///
+/// Returns `1` when complete, `0` when incomplete, or `-1` on invalid arguments / unsupported `type_code`.
+///
+/// # Safety
+///
+/// `head_or_tail_ptr` must be valid for reads of `head_or_tail_len` bytes when non-null and `head_or_tail_len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_image_is_complete_tail(
+    type_code: u32,
+    file_size: u64,
+    head_or_tail_ptr: *const u8,
+    head_or_tail_len: usize,
+) -> i32 {
+    if head_or_tail_ptr.is_null() && head_or_tail_len > 0 {
+        return -1;
+    }
+    let bytes = if head_or_tail_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(head_or_tail_ptr, head_or_tail_len) }
+    };
+    image_is_complete_tail_slice(type_code, file_size, bytes)
+}
+
+#[inline]
+fn read_file_at(file: &mut std::fs::File, offset: u64, dst: &mut [u8]) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        let mut total = 0usize;
+        while total < dst.len() {
+            match file.read_at(&mut dst[total..], offset + total as u64) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(total)
+    }
+    #[cfg(not(unix))]
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        file.seek(SeekFrom::Start(offset))?;
+        let mut total = 0usize;
+        while total < dst.len() {
+            match file.read(&mut dst[total..]) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(total)
+    }
+}
+
+/// Checks `ImageInspector::isComplete` directly on `path_ptr[..path_len]` for `type_code`
+/// (`2` = JPEG, `3` = PNG, `18` = WebP) without PHP stream overhead or intermediate string copies.
+///
+/// Returns `1` when complete, `0` when incomplete or unreadable/short, or `-1` on invalid arguments.
+///
+/// # Safety
+///
+/// `path_ptr` must be valid for reads of `path_len` bytes when non-null and `path_len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_image_is_complete_file(
+    path_ptr: *const u8,
+    path_len: usize,
+    type_code: u32,
+) -> i32 {
+    if path_ptr.is_null()
+        || path_len == 0
+        || !matches!(
+            type_code,
+            PHP_IMAGETYPE_JPEG | PHP_IMAGETYPE_PNG | PHP_IMAGETYPE_WEBP
+        )
+    {
+        return -1;
+    }
+    let path_bytes = unsafe { slice::from_raw_parts(path_ptr, path_len) };
+    if path_bytes.contains(&0) {
+        return -1;
+    }
+
+    #[cfg(unix)]
+    let path = {
+        use std::os::unix::ffi::OsStrExt;
+        std::path::Path::new(std::ffi::OsStr::from_bytes(path_bytes))
+    };
+    #[cfg(not(unix))]
+    let path = {
+        let Ok(s) = std::str::from_utf8(path_bytes) else {
+            return -1;
+        };
+        std::path::Path::new(s)
+    };
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return 0;
+    };
+    let Ok(meta) = file.metadata() else {
+        return 0;
+    };
+    if meta.is_dir() {
+        return 0;
+    }
+    let size = meta.len();
+    if size < 16 {
+        return 0;
+    }
+
+    if type_code == PHP_IMAGETYPE_WEBP {
+        let mut header = [0u8; 8];
+        let Ok(n) = read_file_at(&mut file, 0, &mut header) else {
+            return 0;
+        };
+        return image_is_complete_tail_slice(type_code, size, &header[..n]);
+    }
+
+    let mut tail = [0u8; 4096];
+    let offset = size.saturating_sub(4096);
+    let to_read = (size - offset) as usize;
+    let Ok(n) = read_file_at(&mut file, offset, &mut tail[..to_read]) else {
+        return 0;
+    };
+    image_is_complete_tail_slice(type_code, size, &tail[..n])
+}
+
+/// Computes `FrameQualityScorer::measure` BT.601 luma (`0.299*R + 0.587*G + 0.114*B`) mean and
+/// standard deviation over `pixel_count` contiguous RGB triplets (`3 * pixel_count` bytes).
+///
+/// Returns `1` on success, or `-1` on invalid arguments.
+///
+/// # Safety
+///
+/// `rgb_bytes_ptr` must be valid for reads of `3 * pixel_count` bytes when non-null and `pixel_count > 0`.
+/// `out_mean` and `out_stddev` must be valid for writes of one `f64` each.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_frame_luma_stats_rgb(
+    rgb_bytes_ptr: *const u8,
+    pixel_count: usize,
+    out_mean: *mut f64,
+    out_stddev: *mut f64,
+) -> i32 {
+    if rgb_bytes_ptr.is_null() || pixel_count == 0 || out_mean.is_null() || out_stddev.is_null() {
+        return -1;
+    }
+    let Some(byte_len) = pixel_count.checked_mul(3) else {
+        return -1;
+    };
+    let bytes = unsafe { slice::from_raw_parts(rgb_bytes_ptr, byte_len) };
+
+    let mut sum = 0.0_f64;
+    let mut sum_squares = 0.0_f64;
+    for rgb in bytes.chunks_exact(3) {
+        let luma = 0.299 * (rgb[0] as f64) + 0.587 * (rgb[1] as f64) + 0.114 * (rgb[2] as f64);
+        sum += luma;
+        sum_squares += luma * luma;
+    }
+
+    let pixels = (pixel_count.max(1)) as f64;
+    let mean = sum / pixels;
+    let variance = (sum_squares / pixels - mean * mean).max(0.0);
+    unsafe {
+        *out_mean = mean;
+        *out_stddev = variance.sqrt();
+    }
+    1
+}
+
+/// Computes `FrameQualityScorer::measure` BT.601 luma mean and standard deviation directly from an
+/// uncompressed 24-bit BMP buffer (such as `imagebmp($sample, $stream, false)`), iterating rows in
+/// top-to-bottom `(y = 0..height, x = 0..width)` order so IEEE-754 summation is bit-identical to PHP's
+/// nested `imagecolorat` loop.
+///
+/// Returns `1` on success, or `-1` on invalid or unsupported BMP data.
+///
+/// # Safety
+///
+/// `bmp_ptr` must be valid for reads of `bmp_len` bytes when non-null and `bmp_len > 0`.
+/// `out_mean` and `out_stddev` must be valid for writes of one `f64` each.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_frame_luma_stats_bmp(
+    bmp_ptr: *const u8,
+    bmp_len: usize,
+    out_mean: *mut f64,
+    out_stddev: *mut f64,
+) -> i32 {
+    if bmp_ptr.is_null() || bmp_len < 54 || out_mean.is_null() || out_stddev.is_null() {
+        return -1;
+    }
+    let bmp = unsafe { slice::from_raw_parts(bmp_ptr, bmp_len) };
+    if &bmp[0..2] != b"BM" {
+        return -1;
+    }
+    let data_offset = u32::from_le_bytes([bmp[10], bmp[11], bmp[12], bmp[13]]) as usize;
+    let width_i32 = i32::from_le_bytes([bmp[18], bmp[19], bmp[20], bmp[21]]);
+    let height_i32 = i32::from_le_bytes([bmp[22], bmp[23], bmp[24], bmp[25]]);
+    let planes = u16::from_le_bytes([bmp[26], bmp[27]]);
+    let bpp = u16::from_le_bytes([bmp[28], bmp[29]]);
+    let compression = u32::from_le_bytes([bmp[30], bmp[31], bmp[32], bmp[33]]);
+
+    if data_offset < 54
+        || width_i32 <= 0
+        || height_i32 == 0
+        || height_i32 == i32::MIN
+        || planes != 1
+        || bpp != 24
+        || compression != 0
+    {
+        return -1;
+    }
+
+    let width = width_i32 as usize;
+    let height = height_i32.unsigned_abs() as usize;
+    let Some(row_bytes) = width.checked_mul(3) else {
+        return -1;
+    };
+    let stride = (row_bytes + 3) & !3;
+    let Some(pixel_bytes) = stride.checked_mul(height) else {
+        return -1;
+    };
+    let Some(required_len) = data_offset.checked_add(pixel_bytes) else {
+        return -1;
+    };
+    if required_len > bmp_len {
+        return -1;
+    }
+
+    let bottom_up = height_i32 > 0;
+    let mut sum = 0.0_f64;
+    let mut sum_squares = 0.0_f64;
+    for y in 0..height {
+        let bmp_row = if bottom_up { height - 1 - y } else { y };
+        let row_start = data_offset + bmp_row * stride;
+        let row = &bmp[row_start..row_start + row_bytes];
+        for bgr in row.chunks_exact(3) {
+            let luma = 0.299 * (bgr[2] as f64) + 0.587 * (bgr[1] as f64) + 0.114 * (bgr[0] as f64);
+            sum += luma;
+            sum_squares += luma * luma;
+        }
+    }
+
+    let pixels = (width * height).max(1) as f64;
+    let mean = sum / pixels;
+    let variance = (sum_squares / pixels - mean * mean).max(0.0);
+    unsafe {
+        *out_mean = mean;
+        *out_stddev = variance.sqrt();
+    }
+    1
+}
+
+/// Checks `ThumbnailFrameSelector::looksLikeText($head)`:
+/// `ltrim($head, "\xEF\xBB\xBF \t\r\n")` followed by case-insensitive prefix `#EXTM3U` or `ffconcat`.
+///
+/// Returns `1` when `$head` looks like a playlist/ffconcat script, `0` otherwise, or `-1` on invalid arguments.
+///
+/// # Safety
+///
+/// `head_ptr` must be valid for reads of `head_len` bytes when non-null and `head_len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_thumbnail_looks_like_text(
+    head_ptr: *const u8,
+    head_len: usize,
+) -> i32 {
+    if head_ptr.is_null() && head_len > 0 {
+        return -1;
+    }
+    let bytes = if head_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(head_ptr, head_len) }
+    };
+
+    let mut pos = 0usize;
+    while pos < bytes.len()
+        && matches!(
+            bytes[pos],
+            0xEF | 0xBB | 0xBF | b' ' | b'\t' | b'\r' | b'\n'
+        )
+    {
+        pos += 1;
+    }
+    let start = &bytes[pos..];
+    let matches_playlist = (start.len() >= 7 && start[..7].eq_ignore_ascii_case(b"#extm3u"))
+        || (start.len() >= 8 && start[..8].eq_ignore_ascii_case(b"ffconcat"));
+    i32::from(matches_playlist)
+}
+
+/// Computes `ThumbnailFrameSelector::window` (`[$from, $spacing]` in seconds, rounded to 3 decimal places).
+///
+/// - `position_is_mid != 0`: writes `(0.0, 0.0)`.
+/// - `has_hints`: `0` when `$hints === null`, `1` for non-Complete `$hints`, `2` when `$hints->position === SourcePosition::Complete`.
+///   (When `has_hints == 1` and `total_bytes > 0 && available_bytes > 0`, `fraction = min(1.0, available_bytes / total_bytes)`.)
+///
+/// Returns `1` on success, or `-1` on invalid arguments.
+///
+/// # Safety
+///
+/// `out_from` and `out_spacing` must be valid for writes of one `f64` each.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_thumbnail_window(
+    position_is_mid: u32,
+    duration: f64,
+    has_duration: u32,
+    bit_rate: i64,
+    has_bit_rate: u32,
+    available_bytes: i64,
+    total_bytes: i64,
+    has_hints: u32,
+    attempts: i32,
+    out_from: *mut f64,
+    out_spacing: *mut f64,
+) -> i32 {
+    if out_from.is_null() || out_spacing.is_null() || attempts <= 0 {
+        return -1;
+    }
+    if position_is_mid != 0 {
+        unsafe {
+            *out_from = 0.0;
+            *out_spacing = 0.0;
+        }
+        return 1;
+    }
+    if (has_duration != 0 && !duration.is_finite()) || (has_bit_rate != 0 && bit_rate == 0) {
+        return -1;
+    }
+
+    let fraction: Option<f64> = if has_hints == 2 {
+        Some(1.0)
+    } else if has_hints != 0 && total_bytes > 0 && available_bytes > 0 {
+        Some(((available_bytes as f64) / (total_bytes as f64)).min(1.0))
+    } else {
+        None
+    };
+
+    let playable = if has_duration != 0
+        && let Some(frac) = fraction
+    {
+        duration * frac * if frac < 1.0 { 0.85 } else { 1.0 }
+    } else if has_hints != 0 && has_bit_rate != 0 && available_bytes > 0 {
+        (available_bytes as f64) * 8.0 / (bit_rate as f64) * 0.85
+    } else if has_duration != 0 {
+        duration
+    } else {
+        0.0
+    };
+
+    let from = ((playable * 0.25) * 1000.0).round() / 1000.0 + 0.0;
+    let spacing = (((playable - from) / (attempts as f64)) * 1000.0).round() / 1000.0 + 0.0;
+    unsafe {
+        *out_from = from;
+        *out_spacing = spacing;
+    }
+    1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4451,5 +4874,196 @@ mod tests {
             nntmux_log_index_match_expression("é".as_ptr(), 2, 3, out.as_mut_ptr(), out.len())
         };
         assert_eq!(written, LOG_SEARCH_DECLINED);
+    }
+
+    #[test]
+    fn test_image_is_complete_tail_and_file() {
+        // WebP: RIFF + 4-byte declared size + WEBP...
+        let mut webp = b"RIFF".to_vec();
+        webp.extend_from_slice(&24u32.to_le_bytes());
+        webp.extend_from_slice(b"WEBPVP8 ");
+        webp.resize(32, b'x');
+        assert_eq!(
+            unsafe {
+                nntmux_image_is_complete_tail(PHP_IMAGETYPE_WEBP, 32, webp.as_ptr(), webp.len())
+            },
+            1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_image_is_complete_tail(PHP_IMAGETYPE_WEBP, 31, webp.as_ptr(), webp.len())
+            },
+            0
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_image_is_complete_tail(PHP_IMAGETYPE_WEBP, 15, webp.as_ptr(), webp.len())
+            },
+            0
+        );
+
+        // PNG: IEND in last 64 bytes after rtrim("\0\r\n ")
+        let mut png_tail = vec![b'a'; 100];
+        png_tail.extend_from_slice(b"IEND\xae\x42\x60\x82\0\r\n ");
+        assert_eq!(
+            unsafe {
+                nntmux_image_is_complete_tail(PHP_IMAGETYPE_PNG, 200, png_tail.as_ptr(), png_tail.len())
+            },
+            1
+        );
+        let mut png_too_far = b"IEND".to_vec();
+        png_too_far.extend(std::iter::repeat_n(b'x', 61));
+        assert_eq!(
+            unsafe {
+                nntmux_image_is_complete_tail(
+                    PHP_IMAGETYPE_PNG,
+                    200,
+                    png_too_far.as_ptr(),
+                    png_too_far.len(),
+                )
+            },
+            0
+        );
+
+        // JPEG: \xFF\xD9 in last 1024 bytes after rtrim("\0\r\n ")
+        let mut jpg_tail = vec![b'z'; 500];
+        jpg_tail.extend_from_slice(b"\xFF\xD9  \n\0");
+        assert_eq!(
+            unsafe {
+                nntmux_image_is_complete_tail(PHP_IMAGETYPE_JPEG, 600, jpg_tail.as_ptr(), jpg_tail.len())
+            },
+            1
+        );
+        let mut jpg_too_far = b"\xFF\xD9".to_vec();
+        jpg_too_far.extend(std::iter::repeat_n(b'z', 1023));
+        assert_eq!(
+            unsafe {
+                nntmux_image_is_complete_tail(
+                    PHP_IMAGETYPE_JPEG,
+                    2000,
+                    jpg_too_far.as_ptr(),
+                    jpg_too_far.len(),
+                )
+            },
+            0
+        );
+
+        // File test via temp file
+        let tmp_dir = std::env::temp_dir();
+        let tmp_file = tmp_dir.join(format!("nntmux_img_test_{}.jpg", std::process::id()));
+        std::fs::write(&tmp_file, &jpg_tail).unwrap();
+        let path_bytes = tmp_file.to_string_lossy().into_owned().into_bytes();
+        assert_eq!(
+            unsafe {
+                nntmux_image_is_complete_file(
+                    path_bytes.as_ptr(),
+                    path_bytes.len(),
+                    PHP_IMAGETYPE_JPEG,
+                )
+            },
+            1
+        );
+        std::fs::remove_file(&tmp_file).ok();
+    }
+
+    #[test]
+    fn test_frame_luma_stats_rgb_and_bmp() {
+        let rgb = [0u8, 0, 0, 255, 255, 255];
+        let mut mean = 0.0_f64;
+        let mut stddev = 0.0_f64;
+        assert_eq!(
+            unsafe { nntmux_frame_luma_stats_rgb(rgb.as_ptr(), 2, &mut mean, &mut stddev) },
+            1
+        );
+        assert!((mean - 127.5).abs() < 1e-9);
+        assert!((stddev - 127.5).abs() < 1e-9);
+
+        // Construct a 2x1 24-bit bottom-up BMP with pixels (0,0,0) and (255,255,255)
+        let mut bmp = vec![0u8; 54 + 8];
+        bmp[0] = b'B';
+        bmp[1] = b'M';
+        bmp[2..6].copy_from_slice(&62u32.to_le_bytes());
+        bmp[10..14].copy_from_slice(&54u32.to_le_bytes());
+        bmp[14..18].copy_from_slice(&40u32.to_le_bytes());
+        bmp[18..22].copy_from_slice(&2i32.to_le_bytes());
+        bmp[22..26].copy_from_slice(&1i32.to_le_bytes());
+        bmp[26..28].copy_from_slice(&1u16.to_le_bytes());
+        bmp[28..30].copy_from_slice(&24u16.to_le_bytes());
+        bmp[57] = 255;
+        bmp[58] = 255;
+        bmp[59] = 255;
+        let mut bmp_mean = 0.0_f64;
+        let mut bmp_std = 0.0_f64;
+        assert_eq!(
+            unsafe {
+                nntmux_frame_luma_stats_bmp(bmp.as_ptr(), bmp.len(), &mut bmp_mean, &mut bmp_std)
+            },
+            1
+        );
+        assert_eq!(mean.to_bits(), bmp_mean.to_bits());
+        assert_eq!(stddev.to_bits(), bmp_std.to_bits());
+    }
+
+    #[test]
+    fn test_thumbnail_looks_like_text_and_window() {
+        let m3u = b"\xEF\xBB\xBF \t\r\n#extM3u\nfile:///etc/passwd";
+        assert_eq!(
+            unsafe { nntmux_thumbnail_looks_like_text(m3u.as_ptr(), m3u.len()) },
+            1
+        );
+        let concat = b"  \nFFCONCAT version 1.0";
+        assert_eq!(
+            unsafe { nntmux_thumbnail_looks_like_text(concat.as_ptr(), concat.len()) },
+            1
+        );
+        let mkv = b"\x1A\x45\xDF\xA3matroska";
+        assert_eq!(
+            unsafe { nntmux_thumbnail_looks_like_text(mkv.as_ptr(), mkv.len()) },
+            0
+        );
+
+        let mut from = -1.0_f64;
+        let mut spacing = -1.0_f64;
+        // Complete: duration=100, bit_rate=8000, has_hints=2, attempts=4 -> [25.0, 18.75]
+        assert_eq!(
+            unsafe {
+                nntmux_thumbnail_window(0, 100.0, 1, 8000, 1, 0, 0, 2, 4, &mut from, &mut spacing)
+            },
+            1
+        );
+        assert_eq!((from, spacing), (25.0, 18.75));
+
+        // Partial head(10000, 1000): [2.125, 1.594]
+        assert_eq!(
+            unsafe {
+                nntmux_thumbnail_window(
+                    0, 100.0, 1, 8000, 1, 1000, 10000, 1, 4, &mut from, &mut spacing,
+                )
+            },
+            1
+        );
+        assert_eq!((from, spacing), (2.125, 1.594));
+
+        // Partial head(null, 1000): [0.213, 0.159]
+        assert_eq!(
+            unsafe {
+                nntmux_thumbnail_window(
+                    0, 100.0, 1, 8000, 1, 1000, 0, 1, 4, &mut from, &mut spacing,
+                )
+            },
+            1
+        );
+        assert_eq!((from, spacing), (0.213, 0.159));
+
+        // Mid: [0.0, 0.0]
+        assert_eq!(
+            unsafe {
+                nntmux_thumbnail_window(
+                    1, 100.0, 1, 8000, 1, 1000, 10000, 1, 4, &mut from, &mut spacing,
+                )
+            },
+            1
+        );
+        assert_eq!((from, spacing), (0.0, 0.0));
     }
 }
