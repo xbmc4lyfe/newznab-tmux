@@ -198,8 +198,10 @@ jobs:
           fi
       - uses: actions/configure-pages@v5
         if: steps.publish_now.outputs.publish == 'true'
+        continue-on-error: true
       - uses: actions/deploy-pages@v4
         if: steps.publish_now.outputs.publish == 'true'
+        continue-on-error: true
 
   deploy:
     needs: build
@@ -226,10 +228,26 @@ jobs:
           else
             echo 'Master advanced; its queued refresh will publish the new build.' >> "$GITHUB_STEP_SUMMARY"
           fi
+      - name: Check if rendered build advances the live publication
+        id: advances
+        if: steps.current.outputs.matches != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_SHA: ${{ needs.build.outputs.sha }}
+        run: |
+          pub_sha=$(curl -fsSL https://xbmc4lyfe.github.io/newznab-tmux/publication.json 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin).get('source_sha',''))" 2>/dev/null || true)
+          if [[ -z "$pub_sha" || "$pub_sha" == "$BUILD_SHA" ]]; then
+            echo 'publish=true' >> "$GITHUB_OUTPUT"
+          else
+            rel=$(gh api "repos/xbmc4lyfe/newznab-tmux/compare/${pub_sha}...${BUILD_SHA}" --jq .status 2>/dev/null || echo "ahead")
+            if [[ "$rel" == "ahead" ]]; then
+              echo 'publish=true' >> "$GITHUB_OUTPUT"
+            fi
+          fi
       - uses: actions/configure-pages@v5
-        if: steps.current.outputs.matches == 'true'
+        if: steps.current.outputs.matches == 'true' || steps.advances.outputs.publish == 'true'
       - uses: actions/deploy-pages@v4
-        if: steps.current.outputs.matches == 'true'
+        if: steps.current.outputs.matches == 'true' || steps.advances.outputs.publish == 'true'
         id: deployment
       - uses: actions/checkout@v5
         if: steps.current.outputs.matches == 'true'
