@@ -13013,3 +13013,490 @@ mod wave17_additional_config_metrics_sync_tests {
         );
     }
 }
+// ---------------------------------------------------------------------------
+// Wave 18: ArchiveProcessingService, MediaSourcePlan, DownloadKind,
+// ImageProcessingResult and IngestionConfigurationData helpers.
+// ---------------------------------------------------------------------------
+
+/// `ArchiveProcessingService::normalizeAnalysis` outcome codes.
+pub(crate) const W18_ANALYSIS_OK: i32 = 0;
+pub(crate) const W18_ANALYSIS_OK_ENCRYPTED: i32 = 1;
+pub(crate) const W18_ANALYSIS_ARCHIVE_ERROR: i32 = 2;
+pub(crate) const W18_ANALYSIS_UNKNOWN_ERROR: i32 = 3;
+
+/// `ImageProcessingResult` field presence bits.
+pub(crate) const W18_IPR_SUCCESS: i32 = 1;
+pub(crate) const W18_IPR_PATH: i32 = 1 << 1;
+pub(crate) const W18_IPR_WIDTH: i32 = 1 << 2;
+pub(crate) const W18_IPR_HEIGHT: i32 = 1 << 3;
+pub(crate) const W18_IPR_MIME: i32 = 1 << 4;
+pub(crate) const W18_IPR_REASON: i32 = 1 << 5;
+
+/// Number of non-string `IngestionConfigurationData` fields (declaration order, with
+/// `safeBackfillDate` removed).
+pub(crate) const W18_ICD_NUMERIC_COUNT: usize = 35;
+
+/// Positions of the boolean fields within the numeric field list.
+const W18_ICD_BOOL_SLOTS: [usize; 8] = [7, 23, 24, 25, 28, 29, 30, 31];
+
+/// `IngestionConfigurationData::defaults()` numeric fields (booleans as 0/1).
+const W18_ICD_DEFAULTS: [i64; W18_ICD_NUMERIC_COUNT] = [
+    1, 1, 1, 2, 48, 2, 95, 1, 1_000_000, 20_000, 1000, 10, 4, 72, 0, 0, 0, 1, 0, 0, 0, 1, 100_000,
+    0, 1, 0, 15_000, 3, 1, 0, 0, 0, 1, 2, 100_000,
+];
+
+/// `IngestionConfigurationData::defaults()->safeBackfillDate`.
+const W18_ICD_DEFAULT_DATE: &[u8] = b"2012-06-24";
+
+/// Non-null, `T`-aligned pointer whose `count` elements fit in `isize::MAX` bytes
+/// without wrapping the address space.
+#[inline]
+fn w18_slice_ok<T>(ptr: *const T, count: usize) -> bool {
+    !ptr.is_null()
+        && ptr.is_aligned()
+        && count
+            .checked_mul(std::mem::size_of::<T>())
+            .is_some_and(|bytes| {
+                bytes <= isize::MAX as usize && (ptr as usize).checked_add(bytes).is_some()
+            })
+}
+
+/// PHP truthiness of a string: `""` and `"0"` are falsy.
+#[inline]
+fn w18_php_string_truthy(value: &[u8]) -> bool {
+    !value.is_empty() && value != b"0"
+}
+
+/// `ArchiveProcessingService::analyze` normalization: the archive error is a string,
+/// `encrypted_prop` is `! empty($archiveInfo->isEncrypted)` and `summary_flag` is
+/// `(int) $summary['is_encrypted']` when `summary_flag_present`.
+pub(crate) fn w18_analysis_code(
+    set_data_ok: bool,
+    error: &[u8],
+    encrypted_prop: bool,
+    summary_flag_present: bool,
+    summary_flag: i64,
+) -> i32 {
+    if !set_data_ok {
+        return if w18_php_string_truthy(error) {
+            W18_ANALYSIS_ARCHIVE_ERROR
+        } else {
+            W18_ANALYSIS_UNKNOWN_ERROR
+        };
+    }
+    if !error.is_empty() {
+        return W18_ANALYSIS_ARCHIVE_ERROR;
+    }
+    if encrypted_prop || (summary_flag_present && summary_flag != 0) {
+        W18_ANALYSIS_OK_ENCRYPTED
+    } else {
+        W18_ANALYSIS_OK
+    }
+}
+
+/// `MediaSourcePlan::realSizeOf` over little-endian `[i64 source index][i64 size]`
+/// pairs: `Some(Some(size))` for the first matching index, `Some(None)` when absent and
+/// `None` for a malformed buffer.
+pub(crate) fn w18_real_size_of(packed: &[u8], source_index: i64) -> Option<Option<i64>> {
+    if !packed.len().is_multiple_of(16) {
+        return None;
+    }
+    for pair in packed.as_chunks::<16>().0 {
+        if w15_read_i64(&pair[..8]) == source_index {
+            return Some(Some(w15_read_i64(&pair[8..])));
+        }
+    }
+    Some(None)
+}
+
+/// `DownloadKind::isPreviewSource` by backing value; `None` for an unknown value.
+pub(crate) fn w18_download_kind_is_preview(value: &[u8]) -> Option<bool> {
+    match value {
+        b"par2-index" | b"media-source" | b"jpg" => Some(true),
+        b"sample" | b"media-info" | b"audio" | b"compressed" => Some(false),
+        _ => None,
+    }
+}
+
+/// `ImageProcessingResult::success`/`failure` field presence mask and integer payload.
+pub(crate) fn w18_image_result(success: bool, width: i64, height: i64) -> (i32, [i64; 2]) {
+    if success {
+        (
+            W18_IPR_SUCCESS | W18_IPR_PATH | W18_IPR_WIDTH | W18_IPR_HEIGHT | W18_IPR_MIME,
+            [width, height],
+        )
+    } else {
+        (W18_IPR_REASON, [0, 0])
+    }
+}
+
+/// `IngestionConfigurationData` numeric fields with boolean slots normalized to 0/1.
+pub(crate) fn w18_icd_normalize(
+    raw: &[i64; W18_ICD_NUMERIC_COUNT],
+) -> [i64; W18_ICD_NUMERIC_COUNT] {
+    let mut out = *raw;
+    for slot in W18_ICD_BOOL_SLOTS {
+        out[slot] = i64::from(out[slot] != 0);
+    }
+    out
+}
+
+/// `ArchiveProcessingService` analysis outcome: 0 ok, 1 ok and encrypted, 2 failed with
+/// the archive error, 3 failed with `Unknown error`, or -1 for invalid input.
+///
+/// # Safety
+/// A non-null `error` must be readable for `error_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_aps_analysis_code(
+    set_data_ok: i32,
+    error: *const u8,
+    error_len: usize,
+    encrypted_prop: i32,
+    summary_flag_present: i32,
+    summary_flag: i64,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        let Some(error) = w15_input(error, error_len) else {
+            return -1;
+        };
+        w18_analysis_code(
+            set_data_ok != 0,
+            error,
+            encrypted_prop != 0,
+            summary_flag_present != 0,
+            summary_flag,
+        )
+    })
+    .unwrap_or(-1)
+}
+
+/// Mapped PAR2 size for an NZB source index. `packed` holds little-endian
+/// `[i64 index][i64 size]` pairs. Returns 1 and writes `*out_size` when found, 0 when
+/// absent, or -1 for invalid input (length not a multiple of 16, null/misaligned output).
+///
+/// # Safety
+/// A non-null `packed` must be readable for `len` bytes and `out_size` writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_msp_real_size_of(
+    packed: *const u8,
+    len: usize,
+    source_index: i64,
+    out_size: *mut i64,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        if !w18_slice_ok(out_size.cast_const(), 1) {
+            return -1;
+        }
+        let Some(packed) = w15_input(packed, len) else {
+            return -1;
+        };
+        match w18_real_size_of(packed, source_index) {
+            Some(Some(size)) => {
+                // SAFETY: `out_size` is non-null, aligned and writable for one value.
+                unsafe { out_size.write(size) };
+                1
+            }
+            Some(None) => 0,
+            None => -1,
+        }
+    })
+    .unwrap_or(-1)
+}
+
+/// `DownloadKind::isPreviewSource` by backing value: 1, 0 or -1 for an unknown value or
+/// invalid input.
+///
+/// # Safety
+/// A non-null `ptr` must be readable for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_dk_is_preview_source(ptr: *const u8, len: usize) -> i32 {
+    std::panic::catch_unwind(
+        || match w15_input(ptr, len).and_then(w18_download_kind_is_preview) {
+            Some(preview) => i32::from(preview),
+            None => -1,
+        },
+    )
+    .unwrap_or(-1)
+}
+
+/// `ImageProcessingResult` construction (`kind` 1 success, 0 failure). Writes
+/// `[width, height]` (zero on failure) and returns the field presence mask, or -1 for an
+/// unknown kind or a null/misaligned/short output.
+///
+/// # Safety
+/// A non-null `out` must be writable for `out_count` `int64_t`s.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_ipr_build(
+    kind: i32,
+    width: i64,
+    height: i64,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        if !(kind == 0 || kind == 1) || out_count < 2 || !w18_slice_ok(out.cast_const(), out_count)
+        {
+            return -1;
+        }
+        let (mask, values) = w18_image_result(kind == 1, width, height);
+        // SAFETY: `out` is non-null, aligned and writable for at least two values.
+        unsafe { std::ptr::copy_nonoverlapping(values.as_ptr(), out, 2) };
+        mask
+    })
+    .unwrap_or(-1)
+}
+
+/// `IngestionConfigurationData::defaults()`. Writes the 35 numeric fields to `out` and
+/// the safe backfill date to `date`; returns the date length, `-needed` for a short date
+/// buffer, or -1 for invalid input (null/misaligned/short `out`, invalid `date`).
+///
+/// # Safety
+/// `out` must be writable for `out_count` `int64_t`s and a non-null `date` for
+/// `date_cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_icd_defaults(
+    out: *mut i64,
+    out_count: usize,
+    date: *mut u8,
+    date_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        if out_count < W18_ICD_NUMERIC_COUNT || !w18_slice_ok(out.cast_const(), out_count) {
+            return -1;
+        }
+        let written = w15_write(date, date_cap, W18_ICD_DEFAULT_DATE);
+        if written < 0 {
+            return written;
+        }
+        // SAFETY: `out` is non-null, aligned and writable for `W18_ICD_NUMERIC_COUNT`
+        // values.
+        unsafe {
+            std::ptr::copy_nonoverlapping(W18_ICD_DEFAULTS.as_ptr(), out, W18_ICD_NUMERIC_COUNT)
+        };
+        written
+    })
+    .unwrap_or(-1)
+}
+
+/// Normalizes the 35 numeric `IngestionConfigurationData` fields (booleans to 0/1).
+/// Returns the number of values written or -1 for invalid input. `raw` and `out` may
+/// alias.
+///
+/// # Safety
+/// `raw` must be readable for `count` and `out` writable for `out_count` `int64_t`s.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_icd_normalize(
+    raw: *const i64,
+    count: usize,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        if count != W18_ICD_NUMERIC_COUNT
+            || out_count < W18_ICD_NUMERIC_COUNT
+            || !w18_slice_ok(raw, count)
+            || !w18_slice_ok(out.cast_const(), out_count)
+        {
+            return -1;
+        }
+        let mut values = [0i64; W18_ICD_NUMERIC_COUNT];
+        // SAFETY: `raw` is non-null, aligned and readable for `W18_ICD_NUMERIC_COUNT`
+        // values; `values` is a distinct local.
+        unsafe { std::ptr::copy(raw, values.as_mut_ptr(), W18_ICD_NUMERIC_COUNT) };
+        let normalized = w18_icd_normalize(&values);
+        // SAFETY: `out` is non-null, aligned and writable for `W18_ICD_NUMERIC_COUNT`
+        // values.
+        unsafe { std::ptr::copy(normalized.as_ptr(), out, W18_ICD_NUMERIC_COUNT) };
+        W18_ICD_NUMERIC_COUNT as i32
+    })
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod wave18_additional_archive_media_ingestion_config_tests {
+    use super::*;
+
+    #[test]
+    fn analysis_code_matches_php_branches() {
+        assert_eq!(w18_analysis_code(false, b"Bad", false, false, 0), 2);
+        assert_eq!(w18_analysis_code(false, b"", true, true, 1), 3);
+        assert_eq!(w18_analysis_code(false, b"0", false, false, 0), 3);
+        assert_eq!(w18_analysis_code(true, b"0", false, false, 0), 2);
+        assert_eq!(w18_analysis_code(true, b"x", true, true, 1), 2);
+        assert_eq!(w18_analysis_code(true, b"", false, false, 5), 0);
+        assert_eq!(w18_analysis_code(true, b"", false, true, 0), 0);
+        assert_eq!(w18_analysis_code(true, b"", false, true, -1), 1);
+        assert_eq!(w18_analysis_code(true, b"", true, false, 0), 1);
+        assert_eq!(
+            unsafe { nntmux_aps_analysis_code(1, std::ptr::null(), 0, 0, 1, 1) },
+            1
+        );
+        assert_eq!(
+            unsafe { nntmux_aps_analysis_code(1, std::ptr::null(), 3, 0, 0, 0) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_aps_analysis_code(1, b"x".as_ptr(), usize::MAX, 0, 0, 0) },
+            -1
+        );
+    }
+
+    #[test]
+    fn real_size_of_finds_first_pair_and_validates() {
+        let mut packed = Vec::new();
+        for (index, size) in [(3i64, 100i64), (-1, i64::MAX), (3, 7)] {
+            packed.extend_from_slice(&index.to_le_bytes());
+            packed.extend_from_slice(&size.to_le_bytes());
+        }
+        assert_eq!(w18_real_size_of(&packed, 3), Some(Some(100)));
+        assert_eq!(w18_real_size_of(&packed, -1), Some(Some(i64::MAX)));
+        assert_eq!(w18_real_size_of(&packed, 9), Some(None));
+        assert_eq!(w18_real_size_of(&packed[..15], 3), None);
+        assert_eq!(w18_real_size_of(b"", 0), Some(None));
+
+        let mut out = 0i64;
+        assert_eq!(
+            unsafe { nntmux_msp_real_size_of(packed.as_ptr(), packed.len(), -1, &mut out) },
+            1
+        );
+        assert_eq!(out, i64::MAX);
+        assert_eq!(
+            unsafe { nntmux_msp_real_size_of(packed.as_ptr(), packed.len(), 8, &mut out) },
+            0
+        );
+        assert_eq!(
+            unsafe { nntmux_msp_real_size_of(packed.as_ptr(), 17, 3, &mut out) },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_msp_real_size_of(packed.as_ptr(), packed.len(), 3, std::ptr::null_mut())
+            },
+            -1
+        );
+        let mut words = [0i64; 2];
+        let misaligned = unsafe { words.as_mut_ptr().cast::<u8>().add(1) }.cast::<i64>();
+        assert_eq!(
+            unsafe { nntmux_msp_real_size_of(packed.as_ptr(), packed.len(), 3, misaligned) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_msp_real_size_of(std::ptr::null(), 16, 3, &mut out) },
+            -1
+        );
+    }
+
+    #[test]
+    fn download_kind_preview_classification() {
+        for value in [&b"par2-index"[..], b"media-source", b"jpg"] {
+            assert_eq!(w18_download_kind_is_preview(value), Some(true));
+        }
+        for value in [&b"sample"[..], b"media-info", b"audio", b"compressed"] {
+            assert_eq!(w18_download_kind_is_preview(value), Some(false));
+        }
+        assert_eq!(w18_download_kind_is_preview(b"JPG"), None);
+        assert_eq!(w18_download_kind_is_preview(b""), None);
+        assert_eq!(
+            unsafe { nntmux_dk_is_preview_source(b"jpg".as_ptr(), 3) },
+            1
+        );
+        assert_eq!(
+            unsafe { nntmux_dk_is_preview_source(std::ptr::null(), 3) },
+            -1
+        );
+    }
+
+    #[test]
+    fn image_result_mask_and_contract() {
+        assert_eq!(w18_image_result(true, -5, i64::MAX), (31, [-5, i64::MAX]));
+        assert_eq!(w18_image_result(false, 9, 9), (32, [0, 0]));
+        let mut out = [7i64; 3];
+        assert_eq!(
+            unsafe { nntmux_ipr_build(1, 320, 240, out.as_mut_ptr(), 3) },
+            31
+        );
+        assert_eq!(out, [320, 240, 7]);
+        assert_eq!(
+            unsafe { nntmux_ipr_build(0, 320, 240, out.as_mut_ptr(), 2) },
+            32
+        );
+        assert_eq!(out, [0, 0, 7]);
+        assert_eq!(
+            unsafe { nntmux_ipr_build(2, 1, 1, out.as_mut_ptr(), 2) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_ipr_build(1, 1, 1, out.as_mut_ptr(), 1) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_ipr_build(1, 1, 1, std::ptr::null_mut(), 2) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_ipr_build(1, 1, 1, out.as_mut_ptr(), usize::MAX) },
+            -1
+        );
+    }
+
+    #[test]
+    fn ingestion_defaults_and_normalize() {
+        let mut out = [0i64; W18_ICD_NUMERIC_COUNT];
+        let mut date = [0u8; 16];
+        assert_eq!(
+            unsafe {
+                nntmux_icd_defaults(out.as_mut_ptr(), out.len(), date.as_mut_ptr(), date.len())
+            },
+            10
+        );
+        assert_eq!(out, W18_ICD_DEFAULTS);
+        assert_eq!(&date[..10], b"2012-06-24");
+        assert_eq!(
+            unsafe { nntmux_icd_defaults(out.as_mut_ptr(), out.len(), date.as_mut_ptr(), 4) },
+            -10
+        );
+        assert_eq!(
+            unsafe { nntmux_icd_defaults(out.as_mut_ptr(), 34, date.as_mut_ptr(), 16) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_icd_defaults(out.as_mut_ptr(), 35, std::ptr::null_mut(), 16) },
+            -1
+        );
+
+        let mut raw = [i64::MIN; W18_ICD_NUMERIC_COUNT];
+        raw[7] = 0;
+        let normalized = w18_icd_normalize(&raw);
+        for (slot, value) in normalized.iter().enumerate() {
+            let expected = if slot == 7 {
+                0
+            } else if W18_ICD_BOOL_SLOTS.contains(&slot) {
+                1
+            } else {
+                i64::MIN
+            };
+            assert_eq!(*value, expected, "slot {slot}");
+        }
+        let ptr = raw.as_mut_ptr();
+        assert_eq!(unsafe { nntmux_icd_normalize(ptr, 35, ptr, 35) }, 35);
+        assert_eq!(raw, normalized);
+        assert_eq!(unsafe { nntmux_icd_normalize(ptr, 34, ptr, 35) }, -1);
+        assert_eq!(unsafe { nntmux_icd_normalize(ptr, 35, ptr, 34) }, -1);
+        assert_eq!(
+            unsafe { nntmux_icd_normalize(std::ptr::null(), 35, ptr, 35) },
+            -1
+        );
+        let mut bytes = [0u8; 8 * 36 + 8];
+        let base = bytes.as_mut_ptr();
+        let offset = base.align_offset(8) + 1;
+        let misaligned = unsafe { base.add(offset) }.cast::<i64>();
+        assert_eq!(
+            unsafe { nntmux_icd_normalize(misaligned, 35, out.as_mut_ptr(), 35) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_icd_normalize(out.as_ptr(), 35, misaligned, 35) },
+            -1
+        );
+    }
+}
