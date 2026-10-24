@@ -18,16 +18,48 @@ use App\Support\BookIsbn;
 use App\Support\BookMatchScorer;
 use App\Support\Data\BookParseResult;
 use App\Support\MetadataSearchLookup;
+use App\Support\RustPipelineLibrary;
+use FFI;
+use FFI\CData;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Throwable;
 
 /**
  * Service class for book data fetching and processing.
  */
 class BookService
 {
+    public const string BOOK_FFI_CDEF = <<<'C'
+        ssize_t nntmux_book_parse_release_name(const char *input, size_t input_len, const char *release_type, size_t type_len, char *out, size_t cap);
+        ssize_t nntmux_book_extract_isbn(const char *input, size_t input_len, char *out, size_t cap);
+        int32_t nntmux_book_looks_like_obfuscated(const char *input, size_t input_len);
+        ssize_t nntmux_book_readable_search_name(const char *input, size_t input_len, const char *query, size_t query_len, uint32_t junk, char *out, size_t cap);
+        C;
+
+    private static FFI|false|null $bookFfi = null;
+
+    private static ?CData $bookBuffer = null;
+
+    private static int $bookCapacity = 0;
+
+    private static function bookFfi(): FFI|false
+    {
+        if (self::$bookFfi === null) {
+            self::$bookFfi = RustPipelineLibrary::resolveDomain('book_service', self::BOOK_FFI_CDEF) ?? false;
+            if (self::$bookFfi !== false) {
+                self::$bookBuffer = RustPipelineLibrary::obtainScratch(self::$bookFfi, 16384, self::$bookCapacity);
+                if (self::$bookBuffer === null) {
+                    self::$bookFfi = false;
+                }
+            }
+        }
+
+        return self::$bookFfi;
+    }
+
     private const FAILURE_CACHE_VERSION = 2;
 
     private int $providerRetryAfter = 300;
@@ -668,14 +700,21 @@ class BookService
         return false;
     }
 
+    // Paired benchmarks did not clear the 1.5x mean/p99 gates. Production stays in PHP;
+    // the *Native candidates remain callable by the parity/benchmark harness.
     public function parseReleaseName(string $releaseName, string $releaseType = 'ebook'): BookParseResult
+    {
+        return $this->parseReleaseNamePhp($releaseName, $releaseType);
+    }
+
+    public function parseReleaseNamePhp(string $releaseName, string $releaseType = 'ebook'): BookParseResult
     {
         $rawReleaseName = $releaseName;
         $releaseName = $this->obfuscatedSubjectExtractor->extract($releaseName) ?? $releaseName;
         if (preg_match('/"([^"]{3,240})"/', $releaseName, $quotedMatch) === 1) {
             $releaseName = $quotedMatch[1];
         }
-        $isbn = $this->extractIsbn($releaseName);
+        $isbn = $this->extractIsbnPhp($releaseName);
         $year = null;
         if (preg_match('/\b(19|20)\d{2}\b/', $releaseName, $yearMatch) === 1) {
             $year = (int) $yearMatch[0];
@@ -775,6 +814,11 @@ class BookService
 
     public function extractIsbn(string $releaseName): ?string
     {
+        return $this->extractIsbnPhp($releaseName);
+    }
+
+    public function extractIsbnPhp(string $releaseName): ?string
+    {
         if (preg_match('/\b(97[89](?:[-\s]?\d){10})\b/', $releaseName, $matches) === 1) {
             $isbn = preg_replace('/[^0-9]/', '', $matches[1]);
             if (is_string($isbn)) {
@@ -793,7 +837,12 @@ class BookService
 
     protected function determineReadableBookSearchName(string $rawReleaseName, BookParseResult $parsed): ?string
     {
-        if ($this->looksLikeObfuscatedBookSubject($rawReleaseName)) {
+        return $this->determineReadableBookSearchNamePhp($rawReleaseName, $parsed);
+    }
+
+    public function determineReadableBookSearchNamePhp(string $rawReleaseName, BookParseResult $parsed): ?string
+    {
+        if ($this->looksLikeObfuscatedBookSubjectPhp($rawReleaseName)) {
             $normalized = $this->obfuscatedSubjectExtractor->extract($rawReleaseName);
             if ($normalized !== null) {
                 return $normalized;
@@ -821,7 +870,94 @@ class BookService
 
     protected function looksLikeObfuscatedBookSubject(string $value): bool
     {
+        return $this->looksLikeObfuscatedBookSubjectPhp($value);
+    }
+
+    public function looksLikeObfuscatedBookSubjectPhp(string $value): bool
+    {
         return preg_match('/^\s*(?:N:\/NZB\b|N[\s._:-]*NZB[\s._-]*\[|(?:re\s*)?posted\s+by\b)/i', $value) === 1;
+    }
+
+    /** Rust candidate; every declined input is parsed by the unchanged PHP implementation. */
+    public function parseReleaseNameNative(string $releaseName, string $releaseType = 'ebook'): BookParseResult
+    {
+        $ffi = self::bookFfi();
+        if ($ffi !== false && self::$bookBuffer !== null) {
+            try {
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_book_parse_release_name($releaseName, strlen($releaseName), $releaseType, strlen($releaseType), self::$bookBuffer, self::$bookCapacity);
+                if (is_int($written) && $written > 0) {
+                    $fields = explode("\0", FFI::string(self::$bookBuffer, $written));
+                    if (count($fields) === 7) {
+                        $flags = (int) $fields[6];
+
+                        return new BookParseResult(
+                            rawName: $fields[0], title: $fields[1],
+                            author: ($flags & 1) !== 0 ? $fields[2] : null,
+                            isbn: ($flags & 2) !== 0 ? $fields[3] : null,
+                            year: ($flags & 4) !== 0 ? (int) $fields[4] : null,
+                            format: ($flags & 8) !== 0 ? $fields[5] : null,
+                            isJunk: ($flags & 16) !== 0, isMagazine: ($flags & 32) !== 0,
+                        );
+                    }
+                }
+            } catch (Throwable) {
+            }
+        }
+
+        return $this->parseReleaseNamePhp($releaseName, $releaseType);
+    }
+
+    public function extractIsbnNative(string $releaseName): ?string
+    {
+        $ffi = self::bookFfi();
+        if ($ffi !== false && self::$bookBuffer !== null) {
+            try {
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_book_extract_isbn($releaseName, strlen($releaseName), self::$bookBuffer, self::$bookCapacity);
+                if (is_int($written) && $written >= 0) {
+                    return $written === 0 ? null : FFI::string(self::$bookBuffer, $written);
+                }
+            } catch (Throwable) {
+            }
+        }
+
+        return $this->extractIsbnPhp($releaseName);
+    }
+
+    public function looksLikeObfuscatedBookSubjectNative(string $value): bool
+    {
+        $ffi = self::bookFfi();
+        if ($ffi !== false) {
+            try {
+                // @phpstan-ignore method.notFound
+                $result = $ffi->nntmux_book_looks_like_obfuscated($value, strlen($value));
+                if ($result === 0 || $result === 1) {
+                    return $result === 1;
+                }
+            } catch (Throwable) {
+            }
+        }
+
+        return $this->looksLikeObfuscatedBookSubjectPhp($value);
+    }
+
+    public function determineReadableBookSearchNameNative(string $rawReleaseName, BookParseResult $parsed): ?string
+    {
+        $ffi = self::bookFfi();
+        if ($ffi !== false && self::$bookBuffer !== null) {
+            try {
+                $query = $parsed->searchQuery();
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_book_readable_search_name($rawReleaseName, strlen($rawReleaseName), $query, strlen($query), (int) $parsed->isJunk, self::$bookBuffer, self::$bookCapacity);
+                if (is_int($written) && $written >= 0) {
+                    return $written === 0 ? null : FFI::string(self::$bookBuffer, $written);
+                }
+            } catch (Throwable) {
+            }
+        }
+
+        return $this->determineReadableBookSearchNamePhp($rawReleaseName, $parsed);
     }
 
     /**
