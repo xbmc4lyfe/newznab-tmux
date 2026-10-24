@@ -9,12 +9,15 @@ use App\Services\Configuration\ProcessingRuntimeStateRepository;
 use App\Services\NNTP\NNTPService;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Tmux\CollectionDowntimeCompensator;
+use App\Support\RustPipelineLibrary;
 use DariusIII\NetNntp\Error as NntpError;
 use DariusIII\NetNntp\Protocol\ResponseCode;
+use FFI;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
+use Throwable;
 
 /**
  * Service for downloading and processing of Usenet binary headers.
@@ -27,6 +30,65 @@ use Illuminate\Support\Str;
  */
 class BinariesService
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_binaries_calculate(uint32_t mode, const int64_t *input, size_t len, int64_t *out, size_t cap);
+        ssize_t nntmux_scan_diagnostic(int64_t first, int64_t last, int64_t group_last, const char *name, size_t len, char *out, size_t cap);
+        C;
+
+    // PHP remains the default unless every paired common/uncommon mean and p99 gains 1.5x.
+    private static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
+
+    public static function setUseRustFfi(bool $use): void
+    {
+        self::$useRustFfi = $use;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        self::$ffi ??= RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF) ?? false;
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
+
+    /**
+     * @param  list<int>  $values
+     * @return list<int>|null
+     */
+    private static function calculateNative(int $mode, array $values, int $size): ?array
+    {
+        try {
+            $ffi = self::ffi();
+            if ($ffi === null || count($values) > 1024) {
+                return null;
+            }
+            $input = $ffi->new('int64_t['.max(1, count($values)).']');
+            foreach ($values as $i => $value) {
+                $input[$i] = $value;
+            }
+            $out = $ffi->new('int64_t['.$size.']');
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_binaries_calculate($mode, $input, count($values), $out, $size);
+            if ($written !== $size) {
+                return null;
+            }
+            $result = [];
+            for ($i = 0; $i < $size; $i++) {
+                $result[] = (int) $out[$i];
+            }
+
+            return $result;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
     private BinariesConfig $config;
 
     private HeaderParser $headerParser;
@@ -144,7 +206,7 @@ class BinariesService
      * @param  int  $maxHeaders  (Optional) How many headers to download max.
      *
      * @throws \Exception
-     * @throws \Throwable
+     * @throws Throwable
      */
     public function updateAllGroups(int $maxHeaders = 100000): void
     {
@@ -179,7 +241,7 @@ class BinariesService
 
             try {
                 $this->updateGroup($group, $maxHeaders);
-            } catch (\Throwable $e) {
+            } catch (Throwable $e) {
                 $this->logError('Error updating group '.$group['name'].': '.$e->getMessage());
             }
 
@@ -209,7 +271,7 @@ class BinariesService
      * @param  int  $maxHeaders  (Optional) How many headers to download max.
      *
      * @throws \Exception
-     * @throws \Throwable
+     * @throws Throwable
      */
     public function updateGroup(array $groupMySQL, int $maxHeaders = 0): void
     {
@@ -221,7 +283,7 @@ class BinariesService
         // returns below), so a monitor-only recovery doesn't count this as downtime.
         try {
             app(CollectionDowntimeCompensator::class)->noteIngestion();
-        } catch (\Throwable) {
+        } catch (Throwable) {
             // Best effort.
         }
         $this->logIndexerStart();
@@ -287,7 +349,7 @@ class BinariesService
      * @return array<string, mixed> Empty on failure.
      *
      * @throws \Exception
-     * @throws \Throwable
+     * @throws Throwable
      */
     public function scan(array $groupMySQL, int $first, int $last, string $type = 'update', ?array $missingParts = null): array
     {
@@ -296,11 +358,11 @@ class BinariesService
             if (! app(CandidateRepository::class)->capacityAvailable()) {
                 throw new \RuntimeException('Verification backlog is full; scan paused before downloading headers.');
             }
-        } catch (\Throwable $exception) {
+        } catch (Throwable $exception) {
             if ($type !== 'partrepair') {
                 try {
                     $this->missedPartHandler->deferRange($first, $last, (int) $groupMySQL['id']);
-                } catch (\Throwable $deferralFailure) {
+                } catch (Throwable $deferralFailure) {
                     throw new \RuntimeException('Unable to defer headers after capacity admission failed: '
                         .$exception->getMessage().'; '.$deferralFailure->getMessage(), 0, $exception);
                 }
@@ -393,7 +455,7 @@ class BinariesService
                         $headersNotInserted,
                         $this->headerStorage->store($parseResult['headers'], $groupMySQL, $addToPartRepair)
                     );
-                } catch (\Throwable $e) {
+                } catch (Throwable $e) {
                     Log::error('Binary header storage failed', [
                         'groups_id' => $groupMySQL['id'],
                         'article_count' => \count($parseResult['headers']),
@@ -452,7 +514,7 @@ class BinariesService
      * @param  array<string, mixed>  $groupArr  The info for this group from mysql.
      *
      * @throws \Exception
-     * @throws \Throwable
+     * @throws Throwable
      */
     public function partRepair(array $groupArr): void
     {
@@ -800,33 +862,10 @@ class BinariesService
      */
     private function calculateNewGroupRange(array $groupNNTP): array
     {
-        if ($this->config->newGroupScanByDays) {
-            $first = (int) $this->daytopost($this->config->newGroupDaysToScan, $groupNNTP);
-        } elseif ($groupNNTP['first'] >= ($groupNNTP['last'] - ($this->config->newGroupMessagesToScan + $this->config->messageBuffer))) {
-            $first = (int) $groupNNTP['first'];
-        } else {
-            $first = (int) ($groupNNTP['last'] - ($this->config->newGroupMessagesToScan + $this->config->messageBuffer));
-        }
+        $dateFirst = $this->config->newGroupScanByDays
+            ? (int) $this->daytopost($this->config->newGroupDaysToScan, $groupNNTP) : null;
 
-        $leaveOver = $this->config->messageBuffer;
-        $last = $groupLast = (int) ($groupNNTP['last'] - $leaveOver);
-
-        if ($last < $first) {
-            $last = $groupLast = $first;
-        }
-
-        $total = (int) ($groupLast - $first);
-        $realTotal = (int) ($groupNNTP['last'] - $first);
-
-        return [
-            'first' => $first,
-            'last' => $last,
-            'groupLast' => $groupLast,
-            'total' => $total,
-            'realTotal' => $realTotal,
-            'leaveOver' => $leaveOver,
-            'isNew' => true,
-        ];
+        return self::newHeaderRange((int) $groupNNTP['first'], (int) $groupNNTP['last'], $this->config->newGroupMessagesToScan, $this->config->messageBuffer, $dateFirst);
     }
 
     /**
@@ -836,39 +875,7 @@ class BinariesService
      */
     private function calculateExistingGroupRange(array $groupMySQL, array $groupNNTP, int $maxHeaders): array
     {
-        $first = (int) $groupMySQL['last_record'];
-        $totalCount = (int) ($groupNNTP['last'] - $first);
-
-        if ($totalCount > ($this->config->messageBuffer * 2)) {
-            $leaveOver = (int) round($totalCount % $this->config->messageBuffer, 0, PHP_ROUND_HALF_DOWN) + $this->config->messageBuffer;
-        } else {
-            $leaveOver = (int) round($totalCount / 2, 0, PHP_ROUND_HALF_DOWN);
-        }
-
-        $last = $groupLast = (int) ($groupNNTP['last'] - $leaveOver);
-
-        if ($last < $first) {
-            $last = $groupLast = $first;
-        }
-
-        $total = (int) ($groupLast - $first);
-        $realTotal = (int) ($groupNNTP['last'] - $first);
-
-        // Apply max headers limit
-        if ($maxHeaders > 0 && $maxHeaders < ($groupLast - $first)) {
-            $groupLast = $last = (int) ($first + $maxHeaders);
-            $total = (int) ($groupLast - $first);
-        }
-
-        return [
-            'first' => $first,
-            'last' => $last,
-            'groupLast' => $groupLast,
-            'total' => $total,
-            'realTotal' => $realTotal,
-            'leaveOver' => $leaveOver,
-            'isNew' => false,
-        ];
+        return self::existingHeaderRange((int) $groupMySQL['last_record'], (int) $groupNNTP['last'], $this->config->messageBuffer, $maxHeaders);
     }
 
     /**
@@ -888,18 +895,11 @@ class BinariesService
                 return;
             }
 
-            // Calculate chunk bounds
-            if ($range['total'] > $this->config->messageBuffer) {
-                $last = (int) min($first + $this->config->messageBuffer, $groupLast);
-            }
-
-            $first++;
+            [$first, $last] = self::scanChunk($first, $last, $groupLast, (int) $range['total'], $this->config->messageBuffer);
 
             if ($this->config->echoCli) {
                 cli()->header(
-                    PHP_EOL.'Getting '.number_format($last - $first + 1).' articles ('.number_format($first).
-                    ' to '.number_format($last).') from '.$groupMySQL['name'].' - ('.
-                    number_format($groupLast - $last).' articles in queue).'
+                    self::scanDiagnostic($first, $last, $groupLast, $groupMySQL['name'])
                 );
             }
 
@@ -1090,24 +1090,7 @@ class BinariesService
      */
     private function getNextArticleToTry(int $currentPost, array $groupData): ?int
     {
-        if (abs($currentPost - $groupData['first']) > abs($groupData['last'] - $currentPost)) {
-            $tempPost = (int) round($currentPost / (random_int(1005, 1012) / 1000), 0, PHP_ROUND_HALF_UP);
-            if ($tempPost < $groupData['first']) {
-                $tempPost = $groupData['first'];
-            }
-        } else {
-            $tempPost = (int) round((random_int(1005, 1012) / 1000) * $currentPost, 0, PHP_ROUND_HALF_UP);
-            if ($tempPost > $groupData['last']) {
-                $tempPost = $groupData['last'];
-            }
-        }
-
-        // If we got the same article number, give up
-        if ($tempPost === $currentPost) {
-            return null;
-        }
-
-        return $tempPost;
+        return self::postdateProbe($currentPost, (int) $groupData['first'], (int) $groupData['last'], random_int(1005, 1012));
     }
 
     /**
@@ -1181,9 +1164,7 @@ class BinariesService
 
     private function articleMidpoint(int $minimum, int $maximum): int
     {
-        $distance = $maximum - $minimum;
-
-        return $minimum + intdiv($distance, 2) + ($distance % 2);
+        return self::$useRustFfi ? self::articleMidpointNative($minimum, $maximum) : self::articleMidpointPhp($minimum, $maximum);
     }
 
     // ==================== Output Methods ====================
@@ -1278,5 +1259,152 @@ class BinariesService
         if (config('app.debug')) {
             Log::error($message);
         }
+    }
+
+    /** @return array{first: int, last: int, groupLast: int, total: int, realTotal: int, leaveOver: int, isNew: bool} */
+    public static function existingHeaderRange(int $first, int $newest, int $buffer, int $limit): array
+    {
+        return self::$useRustFfi ? self::existingHeaderRangeNative($first, $newest, $buffer, $limit) : self::existingHeaderRangePhp($first, $newest, $buffer, $limit);
+    }
+
+    /** @return array{first: int, last: int, groupLast: int, total: int, realTotal: int, leaveOver: int, isNew: bool} */
+    public static function existingHeaderRangeNative(int $first, int $newest, int $buffer, int $limit): array
+    {
+        $values = self::calculateNative(0, [$first, $newest, $buffer, $limit], 6);
+
+        return $values === null ? self::existingHeaderRangePhp($first, $newest, $buffer, $limit) : self::headerRangeResult($values, false);
+    }
+
+    /** @return array{first: int, last: int, groupLast: int, total: int, realTotal: int, leaveOver: int, isNew: bool} */
+    public static function existingHeaderRangePhp(int $first, int $newest, int $buffer, int $limit): array
+    {
+        $count = (int) ($newest - $first);
+        $leave = $count > $buffer * 2
+            ? (int) round($count % $buffer, 0, PHP_ROUND_HALF_DOWN) + $buffer
+            : (int) round($count / 2, 0, PHP_ROUND_HALF_DOWN);
+        $last = max((int) ($newest - $leave), $first);
+        if ($limit > 0 && $limit < $last - $first) {
+            $last = (int) ($first + $limit);
+        }
+
+        return self::headerRangeResult([$first, $last, $last, (int) ($last - $first), (int) ($newest - $first), $leave], false);
+    }
+
+    /** @return array{first: int, last: int, groupLast: int, total: int, realTotal: int, leaveOver: int, isNew: bool} */
+    public static function newHeaderRange(int $oldest, int $newest, int $messages, int $buffer, ?int $dateFirst = null): array
+    {
+        return self::$useRustFfi ? self::newHeaderRangeNative($oldest, $newest, $messages, $buffer, $dateFirst) : self::newHeaderRangePhp($oldest, $newest, $messages, $buffer, $dateFirst);
+    }
+
+    /** @return array{first: int, last: int, groupLast: int, total: int, realTotal: int, leaveOver: int, isNew: bool} */
+    public static function newHeaderRangeNative(int $oldest, int $newest, int $messages, int $buffer, ?int $dateFirst = null): array
+    {
+        $values = self::calculateNative(1, [$oldest, $newest, $messages, $buffer, (int) ($dateFirst !== null), $dateFirst ?? 0], 6);
+
+        return $values === null ? self::newHeaderRangePhp($oldest, $newest, $messages, $buffer, $dateFirst) : self::headerRangeResult($values, true);
+    }
+
+    /** @return array{first: int, last: int, groupLast: int, total: int, realTotal: int, leaveOver: int, isNew: bool} */
+    public static function newHeaderRangePhp(int $oldest, int $newest, int $messages, int $buffer, ?int $dateFirst = null): array
+    {
+        $first = $dateFirst ?? (int) max($oldest, $newest - ($messages + $buffer));
+        $last = max((int) ($newest - $buffer), $first);
+
+        return self::headerRangeResult([$first, $last, $last, (int) ($last - $first), (int) ($newest - $first), $buffer], true);
+    }
+
+    /**
+     * @param  list<int>  $values
+     * @return array{first: int, last: int, groupLast: int, total: int, realTotal: int, leaveOver: int, isNew: bool}
+     */
+    private static function headerRangeResult(array $values, bool $isNew): array
+    {
+        return ['first' => $values[0], 'last' => $values[1], 'groupLast' => $values[2], 'total' => $values[3], 'realTotal' => $values[4], 'leaveOver' => $values[5], 'isNew' => $isNew];
+    }
+
+    /** @return array{int, int} */
+    public static function scanChunk(int $first, int $last, int $groupLast, int $total, int $buffer): array
+    {
+        return self::$useRustFfi ? self::scanChunkNative($first, $last, $groupLast, $total, $buffer) : self::scanChunkPhp($first, $last, $groupLast, $total, $buffer);
+    }
+
+    /** @return array{int, int} */
+    public static function scanChunkNative(int $first, int $last, int $groupLast, int $total, int $buffer): array
+    {
+        $values = self::calculateNative(2, [$first, $last, $groupLast, $total, $buffer], 2);
+
+        return $values === null ? self::scanChunkPhp($first, $last, $groupLast, $total, $buffer) : [$values[0], $values[1]];
+    }
+
+    /** @return array{int, int} */
+    public static function scanChunkPhp(int $first, int $last, int $groupLast, int $total, int $buffer): array
+    {
+        return [$first + 1, $total > $buffer ? (int) min($first + $buffer, $groupLast) : $last];
+    }
+
+    public static function scanDiagnostic(int $first, int $last, int $groupLast, string $name): string
+    {
+        return self::$useRustFfi ? self::scanDiagnosticNative($first, $last, $groupLast, $name) : self::scanDiagnosticPhp($first, $last, $groupLast, $name);
+    }
+
+    public static function scanDiagnosticNative(int $first, int $last, int $groupLast, string $name): string
+    {
+        try {
+            $ffi = self::ffi();
+            if ($ffi !== null && strlen($name) <= 1_048_576) {
+                $capacity = strlen($name) + 256;
+                $out = $ffi->new('char['.$capacity.']');
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_scan_diagnostic($first, $last, $groupLast, $name, strlen($name), $out, $capacity);
+                if (is_int($written) && $written >= 0 && $written <= $capacity) {
+                    return FFI::string($out, $written);
+                }
+            }
+        } catch (Throwable) {
+            // Loading/symbol/ABI failures preserve the PHP path.
+        }
+
+        return self::scanDiagnosticPhp($first, $last, $groupLast, $name);
+    }
+
+    public static function scanDiagnosticPhp(int $first, int $last, int $groupLast, string $name): string
+    {
+        return PHP_EOL.'Getting '.number_format($last - $first + 1).' articles ('.number_format($first).' to '.number_format($last).') from '.$name.' - ('.number_format($groupLast - $last).' articles in queue).';
+    }
+
+    public static function articleMidpointNative(int $minimum, int $maximum): int
+    {
+        return self::calculateNative(3, [$minimum, $maximum], 1)[0] ?? self::articleMidpointPhp($minimum, $maximum);
+    }
+
+    public static function articleMidpointPhp(int $minimum, int $maximum): int
+    {
+        $distance = $maximum - $minimum;
+
+        return $minimum + intdiv($distance, 2) + ($distance % 2);
+    }
+
+    public static function postdateProbe(int $current, int $first, int $last, int $factor): ?int
+    {
+        return self::$useRustFfi ? self::postdateProbeNative($current, $first, $last, $factor) : self::postdateProbePhp($current, $first, $last, $factor);
+    }
+
+    public static function postdateProbeNative(int $current, int $first, int $last, int $factor): ?int
+    {
+        $values = self::calculateNative(4, [$current, $first, $last, $factor], 1);
+        if ($values === null) {
+            return self::postdateProbePhp($current, $first, $last, $factor);
+        }
+
+        return $values[0] === $current ? null : $values[0];
+    }
+
+    public static function postdateProbePhp(int $current, int $first, int $last, int $factor): ?int
+    {
+        $probe = abs($current - $first) > abs($last - $current)
+            ? max((int) round($current / ($factor / 1000), 0, PHP_ROUND_HALF_UP), $first)
+            : min((int) round(($factor / 1000) * $current, 0, PHP_ROUND_HALF_UP), $last);
+
+        return $probe === $current ? null : $probe;
     }
 }

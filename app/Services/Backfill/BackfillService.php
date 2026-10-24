@@ -9,8 +9,11 @@ use App\Services\Binaries\BinariesService;
 use App\Services\Configuration\ProcessingRuntimeStateRepository;
 use App\Services\NNTP\NNTPService;
 use App\Services\Releases\Verification\CandidateRepository;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
+use Throwable;
 
 /**
  * Service for backfilling Usenet groups with historical articles.
@@ -23,6 +26,64 @@ use Illuminate\Support\Facades\DB;
  */
 final class BackfillService
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_backfill_calculate(uint32_t mode, const int64_t *input, size_t len, int64_t *out, size_t cap);
+        C;
+
+    // PHP remains the default unless every paired common/uncommon mean and p99 gains 1.5x.
+    private static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
+
+    public static function setUseRustFfi(bool $use): void
+    {
+        self::$useRustFfi = $use;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        self::$ffi ??= RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF) ?? false;
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
+
+    /**
+     * @param  list<int>  $values
+     * @return list<int>|null
+     */
+    private static function calculateNative(int $mode, array $values, int $size): ?array
+    {
+        try {
+            $ffi = self::ffi();
+            if ($ffi === null || count($values) > 1024) {
+                return null;
+            }
+            $input = $ffi->new('int64_t['.max(1, count($values)).']');
+            foreach ($values as $i => $value) {
+                $input[$i] = $value;
+            }
+            $out = $ffi->new('int64_t['.$size.']');
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_backfill_calculate($mode, $input, count($values), $out, $size);
+            if ($written !== $size) {
+                return null;
+            }
+            $result = [];
+            for ($i = 0; $i < $size; $i++) {
+                $result[] = (int) $out[$i];
+            }
+
+            return $result;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
     private const DEFAULT_ARTICLE_COUNT = 20000;
 
     private BackfillConfig $config;
@@ -48,7 +109,7 @@ final class BackfillService
      * @param  int|string  $articles  Number of articles to backfill, or empty for date-based
      * @param  string  $type  Backfill type filter
      *
-     * @throws \Throwable
+     * @throws Throwable
      */
     public function backfillAllGroups(string $groupName = '', int|string $articles = '', string $type = ''): void
     {
@@ -84,7 +145,7 @@ final class BackfillService
      * @param  int  $remainingGroups  Number of groups remaining after this one
      * @param  int|string  $articles  Number of articles to backfill, or empty for date-based
      *
-     * @throws \Throwable
+     * @throws Throwable
      */
     public function backfillGroup(array $groupArr, int $remainingGroups, int|string $articles = ''): void
     {
@@ -126,7 +187,7 @@ final class BackfillService
      *
      * @param  int|string  $articles  Number of articles to backfill
      *
-     * @throws \Throwable
+     * @throws Throwable
      */
     public function safeBackfill(int|string $articles = ''): void
     {
@@ -230,14 +291,11 @@ final class BackfillService
      */
     private function calculateTargetPost(array $groupArr, int|string $articles, array $serverData): int
     {
-        $isArticleBased = $articles !== '';
+        if ($articles !== '') {
+            return self::targetArticle((int) $groupArr['first_record'], (int) $articles, (int) $serverData['first']);
+        }
 
-        $targetPost = $isArticleBased
-            ? (int) round($groupArr['first_record'] - (int) $articles)
-            : (int) $this->binaries->daytopost($groupArr['backfill_target'], $serverData);
-
-        // Ensure target is not below server's oldest article
-        return max($targetPost, (int) $serverData['first']);
+        return self::clampDatePost((int) $this->binaries->daytopost($groupArr['backfill_target'], $serverData), (int) $serverData['first']);
     }
 
     /**
@@ -274,8 +332,7 @@ final class BackfillService
     private function processBackfillChunks(array $groupArr, int $targetPost, int $remainingGroups, string $shortGroupName): void
     {
         $messageBuffer = $this->binaries->getMessageBuffer();
-        $last = $groupArr['first_record'] - 1;
-        $first = max($last - $messageBuffer + 1, $targetPost);
+        [$first, $last] = self::backfillChunk((int) $groupArr['first_record'], $targetPost, $messageBuffer);
 
         while (true) {
             if (app(ProcessingRuntimeStateRepository::class)->stopRequested() || ! app(CandidateRepository::class)->capacityAvailable()) {
@@ -296,8 +353,7 @@ final class BackfillService
             }
 
             // Move to next chunk
-            $last = $first - 1;
-            $first = max($last - $messageBuffer + 1, $targetPost);
+            [$first, $last] = self::backfillChunk($first, $targetPost, $messageBuffer);
         }
     }
 
@@ -404,5 +460,57 @@ final class BackfillService
     {
         $duration = number_format(now()->timestamp - $startTime->timestamp, 2);
         $this->log(PHP_EOL."Group {$shortGroupName} processed in {$duration} seconds.");
+    }
+
+    public static function targetArticle(int $first, int $articles, int $oldest): int
+    {
+        return self::$useRustFfi ? self::targetArticleNative($first, $articles, $oldest) : self::targetArticlePhp($first, $articles, $oldest);
+    }
+
+    public static function targetArticleNative(int $first, int $articles, int $oldest): int
+    {
+        return self::calculateNative(0, [$first, $articles, $oldest], 1)[0] ?? self::targetArticlePhp($first, $articles, $oldest);
+    }
+
+    public static function targetArticlePhp(int $first, int $articles, int $oldest): int
+    {
+        return max((int) round($first - $articles), $oldest);
+    }
+
+    public static function clampDatePost(int $target, int $oldest): int
+    {
+        return self::$useRustFfi ? self::clampDatePostNative($target, $oldest) : self::clampDatePostPhp($target, $oldest);
+    }
+
+    public static function clampDatePostNative(int $target, int $oldest): int
+    {
+        return self::calculateNative(1, [$target, $oldest], 1)[0] ?? self::clampDatePostPhp($target, $oldest);
+    }
+
+    public static function clampDatePostPhp(int $target, int $oldest): int
+    {
+        return max($target, $oldest);
+    }
+
+    /** @return array{int, int} */
+    public static function backfillChunk(int $previousFirst, int $target, int $buffer): array
+    {
+        return self::$useRustFfi ? self::backfillChunkNative($previousFirst, $target, $buffer) : self::backfillChunkPhp($previousFirst, $target, $buffer);
+    }
+
+    /** @return array{int, int} */
+    public static function backfillChunkNative(int $previousFirst, int $target, int $buffer): array
+    {
+        $values = self::calculateNative(2, [$previousFirst, $target, $buffer], 2);
+
+        return $values === null ? self::backfillChunkPhp($previousFirst, $target, $buffer) : [$values[0], $values[1]];
+    }
+
+    /** @return array{int, int} */
+    public static function backfillChunkPhp(int $previousFirst, int $target, int $buffer): array
+    {
+        $last = $previousFirst - 1;
+
+        return [max($last - $buffer + 1, $target), $last];
     }
 }

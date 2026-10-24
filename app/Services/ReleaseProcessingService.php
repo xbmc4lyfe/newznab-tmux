@@ -28,7 +28,9 @@ use App\Support\Data\ProcessReleasesSettings;
 use App\Support\Data\ReleaseCreationResult;
 use App\Support\Data\ReleaseDeleteStats;
 use App\Support\ReleaseSearchIndexSync;
+use App\Support\RustPipelineLibrary;
 use DateTimeInterface;
+use FFI;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -50,6 +52,66 @@ use Throwable;
  */
 final class ReleaseProcessingService
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_release_counts(uint32_t mode, const int64_t *input, size_t len, int64_t *out, size_t cap);
+        ssize_t nntmux_release_elapsed(double seconds, char *out, size_t cap);
+        ssize_t nntmux_release_summary(uint32_t mode, const int64_t *input, size_t len, char *out, size_t cap);
+        C;
+
+    // PHP remains the default unless every paired common/uncommon mean and p99 gains 1.5x.
+    private static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
+
+    public static function setUseRustFfi(bool $use): void
+    {
+        self::$useRustFfi = $use;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        self::$ffi ??= RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF) ?? false;
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
+
+    /**
+     * @param  list<int>  $values
+     * @return list<int>|null
+     */
+    private static function calculateNative(int $mode, array $values, int $size): ?array
+    {
+        try {
+            $ffi = self::ffi();
+            if ($ffi === null || count($values) > 1024) {
+                return null;
+            }
+            $input = $ffi->new('int64_t['.max(1, count($values)).']');
+            foreach ($values as $i => $value) {
+                $input[$i] = $value;
+            }
+            $out = $ffi->new('int64_t['.$size.']');
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_release_counts($mode, $input, count($values), $out, $size);
+            if ($written !== $size) {
+                return null;
+            }
+            $result = [];
+            for ($i = 0; $i < $size; $i++) {
+                $result[] = (int) $out[$i];
+            }
+
+            return $result;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
     private const int BATCH_SIZE = 500;
 
     private const int READY_WINDOW_SIZE = 50;
@@ -389,9 +451,7 @@ final class ReleaseProcessingService
             }
             $totals['iterations']++;
             [$result, $nzbFilesAdded] = $this->processReleaseCollectionWindow($normalizedGroupId, $windowIds, $afterCreation, $afterPass);
-            $totals['releases'] += $result->added;
-            $totals['dupes'] += $result->dupes;
-            $totals['nzbs'] += $nzbFilesAdded;
+            $totals = self::aggregateCounts($totals, $result->added, $nzbFilesAdded, $result->dupes, 0);
 
             foreach ($windowIds as $id) {
                 $processedIds[$id] = true;
@@ -478,10 +538,7 @@ final class ReleaseProcessingService
                     ->where('filecheck', CollectionFileCheckStatus::CompleteParts->value)
                     ->update(['filecheck' => CollectionFileCheckStatus::Sized->value]);
                 [$result, $nzbs] = $this->processReleaseCollectionWindow($groupId, $readyIds, $afterCreation, null);
-                $totals['releases'] += $result->added;
-                $totals['dupes'] += $result->dupes;
-                $totals['nzbs'] += $nzbs;
-                $totals['iterations']++;
+                $totals = self::aggregateCounts($totals, $result->added, $nzbs, $result->dupes);
             }
         });
 
@@ -1990,7 +2047,7 @@ final class ReleaseProcessingService
         cli()->info("      {$prefix}: {$timeStr}");
     }
 
-    private function formatElapsedTime(int|float $seconds): string
+    public static function formatElapsedTimePhp(int|float $seconds): string
     {
         if ($seconds < 1) {
             return sprintf('%dms', (int) ($seconds * 1000));
@@ -2001,14 +2058,14 @@ final class ReleaseProcessingService
         }
 
         $minutes = floor($seconds / 60);
-        $remainingSeconds = $seconds % 60;
+        $remainingSeconds = (int) $seconds % 60;
 
         if ($minutes < 60) {
             return sprintf('%dm %ds', $minutes, (int) $remainingSeconds);
         }
 
         $hours = floor($minutes / 60);
-        $remainingMinutes = $minutes % 60;
+        $remainingMinutes = (int) $minutes % 60;
 
         return sprintf('%dh %dm', $hours, $remainingMinutes);
     }
@@ -2043,12 +2100,13 @@ final class ReleaseProcessingService
         echo PHP_EOL;
         cli()->header('SUMMARY');
         cli()->header('-------');
-        cli()->primary('  Releases added: '.number_format($releasesAdded));
-        cli()->primary('  NZBs created: '.number_format($nzbsCreated));
+        $summary = self::resultSummary($releasesAdded, $nzbsCreated, $dupes, $iterations);
+        cli()->primary($summary[0]);
+        cli()->primary($summary[1]);
         if ($dupes > 0) {
-            cli()->warning('  Duplicates skipped: '.number_format($dupes));
+            cli()->warning($summary[2]);
         }
-        cli()->info('  Processing cycles: '.number_format($iterations));
+        cli()->info($summary[3]);
         cli()->info('  Total time: '.$this->formatElapsedTime($elapsed));
         echo PHP_EOL;
     }
@@ -2058,7 +2116,7 @@ final class ReleaseProcessingService
      */
     private function outputCollectionDeleteStats(array $stats, DateTimeInterface $startTime): void
     {
-        $totalDeleted = $stats['minSize'] + $stats['maxSize'] + $stats['minFiles'] + ($stats['par2Only'] ?? 0);
+        $totalDeleted = self::processingTotal([$stats['minSize'], $stats['maxSize'], $stats['minFiles'], $stats['par2Only'] ?? 0]);
 
         if ($totalDeleted > 0) {
             $this->outputStat('Too small', $stats['minSize']);
@@ -2079,7 +2137,7 @@ final class ReleaseProcessingService
      */
     private function outputReleaseDeleteByGroupStats(array $stats, DateTimeInterface $startTime): void
     {
-        $total = $stats['minSize'] + $stats['maxSize'] + $stats['minFiles'];
+        $total = self::processingTotal([$stats['minSize'], $stats['maxSize'], $stats['minFiles']]);
 
         if ($total > 0) {
             $this->outputStat('Too small', $stats['minSize']);
@@ -2132,5 +2190,113 @@ final class ReleaseProcessingService
         }
 
         $this->outputElapsedTime($startTime);
+    }
+
+    public static function formatElapsedTime(int|float $seconds): string
+    {
+        return self::$useRustFfi ? self::formatElapsedTimeNative($seconds) : self::formatElapsedTimePhp($seconds);
+    }
+
+    public static function formatElapsedTimeNative(int|float $seconds): string
+    {
+        try {
+            if (($ffi = self::ffi()) !== null) {
+                $out = $ffi->new('char[128]');
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_release_elapsed($seconds, $out, 128);
+                if (is_int($written) && $written >= 0 && $written <= 128) {
+                    return FFI::string($out, $written);
+                }
+            }
+        } catch (Throwable) {
+            // Preserve PHP formatting when the library or symbol is unavailable.
+        }
+
+        return self::formatElapsedTimePhp($seconds);
+    }
+
+    /**
+     * @param  array{releases: int, nzbs: int, dupes: int, iterations: int}  $totals
+     * @return array{releases: int, nzbs: int, dupes: int, iterations: int}
+     */
+    public static function aggregateCounts(array $totals, int $releases, int $nzbs, int $dupes, int $iterations = 1): array
+    {
+        return self::$useRustFfi ? self::aggregateCountsNative($totals, $releases, $nzbs, $dupes, $iterations) : self::aggregateCountsPhp($totals, $releases, $nzbs, $dupes, $iterations);
+    }
+
+    /**
+     * @param  array{releases: int, nzbs: int, dupes: int, iterations: int}  $totals
+     * @return array{releases: int, nzbs: int, dupes: int, iterations: int}
+     */
+    public static function aggregateCountsNative(array $totals, int $releases, int $nzbs, int $dupes, int $iterations = 1): array
+    {
+        $values = self::calculateNative(0, [$totals['releases'], $totals['nzbs'], $totals['dupes'], $totals['iterations'], $releases, $nzbs, $dupes, $iterations], 4);
+
+        return $values === null ? self::aggregateCountsPhp($totals, $releases, $nzbs, $dupes, $iterations) : ['releases' => $values[0], 'nzbs' => $values[1], 'dupes' => $values[2], 'iterations' => $values[3]];
+    }
+
+    /**
+     * @param  array{releases: int, nzbs: int, dupes: int, iterations: int}  $totals
+     * @return array{releases: int, nzbs: int, dupes: int, iterations: int}
+     */
+    public static function aggregateCountsPhp(array $totals, int $releases, int $nzbs, int $dupes, int $iterations = 1): array
+    {
+        return ['releases' => $totals['releases'] + $releases, 'nzbs' => $totals['nzbs'] + $nzbs, 'dupes' => $totals['dupes'] + $dupes, 'iterations' => $totals['iterations'] + $iterations];
+    }
+
+    /** @param list<int> $counts */
+    public static function processingTotal(array $counts): int
+    {
+        return self::$useRustFfi ? self::processingTotalNative($counts) : self::processingTotalPhp($counts);
+    }
+
+    /** @param list<int> $counts */
+    public static function processingTotalNative(array $counts): int
+    {
+        return self::calculateNative(1, $counts, 1)[0] ?? self::processingTotalPhp($counts);
+    }
+
+    /** @param list<int> $counts */
+    public static function processingTotalPhp(array $counts): int
+    {
+        return array_sum($counts);
+    }
+
+    /** @return array{string, string, string, string} */
+    public static function resultSummary(int $releases, int $nzbs, int $dupes, int $iterations): array
+    {
+        return self::$useRustFfi ? self::resultSummaryNative($releases, $nzbs, $dupes, $iterations) : self::resultSummaryPhp($releases, $nzbs, $dupes, $iterations);
+    }
+
+    /** @return array{string, string, string, string} */
+    public static function resultSummaryNative(int $releases, int $nzbs, int $dupes, int $iterations): array
+    {
+        try {
+            if (($ffi = self::ffi()) !== null) {
+                $input = $ffi->new('int64_t[4]');
+                foreach ([$releases, $nzbs, $dupes, $iterations] as $i => $value) {
+                    $input[$i] = $value;
+                }
+                $out = $ffi->new('char[512]');
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_release_summary(0, $input, 4, $out, 512);
+                if (is_int($written) && $written >= 0 && $written <= 512) {
+                    $lines = explode("\0", FFI::string($out, $written));
+                    if (count($lines) === 4) {
+                        return [$lines[0], $lines[1], $lines[2], $lines[3]];
+                    }
+                }
+            }
+        } catch (Throwable) {
+            // Preserve the PHP report when Rust declines.
+        }
+
+        return self::resultSummaryPhp($releases, $nzbs, $dupes, $iterations);
+    }
+
+    /** @return array{string, string, string, string} */
+    public static function resultSummaryPhp(int $releases, int $nzbs, int $dupes, int $iterations): array
+    {
+        return ['  Releases added: '.number_format($releases), '  NZBs created: '.number_format($nzbs), $dupes > 0 ? '  Duplicates skipped: '.number_format($dupes) : '', '  Processing cycles: '.number_format($iterations)];
     }
 }
