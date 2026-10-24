@@ -6,15 +6,29 @@ namespace App\Services;
 
 use App\Exceptions\BookProviderException;
 use App\Support\BookIsbn;
+use App\Support\RustPipelineLibrary;
 use Carbon\Carbon;
+use FFI;
+use FFI\CData;
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\GuzzleException;
 use Illuminate\Support\Facades\Cache;
 use JsonException;
+use Throwable;
 
 class GoogleBooksService
 {
     protected const API_URL = 'https://www.googleapis.com/books/v1/volumes';
+
+    public const NORMALIZER_FFI_CDEF = <<<'C'
+        ssize_t nntmux_google_books_query_nul(const char *input, size_t len, char *out, size_t cap);
+        ssize_t nntmux_book_provider_fields(uint32_t op, const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    /** Null selects the benchmark-qualified production default. */
+    public ?bool $useRustFfi = null;
+
+    private static FFI|false|null $normalizerFfi = null;
 
     protected Client $client;
 
@@ -159,7 +173,98 @@ class GoogleBooksService
         }
     }
 
-    private function buildSearchQuery(string $query, ?string $title, ?string $author, ?string $isbn): string
+    public static function normalizerFfi(): ?FFI
+    {
+        if (self::$normalizerFfi === null) {
+            self::$normalizerFfi = RustPipelineLibrary::resolveDomain('metadata', self::NORMALIZER_FFI_CDEF) ?? false;
+        }
+
+        return self::$normalizerFfi === false ? null : self::$normalizerFfi;
+    }
+
+    /**
+     * Return null when Rust declines or the library is unavailable.
+     *
+     * @param  callable(FFI, CData, int): mixed  $call
+     */
+    public static function normalizerString(callable $call, int $hint): ?string
+    {
+        $ffi = self::normalizerFfi();
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, $hint, $capacity);
+            if ($buffer === null) {
+                return null;
+            }
+            $written = $call($ffi, $buffer, $capacity);
+            if (is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return null;
+                }
+                $written = $call($ffi, $buffer, $capacity);
+            }
+
+            return is_int($written) && $written >= 0 && $written <= $capacity ? FFI::string($buffer, $written) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Split a NUL-terminated field frame from `nntmux_book_provider_fields`.
+     *
+     * @param  array<int, mixed>  $values
+     * @return list<string>|null
+     */
+    public static function providerFields(int $operation, array $values, int $count): ?array
+    {
+        try {
+            $input = serialize($values);
+        } catch (Throwable) {
+            return null;
+        }
+        $result = self::normalizerString(
+            // @phpstan-ignore method.notFound
+            static fn (FFI $ffi, CData $buffer, int $capacity): mixed => $ffi->nntmux_book_provider_fields($operation, $input, strlen($input), $buffer, $capacity),
+            strlen($input) + 256,
+        );
+        if ($result === null) {
+            return null;
+        }
+        $parts = explode("\0", $result);
+
+        return count($parts) === $count + 1 && array_pop($parts) === '' ? $parts : null;
+    }
+
+    private function buildSearchQuery(string $query = '', ?string $title = null, ?string $author = null, ?string $isbn = null): string
+    {
+        return ($this->useRustFfi ?? false)
+            ? $this->buildSearchQueryNative($query, $title, $author, $isbn)
+            : $this->buildSearchQueryPhp($query, $title, $author, $isbn);
+    }
+
+    public function buildSearchQueryNative(string $query = '', ?string $title = null, ?string $author = null, ?string $isbn = null): string
+    {
+        $input = $query."\0".$title."\0".$author."\0".$isbn."\0";
+        if (substr_count($input, "\0") === 4) {
+            $result = self::normalizerString(
+                // @phpstan-ignore method.notFound
+                static fn (FFI $ffi, CData $buffer, int $capacity): mixed => $ffi->nntmux_google_books_query_nul($input, strlen($input), $buffer, $capacity),
+                strlen($input) + 32,
+            );
+            if ($result !== null) {
+                return $result;
+            }
+        }
+
+        return $this->buildSearchQueryPhp($query, $title, $author, $isbn);
+    }
+
+    public function buildSearchQueryPhp(string $query = '', ?string $title = null, ?string $author = null, ?string $isbn = null): string
     {
         if ($isbn !== null && $isbn !== '') {
             return 'isbn:'.$isbn;
@@ -186,11 +291,42 @@ class GoogleBooksService
      */
     private function normalizeBookResult(array $item): array
     {
-        $volumeInfo = is_array($item['volumeInfo'] ?? null) ? $item['volumeInfo'] : [];
-        $industryIdentifiers = is_array($volumeInfo['industryIdentifiers'] ?? null) ? $volumeInfo['industryIdentifiers'] : [];
+        return ($this->useRustFfi ?? false) ? $this->normalizeBookResultNative($item) : $this->normalizeBookResultPhp($item);
+    }
 
-        $isbn13 = '';
-        $isbn10 = '';
+    /**
+     * @param  array<string, mixed>  $item
+     * @return array<string, mixed>
+     */
+    public function normalizeBookResultNative(array $item): array
+    {
+        $volumeInfo = is_array($item['volumeInfo'] ?? null) ? $item['volumeInfo'] : [];
+        $parts = self::providerFields(0, [
+            $volumeInfo['industryIdentifiers'] ?? null, $volumeInfo['authors'] ?? null,
+            $volumeInfo['categories'] ?? null, $volumeInfo['description'] ?? null, $volumeInfo['publishedDate'] ?? null,
+        ], 7);
+        if ($parts === null) {
+            return $this->normalizeBookResultPhp($item);
+        }
+
+        return $this->normalizeBookResultPhp($item, [
+            'isbn13' => $parts[0], 'isbn10' => $parts[1], 'author' => $parts[2], 'genre' => $parts[3], 'overview' => $parts[4],
+            'publishdate' => $parts[5] === '1' ? ($parts[6] === '' ? null : $parts[6]) : $this->normalizePublishDate($volumeInfo['publishedDate'] ?? null),
+        ]);
+    }
+
+    /**
+     * @param  array<string, mixed>  $item
+     * @param  array{isbn13: string, isbn10: string, author: string, genre: string, overview: string, publishdate: ?string}|null  $native
+     * @return array<string, mixed>
+     */
+    public function normalizeBookResultPhp(array $item, ?array $native = null): array
+    {
+        $volumeInfo = is_array($item['volumeInfo'] ?? null) ? $item['volumeInfo'] : [];
+        $industryIdentifiers = $native === null && is_array($volumeInfo['industryIdentifiers'] ?? null) ? $volumeInfo['industryIdentifiers'] : [];
+
+        $isbn13 = $native['isbn13'] ?? '';
+        $isbn10 = $native['isbn10'] ?? '';
         foreach ($industryIdentifiers as $identifier) {
             if (! is_array($identifier)) {
                 continue;
@@ -206,10 +342,10 @@ class GoogleBooksService
         }
 
         $identifier = $isbn13 !== '' ? $isbn13 : ($isbn10 !== '' ? $isbn10 : (string) ($item['id'] ?? md5(json_encode($item) ?: '')));
-        $authors = is_array($volumeInfo['authors'] ?? null)
+        $authors = $native === null && is_array($volumeInfo['authors'] ?? null)
             ? array_values(array_filter(array_map('strval', $volumeInfo['authors'])))
             : [];
-        $categories = is_array($volumeInfo['categories'] ?? null)
+        $categories = $native === null && is_array($volumeInfo['categories'] ?? null)
             ? array_values(array_filter(array_map('strval', $volumeInfo['categories'])))
             : [];
         $imageLinks = is_array($volumeInfo['imageLinks'] ?? null) ? $volumeInfo['imageLinks'] : [];
@@ -217,17 +353,17 @@ class GoogleBooksService
 
         return [
             'title' => (string) ($volumeInfo['title'] ?? ''),
-            'author' => implode(', ', $authors),
+            'author' => $native['author'] ?? implode(', ', $authors),
             'asin' => 'googlebooks:'.$identifier,
             'isbn' => $isbn13 !== '' ? $isbn13 : null,
             'ean' => $isbn10 !== '' ? $isbn10 : null,
             'url' => (string) ($volumeInfo['infoLink'] ?? ''),
             'salesrank' => '',
             'publisher' => (string) ($volumeInfo['publisher'] ?? ''),
-            'publishdate' => $this->normalizePublishDate($volumeInfo['publishedDate'] ?? null),
+            'publishdate' => $native !== null ? $native['publishdate'] : $this->normalizePublishDate($volumeInfo['publishedDate'] ?? null),
             'pages' => isset($volumeInfo['pageCount']) && is_numeric($volumeInfo['pageCount']) ? (string) ((int) $volumeInfo['pageCount']) : '',
-            'overview' => strip_tags((string) ($volumeInfo['description'] ?? '')),
-            'genre' => implode(', ', $categories),
+            'overview' => $native['overview'] ?? strip_tags((string) ($volumeInfo['description'] ?? '')),
+            'genre' => $native['genre'] ?? implode(', ', $categories),
             'coverurl' => $coverUrl,
             'cover' => $coverUrl !== '' ? 1 : 0,
         ];
