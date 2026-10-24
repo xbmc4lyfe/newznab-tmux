@@ -620,6 +620,7 @@ final class RustApiQueryAndPageParameterParityTest extends TestCase
     #[Test]
     public function randomized_fuzz_and_locale_restoration_parity(): void
     {
+        $startupAsciiTables = preg_match('/^\s$/', "\xa0") === 0;
         $prevLocale = setlocale(LC_CTYPE, '0') ?: 'C';
         try {
             setlocale(LC_CTYPE, 'C');
@@ -666,6 +667,9 @@ final class RustApiQueryAndPageParameterParityTest extends TestCase
         } finally {
             setlocale(LC_CTYPE, 'C');
             setlocale(LC_CTYPE, $prevLocale);
+            if ($startupAsciiTables) {
+                setlocale(LC_CTYPE, 'C');
+            }
         }
     }
 

@@ -172,6 +172,11 @@ class RegistrationFailureLogService
      */
     public static function matchLineNative(string $line): array|false|null
     {
+        // macOS can retain non-C PCRE character tables after locale restoration.
+        if (preg_match('/^\s$/', "\xa0") === 1 && preg_match('/[\x80-\xff]/', $line) === 1) {
+            return null;
+        }
+
         $ffi = self::ffi();
 
         if ($ffi === null) {
