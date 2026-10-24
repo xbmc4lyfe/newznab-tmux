@@ -5718,3 +5718,506 @@ mod tests {
         );
     }
 }
+
+// Wave 11: byte-oriented helpers. Length-prefixed fields preserve embedded NULs.
+fn w11_fields(mut input: &[u8]) -> Option<Vec<&[u8]>> {
+    let mut fields = Vec::new();
+    while !input.is_empty() {
+        let n = u32::from_le_bytes(input.get(..4)?.try_into().ok()?) as usize;
+        input = &input[4..];
+        fields.push(input.get(..n)?);
+        input = &input[n..];
+    }
+    Some(fields)
+}
+
+fn w11_entity(input: &[u8]) -> Vec<u8> {
+    let mut value: Vec<u8> = input
+        .iter()
+        .map(|b| {
+            if *b == b'\\' {
+                b'/'
+            } else {
+                b.to_ascii_lowercase()
+            }
+        })
+        .collect();
+    while value.last() == Some(&b'/') {
+        value.pop();
+    }
+    let start = value.iter().rposition(|b| *b == b'/').map_or(0, |i| i + 1);
+    let mut value = value[start..].to_vec();
+    for b in &mut value {
+        if matches!(*b, b'-' | b' ') {
+            *b = b'_';
+        }
+    }
+    match value.as_slice() {
+        b"release" | b"releases" => b"release".to_vec(),
+        b"pre" | b"pres" | b"predb" | b"predbs" => b"predb".to_vec(),
+        b"movie" | b"movies" | b"movieinfo" | b"movie_info" => b"movie".to_vec(),
+        b"tv" | b"video" | b"videos" | b"tvshow" | b"tvshows" | b"tv_show" | b"tv_shows" => {
+            b"tvshow".to_vec()
+        }
+        b"secondary" | b"secondary_search" | b"secondary_search_index" => b"secondary".to_vec(),
+        _ => value,
+    }
+}
+
+fn w11_secondary(entity: &[u8]) -> Option<&'static [u8]> {
+    match entity {
+        b"music" | b"musicinfo" | b"music_info" => Some(b"music"),
+        b"book" | b"books" | b"bookinfo" | b"book_info" => Some(b"books"),
+        b"game" | b"games" | b"gamesinfo" | b"games_info" => Some(b"games"),
+        b"console" | b"consoleinfo" | b"console_info" => Some(b"console"),
+        b"steam" | b"steamapp" | b"steamapps" | b"steam_app" | b"steam_apps" => Some(b"steam"),
+        b"anime" | b"anidb" | b"anidbtitle" | b"anidbtitles" | b"anidb_title" | b"anidb_titles"
+        | b"anidbinfo" | b"anidb_info" => Some(b"anime"),
+        _ => None,
+    }
+}
+
+fn w11_key(entity: &[u8], id: &[u8], secondary: &[u8]) -> Vec<u8> {
+    let entity = w11_entity(entity);
+    let index = if entity == b"secondary" {
+        w11_secondary(&w11_entity(secondary))
+    } else {
+        w11_secondary(&entity)
+    };
+    let mut key = Vec::new();
+    if let Some(index) = index {
+        key.extend_from_slice(b"secondary:");
+        key.extend_from_slice(index);
+    } else {
+        key.extend_from_slice(&entity);
+    }
+    key.push(b':');
+    key.extend_from_slice(id);
+    key
+}
+
+fn w11_word(s: &[u8], at: usize, word: &[u8]) -> Option<usize> {
+    s.get(at..at.checked_add(word.len())?)
+        .filter(|v| v.eq_ignore_ascii_case(word))
+        .map(|_| at + word.len())
+}
+fn w11_ws(s: &[u8], at: usize) -> Option<usize> {
+    let mut end = at;
+    while s.get(end).is_some_and(|b| is_ascii_ws(*b)) {
+        end += 1;
+    }
+    (end > at).then_some(end)
+}
+fn w11_words(s: &[u8], at: usize, words: &[&[u8]]) -> Option<usize> {
+    let mut end = at;
+    for (i, word) in words.iter().enumerate() {
+        if i > 0 {
+            end = w11_ws(s, end)?;
+        }
+        end = w11_word(s, end, word)?;
+    }
+    Some(end)
+}
+fn w11_find(s: &[u8], from: usize, words: &[&[u8]]) -> Option<(usize, usize)> {
+    (from..s.len()).find_map(|i| w11_words(s, i, words).map(|end| (i, end)))
+}
+fn w11_dollar(s: &[u8], at: usize) -> bool {
+    at == s.len() || (at + 1 == s.len() && s[at] == b'\n')
+}
+
+fn w11_count_query(query: &[u8], fallback: bool) -> Option<Vec<u8>> {
+    if fallback {
+        let mut from = 0;
+        let (start, mut end) = loop {
+            let (at, prefix) = w11_find(query, from, &[b"FROM", b"releases", b"r"])?;
+            let Some(ws) = w11_ws(query, prefix) else {
+                from = at + 1;
+                continue;
+            };
+            // Greedy whitespace may backtrack one byte to satisfy (.+?).
+            let start = if ws == query.len() { ws - 1 } else { ws };
+            if start <= prefix || start == query.len() {
+                from = at + 1;
+                continue;
+            }
+            let end = (start + 1..query.len())
+                .find(|&i| {
+                    w11_words(query, i, &[b"ORDER", b"BY"]).is_some()
+                        || w11_word(query, i, b"LIMIT").is_some()
+                })
+                .unwrap_or(query.len());
+            break (start, end);
+        };
+        let mut conditions = query[start..end].to_vec();
+        let mut i = 0;
+        while i < conditions.len() {
+            let mut p = i;
+            if let Some(next) = w11_word(&conditions, p, b"LEFT")
+                .or_else(|| w11_word(&conditions, p, b"INNER"))
+                .and_then(|v| w11_ws(&conditions, v))
+            {
+                p = next;
+            }
+            if let Some(next) =
+                w11_word(&conditions, p, b"OUTER").and_then(|v| w11_ws(&conditions, v))
+            {
+                p = next;
+            }
+            if let Some(join) =
+                w11_word(&conditions, p, b"JOIN").and_then(|v| w11_ws(&conditions, v))
+            {
+                let content = if join == conditions.len() {
+                    join - 1
+                } else {
+                    join
+                };
+                if content > p + 4 && content < conditions.len() {
+                    end = (content + 1..conditions.len())
+                        .find(|&j| {
+                            [b"WHERE" as &[u8], b"LEFT", b"INNER", b"JOIN"]
+                                .iter()
+                                .any(|word| w11_word(&conditions, j, word).is_some())
+                        })
+                        .unwrap_or(conditions.len());
+                    conditions.drain(i..end);
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        let mut result = b"SELECT COUNT(*) as count FROM releases r ".to_vec();
+        // PHP trim excludes form feed.
+        let ws = |b: &u8| matches!(*b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b);
+        let start = conditions
+            .iter()
+            .position(|b| !ws(b))
+            .unwrap_or(conditions.len());
+        let end = conditions
+            .iter()
+            .rposition(|b| !ws(b))
+            .map_or(start, |i| i + 1);
+        result.extend_from_slice(&conditions[start..end]);
+        return Some(result);
+    }
+    if (0..query.len()).any(|i| {
+        w11_words(query, i, &[b"SELECT", b"COUNT"]).is_some_and(|end| {
+            let end = w11_ws(query, end).unwrap_or(end);
+            query.get(end) == Some(&b'(')
+        })
+    }) {
+        return Some(query.to_vec());
+    }
+    let mut s = query.to_vec();
+    if let Some((at, _)) = (0..s.len()).find_map(|i| {
+        w11_words(&s, i, &[b"ORDER", b"BY"])
+            .filter(|&end| end < s.len() && !s[end..].contains(&b')'))
+            .map(|end| (i, end))
+    }) {
+        s.truncate(at);
+    }
+    if let Some(at) = (0..s.len()).find(|&i| {
+        w11_words(&s, i, &[b"GROUP", b"BY", b"r.id"])
+            .is_some_and(|end| s[end..].iter().all(|b| is_ascii_ws(*b)))
+    }) {
+        s.truncate(at);
+    }
+    let distinct = w11_find(&s, 0, &[b"SELECT", b"DISTINCT"]).is_some()
+        || w11_find(&s, 0, &[b"GROUP", b"BY"]).is_some();
+    let replacement: &[u8] = if distinct {
+        b"SELECT COUNT(DISTINCT r.id) as count FROM"
+    } else {
+        b"SELECT COUNT(*) as count FROM"
+    };
+    let mut result = Vec::new();
+    let mut copied = 0;
+    let mut scan = 0;
+    while let Some((at, select_end)) = w11_find(&s, scan, &[b"SELECT"]) {
+        if w11_ws(&s, select_end).is_none() {
+            scan = at + 1;
+            continue;
+        }
+        // SELECT\s+.+?\s+FROM: at least one whitespace and one body byte.
+        let found = (select_end + 2..s.len())
+            .find_map(|i| w11_ws(&s, i).and_then(|end| w11_word(&s, end, b"FROM")));
+        if let Some(end) = found {
+            result.extend_from_slice(&s[copied..at]);
+            result.extend_from_slice(replacement);
+            copied = end;
+            scan = end;
+        } else {
+            break;
+        }
+    }
+    result.extend_from_slice(&s[copied..]);
+    let mut limit_at = None;
+    for i in 0..result.len() {
+        if let Some(mut end) = w11_word(&result, i, b"LIMIT").and_then(|v| w11_ws(&result, v)) {
+            let first = end;
+            while result.get(end).is_some_and(|b| b.is_ascii_digit()) {
+                end += 1;
+            }
+            if end == first {
+                continue;
+            }
+            if let Some(offset) = w11_ws(&result, end)
+                .and_then(|v| w11_word(&result, v, b"OFFSET"))
+                .and_then(|v| w11_ws(&result, v))
+            {
+                let mut last = offset;
+                while result.get(last).is_some_and(|b| b.is_ascii_digit()) {
+                    last += 1;
+                }
+                if last > offset && w11_dollar(&result, last) {
+                    limit_at = Some((i, last));
+                    break;
+                }
+            }
+            if w11_dollar(&result, end) {
+                limit_at = Some((i, end));
+                break;
+            }
+        }
+    }
+    if let Some((at, end)) = limit_at {
+        result.drain(at..end);
+    }
+    Some(result)
+}
+
+/// Modes: entity/action/key/compact/release order/movie order/user SQL/count/fallback.
+/// Returns -1 for invalid input, -2 for unsupported input, or negative required capacity.
+///
+/// # Safety
+/// Input/output pointers must reference readable/writable nonoverlapping buffers of the given lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_search_outbox_browse_sql(
+    mode: u32,
+    input_ptr: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if input_ptr.is_null() && input_len != 0 {
+        return -1;
+    }
+    let input = if input_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(input_ptr, input_len) }
+    };
+    let result = match mode {
+        0 => {
+            if !input.is_ascii() {
+                return -2;
+            }
+            w11_entity(input)
+        }
+        1 => {
+            let value: Vec<u8> = input
+                .iter()
+                .map(|b| {
+                    if matches!(*b, b'-' | b' ') {
+                        b'_'
+                    } else {
+                        b.to_ascii_lowercase()
+                    }
+                })
+                .collect();
+            match value.as_slice() {
+                b"insert" | b"inserted" | b"create" | b"created" => b"insert".to_vec(),
+                b"upsert" | b"upserted" | b"replace" | b"replaced" | b"save" | b"saved"
+                | b"index" | b"indexed" => b"upsert".to_vec(),
+                b"update" | b"updated" => b"update".to_vec(),
+                b"delete" | b"deleted" | b"destroy" | b"destroyed" | b"remove" | b"removed" => {
+                    b"delete".to_vec()
+                }
+                _ => value,
+            }
+        }
+        2 | 3 => {
+            let Some(fields) = w11_fields(input) else {
+                return -1;
+            };
+            if mode == 2 {
+                if fields.len() != 3 {
+                    return -1;
+                }
+                if !fields[0].is_ascii() || !fields[2].is_ascii() {
+                    return -2;
+                }
+                w11_key(fields[0], fields[1], fields[2])
+            } else {
+                if fields.len() % 4 != 0 {
+                    return -1;
+                }
+                let mut latest = std::collections::HashMap::new();
+                for (i, row) in fields.chunks_exact(4).enumerate() {
+                    if !row[0].is_ascii() || !row[2].is_ascii() {
+                        return -2;
+                    }
+                    let Ok(bytes) = row[3].try_into() else {
+                        return -1;
+                    };
+                    let id = i64::from_ne_bytes(bytes);
+                    let entry = latest
+                        .entry(w11_key(row[0], row[1], row[2]))
+                        .or_insert((id, i));
+                    if (id, i) > *entry {
+                        *entry = (id, i);
+                    }
+                }
+                // Stable input order for equal ids, as with both PHP stable usort calls.
+                // PHP's first sort determines insertion order by the FIRST row for a key,
+                // so ties between surviving keys use that first occurrence below.
+                let mut first = std::collections::HashMap::new();
+                for (i, row) in fields.chunks_exact(4).enumerate() {
+                    let id = i64::from_ne_bytes(row[3].try_into().unwrap());
+                    first
+                        .entry(w11_key(row[0], row[1], row[2]))
+                        .and_modify(|v: &mut (i64, usize)| *v = (*v).min((id, i)))
+                        .or_insert((id, i));
+                }
+                let mut survivors: Vec<_> = latest
+                    .into_iter()
+                    .map(|(key, (id, i))| (id, first[&key], i))
+                    .collect();
+                survivors.sort_unstable();
+                survivors
+                    .iter()
+                    .map(|(_, _, i)| i.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+                    .into_bytes()
+            }
+        }
+        4 | 5 => {
+            let mut parts = input.split(|b| *b == b'_');
+            let name = parts.next().unwrap_or(b"");
+            let dir = parts.next().unwrap_or(b"desc");
+            let lower = dir.to_ascii_lowercase();
+            let valid = if mode == 4 {
+                lower == b"asc" || lower == b"desc" || lower == b"asc\n" || lower == b"desc\n"
+            } else {
+                lower.starts_with(b"asc") || lower.ends_with(b"desc") || lower.ends_with(b"desc\n")
+            };
+            let field: &[u8] = if mode == 4 {
+                match name {
+                    b"cat" => b"categories_id",
+                    b"name" => b"searchname",
+                    b"size" => b"size",
+                    b"files" => b"totalpart",
+                    b"stats" => b"grabs",
+                    b"comments" => b"comments",
+                    b"added" => b"adddate",
+                    _ => b"postdate",
+                }
+            } else {
+                match name {
+                    b"title" => b"m.title",
+                    b"year" => b"m.year",
+                    b"rating" => b"m.rating",
+                    _ => b"MAX(r.postdate)",
+                }
+            };
+            let mut out = field.to_vec();
+            out.push(0);
+            out.extend_from_slice(if valid { dir } else { b"desc" });
+            out
+        }
+        6 => {
+            let Some(fields) = w11_fields(input) else {
+                return -1;
+            };
+            if fields.is_empty() || (fields.len() - 1) % 3 != 0 {
+                return -1;
+            }
+            let mut out = b"(1=2 ".to_vec();
+            for row in fields[1..].chunks_exact(3) {
+                out.extend_from_slice(b"OR (r.");
+                out.extend_from_slice(fields[0]);
+                out.extend_from_slice(b" = ");
+                out.extend_from_slice(row[0]);
+                if row[1] == b"1" {
+                    out.extend_from_slice(b" AND r.categories_id = ");
+                    out.extend_from_slice(row[2]);
+                }
+                if row[1] == b"2" {
+                    out.extend_from_slice(b" AND r.categories_id IN (");
+                    for b in row[2] {
+                        out.push(if *b == b'|' { b',' } else { *b });
+                    }
+                    out.push(b')');
+                }
+                out.extend_from_slice(b") ");
+            }
+            out.extend_from_slice(b") ");
+            out
+        }
+        7 | 8 => {
+            if input.len() > 16384 || !input.is_ascii() {
+                return -2;
+            }
+            match w11_count_query(input, mode == 8) {
+                Some(v) => v,
+                None => return -2,
+            }
+        }
+        _ => return -1,
+    };
+    let mut out = OutCursor::new(out_buf, out_cap);
+    out.push_slice(&result);
+    out.finish()
+}
+
+#[cfg(test)]
+mod wave11_tests {
+    use super::*;
+    #[test]
+    fn outbox_order_sql_and_abi_contracts() {
+        assert_eq!(w11_entity(b"App\\Models\\Movie-Info///"), b"movie");
+        assert_eq!(w11_key(b"MusicInfo", b"42", b""), b"secondary:music:42");
+        assert_eq!(
+            w11_count_query(b"SELECT r.id FROM releases r ORDER BY r.id LIMIT 5", false).unwrap(),
+            b"SELECT COUNT(*) as count FROM releases r "
+        );
+        assert_eq!(
+            w11_count_query(
+                b"SELECT r.* FROM releases r LEFT JOIN x ON 1 WHERE r.id=2",
+                true
+            )
+            .unwrap(),
+            b"SELECT COUNT(*) as count FROM releases r WHERE r.id=2"
+        );
+        let mut out = [0u8; 64];
+        unsafe {
+            assert_eq!(
+                nntmux_search_outbox_browse_sql(
+                    0,
+                    std::ptr::null(),
+                    1,
+                    out.as_mut_ptr(),
+                    out.len()
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_search_outbox_browse_sql(2, b"bad".as_ptr(), 3, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            assert_eq!(
+                nntmux_search_outbox_browse_sql(
+                    99,
+                    std::ptr::null(),
+                    0,
+                    out.as_mut_ptr(),
+                    out.len()
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_search_outbox_browse_sql(1, b"CREATED".as_ptr(), 7, out.as_mut_ptr(), 1),
+                -6
+            );
+        }
+    }
+}
