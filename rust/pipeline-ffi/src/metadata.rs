@@ -22459,3 +22459,1345 @@ pub mod tv_provider_lookup_video_observers {
     }
 }
 
+/// Wave 21 Slice 21.5: ConsoleInfo, MovieInfo, TvLookupStatus, AnidbCollection, and BookCollection C-ABI helpers.
+///
+/// Every export wraps its body in `std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ...)).unwrap_or(-1)`,
+/// validates raw pointers for non-null, `.is_aligned()`, `<= isize::MAX as usize`, and checked address addition,
+/// never writes partial outputs when capacity is insufficient, and returns `-1` on panic or decline so PHP callers fall back safely.
+pub mod console_movie_tv_status_collections {
+    use super::PhpSerWriter;
+    use std::mem::size_of;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    const DECLINE: isize = -1;
+    const MAX_INPUT: usize = 4 << 20;
+
+    #[inline]
+    unsafe fn input<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null()
+            || !ptr.is_aligned()
+            || len > MAX_INPUT
+            || len > isize::MAX as usize
+            || (ptr as usize).checked_add(len).is_none()
+        {
+            return None;
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn valid_out_cap(out: *mut u8, cap: usize) -> bool {
+        if cap == 0 {
+            return true;
+        }
+        !out.is_null()
+            && out.is_aligned()
+            && cap <= isize::MAX as usize
+            && (out as usize).checked_add(cap).is_some()
+    }
+
+    #[inline]
+    fn valid_mut_ptr<T>(ptr: *mut T) -> bool {
+        !ptr.is_null()
+            && ptr.is_aligned()
+            && (ptr as usize).checked_add(size_of::<T>()).is_some()
+    }
+
+    #[inline]
+    fn valid_i64_out(ptr: *mut i64, cap: usize, min_elems: usize) -> bool {
+        let max_elems = (isize::MAX as usize) / size_of::<i64>();
+        if ptr.is_null() || !ptr.is_aligned() || cap < min_elems || cap > max_elems {
+            return false;
+        }
+        let Some(byte_len) = cap.checked_mul(size_of::<i64>()) else {
+            return false;
+        };
+        (ptr as usize).checked_add(byte_len).is_some()
+    }
+
+    #[inline]
+    unsafe fn write_bytes(out_buf: *mut u8, out_cap: usize, bytes: &[u8]) -> isize {
+        let needed = bytes.len();
+        if needed == 0 {
+            return 0;
+        }
+        if needed > isize::MAX as usize {
+            return DECLINE;
+        }
+        if needed > out_cap {
+            let neg = -(needed as isize);
+            return if neg == -1 { -2 } else { neg };
+        }
+        let dst = unsafe { slice::from_raw_parts_mut(out_buf, needed) };
+        dst.copy_from_slice(bytes);
+        needed as isize
+    }
+
+    #[inline]
+    fn is_php_trim_byte(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\0' | b'\x0B')
+    }
+
+    #[inline]
+    fn is_ascii_space_no_nul(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\x0B' | b'\x0C')
+    }
+
+    #[inline]
+    fn php_trim_bytes(bytes: &[u8]) -> &[u8] {
+        let mut start = 0;
+        let mut end = bytes.len();
+        while start < end && is_php_trim_byte(bytes[start]) {
+            start += 1;
+        }
+        while end > start && is_php_trim_byte(bytes[end - 1]) {
+            end -= 1;
+        }
+        &bytes[start..end]
+    }
+
+    #[inline]
+    fn parse_cast_int_bytes(bytes: &[u8]) -> Option<i64> {
+        if bytes.contains(&0) {
+            return None;
+        }
+        let mut start = 0;
+        let mut end = bytes.len();
+        while start < end && is_ascii_space_no_nul(bytes[start]) {
+            start += 1;
+        }
+        while end > start && is_ascii_space_no_nul(bytes[end - 1]) {
+            end -= 1;
+        }
+        let trimmed = &bytes[start..end];
+        if trimmed.is_empty() {
+            return Some(0);
+        }
+        let (neg, digits) = match trimmed.first()? {
+            b'+' => (false, &trimmed[1..]),
+            b'-' => (true, &trimmed[1..]),
+            _ => (false, trimmed),
+        };
+        if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let mut val: i64 = 0;
+        if neg {
+            for &b in digits {
+                val = val.checked_mul(10)?.checked_sub(i64::from(b - b'0'))?;
+            }
+        } else {
+            for &b in digits {
+                val = val.checked_mul(10)?.checked_add(i64::from(b - b'0'))?;
+            }
+        }
+        Some(val)
+    }
+
+    #[inline]
+    fn push_i64_dec(buf: &mut Vec<u8>, v: i64) {
+        if v < 0 {
+            buf.push(b'-');
+        }
+        let mut n = v.unsigned_abs();
+        let mut tmp = [0u8; 20];
+        let mut i = tmp.len();
+        loop {
+            i -= 1;
+            tmp[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        buf.extend_from_slice(&tmp[i..]);
+    }
+
+    // -------------------------------------------------------------------------
+    // 1. ConsoleInfo helpers
+    // -------------------------------------------------------------------------
+
+    /// Formats the console cover relative paths (`covers/console/<id>.webp` and `covers/console/<id>.jpg`)
+    /// when `(int) $id > 0`.
+    /// `id_kind`: `0` = null/false/empty, `1` = `int` (`id_int`), `2` = `string` (`id_ptr[..id_len]`).
+    /// Returns `0` when `(int) $id <= 0` (setting `*out_webp_len = 0`), `> 0` total bytes written, `< -1` on short buffer, or `-1` on decline.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_console_info_cover_paths(
+        id_kind: i32,
+        id_int: i64,
+        id_ptr: *const u8,
+        id_len: usize,
+        out_webp_len: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_mut_ptr(out_webp_len) || !valid_out_cap(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(id_bytes) = (unsafe { input(id_ptr, id_len) }) else {
+                return DECLINE;
+            };
+
+            match id_kind {
+                0 => {
+                    unsafe {
+                        *out_webp_len = 0;
+                    }
+                    0
+                }
+                1 => {
+                    if id_int <= 0 {
+                        unsafe {
+                            *out_webp_len = 0;
+                        }
+                        return 0;
+                    }
+                    let mut staged = Vec::with_capacity(64);
+                    staged.extend_from_slice(b"covers/console/");
+                    push_i64_dec(&mut staged, id_int);
+                    staged.extend_from_slice(b".webp");
+                    let webp_len = staged.len();
+
+                    staged.extend_from_slice(b"covers/console/");
+                    push_i64_dec(&mut staged, id_int);
+                    staged.extend_from_slice(b".jpg");
+
+                    let written = unsafe { write_bytes(out_buf, out_cap, &staged) };
+                    if written >= 0 {
+                        unsafe {
+                            *out_webp_len = webp_len;
+                        }
+                    }
+                    written
+                }
+                2 => {
+                    let Some(parsed) = parse_cast_int_bytes(id_bytes) else {
+                        return DECLINE;
+                    };
+                    if parsed <= 0 {
+                        unsafe {
+                            *out_webp_len = 0;
+                        }
+                        return 0;
+                    }
+                    let mut staged = Vec::with_capacity(id_bytes.len() * 2 + 48);
+                    staged.extend_from_slice(b"covers/console/");
+                    staged.extend_from_slice(id_bytes);
+                    staged.extend_from_slice(b".webp");
+                    let webp_len = staged.len();
+
+                    staged.extend_from_slice(b"covers/console/");
+                    staged.extend_from_slice(id_bytes);
+                    staged.extend_from_slice(b".jpg");
+
+                    let written = unsafe { write_bytes(out_buf, out_cap, &staged) };
+                    if written >= 0 {
+                        unsafe {
+                            *out_webp_len = webp_len;
+                        }
+                    }
+                    written
+                }
+                _ => DECLINE,
+            }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Resolves the console cover asset key (`(string) $id`) when `(int) $id > 0 && has_cover != 0`.
+    /// `id_kind`: `0` = null/false/empty, `1` = `int` (`id_int`), `2` = `string` (`id_ptr[..id_len]`).
+    /// Returns `0` when null/absent, `> 0` bytes written, `< -1` on short buffer, or `-1` on decline.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_console_info_resolve_cover_key(
+        id_kind: i32,
+        id_int: i64,
+        id_ptr: *const u8,
+        id_len: usize,
+        has_cover: u32,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_cap(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(id_bytes) = (unsafe { input(id_ptr, id_len) }) else {
+                return DECLINE;
+            };
+            match id_kind {
+                0 => 0,
+                1 => {
+                    if id_int <= 0 || has_cover == 0 {
+                        return 0;
+                    }
+                    let mut staged = Vec::with_capacity(20);
+                    push_i64_dec(&mut staged, id_int);
+                    unsafe { write_bytes(out_buf, out_cap, &staged) }
+                }
+                2 => {
+                    let Some(parsed) = parse_cast_int_bytes(id_bytes) else {
+                        return DECLINE;
+                    };
+                    if parsed <= 0 || has_cover == 0 {
+                        return 0;
+                    }
+                    unsafe { write_bytes(out_buf, out_cap, id_bytes) }
+                }
+                _ => DECLINE,
+            }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Normalizes a `ConsoleInfo` field:
+    /// - `kind == 0`: `normalizeAsin` (`strtoupper(trim((string) $asin))` -> empty yields `0` / `null`)
+    /// - `kind == 1`: `normalizePlatform` (`trim(preg_replace('/\s+/', ' ', (string) ($platform ?? '')))`)
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_console_info_normalize_field(
+        kind: i32,
+        input_ptr: *const u8,
+        input_len: usize,
+        has_input: u32,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_cap(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(raw) = (unsafe { input(input_ptr, input_len) }) else {
+                return DECLINE;
+            };
+            if has_input == 0 {
+                return 0;
+            }
+            match kind {
+                0 => {
+                    let trimmed = php_trim_bytes(raw);
+                    if trimmed.is_empty() {
+                        return 0;
+                    }
+                    let mut staged = Vec::with_capacity(trimmed.len());
+                    for &b in trimmed {
+                        staged.push(b.to_ascii_uppercase());
+                    }
+                    unsafe { write_bytes(out_buf, out_cap, &staged) }
+                }
+                1 => {
+                    if raw.contains(&0) {
+                        return DECLINE;
+                    }
+                    let mut start = 0;
+                    let mut end = raw.len();
+                    while start < end && is_ascii_space_no_nul(raw[start]) {
+                        start += 1;
+                    }
+                    while end > start && is_ascii_space_no_nul(raw[end - 1]) {
+                        end -= 1;
+                    }
+                    let trimmed = &raw[start..end];
+                    if trimmed.is_empty() {
+                        return 0;
+                    }
+                    let mut staged = Vec::with_capacity(trimmed.len());
+                    let mut prev_space = false;
+                    for &b in trimmed {
+                        if is_ascii_space_no_nul(b) {
+                            if !prev_space {
+                                staged.push(b' ');
+                                prev_space = true;
+                            }
+                        } else {
+                            staged.push(b);
+                            prev_space = false;
+                        }
+                    }
+                    unsafe { write_bytes(out_buf, out_cap, &staged) }
+                }
+                _ => DECLINE,
+            }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    // -------------------------------------------------------------------------
+    // 2. MovieInfo helpers
+    // -------------------------------------------------------------------------
+
+    #[inline]
+    fn normalize_imdb_bytes(raw: &[u8]) -> Option<Vec<u8>> {
+        let mut trimmed = php_trim_bytes(raw);
+        if trimmed.len() >= 2 && trimmed[..2].eq_ignore_ascii_case(b"tt") {
+            trimmed = php_trim_bytes(&trimmed[2..]);
+        }
+        if trimmed.is_empty() || trimmed.len() > 12 || !trimmed.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        if trimmed.iter().all(|&b| b == b'0') {
+            return None;
+        }
+        let mut out = Vec::with_capacity(trimmed.len().max(7));
+        if trimmed.len() < 7 {
+            out.resize(7 - trimmed.len(), b'0');
+        }
+        out.extend_from_slice(trimmed);
+        Some(out)
+    }
+
+    /// Computes `md5($search)` (32 hex bytes) for `MovieInfo::getAll(string $search = '')`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_movie_info_all_cache_key(
+        search_ptr: *const u8,
+        search_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_cap(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(search) = (unsafe { input(search_ptr, search_len) }) else {
+                return DECLINE;
+            };
+            let digest = crate::md5_hex_slice(search);
+            unsafe { write_bytes(out_buf, out_cap, &digest) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Normalizes an IMDb ID (strips optional `tt` prefix, rejects empty/non-numeric/all-zero,
+    /// left-pads to 7 digits with `'0'`). Returns `0` when invalid/empty.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_movie_info_normalize_imdb_id(
+        raw_ptr: *const u8,
+        raw_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_cap(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(raw) = (unsafe { input(raw_ptr, raw_len) }) else {
+                return DECLINE;
+            };
+            let Some(normalized) = normalize_imdb_bytes(raw) else {
+                return 0;
+            };
+            unsafe { write_bytes(out_buf, out_cap, &normalized) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Formats the `.webp` and `.jpg` candidate filenames (`<imdb>-cover.webp` + `<imdb>-cover.jpg`
+    /// for `kind == 0`, or `<imdb>-backdrop.webp` + `<imdb>-backdrop.jpg` for `kind == 1`).
+    /// Returns `0` when the IMDb ID is invalid, `> 0` total bytes written, `< -1` on short buffer, or `-1` on decline.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_movie_info_image_paths(
+        imdb_id_ptr: *const u8,
+        imdb_id_len: usize,
+        kind: u32,
+        out_webp_len: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_mut_ptr(out_webp_len) || !valid_out_cap(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(raw) = (unsafe { input(imdb_id_ptr, imdb_id_len) }) else {
+                return DECLINE;
+            };
+            let (suffix_webp, suffix_jpg): (&[u8], &[u8]) = match kind {
+                0 => (b"-cover.webp", b"-cover.jpg"),
+                1 => (b"-backdrop.webp", b"-backdrop.jpg"),
+                _ => return DECLINE,
+            };
+            let Some(normalized) = normalize_imdb_bytes(raw) else {
+                unsafe {
+                    *out_webp_len = 0;
+                }
+                return 0;
+            };
+
+            let mut staged = Vec::with_capacity(normalized.len() * 2 + 32);
+            staged.extend_from_slice(&normalized);
+            staged.extend_from_slice(suffix_webp);
+            let webp_len = staged.len();
+
+            staged.extend_from_slice(&normalized);
+            staged.extend_from_slice(suffix_jpg);
+
+            let written = unsafe { write_bytes(out_buf, out_cap, &staged) };
+            if written >= 0 {
+                unsafe {
+                    *out_webp_len = webp_len;
+                }
+            }
+            written
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Splits a comma- or pipe-separated list (`genre` or `actors`) into trimmed non-empty items joined by `\0`
+    /// and writes the item count into `*out_count`. Declines (`-1`) if any trimmed item contains an embedded `\0`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_movie_info_split_csv(
+        raw_ptr: *const u8,
+        raw_len: usize,
+        out_count: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_mut_ptr(out_count) || !valid_out_cap(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(raw) = (unsafe { input(raw_ptr, raw_len) }) else {
+                return DECLINE;
+            };
+            if raw.is_empty() {
+                unsafe {
+                    *out_count = 0;
+                }
+                return 0;
+            }
+
+            let mut staged = Vec::with_capacity(raw.len());
+            let mut count = 0usize;
+            for part in raw.split(|&b| b == b',' || b == b'|') {
+                let trimmed = php_trim_bytes(part);
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if trimmed.contains(&0) {
+                    return DECLINE;
+                }
+                if count > 0 {
+                    staged.push(0);
+                }
+                staged.extend_from_slice(trimmed);
+                count += 1;
+            }
+
+            if count == 0 {
+                unsafe {
+                    *out_count = 0;
+                }
+                return 0;
+            }
+
+            let written = unsafe { write_bytes(out_buf, out_cap, &staged) };
+            if written >= 0 {
+                unsafe {
+                    *out_count = count;
+                }
+            }
+            written
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Builds the PHP-serialized `array{imdb: ?string, tmdb: ?string, trakt: ?string}` of external movie URLs.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_movie_info_external_links(
+        imdb_ptr: *const u8,
+        imdb_len: usize,
+        tmdb_id: i64,
+        trakt_id: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_cap(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(imdb) = (unsafe { input(imdb_ptr, imdb_len) }) else {
+                return DECLINE;
+            };
+
+            let normalized_imdb = normalize_imdb_bytes(imdb);
+
+            let mut w = PhpSerWriter::new();
+            w.arr_open(3);
+
+            w.key(b"imdb");
+            if let Some(norm) = normalized_imdb {
+                let mut url = Vec::with_capacity(30 + norm.len());
+                url.extend_from_slice(b"https://www.imdb.com/title/tt");
+                url.extend_from_slice(&norm);
+                url.push(b'/');
+                w.str(&url);
+            } else {
+                w.null();
+            }
+
+            w.key(b"tmdb");
+            if tmdb_id > 0 {
+                let mut url = Vec::with_capacity(56);
+                url.extend_from_slice(b"https://www.themoviedb.org/movie/");
+                push_i64_dec(&mut url, tmdb_id);
+                w.str(&url);
+            } else {
+                w.null();
+            }
+
+            w.key(b"trakt");
+            if trakt_id > 0 {
+                let mut url = Vec::with_capacity(48);
+                url.extend_from_slice(b"https://trakt.tv/movies/");
+                push_i64_dec(&mut url, trakt_id);
+                w.str(&url);
+            } else {
+                w.null();
+            }
+
+            w.arr_close();
+
+            unsafe { write_bytes(out_buf, out_cap, &w.buf) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    // -------------------------------------------------------------------------
+    // 3. TvLookupStatus helpers
+    // -------------------------------------------------------------------------
+
+    /// Classifies a `releases.tv_episodes_id` integer for `TvLookupStatus`:
+    /// - bit 0 (`1`): known `TvLookupStatus` case (`0, -10, -11, -12, -100`)
+    /// - bit 1 (`2`): `isRetryable` (`0, -11`)
+    /// - bit 2 (`4`): `isTerminal` (`-10, -12, -100`)
+    /// - bit 3 (`8`): `requiresLinkedShow` (`-11, -12`)
+    /// - bit 4 (`16`): `isMatchedEpisodeId` (`value > 0`)
+    /// - bit 5 (`32`): `isLegacyPending` (`-1, -2, -3`)
+    /// - bit 6 (`64`): `isLegacyExhausted` (`-4, -6`)
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tv_lookup_status_classify(value: i64) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| match value {
+            0 => 1 | 2,
+            -10 | -100 => 1 | 4,
+            -11 => 1 | 2 | 8,
+            -12 => 1 | 4 | 8,
+            -3..=-1 => 32,
+            -4 | -6 => 64,
+            v if v > 0 => 16,
+            _ => 0,
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Formats `TvLookupStatus::label()` (`kind == 0`) or `TvLookupStatus::description()` (`kind == 1`).
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tv_lookup_status_text(
+        value: i64,
+        kind: u32,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_cap(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let text: &[u8] = match (kind, value) {
+                (0, 0) => b"Pending",
+                (0, -10) => b"Show Not Found",
+                (0, -11) => b"Episode Missing",
+                (0, -12) => b"Season Pack",
+                (0, -100) => b"Parse Failed",
+                (1, 0) => b"Waiting for TV lookup worker or scheduled retry",
+                (1, -10) => b"No TV provider matched the parsed show",
+                (1, -11) => b"Show matched; waiting for episode availability",
+                (1, -12) => b"Full-season pack linked to show without single episode",
+                (1, -100) => b"Release name could not be parsed into show and episode",
+                _ => return DECLINE,
+            };
+            unsafe { write_bytes(out_buf, out_cap, text) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Populates `TvLookupStatus::reprocessableValues(...)` into `out_values`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tv_lookup_status_reprocessable_values(
+        include_legacy_pending: u32,
+        include_legacy_exhausted: u32,
+        include_show_not_found: u32,
+        include_parse_failed: u32,
+        out_values: *mut i64,
+        values_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_i64_out(out_values, values_cap, 0) {
+                return DECLINE;
+            }
+            let mut staged = [0i64; 9];
+            staged[0] = 0;
+            staged[1] = -11;
+            let mut len = 2usize;
+            if include_legacy_pending != 0 {
+                staged[len] = -1;
+                staged[len + 1] = -2;
+                staged[len + 2] = -3;
+                len += 3;
+            }
+            if include_legacy_exhausted != 0 {
+                staged[len] = -4;
+                staged[len + 1] = -6;
+                len += 2;
+            }
+            if include_show_not_found != 0 {
+                staged[len] = -10;
+                len += 1;
+            }
+            if include_parse_failed != 0 {
+                staged[len] = -100;
+                len += 1;
+            }
+            if values_cap < len {
+                return -(len as isize);
+            }
+            let dst = unsafe { slice::from_raw_parts_mut(out_values, len) };
+            dst.copy_from_slice(&staged[..len]);
+            len as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    // -------------------------------------------------------------------------
+    // 4 & 5. AnidbCollection & BookCollection helpers
+    // -------------------------------------------------------------------------
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    unsafe fn collection_resolve_meta(
+        has_total: u32,
+        total_val: i64,
+        has_per_page: u32,
+        per_page_val: i64,
+        has_current_page: u32,
+        current_page_val: i64,
+        has_last_page: u32,
+        last_page_val: i64,
+        collection_count: i64,
+        out_meta: *mut i64,
+        meta_cap: usize,
+    ) -> isize {
+        if !valid_i64_out(out_meta, meta_cap, 0) || collection_count < 0 {
+            return DECLINE;
+        }
+        if meta_cap < 4 {
+            return -4;
+        }
+        let resolved = [
+            if has_total != 0 {
+                total_val
+            } else {
+                collection_count
+            },
+            if has_per_page != 0 {
+                per_page_val
+            } else {
+                collection_count
+            },
+            if has_current_page != 0 {
+                current_page_val
+            } else {
+                1
+            },
+            if has_last_page != 0 {
+                last_page_val
+            } else {
+                1
+            },
+        ];
+        let slice_out = unsafe { slice::from_raw_parts_mut(out_meta, 4) };
+        slice_out.copy_from_slice(&resolved);
+        4
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    unsafe fn collection_build_envelope(
+        has_total: u32,
+        total_val: i64,
+        has_per_page: u32,
+        per_page_val: i64,
+        has_current_page: u32,
+        current_page_val: i64,
+        has_last_page: u32,
+        last_page_val: i64,
+        collection_count: i64,
+        has_first: u32,
+        first_ptr: *const u8,
+        first_len: usize,
+        has_last: u32,
+        last_ptr: *const u8,
+        last_len: usize,
+        has_prev: u32,
+        prev_ptr: *const u8,
+        prev_len: usize,
+        has_next: u32,
+        next_ptr: *const u8,
+        next_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if !valid_out_cap(out_buf, out_cap) || collection_count < 0 {
+            return DECLINE;
+        }
+        let (Some(first_url), Some(last_url), Some(prev_url), Some(next_url)) = (
+            unsafe { input(first_ptr, first_len) },
+            unsafe { input(last_ptr, last_len) },
+            unsafe { input(prev_ptr, prev_len) },
+            unsafe { input(next_ptr, next_len) },
+        ) else {
+            return DECLINE;
+        };
+
+        let total = if has_total != 0 {
+            total_val
+        } else {
+            collection_count
+        };
+        let per_page = if has_per_page != 0 {
+            per_page_val
+        } else {
+            collection_count
+        };
+        let current_page = if has_current_page != 0 {
+            current_page_val
+        } else {
+            1
+        };
+        let last_page = if has_last_page != 0 {
+            last_page_val
+        } else {
+            1
+        };
+
+        let mut w = PhpSerWriter::new();
+        w.arr_open(2);
+        w.key(b"meta");
+        w.arr_open(4);
+        w.key(b"total");
+        w.int(total);
+        w.key(b"per_page");
+        w.int(per_page);
+        w.key(b"current_page");
+        w.int(current_page);
+        w.key(b"last_page");
+        w.int(last_page);
+        w.arr_close();
+
+        w.key(b"links");
+        w.arr_open(4);
+        w.key(b"first");
+        if has_first != 0 {
+            w.str(first_url);
+        } else {
+            w.null();
+        }
+        w.key(b"last");
+        if has_last != 0 {
+            w.str(last_url);
+        } else {
+            w.null();
+        }
+        w.key(b"prev");
+        if has_prev != 0 {
+            w.str(prev_url);
+        } else {
+            w.null();
+        }
+        w.key(b"next");
+        if has_next != 0 {
+            w.str(next_url);
+        } else {
+            w.null();
+        }
+        w.arr_close();
+        w.arr_close();
+
+        unsafe { write_bytes(out_buf, out_cap, &w.buf) }
+    }
+
+    /// Resolves the 4 pagination metadata integers (`[total, per_page, current_page, last_page]`)
+    /// for `AnidbCollection` into `out_meta[..4]`.
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_anidb_collection_resolve_meta(
+        has_total: u32,
+        total_val: i64,
+        has_per_page: u32,
+        per_page_val: i64,
+        has_current_page: u32,
+        current_page_val: i64,
+        has_last_page: u32,
+        last_page_val: i64,
+        collection_count: i64,
+        out_meta: *mut i64,
+        meta_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| unsafe {
+            collection_resolve_meta(
+                has_total,
+                total_val,
+                has_per_page,
+                per_page_val,
+                has_current_page,
+                current_page_val,
+                has_last_page,
+                last_page_val,
+                collection_count,
+                out_meta,
+                meta_cap,
+            )
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Serializes the `meta` and `links` pagination envelope for `AnidbCollection`.
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_anidb_collection_build_envelope(
+        has_total: u32,
+        total_val: i64,
+        has_per_page: u32,
+        per_page_val: i64,
+        has_current_page: u32,
+        current_page_val: i64,
+        has_last_page: u32,
+        last_page_val: i64,
+        collection_count: i64,
+        has_first: u32,
+        first_ptr: *const u8,
+        first_len: usize,
+        has_last: u32,
+        last_ptr: *const u8,
+        last_len: usize,
+        has_prev: u32,
+        prev_ptr: *const u8,
+        prev_len: usize,
+        has_next: u32,
+        next_ptr: *const u8,
+        next_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| unsafe {
+            collection_build_envelope(
+                has_total,
+                total_val,
+                has_per_page,
+                per_page_val,
+                has_current_page,
+                current_page_val,
+                has_last_page,
+                last_page_val,
+                collection_count,
+                has_first,
+                first_ptr,
+                first_len,
+                has_last,
+                last_ptr,
+                last_len,
+                has_prev,
+                prev_ptr,
+                prev_len,
+                has_next,
+                next_ptr,
+                next_len,
+                out_buf,
+                out_cap,
+            )
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Resolves the 4 pagination metadata integers (`[total, per_page, current_page, last_page]`)
+    /// for `BookCollection` into `out_meta[..4]`.
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_book_collection_resolve_meta(
+        has_total: u32,
+        total_val: i64,
+        has_per_page: u32,
+        per_page_val: i64,
+        has_current_page: u32,
+        current_page_val: i64,
+        has_last_page: u32,
+        last_page_val: i64,
+        collection_count: i64,
+        out_meta: *mut i64,
+        meta_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| unsafe {
+            collection_resolve_meta(
+                has_total,
+                total_val,
+                has_per_page,
+                per_page_val,
+                has_current_page,
+                current_page_val,
+                has_last_page,
+                last_page_val,
+                collection_count,
+                out_meta,
+                meta_cap,
+            )
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Serializes the `meta` and `links` pagination envelope for `BookCollection`.
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_book_collection_build_envelope(
+        has_total: u32,
+        total_val: i64,
+        has_per_page: u32,
+        per_page_val: i64,
+        has_current_page: u32,
+        current_page_val: i64,
+        has_last_page: u32,
+        last_page_val: i64,
+        collection_count: i64,
+        has_first: u32,
+        first_ptr: *const u8,
+        first_len: usize,
+        has_last: u32,
+        last_ptr: *const u8,
+        last_len: usize,
+        has_prev: u32,
+        prev_ptr: *const u8,
+        prev_len: usize,
+        has_next: u32,
+        next_ptr: *const u8,
+        next_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| unsafe {
+            collection_build_envelope(
+                has_total,
+                total_val,
+                has_per_page,
+                per_page_val,
+                has_current_page,
+                current_page_val,
+                has_last_page,
+                last_page_val,
+                collection_count,
+                has_first,
+                first_ptr,
+                first_len,
+                has_last,
+                last_ptr,
+                last_len,
+                has_prev,
+                prev_ptr,
+                prev_len,
+                has_next,
+                next_ptr,
+                next_len,
+                out_buf,
+                out_cap,
+            )
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn console_info_helpers() {
+            let mut buf = [0u8; 256];
+            let mut webp_len = 0usize;
+
+            let n = unsafe {
+                nntmux_console_info_cover_paths(
+                    1,
+                    42,
+                    std::ptr::null(),
+                    0,
+                    &mut webp_len,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(n > 0);
+            assert_eq!(&buf[..webp_len], b"covers/console/42.webp");
+            assert_eq!(&buf[webp_len..n as usize], b"covers/console/42.jpg");
+
+            let k = unsafe {
+                nntmux_console_info_resolve_cover_key(
+                    1,
+                    42,
+                    std::ptr::null(),
+                    0,
+                    1,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(&buf[..k as usize], b"42");
+
+            let asin_n = unsafe {
+                nntmux_console_info_normalize_field(
+                    0,
+                    b"  b001abcdef \n".as_ptr(),
+                    14,
+                    1,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(&buf[..asin_n as usize], b"B001ABCDEF");
+
+            let plat_n = unsafe {
+                nntmux_console_info_normalize_field(
+                    1,
+                    b"  PlayStation \t  5  ".as_ptr(),
+                    20,
+                    1,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(&buf[..plat_n as usize], b"PlayStation 5");
+        }
+
+        #[test]
+        fn movie_info_helpers() {
+            let mut buf = [0u8; 512];
+            let mut webp_len = 0usize;
+            let mut count = 0usize;
+
+            let ck = unsafe {
+                nntmux_movie_info_all_cache_key(
+                    b"matrix".as_ptr(),
+                    6,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(ck, 32);
+
+            let imdb = unsafe {
+                nntmux_movie_info_normalize_imdb_id(
+                    b"tt133093".as_ptr(),
+                    8,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(&buf[..imdb as usize], b"0133093");
+            assert_eq!(
+                unsafe {
+                    nntmux_movie_info_normalize_imdb_id(
+                        b"tt0000000".as_ptr(),
+                        9,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                0
+            );
+
+            let img = unsafe {
+                nntmux_movie_info_image_paths(
+                    b"133093".as_ptr(),
+                    6,
+                    1,
+                    &mut webp_len,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(img > 0);
+            assert_eq!(&buf[..webp_len], b"0133093-backdrop.webp");
+            assert_eq!(&buf[webp_len..img as usize], b"0133093-backdrop.jpg");
+
+            let csv = b" Action , | Sci-Fi , Thriller ";
+            let csv_n = unsafe {
+                nntmux_movie_info_split_csv(
+                    csv.as_ptr(),
+                    csv.len(),
+                    &mut count,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(count, 3);
+            assert_eq!(&buf[..csv_n as usize], b"Action\0Sci-Fi\0Thriller");
+
+            let ext_n = unsafe {
+                nntmux_movie_info_external_links(
+                    b"133093".as_ptr(),
+                    6,
+                    603,
+                    481,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(ext_n > 0);
+        }
+
+        #[test]
+        fn tv_lookup_status_and_collections_helpers() {
+            let mut buf = [0u8; 256];
+            assert_eq!(unsafe { nntmux_tv_lookup_status_classify(0) }, 1 | 2);
+            assert_eq!(unsafe { nntmux_tv_lookup_status_classify(-10) }, 1 | 4);
+            assert_eq!(unsafe { nntmux_tv_lookup_status_classify(-11) }, 1 | 2 | 8);
+            assert_eq!(unsafe { nntmux_tv_lookup_status_classify(-12) }, 1 | 4 | 8);
+            assert_eq!(unsafe { nntmux_tv_lookup_status_classify(-100) }, 1 | 4);
+            assert_eq!(unsafe { nntmux_tv_lookup_status_classify(-2) }, 32);
+            assert_eq!(unsafe { nntmux_tv_lookup_status_classify(-6) }, 64);
+            assert_eq!(unsafe { nntmux_tv_lookup_status_classify(42) }, 16);
+
+            let lbl = unsafe { nntmux_tv_lookup_status_text(-11, 0, buf.as_mut_ptr(), buf.len()) };
+            assert_eq!(&buf[..lbl as usize], b"Episode Missing");
+
+            let mut vals = [0i64; 9];
+            assert_eq!(
+                unsafe {
+                    nntmux_tv_lookup_status_reprocessable_values(1, 0, 0, 0, vals.as_mut_ptr(), 9)
+                },
+                5
+            );
+            assert_eq!(&vals[..5], &[0, -11, -1, -2, -3]);
+
+            let mut meta = [0i64; 4];
+            assert_eq!(
+                unsafe {
+                    nntmux_anidb_collection_resolve_meta(
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        12,
+                        meta.as_mut_ptr(),
+                        4,
+                    )
+                },
+                4
+            );
+            assert_eq!(meta, [12, 12, 1, 1]);
+            assert_eq!(
+                unsafe {
+                    nntmux_book_collection_resolve_meta(
+                        1,
+                        80,
+                        1,
+                        20,
+                        1,
+                        2,
+                        1,
+                        4,
+                        20,
+                        meta.as_mut_ptr(),
+                        4,
+                    )
+                },
+                4
+            );
+            assert_eq!(meta, [80, 20, 2, 4]);
+        }
+
+        #[test]
+        fn unaligned_null_and_insufficient_capacity_preserve_outputs() {
+            let mut raw = [0u64; 8];
+            let mut buf = [b'Z'; 8];
+            let unaligned_usize =
+                unsafe { (raw.as_mut_ptr() as *mut u8).add(1) as *mut usize };
+            let unaligned_i64 = unsafe { (raw.as_mut_ptr() as *mut u8).add(1) as *mut i64 };
+            let mut sentinel_len = 777usize;
+
+            assert_eq!(
+                unsafe {
+                    nntmux_console_info_cover_paths(
+                        1,
+                        42,
+                        std::ptr::null(),
+                        0,
+                        unaligned_usize,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                DECLINE
+            );
+            let short = unsafe {
+                nntmux_console_info_cover_paths(
+                    1,
+                    42,
+                    std::ptr::null(),
+                    0,
+                    &mut sentinel_len,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(short < -1);
+            assert_eq!(sentinel_len, 777);
+            assert_eq!(&buf, &[b'Z'; 8]);
+
+            assert_eq!(
+                unsafe {
+                    nntmux_tv_lookup_status_reprocessable_values(1, 0, 0, 0, unaligned_i64, 9)
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_anidb_collection_resolve_meta(
+                        1,
+                        10,
+                        1,
+                        10,
+                        1,
+                        1,
+                        1,
+                        1,
+                        10,
+                        unaligned_i64,
+                        4,
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_book_collection_resolve_meta(
+                        1,
+                        10,
+                        1,
+                        10,
+                        1,
+                        1,
+                        1,
+                        1,
+                        10,
+                        unaligned_i64,
+                        4,
+                    )
+                },
+                DECLINE
+            );
+        }
+    }
+}
+
+
