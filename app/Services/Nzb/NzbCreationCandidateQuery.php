@@ -6,13 +6,65 @@ namespace App\Services\Nzb;
 
 use App\Models\Release;
 use App\Services\Configuration\ConfigurationProvider;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection as EloquentCollection;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use Throwable;
 
 final class NzbCreationCandidateQuery
 {
+    public const string FFI_CDEF = <<<'C'
+        int64_t nntmux_nzb_claim_ttl(int64_t timeout);
+        intptr_t nntmux_nzb_selectable_columns(const char *input, size_t input_len, int supports_claims, char *out, size_t cap);
+        intptr_t nntmux_nzb_id_order(const char *input, size_t input_len, int sqlite, char *out, size_t cap);
+        C;
+
+    private static bool $useRustFfi = false;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi && RustPipelineLibrary::resolveDomain('nfo', self::FFI_CDEF) !== null;
+    }
+
+    /** @param list<int|string> $arguments */
+    private static function nativeBytes(string $function, array $arguments, int $minimumCapacity): ?string
+    {
+        try {
+            $ffi = RustPipelineLibrary::resolveDomain('nfo', self::FFI_CDEF);
+            if ($ffi === null) {
+                return null;
+            }
+            $capacity = 0;
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, max(256, $minimumCapacity), $capacity);
+            if ($scratch === null) {
+                return null;
+            }
+            $written = $ffi->{$function}(...[...$arguments, $scratch, $capacity]);
+            if (is_int($written) && $written < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($scratch === null) {
+                    return null;
+                }
+                $written = $ffi->{$function}(...[...$arguments, $scratch, $capacity]);
+            }
+            if (! is_int($written) || $written < 0 || $written > $capacity) {
+                return null;
+            }
+
+            return $written === 0 ? '' : FFI::string($scratch, $written);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
     public const string CLAIMED_AT_COLUMN = 'nzb_creation_claimed_at';
 
     public const string CLAIM_TOKEN_COLUMN = 'nzb_creation_claim_token';
@@ -174,6 +226,31 @@ final class NzbCreationCandidateQuery
 
     private static function claimTtlSeconds(): int
     {
+        return self::$useRustFfi ? self::claimTtlSecondsNative() : self::claimTtlSecondsPhp();
+    }
+
+    public static function claimTtlSecondsNative(): int
+    {
+        $timeout = (int) (app(ConfigurationProvider::class)->postProcessing()->releaseTimeoutSeconds ?: 120);
+        try {
+            $ffi = RustPipelineLibrary::resolveDomain('nfo', self::FFI_CDEF);
+            // PHP promotes a positive overflowing product to float; preserve its return-type error.
+            if ($ffi !== null && $timeout <= intdiv(PHP_INT_MAX, 2)) {
+                // @phpstan-ignore method.notFound
+                $result = $ffi->nntmux_nzb_claim_ttl($timeout);
+                if (is_int($result)) {
+                    return $result;
+                }
+            }
+        } catch (Throwable) {
+            // The configuration/provider lookup has already happened exactly once.
+        }
+
+        return max(300, $timeout * 2);
+    }
+
+    public static function claimTtlSecondsPhp(): int
+    {
         $timeout = (int) (app(ConfigurationProvider::class)->postProcessing()->releaseTimeoutSeconds ?: 120);
 
         return max(300, $timeout * 2);
@@ -184,6 +261,53 @@ final class NzbCreationCandidateQuery
      * @return list<string>
      */
     private static function selectableColumns(array $columns, bool $supportsClaims): array
+    {
+        return self::$useRustFfi ? self::selectableColumnsNative($columns, $supportsClaims) : self::selectableColumnsPhp($columns, $supportsClaims);
+    }
+
+    /**
+     * @param  list<string>  $columns
+     * @return list<string>
+     */
+    public static function selectableColumnsNative(array $columns, bool $supportsClaims): array
+    {
+        if (! array_is_list($columns)) {
+            return self::selectableColumnsPhp($columns, $supportsClaims);
+        }
+        $input = '';
+        foreach ($columns as $column) {
+            if (! is_string($column) || strlen($column) > 0xFFFFFFFF) {
+                return self::selectableColumnsPhp($columns, $supportsClaims);
+            }
+            $input .= pack('N', strlen($column)).$column;
+        }
+        $output = self::nativeBytes('nntmux_nzb_selectable_columns', [$input, strlen($input), (int) $supportsClaims], strlen($input));
+        if ($output === null) {
+            return self::selectableColumnsPhp($columns, $supportsClaims);
+        }
+        $result = [];
+        $length = strlen($output);
+        for ($offset = 0; $offset < $length;) {
+            if ($length - $offset < 4) {
+                return self::selectableColumnsPhp($columns, $supportsClaims);
+            }
+            $size = unpack('Nlength', $output, $offset)['length'];
+            $offset += 4;
+            if ($size > $length - $offset) {
+                return self::selectableColumnsPhp($columns, $supportsClaims);
+            }
+            $result[] = substr($output, $offset, $size);
+            $offset += $size;
+        }
+
+        return $result;
+    }
+
+    /**
+     * @param  list<string>  $columns
+     * @return list<string>
+     */
+    public static function selectableColumnsPhp(array $columns, bool $supportsClaims): array
     {
         if ($supportsClaims || $columns === ['*']) {
             return $columns;
@@ -203,7 +327,43 @@ final class NzbCreationCandidateQuery
      */
     private static function idOrderExpression(array $ids): string
     {
-        if (DB::getDriverName() !== 'sqlite') {
+        return self::$useRustFfi ? self::idOrderExpressionNative($ids) : self::idOrderExpressionPhp($ids);
+    }
+
+    /** @param list<int> $ids */
+    public static function idOrderExpressionNative(array $ids): string
+    {
+        $sqlite = DB::getDriverName() === 'sqlite';
+        if (array_is_list($ids)) {
+            $integers = true;
+            foreach ($ids as $id) {
+                if (! is_int($id)) {
+                    $integers = false;
+                    break;
+                }
+            }
+            if ($integers) {
+                $input = $ids === [] ? '' : pack('q*', ...$ids);
+                $output = self::nativeBytes('nntmux_nzb_id_order', [$input, strlen($input), (int) $sqlite], count($ids) * 48 + 64);
+                if ($output !== null) {
+                    return $output;
+                }
+            }
+        }
+
+        return self::idOrderExpressionForDriverPhp($ids, $sqlite);
+    }
+
+    /** @param list<int> $ids */
+    public static function idOrderExpressionPhp(array $ids): string
+    {
+        return self::idOrderExpressionForDriverPhp($ids, DB::getDriverName() === 'sqlite');
+    }
+
+    /** @param list<int> $ids */
+    private static function idOrderExpressionForDriverPhp(array $ids, bool $sqlite): string
+    {
+        if (! $sqlite) {
             return 'FIELD(id, '.implode(',', $ids).')';
         }
 

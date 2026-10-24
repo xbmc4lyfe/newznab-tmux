@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Verification;
 
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Database\Connection;
 use Illuminate\Support\Facades\DB;
 use RuntimeException;
@@ -18,6 +20,23 @@ use Throwable;
  */
 final class DatabaseVerificationLockStore extends VerificationLockStore
 {
+    public const string FFI_CDEF = <<<'C'
+        intptr_t nntmux_verification_lock_key(const char *scope, size_t scope_len, const char *name, size_t name_len, char *out, size_t cap);
+        int64_t nntmux_verification_members(const char *group, size_t len);
+        C;
+
+    private static bool $useRustFfi = false;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi && RustPipelineLibrary::resolveDomain('nfo', self::FFI_CDEF) !== null;
+    }
+
     /** Shared-holder stripes per group; an exclusive holder proves every stripe free. */
     private const array MEMBERS = ['worker' => 512, 'reset' => 64];
 
@@ -274,7 +293,40 @@ final class DatabaseVerificationLockStore extends VerificationLockStore
     /** Names are scoped to the database, so other databases on the server never collide. */
     private function key(string $name): string
     {
-        $key = 'nnv:'.substr(sha1($this->db()->getDatabaseName().'/'.$this->db()->getTablePrefix()), 0, 12).':'.$name;
+        return self::$useRustFfi ? $this->keyNative($name) : $this->keyPhp($name);
+    }
+
+    public function keyNative(string $name): string
+    {
+        $scope = $this->db()->getDatabaseName().'/'.$this->db()->getTablePrefix();
+        try {
+            $ffi = RustPipelineLibrary::resolveDomain('nfo', self::FFI_CDEF);
+            if ($ffi !== null) {
+                $capacity = 0;
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, 64, $capacity);
+                if ($scratch !== null) {
+                    // @phpstan-ignore method.notFound
+                    $written = $ffi->nntmux_verification_lock_key($scope, strlen($scope), $name, strlen($name), $scratch, $capacity);
+                    if (is_int($written) && $written >= 0 && $written <= 64 && $written <= $capacity) {
+                        return $written === 0 ? '' : FFI::string($scratch, $written);
+                    }
+                }
+            }
+        } catch (Throwable) {
+            // Preserve the PHP result, including its length error, when the ABI is unavailable.
+        }
+
+        return self::keyForScopePhp($scope, $name);
+    }
+
+    public function keyPhp(string $name): string
+    {
+        return self::keyForScopePhp($this->db()->getDatabaseName().'/'.$this->db()->getTablePrefix(), $name);
+    }
+
+    private static function keyForScopePhp(string $scope, string $name): string
+    {
+        $key = 'nnv:'.substr(sha1($scope), 0, 12).':'.$name;
         if (strlen($key) > 64) {
             throw new RuntimeException('Verification lock name is too long.');
         }
@@ -283,6 +335,29 @@ final class DatabaseVerificationLockStore extends VerificationLockStore
     }
 
     private function members(string $group): int
+    {
+        return self::$useRustFfi ? $this->membersNative($group) : $this->membersPhp($group);
+    }
+
+    public function membersNative(string $group): int
+    {
+        try {
+            $ffi = RustPipelineLibrary::resolveDomain('nfo', self::FFI_CDEF);
+            if ($ffi !== null) {
+                // @phpstan-ignore method.notFound
+                $count = $ffi->nntmux_verification_members($group, strlen($group));
+                if (is_int($count) && $count > 0) {
+                    return $count;
+                }
+            }
+        } catch (Throwable) {
+            // Fall through to the original unknown-group error.
+        }
+
+        return $this->membersPhp($group);
+    }
+
+    public function membersPhp(string $group): int
     {
         return self::MEMBERS[$group] ?? throw new RuntimeException('Unknown verification lock group.');
     }

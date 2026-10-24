@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services\Releases\Verification;
 
 use App\Exceptions\CandidateMetadataBudgetExceeded;
+use App\Support\RustPipelineLibrary;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -20,6 +21,19 @@ use Throwable;
  */
 final class OversizedCollectionDeferrals
 {
+    // Scalar FFI candidates remain experimental until the paired caller gate passes.
+    private static bool $useRustFfi = false;
+
+    private const string FFI_CDEF = <<<'C'
+        int64_t nntmux_wave15_metadata_budget(int64_t);
+        int32_t nntmux_wave15_raised_budget(const char *, size_t, const char *, size_t, int64_t, int64_t);
+        C;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
     private const string TABLE = 'release_verification_oversized_collections';
 
     private const int FIRST_BACKOFF_SECONDS = 21600;
@@ -37,7 +51,43 @@ final class OversizedCollectionDeferrals
     /** The most header metadata one candidate may hold, counted as in CandidateRepository's snapshot. */
     public static function budget(): int
     {
+        return self::$useRustFfi ? self::budgetNative() : self::budgetPhp();
+    }
+
+    public static function budgetPhp(): int
+    {
         return max(1, (int) config('release_verification.metadata_bytes', 268435456));
+    }
+
+    public static function budgetNative(): int
+    {
+        $budget = (int) config('release_verification.metadata_bytes', 268435456);
+        $ffi = RustPipelineLibrary::resolveDomain('nfo', self::FFI_CDEF);
+        if ($ffi === null) {
+            return max(1, $budget);
+        }
+
+        // @phpstan-ignore method.notFound
+        return $ffi->nntmux_wave15_metadata_budget($budget);
+    }
+
+    public static function raisedBudgetMatchesPhp(?object $row, string $hash, int $budget): bool
+    {
+        return $row !== null && $row->collectionhash === $hash && (int) $row->budget_bytes < $budget;
+    }
+
+    public static function raisedBudgetMatchesNative(?object $row, string $hash, int $budget): bool
+    {
+        if ($row === null || $row->collectionhash !== $hash) {
+            return self::raisedBudgetMatchesPhp($row, $hash, $budget);
+        }
+        $ffi = RustPipelineLibrary::resolveDomain('nfo', self::FFI_CDEF);
+        if ($ffi === null) {
+            return self::raisedBudgetMatchesPhp($row, $hash, $budget);
+        }
+
+        // @phpstan-ignore method.notFound
+        return $ffi->nntmux_wave15_raised_budget($row->collectionhash, strlen($row->collectionhash), $hash, strlen($hash), (int) $row->budget_bytes, $budget) === 1;
     }
 
     /** Whether a deferred collection is now eligible for archival because the configured budget was raised. */
@@ -49,7 +99,8 @@ final class OversizedCollectionDeferrals
             }
             $row = DB::table(self::TABLE)->where('collection_id', $collectionId)->first(['collectionhash', 'budget_bytes']);
 
-            return $row !== null && $row->collectionhash === $collectionHash && (int) $row->budget_bytes < self::budget();
+            return self::$useRustFfi ? self::raisedBudgetMatchesNative($row, $collectionHash, self::budget())
+                : self::raisedBudgetMatchesPhp($row, $collectionHash, self::budget());
         }, false);
     }
 
