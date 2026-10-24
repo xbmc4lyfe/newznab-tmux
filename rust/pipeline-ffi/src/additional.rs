@@ -23024,3 +23024,968 @@ mod wave29_tmux_role_stacking_mail_preview_commands_tests {
         );
     }
 }
+// ---------------------------------------------------------------------------
+// Wave 30 Slice 30.6: AdditionalProcessingDiagnose, ProcessAdditionalGuid,
+// PostProcessGuid, FetchSamples, and CheckServiceHealth command helpers
+// ---------------------------------------------------------------------------
+
+const W306_DIAGNOSE_ROW_SEGMENTS: usize = 8;
+const W306_HEALTH_ROW_SEGMENTS: usize = 5;
+const W306_SUMMARY_ROW_SEGMENTS: usize = 4;
+const W306_IDENTIFIER_SCALARS: usize = 4;
+const W306_RESET_FLAG_SCALARS: usize = 5;
+
+const W306_HEX_CHARS: &[u8] = b"abcdef0123456789";
+const W306_POSTPROCESS_TYPES: [&[u8]; 9] = [
+    b"additional",
+    b"nfo",
+    b"movie",
+    b"tv",
+    b"anime",
+    b"books",
+    b"music",
+    b"console",
+    b"games",
+];
+
+const W306_ERR_MISSING_IDENTIFIER: &[u8] =
+    b"You must supply either a GUID argument or --id=<release id>.";
+const W306_ERR_CONFLICTING_IDENTIFIERS: &[u8] =
+    b"Provide only one identifier: GUID or --id, not both.";
+const W306_ERR_NON_NUMERIC_ID: &[u8] = b"Release ID must be numeric.";
+
+#[inline]
+fn w306_valid_i64_out(ptr: *mut i64, count: usize) -> bool {
+    !ptr.is_null()
+        && ptr.is_aligned()
+        && count
+            .checked_mul(std::mem::size_of::<i64>())
+            .and_then(|bytes| (ptr as usize).checked_add(bytes))
+            .is_some()
+}
+
+#[inline]
+unsafe fn w306_valid_i64_in<'a>(ptr: *const i64, count: usize) -> Option<&'a [i64]> {
+    if ptr.is_null()
+        || !ptr.is_aligned()
+        || count > (isize::MAX as usize) / std::mem::size_of::<i64>()
+        || (ptr as usize)
+            .checked_add(count * std::mem::size_of::<i64>())
+            .is_none()
+    {
+        return None;
+    }
+    if count == 0 {
+        return Some(&[]);
+    }
+    Some(unsafe { std::slice::from_raw_parts(ptr, count) })
+}
+
+/// Writes `parts` back to back into `out_buf` and each part's byte length into `out_lens`, so
+/// segments may contain NUL bytes. Returns the total byte length, `-(needed)` when `out_cap` is
+/// too small (nothing written), or `-1` on invalid pointers.
+#[inline]
+unsafe fn w306_write_segments(
+    out_buf: *mut u8,
+    out_cap: usize,
+    out_lens: *mut i64,
+    parts: &[&[u8]],
+) -> isize {
+    if !add23_valid_out_buf(out_buf, out_cap) || !w306_valid_i64_out(out_lens, parts.len()) {
+        return -1;
+    }
+    let mut needed = 0usize;
+    for part in parts {
+        let Some(next) = needed.checked_add(part.len()) else {
+            return -1;
+        };
+        if next > isize::MAX as usize {
+            return -1;
+        }
+        needed = next;
+    }
+    if needed > out_cap {
+        return -(needed.max(1) as isize);
+    }
+    let mut offset = 0usize;
+    for (index, part) in parts.iter().enumerate() {
+        if !part.is_empty() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(part.as_ptr(), out_buf.add(offset), part.len());
+            }
+            offset += part.len();
+        }
+        unsafe {
+            *out_lens.add(index) = part.len() as i64;
+        }
+    }
+    needed as isize
+}
+
+#[inline]
+fn w306_is_php_trim_byte(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x00 | 0x0B)
+}
+
+/// PHP `trim()` with its default character list.
+#[inline]
+fn w306_php_trim(bytes: &[u8]) -> &[u8] {
+    let mut start = 0usize;
+    let mut end = bytes.len();
+    while start < end && w306_is_php_trim_byte(bytes[start]) {
+        start += 1;
+    }
+    while end > start && w306_is_php_trim_byte(bytes[end - 1]) {
+        end -= 1;
+    }
+    &bytes[start..end]
+}
+
+/// PHP `ctype_digit()` on a string: non-empty and every byte is `0-9`.
+#[inline]
+fn w306_ctype_digit(bytes: &[u8]) -> bool {
+    !bytes.is_empty() && bytes.iter().all(u8::is_ascii_digit)
+}
+
+/// PHP `(int)` of a `ctype_digit()` string, saturating at `PHP_INT_MAX` like PHP does.
+#[inline]
+fn w306_digits_to_i64(bytes: &[u8]) -> i64 {
+    let mut value = 0i64;
+    for &byte in bytes {
+        match value
+            .checked_mul(10)
+            .and_then(|v| v.checked_add(i64::from(byte - b'0')))
+        {
+            Some(next) => value = next,
+            None => return i64::MAX,
+        }
+    }
+    value
+}
+
+#[inline]
+fn w306_group_thousands(digits: &[u8], out: &mut Vec<u8>) {
+    let len = digits.len();
+    for (index, &byte) in digits.iter().enumerate() {
+        if index > 0 && (len - index).is_multiple_of(3) {
+            out.push(b',');
+        }
+        out.push(byte);
+    }
+}
+
+/// PHP `number_format($value, 2)`; `None` for non-finite, large, or near-tie values so the caller
+/// keeps PHP's exact rounding for those.
+fn w306_number_format_2(value: f64) -> Option<Vec<u8>> {
+    if !value.is_finite() || value.abs() >= 1e12 {
+        return None;
+    }
+    let scaled = value * 100.0;
+    let frac = (scaled - scaled.trunc()).abs();
+    if (frac - 0.5).abs() <= 1e-6 {
+        return None;
+    }
+    let cents = scaled.round() as i64;
+    let magnitude = cents.unsigned_abs();
+    let mut out = Vec::with_capacity(24);
+    if cents < 0 {
+        out.push(b'-');
+    }
+    w306_group_thousands((magnitude / 100).to_string().as_bytes(), &mut out);
+    out.push(b'.');
+    let fraction = (magnitude % 100) as u8;
+    out.push(b'0' + fraction / 10);
+    out.push(b'0' + fraction % 10);
+    Some(out)
+}
+
+/// `AdditionalProcessingDiagnose::projectBacklogRows()`: label/value cells for the backlog table.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_additional_diagnose_backlog_rows(
+    total: i64,
+    available: i64,
+    active_claims: i64,
+    stale_claims: i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+    out_lens: *mut i64,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let total = total.to_string();
+        let available = available.to_string();
+        let active_claims = active_claims.to_string();
+        let stale_claims = stale_claims.to_string();
+        let parts: [&[u8]; W306_DIAGNOSE_ROW_SEGMENTS] = [
+            b"Total",
+            total.as_bytes(),
+            b"Available",
+            available.as_bytes(),
+            b"Active claims",
+            active_claims.as_bytes(),
+            b"Stale claims",
+            stale_claims.as_bytes(),
+        ];
+        unsafe { w306_write_segments(out_buf, out_cap, out_lens, &parts) }
+    }))
+    .unwrap_or(-1)
+}
+
+/// `AdditionalProcessingDiagnose::projectPreflightRows()`: label/value cells for the preflight
+/// table; a missing claim queue index renders as `missing`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_additional_diagnose_preflight_rows(
+    driver_ptr: *const u8,
+    driver_len: usize,
+    has_index: u8,
+    index_ptr: *const u8,
+    index_len: usize,
+    path_ptr: *const u8,
+    path_len: usize,
+    writable: u8,
+    out_buf: *mut u8,
+    out_cap: usize,
+    out_lens: *mut i64,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if has_index > 1 || writable > 1 {
+            return -1;
+        }
+        let (Some(driver), Some(index), Some(path)) = (unsafe {
+            (
+                add23_valid_slice(driver_ptr, driver_len, ADD23_MAX_SEG_LEN),
+                add23_valid_slice(index_ptr, index_len, ADD23_MAX_SEG_LEN),
+                add23_valid_slice(path_ptr, path_len, ADD23_MAX_SEG_LEN),
+            )
+        }) else {
+            return -1;
+        };
+        let parts: [&[u8]; W306_DIAGNOSE_ROW_SEGMENTS] = [
+            b"Database driver",
+            driver,
+            b"Claim queue index",
+            if has_index == 1 { index } else { b"missing" },
+            b"Temp path",
+            path,
+            b"Temp path writable",
+            if writable == 1 { b"yes" } else { b"no" },
+        ];
+        unsafe { w306_write_segments(out_buf, out_cap, out_lens, &parts) }
+    }))
+    .unwrap_or(-1)
+}
+
+/// `AdditionalProcessingDiagnose::formatWarningLine()`: `"[{code}] {message}"`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_additional_diagnose_format_warning(
+    code_ptr: *const u8,
+    code_len: usize,
+    message_ptr: *const u8,
+    message_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (Some(code), Some(message)) = (unsafe {
+            (
+                add23_valid_slice(code_ptr, code_len, ADD23_MAX_SEG_LEN),
+                add23_valid_slice(message_ptr, message_len, ADD23_MAX_SEG_LEN),
+            )
+        }) else {
+            return -1;
+        };
+        unsafe { add23_write_slices(out_buf, out_cap, &[b"[", code, b"] ", message], 1) }
+    }))
+    .unwrap_or(-1)
+}
+
+/// `ProcessAdditionalGuid::validateIdentifierInput()`. Writes `[valid, mode, id, exit_code]`
+/// (`mode`: 0 none, 1 id, 2 guid) to `out_scalars` and the trimmed GUID (guid mode) or the error
+/// message (invalid) to `out_buf`. Returns the written byte length or a negative error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_process_additional_validate_identifier(
+    has_guid: u8,
+    guid_ptr: *const u8,
+    guid_len: usize,
+    has_id: u8,
+    id_ptr: *const u8,
+    id_len: usize,
+    out_scalars: *mut i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if has_guid > 1 || has_id > 1 || !w306_valid_i64_out(out_scalars, W306_IDENTIFIER_SCALARS) {
+            return -1;
+        }
+        let (Some(guid_raw), Some(id_raw)) = (unsafe {
+            (
+                add23_valid_slice(guid_ptr, guid_len, ADD23_MAX_SEG_LEN),
+                add23_valid_slice(id_ptr, id_len, ADD23_MAX_SEG_LEN),
+            )
+        }) else {
+            return -1;
+        };
+        let guid: &[u8] = if has_guid == 1 {
+            w306_php_trim(guid_raw)
+        } else {
+            b""
+        };
+        let id: &[u8] = if has_id == 1 { id_raw } else { b"" };
+
+        let (scalars, text): ([i64; W306_IDENTIFIER_SCALARS], &[u8]) =
+            if guid.is_empty() && id.is_empty() {
+                ([0, 0, 0, 1], W306_ERR_MISSING_IDENTIFIER)
+            } else if !guid.is_empty() && !id.is_empty() {
+                ([0, 0, 0, 4], W306_ERR_CONFLICTING_IDENTIFIERS)
+            } else if !id.is_empty() {
+                if w306_ctype_digit(id) {
+                    ([1, 1, w306_digits_to_i64(id), 0], b"")
+                } else {
+                    ([0, 0, 0, 5], W306_ERR_NON_NUMERIC_ID)
+                }
+            } else {
+                ([1, 2, 0, 0], guid)
+            };
+
+        let written = unsafe { add23_write_slices(out_buf, out_cap, &[text], 1) };
+        if written < 0 {
+            return written;
+        }
+        for (index, value) in scalars.iter().enumerate() {
+            unsafe {
+                *out_scalars.add(index) = *value;
+            }
+        }
+        written
+    }))
+    .unwrap_or(-1)
+}
+
+/// `ProcessAdditionalGuid::buildResetFlagsPayload()` integer flags in key order:
+/// `[passwordstatus, haspreview, jpgstatus, videostatus, nfostatus]` (`archive_retry_at` is null).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_process_additional_reset_flags(out_scalars: *mut i64) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !w306_valid_i64_out(out_scalars, W306_RESET_FLAG_SCALARS) {
+            return -1;
+        }
+        for (index, value) in [-1i64, -1, 0, 0, -1].iter().enumerate() {
+            unsafe {
+                *out_scalars.add(index) = *value;
+            }
+        }
+        W306_RESET_FLAG_SCALARS as i32
+    }))
+    .unwrap_or(-1)
+}
+
+/// `PostProcessGuid::isValidHexChar()`: 1 for a single `a-f`/`0-9` byte, 0 otherwise, -1 invalid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_postprocess_guid_is_valid_hex_char(
+    value_ptr: *const u8,
+    value_len: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(value) = (unsafe { add23_valid_slice(value_ptr, value_len, ADD23_MAX_SEG_LEN) })
+        else {
+            return -1;
+        };
+        i32::from(value.len() == 1 && W306_HEX_CHARS.contains(&value[0]))
+    }))
+    .unwrap_or(-1)
+}
+
+/// `PostProcessGuid::isValidPostProcessType()`: 1 for a supported type, 0 otherwise, -1 invalid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_postprocess_guid_is_valid_type(
+    value_ptr: *const u8,
+    value_len: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(value) = (unsafe { add23_valid_slice(value_ptr, value_len, ADD23_MAX_SEG_LEN) })
+        else {
+            return -1;
+        };
+        i32::from(W306_POSTPROCESS_TYPES.contains(&value))
+    }))
+    .unwrap_or(-1)
+}
+
+/// `PostProcessGuid::computeEffectiveBatchTimeout()`: `max(1, $childTimeout - 30)`.
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_postprocess_guid_effective_batch_timeout(child_timeout: i64) -> i64 {
+    child_timeout.saturating_sub(30).max(1)
+}
+
+/// `PostProcessGuid::normalizeWorkerReleaseIds()`: positive IDs, first occurrence order. Returns
+/// the number of IDs written, `-(needed)` when `out_cap` is too small, or `-1` on invalid input.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_postprocess_guid_normalize_release_ids(
+    ids_ptr: *const i64,
+    ids_count: usize,
+    out_ids: *mut i64,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(ids) = (unsafe { w306_valid_i64_in(ids_ptr, ids_count) }) else {
+            return -1;
+        };
+        if !w306_valid_i64_out(out_ids, out_cap) {
+            return -1;
+        }
+        let mut seen = std::collections::HashSet::with_capacity(ids.len());
+        let normalized: Vec<i64> = ids
+            .iter()
+            .copied()
+            .filter(|&id| id > 0 && seen.insert(id))
+            .collect();
+        if normalized.len() > out_cap {
+            return -(normalized.len() as isize);
+        }
+        for (index, id) in normalized.iter().enumerate() {
+            unsafe {
+                *out_ids.add(index) = *id;
+            }
+        }
+        normalized.len() as isize
+    }))
+    .unwrap_or(-1)
+}
+
+/// `FetchSamples::parseCategoryIdsOption()`: split the trimmed option on `[\s,]+`, keep trimmed
+/// `ctype_digit` tokens as integers, first occurrence order. Returns the number of IDs written,
+/// `-(needed)` when `out_cap` is too small, or `-1` on invalid input.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_fetch_samples_parse_category_ids(
+    has_option: u8,
+    option_ptr: *const u8,
+    option_len: usize,
+    out_ids: *mut i64,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if has_option > 1 || !w306_valid_i64_out(out_ids, out_cap) {
+            return -1;
+        }
+        let Some(option) =
+            (unsafe { add23_valid_slice(option_ptr, option_len, ADD23_MAX_SEG_LEN) })
+        else {
+            return -1;
+        };
+        if has_option == 0 {
+            return 0;
+        }
+        let mut seen = std::collections::HashSet::new();
+        let ids: Vec<i64> = w306_php_trim(option)
+            .split(|&byte| matches!(byte, b' ' | b'\t' | b'\n' | 0x0B | 0x0C | b'\r' | b','))
+            .filter(|token| !token.is_empty())
+            .map(w306_php_trim)
+            .filter(|token| w306_ctype_digit(token))
+            .map(w306_digits_to_i64)
+            .filter(|&id| seen.insert(id))
+            .collect();
+        if ids.len() > out_cap {
+            return -(ids.len() as isize);
+        }
+        for (index, id) in ids.iter().enumerate() {
+            unsafe {
+                *out_ids.add(index) = *id;
+            }
+        }
+        ids.len() as isize
+    }))
+    .unwrap_or(-1)
+}
+
+/// `FetchSamples::computeEffectiveTotal()`: `$limit > 0 ? min($limit, $totalAll) : $totalAll`.
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_fetch_samples_effective_total(limit: i64, total_all: i64) -> i64 {
+    if limit > 0 {
+        limit.min(total_all)
+    } else {
+        total_all
+    }
+}
+
+/// `FetchSamples::formatCompletionSummary()`: `"Processing complete. Success: {s}, Failed: {f}."`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_fetch_samples_format_completion_summary(
+    succeeded: i64,
+    failed: i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let succeeded = succeeded.to_string();
+        let failed = failed.to_string();
+        unsafe {
+            add23_write_slices(
+                out_buf,
+                out_cap,
+                &[
+                    b"Processing complete. Success: ",
+                    succeeded.as_bytes(),
+                    b", Failed: ",
+                    failed.as_bytes(),
+                    b".",
+                ],
+                1,
+            )
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// `CheckServiceHealth::isValidAppUrl()`: `rtrim($url, '/')` is non-empty and starts with `http`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_check_service_health_is_valid_app_url(
+    url_ptr: *const u8,
+    url_len: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(url) = (unsafe { add23_valid_slice(url_ptr, url_len, ADD23_MAX_SEG_LEN) }) else {
+            return -1;
+        };
+        let mut end = url.len();
+        while end > 0 && url[end - 1] == b'/' {
+            end -= 1;
+        }
+        let trimmed = &url[..end];
+        i32::from(!trimmed.is_empty() && trimmed.starts_with(b"http"))
+    }))
+    .unwrap_or(-1)
+}
+
+/// `CheckServiceHealth::projectHealthResultRow()`: `[name, TYPE, status|—, {ms}ms|—, Healthy|reason]`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_check_service_health_result_row(
+    name_ptr: *const u8,
+    name_len: usize,
+    type_ptr: *const u8,
+    type_len: usize,
+    status_code: i64,
+    response_time_ms: i64,
+    ok: u8,
+    reason_ptr: *const u8,
+    reason_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+    out_lens: *mut i64,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if ok > 1 {
+            return -1;
+        }
+        let (Some(name), Some(check_type), Some(reason)) = (unsafe {
+            (
+                add23_valid_slice(name_ptr, name_len, ADD23_MAX_SEG_LEN),
+                add23_valid_slice(type_ptr, type_len, ADD23_MAX_SEG_LEN),
+                add23_valid_slice(reason_ptr, reason_len, ADD23_MAX_SEG_LEN),
+            )
+        }) else {
+            return -1;
+        };
+        let upper_type = check_type.to_ascii_uppercase();
+        let status = if status_code != 0 {
+            status_code.to_string().into_bytes()
+        } else {
+            "—".as_bytes().to_vec()
+        };
+        let response = if response_time_ms != 0 {
+            format!("{response_time_ms}ms").into_bytes()
+        } else {
+            "—".as_bytes().to_vec()
+        };
+        let parts: [&[u8]; W306_HEALTH_ROW_SEGMENTS] = [
+            name,
+            &upper_type,
+            &status,
+            &response,
+            if ok == 1 { b"Healthy" } else { reason },
+        ];
+        unsafe { w306_write_segments(out_buf, out_cap, out_lens, &parts) }
+    }))
+    .unwrap_or(-1)
+}
+
+/// `CheckServiceHealth::projectServiceSummaryRow()`:
+/// `[name, label, number_format(uptime, 2).'%', lastChecked ?? 'never']`. Returns `-2` for uptime
+/// values whose `number_format()` result is left to PHP (non-finite, large, near a rounding tie).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_check_service_health_summary_row(
+    name_ptr: *const u8,
+    name_len: usize,
+    label_ptr: *const u8,
+    label_len: usize,
+    uptime_percentage: f64,
+    has_last_checked: u8,
+    checked_ptr: *const u8,
+    checked_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+    out_lens: *mut i64,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if has_last_checked > 1 {
+            return -1;
+        }
+        let (Some(name), Some(label), Some(checked)) = (unsafe {
+            (
+                add23_valid_slice(name_ptr, name_len, ADD23_MAX_SEG_LEN),
+                add23_valid_slice(label_ptr, label_len, ADD23_MAX_SEG_LEN),
+                add23_valid_slice(checked_ptr, checked_len, ADD23_MAX_SEG_LEN),
+            )
+        }) else {
+            return -1;
+        };
+        let Some(mut uptime) = w306_number_format_2(uptime_percentage) else {
+            return -2;
+        };
+        uptime.push(b'%');
+        let parts: [&[u8]; W306_SUMMARY_ROW_SEGMENTS] = [
+            name,
+            label,
+            &uptime,
+            if has_last_checked == 1 {
+                checked
+            } else {
+                b"never"
+            },
+        ];
+        unsafe { w306_write_segments(out_buf, out_cap, out_lens, &parts) }
+    }))
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod wave30_additional_postprocess_health_commands_tests {
+    use super::*;
+
+    fn segments(buf: &[u8], lens: &[i64]) -> Vec<Vec<u8>> {
+        let mut offset = 0usize;
+        lens.iter()
+            .map(|&len| {
+                let part = buf[offset..offset + len as usize].to_vec();
+                offset += len as usize;
+                part
+            })
+            .collect()
+    }
+
+    #[test]
+    fn diagnose_rows_and_warning_match_php_contracts() {
+        let mut buf = [0u8; 256];
+        let mut lens = [0i64; 8];
+        let written = unsafe {
+            nntmux_additional_diagnose_backlog_rows(
+                12,
+                0,
+                -3,
+                i64::MAX,
+                buf.as_mut_ptr(),
+                buf.len(),
+                lens.as_mut_ptr(),
+            )
+        };
+        assert!(written > 0);
+        let parts = segments(&buf, &lens);
+        assert_eq!(parts[0], b"Total");
+        assert_eq!(parts[1], b"12");
+        assert_eq!(parts[5], b"-3");
+        assert_eq!(parts[7], b"9223372036854775807");
+
+        let written = unsafe {
+            nntmux_additional_diagnose_preflight_rows(
+                b"mysql".as_ptr(),
+                5,
+                0,
+                b"".as_ptr(),
+                0,
+                b"/tmp/a\0b".as_ptr(),
+                8,
+                0,
+                buf.as_mut_ptr(),
+                buf.len(),
+                lens.as_mut_ptr(),
+            )
+        };
+        assert!(written > 0);
+        let parts = segments(&buf, &lens);
+        assert_eq!(parts[1], b"mysql");
+        assert_eq!(parts[3], b"missing");
+        assert_eq!(parts[5], b"/tmp/a\0b");
+        assert_eq!(parts[7], b"no");
+
+        let written = unsafe {
+            nntmux_additional_diagnose_format_warning(
+                b"stale".as_ptr(),
+                5,
+                b"msg".as_ptr(),
+                3,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(&buf[..written as usize], b"[stale] msg");
+    }
+
+    #[test]
+    fn identifier_validation_matches_php_exit_codes() {
+        let mut buf = [0u8; 128];
+        let mut scalars = [9i64; 4];
+        let run =
+            |guid: Option<&[u8]>, id: Option<&[u8]>, buf: &mut [u8], scalars: &mut [i64; 4]| {
+                let g = guid.unwrap_or(b"");
+                let i = id.unwrap_or(b"");
+                let written = unsafe {
+                    nntmux_process_additional_validate_identifier(
+                        u8::from(guid.is_some()),
+                        g.as_ptr(),
+                        g.len(),
+                        u8::from(id.is_some()),
+                        i.as_ptr(),
+                        i.len(),
+                        scalars.as_mut_ptr(),
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                };
+                buf[..written as usize].to_vec()
+            };
+        assert_eq!(
+            run(None, None, &mut buf, &mut scalars),
+            W306_ERR_MISSING_IDENTIFIER
+        );
+        assert_eq!(scalars, [0, 0, 0, 1]);
+        assert_eq!(
+            run(Some(b" \0 "), Some(b""), &mut buf, &mut scalars),
+            W306_ERR_MISSING_IDENTIFIER
+        );
+        assert_eq!(
+            run(Some(b"abc"), Some(b"1"), &mut buf, &mut scalars),
+            W306_ERR_CONFLICTING_IDENTIFIERS
+        );
+        assert_eq!(scalars[3], 4);
+        assert_eq!(
+            run(None, Some(b"-1"), &mut buf, &mut scalars),
+            W306_ERR_NON_NUMERIC_ID
+        );
+        assert_eq!(scalars[3], 5);
+        assert_eq!(
+            run(None, Some(b"99999999999999999999"), &mut buf, &mut scalars),
+            b""
+        );
+        assert_eq!(scalars, [1, 1, i64::MAX, 0]);
+        assert_eq!(run(Some(b"\tabc\n"), None, &mut buf, &mut scalars), b"abc");
+        assert_eq!(scalars, [1, 2, 0, 0]);
+
+        let mut flags = [0i64; 5];
+        assert_eq!(
+            unsafe { nntmux_process_additional_reset_flags(flags.as_mut_ptr()) },
+            5
+        );
+        assert_eq!(flags, [-1, -1, 0, 0, -1]);
+    }
+
+    #[test]
+    fn postprocess_guid_helpers_match_php_contracts() {
+        for (value, expected) in [
+            (&b"a"[..], 1),
+            (b"f", 1),
+            (b"9", 1),
+            (b"g", 0),
+            (b"A", 0),
+            (b"ab", 0),
+            (b"", 0),
+        ] {
+            assert_eq!(
+                unsafe { nntmux_postprocess_guid_is_valid_hex_char(value.as_ptr(), value.len()) },
+                expected
+            );
+        }
+        for (value, expected) in [
+            (&b"games"[..], 1),
+            (b"additional", 1),
+            (b"Games", 0),
+            (b"tv ", 0),
+            (b"", 0),
+        ] {
+            assert_eq!(
+                unsafe { nntmux_postprocess_guid_is_valid_type(value.as_ptr(), value.len()) },
+                expected
+            );
+        }
+        assert_eq!(nntmux_postprocess_guid_effective_batch_timeout(1800), 1770);
+        assert_eq!(nntmux_postprocess_guid_effective_batch_timeout(31), 1);
+        assert_eq!(nntmux_postprocess_guid_effective_batch_timeout(i64::MIN), 1);
+        assert_eq!(
+            nntmux_postprocess_guid_effective_batch_timeout(i64::MAX),
+            i64::MAX - 30
+        );
+
+        let ids = [5i64, 0, 3, 5, -2, 3, 7];
+        let mut out = [0i64; 7];
+        let count = unsafe {
+            nntmux_postprocess_guid_normalize_release_ids(
+                ids.as_ptr(),
+                ids.len(),
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(&out[..count as usize], &[5, 3, 7]);
+    }
+
+    #[test]
+    fn fetch_samples_and_health_helpers_match_php_contracts() {
+        let option = b" 2010, 2020\x0b2010\x0c\x00 abc 2030x 0007 ";
+        let mut out = [0i64; 64];
+        let count = unsafe {
+            nntmux_fetch_samples_parse_category_ids(
+                1,
+                option.as_ptr(),
+                option.len(),
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(&out[..count as usize], &[2010, 2020, 7]);
+        assert_eq!(nntmux_fetch_samples_effective_total(0, 10), 10);
+        assert_eq!(nntmux_fetch_samples_effective_total(5, 10), 5);
+        assert_eq!(nntmux_fetch_samples_effective_total(-5, 10), 10);
+
+        let mut buf = [0u8; 256];
+        let written = unsafe {
+            nntmux_fetch_samples_format_completion_summary(3, -1, buf.as_mut_ptr(), buf.len())
+        };
+        assert_eq!(
+            &buf[..written as usize],
+            b"Processing complete. Success: 3, Failed: -1."
+        );
+
+        for (url, expected) in [
+            (&b"https://x/"[..], 1),
+            (b"http", 1),
+            (b"///", 0),
+            (b"ftp://x", 0),
+            (b"", 0),
+        ] {
+            assert_eq!(
+                unsafe { nntmux_check_service_health_is_valid_app_url(url.as_ptr(), url.len()) },
+                expected
+            );
+        }
+
+        let mut lens = [0i64; 5];
+        let written = unsafe {
+            nntmux_check_service_health_result_row(
+                b"API".as_ptr(),
+                3,
+                b"http".as_ptr(),
+                4,
+                0,
+                125,
+                0,
+                b"Down".as_ptr(),
+                4,
+                buf.as_mut_ptr(),
+                buf.len(),
+                lens.as_mut_ptr(),
+            )
+        };
+        assert!(written > 0);
+        let parts = segments(&buf, &lens);
+        assert_eq!(parts[1], b"HTTP");
+        assert_eq!(parts[2], "—".as_bytes());
+        assert_eq!(parts[3], b"125ms");
+        assert_eq!(parts[4], b"Down");
+
+        let mut lens = [0i64; 4];
+        let written = unsafe {
+            nntmux_check_service_health_summary_row(
+                b"API".as_ptr(),
+                3,
+                b"Operational".as_ptr(),
+                11,
+                1234.5678,
+                0,
+                b"".as_ptr(),
+                0,
+                buf.as_mut_ptr(),
+                buf.len(),
+                lens.as_mut_ptr(),
+            )
+        };
+        assert!(written > 0);
+        let parts = segments(&buf, &lens);
+        assert_eq!(parts[2], b"1,234.57%");
+        assert_eq!(parts[3], b"never");
+        for tie in [0.125, 1.005, f64::NAN, f64::INFINITY, 1e13] {
+            assert_eq!(
+                unsafe {
+                    nntmux_check_service_health_summary_row(
+                        b"".as_ptr(),
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        tie,
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                        lens.as_mut_ptr(),
+                    )
+                },
+                -2
+            );
+        }
+        assert_eq!(w306_number_format_2(-0.004).unwrap(), b"0.00");
+        assert_eq!(w306_number_format_2(-12.346).unwrap(), b"-12.35");
+    }
+
+    #[test]
+    fn entrypoints_reject_null_unaligned_and_undersized_buffers() {
+        let mut raw = [0xA5u8; 64];
+        let unaligned = unsafe { raw.as_mut_ptr().add(1).cast::<i64>() };
+        let mut buf = [0u8; 64];
+        assert_eq!(
+            unsafe {
+                nntmux_additional_diagnose_backlog_rows(1, 2, 3, 4, buf.as_mut_ptr(), 64, unaligned)
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_process_additional_reset_flags(unaligned) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_postprocess_guid_is_valid_hex_char(std::ptr::null(), 0) },
+            -1
+        );
+        let mut lens = [0i64; 8];
+        let mut small = [0x5Au8; 4];
+        assert!(
+            unsafe {
+                nntmux_additional_diagnose_backlog_rows(
+                    1,
+                    2,
+                    3,
+                    4,
+                    small.as_mut_ptr(),
+                    4,
+                    lens.as_mut_ptr(),
+                )
+            } < -4
+        );
+        assert_eq!(small, [0x5Au8; 4]);
+        let ids = [1i64, 2, 3];
+        let mut out = [0i64; 2];
+        assert_eq!(
+            unsafe {
+                nntmux_postprocess_guid_normalize_release_ids(ids.as_ptr(), 3, out.as_mut_ptr(), 2)
+            },
+            -3
+        );
+    }
+}
