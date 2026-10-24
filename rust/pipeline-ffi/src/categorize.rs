@@ -6440,3 +6440,680 @@ mod categorizer_tests {
         }
     }
 }
+
+// BookService CPU helpers. All text protocols are byte-counted; NUL-separated parser output
+// contains rawName, title, author, ISBN, year, format, and a presence/status bit mask.
+// No Unicode approximations: unsupported text and exhausted regex budgets return -1.
+macro_rules! book_re {
+    ($pat:expr, $icase:expr) => {{
+        static CELL: std::sync::OnceLock<Re> = std::sync::OnceLock::new();
+        CELL.get_or_init(|| Re::new($pat, $icase))
+    }};
+}
+
+fn book_ascii(input: &[u8]) -> bool {
+    input.len() <= 4096 && input.is_ascii()
+}
+
+fn book_parse_supported(input: &[u8]) -> bool {
+    // Multiline anchors, embedded NUL framing, and extractor title casing are intentionally
+    // handled by PHP for control bytes. Bound recursion in the reference regex engine.
+    input.len() <= 1024 && input.iter().all(|b| (0x20..=0x7e).contains(b))
+}
+
+fn book_looks_obfuscated(input: &[u8]) -> bool {
+    let input = &input[input.iter().take_while(|b| is_pcre_space(**b)).count()..];
+    let prefix = |s: &[u8], p: &[u8]| s.get(..p.len()).is_some_and(|v| v.eq_ignore_ascii_case(p));
+    if prefix(input, b"n:/nzb") && input.get(6).is_none_or(|b| !is_pcre_word(*b)) {
+        return true;
+    }
+    if input.first().is_some_and(|b| b.eq_ignore_ascii_case(&b'n')) {
+        let mut p = 1;
+        while input
+            .get(p)
+            .is_some_and(|b| is_pcre_space(*b) || b"._:-".contains(b))
+        {
+            p += 1;
+        }
+        if prefix(&input[p..], b"nzb") {
+            p += 3;
+            while input
+                .get(p)
+                .is_some_and(|b| is_pcre_space(*b) || b"._-".contains(b))
+            {
+                p += 1;
+            }
+            if input.get(p) == Some(&b'[') {
+                return true;
+            }
+        }
+    }
+    let mut p = 0;
+    if prefix(input, b"re") {
+        p = 2;
+        while input.get(p).is_some_and(|b| is_pcre_space(*b)) {
+            p += 1;
+        }
+    }
+    if !prefix(&input[p..], b"posted") {
+        return false;
+    }
+    p += 6;
+    let before = p;
+    while input.get(p).is_some_and(|b| is_pcre_space(*b)) {
+        p += 1;
+    }
+    p > before && prefix(&input[p..], b"by") && input.get(p + 2).is_none_or(|b| !is_pcre_word(*b))
+}
+
+fn book_extract_isbn(input: &[u8]) -> Option<String> {
+    // PHP returns the normalization of the FIRST regex match, even when its checksum is
+    // invalid; it must not skip ahead to another ISBN (or fall through from 13 to 10).
+    for count in [13, 10] {
+        for start in 0..input.len() {
+            if !input[start].is_ascii_digit() || (start > 0 && is_pcre_word(input[start - 1])) {
+                continue;
+            }
+            if count == 13
+                && !(input[start..].starts_with(b"978") || input[start..].starts_with(b"979"))
+            {
+                continue;
+            }
+            let mut digits = Vec::with_capacity(count);
+            let mut p = start;
+            if count == 13 {
+                digits.extend_from_slice(&input[p..p + 3]);
+                p += 3;
+            }
+            while digits.len() < count {
+                if !digits.is_empty()
+                    && input
+                        .get(p)
+                        .is_some_and(|b| *b == b'-' || is_pcre_space(*b))
+                {
+                    p += 1;
+                }
+                let Some(&b) = input.get(p) else {
+                    break;
+                };
+                if b.is_ascii_digit()
+                    || (count == 10 && digits.len() == 9 && matches!(b, b'X' | b'x'))
+                {
+                    digits.push(b);
+                    p += 1;
+                } else {
+                    break;
+                }
+            }
+            if digits.len() == count && input.get(p).is_none_or(|b| !is_pcre_word(*b)) {
+                return crate::metadata::book_isbn_normalize(std::str::from_utf8(&digits).unwrap());
+            }
+        }
+    }
+    None
+}
+
+fn book_extracted(input: &[u8]) -> Option<Vec<u8>> {
+    let mut buf = vec![0u8; input.len() * 2 + 32];
+    let written = unsafe {
+        crate::cleaning::nntmux_extract_obfuscated_subject(
+            input.as_ptr(),
+            input.len(),
+            buf.as_mut_ptr(),
+            buf.len(),
+        )
+    };
+    if written >= 0 {
+        buf.truncate(written as usize);
+        Some(buf)
+    } else {
+        None
+    }
+}
+
+fn book_capture<'a>(re: &Re, input: &'a [u8], k: usize) -> Option<&'a [u8]> {
+    re.capture(input, k).map(|(a, b)| &input[a..b])
+}
+
+// Patterns passed here wrap the ENTIRE match in capture 1; inner groups are noncapturing.
+// Keep the original subject across global matches so anchors and word boundaries see it.
+fn book_replace(re: &Re, input: &[u8], replacement: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(input.len());
+    let mut from = 0;
+    loop {
+        let (found, caps) = re.exec(input, from, false);
+        if !found {
+            break;
+        }
+        let (a, b) = (caps[2], caps[3]);
+        if a == NO_POS || b <= a {
+            break;
+        }
+        result.extend_from_slice(&input[from..a]);
+        result.extend_from_slice(replacement);
+        from = b;
+        if from == input.len() {
+            break;
+        }
+    }
+    result.extend_from_slice(&input[from..]);
+    result
+}
+
+fn book_spaces(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut space = false;
+    for &b in input {
+        if is_pcre_space(b) {
+            if !space {
+                out.push(b' ');
+            }
+            space = true;
+        } else {
+            out.push(b);
+            space = false;
+        }
+    }
+    php_trim_ascii(&out).to_vec()
+}
+
+/// Returns 0/1, or -1 for unsupported input.
+/// # Safety
+/// Non-null `input` must be readable for `input_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_book_looks_like_obfuscated(
+    input: *const u8,
+    input_len: usize,
+) -> i32 {
+    if input.is_null() && input_len != 0 {
+        return -1;
+    }
+    let input = unsafe { raw_bytes(input, input_len) };
+    if !book_ascii(input) {
+        return -1;
+    }
+    i32::from(book_looks_obfuscated(input))
+}
+
+/// Returns ISBN length, 0 for no ISBN, -1 to decline, or -required_length on overflow.
+/// # Safety
+/// Input/output pointers must be readable/writable for their respective lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_book_extract_isbn(
+    input: *const u8,
+    input_len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    if input.is_null() && input_len != 0 {
+        return -1;
+    }
+    let input = unsafe { raw_bytes(input, input_len) };
+    if !book_ascii(input) {
+        return -1;
+    }
+    let mut cursor = unsafe { OutCursor::new(out, cap) };
+    if let Some(isbn) = book_extract_isbn(input) {
+        cursor.extend(isbn.as_bytes());
+    }
+    cursor.finish()
+}
+
+fn book_quote_re() -> &'static Re {
+    book_re!(r###""([^"]{3,240})""###, false)
+}
+
+fn book_year_re() -> &'static Re {
+    book_re!(r###"\b((?:19|20)\d{2})\b"###, false)
+}
+
+fn book_clean_a_re() -> &'static Re {
+    book_re!(
+        r###"(\d{1,2} \d{1,2} \d{2,4}|(?:19|20)\d\d|anybody got .+?[a-z]\? |[ ._-](?:Novel|TIA)(?:[ ._-]|$)|(?:[ \.])HQ(?:[-\. ])|[\(\)\.\-_ ](?:AVI|AZW3?|DOC|EPUB|LIT|MOBI|NFO|RETAIL|(?:si)?PDF|RTF|TXT)[\)\]\.\-_ ](?=[^a-z0-9]|$)|compleet|DAGSTiDNiNGEN|DiRFiX|\+ extra|r?e ?Books?(?:[\.\-_ ]English|ers)?|azw3?|ePu(?:[bp])s?|html|mobi|^NEW[\.\-_ ]|PDF(?:[\.\-_ ]English)?|Please post more|Post description|Proper|Repack(?:fix)?|[\.\-_ ](?:Chinese|English|French|German|Italian|Retail|Scan|Swedish|Multilingual)|^R4 |Repost|Skytwohigh|TIA!+|TruePDF|V413HAV|(?:would someone )?please (?:re)?post.+? "|with the authors name right)"###,
+        true
+    )
+}
+
+fn book_clean_b_re() -> &'static Re {
+    book_re!(
+        r###"(^(?:As Req |conversion |eq |Das neue Abenteuer \d+|Fixed version(?: ignore previous post)?|Full |Per Req As Found|(?:\s+)?R4 |REQ |revised |version |\d+(?:\s+)?$)|(?:COMPLETE|INTERNAL|RELOADED| (?:AZW3|eB|docx|ENG?|exe|FR|Fix|gnv64|MU|NIV|R\d\s+\d{1,2} \d{1,2}|R\d|Req|TTL|UC|v(?:\s+)?\d))(?:\s+)?$)"###,
+        true
+    )
+}
+
+fn book_brackets_re() -> &'static Re {
+    book_re!(r###"( - \[.+\]|\[.+\])"###, false)
+}
+
+fn book_empty_brackets_re() -> &'static Re {
+    book_re!(r###"((?:\(\)|\[\]))"###, false)
+}
+
+fn book_multi_space_re() -> &'static Re {
+    book_re!(r###"(\s\s+)"###, true)
+}
+
+fn book_dots_re() -> &'static Re {
+    book_re!(r###"([._]+)"###, false)
+}
+
+fn book_isbn_noise_re() -> &'static Re {
+    book_re!(
+        r###"(\b97[89](?:[-\s]?\d){10}\b|\b\d(?:[-\s]?\d){8}[-\s]?[\dXx]\b)"###,
+        false
+    )
+}
+
+fn book_video_noise_re() -> &'static Re {
+    book_re!(
+        r###"(\b(?:S\d{1,3}E\d{1,3}|Season\s*\d+|Temporada\s*\d+|Saison\s*\d+|Staffel\s*\d+|Episode\s*\d+|HDTV|WEB[\s-]?DL|WEBRip|BluRay|BDRip|DVDRip|BRRip|XviD|[xh][\s.]?26[45]|HEVC|10bit|1080[pi]|720p|2160p|4K|UHD|HDR|REMUX|AAC5?\s*\d|DDP?5\s*\d|ATMOS|PAR2?|vol\d+\+\d+|NTb|FLUX|PSA|RARBG|YTS|YIFY|AMZN|DSNP|NF|ATVP|HMAX)\b)"###,
+        true
+    )
+}
+
+fn book_mcn_date_re() -> &'static Re {
+    book_re!(
+        r###"^MCN[._ -]([A-Za-z]+)[._ -](\d{1,2})[._ -]((?:19|20)\d{2})"###,
+        true
+    )
+}
+
+fn book_format_re() -> &'static Re {
+    book_re!(r###"\b(EPUB|MOBI|AZW3?|PDF|FB2|DJVU|LIT)\b"###, true)
+}
+
+fn book_author_dash_re() -> &'static Re {
+    book_re!(r###"^([A-Za-z0-9&'\.\-\s]{3,80})\s-\s(.+)$"###, false)
+}
+
+fn book_mcn_author_re() -> &'static Re {
+    book_re!(r###"^MCN$"###, true)
+}
+
+fn book_month_start_re() -> &'static Re {
+    book_re!(
+        r###"^\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\b"###,
+        true
+    )
+}
+
+fn book_edition_re() -> &'static Re {
+    book_re!(r###"^(?:Issue\s+\d+|\d+\w*\s+Edition\b)"###, true)
+}
+
+fn book_author_by_re() -> &'static Re {
+    book_re!(r###"^(.+?)\s+by\s+([A-Za-z0-9&'\.\-\s]{3,80})$"###, true)
+}
+
+fn book_title_year_format_re() -> &'static Re {
+    book_re!(
+        r###"^(.+?)[\s._-]+((?:19|20)\d{2})[\s._-]+(EPUB|MOBI|AZW3?|PDF|FB2|DJVU|LIT)$"###,
+        true
+    )
+}
+
+fn book_software_re() -> &'static Re {
+    book_re!(
+        r###"\b(?:v?\d+\.\d+\.\d+(?:\.\d+)?|x64|x86|portable|setup|crack(?:ed)?|patch)\b"###,
+        true
+    )
+}
+
+fn book_audio_re() -> &'static Re {
+    book_re!(
+        r###"\b(?:WEB[\.\-_ ]?FLAC|MP3|320kbps|FALCON|discography)\b"###,
+        true
+    )
+}
+
+fn book_video_re() -> &'static Re {
+    book_re!(
+        r###"\b(?:S\d{1,3}[\.\-_ ]?E\d{1,3}|Season[\.\-_ ]?\d+|Temporada[\.\-_ ]?\d+|Saison[\.\-_ ]?\d+|Staffel[\.\-_ ]?\d+|Episode[\.\-_ ]?\d+|[12]\d{3}[\.\-_ ]?S\d{2}|HDTV|WEB[\.\-_ ]?DL|WEBRip|BluRay|BDRip|BRRip|DVDRip|XviD|x26[45]|H[\.\-_ ]?26[45]|HEVC|10bit|AAC5[\.\-]1|DDP?5[\.\-]1|ATMOS|NTb|FLUX|PSA|RARBG|YTS|YIFY|AMZN|DSNP|HMAX|NF[\.\-_ ]|ATVP)\b"###,
+        true
+    )
+}
+
+fn book_archive_re() -> &'static Re {
+    book_re!(
+        r###"\b(?:PAR2|PAR[\.\-_ ]?Files?|vol\d+\+\d+|\.nzb|\.part\d+\.rar|\.r\d{2,}|sample|subs?pack|subtitle|nfo[\.\-_ ]?only)\b"###,
+        true
+    )
+}
+
+fn book_resolution_re() -> &'static Re {
+    book_re!(
+        r###"\b(?:1080[pi]|720p|2160p|4K[\.\-_ ]?UHD|UHD|HDR|SDR|REMUX|mHD|mSD)\b"###,
+        true
+    )
+}
+
+fn book_warez_re() -> &'static Re {
+    book_re!(
+        r###"\b(?:keygen|activat(?:or|ion)|licen[sc]e[\.\-_ ]?key|serial[\.\-_ ]?number|nulled|warez|regged|incl[\.\-_ ]?crack)\b"###,
+        true
+    )
+}
+
+fn book_magazine_re() -> &'static Re {
+    book_re!(
+        r###"^(?:[a-z0-9!]+ ){1,2}(?:N|Vol)?\d{1,4}(?:[abc])?$|^(?:[a-z0-9]+ ){1,2}(?:Jan(?: |unar|$)|Feb(?: |ruary|$)|Mar(?: |ch|$)|Apr(?: |il|$)|May(?=[^a-z0-9]|$)|Jun(?:[ e$])|Jul(?:[ y$])|Aug(?: |ust|$)|Sep(?: |tember|$)|O(?:[ck])t(?: |ober|$)|Nov(?: |ember|$)|De(?:[cz])(?: |ember|$))"###,
+        true
+    )
+}
+
+fn book_issue_re() -> &'static Re {
+    book_re!(r###"\bIssue[\._\- ]?\d{1,4}\b"###, true)
+}
+
+fn book_mcn_marker_re() -> &'static Re {
+    book_re!(r###"\bMCN[._ -]"###, true)
+}
+
+fn book_magazine_marker_re() -> &'static Re {
+    book_re!(r###"\bMAGAZINE\b"###, true)
+}
+
+fn book_mcn_start_re() -> &'static Re {
+    book_re!(r###"^MCN\b"###, true)
+}
+
+fn book_month_re() -> &'static Re {
+    book_re!(
+        r###"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\b"###,
+        true
+    )
+}
+
+fn book_day_re() -> &'static Re {
+    book_re!(r###"\b\d{1,2}\b"###, false)
+}
+
+fn book_part_re() -> &'static Re {
+    book_re!(r###"Part \d+"###, true)
+}
+
+fn book_parse(input: &[u8], ebook: bool) -> Vec<u8> {
+    let extracted = book_extracted(input);
+    let mut release = extracted.as_deref().unwrap_or(input);
+    if let Some(quoted) = book_capture(book_quote_re(), release, 1) {
+        release = quoted;
+    }
+    let isbn = book_extract_isbn(release);
+    let year_from = |s: &[u8]| book_capture(book_year_re(), s, 1).map(|v| v.to_vec());
+    let mut year = year_from(release);
+    let a = book_replace(book_clean_a_re(), release, b"");
+    let b = book_replace(book_clean_b_re(), &a, b"");
+    let c = book_replace(book_brackets_re(), &b, b"");
+    let d = book_replace(book_empty_brackets_re(), &c, b"");
+    let e = book_replace(book_multi_space_re(), &d, b" ");
+    let f = book_replace(book_dots_re(), php_trim_ascii(&e), b" ");
+    let g = book_replace(book_isbn_noise_re(), &f, b"");
+    let h = book_replace(book_video_noise_re(), &g, b"");
+    let normalized = book_spaces(&h);
+    let mut special = None;
+    if let Some(month) = book_capture(book_mcn_date_re(), input, 1) {
+        let mut month = month.to_ascii_lowercase();
+        month[0].make_ascii_uppercase();
+        let day = book_capture(book_mcn_date_re(), input, 2).unwrap();
+        let day_trimmed = day.strip_prefix(b"0").unwrap_or(day);
+        let day_trimmed = if day_trimmed == b"0" {
+            &[][..]
+        } else {
+            day_trimmed
+        };
+        let day = if day_trimmed.is_empty() {
+            day
+        } else {
+            day_trimmed
+        };
+        let y = book_capture(book_mcn_date_re(), input, 3).unwrap();
+        let mut title = b"MCN - ".to_vec();
+        title.extend(month);
+        title.push(b' ');
+        title.extend(day);
+        title.extend(b", ");
+        title.extend(y);
+        special = Some(title);
+        year = Some(y.to_vec());
+    }
+    if let Some(y) = year_from(&normalized) {
+        year = Some(y);
+    }
+    let format = book_capture(book_format_re(), release, 1).map(|v| v.to_ascii_uppercase());
+    let mut author = None;
+    let mut title = special.as_deref().unwrap_or(&normalized).to_vec();
+    let dash_author = book_capture(book_author_dash_re(), &normalized, 1);
+    if special.is_none() && dash_author.is_some() {
+        let a = php_trim_ascii(dash_author.unwrap());
+        let t = php_trim_ascii(book_capture(book_author_dash_re(), &normalized, 2).unwrap());
+        let mcn = book_mcn_author_re().is_match(a) && book_month_start_re().is_match(t);
+        if !mcn && !book_edition_re().is_match(t) {
+            author = Some(a.to_vec());
+            title = t.to_vec();
+        }
+    } else if let Some(t) = book_capture(book_author_by_re(), &normalized, 1) {
+        author = Some(
+            php_trim_ascii(book_capture(book_author_by_re(), &normalized, 2).unwrap()).to_vec(),
+        );
+        title = php_trim_ascii(t).to_vec();
+    }
+    title = book_spaces(&title);
+    if author.is_none()
+        && let Some(t) = book_capture(book_title_year_format_re(), &normalized, 1)
+    {
+        title = php_trim_ascii(t)
+            .iter()
+            .map(|b| if matches!(b, b'.' | b'_') { b' ' } else { *b })
+            .collect();
+    }
+    // Split the one negative month lookahead from the junk pattern into two equivalent tests.
+    let junk_main = book_re!(r"^(?:[a-z0-9] )+$|ArtofUsenet|ekiosk|(?:ebook|mobi).+collection|erotica|Full Video|ImwithJamie|linkoff org|Mega.+pack|NY Times|(?:Book|Massive) Dump|Sexual", true).is_match(&normalized);
+    let junk_two = book_re!(r"^[a-z0-9]+ ([a-z]+(?: (?:ebooks?|The))?)$", true);
+    let junk_words = book_capture(junk_two, &normalized, 1).is_some_and(|rest|
+        !book_re!(r"^(?:January|February|March|April|May|June|July|August|September|O[ck]tober|November|De[cz]ember)", true).is_match(rest));
+    let junk = junk_main
+        || junk_words
+        || (ebook
+            && (book_software_re().is_match(release)
+                || book_audio_re().is_match(release)
+                || book_warez_re().is_match(release)))
+        || book_video_re().is_match(release)
+        || book_archive_re().is_match(release)
+        || book_resolution_re().is_match(release);
+    let magazine = (book_magazine_re().is_match(&normalized)
+        || book_issue_re().is_match(&normalized)
+        || (book_mcn_marker_re().is_match(input) && book_magazine_marker_re().is_match(input))
+        || (book_mcn_start_re().is_match(&normalized)
+            && book_month_re().is_match(&normalized)
+            && book_day_re().is_match(&normalized)))
+        && !book_part_re().is_match(&normalized);
+    let flags = u8::from(author.is_some())
+        | (u8::from(isbn.is_some()) << 1)
+        | (u8::from(year.is_some()) << 2)
+        | (u8::from(format.is_some()) << 3)
+        | (u8::from(junk) << 4)
+        | (u8::from(magazine) << 5);
+    let fields = [
+        release,
+        &title,
+        author.as_deref().unwrap_or_default(),
+        isbn.as_ref().map(|s| s.as_bytes()).unwrap_or_default(),
+        year.as_deref().unwrap_or_default(),
+        format.as_deref().unwrap_or_default(),
+    ];
+    let mut out = Vec::new();
+    for field in fields {
+        out.extend_from_slice(field);
+        out.push(0);
+    }
+    out.extend(flags.to_string().as_bytes());
+    out
+}
+
+/// Parser protocol: six NUL-terminated fields and decimal presence/status mask (see above).
+/// Returns bytes written, -1 to decline, or -required_length on insufficient output capacity.
+/// # Safety
+/// Input/type/output pointers must be valid for their respective lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_book_parse_release_name(
+    input: *const u8,
+    input_len: usize,
+    release_type: *const u8,
+    type_len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    if (input.is_null() && input_len != 0) || (release_type.is_null() && type_len != 0) {
+        return -1;
+    }
+    let input = unsafe { raw_bytes(input, input_len) };
+    let release_type = unsafe { raw_bytes(release_type, type_len) };
+    if !book_parse_supported(input) || !book_parse_supported(release_type) {
+        return -1;
+    }
+    guarded(|| {
+        let parsed = book_parse(input, release_type == b"ebook");
+        let mut cursor = unsafe { OutCursor::new(out, cap) };
+        cursor.extend(&parsed);
+        cursor.finish() as i64
+    }) as isize
+}
+
+/// Computes the readable search name from the raw subject and PHP's searchQuery/junk fields.
+/// Returns 0 for null, -1 to decline, or a byte length (negative required size on overflow).
+/// # Safety
+/// Input/query/output pointers must be valid for their respective lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_book_readable_search_name(
+    input: *const u8,
+    input_len: usize,
+    query: *const u8,
+    query_len: usize,
+    junk: u32,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    if (input.is_null() && input_len != 0) || (query.is_null() && query_len != 0) {
+        return -1;
+    }
+    let input = unsafe { raw_bytes(input, input_len) };
+    let query = unsafe { raw_bytes(query, query_len) };
+    if !book_parse_supported(input) || !book_parse_supported(query) {
+        return -1;
+    }
+    guarded(|| {
+        let mut cursor = unsafe { OutCursor::new(out, cap) };
+        if book_looks_obfuscated(input)
+            && let Some(extracted) = book_extracted(input)
+        {
+            cursor.extend(&extracted);
+            return cursor.finish() as i64;
+        }
+        let query = php_trim_ascii(query);
+        if junk != 0
+            || query.is_empty()
+            || book_re!(r"^[a-z0-9]+$|^(?:[0-9]+ ){1,}$|Part \d+", true).is_match(query)
+        {
+            return 0;
+        }
+        if query.iter().any(|b| is_pcre_space(*b)) {
+            cursor.extend(query);
+        }
+        cursor.finish() as i64
+    }) as isize
+}
+
+#[cfg(test)]
+mod book_service_tests {
+    use super::*;
+
+    #[test]
+    fn isbn_preserves_invalid_first_match_and_13_precedence() {
+        assert_eq!(
+            book_extract_isbn(b"Book 978-0-13-235088-4"),
+            Some("9780132350884".into())
+        );
+        assert_eq!(
+            book_extract_isbn(b"Book 0-8044-2957-x"),
+            Some("080442957X".into())
+        );
+        assert_eq!(book_extract_isbn(b"9780132350885 9780132350884"), None);
+        assert_eq!(book_extract_isbn(b"9780132350885 0132350882"), None);
+        assert_eq!(book_extract_isbn(b"0132350883 0132350882"), None);
+        assert_eq!(
+            book_extract_isbn(b"x9780132350884 97801323508840 ISBN_0132350882"),
+            None
+        );
+        assert_eq!(
+            book_extract_isbn(b"978\x0b0\x0c132350884"),
+            Some("9780132350884".into())
+        );
+    }
+
+    #[test]
+    fn prefix_boundaries_and_pcre_whitespace() {
+        for s in [
+            b"N:/NZB".as_slice(),
+            b"\x0bN_NZB [",
+            b"Re posted by author",
+            b"posted\x0cby!",
+        ] {
+            assert!(book_looks_obfuscated(s), "{s:?}");
+        }
+        for s in [
+            b"N:/NZBfoo".as_slice(),
+            b"N:/NZB_",
+            b"reposted byline",
+            b"postedby",
+        ] {
+            assert!(!book_looks_obfuscated(s), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn abi_capacity_decline_and_parser_protocol() {
+        unsafe {
+            let name = b"Eric Evans - Domain Driven Design EPUB";
+            let mut out = [0; 256];
+            let required = nntmux_book_parse_release_name(
+                name.as_ptr(),
+                name.len(),
+                b"ebook".as_ptr(),
+                5,
+                out.as_mut_ptr(),
+                1,
+            );
+            assert!(required < -1);
+            let written = nntmux_book_parse_release_name(
+                name.as_ptr(),
+                name.len(),
+                b"ebook".as_ptr(),
+                5,
+                out.as_mut_ptr(),
+                out.len(),
+            );
+            assert_eq!(written, -required);
+            let fields: Vec<_> = out[..written as usize].split(|b| *b == 0).collect();
+            assert_eq!(fields.len(), 7);
+            assert_eq!(fields[1], b"Domain Driven Design");
+            assert_eq!(fields[2], b"Eric Evans");
+            assert_eq!(fields[5], b"EPUB");
+            assert_eq!(
+                nntmux_book_parse_release_name(
+                    b"caf\xc3\xa9".as_ptr(),
+                    5,
+                    b"ebook".as_ptr(),
+                    5,
+                    out.as_mut_ptr(),
+                    out.len()
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_book_extract_isbn(std::ptr::null(), 1, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            assert_eq!(nntmux_book_looks_like_obfuscated(std::ptr::null(), 1), -1);
+        }
+    }
+}
