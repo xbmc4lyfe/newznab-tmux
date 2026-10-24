@@ -5,11 +5,14 @@ declare(strict_types=1);
 namespace App\Services;
 
 use App\Exceptions\TvProviderException;
+use App\Support\RustPipelineLibrary;
 use DariusIII\TVMaze\Episode;
 use DariusIII\TVMaze\TVShow;
+use FFI;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\Http;
+use Throwable;
 
 /**
  * TVMaze API client built on Laravel's HTTP client.
@@ -20,6 +23,38 @@ use Illuminate\Support\Facades\Http;
  */
 class TvMazeClient
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_tvmaze_extract_aka_names(const char *ser, size_t ser_len, char *out, size_t cap);
+        ssize_t nntmux_tvmaze_normalize_airdate(const char *airdate, size_t len, char *out, size_t cap);
+        C;
+
+    /** Null selects the benchmark-qualified production default (PHP; see RustTvPipelineAndIgdbDataNodeParityTest). */
+    private static ?bool $useRustFfi = null;
+
+    private static FFI|false|null $ffi = null;
+
+    public static function setUseRustFfi(?bool $use = true): void
+    {
+        self::$useRustFfi = $use;
+        if ($use === null) {
+            self::$ffi = null;
+        }
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? false;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('metadata', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
+
     protected const BASE_URL = 'https://api.tvmaze.com';
 
     /** Minimum seconds between requests from one process. */
@@ -84,9 +119,72 @@ class TvMazeClient
      */
     public function akas(int $showId): array
     {
+        return self::extractAkaNames($this->getList('/shows/'.$showId.'/akas'));
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $akas
+     * @return list<string>
+     */
+    public static function extractAkaNames(array $akas): array
+    {
+        return self::usesRustFfi()
+            ? self::extractAkaNamesNative($akas)
+            : self::extractAkaNamesPhp($akas);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $akas
+     * @return list<string>
+     */
+    public static function extractAkaNamesNative(array $akas): array
+    {
+        if ($akas === []) {
+            return [];
+        }
+        if (($ffi = self::ffi()) === null) {
+            return self::extractAkaNamesPhp($akas);
+        }
+        try {
+            $ser = serialize($akas);
+            $len = \strlen($ser);
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, max(256, $len), $capacity);
+            if ($buffer === null) {
+                return self::extractAkaNamesPhp($akas);
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_tvmaze_extract_aka_names($ser, $len, $buffer, $capacity);
+            if (\is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return self::extractAkaNamesPhp($akas);
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_tvmaze_extract_aka_names($ser, $len, $buffer, $capacity);
+            }
+            if ($written === 0) {
+                return [];
+            }
+            if (! \is_int($written) || $written < 0 || $written > $capacity) {
+                return self::extractAkaNamesPhp($akas);
+            }
+
+            return explode("\0", FFI::string($buffer, $written));
+        } catch (Throwable) {
+            return self::extractAkaNamesPhp($akas);
+        }
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $akas
+     * @return list<string>
+     */
+    public static function extractAkaNamesPhp(array $akas): array
+    {
         $names = [];
-        foreach ($this->getList('/shows/'.$showId.'/akas') as $aka) {
-            if (\is_string($aka['name'] ?? null) && $aka['name'] !== '') {
+        foreach ($akas as $aka) {
+            if (\is_array($aka) && \is_string($aka['name'] ?? null) && $aka['name'] !== '') {
                 $names[] = $aka['name'];
             }
         }
@@ -117,15 +215,58 @@ class TvMazeClient
      */
     public function episodesByDate(int $showId, string $airdate): array
     {
-        $timestamp = strtotime($airdate);
-        if ($timestamp === false) {
+        $normalizedDate = self::normalizeAirdate($airdate);
+        if ($normalizedDate === null) {
             return [];
         }
 
         return array_map(
             static fn (array $episode): Episode => new Episode($episode),
-            $this->getList('/shows/'.$showId.'/episodesbydate', ['date' => date('Y-m-d', $timestamp)]),
+            $this->getList('/shows/'.$showId.'/episodesbydate', ['date' => $normalizedDate]),
         );
+    }
+
+    public static function normalizeAirdate(string $airdate): ?string
+    {
+        return self::usesRustFfi()
+            ? self::normalizeAirdateNative($airdate)
+            : self::normalizeAirdatePhp($airdate);
+    }
+
+    public static function normalizeAirdateNative(string $airdate): ?string
+    {
+        if (($ffi = self::ffi()) === null) {
+            return self::normalizeAirdatePhp($airdate);
+        }
+        $capacity = 0;
+        $buffer = RustPipelineLibrary::obtainScratch($ffi, 32, $capacity);
+        if ($buffer === null) {
+            return self::normalizeAirdatePhp($airdate);
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_tvmaze_normalize_airdate($airdate, \strlen($airdate), $buffer, $capacity);
+            if ($written === 0) {
+                return null;
+            }
+            if (! \is_int($written) || $written <= 0 || $written > $capacity) {
+                return self::normalizeAirdatePhp($airdate);
+            }
+
+            return FFI::string($buffer, $written);
+        } catch (Throwable) {
+            return self::normalizeAirdatePhp($airdate);
+        }
+    }
+
+    public static function normalizeAirdatePhp(string $airdate): ?string
+    {
+        $timestamp = strtotime($airdate);
+        if ($timestamp === false) {
+            return null;
+        }
+
+        return date('Y-m-d', $timestamp);
     }
 
     /**
@@ -159,7 +300,7 @@ class TvMazeClient
                 ->acceptJson()
                 ->timeout($this->timeout)
                 ->connectTimeout(10)
-                ->retry($this->retryTimes, 500, static fn (\Throwable $exception): bool => $exception instanceof ConnectionException, throw: false)
+                ->retry($this->retryTimes, 500, static fn (Throwable $exception): bool => $exception instanceof ConnectionException, throw: false)
                 ->get($path, $query);
         } catch (ConnectionException $e) {
             throw new TvProviderException('tvmaze', 'TVMaze connection failed: '.$e->getMessage(), null, null, $e);
