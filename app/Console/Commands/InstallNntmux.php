@@ -5,12 +5,104 @@ declare(strict_types=1);
 namespace App\Console\Commands;
 
 use App\Models\User;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Process;
+use Throwable;
 
 class InstallNntmux extends Command
 {
+    private const FFI_CDEF = <<<'CDEF'
+ssize_t nntmux_installer_database_config(const char *config, size_t config_len, uint8_t *out, size_t cap);
+CDEF;
+
+    // The end-to-end FFI benchmark must qualify before changing this default.
+    private const bool RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useRustFfi = null;
+
+    private static FFI|false|null $ffi = null;
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? self::RUST_FFI_DEFAULT;
+    }
+
+    public static function setUseRustFfi(?bool $use): void
+    {
+        self::$useRustFfi = $use;
+    }
+
+    private static function additionalFfi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('additional', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi instanceof FFI ? self::$ffi : null;
+    }
+
+    /** @return array{driver: string, host: string, port: int|string, database: string, username: string} */
+    public static function normalizeDatabaseInstallConfig(string $driver, string $host, int|string $port, string $database, string $username): array
+    {
+        return self::usesRustFfi()
+            ? self::normalizeDatabaseInstallConfigNative($driver, $host, $port, $database, $username)
+            : self::normalizeDatabaseInstallConfigPhp($driver, $host, $port, $database, $username);
+    }
+
+    /** @return array{driver: string, host: string, port: int|string, database: string, username: string} */
+    public static function normalizeDatabaseInstallConfigPhp(string $driver, string $host, int|string $port, string $database, string $username): array
+    {
+        // Preserve configured bytes and the port's original type, as the installer does.
+        return compact('driver', 'host', 'port', 'database', 'username');
+    }
+
+    /** @return array{driver: string, host: string, port: int|string, database: string, username: string} */
+    public static function normalizeDatabaseInstallConfigNative(string $driver, string $host, int|string $port, string $database, string $username): array
+    {
+        try {
+            $ffi = self::additionalFfi();
+            if ($ffi !== null) {
+                // Length-prefixed fields preserve invalid UTF-8 and embedded NUL bytes.
+                $payload = '';
+                foreach ([$driver, $host, (string) $port, $database, $username] as $field) {
+                    $length = strlen($field);
+                    if ($length > 0xFFFFFFFF) {
+                        return self::normalizeDatabaseInstallConfigPhp($driver, $host, $port, $database, $username);
+                    }
+                    $payload .= pack('N', $length).$field;
+                }
+                $cap = strlen($payload);
+                $out = $ffi->new("uint8_t[{$cap}]");
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_installer_database_config($payload, $cap, $out, $cap);
+                if ($written === $cap) {
+                    $bytes = FFI::string($out, $written);
+                    $fields = [];
+                    $offset = 0;
+                    for ($i = 0; $i < 5; $i++) {
+                        $header = unpack('Nlength', substr($bytes, $offset, 4));
+                        if ($header === false || ! is_int($header['length']) || $header['length'] > $cap - $offset - 4) {
+                            break;
+                        }
+                        $offset += 4;
+                        $fields[] = substr($bytes, $offset, $header['length']);
+                        $offset += $header['length'];
+                    }
+                    if (count($fields) === 5 && $offset === $cap) {
+                        return ['driver' => $fields[0], 'host' => $fields[1], 'port' => is_int($port) ? $port : $fields[2], 'database' => $fields[3], 'username' => $fields[4]];
+                    }
+                }
+            }
+        } catch (Throwable) {
+            // Keep the original PHP configuration when the native bridge declines it.
+        }
+
+        return self::normalizeDatabaseInstallConfigPhp($driver, $host, $port, $database, $username);
+    }
+
     /**
      * The name and signature of the console command.
      *
@@ -110,6 +202,18 @@ class InstallNntmux extends Command
                 $currentDriver === 'mariadb' ? 0 : 1
             );
         }
+
+        // The installer only changes the selected connection; its other fields remain configured.
+        $connection = config('database.connections.'.$dbType, []);
+        $port = $connection['port'] ?? '';
+        $databaseConfig = self::normalizeDatabaseInstallConfig(
+            $dbType,
+            is_string($connection['host'] ?? null) ? $connection['host'] : '',
+            is_int($port) || is_string($port) ? $port : '',
+            is_string($connection['database'] ?? null) ? $connection['database'] : '',
+            is_string($connection['username'] ?? null) ? $connection['username'] : ''
+        );
+        $dbType = $databaseConfig['driver'];
 
         $this->info("Configuring database driver for: {$dbType}");
 
@@ -268,7 +372,7 @@ class InstallNntmux extends Command
         try {
             User::add(config('nntmux.admin_username'), config('nntmux.admin_password'), config('nntmux.admin_email'), 2);
             User::where('username', config('nntmux.admin_username'))->first()?->markEmailAsVerified();
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             echo $e->getMessage();
             $this->error('Unable to add admin user!');
 

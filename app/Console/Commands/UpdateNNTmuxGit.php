@@ -5,12 +5,74 @@ declare(strict_types=1);
 namespace App\Console\Commands;
 
 use App\Services\NntmuxUpdateLock;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Process;
+use Throwable;
 
 class UpdateNNTmuxGit extends Command
 {
+    private const FFI_CDEF = <<<'CDEF'
+int32_t nntmux_installer_managed_branch(const char *branch, size_t branch_len);
+CDEF;
+
+    // The end-to-end FFI benchmark must qualify before changing this default.
+    private const bool RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useRustFfi = null;
+
+    private static FFI|false|null $ffi = null;
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? self::RUST_FFI_DEFAULT;
+    }
+
+    public static function setUseRustFfi(?bool $use): void
+    {
+        self::$useRustFfi = $use;
+    }
+
+    private static function additionalFfi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('additional', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi instanceof FFI ? self::$ffi : null;
+    }
+
+    // The updater permits every nonempty branch; Git remains responsible for ref validation.
+    public static function isManagedBranch(string $branchName): bool
+    {
+        return self::usesRustFfi() ? self::isManagedBranchNative($branchName) : self::isManagedBranchPhp($branchName);
+    }
+
+    public static function isManagedBranchPhp(string $branchName): bool
+    {
+        return $branchName !== '';
+    }
+
+    public static function isManagedBranchNative(string $branchName): bool
+    {
+        try {
+            $ffi = self::additionalFfi();
+            if ($ffi !== null) {
+                // @phpstan-ignore method.notFound
+                $result = $ffi->nntmux_installer_managed_branch($branchName, strlen($branchName));
+                if ($result === 0 || $result === 1) {
+                    return $result === 1;
+                }
+            }
+        } catch (Throwable) {
+            // Retain arbitrary branch support when FFI is unavailable.
+        }
+
+        return self::isManagedBranchPhp($branchName);
+    }
+
     /**
      * The name and signature of the console command.
      *
@@ -178,7 +240,9 @@ class UpdateNNTmuxGit extends Command
             throw new \Exception('Failed to get current branch: '.$process->errorOutput());
         }
 
-        return trim($process->output());
+        $branch = trim($process->output());
+
+        return self::isManagedBranch($branch) ? $branch : '';
     }
 
     /**
