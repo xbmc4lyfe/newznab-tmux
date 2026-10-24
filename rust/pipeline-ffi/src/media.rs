@@ -10110,3 +10110,1138 @@ mod wave14_slice5_tests {
         );
     }
 }
+
+
+// ============================================================================
+// Wave 21 Slice 21.6: StatusProbes (RedisProbe, NntpProbe, QueueProbe,
+// SearchProbe) & TmuxLayoutBuilder pure-CPU helpers
+// ============================================================================
+
+const MEDIA21_MAX_SEG_LEN: usize = (isize::MAX as usize) / 8;
+const MEDIA21_MAX_FLOAT_EXACT_NS: u64 = 1u64 << 53;
+
+#[inline]
+unsafe fn media21_valid_slice<'a>(
+    ptr: *const u8,
+    len: usize,
+    max_len: usize,
+) -> Option<&'a [u8]> {
+    if ptr.is_null()
+        || len > max_len
+        || len > isize::MAX as usize
+        || (ptr as usize).checked_add(len).is_none()
+    {
+        return None;
+    }
+    if len == 0 {
+        return Some(&[]);
+    }
+    Some(unsafe { slice::from_raw_parts(ptr, len) })
+}
+
+#[inline]
+fn media21_valid_out_buf(out_buf: *mut u8, out_cap: usize) -> bool {
+    !out_buf.is_null()
+        && out_cap <= isize::MAX as usize
+        && (out_buf as usize).checked_add(out_cap).is_some()
+}
+
+#[inline]
+unsafe fn media21_write_slices(out_buf: *mut u8, out_cap: usize, parts: &[&[u8]]) -> isize {
+    if !media21_valid_out_buf(out_buf, out_cap) {
+        return -1;
+    }
+    let mut needed = 0usize;
+    for part in parts {
+        let Some(next) = needed.checked_add(part.len()) else {
+            return -1;
+        };
+        if next > isize::MAX as usize {
+            return -1;
+        }
+        needed = next;
+    }
+    if needed > out_cap {
+        return -(needed.max(4) as isize);
+    }
+    let mut offset = 0usize;
+    for part in parts {
+        if !part.is_empty() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(part.as_ptr(), out_buf.add(offset), part.len());
+            }
+            offset += part.len();
+        }
+    }
+    needed as isize
+}
+
+#[inline]
+fn media21_elapsed_ms(start_ns: i64, end_ns: i64) -> Option<i64> {
+    let diff = end_ns.checked_sub(start_ns)?;
+    if diff.unsigned_abs() > MEDIA21_MAX_FLOAT_EXACT_NS {
+        return None;
+    }
+    Some(diff / 1_000_000)
+}
+
+#[inline]
+fn media21_rtrim_php_default(mut s: &[u8]) -> &[u8] {
+    while let Some(&last) = s.last() {
+        if matches!(last, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B) {
+            s = &s[..s.len() - 1];
+        } else {
+            break;
+        }
+    }
+    s
+}
+
+/// Evaluates `RedisProbe::applicationUsesRedis` driver configuration rules.
+/// Returns `1` when Redis is used, `0` when not used, or `-1` on invalid arguments.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_redis_probe_uses_redis(
+    cache_default_ptr: *const u8,
+    cache_default_len: usize,
+    session_driver_ptr: *const u8,
+    session_driver_len: usize,
+    queue_default_ptr: *const u8,
+    queue_default_len: usize,
+    pulse_ingest_ptr: *const u8,
+    pulse_ingest_len: usize,
+    cache_store_driver_ptr: *const u8,
+    cache_store_driver_len: usize,
+    failover_stores_nul_ptr: *const u8,
+    failover_stores_nul_len: usize,
+    failover_stores_count: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if failover_stores_count > MEDIA21_MAX_SEG_LEN {
+            return -1;
+        }
+        let (
+            Some(cache_default),
+            Some(session_driver),
+            Some(queue_default),
+            Some(pulse_ingest),
+            Some(cache_store_driver),
+            Some(failover_stores_nul),
+        ) = (
+            unsafe {
+                media21_valid_slice(cache_default_ptr, cache_default_len, MEDIA21_MAX_SEG_LEN)
+            },
+            unsafe {
+                media21_valid_slice(session_driver_ptr, session_driver_len, MEDIA21_MAX_SEG_LEN)
+            },
+            unsafe {
+                media21_valid_slice(queue_default_ptr, queue_default_len, MEDIA21_MAX_SEG_LEN)
+            },
+            unsafe { media21_valid_slice(pulse_ingest_ptr, pulse_ingest_len, MEDIA21_MAX_SEG_LEN) },
+            unsafe {
+                media21_valid_slice(
+                    cache_store_driver_ptr,
+                    cache_store_driver_len,
+                    MEDIA21_MAX_SEG_LEN,
+                )
+            },
+            unsafe {
+                media21_valid_slice(
+                    failover_stores_nul_ptr,
+                    failover_stores_nul_len,
+                    MEDIA21_MAX_SEG_LEN,
+                )
+            },
+        ) else {
+            return -1;
+        };
+
+        if cache_default.contains(&0)
+            || session_driver.contains(&0)
+            || queue_default.contains(&0)
+            || pulse_ingest.contains(&0)
+            || cache_store_driver.contains(&0)
+        {
+            return -1;
+        }
+
+        if failover_stores_count == 0 {
+            if !failover_stores_nul.is_empty() {
+                return -1;
+            }
+        } else {
+            let nul_count = failover_stores_nul.iter().filter(|&&b| b == 0).count();
+            if nul_count + 1 != failover_stores_count {
+                return -1;
+            }
+        }
+
+        if cache_default.eq_ignore_ascii_case(b"redis")
+            || session_driver.eq_ignore_ascii_case(b"redis")
+            || queue_default.eq_ignore_ascii_case(b"redis")
+        {
+            return 1;
+        }
+
+        if cache_store_driver == b"failover" && failover_stores_count > 0 {
+            for sub in failover_stores_nul.split(|&b| b == 0) {
+                if sub.eq_ignore_ascii_case(b"redis") {
+                    return 1;
+                }
+            }
+        }
+
+        i32::from(pulse_ingest.eq_ignore_ascii_case(b"redis"))
+    }))
+    .unwrap_or(-1)
+}
+
+/// Evaluates `RedisProbe` ping response and latency.
+/// Writes `*out_elapsed_ms` and `*out_verdict` (`0` = Healthy, `1` = Major) and copies
+/// the reason string to `out_buf`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_redis_probe_evaluate_ping(
+    is_bool_true: u8,
+    pong_ptr: *const u8,
+    pong_len: usize,
+    start_ns: i64,
+    end_ns: i64,
+    out_elapsed_ms: *mut i64,
+    out_verdict: *mut i32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if is_bool_true > 1
+            || out_elapsed_ms.is_null()
+            || !out_elapsed_ms.is_aligned()
+            || out_verdict.is_null()
+            || !out_verdict.is_aligned()
+        {
+            return -1;
+        }
+        let Some(pong) = (unsafe { media21_valid_slice(pong_ptr, pong_len, MEDIA21_MAX_SEG_LEN) })
+        else {
+            return -1;
+        };
+        let Some(elapsed_ms) = media21_elapsed_ms(start_ns, end_ns) else {
+            return -1;
+        };
+
+        let is_ok = is_bool_true == 1 || pong == b"+PONG" || pong.eq_ignore_ascii_case(b"PONG");
+        let (verdict, reason): (i32, &[u8]) = if is_ok {
+            (0, b"Connected")
+        } else {
+            (1, b"Redis ping returned unexpected response")
+        };
+
+        let written = unsafe { media21_write_slices(out_buf, out_cap, &[reason]) };
+        if written < 0 {
+            return written;
+        }
+        unsafe {
+            *out_elapsed_ms = elapsed_ms;
+            *out_verdict = verdict;
+        }
+        written
+    }))
+    .unwrap_or(-1)
+}
+
+/// Formats a failure `ProbeResult` reason for `RedisProbe` (`0`), `NntpProbe` (`1`),
+/// `QueueProbe` (`2`), or `SearchProbe` (`3`) using `Str::limit($msg, 120)` rules.
+/// Returns `-2` when `error_ptr` contains non-ASCII bytes so PHP `mb_strwidth` handles it.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_status_probe_format_failure(
+    probe_kind: u8,
+    error_ptr: *const u8,
+    error_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let prefix: &[u8] = match probe_kind {
+            0 => b"Redis unreachable: ",
+            1 => b"NNTP probe failed: ",
+            2 => b"Queue probe failed: ",
+            3 => b"Search check failed: ",
+            _ => return -1,
+        };
+        if !media21_valid_out_buf(out_buf, out_cap) {
+            return -1;
+        }
+        let Some(error) =
+            (unsafe { media21_valid_slice(error_ptr, error_len, MEDIA21_MAX_SEG_LEN) })
+        else {
+            return -1;
+        };
+        if !error.is_ascii() {
+            return -2;
+        }
+
+        let (body, suffix): (&[u8], &[u8]) = if error.len() <= 120 {
+            (error, b"")
+        } else {
+            (media21_rtrim_php_default(&error[..120]), b"...")
+        };
+
+        unsafe { media21_write_slices(out_buf, out_cap, &[prefix, body, suffix]) }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Classifies a single `NntpProbe::probeConnection` attempt and computes elapsed ms.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nntp_probe_classify_connection(
+    is_success: u8,
+    is_error_obj: u8,
+    error_msg_ptr: *const u8,
+    error_msg_len: usize,
+    start_ns: i64,
+    end_ns: i64,
+    out_elapsed_ms: *mut i64,
+    out_ok: *mut i32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if is_success > 1
+            || is_error_obj > 1
+            || out_elapsed_ms.is_null()
+            || !out_elapsed_ms.is_aligned()
+            || out_ok.is_null()
+            || !out_ok.is_aligned()
+        {
+            return -1;
+        }
+        let Some(error_msg) =
+            (unsafe { media21_valid_slice(error_msg_ptr, error_msg_len, MEDIA21_MAX_SEG_LEN) })
+        else {
+            return -1;
+        };
+        let Some(elapsed_ms) = media21_elapsed_ms(start_ns, end_ns) else {
+            return -1;
+        };
+
+        let (ok_val, reason): (i32, &[u8]) = if is_success == 1 {
+            (1, b"Connected")
+        } else if is_error_obj == 1 {
+            (0, error_msg)
+        } else {
+            (0, b"Unknown connection result")
+        };
+
+        let written = unsafe { media21_write_slices(out_buf, out_cap, &[reason]) };
+        if written < 0 {
+            return written;
+        }
+        unsafe {
+            *out_elapsed_ms = elapsed_ms;
+            *out_ok = ok_val;
+        }
+        written
+    }))
+    .unwrap_or(-1)
+}
+
+/// Evaluates primary and optional alternate NNTP connection probe results for `NntpProbe`.
+/// Writes `*out_response_ms` and `*out_verdict` (`0` = Healthy, `1` = Major, `2` = Critical)
+/// and writes the formatted reason to `out_buf`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nntp_probe_evaluate(
+    primary_ok: u8,
+    primary_elapsed_ms: i64,
+    primary_reason_ptr: *const u8,
+    primary_reason_len: usize,
+    check_alternate: u8,
+    alternate_ok: u8,
+    alternate_reason_ptr: *const u8,
+    alternate_reason_len: usize,
+    out_response_ms: *mut i64,
+    out_verdict: *mut i32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if primary_ok > 1
+            || check_alternate > 1
+            || alternate_ok > 1
+            || out_response_ms.is_null()
+            || !out_response_ms.is_aligned()
+            || out_verdict.is_null()
+            || !out_verdict.is_aligned()
+        {
+            return -1;
+        }
+        let (Some(primary_reason), Some(alternate_reason)) = (
+            unsafe {
+                media21_valid_slice(primary_reason_ptr, primary_reason_len, MEDIA21_MAX_SEG_LEN)
+            },
+            unsafe {
+                media21_valid_slice(
+                    alternate_reason_ptr,
+                    alternate_reason_len,
+                    MEDIA21_MAX_SEG_LEN,
+                )
+            },
+        ) else {
+            return -1;
+        };
+
+        let (verdict, response_ms, prefix, suffix): (i32, i64, &[u8], &[u8]) = if primary_ok == 0 {
+            (2, 0, b"Primary NNTP failed: ", primary_reason)
+        } else if check_alternate == 1 && alternate_ok == 0 {
+            (1, 0, b"Alternate NNTP failed: ", alternate_reason)
+        } else if check_alternate == 1 {
+            (0, primary_elapsed_ms, b"Primary and alternate NNTP connected", b"")
+        } else {
+            (0, primary_elapsed_ms, b"Primary NNTP connected", b"")
+        };
+
+        let written = unsafe { media21_write_slices(out_buf, out_cap, &[prefix, suffix]) };
+        if written < 0 {
+            return written;
+        }
+        unsafe {
+            *out_response_ms = response_ms;
+            *out_verdict = verdict;
+        }
+        written
+    }))
+    .unwrap_or(-1)
+}
+
+/// Evaluates `QueueProbe` connection name and latency.
+/// Writes `*out_elapsed_ms` and `*out_is_sync` (`1` when `connection == "sync"`, `0` otherwise)
+/// and writes the formatted reason to `out_buf`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_queue_probe_evaluate(
+    connection_ptr: *const u8,
+    connection_len: usize,
+    start_ns: i64,
+    end_ns: i64,
+    out_elapsed_ms: *mut i64,
+    out_is_sync: *mut i32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if out_elapsed_ms.is_null()
+            || !out_elapsed_ms.is_aligned()
+            || out_is_sync.is_null()
+            || !out_is_sync.is_aligned()
+        {
+            return -1;
+        }
+        let Some(connection) =
+            (unsafe { media21_valid_slice(connection_ptr, connection_len, MEDIA21_MAX_SEG_LEN) })
+        else {
+            return -1;
+        };
+        let Some(elapsed_ms) = media21_elapsed_ms(start_ns, end_ns) else {
+            return -1;
+        };
+
+        let is_sync = i32::from(connection == b"sync");
+        let written = if is_sync == 1 {
+            unsafe { media21_write_slices(out_buf, out_cap, &[b"Queue uses sync driver"]) }
+        } else {
+            unsafe {
+                media21_write_slices(
+                    out_buf,
+                    out_cap,
+                    &[b"Queue \"", connection, b"\" reachable"],
+                )
+            }
+        };
+        if written < 0 {
+            return written;
+        }
+        unsafe {
+            *out_elapsed_ms = elapsed_ms;
+            *out_is_sync = is_sync;
+        }
+        written
+    }))
+    .unwrap_or(-1)
+}
+
+/// Evaluates `SearchProbe` availability and latency.
+/// Writes `*out_elapsed_ms` and `*out_verdict` (`0` = Healthy, `2` = Critical)
+/// and writes the formatted reason to `out_buf`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_search_probe_evaluate(
+    available: u8,
+    driver_ptr: *const u8,
+    driver_len: usize,
+    start_ns: i64,
+    end_ns: i64,
+    out_elapsed_ms: *mut i64,
+    out_verdict: *mut i32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if available > 1
+            || out_elapsed_ms.is_null()
+            || !out_elapsed_ms.is_aligned()
+            || out_verdict.is_null()
+            || !out_verdict.is_aligned()
+        {
+            return -1;
+        }
+        let Some(driver) =
+            (unsafe { media21_valid_slice(driver_ptr, driver_len, MEDIA21_MAX_SEG_LEN) })
+        else {
+            return -1;
+        };
+        let Some(elapsed_ms) = media21_elapsed_ms(start_ns, end_ns) else {
+            return -1;
+        };
+
+        let (verdict, suffix): (i32, &[u8]) = if available == 1 {
+            (0, b"\" available")
+        } else {
+            (2, b"\" unavailable")
+        };
+
+        let written =
+            unsafe { media21_write_slices(out_buf, out_cap, &[b"Search driver \"", driver, suffix]) };
+        if written < 0 {
+            return written;
+        }
+        unsafe {
+            *out_elapsed_ms = elapsed_ms;
+            *out_verdict = verdict;
+        }
+        written
+    }))
+    .unwrap_or(-1)
+}
+
+#[inline]
+fn media21_pane_display_name(name: &[u8]) -> &[u8] {
+    match name {
+        b"Monitor" => b"\xF3\xB0\x8D\xB9 Monitor",
+        b"update_binaries" => b" Binaries",
+        b"backfill" => b"\xF3\xB0\x91\x93 Backfill",
+        b"update_releases" => b" Releases",
+        b"sequential" => b"\xF3\xB0\x92\xBF Sequential",
+        b"fixReleaseNames" => b"\xF3\xB0\xAF\x83 Fix Names",
+        b"removeCrapReleases" => b"\xF3\xB0\x86\xB4 Remove Crap",
+        b"postprocessing_additional" => b" Additional",
+        b"postprocessing_tv" => b"\xF3\xB0\x9F\xB4 TV/Anime",
+        b"postprocessing_amazon" => b" Metadata",
+        b"postprocessing_movies" => b" Movies",
+        b"scrapeIRC" => b"\xF3\xB0\xBB\x9E IRC Scraper",
+        b"htop" => b" htop",
+        b"nmon" => b"\xF3\xB0\xA8\x87 nmon",
+        b"vnstat" => b"\xF3\xB0\x9B\xB3 vnstat",
+        b"tcptrack" => b"\xF3\xB1\x98\x96 tcptrack",
+        b"bwm-ng" => b"\xF3\xB0\xBE\x86 bwm-ng",
+        b"mytop" => b" mytop",
+        b"redis" => b" Redis",
+        b"bash" => b" Console",
+        other => other,
+    }
+}
+
+/// Resolves `TmuxLayoutBuilder::getPaneDisplayName` for default Nerd Font icons.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_tmux_layout_pane_display_name(
+    name_ptr: *const u8,
+    name_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(name) = (unsafe { media21_valid_slice(name_ptr, name_len, MEDIA21_MAX_SEG_LEN) })
+        else {
+            return -1;
+        };
+        let display = media21_pane_display_name(name);
+        unsafe { media21_write_slices(out_buf, out_cap, &[display]) }
+    }))
+    .unwrap_or(-1)
+}
+
+const TMUX_CORE_STEPS_FULL: &[u8] = concat!(
+    "session\00\0\0\00\0monitor\0Monitor\0\u{F0379} Monitor\0",
+    "split_h\00\0\0monitor\067\0binaries\0update_binaries\0 Binaries\0",
+    "split_v\00\0\0binaries\067\0backfill\0backfill\0\u{F0453} Backfill\0",
+    "split_v\00\0\0backfill\050\0releases\0update_releases\0 Releases\0",
+    "window\01\0 Utils\0\00\0fix_names\0fixReleaseNames\0\u{F0BC3} Fix Names\0",
+    "split_h\01\0\0fix_names\050\0remove_crap\0removeCrapReleases\0\u{F01B4} Remove Crap\0",
+    "window\02\0 Post\0\00\0post_additional\0postprocessing_additional\0 Additional\0",
+    "split_h\02\0\0post_additional\050\0post_movies\0postprocessing_movies\0 Movies\0",
+    "split_v\02\0\0post_additional\067\0post_tv\0postprocessing_tv\0\u{F07F4} TV/Anime\0",
+    "split_v\02\0\0post_tv\050\0post_metadata\0postprocessing_amazon\0 Metadata\0",
+    "window\03\0\u{F0EDE} IRC\0\00\0irc_scraper\0scrapeIRC\0\u{F0EDE} IRC Scraper"
+)
+.as_bytes();
+
+const TMUX_CORE_STEPS_BASIC: &[u8] = concat!(
+    "session\00\0\0\00\0monitor\0Monitor\0\u{F0379} Monitor\0",
+    "split_h\00\0\0monitor\067\0releases\0update_releases\0 Releases\0",
+    "window\01\0 Utils\0\00\0fix_names\0fixReleaseNames\0\u{F0BC3} Fix Names\0",
+    "split_h\01\0\0fix_names\050\0remove_crap\0removeCrapReleases\0\u{F01B4} Remove Crap\0",
+    "window\02\0 Post\0\00\0post_additional\0postprocessing_additional\0 Additional\0",
+    "split_h\02\0\0post_additional\050\0post_movies\0postprocessing_movies\0 Movies\0",
+    "split_v\02\0\0post_additional\067\0post_tv\0postprocessing_tv\0\u{F07F4} TV/Anime\0",
+    "split_v\02\0\0post_tv\050\0post_metadata\0postprocessing_amazon\0 Metadata\0",
+    "window\03\0\u{F0EDE} IRC\0\00\0irc_scraper\0scrapeIRC\0\u{F0EDE} IRC Scraper"
+)
+.as_bytes();
+
+const TMUX_CORE_STEPS_STRIPPED: &[u8] = concat!(
+    "session\00\0\0\00\0monitor\0Monitor\0\u{F0379} Monitor\0",
+    "split_h\00\0\0monitor\067\0sequential\0sequential\0\u{F04BF} Sequential\0",
+    "window\01\0 Utils\0\00\0fix_names\0fixReleaseNames\0\u{F0BC3} Fix Names\0",
+    "split_h\01\0\0fix_names\050\0post_metadata\0postprocessing_amazon\0 Metadata\0",
+    "window\03\0\u{F0EDE} IRC\0\00\0irc_scraper\0scrapeIRC\0\u{F0EDE} IRC Scraper"
+)
+.as_bytes();
+
+/// Plans the core window/pane creation and split steps for `TmuxLayoutBuilder`
+/// (`1` = Basic, `2` = Stripped, any other value = Full).
+/// Writes step count to `*out_step_count` and NUL-separated 8-tuples
+/// (`op \0 window \0 window_name \0 target_role \0 percentage \0 role \0 pane_key \0 title`) to `out_buf`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_tmux_layout_plan_core_steps_nul(
+    sequential_mode: i32,
+    out_step_count: *mut i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if out_step_count.is_null() || !out_step_count.is_aligned() {
+            return -1;
+        }
+        let (count, payload): (i64, &[u8]) = match sequential_mode {
+            1 => (9, TMUX_CORE_STEPS_BASIC),
+            2 => (5, TMUX_CORE_STEPS_STRIPPED),
+            _ => (11, TMUX_CORE_STEPS_FULL),
+        };
+        let written = unsafe { media21_write_slices(out_buf, out_cap, &[payload]) };
+        if written < 0 {
+            return written;
+        }
+        unsafe {
+            *out_step_count = count;
+        }
+        written
+    }))
+    .unwrap_or(-1)
+}
+
+/// Formats the respawn command string for optional monitoring windows in `TmuxLayoutBuilder`.
+/// Returns `-2` when `tool` is not a recognized optional tool identifier.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_tmux_layout_format_tool_command(
+    tool_ptr: *const u8,
+    tool_len: usize,
+    args_ptr: *const u8,
+    args_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !media21_valid_out_buf(out_buf, out_cap) {
+            return -1;
+        }
+        let (Some(tool), Some(args)) = (
+            unsafe { media21_valid_slice(tool_ptr, tool_len, MEDIA21_MAX_SEG_LEN) },
+            unsafe { media21_valid_slice(args_ptr, args_len, MEDIA21_MAX_SEG_LEN) },
+        ) else {
+            return -1;
+        };
+
+        match tool {
+            b"htop" => unsafe { media21_write_slices(out_buf, out_cap, &[b"htop"]) },
+            b"nmon" => unsafe { media21_write_slices(out_buf, out_cap, &[b"nmon -t"]) },
+            b"vnstat" => unsafe {
+                media21_write_slices(out_buf, out_cap, &[b"watch -n10 'vnstat ", args, b"'"])
+            },
+            b"tcptrack" => unsafe {
+                media21_write_slices(out_buf, out_cap, &[b"tcptrack ", args])
+            },
+            b"bwm-ng" => unsafe { media21_write_slices(out_buf, out_cap, &[b"bwm-ng"]) },
+            b"mytop" => unsafe { media21_write_slices(out_buf, out_cap, &[b"mytop -u"]) },
+            b"bash" => unsafe { media21_write_slices(out_buf, out_cap, &[b"bash -i"]) },
+            _ => -2,
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Plans the Redis monitor pane command and environment for `TmuxLayoutBuilder::createOptionalWindows`.
+/// Writes `*out_mode`:
+/// - `0`: shell string (`watch -n... 'redis-cli ...'`), empty env
+/// - `1`: sail shell string (`{sail} artisan redis:monitor --refresh=...`), empty env
+/// - `2`: 4-element NUL-separated argv (`php\0artisan\0redis:monitor\0--refresh=...`), empty env
+/// - `3`: 5-element NUL-separated payload (`php\0artisan\0redis:monitor\0--refresh=...\0{resolved_host}`) where element 5 is `REDIS_HOST`
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_tmux_layout_plan_redis_command_nul(
+    redis_args_ptr: *const u8,
+    redis_args_len: usize,
+    has_redis_cli: u8,
+    redis_host_ptr: *const u8,
+    redis_host_len: usize,
+    redis_port_ptr: *const u8,
+    redis_port_len: usize,
+    refresh_interval: i64,
+    use_sail: u8,
+    override_host: u8,
+    resolved_host_ptr: *const u8,
+    resolved_host_len: usize,
+    php_binary_ptr: *const u8,
+    php_binary_len: usize,
+    artisan_ptr: *const u8,
+    artisan_len: usize,
+    sail_ptr: *const u8,
+    sail_len: usize,
+    out_mode: *mut i32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if has_redis_cli > 1
+            || use_sail > 1
+            || override_host > 1
+            || out_mode.is_null()
+            || !out_mode.is_aligned()
+        {
+            return -1;
+        }
+        let (
+            Some(redis_args),
+            Some(redis_host),
+            Some(redis_port),
+            Some(resolved_host),
+            Some(php_binary),
+            Some(artisan),
+            Some(sail),
+        ) = (
+            unsafe { media21_valid_slice(redis_args_ptr, redis_args_len, MEDIA21_MAX_SEG_LEN) },
+            unsafe { media21_valid_slice(redis_host_ptr, redis_host_len, MEDIA21_MAX_SEG_LEN) },
+            unsafe { media21_valid_slice(redis_port_ptr, redis_port_len, MEDIA21_MAX_SEG_LEN) },
+            unsafe {
+                media21_valid_slice(resolved_host_ptr, resolved_host_len, MEDIA21_MAX_SEG_LEN)
+            },
+            unsafe { media21_valid_slice(php_binary_ptr, php_binary_len, MEDIA21_MAX_SEG_LEN) },
+            unsafe { media21_valid_slice(artisan_ptr, artisan_len, MEDIA21_MAX_SEG_LEN) },
+            unsafe { media21_valid_slice(sail_ptr, sail_len, MEDIA21_MAX_SEG_LEN) },
+        ) else {
+            return -1;
+        };
+
+        if redis_args.contains(&0)
+            || redis_host.contains(&0)
+            || redis_port.contains(&0)
+            || resolved_host.contains(&0)
+            || php_binary.contains(&0)
+            || artisan.contains(&0)
+            || sail.contains(&0)
+        {
+            return -1;
+        }
+
+        let interval_str = refresh_interval.to_string();
+        let interval_bytes = interval_str.as_bytes();
+
+        let has_custom_args =
+            !redis_args.is_empty() && redis_args != b"0" && redis_args != b"NULL";
+
+        let (mode, written) = if has_custom_args && has_redis_cli == 1 {
+            (
+                0,
+                unsafe {
+                    media21_write_slices(
+                        out_buf,
+                        out_cap,
+                        &[
+                            b"watch -n",
+                            interval_bytes,
+                            b" -c 'redis-cli -h ",
+                            redis_host,
+                            b" -p ",
+                            redis_port,
+                            b" ",
+                            redis_args,
+                            b"'",
+                        ],
+                    )
+                },
+            )
+        } else if use_sail == 1 {
+            (
+                1,
+                unsafe {
+                    media21_write_slices(
+                        out_buf,
+                        out_cap,
+                        &[sail, b" artisan redis:monitor --refresh=", interval_bytes],
+                    )
+                },
+            )
+        } else if override_host == 1 {
+            (
+                3,
+                unsafe {
+                    media21_write_slices(
+                        out_buf,
+                        out_cap,
+                        &[
+                            php_binary,
+                            b"\0",
+                            artisan,
+                            b"\0redis:monitor\0--refresh=",
+                            interval_bytes,
+                            b"\0",
+                            resolved_host,
+                        ],
+                    )
+                },
+            )
+        } else {
+            (
+                2,
+                unsafe {
+                    media21_write_slices(
+                        out_buf,
+                        out_cap,
+                        &[
+                            php_binary,
+                            b"\0",
+                            artisan,
+                            b"\0redis:monitor\0--refresh=",
+                            interval_bytes,
+                        ],
+                    )
+                },
+            )
+        };
+
+        if written < 0 {
+            return written;
+        }
+        unsafe {
+            *out_mode = mode;
+        }
+        written
+    }))
+    .unwrap_or(-1)
+}
+
+/// Formats `TmuxLayoutBuilder::requireSuccess` error messages:
+/// `"Unable to {operation}."` or `"Unable to {operation}: {error}."`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_tmux_layout_format_operation_error(
+    operation_ptr: *const u8,
+    operation_len: usize,
+    error_ptr: *const u8,
+    error_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (Some(operation), Some(error)) = (
+            unsafe { media21_valid_slice(operation_ptr, operation_len, MEDIA21_MAX_SEG_LEN) },
+            unsafe { media21_valid_slice(error_ptr, error_len, MEDIA21_MAX_SEG_LEN) },
+        ) else {
+            return -1;
+        };
+        if error.is_empty() {
+            unsafe { media21_write_slices(out_buf, out_cap, &[b"Unable to ", operation, b"."]) }
+        } else {
+            unsafe {
+                media21_write_slices(
+                    out_buf,
+                    out_cap,
+                    &[b"Unable to ", operation, b": ", error, b"."],
+                )
+            }
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod wave21_slice6_tests {
+    use super::*;
+
+    #[test]
+    fn status_probes_redis_nntp_queue_search_and_failure_formatting() {
+        assert_eq!(
+            unsafe {
+                nntmux_redis_probe_uses_redis(
+                    b"REDIS".as_ptr(),
+                    5,
+                    b"file".as_ptr(),
+                    4,
+                    b"sync".as_ptr(),
+                    4,
+                    b"storage".as_ptr(),
+                    7,
+                    b"".as_ptr(),
+                    0,
+                    b"".as_ptr(),
+                    0,
+                    0,
+                )
+            },
+            1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_redis_probe_uses_redis(
+                    b"failover".as_ptr(),
+                    8,
+                    b"file".as_ptr(),
+                    4,
+                    b"sync".as_ptr(),
+                    4,
+                    b"storage".as_ptr(),
+                    7,
+                    b"failover".as_ptr(),
+                    8,
+                    b"array\0Redis".as_ptr(),
+                    11,
+                    2,
+                )
+            },
+            1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_redis_probe_uses_redis(
+                    b"file".as_ptr(),
+                    4,
+                    b"cookie".as_ptr(),
+                    6,
+                    b"sync".as_ptr(),
+                    4,
+                    b"database".as_ptr(),
+                    8,
+                    b"file".as_ptr(),
+                    4,
+                    b"".as_ptr(),
+                    0,
+                    0,
+                )
+            },
+            0
+        );
+
+        let mut buf = [0u8; 256];
+        let mut elapsed = -1i64;
+        let mut verdict = -1i32;
+        let n_ping = unsafe {
+            nntmux_redis_probe_evaluate_ping(
+                0,
+                b"+PONG".as_ptr(),
+                5,
+                1_000_000_000,
+                1_004_500_000,
+                &mut elapsed,
+                &mut verdict,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(&buf[..n_ping as usize], b"Connected");
+        assert_eq!(elapsed, 4);
+        assert_eq!(verdict, 0);
+
+        // Verify insufficient buffer does not mutate out params or write partial output
+        buf.fill(0xAA);
+        elapsed = 77;
+        verdict = 88;
+        let rc_small = unsafe {
+            nntmux_redis_probe_evaluate_ping(
+                0,
+                b"BAD".as_ptr(),
+                3,
+                1_000_000_000,
+                1_010_000_000,
+                &mut elapsed,
+                &mut verdict,
+                buf.as_mut_ptr(),
+                4,
+            )
+        };
+        assert_eq!(rc_small, -39);
+        assert_eq!(elapsed, 77);
+        assert_eq!(verdict, 88);
+        assert_eq!(&buf[..4], &[0xAA; 4]);
+
+        let long_err = [b'x'; 130];
+        let nf = unsafe {
+            nntmux_status_probe_format_failure(
+                0,
+                long_err.as_ptr(),
+                long_err.len(),
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(nf, 19 + 120 + 3);
+        assert!(buf[..nf as usize].starts_with(b"Redis unreachable: "));
+        assert!(buf[..nf as usize].ends_with(b"..."));
+
+        let mut ok_flag = -1i32;
+        let nc = unsafe {
+            nntmux_nntp_probe_classify_connection(
+                0,
+                1,
+                b"502 Auth failed".as_ptr(),
+                15,
+                2_000_000_000,
+                2_015_000_000,
+                &mut elapsed,
+                &mut ok_flag,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(&buf[..nc as usize], b"502 Auth failed");
+        assert_eq!(elapsed, 15);
+        assert_eq!(ok_flag, 0);
+
+        let mut resp_ms = -1i64;
+        let nn = unsafe {
+            nntmux_nntp_probe_evaluate(
+                1,
+                12,
+                b"Connected".as_ptr(),
+                9,
+                1,
+                0,
+                b"Timeout".as_ptr(),
+                7,
+                &mut resp_ms,
+                &mut verdict,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(&buf[..nn as usize], b"Alternate NNTP failed: Timeout");
+        assert_eq!(resp_ms, 0);
+        assert_eq!(verdict, 1);
+
+        let mut is_sync = -1i32;
+        let nq = unsafe {
+            nntmux_queue_probe_evaluate(
+                b"redis".as_ptr(),
+                5,
+                1_000_000_000,
+                1_002_000_000,
+                &mut elapsed,
+                &mut is_sync,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(&buf[..nq as usize], b"Queue \"redis\" reachable");
+        assert_eq!(elapsed, 2);
+        assert_eq!(is_sync, 0);
+
+        let ns = unsafe {
+            nntmux_search_probe_evaluate(
+                0,
+                b"manticore".as_ptr(),
+                9,
+                1_000_000_000,
+                1_008_000_000,
+                &mut elapsed,
+                &mut verdict,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(&buf[..ns as usize], b"Search driver \"manticore\" unavailable");
+        assert_eq!(elapsed, 8);
+        assert_eq!(verdict, 2);
+    }
+
+    #[test]
+    fn tmux_layout_builder_icons_steps_and_commands() {
+        let mut buf = [0u8; 2048];
+        let nd = unsafe {
+            nntmux_tmux_layout_pane_display_name(
+                b"Monitor".as_ptr(),
+                7,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(&buf[..nd as usize], b"\xF3\xB0\x8D\xB9 Monitor");
+
+        let mut step_count = 0i64;
+        let ns = unsafe {
+            nntmux_tmux_layout_plan_core_steps_nul(
+                0,
+                &mut step_count,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert!(ns > 0);
+        assert_eq!(step_count, 11);
+
+        let nt = unsafe {
+            nntmux_tmux_layout_format_tool_command(
+                b"vnstat".as_ptr(),
+                6,
+                b"-i eth0".as_ptr(),
+                7,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(&buf[..nt as usize], b"watch -n10 'vnstat -i eth0'");
+
+        let mut mode = -1i32;
+        let nr = unsafe {
+            nntmux_tmux_layout_plan_redis_command_nul(
+                b"".as_ptr(),
+                0,
+                1,
+                b"redis".as_ptr(),
+                5,
+                b"6379".as_ptr(),
+                4,
+                30,
+                0,
+                1,
+                b"127.0.0.1".as_ptr(),
+                9,
+                b"/usr/bin/php".as_ptr(),
+                12,
+                b"/app/artisan".as_ptr(),
+                12,
+                b"/app/sail".as_ptr(),
+                9,
+                &mut mode,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(mode, 3);
+        assert_eq!(
+            &buf[..nr as usize],
+            b"/usr/bin/php\0/app/artisan\0redis:monitor\0--refresh=30\0127.0.0.1"
+        );
+
+        let ne = unsafe {
+            nntmux_tmux_layout_format_operation_error(
+                b"retain monitor pane".as_ptr(),
+                19,
+                b"pane dead".as_ptr(),
+                9,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(&buf[..ne as usize], b"Unable to retain monitor pane: pane dead.");
+    }
+}
