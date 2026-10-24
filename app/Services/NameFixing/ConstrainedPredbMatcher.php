@@ -4,6 +4,11 @@ declare(strict_types=1);
 
 namespace App\Services\NameFixing;
 
+use App\Support\RustPipelineLibrary;
+use FFI;
+use FFI\CData;
+use Throwable;
+
 /**
  * Bounded identity suggestions; partial evidence never authorizes a PreDB link.
  *
@@ -11,8 +16,127 @@ namespace App\Services\NameFixing;
  */
 final class ConstrainedPredbMatcher
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_constrained_predb_parse(const char *input, size_t input_len, char *out_buf, size_t out_cap);
+        int32_t nntmux_constrained_predb_suggest_batch(const char *query, size_t query_len, const char *hits_nul, size_t hits_len, size_t hit_count, double *out_f64);
+        C;
+
+    private static FFI|false|null $ffi = null;
+
+    private static ?CData $outF64 = null;
+
+    private static bool $useRustFfi = true;
+
+    public function __construct(
+        private readonly bool $useNative = true,
+    ) {}
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
     /** @return Parsed|null */
     public function parse(string $name): ?array
+    {
+        if ($this->useNative && self::$useRustFfi) {
+            $supported = false;
+            $native = $this->parseNative($name, $supported);
+            if ($supported) {
+                return $native;
+            }
+        }
+
+        return $this->parsePhp($name);
+    }
+
+    /**
+     * @param-out bool $supported
+     *
+     * @return Parsed|null
+     */
+    public function parseNative(string $name, bool &$supported = false): ?array
+    {
+        $supported = false;
+        if (! $this->useNative || ! self::$useRustFfi) {
+            return null;
+        }
+        $len = \strlen($name);
+        if ($len === 0 || $len > 512) {
+            $supported = true;
+
+            return null;
+        }
+        $ffi = self::resolveFfi();
+        if ($ffi === null) {
+            return null;
+        }
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, 1024, $cap);
+        if ($scratch === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_constrained_predb_parse($name, $len, $scratch, $cap);
+            if (! \is_int($written)) {
+                return null;
+            }
+            if ($written < -2) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_constrained_predb_parse($name, $len, $scratch, $cap);
+                if (! \is_int($written)) {
+                    return null;
+                }
+            }
+            if ($written === -2) {
+                $supported = true;
+
+                return null;
+            }
+            if ($written < 0) {
+                return null;
+            }
+            $supported = true;
+            $raw = $written === 0 ? '' : FFI::string($scratch, $written);
+            $parts = \explode("\n", $raw, 3);
+            $titleLine = $parts[0] ?? '';
+            $markersLine = $parts[1] ?? '';
+            $suffixLine = $parts[2] ?? '';
+
+            $title = $titleLine === ''
+                ? []
+                : ($titleLine === "\x01" ? [''] : \explode(' ', $titleLine));
+            $markers = [];
+            if ($markersLine !== '') {
+                foreach (\explode("\t", $markersLine) as $pair) {
+                    $kv = \explode(':', $pair, 2);
+                    if (isset($kv[1])) {
+                        $markers[$kv[0]] = $kv[1];
+                    }
+                }
+            }
+            $suffix = $suffixLine === '' ? [] : \explode(' ', $suffixLine);
+
+            return ['title' => $title, 'markers' => $markers, 'suffix' => $suffix];
+        } catch (Throwable) {
+            $supported = false;
+
+            return null;
+        }
+    }
+
+    /** @return Parsed|null */
+    public function parsePhp(string $name): ?array
     {
         if (strlen($name) > 512 || ! mb_check_encoding($name, 'UTF-8')) {
             return null;
@@ -78,10 +202,37 @@ final class ConstrainedPredbMatcher
      */
     public function suggest(string $query, array $hits): array
     {
+        if (\count($hits) > 50) {
+            return ['id' => null, 'reason' => 'candidate_overflow'];
+        }
+        if ($this->useNative && self::$useRustFfi) {
+            $native = $this->suggestNative($query, $hits);
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
+        return $this->suggestPhp($query, $hits);
+    }
+
+    /**
+     * @param  list<array{id: int, title: string}>  $hits
+     * @return array<string, mixed>|null
+     */
+    public function suggestNative(string $query, array $hits): ?array
+    {
+        return $this->evaluateBatchNative($query, $hits, requireCompleteEvidence: false);
+    }
+
+    /** @param list<array{id: int, title: string}> $hits
+     * @return array<string, mixed>
+     */
+    public function suggestPhp(string $query, array $hits): array
+    {
         if (count($hits) > 50) {
             return ['id' => null, 'reason' => 'candidate_overflow'];
         }
-        $q = $this->parse($query);
+        $q = $this->parsePhp($query);
         if ($q === null || count($q['title']) < 2 || strlen(implode('', $q['title'])) < 9) {
             return ['id' => null, 'reason' => 'insufficient_title'];
         }
@@ -93,7 +244,7 @@ final class ConstrainedPredbMatcher
             if ((int) ($hit['id'] ?? 0) <= 0 || ! is_string($hit['title'] ?? null)) {
                 continue;
             }
-            $c = $this->parse($hit['title']);
+            $c = $this->parsePhp($hit['title']);
             if ($c === null || count($c['title']) !== count($q['title'])) {
                 continue;
             }
@@ -155,12 +306,40 @@ final class ConstrainedPredbMatcher
      */
     public function completeEvidence(string $query, array $hits): array
     {
-        $result = $this->suggest($query, $hits);
+        if (\count($hits) > 50) {
+            return ['id' => null, 'reason' => 'candidate_overflow'];
+        }
+        if ($this->useNative && self::$useRustFfi) {
+            $native = $this->completeEvidenceNative($query, $hits);
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
+        return $this->completeEvidencePhp($query, $hits);
+    }
+
+    /**
+     * @param  list<array{id: int, title: string}>  $hits
+     * @return array<string, mixed>|null
+     */
+    public function completeEvidenceNative(string $query, array $hits): ?array
+    {
+        return $this->evaluateBatchNative($query, $hits, requireCompleteEvidence: true);
+    }
+
+    /**
+     * @param  list<array{id: int, title: string}>  $hits
+     * @return array<string, mixed>
+     */
+    public function completeEvidencePhp(string $query, array $hits): array
+    {
+        $result = $this->suggestPhp($query, $hits);
         if ($result['id'] === null) {
             return $result;
         }
-        $q = $this->parse($query);
-        $c = $this->parse($result['title']);
+        $q = $this->parsePhp($query);
+        $c = $this->parsePhp($result['title']);
         if ($q === null || $c === null) {
             return ['id' => null, 'reason' => 'invalid_identity'];
         }
@@ -171,5 +350,144 @@ final class ConstrainedPredbMatcher
         }
 
         return $result;
+    }
+
+    /**
+     * @param  list<array{id: int, title: string}>  $hits
+     * @return array<string, mixed>|null
+     */
+    private function evaluateBatchNative(string $query, array $hits, bool $requireCompleteEvidence): ?array
+    {
+        if (! $this->useNative || ! self::$useRustFfi) {
+            return null;
+        }
+        if (\count($hits) > 50) {
+            return ['id' => null, 'reason' => 'candidate_overflow'];
+        }
+        $qLen = \strlen($query);
+        if ($qLen === 0 || $qLen > 512) {
+            return ['id' => null, 'reason' => 'insufficient_title'];
+        }
+        $ffi = self::resolveFfi();
+        $out = self::$outF64;
+        if ($ffi === null || $out === null) {
+            return null;
+        }
+
+        $validHits = [];
+        $parts = [];
+        foreach ($hits as $hit) {
+            if (! \is_array($hit)) {
+                continue;
+            }
+            $id = (int) ($hit['id'] ?? 0);
+            $title = $hit['title'] ?? null;
+            if ($id <= 0 || ! \is_string($title)) {
+                continue;
+            }
+            $validHits[] = ['id' => $id, 'title' => $title];
+            $parts[] = $id."\0".$title;
+        }
+
+        $validCount = \count($validHits);
+        $packed = $validCount === 0 ? '' : \implode("\0", $parts);
+
+        try {
+            // @phpstan-ignore method.notFound
+            $status = $ffi->nntmux_constrained_predb_suggest_batch(
+                $query,
+                $qLen,
+                $packed,
+                \strlen($packed),
+                $validCount,
+                $out,
+            );
+            if (! \is_int($status) || $status < 0) {
+                return null;
+            }
+            if ($status === 0) {
+                return ['id' => null, 'reason' => 'candidate_overflow'];
+            }
+            if ($status === 1) {
+                return ['id' => null, 'reason' => 'insufficient_title'];
+            }
+            if ($status === 2) {
+                return ['id' => null, 'reason' => 'missing_identity_anchor'];
+            }
+            if ($status === 3) {
+                return ['id' => null, 'reason' => 'constraints_or_score'];
+            }
+            if ($status === 4) {
+                $i0 = (int) $out[0];
+                $i1 = (int) $out[1];
+                if (! isset($validHits[$i0], $validHits[$i1])) {
+                    return null;
+                }
+
+                return [
+                    'id' => null,
+                    'reason' => 'ambiguous',
+                    'ranked' => [
+                        [
+                            'id' => $validHits[$i0]['id'],
+                            'score' => round((float) $out[2], 3),
+                            'title' => $validHits[$i0]['title'],
+                        ],
+                        [
+                            'id' => $validHits[$i1]['id'],
+                            'score' => round((float) $out[3], 3),
+                            'title' => $validHits[$i1]['title'],
+                        ],
+                    ],
+                ];
+            }
+            if ($status === 5 || $status === 6) {
+                $i0 = (int) $out[0];
+                if (! isset($validHits[$i0])) {
+                    return null;
+                }
+                $match = [
+                    'id' => $validHits[$i0]['id'],
+                    'score' => round((float) $out[2], 3),
+                    'title' => $validHits[$i0]['title'],
+                    'reason' => 'constrained_match',
+                ];
+                if ($requireCompleteEvidence && $status === 6) {
+                    return [
+                        'id' => null,
+                        'reason' => 'unresolved_release_variant',
+                        'suggestion' => $match,
+                    ];
+                }
+
+                return $match;
+            }
+        } catch (Throwable) {
+        }
+
+        return null;
+    }
+
+    private static function resolveFfi(): ?FFI
+    {
+        if (self::$ffi !== null) {
+            return self::$ffi === false ? null : self::$ffi;
+        }
+        $ffi = RustPipelineLibrary::resolveDomain('constrained_predb_matcher', self::FFI_CDEF);
+        if ($ffi === null) {
+            self::$ffi = false;
+
+            return null;
+        }
+        try {
+            self::$outF64 = $ffi->new('double[4]');
+            self::$ffi = $ffi;
+
+            return $ffi;
+        } catch (Throwable) {
+            self::$ffi = false;
+
+            return null;
+        }
     }
 }
