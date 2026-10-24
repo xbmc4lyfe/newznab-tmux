@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Http\Controllers\Admin;
 
 use App\Http\Controllers\BasePageController;
+use App\Http\Controllers\GetNzbController;
 use App\Services\AdminDashboardSnapshotService;
 use App\Services\Monitoring\GrafanaEmbedService;
 use App\Services\RegistrationStatusService;
@@ -16,6 +17,175 @@ use Illuminate\Support\Carbon;
 
 class AdminPageController extends BasePageController
 {
+    // Keep PHP as the production default until the Rust performance gate passes.
+    private static bool $useRustFfi = false;
+
+    public const string FFI_CDEF = GetNzbController::FFI_CDEF;
+
+    public static function setUseRustFfi(?bool $useRustFfi): void
+    {
+        self::$useRustFfi = $useRustFfi ?? false;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    /** @param array<array-key, array<string, mixed>> $rows
+     * @return list<array<string, mixed>>
+     */
+    public static function serviceRows(array $rows): array
+    {
+        return self::$useRustFfi ? self::serviceRowsNative($rows) : self::serviceRowsPhp($rows);
+    }
+
+    /** @param array<array-key, array<string, mixed>> $rows
+     * @return list<array<string, mixed>>
+     */
+    public static function serviceRowsPhp(array $rows): array
+    {
+        return array_values(array_map(static fn (array $row): array => [
+            'name' => $row['name'],
+            'slug' => $row['slug'],
+            'check_type' => $row['check_type'],
+            'status' => $row['status'],
+            'status_label' => $row['status_label'],
+            'uptime_percentage' => $row['uptime_percentage'],
+        ], $rows));
+    }
+
+    /** @param array<array-key, array<string, mixed>> $rows
+     * @return list<array<string, mixed>>
+     */
+    public static function serviceRowsNative(array $rows): array
+    {
+        $result = GetNzbController::transformNative(11, [$rows]);
+
+        return is_array($result) ? $result : self::serviceRowsPhp($rows);
+    }
+
+    /** @param array<array-key, array<string, mixed>> $rows
+     * @return list<array<string, mixed>>
+     */
+    public static function incidentRows(array $rows): array
+    {
+        return self::$useRustFfi ? self::incidentRowsNative($rows) : self::incidentRowsPhp($rows);
+    }
+
+    /** @param array<array-key, array<string, mixed>> $rows
+     * @return list<array<string, mixed>>
+     */
+    public static function incidentRowsPhp(array $rows): array
+    {
+        return array_values(array_map(static fn (array $row): array => [
+            'id' => $row['id'],
+            'title' => $row['title'],
+            'impact' => $row['impact'],
+            'impact_label' => $row['impact_label'],
+            'started_at' => $row['started_at'],
+            'started_at_human' => $row['started_at_human'],
+            'is_auto' => $row['is_auto'],
+            'services' => $row['services'],
+        ], $rows));
+    }
+
+    /** @param array<array-key, array<string, mixed>> $rows
+     * @return list<array<string, mixed>>
+     */
+    public static function incidentRowsNative(array $rows): array
+    {
+        $result = GetNzbController::transformNative(12, [$rows]);
+
+        return is_array($result) ? $result : self::incidentRowsPhp($rows);
+    }
+
+    /** @param array<array-key, array<string, mixed>> $rows
+     * @return array<array-key, array<string, mixed>>
+     */
+    public static function activityRows(array $rows, bool $humanOnly = false): array
+    {
+        return self::$useRustFfi ? self::activityRowsNative($rows, $humanOnly) : self::activityRowsPhp($rows, $humanOnly);
+    }
+
+    /** @param array<array-key, array<string, mixed>> $rows
+     * @return array<array-key, array<string, mixed>>
+     */
+    public static function activityRowsPhp(array $rows, bool $humanOnly = false): array
+    {
+        return array_map(static function (array $row) use ($humanOnly): array {
+            $activity = [
+                'type' => $row['type'],
+                'message' => $row['message'],
+                'icon' => $row['icon'],
+                'icon_bg' => $row['icon_bg'],
+                'icon_color' => $row['icon_color'],
+                'created_at' => $humanOnly ? $row['created_at_human'] : $row['created_at'],
+            ];
+            if (! $humanOnly) {
+                $activity['created_at_human'] = $row['created_at_human'];
+            }
+
+            return [...$activity, 'username' => $row['username'], 'metadata' => $row['metadata']];
+        }, $rows);
+    }
+
+    /** @param array<array-key, array<string, mixed>> $rows
+     * @return array<array-key, array<string, mixed>>
+     */
+    public static function activityRowsNative(array $rows, bool $humanOnly = false): array
+    {
+        $result = GetNzbController::transformNative(13, [$rows, $humanOnly]);
+
+        return is_array($result) ? $result : self::activityRowsPhp($rows, $humanOnly);
+    }
+
+    /** @param array<string, mixed>|null $period
+     * @return array<string, mixed>|null
+     */
+    public static function registrationPeriod(?array $period): ?array
+    {
+        return self::$useRustFfi ? self::registrationPeriodNative($period) : self::registrationPeriodPhp($period);
+    }
+
+    /** @param array<string, mixed>|null $period
+     * @return array<string, mixed>|null
+     */
+    public static function registrationPeriodPhp(?array $period): ?array
+    {
+        return $period === null ? null : ['id' => $period['id'], 'name' => $period['name'], 'starts_at' => $period['starts_at'], 'ends_at' => $period['ends_at']];
+    }
+
+    /** @param array<string, mixed>|null $period
+     * @return array<string, mixed>|null
+     */
+    public static function registrationPeriodNative(?array $period): ?array
+    {
+        $result = GetNzbController::transformNative(14, [$period]);
+
+        return is_array($result) ? $result : self::registrationPeriodPhp($period);
+    }
+
+    /** @return array{daily: bool, count: int} */
+    public static function metricWindow(string $range): array
+    {
+        return self::$useRustFfi ? self::metricWindowNative($range) : self::metricWindowPhp($range);
+    }
+
+    /** @return array{daily: bool, count: int} */
+    public static function metricWindowPhp(string $range): array
+    {
+        return ['daily' => $range === '30d', 'count' => $range === '30d' ? 30 : 24];
+    }
+
+    /** @return array{daily: bool, count: int} */
+    public static function metricWindowNative(string $range): array
+    {
+        $result = GetNzbController::transformNative(15, [$range]);
+
+        return is_array($result) ? $result : self::metricWindowPhp($range);
+    }
+
     protected UserStatsService $userStatsService;
 
     protected SystemMetricsService $systemMetricsService;
@@ -76,16 +246,16 @@ class AdminPageController extends BasePageController
     {
         $payload = $this->snapshot->get();
 
-        $serviceStatuses = collect($payload['serviceStatuses'])->map(static fn ($svc) => [
+        $serviceStatuses = self::serviceRows(collect($payload['serviceStatuses'])->map(static fn ($svc) => [
             'name' => $svc->name,
             'slug' => $svc->slug,
             'check_type' => $svc->check_type,
             'status' => $svc->status->value,
             'status_label' => $svc->status->label(),
             'uptime_percentage' => (float) $svc->uptime_percentage,
-        ])->values();
+        ])->values()->all());
 
-        $activeIncidents = collect($payload['activeIncidents'])->map(static fn ($incident) => [
+        $activeIncidents = self::incidentRows(collect($payload['activeIncidents'])->map(static fn ($incident) => [
             'id' => $incident->id,
             'title' => $incident->title,
             'impact' => $incident->impact->value,
@@ -94,9 +264,9 @@ class AdminPageController extends BasePageController
             'started_at_human' => $incident->started_at?->diffForHumans(),
             'is_auto' => (bool) $incident->is_auto,
             'services' => $incident->services->pluck('name')->all(),
-        ])->values();
+        ])->values()->all());
 
-        $recentActivity = array_map(static fn ($activity): array => [
+        $recentActivity = self::activityRows(array_map(static fn ($activity): array => [
             'type' => $activity->type,
             'message' => $activity->message,
             'icon' => $activity->icon,
@@ -106,15 +276,15 @@ class AdminPageController extends BasePageController
             'created_at_human' => $activity->created_at?->diffForHumans(),
             'username' => $activity->username,
             'metadata' => $activity->metadata,
-        ], $payload['recent_activity']);
+        ], $payload['recent_activity']));
 
         $registrationStatus = $payload['registrationStatus'];
-        $serializePeriod = static fn ($period): ?array => $period === null ? null : [
+        $serializePeriod = static fn ($period): ?array => self::registrationPeriod($period === null ? null : [
             'id' => $period->id,
             'name' => $period->name,
             'starts_at' => $period->starts_at?->format('Y-m-d H:i'),
             'ends_at' => $period->ends_at?->format('Y-m-d H:i'),
-        ];
+        ]);
 
         $registrationPayload = [
             'manual_status' => $registrationStatus['manual_status'],
@@ -149,16 +319,17 @@ class AdminPageController extends BasePageController
     {
         $payload = $this->snapshot->get();
 
-        $activities = array_map(static fn ($activity): array => [
+        $activities = self::activityRows(array_map(static fn ($activity): array => [
             'type' => $activity->type,
             'message' => $activity->message,
             'icon' => $activity->icon,
             'icon_bg' => $activity->icon_bg,
             'icon_color' => $activity->icon_color,
-            'created_at' => $activity->created_at?->diffForHumans(),
+            'created_at' => $activity->created_at?->toIso8601String(),
+            'created_at_human' => $activity->created_at?->diffForHumans(),
             'username' => $activity->username,
             'metadata' => $activity->metadata,
-        ], $payload['recent_activity']);
+        ], $payload['recent_activity']), true);
 
         return response()->json([
             'success' => true,
@@ -205,12 +376,14 @@ class AdminPageController extends BasePageController
     {
         $timeRange = request('range', '24h');
 
-        if ($timeRange === '30d') {
-            $cpuHistory = $this->systemMetricsService->getDailyMetrics('cpu', 30);
-            $ramHistory = $this->systemMetricsService->getDailyMetrics('ram', 30);
+        $window = self::metricWindow(is_string($timeRange) ? $timeRange : '');
+
+        if ($window['daily']) {
+            $cpuHistory = $this->systemMetricsService->getDailyMetrics('cpu', $window['count']);
+            $ramHistory = $this->systemMetricsService->getDailyMetrics('ram', $window['count']);
         } else {
-            $cpuHistory = $this->systemMetricsService->getHourlyMetrics('cpu', 24);
-            $ramHistory = $this->systemMetricsService->getHourlyMetrics('ram', 24);
+            $cpuHistory = $this->systemMetricsService->getHourlyMetrics('cpu', $window['count']);
+            $ramHistory = $this->systemMetricsService->getHourlyMetrics('ram', $window['count']);
         }
 
         return response()->json([
