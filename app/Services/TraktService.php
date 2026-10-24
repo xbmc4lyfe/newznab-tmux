@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace App\Services;
 
 use App\Exceptions\TvProviderException;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Http\Client\RequestException;
 use Illuminate\Http\Client\Response;
@@ -12,6 +14,7 @@ use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
+use Throwable;
 
 /**
  * Trakt.tv Service
@@ -36,6 +39,24 @@ class TraktService
     protected const ID_TYPES = ['imdb', 'tmdb', 'trakt', 'tvdb'];
 
     protected const SEARCH_TYPES = ['movie', 'show', 'episode', 'person', 'list'];
+
+    private const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_trakt_image_url(const char *url, size_t url_len, char *out, size_t cap);
+        ssize_t nntmux_trakt_format_imdb_id(const char *id, size_t id_len, char *out, size_t cap);
+        ssize_t nntmux_trakt_format_media_id(const char *id, size_t id_len, char *out, size_t cap);
+        int32_t nntmux_trakt_usable_external_id(const char *id, size_t id_len, uint32_t imdb);
+        C;
+
+    private static ?FFI $traktFfi = null;
+
+    private static bool $traktFfiResolved = false;
+
+    /**
+     * Id helpers through Rust; null selects the benchmark-qualified production defaults: Rust for
+     * the formatMediaId() slug path only, PHP for the helpers that miss the 1.5x gate
+     * (see tests/Unit/RustTvProvidersTraktMatchingParityTest.php).
+     */
+    public ?bool $useRustFfi = null;
 
     /** Minimum seconds between requests to avoid rate limiting (Trakt/Cloudflare). */
     protected const THROTTLE_SECONDS = 1;
@@ -136,7 +157,7 @@ class TraktService
 
         try {
             $response = Http::timeout($this->timeout)
-                ->retry($this->retryTimes, $this->retryDelay, function (\Throwable $exception, PendingRequest $request, ?string $key = null) {
+                ->retry($this->retryTimes, $this->retryDelay, function (Throwable $exception, PendingRequest $request, ?string $key = null) {
                     // Don't retry on 404 - resource doesn't exist
                     if ($exception instanceof RequestException) {
                         $status = $exception->response->status();
@@ -206,7 +227,7 @@ class TraktService
             return null;
         } catch (TvProviderException $e) {
             throw $e;
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             // Check if this is a 404 wrapped in an exception
             if ($e instanceof RequestException && $e->response->status() === 404) {
                 Log::debug('Trakt: Resource not found', ['endpoint' => $endpoint]);
@@ -752,6 +773,11 @@ class TraktService
      */
     protected function formatImdbId(string $id): ?string
     {
+        return ($this->useRustFfi ?? false) ? $this->formatImdbIdNative($id) : $this->formatImdbIdPhp($id);
+    }
+
+    public function formatImdbIdPhp(string $id): ?string
+    {
         if (preg_match('/^tt\d{6,}$/i', $id) === 1) {
             return $id;
         }
@@ -761,7 +787,36 @@ class TraktService
         return $digits !== null && preg_match('/^\d{6,}$/', $digits) === 1 ? 'tt'.$digits : null;
     }
 
+    /**
+     * formatImdbIdPhp() through Rust `nntmux_trakt_format_imdb_id`.
+     */
+    public function formatImdbIdNative(string $id): ?string
+    {
+        $result = self::stringCall('nntmux_trakt_format_imdb_id', $id);
+
+        return $result === false ? $this->formatImdbIdPhp($id) : $result;
+    }
+
     protected function formatMediaId(int|string $id): ?string
+    {
+        $id = trim((string) $id);
+        if ($id === '') {
+            return null;
+        }
+        if (str_starts_with(strtolower($id), 'tt')) {
+            return $this->formatImdbId($id);
+        }
+
+        // Rust slugs printable ASCII (Trakt slugs and numeric ids); IMDb ids stay in PHP, where
+        // the regex is faster than the FFI round trip.
+        if (($this->useRustFfi ?? true) && \is_string($slug = self::stringCall('nntmux_trakt_format_media_id', $id))) {
+            return $slug;
+        }
+
+        return Str::slug($id);
+    }
+
+    public function formatMediaIdPhp(int|string $id): ?string
     {
         $id = trim((string) $id);
         if ($id === '') {
@@ -769,6 +824,58 @@ class TraktService
         }
 
         return str_starts_with(strtolower($id), 'tt') ? $this->formatImdbId($id) : Str::slug($id);
+    }
+
+    /**
+     * formatMediaIdPhp() through Rust `nntmux_trakt_format_media_id` (printable ASCII slugs and
+     * IMDb ids); falls back to PHP when Rust declines.
+     */
+    public function formatMediaIdNative(int|string $id): ?string
+    {
+        $result = self::stringCall('nntmux_trakt_format_media_id', (string) $id);
+
+        return $result === false ? $this->formatMediaIdPhp($id) : $result;
+    }
+
+    /**
+     * The shared Rust library with the Trakt helper exports, or null when unavailable.
+     */
+    public static function traktFfi(): ?FFI
+    {
+        if (! self::$traktFfiResolved) {
+            self::$traktFfi = RustPipelineLibrary::resolveDomain('trakt_matching', self::FFI_CDEF);
+            self::$traktFfiResolved = true;
+        }
+
+        return self::$traktFfi;
+    }
+
+    /**
+     * A string-returning Trakt export: its result, null for PHP `null`, or false to fall back.
+     */
+    private static function stringCall(string $function, string $input): string|false|null
+    {
+        $ffi = self::traktFfi();
+        if ($ffi === null) {
+            return false;
+        }
+        $len = \strlen($input);
+        $cap = 0;
+        // `@` expands to `-at-`: four output bytes per input byte at most.
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, 4 * $len + 16, $cap);
+        if ($scratch === null) {
+            return false;
+        }
+        try {
+            $written = $ffi->{$function}($input, $len, $scratch, $cap);
+        } catch (Throwable) {
+            return false;
+        }
+        if ($written === -2) {
+            return null;
+        }
+
+        return \is_int($written) && $written >= 0 ? ($written === 0 ? '' : FFI::string($scratch, $written)) : false;
     }
 
     /**
@@ -786,14 +893,39 @@ class TraktService
 
     protected function isUsableExternalId(mixed $id, string $idType): bool
     {
+        return ($this->useRustFfi ?? false) ? $this->isUsableExternalIdNative($id, $idType) : $this->isUsableExternalIdPhp($id, $idType);
+    }
+
+    public function isUsableExternalIdPhp(mixed $id, string $idType): bool
+    {
         if ($id === null || $id === '') {
             return false;
         }
 
         if ($idType === 'imdb') {
-            return $this->formatImdbId((string) $id) !== null;
+            return $this->formatImdbIdPhp((string) $id) !== null;
         }
 
         return is_numeric($id) ? (int) $id > 0 : trim((string) $id) !== '';
+    }
+
+    /**
+     * isUsableExternalIdPhp() through Rust `nntmux_trakt_usable_external_id` for string ids.
+     */
+    public function isUsableExternalIdNative(mixed $id, string $idType): bool
+    {
+        if (\is_string($id) && ($ffi = self::traktFfi()) !== null) {
+            try {
+                // @phpstan-ignore method.notFound
+                $usable = $ffi->nntmux_trakt_usable_external_id($id, \strlen($id), $idType === 'imdb' ? 1 : 0);
+                if ($usable === 0 || $usable === 1) {
+                    return $usable === 1;
+                }
+            } catch (Throwable) {
+                // Older native libraries retain the PHP implementation.
+            }
+        }
+
+        return $this->isUsableExternalIdPhp($id, $idType);
     }
 }

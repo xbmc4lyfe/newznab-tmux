@@ -6,9 +6,26 @@ namespace App\Services\TvProcessing\Providers;
 
 use App\Services\TmdbClient;
 use App\Services\TraktService;
+use App\Support\RustPipelineLibrary;
+use FFI;
+use Throwable;
 
 class TmdbProvider extends AbstractTvProvider
 {
+    private const string MATCH_FFI_CDEF = <<<'C'
+        ssize_t nntmux_tv_provider_best_candidate_nul(const char *ours, size_t ours_len, int64_t our_year, uint32_t flags, const char *our_country, size_t our_country_len, const char *titles, size_t titles_len, const char *starteds, size_t starteds_len, const char *countries, size_t countries_len, size_t count);
+        C;
+
+    private static ?FFI $matchFfi = null;
+
+    private static bool $matchFfiResolved = false;
+
+    /**
+     * Candidate selection through Rust; null selects the benchmark-qualified production default
+     * (PHP: the batch call misses the 1.5x gate, see tests/Unit/RustTvProvidersTraktMatchingParityTest.php).
+     */
+    public ?bool $useRustMatchFfi = null;
+
     /**
      * TMDB client that throws TvProviderException on transient failures.
      */
@@ -52,30 +69,9 @@ class TmdbProvider extends AbstractTvProvider
      */
     private function matchShowInfo(array $shows, string $cleanName, ?int $year, string $country): array|false
     {
-        $highestScore = 0.0;
-        $highest = null;
-
-        foreach ($shows as $show) {
-            if (! \is_array($show) || ! $this->checkRequiredAttr($show, 'tmdbS')) {
-                continue;
-            }
-
-            $originCountry = TmdbClient::getArray($show, 'origin_country');
-            foreach (array_unique([TmdbClient::getString($show, 'name'), TmdbClient::getString($show, 'original_name')]) as $candidateName) {
-                $score = $this->scoreCandidate(
-                    $cleanName,
-                    $year,
-                    $candidateName,
-                    TmdbClient::getString($show, 'first_air_date'),
-                    $country,
-                    (string) ($originCountry[0] ?? ''),
-                );
-                if ($score > $highestScore) {
-                    $highestScore = $score;
-                    $highest = $show;
-                }
-            }
-        }
+        $highest = ($this->useRustMatchFfi ?? false)
+            ? $this->selectBestShowNative($shows, $cleanName, $year, $country)
+            : $this->selectBestShowPhp($shows, $cleanName, $year, $country);
 
         if ($highest === null) {
             return false;
@@ -102,6 +98,127 @@ class TmdbProvider extends AbstractTvProvider
         $highest['external_ids'] = TmdbClient::getArray($details, 'external_ids');
 
         return $this->formatShowInfo($highest);
+    }
+
+    /**
+     * The first search result whose name or original name scores strictly highest above zero.
+     *
+     * @param  array<int|string, mixed>  $shows
+     * @return array<int|string, mixed>|null
+     */
+    public function selectBestShowPhp(array $shows, string $cleanName, ?int $year, string $country): ?array
+    {
+        $highestScore = 0.0;
+        $highest = null;
+
+        foreach ($shows as $show) {
+            if (! \is_array($show) || ! $this->checkRequiredAttr($show, 'tmdbS')) {
+                continue;
+            }
+
+            $originCountry = TmdbClient::getArray($show, 'origin_country');
+            foreach (array_unique([TmdbClient::getString($show, 'name'), TmdbClient::getString($show, 'original_name')]) as $candidateName) {
+                $score = $this->scoreCandidate(
+                    $cleanName,
+                    $year,
+                    $candidateName,
+                    TmdbClient::getString($show, 'first_air_date'),
+                    $country,
+                    (string) ($originCountry[0] ?? ''),
+                );
+                if ($score > $highestScore) {
+                    $highestScore = $score;
+                    $highest = $show;
+                }
+            }
+        }
+
+        return $highest;
+    }
+
+    /**
+     * selectBestShowPhp() scored in one Rust call; falls back to PHP when Rust declines.
+     *
+     * @param  array<int|string, mixed>  $shows
+     * @return array<int|string, mixed>|null
+     */
+    public function selectBestShowNative(array $shows, string $cleanName, ?int $year, string $country): ?array
+    {
+        $titles = $starteds = $countries = $owners = [];
+        foreach ($shows as $key => $show) {
+            if (! \is_array($show) || ! $this->checkRequiredAttr($show, 'tmdbS')) {
+                continue;
+            }
+
+            $originCountry = TmdbClient::getArray($show, 'origin_country');
+            $started = 's'.TmdbClient::getString($show, 'first_air_date');
+            $candidateCountry = (string) ($originCountry[0] ?? '');
+            foreach (array_unique([TmdbClient::getString($show, 'name'), TmdbClient::getString($show, 'original_name')]) as $candidateName) {
+                $titles[] = $candidateName;
+                $starteds[] = $started;
+                $countries[] = $candidateCountry;
+                $owners[] = $key;
+            }
+        }
+
+        if ($titles === []) {
+            return null;
+        }
+
+        $index = self::bestCandidateIndexNative($cleanName, $year, $country, $titles, $starteds, $countries);
+        if ($index === null) {
+            return $this->selectBestShowPhp($shows, $cleanName, $year, $country);
+        }
+
+        return $index >= 0 ? $shows[$owners[$index]] : null;
+    }
+
+    /**
+     * `$candidateStarted` framing for bestCandidateIndexNative(): `i`+int, `s`+string or `n`.
+     */
+    public static function encodeCandidateStarted(mixed $started): string
+    {
+        return \is_int($started) ? 'i'.$started : (\is_string($started) ? 's'.$started : 'n');
+    }
+
+    /**
+     * Rust `nntmux_tv_provider_best_candidate_nul`: index of the first candidate scoring strictly
+     * highest above zero (as the providers' scoreCandidate() loops), -1 when none does, or null
+     * when the library is unavailable or declines (NUL bytes, titles outside ASCII/Latin-1).
+     *
+     * @param  list<string>  $titles
+     * @param  list<string>  $starteds  encodeCandidateStarted() values
+     * @param  list<string>  $countries
+     */
+    public static function bestCandidateIndexNative(string $ourName, ?int $ourYear, string $ourCountry, array $titles, array $starteds, array $countries): ?int
+    {
+        $count = \count($titles);
+        if ($count === 0 || \count($starteds) !== $count || \count($countries) !== $count) {
+            return null;
+        }
+        if (! self::$matchFfiResolved) {
+            self::$matchFfi = RustPipelineLibrary::resolveDomain('tv_provider_matching', self::MATCH_FFI_CDEF);
+            self::$matchFfiResolved = true;
+        }
+        if (self::$matchFfi === null) {
+            return null;
+        }
+
+        $titles = implode("\0", $titles);
+        $starteds = implode("\0", $starteds);
+        $countries = implode("\0", $countries);
+        try {
+            // @phpstan-ignore method.notFound
+            $index = self::$matchFfi->nntmux_tv_provider_best_candidate_nul($ourName, \strlen($ourName), $ourYear ?? 0, $ourYear !== null ? 1 : 0, $ourCountry, \strlen($ourCountry), $titles, \strlen($titles), $starteds, \strlen($starteds), $countries, \strlen($countries), $count);
+        } catch (Throwable) {
+            return null;
+        }
+
+        if ($index === -2) {
+            return -1;
+        }
+
+        return \is_int($index) && $index >= 0 && $index < $count ? $index : null;
     }
 
     public function fetchAllEpisodes(int $siteId, int $videoId): int
@@ -244,7 +361,7 @@ class TmdbProvider extends AbstractTvProvider
                     return (int) $ids['trakt'];
                 }
             }
-        } catch (\Throwable) {
+        } catch (Throwable) {
             // Trakt ID lookup is optional enrichment.
         }
 
