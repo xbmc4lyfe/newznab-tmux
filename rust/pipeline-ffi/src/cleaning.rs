@@ -20911,3 +20911,845 @@ mod wave30_nzb_release_cleanup_commands_tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 31 Slice 31.1: BenchmarkRename, PartRepair, UpdateBinaries,
+// OptimizeCbpStorage and NntmuxResetTruncate command helpers
+// ---------------------------------------------------------------------------
+
+pub mod wave31_benchmark_binaries_cbp_reset_commands {
+    //! Request: a JSON array `[operation, ...arguments]`. Response: a JSON array `[result]`.
+    //! Inputs whose PHP semantics are not reproduced exactly are declined with `Err`, so the
+    //! PHP caller falls back to its native implementation.
+
+    use super::wave30_nzb_release_cleanup_commands::{Value, parse};
+
+    unsafe extern "C" {
+        /// The platform libm `pow`, which PHP's `**` operator calls for float operands.
+        safe fn pow(base: f64, exponent: f64) -> f64;
+    }
+
+    /// Characters PHP's `/\s/u` (PCRE2 UTF + UCP) matches.
+    fn is_pcre_unicode_space(ch: char) -> bool {
+        matches!(
+            ch,
+            '\u{9}'..='\u{d}'
+                | ' '
+                | '\u{85}'
+                | '\u{a0}'
+                | '\u{1680}'
+                | '\u{180e}'
+                | '\u{2000}'..='\u{200a}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202f}'
+                | '\u{205f}'
+                | '\u{3000}'
+        )
+    }
+
+    /// Bytes PHP's default `trim()` strips.
+    fn is_php_trim_byte(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b)
+    }
+
+    fn php_trim(text: &[u8]) -> &[u8] {
+        let start = text
+            .iter()
+            .position(|byte| !is_php_trim_byte(*byte))
+            .unwrap_or(text.len());
+        let end = text
+            .iter()
+            .rposition(|byte| !is_php_trim_byte(*byte))
+            .map_or(start, |index| index + 1);
+        &text[start..end]
+    }
+
+    const POW10: [f64; 23] = [
+        1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16,
+        1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
+    ];
+
+    /// PHP 8.4+ `round($value, $places)` (`PHP_ROUND_HALF_UP`) for `1 <= $places <= 22`.
+    pub fn php_round(value: f64, places: usize) -> f64 {
+        if !value.is_finite() || value == 0.0 {
+            return value;
+        }
+        let exponent = POW10[places];
+        let scaled = value * exponent;
+        let (mut integral, next) = if value >= 0.0 {
+            let floor = scaled.floor();
+            (floor, floor + 1.0)
+        } else {
+            let ceil = scaled.ceil();
+            (ceil, ceil - 1.0)
+        };
+        if next / exponent == value {
+            integral = next;
+        }
+        if integral.abs() >= 1e16 {
+            return value;
+        }
+        let edge_case = ((integral + 0.5f64.copysign(integral)) / exponent).abs();
+        if value.abs() >= edge_case {
+            integral += 1.0f64.copysign(integral);
+        }
+        integral / exponent
+    }
+
+    /// PHP `number_format($value, $decimals)` with the default separators; magnitudes whose
+    /// fixed-point rendering could reach a decimal tie are declined.
+    pub fn php_number_format(value: f64, decimals: usize) -> Result<Vec<u8>, ()> {
+        if !value.is_finite() || value.abs() >= 1e11 || !(1..=6).contains(&decimals) {
+            return Err(());
+        }
+        let negative = value < 0.0;
+        let rounded = php_round(value.abs(), decimals);
+        let fixed = format!("{rounded:.decimals$}");
+        let (integer, fraction) = fixed.split_once('.').ok_or(())?;
+        let mut out = Vec::with_capacity(fixed.len() + integer.len() / 3 + 1);
+        if negative && rounded != 0.0 {
+            out.push(b'-');
+        }
+        for (index, digit) in integer.bytes().enumerate() {
+            if index > 0 && (integer.len() - index) % 3 == 0 {
+                out.push(b',');
+            }
+            out.push(digit);
+        }
+        out.push(b'.');
+        out.extend_from_slice(fraction.as_bytes());
+        Ok(out)
+    }
+
+    /// PHP `(int)` of an in-range float.
+    fn php_float_to_int(value: f64) -> Result<i64, ()> {
+        if value.is_finite()
+            && (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&value)
+        {
+            Ok(value.trunc() as i64)
+        } else {
+            Err(())
+        }
+    }
+
+    fn int(value: &Value) -> Result<i64, ()> {
+        match value {
+            Value::Int(number) => Ok(*number),
+            _ => Err(()),
+        }
+    }
+
+    fn float(value: &Value) -> Result<f64, ()> {
+        match value {
+            Value::Float(number) => Ok(*number),
+            _ => Err(()),
+        }
+    }
+
+    fn boolean(value: &Value) -> Result<bool, ()> {
+        match value {
+            Value::Bool(flag) => Ok(*flag),
+            _ => Err(()),
+        }
+    }
+
+    fn string(value: &Value) -> Result<&[u8], ()> {
+        match value {
+            Value::Str(text) => Ok(text),
+            _ => Err(()),
+        }
+    }
+
+    /// The last value stored under `key`, like PHP's `json_decode`.
+    fn field<'a>(value: &'a Value, key: &str) -> Result<&'a Value, ()> {
+        match value {
+            Value::Map(entries) => entries
+                .iter()
+                .rev()
+                .find(|(name, _)| name == key.as_bytes())
+                .map(|(_, item)| item)
+                .ok_or(()),
+            _ => Err(()),
+        }
+    }
+
+    fn entry(key: &str, value: Value) -> (Vec<u8>, Value) {
+        (key.as_bytes().to_vec(), value)
+    }
+
+    fn text(parts: &[&[u8]]) -> Value {
+        Value::Str(parts.concat())
+    }
+
+    /// `BenchmarkRename::computeStatistics()`; integer sums that PHP would promote to float are declined.
+    fn compute_statistics(durations: &Value, items_per_sample: &Value) -> Result<Value, ()> {
+        let Value::List(durations) = durations else {
+            return Err(());
+        };
+        let items_per_sample = int(items_per_sample)?;
+        let count = durations.len();
+        if count == 0 {
+            let mut entries = vec![entry("count", Value::Int(0))];
+            for key in [
+                "min_ms",
+                "p50_ms",
+                "p95_ms",
+                "p99_ms",
+                "max_ms",
+                "mean_ms",
+                "stddev_ms",
+                "iqr_ms",
+                "ops_per_sec",
+            ] {
+                entries.push(entry(key, Value::Float(0.0)));
+            }
+            return Ok(Value::Map(entries));
+        }
+        let durations = durations.iter().map(int).collect::<Result<Vec<_>, _>>()?;
+        let count_int = i64::try_from(count).map_err(|_| ())?;
+        let total_ns = durations
+            .iter()
+            .try_fold(0i64, |sum, ns| sum.checked_add(*ns))
+            .ok_or(())?;
+        let total_ops = items_per_sample.checked_mul(count_int).ok_or(())?;
+
+        let mut times: Vec<f64> = durations
+            .iter()
+            .map(|ns| *ns as f64 / 1_000_000.0)
+            .collect();
+        times.sort_by(f64::total_cmp);
+        let count_float = count as f64;
+        let mean = times.iter().fold(0.0, |sum, time| sum + time) / count_float;
+        let p50 = if count % 2 == 0 {
+            (times[count / 2 - 1] + times[count / 2]) / 2.0
+        } else {
+            times[count / 2]
+        };
+        let percentile = |fraction: f64| -> Result<f64, ()> {
+            let rank = php_float_to_int((fraction * count_float).ceil())? - 1;
+            let index = rank.min(count_int - 1);
+            times
+                .get(usize::try_from(index).map_err(|_| ())?)
+                .copied()
+                .ok_or(())
+        };
+        let p95 = percentile(0.95)?;
+        let p99 = percentile(0.99)?;
+        let iqr = percentile(0.75)? - percentile(0.25)?;
+        let variance = if count > 1 {
+            let exponent = std::hint::black_box(2.0);
+            times
+                .iter()
+                .fold(0.0, |sum, time| sum + pow(time - mean, exponent))
+                / (count - 1) as f64
+        } else {
+            0.0
+        };
+        let ops_per_sec = if total_ns > 0 {
+            (total_ops as f64 * 1_000_000_000.0) / total_ns as f64
+        } else {
+            0.0
+        };
+
+        Ok(Value::Map(vec![
+            entry("count", Value::Int(count_int)),
+            entry("min_ms", Value::Float(php_round(times[0], 6))),
+            entry("p50_ms", Value::Float(php_round(p50, 6))),
+            entry("p95_ms", Value::Float(php_round(p95, 6))),
+            entry("p99_ms", Value::Float(php_round(p99, 6))),
+            entry("max_ms", Value::Float(php_round(times[count - 1], 6))),
+            entry("mean_ms", Value::Float(php_round(mean, 6))),
+            entry("stddev_ms", Value::Float(php_round(variance.sqrt(), 6))),
+            entry("iqr_ms", Value::Float(php_round(iqr, 6))),
+            entry("ops_per_sec", Value::Float(php_round(ops_per_sec, 2))),
+        ]))
+    }
+
+    fn is_production_target(target: &[u8]) -> bool {
+        let target = php_trim(target).to_ascii_lowercase();
+        let stripped = target
+            .split(|byte| *byte == b':')
+            .next()
+            .unwrap_or_default();
+        let contains = |needle: &[u8]| target.windows(needle.len()).any(|window| window == needle);
+        stripped == b"192.168.1.110" || contains(b"192.168.1.110") || contains(b"m5stephen")
+    }
+
+    /// `/\s+/u` collapsed to one space, `trim()`, then `mb_strtolower()`; strings containing a
+    /// capital sigma (context-dependent lowercasing) are declined.
+    pub fn normalize_identity(value: &[u8]) -> Result<Vec<u8>, ()> {
+        let value = std::str::from_utf8(value).map_err(|_| ())?;
+        let mut collapsed = String::with_capacity(value.len());
+        let mut in_space = false;
+        for ch in value.chars() {
+            if ch == '\u{3a3}' {
+                return Err(());
+            }
+            if is_pcre_unicode_space(ch) {
+                if !in_space {
+                    collapsed.push(' ');
+                    in_space = true;
+                }
+            } else {
+                collapsed.push(ch);
+                in_space = false;
+            }
+        }
+        let trimmed = std::str::from_utf8(php_trim(collapsed.as_bytes())).map_err(|_| ())?;
+        Ok(trimmed.to_lowercase().into_bytes())
+    }
+
+    fn compute_binary_cbp_hash(
+        file_number: i64,
+        subject: &[u8],
+        from_name: &[u8],
+    ) -> Result<Vec<u8>, ()> {
+        let digest = if file_number > 0 {
+            crate::md5_raw_slice(format!("file:{file_number}").as_bytes())
+        } else {
+            let mut input = b"subject:".to_vec();
+            input.extend_from_slice(&normalize_identity(subject)?);
+            input.extend_from_slice(b"\0poster:");
+            input.extend_from_slice(&normalize_identity(from_name)?);
+            crate::md5_raw_slice(&input)
+        };
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        Ok(digest
+            .iter()
+            .flat_map(|byte| [HEX[usize::from(byte >> 4)], HEX[usize::from(byte & 0x0f)]])
+            .collect())
+    }
+
+    /// `is_numeric($max) && $max > 0 ? (int) $max : null` for the shapes reproduced exactly.
+    fn positive_numeric_int(value: &Value) -> Result<Option<i64>, ()> {
+        match value {
+            Value::Int(number) => Ok((*number > 0).then_some(*number)),
+            Value::Float(number) => {
+                if *number > 0.0 {
+                    php_float_to_int(*number).map(Some)
+                } else {
+                    Ok(None)
+                }
+            }
+            Value::Str(text) => {
+                if !text.iter().any(u8::is_ascii_digit) {
+                    return Ok(None);
+                }
+                let is_space =
+                    |byte: &u8| matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c);
+                let start = text.iter().position(|byte| !is_space(byte)).ok_or(())?;
+                let end = text.iter().rposition(|byte| !is_space(byte)).ok_or(())? + 1;
+                let body = &text[start..end];
+                let (negative, digits) = match body.first() {
+                    Some(b'-') => (true, &body[1..]),
+                    Some(b'+') => (false, &body[1..]),
+                    _ => (false, body),
+                };
+                if digits.is_empty() || digits.len() > 18 || !digits.iter().all(u8::is_ascii_digit)
+                {
+                    return Err(());
+                }
+                let magnitude = digits
+                    .iter()
+                    .fold(0i64, |acc, digit| acc * 10 + i64::from(digit - b'0'));
+                Ok((!negative && magnitude > 0).then_some(magnitude))
+            }
+            Value::Null | Value::Bool(_) | Value::List(_) | Value::Map(_) => Ok(None),
+        }
+    }
+
+    /// `UpdateBinaries::formatElapsedTime()`; fractional minute values (a PHP deprecation) are declined.
+    fn format_elapsed_time(seconds: f64) -> Result<String, ()> {
+        if !seconds.is_finite() {
+            return Err(());
+        }
+        if seconds < 1.0 {
+            return Ok(format!("{}ms", php_float_to_int(seconds * 1000.0)?));
+        }
+        if seconds < 60.0 {
+            return Ok(format!("{seconds:.1}s"));
+        }
+        if seconds.fract() != 0.0 || seconds >= 9_007_199_254_740_992.0 {
+            return Err(());
+        }
+        let minutes = (seconds / 60.0).floor();
+        let remaining_seconds = php_float_to_int(seconds)? % 60;
+        if minutes < 60.0 {
+            return Ok(format!(
+                "{}m {}s",
+                php_float_to_int(minutes)?,
+                remaining_seconds
+            ));
+        }
+        let hours = (minutes / 60.0).floor();
+        Ok(format!(
+            "{}h {}m",
+            php_float_to_int(hours)?,
+            php_float_to_int(minutes)? % 60
+        ))
+    }
+
+    fn project_benchmark_table_row(method: &[u8], result: &Value) -> Result<Value, ()> {
+        let items = int(field(result, "items")?)?;
+        let stats = field(result, "stats")?;
+        let verified = boolean(field(result, "accuracy_verified")?)?;
+        let mut row = vec![Value::Str(method.to_vec()), Value::Int(items)];
+        row.push(Value::Str(php_number_format(
+            float(field(stats, "ops_per_sec")?)?,
+            1,
+        )?));
+        for key in ["min_ms", "p50_ms", "p95_ms", "p99_ms", "max_ms"] {
+            row.push(Value::Str(php_number_format(
+                float(field(stats, key)?)?,
+                4,
+            )?));
+        }
+        row.push(Value::Str(if verified {
+            b"PASS".to_vec()
+        } else {
+            b"FAIL".to_vec()
+        }));
+        Ok(Value::List(row))
+    }
+
+    pub fn evaluate(operation: &[u8], args: &[Value]) -> Result<Value, ()> {
+        Ok(match (operation, args) {
+            (b"benchmark_rename.compute_statistics", [durations, items_per_sample]) => {
+                compute_statistics(durations, items_per_sample)?
+            }
+            (
+                b"benchmark_rename.is_blocked_production_context",
+                [app_env, db_host, db_database],
+            ) => {
+                let env = php_trim(string(app_env)?).to_ascii_lowercase();
+                Value::Bool(
+                    env == b"production"
+                        || env == b"prod"
+                        || is_production_target(string(db_host)?)
+                        || is_production_target(string(db_database)?),
+                )
+            }
+            (b"benchmark_rename.project_table_row", [method, result]) => {
+                project_benchmark_table_row(string(method)?, result)?
+            }
+            (b"part_repair.format_group_not_found_message", [group]) => {
+                text(&[b"Group not found: ", string(group)?])
+            }
+            (b"part_repair.format_nntp_error_message", [message]) => {
+                text(&[b"Unable to connect to usenet. Error: ", string(message)?])
+            }
+            (b"update_binaries.resolve_max_headers", [max, configured]) => {
+                let configured = int(configured)?;
+                Value::Int(match positive_numeric_int(max)? {
+                    Some(max) => max,
+                    None if configured != 0 => configured,
+                    None => 1_000_000,
+                })
+            }
+            (b"update_binaries.format_elapsed_time", [seconds]) => {
+                Value::Str(format_elapsed_time(float(seconds)?)?.into_bytes())
+            }
+            (b"update_binaries.format_section_header_lines", [title]) => {
+                let title = string(title)?;
+                Value::List(vec![
+                    Value::Str(title.to_ascii_uppercase()),
+                    Value::Str(vec![b'-'; title.len()]),
+                ])
+            }
+            (b"optimize_cbp.normalize_identity", [value]) => {
+                Value::Str(normalize_identity(string(value)?)?)
+            }
+            (b"optimize_cbp.compute_binary_cbp_hash", [file_number, subject, from_name]) => {
+                Value::Str(compute_binary_cbp_hash(
+                    int(file_number)?,
+                    string(subject)?,
+                    string(from_name)?,
+                )?)
+            }
+            (b"optimize_cbp.clamp_batch_size", [batch]) => Value::Int(int(batch)?.clamp(1, 5000)),
+            (b"reset_truncate.build_group_reset_payload", []) => Value::Map(vec![
+                entry("first_record", Value::Int(0)),
+                entry("first_record_postdate", Value::Null),
+                entry("last_record", Value::Int(0)),
+                entry("last_record_postdate", Value::Null),
+                entry("last_updated", Value::Null),
+            ]),
+            (b"reset_truncate.tables_to_truncate", []) => Value::List(
+                ["parts", "missed_parts", "binaries", "collections"]
+                    .iter()
+                    .map(|table| Value::Str(table.as_bytes().to_vec()))
+                    .collect(),
+            ),
+            (b"reset_truncate.format_truncated_success_message", [deleted]) => text(&[
+                int(deleted)?.to_string().as_bytes(),
+                b" releases had no nzb, deleted.",
+            ]),
+            _ => return Err(()),
+        })
+    }
+
+    /// JSON encoding with shortest round-trip floats, which PHP's `json_decode` reads back exactly.
+    pub fn encode(out: &mut Vec<u8>, value: &Value) -> Result<(), ()> {
+        match value {
+            Value::Float(number) => {
+                if !number.is_finite() {
+                    return Err(());
+                }
+                out.extend_from_slice(format!("{number:?}").as_bytes());
+            }
+            Value::List(items) => {
+                out.push(b'[');
+                for (index, item) in items.iter().enumerate() {
+                    if index > 0 {
+                        out.push(b',');
+                    }
+                    encode(out, item)?;
+                }
+                out.push(b']');
+            }
+            Value::Map(entries) => {
+                out.push(b'{');
+                for (index, (key, item)) in entries.iter().enumerate() {
+                    if index > 0 {
+                        out.push(b',');
+                    }
+                    encode(out, &Value::Str(key.clone()))?;
+                    out.push(b':');
+                    encode(out, item)?;
+                }
+                out.push(b'}');
+            }
+            scalar => super::wave30_nzb_release_cleanup_commands::encode(out, scalar)?,
+        }
+        Ok(())
+    }
+
+    /// Evaluates one JSON request and returns its JSON response bytes.
+    pub fn output(input: &[u8]) -> Result<Vec<u8>, ()> {
+        let Value::List(items) = parse(input)? else {
+            return Err(());
+        };
+        let Some((Value::Str(operation), args)) = items.split_first() else {
+            return Err(());
+        };
+        let result = evaluate(operation, args)?;
+        let mut out = Vec::with_capacity(64);
+        out.push(b'[');
+        encode(&mut out, &result)?;
+        out.push(b']');
+        Ok(out)
+    }
+}
+
+/// Evaluate one JSON-dispatched BenchmarkRename, PartRepair, UpdateBinaries, OptimizeCbpStorage or
+/// NntmuxResetTruncate helper request without partially writing output.
+/// Returns bytes written, -1 on invalid or declined input/panic, or the negated required size (always <= -3).
+///
+/// # Safety
+/// Both regions must be non-null and allocated for their stated extents, with
+/// lengths fitting isize and no address overflow. Only byte alignment is needed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w31_benchmark_binaries_cbp_reset_commands(
+    input: *const u8,
+    len: usize,
+    out: *mut u8,
+    out_cap: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, len) || !cleaning_ffi_region_valid(out, out_cap) {
+            return -1;
+        }
+        let output = {
+            let input = unsafe { std::slice::from_raw_parts(input, len) };
+            match wave31_benchmark_binaries_cbp_reset_commands::output(input) {
+                Ok(output) => output,
+                Err(()) => return -1,
+            }
+        };
+        let Ok(needed) = i32::try_from(output.len()) else {
+            return -1;
+        };
+        if output.len() > out_cap {
+            return -needed;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(output.as_ptr(), out, output.len()) };
+        needed
+    }))
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod wave31_benchmark_binaries_cbp_reset_commands_tests {
+    use super::nntmux_w31_benchmark_binaries_cbp_reset_commands as ffi;
+    use super::wave31_benchmark_binaries_cbp_reset_commands::{
+        normalize_identity, output, php_number_format, php_round,
+    };
+
+    fn run(request: &str) -> Option<String> {
+        output(request.as_bytes())
+            .ok()
+            .map(|bytes| String::from_utf8(bytes).unwrap())
+    }
+
+    fn ok(request: &str, expected: &str) {
+        assert_eq!(run(request).as_deref(), Some(expected), "request {request}");
+    }
+
+    fn declined(request: &str) {
+        assert_eq!(run(request), None, "request {request}");
+    }
+
+    #[test]
+    fn php_round_and_number_format_match_php() {
+        // Expected values from PHP 8.5 `round()` / `number_format()`.
+        assert_eq!(php_round(1.005, 2), 1.01);
+        assert_eq!(php_round(0.285, 2), 0.29);
+        assert_eq!(php_round(466_548_724_782.908_6, 4), 466_548_724_782.908_7);
+        assert_eq!(php_round(-5_012_712_164.322_246, 6), -5_012_712_164.322_247);
+        assert!(php_round(-0.000_000_1, 6).is_sign_negative());
+        assert_eq!(php_round(0.0, 6), 0.0);
+        assert_eq!(php_number_format(1.005, 2).unwrap(), b"1.01");
+        assert_eq!(php_number_format(0.25, 1).unwrap(), b"0.3");
+        assert_eq!(
+            php_number_format(1_234_567.891_25, 4).unwrap(),
+            b"1,234,567.8913"
+        );
+        assert_eq!(php_number_format(-0.000_01, 4).unwrap(), b"0.0000");
+        assert_eq!(php_number_format(-1234.5, 1).unwrap(), b"-1,234.5");
+        assert!(php_number_format(1e11, 4).is_err());
+    }
+
+    #[test]
+    fn benchmark_rename_helpers_match_php() {
+        ok(
+            r#"["benchmark_rename.compute_statistics",[],5]"#,
+            r#"[{"count":0,"min_ms":0.0,"p50_ms":0.0,"p95_ms":0.0,"p99_ms":0.0,"max_ms":0.0,"mean_ms":0.0,"stddev_ms":0.0,"iqr_ms":0.0,"ops_per_sec":0.0}]"#,
+        );
+        ok(
+            r#"["benchmark_rename.compute_statistics",[3000000,1000000,2000000,4000000],10]"#,
+            r#"[{"count":4,"min_ms":1.0,"p50_ms":2.5,"p95_ms":4.0,"p99_ms":4.0,"max_ms":4.0,"mean_ms":2.5,"stddev_ms":1.290994,"iqr_ms":2.0,"ops_per_sec":4000.0}]"#,
+        );
+        ok(
+            r#"["benchmark_rename.compute_statistics",[-5],1]"#,
+            r#"[{"count":1,"min_ms":-5e-6,"p50_ms":-5e-6,"p95_ms":-5e-6,"p99_ms":-5e-6,"max_ms":-5e-6,"mean_ms":-5e-6,"stddev_ms":0.0,"iqr_ms":0.0,"ops_per_sec":0.0}]"#,
+        );
+        declined(r#"["benchmark_rename.compute_statistics",[1.5],1]"#);
+        declined(r#"["benchmark_rename.compute_statistics",[9223372036854775807,1],1]"#);
+        declined(r#"["benchmark_rename.compute_statistics",[1],9223372036854775807,1]"#);
+        declined(r#"["benchmark_rename.compute_statistics",{"a":1},1]"#);
+
+        ok(
+            r#"["benchmark_rename.is_blocked_production_context"," PROD\n","",""]"#,
+            "[true]",
+        );
+        ok(
+            r#"["benchmark_rename.is_blocked_production_context","local","192.168.1.110:3306",""]"#,
+            "[true]",
+        );
+        ok(
+            r#"["benchmark_rename.is_blocked_production_context","","","mysql://M5Stephen/db"]"#,
+            "[true]",
+        );
+        ok(
+            r#"["benchmark_rename.is_blocked_production_context","production-like","192.168.1.111","nntmux"]"#,
+            "[false]",
+        );
+
+        ok(
+            r#"["benchmark_rename.project_table_row","Clean",{"items":20,"stats":{"ops_per_sec":12345.67,"min_ms":0.00005,"p50_ms":1.5,"p95_ms":2.0,"p99_ms":3.25,"max_ms":1234.56789},"accuracy_verified":false}]"#,
+            r#"[["Clean",20,"12,345.7","0.0001","1.5000","2.0000","3.2500","1,234.5679","FAIL"]]"#,
+        );
+        declined(
+            r#"["benchmark_rename.project_table_row","Clean",{"items":20,"stats":{"ops_per_sec":1,"min_ms":0.0,"p50_ms":0.0,"p95_ms":0.0,"p99_ms":0.0,"max_ms":0.0},"accuracy_verified":true}]"#,
+        );
+        declined(r#"["benchmark_rename.project_table_row","Clean",{"items":20}]"#);
+    }
+
+    #[test]
+    fn part_repair_and_update_binaries_helpers_match_php() {
+        ok(
+            r#"["part_repair.format_group_not_found_message","alt.bin\u0000é"]"#,
+            r#"["Group not found: alt.bin\u0000é"]"#,
+        );
+        ok(
+            r#"["part_repair.format_nntp_error_message",""]"#,
+            r#"["Unable to connect to usenet. Error: "]"#,
+        );
+
+        for (max, expected) in [
+            ("5", 5),
+            ("\" 12 \"", 12),
+            ("\"+7\"", 7),
+            ("\"-7\"", 77),
+            ("\"0\"", 77),
+            ("\"abc\"", 77),
+            ("\"\"", 77),
+            ("null", 77),
+            ("true", 77),
+            ("[5]", 77),
+            ("2.9", 2),
+            ("-2.9", 77),
+        ] {
+            ok(
+                &format!(r#"["update_binaries.resolve_max_headers",{max},77]"#),
+                &format!("[{expected}]"),
+            );
+        }
+        ok(
+            r#"["update_binaries.resolve_max_headers",null,0]"#,
+            "[1000000]",
+        );
+        declined(r#"["update_binaries.resolve_max_headers","1e3",0]"#);
+        declined(r#"["update_binaries.resolve_max_headers","12abc",0]"#);
+        declined(r#"["update_binaries.resolve_max_headers",1e300,0]"#);
+
+        for (seconds, expected) in [
+            ("0.0", "0ms"),
+            ("0.9999", "999ms"),
+            ("-2.5", "-2500ms"),
+            ("1.0", "1.0s"),
+            ("1.25", "1.2s"),
+            ("59.96", "60.0s"),
+            ("60.0", "1m 0s"),
+            ("3599.0", "59m 59s"),
+            ("3600.0", "1h 0m"),
+            ("90061.0", "25h 1m"),
+        ] {
+            ok(
+                &format!(r#"["update_binaries.format_elapsed_time",{seconds}]"#),
+                &format!(r#"["{expected}"]"#),
+            );
+        }
+        declined(r#"["update_binaries.format_elapsed_time",60.5]"#);
+        declined(r#"["update_binaries.format_elapsed_time",-1e300]"#);
+        declined(r#"["update_binaries.format_elapsed_time",60]"#);
+
+        ok(
+            r#"["update_binaries.format_section_header_lines","Updating é Groups"]"#,
+            r#"[["UPDATING é GROUPS","------------------"]]"#,
+        );
+    }
+
+    #[test]
+    fn optimize_cbp_and_reset_helpers_match_php() {
+        assert_eq!(
+            normalize_identity("\0 A\u{3000}\u{180e}B\t\u{85}İ \0".as_bytes()).unwrap(),
+            "a b i\u{307}".as_bytes()
+        );
+        assert!(normalize_identity("ΑΣ".as_bytes()).is_err());
+        ok(
+            r#"["optimize_cbp.normalize_identity","  Foo  BAR\n"]"#,
+            r#"["foo bar"]"#,
+        );
+        ok(
+            r#"["optimize_cbp.compute_binary_cbp_hash",12,"x","y"]"#,
+            r#"["667617304c9dbe586bbaccb2ed72821c"]"#,
+        );
+        ok(
+            r#"["optimize_cbp.compute_binary_cbp_hash",0," My  Subject ","Poster"]"#,
+            r#"["29dc978a268189c82c0eab0ad62a9893"]"#,
+        );
+        ok(
+            r#"["optimize_cbp.compute_binary_cbp_hash",3,"Σ",""]"#,
+            r#"["e45f45ea93a0b75468fe337f69cb526a"]"#,
+        );
+        declined(r#"["optimize_cbp.compute_binary_cbp_hash",0,"Σ",""]"#);
+        for (batch, expected) in [
+            ("-5", "1"),
+            ("0", "1"),
+            ("1", "1"),
+            ("500", "500"),
+            ("5001", "5000"),
+        ] {
+            ok(
+                &format!(r#"["optimize_cbp.clamp_batch_size",{batch}]"#),
+                &format!("[{expected}]"),
+            );
+        }
+
+        ok(
+            r#"["reset_truncate.build_group_reset_payload"]"#,
+            r#"[{"first_record":0,"first_record_postdate":null,"last_record":0,"last_record_postdate":null,"last_updated":null}]"#,
+        );
+        ok(
+            r#"["reset_truncate.tables_to_truncate"]"#,
+            r#"[["parts","missed_parts","binaries","collections"]]"#,
+        );
+        ok(
+            r#"["reset_truncate.format_truncated_success_message",-3]"#,
+            r#"["-3 releases had no nzb, deleted."]"#,
+        );
+        declined(r#"["reset_truncate.tables_to_truncate",1]"#);
+    }
+
+    #[test]
+    fn malformed_requests_are_declined() {
+        for request in [
+            "",
+            "[]",
+            "{}",
+            "[1]",
+            r#"["unknown"]"#,
+            r#"["optimize_cbp.clamp_batch_size",5"#,
+            r#"["optimize_cbp.clamp_batch_size",5] x"#,
+            r#"["optimize_cbp.clamp_batch_size",5.0]"#,
+            r#"["optimize_cbp.clamp_batch_size",9223372036854775808]"#,
+            r#"["optimize_cbp.normalize_identity","\ud800"]"#,
+            r#"["part_repair.format_group_not_found_message",1]"#,
+        ] {
+            declined(request);
+        }
+        assert!(output(b"[\"optimize_cbp.normalize_identity\",\"\xff\"]").is_err());
+    }
+
+    #[test]
+    fn ffi_rejects_bad_regions_and_leaves_short_output_untouched() {
+        let input = br#"["reset_truncate.format_truncated_success_message",12]"#;
+        let expected = br#"["12 releases had no nzb, deleted."]"#;
+        let mut target = vec![0xab_u8; expected.len() + 8];
+        unsafe {
+            for capacity in [0, 1, expected.len() - 1] {
+                assert_eq!(
+                    ffi(input.as_ptr(), input.len(), target.as_mut_ptr(), capacity),
+                    -(expected.len() as i32)
+                );
+                assert!(target.iter().all(|byte| *byte == 0xab));
+            }
+            assert_eq!(
+                ffi(std::ptr::null(), 0, target.as_mut_ptr(), target.len()),
+                -1
+            );
+            assert_eq!(
+                ffi(input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                -1
+            );
+            assert_eq!(
+                ffi(
+                    input.as_ptr(),
+                    usize::MAX,
+                    target.as_mut_ptr(),
+                    target.len()
+                ),
+                -1
+            );
+            let bad = br#"["unknown"]"#;
+            assert_eq!(
+                ffi(bad.as_ptr(), bad.len(), target.as_mut_ptr(), target.len()),
+                -1
+            );
+            assert!(target.iter().all(|byte| *byte == 0xab));
+            assert_eq!(
+                ffi(
+                    input.as_ptr(),
+                    input.len(),
+                    target.as_mut_ptr().add(1),
+                    expected.len()
+                ),
+                expected.len() as i32
+            );
+            assert_eq!(&target[1..1 + expected.len()], expected);
+            assert_eq!(target[0], 0xab);
+        }
+    }
+}

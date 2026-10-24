@@ -6,7 +6,9 @@ namespace App\Console\Commands;
 
 use App\Services\NameFixing\Extractors\ObfuscatedSubjectExtractor;
 use App\Services\NameFixing\FileNameCleaner;
+use App\Support\RustPipelineLibrary;
 use App\Traits\DetectsHashedNames;
+use FFI;
 use Illuminate\Console\Command;
 use Random\Engine\Mt19937;
 use Random\Randomizer;
@@ -16,6 +18,50 @@ use Throwable;
 
 class BenchmarkRename extends Command
 {
+    private const FFI_CDEF = <<<'CDEF'
+int32_t nntmux_w31_benchmark_binaries_cbp_reset_commands(
+    const char *input,
+    size_t len,
+    uint8_t *out,
+    size_t out_cap
+);
+CDEF;
+
+    /** Rust stays opt-in: the JSON FFI round trip is slower than these PHP helpers (< 1.5x). */
+    private const RUST_FFI_DEFAULT = false;
+
+    private static bool $useRustFfi = self::RUST_FFI_DEFAULT;
+
+    private static FFI|false|null $ffi = null;
+
+    public static function useRustFfi(bool $enabled = true): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function setUseRustFfi(?bool $useRustFfi): void
+    {
+        self::$useRustFfi = $useRustFfi ?? self::RUST_FFI_DEFAULT;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    public static function resetRustFfi(): void
+    {
+        self::$useRustFfi = self::RUST_FFI_DEFAULT;
+        self::$ffi = null;
+    }
+
+    public static function setFfiForTesting(FFI|false|null $ffi = null): void
+    {
+        self::$ffi = $ffi;
+    }
+
+    private const STATISTICS_KEYS = ['count', 'min_ms', 'p50_ms', 'p95_ms', 'p99_ms', 'max_ms', 'mean_ms', 'stddev_ms', 'iqr_ms', 'ops_per_sec'];
+
     /**
      * The name and signature of the console command.
      *
@@ -164,30 +210,17 @@ class BenchmarkRename extends Command
         if ($format === 'table' || $format === 'both') {
             $tableRows = [];
             foreach ($strataResults as $res) {
-                $s = $res['stats'];
-                $tableRows[] = [
-                    $res['name'],
-                    $res['items'],
-                    number_format($s['ops_per_sec'], 1),
-                    number_format($s['min_ms'], 4),
-                    number_format($s['p50_ms'], 4),
-                    number_format($s['p95_ms'], 4),
-                    number_format($s['p99_ms'], 4),
-                    number_format($s['max_ms'], 4),
-                    $accuracyVerified ? 'PASS' : 'FAIL',
-                ];
+                $tableRows[] = self::projectBenchmarkTableRow($res['name'], [
+                    'items' => $res['items'],
+                    'stats' => $res['stats'],
+                    'accuracy_verified' => $accuracyVerified,
+                ]);
             }
-            $tableRows[] = [
-                'OVERALL (100 Vectors)',
-                count($dataset),
-                number_format($overallStats['ops_per_sec'], 1),
-                number_format($overallStats['min_ms'], 4),
-                number_format($overallStats['p50_ms'], 4),
-                number_format($overallStats['p95_ms'], 4),
-                number_format($overallStats['p99_ms'], 4),
-                number_format($overallStats['max_ms'], 4),
-                $accuracyVerified ? 'PASS' : 'FAIL',
-            ];
+            $tableRows[] = self::projectBenchmarkTableRow('OVERALL (100 Vectors)', [
+                'items' => count($dataset),
+                'stats' => $overallStats,
+                'accuracy_verified' => $accuracyVerified,
+            ]);
 
             $this->newLine();
             $this->table(
@@ -266,6 +299,60 @@ class BenchmarkRename extends Command
      * }
      */
     public static function computeStatistics(array $durationsNs, int $itemsPerSample): array
+    {
+        return self::$useRustFfi ? self::computeStatisticsNative($durationsNs, $itemsPerSample) : self::computeStatisticsPhp($durationsNs, $itemsPerSample);
+    }
+
+    /**
+     * @param  list<int>  $durationsNs
+     * @return array{
+     *     count: int,
+     *     min_ms: float,
+     *     p50_ms: float,
+     *     p95_ms: float,
+     *     p99_ms: float,
+     *     max_ms: float,
+     *     mean_ms: float,
+     *     stddev_ms: float,
+     *     iqr_ms: float,
+     *     ops_per_sec: float
+     * }
+     */
+    public static function computeStatisticsNative(array $durationsNs, int $itemsPerSample): array
+    {
+        if (self::callNative(['benchmark_rename.compute_statistics', $durationsNs, $itemsPerSample], $result)
+            && is_array($result) && array_keys($result) === self::STATISTICS_KEYS && is_int($result['count'])) {
+            $stats = ['count' => $result['count']];
+            foreach (array_slice(self::STATISTICS_KEYS, 1) as $key) {
+                if (! is_float($result[$key])) {
+                    return self::computeStatisticsPhp($durationsNs, $itemsPerSample);
+                }
+                $stats[$key] = $result[$key];
+            }
+
+            /** @var array{count: int, min_ms: float, p50_ms: float, p95_ms: float, p99_ms: float, max_ms: float, mean_ms: float, stddev_ms: float, iqr_ms: float, ops_per_sec: float} $stats */
+            return $stats;
+        }
+
+        return self::computeStatisticsPhp($durationsNs, $itemsPerSample);
+    }
+
+    /**
+     * @param  list<int>  $durationsNs
+     * @return array{
+     *     count: int,
+     *     min_ms: float,
+     *     p50_ms: float,
+     *     p95_ms: float,
+     *     p99_ms: float,
+     *     max_ms: float,
+     *     mean_ms: float,
+     *     stddev_ms: float,
+     *     iqr_ms: float,
+     *     ops_per_sec: float
+     * }
+     */
+    public static function computeStatisticsPhp(array $durationsNs, int $itemsPerSample): array
     {
         $count = count($durationsNs);
         if ($count === 0) {
@@ -383,11 +470,9 @@ class BenchmarkRename extends Command
         ];
 
         foreach ($candidateEnvs as $rawEnv) {
-            if ($rawEnv !== null && $rawEnv !== false && $rawEnv !== '') {
-                $normalizedEnv = strtolower(trim((string) $rawEnv));
-                if (in_array($normalizedEnv, ['production', 'prod'], true)) {
-                    throw new RuntimeException('FATAL: Benchmark cannot execute in production environment.');
-                }
+            if ($rawEnv !== null && $rawEnv !== false && $rawEnv !== ''
+                && self::isBlockedProductionContext((string) $rawEnv, '', '')) {
+                throw new RuntimeException('FATAL: Benchmark cannot execute in production environment.');
             }
         }
 
@@ -456,6 +541,29 @@ class BenchmarkRename extends Command
         }
 
         foreach ($targets as $target) {
+            if (self::isBlockedProductionContext('', $target, '')) {
+                throw new RuntimeException('FATAL: Target database resolves to production host 192.168.1.110.');
+            }
+        }
+    }
+
+    /**
+     * Whether a normalized application environment or database host/target names production.
+     */
+    public static function isBlockedProductionContext(string $appEnv, string $dbHost, string $dbDatabase): bool
+    {
+        return self::$useRustFfi
+            ? self::isBlockedProductionContextNative($appEnv, $dbHost, $dbDatabase)
+            : self::isBlockedProductionContextPhp($appEnv, $dbHost, $dbDatabase);
+    }
+
+    public static function isBlockedProductionContextPhp(string $appEnv, string $dbHost, string $dbDatabase): bool
+    {
+        if (in_array(strtolower(trim($appEnv)), ['production', 'prod'], true)) {
+            return true;
+        }
+
+        foreach ([$dbHost, $dbDatabase] as $target) {
             $targetLower = strtolower(trim($target));
             $strippedHost = explode(':', $targetLower)[0];
 
@@ -464,8 +572,132 @@ class BenchmarkRename extends Command
                 || str_contains($targetLower, '192.168.1.110')
                 || str_contains($targetLower, 'm5stephen')
             ) {
-                throw new RuntimeException('FATAL: Target database resolves to production host 192.168.1.110.');
+                return true;
             }
         }
+
+        return false;
+    }
+
+    public static function isBlockedProductionContextNative(string $appEnv, string $dbHost, string $dbDatabase): bool
+    {
+        if (self::callNative(['benchmark_rename.is_blocked_production_context', $appEnv, $dbHost, $dbDatabase], $result) && is_bool($result)) {
+            return $result;
+        }
+
+        return self::isBlockedProductionContextPhp($appEnv, $dbHost, $dbDatabase);
+    }
+
+    /**
+     * Console table row for one benchmark result.
+     *
+     * @param  array{items: int, stats: array{ops_per_sec: float, min_ms: float, p50_ms: float, p95_ms: float, p99_ms: float, max_ms: float}, accuracy_verified: bool}  $result
+     * @return list<int|string>
+     */
+    public static function projectBenchmarkTableRow(string $method, array $result): array
+    {
+        return self::$useRustFfi ? self::projectBenchmarkTableRowNative($method, $result) : self::projectBenchmarkTableRowPhp($method, $result);
+    }
+
+    /**
+     * @param  array{items: int, stats: array{ops_per_sec: float, min_ms: float, p50_ms: float, p95_ms: float, p99_ms: float, max_ms: float}, accuracy_verified: bool}  $result
+     * @return list<int|string>
+     */
+    public static function projectBenchmarkTableRowPhp(string $method, array $result): array
+    {
+        $s = $result['stats'];
+
+        return [
+            $method,
+            $result['items'],
+            number_format($s['ops_per_sec'], 1),
+            number_format($s['min_ms'], 4),
+            number_format($s['p50_ms'], 4),
+            number_format($s['p95_ms'], 4),
+            number_format($s['p99_ms'], 4),
+            number_format($s['max_ms'], 4),
+            $result['accuracy_verified'] ? 'PASS' : 'FAIL',
+        ];
+    }
+
+    /**
+     * @param  array{items: int, stats: array{ops_per_sec: float, min_ms: float, p50_ms: float, p95_ms: float, p99_ms: float, max_ms: float}, accuracy_verified: bool}  $result
+     * @return list<int|string>
+     */
+    public static function projectBenchmarkTableRowNative(string $method, array $result): array
+    {
+        if (self::callNative(['benchmark_rename.project_table_row', $method, $result], $row)
+            && is_array($row) && array_is_list($row) && count($row) === 9 && is_int($row[1])) {
+            $cells = [];
+            foreach ($row as $index => $cell) {
+                if ($index !== 1 && ! is_string($cell)) {
+                    return self::projectBenchmarkTableRowPhp($method, $result);
+                }
+                $cells[] = $cell;
+            }
+
+            /** @var list<int|string> $cells */
+            return $cells;
+        }
+
+        return self::projectBenchmarkTableRowPhp($method, $result);
+    }
+
+    /**
+     * Evaluates `[operation, ...arguments]` in Rust; false means the caller keeps its PHP result.
+     *
+     * @param  list<mixed>  $request
+     *
+     * @param-out mixed $result
+     */
+    private static function callNative(array $request, mixed &$result = null): bool
+    {
+        $ffi = self::nativeFfi();
+        if (! $ffi instanceof FFI) {
+            return false;
+        }
+
+        try {
+            $json = json_encode($request, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION | JSON_THROW_ON_ERROR);
+            $capacity = max(256, strlen($json) * 2 + 256);
+            for ($attempt = 0; $attempt < 2; $attempt++) {
+                $buffer = $ffi->new("uint8_t[{$capacity}]");
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w31_benchmark_binaries_cbp_reset_commands($json, strlen($json), $buffer, $capacity);
+                if (! is_int($written) || $written === -1 || $written === 0) {
+                    return false;
+                }
+                if ($written < 0) {
+                    $capacity = -$written;
+
+                    continue;
+                }
+                $decoded = json_decode(FFI::string($buffer, $written), true, 8, JSON_THROW_ON_ERROR);
+                if (! is_array($decoded) || count($decoded) !== 1 || ! array_key_exists(0, $decoded)) {
+                    return false;
+                }
+                $result = $decoded[0];
+
+                return true;
+            }
+        } catch (Throwable) {
+            return false;
+        }
+
+        return false;
+    }
+
+    private static function nativeFfi(): ?FFI
+    {
+        if (self::$ffi === false) {
+            return null;
+        }
+        if (self::$ffi instanceof FFI) {
+            return self::$ffi;
+        }
+        $ffi = RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF);
+        self::$ffi = $ffi ?? false;
+
+        return $ffi;
     }
 }
