@@ -7,6 +7,8 @@ namespace App\Console\Commands;
 use App\Facades\Search;
 use App\Models\Release;
 use App\Services\Search\Support\ManticoreClientFactory;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -144,13 +146,11 @@ class UpdateReleasesIndexSchema extends Command
             }
 
             $headers = ['Field', 'Type', 'Properties'];
-            $rows = [];
+            $rows = self::projectManticoreColumnRows($columns);
             $existingFields = [];
 
             foreach ($columns as $field => $props) {
                 $type = $props['Type'] ?? 'unknown';
-                $properties = isset($props['Properties']) ? implode(', ', (array) $props['Properties']) : '';
-                $rows[] = [$field, $type, $properties];
                 $existingFields[$field] = strtolower($type);
             }
 
@@ -158,12 +158,7 @@ class UpdateReleasesIndexSchema extends Command
             $this->newLine();
 
             // Check for missing fields
-            $missingFields = [];
-            foreach ($this->expectedFields as $field => $config) {
-                if (! isset($existingFields[$field]) && $field !== 'id') {
-                    $missingFields[] = $field;
-                }
-            }
+            $missingFields = array_keys(self::computeMissingManticoreFields($this->expectedFields, $existingFields));
 
             if (! empty($missingFields)) {
                 $this->warn('Missing fields that should be added:');
@@ -237,12 +232,9 @@ class UpdateReleasesIndexSchema extends Command
                 'haspreview' => 'int',
             ];
 
-            $fieldsToAdd = [];
-            foreach ($mediaFields as $field => $type) {
-                if (! isset($existingFields[$field]) || $this->option('force')) {
-                    $fieldsToAdd[$field] = $type;
-                }
-            }
+            $fieldsToAdd = $this->option('force')
+                ? $mediaFields
+                : self::computeMissingManticoreFields($mediaFields, $existingFields);
 
             if (empty($fieldsToAdd)) {
                 $this->info('All media fields already exist in the index.');
@@ -261,9 +253,15 @@ class UpdateReleasesIndexSchema extends Command
                 return Command::SUCCESS;
             }
 
-            // Add each field using the ManticoreSearch PHP client alter method
+            // Resolve the supported ALTER statement before sending it to Manticore.
             foreach ($fieldsToAdd as $field => $type) {
                 try {
+                    $sql = self::resolveManticoreAlterColumnSql('releases_rt', $field, $type);
+                    if ($sql === null) {
+                        $this->error("Unsupported field type: {$type}");
+
+                        return Command::FAILURE;
+                    }
                     $this->client->table('releases_rt')->alter('add', $field, $type);
                     $this->info("Added field: {$field}");
                 } catch (ResponseException $e) {
@@ -560,5 +558,238 @@ class UpdateReleasesIndexSchema extends Command
         } catch (\Throwable $e) {
             throw $e;
         }
+    }
+
+    // FFI serialization/allocation does not qualify for the 1.5x default-on gate.
+    private static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
+
+    public const string FFI_CDEF = 'ptrdiff_t nntmux_search_schema_log_steam(unsigned int mode, const char *input, size_t input_len, char *out, size_t cap);';
+
+    public static function setUseRustFfi(?bool $enabled): void
+    {
+        self::$useRustFfi = $enabled ?? false;
+    }
+
+    public static function useRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::useRustFfi();
+    }
+
+    public static function setFfiForTesting(FFI|false|null $ffi): void
+    {
+        self::$ffi = $ffi;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+            self::$ffi = RustPipelineLibrary::resolveDomain(
+                'search-schema-log-steam', self::FFI_CDEF,
+                is_string($path) && $path !== '' ? $path : null,
+            ) ?? false;
+        }
+
+        return self::$ffi instanceof FFI ? self::$ffi : null;
+    }
+
+    private static function callFfi(FFI $ffi, string $symbol, mixed ...$args): mixed
+    {
+        return $ffi->$symbol(...$args);
+    }
+
+    /**
+     * Length-prefixed binary packets preserve PHP byte strings, including NULs.
+     *
+     * @param  list<string>  $items
+     * @return list<string>|null
+     */
+    private static function nativePacket(int $mode, array $items): ?array
+    {
+        $ffi = self::ffi();
+        if ($ffi === null || count($items) > 100000) {
+            return null;
+        }
+
+        try {
+            $input = pack('V', count($items));
+            foreach ($items as $item) {
+                if (strlen($item) > 16777216) {
+                    return null;
+                }
+                $input .= pack('V', strlen($item)).$item;
+                if (strlen($input) > 16777216) {
+                    return null;
+                }
+            }
+            $cap = strlen($input) + 256;
+            $out = $ffi->new("char[{$cap}]");
+            $written = self::callFfi($ffi, 'nntmux_search_schema_log_steam', $mode, $input, strlen($input), $out, $cap);
+            if (is_int($written) && $written < 0 && $written >= -16777216) {
+                $cap = -$written;
+                $out = $ffi->new("char[{$cap}]");
+                $written = self::callFfi($ffi, 'nntmux_search_schema_log_steam', $mode, $input, strlen($input), $out, $cap);
+            }
+            if (! is_int($written) || $written < 4 || $written > $cap) {
+                return null;
+            }
+            $packet = FFI::string($out, $written);
+            $count = unpack('Vcount', $packet)['count'];
+            $offset = 4;
+            $result = [];
+            for ($i = 0; $i < $count; $i++) {
+                if ($offset + 4 > $written) {
+                    return null;
+                }
+                $length = unpack('Vlength', $packet, $offset)['length'];
+                $offset += 4;
+                if ($length > $written - $offset) {
+                    return null;
+                }
+                $result[] = substr($packet, $offset, $length);
+                $offset += $length;
+            }
+
+            return $offset === $written ? $result : null;
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $columns
+     * @return list<array{mixed, mixed, string}>
+     */
+    public static function projectManticoreColumnRows(array $columns): array
+    {
+        return self::useRustFfi() ? self::projectManticoreColumnRowsNative($columns) : self::projectManticoreColumnRowsPhp($columns);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $columns
+     * @return list<array{mixed, mixed, string}>
+     */
+    public static function projectManticoreColumnRowsPhp(array $columns): array
+    {
+        $rows = [];
+        foreach ($columns as $field => $props) {
+            $rows[] = [$field, $props['Type'] ?? 'unknown', isset($props['Properties']) ? implode(', ', (array) $props['Properties']) : ''];
+        }
+
+        return $rows;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $columns
+     * @return list<array{mixed, mixed, string}>
+     */
+    public static function projectManticoreColumnRowsNative(array $columns): array
+    {
+        $items = [];
+        foreach ($columns as $field => $props) {
+            if (! is_array($props) || ! is_string($props['Type'] ?? 'unknown')) {
+                return self::projectManticoreColumnRowsPhp($columns);
+            }
+            $properties = (array) ($props['Properties'] ?? []);
+            $items[] = (string) $field;
+            $items[] = $props['Type'] ?? 'unknown';
+            $items[] = (string) count($properties);
+            foreach ($properties as $property) {
+                if (! is_scalar($property) && $property !== null) {
+                    return self::projectManticoreColumnRowsPhp($columns);
+                }
+                $items[] = (string) $property;
+            }
+        }
+        $output = self::nativePacket(7, $items);
+        if ($output === null || count($output) !== count($columns) * 3) {
+            return self::projectManticoreColumnRowsPhp($columns);
+        }
+        $rows = [];
+        foreach (array_keys($columns) as $i => $field) {
+            $rows[] = [$field, $output[$i * 3 + 1], $output[$i * 3 + 2]];
+        }
+
+        return $rows;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $expectedSchema
+     * @param  array<array-key, mixed>  $existingFields
+     * @return array<array-key, mixed>
+     */
+    public static function computeMissingManticoreFields(array $expectedSchema, array $existingFields): array
+    {
+        return self::useRustFfi() ? self::computeMissingManticoreFieldsNative($expectedSchema, $existingFields) : self::computeMissingManticoreFieldsPhp($expectedSchema, $existingFields);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $expectedSchema
+     * @param  array<array-key, mixed>  $existingFields
+     * @return array<array-key, mixed>
+     */
+    public static function computeMissingManticoreFieldsPhp(array $expectedSchema, array $existingFields): array
+    {
+        $missing = [];
+        foreach ($expectedSchema as $field => $config) {
+            if (! isset($existingFields[$field]) && $field !== 'id') {
+                $missing[$field] = $config;
+            }
+        }
+
+        return $missing;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $expectedSchema
+     * @param  array<array-key, mixed>  $existingFields
+     * @return array<array-key, mixed>
+     */
+    public static function computeMissingManticoreFieldsNative(array $expectedSchema, array $existingFields): array
+    {
+        $items = [];
+        $keys = array_keys($expectedSchema);
+        foreach ($keys as $i => $field) {
+            array_push($items, (string) $field, isset($existingFields[$field]) ? '1' : '0', (string) $i);
+        }
+        $indices = self::nativePacket(8, $items);
+        if ($indices === null) {
+            return self::computeMissingManticoreFieldsPhp($expectedSchema, $existingFields);
+        }
+        $missing = [];
+        foreach ($indices as $index) {
+            $field = $keys[(int) $index];
+            $missing[$field] = $expectedSchema[$field];
+        }
+
+        return $missing;
+    }
+
+    public static function resolveManticoreAlterColumnSql(string $tableName, string $field, string $type): ?string
+    {
+        return self::useRustFfi() ? self::resolveManticoreAlterColumnSqlNative($tableName, $field, $type) : self::resolveManticoreAlterColumnSqlPhp($tableName, $field, $type);
+    }
+
+    public static function resolveManticoreAlterColumnSqlPhp(string $tableName, string $field, string $type): ?string
+    {
+        $sqlType = match ($type) {
+            'text' => 'text', 'int' => 'uint', 'bigint' => 'bigint', 'string' => 'string', default => null,
+        };
+
+        return $sqlType === null ? null : "ALTER TABLE {$tableName} ADD COLUMN {$field} {$sqlType}";
+    }
+
+    public static function resolveManticoreAlterColumnSqlNative(string $tableName, string $field, string $type): ?string
+    {
+        $output = self::nativePacket(9, [$tableName, $field, $type]);
+
+        return $output === null ? self::resolveManticoreAlterColumnSqlPhp($tableName, $field, $type) : ($output[0] ?? null);
     }
 }

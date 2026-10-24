@@ -7,7 +7,9 @@ namespace App\Console\Commands;
 use App\Facades\Elasticsearch;
 use App\Models\Release;
 use App\Services\Search\Support\ElasticsearchResponseHelper;
+use App\Support\RustPipelineLibrary;
 use Elastic\Elasticsearch\Client as ElasticsearchClient;
+use FFI;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -170,31 +172,15 @@ class UpdateReleasesIndexSchemaES extends Command
             $existingFields = [];
 
             foreach ($properties as $field => $config) {
-                $type = $config['type'] ?? 'unknown';
-                $props = [];
-                if (isset($config['analyzer'])) {
-                    $props[] = "analyzer: {$config['analyzer']}";
-                }
-                if (isset($config['index']) && ! $config['index']) {
-                    $props[] = 'not indexed';
-                }
-                if (isset($config['fields'])) {
-                    $props[] = 'multi-field';
-                }
-                $rows[] = [$field, $type, implode(', ', $props)];
-                $existingFields[$field] = $type;
+                $rows[] = self::projectEsPropertyRow((string) $field, $config);
+                $existingFields[$field] = $config['type'] ?? 'unknown';
             }
 
             $this->table($headers, $rows);
             $this->newLine();
 
             // Check for missing media fields
-            $missingFields = [];
-            foreach ($this->mediaFields as $field => $config) {
-                if (! isset($existingFields[$field])) {
-                    $missingFields[] = $field;
-                }
-            }
+            $missingFields = array_keys(self::computeMissingMediaFields($this->mediaFields, $existingFields));
 
             if (! empty($missingFields)) {
                 $this->warn('Missing media fields that should be added:');
@@ -247,12 +233,9 @@ class UpdateReleasesIndexSchemaES extends Command
             $existingProperties = $mapping[$indexName]['mappings']['properties'] ?? [];
 
             // Find fields to add
-            $fieldsToAdd = [];
-            foreach ($this->mediaFields as $field => $config) {
-                if (! isset($existingProperties[$field]) || $this->option('force')) {
-                    $fieldsToAdd[$field] = $config;
-                }
-            }
+            $fieldsToAdd = $this->option('force')
+                ? $this->mediaFields
+                : self::computeMissingMediaFields($this->mediaFields, $existingProperties);
 
             if (empty($fieldsToAdd)) {
                 $this->info('All media fields already exist in the index.');
@@ -602,9 +585,11 @@ class UpdateReleasesIndexSchemaES extends Command
     private function prepareMediaData(mixed $release): array
     {
         return [
-            'imdbid' => (string) ($release->imdbid ?: ''),
-            'tmdbid' => (int) ($release->tmdbid ?: ($release->video_tmdb ?: 0)),
-            'traktid' => (int) ($release->traktid ?: ($release->video_trakt ?: 0)),
+            ...self::buildMediaDocPayload(
+                $release->imdbid ?: '',
+                (int) ($release->tmdbid ?: ($release->video_tmdb ?: 0)),
+                (int) ($release->traktid ?: ($release->video_trakt ?: 0)),
+            ),
             'tvdb' => (int) ($release->tvdb ?: 0),
             'tvmaze' => (int) ($release->tvmaze ?: 0),
             'tvrage' => (int) ($release->tvrage ?: 0),
@@ -639,5 +624,228 @@ class UpdateReleasesIndexSchemaES extends Command
             // Other error, assume no media IDs
             return false;
         }
+    }
+
+    // FFI serialization/allocation does not qualify for the 1.5x default-on gate.
+    private static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
+
+    public const string FFI_CDEF = 'ptrdiff_t nntmux_search_schema_log_steam(unsigned int mode, const char *input, size_t input_len, char *out, size_t cap);';
+
+    public static function setUseRustFfi(?bool $enabled): void
+    {
+        self::$useRustFfi = $enabled ?? false;
+    }
+
+    public static function useRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::useRustFfi();
+    }
+
+    public static function setFfiForTesting(FFI|false|null $ffi): void
+    {
+        self::$ffi = $ffi;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+            self::$ffi = RustPipelineLibrary::resolveDomain(
+                'search-schema-log-steam', self::FFI_CDEF,
+                is_string($path) && $path !== '' ? $path : null,
+            ) ?? false;
+        }
+
+        return self::$ffi instanceof FFI ? self::$ffi : null;
+    }
+
+    private static function callFfi(FFI $ffi, string $symbol, mixed ...$args): mixed
+    {
+        return $ffi->$symbol(...$args);
+    }
+
+    /**
+     * Length-prefixed binary packets preserve PHP byte strings, including NULs.
+     *
+     * @param  list<string>  $items
+     * @return list<string>|null
+     */
+    private static function nativePacket(int $mode, array $items): ?array
+    {
+        $ffi = self::ffi();
+        if ($ffi === null || count($items) > 100000) {
+            return null;
+        }
+
+        try {
+            $input = pack('V', count($items));
+            foreach ($items as $item) {
+                if (strlen($item) > 16777216) {
+                    return null;
+                }
+                $input .= pack('V', strlen($item)).$item;
+                if (strlen($input) > 16777216) {
+                    return null;
+                }
+            }
+            $cap = strlen($input) + 256;
+            $out = $ffi->new("char[{$cap}]");
+            $written = self::callFfi($ffi, 'nntmux_search_schema_log_steam', $mode, $input, strlen($input), $out, $cap);
+            if (is_int($written) && $written < 0 && $written >= -16777216) {
+                $cap = -$written;
+                $out = $ffi->new("char[{$cap}]");
+                $written = self::callFfi($ffi, 'nntmux_search_schema_log_steam', $mode, $input, strlen($input), $out, $cap);
+            }
+            if (! is_int($written) || $written < 4 || $written > $cap) {
+                return null;
+            }
+            $packet = FFI::string($out, $written);
+            $count = unpack('Vcount', $packet)['count'];
+            $offset = 4;
+            $result = [];
+            for ($i = 0; $i < $count; $i++) {
+                if ($offset + 4 > $written) {
+                    return null;
+                }
+                $length = unpack('Vlength', $packet, $offset)['length'];
+                $offset += 4;
+                if ($length > $written - $offset) {
+                    return null;
+                }
+                $result[] = substr($packet, $offset, $length);
+                $offset += $length;
+            }
+
+            return $offset === $written ? $result : null;
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $config
+     * @return array{string, mixed, string}
+     */
+    public static function projectEsPropertyRow(string $field, array $config): array
+    {
+        return self::useRustFfi() ? self::projectEsPropertyRowNative($field, $config) : self::projectEsPropertyRowPhp($field, $config);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $config
+     * @return array{string, mixed, string}
+     */
+    public static function projectEsPropertyRowPhp(string $field, array $config): array
+    {
+        $details = [];
+        if (isset($config['analyzer'])) {
+            $details[] = "analyzer: {$config['analyzer']}";
+        }
+        if (($config['index'] ?? null) === false) {
+            $details[] = 'not indexed';
+        }
+        if (! empty($config['fields'])) {
+            $details[] = 'multi-field';
+        }
+
+        return [$field, $config['type'] ?? 'unknown', implode(', ', $details)];
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $config
+     * @return array{string, mixed, string}
+     */
+    public static function projectEsPropertyRowNative(string $field, array $config): array
+    {
+        $type = $config['type'] ?? 'unknown';
+        $analyzer = $config['analyzer'] ?? '';
+        if (! is_string($type) || ! is_scalar($analyzer)) {
+            return self::projectEsPropertyRowPhp($field, $config);
+        }
+        $output = self::nativePacket(10, [$field, $type, isset($config['analyzer']) ? '1' : '0', (string) $analyzer, ($config['index'] ?? null) === false ? '1' : '0', ! empty($config['fields']) ? '1' : '0']);
+
+        return $output !== null && count($output) === 3 ? [$output[0], $output[1], $output[2]] : self::projectEsPropertyRowPhp($field, $config);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $expectedMediaFields
+     * @param  array<array-key, mixed>  $existingProperties
+     * @return array<array-key, mixed>
+     */
+    public static function computeMissingMediaFields(array $expectedMediaFields, array $existingProperties): array
+    {
+        return self::useRustFfi() ? self::computeMissingMediaFieldsNative($expectedMediaFields, $existingProperties) : self::computeMissingMediaFieldsPhp($expectedMediaFields, $existingProperties);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $expectedMediaFields
+     * @param  array<array-key, mixed>  $existingProperties
+     * @return array<array-key, mixed>
+     */
+    public static function computeMissingMediaFieldsPhp(array $expectedMediaFields, array $existingProperties): array
+    {
+        $missing = [];
+        foreach ($expectedMediaFields as $field => $config) {
+            if (! isset($existingProperties[$field])) {
+                $missing[$field] = $config;
+            }
+        }
+
+        return $missing;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $expectedMediaFields
+     * @param  array<array-key, mixed>  $existingProperties
+     * @return array<array-key, mixed>
+     */
+    public static function computeMissingMediaFieldsNative(array $expectedMediaFields, array $existingProperties): array
+    {
+        $items = [];
+        $keys = array_keys($expectedMediaFields);
+        foreach ($keys as $i => $field) {
+            array_push($items, (string) $field, isset($existingProperties[$field]) ? '1' : '0', (string) $i);
+        }
+        $indices = self::nativePacket(11, $items);
+        if ($indices === null) {
+            return self::computeMissingMediaFieldsPhp($expectedMediaFields, $existingProperties);
+        }
+        $missing = [];
+        foreach ($indices as $index) {
+            $field = $keys[(int) $index];
+            $missing[$field] = $expectedMediaFields[$field];
+        }
+
+        return $missing;
+    }
+
+    /** @return array{imdbid: string, tmdbid: int, traktid: int} */
+    public static function buildMediaDocPayload(mixed $imdbid, int $tmdbid, int $traktid): array
+    {
+        return self::useRustFfi() ? self::buildMediaDocPayloadNative($imdbid, $tmdbid, $traktid) : self::buildMediaDocPayloadPhp($imdbid, $tmdbid, $traktid);
+    }
+
+    /** @return array{imdbid: string, tmdbid: int, traktid: int} */
+    public static function buildMediaDocPayloadPhp(mixed $imdbid, int $tmdbid, int $traktid): array
+    {
+        return ['imdbid' => (string) ($imdbid ?? ''), 'tmdbid' => $tmdbid, 'traktid' => $traktid];
+    }
+
+    /** @return array{imdbid: string, tmdbid: int, traktid: int} */
+    public static function buildMediaDocPayloadNative(mixed $imdbid, int $tmdbid, int $traktid): array
+    {
+        if (! is_scalar($imdbid) && $imdbid !== null) {
+            return self::buildMediaDocPayloadPhp($imdbid, $tmdbid, $traktid);
+        }
+        $output = self::nativePacket(12, [(string) ($imdbid ?? ''), (string) $tmdbid, (string) $traktid]);
+
+        return $output !== null && count($output) === 3 ? ['imdbid' => $output[0], 'tmdbid' => (int) $output[1], 'traktid' => (int) $output[2]] : self::buildMediaDocPayloadPhp($imdbid, $tmdbid, $traktid);
     }
 }
