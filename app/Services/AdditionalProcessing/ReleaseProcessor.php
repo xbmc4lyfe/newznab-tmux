@@ -24,15 +24,41 @@ use App\Services\AdditionalProcessing\State\ReleaseProcessingContext;
 use App\Services\NameFixing\SeasonPackDetector;
 use App\Services\Releases\ReleaseBrowseService;
 use App\Services\TempWorkspaceService;
+use App\Support\RustPipelineLibrary;
 use dariusiii\rarinfo\ArchiveInfo;
 use dariusiii\rarinfo\SzipInfo;
+use FFI;
 use Illuminate\Support\Facades\File;
+use Throwable;
 
 /**
  * Stateless release processor for additional post-processing.
  */
 class ReleaseProcessor
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_release_parse_release_files_nul(const char *raw_ptr, size_t raw_len, char *out_ptr, size_t out_cap);
+        ssize_t nntmux_release_normalize_subject(const char *ptr, size_t len, char *out_ptr, size_t out_cap);
+        int32_t nntmux_release_contains_video_pattern(const char *subject_ptr, size_t subject_len, const char *video_regex_ptr, size_t video_regex_len);
+        int32_t nntmux_release_has_usable_sample_filename(const char *ptr, size_t len);
+        int32_t nntmux_release_is_auxiliary_nzb_subject(const char *subject_ptr, size_t subject_len, const char *support_regex_ptr, size_t support_regex_len);
+        int32_t nntmux_release_subject_matches_release(const char *subject_ptr, size_t subject_len, const char *release_ptr, size_t release_len);
+        C;
+
+    private const string DEFAULT_AUDIO_FILE_REGEX = '\.(AAC|AIFF|APE|AC3|ASF|DTS|FLAC|MKA|MKS|MP2|MP3|RA|OGG|OGM|W64|WAV|WMA)';
+
+    private const string DEFAULT_IGNORE_BOOK_REGEX = '/\b(epub|lit|mobi|pdf|sipdf|html)\b.*\.rar(?!.{20,})/i';
+
+    private const string DEFAULT_SUPPORT_FILE_REGEX = '\.(?:vol\d{1,3}\+\d{1,3}|par2|srs|sfv|nzb)';
+
+    private const string DEFAULT_VIDEO_FILE_REGEX = '\.(AVI|F4V|IFO|M1V|M2V|M4V|MKV|MOV|MP4|MPEG|MPG|MPGV|MPV|OGV|QT|RM|RMVB|TS|VOB|WMV)';
+
+    private const string ARCHIVE_PATTERN = '/(\.(part\d+|[rz]\d+|rar|7z|0+|0*10?|zipr\d{2,3}|zipx?)("|\s*\.rar)*($|[ ")]|-])|"[a-f0-9]{32}\.[1-9]\d{1,2}".*\(\d+\/\d{2,}\)$)/i';
+
+    private static ?FFI $ffi = null;
+
+    private static bool $ffiResolved = false;
+
     /**
      * @var array<int, string>
      */
@@ -121,7 +147,7 @@ class ReleaseProcessor
                 ProcessingStage::WorkspacePreparation,
                 fn (): string => $this->tempWorkspace->createReleaseTempFolder($mainTmpPath, $release->guid),
             );
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             $this->output->warning('Unable to prepare release temp directory: '.$e->getMessage());
 
             return $this->result(
@@ -627,7 +653,7 @@ class ReleaseProcessor
                 $this->groupNameCache[$groupId] = UsenetGroup::getNameByID($groupId);
             }
             $context->releaseGroupName = $this->groupNameCache[$groupId];
-        } catch (\Throwable) {
+        } catch (Throwable) {
             $context->releaseGroupName = '';
         }
         $context->releaseHasNoNFO = (int) $context->release->nfostatus !== 1;
@@ -1245,7 +1271,7 @@ class ReleaseProcessor
 
             try {
                 $files = $this->tempWorkspace->listFiles($context->tmpPath, $pattern);
-            } catch (\Throwable) {
+            } catch (Throwable) {
                 break;
             }
 
@@ -1271,7 +1297,7 @@ class ReleaseProcessor
 
         try {
             $files = $this->tempWorkspace->listFiles($context->tmpPath);
-        } catch (\Throwable) {
+        } catch (Throwable) {
             return;
         }
 
@@ -1412,5 +1438,443 @@ class ReleaseProcessor
             }
             File::delete($path);
         }
+    }
+
+    /**
+     * Parse a `|`-separated list of `filename*size` pairs into structured entries.
+     *
+     * Retains the native PHP path in production (~1.34x–1.41x mean speedup in paired
+     * benchmarks, below the 1.5x adoption threshold due to per-entry array allocation
+     * in PHP); see parseReleaseFilesNative() for the Rust FFI implementation.
+     *
+     * @return list<array{name: string, size: int}>
+     */
+    public static function parseReleaseFiles(string $raw): array
+    {
+        return self::parseReleaseFilesPhp($raw);
+    }
+
+    /**
+     * @return list<array{name: string, size: int}>
+     */
+    public static function parseReleaseFilesPhp(string $raw): array
+    {
+        $trimmed = trim($raw);
+        if ($trimmed === '') {
+            return [];
+        }
+
+        $files = [];
+        foreach (explode('|', $trimmed) as $entry) {
+            $entry = trim($entry);
+            if ($entry === '' || preg_match('/^(.+)\*(\d+)$/sD', $entry, $match) !== 1) {
+                continue;
+            }
+            $name = trim($match[1]);
+            if ($name === '') {
+                continue;
+            }
+            $size = filter_var($match[2], FILTER_VALIDATE_INT);
+            if ($size === false || $size < 0) {
+                continue;
+            }
+            $files[] = [
+                'name' => $name,
+                'size' => $size,
+            ];
+        }
+
+        return $files;
+    }
+
+    /**
+     * @return list<array{name: string, size: int}>
+     */
+    public static function parseReleaseFilesNative(string $raw, bool &$supported = false, ?string $libraryPath = null): array
+    {
+        $supported = false;
+        if (str_contains($raw, "\0")) {
+            return self::parseReleaseFilesPhp($raw);
+        }
+
+        $ffi = $libraryPath === null
+            ? self::ffi()
+            : RustPipelineLibrary::resolveDomain('release_processor', self::FFI_CDEF, $libraryPath);
+        if ($ffi === null) {
+            return self::parseReleaseFilesPhp($raw);
+        }
+
+        $rawLen = strlen($raw);
+        if ($rawLen === 0) {
+            $supported = true;
+
+            return [];
+        }
+
+        $needed = $rawLen + 32;
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, $needed, $cap);
+        if ($scratch === null) {
+            return self::parseReleaseFilesPhp($raw);
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_release_parse_release_files_nul($raw, $rawLen, $scratch, $cap);
+            if (is_int($written) && $written < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return self::parseReleaseFilesPhp($raw);
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_release_parse_release_files_nul($raw, $rawLen, $scratch, $cap);
+            }
+        } catch (Throwable) {
+            return self::parseReleaseFilesPhp($raw);
+        }
+
+        if (! is_int($written) || $written < 0) {
+            return self::parseReleaseFilesPhp($raw);
+        }
+
+        $supported = true;
+        if ($written === 0) {
+            return [];
+        }
+
+        $parts = explode("\0", FFI::string($scratch, $written));
+        $files = [];
+        for ($i = 0, $n = count($parts); $i + 1 < $n; $i += 2) {
+            $files[] = [
+                'name' => $parts[$i],
+                'size' => (int) $parts[$i + 1],
+            ];
+        }
+
+        return $files;
+    }
+
+    /**
+     * Extract message ID candidates and work plan from parsed NZB contents.
+     *
+     * @param  array<int|string, mixed>  $nzbContents
+     */
+    public function extractMessageIdCandidates(array $nzbContents, string $groupName = ''): AdditionalWorkPlan
+    {
+        return $this->workPlanner->plan($nzbContents, $groupName);
+    }
+
+    /**
+     * @param  array<int|string, mixed>  $nzbContents
+     */
+    public function extractMessageIdCandidatesPhp(array $nzbContents, string $groupName = ''): AdditionalWorkPlan
+    {
+        return $this->workPlanner->planPhp($nzbContents, $groupName);
+    }
+
+    /**
+     * @param  array<int|string, mixed>  $nzbContents
+     */
+    public function extractMessageIdCandidatesNative(array $nzbContents, string $groupName = '', bool &$supported = false): AdditionalWorkPlan
+    {
+        $canUseRust = $this->config->audioFileRegex === self::DEFAULT_AUDIO_FILE_REGEX
+            && $this->config->ignoreBookRegex === self::DEFAULT_IGNORE_BOOK_REGEX
+            && $this->config->supportFileRegex === self::DEFAULT_SUPPORT_FILE_REGEX
+            && $this->config->videoFileRegex === self::DEFAULT_VIDEO_FILE_REGEX
+            && ! str_contains($groupName, "\0")
+            && RustPipelineLibrary::resolveDomain('release_processor', self::FFI_CDEF) !== null;
+        if ($canUseRust) {
+            foreach ($nzbContents as $file) {
+                if (is_array($file) && str_contains((string) ($file['title'] ?? ''), "\0")) {
+                    $canUseRust = false;
+                    break;
+                }
+            }
+        }
+        $supported = $canUseRust;
+
+        return $this->workPlanner->plan($nzbContents, $groupName);
+    }
+
+    /**
+     * Normalize an NZB subject line into its canonical lower-cased file name.
+     *
+     * Retains the native PHP path in production (~0.65x–0.75x in single-string paired
+     * benchmarks due to FFI string return marshaling; batched classification uses
+     * nntmux_additional_classify_titles_nul); see normalizeSubjectNative().
+     */
+    public static function normalizeSubject(string $subject): string
+    {
+        return self::normalizeSubjectPhp($subject);
+    }
+
+    public static function normalizeSubjectPhp(string $subject): string
+    {
+        return ArchiveCandidate::fileNamePhp($subject);
+    }
+
+    public static function normalizeSubjectNative(string $subject, bool &$supported = false, ?string $libraryPath = null): string
+    {
+        $supported = false;
+        if (str_contains($subject, "\0")) {
+            return self::normalizeSubjectPhp($subject);
+        }
+
+        $ffi = $libraryPath === null
+            ? self::ffi()
+            : RustPipelineLibrary::resolveDomain('release_processor', self::FFI_CDEF, $libraryPath);
+        if ($ffi === null) {
+            return self::normalizeSubjectPhp($subject);
+        }
+
+        $len = strlen($subject);
+        $needed = max(64, $len + 16);
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, $needed, $cap);
+        if ($scratch === null) {
+            return self::normalizeSubjectPhp($subject);
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_release_normalize_subject($subject, $len, $scratch, $cap);
+            if (is_int($written) && $written < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return self::normalizeSubjectPhp($subject);
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_release_normalize_subject($subject, $len, $scratch, $cap);
+            }
+        } catch (Throwable) {
+            return self::normalizeSubjectPhp($subject);
+        }
+
+        if (! is_int($written) || $written < 0) {
+            return self::normalizeSubjectPhp($subject);
+        }
+
+        $supported = true;
+
+        return $written === 0 ? '' : FFI::string($scratch, $written);
+    }
+
+    /**
+     * Check whether an NZB subject contains a video file extension pattern.
+     *
+     * Retains the native PHP path in production (~0.81x single-string FFI vs compiled
+     * PCRE cache); see containsVideoPatternNative() for the Rust FFI helper.
+     */
+    public static function containsVideoPattern(string $subject, ?string $videoFileRegex = null): bool
+    {
+        return self::containsVideoPatternPhp($subject, $videoFileRegex);
+    }
+
+    public static function containsVideoPatternPhp(string $subject, ?string $videoFileRegex = null): bool
+    {
+        $regex = $videoFileRegex ?? self::DEFAULT_VIDEO_FILE_REGEX;
+
+        return preg_match('/'.$regex.'(?:[. ")\]]|$)/i', $subject) === 1;
+    }
+
+    public static function containsVideoPatternNative(
+        string $subject,
+        ?string $videoFileRegex = null,
+        bool &$supported = false,
+        ?string $libraryPath = null,
+    ): bool {
+        $supported = false;
+        $regex = $videoFileRegex ?? self::DEFAULT_VIDEO_FILE_REGEX;
+        $ffi = $libraryPath === null
+            ? self::ffi()
+            : RustPipelineLibrary::resolveDomain('release_processor', self::FFI_CDEF, $libraryPath);
+        if ($ffi === null) {
+            return self::containsVideoPatternPhp($subject, $regex);
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $status = $ffi->nntmux_release_contains_video_pattern(
+                $subject,
+                strlen($subject),
+                $regex,
+                strlen($regex),
+            );
+        } catch (Throwable) {
+            return self::containsVideoPatternPhp($subject, $regex);
+        }
+
+        if (! is_int($status) || $status < 0) {
+            return self::containsVideoPatternPhp($subject, $regex);
+        }
+
+        $supported = true;
+
+        return $status === 1;
+    }
+
+    /**
+     * Check whether an NZB subject represents a usable video sample candidate.
+     *
+     * Retains the native PHP path in production (~0.40x single-string FFI vs stripos
+     * short-circuit); see hasUsableSampleFilenameNative() for the Rust FFI helper.
+     */
+    public static function hasUsableSampleFilename(string $subject): bool
+    {
+        return self::hasUsableSampleFilenamePhp($subject);
+    }
+
+    public static function hasUsableSampleFilenamePhp(string $subject): bool
+    {
+        return stripos($subject, 'sample') !== false
+            && preg_match('/\.(?:jpe?g|png|webp)(?:[. ")\]]|$)/i', $subject) !== 1
+            && preg_match(self::ARCHIVE_PATTERN, $subject) !== 1;
+    }
+
+    public static function hasUsableSampleFilenameNative(string $subject, bool &$supported = false, ?string $libraryPath = null): bool
+    {
+        $supported = false;
+        $ffi = $libraryPath === null
+            ? self::ffi()
+            : RustPipelineLibrary::resolveDomain('release_processor', self::FFI_CDEF, $libraryPath);
+        if ($ffi === null) {
+            return self::hasUsableSampleFilenamePhp($subject);
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $status = $ffi->nntmux_release_has_usable_sample_filename($subject, strlen($subject));
+        } catch (Throwable) {
+            return self::hasUsableSampleFilenamePhp($subject);
+        }
+
+        if (! is_int($status) || $status < 0) {
+            return self::hasUsableSampleFilenamePhp($subject);
+        }
+
+        $supported = true;
+
+        return $status === 1;
+    }
+
+    /**
+     * Check whether an NZB subject is an auxiliary support/NFO file.
+     *
+     * Retains the native PHP path in production (~0.75x single-string FFI vs PCRE);
+     * see isAuxiliaryNzbSubjectNative() for the Rust FFI helper.
+     */
+    public static function isAuxiliaryNzbSubject(string $subject, ?string $supportFileRegex = null): bool
+    {
+        return self::isAuxiliaryNzbSubjectPhp($subject, $supportFileRegex);
+    }
+
+    public static function isAuxiliaryNzbSubjectPhp(string $subject, ?string $supportFileRegex = null): bool
+    {
+        $regex = $supportFileRegex ?? self::DEFAULT_SUPPORT_FILE_REGEX;
+
+        return preg_match(
+            '/(?:'.$regex.'|nfo\b|inf\b|ofn\b)($|[ ")]|-])(?!.{20,})/i',
+            $subject,
+        ) === 1;
+    }
+
+    public static function isAuxiliaryNzbSubjectNative(
+        string $subject,
+        ?string $supportFileRegex = null,
+        bool &$supported = false,
+        ?string $libraryPath = null,
+    ): bool {
+        $supported = false;
+        $regex = $supportFileRegex ?? self::DEFAULT_SUPPORT_FILE_REGEX;
+        $ffi = $libraryPath === null
+            ? self::ffi()
+            : RustPipelineLibrary::resolveDomain('release_processor', self::FFI_CDEF, $libraryPath);
+        if ($ffi === null) {
+            return self::isAuxiliaryNzbSubjectPhp($subject, $regex);
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $status = $ffi->nntmux_release_is_auxiliary_nzb_subject(
+                $subject,
+                strlen($subject),
+                $regex,
+                strlen($regex),
+            );
+        } catch (Throwable) {
+            return self::isAuxiliaryNzbSubjectPhp($subject, $regex);
+        }
+
+        if (! is_int($status) || $status < 0) {
+            return self::isAuxiliaryNzbSubjectPhp($subject, $regex);
+        }
+
+        $supported = true;
+
+        return $status === 1;
+    }
+
+    /**
+     * Check whether a normalized NZB subject matches a release name.
+     */
+    public static function subjectMatchesRelease(string $subject, string $releaseName): bool
+    {
+        return self::subjectMatchesReleaseNative($subject, $releaseName);
+    }
+
+    public static function subjectMatchesReleasePhp(string $subject, string $releaseName): bool
+    {
+        $normSubject = trim((string) preg_replace('/[^a-z0-9]+/', '.', self::normalizeSubjectPhp($subject)), '.');
+        $normRelease = trim((string) preg_replace('/[^a-z0-9]+/', '.', strtolower($releaseName)), '.');
+        if ($normSubject === '' || $normRelease === '') {
+            return false;
+        }
+
+        return str_contains($normSubject, $normRelease) || str_contains($normRelease, $normSubject);
+    }
+
+    public static function subjectMatchesReleaseNative(
+        string $subject,
+        string $releaseName,
+        bool &$supported = false,
+        ?string $libraryPath = null,
+    ): bool {
+        $supported = false;
+        $ffi = $libraryPath === null
+            ? self::ffi()
+            : RustPipelineLibrary::resolveDomain('release_processor', self::FFI_CDEF, $libraryPath);
+        if ($ffi === null) {
+            return self::subjectMatchesReleasePhp($subject, $releaseName);
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $status = $ffi->nntmux_release_subject_matches_release(
+                $subject,
+                strlen($subject),
+                $releaseName,
+                strlen($releaseName),
+            );
+        } catch (Throwable) {
+            return self::subjectMatchesReleasePhp($subject, $releaseName);
+        }
+
+        if (! is_int($status) || $status < 0) {
+            return self::subjectMatchesReleasePhp($subject, $releaseName);
+        }
+
+        $supported = true;
+
+        return $status === 1;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (! self::$ffiResolved) {
+            self::$ffiResolved = true;
+            self::$ffi = RustPipelineLibrary::resolveDomain('release_processor', self::FFI_CDEF);
+        }
+
+        return self::$ffi;
     }
 }

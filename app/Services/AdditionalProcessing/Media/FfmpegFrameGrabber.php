@@ -5,7 +5,10 @@ declare(strict_types=1);
 namespace App\Services\AdditionalProcessing\Media;
 
 use App\Services\AdditionalProcessing\Enums\VideoContainer;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Facades\Log;
+use Throwable;
 
 /**
  * Grabs keyframes with one ffmpeg call. Only keyframes are decoded, so even a
@@ -14,6 +17,14 @@ use Illuminate\Support\Facades\Log;
  */
 class FfmpegFrameGrabber implements VideoFrameGrabber
 {
+    public const string FFI_CDEF = <<<'C'
+        double nntmux_ffmpeg_clock_seconds(const char *ptr, size_t len);
+        C;
+
+    private static ?FFI $ffi = null;
+
+    private static bool $ffiResolved = false;
+
     public function __construct(
         private readonly MediaToolFactory $tools,
         private readonly bool $debugMode = false,
@@ -43,7 +54,7 @@ class FfmpegFrameGrabber implements VideoFrameGrabber
                 '-q:v', '3',
                 $pattern.'%02d.jpg',
             ]);
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             // A truncated file often fails after the frames we need were written.
             if ($this->debugMode) {
                 Log::debug('Frame grab ended with an error: '.$e->getMessage());
@@ -67,7 +78,7 @@ class FfmpegFrameGrabber implements VideoFrameGrabber
                 '-print_format', 'json',
                 $videoPath,
             ]);
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             if ($this->debugMode) {
                 Log::debug('Probe failed: '.$e->getMessage());
             }
@@ -113,12 +124,64 @@ class FfmpegFrameGrabber implements VideoFrameGrabber
     /**
      * Seconds in a Matroska "HH:MM:SS.nnnnnnnnn" duration tag.
      */
-    private static function clockSeconds(mixed $value): ?float
+    public static function clockSeconds(mixed $value): ?float
+    {
+        return self::clockSecondsPhp($value);
+    }
+
+    public static function clockSecondsPhp(mixed $value): ?float
     {
         if (! is_string($value) || preg_match('/^(\d+):(\d{2}):(\d{2}(?:\.\d+)?)$/', $value, $match) !== 1) {
             return null;
         }
 
         return self::positiveFloat((int) $match[1] * 3600 + (int) $match[2] * 60 + (float) $match[3]);
+    }
+
+    public static function clockSecondsNative(mixed $value, bool &$supported = false, ?string $libraryPath = null): ?float
+    {
+        $supported = false;
+        if (! is_string($value)) {
+            $supported = true;
+
+            return null;
+        }
+
+        $ffi = $libraryPath === null
+            ? self::ffi()
+            : RustPipelineLibrary::resolveDomain('ffmpeg_frame_grabber', self::FFI_CDEF, $libraryPath);
+        if ($ffi === null) {
+            return self::clockSecondsPhp($value);
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $seconds = $ffi->nntmux_ffmpeg_clock_seconds($value, strlen($value));
+        } catch (Throwable) {
+            return self::clockSecondsPhp($value);
+        }
+
+        if (! is_float($seconds) && ! is_int($seconds)) {
+            return self::clockSecondsPhp($value);
+        }
+
+        $seconds = (float) $seconds;
+        if ($seconds <= -1.5) {
+            return self::clockSecondsPhp($value);
+        }
+
+        $supported = true;
+
+        return $seconds > 0.0 ? $seconds : null;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (! self::$ffiResolved) {
+            self::$ffiResolved = true;
+            self::$ffi = RustPipelineLibrary::resolveDomain('ffmpeg_frame_grabber', self::FFI_CDEF);
+        }
+
+        return self::$ffi;
     }
 }
