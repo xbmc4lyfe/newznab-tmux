@@ -5,12 +5,16 @@ declare(strict_types=1);
 namespace App\Services\Api\V1;
 
 use App\Models\Release;
+use App\Support\RustPipelineLibrary;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 use Throwable;
 
 final class ReleaseRows
 {
+    /** The Rust helper is opt-in; it did not beat PHP by 1.5x in the paired benchmark. */
+    private const string FFI_CDEF = 'int64_t nntmux_api_release_rows_total(const char *input, size_t len);';
+
     /**
      * @var list<mixed>|null
      */
@@ -100,12 +104,47 @@ final class ReleaseRows
             return 0;
         }
 
-        $totalRows = $this->value($rows[0], '_totalrows');
+        return self::totalRowsFrom($this->value($rows[0], '_totalrows'), \count($rows));
+    }
+
+    /**
+     * The `_totalrows` projection value as an int, else the row count.
+     */
+    public static function totalRowsFrom(mixed $totalRows, int $rowCount, bool $useRustFfi = false): int
+    {
+        return ($useRustFfi ? self::totalRowsFromNative($totalRows) : null) ?? self::totalRowsFromPhp($totalRows, $rowCount);
+    }
+
+    public static function totalRowsFromPhp(mixed $totalRows, int $rowCount): int
+    {
         if ($totalRows !== null) {
             return (int) $totalRows;
         }
 
-        return \count($rows);
+        return $rowCount;
+    }
+
+    /**
+     * Rust `(int)` cast for plain leading-integer strings; null (PHP decides) for
+     * other values and for float forms, overflow or strings without digits.
+     */
+    public static function totalRowsFromNative(mixed $totalRows): ?int
+    {
+        if (! \is_string($totalRows)) {
+            return null;
+        }
+        static $ffi;
+        $ffi ??= RustPipelineLibrary::resolveDomain('search', self::FFI_CDEF) ?? false;
+        if ($ffi === false) {
+            return null;
+        }
+        try {
+            $total = $ffi->nntmux_api_release_rows_total($totalRows, \strlen($totalRows));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return \is_int($total) && $total !== PHP_INT_MIN ? $total : null;
     }
 
     private function value(mixed $row, string $key): mixed
