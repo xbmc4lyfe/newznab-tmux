@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services\Predb\Feeds\Sources;
 
 use App\Services\Predb\Feeds\PredbFeedEntry;
+use App\Support\RustPipelineLibrary;
 use Dom\Element as HtmlElement;
 use Dom\HTMLDocument;
 use Dom\Node as HtmlNode;
@@ -13,6 +14,7 @@ use DOMDocument;
 use DOMElement;
 use DOMNode;
 use DOMXPath;
+use FFI;
 use RuntimeException;
 use SplObjectStorage;
 
@@ -23,6 +25,12 @@ use SplObjectStorage;
 final class Nima4kSource extends BoundedHttpFeedSource
 {
     private const HTML_NAMESPACE = 'http://www.w3.org/1999/xhtml';
+
+    private const FFI_CDEF = <<<'C'
+        ssize_t nntmux_predb_nima4k_parse_html(const char *html, size_t html_len, size_t page_size, size_t max_body_bytes, char *out_buf, size_t out_cap);
+        C;
+
+    private static FFI|false|null $native = null;
 
     private const FORBIDDEN_CHARACTERS = '/[\x{0000}-\x{0008}\x{000B}\x{000C}\x{000E}-\x{001F}\x{007F}-\x{009F}\x{FDD0}-\x{FDEF}\x{FFFE}-\x{FFFF}\x{1FFFE}-\x{1FFFF}\x{2FFFE}-\x{2FFFF}\x{3FFFE}-\x{3FFFF}\x{4FFFE}-\x{4FFFF}\x{5FFFE}-\x{5FFFF}\x{6FFFE}-\x{6FFFF}\x{7FFFE}-\x{7FFFF}\x{8FFFE}-\x{8FFFF}\x{9FFFE}-\x{9FFFF}\x{AFFFE}-\x{AFFFF}\x{BFFFE}-\x{BFFFF}\x{CFFFE}-\x{CFFFF}\x{DFFFE}-\x{DFFFF}\x{EFFFE}-\x{EFFFF}\x{FFFFE}-\x{FFFFF}\x{10FFFE}-\x{10FFFF}]/u';
 
@@ -60,11 +68,63 @@ final class Nima4kSource extends BoundedHttpFeedSource
     }
 
     /**
-     * Require one literal subtitle and one agreeing cover label per observed release card.
+     * Rust accepts only a strict, unambiguous HTML subset; everything else (including every
+     * invalid document) is verified by the dual-DOM PHP parser with its exact diagnostics.
      *
      * @return list<PredbFeedEntry>
      */
     public function parseHtml(string $html): array
+    {
+        $titles = $this->nativeTitles($html);
+        if ($titles === null) {
+            return $this->parseHtmlPhp($html);
+        }
+        $entries = [];
+        foreach ($titles as $title) {
+            $entries[] = new PredbFeedEntry(title: $title, source: 'nima4k.org');
+        }
+
+        return $entries;
+    }
+
+    /** @return list<string>|null */
+    private function nativeTitles(string $html): ?array
+    {
+        $ffi = self::$native ??= RustPipelineLibrary::resolveDomain('predb_nima4k', self::FFI_CDEF) ?? false;
+        if ($ffi === false) {
+            return null;
+        }
+        $length = strlen($html);
+        $capacity = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, $length + 64, $capacity);
+        if ($scratch === null) {
+            return null;
+        }
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_predb_nima4k_parse_html($html, $length, $this->pageSize, $this->maximumBodyBytes, $scratch, $capacity);
+        if (is_int($written) && $written < -1) {
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_predb_nima4k_parse_html($html, $length, $this->pageSize, $this->maximumBodyBytes, $scratch, $capacity);
+        }
+        if (! is_int($written) || $written <= 0) {
+            return null;
+        }
+        $titles = explode("\0", FFI::string($scratch, $written));
+        array_pop($titles);
+
+        return $titles;
+    }
+
+    /**
+     * Require one literal subtitle and one agreeing cover label per observed release card.
+     *
+     * @return list<PredbFeedEntry>
+     */
+    public function parseHtmlPhp(string $html): array
     {
         if (strlen($html) > $this->maximumBodyBytes) {
             throw new RuntimeException('NIMA4K HTML exceeds the body limit.');
