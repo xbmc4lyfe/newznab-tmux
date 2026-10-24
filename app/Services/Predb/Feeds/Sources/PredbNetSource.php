@@ -38,6 +38,11 @@ final class PredbNetSource extends HttpFeedSource
             'page' => max(1, $page),
         ])->throw();
 
+        $native = PredatabaseSource::nativeJsonEntries($response->body(), 7, 'predb.net');
+        if ($native !== null) {
+            return $native[1];
+        }
+
         if ($response->json('status') === 'error') {
             $message = (string) $response->json('message', 'unknown');
 

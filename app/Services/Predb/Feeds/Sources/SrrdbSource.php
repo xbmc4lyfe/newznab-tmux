@@ -6,6 +6,8 @@ namespace App\Services\Predb\Feeds\Sources;
 
 use App\Services\Predb\Feeds\PredbFeedEntry;
 use Carbon\CarbonImmutable;
+use DateTimeImmutable;
+use DateTimeZone;
 use RuntimeException;
 use Throwable;
 
@@ -18,6 +20,9 @@ final class SrrdbSource extends HttpFeedSource
 {
     /** srrDB returns a fixed 45 results per search page. */
     public const int PAGE_SIZE = 45;
+
+    /** @var array<string, DateTimeZone|false> Zones whose local dates may skip Carbon's parser. */
+    private static array $zones = [];
 
     public function __construct(
         string $endpoint,
@@ -43,7 +48,13 @@ final class SrrdbSource extends HttpFeedSource
 
     public function fetch(int $page = 1): array
     {
-        $rows = $this->http()->get(self::pageUrl($this->endpoint, max(1, $page)))->throw()->json('results');
+        $response = $this->http()->get(self::pageUrl($this->endpoint, max(1, $page)))->throw();
+        $native = PredatabaseSource::nativeJsonFields($response->body(), 4);
+        if ($native !== null) {
+            return $this->nativeEntries($native[1]);
+        }
+
+        $rows = $response->json('results');
         if (! is_array($rows) || ! array_is_list($rows)) {
             throw new RuntimeException('srrDB returned an unexpected response (no results list).');
         }
@@ -74,6 +85,39 @@ final class SrrdbSource extends HttpFeedSource
         }
 
         return $entries;
+    }
+
+    /**
+     * @param  list<string>  $fields  PredatabaseSource::nativeJsonFields() output (one empty header field).
+     * @return list<PredbFeedEntry>
+     */
+    private function nativeEntries(array $fields): array
+    {
+        $zone = ! CarbonImmutable::hasTestNow() ? (self::$zones[$this->timezone] ??= in_array($this->timezone, DateTimeZone::listIdentifiers(), true) ? new DateTimeZone($this->timezone) : false) : false;
+        $entries = [];
+        for ($i = 1, $count = count($fields); $i < $count; $i += 7) {
+            $date = $fields[$i + 4];
+            $entries[] = new PredbFeedEntry($fields[$i], 'srrdb', listedAt: $date === '' ? null : $this->nativeDate($date, $zone));
+        }
+
+        return $entries;
+    }
+
+    /**
+     * parseDate() for a trimmed date; "!" marks the canonical "Y-m-d H:i:s" shape, which the native
+     * parser reads exactly as Carbon's createFromFormat() does.
+     */
+    private function nativeDate(string $date, DateTimeZone|false $zone): ?CarbonImmutable
+    {
+        if ($date[0] === '!' && $zone !== false) {
+            $local = DateTimeImmutable::createFromFormat('!Y-m-d H:i:s', substr($date, 1), $zone);
+            $timestamp = $local === false ? -1 : $local->getTimestamp();
+            if ($timestamp >= 0 && $timestamp <= 253402300799) {
+                return PredatabaseSource::nativeTime((string) $timestamp, named: true);
+            }
+        }
+
+        return $this->parseDate(substr($date, 1));
     }
 
     private function parseDate(mixed $value): ?CarbonImmutable

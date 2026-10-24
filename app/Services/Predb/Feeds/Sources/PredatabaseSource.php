@@ -6,9 +6,14 @@ namespace App\Services\Predb\Feeds\Sources;
 
 use App\Services\Predb\Feeds\FeedRateLimitedException;
 use App\Services\Predb\Feeds\PredbFeedEntry;
+use App\Support\RustPipelineLibrary;
 use Carbon\CarbonImmutable;
+use Closure;
+use DateTimeImmutable;
+use FFI;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\RequestException;
+use ReflectionMethod;
 use RuntimeException;
 use Throwable;
 
@@ -29,6 +34,21 @@ final class PredatabaseSource extends HttpFeedSource
     public const ANONYMOUS_REQUEST_LIMIT = 5;
 
     private const MAX_EMPTY_CONTINUATION_REQUESTS = 5;
+
+    private const NATIVE_CDEF = <<<'C'
+        ssize_t nntmux_predb_json_feed_parse(const char *json, size_t json_len, uint32_t source, uint64_t limit, char *out_buf, size_t out_cap);
+        C;
+
+    /** Latest supported Unix time (9999-12-31 23:59:59 UTC) for the cloned-epoch Carbon fast path. */
+    private const NATIVE_MAX_TIMESTAMP = 253402300799;
+
+    private static FFI|false|null $native = null;
+
+    /** @var (Closure(int): CarbonImmutable)|null */
+    private static ?Closure $epoch = null;
+
+    /** @var (Closure(int): CarbonImmutable)|null */
+    private static ?Closure $namedEpoch = null;
 
     private ?string $cursor = null;
 
@@ -100,12 +120,12 @@ final class PredatabaseSource extends HttpFeedSource
                 break;
             }
 
-            [$rows, $nextCursor] = $this->request($this->cursor);
-            $entries = $this->parseRows($rows);
+            [$rows, $nextCursor, $nativeEntries, $nativeTimes] = $this->request($this->cursor);
+            $entries = $nativeEntries ?? $this->parseRows($rows);
             if ($nextCursor !== null && ($nextCursor === $this->cursor || isset($this->visitedCursors[':'.$nextCursor]))) {
                 throw new RuntimeException('predataba.se returned a repeated history cursor.');
             }
-            $oldestTimestamp = $this->validateChronology($rows);
+            $oldestTimestamp = $nativeTimes !== null ? $this->nativeChronology(...$nativeTimes) : $this->validateChronology($rows);
             if ($this->cursor !== null) {
                 $this->visitedCursors[':'.$this->cursor] = true;
             }
@@ -129,7 +149,10 @@ final class PredatabaseSource extends HttpFeedSource
     }
 
     /**
-     * @return array{0: array<int, mixed>, 1: ?string} The rows and the cursor for the next request.
+     * The rows and the cursor for the next request; when Rust decoded the body, the entries and the
+     * newest and oldest positive row times instead of the rows.
+     *
+     * @return array{0: array<int, mixed>, 1: ?string, 2: list<PredbFeedEntry>|null, 3: array{0: ?int, 1: ?int}|null}
      */
     private function request(?string $cursor): array
     {
@@ -156,6 +179,13 @@ final class PredatabaseSource extends HttpFeedSource
 
         $response->throw();
 
+        $native = self::nativeJsonEntries($response->body(), 1, 'predataba.se');
+        if ($native !== null) {
+            [[$next, $newest, $oldest], $entries] = $native;
+
+            return [[], $next !== '' ? $next : null, $entries, [$newest === '' ? null : (int) $newest, $oldest === '' ? null : (int) $oldest]];
+        }
+
         $rows = $response->json('results');
         if (! is_array($rows) || ! array_is_list($rows)) {
             throw new RuntimeException('predataba.se returned an unexpected response (no results).');
@@ -166,7 +196,22 @@ final class PredatabaseSource extends HttpFeedSource
             throw new RuntimeException('predataba.se returned a malformed history cursor.');
         }
 
-        return [$rows, $next !== '' ? $next : null];
+        return [$rows, $next !== '' ? $next : null, null, null];
+    }
+
+    /**
+     * validateChronology() for rows Rust already checked: their positive times never increase.
+     */
+    private function nativeChronology(?int $newest, ?int $oldest): ?int
+    {
+        if ($newest === null) {
+            return $this->oldestTimestamp;
+        }
+        if ($this->oldestTimestamp !== null && $newest > $this->oldestTimestamp) {
+            throw new RuntimeException('predataba.se returned reversed chronological history.');
+        }
+
+        return $oldest;
     }
 
     /**
@@ -218,5 +263,118 @@ final class PredatabaseSource extends HttpFeedSource
         }
 
         return $entries;
+    }
+
+    /**
+     * @internal Rust decode of a JSON feed body, shared by the JSON feed sources. Returns the offset of
+     * the first entry field and the flat field list: the source's header fields, then seven fields per
+     * entry (title, category, size, files, time, nuke status, reason). Null when PHP must decode the
+     * body, which includes every invalid one.
+     *
+     * @return array{0: int, 1: list<string>}|null
+     */
+    public static function nativeJsonFields(string $json, int $source, int $limit = 1): ?array
+    {
+        $ffi = self::$native ??= RustPipelineLibrary::resolveDomain('predb_json_sources', self::NATIVE_CDEF) ?? false;
+        if ($ffi === false || $json === '') {
+            return null;
+        }
+        $length = strlen($json);
+        $limit = max(1, $limit);
+        $capacity = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, $length + 64, $capacity);
+        if ($scratch === null) {
+            return null;
+        }
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_predb_json_feed_parse($json, $length, $source, $limit, $scratch, $capacity);
+        if (is_int($written) && $written < -1) {
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_predb_json_feed_parse($json, $length, $source, $limit, $scratch, $capacity);
+        }
+        if (! is_int($written) || $written < 1) {
+            return null;
+        }
+
+        $fields = explode("\x1F", substr(FFI::string($scratch, $written), 1));
+        $offset = match ($source) {
+            1 => 3,
+            default => 1,
+        };
+
+        return (count($fields) - $offset) % 7 === 0 ? [$offset, $fields] : null;
+    }
+
+    /**
+     * @internal nativeJsonFields() turned into the header fields and entries whose time is the PRE
+     * time, or the listing time when $listed is set.
+     *
+     * @return array{0: list<string>, 1: list<PredbFeedEntry>}|null
+     */
+    public static function nativeJsonEntries(string $json, int $source, string $label, bool $listed = false, int $limit = 1): ?array
+    {
+        $native = self::nativeJsonFields($json, $source, $limit);
+        if ($native === null) {
+            return null;
+        }
+
+        [$offset, $fields] = $native;
+        $fast = ! CarbonImmutable::hasTestNow();
+        $entries = [];
+        for ($i = $offset, $count = count($fields); $i < $count; $i += 7) {
+            $time = $fields[$i + 4];
+            $at = $time === '' ? null : self::nativeTime($time, $fast);
+            $size = $fields[$i + 2];
+            $entries[] = new PredbFeedEntry(
+                $fields[$i],
+                $label,
+                $fields[$i + 1] === '' ? null : $fields[$i + 1],
+                // "~" carries a value near a rounding tie for PHP's own formatting.
+                $size === '' ? null : ($size[0] === '~' ? PredbFeedEntry::sizeFromMegabytes((float) substr($size, 1)) : $size),
+                $fields[$i + 3] === '' ? null : $fields[$i + 3],
+                $listed ? null : $at,
+                (int) $fields[$i + 5],
+                $fields[$i + 6] === '' ? null : $fields[$i + 6],
+                $listed ? $at : null,
+            );
+        }
+
+        return [array_slice($fields, 0, $offset), $entries];
+    }
+
+    /**
+     * CarbonImmutable::createFromTimestampUTC() for a decimal Unix time, or its utc() form when $named.
+     * Setting the time on a cloned epoch yields an identical object much faster, unless Carbon's test
+     * clock is mocked.
+     */
+    public static function nativeTime(string $time, bool $fast = true, bool $named = false): CarbonImmutable
+    {
+        $timestamp = (int) $time;
+        if ($fast && $timestamp >= 0 && $timestamp <= self::NATIVE_MAX_TIMESTAMP) {
+            $set = $named
+                ? self::$namedEpoch ??= self::epochSetter(CarbonImmutable::createFromTimestampUTC(0)->utc())
+                : self::$epoch ??= self::epochSetter(CarbonImmutable::createFromTimestampUTC(0));
+
+            return $set($timestamp);
+        }
+
+        $time = CarbonImmutable::createFromTimestampUTC($timestamp);
+
+        return $named ? $time->utc() : $time;
+    }
+
+    /**
+     * The native DateTimeImmutable::setTimestamp() bound to $epoch, bypassing Carbon's slower override;
+     * each call returns a clone (through Carbon's __clone()) that keeps the epoch's timezone.
+     *
+     * @return Closure(int): CarbonImmutable
+     */
+    private static function epochSetter(CarbonImmutable $epoch): Closure
+    {
+        return (new ReflectionMethod(DateTimeImmutable::class, 'setTimestamp'))->getClosure($epoch);
     }
 }

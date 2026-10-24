@@ -45,6 +45,13 @@ final class XrelSource extends HttpFeedSource
             'page' => max(1, $page),
         ])->throw();
 
+        $native = PredatabaseSource::nativeJsonEntries($response->body(), $this->p2p ? 3 : 2, $this->p2p ? 'xrel-p2p' : 'xrel');
+        if ($native !== null) {
+            $totalPages = (int) $native[0][0];
+
+            return $totalPages > 0 && $page > $totalPages ? [] : $native[1];
+        }
+
         $totalPages = (int) $response->json('pagination.total_pages', -1);
         if ($totalPages > 0 && $page > $totalPages) {
             return [];
