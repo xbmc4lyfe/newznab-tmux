@@ -18432,3 +18432,582 @@ mod wave25_gdpr_retention_prompt_observer_tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 26 Slice 26.6: AuthenticatesUsers, RegistersUsers,
+// HasCompositePrimaryKey, ReleaseUnique, and LogIndexFile pure-CPU helpers
+// ---------------------------------------------------------------------------
+
+pub mod auth_traits_composite_key_models {
+    use super::{ADD23_MAX_SEG_LEN, add23_valid_out_buf, add23_valid_slice, add23_write_slices};
+
+    pub const LOGIN_RULE_REQUIRED_STRING: &[u8] = b"required|string";
+    pub const LOGIN_PASSWORD_KEY: &[u8] = b"password";
+    pub const REGISTER_VIEW_NAME: &[u8] = b"auth.register";
+    pub const RELEASE_UNIQUE_COMPOSITE_KEYS_NUL: &[u8] = b"releases_id\0uniqueid";
+    pub const LOG_INDEX_RESET_KEYS_NUL: &[u8] =
+        b"indexed_offset\0indexed_line\0indexed_size\0indexed_at";
+
+    #[inline]
+    pub unsafe fn build_login_spec_nul(
+        username_ptr: *const u8,
+        username_len: usize,
+        has_custom_response: u8,
+        wants_json: u8,
+        redirect_ptr: *const u8,
+        redirect_len: usize,
+        out_status: *mut i32,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if has_custom_response > 1
+            || wants_json > 1
+            || out_status.is_null()
+            || !out_status.is_aligned()
+        {
+            return -1;
+        }
+        let (Some(username), Some(redirect_path)) = (
+            unsafe { add23_valid_slice(username_ptr, username_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(redirect_ptr, redirect_len, ADD23_MAX_SEG_LEN) },
+        ) else {
+            return -1;
+        };
+        if username.is_empty() || username.contains(&0) || redirect_path.contains(&0) {
+            return -2;
+        }
+
+        let (action, status): (&[u8], i32) = if has_custom_response == 1 {
+            (b"custom", 200)
+        } else if wants_json == 1 {
+            (b"json", 204)
+        } else {
+            (b"redirect_intended", 302)
+        };
+
+        let written = unsafe {
+            add23_write_slices(
+                out_buf,
+                out_cap,
+                &[
+                    username,
+                    b"\0",
+                    LOGIN_RULE_REQUIRED_STRING,
+                    b"\0",
+                    LOGIN_PASSWORD_KEY,
+                    b"\0",
+                    LOGIN_RULE_REQUIRED_STRING,
+                    b"\0",
+                    action,
+                    b"\0",
+                    redirect_path,
+                ],
+                3,
+            )
+        };
+        if written < 0 {
+            return written;
+        }
+        unsafe {
+            *out_status = status;
+        }
+        written
+    }
+
+    #[inline]
+    pub unsafe fn resolve_register_outcome_nul(
+        has_custom_response: u8,
+        wants_json: u8,
+        redirect_ptr: *const u8,
+        redirect_len: usize,
+        out_flags_and_status: *mut i32,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if has_custom_response > 1
+            || wants_json > 1
+            || out_flags_and_status.is_null()
+            || !out_flags_and_status.is_aligned()
+            || (out_flags_and_status as usize)
+                .checked_add(2 * std::mem::size_of::<i32>())
+                .is_none()
+        {
+            return -1;
+        }
+        let Some(redirect_path) =
+            (unsafe { add23_valid_slice(redirect_ptr, redirect_len, ADD23_MAX_SEG_LEN) })
+        else {
+            return -1;
+        };
+        if redirect_path.contains(&0) {
+            return -2;
+        }
+
+        let (action, is_json, status): (&[u8], i32, i32) = if has_custom_response == 1 {
+            (b"custom", 0, 200)
+        } else if wants_json == 1 {
+            (b"json", 1, 201)
+        } else {
+            (b"redirect", 0, 302)
+        };
+
+        let written = unsafe {
+            add23_write_slices(
+                out_buf,
+                out_cap,
+                &[action, b"\0", redirect_path, b"\0", REGISTER_VIEW_NAME],
+                3,
+            )
+        };
+        if written < 0 {
+            return written;
+        }
+        unsafe {
+            *out_flags_and_status.add(0) = is_json;
+            *out_flags_and_status.add(1) = status;
+        }
+        written
+    }
+
+    #[inline]
+    pub unsafe fn format_missing_composite_key_message(
+        col_ptr: *const u8,
+        col_len: usize,
+        class_ptr: *const u8,
+        class_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        let (Some(col), Some(class_name)) = (
+            unsafe { add23_valid_slice(col_ptr, col_len, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(class_ptr, class_len, ADD23_MAX_SEG_LEN) },
+        ) else {
+            return -1;
+        };
+        if col.is_empty() || class_name.is_empty() || col.contains(&0) || class_name.contains(&0) {
+            return -2;
+        }
+
+        unsafe {
+            add23_write_slices(
+                out_buf,
+                out_cap,
+                &[
+                    b"Composite key column [",
+                    col,
+                    b"] is missing on [",
+                    class_name,
+                    b"].",
+                ],
+                3,
+            )
+        }
+    }
+
+    #[inline]
+    pub unsafe fn select_composite_key_sources(
+        count: usize,
+        in_original_mask: *const u8,
+        in_attr_mask: *const u8,
+        out_source_codes: *mut u8,
+        out_missing_index: *mut isize,
+    ) -> i32 {
+        if count == 0
+            || count > ADD23_MAX_SEG_LEN
+            || out_missing_index.is_null()
+            || !out_missing_index.is_aligned()
+            || !add23_valid_out_buf(out_source_codes, count)
+        {
+            return -1;
+        }
+        let (Some(orig_mask), Some(attr_mask)) = (
+            unsafe { add23_valid_slice(in_original_mask, count, ADD23_MAX_SEG_LEN) },
+            unsafe { add23_valid_slice(in_attr_mask, count, ADD23_MAX_SEG_LEN) },
+        ) else {
+            return -1;
+        };
+
+        for i in 0..count {
+            if orig_mask[i] > 1 || attr_mask[i] > 1 {
+                return -1;
+            }
+        }
+
+        for i in 0..count {
+            if orig_mask[i] == 1 {
+                unsafe {
+                    *out_source_codes.add(i) = 1;
+                }
+            } else if attr_mask[i] == 1 {
+                unsafe {
+                    *out_source_codes.add(i) = 2;
+                }
+            } else {
+                unsafe {
+                    *out_missing_index = i as isize;
+                }
+                return 0;
+            }
+        }
+
+        unsafe {
+            *out_missing_index = -1;
+        }
+        1
+    }
+
+    #[inline]
+    pub unsafe fn release_unique_composite_key_columns_nul(
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe { add23_write_slices(out_buf, out_cap, &[RELEASE_UNIQUE_COMPOSITE_KEYS_NUL], 2) }
+    }
+
+    #[inline]
+    pub unsafe fn log_index_file_reset_progress_spec(
+        out_scalars: *mut i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        if out_scalars.is_null()
+            || !out_scalars.is_aligned()
+            || (out_scalars as usize)
+                .checked_add(4 * std::mem::size_of::<i64>())
+                .is_none()
+        {
+            return -1;
+        }
+        let written = unsafe { add23_write_slices(out_buf, out_cap, &[LOG_INDEX_RESET_KEYS_NUL], 2) };
+        if written < 0 {
+            return written;
+        }
+        unsafe {
+            *out_scalars.add(0) = 0;
+            *out_scalars.add(1) = 0;
+            *out_scalars.add(2) = 0;
+            *out_scalars.add(3) = 0;
+        }
+        written
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_auth_login_spec_nul(
+    username_ptr: *const u8,
+    username_len: usize,
+    has_custom_response: u8,
+    wants_json: u8,
+    redirect_ptr: *const u8,
+    redirect_len: usize,
+    out_status: *mut i32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        auth_traits_composite_key_models::build_login_spec_nul(
+            username_ptr,
+            username_len,
+            has_custom_response,
+            wants_json,
+            redirect_ptr,
+            redirect_len,
+            out_status,
+            out_buf,
+            out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_auth_register_outcome_nul(
+    has_custom_response: u8,
+    wants_json: u8,
+    redirect_ptr: *const u8,
+    redirect_len: usize,
+    out_flags_and_status: *mut i32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        auth_traits_composite_key_models::resolve_register_outcome_nul(
+            has_custom_response,
+            wants_json,
+            redirect_ptr,
+            redirect_len,
+            out_flags_and_status,
+            out_buf,
+            out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_composite_key_format_missing_message(
+    col_ptr: *const u8,
+    col_len: usize,
+    class_ptr: *const u8,
+    class_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        auth_traits_composite_key_models::format_missing_composite_key_message(
+            col_ptr, col_len, class_ptr, class_len, out_buf, out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_composite_key_select_sources(
+    count: usize,
+    in_original_mask: *const u8,
+    in_attr_mask: *const u8,
+    out_source_codes: *mut u8,
+    out_missing_index: *mut isize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        auth_traits_composite_key_models::select_composite_key_sources(
+            count,
+            in_original_mask,
+            in_attr_mask,
+            out_source_codes,
+            out_missing_index,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_release_unique_composite_key_columns_nul(
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        auth_traits_composite_key_models::release_unique_composite_key_columns_nul(out_buf, out_cap)
+    }))
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_log_index_file_reset_progress_spec(
+    out_scalars: *mut i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        auth_traits_composite_key_models::log_index_file_reset_progress_spec(
+            out_scalars,
+            out_buf,
+            out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod wave26_auth_traits_composite_key_models_tests {
+    use super::*;
+
+    #[test]
+    fn auth_login_and_register_helpers_match_php_contracts() {
+        let mut buf = [0u8; 256];
+        let mut status = 0i32;
+        let written = unsafe {
+            nntmux_auth_login_spec_nul(
+                b"email".as_ptr(),
+                5,
+                0,
+                1,
+                b"/dashboard".as_ptr(),
+                10,
+                &mut status,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert!(written > 0);
+        assert_eq!(status, 204);
+        let parts: Vec<&[u8]> = buf[..written as usize].split(|&b| b == 0).collect();
+        assert_eq!(
+            parts,
+            vec![
+                &b"email"[..],
+                &b"required|string"[..],
+                &b"password"[..],
+                &b"required|string"[..],
+                &b"json"[..],
+                &b"/dashboard"[..],
+            ]
+        );
+
+        let mut flags_status = [0i32; 2];
+        let r_written = unsafe {
+            nntmux_auth_register_outcome_nul(
+                0,
+                0,
+                b"/home".as_ptr(),
+                5,
+                flags_status.as_mut_ptr(),
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert!(r_written > 0);
+        assert_eq!(flags_status, [0, 302]);
+        assert_eq!(&buf[..r_written as usize], b"redirect\0/home\0auth.register");
+    }
+
+    #[test]
+    fn composite_key_release_unique_and_log_index_file_match_php_contracts() {
+        let mut buf = [0u8; 256];
+        let msg_len = unsafe {
+            nntmux_composite_key_format_missing_message(
+                b"uniqueid".as_ptr(),
+                8,
+                b"App\\Models\\ReleaseUnique".as_ptr(),
+                24,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert!(msg_len > 0);
+        assert_eq!(
+            &buf[..msg_len as usize],
+            b"Composite key column [uniqueid] is missing on [App\\Models\\ReleaseUnique]."
+        );
+
+        let orig = [1u8, 0u8];
+        let attr = [1u8, 1u8];
+        let mut codes = [0u8; 2];
+        let mut missing_idx = -99isize;
+        let rc = unsafe {
+            nntmux_composite_key_select_sources(
+                2,
+                orig.as_ptr(),
+                attr.as_ptr(),
+                codes.as_mut_ptr(),
+                &mut missing_idx,
+            )
+        };
+        assert_eq!(rc, 1);
+        assert_eq!(missing_idx, -1);
+        assert_eq!(codes, [1, 2]);
+
+        let attr_missing = [1u8, 0u8];
+        let rc2 = unsafe {
+            nntmux_composite_key_select_sources(
+                2,
+                orig.as_ptr(),
+                attr_missing.as_ptr(),
+                codes.as_mut_ptr(),
+                &mut missing_idx,
+            )
+        };
+        assert_eq!(rc2, 0);
+        assert_eq!(missing_idx, 1);
+
+        let ru_len =
+            unsafe { nntmux_release_unique_composite_key_columns_nul(buf.as_mut_ptr(), buf.len()) };
+        assert_eq!(ru_len, 20);
+        assert_eq!(&buf[..20], b"releases_id\0uniqueid");
+
+        let mut scalars = [99i64; 4];
+        let li_len = unsafe {
+            nntmux_log_index_file_reset_progress_spec(
+                scalars.as_mut_ptr(),
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(li_len, 51);
+        assert_eq!(scalars, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn wave26_slice6_entrypoints_reject_null_unaligned_and_undersized_buffers() {
+        let mut raw = [0xA5u8; 64];
+        let unaligned_i32 = unsafe { raw.as_mut_ptr().add(1).cast::<i32>() };
+        let unaligned_i64 = unsafe { raw.as_mut_ptr().add(1).cast::<i64>() };
+        let unaligned_isize = unsafe { raw.as_mut_ptr().add(1).cast::<isize>() };
+
+        assert_eq!(
+            unsafe {
+                nntmux_auth_login_spec_nul(
+                    b"email".as_ptr(),
+                    5,
+                    0,
+                    0,
+                    b"/".as_ptr(),
+                    1,
+                    unaligned_i32,
+                    raw.as_mut_ptr(),
+                    32,
+                )
+            },
+            -1
+        );
+
+        assert_eq!(
+            unsafe {
+                nntmux_auth_register_outcome_nul(
+                    0,
+                    0,
+                    b"/".as_ptr(),
+                    1,
+                    unaligned_i32,
+                    raw.as_mut_ptr(),
+                    32,
+                )
+            },
+            -1
+        );
+
+        let mut small = [0x5Au8; 8];
+        assert!(
+            unsafe {
+                nntmux_composite_key_format_missing_message(
+                    b"id".as_ptr(),
+                    2,
+                    b"Model".as_ptr(),
+                    5,
+                    small.as_mut_ptr(),
+                    small.len(),
+                )
+            } < -8
+        );
+        assert_eq!(small, [0x5Au8; 8]);
+
+        let mask = [1u8, 1u8];
+        let mut codes = [0u8; 2];
+        assert_eq!(
+            unsafe {
+                nntmux_composite_key_select_sources(
+                    2,
+                    mask.as_ptr(),
+                    mask.as_ptr(),
+                    codes.as_mut_ptr(),
+                    unaligned_isize,
+                )
+            },
+            -1
+        );
+
+        assert!(
+            unsafe {
+                nntmux_release_unique_composite_key_columns_nul(small.as_mut_ptr(), small.len())
+            } < -8
+        );
+        assert_eq!(small, [0x5Au8; 8]);
+
+        assert_eq!(
+            unsafe {
+                nntmux_log_index_file_reset_progress_spec(unaligned_i64, raw.as_mut_ptr(), 64)
+            },
+            -1
+        );
+    }
+}
