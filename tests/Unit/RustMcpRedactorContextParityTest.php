@@ -346,6 +346,7 @@ class RustMcpRedactorContextParityTest extends TestCase
             "Stack trace:\n#0 app/Http/Controllers/Api/ApiController.php(12): App\\Services\\ReleaseSearchService->find()\n#1 {main} with ReleaseProbe and BackfillRunner and InspectCommand",
             'AService is 1 char before Service so excluded, AbService is 2 chars so included, App\\0 is filtered out, app/.php is excluded',
             'plain error message with no matching symbols at all',
+            'App failed to boot in MyApp and FooApp\\Services\\Bar with Fooapp/Baz.php',
         ];
 
         foreach ($errorQueries as $query) {

@@ -4982,8 +4982,9 @@ pub unsafe extern "C" fn nntmux_mcp_search_terms(
             if let Some(end) = found_end {
                 matched = Some(&s[i..end]);
                 i = end;
-            } else if max_end >= i + 3
-                && (&s[max_end - 3..max_end] == b"App" || &s[max_end - 3..max_end] == b"app")
+            } else if max_end > i + 3
+                && ((&s[max_end - 3..max_end] == b"App" && s.get(max_end) == Some(&b'\\'))
+                    || (&s[max_end - 3..max_end] == b"app" && s.get(max_end) == Some(&b'/')))
             {
                 i = max_end - 3;
             } else {
@@ -5086,6 +5087,18 @@ mod mcp_tests {
             &out[..tlen as usize],
             b"RuntimeException\nRepositoryContextCollector\nProcessRunner"
         );
+
+        let app_edge = b"App failed to boot in MyApp and FooApp\\Services\\Bar with Fooapp/Bar.php";
+        let edge_len = unsafe {
+            nntmux_mcp_search_terms(
+                app_edge.as_ptr(),
+                app_edge.len(),
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert!(edge_len > 0);
+        assert_eq!(&out[..edge_len as usize], b"Bar");
     }
 }
 
