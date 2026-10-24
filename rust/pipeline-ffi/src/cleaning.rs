@@ -2,6 +2,19 @@ use std::slice;
 
 use crate::OutCursor;
 
+/// Reject malformed regions before creating slices or dereferencing scalar outputs.
+/// Allocation validity and aliasing remain the unsafe caller's responsibility.
+#[inline]
+fn cleaning_ffi_region_valid<T>(ptr: *const T, len: usize) -> bool {
+    let Some(bytes) = len.checked_mul(std::mem::size_of::<T>()) else {
+        return false;
+    };
+    !ptr.is_null()
+        && ptr.is_aligned()
+        && bytes <= isize::MAX as usize
+        && (ptr as usize).checked_add(bytes).is_some()
+}
+
 #[inline]
 fn is_php_trim_char(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x00 | 0x0B)
@@ -1361,16 +1374,24 @@ pub unsafe extern "C" fn nntmux_nzbsplit_literal_payload(
     out_buf: *mut u8,
     out_cap: usize,
 ) -> isize {
-    if input.is_null() || input_len == 0 {
-        return -3;
-    }
-    let bytes = unsafe { slice::from_raw_parts(input, input_len) };
-    let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
-    if nzbsplit_literal_payload(bytes, &mut cursor) {
-        cursor.finish()
-    } else {
-        -3
-    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, input_len)
+            || !cleaning_ffi_region_valid(out_buf, out_cap)
+        {
+            return -1;
+        }
+        if input.is_null() || input_len == 0 {
+            return -3;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, input_len) };
+        let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+        if nzbsplit_literal_payload(bytes, &mut cursor) {
+            cursor.finish()
+        } else {
+            -3
+        }
+    }))
+    .unwrap_or(-1)
 }
 
 /// Returns the truncated byte length for `NzbSplitUnwrapper::stripLiteralSubjectTrailer(input)`.
@@ -1383,11 +1404,17 @@ pub unsafe extern "C" fn nntmux_nzbsplit_strip_literal_trailer_len(
     input: *const u8,
     input_len: usize,
 ) -> usize {
-    if input.is_null() || input_len == 0 {
-        return 0;
-    }
-    let bytes = unsafe { slice::from_raw_parts(input, input_len) };
-    nzbsplit_strip_literal_trailer_len(bytes)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, input_len) {
+            return -1;
+        }
+        if input.is_null() || input_len == 0 {
+            return 0;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, input_len) };
+        nzbsplit_strip_literal_trailer_len(bytes) as isize
+    }))
+    .unwrap_or(-1) as usize
 }
 
 /// Evaluates `NzbSplitUnwrapper::unwrap(input)` into `out_buf`.
@@ -1405,23 +1432,31 @@ pub unsafe extern "C" fn nntmux_nzbsplit_unwrap(
     out_buf: *mut u8,
     out_cap: usize,
 ) -> isize {
-    if input.is_null() || input_len == 0 {
-        return -3;
-    }
-    let bytes = unsafe { slice::from_raw_parts(input, input_len) };
-    if find_nzbsplit_from(bytes, 0).is_none() {
-        return -3;
-    }
-    let mut vec = Vec::new();
-    match nzbsplit_unwrap_vec(bytes, &mut vec) {
-        Some(true) => {
-            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
-            cursor.extend(&vec);
-            cursor.finish()
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, input_len)
+            || !cleaning_ffi_region_valid(out_buf, out_cap)
+        {
+            return -1;
         }
-        Some(false) => -3,
-        None => -2,
-    }
+        if input.is_null() || input_len == 0 {
+            return -3;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, input_len) };
+        if find_nzbsplit_from(bytes, 0).is_none() {
+            return -3;
+        }
+        let mut vec = Vec::new();
+        match nzbsplit_unwrap_vec(bytes, &mut vec) {
+            Some(true) => {
+                let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+                cursor.extend(&vec);
+                cursor.finish()
+            }
+            Some(false) => -3,
+            None => -2,
+        }
+    }))
+    .unwrap_or(-1)
 }
 
 /// Evaluates `FileNameCleaner::isPlausibleReleaseTitle(input)`.
@@ -1435,15 +1470,21 @@ pub unsafe extern "C" fn nntmux_is_plausible_release_title(
     input: *const u8,
     input_len: usize,
 ) -> i32 {
-    if input.is_null() || input_len == 0 {
-        return 0;
-    }
-    let bytes = unsafe { slice::from_raw_parts(input, input_len) };
-    match is_plausible_release_title(bytes) {
-        Some(true) => 1,
-        Some(false) => 0,
-        None => -1,
-    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, input_len) {
+            return -1;
+        }
+        if input.is_null() || input_len == 0 {
+            return 0;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, input_len) };
+        match is_plausible_release_title(bytes) {
+            Some(true) => 1,
+            Some(false) => 0,
+            None => -1,
+        }
+    }))
+    .unwrap_or(-1)
 }
 
 /// Evaluates `ReleaseCleaningService::fixerCleaner(input)` into `out_buf`.
@@ -1460,16 +1501,24 @@ pub unsafe extern "C" fn nntmux_release_fixer_clean(
     out_buf: *mut u8,
     out_cap: usize,
 ) -> isize {
-    if input.is_null() || input_len == 0 {
-        return 0;
-    }
-    let bytes = unsafe { slice::from_raw_parts(input, input_len) };
-    let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
-    if release_fixer_clean(bytes, &mut cursor) {
-        cursor.finish()
-    } else {
-        -2
-    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, input_len)
+            || !cleaning_ffi_region_valid(out_buf, out_cap)
+        {
+            return -1;
+        }
+        if input.is_null() || input_len == 0 {
+            return 0;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, input_len) };
+        let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+        if release_fixer_clean(bytes, &mut cursor) {
+            cursor.finish()
+        } else {
+            -2
+        }
+    }))
+    .unwrap_or(-1)
 }
 
 /// Evaluates `ReleaseCleaningService::releaseNameFromFile(input)` into `out_buf`.
@@ -1487,16 +1536,24 @@ pub unsafe extern "C" fn nntmux_release_name_from_file(
     out_buf: *mut u8,
     out_cap: usize,
 ) -> isize {
-    if input.is_null() || input_len == 0 {
-        return -3;
-    }
-    let bytes = unsafe { slice::from_raw_parts(input, input_len) };
-    let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
-    match release_name_from_file(bytes, &mut cursor) {
-        1 => cursor.finish(),
-        0 => -3,
-        _ => -2,
-    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, input_len)
+            || !cleaning_ffi_region_valid(out_buf, out_cap)
+        {
+            return -1;
+        }
+        if input.is_null() || input_len == 0 {
+            return -3;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, input_len) };
+        let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+        match release_name_from_file(bytes, &mut cursor) {
+            1 => cursor.finish(),
+            0 => -3,
+            _ => -2,
+        }
+    }))
+    .unwrap_or(-1)
 }
 
 /// Evaluates `PayloadIdentityResolver::resolve` over `count` NUL-delimited hint filenames.
@@ -1515,81 +1572,89 @@ pub unsafe extern "C" fn nntmux_payload_identity_resolve_nul(
     out_buf: *mut u8,
     out_cap: usize,
 ) -> isize {
-    if count == 0 {
-        return -3;
-    }
-    if input.is_null() {
-        return -2;
-    }
-    let bytes = unsafe { slice::from_raw_parts(input, input_len) };
-    if bytes.iter().any(|&b| b >= 0x80 || b == b'\n' || b == b'\r') {
-        return -2;
-    }
-
-    let mut first_key: Option<Vec<u8>> = None;
-    let mut first_name: Option<Vec<u8>> = None;
-    let mut spaced = Vec::with_capacity(256);
-    let mut name_buf = [0u8; 1024];
-
-    let mut pos = 0usize;
-    for idx in 0..count {
-        let slice_end = if idx + 1 < count {
-            let Some(rel) = crate::find_nul(&bytes[pos..]) else {
-                return -2;
-            };
-            pos + rel
-        } else {
-            if crate::find_nul(&bytes[pos..]).is_some() {
-                return -2;
-            }
-            bytes.len()
-        };
-        let filename = &bytes[pos..slice_end];
-        pos = slice_end + 1;
-
-        if has_payload_sample_marker(filename) {
-            continue;
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, input_len)
+            || !cleaning_ffi_region_valid(out_buf, out_cap)
+        {
+            return -1;
+        }
+        if count == 0 {
+            return -3;
+        }
+        if input.is_null() {
+            return -2;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, input_len) };
+        if bytes.iter().any(|&b| b >= 0x80 || b == b'\n' || b == b'\r') {
+            return -2;
         }
 
-        spaced.clear();
-        for &b in filename {
-            spaced.push(if b == b'_' { b' ' } else { b });
-        }
+        let mut first_key: Option<Vec<u8>> = None;
+        let mut first_name: Option<Vec<u8>> = None;
+        let mut spaced = Vec::with_capacity(256);
+        let mut name_buf = [0u8; 1024];
 
-        let mut cursor = unsafe { OutCursor::new(name_buf.as_mut_ptr(), name_buf.len()) };
-        match release_name_from_file(&spaced, &mut cursor) {
-            1 => {
-                let written = cursor.finish();
-                if written < 0 {
+        let mut pos = 0usize;
+        for idx in 0..count {
+            let slice_end = if idx + 1 < count {
+                let Some(rel) = crate::find_nul(&bytes[pos..]) else {
+                    return -2;
+                };
+                pos + rel
+            } else {
+                if crate::find_nul(&bytes[pos..]).is_some() {
                     return -2;
                 }
-                let name = &name_buf[..written as usize];
-                if !has_payload_release_signal(name) {
-                    continue;
-                }
-                let Some(key) = normalize_predb_key_ascii(name) else {
-                    continue;
-                };
-                if let Some(ref existing_key) = first_key {
-                    if existing_key.as_slice() != key.as_slice() {
-                        return -3;
-                    }
-                } else {
-                    first_key = Some(key);
-                    first_name = Some(name.to_vec());
-                }
-            }
-            0 => continue,
-            _ => return -2,
-        }
-    }
+                bytes.len()
+            };
+            let filename = &bytes[pos..slice_end];
+            pos = slice_end + 1;
 
-    let Some(winner) = first_name else {
-        return -3;
-    };
-    let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
-    out.extend(&winner);
-    out.finish()
+            if has_payload_sample_marker(filename) {
+                continue;
+            }
+
+            spaced.clear();
+            for &b in filename {
+                spaced.push(if b == b'_' { b' ' } else { b });
+            }
+
+            let mut cursor = unsafe { OutCursor::new(name_buf.as_mut_ptr(), name_buf.len()) };
+            match release_name_from_file(&spaced, &mut cursor) {
+                1 => {
+                    let written = cursor.finish();
+                    if written < 0 {
+                        return -2;
+                    }
+                    let name = &name_buf[..written as usize];
+                    if !has_payload_release_signal(name) {
+                        continue;
+                    }
+                    let Some(key) = normalize_predb_key_ascii(name) else {
+                        continue;
+                    };
+                    if let Some(ref existing_key) = first_key {
+                        if existing_key.as_slice() != key.as_slice() {
+                            return -3;
+                        }
+                    } else {
+                        first_key = Some(key);
+                        first_name = Some(name.to_vec());
+                    }
+                }
+                0 => continue,
+                _ => return -2,
+            }
+        }
+
+        let Some(winner) = first_name else {
+            return -3;
+        };
+        let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+        out.extend(&winner);
+        out.finish()
+    }))
+    .unwrap_or(-1)
 }
 
 /// Evaluates `ReleaseCleaningService` generic subject cleaning into `out_buf`:
@@ -1612,67 +1677,75 @@ pub unsafe extern "C" fn nntmux_release_generic_clean(
     out_buf: *mut u8,
     out_cap: usize,
 ) -> isize {
-    if input.is_null() || input_len == 0 {
-        return if mode == 1 { -3 } else { 0 };
-    }
-    let bytes = unsafe { slice::from_raw_parts(input, input_len) };
-    if bytes.contains(&b'\n') || bytes.contains(&b'\r') {
-        return -2;
-    }
-    let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
-    match mode {
-        0 => {
-            release_cleaner_helper(bytes, &mut cursor);
-            cursor.finish()
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, input_len)
+            || !cleaning_ffi_region_valid(out_buf, out_cap)
+        {
+            return -1;
         }
-        1 => {
-            if let Some((file, tail)) = match_counter_file_subject(bytes) {
-                if contains_word_lrap(tail) {
-                    return -3;
-                }
-                match release_name_from_file(file, &mut cursor) {
-                    1 => cursor.finish(),
-                    0 => -3,
-                    _ => -2,
-                }
-            } else {
-                -3
+        if input.is_null() || input_len == 0 {
+            return if mode == 1 { -3 } else { 0 };
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, input_len) };
+        if bytes.contains(&b'\n') || bytes.contains(&b'\r') {
+            return -2;
+        }
+        let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+        match mode {
+            0 => {
+                release_cleaner_helper(bytes, &mut cursor);
+                cursor.finish()
             }
-        }
-        2 => {
-            if let Some((file, tail)) = match_counter_file_subject(bytes) {
-                if !contains_word_lrap(tail) {
+            1 => {
+                if let Some((file, tail)) = match_counter_file_subject(bytes) {
+                    if contains_word_lrap(tail) {
+                        return -3;
+                    }
                     match release_name_from_file(file, &mut cursor) {
-                        1 => return cursor.finish(),
-                        0 => {}
-                        _ => return -2,
+                        1 => cursor.finish(),
+                        0 => -3,
+                        _ => -2,
+                    }
+                } else {
+                    -3
+                }
+            }
+            2 => {
+                if let Some((file, tail)) = match_counter_file_subject(bytes) {
+                    if !contains_word_lrap(tail) {
+                        match release_name_from_file(file, &mut cursor) {
+                            1 => return cursor.finish(),
+                            0 => {}
+                            _ => return -2,
+                        }
                     }
                 }
+                if starts_with_bracket_digits_close(bytes) {
+                    return -2;
+                }
+                release_cleaner_helper(bytes, &mut cursor);
+                cursor.finish()
             }
-            if starts_with_bracket_digits_close(bytes) {
-                return -2;
-            }
-            release_cleaner_helper(bytes, &mut cursor);
-            cursor.finish()
-        }
-        3 => {
-            if contains_subslice(bytes, b"]-[") {
-                return -2;
-            }
-            if let Some((file, tail)) = match_counter_file_subject(bytes) {
-                if !contains_word_lrap(tail) {
-                    match release_name_from_file(file, &mut cursor) {
-                        1 => return cursor.finish(),
-                        0 => {}
-                        _ => return -2,
+            3 => {
+                if contains_subslice(bytes, b"]-[") {
+                    return -2;
+                }
+                if let Some((file, tail)) = match_counter_file_subject(bytes) {
+                    if !contains_word_lrap(tail) {
+                        match release_name_from_file(file, &mut cursor) {
+                            1 => return cursor.finish(),
+                            0 => {}
+                            _ => return -2,
+                        }
                     }
                 }
+                release_cleaner_helper(bytes, &mut cursor);
+                cursor.finish()
             }
-            release_cleaner_helper(bytes, &mut cursor);
-            cursor.finish()
+            _ => -2,
         }
-        _ => -2,
-    }
+    }))
+    .unwrap_or(-1)
 }
 
 #[inline]
@@ -1716,16 +1789,22 @@ pub unsafe extern "C" fn nntmux_extract_obfuscated_subject(
     out_buf: *mut u8,
     out_cap: usize,
 ) -> isize {
-    if input_len == 0 {
-        return -3;
-    }
-    if input.is_null() {
-        return -1;
-    }
-    let bytes = unsafe { slice::from_raw_parts(input, input_len) };
-    if bytes.iter().any(|&b| b >= 0x80 || b == b'\n' || b == b'\r') {
-        return -2;
-    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, input_len)
+            || !cleaning_ffi_region_valid(out_buf, out_cap)
+        {
+            return -1;
+        }
+        if input_len == 0 {
+            return -3;
+        }
+        if input.is_null() {
+            return -1;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, input_len) };
+        if bytes.iter().any(|&b| b >= 0x80 || b == b'\n' || b == b'\r') {
+            return -2;
+        }
 
     let original = php_trim_ascii(bytes);
     if original.is_empty() {
@@ -1735,68 +1814,15 @@ pub unsafe extern "C" fn nntmux_extract_obfuscated_subject(
     let mut norm = original;
     let mut looks_obfuscated = false;
 
-    // Prefix 1: `/^\s*N:\/NZB\s*\[\d+\/\d+\]\s*-\s*/i`
-    {
-        let mut p = 0usize;
-        while p < norm.len() && is_pcre_space(norm[p]) {
-            p += 1;
-        }
-        if norm[p..].len() >= 6 && norm[p..p + 6].eq_ignore_ascii_case(b"n:/nzb") {
-            p += 6;
+        // Prefix 1: `/^\s*N:\/NZB\s*\[\d+\/\d+\]\s*-\s*/i`
+        {
+            let mut p = 0usize;
             while p < norm.len() && is_pcre_space(norm[p]) {
                 p += 1;
             }
-            if norm.get(p) == Some(&b'[') {
-                p += 1;
-                let d1 = p;
-                while p < norm.len() && norm[p].is_ascii_digit() {
-                    p += 1;
-                }
-                if p > d1 && norm.get(p) == Some(&b'/') {
-                    p += 1;
-                    let d2 = p;
-                    while p < norm.len() && norm[p].is_ascii_digit() {
-                        p += 1;
-                    }
-                    if p > d2 && norm.get(p) == Some(&b']') {
-                        p += 1;
-                        while p < norm.len() && is_pcre_space(norm[p]) {
-                            p += 1;
-                        }
-                        if norm.get(p) == Some(&b'-') {
-                            p += 1;
-                            while p < norm.len() && is_pcre_space(norm[p]) {
-                                p += 1;
-                            }
-                            if p > 0 {
-                                norm = &norm[p..];
-                                looks_obfuscated = true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Prefix 2: `/^\s*N[\s._:-]*NZB[\s._-]*\[\d+(?:[\/_]\d+)?\][\s._-]*-\s*/i`
-    {
-        let mut p = 0usize;
-        while p < norm.len() && is_pcre_space(norm[p]) {
-            p += 1;
-        }
-        if norm.get(p).is_some_and(|&b| b.eq_ignore_ascii_case(&b'n')) {
-            p += 1;
-            while p < norm.len()
-                && (is_pcre_space(norm[p]) || matches!(norm[p], b'.' | b'_' | b':' | b'-'))
-            {
-                p += 1;
-            }
-            if norm[p..].len() >= 3 && norm[p..p + 3].eq_ignore_ascii_case(b"nzb") {
-                p += 3;
-                while p < norm.len()
-                    && (is_pcre_space(norm[p]) || matches!(norm[p], b'.' | b'_' | b'-'))
-                {
+            if norm[p..].len() >= 6 && norm[p..p + 6].eq_ignore_ascii_case(b"n:/nzb") {
+                p += 6;
+                while p < norm.len() && is_pcre_space(norm[p]) {
                     p += 1;
                 }
                 if norm.get(p) == Some(&b'[') {
@@ -1805,32 +1831,164 @@ pub unsafe extern "C" fn nntmux_extract_obfuscated_subject(
                     while p < norm.len() && norm[p].is_ascii_digit() {
                         p += 1;
                     }
-                    if p > d1 {
-                        if norm.get(p).is_some_and(|&c| c == b'/' || c == b'_') {
-                            let mut p2 = p + 1;
-                            let d2 = p2;
-                            while p2 < norm.len() && norm[p2].is_ascii_digit() {
-                                p2 += 1;
+                    if p > d1 && norm.get(p) == Some(&b'/') {
+                        p += 1;
+                        let d2 = p;
+                        while p < norm.len() && norm[p].is_ascii_digit() {
+                            p += 1;
+                        }
+                        if p > d2 && norm.get(p) == Some(&b']') {
+                            p += 1;
+                            while p < norm.len() && is_pcre_space(norm[p]) {
+                                p += 1;
                             }
-                            if p2 > d2 {
-                                p = p2;
+                            if norm.get(p) == Some(&b'-') {
+                                p += 1;
+                                while p < norm.len() && is_pcre_space(norm[p]) {
+                                    p += 1;
+                                }
+                                if p > 0 {
+                                    norm = &norm[p..];
+                                    looks_obfuscated = true;
+                                }
                             }
                         }
-                        if norm.get(p) == Some(&b']') {
+                    }
+                }
+            }
+        }
+
+        // Prefix 2: `/^\s*N[\s._:-]*NZB[\s._-]*\[\d+(?:[\/_]\d+)?\][\s._-]*-\s*/i`
+        {
+            let mut p = 0usize;
+            while p < norm.len() && is_pcre_space(norm[p]) {
+                p += 1;
+            }
+            if norm.get(p).is_some_and(|&b| b.eq_ignore_ascii_case(&b'n')) {
+                p += 1;
+                while p < norm.len()
+                    && (is_pcre_space(norm[p]) || matches!(norm[p], b'.' | b'_' | b':' | b'-'))
+                {
+                    p += 1;
+                }
+                if norm[p..].len() >= 3 && norm[p..p + 3].eq_ignore_ascii_case(b"nzb") {
+                    p += 3;
+                    while p < norm.len()
+                        && (is_pcre_space(norm[p]) || matches!(norm[p], b'.' | b'_' | b'-'))
+                    {
+                        p += 1;
+                    }
+                    if norm.get(p) == Some(&b'[') {
+                        p += 1;
+                        let d1 = p;
+                        while p < norm.len() && norm[p].is_ascii_digit() {
                             p += 1;
-                            let mut run_end = p;
-                            let mut last_dash = None;
-                            while run_end < norm.len()
-                                && (is_pcre_space(norm[run_end])
-                                    || matches!(norm[run_end], b'.' | b'_' | b'-'))
-                            {
-                                if norm[run_end] == b'-' {
-                                    last_dash = Some(run_end);
+                        }
+                        if p > d1 {
+                            if norm.get(p).is_some_and(|&c| c == b'/' || c == b'_') {
+                                let mut p2 = p + 1;
+                                let d2 = p2;
+                                while p2 < norm.len() && norm[p2].is_ascii_digit() {
+                                    p2 += 1;
                                 }
-                                run_end += 1;
+                                if p2 > d2 {
+                                    p = p2;
+                                }
                             }
-                            if let Some(dash_idx) = last_dash {
-                                let mut after = dash_idx + 1;
+                            if norm.get(p) == Some(&b']') {
+                                p += 1;
+                                let mut run_end = p;
+                                let mut last_dash = None;
+                                while run_end < norm.len()
+                                    && (is_pcre_space(norm[run_end])
+                                        || matches!(norm[run_end], b'.' | b'_' | b'-'))
+                                {
+                                    if norm[run_end] == b'-' {
+                                        last_dash = Some(run_end);
+                                    }
+                                    run_end += 1;
+                                }
+                                if let Some(dash_idx) = last_dash {
+                                    let mut after = dash_idx + 1;
+                                    while after < norm.len() && is_pcre_space(norm[after]) {
+                                        after += 1;
+                                    }
+                                    if after > 0 {
+                                        norm = &norm[after..];
+                                        looks_obfuscated = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Prefix 3: `/^\s*\[[^\]]{2,80}\]\s*/`
+        {
+            let mut p = 0usize;
+            while p < norm.len() && is_pcre_space(norm[p]) {
+                p += 1;
+            }
+            if norm.get(p) == Some(&b'[')
+                && let Some(rel_close) = norm[p + 1..].iter().position(|&b| b == b']')
+                && (2..=80).contains(&rel_close)
+            {
+                let mut after = p + 1 + rel_close + 1;
+                while after < norm.len() && is_pcre_space(norm[after]) {
+                    after += 1;
+                }
+                if after > 0 {
+                    norm = &norm[after..];
+                    looks_obfuscated = true;
+                }
+            }
+        }
+
+        // Prefix 4: `/^\s*(?:re\s*)?posted\s+by\s+[^-]{2,120}\s*-\s*/i`
+        {
+            let mut p0 = 0usize;
+            while p0 < norm.len() && is_pcre_space(norm[p0]) {
+                p0 += 1;
+            }
+            let mut after_posted = None;
+            if norm[p0..].len() >= 6 && norm[p0..p0 + 6].eq_ignore_ascii_case(b"posted") {
+                after_posted = Some(p0 + 6);
+            } else if norm[p0..].len() >= 8 && norm[p0..p0 + 2].eq_ignore_ascii_case(b"re") {
+                let mut p_re = p0 + 2;
+                while p_re < norm.len() && is_pcre_space(norm[p_re]) {
+                    p_re += 1;
+                }
+                if norm[p_re..].len() >= 6 && norm[p_re..p_re + 6].eq_ignore_ascii_case(b"posted") {
+                    after_posted = Some(p_re + 6);
+                }
+            }
+            if let Some(ap) = after_posted {
+                let mut p_by = ap;
+                while p_by < norm.len() && is_pcre_space(norm[p_by]) {
+                    p_by += 1;
+                }
+                if p_by > ap
+                    && norm[p_by..].len() >= 2
+                    && norm[p_by..p_by + 2].eq_ignore_ascii_case(b"by")
+                {
+                    let after_by = p_by + 2;
+                    if after_by < norm.len() && is_pcre_space(norm[after_by]) {
+                        let span_start = after_by + 1;
+                        if let Some(rel_dash) = norm[span_start..].iter().position(|&b| b == b'-') {
+                            let dash_pos = span_start + rel_dash;
+                            let span = &norm[span_start..dash_pos];
+                            let mut c_start = 0usize;
+                            while c_start < span.len() && is_pcre_space(span[c_start]) {
+                                c_start += 1;
+                            }
+                            let mut c_end = span.len();
+                            while c_end > c_start && is_pcre_space(span[c_end - 1]) {
+                                c_end -= 1;
+                            }
+                            if span.len() >= 2 && (c_end - c_start) <= 120 {
+                                let mut after = dash_pos + 1;
                                 while after < norm.len() && is_pcre_space(norm[after]) {
                                     after += 1;
                                 }
@@ -1844,270 +2002,197 @@ pub unsafe extern "C" fn nntmux_extract_obfuscated_subject(
                 }
             }
         }
-    }
 
-    // Prefix 3: `/^\s*\[[^\]]{2,80}\]\s*/`
-    {
-        let mut p = 0usize;
-        while p < norm.len() && is_pcre_space(norm[p]) {
-            p += 1;
+        // Quoted extraction
+        if let Some(q) = find_quoted_3_to_240(norm, b'"') {
+            norm = q;
+            looks_obfuscated = true;
+        } else if let Some(q) = find_quoted_3_to_240(norm, b'\'') {
+            norm = q;
+            looks_obfuscated = true;
         }
-        if norm.get(p) == Some(&b'[')
-            && let Some(rel_close) = norm[p + 1..].iter().position(|&b| b == b']')
-            && (2..=80).contains(&rel_close)
-        {
-            let mut after = p + 1 + rel_close + 1;
-            while after < norm.len() && is_pcre_space(norm[after]) {
-                after += 1;
-            }
-            if after > 0 {
-                norm = &norm[after..];
-                looks_obfuscated = true;
-            }
-        }
-    }
 
-    // Prefix 4: `/^\s*(?:re\s*)?posted\s+by\s+[^-]{2,120}\s*-\s*/i`
-    {
-        let mut p0 = 0usize;
-        while p0 < norm.len() && is_pcre_space(norm[p0]) {
-            p0 += 1;
-        }
-        let mut after_posted = None;
-        if norm[p0..].len() >= 6 && norm[p0..p0 + 6].eq_ignore_ascii_case(b"posted") {
-            after_posted = Some(p0 + 6);
-        } else if norm[p0..].len() >= 8 && norm[p0..p0 + 2].eq_ignore_ascii_case(b"re") {
-            let mut p_re = p0 + 2;
-            while p_re < norm.len() && is_pcre_space(norm[p_re]) {
-                p_re += 1;
-            }
-            if norm[p_re..].len() >= 6 && norm[p_re..p_re + 6].eq_ignore_ascii_case(b"posted") {
-                after_posted = Some(p_re + 6);
-            }
-        }
-        if let Some(ap) = after_posted {
-            let mut p_by = ap;
-            while p_by < norm.len() && is_pcre_space(norm[p_by]) {
-                p_by += 1;
-            }
-            if p_by > ap
-                && norm[p_by..].len() >= 2
-                && norm[p_by..p_by + 2].eq_ignore_ascii_case(b"by")
-            {
-                let after_by = p_by + 2;
-                if after_by < norm.len() && is_pcre_space(norm[after_by]) {
-                    let span_start = after_by + 1;
-                    if let Some(rel_dash) = norm[span_start..].iter().position(|&b| b == b'-') {
-                        let dash_pos = span_start + rel_dash;
-                        let span = &norm[span_start..dash_pos];
-                        let mut c_start = 0usize;
-                        while c_start < span.len() && is_pcre_space(span[c_start]) {
-                            c_start += 1;
-                        }
-                        let mut c_end = span.len();
-                        while c_end > c_start && is_pcre_space(span[c_end - 1]) {
-                            c_end -= 1;
-                        }
-                        if span.len() >= 2 && (c_end - c_start) <= 120 {
-                            let mut after = dash_pos + 1;
-                            while after < norm.len() && is_pcre_space(norm[after]) {
-                                after += 1;
-                            }
-                            if after > 0 {
-                                norm = &norm[after..];
-                                looks_obfuscated = true;
-                            }
-                        }
-                    }
+        // Trailing archive patterns
+        if looks_obfuscated {
+            // 1. `/\.part\d+\.rar$/i`
+            if norm.len() >= 10 && norm[norm.len() - 4..].eq_ignore_ascii_case(b".rar") {
+                let mut p = norm.len() - 4;
+                let d_end = p;
+                while p > 0 && norm[p - 1].is_ascii_digit() {
+                    p -= 1;
+                }
+                if p < d_end && p >= 5 && norm[p - 5..p].eq_ignore_ascii_case(b".part") {
+                    norm = &norm[..p - 5];
                 }
             }
-        }
-    }
-
-    // Quoted extraction
-    if let Some(q) = find_quoted_3_to_240(norm, b'"') {
-        norm = q;
-        looks_obfuscated = true;
-    } else if let Some(q) = find_quoted_3_to_240(norm, b'\'') {
-        norm = q;
-        looks_obfuscated = true;
-    }
-
-    // Trailing archive patterns
-    if looks_obfuscated {
-        // 1. `/\.part\d+\.rar$/i`
-        if norm.len() >= 10 && norm[norm.len() - 4..].eq_ignore_ascii_case(b".rar") {
-            let mut p = norm.len() - 4;
-            let d_end = p;
-            while p > 0 && norm[p - 1].is_ascii_digit() {
-                p -= 1;
-            }
-            if p < d_end && p >= 5 && norm[p - 5..p].eq_ignore_ascii_case(b".part") {
-                norm = &norm[..p - 5];
-            }
-        }
-        // 2. `/\.r\d{2,4}$/i`
-        {
-            let mut p = norm.len();
-            while p > 0 && norm[p - 1].is_ascii_digit() {
-                p -= 1;
-            }
-            let digits = norm.len() - p;
-            if (2..=4).contains(&digits)
-                && p >= 2
-                && norm[p - 2] == b'.'
-                && norm[p - 1].eq_ignore_ascii_case(&b'r')
+            // 2. `/\.r\d{2,4}$/i`
             {
-                norm = &norm[..p - 2];
+                let mut p = norm.len();
+                while p > 0 && norm[p - 1].is_ascii_digit() {
+                    p -= 1;
+                }
+                let digits = norm.len() - p;
+                if (2..=4).contains(&digits)
+                    && p >= 2
+                    && norm[p - 2] == b'.'
+                    && norm[p - 1].eq_ignore_ascii_case(&b'r')
+                {
+                    norm = &norm[..p - 2];
+                }
             }
-        }
-        // 3. `/\.7z\.\d{2,4}$/i`
-        {
-            let mut p = norm.len();
-            while p > 0 && norm[p - 1].is_ascii_digit() {
-                p -= 1;
+            // 3. `/\.7z\.\d{2,4}$/i`
+            {
+                let mut p = norm.len();
+                while p > 0 && norm[p - 1].is_ascii_digit() {
+                    p -= 1;
+                }
+                let digits = norm.len() - p;
+                if (2..=4).contains(&digits)
+                    && p >= 4
+                    && norm[p - 4..p].eq_ignore_ascii_case(b".7z.")
+                {
+                    norm = &norm[..p - 4];
+                }
             }
-            let digits = norm.len() - p;
-            if (2..=4).contains(&digits) && p >= 4 && norm[p - 4..p].eq_ignore_ascii_case(b".7z.") {
-                norm = &norm[..p - 4];
+            // 4. `/\.7z$/i`
+            if norm.len() >= 3 && norm[norm.len() - 3..].eq_ignore_ascii_case(b".7z") {
+                norm = &norm[..norm.len() - 3];
             }
-        }
-        // 4. `/\.7z$/i`
-        if norm.len() >= 3 && norm[norm.len() - 3..].eq_ignore_ascii_case(b".7z") {
-            norm = &norm[..norm.len() - 3];
-        }
-        // 5. `/\.rar$/i`
-        if norm.len() >= 4 && norm[norm.len() - 4..].eq_ignore_ascii_case(b".rar") {
-            norm = &norm[..norm.len() - 4];
-        }
-        // 6. `/\.par2?$/i`
-        if norm.len() >= 5 && norm[norm.len() - 5..].eq_ignore_ascii_case(b".par2") {
-            norm = &norm[..norm.len() - 5];
-        } else if norm.len() >= 4 && norm[norm.len() - 4..].eq_ignore_ascii_case(b".par") {
-            norm = &norm[..norm.len() - 4];
-        }
-        // 7. `/\.part$/i`
-        if norm.len() >= 5 && norm[norm.len() - 5..].eq_ignore_ascii_case(b".part") {
-            norm = &norm[..norm.len() - 5];
-        }
-        // 8. `/\.vol\d+[+\-]\d+\.par2?$/i`
-        {
-            let par_trim =
-                if norm.len() >= 5 && norm[norm.len() - 5..].eq_ignore_ascii_case(b".par2") {
+            // 5. `/\.rar$/i`
+            if norm.len() >= 4 && norm[norm.len() - 4..].eq_ignore_ascii_case(b".rar") {
+                norm = &norm[..norm.len() - 4];
+            }
+            // 6. `/\.par2?$/i`
+            if norm.len() >= 5 && norm[norm.len() - 5..].eq_ignore_ascii_case(b".par2") {
+                norm = &norm[..norm.len() - 5];
+            } else if norm.len() >= 4 && norm[norm.len() - 4..].eq_ignore_ascii_case(b".par") {
+                norm = &norm[..norm.len() - 4];
+            }
+            // 7. `/\.part$/i`
+            if norm.len() >= 5 && norm[norm.len() - 5..].eq_ignore_ascii_case(b".part") {
+                norm = &norm[..norm.len() - 5];
+            }
+            // 8. `/\.vol\d+[+\-]\d+\.par2?$/i`
+            {
+                let par_trim = if norm.len() >= 5
+                    && norm[norm.len() - 5..].eq_ignore_ascii_case(b".par2")
+                {
                     Some(norm.len() - 5)
                 } else if norm.len() >= 4 && norm[norm.len() - 4..].eq_ignore_ascii_case(b".par") {
                     Some(norm.len() - 4)
                 } else {
                     None
                 };
-            if let Some(mut p) = par_trim {
-                let d2_end = p;
-                while p > 0 && norm[p - 1].is_ascii_digit() {
-                    p -= 1;
-                }
-                if p < d2_end && p > 0 && matches!(norm[p - 1], b'+' | b'-') {
-                    p -= 1;
-                    let d1_end = p;
+                if let Some(mut p) = par_trim {
+                    let d2_end = p;
                     while p > 0 && norm[p - 1].is_ascii_digit() {
                         p -= 1;
                     }
-                    if p < d1_end && p >= 4 && norm[p - 4..p].eq_ignore_ascii_case(b".vol") {
-                        norm = &norm[..p - 4];
+                    if p < d2_end && p > 0 && matches!(norm[p - 1], b'+' | b'-') {
+                        p -= 1;
+                        let d1_end = p;
+                        while p > 0 && norm[p - 1].is_ascii_digit() {
+                            p -= 1;
+                        }
+                        if p < d1_end && p >= 4 && norm[p - 4..p].eq_ignore_ascii_case(b".vol") {
+                            norm = &norm[..p - 4];
+                        }
                     }
                 }
             }
-        }
-        // 9. `/\.\d{3}$/`
-        if norm.len() >= 4
-            && norm[norm.len() - 4] == b'.'
-            && norm[norm.len() - 3..].iter().all(|b| b.is_ascii_digit())
-        {
-            norm = &norm[..norm.len() - 4];
-        }
-    }
-
-    // Transform '_', '+', '.(?=[A-Za-z0-9])' -> ' ', then collapse `\s{2,}` -> ' '
-    let mut stack_buf = [0u8; 512];
-    let mut heap_buf = Vec::new();
-    let use_heap = norm.len() > stack_buf.len();
-    if use_heap {
-        heap_buf.resize(norm.len(), 0);
-    }
-    let stage1: &mut [u8] = if use_heap {
-        &mut heap_buf[..]
-    } else {
-        &mut stack_buf[..norm.len()]
-    };
-    for i in 0..norm.len() {
-        let b = norm[i];
-        stage1[i] = if b == b'_'
-            || b == b'+'
-            || (b == b'.' && norm.get(i + 1).is_some_and(|c| c.is_ascii_alphanumeric()))
-        {
-            b' '
-        } else {
-            b
-        };
-    }
-
-    // Collapse `\s{2,}` in-place inside `stage1`
-    let mut w = 0usize;
-    let mut r = 0usize;
-    while r < stage1.len() {
-        if is_pcre_space(stage1[r]) {
-            let mut r_end = r + 1;
-            while r_end < stage1.len() && is_pcre_space(stage1[r_end]) {
-                r_end += 1;
+            // 9. `/\.\d{3}$/`
+            if norm.len() >= 4
+                && norm[norm.len() - 4] == b'.'
+                && norm[norm.len() - 3..].iter().all(|b| b.is_ascii_digit())
+            {
+                norm = &norm[..norm.len() - 4];
             }
-            if r_end - r >= 2 {
-                stage1[w] = b' ';
+        }
+
+        // Transform '_', '+', '.(?=[A-Za-z0-9])' -> ' ', then collapse `\s{2,}` -> ' '
+        let mut stack_buf = [0u8; 512];
+        let mut heap_buf = Vec::new();
+        let use_heap = norm.len() > stack_buf.len();
+        if use_heap {
+            heap_buf.resize(norm.len(), 0);
+        }
+        let stage1: &mut [u8] = if use_heap {
+            &mut heap_buf[..]
+        } else {
+            &mut stack_buf[..norm.len()]
+        };
+        for i in 0..norm.len() {
+            let b = norm[i];
+            stage1[i] = if b == b'_'
+                || b == b'+'
+                || (b == b'.' && norm.get(i + 1).is_some_and(|c| c.is_ascii_alphanumeric()))
+            {
+                b' '
+            } else {
+                b
+            };
+        }
+
+        // Collapse `\s{2,}` in-place inside `stage1`
+        let mut w = 0usize;
+        let mut r = 0usize;
+        while r < stage1.len() {
+            if is_pcre_space(stage1[r]) {
+                let mut r_end = r + 1;
+                while r_end < stage1.len() && is_pcre_space(stage1[r_end]) {
+                    r_end += 1;
+                }
+                if r_end - r >= 2 {
+                    stage1[w] = b' ';
+                } else {
+                    stage1[w] = stage1[r];
+                }
+                w += 1;
+                r = r_end;
             } else {
                 stage1[w] = stage1[r];
+                w += 1;
+                r += 1;
             }
-            w += 1;
-            r = r_end;
-        } else {
-            stage1[w] = stage1[r];
-            w += 1;
-            r += 1;
         }
-    }
 
-    // Trim `" \t\n\r\0\x0B\"'`-_."`
-    let mut t_start = 0usize;
-    let mut t_end = w;
-    while t_start < t_end && is_obfuscated_trim_char(stage1[t_start]) {
-        t_start += 1;
-    }
-    while t_end > t_start && is_obfuscated_trim_char(stage1[t_end - 1]) {
-        t_end -= 1;
-    }
-    let trimmed = &mut stage1[t_start..t_end];
+        // Trim `" \t\n\r\0\x0B\"'`-_."`
+        let mut t_start = 0usize;
+        let mut t_end = w;
+        while t_start < t_end && is_obfuscated_trim_char(stage1[t_start]) {
+            t_start += 1;
+        }
+        while t_end > t_start && is_obfuscated_trim_char(stage1[t_end - 1]) {
+            t_end -= 1;
+        }
+        let trimmed = &mut stage1[t_start..t_end];
 
-    // `toReadableTitle`: if no uppercase ASCII letter, apply MB_CASE_TITLE
-    if !trimmed.iter().any(|&b| b.is_ascii_uppercase()) {
-        let mut in_word = false;
-        for b in trimmed.iter_mut() {
-            if b.is_ascii_alphabetic() {
-                if !in_word {
-                    *b = b.to_ascii_uppercase();
-                    in_word = true;
-                } else {
-                    *b = b.to_ascii_lowercase();
+        // `toReadableTitle`: if no uppercase ASCII letter, apply MB_CASE_TITLE
+        if !trimmed.iter().any(|&b| b.is_ascii_uppercase()) {
+            let mut in_word = false;
+            for b in trimmed.iter_mut() {
+                if b.is_ascii_alphabetic() {
+                    if !in_word {
+                        *b = b.to_ascii_uppercase();
+                        in_word = true;
+                    } else {
+                        *b = b.to_ascii_lowercase();
+                    }
+                } else if !matches!(*b, b'\'' | b'.' | b':' | b'^' | b'`') {
+                    in_word = false;
                 }
-            } else if !matches!(*b, b'\'' | b'.' | b':' | b'^' | b'`') {
-                in_word = false;
             }
         }
-    }
 
-    if trimmed.is_empty() || trimmed == original {
-        return -3;
-    }
+        if trimmed.is_empty() || trimmed == original {
+            return -3;
+        }
 
-    let mut cur = unsafe { OutCursor::new(out_buf, out_cap) };
-    cur.extend(trimmed);
-    cur.finish()
+        let mut cur = unsafe { OutCursor::new(out_buf, out_cap) };
+        cur.extend(trimmed);
+        cur.finish()
+    }))
+    .unwrap_or(-1)
 }
 
 // libc's bounded byte search is vectorized on supported Linux/macOS hosts.
@@ -2219,10 +2304,16 @@ fn header_subject(subject: &[u8]) -> i64 {
 /// `input` must be readable for `input_len` bytes when non-null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nntmux_header_parse_subject(input: *const u8, input_len: usize) -> i64 {
-    if input.is_null() {
-        return -1;
-    }
-    header_subject(unsafe { slice::from_raw_parts(input, input_len) })
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, input_len) {
+            return -1;
+        }
+        if input.is_null() {
+            return -1;
+        }
+        header_subject(unsafe { slice::from_raw_parts(input, input_len) })
+    }))
+    .unwrap_or(-1)
 }
 
 /// Batch subject captures: input is repeated (u32 little-endian length, subject bytes).
@@ -2240,35 +2331,43 @@ pub unsafe extern "C" fn nntmux_header_parse_batch(
     out_buf: *mut u8,
     out_cap: usize,
 ) -> i64 {
-    let Some(needed) = count.checked_mul(8).filter(|&n| n <= i64::MAX as usize) else {
-        return -1;
-    };
-    if input.is_null() || out_buf.is_null() {
-        return -1;
-    }
-    if out_cap < needed {
-        return -(needed as i64);
-    }
-    let bytes = unsafe { slice::from_raw_parts(input, input_len) };
-    let mut pos = 0usize;
-    for index in 0..count {
-        if bytes.len().saturating_sub(pos) < 4 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, input_len)
+            || !cleaning_ffi_region_valid(out_buf, out_cap)
+        {
             return -1;
         }
-        let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
-        pos += 4;
-        if len > bytes.len() - pos {
+        let Some(needed) = count.checked_mul(8).filter(|&n| n <= i64::MAX as usize) else {
+            return -1;
+        };
+        if input.is_null() || out_buf.is_null() {
             return -1;
         }
-        let packed = header_subject(&bytes[pos..pos + len]);
-        unsafe { std::ptr::write_unaligned(out_buf.add(index * 8).cast::<i64>(), packed) };
-        pos += len;
-    }
-    if pos != bytes.len() {
-        -1
-    } else {
-        needed as i64
-    }
+        if out_cap < needed {
+            return -(needed as i64);
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, input_len) };
+        let mut pos = 0usize;
+        for index in 0..count {
+            if bytes.len().saturating_sub(pos) < 4 {
+                return -1;
+            }
+            let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+            if len > bytes.len() - pos {
+                return -1;
+            }
+            let packed = header_subject(&bytes[pos..pos + len]);
+            unsafe { std::ptr::write_unaligned(out_buf.add(index * 8).cast::<i64>(), packed) };
+            pos += len;
+        }
+        if pos != bytes.len() {
+            -1
+        } else {
+            needed as i64
+        }
+    }))
+    .unwrap_or(-1)
 }
 
 // Deliberately a small PCRE subset: ASCII literals with optional ^/$ anchors and
@@ -2334,31 +2433,39 @@ pub unsafe extern "C" fn nntmux_blacklist_compile(
     out_buf: *mut u8,
     out_cap: usize,
 ) -> i64 {
-    if input.is_null() {
-        return -1;
-    }
-    let mut bytes = unsafe { slice::from_raw_parts(input, input_len) };
-    let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
-    while !bytes.is_empty() {
-        if bytes.len() < 5 || !(1..=3).contains(&bytes[0]) {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, input_len)
+            || !cleaning_ffi_region_valid(out_buf, out_cap)
+        {
             return -1;
         }
-        let field = bytes[0];
-        let len = u32::from_le_bytes(bytes[1..5].try_into().unwrap()) as usize;
-        bytes = &bytes[5..];
-        if len > bytes.len() || len > u16::MAX as usize {
+        if input.is_null() {
             return -1;
         }
-        let Some((flags, literal)) = blacklist_literal(&bytes[..len]) else {
-            return -1;
-        };
-        out.push(field);
-        out.push(flags);
-        out.extend(&(literal.len() as u16).to_le_bytes());
-        out.extend(&literal);
-        bytes = &bytes[len..];
-    }
-    out.finish() as i64
+        let mut bytes = unsafe { slice::from_raw_parts(input, input_len) };
+        let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+        while !bytes.is_empty() {
+            if bytes.len() < 5 || !(1..=3).contains(&bytes[0]) {
+                return -1;
+            }
+            let field = bytes[0];
+            let len = u32::from_le_bytes(bytes[1..5].try_into().unwrap()) as usize;
+            bytes = &bytes[5..];
+            if len > bytes.len() || len > u16::MAX as usize {
+                return -1;
+            }
+            let Some((flags, literal)) = blacklist_literal(&bytes[..len]) else {
+                return -1;
+            };
+            out.push(field);
+            out.push(flags);
+            out.extend(&(literal.len() as u16).to_le_bytes());
+            out.extend(&literal);
+            bytes = &bytes[len..];
+        }
+        out.finish() as i64
+    }))
+    .unwrap_or(-1)
 }
 
 fn blacklist_contains(value: &[u8], literal: &[u8], flags: u8) -> bool {
@@ -2396,65 +2503,75 @@ pub unsafe extern "C" fn nntmux_blacklist_match(
     message_id: *const u8,
     message_id_len: usize,
 ) -> i32 {
-    if rules.is_null() || subject.is_null() || poster.is_null() || message_id.is_null() {
-        return -1;
-    }
-    let mut rules = unsafe { slice::from_raw_parts(rules, rules_len) };
-    let fields = unsafe {
-        [
-            slice::from_raw_parts(subject, subject_len),
-            slice::from_raw_parts(poster, poster_len),
-            slice::from_raw_parts(message_id, message_id_len),
-        ]
-    };
-    let mut lowered: [Option<Vec<u8>>; 3] = [None, None, None];
-    // Probe each distinct literal byte at most once per field. Shared absent bytes
-    // reject entire rule families before libc scans a long or repetitive subject.
-    let mut byte_presence = [[0u8; 128]; 3];
-    let mut index = 0i32;
-    while !rules.is_empty() {
-        if rules.len() < 4 || !(1..=3).contains(&rules[0]) || rules[1] > 3 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(rules, rules_len)
+            || !cleaning_ffi_region_valid(subject, subject_len)
+            || !cleaning_ffi_region_valid(poster, poster_len)
+            || !cleaning_ffi_region_valid(message_id, message_id_len)
+        {
             return -1;
         }
-        let field = (rules[0] - 1) as usize;
-        let flags = rules[1];
-        let len = u16::from_le_bytes([rules[2], rules[3]]) as usize;
-        rules = &rules[4..];
-        if len > rules.len() || index == i32::MAX {
+        if rules.is_null() || subject.is_null() || poster.is_null() || message_id.is_null() {
             return -1;
         }
-        index += 1;
-        let value = lowered[field].get_or_insert_with(|| fields[field].to_ascii_lowercase());
-        if flags == 0 && len > 0 {
-            let mut possible = true;
-            for &byte in &rules[..len] {
-                if byte >= 128 {
-                    return -1;
+        let mut rules = unsafe { slice::from_raw_parts(rules, rules_len) };
+        let fields = unsafe {
+            [
+                slice::from_raw_parts(subject, subject_len),
+                slice::from_raw_parts(poster, poster_len),
+                slice::from_raw_parts(message_id, message_id_len),
+            ]
+        };
+        let mut lowered: [Option<Vec<u8>>; 3] = [None, None, None];
+        // Probe each distinct literal byte at most once per field. Shared absent bytes
+        // reject entire rule families before libc scans a long or repetitive subject.
+        let mut byte_presence = [[0u8; 128]; 3];
+        let mut index = 0i32;
+        while !rules.is_empty() {
+            if rules.len() < 4 || !(1..=3).contains(&rules[0]) || rules[1] > 3 {
+                return -1;
+            }
+            let field = (rules[0] - 1) as usize;
+            let flags = rules[1];
+            let len = u16::from_le_bytes([rules[2], rules[3]]) as usize;
+            rules = &rules[4..];
+            if len > rules.len() || index == i32::MAX {
+                return -1;
+            }
+            index += 1;
+            let value = lowered[field].get_or_insert_with(|| fields[field].to_ascii_lowercase());
+            if flags == 0 && len > 0 {
+                let mut possible = true;
+                for &byte in &rules[..len] {
+                    if byte >= 128 {
+                        return -1;
+                    }
+                    let presence = &mut byte_presence[field][byte as usize];
+                    if *presence == 0 {
+                        *presence = if header_find_byte(value, byte).is_some() {
+                            1
+                        } else {
+                            2
+                        };
+                    }
+                    if *presence == 2 {
+                        possible = false;
+                        break;
+                    }
                 }
-                let presence = &mut byte_presence[field][byte as usize];
-                if *presence == 0 {
-                    *presence = if header_find_byte(value, byte).is_some() {
-                        1
-                    } else {
-                        2
-                    };
-                }
-                if *presence == 2 {
-                    possible = false;
-                    break;
+                if !possible {
+                    rules = &rules[len..];
+                    continue;
                 }
             }
-            if !possible {
-                rules = &rules[len..];
-                continue;
+            if blacklist_contains(value, &rules[..len], flags) {
+                return index;
             }
+            rules = &rules[len..];
         }
-        if blacklist_contains(value, &rules[..len], flags) {
-            return index;
-        }
-        rules = &rules[len..];
-    }
-    0
+        0
+    }))
+    .unwrap_or(-1)
 }
 
 #[cfg(test)]
@@ -3108,6 +3225,9 @@ pub unsafe extern "C" fn nntmux_collections_is_music_group(
     group_len: usize,
 ) -> i32 {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(group, group_len) {
+            return -1;
+        }
         if group_len > isize::MAX as usize || (group.is_null() && group_len != 0) {
             return -1;
         }
@@ -3136,6 +3256,10 @@ pub unsafe extern "C" fn nntmux_collections_extract_music_subject(
     out_cap: usize,
 ) -> isize {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, input_len) || !cleaning_ffi_region_valid(out, out_cap)
+        {
+            return -1;
+        }
         if input_len > isize::MAX as usize
             || out_cap > isize::MAX as usize
             || (input.is_null() && input_len != 0)
@@ -3175,6 +3299,10 @@ pub unsafe extern "C" fn nntmux_collections_clean_generic_pre_normalize(
     out_cap: usize,
 ) -> isize {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, input_len) || !cleaning_ffi_region_valid(out, out_cap)
+        {
+            return -1;
+        }
         if input.is_null()
             || out.is_null()
             || out_cap > isize::MAX as usize
@@ -3208,6 +3336,12 @@ pub unsafe extern "C" fn nntmux_collections_music_subject(
     out_cap: usize,
 ) -> isize {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, input_len)
+            || !cleaning_ffi_region_valid(group, group_len)
+            || !cleaning_ffi_region_valid(out, out_cap)
+        {
+            return -1;
+        }
         if input.is_null()
             || group.is_null()
             || out.is_null()
@@ -3248,6 +3382,12 @@ pub unsafe extern "C" fn nntmux_collections_enhance_short_subject(
     out_cap: usize,
 ) -> isize {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, input_len)
+            || !cleaning_ffi_region_valid(clean, clean_len)
+            || !cleaning_ffi_region_valid(out, out_cap)
+        {
+            return -1;
+        }
         if input.is_null()
             || clean.is_null()
             || out.is_null()
@@ -4369,19 +4509,27 @@ pub unsafe extern "C" fn nntmux_mcp_redact_string(
     out_buf: *mut u8,
     out_cap: usize,
 ) -> isize {
-    if input.is_null() && input_len > 0 {
-        return -1;
-    }
-    if input_len == 0 {
-        return 0;
-    }
-    let bytes = unsafe { slice::from_raw_parts(input, input_len) };
-    let Some(redacted) = mcp_redact_bytes(bytes) else {
-        return 0;
-    };
-    let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
-    out.extend(&redacted);
-    out.finish()
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, input_len)
+            || !cleaning_ffi_region_valid(out_buf, out_cap)
+        {
+            return -1;
+        }
+        if input.is_null() && input_len > 0 {
+            return -1;
+        }
+        if input_len == 0 {
+            return 0;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, input_len) };
+        let Some(redacted) = mcp_redact_bytes(bytes) else {
+            return 0;
+        };
+        let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+        out.extend(&redacted);
+        out.finish()
+    }))
+    .unwrap_or(-1)
 }
 
 /// C-ABI export for `SensitiveValueRedactor::isSensitiveKey(key)`.
@@ -4392,18 +4540,21 @@ pub unsafe extern "C" fn nntmux_mcp_redact_string(
 ///
 /// `input` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn nntmux_mcp_is_sensitive_key(
-    input: *const u8,
-    input_len: usize,
-) -> i32 {
-    if input.is_null() && input_len > 0 {
-        return -1;
-    }
-    if input_len < 5 {
-        return 0;
-    }
-    let bytes = unsafe { slice::from_raw_parts(input, input_len) };
-    i32::from(mcp_is_sensitive_key_slice(bytes))
+pub unsafe extern "C" fn nntmux_mcp_is_sensitive_key(input: *const u8, input_len: usize) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, input_len) {
+            return -1;
+        }
+        if input.is_null() && input_len > 0 {
+            return -1;
+        }
+        if input_len < 5 {
+            return 0;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, input_len) };
+        i32::from(mcp_is_sensitive_key_slice(bytes))
+    }))
+    .unwrap_or(-1)
 }
 
 #[inline]
@@ -4473,15 +4624,21 @@ pub unsafe extern "C" fn nntmux_mcp_parse_and_redact_rg_output(
     out_buf: *mut u8,
     out_cap: usize,
 ) -> isize {
-    if input.is_null() && input_len > 0 {
-        return -1;
-    }
-    if input_len == 0 || max_results == 0 {
-        return 0;
-    }
-    let bytes = unsafe { slice::from_raw_parts(input, input_len) };
-    let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
-    let mut count = 0usize;
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, input_len)
+            || !cleaning_ffi_region_valid(out_buf, out_cap)
+        {
+            return -1;
+        }
+        if input.is_null() && input_len > 0 {
+            return -1;
+        }
+        if input_len == 0 || max_results == 0 {
+            return 0;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, input_len) };
+        let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+        let mut count = 0usize;
 
     for_each_pcre_r_line(bytes, |line| {
         if line.len() < 4 {
@@ -4523,7 +4680,9 @@ pub unsafe extern "C" fn nntmux_mcp_parse_and_redact_rg_output(
         count < max_results
     });
 
-    out.finish()
+        out.finish()
+    }))
+    .unwrap_or(-1)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -4761,20 +4920,27 @@ pub unsafe extern "C" fn nntmux_mcp_glob_matches(
     path: *const u8,
     path_len: usize,
 ) -> i32 {
-    if (glob.is_null() && glob_len > 0) || (path.is_null() && path_len > 0) {
-        return -1;
-    }
-    let glob_bytes: &[u8] = if glob_len == 0 {
-        &[]
-    } else {
-        unsafe { slice::from_raw_parts(glob, glob_len) }
-    };
-    let path_bytes: &[u8] = if path_len == 0 {
-        &[]
-    } else {
-        unsafe { slice::from_raw_parts(path, path_len) }
-    };
-    i32::from(mcp_glob_matches_slice(glob_bytes, path_bytes))
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(glob, glob_len) || !cleaning_ffi_region_valid(path, path_len)
+        {
+            return -1;
+        }
+        if (glob.is_null() && glob_len > 0) || (path.is_null() && path_len > 0) {
+            return -1;
+        }
+        let glob_bytes: &[u8] = if glob_len == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(glob, glob_len) }
+        };
+        let path_bytes: &[u8] = if path_len == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(path, path_len) }
+        };
+        i32::from(mcp_glob_matches_slice(glob_bytes, path_bytes))
+    }))
+    .unwrap_or(-1)
 }
 
 /// C-ABI export for `RepositoryContextCollector::configurationKeys` regex extraction:
@@ -4795,33 +4961,103 @@ pub unsafe extern "C" fn nntmux_mcp_extract_config_keys(
     out_buf: *mut u8,
     out_cap: usize,
 ) -> isize {
-    if input.is_null() && input_len > 0 {
-        return -1;
-    }
-    if input_len < 7 {
-        return 0;
-    }
-    let bytes = unsafe { slice::from_raw_parts(input, input_len) };
-    let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
-    let mut paren_pos = 3usize;
-    let end_limit = bytes.len() - 3;
-    let mut first = true;
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, input_len)
+            || !cleaning_ffi_region_valid(out_buf, out_cap)
+        {
+            return -1;
+        }
+        if input.is_null() && input_len > 0 {
+            return -1;
+        }
+        if input_len < 7 {
+            return 0;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, input_len) };
+        let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+        let mut paren_pos = 3usize;
+        let end_limit = bytes.len() - 3;
+        let mut first = true;
 
-    while paren_pos + 32 <= end_limit {
-        let chunk: &[u8; 32] = bytes[paren_pos..paren_pos + 32].try_into().unwrap();
-        let prev_chunk: &[u8; 32] = bytes[paren_pos - 1..paren_pos + 31].try_into().unwrap();
-        let mut any = 0u8;
-        for k in 0..32 {
-            let is_paren = u8::from(chunk[k] == b'(');
-            let is_gv = u8::from(prev_chunk[k] == b'g') | u8::from(prev_chunk[k] == b'v');
-            any |= is_paren & is_gv;
+        while paren_pos + 32 <= end_limit {
+            let chunk: &[u8; 32] = bytes[paren_pos..paren_pos + 32].try_into().unwrap();
+            let prev_chunk: &[u8; 32] = bytes[paren_pos - 1..paren_pos + 31].try_into().unwrap();
+            let mut any = 0u8;
+            for k in 0..32 {
+                let is_paren = u8::from(chunk[k] == b'(');
+                let is_gv = u8::from(prev_chunk[k] == b'g') | u8::from(prev_chunk[k] == b'v');
+                any |= is_paren & is_gv;
+            }
+            if any == 0 {
+                paren_pos += 32;
+                continue;
+            }
+            let chunk_end = paren_pos + 32;
+            while paren_pos < chunk_end && paren_pos < end_limit {
+                if bytes[paren_pos] != b'(' {
+                    paren_pos += 1;
+                    continue;
+                }
+                let prev = bytes[paren_pos - 1];
+                if prev != b'g' && prev != b'v' {
+                    paren_pos += 1;
+                    continue;
+                }
+                let kw_ok = if prev == b'g' {
+                    paren_pos >= 6
+                        && &bytes[paren_pos - 6..paren_pos] == b"config"
+                        && (paren_pos == 6 || !is_pcre_word(bytes[paren_pos - 7]))
+                } else {
+                    &bytes[paren_pos - 3..paren_pos] == b"env"
+                        && (paren_pos == 3 || !is_pcre_word(bytes[paren_pos - 4]))
+                };
+
+                if !kw_ok {
+                    paren_pos += 1;
+                    continue;
+                }
+
+                let mut p = paren_pos + 1;
+                while p < bytes.len() && is_pcre_space(bytes[p]) {
+                    p += 1;
+                }
+                if p >= bytes.len() || !matches!(bytes[p], b'"' | b'\'') {
+                    paren_pos += 1;
+                    continue;
+                }
+
+                let key_start = p + 1;
+                let mut q = key_start;
+                let mut has_lf = false;
+                while q < bytes.len() && !matches!(bytes[q], b'"' | b'\'') {
+                    if bytes[q] == b'\n' {
+                        has_lf = true;
+                    }
+                    q += 1;
+                }
+                if q >= bytes.len() {
+                    let res = out.finish();
+                    return if res == -1 { -2 } else { res };
+                }
+                if q == key_start {
+                    paren_pos = q + 1;
+                    continue;
+                }
+                if has_lf {
+                    return -2;
+                }
+
+                let key_slice = &bytes[key_start..q];
+                if !first {
+                    out.push(b'\n');
+                }
+                first = false;
+                out.extend(key_slice);
+                paren_pos = q + 1;
+            }
         }
-        if any == 0 {
-            paren_pos += 32;
-            continue;
-        }
-        let chunk_end = paren_pos + 32;
-        while paren_pos < chunk_end && paren_pos < end_limit {
+
+        while paren_pos < end_limit {
             if bytes[paren_pos] != b'(' {
                 paren_pos += 1;
                 continue;
@@ -4864,8 +5100,7 @@ pub unsafe extern "C" fn nntmux_mcp_extract_config_keys(
                 q += 1;
             }
             if q >= bytes.len() {
-                let res = out.finish();
-                return if res == -1 { -2 } else { res };
+                break;
             }
             if q == key_start {
                 paren_pos = q + 1;
@@ -4883,76 +5118,11 @@ pub unsafe extern "C" fn nntmux_mcp_extract_config_keys(
             out.extend(key_slice);
             paren_pos = q + 1;
         }
-    }
 
-    while paren_pos < end_limit {
-        if bytes[paren_pos] != b'(' {
-            paren_pos += 1;
-            continue;
-        }
-        let prev = bytes[paren_pos - 1];
-        if prev != b'g' && prev != b'v' {
-            paren_pos += 1;
-            continue;
-        }
-        let kw_ok = if prev == b'g' {
-            paren_pos >= 6
-                && &bytes[paren_pos - 6..paren_pos] == b"config"
-                && (paren_pos == 6 || !is_pcre_word(bytes[paren_pos - 7]))
-        } else {
-            &bytes[paren_pos - 3..paren_pos] == b"env"
-                && (paren_pos == 3 || !is_pcre_word(bytes[paren_pos - 4]))
-        };
-
-        if !kw_ok {
-            paren_pos += 1;
-            continue;
-        }
-
-        let mut p = paren_pos + 1;
-        while p < bytes.len() && is_pcre_space(bytes[p]) {
-            p += 1;
-        }
-        if p >= bytes.len() || !matches!(bytes[p], b'"' | b'\'') {
-            paren_pos += 1;
-            continue;
-        }
-
-        let key_start = p + 1;
-        let mut q = key_start;
-        let mut has_lf = false;
-        while q < bytes.len() && !matches!(bytes[q], b'"' | b'\'') {
-            if bytes[q] == b'\n' {
-                has_lf = true;
-            }
-            q += 1;
-        }
-        if q >= bytes.len() {
-            break;
-        }
-        if q == key_start {
-            paren_pos = q + 1;
-            continue;
-        }
-        if has_lf {
-            return -2;
-        }
-
-        let key_slice = &bytes[key_start..q];
-        if !first {
-            out.push(b'\n');
-        }
-        first = false;
-        out.extend(key_slice);
-        paren_pos = q + 1;
-    }
-
-    let res = out.finish();
-    if res == -1 {
-        -2
-    } else {
-        res
-    }
+        let res = out.finish();
+        if res == -1 { -2 } else { res }
+    }))
+    .unwrap_or(-1)
 }
 
 #[inline]
@@ -5004,99 +5174,106 @@ pub unsafe extern "C" fn nntmux_mcp_search_terms(
     out_buf: *mut u8,
     out_cap: usize,
 ) -> isize {
-    if input.is_null() && input_len > 0 {
-        return -1;
-    }
-    if input_len < 5 {
-        return 0;
-    }
-    let s = unsafe { slice::from_raw_parts(input, input_len) };
-    let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
-    let mut seen: [&[u8]; 5] = [&[]; 5];
-    let mut seen_len = 0usize;
-    let mut i = 0usize;
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, input_len)
+            || !cleaning_ffi_region_valid(out_buf, out_cap)
+        {
+            return -1;
+        }
+        if input.is_null() && input_len > 0 {
+            return -1;
+        }
+        if input_len < 5 {
+            return 0;
+        }
+        let s = unsafe { slice::from_raw_parts(input, input_len) };
+        let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+        let mut seen: [&[u8]; 5] = [&[]; 5];
+        let mut seen_len = 0usize;
+        let mut i = 0usize;
 
     while i + 5 <= s.len() {
         let mut matched: Option<&[u8]> = None;
 
-        if s[i..].starts_with(b"App\\")
-            && s.get(i + 4)
-                .is_some_and(|&b| is_pcre_word(b) || b == b'\\')
-        {
-            let mut end = i + 5;
-            while end < s.len() && (is_pcre_word(s[end]) || s[end] == b'\\') {
-                end += 1;
-            }
-            matched = Some(&s[i..end]);
-            i = end;
-        } else if s[i..].starts_with(b"app/") {
-            let mut max_end = i + 4;
-            while max_end < s.len()
-                && (is_pcre_word(s[max_end]) || matches!(s[max_end], b'/' | b'.' | b'-'))
+            if s[i..].starts_with(b"App\\")
+                && s.get(i + 4).is_some_and(|&b| is_pcre_word(b) || b == b'\\')
             {
-                max_end += 1;
-            }
-            let mut found_end: Option<usize> = None;
-            let mut end = max_end;
-            while end >= i + 9 {
-                if &s[end - 4..end] == b".php" {
-                    found_end = Some(end);
-                    break;
+                let mut end = i + 5;
+                while end < s.len() && (is_pcre_word(s[end]) || s[end] == b'\\') {
+                    end += 1;
                 }
-                end -= 1;
-            }
-            if let Some(end) = found_end {
                 matched = Some(&s[i..end]);
                 i = end;
+            } else if s[i..].starts_with(b"app/") {
+                let mut max_end = i + 4;
+                while max_end < s.len()
+                    && (is_pcre_word(s[max_end]) || matches!(s[max_end], b'/' | b'.' | b'-'))
+                {
+                    max_end += 1;
+                }
+                let mut found_end: Option<usize> = None;
+                let mut end = max_end;
+                while end >= i + 9 {
+                    if &s[end - 4..end] == b".php" {
+                        found_end = Some(end);
+                        break;
+                    }
+                    end -= 1;
+                }
+                if let Some(end) = found_end {
+                    matched = Some(&s[i..end]);
+                    i = end;
+                } else {
+                    i += 1;
+                }
+            } else if s[i].is_ascii_uppercase() {
+                let mut max_end = i + 1;
+                while max_end < s.len() && is_pcre_word(s[max_end]) {
+                    max_end += 1;
+                }
+                let mut found_end: Option<usize> = None;
+                let mut end = max_end;
+                while end >= i + 7 {
+                    if ends_with_mcp_symbol_suffix(&s[i + 2..end]) {
+                        found_end = Some(end);
+                        break;
+                    }
+                    end -= 1;
+                }
+                if let Some(end) = found_end {
+                    matched = Some(&s[i..end]);
+                    i = end;
+                } else if max_end > i + 3
+                    && ((&s[max_end - 3..max_end] == b"App" && s.get(max_end) == Some(&b'\\'))
+                        || (&s[max_end - 3..max_end] == b"app" && s.get(max_end) == Some(&b'/')))
+                {
+                    i = max_end - 3;
+                } else {
+                    i = max_end;
+                }
             } else {
                 i += 1;
             }
-        } else if s[i].is_ascii_uppercase() {
-            let mut max_end = i + 1;
-            while max_end < s.len() && is_pcre_word(s[max_end]) {
-                max_end += 1;
-            }
-            let mut found_end: Option<usize> = None;
-            let mut end = max_end;
-            while end >= i + 7 {
-                if ends_with_mcp_symbol_suffix(&s[i + 2..end]) {
-                    found_end = Some(end);
-                    break;
-                }
-                end -= 1;
-            }
-            if let Some(end) = found_end {
-                matched = Some(&s[i..end]);
-                i = end;
-            } else if max_end > i + 3
-                && ((&s[max_end - 3..max_end] == b"App" && s.get(max_end) == Some(&b'\\'))
-                    || (&s[max_end - 3..max_end] == b"app" && s.get(max_end) == Some(&b'/')))
-            {
-                i = max_end - 3;
-            } else {
-                i = max_end;
-            }
-        } else {
-            i += 1;
-        }
 
-        if let Some(raw) = matched {
-            let norm = normalize_mcp_search_term(raw);
-            if !norm.is_empty() && norm != b"0" && !seen[..seen_len].contains(&norm) {
-                if seen_len > 0 {
-                    out.push(b'\n');
-                }
-                out.extend(norm);
-                seen[seen_len] = norm;
-                seen_len += 1;
-                if seen_len == 5 {
-                    break;
+            if let Some(raw) = matched {
+                let norm = normalize_mcp_search_term(raw);
+                if !norm.is_empty() && norm != b"0" && !seen[..seen_len].contains(&norm) {
+                    if seen_len > 0 {
+                        out.push(b'\n');
+                    }
+                    out.extend(norm);
+                    seen[seen_len] = norm;
+                    seen_len += 1;
+                    if seen_len == 5 {
+                        break;
+                    }
                 }
             }
         }
-    }
 
-    out.finish()
+        out.finish()
+    }))
+    .unwrap_or(-1)
 }
 
 #[cfg(test)]
@@ -5187,7 +5364,6 @@ mod mcp_tests {
         assert_eq!(&out[..edge_len as usize], b"Bar");
     }
 }
-
 
 // Wave 8 town patterns deliberately retain PHP branch order, captures and modifiers.
 mod release_town {
@@ -5785,35 +5961,43 @@ pub unsafe extern "C" fn nntmux_release_generic_town(
     out_buf: *mut u8,
     out_cap: usize,
 ) -> isize {
-    if subject_len > isize::MAX as usize
-        || subject.is_null() && subject_len != 0
-        || out_buf.is_null() && out_cap != 0
-        || out_cap > isize::MAX as usize
-    {
-        return -1;
-    }
-    let subject = if subject_len == 0 {
-        &[]
-    } else {
-        unsafe { slice::from_raw_parts(subject, subject_len) }
-    };
-    match release_town::capture(subject) {
-        Ok(Some(name)) => {
-            let length = name.len();
-            if length > out_cap {
-                return -(length as isize) - 4;
-            }
-            if length != 0 {
-                // memmove semantics also permit a C caller's in-place output.
-                unsafe {
-                    std::ptr::copy(name.as_ptr(), out_buf, length);
-                }
-            }
-            length as isize
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(subject, subject_len)
+            || !cleaning_ffi_region_valid(out_buf, out_cap)
+        {
+            return -1;
         }
-        Ok(None) => -3,
-        Err(()) => -2,
-    }
+        if subject_len > isize::MAX as usize
+            || subject.is_null() && subject_len != 0
+            || out_buf.is_null() && out_cap != 0
+            || out_cap > isize::MAX as usize
+        {
+            return -1;
+        }
+        let subject = if subject_len == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(subject, subject_len) }
+        };
+        match release_town::capture(subject) {
+            Ok(Some(name)) => {
+                let length = name.len();
+                if length > out_cap {
+                    return -(length as isize) - 4;
+                }
+                if length != 0 {
+                    // memmove semantics also permit a C caller's in-place output.
+                    unsafe {
+                        std::ptr::copy(name.as_ptr(), out_buf, length);
+                    }
+                }
+                length as isize
+            }
+            Ok(None) => -3,
+            Err(()) => -2,
+        }
+    }))
+    .unwrap_or(-1)
 }
 
 #[cfg(test)]
@@ -5844,7 +6028,7 @@ mod release_town_tests {
             );
             assert_eq!(
                 nntmux_release_generic_town(std::ptr::null(), 0, buf.as_mut_ptr(), buf.len()),
-                -3
+                -1
             );
             assert_eq!(
                 nntmux_release_generic_town(
@@ -5862,7 +6046,7 @@ mod release_town_tests {
                     std::ptr::null_mut(),
                     0
                 ),
-                -15
+                -1
             );
             assert_eq!(
                 nntmux_release_generic_town(subject.as_ptr(), subject.len(), buf.as_mut_ptr(), 1),
@@ -6063,18 +6247,24 @@ pub unsafe extern "C" fn nntmux_season_pack_is_unclassified_episode(
     input: *const u8,
     input_len: usize,
 ) -> i32 {
-    let Some(bytes) = (unsafe { wave9_input(input, input_len) }) else {
-        return -1;
-    };
-    if bytes.contains(&b'\n') {
-        return -1;
-    }
-    let base = crate::filename::season_pack_base_name(bytes);
-    i32::from(
-        !crate::filename::matches_sample_regex(base)
-            && crate::filename::is_episode_name(base)
-            && wave9_episode_identity(bytes).is_none(),
-    )
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, input_len) {
+            return -1;
+        }
+        let Some(bytes) = (unsafe { wave9_input(input, input_len) }) else {
+            return -1;
+        };
+        if bytes.contains(&b'\n') {
+            return -1;
+        }
+        let base = crate::filename::season_pack_base_name(bytes);
+        i32::from(
+            !crate::filename::matches_sample_regex(base)
+                && crate::filename::is_episode_name(base)
+                && wave9_episode_identity(bytes).is_none(),
+        )
+    }))
+    .unwrap_or(-1)
 }
 
 /// NUL-separated names; empty input means no names and a final delimiter is
@@ -6089,39 +6279,45 @@ pub unsafe extern "C" fn nntmux_season_pack_has_distinct_identities_nul(
     input: *const u8,
     input_len: usize,
 ) -> i32 {
-    let Some(bytes) = (unsafe { wave9_input(input, input_len) }) else {
-        return -1;
-    };
-    if bytes.contains(&b'\n') {
-        return -1;
-    }
-    if bytes.is_empty() {
-        return 0;
-    }
-    let mut first = None;
-    let mut distinct = false;
-    let mut ancillary = 0i32;
-    for name in bytes.split(|&b| b == 0) {
-        if wave9_ancillary(name) {
-            let Some(count) = ancillary
-                .checked_add(1)
-                .filter(|&count| count <= i32::MAX >> 1)
-            else {
-                return -1;
-            };
-            ancillary = count;
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, input_len) {
+            return -1;
         }
-        if !distinct {
-            if let Some(identity) = wave9_episode_identity(name) {
-                if let Some(previous) = &first {
-                    distinct = previous != &identity;
-                } else {
-                    first = Some(identity);
+        let Some(bytes) = (unsafe { wave9_input(input, input_len) }) else {
+            return -1;
+        };
+        if bytes.contains(&b'\n') {
+            return -1;
+        }
+        if bytes.is_empty() {
+            return 0;
+        }
+        let mut first = None;
+        let mut distinct = false;
+        let mut ancillary = 0i32;
+        for name in bytes.split(|&b| b == 0) {
+            if wave9_ancillary(name) {
+                let Some(count) = ancillary
+                    .checked_add(1)
+                    .filter(|&count| count <= i32::MAX >> 1)
+                else {
+                    return -1;
+                };
+                ancillary = count;
+            }
+            if !distinct {
+                if let Some(identity) = wave9_episode_identity(name) {
+                    if let Some(previous) = &first {
+                        distinct = previous != &identity;
+                    } else {
+                        first = Some(identity);
+                    }
                 }
             }
         }
-    }
-    (ancillary << 1) | i32::from(distinct)
+        (ancillary << 1) | i32::from(distinct)
+    }))
+    .unwrap_or(-1)
 }
 
 /// `-1` requests PHP fallback; otherwise returns the exact Boolean result.
@@ -6133,10 +6329,16 @@ pub unsafe extern "C" fn nntmux_season_pack_is_ancillary_name(
     input: *const u8,
     input_len: usize,
 ) -> i32 {
-    let Some(bytes) = (unsafe { wave9_input(input, input_len) }) else {
-        return -1;
-    };
-    i32::from(wave9_ancillary(bytes))
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, input_len) {
+            return -1;
+        }
+        let Some(bytes) = (unsafe { wave9_input(input, input_len) }) else {
+            return -1;
+        };
+        i32::from(wave9_ancillary(bytes))
+    }))
+    .unwrap_or(-1)
 }
 
 /// Returns the first season folder's raw segment offset, `-2` for no folder,
@@ -6149,23 +6351,29 @@ pub unsafe extern "C" fn nntmux_season_pack_season_folder(
     input: *const u8,
     input_len: usize,
 ) -> i32 {
-    let Some(bytes) = (unsafe { wave9_input(input, input_len) }) else {
-        return -1;
-    };
-    if bytes.contains(&b'\n') {
-        return -1;
-    }
-    let mut start = 0;
-    for (end, &byte) in bytes.iter().enumerate() {
-        if matches!(byte, b'/' | b'\\') {
-            let segment = php_trim_ascii(&bytes[start..end]);
-            if !segment.is_empty() && crate::filename::is_season_pack(segment) {
-                return i32::try_from(start).unwrap_or(-1);
-            }
-            start = end + 1;
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, input_len) {
+            return -1;
         }
-    }
-    -2
+        let Some(bytes) = (unsafe { wave9_input(input, input_len) }) else {
+            return -1;
+        };
+        if bytes.contains(&b'\n') {
+            return -1;
+        }
+        let mut start = 0;
+        for (end, &byte) in bytes.iter().enumerate() {
+            if matches!(byte, b'/' | b'\\') {
+                let segment = php_trim_ascii(&bytes[start..end]);
+                if !segment.is_empty() && crate::filename::is_season_pack(segment) {
+                    return i32::try_from(start).unwrap_or(-1);
+                }
+                start = end + 1;
+            }
+        }
+        -2
+    }))
+    .unwrap_or(-1)
 }
 
 fn wave9_anime_encoding(input: &[u8]) -> Option<Vec<u8>> {
@@ -6263,16 +6471,23 @@ pub unsafe extern "C" fn nntmux_anime_fix_encoding(
     out: *mut u8,
     out_cap: usize,
 ) -> isize {
-    if out_cap > isize::MAX as usize || out.is_null() && out_cap != 0 {
-        return -1;
-    }
-    let Some(bytes) = (unsafe { wave9_input(input, input_len) }) else {
-        return -1;
-    };
-    let Some(output) = wave9_anime_encoding(bytes) else {
-        return -1;
-    };
-    unsafe { wave9_write_output(&output, out, out_cap) }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, input_len) || !cleaning_ffi_region_valid(out, out_cap)
+        {
+            return -1;
+        }
+        if out_cap > isize::MAX as usize || out.is_null() && out_cap != 0 {
+            return -1;
+        }
+        let Some(bytes) = (unsafe { wave9_input(input, input_len) }) else {
+            return -1;
+        };
+        let Some(output) = wave9_anime_encoding(bytes) else {
+            return -1;
+        };
+        unsafe { wave9_write_output(&output, out, out_cap) }
+    }))
+    .unwrap_or(-1)
 }
 
 /// ASCII PreDB identity normalization. `-2` is semantic null (empty input,
@@ -6288,22 +6503,29 @@ pub unsafe extern "C" fn nntmux_predb_identity_key_normalize(
     out: *mut u8,
     out_cap: usize,
 ) -> isize {
-    if out_cap > isize::MAX as usize || out.is_null() && out_cap != 0 {
-        return -1;
-    }
-    let Some(bytes) = (unsafe { wave9_input(input, input_len) }) else {
-        return -1;
-    };
-    if bytes.is_empty() || bytes.len() > 512 || std::str::from_utf8(bytes).is_err() {
-        return -2;
-    }
-    if !bytes.is_ascii() {
-        return -1;
-    }
-    let Some(output) = normalize_predb_key_ascii(bytes) else {
-        return -2;
-    };
-    unsafe { wave9_write_output(&output, out, out_cap) }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, input_len) || !cleaning_ffi_region_valid(out, out_cap)
+        {
+            return -1;
+        }
+        if out_cap > isize::MAX as usize || out.is_null() && out_cap != 0 {
+            return -1;
+        }
+        let Some(bytes) = (unsafe { wave9_input(input, input_len) }) else {
+            return -1;
+        };
+        if bytes.is_empty() || bytes.len() > 512 || std::str::from_utf8(bytes).is_err() {
+            return -2;
+        }
+        if !bytes.is_ascii() {
+            return -1;
+        }
+        let Some(output) = normalize_predb_key_ascii(bytes) else {
+            return -2;
+        };
+        unsafe { wave9_write_output(&output, out, out_cap) }
+    }))
+    .unwrap_or(-1)
 }
 
 #[cfg(test)]
@@ -6542,14 +6764,17 @@ mod wave9_cleaning_tests {
             }
             assert_eq!(
                 nntmux_season_pack_is_unclassified_episode(std::ptr::null(), 0),
-                0
+                -1
             );
             assert_eq!(
                 nntmux_season_pack_has_distinct_identities_nul(std::ptr::null(), 0),
-                0
+                -1
             );
-            assert_eq!(nntmux_season_pack_is_ancillary_name(std::ptr::null(), 0), 0);
-            assert_eq!(nntmux_season_pack_season_folder(std::ptr::null(), 0), -2);
+            assert_eq!(
+                nntmux_season_pack_is_ancillary_name(std::ptr::null(), 0),
+                -1
+            );
+            assert_eq!(nntmux_season_pack_season_folder(std::ptr::null(), 0), -1);
             for export in [
                 nntmux_anime_fix_encoding as StringExport,
                 nntmux_predb_identity_key_normalize,
@@ -6567,17 +6792,17 @@ mod wave9_cleaning_tests {
                 );
                 assert_eq!(export(b"test".as_ptr(), 4, out.as_mut_ptr(), 3), -7);
                 assert_eq!(out, [b'Z'; 8]);
-                assert_eq!(export(b"test".as_ptr(), 4, std::ptr::null_mut(), 0), -7);
+                assert_eq!(export(b"test".as_ptr(), 4, std::ptr::null_mut(), 0), -1);
                 assert_eq!(export(b"test".as_ptr(), 4, out.as_mut_ptr(), 4), 4);
                 assert_eq!(&out[..5], b"testZ");
             }
             assert_eq!(
                 nntmux_anime_fix_encoding(std::ptr::null(), 0, std::ptr::null_mut(), 0),
-                0
+                -1
             );
             assert_eq!(
                 nntmux_predb_identity_key_normalize(std::ptr::null(), 0, std::ptr::null_mut(), 0),
-                -2
+                -1
             );
         }
     }
@@ -6797,10 +7022,16 @@ fn mcp_check_allowed_location_bytes(
 /// `path` must be readable for `path_len` bytes when non-null and `path_len > 0`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nntmux_mcp_check_not_sensitive(path: *const u8, path_len: usize) -> i32 {
-    let Some(bytes) = (unsafe { wave9_input(path, path_len) }) else {
-        return -1;
-    };
-    mcp_check_not_sensitive_bytes(bytes)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(path, path_len) {
+            return -1;
+        }
+        let Some(bytes) = (unsafe { wave9_input(path, path_len) }) else {
+            return -1;
+        };
+        mcp_check_not_sensitive_bytes(bytes)
+    }))
+    .unwrap_or(-1)
 }
 
 /// Checks `ProjectPathGuard::assertAllowedLocation(path)`.
@@ -6824,22 +7055,32 @@ pub unsafe extern "C" fn nntmux_mcp_check_allowed_location(
     denied_segments_nul: *const u8,
     denied_segments_len: usize,
 ) -> i32 {
-    let Some(bytes) = (unsafe { wave9_input(path, path_len) }) else {
-        return -1;
-    };
-    if use_defaults != 0 {
-        return mcp_check_allowed_location_bytes(bytes, true, None, None, None);
-    }
-    let Some(rf) = (unsafe { wave9_input(root_files_nul, root_files_len) }) else {
-        return -1;
-    };
-    let Some(ar) = (unsafe { wave9_input(allowed_roots_nul, allowed_roots_len) }) else {
-        return -1;
-    };
-    let Some(ds) = (unsafe { wave9_input(denied_segments_nul, denied_segments_len) }) else {
-        return -1;
-    };
-    mcp_check_allowed_location_bytes(bytes, false, Some(rf), Some(ar), Some(ds))
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(path, path_len)
+            || !cleaning_ffi_region_valid(root_files_nul, root_files_len)
+            || !cleaning_ffi_region_valid(allowed_roots_nul, allowed_roots_len)
+            || !cleaning_ffi_region_valid(denied_segments_nul, denied_segments_len)
+        {
+            return -1;
+        }
+        let Some(bytes) = (unsafe { wave9_input(path, path_len) }) else {
+            return -1;
+        };
+        if use_defaults != 0 {
+            return mcp_check_allowed_location_bytes(bytes, true, None, None, None);
+        }
+        let Some(rf) = (unsafe { wave9_input(root_files_nul, root_files_len) }) else {
+            return -1;
+        };
+        let Some(ar) = (unsafe { wave9_input(allowed_roots_nul, allowed_roots_len) }) else {
+            return -1;
+        };
+        let Some(ds) = (unsafe { wave9_input(denied_segments_nul, denied_segments_len) }) else {
+            return -1;
+        };
+        mcp_check_allowed_location_bytes(bytes, false, Some(rf), Some(ar), Some(ds))
+    }))
+    .unwrap_or(-1)
 }
 
 /// Normalizes and validates a relative path for `ProjectPathGuard::normalize(path)` up to filesystem resolution.
@@ -6873,94 +7114,111 @@ pub unsafe extern "C" fn nntmux_mcp_normalize_relative_path(
     out_buf: *mut u8,
     out_cap: usize,
 ) -> isize {
-    if out_status.is_null() || out_cap > isize::MAX as usize || (out_buf.is_null() && out_cap > 0) {
-        return -1;
-    }
-    let Some(bytes) = (unsafe { wave9_input(path, path_len) }) else {
-        return -1;
-    };
-    let (rf, ar, ds) = if use_defaults != 0 {
-        (None, None, None)
-    } else {
-        let Some(rf) = (unsafe { wave9_input(root_files_nul, root_files_len) }) else {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(path, path_len)
+            || !cleaning_ffi_region_valid(root_files_nul, root_files_len)
+            || !cleaning_ffi_region_valid(allowed_roots_nul, allowed_roots_len)
+            || !cleaning_ffi_region_valid(denied_segments_nul, denied_segments_len)
+            || !cleaning_ffi_region_valid(out_status, 1)
+            || !cleaning_ffi_region_valid(out_buf, out_cap)
+        {
             return -1;
-        };
-        let Some(ar) = (unsafe { wave9_input(allowed_roots_nul, allowed_roots_len) }) else {
-            return -1;
-        };
-        let Some(ds) = (unsafe { wave9_input(denied_segments_nul, denied_segments_len) }) else {
-            return -1;
-        };
-        (Some(rf), Some(ar), Some(ds))
-    };
-
-    // 1. `$path = trim(str_replace('\\', '/', $path));`
-    let trimmed = php_trim_ascii(bytes);
-    if trimmed.is_empty() || trimmed.contains(&0) {
-        unsafe { *out_status = 1 };
-        return 0;
-    }
-    // 2. `if (str_starts_with($path, '/') || preg_match('/^[A-Za-z]:\//', $path) === 1)`
-    if matches!(trimmed[0], b'/' | b'\\')
-        || (trimmed.len() >= 3
-            && trimmed[0].is_ascii_alphabetic()
-            && trimmed[1] == b':'
-            && matches!(trimmed[2], b'/' | b'\\'))
-    {
-        unsafe { *out_status = 2 };
-        return 0;
-    }
-
-    // 3. `$path = preg_replace('#/+#', '/', $path)` + replace `\` with `/`
-    let mut normalized = Vec::with_capacity(trimmed.len());
-    for &b in trimmed {
-        let mapped = if b == b'\\' { b'/' } else { b };
-        if mapped == b'/' && normalized.last() == Some(&b'/') {
-            continue;
         }
-        normalized.push(mapped);
-    }
+        if out_status.is_null()
+            || out_cap > isize::MAX as usize
+            || (out_buf.is_null() && out_cap > 0)
+        {
+            return -1;
+        }
+        let Some(bytes) = (unsafe { wave9_input(path, path_len) }) else {
+            return -1;
+        };
+        let (rf, ar, ds) = if use_defaults != 0 {
+            (None, None, None)
+        } else {
+            let Some(rf) = (unsafe { wave9_input(root_files_nul, root_files_len) }) else {
+                return -1;
+            };
+            let Some(ar) = (unsafe { wave9_input(allowed_roots_nul, allowed_roots_len) }) else {
+                return -1;
+            };
+            let Some(ds) = (unsafe { wave9_input(denied_segments_nul, denied_segments_len) })
+            else {
+                return -1;
+            };
+            (Some(rf), Some(ar), Some(ds))
+        };
 
-    // 4. `if (in_array('..', $segments, true) || in_array('.', $segments, true))`
-    for seg in normalized.split(|&b| b == b'/') {
-        if seg == b"." || seg == b".." {
-            unsafe { *out_status = 3 };
+        // 1. `$path = trim(str_replace('\\', '/', $path));`
+        let trimmed = php_trim_ascii(bytes);
+        if trimmed.is_empty() || trimmed.contains(&0) {
+            unsafe { *out_status = 1 };
             return 0;
         }
-    }
+        // 2. `if (str_starts_with($path, '/') || preg_match('/^[A-Za-z]:\//', $path) === 1)`
+        if matches!(trimmed[0], b'/' | b'\\')
+            || (trimmed.len() >= 3
+                && trimmed[0].is_ascii_alphabetic()
+                && trimmed[1] == b':'
+                && matches!(trimmed[2], b'/' | b'\\'))
+        {
+            unsafe { *out_status = 2 };
+            return 0;
+        }
 
-    // Ensure `out_buf` can hold `normalized` (needed for status 0, 4, 5).
-    if normalized.len() > out_cap {
-        return -(normalized.len() as isize);
-    }
-    unsafe {
-        std::ptr::copy_nonoverlapping(normalized.as_ptr(), out_buf, normalized.len());
-    }
+        // 3. `$path = preg_replace('#/+#', '/', $path)` + replace `\` with `/`
+        let mut normalized = Vec::with_capacity(trimmed.len());
+        for &b in trimmed {
+            let mapped = if b == b'\\' { b'/' } else { b };
+            if mapped == b'/' && normalized.last() == Some(&b'/') {
+                continue;
+            }
+            normalized.push(mapped);
+        }
 
-    // 5. `assertAllowedLocation`
-    let loc_status = mcp_check_allowed_location_bytes(&normalized, use_defaults != 0, rf, ar, ds);
-    if loc_status == 1 {
-        unsafe { *out_status = 4 };
-        return normalized.len() as isize;
-    }
-    if loc_status == 2 {
-        unsafe { *out_status = 5 };
-        return normalized.len() as isize;
-    }
+        // 4. `if (in_array('..', $segments, true) || in_array('.', $segments, true))`
+        for seg in normalized.split(|&b| b == b'/') {
+            if seg == b"." || seg == b".." {
+                unsafe { *out_status = 3 };
+                return 0;
+            }
+        }
 
-    // 6. `assertNotSensitive`
-    let sens_status = mcp_check_not_sensitive_bytes(&normalized);
-    if sens_status == 1 {
-        unsafe { *out_status = 6 };
-        return 0;
-    }
-    if sens_status == 2 {
-        unsafe { *out_status = 7 };
-        return 0;
-    }
+        // Ensure `out_buf` can hold `normalized` (needed for status 0, 4, 5).
+        if normalized.len() > out_cap {
+            return -(normalized.len() as isize);
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(normalized.as_ptr(), out_buf, normalized.len());
+        }
 
-    unsafe { *out_status = 0 };
-    normalized.len() as isize
+        // 5. `assertAllowedLocation`
+        let loc_status =
+            mcp_check_allowed_location_bytes(&normalized, use_defaults != 0, rf, ar, ds);
+        if loc_status == 1 {
+            unsafe { *out_status = 4 };
+            return normalized.len() as isize;
+        }
+        if loc_status == 2 {
+            unsafe { *out_status = 5 };
+            return normalized.len() as isize;
+        }
+
+        // 6. `assertNotSensitive`
+        let sens_status = mcp_check_not_sensitive_bytes(&normalized);
+        if sens_status == 1 {
+            unsafe { *out_status = 6 };
+            return 0;
+        }
+        if sens_status == 2 {
+            unsafe { *out_status = 7 };
+            return 0;
+        }
+
+        unsafe { *out_status = 0 };
+        normalized.len() as isize
+    }))
+    .unwrap_or(-1)
 }
 
 #[inline]
@@ -7005,10 +7263,16 @@ fn http_is_json_media_type_bytes(bytes: &[u8]) -> bool {
 /// `input` must be readable for `input_len` bytes when non-null and `input_len > 0`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nntmux_http_is_json_media_type(input: *const u8, input_len: usize) -> i32 {
-    let Some(bytes) = (unsafe { wave9_input(input, input_len) }) else {
-        return -1;
-    };
-    i32::from(http_is_json_media_type_bytes(bytes))
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, input_len) {
+            return -1;
+        }
+        let Some(bytes) = (unsafe { wave9_input(input, input_len) }) else {
+            return -1;
+        };
+        i32::from(http_is_json_media_type_bytes(bytes))
+    }))
+    .unwrap_or(-1)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -7356,140 +7620,155 @@ pub unsafe extern "C" fn nntmux_http_validate_query(
     out_buf: *mut u8,
     out_cap: usize,
 ) -> isize {
-    if out_status.is_null() || out_cap > isize::MAX as usize || (out_buf.is_null() && out_cap > 0) {
-        return -1;
-    }
-    if query_keys_count > 66 {
-        return -1;
-    }
-    let Some(ct_bytes) = (unsafe { wave9_input(content_type, content_type_len) }) else {
-        return -1;
-    };
-    let Some(body_bytes) = (unsafe { wave9_input(raw_body, raw_body_len) }) else {
-        return -1;
-    };
-    let Some(qk_bytes) = (unsafe { wave9_input(query_keys_nul, query_keys_len) }) else {
-        return -1;
-    };
-
-    let write_err = |status: i32, msg: &[u8]| -> isize {
-        unsafe { *out_status = status };
-        let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
-        out.extend(msg);
-        out.finish()
-    };
-
-    // 1. Content-Type check
-    if has_content_type == 0 || !http_is_json_media_type_bytes(ct_bytes) {
-        return write_err(
-            415,
-            b"QUERY requests must use Content-Type: application/json",
-        );
-    }
-
-    // 2. Max body size check
-    if raw_body_len > max_body_bytes {
-        return write_err(413, b"QUERY body exceeds the maximum size");
-    }
-
-    // 3. Parse JSON body with depth 3 using stack storage
-    let mut body_entries: [(&[u8], QueryBodyValKind); 66] = [(&[], QueryBodyValKind::Scalar); 66];
-    let mut body_len = 0usize;
-    match parse_top_level_query_json(body_bytes, &mut body_entries, &mut body_len) {
-        JsonParseOutcome::ValidObject => {}
-        JsonParseOutcome::ValidNonObject => {
-            return write_err(400, b"QUERY body must be a JSON object");
-        }
-        JsonParseOutcome::InvalidOrTooDeep => {
-            return write_err(400, b"QUERY body must be valid JSON without nested values");
-        }
-        JsonParseOutcome::Decline => {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(content_type, content_type_len)
+            || !cleaning_ffi_region_valid(raw_body, raw_body_len)
+            || !cleaning_ffi_region_valid(query_keys_nul, query_keys_len)
+            || !cleaning_ffi_region_valid(out_status, 1)
+            || !cleaning_ffi_region_valid(out_buf, out_cap)
+        {
             return -1;
         }
-    }
+        if out_status.is_null()
+            || out_cap > isize::MAX as usize
+            || (out_buf.is_null() && out_cap > 0)
+        {
+            return -1;
+        }
+        if query_keys_count > 66 {
+            return -1;
+        }
+        let Some(ct_bytes) = (unsafe { wave9_input(content_type, content_type_len) }) else {
+            return -1;
+        };
+        let Some(body_bytes) = (unsafe { wave9_input(raw_body, raw_body_len) }) else {
+            return -1;
+        };
+        let Some(qk_bytes) = (unsafe { wave9_input(query_keys_nul, query_keys_len) }) else {
+            return -1;
+        };
 
-    // Collect query keys on stack
-    let mut query_keys: [&[u8]; 66] = [&[]; 66];
-    let mut qk_len = 0usize;
-    if query_keys_count > 0 {
-        for qk in qk_bytes.split(|&b| b == 0) {
-            if qk.contains(&b'\n') || qk_len >= 66 {
+        let write_err = |status: i32, msg: &[u8]| -> isize {
+            unsafe { *out_status = status };
+            let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+            out.extend(msg);
+            out.finish()
+        };
+
+        // 1. Content-Type check
+        if has_content_type == 0 || !http_is_json_media_type_bytes(ct_bytes) {
+            return write_err(
+                415,
+                b"QUERY requests must use Content-Type: application/json",
+            );
+        }
+
+        // 2. Max body size check
+        if raw_body_len > max_body_bytes {
+            return write_err(413, b"QUERY body exceeds the maximum size");
+        }
+
+        // 3. Parse JSON body with depth 3 using stack storage
+        let mut body_entries: [(&[u8], QueryBodyValKind); 66] =
+            [(&[], QueryBodyValKind::Scalar); 66];
+        let mut body_len = 0usize;
+        match parse_top_level_query_json(body_bytes, &mut body_entries, &mut body_len) {
+            JsonParseOutcome::ValidObject => {}
+            JsonParseOutcome::ValidNonObject => {
+                return write_err(400, b"QUERY body must be a JSON object");
+            }
+            JsonParseOutcome::InvalidOrTooDeep => {
+                return write_err(400, b"QUERY body must be valid JSON without nested values");
+            }
+            JsonParseOutcome::Decline => {
                 return -1;
             }
-            query_keys[qk_len] = qk;
-            qk_len += 1;
         }
-        if qk_len != query_keys_count {
-            return -1;
-        }
-    }
 
-    let qk_slice = &query_keys[..qk_len];
-    let body_slice = &body_entries[..body_len];
-
-    // 4. Validate KEY_PATTERN on all keys
-    for &qk in qk_slice {
-        if !is_valid_query_key_pattern(qk) {
-            return write_err(
-                400,
-                b"Parameter names may only contain letters, digits and underscores (max 32)",
-            );
-        }
-    }
-    for &(bk, _) in body_slice {
-        if !is_valid_query_key_pattern(bk) {
-            return write_err(
-                400,
-                b"Parameter names may only contain letters, digits and underscores (max 32)",
-            );
-        }
-    }
-
-    // 5. Count unique keys (`count($keys) > 64`) and find first duplicate in `$query` order
-    let mut first_dup: Option<&[u8]> = None;
-    let mut overlap_count = 0usize;
-    for &qk in qk_slice {
-        if body_slice.iter().any(|&(bk, _)| bk == qk) {
-            overlap_count += 1;
-            if first_dup.is_none() {
-                first_dup = Some(qk);
+        // Collect query keys on stack
+        let mut query_keys: [&[u8]; 66] = [&[]; 66];
+        let mut qk_len = 0usize;
+        if query_keys_count > 0 {
+            for qk in qk_bytes.split(|&b| b == 0) {
+                if qk.contains(&b'\n') || qk_len >= 66 {
+                    return -1;
+                }
+                query_keys[qk_len] = qk;
+                qk_len += 1;
+            }
+            if qk_len != query_keys_count {
+                return -1;
             }
         }
-    }
-    let unique_keys = qk_slice.len() + body_slice.len() - overlap_count;
-    if unique_keys > 64 {
-        return write_err(400, b"QUERY requests accept at most 64 parameters");
-    }
 
-    // 6. Duplicate parameter in both URL and body
-    if let Some(dup) = first_dup {
-        unsafe { *out_status = 400 };
-        let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
-        out.extend(b"Parameter ");
-        out.extend(dup);
-        out.extend(b" must not be sent in both the URL and the body");
-        return out.finish();
-    }
+        let qk_slice = &query_keys[..qk_len];
+        let body_slice = &body_entries[..body_len];
 
-    // 7. Validate body values
-    for &(bk, kind) in body_slice {
-        let valid = match kind {
-            QueryBodyValKind::Scalar => true,
-            QueryBodyValKind::ScalarList => bk == b"cat",
-            QueryBodyValKind::Unsupported => false,
-        };
-        if !valid {
+        // 4. Validate KEY_PATTERN on all keys
+        for &qk in qk_slice {
+            if !is_valid_query_key_pattern(qk) {
+                return write_err(
+                    400,
+                    b"Parameter names may only contain letters, digits and underscores (max 32)",
+                );
+            }
+        }
+        for &(bk, _) in body_slice {
+            if !is_valid_query_key_pattern(bk) {
+                return write_err(
+                    400,
+                    b"Parameter names may only contain letters, digits and underscores (max 32)",
+                );
+            }
+        }
+
+        // 5. Count unique keys (`count($keys) > 64`) and find first duplicate in `$query` order
+        let mut first_dup: Option<&[u8]> = None;
+        let mut overlap_count = 0usize;
+        for &qk in qk_slice {
+            if body_slice.iter().any(|&(bk, _)| bk == qk) {
+                overlap_count += 1;
+                if first_dup.is_none() {
+                    first_dup = Some(qk);
+                }
+            }
+        }
+        let unique_keys = qk_slice.len() + body_slice.len() - overlap_count;
+        if unique_keys > 64 {
+            return write_err(400, b"QUERY requests accept at most 64 parameters");
+        }
+
+        // 6. Duplicate parameter in both URL and body
+        if let Some(dup) = first_dup {
             unsafe { *out_status = 400 };
             let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
             out.extend(b"Parameter ");
-            out.extend(bk);
-            out.extend(b" has an unsupported type");
+            out.extend(dup);
+            out.extend(b" must not be sent in both the URL and the body");
             return out.finish();
         }
-    }
 
-    unsafe { *out_status = 0 };
-    0
+        // 7. Validate body values
+        for &(bk, kind) in body_slice {
+            let valid = match kind {
+                QueryBodyValKind::Scalar => true,
+                QueryBodyValKind::ScalarList => bk == b"cat",
+                QueryBodyValKind::Unsupported => false,
+            };
+            if !valid {
+                unsafe { *out_status = 400 };
+                let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+                out.extend(b"Parameter ");
+                out.extend(bk);
+                out.extend(b" has an unsupported type");
+                return out.finish();
+            }
+        }
+
+        unsafe { *out_status = 0 };
+        0
+    }))
+    .unwrap_or(-1)
 }
 
 /// Checks `BlockAbusiveServices::isBlockedUserAgent` and `matchesAnyUserAgentPattern`.
@@ -7508,35 +7787,43 @@ pub unsafe extern "C" fn nntmux_http_matches_user_agent_patterns_nul(
     patterns_len: usize,
     patterns_count: usize,
 ) -> i32 {
-    let Some(ua) = (unsafe { wave9_input(user_agent, user_agent_len) }) else {
-        return -1;
-    };
-    if use_default_blocked != 0 {
-        for &pat in DEFAULT_BLOCKED_USER_AGENTS {
-            if contains_ignore_ascii_case(ua, pat) {
-                return 1;
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(user_agent, user_agent_len)
+            || !cleaning_ffi_region_valid(patterns_nul, patterns_len)
+        {
+            return -1;
+        }
+        let Some(ua) = (unsafe { wave9_input(user_agent, user_agent_len) }) else {
+            return -1;
+        };
+        if use_default_blocked != 0 {
+            for &pat in DEFAULT_BLOCKED_USER_AGENTS {
+                if contains_ignore_ascii_case(ua, pat) {
+                    return 1;
+                }
+            }
+            return 0;
+        }
+        if patterns_count == 0 {
+            return 0;
+        }
+        let Some(pats) = (unsafe { wave9_input(patterns_nul, patterns_len) }) else {
+            return -1;
+        };
+        let mut seen = 0usize;
+        let mut matched = false;
+        for pat in pats.split(|&b| b == 0) {
+            seen += 1;
+            if !matched && contains_ignore_ascii_case(ua, pat) {
+                matched = true;
             }
         }
-        return 0;
-    }
-    if patterns_count == 0 {
-        return 0;
-    }
-    let Some(pats) = (unsafe { wave9_input(patterns_nul, patterns_len) }) else {
-        return -1;
-    };
-    let mut seen = 0usize;
-    let mut matched = false;
-    for pat in pats.split(|&b| b == 0) {
-        seen += 1;
-        if !matched && contains_ignore_ascii_case(ua, pat) {
-            matched = true;
+        if seen != patterns_count {
+            return -1;
         }
-    }
-    if seen != patterns_count {
-        return -1;
-    }
-    i32::from(matched)
+        i32::from(matched)
+    }))
+    .unwrap_or(-1)
 }
 
 #[inline]
@@ -7560,37 +7847,45 @@ pub unsafe extern "C" fn nntmux_http_redact_sensitive_query_keys_nul(
     out_buf: *mut u8,
     out_cap: usize,
 ) -> isize {
-    if out_cap > isize::MAX as usize || (out_buf.is_null() && out_cap > 0) {
-        return -1;
-    }
-    if keys_count == 0 {
-        return 0;
-    }
-    let Some(bytes) = (unsafe { wave9_input(keys_nul, keys_len) }) else {
-        return -1;
-    };
-    if keys_count > out_cap {
-        return -(keys_count as isize);
-    }
-    let mut idx = 0usize;
-    for key in bytes.split(|&b| b == 0) {
-        if idx >= keys_count {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(keys_nul, keys_len)
+            || !cleaning_ffi_region_valid(out_buf, out_cap)
+        {
             return -1;
         }
-        let flag = if is_sensitive_http_query_param(key) {
-            b'1'
-        } else {
-            b'0'
-        };
-        unsafe {
-            *out_buf.add(idx) = flag;
+        if out_cap > isize::MAX as usize || (out_buf.is_null() && out_cap > 0) {
+            return -1;
         }
-        idx += 1;
-    }
-    if idx != keys_count {
-        return -1;
-    }
-    keys_count as isize
+        if keys_count == 0 {
+            return 0;
+        }
+        let Some(bytes) = (unsafe { wave9_input(keys_nul, keys_len) }) else {
+            return -1;
+        };
+        if keys_count > out_cap {
+            return -(keys_count as isize);
+        }
+        let mut idx = 0usize;
+        for key in bytes.split(|&b| b == 0) {
+            if idx >= keys_count {
+                return -1;
+            }
+            let flag = if is_sensitive_http_query_param(key) {
+                b'1'
+            } else {
+                b'0'
+            };
+            unsafe {
+                *out_buf.add(idx) = flag;
+            }
+            idx += 1;
+        }
+        if idx != keys_count {
+            return -1;
+        }
+        keys_count as isize
+    }))
+    .unwrap_or(-1)
 }
 
 #[inline]
@@ -7650,17 +7945,21 @@ pub unsafe extern "C" fn nntmux_nzb_derive_release_name_span(
     path: *const u8,
     path_len: usize,
 ) -> i64 {
-    if path_len > u32::MAX as usize {
-        return -1;
-    }
-    let Some(bytes) = (unsafe { wave9_input(path, path_len) }) else {
-        return -1;
-    };
-    if bytes.contains(&b'\n') {
-        return -1;
-    }
-    let (start, mut end) = unix_basename_span(bytes);
-    let base = &bytes[start..end];
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(path, path_len) {
+            return -1;
+        }
+        if path_len > u32::MAX as usize {
+            return -1;
+        }
+        let Some(bytes) = (unsafe { wave9_input(path, path_len) }) else {
+            return -1;
+        };
+        if bytes.contains(&b'\n') {
+            return -1;
+        }
+        let (start, mut end) = unix_basename_span(bytes);
+        let base = &bytes[start..end];
 
     // 1. Strip trailing `.nzb` or `.nzb.gz` (case-insensitive)
     if base.len() >= 7 && base[base.len() - 7..].eq_ignore_ascii_case(b".nzb.gz") {
@@ -7669,21 +7968,23 @@ pub unsafe extern "C" fn nntmux_nzb_derive_release_name_span(
         end -= 4;
     }
 
-    // 2. Strip one trailing known media/container extension
-    let after_nzb = &bytes[start..end];
-    if let Some(dot) = after_nzb.iter().rposition(|&b| b == b'.') {
-        if matches_known_media_container_ext(&after_nzb[dot + 1..]) {
-            end = start + dot;
+        // 2. Strip one trailing known media/container extension
+        let after_nzb = &bytes[start..end];
+        if let Some(dot) = after_nzb.iter().rposition(|&b| b == b'.') {
+            if matches_known_media_container_ext(&after_nzb[dot + 1..]) {
+                end = start + dot;
+            }
         }
-    }
 
     // 3. `rtrim($name, ". \t\n\r\0\x0B")`
     while end > start && (bytes[end - 1] == b'.' || is_php_trim_char(bytes[end - 1])) {
         end -= 1;
     }
 
-    let len = end - start;
-    ((start as i64) << 32) | (len as i64)
+        let len = end - start;
+        ((start as i64) << 32) | (len as i64)
+    }))
+    .unwrap_or(-1)
 }
 
 #[inline]
@@ -7753,32 +8054,38 @@ pub unsafe extern "C" fn nntmux_nzb_normalize_imported_subject(
     out_buf: *mut u8,
     out_cap: usize,
 ) -> isize {
-    if out_cap > isize::MAX as usize || (out_buf.is_null() && out_cap > 0) {
-        return -1;
-    }
-    let Some(bytes) = (unsafe { wave9_input(subject, subject_len) }) else {
-        return -1;
-    };
-    if bytes.contains(&b'\n') || bytes.contains(&b'\r') {
-        return -1;
-    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(subject, subject_len)
+            || !cleaning_ffi_region_valid(out_buf, out_cap)
+        {
+            return -1;
+        }
+        if out_cap > isize::MAX as usize || (out_buf.is_null() && out_cap > 0) {
+            return -1;
+        }
+        let Some(bytes) = (unsafe { wave9_input(subject, subject_len) }) else {
+            return -1;
+        };
+        if bytes.contains(&b'\n') || bytes.contains(&b'\r') {
+            return -1;
+        }
 
     let stripped = strip_trailing_paren_part_counters(bytes);
 
-    // Find first case-insensitive `yenc` in `stripped`
-    let mut prefix_end = stripped.len();
-    if stripped.len() >= 4 {
-        let mut i = 0usize;
-        while i + 4 <= stripped.len() {
-            if matches!(stripped[i], b'y' | b'Y')
-                && stripped[i + 1..i + 4].eq_ignore_ascii_case(b"enc")
-            {
-                prefix_end = i;
-                break;
+        // Find first case-insensitive `yenc` in `stripped`
+        let mut prefix_end = stripped.len();
+        if stripped.len() >= 4 {
+            let mut i = 0usize;
+            while i + 4 <= stripped.len() {
+                if matches!(stripped[i], b'y' | b'Y')
+                    && stripped[i + 1..i + 4].eq_ignore_ascii_case(b"enc")
+                {
+                    prefix_end = i;
+                    break;
+                }
+                i += 1;
             }
-            i += 1;
         }
-    }
 
     // The pre-trim result is `stripped[..prefix_end] + "yEnc"`.
     // Because `"yEnc"` ends with `'c'` (not a trim char), `trim(stripped[..prefix_end] + "yEnc")`
@@ -7794,17 +8101,23 @@ pub unsafe extern "C" fn nntmux_nzb_normalize_imported_subject(
         return -1;
     }
 
-    let total_len = trimmed_prefix.len() + 4;
-    if total_len > out_cap {
-        return -(total_len as isize);
-    }
-    unsafe {
-        if !trimmed_prefix.is_empty() {
-            std::ptr::copy_nonoverlapping(trimmed_prefix.as_ptr(), out_buf, trimmed_prefix.len());
+        let total_len = trimmed_prefix.len() + 4;
+        if total_len > out_cap {
+            return -(total_len as isize);
         }
-        std::ptr::copy_nonoverlapping(b"yEnc".as_ptr(), out_buf.add(trimmed_prefix.len()), 4);
-    }
-    total_len as isize
+        unsafe {
+            if !trimmed_prefix.is_empty() {
+                std::ptr::copy_nonoverlapping(
+                    trimmed_prefix.as_ptr(),
+                    out_buf,
+                    trimmed_prefix.len(),
+                );
+            }
+            std::ptr::copy_nonoverlapping(b"yEnc".as_ptr(), out_buf.add(trimmed_prefix.len()), 4);
+        }
+        total_len as isize
+    }))
+    .unwrap_or(-1)
 }
 
 /// Computes `NzbService::groupsFromXref(xref)` as `\n`-separated unique group names in `out_buf`.
@@ -7820,70 +8133,78 @@ pub unsafe extern "C" fn nntmux_nzb_groups_from_xref(
     out_buf: *mut u8,
     out_cap: usize,
 ) -> isize {
-    if out_cap > isize::MAX as usize || (out_buf.is_null() && out_cap > 0) {
-        return -1;
-    }
-    let Some(bytes) = (unsafe { wave9_input(xref, xref_len) }) else {
-        return -1;
-    };
-    if bytes.is_empty() {
-        return 0;
-    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(xref, xref_len)
+            || !cleaning_ffi_region_valid(out_buf, out_cap)
+        {
+            return -1;
+        }
+        if out_cap > isize::MAX as usize || (out_buf.is_null() && out_cap > 0) {
+            return -1;
+        }
+        let Some(bytes) = (unsafe { wave9_input(xref, xref_len) }) else {
+            return -1;
+        };
+        if bytes.is_empty() {
+            return 0;
+        }
 
-    // Collect `\S+` tokens
-    let mut tokens: Vec<&[u8]> = Vec::new();
-    let mut colon_groups: Vec<&[u8]> = Vec::new();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        while i < bytes.len() && is_pcre_space(bytes[i]) {
-            i += 1;
-        }
-        if i >= bytes.len() {
-            break;
-        }
-        let start = i;
-        while i < bytes.len() && !is_pcre_space(bytes[i]) {
-            i += 1;
-        }
-        let tok = &bytes[start..i];
-        tokens.push(tok);
-        if tok.len() >= 3 {
-            if let Some(rel_colon) = tok[1..tok.len() - 1].iter().rposition(|&b| b == b':') {
-                let grp = &tok[..1 + rel_colon];
-                if !colon_groups.contains(&grp) {
-                    colon_groups.push(grp);
+        // Collect `\S+` tokens
+        let mut tokens: Vec<&[u8]> = Vec::new();
+        let mut colon_groups: Vec<&[u8]> = Vec::new();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            while i < bytes.len() && is_pcre_space(bytes[i]) {
+                i += 1;
+            }
+            if i >= bytes.len() {
+                break;
+            }
+            let start = i;
+            while i < bytes.len() && !is_pcre_space(bytes[i]) {
+                i += 1;
+            }
+            let tok = &bytes[start..i];
+            tokens.push(tok);
+            if tok.len() >= 3 {
+                if let Some(rel_colon) = tok[1..tok.len() - 1].iter().rposition(|&b| b == b':') {
+                    let grp = &tok[..1 + rel_colon];
+                    if !colon_groups.contains(&grp) {
+                        colon_groups.push(grp);
+                    }
                 }
             }
         }
-    }
 
     if tokens.is_empty() {
         return 0;
     }
 
-    let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
-    if !colon_groups.is_empty() {
-        for (idx, grp) in colon_groups.iter().enumerate() {
-            if idx > 0 {
-                out.push(b'\n');
+        let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+        if !colon_groups.is_empty() {
+            for (idx, grp) in colon_groups.iter().enumerate() {
+                if idx > 0 {
+                    out.push(b'\n');
+                }
+                out.extend(grp);
             }
-            out.extend(grp);
-        }
-    } else {
-        let mut unique_tokens: Vec<&[u8]> = Vec::with_capacity(tokens.len());
-        for tok in tokens {
-            if !unique_tokens.contains(&tok) {
-                unique_tokens.push(tok);
+        } else {
+            let mut unique_tokens: Vec<&[u8]> = Vec::with_capacity(tokens.len());
+            for tok in tokens {
+                if !unique_tokens.contains(&tok) {
+                    unique_tokens.push(tok);
+                }
+            }
+            for (idx, tok) in unique_tokens.iter().enumerate() {
+                if idx > 0 {
+                    out.push(b'\n');
+                }
+                out.extend(tok);
             }
         }
-        for (idx, tok) in unique_tokens.iter().enumerate() {
-            if idx > 0 {
-                out.push(b'\n');
-            }
-            out.extend(tok);
-        }
-    }
-    out.finish()
+        out.finish()
+    }))
+    .unwrap_or(-1)
 }
 
 /// Checks `NzbService::isTemporaryNzbPathName(path)` (`/\.nzb\.gz\.tmp\.\d+\.[0-9a-f]{12}$/` on `basename($path)`).
@@ -7896,37 +8217,43 @@ pub unsafe extern "C" fn nntmux_nzb_is_temporary_path_name(
     path: *const u8,
     path_len: usize,
 ) -> i32 {
-    let Some(bytes) = (unsafe { wave9_input(path, path_len) }) else {
-        return -1;
-    };
-    if bytes.contains(&b'\n') {
-        return -1;
-    }
-    let (start, end) = unix_basename_span(bytes);
-    let base = &bytes[start..end];
-    // Minimum length: `.nzb.gz.tmp.` (12) + `1` (1) + `.` (1) + 12 hex (12) = 26
-    if base.len() < 26 {
-        return 0;
-    }
-    let hex_part = &base[base.len() - 12..];
-    if !hex_part
-        .iter()
-        .all(|&b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
-    {
-        return 0;
-    }
-    if base[base.len() - 13] != b'.' {
-        return 0;
-    }
-    let digits_end = base.len() - 13;
-    let mut p = digits_end;
-    while p > 0 && base[p - 1].is_ascii_digit() {
-        p -= 1;
-    }
-    if p == digits_end || p < 12 {
-        return 0;
-    }
-    i32::from(&base[p - 12..p] == b".nzb.gz.tmp.")
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(path, path_len) {
+            return -1;
+        }
+        let Some(bytes) = (unsafe { wave9_input(path, path_len) }) else {
+            return -1;
+        };
+        if bytes.contains(&b'\n') {
+            return -1;
+        }
+        let (start, end) = unix_basename_span(bytes);
+        let base = &bytes[start..end];
+        // Minimum length: `.nzb.gz.tmp.` (12) + `1` (1) + `.` (1) + 12 hex (12) = 26
+        if base.len() < 26 {
+            return 0;
+        }
+        let hex_part = &base[base.len() - 12..];
+        if !hex_part
+            .iter()
+            .all(|&b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
+        {
+            return 0;
+        }
+        if base[base.len() - 13] != b'.' {
+            return 0;
+        }
+        let digits_end = base.len() - 13;
+        let mut p = digits_end;
+        while p > 0 && base[p - 1].is_ascii_digit() {
+            p -= 1;
+        }
+        if p == digits_end || p < 12 {
+            return 0;
+        }
+        i32::from(&base[p - 12..p] == b".nzb.gz.tmp.")
+    }))
+    .unwrap_or(-1)
 }
 
 #[cfg(test)]
@@ -7964,11 +8291,11 @@ mod wave10_worker6_tests {
                     b".env.example".as_ptr(),
                     12,
                     1,
-                    std::ptr::null(),
+                    b"".as_ptr(),
                     0,
-                    std::ptr::null(),
+                    b"".as_ptr(),
                     0,
-                    std::ptr::null(),
+                    b"".as_ptr(),
                     0,
                 ),
                 0
@@ -7978,11 +8305,11 @@ mod wave10_worker6_tests {
                     b"vendor/autoload.php".as_ptr(),
                     19,
                     1,
-                    std::ptr::null(),
+                    b"".as_ptr(),
                     0,
-                    std::ptr::null(),
+                    b"".as_ptr(),
                     0,
-                    std::ptr::null(),
+                    b"".as_ptr(),
                     0,
                 ),
                 1
@@ -7992,11 +8319,11 @@ mod wave10_worker6_tests {
                     b"app/vendor/test.php".as_ptr(),
                     19,
                     1,
-                    std::ptr::null(),
+                    b"".as_ptr(),
                     0,
-                    std::ptr::null(),
+                    b"".as_ptr(),
                     0,
-                    std::ptr::null(),
+                    b"".as_ptr(),
                     0,
                 ),
                 2
@@ -8009,11 +8336,11 @@ mod wave10_worker6_tests {
                 raw.as_ptr(),
                 raw.len(),
                 1,
-                std::ptr::null(),
+                b"".as_ptr(),
                 0,
-                std::ptr::null(),
+                b"".as_ptr(),
                 0,
-                std::ptr::null(),
+                b"".as_ptr(),
                 0,
                 &mut status,
                 buf.as_mut_ptr(),
@@ -8089,7 +8416,7 @@ mod wave10_worker6_tests {
                     ua.as_ptr(),
                     ua.len(),
                     1,
-                    std::ptr::null(),
+                    b"".as_ptr(),
                     0,
                     0
                 ),
@@ -8352,74 +8679,84 @@ pub unsafe extern "C" fn nntmux_remover_transform(
     out: *mut u8,
     out_cap: usize,
 ) -> isize {
-    if out_cap > isize::MAX as usize || out.is_null() && out_cap != 0 {
-        return -1;
-    }
-    let (Some(input), Some(second), Some(third)) = (unsafe {
-        (
-            wave9_input(input, input_len),
-            wave9_input(second, second_len),
-            wave9_input(third, third_len),
-        )
-    }) else {
-        return -1;
-    };
-    let mut output = Vec::new();
-    match mode {
-        0 => output = remover_clean_spaces(input),
-        1 => remover_format_like(input, second, &mut output),
-        2 => {
-            if input.contains(&0) {
-                return -1;
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, input_len)
+            || !cleaning_ffi_region_valid(second, second_len)
+            || !cleaning_ffi_region_valid(third, third_len)
+            || !cleaning_ffi_region_valid(out, out_cap)
+        {
+            return -1;
+        }
+        if out_cap > isize::MAX as usize || out.is_null() && out_cap != 0 {
+            return -1;
+        }
+        let (Some(input), Some(second), Some(third)) = (unsafe {
+            (
+                wave9_input(input, input_len),
+                wave9_input(second, second_len),
+                wave9_input(third, third_len),
+            )
+        }) else {
+            return -1;
+        };
+        let mut output = Vec::new();
+        match mode {
+            0 => output = remover_clean_spaces(input),
+            1 => remover_format_like(input, second, &mut output),
+            2 => {
+                if input.contains(&0) {
+                    return -1;
+                }
+                if input == b"ignore" {
+                    output.push(b'I');
+                } else {
+                    let mut args = input.split(|&b| b == b'=');
+                    let (Some(column), Some(modifier), Some(value), None) =
+                        (args.next(), args.next(), args.next(), args.next())
+                    else {
+                        return unsafe { wave9_write_output(b"F", out, out_cap) };
+                    };
+                    if !remover_criteria(
+                        &remover_clean_spaces(column),
+                        &remover_clean_spaces(modifier),
+                        &remover_clean_spaces(value),
+                        &mut output,
+                    ) {
+                        return -1;
+                    }
+                }
             }
-            if input == b"ignore" {
-                output.push(b'I');
-            } else {
-                let mut args = input.split(|&b| b == b'=');
-                let (Some(column), Some(modifier), Some(value), None) =
-                    (args.next(), args.next(), args.next(), args.next())
-                else {
-                    return unsafe { wave9_write_output(b"F", out, out_cap) };
-                };
-                if !remover_criteria(
-                    &remover_clean_spaces(column),
-                    &remover_clean_spaces(modifier),
-                    &remover_clean_spaces(value),
-                    &mut output,
-                ) {
+            3 => {
+                if !remover_criteria(input, second, third, &mut output) {
                     return -1;
                 }
             }
-        }
-        3 => {
-            if !remover_criteria(input, second, third, &mut output) {
-                return -1;
-            }
-        }
-        4 => remover_numeric(input, second, third, &mut output),
-        5 => remover_imdb(input, second, &mut output),
-        6 => remover_completion(input, second, &mut output),
-        7 => {
-            if !input.is_empty() && remover_is_numeric(input) {
-                let mut value = input;
-                while value.first().is_some_and(|b| is_pcre_space(*b)) {
-                    value = &value[1..];
+            4 => remover_numeric(input, second, third, &mut output),
+            5 => remover_imdb(input, second, &mut output),
+            6 => remover_completion(input, second, &mut output),
+            7 => {
+                if !input.is_empty() && remover_is_numeric(input) {
+                    let mut value = input;
+                    while value.first().is_some_and(|b| is_pcre_space(*b)) {
+                        value = &value[1..];
+                    }
+                    while value.last().is_some_and(|b| is_pcre_space(*b)) {
+                        value = &value[..value.len() - 1];
+                    }
+                    // Floating, exponential and overflowing numeric strings retain
+                    // PHP sprintf's integer conversion through the caller fallback.
+                    let Ok(value) = std::str::from_utf8(value).unwrap_or("").parse::<i64>() else {
+                        return -1;
+                    };
+                    output.extend_from_slice(b"AND id = ");
+                    output.extend_from_slice(value.to_string().as_bytes());
                 }
-                while value.last().is_some_and(|b| is_pcre_space(*b)) {
-                    value = &value[..value.len() - 1];
-                }
-                // Floating, exponential and overflowing numeric strings retain
-                // PHP sprintf's integer conversion through the caller fallback.
-                let Ok(value) = std::str::from_utf8(value).unwrap_or("").parse::<i64>() else {
-                    return -1;
-                };
-                output.extend_from_slice(b"AND id = ");
-                output.extend_from_slice(value.to_string().as_bytes());
             }
+            _ => return -1,
         }
-        _ => return -1,
-    }
-    unsafe { wave9_write_output(&output, out, out_cap) }
+        unsafe { wave9_write_output(&output, out, out_cap) }
+    }))
+    .unwrap_or(-1)
 }
 
 /// Returns whether cleanName may use this candidate: nonempty printable ASCII
@@ -8429,46 +8766,52 @@ pub unsafe extern "C" fn nntmux_remover_transform(
 /// Non-null input must cover input_len bytes; null is valid with length zero.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nntmux_subject_candidate(input: *const u8, input_len: usize) -> i32 {
-    let Some(input) = (unsafe { wave9_input(input, input_len) }) else {
-        return -1;
-    };
-    if input.is_empty() || input.iter().any(|b| !(0x20..=0x7e).contains(b)) {
-        return 0;
-    }
-    if input.first() == Some(&b'[') {
-        let mut p = 1;
-        while p < input.len() && is_pcre_space(input[p]) {
-            p += 1;
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, input_len) {
+            return -1;
         }
-        let start = p;
-        while p < input.len() && input[p].is_ascii_digit() {
-            p += 1;
+        let Some(input) = (unsafe { wave9_input(input, input_len) }) else {
+            return -1;
+        };
+        if input.is_empty() || input.iter().any(|b| !(0x20..=0x7e).contains(b)) {
+            return 0;
         }
-        if p > start {
+        if input.first() == Some(&b'[') {
+            let mut p = 1;
             while p < input.len() && is_pcre_space(input[p]) {
                 p += 1;
             }
-            if input.get(p) == Some(&b'/') {
+            let start = p;
+            while p < input.len() && input[p].is_ascii_digit() {
                 p += 1;
+            }
+            if p > start {
                 while p < input.len() && is_pcre_space(input[p]) {
                     p += 1;
                 }
-                let start = p;
-                while p < input.len() && input[p].is_ascii_digit() {
+                if input.get(p) == Some(&b'/') {
                     p += 1;
-                }
-                if p > start {
                     while p < input.len() && is_pcre_space(input[p]) {
                         p += 1;
                     }
-                    if input.get(p) == Some(&b']') {
-                        return 0;
+                    let start = p;
+                    while p < input.len() && input[p].is_ascii_digit() {
+                        p += 1;
+                    }
+                    if p > start {
+                        while p < input.len() && is_pcre_space(input[p]) {
+                            p += 1;
+                        }
+                        if input.get(p) == Some(&b']') {
+                            return 0;
+                        }
                     }
                 }
             }
         }
-    }
-    1
+        1
+    }))
+    .unwrap_or(-1)
 }
 
 fn guid_classification(input: &[u8]) -> u8 {
@@ -8485,10 +8828,16 @@ fn guid_classification(input: &[u8]) -> u8 {
 /// Non-null input must cover input_len bytes; null is valid with length zero.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nntmux_guid_classify(input: *const u8, input_len: usize) -> i32 {
-    let Some(input) = (unsafe { wave9_input(input, input_len) }) else {
-        return -1;
-    };
-    i32::from(guid_classification(input))
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, input_len) {
+            return -1;
+        }
+        let Some(input) = (unsafe { wave9_input(input, input_len) }) else {
+            return -1;
+        };
+        i32::from(guid_classification(input))
+    }))
+    .unwrap_or(-1)
 }
 
 /// Classifies count records encoded as u32 little-endian length followed by
@@ -8506,29 +8855,36 @@ pub unsafe extern "C" fn nntmux_guid_classify_batch(
     out: *mut u8,
     out_cap: usize,
 ) -> isize {
-    if out_cap > isize::MAX as usize || out.is_null() && out_cap != 0 || count > input_len / 4 {
-        return -1;
-    }
-    let Some(mut input) = (unsafe { wave9_input(input, input_len) }) else {
-        return -1;
-    };
-    let mut output = Vec::with_capacity(count);
-    for _ in 0..count {
-        let Some(header) = input.get(..4) else {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, input_len) || !cleaning_ffi_region_valid(out, out_cap)
+        {
+            return -1;
+        }
+        if out_cap > isize::MAX as usize || out.is_null() && out_cap != 0 || count > input_len / 4 {
+            return -1;
+        }
+        let Some(mut input) = (unsafe { wave9_input(input, input_len) }) else {
             return -1;
         };
-        let len = u32::from_le_bytes(header.try_into().unwrap()) as usize;
-        input = &input[4..];
-        let Some(value) = input.get(..len) else {
+        let mut output = Vec::with_capacity(count);
+        for _ in 0..count {
+            let Some(header) = input.get(..4) else {
+                return -1;
+            };
+            let len = u32::from_le_bytes(header.try_into().unwrap()) as usize;
+            input = &input[4..];
+            let Some(value) = input.get(..len) else {
+                return -1;
+            };
+            output.push(guid_classification(value));
+            input = &input[len..];
+        }
+        if !input.is_empty() {
             return -1;
-        };
-        output.push(guid_classification(value));
-        input = &input[len..];
-    }
-    if !input.is_empty() {
-        return -1;
-    }
-    unsafe { wave9_write_output(&output, out, out_cap) }
+        }
+        unsafe { wave9_write_output(&output, out, out_cap) }
+    }))
+    .unwrap_or(-1)
 }
 
 #[cfg(test)]
@@ -8774,9 +9130,9 @@ mod wave11_remover_tests {
                 nntmux_remover_transform(
                     b"abc".as_ptr(),
                     3,
-                    null,
+                    b"".as_ptr(),
                     0,
-                    null,
+                    b"".as_ptr(),
                     0,
                     0,
                     out.as_mut_ptr(),
@@ -8787,16 +9143,16 @@ mod wave11_remover_tests {
             assert_eq!(out, [b'!'; 8]);
             assert_eq!(
                 nntmux_remover_transform(null, 0, null, 0, null, 0, 2, std::ptr::null_mut(), 0),
-                -4
+                -1
             );
             assert_eq!(
                 nntmux_remover_transform(null, 0, null, 0, null, 0, 0, std::ptr::null_mut(), 0),
-                0
+                -1
             );
             assert_eq!(nntmux_subject_candidate(null, 1), -1);
-            assert_eq!(nntmux_subject_candidate(null, 0), 0);
+            assert_eq!(nntmux_subject_candidate(null, 0), -1);
             assert_eq!(nntmux_guid_classify(null, 1), -1);
-            assert_eq!(nntmux_guid_classify(null, 0), 1);
+            assert_eq!(nntmux_guid_classify(null, 0), -1);
         }
     }
 
@@ -8833,7 +9189,7 @@ mod wave11_remover_tests {
             }
             assert_eq!(
                 nntmux_guid_classify_batch(std::ptr::null(), 0, 0, std::ptr::null_mut(), 0),
-                0
+                -1
             );
             assert_eq!(
                 nntmux_guid_classify_batch(std::ptr::null(), 1, 0, out.as_mut_ptr(), 3),
@@ -8845,7 +9201,7 @@ mod wave11_remover_tests {
             );
             assert_eq!(
                 nntmux_guid_classify_batch(bytes.as_ptr(), bytes.len(), 3, std::ptr::null_mut(), 0),
-                -6
+                -1
             );
             let malformed = [0xff; 4];
             assert_eq!(
@@ -9223,16 +9579,22 @@ pub unsafe extern "C" fn nntmux_regex_release_cleaning(
     out: *mut u8,
     cap: usize,
 ) -> isize {
-    if cap > isize::MAX as usize || out.is_null() && cap != 0 {
-        return -1;
-    }
-    let Some(input) = (unsafe { wave9_input(input, len) }) else {
-        return -1;
-    };
-    let Some(output) = regex_release_transform(input, mode) else {
-        return -1;
-    };
-    unsafe { wave9_write_output(&output, out, cap) }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, len) || !cleaning_ffi_region_valid(out, cap) {
+            return -1;
+        }
+        if cap > isize::MAX as usize || out.is_null() && cap != 0 {
+            return -1;
+        }
+        let Some(input) = (unsafe { wave9_input(input, len) }) else {
+            return -1;
+        };
+        let Some(output) = regex_release_transform(input, mode) else {
+            return -1;
+        };
+        unsafe { wave9_write_output(&output, out, cap) }
+    }))
+    .unwrap_or(-1)
 }
 
 #[cfg(test)]
@@ -9295,11 +9657,11 @@ mod wave12_regex_release_tests {
             );
             assert_eq!(
                 nntmux_regex_release_cleaning(null, 0, 4, out.as_mut_ptr(), 2),
-                -10
+                -1
             );
             assert_eq!(
                 nntmux_regex_release_cleaning(null, 0, 8, std::ptr::null_mut(), 0),
-                0
+                -1
             );
             assert_eq!(
                 nntmux_regex_release_cleaning(b"abc".as_ptr(), 3, 6, out.as_mut_ptr(), 2),
@@ -9631,7 +9993,7 @@ mod wave13_maintenance_verification_tests {
             assert_eq!(out, [b'!'; 32]);
             assert_eq!(
                 nntmux_maintenance_verification(std::ptr::null(), 0, 0, std::ptr::null_mut(), 0),
-                0
+                -1
             );
             assert_eq!(
                 nntmux_maintenance_verification(b"abc".as_ptr(), 3, 0, out.as_mut_ptr(), 32),
@@ -9961,20 +10323,26 @@ pub unsafe extern "C" fn nntmux_maintenance_verification(
     out: *mut u8,
     cap: usize,
 ) -> isize {
-    if len > MAINTENANCE_VERIFICATION_MAX_INPUT
-        || cap > isize::MAX as usize
-        || out.is_null() && cap != 0
-    {
-        return -1;
-    }
-    let Some(input) = (unsafe { wave9_input(input, len) }) else {
-        return -1;
-    };
-    let output = match maintenance_verification_transform(input, mode) {
-        Ok(output) => output,
-        Err(code) => return code,
-    };
-    unsafe { wave9_write_output(&output, out, cap) }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, len) || !cleaning_ffi_region_valid(out, cap) {
+            return -1;
+        }
+        if len > MAINTENANCE_VERIFICATION_MAX_INPUT
+            || cap > isize::MAX as usize
+            || out.is_null() && cap != 0
+        {
+            return -1;
+        }
+        let Some(input) = (unsafe { wave9_input(input, len) }) else {
+            return -1;
+        };
+        let output = match maintenance_verification_transform(input, mode) {
+            Ok(output) => output,
+            Err(code) => return code,
+        };
+        unsafe { wave9_write_output(&output, out, cap) }
+    }))
+    .unwrap_or(-1)
 }
 
 // ============================================================================
@@ -10046,6 +10414,14 @@ pub unsafe extern "C" fn nntmux_fingerprint_breaker_key(
     out_cap: usize,
 ) -> isize {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(name, name_len)
+            || !cleaning_ffi_region_valid(port, port_len)
+            || !cleaning_ffi_region_valid(state, state_len)
+            || !cleaning_ffi_region_valid(generation, generation_len)
+            || !cleaning_ffi_region_valid(out, out_cap)
+        {
+            return -1;
+        }
         if out_cap > isize::MAX as usize || (out.is_null() && out_cap != 0) || tls > 2 {
             return -1;
         }
@@ -10144,6 +10520,9 @@ pub unsafe extern "C" fn nntmux_verification_diagnostics_stop(
     max_seconds: i64,
 ) -> i32 {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(reason, reason_len) {
+            return -1;
+        }
         let Some(reason_bytes) = (unsafe { wave9_input(reason, reason_len) }) else {
             return -1;
         };
@@ -10189,6 +10568,10 @@ pub unsafe extern "C" fn nntmux_verification_diagnostics_round_metrics(
     out_cap: usize,
 ) -> isize {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, input_len) || !cleaning_ffi_region_valid(out, out_cap)
+        {
+            return -1;
+        }
         if input_len != 80 || out_cap > isize::MAX as usize || (out.is_null() && out_cap != 0) {
             return -1;
         }
@@ -10233,6 +10616,9 @@ pub unsafe extern "C" fn nntmux_publication_forwarder_classify(
     mode: u32,
 ) -> i32 {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(label, label_len) {
+            return -1;
+        }
         let Some(bytes) = (unsafe { wave9_input(label, label_len) }) else {
             return -1;
         };
@@ -10287,6 +10673,9 @@ pub unsafe extern "C" fn nntmux_publication_forwarder_metrics(
     out_cap: usize,
 ) -> isize {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(out, out_cap) {
+            return -1;
+        }
         if out_cap > isize::MAX as usize || (out.is_null() && out_cap != 0) {
             return -1;
         }
@@ -10373,6 +10762,12 @@ pub unsafe extern "C" fn nntmux_size_unit_convert(
     out_cap: usize,
 ) -> isize {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(value_str, value_len)
+            || !cleaning_ffi_region_valid(unit_str, unit_len)
+            || !cleaning_ffi_region_valid(out, out_cap)
+        {
+            return -1;
+        }
         if out_cap > isize::MAX as usize || (out.is_null() && out_cap != 0) {
             return -1;
         }
@@ -10500,6 +10895,13 @@ pub unsafe extern "C" fn nntmux_sql_error_describe(
     out_cap: usize,
 ) -> isize {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(sqlstate, sqlstate_len)
+            || !cleaning_ffi_region_valid(message, message_len)
+            || !cleaning_ffi_region_valid(is_transient_out, 1)
+            || !cleaning_ffi_region_valid(out_buf, out_cap)
+        {
+            return -1;
+        }
         if out_cap > isize::MAX as usize
             || (out_buf.is_null() && out_cap != 0)
             || is_query_exception > 2
@@ -10653,6 +11055,11 @@ pub unsafe extern "C" fn nntmux_passkey_resolve_rp_host(
     out_cap: usize,
 ) -> isize {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, input_len)
+            || !cleaning_ffi_region_valid(out_buf, out_cap)
+        {
+            return -1;
+        }
         if out_cap > isize::MAX as usize || (out_buf.is_null() && out_cap != 0) {
             return -1;
         }
@@ -10867,33 +11274,20 @@ mod wave14_slice6_support_tests {
             );
             assert_eq!(&out[..host_len as usize], b"auth.example.com");
             assert_eq!(
-                nntmux_passkey_resolve_rp_host(
-                    b"127.0.0.1".as_ptr(),
-                    9,
-                    1,
-                    std::ptr::null_mut(),
-                    0
-                ),
+                nntmux_passkey_resolve_rp_host(b"127.0.0.1".as_ptr(), 9, 1, out.as_mut_ptr(), 0),
                 0
             );
             assert_eq!(
-                nntmux_passkey_resolve_rp_host(
-                    b"localhost".as_ptr(),
-                    9,
-                    1,
-                    std::ptr::null_mut(),
-                    0
-                ),
+                nntmux_passkey_resolve_rp_host(b"localhost".as_ptr(), 9, 1, out.as_mut_ptr(), 0),
                 1
             );
         }
     }
 }
 
-
 // Wave 16: pure arithmetic/reporting candidates. PHP owns NNTP, clocks and database effects.
 // Status: nonnegative = elements/bytes written; -1 = invalid argument, -2 = capacity,
-// -3 = unsupported/overflow, -4 = caught panic. Failures never partially write output.
+// -3 = unsupported/overflow, -1 = caught panic. Failures never partially write output.
 fn wave16_region<T>(ptr: *const T, len: usize) -> bool {
     let Some(bytes) = len.checked_mul(std::mem::size_of::<T>()) else {
         return false;
@@ -11136,7 +11530,13 @@ pub unsafe extern "C" fn nntmux_binaries_calculate(
     out: *mut i64,
     cap: usize,
 ) -> isize {
-    std::panic::catch_unwind(|| unsafe { wave16_math(0, mode, input, len, out, cap) }).unwrap_or(-4)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, len) || !cleaning_ffi_region_valid(out, cap) {
+            return -1;
+        }
+        unsafe { wave16_math(0, mode, input, len, out, cap) }
+    }))
+    .unwrap_or(-1)
 }
 /// # Safety
 /// Nonempty pointers must name aligned readable/writable regions of the declared lengths.
@@ -11148,7 +11548,13 @@ pub unsafe extern "C" fn nntmux_backfill_calculate(
     out: *mut i64,
     cap: usize,
 ) -> isize {
-    std::panic::catch_unwind(|| unsafe { wave16_math(1, mode, input, len, out, cap) }).unwrap_or(-4)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, len) || !cleaning_ffi_region_valid(out, cap) {
+            return -1;
+        }
+        unsafe { wave16_math(1, mode, input, len, out, cap) }
+    }))
+    .unwrap_or(-1)
 }
 /// # Safety
 /// Nonempty pointers must name aligned readable/writable regions of the declared lengths.
@@ -11160,7 +11566,13 @@ pub unsafe extern "C" fn nntmux_cleanup_calculate(
     out: *mut i64,
     cap: usize,
 ) -> isize {
-    std::panic::catch_unwind(|| unsafe { wave16_math(2, mode, input, len, out, cap) }).unwrap_or(-4)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, len) || !cleaning_ffi_region_valid(out, cap) {
+            return -1;
+        }
+        unsafe { wave16_math(2, mode, input, len, out, cap) }
+    }))
+    .unwrap_or(-1)
 }
 /// # Safety
 /// Nonempty pointers must name aligned readable/writable regions of the declared lengths.
@@ -11172,7 +11584,13 @@ pub unsafe extern "C" fn nntmux_release_counts(
     out: *mut i64,
     cap: usize,
 ) -> isize {
-    std::panic::catch_unwind(|| unsafe { wave16_math(3, mode, input, len, out, cap) }).unwrap_or(-4)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, len) || !cleaning_ffi_region_valid(out, cap) {
+            return -1;
+        }
+        unsafe { wave16_math(3, mode, input, len, out, cap) }
+    }))
+    .unwrap_or(-1)
 }
 /// # Safety
 /// Nonempty pointers must name aligned readable/writable regions of the declared lengths.
@@ -11184,7 +11602,13 @@ pub unsafe extern "C" fn nntmux_release_delete_stats(
     out: *mut i64,
     cap: usize,
 ) -> isize {
-    std::panic::catch_unwind(|| unsafe { wave16_math(4, mode, input, len, out, cap) }).unwrap_or(-4)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, len) || !cleaning_ffi_region_valid(out, cap) {
+            return -1;
+        }
+        unsafe { wave16_math(4, mode, input, len, out, cap) }
+    }))
+    .unwrap_or(-1)
 }
 
 fn wave16_grouped(value: i64) -> Result<String, isize> {
@@ -11230,7 +11654,10 @@ pub unsafe extern "C" fn nntmux_scan_diagnostic(
     out: *mut u8,
     cap: usize,
 ) -> isize {
-    std::panic::catch_unwind(|| {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(name, len) || !cleaning_ffi_region_valid(out, cap) {
+            return -1;
+        }
         if !wave16_region(name, len) || !wave16_region(out, cap) || len > 1_048_576 {
             return -1;
         }
@@ -11261,8 +11688,8 @@ pub unsafe extern "C" fn nntmux_scan_diagnostic(
             Ok(v) => unsafe { wave16_text_write(&v, out, cap) },
             Err(e) => e,
         }
-    })
-    .unwrap_or(-4)
+    }))
+    .unwrap_or(-1)
 }
 
 fn wave16_elapsed(seconds: f64) -> Result<String, isize> {
@@ -11290,7 +11717,10 @@ fn wave16_elapsed(seconds: f64) -> Result<String, isize> {
 /// Output must name a writable region of cap bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nntmux_release_elapsed(seconds: f64, out: *mut u8, cap: usize) -> isize {
-    std::panic::catch_unwind(|| {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(out, cap) {
+            return -1;
+        }
         if !wave16_region(out, cap) {
             return -1;
         }
@@ -11298,8 +11728,8 @@ pub unsafe extern "C" fn nntmux_release_elapsed(seconds: f64, out: *mut u8, cap:
             Ok(v) => unsafe { wave16_text_write(v.as_bytes(), out, cap) },
             Err(e) => e,
         }
-    })
-    .unwrap_or(-4)
+    }))
+    .unwrap_or(-1)
 }
 
 /// mode 0: four NUL-separated release summary lines; mode 1: nonzero deletion fields.
@@ -11313,7 +11743,10 @@ pub unsafe extern "C" fn nntmux_release_summary(
     out: *mut u8,
     cap: usize,
 ) -> isize {
-    std::panic::catch_unwind(|| {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, len) || !cleaning_ffi_region_valid(out, cap) {
+            return -1;
+        }
         let expected = match mode {
             0 => 4,
             1 => 9,
@@ -11369,8 +11802,8 @@ pub unsafe extern "C" fn nntmux_release_summary(
             Ok(v) => unsafe { wave16_text_write(v.as_bytes(), out, cap) },
             Err(e) => e,
         }
-    })
-    .unwrap_or(-4)
+    }))
+    .unwrap_or(-1)
 }
 
 #[cfg(test)]
@@ -11596,7 +12029,7 @@ mod wave17_query_pass_tests {
             let ptr = out.as_mut_ptr();
             assert_eq!(
                 nntmux_name_fixing_query_pass(2, std::ptr::null(), 0, 9, 0, ptr, 16),
-                -3
+                -1
             );
             assert_eq!(out, [0xa5; 16]);
             assert_eq!(
@@ -11613,7 +12046,7 @@ mod wave17_query_pass_tests {
                     std::ptr::null_mut(),
                     0
                 ),
-                0
+                -1
             );
             assert_eq!(
                 nntmux_name_fixing_query_pass(0, std::ptr::null(), 1, 0, 0, ptr, 16),
@@ -12302,11 +12735,11 @@ fn name_query_build(
 
 /// Name-fixing helpers with an atomic output contract. Returns bytes written,
 /// -1 for an invalid frame/region, -2 to decline to native PHP, -3 when capacity
-/// is insufficient, and -4 after a caught panic. No error writes output bytes.
+/// is insufficient, and -1 after a caught panic. No error writes output bytes.
 ///
 /// # Safety
 /// Nonempty input/output regions must be valid for reads/writes respectively.
-/// Null is accepted only for a zero-length region. Regions must fit in isize and
+/// Every pointer must be non-null and aligned, including empty regions. Regions must fit in isize and
 /// their addresses must not wrap. No output slice is formed before validation.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nntmux_name_fixing_query_pass(
@@ -12318,7 +12751,10 @@ pub unsafe extern "C" fn nntmux_name_fixing_query_pass(
     out: *mut u8,
     cap: usize,
 ) -> isize {
-    std::panic::catch_unwind(|| {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, len) || !cleaning_ffi_region_valid(out, cap) {
+            return -1;
+        }
         if !name_query_region(input, len) || !name_query_region(out, cap) {
             return -1;
         }
@@ -12338,13 +12774,13 @@ pub unsafe extern "C" fn nntmux_name_fixing_query_pass(
             }
             Err(code) => code,
         }
-    })
-    .unwrap_or(-4)
+    }))
+    .unwrap_or(-1)
 }
 
 // Wave 18 runner/release candidates. PHP retains database/NNTP effects and UTF-8 conversion.
 // Atomic status contract: >=0 written; -1 invalid frame/region; -2 capacity;
-// -3 unsupported arithmetic; -4 caught panic. No error changes the caller's output.
+// -3 unsupported arithmetic; -1 caught panic. No error changes the caller's output.
 struct RunnerReleaseOutput {
     bytes: Vec<u8>,
     cap: usize,
@@ -12652,8 +13088,8 @@ fn runner_release_build(mode: u32, input: &[u8], cap: usize) -> Result<Vec<u8>, 
 
 /// Pure runner/release planner with length-prefixed little-endian byte fields.
 /// # Safety
-/// Nonempty regions must be valid for reads/writes. Null is accepted only at
-/// length zero. Lengths, alignment, address arithmetic and capacity are checked
+/// Pointers must be non-null and aligned, including regions of length zero.
+/// Lengths, alignment, address arithmetic and capacity are checked
 /// before creating slices; callers remain responsible for allocation validity.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nntmux_runner_release_transform(
@@ -12663,7 +13099,10 @@ pub unsafe extern "C" fn nntmux_runner_release_transform(
     out: *mut u8,
     cap: usize,
 ) -> isize {
-    std::panic::catch_unwind(|| {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, len) || !cleaning_ffi_region_valid(out, cap) {
+            return -1;
+        }
         if !wave16_region(input, len) || !wave16_region(out, cap) {
             return -1;
         }
@@ -12683,8 +13122,8 @@ pub unsafe extern "C" fn nntmux_runner_release_transform(
             }
             Err(code) => code,
         }
-    })
-    .unwrap_or(-4)
+    }))
+    .unwrap_or(-1)
 }
 
 /// Integer DTO normalization. Input is copied before output, permitting overlap.
@@ -12699,7 +13138,10 @@ pub unsafe extern "C" fn nntmux_release_creation_values(
     out: *mut i64,
     cap: usize,
 ) -> isize {
-    std::panic::catch_unwind(|| {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, len) || !cleaning_ffi_region_valid(out, cap) {
+            return -1;
+        }
         if !wave16_region(input, len) || !wave16_region(out, cap) {
             return -1;
         }
@@ -12736,8 +13178,8 @@ pub unsafe extern "C" fn nntmux_release_creation_values(
             std::ptr::copy_nonoverlapping(result.as_ptr(), out, result.len());
         }
         result.len() as isize
-    })
-    .unwrap_or(-4)
+    }))
+    .unwrap_or(-1)
 }
 
 #[cfg(test)]
@@ -12840,6 +13282,687 @@ mod wave18_runner_release_tests {
                 ),
                 -1
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod strict_cleaning_abi_tests {
+    use super::*;
+
+    #[test]
+    fn cleaning_exports_reject_null_even_for_empty_regions() {
+        let mut out = [0xA5u8; 8];
+        unsafe {
+            assert_eq!(nntmux_is_plausible_release_title(std::ptr::null(), 0), -1);
+            assert_eq!(
+                nntmux_nzbsplit_strip_literal_trailer_len(std::ptr::null(), 0),
+                usize::MAX
+            );
+            assert_eq!(
+                nntmux_nzbsplit_literal_payload(b"".as_ptr(), 0, std::ptr::null_mut(), 0),
+                -1
+            );
+            assert_eq!(
+                nntmux_collections_extract_music_subject(
+                    std::ptr::null(),
+                    0,
+                    out.as_mut_ptr(),
+                    out.len()
+                ),
+                -1
+            );
+        }
+        assert_eq!(out, [0xA5; 8]);
+    }
+
+    #[test]
+    fn cleaning_exports_reject_unaligned_typed_regions_and_scalar_outputs() {
+        let input = [0i64; 8];
+        let mut output = [0x1234i64; 8];
+        let unaligned_input = unsafe { input.as_ptr().cast::<u8>().add(1).cast::<i64>() };
+        let unaligned_output = unsafe { output.as_mut_ptr().cast::<u8>().add(1).cast::<i64>() };
+        unsafe {
+            assert_eq!(
+                nntmux_release_counts(1, unaligned_input, 0, output.as_mut_ptr(), 8),
+                -1
+            );
+            assert_eq!(
+                nntmux_release_counts(1, input.as_ptr(), 0, unaligned_output, 0),
+                -1
+            );
+            assert_eq!(
+                nntmux_binaries_calculate(0, unaligned_input, 4, output.as_mut_ptr(), 8),
+                -1
+            );
+        }
+        assert_eq!(output, [0x1234; 8]);
+
+        let mut status_words = [0x1234i32; 2];
+        let unaligned_status =
+            unsafe { status_words.as_mut_ptr().cast::<u8>().add(1).cast::<i32>() };
+        let mut bytes = [0xA5u8; 16];
+        unsafe {
+            assert_eq!(
+                nntmux_http_validate_query(
+                    b"".as_ptr(),
+                    0,
+                    0,
+                    b"".as_ptr(),
+                    0,
+                    8192,
+                    b"".as_ptr(),
+                    0,
+                    0,
+                    unaligned_status,
+                    bytes.as_mut_ptr(),
+                    bytes.len(),
+                ),
+                -1
+            );
+        }
+        assert_eq!(status_words, [0x1234; 2]);
+        assert_eq!(bytes, [0xA5; 16]);
+    }
+
+    #[test]
+    fn cleaning_exports_reject_byte_extent_and_address_overflow_without_writes() {
+        let input = [0i64; 8];
+        let mut output = [0x1234i64; 8];
+        type MathExport = unsafe extern "C" fn(u32, *const i64, usize, *mut i64, usize) -> isize;
+        let math_exports: [MathExport; 6] = [
+            nntmux_binaries_calculate,
+            nntmux_backfill_calculate,
+            nntmux_cleanup_calculate,
+            nntmux_release_counts,
+            nntmux_release_delete_stats,
+            nntmux_release_creation_values,
+        ];
+        for export in math_exports {
+            for len in [
+                isize::MAX as usize / std::mem::size_of::<i64>() + 1,
+                usize::MAX,
+            ] {
+                unsafe {
+                    assert_eq!(
+                        export(0, input.as_ptr(), len, output.as_mut_ptr(), output.len()),
+                        -1
+                    );
+                    assert_eq!(
+                        export(0, input.as_ptr(), input.len(), output.as_mut_ptr(), len),
+                        -1
+                    );
+                }
+            }
+            unsafe {
+                assert_eq!(
+                    export(0, (usize::MAX - 7) as *const i64, 1, output.as_mut_ptr(), 8),
+                    -1
+                );
+            }
+        }
+        assert_eq!(output, [0x1234; 8]);
+
+        let mut bytes = [0xA5u8; 16];
+        unsafe {
+            assert_eq!(
+                nntmux_mcp_redact_string(
+                    b"".as_ptr(),
+                    isize::MAX as usize + 1,
+                    bytes.as_mut_ptr(),
+                    16
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_mcp_redact_string(usize::MAX as *const u8, 1, bytes.as_mut_ptr(), 16),
+                -1
+            );
+            assert_eq!(
+                nntmux_mcp_redact_string(b"".as_ptr(), 0, usize::MAX as *mut u8, 1),
+                -1
+            );
+            assert_eq!(
+                nntmux_nzbsplit_strip_literal_trailer_len(b"".as_ptr(), usize::MAX),
+                usize::MAX
+            );
+        }
+        assert_eq!(bytes, [0xA5; 16]);
+    }
+}
+
+
+// Wave 19.1: pattern catalogs and NameFixResult pure helpers.
+const NAME_FIX_APP_PATTERNS: &[(&[u8], &[u8])] = &[
+    (b"WITH_KEYGEN", br#"/\w[\-\w.',;& ]+(\d{1,10}|v\d+[\.\d]*|Linux|UNIX|MacOS)[._ -](RPM|DEB)?[._ -]?(X64|X86|ARM64)?[._ -]?(Incl|With)?[._ -]?(Keygen|Patch|Crack|Serial|License)[\-\w.',;& ]+\w/i"#),
+    (b"WINDOWS", br#"/\w[\-\w.',;& ]+\d{1,8}[._ -](winall|win32|win64|x64|x86)[._ -]?(freeware|portable|repack)?[\-\w.',;& ]+\w/i"#),
+    (b"MACOS", br#"/\w[\-\w.',;& ]+(MacOS|Mac[._ -]?OS[._ -]?X|OSX)[._ -][\-\w.',;& ]+\w/i"#),
+    (b"LINUX", br#"/\w[\-\w.',;& ]+(Linux|Ubuntu|Debian|CentOS|RHEL|Fedora)[._ -](x64|x86|arm64)?[\-\w.',;& ]+\w/i"#),
+    (b"ADOBE", br#"/\w[\-\w.',;& ]*(Adobe|Photoshop|Illustrator|Premiere|After[._ -]?Effects|InDesign|Lightroom)[._ -][\-\w.',;& ]+\w/i"#),
+    (b"MICROSOFT", br#"/\w[\-\w.',;& ]*(Microsoft|Office|Windows|Visual[._ -]?Studio)[._ -]\d{2,4}[._ -][\-\w.',;& ]+\w/i"#),
+    (b"WITH_VERSION", br#"/\w[\-\w.',;& ]+[._ -]v?\d+[\.\d]+[._ -](Multilingual|MULTi|Portable|Repack|Cracked)[\-\w.',;& ]+\w/i"#),
+];
+
+const NAME_FIX_GAME_PATTERNS: &[(&[u8], &[u8])] = &[
+    (b"MODERN_CONSOLE", br#"/\w[\-\w.',;& ]+(NSW|PS[345P]|PSV|XBSX|XSX|XBOX[._ -]?SERIES[._ -]?[XS]|XBOX[._ -]?ONE|XBOX360?|WiiU?|Switch)[._ -](INTERNAL|PROPER|READNFO|READ[._ -]?NFO|MULTI\d{1,2})?[._ -]?[\-\w.',;& ]+\-[A-Za-z0-9]+$/i"#),
+    (b"REGION_CONSOLE", br#"/\w[\-\w.',;& ]+(ASIA|DLC|EUR|GOTY|JPN|KOR|MULTI\d{1}|NTSCU?|PAL|RF|Region[._ -]?Free|USA|XBLA)[._ -](DLC[._ -]Complete|FRENCH|GERMAN|MULTI\d{1}|PROPER|PSN|READ[._ -]?NFO|UMD)?[._ -]?(GC|NDS|NGC|PS[345P]|PSP|PSV|Switch|NSW|Wii(U)?|XBOX(360|ONE|SERIES)?|XBSX)[\-\w.',;& ]+\w/i"#),
+    (b"CONSOLE_SCENE_GROUP", br#"/\w[\-\w.',;& ]+(GC|NDS|NGC|PS[345P]|Switch|NSW|Wii(U)?|XBOX(360|ONE|SERIES)?|XBSX)[._ -](CODEX|DUPLEX|PLAZA|SKIDROW|RELOADED|CPY|EMPRESS|RAZOR1911|HOODLUM|DARKSiDERS|FLT|TiNYiSO|ANOMALY|iNSOMNi|OneUp|STRANGE|SWAG|SKY|SUXXORS)[\-\w.',;& ]+\w/i"#),
+    (b"PC_SCENE_GROUP", br#"/\w[\-\w.',;& ]+(PC|WIN(32|64)?|MAC(OSX?)?|LINUX)[._ -]?(CODEX|SKIDROW|RELOADED|CPY|EMPRESS|RAZOR1911|HOODLUM|DARKSiDERS|FLT|GOG|PROPHET|TiNYiSO|PLAZA|P2P|SiMPLEX|rG)[\-\w.',;& ]+\w/i"#),
+    (b"DLC_UPDATE", br#"/\w[\-\w.',;& ]+(DLC|Update|Patch|Hotfix)[._ -](v?\d+[\.\d]*)?[._ -]?(CODEX|SKIDROW|RELOADED|PLAZA|EMPRESS|FLT|GOG|P2P|TiNYiSO)[\-\w.',;& ]+\w/i"#),
+    (b"OUTLAWS", br#"/\w[\w.',;-].+-OUTLAWS/i"#),
+    (b"ALIAS", br#"/\w[\w.',;-].+\-ALiAS/i"#),
+    (b"GOG", br#"/\w[\-\w.',;& ]+[._ -]GOG[._ -]?(Classic|Galaxy)?[\-\w.',;& ]+\w/i"#),
+    (b"REPACK", br#"/\w[\-\w.',;& ]+[._ -](REPACK|RIP)[._ -](FitGirl|DODI|xatab|R\.G\.|Mechanics)[\-\w.',;& ]+\w/i"#),
+];
+
+const NAME_FIX_MOVIE_PATTERNS: &[(&[u8], &[u8])] = &[
+    (b"UHD_HDR", br#"/\w[\-\w.',;& ]+((19|20)\d\d)[._ -](2160p|4K|UHD)[._ -](HDR10\+?|DV|Dolby[._ -]?Vision|HLG)?[._ -]?(REMUX|BluRay|WEB-?DL|WEB-?RIP|UHD[._ -]?BluRay)[._ -](HEVC|x265|H\.?265|AV1)[._ -]?(Atmos|DTS[._ -]?(HD)?|TrueHD)?[\-\w.',;& ]+\w/i"#),
+    (b"UHD_REMUX", br#"/\w[\-\w.',;& ]+((19|20)\d\d)[._ -](2160p|4K)[._ -](REMUX|Complete[._ -]?UHD)[._ -](HEVC|x265|H\.?265)[\-\w.',;& ]+\w/i"#),
+    (b"STREAMING_4K", br#"/\w[\-\w.',;& ]+((19|20)\d\d)[._ -](2160p|4K)[._ -](AMZN|ATVP|DSNP|HMAX|HULU|iT|NF|PMTP|PCOK|ROKU|STAN|VUDU)[._ -](WEB-?DL|WEB-?RIP)[._ -](HDR10\+?|DV)?[._ -]?(HEVC|x265|H\.?265)[\-\w.',;& ]+\w/i"#),
+    (b"STREAMING_HD", br#"/\w[\-\w.',;& ]+((19|20)\d\d)[._ -](1080p|720p)[._ -](AMZN|ATVP|DSNP|HMAX|HULU|iT|NF|PMTP|PCOK|ROKU|STAN|VUDU)[._ -](WEB-?DL|WEB-?RIP)[._ -](x264|x265|H\.?264|H\.?265|HEVC)[\-\w.',;& ]+\w/i"#),
+    (b"YEAR_RES_VCODEC", br#"/\w[\-\w.',;& ]+((19|20)\d\d)[\-\w.',;& ]+(480|720|1080|2160)[ip]?[._ -](DivX|[HX][._ -]?264|[HX][._ -]?265|HEVC|MPEG2|XviD(HD)?|WMV|AV1)[\-\w.',;& ]+\w/i"#),
+    (b"YEAR_SOURCE_VCODEC_RES", br#"/\w[\-\w.',;& ]+((19|20)\d\d)[._ -](BD(-?(25|50|RIP))?|Blu-?Ray ?(3D)?|BRRIP|CAM(RIP)?|DBrip|DTV|DVD\-?(5|9|(R(IP)?|scr(eener)?))?|[HPS]D?(RIP|TV(RIP)?)?|NTSC|PAL|R5|Ripped |S?VCD|scr(eener)?|SAT(RIP)?|TS|VHS(RIP)?|VOD|WEB-?DL|WEB-?RIP|REMUX)[._ -](DivX|[HX][._ -]?264|[HX][._ -]?265|HEVC|MPEG2|XviD(HD)?|WMV|AV1)[._ -](480|720|1080|2160)[ip]?[\-\w.',;& ]+\w/i"#),
+    (b"YEAR_SOURCE_VCODEC_ACODEC", br#"/\w[\-\w.',;& ]+((19|20)\d\d)[._ -](BD(-?(25|50|RIP))?|Blu-?Ray ?(3D)?|BRRIP|CAM(RIP)?|DBrip|DTV|DVD\-?(5|9|(R(IP)?|scr(eener)?))?|[HPS]D?(RIP|TV(RIP)?)?|NTSC|PAL|R5|Ripped |S?VCD|scr(eener)?|SAT(RIP)?|TS|VHS(RIP)?|VOD|WEB-?DL|WEB-?RIP|REMUX)[._ -](DivX|[HX][._ -]?264|[HX][._ -]?265|HEVC|MPEG2|XviD(HD)?|WMV|AV1)[._ -](AAC( LC)?|AC-?3|DD5([._ -]1)?|(A_)?DTS-?(HD)?(-?MA)?|Dolby( ?TrueHD)?|MP3|TrueHD|Atmos|EAC3|FLAC)[\-\w.',;& ]+\w/i"#),
+    (b"RES_SOURCE_ACODEC_VCODEC", br#"/\w[\-\w.',;& ]+(480|720|1080|2160)[ip]?[._ -](BD(-?(25|50|RIP))?|Blu-?Ray ?(3D)?|BRRIP|CAM(RIP)?|DBrip|DTV|DVD\-?(5|9|(R(IP)?|scr(eener)?))?|[HPS]D?(RIP|TV(RIP)?)?|NTSC|PAL|R5|Ripped |S?VCD|scr(eener)?|SAT(RIP)?|TS|VHS(RIP)?|VOD|WEB-?DL|WEB-?RIP|REMUX)[._ -](AAC( LC)?|AC-?3|DD5([._ -]1)?|(A_)?DTS-?(HD)?(-?MA)?|Dolby( ?TrueHD)?|MP3|TrueHD|Atmos|EAC3|FLAC)[._ -](DivX|[HX][._ -]?264|[HX][._ -]?265|HEVC|MPEG2|XviD(HD)?|WMV|AV1)[\-\w.',;& ]+\w/i"#),
+    (b"RES_ACODEC_SOURCE_YEAR", br#"/\w[\-\w.',;& ]+(480|720|1080|2160)[ip]?[._ -](AAC( LC)?|AC-?3|DD5([._ -]1)?|(A_)?DTS-?(HD)?(-?MA)?|Dolby( ?TrueHD)?|MP3|TrueHD|Atmos|EAC3|FLAC)[\-\w.',;& ]+(BD(-?(25|50|RIP))?|Blu-?Ray ?(3D)?|BRRIP|CAM(RIP)?|DBrip|DTV|DVD\-?(5|9|(R(IP)?|scr(eener)?))?|[HPS]D?(RIP|TV(RIP)?)?|NTSC|PAL|R5|Ripped |S?VCD|scr(eener)?|SAT(RIP)?|TS|VHS(RIP)?|VOD|WEB-?DL|WEB-?RIP|REMUX)[._ -]((19|20)\d\d)[\-\w.',;& ]+\w/i"#),
+    (b"MULTI_LANGUAGE", br#"/\w[\-\w.',;& ]+(Brazilian|Chinese|Croatian|Danish|Deutsch|Dutch|Estonian|English|Finnish|Flemish|Francais|French|German|Greek|Hebrew|Icelandic|Italian|Japenese|Japan|Japanese|Korean|Latin|Nordic|Norwegian|Polish|Portuguese|Russian|Serbian|Slovenian|Swedish|Spanisch|Spanish|Thai|Turkish|MULTi)[._ -]((19|20)\d\d)[._ -](AAC( LC)?|AC-?3|DD5([._ -]1)?|(A_)?DTS-?(HD)?(-?MA)?|Dolby( ?TrueHD)?|MP3|TrueHD|Atmos|EAC3|FLAC)[._ -](BD(-?(25|50|RIP))?|Blu-?Ray ?(3D)?|BRRIP|CAM(RIP)?|DBrip|DTV|DVD\-?(5|9|(R(IP)?|scr(eener)?))?|[HPS]D?(RIP|TV(RIP)?)?|NTSC|PAL|R5|Ripped |S?VCD|scr(eener)?|SAT(RIP)?|TS|VHS(RIP)?|VOD|WEB-?DL|WEB-?RIP|REMUX)[\-\w.',;& ]+\w/i"#),
+    (b"GENERIC", br#"/\w[\-\w.',;& ]+((19|20)\d\d)[\-\w.',;& ]+(480|720|1080|2160)[ip]?[\-\w.',;& ]+(BluRay|BDRip|DVDRip|HDTV|WEB-?DL|WEB-?RIP)[\-\w.',;& ]+\w/i"#),
+];
+
+const NAME_FIX_TV_PATTERNS: &[(&[u8], &[u8])] = &[
+    (b"STREAMING_4K_HDR", br#"/\w[\-\w.',;& ]+((s\d{1,2}[._ -]?e\d{1,3}(-?e\d{1,3})?)|(?<!\d)[S|]\d{1,2}[E|x]\d{1,}(?!\d)|ep[._ -]?\d{2,3})[._ -](2160p|4K|UHD)[._ -](AMZN|ATVP|DSNP|HMAX|HULU|iT|NF|PMTP|PCOK|ROKU|STAN|VUDU)[._ -](WEB-?DL|WEB-?RIP)[._ -](HDR10?\+?|DV|Dolby[._ -]?Vision)?[._ -]?(HEVC|x265|H\.?265)[\-\w.',;& ]+\w/i"#),
+    (b"STREAMING_HD", br#"/\w[\-\w.',;& ]+((s\d{1,2}[._ -]?e\d{1,3}(-?e\d{1,3})?)|(?<!\d)[S|]\d{1,2}[E|x]\d{1,}(?!\d)|ep[._ -]?\d{2,3})[._ -](1080p|720p)[._ -](AMZN|ATVP|DSNP|HMAX|HULU|iT|NF|PMTP|PCOK|ROKU|STAN|VUDU)[._ -](WEB-?DL|WEB-?RIP)[\-\w.',;& ]+\w/i"#),
+    (b"TV_RES_SOURCE_VCODEC", br#"/\w[\-\w.',;& ]+((s\d{1,2}[._ -]?[bde]\d{1,2}(-?e\d{1,3})?)|(?<!\d)\d{1,2}x\d{2}(?!\d)|ep[._ -]?\d{2,3})[\-\w.',;& ]+(480|720|1080|2160)[ip]?[._ -](BD(-?(25|50|RIP))?|Blu-?Ray ?(3D)?|BRRIP|CAM(RIP)?|DBrip|DTV|DVD\-?(5|9|(R(IP)?|scr(eener)?))?|[HPS]D?(RIP|TV(RIP)?)?|NTSC|PAL|R5|Ripped |S?VCD|scr(eener)?|SAT(RIP)?|TS|VHS(RIP)?|VOD|WEB-?DL|WEB-?RIP|REMUX)[._ -](DivX|[HX][._ -]?264|[HX][._ -]?265|HEVC|MPEG2|XviD(HD)?|WMV|AV1)[\-\w.',;& ]+\w/i"#),
+    (b"TV_AUDIO_SOURCE_RES_VCODEC", br#"/\w[\-\w.',;& ]+((s\d{1,2}[._ -]?[bde]\d{1,2}(-?e\d{1,3})?)|(?<!\d)\d{1,2}x\d{2}(?!\d)|ep[._ -]?\d{2})[._ -](AAC( LC)?|AC-?3|DD5([._ -]1)?|(A_)?DTS-?(HD)?(-?MA)?|Dolby( ?TrueHD)?|MP3|TrueHD|Atmos|EAC3)[._ -](BD(-?(25|50|RIP))?|Blu-?Ray ?(3D)?|BRRIP|CAM(RIP)?|DBrip|DTV|DVD\-?(5|9|(R(IP)?|scr(eener)?))?|[HPS]D?(RIP|TV(RIP)?)?|NTSC|PAL|R5|Ripped |S?VCD|scr(eener)?|SAT(RIP)?|TS|VHS(RIP)?|VOD|WEB-?DL|WEB-?RIP|REMUX)[._ -](480|720|1080|2160)[ip]?[._ -](DivX|[HX][._ -]?264|[HX][._ -]?265|HEVC|MPEG2|XviD(HD)?|WMV|AV1)[\-\w.',;& ]+\w/i"#),
+    (b"TV_SOURCE_VCODEC", br#"/\w[\-\w.',;& ]+((s\d{1,2}[._ -]?[bde]\d{1,2}(-?e\d{1,3})?)|(?<!\d)\d{1,2}x\d{2}(?!\d)|ep[._ -]?\d{2})[._ -](BD(-?(25|50|RIP))?|Blu-?Ray ?(3D)?|BRRIP|CAM(RIP)?|DBrip|DTV|DVD\-?(5|9|(R(IP)?|scr(eener)?))?|[HPS]D?(RIP|TV(RIP)?)?|NTSC|PAL|R5|Ripped |S?VCD|scr(eener)?|SAT(RIP)?|TS|VHS(RIP)?|VOD|WEB-?DL|WEB-?RIP|REMUX)[._ -](DivX|[HX][._ -]?264|[HX][._ -]?265|HEVC|MPEG2|XviD(HD)?|WMV|AV1)[\-\w.',;& ]+\w/i"#),
+    (b"TV_SOURCE_GROUP", br#"/\w[\-\w.',;& ]+((s\d{1,2}[._ -]?[bde]\d{1,2}(-?e\d{1,3})?)|(?<!\d)[S|]\d{1,2}[E|x]\d{1,}(?!\d)|ep[._ -]?\d{2})[\-\w.',;.()]+(BD(-?(25|50|RIP))?|Blu-?Ray ?(3D)?|BRRIP|CAM(RIP)?|DBrip|DTV|DVD\-?(5|9|(R(IP)?|scr(eener)?))?|[HPS]D?(RIP|TV(RIP)?)?|NTSC|PAL|R5|Ripped |S?VCD|scr(eener)?|SAT(RIP)?|TS|VHS(RIP)?|VOD|WEB-?DL|WEB-?RIP|REMUX)[._ -][\-\w.',;& ]+\w/i"#),
+    (b"TV_YEAR_SEASON", br#"/\w[\-\w.',;& ]+((19|20)\d\d)[._ -]((s\d{1,2}[._ -]?[bde]\d{1,2}(-?e\d{1,3})?)|(?<!\d)\d{1,2}x\d{2}(?!\d)|ep[._ -]?\d{2})[._ -](BD(-?(25|50|RIP))?|Blu-?Ray ?(3D)?|BRRIP|CAM(RIP)?|DBrip|DTV|DVD\-?(5|9|(R(IP)?|scr(eener)?))?|[HPS]D?(RIP|TV(RIP)?)?|NTSC|PAL|R5|Ripped |S?VCD|scr(eener)?|SAT(RIP)?|TS|VHS(RIP)?|VOD|WEB-?DL|WEB-?RIP|REMUX)[\-\w.',;& ]+\w/i"#),
+    (b"TV_WITH_YEAR", br#"/\w[\-\w.',;& ]+((s\d{1,2}[._ -]?[bde]\d{1,2}(-?e\d{1,3})?)|(?<!\d)\d{1,2}x\d{2}(?!\d)|ep[._ -]?\d{2})[\-\w.',;& ]+((19|20)\d\d)[\-\w.',;& ]+\w/i"#),
+    (b"DAILY_SHOW", br#"/\w[\-\w.',;& ]+(19|20)\d\d[._ -]\d{2}[._ -]\d{2}[._ -](720p|1080p|2160p|HDTV|WEB-?DL|WEB-?RIP)[\-\w.',;& ]+\w/i"#),
+    (b"SPORTS", br#"/\w(19|20)\d\d[._ -]\d{2}[._ -]\d{2}[._ -](IndyCar|F1|Formula[._ -]?1|MotoGP|NBA|NCW([TY])S|NNS|NSCS?|NFL|NHL|MLB|UFC|WWE|Boxing)([._ -](19|20)\d\d)?[\-\w.',;& ]+\w/i"#),
+    (b"COMPLETE_SEASON", br#"/\w[\-\w.',;& ]+[._ -]S\d{1,2}[._ -](COMPLETE|FULL)[._ -](720p|1080p|2160p|HDTV|WEB-?DL|WEB-?RIP|BluRay)[\-\w.',;& ]+\w/i"#),
+    (b"ANIME", br#"/\w[\-\w.',;& ]+[._ -](\d{2,4})[._ -](480p|720p|1080p|2160p)[._ -](HEVC|x265|x264|H\.?264)[._ -](10bit)?[\-\w.',;& ]+\w/i"#),
+];
+
+fn name_fix_patterns(kind: u32) -> Option<&'static [(&'static [u8], &'static [u8])]> {
+    match kind {
+        0 => Some(NAME_FIX_APP_PATTERNS),
+        1 => Some(NAME_FIX_GAME_PATTERNS),
+        2 => Some(NAME_FIX_MOVIE_PATTERNS),
+        3 => Some(NAME_FIX_TV_PATTERNS),
+        _ => None,
+    }
+}
+
+fn name_fix_copy(value: &[u8], out: *mut u8, cap: usize) -> isize {
+    if value.len() > cap {
+        return -2;
+    }
+    // All callers have validated the output allocation and byte extent. The
+    // value is separately allocated or static, so it cannot overlap `out`.
+    if !value.is_empty() {
+        unsafe { std::ptr::copy_nonoverlapping(value.as_ptr(), out, value.len()) };
+    }
+    value.len() as isize
+}
+
+/// Catalog modes: 0 = alternating key/regex fields; 1 = priority key fields;
+/// 2 = count (return value); 3 = exact case-sensitive regex lookup;
+/// 4 = zero-based priority key lookup. Fields are u32 LE length + raw bytes.
+/// Returns bytes/count, -1 for malformed arguments/panic, -2 for capacity,
+/// or -3 for unknown key/index. Errors do not modify the caller's output.
+///
+/// # Safety
+/// Every pointer must be non-null/aligned and valid for its stated byte extent,
+/// even for zero lengths. Allocation validity remains the caller's obligation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_name_fixing_patterns(
+    kind: u32,
+    mode: u32,
+    key: *const u8,
+    key_len: usize,
+    index: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(key, key_len) || !cleaning_ffi_region_valid(out, cap) {
+            return -1;
+        }
+        let Some(patterns) = name_fix_patterns(kind) else {
+            return -1;
+        };
+        let key = unsafe { slice::from_raw_parts(key, key_len) };
+        match mode {
+            0 | 1 => {
+                let mut output = RunnerReleaseOutput {
+                    bytes: Vec::new(),
+                    cap,
+                };
+                for &(name, pattern) in patterns {
+                    if let Err(code) = output.field(name) {
+                        return code;
+                    }
+                    if mode == 0 {
+                        if let Err(code) = output.field(pattern) {
+                            return code;
+                        }
+                    }
+                }
+                name_fix_copy(&output.bytes, out, cap)
+            }
+            2 => patterns.len() as isize,
+            3 => patterns
+                .iter()
+                .find(|&&(name, _)| name == key)
+                .map_or(-3, |&(_, pattern)| name_fix_copy(pattern, out, cap)),
+            4 => patterns
+                .get(index)
+                .map_or(-3, |&(name, _)| name_fix_copy(name, out, cap)),
+            _ => -1,
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+fn name_fix_result_build(
+    mode: u32,
+    input: &[u8],
+    predb_id: i64,
+    matched: u32,
+    cap: usize,
+) -> Result<Vec<u8>, isize> {
+    let fields = name_query_fields(input)?;
+    let mut output = RunnerReleaseOutput {
+        bytes: Vec::new(),
+        cap,
+    };
+    match mode {
+        0 | 2 => {
+            if fields.len() != 3 {
+                return Err(-1);
+            }
+            let has_match = mode == 0 || matched == 1;
+            output.field(if has_match { fields[0] } else { b"" })?;
+            output.field(if has_match { fields[1] } else { b"" })?;
+            output.field(fields[2])?;
+            output.number(if has_match { predb_id } else { 0 })?;
+        }
+        1 => {
+            if fields.len() != 1 {
+                return Err(-1);
+            }
+            for value in [b"".as_slice(), b"", fields[0], b"0"] {
+                output.field(value)?;
+            }
+        }
+        4 => {
+            if fields.len() % 2 != 0 {
+                return Err(-1);
+            }
+            // Preserve raw string keys/values; PHP owns non-string values and
+            // Spatie transformation contexts. Re-emit validated framed pairs.
+            for field in fields {
+                output.field(field)?;
+            }
+        }
+        5 => {
+            if fields.len() != 3 {
+                return Err(-1);
+            }
+            let values = if fields[0].is_empty() {
+                vec![fields[2], b": no match".as_slice()]
+            } else {
+                vec![fields[2], b": ", fields[1], b" => ", fields[0]]
+            };
+            let size = values
+                .iter()
+                .try_fold(0usize, |size, value| size.checked_add(value.len()))
+                .ok_or(-1isize)?;
+            if size > cap {
+                return Err(-2);
+            }
+            output.bytes.try_reserve(size).map_err(|_| -3isize)?;
+            for value in values {
+                output.bytes.extend_from_slice(value);
+            }
+        }
+        _ => return Err(-1),
+    }
+    Ok(output.bytes)
+}
+
+/// NameFixResult modes: 0 = matched; 1 = unmatched; 2 = nullable check result;
+/// 3 = nonempty raw name predicate (return 0/1); 4 = string-pair array projection;
+/// 5 = summary. Factory inputs/outputs are framed as documented above. Floating
+/// confidence, metadata, object identity and Spatie contexts remain owned by PHP.
+/// Errors (-1 malformed/panic, -2 capacity, -3 allocation) never modify output.
+///
+/// # Safety
+/// Every pointer must be non-null/aligned and valid for its stated byte extent,
+/// including zero lengths. Input and output may overlap: output is built first.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_name_fix_result(
+    mode: u32,
+    input: *const u8,
+    len: usize,
+    predb_id: i64,
+    matched: u32,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, len)
+            || !cleaning_ffi_region_valid(out, cap)
+            || matched > 1
+        {
+            return -1;
+        }
+        let input = unsafe { slice::from_raw_parts(input, len) };
+        if mode == 3 {
+            return isize::from(!input.is_empty());
+        }
+        match name_fix_result_build(mode, input, predb_id, matched, cap) {
+            Ok(bytes) => name_fix_copy(&bytes, out, cap),
+            Err(code) => code,
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod cleaning_wave19_name_fix_tests {
+    use super::*;
+
+    fn frames(fields: &[&[u8]]) -> Vec<u8> {
+        let mut output = RunnerReleaseOutput {
+            bytes: Vec::new(),
+            cap: 65536,
+        };
+        for field in fields {
+            output.field(field).unwrap();
+        }
+        output.bytes
+    }
+
+    #[test]
+    fn catalog_preserves_priority_count_bytes_and_lookup_boundaries() {
+        for (kind, count, first, last) in [
+            (0, 7, b"WITH_KEYGEN".as_slice(), b"WITH_VERSION".as_slice()),
+            (1, 9, b"MODERN_CONSOLE", b"REPACK"),
+            (2, 11, b"UHD_HDR", b"GENERIC"),
+            (3, 12, b"STREAMING_4K_HDR", b"ANIME"),
+        ] {
+            let patterns = name_fix_patterns(kind).unwrap();
+            assert_eq!(patterns.len(), count);
+            assert_eq!(patterns[0].0, first);
+            assert_eq!(patterns[count - 1].0, last);
+            let mut out = [0u8; 32768];
+            unsafe {
+                let size = nntmux_name_fixing_patterns(
+                    kind,
+                    0,
+                    b"".as_ptr(),
+                    0,
+                    0,
+                    out.as_mut_ptr(),
+                    out.len(),
+                );
+                assert!(size > 0);
+                let catalog = out[..size as usize].to_vec();
+                let fields = name_query_fields(&catalog).unwrap();
+                for (index, &(name, pattern)) in patterns.iter().enumerate() {
+                    assert_eq!(fields[index * 2], name);
+                    assert_eq!(fields[index * 2 + 1], pattern);
+                    let size = nntmux_name_fixing_patterns(
+                        kind,
+                        3,
+                        name.as_ptr(),
+                        name.len(),
+                        0,
+                        out.as_mut_ptr(),
+                        out.len(),
+                    );
+                    assert_eq!(&out[..size as usize], pattern);
+                }
+                assert_eq!(
+                    nntmux_name_fixing_patterns(kind, 2, b"".as_ptr(), 0, 0, out.as_mut_ptr(), 0),
+                    count as isize
+                );
+                assert_eq!(
+                    nntmux_name_fixing_patterns(
+                        kind,
+                        3,
+                        b"unknown\0\xff".as_ptr(),
+                        9,
+                        0,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    -3
+                );
+                assert_eq!(
+                    nntmux_name_fixing_patterns(
+                        kind,
+                        4,
+                        b"".as_ptr(),
+                        0,
+                        count,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    -3
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn factories_and_summaries_preserve_binary_empty_names_and_signed_ids() {
+        let input = frames(&[b"0\0\xff", b"method\n", "番組".as_bytes()]);
+        for id in [i64::MIN, -1, 0, 1, i64::MAX] {
+            let result = name_fix_result_build(0, &input, id, 1, 65536).unwrap();
+            let fields = name_query_fields(&result).unwrap();
+            assert_eq!(
+                fields,
+                vec![
+                    b"0\0\xff".as_slice(),
+                    b"method\n",
+                    "番組".as_bytes(),
+                    id.to_string().as_bytes()
+                ]
+            );
+            assert_eq!(
+                name_fix_result_build(2, &input, id, 1, 65536).unwrap(),
+                result
+            );
+        }
+        assert_eq!(
+            name_fix_result_build(5, &input, 0, 0, 65536).unwrap(),
+            "番組: method\n => 0\0"
+                .as_bytes()
+                .iter()
+                .copied()
+                .chain([0xff])
+                .collect::<Vec<_>>()
+        );
+        let unmatched = name_fix_result_build(1, &frames(&[b"checker"]), 123, 1, 65536).unwrap();
+        assert_eq!(
+            name_query_fields(&unmatched).unwrap(),
+            vec![b"".as_slice(), b"", b"checker", b"0"]
+        );
+        assert_eq!(
+            name_fix_result_build(2, &frames(&[b"name", b"method", b"checker"]), 123, 0, 65536)
+                .unwrap(),
+            unmatched
+        );
+        assert_eq!(
+            name_fix_result_build(5, &frames(&[b"", b"method", b"checker"]), 0, 0, 65536).unwrap(),
+            b"checker: no match"
+        );
+        let pairs = frames(&[b"newName", b"0\0\xff", b"checkerName", "番組".as_bytes()]);
+        assert_eq!(
+            name_fix_result_build(4, &pairs, 0, 0, pairs.len()).unwrap(),
+            pairs
+        );
+        assert_eq!(name_fix_result_build(4, &[], 0, 0, 0).unwrap(), b"");
+    }
+
+    #[test]
+    fn abi_rejects_bad_regions_frames_flags_and_preserves_output_on_failure() {
+        let mut out = [0x5au8; 32];
+        let input = frames(&[b"name", b"method", b"checker"]);
+        unsafe {
+            for mode in 0..=5 {
+                assert_eq!(
+                    nntmux_name_fix_result(
+                        mode,
+                        std::ptr::null(),
+                        0,
+                        0,
+                        0,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_name_fix_result(
+                        mode,
+                        input.as_ptr(),
+                        usize::MAX,
+                        0,
+                        0,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_name_fix_result(
+                        mode,
+                        input.as_ptr(),
+                        input.len(),
+                        0,
+                        0,
+                        std::ptr::null_mut(),
+                        0
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_name_fix_result(
+                        mode,
+                        input.as_ptr(),
+                        input.len(),
+                        0,
+                        2,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    -1
+                );
+            }
+            for mode in [0, 1, 2, 4, 5] {
+                assert_eq!(
+                    nntmux_name_fix_result(
+                        mode,
+                        b"\xff\xff\xff\xff".as_ptr(),
+                        4,
+                        0,
+                        0,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    -1
+                );
+            }
+            assert_eq!(
+                nntmux_name_fix_result(5, input.as_ptr(), input.len(), 0, 1, out.as_mut_ptr(), 1),
+                -2
+            );
+            assert_eq!(
+                nntmux_name_fix_result(3, b"".as_ptr(), 0, 0, 0, out.as_mut_ptr(), 0),
+                0
+            );
+            assert_eq!(
+                nntmux_name_fix_result(3, b"0".as_ptr(), 1, 0, 0, out.as_mut_ptr(), 0),
+                1
+            );
+            assert_eq!(
+                nntmux_name_fixing_patterns(0, 0, b"".as_ptr(), 0, 0, out.as_mut_ptr(), 1),
+                -2
+            );
+            assert_eq!(
+                nntmux_name_fixing_patterns(0, 0, b"".as_ptr(), 0, 0, out.as_mut_ptr(), usize::MAX),
+                -1
+            );
+            assert_eq!(
+                nntmux_name_fixing_patterns(
+                    0,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    0,
+                    out.as_mut_ptr(),
+                    out.len()
+                ),
+                -1
+            );
+        }
+        assert_eq!(out, [0x5a; 32]);
+        // u8 pointers have alignment 1; typed ABI rejection is covered by the
+        // actual i64/i32 exports in strict_cleaning_abi_tests.
+    }
+
+    #[test]
+    fn result_abi_accepts_exact_capacity_and_overlapping_input_output() {
+        let mut input = frames(&[b"newName", b"bytes\0\xff"]);
+        let expected = input.clone();
+        let pointer = input.as_mut_ptr();
+        unsafe {
+            assert_eq!(
+                nntmux_name_fix_result(4, pointer, input.len(), 0, 0, pointer, input.len()),
+                input.len() as isize
+            );
+        }
+        assert_eq!(input, expected);
+        for mode in [0, 1, 2, 5] {
+            let input = if mode == 1 {
+                frames(&[b"checker"])
+            } else {
+                frames(&[b"name", b"method", b"checker"])
+            };
+            let expected = name_fix_result_build(mode, &input, i64::MIN, 1, 65536).unwrap();
+            let mut out = vec![0x5a; expected.len()];
+            unsafe {
+                assert_eq!(
+                    nntmux_name_fix_result(
+                        mode,
+                        input.as_ptr(),
+                        input.len(),
+                        i64::MIN,
+                        1,
+                        out.as_mut_ptr(),
+                        out.len() - 1
+                    ),
+                    -2
+                );
+                assert!(out.iter().all(|&b| b == 0x5a));
+                assert_eq!(
+                    nntmux_name_fix_result(
+                        mode,
+                        input.as_ptr(),
+                        input.len(),
+                        i64::MIN,
+                        1,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    expected.len() as isize
+                );
+            }
+            assert_eq!(out, expected);
         }
     }
 }
