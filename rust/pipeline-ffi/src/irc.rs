@@ -2738,6 +2738,1023 @@ pub unsafe extern "C" fn nntmux_redis_format_bytes(
     out.finish()
 }
 
+#[inline]
+fn is_ascii_word(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+#[inline]
+fn match_colon_space_digits_word_end(s: &[u8]) -> Option<&[u8]> {
+    if !s.starts_with(b": ") {
+        return None;
+    }
+    let rest = &s[2..];
+    let mut end = 0usize;
+    while end < rest.len() && rest[end].is_ascii_digit() {
+        end += 1;
+    }
+    if end == 0 {
+        return None;
+    }
+    if end < rest.len() && is_ascii_word(rest[end]) {
+        return None;
+    }
+    Some(&rest[..end])
+}
+
+#[inline]
+fn match_first_colon_space_digits_word_end(s: &[u8]) -> Option<&[u8]> {
+    let colon = find_byte(s, b':')?;
+    match_colon_space_digits_word_end(&s[colon..])
+}
+
+/// Extracts the 5 server status metrics (`Threads`, `Opens`, `Tables`, `Slow`, `QPS`) for
+/// `TmuxOutput::_getQueries()` in a single pass, writing `"{threads}\0{opens}\0{tables}\0{slow}\0{qps}"`
+/// into `out_buf`. Declines with `-1` if `info` contains NUL, `\n`, or non-ASCII bytes (`>= 0x80`).
+/// Returns bytes written (`>= 4`), `-(needed as isize)` (`<= -4`) when `out_cap` is too small,
+/// or `-1` on invalid arguments / declined input.
+///
+/// # Safety
+/// `info` must be readable for `info_len` bytes and `out_buf` writable for `out_cap` bytes without overlap.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_tmux_output_extract_server_info(
+    info: *const c_char,
+    info_len: usize,
+    out_buf: *mut c_char,
+    out_cap: usize,
+) -> isize {
+    if (info.is_null() && info_len != 0)
+        || (out_buf.is_null() && out_cap != 0)
+        || info_len > isize::MAX as usize
+        || out_cap > isize::MAX as usize
+    {
+        return -1;
+    }
+    let s = if info_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(info.cast::<u8>(), info_len) }
+    };
+    let mut threads: Option<&[u8]> = None;
+    let mut opens: Option<&[u8]> = None;
+    let mut tables: Option<&[u8]> = None;
+    let mut slow: Option<&[u8]> = None;
+    let mut qps: Option<&[u8]> = None;
+
+    let mut prev_word = false;
+    for i in 0..s.len() {
+        let b = s[i];
+        if b == 0 || b == b'\n' || b >= 0x80 {
+            return -1;
+        }
+        let cur_word = is_ascii_word(b);
+        if !prev_word && cur_word {
+            match b {
+                b'T' => {
+                    if s[i..].starts_with(b"Threads")
+                        && let Some(digits) = match_colon_space_digits_word_end(&s[i + 7..])
+                    {
+                        threads = Some(digits);
+                    }
+                }
+                b'O' => {
+                    if s[i..].starts_with(b"Opens")
+                        && let Some(digits) = match_first_colon_space_digits_word_end(&s[i + 5..])
+                    {
+                        opens = Some(digits);
+                    }
+                }
+                b't' => {
+                    if i > 0
+                        && s[i - 1] == b' '
+                        && s[i..].starts_with(b"tables")
+                        && let Some(digits) = match_colon_space_digits_word_end(&s[i + 6..])
+                    {
+                        tables = Some(digits);
+                    }
+                }
+                b'S' => {
+                    if s[i..].starts_with(b"Slow")
+                        && let Some(digits) = match_first_colon_space_digits_word_end(&s[i + 4..])
+                    {
+                        slow = Some(digits);
+                    }
+                }
+                b'Q' => {
+                    if s[i..].starts_with(b"Queries")
+                        && let Some(digits) = match_first_colon_space_digits_word_end(&s[i + 7..])
+                    {
+                        qps = Some(digits);
+                    }
+                }
+                _ => {}
+            }
+        }
+        prev_word = cur_word;
+    }
+
+    let fields = [
+        threads.unwrap_or(s),
+        opens.unwrap_or(s),
+        tables.unwrap_or(s),
+        slow.unwrap_or(s),
+        qps.unwrap_or(s),
+    ];
+    let mut out = unsafe { OutCursor::new(out_buf.cast::<u8>(), out_cap) };
+    for (idx, field) in fields.iter().enumerate() {
+        if idx > 0 {
+            out.push(0);
+        }
+        out.extend(field);
+    }
+    out.finish()
+}
+
+/// Computes `TmuxOutput::percent(int $part, int $total): int`:
+/// `$total > 0 ? (int) floor(($part / $total) * 100) : 0`.
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_tmux_output_percent(part: i64, total: i64) -> i64 {
+    if total <= 0 {
+        return 0;
+    }
+    (((part as f64) / (total as f64)) * 100.0).floor() as i64
+}
+
+#[inline]
+fn write_i64_number_format(val: i64, out: &mut OutCursor) {
+    let mut num_buf = [0u8; 24];
+    let u = if val < 0 {
+        out.push(b'-');
+        val.unsigned_abs()
+    } else {
+        val as u64
+    };
+    let digits = write_u64_ascii(u, &mut num_buf);
+    for (idx, &b) in digits.iter().enumerate() {
+        if idx > 0 && (digits.len() - idx).is_multiple_of(3) {
+            out.push(b',');
+        }
+        out.push(b);
+    }
+}
+
+#[inline]
+fn write_i64_plain(val: i64, out: &mut OutCursor) {
+    let mut num_buf = [0u8; 24];
+    let u = if val < 0 {
+        out.push(b'-');
+        val.unsigned_abs()
+    } else {
+        val as u64
+    };
+    out.extend(write_u64_ascii(u, &mut num_buf));
+}
+
+/// Formats `TmuxOutput::decodeCountRow` cells `"{number_format(in_process)}({diff})\0{number_format(in_database)}({percent}%)"`.
+/// Returns bytes written (`>= 9`), `-(needed as isize)` (`<= -9`) when `out_cap` is too small,
+/// or `-1` on invalid arguments / embedded NUL in `diff` / `|count| >= 2^52`.
+///
+/// # Safety
+/// `diff` must be readable for `diff_len` bytes and `out_buf` writable for `out_cap` bytes without overlap.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_tmux_output_decode_count_row(
+    in_process: i64,
+    diff: *const c_char,
+    diff_len: usize,
+    in_database: i64,
+    percent: i64,
+    out_buf: *mut c_char,
+    out_cap: usize,
+) -> isize {
+    if (diff.is_null() && diff_len != 0)
+        || (out_buf.is_null() && out_cap != 0)
+        || diff_len > isize::MAX as usize
+        || out_cap > isize::MAX as usize
+        || in_process <= -(1i64 << 52)
+        || in_process >= (1i64 << 52)
+        || in_database <= -(1i64 << 52)
+        || in_database >= (1i64 << 52)
+    {
+        return -1;
+    }
+    let diff_bytes = if diff_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(diff.cast::<u8>(), diff_len) }
+    };
+    if find_byte(diff_bytes, 0).is_some() {
+        return -1;
+    }
+
+    let mut out = unsafe { OutCursor::new(out_buf.cast::<u8>(), out_cap) };
+    write_i64_number_format(in_process, &mut out);
+    out.push(b'(');
+    out.extend(diff_bytes);
+    out.push(b')');
+    out.push(0);
+    write_i64_number_format(in_database, &mut out);
+    out.push(b'(');
+    write_i64_plain(percent, &mut out);
+    out.extend(b"%)");
+    out.finish()
+}
+
+/// Returns newline-separated pane role names for `TmuxPaneManager::getPaneNames(int $sequential, bool $runIrcScraper)`.
+/// Returns bytes written (`> 0`), `-(needed as isize)` (`<= -2`) when `out_cap` is too small,
+/// or `-1` on invalid arguments.
+///
+/// # Safety
+/// `out_buf` must be writable for `out_cap` bytes when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_tmux_pane_get_names(
+    sequential: i32,
+    include_irc: u8,
+    out_buf: *mut c_char,
+    out_cap: usize,
+) -> isize {
+    if (out_buf.is_null() && out_cap != 0) || out_cap > isize::MAX as usize || include_irc > 1 {
+        return -1;
+    }
+    const FULL: [&[u8]; 10] = [
+        b"monitor",
+        b"binaries",
+        b"backfill",
+        b"releases",
+        b"fix_names",
+        b"remove_crap",
+        b"post_additional",
+        b"post_movies",
+        b"post_tv",
+        b"post_metadata",
+    ];
+    const BASIC: [&[u8]; 8] = [
+        b"monitor",
+        b"releases",
+        b"fix_names",
+        b"remove_crap",
+        b"post_additional",
+        b"post_movies",
+        b"post_tv",
+        b"post_metadata",
+    ];
+    const STRIPPED: [&[u8]; 4] = [b"monitor", b"sequential", b"fix_names", b"post_metadata"];
+
+    let base: &[&[u8]] = match sequential {
+        1 => &BASIC,
+        2 => &STRIPPED,
+        _ => &FULL,
+    };
+
+    let mut out = unsafe { OutCursor::new(out_buf.cast::<u8>(), out_cap) };
+    for (idx, name) in base.iter().enumerate() {
+        if idx > 0 {
+            out.push(b'\n');
+        }
+        out.extend(name);
+    }
+    if include_irc != 0 {
+        out.push(b'\n');
+        out.extend(b"irc_scraper");
+    }
+    out.finish()
+}
+
+/// Builds the NUL-separated `respawn-pane` argv list for `TmuxPaneManager::buildRespawnCommand`.
+/// Returns bytes written (`> 0`), `-(needed as isize)` (`<= -2`) when `out_cap` is too small,
+/// or `-1` on invalid arguments / NUL segment count mismatch.
+///
+/// # Safety
+/// All non-null input pointers must be readable for their stated lengths, and `out_buf` writable for `out_cap` bytes without overlap.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_tmux_pane_build_respawn_argv_nul(
+    base_args: *const c_char,
+    base_args_len: usize,
+    base_count: usize,
+    kill_flag: u8,
+    target: *const c_char,
+    target_len: usize,
+    directory: *const c_char,
+    directory_len: usize,
+    env_pairs: *const c_char,
+    env_pairs_len: usize,
+    env_pair_count: usize,
+    worker_args: *const c_char,
+    worker_args_len: usize,
+    worker_count: usize,
+    out_buf: *mut c_char,
+    out_cap: usize,
+) -> isize {
+    if (base_args.is_null() && base_args_len != 0)
+        || (target.is_null() && target_len != 0)
+        || (directory.is_null() && directory_len != 0)
+        || (env_pairs.is_null() && env_pairs_len != 0)
+        || (worker_args.is_null() && worker_args_len != 0)
+        || (out_buf.is_null() && out_cap != 0)
+        || out_cap > isize::MAX as usize
+        || kill_flag > 1
+        || base_count == 0
+        || worker_count == 0
+    {
+        return -1;
+    }
+    let base_bytes = if base_args_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(base_args.cast::<u8>(), base_args_len) }
+    };
+    let target_bytes = if target_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(target.cast::<u8>(), target_len) }
+    };
+    let dir_bytes = if directory_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(directory.cast::<u8>(), directory_len) }
+    };
+    let env_bytes = if env_pairs_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(env_pairs.cast::<u8>(), env_pairs_len) }
+    };
+    let worker_bytes = if worker_args_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(worker_args.cast::<u8>(), worker_args_len) }
+    };
+
+    if find_byte(target_bytes, 0).is_some() || find_byte(dir_bytes, 0).is_some() {
+        return -1;
+    }
+    if base_bytes.iter().filter(|&&b| b == 0).count().checked_add(1) != Some(base_count) {
+        return -1;
+    }
+    if worker_bytes
+        .iter()
+        .filter(|&&b| b == 0)
+        .count()
+        .checked_add(1)
+        != Some(worker_count)
+    {
+        return -1;
+    }
+    if env_pair_count == 0 {
+        if !env_bytes.is_empty() {
+            return -1;
+        }
+    } else {
+        let Some(expected_env_items) = env_pair_count.checked_mul(2) else {
+            return -1;
+        };
+        if env_bytes.iter().filter(|&&b| b == 0).count().checked_add(1)
+            != Some(expected_env_items)
+        {
+            return -1;
+        }
+    }
+
+    let mut out = unsafe { OutCursor::new(out_buf.cast::<u8>(), out_cap) };
+    out.extend(base_bytes);
+    if kill_flag == 1 {
+        out.extend(b"\0-k");
+    }
+    out.extend(b"\0-t\0");
+    out.extend(target_bytes);
+    out.extend(b"\0-c\0");
+    out.extend(dir_bytes);
+
+    if env_pair_count > 0 {
+        let mut iter = env_bytes.split(|&b| b == 0);
+        for _ in 0..env_pair_count {
+            let Some(name) = iter.next() else {
+                return -1;
+            };
+            let Some(val) = iter.next() else {
+                return -1;
+            };
+            out.extend(b"\0-e\0");
+            out.extend(name);
+            out.push(b'=');
+            out.extend(val);
+        }
+    }
+
+    for arg in worker_bytes.split(|&b| b == 0) {
+        out.push(0);
+        if let Some(stem) = arg.strip_suffix(b";") {
+            out.extend(stem);
+            out.extend(b"\\;");
+        } else {
+            out.extend(arg);
+        }
+    }
+    out.finish()
+}
+
+/// Formats `TmuxPaneManager::buildLogTeeSuffix(string $path, string $pane, string $date, bool $writeLogs)`.
+/// Returns bytes written (`>= 0`, `0` when `write_logs == 0`), `-(needed as isize)` (`<= -2`) when `out_cap` is too small,
+/// or `-1` on invalid arguments / embedded NUL.
+///
+/// # Safety
+/// All non-null input pointers must be readable for their stated lengths, and `out_buf` writable for `out_cap` bytes without overlap.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_tmux_pane_build_log_tee_suffix(
+    path: *const c_char,
+    path_len: usize,
+    pane: *const c_char,
+    pane_len: usize,
+    date: *const c_char,
+    date_len: usize,
+    write_logs: u8,
+    out_buf: *mut c_char,
+    out_cap: usize,
+) -> isize {
+    if (path.is_null() && path_len != 0)
+        || (pane.is_null() && pane_len != 0)
+        || (date.is_null() && date_len != 0)
+        || (out_buf.is_null() && out_cap != 0)
+        || out_cap > isize::MAX as usize
+        || write_logs > 1
+    {
+        return -1;
+    }
+    let path_bytes = if path_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(path.cast::<u8>(), path_len) }
+    };
+    let pane_bytes = if pane_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(pane.cast::<u8>(), pane_len) }
+    };
+    let date_bytes = if date_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(date.cast::<u8>(), date_len) }
+    };
+    if find_byte(path_bytes, 0).is_some()
+        || find_byte(pane_bytes, 0).is_some()
+        || find_byte(date_bytes, 0).is_some()
+    {
+        return -1;
+    }
+    if write_logs == 0 {
+        return 0;
+    }
+
+    let mut out = unsafe { OutCursor::new(out_buf.cast::<u8>(), out_cap) };
+    out.extend(b"2>&1 | tee -a ");
+    out.extend(path_bytes);
+    out.push(b'/');
+    out.extend(pane_bytes);
+    out.push(b'-');
+    out.extend(date_bytes);
+    out.extend(b".log");
+    out.finish()
+}
+
+#[inline]
+fn write_posix_shell_arg(arg: &[u8], out: &mut OutCursor) {
+    out.push(b'\'');
+    for &b in arg {
+        if b == b'\'' {
+            out.extend(b"'\\''");
+        } else {
+            out.push(b);
+        }
+    }
+    out.push(b'\'');
+}
+
+/// Formats `TmuxPaneManager::getSequentialCommand` (`nice -n{niceness} '{php_bin}' '{artisan}' {subcommand}[ {log_suffix}]`).
+/// Declines with `-1` if any input contains NUL or non-ASCII bytes (`>= 0x80` in `php_bin` / `artisan` where `escapeshellarg` is locale-dependent).
+/// Returns bytes written (`> 0`), `-(needed as isize)` (`<= -2`) when `out_cap` is too small, or `-1` on invalid arguments.
+///
+/// # Safety
+/// All non-null input pointers must be readable for their stated lengths, and `out_buf` writable for `out_cap` bytes without overlap.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_tmux_pane_get_sequential_command(
+    php_bin: *const c_char,
+    php_bin_len: usize,
+    artisan: *const c_char,
+    artisan_len: usize,
+    niceness: i32,
+    subcommand: *const c_char,
+    subcommand_len: usize,
+    log_suffix: *const c_char,
+    log_suffix_len: usize,
+    out_buf: *mut c_char,
+    out_cap: usize,
+) -> isize {
+    if (php_bin.is_null() && php_bin_len != 0)
+        || (artisan.is_null() && artisan_len != 0)
+        || (subcommand.is_null() && subcommand_len != 0)
+        || (log_suffix.is_null() && log_suffix_len != 0)
+        || (out_buf.is_null() && out_cap != 0)
+        || out_cap > isize::MAX as usize
+    {
+        return -1;
+    }
+    let php_bytes = if php_bin_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(php_bin.cast::<u8>(), php_bin_len) }
+    };
+    let artisan_bytes = if artisan_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(artisan.cast::<u8>(), artisan_len) }
+    };
+    let sub_bytes = if subcommand_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(subcommand.cast::<u8>(), subcommand_len) }
+    };
+    let log_bytes = if log_suffix_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(log_suffix.cast::<u8>(), log_suffix_len) }
+    };
+
+    if php_bytes.iter().any(|&b| b == 0 || b >= 0x80)
+        || artisan_bytes.iter().any(|&b| b == 0 || b >= 0x80)
+        || find_byte(sub_bytes, 0).is_some()
+        || find_byte(log_bytes, 0).is_some()
+    {
+        return -1;
+    }
+
+    let mut out = unsafe { OutCursor::new(out_buf.cast::<u8>(), out_cap) };
+    out.extend(b"nice -n");
+    write_i64_plain(i64::from(niceness), &mut out);
+    out.push(b' ');
+    write_posix_shell_arg(php_bytes, &mut out);
+    out.push(b' ');
+    write_posix_shell_arg(artisan_bytes, &mut out);
+    out.push(b' ');
+    out.extend(sub_bytes);
+    if !log_bytes.is_empty() {
+        out.push(b' ');
+        out.extend(log_bytes);
+    }
+    out.finish()
+}
+
+/// Computes `TmuxMonitorService::incrementRunCount(int $iterations): int` (`iterations + 1`),
+/// returning `-1` on negative input or signed 64-bit integer overflow.
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_tmux_monitor_increment_run_count(iterations: i64) -> i64 {
+    if iterations < 0 {
+        return -1;
+    }
+    iterations.checked_add(1).unwrap_or(-1)
+}
+
+/// Formats `count` comma-grouped integer diffs (`number_format(now_vals[i] - start_vals[i])`) separated by NUL
+/// for `TmuxMonitorService::updateDiffs`.
+/// Returns bytes written (`>= 0`), `-(needed as isize)` (`<= -2`) when `out_cap` is too small,
+/// or `-1` on invalid arguments / integer overflow / `|diff| >= 2^52`.
+///
+/// # Safety
+/// `now_vals` and `start_vals` must be readable for `count` `i64` elements when `count > 0`, and `out_buf` writable for `out_cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_tmux_monitor_update_diffs_nul(
+    now_vals: *const i64,
+    start_vals: *const i64,
+    count: usize,
+    out_buf: *mut c_char,
+    out_cap: usize,
+) -> isize {
+    if ((now_vals.is_null() || start_vals.is_null()) && count != 0)
+        || (out_buf.is_null() && out_cap != 0)
+        || out_cap > isize::MAX as usize
+    {
+        return -1;
+    }
+    if count == 0 {
+        return 0;
+    }
+    let now_slice = unsafe { slice::from_raw_parts(now_vals, count) };
+    let start_slice = unsafe { slice::from_raw_parts(start_vals, count) };
+
+    let mut out = unsafe { OutCursor::new(out_buf.cast::<u8>(), out_cap) };
+    for i in 0..count {
+        let Some(diff) = now_slice[i].checked_sub(start_slice[i]) else {
+            return -1;
+        };
+        if diff <= -(1i64 << 52) || diff >= (1i64 << 52) {
+            return -1;
+        }
+        if i > 0 {
+            out.push(0);
+        }
+        write_i64_number_format(diff, &mut out);
+    }
+    out.finish()
+}
+
+#[inline]
+fn write_percent_02d(num: i64, den: i64, out: &mut OutCursor) {
+    if den <= 0 {
+        return;
+    }
+    let pct = (((num as f64) / (den as f64)) * 100.0).floor() as i64;
+    if (0..10).contains(&pct) {
+        out.push(b'0');
+        out.push(b'0' + (pct as u8));
+    } else {
+        write_i64_plain(pct, out);
+    }
+}
+
+/// Computes `TmuxMonitorService::calculateProcessingStats`:
+/// writes `work + process_sum` to `*total_work_out` and writes 11 NUL-separated percentage tokens
+/// (`tv\0movies\0audio\0books\0console\0pc\0xxx\0misc\0nfo\0predb_matched\0renamed`, where empty token means integer `0`)
+/// into `out_buf`.
+/// Returns bytes written (`>= 10`), `-(needed as isize)` (`<= -10`) when `out_cap` is too small,
+/// or `-1` on invalid arguments / negative counts / integer overflow.
+///
+/// # Safety
+/// `total_work_out` must be a valid writable pointer, and `out_buf` writable for `out_cap` bytes when non-null.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_tmux_monitor_calc_processing_stats(
+    work: i64,
+    process_sum: i64,
+    tv: i64,
+    movies: i64,
+    audio: i64,
+    books: i64,
+    console: i64,
+    pc: i64,
+    xxx: i64,
+    misc: i64,
+    nfo: i64,
+    processnfo: i64,
+    predb_matched: i64,
+    predb: i64,
+    renamed: i64,
+    processrenames: i64,
+    total_work_out: *mut i64,
+    out_buf: *mut c_char,
+    out_cap: usize,
+) -> isize {
+    if total_work_out.is_null()
+        || (out_buf.is_null() && out_cap != 0)
+        || out_cap > isize::MAX as usize
+    {
+        return -1;
+    }
+    let all_inputs = [
+        work,
+        process_sum,
+        tv,
+        movies,
+        audio,
+        books,
+        console,
+        pc,
+        xxx,
+        misc,
+        nfo,
+        processnfo,
+        predb_matched,
+        predb,
+        renamed,
+        processrenames,
+    ];
+    if all_inputs.iter().any(|&v| !(0..(1i64 << 52)).contains(&v)) {
+        return -1;
+    }
+
+    let Some(total_work) = work.checked_add(process_sum) else {
+        return -1;
+    };
+    let categories = [tv, movies, audio, books, console, pc, xxx, misc];
+    let mut total_cat = 0i64;
+    for &c in &categories {
+        let Some(next) = total_cat.checked_add(c) else {
+            return -1;
+        };
+        total_cat = next;
+    }
+    let Some(nfo_total) = nfo.checked_add(processnfo) else {
+        return -1;
+    };
+    let Some(rename_total) = renamed.checked_add(processrenames) else {
+        return -1;
+    };
+
+    unsafe {
+        *total_work_out = total_work;
+    }
+
+    let mut out = unsafe { OutCursor::new(out_buf.cast::<u8>(), out_cap) };
+    for (idx, &val) in categories.iter().enumerate() {
+        if idx > 0 {
+            out.push(0);
+        }
+        write_percent_02d(val, total_cat, &mut out);
+    }
+    out.push(0);
+    write_percent_02d(nfo, nfo_total, &mut out);
+    out.push(0);
+    write_percent_02d(predb_matched, predb, &mut out);
+    out.push(0);
+    write_percent_02d(renamed, rename_total, &mut out);
+    out.finish()
+}
+
+/// Evaluates `TmuxMonitorService::shouldRunPane` for a pane task name (`binaries`, `backfill`,
+/// `releases`, `sequential`, `fixnames`, `removecrap`, `ppadditional`, `tv`/`nonamazon`, `movies`, `amazon`, `scraper`).
+/// Returns `1` (true), `0` (false), or `-1` on invalid arguments.
+///
+/// # Safety
+/// `pane`, `fix_crap_opt`, and `fix_crap` must be readable for their stated lengths when non-null.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_tmux_monitor_should_run_pane(
+    pane: *const c_char,
+    pane_len: usize,
+    binaries_run: i64,
+    backfill: i64,
+    releases_run: i64,
+    fix_names: i64,
+    fix_crap_opt: *const c_char,
+    fix_crap_opt_len: usize,
+    fix_crap: *const c_char,
+    fix_crap_len: usize,
+    post: i64,
+    post_non: i64,
+    post_amazon: i64,
+    processtvrage: i64,
+    processanime: i64,
+    processmovies: i64,
+    processbooks: i64,
+    processmusic: i64,
+    processgames: i64,
+    run_ircscraper: i64,
+    work_available: i64,
+    processnfo: i64,
+    processrenames: i64,
+    count_processtv: i64,
+    count_processanime: i64,
+    count_processmovies: i64,
+    count_processbooks: i64,
+    count_processmusic: i64,
+    count_processconsole: i64,
+    count_processgames: i64,
+    kill_pp: u8,
+    kill_coll: u8,
+) -> i32 {
+    if (pane.is_null() && pane_len != 0)
+        || (fix_crap_opt.is_null() && fix_crap_opt_len != 0)
+        || (fix_crap.is_null() && fix_crap_len != 0)
+        || kill_pp > 1
+        || kill_coll > 1
+    {
+        return -1;
+    }
+    let pane_bytes = if pane_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(pane.cast::<u8>(), pane_len) }
+    };
+    let opt_bytes = if fix_crap_opt_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(fix_crap_opt.cast::<u8>(), fix_crap_opt_len) }
+    };
+    let crap_bytes = if fix_crap_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(fix_crap.cast::<u8>(), fix_crap_len) }
+    };
+
+    let should_run = match pane_bytes {
+        b"binaries" => binaries_run == 1 && kill_pp == 0,
+        b"backfill" => (backfill == 1 || backfill == 4) && kill_coll == 0 && kill_pp == 0,
+        b"releases" => releases_run != 0,
+        b"sequential" => true,
+        b"fixnames" => fix_names == 1 && processrenames > 0,
+        b"removecrap" => {
+            if opt_bytes == b"All" {
+                true
+            } else if opt_bytes == b"Custom" {
+                crap_bytes
+                    .split(|&b| b == b',')
+                    .any(|part| {
+                        let trimmed = php_trim(part);
+                        !trimmed.is_empty() && trimmed != b"0"
+                    })
+            } else {
+                false
+            }
+        }
+        b"ppadditional" => {
+            let has_work = work_available > 0;
+            let has_nfo = processnfo > 0;
+            match post {
+                1 => has_work,
+                2 => has_nfo,
+                3 => has_work || has_nfo,
+                _ => false,
+            }
+        }
+        b"tv" | b"nonamazon" => {
+            post_non > 0
+                && ((processtvrage > 0 && count_processtv > 0)
+                    || (processanime > 0 && count_processanime > 0))
+        }
+        b"movies" => post_non > 0 && processmovies > 0 && count_processmovies > 0,
+        b"amazon" => {
+            post_amazon > 0
+                && ((processbooks > 0 && count_processbooks > 0)
+                    || (processmusic > 0 && count_processmusic > 0)
+                    || (processgames > 0
+                        && (count_processconsole > 0 || count_processgames > 0)))
+        }
+        b"scraper" => run_ircscraper == 1,
+        _ => false,
+    };
+
+    i32::from(should_run)
+}
+
+/// Builds NUL-separated `select-layout -t {session}:{window} tiled` (`cmd_kind == 0`) or
+/// `kill-window -t {session}:{window}` (`cmd_kind == 1`) argv for `TmuxSessionManager`.
+/// Returns bytes written (`> 0`), `-(needed as isize)` (`<= -2`) when `out_cap` is too small,
+/// or `-1` on invalid arguments / NUL segment count mismatch.
+///
+/// # Safety
+/// All non-null input pointers must be readable for their stated lengths, and `out_buf` writable for `out_cap` bytes without overlap.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_tmux_session_build_window_cmd_nul(
+    base_args: *const c_char,
+    base_args_len: usize,
+    base_count: usize,
+    cmd_kind: u8,
+    session_target: *const c_char,
+    session_target_len: usize,
+    window: *const c_char,
+    window_len: usize,
+    out_buf: *mut c_char,
+    out_cap: usize,
+) -> isize {
+    if (base_args.is_null() && base_args_len != 0)
+        || (session_target.is_null() && session_target_len != 0)
+        || (window.is_null() && window_len != 0)
+        || (out_buf.is_null() && out_cap != 0)
+        || out_cap > isize::MAX as usize
+        || cmd_kind > 1
+        || base_count == 0
+        || base_args_len == 0
+        || session_target_len == 0
+        || window_len == 0
+    {
+        return -1;
+    }
+    let base_bytes = if base_args_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(base_args.cast::<u8>(), base_args_len) }
+    };
+    let session_bytes = if session_target_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(session_target.cast::<u8>(), session_target_len) }
+    };
+    let window_bytes = if window_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(window.cast::<u8>(), window_len) }
+    };
+
+    if find_byte(session_bytes, 0).is_some() || find_byte(window_bytes, 0).is_some() {
+        return -1;
+    }
+    if base_bytes.iter().filter(|&&b| b == 0).count().checked_add(1) != Some(base_count) {
+        return -1;
+    }
+
+    let mut out = unsafe { OutCursor::new(out_buf.cast::<u8>(), out_cap) };
+    out.extend(base_bytes);
+    if cmd_kind == 0 {
+        out.extend(b"\0select-layout\0-t\0");
+        out.extend(session_bytes);
+        out.push(b':');
+        out.extend(window_bytes);
+        out.extend(b"\0tiled");
+    } else {
+        out.extend(b"\0kill-window\0-t\0");
+        out.extend(session_bytes);
+        out.push(b':');
+        out.extend(window_bytes);
+    }
+    out.finish()
+}
+
+/// Returns newline-separated split setup rows `"{window}\t{direction}\t{target_role}\t{percentage}\t{role}"`
+/// for `TmuxSessionManager::getSplitSetup(int $sequentialMode)`.
+/// Returns bytes written (`> 0`), `-(needed as isize)` (`<= -2`) when `out_cap` is too small,
+/// or `-1` on invalid arguments.
+///
+/// # Safety
+/// `out_buf` must be writable for `out_cap` bytes when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_tmux_session_get_split_setup(
+    sequential_mode: i32,
+    out_buf: *mut c_char,
+    out_cap: usize,
+) -> isize {
+    if (out_buf.is_null() && out_cap != 0) || out_cap > isize::MAX as usize {
+        return -1;
+    }
+    const FULL: &[u8] = b"0\th\tmonitor\t67\tbinaries\n\
+0\tv\tbinaries\t67\tbackfill\n\
+0\tv\tbackfill\t50\treleases\n\
+1\th\tfix_names\t50\tremove_crap\n\
+2\th\tpost_additional\t50\tpost_movies\n\
+2\tv\tpost_additional\t67\tpost_tv\n\
+2\tv\tpost_tv\t50\tpost_metadata";
+
+    const BASIC: &[u8] = b"0\th\tmonitor\t67\treleases\n\
+1\th\tfix_names\t50\tremove_crap\n\
+2\th\tpost_additional\t50\tpost_movies\n\
+2\tv\tpost_additional\t67\tpost_tv\n\
+2\tv\tpost_tv\t50\tpost_metadata";
+
+    const STRIPPED: &[u8] = b"0\th\tmonitor\t67\tsequential\n\
+1\th\tfix_names\t50\tpost_metadata";
+
+    let payload = match sequential_mode {
+        1 => BASIC,
+        2 => STRIPPED,
+        _ => FULL,
+    };
+
+    let mut out = unsafe { OutCursor::new(out_buf.cast::<u8>(), out_cap) };
+    out.extend(payload);
+    out.finish()
+}
+
+/// Formats `RedisMonitor::formatDuration(int $seconds): string` (`"{d}d {h}h {m}m {s}s"` / `"{h}h {m}m {s}s"` / `"{m}m {s}s"` / `"{s}s"`).
+/// Returns bytes written (`> 0`), `-(needed as isize)` (`<= -2`) when `out_cap` is too small,
+/// or `-1` on invalid arguments.
+///
+/// # Safety
+/// `out_buf` must be writable for `out_cap` bytes when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_redis_format_duration(
+    seconds: i64,
+    out_buf: *mut c_char,
+    out_cap: usize,
+) -> isize {
+    if (out_buf.is_null() && out_cap != 0) || out_cap > isize::MAX as usize {
+        return -1;
+    }
+    let mut out = unsafe { OutCursor::new(out_buf.cast::<u8>(), out_cap) };
+    let u = if seconds < 0 {
+        out.push(b'-');
+        seconds.unsigned_abs()
+    } else {
+        seconds as u64
+    };
+    let days = u / 86_400;
+    let hours = (u % 86_400) / 3_600;
+    let mins = (u % 3_600) / 60;
+    let secs = u % 60;
+
+    let mut num_buf = [0u8; 24];
+    if days > 0 {
+        out.extend(write_u64_ascii(days, &mut num_buf));
+        out.extend(b"d ");
+        out.extend(write_u64_ascii(hours, &mut num_buf));
+        out.extend(b"h ");
+        out.extend(write_u64_ascii(mins, &mut num_buf));
+        out.extend(b"m ");
+        out.extend(write_u64_ascii(secs, &mut num_buf));
+        out.push(b's');
+    } else if hours > 0 {
+        out.extend(write_u64_ascii(hours, &mut num_buf));
+        out.extend(b"h ");
+        out.extend(write_u64_ascii(mins, &mut num_buf));
+        out.extend(b"m ");
+        out.extend(write_u64_ascii(secs, &mut num_buf));
+        out.push(b's');
+    } else if mins > 0 {
+        out.extend(write_u64_ascii(mins, &mut num_buf));
+        out.extend(b"m ");
+        out.extend(write_u64_ascii(secs, &mut num_buf));
+        out.push(b's');
+    } else {
+        out.extend(write_u64_ascii(secs, &mut num_buf));
+        out.push(b's');
+    }
+    out.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3240,6 +4257,187 @@ mod tests {
 
             let fb_len = nntmux_redis_format_bytes(1_572_864, out.as_mut_ptr().cast(), out.len());
             assert_eq!(&out[..fb_len as usize], b"1.50 MB");
+        }
+    }
+
+    #[test]
+    fn tmux_pane_monitor_and_redis_duration_contracts() {
+        let mut out = [0u8; 512];
+        unsafe {
+            let srv = b"Uptime: 12345  Threads: 4  Questions: 987654  Slow queries: 2  Opens: 512  Flush tables: 1  Open tables: 256  Queries per second avg: 80.004";
+            let srv_len = nntmux_tmux_output_extract_server_info(
+                srv.as_ptr().cast(),
+                srv.len(),
+                out.as_mut_ptr().cast(),
+                out.len(),
+            );
+            assert!(srv_len > 0);
+            assert_eq!(&out[..srv_len as usize], b"4\0512\0256\02\080");
+
+            assert_eq!(nntmux_tmux_output_percent(25, 100), 25);
+            assert_eq!(nntmux_tmux_output_percent(50, 0), 0);
+
+            let row_len = nntmux_tmux_output_decode_count_row(
+                1234,
+                b"+12".as_ptr().cast(),
+                3,
+                56789,
+                42,
+                out.as_mut_ptr().cast(),
+                out.len(),
+            );
+            assert!(row_len > 0);
+            assert_eq!(&out[..row_len as usize], b"1,234(+12)\056,789(42%)");
+
+            let names_len =
+                nntmux_tmux_pane_get_names(2, 1, out.as_mut_ptr().cast(), out.len());
+            assert!(names_len > 0);
+            assert_eq!(
+                &out[..names_len as usize],
+                b"monitor\nsequential\nfix_names\npost_metadata\nirc_scraper"
+            );
+
+            let base_args = b"tmux\0-u\0respawn-pane";
+            let env_pairs = b"REDIS_HOST\0127.0.0.1";
+            let worker_args = b"php\0artisan;";
+            let argv_len = nntmux_tmux_pane_build_respawn_argv_nul(
+                base_args.as_ptr().cast(),
+                base_args.len(),
+                3,
+                1,
+                b"%42".as_ptr().cast(),
+                3,
+                b"/app".as_ptr().cast(),
+                4,
+                env_pairs.as_ptr().cast(),
+                env_pairs.len(),
+                1,
+                worker_args.as_ptr().cast(),
+                worker_args.len(),
+                2,
+                out.as_mut_ptr().cast(),
+                out.len(),
+            );
+            assert!(argv_len > 0);
+            assert_eq!(
+                &out[..argv_len as usize],
+                b"tmux\0-u\0respawn-pane\0-k\0-t\0%42\0-c\0/app\0-e\0REDIS_HOST=127.0.0.1\0php\0artisan\\;"
+            );
+
+            let tee_len = nntmux_tmux_pane_build_log_tee_suffix(
+                b"/var/log".as_ptr().cast(),
+                8,
+                b"monitor".as_ptr().cast(),
+                7,
+                b"2026_10_24".as_ptr().cast(),
+                10,
+                1,
+                out.as_mut_ptr().cast(),
+                out.len(),
+            );
+            assert_eq!(
+                &out[..tee_len as usize],
+                b"2>&1 | tee -a /var/log/monitor-2026_10_24.log"
+            );
+
+            let seq_len = nntmux_tmux_pane_get_sequential_command(
+                b"/usr/bin/php".as_ptr().cast(),
+                12,
+                b"/app/artisan".as_ptr().cast(),
+                12,
+                2,
+                b"multiprocessing:update-per-group".as_ptr().cast(),
+                32,
+                b"".as_ptr().cast(),
+                0,
+                out.as_mut_ptr().cast(),
+                out.len(),
+            );
+            assert_eq!(
+                &out[..seq_len as usize],
+                b"nice -n2 '/usr/bin/php' '/app/artisan' multiprocessing:update-per-group"
+            );
+
+            assert_eq!(nntmux_tmux_monitor_increment_run_count(9), 10);
+
+            let now_vals = [1000i64, 50, 0];
+            let start_vals = [200i64, 75, 0];
+            let diffs_len = nntmux_tmux_monitor_update_diffs_nul(
+                now_vals.as_ptr(),
+                start_vals.as_ptr(),
+                3,
+                out.as_mut_ptr().cast(),
+                out.len(),
+            );
+            assert_eq!(&out[..diffs_len as usize], b"800\0-25\00");
+
+            let mut total_work = 0i64;
+            let stats_len = nntmux_tmux_monitor_calc_processing_stats(
+                10,
+                25,
+                50,
+                30,
+                20,
+                0,
+                0,
+                0,
+                0,
+                0,
+                9,
+                1,
+                5,
+                10,
+                0,
+                0,
+                &mut total_work,
+                out.as_mut_ptr().cast(),
+                out.len(),
+            );
+            assert_eq!(total_work, 35);
+            assert_eq!(
+                &out[..stats_len as usize],
+                b"50\030\020\000\000\000\000\000\090\050\0"
+            );
+
+            let dur_len = nntmux_redis_format_duration(90_061, out.as_mut_ptr().cast(), out.len());
+            assert_eq!(&out[..dur_len as usize], b"1d 1h 1m 1s");
+
+            assert_eq!(
+                nntmux_tmux_session_build_window_cmd_nul(
+                    std::ptr::null(),
+                    0,
+                    1,
+                    0,
+                    b"$1".as_ptr().cast(),
+                    2,
+                    b"2".as_ptr().cast(),
+                    1,
+                    out.as_mut_ptr().cast(),
+                    out.len(),
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_tmux_pane_build_respawn_argv_nul(
+                    b"tmux".as_ptr().cast(),
+                    4,
+                    1,
+                    0,
+                    b"%1".as_ptr().cast(),
+                    2,
+                    b"/app".as_ptr().cast(),
+                    4,
+                    b"A\0B".as_ptr().cast(),
+                    3,
+                    usize::MAX,
+                    b"sh".as_ptr().cast(),
+                    2,
+                    1,
+                    out.as_mut_ptr().cast(),
+                    out.len(),
+                ),
+                -1
+            );
         }
     }
 }
