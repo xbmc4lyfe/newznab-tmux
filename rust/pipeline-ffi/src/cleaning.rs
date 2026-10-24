@@ -16680,3 +16680,363 @@ pub unsafe extern "C" fn nntmux_w25_account_auth_mail(
     }))
     .unwrap_or(-1)
 }
+
+// Wave 26.1: contact copy, branded subjects and scalar email-job dispatch fields.
+pub mod wave26_email_dispatch_jobs_mail {
+    use super::{w23_frame, wave22_append_frame, wave22_frames};
+
+    pub(super) fn output(operation: u32, input: &[u8]) -> Result<Vec<u8>, isize> {
+        let count = match operation {
+            0 | 1 | 4 => 3,
+            2 => 1,
+            3 => 2,
+            _ => return Err(-1),
+        };
+        let frames = wave22_frames(input)?;
+        if frames.len() != count {
+            return Err(-1);
+        }
+        let mut output = Vec::new();
+        match operation {
+            0 => {
+                let from = w23_frame(&frames, 0)?;
+                let body = w23_frame(&frames, 1)?;
+                let site = w23_frame(&frames, 2)?;
+                let preheader =
+                    [b"New contact form submission from ".as_slice(), from, b"."].concat();
+                for value in [
+                    b"Contact form submitted".as_slice(),
+                    preheader.as_slice(),
+                    body,
+                    from,
+                    site,
+                ] {
+                    wave22_append_frame(&mut output, Some(value))?;
+                }
+            }
+            1 => {
+                let subject = w23_frame(&frames, 0)?;
+                let prefix = w23_frame(&frames, 1)?;
+                let enabled = w23_frame(&frames, 2)?;
+                let subject = match enabled {
+                    b"0" => subject.to_vec(),
+                    b"1" => [prefix, subject].concat(),
+                    _ => return Err(-1),
+                };
+                wave22_append_frame(&mut output, Some(&subject))?;
+            }
+            2 => wave22_append_frame(&mut output, frames[0])?,
+            3 => {
+                let days = w23_frame(&frames, 1)?;
+                let days_text = std::str::from_utf8(days).map_err(|_| -1isize)?;
+                let days_value = days_text.parse::<i64>().map_err(|_| -1isize)?;
+                if days_value.to_string().as_bytes() != days {
+                    return Err(-1);
+                }
+                wave22_append_frame(&mut output, frames[0])?;
+                wave22_append_frame(&mut output, Some(days))?;
+            }
+            4 => {
+                for index in 0..3 {
+                    wave22_append_frame(&mut output, Some(w23_frame(&frames, index)?))?;
+                }
+            }
+            _ => return Err(-1),
+        }
+        Ok(output)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::output;
+        use crate::cleaning::nntmux_w26_email_dispatch_jobs_mail;
+
+        fn wire(values: &[Option<&[u8]>]) -> Vec<u8> {
+            let mut result = Vec::new();
+            for value in values {
+                match value {
+                    Some(bytes) => {
+                        result.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                        result.extend_from_slice(bytes);
+                    }
+                    None => result.extend_from_slice(&[255; 4]),
+                }
+            }
+            result
+        }
+
+        #[test]
+        fn w26_email_dispatch_jobs_mail_literals_bytes_nulls_and_integer_limits() {
+            assert_eq!(
+                output(
+                    0,
+                    &wire(&[Some(b"alice"), Some(b"<body>\0\xff"), Some(b"Site")])
+                )
+                .unwrap(),
+                wire(&[
+                    Some(b"Contact form submitted"),
+                    Some(b"New contact form submission from alice."),
+                    Some(b"<body>\0\xff"),
+                    Some(b"alice"),
+                    Some(b"Site"),
+                ])
+            );
+            for subject in [b"".as_slice(), b"0", b"\xff\0", "é漢字".as_bytes()] {
+                for flag in [b"0".as_slice(), b"1"] {
+                    let expected = if flag == b"1" {
+                        [b"[Site] ".as_slice(), subject].concat()
+                    } else {
+                        subject.to_vec()
+                    };
+                    assert_eq!(
+                        output(1, &wire(&[Some(subject), Some(b"[Site] "), Some(flag)])).unwrap(),
+                        wire(&[Some(&expected)])
+                    );
+                }
+                assert_eq!(
+                    output(0, &wire(&[Some(subject), Some(subject), Some(subject)])).unwrap(),
+                    wire(&[
+                        Some(b"Contact form submitted"),
+                        Some(
+                            &[
+                                b"New contact form submission from ".as_slice(),
+                                subject,
+                                b"."
+                            ]
+                            .concat()
+                        ),
+                        Some(subject),
+                        Some(subject),
+                        Some(subject),
+                    ])
+                );
+                assert_eq!(
+                    output(4, &wire(&[Some(subject), Some(subject), Some(subject)])).unwrap(),
+                    wire(&[Some(subject), Some(subject), Some(subject)])
+                );
+            }
+            for recipient in [None, Some(b"".as_slice()), Some(b"0"), Some(b"\xff\0")] {
+                assert_eq!(output(2, &wire(&[recipient])).unwrap(), wire(&[recipient]));
+                for days in [
+                    b"-9223372036854775808".as_slice(),
+                    b"9223372036854775807",
+                    b"-1",
+                    b"0",
+                    b"1",
+                ] {
+                    assert_eq!(
+                        output(3, &wire(&[recipient, Some(days)])).unwrap(),
+                        wire(&[recipient, Some(days)])
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn w26_email_dispatch_jobs_mail_rejects_invalid_frames_without_writes() {
+            for operation in 0..=4 {
+                let valid = match operation {
+                    1 => wire(&[Some(b"s"), Some(b"p"), Some(b"1")]),
+                    2 => wire(&[None]),
+                    3 => wire(&[None, Some(b"-1")]),
+                    _ => wire(&[Some(b"a"), Some(b"b"), Some(b"c")]),
+                };
+                let mut invalid = vec![
+                    Vec::new(),
+                    vec![1, 0, 0],
+                    vec![2, 0, 0, 0, b'x'],
+                    vec![254, 255, 255, 255],
+                    valid[..valid.len() - 1].to_vec(),
+                    [valid.clone(), wire(&[Some(b"extra")])].concat(),
+                ];
+                if operation == 1 {
+                    for flag in [None, Some(b"".as_slice()), Some(b"true"), Some(b"2")] {
+                        invalid.push(wire(&[Some(b"s"), Some(b"p"), flag]));
+                    }
+                }
+                if operation == 3 {
+                    for days in [
+                        None,
+                        Some(b"".as_slice()),
+                        Some(b"01"),
+                        Some(b"-0"),
+                        Some(b"+1"),
+                        Some(b"1.0"),
+                        Some(b" 1"),
+                        Some(b"9223372036854775808"),
+                        Some(b"-9223372036854775809"),
+                        Some(b"\xff"),
+                    ] {
+                        invalid.push(wire(&[None, days]));
+                    }
+                }
+                let count = if operation == 2 {
+                    1
+                } else if operation == 3 {
+                    2
+                } else {
+                    3
+                };
+                for index in 0..count {
+                    if (operation == 2 || operation == 3) && index == 0 {
+                        continue;
+                    }
+                    let mut fields = vec![Some(b"1".as_slice()); count];
+                    fields[index] = None;
+                    invalid.push(wire(&fields));
+                }
+                for input in invalid {
+                    assert!(output(operation, &input).is_err());
+                    let mut out = [0xabu8; 256];
+                    assert_eq!(
+                        unsafe {
+                            nntmux_w26_email_dispatch_jobs_mail(
+                                operation,
+                                input.as_ptr(),
+                                input.len(),
+                                out.as_mut_ptr(),
+                                out.len(),
+                            )
+                        },
+                        -1
+                    );
+                    assert_eq!(out, [0xab; 256]);
+                }
+            }
+            assert!(output(5, &[]).is_err());
+        }
+
+        #[test]
+        fn w26_email_dispatch_jobs_mail_regions_capacity_unaligned_and_overlap() {
+            for operation in 0..=4 {
+                let input = match operation {
+                    1 => wire(&[Some(b"s"), Some(b"p"), Some(b"1")]),
+                    2 => wire(&[None]),
+                    3 => wire(&[None, Some(b"-1")]),
+                    _ => wire(&[Some(b"a"), Some(b"b"), Some(b"c")]),
+                };
+                let expected = output(operation, &input).unwrap();
+                let mut out = [0xabu8; 256];
+                unsafe {
+                    for capacity in [0, 1, expected.len() - 1] {
+                        assert_eq!(
+                            nntmux_w26_email_dispatch_jobs_mail(
+                                operation,
+                                input.as_ptr(),
+                                input.len(),
+                                out.as_mut_ptr(),
+                                capacity
+                            ),
+                            -(expected.len() as i32)
+                        );
+                        assert_eq!(out, [0xab; 256]);
+                    }
+                    for (source, length, target, capacity) in [
+                        (std::ptr::null(), 0, out.as_mut_ptr(), out.len()),
+                        (input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                        (usize::MAX as *const u8, 1, out.as_mut_ptr(), out.len()),
+                        (input.as_ptr(), input.len(), usize::MAX as *mut u8, 1),
+                        (input.as_ptr(), usize::MAX, out.as_mut_ptr(), out.len()),
+                        (input.as_ptr(), input.len(), out.as_mut_ptr(), usize::MAX),
+                        (
+                            input.as_ptr(),
+                            isize::MAX as usize + 1,
+                            out.as_mut_ptr(),
+                            out.len(),
+                        ),
+                        (
+                            input.as_ptr(),
+                            input.len(),
+                            out.as_mut_ptr(),
+                            isize::MAX as usize + 1,
+                        ),
+                    ] {
+                        assert_eq!(
+                            nntmux_w26_email_dispatch_jobs_mail(
+                                operation, source, length, target, capacity
+                            ),
+                            -1
+                        );
+                        assert_eq!(out, [0xab; 256]);
+                    }
+                    let unaligned = [vec![0xab], input.clone()].concat();
+                    assert_eq!(
+                        nntmux_w26_email_dispatch_jobs_mail(
+                            operation,
+                            unaligned.as_ptr().add(1),
+                            input.len(),
+                            out.as_mut_ptr().add(1),
+                            expected.len()
+                        ),
+                        expected.len() as i32
+                    );
+                    assert_eq!(&out[1..=expected.len()], expected);
+                    assert_eq!(out[0], 0xab);
+                    assert_eq!(out[expected.len() + 1], 0xab);
+                    for (source_offset, target_offset) in [(0, 0), (0, 1), (3, 0)] {
+                        let mut buffer = [0xabu8; 256];
+                        buffer[source_offset..source_offset + input.len()].copy_from_slice(&input);
+                        let before = buffer;
+                        assert_eq!(
+                            nntmux_w26_email_dispatch_jobs_mail(
+                                operation,
+                                buffer.as_ptr().add(source_offset),
+                                input.len(),
+                                buffer.as_mut_ptr().add(target_offset),
+                                expected.len()
+                            ),
+                            expected.len() as i32
+                        );
+                        assert_eq!(
+                            &buffer[target_offset..target_offset + expected.len()],
+                            expected
+                        );
+                        assert_eq!(&buffer[..target_offset], &before[..target_offset]);
+                        assert_eq!(
+                            &buffer[target_offset + expected.len()..],
+                            &before[target_offset + expected.len()..]
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Render contact mail, branded subject and email-job dispatch byte frames.
+/// Returns bytes written, -1 on invalid input/panic, or negated required size.
+/// Errors leave output untouched; input and output may overlap.
+///
+/// # Safety
+/// Both regions must be non-null and allocated for their stated extents, with
+/// lengths fitting isize and no address overflow. Only byte alignment is needed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w26_email_dispatch_jobs_mail(
+    operation: u32,
+    input: *const u8,
+    len: usize,
+    out: *mut u8,
+    out_cap: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, len) || !cleaning_ffi_region_valid(out, out_cap) {
+            return -1;
+        }
+        let output = {
+            let input = unsafe { slice::from_raw_parts(input, len) };
+            match wave26_email_dispatch_jobs_mail::output(operation, input) {
+                Ok(output) => output,
+                Err(_) => return -1,
+            }
+        };
+        let Ok(needed) = i32::try_from(output.len()) else {
+            return -1;
+        };
+        if output.len() > out_cap {
+            return -needed;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(output.as_ptr(), out, output.len()) };
+        needed
+    }))
+    .unwrap_or(-1)
+}
