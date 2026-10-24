@@ -235,19 +235,19 @@ abstract class BaseModel extends DataNode
 
     public static function extractIdentifierNative(mixed $source, string $key = 'id'): ?int
     {
-        if ($source instanceof DataNode) {
-            $source = $source->toArray();
-        }
-        if (\is_object($source) || ($ffi = self::ffi()) === null) {
-            return self::extractIdentifierPhp($source, $key);
-        }
-        $payload = \is_array($source) ? array_intersect_key($source, [$key => true]) : $source;
-        if (\is_array($payload)) {
-            foreach ($payload as $val) {
-                if (\is_object($val) || \is_array($val)) {
-                    return self::extractIdentifierPhp($source, $key);
-                }
+        if ($source instanceof DataNode || \is_array($source)) {
+            $val = $source[$key] ?? null;
+            if (\is_object($val) || \is_array($val)) {
+                return self::extractIdentifierPhp($source, $key);
             }
+            $payload = [$key => $val];
+        } elseif (\is_object($source)) {
+            return self::extractIdentifierPhp($source, $key);
+        } else {
+            $payload = $source;
+        }
+        if (($ffi = self::ffi()) === null) {
+            return self::extractIdentifierPhp($source, $key);
         }
         try {
             $ser = serialize($payload);
@@ -321,9 +321,7 @@ abstract class BaseModel extends DataNode
         }
         $normalized = [];
         foreach ($items as $item) {
-            if ($item instanceof DataNode) {
-                $normalized[] = [$key => $item[$key] ?? null];
-            } elseif (\is_array($item)) {
+            if ($item instanceof DataNode || \is_array($item)) {
                 $val = $item[$key] ?? null;
                 if (\is_object($val) || \is_array($val)) {
                     return self::extractIdentifiersPhp($items, $key);

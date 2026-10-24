@@ -155,6 +155,12 @@ class RustTvIgdbSteamMetadataParityTest extends TestCase
                 'image' => (object) ['original' => 'https://obj.example/orig.jpg'],
                 'tmdb' => 55,
             ]],
+            'leading nul in tmdb string and 19-digit tvdb' => [[
+                'poster' => 'https://example.test/p.jpg',
+                'tmdb' => "\0123",
+                'tvdb' => '9223372036854775807',
+                'tvmaze' => '',
+            ]],
         ];
     }
 
@@ -283,7 +289,25 @@ class RustTvIgdbSteamMetadataParityTest extends TestCase
             }
         }
 
-        $siteIds = [null, false, true, -10, 0, 1, 42, '', '0', '-5', '15', ' 99 ', 'abc', '12.5'];
+        $siteIds = [
+            null,
+            false,
+            true,
+            -10,
+            0,
+            1,
+            42,
+            '',
+            '0',
+            '-5',
+            '15',
+            ' 99 ',
+            'abc',
+            '12.5',
+            '9223372036854775807',
+            '-9223372036854775808',
+            '9223372036854775808',
+        ];
         foreach ($siteIds as $idx => $siteId) {
             $expectedSite = LocalDbPipe::hasValidSiteIdPhp($siteId);
             $this->assertSame($expectedSite, LocalDbPipe::hasValidSiteIdNative($siteId), "siteId {$idx}");
@@ -376,6 +400,9 @@ class RustTvIgdbSteamMetadataParityTest extends TestCase
             ['name' => 'No ID'],
             new Game(['id' => 555, 'name' => 'Doom']),
             new DataNode(['id' => 777]),
+            new DataNode(['id' => '9223372036854775807', 'cb' => static fn (): int => 1]),
+            new DataNode(['id' => new DataNode(['nested' => 1])]),
+            ['id' => '9223372036854775808'],
             (object) ['id' => 888],
         ];
         foreach ($idSources as $idx => $source) {
@@ -385,6 +412,20 @@ class RustTvIgdbSteamMetadataParityTest extends TestCase
                 BaseModel::setUseRustFfi($toggle);
                 $this->assertSame($expectedId, BaseModel::extractIdentifier($source));
             }
+        }
+
+        foreach (['0', '123'] as $intKey) {
+            $intKeySource = [$intKey => 321];
+            $intKeyNode = new DataNode(['name' => 'Test']);
+            $intKeyNode[$intKey] = '654';
+            $this->assertSame(
+                BaseModel::extractIdentifierPhp($intKeySource, $intKey),
+                BaseModel::extractIdentifierNative($intKeySource, $intKey),
+            );
+            $this->assertSame(
+                BaseModel::extractIdentifiersPhp([$intKeySource, $intKeyNode], $intKey),
+                BaseModel::extractIdentifiersNative([$intKeySource, $intKeyNode], $intKey),
+            );
         }
 
         $game = new Game(['id' => 1942, 'name' => 'The Witcher 3']);
@@ -404,6 +445,10 @@ class RustTvIgdbSteamMetadataParityTest extends TestCase
             'stdClass fallback' => [
                 (object) ['id' => 12],
                 ['id' => 34],
+            ],
+            'DataNode with object value and 19-digit IDs' => [
+                new DataNode(['id' => '9223372036854775807', 'extra' => static fn (): int => 1]),
+                new DataNode(['id' => (object) ['nested' => 1]]),
             ],
         ];
         foreach ($idLists as $label => $items) {
@@ -499,6 +544,26 @@ class RustTvIgdbSteamMetadataParityTest extends TestCase
                 'isJunk' => true,
             ]],
             'empty defaults' => [[]],
+            'empty string year and whitespace year' => [[
+                'rawName' => 'Test Book',
+                'title' => 'Test Book',
+                'year' => '',
+            ]],
+            'zero string year' => [[
+                'rawName' => 'Test Book',
+                'title' => 'Test Book',
+                'year' => '0',
+            ]],
+            '19-digit max int year' => [[
+                'rawName' => 'Test Book',
+                'title' => 'Test Book',
+                'year' => '9223372036854775807',
+            ]],
+            'overflow string year fallback' => [[
+                'rawName' => 'Test Book',
+                'title' => 'Test Book',
+                'year' => '9223372036854775808',
+            ]],
             'nul byte fallback' => [[
                 'rawName' => "Raw\0Name",
                 'title' => 'Title',

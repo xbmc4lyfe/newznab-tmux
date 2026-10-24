@@ -17937,13 +17937,53 @@ pub mod tv_igdb_book_metadata {
     }
 
     #[inline]
-    fn parse_simple_int_bytes(bytes: &[u8]) -> Option<i64> {
-        if bytes.is_empty() {
-            return Some(0);
-        }
+    fn parse_simple_int_bytes(bytes: &[u8]) -> Option<Option<i64>> {
         let trimmed = php_trim_bytes(bytes);
         if trimmed.is_empty() {
+            return Some(None);
+        }
+        let (neg, digits) = match trimmed.first()? {
+            b'+' => (false, &trimmed[1..]),
+            b'-' => (true, &trimmed[1..]),
+            _ => (false, trimmed),
+        };
+        if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+            return Some(None);
+        }
+        let mut val: i64 = 0;
+        if neg {
+            for &b in digits {
+                val = val.checked_mul(10)?.checked_sub(i64::from(b - b'0'))?;
+            }
+        } else {
+            for &b in digits {
+                val = val.checked_mul(10)?.checked_add(i64::from(b - b'0'))?;
+            }
+        }
+        Some(Some(val))
+    }
+
+    #[inline]
+    fn is_ascii_space_no_nul(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\x0B' | b'\x0C')
+    }
+
+    #[inline]
+    fn parse_cast_int_bytes(bytes: &[u8]) -> Option<i64> {
+        if bytes.contains(&0) {
             return None;
+        }
+        let mut start = 0;
+        let mut end = bytes.len();
+        while start < end && is_ascii_space_no_nul(bytes[start]) {
+            start += 1;
+        }
+        while end > start && is_ascii_space_no_nul(bytes[end - 1]) {
+            end -= 1;
+        }
+        let trimmed = &bytes[start..end];
+        if trimmed.is_empty() {
+            return Some(0);
         }
         let (neg, digits) = match trimmed.first()? {
             b'+' => (false, &trimmed[1..]),
@@ -17953,22 +17993,41 @@ pub mod tv_igdb_book_metadata {
         if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
             return None;
         }
-        let nz = digits
-            .iter()
-            .position(|&b| b != b'0')
-            .unwrap_or(digits.len());
-        let sig = &digits[nz..];
-        if sig.is_empty() {
+        let mut val: i64 = 0;
+        if neg {
+            for &b in digits {
+                val = val.checked_mul(10)?.checked_sub(i64::from(b - b'0'))?;
+            }
+        } else {
+            for &b in digits {
+                val = val.checked_mul(10)?.checked_add(i64::from(b - b'0'))?;
+            }
+        }
+        Some(val)
+    }
+
+    #[inline]
+    fn canonical_php_int_key(key: &[u8]) -> Option<i64> {
+        if key == b"0" {
             return Some(0);
         }
-        if sig.len() > 18 {
+        let digits = if key.first() == Some(&b'-') {
+            &key[1..]
+        } else {
+            key
+        };
+        if !matches!(digits.first(), Some(b'1'..=b'9')) || !digits.iter().all(u8::is_ascii_digit) {
             return None;
         }
-        let mut val: i64 = 0;
-        for &b in sig {
-            val = val.checked_mul(10)?.checked_add(i64::from(b - b'0'))?;
-        }
-        Some(if neg { -val } else { val })
+        str::from_utf8(key).ok()?.parse::<i64>().ok()
+    }
+
+    #[inline]
+    fn lookup_php_key<'a>(node: &'a PhpNode<'a>, key: &[u8]) -> Option<&'a PhpNode<'a>> {
+        node.get(key).or_else(|| {
+            let int_key = canonical_php_int_key(key)?;
+            node.get_int_key(int_key)
+        })
     }
 
     #[inline]
@@ -17980,7 +18039,7 @@ pub mod tv_igdb_book_metadata {
             PhpVal::Null => Some(0),
             PhpVal::Int(i) => Some(i),
             PhpVal::Bool(b) => Some(i64::from(b)),
-            PhpVal::Str(s) => parse_simple_int_bytes(s),
+            PhpVal::Str(s) => parse_cast_int_bytes(s),
             _ => None,
         }
     }
@@ -18056,8 +18115,11 @@ pub mod tv_igdb_book_metadata {
     ) -> isize {
         guard(|| {
             if out_tmdb.is_null()
+                || !out_tmdb.is_aligned()
                 || out_tvdb.is_null()
+                || !out_tvdb.is_aligned()
                 || out_tvmaze.is_null()
+                || !out_tvmaze.is_aligned()
                 || !valid_out_cap(out_buf, out_cap)
             {
                 return DECLINE;
@@ -18267,8 +18329,9 @@ pub mod tv_igdb_book_metadata {
                     return DECLINE_I32;
                 };
                 match parse_simple_int_bytes(bytes) {
-                    Some(v) => i32::from(v > 0),
-                    None => 0,
+                    Some(Some(v)) => i32::from(v > 0),
+                    Some(None) => 0,
+                    None => DECLINE_I32,
                 }
             }
             _ => DECLINE_I32,
@@ -18399,13 +18462,13 @@ pub mod tv_igdb_book_metadata {
         match &node.val {
             PhpVal::Null | PhpVal::Bool(_) => Some(None),
             PhpVal::Int(i) => Some((*i > 0).then_some(*i)),
-            PhpVal::Str(s) => Some(parse_simple_int_bytes(s).filter(|&v| v > 0)),
-            PhpVal::Arr(_) => match node.get(key) {
+            PhpVal::Str(s) => Some(parse_simple_int_bytes(s)?.filter(|&v| v > 0)),
+            PhpVal::Arr(_) => match lookup_php_key(node, key) {
                 None => Some(None),
                 Some(inner) => match &inner.val {
                     PhpVal::Null | PhpVal::Bool(_) => Some(None),
                     PhpVal::Int(i) => Some((*i > 0).then_some(*i)),
-                    PhpVal::Str(s) => Some(parse_simple_int_bytes(s).filter(|&v| v > 0)),
+                    PhpVal::Str(s) => Some(parse_simple_int_bytes(s)?.filter(|&v| v > 0)),
                     _ => None,
                 },
             },
@@ -18424,7 +18487,7 @@ pub mod tv_igdb_book_metadata {
         out_id: *mut i64,
     ) -> i32 {
         guard_i32(|| {
-            if out_id.is_null() {
+            if out_id.is_null() || !out_id.is_aligned() {
                 return DECLINE_I32;
             }
             let (Some(ser_bytes), Some(key_bytes)) = (
@@ -18490,7 +18553,12 @@ pub mod tv_igdb_book_metadata {
                 return 0;
             }
             let max_elems = (isize::MAX as usize) / size_of::<i64>();
-            if out_ids.is_null() || cap < len || len > max_elems || cap > max_elems {
+            if out_ids.is_null()
+                || !out_ids.is_aligned()
+                || cap < len
+                || len > max_elems
+                || cap > max_elems
+            {
                 return DECLINE;
             }
             let out_slice = unsafe { slice::from_raw_parts_mut(out_ids, len) };
@@ -18548,7 +18616,12 @@ pub mod tv_igdb_book_metadata {
         out_cap: usize,
     ) -> isize {
         guard(|| {
-            if out_year.is_null() || out_flags.is_null() || !valid_out_cap(out_buf, out_cap) {
+            if out_year.is_null()
+                || !out_year.is_aligned()
+                || out_flags.is_null()
+                || !out_flags.is_aligned()
+                || !valid_out_cap(out_buf, out_cap)
+            {
                 return DECLINE;
             }
             let Some(ser_bytes) = (unsafe { input(ser_ptr, ser_len) }) else {
@@ -18588,9 +18661,14 @@ pub mod tv_igdb_book_metadata {
                     val: PhpVal::Str(s),
                     ..
                 }) => match parse_simple_int_bytes(s) {
-                    Some(i) => (4, i),
-                    None => (0, 0),
+                    Some(Some(i)) => (4, i),
+                    Some(None) => (0, 0),
+                    None => return DECLINE,
                 },
+                Some(PhpNode {
+                    val: PhpVal::Bool(_) | PhpVal::Arr(_),
+                    ..
+                }) => (0, 0),
                 _ => return DECLINE,
             };
 
@@ -18673,7 +18751,9 @@ pub mod tv_igdb_book_metadata {
     ) -> isize {
         guard(|| {
             if out_flags.is_null()
+                || !out_flags.is_aligned()
                 || out_completeness.is_null()
+                || !out_completeness.is_aligned()
                 || !valid_out_cap(out_query, query_cap)
             {
                 return DECLINE;
@@ -18930,6 +19010,67 @@ pub mod tv_igdb_book_metadata {
             assert_eq!(&buf[..qlen as usize], b"Robert C. Martin Clean Code");
             assert_eq!(flags, 15);
             assert_eq!(comp, 5);
+
+            // Empty string year must keep has_year == 0 (bit 2 unset), whereas "0" sets has_year.
+            let empty_year_ser = br#"a:2:{s:5:"title";s:4:"Book";s:4:"year";s:0:"";}"#;
+            let (mut out_year, mut out_flags) = (99i64, 0i32);
+            let n_empty = unsafe {
+                nntmux_book_parse_result_from_serialized(
+                    empty_year_ser.as_ptr(),
+                    empty_year_ser.len(),
+                    &mut out_year,
+                    &mut out_flags,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(n_empty >= 4);
+            assert_eq!(out_flags & 4, 0);
+
+            let zero_year_ser = br#"a:2:{s:5:"title";s:4:"Book";s:4:"year";s:1:"0";}"#;
+            let n_zero = unsafe {
+                nntmux_book_parse_result_from_serialized(
+                    zero_year_ser.as_ptr(),
+                    zero_year_ser.len(),
+                    &mut out_year,
+                    &mut out_flags,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(n_zero >= 4);
+            assert_eq!(out_flags & 4, 4);
+            assert_eq!(out_year, 0);
+
+            // 19-digit i64::MAX succeeds, while i64::MAX + 1 declines (-1).
+            assert_eq!(
+                unsafe {
+                    nntmux_tv_local_pipe_has_valid_site_id(2, 0, b"9223372036854775807".as_ptr(), 19)
+                },
+                1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_tv_local_pipe_has_valid_site_id(2, 0, b"9223372036854775808".as_ptr(), 19)
+                },
+                -1
+            );
+
+            // Canonical integer keys ('0', '123') in PHP serialized arrays.
+            let int_key_ser = br#"a:1:{i:0;i:777;}"#;
+            assert_eq!(
+                unsafe {
+                    nntmux_igdb_model_extract_id(
+                        int_key_ser.as_ptr(),
+                        int_key_ser.len(),
+                        b"0".as_ptr(),
+                        1,
+                        &mut out_id,
+                    )
+                },
+                1
+            );
+            assert_eq!(out_id, 777);
         }
     }
 }
