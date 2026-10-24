@@ -14751,3 +14751,570 @@ mod wave21_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod wave22_admin_request_tests {
+    use super::*;
+
+    fn frames(values: &[Option<&[u8]>]) -> Vec<u8> {
+        let mut result = Vec::new();
+        for value in values {
+            match value {
+                Some(value) => {
+                    result.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                    result.extend_from_slice(value);
+                }
+                None => result.extend_from_slice(&u32::MAX.to_le_bytes()),
+            }
+        }
+        result
+    }
+
+    fn assert_output(mode: u32, input: &[u8], expected: &[u8]) {
+        let mut output = vec![0x5a; expected.len() + 8];
+        assert_eq!(
+            unsafe {
+                nntmux_wave22_admin_request(
+                    mode,
+                    input.as_ptr(),
+                    input.len(),
+                    output.as_mut_ptr(),
+                    expected.len(),
+                )
+            },
+            expected.len() as isize,
+            "mode {mode}, input {input:?}"
+        );
+        assert_eq!(&output[..expected.len()], expected);
+        assert_eq!(&output[expected.len()..], &[0x5a; 8]);
+    }
+
+    fn assert_declined(mode: u32, input: &[u8]) {
+        let mut output = [0x5a; 128];
+        assert_eq!(
+            unsafe {
+                nntmux_wave22_admin_request(
+                    mode,
+                    input.as_ptr(),
+                    input.len(),
+                    output.as_mut_ptr(),
+                    output.len(),
+                )
+            },
+            -1,
+            "mode {mode}, input {input:?}"
+        );
+        assert_eq!(output, [0x5a; 128]);
+    }
+
+    #[test]
+    fn filter_frames_trim_php_bytes_and_encode_empty_as_null() {
+        assert_output(
+            0,
+            &frames(&[Some(b" \t\n\r\0\x0b"), Some(b" \xff\0x\t"), Some(b"\x0c")]),
+            &frames(&[None, Some(b"\xff\0x"), Some(b"\x0c")]),
+        );
+        assert_output(0, b"", b"");
+    }
+
+    #[test]
+    fn raw_names_search_and_actions_preserve_arbitrary_bytes() {
+        for mode in [1, 4, 7] {
+            for input in [b"".as_slice(), b" \xff\0\x0b\x0c\tname "] {
+                assert_output(mode, input, input);
+            }
+        }
+    }
+
+    #[test]
+    fn group_keys_remove_only_excluded_names_and_absent_values_in_order() {
+        assert_output(
+            2,
+            &frames(&[
+                Some(b"groupname"),
+                Some(b"x"),
+                Some(b"page"),
+                Some(b"1"),
+                Some(b"null"),
+                None,
+                Some(b"empty"),
+                Some(b""),
+                Some(b"zero"),
+                Some(b"0"),
+                Some(b"space"),
+                Some(b" "),
+                Some(b"Page"),
+                Some(b"1"),
+                Some(b"\xff\0"),
+                Some(b"x"),
+                Some(b"zero"),
+                Some(b"2"),
+                Some(b""),
+                Some(b"x"),
+            ]),
+            &frames(&[
+                Some(b"zero"),
+                Some(b"space"),
+                Some(b"Page"),
+                Some(b"\xff\0"),
+                Some(b"zero"),
+                Some(b""),
+            ]),
+        );
+        assert_output(2, b"", b"");
+        assert_declined(2, &frames(&[None, Some(b"x")]));
+        assert_declined(2, &frames(&[Some(b"key")]));
+    }
+
+    #[test]
+    fn release_name_trims_php_bytes_but_not_form_feed() {
+        assert_output(3, b" \t\n\r\0\x0b\xff\0x\x0b\0\r\n\t ", b"\xff\0x");
+        assert_output(3, b" \t\n\r\0\x0b", b"");
+        assert_output(3, b" \x0c ", b"\x0c");
+    }
+
+    #[test]
+    fn category_requires_canonical_i64_and_maps_minus_one_to_empty() {
+        for input in [
+            b"0".as_slice(),
+            b"1",
+            b"-2",
+            b"9223372036854775807",
+            b"-9223372036854775808",
+        ] {
+            assert_output(5, input, input);
+        }
+        assert_output(5, b"-1", b"");
+        for input in [
+            b"".as_slice(),
+            b"+1",
+            b"01",
+            b"00",
+            b"-0",
+            b"-01",
+            b" 1",
+            b"1 ",
+            b"1.0",
+            b"1e0",
+            b"1\0",
+            b"\xff",
+            b"9223372036854775808",
+            b"-9223372036854775809",
+        ] {
+            assert_declined(5, input);
+            assert_declined(6, &frames(&[Some(input)]));
+        }
+    }
+
+    #[test]
+    fn id_frames_deduplicate_integer_values_preserving_first_occurrence() {
+        assert_output(
+            6,
+            &frames(&[
+                Some(b"2"),
+                Some(b"-1"),
+                Some(b"2"),
+                Some(b"0"),
+                Some(b"-1"),
+                Some(b"9223372036854775807"),
+                Some(b"-9223372036854775808"),
+                Some(b"0"),
+            ]),
+            &frames(&[
+                Some(b"2"),
+                Some(b"-1"),
+                Some(b"0"),
+                Some(b"9223372036854775807"),
+                Some(b"-9223372036854775808"),
+            ]),
+        );
+        assert_output(6, b"", b"");
+    }
+
+    #[test]
+    fn status_defaults_only_the_empty_string() {
+        assert_output(8, b"", b"pending");
+        for input in [b"0".as_slice(), b" ", b"\xff\0", b"resolved"] {
+            assert_output(8, input, input);
+        }
+    }
+
+    #[test]
+    fn seven_user_filters_trim_without_null_encoding() {
+        assert_output(
+            9,
+            &frames(&[
+                Some(b" a "),
+                Some(b"\0"),
+                Some(b""),
+                Some(b" \xff\t"),
+                Some(b"\x0c"),
+                Some(b"\x0b0\n"),
+                Some(b"x\0y"),
+            ]),
+            &frames(&[
+                Some(b"a"),
+                Some(b""),
+                Some(b""),
+                Some(b"\xff"),
+                Some(b"\x0c"),
+                Some(b"0"),
+                Some(b"x\0y"),
+            ]),
+        );
+        assert_declined(
+            9,
+            &frames(&[
+                Some(b""),
+                Some(b""),
+                Some(b""),
+                None,
+                Some(b""),
+                Some(b""),
+                Some(b""),
+            ]),
+        );
+        for count in [0, 1, 6, 8] {
+            assert_declined(9, &frames(&vec![Some(b"".as_slice()); count]));
+        }
+    }
+
+    #[test]
+    fn order_by_trims_only_candidate_and_requires_exact_allowed_match() {
+        assert_output(
+            10,
+            &frames(&[Some(b" \xff\0x\t"), Some(b"x"), Some(b"\xff\0x")]),
+            b"\xff\0x",
+        );
+        assert_output(10, &frames(&[Some(b" name "), Some(b" name ")]), b"");
+        assert_output(10, &frames(&[Some(b"Name"), Some(b"name")]), b"");
+        assert_output(10, &frames(&[Some(b"name")]), b"");
+        assert_output(10, &frames(&[Some(b" \x0c "), Some(b"\x0c")]), b"\x0c");
+        assert_declined(10, b"");
+    }
+
+    #[test]
+    fn framed_modes_reject_nulls_truncation_and_oversize_lengths() {
+        for mode in [0, 2, 6, 9, 10] {
+            for input in [
+                b"\0".as_slice(),
+                b"\0\0\0",
+                b"\x01\0\0\0",
+                b"\xfe\xff\xff\xffx",
+            ] {
+                assert_declined(mode, input);
+            }
+        }
+        for mode in [0, 6, 9, 10] {
+            assert_declined(mode, &frames(&[None]));
+            assert_declined(mode, &frames(&[Some(b"1"), None]));
+        }
+        assert_declined(11, b"");
+        assert_declined(u32::MAX, b"");
+    }
+
+    #[test]
+    fn invalid_pointer_regions_decline_before_any_access() {
+        let mut output = [0x5a; 8];
+        let too_long = isize::MAX as usize + 1;
+        for mode in 0..=10 {
+            unsafe {
+                assert_eq!(
+                    nntmux_wave22_admin_request(mode, std::ptr::null(), 0, output.as_mut_ptr(), 8),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_wave22_admin_request(mode, b"".as_ptr(), 0, std::ptr::null_mut(), 0),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_wave22_admin_request(
+                        mode,
+                        b"".as_ptr(),
+                        too_long,
+                        output.as_mut_ptr(),
+                        8
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_wave22_admin_request(
+                        mode,
+                        b"".as_ptr(),
+                        0,
+                        output.as_mut_ptr(),
+                        too_long
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_wave22_admin_request(
+                        mode,
+                        usize::MAX as *const u8,
+                        1,
+                        output.as_mut_ptr(),
+                        8
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_wave22_admin_request(mode, b"".as_ptr(), 0, usize::MAX as *mut u8, 1),
+                    -1
+                );
+            }
+        }
+        assert_eq!(output, [0x5a; 8]);
+    }
+
+    #[test]
+    fn insufficient_capacity_never_writes_partial_output() {
+        for (mode, input) in [
+            (0, frames(&[Some(b"x")])),
+            (1, b"x".to_vec()),
+            (2, frames(&[Some(b"k"), Some(b"v")])),
+            (3, b" x ".to_vec()),
+            (4, b"x".to_vec()),
+            (5, b"1".to_vec()),
+            (6, frames(&[Some(b"1")])),
+            (7, b"x".to_vec()),
+            (8, b"".to_vec()),
+            (9, frames(&[Some(b"".as_slice()); 7])),
+            (10, frames(&[Some(b"x"), Some(b"x")])),
+        ] {
+            let mut output = [0x5a; 64];
+            assert_eq!(
+                unsafe {
+                    nntmux_wave22_admin_request(
+                        mode,
+                        input.as_ptr(),
+                        input.len(),
+                        output.as_mut_ptr(),
+                        0,
+                    )
+                },
+                -2
+            );
+            assert_eq!(output, [0x5a; 64]);
+        }
+    }
+
+    #[test]
+    fn owned_output_supports_exact_and_partial_aliasing() {
+        for (mode, input, expected) in [
+            (
+                0,
+                frames(&[Some(b" x "), Some(b" ")]),
+                frames(&[Some(b"x"), None]),
+            ),
+            (1, b"\xff\0x".to_vec(), b"\xff\0x".to_vec()),
+            (2, frames(&[Some(b"k"), Some(b"v")]), frames(&[Some(b"k")])),
+            (3, b" x ".to_vec(), b"x".to_vec()),
+            (4, b"\xff\0".to_vec(), b"\xff\0".to_vec()),
+            (5, b"-2".to_vec(), b"-2".to_vec()),
+            (6, frames(&[Some(b"2"), Some(b"2")]), frames(&[Some(b"2")])),
+            (7, b"\xff\0".to_vec(), b"\xff\0".to_vec()),
+            (8, b"".to_vec(), b"pending".to_vec()),
+            (
+                9,
+                frames(&[Some(b" x ".as_slice()); 7]),
+                frames(&[Some(b"x".as_slice()); 7]),
+            ),
+            (10, frames(&[Some(b" x "), Some(b"x")]), b"x".to_vec()),
+        ] {
+            for (input_start, output_start) in [(1, 1), (1, 2), (2, 1)] {
+                let mut buffer = vec![0x5a; input.len().max(expected.len()) + 4];
+                buffer[input_start..input_start + input.len()].copy_from_slice(&input);
+                let base = buffer.as_mut_ptr();
+                assert_eq!(
+                    unsafe {
+                        nntmux_wave22_admin_request(
+                            mode,
+                            base.add(input_start),
+                            input.len(),
+                            base.add(output_start),
+                            expected.len(),
+                        )
+                    },
+                    expected.len() as isize
+                );
+                assert_eq!(
+                    &buffer[output_start..output_start + expected.len()],
+                    expected
+                );
+            }
+        }
+    }
+}
+
+// Wave 22.1: binary-safe admin request normalization over one framed byte ABI.
+fn wave22_php_trim(input: &[u8]) -> &[u8] {
+    fn is_trim(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b)
+    }
+    let start = input
+        .iter()
+        .position(|byte| !is_trim(*byte))
+        .unwrap_or(input.len());
+    let end = input
+        .iter()
+        .rposition(|byte| !is_trim(*byte))
+        .map_or(start, |index| index + 1);
+    &input[start..end]
+}
+
+fn wave22_frames(mut input: &[u8]) -> Result<Vec<Option<&[u8]>>, isize> {
+    let mut frames = Vec::new();
+    while !input.is_empty() {
+        let header = input.get(..4).ok_or(-1isize)?;
+        let len = u32::from_le_bytes(header.try_into().map_err(|_| -1isize)?);
+        input = &input[4..];
+        if len == u32::MAX {
+            frames.push(None);
+        } else {
+            let len = usize::try_from(len).map_err(|_| -1isize)?;
+            let value = input.get(..len).ok_or(-1isize)?;
+            frames.push(Some(value));
+            input = &input[len..];
+        }
+    }
+    Ok(frames)
+}
+
+fn wave22_append_frame(output: &mut Vec<u8>, value: Option<&[u8]>) -> Result<(), isize> {
+    match value {
+        None => output.extend_from_slice(&u32::MAX.to_le_bytes()),
+        Some(value) => {
+            let len = u32::try_from(value.len()).map_err(|_| -1isize)?;
+            if len == u32::MAX {
+                return Err(-1);
+            }
+            output.extend_from_slice(&len.to_le_bytes());
+            output.extend_from_slice(value);
+        }
+    }
+    Ok(())
+}
+
+fn wave22_canonical_i64(input: &[u8]) -> Result<i64, isize> {
+    let text = std::str::from_utf8(input).map_err(|_| -1isize)?;
+    let value = text.parse::<i64>().map_err(|_| -1isize)?;
+    if value.to_string() != text {
+        return Err(-1);
+    }
+    Ok(value)
+}
+
+fn wave22_admin_request_output(mode: u32, input: &[u8]) -> Result<Vec<u8>, isize> {
+    let mut output = Vec::new();
+    match mode {
+        0 => {
+            for value in wave22_frames(input)? {
+                let value = wave22_php_trim(value.ok_or(-1isize)?);
+                wave22_append_frame(
+                    &mut output,
+                    if value.is_empty() { None } else { Some(value) },
+                )?;
+            }
+        }
+        1 | 4 | 7 => output.extend_from_slice(input),
+        2 => {
+            let frames = wave22_frames(input)?;
+            let mut pairs = frames.chunks_exact(2);
+            for pair in &mut pairs {
+                let key = pair[0].ok_or(-1isize)?;
+                if key == b"groupname" || key == b"page" {
+                    continue;
+                }
+                if pair[1].is_some_and(|value| !value.is_empty()) {
+                    wave22_append_frame(&mut output, Some(key))?;
+                }
+            }
+            if !pairs.remainder().is_empty() {
+                return Err(-1);
+            }
+        }
+        3 => output.extend_from_slice(wave22_php_trim(input)),
+        5 => {
+            if wave22_canonical_i64(input)? != -1 {
+                output.extend_from_slice(input);
+            }
+        }
+        6 => {
+            let mut seen = std::collections::HashSet::new();
+            for value in wave22_frames(input)? {
+                let value = value.ok_or(-1isize)?;
+                if seen.insert(wave22_canonical_i64(value)?) {
+                    wave22_append_frame(&mut output, Some(value))?;
+                }
+            }
+        }
+        8 => output.extend_from_slice(if input.is_empty() { b"pending" } else { input }),
+        9 => {
+            let frames = wave22_frames(input)?;
+            if frames.len() != 7 {
+                return Err(-1);
+            }
+            for value in frames {
+                wave22_append_frame(&mut output, Some(wave22_php_trim(value.ok_or(-1isize)?)))?;
+            }
+        }
+        10 => {
+            let frames = wave22_frames(input)?;
+            let (order_by, allowed) = frames.split_first().ok_or(-1isize)?;
+            let order_by = wave22_php_trim(order_by.ok_or(-1isize)?);
+            let mut matched = false;
+            for value in allowed {
+                if value.ok_or(-1isize)? == order_by {
+                    matched = true;
+                }
+            }
+            if matched {
+                output.extend_from_slice(order_by);
+            }
+        }
+        _ => return Err(-1),
+    }
+    Ok(output)
+}
+
+/// Normalizes binary admin request values according to modes 0 through 10.
+/// Framed modes use little-endian u32 byte lengths; u32::MAX denotes null.
+/// Returns bytes written, -1 for malformed input/regions, or -2 for short output.
+/// Errors leave the output unchanged.
+///
+/// # Safety
+/// Both pointers must be non-null and valid for their stated byte extents, even
+/// when empty. Extents must fit isize. Input and output may overlap.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_wave22_admin_request(
+    mode: u32,
+    input: *const u8,
+    len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, len) || !cleaning_ffi_region_valid(out, cap) {
+            return -1;
+        }
+        let output = {
+            let input = unsafe { slice::from_raw_parts(input, len) };
+            match wave22_admin_request_output(mode, input) {
+                Ok(output) => output,
+                Err(code) => return code,
+            }
+        };
+        if output.len() > isize::MAX as usize {
+            return -1;
+        }
+        if output.len() > cap {
+            return -2;
+        }
+        // No borrowed input survives construction of the owned result.
+        if !output.is_empty() {
+            unsafe { std::ptr::copy_nonoverlapping(output.as_ptr(), out, output.len()) };
+        }
+        output.len() as isize
+    }))
+    .unwrap_or(-1)
+}
