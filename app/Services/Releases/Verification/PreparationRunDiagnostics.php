@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Verification;
 
+use App\Support\RustPipelineLibrary;
+use FFI;
+
 /**
  * Bounded per-run counters; never retain candidate metadata or exception text.
  *
@@ -12,6 +15,19 @@ namespace App\Services\Releases\Verification;
  */
 final class PreparationRunDiagnostics
 {
+    private const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_verification_diagnostic_phase(const char *, size_t, double, uint8_t, char *, size_t);
+        int32_t nntmux_verification_diagnostic_size(uint8_t, int64_t);
+        int32_t nntmux_verification_diagnostic_projection(int64_t, int64_t, int64_t, int64_t, int64_t, uint8_t, uint8_t);
+        C;
+
+    private static bool $useRustFfi = false;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
     /** @var array<string, float> */
     private const array LATENCY_BOUNDS = ['le_0_1' => 0.1, 'le_1' => 1.0, 'le_10' => 10.0,
         'le_100' => 100.0, 'le_1000' => 1000.0, 'le_10000' => 10000.0];
@@ -80,6 +96,57 @@ final class PreparationRunDiagnostics
     /** @param ReadPhase $phase */
     public function recordPhase(string $phase, float $milliseconds, bool $failed): void
     {
+        if (self::$useRustFfi && $this->recordPhaseNative($phase, $milliseconds, $failed)) {
+            return;
+        }
+        $this->recordPhasePhp($phase, $milliseconds, $failed);
+    }
+
+    /** @param ReadPhase $phase */
+    public function recordPhaseNative(string $phase, float $milliseconds, bool $failed): bool
+    {
+        if (! isset($this->phaseDistributions[$phase])) {
+            return true;
+        }
+        if (! self::$useRustFfi || ($ffi = RustPipelineLibrary::resolveDomain('nfo', self::FFI_CDEF)) === null) {
+            return false;
+        }
+        $distribution = $this->phaseDistributions[$phase];
+        $counts = [$distribution['count'], $distribution['failures'], ...array_values($distribution['latency_buckets'])];
+        foreach ($counts as $count) {
+            // PHP promotes overflowing counters to float; leave those cases in PHP.
+            if (! is_int($count)) {
+                return false;
+            }
+        }
+        $input = pack('q2d2q7', $counts[0], $counts[1], $distribution['total_ms'], $distribution['max_ms'], ...array_slice($counts, 2));
+        $capacity = 0;
+        $buffer = RustPipelineLibrary::obtainScratch($ffi, 88, $capacity);
+        if ($buffer === null) {
+            return false;
+        }
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_verification_diagnostic_phase($input, strlen($input), $milliseconds, (int) $failed, $buffer, $capacity);
+        if ($written !== 88) {
+            return false;
+        }
+        $row = unpack('qcount/qfailures/dtotal_ms/dmax_ms/q7buckets', FFI::string($buffer, 88));
+        if ($row === false) {
+            return false;
+        }
+        $buckets = [];
+        foreach (array_keys($distribution['latency_buckets']) as $index => $bucket) {
+            $buckets[$bucket] = $row['buckets'.($index + 1)];
+        }
+        $this->phaseDistributions[$phase] = ['count' => $row['count'], 'failures' => $row['failures'],
+            'total_ms' => $row['total_ms'], 'max_ms' => $row['max_ms'], 'latency_buckets' => $buckets];
+
+        return true;
+    }
+
+    /** @param ReadPhase $phase */
+    public function recordPhasePhp(string $phase, float $milliseconds, bool $failed): void
+    {
         if (! isset($this->phaseDistributions[$phase])) {
             return;
         }
@@ -100,6 +167,35 @@ final class PreparationRunDiagnostics
 
     /** @param 'compressed_bytes'|'json_bytes'|'files' $kind */
     public function recordSize(string $kind, int $size): void
+    {
+        if (self::$useRustFfi && $this->recordSizeNative($kind, $size)) {
+            return;
+        }
+        $this->recordSizePhp($kind, $size);
+    }
+
+    /** @param 'compressed_bytes'|'json_bytes'|'files' $kind */
+    public function recordSizeNative(string $kind, int $size): bool
+    {
+        if (! isset($this->manifestSizes[$kind])) {
+            return true;
+        }
+        if (! self::$useRustFfi || ($ffi = RustPipelineLibrary::resolveDomain('nfo', self::FFI_CDEF)) === null) {
+            return false;
+        }
+        // @phpstan-ignore method.notFound
+        $index = $ffi->nntmux_verification_diagnostic_size((int) ($kind === 'files'), $size);
+        $keys = array_keys($this->manifestSizes[$kind]);
+        if (! isset($keys[$index])) {
+            return false;
+        }
+        $this->manifestSizes[$kind][$keys[$index]]++;
+
+        return true;
+    }
+
+    /** @param 'compressed_bytes'|'json_bytes'|'files' $kind */
+    public function recordSizePhp(string $kind, int $size): void
     {
         if (! isset($this->manifestSizes[$kind])) {
             return;
@@ -166,9 +262,41 @@ final class PreparationRunDiagnostics
     public function report(int $limit, int $seconds, int $inspected, int $deadline, bool $exhausted, bool $error): array
     {
         $finished = hrtime(true);
+
+        return (self::$useRustFfi ? $this->reportAtNative($limit, $seconds, $inspected, $deadline, $exhausted, $error, $finished) : null)
+            ?? $this->reportAtPhp($limit, $seconds, $inspected, $deadline, $exhausted, $error, $finished);
+    }
+
+    /** Explicit clock input keeps differential tests and paired benchmarks deterministic.
+     * @return array<string, mixed>|null
+     */
+    public function reportAtNative(int $limit, int $seconds, int $inspected, int $deadline, bool $exhausted, bool $error, int $finished): ?array
+    {
+        if (! self::$useRustFfi || ($ffi = RustPipelineLibrary::resolveDomain('nfo', self::FFI_CDEF)) === null) {
+            return null;
+        }
+        // @phpstan-ignore method.notFound
+        $flags = $ffi->nntmux_verification_diagnostic_projection($limit, $inspected, $finished, $deadline, $this->uninspectedSelected, (int) $exhausted, (int) $error);
+        if ($flags < 0 || $flags > 15) {
+            return null;
+        }
+
+        return $this->projectReport($limit, $seconds, $inspected, $finished, (bool) ($flags & 1), (bool) ($flags & 2), (bool) ($flags & 4), (bool) ($flags & 8));
+    }
+
+    /** @return array<string, mixed> */
+    public function reportAtPhp(int $limit, int $seconds, int $inspected, int $deadline, bool $exhausted, bool $error, int $finished): array
+    {
         $limitReached = $inspected >= $limit;
         $deadlineReached = $finished >= $deadline;
         $queuesExhausted = $exhausted && $this->uninspectedSelected === 0;
+
+        return $this->projectReport($limit, $seconds, $inspected, $finished, $limitReached, $deadlineReached, $queuesExhausted, $error);
+    }
+
+    /** @return array<string, mixed> */
+    private function projectReport(int $limit, int $seconds, int $inspected, int $finished, bool $limitReached, bool $deadlineReached, bool $queuesExhausted, bool $error): array
+    {
         $stopReason = match (true) {
             $error => 'error',
             $limitReached && $deadlineReached => 'limit_and_deadline',

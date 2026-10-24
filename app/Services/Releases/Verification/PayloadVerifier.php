@@ -5,13 +5,29 @@ declare(strict_types=1);
 namespace App\Services\Releases\Verification;
 
 use App\Services\YencService;
+use App\Support\RustPipelineLibrary;
 use dariusiii\rarinfo\Par2Info;
+use FFI;
 use RuntimeException;
 use Symfony\Component\Process\Process;
 use Throwable;
 
 final class PayloadVerifier
 {
+    private const string FFI_CDEF = <<<'C'
+        int nntmux_payload_article_identity(int64_t part, int64_t number, int64_t total, int64_t observed, uint8_t inferred, uint8_t has_article_total, int64_t article_total, uint8_t has_body_total, int64_t body_total, uint8_t identity_matches);
+        ssize_t nntmux_payload_subject_name(const char *input, size_t length, char *out, size_t capacity);
+        int nntmux_payload_par2_filename(const char *input, size_t length);
+        C;
+
+    // Single-call candidates remain opt-in until paired mean and p99 gates pass.
+    private static bool $useRustFfi = false;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
     private int $initialScratchBytes = 0;
 
     private int $materializedCacheBytes = 0;
@@ -41,27 +57,117 @@ final class PayloadVerifier
     private function validateArticleIdentity(VerifiedArticle $article, int $number, int $totalParts, int $observedParts,
         bool $inferredParts, ?int $bodyTotalParts, ?VerifiedArticle $identity): void
     {
+        $reason = self::$useRustFfi
+            ? self::articleIdentityRejectionNative($article, $number, $totalParts, $observedParts, $inferredParts, $bodyTotalParts, $identity)
+            : self::articleIdentityRejectionPhp($article, $number, $totalParts, $observedParts, $inferredParts, $bodyTotalParts, $identity);
+        if ($reason !== null) {
+            throw new RuntimeException($reason);
+        }
+    }
+
+    public static function articleIdentityRejectionPhp(VerifiedArticle $article, int $number, int $totalParts, int $observedParts,
+        bool $inferredParts, ?int $bodyTotalParts, ?VerifiedArticle $identity): ?string
+    {
         if ($article->part !== $number) {
-            throw new RuntimeException('Article part number differs from the manifest.');
+            return 'Article part number differs from the manifest.';
         }
         if ($article->totalParts !== null) {
             if ($bodyTotalParts !== null && $article->totalParts !== $bodyTotalParts) {
-                throw new RuntimeException('Conflicting article part totals.');
+                return 'Conflicting article part totals.';
             }
             if (! $inferredParts && $article->totalParts !== $totalParts) {
-                throw new RuntimeException('Article part total differs from declared manifest inventory.');
+                return 'Article part total differs from declared manifest inventory.';
             }
             if ($inferredParts && $article->totalParts < $observedParts) {
-                throw new RuntimeException('Article part total contradicts observed segment inventory.');
+                return 'Article part total contradicts observed segment inventory.';
             }
             $totalParts = $article->totalParts;
         }
         if ($article->part > $totalParts) {
-            throw new RuntimeException('Article part number exceeds manifest inventory.');
+            return 'Article part number exceeds manifest inventory.';
         }
         if ($identity !== null && [$article->name, $article->size] !== [$identity->name, $identity->size]) {
-            throw new RuntimeException('Conflicting file identities.');
+            return 'Conflicting file identities.';
         }
+
+        return null;
+    }
+
+    public static function articleIdentityRejectionNative(VerifiedArticle $article, int $number, int $totalParts, int $observedParts,
+        bool $inferredParts, ?int $bodyTotalParts, ?VerifiedArticle $identity): ?string
+    {
+        $ffi = RustPipelineLibrary::resolveDomain('nfo', self::FFI_CDEF);
+        if ($ffi === null) {
+            return self::articleIdentityRejectionPhp($article, $number, $totalParts, $observedParts, $inferredParts, $bodyTotalParts, $identity);
+        }
+        // @phpstan-ignore method.notFound
+        $status = $ffi->nntmux_payload_article_identity($article->part, $number, $totalParts, $observedParts, (int) $inferredParts,
+            (int) ($article->totalParts !== null), $article->totalParts ?? 0, (int) ($bodyTotalParts !== null), $bodyTotalParts ?? 0,
+            (int) ($identity === null || [$article->name, $article->size] === [$identity->name, $identity->size]));
+
+        return match ($status) {
+            0 => null,
+            1 => 'Article part number differs from the manifest.',
+            2 => 'Conflicting article part totals.',
+            3 => 'Article part total differs from declared manifest inventory.',
+            4 => 'Article part total contradicts observed segment inventory.',
+            5 => 'Article part number exceeds manifest inventory.',
+            6 => 'Conflicting file identities.',
+            default => self::articleIdentityRejectionPhp($article, $number, $totalParts, $observedParts, $inferredParts, $bodyTotalParts, $identity),
+        };
+    }
+
+    public static function requiredNamePhp(string $subject): ?string
+    {
+        $name = preg_match('/"([^"\r\n]+)"/', $subject, $match) ? $match[1] : $subject;
+        if ($name === '' || basename($name) !== $name || str_contains($name, '\\') || $name[0] === '.'
+            || $name[0] === '-' || preg_match('/[\x00-\x1f\x7f]/', $name)
+            || preg_match('/[\[\]]|yEnc/i', $name)) {
+            return null;
+        }
+
+        return $name;
+    }
+
+    public static function requiredNameNative(string $subject): ?string
+    {
+        $ffi = RustPipelineLibrary::resolveDomain('nfo', self::FFI_CDEF);
+        if ($ffi === null) {
+            return self::requiredNamePhp($subject);
+        }
+        $capacity = 0;
+        $out = RustPipelineLibrary::obtainScratch($ffi, max(1, strlen($subject)), $capacity);
+        if ($out === null) {
+            return self::requiredNamePhp($subject);
+        }
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_payload_subject_name($subject, strlen($subject), $out, $capacity);
+        if (! is_int($written) || $written < 0) {
+            return self::requiredNamePhp($subject);
+        }
+
+        return $written === 0 ? null : FFI::string($out, $written);
+    }
+
+    public static function validPar2FilenamePhp(string $filename): bool
+    {
+        return $filename !== '' && strlen($filename) <= 200 && mb_check_encoding($filename, 'UTF-8')
+            && ! preg_match('/[\x00-\x1f\x7f]/', $filename) && basename($filename) === $filename
+            && ! str_contains($filename, '\\') && $filename[0] !== '.' && $filename[0] !== '-';
+    }
+
+    public static function validPar2FilenameNative(string $filename): bool
+    {
+        $ffi = RustPipelineLibrary::resolveDomain('nfo', self::FFI_CDEF);
+        if ($ffi !== null) {
+            // @phpstan-ignore method.notFound
+            $valid = $ffi->nntmux_payload_par2_filename($filename, strlen($filename));
+            if ($valid === 0 || $valid === 1) {
+                return $valid === 1;
+            }
+        }
+
+        return self::validPar2FilenamePhp($filename);
     }
 
     /** @param array<string, mixed> $manifest */
@@ -262,10 +368,8 @@ final class PayloadVerifier
                 $requiredNames[] = $identity->name;
             } else {
                 $subject = (string) $file['subject'];
-                $name = preg_match('/"([^"\r\n]+)"/', $subject, $match) ? $match[1] : $subject;
-                if ($name === '' || basename($name) !== $name || str_contains($name, '\\') || $name[0] === '.'
-                    || $name[0] === '-' || preg_match('/[\x00-\x1f\x7f]/', $name)
-                    || preg_match('/[\[\]]|yEnc/i', $name)) {
+                $name = self::$useRustFfi ? self::requiredNameNative($subject) : self::requiredNamePhp($subject);
+                if ($name === null) {
                     return new VerificationResult('unknown', 'Required missing file identity is ambiguous.');
                 }
                 $requiredNames[] = $name;
@@ -297,8 +401,7 @@ final class PayloadVerifier
             }
             foreach ($descriptors as $descriptor) {
                 $filename = (string) ($descriptor['name'] ?? '');
-                if ($filename === '' || strlen($filename) > 200 || ! mb_check_encoding($filename, 'UTF-8') || preg_match('/[\x00-\x1f\x7f]/', $filename) || basename($filename) !== $filename || str_contains($filename, '\\')
-                    || $filename[0] === '.' || $filename[0] === '-') {
+                if (! (self::$useRustFfi ? self::validPar2FilenameNative($filename) : self::validPar2FilenamePhp($filename))) {
                     throw new RuntimeException('Unsafe PAR2 filename.');
                 }
                 $normalizedName = mb_strtolower(\Normalizer::normalize($filename) ?: $filename);
