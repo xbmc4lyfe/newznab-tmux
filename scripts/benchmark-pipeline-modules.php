@@ -62,7 +62,7 @@ function discoverPhpCdefsAndCallers(string $root): array
     }
     sort($phpFiles);
 
-    $cdefPattern = '/((?:const\s+char\s*\*|intptr_t|uintptr_t|ssize_t|size_t|int32_t|int64_t|uint32_t|uint64_t|uint16_t|uint8_t|double|float|bool|void)\s*(nntmux_[a-z0-9_]+|rapidyenc_[a-z0-9_]+)\s*\(([^;]*)\);)/';
+    $cdefPattern = '/((?:const\s+char\s*\*|intptr_t|uintptr_t|ssize_t|size_t|int32_t|int64_t|int16_t|int8_t|uint32_t|uint64_t|uint16_t|uint8_t|unsigned\s+int|unsigned\s+long|long|int|double|float|bool|void)\s*(nntmux_[a-z0-9_]+|rapidyenc_[a-z0-9_]+)\s*\(([^;]*)\);)/';
 
     foreach ($phpFiles as $filePath) {
         $text = (string) file_get_contents($filePath);
@@ -446,7 +446,7 @@ function buildPipelineSymbolPaths(
             }
         }
 
-        $rustClosure = $ffi !== null
+        $rustClosure = ($ffi !== null && $meta['full'] !== '')
             ? static fn () => $ffi->$sym(...$ffiArgs)
             : static fn (): int => crc32($inputStr);
 
