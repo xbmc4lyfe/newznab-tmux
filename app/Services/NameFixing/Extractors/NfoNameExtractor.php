@@ -26,6 +26,53 @@ class NfoNameExtractor
         ssize_t nntmux_file_extract_candidate(const char *filename, size_t filename_len, char *out_buf, size_t out_cap);
     CDEF;
 
+    public const TAGS_FFI_CDEF = <<<'CDEF'
+        ssize_t nntmux_nfo_append_title_year_tags(const char *, size_t, const char *, size_t, char *, size_t);
+        ssize_t nntmux_nfo_append_language(const char *, size_t, const char *, size_t, char *, size_t);
+        ssize_t nntmux_nfo_append_resolution(const char *, size_t, const char *, size_t, char *, size_t);
+        ssize_t nntmux_nfo_append_source(const char *, size_t, const char *, size_t, char *, size_t);
+        ssize_t nntmux_nfo_append_audio_codec(const char *, size_t, const char *, size_t, char *, size_t);
+    CDEF;
+
+    private static bool $tagsFfiResolved = false;
+
+    private static ?\FFI $tagsFfi = null;
+
+    private function appendTagRust(string $symbol, string $name, string $nfo): ?string
+    {
+        try {
+            if ($this->libraryPath !== null) {
+                $ffi = RustPipelineLibrary::resolveDomain('nfo_title_year_tags', self::TAGS_FFI_CDEF, $this->libraryPath);
+            } else {
+                if (! self::$tagsFfiResolved) {
+                    self::$tagsFfi = RustPipelineLibrary::resolveDomain('nfo_title_year_tags', self::TAGS_FFI_CDEF);
+                    self::$tagsFfiResolved = true;
+                }
+                $ffi = self::$tagsFfi;
+            }
+            if ($ffi === null) {
+                return null;
+            }
+            $cap = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, strlen($name) + 512, $cap);
+            if ($buffer === null) {
+                return null;
+            }
+            $written = $ffi->$symbol($name, strlen($name), $nfo, strlen($nfo), $buffer, $cap);
+            if (is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($buffer === null) {
+                    return null;
+                }
+                $written = $ffi->$symbol($name, strlen($name), $nfo, strlen($nfo), $buffer, $cap);
+            }
+
+            return is_int($written) && $written >= 0 && $written <= $cap ? \FFI::string($buffer, $written) : null;
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
     private ?string $libraryPath = null;
 
     private ?string $lastRawNfo = null;
@@ -405,6 +452,21 @@ class NfoNameExtractor
 
     public function checkForTitleYearPhp(string $nfoContent): ?NameFixResult
     {
+        return $this->checkForTitleYearNative($nfoContent);
+    }
+
+    public function checkForTitleYearNative(string $nfoContent): ?NameFixResult
+    {
+        return $this->checkForTitleYearWithTags($nfoContent, false);
+    }
+
+    public function checkForTitleYearTagsRust(string $nfoContent): ?NameFixResult
+    {
+        return $this->checkForTitleYearWithTags($nfoContent, true);
+    }
+
+    private function checkForTitleYearWithTags(string $nfoContent, bool $rust): ?NameFixResult
+    {
         $metadata = $nfoContent;
         $nfoContent = $this->identityText($nfoContent);
         $result = [];
@@ -421,20 +483,9 @@ class NfoNameExtractor
 
         $releaseName = $result[0];
 
-        // Extract language
-        $releaseName = $this->appendLanguageFromNfo($releaseName, $metadata);
-
-        // Extract resolution
-        $releaseName = $this->appendResolutionFromNfo($releaseName, $metadata);
-
-        // Extract source
-        $releaseName = $this->appendSourceFromNfo($releaseName, $metadata);
-
-        // Extract video codec
-        $releaseName = $this->appendVideoCodecFromNfo($releaseName, $metadata);
-
-        // Extract audio codec
-        $releaseName = $this->appendAudioCodecFromNfo($releaseName, $metadata);
+        $releaseName = $rust
+            ? $this->appendTitleYearTagsRust($releaseName, $metadata)
+            : $this->appendTitleYearTagsNative($releaseName, $metadata);
 
         $releaseName .= '-NoGroup';
 
@@ -541,10 +592,45 @@ class NfoNameExtractor
         return null;
     }
 
+    public function appendTitleYearTagsRust(string $releaseName, string $nfoContent): string
+    {
+        if (get_class($this) !== self::class) {
+            return $this->appendTitleYearTagsNative($releaseName, $nfoContent);
+        }
+
+        return $this->appendTagRust('nntmux_nfo_append_title_year_tags', $releaseName, $nfoContent)
+            ?? $this->appendTitleYearTagsNative($releaseName, $nfoContent);
+    }
+
+    public function appendTitleYearTagsNative(string $releaseName, string $nfoContent): string
+    {
+        $releaseName = $this->appendLanguageFromNfo($releaseName, $nfoContent);
+        $releaseName = $this->appendResolutionFromNfo($releaseName, $nfoContent);
+        $releaseName = $this->appendSourceFromNfo($releaseName, $nfoContent);
+        $releaseName = $this->appendVideoCodecFromNfo($releaseName, $nfoContent);
+
+        return $this->appendAudioCodecFromNfo($releaseName, $nfoContent);
+    }
+
     /**
      * Append language from NFO content.
      */
     protected function appendLanguageFromNfo(string $releaseName, string $nfoContent): string
+    {
+        return $this->appendLanguageFromNfoNative($releaseName, $nfoContent);
+    }
+
+    public function appendLanguageFromNfoRust(string $releaseName, string $nfoContent): string
+    {
+        if (get_class($this) !== self::class) {
+            return $this->appendLanguageFromNfoNative($releaseName, $nfoContent);
+        }
+
+        return $this->appendTagRust('nntmux_nfo_append_language', $releaseName, $nfoContent)
+            ?? $this->appendLanguageFromNfoNative($releaseName, $nfoContent);
+    }
+
+    public function appendLanguageFromNfoNative(string $releaseName, string $nfoContent): string
     {
         $result = [];
         if (preg_match('/(idiomas|lang|language|langue|sprache).*?\b(?P<lang>Brazilian|Chinese|Croatian|Danish|DE|Deutsch|Dutch|Estonian|ES|English|Englisch|Finnish|Flemish|Francais|French|FR|German|Greek|Hebrew|Icelandic|Italian|Japenese|Japan|Japanese|Korean|Latin|Nordic|Norwegian|Polish|Portuguese|Russian|Serbian|Slovenian|Swedish|Spanisch|Spanish|Thai|Turkish)\b/i', $nfoContent, $result)) {
@@ -565,6 +651,21 @@ class NfoNameExtractor
      * Append resolution from NFO content.
      */
     protected function appendResolutionFromNfo(string $releaseName, string $nfoContent): string
+    {
+        return $this->appendResolutionFromNfoNative($releaseName, $nfoContent);
+    }
+
+    public function appendResolutionFromNfoRust(string $releaseName, string $nfoContent): string
+    {
+        if (get_class($this) !== self::class) {
+            return $this->appendResolutionFromNfoNative($releaseName, $nfoContent);
+        }
+
+        return $this->appendTagRust('nntmux_nfo_append_resolution', $releaseName, $nfoContent)
+            ?? $this->appendResolutionFromNfoNative($releaseName, $nfoContent);
+    }
+
+    public function appendResolutionFromNfoNative(string $releaseName, string $nfoContent): string
     {
         $result = [];
 
@@ -595,6 +696,21 @@ class NfoNameExtractor
      * Append source from NFO content.
      */
     protected function appendSourceFromNfo(string $releaseName, string $nfoContent): string
+    {
+        return $this->appendSourceFromNfoNative($releaseName, $nfoContent);
+    }
+
+    public function appendSourceFromNfoRust(string $releaseName, string $nfoContent): string
+    {
+        if (get_class($this) !== self::class) {
+            return $this->appendSourceFromNfoNative($releaseName, $nfoContent);
+        }
+
+        return $this->appendTagRust('nntmux_nfo_append_source', $releaseName, $nfoContent)
+            ?? $this->appendSourceFromNfoNative($releaseName, $nfoContent);
+    }
+
+    public function appendSourceFromNfoNative(string $releaseName, string $nfoContent): string
     {
         $result = [];
 
@@ -638,6 +754,21 @@ class NfoNameExtractor
      * Append audio codec from NFO content.
      */
     protected function appendAudioCodecFromNfo(string $releaseName, string $nfoContent): string
+    {
+        return $this->appendAudioCodecFromNfoNative($releaseName, $nfoContent);
+    }
+
+    public function appendAudioCodecFromNfoRust(string $releaseName, string $nfoContent): string
+    {
+        if (get_class($this) !== self::class) {
+            return $this->appendAudioCodecFromNfoNative($releaseName, $nfoContent);
+        }
+
+        return $this->appendTagRust('nntmux_nfo_append_audio_codec', $releaseName, $nfoContent)
+            ?? $this->appendAudioCodecFromNfoNative($releaseName, $nfoContent);
+    }
+
+    public function appendAudioCodecFromNfoNative(string $releaseName, string $nfoContent): string
     {
         $result = [];
 

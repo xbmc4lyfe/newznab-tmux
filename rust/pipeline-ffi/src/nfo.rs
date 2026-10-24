@@ -8939,3 +8939,2035 @@ mod yenc_ffi_tests {
         );
     }
 }
+
+// Wave 8 metadata candidates. PHP already requires PCRE2; these candidates reuse
+// only symbols exported by the current process. They never load a shared library
+// or add a system dependency. A standalone host without these symbols declines
+// to PHP. The caller also guards PHP's PCRE limits/JIT/locale defaults.
+mod nfo_metadata_pcre {
+    use std::ffi::{c_char, c_void};
+    use std::sync::OnceLock;
+
+    unsafe extern "C" {
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    }
+    type Compile = unsafe extern "C" fn(
+        *const u8,
+        usize,
+        u32,
+        *mut i32,
+        *mut usize,
+        *mut c_void,
+    ) -> *mut c_void;
+    type Match = unsafe extern "C" fn(
+        *const c_void,
+        *const u8,
+        usize,
+        usize,
+        u32,
+        *mut c_void,
+        *mut c_void,
+    ) -> i32;
+    type Create = unsafe extern "C" fn(u32, *mut c_void) -> *mut c_void;
+    type Free = unsafe extern "C" fn(*mut c_void);
+    type Ovector = unsafe extern "C" fn(*mut c_void) -> *const usize;
+    type Jit = unsafe extern "C" fn(*mut c_void, u32) -> i32;
+    type Context = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
+    type Limit = unsafe extern "C" fn(*mut c_void, u32) -> i32;
+    type StackCreate = unsafe extern "C" fn(usize, usize, *mut c_void) -> *mut c_void;
+    type StackAssign = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void);
+    pub(super) struct Api {
+        compile: Compile,
+        run: Match,
+        create: Create,
+        free: Free,
+        ovector: Ovector,
+        jit: Jit,
+        context: Context,
+        context_free: Free,
+        match_limit: Limit,
+        depth_limit: Limit,
+        stack_create: StackCreate,
+        stack_assign: StackAssign,
+        stack_free: Free,
+        code_free: Free,
+    }
+    fn api() -> Option<&'static Api> {
+        static API: OnceLock<Option<Api>> = OnceLock::new();
+        API.get_or_init(|| {
+            #[cfg(target_os = "macos")]
+            let handle = (-2isize) as *mut c_void; // RTLD_DEFAULT
+            #[cfg(not(target_os = "macos"))]
+            let handle = std::ptr::null_mut(); // RTLD_DEFAULT on Linux
+            macro_rules! symbol {
+                ($name:literal, $ty:ty) => {{
+                    let ptr = unsafe { dlsym(handle, concat!($name, "\0").as_ptr().cast()) };
+                    if ptr.is_null() {
+                        return None;
+                    }
+                    unsafe { std::mem::transmute::<*mut c_void, $ty>(ptr) }
+                }};
+            }
+            Some(Api {
+                compile: symbol!("pcre2_compile_8", Compile),
+                run: symbol!("pcre2_match_8", Match),
+                create: symbol!("pcre2_match_data_create_8", Create),
+                free: symbol!("pcre2_match_data_free_8", Free),
+                ovector: symbol!("pcre2_get_ovector_pointer_8", Ovector),
+                jit: symbol!("pcre2_jit_compile_8", Jit),
+                context: symbol!("pcre2_match_context_create_8", Context),
+                context_free: symbol!("pcre2_match_context_free_8", Free),
+                match_limit: symbol!("pcre2_set_match_limit_8", Limit),
+                depth_limit: symbol!("pcre2_set_depth_limit_8", Limit),
+                stack_create: symbol!("pcre2_jit_stack_create_8", StackCreate),
+                stack_assign: symbol!("pcre2_jit_stack_assign_8", StackAssign),
+                stack_free: symbol!("pcre2_jit_stack_free_8", Free),
+                code_free: symbol!("pcre2_code_free_8", Free),
+            })
+        })
+        .as_ref()
+    }
+    pub(super) struct Matcher {
+        api: &'static Api,
+        codes: &'static [usize],
+        data: *mut c_void,
+        context: *mut c_void,
+        stack: *mut c_void,
+        match_failed: bool,
+        evidence: Option<Evidence>,
+    }
+    struct Evidence {
+        text: usize,
+        len: usize,
+        first: Vec<Option<[usize; 8]>>,
+        all: Vec<Vec<[usize; 8]>>,
+        counts: Vec<usize>,
+    }
+    impl Matcher {
+        pub(super) fn new() -> Option<Self> {
+            let api = api()?;
+            static CODES: OnceLock<Option<Vec<usize>>> = OnceLock::new();
+            let codes = CODES
+                .get_or_init(|| {
+                    let mut codes = Vec::with_capacity(super::NFO_METADATA_PATTERNS.len());
+                    for &(pattern, options) in super::NFO_METADATA_PATTERNS {
+                        let (mut error, mut offset) = (0, 0);
+                        let code = unsafe {
+                            (api.compile)(
+                                pattern.as_ptr(),
+                                pattern.len(),
+                                options,
+                                &mut error,
+                                &mut offset,
+                                std::ptr::null_mut(),
+                            )
+                        };
+                        if code.is_null() {
+                            for code in codes {
+                                unsafe {
+                                    (api.code_free)(code as *mut c_void);
+                                }
+                            }
+                            return None;
+                        }
+                        // The fixed code objects live for the process lifetime. JIT is
+                        // optional in PCRE2 builds; interpretation remains correct.
+                        unsafe {
+                            (api.jit)(code, 1);
+                        }
+                        codes.push(code as usize);
+                    }
+                    Some(codes)
+                })
+                .as_ref()?;
+            let data = unsafe { (api.create)(32, std::ptr::null_mut()) };
+            if data.is_null() {
+                return None;
+            }
+            let context = unsafe { (api.context)(std::ptr::null_mut()) };
+            if context.is_null() {
+                unsafe {
+                    (api.free)(data);
+                }
+                return None;
+            }
+            // Match PHP's PCRE_JIT_STACK_MIN/MAX_SIZE (ext/pcre/php_pcre.c).
+            // PCRE2's unassigned default is only 32 KiB and can reject matches
+            // that PHP accepts with its expandable 192 KiB stack.
+            let stack = unsafe { (api.stack_create)(32 * 1024, 192 * 1024, std::ptr::null_mut()) };
+            if stack.is_null() {
+                unsafe {
+                    (api.context_free)(context);
+                    (api.free)(data);
+                }
+                return None;
+            }
+            unsafe {
+                (api.stack_assign)(context, std::ptr::null_mut(), stack);
+                (api.match_limit)(context, 1_000_000);
+                (api.depth_limit)(context, 100_000);
+            }
+            Some(Self {
+                api,
+                codes,
+                data,
+                context,
+                stack,
+                match_failed: false,
+                evidence: None,
+            })
+        }
+        pub(super) fn captures<'a>(
+            &mut self,
+            id: usize,
+            text: &'a [u8],
+            offset: usize,
+        ) -> Result<Option<Captures<'a>>, ()> {
+            if let Some(evidence) = &self.evidence {
+                if evidence.text == text.as_ptr() as usize
+                    && evidence.len == text.len()
+                    && offset == 0
+                {
+                    return Ok(evidence.first[id].map(|offsets| Captures { text, offsets }));
+                }
+                return Err(());
+            }
+            self.captures_at(id, text, offset, 0)
+        }
+        fn captures_at<'a>(
+            &mut self,
+            id: usize,
+            text: &'a [u8],
+            offset: usize,
+            options: u32,
+        ) -> Result<Option<Captures<'a>>, ()> {
+            self.match_failed = false;
+            let rc = unsafe {
+                (self.api.run)(
+                    self.codes[id] as *const c_void,
+                    text.as_ptr(),
+                    text.len(),
+                    offset,
+                    options,
+                    self.data,
+                    self.context,
+                )
+            };
+            if rc == -1 {
+                return Ok(None);
+            }
+            // PHP's callers use preg_match(_all) as a condition. Resource-limit
+            // errors are false, so the next pattern is still tried. Keep this
+            // separate from malformed/internal engine failures, which decline.
+            if matches!(rc, -46 | -47 | -53 | -63) {
+                self.match_failed = true;
+                return Ok(None);
+            }
+            if rc <= 0 || rc > 4 {
+                return Err(());
+            }
+            let offsets = unsafe {
+                std::slice::from_raw_parts((self.api.ovector)(self.data), rc as usize * 2)
+            };
+            let mut copied = [usize::MAX; 8];
+            copied[..offsets.len()].copy_from_slice(offsets);
+            Ok(Some(Captures {
+                text,
+                offsets: copied,
+            }))
+        }
+        pub(super) fn prepare_quality(&mut self, text: &[u8]) -> Result<(usize, usize, usize), ()> {
+            self.evidence = None;
+            const IDS: &[usize] = &[
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 24,
+                25, 26, 27, 28, 29, 30, 39, 40, 42, 43, 44, 54, 55, 56, 57, 58, 59, 60, 61, 62,
+            ];
+            static DISPATCH: OnceLock<[Vec<usize>; 256]> = OnceLock::new();
+            let dispatch = DISPATCH.get_or_init(|| {
+                std::array::from_fn(|byte| {
+                    IDS.iter()
+                        .copied()
+                        .filter(|id| super::nfo_quality_first_byte(*id, byte as u8))
+                        .collect()
+                })
+            });
+            let mut evidence = Evidence {
+                text: text.as_ptr() as usize,
+                len: text.len(),
+                first: vec![None; 63],
+                all: (0..63).map(|_| Vec::new()).collect(),
+                counts: vec![0; 63],
+            };
+            let mut next = [0usize; 63];
+            let mut attempts = 0usize;
+            let metrics = super::nfo_quality_scan_with(text, |pos, byte| {
+                for &id in &dispatch[byte as usize] {
+                    let all = matches!(id,0|1|24..=30|59..=62);
+                    if (!all && evidence.first[id].is_some())
+                        || (all && pos < next[id])
+                        || !super::nfo_quality_prefix(id, text, pos)
+                    {
+                        continue;
+                    }
+                    // Overlapping wildcard prefixes can make thousands of
+                    // individually bounded anchored attempts quadratic. Decline
+                    // before attempting long ambiguous prefixes, and bound the
+                    // total request work independently of per-call PCRE limits.
+                    let ambiguous_prefix = match id {
+                        2 | 5 => text[pos..]
+                            .iter()
+                            .take(257)
+                            .take_while(|b| super::is_pcre_space(**b))
+                            .count(),
+                        8 => text[pos..]
+                            .iter()
+                            .take(257)
+                            .take_while(|b| matches!(b, b'-' | b'='))
+                            .count(),
+                        11 => text[pos..]
+                            .iter()
+                            .take(257)
+                            .take_while(|b| !b.is_ascii_alphanumeric())
+                            .count(),
+                        _ => 0,
+                    };
+                    if ambiguous_prefix > 256 {
+                        return Err(());
+                    }
+                    attempts += 1;
+                    if attempts > 8192 {
+                        return Err(());
+                    }
+                    // Anchoring keeps the original full subject: lookbehind,
+                    // word boundaries, ^/$ and cross-line greediness retain
+                    // the original PCRE semantics at this candidate position.
+                    let captured = self.captures_at(id, text, pos, 0x8000_0000)?;
+                    if self.match_failed {
+                        return Err(());
+                    }
+                    if let Some(captured) = captured {
+                        if evidence.first[id].is_none() {
+                            evidence.first[id] = Some(captured.offsets);
+                        }
+                        evidence.counts[id] += 1;
+                        next[id] = captured.offsets[1];
+                        if matches!(id, 0 | 1) {
+                            evidence.all[id].push(captured.offsets);
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+            self.evidence = Some(evidence);
+            Ok(metrics)
+        }
+        pub(super) fn clear_quality(&mut self) {
+            self.evidence = None;
+        }
+        pub(super) fn count(&mut self, id: usize, text: &[u8]) -> Result<usize, ()> {
+            if let Some(evidence) = &self.evidence {
+                if evidence.text == text.as_ptr() as usize && evidence.len == text.len() {
+                    return Ok(evidence.counts[id]);
+                }
+                return Err(());
+            }
+            let (mut count, mut offset) = (0, 0);
+            while let Some(capture) = self.captures(id, text, offset)? {
+                let end = capture.offsets[1];
+                if end <= offset {
+                    return Err(());
+                }
+                offset = end;
+                count += 1;
+            }
+            Ok(if self.match_failed { 0 } else { count })
+        }
+        pub(super) fn all<'a>(
+            &mut self,
+            id: usize,
+            text: &'a [u8],
+        ) -> Result<Vec<Captures<'a>>, ()> {
+            if let Some(evidence) = &self.evidence {
+                if evidence.text == text.as_ptr() as usize && evidence.len == text.len() {
+                    return Ok(evidence.all[id]
+                        .iter()
+                        .map(|offsets| Captures {
+                            text,
+                            offsets: *offsets,
+                        })
+                        .collect());
+                }
+                return Err(());
+            }
+            let mut matches = Vec::new();
+            let mut offset = 0;
+            while let Some(capture) = self.captures(id, text, offset)? {
+                let end = capture.offsets[1];
+                if end <= offset {
+                    return Err(());
+                } // None of the fixed patterns match empty text.
+                offset = end;
+                matches.push(capture);
+            }
+            if self.match_failed {
+                matches.clear();
+            }
+            Ok(matches)
+        }
+    }
+    impl Drop for Matcher {
+        fn drop(&mut self) {
+            unsafe {
+                (self.api.free)(self.data);
+                (self.api.context_free)(self.context);
+                (self.api.stack_free)(self.stack);
+            }
+        }
+    }
+    pub(super) fn with_matcher<T>(
+        run: impl FnOnce(&mut Matcher) -> Result<T, ()>,
+    ) -> Result<T, ()> {
+        thread_local! { static MATCHER: std::cell::RefCell<Option<Matcher>> = const { std::cell::RefCell::new(None) }; }
+        MATCHER.with(|slot| {
+            let mut slot = slot.try_borrow_mut().map_err(|_| ())?;
+            if slot.is_none() {
+                *slot = Some(Matcher::new().ok_or(())?);
+            }
+            let matcher = slot.as_mut().ok_or(())?;
+            matcher.clear_quality();
+            // The RefCell borrow pins this Matcher until after the guard drops.
+            // Clearing on unwind prevents retaining evidence for an input whose
+            // address/length may later be reused for different PHP bytes.
+            struct ResetEvidence(*mut Matcher);
+            impl Drop for ResetEvidence {
+                fn drop(&mut self) {
+                    unsafe {
+                        (*self.0).clear_quality();
+                    }
+                }
+            }
+            let _reset = ResetEvidence(matcher as *mut Matcher);
+            run(matcher)
+        })
+    }
+    pub(super) struct Captures<'a> {
+        text: &'a [u8],
+        offsets: [usize; 8],
+    }
+    impl<'a> Captures<'a> {
+        pub(super) fn get(&self, index: usize) -> &'a [u8] {
+            let start = self.offsets.get(index * 2).copied().unwrap_or(usize::MAX);
+            let end = self
+                .offsets
+                .get(index * 2 + 1)
+                .copied()
+                .unwrap_or(usize::MAX);
+            self.text.get(start..end).unwrap_or(b"")
+        }
+    }
+}
+const NFO_METADATA_PATTERNS: &[(&str, u32)] = &[
+    (r###"https?:\/\/[^\s<>"']+"###, 8),
+    (r###"(?<![\/\.])\bwww\.[a-z0-9][-a-z0-9]*\.[^\s<>"']+"###, 8),
+    (
+        r###"(?:^|\n)\s*[-=*]{3,}.*?([A-Z0-9]{2,15})\s*[-=*]{3,}"###,
+        8,
+    ),
+    (
+        r###"(?:presents?|brought\s+(?:to\s+)?(?:you\s+)?by|from)\s*[:\-]?\s*([A-Z][A-Z0-9]{1,14})"###,
+        8,
+    ),
+    (
+        r###"(?:greets?\s+(?:go(?:es)?\s+)?(?:out\s+)?to|respect\s+to)\s*[:\-]?\s*([\w,\s&]+)"###,
+        8,
+    ),
+    (
+        r###"(?:^|\n)\s*([A-Z][A-Z0-9]{1,14})\s+(?:nfo|info|release)\s*(?:$|\n)"###,
+        8,
+    ),
+    (
+        r###"(?:released\s+by|rls\s+by)\s*[:\-]?\s*([A-Z][A-Z0-9]{1,14})"###,
+        8,
+    ),
+    (
+        r###"\b([A-Z][A-Z0-9]{1,14})\s+(?:presents?|brings?\s+you)"###,
+        8,
+    ),
+    (r###"[-=]{2,}\s*([A-Z][A-Z0-9]{1,14})\s*[-=]{2,}$"###, 1032),
+    (r###"irc\.[a-z0-9.-]+\s+#([A-Z][A-Z0-9]{1,14})"###, 8),
+    (r###"www\.([a-z][a-z0-9]{1,14})\.(?:com|org|net|info)"###, 8),
+    (
+        r###"^\s*[^a-zA-Z0-9]*([A-Z][A-Z0-9]{2,14})[^a-zA-Z0-9]*\s*$"###,
+        1032,
+    ),
+    (
+        r###"(?:date|released?|rls)\s*[:\-]?\s*(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})"###,
+        8,
+    ),
+    (
+        r###"(?:date|released?|rls)\s*[:\-]?\s*(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})"###,
+        8,
+    ),
+    (
+        r###"(?:date|released?|rls)\s*[:\-]?\s*(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2}),?\s+(\d{4})"###,
+        8,
+    ),
+    (
+        r###"(?:video|codec)\s*[:\-]?\s*(x264|x265|hevc|h\.?264|h\.?265|xvid|divx|av1|vp9|mpeg[24]?)"###,
+        8,
+    ),
+    (
+        r###"\b(x264|x265|HEVC|H\.?264|H\.?265|XviD|DivX|AV1|VP9)\b"###,
+        8,
+    ),
+    (
+        r###"(?:audio|sound)\s*[:\-]?\s*(aac|ac3|dts(?:-(?:hd|ma|x))?|truehd|atmos|flac|mp3|eac3|dd[+p]?|dolby)"###,
+        8,
+    ),
+    (
+        r###"\b(AAC|AC3|DTS(?:-(?:HD|MA|X))?|TrueHD|Atmos|FLAC|EAC3|DD[+P]?)\b"###,
+        8,
+    ),
+    (
+        r###"(?:resolution|quality)\s*[:\-]?\s*(\d{3,4}[xX×]\d{3,4}|\d{3,4}p|[48]K|UHD|FHD|HD)"###,
+        8,
+    ),
+    (r###"\b(2160p|1080p|720p|480p|4K|UHD|FHD|HD)\b"###, 8),
+    (r###"\b(\d{3,4})\s*[xX×]\s*(\d{3,4})\b"###, 0),
+    (
+        r###"(?:size|file\s*size)\s*[:\-]?\s*(\d+(?:[.,]\d+)?)\s*(bytes?|[KMGTP]B|[KMGTP]iB)"###,
+        8,
+    ),
+    (r###"\b(\d+(?:[.,]\d+)?)\s*(GB|GiB|MB|MiB|TB|TiB)\b"###, 8),
+    (r###"imdb\.com\/title\/(tt\d{7,})"###, 8),
+    (
+        r###"thetvdb\.com\/(?:\?tab=series&id=|series\/)(\d{1,8})"###,
+        8,
+    ),
+    (r###"themoviedb\.org\/movie\/(\d{1,8})"###, 8),
+    (r###"themoviedb\.org\/tv\/(\d{1,8})"###, 8),
+    (r###"tvmaze\.com\/shows\/(\d{1,6})"###, 8),
+    (
+        r###"anidb\.net\/(?:perl-bin\/animedb\.pl\?show=anime&aid=|anime\/)(\d{1,6})"###,
+        8,
+    ),
+    (r###"myanimelist\.net\/anime\/(\d{1,6})"###, 8),
+    (r###"tvmaze\.com\/shows\/(\d{1,6})"###, 8),
+    (r###"imdb\.com\/title\/(tt\d{7,})"###, 8),
+    (r###"thetvdb\.com\/\?tab=series&id=(\d{1,8})"###, 8),
+    (r###"thetvdb\.com\/series\/(\d{1,8}|[\w-]+)"###, 8),
+    (r###"themoviedb\.org\/movie\/(\d{1,8})"###, 8),
+    (r###"themoviedb\.org\/tv\/(\d{1,8})"###, 8),
+    (
+        r###"anidb\.net\/(?:perl-bin\/animedb\.pl\?show=anime&aid=|anime\/)(\d{1,6})"###,
+        8,
+    ),
+    (r###"trakt\.tv\/(?:shows|movies)\/([\w-]+)"###, 8),
+    (
+        r###"(?:language|audio|spoken?|dialogue)\s*[:\-]?\s*([A-Za-z]+(?:\s*[,\/&]\s*[A-Za-z]+)*)"###,
+        8,
+    ),
+    (
+        r###"(?:subs?|subtitles?)\s*[:\-]?\s*([A-Za-z]+(?:\s*[,\/&]\s*[A-Za-z]+)*)"###,
+        8,
+    ),
+    (r###"[\s,\/&]+"###, 0),
+    (
+        r###"(?:runtime|duration|length|playtime)\s*[:\-]?\s*(?:(\d{1,2})\s*h(?:ours?)?\s*)?(\d{1,3})\s*m(?:in(?:utes?)?)?"###,
+        8,
+    ),
+    (
+        r###"(?:runtime|duration|length|playtime)\s*[:\-]?\s*(\d{1,2}):(\d{2})(?::(\d{2}))?"###,
+        8,
+    ),
+    (r###"\b(\d{2,3})\s*(?:min(?:utes?)?|mins)\b"###, 8),
+    (r###"(?:genre|category|type)\s*[:\-]?\s*([^\n\r]+)"###, 8),
+    (r###"[\s,\/&|]+"###, 0),
+    (
+        r###"(?:platform|os|system|requires?)\s*[:\-]?\s*(windows?|linux|mac(?:os)?|unix|android|ios)"###,
+        8,
+    ),
+    (
+        r###"(?:version|ver|v)\s*[:\-]?\s*(\d+(?:\.\d+)*(?:\s*(?:build|b)\s*\d+)?)"###,
+        8,
+    ),
+    (
+        r###"(?:protection|drm|copy[ -]?protection)\s*[:\-]?\s*([^\n\r]+)"###,
+        8,
+    ),
+    (
+        r###"\b(cracked|keygen|serial|patch|loader|activator)\b"###,
+        8,
+    ),
+    (
+        r###"(?:title|release|name)\s*[:\-]?\s*([^\n\r]{5,100})"###,
+        8,
+    ),
+    (
+        r###"(?:^|\n)\s*(?:[\-=*~]{3,}\s*)?([A-Za-z0-9][\w.\-\s]{10,80}?)(?:\s*[\-=*~]{3,})?\s*(?:\n|$)"###,
+        1024,
+    ),
+    (
+        r###"^(?:date|size|codec|format|video|audio|language|runtime|genre)\s*:"###,
+        8,
+    ),
+    (r###"[-=*~#@]{5,}"###, 0),
+    (r###"[┌┐└┘├┤┬┴┼│─╔╗╚╝║═]{3,}"###, 0),
+    (r###"[░▒▓█▄▀■□▪▫]{3,}"###, 0),
+    (r###"[\/\|_]{3,}.*[\/\|_]{3,}"###, 0),
+    (r###"(\S)\1{4,}"###, 0),
+    (r###"^[ \t]*[-=*]{2,}.*[-=*]{2,}[ \t]*$"###, 1024),
+    (r###"^[ \t]*\[.*\][ \t]*$"###, 1024),
+    (r###"^[ \t]*<.*>[ \t]*$"###, 1024),
+    (r###"^[ \t]*[A-Za-z][A-Za-z\s]{2,20}\s*[:\.].*$"###, 1024),
+];
+const NFO_EXTRACT_URLS: &[usize] = &[0, 1];
+const NFO_EXTRACT_GROUP_NAME: &[usize] = &[2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+const NFO_EXTRACT_RELEASE_DATE: &[usize] = &[12, 13, 14];
+const NFO_EXTRACT_CODEC_INFO: &[usize] = &[15, 16, 17, 18, 19, 20, 21];
+const NFO_EXTRACT_FILE_SIZE: &[usize] = &[22, 23];
+const NFO_EXTRACT_ALL_MEDIA_IDS: &[usize] = &[24, 25, 26, 27, 28, 29, 30];
+const NFO_PARSE_SHOW_ID: &[usize] = &[31, 32, 33, 34, 35, 36, 37, 38];
+const NFO_EXTRACT_LANGUAGE: &[usize] = &[39, 40, 41];
+const NFO_EXTRACT_RUNTIME: &[usize] = &[42, 43, 44];
+const NFO_EXTRACT_GENRE: &[usize] = &[45, 46];
+const NFO_EXTRACT_SOFTWARE_INFO: &[usize] = &[47, 48, 49, 50];
+const NFO_EXTRACT_RELEASE_TITLE: &[usize] = &[51, 52, 53];
+const NFO_HAS_ASCII_ART: &[usize] = &[54, 55, 56, 57, 58];
+const NFO_ANALYZE_STRUCTURE: &[usize] = &[59, 60, 61, 62];
+
+#[derive(Debug, PartialEq)]
+enum NfoMetaValue {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Bytes(Vec<u8>),
+    Array(Vec<(NfoMetaKey, NfoMetaValue)>),
+}
+#[derive(Debug, PartialEq)]
+enum NfoMetaKey {
+    Int(usize),
+    Bytes(&'static str),
+}
+impl NfoMetaValue {
+    fn bytes(bytes: &[u8]) -> Self {
+        Self::Bytes(bytes.to_vec())
+    }
+    fn list(values: impl IntoIterator<Item = Self>) -> Self {
+        Self::Array(
+            values
+                .into_iter()
+                .enumerate()
+                .map(|(i, v)| (NfoMetaKey::Int(i), v))
+                .collect(),
+        )
+    }
+    fn map(values: impl IntoIterator<Item = (&'static str, Self)>) -> Self {
+        Self::Array(
+            values
+                .into_iter()
+                .map(|(k, v)| (NfoMetaKey::Bytes(k), v))
+                .collect(),
+        )
+    }
+    fn count(&self) -> usize {
+        if let Self::Array(a) = self {
+            a.len()
+        } else {
+            0
+        }
+    }
+    fn serialize(&self, out: &mut Vec<u8>) {
+        fn string(out: &mut Vec<u8>, bytes: &[u8]) {
+            out.extend_from_slice(format!("s:{}:\"", bytes.len()).as_bytes());
+            out.extend_from_slice(bytes);
+            out.extend_from_slice(b"\";");
+        }
+        match self {
+            Self::Null => out.extend_from_slice(b"N;"),
+            Self::Bool(v) => out.extend_from_slice(if *v { b"b:1;" } else { b"b:0;" }),
+            Self::Int(v) => out.extend_from_slice(format!("i:{v};").as_bytes()),
+            Self::Bytes(b) => string(out, b),
+            Self::Array(entries) => {
+                out.extend_from_slice(format!("a:{}:{{", entries.len()).as_bytes());
+                for (key, value) in entries {
+                    match key {
+                        NfoMetaKey::Int(i) => out.extend_from_slice(format!("i:{i};").as_bytes()),
+                        NfoMetaKey::Bytes(k) => string(out, k.as_bytes()),
+                    }
+                    value.serialize(out);
+                }
+                out.push(b'}');
+            }
+        }
+    }
+}
+fn nfo_meta_trim(mut text: &[u8]) -> &[u8] {
+    let trim = |b: u8| matches!(b, b' ' | b'\t' | b'\r' | b'\n' | 0 | 11);
+    while text.first().is_some_and(|b| trim(*b)) {
+        text = &text[1..];
+    }
+    while text.last().is_some_and(|b| trim(*b)) {
+        text = &text[..text.len() - 1];
+    }
+    text
+}
+fn nfo_meta_ucfirst(bytes: &[u8]) -> Vec<u8> {
+    let mut bytes = bytes.to_ascii_lowercase();
+    if let Some(first) = bytes.first_mut() {
+        first.make_ascii_uppercase();
+    }
+    bytes
+}
+fn nfo_meta_int(bytes: &[u8]) -> i64 {
+    bytes.iter().fold(0i64, |n, b| {
+        n.saturating_mul(10).saturating_add((b - b'0') as i64)
+    })
+}
+fn nfo_meta_urls(m: &mut nfo_metadata_pcre::Matcher, text: &[u8]) -> Result<NfoMetaValue, ()> {
+    let mut urls: Vec<Vec<u8>> = m
+        .all(NFO_EXTRACT_URLS[0], text)?
+        .iter()
+        .map(|c| c.get(0).to_vec())
+        .collect();
+    for c in m.all(NFO_EXTRACT_URLS[1], text)? {
+        let mut url = b"http://".to_vec();
+        url.extend_from_slice(c.get(0));
+        urls.push(url);
+    }
+    let mut seen = std::collections::HashSet::new();
+    Ok(NfoMetaValue::Array(
+        urls.into_iter()
+            .enumerate()
+            .filter_map(|(i, url)| {
+                if !url.is_empty() && url != b"0" && seen.insert(url.clone()) {
+                    Some((NfoMetaKey::Int(i), NfoMetaValue::Bytes(url)))
+                } else {
+                    None
+                }
+            })
+            .collect(),
+    ))
+}
+fn nfo_meta_group(m: &mut nfo_metadata_pcre::Matcher, text: &[u8]) -> Result<NfoMetaValue, ()> {
+    const FALSE: &[&[u8]] = &[
+        b"THE",
+        b"AND",
+        b"FOR",
+        b"NFO",
+        b"INFO",
+        b"DVD",
+        b"BLU",
+        b"RAY",
+        b"WEB",
+        b"HDTV",
+        b"RELEASE",
+        b"GROUP",
+        b"DATE",
+        b"SIZE",
+        b"CODEC",
+        b"VIDEO",
+        b"AUDIO",
+        b"FORMAT",
+        b"NOTES",
+        b"INSTALL",
+        b"GREETS",
+        b"PRESENTS",
+        b"TEAM",
+        b"SCENE",
+        b"FILE",
+        b"FILES",
+    ];
+    for (i, &id) in NFO_EXTRACT_GROUP_NAME.iter().enumerate() {
+        if let Some(c) = m.captures(id, text, 0)? {
+            let group = nfo_meta_trim(c.get(1));
+            let upper = group.to_ascii_uppercase();
+            if (2..=20).contains(&group.len()) && !FALSE.contains(&upper.as_slice()) {
+                return Ok(if i < 5 {
+                    NfoMetaValue::bytes(group)
+                } else {
+                    NfoMetaValue::Bytes(upper)
+                });
+            }
+        }
+    }
+    Ok(NfoMetaValue::Null)
+}
+fn nfo_meta_date(m: &mut nfo_metadata_pcre::Matcher, text: &[u8]) -> Result<NfoMetaValue, ()> {
+    for (i, &id) in NFO_EXTRACT_RELEASE_DATE.iter().enumerate() {
+        if let Some(c) = m.captures(id, text, 0)? {
+            let (year, month, day) = match i {
+                0 => (
+                    nfo_meta_int(c.get(3)) + if c.get(3).len() == 2 { 2000 } else { 0 },
+                    nfo_meta_int(c.get(2)),
+                    nfo_meta_int(c.get(1)),
+                ),
+                1 => (
+                    nfo_meta_int(c.get(1)),
+                    nfo_meta_int(c.get(2)),
+                    nfo_meta_int(c.get(3)),
+                ),
+                _ => {
+                    let month = [
+                        b"jan", b"feb", b"mar", b"apr", b"may", b"jun", b"jul", b"aug", b"sep",
+                        b"oct", b"nov", b"dec",
+                    ]
+                    .iter()
+                    .position(|v| c.get(1).eq_ignore_ascii_case(*v))
+                    .unwrap_or(0)
+                        + 1;
+                    (nfo_meta_int(c.get(3)), month as i64, nfo_meta_int(c.get(2)))
+                }
+            };
+            return Ok(NfoMetaValue::Bytes(
+                format!("{year:04}-{month:02}-{day:02}").into_bytes(),
+            ));
+        }
+    }
+    Ok(NfoMetaValue::Null)
+}
+fn nfo_meta_codecs(m: &mut nfo_metadata_pcre::Matcher, text: &[u8]) -> Result<NfoMetaValue, ()> {
+    let mut values = Vec::new();
+    for (key, range) in [("video", 0..2), ("audio", 2..4), ("resolution", 4..7)] {
+        for i in range {
+            if let Some(c) = m.captures(NFO_EXTRACT_CODEC_INFO[i], text, 0)? {
+                let mut bytes = c.get(1).to_ascii_uppercase();
+                if i < 2 {
+                    bytes.retain(|b| *b != b'.');
+                }
+                if i == 6 {
+                    bytes.push(b'x');
+                    bytes.extend_from_slice(c.get(2));
+                }
+                values.push((key, NfoMetaValue::Bytes(bytes)));
+                break;
+            }
+        }
+    }
+    Ok(NfoMetaValue::map(values))
+}
+// Zend casts finite doubles modulo 2^64, unlike Rust's saturating `as i64`.
+#[cfg(test)]
+fn nfo_meta_php_float_to_int(value: f64) -> i64 {
+    if !value.is_finite() {
+        return 0;
+    }
+    let value = value.trunc();
+    if value >= i64::MIN as f64 && value < 9_223_372_036_854_775_808.0 {
+        return value as i64;
+    }
+    let modulus = 18_446_744_073_709_551_616.0;
+    let mut value = value % modulus;
+    if value < 0.0 {
+        value += modulus;
+    }
+    if value >= 9_223_372_036_854_775_808.0 {
+        (value - modulus) as i64
+    } else {
+        value as i64
+    }
+}
+fn nfo_meta_size(m: &mut nfo_metadata_pcre::Matcher, text: &[u8]) -> Result<NfoMetaValue, ()> {
+    for &id in NFO_EXTRACT_FILE_SIZE {
+        if let Some(c) = m.captures(id, text, 0)? {
+            let number = c
+                .get(1)
+                .iter()
+                .map(|&b| if b == b',' { b'.' } else { b })
+                .collect::<Vec<_>>();
+            let value: f64 = std::str::from_utf8(&number)
+                .map_err(|_| ())?
+                .parse()
+                .map_err(|_| ())?;
+            let unit = c.get(2).to_ascii_uppercase();
+            let power = match unit.as_slice() {
+                b"B" | b"BYTE" | b"BYTES" => 0,
+                b"KB" | b"KIB" => 1,
+                b"MB" | b"MIB" => 2,
+                b"GB" | b"GIB" => 3,
+                b"TB" | b"TIB" => 4,
+                b"PB" | b"PIB" => 5,
+                _ => continue,
+            };
+            let bytes = value * (1024u64.pow(power) as f64);
+            // PHP 8.5 warns for a non-finite/out-of-range float-to-int cast.
+            // Let the native path emit that exact warning and wrapped value.
+            if !bytes.is_finite() || bytes >= 9_223_372_036_854_775_808.0 {
+                return Err(());
+            }
+            return Ok(NfoMetaValue::Int(bytes as i64));
+        }
+    }
+    Ok(NfoMetaValue::Null)
+}
+fn nfo_meta_ids(m: &mut nfo_metadata_pcre::Matcher, text: &[u8]) -> Result<NfoMetaValue, ()> {
+    let mut ids = Vec::new();
+    for (&id, source) in NFO_EXTRACT_ALL_MEDIA_IDS.iter().zip([
+        "imdb",
+        "thetvdb",
+        "tmdb_movie",
+        "tmdb_tv",
+        "tvmaze",
+        "anidb",
+        "mal",
+    ]) {
+        for c in m.all(id, text)? {
+            ids.push(NfoMetaValue::map([
+                ("id", NfoMetaValue::bytes(c.get(1))),
+                ("source", NfoMetaValue::bytes(source.as_bytes())),
+            ]));
+        }
+    }
+    Ok(NfoMetaValue::list(ids))
+}
+fn nfo_meta_show(m: &mut nfo_metadata_pcre::Matcher, text: &[u8]) -> Result<NfoMetaValue, ()> {
+    for (&id, source) in NFO_PARSE_SHOW_ID.iter().zip([
+        "tvmaze",
+        "imdb",
+        "thetvdb",
+        "thetvdb",
+        "tmdb_movie",
+        "tmdb_tv",
+        "anidb",
+        "trakt",
+    ]) {
+        if let Some(c) = m.captures(id, text, 0)? {
+            return Ok(NfoMetaValue::map([
+                ("showid", NfoMetaValue::bytes(nfo_meta_trim(c.get(1)))),
+                ("site", NfoMetaValue::bytes(source.as_bytes())),
+            ]));
+        }
+    }
+    Ok(NfoMetaValue::Bool(false))
+}
+fn nfo_meta_language(m: &mut nfo_metadata_pcre::Matcher, text: &[u8]) -> Result<NfoMetaValue, ()> {
+    const KNOWN: &[&[u8]] = &[
+        b"english",
+        b"german",
+        b"french",
+        b"spanish",
+        b"italian",
+        b"dutch",
+        b"portuguese",
+        b"russian",
+        b"japanese",
+        b"korean",
+        b"chinese",
+        b"mandarin",
+        b"cantonese",
+        b"swedish",
+        b"norwegian",
+        b"danish",
+        b"finnish",
+        b"polish",
+        b"czech",
+        b"hungarian",
+        b"turkish",
+        b"arabic",
+        b"hindi",
+        b"thai",
+        b"vietnamese",
+        b"indonesian",
+        b"malay",
+        b"multi",
+        b"dual",
+        b"english/german",
+        b"eng",
+        b"ger",
+        b"fre",
+        b"spa",
+        b"ita",
+    ];
+    let mut languages = Vec::new();
+    for &id in &NFO_EXTRACT_LANGUAGE[..2] {
+        if let Some(c) = m.captures(id, text, 0)? {
+            for language in c.get(1).split(|b| is_pcre_space(*b) || b",/&".contains(b)) {
+                let lower = nfo_meta_trim(language).to_ascii_lowercase();
+                // PHP compares lowercase candidates with already-ucfirst output,
+                // so repeated languages (including across fields) are preserved.
+                if KNOWN.contains(&lower.as_slice()) {
+                    languages.push(NfoMetaValue::Bytes(nfo_meta_ucfirst(&lower)));
+                }
+            }
+        }
+    }
+    Ok(NfoMetaValue::list(languages))
+}
+fn nfo_meta_runtime(m: &mut nfo_metadata_pcre::Matcher, text: &[u8]) -> Result<NfoMetaValue, ()> {
+    for (i, &id) in NFO_EXTRACT_RUNTIME.iter().enumerate() {
+        if let Some(c) = m.captures(id, text, 0)? {
+            return Ok(NfoMetaValue::Int(if i == 2 {
+                nfo_meta_int(c.get(1))
+            } else {
+                nfo_meta_int(c.get(1)) * 60 + nfo_meta_int(c.get(2))
+            }));
+        }
+    }
+    Ok(NfoMetaValue::Null)
+}
+fn nfo_meta_genre(m: &mut nfo_metadata_pcre::Matcher, text: &[u8]) -> Result<NfoMetaValue, ()> {
+    const VALID: &[&[u8]] = &[
+        b"action",
+        b"adventure",
+        b"animation",
+        b"biography",
+        b"comedy",
+        b"crime",
+        b"documentary",
+        b"drama",
+        b"family",
+        b"fantasy",
+        b"history",
+        b"horror",
+        b"music",
+        b"musical",
+        b"mystery",
+        b"romance",
+        b"sci-fi",
+        b"scifi",
+        b"sport",
+        b"thriller",
+        b"war",
+        b"western",
+        b"adult",
+        b"xxx",
+        b"erotic",
+        b"anime",
+        b"rpg",
+        b"fps",
+        b"strategy",
+        b"simulation",
+        b"puzzle",
+        b"racing",
+        b"sports",
+        b"rock",
+        b"pop",
+        b"electronic",
+        b"hip-hop",
+        b"rap",
+        b"classical",
+        b"jazz",
+    ];
+    let mut genres = Vec::new();
+    if let Some(c) = m.captures(NFO_EXTRACT_GENRE[0], text, 0)? {
+        for part in c.get(1).split(|b| is_pcre_space(*b) || b",/&|".contains(b)) {
+            let lower = nfo_meta_trim(part).to_ascii_lowercase();
+            let value = NfoMetaValue::Bytes(nfo_meta_ucfirst(&lower));
+            if VALID.contains(&lower.as_slice()) && !genres.contains(&value) {
+                genres.push(value);
+            }
+        }
+    }
+    Ok(NfoMetaValue::list(genres))
+}
+fn nfo_meta_software(m: &mut nfo_metadata_pcre::Matcher, text: &[u8]) -> Result<NfoMetaValue, ()> {
+    let mut info = Vec::new();
+    if let Some(c) = m.captures(NFO_EXTRACT_SOFTWARE_INFO[0], text, 0)? {
+        info.push(("platform", NfoMetaValue::Bytes(nfo_meta_ucfirst(c.get(1)))));
+    }
+    if let Some(c) = m.captures(NFO_EXTRACT_SOFTWARE_INFO[1], text, 0)? {
+        info.push(("version", NfoMetaValue::bytes(nfo_meta_trim(c.get(1)))));
+    }
+    if let Some(c) = m.captures(NFO_EXTRACT_SOFTWARE_INFO[2], text, 0)? {
+        let protection = nfo_meta_trim(c.get(1));
+        if protection.len() > 2 && protection.len() < 50 {
+            info.push(("protection", NfoMetaValue::bytes(protection)));
+        }
+    }
+    if m.captures(NFO_EXTRACT_SOFTWARE_INFO[3], text, 0)?.is_some() {
+        info.push(("has_crack", NfoMetaValue::Bool(true)));
+    }
+    Ok(NfoMetaValue::map(info))
+}
+fn nfo_meta_title(m: &mut nfo_metadata_pcre::Matcher, text: &[u8]) -> Result<NfoMetaValue, ()> {
+    for &id in &NFO_EXTRACT_RELEASE_TITLE[..2] {
+        if let Some(c) = m.captures(id, text, 0)? {
+            let title = nfo_meta_trim(c.get(1));
+            if (5..=100).contains(&title.len())
+                && m.captures(NFO_EXTRACT_RELEASE_TITLE[2], title, 0)?
+                    .is_none()
+            {
+                return Ok(NfoMetaValue::bytes(title));
+            }
+        }
+    }
+    Ok(NfoMetaValue::Null)
+}
+fn nfo_meta_art(m: &mut nfo_metadata_pcre::Matcher, text: &[u8]) -> Result<i32, ()> {
+    for &id in NFO_HAS_ASCII_ART {
+        if m.captures(id, text, 0)?.is_some() {
+            return Ok(1);
+        }
+    }
+    Ok(0)
+}
+fn nfo_meta_structure(m: &mut nfo_metadata_pcre::Matcher, text: &[u8]) -> Result<i32, ()> {
+    let lines = text
+        .split(|b| *b == b'\n')
+        .filter(|line| !nfo_meta_trim(line).is_empty())
+        .take(10)
+        .count();
+    nfo_meta_structure_lines(m, text, lines)
+}
+fn nfo_meta_structure_lines(
+    m: &mut nfo_metadata_pcre::Matcher,
+    text: &[u8],
+    lines: usize,
+) -> Result<i32, ()> {
+    let mut doubled = 0;
+    for &id in &NFO_ANALYZE_STRUCTURE[..3] {
+        doubled += m.count(id, text)?.min(3) * 2;
+    }
+    doubled += m.count(NFO_ANALYZE_STRUCTURE[3], text)?.min(10);
+    if lines >= 10 {
+        doubled += 4;
+    }
+    Ok((doubled / 2).min(15) as i32)
+}
+// The substring keyword scores, binary penalties, and line occupancy are
+// collected in one byte traversal. A tiny immutable Aho-Corasick automaton
+// preserves overlapping keywords (e.g. "install" and "installer"). Metadata
+// captures still use PHP's exact ordered PCRE rules; the complete quality
+// calculation is fused into one ABI call, not a one-scan regex replacement.
+const NFO_QUALITY_KEYWORDS: &[&[u8]] = &[
+    b"release",
+    b"group",
+    b"date",
+    b"size",
+    b"format",
+    b"source",
+    b"genre",
+    b"codec",
+    b"bitrate",
+    b"resolution",
+    b"language",
+    b"subtitle",
+    b"ripped",
+    b"cracked",
+    b"keygen",
+    b"serial",
+    b"patch",
+    b"trainer",
+    b"install",
+    b"notes",
+    b"greets",
+    b"nfo",
+    b"ascii",
+    b"artwork",
+    b"presents",
+    b"proudly",
+    b"brings",
+    b"another",
+    b"scene",
+    b"rls",
+    b"nuked",
+    b"proper",
+    b"repack",
+    b"internal",
+    b"retail",
+    b"webdl",
+    b"webrip",
+    b"bluray",
+    b"bdrip",
+    b"dvdrip",
+    b"hdtv",
+    b"pdtv",
+    b"video",
+    b"audio",
+    b"duration",
+    b"runtime",
+    b"aspect",
+    b"fps",
+    b"channels",
+    b"sample",
+    b"encoder",
+    b"x264",
+    b"x265",
+    b"hevc",
+    b"avc",
+    b"xvid",
+    b"divx",
+    b"aac",
+    b"ac3",
+    b"dts",
+    b"truehd",
+    b"atmos",
+    b"flac",
+    b"mp3",
+    b"movie",
+    b"film",
+    b"episode",
+    b"season",
+    b"series",
+    b"title",
+    b"year",
+    b"director",
+    b"cast",
+    b"actors",
+    b"plot",
+    b"synopsis",
+    b"imdb",
+    b"rating",
+    b"crack",
+    b"readme",
+    b"setup",
+    b"installer",
+    b"license",
+    b"registration",
+    b"protection",
+    b"requirements",
+    b"platform",
+    b"operating",
+    b"system",
+    b"contact",
+    b"irc",
+    b"www",
+    b"http",
+    b"ftp",
+    b"email",
+    b"apply",
+    b"join",
+];
+struct NfoQualityTrie {
+    next: Vec<[u16; 36]>,
+    outputs: Vec<u128>,
+}
+fn nfo_quality_symbol(byte: u8) -> Option<usize> {
+    let byte = byte.to_ascii_lowercase();
+    if byte.is_ascii_lowercase() {
+        Some((byte - b'a') as usize)
+    } else if byte.is_ascii_digit() {
+        Some(26 + (byte - b'0') as usize)
+    } else {
+        None
+    }
+}
+fn nfo_quality_scan(text: &[u8]) -> (usize, usize, usize) {
+    nfo_quality_scan_with(text, |_, _| Ok(())).expect("infallible lexical scan")
+}
+fn nfo_quality_scan_with(
+    text: &[u8],
+    mut visit: impl FnMut(usize, u8) -> Result<(), ()>,
+) -> Result<(usize, usize, usize), ()> {
+    static TRIE: std::sync::OnceLock<NfoQualityTrie> = std::sync::OnceLock::new();
+    let trie = TRIE.get_or_init(|| {
+        let mut next = vec![[0; 36]];
+        let mut outputs = vec![0u128];
+        for (i, keyword) in NFO_QUALITY_KEYWORDS.iter().enumerate() {
+            let mut node = 0;
+            for &byte in *keyword {
+                let symbol = nfo_quality_symbol(byte).unwrap();
+                if next[node][symbol] == 0 {
+                    next[node][symbol] = next.len() as u16;
+                    next.push([0; 36]);
+                    outputs.push(0);
+                }
+                node = next[node][symbol] as usize;
+            }
+            outputs[node] |= 1u128 << i;
+        }
+        let mut fail = vec![0usize; next.len()];
+        let mut queue = std::collections::VecDeque::new();
+        for &node in &next[0] {
+            if node != 0 {
+                queue.push_back(node as usize);
+            }
+        }
+        while let Some(node) = queue.pop_front() {
+            for symbol in 0..36 {
+                let child = next[node][symbol] as usize;
+                if child != 0 {
+                    fail[child] = next[fail[node]][symbol] as usize;
+                    outputs[child] |= outputs[fail[child]];
+                    queue.push_back(child);
+                } else {
+                    next[node][symbol] = next[fail[node]][symbol];
+                }
+            }
+        }
+        NfoQualityTrie { next, outputs }
+    });
+    let (mut state, mut found, mut binary, mut lines, mut occupied) =
+        (0usize, 0u128, 0usize, 0usize, false);
+    for (pos, &byte) in text.iter().enumerate() {
+        visit(pos, byte)?;
+        if found.count_ones() < 10 {
+            state = nfo_quality_symbol(byte).map_or(0, |symbol| trie.next[state][symbol] as usize);
+            found |= trie.outputs[state];
+        }
+        if binary < 4 && (byte <= 8 || byte == 11 || byte == 12 || (14..=31).contains(&byte)) {
+            binary += 1;
+        }
+        if byte == b'\n' {
+            if occupied {
+                lines += 1;
+                occupied = false;
+            }
+        } else if !matches!(byte, b' ' | b'\t' | b'\r' | 0 | 11) {
+            occupied = true;
+        }
+    }
+    if occupied {
+        lines += 1;
+    }
+    Ok((found.count_ones().min(10) as usize, binary, lines))
+}
+fn nfo_meta_quality_fused(m: &mut nfo_metadata_pcre::Matcher, text: &[u8]) -> Result<i32, ()> {
+    nfo_meta_quality_score(m, text, nfo_quality_scan(text))
+}
+fn nfo_meta_quality(m: &mut nfo_metadata_pcre::Matcher, text: &[u8]) -> Result<i32, ()> {
+    let metrics = m.prepare_quality(text)?;
+    let result = nfo_meta_quality_score(m, text, metrics);
+    m.clear_quality();
+    result
+}
+fn nfo_meta_quality_score(
+    m: &mut nfo_metadata_pcre::Matcher,
+    text: &[u8],
+    metrics: (usize, usize, usize),
+) -> Result<i32, ()> {
+    let mut score = 50;
+    score += if text.len() < 100 {
+        -20
+    } else if text.len() > 500 && text.len() < 20_000 {
+        15
+    } else if text.len() >= 20_000 {
+        5
+    } else {
+        0
+    };
+
+    let (keyword_count, binary_count, line_count) = metrics;
+    score += (keyword_count * 2) as i32;
+    let saturated = |score: i32| score >= 100 + (binary_count * 5) as i32;
+    let mut media_count = 0;
+    for &id in NFO_EXTRACT_ALL_MEDIA_IDS {
+        media_count += m.count(id, text)?;
+        if media_count >= 3 {
+            break;
+        }
+    }
+    score += (media_count * 5).min(15) as i32;
+    if saturated(score) {
+        return Ok(100);
+    }
+    score += (nfo_meta_urls(m, text)?.count() * 2).min(10) as i32;
+    if saturated(score) {
+        return Ok(100);
+    }
+    for range in [0..2, 2..4, 4..7] {
+        for i in range {
+            if m.captures(NFO_EXTRACT_CODEC_INFO[i], text, 0)?.is_some() {
+                score += 3;
+                break;
+            }
+        }
+    }
+    if saturated(score) {
+        return Ok(100);
+    }
+    score += nfo_meta_art(m, text)? * 10 + nfo_meta_structure_lines(m, text, line_count)?;
+    if saturated(score) {
+        return Ok(100);
+    }
+    if nfo_meta_group(m, text)? != NfoMetaValue::Null {
+        score += 8;
+    }
+    if saturated(score) {
+        return Ok(100);
+    }
+    for &id in NFO_EXTRACT_RELEASE_DATE {
+        if m.captures(id, text, 0)?.is_some() {
+            score += 5;
+            break;
+        }
+    }
+    score += (nfo_meta_language(m, text)?.count() * 2).min(6) as i32;
+    if saturated(score) {
+        return Ok(100);
+    }
+    for &id in NFO_EXTRACT_RUNTIME {
+        if m.captures(id, text, 0)?.is_some() {
+            score += 4;
+            break;
+        }
+    }
+    score -= (binary_count * 5) as i32;
+    Ok(score.clamp(0, 100))
+}
+fn nfo_meta_parse(m: &mut nfo_metadata_pcre::Matcher, text: &[u8]) -> Result<NfoMetaValue, ()> {
+    Ok(NfoMetaValue::map([
+        ("urls", nfo_meta_urls(m, text)?),
+        ("group", nfo_meta_group(m, text)?),
+        ("release_date", nfo_meta_date(m, text)?),
+        ("codec_info", nfo_meta_codecs(m, text)?),
+        ("file_size", nfo_meta_size(m, text)?),
+        ("media_ids", nfo_meta_ids(m, text)?),
+        ("show_id", nfo_meta_show(m, text)?),
+        ("language", nfo_meta_language(m, text)?),
+        ("runtime", nfo_meta_runtime(m, text)?),
+        ("genre", nfo_meta_genre(m, text)?),
+        ("software_info", nfo_meta_software(m, text)?),
+        ("release_title", nfo_meta_title(m, text)?),
+    ]))
+}
+fn nfo_meta_range(ptr: *const u8, len: usize) -> Option<(usize, usize)> {
+    if (ptr.is_null() && len != 0) || len > isize::MAX as usize {
+        return None;
+    }
+    let start = ptr as usize;
+    Some((start, start.checked_add(len)?))
+}
+fn nfo_meta_overlaps(a: (usize, usize), b: (usize, usize)) -> bool {
+    a.0 < b.1 && b.0 < a.1 && a.0 != a.1 && b.0 != b.1
+}
+unsafe fn nfo_meta_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+    nfo_meta_range(ptr, len)?;
+    Some(if len == 0 {
+        b""
+    } else {
+        unsafe { std::slice::from_raw_parts(ptr, len) }
+    })
+}
+unsafe fn nfo_meta_output(bytes: &[u8], out: *mut u8, cap: usize) -> isize {
+    if cap < bytes.len() {
+        return -(bytes.len().max(2) as isize);
+    }
+    if !bytes.is_empty() {
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len());
+        }
+    }
+    bytes.len() as isize
+}
+macro_rules! nfo_metadata_export {
+    ($export:ident,$implementation:ident) => {
+        /// PHP-serialized byte-preserving metadata; -1 declines, a smaller
+        /// negative result requests that many output bytes. No partial writes.
+        /// # Safety
+        /// Input/output must be valid for their declared lengths and disjoint.
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn $export(
+            text: *const u8,
+            len: usize,
+            out: *mut u8,
+            cap: usize,
+        ) -> isize {
+            let Some(input) = nfo_meta_range(text, len) else {
+                return -1;
+            };
+            let Some(output) = nfo_meta_range(out.cast_const(), cap) else {
+                return -1;
+            };
+            if nfo_meta_overlaps(input, output) {
+                return -1;
+            }
+            std::panic::catch_unwind(|| {
+                let bytes = unsafe { nfo_meta_slice(text, len) }.ok_or(())?;
+                let value =
+                    nfo_metadata_pcre::with_matcher(|matcher| $implementation(matcher, bytes))?;
+                let mut serialized = Vec::new();
+                value.serialize(&mut serialized);
+                Ok::<isize, ()>(unsafe { nfo_meta_output(&serialized, out, cap) })
+            })
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(-1)
+        }
+    };
+}
+nfo_metadata_export!(nntmux_nfo_extract_urls, nfo_meta_urls);
+nfo_metadata_export!(nntmux_nfo_extract_group_name, nfo_meta_group);
+nfo_metadata_export!(nntmux_nfo_extract_release_date, nfo_meta_date);
+nfo_metadata_export!(nntmux_nfo_extract_codec_info, nfo_meta_codecs);
+nfo_metadata_export!(nntmux_nfo_extract_file_size, nfo_meta_size);
+nfo_metadata_export!(nntmux_nfo_extract_all_media_ids, nfo_meta_ids);
+nfo_metadata_export!(nntmux_nfo_parse_show_id, nfo_meta_show);
+nfo_metadata_export!(nntmux_nfo_extract_language, nfo_meta_language);
+nfo_metadata_export!(nntmux_nfo_extract_runtime, nfo_meta_runtime);
+nfo_metadata_export!(nntmux_nfo_extract_genre, nfo_meta_genre);
+nfo_metadata_export!(nntmux_nfo_extract_software_info, nfo_meta_software);
+nfo_metadata_export!(nntmux_nfo_extract_release_title, nfo_meta_title);
+nfo_metadata_export!(nntmux_nfo_parse_metadata, nfo_meta_parse);
+macro_rules! nfo_scalar_export {
+    ($export:ident,$implementation:ident) => {
+        /// Scalar analysis, or -1 when unavailable/invalid.
+        /// # Safety
+        /// Input must be readable for its declared length.
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn $export(text: *const u8, len: usize) -> i32 {
+            std::panic::catch_unwind(|| {
+                let bytes = unsafe { nfo_meta_slice(text, len) }.ok_or(())?;
+                nfo_metadata_pcre::with_matcher(|matcher| $implementation(matcher, bytes))
+            })
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or(-1)
+        }
+    };
+}
+nfo_scalar_export!(nntmux_nfo_calculate_quality, nfo_meta_quality);
+nfo_scalar_export!(nntmux_nfo_calculate_quality_fused, nfo_meta_quality_fused);
+nfo_scalar_export!(nntmux_nfo_has_ascii_art, nfo_meta_art);
+nfo_scalar_export!(nntmux_nfo_analyze_structure, nfo_meta_structure);
+
+unsafe fn nfo_append_tags(
+    name: *const u8,
+    name_len: usize,
+    text: *const u8,
+    len: usize,
+    out: *mut u8,
+    cap: usize,
+    mode: u8,
+) -> isize {
+    let Some(name_range) = nfo_meta_range(name, name_len) else {
+        return -1;
+    };
+    let Some(input_range) = nfo_meta_range(text, len) else {
+        return -1;
+    };
+    let Some(output_range) = nfo_meta_range(out.cast_const(), cap) else {
+        return -1;
+    };
+    if nfo_meta_overlaps(name_range, output_range) || nfo_meta_overlaps(input_range, output_range) {
+        return -1;
+    }
+    std::panic::catch_unwind(|| {
+        let name = unsafe { nfo_meta_slice(name, name_len) }.ok_or(())?;
+        let text = unsafe { nfo_meta_slice(text, len) }.ok_or(())?;
+        let mut bytes = name.to_vec();
+        for i in 1..=4 {
+            if mode != 0 && mode != i {
+                continue;
+            }
+            let value = match i {
+                1 => extract_language_from_nfo(text),
+                2 => extract_resolution_from_nfo(text),
+                3 => extract_source_from_nfo(text),
+                _ => extract_audio_from_nfo(text),
+            };
+            if let Some(value) = value {
+                bytes.push(b'.');
+                bytes.extend_from_slice(value);
+            }
+        }
+        Ok::<isize, ()>(unsafe { nfo_meta_output(&bytes, out, cap) })
+    })
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or(-1)
+}
+macro_rules! nfo_append_export {
+    ($export:ident,$mode:expr) => {
+        /// Appends the selected original NFO tag(s) to raw name bytes.
+        /// # Safety
+        /// Inputs and output must be valid for their lengths; output must not overlap either input.
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn $export(
+            name: *const u8,
+            name_len: usize,
+            text: *const u8,
+            len: usize,
+            out: *mut u8,
+            cap: usize,
+        ) -> isize {
+            unsafe { nfo_append_tags(name, name_len, text, len, out, cap, $mode) }
+        }
+    };
+}
+nfo_append_export!(nntmux_nfo_append_title_year_tags, 0);
+nfo_append_export!(nntmux_nfo_append_language, 1);
+nfo_append_export!(nntmux_nfo_append_resolution, 2);
+nfo_append_export!(nntmux_nfo_append_source, 3);
+nfo_append_export!(nntmux_nfo_append_audio_codec, 4);
+
+#[cfg(test)]
+mod wave8_metadata_tests {
+    use super::*;
+
+    #[test]
+    fn serialized_values_preserve_bytes_and_sparse_keys() {
+        let value = NfoMetaValue::Array(vec![
+            (NfoMetaKey::Int(0), NfoMetaValue::bytes(b"a\xff\0")),
+            (NfoMetaKey::Int(2), NfoMetaValue::Null),
+        ]);
+        let mut out = Vec::new();
+        value.serialize(&mut out);
+        assert_eq!(out, b"a:2:{i:0;s:3:\"a\xff\0\";i:2;N;}");
+    }
+
+    #[test]
+    fn one_scan_quality_metrics_match_php_byte_rules() {
+        let mut corpus = vec![
+            Vec::new(),
+            b"INSTALLER installer crack cracked x264 x265 AVC".to_vec(),
+            b"\0\t \r\n\x0c\nword\n".to_vec(),
+        ];
+        let mut seed = 471u64;
+        for length in [1, 31, 100, 1000, 65535] {
+            let mut text = Vec::new();
+            for _ in 0..length {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                text.push((seed >> 32) as u8);
+            }
+            text.extend_from_slice(
+                b"INSTALLER release x264 language source cracked nfo scene art notes http www",
+            );
+            corpus.push(text);
+        }
+        for text in corpus {
+            let expected_keywords = NFO_QUALITY_KEYWORDS
+                .iter()
+                .filter(|keyword| find_ascii_ci(&text, keyword).is_some())
+                .count()
+                .min(10);
+            let expected_binary = text
+                .iter()
+                .filter(|&&b| b <= 8 || b == 11 || b == 12 || (14..=31).contains(&b))
+                .count()
+                .min(4);
+            let expected_lines = text
+                .split(|b| *b == b'\n')
+                .filter(|line| !nfo_meta_trim(line).is_empty())
+                .count();
+            assert_eq!(
+                nfo_quality_scan(&text),
+                (expected_keywords, expected_binary, expected_lines)
+            );
+        }
+    }
+
+    #[test]
+    fn php_float_cast_wraps_at_integer_boundaries() {
+        assert_eq!(nfo_meta_php_float_to_int(1.99), 1);
+        assert_eq!(nfo_meta_php_float_to_int(f64::INFINITY), 0);
+        assert_eq!(
+            nfo_meta_php_float_to_int(9_223_372_036_854_775_808.0),
+            i64::MIN
+        );
+        assert_eq!(nfo_meta_php_float_to_int(18_446_744_073_709_551_616.0), 0);
+        assert_eq!(
+            nfo_meta_php_float_to_int(18_446_744_073_709_555_712.0),
+            4096
+        );
+    }
+
+    #[test]
+    fn metadata_abi_rejects_invalid_lengths_nulls_and_overlap() {
+        let mut bytes = *b"0123456789abcdef";
+        let ptr = bytes.as_mut_ptr();
+        unsafe {
+            assert_eq!(nntmux_nfo_extract_urls(std::ptr::null(), 1, ptr, 16), -1);
+            assert_eq!(
+                nntmux_nfo_extract_urls(ptr, 16, std::ptr::null_mut(), 1),
+                -1
+            );
+            assert_eq!(nntmux_nfo_extract_urls(ptr, usize::MAX, ptr, 16), -1);
+            assert_eq!(nntmux_nfo_extract_urls(ptr, 8, ptr.add(7), 8), -1);
+            assert_eq!(nntmux_nfo_calculate_quality(std::ptr::null(), 1), -1);
+            assert_eq!(nntmux_nfo_has_ascii_art(ptr, usize::MAX), -1);
+            assert_eq!(nntmux_nfo_analyze_structure(ptr, usize::MAX), -1);
+        }
+        assert_eq!(&bytes, b"0123456789abcdef");
+    }
+
+    #[test]
+    fn append_tags_have_atomic_buffers_and_preserve_binary_name() {
+        let name = b"Movie\xff\0";
+        let nfo = b"Language: DE\nVideo resolution 1280\nSource: BD\nAudio: AC-3";
+        let expected = b"Movie\xff\0.GERMAN.720p.Bluray.x264.AC3";
+        let mut small = [b'?'; 4];
+        unsafe {
+            assert_eq!(
+                nntmux_nfo_append_title_year_tags(
+                    name.as_ptr(),
+                    name.len(),
+                    nfo.as_ptr(),
+                    nfo.len(),
+                    small.as_mut_ptr(),
+                    4
+                ),
+                -(expected.len() as isize)
+            );
+            assert_eq!(small, [b'?'; 4]);
+            let mut out = vec![0; expected.len()];
+            assert_eq!(
+                nntmux_nfo_append_title_year_tags(
+                    name.as_ptr(),
+                    name.len(),
+                    nfo.as_ptr(),
+                    nfo.len(),
+                    out.as_mut_ptr(),
+                    out.len()
+                ),
+                expected.len() as isize
+            );
+            assert_eq!(out, expected);
+            assert_eq!(
+                nntmux_nfo_append_language(
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut(),
+                    0
+                ),
+                0
+            );
+            assert_eq!(
+                nntmux_nfo_append_language(
+                    name.as_ptr(),
+                    name.len(),
+                    std::ptr::null(),
+                    1,
+                    small.as_mut_ptr(),
+                    4
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_nfo_append_language(
+                    small.as_ptr(),
+                    4,
+                    nfo.as_ptr(),
+                    nfo.len(),
+                    small.as_mut_ptr(),
+                    4
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_nfo_append_language(
+                    name.as_ptr(),
+                    name.len(),
+                    small.as_ptr(),
+                    4,
+                    small.as_mut_ptr(),
+                    4
+                ),
+                -1
+            );
+        }
+    }
+
+    #[test]
+    fn quality_prefix_filters_keep_source_match_candidates() {
+        for (id, text, pos) in [
+            (0, b"http://example.org".as_slice(), 0),
+            (1, b"www.example.org".as_slice(), 0),
+            (2, b"x\n---TEST---".as_slice(), 1),
+            (5, b"x\nTest release\n".as_slice(), 1),
+            (7, b"Xy presents".as_slice(), 0),
+            (11, b"x\nTEST".as_slice(), 2),
+            (12, b"released 1/2/2024".as_slice(), 0),
+            (16, b"H.264".as_slice(), 0),
+            (39, b"spoke English".as_slice(), 0),
+            (39, b"spoken English".as_slice(), 0),
+            (55, b"\x94\x8c\xe2".as_slice(), 0),
+            (56, b"\x91\x96\xe2".as_slice(), 0),
+            (58, b"\0\0\0\0\0".as_slice(), 0),
+            (59, b"x\n  === border ===".as_slice(), 2),
+            (62, b"x\nField: value".as_slice(), 2),
+            (62, b"x\nAb : value".as_slice(), 2),
+            (62, b"x\nField\nName: value".as_slice(), 2),
+        ] {
+            assert!(nfo_quality_first_byte(id, text[pos]), "dispatch {id}");
+            assert!(nfo_quality_prefix(id, text, pos), "prefix {id}");
+        }
+    }
+
+    #[test]
+    fn optional_onepass_quality_matches_fused_evidence() {
+        let Some(mut matcher) = nfo_metadata_pcre::Matcher::new() else {
+            return;
+        };
+        let mut corpus = vec![b"".to_vec(),b"x".repeat(19999),b"Title: Film (2024)\n--- TEST ---\nvideo: x265 audio: AAC 1080p\nimdb.com/title/tt1234567\nDate: 1/2/24\nGenre: Drama\nLanguage: English,English".to_vec()];
+        let mut seed = 173u64;
+        for length in [13, 128, 1024, 65535] {
+            let mut text = Vec::with_capacity(length);
+            for _ in 0..length {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                text.push((seed >> 32) as u8);
+            }
+            corpus.push(text);
+        }
+        for text in corpus {
+            let fused = nfo_meta_quality_fused(&mut matcher, &text).unwrap();
+            assert_eq!(nfo_meta_quality(&mut matcher, &text).unwrap(), fused);
+        }
+    }
+
+    #[test]
+    fn optional_quality_declines_ambiguous_prefix_work() {
+        let Some(mut matcher) = nfo_metadata_pcre::Matcher::new() else {
+            return;
+        };
+        for text in [
+            [b" \n".repeat(5000), b"Actual presents".to_vec()].concat(),
+            [
+                b"-".repeat(1000),
+                b"AB".to_vec(),
+                b" ".repeat(1000),
+                b"!\nActual presents".to_vec(),
+            ]
+            .concat(),
+        ] {
+            assert_eq!(nfo_meta_quality(&mut matcher, &text), Err(()));
+        }
+    }
+
+    #[test]
+    fn optional_quality_evidence_does_not_survive_input_reuse_or_unwind() {
+        if nfo_metadata_pcre::Matcher::new().is_none() {
+            return;
+        }
+        let mut buffer = [b'q'; 10];
+        for text in [b"video x264", b"qqqqqqqqqq", b"audio aac ", b"qqqqqqqqqq"]
+            .into_iter()
+            .cycle()
+            .take(100)
+        {
+            buffer.copy_from_slice(text);
+            let fused =
+                unsafe { nntmux_nfo_calculate_quality_fused(buffer.as_ptr(), buffer.len()) };
+            assert_eq!(
+                unsafe { nntmux_nfo_calculate_quality(buffer.as_ptr(), buffer.len()) },
+                fused
+            );
+        }
+        let _ = std::panic::catch_unwind(|| {
+            let _: Result<(), ()> = nfo_metadata_pcre::with_matcher(|matcher| {
+                matcher.prepare_quality(&buffer)?;
+                panic!("test request unwind");
+            });
+        });
+        buffer.copy_from_slice(b"video x265");
+        assert_eq!(
+            unsafe { nntmux_nfo_calculate_quality(buffer.as_ptr(), buffer.len()) },
+            unsafe { nntmux_nfo_calculate_quality_fused(buffer.as_ptr(), buffer.len()) }
+        );
+    }
+
+    #[test]
+    fn optional_pcre_payload_semantics_and_buffers() {
+        // `cargo test` has no PHP process and may have no PCRE2 symbols.
+        // PHP's integration suite exercises every export with the real engine.
+        let Some(mut matcher) = nfo_metadata_pcre::Matcher::new() else {
+            return;
+        };
+        let text = b"http://x.com http://x.com http://y.com www.z.com\nLanguage: English,English\nSubs: English\nDate: 33/44/99\nDuration: 1:30:59\nGenre: Drama Drama\nVideo: x265\nAudio: AAC\nResolution: 1920x1080\nimdb.com/title/tt12345678\ntvmaze.com/shows/123\n";
+        let urls = nfo_meta_urls(&mut matcher, text).unwrap();
+        let mut serialized = Vec::new();
+        urls.serialize(&mut serialized);
+        assert_eq!(serialized,b"a:3:{i:0;s:12:\"http://x.com\";i:2;s:12:\"http://y.com\";i:3;s:16:\"http://www.z.com\";}");
+        assert_eq!(
+            nfo_meta_date(&mut matcher, text).unwrap(),
+            NfoMetaValue::bytes(b"2099-44-33")
+        );
+        assert_eq!(nfo_meta_language(&mut matcher, text).unwrap().count(), 3);
+        assert_eq!(
+            nfo_meta_runtime(&mut matcher, text).unwrap(),
+            NfoMetaValue::Int(90)
+        );
+        assert_eq!(nfo_meta_genre(&mut matcher, text).unwrap().count(), 1);
+        let mut short = [b'?'; 1];
+        unsafe {
+            assert_eq!(
+                nntmux_nfo_extract_urls(text.as_ptr(), text.len(), short.as_mut_ptr(), 1),
+                -(serialized.len() as isize)
+            );
+            assert_eq!(short, [b'?']);
+            let mut out = vec![0; serialized.len()];
+            assert_eq!(
+                nntmux_nfo_extract_urls(text.as_ptr(), text.len(), out.as_mut_ptr(), out.len()),
+                serialized.len() as isize
+            );
+            assert_eq!(out, serialized);
+        }
+    }
+}
+
+fn nfo_quality_prefix(id: usize, text: &[u8], pos: usize) -> bool {
+    let b = text[pos];
+    let wb = pos == 0 || !is_word_byte(text[pos - 1]);
+    let line_start = pos == 0 || matches!(text[pos - 1], b'\n' | b'\r' | 11 | 12 | 0x85 | 0);
+    let starts = |words: &[&[u8]]| {
+        words.iter().any(|word| {
+            text.get(pos..pos + word.len())
+                .is_some_and(|s| s.eq_ignore_ascii_case(word))
+        })
+    };
+    match id {
+        0 => starts(&[b"http://", b"https://"]),
+        1 => wb && starts(&[b"www."]),
+        2 | 5 => pos == 0 || b == b'\n',
+        3 => starts(&[b"present", b"brought", b"from"]),
+        4 => starts(&[b"greet", b"respect"]),
+        6 => starts(&[b"released", b"rls"]),
+        7 => {
+            if !wb || !b.is_ascii_alphabetic() {
+                return false;
+            }
+            let mut end = pos + 1;
+            while end < text.len() && end - pos < 15 && text[end].is_ascii_alphanumeric() {
+                end += 1;
+            }
+            if end - pos < 2 || !text.get(end).is_some_and(|b| is_pcre_space(*b)) {
+                return false;
+            }
+            while text.get(end).is_some_and(|b| is_pcre_space(*b)) {
+                end += 1;
+            }
+            [b"present".as_slice(), b"bring"].iter().any(|word| {
+                text.get(end..end + word.len())
+                    .is_some_and(|s| s.eq_ignore_ascii_case(word))
+            })
+        }
+        8 => {
+            matches!(b, b'-' | b'=') && text.get(pos + 1).is_some_and(|b| matches!(b, b'-' | b'='))
+        }
+        9 => starts(&[b"irc."]),
+        10 => starts(&[b"www."]),
+        11 => line_start,
+        12..=14 => starts(&[b"date", b"release", b"rls"]),
+        15 => starts(&[b"video", b"codec"]),
+        16 => {
+            wb && starts(&[
+                b"x264", b"x265", b"hevc", b"h264", b"h.264", b"h265", b"h.265", b"xvid", b"divx",
+                b"av1", b"vp9",
+            ])
+        }
+        17 => starts(&[b"audio", b"sound"]),
+        18 => {
+            wb && starts(&[
+                b"aac", b"ac3", b"dts", b"truehd", b"atmos", b"flac", b"eac3", b"dd",
+            ])
+        }
+        19 => starts(&[b"resolution", b"quality"]),
+        20 => {
+            wb && starts(&[
+                b"2160p", b"1080p", b"720p", b"480p", b"4k", b"uhd", b"fhd", b"hd",
+            ])
+        }
+        21 => {
+            wb && b.is_ascii_digit()
+                && text.get(pos + 1).is_some_and(u8::is_ascii_digit)
+                && text.get(pos + 2).is_some_and(u8::is_ascii_digit)
+        }
+        24 => starts(&[b"imdb.com/title/"]),
+        25 => starts(&[b"thetvdb.com/"]),
+        26 => starts(&[b"themoviedb.org/movie/"]),
+        27 => starts(&[b"themoviedb.org/tv/"]),
+        28 => starts(&[b"tvmaze.com/shows/"]),
+        29 => starts(&[b"anidb.net/"]),
+        30 => starts(&[b"myanimelist.net/anime/"]),
+        39 => starts(&[b"language", b"audio", b"spoken", b"spoke", b"dialogue"]),
+        40 => starts(&[b"sub"]),
+        42 | 43 => starts(&[b"runtime", b"duration", b"length", b"playtime"]),
+        44 => wb && b.is_ascii_digit() && text.get(pos + 1).is_some_and(u8::is_ascii_digit),
+        54 => {
+            b"-=*~#@".contains(&b)
+                && text
+                    .get(pos..pos + 5)
+                    .is_some_and(|s| s.iter().all(|b| b"-=*~#@".contains(b)))
+        }
+        55 => "┌┐└┘├┤┬┴┼│─╔╗╚╝║═".as_bytes().contains(&b),
+        56 => "░▒▓█▄▀■□▪▫".as_bytes().contains(&b),
+        57 => {
+            b"/|_".contains(&b)
+                && text
+                    .get(pos..pos + 3)
+                    .is_some_and(|s| s.iter().all(|b| b"/|_".contains(b)))
+        }
+        58 => {
+            !is_pcre_space(b)
+                && text
+                    .get(pos..pos + 5)
+                    .is_some_and(|s| s.iter().all(|v| *v == b))
+        }
+        59..=62 => {
+            if !line_start {
+                return false;
+            }
+            let mut start = pos;
+            while text.get(start).is_some_and(|b| matches!(b, b' ' | b'\t')) {
+                start += 1;
+            }
+            let Some(&first) = text.get(start) else {
+                return false;
+            };
+            match id {
+                59 => {
+                    b"-=*".contains(&first)
+                        && text.get(start + 1).is_some_and(|b| b"-=*".contains(b))
+                }
+                60 => first == b'[',
+                61 => first == b'<',
+                _ => {
+                    if !first.is_ascii_alphabetic() {
+                        return false;
+                    }
+                    for end in start + 1..=start + 21 {
+                        if end >= start + 3 {
+                            let mut separator = end;
+                            while text.get(separator).is_some_and(|b| is_pcre_space(*b)) {
+                                separator += 1;
+                            }
+                            if text
+                                .get(separator)
+                                .is_some_and(|b| matches!(b, b':' | b'.'))
+                            {
+                                return true;
+                            }
+                        }
+                        if !text
+                            .get(end)
+                            .is_some_and(|b| b.is_ascii_alphabetic() || is_pcre_space(*b))
+                        {
+                            break;
+                        }
+                    }
+                    false
+                }
+            }
+        }
+        _ => false,
+    }
+}
+// Necessary initial bytes are only a dispatch accelerator. The full prefix
+// predicate and the original anchored PCRE still decide every potential match.
+fn nfo_quality_first_byte(id: usize, byte: u8) -> bool {
+    let lo = byte.to_ascii_lowercase();
+    match id {
+        0 => lo == b'h',
+        1 | 10 => lo == b'w',
+        2 | 5 | 11 | 59..=62 => true,
+        3 => matches!(lo, b'p' | b'b' | b'f'),
+        4 => matches!(lo, b'g' | b'r'),
+        6 => lo == b'r',
+        7 => byte.is_ascii_alphabetic(),
+        8 => matches!(byte, b'-' | b'='),
+        9 => lo == b'i',
+        12..=14 => matches!(lo, b'd' | b'r'),
+        15 => matches!(lo, b'v' | b'c'),
+        16 => matches!(lo, b'x' | b'h' | b'd' | b'a' | b'v'),
+        17 => matches!(lo, b'a' | b's'),
+        18 => matches!(lo, b'a' | b'd' | b't' | b'f' | b'e'),
+        19 => matches!(lo, b'r' | b'q'),
+        20 => matches!(lo, b'2' | b'1' | b'7' | b'4' | b'u' | b'f' | b'h'),
+        21 | 44 => byte.is_ascii_digit(),
+        24 => lo == b'i',
+        25..=28 => lo == b't',
+        29 => lo == b'a',
+        30 => lo == b'm',
+        39 => matches!(lo, b'l' | b'a' | b's' | b'd'),
+        40 => lo == b's',
+        42 | 43 => matches!(lo, b'r' | b'd' | b'l' | b'p'),
+        54 => b"-=*~#@".contains(&byte),
+        55 => "┌┐└┘├┤┬┴┼│─╔╗╚╝║═".as_bytes().contains(&byte),
+        56 => "░▒▓█▄▀■□▪▫".as_bytes().contains(&byte),
+        57 => b"/|_".contains(&byte),
+        58 => !is_pcre_space(byte),
+        _ => false,
+    }
+}
