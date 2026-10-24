@@ -13500,3 +13500,630 @@ mod wave18_additional_archive_media_ingestion_config_tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 19: ProcessingOutcome, PostProcessingConfigurationData, FileCompletionStatus,
+// ImageAssetProfile and BinariesConfig helpers.
+// ---------------------------------------------------------------------------
+
+/// Non-null, aligned typed slice of `count` elements whose byte span fits `isize`.
+#[inline]
+fn w19pc_slice_ok<T>(ptr: *const T, count: usize) -> bool {
+    !ptr.is_null()
+        && ptr.is_aligned()
+        && count
+            .checked_mul(std::mem::size_of::<T>())
+            .is_some_and(|bytes| {
+                bytes <= isize::MAX as usize && (ptr as usize).checked_add(bytes).is_some()
+            })
+}
+
+/// Borrow `len` input bytes; a null pointer is only accepted for an empty input.
+///
+/// # Safety
+/// A non-null `ptr` must be readable for `len` bytes.
+#[inline]
+unsafe fn w19pc_bytes<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+    if len > isize::MAX as usize {
+        return None;
+    }
+    if ptr.is_null() {
+        return (len == 0).then_some(&[][..]);
+    }
+    (ptr as usize).checked_add(len)?;
+    // SAFETY: `ptr` is non-null and the caller guarantees `len` readable bytes.
+    Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+}
+
+/// Copy `bytes` to `out` and return the length, `-(len)` when `cap` is too small
+/// (`-1` stays reserved for invalid input), or -1 for a null/oversized output.
+///
+/// # Safety
+/// A non-null `out` must be writable for `cap` bytes.
+#[inline]
+unsafe fn w19pc_write(out: *mut u8, cap: usize, bytes: &[u8]) -> isize {
+    if out.is_null() || cap > isize::MAX as usize || (out as usize).checked_add(cap).is_none() {
+        return -1;
+    }
+    if bytes.len() > cap {
+        return -(bytes.len().max(2) as isize);
+    }
+    // SAFETY: `out` is non-null and writable for `cap >= bytes.len()` bytes; `bytes` is a
+    // distinct Rust allocation or static.
+    unsafe { std::slice::from_raw_parts_mut(out, bytes.len()) }.copy_from_slice(bytes);
+    bytes.len() as isize
+}
+
+/// `ProcessingOutcome` backing values in declaration order.
+const W19_OUTCOMES: [&[u8]; 12] = [
+    b"completed",
+    b"no-useful-artifacts",
+    b"passworded",
+    b"group-unavailable",
+    b"temporary-workspace-unavailable",
+    b"timed-out",
+    b"deleted-after-timeout",
+    b"deleted-broken-nzb",
+    b"deleted-par2-only",
+    b"not-found",
+    b"awaiting-late-articles",
+    b"failed",
+];
+
+/// Case index plus bit 8 (`isSuccessful`) and bit 9 (`isDeleted`), or `None` when unknown.
+fn w19_outcome_classify(value: &[u8]) -> Option<i32> {
+    let index = W19_OUTCOMES.iter().position(|case| *case == value)?;
+    let successful = matches!(index, 0..=2);
+    let deleted = matches!(index, 6..=8);
+    Some(index as i32 | (i32::from(successful) << 8) | (i32::from(deleted) << 9))
+}
+
+/// `ProcessingOutcome::tryFrom` / `isSuccessful` / `isDeleted` in one call: the case index
+/// (bits 0-7) with bit 8 set when successful and bit 9 when deleted; -1 for an unknown value
+/// or invalid input.
+///
+/// # Safety
+/// A non-null `ptr` must be readable for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_pout_classify(ptr: *const u8, len: usize) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: forwarded caller contract.
+        unsafe { w19pc_bytes(ptr, len) }
+            .and_then(w19_outcome_classify)
+            .unwrap_or(-1)
+    }))
+    .unwrap_or(-1)
+}
+
+/// `PostProcessingConfigurationData` numeric fields (everything but `innerFileBlacklist`).
+const W19_PPCD_NUMERIC_COUNT: usize = 28;
+
+const W19_PPCD_DEFAULT_BLACKLIST: &[u8] = b"/setup.exe|password.url/i";
+
+/// `PostProcessingConfigurationData::defaults()` numeric values (bools as 0/1), skipping
+/// the string at constructor position 16.
+const W19_PPCD_DEFAULTS: [i64; W19_PPCD_NUMERIC_COUNT] = [
+    1,
+    1,
+    1,
+    1,
+    1,
+    60,
+    120,
+    3,
+    25,
+    3,
+    1,
+    10,
+    3,
+    0,
+    2,
+    5,
+    0,
+    0,
+    0,
+    0,
+    1_048_576,
+    107_374_182_400,
+    1_048_576,
+    107_374_182_400,
+    100,
+    5,
+    1,
+    0,
+];
+
+/// Whether numeric position `position` holds a PHP `bool` property (`extractUsingRarInfo`,
+/// `processJpg`..`saveAudioPreview`, `lookupNfo`, `lookupPar2`).
+fn w19_ppcd_is_bool(position: usize) -> bool {
+    matches!(position, 13 | 16..=19 | 26 | 27)
+}
+
+/// Coerce bool positions to 0/1 (PHP `(bool)` of an int); integer positions pass through.
+fn w19_ppcd_normalize(raw: &[i64; W19_PPCD_NUMERIC_COUNT]) -> [i64; W19_PPCD_NUMERIC_COUNT] {
+    let mut out = *raw;
+    for (position, value) in out.iter_mut().enumerate() {
+        if w19_ppcd_is_bool(position) {
+            *value = i64::from(*value != 0);
+        }
+    }
+    out
+}
+
+/// Write the 28 default numeric values to `out` and the default blacklist to `blacklist`;
+/// returns the blacklist length, `-(needed)` when `cap` is too small, or -1 for invalid input.
+///
+/// # Safety
+/// A non-null `out` must be aligned and writable for `out_count` values; a non-null
+/// `blacklist` must be writable for `cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_ppcd_defaults(
+    out: *mut i64,
+    out_count: usize,
+    blacklist: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if out_count < W19_PPCD_NUMERIC_COUNT || !w19pc_slice_ok(out.cast_const(), out_count) {
+            return -1;
+        }
+        // SAFETY: `blacklist` validity is checked by `w19pc_write`; the caller guarantees
+        // `cap` writable bytes.
+        let written = unsafe { w19pc_write(blacklist, cap, W19_PPCD_DEFAULT_BLACKLIST) };
+        if written <= 0 {
+            return written;
+        }
+        // SAFETY: `out` is non-null, aligned and writable for at least 28 values.
+        unsafe {
+            std::ptr::copy_nonoverlapping(W19_PPCD_DEFAULTS.as_ptr(), out, W19_PPCD_NUMERIC_COUNT)
+        };
+        written
+    }))
+    .unwrap_or(-1)
+}
+
+/// Normalize the 28 numeric `PostProcessingConfigurationData` values (bool coercion); `raw`
+/// and `out` may alias. Returns 28 or -1 for invalid input.
+///
+/// # Safety
+/// Non-null pointers must be aligned and valid for their declared counts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_ppcd_normalize(
+    raw: *const i64,
+    count: usize,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if count != W19_PPCD_NUMERIC_COUNT
+            || out_count < W19_PPCD_NUMERIC_COUNT
+            || !w19pc_slice_ok(raw, count)
+            || !w19pc_slice_ok(out.cast_const(), out_count)
+        {
+            return -1;
+        }
+        let mut values = [0i64; W19_PPCD_NUMERIC_COUNT];
+        // SAFETY: `raw` is non-null, aligned and readable for 28 values; `values` is local.
+        unsafe { std::ptr::copy(raw, values.as_mut_ptr(), W19_PPCD_NUMERIC_COUNT) };
+        let normalized = w19_ppcd_normalize(&values);
+        // SAFETY: `out` is non-null, aligned and writable for 28 values.
+        unsafe { std::ptr::copy(normalized.as_ptr(), out, W19_PPCD_NUMERIC_COUNT) };
+        W19_PPCD_NUMERIC_COUNT as i32
+    }))
+    .unwrap_or(-1)
+}
+
+/// `FileCompletionStatus::tryFrom`: 0 Incomplete, 1 Complete, -1 for an unknown value.
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_fcs_classify(value: i64) -> i32 {
+    std::panic::catch_unwind(|| match value {
+        0 | 1 => value as i32,
+        _ => -1,
+    })
+    .unwrap_or(-1)
+}
+
+/// `FileCompletionStatus::description` for `value`; returns the length, `-(needed)` when
+/// `cap` is too small, or -1 for an unknown value or invalid output.
+///
+/// # Safety
+/// A non-null `out` must be writable for `cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_fcs_description(value: i64, out: *mut u8, cap: usize) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let text: &[u8] = match value {
+            0 => b"Incomplete",
+            1 => b"Complete",
+            _ => return -1,
+        };
+        // SAFETY: forwarded caller contract.
+        unsafe { w19pc_write(out, cap, text) }
+    }))
+    .unwrap_or(-1)
+}
+
+/// `ImageAssetProfile` case names in declaration order with `[maxWidth, maxHeight]`
+/// (`-1` for PHP `null`).
+const W19_IAP_PROFILES: [(&[u8], [i64; 2]); 5] = [
+    (b"Original", [-1, -1]),
+    (b"MetadataCover", [250, 250]),
+    (b"Backdrop", [1920, 1024]),
+    (b"Preview", [800, 600]),
+    (b"Sample", [650, 650]),
+];
+
+fn w19_iap_resolve(name: &[u8]) -> Option<(usize, [i64; 2])> {
+    W19_IAP_PROFILES
+        .iter()
+        .position(|(case, _)| *case == name)
+        .map(|index| (index, W19_IAP_PROFILES[index].1))
+}
+
+/// Resolve an `ImageAssetProfile` case name: writes `[maxWidth, maxHeight]` (`-1` for null)
+/// to `out` and returns the case index, or -1 for an unknown name or invalid input.
+///
+/// # Safety
+/// A non-null `name` must be readable for `len` bytes; a non-null `out` must be aligned and
+/// writable for `out_count` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_iap_bounds(
+    name: *const u8,
+    len: usize,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if out_count < 2 || !w19pc_slice_ok(out.cast_const(), out_count) {
+            return -1;
+        }
+        // SAFETY: forwarded caller contract.
+        let Some((index, bounds)) = unsafe { w19pc_bytes(name, len) }.and_then(w19_iap_resolve)
+        else {
+            return -1;
+        };
+        // SAFETY: `out` is non-null, aligned and writable for at least 2 values.
+        unsafe { std::ptr::copy_nonoverlapping(bounds.as_ptr(), out, 2) };
+        index as i32
+    }))
+    .unwrap_or(-1)
+}
+
+/// `BinariesConfig::obfuscationMinArticles`.
+fn w19_bcfg_obfuscation(configured: i64) -> i64 {
+    if configured <= 0 {
+        0
+    } else {
+        configured.max(8)
+    }
+}
+
+/// `BinariesConfig` chunk settings in `normalizeChunkSettings` order.
+const W19_BCFG_CHUNK_COUNT: usize = 7;
+
+fn w19_bcfg_normalize(raw: &[i64; W19_BCFG_CHUNK_COUNT]) -> [i64; W19_BCFG_CHUNK_COUNT] {
+    [
+        raw[0].clamp(50, 2000),
+        raw[1].clamp(50, 1000),
+        raw[2].clamp(50, 2000),
+        raw[3].clamp(500, 20000),
+        raw[4].max(1),
+        raw[5].max(1),
+        w19_bcfg_obfuscation(raw[6]),
+    ]
+}
+
+/// `BinariesConfig` constructor defaults in declaration order (bools as 0/1).
+const W19_BCFG_FIELD_COUNT: usize = 16;
+
+const W19_BCFG_DEFAULTS: [i64; W19_BCFG_FIELD_COUNT] = [
+    20000, 1, 1, 0, 50000, 3, 15000, 3, 0, 500, 500, 500, 5000, 1000, 300, 16,
+];
+
+/// `BinariesConfig::obfuscationMinArticles`: 0 when `configured <= 0`, else at least 8.
+/// Never negative, so -1 signals a caught panic.
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_bcfg_obfuscation_min_articles(configured: i64) -> i64 {
+    std::panic::catch_unwind(|| w19_bcfg_obfuscation(configured)).unwrap_or(-1)
+}
+
+/// Clamp the 7 `BinariesConfig` chunk settings; `raw` and `out` may alias. Returns 7 or -1
+/// for invalid input.
+///
+/// # Safety
+/// Non-null pointers must be aligned and valid for their declared counts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_bcfg_normalize(
+    raw: *const i64,
+    count: usize,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if count != W19_BCFG_CHUNK_COUNT
+            || out_count < W19_BCFG_CHUNK_COUNT
+            || !w19pc_slice_ok(raw, count)
+            || !w19pc_slice_ok(out.cast_const(), out_count)
+        {
+            return -1;
+        }
+        let mut values = [0i64; W19_BCFG_CHUNK_COUNT];
+        // SAFETY: `raw` is non-null, aligned and readable for 7 values; `values` is local.
+        unsafe { std::ptr::copy(raw, values.as_mut_ptr(), W19_BCFG_CHUNK_COUNT) };
+        let normalized = w19_bcfg_normalize(&values);
+        // SAFETY: `out` is non-null, aligned and writable for 7 values.
+        unsafe { std::ptr::copy(normalized.as_ptr(), out, W19_BCFG_CHUNK_COUNT) };
+        W19_BCFG_CHUNK_COUNT as i32
+    }))
+    .unwrap_or(-1)
+}
+
+/// Write the 16 `BinariesConfig` constructor defaults (bools as 0/1); returns 16 or -1.
+///
+/// # Safety
+/// A non-null `out` must be aligned and writable for `out_count` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_bcfg_defaults(out: *mut i64, out_count: usize) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if out_count < W19_BCFG_FIELD_COUNT || !w19pc_slice_ok(out.cast_const(), out_count) {
+            return -1;
+        }
+        // SAFETY: `out` is non-null, aligned and writable for at least 16 values.
+        unsafe {
+            std::ptr::copy_nonoverlapping(W19_BCFG_DEFAULTS.as_ptr(), out, W19_BCFG_FIELD_COUNT)
+        };
+        W19_BCFG_FIELD_COUNT as i32
+    }))
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod wave19_postprocess_config_outcomes_assets_tests {
+    use super::*;
+
+    /// An `i64` pointer offset by one byte from an aligned buffer.
+    fn misaligned_i64(buffer: &mut [i64]) -> *mut i64 {
+        buffer
+            .as_mut_ptr()
+            .cast::<u8>()
+            .wrapping_add(1)
+            .cast::<i64>()
+    }
+
+    #[test]
+    fn outcome_classify_matches_php_predicates() {
+        for (index, value) in W19_OUTCOMES.iter().enumerate() {
+            let code = unsafe { nntmux_pout_classify(value.as_ptr(), value.len()) };
+            assert_eq!(code & 0xff, index as i32);
+            assert_eq!(code & 0x100 != 0, index <= 2, "successful {index}");
+            assert_eq!(
+                code & 0x200 != 0,
+                (6..=8).contains(&index),
+                "deleted {index}"
+            );
+        }
+        assert_eq!(
+            unsafe { nntmux_pout_classify(b"Completed".as_ptr(), 9) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_pout_classify(b"completed ".as_ptr(), 10) },
+            -1
+        );
+        assert_eq!(unsafe { nntmux_pout_classify(std::ptr::null(), 0) }, -1);
+        assert_eq!(unsafe { nntmux_pout_classify(std::ptr::null(), 3) }, -1);
+        assert_eq!(
+            unsafe { nntmux_pout_classify(b"x".as_ptr(), isize::MAX as usize + 1) },
+            -1
+        );
+    }
+
+    #[test]
+    fn ppcd_defaults_and_normalize() {
+        let mut out = [0i64; W19_PPCD_NUMERIC_COUNT];
+        let mut text = [0u8; 64];
+        let written = unsafe {
+            nntmux_ppcd_defaults(out.as_mut_ptr(), out.len(), text.as_mut_ptr(), text.len())
+        };
+        assert_eq!(written, W19_PPCD_DEFAULT_BLACKLIST.len() as isize);
+        assert_eq!(&text[..written as usize], W19_PPCD_DEFAULT_BLACKLIST);
+        assert_eq!(out, W19_PPCD_DEFAULTS);
+        assert_eq!(
+            unsafe { nntmux_ppcd_defaults(out.as_mut_ptr(), out.len(), text.as_mut_ptr(), 4) },
+            -(W19_PPCD_DEFAULT_BLACKLIST.len() as isize)
+        );
+        assert_eq!(
+            unsafe { nntmux_ppcd_defaults(out.as_mut_ptr(), 27, text.as_mut_ptr(), 64) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_ppcd_defaults(out.as_mut_ptr(), out.len(), std::ptr::null_mut(), 64) },
+            -1
+        );
+
+        let mut raw = [7i64; W19_PPCD_NUMERIC_COUNT];
+        raw[13] = -3;
+        raw[16] = 0;
+        let mut normalized = [0i64; W19_PPCD_NUMERIC_COUNT];
+        assert_eq!(
+            unsafe { nntmux_ppcd_normalize(raw.as_ptr(), raw.len(), normalized.as_mut_ptr(), 28) },
+            28
+        );
+        for (position, value) in normalized.iter().enumerate() {
+            let expected = match position {
+                16 => 0,
+                p if w19_ppcd_is_bool(p) => 1,
+                _ => 7,
+            };
+            assert_eq!(*value, expected, "position {position}");
+        }
+        assert_eq!(
+            (0..W19_PPCD_NUMERIC_COUNT)
+                .filter(|p| w19_ppcd_is_bool(*p))
+                .collect::<Vec<_>>(),
+            [13, 16, 17, 18, 19, 26, 27]
+        );
+        let aliased = raw.as_mut_ptr();
+        assert_eq!(
+            unsafe { nntmux_ppcd_normalize(aliased, 28, aliased, 28) },
+            28
+        );
+        assert_eq!(raw[13], 1);
+        assert_eq!(
+            unsafe { nntmux_ppcd_normalize(raw.as_ptr(), 27, normalized.as_mut_ptr(), 28) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_ppcd_normalize(std::ptr::null(), 28, normalized.as_mut_ptr(), 28) },
+            -1
+        );
+    }
+
+    #[test]
+    fn file_completion_status_classify_and_description() {
+        assert_eq!(nntmux_fcs_classify(0), 0);
+        assert_eq!(nntmux_fcs_classify(1), 1);
+        assert_eq!(nntmux_fcs_classify(2), -1);
+        assert_eq!(nntmux_fcs_classify(-1), -1);
+        assert_eq!(nntmux_fcs_classify(i64::MAX), -1);
+        let mut out = [0u8; 16];
+        let written = unsafe { nntmux_fcs_description(0, out.as_mut_ptr(), out.len()) };
+        assert_eq!(&out[..written as usize], b"Incomplete");
+        let written = unsafe { nntmux_fcs_description(1, out.as_mut_ptr(), out.len()) };
+        assert_eq!(&out[..written as usize], b"Complete");
+        assert_eq!(
+            unsafe { nntmux_fcs_description(1, out.as_mut_ptr(), 3) },
+            -8
+        );
+        assert_eq!(
+            unsafe { nntmux_fcs_description(5, out.as_mut_ptr(), 16) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_fcs_description(0, std::ptr::null_mut(), 16) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_fcs_description(0, out.as_mut_ptr(), isize::MAX as usize + 1) },
+            -1
+        );
+    }
+
+    #[test]
+    fn image_asset_profile_bounds() {
+        let mut out = [0i64; 2];
+        let expected: [(&[u8], i32, [i64; 2]); 5] = [
+            (b"Original", 0, [-1, -1]),
+            (b"MetadataCover", 1, [250, 250]),
+            (b"Backdrop", 2, [1920, 1024]),
+            (b"Preview", 3, [800, 600]),
+            (b"Sample", 4, [650, 650]),
+        ];
+        for (name, index, bounds) in expected {
+            assert_eq!(
+                unsafe { nntmux_iap_bounds(name.as_ptr(), name.len(), out.as_mut_ptr(), 2) },
+                index
+            );
+            assert_eq!(out, bounds);
+        }
+        assert_eq!(
+            unsafe { nntmux_iap_bounds(b"sample".as_ptr(), 6, out.as_mut_ptr(), 2) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_iap_bounds(b"Sample".as_ptr(), 6, out.as_mut_ptr(), 1) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_iap_bounds(std::ptr::null(), 6, out.as_mut_ptr(), 2) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_iap_bounds(b"Sample".as_ptr(), 6, std::ptr::null_mut(), 2) },
+            -1
+        );
+    }
+
+    #[test]
+    fn binaries_config_obfuscation_normalize_and_defaults() {
+        for (configured, expected) in [
+            (i64::MIN, 0),
+            (-1, 0),
+            (0, 0),
+            (1, 8),
+            (7, 8),
+            (8, 8),
+            (16, 16),
+            (i64::MAX, i64::MAX),
+        ] {
+            assert_eq!(nntmux_bcfg_obfuscation_min_articles(configured), expected);
+        }
+        let raw = [0i64, 5000, i64::MAX, i64::MIN, 0, -5, 3];
+        let mut out = [0i64; W19_BCFG_CHUNK_COUNT];
+        assert_eq!(
+            unsafe { nntmux_bcfg_normalize(raw.as_ptr(), 7, out.as_mut_ptr(), 7) },
+            7
+        );
+        assert_eq!(out, [50, 1000, 2000, 500, 1, 1, 8]);
+        let mut aliased = [500i64, 500, 500, 5000, 1000, 300, 16];
+        let ptr = aliased.as_mut_ptr();
+        assert_eq!(unsafe { nntmux_bcfg_normalize(ptr, 7, ptr, 7) }, 7);
+        assert_eq!(aliased, [500, 500, 500, 5000, 1000, 300, 16]);
+        assert_eq!(
+            unsafe { nntmux_bcfg_normalize(raw.as_ptr(), 6, out.as_mut_ptr(), 7) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_bcfg_normalize(raw.as_ptr(), 7, std::ptr::null_mut(), 7) },
+            -1
+        );
+        let mut defaults = [0i64; W19_BCFG_FIELD_COUNT];
+        assert_eq!(
+            unsafe { nntmux_bcfg_defaults(defaults.as_mut_ptr(), 16) },
+            16
+        );
+        assert_eq!(defaults, W19_BCFG_DEFAULTS);
+        assert_eq!(
+            unsafe { nntmux_bcfg_defaults(defaults.as_mut_ptr(), 15) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_bcfg_defaults(std::ptr::null_mut(), 16) },
+            -1
+        );
+        assert!(!w19pc_slice_ok(defaults.as_ptr(), usize::MAX / 4));
+    }
+
+    #[test]
+    fn unaligned_pointers_are_rejected() {
+        let mut buffer = [0i64; 40];
+        let misaligned = misaligned_i64(&mut buffer);
+        let mut text = [0u8; 64];
+        assert_eq!(
+            unsafe { nntmux_ppcd_defaults(misaligned, 28, text.as_mut_ptr(), 64) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_ppcd_normalize(misaligned.cast_const(), 28, buffer.as_mut_ptr(), 28) },
+            -1
+        );
+        let mut aligned = [0i64; 28];
+        assert_eq!(
+            unsafe { nntmux_ppcd_normalize(aligned.as_ptr(), 28, misaligned, 28) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_iap_bounds(b"Sample".as_ptr(), 6, misaligned, 2) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_bcfg_normalize(misaligned.cast_const(), 7, aligned.as_mut_ptr(), 7) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_bcfg_normalize(aligned.as_ptr(), 7, misaligned, 7) },
+            -1
+        );
+        assert_eq!(unsafe { nntmux_bcfg_defaults(misaligned, 16) }, -1);
+        assert_eq!(aligned, [0i64; 28]);
+    }
+}
