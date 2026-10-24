@@ -13545,4 +13545,762 @@ pub mod tmux_site_config_and_status_enums {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Wave 20 Slice 20.6: BoundedMetricQuery, PrometheusMetricsExporter,
+// DiskProbe, IncidentImpactEnum, and IncidentStatusEnum helpers
+// ---------------------------------------------------------------------------
+
+pub mod bounded_metric_exporter_disk_and_incident {
+    use std::slice;
+
+    use crate::OutCursor;
+
+    pub const DECLINED: isize = -1;
+
+    const MARIA_STATEMENT_PREFIX: &[u8] = b"SET STATEMENT max_statement_time=2 FOR ";
+    const MYSQL_SELECT_REPLACEMENT: &[u8] = b"select /*+ MAX_EXECUTION_TIME(2000) */";
+    const PUSHGATEWAY_JOB_SEGMENT: &[u8] = b"/metrics/job/";
+    const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
+    const BYTES_PER_GIB: f64 = 1_073_741_824.0;
+
+    #[inline]
+    unsafe fn input<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null() || len > isize::MAX as usize {
+            None
+        } else if len == 0 {
+            Some(&[])
+        } else {
+            Some(unsafe { slice::from_raw_parts(ptr, len) })
+        }
+    }
+
+    #[inline]
+    fn finish_cursor(cursor: OutCursor<'_>) -> isize {
+        match cursor.pos {
+            n if n <= cursor.buf.len() => n as isize,
+            n if n <= isize::MAX as usize => -(n.max(4) as isize),
+            _ => DECLINED,
+        }
+    }
+
+    #[inline]
+    fn is_rfc3986_unreserved(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~')
+    }
+
+    /// Rewrite a SQL query with a statement-local execution time bound for
+    /// `BoundedMetricQuery`:
+    /// - `is_maria == 1`: `'SET STATEMENT max_statement_time=2 FOR ' . $sql`
+    /// - `is_maria == 0`: `preg_replace('/\Aselect\b/i', 'select /*+ MAX_EXECUTION_TIME(2000) */', $sql)`
+    ///
+    /// Returns written byte length (`>= 0`), `< -1` (`-needed`) when `out_cap` is too small,
+    /// or `-1` on invalid arguments or high-byte boundary decline.
+    ///
+    /// # Safety
+    ///
+    /// `sql_ptr` must be non-null and valid for `sql_len` reads when `sql_len > 0`, and
+    /// `out_buf` must be non-null and valid for `out_cap` writes when `out_cap > 0`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_bounded_metric_rewrite_sql(
+        is_maria: u32,
+        sql_ptr: *const u8,
+        sql_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if is_maria > 1 || out_buf.is_null() || out_cap > isize::MAX as usize {
+                return DECLINED;
+            }
+            let Some(sql) = (unsafe { input(sql_ptr, sql_len) }) else {
+                return DECLINED;
+            };
+
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            if is_maria == 1 {
+                cursor.extend(MARIA_STATEMENT_PREFIX);
+                cursor.extend(sql);
+            } else if sql.len() >= 6 && sql[..6].eq_ignore_ascii_case(b"select") {
+                if sql.len() > 6 && sql[6] >= 0x80 {
+                    return DECLINED;
+                }
+                let is_boundary =
+                    sql.len() == 6 || !(sql[6].is_ascii_alphanumeric() || sql[6] == b'_');
+                if is_boundary {
+                    cursor.extend(MYSQL_SELECT_REPLACEMENT);
+                    cursor.extend(&sql[6..]);
+                } else {
+                    cursor.extend(sql);
+                }
+            } else {
+                cursor.extend(sql);
+            }
+
+            finish_cursor(cursor)
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Format the Pushgateway target URL `$baseUrl . '/metrics/job/' . rawurlencode($job)`
+    /// for `PrometheusMetricsExporter::push()`.
+    ///
+    /// Returns written byte length (`> 0`), `< -1` (`-needed`) when `out_cap` is too small,
+    /// or `-1` on null pointers or length overflow.
+    ///
+    /// # Safety
+    ///
+    /// `base_ptr` and `job_ptr` must be non-null and valid for `base_len` / `job_len` reads,
+    /// and `out_buf` must be non-null and valid for `out_cap` writes when `out_cap > 0`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_prometheus_exporter_pushgateway_url(
+        base_ptr: *const u8,
+        base_len: usize,
+        job_ptr: *const u8,
+        job_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if out_buf.is_null() || out_cap > isize::MAX as usize {
+                return DECLINED;
+            }
+            let (Some(base), Some(job)) = (
+                unsafe { input(base_ptr, base_len) },
+                unsafe { input(job_ptr, job_len) },
+            ) else {
+                return DECLINED;
+            };
+
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.extend(base);
+            cursor.extend(PUSHGATEWAY_JOB_SEGMENT);
+            for &b in job {
+                if is_rfc3986_unreserved(b) {
+                    cursor.push(b);
+                } else {
+                    cursor.push(b'%');
+                    cursor.push(HEX_UPPER[(b >> 4) as usize]);
+                    cursor.push(HEX_UPPER[(b & 0x0f) as usize]);
+                }
+            }
+
+            finish_cursor(cursor)
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Compute `($endedAtNs - $startedAtNs) / 1e9` for `PrometheusMetricsExporter::render()`
+    /// and write the result to `*out_seconds`.
+    ///
+    /// Returns `1` on success, or `-1` on null/unaligned `out_seconds` or signed overflow.
+    ///
+    /// # Safety
+    ///
+    /// `out_seconds` must be a non-null, aligned writable pointer to `f64`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_prometheus_exporter_duration_seconds(
+        started_at_ns: i64,
+        ended_at_ns: i64,
+        out_seconds: *mut f64,
+    ) -> i32 {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if out_seconds.is_null() || !out_seconds.is_aligned() {
+                return -1;
+            }
+            let Some(diff) = ended_at_ns.checked_sub(started_at_ns) else {
+                return -1;
+            };
+            unsafe {
+                *out_seconds = (diff as f64) / 1e9;
+            }
+            1
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Truncate an HTTP error body to at most `max_chars` UTF-8 code points
+    /// (`mb_substr($body, 0, $maxChars)`) for `PrometheusMetricsExporter::push()`.
+    ///
+    /// Returns written byte length (`>= 0`), `-2` if `body` is not valid UTF-8,
+    /// `< -2` (`-needed`) when `out_cap` is too small, or `-1` on invalid pointer/length args.
+    ///
+    /// # Safety
+    ///
+    /// `body_ptr` must be non-null and valid for `body_len` reads when `body_len > 0`, and
+    /// `out_buf` must be non-null and valid for `out_cap` writes when `out_cap > 0`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_prometheus_exporter_truncate_body(
+        body_ptr: *const u8,
+        body_len: usize,
+        max_chars: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if max_chars > isize::MAX as usize
+                || out_buf.is_null()
+                || out_cap > isize::MAX as usize
+            {
+                return DECLINED;
+            }
+            let Some(raw) = (unsafe { input(body_ptr, body_len) }) else {
+                return DECLINED;
+            };
+            let Ok(text) = std::str::from_utf8(raw) else {
+                return -2;
+            };
+
+            let end_byte = if max_chars == 0 {
+                0
+            } else if raw.len() <= max_chars {
+                raw.len()
+            } else {
+                match text.char_indices().nth(max_chars) {
+                    Some((idx, _)) => idx,
+                    None => raw.len(),
+                }
+            };
+
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.extend(&raw[..end_byte]);
+            finish_cursor(cursor)
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Compute `round(((float) $freeBytes) / 1_073_741_824, 2)` for `DiskProbe::probe()`
+    /// and store the result in `*out_gb`.
+    ///
+    /// Returns `1` on success, or `-1` on null/unaligned pointer or non-finite/out-of-range input.
+    ///
+    /// # Safety
+    ///
+    /// `out_gb` must be a non-null, aligned writable pointer to `f64`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_disk_probe_bytes_to_gb(
+        free_bytes: f64,
+        out_gb: *mut f64,
+    ) -> i32 {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if out_gb.is_null()
+                || !out_gb.is_aligned()
+                || !free_bytes.is_finite()
+                || free_bytes.abs() >= 1e23
+            {
+                return -1;
+            }
+            let gb = free_bytes / BYTES_PER_GIB;
+            let rounded = (gb * 100.0).round() / 100.0;
+            unsafe {
+                *out_gb = rounded;
+            }
+            1
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Evaluate disk space thresholds for `DiskProbe::probe()` and format the status reason.
+    /// Writes verdict code to `*out_verdict`:
+    /// - `2`: Critical (`lowest_free_gb <= critical_threshold_gb`)
+    /// - `1`: Minor (`lowest_free_gb <= warning_threshold_gb`)
+    /// - `0`: Healthy (`lowest_free_gb > warning_threshold_gb`)
+    ///
+    /// Returns written byte length (`> 0`), `< -1` (`-needed`) when `out_cap` is too small,
+    /// or `-1` on null/unaligned pointers or non-finite floats.
+    ///
+    /// # Safety
+    ///
+    /// `mount_ptr` must be non-null and valid for `mount_len` reads when `mount_len > 0`,
+    /// `out_verdict` must be a non-null, aligned writable pointer to `i64`, and
+    /// `out_buf` must be non-null and valid for `out_cap` writes when `out_cap > 0`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_disk_probe_evaluate(
+        mount_ptr: *const u8,
+        mount_len: usize,
+        lowest_free_gb: f64,
+        warning_threshold_gb: f64,
+        critical_threshold_gb: f64,
+        out_verdict: *mut i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if out_verdict.is_null()
+                || !out_verdict.is_aligned()
+                || out_buf.is_null()
+                || out_cap > isize::MAX as usize
+                || !lowest_free_gb.is_finite()
+                || !warning_threshold_gb.is_finite()
+                || !critical_threshold_gb.is_finite()
+            {
+                return DECLINED;
+            }
+            let Some(mount) = (unsafe { input(mount_ptr, mount_len) }) else {
+                return DECLINED;
+            };
+
+            let free_norm = if lowest_free_gb == 0.0 {
+                0.0
+            } else {
+                lowest_free_gb
+            };
+            let free_formatted = format!("{free_norm:.2}");
+
+            let (verdict, prefix, middle, suffix): (i64, &[u8], &[u8], &[u8]) =
+                if lowest_free_gb <= critical_threshold_gb {
+                    (2, b"Low disk space on ", b" (", b" GB free)")
+                } else if lowest_free_gb <= warning_threshold_gb {
+                    (1, b"Disk space warning on ", b" (", b" GB free)")
+                } else {
+                    (0, b"Disk healthy (lowest: ", b" ", b" GB free)")
+                };
+
+            unsafe {
+                *out_verdict = verdict;
+            }
+
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.extend(prefix);
+            cursor.extend(mount);
+            cursor.extend(middle);
+            cursor.extend(free_formatted.as_bytes());
+            cursor.extend(suffix);
+            finish_cursor(cursor)
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Write `IncidentImpactEnum::label()` into `out_buf` for an impact value string.
+    /// Returns written byte length (`> 0`), `-2` when the value string is unknown,
+    /// `< -2` (`-needed`) when `out_cap` is too small, or `-1` on invalid pointer/length args.
+    ///
+    /// # Safety
+    ///
+    /// `value_ptr` must be non-null and valid for `value_len` reads when `value_len > 0`, and
+    /// `out_buf` must be non-null and valid for `out_cap` writes when `out_cap > 0`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_incident_impact_label(
+        value_ptr: *const u8,
+        value_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if out_buf.is_null() || out_cap > isize::MAX as usize {
+                return DECLINED;
+            }
+            let Some(val) = (unsafe { input(value_ptr, value_len) }) else {
+                return DECLINED;
+            };
+            let label: &[u8] = match val {
+                b"none" => b"None",
+                b"minor" => b"Minor",
+                b"major" => b"Major",
+                b"critical" => b"Critical",
+                _ => return -2,
+            };
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.extend(label);
+            finish_cursor(cursor)
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Write `IncidentImpactEnum::values()` as NUL-separated strings into `out_buf`
+    /// and store the count (`4`) in `*out_count`.
+    ///
+    /// # Safety
+    ///
+    /// `out_count` must be a non-null, aligned writable pointer to `usize`, and
+    /// `out_buf` must be non-null and valid for `out_cap` writes when `out_cap > 0`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_incident_impact_values_nul(
+        out_count: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if out_count.is_null()
+                || !out_count.is_aligned()
+                || out_buf.is_null()
+                || out_cap > isize::MAX as usize
+            {
+                return DECLINED;
+            }
+            const PAYLOAD: &[u8] = b"none\0minor\0major\0critical";
+            unsafe {
+                *out_count = 4;
+            }
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.extend(PAYLOAD);
+            finish_cursor(cursor)
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Write `IncidentStatusEnum::label()` into `out_buf` for a status value string.
+    /// Returns written byte length (`> 0`), `-2` when the value string is unknown,
+    /// `< -2` (`-needed`) when `out_cap` is too small, or `-1` on invalid pointer/length args.
+    ///
+    /// # Safety
+    ///
+    /// `value_ptr` must be non-null and valid for `value_len` reads when `value_len > 0`, and
+    /// `out_buf` must be non-null and valid for `out_cap` writes when `out_cap > 0`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_incident_status_label(
+        value_ptr: *const u8,
+        value_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if out_buf.is_null() || out_cap > isize::MAX as usize {
+                return DECLINED;
+            }
+            let Some(val) = (unsafe { input(value_ptr, value_len) }) else {
+                return DECLINED;
+            };
+            let label: &[u8] = match val {
+                b"investigating" => b"Investigating",
+                b"identified" => b"Identified",
+                b"monitoring" => b"Monitoring",
+                b"resolved" => b"Resolved",
+                _ => return -2,
+            };
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.extend(label);
+            finish_cursor(cursor)
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Write `IncidentStatusEnum::values()` as NUL-separated strings into `out_buf`
+    /// and store the count (`4`) in `*out_count`.
+    ///
+    /// # Safety
+    ///
+    /// `out_count` must be a non-null, aligned writable pointer to `usize`, and
+    /// `out_buf` must be non-null and valid for `out_cap` writes when `out_cap > 0`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_incident_status_values_nul(
+        out_count: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if out_count.is_null()
+                || !out_count.is_aligned()
+                || out_buf.is_null()
+                || out_cap > isize::MAX as usize
+            {
+                return DECLINED;
+            }
+            const PAYLOAD: &[u8] = b"investigating\0identified\0monitoring\0resolved";
+            unsafe {
+                *out_count = 4;
+            }
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.extend(PAYLOAD);
+            finish_cursor(cursor)
+        }))
+        .unwrap_or(-1)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn bounded_metric_query_and_prometheus_exporter_helpers_match_php() {
+            let mut buf = [0u8; 256];
+            let sql = b"select * from `candidates` where `status` = ?";
+
+            let n = unsafe {
+                nntmux_bounded_metric_rewrite_sql(
+                    1,
+                    sql.as_ptr(),
+                    sql.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            } as usize;
+            assert_eq!(
+                &buf[..n],
+                b"SET STATEMENT max_statement_time=2 FOR select * from `candidates` where `status` = ?"
+            );
+
+            let n = unsafe {
+                nntmux_bounded_metric_rewrite_sql(
+                    0,
+                    sql.as_ptr(),
+                    sql.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            } as usize;
+            assert_eq!(
+                &buf[..n],
+                b"select /*+ MAX_EXECUTION_TIME(2000) */ * from `candidates` where `status` = ?"
+            );
+
+            // Word-boundary non-match: "selective" does not match /\Aselect\b/i
+            let non_select = b"selective_view";
+            let n = unsafe {
+                nntmux_bounded_metric_rewrite_sql(
+                    0,
+                    non_select.as_ptr(),
+                    non_select.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            } as usize;
+            assert_eq!(&buf[..n], non_select);
+
+            // Pushgateway URL with RFC 3986 encoding
+            let base = b"http://pushgateway.test:9091";
+            let job = b"nntmux prod/worker 1~a";
+            let n = unsafe {
+                nntmux_prometheus_exporter_pushgateway_url(
+                    base.as_ptr(),
+                    base.len(),
+                    job.as_ptr(),
+                    job.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            } as usize;
+            assert_eq!(
+                &buf[..n],
+                b"http://pushgateway.test:9091/metrics/job/nntmux%20prod%2Fworker%201~a"
+            );
+
+            // Duration seconds calculation
+            let mut secs = 0.0f64;
+            assert_eq!(
+                unsafe {
+                    nntmux_prometheus_exporter_duration_seconds(
+                        1_000_000_000,
+                        2_500_000_000,
+                        &mut secs,
+                    )
+                },
+                1
+            );
+            assert_eq!(secs, 1.5);
+
+            // UTF-8 multibyte body truncation
+            let utf8_body = "é".repeat(600);
+            let mut large_buf = [0u8; 2048];
+            let n = unsafe {
+                nntmux_prometheus_exporter_truncate_body(
+                    utf8_body.as_ptr(),
+                    utf8_body.len(),
+                    500,
+                    large_buf.as_mut_ptr(),
+                    large_buf.len(),
+                )
+            } as usize;
+            assert_eq!(n, 1000);
+            assert_eq!(&large_buf[..n], "é".repeat(500).as_bytes());
+        }
+
+        #[test]
+        fn disk_probe_and_incident_enums_match_php_contracts() {
+            let mut gb = 0.0f64;
+            assert_eq!(
+                unsafe { nntmux_disk_probe_bytes_to_gb(10_737_418_240.0, &mut gb) },
+                1
+            );
+            assert_eq!(gb, 10.0);
+
+            assert_eq!(
+                unsafe { nntmux_disk_probe_bytes_to_gb(134_217_728.0, &mut gb) },
+                1
+            );
+            assert_eq!(gb, 0.13);
+
+            let mut verdict = -1i64;
+            let mut buf = [0u8; 256];
+            let mount = b"/var/lib/mysql";
+
+            let n = unsafe {
+                nntmux_disk_probe_evaluate(
+                    mount.as_ptr(),
+                    mount.len(),
+                    0.75,
+                    5.0,
+                    1.0,
+                    &mut verdict,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            } as usize;
+            assert_eq!(verdict, 2);
+            assert_eq!(&buf[..n], b"Low disk space on /var/lib/mysql (0.75 GB free)");
+
+            let n = unsafe {
+                nntmux_disk_probe_evaluate(
+                    mount.as_ptr(),
+                    mount.len(),
+                    3.5,
+                    5.0,
+                    1.0,
+                    &mut verdict,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            } as usize;
+            assert_eq!(verdict, 1);
+            assert_eq!(
+                &buf[..n],
+                b"Disk space warning on /var/lib/mysql (3.50 GB free)"
+            );
+
+            let n = unsafe {
+                nntmux_disk_probe_evaluate(
+                    mount.as_ptr(),
+                    mount.len(),
+                    42.1,
+                    5.0,
+                    1.0,
+                    &mut verdict,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            } as usize;
+            assert_eq!(verdict, 0);
+            assert_eq!(
+                &buf[..n],
+                b"Disk healthy (lowest: /var/lib/mysql 42.10 GB free)"
+            );
+
+            // IncidentImpactEnum
+            let n = unsafe {
+                nntmux_incident_impact_label(
+                    b"critical".as_ptr(),
+                    8,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            } as usize;
+            assert_eq!(&buf[..n], b"Critical");
+            assert_eq!(
+                unsafe {
+                    nntmux_incident_impact_label(
+                        b"unknown".as_ptr(),
+                        7,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                -2
+            );
+
+            let mut count = 0usize;
+            let n = unsafe {
+                nntmux_incident_impact_values_nul(&mut count, buf.as_mut_ptr(), buf.len())
+            } as usize;
+            assert_eq!(count, 4);
+            assert_eq!(&buf[..n], b"none\0minor\0major\0critical");
+
+            // IncidentStatusEnum
+            let n = unsafe {
+                nntmux_incident_status_label(
+                    b"investigating".as_ptr(),
+                    13,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            } as usize;
+            assert_eq!(&buf[..n], b"Investigating");
+            assert_eq!(
+                unsafe {
+                    nntmux_incident_status_label(
+                        b"invalid".as_ptr(),
+                        7,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                -2
+            );
+
+            let n = unsafe {
+                nntmux_incident_status_values_nul(&mut count, buf.as_mut_ptr(), buf.len())
+            } as usize;
+            assert_eq!(count, 4);
+            assert_eq!(
+                &buf[..n],
+                b"investigating\0identified\0monitoring\0resolved"
+            );
+        }
+
+        #[test]
+        fn unaligned_and_null_pointers_are_rejected_across_wave20_entrypoints() {
+            let mut raw = [0u8; 128];
+            let unaligned_f64 = unsafe { raw.as_mut_ptr().add(1).cast::<f64>() };
+            let unaligned_i64 = unsafe { raw.as_mut_ptr().add(1).cast::<i64>() };
+            let unaligned_usize = unsafe { raw.as_mut_ptr().add(1).cast::<usize>() };
+            let mut buf = [0u8; 128];
+
+            assert_eq!(
+                unsafe { nntmux_prometheus_exporter_duration_seconds(0, 100, unaligned_f64) },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_prometheus_exporter_duration_seconds(0, 100, std::ptr::null_mut())
+                },
+                -1
+            );
+            assert_eq!(
+                unsafe { nntmux_disk_probe_bytes_to_gb(1024.0, unaligned_f64) },
+                -1
+            );
+            assert_eq!(
+                unsafe { nntmux_disk_probe_bytes_to_gb(1024.0, std::ptr::null_mut()) },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_disk_probe_evaluate(
+                        b"/".as_ptr(),
+                        1,
+                        10.0,
+                        5.0,
+                        1.0,
+                        unaligned_i64,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_incident_impact_values_nul(unaligned_usize, buf.as_mut_ptr(), buf.len())
+                },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_incident_status_values_nul(unaligned_usize, buf.as_mut_ptr(), buf.len())
+                },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_bounded_metric_rewrite_sql(
+                        0,
+                        std::ptr::null(),
+                        0,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                -1
+            );
+        }
+    }
+}
 

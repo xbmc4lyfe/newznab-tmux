@@ -16455,3 +16455,655 @@ mod wave19_yenc_article_prereqs_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod wave20_verification_helpers_tests {
+    use super::*;
+    use VerificationOutboxValue as V;
+
+    fn call(op: u32, args: Vec<V>) -> Option<V> {
+        let mut input = Vec::new();
+        w16_list(args).serialize(&mut input);
+        let mut output = [88_u8; 8192];
+        let written = unsafe {
+            nntmux_w20_verification_helpers(
+                op,
+                input.as_ptr(),
+                input.len(),
+                output.as_mut_ptr(),
+                output.len(),
+            )
+        };
+        if written < 0 {
+            return None;
+        }
+        let mut parser = VerificationOutboxParser {
+            bytes: &output[..written as usize],
+            pos: 0,
+            remaining: 1000,
+        };
+        let result = parser.value(0);
+        assert_eq!(parser.pos, written as usize);
+        result
+    }
+    fn s(bytes: &[u8]) -> V {
+        w16_string(bytes)
+    }
+    fn f(text: &str) -> V {
+        V::Float(text.as_bytes().to_vec())
+    }
+    fn assert_value(op: u32, args: Vec<V>, expected: V) {
+        assert!(w16_equal(&call(op, args).expect("ABI declined"), &expected));
+    }
+
+    #[test]
+    fn all_scalar_operations_cross_the_actual_abi() {
+        assert_value(0, vec![V::Null, f("NAN"), f("INF")], V::Bool(true));
+        assert_value(0, vec![f("10"), f("15"), f("5")], V::Bool(true));
+        assert_value(0, vec![f("10"), f("14"), f("5")], V::Bool(false));
+        assert_value(0, vec![f("NAN"), f("INF"), f("1")], V::Bool(false));
+        assert_value(1, vec![s(b"auto"), s(b"mariadb")], s(b"database"));
+        assert_value(1, vec![s(b"auto"), s(b"sqlite")], s(b"file"));
+        assert_value(1, vec![s(b"database"), s(b"sqlite")], s(b"database"));
+        assert_value(1, vec![s(b"bogus"), s(b"mysql")], V::Null);
+        assert_value(2, vec![s(b"/root/"), V::Bool(true)], s(b"/root//locks"));
+        assert_value(2, vec![s(b"\0\xff"), V::Bool(false)], s(b"\0\xff"));
+        assert_value(3, vec![s(b"/root/"), s(b"\xff")], s(b"/root//\xff.state"));
+        assert_value(4, vec![V::Int(100), f("99.9"), V::Int(10)], V::Int(89));
+        assert_value(4, vec![V::Int(100), f("-0.1"), V::Int(10)], V::Int(-11));
+        assert_value(5, vec![V::Int(8), V::Int(10)], V::Int(-2));
+        assert_value(6, vec![V::Int(8), V::Int(-10)], V::Int(0));
+        assert_value(6, vec![V::Int(8), V::Int(10)], V::Int(18));
+        assert_value(7, vec![V::Int(0), V::Int(10), V::Int(10)], V::Bool(false));
+        assert_value(7, vec![V::Int(0), V::Int(11), V::Int(10)], V::Bool(true));
+        assert_value(7, vec![V::Int(-1), V::Int(0), V::Int(10)], V::Bool(true));
+        for mode in [b"auto".as_slice(), b"php", b"native"] {
+            assert_value(8, vec![s(mode)], V::Bool(true));
+        }
+        assert_value(8, vec![s(b"Native")], V::Bool(false));
+        assert_value(
+            9,
+            vec![V::Int(-2), s(b"native"), s(b"\0\xff")],
+            s(b"-2:native:\0\xff"),
+        );
+        assert_value(10, vec![V::Int(42), s(b"a:b")], s(b"42:a:b"));
+        for (mode, library, sapi, os, expected) in [
+            ("php", "lib", "cli", "Linux", true),
+            ("native", "", "fpm", "Darwin", false),
+            ("auto", "lib", "cli", "Linux", false),
+            ("auto", "", "cli", "Linux", true),
+            ("auto", "lib", "fpm", "Linux", true),
+            ("auto", "lib", "cli", "Darwin", true),
+        ] {
+            assert_value(
+                11,
+                vec![
+                    s(mode.as_bytes()),
+                    s(library.as_bytes()),
+                    s(sapi.as_bytes()),
+                    s(os.as_bytes()),
+                ],
+                V::Bool(expected),
+            );
+        }
+    }
+
+    #[test]
+    fn arithmetic_promotes_overflow_and_declines_unsafe_casts() {
+        assert!(matches!(
+            call(5, vec![V::Int(i64::MAX), V::Int(-1)]),
+            Some(V::Float(_))
+        ));
+        assert!(matches!(
+            call(5, vec![V::Int(i64::MIN), V::Int(1)]),
+            Some(V::Float(_))
+        ));
+        assert!(matches!(
+            call(6, vec![V::Int(i64::MAX), V::Int(1)]),
+            Some(V::Float(_))
+        ));
+        assert_value(6, vec![V::Int(i64::MIN), V::Int(-1)], V::Int(0));
+        for free in [
+            "NAN",
+            "INF",
+            "-INF",
+            "9223372036854775808",
+            "-9223372036854777856",
+        ] {
+            assert!(call(4, vec![V::Int(100), f(free), V::Int(0)]).is_none());
+        }
+        assert!(call(4, vec![V::Int(100), f("-9223372036854775808"), V::Int(1)]).is_none());
+    }
+
+    #[test]
+    fn descriptor_row_preserves_order_binary_and_fixed_fields() {
+        let descriptor = w16_map(vec![
+            ("packet_checksum", s(b"checksum")),
+            ("recovery_set_id", s(b"set")),
+            ("file_id", s(b"file")),
+            ("hash", s(b"hash")),
+            ("hash_16K", s(b"16k")),
+            ("size_decimal", s(b"18446744073709551615")),
+            ("filename_bytes", s(b"\0\xffa")),
+        ]);
+        let expected = w16_map(vec![
+            ("releases_id", V::Int(7)),
+            ("release_guid", s(b"guid\0")),
+            ("packet_checksum", s(b"checksum")),
+            ("recovery_set_id", s(b"set")),
+            ("file_id", s(b"file")),
+            ("full_md5", s(b"hash")),
+            ("hash16k", s(b"16k")),
+            ("file_size", s(b"18446744073709551615")),
+            ("raw_filename_base64", s(b"AP9h")),
+            ("descriptor_proof_version", V::Int(1)),
+            ("classification", s(b"unknown")),
+            ("classification_version", V::Int(0)),
+            ("classification_provenance", s(b"unclassified")),
+        ]);
+        assert_value(12, vec![V::Int(7), s(b"guid\0"), descriptor], expected);
+        assert!(call(12, vec![V::Int(7), s(b"guid"), w16_map(vec![])]).is_none());
+    }
+
+    #[test]
+    fn evidence_comparison_uses_php_integer_cast_and_strict_ordered_values() {
+        assert_value(
+            13,
+            vec![
+                w16_map(vec![("id", s(b"  +007  ")), ("extra", V::Null)]),
+                w16_map(vec![("id", V::Int(7))]),
+            ],
+            V::Bool(true),
+        );
+        assert_value(
+            13,
+            vec![
+                w16_map(vec![("id", s(b"8"))]),
+                w16_map(vec![("id", V::Int(7))]),
+            ],
+            V::Bool(false),
+        );
+        assert_value(
+            13,
+            vec![
+                w16_map(vec![("id", V::Int(7))]),
+                w16_map(vec![("id", s(b"7"))]),
+            ],
+            V::Bool(false),
+        );
+        assert_value(
+            13,
+            vec![w16_map(vec![("x", f("1.0"))]), w16_map(vec![("x", f("1"))])],
+            V::Bool(true),
+        );
+        assert_value(
+            13,
+            vec![
+                w16_map(vec![("x", f("NAN"))]),
+                w16_map(vec![("x", f("NAN"))]),
+            ],
+            V::Bool(false),
+        );
+        let left = w16_map(vec![("a", V::Int(1)), ("b", V::Int(2))]);
+        let right = w16_map(vec![("b", V::Int(2)), ("a", V::Int(1))]);
+        assert_value(
+            13,
+            vec![w16_map(vec![("x", left)]), w16_map(vec![("x", right)])],
+            V::Bool(false),
+        );
+        assert!(call(13, vec![w16_map(vec![]), w16_map(vec![("id", V::Int(7))])]).is_none());
+        assert!(
+            call(
+                13,
+                vec![
+                    w16_map(vec![("id", s(b"7foo"))]),
+                    w16_map(vec![("id", V::Int(7))])
+                ]
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_arity_types_and_malformed_wire() {
+        for op in 0..=14 {
+            assert!(call(op, vec![]).is_none());
+        }
+        assert!(call(2, vec![s(b"a"), V::Int(1)]).is_none());
+        let mut output = [88_u8; 256];
+        for bad in [
+            b"N;".as_slice(),
+            b"a:0:{}junk",
+            b"a:1:{i:1;s:1:\"a\";}",
+            b"a:1:{i:0;R:1;}",
+            b"a:1:{i:0;O:1:\"X\":0:{}}",
+        ] {
+            assert_eq!(
+                unsafe {
+                    nntmux_w20_verification_helpers(
+                        8,
+                        bad.as_ptr(),
+                        bad.len(),
+                        output.as_mut_ptr(),
+                        output.len(),
+                    )
+                },
+                -1
+            );
+        }
+        assert_eq!(output, [88; 256]);
+    }
+
+    #[test]
+    fn rejects_invalid_ranges_and_short_outputs_without_writes() {
+        let input = b"a:1:{i:0;s:3:\"php\";}";
+        let mut output = [88_u8; 64];
+        unsafe {
+            let abi = nntmux_w20_verification_helpers;
+            assert_eq!(abi(8, std::ptr::null(), 0, output.as_mut_ptr(), 64), -1);
+            assert_eq!(
+                abi(8, input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                -1
+            );
+            assert_eq!(
+                abi(8, input.as_ptr(), usize::MAX, output.as_mut_ptr(), 64),
+                -1
+            );
+            assert_eq!(
+                abi(
+                    8,
+                    input.as_ptr(),
+                    input.len(),
+                    output.as_mut_ptr(),
+                    usize::MAX
+                ),
+                -1
+            );
+            assert_eq!(
+                abi(8, usize::MAX as *const u8, 1, output.as_mut_ptr(), 64),
+                -1
+            );
+            assert_eq!(
+                abi(8, input.as_ptr(), input.len(), usize::MAX as *mut u8, 1),
+                -1
+            );
+            assert_eq!(
+                abi(
+                    8,
+                    input.as_ptr(),
+                    64 * 1024 * 1024 + 1,
+                    output.as_mut_ptr(),
+                    64
+                ),
+                -1
+            );
+            assert_eq!(
+                abi(
+                    8,
+                    input.as_ptr(),
+                    input.len(),
+                    output.as_mut_ptr(),
+                    64 * 1024 * 1024 + 1
+                ),
+                -1
+            );
+            assert_eq!(abi(8, output.as_ptr(), 8, output.as_mut_ptr(), 64), -1);
+            assert_eq!(
+                abi(8, input.as_ptr(), input.len(), output.as_mut_ptr(), 0),
+                -4
+            );
+            assert_eq!(
+                abi(8, input.as_ptr(), input.len(), output.as_mut_ptr(), 3),
+                -4
+            );
+        }
+        assert_eq!(output, [88; 64]);
+    }
+
+    #[test]
+    fn byte_aligned_adjacent_buffers_are_valid() {
+        let input = b"a:1:{i:0;s:3:\"php\";}";
+        let mut buffer = [88_u8; 128];
+        buffer[1..1 + input.len()].copy_from_slice(input);
+        let written = unsafe {
+            nntmux_w20_verification_helpers(
+                8,
+                buffer.as_ptr().add(1),
+                input.len(),
+                buffer.as_mut_ptr().add(1 + input.len()),
+                4,
+            )
+        };
+        assert_eq!(written, 4);
+        assert_eq!(&buffer[1 + input.len()..5 + input.len()], b"b:1;");
+        assert_eq!(buffer[0], 88);
+    }
+}
+
+// Wave 20 slice 20.2: bounded pure helpers. PHP retains every side effect and
+// falls back when a value cannot be represented without changing its semantics.
+fn w20_float(value: &VerificationOutboxValue) -> Option<f64> {
+    let VerificationOutboxValue::Float(bytes) = value else {
+        return None;
+    };
+    match bytes.as_slice() {
+        b"NAN" => Some(f64::NAN),
+        b"INF" => Some(f64::INFINITY),
+        b"-INF" => Some(f64::NEG_INFINITY),
+        _ => std::str::from_utf8(bytes).ok()?.parse().ok(),
+    }
+}
+
+fn w20_double(value: f64) -> VerificationOutboxValue {
+    VerificationOutboxValue::Float(value.to_string().into_bytes())
+}
+
+fn w20_join(parts: &[&[u8]]) -> VerificationOutboxValue {
+    VerificationOutboxValue::Bytes(parts.concat())
+}
+
+// Unlike Rust's saturating casts, PHP's out-of-range float conversion is not
+// portable. Only the exactly bounded domain is evaluated here.
+fn w20_bounded_int(value: f64) -> Option<i64> {
+    (value.is_finite()
+        && (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&value))
+    .then(|| value as i64)
+}
+
+fn w20_stored_int(value: &VerificationOutboxValue) -> Option<i64> {
+    use VerificationOutboxValue as V;
+    match value {
+        V::Null => Some(0),
+        V::Bool(v) => Some(i64::from(*v)),
+        V::Int(v) => Some(*v),
+        V::Float(_) => w20_bounded_int(w20_float(value)?.trunc()),
+        V::Array(entries) => Some(i64::from(!entries.is_empty())),
+        V::Bytes(bytes) => {
+            let text = std::str::from_utf8(bytes)
+                .ok()?
+                .trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c'));
+            let digits = text.strip_prefix(['+', '-']).unwrap_or(text);
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            // Exponent, fraction, leading-numeric and overflow strings are
+            // intentionally left to PHP's complete numeric-string conversion.
+            text.parse().ok()
+        }
+    }
+}
+
+// PHP serializes already-normalized array keys. Decline crafted duplicate or
+// numeric-string keys instead of interpreting them differently from PHP.
+fn w20_canonical(value: &VerificationOutboxValue) -> bool {
+    use VerificationOutboxValue as V;
+    let V::Array(entries) = value else {
+        return true;
+    };
+    let mut keys = std::collections::HashSet::with_capacity(entries.len());
+    entries.iter().all(|(key, value)| {
+        let mut encoded = Vec::new();
+        match key {
+            V::Int(_) => key.serialize(&mut encoded),
+            V::Bytes(bytes) => {
+                if std::str::from_utf8(bytes)
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .is_some_and(|n| n.to_string().as_bytes() == bytes)
+                {
+                    return false;
+                }
+                key.serialize(&mut encoded);
+            }
+            _ => return false,
+        }
+        keys.insert(encoded) && w20_canonical(value)
+    })
+}
+
+fn w20_strict_equal(left: &VerificationOutboxValue, right: &VerificationOutboxValue) -> bool {
+    use VerificationOutboxValue as V;
+    match (left, right) {
+        (V::Null, V::Null) => true,
+        (V::Bool(a), V::Bool(b)) => a == b,
+        (V::Int(a), V::Int(b)) => a == b,
+        (V::Bytes(a), V::Bytes(b)) => a == b,
+        (V::Float(_), V::Float(_)) => w20_float(left)
+            .zip(w20_float(right))
+            .is_some_and(|(a, b)| a == b),
+        (V::Array(a), V::Array(b)) => {
+            a.len() == b.len()
+                && a.iter().zip(b).all(|((ak, av), (bk, bv))| {
+                    w20_strict_equal(ak, bk) && w20_strict_equal(av, bv)
+                })
+        }
+        _ => false,
+    }
+}
+
+fn w20_base64(bytes: &[u8]) -> Vec<u8> {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = Vec::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let a = chunk[0];
+        let b = chunk.get(1).copied().unwrap_or(0);
+        let c = chunk.get(2).copied().unwrap_or(0);
+        output.push(TABLE[(a >> 2) as usize]);
+        output.push(TABLE[(((a & 3) << 4) | (b >> 4)) as usize]);
+        output.push(if chunk.len() > 1 {
+            TABLE[(((b & 15) << 2) | (c >> 6)) as usize]
+        } else {
+            b'='
+        });
+        output.push(if chunk.len() > 2 {
+            TABLE[(c & 63) as usize]
+        } else {
+            b'='
+        });
+    }
+    output
+}
+
+fn w20_compute(
+    operation: u32,
+    args: &[VerificationOutboxValue],
+) -> Option<VerificationOutboxValue> {
+    use VerificationOutboxValue as V;
+    Some(match (operation, args) {
+        (0, [last, now, interval]) => {
+            let now = w20_float(now)?;
+            let interval = w20_float(interval)?;
+            V::Bool(matches!(last, V::Null) || now - w20_float(last)? >= interval)
+        }
+        (1, [driver, db_driver]) => {
+            let driver = w16_bytes(driver)?;
+            let db_driver = w16_bytes(db_driver)?;
+            match driver {
+                b"database" | b"file" => w16_string(driver),
+                b"auto" => w16_string(if matches!(db_driver, b"mysql" | b"mariadb") {
+                    b"database"
+                } else {
+                    b"file"
+                }),
+                _ => V::Null,
+            }
+        }
+        (2, [root, locks]) => w20_join(&[
+            w16_bytes(root)?,
+            if w16_bool(locks)? { b"/locks" } else { b"" },
+        ]),
+        (3, [directory, name]) => {
+            w20_join(&[w16_bytes(directory)?, b"/", w16_bytes(name)?, b".state"])
+        }
+        (4, [scratch, free, reserve]) => V::Int(
+            w16_int(scratch)?
+                .min(w20_bounded_int(w20_float(free)?.floor())?.checked_sub(w16_int(reserve)?)?),
+        ),
+        (5, [bytes, reserved]) => {
+            let (bytes, reserved) = (w16_int(bytes)?, w16_int(reserved)?);
+            match bytes.checked_sub(reserved) {
+                Some(n) => V::Int(n),
+                None => w20_double(bytes as f64 - reserved as f64),
+            }
+        }
+        (6, [reserved, delta]) => {
+            let (reserved, delta) = (w16_int(reserved)?, w16_int(delta)?);
+            match reserved.checked_add(delta) {
+                Some(n) => V::Int(n.max(0)),
+                None => {
+                    let result = reserved as f64 + delta as f64;
+                    if result > 0.0 {
+                        w20_double(result)
+                    } else {
+                        V::Int(0)
+                    }
+                }
+            }
+        }
+        (7, [delta, reserved, limit]) => {
+            let (delta, reserved, limit) = (w16_int(delta)?, w16_int(reserved)?, w16_int(limit)?);
+            V::Bool(delta != 0 || reserved > limit)
+        }
+        (8, [mode]) => V::Bool(matches!(w16_bytes(mode)?, b"auto" | b"php" | b"native")),
+        (9, [pid, mode, library]) => w20_join(&[
+            w16_int(pid)?.to_string().as_bytes(),
+            b":",
+            w16_bytes(mode)?,
+            b":",
+            w16_bytes(library)?,
+        ]),
+        (10, [pid, library]) => w20_join(&[
+            w16_int(pid)?.to_string().as_bytes(),
+            b":",
+            w16_bytes(library)?,
+        ]),
+        (11, [mode, library, sapi, os]) => {
+            let (mode, library, sapi, os) = (
+                w16_bytes(mode)?,
+                w16_bytes(library)?,
+                w16_bytes(sapi)?,
+                w16_bytes(os)?,
+            );
+            V::Bool(
+                mode == b"php"
+                    || (mode == b"auto"
+                        && (library.is_empty() || sapi != b"cli" || os != b"Linux")),
+            )
+        }
+        (12, [release_id, guid, descriptor]) => {
+            w16_int(release_id)?;
+            w16_bytes(guid)?;
+            let field = |name: &[u8]| -> Option<V> {
+                Some(w16_string(w16_bytes(descriptor.field(name)?)?))
+            };
+            w16_map(vec![
+                ("releases_id", release_id.clone()),
+                ("release_guid", guid.clone()),
+                ("packet_checksum", field(b"packet_checksum")?),
+                ("recovery_set_id", field(b"recovery_set_id")?),
+                ("file_id", field(b"file_id")?),
+                ("full_md5", field(b"hash")?),
+                ("hash16k", field(b"hash_16K")?),
+                ("file_size", field(b"size_decimal")?),
+                (
+                    "raw_filename_base64",
+                    V::Bytes(w20_base64(w16_bytes(descriptor.field(b"filename_bytes")?)?)),
+                ),
+                ("descriptor_proof_version", V::Int(1)),
+                ("classification", w16_string(b"unknown")),
+                ("classification_version", V::Int(0)),
+                ("classification_provenance", w16_string(b"unclassified")),
+            ])
+        }
+        (13, [stored, incoming]) => {
+            let stored = w16_entries(stored)?;
+            let incoming = w16_entries(incoming)?;
+            // Index once so arbitrary incoming row widths cannot turn the
+            // bounded wire input into a quadratic field search.
+            let mut index = std::collections::HashMap::with_capacity(stored.len());
+            for (key, value) in stored {
+                let mut wire = Vec::new();
+                key.serialize(&mut wire);
+                index.insert(wire, value);
+            }
+            let mut equal = true;
+            for (key, value) in incoming {
+                let mut wire = Vec::new();
+                key.serialize(&mut wire);
+                let previous = index.get(&wire)?;
+                let field_equal = match value {
+                    V::Int(n) => w20_stored_int(previous)? == *n,
+                    _ => w20_strict_equal(previous, value),
+                };
+                equal &= field_equal;
+            }
+            V::Bool(equal)
+        }
+        _ => return None,
+    })
+}
+
+/// Evaluate a pure helper using PHP serialized list arguments and a serialized
+/// result. Returns -1 to decline, or -required for insufficient output capacity,
+/// without writing any output. Both pointers must be non-null even at length 0.
+///
+/// # Safety
+/// The caller must provide live readable input and writable output allocations
+/// of the declared lengths, disjoint for the duration of this call. Byte-aligned
+/// pointers are sufficient; each range is limited to 64 MiB and isize::MAX.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w20_verification_helpers(
+    operation: u32,
+    input: *const u8,
+    length: usize,
+    output: *mut u8,
+    capacity: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        const MAX_BYTES: usize = 64 * 1024 * 1024;
+        if !nfo_abi_range(input, length, false)
+            || !nfo_abi_range(output, capacity, false)
+            || length > MAX_BYTES
+            || capacity > MAX_BYTES
+            || yenc_ranges_overlap(input as usize, length, output as usize, capacity)
+        {
+            return -1;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, length) };
+        let mut parser = VerificationOutboxParser {
+            bytes,
+            pos: 0,
+            remaining: 100_000,
+        };
+        let Some(value) = parser.value(488) else {
+            return -1;
+        };
+        if parser.pos != length || !w19_list(&value) || !w20_canonical(&value) {
+            return -1;
+        }
+        let args: Vec<_> = w16_entries(&value)
+            .unwrap()
+            .iter()
+            .map(|(_, value)| value.clone())
+            .collect();
+        let Some(result) = w20_compute(operation, &args) else {
+            return -1;
+        };
+        let mut wire = Vec::new();
+        result.serialize(&mut wire);
+        if wire.len() > MAX_BYTES {
+            return -1;
+        }
+        let Ok(required) = isize::try_from(wire.len()) else {
+            return -1;
+        };
+        if wire.len() > capacity {
+            return -required;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(wire.as_ptr(), output, wire.len());
+        }
+        required
+    }))
+    .unwrap_or(-1)
+}

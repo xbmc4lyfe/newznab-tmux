@@ -15,6 +15,14 @@ use RuntimeException;
  */
 abstract class VerificationLockStore
 {
+    // Single-call FFI remains opt-in until every paired mean/p99 gate reaches 1.5x.
+    private static bool $useRustFfi = false;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
     /**
      * Database locks cover every worker host using the shared database; file locks cover only
      * this host's storage and remain for SQLite and single-host installs.
@@ -22,9 +30,7 @@ abstract class VerificationLockStore
     public static function make(): self
     {
         $driver = (string) config('release_verification.locks', 'auto');
-        if ($driver === 'auto') {
-            $driver = in_array(DB::connection()->getDriverName(), ['mysql', 'mariadb'], true) ? 'database' : 'file';
-        }
+        $driver = self::resolveDriver($driver, $driver === 'auto' ? DB::connection()->getDriverName() : '');
 
         return match ($driver) {
             'database' => new DatabaseVerificationLockStore,
@@ -83,19 +89,72 @@ abstract class VerificationLockStore
     /** Fairness state for a named lock lives on this host and is written only by its holder. */
     protected function statePath(string $name): string
     {
-        return $this->directory(true).'/'.$name.'.state';
+        return self::stateFilePath($this->directory(true), $name);
     }
 
     protected function directory(bool $locks): string
     {
         $root = (string) config('release_verification.storage_path');
-        foreach ($locks ? [$root, $root.'/locks'] : [$root] as $directory) {
+        foreach ($locks ? [$root, self::lockPath($root, true)] : [$root] as $directory) {
             if (is_link($directory)) {
                 throw new RuntimeException('Verification lock directory cannot be a symlink.');
             }
             File::ensureDirectoryExists($directory, 0700);
         }
 
+        return self::lockPath($root, $locks);
+    }
+
+    public static function resolveDriver(string $driver, string $databaseDriver): ?string
+    {
+        return self::$useRustFfi ? (self::resolveDriverNative($driver, $databaseDriver) ?? self::resolveDriverPhp($driver, $databaseDriver)) : self::resolveDriverPhp($driver, $databaseDriver);
+    }
+
+    public static function resolveDriverPhp(string $driver, string $databaseDriver): ?string
+    {
+        return match ($driver) {
+            'auto' => in_array($databaseDriver, ['mysql', 'mariadb'], true) ? 'database' : 'file', 'database', 'file' => $driver, default => null
+        };
+    }
+
+    public static function resolveDriverNative(string $driver, string $databaseDriver): ?string
+    {
+        $result = LeaseHeartbeat::computeNative(1, [$driver, $databaseDriver])['value'] ?? null;
+
+        return is_string($result) ? $result : null;
+    }
+
+    public static function lockPath(string $root, bool $locks): string
+    {
+        return self::$useRustFfi ? (self::lockPathNative($root, $locks) ?? self::lockPathPhp($root, $locks)) : self::lockPathPhp($root, $locks);
+    }
+
+    public static function lockPathPhp(string $root, bool $locks): string
+    {
         return $locks ? $root.'/locks' : $root;
+    }
+
+    public static function lockPathNative(string $root, bool $locks): ?string
+    {
+        $result = LeaseHeartbeat::computeNative(2, [$root, $locks])['value'] ?? null;
+
+        return is_string($result) ? $result : null;
+    }
+
+    public static function stateFilePath(string $directory, string $name): string
+    {
+        return self::$useRustFfi ? (self::stateFilePathNative($directory, $name) ?? self::stateFilePathPhp($directory, $name)) : self::stateFilePathPhp($directory, $name);
+    }
+
+    public static function stateFilePathPhp(string $directory, string $name): string
+    {
+        return $directory.'/'.$name.'.state';
+    }
+
+    public static function stateFilePathNative(string $directory, string $name): ?string
+    {
+        $result = LeaseHeartbeat::computeNative(3, [$directory, $name])['value'] ?? null;
+
+        return is_string($result) ? $result : null;
     }
 }
