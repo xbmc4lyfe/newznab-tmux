@@ -1396,6 +1396,588 @@ pub unsafe extern "C" fn nntmux_nzb_validate_passwords(
     u32::from(seen == count)
 }
 
+// ============================================================================
+// Par2FileHashEvidence, ReleaseArchiveNamingEvidence, Utf8, IrcChannelList
+// ============================================================================
+
+/// Validates whether `bytes` is a canonical unsigned 64-bit base-10 integer string
+/// (`0` or `[1-9][0-9]{0,19}` <= `18446744073709551615`), matching `Par2FileHashEvidence::sizeDecimal`.
+#[inline]
+pub fn par2_size_decimal_valid(bytes: &[u8]) -> bool {
+    match bytes.len() {
+        0 => false,
+        1 => bytes[0].is_ascii_digit(),
+        2..=19 => {
+            (b'1'..=b'9').contains(&bytes[0]) && bytes[1..].iter().all(|b| b.is_ascii_digit())
+        }
+        20 => {
+            (b'1'..=b'9').contains(&bytes[0])
+                && bytes[1..].iter().all(|b| b.is_ascii_digit())
+                && bytes <= b"18446744073709551615"
+        }
+        _ => false,
+    }
+}
+
+/// Validates a string candidate for `Par2FileHashEvidence::sizeDecimal`.
+/// Returns `1` when `s[..len]` is a valid base-10 `u64` string, `0` otherwise.
+///
+/// # Safety
+///
+/// `s` must be valid for reads of `len` bytes when non-null and `len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_par2_size_decimal_valid(s: *const u8, len: usize) -> i32 {
+    if s.is_null() || len == 0 || len > 20 {
+        return 0;
+    }
+    let bytes = unsafe { slice::from_raw_parts(s, len) };
+    i32::from(par2_size_decimal_valid(bytes))
+}
+
+/// Converts 8 little-endian bytes (`u64::from_le_bytes`) into a base-10 ASCII string in `out_buf`,
+/// matching `Par2FileHashEvidence::littleEndianSize`.
+/// Returns:
+/// - `1..=20`: number of ASCII bytes written to `out_buf`
+/// - `0`: invalid input (`bytes` is null or `len != 8`)
+/// - `< 0`: `-(required_len as isize)` if `out_cap` is too small or `out_buf` is null
+///
+/// # Safety
+///
+/// `bytes` must be valid for reads of `len` bytes when non-null and `len > 0`.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_par2_le_u64_to_decimal(
+    bytes: *const u8,
+    len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if bytes.is_null() || len != 8 {
+        return 0;
+    }
+    let raw = unsafe { slice::from_raw_parts(bytes, 8) };
+    let mut val = u64::from_le_bytes([
+        raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+    ]);
+    let mut tmp = [0u8; 20];
+    let mut pos = 20usize;
+    if val == 0 {
+        pos = 19;
+        tmp[19] = b'0';
+    } else {
+        while val > 0 {
+            pos -= 1;
+            tmp[pos] = b'0' + (val % 10) as u8;
+            val /= 10;
+        }
+    }
+    let digits = &tmp[pos..];
+    if digits.len() > out_cap || out_buf.is_null() {
+        return -(digits.len() as isize);
+    }
+    unsafe { std::ptr::copy_nonoverlapping(digits.as_ptr(), out_buf, digits.len()) };
+    digits.len() as isize
+}
+
+#[inline]
+fn fxhash_bytes(bytes: &[u8]) -> usize {
+    let mut h = 0xcbf29ce484222325u64;
+    let (chunks, rem) = bytes.as_chunks::<8>();
+    for &chunk in chunks {
+        h = (h ^ u64::from_le_bytes(chunk)).wrapping_mul(0x100000001b3);
+    }
+    for &b in rem {
+        h = (h ^ (b as u64)).wrapping_mul(0x100000001b3);
+    }
+    (h ^ (h >> 32)) as usize
+}
+
+/// Deduplicates and bounds `count` NUL-separated archive witness filenames in `input[..input_len]`,
+/// matching `ReleaseArchiveNamingEvidence::boundedNames`.
+/// Sets `*overflow_out` to `1` if any unique entry was invalid (`""`, `> 4096` bytes, or invalid UTF-8)
+/// or exceeded `MAX_WITNESSES = 256` or `32768` total cumulative bytes, else `0`.
+/// Writes kept names separated by NUL (`\0`) into `out_buf`.
+/// Returns:
+/// - `>= 0`: bytes written to `out_buf` (`0` when the bounded list is empty)
+/// - `-1`: declined to PHP fallback (e.g. embedded NUL causing slice count != `count`)
+/// - `< -1`: `-(required_len as isize)` if `out_cap` is too small
+///
+/// # Safety
+///
+/// `input` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
+/// `overflow_out` must be valid for writes of 1 byte when non-null.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_archive_witness_bounded_names_nul(
+    input: *const u8,
+    input_len: usize,
+    count: usize,
+    overflow_out: *mut u8,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if count == 0 {
+        if input_len != 0 {
+            return -1;
+        }
+        if !overflow_out.is_null() {
+            unsafe { *overflow_out = 0 };
+        }
+        return 0;
+    }
+    if input.is_null() && input_len > 0 {
+        return -1;
+    }
+    let bytes: &[u8] = if input_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(input, input_len) }
+    };
+
+    let all_utf8 = std::str::from_utf8(bytes).is_ok();
+    let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+
+    let mut seen_stack: [std::mem::MaybeUninit<&[u8]>; 512] =
+        [const { std::mem::MaybeUninit::uninit() }; 512];
+    let mut seen_len = 0usize;
+    let use_ht = count > 24 && count <= 512;
+    let mut ht = [0u16; 1024];
+    let mut seen_fallback: Option<std::collections::HashSet<&[u8]>> = if count > 512 {
+        Some(std::collections::HashSet::with_capacity(count))
+    } else {
+        None
+    };
+
+    let mut seen_slices = 0usize;
+    let mut bounded_count = 0usize;
+    let mut total_bytes = 0usize;
+    let mut overflow = false;
+
+    for name in bytes.split(|&b| b == 0) {
+        seen_slices += 1;
+        if seen_slices > count {
+            return -1;
+        }
+
+        let is_new = if let Some(ref mut set) = seen_fallback {
+            set.insert(name)
+        } else if use_ht {
+            let mut slot = fxhash_bytes(name) & 1023;
+            let mut duplicate = false;
+            loop {
+                let entry = ht[slot];
+                if entry == 0 {
+                    seen_stack[seen_len].write(name);
+                    seen_len += 1;
+                    ht[slot] = seen_len as u16;
+                    break;
+                }
+                let prev = unsafe { seen_stack[(entry - 1) as usize].assume_init() };
+                if prev == name {
+                    duplicate = true;
+                    break;
+                }
+                slot = (slot + 1) & 1023;
+            }
+            !duplicate
+        } else {
+            let mut duplicate = false;
+            for item in &seen_stack[..seen_len] {
+                let prev = unsafe { item.assume_init() };
+                if prev == name {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if !duplicate {
+                seen_stack[seen_len].write(name);
+                seen_len += 1;
+            }
+            !duplicate
+        };
+
+        if !is_new {
+            continue;
+        }
+
+        if name.is_empty()
+            || name.len() > 4096
+            || (!all_utf8 && std::str::from_utf8(name).is_err())
+        {
+            overflow = true;
+            continue;
+        }
+
+        total_bytes = total_bytes.saturating_add(name.len());
+        if bounded_count >= 256 || total_bytes > 32768 {
+            overflow = true;
+            continue;
+        }
+
+        if bounded_count > 0 {
+            out.push(0);
+        }
+        out.extend(name);
+        bounded_count += 1;
+    }
+
+    if seen_slices != count {
+        return -1;
+    }
+
+    if !overflow_out.is_null() {
+        unsafe { *overflow_out = u8::from(overflow) };
+    }
+
+    if bounded_count == 0 {
+        return 0;
+    }
+    let res = out.finish();
+    if res < 0 {
+        res.min(-2)
+    } else {
+        res
+    }
+}
+
+#[inline]
+fn skip_json_ws(bytes: &[u8], mut pos: usize) -> usize {
+    while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\n' | b'\r') {
+        pos += 1;
+    }
+    pos
+}
+
+/// Decodes and validates a JSON list of archive witness filenames in `json[..json_len]`,
+/// matching `ReleaseArchiveNamingEvidence::decodeNames`.
+/// Declines (`-1`) if the JSON contains `\uXXXX` escapes or fails validation/bounding so the
+/// PHP caller can either decode `\uXXXX` or raise the exact domain exception.
+/// Writes validated names separated by NUL (`\0`) into `out_buf`.
+/// Returns:
+/// - `>= 0`: bytes written to `out_buf` (`0` for an empty JSON array `[]`)
+/// - `-1`: declined or invalid/unbounded JSON
+/// - `< -1`: `-(required_len as isize)` if `out_cap` is too small
+///
+/// # Safety
+///
+/// `json` must be valid for reads of `json_len` bytes when non-null and `json_len > 0`.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_archive_witness_decode_names_json(
+    json: *const u8,
+    json_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if json.is_null() || json_len == 0 {
+        return -1;
+    }
+    let bytes = unsafe { slice::from_raw_parts(json, json_len) };
+    let mut pos = skip_json_ws(bytes, 0);
+    if pos >= bytes.len() || bytes[pos] != b'[' {
+        return -1;
+    }
+    pos = skip_json_ws(bytes, pos + 1);
+    if pos >= bytes.len() {
+        return -1;
+    }
+    if bytes[pos] == b']' {
+        pos = skip_json_ws(bytes, pos + 1);
+        return if pos == bytes.len() { 0 } else { -1 };
+    }
+
+    if std::str::from_utf8(bytes).is_err() {
+        return -1;
+    }
+
+    let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+    let mut seen_spans: [std::mem::MaybeUninit<(usize, usize, bool)>; 256] =
+        [const { std::mem::MaybeUninit::uninit() }; 256];
+    let mut seen_count = 0usize;
+    let mut ht = [0u16; 512];
+    let mut ht_active = false;
+    let mut escaped_pool: Vec<u8> = Vec::new();
+    let mut total_bytes = 0usize;
+
+    loop {
+        if pos >= bytes.len() || bytes[pos] != b'"' {
+            return -1;
+        }
+        pos += 1;
+        let str_start = pos;
+
+        while pos < bytes.len() {
+            let b = bytes[pos];
+            if b == b'"' || b == b'\\' || b < 0x20 {
+                break;
+            }
+            pos += 1;
+        }
+        if pos >= bytes.len() {
+            return -1;
+        }
+
+        let (item_start, item_len, has_escape) = if bytes[pos] == b'"' {
+            let len = pos - str_start;
+            pos += 1;
+            (str_start, len, false)
+        } else if bytes[pos] == b'\\' {
+            let prefix_len = pos - str_start;
+            if prefix_len > 4096 {
+                return -1;
+            }
+            let pool_start = escaped_pool.len();
+            escaped_pool.extend_from_slice(&bytes[str_start..pos]);
+            let mut s_len = prefix_len;
+            loop {
+                if pos >= bytes.len() {
+                    return -1;
+                }
+                let b = bytes[pos];
+                if b == b'"' {
+                    pos += 1;
+                    break;
+                }
+                if b == b'\\' {
+                    pos += 1;
+                    if pos >= bytes.len() {
+                        return -1;
+                    }
+                    let esc = match bytes[pos] {
+                        b'"' => b'"',
+                        b'\\' => b'\\',
+                        b'/' => b'/',
+                        b'b' => 0x08,
+                        b'f' => 0x0C,
+                        b'n' => b'\n',
+                        b'r' => b'\r',
+                        b't' => b'\t',
+                        _ => return -1,
+                    };
+                    if s_len >= 4096 {
+                        return -1;
+                    }
+                    escaped_pool.push(esc);
+                    s_len += 1;
+                    pos += 1;
+                    continue;
+                }
+                if b < 0x20 || s_len >= 4096 {
+                    return -1;
+                }
+                escaped_pool.push(b);
+                s_len += 1;
+                pos += 1;
+            }
+            (pool_start, s_len, true)
+        } else {
+            return -1;
+        };
+
+        if item_len == 0 || item_len > 4096 {
+            return -1;
+        }
+
+        total_bytes = total_bytes.saturating_add(item_len);
+        if seen_count >= 256 || total_bytes > 32768 {
+            return -1;
+        }
+
+        let item_slice: &[u8] = if has_escape {
+            &escaped_pool[item_start..item_start + item_len]
+        } else {
+            &bytes[item_start..item_start + item_len]
+        };
+
+        if !ht_active && seen_count == 16 {
+            ht_active = true;
+            for idx in 0..seen_count {
+                let (p_start, p_len, p_esc) = unsafe { seen_spans[idx].assume_init() };
+                let prev = if p_esc {
+                    &escaped_pool[p_start..p_start + p_len]
+                } else {
+                    &bytes[p_start..p_start + p_len]
+                };
+                let mut s = fxhash_bytes(prev) & 511;
+                while ht[s] != 0 {
+                    s = (s + 1) & 511;
+                }
+                ht[s] = (idx + 1) as u16;
+            }
+        }
+
+        if ht_active {
+            let mut slot = fxhash_bytes(item_slice) & 511;
+            loop {
+                let entry = ht[slot];
+                if entry == 0 {
+                    seen_spans[seen_count].write((item_start, item_len, has_escape));
+                    seen_count += 1;
+                    ht[slot] = seen_count as u16;
+                    break;
+                }
+                let (p_start, p_len, p_esc) =
+                    unsafe { seen_spans[(entry - 1) as usize].assume_init() };
+                if p_len == item_len {
+                    let prev_slice = if p_esc {
+                        &escaped_pool[p_start..p_start + p_len]
+                    } else {
+                        &bytes[p_start..p_start + p_len]
+                    };
+                    if prev_slice == item_slice {
+                        return -1;
+                    }
+                }
+                slot = (slot + 1) & 511;
+            }
+        } else {
+            for item in &seen_spans[..seen_count] {
+                let (p_start, p_len, p_esc) = unsafe { item.assume_init() };
+                if p_len == item_len {
+                    let prev_slice = if p_esc {
+                        &escaped_pool[p_start..p_start + p_len]
+                    } else {
+                        &bytes[p_start..p_start + p_len]
+                    };
+                    if prev_slice == item_slice {
+                        return -1;
+                    }
+                }
+            }
+            seen_spans[seen_count].write((item_start, item_len, has_escape));
+            seen_count += 1;
+        }
+
+        if seen_count > 1 {
+            out.push(0);
+        }
+        out.extend(item_slice);
+
+        pos = skip_json_ws(bytes, pos);
+        if pos >= bytes.len() {
+            return -1;
+        }
+        if bytes[pos] == b',' {
+            pos = skip_json_ws(bytes, pos + 1);
+            continue;
+        }
+        if bytes[pos] == b']' {
+            pos = skip_json_ws(bytes, pos + 1);
+            if pos != bytes.len() {
+                return -1;
+            }
+            let res = out.finish();
+            return if res < 0 { res.min(-2) } else { res };
+        }
+        return -1;
+    }
+}
+
+/// Checks whether `input[..len]` is valid UTF-8, matching `mb_check_encoding($value, 'UTF-8')`
+/// in `Utf8::clean`.
+/// Returns `1` if valid UTF-8, `0` otherwise.
+///
+/// # Safety
+///
+/// `input` must be valid for reads of `len` bytes when non-null and `len > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_utf8_is_valid(input: *const u8, len: usize) -> i32 {
+    if len == 0 {
+        return 1;
+    }
+    if input.is_null() {
+        return 0;
+    }
+    let bytes = unsafe { slice::from_raw_parts(input, len) };
+    i32::from(std::str::from_utf8(bytes).is_ok())
+}
+
+/// Parses an IRC channel list string (`"#chan1,#chan2:password"`) matching `IrcChannelList::parse`.
+/// Writes `2 * k` NUL-separated slices (`channel_0 \0 password_0 \0 channel_1 \0 password_1 ...`)
+/// into `out_buf`, where an empty `password_i` slice denotes `null`.
+/// Returns:
+/// - `0`: no valid channels parsed (caller returns `[$default => null]`)
+/// - `> 0`: bytes written to `out_buf`
+/// - `-1`: declined to PHP fallback (e.g. embedded NUL inside a trimmed channel or password)
+/// - `< -1`: `-(required_len as isize)` if `out_cap` is too small
+///
+/// # Safety
+///
+/// `input` must be valid for reads of `len` bytes when non-null and `len > 0`.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_irc_channel_list_parse(
+    input: *const u8,
+    len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if len == 0 {
+        return 0;
+    }
+    if input.is_null() {
+        return -1;
+    }
+    let bytes = unsafe { slice::from_raw_parts(input, len) };
+
+    // Preserve PHP associative array insertion order when a channel key is overwritten.
+    // Store `(has_hash_prefix, raw_name_without_leading_hash_if_added, password_slice)`.
+    let mut entries: Vec<(bool, &[u8], &[u8])> = Vec::with_capacity(8);
+
+    for raw_item in bytes.split(|&b| b == b',') {
+        let item = php_trim(raw_item);
+        if item.is_empty() {
+            continue;
+        }
+        let (raw_name, raw_pass) = match item.iter().position(|&b| b == b':') {
+            Some(colon) => (&item[..colon], Some(&item[colon + 1..])),
+            None => (item, None),
+        };
+        let name = php_trim(raw_name);
+        if name.is_empty() || name == b"#" {
+            continue;
+        }
+        let pass: &[u8] = match raw_pass {
+            Some(p) => php_trim(p),
+            None => &[],
+        };
+        if name.contains(&0) || pass.contains(&0) {
+            return -1;
+        }
+        let has_hash = name[0] == b'#';
+        let bare = if has_hash { &name[1..] } else { name };
+
+        // Check if this normalized channel key (`#` + `bare`) already exists.
+        if let Some(existing) = entries.iter_mut().find(|(_, b, _)| *b == bare) {
+            existing.2 = pass;
+        } else {
+            entries.push((has_hash, bare, pass));
+        }
+    }
+
+    if entries.is_empty() {
+        return 0;
+    }
+
+    let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+    for (idx, &(_has_hash, bare, pass)) in entries.iter().enumerate() {
+        if idx > 0 {
+            out.push(0);
+        }
+        out.push(b'#');
+        out.extend(bare);
+        out.push(0);
+        out.extend(pass);
+    }
+
+    let res = out.finish();
+    if res < 0 {
+        res.min(-2)
+    } else {
+        res
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1533,5 +2115,138 @@ mod tests {
         };
         assert_eq!(rc, 4);
         assert_eq!(&out[..4], b"abcd");
+    }
+
+    #[test]
+    fn par2_size_decimal_and_le_u64_match_php() {
+        for valid in [
+            &b"0"[..],
+            b"1",
+            b"42",
+            b"4294967296",
+            b"9223372036854775807",
+            b"9223372036854775808",
+            b"18446744073709551615",
+        ] {
+            assert_eq!(
+                unsafe { nntmux_par2_size_decimal_valid(valid.as_ptr(), valid.len()) },
+                1
+            );
+        }
+        for invalid in [
+            &b""[..],
+            b"00",
+            b"01",
+            b"-1",
+            b"+1",
+            b"123\n",
+            b" 123",
+            b"18446744073709551616",
+            b"99999999999999999999",
+            b"100000000000000000000",
+        ] {
+            assert_eq!(
+                unsafe { nntmux_par2_size_decimal_valid(invalid.as_ptr(), invalid.len()) },
+                0
+            );
+        }
+
+        let cases: [(u64, &[u8]); 5] = [
+            (0, b"0"),
+            (1, b"1"),
+            (u32::MAX as u64, b"4294967295"),
+            (i64::MAX as u64 + 1, b"9223372036854775808"),
+            (u64::MAX, b"18446744073709551615"),
+        ];
+        for (val, expected) in cases {
+            let le = val.to_le_bytes();
+            let mut out = [0u8; 24];
+            let n = unsafe {
+                nntmux_par2_le_u64_to_decimal(le.as_ptr(), le.len(), out.as_mut_ptr(), out.len())
+            };
+            assert_eq!(n, expected.len() as isize);
+            assert_eq!(&out[..n as usize], expected);
+        }
+        let mut tiny = [0u8; 2];
+        assert_eq!(
+            unsafe {
+                nntmux_par2_le_u64_to_decimal(
+                    1000u64.to_le_bytes().as_ptr(),
+                    8,
+                    tiny.as_mut_ptr(),
+                    tiny.len(),
+                )
+            },
+            -4
+        );
+        assert_eq!(
+            unsafe { nntmux_par2_le_u64_to_decimal(b"short".as_ptr(), 5, tiny.as_mut_ptr(), 2) },
+            0
+        );
+    }
+
+    #[test]
+    fn archive_witness_bounded_names_and_decode_json_match_php() {
+        let mut overflow = 9u8;
+        let mut out = [0u8; 256];
+        let input = b"Ep1.mkv\0Ep2.mkv\0Ep1.mkv";
+        let rc = unsafe {
+            nntmux_archive_witness_bounded_names_nul(
+                input.as_ptr(),
+                input.len(),
+                3,
+                &mut overflow,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(overflow, 0);
+        assert_eq!(&out[..rc as usize], b"Ep1.mkv\0Ep2.mkv");
+
+        let json = br#"["Show.S01E01.mkv", "Show\\Sub\/Ep\"2\".nfo"]"#;
+        let rc = unsafe {
+            nntmux_archive_witness_decode_names_json(
+                json.as_ptr(),
+                json.len(),
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert!(rc > 0);
+        assert_eq!(
+            &out[..rc as usize],
+            b"Show.S01E01.mkv\0Show\\Sub/Ep\"2\".nfo"
+        );
+
+        let dup_json = br#"["a.mkv", "a.mkv"]"#;
+        assert_eq!(
+            unsafe {
+                nntmux_archive_witness_decode_names_json(
+                    dup_json.as_ptr(),
+                    dup_json.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            },
+            -1
+        );
+    }
+
+    #[test]
+    fn utf8_and_irc_channel_list_match_php() {
+        assert_eq!(unsafe { nntmux_utf8_is_valid(b"".as_ptr(), 0) }, 1);
+        assert_eq!(
+            unsafe { nntmux_utf8_is_valid("MÖVIE-映画".as_ptr(), "MÖVIE-映画".len()) },
+            1
+        );
+        assert_eq!(unsafe { nntmux_utf8_is_valid(b"\xff\xfe".as_ptr(), 2) }, 0);
+
+        let mut out = [0u8; 256];
+        let raw = b" #chan1 , chan2 : secret , # , :nopass , chan1 : override ";
+        let rc = unsafe {
+            nntmux_irc_channel_list_parse(raw.as_ptr(), raw.len(), out.as_mut_ptr(), out.len())
+        };
+        assert!(rc > 0);
+        assert_eq!(&out[..rc as usize], b"#chan1\0override\0#chan2\0secret");
     }
 }
