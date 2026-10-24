@@ -6,7 +6,10 @@ namespace App\Services\Predb\Irc;
 
 use App\Models\Predb;
 use App\Services\Predb\Feeds\PredbFeedEntry;
+use App\Support\RustPipelineLibrary;
 use Carbon\CarbonImmutable;
+use FFI;
+use FFI\CData;
 use InvalidArgumentException;
 
 /**
@@ -28,6 +31,19 @@ use InvalidArgumentException;
  */
 final class PreAnnounceParser
 {
+    private const NATIVE_CDEF = <<<'C'
+        ssize_t nntmux_irc_pre_announce_parse(const char *line, size_t line_len, int32_t format, char *out_buf, size_t out_cap);
+        ssize_t nntmux_irc_pre_announce_parse_batch_nul(const char *lines, size_t lines_len, int32_t format, char *out_buf, size_t out_cap);
+        C;
+
+    private static FFI|false|null $native = null;
+
+    private static ?CData $nativeBuffer = null;
+
+    private static int $nativeCapacity = 0;
+
+    private readonly int $nativeFormat;
+
     public const FORMATS = ['corruptnet', 'zenet', 'predatabase', 'ngp', 'rizon', 'opentrackers'];
 
     private const RELAY_FORMATS = ['corruptnet', 'zenet', 'predatabase', 'rizon'];
@@ -87,9 +103,24 @@ final class PreAnnounceParser
         if ($format !== 'opentrackers' && ! isset(self::PATTERNS[$format])) {
             throw new InvalidArgumentException("Unknown IRC pre announce format [{$format}]. Available: ".implode(', ', self::FORMATS));
         }
+        $this->nativeFormat = (int) array_search($format, self::FORMATS, true);
     }
 
     public function parse(string $message, ?CarbonImmutable $receivedAt = null): ?PredbFeedEntry
+    {
+        // Bounded ASCII relay PRE/nuke lines qualified; INFO conversion missed p99.
+        if ($this->format === 'opentrackers' && strlen($message) <= 512 && strncasecmp(ltrim($message, " \t\v("), 'INFO', 4) !== 0 && mb_check_encoding($message, 'ASCII')
+            && ! str_contains($message, "\0") && ! str_contains($message, "\r") && ! str_contains($message, "\n")) {
+            $entry = $this->parseNative($message, $receivedAt);
+            if ($entry !== false) {
+                return $entry;
+            }
+        }
+
+        return $this->parsePhp($message, $receivedAt);
+    }
+
+    private function parsePhp(string $message, ?CarbonImmutable $receivedAt = null): ?PredbFeedEntry
     {
         if (str_contains($message, "\r") || str_contains($message, "\n")) {
             return null;
@@ -108,6 +139,122 @@ final class PreAnnounceParser
         }
 
         return null;
+    }
+
+    /**
+     * Preserve one result per input, including unmatched lines. Embedded NUL bytes
+     * use PHP rather than splitting a message into multiple transport records.
+     *
+     * @param  list<string>  $messages
+     * @return list<PredbFeedEntry|null>
+     */
+    public function parseBatch(array $messages, ?CarbonImmutable $receivedAt = null): array
+    {
+        if ($messages === []) {
+            return [];
+        }
+        // Small and single-grammar batches did not meet the 1.5x adoption gate.
+        if ($this->format === 'opentrackers' && count($messages) >= 16
+            && array_all($messages, static fn (string $message): bool => strlen($message) <= 512 && strncasecmp(ltrim($message, " \t\v("), 'INFO', 4) !== 0)) {
+            $joined = implode("\0", $messages)."\0";
+            if (mb_check_encoding($joined, 'ASCII') && substr_count($joined, "\0") === count($messages)) {
+                $entries = $this->parseBatchNative($messages, $receivedAt);
+                if ($entries !== null) {
+                    return $entries;
+                }
+            }
+        }
+
+        return array_map(fn (string $message): ?PredbFeedEntry => $this->parsePhp($message, $receivedAt), $messages);
+    }
+
+    /**
+     * @param  list<string>  $messages
+     * @return list<PredbFeedEntry|null>|null Null means transport unavailable/unsupported.
+     */
+    private function parseBatchNative(array $messages, ?CarbonImmutable $receivedAt = null): ?array
+    {
+        if ($messages === []) {
+            return [];
+        }
+        $joined = implode("\0", $messages)."\0";
+        if (substr_count($joined, "\0") !== count($messages)) {
+            return null;
+        }
+        $wire = $this->nativeWire($joined, true);
+        if ($wire === null) {
+            return null;
+        }
+        // Remove only the final transport delimiter, retaining empty result slots.
+        $records = explode("\n", substr($wire, 0, -1));
+        if (count($records) !== count($messages)) {
+            return null;
+        }
+        $entries = [];
+        foreach ($records as $i => $record) {
+            $entries[] = $record === '?' ? $this->parsePhp($messages[$i], $receivedAt)
+                : ($record === '' ? null : $this->nativeEntry($record, $receivedAt));
+        }
+
+        return $entries;
+    }
+
+    private function parseNative(string $message, ?CarbonImmutable $receivedAt = null): PredbFeedEntry|false|null
+    {
+        $wire = $this->nativeWire($message, false);
+        if ($wire === null) {
+            return false;
+        }
+
+        return $wire === '' ? null : $this->nativeEntry($wire, $receivedAt);
+    }
+
+    private function nativeWire(string $message, bool $batch): ?string
+    {
+        if (self::$native === null) {
+            self::$native = RustPipelineLibrary::resolveDomain('irc_scene_announce', self::NATIVE_CDEF) ?? false;
+        }
+        $ffi = self::$native;
+        if ($ffi === false) {
+            return null;
+        }
+        // Six fields plus delimiters fit within twice the input plus a small header.
+        $needed = strlen($message) * 2 + 64;
+        if (self::$nativeBuffer === null || self::$nativeCapacity < $needed) {
+            self::$nativeCapacity = max(4096, $needed);
+            self::$nativeBuffer = $ffi->new('char['.self::$nativeCapacity.']');
+        }
+        if ($batch) {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_irc_pre_announce_parse_batch_nul($message, strlen($message), $this->nativeFormat, self::$nativeBuffer, self::$nativeCapacity);
+        } else {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_irc_pre_announce_parse($message, strlen($message), $this->nativeFormat, self::$nativeBuffer, self::$nativeCapacity);
+        }
+
+        return is_int($written) && $written >= 0 ? ($written === 0 ? '' : FFI::string(self::$nativeBuffer, $written)) : null;
+    }
+
+    private function nativeEntry(string $wire, ?CarbonImmutable $receivedAt): PredbFeedEntry
+    {
+        [$type, $title, $section, $reason, $files, $size] = explode("\0", $wire);
+        $info = $type === 'INFO';
+        $pre = $type === 'PRE' || $type === 'P2P';
+        $relay = $this->format === 'opentrackers';
+        $nuked = self::TYPES[$type];
+
+        return new PredbFeedEntry(
+            title: $title,
+            source: $relay ? 'opentrackers-relay' : $this->source,
+            category: $section !== '' ? $section : null,
+            size: $info ? PredbFeedEntry::sizeFromMegabytes((float) $size) : null,
+            files: $info ? PredbFeedEntry::filesFromCount((int) $files) : null,
+            predate: $pre && ! $relay ? ($receivedAt ?? CarbonImmutable::now('UTC')) : null,
+            nuked: $nuked,
+            nukeReason: $nuked === Predb::PRE_NONUKE || $reason === '' ? null : $reason,
+            listedAt: $pre && $relay ? ($receivedAt ?? CarbonImmutable::now('UTC')) : null,
+            enrichOnly: $info,
+        );
     }
 
     /**
