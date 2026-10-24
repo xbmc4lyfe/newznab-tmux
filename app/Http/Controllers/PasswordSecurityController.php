@@ -8,6 +8,8 @@ use App\Http\Requests\Disable2faPasswordSecurityRequest;
 use App\Models\PasswordSecurity;
 use App\Models\TrustedDevice;
 use App\Models\User;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Auth\Events\OtherDeviceLogout;
 use Illuminate\Contracts\View\Factory;
 use Illuminate\Contracts\View\View;
@@ -22,9 +24,38 @@ use PragmaRX\Google2FA\Exceptions\IncompatibleWithGoogleAuthenticatorException;
 use PragmaRX\Google2FA\Exceptions\InvalidCharactersException;
 use PragmaRX\Google2FA\Exceptions\SecretKeyTooShortException;
 use PragmaRX\Google2FALaravel\Facade as Google2FA;
+use Throwable;
 
 class PasswordSecurityController extends Controller
 {
+    public const string FFI_CDEF = <<<'CDEF'
+    int32_t nntmux_password_security_profile_referer(
+        uint8_t from_profile,
+        uint8_t has_referer,
+        const char *referer,
+        size_t referer_len
+    );
+    int32_t nntmux_password_security_trusted_cookie(
+        int64_t user_id,
+        const char *token,
+        size_t token_len,
+        int64_t expires_at,
+        char *out,
+        size_t cap
+    );
+    int32_t nntmux_password_security_can_cancel(uint8_t exists, uint8_t enabled);
+    CDEF;
+
+    private const int JSON_INVALID_UTF8 = -2147483647;
+
+    /**
+     * Production default stays false until benchmark/parity sign-off; see
+     * tests/Unit/RustProfileSecurityPrivacyInviteControllersParityTest.php.
+     */
+    private static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
+
     public function show2faForm(Request $request): Application|View|Factory|\Illuminate\Contracts\Foundation\Application|RedirectResponse
     {
         $user = $request->user();
@@ -72,7 +103,7 @@ class PasswordSecurityController extends Controller
         );
 
         // Check if request is from profile page
-        if ($request->has('from_profile') || $request->headers->get('referer') && str_contains($request->headers->get('referer'), 'profileedit')) {
+        if (self::isProfileReferer($request->has('from_profile'), $request->headers->get('referer'))) {
             return redirect()->to('profileedit#security')->with('success_2fa', 'Secret Key is generated, Please scan the QR code and verify to Enable 2FA');
         }
 
@@ -115,7 +146,8 @@ class PasswordSecurityController extends Controller
         }
 
         // Only allow canceling if 2FA is not yet enabled
-        if ($user->passwordSecurity()->exists() && ! $user->passwordSecurity->google2fa_enable) {
+        $exists = $user->passwordSecurity()->exists();
+        if (self::canCancelSetup($exists, $exists && (bool) $user->passwordSecurity->google2fa_enable)) {
             $user->passwordSecurity()->delete();
 
             return redirect()->to('profileedit#security')->with('success_2fa', '2FA setup has been cancelled.');
@@ -212,14 +244,8 @@ class PasswordSecurityController extends Controller
             $trustedDevice = TrustedDevice::issueForUser($user, $request->ip(), $request->userAgent());
             $expiresAt = $trustedDevice['device']->expires_at->getTimestamp();
 
-            $cookieData = [
-                'user_id' => $user->id,
-                'token' => $trustedDevice['plain'],
-                'expires_at' => $expiresAt,
-            ];
-
-            $cookieValue = json_encode($cookieData, JSON_UNESCAPED_SLASHES);
-            if ($cookieValue !== false) {
+            $cookieValue = self::trustedDeviceCookiePayload($user->id, $trustedDevice['plain'], $expiresAt);
+            if ($cookieValue !== null) {
                 $redirect->withCookie(cookie(
                     '2fa_trusted_device',
                     $cookieValue,
@@ -335,6 +361,162 @@ class PasswordSecurityController extends Controller
         ];
 
         return view('auth.2fa')->with('data', $data);
+    }
+
+    public static function setUseRustFfi(?bool $useRustFfi): void
+    {
+        self::$useRustFfi = $useRustFfi ?? false;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    public static function setFfiForTesting(FFI|false|null $ffi): void
+    {
+        self::$ffi = $ffi;
+    }
+
+    /**
+     * The 2FA secret request came from the profile page: `from_profile` is present or the referer contains `profileedit`.
+     */
+    public static function isProfileReferer(bool $fromProfile, ?string $referer): bool
+    {
+        return self::$useRustFfi
+            ? self::isProfileRefererNative($fromProfile, $referer)
+            : self::isProfileRefererPhp($fromProfile, $referer);
+    }
+
+    public static function isProfileRefererPhp(bool $fromProfile, ?string $referer): bool
+    {
+        return $fromProfile || ($referer !== null && str_contains($referer, 'profileedit'));
+    }
+
+    public static function isProfileRefererNative(bool $fromProfile, ?string $referer): bool
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return self::isProfileRefererPhp($fromProfile, $referer);
+        }
+
+        try {
+            $value = $referer ?? '';
+            $result = self::callFfi($ffi, 'nntmux_password_security_profile_referer', $fromProfile ? 1 : 0, $referer === null ? 0 : 1, $value, \strlen($value));
+
+            return match ($result) {
+                0 => false,
+                1 => true,
+                default => self::isProfileRefererPhp($fromProfile, $referer),
+            };
+        } catch (Throwable) {
+            return self::isProfileRefererPhp($fromProfile, $referer);
+        }
+    }
+
+    /**
+     * Trusted-device cookie JSON, or null when `json_encode()` fails (invalid UTF-8 token).
+     */
+    public static function trustedDeviceCookiePayload(int $userId, string $token, int $expiresAt): ?string
+    {
+        return self::$useRustFfi
+            ? self::trustedDeviceCookiePayloadNative($userId, $token, $expiresAt)
+            : self::trustedDeviceCookiePayloadPhp($userId, $token, $expiresAt);
+    }
+
+    public static function trustedDeviceCookiePayloadPhp(int $userId, string $token, int $expiresAt): ?string
+    {
+        $payload = json_encode([
+            'user_id' => $userId,
+            'token' => $token,
+            'expires_at' => $expiresAt,
+        ], JSON_UNESCAPED_SLASHES);
+
+        return $payload === false ? null : $payload;
+    }
+
+    public static function trustedDeviceCookiePayloadNative(int $userId, string $token, int $expiresAt): ?string
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return self::trustedDeviceCookiePayloadPhp($userId, $token, $expiresAt);
+        }
+
+        try {
+            $capacity = 0;
+            // Escaping expands a byte to at most six; the fixed keys and two integers fit in 96.
+            $out = RustPipelineLibrary::obtainScratch($ffi, 6 * \strlen($token) + 96, $capacity);
+            if ($out === null) {
+                return self::trustedDeviceCookiePayloadPhp($userId, $token, $expiresAt);
+            }
+            $written = self::callFfi($ffi, 'nntmux_password_security_trusted_cookie', $userId, $token, \strlen($token), $expiresAt, $out, $capacity);
+            if ($written === self::JSON_INVALID_UTF8) {
+                return null;
+            }
+            if (! \is_int($written) || $written <= 0 || $written > $capacity) {
+                return self::trustedDeviceCookiePayloadPhp($userId, $token, $expiresAt);
+            }
+
+            return FFI::string($out, $written);
+        } catch (Throwable) {
+            return self::trustedDeviceCookiePayloadPhp($userId, $token, $expiresAt);
+        }
+    }
+
+    /**
+     * A 2FA setup can be cancelled only while its record exists and is not yet enabled.
+     */
+    public static function canCancelSetup(bool $exists, bool $enabled): bool
+    {
+        return self::$useRustFfi
+            ? self::canCancelSetupNative($exists, $enabled)
+            : self::canCancelSetupPhp($exists, $enabled);
+    }
+
+    public static function canCancelSetupPhp(bool $exists, bool $enabled): bool
+    {
+        return $exists && ! $enabled;
+    }
+
+    public static function canCancelSetupNative(bool $exists, bool $enabled): bool
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return self::canCancelSetupPhp($exists, $enabled);
+        }
+
+        try {
+            $result = self::callFfi($ffi, 'nntmux_password_security_can_cancel', $exists ? 1 : 0, $enabled ? 1 : 0);
+
+            return match ($result) {
+                0 => false,
+                1 => true,
+                default => self::canCancelSetupPhp($exists, $enabled),
+            };
+        } catch (Throwable) {
+            return self::canCancelSetupPhp($exists, $enabled);
+        }
+    }
+
+    private static function callFfi(FFI $ffi, string $symbol, mixed ...$args): mixed
+    {
+        return $ffi->$symbol(...$args);
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (self::$ffi === false) {
+            return null;
+        }
+
+        if (self::$ffi instanceof FFI) {
+            return self::$ffi;
+        }
+
+        $ffi = RustPipelineLibrary::resolveDomain('search', self::FFI_CDEF);
+        self::$ffi = $ffi ?? false;
+
+        return $ffi;
     }
 
     private function redirectToLoginWithError(string $message): RedirectResponse
