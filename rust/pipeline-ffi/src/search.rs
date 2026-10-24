@@ -7449,3 +7449,753 @@ mod wave13_rss_reconcile_tests {
         assert_eq!(parse(b"0:9308").0, 0);
     }
 }
+
+// Wave 14 diagnostics/log-viewer candidates. The PHP adapters retain the checked-in
+// contracts (including keyed SQL rows, CRC32 composite keys and one-decimal sizes).
+// Buffer results: -1 invalid input, -2 panic, -(required + 3) insufficient space.
+unsafe fn w14_input<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+    if len > isize::MAX as usize
+        || (len != 0 && ptr.is_null())
+        || (ptr as usize).checked_add(len).is_none()
+    {
+        return None;
+    }
+    Some(if len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(ptr, len) }
+    })
+}
+
+fn w14_output(bytes: &[u8], out: *mut u8, cap: usize) -> isize {
+    if cap > isize::MAX as usize
+        || (out.is_null() && cap != 0)
+        || (out as usize).checked_add(cap).is_none()
+        || bytes.len() > isize::MAX as usize - 3
+    {
+        return -1;
+    }
+    if cap < bytes.len() {
+        return -(bytes.len() as isize + 3);
+    }
+    if !bytes.is_empty() {
+        // `ptr::copy` also permits callers to reuse the input allocation for output.
+        unsafe { std::ptr::copy(bytes.as_ptr(), out, bytes.len()) };
+    }
+    bytes.len() as isize
+}
+
+// A dependency-free, depth-limited JSON walker. Raw spans preserve SQL row values
+// and object insertion order; strings are decoded for diagnostic comparisons.
+#[derive(Debug)]
+struct W14Json<'a> {
+    raw: &'a [u8],
+    text: Option<String>,
+    entries: Option<Vec<(String, W14Json<'a>)>>,
+    object: bool,
+}
+
+impl<'a> W14Json<'a> {
+    fn parse(s: &'a [u8]) -> Option<Self> {
+        let mut p = 0;
+        let value = Self::value(s, &mut p, 0)?;
+        Self::ws(s, &mut p);
+        (p == s.len()).then_some(value)
+    }
+
+    fn ws(s: &[u8], p: &mut usize) {
+        while s
+            .get(*p)
+            .is_some_and(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+        {
+            *p += 1;
+        }
+    }
+
+    fn string(s: &[u8], p: &mut usize) -> Option<String> {
+        if s.get(*p) != Some(&b'"') {
+            return None;
+        }
+        *p += 1;
+        let mut bytes = Vec::new();
+        loop {
+            let b = *s.get(*p)?;
+            *p += 1;
+            match b {
+                b'"' => return String::from_utf8(bytes).ok(),
+                b'\\' => {
+                    let escape = *s.get(*p)?;
+                    *p += 1;
+                    match escape {
+                        b'"' | b'\\' | b'/' => bytes.push(escape),
+                        b'b' => bytes.push(8),
+                        b'f' => bytes.push(12),
+                        b'n' => bytes.push(b'\n'),
+                        b'r' => bytes.push(b'\r'),
+                        b't' => bytes.push(b'\t'),
+                        b'u' => {
+                            let hex = |p: &mut usize| -> Option<u32> {
+                                let mut n = 0;
+                                for &d in s.get(*p..p.checked_add(4)?)? {
+                                    n = n * 16 + (d as char).to_digit(16)?;
+                                }
+                                *p += 4;
+                                Some(n)
+                            };
+                            let mut code = hex(p)?;
+                            if (0xd800..=0xdbff).contains(&code) {
+                                if s.get(*p..p.checked_add(2)?)? != b"\\u" {
+                                    return None;
+                                }
+                                *p += 2;
+                                let low = hex(p)?;
+                                if !(0xdc00..=0xdfff).contains(&low) {
+                                    return None;
+                                }
+                                code = 0x10000 + ((code - 0xd800) << 10) + low - 0xdc00;
+                            }
+                            let mut buf = [0; 4];
+                            bytes.extend_from_slice(
+                                char::from_u32(code)?.encode_utf8(&mut buf).as_bytes(),
+                            );
+                        }
+                        _ => return None,
+                    }
+                }
+                0..=31 => return None,
+                _ => bytes.push(b),
+            }
+        }
+    }
+
+    fn value(s: &'a [u8], p: &mut usize, depth: usize) -> Option<Self> {
+        if depth > 64 {
+            return None;
+        }
+        Self::ws(s, p);
+        let start = *p;
+        let mut value = Self {
+            raw: &[],
+            text: None,
+            entries: None,
+            object: false,
+        };
+        match *s.get(*p)? {
+            b'"' => value.text = Some(Self::string(s, p)?),
+            open @ (b'[' | b'{') => {
+                value.object = open == b'{';
+                let close = if value.object { b'}' } else { b']' };
+                *p += 1;
+                Self::ws(s, p);
+                let mut entries = Vec::new();
+                if s.get(*p) != Some(&close) {
+                    loop {
+                        Self::ws(s, p);
+                        let key = if value.object {
+                            let key = Self::string(s, p)?;
+                            Self::ws(s, p);
+                            if s.get(*p) != Some(&b':') {
+                                return None;
+                            }
+                            *p += 1;
+                            key
+                        } else {
+                            entries.len().to_string()
+                        };
+                        entries.push((key, Self::value(s, p, depth + 1)?));
+                        Self::ws(s, p);
+                        if s.get(*p) != Some(&b',') {
+                            break;
+                        }
+                        *p += 1;
+                    }
+                }
+                if s.get(*p) != Some(&close) {
+                    return None;
+                }
+                *p += 1;
+                value.entries = Some(entries);
+            }
+            b'n' | b't' | b'f' => {
+                let literal: &[u8] = match s[*p] {
+                    b'n' => b"null",
+                    b't' => b"true",
+                    _ => b"false",
+                };
+                if s.get(*p..p.checked_add(literal.len())?)? != literal {
+                    return None;
+                }
+                *p += literal.len();
+            }
+            b'-' | b'0'..=b'9' => {
+                if s[*p] == b'-' {
+                    *p += 1;
+                }
+                match s.get(*p)? {
+                    b'0' => *p += 1,
+                    b'1'..=b'9' => {
+                        while s.get(*p).is_some_and(u8::is_ascii_digit) {
+                            *p += 1;
+                        }
+                    }
+                    _ => return None,
+                }
+                if s.get(*p) == Some(&b'.') {
+                    *p += 1;
+                    if !s.get(*p).is_some_and(u8::is_ascii_digit) {
+                        return None;
+                    }
+                    while s.get(*p).is_some_and(u8::is_ascii_digit) {
+                        *p += 1;
+                    }
+                }
+                if matches!(s.get(*p), Some(b'e' | b'E')) {
+                    *p += 1;
+                    if matches!(s.get(*p), Some(b'+' | b'-')) {
+                        *p += 1;
+                    }
+                    if !s.get(*p).is_some_and(u8::is_ascii_digit) {
+                        return None;
+                    }
+                    while s.get(*p).is_some_and(u8::is_ascii_digit) {
+                        *p += 1;
+                    }
+                }
+            }
+            _ => return None,
+        }
+        value.raw = &s[start..*p];
+        Some(value)
+    }
+
+    fn get(&self, key: &str) -> Option<&Self> {
+        self.entries
+            .as_ref()?
+            .iter()
+            .rev()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v)
+    }
+
+    fn integer(&self) -> Option<i64> {
+        std::str::from_utf8(self.raw).ok()?.parse().ok()
+    }
+}
+
+/// Compare normalized expected/index fields. JSON input is
+/// [hidden, expected-string-fields, index-string-fields, dbPost, ixPost, dbAdd, ixAdd]
+/// or null for a missing index row. Output is [status, mismatched-field-names].
+/// # Safety
+/// Input/output allocations must contain the declared readable/writable byte counts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_search_diag_classify_json(
+    input: *const u8,
+    len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        let Some(bytes) = (unsafe { w14_input(input, len) }) else {
+            return -1;
+        };
+        let Some(root) = W14Json::parse(bytes) else {
+            return -1;
+        };
+        if root.raw == b"null" {
+            return w14_output(b"[\"MISSING_IN_INDEX\",[]]", out, cap);
+        }
+        let Some(fields) = root.entries.as_ref() else {
+            return -1;
+        };
+        if root.object || fields.len() != 7 {
+            return -1;
+        }
+        let Some(hidden) = root.get("0") else {
+            return -1;
+        };
+        if hidden.raw != b"true" && hidden.raw != b"false" {
+            return -1;
+        }
+        let Some(expected) = root.get("1").and_then(|v| v.entries.as_ref()) else {
+            return -1;
+        };
+        let Some(index) = root.get("2").and_then(|v| v.entries.as_ref()) else {
+            return -1;
+        };
+        if expected.len() != 7 || index.len() != 7 {
+            return -1;
+        }
+        let names = [
+            "searchname",
+            "name",
+            "categories_id",
+            "passwordstatus",
+            "size",
+            "groups_id",
+            "nzbstatus",
+            "postdate_ts",
+            "adddate_ts",
+        ];
+        let mut mismatches = Vec::new();
+        for i in 0..7 {
+            let (Some(db), Some(ix)) = (&expected[i].1.text, &index[i].1.text) else {
+                return -1;
+            };
+            if db != ix {
+                mismatches.push(names[i]);
+            }
+        }
+        for (a, b, name) in [("3", "4", names[7]), ("5", "6", names[8])] {
+            let (Some(db), Some(ix)) = (
+                root.get(a).and_then(W14Json::integer),
+                root.get(b).and_then(W14Json::integer),
+            ) else {
+                return -1;
+            };
+            if (i128::from(db) - i128::from(ix)).abs() > 2 {
+                mismatches.push(name);
+            }
+        }
+        let status = if !mismatches.is_empty() {
+            "STALE_INDEX"
+        } else if hidden.raw == b"true" {
+            "STATUS_HIDDEN"
+        } else {
+            "OK"
+        };
+        let quoted = mismatches
+            .iter()
+            .map(|s| format!("\"{s}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        w14_output(format!("[\"{status}\",[{quoted}]]").as_bytes(), out, cap)
+    })
+    .unwrap_or(-2)
+}
+
+/// Reconstruct keyed raw Manticore SQL rows, preserving the existing data fallback.
+/// # Safety
+/// Input/output allocations must contain the declared readable/writable byte counts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_search_diag_extract_sql_rows_json(
+    input: *const u8,
+    len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        let Some(bytes) = (unsafe { w14_input(input, len) }) else {
+            return -1;
+        };
+        let Some(root) = W14Json::parse(bytes) else {
+            return -1;
+        };
+        let mut rows = Vec::new();
+        if let Some(entries) = &root.entries {
+            for (key, value) in entries {
+                // PHP integer keys include negatives, but numeric string keys only digits.
+                let integer_key = key.parse::<i64>().ok().filter(|n| n.to_string() == *key);
+                if integer_key.is_none()
+                    && (key.is_empty() || !key.bytes().all(|b| b.is_ascii_digit()))
+                {
+                    continue;
+                }
+                let id = integer_key.unwrap_or_else(|| key.parse::<i64>().unwrap_or(i64::MAX));
+                if value.entries.is_some() {
+                    if value.get("id").is_some_and(|id| id.raw != b"null") {
+                        rows.push(value.raw.to_vec());
+                    } else if value.object {
+                        // Replace a null id in-place as PHP's isset()/assignment does.
+                        let mut row = value.raw[..value.raw.len() - 1].to_vec();
+                        if value.entries.as_ref().is_some_and(|e| !e.is_empty()) {
+                            row.push(b',');
+                        }
+                        row.extend_from_slice(format!("\"id\":{id}}}").as_bytes());
+                        rows.push(row);
+                    } else {
+                        let mut row = Vec::from(&b"{"[..]);
+                        for (i, (_, v)) in value.entries.as_ref().unwrap().iter().enumerate() {
+                            if i != 0 {
+                                row.push(b',');
+                            }
+                            row.extend_from_slice(format!("\"{i}\":").as_bytes());
+                            row.extend_from_slice(v.raw);
+                        }
+                        if value.entries.as_ref().is_some_and(|e| !e.is_empty()) {
+                            row.push(b',');
+                        }
+                        row.extend_from_slice(format!("\"id\":{id}}}").as_bytes());
+                        rows.push(row);
+                    }
+                } else {
+                    rows.push(format!("{{\"id\":{id}}}").into_bytes());
+                }
+            }
+            if rows.is_empty() {
+                if let Some(data) = root.get("data").and_then(|v| v.entries.as_ref()) {
+                    rows.extend(data.iter().map(|(_, v)| v.raw.to_vec()));
+                }
+            }
+        }
+        let mut result = vec![b'['];
+        for (i, row) in rows.iter().enumerate() {
+            if i != 0 {
+                result.push(b',');
+            }
+            result.extend_from_slice(row);
+        }
+        result.push(b']');
+        w14_output(&result, out, cap)
+    })
+    .unwrap_or(-2)
+}
+
+/// Delay used by the existing repair command; the caller adds it to now().
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_search_repair_backoff(attempts: i64) -> f64 {
+    std::panic::catch_unwind(|| {
+        if attempts < -1074 {
+            0.0
+        } else {
+            2.0_f64.powi(attempts.min(10) as i32)
+        }
+    })
+    .unwrap_or(-1.0)
+}
+
+/// Resolve a physical table name. Configured aliases are handled by the PHP caller.
+/// # Safety
+/// Input/output allocations must contain the declared readable/writable byte counts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_manticore_registry_logical_name(
+    input: *const u8,
+    len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        let Some(table) = (unsafe { w14_input(input, len) }) else {
+            return -1;
+        };
+        let names: &[&[u8]] = &[
+            b"releases",
+            b"predb",
+            b"movies",
+            b"tvshows",
+            b"music",
+            b"books",
+            b"games",
+            b"console",
+            b"steam",
+            b"anime",
+        ];
+        let logical = table
+            .strip_suffix(b"_rt")
+            .filter(|s| names.contains(s))
+            .unwrap_or(b"");
+        w14_output(logical, out, cap)
+    })
+    .unwrap_or(-2)
+}
+
+/// CRC32 of PHP's composite `anidbid|type|lang|title` payload, as an unsigned ID.
+/// # Safety
+/// Input must contain `len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_secondary_index_anime_doc_id(input: *const u8, len: usize) -> i64 {
+    std::panic::catch_unwind(|| {
+        let Some(bytes) = (unsafe { w14_input(input, len) }) else {
+            return -1;
+        };
+        let mut crc = !0u32;
+        for &b in bytes {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xedb88320 & 0u32.wrapping_sub(crc & 1));
+            }
+        }
+        i64::from(!crc)
+    })
+    .unwrap_or(-1)
+}
+
+/// LogFile's one-decimal number_format(), including grouping and negative byte counts.
+/// # Safety
+/// Output allocation must contain `cap` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_log_viewer_format_bytes(
+    bytes: i64,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        let text = if bytes < 1024 {
+            format!("{bytes} B")
+        } else {
+            let units = ["KB", "MB", "GB", "TB"];
+            let mut value = bytes as f64 / 1024.0;
+            let mut unit = 0;
+            while value >= 1024.0 && unit < 3 {
+                value /= 1024.0;
+                unit += 1;
+            }
+            // PHP 8.4+ compares the original value with the decimal half edge.
+            // Adding an epsilon would incorrectly round values just below a tie.
+            let mut integral = (value * 10.0).floor();
+            if (integral + 1.0) / 10.0 == value {
+                integral += 1.0;
+            }
+            if value >= (integral + 0.5) / 10.0 {
+                integral += 1.0;
+            }
+            let rounded = integral / 10.0;
+            let plain = format!("{rounded:.1}");
+            let dot = plain.find('.').unwrap();
+            let mut grouped = String::new();
+            for (i, b) in plain.bytes().enumerate() {
+                if i != 0 && i < dot && (dot - i).is_multiple_of(3) {
+                    grouped.push(',');
+                }
+                grouped.push(b as char);
+            }
+            format!("{grouped} {}", units[unit])
+        };
+        w14_output(text.as_bytes(), out, cap)
+    })
+    .unwrap_or(-2)
+}
+
+/// `ltrim(str_replace('\\', '/', trim(path)), '/')`, byte-for-byte PHP trim semantics.
+/// # Safety
+/// Input/output allocations must contain the declared readable/writable byte counts.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_log_viewer_normalize_path(
+    input: *const u8,
+    len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        let Some(bytes) = (unsafe { w14_input(input, len) }) else {
+            return -1;
+        };
+        let original = bytes;
+        let trim = |b: &u8| matches!(*b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 11);
+        let start = original
+            .iter()
+            .position(|b| !trim(b))
+            .unwrap_or(original.len());
+        let end = original
+            .iter()
+            .rposition(|b| !trim(b))
+            .map_or(start, |p| p + 1);
+        let normalized: Vec<u8> = original[start..end]
+            .iter()
+            .map(|&b| if b == b'\\' { b'/' } else { b })
+            .collect();
+        let start = normalized
+            .iter()
+            .position(|&b| b != b'/')
+            .unwrap_or(normalized.len());
+        w14_output(&normalized[start..], out, cap)
+    })
+    .unwrap_or(-2)
+}
+
+/// Inspect an already-read (at most 8192-byte) sample using the existing Monolog parser.
+/// # Safety
+/// Input must contain `len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_log_viewer_looks_structured(input: *const u8, len: usize) -> i32 {
+    std::panic::catch_unwind(|| {
+        let Some(sample) = (unsafe { w14_input(input, len) }) else {
+            return -1;
+        };
+        let sample = &sample[..sample.len().min(8192)];
+        for line in sample.split(|&b| b == b'\n') {
+            let end = line.iter().rposition(|&b| b != b'\r').map_or(0, |p| p + 1);
+            let line = &line[..end];
+            let parsed =
+                unsafe { crate::media::nntmux_log_parse_header_spans(line.as_ptr(), line.len()) };
+            // -2 means recognition succeeded, but the spans exceed the packed ABI.
+            // Sniffing also recognizes headers with long fractional timestamps.
+            if parsed >= 0 || parsed == -2 {
+                return 1;
+            }
+        }
+        0
+    })
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod wave14_search_diag_logviewer_tests {
+    use super::*;
+
+    fn text(f: impl FnOnce(*mut u8, usize) -> isize) -> String {
+        let mut out = [0; 4096];
+        let n = f(out.as_mut_ptr(), out.len());
+        assert!(n >= 0, "unexpected ABI result {n}");
+        String::from_utf8(out[..n as usize].to_vec()).unwrap()
+    }
+
+    #[test]
+    fn errors_lengths_resize_and_empty_buffers() {
+        unsafe {
+            assert_eq!(
+                nntmux_log_viewer_normalize_path(std::ptr::null(), 1, std::ptr::null_mut(), 0),
+                -1
+            );
+            assert_eq!(
+                nntmux_log_viewer_normalize_path(
+                    b"a".as_ptr(),
+                    usize::MAX,
+                    std::ptr::null_mut(),
+                    0
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_log_viewer_normalize_path(std::ptr::null(), 0, std::ptr::null_mut(), 0),
+                0
+            );
+            assert_eq!(
+                nntmux_log_viewer_normalize_path(b"a".as_ptr(), 1, std::ptr::null_mut(), 1),
+                -1
+            );
+            assert_eq!(
+                nntmux_log_viewer_normalize_path(b"abc".as_ptr(), 3, std::ptr::null_mut(), 0),
+                -6
+            );
+            assert_eq!(
+                nntmux_log_viewer_format_bytes(0, std::ptr::null_mut(), usize::MAX),
+                -1
+            );
+            assert_eq!(nntmux_secondary_index_anime_doc_id(std::ptr::null(), 5), -1);
+            assert_eq!(nntmux_log_viewer_looks_structured(std::ptr::null(), 3), -1);
+            assert_eq!(
+                nntmux_search_diag_classify_json(b"?".as_ptr(), 1, std::ptr::null_mut(), 0),
+                -1
+            );
+            assert_eq!(
+                nntmux_search_diag_extract_sql_rows_json(b"[".as_ptr(), 1, std::ptr::null_mut(), 0),
+                -1
+            );
+        }
+        for input in [
+            "[1,]",
+            "{\"x\":01}",
+            "\"\\ud800\"",
+            "\"\\udc00\"",
+            "[true]x",
+            "1e",
+            "1.",
+            "\"\n\"",
+        ] {
+            assert!(W14Json::parse(input.as_bytes()).is_none(), "{input}");
+        }
+        let deep = format!("{}0{}", "[".repeat(66), "]".repeat(66));
+        assert!(W14Json::parse(deep.as_bytes()).is_none());
+        assert_eq!(
+            W14Json::parse(b"\"\\ud83d\\ude00\"")
+                .unwrap()
+                .text
+                .as_deref(),
+            Some("😀")
+        );
+    }
+
+    #[test]
+    fn keyed_sql_and_classify() {
+        let input = br#"{"42":{"name":"Hello"},"3":3,"data":[{"id":9}]}"#;
+        assert_eq!(
+            text(|out, cap| unsafe {
+                nntmux_search_diag_extract_sql_rows_json(input.as_ptr(), input.len(), out, cap)
+            }),
+            r#"[{"name":"Hello","id":42},{"id":3}]"#
+        );
+        let input = br#"{"data":{"x":{"id":9}}}"#;
+        assert_eq!(
+            text(|out, cap| unsafe {
+                nntmux_search_diag_extract_sql_rows_json(input.as_ptr(), input.len(), out, cap)
+            }),
+            r#"[{"id":9}]"#
+        );
+        let input =
+            br#"[false,["a","b","1","0","42","7","1"],["a","b","1","0","42","7","1"],1,3,2,2]"#;
+        assert_eq!(
+            text(|out, cap| unsafe {
+                nntmux_search_diag_classify_json(input.as_ptr(), input.len(), out, cap)
+            }),
+            r#"["OK",[]]"#
+        );
+        let input =
+            br#"[true,["a","b","1","0","42","7","1"],["z","b","1","0","42","7","1"],1,4,2,2]"#;
+        assert_eq!(
+            text(|out, cap| unsafe {
+                nntmux_search_diag_classify_json(input.as_ptr(), input.len(), out, cap)
+            }),
+            r#"["STALE_INDEX",["searchname","postdate_ts"]]"#
+        );
+    }
+
+    #[test]
+    fn existing_php_scalar_contracts() {
+        assert_eq!(nntmux_search_repair_backoff(-1), 0.5);
+        assert_eq!(nntmux_search_repair_backoff(0), 1.0);
+        assert_eq!(nntmux_search_repair_backoff(i64::MAX), 1024.0);
+        assert_eq!(
+            unsafe { nntmux_secondary_index_anime_doc_id(b"123456789".as_ptr(), 9) },
+            0xcbf43926
+        );
+        assert_eq!(
+            text(|out, cap| unsafe { nntmux_log_viewer_format_bytes(-1, out, cap) }),
+            "-1 B"
+        );
+        assert_eq!(
+            text(|out, cap| unsafe { nntmux_log_viewer_format_bytes(1536, out, cap) }),
+            "1.5 KB"
+        );
+        assert_eq!(
+            text(|out, cap| unsafe { nntmux_log_viewer_format_bytes(i64::MAX, out, cap) }),
+            "8,388,608.0 TB"
+        );
+        assert_eq!(
+            text(|out, cap| unsafe { nntmux_log_viewer_format_bytes(1125844931261235, out, cap) }),
+            "1,023.9 TB"
+        );
+        let input = b" \t/\\foo\\bar.log\0\x0b";
+        assert_eq!(
+            text(|out, cap| unsafe {
+                nntmux_log_viewer_normalize_path(input.as_ptr(), input.len(), out, cap)
+            }),
+            "foo/bar.log"
+        );
+        let input = b"\x0c/foo\x0c";
+        assert_eq!(
+            text(|out, cap| unsafe {
+                nntmux_log_viewer_normalize_path(input.as_ptr(), input.len(), out, cap)
+            }),
+            "\x0c/foo\x0c"
+        );
+        let input = b"console\n[2026-10-24 12:00:00] local.INFO: yes\r\r\n";
+        assert_eq!(
+            unsafe { nntmux_log_viewer_looks_structured(input.as_ptr(), input.len()) },
+            1
+        );
+        let fractional = format!(
+            "[2026-10-24 10:00:00.{}] local.INFO: hello",
+            "1".repeat(300)
+        );
+        assert_eq!(
+            unsafe { nntmux_log_viewer_looks_structured(fractional.as_ptr(), fractional.len()) },
+            1
+        );
+        let mut sample = vec![b'x'; 8192];
+        sample.extend_from_slice(input);
+        assert_eq!(
+            unsafe { nntmux_log_viewer_looks_structured(sample.as_ptr(), sample.len()) },
+            0
+        );
+    }
+}

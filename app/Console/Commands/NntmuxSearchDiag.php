@@ -8,6 +8,8 @@ use App\Models\Release;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Services\Search\Drivers\ManticoreSearchDriver;
 use App\Support\ReleaseSearchIndexDocument;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Console\Command;
 use Throwable;
 
@@ -114,6 +116,38 @@ class NntmuxSearchDiag extends Command
             return [];
         }
 
+        return $this->extractSqlRows($response);
+    }
+
+    /** @return array<int, array<string, mixed>> */
+    public function extractSqlRows(mixed $response, bool $useRustFfi = false): array
+    {
+        return ($useRustFfi ? $this->manticoreSqlRowsNative($response) : null) ?? $this->manticoreSqlRowsPhp($response);
+    }
+
+    /** @return array<int, array<string, mixed>>|null */
+    public function manticoreSqlRowsNative(mixed $response): ?array
+    {
+        // Non-array responses cannot contain SQL rows. Objects inside arrays must
+        // retain PHP identity rather than being converted by a JSON round trip.
+        if (! is_array($response)) {
+            return [];
+        }
+        if (self::hasObjects($response)) {
+            return null;
+        }
+        $payload = json_encode($response, JSON_PRESERVE_ZERO_FRACTION);
+        if ($payload === false) {
+            return null;
+        }
+
+        /** @var array<int, array<string, mixed>>|null */
+        return self::nativeJson('nntmux_search_diag_extract_sql_rows_json', $payload);
+    }
+
+    /** @return array<int, array<string, mixed>> */
+    public function manticoreSqlRowsPhp(mixed $response): array
+    {
         if (! \is_array($response)) {
             return [];
         }
@@ -196,45 +230,135 @@ class NntmuxSearchDiag extends Command
         if ($indexRow === null) {
             return 'MISSING_IN_INDEX';
         }
-
-        $maxVisiblePasswordStatus = $showPasswords ? 1 : 0;
-        $hidden = (int) $release->passwordstatus > $maxVisiblePasswordStatus;
-
         $expected = ReleaseSearchIndexDocument::normalize($release->toArray());
         unset($expected['id']);
-
-        $drift = false;
-        foreach (['searchname', 'name', 'categories_id', 'passwordstatus', 'size', 'groups_id', 'nzbstatus'] as $field) {
-            $dbVal = $expected[$field] ?? null;
-            $ixVal = $indexRow[$field] ?? null;
-            if ((string) $dbVal !== (string) $ixVal) {
-                $drift = true;
-                if ($verbose) {
-                    $this->line("  drift: {$field} db=".json_encode($dbVal).' ix='.json_encode($ixVal));
+        // The measured candidate is selected inside classifyFields; normalization and
+        // verbose output remain shared by both paths.
+        [$status, $mismatches] = $this->classifyFields($expected, $indexRow, $showPasswords);
+        if ($verbose) {
+            foreach ($mismatches as $field) {
+                if ($field !== 'postdate_ts' && $field !== 'adddate_ts') {
+                    $this->line("  drift: {$field} db=".json_encode($expected[$field] ?? null).' ix='.json_encode($indexRow[$field] ?? null));
                 }
             }
         }
 
-        $dbPostTs = (int) ($expected['postdate_ts'] ?? 0);
-        $ixPostTs = isset($indexRow['postdate_ts']) ? (int) $indexRow['postdate_ts'] : 0;
-        if (abs($dbPostTs - $ixPostTs) > 2) {
-            $drift = true;
+        return $status;
+    }
+
+    /**
+     * @param  array<string, mixed>  $expected
+     * @param  array<string, mixed>|null  $indexRow
+     * @return array{string, list<string>}
+     */
+    public function classifyFields(array $expected, ?array $indexRow, bool $showPasswords, bool $useRustFfi = false): array
+    {
+        return ($useRustFfi ? $this->classifyNative($expected, $indexRow, $showPasswords) : null)
+            ?? $this->classifyPhp($expected, $indexRow, $showPasswords);
+    }
+
+    /**
+     * @param  array<string, mixed>  $expected
+     * @param  array<string, mixed>|null  $indexRow
+     * @return array{string, list<string>}
+     */
+    public function classifyPhp(array $expected, ?array $indexRow, bool $showPasswords): array
+    {
+        if ($indexRow === null) {
+            return ['MISSING_IN_INDEX', []];
+        }
+        $mismatches = [];
+        foreach (['searchname', 'name', 'categories_id', 'passwordstatus', 'size', 'groups_id', 'nzbstatus'] as $field) {
+            if ((string) ($expected[$field] ?? null) !== (string) ($indexRow[$field] ?? null)) {
+                $mismatches[] = $field;
+            }
+        }
+        foreach (['postdate_ts', 'adddate_ts'] as $field) {
+            if (abs((int) ($expected[$field] ?? 0) - (int) ($indexRow[$field] ?? 0)) > 2) {
+                $mismatches[] = $field;
+            }
+        }
+        $hidden = (int) ($expected['passwordstatus'] ?? 0) > ($showPasswords ? 1 : 0);
+
+        return [$mismatches !== [] ? 'STALE_INDEX' : ($hidden ? 'STATUS_HIDDEN' : 'OK'), $mismatches];
+    }
+
+    /**
+     * @param  array<string, mixed>  $expected
+     * @param  array<string, mixed>|null  $indexRow
+     * @return array{string, list<string>}|null
+     */
+    public function classifyNative(array $expected, ?array $indexRow, bool $showPasswords): ?array
+    {
+        $payload = null;
+        if ($indexRow !== null) {
+            $db = $ix = [];
+            foreach (['searchname', 'name', 'categories_id', 'passwordstatus', 'size', 'groups_id', 'nzbstatus'] as $field) {
+                $db[] = (string) ($expected[$field] ?? null);
+                $ix[] = (string) ($indexRow[$field] ?? null);
+            }
+            $payload = [(int) ($expected['passwordstatus'] ?? 0) > ($showPasswords ? 1 : 0), $db, $ix,
+                (int) ($expected['postdate_ts'] ?? 0), (int) ($indexRow['postdate_ts'] ?? 0),
+                (int) ($expected['adddate_ts'] ?? 0), (int) ($indexRow['adddate_ts'] ?? 0)];
+        }
+        $json = json_encode($payload);
+        if ($json === false) {
+            return null;
         }
 
-        $dbAddTs = (int) ($expected['adddate_ts'] ?? 0);
-        $ixAddTs = isset($indexRow['adddate_ts']) ? (int) $indexRow['adddate_ts'] : 0;
-        if (abs($dbAddTs - $ixAddTs) > 2) {
-            $drift = true;
+        /** @var array{string, list<string>}|null */
+        return self::nativeJson('nntmux_search_diag_classify_json', $json);
+    }
+
+    /** @param array<mixed> $values */
+    private static function hasObjects(array $values, int $depth = 0): bool
+    {
+        if ($depth > 64) {
+            return true;
+        }
+        foreach ($values as $value) {
+            if (is_object($value) || is_resource($value) || (is_array($value) && self::hasObjects($value, $depth + 1))) {
+                return true;
+            }
         }
 
-        if ($drift) {
-            return 'STALE_INDEX';
-        }
+        return false;
+    }
 
-        if ($hidden) {
-            return 'STATUS_HIDDEN';
+    /** @return array<mixed>|null */
+    private static function nativeJson(string $symbol, string $payload): ?array
+    {
+        static $ffi;
+        $ffi ??= RustPipelineLibrary::resolveDomain('search', <<<'C'
+            ssize_t nntmux_search_diag_classify_json(const char *input, size_t len, char *out, size_t cap);
+            ssize_t nntmux_search_diag_extract_sql_rows_json(const char *input, size_t len, char *out, size_t cap);
+            C) ?? false;
+        if ($ffi === false) {
+            return null;
         }
+        try {
+            $length = strlen($payload);
+            $cap = 0;
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, max(256, $length + 128), $cap);
+            if ($scratch === null) {
+                return null;
+            }
+            $written = $ffi->$symbol($payload, $length, $scratch, $cap);
+            if (is_int($written) && $written < -3) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written - 3, $cap);
+                if ($scratch === null) {
+                    return null;
+                }
+                $written = $ffi->$symbol($payload, $length, $scratch, $cap);
+            }
+            if (! is_int($written) || $written < 0 || $written > $cap) {
+                return null;
+            }
+            $result = json_decode(FFI::string($scratch, $written), true, 512, JSON_THROW_ON_ERROR);
 
-        return 'OK';
+            return is_array($result) ? $result : null;
+        } catch (Throwable) {
+            return null;
+        }
     }
 }

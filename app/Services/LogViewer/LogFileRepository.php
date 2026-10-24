@@ -4,9 +4,12 @@ declare(strict_types=1);
 
 namespace App\Services\LogViewer;
 
+use App\Support\RustPipelineLibrary;
 use Carbon\CarbonImmutable;
+use FFI;
 use Illuminate\Support\Facades\File;
 use RuntimeException;
+use Throwable;
 
 /**
  * Lists readable files under the log directory. The listing doubles as the access whitelist:
@@ -122,17 +125,37 @@ class LogFileRepository
         return $this->files = $files;
     }
 
-    private function looksStructured(string $absolutePath): bool
+    private function looksStructured(string $absolutePath, bool $useRustFfi = false): bool
     {
-        $handle = @fopen($absolutePath, 'rb');
+        return ($useRustFfi ? $this->looksStructuredNative($absolutePath) : null) ?? $this->looksStructuredPhp($absolutePath);
+    }
 
-        if ($handle === false) {
+    public function looksStructuredNative(string $absolutePath): ?bool
+    {
+        static $ffi;
+        $ffi ??= RustPipelineLibrary::resolveDomain('search', 'int32_t nntmux_log_viewer_looks_structured(const char *input, size_t len);') ?? false;
+        if ($ffi === false) {
+            return null;
+        }
+        $sample = $this->readSample($absolutePath);
+        if ($sample === null) {
             return false;
         }
+        try {
+            $result = $ffi->nntmux_log_viewer_looks_structured($sample, strlen($sample));
 
-        $sample = (string) fread($handle, self::STRUCTURE_SNIFF_BYTES);
-        fclose($handle);
+            return $result === 0 || $result === 1 ? (bool) $result : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
 
+    public function looksStructuredPhp(string $absolutePath): bool
+    {
+        $sample = $this->readSample($absolutePath);
+        if ($sample === null) {
+            return false;
+        }
         foreach (explode("\n", $sample) as $line) {
             if ($this->parser->isHeader(rtrim($line, "\r"))) {
                 return true;
@@ -142,7 +165,49 @@ class LogFileRepository
         return false;
     }
 
-    private function normalize(string $relativePath): string
+    private function readSample(string $absolutePath): ?string
+    {
+        $handle = @fopen($absolutePath, 'rb');
+
+        if ($handle === false) {
+            return null;
+        }
+
+        try {
+            return (string) fread($handle, self::STRUCTURE_SNIFF_BYTES);
+        } finally {
+            fclose($handle);
+        }
+    }
+
+    private function normalize(string $relativePath, bool $useRustFfi = false): string
+    {
+        return ($useRustFfi ? $this->normalizeNative($relativePath) : null) ?? $this->normalizePhp($relativePath);
+    }
+
+    public function normalizeNative(string $relativePath): ?string
+    {
+        static $ffi;
+        $ffi ??= RustPipelineLibrary::resolveDomain('search', 'ssize_t nntmux_log_viewer_normalize_path(const char *input, size_t len, char *out, size_t cap);') ?? false;
+        if ($ffi === false) {
+            return null;
+        }
+        try {
+            $length = strlen($relativePath);
+            $cap = 0;
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, max(1, $length), $cap);
+            if ($scratch === null) {
+                return null;
+            }
+            $written = $ffi->nntmux_log_viewer_normalize_path($relativePath, $length, $scratch, $cap);
+
+            return is_int($written) && $written >= 0 && $written <= $cap ? FFI::string($scratch, $written) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    public function normalizePhp(string $relativePath): string
     {
         return ltrim(str_replace('\\', '/', trim($relativePath)), '/');
     }

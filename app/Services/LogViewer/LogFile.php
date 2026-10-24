@@ -4,7 +4,10 @@ declare(strict_types=1);
 
 namespace App\Services\LogViewer;
 
+use App\Support\RustPipelineLibrary;
 use Carbon\CarbonImmutable;
+use FFI;
+use Throwable;
 
 final readonly class LogFile
 {
@@ -52,7 +55,33 @@ final readonly class LogFile
         ];
     }
 
-    public static function formatBytes(int $bytes): string
+    public static function formatBytes(int $bytes, bool $useRustFfi = false): string
+    {
+        return ($useRustFfi ? self::formatBytesNative($bytes) : null) ?? self::formatBytesPhp($bytes);
+    }
+
+    public static function formatBytesNative(int $bytes): ?string
+    {
+        static $ffi;
+        $ffi ??= RustPipelineLibrary::resolveDomain('search', 'ssize_t nntmux_log_viewer_format_bytes(int64_t bytes, char *out, size_t cap);') ?? false;
+        if ($ffi === false) {
+            return null;
+        }
+        try {
+            $cap = 0;
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, 64, $cap);
+            if ($scratch === null) {
+                return null;
+            }
+            $written = $ffi->nntmux_log_viewer_format_bytes($bytes, $scratch, $cap);
+
+            return is_int($written) && $written >= 0 && $written <= $cap ? FFI::string($scratch, $written) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    public static function formatBytesPhp(int $bytes): string
     {
         if ($bytes < 1024) {
             return $bytes.' B';
