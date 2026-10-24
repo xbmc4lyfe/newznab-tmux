@@ -39,7 +39,13 @@ final class ApibaySource extends HttpFeedSource
             return [];
         }
 
-        $rows = $this->http()->get($this->endpoint)->throw()->json();
+        $response = $this->http()->get($this->endpoint)->throw();
+        $native = PredatabaseSource::nativeJsonEntries($response->body(), 9, 'apibay', listed: true, limit: $this->pageSize);
+        if ($native !== null) {
+            return $native[1];
+        }
+
+        $rows = $response->json();
         if (! is_array($rows) || ! array_is_list($rows)) {
             throw new RuntimeException('apibay returned an unexpected response (not a JSON list).');
         }

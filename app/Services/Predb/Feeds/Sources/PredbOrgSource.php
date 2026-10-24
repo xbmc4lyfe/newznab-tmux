@@ -36,6 +36,11 @@ final class PredbOrgSource extends HttpFeedSource
             'page' => max(1, $page),
         ])->throw();
 
+        $native = PredatabaseSource::nativeJsonEntries($response->body(), 8, 'predb.org');
+        if ($native !== null) {
+            return $native[1];
+        }
+
         $rows = $response->json('values');
         if (! is_array($rows) || ! array_is_list($rows)) {
             throw new RuntimeException('predb.org returned an unexpected response (no values).');
