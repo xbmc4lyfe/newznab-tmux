@@ -13,7 +13,10 @@ use App\Services\AdditionalProcessing\State\MediaByteBudget;
 use App\Services\AdditionalProcessing\State\ReleaseProcessingContext;
 use App\Services\AdditionalProcessing\UsenetDownloadService;
 use App\Services\Par2FileList;
+use App\Support\RustPipelineLibrary;
 use dariusiii\rarinfo\Par2Info;
+use FFI;
+use Throwable;
 
 /**
  * Reads the release's PAR2 index to learn the real names behind obfuscated NZB files.
@@ -22,10 +25,15 @@ class MediaSourceResolver
 {
     private const string PAR2_SIGNATURE = "PAR2\0PKT";
 
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_media_source_rank_wanted_files_nul(const char *names, size_t names_len, const char *sizes, size_t sizes_len, const char *video_regex, size_t video_regex_len, size_t count, char *out_buf, size_t out_cap);
+        C;
+
     public function __construct(
         private readonly ProcessingConfiguration $config,
         private readonly UsenetDownloadService $downloadService,
         private readonly Par2FileMapper $mapper = new Par2FileMapper,
+        private readonly ?string $libraryPath = null,
     ) {}
 
     public function resolve(ReleaseProcessingContext $context): ?MediaSourcePlan
@@ -186,7 +194,122 @@ class MediaSourceResolver
      * @param  list<Par2FileEntry>  $files
      * @return list<Par2FileEntry>
      */
-    private function wantedFiles(array $files): array
+    public function wantedFiles(array $files): array
+    {
+        return $this->wantedFilesNative($files);
+    }
+
+    /**
+     * Rank and filter wanted PAR2 entries via the Rust FFI accelerator, falling back to PHP.
+     *
+     * @param  list<Par2FileEntry>  $files
+     * @return list<Par2FileEntry>
+     */
+    public function wantedFilesNative(array $files, bool &$supported = false): array
+    {
+        $supported = false;
+        $count = count($files);
+        $ffi = RustPipelineLibrary::resolveDomain('media_source_resolver', self::FFI_CDEF, $this->libraryPath);
+        if ($ffi === null) {
+            return $this->wantedFilesPhp($files);
+        }
+        if ($count === 0) {
+            $supported = true;
+
+            return [];
+        }
+
+        $values = array_values($files);
+        $names = [];
+        $sizes = [];
+        foreach ($values as $file) {
+            $names[] = $file->name;
+            $sizes[] = $file->size;
+        }
+
+        $joinedNames = implode("\0", $names);
+        if (substr_count($joinedNames, "\0") !== $count - 1) {
+            return $this->wantedFilesPhp($files);
+        }
+
+        $packedSizes = pack('q*', ...$sizes);
+        $videoRegex = $this->config->videoFileRegex;
+        $needed = $count * 4 + 16;
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, $needed, $cap);
+        if ($scratch === null) {
+            return $this->wantedFilesPhp($files);
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_media_source_rank_wanted_files_nul(
+                $joinedNames,
+                strlen($joinedNames),
+                $packedSizes,
+                strlen($packedSizes),
+                $videoRegex,
+                strlen($videoRegex),
+                $count,
+                $scratch,
+                $cap,
+            );
+            if (is_int($written) && $written < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return $this->wantedFilesPhp($files);
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_media_source_rank_wanted_files_nul(
+                    $joinedNames,
+                    strlen($joinedNames),
+                    $packedSizes,
+                    strlen($packedSizes),
+                    $videoRegex,
+                    strlen($videoRegex),
+                    $count,
+                    $scratch,
+                    $cap,
+                );
+            }
+        } catch (Throwable) {
+            return $this->wantedFilesPhp($files);
+        }
+
+        if (! is_int($written) || $written < 0) {
+            return $this->wantedFilesPhp($files);
+        }
+        if ($written === 0) {
+            $supported = true;
+
+            return [];
+        }
+        if (($written & 3) !== 0) {
+            return $this->wantedFilesPhp($files);
+        }
+
+        /** @var array<int, int>|false $order */
+        $order = unpack('V*', FFI::string($scratch, $written));
+        if ($order === false) {
+            return $this->wantedFilesPhp($files);
+        }
+
+        $supported = true;
+        $wanted = [];
+        foreach ($order as $idx) {
+            $wanted[] = $values[$idx];
+        }
+
+        return $wanted;
+    }
+
+    /**
+     * Pure PHP reference implementation of `wantedFiles()`.
+     *
+     * @param  list<Par2FileEntry>  $files
+     * @return list<Par2FileEntry>
+     */
+    public function wantedFilesPhp(array $files): array
     {
         $ranked = [];
         foreach ($files as $file) {
