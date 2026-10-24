@@ -12511,3 +12511,961 @@ mod book_itunes_steam_normalizer {
         }
     }
 }
+
+// ============================================================================
+// Wave 12: AniList, IGDB QueryBuilder, ParsedTvRelease & MetadataSearchLookup
+// ============================================================================
+
+mod anilist_igdb_tv_metadata {
+    use super::{OutCursor, PhpNode, PhpSerParser, PhpVal};
+    use std::borrow::Cow;
+    use std::fmt::Write as _;
+    use std::slice;
+
+    const DECLINE: isize = -1;
+    const MAX_INPUT: usize = 4 << 20;
+
+    #[inline]
+    unsafe fn input<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null() || len > MAX_INPUT {
+            return None;
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    unsafe fn emit_slice(out: *mut u8, cap: usize, data: &[u8]) -> isize {
+        let mut cursor = unsafe { OutCursor::new(out, cap) };
+        cursor.extend(data);
+        cursor.finish()
+    }
+
+    #[inline]
+    fn field(out: &mut Vec<u8>, value: &[u8]) -> Option<()> {
+        if value.contains(&0) {
+            return None;
+        }
+        out.extend_from_slice(value);
+        out.push(0);
+        Some(())
+    }
+
+    #[inline]
+    fn strval<'a>(node: Option<&PhpNode<'a>>) -> Option<Cow<'a, [u8]>> {
+        match node.map(|n| &n.val) {
+            None | Some(PhpVal::Null) | Some(PhpVal::Bool(false)) => Some(Cow::Borrowed(b"")),
+            Some(PhpVal::Bool(true)) => Some(Cow::Borrowed(b"1")),
+            Some(PhpVal::Int(i)) => Some(Cow::Owned(i.to_string().into_bytes())),
+            Some(PhpVal::Str(s)) => Some(Cow::Borrowed(s)),
+            Some(PhpVal::Float) | Some(PhpVal::Arr(_)) => None,
+        }
+    }
+
+    #[inline]
+    fn empty(node: Option<&PhpNode<'_>>) -> Option<bool> {
+        match node.map(|n| &n.val) {
+            None | Some(PhpVal::Null) => Some(true),
+            Some(PhpVal::Bool(b)) => Some(!b),
+            Some(PhpVal::Int(i)) => Some(*i == 0),
+            Some(PhpVal::Str(s)) => Some(s.is_empty() || *s == b"0"),
+            Some(PhpVal::Arr(items)) => Some(items.is_empty()),
+            Some(PhpVal::Float) => None,
+        }
+    }
+
+    #[inline]
+    fn is_pcre_c_space(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C)
+    }
+
+    #[inline]
+    fn is_php_trim_byte(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B)
+    }
+
+    #[inline]
+    fn php_trim_bytes(s: &[u8]) -> &[u8] {
+        let mut start = 0;
+        let mut end = s.len();
+        while start < end && is_php_trim_byte(s[start]) {
+            start += 1;
+        }
+        while end > start && is_php_trim_byte(s[end - 1]) {
+            end -= 1;
+        }
+        &s[start..end]
+    }
+
+    // ---- 1. PopulateAniListService payload normalizer -----------------------
+
+    fn strip_tags_anilist(s: &[u8]) -> Option<Vec<u8>> {
+        let mut out = Vec::with_capacity(s.len());
+        let mut i = 0;
+        while i < s.len() {
+            match s[i] {
+                0 | b'>' => return None,
+                b'<' => {
+                    let first = *s.get(i + 1)?;
+                    if !(first.is_ascii_alphabetic() || first == b'/') {
+                        return None;
+                    }
+                    let mut j = i + 2;
+                    let mut quote = 0u8;
+                    while j < s.len() {
+                        let c = s[j];
+                        if c == 0 || c == b'<' || c == b'!' || c == b'?' {
+                            return None;
+                        }
+                        if quote != 0 {
+                            if c == b'>' {
+                                return None;
+                            }
+                            if c == quote {
+                                quote = 0;
+                            }
+                        } else if c == b'"' || c == b'\'' {
+                            quote = c;
+                        } else if c == b'>' {
+                            break;
+                        }
+                        j += 1;
+                    }
+                    if j >= s.len() || quote != 0 {
+                        return None;
+                    }
+                    i = j + 1;
+                }
+                b => {
+                    out.push(b);
+                    i += 1;
+                }
+            }
+        }
+        Some(out)
+    }
+
+    fn decode_html_entities_into(s: &[u8], out: &mut Vec<u8>) -> Option<()> {
+        if !s.contains(&b'&') {
+            out.extend_from_slice(s);
+            return Some(());
+        }
+        let mut i = 0;
+        while i < s.len() {
+            if s[i] != b'&' {
+                out.push(s[i]);
+                i += 1;
+                continue;
+            }
+            if s.get(i + 1) == Some(&b' ') {
+                out.push(b'&');
+                i += 1;
+                continue;
+            }
+            let max_end = (i + 12).min(s.len());
+            let rel_semi = s[i + 1..max_end].iter().position(|&b| b == b';')?;
+            let semi = i + 1 + rel_semi;
+            let ent = &s[i + 1..semi];
+            let replacement: &[u8] = match ent {
+                b"amp" => b"&",
+                b"lt" => b"<",
+                b"gt" => b">",
+                b"quot" | b"#34" | b"#034" | b"#x22" | b"#x0022" | b"#X22" => b"\"",
+                b"apos" | b"#39" | b"#039" | b"#x27" | b"#x0027" | b"#X27" => b"'",
+                b"nbsp" | b"#160" | b"#xa0" | b"#xA0" => "\u{00A0}".as_bytes(),
+                b"ndash" | b"#8211" | b"#x2013" => "\u{2013}".as_bytes(),
+                b"mdash" | b"#8212" | b"#x2014" => "\u{2014}".as_bytes(),
+                b"hellip" | b"#8230" | b"#x2026" => "\u{2026}".as_bytes(),
+                b"rsquo" | b"#8217" | b"#x2019" => "\u{2019}".as_bytes(),
+                b"lsquo" | b"#8216" | b"#x2018" => "\u{2018}".as_bytes(),
+                b"rdquo" | b"#8221" | b"#x201d" | b"#x201D" => "\u{201D}".as_bytes(),
+                b"ldquo" | b"#8220" | b"#x201c" | b"#x201C" => "\u{201C}".as_bytes(),
+                _ => return None,
+            };
+            out.extend_from_slice(replacement);
+            i = semi + 1;
+        }
+        Some(())
+    }
+
+    fn anilist_date_field(out: &mut Vec<u8>, node: Option<&PhpNode<'_>>) -> Option<()> {
+        let Some(node) = node else {
+            out.extend_from_slice(b"0\0\0");
+            return Some(());
+        };
+        if !node.is_arr() {
+            return None;
+        }
+        let (y, m, d) = (
+            node.coalesce(b"year"),
+            node.coalesce(b"month"),
+            node.coalesce(b"day"),
+        );
+        let (Some(y), Some(m), Some(d)) = (y, m, d) else {
+            out.extend_from_slice(b"0\0\0");
+            return Some(());
+        };
+        let (Some(y), Some(m), Some(d)) = (y.as_int(), m.as_int(), d.as_int()) else {
+            return None;
+        };
+        if !(0..=9999).contains(&y) || !(0..=99).contains(&m) || !(0..=99).contains(&d) {
+            return None;
+        }
+        out.extend_from_slice(b"1\0");
+        let mut s = String::with_capacity(10);
+        let _ = write!(s, "{y:04}-{m:02}-{d:02}");
+        out.extend_from_slice(s.as_bytes());
+        out.push(0);
+        Some(())
+    }
+
+    fn anilist_cover_basename(url: &[u8]) -> Option<&[u8]> {
+        let rest = if let Some(r) = url.strip_prefix(b"https://") {
+            r
+        } else {
+            url.strip_prefix(b"http://")?
+        };
+        let slash = rest.iter().position(|&b| b == b'/')?;
+        let host = &rest[..slash];
+        if host.is_empty()
+            || !host
+                .iter()
+                .all(|&b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+        {
+            return None;
+        }
+        let path = &rest[slash..];
+        if path.ends_with(b"/")
+            || !path
+                .iter()
+                .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-'))
+        {
+            return None;
+        }
+        let last_slash = path.iter().rposition(|&b| b == b'/')?;
+        let base = &path[last_slash + 1..];
+        if base.is_empty() || base == b"." || base == b".." {
+            return None;
+        }
+        Some(base)
+    }
+
+    fn anilist_normalize_media(doc: &PhpNode<'_>) -> Option<Vec<u8>> {
+        if !doc.is_arr() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(512);
+
+        // 0..2: startDate (hasStart, startDate)
+        anilist_date_field(&mut out, doc.coalesce(b"startDate"))?;
+        // 2..4: endDate (hasEnd, endDate)
+        anilist_date_field(&mut out, doc.coalesce(b"endDate"))?;
+
+        // 4: description
+        let raw_desc: &[u8] = match doc.coalesce(b"description").map(|n| &n.val) {
+            None => b"",
+            Some(PhpVal::Str(s)) => s,
+            _ => return None,
+        };
+        std::str::from_utf8(raw_desc).ok()?;
+        let stripped = strip_tags_anilist(raw_desc)?;
+        decode_html_entities_into(&stripped, &mut out)?;
+        out.push(0);
+
+        // 5..7: picture (hasPic, picture)
+        let large_node = match doc.coalesce(b"coverImage") {
+            None => None,
+            Some(ci) if ci.is_arr() => ci.coalesce(b"large"),
+            _ => return None,
+        };
+        match large_node.map(|n| &n.val) {
+            None => out.extend_from_slice(b"0\0\0"),
+            Some(PhpVal::Str(url)) => {
+                let base = anilist_cover_basename(url)?;
+                out.extend_from_slice(b"1\0");
+                field(&mut out, base)?;
+            }
+            _ => return None,
+        }
+
+        // 7: categories (genres) - implode(', ', $anilistData['genres'])
+        if let Some(genres) = doc.coalesce(b"genres").filter(|n| n.is_arr()) {
+            let mut first = true;
+            for (_, g) in genres.items() {
+                let val = strval(Some(g))?;
+                if val.contains(&0) {
+                    return None;
+                }
+                if !first {
+                    out.extend_from_slice(b", ");
+                }
+                first = false;
+                out.extend_from_slice(&val);
+            }
+        }
+        out.push(0);
+
+        // 8: characters (up to 10 characters.nodes -> name.full, array_filter)
+        if let Some(chars) = doc.coalesce(b"characters") {
+            if !chars.is_arr() {
+                return None;
+            }
+            if let Some(nodes) = chars.coalesce(b"nodes").filter(|n| n.is_arr()) {
+                let mut first = true;
+                for (_, character) in nodes.items().iter().take(10) {
+                    if !character.is_arr() {
+                        return None;
+                    }
+                    let full_node = match character.coalesce(b"name") {
+                        None => None,
+                        Some(n) if n.is_arr() => n.coalesce(b"full"),
+                        _ => return None,
+                    };
+                    if !empty(full_node)? {
+                        let val = strval(full_node)?;
+                        if val.contains(&0) {
+                            return None;
+                        }
+                        if !first {
+                            out.extend_from_slice(b", ");
+                        }
+                        first = false;
+                        out.extend_from_slice(&val);
+                    }
+                }
+            }
+        }
+        out.push(0);
+
+        // 9: creators (studios.nodes -> name, array_filter)
+        if let Some(studios) = doc.coalesce(b"studios") {
+            if !studios.is_arr() {
+                return None;
+            }
+            if let Some(nodes) = studios.coalesce(b"nodes").filter(|n| n.is_arr()) {
+                let mut first = true;
+                for (_, studio) in nodes.items() {
+                    if !studio.is_arr() {
+                        return None;
+                    }
+                    let name_node = studio.coalesce(b"name");
+                    if !empty(name_node)? {
+                        let val = strval(name_node)?;
+                        if val.contains(&0) {
+                            return None;
+                        }
+                        if !first {
+                            out.extend_from_slice(b", ");
+                        }
+                        first = false;
+                        out.extend_from_slice(&val);
+                    }
+                }
+            }
+        }
+        out.push(0);
+
+        // 10, 11: related and similar
+        let mut related = Vec::new();
+        let mut similar = Vec::new();
+        if let Some(relations) = doc.coalesce(b"relations") {
+            if !relations.is_arr() {
+                return None;
+            }
+            if let Some(edges) = relations.coalesce(b"edges").filter(|n| n.is_arr()) {
+                let mut related_count = 0usize;
+                let mut similar_count = 0usize;
+                for (_, edge) in edges.items() {
+                    if !edge.is_arr() {
+                        return None;
+                    }
+                    let rel_type = edge.coalesce(b"relationType");
+                    if matches!(rel_type.map(|n| &n.val), Some(PhpVal::Arr(_) | PhpVal::Float)) {
+                        return None;
+                    }
+                    let node = match edge.coalesce(b"node") {
+                        None => None,
+                        Some(n) if n.is_arr() => Some(n),
+                        _ => return None,
+                    };
+                    let title_arr = match node.and_then(|n| n.coalesce(b"title")) {
+                        None => None,
+                        Some(t) if t.is_arr() => Some(t),
+                        _ => return None,
+                    };
+                    let title_node = title_arr
+                        .and_then(|t| t.coalesce(b"english").or_else(|| t.coalesce(b"romaji")));
+                    let id_node = node.and_then(|n| n.coalesce(b"id"));
+                    let title_val = strval(title_node)?;
+                    let id_val = strval(id_node)?;
+                    if title_val.contains(&0) || id_val.contains(&0) {
+                        return None;
+                    }
+                    match rel_type.and_then(PhpNode::as_str) {
+                        Some(b"SEQUEL" | b"PREQUEL" | b"SIDE_STORY" | b"PARENT" | b"SPIN_OFF") => {
+                            if related_count < 20 {
+                                if related_count > 0 {
+                                    related.extend_from_slice(b", ");
+                                }
+                                related.extend_from_slice(&title_val);
+                                related.extend_from_slice(b" (");
+                                related.extend_from_slice(&id_val);
+                                related.push(b')');
+                                related_count += 1;
+                            }
+                        }
+                        Some(b"ALTERNATIVE" | b"CHARACTER") => {
+                            if similar_count < 20 {
+                                if similar_count > 0 {
+                                    similar.extend_from_slice(b", ");
+                                }
+                                similar.extend_from_slice(&title_val);
+                                similar.extend_from_slice(b" (");
+                                similar.extend_from_slice(&id_val);
+                                similar.push(b')');
+                                similar_count += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        out.extend_from_slice(&related);
+        out.push(0);
+        out.extend_from_slice(&similar);
+        out.push(0);
+
+        Some(out)
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_anilist_normalize_media(
+        ptr: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let Some(bytes) = (unsafe { input(ptr, len) }) else {
+            return DECLINE;
+        };
+        let Some(doc) = PhpSerParser::parse_document(bytes) else {
+            return DECLINE;
+        };
+        let Some(result) = anilist_normalize_media(&doc) else {
+            return DECLINE;
+        };
+        unsafe { emit_slice(out, cap, &result) }
+    }
+
+    // ---- 2. IGDB QueryBuilder helpers ---------------------------------------
+
+    #[inline]
+    fn write_escaped_igdb_string(cursor: &mut OutCursor, s: &[u8]) {
+        cursor.push(b'"');
+        let mut last = 0usize;
+        for (i, &b) in s.iter().enumerate() {
+            if b == b'\\' || b == b'"' {
+                if i > last {
+                    cursor.extend(&s[last..i]);
+                }
+                cursor.push(b'\\');
+                cursor.push(b);
+                last = i + 1;
+            }
+        }
+        if last < s.len() {
+            cursor.extend(&s[last..]);
+        }
+        cursor.push(b'"');
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_igdb_format_string(
+        ptr: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let Some(s) = (unsafe { input(ptr, len) }) else {
+            return DECLINE;
+        };
+        let mut cursor = unsafe { OutCursor::new(out, cap) };
+        write_escaped_igdb_string(&mut cursor, s);
+        cursor.finish()
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_igdb_where_in(
+        field_ptr: *const u8,
+        field_len: usize,
+        ser_ptr: *const u8,
+        ser_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let (Some(field_bytes), Some(ser_bytes)) = (
+            unsafe { input(field_ptr, field_len) },
+            unsafe { input(ser_ptr, ser_len) },
+        ) else {
+            return DECLINE;
+        };
+        let Some(doc) = PhpSerParser::parse_document(ser_bytes) else {
+            return DECLINE;
+        };
+        if !doc.is_arr() {
+            return DECLINE;
+        }
+        for (_, item) in doc.items() {
+            if matches!(item.val, PhpVal::Float | PhpVal::Arr(_)) {
+                return DECLINE;
+            }
+        }
+        let mut cursor = unsafe { OutCursor::new(out, cap) };
+        cursor.extend(field_bytes);
+        cursor.extend(b" = (");
+        for (idx, (_, item)) in doc.items().iter().enumerate() {
+            if idx > 0 {
+                cursor.push(b',');
+            }
+            match &item.val {
+                PhpVal::Bool(true) => cursor.extend(b"true"),
+                PhpVal::Bool(false) => cursor.extend(b"false"),
+                PhpVal::Null => cursor.extend(b"null"),
+                PhpVal::Int(_) => {
+                    // `item.raw` is `i:<digits>;`
+                    cursor.extend(&item.raw[2..item.raw.len() - 1]);
+                }
+                PhpVal::Str(s) => write_escaped_igdb_string(&mut cursor, s),
+                PhpVal::Float | PhpVal::Arr(_) => return DECLINE,
+            }
+        }
+        cursor.push(b')');
+        cursor.finish()
+    }
+
+    fn write_unique_nul_joined(
+        cursor: &mut OutCursor,
+        raw: &[u8],
+        expected_count: usize,
+        sep: &[u8],
+    ) -> bool {
+        if expected_count == 0 {
+            return raw.is_empty();
+        }
+        const INLINE_CAP: usize = 64;
+        let mut inline: [&[u8]; INLINE_CAP] = [&[]; INLINE_CAP];
+        let mut spilled: Vec<&[u8]> = Vec::new();
+        let mut unique_count = 0usize;
+        let mut seen_parts = 0usize;
+
+        for part in raw.split(|&b| b == 0) {
+            seen_parts += 1;
+            let seen_slice = if unique_count <= INLINE_CAP {
+                &inline[..unique_count]
+            } else {
+                &spilled[..]
+            };
+            if !seen_slice.contains(&part) {
+                if unique_count > 0 {
+                    cursor.extend(sep);
+                }
+                cursor.extend(part);
+                if unique_count < INLINE_CAP {
+                    inline[unique_count] = part;
+                } else {
+                    if unique_count == INLINE_CAP {
+                        spilled.extend_from_slice(&inline);
+                    }
+                    spilled.push(part);
+                }
+                unique_count += 1;
+            }
+        }
+        seen_parts == expected_count
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_igdb_to_query_nul(
+        fields_ptr: *const u8,
+        fields_len: usize,
+        fields_count: usize,
+        where_ptr: *const u8,
+        where_len: usize,
+        where_count: usize,
+        search_ptr: *const u8,
+        search_len: usize,
+        sort_ptr: *const u8,
+        sort_len: usize,
+        has_sort: u32,
+        has_limit: u32,
+        limit_val: i64,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let (Some(fields_bytes), Some(where_bytes), Some(search_bytes), Some(sort_bytes)) = (
+            unsafe { input(fields_ptr, fields_len) },
+            unsafe { input(where_ptr, where_len) },
+            unsafe { input(search_ptr, search_len) },
+            unsafe { input(sort_ptr, sort_len) },
+        ) else {
+            return DECLINE;
+        };
+        let mut cursor = unsafe { OutCursor::new(out, cap) };
+        cursor.extend(b"fields ");
+        if !write_unique_nul_joined(&mut cursor, fields_bytes, fields_count, b",") {
+            return DECLINE;
+        }
+        cursor.push(b';');
+
+        if search_len > 0 {
+            cursor.extend(b"\nsearch ");
+            write_escaped_igdb_string(&mut cursor, search_bytes);
+            cursor.push(b';');
+        }
+
+        if where_count > 0 {
+            cursor.extend(b"\nwhere ");
+            if !write_unique_nul_joined(&mut cursor, where_bytes, where_count, b" & ") {
+                return DECLINE;
+            }
+            cursor.push(b';');
+        } else if where_len != 0 {
+            return DECLINE;
+        }
+
+        if has_sort != 0 {
+            cursor.extend(b"\nsort ");
+            cursor.extend(sort_bytes);
+            cursor.push(b';');
+        }
+
+        if has_limit != 0 {
+            cursor.extend(b"\nlimit ");
+            let mut buf = [0u8; 24];
+            let s = limit_val.to_string();
+            let sb = s.as_bytes();
+            buf[..sb.len()].copy_from_slice(sb);
+            cursor.extend(&buf[..sb.len()]);
+            cursor.push(b';');
+        }
+
+        cursor.finish()
+    }
+
+    // ---- 3. ParsedTvRelease helpers -----------------------------------------
+
+    /// Reproduces `is_numeric($v) ? (int) $v : null`.
+    /// Returns `None` when float/complex numeric string semantics require PHP.
+    fn php_numeric_to_int(node: Option<&PhpNode<'_>>) -> Option<Option<i64>> {
+        match node.map(|n| &n.val) {
+            None | Some(PhpVal::Null | PhpVal::Bool(_) | PhpVal::Arr(_)) => Some(None),
+            Some(PhpVal::Int(i)) => Some(Some(*i)),
+            Some(PhpVal::Float) => None,
+            Some(PhpVal::Str(s)) => {
+                if !s.iter().any(u8::is_ascii_digit) {
+                    return Some(None);
+                }
+                let mut p = 0;
+                while p < s.len() && is_pcre_c_space(s[p]) {
+                    p += 1;
+                }
+                let mut neg = false;
+                if let Some(&sign @ (b'+' | b'-')) = s.get(p) {
+                    neg = sign == b'-';
+                    p += 1;
+                }
+                let digits = &s[p..];
+                if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+                    return None;
+                }
+                let nonzero_start = digits
+                    .iter()
+                    .position(|&b| b != b'0')
+                    .unwrap_or(digits.len());
+                let sig = &digits[nonzero_start..];
+                if sig.is_empty() {
+                    return Some(Some(0));
+                }
+                if sig.len() > 18 {
+                    return None;
+                }
+                let mut val: i64 = 0;
+                for &b in sig {
+                    val = val * 10 + i64::from(b - b'0');
+                }
+                Some(Some(if neg { -val } else { val }))
+            }
+        }
+    }
+
+    fn tv_from_parse_info(doc: &PhpNode<'_>) -> Option<Vec<u8>> {
+        if !doc.is_arr() {
+            return None;
+        }
+        let name_node = doc.coalesce(b"name");
+        if empty(name_node)? {
+            return Some(Vec::new());
+        }
+        let season_node = doc.coalesce(b"season");
+        let episode_node = doc.coalesce(b"episode");
+        if season_node.is_none() || episode_node.is_none() {
+            return Some(Vec::new());
+        }
+
+        let resolved_ep: Option<&PhpNode<'_>> = match episode_node.map(|n| &n.val) {
+            Some(PhpVal::Arr(_)) => episode_node.unwrap().get_int_key(0),
+            _ => episode_node,
+        };
+        let ep_is_default_zero = episode_node.is_some_and(PhpNode::is_arr)
+            && resolved_ep.is_none_or(|n| matches!(n.val, PhpVal::Null));
+
+        let season_pack = !ep_is_default_zero
+            && matches!(resolved_ep.map(|n| &n.val), Some(PhpVal::Str(b"all")));
+
+        let name_str = strval(name_node)?;
+        let clean_node = doc.coalesce(b"cleanname").or(name_node);
+        let clean_str = strval(clean_node)?;
+        let country_str = strval(doc.coalesce(b"country"))?;
+        let airdate_str = strval(doc.coalesce(b"airdate"))?;
+
+        let season_val = php_numeric_to_int(season_node)?;
+        let episode_val = if season_pack {
+            None
+        } else if ep_is_default_zero {
+            Some(0)
+        } else {
+            php_numeric_to_int(resolved_ep)?
+        };
+        let year_val = php_numeric_to_int(doc.coalesce(b"year"))?;
+
+        let mut out = Vec::with_capacity(
+            name_str.len() + clean_str.len() + country_str.len() + airdate_str.len() + 32,
+        );
+        field(&mut out, &name_str)?;
+        field(&mut out, &clean_str)?;
+        field(&mut out, &country_str)?;
+        field(&mut out, &airdate_str)?;
+        field(&mut out, if season_pack { b"1" } else { b"0" })?;
+        match season_val {
+            Some(v) => field(&mut out, v.to_string().as_bytes())?,
+            None => field(&mut out, b"")?,
+        }
+        match episode_val {
+            Some(v) => field(&mut out, v.to_string().as_bytes())?,
+            None => field(&mut out, b"")?,
+        }
+        match year_val {
+            Some(v) => field(&mut out, v.to_string().as_bytes())?,
+            None => field(&mut out, b"")?,
+        }
+        Some(out)
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tv_from_parse_info(
+        ser_ptr: *const u8,
+        ser_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let Some(bytes) = (unsafe { input(ser_ptr, ser_len) }) else {
+            return DECLINE;
+        };
+        let Some(doc) = PhpSerParser::parse_document(bytes) else {
+            return DECLINE;
+        };
+        let Some(result) = tv_from_parse_info(&doc) else {
+            return DECLINE;
+        };
+        unsafe { emit_slice(out, cap, &result) }
+    }
+
+    fn tv_title_without_year(s: &[u8]) -> Option<&[u8]> {
+        if s.contains(&b'\n') {
+            return None;
+        }
+        let mut slice = s;
+        if slice.len() >= 6
+            && slice[slice.len() - 6] == b'('
+            && matches!(&slice[slice.len() - 5..slice.len() - 3], b"19" | b"20")
+            && slice[slice.len() - 3].is_ascii_digit()
+            && slice[slice.len() - 2].is_ascii_digit()
+            && slice[slice.len() - 1] == b')'
+        {
+            let mut end = slice.len() - 6;
+            while end > 0 && is_pcre_c_space(slice[end - 1]) {
+                end -= 1;
+            }
+            slice = &slice[..end];
+        }
+        Some(php_trim_bytes(slice))
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tv_title_without_year(
+        ptr: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let Some(s) = (unsafe { input(ptr, len) }) else {
+            return DECLINE;
+        };
+        let Some(trimmed) = tv_title_without_year(s) else {
+            return DECLINE;
+        };
+        unsafe { emit_slice(out, cap, trimmed) }
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tv_country_code(
+        ptr: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let Some(s) = (unsafe { input(ptr, len) }) else {
+            return DECLINE;
+        };
+        if s.len() == 2 {
+            unsafe { emit_slice(out, cap, s) }
+        } else {
+            0
+        }
+    }
+
+    // ---- 4. MetadataSearchLookup::normalizeBooleanSearchWords ---------------
+
+    #[inline]
+    fn is_bool_search_sep(b: u8) -> bool {
+        b == b'+' || is_pcre_c_space(b)
+    }
+
+    #[inline]
+    fn is_bool_search_trim_edge(b: u8) -> bool {
+        b == 0 || is_bool_search_sep(b)
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_metadata_normalize_boolean_search_words(
+        ptr: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let Some(s) = (unsafe { input(ptr, len) }) else {
+            return DECLINE;
+        };
+        let mut start = 0;
+        let mut end = s.len();
+        while start < end && is_bool_search_trim_edge(s[start]) {
+            start += 1;
+        }
+        while end > start && is_bool_search_trim_edge(s[end - 1]) {
+            end -= 1;
+        }
+        let body = &s[start..end];
+        let mut cursor = unsafe { OutCursor::new(out, cap) };
+        let mut in_sep = false;
+        let mut run_start = 0usize;
+        for (i, &b) in body.iter().enumerate() {
+            if is_bool_search_sep(b) {
+                if !in_sep {
+                    if i > run_start {
+                        cursor.extend(&body[run_start..i]);
+                    }
+                    cursor.push(b' ');
+                    in_sep = true;
+                }
+                run_start = i + 1;
+            } else {
+                in_sep = false;
+            }
+        }
+        if run_start < body.len() {
+            cursor.extend(&body[run_start..]);
+        }
+        cursor.finish()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn strip_tags_and_entities_match_php() {
+            let stripped =
+                strip_tags_anilist(b"<p>Hello &amp; <i>world</i>!<br><a href=\"x\">link</a></p>")
+                    .unwrap();
+            let mut decoded = Vec::new();
+            decode_html_entities_into(&stripped, &mut decoded).unwrap();
+            assert_eq!(decoded, b"Hello & world!link");
+            assert!(strip_tags_anilist(b"a < b").is_none());
+            assert!(strip_tags_anilist(b"<a href=\"a>b\">x</a>").is_none());
+            let mut unk = Vec::new();
+            assert!(decode_html_entities_into(b"&copy;", &mut unk).is_none());
+        }
+
+        #[test]
+        fn igdb_formatting_and_query_building() {
+            let mut buf = [0u8; 128];
+            let n = unsafe {
+                nntmux_igdb_format_string(b"Halo \"CE\" \\1".as_ptr(), 12, buf.as_mut_ptr(), 128)
+            };
+            assert_eq!(&buf[..n as usize], b"\"Halo \\\"CE\\\" \\\\1\"");
+
+            let q_len = unsafe {
+                nntmux_igdb_to_query_nul(
+                    b"*\0cover.url\0*".as_ptr(),
+                    13,
+                    3,
+                    b"category = 0\0platforms = (6,14)".as_ptr(),
+                    31,
+                    2,
+                    b"Halo".as_ptr(),
+                    4,
+                    b"rating desc".as_ptr(),
+                    11,
+                    1,
+                    1,
+                    10,
+                    buf.as_mut_ptr(),
+                    128,
+                )
+            };
+            assert_eq!(
+                std::str::from_utf8(&buf[..q_len as usize]).unwrap(),
+                "fields *,cover.url;\nsearch \"Halo\";\nwhere category = 0 & platforms = (6,14);\nsort rating desc;\nlimit 10;"
+            );
+        }
+
+        #[test]
+        fn tv_title_without_year_and_boolean_search_words() {
+            assert_eq!(
+                tv_title_without_year(b"Doctor Who (2005)").unwrap(),
+                b"Doctor Who"
+            );
+            assert_eq!(
+                tv_title_without_year(b"Show (1899)").unwrap(),
+                b"Show (1899)"
+            );
+            assert!(tv_title_without_year(b"Show (2005)\n").is_none());
+
+            let mut buf = [0u8; 64];
+            let n = unsafe {
+                nntmux_metadata_normalize_boolean_search_words(
+                    b"\x0c\0 +word1   +word2\t+word3 \0".as_ptr(),
+                    27,
+                    buf.as_mut_ptr(),
+                    64,
+                )
+            };
+            assert_eq!(&buf[..n as usize], b"word1 word2 word3");
+        }
+    }
+}
+
