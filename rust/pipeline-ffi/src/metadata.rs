@@ -15739,3 +15739,1147 @@ pub mod tv_adder_steam_dto {
         }
     }
 }
+
+/// Wave 15 Slice 6: TvProcessingPipeline, TvProcessingPassable, TvProcessingResult,
+/// AbstractApiProviderPipe, TvMazeClient, IGDB DataNode, SteamPriceData, and
+/// MetadataSources C-ABI helpers.
+///
+/// Every export validates raw pointers and lengths before constructing slices and
+/// wraps its body in `std::panic::catch_unwind`, returning `-1` on panic or decline
+/// so the PHP caller falls back to its pure-PHP implementation.
+pub mod tv_pipeline_igdb_metadata {
+    use super::{OutCursor, PhpKey, PhpNode, PhpSerParser, PhpVal};
+    use std::panic::{UnwindSafe, catch_unwind};
+    use std::slice;
+
+    const DECLINE: isize = -1;
+    const DECLINE_I32: i32 = -1;
+    const MAX_INPUT: usize = 4 << 20;
+
+    #[inline]
+    unsafe fn input<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null() || len > MAX_INPUT {
+            return None;
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn guard<F: FnOnce() -> isize + UnwindSafe>(f: F) -> isize {
+        catch_unwind(f).unwrap_or(DECLINE)
+    }
+
+    #[inline]
+    fn guard_i32<F: FnOnce() -> i32 + UnwindSafe>(f: F) -> i32 {
+        catch_unwind(f).unwrap_or(DECLINE_I32)
+    }
+
+    #[inline]
+    fn is_php_trim_byte(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\0' | 0x0B)
+    }
+
+    #[inline]
+    fn is_php_filter_trim_byte(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0B)
+    }
+
+    #[inline]
+    fn php_trim_bytes(bytes: &[u8]) -> &[u8] {
+        let mut start = 0;
+        let mut end = bytes.len();
+        while start < end && is_php_trim_byte(bytes[start]) {
+            start += 1;
+        }
+        while end > start && is_php_trim_byte(bytes[end - 1]) {
+            end -= 1;
+        }
+        &bytes[start..end]
+    }
+
+    #[inline]
+    fn php_filter_trim_bytes(bytes: &[u8]) -> &[u8] {
+        let mut start = 0;
+        let mut end = bytes.len();
+        while start < end && is_php_filter_trim_byte(bytes[start]) {
+            start += 1;
+        }
+        while end > start && is_php_filter_trim_byte(bytes[end - 1]) {
+            end -= 1;
+        }
+        &bytes[start..end]
+    }
+
+    fn write_i64(out: &mut OutCursor<'_>, value: i64) {
+        if value < 0 {
+            out.push(b'-');
+        }
+        let mut n = value.unsigned_abs();
+        let mut digits = [0u8; 20];
+        let mut i = digits.len();
+        loop {
+            i -= 1;
+            digits[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        out.extend(&digits[i..]);
+    }
+
+    // -------------------------------------------------------------------------
+    // 1. TvProcessingPipeline helpers
+    // -------------------------------------------------------------------------
+
+    /// Classifies `TvProcessingPipeline::updateStats` status into bucket code:
+    /// `0` = `matched` (`matched` or `season_pack`), `1` = `episode_missing`,
+    /// `2` = `deferred` (`transient`), `3` = `not_found` (default), `-1` = decline.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tv_pipeline_classify_status(
+        status_ptr: *const u8,
+        status_len: usize,
+    ) -> i32 {
+        guard_i32(|| {
+            let Some(status) = (unsafe { input(status_ptr, status_len) }) else {
+                return DECLINE_I32;
+            };
+            match status {
+                b"matched" | b"season_pack" => 0,
+                b"episode_missing" => 1,
+                b"transient" => 2,
+                _ => 3,
+            }
+        })
+    }
+
+    /// Formats `TvProcessingPipeline::displaySummary` header line.
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tv_pipeline_format_summary_header(
+        processed: i64,
+        matched: i64,
+        episode_missing: i64,
+        not_found: i64,
+        deferred: i64,
+        duration: f64,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        guard(|| {
+            if !duration.is_finite() || duration.abs() > 1e12 {
+                return DECLINE;
+            }
+            let norm_duration = if duration == 0.0 { 0.0 } else { duration };
+            let formatted_dur = format!("{norm_duration:.2}");
+            let mut cursor = unsafe { OutCursor::new(out, cap) };
+            cursor.extend(b"TV processing complete: ");
+            write_i64(&mut cursor, processed);
+            cursor.extend(b" processed, ");
+            write_i64(&mut cursor, matched);
+            cursor.extend(b" matched, ");
+            write_i64(&mut cursor, episode_missing);
+            cursor.extend(b" episode missing, ");
+            write_i64(&mut cursor, not_found);
+            cursor.extend(b" not found, ");
+            write_i64(&mut cursor, deferred);
+            cursor.extend(b" deferred (");
+            cursor.extend(formatted_dur.as_bytes());
+            cursor.extend(b"s)");
+            cursor.finish()
+        })
+    }
+
+    /// Formats `TvProcessingPipeline::displaySummary` provider summary line from a PHP
+    /// `serialize($providers)` payload. Returns `0` when empty, `> 0` bytes written,
+    /// `-(required_len)` when `cap` is too small, or `-1` on decline.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tv_pipeline_format_provider_summary(
+        ser_ptr: *const u8,
+        ser_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        guard(|| {
+            let Some(ser_bytes) = (unsafe { input(ser_ptr, ser_len) }) else {
+                return DECLINE;
+            };
+            let Some(doc) = PhpSerParser::parse_document(ser_bytes) else {
+                return DECLINE;
+            };
+            let PhpVal::Arr(items) = &doc.val else {
+                return DECLINE;
+            };
+            if items.is_empty() {
+                return 0;
+            }
+            let mut cursor = unsafe { OutCursor::new(out, cap) };
+            cursor.extend(b"Matches by provider: ");
+            for (idx, (key, node)) in items.iter().enumerate() {
+                let PhpVal::Int(count) = node.val else {
+                    return DECLINE;
+                };
+                if idx > 0 {
+                    cursor.extend(b", ");
+                }
+                match key {
+                    PhpKey::Int(k) => write_i64(&mut cursor, *k),
+                    PhpKey::Str(s) => cursor.extend(s),
+                }
+                cursor.extend(b": ");
+                write_i64(&mut cursor, count);
+            }
+            cursor.finish()
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // 2. TvProcessingPassable & 3. TvProcessingResult helpers
+    // -------------------------------------------------------------------------
+
+    /// Mirrors `TvProcessingPassable::isResolved()`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn nntmux_tv_passable_is_resolved(
+        parse_failed: u32,
+        episode_id: i64,
+        season_pack: u32,
+    ) -> i32 {
+        guard_i32(|| i32::from(parse_failed != 0 || episode_id > 0 || season_pack != 0))
+    }
+
+    /// Resolves `TvProcessingPassable::finalResult()` outcome branch:
+    /// `0` = `parse_failed`, `1` = `matched`, `2` = `season_pack`,
+    /// `3` = `episode_missing`, `4` = `transient`, `5` = `not_found`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn nntmux_tv_passable_resolve_final_status(
+        parse_failed: u32,
+        has_parsed: u32,
+        video_id: i64,
+        episode_id: i64,
+        season_pack: u32,
+        has_transient: u32,
+    ) -> i32 {
+        guard_i32(|| {
+            if parse_failed != 0 || has_parsed == 0 {
+                0
+            } else if episode_id > 0 {
+                1
+            } else if season_pack != 0 && video_id > 0 {
+                2
+            } else if video_id > 0 {
+                3
+            } else if has_transient != 0 {
+                4
+            } else {
+                5
+            }
+        })
+    }
+
+    /// Deduplicates `count` NUL-separated provider names in first-seen order and joins
+    /// them with `,` (`implode(',', array_unique($providers))`).
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tv_passable_dedup_transient_providers_nul(
+        input_ptr: *const u8,
+        input_len: usize,
+        count: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        guard(|| {
+            if count == 0 {
+                return if input_len == 0 { 0 } else { DECLINE };
+            }
+            let Some(bytes) = (unsafe { input(input_ptr, input_len) }) else {
+                return DECLINE;
+            };
+            let mut seen: Vec<&[u8]> = Vec::with_capacity(count.min(16));
+            let mut seg_count = 0usize;
+            for seg in bytes.split(|&b| b == 0) {
+                seg_count += 1;
+                if !seen.contains(&seg) {
+                    seen.push(seg);
+                }
+            }
+            if seg_count != count {
+                return DECLINE;
+            }
+            let mut cursor = unsafe { OutCursor::new(out, cap) };
+            for (idx, seg) in seen.iter().enumerate() {
+                if idx > 0 {
+                    cursor.push(b',');
+                }
+                cursor.extend(seg);
+            }
+            cursor.finish()
+        })
+    }
+
+    /// Mirrors `TvProcessingResult::isMatched()`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tv_result_is_matched(
+        status_ptr: *const u8,
+        status_len: usize,
+    ) -> i32 {
+        guard_i32(|| {
+            let Some(status) = (unsafe { input(status_ptr, status_len) }) else {
+                return DECLINE_I32;
+            };
+            i32::from(status == b"matched")
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // 4. AbstractApiProviderPipe helpers
+    // -------------------------------------------------------------------------
+
+    /// `kind` 0 = `<season>x<episode>` episode lookup key;
+    /// `kind` 1 = `show has no <siteColumn> id` skip reason.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tv_api_pipe_format(
+        kind: i32,
+        season: i64,
+        episode: i64,
+        col_ptr: *const u8,
+        col_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        guard(|| {
+            let Some(col) = (unsafe { input(col_ptr, col_len) }) else {
+                return DECLINE;
+            };
+            let mut cursor = unsafe { OutCursor::new(out, cap) };
+            match kind {
+                0 => {
+                    write_i64(&mut cursor, season);
+                    cursor.push(b'x');
+                    write_i64(&mut cursor, episode);
+                }
+                1 => {
+                    cursor.extend(b"show has no ");
+                    cursor.extend(col);
+                    cursor.extend(b" id");
+                }
+                _ => return DECLINE,
+            }
+            cursor.finish()
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // 5. TvMazeClient helpers
+    // -------------------------------------------------------------------------
+
+    /// Extracts non-empty string `$aka['name']` entries from a PHP `serialize($akas)`
+    /// payload and emits them separated by `\0`. Returns `0` when none match, `> 0`
+    /// bytes written, `-(required_len)` if `cap` is too small, or `-1` on decline.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tvmaze_extract_aka_names(
+        ser_ptr: *const u8,
+        ser_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        guard(|| {
+            let Some(ser_bytes) = (unsafe { input(ser_ptr, ser_len) }) else {
+                return DECLINE;
+            };
+            let Some(doc) = PhpSerParser::parse_document(ser_bytes) else {
+                return DECLINE;
+            };
+            let PhpVal::Arr(items) = &doc.val else {
+                return DECLINE;
+            };
+            let mut cursor = unsafe { OutCursor::new(out, cap) };
+            let mut emitted = 0usize;
+            for (_, item) in items {
+                if let PhpVal::Arr(_) = &item.val
+                    && let Some(name_node) = item.get(b"name")
+                    && let PhpVal::Str(name_bytes) = &name_node.val
+                    && !name_bytes.is_empty()
+                {
+                    if name_bytes.contains(&0) {
+                        return DECLINE;
+                    }
+                    if emitted > 0 {
+                        cursor.push(0);
+                    }
+                    cursor.extend(name_bytes);
+                    emitted += 1;
+                }
+            }
+            cursor.finish()
+        })
+    }
+
+    fn is_leap_year(year: u32) -> bool {
+        (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
+    }
+
+    fn days_in_month(year: u32, month: u32) -> u32 {
+        match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 => {
+                if is_leap_year(year) {
+                    29
+                } else {
+                    28
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    fn parse_canonical_ymd(trimmed: &[u8]) -> Option<[u8; 10]> {
+        if trimmed.len() < 8 || trimmed.len() > 10 {
+            return None;
+        }
+        if !trimmed[..4].iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let year = u32::from(trimmed[0] - b'0') * 1000
+            + u32::from(trimmed[1] - b'0') * 100
+            + u32::from(trimmed[2] - b'0') * 10
+            + u32::from(trimmed[3] - b'0');
+        if !(1970..=2099).contains(&year) {
+            return None;
+        }
+        let sep = trimmed[4];
+        if !matches!(sep, b'-' | b'/') {
+            return None;
+        }
+        let rest = &trimmed[5..];
+        let sep2_idx = rest.iter().position(|&b| b == sep)?;
+        let m_slice = &rest[..sep2_idx];
+        let d_slice = &rest[sep2_idx + 1..];
+        if !(1..=2).contains(&m_slice.len())
+            || !(1..=2).contains(&d_slice.len())
+            || !m_slice.iter().all(u8::is_ascii_digit)
+            || !d_slice.iter().all(u8::is_ascii_digit)
+        {
+            return None;
+        }
+        let month: u32 = m_slice
+            .iter()
+            .fold(0, |acc, &b| acc * 10 + u32::from(b - b'0'));
+        let day: u32 = d_slice
+            .iter()
+            .fold(0, |acc, &b| acc * 10 + u32::from(b - b'0'));
+        let max_day = days_in_month(year, month);
+        if max_day == 0 || day == 0 || day > max_day {
+            return None;
+        }
+        Some([
+            trimmed[0],
+            trimmed[1],
+            trimmed[2],
+            trimmed[3],
+            b'-',
+            b'0' + (month / 10) as u8,
+            b'0' + (month % 10) as u8,
+            b'-',
+            b'0' + (day / 10) as u8,
+            b'0' + (day % 10) as u8,
+        ])
+    }
+
+    /// Normalizes a TVMaze airdate string (`YYYY-M(M)-D(D)` or `YYYY/M(M)/D(D)`) into
+    /// `YYYY-MM-DD`. Returns `0` for empty/whitespace-only inputs (invalid date), `10`
+    /// (or `-10` if `cap < 10`) on canonical match, or `-1` (`DECLINE`) for non-canonical
+    /// strings so PHP runs `strtotime` + `date('Y-m-d', ...)`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tvmaze_normalize_airdate(
+        airdate_ptr: *const u8,
+        airdate_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        guard(|| {
+            let Some(raw) = (unsafe { input(airdate_ptr, airdate_len) }) else {
+                return DECLINE;
+            };
+            let trimmed = php_trim_bytes(raw);
+            if trimmed.is_empty() {
+                return 0;
+            }
+            let Some(ymd) = parse_canonical_ymd(trimmed) else {
+                return DECLINE;
+            };
+            let mut cursor = unsafe { OutCursor::new(out, cap) };
+            cursor.extend(&ymd);
+            cursor.finish()
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // 6. IGDB\DataNode helpers
+    // -------------------------------------------------------------------------
+
+    fn key_in_nul_fields(key: &[u8], fields: &[u8], count: usize) -> Option<bool> {
+        if key.contains(&0) {
+            return None;
+        }
+        if count == 0 {
+            return fields.is_empty().then_some(false);
+        }
+        let mut seen_count = 0usize;
+        let mut matched = false;
+        for seg in fields.split(|&b| b == 0) {
+            seen_count += 1;
+            if seg == key {
+                matched = true;
+            }
+        }
+        (seen_count == count).then_some(matched)
+    }
+
+    /// Checks `in_array($key, $dateFields, true)` for NUL-joined string `$dateFields`.
+    /// Returns `1` when matched, `0` when not matched, or `-1` on decline.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_igdb_datanode_is_date_field_nul(
+        key_ptr: *const u8,
+        key_len: usize,
+        fields_ptr: *const u8,
+        fields_len: usize,
+        count: usize,
+    ) -> i32 {
+        guard_i32(|| {
+            let (Some(key), Some(fields)) =
+                (unsafe { input(key_ptr, key_len) }, unsafe {
+                    input(fields_ptr, fields_len)
+                })
+            else {
+                return DECLINE_I32;
+            };
+            key_in_nul_fields(key, fields, count).map_or(DECLINE_I32, i32::from)
+        })
+    }
+
+    #[inline]
+    fn is_pcre_c_space(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C)
+    }
+
+    fn parse_simple_numeric_string(s: &[u8]) -> Option<Option<i64>> {
+        if !s.iter().any(u8::is_ascii_digit) {
+            return Some(None);
+        }
+        let mut start = 0;
+        let mut end = s.len();
+        while start < end && is_pcre_c_space(s[start]) {
+            start += 1;
+        }
+        while end > start && is_pcre_c_space(s[end - 1]) {
+            end -= 1;
+        }
+        let trimmed = &s[start..end];
+        if trimmed.is_empty() {
+            return Some(None);
+        }
+        let (neg, digits) = match trimmed.first()? {
+            b'+' => (false, &trimmed[1..]),
+            b'-' => (true, &trimmed[1..]),
+            _ => (false, trimmed),
+        };
+        if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let nz = digits
+            .iter()
+            .position(|&b| b != b'0')
+            .unwrap_or(digits.len());
+        let sig = &digits[nz..];
+        if sig.is_empty() {
+            return Some(Some(0));
+        }
+        if sig.len() > 18 {
+            return None;
+        }
+        let mut val: i64 = 0;
+        for &b in sig {
+            val = val * 10 + i64::from(b - b'0');
+        }
+        Some(Some(if neg { -val } else { val }))
+    }
+
+    /// Resolves `(in_array($key, $dateFields, true) && is_numeric($value)) ? (int) $value : null`.
+    /// `val_kind`: `0` = non-numeric type, `1` = int, `2` = finite in-range float (cast in `int_val`),
+    /// `3` = string in `str_ptr[..str_len]`.
+    /// Returns `1` and writes `*out_ts` when matched, `0` when not a numeric date field, or `-1` on decline.
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_igdb_datanode_resolve_timestamp_nul(
+        key_ptr: *const u8,
+        key_len: usize,
+        fields_ptr: *const u8,
+        fields_len: usize,
+        count: usize,
+        val_kind: i32,
+        int_val: i64,
+        str_ptr: *const u8,
+        str_len: usize,
+        out_ts: *mut i64,
+    ) -> i32 {
+        guard_i32(|| {
+            if out_ts.is_null() {
+                return DECLINE_I32;
+            }
+            let (Some(key), Some(fields)) =
+                (unsafe { input(key_ptr, key_len) }, unsafe {
+                    input(fields_ptr, fields_len)
+                })
+            else {
+                return DECLINE_I32;
+            };
+            let Some(is_date) = key_in_nul_fields(key, fields, count) else {
+                return DECLINE_I32;
+            };
+            if !is_date {
+                return 0;
+            }
+            match val_kind {
+                0 => 0,
+                1 | 2 => {
+                    unsafe { *out_ts = int_val };
+                    1
+                }
+                3 => {
+                    let Some(s) = (unsafe { input(str_ptr, str_len) }) else {
+                        return DECLINE_I32;
+                    };
+                    match parse_simple_numeric_string(s) {
+                        Some(Some(ts)) => {
+                            unsafe { *out_ts = ts };
+                            1
+                        }
+                        Some(None) => 0,
+                        None => DECLINE_I32,
+                    }
+                }
+                _ => DECLINE_I32,
+            }
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // 7. SteamPriceData helpers
+    // -------------------------------------------------------------------------
+
+    /// Parses a `serialize($data)` Steam price API response payload:
+    /// writes `*out_initial = (initial ?? 0) / 100.0`, `*out_final = (final ?? 0) / 100.0`,
+    /// `*out_discount = discount_percent ?? 0`, `*out_has_fmt = 1|0`, and emits
+    /// `<currency>\0<final_formatted>` into `out_buf`.
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_steam_price_from_api(
+        ser_ptr: *const u8,
+        ser_len: usize,
+        out_initial: *mut f64,
+        out_final: *mut f64,
+        out_discount: *mut i64,
+        out_has_fmt: *mut i32,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        guard(|| {
+            if out_initial.is_null()
+                || out_final.is_null()
+                || out_discount.is_null()
+                || out_has_fmt.is_null()
+            {
+                return DECLINE;
+            }
+            let Some(ser_bytes) = (unsafe { input(ser_ptr, ser_len) }) else {
+                return DECLINE;
+            };
+            let Some(doc) = PhpSerParser::parse_document(ser_bytes) else {
+                return DECLINE;
+            };
+            if !doc.is_arr() {
+                return DECLINE;
+            }
+            let currency: &[u8] = match doc.coalesce(b"currency") {
+                None => b"USD",
+                Some(PhpNode {
+                    val: PhpVal::Str(s),
+                    ..
+                }) if !s.contains(&0) => s,
+                _ => return DECLINE,
+            };
+            let initial_cents: i64 = match doc.coalesce(b"initial") {
+                None => 0,
+                Some(PhpNode {
+                    val: PhpVal::Int(i),
+                    ..
+                }) => *i,
+                _ => return DECLINE,
+            };
+            let final_cents: i64 = match doc.coalesce(b"final") {
+                None => 0,
+                Some(PhpNode {
+                    val: PhpVal::Int(i),
+                    ..
+                }) => *i,
+                _ => return DECLINE,
+            };
+            let discount: i64 = match doc.coalesce(b"discount_percent") {
+                None => 0,
+                Some(PhpNode {
+                    val: PhpVal::Int(i),
+                    ..
+                }) => *i,
+                _ => return DECLINE,
+            };
+            let (has_fmt, fmt_bytes): (i32, &[u8]) = match doc.coalesce(b"final_formatted") {
+                None => (0, b""),
+                Some(PhpNode {
+                    val: PhpVal::Str(s),
+                    ..
+                }) if !s.contains(&0) => (1, s),
+                _ => return DECLINE,
+            };
+
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.extend(currency);
+            cursor.push(0);
+            cursor.extend(fmt_bytes);
+            let written = cursor.finish();
+            if written >= 0 {
+                unsafe {
+                    *out_initial = (initial_cents as f64) / 100.0;
+                    *out_final = (final_cents as f64) / 100.0;
+                    *out_discount = discount;
+                    *out_has_fmt = has_fmt;
+                }
+            }
+            written
+        })
+    }
+
+    /// Mirrors `SteamPriceData::getSavings()`: `max(0, $this->initial - $this->final)`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_steam_price_get_savings(
+        initial: f64,
+        final_price: f64,
+        out_savings: *mut f64,
+    ) -> i32 {
+        guard_i32(|| {
+            if out_savings.is_null() || !initial.is_finite() || !final_price.is_finite() {
+                return DECLINE_I32;
+            }
+            let diff = initial - final_price;
+            unsafe {
+                *out_savings = if diff > 0.0 { diff } else { 0.0 };
+            }
+            1
+        })
+    }
+
+    /// Mirrors `SteamPriceData::getDisplayPrice()`.
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_steam_price_display(
+        currency_ptr: *const u8,
+        currency_len: usize,
+        final_price: f64,
+        has_formatted: u32,
+        formatted_ptr: *const u8,
+        formatted_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        guard(|| {
+            let (Some(currency), Some(formatted)) = (
+                unsafe { input(currency_ptr, currency_len) },
+                unsafe { input(formatted_ptr, formatted_len) },
+            ) else {
+                return DECLINE;
+            };
+            let mut cursor = unsafe { OutCursor::new(out, cap) };
+            if has_formatted != 0 {
+                cursor.extend(formatted);
+                return cursor.finish();
+            }
+            if !final_price.is_finite() || final_price.abs() > 1e12 {
+                return DECLINE;
+            }
+            if final_price <= 0.0 {
+                cursor.extend(b"Free");
+                return cursor.finish();
+            }
+            let formatted_num = format!("{final_price:.2}");
+            cursor.extend(currency);
+            cursor.push(b' ');
+            cursor.extend(formatted_num.as_bytes());
+            cursor.finish()
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // 8. MetadataSources helpers
+    // -------------------------------------------------------------------------
+
+    /// Mirrors `MetadataSources::missingKey`: returns `0` when `trim(val) !== ''`,
+    /// or writes `'no API key (' . env . ')'` into `out`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_metadata_sources_missing_key(
+        val_ptr: *const u8,
+        val_len: usize,
+        env_ptr: *const u8,
+        env_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        guard(|| {
+            let (Some(val), Some(env)) =
+                (unsafe { input(val_ptr, val_len) }, unsafe {
+                    input(env_ptr, env_len)
+                })
+            else {
+                return DECLINE;
+            };
+            if !php_trim_bytes(val).is_empty() {
+                return 0;
+            }
+            let mut cursor = unsafe { OutCursor::new(out, cap) };
+            cursor.extend(b"no API key (");
+            cursor.extend(env);
+            cursor.push(b')');
+            cursor.finish()
+        })
+    }
+
+    /// Mirrors `MetadataSources::disabled`: returns `0` when `filter_var(val, FILTER_VALIDATE_BOOL)`
+    /// is true, or writes `'disabled by ' . env` into `out`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_metadata_sources_disabled(
+        val_ptr: *const u8,
+        val_len: usize,
+        env_ptr: *const u8,
+        env_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        guard(|| {
+            let (Some(val), Some(env)) =
+                (unsafe { input(val_ptr, val_len) }, unsafe {
+                    input(env_ptr, env_len)
+                })
+            else {
+                return DECLINE;
+            };
+            let trimmed = php_filter_trim_bytes(val);
+            let enabled = trimmed.eq_ignore_ascii_case(b"1")
+                || trimmed.eq_ignore_ascii_case(b"true")
+                || trimmed.eq_ignore_ascii_case(b"on")
+                || trimmed.eq_ignore_ascii_case(b"yes");
+            if enabled {
+                return 0;
+            }
+            let mut cursor = unsafe { OutCursor::new(out, cap) };
+            cursor.extend(b"disabled by ");
+            cursor.extend(env);
+            cursor.finish()
+        })
+    }
+
+    /// Formats `MetadataSources::summaryLines` from a PHP `serialize(MetadataSources::all())`
+    /// payload, emitting unavailable source lines separated by `\0`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_metadata_sources_summary_lines(
+        ser_ptr: *const u8,
+        ser_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        guard(|| {
+            let Some(ser_bytes) = (unsafe { input(ser_ptr, ser_len) }) else {
+                return DECLINE;
+            };
+            let Some(doc) = PhpSerParser::parse_document(ser_bytes) else {
+                return DECLINE;
+            };
+            let PhpVal::Arr(entries) = &doc.val else {
+                return DECLINE;
+            };
+            let mut cursor = unsafe { OutCursor::new(out, cap) };
+            let mut emitted = 0usize;
+            for (_, entry) in entries {
+                let PhpVal::Arr(_) = &entry.val else {
+                    return DECLINE;
+                };
+                let Some(avail_node) = entry.get(b"available") else {
+                    return DECLINE;
+                };
+                let PhpVal::Bool(avail) = avail_node.val else {
+                    return DECLINE;
+                };
+                if avail {
+                    continue;
+                }
+                let Some(label_node) = entry.get(b"label") else {
+                    return DECLINE;
+                };
+                let PhpVal::Str(label) = label_node.val else {
+                    return DECLINE;
+                };
+                let reason: &[u8] = match entry.get(b"reason") {
+                    Some(PhpNode {
+                        val: PhpVal::Str(r),
+                        ..
+                    }) => r,
+                    Some(PhpNode {
+                        val: PhpVal::Null,
+                        ..
+                    }) => b"",
+                    _ => return DECLINE,
+                };
+                if label.contains(&0) || reason.contains(&0) {
+                    return DECLINE;
+                }
+                if emitted > 0 {
+                    cursor.push(0);
+                }
+                cursor.extend(b"Metadata source ");
+                cursor.extend(label);
+                cursor.extend(b": ");
+                cursor.extend(reason);
+                cursor.extend(b", lookups disabled");
+                emitted += 1;
+            }
+            cursor.finish()
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn tv_pipeline_status_and_summary() {
+            assert_eq!(
+                unsafe { nntmux_tv_pipeline_classify_status(b"matched".as_ptr(), 7) },
+                0
+            );
+            assert_eq!(
+                unsafe { nntmux_tv_pipeline_classify_status(b"season_pack".as_ptr(), 11) },
+                0
+            );
+            assert_eq!(
+                unsafe { nntmux_tv_pipeline_classify_status(b"episode_missing".as_ptr(), 15) },
+                1
+            );
+            assert_eq!(
+                unsafe { nntmux_tv_pipeline_classify_status(b"transient".as_ptr(), 9) },
+                2
+            );
+            assert_eq!(
+                unsafe { nntmux_tv_pipeline_classify_status(b"not_found".as_ptr(), 9) },
+                3
+            );
+            assert_eq!(
+                unsafe { nntmux_tv_pipeline_classify_status(std::ptr::null(), 5) },
+                -1
+            );
+
+            let mut buf = [0u8; 256];
+            let n = unsafe {
+                nntmux_tv_pipeline_format_summary_header(
+                    10,
+                    6,
+                    2,
+                    1,
+                    1,
+                    1.25,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(
+                &buf[..n as usize],
+                b"TV processing complete: 10 processed, 6 matched, 2 episode missing, 1 not found, 1 deferred (1.25s)"
+            );
+
+            let ser = br#"a:2:{s:4:"TVDB";i:4;s:6:"TVMaze";i:2;}"#;
+            let p = unsafe {
+                nntmux_tv_pipeline_format_provider_summary(
+                    ser.as_ptr(),
+                    ser.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(
+                &buf[..p as usize],
+                b"Matches by provider: TVDB: 4, TVMaze: 2"
+            );
+        }
+
+        #[test]
+        fn tv_passable_result_and_api_pipe() {
+            assert_eq!(nntmux_tv_passable_is_resolved(0, 0, 0), 0);
+            assert_eq!(nntmux_tv_passable_is_resolved(1, 0, 0), 1);
+            assert_eq!(nntmux_tv_passable_is_resolved(0, 5, 0), 1);
+            assert_eq!(nntmux_tv_passable_is_resolved(0, 0, 1), 1);
+
+            assert_eq!(nntmux_tv_passable_resolve_final_status(1, 1, 5, 6, 0, 0), 0);
+            assert_eq!(nntmux_tv_passable_resolve_final_status(0, 0, 5, 6, 0, 0), 0);
+            assert_eq!(nntmux_tv_passable_resolve_final_status(0, 1, 5, 6, 0, 0), 1);
+            assert_eq!(nntmux_tv_passable_resolve_final_status(0, 1, 5, 0, 1, 0), 2);
+            assert_eq!(nntmux_tv_passable_resolve_final_status(0, 1, 5, 0, 0, 1), 3);
+            assert_eq!(nntmux_tv_passable_resolve_final_status(0, 1, 0, 0, 0, 1), 4);
+            assert_eq!(nntmux_tv_passable_resolve_final_status(0, 1, 0, 0, 0, 0), 5);
+
+            let mut buf = [0u8; 64];
+            let dedup = b"tvdb\0tvmaze\0tvdb\0trakt";
+            let n = unsafe {
+                nntmux_tv_passable_dedup_transient_providers_nul(
+                    dedup.as_ptr(),
+                    dedup.len(),
+                    4,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(&buf[..n as usize], b"tvdb,tvmaze,trakt");
+
+            assert_eq!(
+                unsafe { nntmux_tv_result_is_matched(b"matched".as_ptr(), 7) },
+                1
+            );
+            assert_eq!(
+                unsafe { nntmux_tv_result_is_matched(b"season_pack".as_ptr(), 11) },
+                0
+            );
+
+            let k = unsafe {
+                nntmux_tv_api_pipe_format(0, 3, 12, std::ptr::null(), 0, buf.as_mut_ptr(), 64)
+            };
+            assert_eq!(&buf[..k as usize], b"3x12");
+            let r = unsafe {
+                nntmux_tv_api_pipe_format(1, 0, 0, b"tvdb".as_ptr(), 4, buf.as_mut_ptr(), 64)
+            };
+            assert_eq!(&buf[..r as usize], b"show has no tvdb id");
+        }
+
+        #[test]
+        fn tvmaze_igdb_steam_price_and_metadata_sources() {
+            let mut buf = [0u8; 256];
+            let akas = br#"a:3:{i:0;a:1:{s:4:"name";s:15:"Haus des Geldes";}i:1;a:1:{s:4:"name";s:0:"";}i:2;a:1:{s:4:"name";s:16:"La Casa de Papel";}}"#;
+            let n = unsafe {
+                nntmux_tvmaze_extract_aka_names(
+                    akas.as_ptr(),
+                    akas.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(&buf[..n as usize], b"Haus des Geldes\0La Casa de Papel");
+
+            let d = unsafe {
+                nntmux_tvmaze_normalize_airdate(
+                    b" 2024/3/5 ".as_ptr(),
+                    10,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(&buf[..d as usize], b"2024-03-05");
+            assert_eq!(
+                unsafe {
+                    nntmux_tvmaze_normalize_airdate(
+                        b"2024-02-30".as_ptr(),
+                        10,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                -1
+            );
+
+            let fields = b"created_at\0first_release_date";
+            assert_eq!(
+                unsafe {
+                    nntmux_igdb_datanode_is_date_field_nul(
+                        b"first_release_date".as_ptr(),
+                        18,
+                        fields.as_ptr(),
+                        fields.len(),
+                        2,
+                    )
+                },
+                1
+            );
+            let mut ts = 0i64;
+            assert_eq!(
+                unsafe {
+                    nntmux_igdb_datanode_resolve_timestamp_nul(
+                        b"created_at".as_ptr(),
+                        10,
+                        fields.as_ptr(),
+                        fields.len(),
+                        2,
+                        3,
+                        0,
+                        b"1700000000".as_ptr(),
+                        10,
+                        &mut ts,
+                    )
+                },
+                1
+            );
+            assert_eq!(ts, 1_700_000_000);
+
+            let mut sav = 0.0f64;
+            assert_eq!(
+                unsafe { nntmux_steam_price_get_savings(59.99, 29.99, &mut sav) },
+                1
+            );
+            assert!((sav - 30.0).abs() < 1e-9);
+
+            let disp = unsafe {
+                nntmux_steam_price_display(
+                    b"USD".as_ptr(),
+                    3,
+                    29.99,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(&buf[..disp as usize], b"USD 29.99");
+
+            let miss = unsafe {
+                nntmux_metadata_sources_missing_key(
+                    b"  ".as_ptr(),
+                    2,
+                    b"TMDB_APIKEY".as_ptr(),
+                    11,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(&buf[..miss as usize], b"no API key (TMDB_APIKEY)");
+
+            let dis = unsafe {
+                nntmux_metadata_sources_disabled(
+                    b"false".as_ptr(),
+                    5,
+                    b"IMDB_SCRAPER_ENABLED".as_ptr(),
+                    20,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(&buf[..dis as usize], b"disabled by IMDB_SCRAPER_ENABLED");
+        }
+    }
+}
+

@@ -13,9 +13,12 @@ use App\Services\TvProcessing\Pipes\TmdbPipe;
 use App\Services\TvProcessing\Pipes\TraktPipe;
 use App\Services\TvProcessing\Pipes\TvdbPipe;
 use App\Services\TvProcessing\Pipes\TvMazePipe;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Pipeline\Pipeline;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Log;
+use Throwable;
 
 /**
  * Matches TV releases to shows and episodes by passing each one through the
@@ -24,6 +27,39 @@ use Illuminate\Support\Facades\Log;
  */
 class TvProcessingPipeline
 {
+    public const string FFI_CDEF = <<<'C'
+        int32_t nntmux_tv_pipeline_classify_status(const char *status, size_t len);
+        ssize_t nntmux_tv_pipeline_format_summary_header(int64_t processed, int64_t matched, int64_t episode_missing, int64_t not_found, int64_t deferred, double duration, char *out, size_t cap);
+        ssize_t nntmux_tv_pipeline_format_provider_summary(const char *ser, size_t ser_len, char *out, size_t cap);
+        C;
+
+    /** Null selects the benchmark-qualified production default (PHP; see RustTvPipelineAndIgdbDataNodeParityTest). */
+    private static ?bool $useRustFfi = null;
+
+    private static FFI|false|null $ffi = null;
+
+    public static function setUseRustFfi(?bool $use = true): void
+    {
+        self::$useRustFfi = $use;
+        if ($use === null) {
+            self::$ffi = null;
+        }
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? false;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('metadata', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
+
     /**
      * @var Collection<int, AbstractTvProviderPipe>
      */
@@ -99,7 +135,7 @@ class TvProcessingPipeline
                 ->send($passable)
                 ->through($this->pipes->all())
                 ->thenReturn();
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             // One broken release must not abort the batch; the attempt cap stops it looping forever.
             Log::error('TV processing failed for release', [
                 'release_id' => $context->releaseId,
@@ -235,26 +271,53 @@ class TvProcessingPipeline
     {
         $this->stats['processed']++;
 
-        switch ($result['status'] ?? '') {
-            case TvProcessingResult::STATUS_MATCHED:
-            case TvProcessingResult::STATUS_SEASON_PACK:
-                $this->stats['matched']++;
-                $provider = (string) ($result['provider'] ?? 'unknown');
-                $this->stats['providers'][$provider] = ($this->stats['providers'][$provider] ?? 0) + 1;
-                break;
+        $rawStatus = $result['status'] ?? '';
+        $status = \is_string($rawStatus) ? $rawStatus : (string) $rawStatus;
+        $bucket = self::classifyResultStatus($status);
+        $this->stats[$bucket]++;
 
-            case TvProcessingResult::STATUS_EPISODE_MISSING:
-                $this->stats['episode_missing']++;
-                break;
-
-            case TvProcessingResult::STATUS_TRANSIENT:
-                $this->stats['deferred']++;
-                break;
-
-            default:
-                $this->stats['not_found']++;
-                break;
+        if ($bucket === 'matched') {
+            $provider = (string) ($result['provider'] ?? 'unknown');
+            $this->stats['providers'][$provider] = ($this->stats['providers'][$provider] ?? 0) + 1;
         }
+    }
+
+    public static function classifyResultStatus(string $status): string
+    {
+        return self::usesRustFfi()
+            ? self::classifyResultStatusNative($status)
+            : self::classifyResultStatusPhp($status);
+    }
+
+    public static function classifyResultStatusNative(string $status): string
+    {
+        if (($ffi = self::ffi()) === null) {
+            return self::classifyResultStatusPhp($status);
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $code = $ffi->nntmux_tv_pipeline_classify_status($status, \strlen($status));
+        } catch (Throwable) {
+            return self::classifyResultStatusPhp($status);
+        }
+
+        return match ($code) {
+            0 => 'matched',
+            1 => 'episode_missing',
+            2 => 'deferred',
+            3 => 'not_found',
+            default => self::classifyResultStatusPhp($status),
+        };
+    }
+
+    public static function classifyResultStatusPhp(string $status): string
+    {
+        return match ($status) {
+            TvProcessingResult::STATUS_MATCHED, TvProcessingResult::STATUS_SEASON_PACK => 'matched',
+            TvProcessingResult::STATUS_EPISODE_MISSING => 'episode_missing',
+            TvProcessingResult::STATUS_TRANSIENT => 'deferred',
+            default => 'not_found',
+        };
     }
 
     protected function displaySummary(): void
@@ -263,23 +326,163 @@ class TvProcessingPipeline
             return;
         }
 
-        cli()->header(sprintf(
-            'TV processing complete: %d processed, %d matched, %d episode missing, %d not found, %d deferred (%.2fs)',
-            $this->stats['processed'],
-            $this->stats['matched'],
-            $this->stats['episode_missing'],
-            $this->stats['not_found'],
-            $this->stats['deferred'],
-            $this->stats['duration']
-        ));
+        cli()->header(self::formatSummaryHeader($this->stats));
 
-        if (! empty($this->stats['providers'])) {
-            $providerSummary = [];
-            foreach ($this->stats['providers'] as $provider => $count) {
-                $providerSummary[] = "$provider: $count";
-            }
-            cli()->primary('Matches by provider: '.implode(', ', $providerSummary));
+        $providerSummary = self::formatProviderSummary($this->stats['providers']);
+        if ($providerSummary !== null) {
+            cli()->primary($providerSummary);
         }
+    }
+
+    /**
+     * @param  array{processed: int, matched: int, episode_missing: int, not_found: int, deferred: int, duration: float, providers?: array<string, int>}  $stats
+     */
+    public static function formatSummaryHeader(array $stats): string
+    {
+        return self::usesRustFfi()
+            ? self::formatSummaryHeaderNative($stats)
+            : self::formatSummaryHeaderPhp($stats);
+    }
+
+    /**
+     * @param  array{processed: int, matched: int, episode_missing: int, not_found: int, deferred: int, duration: float, providers?: array<string, int>}  $stats
+     */
+    public static function formatSummaryHeaderNative(array $stats): string
+    {
+        if (($ffi = self::ffi()) === null) {
+            return self::formatSummaryHeaderPhp($stats);
+        }
+        $duration = (float) $stats['duration'];
+        if (! is_finite($duration) || abs($duration) > 1e12) {
+            return self::formatSummaryHeaderPhp($stats);
+        }
+        $capacity = 0;
+        $buffer = RustPipelineLibrary::obtainScratch($ffi, 256, $capacity);
+        if ($buffer === null) {
+            return self::formatSummaryHeaderPhp($stats);
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_tv_pipeline_format_summary_header(
+                (int) $stats['processed'],
+                (int) $stats['matched'],
+                (int) $stats['episode_missing'],
+                (int) $stats['not_found'],
+                (int) $stats['deferred'],
+                $duration,
+                $buffer,
+                $capacity,
+            );
+            if (\is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return self::formatSummaryHeaderPhp($stats);
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_tv_pipeline_format_summary_header(
+                    (int) $stats['processed'],
+                    (int) $stats['matched'],
+                    (int) $stats['episode_missing'],
+                    (int) $stats['not_found'],
+                    (int) $stats['deferred'],
+                    $duration,
+                    $buffer,
+                    $capacity,
+                );
+            }
+            if (! \is_int($written) || $written <= 0 || $written > $capacity) {
+                return self::formatSummaryHeaderPhp($stats);
+            }
+
+            return FFI::string($buffer, $written);
+        } catch (Throwable) {
+            return self::formatSummaryHeaderPhp($stats);
+        }
+    }
+
+    /**
+     * @param  array{processed: int, matched: int, episode_missing: int, not_found: int, deferred: int, duration: float, providers?: array<string, int>}  $stats
+     */
+    public static function formatSummaryHeaderPhp(array $stats): string
+    {
+        return sprintf(
+            'TV processing complete: %d processed, %d matched, %d episode missing, %d not found, %d deferred (%.2fs)',
+            $stats['processed'],
+            $stats['matched'],
+            $stats['episode_missing'],
+            $stats['not_found'],
+            $stats['deferred'],
+            $stats['duration']
+        );
+    }
+
+    /**
+     * @param  array<string, int>  $providers
+     */
+    public static function formatProviderSummary(array $providers): ?string
+    {
+        return self::usesRustFfi()
+            ? self::formatProviderSummaryNative($providers)
+            : self::formatProviderSummaryPhp($providers);
+    }
+
+    /**
+     * @param  array<string, int>  $providers
+     */
+    public static function formatProviderSummaryNative(array $providers): ?string
+    {
+        if ($providers === []) {
+            return null;
+        }
+        if (($ffi = self::ffi()) === null) {
+            return self::formatProviderSummaryPhp($providers);
+        }
+        try {
+            $ser = serialize($providers);
+            $len = \strlen($ser);
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, max(256, $len + 64), $capacity);
+            if ($buffer === null) {
+                return self::formatProviderSummaryPhp($providers);
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_tv_pipeline_format_provider_summary($ser, $len, $buffer, $capacity);
+            if (\is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return self::formatProviderSummaryPhp($providers);
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_tv_pipeline_format_provider_summary($ser, $len, $buffer, $capacity);
+            }
+            if ($written === 0) {
+                return null;
+            }
+            if (! \is_int($written) || $written < 0 || $written > $capacity) {
+                return self::formatProviderSummaryPhp($providers);
+            }
+
+            return FFI::string($buffer, $written);
+        } catch (Throwable) {
+            return self::formatProviderSummaryPhp($providers);
+        }
+    }
+
+    /**
+     * @param  array<string, int>  $providers
+     */
+    public static function formatProviderSummaryPhp(array $providers): ?string
+    {
+        if (empty($providers)) {
+            return null;
+        }
+
+        $providerSummary = [];
+        foreach ($providers as $provider => $count) {
+            $providerSummary[] = "$provider: $count";
+        }
+
+        return 'Matches by provider: '.implode(', ', $providerSummary);
     }
 
     /**

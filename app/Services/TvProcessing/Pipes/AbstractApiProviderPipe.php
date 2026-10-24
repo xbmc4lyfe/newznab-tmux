@@ -10,7 +10,10 @@ use App\Services\TvProcessing\Providers\AbstractTvProvider;
 use App\Services\TvProcessing\TvPosterResolver;
 use App\Services\TvProcessing\TvProcessingPassable;
 use App\Services\TvProcessing\TvProcessingResult;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Facades\Log;
+use Throwable;
 
 /**
  * Shared flow for the pipes backed by an external API (TVDB, TVMaze, TMDB, Trakt).
@@ -25,6 +28,37 @@ use Illuminate\Support\Facades\Log;
  */
 abstract class AbstractApiProviderPipe extends AbstractTvProviderPipe
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_tv_api_pipe_format(int32_t kind, int64_t season, int64_t episode, const char *col, size_t col_len, char *out, size_t cap);
+        C;
+
+    /** Null selects the benchmark-qualified production default (PHP; see RustTvPipelineAndIgdbDataNodeParityTest). */
+    private static ?bool $useRustFfi = null;
+
+    private static FFI|false|null $ffi = null;
+
+    public static function setUseRustFfi(?bool $use = true): void
+    {
+        self::$useRustFfi = $use;
+        if ($use === null) {
+            self::$ffi = null;
+        }
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? false;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('metadata', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
+
     public function __construct(
         private ?AbstractTvProvider $provider = null,
         private readonly ?TvPosterResolver $posterResolver = null,
@@ -132,7 +166,7 @@ abstract class AbstractApiProviderPipe extends AbstractTvProviderPipe
 
         $siteId = (int) $provider->getSiteIDFromVideoID($this->siteColumn(), $videoId);
         if ($siteId <= 0) {
-            return TvProcessingResult::skipped('show has no '.$this->siteColumn().' id', $name);
+            return TvProcessingResult::skipped(self::formatMissingSiteIdReason($this->siteColumn()), $name);
         }
 
         $episodeId = $this->resolveEpisode($passable, $parsed, $provider, $siteId, $videoId);
@@ -168,7 +202,7 @@ abstract class AbstractApiProviderPipe extends AbstractTvProviderPipe
         }
 
         if ($parsed->hasEpisodeNumbers()
-            && $passable->runState->firstEpisodeLookup($this->getName(), $videoId, $parsed->season.'x'.$parsed->episode)) {
+            && $passable->runState->firstEpisodeLookup($this->getName(), $videoId, self::formatSeasonEpisodeKey((int) $parsed->season, (int) $parsed->episode))) {
             $episode = $provider->fetchEpisode($siteId, (int) $parsed->season, (int) $parsed->episode, $videoId);
             if (\is_array($episode)) {
                 $episodeId = (int) $provider->addEpisode($videoId, $episode);
@@ -193,6 +227,74 @@ abstract class AbstractApiProviderPipe extends AbstractTvProviderPipe
         }
 
         return 0;
+    }
+
+    public static function formatSeasonEpisodeKey(int $season, int $episode): string
+    {
+        return self::usesRustFfi()
+            ? self::formatSeasonEpisodeKeyNative($season, $episode)
+            : self::formatSeasonEpisodeKeyPhp($season, $episode);
+    }
+
+    public static function formatSeasonEpisodeKeyNative(int $season, int $episode): string
+    {
+        return self::callFormatNative(0, $season, $episode, '')
+            ?? self::formatSeasonEpisodeKeyPhp($season, $episode);
+    }
+
+    public static function formatSeasonEpisodeKeyPhp(int $season, int $episode): string
+    {
+        return $season.'x'.$episode;
+    }
+
+    public static function formatMissingSiteIdReason(string $siteColumn): string
+    {
+        return self::usesRustFfi()
+            ? self::formatMissingSiteIdReasonNative($siteColumn)
+            : self::formatMissingSiteIdReasonPhp($siteColumn);
+    }
+
+    public static function formatMissingSiteIdReasonNative(string $siteColumn): string
+    {
+        return self::callFormatNative(1, 0, 0, $siteColumn)
+            ?? self::formatMissingSiteIdReasonPhp($siteColumn);
+    }
+
+    public static function formatMissingSiteIdReasonPhp(string $siteColumn): string
+    {
+        return 'show has no '.$siteColumn.' id';
+    }
+
+    private static function callFormatNative(int $kind, int $season, int $episode, string $siteColumn): ?string
+    {
+        if (($ffi = self::ffi()) === null) {
+            return null;
+        }
+        $colLen = \strlen($siteColumn);
+        $capacity = 0;
+        $buffer = RustPipelineLibrary::obtainScratch($ffi, max(64, $colLen + 32), $capacity);
+        if ($buffer === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_tv_api_pipe_format($kind, $season, $episode, $siteColumn, $colLen, $buffer, $capacity);
+            if (\is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_tv_api_pipe_format($kind, $season, $episode, $siteColumn, $colLen, $buffer, $capacity);
+            }
+            if (! \is_int($written) || $written <= 0 || $written > $capacity) {
+                return null;
+            }
+
+            return FFI::string($buffer, $written);
+        } catch (Throwable) {
+            return null;
+        }
     }
 
     private function findLocalEpisode(AbstractTvProvider $provider, int $videoId, ParsedTvRelease $parsed): int
@@ -229,7 +331,7 @@ abstract class AbstractApiProviderPipe extends AbstractTvProviderPipe
             if ($url !== '') {
                 $provider->savePoster($videoId, $url);
             }
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             Log::info('TV poster download failed', ['video_id' => $videoId, 'error' => $e->getMessage()]);
         }
     }
