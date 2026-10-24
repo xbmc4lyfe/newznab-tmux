@@ -48,7 +48,7 @@ concurrency:
 jobs:
   compare:
     name: ${{ startsWith(matrix.kind, 'fingerprint-') && 'Experimental comparison' || 'CPU snapshot comparison' }} ${{ matrix.kind }} (${{ matrix.runner }})
-    runs-on: ${{ matrix.runner }}
+    runs-on: [spot, '${{ matrix.runner }}']
     timeout-minutes: 360
     strategy:
       fail-fast: false

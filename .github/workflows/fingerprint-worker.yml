@@ -30,7 +30,7 @@ concurrency:
 
 jobs:
   standalone-worker:
-    runs-on: ubuntu-24.04
+    runs-on: [spot, ubuntu-latest]
     timeout-minutes: 25
     services:
       mariadb:
