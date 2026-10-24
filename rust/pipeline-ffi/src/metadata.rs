@@ -16883,3 +16883,995 @@ pub mod tv_pipeline_igdb_metadata {
     }
 }
 
+/// Wave 16 Worker 5: TvLookupOutcomeWriter, TvReleaseContext,
+/// BookProcessingCandidateQuery, SeriesReleaseService, and
+/// CollectionFileCheckStatus C-ABI helpers.
+///
+/// Every export validates raw pointers, input lengths, and output capacities
+/// before constructing slices, guards against integer overflow, and wraps its
+/// body in `std::panic::catch_unwind`, returning `-1` on panic or decline so
+/// the PHP caller falls back to its pure-PHP implementation.
+pub mod tv_book_series_lookup {
+    use super::{OutCursor, PhpKey, PhpNode, PhpSerParser, PhpVal};
+    use std::collections::BTreeMap;
+    use std::mem::size_of;
+    use std::panic::{UnwindSafe, catch_unwind};
+    use std::slice;
+
+    const DECLINE: isize = -1;
+    const DECLINE_I32: i32 = -1;
+    const DECLINE_I64: i64 = -1;
+    const MAX_INPUT: usize = 4 << 20;
+
+    #[inline]
+    unsafe fn input<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null() || len > MAX_INPUT || len > isize::MAX as usize {
+            return None;
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn valid_out_cap(out: *mut u8, cap: usize) -> bool {
+        out.is_null() || cap <= isize::MAX as usize
+    }
+
+    #[inline]
+    fn guard<F: FnOnce() -> isize + UnwindSafe>(f: F) -> isize {
+        catch_unwind(f).unwrap_or(DECLINE)
+    }
+
+    #[inline]
+    fn guard_i32<F: FnOnce() -> i32 + UnwindSafe>(f: F) -> i32 {
+        catch_unwind(f).unwrap_or(DECLINE_I32)
+    }
+
+    #[inline]
+    fn guard_i64<F: FnOnce() -> i64 + UnwindSafe>(f: F) -> i64 {
+        catch_unwind(f).unwrap_or(DECLINE_I64)
+    }
+
+    #[inline]
+    fn parse_simple_int_bytes(bytes: &[u8]) -> Option<i64> {
+        if bytes.is_empty() {
+            return Some(0);
+        }
+        let mut start = 0;
+        let mut end = bytes.len();
+        while start < end && bytes[start].is_ascii_whitespace() {
+            start += 1;
+        }
+        while end > start && bytes[end - 1].is_ascii_whitespace() {
+            end -= 1;
+        }
+        let trimmed = &bytes[start..end];
+        if trimmed.is_empty() {
+            return None;
+        }
+        let (neg, digits) = match trimmed.first()? {
+            b'+' => (false, &trimmed[1..]),
+            b'-' => (true, &trimmed[1..]),
+            _ => (false, trimmed),
+        };
+        if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let nz = digits
+            .iter()
+            .position(|&b| b != b'0')
+            .unwrap_or(digits.len());
+        let sig = &digits[nz..];
+        if sig.is_empty() {
+            return Some(0);
+        }
+        if sig.len() > 18 {
+            return None;
+        }
+        let mut val: i64 = 0;
+        for &b in sig {
+            val = val.checked_mul(10)?.checked_add(i64::from(b - b'0'))?;
+        }
+        Some(if neg { -val } else { val })
+    }
+
+    #[inline]
+    fn node_to_int(node: Option<&PhpNode<'_>>) -> Option<i64> {
+        let Some(n) = node else {
+            return Some(0);
+        };
+        match n.val {
+            PhpVal::Null => Some(0),
+            PhpVal::Int(i) => Some(i),
+            PhpVal::Bool(b) => Some(i64::from(b)),
+            PhpVal::Str(s) => parse_simple_int_bytes(s),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn key_to_int(key: &PhpKey<'_>) -> Option<i64> {
+        match key {
+            PhpKey::Int(i) => Some(*i),
+            PhpKey::Str(s) => parse_simple_int_bytes(s),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 1. TvLookupOutcomeWriter helpers
+    // -------------------------------------------------------------------------
+
+    const TV_LOOKUP_PENDING: i64 = 0;
+    const TV_LOOKUP_SHOW_NOT_FOUND: i64 = -10;
+    const TV_LOOKUP_EPISODE_MISSING: i64 = -11;
+    const TV_LOOKUP_SEASON_PACK: i64 = -12;
+    const TV_LOOKUP_PARSE_FAILED: i64 = -100;
+
+    const TV_MAX_TRANSIENT_ATTEMPTS: i64 = 8;
+    const TV_MAX_EPISODE_ATTEMPTS: i64 = 6;
+    const TV_KNOWN_SHOW_TRANSIENT_DELAY: i64 = 900;
+
+    #[inline]
+    fn tv_transient_delay(attempts: i64, provider_retry_after: i64) -> i64 {
+        let base = match attempts {
+            1 => 300,
+            2 => 900,
+            3 => 3600,
+            _ => 21600,
+        };
+        provider_retry_after.max(base)
+    }
+
+    #[inline]
+    fn tv_episode_delay(attempts: i64) -> i64 {
+        match attempts {
+            1 => 3600,
+            2 => 21600,
+            3 => 86400,
+            4 => 259_200,
+            _ => 604_800,
+        }
+    }
+
+    #[inline]
+    fn tv_has_link_changed(
+        prev_video_id: i64,
+        prev_episode_id: i64,
+        new_video_id: i64,
+        new_episode_id: i64,
+    ) -> bool {
+        new_video_id != prev_video_id
+            || (new_episode_id != prev_episode_id && new_episode_id.max(prev_episode_id) > 0)
+    }
+
+    /// Mirrors `TvLookupOutcomeWriter` link-change check:
+    /// `$columns['videos_id'] !== (int) $release->videos_id || ($columns['tv_episodes_id'] !== (int) $release->tv_episodes_id && max(...) > 0)`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn nntmux_tv_outcome_has_link_changed(
+        prev_video_id: i64,
+        prev_episode_id: i64,
+        new_video_id: i64,
+        new_episode_id: i64,
+    ) -> i32 {
+        guard_i32(|| {
+            i32::from(tv_has_link_changed(
+                prev_video_id,
+                prev_episode_id,
+                new_video_id,
+                new_episode_id,
+            ))
+        })
+    }
+
+    /// Mirrors `TvLookupOutcomeWriter` cache-bump check:
+    /// `$linked && in_array($result->status, ['matched', 'season_pack'], true)`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tv_outcome_should_bump_cache(
+        linked: u32,
+        status_ptr: *const u8,
+        status_len: usize,
+    ) -> i32 {
+        guard_i32(|| {
+            let Some(status) = (unsafe { input(status_ptr, status_len) }) else {
+                return DECLINE_I32;
+            };
+            i32::from(linked != 0 && matches!(status, b"matched" | b"season_pack"))
+        })
+    }
+
+    /// Resolves `TvLookupOutcomeWriter::columnsFor` and link-change status.
+    /// Writes `*out_video_id`, `*out_episode_status`, `*out_attempts`,
+    /// `*out_retry_delay` (`-1` when `tv_lookup_retry_at` is `null`, else `>= 0` seconds),
+    /// and `*out_link_changed` (`1` or `0`). Returns `1` on success or `-1` on decline.
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tv_outcome_resolve(
+        prev_video_id: i64,
+        prev_episode_id: i64,
+        prev_attempts: i64,
+        status_ptr: *const u8,
+        status_len: usize,
+        video_id: i64,
+        episode_id: i64,
+        transient: u32,
+        retry_after: i64,
+        out_video_id: *mut i64,
+        out_episode_status: *mut i64,
+        out_attempts: *mut i64,
+        out_retry_delay: *mut i64,
+        out_link_changed: *mut i32,
+    ) -> i32 {
+        guard_i32(|| {
+            if out_video_id.is_null()
+                || out_episode_status.is_null()
+                || out_attempts.is_null()
+                || out_retry_delay.is_null()
+                || out_link_changed.is_null()
+            {
+                return DECLINE_I32;
+            }
+            let Some(status) = (unsafe { input(status_ptr, status_len) }) else {
+                return DECLINE_I32;
+            };
+
+            let (new_vid, new_ep, new_attempts, retry_delay): (i64, i64, i64, i64) = match status {
+                b"matched" => (video_id, episode_id, 0, -1),
+                b"season_pack" => (video_id, TV_LOOKUP_SEASON_PACK, 0, -1),
+                b"episode_missing" => {
+                    let attempts = if prev_episode_id == TV_LOOKUP_EPISODE_MISSING {
+                        let Some(next) = prev_attempts.checked_add(1) else {
+                            return DECLINE_I32;
+                        };
+                        next
+                    } else {
+                        1
+                    };
+                    let delay = if transient != 0 {
+                        retry_after.max(TV_KNOWN_SHOW_TRANSIENT_DELAY)
+                    } else if attempts < TV_MAX_EPISODE_ATTEMPTS {
+                        tv_episode_delay(attempts)
+                    } else {
+                        -1
+                    };
+                    (video_id, TV_LOOKUP_EPISODE_MISSING, attempts, delay)
+                }
+                b"transient" => {
+                    let attempts = if prev_episode_id == TV_LOOKUP_PENDING {
+                        let Some(next) = prev_attempts.checked_add(1) else {
+                            return DECLINE_I32;
+                        };
+                        next
+                    } else {
+                        1
+                    };
+                    if attempts >= TV_MAX_TRANSIENT_ATTEMPTS {
+                        (0, TV_LOOKUP_SHOW_NOT_FOUND, 0, -1)
+                    } else {
+                        (
+                            0,
+                            TV_LOOKUP_PENDING,
+                            attempts,
+                            tv_transient_delay(attempts, retry_after),
+                        )
+                    }
+                }
+                b"parse_failed" => (0, TV_LOOKUP_PARSE_FAILED, 0, -1),
+                _ => (0, TV_LOOKUP_SHOW_NOT_FOUND, 0, -1),
+            };
+
+            let link_changed = i32::from(tv_has_link_changed(
+                prev_video_id,
+                prev_episode_id,
+                new_vid,
+                new_ep,
+            ));
+
+            unsafe {
+                *out_video_id = new_vid;
+                *out_episode_status = new_ep;
+                *out_attempts = new_attempts;
+                *out_retry_delay = retry_delay;
+                *out_link_changed = link_changed;
+            }
+            1
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // 2. TvReleaseContext helpers
+    // -------------------------------------------------------------------------
+
+    /// Parses a PHP `serialize($data)` release array into `TvReleaseContext` fields.
+    /// Emits `<searchname>\0<guid>\0<leftguid>` into `out_buf` (always `>= 2` bytes on success)
+    /// and writes scalar fields and `*out_flags` (bit 0 = `has_guid`, bit 1 = `has_left_guid`).
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tv_release_context_from_serialized(
+        ser_ptr: *const u8,
+        ser_len: usize,
+        out_release_id: *mut i64,
+        out_groups_id: *mut i64,
+        out_categories_id: *mut i64,
+        out_videos_id: *mut i64,
+        out_tv_episodes_id: *mut i64,
+        out_flags: *mut i32,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        guard(|| {
+            if out_release_id.is_null()
+                || out_groups_id.is_null()
+                || out_categories_id.is_null()
+                || out_videos_id.is_null()
+                || out_tv_episodes_id.is_null()
+                || out_flags.is_null()
+                || !valid_out_cap(out_buf, out_cap)
+            {
+                return DECLINE;
+            }
+            let Some(ser_bytes) = (unsafe { input(ser_ptr, ser_len) }) else {
+                return DECLINE;
+            };
+            let Some(doc) = PhpSerParser::parse_document(ser_bytes) else {
+                return DECLINE;
+            };
+            if !doc.is_arr() {
+                return DECLINE;
+            }
+
+            let Some(release_id) = node_to_int(doc.get(b"id")) else {
+                return DECLINE;
+            };
+            let Some(groups_id) = node_to_int(doc.get(b"groups_id")) else {
+                return DECLINE;
+            };
+            let Some(categories_id) = node_to_int(doc.get(b"categories_id")) else {
+                return DECLINE;
+            };
+            let Some(videos_id) = node_to_int(doc.get(b"videos_id")) else {
+                return DECLINE;
+            };
+            let Some(tv_episodes_id) = node_to_int(doc.get(b"tv_episodes_id")) else {
+                return DECLINE;
+            };
+
+            let search_name: &[u8] = match doc.coalesce(b"searchname") {
+                None => b"",
+                Some(PhpNode {
+                    val: PhpVal::Str(s),
+                    ..
+                }) if !s.contains(&0) => s,
+                _ => return DECLINE,
+            };
+            let (has_guid, guid_bytes): (i32, &[u8]) = match doc.coalesce(b"guid") {
+                None => (0, b""),
+                Some(PhpNode {
+                    val: PhpVal::Str(s),
+                    ..
+                }) if !s.contains(&0) => (1, s),
+                _ => return DECLINE,
+            };
+            let (has_left_guid, left_guid_bytes): (i32, &[u8]) = match doc.coalesce(b"leftguid") {
+                None => (0, b""),
+                Some(PhpNode {
+                    val: PhpVal::Str(s),
+                    ..
+                }) if !s.contains(&0) => (2, s),
+                _ => return DECLINE,
+            };
+
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.extend(search_name);
+            cursor.push(0);
+            cursor.extend(guid_bytes);
+            cursor.push(0);
+            cursor.extend(left_guid_bytes);
+            let written = cursor.finish();
+            if written >= 2 {
+                unsafe {
+                    *out_release_id = release_id;
+                    *out_groups_id = groups_id;
+                    *out_categories_id = categories_id;
+                    *out_videos_id = videos_id;
+                    *out_tv_episodes_id = tv_episodes_id;
+                    *out_flags = has_guid | has_left_guid;
+                }
+            }
+            written
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // 3. BookProcessingCandidateQuery helpers
+    // -------------------------------------------------------------------------
+
+    const BOOK_CATEGORY_SQL: &[u8] = b"(categories_id BETWEEN 7000 AND 7999 OR categories_id = 3030)";
+    const BOOK_METADATA_MODE1_SQL: &[u8] = b"(bookinfo_id IS NULL AND book_lookup_attempts < 5 AND (book_lookup_retry_at IS NULL OR book_lookup_retry_at <= CURRENT_TIMESTAMP))";
+    const BOOK_METADATA_MODE2_SQL: &[u8] = b"(bookinfo_id IS NULL AND book_lookup_attempts < 5 AND (book_lookup_retry_at IS NULL OR book_lookup_retry_at <= CURRENT_TIMESTAMP) AND isrenamed = 1)";
+    const BOOK_NORM_MODE1_SQL: &[u8] = b"(book_name_normalized_at IS NULL AND (isrenamed = 0 OR searchname LIKE 'N:/NZB%' OR searchname LIKE 'N_NZB_%' OR name LIKE 'N:/NZB%' OR name LIKE 'N_NZB_%'))";
+    const BOOK_NORM_MODE2_SQL: &[u8] = b"(book_name_normalized_at IS NULL AND (searchname LIKE 'N:/NZB%' OR searchname LIKE 'N_NZB_%' OR name LIKE 'N:/NZB%' OR name LIKE 'N_NZB_%'))";
+    const BOOK_SETTLED_LATE_SQL: &[u8] = b"late_article_candidate_id IS NULL";
+    const BOOK_SETTLED_NONE_SQL: &[u8] = b"1 = 1";
+    const BOOK_DISABLED_SQL: &[u8] = b"0 = 1";
+
+    #[inline]
+    fn book_metadata_sql(lookup_mode: i64) -> &'static [u8] {
+        if lookup_mode <= 0 {
+            BOOK_DISABLED_SQL
+        } else if lookup_mode == 2 {
+            BOOK_METADATA_MODE2_SQL
+        } else {
+            BOOK_METADATA_MODE1_SQL
+        }
+    }
+
+    #[inline]
+    fn book_normalization_sql(lookup_mode: i64) -> &'static [u8] {
+        if lookup_mode <= 0 {
+            BOOK_DISABLED_SQL
+        } else if lookup_mode == 2 {
+            BOOK_NORM_MODE2_SQL
+        } else {
+            BOOK_NORM_MODE1_SQL
+        }
+    }
+
+    #[inline]
+    fn book_settled_sql(has_late_article_flag: u32) -> &'static [u8] {
+        if has_late_article_flag != 0 {
+            BOOK_SETTLED_LATE_SQL
+        } else {
+            BOOK_SETTLED_NONE_SQL
+        }
+    }
+
+    /// Mirrors `BookProcessingCandidateQuery::retryDelay(int $failures, int $providerRetryAfter): int`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn nntmux_book_candidate_retry_delay(
+        failures: i64,
+        provider_retry_after: i64,
+    ) -> i64 {
+        guard_i64(|| {
+            let base = match failures {
+                1 => 300,
+                2 => 900,
+                3 => 3600,
+                _ => 21600,
+            };
+            provider_retry_after.max(base)
+        })
+    }
+
+    /// Formats `BookProcessingCandidateQuery` SQL fragments:
+    /// `kind` 0 = `categoryCondition()`, 1 = `metadataCondition($lookupMode)`,
+    /// 2 = `normalizationCondition($lookupMode)`, 3 = `settledCondition()`,
+    /// 4 = `workCondition($lookupMode)`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_book_candidate_sql_condition(
+        kind: i32,
+        lookup_mode: i64,
+        has_late_article_flag: u32,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        guard(|| {
+            if !valid_out_cap(out, cap) {
+                return DECLINE;
+            }
+            let mut cursor = unsafe { OutCursor::new(out, cap) };
+            match kind {
+                0 => cursor.extend(BOOK_CATEGORY_SQL),
+                1 => cursor.extend(book_metadata_sql(lookup_mode)),
+                2 => cursor.extend(book_normalization_sql(lookup_mode)),
+                3 => cursor.extend(book_settled_sql(has_late_article_flag)),
+                4 => {
+                    cursor.extend(BOOK_CATEGORY_SQL);
+                    cursor.extend(b" AND ");
+                    cursor.extend(book_settled_sql(has_late_article_flag));
+                    cursor.extend(b" AND (");
+                    cursor.extend(book_metadata_sql(lookup_mode));
+                    cursor.extend(b" OR ");
+                    cursor.extend(book_normalization_sql(lookup_mode));
+                    cursor.push(b')');
+                }
+                _ => return DECLINE,
+            }
+            cursor.finish()
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // 4. SeriesReleaseService helpers
+    // -------------------------------------------------------------------------
+
+    /// Computes pagination bounds for `SeriesReleaseService::releasesForSeason`.
+    /// `out_fallback_mode`: `0` = empty, `1` = `slice(fallback_offset, fallback_limit)`,
+    /// `2` = `take(fallback_limit)`.
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_series_plan_season_window(
+        matched_count: i64,
+        fallback_count: i64,
+        offset: i64,
+        limit: i64,
+        out_matched_limit: *mut i64,
+        out_matched_offset: *mut i64,
+        out_fallback_mode: *mut i32,
+        out_fallback_offset: *mut i64,
+        out_fallback_limit: *mut i64,
+        out_total: *mut i64,
+    ) -> i32 {
+        guard_i32(|| {
+            if out_matched_limit.is_null()
+                || out_matched_offset.is_null()
+                || out_fallback_mode.is_null()
+                || out_fallback_offset.is_null()
+                || out_fallback_limit.is_null()
+                || out_total.is_null()
+            {
+                return DECLINE_I32;
+            }
+            let Some(total) = matched_count.checked_add(fallback_count) else {
+                return DECLINE_I32;
+            };
+
+            let mut matched_limit = limit;
+            let mut matched_offset = offset;
+            let mut fallback_mode = 0i32;
+            let mut fallback_offset = 0i64;
+            let mut fallback_limit = 0i64;
+
+            if limit > 0 {
+                if offset >= matched_count {
+                    let Some(fb_off) = offset.checked_sub(matched_count) else {
+                        return DECLINE_I32;
+                    };
+                    matched_limit = 0;
+                    matched_offset = 0;
+                    fallback_mode = 1;
+                    fallback_offset = fb_off;
+                    fallback_limit = limit;
+                } else {
+                    let Some(end) = offset.checked_add(limit) else {
+                        return DECLINE_I32;
+                    };
+                    if end > matched_count {
+                        let Some(m_lim) = matched_count.checked_sub(offset) else {
+                            return DECLINE_I32;
+                        };
+                        let Some(fb_lim) = limit.checked_sub(m_lim) else {
+                            return DECLINE_I32;
+                        };
+                        matched_limit = m_lim;
+                        fallback_mode = 2;
+                        fallback_limit = fb_lim;
+                    }
+                }
+            }
+
+            unsafe {
+                *out_matched_limit = matched_limit;
+                *out_matched_offset = matched_offset;
+                *out_fallback_mode = fallback_mode;
+                *out_fallback_offset = fallback_offset;
+                *out_fallback_limit = fallback_limit;
+                *out_total = total;
+            }
+            1
+        })
+    }
+
+    /// Merges matched and fallback season count maps (`serialize($matched)`, `serialize($fallback)`)
+    /// with integer key/value normalization and ascending `ksort` order.
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_series_merge_season_counts(
+        matched_ser_ptr: *const u8,
+        matched_ser_len: usize,
+        fallback_ser_ptr: *const u8,
+        fallback_ser_len: usize,
+        out_seasons: *mut i64,
+        out_counts: *mut i64,
+        cap_pairs: usize,
+    ) -> isize {
+        guard(|| {
+            let (Some(m_bytes), Some(f_bytes)) = (
+                unsafe { input(matched_ser_ptr, matched_ser_len) },
+                unsafe { input(fallback_ser_ptr, fallback_ser_len) },
+            ) else {
+                return DECLINE;
+            };
+            let (Some(m_doc), Some(f_doc)) = (
+                PhpSerParser::parse_document(m_bytes),
+                PhpSerParser::parse_document(f_bytes),
+            ) else {
+                return DECLINE;
+            };
+            let (PhpVal::Arr(m_items), PhpVal::Arr(f_items)) = (&m_doc.val, &f_doc.val) else {
+                return DECLINE;
+            };
+
+            let mut merged: BTreeMap<i64, i64> = BTreeMap::new();
+            for (k, v) in m_items {
+                let (Some(season), Some(count)) = (key_to_int(k), node_to_int(Some(v))) else {
+                    return DECLINE;
+                };
+                merged.insert(season, count);
+            }
+            for (k, v) in f_items {
+                let (Some(season), Some(count)) = (key_to_int(k), node_to_int(Some(v))) else {
+                    return DECLINE;
+                };
+                let prev = merged.get(&season).copied().unwrap_or(0);
+                let Some(sum) = prev.checked_add(count) else {
+                    return DECLINE;
+                };
+                merged.insert(season, sum);
+            }
+
+            let len = merged.len();
+            if len == 0 {
+                return 0;
+            }
+            let max_elems = (isize::MAX as usize) / size_of::<i64>();
+            if out_seasons.is_null()
+                || out_counts.is_null()
+                || cap_pairs < len
+                || len > max_elems
+                || cap_pairs > max_elems
+            {
+                return DECLINE;
+            }
+
+            let seasons_slice = unsafe { slice::from_raw_parts_mut(out_seasons, len) };
+            let counts_slice = unsafe { slice::from_raw_parts_mut(out_counts, len) };
+            for (idx, (season, count)) in merged.into_iter().enumerate() {
+                seasons_slice[idx] = season;
+                counts_slice[idx] = count;
+            }
+            len as isize
+        })
+    }
+
+    /// Mirrors `SeriesReleaseService::fallbackCandidates` filter:
+    /// `$series !== null && $series !== '' && !empty($episode)`.
+    /// `series_kind`: `0` = null, `1` = string (`series_len > 0`), `2` = other non-null value.
+    /// `episode_kind`: `0` = null/false/empty-array, `1` = int (`episode_int != 0`),
+    /// `2` = string (`episode_ptr[..episode_len]` non-empty and `!= "0"`), `3` = other truthy value.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_series_has_valid_fallback_episode(
+        series_kind: i32,
+        series_len: usize,
+        episode_kind: i32,
+        episode_int: i64,
+        episode_ptr: *const u8,
+        episode_len: usize,
+    ) -> i32 {
+        guard_i32(|| {
+            let series_ok = match series_kind {
+                0 => false,
+                1 => series_len > 0,
+                2 => true,
+                _ => return DECLINE_I32,
+            };
+            let ep_bytes = match episode_kind {
+                2 => {
+                    let Some(s) = (unsafe { input(episode_ptr, episode_len) }) else {
+                        return DECLINE_I32;
+                    };
+                    s
+                }
+                0 | 1 | 3 => &[],
+                _ => return DECLINE_I32,
+            };
+            if !series_ok {
+                return 0;
+            }
+            let episode_ok = match episode_kind {
+                0 => false,
+                1 => episode_int != 0,
+                2 => !ep_bytes.is_empty() && ep_bytes != b"0",
+                3 => true,
+                _ => return DECLINE_I32,
+            };
+            i32::from(episode_ok)
+        })
+    }
+
+    /// Normalizes a PHP `serialize($categories)` payload into `int64_t` category IDs
+    /// (`$categories === null ? [] : array_values(array_map('intval', $categories))`).
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_series_normalize_category_ids(
+        ser_ptr: *const u8,
+        ser_len: usize,
+        out_ids: *mut i64,
+        cap: usize,
+    ) -> isize {
+        guard(|| {
+            let Some(ser_bytes) = (unsafe { input(ser_ptr, ser_len) }) else {
+                return DECLINE;
+            };
+            let Some(doc) = PhpSerParser::parse_document(ser_bytes) else {
+                return DECLINE;
+            };
+            match &doc.val {
+                PhpVal::Null => 0,
+                PhpVal::Arr(items) => {
+                    let len = items.len();
+                    if len == 0 {
+                        return 0;
+                    }
+                    let max_elems = (isize::MAX as usize) / size_of::<i64>();
+                    if out_ids.is_null() || cap < len || len > max_elems || cap > max_elems {
+                        return DECLINE;
+                    }
+                    let out_slice = unsafe { slice::from_raw_parts_mut(out_ids, len) };
+                    for (idx, (_, item)) in items.iter().enumerate() {
+                        let Some(val) = node_to_int(Some(item)) else {
+                            return DECLINE;
+                        };
+                        out_slice[idx] = val;
+                    }
+                    len as isize
+                }
+                _ => DECLINE,
+            }
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // 5. CollectionFileCheckStatus helpers
+    // -------------------------------------------------------------------------
+
+    /// Mirrors `CollectionFileCheckStatus::description()`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_collection_file_check_description(
+        status: i64,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        guard(|| {
+            if !valid_out_cap(out, cap) {
+                return DECLINE;
+            }
+            let desc: &[u8] = match status {
+                0 => b"Newly discovered",
+                1 => b"Complete collection",
+                2 => b"Complete parts",
+                3 => b"Size calculated",
+                4 => b"Inserted as release",
+                5 => b"Marked for deletion",
+                15 => b"Temporarily complete",
+                16 => b"Zero-part collection",
+                _ => return DECLINE,
+            };
+            let mut cursor = unsafe { OutCursor::new(out, cap) };
+            cursor.extend(desc);
+            cursor.finish()
+        })
+    }
+
+    /// Classifies a `CollectionFileCheckStatus` backing integer into a bitmask:
+    /// bit 0 (`1`) = `isProcessingComplete()`, bit 1 (`2`) = in `readyForRelease()`,
+    /// bit 2 (`4`) = in `inProgress()`. Returns `-1` on unknown status.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn nntmux_collection_file_check_classify(status: i64) -> i32 {
+        guard_i32(|| match status {
+            0 | 1 | 2 | 15 | 16 => 4,
+            3 => 2,
+            4 | 5 => 1,
+            _ => DECLINE_I32,
+        })
+    }
+
+    /// Writes `CollectionFileCheckStatus::readyForRelease()` (`kind = 0`, 1 item) or
+    /// `CollectionFileCheckStatus::inProgress()` (`kind = 1`, 5 items) backing integers
+    /// into `out_values`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_collection_file_check_list_values(
+        kind: i32,
+        out_values: *mut i64,
+        cap: usize,
+    ) -> isize {
+        guard(|| {
+            let values: &[i64] = match kind {
+                0 => &[3],
+                1 => &[0, 1, 2, 15, 16],
+                _ => return DECLINE,
+            };
+            let max_elems = (isize::MAX as usize) / size_of::<i64>();
+            if out_values.is_null() || cap < values.len() || cap > max_elems {
+                return DECLINE;
+            }
+            let out_slice = unsafe { slice::from_raw_parts_mut(out_values, values.len()) };
+            out_slice.copy_from_slice(values);
+            values.len() as isize
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn tv_outcome_resolve_and_flags() {
+            assert_eq!(nntmux_tv_outcome_has_link_changed(0, 0, 10, 20), 1);
+            assert_eq!(nntmux_tv_outcome_has_link_changed(0, 0, 0, -10), 0);
+            assert_eq!(nntmux_tv_outcome_has_link_changed(10, 20, 10, -11), 1);
+
+            assert_eq!(
+                unsafe { nntmux_tv_outcome_should_bump_cache(1, b"matched".as_ptr(), 7) },
+                1
+            );
+            assert_eq!(
+                unsafe { nntmux_tv_outcome_should_bump_cache(1, b"season_pack".as_ptr(), 11) },
+                1
+            );
+            assert_eq!(
+                unsafe { nntmux_tv_outcome_should_bump_cache(0, b"matched".as_ptr(), 7) },
+                0
+            );
+            assert_eq!(
+                unsafe { nntmux_tv_outcome_should_bump_cache(1, b"not_found".as_ptr(), 9) },
+                0
+            );
+
+            let (mut vid, mut ep, mut att, mut delay, mut changed) = (0i64, 0i64, 0i64, 0i64, 0i32);
+            assert_eq!(
+                unsafe {
+                    nntmux_tv_outcome_resolve(
+                        0,
+                        -11,
+                        2,
+                        b"episode_missing".as_ptr(),
+                        15,
+                        55,
+                        0,
+                        0,
+                        0,
+                        &mut vid,
+                        &mut ep,
+                        &mut att,
+                        &mut delay,
+                        &mut changed,
+                    )
+                },
+                1
+            );
+            assert_eq!((vid, ep, att, delay, changed), (55, -11, 3, 86400, 1));
+
+            assert_eq!(
+                unsafe {
+                    nntmux_tv_outcome_resolve(
+                        0,
+                        0,
+                        7,
+                        b"transient".as_ptr(),
+                        9,
+                        0,
+                        0,
+                        1,
+                        120,
+                        &mut vid,
+                        &mut ep,
+                        &mut att,
+                        &mut delay,
+                        &mut changed,
+                    )
+                },
+                1
+            );
+            assert_eq!((vid, ep, att, delay, changed), (0, -10, 0, -1, 0));
+        }
+
+        #[test]
+        fn tv_release_context_from_serialized() {
+            let ser = br#"a:8:{s:2:"id";i:42;s:10:"searchname";s:14:"Severance.S01E01";s:9:"groups_id";i:3;s:13:"categories_id";i:5040;s:9:"videos_id";i:12;s:14:"tv_episodes_id";i:-11;s:4:"guid";s:8:"deadbeef";s:8:"leftguid";s:1:"d";}"#;
+            let (mut rid, mut gid, mut cid, mut vid, mut eid, mut flags) =
+                (0i64, 0i64, 0i64, 0i64, 0i64, 0i32);
+            let mut buf = [0u8; 128];
+            let ser_fixed = br#"a:8:{s:2:"id";i:42;s:10:"searchname";s:16:"Severance.S01E01";s:9:"groups_id";i:3;s:13:"categories_id";i:5040;s:9:"videos_id";i:12;s:14:"tv_episodes_id";i:-11;s:4:"guid";s:8:"deadbeef";s:8:"leftguid";s:1:"d";}"#;
+            let n = unsafe {
+                nntmux_tv_release_context_from_serialized(
+                    ser_fixed.as_ptr(),
+                    ser_fixed.len(),
+                    &mut rid,
+                    &mut gid,
+                    &mut cid,
+                    &mut vid,
+                    &mut eid,
+                    &mut flags,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            let _ = ser;
+            assert!(n > 0);
+            assert_eq!((rid, gid, cid, vid, eid, flags), (42, 3, 5040, 12, -11, 3));
+            assert_eq!(&buf[..n as usize], b"Severance.S01E01\0deadbeef\0d");
+        }
+
+        #[test]
+        fn book_candidate_sql_and_retry_delay() {
+            assert_eq!(nntmux_book_candidate_retry_delay(1, 0), 300);
+            assert_eq!(nntmux_book_candidate_retry_delay(2, 1200), 1200);
+            assert_eq!(nntmux_book_candidate_retry_delay(5, 0), 21600);
+
+            let mut buf = [0u8; 512];
+            let n = unsafe {
+                nntmux_book_candidate_sql_condition(0, 1, 0, buf.as_mut_ptr(), buf.len())
+            };
+            assert_eq!(
+                &buf[..n as usize],
+                b"(categories_id BETWEEN 7000 AND 7999 OR categories_id = 3030)"
+            );
+            let m0 = unsafe {
+                nntmux_book_candidate_sql_condition(1, 0, 0, buf.as_mut_ptr(), buf.len())
+            };
+            assert_eq!(&buf[..m0 as usize], b"0 = 1");
+        }
+
+        #[test]
+        fn series_release_and_collection_file_check() {
+            let (mut ml, mut mo, mut fm, mut fo, mut fl, mut tot) =
+                (0i64, 0i64, 0i32, 0i64, 0i64, 0i64);
+            assert_eq!(
+                unsafe {
+                    nntmux_series_plan_season_window(
+                        3, 5, 2, 4, &mut ml, &mut mo, &mut fm, &mut fo, &mut fl, &mut tot,
+                    )
+                },
+                1
+            );
+            assert_eq!((ml, mo, fm, fo, fl, tot), (1, 2, 2, 0, 3, 8));
+
+            let m_ser = br#"a:2:{i:2;i:4;i:1;i:3;}"#;
+            let f_ser = br#"a:2:{i:1;i:2;i:3;i:5;}"#;
+            let mut seasons = [0i64; 4];
+            let mut counts = [0i64; 4];
+            let pairs = unsafe {
+                nntmux_series_merge_season_counts(
+                    m_ser.as_ptr(),
+                    m_ser.len(),
+                    f_ser.as_ptr(),
+                    f_ser.len(),
+                    seasons.as_mut_ptr(),
+                    counts.as_mut_ptr(),
+                    4,
+                )
+            };
+            assert_eq!(pairs, 3);
+            assert_eq!(&seasons[..3], &[1, 2, 3]);
+            assert_eq!(&counts[..3], &[5, 4, 5]);
+
+            assert_eq!(
+                unsafe {
+                    nntmux_series_has_valid_fallback_episode(2, 0, 2, 0, b"E01".as_ptr(), 3)
+                },
+                1
+            );
+            assert_eq!(
+                unsafe { nntmux_series_has_valid_fallback_episode(1, 0, 1, 1, std::ptr::null(), 0) },
+                0
+            );
+
+            let mut buf = [0u8; 64];
+            let d =
+                unsafe { nntmux_collection_file_check_description(3, buf.as_mut_ptr(), buf.len()) };
+            assert_eq!(&buf[..d as usize], b"Size calculated");
+            assert_eq!(nntmux_collection_file_check_classify(4), 1);
+            assert_eq!(nntmux_collection_file_check_classify(3), 2);
+            assert_eq!(nntmux_collection_file_check_classify(15), 4);
+            assert_eq!(nntmux_collection_file_check_classify(99), -1);
+
+            let mut vals = [0i64; 5];
+            let cnt = unsafe { nntmux_collection_file_check_list_values(1, vals.as_mut_ptr(), 5) };
+            assert_eq!(cnt, 5);
+            assert_eq!(&vals, &[0, 1, 2, 15, 16]);
+        }
+    }
+}
+
+
