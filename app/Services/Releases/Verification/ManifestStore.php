@@ -20,6 +20,13 @@ use RuntimeException;
  */
 final class ManifestStore
 {
+    private static bool $useRustFfi = true;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
     private const string TABLE = 'release_verification_manifests';
 
     /** Import chunk bounds: names per transaction, and file bytes held in memory at once. */
@@ -168,7 +175,12 @@ final class ManifestStore
      * The bounded decode establishes the first member's output; check complete consumption
      * without accepting trailing bytes or extra gzip members.
      */
-    private function consumesExactly(string $body, string $json): bool
+    public function consumesExactly(string $body, string $json): bool
+    {
+        return $this->consumesExactlyPhp($body, $json);
+    }
+
+    public function consumesExactlyPhp(string $body, string $json): bool
     {
         $inflater = inflate_init(ZLIB_ENCODING_GZIP);
 
@@ -347,11 +359,16 @@ final class ManifestStore
         }
     }
 
-    private function validBody(string $name, string $body): bool
+    public function validBody(string $name, string $body): bool
+    {
+        return $this->validBodyPhp($name, $body);
+    }
+
+    public function validBodyPhp(string $name, string $body): bool
     {
         $json = @gzdecode($body);
 
-        return $json !== false && hash('sha256', $json).'.json.gz' === $name && $this->consumesExactly($body, $json);
+        return $json !== false && hash('sha256', $json).'.json.gz' === $name && $this->consumesExactlyPhp($body, $json);
     }
 
     /**
@@ -438,10 +455,60 @@ final class ManifestStore
         return is_string($body) ? $body : null;
     }
 
-    private function assertName(string $name): void
+    public function assertName(string $name): void
+    {
+        $this->assertNamePhp($name);
+    }
+
+    public function assertNamePhp(string $name): void
     {
         if (preg_match('/\A[0-9a-f]{64}\.json\.gz\z/', $name) !== 1) {
             throw new RuntimeException('Invalid manifest reference.');
         }
+    }
+
+    /** True on success, null when the candidate is unavailable; invalid names still throw. */
+    public function assertNameNative(string $name): ?bool
+    {
+        if (! self::$useRustFfi || ($ffi = PreparedManifest::nativeLibrary()) === null) {
+            return null;
+        }
+        // @phpstan-ignore method.notFound
+        $status = $ffi->nntmux_verification_manifest_name($name, strlen($name));
+        if ($status === 0) {
+            throw new RuntimeException('Invalid manifest reference.');
+        }
+
+        return $status === 1 ? true : null;
+    }
+
+    public function validBodyNative(string $name, string $body): ?bool
+    {
+        if (! self::$useRustFfi || ($ffi = PreparedManifest::nativeLibrary()) === null) {
+            return null;
+        }
+        $json = @gzdecode($body);
+        if ($json === false) {
+            return false;
+        }
+        // @phpstan-ignore method.notFound
+        $status = $ffi->nntmux_verification_manifest_body($name, strlen($name), $body, strlen($body), $json, strlen($json));
+
+        return $status < 0 ? null : ($status === 1 && ($this->consumesExactlyNative($body, $json) ?? $this->consumesExactlyPhp($body, $json)));
+    }
+
+    public function consumesExactlyNative(string $body, string $json): ?bool
+    {
+        if (! self::$useRustFfi || ($ffi = PreparedManifest::nativeLibrary()) === null) {
+            return null;
+        }
+        $inflater = inflate_init(ZLIB_ENCODING_GZIP);
+        if ($inflater === false || ($inflated = @inflate_add($inflater, $body, ZLIB_FINISH)) === false) {
+            return false;
+        }
+        // @phpstan-ignore method.notFound
+        $status = $ffi->nntmux_verification_manifest_consumes(strlen($body), $json, strlen($json), $inflated, strlen($inflated), inflate_get_read_len($inflater), inflate_get_status($inflater));
+
+        return $status >= 0 ? $status === 1 : null;
     }
 }

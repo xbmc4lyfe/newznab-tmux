@@ -10,6 +10,13 @@ use RuntimeException;
 
 final class CollectionReleasePolicy
 {
+    private static bool $useRustFfi = true;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
     private const VERIFIED_OVERSIZE = 'Verified payload exceeds the configured maximum size.';
 
     private const DECLARED_OVERSIZE = 'Declared collection size exceeds the configured maximum.';
@@ -56,7 +63,7 @@ final class CollectionReleasePolicy
         if (count($names) < $limits['min_files']) {
             return 'Verified inventory is below the configured minimum file count.';
         }
-        if (array_filter($names, static fn (string $name): bool => preg_match('/\.par2\z/i', $name) !== 1) === []) {
+        if (self::onlyPar2($names)) {
             return 'Verified inventory contains only PAR2 files without a proved source payload.';
         }
 
@@ -98,8 +105,7 @@ final class CollectionReleasePolicy
             $nonParityEmitted = [];
         }
         $subjects = array_map(static fn (array $file): string => (string) ($file['subject'] ?? ''), $nonParityEmitted);
-        $hasPayload = array_filter($subjects,
-            static fn (string $subject): bool => preg_match('/\.par2(?:["\'\s]|$)/i', $subject) !== 1) !== [];
+        $hasPayload = self::subjectsHavePayload($subjects);
         // An obfuscated, extensionless body name is not evidence of a source payload.
         $sampledNames = $nonParityEmitted === [] ? [] : array_filter($verifiedNames,
             static fn (string $name): bool => HeaderFilenameIdentity::provesPayload($name));
@@ -108,6 +114,58 @@ final class CollectionReleasePolicy
         }
 
         return null;
+    }
+
+    /** @param list<string> $names */
+    public static function onlyPar2(array $names): bool
+    {
+        return self::onlyPar2Php($names);
+    }
+
+    /** @param list<string> $names */
+    public static function onlyPar2Php(array $names): bool
+    {
+        return array_filter($names, static fn (string $name): bool => preg_match('/\.par2\z/i', $name) !== 1) === [];
+    }
+
+    /** @param list<string> $subjects */
+    public static function subjectsHavePayload(array $subjects): bool
+    {
+        return self::subjectsHavePayloadPhp($subjects);
+    }
+
+    /** @param list<string> $subjects */
+    public static function subjectsHavePayloadPhp(array $subjects): bool
+    {
+        return array_filter($subjects, static fn (string $subject): bool => preg_match('/\.par2(?:["\'\s]|$)/i', $subject) !== 1) !== [];
+    }
+
+    /** @param list<string> $names */
+    public static function onlyPar2Native(array $names): ?bool
+    {
+        return self::inspectNative($names, 0);
+    }
+
+    /** @param list<string> $subjects */
+    public static function subjectsHavePayloadNative(array $subjects): ?bool
+    {
+        return self::inspectNative($subjects, 1);
+    }
+
+    /** @param list<string> $values */
+    private static function inspectNative(array $values, int $mode): ?bool
+    {
+        if (! self::$useRustFfi || ($ffi = PreparedManifest::nativeLibrary()) === null) {
+            return null;
+        }
+        $packed = '';
+        foreach ($values as $value) {
+            $packed .= pack('V', strlen($value)).$value;
+        }
+        // @phpstan-ignore method.notFound
+        $status = $ffi->nntmux_verification_collection_inspect($packed, strlen($packed), $mode);
+
+        return $status >= 0 ? $status === 1 : null;
     }
 
     /** @return array{min_size:int,max_size:int,min_files:int} */
