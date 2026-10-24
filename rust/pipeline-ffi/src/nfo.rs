@@ -13298,3 +13298,454 @@ pub extern "C" fn nntmux_verification_diagnostic_projection(
         | (i32::from(exhausted != 0 && uninspected == 0) << 2)
         | (i32::from(error != 0) << 3)
 }
+
+// Wave 15: computations only. PHP retains filesystem fencing and DB session ownership.
+// Every exported body contains panic propagation and rejects invalid/overlapping ranges.
+// The wire protocol is bounded independently of the caller's address arithmetic.
+unsafe fn wave15_input<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+    if len > 64 * 1024 * 1024 {
+        return None;
+    }
+    unsafe { verification_input(ptr, len) }
+}
+
+fn wave15_sha1(bytes: &[u8]) -> [u8; 20] {
+    let mut h = [
+        0x67452301u32,
+        0xefcdab89,
+        0x98badcfe,
+        0x10325476,
+        0xc3d2e1f0,
+    ];
+    let mut data = bytes.to_vec();
+    data.push(0x80);
+    while data.len() % 64 != 56 {
+        data.push(0);
+    }
+    data.extend_from_slice(&(bytes.len() as u64).wrapping_mul(8).to_be_bytes());
+    for chunk in data.chunks_exact(64) {
+        let mut w = [0u32; 80];
+        for (i, part) in chunk.chunks_exact(4).enumerate() {
+            w[i] = u32::from_be_bytes(part.try_into().unwrap());
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e] = h;
+        for (i, word) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | (!b & d), 0x5a827999u32),
+                20..=39 => (b ^ c ^ d, 0x6ed9eba1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1bbcdc),
+                _ => (b ^ c ^ d, 0xca62c1d6),
+            };
+            let t = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(*word);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = t;
+        }
+        for (old, new) in h.iter_mut().zip([a, b, c, d, e]) {
+            *old = old.wrapping_add(new);
+        }
+    }
+    let mut result = [0u8; 20];
+    for (i, word) in h.iter().enumerate() {
+        result[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    result
+}
+
+fn wave15_digest_prefix(bytes: &[u8]) -> String {
+    wave15_sha1(bytes)[..6]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+unsafe fn wave15_output(
+    input_ranges: &[(usize, usize)],
+    bytes: &[u8],
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    if !(out.is_null() && cap == 0 || yenc_valid_range(out as usize, cap))
+        || input_ranges
+            .iter()
+            .any(|(p, n)| yenc_ranges_overlap(*p, *n, out as usize, cap))
+    {
+        return -1;
+    }
+    let mut cursor = unsafe { OutCursor::new(out, cap) };
+    cursor.extend(bytes);
+    cursor.finish()
+}
+
+/// # Safety
+/// Supplied input ranges must be readable and output writable, with no overlap.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_verification_lock_key(
+    scope: *const u8,
+    scope_len: usize,
+    name: *const u8,
+    name_len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        let Some(scope_bytes) = (unsafe { wave15_input(scope, scope_len) }) else {
+            return -1;
+        };
+        let Some(name_bytes) = (unsafe { wave15_input(name, name_len) }) else {
+            return -1;
+        };
+        if name_len > 47 {
+            return -1;
+        }
+        let mut result = format!("nnv:{}:", wave15_digest_prefix(scope_bytes)).into_bytes();
+        result.extend_from_slice(name_bytes);
+        unsafe {
+            wave15_output(
+                &[(scope as usize, scope_len), (name as usize, name_len)],
+                &result,
+                out,
+                cap,
+            )
+        }
+    })
+    .unwrap_or(-1)
+}
+
+/// # Safety
+/// Input must be readable for len bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_verification_members(group: *const u8, len: usize) -> i64 {
+    std::panic::catch_unwind(|| match unsafe { wave15_input(group, len) } {
+        Some(b"worker") => 512,
+        Some(b"reset") => 64,
+        _ => -1,
+    })
+    .unwrap_or(-1)
+}
+
+/// # Safety
+/// Input must be readable, output writable, with no overlap.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_verification_forwarder_lock_name(
+    host: *const u8,
+    len: usize,
+    number: i64,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        let Some(bytes) = (unsafe { wave15_input(host, len) }) else {
+            return -1;
+        };
+        let result = format!(
+            "publication-forwarder-{}-{number}",
+            wave15_digest_prefix(bytes)
+        );
+        unsafe { wave15_output(&[(host as usize, len)], result.as_bytes(), out, cap) }
+    })
+    .unwrap_or(-1)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_verification_slots(configured: i64) -> i64 {
+    std::panic::catch_unwind(|| configured.clamp(1, 64)).unwrap_or(-1)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_verification_first_slot(slots: i64, offset: i64) -> i64 {
+    std::panic::catch_unwind(|| offset.clamp(0, 256 - slots.clamp(1, 64)) + 1).unwrap_or(-1)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_verification_last_slot(first: i64, slots: i64) -> i64 {
+    std::panic::catch_unwind(|| {
+        first
+            .checked_add(slots)
+            .and_then(|v| v.checked_sub(1))
+            .unwrap_or(-1)
+    })
+    .unwrap_or(-1)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_verification_protects(
+    exclusive: i32,
+    global: i32,
+    candidate: i32,
+    held: i32,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        if [exclusive, global, candidate, held]
+            .iter()
+            .any(|v| ![0, 1].contains(v))
+        {
+            return -1;
+        }
+        i32::from(
+            held == 1
+                && if exclusive == 1 {
+                    global == 1
+                } else {
+                    candidate == 1
+                },
+        )
+    })
+    .unwrap_or(-1)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_nzb_claim_ttl(timeout: i64) -> i64 {
+    std::panic::catch_unwind(|| {
+        if timeout <= 150 {
+            300
+        } else {
+            timeout.checked_mul(2).unwrap_or(-1)
+        }
+    })
+    .unwrap_or(-1)
+}
+
+/// # Safety
+/// Input length-prefixed columns must be readable; output writable, without overlap.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nzb_selectable_columns(
+    input: *const u8,
+    len: usize,
+    supports: i32,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        let Some(bytes) = (unsafe { wave15_input(input, len) }) else {
+            return -1;
+        };
+        if ![0, 1].contains(&supports) {
+            return -1;
+        }
+        let mut offset = 0;
+        let mut columns = Vec::new();
+        while offset < len {
+            if len - offset < 4 {
+                return -1;
+            }
+            let size = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 4;
+            if size > len - offset {
+                return -1;
+            }
+            columns.push(&bytes[offset..offset + size]);
+            offset += size;
+        }
+        let all = supports == 1 || columns == [b"*".as_slice()];
+        let mut result = Vec::new();
+        for column in columns {
+            if all
+                || (column != b"nzb_creation_claimed_at" && column != b"nzb_creation_claim_token")
+            {
+                result.extend_from_slice(&(column.len() as u32).to_be_bytes());
+                result.extend_from_slice(column);
+            }
+        }
+        unsafe { wave15_output(&[(input as usize, len)], &result, out, cap) }
+    })
+    .unwrap_or(-1)
+}
+
+/// # Safety
+/// Input is readable native-endian i64 IDs; output writable, without overlap.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nzb_id_order(
+    input: *const u8,
+    len: usize,
+    sqlite: i32,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    use std::fmt::Write;
+    std::panic::catch_unwind(|| {
+        let Some(bytes) = (unsafe { wave15_input(input, len) }) else {
+            return -1;
+        };
+        if len % 8 != 0 || ![0, 1].contains(&sqlite) {
+            return -1;
+        }
+        let mut result = if sqlite == 1 {
+            "CASE id ".to_string()
+        } else {
+            "FIELD(id, ".to_string()
+        };
+        for (position, part) in bytes.chunks_exact(8).enumerate() {
+            let id = i64::from_ne_bytes(part.try_into().unwrap());
+            if position > 0 {
+                result.push(if sqlite == 1 { ' ' } else { ',' });
+            }
+            if sqlite == 1 {
+                let _ = write!(result, "WHEN {id} THEN {position}");
+            } else {
+                let _ = write!(result, "{id}");
+            }
+        }
+        if sqlite == 1 {
+            let _ = write!(result, " ELSE {} END", len / 8);
+        } else {
+            result.push(')');
+        }
+        unsafe { wave15_output(&[(input as usize, len)], result.as_bytes(), out, cap) }
+    })
+    .unwrap_or(-1)
+}
+
+/// # Safety
+/// Input must be readable for len bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_wave15_outbox_folder(
+    input: *const u8,
+    len: usize,
+    mode: u32,
+    except: i64,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        let Some(bytes) = (unsafe { wave15_input(input, len) }) else {
+            return -1;
+        };
+        match mode {
+            0 => i32::from(bytes != b"." && bytes != b".."),
+            1 => {
+                if bytes.is_empty()
+                    || !(b'1'..=b'9').contains(&bytes[0])
+                    || !bytes.iter().all(u8::is_ascii_digit)
+                {
+                    return 0;
+                }
+                let number = bytes.iter().fold(0i64, |n, b| {
+                    n.saturating_mul(10).saturating_add(i64::from(b - b'0'))
+                });
+                i32::from(number != except)
+            }
+            _ => -1,
+        }
+    })
+    .unwrap_or(-1)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_wave15_outbox_state(
+    enqueued: f64,
+    not_before: f64,
+    attempts: i64,
+    deferrals: i64,
+    now: f64,
+    max_age: f64,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        i32::from(not_before <= now)
+            | (i32::from(now - enqueued > max_age) << 1)
+            | (i32::from(attempts > 0 || deferrals > 0) << 2)
+    })
+    .unwrap_or(-1)
+}
+
+/// # Safety
+/// PHP serialized input must be readable; output writable, without overlap.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_wave15_outbox_normalize(
+    input: *const u8,
+    len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        let Some(bytes) = (unsafe { wave15_input(input, len) }) else {
+            return -1;
+        };
+        let Some(result) = verification_outbox_normalize(bytes) else {
+            return -1;
+        };
+        unsafe { wave15_output(&[(input as usize, len)], &result, out, cap) }
+    })
+    .unwrap_or(-1)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_wave15_metadata_budget(budget: i64) -> i64 {
+    std::panic::catch_unwind(|| budget.max(1)).unwrap_or(-1)
+}
+/// # Safety
+/// Both hash ranges must be readable for their lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_wave15_raised_budget(
+    stored: *const u8,
+    stored_len: usize,
+    current: *const u8,
+    current_len: usize,
+    old: i64,
+    budget: i64,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        let Some(left) = (unsafe { wave15_input(stored, stored_len) }) else {
+            return -1;
+        };
+        let Some(right) = (unsafe { wave15_input(current, current_len) }) else {
+            return -1;
+        };
+        i32::from(left == right && old < budget)
+    })
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod wave15_tests {
+    use super::*;
+    #[test]
+    fn sha1_and_scalar_boundaries() {
+        assert_eq!(wave15_digest_prefix(b""), "da39a3ee5e6b");
+        assert_eq!(wave15_digest_prefix(b"abc"), "a9993e364706");
+        assert_eq!(wave15_digest_prefix(&[b'a'; 1000]), "291e9a6c6699");
+        assert_eq!(nntmux_verification_slots(i64::MAX), 64);
+        assert_eq!(nntmux_verification_first_slot(64, i64::MAX), 193);
+        assert_eq!(nntmux_verification_last_slot(193, 64), 256);
+        assert_eq!(nntmux_nzb_claim_ttl(i64::MAX), -1);
+        assert_eq!(nntmux_wave15_outbox_state(0.0, 100.0, 0, 0, 30.0, 30.0), 0);
+    }
+    #[test]
+    fn rejects_bad_ranges_and_packed_lengths() {
+        unsafe {
+            assert_eq!(nntmux_wave15_outbox_folder(std::ptr::null(), 0, 0, 0), -1);
+            assert_eq!(
+                nntmux_wave15_outbox_folder(b"1".as_ptr(), usize::MAX, 1, 0),
+                -1
+            );
+            assert_eq!(
+                nntmux_nzb_id_order(b"x".as_ptr(), 1, 0, std::ptr::null_mut(), 0),
+                -1
+            );
+            assert_eq!(
+                nntmux_nzb_selectable_columns(
+                    b"\0\0\0\x08x".as_ptr(),
+                    5,
+                    0,
+                    std::ptr::null_mut(),
+                    0
+                ),
+                -1
+            );
+            let mut data = *b"worker";
+            assert_eq!(
+                nntmux_verification_lock_key(
+                    data.as_ptr(),
+                    6,
+                    b"x".as_ptr(),
+                    1,
+                    data.as_mut_ptr(),
+                    6
+                ),
+                -1
+            );
+        }
+    }
+}
