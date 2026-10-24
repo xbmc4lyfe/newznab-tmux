@@ -14852,3 +14852,557 @@ mod wave20_additional_config_domain_runtime_postprocess_tests {
         assert_eq!(aligned, [0i64; 8]);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 21: ForkingService, MediaInfo, MappingConfidence, ProcessingStage and
+// SourcePosition helpers.
+// ---------------------------------------------------------------------------
+
+/// `NfoService::NFO_UNPROC`.
+const W21_NFO_UNPROC: i64 = -1;
+
+/// Lowest retry marker `ForkingService` accepts.
+const W21_MIN_RETRIES: i64 = -8;
+
+/// `ForkingService::maxRetriesFor`: `-(retries + 1)` for a non-negative setting, else
+/// `NFO_UNPROC`, never below -8. Writes the marker to `out`; returns 0 or -1 for invalid input.
+///
+/// # Safety
+/// A non-null `out` must be aligned and writable for one value.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_fork_max_retries(max_nfo_retries: i64, out: *mut i64) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !w19pc_slice_ok(out.cast_const(), 1) {
+            return -1;
+        }
+        let marker = if max_nfo_retries >= 0 {
+            // PHP turns `-(PHP_INT_MAX + 1)` into a float that still clamps to -8.
+            max_nfo_retries
+                .checked_add(1)
+                .map_or(W21_MIN_RETRIES, |next| (-next).max(W21_MIN_RETRIES))
+        } else {
+            W21_NFO_UNPROC.max(W21_MIN_RETRIES)
+        };
+        // SAFETY: `out` is non-null, aligned and writable for one value.
+        unsafe { out.write(marker) };
+        0
+    }))
+    .unwrap_or(-1)
+}
+
+/// `ForkingService::WORK_TYPES` in declaration order.
+const W21_WORK_TYPES: [&[u8]; 18] = [
+    b"backfill",
+    b"binaries",
+    b"fixRelNames_standard",
+    b"fixRelNames_predbft",
+    b"releases",
+    b"postProcess_add",
+    b"postProcess_ani",
+    b"postProcess_ama",
+    b"postProcess_boo",
+    b"postProcess_con",
+    b"postProcess_gam",
+    b"postProcess_mov",
+    b"postProcess_mus",
+    b"postProcess_nfo",
+    b"postProcess_tv",
+    b"safe_backfill",
+    b"safe_binaries",
+    b"update_per_group",
+];
+
+/// `ForkingService::workTypeIndex`: the exact (case-sensitive) work type index, -2 for an
+/// unknown type, or -1 for invalid input.
+///
+/// # Safety
+/// A non-null `ptr` must be readable for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_fork_work_type(ptr: *const u8, len: usize) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: forwarded caller contract.
+        let Some(value) = (unsafe { w19pc_bytes(ptr, len) }) else {
+            return -1;
+        };
+        W21_WORK_TYPES
+            .iter()
+            .position(|work_type| *work_type == value)
+            .map_or(-2, |index| index as i32)
+    }))
+    .unwrap_or(-1)
+}
+
+/// `ForkingService::timingHeader` text.
+fn w21_timing_header(task: &[u8], elapsed: i64, date: &[u8]) -> Vec<u8> {
+    const PREFIX: &[u8] = b"Multi-processing for ";
+    const MIDDLE: &[u8] = b" finished in ";
+    const SUFFIX: &[u8] = b" seconds at ";
+    let elapsed = elapsed.to_string();
+    let mut text = Vec::with_capacity(
+        PREFIX.len() + task.len() + MIDDLE.len() + elapsed.len() + SUFFIX.len() + date.len() + 2,
+    );
+    text.extend_from_slice(PREFIX);
+    text.extend_from_slice(task);
+    text.extend_from_slice(MIDDLE);
+    text.extend_from_slice(elapsed.as_bytes());
+    text.extend_from_slice(SUFFIX);
+    text.extend_from_slice(date);
+    text.extend_from_slice(b".\n");
+    text
+}
+
+/// Write `Multi-processing for {task} finished in {elapsed} seconds at {date}.\n` to `out`;
+/// returns the length, `-(needed)` when `cap` is too small (nothing is written), or -1 for
+/// invalid input.
+///
+/// # Safety
+/// Non-null `task`/`date` must be readable for their lengths; a non-null `out` must be
+/// writable for `cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_fork_timing_header(
+    task: *const u8,
+    task_len: usize,
+    elapsed: i64,
+    date: *const u8,
+    date_len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: forwarded caller contract.
+        let (Some(task), Some(date)) = (unsafe { w19pc_bytes(task, task_len) }, unsafe {
+            w19pc_bytes(date, date_len)
+        }) else {
+            return -1;
+        };
+        let text = w21_timing_header(task, elapsed, date);
+        // SAFETY: `out` validity is checked by `w19pc_write`; the caller guarantees `cap`
+        // writable bytes.
+        unsafe { w19pc_write(out, cap, &text) }
+    }))
+    .unwrap_or(-1)
+}
+
+/// `MediaInfo::normalizeUniqueId` value tags.
+const W21_MI_NULL: i32 = 0;
+const W21_MI_INT: i32 = 1;
+const W21_MI_STRING: i32 = 2;
+const W21_MI_OTHER: i32 = 3;
+
+/// Whether a MediaInfo `unique_id` is a placeholder (null, `0`, `'0'` or `'0x0'`) that must not
+/// be stored: 1 placeholder, 0 keep, -1 for an unknown tag or invalid input.
+///
+/// # Safety
+/// A non-null `ptr` must be readable for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_mi_unique_id_placeholder(
+    tag: i32,
+    int_value: i64,
+    ptr: *const u8,
+    len: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: forwarded caller contract.
+        let Some(bytes) = (unsafe { w19pc_bytes(ptr, len) }) else {
+            return -1;
+        };
+        match tag {
+            W21_MI_NULL => 1,
+            W21_MI_INT => i32::from(int_value == 0),
+            W21_MI_STRING => i32::from(bytes == b"0" || bytes == b"0x0"),
+            W21_MI_OTHER => 0,
+            _ => -1,
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Enum selectors for the `nntmux_aenum_*` exports.
+const W21_ENUM_MAPPING_CONFIDENCE: i32 = 0;
+const W21_ENUM_PROCESSING_STAGE: i32 = 1;
+const W21_ENUM_SOURCE_POSITION: i32 = 2;
+
+/// Backing values, labels and ranks of one enum, in declaration order.
+struct W21EnumTable {
+    values: &'static [&'static [u8]],
+    labels: &'static [&'static [u8]],
+    ranks: &'static [i32],
+}
+
+const W21_MAPPING_CONFIDENCE: W21EnumTable = W21EnumTable {
+    values: &[b"verified", b"unique-size"],
+    labels: &[b"Verified", b"Unique size"],
+    ranks: &[2, 1],
+};
+
+const W21_PROCESSING_STAGE: W21EnumTable = W21EnumTable {
+    values: &[
+        b"workspace-preparation",
+        b"nzb-parsing",
+        b"release-initialization",
+        b"message-id-selection",
+        b"media-source-planning",
+        b"direct-downloads",
+        b"archive-downloads",
+        b"extracted-files",
+        b"media-sources",
+        b"archive-fallbacks",
+        b"timeout-handling",
+        b"finalization",
+        b"workspace-cleanup",
+    ],
+    labels: &[
+        b"Workspace preparation",
+        b"NZB parsing",
+        b"Release initialization",
+        b"Message-ID selection",
+        b"Media source planning",
+        b"Direct downloads",
+        b"Archive downloads",
+        b"Extracted files",
+        b"Media sources",
+        b"Archive fallbacks",
+        b"Timeout handling",
+        b"Finalization",
+        b"Workspace cleanup",
+    ],
+    ranks: &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+};
+
+const W21_SOURCE_POSITION: W21EnumTable = W21EnumTable {
+    values: &[b"complete", b"head", b"mid"],
+    labels: &[b"Complete file", b"File head", b"Mid-file"],
+    ranks: &[2, 1, 0],
+};
+
+fn w21_enum_table(kind: i32) -> Option<&'static W21EnumTable> {
+    match kind {
+        W21_ENUM_MAPPING_CONFIDENCE => Some(&W21_MAPPING_CONFIDENCE),
+        W21_ENUM_PROCESSING_STAGE => Some(&W21_PROCESSING_STAGE),
+        W21_ENUM_SOURCE_POSITION => Some(&W21_SOURCE_POSITION),
+        _ => None,
+    }
+}
+
+/// PHP `trim()` default characters.
+fn w21_is_trim_byte(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | b'\0' | 0x0b)
+}
+
+/// Case index for `str_replace('_', '-', strtolower(trim($value)))`, or `None`.
+fn w21_enum_resolve(table: &W21EnumTable, value: &[u8]) -> Option<usize> {
+    let start = value.iter().position(|byte| !w21_is_trim_byte(*byte))?;
+    let end = value.iter().rposition(|byte| !w21_is_trim_byte(*byte))? + 1;
+    let body = &value[start..end];
+    table.values.iter().position(|case| {
+        case.len() == body.len()
+            && case.iter().zip(body).all(|(expected, byte)| {
+                let normalized = match byte.to_ascii_lowercase() {
+                    b'_' => b'-',
+                    other => other,
+                };
+                *expected == normalized
+            })
+    })
+}
+
+/// `tryFromNormalized` for enum `kind`: the case index, -2 when no case matches, or -1 for an
+/// unknown kind or invalid input.
+///
+/// # Safety
+/// A non-null `ptr` must be readable for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_aenum_resolve(kind: i32, ptr: *const u8, len: usize) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(table) = w21_enum_table(kind) else {
+            return -1;
+        };
+        // SAFETY: forwarded caller contract.
+        let Some(value) = (unsafe { w19pc_bytes(ptr, len) }) else {
+            return -1;
+        };
+        w21_enum_resolve(table, value).map_or(-2, |index| index as i32)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Write the label of case `index` of enum `kind` to `out`; returns the length, `-(needed)`
+/// when `cap` is too small (nothing is written), or -1 for an unknown kind/index or invalid
+/// input.
+///
+/// # Safety
+/// A non-null `out` must be writable for `cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_aenum_label(
+    kind: i32,
+    index: i64,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(label) = w21_enum_table(kind).and_then(|table| {
+            usize::try_from(index)
+                .ok()
+                .and_then(|index| table.labels.get(index))
+        }) else {
+            return -1;
+        };
+        // SAFETY: `out` validity is checked by `w19pc_write`; the caller guarantees `cap`
+        // writable bytes.
+        unsafe { w19pc_write(out, cap, label) }
+    }))
+    .unwrap_or(-1)
+}
+
+/// Rank of case `index` of enum `kind` (confidence strength, pipeline order or source
+/// coverage), or -1 for an unknown kind/index.
+///
+/// # Safety
+/// Takes no pointers; any argument values are accepted.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_aenum_rank(kind: i32, index: i64) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        w21_enum_table(kind)
+            .and_then(|table| {
+                usize::try_from(index)
+                    .ok()
+                    .and_then(|index| table.ranks.get(index))
+            })
+            .copied()
+            .unwrap_or(-1)
+    }))
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod wave21_forking_mediainfo_enum_tests {
+    use super::*;
+
+    fn max_retries(value: i64) -> i64 {
+        let mut out = i64::MIN;
+        assert_eq!(unsafe { nntmux_fork_max_retries(value, &mut out) }, 0);
+        out
+    }
+
+    #[test]
+    fn max_retries_matches_php_clamp() {
+        for (value, expected) in [
+            (0, -1),
+            (1, -2),
+            (6, -7),
+            (7, -8),
+            (8, -8),
+            (i64::MAX, -8),
+            (-1, -1),
+            (-5, -1),
+            (i64::MIN, -1),
+        ] {
+            assert_eq!(max_retries(value), expected, "{value}");
+        }
+        assert_eq!(
+            unsafe { nntmux_fork_max_retries(3, std::ptr::null_mut()) },
+            -1
+        );
+        let mut buffer = [0i64; 4];
+        let bad = unsafe { buffer.as_mut_ptr().cast::<u8>().add(1) }.cast::<i64>();
+        assert_eq!(unsafe { nntmux_fork_max_retries(3, bad) }, -1);
+        assert_eq!(buffer, [0; 4]);
+    }
+
+    #[test]
+    fn work_type_lookup_is_exact() {
+        for (index, work_type) in W21_WORK_TYPES.iter().enumerate() {
+            assert_eq!(
+                unsafe { nntmux_fork_work_type(work_type.as_ptr(), work_type.len()) },
+                index as i32
+            );
+        }
+        for value in [
+            &b""[..],
+            b"Backfill",
+            b" backfill",
+            b"backfill\0",
+            b"postProcess_",
+        ] {
+            assert_eq!(
+                unsafe { nntmux_fork_work_type(value.as_ptr(), value.len()) },
+                -2,
+                "{value:?}"
+            );
+        }
+        assert_eq!(unsafe { nntmux_fork_work_type(std::ptr::null(), 0) }, -2);
+        assert_eq!(unsafe { nntmux_fork_work_type(std::ptr::null(), 3) }, -1);
+        assert_eq!(
+            unsafe { nntmux_fork_work_type(b"x".as_ptr(), usize::MAX) },
+            -1
+        );
+    }
+
+    #[test]
+    fn timing_header_formats_and_never_writes_partially() {
+        let task = b"postProcess_tv";
+        let date = b"Sat, 24 Oct 2026 19:06:17 +0200";
+        let expected = b"Multi-processing for postProcess_tv finished in -3 seconds at Sat, 24 Oct 2026 19:06:17 +0200.\n";
+        let mut out = [0u8; 256];
+        let written = unsafe {
+            nntmux_fork_timing_header(
+                task.as_ptr(),
+                task.len(),
+                -3,
+                date.as_ptr(),
+                date.len(),
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(written, expected.len() as isize);
+        assert_eq!(&out[..expected.len()], expected);
+        let mut small = [7u8; 8];
+        assert_eq!(
+            unsafe {
+                nntmux_fork_timing_header(
+                    task.as_ptr(),
+                    task.len(),
+                    -3,
+                    date.as_ptr(),
+                    date.len(),
+                    small.as_mut_ptr(),
+                    small.len(),
+                )
+            },
+            -(expected.len() as isize)
+        );
+        assert_eq!(small, [7u8; 8]);
+        let empty = unsafe {
+            nntmux_fork_timing_header(
+                std::ptr::null(),
+                0,
+                i64::MIN,
+                std::ptr::null(),
+                0,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        let min = b"Multi-processing for  finished in -9223372036854775808 seconds at .\n";
+        assert_eq!(empty, min.len() as isize);
+        assert_eq!(&out[..min.len()], min);
+        assert_eq!(
+            unsafe {
+                nntmux_fork_timing_header(
+                    std::ptr::null(),
+                    1,
+                    0,
+                    date.as_ptr(),
+                    date.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_fork_timing_header(
+                    task.as_ptr(),
+                    task.len(),
+                    0,
+                    date.as_ptr(),
+                    date.len(),
+                    std::ptr::null_mut(),
+                    64,
+                )
+            },
+            -1
+        );
+    }
+
+    #[test]
+    fn unique_id_placeholders() {
+        let check = |tag: i32, int_value: i64, bytes: &[u8]| unsafe {
+            nntmux_mi_unique_id_placeholder(tag, int_value, bytes.as_ptr(), bytes.len())
+        };
+        assert_eq!(check(W21_MI_NULL, 0, b""), 1);
+        assert_eq!(check(W21_MI_INT, 0, b""), 1);
+        assert_eq!(check(W21_MI_INT, 1, b""), 0);
+        assert_eq!(check(W21_MI_INT, -1, b""), 0);
+        assert_eq!(check(W21_MI_STRING, 0, b"0"), 1);
+        assert_eq!(check(W21_MI_STRING, 0, b"0x0"), 1);
+        for value in [&b""[..], b"00", b" 0", b"0X0", b"0x00", b"0\0", b"123"] {
+            assert_eq!(check(W21_MI_STRING, 0, value), 0, "{value:?}");
+        }
+        assert_eq!(check(W21_MI_OTHER, 0, b""), 0);
+        assert_eq!(check(4, 0, b""), -1);
+        assert_eq!(
+            unsafe { nntmux_mi_unique_id_placeholder(W21_MI_STRING, 0, std::ptr::null(), 1) },
+            -1
+        );
+    }
+
+    #[test]
+    fn enum_resolve_normalizes_like_php() {
+        for (kind, table) in [
+            (W21_ENUM_MAPPING_CONFIDENCE, &W21_MAPPING_CONFIDENCE),
+            (W21_ENUM_PROCESSING_STAGE, &W21_PROCESSING_STAGE),
+            (W21_ENUM_SOURCE_POSITION, &W21_SOURCE_POSITION),
+        ] {
+            assert_eq!(table.values.len(), table.labels.len());
+            assert_eq!(table.values.len(), table.ranks.len());
+            for (index, value) in table.values.iter().enumerate() {
+                assert_eq!(
+                    unsafe { nntmux_aenum_resolve(kind, value.as_ptr(), value.len()) },
+                    index as i32
+                );
+            }
+        }
+        let resolve = |kind: i32, value: &[u8]| unsafe {
+            nntmux_aenum_resolve(kind, value.as_ptr(), value.len())
+        };
+        assert_eq!(resolve(0, b" \t\nUNIQUE_SIZE\0\x0b"), 1);
+        assert_eq!(resolve(1, b"Nzb_Parsing"), 1);
+        assert_eq!(resolve(2, b"MID\r"), 2);
+        assert_eq!(resolve(2, b"\x0cmid"), -2);
+        assert_eq!(resolve(2, b"m id"), -2);
+        assert_eq!(resolve(2, "h\u{e9}ad".as_bytes()), -2);
+        assert_eq!(resolve(2, b""), -2);
+        assert_eq!(resolve(2, b"   "), -2);
+        assert_eq!(resolve(3, b"mid"), -1);
+        assert_eq!(unsafe { nntmux_aenum_resolve(2, std::ptr::null(), 0) }, -2);
+        assert_eq!(unsafe { nntmux_aenum_resolve(2, std::ptr::null(), 3) }, -1);
+    }
+
+    #[test]
+    fn enum_label_and_rank() {
+        let mut out = [0u8; 64];
+        let written = unsafe { nntmux_aenum_label(1, 3, out.as_mut_ptr(), out.len()) };
+        assert_eq!(&out[..written as usize], b"Message-ID selection");
+        let mut small = [9u8; 4];
+        assert_eq!(
+            unsafe { nntmux_aenum_label(0, 1, small.as_mut_ptr(), small.len()) },
+            -11
+        );
+        assert_eq!(small, [9u8; 4]);
+        assert_eq!(
+            unsafe { nntmux_aenum_label(0, 2, out.as_mut_ptr(), out.len()) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_aenum_label(0, -1, out.as_mut_ptr(), out.len()) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_aenum_label(5, 0, out.as_mut_ptr(), out.len()) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_aenum_label(0, 0, std::ptr::null_mut(), 64) },
+            -1
+        );
+        assert_eq!(unsafe { nntmux_aenum_rank(0, 0) }, 2);
+        assert_eq!(unsafe { nntmux_aenum_rank(1, 12) }, 12);
+        assert_eq!(unsafe { nntmux_aenum_rank(2, 2) }, 0);
+        assert_eq!(unsafe { nntmux_aenum_rank(2, 3) }, -1);
+        assert_eq!(unsafe { nntmux_aenum_rank(2, i64::MIN) }, -1);
+        assert_eq!(unsafe { nntmux_aenum_rank(-1, 0) }, -1);
+    }
+}
