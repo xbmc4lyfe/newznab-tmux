@@ -13552,3 +13552,1389 @@ pub mod search_unavailable_observers_failed_release_2fa {
         }
     }
 }
+/// Wave 22 Slice 22.4: `ValidEmailDomain`, `CaptchaHelper`, `RecaptchaService`,
+/// `TurnstileService`, and `TrustedDevice` C-ABI helpers.
+///
+/// Every export wraps its body in `catch_unwind(...).unwrap_or(-1)`, validates raw
+/// pointers for non-null, alignment, `<= isize::MAX` lengths, and checked address
+/// ranges, and never writes partial output: a short buffer returns
+/// `-(needed + 1)` without touching `out`. `-1` means invalid input, a panic, or a
+/// shape whose PHP behavior is not reproduced, so PHP callers run their native
+/// implementation.
+pub mod email_captcha_turnstile_trusted_device {
+    use std::mem::size_of;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    const DECLINE: isize = -1;
+    const MAX_INPUT: usize = 1 << 20;
+    const MAX_PARTS: usize = 4096;
+    const MAX_JSON_DEPTH: usize = 128;
+
+    /// `ValidEmailDomain::SUSPICIOUS_PATTERNS`, in the same order.
+    const SUSPICIOUS_PATTERNS: [&[u8]; 21] = [
+        b"temp",
+        b"temporary",
+        b"disposable",
+        b"throwaway",
+        b"fake",
+        b"trash",
+        b"spam",
+        b"guerrilla",
+        b"10minute",
+        b"minutemail",
+        b"tempmail",
+        b"guerrillamail",
+        b"mailinator",
+        b"yopmail",
+        b"maildrop",
+        b"trashmail",
+        b"getnada",
+        b"throwawaymail",
+        b"sharklasers",
+        b"guerrillamail",
+        b"grr.la",
+    ];
+
+    /// `ValidEmailDomain::BLOCKED_DOMAINS`, in the same order.
+    const BLOCKED_DOMAINS: [&[u8]; 40] = [
+        b"10minutemail.com",
+        b"guerrillamail.com",
+        b"mailinator.com",
+        b"maildrop.cc",
+        b"temp-mail.org",
+        b"tempmail.com",
+        b"throwawaymail.com",
+        b"yopmail.com",
+        b"getnada.com",
+        b"sharklasers.com",
+        b"guerrillamail.info",
+        b"guerrillamail.biz",
+        b"guerrillamail.de",
+        b"grr.la",
+        b"guerrillamail.net",
+        b"guerrillamail.org",
+        b"guerrillamail.com",
+        b"spam4.me",
+        b"trashmail.com",
+        b"dispostable.com",
+        b"fakeinbox.com",
+        b"tmpeml.info",
+        b"tempinbox.com",
+        b"mytemp.email",
+        b"mohmal.com",
+        b"emailondeck.com",
+        b"throwam.com",
+        b"mintemail.com",
+        b"spamgourmet.com",
+        b"mailnesia.com",
+        b"trashmail.net",
+        b"trash-mail.com",
+        b"emailtemporanea.com",
+        b"anonbox.net",
+        b"anonymbox.com",
+        b"discard.email",
+        b"spambox.us",
+        b"trbvm.com",
+        b"emailna.co",
+        b"my10minutemail.com",
+    ];
+
+    #[inline]
+    fn range_ok(addr: usize, bytes: usize) -> bool {
+        bytes <= isize::MAX as usize && addr.checked_add(bytes).is_some()
+    }
+
+    #[inline]
+    unsafe fn input<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null() || len > MAX_INPUT || !range_ok(ptr as usize, len) {
+            return None;
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    unsafe fn usize_array<'a>(ptr: *const usize, count: usize) -> Option<&'a [usize]> {
+        if count == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null() || !ptr.is_aligned() || count > MAX_PARTS {
+            return None;
+        }
+        let bytes = count.checked_mul(size_of::<usize>())?;
+        if !range_ok(ptr as usize, bytes) {
+            return None;
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, count) })
+    }
+
+    /// Copies `parts` contiguously into `out` only when all of them fit.
+    #[inline]
+    unsafe fn write_all(parts: &[&[u8]], out: *mut u8, cap: usize) -> isize {
+        let Some(needed) = parts
+            .iter()
+            .try_fold(0usize, |acc, p| acc.checked_add(p.len()))
+        else {
+            return DECLINE;
+        };
+        if needed > isize::MAX as usize - 2 {
+            return DECLINE;
+        }
+        if cap < needed {
+            return -(needed as isize) - 1;
+        }
+        if needed == 0 {
+            return 0;
+        }
+        if out.is_null() || !range_ok(out as usize, cap) {
+            return DECLINE;
+        }
+        let dst = unsafe { slice::from_raw_parts_mut(out, needed) };
+        let mut pos = 0;
+        for p in parts {
+            dst[pos..pos + p.len()].copy_from_slice(p);
+            pos += p.len();
+        }
+        needed as isize
+    }
+
+    /// PHP `trim()` default characters: `" \t\n\r\0\x0B"`.
+    #[inline]
+    fn is_php_trim(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B)
+    }
+
+    #[inline]
+    fn php_rtrim(mut s: &[u8]) -> &[u8] {
+        while let [rest @ .., last] = s {
+            if !is_php_trim(*last) {
+                break;
+            }
+            s = rest;
+        }
+        s
+    }
+
+    #[inline]
+    fn php_trim(mut s: &[u8]) -> &[u8] {
+        while let [first, rest @ ..] = s {
+            if !is_php_trim(*first) {
+                break;
+            }
+            s = rest;
+        }
+        php_rtrim(s)
+    }
+
+    /// PHP `empty()` for a string: `''` and `'0'`.
+    #[inline]
+    fn php_empty(s: &[u8]) -> bool {
+        s.is_empty() || s == b"0"
+    }
+
+    #[inline]
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        needle.is_empty() || haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    // -------------------------------------------------------------------------
+    // 1. ValidEmailDomain
+    // -------------------------------------------------------------------------
+
+    /// `ValidEmailDomain::normalizedDomain()` for a string: the trimmed, ASCII
+    /// lowercased domain of an `local@domain` address. Returns its length, or 0 when
+    /// the address is rejected as invalid.
+    fn normalized_domain(email: &[u8]) -> Option<Vec<u8>> {
+        if php_empty(email) {
+            return None;
+        }
+        let at = email.iter().position(|&b| b == b'@')?;
+        let (local, domain) = (&email[..at], &email[at + 1..]);
+        if domain.contains(&b'@') || php_empty(php_trim(local)) {
+            return None;
+        }
+        let domain = php_trim(domain).to_ascii_lowercase();
+        (!php_empty(&domain)).then_some(domain)
+    }
+
+    /// Writes the normalized domain and returns its length, 0 for an invalid
+    /// address, `-(needed + 1)` for a short buffer, or -1 for invalid input.
+    ///
+    /// # Safety
+    /// `email` holds `email_len` readable bytes and `out` `cap` writable bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_email_normalized_domain(
+        email: *const u8,
+        email_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(email) = (unsafe { input(email, email_len) }) else {
+                return DECLINE;
+            };
+            match normalized_domain(email) {
+                Some(domain) => unsafe { write_all(&[&domain], out, cap) },
+                None => 0,
+            }
+        }))
+        .unwrap_or(-1)
+    }
+
+    fn domain_block_code(domain: &[u8]) -> i32 {
+        if BLOCKED_DOMAINS.contains(&domain) {
+            return 1;
+        }
+        SUSPICIOUS_PATTERNS
+            .iter()
+            .position(|p| contains(domain, p))
+            .map_or(0, |i| 2 + i as i32)
+    }
+
+    /// `ValidEmailDomain::domainBlockCode()`: 0 allowed, 1 hardcoded blacklist,
+    /// `2 + i` for the first matching `SUSPICIOUS_PATTERNS[i]`, -1 for invalid input.
+    ///
+    /// # Safety
+    /// `domain` holds `domain_len` readable bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_email_domain_block_code(
+        domain: *const u8,
+        domain_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            match unsafe { input(domain, domain_len) } {
+                Some(d) => domain_block_code(d),
+                None => -1,
+            }
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// `ValidEmailDomain::hasPlusAddressing()`: 1 when the part before the first
+    /// `@` contains `+`, 0 otherwise, -1 for invalid input.
+    ///
+    /// # Safety
+    /// `email` holds `email_len` readable bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_email_has_plus_addressing(
+        email: *const u8,
+        email_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            match unsafe { input(email, email_len) } {
+                Some(e) => i32::from(e.iter().take_while(|&&b| b != b'@').any(|&b| b == b'+')),
+                None => -1,
+            }
+        }))
+        .unwrap_or(-1)
+    }
+
+    // -------------------------------------------------------------------------
+    // 2. CaptchaHelper
+    // -------------------------------------------------------------------------
+
+    const CAPTCHA_RECAPTCHA: u32 = 1;
+    const CAPTCHA_TURNSTILE: u32 = 2;
+    const CAPTCHA_LEGACY: u32 = 4;
+
+    /// `CaptchaHelper::enabledFor()`: `flags` holds bit 1 (reCAPTCHA configured), 2
+    /// (Turnstile configured), and 4 (legacy reCAPTCHA keys configured). Returns 1
+    /// when the configured provider is usable, 0 otherwise, -1 for invalid input.
+    ///
+    /// # Safety
+    /// `provider` holds `provider_len` readable bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_captcha_enabled(
+        provider: *const u8,
+        provider_len: usize,
+        flags: u32,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(provider) = (unsafe { input(provider, provider_len) }) else {
+                return -1;
+            };
+            if flags > 7 {
+                return -1;
+            }
+            let enabled = if provider == b"turnstile" {
+                flags & CAPTCHA_TURNSTILE != 0
+            } else {
+                flags & (CAPTCHA_RECAPTCHA | CAPTCHA_LEGACY) != 0
+            };
+            i32::from(enabled)
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// `CaptchaHelper::responseFieldNameFor()`: 1 for `cf-turnstile-response`, 0
+    /// for `g-recaptcha-response`, -1 for invalid input.
+    ///
+    /// # Safety
+    /// `provider` holds `provider_len` readable bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_captcha_response_field(
+        provider: *const u8,
+        provider_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            match unsafe { input(provider, provider_len) } {
+                Some(p) => i32::from(p == b"turnstile"),
+                None => -1,
+            }
+        }))
+        .unwrap_or(-1)
+    }
+
+    // -------------------------------------------------------------------------
+    // 3. RecaptchaService / TurnstileService widget rendering
+    // -------------------------------------------------------------------------
+
+    #[inline]
+    fn utf8_lead(c: u8) -> bool {
+        c < 0x80 || (0xC2..=0xF4).contains(&c)
+    }
+
+    #[inline]
+    fn utf8_trail(c: u8) -> bool {
+        (0x80..=0xBF).contains(&c)
+    }
+
+    /// PHP's `get_next_char()` for UTF-8: `Ok(len)` for a valid character or
+    /// `Err(advance)` for an invalid sequence, with PHP's exact skip lengths.
+    fn next_utf8(s: &[u8]) -> Result<usize, usize> {
+        let c = s[0];
+        let avail = s.len();
+        let at = |i: usize| s.get(i).copied();
+        if c < 0x80 {
+            Ok(1)
+        } else if c < 0xC2 {
+            Err(1)
+        } else if c < 0xE0 {
+            match at(1) {
+                None => Err(1),
+                Some(n) if !utf8_trail(n) => Err(if utf8_lead(n) { 1 } else { 2 }),
+                Some(_) => Ok(2),
+            }
+        } else if c < 0xF0 {
+            if avail < 3 || !utf8_trail(s[1]) || !utf8_trail(s[2]) {
+                return Err(if avail < 2 || utf8_lead(s[1]) {
+                    1
+                } else if avail < 3 || utf8_lead(s[2]) {
+                    2
+                } else {
+                    3
+                });
+            }
+            let cp = (u32::from(c & 0x0F) << 12)
+                | (u32::from(s[1] & 0x3F) << 6)
+                | u32::from(s[2] & 0x3F);
+            if cp < 0x800 || (0xD800..=0xDFFF).contains(&cp) {
+                Err(3)
+            } else {
+                Ok(3)
+            }
+        } else if c < 0xF5 {
+            if avail < 4 || !utf8_trail(s[1]) || !utf8_trail(s[2]) || !utf8_trail(s[3]) {
+                return Err(if avail < 2 || utf8_lead(s[1]) {
+                    1
+                } else if avail < 3 || utf8_lead(s[2]) {
+                    2
+                } else if avail < 4 || utf8_lead(s[3]) {
+                    3
+                } else {
+                    4
+                });
+            }
+            let cp = (u32::from(c & 0x07) << 18)
+                | (u32::from(s[1] & 0x3F) << 12)
+                | (u32::from(s[2] & 0x3F) << 6)
+                | u32::from(s[3] & 0x3F);
+            if !(0x10000..=0x10FFFF).contains(&cp) {
+                Err(4)
+            } else {
+                Ok(4)
+            }
+        } else {
+            Err(1)
+        }
+    }
+
+    /// `htmlspecialchars($value, ENT_QUOTES[|ENT_SUBSTITUTE], 'UTF-8')`. Without
+    /// `substitute`, an invalid sequence makes the whole result empty.
+    fn html_escape_into(value: &[u8], substitute: bool, out: &mut Vec<u8>) {
+        let start = out.len();
+        if value.is_ascii() || substitute || std::str::from_utf8(value).is_ok() {
+            let mut i = 0;
+            while i < value.len() {
+                let b = value[i];
+                if b < 0x80 {
+                    match b {
+                        b'&' => out.extend_from_slice(b"&amp;"),
+                        b'"' => out.extend_from_slice(b"&quot;"),
+                        b'\'' => out.extend_from_slice(b"&#039;"),
+                        b'<' => out.extend_from_slice(b"&lt;"),
+                        b'>' => out.extend_from_slice(b"&gt;"),
+                        _ => out.push(b),
+                    }
+                    i += 1;
+                    continue;
+                }
+                match next_utf8(&value[i..]) {
+                    Ok(n) => {
+                        out.extend_from_slice(&value[i..i + n]);
+                        i += n;
+                    }
+                    Err(n) => {
+                        if !substitute {
+                            out.truncate(start);
+                            return;
+                        }
+                        out.extend_from_slice("\u{FFFD}".as_bytes());
+                        i += n;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Splits `packed` into consecutive parts whose lengths sum to `packed.len()`.
+    fn split_parts<'a>(packed: &'a [u8], lens: &[usize]) -> Option<Vec<&'a [u8]>> {
+        let mut parts = Vec::with_capacity(lens.len());
+        let mut pos = 0usize;
+        for &len in lens {
+            let end = pos.checked_add(len)?;
+            parts.push(packed.get(pos..end)?);
+            pos = end;
+        }
+        (pos == packed.len()).then_some(parts)
+    }
+
+    /// `sprintf('<div %s></div>', trim(...))` over `key="escaped value" ` pairs.
+    fn widget_html(pairs: &[&[u8]], substitute: bool) -> Vec<u8> {
+        let mut attrs = Vec::with_capacity(pairs.iter().map(|p| p.len() + 8).sum());
+        for pair in pairs.as_chunks::<2>().0 {
+            attrs.extend_from_slice(pair[0]);
+            attrs.extend_from_slice(b"=\"");
+            html_escape_into(pair[1], substitute, &mut attrs);
+            attrs.extend_from_slice(b"\" ");
+        }
+        let trimmed = php_trim(&attrs);
+        let mut html = Vec::with_capacity(trimmed.len() + 13);
+        html.extend_from_slice(b"<div ");
+        html.extend_from_slice(trimmed);
+        html.extend_from_slice(b"></div>");
+        html
+    }
+
+    /// `RecaptchaService::renderWidget()` (`mode` 0, `ENT_QUOTES`) and
+    /// `TurnstileService::renderWidget()` (`mode` 1, PHP's default
+    /// `ENT_QUOTES | ENT_SUBSTITUTE`). `parts` holds `count` alternating attribute
+    /// names and string values of the merged attribute array, concatenated with
+    /// their lengths in `lens`.
+    ///
+    /// # Safety
+    /// `parts` holds `parts_len` bytes; `lens` holds `count` aligned `size_t`
+    /// values; `out` holds `cap` writable bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_captcha_widget_html(
+        parts: *const u8,
+        parts_len: usize,
+        lens: *const usize,
+        count: usize,
+        mode: u32,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if mode > 1 || !count.is_multiple_of(2) {
+                return DECLINE;
+            }
+            let Some(packed) = (unsafe { input(parts, parts_len) }) else {
+                return DECLINE;
+            };
+            let Some(lens) = (unsafe { usize_array(lens, count) }) else {
+                return DECLINE;
+            };
+            let Some(pairs) = split_parts(packed, lens) else {
+                return DECLINE;
+            };
+            let html = widget_html(&pairs, mode == 1);
+            unsafe { write_all(&[&html], out, cap) }
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Verification outcome shared by both providers: 0 success, 1 `http-error`,
+    /// 2 `rejected`, 3 `invalid-response`. reCAPTCHA (`provider` 0) ignores the HTTP
+    /// status like `RecaptchaService::verify()`; Turnstile (`provider` 1) follows
+    /// `TurnstileService::verify()`. Returns -1 for invalid flags.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn nntmux_captcha_verification_outcome(
+        provider: u32,
+        http_ok: u32,
+        result_is_array: u32,
+        success_true: u32,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if provider > 1 || http_ok > 1 || result_is_array > 1 || success_true > 1 {
+                return -1;
+            }
+            let (http_ok, is_array, success) = (
+                http_ok == 1 || provider == 0,
+                result_is_array == 1,
+                success_true == 1,
+            );
+            if http_ok && is_array && success {
+                0
+            } else if !http_ok {
+                1
+            } else if is_array {
+                2
+            } else {
+                3
+            }
+        }))
+        .unwrap_or(-1)
+    }
+
+    // -------------------------------------------------------------------------
+    // 4. TrustedDevice
+    // -------------------------------------------------------------------------
+
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+        use crate::metadata::candidate_inventory::sha256;
+        let mut block = [0u8; 64];
+        if key.len() > 64 {
+            block[..32].copy_from_slice(&sha256(key));
+        } else {
+            block[..key.len()].copy_from_slice(key);
+        }
+        let mut inner = Vec::with_capacity(64 + message.len());
+        inner.extend(block.iter().map(|b| b ^ 0x36));
+        inner.extend_from_slice(message);
+        let inner_hash = sha256(&inner);
+        let mut outer = [0u8; 96];
+        for (o, b) in outer.iter_mut().zip(block) {
+            *o = b ^ 0x5C;
+        }
+        outer[64..].copy_from_slice(&inner_hash);
+        sha256(&outer)
+    }
+
+    /// `TrustedDevice::hmacTokenHash()`: writes the 64-character lowercase
+    /// `hash_hmac('sha256', $token, $key)` digest.
+    ///
+    /// # Safety
+    /// `token`/`key` hold their lengths in readable bytes and `out` `cap` writable
+    /// bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_trusted_device_token_hash(
+        token: *const u8,
+        token_len: usize,
+        key: *const u8,
+        key_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            let (Some(token), Some(key)) = (unsafe { input(token, token_len) }, unsafe {
+                input(key, key_len)
+            }) else {
+                return DECLINE;
+            };
+            let digest = hmac_sha256(key, token);
+            let mut hex = [0u8; 64];
+            for (pair, b) in hex.as_chunks_mut::<2>().0.iter_mut().zip(digest) {
+                pair[0] = HEX[usize::from(b >> 4)];
+                pair[1] = HEX[usize::from(b & 15)];
+            }
+            unsafe { write_all(&[&hex], out, cap) }
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Why a JSON document cannot be answered: PHP's `json_decode()` fails
+    /// (`Invalid`) or the shape is outside what this parser reproduces (`Decline`).
+    enum JsonStop {
+        Invalid,
+        Decline,
+    }
+
+    /// The JSON value kinds that decide `cookieIsValidForUser()`.
+    enum JsonValue {
+        Null,
+        Bool,
+        Int(i64),
+        BigOrFloat,
+        Str(Vec<u8>),
+        Container,
+    }
+
+    struct JsonParser<'a> {
+        s: &'a [u8],
+        i: usize,
+    }
+
+    impl JsonParser<'_> {
+        fn ws(&mut self) {
+            while let Some(b' ' | b'\t' | b'\n' | b'\r') = self.s.get(self.i) {
+                self.i += 1;
+            }
+        }
+
+        fn eat(&mut self, b: u8) -> bool {
+            if self.s.get(self.i) == Some(&b) {
+                self.i += 1;
+                true
+            } else {
+                false
+            }
+        }
+
+        fn hex4(&mut self) -> Result<u32, JsonStop> {
+            let digits = self.s.get(self.i..self.i + 4).ok_or(JsonStop::Invalid)?;
+            let mut v = 0u32;
+            for &d in digits {
+                let n = (d as char).to_digit(16).ok_or(JsonStop::Invalid)?;
+                v = v * 16 + n;
+            }
+            self.i += 4;
+            Ok(v)
+        }
+
+        fn string(&mut self) -> Result<Vec<u8>, JsonStop> {
+            // The opening quote has been consumed; the input is valid UTF-8.
+            let mut out = Vec::new();
+            loop {
+                let &b = self.s.get(self.i).ok_or(JsonStop::Invalid)?;
+                self.i += 1;
+                match b {
+                    b'"' => return Ok(out),
+                    0..0x20 => return Err(JsonStop::Invalid),
+                    b'\\' => {
+                        let &e = self.s.get(self.i).ok_or(JsonStop::Invalid)?;
+                        self.i += 1;
+                        let c = match e {
+                            b'"' => b'"',
+                            b'\\' => b'\\',
+                            b'/' => b'/',
+                            b'b' => 0x08,
+                            b'f' => 0x0C,
+                            b'n' => b'\n',
+                            b'r' => b'\r',
+                            b't' => b'\t',
+                            b'u' => {
+                                let mut cp = self.hex4()?;
+                                if (0xD800..0xDC00).contains(&cp) {
+                                    if self.s.get(self.i..self.i + 2) != Some(b"\\u") {
+                                        return Err(JsonStop::Decline);
+                                    }
+                                    self.i += 2;
+                                    let low = self.hex4()?;
+                                    if !(0xDC00..0xE000).contains(&low) {
+                                        return Err(JsonStop::Decline);
+                                    }
+                                    cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                                } else if (0xDC00..0xE000).contains(&cp) {
+                                    return Err(JsonStop::Decline);
+                                }
+                                let ch = char::from_u32(cp).ok_or(JsonStop::Decline)?;
+                                let mut buf = [0u8; 4];
+                                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                                continue;
+                            }
+                            _ => return Err(JsonStop::Invalid),
+                        };
+                        out.push(c);
+                    }
+                    _ => out.push(b),
+                }
+            }
+        }
+
+        fn number(&mut self) -> Result<JsonValue, JsonStop> {
+            let start = self.i;
+            self.eat(b'-');
+            let digits_start = self.i;
+            match self.s.get(self.i) {
+                Some(b'0') => self.i += 1,
+                Some(b'1'..=b'9') => {
+                    while let Some(b'0'..=b'9') = self.s.get(self.i) {
+                        self.i += 1;
+                    }
+                }
+                _ => return Err(JsonStop::Invalid),
+            }
+            let int_end = self.i;
+            let mut float = false;
+            if self.eat(b'.') {
+                float = true;
+                let frac = self.i;
+                while let Some(b'0'..=b'9') = self.s.get(self.i) {
+                    self.i += 1;
+                }
+                if self.i == frac {
+                    return Err(JsonStop::Invalid);
+                }
+            }
+            if let Some(b'e' | b'E') = self.s.get(self.i) {
+                float = true;
+                self.i += 1;
+                if let Some(b'+' | b'-') = self.s.get(self.i) {
+                    self.i += 1;
+                }
+                let exp = self.i;
+                while let Some(b'0'..=b'9') = self.s.get(self.i) {
+                    self.i += 1;
+                }
+                if self.i == exp {
+                    return Err(JsonStop::Invalid);
+                }
+            }
+            if float || int_end - digits_start > 19 {
+                return Ok(JsonValue::BigOrFloat);
+            }
+            let text =
+                std::str::from_utf8(&self.s[start..int_end]).map_err(|_| JsonStop::Decline)?;
+            Ok(text
+                .parse::<i64>()
+                .map_or(JsonValue::BigOrFloat, JsonValue::Int))
+        }
+
+        fn literal(&mut self, word: &[u8], value: JsonValue) -> Result<JsonValue, JsonStop> {
+            if self.s.get(self.i..self.i + word.len()) == Some(word) {
+                self.i += word.len();
+                Ok(value)
+            } else {
+                Err(JsonStop::Invalid)
+            }
+        }
+
+        fn value(&mut self, depth: usize) -> Result<JsonValue, JsonStop> {
+            self.ws();
+            match self.s.get(self.i) {
+                Some(b'{') | Some(b'[') => {
+                    self.container(depth + 1, |_, _| {})?;
+                    Ok(JsonValue::Container)
+                }
+                Some(b'"') => {
+                    self.i += 1;
+                    self.string().map(JsonValue::Str)
+                }
+                Some(b't') => self.literal(b"true", JsonValue::Bool),
+                Some(b'f') => self.literal(b"false", JsonValue::Bool),
+                Some(b'n') => self.literal(b"null", JsonValue::Null),
+                Some(b'-' | b'0'..=b'9') => self.number(),
+                _ => Err(JsonStop::Invalid),
+            }
+        }
+
+        /// Parses the object or array at the cursor, passing each object member to
+        /// `member` (last duplicate wins for the caller).
+        fn container(
+            &mut self,
+            depth: usize,
+            mut member: impl FnMut(Vec<u8>, JsonValue),
+        ) -> Result<(), JsonStop> {
+            if depth > MAX_JSON_DEPTH {
+                return Err(JsonStop::Decline);
+            }
+            let object = self.s[self.i] == b'{';
+            let close = if object { b'}' } else { b']' };
+            self.i += 1;
+            self.ws();
+            if self.eat(close) {
+                return Ok(());
+            }
+            loop {
+                if object {
+                    self.ws();
+                    if !self.eat(b'"') {
+                        return Err(JsonStop::Invalid);
+                    }
+                    let key = self.string()?;
+                    self.ws();
+                    if !self.eat(b':') {
+                        return Err(JsonStop::Invalid);
+                    }
+                    let value = self.value(depth)?;
+                    member(key, value);
+                } else {
+                    self.value(depth)?;
+                }
+                self.ws();
+                if self.eat(b',') {
+                    continue;
+                }
+                if self.eat(close) {
+                    return Ok(());
+                }
+                return Err(JsonStop::Invalid);
+            }
+        }
+    }
+
+    /// Result of one `cookieIsValidForUser()` condition.
+    enum Check {
+        Pass,
+        Fail,
+        Unknown,
+    }
+
+    /// `is_numeric()`: ints and floats pass, numeric strings need PHP's rules.
+    fn is_numeric(value: &JsonValue) -> Check {
+        match value {
+            JsonValue::Int(_) | JsonValue::BigOrFloat => Check::Pass,
+            JsonValue::Str(_) => Check::Unknown,
+            JsonValue::Null | JsonValue::Bool | JsonValue::Container => Check::Fail,
+        }
+    }
+
+    /// `(int) $value` compared by `ok`; float casts may warn, so PHP decides them.
+    fn int_cast(value: &JsonValue, ok: impl Fn(i64) -> bool) -> Check {
+        match value {
+            JsonValue::Int(v) if ok(*v) => Check::Pass,
+            JsonValue::Int(_) => Check::Fail,
+            _ => Check::Unknown,
+        }
+    }
+
+    /// `TrustedDevice::cookiePayloadToken()`: `Ok(Some(token))` when the cookie
+    /// payload is valid for the user at `now`, `Ok(None)` when it is not, `Err(())`
+    /// when PHP must decide.
+    fn cookie_token(cookie: &[u8], user_id: i64, now: i64) -> Result<Option<Vec<u8>>, ()> {
+        if cookie.is_empty() {
+            return Ok(None);
+        }
+        if std::str::from_utf8(cookie).is_err() {
+            return Ok(None);
+        }
+        let mut parser = JsonParser { s: cookie, i: 0 };
+        parser.ws();
+        if parser.s.get(parser.i) != Some(&b'{') {
+            // Scalars, lists, and malformed documents never yield the three keys.
+            return Ok(None);
+        }
+        let (mut uid, mut token, mut expires) = (None, None, None);
+        let parsed = parser.container(1, |key, value| match key.as_slice() {
+            b"user_id" => uid = Some(value),
+            b"token" => token = Some(value),
+            b"expires_at" => expires = Some(value),
+            _ => {}
+        });
+        match parsed {
+            Ok(()) => {}
+            Err(JsonStop::Invalid) => return Ok(None),
+            Err(JsonStop::Decline) => return Err(()),
+        }
+        parser.ws();
+        if parser.i != parser.s.len() {
+            return Ok(None);
+        }
+        // `isset()` of all three keys.
+        let (Some(uid), Some(token), Some(expires)) = (uid, token, expires) else {
+            return Ok(None);
+        };
+        if [&uid, &token, &expires]
+            .iter()
+            .any(|v| matches!(v, JsonValue::Null))
+        {
+            return Ok(None);
+        }
+        let token_check = if matches!(token, JsonValue::Str(_)) {
+            Check::Pass
+        } else {
+            Check::Fail
+        };
+        // The `||` chain in PHP order: the first failing condition decides, and an
+        // undecidable condition before it (numeric strings, float casts) defers to PHP.
+        let checks = [
+            is_numeric(&uid),
+            token_check,
+            is_numeric(&expires),
+            int_cast(&uid, |v| v == user_id),
+            int_cast(&expires, |v| now <= v),
+        ];
+        for check in checks {
+            match check {
+                Check::Pass => {}
+                Check::Fail => return Ok(None),
+                Check::Unknown => return Err(()),
+            }
+        }
+        match token {
+            JsonValue::Str(t) => Ok(Some(t)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Writes the trusted-device token and returns `token_len + 1` when the JSON
+    /// cookie payload is valid for `user_id` at `now`; 0 when it is not;
+    /// `-(needed + 1)` for a short buffer; -1 for invalid input or a payload that
+    /// PHP must evaluate (numeric strings, floats, unpaired surrogates, deep nesting).
+    ///
+    /// # Safety
+    /// `cookie` holds `cookie_len` readable bytes and `out` `cap` writable bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_trusted_device_cookie_token(
+        cookie: *const u8,
+        cookie_len: usize,
+        user_id: i64,
+        now: i64,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(cookie) = (unsafe { input(cookie, cookie_len) }) else {
+                return DECLINE;
+            };
+            match cookie_token(cookie, user_id, now) {
+                Ok(Some(token)) => {
+                    let written = unsafe { write_all(&[&token], out, cap) };
+                    if written >= 0 { written + 1 } else { written }
+                }
+                Ok(None) => 0,
+                Err(()) => DECLINE,
+            }
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// `TrustedDevice::limitUserAgent()` for ASCII input: `Str::limit($ua, $limit, '')`
+    /// returns the value unchanged within the limit and otherwise right-trims the
+    /// first `limit` bytes. Returns the written length or -1 for non-ASCII input,
+    /// whose `mb_strwidth()` widths PHP must compute.
+    ///
+    /// # Safety
+    /// `ua` holds `ua_len` readable bytes and `out` `cap` writable bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_trusted_device_user_agent_limit(
+        ua: *const u8,
+        ua_len: usize,
+        limit: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(ua) = (unsafe { input(ua, ua_len) }) else {
+                return DECLINE;
+            };
+            if !ua.is_ascii() || limit > isize::MAX as usize {
+                return DECLINE;
+            }
+            let limited = if ua.len() <= limit {
+                ua
+            } else {
+                php_rtrim(&ua[..limit])
+            };
+            unsafe { write_all(&[limited], out, cap) }
+        }))
+        .unwrap_or(-1)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn buf_call(f: impl Fn(*mut u8, usize) -> isize) -> Result<Vec<u8>, isize> {
+            let mut buf = vec![0u8; 4096];
+            let n = f(buf.as_mut_ptr(), buf.len());
+            if n < 0 {
+                return Err(n);
+            }
+            buf.truncate(n as usize);
+            Ok(buf)
+        }
+
+        fn pack(parts: &[&[u8]]) -> (Vec<u8>, Vec<usize>) {
+            (parts.concat(), parts.iter().map(|p| p.len()).collect())
+        }
+
+        fn domain(e: &[u8]) -> Result<Vec<u8>, isize> {
+            buf_call(|o, c| unsafe { nntmux_email_normalized_domain(e.as_ptr(), e.len(), o, c) })
+        }
+
+        #[test]
+        fn email_normalized_domain() {
+            assert_eq!(domain(b"User@Example.COM").unwrap(), b"example.com");
+            assert_eq!(domain(b"  a @ \tGmail.com\0 ").unwrap(), b"gmail.com");
+            assert_eq!(domain(b"a@\x0Cx").unwrap(), b"\x0cx");
+            assert_eq!(domain(b"a@\xC3\x89x").unwrap(), b"\xc3\x89x");
+            for bad in [
+                &b""[..],
+                b"0",
+                b"plain",
+                b"@x.com",
+                b" @x.com",
+                b"0@x.com",
+                b" 0 @x.com",
+                b"a@",
+                b"a@ ",
+                b"a@0",
+                b"a@ 0 ",
+                b"a@b@c",
+            ] {
+                assert_eq!(domain(bad).unwrap(), b"", "{:?}", bad);
+            }
+            assert_eq!(domain(b"00@x").unwrap(), b"x");
+            let mut small = [0xAAu8; 3];
+            let n = unsafe {
+                nntmux_email_normalized_domain(b"a@example".as_ptr(), 9, small.as_mut_ptr(), 3)
+            };
+            assert_eq!(n, -8);
+            assert_eq!(small, [0xAA; 3]);
+            assert_eq!(
+                unsafe {
+                    nntmux_email_normalized_domain(std::ptr::null(), 3, small.as_mut_ptr(), 3)
+                },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_email_normalized_domain(
+                        b"a@b".as_ptr(),
+                        isize::MAX as usize + 1,
+                        small.as_mut_ptr(),
+                        3,
+                    )
+                },
+                -1
+            );
+        }
+
+        #[test]
+        fn email_block_code_and_plus() {
+            let code = |d: &[u8]| unsafe { nntmux_email_domain_block_code(d.as_ptr(), d.len()) };
+            assert_eq!(code(b"gmail.com"), 0);
+            assert_eq!(code(b"mailinator.com"), 1);
+            assert_eq!(code(b"my10minutemail.com"), 1);
+            assert_eq!(code(b"mytempbox.net"), 2);
+            assert_eq!(code(b"guerrillamail.xyz"), 9);
+            assert_eq!(code(b"x.grr.la.io"), 22);
+            assert_eq!(code(b"MAILINATOR.COM"), 0);
+            assert_eq!(code(b""), 0);
+            assert_eq!(
+                unsafe { nntmux_email_domain_block_code(std::ptr::null(), 1) },
+                -1
+            );
+
+            let plus = |e: &[u8]| unsafe { nntmux_email_has_plus_addressing(e.as_ptr(), e.len()) };
+            assert_eq!(plus(b"a+b@x.com"), 1);
+            assert_eq!(plus(b"ab@x+y.com"), 0);
+            assert_eq!(plus(b"a+b"), 1);
+            assert_eq!(plus(b""), 0);
+            assert_eq!(
+                unsafe { nntmux_email_has_plus_addressing(std::ptr::null(), 1) },
+                -1
+            );
+        }
+
+        #[test]
+        fn captcha_enabled_and_field() {
+            let en = |p: &[u8], f: u32| unsafe { nntmux_captcha_enabled(p.as_ptr(), p.len(), f) };
+            assert_eq!(en(b"turnstile", 2), 1);
+            assert_eq!(en(b"turnstile", 5), 0);
+            assert_eq!(en(b"recaptcha", 1), 1);
+            assert_eq!(en(b"recaptcha", 4), 1);
+            assert_eq!(en(b"other", 2), 0);
+            assert_eq!(en(b"", 0), 0);
+            assert_eq!(en(b"Turnstile", 2), 0);
+            assert_eq!(en(b"turnstile", 8), -1);
+            let field = |p: &[u8]| unsafe { nntmux_captcha_response_field(p.as_ptr(), p.len()) };
+            assert_eq!(field(b"turnstile"), 1);
+            assert_eq!(field(b"recaptcha"), 0);
+            assert_eq!(
+                unsafe { nntmux_captcha_response_field(std::ptr::null(), 2) },
+                -1
+            );
+        }
+
+        fn widget(parts: &[&[u8]], mode: u32) -> Result<Vec<u8>, isize> {
+            let (p, l) = pack(parts);
+            buf_call(|o, c| unsafe {
+                nntmux_captcha_widget_html(p.as_ptr(), p.len(), l.as_ptr(), l.len(), mode, o, c)
+            })
+        }
+
+        #[test]
+        fn captcha_widget_html() {
+            assert_eq!(
+                widget(&[b"class", b"g-recaptcha", b"data-sitekey", b"k<'&\">"], 0).unwrap(),
+                b"<div class=\"g-recaptcha\" data-sitekey=\"k&lt;&#039;&amp;&quot;&gt;\"></div>"
+            );
+            assert_eq!(widget(&[b"a", b"x\xC3"], 0).unwrap(), b"<div a=\"\"></div>");
+            assert_eq!(
+                widget(&[b"a", b"x\xC3"], 1).unwrap(),
+                b"<div a=\"x\xEF\xBF\xBD\"></div>"
+            );
+            assert_eq!(
+                widget(&[b"a", b"\xE0\x80\x80!"], 1).unwrap(),
+                b"<div a=\"\xEF\xBF\xBD!\"></div>"
+            );
+            assert_eq!(widget(&[b" k", b""], 0).unwrap(), b"<div k=\"\"></div>");
+            assert_eq!(widget(&[], 0).unwrap(), b"<div ></div>");
+            assert_eq!(widget(&[b"a"], 0), Err(-1));
+            assert_eq!(widget(&[b"a", b"b"], 2), Err(-1));
+            let (p, l) = pack(&[b"a", b"b"]);
+            let mut small = [0xAAu8; 4];
+            let n = unsafe {
+                nntmux_captcha_widget_html(
+                    p.as_ptr(),
+                    p.len(),
+                    l.as_ptr(),
+                    2,
+                    0,
+                    small.as_mut_ptr(),
+                    4,
+                )
+            };
+            assert_eq!(n, -(17 + 1));
+            assert_eq!(small, [0xAA; 4]);
+            let mut raw = [0u8; 32];
+            let misaligned = unsafe { raw.as_mut_ptr().add(1) } as *const usize;
+            assert_eq!(
+                unsafe {
+                    nntmux_captcha_widget_html(
+                        p.as_ptr(),
+                        2,
+                        misaligned,
+                        2,
+                        0,
+                        small.as_mut_ptr(),
+                        4,
+                    )
+                },
+                -1
+            );
+        }
+
+        #[test]
+        fn captcha_verification_outcome() {
+            let o = nntmux_captcha_verification_outcome;
+            assert_eq!(o(1, 1, 1, 1), 0);
+            assert_eq!(o(1, 0, 1, 1), 1);
+            assert_eq!(o(1, 1, 1, 0), 2);
+            assert_eq!(o(1, 1, 0, 0), 3);
+            assert_eq!(o(0, 0, 1, 1), 0);
+            assert_eq!(o(0, 0, 0, 0), 3);
+            assert_eq!(o(0, 1, 1, 0), 2);
+            assert_eq!(o(2, 1, 1, 1), -1);
+        }
+
+        #[test]
+        fn trusted_device_token_hash() {
+            let hash = |t: &[u8], k: &[u8]| {
+                buf_call(|o, c| unsafe {
+                    nntmux_trusted_device_token_hash(t.as_ptr(), t.len(), k.as_ptr(), k.len(), o, c)
+                })
+                .unwrap()
+            };
+            // RFC 4231 test case 2.
+            assert_eq!(
+                hash(b"what do ya want for nothing?", b"Jefe"),
+                b"5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+            );
+            assert_eq!(
+                hash(b"", b""),
+                b"b613679a0814d9ec772f95d778c35fc5ff1697c493715653c6c712144292c5ad"
+            );
+            // RFC 4231 test case 6 (131-byte key).
+            assert_eq!(
+                hash(
+                    b"Test Using Larger Than Block-Size Key - Hash Key First",
+                    &[0xAA; 131]
+                ),
+                b"60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+            );
+            let mut small = [0xAAu8; 63];
+            assert_eq!(
+                unsafe {
+                    nntmux_trusted_device_token_hash(
+                        b"a".as_ptr(),
+                        1,
+                        b"k".as_ptr(),
+                        1,
+                        small.as_mut_ptr(),
+                        63,
+                    )
+                },
+                -65
+            );
+            assert_eq!(small, [0xAA; 63]);
+        }
+
+        fn cookie(c: &[u8], uid: i64, now: i64) -> isize {
+            let mut buf = [0u8; 256];
+            unsafe {
+                nntmux_trusted_device_cookie_token(
+                    c.as_ptr(),
+                    c.len(),
+                    uid,
+                    now,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            }
+        }
+
+        #[test]
+        fn trusted_device_cookie_token() {
+            let ok = br#"{"user_id":7,"token":"abc","expires_at":100}"#;
+            assert_eq!(cookie(ok, 7, 100), 4);
+            assert_eq!(cookie(ok, 7, 101), 0);
+            assert_eq!(cookie(ok, 8, 50), 0);
+            assert_eq!(
+                cookie(
+                    br#" {"token":"","user_id":7,"expires_at":100,"x":[1,{"a":1.5e3}]} "#,
+                    7,
+                    1
+                ),
+                1
+            );
+            assert_eq!(
+                cookie(
+                    br#"{"user_id":7,"token":"t","expires_at":100,"user_id":8}"#,
+                    7,
+                    1
+                ),
+                0
+            );
+            assert_eq!(
+                cookie(
+                    b"{\"user\\u005fid\":7,\"token\":\"\\u00e9\\ud83d\\ude00\",\"expires_at\":100}",
+                    7,
+                    1
+                ),
+                1 + 6
+            );
+            assert_eq!(
+                cookie(br#"{"user_id":"7","token":"t","expires_at":100}"#, 7, 1),
+                -1
+            );
+            assert_eq!(
+                cookie(br#"{"user_id":7.0,"token":"t","expires_at":100}"#, 7, 1),
+                -1
+            );
+            assert_eq!(
+                cookie(br#"{"user_id":"7","token":1,"expires_at":100}"#, 7, 1),
+                -1
+            );
+            assert_eq!(
+                cookie(br#"{"user_id":7,"token":1,"expires_at":"x"}"#, 7, 1),
+                0
+            );
+            assert_eq!(
+                cookie(br#"{"user_id":1e20,"token":"t","expires_at":1}"#, 7, 5),
+                -1
+            );
+            assert_eq!(
+                cookie(br#"{"user_id":8,"token":"t","expires_at":1e20}"#, 7, 5),
+                0
+            );
+            assert_eq!(
+                cookie(br#"{"user_id":true,"token":"t","expires_at":100}"#, 1, 1),
+                0
+            );
+            assert_eq!(
+                cookie(br#"{"user_id":null,"token":"t","expires_at":100}"#, 1, 1),
+                0
+            );
+            assert_eq!(cookie(br#"{"user_id":7,"token":"t"}"#, 7, 1), 0);
+            assert_eq!(
+                cookie(br#"{"user_id":7,"token":"t","expires_at":100,}"#, 7, 1),
+                0
+            );
+            assert_eq!(
+                cookie(br#"{"user_id":7,"token":"t","expires_at":100} x"#, 7, 1),
+                0
+            );
+            assert_eq!(
+                cookie(br#"{"user_id":07,"token":"t","expires_at":100}"#, 7, 1),
+                0
+            );
+            assert_eq!(
+                cookie(br#"{"user_id":7,"token":"\ud800","expires_at":100}"#, 7, 1),
+                -1
+            );
+            assert_eq!(
+                cookie(
+                    b"{\"user_id\":7,\"token\":\"a\x01\",\"expires_at\":100}",
+                    7,
+                    1
+                ),
+                0
+            );
+            assert_eq!(
+                cookie(
+                    b"{\"user_id\":7,\"token\":\"\xff\",\"expires_at\":100}",
+                    7,
+                    1
+                ),
+                0
+            );
+            assert_eq!(
+                cookie(
+                    br#"{"user_id":99999999999999999999,"token":"t","expires_at":100}"#,
+                    7,
+                    1
+                ),
+                -1
+            );
+            assert_eq!(cookie(br#"{"user_id":-9223372036854775808,"token":"t","expires_at":9223372036854775807}"#, i64::MIN, 1), 2);
+            assert_eq!(cookie(br#"[7,"t",100]"#, 7, 1), 0);
+            assert_eq!(cookie(b"", 7, 1), 0);
+            let deep = [vec![b'['; 200], vec![b']'; 200]].concat();
+            let doc = [
+                &br#"{"user_id":7,"token":"t","expires_at":100,"d":"#[..],
+                &deep,
+                b"}",
+            ]
+            .concat();
+            assert_eq!(cookie(&doc, 7, 1), -1);
+            let mut small = [0xAAu8; 2];
+            let n = unsafe {
+                nntmux_trusted_device_cookie_token(
+                    ok.as_ptr(),
+                    ok.len(),
+                    7,
+                    1,
+                    small.as_mut_ptr(),
+                    2,
+                )
+            };
+            assert_eq!(n, -4);
+            assert_eq!(small, [0xAA; 2]);
+        }
+
+        #[test]
+        fn trusted_device_user_agent_limit() {
+            let limit = |u: &[u8], l: usize| {
+                buf_call(|o, c| unsafe {
+                    nntmux_trusted_device_user_agent_limit(u.as_ptr(), u.len(), l, o, c)
+                })
+            };
+            assert_eq!(limit(b"Mozilla ", 500).unwrap(), b"Mozilla ");
+            assert_eq!(limit(b"abc  def", 5).unwrap(), b"abc");
+            assert_eq!(limit(b"abcdef", 5).unwrap(), b"abcde");
+            assert_eq!(limit(b"ab\0\x0b\t x", 6).unwrap(), b"ab");
+            assert_eq!(limit(b"\xC3\xA9", 500), Err(-1));
+            assert_eq!(
+                unsafe {
+                    nntmux_trusted_device_user_agent_limit(
+                        std::ptr::null(),
+                        1,
+                        5,
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                },
+                -1
+            );
+        }
+    }
+}
