@@ -8,6 +8,7 @@ use App\Enums\SecondarySearchIndex;
 use App\Facades\Search;
 use App\Models\SteamApp;
 use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Collection;
@@ -15,6 +16,7 @@ use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\RateLimiter;
+use Throwable;
 
 /**
  * SteamService - Comprehensive Steam API integration for PC Games.
@@ -900,6 +902,12 @@ class SteamService
      */
     protected function generateQueryVariants(string $title): array
     {
+        return $this->generateQueryVariantsPhp($title);
+    }
+
+    /** @return list<string> */
+    public function generateQueryVariantsPhp(string $title): array
+    {
         $variants = [$title];
 
         // Without edition tags (already cleaned, but be sure)
@@ -1098,6 +1106,12 @@ class SteamService
      */
     protected function tokenize(string $s): array
     {
+        return $this->tokenizePhp($s);
+    }
+
+    /** @return list<string> */
+    public function tokenizePhp(string $s): array
+    {
         $parts = preg_split('/\s+/u', mb_strtolower($s)) ?: [];
         $seen = [];
         $out = [];
@@ -1150,6 +1164,11 @@ class SteamService
      */
     protected function buildLikePattern(string $term): string
     {
+        return $this->buildLikePatternPhp($term);
+    }
+
+    public function buildLikePatternPhp(string $term): string
+    {
         $normalized = $this->normalizeTitle($term);
         $pattern = preg_replace('/\s+/', '%', $normalized);
         $pattern = trim($pattern ?? '');
@@ -1165,5 +1184,78 @@ class SteamService
         // Note: This is a placeholder. In production, you'd use tagged caches
         // or implement specific cache key management.
         Log::info('SteamService: Cache clear requested');
+    }
+
+    private static ?FFI $titleMatchingFfi = null;
+
+    private static bool $titleMatchingResolved = false;
+
+    private static function titleMatchingFfi(): ?FFI
+    {
+        if (! self::$titleMatchingResolved) {
+            self::$titleMatchingResolved = true;
+            self::$titleMatchingFfi = RustPipelineLibrary::resolveDomain('steam_title_matching', <<<'C'
+        ssize_t nntmux_steam_generate_query_variants_nul(const char *, size_t, char *, size_t);
+        ssize_t nntmux_steam_tokenize_nul(const char *, size_t, char *, size_t);
+        ssize_t nntmux_steam_build_like_pattern(const char *, size_t, char *, size_t);
+        C);
+        }
+
+        return self::$titleMatchingFfi;
+    }
+
+    /** Null means unavailable/declined; negative byte counts request an exact-size retry. */
+    private static function titleMatchingStringNative(string $symbol, string $input): ?string
+    {
+        $ffi = self::$titleMatchingFfi ?? self::titleMatchingFfi();
+        if ($ffi === null) {
+            return null;
+        }
+        $capacity = 0;
+        $buffer = RustPipelineLibrary::obtainScratch($ffi, max(256, strlen($input) + 32), $capacity);
+        if ($buffer === null) {
+            return null;
+        }
+        try {
+            $written = $ffi->$symbol($input, strlen($input), $buffer, $capacity);
+            if (! is_int($written) || $written === PHP_INT_MIN) {
+                return null;
+            }
+            if ($written < 0) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return null;
+                }
+                $written = $ffi->$symbol($input, strlen($input), $buffer, $capacity);
+            }
+            if (! is_int($written) || $written < 0 || $written > $capacity) {
+                return null;
+            }
+
+            return $written === 0 ? '' : FFI::string($buffer, $written);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** @return list<string>|null */
+    public static function generateQueryVariantsNative(string $title): ?array
+    {
+        $packed = self::titleMatchingStringNative('nntmux_steam_generate_query_variants_nul', $title);
+
+        return $packed === null ? null : ($packed === '' ? [] : explode("\0", $packed));
+    }
+
+    /** @return list<string>|null */
+    public static function tokenizeNative(string $title): ?array
+    {
+        $packed = self::titleMatchingStringNative('nntmux_steam_tokenize_nul', $title);
+
+        return $packed === null ? null : ($packed === '' ? [] : explode("\0", $packed));
+    }
+
+    public static function buildLikePatternNative(string $title): ?string
+    {
+        return self::titleMatchingStringNative('nntmux_steam_build_like_pattern', $title);
     }
 }
