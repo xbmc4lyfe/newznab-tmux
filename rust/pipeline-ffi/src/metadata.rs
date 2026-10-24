@@ -6140,6 +6140,711 @@ pub unsafe extern "C" fn nntmux_compact_fp_yenc_integrity(
 }
 
 #[inline]
+// ---- NzbManifestReader ----------------------------------------------------
+
+fn manifest_regex_ws(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
+}
+
+fn manifest_decimal_infinite(bytes: &[u8]) -> bool {
+    // PHP converts overflowing integer strings via double. Finite overflow
+    // clamps to the integer bound, but infinity converts to zero.
+    bytes.len() >= 309
+        && str::from_utf8(bytes)
+            .ok()
+            .and_then(|text| text.parse::<f64>().ok())
+            .is_some_and(f64::is_infinite)
+}
+
+fn manifest_decimal(bytes: &[u8]) -> i64 {
+    if manifest_decimal_infinite(bytes) {
+        return 0;
+    }
+    bytes.iter().fold(0_i64, |n, b| {
+        n.saturating_mul(10).saturating_add((b - b'0') as i64)
+    })
+}
+
+/// Locate PHP's trailing article counter, including preceding regex whitespace.
+fn manifest_part_suffix(subject: &[u8]) -> Option<(usize, i64)> {
+    let mut end = subject.len();
+    while end > 0 && manifest_regex_ws(subject[end - 1]) {
+        end -= 1;
+    }
+    if end == 0 || subject[end - 1] != b')' {
+        return None;
+    }
+    let total_end = end - 1;
+    let mut pos = total_end;
+    while pos > 0 && subject[pos - 1].is_ascii_digit() {
+        pos -= 1;
+    }
+    if pos == total_end || pos == 0 || subject[pos - 1] != b'/' {
+        return None;
+    }
+    let total = manifest_decimal(&subject[pos..total_end]);
+    pos -= 1;
+    let index_end = pos;
+    while pos > 0 && subject[pos - 1].is_ascii_digit() {
+        pos -= 1;
+    }
+    if pos == index_end || pos == 0 || subject[pos - 1] != b'(' {
+        return None;
+    }
+    pos -= 1;
+    while pos > 0 && manifest_regex_ws(subject[pos - 1]) {
+        pos -= 1;
+    }
+    Some((pos, total))
+}
+
+fn manifest_declared_count(subject: &[u8]) -> i64 {
+    // PCRE removes complete same-quote spans, but never spans CR or LF.
+    let mut outside = Vec::with_capacity(subject.len());
+    let mut pos = 0;
+    while pos < subject.len() {
+        let quote = subject[pos];
+        if matches!(quote, b'\'' | b'"') {
+            let mut end = pos + 1;
+            while end < subject.len() && !matches!(subject[end], b'\r' | b'\n') {
+                if subject[end] == quote {
+                    break;
+                }
+                end += 1;
+            }
+            if subject.get(end) == Some(&quote) {
+                pos = end + 1;
+                continue;
+            }
+        }
+        outside.push(quote);
+        pos += 1;
+    }
+    let end = manifest_part_suffix(&outside).map_or(outside.len(), |(start, _)| start);
+    let bytes = &outside[..end];
+    let mut expected = 0;
+    pos = 0;
+    while pos < bytes.len() {
+        if !matches!(bytes[pos], b'[' | b'(') || (pos > 0 && !manifest_regex_ws(bytes[pos - 1])) {
+            pos += 1;
+            continue;
+        }
+        let index_start = pos + 1;
+        let mut cursor = index_start;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+            cursor += 1;
+        }
+        if cursor == index_start || bytes.get(cursor) != Some(&b'/') {
+            pos += 1;
+            continue;
+        }
+        let index = manifest_decimal(&bytes[index_start..cursor]);
+        cursor += 1;
+        let total_start = cursor;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+            cursor += 1;
+        }
+        if cursor > total_start
+            && bytes.get(cursor).is_some_and(|b| matches!(b, b']' | b')'))
+            && (cursor + 1 == bytes.len() || manifest_regex_ws(bytes[cursor + 1]))
+        {
+            let total = manifest_decimal(&bytes[total_start..cursor]);
+            if total > 0 && index <= total {
+                expected = expected.max(total);
+            }
+            pos = cursor + 1;
+        } else {
+            pos += 1;
+        }
+    }
+    expected
+}
+
+/// Returns the checked-in PHP declared-file-count algorithm, or -1 to decline.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nzb_declared_file_count(
+    subject: *const u8,
+    subject_len: usize,
+) -> i64 {
+    if subject_len == 0 {
+        return 0;
+    }
+    if subject_len > 1_000_000 {
+        return -1;
+    }
+    unsafe { par2_input(subject, subject_len) }.map_or(-1, manifest_declared_count)
+}
+
+fn manifest_xml_char(ch: char) -> bool {
+    let code = ch as u32;
+    (matches!(code, 9 | 10 | 13) || code >= 0x20)
+        && code & 0xffff != 0xfffe
+        && code & 0xffff != 0xffff
+        && !(0xfdd0..=0xfdef).contains(&code)
+}
+
+/// XML 1.0 predefined/numeric references and end-of-line/attribute normalization.
+/// No entity expansion, DTD processing, namespace interpretation or recovery.
+fn manifest_xml_value(raw: &[u8], attr: bool) -> Option<Cow<'_, [u8]>> {
+    if raw.contains(&b'<') || (!attr && raw.windows(3).any(|s| s == b"]]>")) {
+        return None;
+    }
+    if !raw
+        .iter()
+        .any(|b| *b == b'&' || *b == b'\r' || (attr && matches!(b, b'\n' | b'\t')))
+    {
+        return Some(Cow::Borrowed(raw));
+    }
+    let mut out = Vec::with_capacity(raw.len());
+    let mut pos = 0;
+    while pos < raw.len() {
+        let byte = raw[pos];
+        if byte == b'&' {
+            let semi = raw[pos + 1..].iter().position(|b| *b == b';')? + pos + 1;
+            let entity = &raw[pos + 1..semi];
+            match entity {
+                b"amp" => out.push(b'&'),
+                b"lt" => out.push(b'<'),
+                b"gt" => out.push(b'>'),
+                b"quot" => out.push(b'"'),
+                b"apos" => out.push(b'\''),
+                _ => {
+                    let (digits, radix) = if entity.starts_with(b"#x") {
+                        (&entity[2..], 16)
+                    } else if entity.starts_with(b"#") {
+                        (&entity[1..], 10)
+                    } else {
+                        return None;
+                    };
+                    if digits.is_empty()
+                        || !digits.iter().all(|b| {
+                            if radix == 16 {
+                                b.is_ascii_hexdigit()
+                            } else {
+                                b.is_ascii_digit()
+                            }
+                        })
+                    {
+                        return None;
+                    }
+                    let code = u32::from_str_radix(str::from_utf8(digits).ok()?, radix).ok()?;
+                    let ch = char::from_u32(code).filter(|ch| manifest_xml_char(*ch))?;
+                    out.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
+                }
+            }
+            pos = semi + 1;
+        } else {
+            if byte == b'\r' {
+                out.push(if attr { b' ' } else { b'\n' });
+                if raw.get(pos + 1) == Some(&b'\n') {
+                    pos += 1;
+                }
+            } else if attr && matches!(byte, b'\n' | b'\t') {
+                out.push(b' ');
+            } else {
+                out.push(byte);
+            }
+            pos += 1;
+        }
+    }
+    Some(Cow::Owned(out))
+}
+
+struct ManifestXml<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> ManifestXml<'a> {
+    fn space(&mut self) -> Option<()> {
+        self.pos = skip_nzb_xml_ws_and_comments(self.bytes, self.pos)?;
+        Some(())
+    }
+
+    fn close(&mut self, tag: &[u8]) -> bool {
+        if let Some(pos) = expect_nzb_closing_tag(self.bytes, self.pos, tag) {
+            self.pos = pos;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn open(&mut self, tag: &[u8], attrs: &[&[u8]]) -> Option<(bool, Vec<Cow<'a, [u8]>>)> {
+        let start = match_nzb_tag_exact(self.bytes, self.pos, tag)?;
+        let mut values = vec![Cow::Borrowed(&b""[..]); attrs.len()];
+        let (end, empty) =
+            parse_nzb_xml_attributes(self.bytes, start, tag == b"<nzb", |name, raw| {
+                let Some(index) = attrs.iter().position(|a| *a == name) else {
+                    return false;
+                };
+                let Some(value) = manifest_xml_value(raw, true) else {
+                    return false;
+                };
+                values[index] = value;
+                true
+            })?;
+        self.pos = end;
+        Some((empty, values))
+    }
+
+    fn text(&mut self, close: &[u8], empty: bool) -> Option<Cow<'a, [u8]>> {
+        if empty {
+            return Some(Cow::Borrowed(b""));
+        }
+        let end = self.bytes[self.pos..].iter().position(|b| *b == b'<')? + self.pos;
+        let value = manifest_xml_value(&self.bytes[self.pos..end], false)?;
+        self.pos = end;
+        if !self.close(close) {
+            return None;
+        }
+        Some(value)
+    }
+}
+
+/// Restrict numeric attributes to a PHP integer cast whose result is unambiguous.
+fn manifest_integer(raw: &[u8]) -> Option<i64> {
+    let raw = raw.trim_ascii();
+    if raw.is_empty() {
+        return Some(0);
+    }
+    let (negative, digits) = match raw[0] {
+        b'-' => (true, &raw[1..]),
+        b'+' => (false, &raw[1..]),
+        _ => (false, raw),
+    };
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    if manifest_decimal_infinite(digits) {
+        return Some(0);
+    }
+    let mut result = 0_i64;
+    for digit in digits {
+        result = result.saturating_mul(10);
+        result = if negative {
+            result.saturating_sub((digit - b'0') as i64)
+        } else {
+            result.saturating_add((digit - b'0') as i64)
+        };
+    }
+    Some(result)
+}
+
+fn manifest_read_xml(bytes: &[u8]) -> Option<Vec<u8>> {
+    // Stay below libxml's default lexical limits; larger documents need PHP.
+    if bytes.len() > 8 * 1024 * 1024 || !str::from_utf8(bytes).ok()?.chars().all(manifest_xml_char)
+    {
+        return None;
+    }
+    let start = if bytes.starts_with(b"\xef\xbb\xbf") {
+        3
+    } else {
+        0
+    };
+    let mut xml = ManifestXml {
+        bytes,
+        pos: parse_nzb_xml_decl(bytes, start)?,
+    };
+    xml.space()?;
+    let (empty, root) = xml.open(b"<nzb", &[b"xmlns"])?;
+    if empty || (!root[0].is_empty() && root[0].as_ref() != b"http://www.newzbin.com/DTD/2003/nzb")
+    {
+        return None;
+    }
+    let mut files = PhpSerWriter::new();
+    let mut file_count = 0;
+    let mut groups: Vec<Vec<u8>> = Vec::new();
+    let mut group_set = std::collections::HashSet::new();
+    let mut expected = 0_i64;
+    let mut conflict = false;
+    let mut spot_check = false;
+    let mut had_head = false;
+    loop {
+        xml.space()?;
+        if xml.close(b"</nzb") {
+            break;
+        }
+        if match_nzb_tag_exact(bytes, xml.pos, b"<head").is_some() {
+            if had_head {
+                return None;
+            }
+            had_head = true;
+            let (empty, _) = xml.open(b"<head", &[])?;
+            if empty {
+                continue;
+            }
+            loop {
+                xml.space()?;
+                if xml.close(b"</head") {
+                    break;
+                }
+                let (empty, attrs) = xml.open(b"<meta", &[b"type"])?;
+                let kind = attrs[0].as_ref();
+                // Preserve PHP's complete password/protected-metadata boundary.
+                let lower: Vec<u8> = kind.iter().map(u8::to_ascii_lowercase).collect();
+                if lower.windows(8).any(|s| s == b"password")
+                    || lower.windows(7).any(|s| s == b"protect")
+                {
+                    return None;
+                }
+                let value = xml.text(b"</meta", empty)?;
+                if kind == b"nntmux:verification-mode" && value.as_ref() == b"spot-check" {
+                    spot_check = true;
+                }
+                if matches!(
+                    kind,
+                    b"nntmux:verified-file-count" | b"nntmux:declared-file-count"
+                ) && (1..=7).contains(&value.len())
+                    && matches!(value[0], b'1'..=b'9')
+                    && value.iter().all(u8::is_ascii_digit)
+                {
+                    expected = expected.max(manifest_decimal(&value));
+                }
+            }
+            continue;
+        }
+        let (empty, attrs) = xml.open(b"<file", &[b"subject", b"poster", b"date"])?;
+        let subject = attrs[0].as_ref();
+        if subject.len() > 1_000_000 {
+            return None;
+        }
+        expected = expected.max(manifest_declared_count(subject));
+        let suffix = manifest_part_suffix(subject);
+        let mut segments = PhpSerWriter::new();
+        let mut segment_count = 0;
+        let mut observed_parts = 0_i64;
+        let mut part_numbers = std::collections::HashSet::new();
+        let mut had_groups = false;
+        let mut had_segments = false;
+        if !empty {
+            loop {
+                xml.space()?;
+                if xml.close(b"</file") {
+                    break;
+                }
+                if match_nzb_tag_exact(bytes, xml.pos, b"<groups").is_some() {
+                    if had_groups {
+                        return None;
+                    }
+                    had_groups = true;
+                    let (empty, _) = xml.open(b"<groups", &[])?;
+                    if empty {
+                        continue;
+                    }
+                    loop {
+                        xml.space()?;
+                        if xml.close(b"</groups") {
+                            break;
+                        }
+                        let (empty, _) = xml.open(b"<group", &[])?;
+                        let value = xml.text(b"</group", empty)?;
+                        if group_set.insert(value.to_vec()) {
+                            groups.push(value.into_owned());
+                        }
+                    }
+                } else {
+                    if had_segments {
+                        return None;
+                    }
+                    had_segments = true;
+                    let (empty, _) = xml.open(b"<segments", &[])?;
+                    if empty {
+                        continue;
+                    }
+                    loop {
+                        xml.space()?;
+                        if xml.close(b"</segments") {
+                            break;
+                        }
+                        let (empty, attrs) = xml.open(b"<segment", &[b"number", b"bytes"])?;
+                        let number = manifest_integer(&attrs[0])?;
+                        let size = manifest_integer(&attrs[1])?;
+                        let value = xml.text(b"</segment", empty)?;
+                        let message_id = php_trim_bytes(&value);
+                        if number < 1 || !part_numbers.insert(number) {
+                            conflict = true;
+                        }
+                        if number > 0 && !message_id.is_empty() {
+                            observed_parts = observed_parts.max(number);
+                        }
+                        segments.idx(segment_count);
+                        segments.arr_open(3);
+                        segments.key(b"number");
+                        segments.int(number);
+                        segments.key(b"bytes");
+                        segments.int(size);
+                        segments.key(b"messageid");
+                        segments.str(message_id);
+                        segments.arr_close();
+                        segment_count += 1;
+                    }
+                }
+            }
+        }
+        files.idx(file_count);
+        files.arr_open(5);
+        files.key(b"key");
+        files.str(&crate::predb::sha256_hex_slice(subject));
+        files.key(b"subject");
+        files.str(&subject[..suffix.map_or(subject.len(), |(start, _)| start)]);
+        files.key(b"totalparts");
+        files.int(suffix.map_or(observed_parts, |(_, total)| total));
+        files.key(b"totalparts_inferred");
+        files.bool(suffix.is_none());
+        files.key(b"segments");
+        files.arr_open(segment_count);
+        files.raw(&segments.buf);
+        files.arr_close();
+        files.arr_close();
+        file_count += 1;
+    }
+    xml.space()?;
+    if xml.pos != bytes.len() || file_count == 0 {
+        return None;
+    }
+    let mut result = PhpSerWriter::new();
+    result.arr_open(3 + usize::from(conflict) + usize::from(spot_check));
+    result.key(b"expected_files");
+    result.int(expected);
+    result.key(b"groups");
+    result.arr_open(groups.len());
+    for (index, group) in groups.iter().enumerate() {
+        result.idx(index);
+        // array_keys() preserves PHP's conversion of canonical integer keys.
+        match str::from_utf8(group)
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+        {
+            Some(number) if number.to_string().as_bytes() == group => result.int(number),
+            _ => result.str(group),
+        }
+    }
+    result.arr_close();
+    result.key(b"files");
+    result.arr_open(file_count);
+    result.raw(&files.buf);
+    result.arr_close();
+    if conflict {
+        result.key(b"conflict");
+        result.bool(true);
+    }
+    if spot_check {
+        result.key(b"verification_mode");
+        result.str(b"spot_check");
+    }
+    result.arr_close();
+    Some(result.buf)
+}
+
+/// Serialize the XML-derived manifest fields. -1 requests PHP fallback; a larger
+/// negative magnitude is the required buffer capacity, following par2_emit.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nzb_manifest_read_xml(
+    xml: *const u8,
+    xml_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    let Some(result) = unsafe { par2_input(xml, xml_len) }.and_then(manifest_read_xml) else {
+        return -1;
+    };
+    unsafe { par2_emit(out_buf, out_cap, &result) }
+}
+
+#[cfg(test)]
+mod manifest_reader_tests {
+    use super::*;
+
+    #[test]
+    fn decimal_overflow_preserves_php_infinity_casts() {
+        for (digits, expected) in [
+            ("9".repeat(308), i64::MAX),
+            ("9".repeat(309), 0),
+            (format!("1{}", "0".repeat(308)), i64::MAX),
+            (format!("2{}", "0".repeat(308)), 0),
+            (format!("{}12", "0".repeat(400)), 12),
+        ] {
+            assert_eq!(manifest_decimal(digits.as_bytes()), expected);
+            assert_eq!(manifest_integer(digits.as_bytes()), Some(expected));
+        }
+        let huge_negative = format!("-{}", "9".repeat(309));
+        assert_eq!(manifest_integer(huge_negative.as_bytes()), Some(0));
+        let huge_attribute = format!("<nzb><file poster=\"{}\"/></nzb>", "x".repeat(10_000_001));
+        assert!(manifest_read_xml(huge_attribute.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn declared_count_matches_php_counter_boundaries() {
+        for (subject, expected) in [
+            ("[1/42] \"[1/900].rar\" (1/12)", 42),
+            ("'[1/999]' (1/15)", 0),
+            ("[0/42] [43/42] [1/0]", 42),
+            ("name[1/42] [1/12]suffix", 0),
+            ("[1/7) (1/9] tail", 9),
+            ("[1/42]\u{b}[1/55]\u{c}(1/3)\u{b}", 55),
+            ("\"broken\n[1/23] tail", 23),
+            ("[0001/00042] tail", 42),
+            ("[1/99999999999999999999999] tail", i64::MAX),
+        ] {
+            assert_eq!(
+                unsafe { nntmux_nzb_declared_file_count(subject.as_ptr(), subject.len()) },
+                expected,
+                "{subject:?}"
+            );
+        }
+        assert_eq!(
+            unsafe { nntmux_nzb_declared_file_count(std::ptr::null(), 0) },
+            0
+        );
+        assert_eq!(
+            unsafe { nntmux_nzb_declared_file_count(std::ptr::null(), 1) },
+            -1
+        );
+    }
+
+    #[test]
+    fn manifest_reader_serializes_metadata_files_and_conflicts() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+        <nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+          <head><meta type="unused">ignored</meta>
+            <meta type="nntmux:declared-file-count">32</meta>
+            <meta type="nntmux:verification-mode">spot-check</meta></head>
+          <file subject="[1/42] &quot;name.rar&quot; (1/4)" poster="poster" date="1">
+            <groups><group>alt.test</group><group>12</group><group>alt.test</group><group>01</group></groups>
+            <segments><segment number="2" bytes="-12"> &lt;id&gt; </segment>
+              <segment number="2" bytes="+34">duplicate</segment>
+              <segment number="0" bytes="0"/></segments>
+          </file>
+          <file subject="inferred"><segments><segment number="9" bytes="1"> </segment>
+            <segment number="3" bytes="2">id</segment></segments></file>
+        </nzb>"#;
+        let serialized = manifest_read_xml(xml).unwrap();
+        let parsed = PhpSerParser::parse_document(&serialized).unwrap();
+        assert_eq!(parsed.get(b"expected_files").unwrap().as_int(), Some(42));
+        assert_eq!(parsed.get(b"conflict").unwrap().raw, b"b:1;");
+        assert_eq!(
+            parsed.get(b"verification_mode").unwrap().as_str(),
+            Some(&b"spot_check"[..])
+        );
+        let groups = parsed.get(b"groups").unwrap();
+        assert_eq!(groups.items().len(), 3);
+        assert_eq!(groups.items()[1].1.as_int(), Some(12));
+        assert_eq!(groups.items()[2].1.as_str(), Some(&b"01"[..]));
+        let files = parsed.get(b"files").unwrap();
+        let file = &files.items()[0].1;
+        assert_eq!(
+            file.get(b"subject").unwrap().as_str(),
+            Some(&b"[1/42] \"name.rar\""[..])
+        );
+        assert_eq!(
+            file.get(b"key").unwrap().as_str(),
+            Some(crate::predb::sha256_hex_slice(b"[1/42] \"name.rar\" (1/4)").as_slice())
+        );
+        assert_eq!(file.get(b"totalparts").unwrap().as_int(), Some(4));
+        assert_eq!(
+            files.items()[1].1.get(b"totalparts").unwrap().as_int(),
+            Some(3)
+        );
+        let first_segment = &file.get(b"segments").unwrap().items()[0].1;
+        assert_eq!(first_segment.get(b"bytes").unwrap().as_int(), Some(-12));
+        assert_eq!(
+            first_segment.get(b"messageid").unwrap().as_str(),
+            Some(&b"<id>"[..])
+        );
+        let mut tiny = [0; 2];
+        let required = unsafe {
+            nntmux_nzb_manifest_read_xml(xml.as_ptr(), xml.len(), tiny.as_mut_ptr(), tiny.len())
+        };
+        assert_eq!(required, -(serialized.len() as isize));
+        let mut output = vec![0; serialized.len()];
+        assert_eq!(
+            unsafe {
+                nntmux_nzb_manifest_read_xml(
+                    xml.as_ptr(),
+                    xml.len(),
+                    output.as_mut_ptr(),
+                    output.len(),
+                )
+            },
+            serialized.len() as isize
+        );
+        assert_eq!(output, serialized);
+    }
+
+    #[test]
+    fn manifest_reader_normalizes_xml_but_preserves_character_references() {
+        let xml = "\u{feff}<nzb><file subject=\"Café\r\nfile\t(1/2)\"><groups><group>a\r\nb</group></groups><segments><segment number=\"1\" bytes=\"2\">x&#13;y\r\nz</segment></segments></file></nzb>";
+        let output = manifest_read_xml(xml.as_bytes()).unwrap();
+        let parsed = PhpSerParser::parse_document(&output).unwrap();
+        let file = &parsed.get(b"files").unwrap().items()[0].1;
+        assert_eq!(
+            file.get(b"subject").unwrap().as_str(),
+            Some("Café file".as_bytes())
+        );
+        assert_eq!(
+            parsed.get(b"groups").unwrap().items()[0].1.as_str(),
+            Some(&b"a\nb"[..])
+        );
+        assert_eq!(
+            file.get(b"segments").unwrap().items()[0]
+                .1
+                .get(b"messageid")
+                .unwrap()
+                .as_str(),
+            Some(&b"x\ry\nz"[..])
+        );
+    }
+
+    #[test]
+    fn manifest_reader_declines_unsafe_and_noncanonical_xml() {
+        for xml in [
+            "<nzb/>",
+            "<nzb></nzb>",
+            "<!DOCTYPE nzb><nzb><file/></nzb>",
+            "<!DOCTYPE nzb [<!ENTITY x 'x'>]><nzb><file subject='&x;'/></nzb>",
+            "<nzb><file><segments><segment><![CDATA[id]]></segment></segments></file></nzb>",
+            "<nzb><head><meta type='password'>secret</meta></head><file/></nzb>",
+            "<nzb><head><meta type='pass&#119;ord'>secret</meta></head><file/></nzb>",
+            "<nzb><head><meta type='PASSWORD'>secret</meta></head><file/></nzb>",
+            "<nzb><head><meta type='protected'>true</meta></head><file/></nzb>",
+            "<nzb><head/><head/><file/></nzb>",
+            "<nzb xmlns='urn:evil'><file/></nzb>",
+            "<nzb><file xmlns=''/></nzb>",
+            "<n:nzb xmlns:n='http://www.newzbin.com/DTD/2003/nzb'><n:file/></n:nzb>",
+            "<nzb><file x:subject='x'/></nzb>",
+            "<nzb><file subject='a'subject='b'/></nzb>",
+            "<nzb><file subject='a'poster='b'/></nzb>",
+            "<nzb><file subject='a' subject='b'/></nzb>",
+            "<nzb><file subject='a' / ></nzb>",
+            "<nzb><file subject='a'></files></nzb>",
+            "<nzb><file><groups/><groups/></file></nzb>",
+            "<nzb><file subject='&#xFFFF;'/></nzb>",
+            "<nzb><file subject='&#0;'/></nzb>",
+            "<nzb><file subject='&#X41;'/></nzb>",
+            "<nzb><file subject='&unknown;'/></nzb>",
+            "<nzb><file subject='<bad'/></nzb>",
+            "<nzb><!-- invalid -- comment --><file/></nzb>",
+            "<nzb><file><groups><group>]]></group></groups></file></nzb>",
+            "<nzb><file/></nzb><nzb/>",
+            "<nzb>\u{b}<file/></nzb>",
+            "<nzb><file subject='\u{c}'/></nzb>",
+            "<nzb><file subject='\0'/></nzb>",
+            " <?xml version='1.0'?><nzb><file/></nzb>",
+        ] {
+            assert!(
+                manifest_read_xml(xml.as_bytes()).is_none(),
+                "accepted {xml:?}"
+            );
+        }
+        assert!(manifest_read_xml(b"<nzb><file subject='\xff'/></nzb>").is_none());
+        assert_eq!(
+            unsafe { nntmux_nzb_manifest_read_xml(std::ptr::null(), 0, std::ptr::null_mut(), 0) },
+            -1
+        );
+    }
+}
+
 fn is_nzb_xml_ws(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\r' | b'\n')
 }
