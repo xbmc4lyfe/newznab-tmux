@@ -9,6 +9,9 @@ use App\Services\AdditionalProcessing\DTO\AdditionalWorkPlan;
 use App\Services\AdditionalProcessing\DTO\ArchivedMediaEntry;
 use App\Services\AdditionalProcessing\DTO\DownloadedArchive;
 use App\Services\AdditionalProcessing\DTO\MediaSourcePlan;
+use App\Support\RustPipelineLibrary;
+use FFI;
+use Throwable;
 
 /**
  * Mutable context object that holds the processing state for a single release.
@@ -21,6 +24,14 @@ use App\Services\AdditionalProcessing\DTO\MediaSourcePlan;
  */
 class ReleaseProcessingContext
 {
+    // Caller-level FFI benchmarks must qualify every workload before adoption.
+    private static bool $useRustFfi = false;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
     private const int MAX_RETAINED_ARCHIVES = 2;
 
     private const int MAX_RETAINED_ARCHIVE_BYTES = 16_777_216;
@@ -443,15 +454,57 @@ class ReleaseProcessingContext
     /** Admit names once, before callers retain them for naming or inventory. */
     public function rememberNamingWitness(string $name): bool
     {
+        return self::$useRustFfi ? $this->rememberNamingWitnessNative($name) : $this->rememberNamingWitnessPhp($name);
+    }
+
+    /** @phpstan-impure */
+    public function rememberNamingWitnessNative(string $name): bool
+    {
+        return $this->admitNamingWitness($name, true);
+    }
+
+    /** @phpstan-impure */
+    public function rememberNamingWitnessPhp(string $name): bool
+    {
+        return $this->admitNamingWitness($name, false);
+    }
+
+    public function validateNamingWitnessPhp(string $name): bool
+    {
+        return $name !== '' && strlen($name) <= 4096 && preg_match('//u', $name) === 1
+            && count($this->archiveNamingWitnesses) < self::MAX_ARCHIVE_FILE_NAMES
+            && $this->namingWitnessBytes + strlen($name) <= self::MAX_NAMING_WITNESS_BYTES;
+    }
+
+    public function validateNamingWitnessNative(string $name): ?bool
+    {
+        try {
+            $ffi = RustPipelineLibrary::resolveDomain('additional',
+                'int32_t nntmux_additional_validate_naming_witness(const char *input, size_t len, size_t count, size_t total);');
+            if ($ffi === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound (domain C ABI)
+            $valid = $ffi->nntmux_additional_validate_naming_witness($name, strlen($name), count($this->archiveNamingWitnesses), $this->namingWitnessBytes);
+
+            return match ($valid) {
+                0 => false, 1 => true, default => null
+            };
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private function admitNamingWitness(string $name, bool $native): bool
+    {
         if ($this->namingWitnessesOmitted) {
             return false;
         }
         if (isset($this->archiveNamingWitnesses[$name])) {
             return true;
         }
-        if ($name === '' || strlen($name) > 4096 || ! mb_check_encoding($name, 'UTF-8')
-            || count($this->archiveNamingWitnesses) >= self::MAX_ARCHIVE_FILE_NAMES
-            || $this->namingWitnessBytes + strlen($name) > self::MAX_NAMING_WITNESS_BYTES) {
+        $valid = $native ? ($this->validateNamingWitnessNative($name) ?? $this->validateNamingWitnessPhp($name)) : $this->validateNamingWitnessPhp($name);
+        if (! $valid) {
             $this->namingWitnessesOmitted = true;
             $this->archiveNameEvidenceIncomplete = true;
 
@@ -539,6 +592,22 @@ class ReleaseProcessingContext
      */
     public function compressedFilesAreMedia(): bool
     {
+        return self::$useRustFfi ? ($this->compressedFilesAreMediaNative() ?? $this->compressedFilesAreMediaPhp()) : $this->compressedFilesAreMediaPhp();
+    }
+
+    public function compressedFilesAreMediaNative(): ?bool
+    {
+        $files = [['is_media' => $this->mediaVolumeSets !== [] && ! $this->unplannedArchiveSeen]];
+        foreach ($this->workPlan->archiveCandidates ?? [] as $candidate) {
+            $files[] = ['is_media' => isset($this->mediaVolumeSets[$candidate->volumeSet()])];
+        }
+        $result = self::nativeJson($files);
+
+        return is_bool($result) ? $result : null;
+    }
+
+    public function compressedFilesAreMediaPhp(): bool
+    {
         if ($this->mediaVolumeSets === [] || $this->unplannedArchiveSeen) {
             return false;
         }
@@ -589,5 +658,40 @@ class ReleaseProcessingContext
     public function getElapsedSeconds(): int
     {
         return (int) ((hrtime(true) - $this->startTime) / 1e9);
+    }
+
+    /** @param array<mixed> $input */
+    private static function nativeJson(array $input): mixed
+    {
+        try {
+            $ffi = RustPipelineLibrary::resolveDomain('additional',
+                'ssize_t nntmux_additional_compressed_files_are_media_json(const char *input, size_t len, char *out, size_t cap);');
+            if ($ffi === null) {
+                return null;
+            }
+            $json = json_encode($input, JSON_THROW_ON_ERROR | JSON_PRESERVE_ZERO_FRACTION);
+            $cap = 0;
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, max(256, strlen($json)), $cap);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound (domain C ABI)
+            $written = $ffi->nntmux_additional_compressed_files_are_media_json($json, strlen($json), $scratch, $cap);
+            if ($written < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound (domain C ABI)
+                $written = $ffi->nntmux_additional_compressed_files_are_media_json($json, strlen($json), $scratch, $cap);
+            }
+            if ($written < 0 || $written > $cap) {
+                return null;
+            }
+
+            return json_decode(FFI::string($scratch, $written), true, flags: JSON_THROW_ON_ERROR);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }
