@@ -27,6 +27,7 @@ use App\Support\RustPipelineLibrary;
 use App\Support\SecondaryIndexDocuments;
 use Elastic\Elasticsearch\Client;
 use Elastic\Elasticsearch\Exception\ElasticsearchException;
+use FFI\CData;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
@@ -41,6 +42,37 @@ use RuntimeException;
 class ElasticSearchDriver implements PredbFilenameCandidateLookup, ReleaseCandidatePager, SearchDriverInterface
 {
     private const CACHE_TTL_MINUTES = 5;
+
+    private const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_elastic_escape_string(const char *input_ptr, size_t input_len, uint8_t *out_buf, size_t out_cap);
+        C;
+
+    private static ?bool $useRustFfi = null;
+
+    private static \FFI|false|null $ffi = null;
+
+    private static ?CData $escapeBuf = null;
+
+    private static int $escapeCap = 0;
+
+    public static function setUseRustFfi(?bool $useRust): void
+    {
+        self::$useRustFfi = $useRust;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? false;
+    }
+
+    public static function ffi(): ?\FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('elastic_escape_string', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
 
     private const SCROLL_TIMEOUT = '30s';
 
@@ -302,6 +334,64 @@ class ElasticSearchDriver implements PredbFilenameCandidateLookup, ReleaseCandid
      * Escape special characters for Elasticsearch.
      */
     public static function escapeString(string $string): string
+    {
+        if (self::$useRustFfi === true) {
+            $native = self::escapeStringNative($string);
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
+        return self::escapeStringPhp($string);
+    }
+
+    public static function escapeStringNative(string $string): ?string
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        if ($string === '' || $string === '0' || $string === '*') {
+            return '';
+        }
+
+        $len = strlen($string);
+        $needed = max(256, $len + 16);
+        if (self::$escapeBuf === null || self::$escapeCap < $needed) {
+            self::$escapeCap = $needed;
+            self::$escapeBuf = $ffi->new("uint8_t[{$needed}]");
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_elastic_escape_string(
+            $string,
+            $len,
+            self::$escapeBuf,
+            self::$escapeCap,
+        );
+        if ($written < -1) {
+            $req = -$written;
+            self::$escapeCap = max($req + 16, 256);
+            self::$escapeBuf = $ffi->new('uint8_t['.self::$escapeCap.']');
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_elastic_escape_string(
+                $string,
+                $len,
+                self::$escapeBuf,
+                self::$escapeCap,
+            );
+        }
+        if ($written < 0) {
+            return null;
+        }
+        if ($written === 0) {
+            return '';
+        }
+
+        return \FFI::string(self::$escapeBuf, $written);
+    }
+
+    public static function escapeStringPhp(string $string): string
     {
         if (empty($string) || $string === '*') {
             return '';

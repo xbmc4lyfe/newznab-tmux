@@ -29,6 +29,7 @@ use App\Support\PredbSearchDocument;
 use App\Support\ReleaseSearchIndexDocument;
 use App\Support\RustPipelineLibrary;
 use App\Support\SecondaryIndexDocuments;
+use FFI\CData;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -43,6 +44,37 @@ use Manticoresearch\Search;
 class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCandidateLookup, ReleaseCandidatePager, SearchDriverInterface
 {
     private const AVAILABILITY_CHECK_CACHE_TTL = 30;
+
+    private const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_manticore_phrases_to_fuzzy(const char *input_ptr, size_t input_len, size_t segment_count, uint8_t *out_buf, size_t out_cap);
+        C;
+
+    private static ?bool $useRustFfi = null;
+
+    private static \FFI|false|null $ffi = null;
+
+    private static ?CData $fuzzyBuf = null;
+
+    private static int $fuzzyCap = 0;
+
+    public static function setUseRustFfi(?bool $useRust): void
+    {
+        self::$useRustFfi = $useRust;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? false;
+    }
+
+    public static function ffi(): ?\FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('manticore_fuzzy_phrases', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
 
     /** @var list<string> */
     /**
@@ -3330,10 +3362,10 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
     }
 
     /**
-     * @param  array<string, mixed>|string  $phrases
-     * @return array<string, mixed>
+     * @param  array<int|string, mixed>|string  $phrases
+     * @return array<int|string, mixed>
      */
-    private function phrasesToSearchArray(array|string $phrases): array
+    private static function phrasesToSearchArrayStatic(array|string $phrases): array
     {
         if (is_string($phrases)) {
             return ['searchname' => $phrases];
@@ -3348,10 +3380,152 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
 
     /**
      * @param  array<string, mixed>|string  $phrases
+     * @return array<string, mixed>
      */
-    private function phrasesToFuzzyString(array|string $phrases): string
+    private function phrasesToSearchArray(array|string $phrases): array
     {
-        $searchArray = $this->phrasesToSearchArray($phrases);
+        return self::phrasesToSearchArrayStatic($phrases);
+    }
+
+    /**
+     * @param  array<int|string, mixed>|string  $phrases
+     */
+    public static function phrasesToFuzzyString(array|string $phrases): string
+    {
+        if (self::$useRustFfi === true) {
+            $native = self::phrasesToFuzzyStringNative($phrases);
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
+        return self::phrasesToFuzzyStringPhp($phrases);
+    }
+
+    /**
+     * @param  array<int|string, mixed>|string  $phrases
+     */
+    public static function phrasesToFuzzyStringNative(array|string $phrases): ?string
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+
+        if (is_string($phrases)) {
+            if ($phrases === '' || $phrases === '0') {
+                return '';
+            }
+
+            return self::callManticorePhrasesToFuzzy($ffi, $phrases, 1);
+        }
+
+        if ($phrases === []) {
+            return '';
+        }
+
+        $isAssociative = false;
+        foreach ($phrases as $k => $_) {
+            if (is_string($k)) {
+                $isAssociative = true;
+                break;
+            }
+        }
+
+        if (! $isAssociative) {
+            $joined = implode(' ', $phrases);
+            if ($joined === '' || $joined === '0') {
+                return '';
+            }
+
+            return self::callManticorePhrasesToFuzzy($ffi, $joined, 1);
+        }
+
+        $segments = [];
+        $hasNul = false;
+        foreach ($phrases as $value) {
+            if (! empty($value)) {
+                $s = (string) $value;
+                if (str_contains($s, "\0")) {
+                    $hasNul = true;
+                }
+                $segments[] = $s;
+            }
+        }
+
+        $segCount = count($segments);
+        if ($segCount === 0) {
+            return '';
+        }
+        if ($segCount === 1) {
+            return self::callManticorePhrasesToFuzzy($ffi, $segments[0], 1);
+        }
+        if (! $hasNul) {
+            $packed = implode("\0", $segments);
+
+            return self::callManticorePhrasesToFuzzy($ffi, $packed, $segCount);
+        }
+
+        $cleaned = [];
+        foreach ($segments as $seg) {
+            $part = self::callManticorePhrasesToFuzzy($ffi, $seg, 1);
+            if ($part === null) {
+                return null;
+            }
+            if ($part !== '') {
+                $cleaned[] = $part;
+            }
+        }
+
+        return implode(' ', $cleaned);
+    }
+
+    private static function callManticorePhrasesToFuzzy(\FFI $ffi, string $packed, int $segCount): ?string
+    {
+        $len = strlen($packed);
+        $needed = max(256, $len + 16);
+        if (self::$fuzzyBuf === null || self::$fuzzyCap < $needed) {
+            self::$fuzzyCap = $needed;
+            self::$fuzzyBuf = $ffi->new("uint8_t[{$needed}]");
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_manticore_phrases_to_fuzzy(
+            $packed,
+            $len,
+            $segCount,
+            self::$fuzzyBuf,
+            self::$fuzzyCap,
+        );
+        if ($written < -1) {
+            $req = -$written;
+            self::$fuzzyCap = max($req + 16, 256);
+            self::$fuzzyBuf = $ffi->new('uint8_t['.self::$fuzzyCap.']');
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_manticore_phrases_to_fuzzy(
+                $packed,
+                $len,
+                $segCount,
+                self::$fuzzyBuf,
+                self::$fuzzyCap,
+            );
+        }
+        if ($written < 0) {
+            return null;
+        }
+        if ($written === 0) {
+            return '';
+        }
+
+        return \FFI::string(self::$fuzzyBuf, $written);
+    }
+
+    /**
+     * @param  array<int|string, mixed>|string  $phrases
+     */
+    public static function phrasesToFuzzyStringPhp(array|string $phrases): string
+    {
+        $searchArray = self::phrasesToSearchArrayStatic($phrases);
         $searchTerms = [];
         foreach ($searchArray as $value) {
             if (! empty($value)) {
