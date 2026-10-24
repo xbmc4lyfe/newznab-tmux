@@ -5794,3 +5794,705 @@ mod release_town_tests {
         assert_eq!(release_town::capture("Unicode\u{212a}".as_bytes()), Err(()));
     }
 }
+
+// Season detection uses PHP's byte patterns and ASCII strtolower, including for
+// Unicode/raw filename bytes. String normalizers retain PHP/ICU Unicode fallback.
+unsafe fn wave9_input<'a>(input: *const u8, len: usize) -> Option<&'a [u8]> {
+    if len > isize::MAX as usize || input.is_null() && len != 0 {
+        None
+    } else if len == 0 {
+        Some(&[])
+    } else {
+        Some(unsafe { slice::from_raw_parts(input, len) })
+    }
+}
+
+#[inline]
+fn wave9_episode_separator(byte: u8) -> bool {
+    matches!(byte, b'.' | b'_' | b' ' | b'-')
+}
+
+/// Only the fields needed by `parseEpisode` identity consumers. The S-pattern
+/// takes precedence over the x-pattern, even when the x-marker occurs first.
+fn wave9_episode_identity(name: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    let base = crate::filename::season_pack_base_name(name);
+    if base.is_empty() || crate::filename::matches_sample_regex(base) {
+        return None;
+    }
+    let mut matched = None;
+    for x_pattern in [false, true] {
+        for marker in 2..base.len() {
+            if !wave9_episode_separator(base[marker - 1]) {
+                continue;
+            }
+            let mut season_start = marker;
+            if !x_pattern {
+                if !matches!(base[marker], b's' | b'S') {
+                    continue;
+                }
+                season_start += 1;
+            }
+            let mut season_end = season_start;
+            while season_end < base.len() && base[season_end].is_ascii_digit() {
+                season_end += 1;
+            }
+            if !(1..=if x_pattern { 2 } else { 4 }).contains(&(season_end - season_start)) {
+                continue;
+            }
+            let mut delimiter = season_end;
+            if !x_pattern
+                && base
+                    .get(delimiter)
+                    .is_some_and(|b| matches!(b, b'.' | b'_' | b' '))
+            {
+                delimiter += 1;
+            }
+            if !base.get(delimiter).is_some_and(|b| {
+                if x_pattern {
+                    matches!(b, b'x' | b'X')
+                } else {
+                    matches!(b, b'e' | b'E')
+                }
+            }) {
+                continue;
+            }
+            let episode_start = delimiter + 1;
+            let mut episode_end = episode_start;
+            while episode_end < base.len() && base[episode_end].is_ascii_digit() {
+                episode_end += 1;
+            }
+            if !(if x_pattern { 2 } else { 1 }..=if x_pattern { 3 } else { 4 })
+                .contains(&(episode_end - episode_start))
+                || x_pattern && base.get(episode_end).is_some_and(u8::is_ascii_alphanumeric)
+            {
+                continue;
+            }
+            // `.+?` must consume at least one byte, while the following
+            // separator run is greedy. Compound S episodes affect only `rest`,
+            // which is not used by either identity consumer.
+            let mut prefix_end = marker - 1;
+            while prefix_end > 1 && wave9_episode_separator(base[prefix_end - 1]) {
+                prefix_end -= 1;
+            }
+            matched = Some((
+                &base[..prefix_end],
+                &base[season_start..season_end],
+                &base[episode_start..episode_end],
+            ));
+            break;
+        }
+        if matched.is_some() {
+            break;
+        }
+    }
+    let (prefix, season, episode) = matched?;
+    let prefix = php_trim_ascii(prefix);
+    if prefix.is_empty() {
+        return None;
+    }
+    let mut key = Vec::with_capacity(prefix.len());
+    let mut separator = false;
+    for &byte in prefix {
+        if wave9_episode_separator(byte) {
+            separator = true;
+        } else {
+            if separator && !key.is_empty() {
+                key.push(b'.');
+            }
+            key.push(byte.to_ascii_lowercase());
+            separator = false;
+        }
+    }
+    let number = |digits: &[u8]| {
+        digits
+            .iter()
+            .fold(0u32, |n, &b| n * 10 + u32::from(b - b'0'))
+    };
+    Some((key, number(season), number(episode)))
+}
+
+fn wave9_basename(name: &[u8]) -> &[u8] {
+    let mut base = php_trim_ascii(name);
+    while base.last().is_some_and(|b| matches!(b, b'/' | b'\\')) {
+        base = &base[..base.len() - 1];
+    }
+    match base.iter().rposition(|b| matches!(b, b'/' | b'\\')) {
+        Some(slash) => &base[slash + 1..],
+        None => base,
+    }
+}
+
+fn wave9_ancillary(name: &[u8]) -> bool {
+    if crate::filename::matches_sample_regex(crate::filename::season_pack_base_name(name)) {
+        return true;
+    }
+    let base = wave9_basename(name);
+    let Some(dot) = base.iter().rposition(|&b| b == b'.') else {
+        return false;
+    };
+    // The basename was trimmed before splitting, but may have a final LF when
+    // followed by a slash; PCRE's `$` also accepts immediately before that LF.
+    let extension = base[dot + 1..]
+        .strip_suffix(b"\n")
+        .unwrap_or(&base[dot + 1..]);
+    [
+        &b"nfo"[..],
+        b"sfv",
+        b"nzb",
+        b"srr",
+        b"srs",
+        b"par2",
+        b"jpg",
+        b"jpeg",
+        b"png",
+        b"gif",
+        b"bmp",
+        b"tif",
+        b"tiff",
+        b"webp",
+        b"txt",
+        b"diz",
+        b"md5",
+        b"sha1",
+        b"cue",
+        b"log",
+        b"srt",
+        b"sub",
+        b"idx",
+        b"ass",
+        b"ssa",
+        b"vtt",
+        b"sup",
+    ]
+    .iter()
+    .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+}
+
+/// `-1` requests PHP fallback; otherwise returns the exact Boolean result.
+///
+/// # Safety
+/// Non-null input must be readable for input_len bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_season_pack_is_unclassified_episode(
+    input: *const u8,
+    input_len: usize,
+) -> i32 {
+    let Some(bytes) = (unsafe { wave9_input(input, input_len) }) else {
+        return -1;
+    };
+    if bytes.contains(&b'\n') {
+        return -1;
+    }
+    let base = crate::filename::season_pack_base_name(bytes);
+    i32::from(
+        !crate::filename::matches_sample_regex(base)
+            && crate::filename::is_episode_name(base)
+            && wave9_episode_identity(bytes).is_none(),
+    )
+}
+
+/// NUL-separated names; empty input means no names and a final delimiter is
+/// optional. Bit zero is distinct identity; remaining bits count ancillary
+/// entries, including duplicates and entries after an identity distinction.
+/// `-1` requests fallback for invalid/unsupported input or count overflow.
+///
+/// # Safety
+/// Non-null input must be readable for input_len bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_season_pack_has_distinct_identities_nul(
+    input: *const u8,
+    input_len: usize,
+) -> i32 {
+    let Some(bytes) = (unsafe { wave9_input(input, input_len) }) else {
+        return -1;
+    };
+    if bytes.contains(&b'\n') {
+        return -1;
+    }
+    if bytes.is_empty() {
+        return 0;
+    }
+    let mut first = None;
+    let mut distinct = false;
+    let mut ancillary = 0i32;
+    for name in bytes.split(|&b| b == 0) {
+        if wave9_ancillary(name) {
+            let Some(count) = ancillary
+                .checked_add(1)
+                .filter(|&count| count <= i32::MAX >> 1)
+            else {
+                return -1;
+            };
+            ancillary = count;
+        }
+        if !distinct {
+            if let Some(identity) = wave9_episode_identity(name) {
+                if let Some(previous) = &first {
+                    distinct = previous != &identity;
+                } else {
+                    first = Some(identity);
+                }
+            }
+        }
+    }
+    (ancillary << 1) | i32::from(distinct)
+}
+
+/// `-1` requests PHP fallback; otherwise returns the exact Boolean result.
+///
+/// # Safety
+/// Non-null input must be readable for input_len bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_season_pack_is_ancillary_name(
+    input: *const u8,
+    input_len: usize,
+) -> i32 {
+    let Some(bytes) = (unsafe { wave9_input(input, input_len) }) else {
+        return -1;
+    };
+    i32::from(wave9_ancillary(bytes))
+}
+
+/// Returns the first season folder's raw segment offset, `-2` for no folder,
+/// or `-1` for invalid/unsupported input. The last segment is the file name.
+///
+/// # Safety
+/// Non-null input must be readable for input_len bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_season_pack_season_folder(
+    input: *const u8,
+    input_len: usize,
+) -> i32 {
+    let Some(bytes) = (unsafe { wave9_input(input, input_len) }) else {
+        return -1;
+    };
+    if bytes.contains(&b'\n') {
+        return -1;
+    }
+    let mut start = 0;
+    for (end, &byte) in bytes.iter().enumerate() {
+        if matches!(byte, b'/' | b'\\') {
+            let segment = php_trim_ascii(&bytes[start..end]);
+            if !segment.is_empty() && crate::filename::is_season_pack(segment) {
+                return i32::try_from(start).unwrap_or(-1);
+            }
+            start = end + 1;
+        }
+    }
+    -2
+}
+
+fn wave9_anime_encoding(input: &[u8]) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(input).ok()?;
+    // Unicode whitespace survives later stages or needs ICU/PCRE property
+    // agreement in the first pattern, so let the existing PHP implementation
+    // handle it. No HTML entity decoding occurs in the PHP method.
+    if text.chars().any(|c| !c.is_ascii() && c.is_whitespace()) {
+        return None;
+    }
+    let mut stage = String::with_capacity(input.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == 'Ã' {
+            let mut lookahead = chars.clone();
+            if lookahead.next() == Some('¢') && lookahead.next() == Some('Â') {
+                chars = lookahead;
+                while chars.peek().is_some_and(|c| {
+                    *c == '_' || *c == 'Â' || c.is_ascii() && is_pcre_space(*c as u8)
+                }) {
+                    chars.next();
+                }
+                continue;
+            }
+        }
+        stage.push(c);
+    }
+    let mut second = String::with_capacity(stage.len());
+    let mut chars = stage.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == 'Ã'
+            && chars
+                .peek()
+                .is_some_and(|c| matches!(c, '¢' | 'Â' | '©' | '€' | '£'))
+        {
+            chars.next();
+        } else if c != 'Â' {
+            second.push(c);
+        }
+    }
+    let mut output = Vec::with_capacity(second.len());
+    let mut chars = second.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == 'Ã' {
+            while chars
+                .peek()
+                .is_some_and(|c| !c.is_ascii() || !is_pcre_space(*c as u8))
+            {
+                chars.next();
+            }
+            continue;
+        }
+        if c.is_ascii() {
+            let byte = c as u8;
+            if !matches!(byte, 0..=8 | 11..=12 | 14..=31 | 127) {
+                output.push(byte);
+            }
+        } else if !matches!(c, '\u{00c0}'..='\u{00c5}') {
+            // NFC cannot be implemented exactly using std. All supported
+            // survivors before the final artifact removal are ASCII or the
+            // already-normalized U+00C0..U+00C5 characters removed by PHP.
+            return None;
+        }
+    }
+    Some(output)
+}
+
+unsafe fn wave9_write_output(output: &[u8], out: *mut u8, cap: usize) -> isize {
+    let Some(required) = isize::try_from(output.len())
+        .ok()
+        .filter(|&n| n <= isize::MAX - 3)
+    else {
+        return -1;
+    };
+    if output.len() > cap {
+        return -required - 3;
+    }
+    if !output.is_empty() {
+        unsafe {
+            std::ptr::copy(output.as_ptr(), out, output.len());
+        }
+    }
+    required
+}
+
+/// Exact encoding cleanup when the result is ASCII. `-1` requests fallback;
+/// `-(required+3)` requests a larger buffer, without writing any output.
+///
+/// # Safety
+/// Non-null input/out must be readable/writable for input_len/out_cap bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_anime_fix_encoding(
+    input: *const u8,
+    input_len: usize,
+    out: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if out_cap > isize::MAX as usize || out.is_null() && out_cap != 0 {
+        return -1;
+    }
+    let Some(bytes) = (unsafe { wave9_input(input, input_len) }) else {
+        return -1;
+    };
+    let Some(output) = wave9_anime_encoding(bytes) else {
+        return -1;
+    };
+    unsafe { wave9_write_output(&output, out, out_cap) }
+}
+
+/// ASCII PreDB identity normalization. `-2` is semantic null (empty input,
+/// more than 512 bytes, invalid UTF-8), `-1` requests Unicode/PHP fallback, and
+/// `-(required+3)` requests a larger buffer without writing any output.
+///
+/// # Safety
+/// Non-null input/out must be readable/writable for input_len/out_cap bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_predb_identity_key_normalize(
+    input: *const u8,
+    input_len: usize,
+    out: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if out_cap > isize::MAX as usize || out.is_null() && out_cap != 0 {
+        return -1;
+    }
+    let Some(bytes) = (unsafe { wave9_input(input, input_len) }) else {
+        return -1;
+    };
+    if bytes.is_empty() || bytes.len() > 512 || std::str::from_utf8(bytes).is_err() {
+        return -2;
+    }
+    if !bytes.is_ascii() {
+        return -1;
+    }
+    let Some(output) = normalize_predb_key_ascii(bytes) else {
+        return -2;
+    };
+    unsafe { wave9_write_output(&output, out, out_cap) }
+}
+
+#[cfg(test)]
+mod wave9_cleaning_tests {
+    use super::*;
+
+    type StringExport = unsafe extern "C" fn(*const u8, usize, *mut u8, usize) -> isize;
+
+    fn result(export: StringExport, input: &[u8]) -> Result<Vec<u8>, isize> {
+        let mut output = vec![0; input.len() + 8];
+        let len = unsafe {
+            export(
+                input.as_ptr(),
+                input.len(),
+                output.as_mut_ptr(),
+                output.len(),
+            )
+        };
+        if len < 0 {
+            Err(len)
+        } else {
+            output.truncate(len as usize);
+            Ok(output)
+        }
+    }
+
+    #[test]
+    fn unclassified_episode_requires_marker_without_parseable_identity() {
+        for (input, expected) in [
+            (&b"Show.Episode.5.mkv"[..], 1),
+            (b"Show.E05.mkv", 1),
+            (b"Show.S12345E01.mkv", 1),
+            (b"S01E01.mkv", 1),
+            (b"Show.1x01e2.mkv", 1),
+            (b"Show.S01E01E02.mkv", 0),
+            (b"Show.1x01.mkv", 0),
+            (b"Show.S01E01.sample.mkv", 0),
+            (b"Show.S01.1080p", 0),
+            (b"", 0),
+        ] {
+            assert_eq!(
+                unsafe { nntmux_season_pack_is_unclassified_episode(input.as_ptr(), input.len()) },
+                expected,
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn distinct_identity_batch_counts_every_ancillary_entry_after_distinction() {
+        for (input, expected) in [
+            (&b""[..], 0),
+            (b"Show.S01E01.720p.mkv\0show_s1e1.1080p.mkv", 0),
+            (
+                b"Show.S01E01.mkv\0Show.S01E02.mkv\0cover.jpg\0notes.nfo\0Show.E03.sample.mkv",
+                7,
+            ),
+            (b"Show.S01E01.mkv\0Other.S01E01.mkv", 1),
+            (b"Show.1x01.mkv\0Show.S01E01E02.mkv", 0),
+            (b"Show.S01E01.mkv\0Show.S01E01.nfo", 2),
+            (b"Show.1x01e2.mkv\0Show.E03.mkv", 0),
+            (b"cover.jpg\0cover.jpg\0", 4),
+        ] {
+            assert_eq!(
+                unsafe {
+                    nntmux_season_pack_has_distinct_identities_nul(input.as_ptr(), input.len())
+                },
+                expected,
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ancillary_detection_keeps_unknown_payloads_and_uses_sample_boundaries() {
+        for (input, expected) in [
+            (&b" folder\\Show.S01E01.srt "[..], 1),
+            (b"folder/image.JPEG/", 1),
+            (b"Show.proof.mkv", 1),
+            (b"Show.sample.part01.rar", 1),
+            (b"Show.sampled.mkv", 0),
+            (b"Show.7z", 0),
+            (b"Show.pdf", 0),
+            (b"Show", 0),
+        ] {
+            assert_eq!(
+                unsafe { nntmux_season_pack_is_ancillary_name(input.as_ptr(), input.len()) },
+                expected,
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn season_folder_returns_raw_outermost_segment_offset_and_ignores_filename() {
+        for (input, expected) in [
+            (&b"root/ Show.S01 /Show.S02/episode.mkv"[..], 5),
+            (b"\\root\\Show.Complete.Series\\episode.mkv", 6),
+            (b"Show.S01/episode.mkv", 0),
+            (b"Show.S01", -2),
+            (b"root/Show.S01E01/file.mkv", -2),
+            (b"root/Show.S01/", 5),
+        ] {
+            assert_eq!(
+                unsafe { nntmux_season_pack_season_folder(input.as_ptr(), input.len()) },
+                expected,
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn season_byte_patterns_preserve_unicode_and_invalid_utf8_prefixes() {
+        unsafe {
+            for name in ["進撃の巨人.E05.mkv".as_bytes(), &b"Show\xff.E05.mkv"[..]] {
+                assert_eq!(
+                    nntmux_season_pack_is_unclassified_episode(name.as_ptr(), name.len()),
+                    1
+                );
+            }
+            for name in [
+                "進撃の巨人.S01E01.mkv".as_bytes(),
+                &b"Show\xff.S01E01.mkv"[..],
+            ] {
+                assert_eq!(
+                    nntmux_season_pack_is_unclassified_episode(name.as_ptr(), name.len()),
+                    0
+                );
+            }
+            for name in ["進撃の巨人.jpg".as_bytes(), &b"Show\xff.nfo"[..]] {
+                assert_eq!(
+                    nntmux_season_pack_is_ancillary_name(name.as_ptr(), name.len()),
+                    1
+                );
+            }
+            for path in [
+                "root/進撃の巨人.S01/episode.mkv".as_bytes(),
+                &b"root/Show\xff.S01/episode.mkv"[..],
+            ] {
+                assert_eq!(
+                    nntmux_season_pack_season_folder(path.as_ptr(), path.len()),
+                    5
+                );
+            }
+            let same = "進撃の巨人.S01E01.mkv\0進撃の巨人_s1e1.nfo".as_bytes();
+            assert_eq!(
+                nntmux_season_pack_has_distinct_identities_nul(same.as_ptr(), same.len()),
+                2
+            );
+            let different = b"Show\xff.S01E01.mkv\0Show\xfe.S01E01.mkv";
+            assert_eq!(
+                nntmux_season_pack_has_distinct_identities_nul(different.as_ptr(), different.len()),
+                1
+            );
+            let unicode_case = "École.S01E01.mkv\0école.S01E01.mkv".as_bytes();
+            assert_eq!(
+                nntmux_season_pack_has_distinct_identities_nul(
+                    unicode_case.as_ptr(),
+                    unicode_case.len()
+                ),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn anime_encoding_removes_artifacts_controls_and_preserves_entities() {
+        for (input, expected) in [
+            (
+                &b"Title &amp; &#169; &#xC3; &quot;"[..],
+                &b"Title &amp; &#169; &#xC3; &quot;"[..],
+            ),
+            (b"A\0\x01\tB\n\rC\x0b\x0c\x7f", b"A\tB\n\rC"),
+            ("Title Ã¢Â_Â Test".as_bytes(), b"Title Test"),
+            ("Title Ã©English End".as_bytes(), b"Title English End"),
+            ("Title Ãxyz End".as_bytes(), b"Title  End"),
+            ("Title ÂÂ End".as_bytes(), b"Title  End"),
+            ("ÀÁÂÃÄÅ".as_bytes(), b""),
+        ] {
+            assert_eq!(
+                result(nntmux_anime_fix_encoding, input),
+                Ok(expected.to_vec()),
+                "{input:?}"
+            );
+        }
+        assert_eq!(
+            result(nntmux_anime_fix_encoding, "Café".as_bytes()),
+            Err(-1)
+        );
+        assert_eq!(result(nntmux_anime_fix_encoding, b"\xff"), Err(-1));
+    }
+
+    #[test]
+    fn predb_normalize_distinguishes_semantic_null_and_unsupported_unicode() {
+        assert_eq!(
+            result(
+                nntmux_predb_identity_key_normalize,
+                b" \tShow__Name . WEB-DL\r\n"
+            ),
+            Ok(b"show.name.web-dl".to_vec())
+        );
+        assert_eq!(
+            result(nntmux_predb_identity_key_normalize, b"\0\x0b  \r\n"),
+            Ok(Vec::new())
+        );
+        assert_eq!(
+            result(nntmux_predb_identity_key_normalize, b"A\0B\x0cC"),
+            Ok(b"a\0b.c".to_vec())
+        );
+        assert_eq!(result(nntmux_predb_identity_key_normalize, b""), Err(-2));
+        assert_eq!(
+            result(nntmux_predb_identity_key_normalize, &vec![b'a'; 513]),
+            Err(-2)
+        );
+        assert_eq!(
+            result(nntmux_predb_identity_key_normalize, b"\xff"),
+            Err(-2)
+        );
+        assert_eq!(
+            result(nntmux_predb_identity_key_normalize, "École".as_bytes()),
+            Err(-1)
+        );
+    }
+
+    #[test]
+    fn wave9_abi_checks_lengths_nulls_short_buffers_and_declines() {
+        unsafe {
+            for export in [
+                nntmux_season_pack_is_unclassified_episode,
+                nntmux_season_pack_has_distinct_identities_nul,
+                nntmux_season_pack_is_ancillary_name,
+                nntmux_season_pack_season_folder,
+            ] {
+                assert_eq!(export(std::ptr::null(), 1), -1);
+                assert_eq!(export(b"x".as_ptr(), usize::MAX), -1);
+            }
+            assert_eq!(
+                nntmux_season_pack_is_unclassified_episode(std::ptr::null(), 0),
+                0
+            );
+            assert_eq!(
+                nntmux_season_pack_has_distinct_identities_nul(std::ptr::null(), 0),
+                0
+            );
+            assert_eq!(nntmux_season_pack_is_ancillary_name(std::ptr::null(), 0), 0);
+            assert_eq!(nntmux_season_pack_season_folder(std::ptr::null(), 0), -2);
+            for export in [
+                nntmux_anime_fix_encoding as StringExport,
+                nntmux_predb_identity_key_normalize,
+            ] {
+                let mut out = [b'Z'; 8];
+                assert_eq!(export(std::ptr::null(), 1, out.as_mut_ptr(), 8), -1);
+                assert_eq!(export(b"test".as_ptr(), 4, std::ptr::null_mut(), 1), -1);
+                assert_eq!(
+                    export(b"test".as_ptr(), usize::MAX, out.as_mut_ptr(), 8),
+                    -1
+                );
+                assert_eq!(
+                    export(b"test".as_ptr(), 4, out.as_mut_ptr(), usize::MAX),
+                    -1
+                );
+                assert_eq!(export(b"test".as_ptr(), 4, out.as_mut_ptr(), 3), -7);
+                assert_eq!(out, [b'Z'; 8]);
+                assert_eq!(export(b"test".as_ptr(), 4, std::ptr::null_mut(), 0), -7);
+                assert_eq!(export(b"test".as_ptr(), 4, out.as_mut_ptr(), 4), 4);
+                assert_eq!(&out[..5], b"testZ");
+            }
+            assert_eq!(
+                nntmux_anime_fix_encoding(std::ptr::null(), 0, std::ptr::null_mut(), 0),
+                0
+            );
+            assert_eq!(
+                nntmux_predb_identity_key_normalize(std::ptr::null(), 0, std::ptr::null_mut(), 0),
+                -2
+            );
+        }
+    }
+}
