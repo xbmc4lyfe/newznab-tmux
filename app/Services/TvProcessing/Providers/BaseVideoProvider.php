@@ -28,9 +28,12 @@ namespace App\Services\TvProcessing\Providers;
 use App\Models\TvInfo;
 use App\Models\Video;
 use App\Models\VideoAlias;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Support\Facades\Cache;
+use Throwable;
 
 /**
  * Parent class for TV/Film and any similar classes to inherit from.
@@ -51,7 +54,17 @@ abstract class BaseVideoProvider
      */
     private static array $sites = ['imdb', 'tmdb', 'trakt', 'tvdb', 'tvmaze', 'tvrage'];
 
-    public function __construct()
+    // Keep production normalization in PHP; the paired common-path gate failed.
+    // *Native entry points remain available for differential testing.
+    private const string NATIVE_CDEF = <<<'C'
+        ssize_t nntmux_imdb_search_text(const char *input, size_t input_len, uint32_t mode, char *out_buf, size_t out_cap);
+        C;
+
+    private ?FFI $native = null;
+
+    private bool $nativeResolved = false;
+
+    public function __construct(private readonly bool $useRustFfi = true)
     {
         $this->echooutput = (bool) config('nntmux.echocli');
     }
@@ -105,8 +118,8 @@ abstract class BaseVideoProvider
         }
 
         // If title contains a year in parentheses, try without the year
-        if (preg_match('/^(.+?)\s*\(\d{4}\)$/', $title, $yearMatch)) {
-            $titleWithoutYear = trim($yearMatch[1]);
+        $titleWithoutYear = $this->titleWithoutYear($title);
+        if ($titleWithoutYear !== $title) {
             $res = $this->getTitleExact($titleWithoutYear, $type, $source);
             if ($res !== 0) {
                 return $res;
@@ -119,7 +132,7 @@ abstract class BaseVideoProvider
             return $res;
         }
 
-        $title2 = str_ireplace(' and ', ' & ', $title);
+        $title2 = $this->normalizeTitleConjunction($title);
         if ($title !== $title2) {
             $res = $this->getTitleExact($title2, $type, $source);
             if ($res !== 0) {
@@ -133,7 +146,7 @@ abstract class BaseVideoProvider
 
         // Some words are spelled correctly 2 ways
         // example theatre and theater
-        $title2 = str_ireplace('er', 're', $title);
+        $title2 = $this->normalizeTitleSpelling($title);
         if ($title !== $title2) {
             $res = $this->getTitleExact($title2, $type, $source);
             if ($res !== 0) {
@@ -154,6 +167,69 @@ abstract class BaseVideoProvider
         }
 
         return 0;
+    }
+
+    private function titleWithoutYear(string $title): string
+    {
+        return preg_match('/^(.+?)\s*\(\d{4}\)$/', $title, $match) === 1 ? trim($match[1]) : $title;
+    }
+
+    private function normalizeTitleConjunction(string $title): string
+    {
+        return str_ireplace(' and ', ' & ', $title);
+    }
+
+    private function normalizeTitleSpelling(string $title): string
+    {
+        return str_ireplace('er', 're', $title);
+    }
+
+    private function titleNativeOutput(string $title, int $mode): ?string
+    {
+        if (! $this->useRustFfi) {
+            return null;
+        }
+        if (! $this->nativeResolved) {
+            $this->native = RustPipelineLibrary::resolveDomain('media', self::NATIVE_CDEF);
+            $this->nativeResolved = true;
+        }
+        $ffi = $this->native;
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            $capacity = 0;
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, strlen($title) + 2, $capacity);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_imdb_search_text($title, strlen($title), $mode, $scratch, $capacity);
+
+            return $written < 0 ? null : ($written === 0 ? '' : FFI::string($scratch, $written));
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    public function loosePatternNative(string $title): string
+    {
+        return $this->titleNativeOutput($title, 3) ?? $this->loosePattern($title);
+    }
+
+    public function titleWithoutYearNative(string $title): string
+    {
+        return $this->titleNativeOutput($title, 4) ?? $this->titleWithoutYear($title);
+    }
+
+    public function normalizeTitleConjunctionNative(string $title): string
+    {
+        return $this->titleNativeOutput($title, 5) ?? $this->normalizeTitleConjunction($title);
+    }
+
+    public function normalizeTitleSpellingNative(string $title): string
+    {
+        return $this->titleNativeOutput($title, 6) ?? $this->normalizeTitleSpelling($title);
     }
 
     private function loosePattern(string $title): string
