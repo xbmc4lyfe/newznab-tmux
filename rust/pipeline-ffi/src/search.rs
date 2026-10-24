@@ -16544,3 +16544,618 @@ pub mod passkey_captcha_rule_support {
         }
     }
 }
+
+/// Wave 25.5 signup-error, user-role, queue-type and registration-status enum helpers
+/// plus admin view-composer normalization. No dependencies.
+///
+/// Enum kinds: 0 = `SignupError` (message), 1 = `UserRole`, 2 = `QueueType`,
+/// 3 = `RegistrationStatus`. Label exports return the written byte length, `0` for an
+/// unknown backing value, the negative required length when capacity is insufficient,
+/// and DECLINE for an invalid kind, flag or pointer range. Every buffer export is
+/// atomic: a negative or DECLINE result writes nothing. Label resolution compares exact
+/// bytes, like PHP `===`.
+pub mod signup_role_queue_enum_composer {
+    use std::mem::{align_of, size_of};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    pub const DECLINE: i32 = i32::MIN;
+    const MAX_INPUT: usize = 1 << 20;
+
+    pub const FLAG_KNOWN: i32 = 1;
+    pub const FLAG_SIGNUP_ERROR: i32 = 2;
+    pub const FLAG_SIGNUP_SUCCESS: i32 = 4;
+    pub const FLAG_ROLE_ADMIN: i32 = 2;
+    pub const FLAG_ROLE_MODERATOR: i32 = 4;
+    pub const FLAG_ROLE_DISABLED: i32 = 8;
+    pub const FLAG_ROLE_ELEVATED: i32 = 16;
+
+    type Table = &'static [(i64, &'static [u8])];
+
+    const SIGNUP_ERROR: Table = &[
+        (-1, b"Invalid username provided."),
+        (-2, b"Invalid password provided."),
+        (-3, b"Invalid email address provided."),
+        (-4, b"Username is already in use."),
+        (-5, b"Email address is already in use."),
+        (-6, b"Invalid or expired invite code."),
+        (1, b"Registration successful."),
+    ];
+    const USER_ROLE: Table = &[
+        (1, b"User"),
+        (2, b"Admin"),
+        (3, b"Disabled"),
+        (4, b"Moderator"),
+    ];
+    const QUEUE_TYPE: Table = &[(0, b"None"), (1, b"SABnzbd"), (2, b"NZBGet")];
+    const REGISTRATION_STATUS: Table = &[(0, b"Open"), (1, b"Invite"), (2, b"Closed")];
+
+    fn table(kind: u32) -> Option<Table> {
+        match kind {
+            0 => Some(SIGNUP_ERROR),
+            1 => Some(USER_ROLE),
+            2 => Some(QUEUE_TYPE),
+            3 => Some(REGISTRATION_STATUS),
+            _ => None,
+        }
+    }
+
+    /// `None` for an invalid kind; `Some(None)` for an unknown backing value.
+    fn label(kind: u32, value: i64) -> Option<Option<&'static [u8]>> {
+        table(kind).map(|t| t.iter().find(|(v, _)| *v == value).map(|(_, l)| *l))
+    }
+
+    fn flags(kind: u32, value: i64) -> Option<i32> {
+        if label(kind, value)?.is_none() {
+            return Some(0);
+        }
+        Some(
+            FLAG_KNOWN
+                | match (kind, value) {
+                    (0, v) if v < 0 => FLAG_SIGNUP_ERROR,
+                    (0, 1) => FLAG_SIGNUP_SUCCESS,
+                    (1, 2) => FLAG_ROLE_ADMIN | FLAG_ROLE_ELEVATED,
+                    (1, 3) => FLAG_ROLE_DISABLED,
+                    (1, 4) => FLAG_ROLE_MODERATOR | FLAG_ROLE_ELEVATED,
+                    _ => 0,
+                },
+        )
+    }
+
+    fn range_ok(address: usize, length: usize) -> bool {
+        length <= isize::MAX as usize && address.checked_add(length).is_some()
+    }
+
+    fn writable<T>(pointer: *mut T, count: usize) -> bool {
+        let Some(length) = size_of::<T>().checked_mul(count) else {
+            return false;
+        };
+        !pointer.is_null()
+            && (pointer as usize).is_multiple_of(align_of::<T>())
+            && range_ok(pointer as usize, length)
+    }
+
+    fn output_ok(pointer: *mut u8, capacity: usize) -> bool {
+        range_ok(pointer as usize, capacity) && (capacity == 0 || !pointer.is_null())
+    }
+
+    fn flag(value: u32) -> Option<bool> {
+        match value {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+
+    unsafe fn bytes<'a>(pointer: *const u8, length: usize) -> Option<&'a [u8]> {
+        if length > MAX_INPUT || !range_ok(pointer as usize, length) {
+            return None;
+        }
+        if length == 0 {
+            return Some(&[]);
+        }
+        if pointer.is_null() {
+            return None;
+        }
+        // u8 alignment is one; the range was checked above.
+        Some(unsafe { slice::from_raw_parts(pointer, length) })
+    }
+
+    /// Writes the backing value's label (`SignupError` message for kind 0).
+    ///
+    /// # Safety
+    /// `out` must be writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_signup_role_queue_label(
+        kind: u32,
+        value: i64,
+        out: *mut u8,
+        cap: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !output_ok(out, cap) {
+                return DECLINE;
+            }
+            let Some(found) = label(kind, value) else {
+                return DECLINE;
+            };
+            let Some(data) = found else {
+                return 0;
+            };
+            if cap < data.len() {
+                return -(data.len() as i32);
+            }
+            // Labels are static constants, so they never overlap the caller's buffer.
+            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), out, data.len()) };
+            data.len() as i32
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `0` = unknown value, otherwise `FLAG_KNOWN` plus the kind's status bits.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn nntmux_signup_role_queue_flags(kind: u32, value: i64) -> i32 {
+        catch_unwind(|| flags(kind, value).unwrap_or(DECLINE)).unwrap_or(DECLINE)
+    }
+
+    /// `1` = found (writes the backing value), `0` = not found (writes nothing).
+    ///
+    /// # Safety
+    /// `label_ptr` must be readable for `label_len` bytes; `out_value` must be an
+    /// aligned, writable `i64`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_signup_role_queue_resolve_label(
+        kind: u32,
+        label_ptr: *const u8,
+        label_len: usize,
+        out_value: *mut i64,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !writable(out_value, 1) {
+                return DECLINE;
+            }
+            let Some(table) = table(kind) else {
+                return DECLINE;
+            };
+            let Some(needle) = (unsafe { bytes(label_ptr, label_len) }) else {
+                return DECLINE;
+            };
+            match table.iter().find(|(_, l)| *l == needle) {
+                Some((value, _)) => {
+                    unsafe { out_value.write(*value) };
+                    1
+                }
+                None => 0,
+            }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Normalizes `AdminDataComposer` view state. On success writes
+    /// `out_flags = [loggedin, isadmin, ismod]`, `out_lens = [theme, color]` and the
+    /// concatenated theme/color bytes, returning their total length.
+    ///
+    /// # Safety
+    /// `theme_ptr`/`color_ptr` must be readable for their lengths, `out_flags` must be
+    /// an aligned writable `u32[3]`, `out_lens` an aligned writable `size_t[2]`, and
+    /// `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_admin_composer_view_state(
+        logged_in: u32,
+        is_user: u32,
+        is_admin: u32,
+        is_mod: u32,
+        has_theme: u32,
+        theme_ptr: *const u8,
+        theme_len: usize,
+        has_color: u32,
+        color_ptr: *const u8,
+        color_len: usize,
+        out_flags: *mut u32,
+        out_lens: *mut usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let (
+                Some(logged_in),
+                Some(is_user),
+                Some(is_admin),
+                Some(is_mod),
+                Some(has_theme),
+                Some(has_color),
+            ) = (
+                flag(logged_in),
+                flag(is_user),
+                flag(is_admin),
+                flag(is_mod),
+                flag(has_theme),
+                flag(has_color),
+            )
+            else {
+                return DECLINE;
+            };
+            let (Some(theme), Some(color)) = (unsafe { bytes(theme_ptr, theme_len) }, unsafe {
+                bytes(color_ptr, color_len)
+            }) else {
+                return DECLINE;
+            };
+            if !writable(out_flags, 3) || !writable(out_lens, 2) || !output_ok(out, cap) {
+                return DECLINE;
+            }
+            let theme: &[u8] = if is_user && has_theme {
+                theme
+            } else {
+                b"light"
+            };
+            let color: &[u8] = if is_user && has_color { color } else { b"blue" };
+            let Some(total) = theme.len().checked_add(color.len()) else {
+                return DECLINE;
+            };
+            if total > i32::MAX as usize {
+                return DECLINE;
+            }
+            if cap < total {
+                return -(total as i32);
+            }
+            // Copy first: the inputs may alias the output buffer.
+            let mut payload = Vec::with_capacity(total);
+            payload.extend_from_slice(theme);
+            payload.extend_from_slice(color);
+            let state = [
+                u32::from(logged_in),
+                u32::from(is_user && is_admin),
+                u32::from(is_user && is_mod),
+            ];
+            let lens = [theme.len(), color.len()];
+            unsafe {
+                if total != 0 {
+                    std::ptr::copy_nonoverlapping(payload.as_ptr(), out, total);
+                }
+                std::ptr::copy_nonoverlapping(state.as_ptr(), out_flags, 3);
+                std::ptr::copy_nonoverlapping(lens.as_ptr(), out_lens, 2);
+            }
+            total as i32
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn label_of(kind: u32, value: i64) -> Result<Vec<u8>, i32> {
+            let needed =
+                unsafe { nntmux_signup_role_queue_label(kind, value, std::ptr::null_mut(), 0) };
+            if needed >= 0 || needed == DECLINE {
+                return Err(needed);
+            }
+            let mut out = vec![0xa5; (-needed) as usize + 1];
+            let len = out.len();
+            assert_eq!(
+                unsafe { nntmux_signup_role_queue_label(kind, value, out.as_mut_ptr(), len - 2) },
+                needed
+            );
+            assert!(out.iter().all(|b| *b == 0xa5));
+            let written =
+                unsafe { nntmux_signup_role_queue_label(kind, value, out.as_mut_ptr(), len) };
+            assert_eq!(written, -needed);
+            assert_eq!(out[written as usize], 0xa5);
+            out.truncate(written as usize);
+            Ok(out)
+        }
+
+        fn resolve(kind: u32, needle: &[u8]) -> (i32, i64) {
+            let mut value = -99;
+            let rc = unsafe {
+                nntmux_signup_role_queue_resolve_label(
+                    kind,
+                    needle.as_ptr(),
+                    needle.len(),
+                    &mut value,
+                )
+            };
+            (rc, value)
+        }
+
+        #[test]
+        fn wave25_5_labels_flags_and_resolution_round_trip() {
+            for kind in 0..=3 {
+                for (value, text) in table(kind).unwrap() {
+                    assert_eq!(label_of(kind, *value).unwrap(), *text);
+                    assert_eq!(resolve(kind, text), (1, *value));
+                    assert_eq!(
+                        nntmux_signup_role_queue_flags(kind, *value) & FLAG_KNOWN,
+                        FLAG_KNOWN
+                    );
+                }
+                for unknown in [i64::MIN, -7, 5, 99, i64::MAX] {
+                    assert_eq!(label_of(kind, unknown), Err(0));
+                    assert_eq!(nntmux_signup_role_queue_flags(kind, unknown), 0);
+                }
+                for miss in [b"".as_slice(), b"user", b"Admin ", b"\0\xff", b"SABNZBD"] {
+                    assert_eq!(resolve(kind, miss), (0, -99));
+                }
+            }
+            assert_eq!(
+                nntmux_signup_role_queue_flags(0, -6),
+                FLAG_KNOWN | FLAG_SIGNUP_ERROR
+            );
+            assert_eq!(
+                nntmux_signup_role_queue_flags(0, 1),
+                FLAG_KNOWN | FLAG_SIGNUP_SUCCESS
+            );
+            assert_eq!(nntmux_signup_role_queue_flags(1, 1), FLAG_KNOWN);
+            assert_eq!(
+                nntmux_signup_role_queue_flags(1, 2),
+                FLAG_KNOWN | FLAG_ROLE_ADMIN | FLAG_ROLE_ELEVATED
+            );
+            assert_eq!(
+                nntmux_signup_role_queue_flags(1, 3),
+                FLAG_KNOWN | FLAG_ROLE_DISABLED
+            );
+            assert_eq!(
+                nntmux_signup_role_queue_flags(1, 4),
+                FLAG_KNOWN | FLAG_ROLE_MODERATOR | FLAG_ROLE_ELEVATED
+            );
+            assert_eq!(nntmux_signup_role_queue_flags(2, 1), FLAG_KNOWN);
+            assert_eq!(nntmux_signup_role_queue_flags(4, 1), DECLINE);
+            assert_eq!(label_of(4, 1), Err(DECLINE));
+            assert_eq!(resolve(4, b"User"), (DECLINE, -99));
+        }
+
+        fn view(
+            args: [u32; 6],
+            theme: &[u8],
+            color: &[u8],
+            cap: usize,
+        ) -> (i32, [u32; 3], [usize; 2], Vec<u8>) {
+            let mut state = [7u32; 3];
+            let mut lens = [7usize; 2];
+            let mut out = vec![0x5a; cap.max(1)];
+            let rc = unsafe {
+                nntmux_admin_composer_view_state(
+                    args[0],
+                    args[1],
+                    args[2],
+                    args[3],
+                    args[4],
+                    theme.as_ptr(),
+                    theme.len(),
+                    args[5],
+                    color.as_ptr(),
+                    color.len(),
+                    state.as_mut_ptr(),
+                    lens.as_mut_ptr(),
+                    out.as_mut_ptr(),
+                    cap,
+                )
+            };
+            (rc, state, lens, out)
+        }
+
+        #[test]
+        fn wave25_5_composer_view_state_matrix() {
+            let (rc, state, lens, out) = view([1, 1, 1, 1, 1, 1], b"dark", b"\0\xff", 16);
+            assert_eq!((rc, state, lens), (6, [1, 1, 1], [4, 2]));
+            assert_eq!(&out[..6], b"dark\0\xff");
+            let (rc, state, lens, out) = view([1, 1, 0, 1, 0, 0], b"dark", b"red", 16);
+            assert_eq!((rc, state, lens), (9, [1, 0, 1], [5, 4]));
+            assert_eq!(&out[..9], b"lightblue");
+            let (rc, state, lens, out) = view([1, 0, 1, 1, 1, 1], b"dark", b"red", 16);
+            assert_eq!((rc, state, lens), (9, [1, 0, 0], [5, 4]));
+            assert_eq!(&out[..9], b"lightblue");
+            let (rc, state, lens, _) = view([0, 1, 0, 0, 1, 1], b"", b"", 0);
+            assert_eq!((rc, state, lens), (0, [0, 0, 0], [0, 0]));
+            let (rc, state, lens, out) = view([1, 1, 0, 0, 1, 1], b"dark", b"red", 6);
+            assert_eq!((rc, state, lens), (-7, [7; 3], [7; 2]));
+            assert!(out.iter().all(|b| *b == 0x5a));
+            for bad in 0..6 {
+                let mut args = [1; 6];
+                args[bad] = 2;
+                let (rc, state, lens, out) = view(args, b"dark", b"red", 16);
+                assert_eq!((rc, state, lens), (DECLINE, [7; 3], [7; 2]));
+                assert!(out.iter().all(|b| *b == 0x5a));
+            }
+        }
+
+        #[test]
+        fn wave25_5_pointer_contract_and_aliasing() {
+            let mut out = [0xa5u8; 64];
+            let original = out;
+            assert_eq!(
+                unsafe { nntmux_signup_role_queue_label(1, 2, std::ptr::null_mut(), 8) },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe { nntmux_signup_role_queue_label(1, 2, out.as_mut_ptr(), usize::MAX) },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe { nntmux_signup_role_queue_label(1, 2, usize::MAX as *mut u8, 8) },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe { nntmux_signup_role_queue_label(1, 99, usize::MAX as *mut u8, 8) },
+                DECLINE
+            );
+            let mut value = -99i64;
+            assert_eq!(
+                unsafe {
+                    nntmux_signup_role_queue_resolve_label(1, std::ptr::null(), 1, &mut value)
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_signup_role_queue_resolve_label(
+                        1,
+                        std::ptr::dangling(),
+                        usize::MAX,
+                        &mut value,
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_signup_role_queue_resolve_label(
+                        1,
+                        usize::MAX as *const u8,
+                        2,
+                        &mut value,
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_signup_role_queue_resolve_label(
+                        1,
+                        b"User".as_ptr(),
+                        4,
+                        std::ptr::null_mut(),
+                    )
+                },
+                DECLINE
+            );
+            let mut aligned = [0u64; 2];
+            let misaligned = unsafe { (aligned.as_mut_ptr() as *mut u8).add(1) } as *mut i64;
+            assert_eq!(
+                unsafe {
+                    nntmux_signup_role_queue_resolve_label(1, b"User".as_ptr(), 4, misaligned)
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_signup_role_queue_resolve_label(
+                        1,
+                        b"User".as_ptr(),
+                        4,
+                        (usize::MAX - 7) as *mut i64,
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(aligned, [0, 0]);
+            assert_eq!(value, -99);
+            let mut state = [7u32; 4];
+            let mut lens = [7usize; 3];
+            let call = |theme: *const u8,
+                        theme_len,
+                        flags: *mut u32,
+                        lens: *mut usize,
+                        out: *mut u8,
+                        cap| unsafe {
+                nntmux_admin_composer_view_state(
+                    1,
+                    1,
+                    0,
+                    0,
+                    1,
+                    theme,
+                    theme_len,
+                    0,
+                    b"".as_ptr(),
+                    0,
+                    flags,
+                    lens,
+                    out,
+                    cap,
+                )
+            };
+            let bad_flags = unsafe { (state.as_mut_ptr() as *mut u8).add(1) } as *mut u32;
+            let bad_lens = unsafe { (lens.as_mut_ptr() as *mut u8).add(1) } as *mut usize;
+            let cases: [(*const u8, usize, *mut u32, *mut usize, *mut u8, usize); 8] = [
+                (
+                    std::ptr::null(),
+                    1,
+                    state.as_mut_ptr(),
+                    lens.as_mut_ptr(),
+                    out.as_mut_ptr(),
+                    64,
+                ),
+                (
+                    usize::MAX as *const u8,
+                    2,
+                    state.as_mut_ptr(),
+                    lens.as_mut_ptr(),
+                    out.as_mut_ptr(),
+                    64,
+                ),
+                (
+                    b"x".as_ptr(),
+                    1,
+                    std::ptr::null_mut(),
+                    lens.as_mut_ptr(),
+                    out.as_mut_ptr(),
+                    64,
+                ),
+                (
+                    b"x".as_ptr(),
+                    1,
+                    bad_flags,
+                    lens.as_mut_ptr(),
+                    out.as_mut_ptr(),
+                    64,
+                ),
+                (
+                    b"x".as_ptr(),
+                    1,
+                    state.as_mut_ptr(),
+                    bad_lens,
+                    out.as_mut_ptr(),
+                    64,
+                ),
+                (
+                    b"x".as_ptr(),
+                    1,
+                    state.as_mut_ptr(),
+                    (usize::MAX - 7) as *mut usize,
+                    out.as_mut_ptr(),
+                    64,
+                ),
+                (
+                    b"x".as_ptr(),
+                    1,
+                    state.as_mut_ptr(),
+                    lens.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                    64,
+                ),
+                (
+                    b"x".as_ptr(),
+                    1,
+                    state.as_mut_ptr(),
+                    lens.as_mut_ptr(),
+                    out.as_mut_ptr(),
+                    usize::MAX,
+                ),
+            ];
+            for (theme, theme_len, flags, lens_ptr, out_ptr, cap) in cases {
+                assert_eq!(
+                    call(theme, theme_len, flags, lens_ptr, out_ptr, cap),
+                    DECLINE
+                );
+            }
+            assert_eq!(state, [7; 4]);
+            assert_eq!(lens, [7; 3]);
+            assert_eq!(out, original);
+            let mut alias = *b"darkXXXX";
+            let rc = call(
+                alias.as_ptr(),
+                4,
+                state.as_mut_ptr(),
+                lens.as_mut_ptr(),
+                alias.as_mut_ptr(),
+                alias.len(),
+            );
+            assert_eq!(rc, 8);
+            assert_eq!(&alias, b"darkblue");
+            assert_eq!(&state[..3], &[1, 0, 0]);
+            assert_eq!(&lens[..2], &[4, 4]);
+        }
+    }
+}
