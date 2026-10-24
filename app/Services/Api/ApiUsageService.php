@@ -7,6 +7,8 @@ namespace App\Services\Api;
 use App\Jobs\UpdateUserApiAccess;
 use App\Models\User;
 use App\Models\UserRequest;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Contracts\Cache\LockProvider;
 use Illuminate\Contracts\Cache\LockTimeoutException;
 use Illuminate\Http\Request;
@@ -17,6 +19,12 @@ use Throwable;
 
 final class ApiUsageService
 {
+    /** Rust helpers are opt-in; neither beat PHP by 1.5x in the paired benchmark. */
+    private const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_api_audit_entry(const char *input, size_t len, const int64_t *lens, size_t count, char *out, size_t cap);
+        int64_t nntmux_api_quota_reservation(int64_t used, int64_t max);
+        C;
+
     /**
      * Only these filter parameters are written to `user_requests.request`;
      * credentials and unknown fields never are (the column ends up in GDPR exports).
@@ -83,14 +91,55 @@ final class ApiUsageService
                     ->where('timestamp', '>', now()->subDay()->toDateTimeString())
                     ->count();
 
-                if ($used >= $maxRequests) {
+                $reserved = self::reservedCount($used, $maxRequests);
+                if ($reserved === null) {
                     return null;
                 }
 
                 $this->record($user, $request);
 
-                return $used + 1;
+                return $reserved;
             });
+    }
+
+    /**
+     * Requests used including this one, or null when the quota is exhausted.
+     */
+    public static function reservedCount(int $used, int $maxRequests, bool $useRustFfi = false): ?int
+    {
+        $supported = false;
+        $native = $useRustFfi ? self::reservedCountNative($used, $maxRequests, $supported) : null;
+
+        return $supported ? $native : self::reservedCountPhp($used, $maxRequests);
+    }
+
+    public static function reservedCountPhp(int $used, int $maxRequests): ?int
+    {
+        return $used >= $maxRequests ? null : $used + 1;
+    }
+
+    /**
+     * @param-out bool $supported
+     */
+    public static function reservedCountNative(int $used, int $maxRequests, bool &$supported = false): ?int
+    {
+        $supported = false;
+        static $ffi;
+        $ffi ??= RustPipelineLibrary::resolveDomain('search', self::FFI_CDEF) ?? false;
+        if ($ffi === false) {
+            return null;
+        }
+        try {
+            $reserved = $ffi->nntmux_api_quota_reservation($used, $maxRequests);
+        } catch (Throwable) {
+            return null;
+        }
+        if (! is_int($reserved)) {
+            return null;
+        }
+        $supported = true;
+
+        return $reserved === PHP_INT_MIN ? null : $reserved;
     }
 
     /**
@@ -147,10 +196,26 @@ final class ApiUsageService
      * Build the redacted audit entry from the path and allowlisted filters of
      * the effective input (URL and body), e.g. `/api/v2/search?cat=5030&id=test`.
      */
-    public function auditEntry(Request $request): string
+    public function auditEntry(Request $request, bool $useRustFfi = false): string
     {
         $parameters = $this->inputCanonicalizer->canonicalize(Arr::only($request->input(), self::AUDITED_PARAMETERS));
 
+        return self::auditEntryFrom($request->path(), $parameters, $useRustFfi);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $parameters  canonicalized allowlisted filters
+     */
+    public static function auditEntryFrom(string $path, array $parameters, bool $useRustFfi = false): string
+    {
+        return ($useRustFfi ? self::auditEntryFromNative($path, $parameters) : null) ?? self::auditEntryFromPhp($path, $parameters);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $parameters
+     */
+    public static function auditEntryFromPhp(string $path, array $parameters): string
+    {
         $audited = [];
         foreach ($parameters as $key => $value) {
             if (is_string($value)) {
@@ -162,11 +227,58 @@ final class ApiUsageService
             // Legacy array values (e.g. `o[]=json`) are skipped.
         }
 
-        $entry = '/'.ltrim($request->path(), '/');
+        $entry = '/'.ltrim($path, '/');
         if ($audited !== []) {
             $entry .= '?'.http_build_query($audited, '', '&', PHP_QUERY_RFC3986);
         }
 
         return mb_substr($entry, 0, self::AUDIT_MAX_LENGTH);
+    }
+
+    /**
+     * Rust truncation and RFC 3986 encoding; null (PHP decides) without FFI, outside
+     * a UTF-8 mbstring encoding, or for invalid UTF-8 the PHP path substitutes.
+     *
+     * @param  array<array-key, mixed>  $parameters
+     */
+    public static function auditEntryFromNative(string $path, array $parameters): ?string
+    {
+        static $ffi;
+        $ffi ??= RustPipelineLibrary::resolveDomain('search', self::FFI_CDEF) ?? false;
+        if ($ffi === false || mb_internal_encoding() !== 'UTF-8') {
+            return null;
+        }
+        $fields = [$path];
+        foreach ($parameters as $key => $value) {
+            if (is_string($value) || $value === null) {
+                $fields[] = (string) $key;
+                $fields[] = (string) $value;
+            }
+        }
+        $count = count($fields);
+        static $lengths, $out, $capacity = 0, $outCapacity = 0;
+        try {
+            if ($capacity < $count) {
+                $capacity = max(64, $count * 2);
+                $lengths = $ffi->new("int64_t[{$capacity}]");
+            }
+            foreach ($fields as $i => $field) {
+                $lengths[$i] = strlen($field);
+            }
+            $joined = implode('', $fields);
+            // At most 255 code points of four bytes each.
+            if ($outCapacity === 0) {
+                $outCapacity = self::AUDIT_MAX_LENGTH * 4;
+                $out = $ffi->new("char[{$outCapacity}]");
+            }
+            $written = $ffi->nntmux_api_audit_entry($joined, strlen($joined), $lengths, $count, $out, $outCapacity);
+            if (! is_int($written) || $written < 0) {
+                return null;
+            }
+
+            return $written === 0 ? '' : FFI::string($out, $written);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }
