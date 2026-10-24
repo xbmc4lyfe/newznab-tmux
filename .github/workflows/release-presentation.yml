@@ -35,7 +35,7 @@ concurrency:
 jobs:
   native-presentation:
     # Avoid self-hosted workers that also advertise ubuntu-latest but have no Docker daemon.
-    runs-on: ubuntu-24.04
+    runs-on: [spot, ubuntu-latest]
     env:
       RUST_TOOLCHAIN: '1.98.0'
       RUSTUP_TOOLCHAIN: '1.98.0'
