@@ -9,8 +9,10 @@ use App\Models\Category;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Services\Nzb\NzbService;
 use App\Services\Releases\ReleaseManagementService;
+use App\Support\RustPipelineLibrary;
 use Carbon\Carbon;
 use Exception;
+use FFI;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
@@ -19,6 +21,127 @@ use Illuminate\Support\Facades\Log;
  */
 class ReleaseRemoverService
 {
+    // Opt-in candidate dispatch only. Production defaults to PHP until every benchmark gate passes.
+    private static bool $useRustFfi = false;
+
+    private const string REMOVER_CDEF = 'ssize_t nntmux_remover_transform(const char *input, size_t input_len, const char *second, size_t second_len, const char *third, size_t third_len, uint32_t mode, char *out_buf, size_t out_cap);';
+
+    public static function useRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public function cleanSpacesNative(string $string): ?string
+    {
+        // PCRE character tables depend on LC_CTYPE; decline non-C locales.
+        if (ini_get('pcre.backtrack_limit') !== '1000000' || ini_get('pcre.recursion_limit') !== '100000') {
+            return null;
+        }
+
+        return in_array(setlocale(LC_CTYPE, '0'), ['C', 'POSIX', 'C.UTF-8', 'C.utf8'], true) ? self::removerTransform(0, $string) : null;
+    }
+
+    public function formatLikeNative(string $string, string $column): ?string
+    {
+        return self::removerTransform(1, $string, $column);
+    }
+
+    public function formatCriteriaQueryNative(string $argument): bool|string|null
+    {
+        if (! in_array(setlocale(LC_CTYPE, '0'), ['C', 'POSIX', 'C.UTF-8', 'C.utf8'], true)
+            || ini_get('pcre.backtrack_limit') !== '1000000' || ini_get('pcre.recursion_limit') !== '100000') {
+            return null;
+        }
+        $result = self::removerTransform(2, $argument);
+        if ($result === null) {
+            return null;
+        }
+        if ($result === 'I') {
+            $this->ignoreUserCheck = true;
+
+            return '';
+        }
+        $this->error = 'Invalid argument supplied: '.$argument.PHP_EOL;
+
+        return $this->decodeCriteria($result);
+    }
+
+    public function buildCriteriaClauseNative(string $column, string $modifier, string $value): bool|string|null
+    {
+        return $this->decodeCriteria(self::removerTransform(3, $column, $modifier, $value));
+    }
+
+    public function buildNumericClauseNative(string $column, string $modifier, string $value): bool|string|null
+    {
+        return $this->decodeCriteria(self::removerTransform(4, $column, $modifier, $value));
+    }
+
+    public function buildImdbClauseNative(string $modifier, string $value): bool|string|null
+    {
+        return $this->decodeCriteria(self::removerTransform(5, $modifier, $value));
+    }
+
+    public function buildCompletionClauseNative(string $modifier, string $value): bool|string|null
+    {
+        return $this->decodeCriteria(self::removerTransform(6, $modifier, $value));
+    }
+
+    public function formatBlacklistIDNative(int|string $blacklistID): ?string
+    {
+        // PHP owns sprintf's float/exponent/overflow coercion when Rust declines.
+        return self::removerTransform(7, (string) $blacklistID) ?? $this->formatBlacklistIDPhp($blacklistID);
+    }
+
+    private function decodeCriteria(?string $result): bool|string|null
+    {
+        if ($result === null || $result === '') {
+            return null;
+        }
+        if ($result[0] === 'S') {
+            return substr($result, 1);
+        }
+        if ($result === 'F') {
+            return false;
+        }
+        if ($result[0] === 'D') {
+            $parts = explode("\0", substr($result, 1));
+            if (count($parts) === 3) {
+                // Escaping and all database lookups stay in Laravel/PHP.
+                return $this->buildCriteriaClausePhp($parts[0], $parts[1], $parts[2]);
+            }
+        }
+
+        return null;
+    }
+
+    private static function removerTransform(int $mode, string $input, string $second = '', string $third = ''): ?string
+    {
+        $ffi = RustPipelineLibrary::resolveDomain('cleaning', self::REMOVER_CDEF);
+        if ($ffi === null) {
+            return null;
+        }
+        $capacity = 0;
+        $buffer = RustPipelineLibrary::obtainScratch($ffi, max(256, strlen($input) + strlen($second) + strlen($third) + 128), $capacity);
+        if ($buffer === null) {
+            return null;
+        }
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_remover_transform($input, strlen($input), $second, strlen($second), $third, strlen($third), $mode, $buffer, $capacity);
+        if (is_int($written) && $written <= -4) {
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written - 3, $capacity);
+            if ($buffer === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_remover_transform($input, strlen($input), $second, strlen($second), $third, strlen($third), $mode, $buffer, $capacity);
+        }
+        if (! is_int($written) || $written < 0 || $written > $capacity) {
+            return null;
+        }
+
+        return $written === 0 ? '' : FFI::string($buffer, $written);
+    }
+
     private const int BATCH_SIZE = 500;
 
     private const int BATCH_PAUSE_US = 10000;
@@ -204,6 +327,11 @@ class ReleaseRemoverService
      * Format the blacklist ID for query use.
      */
     private function formatBlacklistID(int|string $blacklistID): string
+    {
+        return self::$useRustFfi ? ($this->formatBlacklistIDNative($blacklistID) ?? $this->formatBlacklistIDPhp($blacklistID)) : $this->formatBlacklistIDPhp($blacklistID);
+    }
+
+    private function formatBlacklistIDPhp(int|string $blacklistID): string
     {
         if ($blacklistID !== '' && is_numeric($blacklistID)) {
             return sprintf('AND id = %d', $blacklistID);
@@ -1031,6 +1159,11 @@ class ReleaseRemoverService
      */
     protected function formatCriteriaQuery(string $argument): bool|string
     {
+        return self::$useRustFfi ? ($this->formatCriteriaQueryNative($argument) ?? $this->formatCriteriaQueryPhp($argument)) : $this->formatCriteriaQueryPhp($argument);
+    }
+
+    protected function formatCriteriaQueryPhp(string $argument): bool|string
+    {
         if ($argument === 'ignore') {
             $this->ignoreUserCheck = true;
 
@@ -1055,6 +1188,11 @@ class ReleaseRemoverService
      * Build a criteria clause based on column, modifier and value.
      */
     private function buildCriteriaClause(string $column, string $modifier, string $value): bool|string
+    {
+        return self::$useRustFfi ? ($this->buildCriteriaClauseNative($column, $modifier, $value) ?? $this->buildCriteriaClausePhp($column, $modifier, $value)) : $this->buildCriteriaClausePhp($column, $modifier, $value);
+    }
+
+    private function buildCriteriaClausePhp(string $column, string $modifier, string $value): bool|string
     {
         // Simple equals columns
         $simpleEqualsColumns = ['categories_id', 'nzbstatus', 'videos_id'];
@@ -1103,6 +1241,11 @@ class ReleaseRemoverService
      */
     private function buildNumericClause(string $column, string $modifier, string $value): bool|string
     {
+        return self::$useRustFfi ? ($this->buildNumericClauseNative($column, $modifier, $value) ?? $this->buildNumericClausePhp($column, $modifier, $value)) : $this->buildNumericClausePhp($column, $modifier, $value);
+    }
+
+    private function buildNumericClausePhp(string $column, string $modifier, string $value): bool|string
+    {
         return match ($modifier) {
             'equals' => " AND {$column} = {$value}",
             'bigger' => " AND {$column} > {$value}",
@@ -1139,6 +1282,11 @@ class ReleaseRemoverService
      * Build imdbid clause.
      */
     private function buildImdbClause(string $modifier, string $value): bool|string
+    {
+        return self::$useRustFfi ? ($this->buildImdbClauseNative($modifier, $value) ?? $this->buildImdbClausePhp($modifier, $value)) : $this->buildImdbClausePhp($modifier, $value);
+    }
+
+    private function buildImdbClausePhp(string $modifier, string $value): bool|string
     {
         if ($modifier !== 'equals') {
             return false;
@@ -1184,6 +1332,11 @@ class ReleaseRemoverService
      */
     private function buildCompletionClause(string $modifier, string $value): bool|string
     {
+        return self::$useRustFfi ? ($this->buildCompletionClauseNative($modifier, $value) ?? $this->buildCompletionClausePhp($modifier, $value)) : $this->buildCompletionClausePhp($modifier, $value);
+    }
+
+    private function buildCompletionClausePhp(string $modifier, string $value): bool|string
+    {
         if (! is_numeric($value) || $modifier !== 'smaller') {
             return false;
         }
@@ -1222,6 +1375,11 @@ class ReleaseRemoverService
      */
     protected function cleanSpaces(string $string): string
     {
+        return self::$useRustFfi ? ($this->cleanSpacesNative($string) ?? $this->cleanSpacesPhp($string)) : $this->cleanSpacesPhp($string);
+    }
+
+    protected function cleanSpacesPhp(string $string): string
+    {
         return trim(preg_replace('/\s{2,}/', ' ', $string));
     }
 
@@ -1229,6 +1387,11 @@ class ReleaseRemoverService
      * Format a "like" string. ie: "name LIKE '%test%' AND name LIKE '%123%'.
      */
     protected function formatLike(string $string, string $column): string
+    {
+        return self::$useRustFfi ? ($this->formatLikeNative($string, $column) ?? $this->formatLikePhp($string, $column)) : $this->formatLikePhp($string, $column);
+    }
+
+    protected function formatLikePhp(string $string, string $column): string
     {
         $parts = explode(' ', $string);
         if (\count($parts) > 1) {

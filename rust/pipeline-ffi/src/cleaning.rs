@@ -8067,3 +8067,705 @@ mod wave10_worker6_tests {
         }
     }
 }
+
+// Release-removal helpers use PHP's byte semantics. Database quoting/lookups
+// remain in PHP; the D tag carries the exact arguments for that boundary.
+fn remover_clean_spaces(input: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(input.len());
+    let mut p = 0;
+    while p < input.len() {
+        if is_pcre_space(input[p]) {
+            let start = p;
+            p += 1;
+            while p < input.len() && is_pcre_space(input[p]) {
+                p += 1;
+            }
+            output.push(if p - start > 1 { b' ' } else { input[start] });
+        } else {
+            output.push(input[p]);
+            p += 1;
+        }
+    }
+    let trimmed = php_trim_ascii(&output);
+    let start = trimmed.as_ptr() as usize - output.as_ptr() as usize;
+    let end = start + trimmed.len();
+    output.truncate(end);
+    output.drain(..start);
+    output
+}
+
+fn remover_format_like(value: &[u8], column: &[u8], out: &mut Vec<u8>) {
+    out.extend_from_slice(b" LIKE '%");
+    if value.contains(&b' ') {
+        let mut seen = std::collections::HashSet::new();
+        let mut first = true;
+        for word in value.split(|&b| b == b' ') {
+            if seen.insert(word) {
+                if !first {
+                    out.extend_from_slice(b"%' AND ");
+                    out.extend_from_slice(column);
+                    out.extend_from_slice(b" LIKE '%");
+                }
+                out.extend_from_slice(word);
+                first = false;
+            }
+        }
+    } else {
+        out.extend_from_slice(value);
+    }
+    out.extend_from_slice(b"%' ");
+}
+
+/// PHP 8 is_numeric string grammar, without float conversion or range limits.
+fn remover_is_numeric(mut value: &[u8]) -> bool {
+    while value.first().is_some_and(|b| is_pcre_space(*b)) {
+        value = &value[1..];
+    }
+    while value.last().is_some_and(|b| is_pcre_space(*b)) {
+        value = &value[..value.len() - 1];
+    }
+    let mut p = usize::from(matches!(value.first(), Some(b'+' | b'-')));
+    let start = p;
+    while p < value.len() && value[p].is_ascii_digit() {
+        p += 1;
+    }
+    let mut digits = p - start;
+    if value.get(p) == Some(&b'.') {
+        p += 1;
+        let start = p;
+        while p < value.len() && value[p].is_ascii_digit() {
+            p += 1;
+        }
+        digits += p - start;
+    }
+    if digits == 0 {
+        return false;
+    }
+    if matches!(value.get(p), Some(b'e' | b'E')) {
+        p += 1;
+        if matches!(value.get(p), Some(b'+' | b'-')) {
+            p += 1;
+        }
+        let start = p;
+        while p < value.len() && value[p].is_ascii_digit() {
+            p += 1;
+        }
+        if start == p {
+            return false;
+        }
+    }
+    p == value.len()
+}
+
+fn remover_numeric(column: &[u8], modifier: &[u8], value: &[u8], out: &mut Vec<u8>) {
+    let operator: &[u8] = match modifier {
+        b"equals" => b" = ",
+        b"bigger" => b" > ",
+        b"smaller" => b" < ",
+        _ => {
+            out.push(b'F');
+            return;
+        }
+    };
+    out.extend_from_slice(b"S AND ");
+    out.extend_from_slice(column);
+    out.extend_from_slice(operator);
+    out.extend_from_slice(value);
+}
+
+fn remover_imdb(modifier: &[u8], value: &[u8], out: &mut Vec<u8>) {
+    if modifier != b"equals" {
+        out.push(b'F');
+    } else if value == b"NULL" {
+        out.extend_from_slice(b"S AND imdbid IS NULL ");
+    } else {
+        out.extend_from_slice(b"S AND imdbid = ");
+        out.extend_from_slice(value);
+    }
+}
+
+fn remover_completion(modifier: &[u8], value: &[u8], out: &mut Vec<u8>) {
+    if modifier == b"smaller" && remover_is_numeric(value) {
+        out.extend_from_slice(b"S AND completion > 0 AND completion < ");
+        out.extend_from_slice(value);
+    } else {
+        out.push(b'F');
+    }
+}
+
+fn remover_delegate(column: &[u8], modifier: &[u8], value: &[u8], out: &mut Vec<u8>) -> bool {
+    if column.contains(&0) || modifier.contains(&0) || value.contains(&0) {
+        return false;
+    }
+    out.push(b'D');
+    out.extend_from_slice(column);
+    out.push(0);
+    out.extend_from_slice(modifier);
+    out.push(0);
+    out.extend_from_slice(value);
+    true
+}
+
+fn remover_criteria(column: &[u8], modifier: &[u8], value: &[u8], out: &mut Vec<u8>) -> bool {
+    match column {
+        b"categories_id" | b"nzbstatus" | b"videos_id" if modifier == b"equals" => {
+            remover_numeric(column, modifier, value, out);
+        }
+        b"totalpart" => remover_numeric(column, modifier, value, out),
+        b"size" if remover_is_numeric(value) => remover_numeric(column, modifier, value, out),
+        b"adddate" | b"postdate" if remover_is_numeric(value) => {
+            let operator: &[u8] = match modifier {
+                b"bigger" => b" < NOW() - INTERVAL ",
+                b"smaller" => b" > NOW() - INTERVAL ",
+                _ => {
+                    out.push(b'F');
+                    return true;
+                }
+            };
+            out.extend_from_slice(b"S AND ");
+            out.extend_from_slice(column);
+            out.extend_from_slice(operator);
+            out.extend_from_slice(value);
+            out.extend_from_slice(b" HOUR");
+        }
+        b"fromname" | b"name" | b"searchname" if modifier == b"like" => {
+            out.extend_from_slice(b"S AND ");
+            out.extend_from_slice(column);
+            out.push(b' ');
+            remover_format_like(value, column, out);
+        }
+        b"fromname" | b"name" | b"searchname" | b"guid" if modifier == b"equals" => {
+            return remover_delegate(column, modifier, value, out);
+        }
+        b"groupname" => return remover_delegate(column, modifier, value, out),
+        b"imdbid" => remover_imdb(modifier, value, out),
+        b"completion" => remover_completion(modifier, value, out),
+        _ => out.push(b'F'),
+    }
+    true
+}
+
+/// Release-remover transforms. Modes 0/1/7 return raw bytes. Modes 2/3/4/5/6
+/// return S+SQL or F; mode 2 additionally returns I for exact `ignore`.
+/// Modes 2/3 return D+column+NUL+modifier+NUL+value for PHP database work.
+/// `-1` declines invalid pointers, modes or unsupported conversions/encoding;
+/// `-(required+3)` requests capacity without writing any output.
+///
+/// # Safety
+/// Non-null pointers must cover their specified lengths, and output must not
+/// overlap input. Null is valid only with length/capacity zero.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_remover_transform(
+    input: *const u8,
+    input_len: usize,
+    second: *const u8,
+    second_len: usize,
+    third: *const u8,
+    third_len: usize,
+    mode: u32,
+    out: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if out_cap > isize::MAX as usize || out.is_null() && out_cap != 0 {
+        return -1;
+    }
+    let (Some(input), Some(second), Some(third)) = (unsafe {
+        (
+            wave9_input(input, input_len),
+            wave9_input(second, second_len),
+            wave9_input(third, third_len),
+        )
+    }) else {
+        return -1;
+    };
+    let mut output = Vec::new();
+    match mode {
+        0 => output = remover_clean_spaces(input),
+        1 => remover_format_like(input, second, &mut output),
+        2 => {
+            if input.contains(&0) {
+                return -1;
+            }
+            if input == b"ignore" {
+                output.push(b'I');
+            } else {
+                let mut args = input.split(|&b| b == b'=');
+                let (Some(column), Some(modifier), Some(value), None) =
+                    (args.next(), args.next(), args.next(), args.next())
+                else {
+                    return unsafe { wave9_write_output(b"F", out, out_cap) };
+                };
+                if !remover_criteria(
+                    &remover_clean_spaces(column),
+                    &remover_clean_spaces(modifier),
+                    &remover_clean_spaces(value),
+                    &mut output,
+                ) {
+                    return -1;
+                }
+            }
+        }
+        3 => {
+            if !remover_criteria(input, second, third, &mut output) {
+                return -1;
+            }
+        }
+        4 => remover_numeric(input, second, third, &mut output),
+        5 => remover_imdb(input, second, &mut output),
+        6 => remover_completion(input, second, &mut output),
+        7 => {
+            if !input.is_empty() && remover_is_numeric(input) {
+                let mut value = input;
+                while value.first().is_some_and(|b| is_pcre_space(*b)) {
+                    value = &value[1..];
+                }
+                while value.last().is_some_and(|b| is_pcre_space(*b)) {
+                    value = &value[..value.len() - 1];
+                }
+                // Floating, exponential and overflowing numeric strings retain
+                // PHP sprintf's integer conversion through the caller fallback.
+                let Ok(value) = std::str::from_utf8(value).unwrap_or("").parse::<i64>() else {
+                    return -1;
+                };
+                output.extend_from_slice(b"AND id = ");
+                output.extend_from_slice(value.to_string().as_bytes());
+            }
+        }
+        _ => return -1,
+    }
+    unsafe { wave9_write_output(&output, out, out_cap) }
+}
+
+/// Returns whether cleanName may use this candidate: nonempty printable ASCII
+/// without an anchored [part/total] prefix. A literal `0` remains valid.
+///
+/// # Safety
+/// Non-null input must cover input_len bytes; null is valid with length zero.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_subject_candidate(input: *const u8, input_len: usize) -> i32 {
+    let Some(input) = (unsafe { wave9_input(input, input_len) }) else {
+        return -1;
+    };
+    if input.is_empty() || input.iter().any(|b| !(0x20..=0x7e).contains(b)) {
+        return 0;
+    }
+    if input.first() == Some(&b'[') {
+        let mut p = 1;
+        while p < input.len() && is_pcre_space(input[p]) {
+            p += 1;
+        }
+        let start = p;
+        while p < input.len() && input[p].is_ascii_digit() {
+            p += 1;
+        }
+        if p > start {
+            while p < input.len() && is_pcre_space(input[p]) {
+                p += 1;
+            }
+            if input.get(p) == Some(&b'/') {
+                p += 1;
+                while p < input.len() && is_pcre_space(input[p]) {
+                    p += 1;
+                }
+                let start = p;
+                while p < input.len() && input[p].is_ascii_digit() {
+                    p += 1;
+                }
+                if p > start {
+                    while p < input.len() && is_pcre_space(input[p]) {
+                        p += 1;
+                    }
+                    if input.get(p) == Some(&b']') {
+                        return 0;
+                    }
+                }
+            }
+        }
+    }
+    1
+}
+
+fn guid_classification(input: &[u8]) -> u8 {
+    let unsupported =
+        !(1..=40).contains(&input.len()) || input.iter().any(|b| !(0x20..=0x7e).contains(b));
+    let hex = (32..=40).contains(&input.len()) && input.iter().all(u8::is_ascii_hexdigit);
+    u8::from(unsupported) | (u8::from(hex) << 1)
+}
+
+/// Bit 0 means unsupported (not 1..40 printable ASCII bytes), bit 1 means the
+/// entire input is 32..40 ASCII hexadecimal bytes. Invalid pointers return -1.
+///
+/// # Safety
+/// Non-null input must cover input_len bytes; null is valid with length zero.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_guid_classify(input: *const u8, input_len: usize) -> i32 {
+    let Some(input) = (unsafe { wave9_input(input, input_len) }) else {
+        return -1;
+    };
+    i32::from(guid_classification(input))
+}
+
+/// Classifies count records encoded as u32 little-endian length followed by
+/// those bytes. Returns count bytes, -1 for malformed/trailing input or invalid
+/// pointers, or -(count+3) for insufficient capacity without writing any output.
+///
+/// # Safety
+/// Non-null pointers must cover their lengths. Output must not overlap input.
+/// Null is valid only with length/capacity zero.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_guid_classify_batch(
+    input: *const u8,
+    input_len: usize,
+    count: usize,
+    out: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if out_cap > isize::MAX as usize || out.is_null() && out_cap != 0 || count > input_len / 4 {
+        return -1;
+    }
+    let Some(mut input) = (unsafe { wave9_input(input, input_len) }) else {
+        return -1;
+    };
+    let mut output = Vec::with_capacity(count);
+    for _ in 0..count {
+        let Some(header) = input.get(..4) else {
+            return -1;
+        };
+        let len = u32::from_le_bytes(header.try_into().unwrap()) as usize;
+        input = &input[4..];
+        let Some(value) = input.get(..len) else {
+            return -1;
+        };
+        output.push(guid_classification(value));
+        input = &input[len..];
+    }
+    if !input.is_empty() {
+        return -1;
+    }
+    unsafe { wave9_write_output(&output, out, out_cap) }
+}
+
+#[cfg(test)]
+mod wave11_remover_tests {
+    use super::*;
+
+    fn transform(mode: u32, input: &[u8], second: &[u8], third: &[u8]) -> Result<Vec<u8>, isize> {
+        let mut out = vec![0; 1024];
+        let len = unsafe {
+            nntmux_remover_transform(
+                input.as_ptr(),
+                input.len(),
+                second.as_ptr(),
+                second.len(),
+                third.as_ptr(),
+                third.len(),
+                mode,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        if len < 0 {
+            Err(len)
+        } else {
+            out.truncate(len as usize);
+            Ok(out)
+        }
+    }
+
+    #[test]
+    fn spaces_and_like_preserve_php_byte_behavior() {
+        for (input, expected) in [
+            (&b"\0 \tA\tB\nC\x0c"[..], &b"A\tB\nC\x0c"[..]),
+            (b"A\x0c\x0cB", b"A B"),
+            (b"\x0c", b"\x0c"),
+            (b"\x0b", b""),
+            (b"A\0B", b"A\0B"),
+            (b"\xff A", b"\xff A"),
+            (b"", b""),
+        ] {
+            assert_eq!(transform(0, input, b"", b"").unwrap(), expected);
+        }
+        assert_eq!(
+            transform(1, b" x x  y ", b"name", b"").unwrap(),
+            b" LIKE '%%' AND name LIKE '%x%' AND name LIKE '%y%' "
+        );
+        assert_eq!(
+            transform(1, b"0 00 0", b"name", b"").unwrap(),
+            b" LIKE '%0%' AND name LIKE '%00%' "
+        );
+        assert_eq!(
+            transform(1, b"a\0b", b"n\0m", b"").unwrap(),
+            b" LIKE '%a\0b%' "
+        );
+    }
+
+    #[test]
+    fn numeric_grammar_does_not_depend_on_float_range() {
+        for value in [
+            "0",
+            "+1",
+            "-2",
+            ".5",
+            "1.",
+            "1.e2",
+            "-.1E-5",
+            "1e99999",
+            " \t1\n\x0c",
+            "9223372036854775808",
+        ] {
+            assert!(remover_is_numeric(value.as_bytes()), "{value:?}");
+        }
+        for value in [
+            "", " ", "+", ".", "1e", "0x10", "NaN", "INF", "1\0", "1_0", "1 2", "\u{a0}1",
+        ] {
+            assert!(!remover_is_numeric(value.as_bytes()), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn criteria_tags_and_exact_sql_match_native_helpers() {
+        for (mode, input, second, third, expected) in [
+            (2, &b"ignore"[..], &b""[..], &b""[..], &b"I"[..]),
+            (2, b" ignore ", b"", b"", b"F"),
+            (2, b"x=equals=a=b", b"", b"", b"F"),
+            (
+                2,
+                b" totalpart = bigger = thing ",
+                b"",
+                b"",
+                b"S AND totalpart > thing",
+            ),
+            (
+                2,
+                b" name = equals = hello  world ",
+                b"",
+                b"",
+                b"Dname\0equals\0hello world",
+            ),
+            (
+                3,
+                b"name",
+                b"like",
+                b"a a b",
+                b"S AND name  LIKE '%a%' AND name LIKE '%b%' ",
+            ),
+            (
+                3,
+                b"categories_id",
+                b"equals",
+                b"any\0bytes",
+                b"S AND categories_id = any\0bytes",
+            ),
+            (3, b"size", b"bigger", b"no", b"F"),
+            (3, b"size", b"smaller", b"1e99999", b"S AND size < 1e99999"),
+            (
+                3,
+                b"postdate",
+                b"bigger",
+                b".5",
+                b"S AND postdate < NOW() - INTERVAL .5 HOUR",
+            ),
+            (
+                3,
+                b"adddate",
+                b"smaller",
+                b"2",
+                b"S AND adddate > NOW() - INTERVAL 2 HOUR",
+            ),
+            (3, b"adddate", b"equals", b"2", b"F"),
+            (3, b"guid", b"equals", b"abc", b"Dguid\0equals\0abc"),
+            (3, b"groupname", b"bogus", b"a", b"Dgroupname\0bogus\0a"),
+            (4, b"arbitrary", b"equals", b"no", b"S AND arbitrary = no"),
+            (5, b"equals", b"NULL", b"", b"S AND imdbid IS NULL "),
+            (5, b"equals", b"null", b"", b"S AND imdbid = null"),
+            (5, b"like", b"1", b"", b"F"),
+            (
+                6,
+                b"smaller",
+                b"1e2",
+                b"",
+                b"S AND completion > 0 AND completion < 1e2",
+            ),
+            (6, b"smaller", b"a", b"", b"F"),
+            (6, b"equals", b"1", b"", b"F"),
+        ] {
+            assert_eq!(transform(mode, input, second, third).unwrap(), expected);
+        }
+        assert_eq!(transform(2, b"name=equals=a\0b", b"", b""), Err(-1));
+        assert_eq!(transform(3, b"name", b"equals", b"a\0b"), Err(-1));
+        assert_eq!(transform(3, b"groupname", b"x\0y", b"a"), Err(-1));
+    }
+
+    #[test]
+    fn blacklist_preserves_exact_integers_and_declines_php_float_conversion() {
+        for (value, expected) in [
+            ("", ""),
+            ("oops", ""),
+            ("0", "AND id = 0"),
+            (" \t+00042\n", "AND id = 42"),
+            ("-0", "AND id = 0"),
+            ("-9223372036854775808", "AND id = -9223372036854775808"),
+            ("9223372036854775807", "AND id = 9223372036854775807"),
+        ] {
+            assert_eq!(
+                transform(7, value.as_bytes(), b"", b"").unwrap(),
+                expected.as_bytes()
+            );
+        }
+        for value in [
+            "1e2",
+            "1.",
+            ".0",
+            "9223372036854775808",
+            "-9223372036854775809",
+        ] {
+            assert_eq!(transform(7, value.as_bytes(), b"", b""), Err(-1));
+        }
+    }
+
+    #[test]
+    fn subject_and_guid_flags_match_anchored_ascii_contract() {
+        for (input, expected) in [
+            (&b""[..], 0),
+            (b"0", 1),
+            (b" ", 1),
+            (b"[ 1 / 20 ]name", 0),
+            (b"x[1/2]", 1),
+            (b"[1/2", 1),
+            (b"[a/2]", 1),
+            (b"[1/2a]", 1),
+            (b"a\n", 0),
+            (b"a\0", 0),
+            (b"a\x7f", 0),
+            (b"\xff", 0),
+        ] {
+            assert_eq!(
+                unsafe { nntmux_subject_candidate(input.as_ptr(), input.len()) },
+                expected
+            );
+        }
+        for (input, expected) in [
+            (&b""[..], 1),
+            (b" ", 0),
+            (b"a\n", 1),
+            (b"0123456789abcdef0123456789ABCDEF", 2),
+            (b"0123456789abcdef0123456789ABCDEF01234567", 2),
+            (b"0123456789abcdef0123456789ABCDEF012345678", 1),
+        ] {
+            assert_eq!(
+                unsafe { nntmux_guid_classify(input.as_ptr(), input.len()) },
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn abi_rejects_malformed_pointers_and_preserves_short_buffers() {
+        unsafe {
+            let null = std::ptr::null();
+            let mut out = [b'!'; 8];
+            assert_eq!(
+                nntmux_remover_transform(null, 1, null, 0, null, 0, 0, out.as_mut_ptr(), 8),
+                -1
+            );
+            assert_eq!(
+                nntmux_remover_transform(null, 0, null, 1, null, 0, 0, out.as_mut_ptr(), 8),
+                -1
+            );
+            assert_eq!(
+                nntmux_remover_transform(null, 0, null, 0, null, 1, 0, out.as_mut_ptr(), 8),
+                -1
+            );
+            assert_eq!(
+                nntmux_remover_transform(null, 0, null, 0, null, 0, 0, std::ptr::null_mut(), 1),
+                -1
+            );
+            assert_eq!(
+                nntmux_remover_transform(null, 0, null, 0, null, 0, 99, out.as_mut_ptr(), 8),
+                -1
+            );
+            assert_eq!(
+                nntmux_remover_transform(
+                    b"abc".as_ptr(),
+                    3,
+                    null,
+                    0,
+                    null,
+                    0,
+                    0,
+                    out.as_mut_ptr(),
+                    2
+                ),
+                -6
+            );
+            assert_eq!(out, [b'!'; 8]);
+            assert_eq!(
+                nntmux_remover_transform(null, 0, null, 0, null, 0, 2, std::ptr::null_mut(), 0),
+                -4
+            );
+            assert_eq!(
+                nntmux_remover_transform(null, 0, null, 0, null, 0, 0, std::ptr::null_mut(), 0),
+                0
+            );
+            assert_eq!(nntmux_subject_candidate(null, 1), -1);
+            assert_eq!(nntmux_subject_candidate(null, 0), 0);
+            assert_eq!(nntmux_guid_classify(null, 1), -1);
+            assert_eq!(nntmux_guid_classify(null, 0), 1);
+        }
+    }
+
+    #[test]
+    fn guid_batch_requires_exact_framing_and_capacity() {
+        let mut bytes = Vec::new();
+        for value in [
+            &b""[..],
+            &b"ab"[..],
+            &b"0123456789abcdef0123456789ABCDEF"[..],
+        ] {
+            bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(value);
+        }
+        unsafe {
+            let mut out = [b'!'; 3];
+            assert_eq!(
+                nntmux_guid_classify_batch(bytes.as_ptr(), bytes.len(), 3, out.as_mut_ptr(), 3),
+                3
+            );
+            assert_eq!(out, [1, 0, 2]);
+            out.fill(b'!');
+            assert_eq!(
+                nntmux_guid_classify_batch(bytes.as_ptr(), bytes.len(), 3, out.as_mut_ptr(), 2),
+                -6
+            );
+            assert_eq!(out, [b'!'; 3]);
+            for (len, count) in [(bytes.len() - 1, 3), (bytes.len(), 2), (2, 1), (0, 1)] {
+                assert_eq!(
+                    nntmux_guid_classify_batch(bytes.as_ptr(), len, count, out.as_mut_ptr(), 3),
+                    -1
+                );
+                assert_eq!(out, [b'!'; 3]);
+            }
+            assert_eq!(
+                nntmux_guid_classify_batch(std::ptr::null(), 0, 0, std::ptr::null_mut(), 0),
+                0
+            );
+            assert_eq!(
+                nntmux_guid_classify_batch(std::ptr::null(), 1, 0, out.as_mut_ptr(), 3),
+                -1
+            );
+            assert_eq!(
+                nntmux_guid_classify_batch(bytes.as_ptr(), bytes.len(), 3, std::ptr::null_mut(), 1),
+                -1
+            );
+            assert_eq!(
+                nntmux_guid_classify_batch(bytes.as_ptr(), bytes.len(), 3, std::ptr::null_mut(), 0),
+                -6
+            );
+            let malformed = [0xff; 4];
+            assert_eq!(
+                nntmux_guid_classify_batch(malformed.as_ptr(), 4, 1, out.as_mut_ptr(), 3),
+                -1
+            );
+        }
+    }
+}

@@ -7,6 +7,7 @@ namespace App\Console\Commands;
 use App\Models\Predb;
 use App\Services\NameFixing\ReleaseUpdateService;
 use App\Services\ReleaseCleaningService;
+use App\Support\RustPipelineLibrary;
 use Illuminate\Console\Attributes\Description;
 use Illuminate\Console\Attributes\Signature;
 use Illuminate\Console\Command;
@@ -30,6 +31,34 @@ use Illuminate\Support\Facades\DB;
 #[Description('Rename releases still named after a raw "[n/m] - \"file\"" posting subject')]
 class ReleasesCleanSubjectNames extends Command
 {
+    private static bool $useRustFfi = false;
+
+    public static function useRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function subjectCandidateNative(string $name): ?bool
+    {
+        if (ini_get('pcre.backtrack_limit') !== '1000000' || ini_get('pcre.recursion_limit') !== '100000') {
+            return null;
+        }
+        $ffi = RustPipelineLibrary::resolveDomain('cleaning', 'int32_t nntmux_subject_candidate(const char *input, size_t input_len);');
+        if ($ffi === null) {
+            return null;
+        }
+        // @phpstan-ignore method.notFound
+        $result = $ffi->nntmux_subject_candidate($name, strlen($name));
+
+        return $result === 0 || $result === 1 ? $result === 1 : null;
+    }
+
+    private static function subjectCandidatePhp(string $name): bool
+    {
+        return $name !== '' && preg_match('/^\[\s*\d+\s*\/\s*\d+\s*\]/', $name) !== 1
+            && preg_match('/[^\x20-\x7E]/', $name) !== 1;
+    }
+
     /** Search names that may still be a raw counter-and-file subject (`[1/9] - "`, `[1/9] "`, `[1/9]-"`, `[1/9] - #34;`). */
     private const string RAW_SUBJECT_LIKE = '[%/%]%';
 
@@ -118,14 +147,9 @@ class ReleasesCleanSubjectNames extends Command
         $name = is_array($meta) ? trim((string) ($meta['cleansubject'] ?? '')) : '';
         $preId = is_array($meta) ? max(0, (int) ($meta['predb'] ?? 0)) : 0;
 
-        // Still a counter-and-file subject: no cleaner recognised it (for example a hashed file name).
-        if ($name === '' || preg_match('/^\[\s*\d+\s*\/\s*\d+\s*\]/', $name) === 1) {
-            return [null, 0];
-        }
-
-        // The name-fixing update path drops non-ASCII characters, which would mangle an accented title.
-        // New releases keep it, so leave these rather than corrupt them.
-        if (preg_match('/[^\x20-\x7E]/', $name) === 1) {
+        // Preserve empty/counter/non-ASCII rejection before looking up PreDB.
+        $accepted = self::$useRustFfi ? (self::subjectCandidateNative($name) ?? self::subjectCandidatePhp($name)) : self::subjectCandidatePhp($name);
+        if (! $accepted) {
             return [null, 0];
         }
 
