@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace App\Services\NameFixing;
 
 use App\Support\RustPipelineLibrary;
+use FFI;
+use Throwable;
 
 /**
  * Recognises whole-season TV releases and derives a season-level release name
@@ -15,6 +17,24 @@ use App\Support\RustPipelineLibrary;
  */
 final class SeasonPackDetector
 {
+    private const string CLEANING_CDEF = <<<'C'
+        int32_t nntmux_season_pack_is_unclassified_episode(const char *name, size_t len);
+        int32_t nntmux_season_pack_has_distinct_identities_nul(const char *names, size_t len);
+        int32_t nntmux_season_pack_is_ancillary_name(const char *name, size_t len);
+        int32_t nntmux_season_pack_season_folder(const char *name, size_t len);
+        C;
+
+    private static FFI|false|null $cleaningFfi = null;
+
+    private static function cleaningLibrary(): ?FFI
+    {
+        if (self::$cleaningFfi === null) {
+            self::$cleaningFfi = RustPipelineLibrary::resolveDomain('season_pack_cleaning', self::CLEANING_CDEF) ?? false;
+        }
+
+        return self::$cleaningFfi ?: null;
+    }
+
     /** S01, S1, S01-S03, S01-03, S01D1, S01.Disc.2 between separators */
     private const string SEASON_TOKEN_REGEX = '/(?:^|[._ \-\[(])S\d{1,4}(?:[._ ]?D(?:is[ck])?[._ ]?\d{1,2})?(?=$|[._ \-\])])/i';
 
@@ -91,6 +111,11 @@ final class SeasonPackDetector
     /** Recognized episode markers without enough information to infer a season safely. */
     public static function isUnclassifiedEpisodeName(string $name): bool
     {
+        return self::isUnclassifiedEpisodeNameNative($name) ?? self::isUnclassifiedEpisodeNamePhp($name);
+    }
+
+    public static function isUnclassifiedEpisodeNamePhp(string $name): bool
+    {
         $base = self::baseName($name);
 
         return preg_match(self::SAMPLE_REGEX, $base) !== 1
@@ -122,6 +147,14 @@ final class SeasonPackDetector
      * @param  list<string>  $names
      */
     public static function hasDistinctEpisodeIdentities(array $names): bool
+    {
+        // Counting every ancillary entry in Rust loses PHP's two-identity early
+        // exit on large batches; keep this caller native (benchmark in parity test).
+        return self::hasDistinctEpisodeIdentitiesPhp($names);
+    }
+
+    /** @param list<string> $names */
+    public static function hasDistinctEpisodeIdentitiesPhp(array $names): bool
     {
         $first = null;
         foreach ($names as $name) {
@@ -232,6 +265,11 @@ final class SeasonPackDetector
     /** Only explicit metadata/subtitle/artwork and sample conventions are ancillary. */
     public static function isAncillaryName(string $name): bool
     {
+        return self::isAncillaryNameNative($name) ?? self::isAncillaryNamePhp($name);
+    }
+
+    public static function isAncillaryNamePhp(string $name): bool
+    {
         if (preg_match(self::SAMPLE_REGEX, self::baseName($name)) === 1) {
             return true;
         }
@@ -338,6 +376,15 @@ final class SeasonPackDetector
      */
     public static function seasonFolder(array $paths): ?string
     {
+        $supported = false;
+        $folder = self::seasonFolderNative($paths, $supported);
+
+        return $supported ? $folder : self::seasonFolderPhp($paths);
+    }
+
+    /** @param list<string> $paths */
+    public static function seasonFolderPhp(array $paths): ?string
+    {
         foreach ($paths as $path) {
             $segments = explode('/', str_replace('\\', '/', $path));
             array_pop($segments);
@@ -429,6 +476,102 @@ final class SeasonPackDetector
         }
 
         return trim($base, " \t\n\r\0\x0B.");
+    }
+
+    /** null requests exact PHP fallback, including PCRE newline edge cases. */
+    public static function isUnclassifiedEpisodeNameNative(string $name): ?bool
+    {
+        $ffi = self::cleaningLibrary();
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound (domain C ABI)
+            $result = $ffi->nntmux_season_pack_is_unclassified_episode($name, \strlen($name));
+
+            return $result < 0 ? null : $result === 1;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * One FFI call parses identities and counts ancillary names. Bit zero carries
+     * distinctness; the higher bits carry the ancillary count for batch consumers.
+     * Embedded NULs cannot be represented by this wire format and fall back.
+     *
+     * @param  list<string>  $names
+     */
+    public static function hasDistinctEpisodeIdentitiesNative(array $names): ?bool
+    {
+        $ffi = self::cleaningLibrary();
+        if ($ffi === null) {
+            return null;
+        }
+        foreach ($names as $name) {
+            if (str_contains($name, "\0")) {
+                return null;
+            }
+        }
+        $joined = implode("\0", $names);
+        try {
+            // @phpstan-ignore method.notFound (domain C ABI)
+            $result = $ffi->nntmux_season_pack_has_distinct_identities_nul($joined, \strlen($joined));
+
+            return $result < 0 ? null : ($result & 1) !== 0;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    public static function isAncillaryNameNative(string $name): ?bool
+    {
+        $ffi = self::cleaningLibrary();
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound (domain C ABI)
+            $result = $ffi->nntmux_season_pack_is_ancillary_name($name, \strlen($name));
+
+            return $result < 0 ? null : $result === 1;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * The ABI returns a byte offset into each path; PHP preserves the spelling of
+     * the first outermost matching folder and input path order.
+     *
+     * @param  list<string>  $paths
+     */
+    public static function seasonFolderNative(array $paths, bool &$supported = false): ?string
+    {
+        $supported = false;
+        $ffi = self::cleaningLibrary();
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            foreach ($paths as $path) {
+                // @phpstan-ignore method.notFound (domain C ABI)
+                $offset = $ffi->nntmux_season_pack_season_folder($path, \strlen($path));
+                if ($offset === -1) {
+                    return null;
+                }
+                if ($offset >= 0) {
+                    $supported = true;
+
+                    return trim(substr($path, $offset, strcspn($path, '/\\', $offset)));
+                }
+            }
+            $supported = true;
+
+            return null;
+        } catch (Throwable) {
+            return null;
+        }
     }
 
     /**

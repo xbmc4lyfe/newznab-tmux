@@ -11,9 +11,15 @@ use App\Models\Release;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Services\PopulateAniListService as PaList;
 use App\Support\RustPipelineLibrary;
+use FFI;
+use Throwable;
 
 class AnimeProcessor
 {
+    private const string CLEANING_CDEF = 'ssize_t nntmux_anime_fix_encoding(const char *text, size_t len, char *out, size_t cap);';
+
+    private static FFI|false|null $cleaningFfi = null;
+
     private const PROC_EXTFAIL = -1; // Release Anime title/episode # could not be extracted from searchname
 
     private const PROC_NOMATCH = -2; // AniList ID was not found in anidb table using extracted title
@@ -208,6 +214,41 @@ class AnimeProcessor
      * Fix UTF-8 encoding issues in strings (double-encoding, corrupted sequences).
      */
     private function fixEncoding(string $text): string
+    {
+        // The full caller misses the mean/p99 gate; keep Unicode cleanup in PHP.
+        return $this->fixEncodingPhp($text);
+    }
+
+    /** Dependency-free Rust declines inputs requiring Unicode NFC normalization. */
+    public function fixEncodingNative(string $text): ?string
+    {
+        if (self::$cleaningFfi === null) {
+            self::$cleaningFfi = RustPipelineLibrary::resolveDomain('anime_fix_encoding', self::CLEANING_CDEF) ?? false;
+        }
+        $ffi = self::$cleaningFfi;
+        if ($ffi === false) {
+            return null;
+        }
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, \strlen($text) + 1, $cap);
+        if ($scratch === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound (domain C ABI)
+            $written = $ffi->nntmux_anime_fix_encoding($text, \strlen($text), $scratch, $cap);
+            if ($written < 0) {
+                return null;
+            }
+
+            return $written === 0 ? '' : FFI::string($scratch, $written);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** Exact PHP reference and fallback, including literal HTML entity handling. */
+    public function fixEncodingPhp(string $text): string
     {
         // Remove common corrupted character sequences (encoding artifacts)
         // Pattern: Ã¢Â_Â, Ã¢Â Â, Ã¢Â, etc.
