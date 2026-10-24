@@ -19,6 +19,97 @@ final class ImportDatabaseNzbs extends Command
 
     protected $description = 'Copy retained NZBs into the shared database without adding historical fingerprint work; preserve originals';
 
+    // Keep PHP as the production default until the Rust performance gate passes.
+    private static ?bool $useRustFfi = null;
+
+    public static function setUseRustFfi(?bool $useRustFfi): void
+    {
+        self::$useRustFfi = $useRustFfi;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::useRustFfi();
+    }
+
+    public static function isValidCheckpointName(string $checkpoint): bool
+    {
+        return self::useRustFfi() ? self::isValidCheckpointNameNative($checkpoint) : self::isValidCheckpointNamePhp($checkpoint);
+    }
+
+    public static function isValidCheckpointNamePhp(string $checkpoint): bool
+    {
+        return $checkpoint !== '' && strlen($checkpoint) <= 120;
+    }
+
+    public static function isValidCheckpointNameNative(string $checkpoint): bool
+    {
+        $result = ImportNfos::transformNative(6, [$checkpoint]);
+
+        return is_bool($result) ? $result : self::isValidCheckpointNamePhp($checkpoint);
+    }
+
+    public static function clampLimit(int $limit): int
+    {
+        return self::useRustFfi() ? self::clampLimitNative($limit) : self::clampLimitPhp($limit);
+    }
+
+    public static function clampLimitPhp(int $limit): int
+    {
+        return max(1, min(10000, $limit));
+    }
+
+    public static function clampLimitNative(int $limit): int
+    {
+        $result = ImportNfos::transformNative(7, [$limit]);
+
+        return is_int($result) ? $result : self::clampLimitPhp($limit);
+    }
+
+    /**
+     * The anchored pattern rejects trailing newlines (`D`), matching the legacy lookup guard.
+     */
+    public static function isValidReleaseGuid(string $guid): bool
+    {
+        return self::useRustFfi() ? self::isValidReleaseGuidNative($guid) : self::isValidReleaseGuidPhp($guid);
+    }
+
+    public static function isValidReleaseGuidPhp(string $guid): bool
+    {
+        return preg_match('/^[a-zA-Z0-9_-]{1,40}$/D', $guid) === 1;
+    }
+
+    public static function isValidReleaseGuidNative(string $guid): bool
+    {
+        $result = ImportNfos::transformNative(8, [$guid]);
+
+        return is_bool($result) ? $result : self::isValidReleaseGuidPhp($guid);
+    }
+
+    public static function formatSummaryLine(bool $dryRun, int $processed, int $imported, int $alreadyInDb, int $missingFile, int $readFailed, int $cursor): string
+    {
+        return self::useRustFfi()
+            ? self::formatSummaryLineNative($dryRun, $processed, $imported, $alreadyInDb, $missingFile, $readFailed, $cursor)
+            : self::formatSummaryLinePhp($dryRun, $processed, $imported, $alreadyInDb, $missingFile, $readFailed, $cursor);
+    }
+
+    public static function formatSummaryLinePhp(bool $dryRun, int $processed, int $imported, int $alreadyInDb, int $missingFile, int $readFailed, int $cursor): string
+    {
+        $line = ($dryRun ? 'Dry run: ' : '')."Imported {$imported}; already stored {$alreadyInDb}; resume after release {$cursor}.";
+        if ($missingFile !== 0 || $readFailed !== 0) {
+            $line .= " Skipped {$missingFile} missing and {$readFailed} unreadable of {$processed} processed.";
+        }
+
+        return $line;
+    }
+
+    public static function formatSummaryLineNative(bool $dryRun, int $processed, int $imported, int $alreadyInDb, int $missingFile, int $readFailed, int $cursor): string
+    {
+        $result = ImportNfos::transformNative(9, [$dryRun, $processed, $imported, $alreadyInDb, $missingFile, $readFailed, $cursor]);
+
+        return is_string($result) ? $result : self::formatSummaryLinePhp($dryRun, $processed, $imported, $alreadyInDb, $missingFile, $readFailed, $cursor);
+    }
+
     public function handle(): int
     {
         $roots = array_map(static fn (string $path): string => rtrim($path, '/'), $this->option('root'));
@@ -28,12 +119,12 @@ final class ImportDatabaseNzbs extends Command
             return self::FAILURE;
         }
         $name = (string) $this->option('name');
-        if ($name === '' || strlen($name) > 120) {
+        if (! self::isValidCheckpointName($name)) {
             return self::INVALID;
         }
         $cursor = $this->option('after-id') !== null ? max(0, (int) $this->option('after-id'))
             : (int) (DB::table('nzb_storage_imports')->where('name', $name)->value('last_release_id') ?? 0);
-        $limit = max(1, min(10000, (int) $this->option('limit')));
+        $limit = self::clampLimit((int) $this->option('limit'));
         $rows = DB::table('releases')->where('id', '>', $cursor)->where('nzbstatus', 1)->orderBy('id')->limit($limit)->get(['id', 'guid']);
         $copied = $existing = 0;
         foreach ($rows as $release) {
@@ -74,7 +165,8 @@ final class ImportDatabaseNzbs extends Command
                 return self::FAILURE;
             }
         }
-        $this->info(($this->option('dry-run') ? 'Dry run: ' : '')."Imported {$copied}; already stored {$existing}; resume after release {$cursor}.");
+        // The import stops at the first unreadable or missing source, so a completed run has none.
+        $this->info(self::formatSummaryLine((bool) $this->option('dry-run'), $copied + $existing, $copied, $existing, 0, 0, $cursor));
 
         return self::SUCCESS;
     }
@@ -86,7 +178,7 @@ final class ImportDatabaseNzbs extends Command
      */
     private function locate(array $roots, string $guid): string
     {
-        if (preg_match('/^[a-zA-Z0-9_-]{1,40}$/D', $guid) !== 1) {
+        if (! self::isValidReleaseGuid($guid)) {
             throw new RuntimeException('Invalid release GUID.');
         }
         foreach ($roots as $root) {
@@ -102,5 +194,10 @@ final class ImportDatabaseNzbs extends Command
             }
         }
         throw new RuntimeException('Legacy NZB is missing.');
+    }
+
+    private static function useRustFfi(): bool
+    {
+        return self::$useRustFfi ?? false;
     }
 }
