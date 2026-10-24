@@ -5,8 +5,11 @@ declare(strict_types=1);
 namespace App\Services\Tmux;
 
 use App\Facades\Yenc;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Process;
+use Throwable;
 
 /**
  * Tmux output functions for printing monitor data.
@@ -16,6 +19,18 @@ use Illuminate\Support\Facades\Process;
  */
 class TmuxOutput extends Tmux
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_tmux_output_extract_server_info(const char *info, size_t info_len, char *out_buf, size_t out_cap);
+        int64_t nntmux_tmux_output_percent(int64_t part, int64_t total);
+        ssize_t nntmux_tmux_output_decode_count_row(int64_t in_process, const char *diff, size_t diff_len, int64_t in_database, int64_t percent, char *out_buf, size_t out_cap);
+        C;
+
+    private static bool $useRustFfi = true;
+
+    private static ?FFI $ffi = null;
+
+    private static bool $ffiResolved = false;
+
     protected mixed $_colourMasks;
 
     private mixed $runVar;
@@ -36,6 +51,208 @@ class TmuxOutput extends Tmux
         parent::__construct();
 
         $this->_setColourMasks();
+    }
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (! self::$ffiResolved) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('irc', self::FFI_CDEF);
+            self::$ffiResolved = true;
+        }
+
+        return self::$ffi;
+    }
+
+    public function percent(int $part, int $total): int
+    {
+        return $this->percentPhp($part, $total);
+    }
+
+    public static function percentNative(int $part, int $total): ?int
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $res = $ffi->nntmux_tmux_output_percent($part, $total);
+
+            return is_int($res) ? $res : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    public function percentPhp(int $part, int $total): int
+    {
+        return $total > 0 ? (int) floor(($part / $total) * 100) : 0;
+    }
+
+    /**
+     * @return array{0: string, 1: string}
+     */
+    public function decodeCountRow(int $inProcess, string $diff, int $inDatabase, int|string $percent): array
+    {
+        return $this->decodeCountRowPhp($inProcess, $diff, $inDatabase, $percent);
+    }
+
+    /**
+     * @return array{0: string, 1: string}|null
+     */
+    public static function decodeCountRowNative(int $inProcess, string $diff, int $inDatabase, int|string $percent): ?array
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $diffLen = strlen($diff);
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(128, $diffLen + 64), $cap);
+        if ($scratch === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_tmux_output_decode_count_row(
+                $inProcess,
+                $diff,
+                $diffLen,
+                $inDatabase,
+                (int) $percent,
+                $scratch,
+                $cap,
+            );
+            if (! is_int($written) || $written === -1) {
+                return null;
+            }
+            if ($written < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_tmux_output_decode_count_row(
+                    $inProcess,
+                    $diff,
+                    $diffLen,
+                    $inDatabase,
+                    (int) $percent,
+                    $scratch,
+                    $cap,
+                );
+                if (! is_int($written) || $written <= 0) {
+                    return null;
+                }
+            }
+            $parts = explode("\0", FFI::string($scratch, $written), 2);
+            if (count($parts) !== 2) {
+                return null;
+            }
+
+            return [$parts[0], $parts[1]];
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * @return array{0: string, 1: string}
+     */
+    public function decodeCountRowPhp(int $inProcess, string $diff, int $inDatabase, int|string $percent): array
+    {
+        return [
+            sprintf('%s(%s)', number_format($inProcess), $diff),
+            sprintf('%s(%d%%)', number_format($inDatabase), (int) $percent),
+        ];
+    }
+
+    /**
+     * @return array{Threads: string, Opens: string, Tables: string, Slow: string, QPS: string}
+     */
+    public function extractServerInfoMetrics(string $info): array
+    {
+        if (self::$useRustFfi) {
+            $native = self::extractServerInfoMetricsNative($info);
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
+        return $this->extractServerInfoMetricsPhp($info);
+    }
+
+    /**
+     * @return array{Threads: string, Opens: string, Tables: string, Slow: string, QPS: string}|null
+     */
+    public static function extractServerInfoMetricsNative(string $info): ?array
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $len = strlen($info);
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(256, $len * 5 + 16), $cap);
+        if ($scratch === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_tmux_output_extract_server_info($info, $len, $scratch, $cap);
+            if (! is_int($written) || $written === -1) {
+                return null;
+            }
+            if ($written < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_tmux_output_extract_server_info($info, $len, $scratch, $cap);
+                if (! is_int($written) || $written < 4) {
+                    return null;
+                }
+            }
+            $parts = explode("\0", FFI::string($scratch, $written), 5);
+            if (count($parts) !== 5) {
+                return null;
+            }
+
+            return [
+                'Threads' => $parts[0],
+                'Opens' => $parts[1],
+                'Tables' => $parts[2],
+                'Slow' => $parts[3],
+                'QPS' => $parts[4],
+            ];
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * @return array{Threads: string, Opens: string, Tables: string, Slow: string, QPS: string}
+     */
+    public function extractServerInfoMetricsPhp(string $info): array
+    {
+        return [
+            'Threads' => (string) preg_replace('/.*\bThreads: (\d+)\b.*/', '$1', $info),
+            'Opens' => (string) preg_replace('/.*\bOpens[^:]*?: (\d+)\b.*/', '$1', $info),
+            'Tables' => (string) preg_replace('/.* tables: (\d+)\b.*/', '$1', $info),
+            'Slow' => (string) preg_replace('/.*\bSlow[^:]*?: (\d+)\b.*/', '$1', $info),
+            'QPS' => (string) preg_replace('/.*\bQueries[^:]*?: (\d+)\b.*/', '$1', $info),
+        ];
     }
 
     public function updateMonitorPane(mixed &$runVar): void
@@ -225,166 +442,89 @@ class TmuxOutput extends Tmux
         $buffer .= sprintf($this->tmpMasks[3], 'PP Lists', 'Unmatched', 'Matched');
         $buffer .= $this->_getSeparator();
 
-        $buffer .= sprintf(
-            $this->tmpMasks[4],
-            'Nfo',
-            sprintf(
-                '%s(%s)',
-                number_format((int) ($this->runVar['counts']['now']['processnfo'] ?? 0)),
-                $this->runVar['counts']['diff']['processnfo']
-            ),
-            sprintf(
-                '%s(%d%%)',
-                number_format((int) ($this->runVar['counts']['now']['nfo'] ?? 0)),
-                $this->runVar['counts']['percent']['nfo']
-            )
+        [$nfoInProcess, $nfoInDb] = $this->decodeCountRow(
+            (int) ($this->runVar['counts']['now']['processnfo'] ?? 0),
+            (string) $this->runVar['counts']['diff']['processnfo'],
+            (int) ($this->runVar['counts']['now']['nfo'] ?? 0),
+            $this->runVar['counts']['percent']['nfo']
         );
-        $buffer .= sprintf(
-            $this->tmpMasks[4],
-            'PreDB',
-            sprintf(
-                '%s(%s)',
-                number_format((int) ($this->runVar['counts']['now']['predb'] ?? 0) -
-                    (int) ($this->runVar['counts']['now']['distinct_predb_matched'] ?? 0)),
-                $this->runVar['counts']['diff']['distinct_predb_matched']
-            ),
-            sprintf(
-                '%s(%d%%)',
-                number_format((int) ($this->runVar['counts']['now']['predb_matched'] ?? 0)),
-                $this->runVar['counts']['percent']['predb_matched']
-            )
+        $buffer .= sprintf($this->tmpMasks[4], 'Nfo', $nfoInProcess, $nfoInDb);
+        [$predbInProcess, $predbInDb] = $this->decodeCountRow(
+            (int) ($this->runVar['counts']['now']['predb'] ?? 0) -
+                (int) ($this->runVar['counts']['now']['distinct_predb_matched'] ?? 0),
+            (string) $this->runVar['counts']['diff']['distinct_predb_matched'],
+            (int) ($this->runVar['counts']['now']['predb_matched'] ?? 0),
+            $this->runVar['counts']['percent']['predb_matched']
         );
-        $buffer .= sprintf(
-            $this->tmpMasks[4],
-            'Renames',
-            sprintf(
-                '%s(%s)',
-                number_format((int) ($this->runVar['counts']['now']['processrenames'] ?? 0)),
-                $this->runVar['counts']['diff']['processrenames']
-            ),
-            sprintf(
-                '%s(%d%%)',
-                number_format((int) ($this->runVar['counts']['now']['renamed'] ?? 0)),
-                $this->runVar['counts']['percent']['renamed']
-            )
+        $buffer .= sprintf($this->tmpMasks[4], 'PreDB', $predbInProcess, $predbInDb);
+        [$renamesInProcess, $renamesInDb] = $this->decodeCountRow(
+            (int) ($this->runVar['counts']['now']['processrenames'] ?? 0),
+            (string) $this->runVar['counts']['diff']['processrenames'],
+            (int) ($this->runVar['counts']['now']['renamed'] ?? 0),
+            $this->runVar['counts']['percent']['renamed']
         );
+        $buffer .= sprintf($this->tmpMasks[4], 'Renames', $renamesInProcess, $renamesInDb);
 
         $buffer .= PHP_EOL;
         $buffer .= sprintf($this->tmpMasks[3], 'Category', 'In Process', 'In Database');
         $buffer .= $this->_getSeparator();
 
-        $buffer .= sprintf(
-            $this->tmpMasks[4],
-            'Audio',
-            sprintf(
-                '%s(%s)',
-                number_format((int) ($this->runVar['counts']['now']['processmusic'] ?? 0)),
-                $this->runVar['counts']['diff']['processmusic']
-            ),
-            sprintf(
-                '%s(%d%%)',
-                number_format((int) ($this->runVar['counts']['now']['audio'] ?? 0)),
-                $this->runVar['counts']['percent']['audio']
-            )
+        [$audioInProcess, $audioInDb] = $this->decodeCountRow(
+            (int) ($this->runVar['counts']['now']['processmusic'] ?? 0),
+            (string) $this->runVar['counts']['diff']['processmusic'],
+            (int) ($this->runVar['counts']['now']['audio'] ?? 0),
+            $this->runVar['counts']['percent']['audio']
         );
-        $buffer .= sprintf(
-            $this->tmpMasks[4],
-            'Books',
-            sprintf(
-                '%s(%s)',
-                number_format((int) ($this->runVar['counts']['now']['processbooks'] ?? 0)),
-                $this->runVar['counts']['diff']['processbooks']
-            ),
-            sprintf(
-                '%s(%d%%)',
-                number_format((int) ($this->runVar['counts']['now']['books'] ?? 0)),
-                $this->runVar['counts']['percent']['books']
-            )
+        $buffer .= sprintf($this->tmpMasks[4], 'Audio', $audioInProcess, $audioInDb);
+        [$booksInProcess, $booksInDb] = $this->decodeCountRow(
+            (int) ($this->runVar['counts']['now']['processbooks'] ?? 0),
+            (string) $this->runVar['counts']['diff']['processbooks'],
+            (int) ($this->runVar['counts']['now']['books'] ?? 0),
+            $this->runVar['counts']['percent']['books']
         );
-        $buffer .= sprintf(
-            $this->tmpMasks[4],
-            'Console',
-            sprintf(
-                '%s(%s)',
-                number_format((int) ($this->runVar['counts']['now']['processconsole'] ?? 0)),
-                $this->runVar['counts']['diff']['processconsole']
-            ),
-            sprintf(
-                '%s(%d%%)',
-                number_format((int) ($this->runVar['counts']['now']['console'] ?? 0)),
-                $this->runVar['counts']['percent']['console']
-            )
+        $buffer .= sprintf($this->tmpMasks[4], 'Books', $booksInProcess, $booksInDb);
+        [$consoleInProcess, $consoleInDb] = $this->decodeCountRow(
+            (int) ($this->runVar['counts']['now']['processconsole'] ?? 0),
+            (string) $this->runVar['counts']['diff']['processconsole'],
+            (int) ($this->runVar['counts']['now']['console'] ?? 0),
+            $this->runVar['counts']['percent']['console']
         );
-        $buffer .= sprintf(
-            $this->tmpMasks[4],
-            'Misc',
-            sprintf(
-                '%s(%s)',
-                number_format((int) ($this->runVar['counts']['now']['work'] ?? 0)),
-                $this->runVar['counts']['diff']['work']
-            ),
-            sprintf(
-                '%s(%d%%)',
-                number_format((int) ($this->runVar['counts']['now']['misc'] ?? 0)),
-                $this->runVar['counts']['percent']['misc']
-            )
+        $buffer .= sprintf($this->tmpMasks[4], 'Console', $consoleInProcess, $consoleInDb);
+        [$miscInProcess, $miscInDb] = $this->decodeCountRow(
+            (int) ($this->runVar['counts']['now']['work'] ?? 0),
+            (string) $this->runVar['counts']['diff']['work'],
+            (int) ($this->runVar['counts']['now']['misc'] ?? 0),
+            $this->runVar['counts']['percent']['misc']
         );
-        $buffer .= sprintf(
-            $this->tmpMasks[4],
-            'Movie',
-            sprintf(
-                '%s(%s)',
-                number_format((int) ($this->runVar['counts']['now']['processmovies'] ?? 0)),
-                $this->runVar['counts']['diff']['processmovies']
-            ),
-            sprintf(
-                '%s(%d%%)',
-                number_format((int) ($this->runVar['counts']['now']['movies'] ?? 0)),
-                $this->runVar['counts']['percent']['movies']
-            )
+        $buffer .= sprintf($this->tmpMasks[4], 'Misc', $miscInProcess, $miscInDb);
+        [$movieInProcess, $movieInDb] = $this->decodeCountRow(
+            (int) ($this->runVar['counts']['now']['processmovies'] ?? 0),
+            (string) $this->runVar['counts']['diff']['processmovies'],
+            (int) ($this->runVar['counts']['now']['movies'] ?? 0),
+            $this->runVar['counts']['percent']['movies']
         );
-        $buffer .= sprintf(
-            $this->tmpMasks[4],
-            'PC',
-            sprintf(
-                '%s(%s)',
-                number_format((int) ($this->runVar['counts']['now']['processgames'] ?? 0)),
-                $this->runVar['counts']['diff']['processgames']
-            ),
-            sprintf(
-                '%s(%d%%)',
-                number_format((int) ($this->runVar['counts']['now']['pc'] ?? 0)),
-                $this->runVar['counts']['percent']['pc']
-            )
+        $buffer .= sprintf($this->tmpMasks[4], 'Movie', $movieInProcess, $movieInDb);
+        [$pcInProcess, $pcInDb] = $this->decodeCountRow(
+            (int) ($this->runVar['counts']['now']['processgames'] ?? 0),
+            (string) $this->runVar['counts']['diff']['processgames'],
+            (int) ($this->runVar['counts']['now']['pc'] ?? 0),
+            $this->runVar['counts']['percent']['pc']
         );
-        $buffer .= sprintf(
-            $this->tmpMasks[4],
-            'TV',
-            sprintf(
-                '%s(%s)',
-                number_format((int) ($this->runVar['counts']['now']['processtv'] ?? 0)),
-                $this->runVar['counts']['diff']['processtv']
-            ),
-            sprintf(
-                '%s(%d%%)',
-                number_format((int) ($this->runVar['counts']['now']['tv'] ?? 0)),
-                $this->runVar['counts']['percent']['tv']
-            )
+        $buffer .= sprintf($this->tmpMasks[4], 'PC', $pcInProcess, $pcInDb);
+        [$tvInProcess, $tvInDb] = $this->decodeCountRow(
+            (int) ($this->runVar['counts']['now']['processtv'] ?? 0),
+            (string) $this->runVar['counts']['diff']['processtv'],
+            (int) ($this->runVar['counts']['now']['tv'] ?? 0),
+            $this->runVar['counts']['percent']['tv']
         );
-        $buffer .= sprintf(
-            $this->tmpMasks[4],
-            'XXX',
-            sprintf(
-                '%s(%s)',
-                '0',
-                '0'
-            ),
-            sprintf(
-                '%s(%d%%)',
-                number_format((int) ($this->runVar['counts']['now']['xxx'] ?? 0)),
-                $this->runVar['counts']['percent']['xxx'] ?? 0
-            )
+        $buffer .= sprintf($this->tmpMasks[4], 'TV', $tvInProcess, $tvInDb);
+        [$xxxInProcess, $xxxInDb] = $this->decodeCountRow(
+            0,
+            '0',
+            (int) ($this->runVar['counts']['now']['xxx'] ?? 0),
+            $this->runVar['counts']['percent']['xxx'] ?? 0
         );
+        $buffer .= sprintf($this->tmpMasks[4], 'XXX', $xxxInProcess, $xxxInDb);
         $buffer .= $this->_getSeparator();
 
         $buffer .= sprintf(
@@ -474,17 +614,11 @@ class TmuxOutput extends Tmux
         );
 
         $pdo = $this->pdo instanceof \PDO ? $this->pdo : DB::connection()->getPdo();
-        $info = $pdo->getAttribute(\PDO::ATTR_SERVER_INFO);
+        $info = (string) $pdo->getAttribute(\PDO::ATTR_SERVER_INFO);
         $pieces = [];
-        foreach ([
-            ['Threads', '/.*\bThreads: (\d+)\b.*/'],
-            ['Opens', '/.*\bOpens[^:]*?: (\d+)\b.*/'],
-            ['Tables', '/.* tables: (\d+)\b.*/'],
-            ['Slow', '/.*\bSlow[^:]*?: (\d+)\b.*/'],
-            ['QPS', '/.*\bQueries[^:]*?: (\d+)\b.*/'],
-        ] as $v) {
-            $pieces[] = cli()->ansiString($v[0].' = ', 'green').
-                cli()->ansiString(preg_replace($v[1], '$1', $info), 'yellow');
+        foreach ($this->extractServerInfoMetrics($info) as $label => $value) {
+            $pieces[] = cli()->ansiString($label.' = ', 'green').
+                cli()->ansiString($value, 'yellow');
         }
         $buffer .= PHP_EOL.implode(', ', $pieces).PHP_EOL;
 
