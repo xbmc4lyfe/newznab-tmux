@@ -9,7 +9,7 @@ use Throwable;
 
 final class PredbSearchDocument
 {
-    public const PREDB_IDENTITY_POLICY = '2ca16d6496f3ad5cec424f796b17fae0cf25e17cc84522ad874727c821e5f579';
+    public const PREDB_IDENTITY_POLICY = '602ab87b80da1ca545fbb0cb363d26577d781442f51059251f07ef548be53a3d';
 
     private const string FFI_CDEF = <<<'C'
         int64_t nntmux_predb_validate_filename_candidate(const char *id_str, size_t id_len, int64_t id_int, uint32_t has_id_int, const char *title, size_t title_len, const char *filename, size_t filename_len, const char *source, size_t source_len);

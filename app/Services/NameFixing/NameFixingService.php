@@ -16,6 +16,8 @@ use App\Services\Predb\PredbIdentityLookup;
 use App\Services\Predb\PredbIdentityPolicy;
 use App\Support\Par2FileHashEvidence;
 use App\Support\PredbSearchDocument;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Cache\Lock;
 use Illuminate\Contracts\Cache\LockProvider;
 use Illuminate\Database\Query\Builder;
@@ -33,7 +35,59 @@ use Throwable;
  */
 class NameFixingService
 {
-    public const PREDB_IDENTITY_POLICY = '1919aa942e15c30f6c3fc7c3b0a28534d22f7bd58d09efcd4497834910455f82';
+    private const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_name_fixing_query_pass(uint32_t mode, const char *input, size_t len, int64_t first, int64_t second, char *out, size_t cap);
+        C;
+
+    // Retained PHP: the paired caller benchmark must pass all four 1.5x gates.
+    private static bool $useRustFfi = false;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    /** Negative ABI results retain the exact PHP implementation. */
+    private static function queryPassNative(int $mode, ?string $input, int $first = 0, int $second = 0, int $needed = 4096): ?string
+    {
+        if ($input === null || strlen($input) > intdiv(PHP_INT_MAX - 4096, 8)) {
+            return null;
+        }
+        try {
+            $ffi = RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF);
+            if ($ffi === null) {
+                return null;
+            }
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, max($needed, strlen($input) * 8 + 4096), $capacity);
+            if ($buffer === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_name_fixing_query_pass($mode, $input, strlen($input), $first, $second, $buffer, $capacity);
+
+            return is_int($written) && $written >= 0 && $written <= $capacity
+                ? ($written === 0 ? '' : FFI::string($buffer, $written)) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** @param list<string> $fields */
+    private static function queryPassFields(array $fields): ?string
+    {
+        $input = '';
+        foreach ($fields as $field) {
+            if (strlen($field) > 0xFFFFFFFF) {
+                return null;
+            }
+            $input .= pack('V', strlen($field)).$field;
+        }
+
+        return $input;
+    }
+
+    public const PREDB_IDENTITY_POLICY = '0fa60dd1f7515a7d75cd1bad1c8249e06d9c401ccc4f92ecdddd9663d0517bcc';
 
     private const PREDB_CANDIDATE_PAGE_SIZE = 21;
 
@@ -718,7 +772,34 @@ class NameFixingService
      * @param  array<int, list<object>>  $groupedRows
      * @return list<string>
      */
+    /** @param array<int, list<object>> $groupedRows
+     * @return list<string>
+     */
     protected function distinctValues(array $groupedRows, string $column): array
+    {
+        return (self::$useRustFfi ? $this->distinctValuesNative($groupedRows, $column) : null) ?? $this->distinctValuesPhp($groupedRows, $column);
+    }
+
+    /** @param array<int, list<object>> $groupedRows
+     * @return list<string>|null
+     */
+    private function distinctValuesNative(array $groupedRows, string $column): ?array
+    {
+        $fields = [];
+        foreach ($groupedRows as $rows) {
+            foreach ($rows as $row) {
+                $fields[] = (string) ($row->{$column} ?? '');
+            }
+        }
+        $raw = self::queryPassNative(18, self::queryPassFields($fields));
+
+        return $raw === null ? null : self::queryPassDecode($raw);
+    }
+
+    /** @param array<int, list<object>> $groupedRows
+     * @return list<string>
+     */
+    protected function distinctValuesPhp(array $groupedRows, string $column): array
     {
         $values = [];
 
@@ -1518,7 +1599,48 @@ class NameFixingService
      * @param  array<string, mixed>  $page
      * @return array{ids: list<int>, has_more: bool, last_id: int}
      */
+    /** @param array<string, mixed> $page
+     * @return array{ids: list<int>, has_more: bool, last_id: int}
+     */
     private function validatePredbCandidatePage(array $page, int $afterId): array
+    {
+        return (self::$useRustFfi ? $this->validatePredbCandidatePageNative($page, $afterId) : null) ?? $this->validatePredbCandidatePagePhp($page, $afterId);
+    }
+
+    /** @param array<string, mixed> $page
+     * @return array{ids: list<int>, has_more: bool, last_id: int}|null
+     */
+    private function validatePredbCandidatePageNative(array $page, int $afterId): ?array
+    {
+        $ids = $page['ids'] ?? null;
+        $hasMore = $page['has_more'] ?? null;
+        if (! is_array($ids) || ! array_is_list($ids) || ! is_bool($hasMore)) {
+            return null;
+        }
+        $fields = [];
+        foreach ($ids as $id) {
+            if (! is_int($id)) {
+                return null;
+            }
+            $fields[] = (string) $id;
+        }
+        $raw = self::queryPassNative(16, self::queryPassFields($fields), $afterId, (int) $hasMore);
+        if ($raw === null) {
+            return null;
+        }
+        if ($raw !== '') {
+            throw new IncompletePredbMatchException($raw === 'boundaries'
+                ? 'PreDB fulltext matching is incomplete: invalid candidate page boundaries.'
+                : 'PreDB fulltext matching is incomplete: candidate IDs did not advance in order.');
+        }
+
+        return ['ids' => $ids, 'has_more' => $hasMore, 'last_id' => $ids === [] ? $afterId : $ids[array_key_last($ids)]];
+    }
+
+    /** @param array<string, mixed> $page
+     * @return array{ids: list<int>, has_more: bool, last_id: int}
+     */
+    private function validatePredbCandidatePagePhp(array $page, int $afterId): array
     {
         $ids = $page['ids'] ?? null;
         $hasMore = $page['has_more'] ?? null;
@@ -1953,26 +2075,9 @@ class NameFixingService
      */
     protected function updateProcessingFlags(string $type, int $releaseId): void
     {
-        switch ($type) {
-            case 'NFO, ':
-                $this->updateService->updateSingleColumn('proc_nfo', self::PROC_NFO_DONE, $releaseId);
-                break;
-            case 'PAR2, ':
-                $this->updateService->updateSingleColumn('proc_par2', self::PROC_PAR2_DONE, $releaseId);
-                break;
-            case 'PAR2 hash, ':
-                $this->updateService->updateSingleColumn('proc_hash16k', self::PROC_HASH16K_DONE, $releaseId);
-                break;
-            case 'SRR, ':
-                $this->updateService->updateSingleColumn('proc_srr', self::PROC_SRR_DONE, $releaseId);
-                break;
-            case 'UID, ':
-            case 'Mediainfo, ':
-                $this->updateService->updateSingleColumn('proc_uid', self::PROC_UID_DONE, $releaseId);
-                break;
-            case 'CRC32, ':
-                $this->updateService->updateSingleColumn('proc_crc32', self::PROC_CRC_DONE, $releaseId);
-                break;
+        $column = $this->processingStatusColumn($type);
+        if ($column !== '') {
+            $this->updateService->updateSingleColumn($column, 1, $releaseId);
         }
     }
 
@@ -2032,6 +2137,41 @@ class NameFixingService
         return 0;
     }
 
+    private function diagnosticSource(string $source): string
+    {
+        return (self::$useRustFfi ? $this->diagnosticSourceNative($source) : null) ?? $this->diagnosticSourcePhp($source);
+    }
+
+    private function diagnosticSourceNative(string $source): ?string
+    {
+        return self::queryPassNative(1, $source);
+    }
+
+    private function diagnosticSourcePhp(string $source): string
+    {
+        return strlen($source) <= 200 && mb_check_encoding($source, 'UTF-8')
+            && mb_strlen($source, 'UTF-8') <= 50 && preg_match('/\p{C}/u', $source) === 0 ? $source : '';
+    }
+
+    private function processingStatusColumn(string $type): string
+    {
+        return (self::$useRustFfi ? $this->processingStatusColumnNative($type) : null) ?? $this->processingStatusColumnPhp($type);
+    }
+
+    private function processingStatusColumnNative(string $type): ?string
+    {
+        return self::queryPassNative(15, $type);
+    }
+
+    private function processingStatusColumnPhp(string $type): string
+    {
+        return match ($type) {
+            'NFO, ' => 'proc_nfo', 'PAR2, ' => 'proc_par2', 'PAR2 hash, ' => 'proc_hash16k',
+            'SRR, ' => 'proc_srr', 'UID, ', 'Mediainfo, ' => 'proc_uid', 'CRC32, ' => 'proc_crc32',
+            default => '',
+        };
+    }
+
     /** Optional CLI context; never used to authorize or compare release identity. */
     private function predbFilenameSourceDiagnostic(int $predbId): string
     {
@@ -2043,8 +2183,7 @@ class NameFixingService
             $source = $connection->table('predb')->where('id', $predbId)
                 ->selectRaw('substr(CAST(source AS BLOB), 1, 201) AS diagnostic_source')->value('diagnostic_source');
 
-            return is_string($source) && strlen($source) <= 200 && mb_check_encoding($source, 'UTF-8')
-                && mb_strlen($source, 'UTF-8') <= 50 && preg_match('/\p{C}/u', $source) === 0 ? $source : '';
+            return is_string($source) ? $this->diagnosticSource($source) : '';
         } catch (Throwable) {
             return '';
         }
@@ -2056,7 +2195,19 @@ class NameFixingService
      */
     public function isSeasonPack(string $name): bool
     {
-        return SeasonPackDetector::isSeasonPack($name);
+        return (self::$useRustFfi ? $this->isSeasonPackNative($name) : null) ?? $this->isSeasonPackPhp($name);
+    }
+
+    private function isSeasonPackNative(string $name): ?bool
+    {
+        $raw = self::queryPassNative(0, $name);
+
+        return $raw === null ? null : $raw === '1';
+    }
+
+    public function isSeasonPackPhp(string $name): bool
+    {
+        return SeasonPackDetector::isSeasonPackPhp($name);
     }
 
     /**
@@ -2140,5 +2291,27 @@ class NameFixingService
         }
 
         cli()->info(PHP_EOL.'Renamed '.number_format($counted).' releases in '.now()->diffInSeconds($timeStart, true).' seconds.');
+    }
+
+    /** @return list<string>|null */
+    private static function queryPassDecode(string $raw): ?array
+    {
+        $fields = [];
+        $offset = 0;
+        $length = strlen($raw);
+        while ($offset < $length) {
+            if ($length - $offset < 4) {
+                return null;
+            }
+            $size = unpack('Vsize', substr($raw, $offset, 4))['size'];
+            $offset += 4;
+            if ($size > $length - $offset) {
+                return null;
+            }
+            $fields[] = substr($raw, $offset, $size);
+            $offset += $size;
+        }
+
+        return $fields;
     }
 }
