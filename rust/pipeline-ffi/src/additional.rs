@@ -3000,14 +3000,14 @@ fn expect_xml_close(bytes: &[u8], pos: usize, close_exact: &[u8]) -> Option<usiz
     }
 }
 
-fn parse_attrs_xml<F>(
-    bytes: &[u8],
+fn parse_attrs_xml<'a, F>(
+    bytes: &'a [u8],
     mut pos: usize,
     allow_xmlns: bool,
     mut on_attr: F,
 ) -> Option<(usize, bool)>
 where
-    F: FnMut(&[u8], &[u8]) -> bool,
+    F: FnMut(&'a [u8], &'a [u8]) -> bool,
 {
     let mut seen_names: [&[u8]; 8] = [&[]; 8];
     let mut seen_count = 0usize;
@@ -3948,5 +3948,446 @@ mod tests {
         assert_eq!(mi_idx, 1);
         assert_eq!(audio_idx, 3);
         assert_eq!(&out[28..32], b"flac");
+    }
+}
+
+// Coverage intentionally accepts a narrow XML subset. Anything whose namespace,
+// entity or normalization semantics need libxml is declined to the PHP oracle.
+fn coverage_decode(raw: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>, isize> {
+    if !raw
+        .iter()
+        .all(|&b| b.is_ascii() && (b >= 0x20 || is_xml_ws(b)))
+    {
+        return Err(-1);
+    }
+    if !raw.contains(&b'&') {
+        return Ok(std::borrow::Cow::Borrowed(raw));
+    }
+    let mut decoded = Vec::with_capacity(raw.len());
+    let mut pos = 0;
+    while pos < raw.len() {
+        if raw[pos] != b'&' {
+            decoded.push(raw[pos]);
+            pos += 1;
+            continue;
+        }
+        let end = raw[pos + 1..]
+            .iter()
+            .position(|&b| b == b';')
+            .ok_or(-1isize)?
+            + pos
+            + 1;
+        let entity = &raw[pos + 1..end];
+        let code = match entity {
+            b"amp" => b'&',
+            b"lt" => b'<',
+            b"gt" => b'>',
+            b"quot" => b'"',
+            b"apos" => b'\'',
+            _ => {
+                let (digits, radix) = if entity.starts_with(b"#x") {
+                    (&entity[2..], 16)
+                } else if entity.starts_with(b"#") {
+                    (&entity[1..], 10)
+                } else {
+                    return Err(-1);
+                };
+                if digits.is_empty()
+                    || !digits.iter().all(|b| {
+                        if radix == 16 {
+                            b.is_ascii_hexdigit()
+                        } else {
+                            b.is_ascii_digit()
+                        }
+                    })
+                {
+                    return Err(-1);
+                }
+                let text = std::str::from_utf8(digits).map_err(|_| -1isize)?;
+                let code = u32::from_str_radix(text, radix).map_err(|_| -1isize)?;
+                if code > 127 || !(code >= 32 || matches!(code, 9 | 10 | 13)) {
+                    return Err(-1);
+                }
+                code as u8
+            }
+        };
+        decoded.push(code);
+        pos = end + 1;
+    }
+    Ok(std::borrow::Cow::Owned(decoded))
+}
+
+#[derive(Clone, Copy)]
+enum CoverageElement {
+    Root,
+    File,
+    Segments,
+    Ignored,
+}
+
+fn coverage_ids_xml(xml: &[u8]) -> Result<Vec<u8>, isize> {
+    if xml.len() > 16_777_216 {
+        return Err(-2);
+    }
+    let mut pos = skip_ws_xml(xml, 0);
+    pos = parse_decl_xml(xml, pos).ok_or(-1isize)?;
+    let mut stack: Vec<(&[u8], CoverageElement, usize)> = Vec::new();
+    let mut root_seen = false;
+    let mut files = 0;
+    let mut segments = 0;
+    let mut ids = std::collections::HashSet::<Vec<u8>>::new();
+    let mut output = Vec::new();
+    loop {
+        let text_start = pos;
+        while pos < xml.len() && xml[pos] != b'<' {
+            pos += 1;
+        }
+        if stack.is_empty() && !xml[text_start..pos].iter().copied().all(is_xml_ws) {
+            return Err(-1);
+        }
+        if pos == xml.len() {
+            return if root_seen && stack.is_empty() && files > 0 {
+                Ok(output)
+            } else {
+                Err(-2)
+            };
+        }
+        if matches!(xml.get(pos + 1), Some(b'!' | b'?')) {
+            return Err(-1);
+        }
+        if xml.get(pos + 1) == Some(&b'/') {
+            let (name, kind, children) = stack.pop().ok_or(-1isize)?;
+            pos = expect_xml_close(xml, pos, &[b"</", name].concat()).ok_or(-1isize)?;
+            match kind {
+                CoverageElement::File if children != 1 => return Err(-2),
+                CoverageElement::Segments if children == 0 => return Err(-2),
+                _ => {}
+            }
+            continue;
+        }
+        let start = pos + 1;
+        pos = start;
+        while pos < xml.len()
+            && (xml[pos].is_ascii_alphanumeric() || matches!(xml[pos], b'_' | b'-' | b'.'))
+        {
+            pos += 1;
+        }
+        let name = &xml[start..pos];
+        if name.is_empty() || xml.get(pos) == Some(&b':') {
+            return Err(-1);
+        }
+        let is_root = stack.is_empty();
+        let mut number = None;
+        let mut bytes = None;
+        let (after, empty) = parse_attrs_xml(xml, pos, is_root, |key, value| {
+            match key {
+                b"xmlns" => {
+                    return is_root
+                        && matches!(value, b"" | b"http://www.newzbin.com/DTD/2003/nzb");
+                }
+                b"number" => number = Some(value),
+                b"bytes" => bytes = Some(value),
+                _ => {}
+            }
+            true
+        })
+        .ok_or(-1isize)?;
+        pos = after;
+        let kind = match stack.last_mut() {
+            None => {
+                if root_seen || name != b"nzb" {
+                    return Err(-1);
+                }
+                root_seen = true;
+                CoverageElement::Root
+            }
+            Some((_, CoverageElement::Root, _)) => match name {
+                b"file" => {
+                    files += 1;
+                    CoverageElement::File
+                }
+                b"head" => CoverageElement::Ignored,
+                _ => return Err(-1), // PHP permits extra root children.
+            },
+            Some((_, CoverageElement::File, count)) => match name {
+                b"segments" => {
+                    *count += 1;
+                    CoverageElement::Segments
+                }
+                b"groups" => CoverageElement::Ignored,
+                _ => return Err(-1), // PHP permits extra file children.
+            },
+            Some((_, CoverageElement::Segments, count)) => {
+                if name != b"segment" {
+                    return Err(-2);
+                }
+                *count += 1;
+                segments += 1;
+                if segments > 100_000 || empty {
+                    return Err(-2);
+                }
+                let number = coverage_decode(number.ok_or(-2isize)?)?;
+                let bytes = coverage_decode(bytes.ok_or(-2isize)?)?;
+                if number.is_empty()
+                    || number[0] == b'0'
+                    || !number.iter().all(u8::is_ascii_digit)
+                    || bytes.is_empty()
+                    || !bytes.iter().all(u8::is_ascii_digit)
+                {
+                    return Err(-2);
+                }
+                let end = xml[pos..].iter().position(|&b| b == b'<').ok_or(-1isize)? + pos;
+                let decoded = coverage_decode(&xml[pos..end])?;
+                pos = if let Some(after) = expect_xml_close(xml, end, b"</segment") {
+                    after
+                } else {
+                    return Err(if matches!(xml.get(end + 1), Some(b'!' | b'?')) {
+                        -1
+                    } else {
+                        -2
+                    });
+                };
+                let mut id = trim_php(&decoded);
+                // The current PHP oracle also strips quotes, permits inner angles,
+                // and caps IDs at 255 bytes. Keep those edge cases in PHP.
+                if matches!(id.first(), Some(b'\'' | b'"')) {
+                    return Err(-1);
+                }
+                if id.starts_with(b"<") && id.ends_with(b">") {
+                    id = trim_php(&id[1..id.len() - 1]);
+                }
+                if id.len() > 255 || id.contains(&b'<') || id.contains(&b'>') {
+                    return Err(-1);
+                }
+                if id.is_empty() || id.iter().any(|&b| b <= 0x20 || b == 0x7f) {
+                    return Err(-2);
+                }
+                if !ids.contains(id) {
+                    if !output.is_empty() {
+                        output.push(b'\n');
+                    }
+                    output.extend_from_slice(id);
+                    ids.insert(id.to_vec());
+                }
+                continue;
+            }
+            Some((_, CoverageElement::Ignored, _)) => CoverageElement::Ignored,
+        };
+        if empty {
+            if matches!(kind, CoverageElement::File | CoverageElement::Segments) {
+                return Err(-2);
+            }
+        } else {
+            if stack.len() >= 256 {
+                return Err(-1);
+            }
+            stack.push((name, kind, 0));
+        }
+    }
+}
+
+/// Validated, unique newline-separated IDs in encounter order. -1 declines to
+/// PHP, -2 is invalid, and -(needed + 16) requests a larger output buffer.
+///
+/// # Safety
+/// Non-null input/output pointers must span their supplied lengths, must not
+/// overlap, and output must be writable for out_cap bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nzb_coverage_ids(
+    xml: *const std::ffi::c_char,
+    xml_len: usize,
+    out_buf: *mut std::ffi::c_char,
+    out_cap: usize,
+) -> isize {
+    if xml.is_null() || (out_buf.is_null() && out_cap != 0) || xml_len > 16_777_216 {
+        return -1;
+    }
+    let input = unsafe { slice::from_raw_parts(xml.cast::<u8>(), xml_len) };
+    match coverage_ids_xml(input) {
+        Err(status) => status,
+        Ok(ids) => {
+            if out_cap < ids.len() {
+                return -(ids.len() as isize + 16);
+            }
+            if !ids.is_empty() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(ids.as_ptr(), out_buf.cast::<u8>(), ids.len())
+                };
+            }
+            ids.len() as isize
+        }
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    fn inventory(segments: &str) -> String {
+        format!("<nzb><file><segments>{segments}</segments></file></nzb>")
+    }
+
+    const ONE: &str = r#"<segment number="1" bytes="0">one@test</segment>"#;
+
+    #[test]
+    fn unique_ids_keep_first_encounter_order_across_files() {
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb"><head><meta type="title">ignored</meta></head><file><groups><group>alt.test</group></groups><segments>{ONE}</segments></file><file><segments><segment bytes="99999999999999999999999" number="123456789012345678901234567890">two@test</segment>{ONE}</segments></file></nzb>"#
+        );
+        assert_eq!(
+            coverage_ids_xml(xml.as_bytes()),
+            Ok(b"one@test\ntwo@test".to_vec())
+        );
+    }
+
+    #[test]
+    fn decodes_entities_before_attributes_and_message_id_validation() {
+        let xml = inventory(
+            r#"<segment number="&#49;" bytes="&#x30;"> &#9;&lt;a&amp;b&#64;test&gt;&#10;</segment><segment number="2" bytes="00">two&#x40;test</segment>"#,
+        );
+        assert_eq!(
+            coverage_ids_xml(xml.as_bytes()),
+            Ok(b"a&b@test\ntwo@test".to_vec())
+        );
+        for text in ["bad id", "bad&#10;id", "bad&#127;id", "", "&lt;&gt;"] {
+            let xml = inventory(&format!(
+                r#"<segment number="1" bytes="1">{text}</segment>"#
+            ));
+            assert_eq!(coverage_ids_xml(xml.as_bytes()), Err(-2), "{text}");
+        }
+    }
+
+    #[test]
+    fn requires_positive_decimal_number_and_nonempty_digit_bytes() {
+        for number in ["0", "01", "-1", "+1", "", "1.0", "1 "] {
+            let xml = inventory(&format!(
+                r#"<segment number="{number}" bytes="1">one@test</segment>"#
+            ));
+            assert_eq!(coverage_ids_xml(xml.as_bytes()), Err(-2), "{number}");
+        }
+        for bytes in ["", "-1", "+1", "1.0", "1 "] {
+            let xml = inventory(&format!(
+                r#"<segment number="1" bytes="{bytes}">one@test</segment>"#
+            ));
+            assert_eq!(coverage_ids_xml(xml.as_bytes()), Err(-2), "{bytes}");
+        }
+        assert_eq!(
+            coverage_ids_xml(inventory("<segment>id</segment>").as_bytes()),
+            Err(-2)
+        );
+    }
+
+    #[test]
+    fn requires_files_and_exactly_one_nonempty_segment_container() {
+        for xml in [
+            "<nzb/>",
+            "<nzb><head/></nzb>",
+            "<nzb><file/></nzb>",
+            "<nzb><file><groups/></file></nzb>",
+            "<nzb><file><segments/></file></nzb>",
+            "<nzb><file><segments></segments></file></nzb>",
+        ] {
+            assert_eq!(coverage_ids_xml(xml.as_bytes()), Err(-2), "{xml}");
+        }
+        let multiple =
+            format!("<nzb><file><segments>{ONE}</segments><segments>{ONE}</segments></file></nzb>");
+        assert_eq!(coverage_ids_xml(multiple.as_bytes()), Err(-2));
+        for child in [
+            "<other/>",
+            r#"<segment number="1" bytes="1">one<child/>@test</segment>"#,
+        ] {
+            assert_eq!(coverage_ids_xml(inventory(child).as_bytes()), Err(-2));
+        }
+    }
+
+    #[test]
+    fn declines_special_xml_and_namespace_semantics() {
+        for xml in [
+            inventory(&format!("<!-- comment -->{ONE}")),
+            inventory(&format!("<?test value?>{ONE}")),
+            inventory(r#"<segment number="1" bytes="1"><![CDATA[one@test]]></segment>"#),
+            format!("<!DOCTYPE nzb SYSTEM \"urn:offline\">{}", inventory(ONE)),
+            format!("<nzb xmlns=\"urn:other\"><file><segments>{ONE}</segments></file></nzb>"),
+            format!("<nzb xmlns:x=\"urn:other\"><file><segments>{ONE}</segments></file></nzb>"),
+            format!("<nzb><file xmlns=\"\"><segments>{ONE}</segments></file></nzb>"),
+            "<n:nzb xmlns:n=\"http://www.newzbin.com/DTD/2003/nzb\"/>".to_string(),
+            format!("<nzb><extra/><file><segments>{ONE}</segments></file></nzb>"),
+            format!("<nzb><file><extra/><segments>{ONE}</segments></file></nzb>"),
+        ] {
+            assert_eq!(coverage_ids_xml(xml.as_bytes()), Err(-1), "{xml}");
+        }
+    }
+
+    #[test]
+    fn defers_php_normalization_edges_and_non_ascii() {
+        for text in [
+            "&quot;&lt;one@test&gt;&quot;".to_string(),
+            "one&lt;x&gt;@test".to_string(),
+            "é@test".to_string(),
+            "a".repeat(256),
+            "a".repeat(512),
+        ] {
+            let xml = inventory(&format!(
+                r#"<segment number="1" bytes="1">{text}</segment>"#
+            ));
+            assert_eq!(coverage_ids_xml(xml.as_bytes()), Err(-1));
+        }
+        let xml = inventory(&format!(
+            r#"<segment number="1" bytes="1">{}</segment>"#,
+            "a".repeat(255)
+        ));
+        assert_eq!(coverage_ids_xml(xml.as_bytes()), Ok(vec![b'a'; 255]));
+    }
+
+    #[test]
+    fn segment_count_is_not_unique_id_count() {
+        let mut segments = ONE.repeat(100_000);
+        assert_eq!(
+            coverage_ids_xml(inventory(&segments).as_bytes()),
+            Ok(b"one@test".to_vec())
+        );
+        segments.push_str(ONE);
+        assert_eq!(coverage_ids_xml(inventory(&segments).as_bytes()), Err(-2));
+    }
+
+    #[test]
+    fn ffi_capacity_statuses_and_output_bounds() {
+        let xml = inventory(ONE);
+        let mut buffer = [0x7fu8; 32];
+        unsafe {
+            assert_eq!(
+                nntmux_nzb_coverage_ids(xml.as_ptr().cast(), xml.len(), std::ptr::null_mut(), 0),
+                -24
+            );
+            assert_eq!(
+                nntmux_nzb_coverage_ids(
+                    xml.as_ptr().cast(),
+                    xml.len(),
+                    buffer.as_mut_ptr().cast(),
+                    7
+                ),
+                -24
+            );
+            assert_eq!(buffer, [0x7fu8; 32]);
+            assert_eq!(
+                nntmux_nzb_coverage_ids(
+                    xml.as_ptr().cast(),
+                    xml.len(),
+                    buffer.as_mut_ptr().cast(),
+                    8
+                ),
+                8
+            );
+            assert_eq!(&buffer[..8], b"one@test");
+            assert!(buffer[8..].iter().all(|&b| b == 0x7f));
+            assert_eq!(
+                nntmux_nzb_coverage_ids(std::ptr::null(), 1, buffer.as_mut_ptr().cast(), 32),
+                -1
+            );
+            assert_eq!(
+                nntmux_nzb_coverage_ids(xml.as_ptr().cast(), xml.len(), std::ptr::null_mut(), 1),
+                -1
+            );
+        }
     }
 }

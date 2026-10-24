@@ -6,6 +6,9 @@ namespace App\Services\Nzb;
 
 use App\Models\Release;
 use App\Services\Releases\ReleaseDuplicateFinder;
+use App\Support\RustPipelineLibrary;
+use FFI;
+use Throwable;
 
 /** Proves single-release article coverage without metadata-only suppression. */
 final class NzbArticleCoverage
@@ -21,6 +24,8 @@ final class NzbArticleCoverage
     private const int COVERAGE_TOTAL_BYTES = 33_554_432;
 
     private const int COVERAGE_IDS = 100_000;
+
+    private const string FFI_CDEF = 'ssize_t nntmux_nzb_coverage_ids(const char *xml, size_t xml_len, char *out_buf, size_t out_cap);';
 
     /**
      * Stored fingerprints and metadata only nominate uploads. Every suppression
@@ -167,6 +172,52 @@ final class NzbArticleCoverage
      * @return array<string, true>|null
      */
     public function coverageIds(\SimpleXMLElement $xml): ?array
+    {
+        $serialized = $xml->asXML();
+        if ($serialized === false || strlen($serialized) > self::COVERAGE_DECODED_BYTES) {
+            return null;
+        }
+        // The PHP XPath checks are document-absolute, even for attached subtrees.
+        if (dom_import_simplexml($xml)->parentNode instanceof \DOMDocument) {
+            try {
+                $ffi = RustPipelineLibrary::resolveDomain('nzb_article_coverage', self::FFI_CDEF);
+                if ($ffi !== null) {
+                    $capacity = 0;
+                    $scratch = RustPipelineLibrary::obtainScratch($ffi, strlen($serialized), $capacity);
+                    if ($scratch !== null) {
+                        // @phpstan-ignore method.notFound
+                        $written = $ffi->nntmux_nzb_coverage_ids($serialized, strlen($serialized), $scratch, $capacity);
+                        if (is_int($written) && $written < -2) {
+                            $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                            if ($scratch !== null) {
+                                // @phpstan-ignore method.notFound
+                                $written = $ffi->nntmux_nzb_coverage_ids($serialized, strlen($serialized), $scratch, $capacity);
+                            }
+                        }
+                        if ($written === -2 || $written === 0) {
+                            return null;
+                        }
+                        if (is_int($written) && $written > 0 && $written <= $capacity && $scratch !== null) {
+                            $raw = FFI::string($scratch, $written);
+                            $ids = [];
+                            foreach (explode("\n", $raw) as $id) {
+                                $ids["\0".$id] = true;
+                            }
+
+                            return $ids;
+                        }
+                    }
+                }
+            } catch (Throwable) {
+                // Missing exports, disabled FFI and allocation failures use PHP.
+            }
+        }
+
+        return $this->coverageIdsPhp($xml);
+    }
+
+    /** @return array<string, true>|null */
+    public function coverageIdsPhp(\SimpleXMLElement $xml): ?array
     {
         $serialized = $xml->asXML();
         if ($serialized === false || strlen($serialized) > self::COVERAGE_DECODED_BYTES) {
