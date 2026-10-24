@@ -9,6 +9,8 @@ use App\Services\LogViewer\LogEntry;
 use App\Services\LogViewer\LogFile;
 use App\Services\LogViewer\LogFileRepository;
 use App\Services\LogViewer\LogReader;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Facades\Log;
 use Throwable;
 
@@ -35,6 +37,21 @@ class LogIndexer
      * Minutes without writes after which a file's last entry counts as finished.
      */
     private const int TAIL_FLUSH_MINUTES = 2;
+
+    /**
+     * Rust parity exports; the document builder stays in PHP (below the 1.5x adoption gate, see
+     * `tests/Unit/RustLogViewerAndAuditParserParityTest.php`).
+     */
+    public const string FFI_CDEF = <<<'C'
+        int64_t nntmux_logviewer_document_id(int64_t file_id, int64_t offset);
+        ssize_t nntmux_logviewer_scrub_utf8(const char *input, size_t len, char *out_buf, size_t out_cap);
+        C;
+
+    private static bool $useRustFfi = true;
+
+    private static ?FFI $ffi = null;
+
+    private static bool $ffiResolved = false;
 
     public function __construct(
         private readonly LogIndex $index,
@@ -333,9 +350,19 @@ class LogIndexer
      */
     private function document(LogIndexFile $row, LogEntry $entry, string $firstLine): array
     {
+        return self::documentFields($row->id, $entry, $firstLine);
+    }
+
+    /**
+     * The Manticore document for one entry of the tracked file `$fileId`.
+     *
+     * @return array<string, int|string>
+     */
+    public static function documentFields(int $fileId, LogEntry $entry, string $firstLine): array
+    {
         return [
-            'id' => LogIndex::documentId($row->id, $entry->offset),
-            'file_id' => $row->id,
+            'id' => LogIndex::documentId($fileId, $entry->offset),
+            'file_id' => $fileId,
             'byte_offset' => $entry->offset,
             'byte_end' => $entry->end,
             'line_no' => $entry->lineNumber ?? 0,
@@ -347,6 +374,115 @@ class LogIndexer
             'first_line' => mb_scrub($firstLine, 'UTF-8'),
             'body' => mb_scrub($entry->body, 'UTF-8'),
         ];
+    }
+
+    /**
+     * Rust parity helper for {@see documentFields()}; null when the library is unavailable or disabled.
+     *
+     * @return array<string, int|string>|null
+     */
+    public static function documentFieldsNative(int $fileId, LogEntry $entry, string $firstLine): ?array
+    {
+        $ffi = self::ffi();
+
+        if ($ffi === null) {
+            return null;
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $id = $ffi->nntmux_logviewer_document_id($fileId, $entry->offset);
+            $first = self::scrubNative($ffi, $firstLine);
+            $body = self::scrubNative($ffi, $entry->body);
+        } catch (Throwable) {
+            return null;
+        }
+
+        if (! is_int($id) || $first === null || $body === null) {
+            return null;
+        }
+
+        return [
+            'id' => $id,
+            'file_id' => $fileId,
+            'byte_offset' => $entry->offset,
+            'byte_end' => $entry->end,
+            'line_no' => $entry->lineNumber ?? 0,
+            'logged_at' => $entry->loggedAt() ?? 0,
+            'level' => $entry->level ?? '',
+            'channel' => $entry->channel ?? '',
+            'structured' => $entry->channel !== null ? 1 : 0,
+            'truncated' => $entry->truncated ? 1 : 0,
+            'first_line' => $first,
+            'body' => $body,
+        ];
+    }
+
+    /**
+     * `mb_scrub($text, 'UTF-8')` through Rust.
+     */
+    public static function scrubUtf8Native(string $text): ?string
+    {
+        $ffi = self::ffi();
+
+        if ($ffi === null) {
+            return null;
+        }
+
+        try {
+            return self::scrubNative($ffi, $text);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    private static function scrubNative(FFI $ffi, string $text): ?string
+    {
+        $length = strlen($text);
+
+        if ($length === 0) {
+            return '';
+        }
+
+        $capacity = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, $length, $capacity);
+
+        if ($scratch === null) {
+            return null;
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_logviewer_scrub_utf8($text, $length, $scratch, $capacity);
+
+        if ($written === -1) {
+            return $text;
+        }
+
+        return is_int($written) && $written >= 0 ? FFI::string($scratch, $written) : null;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (! self::$useRustFfi) {
+            return null;
+        }
+
+        if (! self::$ffiResolved) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('search', self::FFI_CDEF);
+            self::$ffiResolved = true;
+        }
+
+        return self::$ffi;
     }
 
     /**

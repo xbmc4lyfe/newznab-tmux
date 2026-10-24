@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Services\LogViewer\Index;
 
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Facades\Cache;
 use InvalidArgumentException;
 use Manticoresearch\Client;
@@ -21,12 +23,27 @@ class LogIndex
 
     private const int AVAILABILITY_TTL_SECONDS = 30;
 
+    /**
+     * Rust parity exports; both helpers stay in PHP (below the 1.5x adoption gate, see
+     * `tests/Unit/RustLogViewerAndAuditParserParityTest.php`).
+     */
+    public const string FFI_CDEF = <<<'C'
+        int64_t nntmux_logviewer_document_id(int64_t file_id, int64_t offset);
+        int32_t nntmux_logviewer_valid_table_name(const char *name, size_t len);
+        C;
+
+    private static bool $useRustFfi = true;
+
+    private static ?FFI $ffi = null;
+
+    private static bool $ffiResolved = false;
+
     public function __construct(
         private readonly Client $client,
         private readonly string $table,
         private readonly bool $enabled,
     ) {
-        if (preg_match('/^[A-Za-z0-9_]+$/', $table) !== 1) {
+        if (! self::isSafeTableName($table)) {
             throw new InvalidArgumentException('Unsafe Manticore log index table name.');
         }
     }
@@ -57,6 +74,77 @@ class LogIndex
     public static function documentId(int $fileId, int $offset): int
     {
         return ($fileId << self::OFFSET_BITS) | $offset;
+    }
+
+    /**
+     * Rust parity helper for {@see documentId()}; null when the library is unavailable or disabled.
+     */
+    public static function documentIdNative(int $fileId, int $offset): ?int
+    {
+        $ffi = self::ffi();
+
+        if ($ffi === null) {
+            return null;
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $id = $ffi->nntmux_logviewer_document_id($fileId, $offset);
+        } catch (Throwable) {
+            return null;
+        }
+
+        return is_int($id) ? $id : null;
+    }
+
+    public static function isSafeTableName(string $table): bool
+    {
+        return preg_match('/^[A-Za-z0-9_]+$/', $table) === 1;
+    }
+
+    /**
+     * Rust parity helper for {@see isSafeTableName()}; null when the library is unavailable or disabled.
+     */
+    public static function isSafeTableNameNative(string $table): ?bool
+    {
+        $ffi = self::ffi();
+
+        if ($ffi === null) {
+            return null;
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $valid = $ffi->nntmux_logviewer_valid_table_name($table, strlen($table));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return is_int($valid) && $valid >= 0 ? $valid === 1 : null;
+    }
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (! self::$useRustFfi) {
+            return null;
+        }
+
+        if (! self::$ffiResolved) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('search', self::FFI_CDEF);
+            self::$ffiResolved = true;
+        }
+
+        return self::$ffi;
     }
 
     public function isEnabled(): bool
