@@ -7,8 +7,10 @@ namespace App\Console\Commands;
 use App\Facades\Search;
 use App\Services\Search\Contracts\BulkReleaseIndexUpdater;
 use App\Services\Search\SearchService;
+use App\Support\RustPipelineLibrary;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
+use Throwable;
 
 final class NntmuxSearchRepair extends Command
 {
@@ -99,8 +101,45 @@ final class NntmuxSearchRepair extends Command
         ]);
     }
 
-    private function backoff(int $attempts): \DateTimeInterface
+    private function backoff(int $attempts, bool $useRustFfi = false): \DateTimeInterface
     {
-        return now()->addSeconds(min(3600, 2 ** min($attempts, 10)));
+        return ($useRustFfi ? $this->backoffNative($attempts) : null) ?? $this->backoffPhp($attempts);
+    }
+
+    public function backoffPhp(int $attempts): \DateTimeInterface
+    {
+        return now()->addSeconds(self::backoffDelayPhp($attempts));
+    }
+
+    public function backoffNative(int $attempts): ?\DateTimeInterface
+    {
+        $delay = self::backoffDelayNative($attempts);
+
+        return $delay === null ? null : now()->addSeconds($delay);
+    }
+
+    public static function backoffDelayPhp(int $attempts): int|float
+    {
+        return $attempts < 0 ? 2.0 ** $attempts : min(3600, 2 ** min($attempts, 10));
+    }
+
+    public static function backoffDelayNative(int $attempts): int|float|null
+    {
+        static $ffi;
+        $ffi ??= RustPipelineLibrary::resolveDomain('search', 'double nntmux_search_repair_backoff(int64_t attempts);') ?? false;
+        if ($ffi === false) {
+            return null;
+        }
+        try {
+            $delay = $ffi->nntmux_search_repair_backoff($attempts);
+
+            if (! is_float($delay) || $delay < 0) {
+                return null;
+            }
+
+            return $attempts < 0 ? $delay : (int) $delay;
+        } catch (Throwable) {
+            return null;
+        }
     }
 }

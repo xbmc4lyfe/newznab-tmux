@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace App\Enums;
 
+use App\Support\RustPipelineLibrary;
+use Throwable;
+
 /**
  * Logical names for metadata indexes (Manticore *_rt / Elasticsearch).
  */
@@ -87,7 +90,30 @@ enum SecondarySearchIndex: string
     /**
      * Stable integer document id for composite anime title rows (PK is multi-column in MySQL).
      */
-    public static function animeTitleDocumentId(int $anidbid, string $type, string $lang, string $title): int
+    public static function animeTitleDocumentId(int $anidbid, string $type, string $lang, string $title, bool $useRustFfi = false): int
+    {
+        return ($useRustFfi ? self::animeTitleDocumentIdNative($anidbid, $type, $lang, $title) : null)
+            ?? self::animeTitleDocumentIdPhp($anidbid, $type, $lang, $title);
+    }
+
+    public static function animeTitleDocumentIdNative(int $anidbid, string $type, string $lang, string $title): ?int
+    {
+        static $ffi;
+        $ffi ??= RustPipelineLibrary::resolveDomain('search', 'int64_t nntmux_secondary_index_anime_doc_id(const char *input, size_t len);') ?? false;
+        if ($ffi === false) {
+            return null;
+        }
+        $payload = $anidbid.'|'.$type.'|'.$lang.'|'.$title;
+        try {
+            $id = $ffi->nntmux_secondary_index_anime_doc_id($payload, strlen($payload));
+
+            return is_int($id) && $id >= 0 ? $id : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    public static function animeTitleDocumentIdPhp(int $anidbid, string $type, string $lang, string $title): int
     {
         $payload = $anidbid.'|'.$type.'|'.$lang.'|'.$title;
 
