@@ -20047,3 +20047,867 @@ pub unsafe extern "C" fn nntmux_w29_admin_gdpr_reg_promo_invite_history(
     }))
     .unwrap_or(-1)
 }
+
+// ---------------------------------------------------------------------------
+// Wave 30 Slice 30.1: CleanNZB, FixNzbSplitNames, RemoveCrapReleases,
+// NntmuxRemoveBadReleases and ReclassifyHeaderRejections command helpers
+// ---------------------------------------------------------------------------
+
+pub mod wave30_nzb_release_cleanup_commands {
+    //! Request: a JSON array `[operation, ...arguments]`. Response: a JSON array `[result]`.
+    //! Inputs whose PHP semantics are not reproduced exactly are declined with `Err`, so the
+    //! PHP caller falls back to its native implementation.
+
+    use std::collections::HashSet;
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum Value {
+        Null,
+        Bool(bool),
+        Int(i64),
+        Float(f64),
+        Str(Vec<u8>),
+        List(Vec<Value>),
+        Map(Vec<(Vec<u8>, Value)>),
+    }
+
+    const MAX_DEPTH: usize = 4;
+    const MAX_INPUT_LEN: usize = 16 * 1024 * 1024;
+
+    struct Parser<'a> {
+        bytes: &'a [u8],
+        pos: usize,
+    }
+
+    impl Parser<'_> {
+        fn skip_ws(&mut self) {
+            while matches!(self.bytes.get(self.pos), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+                self.pos += 1;
+            }
+        }
+
+        fn literal(&mut self, text: &[u8], value: Value) -> Result<Value, ()> {
+            if self.bytes[self.pos..].starts_with(text) {
+                self.pos += text.len();
+                Ok(value)
+            } else {
+                Err(())
+            }
+        }
+
+        fn value(&mut self, depth: usize) -> Result<Value, ()> {
+            self.skip_ws();
+            match *self.bytes.get(self.pos).ok_or(())? {
+                b'n' => self.literal(b"null", Value::Null),
+                b't' => self.literal(b"true", Value::Bool(true)),
+                b'f' => self.literal(b"false", Value::Bool(false)),
+                b'"' => self.string().map(Value::Str),
+                b'-' | b'0'..=b'9' => self.number(),
+                b'[' => {
+                    if depth >= MAX_DEPTH {
+                        return Err(());
+                    }
+                    self.pos += 1;
+                    let mut items = Vec::new();
+                    self.skip_ws();
+                    if self.bytes.get(self.pos) == Some(&b']') {
+                        self.pos += 1;
+                        return Ok(Value::List(items));
+                    }
+                    loop {
+                        items.push(self.value(depth + 1)?);
+                        self.skip_ws();
+                        match self.bytes.get(self.pos) {
+                            Some(b',') => self.pos += 1,
+                            Some(b']') => {
+                                self.pos += 1;
+                                return Ok(Value::List(items));
+                            }
+                            _ => return Err(()),
+                        }
+                    }
+                }
+                b'{' => {
+                    if depth >= MAX_DEPTH {
+                        return Err(());
+                    }
+                    self.pos += 1;
+                    let mut entries = Vec::new();
+                    self.skip_ws();
+                    if self.bytes.get(self.pos) == Some(&b'}') {
+                        self.pos += 1;
+                        return Ok(Value::Map(entries));
+                    }
+                    loop {
+                        self.skip_ws();
+                        if self.bytes.get(self.pos) != Some(&b'"') {
+                            return Err(());
+                        }
+                        let key = self.string()?;
+                        self.skip_ws();
+                        if self.bytes.get(self.pos) != Some(&b':') {
+                            return Err(());
+                        }
+                        self.pos += 1;
+                        entries.push((key, self.value(depth + 1)?));
+                        self.skip_ws();
+                        match self.bytes.get(self.pos) {
+                            Some(b',') => self.pos += 1,
+                            Some(b'}') => {
+                                self.pos += 1;
+                                return Ok(Value::Map(entries));
+                            }
+                            _ => return Err(()),
+                        }
+                    }
+                }
+                _ => Err(()),
+            }
+        }
+
+        fn digits(&mut self) -> usize {
+            let start = self.pos;
+            while self.bytes.get(self.pos).is_some_and(u8::is_ascii_digit) {
+                self.pos += 1;
+            }
+            self.pos - start
+        }
+
+        fn number(&mut self) -> Result<Value, ()> {
+            let start = self.pos;
+            if self.bytes.get(self.pos) == Some(&b'-') {
+                self.pos += 1;
+            }
+            match self.bytes.get(self.pos) {
+                Some(b'0') => self.pos += 1,
+                Some(b'1'..=b'9') => {
+                    self.digits();
+                }
+                _ => return Err(()),
+            }
+            let mut float = false;
+            if self.bytes.get(self.pos) == Some(&b'.') {
+                float = true;
+                self.pos += 1;
+                if self.digits() == 0 {
+                    return Err(());
+                }
+            }
+            if matches!(self.bytes.get(self.pos), Some(b'e' | b'E')) {
+                float = true;
+                self.pos += 1;
+                if matches!(self.bytes.get(self.pos), Some(b'+' | b'-')) {
+                    self.pos += 1;
+                }
+                if self.digits() == 0 {
+                    return Err(());
+                }
+            }
+            let text = std::str::from_utf8(&self.bytes[start..self.pos]).map_err(|_| ())?;
+            if float {
+                let value: f64 = text.parse().map_err(|_| ())?;
+                if !value.is_finite() {
+                    return Err(());
+                }
+                Ok(Value::Float(value))
+            } else {
+                text.parse::<i64>().map(Value::Int).map_err(|_| ())
+            }
+        }
+
+        fn hex4(&mut self) -> Result<u32, ()> {
+            let digits = self.bytes.get(self.pos..self.pos + 4).ok_or(())?;
+            let mut value = 0u32;
+            for &digit in digits {
+                value = value * 16 + char::from(digit).to_digit(16).ok_or(())?;
+            }
+            self.pos += 4;
+            Ok(value)
+        }
+
+        fn string(&mut self) -> Result<Vec<u8>, ()> {
+            self.pos += 1;
+            let mut out = Vec::new();
+            loop {
+                let byte = *self.bytes.get(self.pos).ok_or(())?;
+                self.pos += 1;
+                match byte {
+                    b'"' => return Ok(out),
+                    b'\\' => {
+                        let escape = *self.bytes.get(self.pos).ok_or(())?;
+                        self.pos += 1;
+                        match escape {
+                            b'"' | b'\\' | b'/' => out.push(escape),
+                            b'b' => out.push(0x08),
+                            b'f' => out.push(0x0c),
+                            b'n' => out.push(b'\n'),
+                            b'r' => out.push(b'\r'),
+                            b't' => out.push(b'\t'),
+                            b'u' => {
+                                let mut code = self.hex4()?;
+                                if (0xD800..0xDC00).contains(&code) {
+                                    if self.bytes.get(self.pos..self.pos + 2) != Some(b"\\u") {
+                                        return Err(());
+                                    }
+                                    self.pos += 2;
+                                    let low = self.hex4()?;
+                                    if !(0xDC00..0xE000).contains(&low) {
+                                        return Err(());
+                                    }
+                                    code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+                                }
+                                let ch = char::from_u32(code).ok_or(())?;
+                                let mut buf = [0u8; 4];
+                                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                            }
+                            _ => return Err(()),
+                        }
+                    }
+                    0x00..=0x1f => return Err(()),
+                    _ => out.push(byte),
+                }
+            }
+        }
+    }
+
+    pub fn parse(input: &[u8]) -> Result<Value, ()> {
+        if input.len() > MAX_INPUT_LEN || std::str::from_utf8(input).is_err() {
+            return Err(());
+        }
+        let mut parser = Parser {
+            bytes: input,
+            pos: 0,
+        };
+        let value = parser.value(0)?;
+        parser.skip_ws();
+        if parser.pos != input.len() {
+            return Err(());
+        }
+        Ok(value)
+    }
+
+    fn push_string(out: &mut Vec<u8>, text: &[u8]) {
+        out.push(b'"');
+        for &byte in text {
+            match byte {
+                b'"' => out.extend_from_slice(b"\\\""),
+                b'\\' => out.extend_from_slice(b"\\\\"),
+                b'\n' => out.extend_from_slice(b"\\n"),
+                b'\r' => out.extend_from_slice(b"\\r"),
+                b'\t' => out.extend_from_slice(b"\\t"),
+                0x00..=0x1f => {
+                    const HEX: &[u8; 16] = b"0123456789abcdef";
+                    out.extend_from_slice(b"\\u00");
+                    out.push(HEX[usize::from(byte >> 4)]);
+                    out.push(HEX[usize::from(byte & 0x0f)]);
+                }
+                _ => out.push(byte),
+            }
+        }
+        out.push(b'"');
+    }
+
+    pub fn encode(out: &mut Vec<u8>, value: &Value) -> Result<(), ()> {
+        match value {
+            Value::Null => out.extend_from_slice(b"null"),
+            Value::Bool(true) => out.extend_from_slice(b"true"),
+            Value::Bool(false) => out.extend_from_slice(b"false"),
+            Value::Int(number) => out.extend_from_slice(number.to_string().as_bytes()),
+            // Responses never carry floats; PHP's float rendering is not reproduced here.
+            Value::Float(_) => return Err(()),
+            Value::Str(text) => push_string(out, text),
+            Value::List(items) => {
+                out.push(b'[');
+                for (index, item) in items.iter().enumerate() {
+                    if index > 0 {
+                        out.push(b',');
+                    }
+                    encode(out, item)?;
+                }
+                out.push(b']');
+            }
+            Value::Map(entries) => {
+                out.push(b'{');
+                for (index, (key, item)) in entries.iter().enumerate() {
+                    if index > 0 {
+                        out.push(b',');
+                    }
+                    push_string(out, key);
+                    out.push(b':');
+                    encode(out, item)?;
+                }
+                out.push(b'}');
+            }
+        }
+        Ok(())
+    }
+
+    fn int(value: &Value) -> Result<i64, ()> {
+        match value {
+            Value::Int(number) => Ok(*number),
+            _ => Err(()),
+        }
+    }
+
+    fn boolean(value: &Value) -> Result<bool, ()> {
+        match value {
+            Value::Bool(flag) => Ok(*flag),
+            _ => Err(()),
+        }
+    }
+
+    fn string(value: &Value) -> Result<&[u8], ()> {
+        match value {
+            Value::Str(text) => Ok(text),
+            _ => Err(()),
+        }
+    }
+
+    /// PHP `(int)` for plain decimal strings; any other string shape is declined.
+    fn php_int_cast_str(text: &[u8]) -> Result<i64, ()> {
+        if text.is_empty() {
+            return Ok(0);
+        }
+        let negative = text[0] == b'-';
+        let digits = if matches!(text[0], b'+' | b'-') {
+            &text[1..]
+        } else {
+            text
+        };
+        if digits.is_empty() || digits.len() > 18 || !digits.iter().all(u8::is_ascii_digit) {
+            return Err(());
+        }
+        let magnitude = digits
+            .iter()
+            .fold(0i64, |acc, digit| acc * 10 + i64::from(digit - b'0'));
+        Ok(if negative { -magnitude } else { magnitude })
+    }
+
+    /// PHP `(int)` for scalars and null; arrays, maps and non-representable floats are declined.
+    fn php_int_cast(value: &Value) -> Result<i64, ()> {
+        match value {
+            Value::Null => Ok(0),
+            Value::Bool(flag) => Ok(i64::from(*flag)),
+            Value::Int(number) => Ok(*number),
+            Value::Float(number) => {
+                if number.is_finite()
+                    && *number >= -9_223_372_036_854_775_808.0
+                    && *number < 9_223_372_036_854_775_808.0
+                {
+                    Ok(number.trunc() as i64)
+                } else {
+                    Err(())
+                }
+            }
+            Value::Str(text) => php_int_cast_str(text),
+            Value::List(_) | Value::Map(_) => Err(()),
+        }
+    }
+
+    /// PHP `(string)` for strings, ints, booleans and null; floats and containers are declined.
+    fn php_string_cast(value: &Value) -> Result<Vec<u8>, ()> {
+        match value {
+            Value::Null | Value::Bool(false) => Ok(Vec::new()),
+            Value::Bool(true) => Ok(b"1".to_vec()),
+            Value::Int(number) => Ok(number.to_string().into_bytes()),
+            Value::Str(text) => Ok(text.clone()),
+            Value::Float(_) | Value::List(_) | Value::Map(_) => Err(()),
+        }
+    }
+
+    /// PHP `$value ?? $default` followed by `(string)`.
+    fn coalesce_string(value: &Value, default: &[u8]) -> Result<Value, ()> {
+        match value {
+            Value::Null => Ok(Value::Str(default.to_vec())),
+            other => php_string_cast(other).map(Value::Str),
+        }
+    }
+
+    fn text(parts: &[&[u8]]) -> Value {
+        Value::Str(parts.concat())
+    }
+
+    fn entry(key: &str, value: Value) -> (Vec<u8>, Value) {
+        (key.as_bytes().to_vec(), value)
+    }
+
+    pub fn evaluate(operation: &[u8], args: &[Value]) -> Result<Value, ()> {
+        Ok(match (operation, args) {
+            (b"clean_nzb.normalize_temp_age_seconds", [hours]) => {
+                Value::Int(php_int_cast(hours)?.max(1).checked_mul(3600).ok_or(())?)
+            }
+            (b"clean_nzb.extract_guid_from_nzb_gz_filename", [filename]) => {
+                let filename = string(filename)?;
+                match filename.strip_suffix(b".nzb.gz") {
+                    Some(guid) => Value::Str(guid.to_vec()),
+                    None => Value::Null,
+                }
+            }
+            (b"clean_nzb.format_staged_outcome_line", [delete, applied, deleted, kept]) => {
+                Value::Str(
+                    format!(
+                        "{} stale temporary NZBs: {} deleted, {} applied, {} kept.",
+                        if boolean(delete)? { "Cleaned" } else { "Checked (dry run)" },
+                        int(deleted)?,
+                        int(applied)?,
+                        int(kept)?
+                    )
+                    .into_bytes(),
+                )
+            }
+            (b"clean_nzb.format_temp_cleanup_line", [delete, stale]) => {
+                let stale = int(stale)?;
+                Value::Str(
+                    if boolean(delete)? {
+                        format!("Cleaning {stale} stale temporary NZB paths.")
+                    } else {
+                        format!("Found {stale} stale temporary NZB paths (dry run).")
+                    }
+                    .into_bytes(),
+                )
+            }
+            (b"fix_nzb_split.format_dry_run_diff_line", [id, old_name, new_name, old_cat, new_cat]) => {
+                text(&[
+                    b"[dry-run] #",
+                    int(id)?.to_string().as_bytes(),
+                    b" ",
+                    string(old_name)?,
+                    b" -> ",
+                    string(new_name)?,
+                    b" (",
+                    int(old_cat)?.to_string().as_bytes(),
+                    b" -> ",
+                    int(new_cat)?.to_string().as_bytes(),
+                    b")",
+                ])
+            }
+            (b"fix_nzb_split.build_reset_update_payload", [new_name, category]) => {
+                let new_name = string(new_name)?;
+                Value::Map(vec![
+                    entry("name", Value::Str(new_name.to_vec())),
+                    entry("searchname", Value::Str(new_name.to_vec())),
+                    entry("categories_id", Value::Int(int(category)?)),
+                    entry("isrenamed", Value::Int(1)),
+                    entry("iscategorized", Value::Int(1)),
+                    entry("videos_id", Value::Int(0)),
+                    entry("tv_episodes_id", Value::Int(0)),
+                    entry("imdbid", Value::Null),
+                    entry("musicinfo_id", Value::Null),
+                    entry("consoleinfo_id", Value::Null),
+                    entry("gamesinfo_id", Value::Int(0)),
+                    entry("bookinfo_id", Value::Null),
+                    entry("anidbid", Value::Null),
+                    entry("movieinfo_id", Value::Null),
+                ])
+            }
+            (b"fix_nzb_split.format_completion_summary", [dry_run, fixed, checked]) => {
+                Value::Str(
+                    if boolean(dry_run)? {
+                        format!("Dry run complete. {} NZBSPLIT-wrapped releases inspected.", int(checked)?)
+                    } else {
+                        format!("Updated {} NZBSPLIT-wrapped releases.", int(fixed)?)
+                    }
+                    .into_bytes(),
+                )
+            }
+            (b"remove_crap.normalize_options", [kind, time, blacklist_id, delete]) => Value::Map(vec![
+                entry("type", coalesce_string(kind, b"")?),
+                entry("time", coalesce_string(time, b"full")?),
+                entry("blacklist_id", coalesce_string(blacklist_id, b"")?),
+                entry("delete", Value::Bool(boolean(delete)?)),
+            ]),
+            (b"remove_crap.format_summary_message", [result, delete]) => {
+                let delete = boolean(delete)?;
+                let (status, message) = match result {
+                    Value::Bool(true) if delete => ("info", b"Crap release removal complete.".to_vec()),
+                    Value::Bool(true) => ("info", b"Dry run complete. Use --delete to remove the matched releases.".to_vec()),
+                    Value::Str(message) if !message.is_empty() => ("warn", message.clone()),
+                    _ => ("warn", b"Crap release removal failed.".to_vec()),
+                };
+                Value::Map(vec![
+                    entry("status", Value::Str(status.as_bytes().to_vec())),
+                    entry("message", Value::Str(message)),
+                ])
+            }
+            (b"remove_bad.is_bad_password_status", [status]) => Value::Bool(int(status)? <= -2),
+            (b"remove_bad.normalize_release_id_list", [Value::List(values)]) => {
+                let mut seen = HashSet::with_capacity(values.len());
+                let mut ids = Vec::with_capacity(values.len());
+                for value in values {
+                    let id = match value {
+                        Value::List(_) | Value::Map(_) => 0,
+                        scalar => php_int_cast(scalar)?,
+                    };
+                    if id > 0 && seen.insert(id) {
+                        ids.push(Value::Int(id));
+                    }
+                }
+                Value::List(ids)
+            }
+            (b"remove_bad.format_updated_bad_releases_message", [count]) => {
+                Value::Str(format!("Updated {} bad releases", int(count)?).into_bytes())
+            }
+            (b"reclassify.normalize_chunk_window", [chunk, after]) => {
+                let chunk = int(chunk)?.max(1);
+                let after = int(after)?.max(0);
+                Value::Map(vec![
+                    entry("chunk", Value::Int(chunk)),
+                    entry("after", Value::Int(after)),
+                    entry("through", Value::Int(after.checked_add(chunk).ok_or(())?)),
+                ])
+            }
+            (b"reclassify.has_exceeded_max_seconds", [max_seconds, elapsed]) => {
+                let max_seconds = int(max_seconds)?;
+                Value::Bool(
+                    max_seconds > 0
+                        && match elapsed {
+                            Value::Int(elapsed) => *elapsed >= max_seconds,
+                            // PHP compares an int with a float as `(double) int`.
+                            Value::Float(elapsed) => *elapsed >= max_seconds as f64,
+                            _ => return Err(()),
+                        },
+                )
+            }
+            (b"reclassify.format_summary_line", [scanned, reclassified, deleted, last_id]) => Value::Str(
+                format!(
+                    "Reclassified {} candidates with header defects (scanned {} ids through {}, deleted {}).",
+                    int(reclassified)?,
+                    int(scanned)?,
+                    int(last_id)?,
+                    int(deleted)?
+                )
+                .into_bytes(),
+            ),
+            _ => return Err(()),
+        })
+    }
+
+    /// Evaluates one JSON request and returns its JSON response bytes.
+    pub fn output(input: &[u8]) -> Result<Vec<u8>, ()> {
+        let Value::List(items) = parse(input)? else {
+            return Err(());
+        };
+        let Some((Value::Str(operation), args)) = items.split_first() else {
+            return Err(());
+        };
+        let result = evaluate(operation, args)?;
+        let mut out = Vec::with_capacity(64);
+        out.push(b'[');
+        encode(&mut out, &result)?;
+        out.push(b']');
+        Ok(out)
+    }
+}
+
+/// Evaluate one JSON-dispatched CleanNZB, FixNzbSplitNames, RemoveCrapReleases, NntmuxRemoveBadReleases or
+/// ReclassifyHeaderRejections helper request without partially writing output.
+/// Returns bytes written, -1 on invalid or declined input/panic, or the negated required size (always <= -3).
+///
+/// # Safety
+/// Both regions must be non-null and allocated for their stated extents, with
+/// lengths fitting isize and no address overflow. Only byte alignment is needed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w30_nzb_release_cleanup_commands(
+    input: *const u8,
+    len: usize,
+    out: *mut u8,
+    out_cap: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, len) || !cleaning_ffi_region_valid(out, out_cap) {
+            return -1;
+        }
+        let output = {
+            let input = unsafe { std::slice::from_raw_parts(input, len) };
+            match wave30_nzb_release_cleanup_commands::output(input) {
+                Ok(output) => output,
+                Err(()) => return -1,
+            }
+        };
+        let Ok(needed) = i32::try_from(output.len()) else {
+            return -1;
+        };
+        if output.len() > out_cap {
+            return -needed;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(output.as_ptr(), out, output.len()) };
+        needed
+    }))
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod wave30_nzb_release_cleanup_commands_tests {
+    use super::nntmux_w30_nzb_release_cleanup_commands as ffi;
+    use super::wave30_nzb_release_cleanup_commands::output;
+
+    fn run(request: &str) -> Option<String> {
+        output(request.as_bytes())
+            .ok()
+            .map(|bytes| String::from_utf8(bytes).unwrap())
+    }
+
+    fn ok(request: &str, expected: &str) {
+        assert_eq!(run(request).as_deref(), Some(expected), "request {request}");
+    }
+
+    fn declined(request: &str) {
+        assert_eq!(run(request), None, "request {request}");
+    }
+
+    #[test]
+    fn clean_nzb_helpers_match_php() {
+        ok(
+            r#"["clean_nzb.normalize_temp_age_seconds","24"]"#,
+            "[86400]",
+        );
+        ok(r#"["clean_nzb.normalize_temp_age_seconds",null]"#, "[3600]");
+        ok(r#"["clean_nzb.normalize_temp_age_seconds",""]"#, "[3600]");
+        ok(r#"["clean_nzb.normalize_temp_age_seconds","-5"]"#, "[3600]");
+        ok(r#"["clean_nzb.normalize_temp_age_seconds","+2"]"#, "[7200]");
+        ok(r#"["clean_nzb.normalize_temp_age_seconds",true]"#, "[3600]");
+        ok(r#"["clean_nzb.normalize_temp_age_seconds",2.9]"#, "[7200]");
+        ok(r#"["clean_nzb.normalize_temp_age_seconds",48]"#, "[172800]");
+        declined(r#"["clean_nzb.normalize_temp_age_seconds","12abc"]"#);
+        declined(r#"["clean_nzb.normalize_temp_age_seconds"," 12"]"#);
+        declined(r#"["clean_nzb.normalize_temp_age_seconds",9223372036854775807]"#);
+        declined(r#"["clean_nzb.normalize_temp_age_seconds",1.0e300]"#);
+        declined(r#"["clean_nzb.normalize_temp_age_seconds",[1]]"#);
+
+        ok(
+            r#"["clean_nzb.extract_guid_from_nzb_gz_filename","abc.nzb.gz"]"#,
+            r#"["abc"]"#,
+        );
+        ok(
+            r#"["clean_nzb.extract_guid_from_nzb_gz_filename",".nzb.gz"]"#,
+            r#"[""]"#,
+        );
+        ok(
+            r#"["clean_nzb.extract_guid_from_nzb_gz_filename","abc.NZB.GZ"]"#,
+            "[null]",
+        );
+        ok(
+            r#"["clean_nzb.extract_guid_from_nzb_gz_filename","a\u0000b.nzb.gz"]"#,
+            r#"["a\u0000b"]"#,
+        );
+        ok(
+            r#"["clean_nzb.extract_guid_from_nzb_gz_filename","é😀.nzb.gz"]"#,
+            r#"["é😀"]"#,
+        );
+        ok(
+            r#"["clean_nzb.extract_guid_from_nzb_gz_filename","\ud83d\ude00.nzb.gz"]"#,
+            r#"["😀"]"#,
+        );
+        declined(r#"["clean_nzb.extract_guid_from_nzb_gz_filename",5]"#);
+
+        ok(
+            r#"["clean_nzb.format_staged_outcome_line",false,1,2,0]"#,
+            r#"["Checked (dry run) stale temporary NZBs: 2 deleted, 1 applied, 0 kept."]"#,
+        );
+        ok(
+            r#"["clean_nzb.format_staged_outcome_line",true,0,-3,1]"#,
+            r#"["Cleaned stale temporary NZBs: -3 deleted, 0 applied, 1 kept."]"#,
+        );
+        ok(
+            r#"["clean_nzb.format_temp_cleanup_line",true,4]"#,
+            r#"["Cleaning 4 stale temporary NZB paths."]"#,
+        );
+        ok(
+            r#"["clean_nzb.format_temp_cleanup_line",false,0]"#,
+            r#"["Found 0 stale temporary NZB paths (dry run)."]"#,
+        );
+        declined(r#"["clean_nzb.format_temp_cleanup_line",1,0]"#);
+    }
+
+    #[test]
+    fn fix_nzb_split_helpers_match_php() {
+        ok(
+            r#"["fix_nzb_split.format_dry_run_diff_line",7,"Old \"x\"\\y","Néw\n",-1,5050]"#,
+            r#"["[dry-run] #7 Old \"x\"\\y -> Néw\n (-1 -> 5050)"]"#,
+        );
+        ok(
+            r#"["fix_nzb_split.build_reset_update_payload","T",2030]"#,
+            r#"[{"name":"T","searchname":"T","categories_id":2030,"isrenamed":1,"iscategorized":1,"videos_id":0,"tv_episodes_id":0,"imdbid":null,"musicinfo_id":null,"consoleinfo_id":null,"gamesinfo_id":0,"bookinfo_id":null,"anidbid":null,"movieinfo_id":null}]"#,
+        );
+        ok(
+            r#"["fix_nzb_split.format_completion_summary",true,0,9]"#,
+            r#"["Dry run complete. 9 NZBSPLIT-wrapped releases inspected."]"#,
+        );
+        ok(
+            r#"["fix_nzb_split.format_completion_summary",false,3,9]"#,
+            r#"["Updated 3 NZBSPLIT-wrapped releases."]"#,
+        );
+        declined(r#"["fix_nzb_split.format_completion_summary",false,3]"#);
+    }
+
+    #[test]
+    fn remove_crap_and_bad_release_helpers_match_php() {
+        ok(
+            r#"["remove_crap.normalize_options",null,null,null,false]"#,
+            r#"[{"type":"","time":"full","blacklist_id":"","delete":false}]"#,
+        );
+        ok(
+            r#"["remove_crap.normalize_options","0","0",0,true]"#,
+            r#"[{"type":"0","time":"0","blacklist_id":"0","delete":true}]"#,
+        );
+        ok(
+            r#"["remove_crap.normalize_options",false,true,"",false]"#,
+            r#"[{"type":"","time":"1","blacklist_id":"","delete":false}]"#,
+        );
+        declined(r#"["remove_crap.normalize_options",1.5,null,null,false]"#);
+        ok(
+            r#"["remove_crap.format_summary_message",true,true]"#,
+            r#"[{"status":"info","message":"Crap release removal complete."}]"#,
+        );
+        ok(
+            r#"["remove_crap.format_summary_message","Wrong type: x",false]"#,
+            r#"[{"status":"warn","message":"Wrong type: x"}]"#,
+        );
+        ok(
+            r#"["remove_crap.format_summary_message","",false]"#,
+            r#"[{"status":"warn","message":"Crap release removal failed."}]"#,
+        );
+        ok(
+            r#"["remove_crap.format_summary_message",1,false]"#,
+            r#"[{"status":"warn","message":"Crap release removal failed."}]"#,
+        );
+
+        ok(r#"["remove_bad.is_bad_password_status",-2]"#, "[true]");
+        ok(r#"["remove_bad.is_bad_password_status",-1]"#, "[false]");
+        ok(
+            r#"["remove_bad.normalize_release_id_list",[3,"3","7",0,-1,null,true,[9],{"a":1},"",2.5]]"#,
+            "[[3,7,1,2]]",
+        );
+        ok(r#"["remove_bad.normalize_release_id_list",[]]"#, "[[]]");
+        declined(r#"["remove_bad.normalize_release_id_list",["x"]]"#);
+        declined(r#"["remove_bad.normalize_release_id_list",5]"#);
+        ok(
+            r#"["remove_bad.format_updated_bad_releases_message",12]"#,
+            r#"["Updated 12 bad releases"]"#,
+        );
+    }
+
+    #[test]
+    fn reclassify_helpers_match_php() {
+        ok(
+            r#"["reclassify.normalize_chunk_window",0,-5]"#,
+            r#"[{"chunk":1,"after":0,"through":1}]"#,
+        );
+        ok(
+            r#"["reclassify.normalize_chunk_window",5000,100]"#,
+            r#"[{"chunk":5000,"after":100,"through":5100}]"#,
+        );
+        declined(r#"["reclassify.normalize_chunk_window",2,9223372036854775807]"#);
+        ok(
+            r#"["reclassify.has_exceeded_max_seconds",0,100]"#,
+            "[false]",
+        );
+        ok(r#"["reclassify.has_exceeded_max_seconds",10,10]"#, "[true]");
+        ok(
+            r#"["reclassify.has_exceeded_max_seconds",10,9.999]"#,
+            "[false]",
+        );
+        ok(
+            r#"["reclassify.has_exceeded_max_seconds",10,10.0]"#,
+            "[true]",
+        );
+        ok(
+            r#"["reclassify.has_exceeded_max_seconds",-1,10.0]"#,
+            "[false]",
+        );
+        declined(r#"["reclassify.has_exceeded_max_seconds",10,"10"]"#);
+        ok(
+            r#"["reclassify.format_summary_line",10,2,0,110]"#,
+            r#"["Reclassified 2 candidates with header defects (scanned 10 ids through 110, deleted 0)."]"#,
+        );
+    }
+
+    #[test]
+    fn malformed_requests_are_declined() {
+        for request in [
+            "",
+            "[]",
+            "{}",
+            "[1]",
+            r#"["unknown"]"#,
+            r#"["remove_bad.is_bad_password_status",-2"#,
+            r#"["remove_bad.is_bad_password_status",-2] x"#,
+            r#"["remove_bad.is_bad_password_status",01]"#,
+            r#"["remove_bad.is_bad_password_status",1.]"#,
+            r#"["remove_bad.is_bad_password_status",9223372036854775808]"#,
+            r#"["clean_nzb.extract_guid_from_nzb_gz_filename","\ud800.nzb.gz"]"#,
+            r#"["clean_nzb.extract_guid_from_nzb_gz_filename","\x"]"#,
+            "[\"clean_nzb.extract_guid_from_nzb_gz_filename\",\"a\tb\"]",
+            r#"["remove_bad.normalize_release_id_list",[[[[1]]]]]"#,
+        ] {
+            declined(request);
+        }
+        assert!(
+            output(b"[\"clean_nzb.extract_guid_from_nzb_gz_filename\",\"\xff.nzb.gz\"]").is_err()
+        );
+    }
+
+    #[test]
+    fn ffi_rejects_bad_regions_and_leaves_short_output_untouched() {
+        let input = br#"["remove_bad.format_updated_bad_releases_message",12]"#;
+        let expected = br#"["Updated 12 bad releases"]"#;
+        let mut target = vec![0xab_u8; expected.len() + 8];
+        unsafe {
+            for capacity in [0, 1, expected.len() - 1] {
+                assert_eq!(
+                    ffi(input.as_ptr(), input.len(), target.as_mut_ptr(), capacity),
+                    -(expected.len() as i32)
+                );
+                assert!(target.iter().all(|byte| *byte == 0xab));
+            }
+            assert_eq!(
+                ffi(std::ptr::null(), 0, target.as_mut_ptr(), target.len()),
+                -1
+            );
+            assert_eq!(
+                ffi(input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                -1
+            );
+            assert_eq!(
+                ffi(
+                    input.as_ptr(),
+                    usize::MAX,
+                    target.as_mut_ptr(),
+                    target.len()
+                ),
+                -1
+            );
+            assert_eq!(
+                ffi(
+                    input.as_ptr(),
+                    input.len(),
+                    target.as_mut_ptr(),
+                    isize::MAX as usize + 1
+                ),
+                -1
+            );
+            let bad = br#"["unknown"]"#;
+            assert_eq!(
+                ffi(bad.as_ptr(), bad.len(), target.as_mut_ptr(), target.len()),
+                -1
+            );
+            assert!(target.iter().all(|byte| *byte == 0xab));
+            assert_eq!(
+                ffi(
+                    input.as_ptr(),
+                    input.len(),
+                    target.as_mut_ptr().add(1),
+                    expected.len()
+                ),
+                expected.len() as i32
+            );
+            assert_eq!(&target[1..1 + expected.len()], expected);
+            assert_eq!(target[0], 0xab);
+            assert!(
+                target[1 + expected.len()..]
+                    .iter()
+                    .all(|byte| *byte == 0xab)
+            );
+        }
+    }
+}
