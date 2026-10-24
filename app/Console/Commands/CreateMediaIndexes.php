@@ -7,13 +7,39 @@ namespace App\Console\Commands;
 use App\Services\Search\Support\ElasticsearchClientFactory;
 use App\Services\Search\Support\ElasticsearchResponseHelper;
 use App\Services\Search\Support\ManticoreClientFactory;
+use App\Support\RustPipelineLibrary;
 use Elastic\Elasticsearch\Client as ElasticsearchClient;
+use FFI;
 use Illuminate\Console\Command;
 use Manticoresearch\Client as ManticoreClient;
 use Manticoresearch\Exceptions\ResponseException;
+use Throwable;
 
 class CreateMediaIndexes extends Command
 {
+    public const string FFI_CDEF = <<<'CDEF'
+    int32_t nntmux_media_index_schema(uint32_t kind, char *out, size_t cap);
+    int32_t nntmux_media_driver_kind(const char *driver, size_t driver_len);
+    CDEF;
+
+    public const int DRIVER_MANTICORE = 0;
+
+    public const int DRIVER_ELASTICSEARCH = 1;
+
+    public const int DRIVER_UNSUPPORTED = 2;
+
+    private const int SCHEMA_MANTICORE = 0;
+
+    private const int SCHEMA_ELASTICSEARCH = 1;
+
+    /**
+     * Production default stays false until benchmark/parity sign-off; see
+     * tests/Unit/RustApiV1ManticoreMediaIndexCommandsParityTest.php.
+     */
+    private static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
+
     /**
      * The name and signature of the console command.
      *
@@ -38,9 +64,10 @@ class CreateMediaIndexes extends Command
         $driver = config('search.default', 'manticore');
         $this->info("Creating media search indexes for driver: {$driver}");
 
-        if ($driver === 'manticore') {
+        $driverKind = self::mediaDriver($driver);
+        if ($driverKind === self::DRIVER_MANTICORE) {
             return $this->createManticoreIndexes();
-        } elseif ($driver === 'elasticsearch') {
+        } elseif ($driverKind === self::DRIVER_ELASTICSEARCH) {
             return $this->createElasticsearchIndexes();
         } else {
             $this->error("Unsupported search driver: {$driver}");
@@ -68,44 +95,7 @@ class CreateMediaIndexes extends Command
 
         $dropExisting = $this->option('drop');
 
-        // Define movies and tvshows indexes
-        $indexes = [
-            'movies_rt' => [
-                'settings' => [
-                    'min_prefix_len' => 0,
-                    'min_infix_len' => 2,
-                ],
-                'columns' => [
-                    'imdbid' => ['type' => 'string'],
-                    'tmdbid' => ['type' => 'integer'],
-                    'traktid' => ['type' => 'integer'],
-                    'title' => ['type' => 'text'],
-                    'year' => ['type' => 'text'],
-                    'genre' => ['type' => 'text'],
-                    'actors' => ['type' => 'text'],
-                    'director' => ['type' => 'text'],
-                    'rating' => ['type' => 'text'],
-                    'plot' => ['type' => 'text'],
-                ],
-            ],
-            'tvshows_rt' => [
-                'settings' => [
-                    'min_prefix_len' => 0,
-                    'min_infix_len' => 2,
-                ],
-                'columns' => [
-                    'title' => ['type' => 'text'],
-                    'tvdb' => ['type' => 'integer'],
-                    'trakt' => ['type' => 'integer'],
-                    'tvmaze' => ['type' => 'integer'],
-                    'tvrage' => ['type' => 'integer'],
-                    'imdb' => ['type' => 'string'],
-                    'tmdb' => ['type' => 'integer'],
-                    'started' => ['type' => 'text'],
-                    'type' => ['type' => 'integer'],
-                ],
-            ],
-        ];
+        $indexes = self::manticoreMediaSchemas();
 
         $hasErrors = false;
 
@@ -182,14 +172,15 @@ class CreateMediaIndexes extends Command
             return true;
 
         } catch (ResponseException $e) {
+            $kind = CreateManticoreIndexes::createErrorKind($e->getMessage());
             // Check if the error is because the index already exists
-            if (str_contains($e->getMessage(), 'already exists')) {
+            if ($kind === CreateManticoreIndexes::CREATE_ERROR_ALREADY_EXISTS) {
                 $this->warn("Index {$indexName} already exists. Use --drop to recreate.");
 
                 return true;
             }
             // Check for data_dir configuration error
-            if (str_contains($e->getMessage(), 'data_dir')) {
+            if ($kind === CreateManticoreIndexes::CREATE_ERROR_DATA_DIR) {
                 $this->error("Failed to create index {$indexName}: ".$e->getMessage());
                 $this->newLine();
                 $this->warn('ManticoreSearch requires data_dir to be set in its configuration file.');
@@ -203,7 +194,7 @@ class CreateMediaIndexes extends Command
             $this->error("Failed to create index {$indexName}: ".$e->getMessage());
 
             return false;
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             $this->error("Unexpected error creating index {$indexName}: ".$e->getMessage());
 
             return false;
@@ -219,48 +210,7 @@ class CreateMediaIndexes extends Command
 
         $dropExisting = $this->option('drop');
 
-        // Movies index mapping
-        $moviesMapping = [
-            'mappings' => [
-                'properties' => [
-                    'imdbid' => ['type' => 'keyword'],
-                    'tmdbid' => ['type' => 'integer'],
-                    'traktid' => ['type' => 'integer'],
-                    'title' => ['type' => 'text', 'analyzer' => 'standard'],
-                    'year' => ['type' => 'keyword'],
-                    'genre' => ['type' => 'text'],
-                    'actors' => ['type' => 'text'],
-                    'director' => ['type' => 'text'],
-                    'rating' => ['type' => 'keyword'],
-                    'plot' => ['type' => 'text'],
-                ],
-            ],
-            'settings' => [
-                'number_of_shards' => 1,
-                'number_of_replicas' => 0,
-            ],
-        ];
-
-        // TV shows index mapping
-        $tvshowsMapping = [
-            'mappings' => [
-                'properties' => [
-                    'title' => ['type' => 'text', 'analyzer' => 'standard'],
-                    'tvdb' => ['type' => 'integer'],
-                    'trakt' => ['type' => 'integer'],
-                    'tvmaze' => ['type' => 'integer'],
-                    'tvrage' => ['type' => 'integer'],
-                    'imdb' => ['type' => 'keyword'],
-                    'tmdb' => ['type' => 'integer'],
-                    'started' => ['type' => 'keyword'],
-                    'type' => ['type' => 'integer'],
-                ],
-            ],
-            'settings' => [
-                'number_of_shards' => 1,
-                'number_of_replicas' => 0,
-            ],
-        ];
+        ['movies' => $moviesMapping, 'tvshows' => $tvshowsMapping] = self::elasticsearchMediaMappings();
 
         try {
             $esConfig = config('search.drivers.elasticsearch');
@@ -328,10 +278,254 @@ class CreateMediaIndexes extends Command
 
             return Command::SUCCESS;
 
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             $this->error('Failed to create Elasticsearch indexes: '.$e->getMessage());
 
             return Command::FAILURE;
         }
+    }
+
+    public static function setUseRustFfi(?bool $useRustFfi): void
+    {
+        self::$useRustFfi = $useRustFfi ?? false;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    public static function setFfiForTesting(FFI|false|null $ffi): void
+    {
+        self::$ffi = $ffi;
+    }
+
+    /**
+     * The configured search driver: Manticore, Elasticsearch, or unsupported (strict comparison).
+     */
+    public static function mediaDriver(mixed $driver): int
+    {
+        return self::$useRustFfi ? self::mediaDriverNative($driver) : self::mediaDriverPhp($driver);
+    }
+
+    public static function mediaDriverPhp(mixed $driver): int
+    {
+        return match ($driver) {
+            'manticore' => self::DRIVER_MANTICORE,
+            'elasticsearch' => self::DRIVER_ELASTICSEARCH,
+            default => self::DRIVER_UNSUPPORTED,
+        };
+    }
+
+    public static function mediaDriverNative(mixed $driver): int
+    {
+        $ffi = self::ffi();
+        if ($ffi === null || ! \is_string($driver)) {
+            return self::mediaDriverPhp($driver);
+        }
+
+        try {
+            $kind = self::callFfi($ffi, 'nntmux_media_driver_kind', $driver, \strlen($driver));
+
+            return match ($kind) {
+                self::DRIVER_MANTICORE, self::DRIVER_ELASTICSEARCH, self::DRIVER_UNSUPPORTED => $kind,
+                default => self::mediaDriverPhp($driver),
+            };
+        } catch (Throwable) {
+            return self::mediaDriverPhp($driver);
+        }
+    }
+
+    /**
+     * Manticore `movies_rt` and `tvshows_rt` table schemas.
+     *
+     * @return array<string, array<string, mixed>>
+     */
+    public static function manticoreMediaSchemas(): array
+    {
+        return self::$useRustFfi ? self::manticoreMediaSchemasNative() : self::manticoreMediaSchemasPhp();
+    }
+
+    /**
+     * @return array<string, array<string, mixed>>
+     */
+    public static function manticoreMediaSchemasPhp(): array
+    {
+        return [
+            'movies_rt' => [
+                'settings' => [
+                    'min_prefix_len' => 0,
+                    'min_infix_len' => 2,
+                ],
+                'columns' => [
+                    'imdbid' => ['type' => 'string'],
+                    'tmdbid' => ['type' => 'integer'],
+                    'traktid' => ['type' => 'integer'],
+                    'title' => ['type' => 'text'],
+                    'year' => ['type' => 'text'],
+                    'genre' => ['type' => 'text'],
+                    'actors' => ['type' => 'text'],
+                    'director' => ['type' => 'text'],
+                    'rating' => ['type' => 'text'],
+                    'plot' => ['type' => 'text'],
+                ],
+            ],
+            'tvshows_rt' => [
+                'settings' => [
+                    'min_prefix_len' => 0,
+                    'min_infix_len' => 2,
+                ],
+                'columns' => [
+                    'title' => ['type' => 'text'],
+                    'tvdb' => ['type' => 'integer'],
+                    'trakt' => ['type' => 'integer'],
+                    'tvmaze' => ['type' => 'integer'],
+                    'tvrage' => ['type' => 'integer'],
+                    'imdb' => ['type' => 'string'],
+                    'tmdb' => ['type' => 'integer'],
+                    'started' => ['type' => 'text'],
+                    'type' => ['type' => 'integer'],
+                ],
+            ],
+        ];
+    }
+
+    /**
+     * @return array<string, array<string, mixed>>
+     */
+    public static function manticoreMediaSchemasNative(): array
+    {
+        return self::nativeSchema(self::SCHEMA_MANTICORE) ?? self::manticoreMediaSchemasPhp();
+    }
+
+    /**
+     * Elasticsearch `movies` and `tvshows` index mappings.
+     *
+     * @return array{movies: array<string, mixed>, tvshows: array<string, mixed>}
+     */
+    public static function elasticsearchMediaMappings(): array
+    {
+        return self::$useRustFfi ? self::elasticsearchMediaMappingsNative() : self::elasticsearchMediaMappingsPhp();
+    }
+
+    /**
+     * @return array{movies: array<string, mixed>, tvshows: array<string, mixed>}
+     */
+    public static function elasticsearchMediaMappingsPhp(): array
+    {
+        return [
+            'movies' => [
+                'mappings' => [
+                    'properties' => [
+                        'imdbid' => ['type' => 'keyword'],
+                        'tmdbid' => ['type' => 'integer'],
+                        'traktid' => ['type' => 'integer'],
+                        'title' => ['type' => 'text', 'analyzer' => 'standard'],
+                        'year' => ['type' => 'keyword'],
+                        'genre' => ['type' => 'text'],
+                        'actors' => ['type' => 'text'],
+                        'director' => ['type' => 'text'],
+                        'rating' => ['type' => 'keyword'],
+                        'plot' => ['type' => 'text'],
+                    ],
+                ],
+                'settings' => [
+                    'number_of_shards' => 1,
+                    'number_of_replicas' => 0,
+                ],
+            ],
+            'tvshows' => [
+                'mappings' => [
+                    'properties' => [
+                        'title' => ['type' => 'text', 'analyzer' => 'standard'],
+                        'tvdb' => ['type' => 'integer'],
+                        'trakt' => ['type' => 'integer'],
+                        'tvmaze' => ['type' => 'integer'],
+                        'tvrage' => ['type' => 'integer'],
+                        'imdb' => ['type' => 'keyword'],
+                        'tmdb' => ['type' => 'integer'],
+                        'started' => ['type' => 'keyword'],
+                        'type' => ['type' => 'integer'],
+                    ],
+                ],
+                'settings' => [
+                    'number_of_shards' => 1,
+                    'number_of_replicas' => 0,
+                ],
+            ],
+        ];
+    }
+
+    /**
+     * @return array{movies: array<string, mixed>, tvshows: array<string, mixed>}
+     */
+    public static function elasticsearchMediaMappingsNative(): array
+    {
+        $mappings = self::nativeSchema(self::SCHEMA_ELASTICSEARCH);
+        if ($mappings === null || ! isset($mappings['movies'], $mappings['tvshows']) || \count($mappings) !== 2) {
+            return self::elasticsearchMediaMappingsPhp();
+        }
+
+        return ['movies' => $mappings['movies'], 'tvshows' => $mappings['tvshows']];
+    }
+
+    /**
+     * Decode a Rust-built schema JSON object, or null when unavailable or malformed.
+     *
+     * @return array<string, array<string, mixed>>|null
+     */
+    private static function nativeSchema(int $kind): ?array
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+
+        try {
+            $capacity = 0;
+            $out = RustPipelineLibrary::obtainScratch($ffi, 2048, $capacity);
+            if ($out === null) {
+                return null;
+            }
+            $written = self::callFfi($ffi, 'nntmux_media_index_schema', $kind, $out, $capacity);
+            if (! \is_int($written) || $written <= 0 || $written > $capacity) {
+                return null;
+            }
+            $decoded = json_decode(FFI::string($out, $written), true, 16, JSON_THROW_ON_ERROR);
+            if (! \is_array($decoded)) {
+                return null;
+            }
+            foreach ($decoded as $name => $schema) {
+                if (! \is_string($name) || ! \is_array($schema)) {
+                    return null;
+                }
+            }
+
+            /** @var array<string, array<string, mixed>> $decoded */
+            return $decoded;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private static function callFfi(FFI $ffi, string $symbol, mixed ...$args): mixed
+    {
+        return $ffi->$symbol(...$args);
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (self::$ffi === false) {
+            return null;
+        }
+
+        if (self::$ffi instanceof FFI) {
+            return self::$ffi;
+        }
+
+        $ffi = RustPipelineLibrary::resolveDomain('search', self::FFI_CDEF);
+        self::$ffi = $ffi ?? false;
+
+        return $ffi;
     }
 }
