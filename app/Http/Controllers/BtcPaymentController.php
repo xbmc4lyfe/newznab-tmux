@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Http\Controllers;
 
+use App\Http\Controllers\Admin\AdminPaymentController;
 use App\Models\Payment;
 use App\Models\User;
 use App\Services\AdminDashboardSnapshotService;
@@ -14,13 +15,104 @@ use Illuminate\Support\Facades\Log;
 
 class BtcPaymentController extends BasePageController
 {
+    // PHP remains the default unless every common and uncommon workload passes the 1.5x gate.
+    private static bool $useRustFfi = false;
+
+    public static function setUseRustFfi(?bool $useRustFfi): void
+    {
+        self::$useRustFfi = $useRustFfi ?? false;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    public static function verifyWebhookSignature(string $body, string $secret, ?string $signature): bool
+    {
+        return self::$useRustFfi ? self::verifyWebhookSignatureNative($body, $secret, $signature) : self::verifyWebhookSignaturePhp($body, $secret, $signature);
+    }
+
+    public static function verifyWebhookSignaturePhp(string $body, string $secret, ?string $signature): bool
+    {
+        return $signature !== null && hash_equals('sha256='.hash_hmac('sha256', $body, $secret), $signature);
+    }
+
+    public static function verifyWebhookSignatureNative(string $body, string $secret, ?string $signature): bool
+    {
+        $result = AdminPaymentController::transformNative(12, [$body, $secret, $signature]);
+
+        return is_bool($result) ? $result : self::verifyWebhookSignaturePhp($body, $secret, $signature);
+    }
+
+    /**
+     * @return list<string>
+     */
+    public static function fallbackEmails(string $email): array
+    {
+        return self::$useRustFfi ? self::fallbackEmailsNative($email) : self::fallbackEmailsPhp($email);
+    }
+
+    /**
+     * @return list<string>
+     */
+    public static function fallbackEmailsPhp(string $email): array
+    {
+        if (! str_ends_with($email, '@pm.me')) {
+            return [];
+        }
+
+        $local = substr($email, 0, -6);
+
+        return [$local.'@proton.me', $local.'@protonmail.com'];
+    }
+
+    /**
+     * @return list<string>
+     */
+    public static function fallbackEmailsNative(string $email): array
+    {
+        $result = AdminPaymentController::transformNative(13, [$email]);
+
+        return is_array($result) ? $result : self::fallbackEmailsPhp($email);
+    }
+
+    /**
+     * @return array{role: string, addYears: ?int}
+     */
+    public static function parseItemDescription(string $description): array
+    {
+        return self::$useRustFfi ? self::parseItemDescriptionNative($description) : self::parseItemDescriptionPhp($description);
+    }
+
+    /**
+     * @return array{role: string, addYears: ?int}
+     */
+    public static function parseItemDescriptionPhp(string $description): array
+    {
+        if (preg_match('/(?P<role>\w+(\s\+\+)?)[\s]+(?P<addYears>\d+)/i', $description, $matches)) {
+            return ['role' => $matches['role'], 'addYears' => (int) $matches['addYears']];
+        }
+
+        return ['role' => $description, 'addYears' => null];
+    }
+
+    /**
+     * @return array{role: string, addYears: ?int}
+     */
+    public static function parseItemDescriptionNative(string $description): array
+    {
+        $result = AdminPaymentController::transformNative(14, [$description]);
+
+        return is_array($result) && isset($result['role']) && array_key_exists('addYears', $result) ? $result : self::parseItemDescriptionPhp($description);
+    }
+
     /**
      * BtcPay callback.
      */
     public function btcPayCallback(Request $request): Response
     {
-        $hashCheck = 'sha256='.hash_hmac('sha256', $request->getContent(), config('nntmux.btcpay_webhook_secret'));
-        if ($hashCheck !== $request->header('btcpay-sig')) {
+        if (! self::verifyWebhookSignature($request->getContent(), (string) config('nntmux.btcpay_webhook_secret'), $request->header('btcpay-sig'))) {
             Log::channel('btc_payment')->error('BTCPay webhook hash check failed: '.$request->header('btcpay-sig'));
 
             return response('Not Found', 404);
@@ -69,24 +161,18 @@ class BtcPaymentController extends BasePageController
             if ($checkOrder !== null) {
                 $user = User::query()->where('email', '=', $checkOrder->email)->first();
 
-                // If user not found and email ends with pm.me, try proton.me and protonmail.com
-                if (! $user && str_ends_with($checkOrder->email, '@pm.me')) {
-                    $emailLocalPart = substr($checkOrder->email, 0, -6); // Remove @pm.me
-                    $user = User::query()->where('email', '=', $emailLocalPart.'@proton.me')->first();
-                    if (! $user) {
-                        $user = User::query()->where('email', '=', $emailLocalPart.'@protonmail.com')->first();
+                if (! $user) {
+                    foreach (self::fallbackEmails($checkOrder->email) as $email) {
+                        $user = User::query()->where('email', '=', $email)->first();
+                        if ($user) {
+                            break;
+                        }
                     }
                 }
                 if ($user) {
-                    // Extract role name and addYears from item_description using regex
-                    // Matches patterns like "User 1", "Admin ++ 2", "Friend 3"
-                    if (preg_match('/(?P<role>\w+(\s\+\+)?)[\s]+(?P<addYears>\d+)/i', $checkOrder->item_description, $matches)) {
-                        $roleName = $matches['role'];
-                        $addYears = (int) $matches['addYears'];
-                    } else {
-                        $roleName = $checkOrder->item_description;
-                        $addYears = null;
-                    }
+                    $description = self::parseItemDescription($checkOrder->item_description);
+                    $roleName = $description['role'];
+                    $addYears = $description['addYears'];
 
                     User::updateUserRole($user->id, $roleName, addYears: $addYears);
                     $checkOrder->update(['invoice_status' => Payment::INVOICE_STATUS_SETTLED]);
@@ -114,31 +200,54 @@ class BtcPaymentController extends BasePageController
     }
 
     /**
-     * Payment.status values from BTCPay Greenfield API (payload.payment.status). Used for admin filters.
-     *
      * @return list<string>
      */
     public static function paymentStatusesForAdminFilter(): array
     {
-        return [
-            'Pending',
-            'Processing',
-            Payment::PAYMENT_STATUS_SETTLED,
-            'Invalid',
-            'Manual',
-        ];
+        return self::$useRustFfi ? self::paymentStatusesForAdminFilterNative() : self::paymentStatusesForAdminFilterPhp();
     }
 
     /**
-     * invoice_status values used in our DB (migration default Pending; webhook sets Settled after role upgrade).
-     *
+     * @return list<string>
+     */
+    public static function paymentStatusesForAdminFilterPhp(): array
+    {
+        return ['Pending', 'Processing', Payment::PAYMENT_STATUS_SETTLED, 'Invalid', 'Manual'];
+    }
+
+    /**
+     * @return list<string>
+     */
+    public static function paymentStatusesForAdminFilterNative(): array
+    {
+        $result = AdminPaymentController::transformNative(15, []);
+
+        return is_array($result) ? $result : self::paymentStatusesForAdminFilterPhp();
+    }
+
+    /**
      * @return list<string>
      */
     public static function invoiceStatusesForAdminFilter(): array
     {
-        return [
-            Payment::INVOICE_STATUS_PENDING,
-            Payment::INVOICE_STATUS_SETTLED,
-        ];
+        return self::$useRustFfi ? self::invoiceStatusesForAdminFilterNative() : self::invoiceStatusesForAdminFilterPhp();
+    }
+
+    /**
+     * @return list<string>
+     */
+    public static function invoiceStatusesForAdminFilterPhp(): array
+    {
+        return [Payment::INVOICE_STATUS_PENDING, Payment::INVOICE_STATUS_SETTLED];
+    }
+
+    /**
+     * @return list<string>
+     */
+    public static function invoiceStatusesForAdminFilterNative(): array
+    {
+        $result = AdminPaymentController::transformNative(16, []);
+
+        return is_array($result) ? $result : self::invoiceStatusesForAdminFilterPhp();
     }
 }

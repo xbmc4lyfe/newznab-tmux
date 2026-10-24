@@ -19,6 +19,54 @@ use Illuminate\View\View;
 
 class AdminStatusController extends BasePageController
 {
+    // Keep PHP as the production default until the Rust performance gate passes.
+    private static bool $useRustFfi = false;
+
+    public static function setUseRustFfi(?bool $useRustFfi): void
+    {
+        self::$useRustFfi = $useRustFfi ?? false;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    /**
+     * @param  array<string, mixed>  $data
+     * @return array<string, mixed>
+     */
+    public static function normalizeIncident(array $data, string $now, bool $updating = false): array
+    {
+        return self::$useRustFfi ? self::normalizeIncidentNative($data, $now, $updating) : self::normalizeIncidentPhp($data, $now, $updating);
+    }
+
+    /**
+     * @param  array<string, mixed>  $data
+     * @return array<string, mixed>
+     */
+    public static function normalizeIncidentPhp(array $data, string $now, bool $updating = false): array
+    {
+        if (($data['status'] ?? null) === IncidentStatusEnum::Resolved->value) {
+            $data['resolved_at'] = $updating && empty($data['resolved_at']) ? $now : ($data['resolved_at'] ?? $now);
+        } elseif ($updating) {
+            $data['resolved_at'] = null;
+        }
+
+        return $data;
+    }
+
+    /**
+     * @param  array<string, mixed>  $data
+     * @return array<string, mixed>
+     */
+    public static function normalizeIncidentNative(array $data, string $now, bool $updating = false): array
+    {
+        $result = AdminPaymentController::transformNative(4, [$data, $now, $updating]);
+
+        return is_array($result) ? $result : self::normalizeIncidentPhp($data, $now, $updating);
+    }
+
     public function __construct(
         protected SiteStatusService $siteStatusService
     ) {
@@ -72,9 +120,7 @@ class AdminStatusController extends BasePageController
         $data = $request->validated();
         $data['created_by'] = Auth::id();
 
-        if ($data['status'] === IncidentStatusEnum::Resolved->value) {
-            $data['resolved_at'] = $data['resolved_at'] ?? now()->toDateTimeString();
-        }
+        $data = self::normalizeIncident($data, now()->toDateTimeString());
 
         $this->siteStatusService->createIncident($data);
 
@@ -106,13 +152,7 @@ class AdminStatusController extends BasePageController
     {
         $data = $request->validated();
 
-        if (($data['status'] ?? null) === IncidentStatusEnum::Resolved->value && empty($data['resolved_at'])) {
-            $data['resolved_at'] = now()->toDateTimeString();
-        }
-
-        if (($data['status'] ?? null) !== IncidentStatusEnum::Resolved->value) {
-            $data['resolved_at'] = null;
-        }
+        $data = self::normalizeIncident($data, now()->toDateTimeString(), true);
 
         $this->siteStatusService->updateIncident($incident, $data);
 
