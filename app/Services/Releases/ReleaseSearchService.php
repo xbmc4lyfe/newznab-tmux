@@ -14,17 +14,36 @@ use App\Services\Configuration\ConfigurationProvider;
 use App\Services\Search\DTO\ReleaseSearchQuery;
 use App\Services\Search\DTO\SearchCursor;
 use App\Support\ReleaseSearchIndexDocument;
+use App\Support\RustPipelineLibrary;
+use FFI;
+use FFI\CData;
 use Illuminate\Database\Eloquent\Collection;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
+use Throwable;
 
 /**
  * Service for searching releases.
  */
 class ReleaseSearchService
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_search_normalize_mysql_fallback_phrase(const char *input_ptr, size_t input_len, char *out_buf, size_t out_cap);
+        ssize_t nntmux_search_build_range_sql_conditions(int64_t size_min, int64_t size_max, int64_t totalpart_min, int64_t totalpart_max, int64_t grabs_min, int64_t grabs_max, int64_t comments_min, int64_t comments_max, int64_t adddate_min, int64_t adddate_max, char *out_buf, size_t out_cap);
+        ssize_t nntmux_search_build_episode_join_predicates(const char *series_ptr, size_t series_len, const char *episode_ptr, size_t episode_len, const char *airdate_ptr, size_t airdate_len, char *out_buf, size_t out_cap);
+        int32_t nntmux_search_resolve_size_range_bounds(int64_t size_from, int64_t size_to, int64_t *out_bounds2);
+        C;
+
+    private static FFI|false|null $ffi = null;
+
+    private static ?CData $outBuf512 = null;
+
+    private static ?CData $outBounds2 = null;
+
+    private static bool $useRustFfi = true;
+
     private const CACHE_VERSION_KEY = 'releases:cache_version';
 
     private const SEARCH_INDEX_BUFFER_PAGES = 10;
@@ -39,6 +58,16 @@ class ReleaseSearchService
     public const PASSWD_RAR = 1;
 
     public function __construct() {}
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
 
     /**
      * Function for searching on the site (by subject, searchname or advanced).
@@ -485,10 +514,197 @@ class ReleaseSearchService
     }
 
     /**
-     * @param  array<string, array<string, int>>  $ranges
+     * @param  array<string, mixed>  $ranges
      * @return list<string>
      */
-    private function buildRangeSqlConditions(array $ranges): array
+    public function buildRangeSqlConditions(array $ranges): array
+    {
+        if (self::$useRustFfi) {
+            $native = $this->buildRangeSqlConditionsNative($ranges);
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
+        return $this->buildRangeSqlConditionsPhp($ranges);
+    }
+
+    /**
+     * @param  array<string, mixed>  $ranges
+     * @return list<string>|null
+     */
+    public function buildRangeSqlConditionsNative(array $ranges): ?array
+    {
+        if (! self::$useRustFfi) {
+            return null;
+        }
+        if ($ranges === []) {
+            return [];
+        }
+
+        $ffi = self::$ffi ?? self::resolveFfi();
+        $buf = self::$outBuf512;
+        if ($ffi === null || $ffi === false || $buf === null) {
+            return null;
+        }
+
+        $sMin = -1;
+        $sMax = -1;
+        if (\is_array($sArr = $ranges['size'] ?? null)) {
+            if (\is_int($v = $sArr['min'] ?? null)) {
+                $sMin = $v >= 0 ? $v : -1;
+            } elseif (\is_string($v)) {
+                $sMin = (\ctype_digit($v) && ($v === '0' || ($v[0] !== '0' && \strlen($v) < 19)))
+                    ? (int) $v
+                    : (ReleaseSearchQuery::normalizeRangeBound($v) ?? -1);
+            }
+            if (\is_int($v = $sArr['max'] ?? null)) {
+                $sMax = $v >= 0 ? $v : -1;
+            } elseif (\is_string($v)) {
+                $sMax = (\ctype_digit($v) && ($v === '0' || ($v[0] !== '0' && \strlen($v) < 19)))
+                    ? (int) $v
+                    : (ReleaseSearchQuery::normalizeRangeBound($v) ?? -1);
+            }
+        }
+
+        $tMin = -1;
+        $tMax = -1;
+        if (\is_array($tArr = $ranges['totalpart'] ?? null)) {
+            if (\is_int($v = $tArr['min'] ?? null)) {
+                $tMin = $v >= 0 ? $v : -1;
+            } elseif (\is_string($v)) {
+                $tMin = (\ctype_digit($v) && ($v === '0' || ($v[0] !== '0' && \strlen($v) < 19)))
+                    ? (int) $v
+                    : (ReleaseSearchQuery::normalizeRangeBound($v) ?? -1);
+            }
+            if (\is_int($v = $tArr['max'] ?? null)) {
+                $tMax = $v >= 0 ? $v : -1;
+            } elseif (\is_string($v)) {
+                $tMax = (\ctype_digit($v) && ($v === '0' || ($v[0] !== '0' && \strlen($v) < 19)))
+                    ? (int) $v
+                    : (ReleaseSearchQuery::normalizeRangeBound($v) ?? -1);
+            }
+        }
+
+        $gMin = -1;
+        $gMax = -1;
+        if (\is_array($gArr = $ranges['grabs'] ?? null)) {
+            if (\is_int($v = $gArr['min'] ?? null)) {
+                $gMin = $v >= 0 ? $v : -1;
+            } elseif (\is_string($v)) {
+                $gMin = (\ctype_digit($v) && ($v === '0' || ($v[0] !== '0' && \strlen($v) < 19)))
+                    ? (int) $v
+                    : (ReleaseSearchQuery::normalizeRangeBound($v) ?? -1);
+            }
+            if (\is_int($v = $gArr['max'] ?? null)) {
+                $gMax = $v >= 0 ? $v : -1;
+            } elseif (\is_string($v)) {
+                $gMax = (\ctype_digit($v) && ($v === '0' || ($v[0] !== '0' && \strlen($v) < 19)))
+                    ? (int) $v
+                    : (ReleaseSearchQuery::normalizeRangeBound($v) ?? -1);
+            }
+        }
+
+        $cMin = -1;
+        $cMax = -1;
+        if (\is_array($cArr = $ranges['comments'] ?? null)) {
+            if (\is_int($v = $cArr['min'] ?? null)) {
+                $cMin = $v >= 0 ? $v : -1;
+            } elseif (\is_string($v)) {
+                $cMin = (\ctype_digit($v) && ($v === '0' || ($v[0] !== '0' && \strlen($v) < 19)))
+                    ? (int) $v
+                    : (ReleaseSearchQuery::normalizeRangeBound($v) ?? -1);
+            }
+            if (\is_int($v = $cArr['max'] ?? null)) {
+                $cMax = $v >= 0 ? $v : -1;
+            } elseif (\is_string($v)) {
+                $cMax = (\ctype_digit($v) && ($v === '0' || ($v[0] !== '0' && \strlen($v) < 19)))
+                    ? (int) $v
+                    : (ReleaseSearchQuery::normalizeRangeBound($v) ?? -1);
+            }
+        }
+
+        $aMin = -1;
+        $aMax = -1;
+        if (\is_array($aArr = $ranges['adddate_ts'] ?? null)) {
+            if (\is_int($v = $aArr['min'] ?? null)) {
+                $aMin = $v >= 0 ? $v : -1;
+            } elseif (\is_string($v)) {
+                $aMin = (\ctype_digit($v) && ($v === '0' || ($v[0] !== '0' && \strlen($v) < 19)))
+                    ? (int) $v
+                    : (ReleaseSearchQuery::normalizeRangeBound($v) ?? -1);
+            }
+            if (\is_int($v = $aArr['max'] ?? null)) {
+                $aMax = $v >= 0 ? $v : -1;
+            } elseif (\is_string($v)) {
+                $aMax = (\ctype_digit($v) && ($v === '0' || ($v[0] !== '0' && \strlen($v) < 19)))
+                    ? (int) $v
+                    : (ReleaseSearchQuery::normalizeRangeBound($v) ?? -1);
+            }
+        }
+
+        if (($sMin & $sMax & $tMin & $tMax & $gMin & $gMax & $cMin & $cMax & $aMin & $aMax) === -1) {
+            return [];
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_search_build_range_sql_conditions(
+                $sMin,
+                $sMax,
+                $tMin,
+                $tMax,
+                $gMin,
+                $gMax,
+                $cMin,
+                $cMax,
+                $aMin,
+                $aMax,
+                $buf,
+                512,
+            );
+            if (! \is_int($written) || $written === -1 || $written === -2) {
+                return null;
+            }
+            if ($written < -2) {
+                $cap = 0;
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_search_build_range_sql_conditions(
+                    $sMin,
+                    $sMax,
+                    $tMin,
+                    $tMax,
+                    $gMin,
+                    $gMax,
+                    $cMin,
+                    $cMax,
+                    $aMin,
+                    $aMax,
+                    $scratch,
+                    $cap,
+                );
+                if (! \is_int($written) || $written < 0) {
+                    return null;
+                }
+
+                return $written === 0 ? [] : \explode("\n", FFI::string($scratch, $written));
+            }
+
+            return $written === 0 ? [] : \explode("\n", FFI::string($buf, $written));
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * @param  array<string, mixed>  $ranges
+     * @return list<string>
+     */
+    public function buildRangeSqlConditionsPhp(array $ranges): array
     {
         $conditions = [];
         foreach (ReleaseSearchQuery::normalizeRanges($ranges) as $field => $bounds) {
@@ -1735,9 +1951,88 @@ class ReleaseSearchService
      * SQL predicates on tv_episodes (alias tve) for season / episode / airdate, matching
      * newznab-style tvsearch parameters. Empty array means no narrowing.
      *
+     * Retains native PHP in production under the < 1.5x FFI threshold (`0.92x` mean / `0.86x` p99
+     * on season+episode and `0.62x` mean / `0.67x` p99 on season-only due to `FFI::string` + `explode`
+     * allocation overhead on 1-2 short predicates); see `buildEpisodeJoinPredicatesNative`.
+     *
      * @return list<string>
      */
-    private function buildEpisodeJoinPredicates(string $series, string $episode, string $airDate): array
+    public function buildEpisodeJoinPredicates(string $series, string $episode, string $airDate): array
+    {
+        return $this->buildEpisodeJoinPredicatesPhp($series, $episode, $airDate);
+    }
+
+    /**
+     * @return list<string>|null
+     */
+    public function buildEpisodeJoinPredicatesNative(string $series, string $episode, string $airDate): ?array
+    {
+        if (! self::$useRustFfi) {
+            return null;
+        }
+        if (($series === '' || $series === '0') && ($airDate === '' || $airDate === '0')) {
+            return [];
+        }
+
+        $ffi = self::$ffi ?? self::resolveFfi();
+        $buf = self::$outBuf512;
+        if ($ffi === null || $ffi === false || $buf === null) {
+            return null;
+        }
+
+        $sLen = \strlen($series);
+        $eLen = \strlen($episode);
+        $aLen = \strlen($airDate);
+
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_search_build_episode_join_predicates(
+                $series,
+                $sLen,
+                $episode,
+                $eLen,
+                $airDate,
+                $aLen,
+                $buf,
+                512,
+            );
+            if (! \is_int($written) || $written === -1 || $written === -2) {
+                return null;
+            }
+            if ($written < -2) {
+                $cap = 0;
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_search_build_episode_join_predicates(
+                    $series,
+                    $sLen,
+                    $episode,
+                    $eLen,
+                    $airDate,
+                    $aLen,
+                    $scratch,
+                    $cap,
+                );
+                if (! \is_int($written) || $written < 0) {
+                    return null;
+                }
+
+                return $written === 0 ? [] : \explode("\n", FFI::string($scratch, $written));
+            }
+
+            return $written === 0 ? [] : \explode("\n", FFI::string($buf, $written));
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * @return list<string>
+     */
+    public function buildEpisodeJoinPredicatesPhp(string $series, string $episode, string $airDate): array
     {
         $predicates = [];
         if (! empty($series) && (int) $series < 1900) {
@@ -1956,7 +2251,7 @@ class ReleaseSearchService
             }
 
             return $results;
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             Log::error('performMySQLSearch: MySQL fallback failed', [
                 'error' => $e->getMessage(),
             ]);
@@ -1965,7 +2260,75 @@ class ReleaseSearchService
         }
     }
 
-    private function normalizeMysqlFallbackPhrase(string $value): string
+    public function normalizeMysqlFallbackPhrase(string $value): string
+    {
+        if (self::$useRustFfi) {
+            $len = \strlen($value);
+            if ($len === 0) {
+                return '';
+            }
+            $ffi = self::$ffi ?? self::resolveFfi();
+            $buf = self::$outBuf512;
+            if ($ffi !== null && $ffi !== false && $buf !== null && $len <= 512) {
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_search_normalize_mysql_fallback_phrase($value, $len, $buf, 512);
+                if (\is_int($written) && $written >= 0) {
+                    return $written === 0 ? '' : FFI::string($buf, $written);
+                }
+            }
+            $native = $this->normalizeMysqlFallbackPhraseNative($value);
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
+        return $this->normalizeMysqlFallbackPhrasePhp($value);
+    }
+
+    public function normalizeMysqlFallbackPhraseNative(string $value): ?string
+    {
+        if (! self::$useRustFfi) {
+            return null;
+        }
+        $len = \strlen($value);
+        if ($len === 0) {
+            return '';
+        }
+
+        $ffi = self::$ffi ?? self::resolveFfi();
+        $buf = self::$outBuf512;
+        if ($ffi === null || $ffi === false || $buf === null) {
+            return null;
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_search_normalize_mysql_fallback_phrase($value, $len, $buf, 512);
+            if (! \is_int($written) || $written === -1) {
+                return null;
+            }
+            if ($written < -1) {
+                $cap = 0;
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_search_normalize_mysql_fallback_phrase($value, $len, $scratch, $cap);
+                if (! \is_int($written) || $written < 0) {
+                    return null;
+                }
+
+                return $written === 0 ? '' : FFI::string($scratch, $written);
+            }
+
+            return $written === 0 ? '' : FFI::string($buf, $written);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    public function normalizeMysqlFallbackPhrasePhp(string $value): string
     {
         $normalized = strtolower(trim($value));
         $normalized = str_replace(['.', '-', '_'], ' ', $normalized);
@@ -2105,9 +2468,50 @@ class ReleaseSearchService
     /**
      * Resolve UI size bucket inputs into byte bounds used by SQL/index filters.
      *
+     * Retains native PHP in production under the < 1.5x FFI threshold (`0.51x` mean / `0.50x` p99
+     * due to single-call FFI boundary overhead versus a 2-key PHP array lookup); see `resolveSizeRangeBoundsNative`.
+     *
      * @return array{0:int,1:int}
      */
-    private function resolveSizeRangeBounds(mixed $sizeFrom, mixed $sizeTo): array
+    public function resolveSizeRangeBounds(mixed $sizeFrom, mixed $sizeTo): array
+    {
+        return $this->resolveSizeRangeBoundsPhp($sizeFrom, $sizeTo);
+    }
+
+    /**
+     * @return array{0:int,1:int}|null
+     */
+    public function resolveSizeRangeBoundsNative(mixed $sizeFrom, mixed $sizeTo): ?array
+    {
+        if (! self::$useRustFfi) {
+            return null;
+        }
+        $ffi = self::$ffi ?? self::resolveFfi();
+        $out = self::$outBounds2;
+        if ($ffi === null || $ffi === false || $out === null) {
+            return null;
+        }
+
+        $fromKey = self::normalizeSizeBucketKey($sizeFrom);
+        $toKey = self::normalizeSizeBucketKey($sizeTo);
+
+        try {
+            // @phpstan-ignore method.notFound
+            $rc = $ffi->nntmux_search_resolve_size_range_bounds($fromKey, $toKey, $out);
+            if ($rc !== 0) {
+                return null;
+            }
+
+            return [(int) $out[0], (int) $out[1]];
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * @return array{0:int,1:int}
+     */
+    public function resolveSizeRangeBoundsPhp(mixed $sizeFrom, mixed $sizeTo): array
     {
         $sizeRange = [
             1 => 1,
@@ -2125,14 +2529,54 @@ class ReleaseSearchService
 
         $sizeMin = 0;
         $sizeMax = 0;
-        if (array_key_exists($sizeFrom, $sizeRange)) {
-            $sizeMin = 104857600 * (int) $sizeRange[$sizeFrom];
+        if (\is_int($sizeFrom) || \is_string($sizeFrom)) {
+            if (array_key_exists($sizeFrom, $sizeRange)) {
+                $sizeMin = 104857600 * (int) $sizeRange[$sizeFrom];
+            }
         }
-        if (array_key_exists($sizeTo, $sizeRange)) {
-            $sizeMax = 104857600 * (int) $sizeRange[$sizeTo];
+        if (\is_int($sizeTo) || \is_string($sizeTo)) {
+            if (array_key_exists($sizeTo, $sizeRange)) {
+                $sizeMax = 104857600 * (int) $sizeRange[$sizeTo];
+            }
         }
 
         return [$sizeMin, $sizeMax];
+    }
+
+    private static function normalizeSizeBucketKey(mixed $bucket): int
+    {
+        if (\is_int($bucket)) {
+            return $bucket;
+        }
+        if (\is_string($bucket) && $bucket !== '' && $bucket[0] !== '0' && \ctype_digit($bucket)) {
+            return (int) $bucket;
+        }
+
+        return -1;
+    }
+
+    private static function resolveFfi(): ?FFI
+    {
+        if (self::$ffi !== null) {
+            return self::$ffi === false ? null : self::$ffi;
+        }
+        $ffi = RustPipelineLibrary::resolveDomain('release_search_service', self::FFI_CDEF);
+        if ($ffi === null) {
+            self::$ffi = false;
+
+            return null;
+        }
+        try {
+            self::$outBuf512 = $ffi->new('char[512]');
+            self::$outBounds2 = $ffi->new('int64_t[2]');
+            self::$ffi = $ffi;
+
+            return $ffi;
+        } catch (Throwable) {
+            self::$ffi = false;
+
+            return null;
+        }
     }
 
     /**

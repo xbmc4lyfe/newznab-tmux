@@ -3853,6 +3853,884 @@ pub unsafe extern "C" fn nntmux_constrained_predb_suggest_batch(
     if ranked[0].complete_match { 5 } else { 6 }
 }
 
+// ---------------------------------------------------------------------------
+// Wave 9 Slice 9.6: API XML CDATA, ReleaseSearchService SQL Builders, and
+// ManticoreSchemaInspector FFI Exports
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn push_u64_decimal(cur: &mut OutCursor, mut n: u64) {
+    if n == 0 {
+        cur.push_byte(b'0');
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut i = 20usize;
+    while n > 0 {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    cur.push_slice(&buf[i..]);
+}
+
+#[inline]
+fn push_i64_decimal(cur: &mut OutCursor, n: i64) {
+    if n < 0 {
+        cur.push_byte(b'-');
+        push_u64_decimal(cur, n.unsigned_abs());
+    } else {
+        push_u64_decimal(cur, n as u64);
+    }
+}
+
+#[inline]
+fn gmdate_ymd_hms_bytes(ts: i64) -> Option<[u8; 19]> {
+    if !(0..=MAX_RFC2822_TS_UTC).contains(&ts) {
+        return None;
+    }
+    let days = ts / 86_400;
+    let sod = (ts % 86_400) as u32;
+    let (year, month, day) = civil_from_days(days);
+    if !(0..=9999).contains(&year) {
+        return None;
+    }
+    let y = year as u32;
+    let hour = sod / 3_600;
+    let rem = sod % 3_600;
+    let min = rem / 60;
+    let sec = rem % 60;
+    Some([
+        b'0' + ((y / 1000) % 10) as u8,
+        b'0' + ((y / 100) % 10) as u8,
+        b'0' + ((y / 10) % 10) as u8,
+        b'0' + (y % 10) as u8,
+        b'-',
+        b'0' + (month / 10) as u8,
+        b'0' + (month % 10) as u8,
+        b'-',
+        b'0' + (day / 10) as u8,
+        b'0' + (day % 10) as u8,
+        b' ',
+        b'0' + (hour / 10) as u8,
+        b'0' + (hour % 10) as u8,
+        b':',
+        b'0' + (min / 10) as u8,
+        b'0' + (min % 10) as u8,
+        b':',
+        b'0' + (sec / 10) as u8,
+        b'0' + (sec % 10) as u8,
+    ])
+}
+
+/// Parses a PHP `(int) $string` cast for normal integer strings, returning `None` when
+/// scientific/float suffixes or `> 18` significant digits require declining to PHP.
+#[inline]
+fn php_cast_str_to_i64(s: &[u8]) -> Option<i64> {
+    let mut i = 0usize;
+    while i < s.len() && is_ascii_ws(s[i]) {
+        i += 1;
+    }
+    if i >= s.len() {
+        return Some(0);
+    }
+    let mut neg = false;
+    if s[i] == b'-' {
+        neg = true;
+        i += 1;
+    } else if s[i] == b'+' {
+        i += 1;
+    }
+    if i >= s.len() || !s[i].is_ascii_digit() {
+        return Some(0);
+    }
+    while i < s.len() && s[i] == b'0' {
+        i += 1;
+    }
+    let start = i;
+    while i < s.len() && s[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i < s.len() && matches!(s[i], b'.' | b'e' | b'E') {
+        return None;
+    }
+    let digits = &s[start..i];
+    if digits.is_empty() {
+        return Some(0);
+    }
+    if digits.len() > 18 {
+        return None;
+    }
+    let mut acc: i64 = 0;
+    for &b in digits {
+        acc = acc * 10 + i64::from(b - b'0');
+    }
+    Some(if neg { -acc } else { acc })
+}
+
+#[inline]
+fn size_bucket_bytes(bucket: i64) -> i64 {
+    const MULTIPLIERS: [i64; 12] = [0, 1, 2, 5, 10, 20, 30, 40, 80, 160, 320, 640];
+    if (1..=11).contains(&bucket) {
+        104_857_600 * MULTIPLIERS[bucket as usize]
+    } else {
+        0
+    }
+}
+
+#[inline]
+fn ascii_contains_ignore_case_any(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    let first = needle[0].to_ascii_lowercase();
+    let max_i = haystack.len() - needle.len();
+    for i in 0..=max_i {
+        if haystack[i].to_ascii_lowercase() == first
+            && haystack[i..i + needle.len()].eq_ignore_ascii_case(needle)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[inline]
+fn is_mysql_phrase_trim_or_sep(b: u8) -> bool {
+    matches!(
+        b,
+        b' ' | b'\t' | b'\n' | b'\r' | 0x00 | 0x0B | 0x0C | b'.' | b'-' | b'_'
+    )
+}
+
+const MYSQL_PHRASE_TABLE: [u8; 256] = {
+    let mut table = [0u8; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let b = i as u8;
+        table[i] = match b {
+            b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C | b'.' | b'-' | b'_' => b' ',
+            b'A'..=b'Z' => b + 32,
+            _ => b,
+        };
+        i += 1;
+    }
+    table
+};
+
+/// Accelerates `XML_Response::buildCdata` across `pair_count` NUL-separated `(col, value)` pairs.
+/// Returns `>= 0` written bytes, `-1` on null/malformed packing, `-2` when `mu_releasedate`
+/// requires PHP `strtotime`/`date` fallback, or `< -2` when `out_cap` is too small.
+///
+/// # Safety
+///
+/// `pairs_nul` must be valid for reads of `pairs_len` bytes when non-null and `pairs_len > 0`.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_api_build_cdata(
+    pairs_nul: *const u8,
+    pairs_len: usize,
+    pair_count: usize,
+    tz_is_utc: u32,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if pairs_len > 0 && pairs_nul.is_null() {
+        return -1;
+    }
+    if pair_count == 0 {
+        return if pairs_len == 0 { 0 } else { -1 };
+    }
+    if pairs_nul.is_null() {
+        return -1;
+    }
+    let slice = if pairs_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(pairs_nul, pairs_len) }
+    };
+    let mut iter = slice.split(|&b| b == 0);
+    let mut cur = OutCursor::new(out_buf, out_cap);
+    for _ in 0..pair_count {
+        let Some(col) = iter.next() else {
+            return -1;
+        };
+        let Some(val) = iter.next() else {
+            return -1;
+        };
+        if col.is_empty() || val.is_empty() || val == b"0" {
+            continue;
+        }
+        if col == b"mu_releasedate" {
+            if tz_is_utc == 0 {
+                return -2;
+            }
+            let trimmed = trim_php_ws(val);
+            if trimmed.len() < 10 {
+                return -2;
+            }
+            let ts = unsafe { nntmux_datetime_to_unix_utc(val.as_ptr(), val.len()) };
+            if ts == i64::MIN {
+                return -2;
+            }
+            cur.push_slice(b"<li>Released: ");
+            cur.push_slice(&trimmed[..10]);
+            cur.push_slice(b"</li>\n");
+        } else {
+            let stripped = if col.len() >= 3
+                && col[0].is_ascii_alphabetic()
+                && col[1].is_ascii_alphabetic()
+                && col[2] == b'_'
+            {
+                &col[3..]
+            } else {
+                col
+            };
+            cur.push_slice(b"<li>");
+            if let Some((&first, tail)) = stripped.split_first() {
+                cur.push_byte(first.to_ascii_uppercase());
+                cur.push_slice(tail);
+            }
+            cur.push_slice(b": ");
+            cur.push_slice(val);
+            cur.push_slice(b"</li>\n");
+        }
+    }
+    if iter.next().is_some() {
+        return -1;
+    }
+    cur.finish()
+}
+
+/// Accelerates `ReleaseSearchService::normalizeMysqlFallbackPhrase(string $value)`.
+///
+/// # Safety
+///
+/// `input_ptr` must be valid for reads of `input_len` bytes when non-null and `input_len > 0`.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_search_normalize_mysql_fallback_phrase(
+    input_ptr: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if input_len == 0 {
+        return 0;
+    }
+    if input_ptr.is_null() {
+        return -1;
+    }
+    let mut slice = unsafe { slice::from_raw_parts(input_ptr, input_len) };
+    while let Some(&b) = slice.first() {
+        if is_mysql_phrase_trim_or_sep(b) {
+            slice = &slice[1..];
+        } else {
+            break;
+        }
+    }
+    while let Some(&b) = slice.last() {
+        if is_mysql_phrase_trim_or_sep(b) {
+            slice = &slice[..slice.len() - 1];
+        } else {
+            break;
+        }
+    }
+    if slice.is_empty() {
+        return 0;
+    }
+    if !out_buf.is_null() && out_cap >= slice.len() {
+        let mut out_len = 0usize;
+        let mut prev_space = false;
+        for &b in slice {
+            let mapped = MYSQL_PHRASE_TABLE[b as usize];
+            if mapped == b' ' {
+                if !prev_space {
+                    unsafe {
+                        *out_buf.add(out_len) = b' ';
+                    }
+                    out_len += 1;
+                    prev_space = true;
+                }
+            } else {
+                unsafe {
+                    *out_buf.add(out_len) = mapped;
+                }
+                out_len += 1;
+                prev_space = false;
+            }
+        }
+        return out_len as isize;
+    }
+    let mut cur = OutCursor::new(out_buf, out_cap);
+    let mut prev_space = false;
+    for &b in slice {
+        let mapped = MYSQL_PHRASE_TABLE[b as usize];
+        if mapped == b' ' {
+            if !prev_space {
+                cur.push_byte(b' ');
+                prev_space = true;
+            }
+        } else {
+            cur.push_byte(mapped);
+            prev_space = false;
+        }
+    }
+    cur.finish()
+}
+
+/// Accelerates `ReleaseSearchService::buildRangeSqlConditions(array $ranges)`.
+/// Each bound is `< 0` when omitted, or `>= 0` when active.
+/// Writes `\n`-separated SQL condition strings to `out_buf`.
+///
+/// # Safety
+///
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_search_build_range_sql_conditions(
+    size_min: i64,
+    size_max: i64,
+    totalpart_min: i64,
+    totalpart_max: i64,
+    grabs_min: i64,
+    grabs_max: i64,
+    comments_min: i64,
+    comments_max: i64,
+    adddate_min: i64,
+    adddate_max: i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if adddate_min > MAX_RFC2822_TS_UTC || adddate_max > MAX_RFC2822_TS_UTC {
+        return -2;
+    }
+    let mut cur = OutCursor::new(out_buf, out_cap);
+    let mut first = true;
+    let scalar_bounds: [(&[u8], i64); 8] = [
+        (b"r.size >= ", size_min),
+        (b"r.size <= ", size_max),
+        (b"r.totalpart >= ", totalpart_min),
+        (b"r.totalpart <= ", totalpart_max),
+        (b"r.grabs >= ", grabs_min),
+        (b"r.grabs <= ", grabs_max),
+        (b"r.comments >= ", comments_min),
+        (b"r.comments <= ", comments_max),
+    ];
+    for &(prefix, val) in &scalar_bounds {
+        if val >= 0 {
+            if !first {
+                cur.push_byte(b'\n');
+            }
+            first = false;
+            cur.push_slice(prefix);
+            push_u64_decimal(&mut cur, val as u64);
+        }
+    }
+    for (prefix, val) in [
+        (&b"r.adddate >= '"[..], adddate_min),
+        (&b"r.adddate <= '"[..], adddate_max),
+    ] {
+        if val >= 0 {
+            let Some(dt) = gmdate_ymd_hms_bytes(val) else {
+                return -2;
+            };
+            if !first {
+                cur.push_byte(b'\n');
+            }
+            first = false;
+            cur.push_slice(prefix);
+            cur.push_slice(&dt);
+            cur.push_byte(b'\'');
+        }
+    }
+    cur.finish()
+}
+
+/// Accelerates `ReleaseSearchService::buildEpisodeJoinPredicates(string $series, string $episode, string $airDate)`.
+/// Writes `\n`-separated SQL predicates to `out_buf`, or returns `-2` when `escapeString($airDate)`
+/// or float-like `(int)` coercion requires PHP fallback.
+///
+/// # Safety
+///
+/// `series_ptr`, `episode_ptr`, and `airdate_ptr` must be valid for reads of their lengths when length > 0.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_search_build_episode_join_predicates(
+    series_ptr: *const u8,
+    series_len: usize,
+    episode_ptr: *const u8,
+    episode_len: usize,
+    airdate_ptr: *const u8,
+    airdate_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if (series_len > 0 && series_ptr.is_null())
+        || (episode_len > 0 && episode_ptr.is_null())
+        || (airdate_len > 0 && airdate_ptr.is_null())
+    {
+        return -1;
+    }
+    let series = if series_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(series_ptr, series_len) }
+    };
+    let episode = if episode_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(episode_ptr, episode_len) }
+    };
+    let airdate = if airdate_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(airdate_ptr, airdate_len) }
+    };
+
+    let mut cur = OutCursor::new(out_buf, out_cap);
+    if !series.is_empty() && series != b"0" {
+        let Some(series_cast) = php_cast_str_to_i64(series) else {
+            return -2;
+        };
+        if series_cast < 1900 {
+            let stripped_series = if matches!(series.first(), Some(b's' | b'S')) {
+                let mut idx = 1usize;
+                while idx < series.len() && series[idx] == b'0' {
+                    idx += 1;
+                }
+                &series[idx..]
+            } else {
+                series
+            };
+            let Some(series_num) = php_cast_str_to_i64(stripped_series) else {
+                return -2;
+            };
+            cur.push_slice(b"tve.series = ");
+            push_i64_decimal(&mut cur, series_num);
+
+            if !episode.is_empty() && episode != b"0" && !episode.contains(&b'/') {
+                let stripped_ep = if matches!(episode.first(), Some(b'e' | b'E')) {
+                    let mut idx = 1usize;
+                    while idx < episode.len() && episode[idx] == b'0' {
+                        idx += 1;
+                    }
+                    &episode[idx..]
+                } else {
+                    episode
+                };
+                let Some(ep_num) = php_cast_str_to_i64(stripped_ep) else {
+                    return -2;
+                };
+                cur.push_slice(b"\ntve.episode = ");
+                push_i64_decimal(&mut cur, ep_num);
+            }
+            return cur.finish();
+        }
+    }
+
+    if !airdate.is_empty() && airdate != b"0" {
+        if !airdate
+            .iter()
+            .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'/' | b'.' | b'_' | b':' | b' '))
+        {
+            return -2;
+        }
+        cur.push_slice(b"DATE(tve.firstaired) = '");
+        cur.push_slice(airdate);
+        cur.push_byte(b'\'');
+        return cur.finish();
+    }
+
+    0
+}
+
+/// Accelerates `ReleaseSearchService::resolveSizeRangeBounds(mixed $sizeFrom, mixed $sizeTo)`.
+/// Writes `[size_min_bytes, size_max_bytes]` to `out_bounds2` and returns `0` (or `-1` on null `out_bounds2`).
+///
+/// # Safety
+///
+/// `out_bounds2` must be valid for writes of 2 `i64` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_search_resolve_size_range_bounds(
+    size_from: i64,
+    size_to: i64,
+    out_bounds2: *mut i64,
+) -> i32 {
+    if out_bounds2.is_null() {
+        return -1;
+    }
+    unsafe {
+        *out_bounds2.add(0) = size_bucket_bytes(size_from);
+        *out_bounds2.add(1) = size_bucket_bytes(size_to);
+    }
+    0
+}
+
+/// Accelerates `ManticoreSchemaInspector::compareColumns(array $actual, array $expected)`.
+/// `actual_nul` contains `actual_count` NUL-separated `(name, type)` pairs.
+/// `expected_nul` contains `expected_count` NUL-separated `(name, expected_type)` pairs.
+/// Writes `\n`-separated lines (`"M\t{name}"` or `"I\t{name}\t{expected_low}\t{actual_low}"`) to `out_buf`.
+///
+/// # Safety
+///
+/// `actual_nul` and `expected_nul` must be valid for reads of their lengths when length > 0.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_manticore_schema_compare_columns_nul(
+    actual_nul: *const u8,
+    actual_len: usize,
+    actual_count: usize,
+    expected_nul: *const u8,
+    expected_len: usize,
+    expected_count: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if (actual_len > 0 && actual_nul.is_null()) || (expected_len > 0 && expected_nul.is_null()) {
+        return -1;
+    }
+    let act_slice = if actual_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(actual_nul, actual_len) }
+    };
+    let exp_slice = if expected_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(expected_nul, expected_len) }
+    };
+
+    let mut stack_pairs: [(&[u8], &[u8]); 64] = [(&[], &[]); 64];
+    let mut stack_len = 0usize;
+    let mut heap_pairs: Option<Vec<(&[u8], &[u8])>> = None;
+
+    if actual_count == 0 {
+        if !act_slice.is_empty() {
+            return -1;
+        }
+    } else {
+        let mut act_iter = act_slice.split(|&b| b == 0);
+        for _ in 0..actual_count {
+            let Some(name) = act_iter.next() else {
+                return -1;
+            };
+            let Some(ty) = act_iter.next() else {
+                return -1;
+            };
+            if !name.is_empty() {
+                if let Some(ref mut v) = heap_pairs {
+                    v.push((name, ty));
+                } else if stack_len < 64 {
+                    stack_pairs[stack_len] = (name, ty);
+                    stack_len += 1;
+                } else {
+                    let mut v = Vec::with_capacity(actual_count);
+                    v.extend_from_slice(&stack_pairs[..stack_len]);
+                    v.push((name, ty));
+                    heap_pairs = Some(v);
+                }
+            }
+        }
+        if act_iter.next().is_some() {
+            return -1;
+        }
+    }
+
+    if expected_count == 0 {
+        return if exp_slice.is_empty() { 0 } else { -1 };
+    }
+
+    let act_pairs: &[(&[u8], &[u8])] = match heap_pairs {
+        Some(ref v) => v.as_slice(),
+        None => &stack_pairs[..stack_len],
+    };
+
+    let mut exp_iter = exp_slice.split(|&b| b == 0);
+    let mut cur = OutCursor::new(out_buf, out_cap);
+    let mut first_line = true;
+
+    for _ in 0..expected_count {
+        let Some(name) = exp_iter.next() else {
+            return -1;
+        };
+        let Some(exp_type_raw) = exp_iter.next() else {
+            return -1;
+        };
+        if name.contains(&b'\n')
+            || name.contains(&b'\t')
+            || exp_type_raw.contains(&b'\n')
+            || exp_type_raw.contains(&b'\t')
+        {
+            return -2;
+        }
+
+        if let Some(&(_, act_type_raw)) = act_pairs.iter().rev().find(|&&(n, _)| n == name) {
+            if act_type_raw.contains(&b'\n') || act_type_raw.contains(&b'\t') {
+                return -2;
+            }
+            let compatible = if exp_type_raw.eq_ignore_ascii_case(b"integer") {
+                ascii_contains_ignore_case_any(act_type_raw, b"integer")
+                    || ascii_contains_ignore_case_any(act_type_raw, b"uint")
+            } else {
+                ascii_contains_ignore_case_any(act_type_raw, exp_type_raw)
+            };
+            if !compatible {
+                if !first_line {
+                    cur.push_byte(b'\n');
+                }
+                first_line = false;
+                cur.push_slice(b"I\t");
+                cur.push_slice(name);
+                cur.push_byte(b'\t');
+                for &b in exp_type_raw {
+                    cur.push_byte(b.to_ascii_lowercase());
+                }
+                cur.push_byte(b'\t');
+                for &b in act_type_raw {
+                    cur.push_byte(b.to_ascii_lowercase());
+                }
+            }
+        } else {
+            if !first_line {
+                cur.push_byte(b'\n');
+            }
+            first_line = false;
+            cur.push_slice(b"M\t");
+            cur.push_slice(name);
+        }
+    }
+    if exp_iter.next().is_some() {
+        return -1;
+    }
+    cur.finish()
+}
+
+struct SettingsSliceMap<'a> {
+    stack: [(&'a [u8], &'a [u8]); 12],
+    len: usize,
+    heap: Option<Vec<(&'a [u8], &'a [u8])>>,
+}
+
+impl<'a> SettingsSliceMap<'a> {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            stack: [(&[], &[]); 12],
+            len: 0,
+            heap: None,
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, k: &'a [u8], v: &'a [u8]) {
+        if let Some(ref mut h) = self.heap {
+            h.push((k, v));
+        } else if self.len < 12 {
+            self.stack[self.len] = (k, v);
+            self.len += 1;
+        } else {
+            let mut h = Vec::with_capacity(32);
+            h.extend_from_slice(&self.stack[..self.len]);
+            h.push((k, v));
+            self.heap = Some(h);
+        }
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[(&'a [u8], &'a [u8])] {
+        match self.heap {
+            Some(ref h) => h.as_slice(),
+            None => &self.stack[..self.len],
+        }
+    }
+}
+
+fn parse_manticore_settings_blob_into<'a>(
+    blob: &'a [u8],
+    settings: &mut SettingsSliceMap<'a>,
+) -> bool {
+    if blob.iter().any(|&b| b >= 0x80) {
+        return false;
+    }
+    let mut parse_line = |line: &'a [u8]| {
+        let mut i = 0usize;
+        while i < line.len() && is_ascii_ws(line[i]) {
+            i += 1;
+        }
+        let key_start = i;
+        while i < line.len() && (line[i].is_ascii_alphanumeric() || line[i] == b'_') {
+            i += 1;
+        }
+        let key_slice = &line[key_start..i];
+        if key_slice.is_empty() {
+            return;
+        }
+        while i < line.len() && is_ascii_ws(line[i]) {
+            i += 1;
+        }
+        if i >= line.len() || line[i] != b'=' {
+            return;
+        }
+        i += 1;
+        while i < line.len() && is_ascii_ws(line[i]) {
+            i += 1;
+        }
+        let mut rest = &line[i..];
+        while let Some(&b) = rest.last() {
+            if is_ascii_ws(b) {
+                rest = &rest[..rest.len() - 1];
+            } else {
+                break;
+            }
+        }
+        if rest.first().is_some_and(|&b| b == b'\'' || b == b'"') {
+            rest = &rest[1..];
+        }
+        if rest.last().is_some_and(|&b| b == b'\'' || b == b'"') {
+            rest = &rest[..rest.len() - 1];
+        }
+        if rest.is_empty() || rest.iter().any(|&b| b == b'\'' || b == b'"') {
+            return;
+        }
+        let trimmed_val = trim_php_default(rest);
+        settings.push(key_slice, trimmed_val);
+    };
+
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < blob.len() {
+        let b = blob[i];
+        if b == b'\r' {
+            parse_line(&blob[start..i]);
+            if i + 1 < blob.len() && blob[i + 1] == b'\n' {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            start = i;
+        } else if matches!(b, b'\n' | 0x0B | 0x0C) {
+            parse_line(&blob[start..i]);
+            i += 1;
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    parse_line(&blob[start..]);
+    true
+}
+
+/// Accelerates `ManticoreSchemaInspector::missingSettings(mixed $actual, array $expected)`.
+/// `actual_nul` contains `actual_count` NUL-separated `(key_or_blob_marker, value)` pairs,
+/// where `key == "\x01"` denotes a bundled multi-line `settings` string.
+/// `expected_nul` contains `expected_count` NUL-separated `(setting_name, expected_value)` pairs.
+/// Writes `\n`-separated missing setting names to `out_buf`.
+///
+/// # Safety
+///
+/// `actual_nul` and `expected_nul` must be valid for reads of their lengths when length > 0.
+/// `out_buf` must be valid for writes of `out_cap` bytes when non-null and `out_cap > 0`.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_manticore_schema_missing_settings_nul(
+    actual_nul: *const u8,
+    actual_len: usize,
+    actual_count: usize,
+    expected_nul: *const u8,
+    expected_len: usize,
+    expected_count: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if (actual_len > 0 && actual_nul.is_null()) || (expected_len > 0 && expected_nul.is_null()) {
+        return -1;
+    }
+    let act_slice = if actual_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(actual_nul, actual_len) }
+    };
+    let exp_slice = if expected_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(expected_nul, expected_len) }
+    };
+
+    let mut settings = SettingsSliceMap::new();
+    if actual_count == 0 {
+        if !act_slice.is_empty() {
+            return -1;
+        }
+    } else if actual_count == 0xFFFF_FFFF {
+        if !parse_manticore_settings_blob_into(act_slice, &mut settings) {
+            return -2;
+        }
+    } else {
+        let mut act_iter = act_slice.split(|&b| b == 0);
+        for _ in 0..actual_count {
+            let Some(k) = act_iter.next() else {
+                return -1;
+            };
+            let Some(v) = act_iter.next() else {
+                return -1;
+            };
+            if k == b"\x01" {
+                if !parse_manticore_settings_blob_into(v, &mut settings) {
+                    return -2;
+                }
+            } else {
+                settings.push(k, v);
+            }
+        }
+        if act_iter.next().is_some() {
+            return -1;
+        }
+    }
+
+    if expected_count == 0 {
+        return if exp_slice.is_empty() { 0 } else { -1 };
+    }
+
+    let settings_slice = settings.as_slice();
+    let mut exp_iter = exp_slice.split(|&b| b == 0);
+    let mut cur = OutCursor::new(out_buf, out_cap);
+    let mut first_line = true;
+
+    for _ in 0..expected_count {
+        let Some(setting) = exp_iter.next() else {
+            return -1;
+        };
+        let Some(exp_val) = exp_iter.next() else {
+            return -1;
+        };
+        if setting.is_empty() || setting.contains(&b'\n') {
+            return -2;
+        }
+        let matches_expected = settings_slice
+            .iter()
+            .rev()
+            .find(|&&(k, _)| k.eq_ignore_ascii_case(setting))
+            .is_some_and(|&(_, v)| v.eq_ignore_ascii_case(exp_val));
+        if !matches_expected {
+            if !first_line {
+                cur.push_byte(b'\n');
+            }
+            first_line = false;
+            cur.push_slice(setting);
+        }
+    }
+    if exp_iter.next().is_some() {
+        return -1;
+    }
+    cur.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4209,5 +5087,163 @@ mod tests {
             &buf[..63],
             b"Fri, 02 Jan 2026 03:04:05 +0000\nThu, 29 Feb 2024 23:59:59 +0000"
         );
+    }
+
+    #[test]
+    fn test_wave9_slice96_cdata_search_sql_and_manticore_schema() {
+        let mut buf = [0u8; 512];
+
+        // 1. nntmux_api_build_cdata
+        let cdata_in = b"mu_artist\0Daft Punk\0mu_releasedate\02013-05-17 00:00:00\0year\02013";
+        let n_cdata = unsafe {
+            nntmux_api_build_cdata(
+                cdata_in.as_ptr(),
+                cdata_in.len(),
+                3,
+                1,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert!(n_cdata > 0);
+        assert_eq!(
+            &buf[..n_cdata as usize],
+            b"<li>Artist: Daft Punk</li>\n<li>Released: 2013-05-17</li>\n<li>Year: 2013</li>\n"
+        );
+
+        // 2. nntmux_search_normalize_mysql_fallback_phrase
+        let phrase_in = b"  Example.Show-S01_E02 \t\n O'Reilly.. ";
+        let n_phrase = unsafe {
+            nntmux_search_normalize_mysql_fallback_phrase(
+                phrase_in.as_ptr(),
+                phrase_in.len(),
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert!(n_phrase > 0);
+        assert_eq!(
+            &buf[..n_phrase as usize],
+            b"example show s01 e02 o'reilly"
+        );
+
+        // 3. nntmux_search_build_range_sql_conditions
+        let n_range = unsafe {
+            nntmux_search_build_range_sql_conditions(
+                20,
+                40,
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                0,
+                1_700_000_000,
+                1_700_086_399,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert!(n_range > 0);
+        assert_eq!(
+            &buf[..n_range as usize],
+            b"r.size >= 20\nr.size <= 40\nr.comments <= 0\nr.adddate >= '2023-11-14 22:13:20'\nr.adddate <= '2023-11-15 22:13:19'"
+        );
+
+        // 4. nntmux_search_build_episode_join_predicates
+        let n_ep = unsafe {
+            nntmux_search_build_episode_join_predicates(
+                b"S06".as_ptr(),
+                3,
+                b"E024".as_ptr(),
+                4,
+                std::ptr::null(),
+                0,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert!(n_ep > 0);
+        assert_eq!(&buf[..n_ep as usize], b"tve.series = 6\ntve.episode = 24");
+
+        let n_air = unsafe {
+            nntmux_search_build_episode_join_predicates(
+                b"2024".as_ptr(),
+                4,
+                std::ptr::null(),
+                0,
+                b"2024-03-05".as_ptr(),
+                10,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert!(n_air > 0);
+        assert_eq!(
+            &buf[..n_air as usize],
+            b"DATE(tve.firstaired) = '2024-03-05'"
+        );
+
+        // 5. nntmux_search_resolve_size_range_bounds
+        let mut bounds = [0i64; 2];
+        let rc_bounds =
+            unsafe { nntmux_search_resolve_size_range_bounds(2, 4, bounds.as_mut_ptr()) };
+        assert_eq!(rc_bounds, 0);
+        assert_eq!(bounds, [209_715_200, 1_048_576_000]);
+
+        // 6. nntmux_manticore_schema_compare_columns_nul
+        let act_cols = b"passwordstatus\0uint\0categories_id\0uint";
+        let exp_cols = b"passwordstatus\0bigint\0haspreview\0bigint\0categories_id\0integer";
+        let n_cols = unsafe {
+            nntmux_manticore_schema_compare_columns_nul(
+                act_cols.as_ptr(),
+                act_cols.len(),
+                2,
+                exp_cols.as_ptr(),
+                exp_cols.len(),
+                3,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert!(n_cols > 0);
+        assert_eq!(
+            &buf[..n_cols as usize],
+            b"I\tpasswordstatus\tbigint\tuint\nM\thaspreview"
+        );
+
+        // 7. nntmux_manticore_schema_missing_settings_nul
+        let act_set = b"\x01\0min_infix_len = '2'\r\nindex_field_lengths = 1";
+        let exp_set = b"min_infix_len\02\0exact_words\01\0index_field_lengths\01";
+        let n_set = unsafe {
+            nntmux_manticore_schema_missing_settings_nul(
+                act_set.as_ptr(),
+                act_set.len(),
+                1,
+                exp_set.as_ptr(),
+                exp_set.len(),
+                3,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert!(n_set > 0);
+        assert_eq!(&buf[..n_set as usize], b"exact_words");
+
+        let raw_blob = b"min_infix_len = '2'\r\nindex_field_lengths = 1";
+        let n_blob = unsafe {
+            nntmux_manticore_schema_missing_settings_nul(
+                raw_blob.as_ptr(),
+                raw_blob.len(),
+                0xFFFF_FFFF,
+                exp_set.as_ptr(),
+                exp_set.len(),
+                3,
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        assert_eq!(n_blob, n_set);
+        assert_eq!(&buf[..n_blob as usize], b"exact_words");
     }
 }
