@@ -920,6 +920,535 @@ pub unsafe extern "C" fn nntmux_irc_pre_announce_parse_batch_nul(
     }
 }
 
+#[inline]
+fn is_php_trim_byte(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b)
+}
+
+#[inline]
+fn php_trim(mut s: &[u8]) -> &[u8] {
+    while let Some(&first) = s.first() {
+        if is_php_trim_byte(first) {
+            s = &s[1..];
+        } else {
+            break;
+        }
+    }
+    while let Some(&last) = s.last() {
+        if is_php_trim_byte(last) {
+            s = &s[..s.len() - 1];
+        } else {
+            break;
+        }
+    }
+    s
+}
+
+#[inline]
+fn is_valid_ipv4(s: &[u8]) -> bool {
+    if s.len() < 7 || s.len() > 15 {
+        return false;
+    }
+    let mut octets = 0usize;
+    let mut i = 0usize;
+    while i < s.len() {
+        let start = i;
+        let mut val = 0u16;
+        while i < s.len() && s[i] != b'.' {
+            let b = s[i];
+            if !b.is_ascii_digit() {
+                return false;
+            }
+            val = val * 10 + u16::from(b - b'0');
+            i += 1;
+            if i - start > 3 {
+                return false;
+            }
+        }
+        let len = i - start;
+        if len == 0 || (len > 1 && s[start] == b'0') || val > 255 {
+            return false;
+        }
+        octets += 1;
+        if i < s.len() {
+            if octets == 4 || i + 1 == s.len() {
+                return false;
+            }
+            i += 1;
+        }
+    }
+    octets == 4
+}
+
+#[inline]
+fn count_ipv6_groups(part: &[u8]) -> Option<usize> {
+    if part.is_empty() {
+        return None;
+    }
+    let mut groups = 0usize;
+    let mut i = 0usize;
+    while i < part.len() {
+        let start = i;
+        while i < part.len() && part[i] != b':' {
+            if !part[i].is_ascii_hexdigit() {
+                return None;
+            }
+            i += 1;
+            if i - start > 4 {
+                return None;
+            }
+        }
+        if i == start {
+            return None;
+        }
+        groups += 1;
+        if i < part.len() {
+            if i + 1 == part.len() {
+                return None;
+            }
+            i += 1;
+        }
+    }
+    Some(groups)
+}
+
+#[inline]
+fn validate_ipv6_groups(s: &[u8], target_groups: usize) -> bool {
+    let mut double_colon = None;
+    let mut i = 0usize;
+    while i + 1 < s.len() {
+        if s[i] == b':' && s[i + 1] == b':' {
+            double_colon = Some(i);
+            break;
+        }
+        i += 1;
+    }
+    match double_colon {
+        None => count_ipv6_groups(s) == Some(target_groups),
+        Some(pos) => {
+            let left = &s[..pos];
+            let right = &s[pos + 2..];
+            let left_groups = if left.is_empty() {
+                0
+            } else {
+                match count_ipv6_groups(left) {
+                    Some(n) => n,
+                    None => return false,
+                }
+            };
+            let right_groups = if right.is_empty() {
+                0
+            } else {
+                match count_ipv6_groups(right) {
+                    Some(n) => n,
+                    None => return false,
+                }
+            };
+            left_groups + right_groups < target_groups
+        }
+    }
+}
+
+#[inline]
+fn is_valid_ipv6(s: &[u8]) -> bool {
+    if s.len() < 2 || find_byte(s, b':').is_none() {
+        return false;
+    }
+    if find_byte(s, b'.').is_some() {
+        let Some(last_colon) = s.iter().rposition(|&b| b == b':') else {
+            return false;
+        };
+        if last_colon == 0 || !is_valid_ipv4(&s[last_colon + 1..]) {
+            return false;
+        }
+        let prefix = if s[last_colon - 1] == b':' {
+            &s[..=last_colon]
+        } else {
+            &s[..last_colon]
+        };
+        return validate_ipv6_groups(prefix, 6);
+    }
+    validate_ipv6_groups(s, 8)
+}
+
+#[inline]
+fn is_valid_cidr(cidr: &[u8]) -> Option<bool> {
+    let Some(slash) = find_byte(cidr, b'/') else {
+        return Some(false);
+    };
+    let address = &cidr[..slash];
+    let prefix = &cidr[slash + 1..];
+    if prefix.is_empty() || !prefix.iter().all(u8::is_ascii_digit) {
+        return Some(false);
+    }
+    let is_ipv4 = is_valid_ipv4(address);
+    let is_ipv6 = !is_ipv4 && is_valid_ipv6(address);
+    if !is_ipv4 && !is_ipv6 {
+        return Some(false);
+    }
+    let max_prefix: u16 = if is_ipv4 { 32 } else { 128 };
+    let significant = match prefix.iter().position(|&b| b != b'0') {
+        Some(idx) => &prefix[idx..],
+        None => return Some(true),
+    };
+    if significant.len() > 18 {
+        return None;
+    }
+    if significant.len() > 3 {
+        return Some(false);
+    }
+    let mut val = 0u16;
+    for &b in significant {
+        val = val * 10 + u16::from(b - b'0');
+    }
+    Some(val <= max_prefix)
+}
+
+struct SeenCidrs<'a> {
+    stack: [&'a [u8]; 32],
+    len: usize,
+    overflow_set: Option<std::collections::HashSet<&'a [u8]>>,
+    overflow_vec: Vec<&'a [u8]>,
+}
+
+impl<'a> SeenCidrs<'a> {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            stack: [&[]; 32],
+            len: 0,
+            overflow_set: None,
+            overflow_vec: Vec::new(),
+        }
+    }
+
+    #[inline]
+    fn insert(&mut self, item: &'a [u8]) -> bool {
+        if let Some(set) = &mut self.overflow_set {
+            if set.insert(item) {
+                self.overflow_vec.push(item);
+                return true;
+            }
+            return false;
+        }
+        for i in 0..self.len {
+            if self.stack[i] == item {
+                return false;
+            }
+        }
+        if self.len < 32 {
+            self.stack[self.len] = item;
+            self.len += 1;
+            return true;
+        }
+        let mut set = std::collections::HashSet::with_capacity(64);
+        for i in 0..32 {
+            set.insert(self.stack[i]);
+        }
+        set.insert(item);
+        self.overflow_set = Some(set);
+        self.overflow_vec.push(item);
+        true
+    }
+
+    #[inline]
+    fn write_lines(&self, out: &mut OutCursor<'_>) {
+        for i in 0..self.len {
+            if i > 0 {
+                out.push(b'\n');
+            }
+            out.extend(self.stack[i]);
+        }
+        for item in &self.overflow_vec {
+            out.push(b'\n');
+            out.extend(item);
+        }
+    }
+}
+
+#[inline]
+fn normalize_cidr_token<'a>(raw: &'a [u8], allow_proxy_tokens: bool) -> Result<Option<&'a [u8]>, ()> {
+    let trimmed = php_trim(raw);
+    if trimmed.is_empty() || trimmed.first() == Some(&b'#') {
+        return Ok(None);
+    }
+    if allow_proxy_tokens {
+        if trimmed == b"REMOTE_ADDR" {
+            return Ok(Some(b"REMOTE_ADDR"));
+        }
+        if trimmed == b"PRIVATE_SUBNETS" || trimmed == b"private_ranges" {
+            return Ok(Some(b"PRIVATE_SUBNETS"));
+        }
+    }
+    match is_valid_cidr(trimmed) {
+        Some(true) => Ok(Some(trimmed)),
+        Some(false) | None => Err(()),
+    }
+}
+
+/// Validates a single CIDR string (`CloudflareIpRangeService::isValidCidr`).
+/// Returns `1` if valid IPv4/IPv6 CIDR, `0` if invalid, or `-1` when declined to PHP fallback.
+///
+/// # Safety
+/// `cidr` must be readable for `cidr_len` bytes when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_cloudflare_is_valid_cidr(
+    cidr: *const c_char,
+    cidr_len: usize,
+) -> i32 {
+    if cidr.is_null() && cidr_len != 0 {
+        return -1;
+    }
+    let bytes = if cidr_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(cidr.cast::<u8>(), cidr_len) }
+    };
+    match is_valid_cidr(bytes) {
+        Some(true) => 1,
+        Some(false) => 0,
+        None => -1,
+    }
+}
+
+/// Parses a newline-delimited Cloudflare CIDR response body (`CloudflareIpRangeService::parseRangesFromBody`),
+/// trimming, skipping blank/comment lines, validating CIDRs, and deduplicating in first-seen order.
+/// Returns `0` for empty result, `> 0` bytes written (`\n`-separated), `-(required as isize)` (`<= -4`)
+/// when `out_cap` is insufficient, or `-1` on invalid CIDR / invalid arguments so PHP can throw its exception.
+///
+/// # Safety
+/// `body` must be readable for `body_len` bytes and `out_buf` writable for `out_cap` bytes without overlap.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_cloudflare_parse_cidr_body(
+    body: *const c_char,
+    body_len: usize,
+    allow_proxy_tokens: u8,
+    out_buf: *mut c_char,
+    out_cap: usize,
+) -> isize {
+    if (body.is_null() && body_len != 0)
+        || (out_buf.is_null() && out_cap != 0)
+        || body_len > isize::MAX as usize
+        || out_cap > isize::MAX as usize
+    {
+        return -1;
+    }
+    let bytes = if body_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(body.cast::<u8>(), body_len) }
+    };
+    let allow_tokens = allow_proxy_tokens != 0;
+    let mut seen = SeenCidrs::new();
+    for line in bytes.split(|&b| b == b'\r' || b == b'\n') {
+        match normalize_cidr_token(line, allow_tokens) {
+            Ok(Some(canon)) => {
+                seen.insert(canon);
+            }
+            Ok(None) => {}
+            Err(()) => return -1,
+        }
+    }
+    let mut out = unsafe { OutCursor::new(out_buf.cast::<u8>(), out_cap) };
+    seen.write_lines(&mut out);
+    out.finish()
+}
+
+/// Normalizes and deduplicates `count` NUL-separated CIDR/proxy-token entries (`CloudflareIpRangeService::normalizeRanges`).
+/// Returns `0` for empty result, `> 0` bytes written (`\n`-separated), `-(required as isize)` (`<= -4`)
+/// when `out_cap` is insufficient, or `-1` on invalid entry / embedded NUL so PHP can fall back and throw.
+///
+/// # Safety
+/// `input` must be readable for `input_len` bytes and `out_buf` writable for `out_cap` bytes without overlap.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_cloudflare_normalize_cidrs_nul(
+    input: *const c_char,
+    input_len: usize,
+    count: usize,
+    allow_proxy_tokens: u8,
+    out_buf: *mut c_char,
+    out_cap: usize,
+) -> isize {
+    if (input.is_null() && input_len != 0)
+        || (out_buf.is_null() && out_cap != 0)
+        || input_len > isize::MAX as usize
+        || out_cap > isize::MAX as usize
+    {
+        return -1;
+    }
+    if count == 0 {
+        return if input_len == 0 { 0 } else { -1 };
+    }
+    let bytes = if input_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(input.cast::<u8>(), input_len) }
+    };
+    let allow_tokens = allow_proxy_tokens != 0;
+    let mut seen = SeenCidrs::new();
+    let mut seg_count = 0usize;
+    for raw in bytes.split(|&b| b == 0) {
+        seg_count += 1;
+        match normalize_cidr_token(raw, allow_tokens) {
+            Ok(Some(canon)) => {
+                seen.insert(canon);
+            }
+            Ok(None) => {}
+            Err(()) => return -1,
+        }
+    }
+    if seg_count != count {
+        return -1;
+    }
+    let mut out = unsafe { OutCursor::new(out_buf.cast::<u8>(), out_cap) };
+    seen.write_lines(&mut out);
+    out.finish()
+}
+
+#[inline]
+fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return false;
+    }
+    let first_lo = needle[0].to_ascii_lowercase();
+    let first_hi = needle[0].to_ascii_uppercase();
+    let rest = &needle[1..];
+    let end = haystack.len() - needle.len() + 1;
+    let mut i = 0usize;
+    while i < end {
+        let b = haystack[i];
+        if (b == first_lo || b == first_hi)
+            && haystack[i + 1..i + needle.len()].eq_ignore_ascii_case(rest)
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Matches `haystack` against `patterns` using ASCII case-insensitive substring search (`IndexerProxyDetector`).
+/// - `mode = 0`: `patterns` is a raw configuration string split on `\r`, `\n`, or `,`, trimmed via `php_trim`,
+///   and filtered with PHP `array_filter` rules (skipping `""` and `"0"`).
+/// - `mode = 1`: `patterns` is a NUL-separated list of `count` pattern strings; each non-empty pattern (`!= ""`)
+///   is tested in order. If the number of NUL-separated segments does not equal `count`, returns `-1`.
+/// Returns `1` if any pattern matches, `0` if none match, or `-1` on invalid arguments.
+///
+/// # Safety
+/// `haystack` and `patterns` must be readable for their respective byte lengths when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_proxy_detector_match_referer(
+    haystack: *const c_char,
+    haystack_len: usize,
+    patterns: *const c_char,
+    patterns_len: usize,
+    count: usize,
+    mode: u8,
+) -> i32 {
+    if (haystack.is_null() && haystack_len != 0)
+        || (patterns.is_null() && patterns_len != 0)
+        || mode > 1
+    {
+        return -1;
+    }
+    let hay = if haystack_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(haystack.cast::<u8>(), haystack_len) }
+    };
+    let pat_bytes = if patterns_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(patterns.cast::<u8>(), patterns_len) }
+    };
+    if mode == 0 {
+        if hay.is_empty() || pat_bytes.is_empty() {
+            return 0;
+        }
+        for raw in pat_bytes.split(|&b| matches!(b, b'\r' | b'\n' | b',')) {
+            let trimmed = php_trim(raw);
+            if !trimmed.is_empty()
+                && trimmed != b"0"
+                && contains_ascii_case_insensitive(hay, trimmed)
+            {
+                return 1;
+            }
+        }
+        0
+    } else {
+        if count == 0 {
+            return if patterns_len == 0 { 0 } else { -1 };
+        }
+        let mut seen = 0usize;
+        let mut matched = false;
+        for pat in pat_bytes.split(|&b| b == 0) {
+            seen += 1;
+            if !matched && !hay.is_empty() && !pat.is_empty() && contains_ascii_case_insensitive(hay, pat) {
+                matched = true;
+            }
+        }
+        if seen != count {
+            return -1;
+        }
+        i32::from(matched)
+    }
+}
+
+/// Builds `proxy_detect:` + `:`-joined parts where any part containing `:` or with `len > 40`
+/// is replaced by its 32-byte lowercase hex MD5 (`IndexerProxyDetector::key`).
+/// Returns bytes written (`> 0`), `-(required as isize)` if `out_cap` is too small, or `-1` on invalid input.
+///
+/// # Safety
+/// `input` must be readable for `input_len` bytes and `out_buf` writable for `out_cap` bytes without overlap.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_proxy_detector_cache_key_nul(
+    input: *const c_char,
+    input_len: usize,
+    count: usize,
+    out_buf: *mut c_char,
+    out_cap: usize,
+) -> isize {
+    if (input.is_null() && input_len != 0)
+        || (out_buf.is_null() && out_cap != 0)
+        || input_len > isize::MAX as usize
+        || out_cap > isize::MAX as usize
+    {
+        return -1;
+    }
+    if count == 0 {
+        if input_len != 0 {
+            return -1;
+        }
+        let mut out = unsafe { OutCursor::new(out_buf.cast::<u8>(), out_cap) };
+        out.extend(b"proxy_detect:");
+        return out.finish();
+    }
+    let bytes: &[u8] = if input_len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(input.cast::<u8>(), input_len) }
+    };
+    let mut out = unsafe { OutCursor::new(out_buf.cast::<u8>(), out_cap) };
+    out.extend(b"proxy_detect:");
+    let mut seen = 0usize;
+    for (idx, part) in bytes.split(|&b| b == 0).enumerate() {
+        seen += 1;
+        if idx > 0 {
+            out.push(b':');
+        }
+        if part.len() > 40 || find_byte(part, b':').is_some() {
+            let hex = crate::md5_hex_slice(part);
+            out.extend(&hex);
+        } else {
+            out.extend(part);
+        }
+    }
+    if seen != count {
+        return -1;
+    }
+    out.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1181,6 +1710,138 @@ mod tests {
             assert_eq!(
                 nntmux_irc_parse_bot_message(std::ptr::null(), 1, out.as_mut_ptr(), 32),
                 -1
+            );
+        }
+    }
+
+    #[test]
+    fn cloudflare_cidr_validation_and_normalization_contracts() {
+        for valid in [
+            b"173.245.48.0/20".as_slice(),
+            b"0.0.0.0/0",
+            b"255.255.255.255/32",
+            b"192.0.2.1/08",
+            b"::/0",
+            b"::1/128",
+            b"2400:cb00::/32",
+            b"::ffff:192.0.2.1/96",
+            b"1:2:3:4:5:6:192.0.2.1/128",
+            b"1:2:3:4:5::192.0.2.1/64",
+        ] {
+            unsafe {
+                assert_eq!(
+                    nntmux_cloudflare_is_valid_cidr(valid.as_ptr().cast(), valid.len()),
+                    1,
+                    "expected valid: {:?}",
+                    std::str::from_utf8(valid)
+                );
+            }
+        }
+        for invalid in [
+            b"".as_slice(),
+            b"173.245.48.0",
+            b"173.245.48.0/",
+            b"173.245.48.0/33",
+            b"173.245.48.0/-1",
+            b"01.2.3.4/24",
+            b"256.0.0.1/24",
+            b"2400:cb00::/129",
+            b"1:2:3:4:5:6::192.0.2.1/64",
+            b"1:2:3:4:5:6:7::8/64",
+            b"fe80::1%eth0/64",
+        ] {
+            unsafe {
+                assert_eq!(
+                    nntmux_cloudflare_is_valid_cidr(invalid.as_ptr().cast(), invalid.len()),
+                    0,
+                    "expected invalid: {:?}",
+                    std::str::from_utf8(invalid)
+                );
+            }
+        }
+        let body = b" # comment\r\n 173.245.48.0/20 \n104.16.0.0/13\r173.245.48.0/20\n2400:cb00::/32\n";
+        let mut out = [0u8; 128];
+        unsafe {
+            let written = nntmux_cloudflare_parse_cidr_body(
+                body.as_ptr().cast(),
+                body.len(),
+                0,
+                out.as_mut_ptr().cast(),
+                out.len(),
+            );
+            assert!(written > 0);
+            assert_eq!(
+                &out[..written as usize],
+                b"173.245.48.0/20\n104.16.0.0/13\n2400:cb00::/32"
+            );
+            assert_eq!(
+                nntmux_cloudflare_parse_cidr_body(
+                    body.as_ptr().cast(),
+                    body.len(),
+                    0,
+                    out.as_mut_ptr().cast(),
+                    4
+                ),
+                -written
+            );
+            let nul = b" private_ranges \0REMOTE_ADDR\0PRIVATE_SUBNETS\010.0.0.0/8";
+            let written2 = nntmux_cloudflare_normalize_cidrs_nul(
+                nul.as_ptr().cast(),
+                nul.len(),
+                4,
+                1,
+                out.as_mut_ptr().cast(),
+                out.len(),
+            );
+            assert!(written2 > 0);
+            assert_eq!(
+                &out[..written2 as usize],
+                b"PRIVATE_SUBNETS\nREMOTE_ADDR\n10.0.0.0/8"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_detector_referer_and_cache_key_contracts() {
+        let referer = b"http://Prowlarr.local:9696/1/api";
+        let spec = b" hydra , 0 , \r\n prowlarr ";
+        unsafe {
+            assert_eq!(
+                nntmux_proxy_detector_match_referer(
+                    referer.as_ptr().cast(),
+                    referer.len(),
+                    spec.as_ptr().cast(),
+                    spec.len(),
+                    0,
+                    0
+                ),
+                1
+            );
+            let nul_pats = b"hydra\0prowlarr";
+            assert_eq!(
+                nntmux_proxy_detector_match_referer(
+                    referer.as_ptr().cast(),
+                    referer.len(),
+                    nul_pats.as_ptr().cast(),
+                    nul_pats.len(),
+                    2,
+                    1
+                ),
+                1
+            );
+            let key_in = b"ip\02001:db8::1\0indexer_ua";
+            let mut out = [0u8; 128];
+            let written = nntmux_proxy_detector_cache_key_nul(
+                key_in.as_ptr().cast(),
+                key_in.len(),
+                3,
+                out.as_mut_ptr().cast(),
+                out.len(),
+            );
+            assert!(written > 0);
+            assert_eq!(
+                &out[..written as usize],
+                b"proxy_detect:ip:1d64d10fff2ff210518623b74a8c1696:indexer_ua"
             );
         }
     }

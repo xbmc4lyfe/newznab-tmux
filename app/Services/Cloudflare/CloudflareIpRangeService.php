@@ -4,15 +4,30 @@ declare(strict_types=1);
 
 namespace App\Services\Cloudflare;
 
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Filesystem\Filesystem;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
 use JsonException;
 use RuntimeException;
+use Throwable;
 
 class CloudflareIpRangeService
 {
     private const MANIFEST_VERSION = 1;
+
+    private const string FFI_CDEF = <<<'C'
+        int32_t nntmux_cloudflare_is_valid_cidr(const char *cidr, size_t cidr_len);
+        ssize_t nntmux_cloudflare_parse_cidr_body(const char *body, size_t body_len, uint8_t allow_proxy_tokens, char *out_buf, size_t out_cap);
+        ssize_t nntmux_cloudflare_normalize_cidrs_nul(const char *input, size_t input_len, size_t count, uint8_t allow_proxy_tokens, char *out_buf, size_t out_cap);
+        C;
+
+    private static ?FFI $ffi = null;
+
+    private static bool $ffiResolved = false;
+
+    private static bool $useRustFfi = true;
 
     /**
      * @var array<int, string>
@@ -22,6 +37,11 @@ class CloudflareIpRangeService
         'PRIVATE_SUBNETS',
         'private_ranges',
     ];
+
+    public static function setUseRustFfi(bool $use): void
+    {
+        self::$useRustFfi = $use;
+    }
 
     public function __construct(
         private readonly Filesystem $files,
@@ -231,9 +251,66 @@ class CloudflareIpRangeService
      */
     private function parseRangesFromBody(string $body): array
     {
+        if (self::$useRustFfi) {
+            $native = self::parseRangesFromBodyNative($body);
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
+        return $this->parseRangesFromBodyPhp($body);
+    }
+
+    /**
+     * @return array<int, string>
+     */
+    private function parseRangesFromBodyPhp(string $body): array
+    {
         $lines = preg_split('/\r\n|\r|\n/', $body) ?: [];
 
-        return $this->normalizeRanges($lines);
+        return $this->normalizeRangesPhp($lines);
+    }
+
+    /**
+     * @return array<int, string>|null
+     */
+    public static function parseRangesFromBodyNative(string $body, bool $allowProxyTokens = false): ?array
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $len = strlen($body);
+        if ($len === 0) {
+            return [];
+        }
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(256, $len + 32), $cap);
+        if ($scratch === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_cloudflare_parse_cidr_body($body, $len, $allowProxyTokens ? 1 : 0, $scratch, $cap);
+            if (! is_int($written) || $written === -1) {
+                return null;
+            }
+            if ($written < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_cloudflare_parse_cidr_body($body, $len, $allowProxyTokens ? 1 : 0, $scratch, $cap);
+                if (! is_int($written) || $written < 0) {
+                    return null;
+                }
+            }
+
+            return $written === 0 ? [] : explode("\n", FFI::string($scratch, $written));
+        } catch (Throwable) {
+            return null;
+        }
     }
 
     /**
@@ -267,6 +344,22 @@ class CloudflareIpRangeService
      */
     private function normalizeRanges(array $ranges, bool $allowProxyTokens = false): array
     {
+        if (self::$useRustFfi && count($ranges) >= 4) {
+            $native = self::normalizeRangesNative($ranges, $allowProxyTokens);
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
+        return $this->normalizeRangesPhp($ranges, $allowProxyTokens);
+    }
+
+    /**
+     * @param  array<int, mixed>  $ranges
+     * @return array<int, string>
+     */
+    private function normalizeRangesPhp(array $ranges, bool $allowProxyTokens = false): array
+    {
         $normalized = [];
 
         foreach ($ranges as $range) {
@@ -296,7 +389,79 @@ class CloudflareIpRangeService
         return $this->deduplicate($normalized);
     }
 
+    /**
+     * @param  array<int, mixed>  $ranges
+     * @return array<int, string>|null
+     */
+    public static function normalizeRangesNative(array $ranges, bool $allowProxyTokens = false): ?array
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $strings = array_values(array_filter($ranges, 'is_string'));
+        $count = count($strings);
+        if ($count === 0) {
+            return [];
+        }
+        $joined = implode("\0", $strings);
+        if (substr_count($joined, "\0") !== $count - 1) {
+            return null;
+        }
+        $len = strlen($joined);
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(256, $len + 32), $cap);
+        if ($scratch === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_cloudflare_normalize_cidrs_nul($joined, $len, $count, $allowProxyTokens ? 1 : 0, $scratch, $cap);
+            if (! is_int($written) || $written === -1) {
+                return null;
+            }
+            if ($written < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_cloudflare_normalize_cidrs_nul($joined, $len, $count, $allowProxyTokens ? 1 : 0, $scratch, $cap);
+                if (! is_int($written) || $written < 0) {
+                    return null;
+                }
+            }
+
+            return $written === 0 ? [] : explode("\n", FFI::string($scratch, $written));
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
     private function isValidCidr(string $cidr): bool
+    {
+        // Retain native PHP validation for standalone single-CIDR calls (1.15x-1.37x mean / 1.20x-1.25x p99 < 1.5x);
+        // batch callers (parseRangesFromBody / normalizeRanges) validate in Rust at 2.45x-4.27x speedup.
+        return $this->isValidCidrPhp($cidr);
+    }
+
+    public static function isValidCidrNative(string $cidr): ?bool
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $res = $ffi->nntmux_cloudflare_is_valid_cidr($cidr, strlen($cidr));
+
+            return is_int($res) && $res >= 0 ? ($res === 1) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private function isValidCidrPhp(string $cidr): bool
     {
         if (! str_contains($cidr, '/')) {
             return false;
@@ -319,6 +484,16 @@ class CloudflareIpRangeService
         $prefixLength = (int) $prefix;
 
         return $prefixLength >= 0 && $prefixLength <= $maxPrefix;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (! self::$ffiResolved) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('cloudflare_cidr', self::FFI_CDEF);
+            self::$ffiResolved = true;
+        }
+
+        return self::$ffi;
     }
 
     /**
