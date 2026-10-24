@@ -6763,15 +6763,7 @@ fn find_yenc_control_line(text: &[u8], control_lower: &[u8], offset: usize) -> O
     }
     let mut search_from = offset.saturating_sub(1);
     while search_from + 1 + clen <= text.len() {
-        let rem = &text[search_from..];
-        let nl_rel = unsafe {
-            let p = memchr(rem.as_ptr(), b'\n' as i32, rem.len());
-            if p.is_null() {
-                return None;
-            }
-            p.offset_from_unsigned(rem.as_ptr())
-        };
-        let pos = search_from + nl_rel + 1;
+        let pos = find_yenc_line_prefix(text, search_from)? + 1;
         let after = pos + clen;
         if after <= text.len()
             && text[pos..after].eq_ignore_ascii_case(control_lower)
@@ -6851,73 +6843,598 @@ struct ParsedYencFrame {
     payload_length: usize,
 }
 
-fn parse_yenc_article_frame(text: &[u8]) -> Option<ParsedYencFrame> {
-    let mut offset = 0usize;
-    while let Some(begin) = find_yenc_control_line(text, b"=ybegin", offset) {
-        let rem = &text[begin..];
-        let line_end_rel = unsafe {
-            let p = memchr(rem.as_ptr(), b'\n' as i32, rem.len());
-            if p.is_null() {
-                return None;
+struct LocatedYencFrame {
+    header: Vec<(Vec<u8>, Vec<u8>)>,
+    part: Option<Vec<(Vec<u8>, Vec<u8>)>>,
+    // [begin, header LF, part LF or usize::MAX, payload, trailer, trailer LF/EOF]
+    spans: [usize; 6],
+}
+
+/// Find a line-start equals sign in bulk. Checking adjacent vectors avoids a
+/// libc call for every ordinary payload line, while keeping every load inside
+/// the input allocation (the second load is shifted by one readable byte).
+fn find_yenc_line_prefix(text: &[u8], offset: usize) -> Option<usize> {
+    let mut cursor = offset;
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        let newline = vdupq_n_u8(b'\n');
+        let equals = vdupq_n_u8(b'=');
+        while text.len() - cursor >= 17 {
+            let left = vld1q_u8(text.as_ptr().add(cursor));
+            let right = vld1q_u8(text.as_ptr().add(cursor + 1));
+            let matches = vandq_u8(vceqq_u8(left, newline), vceqq_u8(right, equals));
+            if vmaxvq_u8(matches) != 0 {
+                for lane in 0..16 {
+                    if text[cursor + lane] == b'\n' && text[cursor + lane + 1] == b'=' {
+                        return Some(cursor + lane);
+                    }
+                }
             }
-            p.offset_from_unsigned(rem.as_ptr())
-        };
-        let line_end = begin + line_end_rel;
-        let header = parse_yenc_frame_fields(&text[begin + 7..line_end], true);
-        offset = line_end + 1;
-        let has_line = header.iter().any(|(k, _)| k == b"line");
-        let has_size = header.iter().any(|(k, _)| k == b"size");
-        let has_name = header.iter().any(|(k, _)| k == b"name");
-        if !has_line || !has_size || !has_name {
+            cursor += 16;
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::*;
+        // SSE2 is part of the x86_64 baseline; no runtime CPU dispatch is needed.
+        let newline = _mm_set1_epi8(b'\n' as i8);
+        let equals = _mm_set1_epi8(b'=' as i8);
+        while text.len() - cursor >= 17 {
+            let left = _mm_loadu_si128(text.as_ptr().add(cursor).cast());
+            let right = _mm_loadu_si128(text.as_ptr().add(cursor + 1).cast());
+            let matches =
+                _mm_and_si128(_mm_cmpeq_epi8(left, newline), _mm_cmpeq_epi8(right, equals));
+            let mask = _mm_movemask_epi8(matches) as u32;
+            if mask != 0 {
+                return Some(cursor + mask.trailing_zeros() as usize);
+            }
+            cursor += 16;
+        }
+    }
+    while cursor + 1 < text.len() {
+        if text[cursor] == b'\n' && text[cursor + 1] == b'=' {
+            return Some(cursor);
+        }
+        cursor += 1;
+    }
+    None
+}
+
+/// Search both competing controls in one pass; scanning for a second header after
+/// finding the trailer would otherwise revisit the complete encoded payload.
+fn next_yenc_frame_control(text: &[u8], offset: usize) -> Option<(usize, bool)> {
+    let mut cursor = offset.saturating_sub(1);
+    while cursor < text.len() {
+        let position = find_yenc_line_prefix(text, cursor)? + 1;
+        cursor = position;
+        let tail = &text[position..];
+        if !tail.starts_with(b"=") || !tail.get(1).is_some_and(|b| b.eq_ignore_ascii_case(&b'y')) {
             continue;
         }
+        for (control, is_begin) in [(b"=yend".as_slice(), false), (b"=ybegin".as_slice(), true)] {
+            if tail.len() >= control.len()
+                && tail[..control.len()].eq_ignore_ascii_case(control)
+                && tail
+                    .get(control.len())
+                    .is_none_or(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+            {
+                return Some((position, is_begin));
+            }
+        }
+    }
+    None
+}
 
-        let mut part = None;
-        if text.len() >= offset + 7
-            && text[offset..offset + 6].eq_ignore_ascii_case(b"=ypart")
-            && matches!(text[offset + 6], b' ' | b'\t')
+fn yenc_line_end(text: &[u8], offset: usize) -> Option<usize> {
+    let rem = &text[offset..];
+    let newline = unsafe { memchr(rem.as_ptr(), b'\n' as i32, rem.len()) };
+    if newline.is_null() {
+        None
+    } else {
+        Some(offset + unsafe { newline.offset_from_unsigned(rem.as_ptr()) })
+    }
+}
+
+/// Recognize the PHP field grammar without allocating keys or values. `name`
+/// consumes the remainder, so required fields appearing inside it do not count.
+fn yenc_header_has_required_fields(mut line: &[u8]) -> bool {
+    while line.ends_with(b"\r") {
+        line = &line[..line.len() - 1];
+    }
+    let mut required = 0u8;
+    let mut pos = 0;
+    while pos < line.len() {
+        let start = if pos == 0 && line[0].is_ascii_alphabetic() {
+            0
+        } else if matches!(line[pos], b' ' | b'\t')
+            && line.get(pos + 1).is_some_and(u8::is_ascii_alphabetic)
         {
-            let prem = &text[offset..];
-            let part_end_rel = unsafe {
-                let p = memchr(prem.as_ptr(), b'\n' as i32, prem.len());
-                if p.is_null() {
-                    return None;
-                }
-                p.offset_from_unsigned(prem.as_ptr())
-            };
-            let part_end = offset + part_end_rel;
-            part = Some(parse_yenc_frame_fields(&text[offset + 6..part_end], false));
+            pos + 1
+        } else {
+            pos += 1;
+            continue;
+        };
+        let mut end = start + 1;
+        while end < line.len()
+            && (line[end].is_ascii_alphanumeric() || matches!(line[end], b'_' | b'-'))
+        {
+            end += 1;
+        }
+        if line.get(end) != Some(&b'=') {
+            pos = end;
+            continue;
+        }
+        let key = &line[start..end];
+        if key.eq_ignore_ascii_case(b"name") {
+            return required == 3;
+        }
+        if key.eq_ignore_ascii_case(b"line") {
+            required |= 1;
+        } else if key.eq_ignore_ascii_case(b"size") {
+            required |= 2;
+        }
+        pos = end + 1;
+        while pos < line.len() && !matches!(line[pos], b' ' | b'\t') {
+            pos += 1;
+        }
+    }
+    false
+}
+
+fn locate_yenc_article_frame(text: &[u8], with_fields: bool) -> Option<LocatedYencFrame> {
+    let mut offset = 0usize;
+    while let Some(begin) = find_yenc_control_line(text, b"=ybegin", offset) {
+        let line_end = yenc_line_end(text, begin)?;
+        let header_line = &text[begin + 7..line_end];
+        offset = line_end + 1;
+        if !yenc_header_has_required_fields(header_line) {
+            continue;
+        }
+        let header = if with_fields {
+            parse_yenc_frame_fields(header_line, true)
+        } else {
+            Vec::new()
+        };
+        let mut part = None;
+        let mut part_end = usize::MAX;
+        if text
+            .get(offset..offset.saturating_add(7))
+            .is_some_and(|prefix| {
+                prefix[..6].eq_ignore_ascii_case(b"=ypart") && matches!(prefix[6], b' ' | b'\t')
+            })
+        {
+            part_end = yenc_line_end(text, offset)?;
+            if with_fields {
+                part = Some(parse_yenc_frame_fields(&text[offset + 6..part_end], false));
+            }
             offset = part_end + 1;
         }
-
-        let end = find_yenc_control_line(text, b"=yend", offset)?;
-        if let Some(next_begin) = find_yenc_control_line(text, b"=ybegin", offset) {
-            if next_begin < end {
-                offset = next_begin;
-                continue;
-            }
+        let (end, is_begin) = next_yenc_frame_control(text, offset)?;
+        if is_begin {
+            offset = end;
+            continue;
         }
-
-        let trem = &text[end..];
-        let trailer_end = unsafe {
-            let p = memchr(trem.as_ptr(), b'\n' as i32, trem.len());
-            if p.is_null() {
-                text.len()
-            } else {
-                end + p.offset_from_unsigned(trem.as_ptr())
-            }
-        };
-        let trailer = parse_yenc_frame_fields(&text[end + 5..trailer_end], false);
-
-        return Some(ParsedYencFrame {
+        return Some(LocatedYencFrame {
             header,
             part,
-            trailer,
-            payload_offset: offset,
-            payload_length: end - offset,
+            spans: [
+                begin,
+                line_end,
+                part_end,
+                offset,
+                end,
+                yenc_line_end(text, end).unwrap_or(text.len()),
+            ],
         });
     }
     None
+}
+
+fn parse_yenc_article_frame(text: &[u8]) -> Option<ParsedYencFrame> {
+    let frame = locate_yenc_article_frame(text, true)?;
+    Some(ParsedYencFrame {
+        header: frame.header,
+        part: frame.part,
+        trailer: parse_yenc_frame_fields(&text[frame.spans[4] + 5..frame.spans[5]], false),
+        payload_offset: frame.spans[3],
+        payload_length: frame.spans[4] - frame.spans[3],
+    })
+}
+
+fn yenc_valid_range(address: usize, length: usize) -> bool {
+    address != 0 && length <= isize::MAX as usize && address.checked_add(length).is_some()
+}
+
+fn yenc_ranges_overlap(a: usize, a_len: usize, b: usize, b_len: usize) -> bool {
+    a_len != 0 && b_len != 0 && a < b + b_len && b < a + a_len
+}
+
+/// Encode exactly the PHP YencService wire format. Input and filename remain
+/// read-only and must not overlap the caller-owned output. A null output with
+/// zero capacity is a supported required-capacity query. Returns -1 for invalid
+/// arguments, or the negated required capacity when the output is too small.
+///
+/// # Safety
+/// Non-null pointers must address readable/writable allocations of the supplied
+/// lengths, respectively, for the duration of this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_yenc_encode(
+    input_ptr: *const u8,
+    input_len: usize,
+    filename_ptr: *const u8,
+    filename_len: usize,
+    line_len: usize,
+    crc32_flag: u8,
+    out_ptr: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if line_len == 0
+        || !yenc_valid_range(input_ptr as usize, input_len)
+        || !yenc_valid_range(filename_ptr as usize, filename_len)
+        || (out_cap != 0 && !yenc_valid_range(out_ptr as usize, out_cap))
+        || input_len
+            .checked_mul(4)
+            .and_then(|n| n.checked_add(filename_len))
+            .and_then(|n| n.checked_add(128))
+            .is_none_or(|n| n > isize::MAX as usize)
+        || yenc_ranges_overlap(input_ptr as usize, input_len, out_ptr as usize, out_cap)
+        || yenc_ranges_overlap(
+            filename_ptr as usize,
+            filename_len,
+            out_ptr as usize,
+            out_cap,
+        )
+    {
+        return -1;
+    }
+    let input = unsafe { slice::from_raw_parts(input_ptr, input_len) };
+    let filename = unsafe { slice::from_raw_parts(filename_ptr, filename_len) };
+    if filename.iter().any(|b| matches!(b, b'\r' | b'\n')) {
+        return -1;
+    }
+    let line_len = line_len.min(254);
+    let mut out = unsafe { OutCursor::new(out_ptr, out_cap) };
+    out.extend(b"=ybegin line=");
+    write_usize_decimal(&mut out, line_len);
+    out.extend(b" size=");
+    write_usize_decimal(&mut out, input_len);
+    out.extend(b" name=");
+    out.extend(php_trim(filename));
+    out.extend(b"\r\n");
+    let mut column = 0usize;
+    for &raw in input {
+        if column >= line_len {
+            out.extend(b"\r\n");
+            column = 0;
+        }
+        let byte = raw.wrapping_add(42);
+        if matches!(byte, 0 | 9 | 10 | 13 | 32 | 46 | 61) {
+            out.push(b'=');
+            out.push(byte.wrapping_add(64));
+            column += 2;
+        } else {
+            out.push(byte);
+            column += 1;
+        }
+    }
+    out.extend(b"\r\n=yend size=");
+    write_usize_decimal(&mut out, input_len);
+    if crc32_flag != 0 {
+        out.extend(b" crc32=");
+        let crc = crc32_ieee(input);
+        for shift in (0..8).rev() {
+            out.push(b"0123456789abcdef"[((crc >> (shift * 4)) & 15) as usize]);
+        }
+    }
+    out.finish()
+}
+
+/// Locate a frame without copying its payload. Six output words contain the
+/// begin control offset, header LF, part LF (usize::MAX when absent), payload
+/// start, trailer control offset, and trailer LF (or EOF). Returns 1/0/-1 for
+/// frame/no frame/invalid pointers, and leaves output untouched on 0 or -1.
+///
+/// # Safety
+/// Input must be readable for input_len bytes and out_spans must address six
+/// writable, aligned usize values in a disjoint allocation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_yenc_frame_spans(
+    input_ptr: *const u8,
+    input_len: usize,
+    out_spans: *mut usize,
+) -> i32 {
+    let out_len = 6 * size_of::<usize>();
+    if !yenc_valid_range(input_ptr as usize, input_len)
+        || !yenc_valid_range(out_spans as usize, out_len)
+        || !out_spans.is_aligned()
+        || yenc_ranges_overlap(input_ptr as usize, input_len, out_spans as usize, out_len)
+    {
+        return -1;
+    }
+    let input = unsafe { slice::from_raw_parts(input_ptr, input_len) };
+    let Some(frame) = locate_yenc_article_frame(input, false) else {
+        return 0;
+    };
+    unsafe {
+        std::ptr::copy_nonoverlapping(frame.spans.as_ptr(), out_spans, 6);
+    }
+    1
+}
+
+/// Visit raw matches of ArticleFrame::fields. Duplicate keys are deliberately
+/// retained: PHP unserialize applies the same last-value/first-position array
+/// semantics, avoiding an intermediate owned map or quadratic deduplication.
+fn visit_yenc_frame_fields<'a>(
+    mut line: &'a [u8],
+    with_name: bool,
+    mut visit: impl FnMut(&'a [u8], &'a [u8]),
+) -> usize {
+    while line.ends_with(b"\r") {
+        line = &line[..line.len() - 1];
+    }
+    let mut count = 0;
+    let mut pos = 0;
+    while pos < line.len() {
+        let start = if pos == 0 && line[0].is_ascii_alphabetic() {
+            0
+        } else if matches!(line[pos], b' ' | b'\t')
+            && line.get(pos + 1).is_some_and(u8::is_ascii_alphabetic)
+        {
+            pos + 1
+        } else {
+            pos += 1;
+            continue;
+        };
+        let mut end = start + 1;
+        while end < line.len()
+            && (line[end].is_ascii_alphanumeric() || matches!(line[end], b'_' | b'-'))
+        {
+            end += 1;
+        }
+        if line.get(end) != Some(&b'=') {
+            pos = end;
+            continue;
+        }
+        let key = &line[start..end];
+        let value_start = end + 1;
+        count += 1;
+        if with_name && key.eq_ignore_ascii_case(b"name") {
+            visit(key, &line[value_start..]);
+            break;
+        }
+        let mut value_end = value_start;
+        while value_end < line.len() && !matches!(line[value_end], b' ' | b'\t') {
+            value_end += 1;
+        }
+        visit(key, &line[value_start..value_end]);
+        pos = value_end;
+    }
+    count
+}
+
+fn write_yenc_serialized_string(out: &mut OutCursor<'_>, bytes: &[u8], lowercase: bool) {
+    out.extend(b"s:");
+    write_usize_decimal(out, bytes.len());
+    out.extend(b":\"");
+    if lowercase {
+        for &byte in bytes {
+            out.push(byte.to_ascii_lowercase());
+        }
+    } else {
+        out.extend(bytes);
+    }
+    out.extend(b"\";");
+}
+
+fn write_yenc_serialized_key(out: &mut OutCursor<'_>, key: &[u8]) {
+    // Canonical lowercase control keys are fixed byte strings. Unusual names
+    // and case variations retain the complete normalization path.
+    let encoded: &[u8] = match key {
+        b"line" => b"s:4:\"line\";",
+        b"size" => b"s:4:\"size\";",
+        b"name" => b"s:4:\"name\";",
+        b"part" => b"s:4:\"part\";",
+        b"total" => b"s:5:\"total\";",
+        b"begin" => b"s:5:\"begin\";",
+        b"end" => b"s:3:\"end\";",
+        b"crc32" => b"s:5:\"crc32\";",
+        b"pcrc32" => b"s:6:\"pcrc32\";",
+        _ => {
+            write_yenc_serialized_string(out, key, true);
+            return;
+        }
+    };
+    out.extend(encoded);
+}
+
+fn write_yenc_serialized_fields(out: &mut OutCursor<'_>, line: &[u8], with_name: bool) {
+    let mut small = [(&[][..], &[][..]); 8];
+    let mut count = 0;
+    visit_yenc_frame_fields(line, with_name, |key, value| {
+        if count < small.len() {
+            small[count] = (key, value);
+        }
+        count += 1;
+    });
+    out.extend(b"a:");
+    write_usize_decimal(out, count);
+    out.extend(b":{");
+    let mut write_field = |key: &[u8], value: &[u8]| {
+        write_yenc_serialized_key(out, key);
+        write_yenc_serialized_string(out, value, false);
+    };
+    if count <= small.len() {
+        for &(key, value) in &small[..count] {
+            write_field(key, value);
+        }
+    } else {
+        // Large or duplicate-rich metadata still has linear work and no heap
+        // allocation; the usual small map requires only one grammar scan.
+        visit_yenc_frame_fields(line, with_name, &mut write_field);
+    }
+    out.push(b'}');
+}
+
+/// Return metadata only as a PHP serialized App\Services\Yenc\ArticleFrame
+/// object with header, part, trailer, payloadOffset and payloadLength. String byte
+/// lengths protect binary metadata, including NULs and serialization syntax.
+/// No payload bytes are copied, and no owned maps are built. A zero trailer flag
+/// emits an empty trailer array. Returns 0 without touching output for no frame,
+/// -1 for invalid arguments, or the negative required capacity when too small.
+///
+/// # Safety
+/// Input and output must address readable/writable allocations of their supplied
+/// lengths and must be disjoint. Null output is valid only with zero capacity.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_yenc_frame_record(
+    input_ptr: *const u8,
+    input_len: usize,
+    parse_trailer_fields: u8,
+    out_ptr: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if !yenc_valid_range(input_ptr as usize, input_len)
+        || (out_cap != 0 && !yenc_valid_range(out_ptr as usize, out_cap))
+        || input_len
+            .checked_mul(64)
+            .and_then(|length| length.checked_add(256))
+            .is_none_or(|length| length > isize::MAX as usize)
+        || yenc_ranges_overlap(input_ptr as usize, input_len, out_ptr as usize, out_cap)
+    {
+        return -1;
+    }
+    let input = unsafe { slice::from_raw_parts(input_ptr, input_len) };
+    let Some(frame) = locate_yenc_article_frame(input, false) else {
+        return 0;
+    };
+    let [
+        begin,
+        header_end,
+        part_end,
+        payload_start,
+        trailer_start,
+        trailer_end,
+    ] = frame.spans;
+    let mut out = unsafe { OutCursor::new(out_ptr, out_cap) };
+    let class = b"App\\Services\\Yenc\\ArticleFrame";
+    out.extend(b"O:");
+    write_usize_decimal(&mut out, class.len());
+    out.extend(b":\"");
+    out.extend(class);
+    out.extend(b"\":5:{s:6:\"header\";");
+    write_yenc_serialized_fields(&mut out, &input[begin + 7..header_end], true);
+    out.extend(b"s:4:\"part\";");
+    if part_end == usize::MAX {
+        out.extend(b"N;");
+    } else {
+        write_yenc_serialized_fields(&mut out, &input[header_end + 7..part_end], false);
+    }
+    out.extend(b"s:7:\"trailer\";");
+    if parse_trailer_fields != 0 {
+        write_yenc_serialized_fields(&mut out, &input[trailer_start + 5..trailer_end], false);
+    } else {
+        out.extend(b"a:0:{}");
+    }
+    out.extend(b"s:13:\"payloadOffset\";i:");
+    write_usize_decimal(&mut out, payload_start);
+    out.extend(b";s:13:\"payloadLength\";i:");
+    write_usize_decimal(&mut out, trailer_start - payload_start);
+    out.extend(b";}");
+    out.finish()
+}
+
+fn yenc_field<'a>(fields: &'a [(Vec<u8>, Vec<u8>)], key: &[u8]) -> Option<&'a [u8]> {
+    fields
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, value)| value.as_slice())
+}
+
+/// Metadata is advisory: prefer a valid trailer size, then a valid 1-based part
+/// range, then a valid header size; use -1 when none is available. Multipart
+/// frames select pcrc32, others crc32. Invalid/missing CRC metadata has length 0;
+/// valid 1..8 hex digits are lowercase and left-padded to eight bytes. Metadata
+/// errors never reject an otherwise complete frame.
+///
+/// # Safety
+/// All outputs must point to writable, aligned values (CRC: eight bytes), be
+/// pairwise disjoint, and not overlap the readable input allocation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_yenc_parse_frame(
+    input_ptr: *const u8,
+    input_len: usize,
+    out_payload_start: *mut usize,
+    out_payload_len: *mut usize,
+    out_expected_size: *mut i64,
+    out_expected_crc: *mut u8,
+    out_crc_len: *mut usize,
+) -> i32 {
+    let outputs = [
+        (out_payload_start as usize, size_of::<usize>()),
+        (out_payload_len as usize, size_of::<usize>()),
+        (out_expected_size as usize, size_of::<i64>()),
+        (out_expected_crc as usize, 8),
+        (out_crc_len as usize, size_of::<usize>()),
+    ];
+    if !yenc_valid_range(input_ptr as usize, input_len)
+        || !out_payload_start.is_aligned()
+        || !out_payload_len.is_aligned()
+        || !out_expected_size.is_aligned()
+        || !out_crc_len.is_aligned()
+        || outputs
+            .iter()
+            .any(|&(address, length)| !yenc_valid_range(address, length))
+    {
+        return -1;
+    }
+    for (i, &(address, length)) in outputs.iter().enumerate() {
+        if yenc_ranges_overlap(input_ptr as usize, input_len, address, length)
+            || outputs[..i]
+                .iter()
+                .any(|&(other, other_len)| yenc_ranges_overlap(address, length, other, other_len))
+        {
+            return -1;
+        }
+    }
+    let input = unsafe { slice::from_raw_parts(input_ptr, input_len) };
+    let Some(frame) = parse_yenc_article_frame(input) else {
+        return 0;
+    };
+    let number = |fields: &[(Vec<u8>, Vec<u8>)], key: &[u8]| {
+        yenc_field(fields, key).and_then(nzb_metadata_number)
+    };
+    let part_size = frame.part.as_ref().and_then(|part| {
+        let begin = number(part, b"begin")?;
+        let end = number(part, b"end")?;
+        (begin >= 1 && end >= begin).then(|| end - begin + 1)
+    });
+    let size = number(&frame.trailer, b"size")
+        .or(part_size)
+        .or_else(|| number(&frame.header, b"size"))
+        .unwrap_or(-1);
+    let multipart = frame.part.is_some()
+        || yenc_field(&frame.header, b"part").is_some()
+        || yenc_field(&frame.trailer, b"part").is_some();
+    let mut crc = [0u8; 8];
+    let mut crc_len = 0;
+    if let Some(raw) = yenc_field(&frame.trailer, if multipart { b"pcrc32" } else { b"crc32" }) {
+        if !raw.is_empty() && raw.len() <= 8 && raw.iter().all(u8::is_ascii_hexdigit) {
+            crc.fill(b'0');
+            for (target, source) in crc[8 - raw.len()..].iter_mut().zip(raw) {
+                *target = source.to_ascii_lowercase();
+            }
+            crc_len = 8;
+        }
+    }
+    unsafe {
+        out_payload_start.write(frame.payload_offset);
+        out_payload_len.write(frame.payload_length);
+        out_expected_size.write(size);
+        std::ptr::copy_nonoverlapping(crc.as_ptr(), out_expected_crc, 8);
+        out_crc_len.write(crc_len);
+    }
+    1
 }
 
 pub(crate) fn nzb_analyze_article_body_into(
@@ -7853,5 +8370,572 @@ mod tests {
             );
         }
         assert_eq!(crc32_ieee(b"123456789"), 0xCBF4_3926);
+    }
+}
+
+#[cfg(test)]
+mod yenc_ffi_tests {
+    use super::*;
+
+    fn encode(data: &[u8], filename: &[u8], line: usize, crc: bool) -> Vec<u8> {
+        let required = unsafe {
+            nntmux_yenc_encode(
+                data.as_ptr(),
+                data.len(),
+                filename.as_ptr(),
+                filename.len(),
+                line,
+                u8::from(crc),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        assert!(required < -1);
+        let mut output = vec![0; (-required) as usize];
+        let written = unsafe {
+            nntmux_yenc_encode(
+                data.as_ptr(),
+                data.len(),
+                filename.as_ptr(),
+                filename.len(),
+                line,
+                u8::from(crc),
+                output.as_mut_ptr(),
+                output.len(),
+            )
+        };
+        assert_eq!(written, output.len() as isize);
+        output
+    }
+
+    fn parse(data: &[u8]) -> (i32, usize, usize, i64, [u8; 8], usize) {
+        let (mut start, mut length, mut size, mut crc, mut crc_len) = (99, 99, 99, [b'?'; 8], 99);
+        let status = unsafe {
+            nntmux_yenc_parse_frame(
+                data.as_ptr(),
+                data.len(),
+                &mut start,
+                &mut length,
+                &mut size,
+                crc.as_mut_ptr(),
+                &mut crc_len,
+            )
+        };
+        (status, start, length, size, crc, crc_len)
+    }
+
+    #[test]
+    fn encoder_exact_php_wire_format_and_trim() {
+        assert_eq!(
+            encode(b"", b" \t\0\x0bname\0 ", usize::MAX, true),
+            b"=ybegin line=254 size=0 name=name\r\n\r\n=yend size=0 crc32=00000000"
+        );
+        assert_eq!(
+            encode(b"123456789", b"test.bin", 128, true),
+            b"=ybegin line=128 size=9 name=test.bin\r\n[\\]^_`abc\r\n=yend size=9 crc32=cbf43926"
+        );
+        // Each special transformed byte is escaped, including dots away from
+        // line starts; an escape can cross the line limit before the next byte.
+        let input: Vec<u8> = [0u8, 9, 10, 13, 32, 46, 61]
+            .iter()
+            .map(|b| b.wrapping_sub(42))
+            .collect();
+        assert_eq!(
+            encode(&input, b"x", 3, false),
+            b"=ybegin line=3 size=7 name=x\r\n=@=I\r\n=J=M\r\n=`=n\r\n=}\r\n=yend size=7"
+        );
+        assert_eq!(
+            encode(b"\x00\x01", b"x", 1, false),
+            b"=ybegin line=1 size=2 name=x\r\n*\r\n+\r\n=yend size=2"
+        );
+    }
+
+    #[test]
+    fn encoder_buffers_and_invalid_arguments() {
+        let mut output = [0x7f; 3];
+        let data = b"data";
+        let filename = b"x";
+        let result = unsafe {
+            nntmux_yenc_encode(
+                data.as_ptr(),
+                data.len(),
+                filename.as_ptr(),
+                1,
+                128,
+                0,
+                output.as_mut_ptr(),
+                output.len(),
+            )
+        };
+        assert_eq!((-result) as usize, encode(data, filename, 128, false).len());
+        for bad_filename in [b"x\r".as_slice(), b"x\n".as_slice()] {
+            assert_eq!(
+                unsafe {
+                    nntmux_yenc_encode(
+                        data.as_ptr(),
+                        4,
+                        bad_filename.as_ptr(),
+                        bad_filename.len(),
+                        128,
+                        1,
+                        output.as_mut_ptr(),
+                        3,
+                    )
+                },
+                -1
+            );
+        }
+        assert_eq!(
+            unsafe {
+                nntmux_yenc_encode(
+                    data.as_ptr(),
+                    4,
+                    filename.as_ptr(),
+                    1,
+                    0,
+                    0,
+                    output.as_mut_ptr(),
+                    3,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_yenc_encode(
+                    std::ptr::null(),
+                    0,
+                    filename.as_ptr(),
+                    1,
+                    128,
+                    0,
+                    output.as_mut_ptr(),
+                    3,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_yenc_encode(
+                    data.as_ptr(),
+                    4,
+                    filename.as_ptr(),
+                    1,
+                    128,
+                    0,
+                    std::ptr::null_mut(),
+                    3,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_yenc_encode(
+                    output.as_ptr(),
+                    3,
+                    filename.as_ptr(),
+                    1,
+                    128,
+                    0,
+                    output.as_mut_ptr(),
+                    3,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_yenc_encode(
+                    data.as_ptr(),
+                    usize::MAX,
+                    filename.as_ptr(),
+                    1,
+                    128,
+                    0,
+                    output.as_mut_ptr(),
+                    3,
+                )
+            },
+            -1
+        );
+    }
+
+    fn record(input: &[u8], trailer: bool) -> Vec<u8> {
+        let needed = unsafe {
+            nntmux_yenc_frame_record(
+                input.as_ptr(),
+                input.len(),
+                u8::from(trailer),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        assert!(needed < -1);
+        let mut output = vec![0; (-needed) as usize];
+        assert_eq!(
+            unsafe {
+                nntmux_yenc_frame_record(
+                    input.as_ptr(),
+                    input.len(),
+                    u8::from(trailer),
+                    output.as_mut_ptr(),
+                    output.len(),
+                )
+            },
+            output.len() as isize
+        );
+        output
+    }
+
+    #[test]
+    fn record_streams_duplicate_and_binary_metadata_with_exact_byte_lengths() {
+        let article = b"=ybegin LINE=1 size=3 line=2 name=x\0\xff\r\r\n=ypart begin=1 end=3 BEGIN=2\r\n*+-\r\n=yend size=3 crc32=A crc32=B\r\r";
+        let parsed = parse_yenc_article_frame(article).unwrap();
+        let mut expected = b"O:30:\"App\\Services\\Yenc\\ArticleFrame\":5:{s:6:\"header\";a:4:{s:4:\"line\";s:1:\"1\";s:4:\"size\";s:1:\"3\";s:4:\"line\";s:1:\"2\";s:4:\"name\";s:3:\"x\0\xff\";}s:4:\"part\";a:3:{s:5:\"begin\";s:1:\"1\";s:3:\"end\";s:1:\"3\";s:5:\"begin\";s:1:\"2\";}s:7:\"trailer\";a:3:{s:4:\"size\";s:1:\"3\";s:5:\"crc32\";s:1:\"A\";s:5:\"crc32\";s:1:\"B\";}".to_vec();
+        expected.extend(
+            format!(
+                "s:13:\"payloadOffset\";i:{};s:13:\"payloadLength\";i:{};}}",
+                parsed.payload_offset, parsed.payload_length
+            )
+            .as_bytes(),
+        );
+        assert_eq!(record(article, true), expected);
+        let without_trailer = record(article, false);
+        assert!(
+            without_trailer
+                .windows(b"s:7:\"trailer\";a:0:{}s:13:\"payloadOffset\";".len())
+                .any(|window| window == b"s:7:\"trailer\";a:0:{}s:13:\"payloadOffset\";")
+        );
+        let plain = record(
+            b"=ybegin line=1 size=0 name=\";}i:99;N;\0\n\n=yend size=0",
+            true,
+        );
+        assert!(
+            plain
+                .windows(b"s:4:\"part\";N;s:7:\"trailer\";".len())
+                .any(|window| window == b"s:4:\"part\";N;s:7:\"trailer\";")
+        );
+    }
+
+    #[test]
+    fn record_small_stack_and_large_fallback_match_generic_serialization() {
+        for line in [
+            b"".as_slice(),
+            b"line=128 size=4 name=x",
+            b"part=1 total=2 line=128 size=4 name=x",
+            b"line=1 size=0 a=1 b=2 c=3 d=4 e=5 f=6 g=7 name=\0\xff",
+            b"crc32=A pcrc32=B CRC32=C begin=1 end=2 strange-key=v",
+        ] {
+            for with_name in [false, true] {
+                let mut expected = [0; 2048];
+                let mut actual = [0; 2048];
+                let mut reference =
+                    unsafe { OutCursor::new(expected.as_mut_ptr(), expected.len()) };
+                reference.extend(b"a:");
+                write_usize_decimal(
+                    &mut reference,
+                    visit_yenc_frame_fields(line, with_name, |_, _| {}),
+                );
+                reference.extend(b":{");
+                visit_yenc_frame_fields(line, with_name, |key, value| {
+                    write_yenc_serialized_string(&mut reference, key, true);
+                    write_yenc_serialized_string(&mut reference, value, false);
+                });
+                reference.push(b'}');
+                let expected_len = reference.finish() as usize;
+                let mut output = unsafe { OutCursor::new(actual.as_mut_ptr(), actual.len()) };
+                write_yenc_serialized_fields(&mut output, line, with_name);
+                let actual_len = output.finish() as usize;
+                assert_eq!(&actual[..actual_len], &expected[..expected_len]);
+            }
+        }
+    }
+
+    #[test]
+    fn record_buffer_no_frame_and_invalid_pointer_contracts() {
+        let article = b"=ybegin line=128 size=1 name=x\n*\n=yend size=1";
+        let expected = record(article, true);
+        let mut output = [0x7f; 3];
+        assert_eq!(
+            unsafe {
+                nntmux_yenc_frame_record(
+                    article.as_ptr(),
+                    article.len(),
+                    1,
+                    output.as_mut_ptr(),
+                    output.len(),
+                )
+            },
+            -(expected.len() as isize)
+        );
+        output.fill(0x7f);
+        assert_eq!(
+            unsafe {
+                nntmux_yenc_frame_record(b"plain text".as_ptr(), 10, 1, output.as_mut_ptr(), 3)
+            },
+            0
+        );
+        assert_eq!(output, [0x7f; 3]);
+        assert_eq!(
+            unsafe { nntmux_yenc_frame_record(std::ptr::null(), 0, 1, output.as_mut_ptr(), 3) },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_yenc_frame_record(
+                    article.as_ptr(),
+                    article.len(),
+                    1,
+                    std::ptr::null_mut(),
+                    3,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_yenc_frame_record(article.as_ptr(), usize::MAX, 1, output.as_mut_ptr(), 3)
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_yenc_frame_record(output.as_ptr(), 3, 1, output.as_mut_ptr(), 3) },
+            -1
+        );
+    }
+
+    #[test]
+    fn initial_control_search_matches_scalar_with_dense_newlines() {
+        let cases: &[&[u8]] = &[
+            b"",
+            b"\n\n\n",
+            b"=ybegin",
+            b"=YBEGIN ",
+            b"=ybeginx\n=yend",
+            b"prefix\n=YBEGIN\tline=128",
+            b"\n\n=ypart\n=ybeginx\n=yBEGIN\r\n=yend\n",
+        ];
+        let mut dense = b"ordinary text\n=not a control\n\n".repeat(256);
+        dense.extend(b"=ybeginx\n=yendx\n=YBEGIN size=0 line=128 name=x\n\n=yend size=0");
+        for text in cases
+            .iter()
+            .copied()
+            .chain(std::iter::once(dense.as_slice()))
+        {
+            for control in [b"=ybegin".as_slice(), b"=yend"] {
+                for offset in 0..=text.len() {
+                    let expected = (offset..text.len()).find(|&pos| {
+                        (pos == 0 || text[pos - 1] == b'\n')
+                            && text
+                                .get(pos..pos + control.len())
+                                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(control))
+                            && text
+                                .get(pos + control.len())
+                                .is_none_or(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+                    });
+                    assert_eq!(
+                        find_yenc_control_line(text, control, offset),
+                        expected,
+                        "offset={offset} control={control:?}"
+                    );
+                }
+            }
+        }
+        assert_eq!(parse(&b"ordinary text\n".repeat(1024)).0, 0);
+    }
+
+    #[test]
+    fn vector_line_prefix_matches_scalar_at_all_boundaries() {
+        for length in 0..160 {
+            for prefix in 0..length {
+                let mut storage = vec![b'x'; length + 32];
+                for alignment in 0..16 {
+                    storage.fill(b'x');
+                    let text = &mut storage[alignment..alignment + length];
+                    text[prefix] = b'\n';
+                    if prefix + 1 < length {
+                        text[prefix + 1] = b'=';
+                    }
+                    for offset in [
+                        0,
+                        prefix.saturating_sub(1),
+                        prefix,
+                        (prefix + 1).min(length),
+                        length,
+                    ] {
+                        let expected = text[offset..]
+                            .windows(2)
+                            .position(|pair| pair == b"\n=")
+                            .map(|position| offset + position);
+                        assert_eq!(
+                            find_yenc_line_prefix(text, offset),
+                            expected,
+                            "len={length} prefix={prefix} alignment={alignment} offset={offset}"
+                        );
+                    }
+                }
+            }
+        }
+        for length in 0..160 {
+            let text: Vec<u8> = (0..length)
+                .map(|i| [b'\n', b'x', b'=', b'\n', b'='][i % 5])
+                .collect();
+            for offset in 0..=length {
+                let expected = text[offset..]
+                    .windows(2)
+                    .position(|pair| pair == b"\n=")
+                    .map(|position| offset + position);
+                assert_eq!(find_yenc_line_prefix(&text, offset), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn allocation_free_header_validation_matches_full_fields_parser() {
+        let chunks: &[&[u8]] = &[
+            b"line=128",
+            b"size=",
+            b"name=x size=4",
+            b"LiNe=",
+            b"SIZE=23",
+            b"NAME=",
+            b"bad",
+            b"!name=x",
+            b"x=",
+            b"\t",
+            b" ",
+            b"\r",
+            b"\0",
+            b"a-b_4=5",
+            b"name\n=x",
+        ];
+        let mut state = 0x9e3779b9u32;
+        for _ in 0..4096 {
+            let mut line = Vec::new();
+            for _ in 0..12 {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                line.extend(chunks[state as usize % chunks.len()]);
+            }
+            let fields = parse_yenc_frame_fields(&line, true);
+            let expected = [b"line".as_slice(), b"size", b"name"]
+                .iter()
+                .all(|key| fields.iter().any(|(k, _)| k == key));
+            assert_eq!(yenc_header_has_required_fields(&line), expected, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn parser_offsets_spans_case_and_nested_begin() {
+        let article = b"preamble\n=ybegin line=128 size=99 name=old\nignored\n=YBEGIN line=128 size=4 name=test.bin\r\n=YPART begin=3 end=6\r\n*+,-\r\n=YEND size=4 pcrc32=ABc\npostamble";
+        let (status, start, length, size, crc, crc_len) = parse(article);
+        assert_eq!(status, 1);
+        assert_eq!(&article[start..start + length], b"*+,-\r\n");
+        assert_eq!((size, crc, crc_len), (4, *b"00000abc", 8));
+        let mut spans = [0; 6];
+        assert_eq!(
+            unsafe { nntmux_yenc_frame_spans(article.as_ptr(), article.len(), spans.as_mut_ptr()) },
+            1
+        );
+        assert_eq!(
+            &article[spans[0]..spans[1]],
+            b"=YBEGIN line=128 size=4 name=test.bin\r"
+        );
+        assert_eq!(&article[spans[1] + 1..spans[2]], b"=YPART begin=3 end=6\r");
+        assert_eq!(spans[3], start);
+        assert_eq!(spans[4] - spans[3], length);
+        assert_eq!(&article[spans[4]..spans[5]], b"=YEND size=4 pcrc32=ABc");
+    }
+
+    #[test]
+    fn parser_metadata_is_advisory_and_crc_selection_is_multipart_aware() {
+        let (status, _, _, size, crc, crc_len) = parse(b"=ybegin line=0 size=999 name=x\n=ypart begin=4 end=8\npayload\n=yend size=bad crc32=ffffffff pcrc32=G");
+        assert_eq!((status, size, crc, crc_len), (1, 5, [0; 8], 0));
+        assert_eq!(
+            parse(b"=ybegin line=bad size=007 name=x\npayload\n=yend crc32=F").3,
+            7
+        );
+        assert_eq!(
+            parse(b"=ybegin line=bad size=999999999999999999999 name=x\npayload\n=yend size=-1").3,
+            -1
+        );
+        assert_eq!(
+            parse(b"=ybegin line=128 size=3 part=1 name=x\npayload\n=yend crc32=f").5,
+            0
+        );
+        assert_eq!(
+            parse(b"=ybegin line=128 size=3 name=x\npayload\n=yend part=1 crc32=f pcrc32=Ab").4,
+            *b"000000ab"
+        );
+        let article = b"=ybegin size=3 line=128 name=x\npayload\n=yend size=0 crc32=f";
+        assert_eq!(parse(article).3, 0);
+        let mut spans = [0; 6];
+        assert_eq!(
+            unsafe { nntmux_yenc_frame_spans(article.as_ptr(), article.len(), spans.as_mut_ptr()) },
+            1
+        );
+        assert_eq!(spans[2], usize::MAX);
+        assert_eq!(spans[5], article.len());
+    }
+
+    #[test]
+    fn parser_no_frame_invalid_boundaries_and_invalid_pointers() {
+        for data in [
+            b"".as_slice(),
+            b"=ybegin line=128 size=1 name=x",
+            b"=ybegin line=128 name=x\n*=yend size=1",
+            b"=ybeginx line=128 size=1 name=x\n*\n=yend size=1",
+            b"=ybegin line=128 size=1 name=x\n=ypart begin=1 end=1",
+            b"=ybegin line=128 size=1 name=x\n*\n=yendx size=1",
+        ] {
+            assert_eq!(parse(data), (0, 99, 99, 99, [b'?'; 8], 99));
+        }
+        let article = b"=ybegin line=128 size=1 name=x\n*\n=yend size=1";
+        let mut spans = [7; 6];
+        assert_eq!(
+            unsafe { nntmux_yenc_frame_spans(std::ptr::null(), 0, spans.as_mut_ptr()) },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_yenc_frame_spans(article.as_ptr(), article.len(), std::ptr::null_mut())
+            },
+            -1
+        );
+        assert_eq!(spans, [7; 6]);
+        let (mut start, mut length, mut size, mut crc, mut crc_len) = (0, 0, 0, [0; 8], 0);
+        assert_eq!(
+            unsafe {
+                nntmux_yenc_parse_frame(
+                    article.as_ptr(),
+                    article.len(),
+                    &mut start,
+                    &mut length,
+                    &mut size,
+                    std::ptr::null_mut(),
+                    &mut crc_len,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_yenc_parse_frame(
+                    article.as_ptr(),
+                    article.len(),
+                    &mut start,
+                    &mut length,
+                    &mut size,
+                    crc.as_mut_ptr(),
+                    &mut start,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_yenc_frame_spans(article.as_ptr(), usize::MAX, spans.as_mut_ptr()) },
+            -1
+        );
     }
 }
