@@ -13391,3 +13391,803 @@ mod cleaning_wave19_name_fix_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod wave20_tests {
+    use super::*;
+
+    type Export = unsafe extern "C" fn(u32, *const u8, usize, *mut u8, usize) -> isize;
+
+    fn frames(values: &[&[u8]]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for value in values {
+            bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(value);
+        }
+        bytes
+    }
+
+    fn check(export: Export, mode: u32, input: &[u8], expected: &[u8]) {
+        let mut output = vec![0x5a; expected.len() + 1];
+        unsafe {
+            if !expected.is_empty() {
+                assert_eq!(
+                    export(
+                        mode,
+                        input.as_ptr(),
+                        input.len(),
+                        output.as_mut_ptr(),
+                        expected.len() - 1
+                    ),
+                    -2
+                );
+                assert!(output.iter().all(|&byte| byte == 0x5a));
+            }
+            assert_eq!(
+                export(
+                    mode,
+                    input.as_ptr(),
+                    input.len(),
+                    output.as_mut_ptr(),
+                    expected.len()
+                ),
+                expected.len() as isize
+            );
+        }
+        assert_eq!(&output[..expected.len()], expected);
+        assert_eq!(output[expected.len()], 0x5a);
+        // Shift both byte pointers by one: alignment 1 accepts these addresses.
+        let mut shared = vec![0x5a; input.len().max(expected.len()) + 2];
+        shared[1..input.len() + 1].copy_from_slice(input);
+        let pointer = unsafe { shared.as_mut_ptr().add(1) };
+        unsafe {
+            assert_eq!(
+                export(mode, pointer, input.len(), pointer, expected.len()),
+                expected.len() as isize
+            );
+        }
+        assert_eq!(&shared[1..expected.len() + 1], expected);
+    }
+
+    fn reject(export: Export, mode: u32, input: &[u8]) {
+        let mut output = [0x5a; 256];
+        unsafe {
+            assert_eq!(
+                export(
+                    mode,
+                    input.as_ptr(),
+                    input.len(),
+                    output.as_mut_ptr(),
+                    output.len()
+                ),
+                -1
+            );
+        }
+        assert_eq!(output, [0x5a; 256]);
+    }
+
+    #[test]
+    fn backfill_modes_preserve_flags_date_and_independent_repair() {
+        check(nntmux_wave20_backfill, 0, b"0", b"backfill");
+        check(nntmux_wave20_backfill, 0, b"1", b"update");
+        for repair in [b"0".as_slice(), b"1"] {
+            for disable in [b"0".as_slice(), b"1"] {
+                let date = b"2026-10-24\0\xff";
+                let input = frames(&[b"1", b"0", date, repair, disable]);
+                let resolved: &[u8] = if repair == b"1" {
+                    b"update"
+                } else {
+                    b"backfill"
+                };
+                check(
+                    nntmux_wave20_backfill,
+                    1,
+                    &input,
+                    &frames(&[b"1", b"0", date, resolved, disable]),
+                );
+            }
+        }
+        for flag_index in [0, 1, 3, 4] {
+            let mut values: [&[u8]; 5] = [b"0", b"0", b"", b"0", b"0"];
+            values[flag_index] = b"2";
+            reject(nntmux_wave20_backfill, 1, &frames(&values));
+        }
+        reject(nntmux_wave20_backfill, 0, b"");
+        reject(nntmux_wave20_backfill, 0, b"true");
+        reject(nntmux_wave20_backfill, 1, &frames(&[b"0"]));
+    }
+
+    #[test]
+    fn group_modes_dedupe_byte_names_and_build_inactive_defaults() {
+        let max = vec![b'x'; 255];
+        let too_long = vec![b'x'; 256];
+        let input = frames(&[b"a", b"a", b"A", b"", b"a\0\xff", &max, &too_long, b""]);
+        check(
+            nntmux_wave20_group,
+            0,
+            &input,
+            &frames(&[b"a", b"A", b"", b"a\0\xff", &max]),
+        );
+        check(nntmux_wave20_group, 0, b"", b"");
+        for name in [b"".as_slice(), b"a\0\xff"] {
+            check(
+                nntmux_wave20_group,
+                1,
+                name,
+                &frames(&[
+                    name,
+                    b"Added by Release processing",
+                    b"1",
+                    b"0",
+                    b"0",
+                    b"0",
+                    b"0",
+                    b"",
+                    b"",
+                ]),
+            );
+        }
+    }
+
+    #[test]
+    fn recat_modes_match_snapshot_hex_and_category_predicate() {
+        check(nntmux_wave20_recat, 0, b"", b"1");
+        check(
+            nntmux_wave20_recat,
+            0,
+            &frames(&[b"-1", b"a\0\xff", b"-1", b"a\0\xff"]),
+            b"1",
+        );
+        check(
+            nntmux_wave20_recat,
+            0,
+            &frames(&[b"1", b"a", b"2", b"a"]),
+            b"0",
+        );
+        check(
+            nntmux_wave20_recat,
+            0,
+            &frames(&[b"1", b"a", b"1", b"A"]),
+            b"0",
+        );
+        check(nntmux_wave20_recat, 1, b"\0\xffAz", b"00FF417A");
+        check(nntmux_wave20_recat, 1, b"", b"");
+        for (current, new, categorized, result) in [
+            (
+                b"1".as_slice(),
+                b"1".as_slice(),
+                b"1".as_slice(),
+                b"1".as_slice(),
+            ),
+            (b"1", b"1", b"0", b"0"),
+            (b"1", b"2", b"1", b"0"),
+            (b"-1", b"-1", b"2", b"0"),
+        ] {
+            check(
+                nntmux_wave20_recat,
+                2,
+                &frames(&[current, new, categorized]),
+                result,
+            );
+        }
+        for invalid in [
+            b"01".as_slice(),
+            b"-0",
+            b"+1",
+            b"",
+            b"9223372036854775808",
+            b"-9223372036854775809",
+            b"1\0",
+        ] {
+            reject(
+                nntmux_wave20_recat,
+                0,
+                &frames(&[invalid, b"a", b"1", b"a"]),
+            );
+            reject(nntmux_wave20_recat, 2, &frames(&[b"1", invalid, b"0"]));
+        }
+        check(
+            nntmux_wave20_recat,
+            2,
+            &frames(&[b"-9223372036854775808", b"-9223372036854775808", b"1"]),
+            b"1",
+        );
+        reject(nntmux_wave20_recat, 0, &frames(&[b"1"]));
+        reject(nntmux_wave20_recat, 2, b"");
+    }
+
+    #[test]
+    fn report_reasons_match_php_trim_empty_ucfirst_and_label_deduplication() {
+        check(nntmux_wave20_report, 0, b"", b"Unknown");
+        check(nntmux_wave20_report, 0, b"0", b"Unknown");
+        check(nntmux_wave20_report, 0, b"duplicate,fake,password,incomplete,wrong_category,spam,other", b"Duplicate Release, Fake/Malicious Content, Password Protected, Incomplete/Corrupted, Wrong Category, Spam/Advertisement, Other");
+        check(
+            nntmux_wave20_report,
+            0,
+            b" \t\n\r\0\x0bspam\0,spam,other,Other,unknown,Unknown",
+            b"Spam/Advertisement, Other, Unknown",
+        );
+        check(nntmux_wave20_report, 0, b" ,,, ", b"");
+        check(
+            nntmux_wave20_report,
+            0,
+            b"\x0cspam\x0c,\xfffoo,a\0b,0",
+            b"\x0cspam\x0c, \xfffoo, A\0b, 0",
+        );
+    }
+
+    #[test]
+    fn report_stats_include_unknown_statuses_and_checked_nonnegative_counts() {
+        check(
+            nntmux_wave20_report,
+            1,
+            b"",
+            &frames(&[b"0", b"0", b"0", b"0", b"0"]),
+        );
+        check(
+            nntmux_wave20_report,
+            1,
+            &frames(&[b"pending", b"2", b"resolved", b"3", b"other\0\xff", b"4"]),
+            &frames(&[b"2", b"0", b"3", b"0", b"9"]),
+        );
+        check(
+            nntmux_wave20_report,
+            1,
+            &frames(&[b"reviewed", b"0", b"dismissed", b"9223372036854775807"]),
+            &frames(&[
+                b"0",
+                b"0",
+                b"0",
+                b"9223372036854775807",
+                b"9223372036854775807",
+            ]),
+        );
+        for invalid in [
+            b"-1".as_slice(),
+            b"01",
+            b"+1",
+            b"",
+            b"9223372036854775808",
+            b"1\0",
+        ] {
+            reject(nntmux_wave20_report, 1, &frames(&[b"pending", invalid]));
+        }
+        reject(nntmux_wave20_report, 1, &frames(&[b"pending"]));
+        reject(
+            nntmux_wave20_report,
+            1,
+            &frames(&[b"pending", b"9223372036854775807", b"other", b"1"]),
+        );
+    }
+
+    #[test]
+    fn file_modes_validate_hash_and_snapshot_eligibility() {
+        check(
+            nntmux_wave20_file,
+            0,
+            b"0123456789ABCDEFabcdef0123456789",
+            b"0123456789abcdefabcdef0123456789",
+        );
+        for hash in [
+            b"".as_slice(),
+            b"0123456789ABCDEFabcdef0123456789A",
+            b"g123456789ABCDEFabcdef0123456789AB",
+            b"\0\xff",
+        ] {
+            check(nntmux_wave20_file, 0, hash, b"");
+        }
+        for (has, predb, renamed, expected) in [
+            (
+                b"1".as_slice(),
+                b"0".as_slice(),
+                b"0".as_slice(),
+                b"1".as_slice(),
+            ),
+            (b"1", b"0", b"1", b"1"),
+            (b"0", b"0", b"0", b"0"),
+            (b"1", b"1", b"0", b"0"),
+            (b"1", b"0", b"2", b"0"),
+            (b"1", b"-1", b"0", b"0"),
+        ] {
+            check(
+                nntmux_wave20_file,
+                1,
+                &frames(&[has, predb, renamed]),
+                expected,
+            );
+        }
+        reject(nntmux_wave20_file, 1, &frames(&[b"2", b"0", b"0"]));
+        reject(nntmux_wave20_file, 1, &frames(&[b"1", b"00", b"0"]));
+        reject(nntmux_wave20_file, 1, &frames(&[b"1", b"0", b"01"]));
+    }
+
+    #[test]
+    fn all_exports_reject_invalid_regions_modes_and_malformed_frames_without_writes() {
+        let exports: [Export; 5] = [
+            nntmux_wave20_backfill,
+            nntmux_wave20_group,
+            nntmux_wave20_recat,
+            nntmux_wave20_report,
+            nntmux_wave20_file,
+        ];
+        for export in exports {
+            let mut output = [0x5a; 16];
+            unsafe {
+                assert_eq!(export(0, std::ptr::null(), 0, output.as_mut_ptr(), 16), -1);
+                assert_eq!(export(0, b"".as_ptr(), 0, std::ptr::null_mut(), 0), -1);
+                assert_eq!(
+                    export(0, b"".as_ptr(), usize::MAX, output.as_mut_ptr(), 16),
+                    -1
+                );
+                assert_eq!(
+                    export(0, b"".as_ptr(), 0, output.as_mut_ptr(), usize::MAX),
+                    -1
+                );
+            }
+            assert_eq!(output, [0x5a; 16]);
+            reject(export, u32::MAX, b"");
+        }
+        for (export, mode) in [
+            (nntmux_wave20_backfill as Export, 1),
+            (nntmux_wave20_group as Export, 0),
+            (nntmux_wave20_recat as Export, 0),
+            (nntmux_wave20_recat as Export, 2),
+            (nntmux_wave20_report as Export, 1),
+            (nntmux_wave20_file as Export, 1),
+        ] {
+            for malformed in [
+                b"\0".as_slice(),
+                b"\0\0\0",
+                b"\x01\0\0\0",
+                b"\xff\xff\xff\xff",
+                b"\0\0\0\0\0",
+            ] {
+                reject(export, mode, malformed);
+            }
+        }
+    }
+}
+
+fn wave20_frames(mut bytes: &[u8]) -> Result<Vec<&[u8]>, isize> {
+    let mut fields = Vec::new();
+    while !bytes.is_empty() {
+        let prefix = bytes.get(..4).ok_or(-1isize)?;
+        let length = u32::from_le_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]) as usize;
+        bytes = &bytes[4..];
+        fields.push(bytes.get(..length).ok_or(-1isize)?);
+        bytes = &bytes[length..];
+    }
+    Ok(fields)
+}
+
+fn wave20_encode(fields: &[&[u8]]) -> Result<Vec<u8>, isize> {
+    let mut result = Vec::new();
+    for field in fields {
+        let length = u32::try_from(field.len()).map_err(|_| -1isize)?;
+        let size = result
+            .len()
+            .checked_add(4)
+            .and_then(|size| size.checked_add(field.len()))
+            .ok_or(-1isize)?;
+        if size > isize::MAX as usize {
+            return Err(-1);
+        }
+        result.extend_from_slice(&length.to_le_bytes());
+        result.extend_from_slice(field);
+    }
+    Ok(result)
+}
+
+fn wave20_decimal(bytes: &[u8]) -> Result<i64, isize> {
+    let text = std::str::from_utf8(bytes).map_err(|_| -1isize)?;
+    let value = text.parse::<i64>().map_err(|_| -1isize)?;
+    if value.to_string().as_bytes() != bytes {
+        return Err(-1);
+    }
+    Ok(value)
+}
+
+fn wave20_flag(bytes: &[u8]) -> Result<bool, isize> {
+    match bytes {
+        b"0" => Ok(false),
+        b"1" => Ok(true),
+        _ => Err(-1),
+    }
+}
+
+fn wave20_bool(value: bool) -> Vec<u8> {
+    if value { b"1".to_vec() } else { b"0".to_vec() }
+}
+
+fn wave20_backfill(mode: u32, input: &[u8]) -> Result<Vec<u8>, isize> {
+    match mode {
+        0 => Ok(if wave20_flag(input)? {
+            b"update".to_vec()
+        } else {
+            b"backfill".to_vec()
+        }),
+        1 => {
+            let fields = wave20_frames(input)?;
+            if fields.len() != 5 {
+                return Err(-1);
+            }
+            wave20_flag(fields[0])?;
+            wave20_flag(fields[1])?;
+            let repair = wave20_flag(fields[3])?;
+            wave20_flag(fields[4])?;
+            let literal: &[u8] = if repair { b"update" } else { b"backfill" };
+            wave20_encode(&[fields[0], fields[1], fields[2], literal, fields[4]])
+        }
+        _ => Err(-1),
+    }
+}
+
+fn wave20_group(mode: u32, input: &[u8]) -> Result<Vec<u8>, isize> {
+    match mode {
+        0 => {
+            let fields = wave20_frames(input)?;
+            let mut seen = std::collections::HashSet::new();
+            let names: Vec<&[u8]> = fields
+                .into_iter()
+                .filter(|name| name.len() <= 255 && seen.insert(*name))
+                .collect();
+            wave20_encode(&names)
+        }
+        1 => wave20_encode(&[
+            input,
+            b"Added by Release processing",
+            b"1",
+            b"0",
+            b"0",
+            b"0",
+            b"0",
+            b"",
+            b"",
+        ]),
+        _ => Err(-1),
+    }
+}
+
+fn wave20_recat(mode: u32, input: &[u8]) -> Result<Vec<u8>, isize> {
+    match mode {
+        0 => {
+            let fields = wave20_frames(input)?;
+            if fields.is_empty() {
+                return Ok(wave20_bool(true));
+            }
+            if fields.len() != 4 {
+                return Err(-1);
+            }
+            wave20_decimal(fields[0])?;
+            wave20_decimal(fields[2])?;
+            Ok(wave20_bool(
+                fields[0] == fields[2] && fields[1] == fields[3],
+            ))
+        }
+        1 => {
+            let size = input
+                .len()
+                .checked_mul(2)
+                .filter(|&size| size <= isize::MAX as usize)
+                .ok_or(-1isize)?;
+            let mut result = Vec::with_capacity(size);
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            for &byte in input {
+                result.push(HEX[(byte >> 4) as usize]);
+                result.push(HEX[(byte & 15) as usize]);
+            }
+            Ok(result)
+        }
+        2 => {
+            let fields = wave20_frames(input)?;
+            if fields.len() != 3 {
+                return Err(-1);
+            }
+            for field in &fields {
+                wave20_decimal(field)?;
+            }
+            Ok(wave20_bool(fields[0] == fields[1] && fields[2] == b"1"))
+        }
+        _ => Err(-1),
+    }
+}
+
+fn wave20_report(mode: u32, input: &[u8]) -> Result<Vec<u8>, isize> {
+    match mode {
+        0 => {
+            if input.is_empty() || input == b"0" {
+                return Ok(b"Unknown".to_vec());
+            }
+            let mut labels = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for key in input.split(|&byte| byte == b',') {
+                let key = php_trim_ascii(key);
+                let label = match key {
+                    b"duplicate" => b"Duplicate Release".to_vec(),
+                    b"fake" => b"Fake/Malicious Content".to_vec(),
+                    b"password" => b"Password Protected".to_vec(),
+                    b"incomplete" => b"Incomplete/Corrupted".to_vec(),
+                    b"wrong_category" => b"Wrong Category".to_vec(),
+                    b"spam" => b"Spam/Advertisement".to_vec(),
+                    b"other" => b"Other".to_vec(),
+                    _ => {
+                        let mut label = key.to_vec();
+                        if let Some(first) = label.first_mut() {
+                            first.make_ascii_uppercase();
+                        }
+                        label
+                    }
+                };
+                if seen.insert(label.clone()) {
+                    labels.push(label);
+                }
+            }
+            Ok(labels.join(b", ".as_slice()))
+        }
+        1 => {
+            let fields = wave20_frames(input)?;
+            if fields.len() % 2 != 0 {
+                return Err(-1);
+            }
+            let mut counts: [&[u8]; 4] = [b"0"; 4];
+            let mut total = 0i64;
+            for pair in fields.chunks_exact(2) {
+                let count = wave20_decimal(pair[1])?;
+                if count < 0 {
+                    return Err(-1);
+                }
+                total = total.checked_add(count).ok_or(-1isize)?;
+                let index = match pair[0] {
+                    b"pending" => Some(0),
+                    b"reviewed" => Some(1),
+                    b"resolved" => Some(2),
+                    b"dismissed" => Some(3),
+                    _ => None,
+                };
+                if let Some(index) = index {
+                    counts[index] = pair[1];
+                }
+            }
+            wave20_encode(&[
+                counts[0],
+                counts[1],
+                counts[2],
+                counts[3],
+                total.to_string().as_bytes(),
+            ])
+        }
+        _ => Err(-1),
+    }
+}
+
+fn wave20_file(mode: u32, input: &[u8]) -> Result<Vec<u8>, isize> {
+    match mode {
+        0 => Ok(
+            if input.len() == 32 && input.iter().all(u8::is_ascii_hexdigit) {
+                input.to_ascii_lowercase()
+            } else {
+                Vec::new()
+            },
+        ),
+        1 => {
+            let fields = wave20_frames(input)?;
+            if fields.len() != 3 {
+                return Err(-1);
+            }
+            let has_hash = wave20_flag(fields[0])?;
+            wave20_decimal(fields[1])?;
+            wave20_decimal(fields[2])?;
+            Ok(wave20_bool(
+                has_hash && fields[1] == b"0" && matches!(fields[2], b"0" | b"1"),
+            ))
+        }
+        _ => Err(-1),
+    }
+}
+
+unsafe fn wave20_dispatch(
+    build: fn(u32, &[u8]) -> Result<Vec<u8>, isize>,
+    mode: u32,
+    input: *const u8,
+    input_len: usize,
+    out: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if !cleaning_ffi_region_valid(input, input_len) || !cleaning_ffi_region_valid(out, out_cap) {
+        return -1;
+    }
+    // The shared region validator checks non-null pointers, alignment and byte
+    // extents before any slice is created. u8 requires only alignment 1.
+    let result = {
+        let input = unsafe { slice::from_raw_parts(input, input_len) };
+        match build(mode, input) {
+            Ok(result) => result,
+            Err(code) => return code,
+        }
+    };
+    if result.len() > isize::MAX as usize {
+        return -1;
+    }
+    if result.len() > out_cap {
+        return -2;
+    }
+    // The result owns its allocation, and the input borrow has ended. This
+    // permits callers to alias their input and output byte regions.
+    if !result.is_empty() {
+        unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), out, result.len()) };
+    }
+    result.len() as isize
+}
+
+/// Backfill modes: 0 = repair literal; 1 = five configuration frames.
+/// Returns output bytes, -1 for invalid input/panic, or -2 for short capacity.
+/// Errors leave output unchanged.
+///
+/// # Safety
+/// Input and output must be non-null and valid for their stated byte extents,
+/// including zero extents. Regions may overlap; both lengths must fit isize.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_wave20_backfill(
+    mode: u32,
+    input: *const u8,
+    input_len: usize,
+    out: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        wave20_dispatch(wave20_backfill, mode, input, input_len, out, out_cap)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Group modes: 0 = unique name frames of at most 255 bytes; 1 = defaults.
+/// Returns output bytes, -1 for invalid input/panic, or -2 for short capacity.
+///
+/// # Safety
+/// Pointers must be non-null and valid for their byte extents, even when zero;
+/// regions may overlap and each extent must be at most isize::MAX.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_wave20_group(
+    mode: u32,
+    input: *const u8,
+    input_len: usize,
+    out: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        wave20_dispatch(wave20_group, mode, input, input_len, out, out_cap)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Recat modes: 0 = snapshot match; 1 = uppercase hex; 2 = category predicate.
+/// Returns output bytes, -1 for invalid input/panic, or -2 for short capacity.
+///
+/// # Safety
+/// Pointers must be non-null and valid for their byte extents, even when zero;
+/// regions may overlap and each extent must be at most isize::MAX.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_wave20_recat(
+    mode: u32,
+    input: *const u8,
+    input_len: usize,
+    out: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        wave20_dispatch(wave20_recat, mode, input, input_len, out, out_cap)
+    }))
+    .unwrap_or(-1)
+}
+
+/// Report modes: 0 = reason labels; 1 = four status counts and total frames.
+/// Returns output bytes, -1 for invalid input/panic, or -2 for short capacity.
+///
+/// # Safety
+/// Pointers must be non-null and valid for their byte extents, even when zero;
+/// regions may overlap and each extent must be at most isize::MAX.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_wave20_report(
+    mode: u32,
+    input: *const u8,
+    input_len: usize,
+    out: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        wave20_dispatch(wave20_report, mode, input, input_len, out, out_cap)
+    }))
+    .unwrap_or(-1)
+}
+
+/// File modes: 0 = normalized valid hash; 1 = snapshot eligibility predicate.
+/// Returns output bytes, -1 for invalid input/panic, or -2 for short capacity.
+///
+/// # Safety
+/// Pointers must be non-null and valid for their byte extents, even when zero;
+/// regions may overlap and each extent must be at most isize::MAX.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_wave20_file(
+    mode: u32,
+    input: *const u8,
+    input_len: usize,
+    out: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        wave20_dispatch(wave20_file, mode, input, input_len, out, out_cap)
+    }))
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod wave20_overlap_tests {
+    use super::*;
+
+    #[test]
+    fn partial_overlaps_in_both_directions_preserve_owned_results() {
+        type Export = unsafe extern "C" fn(u32, *const u8, usize, *mut u8, usize) -> isize;
+        let fixtures: [(Export, u32, &[u8], &[u8]); 5] = [
+            (nntmux_wave20_backfill, 0, b"1", b"update"),
+            (
+                nntmux_wave20_group,
+                0,
+                b"\x01\0\0\0a\x01\0\0\0a",
+                b"\x01\0\0\0a",
+            ),
+            (nntmux_wave20_recat, 1, b"\0\xff", b"00FF"),
+            (nntmux_wave20_report, 0, b"spam,spam", b"Spam/Advertisement"),
+            (
+                nntmux_wave20_file,
+                0,
+                b"0123456789ABCDEF0123456789ABCDEF",
+                b"0123456789abcdef0123456789abcdef",
+            ),
+        ];
+        for (export, mode, input, expected) in fixtures {
+            for (input_start, output_start) in [(1usize, 2usize), (2, 1)] {
+                let mut buffer = vec![0x5a; input.len().max(expected.len()) + 4];
+                buffer[input_start..input_start + input.len()].copy_from_slice(input);
+                let base = buffer.as_mut_ptr();
+                unsafe {
+                    assert_eq!(
+                        export(
+                            mode,
+                            base.add(input_start),
+                            input.len(),
+                            base.add(output_start),
+                            expected.len()
+                        ),
+                        expected.len() as isize
+                    );
+                }
+                assert_eq!(
+                    &buffer[output_start..output_start + expected.len()],
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn address_overflow_is_rejected_before_slice_creation() {
+        let exports = [
+            nntmux_wave20_backfill,
+            nntmux_wave20_group,
+            nntmux_wave20_recat,
+            nntmux_wave20_report,
+            nntmux_wave20_file,
+        ];
+        for export in exports {
+            let mut output = [0x5a; 8];
+            unsafe {
+                assert_eq!(
+                    export(0, usize::MAX as *const u8, 1, output.as_mut_ptr(), 8),
+                    -1
+                );
+                assert_eq!(export(0, b"".as_ptr(), 0, usize::MAX as *mut u8, 1), -1);
+            }
+            assert_eq!(output, [0x5a; 8]);
+        }
+    }
+}
