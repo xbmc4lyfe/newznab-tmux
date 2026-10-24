@@ -20985,3 +20985,1129 @@ pub mod categorization_pipes_commands {
         }
     }
 }
+/// Wave 30.3: pure helpers behind `RecategorizeReleases`, `GroupsUpdate`, `BackfillGroup`,
+/// `UpdateBackfill` and `UpdateGroupHeaders`.
+pub mod recategorize_groups_backfill_commands {
+    use std::collections::HashSet;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::ptr;
+    use std::slice;
+
+    pub const DECLINE: isize = -1;
+
+    /// Scalar kinds for PHP `(int)` casts.
+    pub const KIND_NULL: u8 = 0;
+    pub const KIND_BOOL: u8 = 1;
+    pub const KIND_INT: u8 = 2;
+    pub const KIND_STRING: u8 = 3;
+
+    pub const MESSAGE_NNTP_FAILED: u8 = 0;
+    pub const MESSAGE_GROUP_NOT_FOUND: u8 = 1;
+
+    /// `resolveQuantity()` outcomes.
+    pub const QUANTITY_INT: i32 = 0;
+    pub const QUANTITY_EMPTY: i32 = 1;
+
+    /// `UpdateBackfill::resolveBackfillDispatchPlan()` actions (low four bits of the plan).
+    pub const ACTION_BACKFILL_ALL: i32 = 0;
+    pub const ACTION_BACKFILL_ALPH: i32 = 1;
+    pub const ACTION_BACKFILL_DATE: i32 = 2;
+    pub const ACTION_BACKFILL_SAFE: i32 = 3;
+    pub const ACTION_GROUP_DATE: i32 = 4;
+    pub const ACTION_GROUP_QUANTITY: i32 = 5;
+    pub const ACTION_INVALID: i32 = 6;
+    /// Backfill type (bits 4-5): `''`, `'normal'` or `'date'`.
+    pub const TYPE_SHIFT: i32 = 4;
+    pub const TYPE_NONE: i32 = 0;
+    pub const TYPE_NORMAL: i32 = 1;
+    pub const TYPE_DATE: i32 = 2;
+    /// Set when the plan carries the caller's quantity.
+    pub const PLAN_USES_QUANTITY: i32 = 0x100;
+
+    /// PHP `trim()` default characters.
+    #[inline]
+    fn is_trim_byte(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0)
+    }
+
+    /// PHP numeric-string leading whitespace.
+    #[inline]
+    fn is_numeric_whitespace(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C)
+    }
+
+    /// PHP 8 `(int) $string`: the leading numeric prefix after whitespace, integers saturating
+    /// at the `int` bounds, float forms truncated toward zero and saturated, infinity as `0`.
+    pub fn php_int_cast(s: &[u8]) -> i64 {
+        let mut i = 0;
+        while i < s.len() && is_numeric_whitespace(s[i]) {
+            i += 1;
+        }
+        let start = i;
+        let negative = i < s.len() && s[i] == b'-';
+        if i < s.len() && (s[i] == b'+' || s[i] == b'-') {
+            i += 1;
+        }
+        let digits_start = i;
+        while i < s.len() && s[i].is_ascii_digit() {
+            i += 1;
+        }
+        let digits_end = i;
+        let mut is_float = false;
+        if i < s.len() && s[i] == b'.' {
+            let mut j = i + 1;
+            while j < s.len() && s[j].is_ascii_digit() {
+                j += 1;
+            }
+            if digits_end > digits_start || j > i + 1 {
+                is_float = true;
+                i = j;
+            }
+        }
+        if digits_end == digits_start && !is_float {
+            return 0;
+        }
+        if i < s.len() && (s[i] == b'e' || s[i] == b'E') {
+            let mut j = i + 1;
+            if j < s.len() && (s[j] == b'+' || s[j] == b'-') {
+                j += 1;
+            }
+            if j < s.len() && s[j].is_ascii_digit() {
+                while j < s.len() && s[j].is_ascii_digit() {
+                    j += 1;
+                }
+                is_float = true;
+                i = j;
+            }
+        }
+        if !is_float {
+            let limit: u128 = if negative { 1 << 63 } else { (1 << 63) - 1 };
+            let mut magnitude: u128 = 0;
+            for &digit in &s[digits_start..digits_end] {
+                magnitude = (magnitude * 10 + u128::from(digit - b'0')).min(limit);
+            }
+            return if negative {
+                (magnitude as i128).wrapping_neg() as i64
+            } else {
+                magnitude as i64
+            };
+        }
+        // The prefix is ASCII by construction.
+        let text = std::str::from_utf8(&s[start..i]).unwrap_or("0");
+        match text.parse::<f64>() {
+            Ok(value) if value.is_finite() => value as i64,
+            _ => 0,
+        }
+    }
+
+    /// PHP `trim()` with its default character list.
+    pub fn php_trim(s: &[u8]) -> &[u8] {
+        let mut start = 0;
+        let mut end = s.len();
+        while start < end && is_trim_byte(s[start]) {
+            start += 1;
+        }
+        while end > start && is_trim_byte(s[end - 1]) {
+            end -= 1;
+        }
+        &s[start..end]
+    }
+
+    /// `array_map('intval', explode(',', $csv))`.
+    pub fn parse_comma_separated_ints(csv: &[u8]) -> Vec<i64> {
+        csv.split(|&byte| byte == b',').map(php_int_cast).collect()
+    }
+
+    /// `array_map('trim', explode(',', $csv))`, re-joined with `,` (no piece contains one).
+    pub fn parse_comma_separated_names(csv: &[u8]) -> Vec<u8> {
+        let mut joined = Vec::with_capacity(csv.len());
+        for (index, piece) in csv.split(|&byte| byte == b',').enumerate() {
+            if index > 0 {
+                joined.push(b',');
+            }
+            joined.extend_from_slice(php_trim(piece));
+        }
+        joined
+    }
+
+    /// `key=i<int>` or `key=n` lines for `RecategorizeReleases::buildResetPayload()`.
+    pub const RESET_PAYLOAD: &[u8] = b"videos_id=i0\ntv_episodes_id=i0\nimdbid=n\nmusicinfo_id=n\nconsoleinfo_id=n\ngamesinfo_id=i0\nbookinfo_id=n\nanidbid=n\nmovieinfo_id=n\niscategorized=i0";
+
+    pub fn category_display_name(title: Option<&[u8]>, parent: Option<&[u8]>) -> Vec<u8> {
+        match (title, parent) {
+            (None, _) => b"N/A".to_vec(),
+            (Some(title), Some(parent)) if !parent.is_empty() => [parent, b" -> ", title].concat(),
+            (Some(title), _) => title.to_vec(),
+        }
+    }
+
+    /// Splits `u64` little-endian length-prefixed entries.
+    pub fn decode_entries(blob: &[u8]) -> Option<Vec<&[u8]>> {
+        let mut entries = Vec::new();
+        let mut rest = blob;
+        while !rest.is_empty() {
+            let (length, tail) = rest.split_at_checked(8)?;
+            let length = usize::try_from(u64::from_le_bytes(length.try_into().ok()?)).ok()?;
+            let (entry, tail) = tail.split_at_checked(length)?;
+            entries.push(entry);
+            rest = tail;
+        }
+        Some(entries)
+    }
+
+    /// One `0`/`1` byte per server group: `in_array($group, $active, true)` for strings.
+    pub fn active_group_mask(groups: &[&[u8]], active: &[&[u8]]) -> Vec<u8> {
+        let active: HashSet<&[u8]> = active.iter().copied().collect();
+        groups
+            .iter()
+            .map(|group| u8::from(active.contains(group)))
+            .collect()
+    }
+
+    pub fn cast_scalar(kind: u8, int_value: i64, text: &[u8]) -> Option<i64> {
+        match kind {
+            KIND_NULL => Some(0),
+            KIND_BOOL => match int_value {
+                0 | 1 => Some(int_value),
+                _ => None,
+            },
+            KIND_INT => Some(int_value),
+            KIND_STRING => Some(php_int_cast(text)),
+            _ => None,
+        }
+    }
+
+    /// Both completion lines; the first line's length lets the caller split them.
+    pub fn completion_lines(updated: i64, elapsed: &[u8]) -> (Vec<u8>, usize) {
+        let first = format!("\u{2705} Updated {updated} groups").into_bytes();
+        let first_len = first.len();
+        let joined = [
+            first.as_slice(),
+            "\u{23f1}\u{fe0f}  Running time: ".as_bytes(),
+            elapsed,
+            b" seconds",
+        ]
+        .concat();
+        (joined, first_len)
+    }
+
+    #[inline]
+    pub fn is_valid_backfill_type(backfill_type: i64) -> bool {
+        backfill_type == 1 || backfill_type == 2
+    }
+
+    /// `Some(n)` for an integer quantity, `None` for the interval default `''`.
+    pub fn resolve_quantity(
+        quantity: Option<&[u8]>,
+        backfill_type: i64,
+        default: i64,
+    ) -> Option<i64> {
+        match quantity {
+            Some(quantity) => Some(php_int_cast(quantity)),
+            None if backfill_type == 1 => None,
+            None => Some(default),
+        }
+    }
+
+    pub fn message(kind: u8, text: &[u8]) -> Option<Vec<u8>> {
+        let prefix: &[u8] = match kind {
+            MESSAGE_NNTP_FAILED => b"NNTP connection failed: ",
+            MESSAGE_GROUP_NOT_FOUND => b"Group not found: ",
+            _ => return None,
+        };
+        Some([prefix, text].concat())
+    }
+
+    #[inline]
+    fn is_group_name_byte(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'_' | b'.' | b'-')
+    }
+
+    /// `preg_match('/^[a-z0-9+_.-]+\.[a-z0-9+_.-]+$/i', $mode) === 1` (`$` also matches before a
+    /// final newline) for a mode outside `all`, `alph`, `date` and `safe`.
+    pub fn is_group_name_argument(mode: &[u8]) -> bool {
+        if matches!(mode, b"all" | b"alph" | b"date" | b"safe") {
+            return false;
+        }
+        let body = mode.strip_suffix(b"\n").unwrap_or(mode);
+        body.len() >= 3
+            && body.iter().all(|&byte| is_group_name_byte(byte))
+            && body[1..body.len() - 1].contains(&b'.')
+    }
+
+    pub fn backfill_plan(mode: &[u8], has_quantity: bool) -> i32 {
+        let group = is_group_name_argument(mode);
+        let (action, kind) = match (mode, has_quantity) {
+            (b"all", false) => (ACTION_BACKFILL_ALL, TYPE_NONE),
+            (b"alph", true) => (ACTION_BACKFILL_ALPH, TYPE_NORMAL),
+            (b"date", true) => (ACTION_BACKFILL_DATE, TYPE_DATE),
+            (b"safe", true) => (ACTION_BACKFILL_SAFE, TYPE_NONE),
+            (_, false) if group => (ACTION_GROUP_DATE, TYPE_NONE),
+            (_, true) if group => (ACTION_GROUP_QUANTITY, TYPE_NONE),
+            _ => (ACTION_INVALID, TYPE_NONE),
+        };
+        let uses_quantity = matches!(
+            action,
+            ACTION_BACKFILL_ALPH
+                | ACTION_BACKFILL_DATE
+                | ACTION_BACKFILL_SAFE
+                | ACTION_GROUP_QUANTITY
+        );
+        action | (kind << TYPE_SHIFT) | if uses_quantity { PLAN_USES_QUANTITY } else { 0 }
+    }
+
+    #[inline]
+    unsafe fn valid_in<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null() || len > isize::MAX as usize || (ptr as usize).checked_add(len).is_none() {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    /// An optional input: `present` must be `0` or `1`; an absent value ignores its pointer.
+    #[inline]
+    unsafe fn optional_in<'a>(present: u8, ptr: *const u8, len: usize) -> Option<Option<&'a [u8]>> {
+        match present {
+            0 => Some(None),
+            1 => unsafe { valid_in(ptr, len) }.map(Some),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn valid_out<T>(ptr: *mut T, len: usize) -> bool {
+        !ptr.is_null()
+            && ptr.is_aligned()
+            && len <= isize::MAX as usize / size_of::<T>()
+            && (ptr as usize).checked_add(len * size_of::<T>()).is_some()
+    }
+
+    #[inline]
+    fn required(total: usize) -> isize {
+        // `-1` is reserved for DECLINE, so a one-element requirement reports `-2`.
+        if total <= 1 { -2 } else { -(total as isize) }
+    }
+
+    /// Copies `items` to a validated output buffer, or reports the required capacity.
+    #[inline]
+    unsafe fn write_items<T: Copy>(out: *mut T, out_cap: usize, items: &[T]) -> isize {
+        if items.len() > isize::MAX as usize {
+            return DECLINE;
+        }
+        if items.len() > out_cap {
+            return required(items.len());
+        }
+        if !items.is_empty() {
+            unsafe { ptr::copy_nonoverlapping(items.as_ptr(), out, items.len()) };
+        }
+        items.len() as isize
+    }
+
+    #[inline]
+    fn guarded_isize(body: impl FnOnce() -> isize) -> isize {
+        catch_unwind(AssertUnwindSafe(body)).unwrap_or(DECLINE)
+    }
+
+    #[inline]
+    fn guarded_i32(body: impl FnOnce() -> i32) -> i32 {
+        catch_unwind(AssertUnwindSafe(body)).unwrap_or(-1)
+    }
+
+    /// Backs `RecategorizeReleases::parseCommaSeparatedIntsNative()`; writes one `int64_t` per
+    /// comma-separated piece.
+    ///
+    /// # Safety
+    ///
+    /// `csv_ptr` must be readable for `csv_len` bytes and `out_vals` writable for `out_cap` values.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_cat_rgb_cmd_parse_ints(
+        csv_ptr: *const u8,
+        csv_len: usize,
+        out_vals: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        guarded_isize(|| {
+            let Some(csv) = (unsafe { valid_in(csv_ptr, csv_len) }) else {
+                return DECLINE;
+            };
+            if !valid_out(out_vals, out_cap) {
+                return DECLINE;
+            }
+            unsafe { write_items(out_vals, out_cap, &parse_comma_separated_ints(csv)) }
+        })
+    }
+
+    /// Backs `RecategorizeReleases::parseCommaSeparatedGroupNamesNative()`.
+    ///
+    /// # Safety
+    ///
+    /// `csv_ptr` must be readable for `csv_len` bytes and `out_buf` writable for `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_cat_rgb_cmd_parse_names(
+        csv_ptr: *const u8,
+        csv_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        guarded_isize(|| {
+            let Some(csv) = (unsafe { valid_in(csv_ptr, csv_len) }) else {
+                return DECLINE;
+            };
+            if !valid_out(out_buf, out_cap) {
+                return DECLINE;
+            }
+            unsafe { write_items(out_buf, out_cap, &parse_comma_separated_names(csv)) }
+        })
+    }
+
+    /// Backs `RecategorizeReleases::buildResetPayloadNative()`.
+    ///
+    /// # Safety
+    ///
+    /// `out_buf` must be writable for `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_cat_rgb_cmd_reset_payload(
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        guarded_isize(|| {
+            if !valid_out(out_buf, out_cap) {
+                return DECLINE;
+            }
+            unsafe { write_items(out_buf, out_cap, RESET_PAYLOAD) }
+        })
+    }
+
+    /// Backs `RecategorizeReleases::formatCategoryDisplayNameNative()`.
+    ///
+    /// # Safety
+    ///
+    /// Present inputs must be readable for their lengths and `out_buf` writable for `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_cat_rgb_cmd_category_display(
+        title_present: u8,
+        title_ptr: *const u8,
+        title_len: usize,
+        parent_present: u8,
+        parent_ptr: *const u8,
+        parent_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        guarded_isize(|| {
+            let (Some(title), Some(parent)) = (unsafe {
+                (
+                    optional_in(title_present, title_ptr, title_len),
+                    optional_in(parent_present, parent_ptr, parent_len),
+                )
+            }) else {
+                return DECLINE;
+            };
+            if !valid_out(out_buf, out_cap) {
+                return DECLINE;
+            }
+            unsafe { write_items(out_buf, out_cap, &category_display_name(title, parent)) }
+        })
+    }
+
+    /// Backs `GroupsUpdate::filterActiveServerGroupsNative()`. Both inputs are `u64` little-endian
+    /// length-prefixed byte strings; writes one `0`/`1` keep byte per server group.
+    ///
+    /// # Safety
+    ///
+    /// Inputs must be readable for their lengths and `out_buf` writable for `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_cat_rgb_cmd_filter_groups(
+        groups_ptr: *const u8,
+        groups_len: usize,
+        active_ptr: *const u8,
+        active_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        guarded_isize(|| {
+            let (Some(groups), Some(active)) = (unsafe {
+                (
+                    valid_in(groups_ptr, groups_len),
+                    valid_in(active_ptr, active_len),
+                )
+            }) else {
+                return DECLINE;
+            };
+            let (Some(groups), Some(active)) = (decode_entries(groups), decode_entries(active))
+            else {
+                return DECLINE;
+            };
+            if !valid_out(out_buf, out_cap) {
+                return DECLINE;
+            }
+            unsafe { write_items(out_buf, out_cap, &active_group_mask(&groups, &active)) }
+        })
+    }
+
+    /// Backs `GroupsUpdate::projectShortGroupRowNative()`: `(int)` casts of `first` and `last`
+    /// into `out_values[0..2]`. Returns `1`, or `-1` for an unsupported kind or invalid input.
+    ///
+    /// # Safety
+    ///
+    /// String inputs must be readable for their lengths and `out_values` writable for two values.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_cat_rgb_cmd_project_row(
+        first_kind: u8,
+        first_int: i64,
+        first_ptr: *const u8,
+        first_len: usize,
+        last_kind: u8,
+        last_int: i64,
+        last_ptr: *const u8,
+        last_len: usize,
+        out_values: *mut i64,
+    ) -> i32 {
+        guarded_i32(|| {
+            if !valid_out(out_values, 2) {
+                return -1;
+            }
+            let (Some(first_text), Some(last_text)) =
+                (unsafe { (valid_in(first_ptr, first_len), valid_in(last_ptr, last_len)) })
+            else {
+                return -1;
+            };
+            let (Some(first), Some(last)) = (
+                cast_scalar(first_kind, first_int, first_text),
+                cast_scalar(last_kind, last_int, last_text),
+            ) else {
+                return -1;
+            };
+            unsafe { write_items(out_values, 2, &[first, last]) };
+            1
+        })
+    }
+
+    /// Backs `GroupsUpdate::formatCompletionLinesNative()`.
+    ///
+    /// # Safety
+    ///
+    /// `elapsed_ptr` must be readable for `elapsed_len` bytes, `out_first_len` writable and
+    /// `out_buf` writable for `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_cat_rgb_cmd_completion_lines(
+        updated: i64,
+        elapsed_ptr: *const u8,
+        elapsed_len: usize,
+        out_first_len: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        guarded_isize(|| {
+            let Some(elapsed) = (unsafe { valid_in(elapsed_ptr, elapsed_len) }) else {
+                return DECLINE;
+            };
+            if !valid_out(out_first_len, 1) || !valid_out(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let (joined, first_len) = completion_lines(updated, elapsed);
+            let written = unsafe { write_items(out_buf, out_cap, &joined) };
+            if written >= 0 {
+                unsafe { out_first_len.write(first_len) };
+            }
+            written
+        })
+    }
+
+    /// Backs `BackfillGroup::isValidBackfillTypeNative()`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn nntmux_cat_rgb_cmd_valid_backfill_type(backfill_type: i64) -> i32 {
+        guarded_i32(|| i32::from(is_valid_backfill_type(backfill_type)))
+    }
+
+    /// Backs `BackfillGroup::resolveQuantityNative()`. Returns `QUANTITY_INT` with the value in
+    /// `out_value`, `QUANTITY_EMPTY` for `''`, or `-1` for invalid input.
+    ///
+    /// # Safety
+    ///
+    /// A present quantity must be readable for `quantity_len` bytes and `out_value` writable.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_cat_rgb_cmd_resolve_quantity(
+        quantity_present: u8,
+        quantity_ptr: *const u8,
+        quantity_len: usize,
+        backfill_type: i64,
+        default_quantity: i64,
+        out_value: *mut i64,
+    ) -> i32 {
+        guarded_i32(|| {
+            let Some(quantity) =
+                (unsafe { optional_in(quantity_present, quantity_ptr, quantity_len) })
+            else {
+                return -1;
+            };
+            if !valid_out(out_value, 1) {
+                return -1;
+            }
+            match resolve_quantity(quantity, backfill_type, default_quantity) {
+                Some(value) => {
+                    unsafe { out_value.write(value) };
+                    QUANTITY_INT
+                }
+                None => QUANTITY_EMPTY,
+            }
+        })
+    }
+
+    /// Backs the NNTP failure and group-not-found message helpers.
+    ///
+    /// # Safety
+    ///
+    /// `text_ptr` must be readable for `text_len` bytes and `out_buf` writable for `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_cat_rgb_cmd_message(
+        kind: u8,
+        text_ptr: *const u8,
+        text_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        guarded_isize(|| {
+            let Some(text) = (unsafe { valid_in(text_ptr, text_len) }) else {
+                return DECLINE;
+            };
+            if !valid_out(out_buf, out_cap) {
+                return DECLINE;
+            }
+            message(kind, text).map_or(DECLINE, |line| unsafe {
+                write_items(out_buf, out_cap, &line)
+            })
+        })
+    }
+
+    /// Backs `UpdateBackfill::isGroupNameArgumentNative()`.
+    ///
+    /// # Safety
+    ///
+    /// `mode_ptr` must be readable for `mode_len` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_cat_rgb_cmd_is_group_name(
+        mode_ptr: *const u8,
+        mode_len: usize,
+    ) -> i32 {
+        guarded_i32(|| {
+            unsafe { valid_in(mode_ptr, mode_len) }
+                .map_or(-1, |mode| i32::from(is_group_name_argument(mode)))
+        })
+    }
+
+    /// Backs `UpdateBackfill::resolveBackfillDispatchPlanNative()`; returns the packed plan.
+    ///
+    /// # Safety
+    ///
+    /// `mode_ptr` must be readable for `mode_len` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_cat_rgb_cmd_backfill_plan(
+        mode_ptr: *const u8,
+        mode_len: usize,
+        has_quantity: u8,
+    ) -> i32 {
+        guarded_i32(|| {
+            let has_quantity = match has_quantity {
+                0 => false,
+                1 => true,
+                _ => return -1,
+            };
+            unsafe { valid_in(mode_ptr, mode_len) }
+                .map_or(-1, |mode| backfill_plan(mode, has_quantity))
+        })
+    }
+
+    /// Backs `UpdateGroupHeaders::clampMaxHeadersNative()`: `max(0, (int) $max)` into `out_value`.
+    /// Returns `1`, or `-1` for an unsupported kind or invalid input.
+    ///
+    /// # Safety
+    ///
+    /// `text_ptr` must be readable for `text_len` bytes and `out_value` writable.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_cat_rgb_cmd_clamp_max_headers(
+        kind: u8,
+        int_value: i64,
+        text_ptr: *const u8,
+        text_len: usize,
+        out_value: *mut i64,
+    ) -> i32 {
+        guarded_i32(|| {
+            let Some(text) = (unsafe { valid_in(text_ptr, text_len) }) else {
+                return -1;
+            };
+            if !valid_out(out_value, 1) {
+                return -1;
+            }
+            match cast_scalar(kind, int_value, text) {
+                Some(value) => {
+                    unsafe { out_value.write(value.max(0)) };
+                    1
+                }
+                None => -1,
+            }
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn written(mut call: impl FnMut(*mut u8, usize) -> isize) -> Vec<u8> {
+            let mut buf = vec![0u8; 512];
+            let written = call(buf.as_mut_ptr(), buf.len());
+            assert!(written >= 0, "export declined: {written}");
+            buf.truncate(written as usize);
+            buf
+        }
+
+        #[test]
+        fn php_int_cast_matches_php_8() {
+            let vectors: &[(&[u8], i64)] = &[
+                (b"1e3", 1000),
+                (b"1e100", i64::MAX),
+                (b"-1e100", i64::MIN),
+                (b"1e1000", 0),
+                (b"-1e1000", 0),
+                (b"9999999999999999999", i64::MAX),
+                (b"-9999999999999999999", i64::MIN),
+                (b"9223372036854775807", i64::MAX),
+                (b"9223372036854775808", i64::MAX),
+                (b"-9223372036854775808", i64::MIN),
+                (b"-9223372036854775809", i64::MIN),
+                (
+                    b"00000000000000000000000000009007199254740993",
+                    9_007_199_254_740_993,
+                ),
+                (b"9007199254740993.0", 9_007_199_254_740_992),
+                (b" \t\n\r\x0b\x0c12abc", 12),
+                (b"\x0012", 0),
+                (b"12\x00", 12),
+                (b".5", 0),
+                (b"5.", 5),
+                (b"5.e3", 5000),
+                (b".e5", 0),
+                (b"1e", 1),
+                (b"1e+", 1),
+                (b"1e+5x", 100_000),
+                (b"-.5e1", -5),
+                (b"+5", 5),
+                (b"- 5", 0),
+                (b"0x1A", 0),
+                (b"  ", 0),
+                (b"", 0),
+                (b"abc", 0),
+                (b"1.9", 1),
+                (b"-1.9", -1),
+                (b"1_000", 1),
+                ("\u{ff11}\u{ff12}".as_bytes(), 0),
+                (b"0.0000001e10", 1000),
+                (b"123456789012345678901234567890e-20", 1_234_567_890),
+                (b"9223372036854775807.5", i64::MAX),
+                (b"1.8446744073709552e19", i64::MAX),
+                (b"4e18", 4_000_000_000_000_000_000),
+                (b"-0", 0),
+                (b"9.2233720368547758e18", i64::MAX),
+                (b".", 0),
+                (b"-", 0),
+                (b"\xff7", 0),
+            ];
+            for (input, expected) in vectors {
+                assert_eq!(
+                    php_int_cast(input),
+                    *expected,
+                    "{:?}",
+                    String::from_utf8_lossy(input)
+                );
+            }
+        }
+
+        #[test]
+        fn recategorize_helpers() {
+            assert_eq!(parse_comma_separated_ints(b""), vec![0]);
+            assert_eq!(
+                parse_comma_separated_ints(b"1, 2,,-3,x9,4.7"),
+                vec![1, 2, 0, -3, 0, 4]
+            );
+            assert_eq!(
+                parse_comma_separated_names(b" a ,\x0b\0b\t\n,,\x0cc"),
+                b"a,b,,\x0cc".to_vec()
+            );
+            assert_eq!(php_trim(b"\x00 \xc2\xa0x \r"), b"\xc2\xa0x");
+            assert_eq!(category_display_name(None, Some(b"TV")), b"N/A");
+            assert_eq!(category_display_name(Some(b"HD"), Some(b"TV")), b"TV -> HD");
+            assert_eq!(category_display_name(Some(b"HD"), Some(b"")), b"HD");
+            assert_eq!(category_display_name(Some(b""), None), b"");
+        }
+
+        #[test]
+        fn groups_helpers() {
+            let blob = |items: &[&[u8]]| -> Vec<u8> {
+                items
+                    .iter()
+                    .flat_map(|item| [(item.len() as u64).to_le_bytes().as_slice(), item].concat())
+                    .collect()
+            };
+            let groups = blob(&[b"a.b", b"", b"c\0d", b"A.B"]);
+            let active = blob(&[b"a.b", b"c\0d", b""]);
+            let decoded_groups = decode_entries(&groups).unwrap();
+            let decoded_active = decode_entries(&active).unwrap();
+            assert_eq!(
+                active_group_mask(&decoded_groups, &decoded_active),
+                vec![1, 1, 1, 0]
+            );
+            assert!(decode_entries(&groups[..groups.len() - 1]).is_none());
+            assert!(decode_entries(&[1, 0, 0]).is_none());
+            assert_eq!(cast_scalar(KIND_STRING, 0, b" 42z"), Some(42));
+            assert_eq!(cast_scalar(KIND_BOOL, 2, b""), None);
+            assert_eq!(cast_scalar(9, 0, b""), None);
+            let (joined, first_len) = completion_lines(i64::MIN, b"1.5");
+            assert_eq!(
+                String::from_utf8(joined[..first_len].to_vec()).unwrap(),
+                format!("\u{2705} Updated {} groups", i64::MIN)
+            );
+            assert_eq!(
+                &joined[first_len..],
+                "\u{23f1}\u{fe0f}  Running time: 1.5 seconds".as_bytes()
+            );
+        }
+
+        #[test]
+        fn backfill_helpers() {
+            assert!(is_valid_backfill_type(1) && is_valid_backfill_type(2));
+            assert!(
+                !is_valid_backfill_type(0)
+                    && !is_valid_backfill_type(3)
+                    && !is_valid_backfill_type(-1)
+            );
+            assert_eq!(resolve_quantity(Some(b"12abc"), 1, 9), Some(12));
+            assert_eq!(resolve_quantity(None, 1, 9), None);
+            assert_eq!(resolve_quantity(None, 2, 9), Some(9));
+            assert_eq!(
+                message(MESSAGE_NNTP_FAILED, b"x\0").unwrap(),
+                b"NNTP connection failed: x\0"
+            );
+            assert_eq!(
+                message(MESSAGE_GROUP_NOT_FOUND, b"").unwrap(),
+                b"Group not found: "
+            );
+            assert!(message(2, b"").is_none());
+        }
+
+        #[test]
+        fn update_backfill_helpers() {
+            for mode in [
+                &b"alt.binaries.test"[..],
+                b"a.b",
+                b"A+_-.9",
+                b"a.b\n",
+                b"a..b",
+                b".a.b",
+            ] {
+                assert!(
+                    is_group_name_argument(mode),
+                    "{:?}",
+                    String::from_utf8_lossy(mode)
+                );
+            }
+            for mode in [
+                &b"all"[..],
+                b"alph",
+                b"a.",
+                b".a",
+                b"ab",
+                b"a.b\n\n",
+                b"a b.c",
+                b"a.b\r",
+                b"\na.b",
+                b"",
+                b".",
+                b"..",
+                b"a\xc3\xa9.b",
+            ] {
+                assert!(
+                    !is_group_name_argument(mode),
+                    "{:?}",
+                    String::from_utf8_lossy(mode)
+                );
+            }
+            assert_eq!(backfill_plan(b"all", false), ACTION_BACKFILL_ALL);
+            assert_eq!(backfill_plan(b"all", true), ACTION_INVALID);
+            assert_eq!(
+                backfill_plan(b"alph", true),
+                ACTION_BACKFILL_ALPH | (TYPE_NORMAL << TYPE_SHIFT) | PLAN_USES_QUANTITY
+            );
+            assert_eq!(
+                backfill_plan(b"date", true),
+                ACTION_BACKFILL_DATE | (TYPE_DATE << TYPE_SHIFT) | PLAN_USES_QUANTITY
+            );
+            assert_eq!(
+                backfill_plan(b"safe", true),
+                ACTION_BACKFILL_SAFE | PLAN_USES_QUANTITY
+            );
+            assert_eq!(backfill_plan(b"safe", false), ACTION_INVALID);
+            assert_eq!(backfill_plan(b"a.b", false), ACTION_GROUP_DATE);
+            assert_eq!(
+                backfill_plan(b"a.b", true),
+                ACTION_GROUP_QUANTITY | PLAN_USES_QUANTITY
+            );
+            assert_eq!(backfill_plan(b"ALL", false), ACTION_INVALID);
+        }
+
+        #[test]
+        fn exports_write_exact_lengths_and_decline_invalid_input() {
+            let csv = b"7, x,-2";
+            let mut values = [0i64; 3];
+            assert_eq!(
+                unsafe {
+                    nntmux_cat_rgb_cmd_parse_ints(csv.as_ptr(), csv.len(), values.as_mut_ptr(), 3)
+                },
+                3
+            );
+            assert_eq!(values, [7, 0, -2]);
+            let mut short = [5i64; 2];
+            assert_eq!(
+                unsafe {
+                    nntmux_cat_rgb_cmd_parse_ints(csv.as_ptr(), csv.len(), short.as_mut_ptr(), 2)
+                },
+                -3
+            );
+            assert_eq!(short, [5, 5]);
+            assert_eq!(
+                unsafe { nntmux_cat_rgb_cmd_parse_ints(ptr::null(), 0, values.as_mut_ptr(), 3) },
+                DECLINE
+            );
+
+            assert_eq!(
+                written(|out, cap| unsafe {
+                    nntmux_cat_rgb_cmd_parse_names(b" a ,b".as_ptr(), 5, out, cap)
+                }),
+                b"a,b"
+            );
+            assert_eq!(
+                written(|out, cap| unsafe { nntmux_cat_rgb_cmd_reset_payload(out, cap) }),
+                RESET_PAYLOAD
+            );
+            assert_eq!(
+                written(|out, cap| unsafe {
+                    nntmux_cat_rgb_cmd_category_display(
+                        1,
+                        b"HD".as_ptr(),
+                        2,
+                        1,
+                        b"TV".as_ptr(),
+                        2,
+                        out,
+                        cap,
+                    )
+                }),
+                b"TV -> HD"
+            );
+            assert_eq!(
+                written(|out, cap| unsafe {
+                    nntmux_cat_rgb_cmd_category_display(
+                        0,
+                        ptr::null(),
+                        0,
+                        0,
+                        ptr::null(),
+                        0,
+                        out,
+                        cap,
+                    )
+                }),
+                b"N/A"
+            );
+            let mut buf = [0u8; 8];
+            assert_eq!(
+                unsafe {
+                    nntmux_cat_rgb_cmd_category_display(
+                        2,
+                        b"x".as_ptr(),
+                        1,
+                        0,
+                        ptr::null(),
+                        0,
+                        buf.as_mut_ptr(),
+                        8,
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe { nntmux_cat_rgb_cmd_reset_payload(buf.as_mut_ptr(), 1) },
+                -(RESET_PAYLOAD.len() as isize)
+            );
+            assert_eq!(buf, [0u8; 8]);
+
+            let groups = [&3u64.to_le_bytes()[..], b"a.b", &1u64.to_le_bytes(), b"x"].concat();
+            let active = [&3u64.to_le_bytes()[..], b"a.b"].concat();
+            assert_eq!(
+                written(|out, cap| unsafe {
+                    nntmux_cat_rgb_cmd_filter_groups(
+                        groups.as_ptr(),
+                        groups.len(),
+                        active.as_ptr(),
+                        active.len(),
+                        out,
+                        cap,
+                    )
+                }),
+                [1, 0]
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_cat_rgb_cmd_filter_groups(
+                        groups.as_ptr(),
+                        groups.len() - 1,
+                        active.as_ptr(),
+                        active.len(),
+                        buf.as_mut_ptr(),
+                        8,
+                    )
+                },
+                DECLINE
+            );
+
+            let mut row = [0i64; 2];
+            assert_eq!(
+                unsafe {
+                    nntmux_cat_rgb_cmd_project_row(
+                        3,
+                        0,
+                        b"10".as_ptr(),
+                        2,
+                        2,
+                        -4,
+                        b"".as_ptr(),
+                        0,
+                        row.as_mut_ptr(),
+                    )
+                },
+                1
+            );
+            assert_eq!(row, [10, -4]);
+            assert_eq!(
+                unsafe {
+                    nntmux_cat_rgb_cmd_project_row(
+                        4,
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        0,
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        row.as_mut_ptr(),
+                    )
+                },
+                -1
+            );
+
+            let mut first_len = 0usize;
+            let lines = written(|out, cap| unsafe {
+                nntmux_cat_rgb_cmd_completion_lines(3, b"0.5".as_ptr(), 3, &mut first_len, out, cap)
+            });
+            assert_eq!(&lines[..first_len], "\u{2705} Updated 3 groups".as_bytes());
+
+            assert_eq!(
+                [
+                    nntmux_cat_rgb_cmd_valid_backfill_type(1),
+                    nntmux_cat_rgb_cmd_valid_backfill_type(3)
+                ],
+                [1, 0]
+            );
+            let mut value = 0i64;
+            assert_eq!(
+                unsafe {
+                    nntmux_cat_rgb_cmd_resolve_quantity(1, b"5".as_ptr(), 1, 1, 9, &mut value)
+                },
+                QUANTITY_INT
+            );
+            assert_eq!(value, 5);
+            assert_eq!(
+                unsafe { nntmux_cat_rgb_cmd_resolve_quantity(0, ptr::null(), 0, 1, 9, &mut value) },
+                QUANTITY_EMPTY
+            );
+            assert_eq!(
+                unsafe { nntmux_cat_rgb_cmd_resolve_quantity(0, ptr::null(), 0, 2, 9, &mut value) },
+                QUANTITY_INT
+            );
+            assert_eq!(value, 9);
+            assert_eq!(
+                unsafe { nntmux_cat_rgb_cmd_resolve_quantity(2, ptr::null(), 0, 2, 9, &mut value) },
+                -1
+            );
+
+            assert_eq!(
+                written(|out, cap| unsafe {
+                    nntmux_cat_rgb_cmd_message(
+                        MESSAGE_GROUP_NOT_FOUND,
+                        b"a.b".as_ptr(),
+                        3,
+                        out,
+                        cap,
+                    )
+                }),
+                b"Group not found: a.b"
+            );
+            assert_eq!(
+                unsafe { nntmux_cat_rgb_cmd_message(7, b"x".as_ptr(), 1, buf.as_mut_ptr(), 8) },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe { nntmux_cat_rgb_cmd_is_group_name(b"a.b".as_ptr(), 3) },
+                1
+            );
+            assert_eq!(
+                unsafe { nntmux_cat_rgb_cmd_is_group_name(ptr::null(), 0) },
+                -1
+            );
+            assert_eq!(
+                unsafe { nntmux_cat_rgb_cmd_backfill_plan(b"all".as_ptr(), 3, 0) },
+                ACTION_BACKFILL_ALL
+            );
+            assert_eq!(
+                unsafe { nntmux_cat_rgb_cmd_backfill_plan(b"all".as_ptr(), 3, 2) },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_cat_rgb_cmd_clamp_max_headers(
+                        KIND_STRING,
+                        0,
+                        b"-5".as_ptr(),
+                        2,
+                        &mut value,
+                    )
+                },
+                1
+            );
+            assert_eq!(value, 0);
+            assert_eq!(
+                unsafe {
+                    nntmux_cat_rgb_cmd_clamp_max_headers(KIND_INT, 77, b"".as_ptr(), 0, &mut value)
+                },
+                1
+            );
+            assert_eq!(value, 77);
+            assert_eq!(
+                unsafe {
+                    nntmux_cat_rgb_cmd_clamp_max_headers(
+                        KIND_BOOL,
+                        1,
+                        b"".as_ptr(),
+                        0,
+                        ptr::null_mut(),
+                    )
+                },
+                -1
+            );
+        }
+    }
+}
