@@ -7980,3 +7980,422 @@ pub mod candidate_scoring {
         }
     }
 }
+
+/// Wave 9.2: byte-exact PHP title helpers. Unsupported inputs decline to the PHP caller.
+pub mod games_steam_title_matching {
+    use super::{
+        Re, book_replace, candidate_scoring::mb_lower_latin1_into, is_pcre_space, is_pcre_word,
+        php_trim_ascii,
+    };
+    use crate::{
+        OutCursor, metadata,
+        predb::{php_levenshtein as levenshtein, similarity_percent},
+    };
+    use std::{panic::catch_unwind, slice};
+
+    /// Distinct from -required_bytes, including a one-byte output (-1). Empty fallback output means false.
+    const DECLINED: isize = isize::MIN;
+    const MAX_TITLE: usize = 1024;
+
+    /// # Safety
+    /// A non-null pointer must reference `len` readable bytes. Null is valid only for an empty input.
+    unsafe fn input<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len > MAX_TITLE || (ptr.is_null() && len != 0) {
+            None
+        } else if len == 0 {
+            Some(&[])
+        } else {
+            Some(unsafe { slice::from_raw_parts(ptr, len) })
+        }
+    }
+
+    fn numeric(token: &[u8]) -> bool {
+        !token.is_empty() && token.iter().all(u8::is_ascii_digit)
+    }
+
+    fn clean_version_tokens(name: &[u8]) -> Vec<u8> {
+        // Keep empty edge tokens: preg_split() on a leading/trailing form feed preserves them.
+        let mut parts = Vec::with_capacity(16);
+        let mut pos = 0;
+        let name = php_trim_ascii(name);
+        for (i, &b) in name.iter().enumerate() {
+            if is_pcre_space(b) && (i == 0 || !is_pcre_space(name[i - 1])) {
+                parts.push(&name[pos..i]);
+            }
+            if is_pcre_space(b) {
+                pos = i + 1;
+            }
+        }
+        if pos < name.len() || name.last().is_some_and(|b| is_pcre_space(*b)) || name.is_empty() {
+            parts.push(&name[pos..]);
+        }
+        let mut out = Vec::with_capacity(name.len());
+        let mut first = true;
+        let mut i = 0;
+        while i < parts.len() {
+            let tok = parts[i];
+            let starts_v = tok.first().is_some_and(|b| b.eq_ignore_ascii_case(&b'v'));
+            let digits = if starts_v { &tok[1..] } else { tok };
+            if numeric(digits) {
+                let mut j = i + 1;
+                while j < parts.len() && numeric(parts[j]) {
+                    j += 1;
+                }
+                if j - i > if starts_v { 1 } else { 2 } {
+                    i = j;
+                    continue;
+                }
+            }
+            if !first {
+                out.push(b' ');
+            }
+            first = false;
+            out.extend_from_slice(tok);
+            i += 1;
+        }
+        out
+    }
+
+    fn multi_re() -> &'static Re {
+        static RE: std::sync::OnceLock<Re> = std::sync::OnceLock::new();
+        RE.get_or_init(|| Re::new(r"(\sMulti\d?\s)", true))
+    }
+
+    fn fallback_parse(name: &[u8]) -> Vec<u8> {
+        let cleaned = book_replace(multi_re(), name, b"");
+        // LEGACY_TITLE_REGEX's mandatory first capture is greedy [\w\s.]+. Every
+        // subsequent group is optional, so it cannot extend or shorten that capture.
+        let allowed = |b: &u8| is_pcre_word(*b) || is_pcre_space(*b) || *b == b'.';
+        let Some(start) = cleaned.iter().position(allowed) else {
+            return Vec::new();
+        };
+        let end = start + cleaned[start..].iter().take_while(|b| allowed(b)).count();
+        let title: Vec<_> = cleaned[start..end]
+            .iter()
+            .map(|b| if matches!(b, b'.' | b'_') { b' ' } else { *b })
+            .collect();
+        // PHP str_replace is non-overlapping, case-sensitive, and runs before language stripping.
+        let mut rf = Vec::with_capacity(title.len());
+        let mut i = 0;
+        while i < title.len() {
+            if title[i..].starts_with(b" RF ") {
+                rf.push(b' ');
+                i += 4;
+            } else {
+                rf.push(title[i]);
+                i += 1;
+            }
+        }
+        let suffix_end = rf.len() - usize::from(rf.last() == Some(&b'\n'));
+        for lang in [
+            "brazilian",
+            "chinese",
+            "croatian",
+            "danish",
+            "deutsch",
+            "dutch",
+            "english",
+            "estonian",
+            "flemish",
+            "finnish",
+            "french",
+            "german",
+            "greek",
+            "hebrew",
+            "icelandic",
+            "italian",
+            "latin",
+            "nordic",
+            "norwegian",
+            "polish",
+            "portuguese",
+            "japenese",
+            "japanese",
+            "russian",
+            "serbian",
+            "slovenian",
+            "spanish",
+            "spanisch",
+            "swedish",
+            "thai",
+            "turkish",
+        ] {
+            if suffix_end >= lang.len()
+                && rf[suffix_end - lang.len()..suffix_end].eq_ignore_ascii_case(lang.as_bytes())
+            {
+                rf.drain(suffix_end - lang.len()..suffix_end);
+                break;
+            }
+        }
+        let mut out = Vec::with_capacity(rf.len());
+        let mut i = 0;
+        while i < rf.len() {
+            if is_pcre_space(rf[i]) {
+                let mut end = i + 1;
+                while end < rf.len() && is_pcre_space(rf[end]) {
+                    end += 1;
+                }
+                out.push(if end - i >= 2 { b' ' } else { rf[i] });
+                i = end;
+            } else {
+                out.push(rf[i]);
+                i += 1;
+            }
+        }
+        let title = php_trim_ascii(&out);
+        if title == b"0" {
+            Vec::new()
+        } else {
+            title.to_vec()
+        }
+    }
+
+    // The reused metadata helpers are verified for ASCII. Decline newline/VT cases where
+    // existing callers take PHP fallback or Rust's ASCII whitespace set differs from PCRE.
+    fn steam_input(bytes: &[u8]) -> Option<&str> {
+        if !bytes.is_ascii() || bytes.iter().any(|b| matches!(b, 0 | b'\n' | b'\r' | 0x0b)) {
+            None
+        } else {
+            std::str::from_utf8(bytes).ok()
+        }
+    }
+
+    fn query_variants(title: &str) -> Vec<u8> {
+        let stripped = metadata::steam_strip_edition_tags(title);
+        let mut variants = vec![title.to_owned()];
+        if stripped != title && !stripped.is_empty() {
+            variants.push(stripped.clone());
+        }
+        let mut no_paren = Vec::with_capacity(stripped.len());
+        let b = stripped.as_bytes();
+        let mut pos = 0;
+        let mut from = 0;
+        while pos < b.len() {
+            if b[pos] == b'('
+                && let Some(close) = b[pos + 1..].iter().position(|c| *c == b')')
+            {
+                let mut start = pos;
+                while start > from && is_pcre_space(b[start - 1]) {
+                    start -= 1;
+                }
+                no_paren.extend_from_slice(&b[from..start]);
+                no_paren.push(b' ');
+                pos += close + 2;
+                while pos < b.len() && is_pcre_space(b[pos]) {
+                    pos += 1;
+                }
+                from = pos;
+            } else {
+                pos += 1;
+            }
+        }
+        no_paren.extend_from_slice(&b[from..]);
+        let no_paren = super::book_spaces(&no_paren);
+        let no_paren = std::str::from_utf8(php_trim_ascii(&no_paren)).unwrap();
+        if no_paren != stripped && !no_paren.is_empty() {
+            variants.push(no_paren.to_owned());
+        }
+        if let Some((left, _)) = no_paren.split_once(':') {
+            let left = left.trim_matches(|c: char| is_php_trim(c));
+            if !left.is_empty() && left != no_paren {
+                variants.push(left.to_owned());
+            }
+        }
+        let normalized = metadata::steam_normalize_title(no_paren);
+        if normalized != no_paren && !normalized.is_empty() {
+            variants.push(normalized);
+        }
+        let mut seen = Vec::with_capacity(variants.len());
+        let mut result = Vec::with_capacity(title.len() * 3);
+        for variant in variants {
+            let v = variant.trim_matches(|c: char| is_php_trim(c));
+            let lower = v.to_ascii_lowercase();
+            if !v.is_empty() && !seen.contains(&lower) {
+                if !seen.is_empty() {
+                    result.push(0);
+                }
+                seen.push(lower);
+                result.extend_from_slice(v.as_bytes());
+            }
+        }
+        result
+    }
+
+    fn is_php_trim(c: char) -> bool {
+        c.is_ascii() && super::is_php_trim_char(c as u8)
+    }
+
+    fn tokenize(title: &[u8]) -> Option<Vec<u8>> {
+        if title.contains(&0) {
+            return None;
+        }
+        let mut lower = Vec::with_capacity(title.len());
+        if !mb_lower_latin1_into(title, &mut lower) {
+            return None;
+        }
+        let lower = std::str::from_utf8(&lower).ok()?;
+        let mut seen = Vec::new();
+        let mut out = Vec::with_capacity(lower.len());
+        for token in lower.split(|c: char| {
+            (c.is_ascii() && is_pcre_space(c as u8)) || matches!(c, '\u{0085}' | '\u{00a0}')
+        }) {
+            let token = token.trim_matches(is_php_trim);
+            if token.is_empty() || seen.contains(&token) {
+                continue;
+            }
+            if !seen.is_empty() {
+                out.push(0);
+            }
+            out.extend_from_slice(token.as_bytes());
+            seen.push(token);
+        }
+        Some(out)
+    }
+
+    /// # Safety
+    /// Inputs must be readable and output must be writable for the specified lengths, without overlap.
+    /// Returns written bytes, -required_bytes on short capacity, or isize::MIN on decline.
+    unsafe fn string_call(ptr: *const u8, len: usize, out: *mut u8, cap: usize, kind: u8) -> isize {
+        catch_unwind(|| {
+            let Some(bytes) = (unsafe { input(ptr, len) }) else {
+                return DECLINED;
+            };
+            let result = match kind {
+                0 => clean_version_tokens(bytes),
+                1 => fallback_parse(bytes),
+                2 => {
+                    let Some(s) = steam_input(bytes) else {
+                        return DECLINED;
+                    };
+                    query_variants(s)
+                }
+                3 => {
+                    let Some(tokens) = tokenize(bytes) else {
+                        return DECLINED;
+                    };
+                    tokens
+                }
+                _ => {
+                    let Some(s) = steam_input(bytes) else {
+                        return DECLINED;
+                    };
+                    let normalized = metadata::steam_normalize_title(s);
+                    let mut pattern = Vec::with_capacity(normalized.len() + 2);
+                    pattern.push(b'%');
+                    if !normalized.is_empty() {
+                        pattern.extend(
+                            normalized
+                                .bytes()
+                                .map(|b| if is_pcre_space(b) { b'%' } else { b }),
+                        );
+                        pattern.push(b'%');
+                    }
+                    pattern
+                }
+            };
+            let mut cursor = unsafe { OutCursor::new(out, cap) };
+            cursor.extend(&result);
+            cursor.finish()
+        })
+        .unwrap_or(DECLINED)
+    }
+
+    macro_rules! string_export {
+        ($name:ident, $kind:expr) => {
+            /// # Safety
+            /// Input/output must be valid for their lengths and must not overlap. See `string_call`.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                ptr: *const u8,
+                len: usize,
+                out: *mut u8,
+                cap: usize,
+            ) -> isize {
+                unsafe { string_call(ptr, len, out, cap, $kind) }
+            }
+        };
+    }
+    string_export!(nntmux_games_clean_version_tokens, 0);
+    string_export!(nntmux_games_fallback_parse, 1);
+    string_export!(nntmux_steam_generate_query_variants_nul, 2);
+    string_export!(nntmux_steam_tokenize_nul, 3);
+    string_export!(nntmux_steam_build_like_pattern, 4);
+
+    /// # Safety
+    /// Both pointers must reference their specified readable lengths. Returns -1.0 on decline.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_games_compute_similarity(
+        a: *const u8,
+        alen: usize,
+        b: *const u8,
+        blen: usize,
+    ) -> f64 {
+        catch_unwind(|| {
+            let (Some(a), Some(b)) = (unsafe { input(a, alen) }, unsafe { input(b, blen) }) else {
+                return -1.0;
+            };
+            if a == b {
+                return 100.0;
+            }
+            let len = a.len().max(b.len());
+            similarity_percent(a, b).max((1.0 - levenshtein(a, b) as f64 / len as f64) * 100.0)
+        })
+        .unwrap_or(-1.0)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn version_edges_and_legacy_capture() {
+            assert_eq!(
+                clean_version_tokens(b"Game v1 2 3 title 4 5"),
+                b"Game title 4 5"
+            );
+            assert_eq!(clean_version_tokens(b"\x0cGame\x0c"), b" Game ");
+            assert_eq!(
+                fallback_parse(b" Game.Multi2.Title-English"),
+                b"Game Multi2 Title"
+            );
+            assert_eq!(fallback_parse(b"0"), b"");
+            assert_eq!(fallback_parse(b"Notenglish\n"), b"Not");
+            assert_eq!(
+                tokenize("É\u{00a0}É".as_bytes()),
+                Some("é".as_bytes().to_vec())
+            );
+        }
+
+        #[test]
+        fn myers_matches_dynamic_programming() {
+            let mut seed = 902u64;
+            for len in [0, 1, 2, 31, 63, 64, 65, 130] {
+                for other in [0, 1, 9, 63, 64, 65, 140] {
+                    let mut make = |n| {
+                        (0..n)
+                            .map(|_| {
+                                seed ^= seed << 13;
+                                seed ^= seed >> 7;
+                                seed ^= seed << 17;
+                                (seed % 7) as u8
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    let (a, b) = (make(len), make(other));
+                    let mut row: Vec<_> = (0..=a.len()).collect();
+                    for (i, &cb) in b.iter().enumerate() {
+                        let mut diag = row[0];
+                        row[0] = i + 1;
+                        for (j, &ca) in a.iter().enumerate() {
+                            let old = row[j + 1];
+                            row[j + 1] =
+                                (row[j] + 1).min(old + 1).min(diag + usize::from(ca != cb));
+                            diag = old;
+                        }
+                    }
+                    assert_eq!(levenshtein(&a, &b), row[a.len()]);
+                }
+            }
+        }
+    }
+}
