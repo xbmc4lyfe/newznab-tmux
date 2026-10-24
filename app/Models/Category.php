@@ -13,6 +13,7 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Facade;
 
 /**
  * App\Models\Category.
@@ -512,7 +513,7 @@ class Category extends Model
 
     public static function isParentPhp(mixed $cid): bool
     {
-        if (Cache::getFacadeRoot() === null) {
+        if (! self::hasParentCategoryCache()) {
             return self::isParentCategoryIdPhp($cid);
         }
 
@@ -534,7 +535,7 @@ class Category extends Model
 
     public static function isParentNative(mixed $cid): bool
     {
-        if (Cache::getFacadeRoot() === null) {
+        if (! self::hasParentCategoryCache()) {
             return self::isParentCategoryIdNative($cid);
         }
 
@@ -550,6 +551,16 @@ class Category extends Model
         Cache::put($cacheKey, $isParent, now()->addHours(24));
 
         return $isParent;
+    }
+
+    private static function hasParentCategoryCache(): bool
+    {
+        $app = Facade::getFacadeApplication();
+
+        return $app !== null
+            && $app->bound('cache')
+            && RootCategory::getConnectionResolver() !== null
+            && Cache::getFacadeRoot() !== null;
     }
 
     public static function isParentCategoryId(mixed $cid): bool
