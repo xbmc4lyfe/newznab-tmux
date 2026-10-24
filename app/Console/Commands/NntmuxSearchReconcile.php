@@ -8,7 +8,10 @@ use App\Facades\Search;
 use App\Models\Predb;
 use App\Models\Release;
 use App\Services\Search\Drivers\ManticoreSearchDriver;
+use App\Support\RustPipelineLibrary;
 use Carbon\Carbon;
+use FFI;
+use FFI\CData;
 use Illuminate\Console\Command;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Log;
@@ -18,6 +21,30 @@ use Throwable;
 
 class NntmuxSearchReconcile extends Command
 {
+    public const string FFI_CDEF = <<<'C'
+        int32_t nntmux_reconcile_parse_since(const char *input, size_t len, int64_t *amount);
+        ssize_t nntmux_reconcile_missing_ids(const char *batch, size_t batch_count, const char *indexed, size_t indexed_count, char *out, size_t out_cap);
+        ssize_t nntmux_reconcile_probe_sql(const char *index, size_t index_len, const char *ids, size_t count, char *out, size_t out_cap);
+        C;
+
+    /**
+     * Smallest id list routed to Rust; below ~32 ids the FFI call and pack/unpack cost more
+     * than PHP's own `array_diff()` / `implode()`.
+     */
+    public const int NATIVE_MIN_IDS = 64;
+
+    private static FFI|false|null $reconcileFfi = null;
+
+    private static ?CData $reconcileIntOut = null;
+
+    private static ?bool $useRustFfi = null;
+
+    private static bool $adoptMissingIdsFfi = true;
+
+    private static bool $adoptProbeSqlFfi = true;
+
+    private static bool $adoptParseSinceFfi = false;
+
     protected $signature = 'nntmux:search-reconcile
                             {--predb : Reconcile PreDB documents; requires --all}
                             {--since=24h : Only releases with adddate after this window (e.g. 24h, 7d)}
@@ -86,8 +113,8 @@ class NntmuxSearchReconcile extends Command
                 $scanned += \count($ids);
                 foreach (array_chunk($ids, $inBatch) as $batch) {
                     $indexed = $this->fetchIndexedIds($manticore, $index, $batch);
-                    foreach (array_diff($batch, $indexed) as $mid) {
-                        $missingAll[] = (int) $mid;
+                    foreach (self::missingIds($batch, $indexed) as $mid) {
+                        $missingAll[] = $mid;
                     }
                 }
                 $bar->advance($releases->count());
@@ -174,7 +201,7 @@ class NntmuxSearchReconcile extends Command
                     foreach ($rows->chunk($inBatch) as $batch) {
                         $ids = $batch->pluck('id')->map(static fn ($id): int => (int) $id)->all();
                         $indexed = $this->fetchPredbIndexedIds($driver, $index, $ids);
-                        $missing = array_values(array_diff($ids, $indexed));
+                        $missing = self::missingIds($ids, $indexed);
                         $scanned += count($ids);
                         $missingTotal += count($missing);
                         $sample = array_slice([...$sample, ...array_slice($missing, 0, 20)], 0, 20);
@@ -187,7 +214,7 @@ class NntmuxSearchReconcile extends Command
                             if (($result['success'] ?? null) !== count($missing) || ($result['errors'] ?? null) !== 0) {
                                 throw new RuntimeException('PreDB bulk write failed.');
                             }
-                            if (array_diff($missing, $this->fetchPredbIndexedIds($driver, $index, $missing)) !== []) {
+                            if (self::missingIds($missing, $this->fetchPredbIndexedIds($driver, $index, $missing)) !== []) {
                                 throw new RuntimeException('PreDB write verification failed.');
                             }
                             $repaired += count($missing);
@@ -286,13 +313,11 @@ class NntmuxSearchReconcile extends Command
 
     private function parseSinceCutoff(string $since): Carbon
     {
+        $window = self::parseSinceWindow($since);
+        if ($window !== null) {
+            return $window[0] === 'h' ? Carbon::now()->subHours($window[1]) : Carbon::now()->subDays($window[1]);
+        }
         $since = trim($since);
-        if (preg_match('/^(\d+)h$/i', $since, $m)) {
-            return Carbon::now()->subHours((int) $m[1]);
-        }
-        if (preg_match('/^(\d+)d$/i', $since, $m)) {
-            return Carbon::now()->subDays((int) $m[1]);
-        }
 
         try {
             return Carbon::parse($since, config('app.timezone'));
@@ -300,6 +325,264 @@ class NntmuxSearchReconcile extends Command
             $this->warn("Could not parse --since={$since}; defaulting to 24 hours.");
 
             return Carbon::now()->subHours(24);
+        }
+    }
+
+    public static function setUseRustFfi(?bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? self::$adoptMissingIdsFfi;
+    }
+
+    public static function reconcileFfi(): ?FFI
+    {
+        return self::resolveReconcileFfi();
+    }
+
+    /**
+     * `--since` shorthand: `['h'|'d', amount]` for `<n>h` / `<n>d`, otherwise null.
+     *
+     * @return array{0: 'h'|'d', 1: int}|null
+     */
+    public static function parseSinceWindow(string $since): ?array
+    {
+        if (self::$useRustFfi ?? self::$adoptParseSinceFfi) {
+            $supported = false;
+            $native = self::parseSinceWindowNative($since, $supported);
+            if ($supported) {
+                return $native;
+            }
+        }
+
+        return self::parseSinceWindowPhp($since);
+    }
+
+    /**
+     * @param-out bool $supported
+     *
+     * @return array{0: 'h'|'d', 1: int}|null
+     */
+    public static function parseSinceWindowNative(string $since, bool &$supported = false): ?array
+    {
+        $supported = false;
+        if (self::$useRustFfi === false) {
+            return null;
+        }
+        $ffi = self::resolveReconcileFfi();
+        if ($ffi === null || self::$reconcileIntOut === null) {
+            return null;
+        }
+
+        try {
+            // @phpstan-ignore method.notFound
+            $kind = $ffi->nntmux_reconcile_parse_since($since, \strlen($since), self::$reconcileIntOut);
+        } catch (Throwable) {
+            return null;
+        }
+        if (! \in_array($kind, [0, 1, 2], true)) {
+            return null;
+        }
+        $supported = true;
+        if ($kind === 0) {
+            return null;
+        }
+
+        return [$kind === 1 ? 'h' : 'd', (int) self::$reconcileIntOut[0]];
+    }
+
+    /**
+     * @return array{0: 'h'|'d', 1: int}|null
+     */
+    public static function parseSinceWindowPhp(string $since): ?array
+    {
+        $since = trim($since);
+        if (preg_match('/^(\d+)h$/i', $since, $m)) {
+            return ['h', (int) $m[1]];
+        }
+        if (preg_match('/^(\d+)d$/i', $since, $m)) {
+            return ['d', (int) $m[1]];
+        }
+
+        return null;
+    }
+
+    /**
+     * Ids from `$batch` absent from `$indexed`, in batch order with duplicates kept.
+     *
+     * @param  list<int>  $batch
+     * @param  list<int>  $indexed
+     * @return list<int>
+     */
+    public static function missingIds(array $batch, array $indexed): array
+    {
+        if ((self::$useRustFfi ?? self::$adoptMissingIdsFfi) && \count($batch) >= self::NATIVE_MIN_IDS) {
+            $supported = false;
+            $native = self::missingIdsNative($batch, $indexed, $supported);
+            if ($supported && $native !== null) {
+                return $native;
+            }
+        }
+
+        return self::missingIdsPhp($batch, $indexed);
+    }
+
+    /**
+     * @param  list<int>  $batch
+     * @param  list<int>  $indexed
+     *
+     * @param-out bool $supported
+     *
+     * @return list<int>|null
+     */
+    public static function missingIdsNative(array $batch, array $indexed, bool &$supported = false): ?array
+    {
+        $supported = false;
+        if (self::$useRustFfi === false) {
+            return null;
+        }
+        $count = \count($batch);
+        if ($count === 0) {
+            $supported = true;
+
+            return [];
+        }
+        $ffi = self::resolveReconcileFfi();
+        if ($ffi === null) {
+            return null;
+        }
+        $capacity = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, $count * 8, $capacity);
+        if ($scratch === null) {
+            return null;
+        }
+
+        try {
+            $packedBatch = pack('q*', ...$batch);
+            $packedIndexed = $indexed === [] ? '' : pack('q*', ...$indexed);
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_reconcile_missing_ids($packedBatch, $count, $packedIndexed, \count($indexed), $scratch, $capacity);
+        } catch (Throwable) {
+            return null;
+        }
+        if (! \is_int($written) || $written < 0 || $written % 8 !== 0) {
+            return null;
+        }
+        $supported = true;
+        if ($written === 0) {
+            return [];
+        }
+
+        /** @var list<int> */
+        return array_values((array) unpack('q*', FFI::string($scratch, $written)));
+    }
+
+    /**
+     * @param  list<int>  $batch
+     * @param  list<int>  $indexed
+     * @return list<int>
+     */
+    public static function missingIdsPhp(array $batch, array $indexed): array
+    {
+        $missing = [];
+        foreach (array_diff($batch, $indexed) as $id) {
+            $missing[] = (int) $id;
+        }
+
+        return $missing;
+    }
+
+    /**
+     * Raw-mode id probe for `$ids` against `$index` with LIMIT and max_matches raised to the batch size.
+     *
+     * @param  list<int>  $ids
+     */
+    public static function indexedIdsProbeSql(string $index, array $ids): string
+    {
+        if ((self::$useRustFfi ?? self::$adoptProbeSqlFfi) && \count($ids) >= self::NATIVE_MIN_IDS) {
+            $supported = false;
+            $native = self::indexedIdsProbeSqlNative($index, $ids, $supported);
+            if ($supported && $native !== null) {
+                return $native;
+            }
+        }
+
+        return self::indexedIdsProbeSqlPhp($index, $ids);
+    }
+
+    /**
+     * @param  list<int>  $ids
+     *
+     * @param-out bool $supported
+     */
+    public static function indexedIdsProbeSqlNative(string $index, array $ids, bool &$supported = false): ?string
+    {
+        $supported = false;
+        if (self::$useRustFfi === false) {
+            return null;
+        }
+        $ffi = self::resolveReconcileFfi();
+        if ($ffi === null) {
+            return null;
+        }
+        $count = \count($ids);
+        $indexLen = \strlen($index);
+        $capacity = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, 2 * $indexLen + 21 * $count + 96, $capacity);
+        if ($scratch === null) {
+            return null;
+        }
+
+        try {
+            $packed = $count === 0 ? '' : pack('q*', ...$ids);
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_reconcile_probe_sql($index, $indexLen, $packed, $count, $scratch, $capacity);
+        } catch (Throwable) {
+            return null;
+        }
+        if (! \is_int($written) || $written <= 0) {
+            return null;
+        }
+        $supported = true;
+
+        return FFI::string($scratch, $written);
+    }
+
+    /**
+     * @param  list<int>  $ids
+     */
+    public static function indexedIdsProbeSqlPhp(string $index, array $ids): string
+    {
+        $list = implode(',', array_map(static fn (int $id): string => (string) $id, $ids));
+        $safeIndex = str_replace('`', '``', $index);
+        $limit = max(\count($ids), 1);
+
+        return "SELECT id FROM `{$safeIndex}` WHERE id IN ({$list}) LIMIT {$limit} OPTION max_matches={$limit}";
+    }
+
+    private static function resolveReconcileFfi(): ?FFI
+    {
+        if (self::$reconcileFfi !== null) {
+            return self::$reconcileFfi === false ? null : self::$reconcileFfi;
+        }
+        $ffi = RustPipelineLibrary::resolveDomain('search', self::FFI_CDEF);
+        if ($ffi === null) {
+            self::$reconcileFfi = false;
+
+            return null;
+        }
+        try {
+            self::$reconcileIntOut = $ffi->new('int64_t[1]');
+            self::$reconcileFfi = $ffi;
+
+            return $ffi;
+        } catch (Throwable) {
+            self::$reconcileFfi = false;
+
+            return null;
         }
     }
 
@@ -313,14 +596,11 @@ class NntmuxSearchReconcile extends Command
             return [];
         }
 
-        $list = implode(',', array_map(static fn (int $id): string => (string) $id, $ids));
-        $safeIndex = str_replace('`', '``', $index);
         // Manticore SQL applies an implicit LIMIT 20 when no LIMIT clause is given, AND
         // max_matches defaults to 1000. Without explicitly raising both, our IN() probe
         // would only return the first 20 (or 1000) matches per batch, falsely flagging
         // the rest as missing. Use the actual batch size with a small ceiling cushion.
-        $limit = max(\count($ids), 1);
-        $sql = "SELECT id FROM `{$safeIndex}` WHERE id IN ({$list}) LIMIT {$limit} OPTION max_matches={$limit}";
+        $sql = self::indexedIdsProbeSql($index, $ids);
 
         try {
             $response = $driver->manticoreSearch->sql($sql, true);
@@ -390,10 +670,7 @@ class NntmuxSearchReconcile extends Command
             return;
         }
 
-        $list = implode(',', array_map(static fn (int $id): string => (string) $id, $sampleIds));
-        $safeIndex = str_replace('`', '``', $index);
-        $limit = max(\count($sampleIds), 1);
-        $sql = "SELECT id FROM `{$safeIndex}` WHERE id IN ({$list}) LIMIT {$limit} OPTION max_matches={$limit}";
+        $sql = self::indexedIdsProbeSql($index, $sampleIds);
 
         $rawShape = 'unavailable';
         try {
