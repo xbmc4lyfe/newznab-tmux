@@ -12558,3 +12558,991 @@ pub mod categorize_metrics_and_status {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Wave 19 Slice 19.6: TmuxConfigurationData, SiteConfigurationData,
+// RegistrationConfigurationData, ServiceStatusEnum, and TmuxMode helpers
+// ---------------------------------------------------------------------------
+
+pub mod tmux_site_config_and_status_enums {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    use crate::OutCursor;
+
+    pub const DECLINED: isize = -1;
+
+    /// 37 numeric/boolean fields in `TmuxConfigurationData` declaration order,
+    /// followed by 3 presence flags (`has_vnstat_args`, `has_tcp_track_args`, `has_redis_args`).
+    pub const TMUX_SCALAR_COUNT: usize = 37;
+    pub const TMUX_DEFAULTS_SCALAR_LEN: usize = 40;
+    pub const TMUX_DEFAULT_EXCLUSIONS_LEN: usize = 19;
+
+    const TMUX_DEFAULT_SCALARS: [i64; TMUX_DEFAULTS_SCALAR_LEN] = [
+        30,  // 0: monitorDelay
+        19,  // 1: niceness
+        0,   // 2: sequentialMode
+        30,  // 3: sequentialTimer
+        0,   // 4: binariesEnabled (bool)
+        30,  // 5: binariesTimer
+        1,   // 6: binariesKillTimer
+        0,   // 7: backfillMode
+        4,   // 8: backfillGroups
+        30,  // 9: backfillTimer
+        0,   // 10: progressiveBackfill (bool)
+        0,   // 11: releasesEnabled (bool)
+        30,  // 12: releaseTimer
+        0,   // 13: postMode
+        30,  // 14: postTimer
+        300, // 15: postKillTimer
+        0,   // 16: postAmazonMode
+        30,  // 17: postAmazonTimer
+        0,   // 18: postNonMode
+        30,  // 19: postNonTimer
+        0,   // 20: fixNamesEnabled (bool)
+        30,  // 21: fixTimer
+        30,  // 22: cleanupTimer
+        0,   // 23: runIrcScraper (bool)
+        0,   // 24: consoleEnabled (bool)
+        0,   // 25: htopEnabled (bool)
+        0,   // 26: mytopEnabled (bool)
+        0,   // 27: nmonEnabled (bool)
+        0,   // 28: vnstatEnabled (bool)
+        0,   // 29: tcpTrackEnabled (bool)
+        0,   // 30: bwmngEnabled (bool)
+        0,   // 31: redisEnabled (bool)
+        0,   // 32: writeLogs (bool)
+        0,   // 33: collectionsKillThreshold
+        0,   // 34: postProcessKillThreshold
+        1,   // 35: colorsStart
+        250, // 36: colorsEnd
+        0,   // 37: has_vnstat_args (null)
+        1,   // 38: has_tcp_track_args (non-null)
+        0,   // 39: has_redis_args (null)
+    ];
+
+    const TMUX_DEFAULT_COLOR_EXCLUSIONS: [i64; TMUX_DEFAULT_EXCLUSIONS_LEN] = [
+        4, 8, 9, 11, 15, 16, 17, 18, 19, 46, 47, 48, 49, 50, 51, 52, 53, 59, 60,
+    ];
+
+    /// NUL-separated default strings for `TmuxConfigurationData`:
+    /// `sessionName\0cleanupMode\0vnstatArgs\0tcpTrackArgs\0redisArgs`
+    const TMUX_DEFAULT_STRINGS_NUL: &[u8] = b"nntmux\0Disabled\0\0-i eth0 port 443\0";
+
+    /// NUL-separated default strings for `SiteConfigurationData` (10 string slots):
+    /// `title\0homeLink\0logoPath\0strapline\0metaTitle\0metaDescription\0metaKeywords\0footer\0dereferrerLink\0terms`
+    const SITE_DEFAULT_STRINGS_NUL: &[u8] = b"NNTmux\0/\0\0A great usenet indexer\0An indexer\0A usenet indexing website\0usenet,nzbs,cms,community\0Usenet binary indexer.\0\0";
+
+    #[inline]
+    unsafe fn input<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len > isize::MAX as usize {
+            None
+        } else if len == 0 {
+            Some(&[])
+        } else if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { slice::from_raw_parts(ptr, len) })
+        }
+    }
+
+    #[inline]
+    fn is_tmux_bool_slot(idx: usize) -> bool {
+        matches!(
+            idx,
+            4 | 10 | 11 | 20 | 23 | 24 | 25 | 26 | 27 | 28 | 29 | 30 | 31 | 32
+        )
+    }
+
+    /// Populate `TmuxConfigurationData::defaults()` into `out_scalars[0..40]`,
+    /// `out_exclusions[0..19]`, and `out_buf` (5 NUL-separated string slots).
+    /// Returns written byte count (`> 0`), `< -1` (`-needed`) if `out_cap` is too small,
+    /// or `-1` on invalid/unaligned pointers or insufficient array capacities.
+    ///
+    /// # Safety
+    ///
+    /// `out_scalars` must be valid for `scalars_cap` writes of `i64` (`>= 40`),
+    /// `out_exclusions` for `exclusions_cap` writes of `i64` (`>= 19`), and
+    /// `out_buf` for `out_cap` byte writes when `out_cap > 0`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tmux_config_defaults(
+        out_scalars: *mut i64,
+        scalars_cap: usize,
+        out_exclusions: *mut i64,
+        exclusions_cap: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            let max_i64 = (isize::MAX as usize) / std::mem::size_of::<i64>();
+            if out_scalars.is_null()
+                || !out_scalars.is_aligned()
+                || scalars_cap < TMUX_DEFAULTS_SCALAR_LEN
+                || scalars_cap > max_i64
+                || out_exclusions.is_null()
+                || !out_exclusions.is_aligned()
+                || exclusions_cap < TMUX_DEFAULT_EXCLUSIONS_LEN
+                || exclusions_cap > max_i64
+                || out_cap > isize::MAX as usize
+                || (out_cap > 0 && out_buf.is_null())
+            {
+                return DECLINED;
+            }
+
+            let scalars =
+                unsafe { slice::from_raw_parts_mut(out_scalars, TMUX_DEFAULTS_SCALAR_LEN) };
+            scalars.copy_from_slice(&TMUX_DEFAULT_SCALARS);
+
+            let exclusions =
+                unsafe { slice::from_raw_parts_mut(out_exclusions, TMUX_DEFAULT_EXCLUSIONS_LEN) };
+            exclusions.copy_from_slice(&TMUX_DEFAULT_COLOR_EXCLUSIONS);
+
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.extend(TMUX_DEFAULT_STRINGS_NUL);
+            match cursor.pos {
+                n if n <= cursor.buf.len() => n as isize,
+                n if n <= isize::MAX as usize => -(n.max(4) as isize),
+                _ => DECLINED,
+            }
+        }))
+        .unwrap_or(DECLINED)
+    }
+
+    /// Normalize the 37 numeric/boolean fields of `TmuxConfigurationData` (collapsing boolean
+    /// slots to `0`/`1`). Supports in-place normalization (`raw_ptr == out_ptr`).
+    /// Returns `37` on success, or `-1` on invalid/unaligned pointers or wrong counts.
+    ///
+    /// # Safety
+    ///
+    /// `raw_ptr` must be valid for `count` reads of `i64` and `out_ptr` for `out_cap` writes of `i64`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tmux_config_normalize_scalars(
+        raw_ptr: *const i64,
+        count: usize,
+        out_ptr: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            let max_i64 = (isize::MAX as usize) / std::mem::size_of::<i64>();
+            if count != TMUX_SCALAR_COUNT
+                || out_cap < TMUX_SCALAR_COUNT
+                || out_cap > max_i64
+                || raw_ptr.is_null()
+                || !raw_ptr.is_aligned()
+                || out_ptr.is_null()
+                || !out_ptr.is_aligned()
+            {
+                return DECLINED;
+            }
+
+            let raw = unsafe { slice::from_raw_parts(raw_ptr, TMUX_SCALAR_COUNT) };
+            let mut normalized = [0i64; TMUX_SCALAR_COUNT];
+            for (idx, &val) in raw.iter().enumerate() {
+                normalized[idx] = if is_tmux_bool_slot(idx) {
+                    i64::from(val != 0)
+                } else {
+                    val
+                };
+            }
+
+            let out = unsafe { slice::from_raw_parts_mut(out_ptr, TMUX_SCALAR_COUNT) };
+            out.copy_from_slice(&normalized);
+            TMUX_SCALAR_COUNT as isize
+        }))
+        .unwrap_or(DECLINED)
+    }
+
+    /// Normalize `count` `colorExclusions` integer entries for `TmuxConfigurationData`.
+    /// Returns `count` (`>= 0`) on success, `< -1` (`-needed`) if `out_cap < count`,
+    /// or `-1` on null/unaligned pointers or overflow.
+    ///
+    /// # Safety
+    ///
+    /// `raw_ptr` must be valid for `count` reads of `i64` when `count > 0`, and
+    /// `out_ptr` must be valid for `out_cap` writes of `i64` when `out_cap > 0`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tmux_config_normalize_color_exclusions(
+        raw_ptr: *const i64,
+        count: usize,
+        out_ptr: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            let max_i64 = (isize::MAX as usize) / std::mem::size_of::<i64>();
+            if count > max_i64
+                || out_cap > max_i64
+                || (out_cap > 0 && (out_ptr.is_null() || !out_ptr.is_aligned()))
+            {
+                return DECLINED;
+            }
+            if count == 0 {
+                return 0;
+            }
+            if raw_ptr.is_null() || !raw_ptr.is_aligned() {
+                return DECLINED;
+            }
+            if count > out_cap {
+                return -(count.max(2) as isize);
+            }
+
+            let raw = unsafe { slice::from_raw_parts(raw_ptr, count) };
+            let tmp: Vec<i64> = raw.to_vec();
+            let out = unsafe { slice::from_raw_parts_mut(out_ptr, count) };
+            out.copy_from_slice(&tmp);
+            count as isize
+        }))
+        .unwrap_or(DECLINED)
+    }
+
+    /// Validate and normalize `count` NUL-separated `cleanupRules` strings for
+    /// `TmuxConfigurationData`. Returns written byte length (`>= 0`), `< -1` (`-needed`)
+    /// when `out_cap` is too small, or `-1` on invalid arguments / NUL count mismatch.
+    ///
+    /// # Safety
+    ///
+    /// `input_ptr` must be valid for `input_len` reads when `input_len > 0`, and
+    /// `out_buf` must be valid for `out_cap` writes when `out_cap > 0`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tmux_config_normalize_cleanup_rules_nul(
+        input_ptr: *const u8,
+        input_len: usize,
+        count: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if count > isize::MAX as usize
+                || out_cap > isize::MAX as usize
+                || (out_cap > 0 && out_buf.is_null())
+            {
+                return DECLINED;
+            }
+            if count == 0 {
+                return if input_len == 0 { 0 } else { DECLINED };
+            }
+            let Some(raw) = (unsafe { input(input_ptr, input_len) }) else {
+                return DECLINED;
+            };
+
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            let mut seen = 0usize;
+            for part in raw.split(|&b| b == 0) {
+                if seen >= count {
+                    return DECLINED;
+                }
+                if seen > 0 {
+                    cursor.push(0);
+                }
+                cursor.extend(part);
+                seen += 1;
+            }
+            if seen != count {
+                return DECLINED;
+            }
+
+            match cursor.pos {
+                n if n <= cursor.buf.len() => n as isize,
+                n if n <= isize::MAX as usize => -(n.max(4) as isize),
+                _ => DECLINED,
+            }
+        }))
+        .unwrap_or(DECLINED)
+    }
+
+    /// Populate `SiteConfigurationData::defaults()` into `out_scalars[0..4]`
+    /// (`[has_logo=0, trailers_display=1, trailer_width=480, trailer_height=345]`)
+    /// and `out_buf` (10 NUL-separated string fields).
+    ///
+    /// # Safety
+    ///
+    /// `out_scalars` must be valid for `scalars_cap` writes of `i64` (`>= 4`), and
+    /// `out_buf` must be valid for `out_cap` writes when `out_cap > 0`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_site_config_defaults(
+        out_scalars: *mut i64,
+        scalars_cap: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            let max_i64 = (isize::MAX as usize) / std::mem::size_of::<i64>();
+            if out_scalars.is_null()
+                || !out_scalars.is_aligned()
+                || scalars_cap < 4
+                || scalars_cap > max_i64
+                || out_cap > isize::MAX as usize
+                || (out_cap > 0 && out_buf.is_null())
+            {
+                return DECLINED;
+            }
+
+            let scalars = unsafe { slice::from_raw_parts_mut(out_scalars, 4) };
+            scalars[0] = 0;
+            scalars[1] = 1;
+            scalars[2] = 480;
+            scalars[3] = 345;
+
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.extend(SITE_DEFAULT_STRINGS_NUL);
+            match cursor.pos {
+                n if n <= cursor.buf.len() => n as isize,
+                n if n <= isize::MAX as usize => -(n.max(4) as isize),
+                _ => DECLINED,
+            }
+        }))
+        .unwrap_or(DECLINED)
+    }
+
+    /// Normalize `SiteConfiguration::$site_logo` (`null` or `""` -> `0` bytes meaning `null`;
+    /// non-empty string -> copies bytes and returns byte length `> 0`).
+    ///
+    /// # Safety
+    ///
+    /// `logo_ptr` must be valid for `logo_len` reads when `logo_len > 0`, and
+    /// `out_buf` must be valid for `out_cap` writes when `out_cap > 0`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_site_config_normalize_logo(
+        has_logo: u32,
+        logo_ptr: *const u8,
+        logo_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if has_logo > 1
+                || out_cap > isize::MAX as usize
+                || (out_cap > 0 && out_buf.is_null())
+            {
+                return DECLINED;
+            }
+            if has_logo == 0 {
+                return if logo_len == 0 { 0 } else { DECLINED };
+            }
+            let Some(logo) = (unsafe { input(logo_ptr, logo_len) }) else {
+                return DECLINED;
+            };
+            if logo.is_empty() {
+                return 0;
+            }
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.extend(logo);
+            match cursor.pos {
+                n if n <= cursor.buf.len() => n as isize,
+                n if n <= isize::MAX as usize => -(n.max(4) as isize),
+                _ => DECLINED,
+            }
+        }))
+        .unwrap_or(DECLINED)
+    }
+
+    /// Normalize scalar fields for `SiteConfigurationData` (`[has_logo, trailers_display, trailer_width, trailer_height]`).
+    /// Returns `4` on success, or `-1` on invalid arguments / unaligned pointer.
+    ///
+    /// # Safety
+    ///
+    /// `out_scalars` must be valid for `scalars_cap` writes of `i64` (`>= 4`).
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_site_config_normalize_scalars(
+        has_logo: u32,
+        trailers_display: i64,
+        trailer_width: i64,
+        trailer_height: i64,
+        out_scalars: *mut i64,
+        scalars_cap: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let max_i64 = (isize::MAX as usize) / std::mem::size_of::<i64>();
+            if has_logo > 1
+                || out_scalars.is_null()
+                || !out_scalars.is_aligned()
+                || scalars_cap < 4
+                || scalars_cap > max_i64
+            {
+                return -1;
+            }
+            let scalars = unsafe { slice::from_raw_parts_mut(out_scalars, 4) };
+            scalars[0] = i64::from(has_logo);
+            scalars[1] = i64::from(trailers_display != 0);
+            scalars[2] = trailer_width;
+            scalars[3] = trailer_height;
+            4
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Return the default `RegistrationStatus` backing integer value (`0` = `Open`).
+    ///
+    /// # Safety
+    ///
+    /// No pointer arguments; safe to call from C.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_registration_config_default_status() -> i32 {
+        catch_unwind(AssertUnwindSafe(|| 0)).unwrap_or(-1)
+    }
+
+    /// Validate a `RegistrationStatus` integer value (`0` = Open, `1` = Invite, `2` = Closed)
+    /// and write it to `out_normalized`. Returns `1` when valid, `0` when out of range,
+    /// or `-1` on null/unaligned pointer.
+    ///
+    /// # Safety
+    ///
+    /// `out_normalized` must be a non-null, aligned writable pointer to `i64`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_registration_config_validate_status(
+        status: i64,
+        out_normalized: *mut i64,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out_normalized.is_null() || !out_normalized.is_aligned() {
+                return -1;
+            }
+            if !(0..=2).contains(&status) {
+                return 0;
+            }
+            unsafe {
+                *out_normalized = status;
+            }
+            1
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Write the human-readable label for a `RegistrationStatus` value (`0` -> `Open`,
+    /// `1` -> `Invite`, `2` -> `Closed`). Returns written byte length (`> 0`),
+    /// `-2` when `status` is unknown, `< -2` when `out_cap` is too small, or `-1` on invalid buffer args.
+    ///
+    /// # Safety
+    ///
+    /// `out_buf` must be valid for `out_cap` writes when `out_cap > 0`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_registration_config_status_label(
+        status: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out_cap > isize::MAX as usize || (out_cap > 0 && out_buf.is_null()) {
+                return DECLINED;
+            }
+            let label: &[u8] = match status {
+                0 => b"Open",
+                1 => b"Invite",
+                2 => b"Closed",
+                _ => return -2,
+            };
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.extend(label);
+            match cursor.pos {
+                n if n <= cursor.buf.len() => n as isize,
+                n if n <= isize::MAX as usize => -(n.max(4) as isize),
+                _ => DECLINED,
+            }
+        }))
+        .unwrap_or(DECLINED)
+    }
+
+    /// Write `ServiceStatusEnum::label()` into `out_buf` for a status value string.
+    /// Returns written byte length (`> 0`), `-2` when the status string is unknown,
+    /// `< -2` when `out_cap` is too small, or `-1` on invalid pointer/length arguments.
+    ///
+    /// # Safety
+    ///
+    /// `value_ptr` must be valid for `value_len` reads when `value_len > 0`, and
+    /// `out_buf` must be valid for `out_cap` writes when `out_cap > 0`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_service_status_label(
+        value_ptr: *const u8,
+        value_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out_cap > isize::MAX as usize || (out_cap > 0 && out_buf.is_null()) {
+                return DECLINED;
+            }
+            let Some(val) = (unsafe { input(value_ptr, value_len) }) else {
+                return DECLINED;
+            };
+            let label: &[u8] = match val {
+                b"operational" => b"Operational",
+                b"degraded" => b"Degraded",
+                b"partial_outage" => b"Partial outage",
+                b"major_outage" => b"Major outage",
+                b"maintenance" => b"Maintenance",
+                _ => return -2,
+            };
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.extend(label);
+            match cursor.pos {
+                n if n <= cursor.buf.len() => n as isize,
+                n if n <= isize::MAX as usize => -(n.max(4) as isize),
+                _ => DECLINED,
+            }
+        }))
+        .unwrap_or(DECLINED)
+    }
+
+    /// Return `ServiceStatusEnum::severity()` (`0..=4`) for a status value string,
+    /// `-2` when the status value is unknown, or `-1` on null/overflow input.
+    ///
+    /// # Safety
+    ///
+    /// `value_ptr` must be valid for `value_len` reads when `value_len > 0`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_service_status_severity(
+        value_ptr: *const u8,
+        value_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(val) = (unsafe { input(value_ptr, value_len) }) else {
+                return -1;
+            };
+            match val {
+                b"operational" => 0,
+                b"degraded" => 1,
+                b"maintenance" => 2,
+                b"partial_outage" => 3,
+                b"major_outage" => 4,
+                _ => -2,
+            }
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Write `ServiceStatusEnum::values()` as NUL-separated strings into `out_buf`
+    /// and store the count (`5`) in `*out_count`.
+    ///
+    /// # Safety
+    ///
+    /// `out_count` must be a non-null, aligned writable pointer to `usize`, and
+    /// `out_buf` must be valid for `out_cap` writes when `out_cap > 0`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_service_status_values_nul(
+        out_count: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out_count.is_null()
+                || !out_count.is_aligned()
+                || out_cap > isize::MAX as usize
+                || (out_cap > 0 && out_buf.is_null())
+            {
+                return DECLINED;
+            }
+            const PAYLOAD: &[u8] =
+                b"operational\0degraded\0partial_outage\0major_outage\0maintenance";
+            unsafe {
+                *out_count = 5;
+            }
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.extend(PAYLOAD);
+            match cursor.pos {
+                n if n <= cursor.buf.len() => n as isize,
+                n if n <= isize::MAX as usize => -(n.max(4) as isize),
+                _ => DECLINED,
+            }
+        }))
+        .unwrap_or(DECLINED)
+    }
+
+    /// Write `TmuxMode::tasks()` as NUL-separated `key\0role_value` pairs into `out_buf`
+    /// and store the pair count in `*out_pair_count`.
+    /// Returns written byte length (`> 0`), `-2` if `mode` is not in `0..=2`,
+    /// `< -2` (`-needed`) if `out_cap` is too small, or `-1` on invalid/unaligned pointers.
+    ///
+    /// # Safety
+    ///
+    /// `out_pair_count` must be a non-null, aligned writable pointer to `usize`, and
+    /// `out_buf` must be valid for `out_cap` writes when `out_cap > 0`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tmux_mode_tasks_nul(
+        mode: i64,
+        out_pair_count: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out_pair_count.is_null()
+                || !out_pair_count.is_aligned()
+                || out_cap > isize::MAX as usize
+                || (out_cap > 0 && out_buf.is_null())
+            {
+                return DECLINED;
+            }
+
+            const FULL_TASKS: &[u8] = b"binaries\0binaries\0backfill\0backfill\0releases\0releases\0fixnames\0fix_names\0removecrap\0remove_crap\0ppadditional\0post_additional\0tv\0post_tv\0movies\0post_movies\0amazon\0post_metadata\0scraper\0irc_scraper";
+            const BASIC_TASKS: &[u8] = b"releases\0releases\0fixnames\0fix_names\0removecrap\0remove_crap\0ppadditional\0post_additional\0tv\0post_tv\0movies\0post_movies\0amazon\0post_metadata\0scraper\0irc_scraper";
+            const STRIPPED_TASKS: &[u8] =
+                b"main\0sequential\0fixnames\0fix_names\0amazon\0post_metadata\0scraper\0irc_scraper";
+
+            let (pairs, payload): (usize, &[u8]) = match mode {
+                0 => (10, FULL_TASKS),
+                1 => (8, BASIC_TASKS),
+                2 => (4, STRIPPED_TASKS),
+                _ => return -2,
+            };
+
+            unsafe {
+                *out_pair_count = pairs;
+            }
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.extend(payload);
+            match cursor.pos {
+                n if n <= cursor.buf.len() => n as isize,
+                n if n <= isize::MAX as usize => -(n.max(4) as isize),
+                _ => DECLINED,
+            }
+        }))
+        .unwrap_or(DECLINED)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn tmux_site_and_registration_config_helpers_match_php_contracts() {
+            let mut scalars = [0i64; TMUX_DEFAULTS_SCALAR_LEN];
+            let mut exclusions = [0i64; TMUX_DEFAULT_EXCLUSIONS_LEN];
+            let mut buf = [0u8; 256];
+
+            let n = unsafe {
+                nntmux_tmux_config_defaults(
+                    scalars.as_mut_ptr(),
+                    scalars.len(),
+                    exclusions.as_mut_ptr(),
+                    exclusions.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            } as usize;
+            assert_eq!(&buf[..n], TMUX_DEFAULT_STRINGS_NUL);
+            assert_eq!(scalars[0], 30);
+            assert_eq!(scalars[1], 19);
+            assert_eq!(scalars[15], 300);
+            assert_eq!(scalars[36], 250);
+            assert_eq!(scalars[37], 0);
+            assert_eq!(scalars[38], 1);
+            assert_eq!(scalars[39], 0);
+            assert_eq!(exclusions, TMUX_DEFAULT_COLOR_EXCLUSIONS);
+
+            let mut raw_scalars = [0i64; TMUX_SCALAR_COUNT];
+            raw_scalars[0] = 45;
+            raw_scalars[4] = 99; // binariesEnabled -> 1
+            raw_scalars[10] = -3; // progressiveBackfill -> 1
+            raw_scalars[32] = 0; // writeLogs -> 0
+            assert_eq!(
+                unsafe {
+                    nntmux_tmux_config_normalize_scalars(
+                        raw_scalars.as_ptr(),
+                        TMUX_SCALAR_COUNT,
+                        raw_scalars.as_mut_ptr(),
+                        TMUX_SCALAR_COUNT,
+                    )
+                },
+                TMUX_SCALAR_COUNT as isize
+            );
+            assert_eq!(raw_scalars[0], 45);
+            assert_eq!(raw_scalars[4], 1);
+            assert_eq!(raw_scalars[10], 1);
+            assert_eq!(raw_scalars[32], 0);
+
+            let colors = [4i64, 8, 255];
+            let mut out_colors = [0i64; 3];
+            assert_eq!(
+                unsafe {
+                    nntmux_tmux_config_normalize_color_exclusions(
+                        colors.as_ptr(),
+                        colors.len(),
+                        out_colors.as_mut_ptr(),
+                        out_colors.len(),
+                    )
+                },
+                3
+            );
+            assert_eq!(out_colors, colors);
+
+            let rules = b"size\0gibberish\0sample";
+            let n = unsafe {
+                nntmux_tmux_config_normalize_cleanup_rules_nul(
+                    rules.as_ptr(),
+                    rules.len(),
+                    3,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            } as usize;
+            assert_eq!(&buf[..n], rules);
+
+            let mut site_scalars = [0i64; 4];
+            let n = unsafe {
+                nntmux_site_config_defaults(
+                    site_scalars.as_mut_ptr(),
+                    site_scalars.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            } as usize;
+            assert_eq!(&buf[..n], SITE_DEFAULT_STRINGS_NUL);
+            assert_eq!(site_scalars, [0, 1, 480, 345]);
+
+            assert_eq!(
+                unsafe {
+                    nntmux_site_config_normalize_logo(
+                        0,
+                        std::ptr::null(),
+                        0,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                0
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_site_config_normalize_logo(
+                        1,
+                        b"".as_ptr(),
+                        0,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                0
+            );
+            let n = unsafe {
+                nntmux_site_config_normalize_logo(
+                    1,
+                    b"/assets/logo.png".as_ptr(),
+                    16,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            } as usize;
+            assert_eq!(&buf[..n], b"/assets/logo.png");
+
+            assert_eq!(
+                unsafe {
+                    nntmux_site_config_normalize_scalars(
+                        1,
+                        5,
+                        640,
+                        480,
+                        site_scalars.as_mut_ptr(),
+                        4,
+                    )
+                },
+                4
+            );
+            assert_eq!(site_scalars, [1, 1, 640, 480]);
+
+            assert_eq!(unsafe { nntmux_registration_config_default_status() }, 0);
+            let mut reg_out = -1i64;
+            assert_eq!(
+                unsafe { nntmux_registration_config_validate_status(2, &mut reg_out) },
+                1
+            );
+            assert_eq!(reg_out, 2);
+            assert_eq!(
+                unsafe { nntmux_registration_config_validate_status(3, &mut reg_out) },
+                0
+            );
+
+            let n = unsafe {
+                nntmux_registration_config_status_label(1, buf.as_mut_ptr(), buf.len())
+            } as usize;
+            assert_eq!(&buf[..n], b"Invite");
+            assert_eq!(
+                unsafe {
+                    nntmux_registration_config_status_label(99, buf.as_mut_ptr(), buf.len())
+                },
+                -2
+            );
+        }
+
+        #[test]
+        fn service_status_and_tmux_mode_helpers_match_php_contracts() {
+            let mut buf = [0u8; 256];
+            let n = unsafe {
+                nntmux_service_status_label(
+                    b"partial_outage".as_ptr(),
+                    14,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            } as usize;
+            assert_eq!(&buf[..n], b"Partial outage");
+            assert_eq!(
+                unsafe {
+                    nntmux_service_status_label(b"unknown".as_ptr(), 7, buf.as_mut_ptr(), buf.len())
+                },
+                -2
+            );
+
+            assert_eq!(
+                unsafe { nntmux_service_status_severity(b"operational".as_ptr(), 11) },
+                0
+            );
+            assert_eq!(
+                unsafe { nntmux_service_status_severity(b"maintenance".as_ptr(), 11) },
+                2
+            );
+            assert_eq!(
+                unsafe { nntmux_service_status_severity(b"major_outage".as_ptr(), 12) },
+                4
+            );
+            assert_eq!(
+                unsafe { nntmux_service_status_severity(b"invalid".as_ptr(), 7) },
+                -2
+            );
+
+            let mut count = 0usize;
+            let n = unsafe {
+                nntmux_service_status_values_nul(&mut count, buf.as_mut_ptr(), buf.len())
+            } as usize;
+            assert_eq!(count, 5);
+            assert_eq!(
+                &buf[..n],
+                b"operational\0degraded\0partial_outage\0major_outage\0maintenance"
+            );
+
+            let mut pairs = 0usize;
+            let n = unsafe {
+                nntmux_tmux_mode_tasks_nul(0, &mut pairs, buf.as_mut_ptr(), buf.len())
+            } as usize;
+            assert_eq!(pairs, 10);
+            assert!(buf[..n].starts_with(b"binaries\0binaries\0"));
+            assert!(buf[..n].ends_with(b"\0scraper\0irc_scraper"));
+
+            let n = unsafe {
+                nntmux_tmux_mode_tasks_nul(2, &mut pairs, buf.as_mut_ptr(), buf.len())
+            } as usize;
+            assert_eq!(pairs, 4);
+            assert_eq!(
+                &buf[..n],
+                b"main\0sequential\0fixnames\0fix_names\0amazon\0post_metadata\0scraper\0irc_scraper"
+            );
+
+            assert_eq!(
+                unsafe {
+                    nntmux_tmux_mode_tasks_nul(9, &mut pairs, buf.as_mut_ptr(), buf.len())
+                },
+                -2
+            );
+        }
+
+        #[test]
+        fn unaligned_pointers_are_rejected_across_wave19_entrypoints() {
+            let mut raw = [0u8; 512];
+            let unaligned_i64 = unsafe { raw.as_mut_ptr().add(1).cast::<i64>() };
+            let unaligned_usize = unsafe { raw.as_mut_ptr().add(1).cast::<usize>() };
+            let mut aligned_scalars = [0i64; TMUX_DEFAULTS_SCALAR_LEN];
+            let mut aligned_exclusions = [0i64; TMUX_DEFAULT_EXCLUSIONS_LEN];
+            let mut buf = [0u8; 256];
+
+            assert_eq!(
+                unsafe {
+                    nntmux_tmux_config_defaults(
+                        unaligned_i64,
+                        TMUX_DEFAULTS_SCALAR_LEN,
+                        aligned_exclusions.as_mut_ptr(),
+                        TMUX_DEFAULT_EXCLUSIONS_LEN,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_tmux_config_defaults(
+                        aligned_scalars.as_mut_ptr(),
+                        TMUX_DEFAULTS_SCALAR_LEN,
+                        unaligned_i64,
+                        TMUX_DEFAULT_EXCLUSIONS_LEN,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                -1
+            );
+
+            assert_eq!(
+                unsafe {
+                    nntmux_tmux_config_normalize_scalars(
+                        unaligned_i64.cast_const(),
+                        TMUX_SCALAR_COUNT,
+                        aligned_scalars.as_mut_ptr(),
+                        TMUX_SCALAR_COUNT,
+                    )
+                },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_tmux_config_normalize_scalars(
+                        aligned_scalars.as_ptr(),
+                        TMUX_SCALAR_COUNT,
+                        unaligned_i64,
+                        TMUX_SCALAR_COUNT,
+                    )
+                },
+                -1
+            );
+
+            assert_eq!(
+                unsafe {
+                    nntmux_tmux_config_normalize_color_exclusions(
+                        unaligned_i64.cast_const(),
+                        4,
+                        aligned_exclusions.as_mut_ptr(),
+                        4,
+                    )
+                },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_tmux_config_normalize_color_exclusions(
+                        aligned_exclusions.as_ptr(),
+                        4,
+                        unaligned_i64,
+                        4,
+                    )
+                },
+                -1
+            );
+
+            assert_eq!(
+                unsafe {
+                    nntmux_site_config_defaults(unaligned_i64, 4, buf.as_mut_ptr(), buf.len())
+                },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_site_config_normalize_scalars(1, 1, 480, 345, unaligned_i64, 4)
+                },
+                -1
+            );
+            assert_eq!(
+                unsafe { nntmux_registration_config_validate_status(0, unaligned_i64) },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_service_status_values_nul(unaligned_usize, buf.as_mut_ptr(), buf.len())
+                },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_tmux_mode_tasks_nul(0, unaligned_usize, buf.as_mut_ptr(), buf.len())
+                },
+                -1
+            );
+        }
+    }
+}
+
+
