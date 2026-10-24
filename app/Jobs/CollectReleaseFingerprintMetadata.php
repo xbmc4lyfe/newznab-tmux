@@ -11,6 +11,8 @@ use App\Services\Releases\Fingerprint\CompactFingerprintCollector;
 use App\Services\Releases\Fingerprint\DatabaseFingerprintQueue;
 use App\Services\Releases\Fingerprint\ReleaseFingerprintCollector;
 use App\Support\ReleaseArchiveNamingEvidence;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeUnique;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -23,6 +25,76 @@ use Throwable;
 
 final class CollectReleaseFingerprintMetadata implements ShouldBeUnique, ShouldQueue
 {
+    public const string FFI_CDEF = <<<'C'
+        intptr_t nntmux_w18_verification_metadata_fingerprint(uint32_t operation, const char *input, size_t length, char *output, size_t capacity);
+        C;
+
+    // Enable only after paired common/uncommon mean and p99 all reach 1.5x.
+    private static bool $useRustFfi = false;
+
+    public static function setUseRustFfi(bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    /** Decline objects/resources/cycles before serialize() could invoke user code. */
+    private static function nativeValueSupported(mixed $value, int &$remaining, int $depth): bool
+    {
+        if (--$remaining < 0 || $depth > 24) {
+            return false;
+        }
+        if (is_array($value)) {
+            foreach ($value as $item) {
+                if (! self::nativeValueSupported($item, $remaining, $depth + 1)) {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        return $value === null || is_scalar($value);
+    }
+
+    /**
+     * @param  list<mixed>  $arguments
+     * @return array{value: mixed}|null An envelope distinguishes a native null from failure.
+     */
+    private static function computeNative(int $operation, array $arguments): ?array
+    {
+        if (! self::$useRustFfi) {
+            return null;
+        }
+        try {
+            $remaining = 100000;
+            if (! self::nativeValueSupported($arguments, $remaining, 0)) {
+                return null;
+            }
+            $ffi = RustPipelineLibrary::resolveDomain('nfo', self::FFI_CDEF);
+            if ($ffi === null) {
+                return null;
+            }
+            $input = serialize($arguments);
+            if (strlen($input) > 64 * 1024 * 1024) {
+                return null;
+            }
+            $capacity = 0;
+            $output = RustPipelineLibrary::obtainScratch($ffi, max(4096, strlen($input) + 1024), $capacity);
+            if ($output === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound (Declared by FFI_CDEF.)
+            $written = $ffi->nntmux_w18_verification_metadata_fingerprint($operation, $input, strlen($input), $output, $capacity);
+            if (! is_int($written) || $written < 2 || $written > $capacity) {
+                return null;
+            }
+
+            return ['value' => unserialize(FFI::string($output, $written), ['allowed_classes' => false])];
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
     public const TIMEOUT_SECONDS = 1800;
@@ -57,26 +129,88 @@ final class CollectReleaseFingerprintMetadata implements ShouldBeUnique, ShouldQ
 
     public function uniqueId(): string
     {
+        return self::$useRustFfi ? ($this->uniqueIdNative() ?? $this->uniqueIdPhp()) : $this->uniqueIdPhp();
+    }
+
+    public function uniqueIdPhp(): string
+    {
         return $this->generation === '' ? (string) $this->releaseId : $this->releaseId.':'.$this->generation;
+    }
+
+    public function uniqueIdNative(): ?string
+    {
+        $result = self::computeNative(7, [$this->releaseId, $this->generation])['value'] ?? null;
+
+        return is_string($result) ? $result : null;
     }
 
     /** Format marker of the configured collector's records; null for the legacy full collector. */
     public static function currentFormat(): ?string
     {
+        return self::$useRustFfi ? (self::currentFormatNative() ?? self::currentFormatPhp()) : self::currentFormatPhp();
+    }
+
+    public static function currentFormatPhp(): ?string
+    {
         return self::compactFormat() ? CompactFingerprintCollector::FORMAT : null;
+    }
+
+    public static function currentFormatNative(): ?string
+    {
+        if (! self::$useRustFfi) {
+            return null;
+        }
+
+        $result = self::computeNative(8, [self::compactFormat(), CompactFingerprintCollector::FORMAT])['value'] ?? null;
+
+        return is_string($result) ? $result : null;
     }
 
     /** Schema version the configured collector writes; any other or missing version is collected again. */
     public static function currentSchemaVersion(): int
     {
+        return self::$useRustFfi ? (self::currentSchemaVersionNative() ?? self::currentSchemaVersionPhp()) : self::currentSchemaVersionPhp();
+    }
+
+    public static function currentSchemaVersionPhp(): int
+    {
         return self::compactFormat() ? CompactFingerprintCollector::SCHEMA_VERSION : ReleaseFingerprintCollector::SCHEMA_VERSION;
+    }
+
+    public static function currentSchemaVersionNative(): ?int
+    {
+        if (! self::$useRustFfi) {
+            return null;
+        }
+
+        $result = self::computeNative(9, [self::compactFormat(), CompactFingerprintCollector::SCHEMA_VERSION, ReleaseFingerprintCollector::SCHEMA_VERSION])['value'] ?? null;
+
+        return is_int($result) ? $result : null;
     }
 
     /** A JSON column can decode to a scalar; anything but the exact current markers is stale. */
     public static function isCurrent(mixed $metadata): bool
     {
-        return is_array($metadata) && ($metadata['format'] ?? null) === self::currentFormat()
-            && ($metadata['schema_version'] ?? null) === self::currentSchemaVersion();
+        return self::$useRustFfi ? (self::isCurrentNative($metadata) ?? self::isCurrentPhp($metadata)) : self::isCurrentPhp($metadata);
+    }
+
+    public static function isCurrentPhp(mixed $metadata): bool
+    {
+        return is_array($metadata) && ($metadata['format'] ?? null) === self::currentFormatPhp()
+            && ($metadata['schema_version'] ?? null) === self::currentSchemaVersionPhp();
+    }
+
+    public static function isCurrentNative(mixed $metadata): ?bool
+    {
+        if (! self::$useRustFfi) {
+            return null;
+        }
+
+        // Real metadata can be large; only its markers participate in this predicate.
+        $markers = is_array($metadata) ? array_intersect_key($metadata, ['format' => true, 'schema_version' => true]) : $metadata;
+        $result = self::computeNative(10, [$markers, self::currentFormatPhp(), self::currentSchemaVersionPhp()])['value'] ?? null;
+
+        return is_bool($result) ? $result : null;
     }
 
     private static function compactFormat(): bool
@@ -158,7 +292,19 @@ final class CollectReleaseFingerprintMetadata implements ShouldBeUnique, ShouldQ
      */
     private function claimToken(): string
     {
+        return self::$useRustFfi ? ($this->claimTokenNative() ?? $this->claimTokenPhp()) : $this->claimTokenPhp();
+    }
+
+    public function claimTokenPhp(): string
+    {
         return $this->runToken !== '' ? $this->runToken : substr(hash('sha256', 'legacy:'.$this->releaseId.':'.$this->generation), 0, 16);
+    }
+
+    public function claimTokenNative(): ?string
+    {
+        $result = self::computeNative(11, [$this->releaseId, $this->generation, $this->runToken])['value'] ?? null;
+
+        return is_string($result) ? $result : null;
     }
 
     /** @var \WeakMap<\PDO, bool>|null */
