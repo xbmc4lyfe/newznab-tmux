@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace App\Services;
 
 use App\Support\RustPipelineLibrary;
+use FFI;
+use Throwable;
 
 /**
  * GamesTitleParser - Parse and clean game release titles.
@@ -145,6 +147,11 @@ class GamesTitleParser
      */
     protected function cleanVersionTokens(string $name): string
     {
+        return $this->cleanVersionTokensPhp($name);
+    }
+
+    public function cleanVersionTokensPhp(string $name): string
+    {
         $tokens = preg_split('/\s+/', trim($name)) ?: [];
         $filtered = [];
         $i = 0;
@@ -185,6 +192,12 @@ class GamesTitleParser
      * @return array{title: string, release: string}|false
      */
     protected function fallbackParse(string $releaseName): array|false
+    {
+        return $this->fallbackParsePhp($releaseName);
+    }
+
+    /** @return array{title: string, release: string}|false */
+    public function fallbackParsePhp(string $releaseName): array|false
     {
         $cleanedName = preg_replace('/\sMulti\d?\s/i', '', $releaseName);
         if (preg_match(self::LEGACY_TITLE_REGEX, $cleanedName, $hits)) {
@@ -249,6 +262,15 @@ class GamesTitleParser
             return 100.0;
         }
 
+        return self::computeSimilarityNative($a, $b) ?? $this->computeSimilarityPhp($a, $b);
+    }
+
+    public function computeSimilarityPhp(string $a, string $b): float
+    {
+        if ($a === $b) {
+            return 100.0;
+        }
+
         $percent = 0.0;
         similar_text($a, $b, $percent);
 
@@ -263,5 +285,89 @@ class GamesTitleParser
         }
 
         return max($percent, $levScore);
+    }
+
+    private static ?FFI $titleMatchingFfi = null;
+
+    private static bool $titleMatchingResolved = false;
+
+    private static function titleMatchingFfi(): ?FFI
+    {
+        if (! self::$titleMatchingResolved) {
+            self::$titleMatchingResolved = true;
+            self::$titleMatchingFfi = RustPipelineLibrary::resolveDomain('games_title_matching', <<<'C'
+        ssize_t nntmux_games_clean_version_tokens(const char *, size_t, char *, size_t);
+        ssize_t nntmux_games_fallback_parse(const char *, size_t, char *, size_t);
+        double nntmux_games_compute_similarity(const char *, size_t, const char *, size_t);
+        C);
+        }
+
+        return self::$titleMatchingFfi;
+    }
+
+    /** Null means unavailable/declined; negative byte counts request an exact-size retry. */
+    private static function titleMatchingStringNative(string $symbol, string $input): ?string
+    {
+        $ffi = self::$titleMatchingFfi ?? self::titleMatchingFfi();
+        if ($ffi === null) {
+            return null;
+        }
+        $capacity = 0;
+        $buffer = RustPipelineLibrary::obtainScratch($ffi, max(256, strlen($input) + 32), $capacity);
+        if ($buffer === null) {
+            return null;
+        }
+        try {
+            $written = $ffi->$symbol($input, strlen($input), $buffer, $capacity);
+            if (! is_int($written) || $written === PHP_INT_MIN) {
+                return null;
+            }
+            if ($written < 0) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return null;
+                }
+                $written = $ffi->$symbol($input, strlen($input), $buffer, $capacity);
+            }
+            if (! is_int($written) || $written < 0 || $written > $capacity) {
+                return null;
+            }
+
+            return $written === 0 ? '' : FFI::string($buffer, $written);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    public static function cleanVersionTokensNative(string $name): ?string
+    {
+        return self::titleMatchingStringNative('nntmux_games_clean_version_tokens', $name);
+    }
+
+    /** @return array{title: string, release: string}|false|null */
+    public static function fallbackParseNative(string $releaseName): array|false|null
+    {
+        $title = self::titleMatchingStringNative('nntmux_games_fallback_parse', $releaseName);
+        if ($title === null) {
+            return null;
+        }
+
+        return $title === '' ? false : ['title' => $title, 'release' => trim($releaseName)];
+    }
+
+    public static function computeSimilarityNative(string $a, string $b): ?float
+    {
+        $ffi = self::$titleMatchingFfi ?? self::titleMatchingFfi();
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $score = $ffi->nntmux_games_compute_similarity($a, strlen($a), $b, strlen($b));
+
+            return is_float($score) && $score >= 0.0 && $score <= 100.0 ? $score : null;
+        } catch (Throwable) {
+            return null;
+        }
     }
 }
