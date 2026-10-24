@@ -4,11 +4,14 @@ declare(strict_types=1);
 
 namespace App\Models;
 
+use App\Support\RustPipelineLibrary;
 use Carbon\Carbon;
+use FFI;
 use Illuminate\Contracts\Pagination\LengthAwarePaginator;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Support\Facades\DB;
+use Throwable;
 
 /**
  * App\Models\ReleaseComment.
@@ -43,6 +46,100 @@ use Illuminate\Support\Facades\DB;
  */
 class ReleaseComment extends Model
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_wave21_comment_host(uint32_t mode, const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
+
+    public static function enableRustFfi(): void
+    {
+        self::$useRustFfi = true;
+    }
+
+    public static function disableRustFfi(): void
+    {
+        self::$useRustFfi = false;
+    }
+
+    public static function resetRustFfi(): void
+    {
+        self::$useRustFfi = false;
+        self::$ffi = null;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi && self::ffi() !== null;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        try {
+            self::$ffi ??= RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF) ?? false;
+
+            return self::$ffi === false ? null : self::$ffi;
+        } catch (Throwable) {
+            self::$ffi = false;
+
+            return null;
+        }
+    }
+
+    public static function commentHost(?string $host, mixed $storeUserIp): ?string
+    {
+        $native = self::$useRustFfi ? self::commentHostNative($host, $storeUserIp) : null;
+
+        return $native !== null ? $native['host'] : self::commentHostPhp($host, $storeUserIp);
+    }
+
+    public static function commentHostPhp(?string $host, mixed $storeUserIp): ?string
+    {
+        return $storeUserIp === false ? '' : $host;
+    }
+
+    /**
+     * @return array{host: string|null}|null
+     */
+    public static function commentHostNative(?string $host, mixed $storeUserIp): ?array
+    {
+        if (! is_bool($storeUserIp)) {
+            return null;
+        }
+
+        try {
+            $ffi = self::ffi();
+            if ($ffi === null) {
+                return null;
+            }
+
+            $mode = $storeUserIp === false ? 0 : ($host === null ? 2 : 1);
+            $input = $host ?? '';
+            $length = strlen($input);
+            $capacity = $mode === 1 ? $length + 1 : 1;
+            $buffer = $ffi->new("char[$capacity]");
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_wave21_comment_host($mode, $input, $length, $buffer, $capacity);
+            if (! is_int($written) || $written !== $capacity) {
+                return null;
+            }
+
+            $result = FFI::string($buffer, $written);
+            if ($mode === 2) {
+                return $result === "\x00" ? ['host' => null] : null;
+            }
+            if ($result[0] !== "\x01") {
+                return null;
+            }
+
+            return ['host' => substr($result, 1)];
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
     /**
      * @var array<string>
      */
@@ -116,9 +213,7 @@ class ReleaseComment extends Model
      */
     public static function addComment(int $releaseId, string $text, int $userId, ?string $host): int
     {
-        if (config('nntmux:settings.store_user_ip') === false) {
-            $host = '';
-        }
+        $host = self::commentHost($host, config('nntmux:settings.store_user_ip'));
 
         $username = User::query()->where('id', $userId)->first(['username']);
         $username = ($username === null ? 'ANON' : $username['username']);
