@@ -6171,3 +6171,1196 @@ mod nima4k_tests {
         assert_eq!(n, -1);
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// NZB PAR2 rename candidates (`NzbContentsService::par2Candidates` / `par2FamilyKey`)
+// ---------------------------------------------------------------------------------------------
+//
+// PHP hands over `SimpleXMLElement::asXML()` of the loaded NZB document. The XML subset reader
+// above walks it the way SimpleXML property access does: `$nzb->file`, the first
+// `$file->segments` and its `segment` children are unprefixed element names, attributes are
+// unprefixed, and `(string) $segment` is the element's own character data. A DOCTYPE without
+// an internal subset is skipped; everything else outside the reader's subset, a `file` without a
+// `segments` child (PHP raises a `TypeError`), a non-UTF-8 document, a family key that
+// `mb_strtolower` might map differently, or an overflowing byte total returns `-1` so PHP runs
+// its own implementation. The non-UTF-8 `preg_match` patterns are reproduced byte-for-byte
+// (`\s` is ASCII `[\t\n\v\f\r ]`, `/i` folds ASCII only, `$` also matches before a final `\n`).
+
+/// Streaming SHA-256 using the ARMv8 SHA2 instructions when the CPU has them.
+struct Par2Sha256 {
+    state: [u32; 8],
+    buffer: [u8; 64],
+    buffered: usize,
+    total: u64,
+}
+
+const PAR2_SHA256_K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+fn par2_sha256_blocks_scalar(state: &mut [u32; 8], blocks: &[u8]) {
+    for block in blocks.as_chunks::<64>().0 {
+        let mut w = [0u32; 64];
+        for (i, word) in block.as_chunks::<4>().0.iter().enumerate() {
+            w[i] = u32::from_be_bytes(*word);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ (!e & g);
+            let t1 = h
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(PAR2_SHA256_K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        for (slot, value) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+            *slot = slot.wrapping_add(value);
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "sha2")]
+unsafe fn par2_sha256_blocks_arm(state: &mut [u32; 8], blocks: &[u8]) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let mut abcd = vld1q_u32(state.as_ptr());
+        let mut efgh = vld1q_u32(state.as_ptr().add(4));
+        for block in blocks.as_chunks::<64>().0 {
+            let (abcd_saved, efgh_saved) = (abcd, efgh);
+            let p = block.as_ptr();
+            let mut m = [
+                vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(p))),
+                vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(p.add(16)))),
+                vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(p.add(32)))),
+                vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(p.add(48)))),
+            ];
+            for i in 0..16 {
+                let wk = vaddq_u32(m[0], vld1q_u32(PAR2_SHA256_K.as_ptr().add(i * 4)));
+                let previous = abcd;
+                abcd = vsha256hq_u32(abcd, efgh, wk);
+                efgh = vsha256h2q_u32(efgh, previous, wk);
+                let next = if i < 12 {
+                    vsha256su1q_u32(vsha256su0q_u32(m[0], m[1]), m[2], m[3])
+                } else {
+                    m[0]
+                };
+                m = [m[1], m[2], m[3], next];
+            }
+            abcd = vaddq_u32(abcd, abcd_saved);
+            efgh = vaddq_u32(efgh, efgh_saved);
+        }
+        vst1q_u32(state.as_mut_ptr(), abcd);
+        vst1q_u32(state.as_mut_ptr().add(4), efgh);
+    }
+}
+
+impl Par2Sha256 {
+    fn new() -> Self {
+        Self {
+            state: [
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+                0x5be0cd19,
+            ],
+            buffer: [0; 64],
+            buffered: 0,
+            total: 0,
+        }
+    }
+
+    #[inline]
+    fn blocks(state: &mut [u32; 8], blocks: &[u8]) {
+        #[cfg(target_arch = "aarch64")]
+        if std::arch::is_aarch64_feature_detected!("sha2") {
+            // SAFETY: the SHA2 extension was detected at runtime.
+            unsafe { par2_sha256_blocks_arm(state, blocks) };
+            return;
+        }
+        par2_sha256_blocks_scalar(state, blocks);
+    }
+
+    fn update(&mut self, mut data: &[u8]) {
+        self.total += data.len() as u64;
+        if self.buffered > 0 {
+            let take = (64 - self.buffered).min(data.len());
+            self.buffer[self.buffered..self.buffered + take].copy_from_slice(&data[..take]);
+            self.buffered += take;
+            data = &data[take..];
+            if self.buffered < 64 {
+                return;
+            }
+            let block = self.buffer;
+            Self::blocks(&mut self.state, &block);
+            self.buffered = 0;
+        }
+        let full = data.len() & !63;
+        if full > 0 {
+            Self::blocks(&mut self.state, &data[..full]);
+        }
+        let rest = &data[full..];
+        self.buffer[..rest.len()].copy_from_slice(rest);
+        self.buffered = rest.len();
+    }
+
+    fn finish_hex(mut self) -> [u8; 64] {
+        let bits = self.total.wrapping_mul(8);
+        let mut tail = [0u8; 128];
+        tail[..self.buffered].copy_from_slice(&self.buffer[..self.buffered]);
+        tail[self.buffered] = 0x80;
+        let len = if self.buffered < 56 { 64 } else { 128 };
+        tail[len - 8..len].copy_from_slice(&bits.to_be_bytes());
+        Self::blocks(&mut self.state, &tail[..len]);
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = [0u8; 64];
+        for (i, word) in self.state.iter().enumerate() {
+            for (j, byte) in word.to_be_bytes().iter().enumerate() {
+                out[i * 8 + j * 2] = HEX[(byte >> 4) as usize];
+                out[i * 8 + j * 2 + 1] = HEX[(byte & 0xF) as usize];
+            }
+        }
+        out
+    }
+}
+
+fn par2_sha256_hex(data: &[u8]) -> [u8; 64] {
+    let mut hasher = Par2Sha256::new();
+    hasher.update(data);
+    hasher.finish_hex()
+}
+
+/// PCRE2 `\s` without UTF/UCP.
+#[inline]
+fn pcre_space(b: u8) -> bool {
+    matches!(b, b'\t' | b'\n' | 0x0B | 0x0C | b'\r' | b' ')
+}
+
+/// `(?:["\s]|$)` at `pos`.
+#[inline]
+fn par2_terminator(s: &[u8], pos: usize) -> bool {
+    pos >= s.len() || s[pos] == b'"' || pcre_space(s[pos])
+}
+
+#[inline]
+fn ci_at(s: &[u8], pos: usize, lit: &[u8]) -> bool {
+    pos <= s.len()
+        && s.len() - pos >= lit.len()
+        && s[pos..pos + lit.len()].eq_ignore_ascii_case(lit)
+}
+
+#[inline]
+fn ends_with_ci(s: &[u8], lit: &[u8]) -> bool {
+    s.len() >= lit.len() && s[s.len() - lit.len()..].eq_ignore_ascii_case(lit)
+}
+
+#[inline]
+fn digits_from(s: &[u8], pos: usize) -> usize {
+    s.get(pos..).map_or(0, |rest| {
+        rest.iter().take_while(|b| b.is_ascii_digit()).count()
+    })
+}
+
+#[inline]
+fn digits_before(s: &[u8], end: usize) -> usize {
+    s[..end]
+        .iter()
+        .rev()
+        .take_while(|b| b.is_ascii_digit())
+        .count()
+}
+
+/// Calls `f` with the index after each `.` until it returns true.
+#[inline]
+fn any_after_dot(s: &[u8], mut f: impl FnMut(usize) -> bool) -> bool {
+    let mut from = 0;
+    while let Some(i) = xml_memchr(b'.', s, from) {
+        if f(i + 1) {
+            return true;
+        }
+        from = i + 1;
+    }
+    false
+}
+
+/// `/\.par2(?:["\s]|$)/i`
+fn par2_is_explicit(s: &[u8]) -> bool {
+    any_after_dot(s, |t| ci_at(s, t, b"par2") && par2_terminator(s, t + 4))
+}
+
+/// `/\.vol\d+\+\d+\.par2(?:["\s]|$)/i`
+fn par2_is_volume(s: &[u8]) -> bool {
+    any_after_dot(s, |t| {
+        if !ci_at(s, t, b"vol") {
+            return false;
+        }
+        let first = digits_from(s, t + 3);
+        let plus = t + 3 + first;
+        if first == 0 || s.get(plus) != Some(&b'+') {
+            return false;
+        }
+        let second = digits_from(s, plus + 1);
+        let dot = plus + 1 + second;
+        second > 0
+            && s.get(dot) == Some(&b'.')
+            && ci_at(s, dot + 1, b"par2")
+            && par2_terminator(s, dot + 5)
+    })
+}
+
+/// `/\.(?:rar|r\d{2,4}|\d{3}|7z|zip|mkv|mp4|avi|m2ts|ts|iso|nfo|sfv|srr|srs|jpg|png|mp3|flac)(?:["\s]|$)/i`
+fn par2_known_content(s: &[u8]) -> bool {
+    const LITERALS: [&[u8]; 17] = [
+        b"rar", b"7z", b"zip", b"mkv", b"mp4", b"avi", b"m2ts", b"ts", b"iso", b"nfo", b"sfv",
+        b"srr", b"srs", b"jpg", b"png", b"mp3", b"flac",
+    ];
+    any_after_dot(s, |t| {
+        if LITERALS
+            .iter()
+            .any(|lit| ci_at(s, t, lit) && par2_terminator(s, t + lit.len()))
+        {
+            return true;
+        }
+        if ci_at(s, t, b"r") {
+            let run = digits_from(s, t + 1);
+            if (2..=4).contains(&run) && par2_terminator(s, t + 1 + run) {
+                return true;
+            }
+        }
+        digits_from(s, t) == 3 && par2_terminator(s, t + 3)
+    })
+}
+
+/// `/\.(par[" ]|\d{2,3}").+\(1\/1\)/i`
+fn par2_is_legacy(s: &[u8]) -> bool {
+    any_after_dot(s, |t| {
+        let after = if ci_at(s, t, b"par") && matches!(s.get(t + 3), Some(b'"' | b' ')) {
+            t + 4
+        } else {
+            let run = digits_from(s, t);
+            if (2..=3).contains(&run) && s.get(t + run) == Some(&b'"') {
+                t + run + 1
+            } else {
+                return false;
+            }
+        };
+        let line_end = xml_memchr(b'\n', s, after).unwrap_or(s.len());
+        line_end > after + 1 && find(&s[..line_end], after + 1, b"(1/1)").is_some()
+    })
+}
+
+/// End index matched by `$` for a subject: the end, or before a final `\n`.
+#[inline]
+fn pcre_dollar_end(s: &[u8]) -> usize {
+    if s.last() == Some(&b'\n') {
+        s.len() - 1
+    } else {
+        s.len()
+    }
+}
+
+/// `(int) $digits` for an ASCII digit run is at most one (saturating casts only grow).
+#[inline]
+fn digits_at_most_one(d: &[u8]) -> bool {
+    let rest = &d[d.iter().take_while(|&&b| b == b'0').count()..];
+    rest.is_empty() || rest == b"1"
+}
+
+/// `NzbParserService::extractPartsTotal($subject) <= 1`.
+fn par2_parts_total_at_most_one(s: &[u8]) -> bool {
+    let end = pcre_dollar_end(s);
+    // /(?:[(\[])?(\d+)[\/)\]](\d+)[)\]]?$/
+    let digits_end = if end > 0 && matches!(s[end - 1], b')' | b']') {
+        end - 1
+    } else {
+        end
+    };
+    let total = digits_before(s, digits_end);
+    if total > 0 && digits_end > total {
+        let sep = digits_end - total - 1;
+        if matches!(s[sep], b'/' | b')' | b']') && sep > 0 && s[sep - 1].is_ascii_digit() {
+            let digits = &s[digits_end - total..digits_end];
+            if digits.iter().any(|&b| b != b'0') {
+                return digits_at_most_one(digits);
+            }
+        }
+    }
+    // /(\d+)\)$/
+    if end > 0 && s[end - 1] == b')' {
+        let run = digits_before(s, end - 1);
+        if run > 0 {
+            return digits_at_most_one(&s[end - 1 - run..end - 1]);
+        }
+    }
+    true
+}
+
+/// End of a trailing `\.par2$` match (case-insensitive), if any.
+fn par2_suffix_end(s: &[u8]) -> Option<usize> {
+    if ends_with_ci(s, b".par2") {
+        Some(s.len())
+    } else if s.last() == Some(&b'\n') && ends_with_ci(&s[..s.len() - 1], b".par2") {
+        Some(s.len() - 1)
+    } else {
+        None
+    }
+}
+
+/// `NzbContentsService::par2FamilyKey()` before `mb_strtolower`.
+fn par2_family_key(subject: &[u8]) -> Option<Cow<'_, [u8]>> {
+    // preg_replace('/^\s*\[\d+\/\d+\]\s*/', '', $subject)
+    let mut s = subject;
+    let mut i = s.iter().take_while(|&&b| pcre_space(b)).count();
+    if s.get(i) == Some(&b'[') {
+        let first = digits_from(s, i + 1);
+        let slash = i + 1 + first;
+        if first > 0 && s.get(slash) == Some(&b'/') {
+            let second = digits_from(s, slash + 1);
+            let close = slash + 1 + second;
+            if second > 0 && s.get(close) == Some(&b']') {
+                i = close + 1;
+                i += s[i..].iter().take_while(|&&b| pcre_space(b)).count();
+                s = &s[i..];
+            }
+        }
+    }
+
+    let mut name: Option<&[u8]> = None;
+    // /"([^"]+\.par2)"/i
+    if let Some(mut open) = xml_memchr(b'"', s, 0) {
+        while let Some(close) = xml_memchr(b'"', s, open + 1) {
+            let inner = &s[open + 1..close];
+            if inner.len() > 5 && ends_with_ci(inner, b".par2") {
+                name = Some(inner);
+                break;
+            }
+            open = close;
+        }
+    }
+    // /(?:^|\s)([^\s"]+\.par2)(?=\s|$)/i
+    if name.is_none() {
+        let mut start = 0;
+        while start <= s.len() {
+            let run = s[start..]
+                .iter()
+                .take_while(|&&b| !pcre_space(b) && b != b'"')
+                .count();
+            let end = start + run;
+            if run > 5
+                && (end == s.len() || pcre_space(s[end]))
+                && ends_with_ci(&s[start..end], b".par2")
+            {
+                name = Some(&s[start..end]);
+                break;
+            }
+            match s[end..].iter().position(|&b| pcre_space(b)) {
+                Some(p) => start = end + p + 1,
+                None => break,
+            }
+        }
+    }
+    let name = name.unwrap_or_else(|| {
+        let is_trim = |b: &u8| matches!(b, b' ' | b'\t' | b'"' | b'\'');
+        let start = s.iter().position(|b| !is_trim(b)).unwrap_or(s.len());
+        let end = s.iter().rposition(|b| !is_trim(b)).map_or(start, |p| p + 1);
+        &s[start..end]
+    });
+
+    // preg_replace('/\.vol\d+\+\d+\.par2$/i', '.par2', $name), then /\.par2$/i
+    let end = par2_suffix_end(name)?;
+    let dot = end - 5;
+    let second = digits_before(name, dot);
+    if second > 0 && dot > second && name[dot - second - 1] == b'+' {
+        let plus = dot - second - 1;
+        let first = digits_before(name, plus);
+        let digits_start = plus - first;
+        if first > 0
+            && digits_start >= 4
+            && name[digits_start - 4..digits_start].eq_ignore_ascii_case(b".vol")
+        {
+            let mut replaced = Vec::with_capacity(name.len());
+            replaced.extend_from_slice(&name[..digits_start - 4]);
+            replaced.extend_from_slice(b".par2");
+            replaced.extend_from_slice(&name[end..]);
+            return Some(Cow::Owned(replaced));
+        }
+    }
+    Some(Cow::Borrowed(name))
+}
+
+/// `filter_var($s, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]])`.
+fn php_filter_positive_int(s: &[u8]) -> Option<i64> {
+    let s = php_trim(s);
+    let (negative, digits) = match s.first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
+    if negative || digits.is_empty() || digits[0] == b'0' || !digits.iter().all(u8::is_ascii_digit)
+    {
+        return None;
+    }
+    let mut value: i64 = 0;
+    for &d in digits {
+        value = value.checked_mul(10)?.checked_add(i64::from(d - b'0'))?;
+    }
+    Some(value)
+}
+
+/// `json_encode()` of a valid UTF-8 string with default flags.
+fn php_json_string(out: &mut Vec<u8>, s: &[u8]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let push_u = |out: &mut Vec<u8>, unit: u32| {
+        out.extend_from_slice(b"\\u");
+        for shift in [12, 8, 4, 0] {
+            out.push(HEX[((unit >> shift) & 0xF) as usize]);
+        }
+    };
+    out.push(b'"');
+    let mut i = 0;
+    while i < s.len() {
+        let start = i;
+        while i < s.len() && s[i] >= 0x20 && s[i] < 0x80 && !matches!(s[i], b'"' | b'\\' | b'/') {
+            i += 1;
+        }
+        out.extend_from_slice(&s[start..i]);
+        if i >= s.len() {
+            break;
+        }
+        let b = s[i];
+        match b {
+            b'"' => out.extend_from_slice(b"\\\""),
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            b'/' => out.extend_from_slice(b"\\/"),
+            0x08 => out.extend_from_slice(b"\\b"),
+            0x0C => out.extend_from_slice(b"\\f"),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            _ if b < 0x20 => push_u(out, u32::from(b)),
+            _ => {
+                let width = if b >= 0xF0 {
+                    4
+                } else if b >= 0xE0 {
+                    3
+                } else {
+                    2
+                };
+                let c = std::str::from_utf8(&s[i..i + width])
+                    .ok()
+                    .and_then(|t| t.chars().next())
+                    .unwrap_or('\u{FFFD}');
+                let mut units = [0u16; 2];
+                for unit in c.encode_utf16(&mut units) {
+                    push_u(out, u32::from(*unit));
+                }
+                i += width;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.push(b'"');
+}
+
+struct NzbSegment<'a> {
+    number: Cow<'a, [u8]>,
+    bytes: Cow<'a, [u8]>,
+    id: Cow<'a, [u8]>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Par2Class {
+    Index,
+    Volume,
+    Legacy,
+    Hidden,
+    Excluded,
+}
+
+impl Par2Class {
+    fn label(self) -> &'static [u8] {
+        match self {
+            Par2Class::Index => b"index",
+            Par2Class::Volume => b"volume",
+            Par2Class::Legacy => b"legacy",
+            Par2Class::Hidden => b"hidden",
+            Par2Class::Excluded => b"excluded",
+        }
+    }
+}
+
+struct Par2Candidate {
+    json: std::ops::Range<usize>,
+    first_bytes: i64,
+}
+
+#[derive(Default)]
+struct Par2Lists {
+    arena: Vec<u8>,
+    seen: HashSet<[u8; 64]>,
+    explicit: Vec<Par2Candidate>,
+    legacy: Vec<Par2Candidate>,
+    hidden: Vec<Par2Candidate>,
+    /// Volumes in order, with their lowercased family and whether they open that family.
+    volumes: Vec<(Par2Candidate, Vec<u8>, bool)>,
+    families: HashSet<Vec<u8>>,
+    index_families: HashSet<Vec<u8>>,
+}
+
+/// Family keys whose lowercase form `mb_strtolower` decides: the first pass collects them, PHP
+/// lowercases them and the second pass consumes its answers in the same order.
+struct Par2Lowering<'p> {
+    provided: Option<Vec<&'p [u8]>>,
+    next: usize,
+    pending: Vec<Vec<u8>>,
+}
+
+/// `mb_strtolower($this->par2FamilyKey($subject) ?? $key)`.
+fn par2_family(
+    subject: &[u8],
+    key: &[u8; 64],
+    lowering: &mut Par2Lowering<'_>,
+) -> XmlResult<Vec<u8>> {
+    let Some(name) = par2_family_key(subject) else {
+        return Ok(key.to_vec());
+    };
+    if let Some(lower) = xml_lower(&name) {
+        return Ok(lower);
+    }
+    match &lowering.provided {
+        Some(answers) => {
+            let lower = answers.get(lowering.next).ok_or(())?.to_vec();
+            lowering.next += 1;
+            Ok(lower)
+        }
+        None => {
+            lowering.pending.push(name.to_vec());
+            Ok(name.into_owned())
+        }
+    }
+}
+
+struct Par2Totals {
+    structure_valid: bool,
+    non_explicit_bytes: i64,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn par2_file(
+    subject: &[u8],
+    raw: &[NzbSegment<'_>],
+    max_bytes: i64,
+    manifest: &mut OutCursor<'_>,
+    lists: &mut Par2Lists,
+    totals: &mut Par2Totals,
+    scratch: &mut Vec<u8>,
+    lowering: &mut Par2Lowering<'_>,
+) -> XmlResult<()> {
+    let mut valid = !raw.is_empty();
+    let mut segments: Vec<(i64, &[u8], i64)> = Vec::with_capacity(raw.len());
+    for segment in raw {
+        let number = php_filter_positive_int(&segment.number);
+        let bytes = php_filter_positive_int(&segment.bytes);
+        let id = php_trim(&segment.id);
+        valid = valid && number.is_some() && bytes.is_some() && !id.is_empty();
+        segments.push((number.unwrap_or(0), id, bytes.unwrap_or(0)));
+    }
+    segments.sort_by_key(|segment| segment.0);
+    if segments
+        .iter()
+        .enumerate()
+        .any(|(index, segment)| segment.0 != index as i64 + 1)
+    {
+        valid = false;
+    }
+    let explicit = par2_is_explicit(subject);
+    if !explicit {
+        for segment in &segments {
+            totals.non_explicit_bytes =
+                totals.non_explicit_bytes.checked_add(segment.2).ok_or(())?;
+        }
+    }
+    let mut class = if !explicit {
+        Par2Class::Excluded
+    } else if par2_is_volume(subject) {
+        Par2Class::Volume
+    } else {
+        Par2Class::Index
+    };
+    let single_part = segments.len() == 1 && par2_parts_total_at_most_one(subject);
+    if !explicit
+        && (single_part || !par2_known_content(subject))
+        && !segments.is_empty()
+        && (!valid || segments[0].2 <= max_bytes)
+    {
+        class = if single_part && par2_is_legacy(subject) {
+            Par2Class::Legacy
+        } else {
+            Par2Class::Hidden
+        };
+    }
+
+    scratch.clear();
+    scratch.extend_from_slice(b"{\"subject\":");
+    php_json_string(scratch, subject);
+    scratch.extend_from_slice(b",\"classification\":\"");
+    scratch.extend_from_slice(class.label());
+    scratch.extend_from_slice(b"\",\"segments\":[");
+    for (index, segment) in raw.iter().enumerate() {
+        if index > 0 {
+            scratch.push(b',');
+        }
+        scratch.extend_from_slice(b"{\"number\":");
+        php_json_string(scratch, &segment.number);
+        scratch.extend_from_slice(b",\"id\":");
+        php_json_string(scratch, &segment.id);
+        scratch.extend_from_slice(b",\"bytes\":");
+        php_json_string(scratch, &segment.bytes);
+        scratch.push(b'}');
+    }
+    scratch.extend_from_slice(b"]}");
+    manifest.extend(scratch);
+
+    if !valid && class != Par2Class::Excluded {
+        totals.structure_valid = false;
+    }
+    if class == Par2Class::Excluded || segments.is_empty() {
+        return Ok(());
+    }
+    if !valid {
+        segments[0].0 = 0;
+    }
+
+    let start = lists.arena.len();
+    let json = &mut lists.arena;
+    json.extend_from_slice(b"{\"subject\":");
+    php_json_string(json, subject);
+    json.extend_from_slice(if explicit {
+        b",\"explicit\":true,\"segments\":["
+    } else {
+        b",\"explicit\":false,\"segments\":["
+    });
+    for (index, (number, id, bytes)) in segments.iter().enumerate() {
+        if index > 0 {
+            json.push(b',');
+        }
+        json.extend_from_slice(b"{\"number\":");
+        json.extend_from_slice(number.to_string().as_bytes());
+        json.extend_from_slice(b",\"id\":");
+        php_json_string(json, id);
+        json.extend_from_slice(b",\"bytes\":");
+        json.extend_from_slice(bytes.to_string().as_bytes());
+        json.push(b'}');
+    }
+    json.extend_from_slice(b"],\"classification\":\"");
+    json.extend_from_slice(class.label());
+    json.extend_from_slice(b"\"}");
+    let key = par2_sha256_hex(&json[start..]);
+    if !lists.seen.insert(key) {
+        // `$list[$key] = $candidate` keeps the first position for an identical candidate.
+        lists.arena.truncate(start);
+        return Ok(());
+    }
+    let candidate = Par2Candidate {
+        json: start..lists.arena.len(),
+        first_bytes: segments[0].2,
+    };
+    match class {
+        Par2Class::Index => {
+            let family = par2_family(subject, &key, lowering)?;
+            lists.index_families.insert(family);
+            lists.explicit.push(candidate);
+        }
+        Par2Class::Volume => {
+            let family = par2_family(subject, &key, lowering)?;
+            let first = lists.families.insert(family.clone());
+            lists.volumes.push((candidate, family, first));
+        }
+        Par2Class::Legacy => lists.legacy.push(candidate),
+        _ => lists.hidden.push(candidate),
+    }
+    Ok(())
+}
+
+/// Skips whitespace, comments, processing instructions and a DOCTYPE without internal subset
+/// before the root element.
+fn nzb_skip_prolog(reader: &mut XmlReader<'_>) -> XmlResult<()> {
+    loop {
+        reader.skip_space();
+        let rest = &reader.s[reader.pos..];
+        if rest.starts_with(b"<!--") {
+            reader.comment()?;
+        } else if rest.starts_with(b"<?") {
+            reader.processing_instruction()?;
+        } else if rest.starts_with(b"<!DOCTYPE") && rest.len() > 9 && is_xml_space(rest[9]) {
+            let mut i = reader.pos + 9;
+            loop {
+                match reader.s.get(i) {
+                    Some(&quote @ (b'"' | b'\'')) => {
+                        i = xml_memchr(quote, reader.s, i + 1).ok_or(())? + 1;
+                    }
+                    Some(b'>') => break,
+                    Some(b'[' | b'<') | None => return Err(()),
+                    Some(_) => i += 1,
+                }
+            }
+            reader.pos = i + 1;
+        } else {
+            return Ok(());
+        }
+    }
+}
+
+fn nzb_attr<'a>(reader: &XmlReader<'a>, name: &[u8]) -> Cow<'a, [u8]> {
+    reader
+        .attrs
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map_or(Cow::Borrowed(&b""[..]), |(_, v)| v.clone())
+}
+
+fn nzb_par2_candidates(
+    xml: &[u8],
+    raw: bool,
+    max_bytes: i64,
+    lowering: &mut Par2Lowering<'_>,
+    out: &mut OutCursor<'_>,
+) -> XmlResult<()> {
+    if if raw {
+        !xml_prescan(xml)
+    } else {
+        std::str::from_utf8(xml).is_err()
+    } {
+        return Err(());
+    }
+    let mut reader = XmlReader::new(xml, XmlNsMode::Rss)?;
+    nzb_skip_prolog(&mut reader)?;
+
+    let mut lists = Par2Lists::default();
+    let mut totals = Par2Totals {
+        structure_valid: false,
+        non_explicit_bytes: 0,
+    };
+    let mut scratch = Vec::new();
+    let mut files = 0usize;
+    let mut subject: Cow<'_, [u8]> = Cow::Borrowed(b"");
+    let mut segments: Vec<NzbSegment<'_>> = Vec::new();
+    let (mut in_file, mut seen_segments, mut in_segments, mut in_segment) =
+        (false, false, false, false);
+
+    out.push(b'[');
+    loop {
+        match reader.next()? {
+            XmlEvent::Start(name) => match reader.depth() {
+                2 if name == b"file" => {
+                    in_file = true;
+                    seen_segments = false;
+                    subject = nzb_attr(&reader, b"subject");
+                    segments.clear();
+                }
+                3 if in_file && !seen_segments && name == b"segments" => {
+                    seen_segments = true;
+                    in_segments = true;
+                }
+                4 if in_segments && name == b"segment" => {
+                    in_segment = true;
+                    segments.push(NzbSegment {
+                        number: nzb_attr(&reader, b"number"),
+                        bytes: nzb_attr(&reader, b"bytes"),
+                        id: Cow::Borrowed(b""),
+                    });
+                }
+                _ => {}
+            },
+            XmlEvent::Text(text) => {
+                if in_segment
+                    && reader.depth() == 4
+                    && let Some(segment) = segments.last_mut()
+                {
+                    if segment.id.is_empty() {
+                        segment.id = text;
+                    } else {
+                        segment.id.to_mut().extend_from_slice(&text);
+                    }
+                }
+            }
+            XmlEvent::End => match reader.depth() {
+                3 if in_segment => in_segment = false,
+                2 if in_segments => in_segments = false,
+                1 if in_file => {
+                    in_file = false;
+                    if !seen_segments {
+                        return Err(());
+                    }
+                    if files > 0 {
+                        out.push(b',');
+                    }
+                    if files == 0 {
+                        totals.structure_valid = true;
+                    }
+                    files += 1;
+                    par2_file(
+                        &subject,
+                        &segments,
+                        max_bytes,
+                        out,
+                        &mut lists,
+                        &mut totals,
+                        &mut scratch,
+                        lowering,
+                    )?;
+                }
+                _ => {}
+            },
+            XmlEvent::Eof => break,
+        }
+    }
+    if !lowering.pending.is_empty()
+        || lowering
+            .provided
+            .as_ref()
+            .is_some_and(|answers| answers.len() != lowering.next)
+    {
+        return Ok(());
+    }
+    out.extend(b"]\n[");
+
+    lists.hidden.sort_by_key(|candidate| candidate.first_bytes);
+    let arena = &lists.arena;
+    let mut first = true;
+    let mut emit = |out: &mut OutCursor<'_>, candidate: &Par2Candidate| {
+        if !first {
+            out.push(b',');
+        }
+        first = false;
+        out.extend(&arena[candidate.json.clone()]);
+    };
+    for candidate in &lists.explicit {
+        emit(out, candidate);
+    }
+    for (candidate, family, opens) in &lists.volumes {
+        if *opens && lists.index_families.contains(family) {
+            emit(out, candidate);
+        }
+    }
+    for candidate in &lists.legacy {
+        emit(out, candidate);
+    }
+    for candidate in &lists.hidden {
+        emit(out, candidate);
+    }
+    for (candidate, family, opens) in &lists.volumes {
+        if *opens && !lists.index_families.contains(family) {
+            emit(out, candidate);
+        }
+    }
+    for (candidate, _, opens) in &lists.volumes {
+        if !*opens {
+            emit(out, candidate);
+        }
+    }
+    out.extend(b"]\n");
+    out.push(if totals.structure_valid { b'1' } else { b'0' });
+    out.extend(totals.non_explicit_bytes.to_string().as_bytes());
+    Ok(())
+}
+
+/// `NzbContentsService::par2Candidates()` over the NZB source libxml parsed (`raw != 0`) or its
+/// `asXML()` serialization: writes the manifest JSON, `\n`,
+/// the ordered candidate list JSON, `\n`, then `1`/`0` (structure valid) and the non-explicit
+/// byte total. Returns the written length, `-1` to decline to PHP, or `<= -2` (minus the
+/// required size) when `out_cap` is too small.
+///
+/// When a family key needs `mb_strtolower` (characters outside the shared lowercase set), the
+/// output is instead `F` and the raw keys joined by NUL; the caller repeats the call with their
+/// `mb_strtolower` forms joined by NUL in `families`.
+///
+/// # Safety
+/// `xml` must be readable for `xml_len` bytes and `out_buf` writable for `out_cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_nzb_par2_candidates_batch(
+    xml: *const u8,
+    xml_len: usize,
+    raw: u32,
+    max_bytes: i64,
+    families: *const u8,
+    families_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    if xml.is_null() || xml_len == 0 {
+        return -1;
+    }
+    let xml = unsafe { slice::from_raw_parts(xml, xml_len) };
+    let provided = (!families.is_null() && families_len > 0).then(|| {
+        unsafe { slice::from_raw_parts(families, families_len) }
+            .split(|&b| b == 0)
+            .collect()
+    });
+    let mut lowering = Par2Lowering {
+        provided,
+        next: 0,
+        pending: Vec::new(),
+    };
+    let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+    if nzb_par2_candidates(xml, raw != 0, max_bytes, &mut lowering, &mut out).is_err() {
+        return -1;
+    }
+    if lowering
+        .provided
+        .as_ref()
+        .is_some_and(|answers| answers.len() != lowering.next)
+    {
+        return -1;
+    }
+    if !lowering.pending.is_empty() {
+        let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+        out.push(b'F');
+        out.extend(&lowering.pending.join(&0u8));
+        return xml_out_finish(out);
+    }
+    xml_out_finish(out)
+}
+
+/// `NzbContentsService::par2FamilyKey()`: writes the key and returns its length, `-1` when PHP
+/// returns `null`, or `<= -2` (minus the required size) when `out_cap` is too small.
+///
+/// # Safety
+/// `subject` must be readable for `subject_len` bytes and `out_buf` writable for `out_cap` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_par2_family_key(
+    subject: *const u8,
+    subject_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    let subject = if subject.is_null() || subject_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(subject, subject_len) }
+    };
+    let Some(key) = par2_family_key(subject) else {
+        return -1;
+    };
+    if key.is_empty() {
+        return 0;
+    }
+    let mut out = unsafe { OutCursor::new(out_buf, out_cap) };
+    out.extend(&key);
+    xml_out_finish(out)
+}
+
+/// Lowercase hex SHA-256 of `head . manifest . tail` (the PAR2 progress signature) into `out_hex`
+/// (64 bytes); returns 64.
+///
+/// # Safety
+/// Each input must be readable for its length (or null with length 0) and `out_hex` writable
+/// for 64 bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_par2_signature_sha256(
+    head: *const u8,
+    head_len: usize,
+    manifest: *const u8,
+    manifest_len: usize,
+    tail: *const u8,
+    tail_len: usize,
+    out_hex: *mut u8,
+) -> isize {
+    if out_hex.is_null() {
+        return -1;
+    }
+    let mut hasher = Par2Sha256::new();
+    for (ptr, len) in [(head, head_len), (manifest, manifest_len), (tail, tail_len)] {
+        if !ptr.is_null() && len > 0 {
+            hasher.update(unsafe { slice::from_raw_parts(ptr, len) });
+        }
+    }
+    let hex = hasher.finish_hex();
+    unsafe { std::ptr::copy_nonoverlapping(hex.as_ptr(), out_hex, 64) };
+    64
+}
+
+#[cfg(test)]
+mod par2_candidate_tests {
+    use super::*;
+
+    fn run(xml: &[u8], raw: bool, families: &[u8]) -> (isize, Vec<u8>) {
+        let mut buf = vec![0u8; 1 << 16];
+        let n = unsafe {
+            nntmux_nzb_par2_candidates_batch(
+                xml.as_ptr(),
+                xml.len(),
+                u32::from(raw),
+                2_097_152,
+                if families.is_empty() {
+                    std::ptr::null()
+                } else {
+                    families.as_ptr()
+                },
+                families.len(),
+                buf.as_mut_ptr(),
+                buf.len(),
+            )
+        };
+        buf.truncate(n.max(0) as usize);
+        (n, buf)
+    }
+
+    fn key(subject: &str) -> Option<String> {
+        par2_family_key(subject.as_bytes()).map(|k| String::from_utf8(k.into_owned()).unwrap())
+    }
+
+    #[test]
+    fn sha256_matches_known_vectors_on_every_path() {
+        let cases: [(&[u8], &str); 3] = [
+            (
+                b"",
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+            (
+                b"abc",
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            ),
+            (
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+                "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+            ),
+        ];
+        for (input, hex) in cases {
+            assert_eq!(&par2_sha256_hex(input), hex.as_bytes());
+        }
+        let long: Vec<u8> = (0..10_000u32).map(|i| (i * 31 % 251) as u8).collect();
+        let expected = crate::predb::sha256_hex_slice(&long);
+        assert_eq!(par2_sha256_hex(&long), expected);
+        let mut streamed = Par2Sha256::new();
+        for chunk in long.chunks(37) {
+            streamed.update(chunk);
+        }
+        assert_eq!(streamed.finish_hex(), expected);
+        let mut state = Par2Sha256::new().state;
+        let mut scalar = state;
+        Par2Sha256::blocks(&mut state, &long[..9984]);
+        par2_sha256_blocks_scalar(&mut scalar, &long[..9984]);
+        assert_eq!(state, scalar);
+    }
+
+    #[test]
+    fn subject_patterns_follow_pcre_byte_semantics() {
+        assert!(par2_is_explicit(b"a.PAR2"));
+        assert!(par2_is_explicit(b"\"a.par2\" yEnc"));
+        assert!(par2_is_explicit(b"a.par2\x0b"));
+        assert!(!par2_is_explicit(b"a.par2x"));
+        assert!(par2_is_volume(b"a.vol01+02.par2"));
+        assert!(!par2_is_volume(b"a.vol+02.par2"));
+        assert!(par2_known_content(b"x.r1234 "));
+        assert!(!par2_known_content(b"x.r12345"));
+        assert!(par2_known_content(b"x.001\""));
+        assert!(!par2_known_content(b"x.0001"));
+        assert!(par2_is_legacy(b"a.par\" b (1/1)"));
+        assert!(par2_is_legacy(b"a.12\"x(1/1)"));
+        assert!(!par2_is_legacy(b"a.12\"(1/1)"));
+        assert!(!par2_is_legacy(b"a.par \n(1/1)"));
+        assert!(par2_parts_total_at_most_one(b"x (1/1)"));
+        assert!(!par2_parts_total_at_most_one(b"x [1/2]"));
+        assert!(par2_parts_total_at_most_one(b"x (0/0)"));
+        assert!(!par2_parts_total_at_most_one(b"x (12)"));
+        assert!(!par2_parts_total_at_most_one(b"x 1/99999999999999999999\n"));
+        assert!(par2_parts_total_at_most_one(b"x (5)y"));
+    }
+
+    #[test]
+    fn family_keys_match_par2_family_key() {
+        assert_eq!(
+            key("[1/2] \"x.vol1+2.par2\" yEnc").as_deref(),
+            Some("x.par2")
+        );
+        assert_eq!(key("a\"b.par2 c").as_deref(), None);
+        assert_eq!(key("\"q\" b.PAR2").as_deref(), Some("b.PAR2"));
+        assert_eq!(key("x.vol1+2.par2\n").as_deref(), Some("x.par2"));
+        assert_eq!(key("\"x.vol1+2.par2\n").as_deref(), Some("x.par2\n"));
+        assert_eq!(key("'r.par2'").as_deref(), Some("r.par2"));
+        assert_eq!(key("r.rar").as_deref(), None);
+    }
+
+    #[test]
+    fn filter_int_and_json_follow_php() {
+        assert_eq!(php_filter_positive_int(b" +5\n"), Some(5));
+        assert_eq!(php_filter_positive_int(b"05"), None);
+        assert_eq!(php_filter_positive_int(b"\x0c5"), None);
+        assert_eq!(php_filter_positive_int(b"9223372036854775808"), None);
+        let mut out = Vec::new();
+        php_json_string(&mut out, "é/\t\u{1}\u{1F600}\"\\".as_bytes());
+        assert_eq!(
+            out,
+            b"\"\\u00e9\\/\\t\\u0001\\ud83d\\ude00\\\"\\\\\"".to_vec()
+        );
+    }
+
+    #[test]
+    fn documents_produce_ordered_candidates_or_decline() {
+        let doc = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE nzb PUBLIC "-//newzBin//DTD NZB 1.1//EN" "http://www.newzbin.com/DTD/nzb/nzb-1.1.dtd">
+<!-- generated -->
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb"><file subject="r.vol0+1.par2"><segments><segment number="1" bytes="5">v@x</segment></segments></file><file subject="r.par2"><segments><segment number="1" bytes="7">i@x</segment></segments></file><file subject="r.rar"><segments><segment number="1" bytes="9">a@x</segment></segments></file></nzb>"#;
+        let (n, out) = run(doc, true, b"");
+        assert!(n > 0);
+        let text = String::from_utf8(out).unwrap();
+        let parts: Vec<&str> = text.split('\n').collect();
+        assert_eq!(parts.len(), 3);
+        assert!(parts[1].starts_with(r#"[{"subject":"r.par2","explicit":true"#));
+        assert!(parts[1].contains(r#"},{"subject":"r.vol0+1.par2""#));
+        assert_eq!(parts[2], "19");
+        assert_eq!(
+            run(
+                br#"<?xml version="1.0"?><nzb><file subject="a"/></nzb>"#,
+                false,
+                b""
+            )
+            .0,
+            -1
+        );
+        assert_eq!(
+            run(
+                b"<?xml version=\"1.0\"?><nzb><file subject=\"a\tb\"><segments/></file></nzb>",
+                true,
+                b""
+            )
+            .0,
+            -1
+        );
+
+        let greek = "<?xml version=\"1.0\"?><nzb><file subject=\"ΣΑΣ.par2\"><segments><segment number=\"1\" bytes=\"3\">a@x</segment></segments></file></nzb>";
+        let (n, out) = run(greek.as_bytes(), false, b"");
+        assert!(n > 0);
+        assert_eq!(out, "FΣΑΣ.par2".as_bytes());
+        let (n, out) = run(greek.as_bytes(), false, "σας.par2".as_bytes());
+        assert!(n > 0 && out.ends_with(b"]\n10"));
+        assert_eq!(run(greek.as_bytes(), false, "a\0b".as_bytes()).0, -1);
+    }
+}
