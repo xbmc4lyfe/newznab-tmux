@@ -18156,3 +18156,481 @@ mod w23_mcp_tool_runner_tests {
         }
     }
 }
+
+// Wave 24 Slice 1: pure MCP inspection/prompt helpers. Append-only experiment.
+// PHP remains the production default until paired caller-inclusive benchmarks
+// qualify every common and uncommon workload. Existing wire helpers preserve
+// PHP's scalar types, byte strings, array keys, and insertion order.
+const W24_MCP_MAX_BYTES: usize = 67_108_864;
+const W24_DIAGNOSE_ASSISTANT: &[u8] = b"Act as an evidence-first NNTmux debugger. Inspect the producer, runtime path, schema/configuration, history, and related tests before proposing a change. Identify the narrow root cause, preserve public behavior, and finish with focused failure-mode coverage plus the verification plan. Use runtime probes only when useful, and request NNTP explicitly if it is genuinely required.";
+
+fn w24_mcp_summary(operation: u32, count: i64) -> Option<VerificationOutboxValue> {
+    Some(w16_string(
+        match operation {
+            0 => format!("Assessed change impact for {count} path(s)."),
+            3 => format!("Found {count} relevant source location(s)."),
+            4 => format!("Planned {count} verification check(s)."),
+            _ => return None,
+        }
+        .as_bytes(),
+    ))
+}
+
+fn w24_project_overview(schema_version: i64) -> VerificationOutboxValue {
+    use VerificationOutboxValue as V;
+    w16_map(vec![
+        (
+            "schema_version",
+            V::Int(schema_version),
+        ),
+        (
+            "summary",
+            w16_string(b"NNTmux is a Laravel Usenet indexer with local host tooling and an optional tmux processing engine."),
+        ),
+        (
+            "architecture",
+            w16_map(vec![
+                (
+                    "processing_flow",
+                    w16_string(b"NNTP -> NNTPService -> BinariesRunner -> ReleaseCreationService -> ReleaseProcessingService -> SearchService -> API/Web"),
+                ),
+                (
+                    "patterns",
+                    w16_list(vec![
+                        w16_string(b"service layer"),
+                        w16_string(b"pipelines"),
+                        w16_string(b"search drivers"),
+                        w16_string(b"runners"),
+                        w16_string(b"DTOs"),
+                        w16_string(b"enums"),
+                        w16_string(b"observers"),
+                        w16_string(b"status probes"),
+                    ]),
+                ),
+                (
+                    "important_directories",
+                    w16_map(vec![
+                        (
+                            "app/Services",
+                            w16_string(b"Domain services, runners, search drivers, processing pipelines, and status probes."),
+                        ),
+                        (
+                            "app/Console/Commands",
+                            w16_string(b"Artisan processing and maintenance commands."),
+                        ),
+                        (
+                            "app/Mcp",
+                            w16_string(b"The local NNTmux MCP server, tools, resources, and prompts."),
+                        ),
+                        (
+                            "tests",
+                            w16_string(b"PHPUnit unit, feature, install, and opt-in integration coverage."),
+                        ),
+                        (
+                            "resources",
+                            w16_string(b"Blade, Alpine.js, Tailwind CSS, and Vite source assets."),
+                        ),
+                    ]),
+                ),
+            ]),
+        ),
+        (
+            "testing",
+            w16_map(vec![
+                (
+                    "framework",
+                    w16_string(b"PHPUnit 12"),
+                ),
+                (
+                    "database",
+                    w16_string(b"In-memory SQLite through DB_CONNECTION=testing"),
+                ),
+                (
+                    "focused_command",
+                    w16_string(b"php artisan test --compact --filter=TestName"),
+                ),
+            ]),
+        ),
+        (
+            "command_policy",
+            w16_map(vec![
+                (
+                    "default",
+                    w16_string(b"Run PHP, Artisan, Composer, npm, Pint, PHPStan, and tests on the WSL host."),
+                ),
+                (
+                    "containers",
+                    w16_string(b"Use Sail or just only for Compose lifecycle or when explicitly requested."),
+                ),
+            ]),
+        ),
+        (
+            "companion",
+            w16_string(b"Use Laravel Boost for generic Laravel documentation, schema and read-only queries, logs, browser logs, and Tinker."),
+        ),
+        (
+            "warnings",
+            w16_list(vec![
+                w16_string(b"Runtime probes may be unavailable. NNTP is never probed unless explicitly requested."),
+            ]),
+        ),
+        (
+            "truncated",
+            V::Bool(false),
+        ),
+    ])
+}
+
+fn w24_mcp_compute(
+    operation: u32,
+    args: &[VerificationOutboxValue],
+) -> Option<VerificationOutboxValue> {
+    use VerificationOutboxValue as V;
+    Some(match (operation, args) {
+        (0 | 3 | 4, [count]) => w24_mcp_summary(operation, w16_int(count)?)?,
+        (1, [impact, schema_version]) => {
+            let schema_version = w16_int(schema_version)?;
+            let count = i64::try_from(w16_entries(impact.field(b"paths")?)?.len()).ok()?;
+            // Leave warnings/types for absent keys to PHP, preserving its errors.
+            let warnings = impact.field(b"warnings")?;
+            let truncated = impact.field(b"truncated")?;
+            w16_map(vec![
+                ("schema_version", V::Int(schema_version)),
+                ("summary", w24_mcp_summary(0, count)?),
+                ("evidence", impact.clone()),
+                ("warnings", warnings.clone()),
+                ("truncated", truncated.clone()),
+            ])
+        }
+        (2, [query, kind, max_results, maximum_results]) => {
+            let query = w16_bytes(query)?;
+            // PHP trim() removes exactly these six bytes, not Unicode whitespace
+            // or ASCII form feed. Do not normalize supplied kind/result values.
+            let is_trim = |b: &u8| matches!(*b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b);
+            let start = query
+                .iter()
+                .position(|b| !is_trim(b))
+                .unwrap_or(query.len());
+            let end = query
+                .iter()
+                .rposition(|b| !is_trim(b))
+                .map_or(start, |i| i + 1);
+            let kind = match kind {
+                V::Null => w16_string(b"auto"),
+                V::Bytes(_) => kind.clone(),
+                _ => return None,
+            };
+            let maximum_results = w16_int(maximum_results)?;
+            let max_results = match max_results {
+                V::Null => V::Int(20.min(maximum_results)),
+                V::Int(_) => max_results.clone(),
+                _ => return None,
+            };
+            w16_map(vec![
+                ("query", w16_string(&query[start..end])),
+                ("kind", kind),
+                ("max_results", max_results),
+            ])
+        }
+        (5, [started_at, now]) => {
+            let started_at = w16_int(started_at)?;
+            let now = w16_int(now)?;
+            // PHP keeps exact integer quotients as integers. Converting those
+            // large deltas to double first can round the final cast down by one.
+            let duration = match now.checked_sub(started_at) {
+                Some(delta) if delta % 1_000_000 == 0 => delta / 1_000_000,
+                Some(delta) => (delta as f64 / 1_000_000.0) as i64,
+                None => ((now as f64 - started_at as f64) / 1_000_000.0) as i64,
+            };
+            V::Int(duration)
+        }
+        (6, [problem, scope]) => {
+            let problem = w16_bytes(problem)?;
+            let scope = match scope {
+                V::Null => b"Infer the narrowest safe scope from evidence.".as_slice(),
+                V::Bytes(bytes) => bytes,
+                _ => return None,
+            };
+            let size = problem.len().checked_add(scope.len())?.checked_add(18)?;
+            if size > W24_MCP_MAX_BYTES {
+                return None;
+            }
+            let mut user = Vec::with_capacity(size);
+            user.extend_from_slice(b"Problem:\n");
+            user.extend_from_slice(problem);
+            user.extend_from_slice(b"\n\nScope:\n");
+            user.extend_from_slice(scope);
+            w16_list(vec![w16_string(W24_DIAGNOSE_ASSISTANT), w16_string(&user)])
+        }
+        (7, [schema_version]) => w24_project_overview(w16_int(schema_version)?),
+        _ => return None,
+    })
+}
+
+/// Evaluate the bounded canonical PHP scalar/array protocol for Wave 24.1.
+/// Returns -1 for invalid/unsupported input, -required for insufficient capacity
+/// without writing, or the exact positive output length (no NUL terminator).
+/// Byte buffers have alignment one, so offsets of one byte are valid. There are
+/// no typed output pointers. Unwinding never crosses the ABI boundary.
+///
+/// # Safety
+/// Callers must supply live disjoint allocations covering the declared readable
+/// input and writable output ranges, with non-null pointers even at length zero.
+/// Range checks establish arithmetic/alignment, not allocation provenance.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w24_mcp_inspect_prompt(
+    operation: u32,
+    input: *const u8,
+    length: usize,
+    output: *mut u8,
+    capacity: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // nfo_abi_range checks null, is_aligned(), isize::MAX, and checked_add
+        // before any slice construction; overlap is checked before writes.
+        if !nfo_abi_range(input, length, false)
+            || !nfo_abi_range(output, capacity, false)
+            || length > W24_MCP_MAX_BYTES
+            || capacity > W24_MCP_MAX_BYTES
+            || yenc_ranges_overlap(input as usize, length, output as usize, capacity)
+        {
+            return -1;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, length) };
+        let mut parser = VerificationOutboxParser {
+            bytes,
+            pos: 0,
+            remaining: 32768,
+        };
+        let Some(value) = parser.value(448) else {
+            return -1;
+        };
+        if parser.pos != length || !w19_list(&value) || !w20_canonical(&value) {
+            return -1;
+        }
+        let mut canonical = Vec::new();
+        value.serialize(&mut canonical);
+        if canonical != bytes {
+            return -1;
+        }
+        let Some(entries) = w16_entries(&value) else {
+            return -1;
+        };
+        let args: Vec<_> = entries.iter().map(|(_, value)| value.clone()).collect();
+        let Some(result) = w24_mcp_compute(operation, &args) else {
+            return -1;
+        };
+        let mut wire = Vec::new();
+        result.serialize(&mut wire);
+        if wire.len() > W24_MCP_MAX_BYTES {
+            return -1;
+        }
+        let Ok(needed) = i32::try_from(wire.len()) else {
+            return -1;
+        };
+        if wire.len() > capacity {
+            return -needed;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(wire.as_ptr(), output, wire.len()) };
+        needed
+    }))
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod w24_mcp_inspect_prompt_tests {
+    use super::*;
+
+    fn wire(args: Vec<VerificationOutboxValue>) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        w16_list(args).serialize(&mut bytes);
+        bytes
+    }
+
+    fn parity(op: u32, args: Vec<VerificationOutboxValue>, expected: VerificationOutboxValue) {
+        let input = wire(args);
+        let mut expected_bytes = Vec::new();
+        expected.serialize(&mut expected_bytes);
+        let mut out = vec![0xa5; expected_bytes.len() + 2];
+        for capacity in [0, 1, expected_bytes.len() - 1] {
+            assert_eq!(
+                unsafe {
+                    nntmux_w24_mcp_inspect_prompt(
+                        op,
+                        input.as_ptr(),
+                        input.len(),
+                        out.as_mut_ptr(),
+                        capacity,
+                    )
+                },
+                -(expected_bytes.len() as i32)
+            );
+            assert!(out.iter().all(|b| *b == 0xa5));
+        }
+        let mut backing = vec![0; input.len() + 1];
+        backing[1..].copy_from_slice(&input);
+        assert_eq!(
+            unsafe {
+                nntmux_w24_mcp_inspect_prompt(
+                    op,
+                    backing.as_ptr().add(1),
+                    input.len(),
+                    out.as_mut_ptr().add(1),
+                    expected_bytes.len(),
+                )
+            },
+            expected_bytes.len() as i32
+        );
+        assert_eq!(&out[1..1 + expected_bytes.len()], &expected_bytes);
+        assert_eq!(out[0], 0xa5);
+        assert_eq!(out[out.len() - 1], 0xa5);
+    }
+
+    #[test]
+    fn all_operations_and_atomic_unaligned_buffers() {
+        use VerificationOutboxValue as V;
+        parity(
+            0,
+            vec![V::Int(i64::MIN)],
+            w16_string(b"Assessed change impact for -9223372036854775808 path(s)."),
+        );
+        let impact = w16_map(vec![
+            ("paths", w16_list(vec![w16_string(b"a")])),
+            ("warnings", w16_list(vec![])),
+            ("truncated", V::Bool(false)),
+        ]);
+        parity(
+            1,
+            vec![impact.clone(), V::Int(3)],
+            w16_map(vec![
+                ("schema_version", V::Int(3)),
+                (
+                    "summary",
+                    w16_string(b"Assessed change impact for 1 path(s)."),
+                ),
+                ("evidence", impact),
+                ("warnings", w16_list(vec![])),
+                ("truncated", V::Bool(false)),
+            ]),
+        );
+        parity(
+            2,
+            vec![w16_string(b"\0 \t\xff\x0c\n"), V::Null, V::Null, V::Int(3)],
+            w16_map(vec![
+                ("query", w16_string(b"\xff\x0c")),
+                ("kind", w16_string(b"auto")),
+                ("max_results", V::Int(3)),
+            ]),
+        );
+        parity(
+            2,
+            vec![w16_string(b"  "), w16_string(b""), V::Int(-1), V::Int(50)],
+            w16_map(vec![
+                ("query", w16_string(b"")),
+                ("kind", w16_string(b"")),
+                ("max_results", V::Int(-1)),
+            ]),
+        );
+        parity(
+            3,
+            vec![V::Int(0)],
+            w16_string(b"Found 0 relevant source location(s)."),
+        );
+        parity(
+            4,
+            vec![V::Int(3)],
+            w16_string(b"Planned 3 verification check(s)."),
+        );
+        parity(5, vec![V::Int(2_000_000), V::Int(1)], V::Int(-1));
+        parity(
+            5,
+            vec![V::Int(0), V::Int(7952064785736000000)],
+            V::Int(7952064785736),
+        );
+        parity(
+            5,
+            vec![V::Int(7952064785736000000), V::Int(0)],
+            V::Int(-7952064785736),
+        );
+        parity(
+            5,
+            vec![V::Int(i64::MIN), V::Int(i64::MAX)],
+            V::Int(18446744073709),
+        );
+        parity(
+            6,
+            vec![w16_string(b"\xff\0"), V::Null],
+            w16_list(vec![
+                w16_string(W24_DIAGNOSE_ASSISTANT),
+                w16_string(
+                    b"Problem:\n\xff\0\n\nScope:\nInfer the narrowest safe scope from evidence.",
+                ),
+            ]),
+        );
+        parity(7, vec![V::Int(i64::MAX)], w24_project_overview(i64::MAX));
+    }
+
+    #[test]
+    fn malformed_and_unsafe_ranges_are_rejected_before_access_or_write() {
+        let input = wire(vec![VerificationOutboxValue::Int(1)]);
+        let mut out = [0xa5; 256];
+        let run = |op, p, len, o, cap| unsafe { nntmux_w24_mcp_inspect_prompt(op, p, len, o, cap) };
+        for malformed in [
+            b"".as_slice(),
+            b"N;",
+            b"a:0:{}junk",
+            b"a:1:{i:00;i:1;}",
+            b"a:2:{i:0;i:1;i:0;i:2;}",
+            b"a:1:{i:0;O:8:\"stdClass\":0:{}}",
+            b"a:1:{i:0;R:1;}",
+        ] {
+            assert_eq!(
+                run(
+                    0,
+                    malformed.as_ptr(),
+                    malformed.len(),
+                    out.as_mut_ptr(),
+                    256
+                ),
+                -1
+            );
+        }
+        assert_eq!(
+            run(8, input.as_ptr(), input.len(), out.as_mut_ptr(), 256),
+            -1
+        );
+        assert_eq!(run(0, std::ptr::null(), 0, out.as_mut_ptr(), 256), -1);
+        assert_eq!(
+            run(0, input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+            -1
+        );
+        assert_eq!(
+            run(0, input.as_ptr(), usize::MAX, out.as_mut_ptr(), 256),
+            -1
+        );
+        assert_eq!(
+            run(0, usize::MAX as *const u8, 2, out.as_mut_ptr(), 256),
+            -1
+        );
+        assert_eq!(
+            run(0, input.as_ptr(), input.len(), usize::MAX as *mut u8, 2),
+            -1
+        );
+        assert_eq!(
+            run(0, input.as_ptr(), input.len(), out.as_mut_ptr(), usize::MAX),
+            -1
+        );
+        assert_eq!(
+            run(
+                0,
+                input.as_ptr(),
+                W24_MCP_MAX_BYTES + 1,
+                out.as_mut_ptr(),
+                256
+            ),
+            -1
+        );
+        assert_eq!(run(0, out.as_ptr(), 1, out.as_mut_ptr(), 256), -1);
+        assert!(out.iter().all(|b| *b == 0xa5));
+    }
+}
