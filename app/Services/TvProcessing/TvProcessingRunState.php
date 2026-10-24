@@ -4,7 +4,10 @@ declare(strict_types=1);
 
 namespace App\Services\TvProcessing;
 
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Facades\Cache;
+use Throwable;
 
 /**
  * Memo shared by every release processed in one pipeline run.
@@ -20,6 +23,37 @@ final class TvProcessingRunState
 
     /** Consecutive transient failures before a provider is skipped for the rest of the run. */
     public const int CIRCUIT_BREAKER_THRESHOLD = 3;
+
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_tv_run_state_episode_lookup_key(int32_t kind, const char *provider, size_t provider_len, int64_t video_id, const char *episode_key, size_t episode_key_len, char *out, size_t cap);
+        C;
+
+    /** Null selects the benchmark-qualified production default (PHP; see RustTvShowAdderAndMetadataParityTest). */
+    private static ?bool $useRustFfi = null;
+
+    private static FFI|false|null $ffi = null;
+
+    public static function setUseRustFfi(?bool $use = true): void
+    {
+        self::$useRustFfi = $use;
+        if ($use === null) {
+            self::$ffi = null;
+        }
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? false;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('metadata', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
 
     /** @var array<string, array<string, true>> */
     private array $notFoundTitles = [];
@@ -63,7 +97,7 @@ final class TvProcessingRunState
      */
     public function firstEpisodeLookup(string $provider, int $videoId, string $episodeKey): bool
     {
-        $key = $provider.':'.$videoId.':'.$episodeKey;
+        $key = $this->episodeLookupKey($provider, $videoId, $episodeKey);
         if (isset($this->episodeLookups[$key])) {
             return false;
         }
@@ -89,6 +123,69 @@ final class TvProcessingRunState
 
     private function refreshKey(string $provider, int $videoId): string
     {
+        return self::usesRustFfi()
+            ? self::refreshKeyNative($provider, $videoId)
+            : self::refreshKeyPhp($provider, $videoId);
+    }
+
+    public static function refreshKeyNative(string $provider, int $videoId): string
+    {
+        return self::nativeKey(0, $provider, $videoId, '') ?? self::refreshKeyPhp($provider, $videoId);
+    }
+
+    public static function refreshKeyPhp(string $provider, int $videoId): string
+    {
         return 'tv:eps-refreshed:'.mb_strtolower($provider).':'.$videoId;
+    }
+
+    private function episodeLookupKey(string $provider, int $videoId, string $episodeKey): string
+    {
+        return self::usesRustFfi()
+            ? self::episodeLookupKeyNative($provider, $videoId, $episodeKey)
+            : self::episodeLookupKeyPhp($provider, $videoId, $episodeKey);
+    }
+
+    public static function episodeLookupKeyNative(string $provider, int $videoId, string $episodeKey): string
+    {
+        return self::nativeKey(1, $provider, $videoId, $episodeKey)
+            ?? self::episodeLookupKeyPhp($provider, $videoId, $episodeKey);
+    }
+
+    public static function episodeLookupKeyPhp(string $provider, int $videoId, string $episodeKey): string
+    {
+        return $provider.':'.$videoId.':'.$episodeKey;
+    }
+
+    private static function nativeKey(int $kind, string $provider, int $videoId, string $episodeKey): ?string
+    {
+        if (($ffi = self::ffi()) === null) {
+            return null;
+        }
+        $providerLen = \strlen($provider);
+        $episodeKeyLen = \strlen($episodeKey);
+        $capacity = 0;
+        $buffer = RustPipelineLibrary::obtainScratch($ffi, $providerLen + $episodeKeyLen + 64, $capacity);
+        if ($buffer === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_tv_run_state_episode_lookup_key($kind, $provider, $providerLen, $videoId, $episodeKey, $episodeKeyLen, $buffer, $capacity);
+            if (\is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_tv_run_state_episode_lookup_key($kind, $provider, $providerLen, $videoId, $episodeKey, $episodeKeyLen, $buffer, $capacity);
+            }
+            if (! \is_int($written) || $written <= 0 || $written > $capacity) {
+                return null;
+            }
+
+            return FFI::string($buffer, $written);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }
