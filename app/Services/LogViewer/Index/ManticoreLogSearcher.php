@@ -11,6 +11,8 @@ use App\Services\LogViewer\LogFile;
 use App\Services\LogViewer\LogReader;
 use App\Services\LogViewer\LogSearcher;
 use App\Services\LogViewer\SearchQuery;
+use App\Support\RustPipelineLibrary;
+use Throwable;
 
 /**
  * Answers log searches from the Manticore log index, with the same per-file result shape as
@@ -199,17 +201,71 @@ class ManticoreLogSearcher
      */
     private function entryFromHit(array $hit): LogEntry
     {
-        $line = (int) ($hit['line_no'] ?? 0);
+        [$offset, $end, $line] = self::hitPosition($hit);
 
         return $this->parser->make(
-            (int) $hit['byte_offset'],
-            (int) ($hit['byte_end'] ?? $hit['byte_offset']),
+            $offset,
+            $end,
             (string) ($hit['first_line'] ?? ''),
             (string) ($hit['body'] ?? ''),
             (bool) ($hit['truncated'] ?? false),
             (bool) ($hit['structured'] ?? false),
-            $line > 0 ? $line : null,
+            $line,
         );
+    }
+
+    /**
+     * Byte offset, byte end and positive line number of an index hit. Rust is opt-in.
+     *
+     * @param  array<string, mixed>  $hit
+     * @return array{int, int, int|null}
+     */
+    public static function hitPosition(array $hit, bool $useRustFfi = false): array
+    {
+        return ($useRustFfi ? self::hitPositionNative($hit) : null) ?? self::hitPositionPhp($hit);
+    }
+
+    /**
+     * @param  array<string, mixed>  $hit
+     * @return array{int, int, int|null}
+     */
+    public static function hitPositionPhp(array $hit): array
+    {
+        $line = (int) ($hit['line_no'] ?? 0);
+
+        return [(int) $hit['byte_offset'], (int) ($hit['byte_end'] ?? $hit['byte_offset']), $line > 0 ? $line : null];
+    }
+
+    /**
+     * Native casts for integer (or absent) hit fields; null defers other types to PHP.
+     *
+     * @param  array<string, mixed>  $hit
+     * @return array{int, int, int|null}|null
+     */
+    public static function hitPositionNative(array $hit): ?array
+    {
+        $offset = $hit['byte_offset'] ?? null;
+        $end = $hit['byte_end'] ?? null;
+        $line = $hit['line_no'] ?? null;
+        if (! is_int($offset) || ($end !== null && ! is_int($end)) || ($line !== null && ! is_int($line))) {
+            return null;
+        }
+        static $ffi, $slots;
+        $ffi ??= RustPipelineLibrary::resolveDomain('search', 'int32_t nntmux_log_hit_position(int64_t offset, int64_t end, uint32_t has_end, int64_t line, int64_t *out);') ?? false;
+        if ($ffi === false) {
+            return null;
+        }
+        try {
+            $slots ??= $ffi->new('int64_t[3]');
+            if ($ffi->nntmux_log_hit_position($offset, $end ?? 0, $end === null ? 0 : 1, $line ?? 0, $slots) !== 0) {
+                return null;
+            }
+            $lineNumber = (int) $slots[2];
+
+            return [(int) $slots[0], (int) $slots[1], $lineNumber > 0 ? $lineNumber : null];
+        } catch (Throwable) {
+            return null;
+        }
     }
 
     /**
