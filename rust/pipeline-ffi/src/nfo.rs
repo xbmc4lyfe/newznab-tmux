@@ -22532,3 +22532,573 @@ pub unsafe extern "C" fn nntmux_w30_nfo_nzb_manifest_import_yenc_commands(
     }))
     .unwrap_or(-1)
 }
+/// Wave 31.2 article-range, candidate-preparation, verification-barrier and
+/// fingerprint-queue command helpers. Every result is wrapped in a one-element
+/// JSON array so a genuine `null` result stays distinct from a declined call.
+mod wave31_article_candidate_barrier_fingerprint_commands {
+    use super::wave30_nfo_nzb_manifest_import_yenc_commands::{J, MAX_BYTES, parse, write};
+    use super::{nfo_abi_range, yenc_ranges_overlap};
+    use std::slice;
+
+    const FINGERPRINT_JOB: &[u8] = b"App\\Jobs\\CollectReleaseFingerprintMetadata";
+    const RELEASE_ID_MARKER: &[u8] = b"releaseId\";i:";
+
+    /// PHP 8 `(int) $value` restricted to unambiguous results; floats, arrays,
+    /// numeric prefixes and overflowing strings decline so PHP decides them.
+    fn php_int_cast(value: &J) -> Option<i64> {
+        match value {
+            J::Null | J::Bool(false) => Some(0),
+            J::Bool(true) => Some(1),
+            J::Int(i) => Some(*i),
+            J::Str(text) => php_plain_int_cast(text),
+            _ => None,
+        }
+    }
+
+    /// No ASCII digit at all (0) or a whitespace-padded plain decimal integer.
+    fn php_plain_int_cast(value: &[u8]) -> Option<i64> {
+        if !value.iter().any(u8::is_ascii_digit) {
+            return Some(0);
+        }
+        let ws = |b: &u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c);
+        let start = value.iter().position(|b| !ws(b))?;
+        let end = value.iter().rposition(|b| !ws(b))? + 1;
+        let body = &value[start..end];
+        let digits = body
+            .strip_prefix(b"-")
+            .or_else(|| body.strip_prefix(b"+"))
+            .unwrap_or(body);
+        if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        std::str::from_utf8(body).ok()?.parse::<i64>().ok()
+    }
+
+    /// `preg_match('/\A-?[0-9]+\z/', $value) === 1`.
+    fn is_signed_digits(value: &[u8]) -> bool {
+        let digits = value.strip_prefix(b"-").unwrap_or(value);
+        !digits.is_empty() && digits.iter().all(u8::is_ascii_digit)
+    }
+
+    /// The first `/releaseId";i:([1-9][0-9]*);/` match. The outer `None` declines
+    /// an id beyond i64 (PHP saturates it); the inner `None` means no match.
+    fn release_id_in_command(command: &[u8]) -> Option<Option<i64>> {
+        for start in 0..command.len() {
+            let Some(rest) = command[start..].strip_prefix(RELEASE_ID_MARKER) else {
+                continue;
+            };
+            let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+            if digits == 0 || rest[0] == b'0' || rest.get(digits) != Some(&b';') {
+                continue;
+            }
+            let text = std::str::from_utf8(&rest[..digits]).ok()?;
+            return Some(Some(text.parse::<i64>().ok()?));
+        }
+        Some(None)
+    }
+
+    fn entry<'a>(entries: &'a [(Vec<u8>, J)], key: &[u8]) -> Option<&'a J> {
+        entries.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
+    /// `TransferFingerprintQueue::extractReleaseIdFromQueuePayload`. A payload
+    /// this strict parser rejects (duplicate keys, deep nesting, invalid JSON)
+    /// declines, because `json_decode()` remains the authority for it.
+    fn extract_release_id(payload: &[u8]) -> Option<J> {
+        let data = parse(payload)?;
+        let J::Obj(entries) = &data else {
+            return Some(J::Null);
+        };
+        if !matches!(entry(entries, b"displayName"), Some(J::Str(name)) if name == FINGERPRINT_JOB)
+        {
+            return Some(J::Null);
+        }
+        let Some(J::Obj(job)) = entry(entries, b"data") else {
+            return Some(J::Null);
+        };
+        let Some(J::Str(command)) = entry(job, b"command") else {
+            return Some(J::Null);
+        };
+        Some(release_id_in_command(command)?.map_or(J::Null, J::Int))
+    }
+
+    /// `(string) $value` for the nullable string markers.
+    fn nullable_text(value: &J) -> Option<&[u8]> {
+        match value {
+            J::Null => Some(b""),
+            J::Str(text) => Some(text),
+            _ => None,
+        }
+    }
+
+    /// `BackfillReleaseFingerprintMetadata::markersAreCurrent`.
+    fn markers_are_current(args: &[J]) -> Option<bool> {
+        let version_value = nullable_text(&args[0])?;
+        let version_type = nullable_text(&args[1])?.to_ascii_lowercase();
+        let format_value = nullable_text(&args[2])?;
+        let format_type = nullable_text(&args[3])?.to_ascii_lowercase();
+        let J::Int(expected_version) = args[4] else {
+            return None;
+        };
+        let expected_format = match &args[5] {
+            J::Null => None,
+            J::Str(text) => Some(text.as_slice()),
+            _ => return None,
+        };
+        // Only an integer marker can equal the expected version; others are strings or absent.
+        let version_current = if version_type == b"integer" && is_signed_digits(version_value) {
+            std::str::from_utf8(version_value)
+                .ok()?
+                .parse::<i64>()
+                .ok()?
+                == expected_version
+        } else {
+            false
+        };
+        let format_current = match format_type.as_slice() {
+            b"string" | b"text" => expected_format == Some(format_value),
+            b"" | b"null" => expected_format.is_none(),
+            // Arrays, objects, numbers and booleans are never a valid format marker.
+            _ => false,
+        };
+        Some(version_current && format_current)
+    }
+
+    pub(super) fn compute(operation: u32, args: &[J]) -> Option<J> {
+        let arity = |n: usize| args.len() == n;
+        let int = |i: usize| match args.get(i)? {
+            J::Int(value) => Some(*value),
+            _ => None,
+        };
+        let text = |i: usize| match args.get(i)? {
+            J::Str(value) => Some(value.as_slice()),
+            _ => None,
+        };
+        let flag = |i: usize| match args.get(i)? {
+            J::Bool(value) => Some(*value),
+            _ => None,
+        };
+        let cast = |i: usize| php_int_cast(args.get(i)?);
+        let s = |line: String| J::Str(line.into_bytes());
+        Some(match operation {
+            // GetArticleRange
+            0 if arity(1) => J::Bool(matches!(text(0)?, b"binaries" | b"backfill")),
+            1 if arity(2) => {
+                let (first, last) = (int(0)?, int(1)?);
+                J::Bool(first >= 1 && last >= first)
+            }
+            2 if arity(3) => {
+                let mode = text(0)?;
+                let cursor = match &args[1] {
+                    J::Null => None,
+                    J::Int(cursor) => Some(*cursor),
+                    _ => return None,
+                };
+                let first = i128::from(int(2)?);
+                // PHP promotes `PHP_INT_MAX + 1` to float; every int still compares below it.
+                J::Bool(mode == b"binaries" && cursor.is_some_and(|c| first <= i128::from(c) + 1))
+            }
+            // PrepareReleaseCandidates
+            3 if arity(4) => J::Obj(vec![
+                (b"limit".to_vec(), J::Int(cast(0)?.max(1))),
+                (b"max_seconds".to_vec(), J::Int(cast(1)?.max(1))),
+                (b"dirty_limit".to_vec(), J::Int(cast(2)?.max(1))),
+                (b"dirty_seconds".to_vec(), J::Int(cast(3)?.max(1))),
+            ]),
+            4 if arity(1) => s(format!(
+                "Classified {} candidate header inventories.",
+                int(0)?
+            )),
+            5 if arity(3) => s(format!(
+                "Settled {} of {} dirty candidates ({} late collections kept for a later pass).",
+                int(0)?,
+                int(1)?,
+                int(2)?
+            )),
+            // ReleaseVerificationBarrier
+            6 if arity(1) => {
+                if flag(0)? {
+                    J::Null
+                } else {
+                    s("deployment".to_owned())
+                }
+            }
+            7 if arity(1) => J::Int(cast(0)?.max(1)),
+            // An overflowing PHP subtraction becomes a float far from 5; i128 keeps its sign.
+            8 if arity(2) => J::Bool(i128::from(int(0)?) - i128::from(int(1)?) >= 5),
+            // TransferFingerprintQueue
+            9 if arity(1) => J::Int(cast(0)?.clamp(1, 10_000)),
+            10 if arity(1) => extract_release_id(text(0)?)?,
+            11 if arity(2) => s(format!(
+                "{}{} fingerprint jobs.",
+                if flag(0)? {
+                    "Validated "
+                } else {
+                    "Transferred "
+                },
+                int(1)?
+            )),
+            // BackfillReleaseFingerprintMetadata
+            12 if arity(3) => J::Obj(vec![
+                (b"limit".to_vec(), J::Int(cast(0)?.clamp(1, 10_000))),
+                (b"after_id".to_vec(), J::Int(cast(1)?.max(0))),
+                (b"delay_ms".to_vec(), J::Int(cast(2)?.clamp(0, 60_000))),
+            ]),
+            13 if arity(6) => J::Bool(markers_are_current(args)?),
+            14 if arity(3) => {
+                let (queued, resume) = (int(1)?, int(2)?);
+                s(if flag(0)? {
+                    format!("Dry run: {queued} matching releases; nothing was queued.")
+                } else {
+                    format!("Queued {queued} releases. Resume with --after-id={resume}.")
+                })
+            }
+            _ => return None,
+        })
+    }
+
+    /// # Safety
+    /// See [`super::nntmux_w31_article_candidate_barrier_fingerprint_commands`].
+    pub(super) unsafe fn evaluate(
+        operation: u32,
+        input: *const u8,
+        length: usize,
+        output: *mut u8,
+        capacity: usize,
+    ) -> i64 {
+        if !nfo_abi_range(input, length, false)
+            || !nfo_abi_range(output, capacity, false)
+            || length > MAX_BYTES
+            || capacity > MAX_BYTES
+            || yenc_ranges_overlap(input as usize, length, output as usize, capacity)
+        {
+            return -1;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, length) };
+        let Some(J::Arr(args)) = parse(bytes) else {
+            return -1;
+        };
+        let Some(result) = compute(operation, &args) else {
+            return -1;
+        };
+        let mut wire = Vec::new();
+        write(&mut wire, &J::Arr(vec![result]));
+        if wire.len() > MAX_BYTES {
+            return -1;
+        }
+        let needed = wire.len() as i64;
+        if wire.len() > capacity {
+            return -needed;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(wire.as_ptr(), output, wire.len()) };
+        needed
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn run(operation: u32, input: &str) -> Option<String> {
+            let mut out = vec![0xa5u8; 4096];
+            let written = unsafe {
+                evaluate(
+                    operation,
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            if written < 0 {
+                assert_eq!(written, -1);
+                return None;
+            }
+            Some(String::from_utf8(out[..written as usize].to_vec()).unwrap())
+        }
+
+        fn ok(operation: u32, input: &str) -> String {
+            run(operation, input).unwrap_or_else(|| panic!("{operation} {input} declined"))
+        }
+
+        #[test]
+        fn w31_2_article_range_predicates() {
+            for (mode, expected) in [
+                ("binaries", "true"),
+                ("backfill", "true"),
+                ("Binaries", "false"),
+                ("binaries ", "false"),
+                ("", "false"),
+                ("binaries\\u0000", "false"),
+                ("é", "false"),
+            ] {
+                assert_eq!(
+                    ok(0, &format!("[\"{mode}\"]")),
+                    format!("[{expected}]"),
+                    "{mode}"
+                );
+            }
+            assert_eq!(run(0, "[null]"), None);
+            for (first, last, expected) in [
+                (1, 1, true),
+                (1, 2, true),
+                (2, 1, false),
+                (0, 5, false),
+                (-1, 5, false),
+                (i64::MAX, i64::MAX, true),
+                (i64::MIN, i64::MAX, false),
+            ] {
+                assert_eq!(ok(1, &format!("[{first},{last}]")), format!("[{expected}]"));
+            }
+            for (mode, cursor, first, expected) in [
+                ("binaries", "10", 11, true),
+                ("binaries", "10", 12, false),
+                ("binaries", "10", 1, true),
+                ("binaries", "null", 1, false),
+                ("backfill", "10", 1, false),
+                ("binaries", "-1", 0, true),
+                ("binaries", &i64::MAX.to_string(), i64::MAX, true),
+                ("binaries", &i64::MIN.to_string(), 1, false),
+            ] {
+                assert_eq!(
+                    ok(2, &format!("[\"{mode}\",{cursor},{first}]")),
+                    format!("[{expected}]")
+                );
+            }
+            assert_eq!(run(2, r#"["binaries","10",1]"#), None);
+        }
+
+        #[test]
+        fn w31_2_option_normalization_matches_php_int_cast() {
+            assert_eq!(
+                ok(3, r#"["5000","30",null,false]"#),
+                r#"[{"limit":5000,"max_seconds":30,"dirty_limit":1,"dirty_seconds":1}]"#
+            );
+            assert_eq!(
+                ok(3, r#"[true," 12 ","\u000b7","abc"]"#),
+                r#"[{"limit":1,"max_seconds":12,"dirty_limit":7,"dirty_seconds":1}]"#
+            );
+            assert_eq!(ok(7, r#"["-5"]"#), "[1]");
+            assert_eq!(ok(7, r#"["+900"]"#), "[900]");
+            assert_eq!(ok(7, r#"[""]"#), "[1]");
+            assert_eq!(ok(9, r#"["0"]"#), "[1]");
+            assert_eq!(ok(9, r#"["10001"]"#), "[10000]");
+            assert_eq!(ok(9, &format!("[{}]", i64::MIN)), "[1]");
+            assert_eq!(
+                ok(12, r#"["0","-3","70000"]"#),
+                r#"[{"limit":1,"after_id":0,"delay_ms":60000}]"#
+            );
+            assert_eq!(
+                ok(12, r#"[100,42,"-1"]"#),
+                r#"[{"limit":100,"after_id":42,"delay_ms":0}]"#
+            );
+            for declined in [
+                "1.5",
+                r#""12abc""#,
+                r#""1e3""#,
+                r#""1.0""#,
+                r#""99999999999999999999""#,
+                "[]",
+                "{}",
+            ] {
+                assert_eq!(run(7, &format!("[{declined}]")), None, "{declined}");
+                assert_eq!(run(9, &format!("[{declined}]")), None, "{declined}");
+            }
+        }
+
+        #[test]
+        fn w31_2_messages_and_barrier_helpers() {
+            assert_eq!(
+                ok(4, "[-3]"),
+                r#"["Classified -3 candidate header inventories."]"#
+            );
+            assert_eq!(
+                ok(5, "[1,2,3]"),
+                r#"["Settled 1 of 2 dirty candidates (3 late collections kept for a later pass)."]"#
+            );
+            assert_eq!(ok(6, "[true]"), "[null]");
+            assert_eq!(ok(6, "[false]"), r#"["deployment"]"#);
+            assert_eq!(run(6, "[1]"), None);
+            assert_eq!(ok(8, "[10,5]"), "[true]");
+            assert_eq!(ok(8, "[9,5]"), "[false]");
+            assert_eq!(ok(8, &format!("[{},1]", i64::MIN)), "[false]");
+            assert_eq!(ok(8, &format!("[{},-1]", i64::MAX)), "[true]");
+            assert_eq!(ok(11, "[true,0]"), r#"["Validated 0 fingerprint jobs."]"#);
+            assert_eq!(
+                ok(11, "[false,7]"),
+                r#"["Transferred 7 fingerprint jobs."]"#
+            );
+            assert_eq!(
+                ok(14, "[true,3,9]"),
+                r#"["Dry run: 3 matching releases; nothing was queued."]"#
+            );
+            assert_eq!(
+                ok(14, "[false,3,9]"),
+                r#"["Queued 3 releases. Resume with --after-id=9."]"#
+            );
+        }
+
+        #[test]
+        fn w31_2_queue_payload_release_ids() {
+            let payload = |command: &str| {
+                format!(
+                    r#"{{"displayName":"App\\Jobs\\CollectReleaseFingerprintMetadata","data":{{"command":"{command}"}}}}"#
+                )
+            };
+            let wrap = |raw: String| {
+                let mut out = Vec::new();
+                write(&mut out, &J::Arr(vec![J::Str(raw.into_bytes())]));
+                String::from_utf8(out).unwrap()
+            };
+            for (command, expected) in [
+                (r#"O:1:\"x\":1:{s:9:\"releaseId\";i:42;}"#, "42"),
+                (r#"releaseId\";i:0;releaseId\";i:7;"#, "7"),
+                (r#"releaseId\";i:012;"#, "null"),
+                (r#"releaseId\";i:12"#, "null"),
+                (r#"releaseId\";i:-3;"#, "null"),
+                (
+                    r#"releaseId\";i:9223372036854775807;"#,
+                    "9223372036854775807",
+                ),
+                ("", "null"),
+            ] {
+                assert_eq!(
+                    ok(10, &wrap(payload(command))),
+                    format!("[{expected}]"),
+                    "{command}"
+                );
+            }
+            assert_eq!(
+                run(10, &wrap(payload(r#"releaseId\";i:9223372036854775808;"#))),
+                None
+            );
+            for (raw, expected) in [
+                (
+                    r#"{"displayName":"Other","data":{"command":"releaseId\";i:4;"}}"#,
+                    "null",
+                ),
+                (
+                    r#"{"displayName":"App\\Jobs\\CollectReleaseFingerprintMetadata","data":{"command":4}}"#,
+                    "null",
+                ),
+                (
+                    r#"{"displayName":"App\\Jobs\\CollectReleaseFingerprintMetadata","data":"x"}"#,
+                    "null",
+                ),
+                (
+                    r#"{"displayName":"App\\Jobs\\CollectReleaseFingerprintMetadata"}"#,
+                    "null",
+                ),
+                (
+                    r#"["App\\Jobs\\CollectReleaseFingerprintMetadata"]"#,
+                    "null",
+                ),
+                ("5", "null"),
+            ] {
+                assert_eq!(
+                    ok(10, &wrap(raw.to_owned())),
+                    format!("[{expected}]"),
+                    "{raw}"
+                );
+            }
+            for declined in ["", "{", r#"{"a":1,"a":2}"#, &"[".repeat(40)] {
+                assert_eq!(run(10, &wrap(declined.to_owned())), None, "{declined}");
+            }
+        }
+
+        #[test]
+        fn w31_2_fingerprint_markers() {
+            for (input, expected) in [
+                (r#"["40","integer",null,null,40,null]"#, "true"),
+                (r#"["40","INTEGER",null,"NULL",40,null]"#, "true"),
+                (
+                    r#"["1","integer","compact-v1","text",1,"compact-v1"]"#,
+                    "true",
+                ),
+                (r#"["1","integer","compact-v1","string",1,null]"#, "false"),
+                (r#"["1","integer",null,null,1,"compact-v1"]"#, "false"),
+                (r#"["1","integer","[1]","array",1,"compact-v1"]"#, "false"),
+                (
+                    r#"["1","text","compact-v1","text",1,"compact-v1"]"#,
+                    "false",
+                ),
+                (r#"["01","integer",null,null,1,null]"#, "true"),
+                (r#"["-0","integer",null,null,0,null]"#, "true"),
+                (r#"["1.0","integer",null,null,1,null]"#, "false"),
+                (r#"[" 1","integer",null,null,1,null]"#, "false"),
+                (r#"[null,"integer",null,null,0,null]"#, "false"),
+                (r#"["40",null,null,null,40,null]"#, "false"),
+                (r#"["40","integer","x\u0000","text",40,"x\u0000"]"#, "true"),
+            ] {
+                assert_eq!(ok(13, input), format!("[{expected}]"), "{input}");
+            }
+            assert_eq!(
+                run(13, r#"["99999999999999999999","integer",null,null,1,null]"#),
+                None
+            );
+            assert_eq!(run(13, r#"[1,"integer",null,null,1,null]"#), None);
+            assert_eq!(run(13, r#"["1","integer",null,null,"1",null]"#), None);
+        }
+
+        #[test]
+        fn w31_2_rejects_malformed_json_arity_and_bad_ranges() {
+            for (op, bad) in [
+                (0, "[\"a\"] x"),
+                (0, "[\"a\""),
+                (0, "[\"\\ud800\"]"),
+                (0, "{\"0\":\"a\"}"),
+                (0, "[\"a\",\"b\"]"),
+                (1, "[1]"),
+                (1, "[1,2.0]"),
+                (3, "[1,2,3]"),
+                (13, "[]"),
+                (15, "[]"),
+            ] {
+                assert_eq!(run(op, bad), None, "{op} {bad}");
+            }
+            let input = b"[true]";
+            let mut out = [0x5au8; 16];
+            let call = |p: *const u8, len: usize, o: *mut u8, cap: usize| unsafe {
+                evaluate(6, p, len, o, cap)
+            };
+            assert_eq!(call(std::ptr::null(), 0, out.as_mut_ptr(), out.len()), -1);
+            assert_eq!(
+                call(input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                -1
+            );
+            assert_eq!(
+                call(input.as_ptr(), MAX_BYTES + 1, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            assert_eq!(call(input.as_ptr(), input.len(), out.as_mut_ptr(), 5), -6);
+            assert!(out.iter().all(|b| *b == 0x5a));
+            assert_eq!(call(input.as_ptr(), input.len(), out.as_mut_ptr(), 6), 6);
+            assert_eq!(&out[..6], b"[null]");
+            let p = out.as_mut_ptr();
+            assert_eq!(call(p, 4, unsafe { p.add(2) }, 4), -1);
+        }
+    }
+}
+
+/// Evaluate one Wave 31.2 command helper. `input` is a `json_encode()`d argument
+/// list; the one-element JSON array result is copied to `output`. Returns the byte
+/// count written, the negated required capacity when `output` is too small (nothing
+/// written), or -1 when the input is malformed or outside the strict contract.
+///
+/// # Safety
+/// Both ranges must be live, disjoint readable/writable allocations. Pointers must
+/// be non-null even for zero lengths; arithmetic checks cannot prove provenance.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w31_article_candidate_barrier_fingerprint_commands(
+    operation: u32,
+    input: *const u8,
+    length: usize,
+    output: *mut u8,
+    capacity: usize,
+) -> i64 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        wave31_article_candidate_barrier_fingerprint_commands::evaluate(
+            operation, input, length, output, capacity,
+        )
+    }))
+    .unwrap_or(-1)
+}
