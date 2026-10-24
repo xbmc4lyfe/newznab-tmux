@@ -5,13 +5,58 @@ declare(strict_types=1);
 namespace App\Console\Commands;
 
 use App\Services\XrefService;
+use App\Support\RustPipelineLibrary;
 use App\Support\Utf8;
+use FFI;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
+use Throwable;
 
 final class OptimizeCbpStorage extends Command
 {
+    private const FFI_CDEF = <<<'CDEF'
+int32_t nntmux_w31_benchmark_binaries_cbp_reset_commands(
+    const char *input,
+    size_t len,
+    uint8_t *out,
+    size_t out_cap
+);
+CDEF;
+
+    /** Rust stays opt-in: the JSON FFI round trip is slower than these PHP helpers (< 1.5x). */
+    private const RUST_FFI_DEFAULT = false;
+
+    private static bool $useRustFfi = self::RUST_FFI_DEFAULT;
+
+    private static FFI|false|null $ffi = null;
+
+    public static function useRustFfi(bool $enabled = true): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function setUseRustFfi(?bool $useRustFfi): void
+    {
+        self::$useRustFfi = $useRustFfi ?? self::RUST_FFI_DEFAULT;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    public static function resetRustFfi(): void
+    {
+        self::$useRustFfi = self::RUST_FFI_DEFAULT;
+        self::$ffi = null;
+    }
+
+    public static function setFfiForTesting(FFI|false|null $ffi = null): void
+    {
+        self::$ffi = $ffi;
+    }
+
     protected $signature = 'cbp:optimize-storage
                             {--execute : Apply the reported storage changes}
                             {--batch= : Override the bounded reconciliation batch size}';
@@ -42,7 +87,7 @@ final class OptimizeCbpStorage extends Command
             return self::SUCCESS;
         }
 
-        $batchSize = max(1, min(5000, (int) ($this->option('batch') ?: config('nntmux.cbp.reconcile_batch_size', 500))));
+        $batchSize = self::clampBatchSize((int) ($this->option('batch') ?: config('nntmux.cbp.reconcile_batch_size', 500)));
         $this->ensureCheckpointTable();
 
         try {
@@ -58,7 +103,7 @@ final class OptimizeCbpStorage extends Command
             $this->step('10_constraints', fn () => $this->installConstraintsAndIndexes());
             $this->step('11_aggregates', fn () => $this->rebuildAggregates($batchSize));
             $this->step('12_finalize', fn () => $this->finalizeOptimization());
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             $this->error('Optimization stopped: '.$e->getMessage());
             $this->warn('Completed checkpoints are retained; fix the cause and rerun the same command.');
 
@@ -232,9 +277,7 @@ final class OptimizeCbpStorage extends Command
             );
             foreach ($rows as $row) {
                 $lastId = (int) $row->id;
-                $hash = (int) $row->filenumber > 0
-                    ? md5('file:'.(int) $row->filenumber, true)
-                    : md5('subject:'.$this->normalizeIdentity((string) $row->name)."\0poster:".$this->normalizeIdentity((string) $row->fromname), true);
+                $hash = self::computeBinaryCbpHash((int) $row->filenumber, (string) $row->name, (string) $row->fromname);
                 DB::update('UPDATE binaries SET cbp_hash = ? WHERE id = ?', [$hash, $lastId]);
             }
         } while (\count($rows) === $batchSize);
@@ -427,11 +470,6 @@ final class OptimizeCbpStorage extends Command
         DB::statement('ANALYZE TABLE collections, binaries, parts, collection_groups');
     }
 
-    private function normalizeIdentity(string $value): string
-    {
-        return mb_strtolower(trim(preg_replace('/\s+/u', ' ', Utf8::clean($value)) ?? ''));
-    }
-
     private function indexExists(string $table, string $index): bool
     {
         return DB::select("SHOW INDEX FROM `{$table}` WHERE Key_name = ?", [$index]) !== [];
@@ -455,5 +493,128 @@ final class OptimizeCbpStorage extends Command
         if ($exists !== []) {
             DB::statement("ALTER TABLE `{$table}` DROP FOREIGN KEY `{$constraint}`");
         }
+    }
+
+    public static function normalizeIdentity(string $value): string
+    {
+        return self::$useRustFfi ? self::normalizeIdentityNative($value) : self::normalizeIdentityPhp($value);
+    }
+
+    public static function normalizeIdentityPhp(string $value): string
+    {
+        return mb_strtolower(trim(preg_replace('/\s+/u', ' ', Utf8::clean($value)) ?? ''));
+    }
+
+    public static function normalizeIdentityNative(string $value): string
+    {
+        if (self::callNative(['optimize_cbp.normalize_identity', $value], $result) && is_string($result)) {
+            return $result;
+        }
+
+        return self::normalizeIdentityPhp($value);
+    }
+
+    /**
+     * Raw 16-byte MD5 binary identity: the file number when positive, otherwise the normalized subject and poster.
+     */
+    public static function computeBinaryCbpHash(int $fileNumber, string $subject, string $fromName): string
+    {
+        return self::$useRustFfi
+            ? self::computeBinaryCbpHashNative($fileNumber, $subject, $fromName)
+            : self::computeBinaryCbpHashPhp($fileNumber, $subject, $fromName);
+    }
+
+    public static function computeBinaryCbpHashPhp(int $fileNumber, string $subject, string $fromName): string
+    {
+        return $fileNumber > 0
+            ? md5('file:'.$fileNumber, true)
+            : md5('subject:'.self::normalizeIdentityPhp($subject)."\0poster:".self::normalizeIdentityPhp($fromName), true);
+    }
+
+    public static function computeBinaryCbpHashNative(int $fileNumber, string $subject, string $fromName): string
+    {
+        if (self::callNative(['optimize_cbp.compute_binary_cbp_hash', $fileNumber, $subject, $fromName], $result)
+            && is_string($result) && strlen($result) === 32 && ctype_xdigit($result)) {
+            return (string) hex2bin($result);
+        }
+
+        return self::computeBinaryCbpHashPhp($fileNumber, $subject, $fromName);
+    }
+
+    public static function clampBatchSize(int $batch): int
+    {
+        return self::$useRustFfi ? self::clampBatchSizeNative($batch) : self::clampBatchSizePhp($batch);
+    }
+
+    public static function clampBatchSizePhp(int $batch): int
+    {
+        return max(1, min(5000, $batch));
+    }
+
+    public static function clampBatchSizeNative(int $batch): int
+    {
+        if (self::callNative(['optimize_cbp.clamp_batch_size', $batch], $result) && is_int($result)) {
+            return $result;
+        }
+
+        return self::clampBatchSizePhp($batch);
+    }
+
+    /**
+     * Evaluates `[operation, ...arguments]` in Rust; false means the caller keeps its PHP result.
+     *
+     * @param  list<mixed>  $request
+     *
+     * @param-out mixed $result
+     */
+    private static function callNative(array $request, mixed &$result = null): bool
+    {
+        $ffi = self::nativeFfi();
+        if (! $ffi instanceof FFI) {
+            return false;
+        }
+
+        try {
+            $json = json_encode($request, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION | JSON_THROW_ON_ERROR);
+            $capacity = max(256, strlen($json) * 2 + 256);
+            for ($attempt = 0; $attempt < 2; $attempt++) {
+                $buffer = $ffi->new("uint8_t[{$capacity}]");
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w31_benchmark_binaries_cbp_reset_commands($json, strlen($json), $buffer, $capacity);
+                if (! is_int($written) || $written === -1 || $written === 0) {
+                    return false;
+                }
+                if ($written < 0) {
+                    $capacity = -$written;
+
+                    continue;
+                }
+                $decoded = json_decode(FFI::string($buffer, $written), true, 8, JSON_THROW_ON_ERROR);
+                if (! is_array($decoded) || count($decoded) !== 1 || ! array_key_exists(0, $decoded)) {
+                    return false;
+                }
+                $result = $decoded[0];
+
+                return true;
+            }
+        } catch (Throwable) {
+            return false;
+        }
+
+        return false;
+    }
+
+    private static function nativeFfi(): ?FFI
+    {
+        if (self::$ffi === false) {
+            return null;
+        }
+        if (self::$ffi instanceof FFI) {
+            return self::$ffi;
+        }
+        $ffi = RustPipelineLibrary::resolveDomain('cleaning', self::FFI_CDEF);
+        self::$ffi = $ffi ?? false;
+
+        return $ffi;
     }
 }
