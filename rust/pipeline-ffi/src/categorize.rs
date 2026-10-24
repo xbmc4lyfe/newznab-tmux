@@ -11268,3 +11268,1293 @@ pub mod categorization_pipes_and_groups {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// AbstractCategorizationPipe, Prometheus\MetricFamily, TmuxSnapshotCollector,
+// CollectionDowntimeCompensator, and SiteStatusService helpers
+// ---------------------------------------------------------------------------
+
+pub mod categorize_metrics_and_status {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    use super::strip_trailing_pcre_newline;
+    use crate::OutCursor;
+
+    pub const DECLINED: isize = -1;
+    pub const CATEGORY_OTHER_MISC: i64 = 10;
+
+    #[inline]
+    unsafe fn input<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len > isize::MAX as usize {
+            None
+        } else if len == 0 {
+            Some(&[])
+        } else if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { slice::from_raw_parts(ptr, len) })
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_valid_prometheus_metric_name(name: &[u8]) -> bool {
+        let s = strip_trailing_pcre_newline(name);
+        !s.is_empty()
+            && (s[0].is_ascii_alphabetic() || s[0] == b'_' || s[0] == b':')
+            && s[1..]
+                .iter()
+                .all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b':')
+    }
+
+    #[inline]
+    pub(crate) fn is_valid_prometheus_label_name(label: &[u8]) -> bool {
+        let s = strip_trailing_pcre_newline(label);
+        !s.is_empty()
+            && (s[0].is_ascii_alphabetic() || s[0] == b'_')
+            && s[1..].iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_')
+    }
+
+    #[inline]
+    fn push_usize_decimal(mut val: usize, out: &mut OutCursor<'_>) {
+        if val == 0 {
+            out.push(b'0');
+            return;
+        }
+        let mut digits = [0u8; 20];
+        let mut pos = digits.len();
+        while val > 0 {
+            pos -= 1;
+            digits[pos] = b'0' + (val % 10) as u8;
+            val /= 10;
+        }
+        out.extend(&digits[pos..]);
+    }
+
+    #[inline]
+    pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
+        let z = z + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = (z - era * 146_097) as u64;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+        let y = (yoe as i64) + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let year = if m <= 2 { y + 1 } else { y };
+        (year, m as u32, d as u32)
+    }
+
+    #[inline]
+    fn is_leap_year(year: i64) -> bool {
+        (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+    }
+
+    #[inline]
+    fn days_in_month(year: i64, month: u32) -> u32 {
+        match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 => {
+                if is_leap_year(year) {
+                    29
+                } else {
+                    28
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+        let y = if month <= 2 { year - 1 } else { year };
+        let era = if y >= 0 { y } else { y - 399 } / 400;
+        let yoe = (y - era * 400) as u64;
+        let m = month as u64;
+        let d = day as u64;
+        let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146_097 + (doe as i64) - 719_468
+    }
+
+    #[inline]
+    fn parse_two_digits(bytes: &[u8]) -> Option<u32> {
+        if bytes.len() != 2 || !bytes[0].is_ascii_digit() || !bytes[1].is_ascii_digit() {
+            return None;
+        }
+        Some(((bytes[0] - b'0') as u32) * 10 + ((bytes[1] - b'0') as u32))
+    }
+
+    #[inline]
+    fn parse_four_digits(bytes: &[u8]) -> Option<i64> {
+        if bytes.len() != 4 || !bytes.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        Some(
+            ((bytes[0] - b'0') as i64) * 1000
+                + ((bytes[1] - b'0') as i64) * 100
+                + ((bytes[2] - b'0') as i64) * 10
+                + ((bytes[3] - b'0') as i64),
+        )
+    }
+
+    #[inline]
+    pub(crate) fn parse_civil_ymdhms(raw: &[u8]) -> Option<i64> {
+        if raw.len() < 19 {
+            return None;
+        }
+        let s = &raw[..19];
+        if s[4] != b'-' || s[7] != b'-' || s[10] != b' ' || s[13] != b':' || s[16] != b':' {
+            return None;
+        }
+        let year = parse_four_digits(&s[0..4])?;
+        let month = parse_two_digits(&s[5..7])?;
+        let day = parse_two_digits(&s[8..10])?;
+        let hour = parse_two_digits(&s[11..13])?;
+        let minute = parse_two_digits(&s[14..16])?;
+        let second = parse_two_digits(&s[17..19])?;
+
+        if !(1..=12).contains(&month) {
+            return None;
+        }
+        let max_day = days_in_month(year, month);
+        if day < 1 || day > max_day || hour > 23 || minute > 59 || second > 59 {
+            return None;
+        }
+
+        let days = days_from_civil(year, month, day);
+        let day_secs = days.checked_mul(86_400)?;
+        let hms_secs = (hour as i64) * 3600 + (minute as i64) * 60 + (second as i64);
+        day_secs.checked_add(hms_secs)
+    }
+
+    #[inline]
+    pub(crate) fn service_status_severity(raw: &[u8]) -> Option<i32> {
+        match raw {
+            b"operational" => Some(0),
+            b"degraded" => Some(1),
+            b"maintenance" => Some(2),
+            b"partial_outage" => Some(3),
+            b"major_outage" => Some(4),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn map_incident_impact_severity(raw: &[u8]) -> Option<i32> {
+        match raw {
+            b"none" | b"minor" => Some(1),
+            b"major" => Some(3),
+            b"critical" => Some(4),
+            _ => None,
+        }
+    }
+
+    // -- C ABI -------------------------------------------------------------------------------
+
+    /// Evaluate `AbstractCategorizationPipe` skip guard (`shouldStopProcessing` or `shouldSkip`).
+    ///
+    /// # Safety
+    ///
+    /// Scalar arguments only; safe to call from C.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_categorize_pipe_should_skip(
+        locked_to_misc: u32,
+        confidence: f64,
+        pipe_skip: u32,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if locked_to_misc > 1 || pipe_skip > 1 {
+                return -1;
+            }
+            i32::from(locked_to_misc == 1 || confidence >= 0.95 || pipe_skip == 1)
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Normalize result metadata for `AbstractCategorizationPipe::matched()` and `noMatch()`.
+    ///
+    /// # Safety
+    ///
+    /// `matched_by_ptr` must be valid for `matched_by_len` reads when `is_no_match == 0`,
+    /// `out_category_id` and `out_confidence` must be non-null writable pointers, and `out_buf`
+    /// must be valid for `out_cap` writes when `out_cap > 0`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_categorize_pipe_format_result_meta(
+        is_no_match: u32,
+        category_id: i64,
+        confidence: f64,
+        matched_by_ptr: *const u8,
+        matched_by_len: usize,
+        out_category_id: *mut i64,
+        out_confidence: *mut f64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if is_no_match > 1
+                || out_category_id.is_null()
+                || !out_category_id.is_aligned()
+                || out_confidence.is_null()
+                || !out_confidence.is_aligned()
+                || out_cap > isize::MAX as usize
+                || (out_cap > 0 && out_buf.is_null())
+            {
+                return DECLINED;
+            }
+
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            if is_no_match == 1 {
+                unsafe {
+                    *out_category_id = CATEGORY_OTHER_MISC;
+                    *out_confidence = 0.0;
+                }
+                cursor.extend(b"no_match");
+            } else {
+                let Some(matched_by) = (unsafe { input(matched_by_ptr, matched_by_len) }) else {
+                    return DECLINED;
+                };
+                unsafe {
+                    *out_category_id = category_id;
+                    *out_confidence = confidence;
+                }
+                cursor.extend(matched_by);
+            }
+
+            match cursor.pos {
+                n if n <= cursor.buf.len() => n as isize,
+                n if n <= isize::MAX as usize => -(n.max(2) as isize),
+                _ => DECLINED,
+            }
+        }))
+        .unwrap_or(DECLINED)
+    }
+
+    /// Validate a Prometheus `MetricFamily` name and type (`gauge` => 1, `counter` => 2,
+    /// `-2` invalid metric name, `-3` unsupported metric type, `-1` null/invalid input).
+    ///
+    /// # Safety
+    ///
+    /// `name_ptr` and `type_ptr` must be valid for their respective byte lengths when non-null.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_prometheus_validate_metric_definition(
+        name_ptr: *const u8,
+        name_len: usize,
+        type_ptr: *const u8,
+        type_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let (Some(name), Some(metric_type)) =
+                (unsafe { (input(name_ptr, name_len), input(type_ptr, type_len)) })
+            else {
+                return -1;
+            };
+            if !is_valid_prometheus_metric_name(name) {
+                return -2;
+            }
+            match metric_type {
+                b"gauge" => 1,
+                b"counter" => 2,
+                _ => -3,
+            }
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Validate and normalize NUL-separated `(label, value)` pairs for `MetricFamily::add()`.
+    /// Returns `>= 0` written byte length on success, `-2` when a label name is invalid (writing its
+    /// pair index into `out_invalid_index`), `< -2` when `out_cap` is too small, or `-1` on invalid args.
+    ///
+    /// # Safety
+    ///
+    /// `input_ptr` must be valid for `input_len` reads, `out_invalid_index` must be writable when non-null,
+    /// and `out_buf` must be valid for `out_cap` writes when `out_cap > 0`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_prometheus_normalize_labels_nul(
+        input_ptr: *const u8,
+        input_len: usize,
+        pair_count: usize,
+        out_invalid_index: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !out_invalid_index.is_null() {
+                if !out_invalid_index.is_aligned() {
+                    return DECLINED;
+                }
+                unsafe {
+                    *out_invalid_index = usize::MAX;
+                }
+            }
+            if pair_count > (isize::MAX as usize) / 2
+                || out_cap > isize::MAX as usize
+                || (out_cap > 0 && out_buf.is_null())
+            {
+                return DECLINED;
+            }
+            if pair_count == 0 {
+                return if input_len == 0 { 0 } else { DECLINED };
+            }
+            let Some(raw) = (unsafe { input(input_ptr, input_len) }) else {
+                return DECLINED;
+            };
+            let expected_tokens = pair_count * 2;
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            let mut token_idx = 0usize;
+            let mut current_label: &[u8] = &[];
+
+            for part in raw.split(|&b| b == 0) {
+                if token_idx >= expected_tokens {
+                    return DECLINED;
+                }
+                if token_idx % 2 == 0 {
+                    let pair_idx = token_idx / 2;
+                    if !is_valid_prometheus_label_name(part) {
+                        if !out_invalid_index.is_null() {
+                            unsafe {
+                                *out_invalid_index = pair_idx;
+                            }
+                        }
+                        return -2;
+                    }
+                    current_label = part;
+                } else {
+                    if token_idx > 1 {
+                        cursor.push(0);
+                    }
+                    cursor.extend(current_label);
+                    cursor.push(0);
+                    cursor.extend(part);
+                }
+                token_idx += 1;
+            }
+
+            if token_idx != expected_tokens {
+                return DECLINED;
+            }
+
+            match cursor.pos {
+                n if n <= cursor.buf.len() => n as isize,
+                n if n <= isize::MAX as usize => -(n.max(4) as isize),
+                _ => DECLINED,
+            }
+        }))
+        .unwrap_or(DECLINED)
+    }
+
+    /// Compute `max(0, now - collected_at)` for `TmuxSnapshotCollector`, or `-1` on signed overflow.
+    ///
+    /// # Safety
+    ///
+    /// Scalar arguments only; safe to call from C.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tmux_collector_snapshot_age(
+        collected_at: i64,
+        now: i64,
+    ) -> i64 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(diff) = now.checked_sub(collected_at) else {
+                return -1;
+            };
+            diff.max(0)
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Classify NUL-separated `$snapshot['counts']` keys for `TmuxSnapshotCollector`.
+    /// Populates `out_scalar_indices[0..10]`, `out_table_indices[0..4]`, `out_category_indices[0..8]`
+    /// with the key index (or `-1` if absent), and writes `<idx>\t<type>` lines for `process*` keys
+    /// into `out_buf`.
+    ///
+    /// # Safety
+    ///
+    /// `input_ptr` must be valid for `input_len` reads, `out_scalar_indices` for 10 `i32` writes,
+    /// `out_table_indices` for 4 `i32` writes, `out_category_indices` for 8 `i32` writes, and
+    /// `out_buf` for `out_cap` byte writes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tmux_collector_classify_count_keys_nul(
+        input_ptr: *const u8,
+        input_len: usize,
+        count: usize,
+        out_scalar_indices: *mut i32,
+        out_table_indices: *mut i32,
+        out_category_indices: *mut i32,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out_scalar_indices.is_null()
+                || !out_scalar_indices.is_aligned()
+                || out_table_indices.is_null()
+                || !out_table_indices.is_aligned()
+                || out_category_indices.is_null()
+                || !out_category_indices.is_aligned()
+                || count > i32::MAX as usize
+                || out_cap > isize::MAX as usize
+                || (out_cap > 0 && out_buf.is_null())
+            {
+                return DECLINED;
+            }
+
+            let scalars = unsafe { slice::from_raw_parts_mut(out_scalar_indices, 10) };
+            let tables = unsafe { slice::from_raw_parts_mut(out_table_indices, 4) };
+            let categories = unsafe { slice::from_raw_parts_mut(out_category_indices, 8) };
+            scalars.fill(-1);
+            tables.fill(-1);
+            categories.fill(-1);
+
+            if count == 0 {
+                return if input_len == 0 { 0 } else { DECLINED };
+            }
+            let Some(raw) = (unsafe { input(input_ptr, input_len) }) else {
+                return DECLINED;
+            };
+
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            let mut key_idx = 0usize;
+            let mut wrote_backlog = false;
+
+            for key in raw.split(|&b| b == 0) {
+                if key_idx >= count {
+                    return DECLINED;
+                }
+                let idx_i32 = key_idx as i32;
+
+                if let Some(suffix) = key.strip_prefix(b"process") {
+                    if !is_valid_prometheus_label_name(b"type") || suffix.contains(&b'\n') {
+                        return DECLINED;
+                    }
+                    if wrote_backlog {
+                        cursor.push(b'\n');
+                    }
+                    push_usize_decimal(key_idx, &mut cursor);
+                    cursor.push(b'\t');
+                    cursor.extend(suffix);
+                    wrote_backlog = true;
+                }
+
+                match key {
+                    b"collections_table" => tables[0] = idx_i32,
+                    b"binaries_table" => tables[1] = idx_i32,
+                    b"parts_table" => tables[2] = idx_i32,
+                    b"missed_parts_table" => tables[3] = idx_i32,
+                    b"tv" => categories[0] = idx_i32,
+                    b"movies" => categories[1] = idx_i32,
+                    b"audio" => categories[2] = idx_i32,
+                    b"books" => categories[3] = idx_i32,
+                    b"console" => categories[4] = idx_i32,
+                    b"pc" => categories[5] = idx_i32,
+                    b"xxx" => categories[6] = idx_i32,
+                    b"misc" => categories[7] = idx_i32,
+                    b"total_work" => scalars[0] = idx_i32,
+                    b"work" => scalars[1] = idx_i32,
+                    b"work_available" => scalars[2] = idx_i32,
+                    b"releases" => scalars[3] = idx_i32,
+                    b"predb" => scalars[4] = idx_i32,
+                    b"predb_matched" => scalars[5] = idx_i32,
+                    b"nfo" => scalars[6] = idx_i32,
+                    b"renamed" => scalars[7] = idx_i32,
+                    b"active_groups" => scalars[8] = idx_i32,
+                    b"all_groups" => scalars[9] = idx_i32,
+                    _ => {}
+                }
+
+                key_idx += 1;
+            }
+
+            if key_idx != count {
+                return DECLINED;
+            }
+
+            match cursor.pos {
+                n if n <= cursor.buf.len() => n as isize,
+                n if n <= isize::MAX as usize => -(n.max(4) as isize),
+                _ => DECLINED,
+            }
+        }))
+        .unwrap_or(DECLINED)
+    }
+
+    /// Format `CollectionDowntimeCompensator::at()` as `Y-m-d H:i:s` given a Unix timestamp
+    /// and its local timezone UTC offset in seconds.
+    ///
+    /// # Safety
+    ///
+    /// `out_buf` must be valid for `out_cap` writes when `out_cap > 0`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_downtime_format_at(
+        timestamp: i64,
+        utc_offset_seconds: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out_cap > isize::MAX as usize || (out_cap > 0 && out_buf.is_null()) {
+                return DECLINED;
+            }
+            let Some(local_secs) = timestamp.checked_add(utc_offset_seconds) else {
+                return DECLINED;
+            };
+            let days = local_secs.div_euclid(86_400);
+            let sec_of_day = local_secs.rem_euclid(86_400) as u32;
+            let (year, month, day) = civil_from_days(days);
+            if !(0..=9999).contains(&year) {
+                return DECLINED;
+            }
+            let hour = sec_of_day / 3600;
+            let minute = (sec_of_day % 3600) / 60;
+            let second = sec_of_day % 60;
+
+            let mut formatted = [0u8; 19];
+            let y = year as u32;
+            formatted[0] = b'0' + ((y / 1000) % 10) as u8;
+            formatted[1] = b'0' + ((y / 100) % 10) as u8;
+            formatted[2] = b'0' + ((y / 10) % 10) as u8;
+            formatted[3] = b'0' + (y % 10) as u8;
+            formatted[4] = b'-';
+            formatted[5] = b'0' + (month / 10) as u8;
+            formatted[6] = b'0' + (month % 10) as u8;
+            formatted[7] = b'-';
+            formatted[8] = b'0' + (day / 10) as u8;
+            formatted[9] = b'0' + (day % 10) as u8;
+            formatted[10] = b' ';
+            formatted[11] = b'0' + (hour / 10) as u8;
+            formatted[12] = b'0' + (hour % 10) as u8;
+            formatted[13] = b':';
+            formatted[14] = b'0' + (minute / 10) as u8;
+            formatted[15] = b'0' + (minute % 10) as u8;
+            formatted[16] = b':';
+            formatted[17] = b'0' + (second / 10) as u8;
+            formatted[18] = b'0' + (second % 10) as u8;
+
+            let mut cursor = unsafe { OutCursor::new(out_buf, out_cap) };
+            cursor.extend(&formatted);
+            match cursor.pos {
+                n if n <= cursor.buf.len() => n as isize,
+                n => -(n.max(4) as isize),
+            }
+        }))
+        .unwrap_or(DECLINED)
+    }
+
+    /// Parse the first 19 bytes of `dateTime` (`Y-m-d H:i:s`) into civil UTC epoch seconds
+    /// for `CollectionDowntimeCompensator::timestamp()`.
+    /// Returns `1` on valid parse, `0` when format/date is invalid, or `-1` on null pointers.
+    ///
+    /// # Safety
+    ///
+    /// `input_ptr` must be valid for `input_len` reads and `out_civil_epoch` must be non-null.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_downtime_parse_civil_datetime(
+        input_ptr: *const u8,
+        input_len: usize,
+        out_civil_epoch: *mut i64,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out_civil_epoch.is_null() || !out_civil_epoch.is_aligned() {
+                return -1;
+            }
+            let Some(raw) = (unsafe { input(input_ptr, input_len) }) else {
+                return -1;
+            };
+            let Some(epoch) = parse_civil_ymdhms(raw) else {
+                return 0;
+            };
+            unsafe {
+                *out_civil_epoch = epoch;
+            }
+            1
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Compute the largest backward UTC-offset change (`max(0, offsets[i - 1] - offsets[i])`)
+    /// for `CollectionDowntimeCompensator::largestOffsetChange()`, or `-1` on error/overflow.
+    ///
+    /// # Safety
+    ///
+    /// `offsets_ptr` must be valid for `count` reads of `i64` when `count > 0`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_downtime_largest_offset_change(
+        offsets_ptr: *const i64,
+        count: usize,
+    ) -> i64 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if count > (isize::MAX as usize) / std::mem::size_of::<i64>()
+                || (count > 0 && (offsets_ptr.is_null() || !offsets_ptr.is_aligned()))
+            {
+                return -1;
+            }
+            if count < 2 {
+                return 0;
+            }
+            let offsets = unsafe { slice::from_raw_parts(offsets_ptr, count) };
+            let mut largest = 0i64;
+            for i in 1..count {
+                let Some(diff) = offsets[i - 1].checked_sub(offsets[i]) else {
+                    return -1;
+                };
+                if diff > largest {
+                    largest = diff;
+                }
+            }
+            largest
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Evaluate `CollectionDowntimeCompensator::crossesOffsetChange()` from the transition count.
+    /// Pass `-1` when `DateTimeZone::getTransitions()` returned `false`.
+    ///
+    /// # Safety
+    ///
+    /// Scalar argument only; safe to call from C.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_downtime_crosses_offset_change(transition_count: isize) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if transition_count < -1 {
+                return -1;
+            }
+            i32::from(transition_count > 1)
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Select the latest candidate timestamp `<= not_after` (or `first` if none is `<= not_after`)
+    /// for `CollectionDowntimeCompensator::timestampNotAfter()`.
+    ///
+    /// # Safety
+    ///
+    /// `candidates_ptr` must be valid for `count` reads of `i64` when `count > 0`, and
+    /// `out_timestamp` must be non-null.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_downtime_select_timestamp_not_after(
+        first: i64,
+        not_after: i64,
+        candidates_ptr: *const i64,
+        count: usize,
+        out_timestamp: *mut i64,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out_timestamp.is_null()
+                || !out_timestamp.is_aligned()
+                || count > (isize::MAX as usize) / std::mem::size_of::<i64>()
+                || (count > 0 && (candidates_ptr.is_null() || !candidates_ptr.is_aligned()))
+            {
+                return -1;
+            }
+            let mut best_le: Option<i64> = if first <= not_after {
+                Some(first)
+            } else {
+                None
+            };
+            if count > 0 {
+                let candidates = unsafe { slice::from_raw_parts(candidates_ptr, count) };
+                for &cand in candidates {
+                    if cand <= not_after {
+                        best_le = Some(best_le.map_or(cand, |cur| cur.max(cand)));
+                    }
+                }
+            }
+            unsafe {
+                *out_timestamp = best_le.unwrap_or(first);
+            }
+            1
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Verify that `dirname(temporary)` matches `realpath(directory)` for `prepareMarker()`.
+    ///
+    /// # Safety
+    ///
+    /// `temp_dir_ptr` and `real_dir_ptr` must be valid for their respective byte lengths when non-null.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_downtime_verify_marker_dir(
+        temp_dir_ptr: *const u8,
+        temp_dir_len: usize,
+        real_dir_ptr: *const u8,
+        real_dir_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let (Some(temp_dir), Some(real_dir)) = (unsafe {
+                (
+                    input(temp_dir_ptr, temp_dir_len),
+                    input(real_dir_ptr, real_dir_len),
+                )
+            }) else {
+                return -1;
+            };
+            i32::from(!real_dir.is_empty() && temp_dir == real_dir)
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Verify byte count, `fflush`, and `fsync` completion for `prepareMarker()`.
+    ///
+    /// # Safety
+    ///
+    /// Scalar arguments only; safe to call from C.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_downtime_verify_marker_write(
+        expected_len: usize,
+        written_bytes: isize,
+        flushed: u32,
+        synced: u32,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if expected_len > isize::MAX as usize || flushed > 1 || synced > 1 {
+                return -1;
+            }
+            i32::from(
+                written_bytes >= 0
+                    && (written_bytes as usize) == expected_len
+                    && flushed == 1
+                    && synced == 1,
+            )
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Merge overlapping/adjacent `[start, end]` intervals for `SiteStatusService::mergeIntervals()`.
+    /// Returns the number of merged intervals written into `out_pairs_ptr` (`>= 0`),
+    /// `< -1` (`-needed_pairs`) when `out_pair_cap` is too small, or `-1` on invalid arguments.
+    ///
+    /// # Safety
+    ///
+    /// `flat_pairs_ptr` must be valid for `pair_count * 2` reads of `i64` when `pair_count > 0`,
+    /// and `out_pairs_ptr` must be valid for `out_pair_cap * 2` writes of `i64` when `out_pair_cap > 0`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_site_status_merge_intervals(
+        flat_pairs_ptr: *const i64,
+        pair_count: usize,
+        out_pairs_ptr: *mut i64,
+        out_pair_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            let max_pairs = (isize::MAX as usize) / (2 * std::mem::size_of::<i64>());
+            if pair_count > max_pairs
+                || out_pair_cap > max_pairs
+                || (out_pair_cap > 0 && (out_pairs_ptr.is_null() || !out_pairs_ptr.is_aligned()))
+            {
+                return DECLINED;
+            }
+            if pair_count == 0 {
+                return 0;
+            }
+            if flat_pairs_ptr.is_null() || !flat_pairs_ptr.is_aligned() {
+                return DECLINED;
+            }
+
+            let raw = unsafe { slice::from_raw_parts(flat_pairs_ptr, pair_count * 2) };
+            let mut pairs: Vec<(i64, i64)> = Vec::with_capacity(pair_count);
+            for i in 0..pair_count {
+                pairs.push((raw[i * 2], raw[i * 2 + 1]));
+            }
+
+            pairs.sort_by_key(|&(start, _)| start);
+
+            let mut merged: Vec<(i64, i64)> = Vec::with_capacity(pair_count);
+            merged.push(pairs[0]);
+            for &(s, e) in &pairs[1..] {
+                let last = merged.last_mut().unwrap();
+                if s <= last.1 {
+                    if e > last.1 {
+                        last.1 = e;
+                    }
+                } else {
+                    merged.push((s, e));
+                }
+            }
+
+            let merged_len = merged.len();
+            if merged_len > out_pair_cap {
+                return -(merged_len.max(2) as isize);
+            }
+
+            let out = unsafe { slice::from_raw_parts_mut(out_pairs_ptr, merged_len * 2) };
+            for (idx, &(s, e)) in merged.iter().enumerate() {
+                out[idx * 2] = s;
+                out[idx * 2 + 1] = e;
+            }
+
+            merged_len as isize
+        }))
+        .unwrap_or(DECLINED)
+    }
+
+    /// Reduce NUL-separated `ServiceStatusEnum` values to the worst severity code (`0..=4`)
+    /// for `SiteStatusService::aggregateWorstStatus()`, or `-1` on invalid input.
+    ///
+    /// # Safety
+    ///
+    /// `input_ptr` must be valid for `input_len` reads when `input_len > 0`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_site_status_aggregate_worst_nul(
+        input_ptr: *const u8,
+        input_len: usize,
+        count: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if count > isize::MAX as usize {
+                return -1;
+            }
+            if count == 0 {
+                return if input_len == 0 { 0 } else { -1 };
+            }
+            let Some(raw) = (unsafe { input(input_ptr, input_len) }) else {
+                return -1;
+            };
+            let mut seen = 0usize;
+            let mut worst = 0i32;
+            for part in raw.split(|&b| b == 0) {
+                if seen >= count {
+                    return -1;
+                }
+                let Some(sev) = service_status_severity(part) else {
+                    return -1;
+                };
+                if sev > worst {
+                    worst = sev;
+                }
+                seen += 1;
+            }
+            if seen != count {
+                return -1;
+            }
+            worst
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Map an `IncidentImpactEnum` value (`none`, `minor`, `major`, `critical`) to its
+    /// `ServiceStatusEnum` severity code (`1`, `3`, `4`), or `-1` on unknown/invalid input.
+    ///
+    /// # Safety
+    ///
+    /// `impact_ptr` must be valid for `impact_len` reads when non-null.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_site_status_map_incident_impact(
+        impact_ptr: *const u8,
+        impact_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(impact) = (unsafe { input(impact_ptr, impact_len) }) else {
+                return -1;
+            };
+            map_incident_impact_severity(impact).unwrap_or(-1)
+        }))
+        .unwrap_or(-1)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn pipe_and_prometheus_helpers_match_php_contracts() {
+            assert_eq!(
+                unsafe { nntmux_categorize_pipe_should_skip(0, 0.94, 0) },
+                0
+            );
+            assert_eq!(
+                unsafe { nntmux_categorize_pipe_should_skip(0, 0.95, 0) },
+                1
+            );
+            assert_eq!(
+                unsafe { nntmux_categorize_pipe_should_skip(0, 0.10, 1) },
+                1
+            );
+            assert_eq!(
+                unsafe { nntmux_categorize_pipe_should_skip(2, 0.50, 0) },
+                -1
+            );
+
+            let mut cat_id = 0i64;
+            let mut conf = 0.0f64;
+            let mut buf = [0u8; 64];
+            let n = unsafe {
+                nntmux_categorize_pipe_format_result_meta(
+                    1,
+                    5040,
+                    0.9,
+                    std::ptr::null(),
+                    0,
+                    &mut cat_id,
+                    &mut conf,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            } as usize;
+            assert_eq!(cat_id, 10);
+            assert_eq!(conf, 0.0);
+            assert_eq!(&buf[..n], b"no_match");
+
+            let n = unsafe {
+                nntmux_categorize_pipe_format_result_meta(
+                    0,
+                    2040,
+                    0.85,
+                    b"movie_hd".as_ptr(),
+                    8,
+                    &mut cat_id,
+                    &mut conf,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            } as usize;
+            assert_eq!(cat_id, 2040);
+            assert_eq!(conf, 0.85);
+            assert_eq!(&buf[..n], b"movie_hd");
+
+            assert_eq!(
+                unsafe {
+                    nntmux_prometheus_validate_metric_definition(
+                        b"nntmux:backlog_total".as_ptr(),
+                        20,
+                        b"gauge".as_ptr(),
+                        5,
+                    )
+                },
+                1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_prometheus_validate_metric_definition(
+                        b"nntmux_counter".as_ptr(),
+                        14,
+                        b"counter".as_ptr(),
+                        7,
+                    )
+                },
+                2
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_prometheus_validate_metric_definition(
+                        b"bad-name".as_ptr(),
+                        8,
+                        b"gauge".as_ptr(),
+                        5,
+                    )
+                },
+                -2
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_prometheus_validate_metric_definition(
+                        b"nntmux_ok".as_ptr(),
+                        9,
+                        b"summary".as_ptr(),
+                        7,
+                    )
+                },
+                -3
+            );
+
+            let mut bad_idx = usize::MAX;
+            let pairs = b"server\0primary\0state\0active";
+            let n = unsafe {
+                nntmux_prometheus_normalize_labels_nul(
+                    pairs.as_ptr(),
+                    pairs.len(),
+                    2,
+                    &mut bad_idx,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            } as usize;
+            assert_eq!(&buf[..n], pairs);
+
+            let bad_pairs = b"valid_1\0ok\0bad-label\0val";
+            let rc = unsafe {
+                nntmux_prometheus_normalize_labels_nul(
+                    bad_pairs.as_ptr(),
+                    bad_pairs.len(),
+                    2,
+                    &mut bad_idx,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(rc, -2);
+            assert_eq!(bad_idx, 1);
+        }
+
+        #[test]
+        fn collector_downtime_and_site_status_helpers_match_php_contracts() {
+            assert_eq!(
+                unsafe { nntmux_tmux_collector_snapshot_age(1_700_000_000, 1_700_000_045) },
+                45
+            );
+            assert_eq!(
+                unsafe { nntmux_tmux_collector_snapshot_age(1_700_000_050, 1_700_000_000) },
+                0
+            );
+
+            let keys = b"processnfo\0collections_table\0tv\0releases\0processtv";
+            let mut scalars = [0i32; 10];
+            let mut tables = [0i32; 4];
+            let mut cats = [0i32; 8];
+            let mut buf = [0u8; 128];
+            let n = unsafe {
+                nntmux_tmux_collector_classify_count_keys_nul(
+                    keys.as_ptr(),
+                    keys.len(),
+                    5,
+                    scalars.as_mut_ptr(),
+                    tables.as_mut_ptr(),
+                    cats.as_mut_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            } as usize;
+            assert_eq!(&buf[..n], b"0\tnfo\n4\ttv");
+            assert_eq!(tables[0], 1);
+            assert_eq!(cats[0], 2);
+            assert_eq!(scalars[3], 3);
+
+            let n = unsafe {
+                nntmux_downtime_format_at(1_791_720_000, 0, buf.as_mut_ptr(), buf.len())
+            } as usize;
+            assert_eq!(&buf[..n], b"2026-10-11 12:00:00");
+
+            let mut epoch = 0i64;
+            assert_eq!(
+                unsafe {
+                    nntmux_downtime_parse_civil_datetime(
+                        b"2026-10-11 12:00:00".as_ptr(),
+                        19,
+                        &mut epoch,
+                    )
+                },
+                1
+            );
+            assert_eq!(epoch, 1_791_720_000);
+
+            let offsets = [-14_400i64, -18_000i64, -14_400i64];
+            assert_eq!(
+                unsafe { nntmux_downtime_largest_offset_change(offsets.as_ptr(), offsets.len()) },
+                3600
+            );
+            assert_eq!(unsafe { nntmux_downtime_crosses_offset_change(1) }, 0);
+            assert_eq!(unsafe { nntmux_downtime_crosses_offset_change(2) }, 1);
+
+            let cands = [1_000i64, 4_600i64];
+            let mut chosen = 0i64;
+            assert_eq!(
+                unsafe {
+                    nntmux_downtime_select_timestamp_not_after(
+                        1_000,
+                        5_000,
+                        cands.as_ptr(),
+                        cands.len(),
+                        &mut chosen,
+                    )
+                },
+                1
+            );
+            assert_eq!(chosen, 4_600);
+
+            let intervals = [100i64, 200, 150, 300, 400, 500, 50, 80];
+            let mut merged = [0i64; 8];
+            let m_count = unsafe {
+                nntmux_site_status_merge_intervals(
+                    intervals.as_ptr(),
+                    4,
+                    merged.as_mut_ptr(),
+                    4,
+                )
+            } as usize;
+            assert_eq!(m_count, 3);
+            assert_eq!(&merged[..6], &[50, 80, 100, 300, 400, 500]);
+
+            let statuses = b"operational\0degraded\0partial_outage\0maintenance";
+            assert_eq!(
+                unsafe {
+                    nntmux_site_status_aggregate_worst_nul(statuses.as_ptr(), statuses.len(), 4)
+                },
+                3
+            );
+            assert_eq!(
+                unsafe { nntmux_site_status_map_incident_impact(b"critical".as_ptr(), 8) },
+                4
+            );
+        }
+
+        #[test]
+        fn unaligned_pointers_are_rejected_across_ffi_entrypoints() {
+            let mut raw = [0u8; 256];
+            let unaligned_i64 = unsafe { raw.as_mut_ptr().add(1).cast::<i64>() };
+            let unaligned_f64 = unsafe { raw.as_mut_ptr().add(1).cast::<f64>() };
+            let unaligned_usize = unsafe { raw.as_mut_ptr().add(1).cast::<usize>() };
+            let unaligned_i32 = unsafe { raw.as_mut_ptr().add(1).cast::<i32>() };
+            let mut aligned_i64 = 0i64;
+            let mut aligned_f64 = 0.0f64;
+            let mut aligned_i32_10 = [0i32; 10];
+            let mut aligned_i32_4 = [0i32; 4];
+            let mut aligned_i32_8 = [0i32; 8];
+            let mut buf = [0u8; 64];
+
+            assert_eq!(
+                unsafe {
+                    nntmux_categorize_pipe_format_result_meta(
+                        1,
+                        5040,
+                        0.9,
+                        std::ptr::null(),
+                        0,
+                        unaligned_i64,
+                        &mut aligned_f64,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_categorize_pipe_format_result_meta(
+                        1,
+                        5040,
+                        0.9,
+                        std::ptr::null(),
+                        0,
+                        &mut aligned_i64,
+                        unaligned_f64,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                -1
+            );
+
+            let pairs = b"server\0primary";
+            assert_eq!(
+                unsafe {
+                    nntmux_prometheus_normalize_labels_nul(
+                        pairs.as_ptr(),
+                        pairs.len(),
+                        1,
+                        unaligned_usize,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                -1
+            );
+
+            let keys = b"tv";
+            assert_eq!(
+                unsafe {
+                    nntmux_tmux_collector_classify_count_keys_nul(
+                        keys.as_ptr(),
+                        keys.len(),
+                        1,
+                        unaligned_i32,
+                        aligned_i32_4.as_mut_ptr(),
+                        aligned_i32_8.as_mut_ptr(),
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_tmux_collector_classify_count_keys_nul(
+                        keys.as_ptr(),
+                        keys.len(),
+                        1,
+                        aligned_i32_10.as_mut_ptr(),
+                        unaligned_i32,
+                        aligned_i32_8.as_mut_ptr(),
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_tmux_collector_classify_count_keys_nul(
+                        keys.as_ptr(),
+                        keys.len(),
+                        1,
+                        aligned_i32_10.as_mut_ptr(),
+                        aligned_i32_4.as_mut_ptr(),
+                        unaligned_i32,
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                },
+                -1
+            );
+
+            assert_eq!(
+                unsafe {
+                    nntmux_downtime_parse_civil_datetime(
+                        b"2026-10-11 12:00:00".as_ptr(),
+                        19,
+                        unaligned_i64,
+                    )
+                },
+                -1
+            );
+
+            assert_eq!(
+                unsafe { nntmux_downtime_largest_offset_change(unaligned_i64.cast_const(), 2) },
+                -1
+            );
+
+            let cands = [1_000i64, 2_000i64];
+            assert_eq!(
+                unsafe {
+                    nntmux_downtime_select_timestamp_not_after(
+                        1_000,
+                        2_000,
+                        unaligned_i64.cast_const(),
+                        2,
+                        &mut aligned_i64,
+                    )
+                },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_downtime_select_timestamp_not_after(
+                        1_000,
+                        2_000,
+                        cands.as_ptr(),
+                        2,
+                        unaligned_i64,
+                    )
+                },
+                -1
+            );
+
+            let mut out_pairs = [0i64; 4];
+            assert_eq!(
+                unsafe {
+                    nntmux_site_status_merge_intervals(
+                        unaligned_i64.cast_const(),
+                        1,
+                        out_pairs.as_mut_ptr(),
+                        2,
+                    )
+                },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_site_status_merge_intervals(cands.as_ptr(), 1, unaligned_i64, 2)
+                },
+                -1
+            );
+        }
+    }
+}
+
