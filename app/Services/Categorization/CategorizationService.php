@@ -6,7 +6,9 @@ namespace App\Services\Categorization;
 
 use App\Models\Category;
 use App\Services\Categorization\Pipes\AbstractCategorizationPipe;
+use App\Support\RustPipelineLibrary;
 use Blacklight\Categorize;
+use FFI;
 
 /**
  * Categorization service using Laravel Pipeline.
@@ -16,7 +18,42 @@ use Blacklight\Categorize;
  */
 class CategorizationService
 {
+    public const string FFI_CDEF = <<<'C'
+        int32_t nntmux_categorize_passable_should_stop(uint32_t locked_to_misc, double confidence);
+        int32_t nntmux_categorize_passable_should_update_best(int64_t cand_cat_id, double cand_conf, const char *cand_matched_ptr, size_t cand_matched_len, int64_t best_cat_id, double best_conf, const char *best_matched_ptr, size_t best_matched_len);
+        ssize_t nntmux_categorize_passable_pack_summary(uint32_t debug, const char *matched_by_ptr, size_t matched_by_len, const char *release_name_ptr, size_t release_name_len, const char *group_name_ptr, size_t group_name_len, char *out_buf, size_t out_cap);
+        int32_t nntmux_categorize_misc_pipe_should_lock(int64_t category_id, const char *matched_by_ptr, size_t matched_by_len);
+        int32_t nntmux_categorize_safety_net_should_downgrade(uint32_t locked_to_misc, uint32_t low_signal, const char *matched_by_ptr, size_t matched_by_len);
+        ssize_t nntmux_categorize_service_compare_summary(int64_t pipeline_cat_id, uint32_t has_pipeline_title, const char *pipeline_title_ptr, size_t pipeline_title_len, int64_t legacy_cat_id, uint32_t has_legacy_title, const char *legacy_title_ptr, size_t legacy_title_len, uint32_t legacy_state, char *out_buf, size_t out_cap);
+        int32_t nntmux_category_is_parent_id(int64_t cid);
+        int32_t nntmux_category_is_parent_str(const char *input_ptr, size_t input_len);
+        ssize_t nntmux_category_others_group(char *out_buf, size_t out_cap);
+        int32_t nntmux_category_value(const char *name_ptr, size_t name_len);
+        ssize_t nntmux_usenet_group_normalize_valid(const char *name_ptr, size_t name_len, char *out_buf, size_t out_cap);
+        ssize_t nntmux_usenet_group_format_status_message(int64_t id, int64_t status, char *out_buf, size_t out_cap);
+        C;
+
+    public static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
+
     protected CategorizationPipeline $pipeline;
+
+    public static function setUseRustFfi(bool $useRustFfi): void
+    {
+        self::$useRustFfi = $useRustFfi;
+    }
+
+    public static function categorizeFfi(): ?FFI
+    {
+        if (self::$ffi !== null) {
+            return self::$ffi === false ? null : self::$ffi;
+        }
+
+        self::$ffi = RustPipelineLibrary::resolveDomain('categorize', self::FFI_CDEF) ?? false;
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
 
     public function __construct(?CategorizationPipeline $pipeline = null)
     {
@@ -97,29 +134,88 @@ class CategorizationService
      */
     public function compare(int|string $groupId, string $releaseName): array
     {
-        // Run the new pipeline categorization
-        $pipelineResult = $this->determineCategory($groupId, $releaseName);
-        $pipelineCategoryId = $pipelineResult['categories_id'];
-        $pipelineCategory = Category::find($pipelineCategoryId);
-        $pipelineCategoryName = $pipelineCategory ? $pipelineCategory->title : 'Unknown';
+        return self::$useRustFfi
+            ? $this->compareNative($groupId, $releaseName)
+            : $this->comparePhp($groupId, $releaseName);
+    }
 
-        // Attempt legacy categorization if the class still exists
-        $legacyCategoryId = Category::OTHER_MISC;
-        $legacyCategoryName = 'Unknown';
+    /**
+     * @return array{pipeline: array{category_id: int, category_name: string}, legacy: array{category_id: int, category_name: string}, match: bool}
+     */
+    public function comparePhp(int|string $groupId, string $releaseName): array
+    {
+        [$pipelineCategoryId, $pipelineCategoryTitle, $legacyCategoryId, $legacyCategoryTitle, $legacyState] = $this->resolveComparisonInputs($groupId, $releaseName);
 
-        if (class_exists(Categorize::class)) {
-            try {
-                $legacy = new Categorize;
-                /** @var int $legacyCategoryId */
-                $legacyCategoryId = (int) $legacy->determineCategory($groupId, $releaseName);
-                $legacyCategory = Category::find($legacyCategoryId);
-                $legacyCategoryName = $legacyCategory ? $legacyCategory->title : 'Unknown';
-            } catch (\Throwable) {
-                $legacyCategoryName = 'Legacy error';
-            }
-        } else {
-            $legacyCategoryName = 'Legacy unavailable';
-        }
+        return $this->buildComparisonResultPhp(
+            $pipelineCategoryId,
+            $pipelineCategoryTitle,
+            $legacyCategoryId,
+            $legacyCategoryTitle,
+            $legacyState
+        );
+    }
+
+    /**
+     * @return array{pipeline: array{category_id: int, category_name: string}, legacy: array{category_id: int, category_name: string}, match: bool}
+     */
+    public function compareNative(int|string $groupId, string $releaseName): array
+    {
+        [$pipelineCategoryId, $pipelineCategoryTitle, $legacyCategoryId, $legacyCategoryTitle, $legacyState] = $this->resolveComparisonInputs($groupId, $releaseName);
+
+        return $this->buildComparisonResultNative(
+            $pipelineCategoryId,
+            $pipelineCategoryTitle,
+            $legacyCategoryId,
+            $legacyCategoryTitle,
+            $legacyState
+        );
+    }
+
+    /**
+     * Build the comparison diff array between pipeline and legacy categorization results.
+     *
+     * @return array{pipeline: array{category_id: int, category_name: string}, legacy: array{category_id: int, category_name: string}, match: bool}
+     */
+    public function buildComparisonResult(
+        int $pipelineCategoryId,
+        ?string $pipelineCategoryTitle,
+        int $legacyCategoryId,
+        ?string $legacyCategoryTitle,
+        int $legacyState = 0
+    ): array {
+        return self::$useRustFfi
+            ? $this->buildComparisonResultNative(
+                $pipelineCategoryId,
+                $pipelineCategoryTitle,
+                $legacyCategoryId,
+                $legacyCategoryTitle,
+                $legacyState
+            )
+            : $this->buildComparisonResultPhp(
+                $pipelineCategoryId,
+                $pipelineCategoryTitle,
+                $legacyCategoryId,
+                $legacyCategoryTitle,
+                $legacyState
+            );
+    }
+
+    /**
+     * @return array{pipeline: array{category_id: int, category_name: string}, legacy: array{category_id: int, category_name: string}, match: bool}
+     */
+    public function buildComparisonResultPhp(
+        int $pipelineCategoryId,
+        ?string $pipelineCategoryTitle,
+        int $legacyCategoryId,
+        ?string $legacyCategoryTitle,
+        int $legacyState = 0
+    ): array {
+        $pipelineCategoryName = $pipelineCategoryTitle !== null ? $pipelineCategoryTitle : 'Unknown';
+        $legacyCategoryName = match ($legacyState) {
+            1 => 'Legacy error',
+            2 => 'Legacy unavailable',
+            default => $legacyCategoryTitle !== null ? $legacyCategoryTitle : 'Unknown',
+        };
 
         return [
             'pipeline' => [
@@ -132,6 +228,162 @@ class CategorizationService
             ],
             'match' => $pipelineCategoryId === $legacyCategoryId,
         ];
+    }
+
+    /**
+     * @return array{pipeline: array{category_id: int, category_name: string}, legacy: array{category_id: int, category_name: string}, match: bool}
+     */
+    public function buildComparisonResultNative(
+        int $pipelineCategoryId,
+        ?string $pipelineCategoryTitle,
+        int $legacyCategoryId,
+        ?string $legacyCategoryTitle,
+        int $legacyState = 0
+    ): array {
+        if (! \in_array($legacyState, [0, 1, 2], true)) {
+            $legacyState = 0;
+        }
+        $ffi = self::categorizeFfi();
+        if ($ffi === null) {
+            return $this->buildComparisonResultPhp(
+                $pipelineCategoryId,
+                $pipelineCategoryTitle,
+                $legacyCategoryId,
+                $legacyCategoryTitle,
+                $legacyState
+            );
+        }
+
+        $pStr = $pipelineCategoryTitle ?? '';
+        $lStr = $legacyCategoryTitle ?? '';
+        $pLen = \strlen($pStr);
+        $lLen = \strlen($lStr);
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(256, $pLen + $lLen + 64), $cap);
+        if ($scratch === null) {
+            return $this->buildComparisonResultPhp(
+                $pipelineCategoryId,
+                $pipelineCategoryTitle,
+                $legacyCategoryId,
+                $legacyCategoryTitle,
+                $legacyState
+            );
+        }
+
+        // @phpstan-ignore method.notFound
+        $written = $ffi->nntmux_categorize_service_compare_summary(
+            $pipelineCategoryId,
+            $pipelineCategoryTitle !== null ? 1 : 0,
+            $pStr,
+            $pLen,
+            $legacyCategoryId,
+            $legacyCategoryTitle !== null ? 1 : 0,
+            $lStr,
+            $lLen,
+            $legacyState,
+            $scratch,
+            $cap
+        );
+        if (\is_int($written) && $written < -1) {
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+            if ($scratch === null) {
+                return $this->buildComparisonResultPhp(
+                    $pipelineCategoryId,
+                    $pipelineCategoryTitle,
+                    $legacyCategoryId,
+                    $legacyCategoryTitle,
+                    $legacyState
+                );
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_categorize_service_compare_summary(
+                $pipelineCategoryId,
+                $pipelineCategoryTitle !== null ? 1 : 0,
+                $pStr,
+                $pLen,
+                $legacyCategoryId,
+                $legacyCategoryTitle !== null ? 1 : 0,
+                $lStr,
+                $lLen,
+                $legacyState,
+                $scratch,
+                $cap
+            );
+        }
+        if (! \is_int($written) || $written < 2) {
+            return $this->buildComparisonResultPhp(
+                $pipelineCategoryId,
+                $pipelineCategoryTitle,
+                $legacyCategoryId,
+                $legacyCategoryTitle,
+                $legacyState
+            );
+        }
+
+        $raw = FFI::string($scratch, $written);
+        $sep = strpos($raw, "\0", 1);
+        if ($sep === false) {
+            return $this->buildComparisonResultPhp(
+                $pipelineCategoryId,
+                $pipelineCategoryTitle,
+                $legacyCategoryId,
+                $legacyCategoryTitle,
+                $legacyState
+            );
+        }
+
+        return [
+            'pipeline' => [
+                'category_id' => $pipelineCategoryId,
+                'category_name' => substr($raw, 1, $sep - 1),
+            ],
+            'legacy' => [
+                'category_id' => $legacyCategoryId,
+                'category_name' => substr($raw, $sep + 1),
+            ],
+            'match' => $raw[0] === '1',
+        ];
+    }
+
+    /**
+     * @return array{0: int, 1: ?string, 2: int, 3: ?string, 4: int}
+     */
+    protected function resolveComparisonInputs(int|string $groupId, string $releaseName): array
+    {
+        $pipelineResult = $this->determineCategory($groupId, $releaseName);
+        /** @var int $pipelineCategoryId */
+        $pipelineCategoryId = (int) $pipelineResult['categories_id'];
+        $pipelineCategoryTitle = $this->findCategoryTitle($pipelineCategoryId);
+
+        $legacyCategoryId = Category::OTHER_MISC;
+        $legacyCategoryTitle = null;
+        $legacyState = 0;
+
+        if (class_exists(Categorize::class)) {
+            try {
+                $legacy = new Categorize;
+                /** @var int $legacyCategoryId */
+                $legacyCategoryId = (int) $legacy->determineCategory($groupId, $releaseName);
+                $legacyCategoryTitle = $this->findCategoryTitle($legacyCategoryId);
+            } catch (\Throwable) {
+                $legacyState = 1;
+            }
+        } else {
+            $legacyState = 2;
+        }
+
+        return [$pipelineCategoryId, $pipelineCategoryTitle, $legacyCategoryId, $legacyCategoryTitle, $legacyState];
+    }
+
+    protected function findCategoryTitle(int $categoryId): ?string
+    {
+        try {
+            $category = Category::find($categoryId);
+
+            return $category ? $category->title : null;
+        } catch (\Throwable) {
+            return null;
+        }
     }
 
     /**
