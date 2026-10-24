@@ -9,14 +9,46 @@ use App\Http\Requests\Admin\AdminReleaseListRequest;
 use App\Models\Category;
 use App\Models\Release;
 use App\Services\Releases\ReleaseManagementService;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Foundation\Application;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\Routing\Redirector;
 use Illuminate\View\View;
+use Throwable;
 
 class AdminReleasesController extends BasePageController
 {
+    public const string FFI_CDEF = <<<'CDEF'
+    int32_t nntmux_admin_ctl_release_destroy_redirect(
+        uint8_t has_referer,
+        const char *referer_ptr,
+        size_t referer_len,
+        uint8_t has_intended
+    );
+    ssize_t nntmux_admin_ctl_release_bulk_category_message(int64_t count, char *out_buf, size_t out_cap);
+    CDEF;
+
+    /** Redirect to the home `All` route (the release was deleted from its details page). */
+    public const string REDIRECT_HOME = 'home';
+
+    /** Redirect to the session's `intended_redirect` URL. */
+    public const string REDIRECT_INTENDED = 'intended';
+
+    /** Redirect to the `admin.release-list` route. */
+    public const string REDIRECT_RELEASE_LIST = 'release-list';
+
+    private const array REDIRECT_CODES = [self::REDIRECT_HOME, self::REDIRECT_INTENDED, self::REDIRECT_RELEASE_LIST];
+
+    /**
+     * Production default stays false until benchmark/parity sign-off; see
+     * tests/Unit/RustAdminCategoryReleaseContentControllersParityTest.php.
+     */
+    private static bool $useRustFfi = false;
+
+    private static FFI|false|null $ffi = null;
+
     private ReleaseManagementService $releaseManagement;
 
     public function __construct(ReleaseManagementService $releaseManagement)
@@ -62,7 +94,7 @@ class AdminReleasesController extends BasePageController
             (int) $validated['categories_id'],
         );
 
-        return back()->with('success', $count.' release(s) re-categorised.');
+        return back()->with('success', self::bulkCategoryMessage($count));
     }
 
     /**
@@ -145,15 +177,15 @@ class AdminReleasesController extends BasePageController
                 ], 400);
             }
 
-            // Check if request is coming from the NZB details page
-            $referer = request()->headers->get('referer');
-            if ($referer && str_contains($referer, '/details/')) {
-                // If coming from details page, redirect to home page
+            // Coming from the NZB details page redirects to the home page; otherwise use the
+            // intended URL or the release list.
+            $intended = session('intended_redirect');
+            $target = self::destroyRedirectTarget(request()->headers->get('referer'), $intended !== null);
+            if ($target === self::REDIRECT_HOME) {
                 return redirect()->route('All');
             }
 
-            // Default redirection logic for other cases
-            $redirectUrl = session('intended_redirect') ?? route('admin.release-list');
+            $redirectUrl = $target === self::REDIRECT_INTENDED ? $intended : route('admin.release-list');
             session()->forget('intended_redirect');
 
             return redirect($redirectUrl);
@@ -170,5 +202,138 @@ class AdminReleasesController extends BasePageController
 
             return redirect()->route('admin.release-list');
         }
+    }
+
+    /**
+     * Overrides the base page toggle for this controller's helpers; `null` restores the PHP default.
+     */
+    public static function setUseRustFfi(?bool $useRustFfi): void
+    {
+        self::$useRustFfi = $useRustFfi ?? false;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
+
+    public static function setFfiForTesting(FFI|false|null $ffi): void
+    {
+        self::$ffi = $ffi;
+    }
+
+    /**
+     * `REDIRECT_*` target after a non-AJAX release delete.
+     */
+    public static function destroyRedirectTarget(?string $referer, bool $hasIntended): string
+    {
+        return self::$useRustFfi
+            ? self::destroyRedirectTargetNative($referer, $hasIntended)
+            : self::destroyRedirectTargetPhp($referer, $hasIntended);
+    }
+
+    public static function destroyRedirectTargetPhp(?string $referer, bool $hasIntended): string
+    {
+        if ($referer && str_contains($referer, '/details/')) {
+            return self::REDIRECT_HOME;
+        }
+
+        return $hasIntended ? self::REDIRECT_INTENDED : self::REDIRECT_RELEASE_LIST;
+    }
+
+    public static function destroyRedirectTargetNative(?string $referer, bool $hasIntended): string
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return self::destroyRedirectTargetPhp($referer, $hasIntended);
+        }
+
+        try {
+            $code = self::callFfi(
+                $ffi,
+                'nntmux_admin_ctl_release_destroy_redirect',
+                $referer === null ? 0 : 1,
+                $referer ?? '',
+                \strlen($referer ?? ''),
+                $hasIntended ? 1 : 0
+            );
+
+            return \is_int($code) && isset(self::REDIRECT_CODES[$code])
+                ? self::REDIRECT_CODES[$code]
+                : self::destroyRedirectTargetPhp($referer, $hasIntended);
+        } catch (Throwable) {
+            return self::destroyRedirectTargetPhp($referer, $hasIntended);
+        }
+    }
+
+    public static function bulkCategoryMessage(int $count): string
+    {
+        return self::$useRustFfi ? self::bulkCategoryMessageNative($count) : self::bulkCategoryMessagePhp($count);
+    }
+
+    public static function bulkCategoryMessagePhp(int $count): string
+    {
+        return $count.' release(s) re-categorised.';
+    }
+
+    public static function bulkCategoryMessageNative(int $count): string
+    {
+        $ffi = self::ffi();
+        if ($ffi === null || PHP_INT_SIZE !== 8) {
+            return self::bulkCategoryMessagePhp($count);
+        }
+
+        return self::callForString($ffi, 'nntmux_admin_ctl_release_bulk_category_message', 64, $count)
+            ?? self::bulkCategoryMessagePhp($count);
+    }
+
+    /**
+     * Calls a byte-output export with a scratch buffer, growing it once when Rust reports a larger requirement.
+     */
+    private static function callForString(FFI $ffi, string $symbol, int $estimate, mixed ...$args): ?string
+    {
+        try {
+            $capacity = 0;
+            $outBuf = RustPipelineLibrary::obtainScratch($ffi, max(1, $estimate), $capacity);
+            if ($outBuf === null) {
+                return null;
+            }
+            $written = self::callFfi($ffi, $symbol, ...[...$args, $outBuf, $capacity]);
+            if (\is_int($written) && $written < -1 && -$written > $capacity) {
+                $outBuf = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($outBuf === null) {
+                    return null;
+                }
+                $written = self::callFfi($ffi, $symbol, ...[...$args, $outBuf, $capacity]);
+            }
+            if (! \is_int($written) || $written < 0 || $written > $capacity) {
+                return null;
+            }
+
+            return $written === 0 ? '' : FFI::string($outBuf, $written);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private static function callFfi(FFI $ffi, string $symbol, mixed ...$args): mixed
+    {
+        return $ffi->$symbol(...$args);
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (self::$ffi === false) {
+            return null;
+        }
+
+        if (self::$ffi instanceof FFI) {
+            return self::$ffi;
+        }
+
+        $ffi = RustPipelineLibrary::resolveDomain('w28-admin-category-release-content-controllers', self::FFI_CDEF, getenv('NNTMUX_PIPELINE_FFI_LIB') ?: null);
+        self::$ffi = $ffi ?? false;
+
+        return $ffi;
     }
 }

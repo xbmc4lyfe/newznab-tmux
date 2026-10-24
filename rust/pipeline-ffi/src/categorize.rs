@@ -18894,3 +18894,1297 @@ pub mod categorization_pipes_spec {
         }
     }
 }
+// ---------------------------------------------------------------------------
+// Admin category, release, release-report, AJAX and content controller helpers
+// ---------------------------------------------------------------------------
+
+/// Wave 28.3: admin category, release, release-report, AJAX and content controller helpers.
+///
+/// Backs the `*Native()` helpers on `AdminCategoryController`, `AdminReleasesController`,
+/// `AdminReleaseReportController`, `AdminAjaxController` and `AdminContentController`.
+/// Byte-output exports return the number of bytes written, `-1` for invalid arguments, an
+/// unsupported input or a caught panic, and `-(required capacity)` (never `-1`) without
+/// writing when `out_cap` is too small. Code exports return `-1` for invalid arguments.
+pub mod admin_category_release_content_controllers {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::ptr;
+    use std::slice;
+
+    pub const DECLINE: isize = -1;
+
+    /// `AdminCategoryController::destroy()` outcomes.
+    pub const DELETE_MISSING_ID: u8 = 0;
+    pub const DELETE_NOT_FOUND: u8 = 1;
+    pub const DELETE_HAS_CHILDREN: u8 = 2;
+    pub const DELETE_DELETED: u8 = 3;
+
+    /// `AdminReleasesController::destroy()` redirect targets.
+    pub const REDIRECT_HOME: i32 = 0;
+    pub const REDIRECT_INTENDED: i32 = 1;
+    pub const REDIRECT_RELEASE_LIST: i32 = 2;
+
+    /// `AdminReleaseReportController` bulk status codes.
+    pub const REPORT_STATUS_NONE: i32 = 0;
+    pub const REPORT_STATUS_DISMISSED: i32 = 1;
+    pub const REPORT_STATUS_RESOLVED: i32 = 2;
+    pub const REPORT_STATUS_REVIEWED: i32 = 3;
+
+    /// `AdminAjaxController` canonical action kinds.
+    pub const AJAX_BLACKLIST_DELETE: i32 = 0;
+    pub const AJAX_REGEX_DELETE: i32 = 1;
+    pub const AJAX_PURGE_ALL: i32 = 2;
+    pub const AJAX_RESET_ALL: i32 = 3;
+    pub const AJAX_PURGE_GROUP: i32 = 4;
+    pub const AJAX_RESET_GROUP: i32 = 5;
+    pub const AJAX_RESET_SELECTED: i32 = 6;
+    pub const AJAX_DELETE_GROUP: i32 = 7;
+    pub const AJAX_TOGGLE_ACTIVE: i32 = 8;
+    pub const AJAX_TOGGLE_BACKFILL: i32 = 9;
+    pub const AJAX_UNKNOWN: i32 = 10;
+
+    /// `AdminAjaxController` response message kinds.
+    pub const MESSAGE_BLACKLIST_DELETED: u8 = 0;
+    pub const MESSAGE_REGEX_DELETED: u8 = 1;
+    pub const MESSAGE_ALL_PURGED: u8 = 2;
+    pub const MESSAGE_ALL_RESET: u8 = 3;
+    pub const MESSAGE_GROUP_PURGED: u8 = 4;
+    pub const MESSAGE_GROUP_RESET: u8 = 5;
+    pub const MESSAGE_GROUPS_RESET: u8 = 6;
+    pub const MESSAGE_GROUP_DELETED: u8 = 7;
+
+    /// Request value states for the AJAX status flag export.
+    pub const VALUE_ABSENT: u8 = 0;
+    pub const VALUE_STRING: u8 = 1;
+    pub const VALUE_NULL: u8 = 2;
+
+    /// Longer content URLs are left to PHP.
+    pub const MAX_CONTENT_URL: usize = 65_536;
+
+    /// PHP truthiness of a string: only `""` and `"0"` are falsy.
+    #[inline]
+    pub fn php_truthy(value: &[u8]) -> bool {
+        !(value.is_empty() || value == b"0")
+    }
+
+    #[inline]
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    pub fn category_delete_message(kind: u8, title: &[u8]) -> Option<Vec<u8>> {
+        let parts: [&[u8]; 3] = match kind {
+            DELETE_MISSING_ID => [b"No category ID provided.", b"", b""],
+            DELETE_NOT_FOUND => [b"Category not found.", b"", b""],
+            DELETE_HAS_CHILDREN => [
+                b"Cannot delete category \"",
+                title,
+                b"\" because it has child categories. Remove or reassign them first.",
+            ],
+            DELETE_DELETED => [b"Category \"", title, b"\" deleted successfully."],
+            _ => return None,
+        };
+        Some(parts.concat())
+    }
+
+    #[inline]
+    pub fn destroy_redirect(referer: Option<&[u8]>, has_intended: bool) -> i32 {
+        if referer.is_some_and(|referer| contains(referer, b"/details/")) {
+            REDIRECT_HOME
+        } else if has_intended {
+            REDIRECT_INTENDED
+        } else {
+            REDIRECT_RELEASE_LIST
+        }
+    }
+
+    pub fn bulk_category_message(count: i64) -> Vec<u8> {
+        format!("{count} release(s) re-categorised.").into_bytes()
+    }
+
+    #[inline]
+    pub fn report_bulk_status(action: &[u8]) -> i32 {
+        match action {
+            b"dismiss" => REPORT_STATUS_DISMISSED,
+            b"resolve" => REPORT_STATUS_RESOLVED,
+            b"reviewed" | b"revert" => REPORT_STATUS_REVIEWED,
+            _ => REPORT_STATUS_NONE,
+        }
+    }
+
+    #[inline]
+    pub fn report_action_label(action: &[u8]) -> &'static [u8] {
+        match action {
+            b"delete" => b"deleted",
+            b"dismiss" => b"dismissed",
+            b"resolve" => b"resolved",
+            b"reviewed" => b"marked as reviewed",
+            b"revert" => b"reverted to reviewed",
+            _ => b"processed",
+        }
+    }
+
+    pub fn report_bulk_message(count: i64, action: &[u8]) -> Vec<u8> {
+        let mut message = format!("{count} report(s) ").into_bytes();
+        message.extend_from_slice(report_action_label(action));
+        message.extend_from_slice(b" successfully.");
+        message
+    }
+
+    /// `in_array($status, ['resolved', 'dismissed'])` for a string status; neither needle is
+    /// numeric, so PHP's loose string comparison is byte equality.
+    #[inline]
+    pub fn report_can_revert(status: &[u8]) -> bool {
+        status == b"resolved" || status == b"dismissed"
+    }
+
+    /// PHP `trim()` with its default `" \t\n\r\0\x0B"` character list.
+    pub fn php_trim(value: &[u8]) -> &[u8] {
+        let strip = |byte: &u8| matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | b'\0' | 0x0B);
+        let start = value
+            .iter()
+            .position(|byte| !strip(byte))
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|byte| !strip(byte))
+            .map_or(start, |index| index + 1);
+        &value[start..end]
+    }
+
+    /// A string action's canonical kind; no case label is numeric, so PHP's loose `switch`
+    /// comparison is byte equality for string input.
+    #[inline]
+    pub fn ajax_action_kind(action: &[u8]) -> i32 {
+        match action {
+            b"binary_blacklist_delete" => AJAX_BLACKLIST_DELETE,
+            b"category_regex_delete"
+            | b"collection_regex_delete"
+            | b"release_naming_regex_delete" => AJAX_REGEX_DELETE,
+            b"group_edit_purge_all" | b"purge_all_groups" => AJAX_PURGE_ALL,
+            b"group_edit_reset_all" | b"reset_all_groups" => AJAX_RESET_ALL,
+            b"group_edit_purge_single" | b"purge_group" => AJAX_PURGE_GROUP,
+            b"group_edit_reset_single" | b"reset_group" => AJAX_RESET_GROUP,
+            b"reset_selected_groups" => AJAX_RESET_SELECTED,
+            b"group_edit_delete_single" | b"delete_group" => AJAX_DELETE_GROUP,
+            b"toggle_group_active_status" => AJAX_TOGGLE_ACTIVE,
+            b"toggle_group_backfill_status" | b"toggle_group_backfill" => AJAX_TOGGLE_BACKFILL,
+            _ => AJAX_UNKNOWN,
+        }
+    }
+
+    /// Regex table for a regex delete action; empty for every other action.
+    #[inline]
+    pub fn ajax_regex_table(action: &[u8]) -> &'static [u8] {
+        match action {
+            b"category_regex_delete" => b"category_regexes",
+            b"collection_regex_delete" => b"collection_regexes",
+            b"release_naming_regex_delete" => b"release_naming_regexes",
+            _ => b"",
+        }
+    }
+
+    /// `(int)` of a plain `[+-]?[0-9]+` or empty string; other strings and values that do
+    /// not fit `i64` are left to PHP.
+    pub fn php_int_from_string(value: &[u8]) -> Option<i64> {
+        if value.is_empty() {
+            return Some(0);
+        }
+        let (negative, digits) = match value[0] {
+            b'-' => (true, &value[1..]),
+            b'+' => (false, &value[1..]),
+            _ => (false, value),
+        };
+        if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let mut magnitude: i64 = 0;
+        for digit in digits {
+            let digit = i64::from(digit - b'0');
+            magnitude = magnitude.checked_mul(10)?;
+            magnitude = if negative {
+                magnitude.checked_sub(digit)?
+            } else {
+                magnitude.checked_add(digit)?
+            };
+        }
+        Some(magnitude)
+    }
+
+    /// `json_decode($json, true)` followed by `(int)` per element, for a flat JSON array of
+    /// integers and plain digit strings. Any other document (including invalid JSON, floats,
+    /// escapes and integers beyond `i64`) is left to PHP.
+    pub fn ajax_group_ids(json: &[u8]) -> Option<Vec<i64>> {
+        let is_ws = |byte: u8| matches!(byte, b' ' | b'\t' | b'\n' | b'\r');
+        let mut pos = 0;
+        let skip_ws = |pos: &mut usize| {
+            while *pos < json.len() && is_ws(json[*pos]) {
+                *pos += 1;
+            }
+        };
+        skip_ws(&mut pos);
+        if json.get(pos) != Some(&b'[') {
+            return None;
+        }
+        pos += 1;
+        let mut ids = Vec::new();
+        skip_ws(&mut pos);
+        if json.get(pos) == Some(&b']') {
+            pos += 1;
+        } else {
+            loop {
+                skip_ws(&mut pos);
+                let id = match *json.get(pos)? {
+                    b'"' => {
+                        let start = pos + 1;
+                        let len = json[start..].iter().position(|&byte| byte == b'"')?;
+                        let text = &json[start..start + len];
+                        if !text.iter().all(u8::is_ascii_digit) {
+                            return None;
+                        }
+                        pos = start + len + 1;
+                        php_int_from_string(text)?
+                    }
+                    b'-' | b'0'..=b'9' => {
+                        let start = pos;
+                        if json[pos] == b'-' {
+                            pos += 1;
+                        }
+                        let digits = pos;
+                        while pos < json.len() && json[pos].is_ascii_digit() {
+                            pos += 1;
+                        }
+                        let count = pos - digits;
+                        if count == 0 || (count > 1 && json[digits] == b'0') {
+                            return None;
+                        }
+                        if matches!(json.get(pos), Some(b'.' | b'e' | b'E')) {
+                            return None;
+                        }
+                        php_int_from_string(&json[start..pos])?
+                    }
+                    _ => return None,
+                };
+                ids.push(id);
+                skip_ws(&mut pos);
+                match *json.get(pos)? {
+                    b',' => pos += 1,
+                    b']' => {
+                        pos += 1;
+                        break;
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        skip_ws(&mut pos);
+        (pos == json.len()).then_some(ids)
+    }
+
+    /// `(int)` of a present request value (`None` = absent, `Some(None)` = `null`).
+    fn status_value(value: Option<Option<&[u8]>>) -> Option<Option<i64>> {
+        match value {
+            None => Some(None),
+            Some(None) => Some(Some(0)),
+            Some(Some(text)) => php_int_from_string(text).map(Some),
+        }
+    }
+
+    /// The primary value when present, else the secondary value when present, else `0`.
+    pub fn ajax_status_flag(
+        primary: Option<Option<&[u8]>>,
+        secondary: Option<Option<&[u8]>>,
+    ) -> Option<i64> {
+        if let Some(value) = status_value(primary)? {
+            return Some(value);
+        }
+        Some(status_value(secondary)?.unwrap_or(0))
+    }
+
+    pub fn ajax_message(kind: u8, value: i64) -> Option<Vec<u8>> {
+        let message = match kind {
+            MESSAGE_BLACKLIST_DELETED => format!("Blacklist {value} deleted."),
+            MESSAGE_REGEX_DELETED => format!("Regex {value} deleted."),
+            MESSAGE_ALL_PURGED => "All groups purged successfully".to_owned(),
+            MESSAGE_ALL_RESET => "All groups reset successfully".to_owned(),
+            MESSAGE_GROUP_PURGED => format!("Group {value} purged successfully"),
+            MESSAGE_GROUP_RESET => format!("Group {value} reset successfully"),
+            MESSAGE_GROUPS_RESET => format!("{value} group(s) reset successfully"),
+            MESSAGE_GROUP_DELETED => format!("Group {value} deleted successfully"),
+            _ => return None,
+        };
+        Some(message.into_bytes())
+    }
+
+    /// `preg_match('/^[a-zA-Z0-9][a-zA-Z0-9-]*\.[a-zA-Z]{2,}/', $url)`: `.` is outside the
+    /// repeated class, so only the first byte after the leading run can be the dot.
+    fn looks_like_domain(url: &[u8]) -> bool {
+        if !url.first().is_some_and(u8::is_ascii_alphanumeric) {
+            return false;
+        }
+        let run = url[1..]
+            .iter()
+            .position(|&byte| !(byte.is_ascii_alphanumeric() || byte == b'-'))
+            .map_or(url.len(), |index| index + 1);
+        url.get(run) == Some(&b'.')
+            && url.get(run + 1).is_some_and(u8::is_ascii_alphabetic)
+            && url.get(run + 2).is_some_and(u8::is_ascii_alphabetic)
+    }
+
+    /// Internal URLs gain a leading and trailing `/`; external URLs are unchanged.
+    pub fn content_normalize_url(url: &[u8]) -> Option<Vec<u8>> {
+        if url.len() > MAX_CONTENT_URL {
+            return None;
+        }
+        let has_protocol = url.starts_with(b"http://") || url.starts_with(b"https://");
+        let is_domain = !url.starts_with(b"/") && looks_like_domain(url);
+        let mut normalized = Vec::with_capacity(url.len() + 2);
+        if !has_protocol && !is_domain && url != b"/" && !url.starts_with(b"/") {
+            normalized.push(b'/');
+        }
+        normalized.extend_from_slice(url);
+        if !has_protocol && !is_domain && !normalized.ends_with(b"/") {
+            normalized.push(b'/');
+        }
+        Some(normalized)
+    }
+
+    /// Equal counts and no difference in either direction (`array_diff` on integers).
+    pub fn content_reorder_matches(ordered: &[i64], expected: &[i64]) -> bool {
+        if ordered.len() != expected.len() {
+            return false;
+        }
+        let mut left = ordered.to_vec();
+        let mut right = expected.to_vec();
+        left.sort_unstable();
+        left.dedup();
+        right.sort_unstable();
+        right.dedup();
+        left == right
+    }
+
+    #[inline]
+    pub fn content_toggle_status(status: i64, enabled: i64, disabled: i64) -> i64 {
+        if status == enabled { disabled } else { enabled }
+    }
+
+    #[inline]
+    unsafe fn valid_in<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null() || len > isize::MAX as usize || (ptr as usize).checked_add(len).is_none() {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    unsafe fn valid_in_i64<'a>(ptr: *const i64, len: usize) -> Option<&'a [i64]> {
+        let bytes = len.checked_mul(size_of::<i64>())?;
+        if ptr.is_null()
+            || !ptr.is_aligned()
+            || bytes > isize::MAX as usize
+            || (ptr as usize).checked_add(bytes).is_none()
+        {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn valid_out(ptr: *mut u8, len: usize) -> bool {
+        !ptr.is_null()
+            && ptr.is_aligned()
+            && len <= isize::MAX as usize
+            && (ptr as usize).checked_add(len).is_some()
+    }
+
+    #[inline]
+    fn valid_out_i64(ptr: *mut i64, len: usize) -> bool {
+        len.checked_mul(size_of::<i64>()).is_some_and(|bytes| {
+            !ptr.is_null()
+                && ptr.is_aligned()
+                && bytes <= isize::MAX as usize
+                && (ptr as usize).checked_add(bytes).is_some()
+        })
+    }
+
+    #[inline]
+    fn required(total: usize) -> isize {
+        // `-1` is reserved for DECLINE, so a one-unit requirement reports `-2`.
+        if total <= 1 { -2 } else { -(total as isize) }
+    }
+
+    /// Copies `bytes` to a validated output buffer, or reports the required capacity.
+    #[inline]
+    unsafe fn write_bytes(out_buf: *mut u8, out_cap: usize, bytes: &[u8]) -> isize {
+        if bytes.len() > out_cap {
+            return required(bytes.len());
+        }
+        if !bytes.is_empty() {
+            unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len()) };
+        }
+        bytes.len() as isize
+    }
+
+    #[inline]
+    unsafe fn value_state<'a>(
+        state: u8,
+        ptr: *const u8,
+        len: usize,
+    ) -> Option<Option<Option<&'a [u8]>>> {
+        match state {
+            VALUE_ABSENT => Some(None),
+            VALUE_NULL => Some(Some(None)),
+            VALUE_STRING => unsafe { valid_in(ptr, len) }.map(|text| Some(Some(text))),
+            _ => None,
+        }
+    }
+
+    /// Backs `AdminCategoryController::categoryAttributesNative()`.
+    ///
+    /// Returns `1` when the parent id is kept, `0` when it becomes `null`, `-1` for
+    /// invalid input.
+    ///
+    /// # Safety
+    ///
+    /// `value_ptr` must be readable for `value_len` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_admin_ctl_category_parent_is_set(
+        value_ptr: *const u8,
+        value_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            unsafe { valid_in(value_ptr, value_len) }
+                .map_or(-1, |value| i32::from(php_truthy(value)))
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Backs `AdminCategoryController::deleteFlashNative()`.
+    ///
+    /// # Safety
+    ///
+    /// `title_ptr` must be readable for `title_len` bytes and `out_buf` writable for
+    /// `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_admin_ctl_category_delete_message(
+        kind: u8,
+        title_ptr: *const u8,
+        title_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(title) = (unsafe { valid_in(title_ptr, title_len) }) else {
+                return DECLINE;
+            };
+            if !valid_out(out_buf, out_cap) {
+                return DECLINE;
+            }
+            category_delete_message(kind, title).map_or(DECLINE, |message| unsafe {
+                write_bytes(out_buf, out_cap, &message)
+            })
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Backs `AdminReleasesController::destroyRedirectTargetNative()`.
+    ///
+    /// Returns a `REDIRECT_*` code, or `-1` for invalid input.
+    ///
+    /// # Safety
+    ///
+    /// When `has_referer` is non-zero, `referer_ptr` must be readable for `referer_len` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_admin_ctl_release_destroy_redirect(
+        has_referer: u8,
+        referer_ptr: *const u8,
+        referer_len: usize,
+        has_intended: u8,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if has_referer > 1 || has_intended > 1 {
+                return -1;
+            }
+            let referer = if has_referer == 1 {
+                let Some(referer) = (unsafe { valid_in(referer_ptr, referer_len) }) else {
+                    return -1;
+                };
+                Some(referer)
+            } else {
+                None
+            };
+            destroy_redirect(referer, has_intended == 1)
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Backs `AdminReleasesController::bulkCategoryMessageNative()`.
+    ///
+    /// # Safety
+    ///
+    /// `out_buf` must be writable for `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_admin_ctl_release_bulk_category_message(
+        count: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out(out_buf, out_cap) {
+                return DECLINE;
+            }
+            unsafe { write_bytes(out_buf, out_cap, &bulk_category_message(count)) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Backs `AdminReleaseReportController::bulkStatusNative()`.
+    ///
+    /// Returns a `REPORT_STATUS_*` code, or `-1` for invalid input.
+    ///
+    /// # Safety
+    ///
+    /// `action_ptr` must be readable for `action_len` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_admin_ctl_report_bulk_status(
+        action_ptr: *const u8,
+        action_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            unsafe { valid_in(action_ptr, action_len) }.map_or(-1, report_bulk_status)
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Backs `AdminReleaseReportController::bulkActionLabelNative()`.
+    ///
+    /// # Safety
+    ///
+    /// `action_ptr` must be readable for `action_len` bytes and `out_buf` writable for
+    /// `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_admin_ctl_report_action_label(
+        action_ptr: *const u8,
+        action_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(action) = (unsafe { valid_in(action_ptr, action_len) }) else {
+                return DECLINE;
+            };
+            if !valid_out(out_buf, out_cap) {
+                return DECLINE;
+            }
+            unsafe { write_bytes(out_buf, out_cap, report_action_label(action)) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Backs `AdminReleaseReportController::bulkActionMessageNative()`.
+    ///
+    /// # Safety
+    ///
+    /// `action_ptr` must be readable for `action_len` bytes and `out_buf` writable for
+    /// `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_admin_ctl_report_bulk_message(
+        count: i64,
+        action_ptr: *const u8,
+        action_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(action) = (unsafe { valid_in(action_ptr, action_len) }) else {
+                return DECLINE;
+            };
+            if !valid_out(out_buf, out_cap) {
+                return DECLINE;
+            }
+            unsafe { write_bytes(out_buf, out_cap, &report_bulk_message(count, action)) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Backs `AdminReleaseReportController::canRevertNative()`.
+    ///
+    /// Returns `1` when the status can be reverted, `0` otherwise, `-1` for invalid input.
+    ///
+    /// # Safety
+    ///
+    /// `status_ptr` must be readable for `status_len` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_admin_ctl_report_can_revert(
+        status_ptr: *const u8,
+        status_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            unsafe { valid_in(status_ptr, status_len) }
+                .map_or(-1, |status| i32::from(report_can_revert(status)))
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Backs `AdminReleaseReportController::responseStateNative()`: writes the trimmed
+    /// response; `0` bytes means the response is cleared.
+    ///
+    /// # Safety
+    ///
+    /// `response_ptr` must be readable for `response_len` bytes and `out_buf` writable for
+    /// `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_admin_ctl_report_trim_response(
+        response_ptr: *const u8,
+        response_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(response) = (unsafe { valid_in(response_ptr, response_len) }) else {
+                return DECLINE;
+            };
+            if !valid_out(out_buf, out_cap) {
+                return DECLINE;
+            }
+            unsafe { write_bytes(out_buf, out_cap, php_trim(response)) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Backs `AdminAjaxController::actionKindNative()`.
+    ///
+    /// Returns an `AJAX_*` kind, or `-1` for invalid input.
+    ///
+    /// # Safety
+    ///
+    /// `action_ptr` must be readable for `action_len` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_admin_ctl_ajax_action_kind(
+        action_ptr: *const u8,
+        action_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            unsafe { valid_in(action_ptr, action_len) }.map_or(-1, ajax_action_kind)
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Backs `AdminAjaxController::regexTableNative()`; `0` bytes means no regex table.
+    ///
+    /// # Safety
+    ///
+    /// `action_ptr` must be readable for `action_len` bytes and `out_buf` writable for
+    /// `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_admin_ctl_ajax_regex_table(
+        action_ptr: *const u8,
+        action_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(action) = (unsafe { valid_in(action_ptr, action_len) }) else {
+                return DECLINE;
+            };
+            if !valid_out(out_buf, out_cap) {
+                return DECLINE;
+            }
+            unsafe { write_bytes(out_buf, out_cap, ajax_regex_table(action)) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Backs `AdminAjaxController::selectedGroupIdsNative()`.
+    ///
+    /// Returns the number of ids written to `out_ids`, `-1` for invalid arguments or a JSON
+    /// document left to PHP, and `-(required count)` without writing when `out_cap` (in
+    /// elements) is too small.
+    ///
+    /// # Safety
+    ///
+    /// `json_ptr` must be readable for `json_len` bytes and `out_ids` writable for `out_cap`
+    /// `int64_t` elements.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_admin_ctl_ajax_group_ids(
+        json_ptr: *const u8,
+        json_len: usize,
+        out_ids: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(json) = (unsafe { valid_in(json_ptr, json_len) }) else {
+                return DECLINE;
+            };
+            if !valid_out_i64(out_ids, out_cap) {
+                return DECLINE;
+            }
+            let Some(ids) = ajax_group_ids(json) else {
+                return DECLINE;
+            };
+            if ids.len() > out_cap {
+                return required(ids.len());
+            }
+            if !ids.is_empty() {
+                unsafe { ptr::copy_nonoverlapping(ids.as_ptr(), out_ids, ids.len()) };
+            }
+            ids.len() as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Backs `AdminAjaxController::activeStatusFlagNative()` and `backfillStatusFlagNative()`.
+    ///
+    /// Each value is described by a `VALUE_*` state. Returns `1` after writing the flag,
+    /// `0` without writing when a string is left to PHP, and `-1` for invalid arguments.
+    ///
+    /// # Safety
+    ///
+    /// For a `VALUE_STRING` state the matching pointer must be readable for its length, and
+    /// `out_value` must be writable for one `int64_t`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_admin_ctl_ajax_status_flag(
+        primary_state: u8,
+        primary_ptr: *const u8,
+        primary_len: usize,
+        secondary_state: u8,
+        secondary_ptr: *const u8,
+        secondary_len: usize,
+        out_value: *mut i64,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out_value.is_null() || !out_value.is_aligned() {
+                return -1;
+            }
+            let Some(primary) = (unsafe { value_state(primary_state, primary_ptr, primary_len) })
+            else {
+                return -1;
+            };
+            let Some(secondary) =
+                (unsafe { value_state(secondary_state, secondary_ptr, secondary_len) })
+            else {
+                return -1;
+            };
+            match ajax_status_flag(primary, secondary) {
+                Some(value) => {
+                    unsafe { out_value.write(value) };
+                    1
+                }
+                None => 0,
+            }
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Backs `AdminAjaxController::responseMessageNative()`.
+    ///
+    /// # Safety
+    ///
+    /// `out_buf` must be writable for `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_admin_ctl_ajax_message(
+        kind: u8,
+        value: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out(out_buf, out_cap) {
+                return DECLINE;
+            }
+            ajax_message(kind, value).map_or(DECLINE, |message| unsafe {
+                write_bytes(out_buf, out_cap, &message)
+            })
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Backs `AdminContentController::normalizeContentUrlDataNative()`.
+    ///
+    /// # Safety
+    ///
+    /// `url_ptr` must be readable for `url_len` bytes and `out_buf` writable for `out_cap`
+    /// bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_admin_ctl_content_normalize_url(
+        url_ptr: *const u8,
+        url_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(url) = (unsafe { valid_in(url_ptr, url_len) }) else {
+                return DECLINE;
+            };
+            if !valid_out(out_buf, out_cap) {
+                return DECLINE;
+            }
+            content_normalize_url(url).map_or(DECLINE, |normalized| unsafe {
+                write_bytes(out_buf, out_cap, &normalized)
+            })
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Backs `AdminContentController::reorderOrdinalsNative()`.
+    ///
+    /// Returns `1` after writing the 1-based ordinal of each ordered id to `out_ordinals`,
+    /// `0` when the id sets differ, `-1` for invalid arguments, and `-(required count)`
+    /// without writing when `out_cap` (in elements) is too small for a matching set.
+    ///
+    /// # Safety
+    ///
+    /// The id pointers must be readable for their `int64_t` lengths and `out_ordinals`
+    /// writable for `out_cap` `int64_t` elements.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_admin_ctl_content_reorder(
+        ordered_ptr: *const i64,
+        ordered_len: usize,
+        expected_ptr: *const i64,
+        expected_len: usize,
+        out_ordinals: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(ordered) = (unsafe { valid_in_i64(ordered_ptr, ordered_len) }) else {
+                return DECLINE;
+            };
+            let Some(expected) = (unsafe { valid_in_i64(expected_ptr, expected_len) }) else {
+                return DECLINE;
+            };
+            if !valid_out_i64(out_ordinals, out_cap) {
+                return DECLINE;
+            }
+            if !content_reorder_matches(ordered, expected) {
+                return 0;
+            }
+            if ordered.len() > out_cap {
+                return required(ordered.len());
+            }
+            for index in 0..ordered.len() {
+                let Ok(ordinal) = i64::try_from(index + 1) else {
+                    return DECLINE;
+                };
+                unsafe { out_ordinals.add(index).write(ordinal) };
+            }
+            1
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Backs `AdminContentController::toggledStatusNative()`.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn nntmux_admin_ctl_content_toggle_status(
+        status: i64,
+        enabled: i64,
+        disabled: i64,
+    ) -> i64 {
+        catch_unwind(AssertUnwindSafe(|| {
+            content_toggle_status(status, enabled, disabled)
+        }))
+        .unwrap_or(enabled)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn bytes_call(call: impl Fn(*mut u8, usize) -> isize, cap: usize) -> (isize, Vec<u8>) {
+            let mut buf = vec![b'Z'; cap.max(1)];
+            let rc = call(buf.as_mut_ptr(), cap);
+            (rc, buf)
+        }
+
+        fn delete_message(kind: u8, title: &[u8], cap: usize) -> (isize, Vec<u8>) {
+            bytes_call(
+                |out, cap| unsafe {
+                    nntmux_admin_ctl_category_delete_message(
+                        kind,
+                        title.as_ptr(),
+                        title.len(),
+                        out,
+                        cap,
+                    )
+                },
+                cap,
+            )
+        }
+
+        #[test]
+        fn category_parent_and_delete_messages() {
+            for (value, expected) in [(&b""[..], 0), (b"0", 0), (b"00", 1), (b"5", 1), (b" ", 1)] {
+                assert_eq!(
+                    unsafe { nntmux_admin_ctl_category_parent_is_set(value.as_ptr(), value.len()) },
+                    expected
+                );
+            }
+            assert_eq!(
+                unsafe { nntmux_admin_ctl_category_parent_is_set(ptr::null(), 0) },
+                -1
+            );
+            let expected: [(u8, &[u8]); 4] = [
+                (DELETE_MISSING_ID, b"No category ID provided."),
+                (DELETE_NOT_FOUND, b"Category not found."),
+                (
+                    DELETE_HAS_CHILDREN,
+                    b"Cannot delete category \"A\0\xff\" because it has child categories. Remove or reassign them first.",
+                ),
+                (DELETE_DELETED, b"Category \"A\0\xff\" deleted successfully."),
+            ];
+            for (kind, message) in expected {
+                let (rc, buf) = delete_message(kind, b"A\0\xff", 256);
+                assert_eq!(rc, message.len() as isize);
+                assert_eq!(&buf[..message.len()], message);
+            }
+            assert_eq!(delete_message(4, b"", 256).0, DECLINE);
+        }
+
+        #[test]
+        fn short_buffers_report_capacity_without_writing() {
+            let (rc, buf) = delete_message(DELETE_NOT_FOUND, b"", 4);
+            assert_eq!(rc, -19);
+            assert_eq!(buf, b"ZZZZ");
+            let (rc, buf) = delete_message(DELETE_NOT_FOUND, b"", 19);
+            assert_eq!(rc, 19);
+            assert_eq!(&buf[..], b"Category not found.");
+            let (rc, buf) = bytes_call(
+                |out, cap| unsafe { nntmux_admin_ctl_ajax_regex_table(b"x".as_ptr(), 1, out, cap) },
+                0,
+            );
+            assert_eq!((rc, buf), (0, vec![b'Z']));
+            let mut ids = [7i64; 1];
+            let json = b"[1,2]";
+            assert_eq!(
+                unsafe {
+                    nntmux_admin_ctl_ajax_group_ids(json.as_ptr(), json.len(), ids.as_mut_ptr(), 1)
+                },
+                -2
+            );
+            assert_eq!(ids, [7]);
+            let json = b"[1,2,3]";
+            assert_eq!(
+                unsafe {
+                    nntmux_admin_ctl_ajax_group_ids(json.as_ptr(), json.len(), ids.as_mut_ptr(), 1)
+                },
+                -3
+            );
+            assert_eq!(ids, [7]);
+            let ordered = [3i64, 1, 2];
+            let mut ordinals = [9i64; 3];
+            assert_eq!(
+                unsafe {
+                    nntmux_admin_ctl_content_reorder(
+                        ordered.as_ptr(),
+                        3,
+                        [1i64, 2, 3].as_ptr(),
+                        3,
+                        ordinals.as_mut_ptr(),
+                        2,
+                    )
+                },
+                -3
+            );
+            assert_eq!(ordinals, [9; 3]);
+        }
+
+        #[test]
+        fn invalid_pointers_and_bounds_decline() {
+            let mut buf = [0u8; 8];
+            unsafe {
+                assert_eq!(
+                    nntmux_admin_ctl_release_bulk_category_message(1, ptr::null_mut(), 8),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_admin_ctl_release_bulk_category_message(1, buf.as_mut_ptr(), usize::MAX),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_admin_ctl_release_bulk_category_message(
+                        1,
+                        buf.as_mut_ptr(),
+                        isize::MAX as usize + 1
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_admin_ctl_report_trim_response(
+                        b"x".as_ptr(),
+                        usize::MAX,
+                        buf.as_mut_ptr(),
+                        8
+                    ),
+                    DECLINE
+                );
+                assert_eq!(nntmux_admin_ctl_report_bulk_status(ptr::null(), 0), -1);
+                assert_eq!(nntmux_admin_ctl_report_can_revert(ptr::null(), 1), -1);
+                assert_eq!(
+                    nntmux_admin_ctl_ajax_action_kind(b"x".as_ptr(), usize::MAX),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_admin_ctl_release_destroy_redirect(1, ptr::null(), 0, 0),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_admin_ctl_release_destroy_redirect(2, ptr::null(), 0, 0),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_admin_ctl_release_destroy_redirect(0, ptr::null(), 0, 2),
+                    -1
+                );
+                let mut storage = [0i64; 4];
+                let misaligned = (storage.as_mut_ptr() as *mut u8).add(1) as *mut i64;
+                assert_eq!(
+                    nntmux_admin_ctl_ajax_group_ids(b"[1]".as_ptr(), 3, misaligned, 2),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_admin_ctl_ajax_group_ids(
+                        b"[1]".as_ptr(),
+                        3,
+                        storage.as_mut_ptr(),
+                        usize::MAX / 4
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_admin_ctl_content_reorder(
+                        misaligned,
+                        1,
+                        storage.as_ptr(),
+                        1,
+                        storage.as_mut_ptr(),
+                        1
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_admin_ctl_content_reorder(
+                        ptr::null(),
+                        0,
+                        storage.as_ptr(),
+                        0,
+                        storage.as_mut_ptr(),
+                        1
+                    ),
+                    DECLINE
+                );
+                let mut out = 5i64;
+                assert_eq!(
+                    nntmux_admin_ctl_ajax_status_flag(
+                        1,
+                        ptr::null(),
+                        0,
+                        0,
+                        ptr::null(),
+                        0,
+                        &mut out
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_admin_ctl_ajax_status_flag(
+                        3,
+                        ptr::null(),
+                        0,
+                        0,
+                        ptr::null(),
+                        0,
+                        &mut out
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_admin_ctl_ajax_status_flag(
+                        0,
+                        ptr::null(),
+                        0,
+                        0,
+                        ptr::null(),
+                        0,
+                        ptr::null_mut()
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_admin_ctl_ajax_status_flag(
+                        0,
+                        ptr::null(),
+                        0,
+                        0,
+                        ptr::null(),
+                        0,
+                        misaligned
+                    ),
+                    -1
+                );
+                assert_eq!(out, 5);
+            }
+            assert_eq!(buf, [0u8; 8]);
+        }
+
+        #[test]
+        fn release_and_report_rules() {
+            assert_eq!(
+                destroy_redirect(Some(b"https://x/details/abc"), true),
+                REDIRECT_HOME
+            );
+            assert_eq!(
+                destroy_redirect(Some(b"https://x/detail/abc"), true),
+                REDIRECT_INTENDED
+            );
+            assert_eq!(destroy_redirect(None, false), REDIRECT_RELEASE_LIST);
+            assert_eq!(destroy_redirect(Some(b""), false), REDIRECT_RELEASE_LIST);
+            assert_eq!(bulk_category_message(-3), b"-3 release(s) re-categorised.");
+            assert_eq!(report_bulk_status(b"dismiss"), REPORT_STATUS_DISMISSED);
+            assert_eq!(report_bulk_status(b"resolve"), REPORT_STATUS_RESOLVED);
+            assert_eq!(report_bulk_status(b"reviewed"), REPORT_STATUS_REVIEWED);
+            assert_eq!(report_bulk_status(b"revert"), REPORT_STATUS_REVIEWED);
+            assert_eq!(report_bulk_status(b"delete"), REPORT_STATUS_NONE);
+            assert_eq!(report_bulk_status(b"Dismiss"), REPORT_STATUS_NONE);
+            assert_eq!(
+                report_bulk_message(2, b"revert"),
+                b"2 report(s) reverted to reviewed successfully."
+            );
+            assert_eq!(
+                report_bulk_message(0, b"x"),
+                b"0 report(s) processed successfully."
+            );
+            assert!(report_can_revert(b"resolved") && report_can_revert(b"dismissed"));
+            assert!(!report_can_revert(b"reviewed") && !report_can_revert(b"resolved "));
+            assert_eq!(php_trim(b" \t\n\r\0\x0Bhi there\x0B\0 "), b"hi there");
+            assert_eq!(php_trim(b"\x0C x \x0C"), b"\x0C x \x0C");
+            assert_eq!(php_trim(b" \0 "), b"");
+        }
+
+        #[test]
+        fn ajax_rules() {
+            assert_eq!(ajax_action_kind(b"purge_group"), AJAX_PURGE_GROUP);
+            assert_eq!(
+                ajax_action_kind(b"toggle_group_backfill"),
+                AJAX_TOGGLE_BACKFILL
+            );
+            assert_eq!(
+                ajax_action_kind(b"release_naming_regex_delete"),
+                AJAX_REGEX_DELETE
+            );
+            assert_eq!(ajax_action_kind(b"Purge_group"), AJAX_UNKNOWN);
+            assert_eq!(
+                ajax_regex_table(b"collection_regex_delete"),
+                b"collection_regexes"
+            );
+            assert_eq!(
+                ajax_group_ids(b" [ 1 , \"2\" ,-3,\"\"]\n"),
+                Some(vec![1, 2, -3, 0])
+            );
+            assert_eq!(ajax_group_ids(b"[]"), Some(vec![]));
+            assert_eq!(
+                ajax_group_ids(b"[9223372036854775807]"),
+                Some(vec![i64::MAX])
+            );
+            assert_eq!(
+                ajax_group_ids(b"[-9223372036854775808]"),
+                Some(vec![i64::MIN])
+            );
+            for declined in [
+                &b""[..],
+                b"[",
+                b"[1,]",
+                b"[01]",
+                b"[1.0]",
+                b"[1e2]",
+                b"[\"-1\"]",
+                b"[\"1\\u0030\"]",
+                b"[true]",
+                b"[[1]]",
+                b"{\"a\":1}",
+                b"5",
+                b"[9223372036854775808]",
+                b"[1] x",
+                b"[-]",
+            ] {
+                assert_eq!(ajax_group_ids(declined), None, "{declined:?}");
+            }
+            assert_eq!(php_int_from_string(b"+12"), Some(12));
+            assert_eq!(php_int_from_string(b"-0"), Some(0));
+            assert_eq!(php_int_from_string(b"1a"), None);
+            assert_eq!(php_int_from_string(b" 1"), None);
+            assert_eq!(
+                ajax_status_flag(Some(Some(b"1")), Some(Some(b"x"))),
+                Some(1)
+            );
+            assert_eq!(ajax_status_flag(None, Some(Some(b"0"))), Some(0));
+            assert_eq!(ajax_status_flag(Some(None), Some(Some(b"1"))), Some(0));
+            assert_eq!(ajax_status_flag(None, None), Some(0));
+            assert_eq!(ajax_status_flag(None, Some(Some(b"x"))), None);
+            assert_eq!(
+                ajax_message(MESSAGE_GROUPS_RESET, 3).as_deref(),
+                Some(&b"3 group(s) reset successfully"[..])
+            );
+            assert_eq!(ajax_message(8, 3), None);
+        }
+
+        #[test]
+        fn content_rules() {
+            let normalize = |url: &[u8]| content_normalize_url(url).unwrap();
+            assert_eq!(normalize(b"about"), b"/about/");
+            assert_eq!(normalize(b"/about"), b"/about/");
+            assert_eq!(normalize(b"/"), b"/");
+            assert_eq!(normalize(b"//x"), b"//x/");
+            assert_eq!(normalize(b"http://x"), b"http://x");
+            assert_eq!(normalize(b"https://x"), b"https://x");
+            assert_eq!(normalize(b"HTTP://x"), b"/HTTP://x/");
+            assert_eq!(normalize(b"example.com"), b"example.com");
+            assert_eq!(normalize(b"my-site.co/path"), b"my-site.co/path");
+            assert_eq!(normalize(b"a.b"), b"/a.b/");
+            assert_eq!(normalize(b"-a.com"), b"/-a.com/");
+            assert_eq!(normalize(b"a_b.com"), b"/a_b.com/");
+            assert_eq!(normalize(b"a..com"), b"/a..com/");
+            assert_eq!(normalize(b"a.c0m"), b"/a.c0m/");
+            assert_eq!(
+                content_normalize_url(&vec![b'a'; MAX_CONTENT_URL + 1]),
+                None
+            );
+            assert!(content_reorder_matches(&[3, 1, 2], &[1, 2, 3]));
+            assert!(content_reorder_matches(&[], &[]));
+            assert!(content_reorder_matches(&[1, 2, 2], &[1, 1, 2]));
+            assert!(!content_reorder_matches(&[1, 2], &[1, 2, 3]));
+            assert!(!content_reorder_matches(&[1, 1], &[1, 2]));
+            assert_eq!(content_toggle_status(1, 1, 0), 0);
+            assert_eq!(content_toggle_status(0, 1, 0), 1);
+            assert_eq!(content_toggle_status(7, 1, 0), 1);
+            let mut ordinals = [0i64; 3];
+            let rc = unsafe {
+                nntmux_admin_ctl_content_reorder(
+                    [3i64, 1, 2].as_ptr(),
+                    3,
+                    [1i64, 2, 3].as_ptr(),
+                    3,
+                    ordinals.as_mut_ptr(),
+                    3,
+                )
+            };
+            assert_eq!((rc, ordinals), (1, [1, 2, 3]));
+            let rc = unsafe {
+                nntmux_admin_ctl_content_reorder(
+                    [3i64].as_ptr(),
+                    1,
+                    [1i64].as_ptr(),
+                    1,
+                    ordinals.as_mut_ptr(),
+                    0,
+                )
+            };
+            assert_eq!(rc, 0);
+        }
+    }
+}
