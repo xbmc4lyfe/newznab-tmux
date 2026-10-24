@@ -27854,5 +27854,445 @@ pub mod cover_cart_failed_controllers {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Wave 27 Slice 27.4: TmdbPipe, TraktPipe, TvMazePipe, TvdbPipe, and
+// LocalDbProvider helpers
+// ---------------------------------------------------------------------------
+
+pub mod tv_processing_pipes_provider {
+    use std::mem::size_of;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    const DECLINE: isize = -1;
+    const MAX_INPUT: usize = (isize::MAX as usize) / 8;
+
+    const PIPE_KIND_TVDB: i32 = 1;
+    const PIPE_KIND_TVMAZE: i32 = 2;
+    const PIPE_KIND_TMDB: i32 = 3;
+    const PIPE_KIND_TRAKT: i32 = 4;
+
+    #[inline]
+    unsafe fn valid_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null()
+            || !ptr.is_aligned()
+            || len > MAX_INPUT
+            || len > isize::MAX as usize
+            || (ptr as usize).checked_add(len).is_none()
+        {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn valid_out_buf(out_buf: *mut u8, out_cap: usize) -> bool {
+        !out_buf.is_null()
+            && out_buf.is_aligned()
+            && out_cap <= isize::MAX as usize
+            && (out_buf as usize).checked_add(out_cap).is_some()
+    }
+
+    #[inline]
+    fn valid_mut_slice<T>(ptr: *mut T, count: usize) -> bool {
+        if ptr.is_null() || !ptr.is_aligned() {
+            return false;
+        }
+        let Some(byte_len) = count.checked_mul(size_of::<T>()) else {
+            return false;
+        };
+        byte_len <= isize::MAX as usize && (ptr as usize).checked_add(byte_len).is_some()
+    }
+
+    #[inline]
+    fn is_php_trim_byte(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\0' | b'\x0b')
+    }
+
+    #[inline]
+    fn trim_php_ascii(mut slice: &[u8]) -> &[u8] {
+        while let Some((&first, rest)) = slice.split_first() {
+            if is_php_trim_byte(first) {
+                slice = rest;
+            } else {
+                break;
+            }
+        }
+        while let Some((&last, rest)) = slice.split_last() {
+            if is_php_trim_byte(last) {
+                slice = rest;
+            } else {
+                break;
+            }
+        }
+        slice
+    }
+
+    #[inline]
+    fn pipe_spec_table(pipe_kind: i32) -> Option<(&'static [u8], &'static [u8], i64, &'static [u8])> {
+        match pipe_kind {
+            PIPE_KIND_TVDB => Some((b"TVDB", b"tvdb", 20, b"tvdb")),
+            PIPE_KIND_TVMAZE => Some((b"TVMaze", b"tvmaze", 30, b"")),
+            PIPE_KIND_TMDB => Some((b"TMDB", b"tmdb", 40, b"tmdb")),
+            PIPE_KIND_TRAKT => Some((b"Trakt", b"trakt", 50, b"trakt")),
+            _ => None,
+        }
+    }
+
+    /// Resolves the static pipe metadata `(name, site_column, priority, source_key)`
+    /// for `TvdbPipe` (`1`), `TvMazePipe` (`2`), `TmdbPipe` (`3`), and `TraktPipe` (`4`).
+    ///
+    /// Writes `priority` to `*out_priority` (`i64[1]`), byte lengths `[name_len,
+    /// site_column_len, source_key_len]` to `out_lens` (`usize[3]`), and the
+    /// concatenated strings into `out_buf`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tv_pipe_resolve_spec(
+        pipe_kind: i32,
+        out_priority: *mut i64,
+        out_lens: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_mut_slice(out_priority, 1)
+                || !valid_mut_slice(out_lens, 3)
+                || !valid_out_buf(out_buf, out_cap)
+            {
+                return DECLINE;
+            }
+            let Some((name, site_col, priority, source_key)) = pipe_spec_table(pipe_kind) else {
+                return DECLINE;
+            };
+
+            let required = name.len() + site_col.len() + source_key.len();
+            unsafe {
+                *out_priority = priority;
+            }
+            let lens = unsafe { slice::from_raw_parts_mut(out_lens, 3) };
+            lens[0] = name.len();
+            lens[1] = site_col.len();
+            lens[2] = source_key.len();
+
+            if required > out_cap {
+                return -(required as isize);
+            }
+
+            let dst = unsafe { slice::from_raw_parts_mut(out_buf, required) };
+            let mut offset = 0usize;
+            dst[offset..offset + name.len()].copy_from_slice(name);
+            offset += name.len();
+            dst[offset..offset + site_col.len()].copy_from_slice(site_col);
+            offset += site_col.len();
+            dst[offset..offset + source_key.len()].copy_from_slice(source_key);
+
+            required as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Evaluates whether a TV provider pipe is available given its `pipe_kind`
+    /// (`1..=4`) and the optional unavailable-reason string from `MetadataSources`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tv_pipe_is_available(
+        pipe_kind: i32,
+        has_unavailable_reason: u32,
+        reason_ptr: *const u8,
+        reason_len: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if pipe_spec_table(pipe_kind).is_none() || has_unavailable_reason > 1 {
+                return DECLINE as i32;
+            }
+            if (unsafe { valid_slice(reason_ptr, reason_len) }).is_none() {
+                return DECLINE as i32;
+            }
+            i32::from(has_unavailable_reason == 0)
+        }))
+        .unwrap_or(DECLINE as i32)
+    }
+
+    /// Normalizes a show lookup tuple `(name, year, country)` for `LocalDbProvider`.
+    ///
+    /// Writes `[has_year, normalized_year, has_name]` to `out_scalars` (`i64[3]`),
+    /// `[name_len, country_len]` to `out_lens` (`usize[2]`), and the concatenated
+    /// `trimmed_name` + `uppercase_trimmed_country` into `out_buf`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tv_local_db_normalize_show_lookup(
+        name_ptr: *const u8,
+        name_len: usize,
+        has_year: u32,
+        year: i64,
+        country_ptr: *const u8,
+        country_len: usize,
+        out_scalars: *mut i64,
+        out_lens: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if has_year > 1
+                || !valid_mut_slice(out_scalars, 3)
+                || !valid_mut_slice(out_lens, 2)
+                || !valid_out_buf(out_buf, out_cap)
+            {
+                return DECLINE;
+            }
+            let Some(name) = (unsafe { valid_slice(name_ptr, name_len) }) else {
+                return DECLINE;
+            };
+            let Some(country) = (unsafe { valid_slice(country_ptr, country_len) }) else {
+                return DECLINE;
+            };
+
+            let trimmed_name = trim_php_ascii(name);
+            let trimmed_country = trim_php_ascii(country);
+            let Some(required) = trimmed_name.len().checked_add(trimmed_country.len()) else {
+                return DECLINE;
+            };
+            if required > isize::MAX as usize {
+                return DECLINE;
+            }
+
+            let (norm_has_year, norm_year) = if has_year == 1 && year > 0 {
+                (1i64, year)
+            } else {
+                (0i64, 0i64)
+            };
+            let has_name = i64::from(!trimmed_name.is_empty());
+
+            let scalars = unsafe { slice::from_raw_parts_mut(out_scalars, 3) };
+            scalars[0] = norm_has_year;
+            scalars[1] = norm_year;
+            scalars[2] = has_name;
+
+            let lens = unsafe { slice::from_raw_parts_mut(out_lens, 2) };
+            lens[0] = trimmed_name.len();
+            lens[1] = trimmed_country.len();
+
+            if required > out_cap {
+                return -(required as isize);
+            }
+
+            if required > 0 {
+                let dst = unsafe { slice::from_raw_parts_mut(out_buf, required) };
+                dst[..trimmed_name.len()].copy_from_slice(trimmed_name);
+                for (i, &b) in trimmed_country.iter().enumerate() {
+                    dst[trimmed_name.len() + i] = b.to_ascii_uppercase();
+                }
+            }
+
+            required as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Normalizes an episode lookup tuple `(site_id, season, episode, video_id)`
+    /// for `LocalDbProvider` into `out_scalars` (`i64[5]`:
+    /// `[norm_site_id, norm_season, norm_episode, norm_video_id, valid]`).
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tv_local_db_normalize_episode_lookup(
+        site_id: i64,
+        season: i64,
+        episode: i64,
+        video_id: i64,
+        out_scalars: *mut i64,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_mut_slice(out_scalars, 5) {
+                return DECLINE as i32;
+            }
+
+            let scalars = unsafe { slice::from_raw_parts_mut(out_scalars, 5) };
+            scalars[0] = site_id.max(0);
+            scalars[1] = season.max(0);
+            scalars[2] = episode.max(0);
+            scalars[3] = video_id.max(0);
+            scalars[4] = i64::from(video_id > 0 && season >= 0 && episode >= 0);
+            0
+        }))
+        .unwrap_or(DECLINE as i32)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn tv_pipe_resolve_spec_and_availability_contracts() {
+            let mut prio = 0i64;
+            let mut lens = [0usize; 3];
+            let mut buf = [0u8; 64];
+
+            let expected = [
+                (PIPE_KIND_TVDB, 20i64, [4usize, 4, 4], &b"TVDBtvdbtvdb"[..]),
+                (PIPE_KIND_TVMAZE, 30i64, [6usize, 6, 0], &b"TVMazetvmaze"[..]),
+                (PIPE_KIND_TMDB, 40i64, [4usize, 4, 4], &b"TMDBtmdbtmdb"[..]),
+                (PIPE_KIND_TRAKT, 50i64, [5usize, 5, 5], &b"Trakttrakttrakt"[..]),
+            ];
+
+            for (kind, exp_prio, exp_lens, exp_bytes) in expected {
+                let rc = unsafe {
+                    nntmux_tv_pipe_resolve_spec(
+                        kind,
+                        &mut prio,
+                        lens.as_mut_ptr(),
+                        buf.as_mut_ptr(),
+                        buf.len(),
+                    )
+                };
+                assert_eq!(rc, exp_bytes.len() as isize);
+                assert_eq!(prio, exp_prio);
+                assert_eq!(lens, exp_lens);
+                assert_eq!(&buf[..rc as usize], exp_bytes);
+
+                assert_eq!(
+                    unsafe { nntmux_tv_pipe_is_available(kind, 0, b"".as_ptr(), 0) },
+                    1
+                );
+                assert_eq!(
+                    unsafe {
+                        nntmux_tv_pipe_is_available(kind, 1, b"missing key".as_ptr(), 11)
+                    },
+                    0
+                );
+            }
+        }
+
+        #[test]
+        fn local_db_provider_lookup_normalization_contracts() {
+            let mut scalars = [0i64; 3];
+            let mut lens = [0usize; 2];
+            let mut buf = [0u8; 64];
+
+            let rc = unsafe {
+                nntmux_tv_local_db_normalize_show_lookup(
+                    b"  The Expanse \t\n".as_ptr(),
+                    16,
+                    1,
+                    2015,
+                    b" us ".as_ptr(),
+                    4,
+                    scalars.as_mut_ptr(),
+                    lens.as_mut_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert_eq!(rc, 13);
+            assert_eq!(scalars, [1, 2015, 1]);
+            assert_eq!(lens, [11, 2]);
+            assert_eq!(&buf[..rc as usize], b"The ExpanseUS");
+
+            let mut ep_scalars = [0i64; 5];
+            let rc_ep = unsafe {
+                nntmux_tv_local_db_normalize_episode_lookup(
+                    -5,
+                    2,
+                    10,
+                    42,
+                    ep_scalars.as_mut_ptr(),
+                )
+            };
+            assert_eq!(rc_ep, 0);
+            assert_eq!(ep_scalars, [0, 2, 10, 42, 1]);
+        }
+
+        #[test]
+        fn abi_safety_null_unaligned_invalid_kinds_and_undersized_buffers() {
+            let mut raw = [0u8; 64];
+            let unaligned_usize = unsafe { raw.as_mut_ptr().add(1) as *mut usize };
+            let unaligned_i64 = unsafe { raw.as_mut_ptr().add(1) as *mut i64 };
+            let mut small = [b'Z'; 4];
+            let mut prio = 0i64;
+            let mut lens3 = [0usize; 3];
+            let mut scalars3 = [0i64; 3];
+            let mut lens2 = [0usize; 2];
+
+            assert_eq!(
+                unsafe {
+                    nntmux_tv_pipe_resolve_spec(
+                        99,
+                        &mut prio,
+                        lens3.as_mut_ptr(),
+                        small.as_mut_ptr(),
+                        small.len(),
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_tv_pipe_resolve_spec(
+                        PIPE_KIND_TMDB,
+                        unaligned_i64,
+                        lens3.as_mut_ptr(),
+                        small.as_mut_ptr(),
+                        small.len(),
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_tv_pipe_resolve_spec(
+                        PIPE_KIND_TMDB,
+                        &mut prio,
+                        lens3.as_mut_ptr(),
+                        small.as_mut_ptr(),
+                        small.len(),
+                    )
+                },
+                -12
+            );
+            assert_eq!(small, [b'Z'; 4]);
+
+            assert_eq!(
+                unsafe {
+                    nntmux_tv_local_db_normalize_show_lookup(
+                        b"Severance".as_ptr(),
+                        9,
+                        1,
+                        2022,
+                        b"us".as_ptr(),
+                        2,
+                        scalars3.as_mut_ptr(),
+                        unaligned_usize,
+                        small.as_mut_ptr(),
+                        small.len(),
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_tv_local_db_normalize_show_lookup(
+                        b"Severance".as_ptr(),
+                        9,
+                        1,
+                        2022,
+                        b"us".as_ptr(),
+                        2,
+                        scalars3.as_mut_ptr(),
+                        lens2.as_mut_ptr(),
+                        small.as_mut_ptr(),
+                        small.len(),
+                    )
+                },
+                -11
+            );
+            assert_eq!(small, [b'Z'; 4]);
+
+            assert_eq!(
+                unsafe { nntmux_tv_local_db_normalize_episode_lookup(1, 1, 1, 1, unaligned_i64) },
+                DECLINE as i32
+            );
+        }
+    }
+}
+
+
 
 
