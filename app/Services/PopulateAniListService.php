@@ -7,9 +7,12 @@ namespace App\Services;
 use App\Enums\ImageAssetProfile;
 use App\Models\AnidbInfo;
 use App\Models\AnidbTitle;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\ClientException;
 use GuzzleHttp\Exception\GuzzleException;
+use Throwable;
 
 class PopulateAniListService
 {
@@ -22,6 +25,15 @@ class PopulateAniListService
      * Rate limit: 20 requests per minute (conservative limit to avoid hitting AniList's 90/min limit)
      */
     private const RATE_LIMIT_PER_MINUTE = 20;
+
+    public const NORMALIZER_FFI_CDEF = <<<'C'
+        ssize_t nntmux_anilist_normalize_media(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    /** Null selects the benchmark-qualified production default. */
+    public ?bool $useRustFfi = null;
+
+    private static FFI|false|null $normalizerFfi = null;
 
     /**
      * Whether to echo message output.
@@ -464,14 +476,115 @@ class PopulateAniListService
         }
     }
 
+    public static function normalizerFfi(): ?FFI
+    {
+        if (self::$normalizerFfi === null) {
+            self::$normalizerFfi = RustPipelineLibrary::resolveDomain('metadata', self::NORMALIZER_FFI_CDEF) ?? false;
+        }
+
+        return self::$normalizerFfi === false ? null : self::$normalizerFfi;
+    }
+
+    /** `basename()` follows LC_CTYPE character tables outside the C locales. */
+    public static function normalizerEnvironmentSupported(): bool
+    {
+        return \in_array(setlocale(LC_CTYPE, '0'), ['C', 'POSIX', 'C.UTF-8', 'C.utf8'], true);
+    }
+
     /**
-     * Insert or update AniList info data.
+     * Normalize raw AniList GraphQL media payload into database-ready info and title records.
      *
      * @param  array<string, mixed>  $anilistData
+     * @return array<string, mixed>
      */
-    protected function insertAniListInfo(int $anidbid, array $anilistData): void
+    public function normalizeAniListMedia(array $anilistData): array
     {
-        // Extract data from AniList response
+        return ($this->useRustFfi ?? false)
+            ? $this->normalizeAniListMediaNative($anilistData)
+            : $this->normalizeAniListMediaPhp($anilistData);
+    }
+
+    /**
+     * @param  array<string, mixed>  $anilistData
+     * @return array<string, mixed>
+     */
+    public function normalizeAniListMediaNative(array $anilistData): array
+    {
+        if (! self::normalizerEnvironmentSupported() || ($ffi = self::normalizerFfi()) === null) {
+            return $this->normalizeAniListMediaPhp($anilistData);
+        }
+        try {
+            $input = serialize($anilistData);
+            $len = \strlen($input);
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, $len + 256, $capacity);
+            if ($buffer === null) {
+                return $this->normalizeAniListMediaPhp($anilistData);
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_anilist_normalize_media($input, $len, $buffer, $capacity);
+            if (\is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return $this->normalizeAniListMediaPhp($anilistData);
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_anilist_normalize_media($input, $len, $buffer, $capacity);
+            }
+            if (! \is_int($written) || $written < 0 || $written > $capacity) {
+                return $this->normalizeAniListMediaPhp($anilistData);
+            }
+            $output = FFI::string($buffer, $written);
+        } catch (Throwable) {
+            return $this->normalizeAniListMediaPhp($anilistData);
+        }
+        $parts = explode("\0", $output);
+        if (\count($parts) !== 13 || $parts[12] !== '') {
+            return $this->normalizeAniListMediaPhp($anilistData);
+        }
+
+        $titles = [];
+        if (isset($anilistData['title']['romaji']) && ! empty($anilistData['title']['romaji'])) {
+            $titles[] = ['type' => 'main', 'lang' => 'x-jat', 'title' => $anilistData['title']['romaji']];
+        }
+        if (isset($anilistData['title']['english']) && ! empty($anilistData['title']['english'])) {
+            $titles[] = ['type' => 'official', 'lang' => 'en', 'title' => $anilistData['title']['english']];
+        }
+        if (isset($anilistData['title']['native']) && ! empty($anilistData['title']['native'])) {
+            $titles[] = ['type' => 'main', 'lang' => 'ja', 'title' => $anilistData['title']['native']];
+        }
+
+        return [
+            'anilist_id' => $anilistData['id'] ?? null,
+            'mal_id' => $anilistData['idMal'] ?? null,
+            'country' => $anilistData['countryOfOrigin'] ?? null,
+            'media_type' => $anilistData['type'] ?? null,
+            'type' => $anilistData['format'] ?? null,
+            'episodes' => isset($anilistData['episodes']) ? (int) $anilistData['episodes'] : null,
+            'duration' => isset($anilistData['duration']) ? (int) $anilistData['duration'] : null,
+            'status' => $anilistData['status'] ?? null,
+            'source' => $anilistData['source'] ?? null,
+            'hashtag' => $anilistData['hashtag'] ?? null,
+            'startdate' => $parts[0] === '1' ? $parts[1] : null,
+            'enddate' => $parts[2] === '1' ? $parts[3] : null,
+            'description' => $parts[4],
+            'rating' => isset($anilistData['averageScore']) ? (string) $anilistData['averageScore'] : null,
+            'picture' => $parts[5] === '1' ? $parts[6] : null,
+            'categories' => $parts[7],
+            'characters' => $parts[8],
+            'creators' => $parts[9],
+            'related' => $parts[10],
+            'similar' => $parts[11],
+            'titles' => $titles,
+        ];
+    }
+
+    /**
+     * @param  array<string, mixed>  $anilistData
+     * @return array<string, mixed>
+     */
+    public function normalizeAniListMediaPhp(array $anilistData): array
+    {
         $startDate = null;
         if (isset($anilistData['startDate']['year'], $anilistData['startDate']['month'], $anilistData['startDate']['day'])) {
             $startDate = sprintf(
@@ -545,15 +658,69 @@ class PopulateAniListService
             $similar = implode(', ', array_slice($similarItems, 0, 20));
         }
 
-        $anilistId = $anilistData['id'] ?? null;
-        $malId = $anilistData['idMal'] ?? null;
-        $country = $anilistData['countryOfOrigin'] ?? null;
-        $mediaType = $anilistData['type'] ?? null; // ANIME or MANGA
-        $episodes = isset($anilistData['episodes']) ? (int) $anilistData['episodes'] : null;
-        $duration = isset($anilistData['duration']) ? (int) $anilistData['duration'] : null;
-        $status = $anilistData['status'] ?? null;
-        $source = $anilistData['source'] ?? null;
-        $hashtag = $anilistData['hashtag'] ?? null;
+        $titles = [];
+        if (isset($anilistData['title']['romaji']) && ! empty($anilistData['title']['romaji'])) {
+            $titles[] = ['type' => 'main', 'lang' => 'x-jat', 'title' => $anilistData['title']['romaji']];
+        }
+        if (isset($anilistData['title']['english']) && ! empty($anilistData['title']['english'])) {
+            $titles[] = ['type' => 'official', 'lang' => 'en', 'title' => $anilistData['title']['english']];
+        }
+        if (isset($anilistData['title']['native']) && ! empty($anilistData['title']['native'])) {
+            $titles[] = ['type' => 'main', 'lang' => 'ja', 'title' => $anilistData['title']['native']];
+        }
+
+        return [
+            'anilist_id' => $anilistData['id'] ?? null,
+            'mal_id' => $anilistData['idMal'] ?? null,
+            'country' => $anilistData['countryOfOrigin'] ?? null,
+            'media_type' => $anilistData['type'] ?? null,
+            'type' => $anilistData['format'] ?? null,
+            'episodes' => isset($anilistData['episodes']) ? (int) $anilistData['episodes'] : null,
+            'duration' => isset($anilistData['duration']) ? (int) $anilistData['duration'] : null,
+            'status' => $anilistData['status'] ?? null,
+            'source' => $anilistData['source'] ?? null,
+            'hashtag' => $anilistData['hashtag'] ?? null,
+            'startdate' => $startDate,
+            'enddate' => $endDate,
+            'description' => $description,
+            'rating' => $rating,
+            'picture' => $picture,
+            'categories' => $genres,
+            'characters' => $characters,
+            'creators' => $creators,
+            'related' => $related,
+            'similar' => $similar,
+            'titles' => $titles,
+        ];
+    }
+
+    /**
+     * Insert or update AniList info data.
+     *
+     * @param  array<string, mixed>  $anilistData
+     */
+    protected function insertAniListInfo(int $anidbid, array $anilistData): void
+    {
+        $normalized = $this->normalizeAniListMedia($anilistData);
+        $startDate = $normalized['startdate'];
+        $endDate = $normalized['enddate'];
+        $description = $normalized['description'];
+        $rating = $normalized['rating'];
+        $picture = $normalized['picture'];
+        $genres = $normalized['categories'];
+        $characters = $normalized['characters'];
+        $creators = $normalized['creators'];
+        $related = $normalized['related'];
+        $similar = $normalized['similar'];
+        $anilistId = $normalized['anilist_id'];
+        $malId = $normalized['mal_id'];
+        $country = $normalized['country'];
+        $mediaType = $normalized['media_type'];
+        $episodes = $normalized['episodes'];
+        $duration = $normalized['duration'];
+        $status = $normalized['status'];
+        $source = $normalized['source'];
+        $hashtag = $normalized['hashtag'];
 
         // Use updateOrInsert to handle race conditions atomically
         // This prevents duplicate key errors when multiple processes try to insert the same record
@@ -565,7 +732,7 @@ class PopulateAniListService
             'mal_id' => $malId,
             'country' => $country,
             'media_type' => $mediaType,
-            'type' => $anilistData['format'] ?? null,
+            'type' => $normalized['type'],
             'episodes' => $episodes,
             'duration' => $duration,
             'status' => $status,
@@ -615,14 +782,8 @@ class PopulateAniListService
         );
 
         // Insert titles
-        if (isset($anilistData['title']['romaji']) && ! empty($anilistData['title']['romaji'])) {
-            $this->insertAniListTitle($anidbid, 'main', 'x-jat', $anilistData['title']['romaji']);
-        }
-        if (isset($anilistData['title']['english']) && ! empty($anilistData['title']['english'])) {
-            $this->insertAniListTitle($anidbid, 'official', 'en', $anilistData['title']['english']);
-        }
-        if (isset($anilistData['title']['native']) && ! empty($anilistData['title']['native'])) {
-            $this->insertAniListTitle($anidbid, 'main', 'ja', $anilistData['title']['native']);
+        foreach ($normalized['titles'] as $titleRecord) {
+            $this->insertAniListTitle($anidbid, $titleRecord['type'], $titleRecord['lang'], $titleRecord['title']);
         }
 
         // Download cover image if available
