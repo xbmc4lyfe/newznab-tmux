@@ -15,6 +15,8 @@ use App\Services\Releases\ReleaseBrowseService;
 use App\Services\TvProcessing\Providers\TraktProvider;
 use App\Support\ReleaseSearchIndexSync;
 use App\Support\RustPipelineLibrary;
+use FFI;
+use FFI\CData;
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\GuzzleException;
 use Illuminate\Support\Carbon;
@@ -22,6 +24,7 @@ use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
+use Throwable;
 
 /**
  * Service class for movie data fetching and processing.
@@ -34,6 +37,18 @@ class MovieService
     protected const MATCH_PERCENT_ALT_TITLE = 55;
 
     protected const YEAR_MATCH_PERCENT = 80;
+
+    private const string FFI_CDEF = <<<'C'
+        int32_t nntmux_movie_matches_context(const char *current_title, size_t current_title_len, const char *current_year, size_t current_year_len, const char *title, size_t title_len, const char *year, size_t year_len);
+        ssize_t nntmux_movie_score_local_candidates_batch_nul(const char *current_title, size_t current_title_len, const char *current_year, size_t current_year_len, const char *titles, size_t titles_len, const char *years, size_t years_len, size_t count, double *out_score);
+        const char *nntmux_movie_clean_release_name(const char *name, size_t name_len);
+        C;
+
+    private static ?FFI $ffi = null;
+
+    private static bool $ffiResolved = false;
+
+    private static ?CData $scoreOut = null;
 
     protected string $currentTitle = '';
 
@@ -379,7 +394,7 @@ class MovieService
                 if ($mov['cover'] === 0) {
                     Log::warning('Failed to save FanartTV cover for '.$imdbId.' from URL: '.$fanart['cover']);
                 }
-            } catch (\Throwable $e) {
+            } catch (Throwable $e) {
                 Log::error('Error saving FanartTV cover for '.$imdbId.': '.$e->getMessage());
                 $mov['cover'] = 0;
             }
@@ -391,7 +406,7 @@ class MovieService
                 if ($mov['cover'] === 0) {
                     Log::warning('Failed to save TMDB cover for '.$imdbId.' from URL: '.$tmdb['cover']);
                 }
-            } catch (\Throwable $e) {
+            } catch (Throwable $e) {
                 Log::error('Error saving TMDB cover for '.$imdbId.': '.$e->getMessage());
                 $mov['cover'] = 0;
             }
@@ -403,7 +418,7 @@ class MovieService
                 if ($mov['cover'] === 0) {
                     Log::warning('Failed to save IMDB cover for '.$imdbId.' from URL: '.$imdb['cover']);
                 }
-            } catch (\Throwable $e) {
+            } catch (Throwable $e) {
                 Log::error('Error saving IMDB cover for '.$imdbId.': '.$e->getMessage());
                 $mov['cover'] = 0;
             }
@@ -415,7 +430,7 @@ class MovieService
                 if ($mov['cover'] === 0) {
                     Log::warning('Failed to save OMDB cover for '.$imdbId.' from URL: '.$omdb['cover']);
                 }
-            } catch (\Throwable $e) {
+            } catch (Throwable $e) {
                 Log::error('Error saving OMDB cover for '.$imdbId.': '.$e->getMessage());
                 $mov['cover'] = 0;
             }
@@ -425,7 +440,7 @@ class MovieService
         if (! empty($fanart['backdrop'])) {
             try {
                 $mov['backdrop'] = $this->saveRemoteAsset($imdbId.'-backdrop', $fanart['backdrop'], ImageAssetProfile::Backdrop);
-            } catch (\Throwable $e) {
+            } catch (Throwable $e) {
                 Log::warning('Error saving FanartTV backdrop for '.$imdbId.': '.$e->getMessage());
                 $mov['backdrop'] = 0;
             }
@@ -434,7 +449,7 @@ class MovieService
         if ($mov['backdrop'] === 0 && ! empty($tmdb['backdrop'])) {
             try {
                 $mov['backdrop'] = $this->saveRemoteAsset($imdbId.'-backdrop', $tmdb['backdrop'], ImageAssetProfile::Backdrop);
-            } catch (\Throwable $e) {
+            } catch (Throwable $e) {
                 Log::warning('Error saving TMDB backdrop for '.$imdbId.': '.$e->getMessage());
                 $mov['backdrop'] = 0;
             }
@@ -444,7 +459,7 @@ class MovieService
         if (! empty($fanart['banner'])) {
             try {
                 $mov['banner'] = $this->saveRemoteAsset($imdbId.'-banner', $fanart['banner']);
-            } catch (\Throwable $e) {
+            } catch (Throwable $e) {
                 Log::warning('Error saving FanartTV banner for '.$imdbId.': '.$e->getMessage());
                 $mov['banner'] = 0;
             }
@@ -558,7 +573,7 @@ class MovieService
 
                 return $result;
             }
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             Log::warning('FanartTV API error for '.$imdbId.': '.$e->getMessage());
         }
 
@@ -717,7 +732,7 @@ class MovieService
 
             return $ret;
 
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             Log::warning('TMDB API error for '.$lookupId.': '.$e->getMessage());
             Cache::put($cacheKey, false, now()->addHours(6));
 
@@ -801,7 +816,7 @@ class MovieService
             }
 
             return $scraped;
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             Log::warning('IMDb scrape error for '.$imdbId.': '.$e->getMessage());
             Cache::put($cacheKey, false, now()->addHours(6));
 
@@ -869,7 +884,7 @@ class MovieService
 
             return $movieData;
 
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             Log::warning('Trakt API error for '.$imdbId.': '.$e->getMessage());
             Cache::put($cacheKey, false, now()->addHours(6));
 
@@ -954,7 +969,7 @@ class MovieService
 
             return $movieData;
 
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             Log::warning('OMDB API error for '.$imdbId.': '.$e->getMessage());
             Cache::put($cacheKey, false, now()->addHours(6));
 
@@ -1223,7 +1238,7 @@ class MovieService
                     return true;
                 }
             }
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             Log::debug('IMDb scraper search failed: '.$e->getMessage());
         }
 
@@ -1354,7 +1369,7 @@ class MovieService
                 }
             }
 
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             Log::warning('TMDB API error: '.$e->getMessage());
         }
 
@@ -1391,6 +1406,30 @@ class MovieService
             return false;
         }
 
+        $match = $this->bestLocalMatch($potentialMatches->all());
+
+        if ($match !== null) {
+            Cache::put($cacheKey, $match, now()->addDays(7));
+
+            if ($this->echooutput) {
+                cli()->info("Found local match: {$this->currentTitle} ({$match})");
+            }
+
+            return $match;
+        }
+
+        Cache::put($cacheKey, false, now()->addHours(6));
+
+        return false;
+    }
+
+    /**
+     * IMDb id of the best local movieinfo candidate for the current title/year, or null.
+     *
+     * @param  array<int, MovieInfo|array<string, mixed>>  $potentialMatches
+     */
+    protected function bestLocalMatch(array $potentialMatches): ?string
+    {
         $candidates = [];
         foreach ($potentialMatches as $match) {
             $percent = $this->similarityPercent($this->currentTitle, $match['title']);
@@ -1411,21 +1450,54 @@ class MovieService
             $candidates[] = ['imdbid' => $match['imdbid'], 'percent' => $percent];
         }
 
-        $match = $this->pickBestLocalCandidate($candidates);
+        return $this->pickBestLocalCandidate($candidates);
+    }
 
-        if ($match !== null) {
-            Cache::put($cacheKey, $match, now()->addDays(7));
-
-            if ($this->echooutput) {
-                cli()->info("Found local match: {$this->currentTitle} ({$match})");
+    /**
+     * Rust `nntmux_movie_score_local_candidates_batch_nul` for parity testing: the index and percent of
+     * the candidate `bestLocalMatch()` picks, `false` when none is accepted, or `null` when the library
+     * is unavailable or declines (non-digit current year, NUL bytes, non-string/int fields). Production
+     * keeps the PHP loop: Eloquent attribute reads dominate, leaving common p99 at 1.33-1.57x.
+     *
+     * @param  array<int, array{title: mixed, year: mixed}>  $candidates
+     * @return array{index: int, percent: float}|false|null
+     */
+    public static function scoreLocalCandidatesNative(string $currentTitle, string $currentYear, array $candidates): array|false|null
+    {
+        $ffi = self::$ffi ?? (self::$ffiResolved ? null : self::ffi());
+        $count = count($candidates);
+        if ($ffi === null || $count === 0) {
+            return null;
+        }
+        $titles = [];
+        $years = [];
+        foreach ($candidates as $candidate) {
+            $title = self::ffiScalar($candidate['title']);
+            $year = self::ffiScalar($candidate['year']);
+            if ($title === null || $year === null) {
+                return null;
             }
-
-            return $match;
+            $titles[] = $title;
+            $years[] = $year;
+        }
+        $titles = implode("\0", $titles);
+        $years = implode("\0", $years);
+        if (substr_count($titles, "\0") !== $count - 1 || substr_count($years, "\0") !== $count - 1) {
+            return null;
+        }
+        try {
+            $out = self::$scoreOut ??= $ffi->new('double');
+            // @phpstan-ignore method.notFound
+            $index = $ffi->nntmux_movie_score_local_candidates_batch_nul($currentTitle, strlen($currentTitle), $currentYear, strlen($currentYear), $titles, strlen($titles), $years, strlen($years), $count, FFI::addr($out));
+        } catch (Throwable) {
+            return null;
+        }
+        if ($index === -2) {
+            return false;
         }
 
-        Cache::put($cacheKey, false, now()->addHours(6));
-
-        return false;
+        // @phpstan-ignore property.notFound
+        return is_int($index) && $index >= 0 && $index < $count ? ['index' => $index, 'percent' => (float) $out->cdata] : null;
     }
 
     /**
@@ -1440,6 +1512,26 @@ class MovieService
         usort($candidates, static fn (array $a, array $b): int => $b['percent'] <=> $a['percent']);
 
         return $candidates[0]['imdbid'];
+    }
+
+    /**
+     * Rust `nntmux_movie_clean_release_name` for parity testing; `null` when the library is unavailable or
+     * declines (NUL bytes). Production keeps PHP: the FFI call costs more on short names (0.79-0.81x).
+     */
+    public static function cleanReleaseNameForMovieLookupNative(string $searchname): ?string
+    {
+        $ffi = self::$ffi ?? (self::$ffiResolved ? null : self::ffi());
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $clean = $ffi->nntmux_movie_clean_release_name($searchname, strlen($searchname));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return is_string($clean) ? $clean : null;
     }
 
     /**
@@ -1467,6 +1559,32 @@ class MovieService
         similar_text($normalizedLeft, $normalizedRight, $percent);
 
         return $percent;
+    }
+
+    /**
+     * Rust `nntmux_movie_matches_context`: bit 0 is `matchesCurrentContext()`'s result and bit 1 is set when
+     * it flags `candidateMismatch`; `null` when the library is unavailable or declines (non-digit current
+     * year, non-string/int title or year). Production keeps PHP: common-path gains are 1.34-1.36x.
+     */
+    public static function matchesContextNative(string $currentTitle, string $currentYear, mixed $title, mixed $year): ?int
+    {
+        $ffi = self::$ffi ?? (self::$ffiResolved ? null : self::ffi());
+        if ($ffi === null) {
+            return null;
+        }
+        $title = self::ffiScalar($title);
+        $year = self::ffiScalar($year);
+        if ($title === null || $year === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $packed = $ffi->nntmux_movie_matches_context($currentTitle, strlen($currentTitle), $currentYear, strlen($currentYear), $title, strlen($title), $year, strlen($year));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return is_int($packed) && $packed >= 0 ? $packed : null;
     }
 
     /**
@@ -1565,6 +1683,30 @@ class MovieService
         }
 
         return $this->candidateMatchesLocalInfo($imdbId);
+    }
+
+    /**
+     * A title/year as the Rust helpers receive it: `null` and ints keep their `empty()`,
+     * `(string)` and `similar_text()` behaviour as strings; other types decline to PHP.
+     */
+    private static function ffiScalar(mixed $value): ?string
+    {
+        return match (true) {
+            is_string($value) => $value,
+            is_int($value) => (string) $value,
+            $value === null => '',
+            default => null,
+        };
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (! self::$ffiResolved) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('movie_candidate_scoring', self::FFI_CDEF);
+            self::$ffiResolved = true;
+        }
+
+        return self::$ffi;
     }
 
     private function normalizeComparisonValue(mixed $value): ?string
@@ -1725,7 +1867,7 @@ class MovieService
                     return true;
                 }
             }
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             Log::debug('Fanart cover fetch failed for '.$imdbId.': '.$e->getMessage());
         }
 
@@ -1736,7 +1878,7 @@ class MovieService
                     return true;
                 }
             }
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             Log::debug('TMDB cover fetch failed for '.$imdbId.': '.$e->getMessage());
         }
 
@@ -1747,7 +1889,7 @@ class MovieService
                     return true;
                 }
             }
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             Log::debug('IMDB cover fetch failed for '.$imdbId.': '.$e->getMessage());
         }
 
@@ -1758,7 +1900,7 @@ class MovieService
                     return true;
                 }
             }
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             Log::debug('OMDB cover fetch failed for '.$imdbId.': '.$e->getMessage());
         }
 

@@ -7117,3 +7117,866 @@ mod book_service_tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// AbstractTvProvider / MovieService candidate scoring
+// ---------------------------------------------------------------------------
+
+/// Rust mirrors of `AbstractTvProvider::checkMatch()/scoreCandidate()/normalizeShowTitle()` and
+/// `MovieService::matchesCurrentContext()/localIMDBSearch()` scoring and
+/// `cleanReleaseNameForMovieLookup()`. Every similarity uses PHP's byte-level `similar_text`
+/// (`crate::predb::similarity_percent`).
+pub mod candidate_scoring {
+    use std::cell::RefCell;
+    use std::ffi::c_char;
+    use std::slice;
+
+    use super::{is_pcre_space, is_pcre_word, php_trim_ascii};
+    use crate::predb::similarity_percent;
+
+    /// `AbstractTvProvider::MATCH_PROBABILITY`.
+    const TV_MATCH_PROBABILITY: f64 = 75.0;
+
+    /// `MovieService::MATCH_PERCENT`.
+    const MOVIE_MATCH_PERCENT: f64 = 75.0;
+
+    /// `nntmux_tv_score_candidate` flag: `$ourYear` is not null.
+    pub const TV_FLAG_OUR_YEAR: u32 = 1;
+    /// `nntmux_tv_score_candidate` flag: `$candidateStarted` is an int (`started_int`).
+    pub const TV_FLAG_STARTED_INT: u32 = 2;
+    /// `nntmux_tv_score_candidate` flag: `$candidateStarted` is a string (`started`).
+    pub const TV_FLAG_STARTED_STRING: u32 = 4;
+
+    #[inline]
+    unsafe fn input<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            Some(&[])
+        } else if ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { slice::from_raw_parts(ptr, len) })
+        }
+    }
+
+    thread_local! {
+        static OUT: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(256));
+        static LOWER: RefCell<(Vec<u8>, Vec<u8>)> = RefCell::new((Vec::with_capacity(128), Vec::with_capacity(128)));
+    }
+
+    /// PHP `mb_strtolower()` (UTF-8) for ASCII and U+0080..U+00FF; `false` (decline) for any other
+    /// code point or invalid UTF-8, where Unicode-version or substitution behaviour could diverge.
+    pub fn mb_lower_latin1_into(input: &[u8], out: &mut Vec<u8>) -> bool {
+        out.clear();
+        out.reserve(input.len());
+        let mut i = 0;
+        while i < input.len() {
+            let b = input[i];
+            if b < 0x80 {
+                out.push(b.to_ascii_lowercase());
+                i += 1;
+                continue;
+            }
+            let Some(&c) = input.get(i + 1) else {
+                return false;
+            };
+            if !(0x80..=0xBF).contains(&c) {
+                return false;
+            }
+            match b {
+                0xC2 => out.extend_from_slice(&[b, c]),
+                0xC3 => out.extend_from_slice(&[
+                    b,
+                    if (0x80..=0x9E).contains(&c) && c != 0x97 {
+                        c + 0x20
+                    } else {
+                        c
+                    },
+                ]),
+                _ => return false,
+            }
+            i += 2;
+        }
+        true
+    }
+
+    /// `AbstractTvProvider::yearOf()` for a string: `/^((?:19|20)\d{2})\b/` on `trim($date)`.
+    pub fn tv_year_of_str(date: &[u8]) -> Option<i64> {
+        let d = php_trim_ascii(date);
+        if d.len() < 4
+            || !matches!((d[0], d[1]), (b'1', b'9') | (b'2', b'0'))
+            || !d[2].is_ascii_digit()
+            || !d[3].is_ascii_digit()
+            || d.get(4).is_some_and(|&b| is_pcre_word(b))
+        {
+            return None;
+        }
+        Some(
+            d[..4]
+                .iter()
+                .fold(0i64, |acc, &b| acc * 10 + i64::from(b - b'0')),
+        )
+    }
+
+    /// `AbstractTvProvider::yearOf()` for an int.
+    #[inline]
+    pub fn tv_year_of_int(date: i64) -> Option<i64> {
+        (date >= 1900).then_some(date)
+    }
+
+    /// `/^(?P<title>.+?)\s*\((?P<year>(19|20)\d{2})\)$/` on an already trimmed title.
+    pub fn tv_split_title_year(t: &[u8]) -> Option<(&[u8], i64)> {
+        let n = t.len();
+        if n < 7 {
+            return None;
+        }
+        let suffix = &t[n - 6..];
+        if suffix[0] != b'('
+            || suffix[5] != b')'
+            || !matches!((suffix[1], suffix[2]), (b'1', b'9') | (b'2', b'0'))
+            || !suffix[3].is_ascii_digit()
+            || !suffix[4].is_ascii_digit()
+        {
+            return None;
+        }
+        let head = &t[..n - 6];
+        let mut end = head.len();
+        while end > 0 && is_pcre_space(head[end - 1]) {
+            end -= 1;
+        }
+        let end = end.max(1);
+        if head[..end].contains(&b'\n') {
+            return None;
+        }
+        let year = suffix[1..5]
+            .iter()
+            .fold(0i64, |acc, &b| acc * 10 + i64::from(b - b'0'));
+        Some((&head[..end], year))
+    }
+
+    /// `AbstractTvProvider::normalizeCountryCode($a) === normalizeCountryCode($b)`.
+    pub fn tv_country_eq(a: &[u8], b: &[u8]) -> bool {
+        fn norm(c: &[u8]) -> &[u8] {
+            let c = php_trim_ascii(c);
+            if c.eq_ignore_ascii_case(b"UK") {
+                b"GB"
+            } else {
+                c
+            }
+        }
+        norm(a).eq_ignore_ascii_case(norm(b))
+    }
+
+    /// `checkMatch($ours, $scrape, $probability)` for strings.
+    #[inline]
+    pub fn tv_check_match(ours: &[u8], scrape: &[u8], probability: f64) -> f64 {
+        let pct = similarity_percent(ours, scrape);
+        if pct >= probability { pct } else { 0.0 }
+    }
+
+    /// `scoreCandidate()` given the already lowercased trimmed release title; `None` declines.
+    pub fn tv_score_with_lower(
+        ours_lower: &[u8],
+        our_year: Option<i64>,
+        title: &[u8],
+        started_year: Option<i64>,
+        our_country: &[u8],
+        candidate_country: &[u8],
+        buf: &mut Vec<u8>,
+    ) -> Option<f64> {
+        let mut candidate_year = started_year;
+        let mut title = php_trim_ascii(title);
+        if let Some((t, y)) = tv_split_title_year(title) {
+            title = t;
+            candidate_year = candidate_year.or(Some(y));
+        }
+        if !mb_lower_latin1_into(php_trim_ascii(title), buf) {
+            return None;
+        }
+        if ours_lower.is_empty() || buf.is_empty() {
+            return Some(0.0);
+        }
+        let exact = ours_lower == buf.as_slice();
+        let mut score = if exact {
+            100.0
+        } else {
+            tv_check_match(buf, ours_lower, TV_MATCH_PROBABILITY)
+        };
+        if score <= 0.0 {
+            return Some(0.0);
+        }
+        if let (Some(ours), Some(theirs)) = (our_year, candidate_year) {
+            if (i128::from(ours) - i128::from(theirs)).abs() <= 1 {
+                score += 10.0;
+            } else if !exact {
+                return Some(0.0);
+            } else {
+                score -= 20.0;
+            }
+        }
+        if !our_country.is_empty()
+            && !candidate_country.is_empty()
+            && tv_country_eq(our_country, candidate_country)
+        {
+            score += 2.0;
+        }
+        Some(score)
+    }
+
+    /// Full `scoreCandidate()`; `None` declines (non-Latin-1 or invalid UTF-8 titles).
+    pub fn tv_score_candidate(
+        ours: &[u8],
+        our_year: Option<i64>,
+        title: &[u8],
+        started_year: Option<i64>,
+        our_country: &[u8],
+        candidate_country: &[u8],
+    ) -> Option<f64> {
+        LOWER.with(|cell| {
+            let (ours_lower, buf) = &mut *cell.borrow_mut();
+            if !mb_lower_latin1_into(php_trim_ascii(ours), ours_lower) {
+                return None;
+            }
+            tv_score_with_lower(
+                ours_lower,
+                our_year,
+                title,
+                started_year,
+                our_country,
+                candidate_country,
+                buf,
+            )
+        })
+    }
+
+    /// `normalizeShowTitle()`'s alias for `strtolower(trim($name))`, NUL-terminated.
+    pub fn tv_show_alias(name: &[u8]) -> Option<&'static [u8]> {
+        let name = php_trim_ascii(name);
+        let mut lower = [0u8; 64];
+        if name.len() > lower.len() {
+            return None;
+        }
+        for (dst, &b) in lower.iter_mut().zip(name) {
+            *dst = b.to_ascii_lowercase();
+        }
+        let alias: &'static [u8] = match &lower[..name.len()] {
+            b"grits" => b"Girls Raised in the South\0",
+            b"shield" => b"Agents of S.H.I.E.L.D.\0",
+            b"stephen colbert"
+            | b"late show with stephen colbert"
+            | b"late show stephen colbert"
+            | b"the late show stephen colbert"
+            | b"colbert" => b"The Late Show with Stephen Colbert\0",
+            b"daily show" | b"the daily show" => b"The Daily Show\0",
+            b"daily show with jon stewart" | b"the daily show with jon stewart" => {
+                b"The Daily Show with Jon Stewart\0"
+            }
+            b"daily show with trevor noah" | b"the daily show with trevor noah" => {
+                b"The Daily Show with Trevor Noah\0"
+            }
+            b"seth meyers" | b"late night with seth meyers" | b"late night seth meyers" => {
+                b"Late Night with Seth Meyers\0"
+            }
+            b"jimmy kimmel" | b"jimmy kimmel live" => b"Jimmy Kimmel Live!\0",
+            b"the late late show with james corden"
+            | b"late late show with james corden"
+            | b"late show with james corden"
+            | b"james corden"
+            | b"late late show james corden" => b"The Late Late Show with James Corden\0",
+            b"jimmy fallon"
+            | b"the tonight show starring jimmy fallon"
+            | b"tonight show with jimmy fallon"
+            | b"tonight show jimmy fallon" => b"The Tonight Show Starring Jimmy Fallon\0",
+            b"oak island fluch und legende"
+            | b"oak island - fluch und legende"
+            | b"die schatzsucher von oak island" => b"The Curse of Oak Island\0",
+            b"tierische freundschaften" => b"Animal Odd Couples\0",
+            b"zwischen meer und maloche" => b"Zwischen Meer und Maloche\0",
+            b"game of thrones das lied von eis und feuer" => b"Game of Thrones\0",
+            b"die simpsons" => b"The Simpsons\0",
+            b"die wilden siebziger" => b"That 70s Show\0",
+            b"how i met your mother" => b"How I Met Your Mother\0",
+            b"scrubs die anfanger" | b"scrubs die anfaenger" => b"Scrubs\0",
+            b"der prinz von bel-air" | b"prinz von bel-air" | b"der prinz von bel air" => {
+                b"The Fresh Prince of Bel-Air\0"
+            }
+            b"alarm fur cobra 11" | b"alarm fuer cobra 11" => b"Alarm for Cobra 11\0",
+            b"soko" => b"SOKO\0",
+            b"der bergdoktor" => b"Der Bergdoktor\0",
+            b"das boot" => b"Das Boot\0",
+            b"babylon berlin" => b"Babylon Berlin\0",
+            b"dark" => b"Dark\0",
+            b"tatort" => b"Tatort\0",
+            b"polizeiruf 110" => b"Polizeiruf 110\0",
+            _ => return None,
+        };
+        Some(alias)
+    }
+
+    /// PHP `empty()` for a string.
+    #[inline]
+    fn php_empty(s: &[u8]) -> bool {
+        s.is_empty() || s == b"0"
+    }
+
+    /// Marker error: the current year is not `''` or plain ASCII digits, so the caller declines to PHP.
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct UnsupportedYear;
+
+    /// `(int) $this->currentYear` when it is `''` (`Ok(None)`) or plain ASCII digits; `Err` declines.
+    pub fn movie_current_year(year: &[u8]) -> Result<Option<i64>, UnsupportedYear> {
+        if year.is_empty() {
+            return Ok(None);
+        }
+        if year.len() > 18 || !year.iter().all(u8::is_ascii_digit) {
+            return Err(UnsupportedYear);
+        }
+        Ok(Some(
+            year.iter()
+                .fold(0i64, |acc, &b| acc * 10 + i64::from(b - b'0')),
+        ))
+    }
+
+    /// `MovieService::yearDifference($year)` for a stringified `$year`.
+    pub fn movie_year_difference(current: Option<i64>, year: &[u8]) -> Option<i64> {
+        let current = current?;
+        if php_empty(year) {
+            return None;
+        }
+        let start = year
+            .windows(4)
+            .position(|w| w.iter().all(u8::is_ascii_digit))?;
+        let found = year[start..start + 4]
+            .iter()
+            .fold(0i64, |acc, &b| acc * 10 + i64::from(b - b'0'));
+        Some((current - found).abs())
+    }
+
+    /// `MovieService::isNearExactTitleMatch($candidate, $percent)`.
+    pub fn movie_near_exact(candidate: &[u8], current: &[u8], percent: f64) -> bool {
+        if percent >= 95.0 {
+            return true;
+        }
+        let keep = |b: &u8| {
+            let l = b.to_ascii_lowercase();
+            l.is_ascii_lowercase() || l.is_ascii_digit()
+        };
+        let mut a = candidate
+            .iter()
+            .filter(|b| keep(b))
+            .map(u8::to_ascii_lowercase);
+        let mut b = current
+            .iter()
+            .filter(|b| keep(b))
+            .map(u8::to_ascii_lowercase);
+        loop {
+            match (a.next(), b.next()) {
+                (None, None) => return true,
+                (Some(x), Some(y)) if x == y => {}
+                _ => return false,
+            }
+        }
+    }
+
+    /// `MovieService::matchesCurrentContext()`: bit 0 = result, bit 1 = `candidateMismatch` set.
+    pub fn movie_matches_context(
+        current_title: &[u8],
+        current_year: Option<i64>,
+        title: &[u8],
+        year: &[u8],
+    ) -> u8 {
+        if current_title.is_empty() {
+            return 1;
+        }
+        let title_empty = php_empty(title);
+        let percent = if title_empty {
+            0.0
+        } else {
+            similarity_percent(current_title, title)
+        };
+        let near_exact = !title_empty && movie_near_exact(title, current_title, percent);
+        let difference = movie_year_difference(current_year, year);
+        if let Some(d) = difference
+            && d > i64::from(near_exact)
+        {
+            return 2;
+        }
+        if percent < MOVIE_MATCH_PERCENT && difference != Some(0) {
+            return 2;
+        }
+        1
+    }
+
+    /// `localIMDBSearch()` candidate filter + `pickBestLocalCandidate()`: index and percent of the
+    /// first highest-scoring accepted candidate.
+    pub fn movie_best_local<'a>(
+        current_title: &[u8],
+        current_year: Option<i64>,
+        candidates: impl Iterator<Item = (&'a [u8], &'a [u8])>,
+    ) -> Option<(usize, f64)> {
+        let mut best: Option<(usize, f64)> = None;
+        for (i, (title, year)) in candidates.enumerate() {
+            let percent = similarity_percent(current_title, title);
+            if percent < MOVIE_MATCH_PERCENT {
+                continue;
+            }
+            if let Some(d) = movie_year_difference(current_year, year)
+                && d > i64::from(movie_near_exact(title, current_title, percent))
+            {
+                continue;
+            }
+            if best.is_none_or(|(_, p)| percent > p) {
+                best = Some((i, percent));
+            }
+        }
+        best
+    }
+
+    /// `cleanReleaseNameForMovieLookup()`; `false` declines inputs containing NUL.
+    pub fn movie_clean_release_name_into(input: &[u8], out: &mut Vec<u8>) -> bool {
+        if input.contains(&0) {
+            return false;
+        }
+        let map = |b: u8| if b == b'.' || b == b'_' { b' ' } else { b };
+        let mut collapsed = Vec::with_capacity(input.len());
+        let mut i = 0;
+        while i < input.len() {
+            let b = map(input[i]);
+            if is_pcre_space(b) {
+                let start = i;
+                while i < input.len() && is_pcre_space(map(input[i])) {
+                    i += 1;
+                }
+                if i - start >= 2 {
+                    collapsed.push(b' ');
+                } else {
+                    collapsed.push(b);
+                }
+            } else {
+                collapsed.push(b);
+                i += 1;
+            }
+        }
+        out.clear();
+        out.extend_from_slice(php_trim_ascii(&collapsed));
+        true
+    }
+
+    // -- C ABI -------------------------------------------------------------------------------
+
+    /// `checkMatch()` for two strings and a numeric probability; `-1.0` for an invalid pointer.
+    ///
+    /// # Safety
+    ///
+    /// `ours` and `scrape` must be valid for reads of their lengths when non-null.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tv_check_match(
+        ours: *const u8,
+        ours_len: usize,
+        scrape: *const u8,
+        scrape_len: usize,
+        probability: f64,
+    ) -> f64 {
+        match unsafe { (input(ours, ours_len), input(scrape, scrape_len)) } {
+            (Some(a), Some(b)) => tv_check_match(a, b, probability),
+            _ => -1.0,
+        }
+    }
+
+    /// `scoreCandidate()`. `flags` carries [`TV_FLAG_OUR_YEAR`], [`TV_FLAG_STARTED_INT`] (`started_int`
+    /// holds `$candidateStarted`) or [`TV_FLAG_STARTED_STRING`] (`started` holds it). Returns the score
+    /// (`>= 0`) or `-1.0` to decline to PHP.
+    ///
+    /// # Safety
+    ///
+    /// Every pointer must be valid for reads of its length when non-null.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_tv_score_candidate(
+        ours: *const u8,
+        ours_len: usize,
+        our_year: i64,
+        title: *const u8,
+        title_len: usize,
+        started: *const u8,
+        started_len: usize,
+        started_int: i64,
+        our_country: *const u8,
+        our_country_len: usize,
+        candidate_country: *const u8,
+        candidate_country_len: usize,
+        flags: u32,
+    ) -> f64 {
+        let (Some(ours), Some(title), Some(started), Some(oc), Some(cc)) = (unsafe {
+            (
+                input(ours, ours_len),
+                input(title, title_len),
+                input(started, started_len),
+                input(our_country, our_country_len),
+                input(candidate_country, candidate_country_len),
+            )
+        }) else {
+            return -1.0;
+        };
+        let started_year = if flags & TV_FLAG_STARTED_INT != 0 {
+            tv_year_of_int(started_int)
+        } else if flags & TV_FLAG_STARTED_STRING != 0 {
+            tv_year_of_str(started)
+        } else {
+            None
+        };
+        let our_year = (flags & TV_FLAG_OUR_YEAR != 0).then_some(our_year);
+        tv_score_candidate(ours, our_year, title, started_year, oc, cc).unwrap_or(-1.0)
+    }
+
+    /// Batch `scoreCandidate()` over `count` candidates. `titles` and `countries` are NUL-separated;
+    /// `starteds` is NUL-separated segments of `n` (null/other), `i<decimal>` (int) or `s<string>`.
+    /// Writes each score to `out_scores` (`-1.0` where that candidate declines) and returns `count`,
+    /// or `-1` to decline the whole batch (segment mismatch, invalid release title).
+    ///
+    /// # Safety
+    ///
+    /// Every input pointer must be valid for reads of its length when non-null, and `out_scores`
+    /// must be valid for `count` `f64` writes.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_tv_score_candidates_batch_nul(
+        ours: *const u8,
+        ours_len: usize,
+        our_year: i64,
+        flags: u32,
+        our_country: *const u8,
+        our_country_len: usize,
+        titles: *const u8,
+        titles_len: usize,
+        starteds: *const u8,
+        starteds_len: usize,
+        countries: *const u8,
+        countries_len: usize,
+        count: usize,
+        out_scores: *mut f64,
+    ) -> isize {
+        if count == 0 || out_scores.is_null() || count > isize::MAX as usize {
+            return -1;
+        }
+        let (Some(ours), Some(oc), Some(titles), Some(starteds), Some(countries)) = (unsafe {
+            (
+                input(ours, ours_len),
+                input(our_country, our_country_len),
+                input(titles, titles_len),
+                input(starteds, starteds_len),
+                input(countries, countries_len),
+            )
+        }) else {
+            return -1;
+        };
+        let nuls = |s: &[u8]| s.iter().filter(|&&b| b == 0).count();
+        if nuls(titles) != count - 1 || nuls(starteds) != count - 1 || nuls(countries) != count - 1
+        {
+            return -1;
+        }
+        let mut started_years = Vec::with_capacity(count);
+        for seg in starteds.split(|&b| b == 0) {
+            let year = match seg.split_first() {
+                Some((b'n', [])) => None,
+                Some((b's', rest)) => tv_year_of_str(rest),
+                Some((b'i', digits)) => {
+                    let Some(v) = std::str::from_utf8(digits)
+                        .ok()
+                        .and_then(|d| d.parse::<i64>().ok())
+                    else {
+                        return -1;
+                    };
+                    tv_year_of_int(v)
+                }
+                _ => return -1,
+            };
+            started_years.push(year);
+        }
+        let our_year = (flags & TV_FLAG_OUR_YEAR != 0).then_some(our_year);
+        LOWER.with(|cell| {
+            let (ours_lower, buf) = &mut *cell.borrow_mut();
+            if !mb_lower_latin1_into(php_trim_ascii(ours), ours_lower) {
+                return -1;
+            }
+            let scores = unsafe { slice::from_raw_parts_mut(out_scores, count) };
+            for (((slot, title), country), started_year) in scores
+                .iter_mut()
+                .zip(titles.split(|&b| b == 0))
+                .zip(countries.split(|&b| b == 0))
+                .zip(started_years)
+            {
+                *slot = tv_score_with_lower(
+                    ours_lower,
+                    our_year,
+                    title,
+                    started_year,
+                    oc,
+                    country,
+                    buf,
+                )
+                .unwrap_or(-1.0);
+            }
+            count as isize
+        })
+    }
+
+    /// `normalizeShowTitle()` alias as a static NUL-terminated string, or NULL when the title has no
+    /// alias (PHP then returns the title unchanged).
+    ///
+    /// # Safety
+    ///
+    /// `name` must be valid for `name_len` reads when non-null.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tv_normalize_show_title(
+        name: *const u8,
+        name_len: usize,
+    ) -> *const c_char {
+        match unsafe { input(name, name_len) }.and_then(tv_show_alias) {
+            Some(alias) => alias.as_ptr().cast(),
+            None => std::ptr::null(),
+        }
+    }
+
+    /// `matchesCurrentContext()` for a stringified `$title` and `$year`: bit 0 = return value,
+    /// bit 1 = `candidateMismatch` set; `-1` declines (non-digit current year, invalid pointer).
+    ///
+    /// # Safety
+    ///
+    /// Every pointer must be valid for reads of its length when non-null.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_movie_matches_context(
+        current_title: *const u8,
+        current_title_len: usize,
+        current_year: *const u8,
+        current_year_len: usize,
+        title: *const u8,
+        title_len: usize,
+        year: *const u8,
+        year_len: usize,
+    ) -> i32 {
+        let (Some(ct), Some(cy), Some(title), Some(year)) = (unsafe {
+            (
+                input(current_title, current_title_len),
+                input(current_year, current_year_len),
+                input(title, title_len),
+                input(year, year_len),
+            )
+        }) else {
+            return -1;
+        };
+        if ct.is_empty() {
+            return 1;
+        }
+        match movie_current_year(cy) {
+            Ok(cy) => i32::from(movie_matches_context(ct, cy, title, year)),
+            Err(UnsupportedYear) => -1,
+        }
+    }
+
+    /// `localIMDBSearch()` scoring over `count` NUL-separated stringified `(title, year)` pairs.
+    /// Returns the best candidate index (writing its percent to `out_score`), `-2` when none is
+    /// accepted, or `-1` to decline.
+    ///
+    /// # Safety
+    ///
+    /// Every input pointer must be valid for reads of its length when non-null, and `out_score`
+    /// must be valid for one `f64` write.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_movie_score_local_candidates_batch_nul(
+        current_title: *const u8,
+        current_title_len: usize,
+        current_year: *const u8,
+        current_year_len: usize,
+        titles: *const u8,
+        titles_len: usize,
+        years: *const u8,
+        years_len: usize,
+        count: usize,
+        out_score: *mut f64,
+    ) -> isize {
+        if count == 0 || out_score.is_null() || count > isize::MAX as usize {
+            return -1;
+        }
+        let (Some(ct), Some(cy), Some(titles), Some(years)) = (unsafe {
+            (
+                input(current_title, current_title_len),
+                input(current_year, current_year_len),
+                input(titles, titles_len),
+                input(years, years_len),
+            )
+        }) else {
+            return -1;
+        };
+        let nuls = |s: &[u8]| s.iter().filter(|&&b| b == 0).count();
+        if nuls(titles) != count - 1 || nuls(years) != count - 1 {
+            return -1;
+        }
+        let Ok(cy) = movie_current_year(cy) else {
+            return -1;
+        };
+        match movie_best_local(
+            ct,
+            cy,
+            titles.split(|&b| b == 0).zip(years.split(|&b| b == 0)),
+        ) {
+            Some((index, percent)) => {
+                unsafe { *out_score = percent };
+                index as isize
+            }
+            None => -2,
+        }
+    }
+
+    /// `cleanReleaseNameForMovieLookup()` as a NUL-terminated thread-local string, or NULL to decline
+    /// (inputs containing NUL). The pointer stays valid until the next call on the same thread.
+    ///
+    /// # Safety
+    ///
+    /// `name` must be valid for `name_len` reads when non-null.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_movie_clean_release_name(
+        name: *const u8,
+        name_len: usize,
+    ) -> *const c_char {
+        let Some(name) = (unsafe { input(name, name_len) }) else {
+            return std::ptr::null();
+        };
+        OUT.with(|cell| {
+            let mut out = cell.borrow_mut();
+            if !movie_clean_release_name_into(name, &mut out) {
+                return std::ptr::null();
+            }
+            out.push(0);
+            out.as_ptr().cast()
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn score(ours: &str, year: Option<i64>, title: &str, started: Option<&str>) -> Option<f64> {
+            tv_score_candidate(
+                ours.as_bytes(),
+                year,
+                title.as_bytes(),
+                started.and_then(|s| tv_year_of_str(s.as_bytes())),
+                b"",
+                b"",
+            )
+        }
+
+        #[test]
+        fn tv_score_matches_php_examples() {
+            let classic =
+                score("Doctor Who", Some(2005), "Doctor Who", Some("1963-11-23")).unwrap();
+            let revival = score(
+                "Doctor Who",
+                Some(2005),
+                "Doctor Who (2005)",
+                Some("2005-03-26"),
+            )
+            .unwrap();
+            assert_eq!(classic, 80.0);
+            assert_eq!(revival, 110.0);
+            assert_eq!(
+                score("Shameless", Some(2011), "Shameful", Some("1990-01-01")),
+                Some(0.0)
+            );
+            assert_eq!(
+                score("The Office", None, "Parks and Recreation", None),
+                Some(0.0)
+            );
+            assert_eq!(
+                score("Doctor Who", None, "Doctor Who (2005)", None),
+                Some(100.0)
+            );
+            assert_eq!(score("Pokémon", None, "POKÉMON", None), Some(100.0));
+            assert_eq!(score("İstanbul", None, "istanbul", None), None);
+            assert_eq!(score("Show", None, "Шоу", None), None);
+            assert_eq!(score("  ", None, "Show", None), Some(0.0));
+        }
+
+        #[test]
+        fn title_year_split_and_year_of() {
+            assert_eq!(
+                tv_split_title_year(b"Foo (2005)"),
+                Some((&b"Foo"[..], 2005))
+            );
+            assert_eq!(
+                tv_split_title_year(b"Foo\x0c\x0b (1999)"),
+                Some((&b"Foo"[..], 1999))
+            );
+            assert_eq!(
+                tv_split_title_year(b"\x0c(2005)"),
+                Some((&b"\x0c"[..], 2005))
+            );
+            assert_eq!(tv_split_title_year(b"(2005)"), None);
+            assert_eq!(tv_split_title_year(b"Foo\nBar (2005)"), None);
+            assert_eq!(
+                tv_split_title_year(b"Foo \n(2005)"),
+                Some((&b"Foo"[..], 2005))
+            );
+            assert_eq!(tv_split_title_year(b"Foo (2105)"), None);
+            assert_eq!(tv_year_of_str(b" 2005-01-01"), Some(2005));
+            assert_eq!(tv_year_of_str(b"20051"), None);
+            assert_eq!(tv_year_of_str(b"2005_"), None);
+            assert_eq!(tv_year_of_str("2005é".as_bytes()), Some(2005));
+            assert_eq!(tv_year_of_int(1899), None);
+            assert_eq!(tv_year_of_int(3000), Some(3000));
+        }
+
+        #[test]
+        fn country_and_alias() {
+            assert!(tv_country_eq(b" uk", b"GB"));
+            assert!(tv_country_eq(b"us", b"US "));
+            assert!(!tv_country_eq(b"US", b"CA"));
+            assert_eq!(
+                tv_show_alias(b"  Daily Show\t"),
+                Some(&b"The Daily Show\0"[..])
+            );
+            assert_eq!(tv_show_alias(b"Dark"), Some(&b"Dark\0"[..]));
+            assert_eq!(tv_show_alias(b"Darker"), None);
+        }
+
+        #[test]
+        fn movie_context_and_local_best() {
+            let cy = movie_current_year(b"2026").unwrap();
+            assert_eq!(movie_matches_context(b"Moana", cy, b"Moana 2", b"2024"), 2);
+            assert_eq!(movie_matches_context(b"Moana", cy, b"Moana", b"2025"), 1);
+            assert_eq!(
+                movie_matches_context(b"Salve Geral", cy, b"State of Fear", b"2026"),
+                1
+            );
+            assert_eq!(
+                movie_matches_context(b"Salve Geral", cy, b"State of Fear", b""),
+                2
+            );
+            assert_eq!(movie_matches_context(b"Moana", cy, b"0", b"0"), 2);
+            assert!(movie_current_year(b"20x6").is_err());
+            let titles: [&[u8]; 3] = [b"Moana 2", b"Moana", b"Moana!"];
+            let years: [&[u8]; 3] = [b"2024", b"2026", b"2026"];
+            let best = movie_best_local(
+                b"Moana",
+                cy,
+                titles.iter().copied().zip(years.iter().copied()),
+            );
+            assert_eq!(best, Some((1, 100.0)));
+        }
+
+        #[test]
+        fn clean_release_name() {
+            let mut out = Vec::new();
+            assert!(movie_clean_release_name_into(
+                b"..The_Movie.\t2024..x\t",
+                &mut out
+            ));
+            assert_eq!(out, b"The Movie 2024 x");
+            assert!(movie_clean_release_name_into(b"a\tb\x0c", &mut out));
+            assert_eq!(out, b"a\tb\x0c");
+            assert!(!movie_clean_release_name_into(b"a\0b", &mut out));
+        }
+    }
+}
