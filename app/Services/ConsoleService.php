@@ -14,9 +14,12 @@ use App\Models\Release;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Services\IGDB\Exceptions\IgdbHttpException;
 use App\Support\MetadataSearchLookup;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use Throwable;
 
 /**
  * ConsoleService - Console/Game processing service.
@@ -33,6 +36,26 @@ class ConsoleService
     public const int CONS_UPROC = 0; // Release has not been processed.
 
     public const int CONS_NTFND = -2;
+
+    private const string FFI_CDEF = <<<'C'
+        const char *nntmux_console_parse_title(const char *input, size_t input_len);
+        int32_t nntmux_console_replace_platform(const char *input, size_t input_len);
+        C;
+
+    /**
+     * `replacePlatform()` targets indexed by `nntmux_console_replace_platform` return codes.
+     */
+    private const array NATIVE_PLATFORM_NAMES = [
+        'Xbox 360', 'Xbox One', 'Nintendo DS', 'Nintendo 3DS', 'PlayStation2', 'PlayStation 3',
+        'PlayStation 4', 'Sony PSP', 'PlayStation Vita', 'PlayStation', 'Nintendo Wii U',
+        'Nintendo Wii', 'GameCube', 'Nintendo 64', 'Nintendo NES', 'SNES',
+    ];
+
+    private static ?FFI $ffi = null;
+
+    private static bool $ffiResolved = false;
+
+    private static bool $useRustFfi = true;
 
     public bool $echoOutput;
 
@@ -65,6 +88,11 @@ class ConsoleService
         $this->renamed = (int) app(ConfigurationProvider::class)->metadata()->gameLookup->value === 2;
 
         $this->failCache = [];
+    }
+
+    public static function setUseRustFfi(bool $use): void
+    {
+        self::$useRustFfi = $use;
     }
 
     // ========================================
@@ -582,6 +610,58 @@ class ConsoleService
      */
     public function parseTitle(string $releaseName): array|false
     {
+        if (self::$useRustFfi) {
+            $native = self::parseTitleNative($releaseName);
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
+        return $this->parseTitlePhp($releaseName);
+    }
+
+    /**
+     * Rust `nntmux_console_parse_title`; `null` when the library is unavailable or declines the input.
+     *
+     * @return array<string, string>|false|null
+     */
+    public static function parseTitleNative(string $releaseName): array|false|null
+    {
+        $ffi = self::$ffi ?? (self::$ffiResolved ? null : self::ffi());
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $parsed = $ffi->nntmux_console_parse_title($releaseName, strlen($releaseName));
+        } catch (Throwable) {
+            return null;
+        }
+        if (! is_string($parsed)) {
+            return null;
+        }
+        if ($parsed === '') {
+            return false;
+        }
+        $fields = explode("\x1F", $parsed, 3);
+        if (count($fields) !== 3) {
+            return null;
+        }
+        [$title, $platform, $release] = $fields;
+        if ($title[0] === '1') {
+            return ['title' => substr($title, 1), 'dlc' => '1', 'platform' => $platform, 'release' => $release];
+        }
+
+        return ['title' => substr($title, 1), 'platform' => $platform, 'release' => $release];
+    }
+
+    /**
+     * Native PHP `parseTitle()` implementation and fallback for inputs the Rust path declines.
+     *
+     * @return array<string, mixed>|false
+     */
+    protected function parseTitlePhp(string $releaseName): array|false
+    {
         $releaseName = preg_replace('/\sMulti\d?\s/i', '', $releaseName);
         $result = [];
 
@@ -647,6 +727,7 @@ class ConsoleService
      */
     public function replacePlatform(string $platform): string
     {
+        // Native PHP: the Rust lookup cannot amortize the FFI call (see RustMusicConsoleIgdbParityTest).
         return match (strtoupper($platform)) {
             'X360', 'XBOX360' => 'Xbox 360',
             'XBOXONE', 'XBOX ONE' => 'Xbox One',
@@ -666,6 +747,38 @@ class ConsoleService
             'SUPER NINTENDO', 'NINTENDO SUPER NES', 'SNES' => 'SNES',
             default => $platform,
         };
+    }
+
+    /**
+     * Rust `nntmux_console_replace_platform` for parity testing; `null` when the library is unavailable.
+     */
+    public static function replacePlatformNative(string $platform): ?string
+    {
+        $ffi = self::$ffi ?? (self::$ffiResolved ? null : self::ffi());
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $code = $ffi->nntmux_console_replace_platform($platform, strlen($platform));
+        } catch (Throwable) {
+            return null;
+        }
+        if ($code === -2) {
+            return $platform;
+        }
+
+        return is_int($code) ? (self::NATIVE_PLATFORM_NAMES[$code] ?? null) : null;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (! self::$ffiResolved) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('console_parse_title', self::FFI_CDEF);
+            self::$ffiResolved = true;
+        }
+
+        return self::$ffi;
     }
 
     // ========================================
