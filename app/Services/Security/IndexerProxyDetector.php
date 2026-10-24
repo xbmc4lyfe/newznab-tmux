@@ -4,7 +4,10 @@ declare(strict_types=1);
 
 namespace App\Services\Security;
 
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Contracts\Cache\Repository as CacheRepository;
+use Throwable;
 
 /**
  * Behavioural detector for direct NZBHydra2/Prowlarr proxy fetches.
@@ -25,7 +28,23 @@ final class IndexerProxyDetector
 
     private const MAX_TRACKED_USER_AGENTS = 5;
 
+    private const string FFI_CDEF = <<<'C'
+        int32_t nntmux_proxy_detector_match_referer(const char *haystack, size_t haystack_len, const char *patterns, size_t patterns_len, size_t count, uint8_t mode);
+        ssize_t nntmux_proxy_detector_cache_key_nul(const char *input, size_t input_len, size_t count, char *out_buf, size_t out_cap);
+        C;
+
+    private static ?FFI $ffi = null;
+
+    private static bool $ffiResolved = false;
+
+    private static bool $useRustFfi = true;
+
     public function __construct(private readonly CacheRepository $cache) {}
+
+    public static function setUseRustFfi(bool $use): void
+    {
+        self::$useRustFfi = $use;
+    }
 
     /**
      * Score a download request and decide whether it should be blocked.
@@ -193,7 +212,43 @@ final class IndexerProxyDetector
             return false;
         }
 
+        if (self::$useRustFfi) {
+            $configured = config('nntmux.proxy_detection_indexer_referer_patterns', '');
+            if (! is_array($configured)) {
+                $native = self::refererLooksLikeIndexerNative($referer, (string) $configured);
+                if ($native !== null) {
+                    return $native;
+                }
+            }
+        }
+
         return $this->matchesAnyPattern($referer, $this->indexerRefererPatterns());
+    }
+
+    public static function refererLooksLikeIndexerNative(?string $referer, string $configuredPatterns): ?bool
+    {
+        if ($referer === null || $referer === '' || $configuredPatterns === '') {
+            return false;
+        }
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $res = $ffi->nntmux_proxy_detector_match_referer(
+                $referer,
+                strlen($referer),
+                $configuredPatterns,
+                strlen($configuredPatterns),
+                0,
+                0,
+            );
+
+            return is_int($res) && $res >= 0 ? ($res === 1) : null;
+        } catch (Throwable) {
+            return null;
+        }
     }
 
     /**
@@ -201,6 +256,7 @@ final class IndexerProxyDetector
      */
     private function matchesAnyPattern(string $haystack, array $patterns): bool
     {
+        // Retain native PHP loop for pre-split pattern arrays: implode + FFI crossing is 0.64x mean / 0.71x p99.
         $lower = strtolower($haystack);
 
         foreach ($patterns as $pattern) {
@@ -210,6 +266,40 @@ final class IndexerProxyDetector
         }
 
         return false;
+    }
+
+    /**
+     * @param  array<int, string>  $patterns
+     */
+    public static function matchesAnyPatternNative(string $haystack, array $patterns): ?bool
+    {
+        $count = count($patterns);
+        if ($count === 0) {
+            return false;
+        }
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $joined = implode("\0", $patterns);
+        if (substr_count($joined, "\0") !== $count - 1) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $res = $ffi->nntmux_proxy_detector_match_referer(
+                $haystack,
+                strlen($haystack),
+                $joined,
+                strlen($joined),
+                $count,
+                1,
+            );
+
+            return is_int($res) && $res >= 0 ? ($res === 1) : null;
+        } catch (Throwable) {
+            return null;
+        }
     }
 
     /**
@@ -233,12 +323,64 @@ final class IndexerProxyDetector
 
     private function key(string ...$parts): string
     {
+        // Retain native PHP key assembly in production: 2..3 short strings with implode + FFI::string is 1.10x mean / 1.25x p99 (< 1.5x).
         return self::CACHE_PREFIX.implode(':', array_map(
             static fn (string $part): string => str_contains($part, ':') || strlen($part) > 40
                 ? md5($part)
                 : $part,
             $parts,
         ));
+    }
+
+    public static function keyNative(string ...$parts): ?string
+    {
+        $ffi = self::ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $count = count($parts);
+        $joined = $count === 0 ? '' : implode("\0", $parts);
+        if ($count > 0 && substr_count($joined, "\0") !== $count - 1) {
+            return null;
+        }
+        $len = strlen($joined);
+        $cap = 0;
+        $scratch = RustPipelineLibrary::obtainScratch($ffi, max(256, $len + $count * 33 + 32), $cap);
+        if ($scratch === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_proxy_detector_cache_key_nul($joined, $len, $count, $scratch, $cap);
+            if (! is_int($written) || $written === -1) {
+                return null;
+            }
+            if ($written < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_proxy_detector_cache_key_nul($joined, $len, $count, $scratch, $cap);
+                if (! is_int($written) || $written <= 0) {
+                    return null;
+                }
+            }
+
+            return $written <= 0 ? null : FFI::string($scratch, $written);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (! self::$ffiResolved) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('indexer_proxy_detector', self::FFI_CDEF);
+            self::$ffiResolved = true;
+        }
+
+        return self::$ffi;
     }
 
     private function enabled(): bool
