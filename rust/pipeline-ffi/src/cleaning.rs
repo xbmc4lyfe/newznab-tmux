@@ -16270,3 +16270,413 @@ mod w24_transactional_mail_tests {
         }
     }
 }
+
+// Wave 25.1: binary-safe account/authentication mail content.
+pub mod wave25_account_auth_mail {
+    use super::{w23_frame, wave22_append_frame, wave22_frames};
+
+    pub(super) fn output(operation: u32, input: &[u8]) -> Result<Vec<u8>, isize> {
+        if operation > 4 {
+            return Err(-1);
+        }
+        let frames = wave22_frames(input)?;
+        if frames.len() != if operation == 1 { 3 } else { 2 } {
+            return Err(-1);
+        }
+        let first = w23_frame(&frames, 0)?;
+        let site = w23_frame(&frames, 1)?;
+        let role = if operation == 1 {
+            frames[2].unwrap_or(b"User")
+        } else {
+            b"User"
+        };
+        let (subject, preheader): (Vec<u8>, Vec<u8>) = match operation {
+            0 => (
+                b"User account deleted".to_vec(),
+                [
+                    b"User ".as_slice(),
+                    first,
+                    b" deleted their ",
+                    site,
+                    b" account.",
+                ]
+                .concat(),
+            ),
+            1 => (
+                b"Your account has expired".to_vec(),
+                [
+                    b"Your ".as_slice(),
+                    site,
+                    " subscription has expired — account downgraded to ".as_bytes(),
+                    role,
+                    b".",
+                ]
+                .concat(),
+            ),
+            2 => (
+                b"Reset your password".to_vec(),
+                b"Reset your password using the secure link inside.".to_vec(),
+            ),
+            3 => (
+                b"New account registered".to_vec(),
+                [b"New user registered on ".as_slice(), site, b"."].concat(),
+            ),
+            4 => (
+                [b"Welcome to ".as_slice(), site].concat(),
+                [
+                    b"Welcome to ".as_slice(),
+                    site,
+                    " — your account is ready.".as_bytes(),
+                ]
+                .concat(),
+            ),
+            _ => return Err(-1),
+        };
+        let mut output = Vec::new();
+        for value in [subject.as_slice(), preheader.as_slice(), first, site] {
+            wave22_append_frame(&mut output, Some(value))?;
+        }
+        if operation == 1 {
+            wave22_append_frame(&mut output, Some(role))?;
+        }
+        Ok(output)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::output;
+        use crate::cleaning::nntmux_w25_account_auth_mail;
+
+        // Independent encoder keeps expected payloads separate from production framing.
+        fn wire(values: &[Option<&[u8]>]) -> Vec<u8> {
+            let mut result = Vec::new();
+            for value in values {
+                match value {
+                    Some(bytes) => {
+                        result.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                        result.extend_from_slice(bytes);
+                    }
+                    None => result.extend_from_slice(&[255; 4]),
+                }
+            }
+            result
+        }
+
+        #[test]
+        fn w25_account_auth_mail_literal_content_and_order() {
+            let cases: &[(u32, &[Option<&[u8]>], &[Option<&[u8]>])] = &[
+                (
+                    0,
+                    &[Some(b"Alice"), Some(b"Example")],
+                    &[
+                        Some(b"User account deleted"),
+                        Some(b"User Alice deleted their Example account."),
+                        Some(b"Alice"),
+                        Some(b"Example"),
+                    ],
+                ),
+                (
+                    1,
+                    &[Some(b"Alice"), Some(b"Example"), Some(b"VIP")],
+                    &[
+                        Some(b"Your account has expired"),
+                        Some(
+                            "Your Example subscription has expired — account downgraded to VIP."
+                                .as_bytes(),
+                        ),
+                        Some(b"Alice"),
+                        Some(b"Example"),
+                        Some(b"VIP"),
+                    ],
+                ),
+                (
+                    2,
+                    &[Some(b"https://x/reset?a=1&b=2"), Some(b"Example")],
+                    &[
+                        Some(b"Reset your password"),
+                        Some(b"Reset your password using the secure link inside."),
+                        Some(b"https://x/reset?a=1&b=2"),
+                        Some(b"Example"),
+                    ],
+                ),
+                (
+                    3,
+                    &[Some(b"Alice"), Some(b"Example")],
+                    &[
+                        Some(b"New account registered"),
+                        Some(b"New user registered on Example."),
+                        Some(b"Alice"),
+                        Some(b"Example"),
+                    ],
+                ),
+                (
+                    4,
+                    &[Some(b"Alice"), Some(b"Example")],
+                    &[
+                        Some(b"Welcome to Example"),
+                        Some("Welcome to Example — your account is ready.".as_bytes()),
+                        Some(b"Alice"),
+                        Some(b"Example"),
+                    ],
+                ),
+            ];
+            for (operation, input, expected) in cases {
+                assert_eq!(output(*operation, &wire(input)).unwrap(), wire(expected));
+            }
+        }
+
+        #[test]
+        fn w25_account_auth_mail_preserves_bytes_empty_and_nullable_role() {
+            assert_eq!(
+                output(0, &wire(&[Some(b"\0\xff"), Some(b"\xfe\0")])).unwrap(),
+                wire(&[
+                    Some(b"User account deleted"),
+                    Some(b"User \0\xff deleted their \xfe\0 account."),
+                    Some(b"\0\xff"),
+                    Some(b"\xfe\0"),
+                ])
+            );
+            for (role, expected_role, preheader) in [
+                (
+                    None,
+                    b"User".as_slice(),
+                    "Your  subscription has expired — account downgraded to User.".as_bytes(),
+                ),
+                (
+                    Some(b"".as_slice()),
+                    b"".as_slice(),
+                    "Your  subscription has expired — account downgraded to .".as_bytes(),
+                ),
+                (
+                    Some(b"\xff\0".as_slice()),
+                    b"\xff\0".as_slice(),
+                    b"Your  subscription has expired \xe2\x80\x94 account downgraded to \xff\0."
+                        .as_slice(),
+                ),
+            ] {
+                assert_eq!(
+                    output(1, &wire(&[Some(b""), Some(b""), role])).unwrap(),
+                    wire(&[
+                        Some(b"Your account has expired"),
+                        Some(preheader),
+                        Some(b""),
+                        Some(b""),
+                        Some(expected_role)
+                    ])
+                );
+            }
+            for operation in 2..=4 {
+                let first = b"\0\xff";
+                let site = b"\xfe\0";
+                let actual = output(operation, &wire(&[Some(first), Some(site)])).unwrap();
+                let frames = super::super::wave22_frames(&actual).unwrap();
+                assert_eq!(frames[2], Some(first.as_slice()));
+                assert_eq!(frames[3], Some(site.as_slice()));
+                assert!(output(operation, &wire(&[Some(b""), Some(b"")])).is_ok());
+            }
+        }
+
+        #[test]
+        fn w25_account_auth_mail_rejects_malformed_and_null_frames_without_writes() {
+            let mut cases = vec![(5, wire(&[Some(b"u"), Some(b"s")]))];
+            for operation in 0..=4 {
+                let mut valid = vec![Some(b"u".as_slice()), Some(b"s".as_slice())];
+                if operation == 1 {
+                    valid.push(None);
+                }
+                cases.push((operation, Vec::new()));
+                cases.push((operation, vec![1, 0, 0]));
+                cases.push((operation, vec![2, 0, 0, 0, b'x']));
+                cases.push((operation, vec![254, 255, 255, 255]));
+                cases.push((operation, wire(&valid[..valid.len() - 1])));
+                let mut excess = valid.clone();
+                excess.push(Some(b""));
+                cases.push((operation, wire(&excess)));
+                for index in 0..2 {
+                    let mut null = valid.clone();
+                    null[index] = None;
+                    cases.push((operation, wire(&null)));
+                }
+                let mut truncated = wire(&valid);
+                truncated.pop();
+                cases.push((operation, truncated));
+            }
+            for (operation, input) in cases {
+                assert!(output(operation, &input).is_err());
+                let mut destination = [0xabu8; 256];
+                assert_eq!(
+                    unsafe {
+                        nntmux_w25_account_auth_mail(
+                            operation,
+                            input.as_ptr(),
+                            input.len(),
+                            destination.as_mut_ptr(),
+                            destination.len(),
+                        )
+                    },
+                    -1
+                );
+                assert_eq!(destination, [0xab; 256]);
+            }
+        }
+
+        #[test]
+        fn w25_account_auth_mail_checks_regions_capacity_and_unaligned_buffers() {
+            let input = wire(&[Some(b"u"), Some(b"s")]);
+            let expected = wire(&[
+                Some(b"User account deleted"),
+                Some(b"User u deleted their s account."),
+                Some(b"u"),
+                Some(b"s"),
+            ]);
+            let mut destination = vec![0xabu8; expected.len() + 2];
+            unsafe {
+                for capacity in [0, 1, expected.len() - 1] {
+                    assert_eq!(
+                        nntmux_w25_account_auth_mail(
+                            0,
+                            input.as_ptr(),
+                            input.len(),
+                            destination.as_mut_ptr(),
+                            capacity
+                        ),
+                        -(expected.len() as i32)
+                    );
+                    assert!(destination.iter().all(|byte| *byte == 0xab));
+                }
+                for (source, length, target, capacity) in [
+                    (
+                        std::ptr::null(),
+                        0,
+                        destination.as_mut_ptr(),
+                        destination.len(),
+                    ),
+                    (input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                    (
+                        usize::MAX as *const u8,
+                        1,
+                        destination.as_mut_ptr(),
+                        destination.len(),
+                    ),
+                    (input.as_ptr(), input.len(), usize::MAX as *mut u8, 1),
+                    (
+                        input.as_ptr(),
+                        usize::MAX,
+                        destination.as_mut_ptr(),
+                        destination.len(),
+                    ),
+                    (
+                        input.as_ptr(),
+                        input.len(),
+                        destination.as_mut_ptr(),
+                        usize::MAX,
+                    ),
+                    (
+                        input.as_ptr(),
+                        isize::MAX as usize + 1,
+                        destination.as_mut_ptr(),
+                        destination.len(),
+                    ),
+                    (
+                        input.as_ptr(),
+                        input.len(),
+                        destination.as_mut_ptr(),
+                        isize::MAX as usize + 1,
+                    ),
+                ] {
+                    assert_eq!(
+                        nntmux_w25_account_auth_mail(0, source, length, target, capacity),
+                        -1
+                    );
+                    assert!(destination.iter().all(|byte| *byte == 0xab));
+                }
+                let unaligned_input = [vec![0xab], input.clone()].concat();
+                assert_eq!(
+                    nntmux_w25_account_auth_mail(
+                        0,
+                        unaligned_input.as_ptr().add(1),
+                        input.len(),
+                        destination.as_mut_ptr().add(1),
+                        expected.len()
+                    ),
+                    expected.len() as i32
+                );
+                assert_eq!(&destination[1..1 + expected.len()], expected);
+                assert_eq!(destination[0], 0xab);
+                assert_eq!(destination[expected.len() + 1], 0xab);
+            }
+        }
+
+        #[test]
+        fn w25_account_auth_mail_supports_exact_and_partial_overlap() {
+            let input = wire(&[Some(b"u"), Some(b"s")]);
+            let expected = wire(&[
+                Some(b"Welcome to s"),
+                Some("Welcome to s — your account is ready.".as_bytes()),
+                Some(b"u"),
+                Some(b"s"),
+            ]);
+            for (source_start, target_start) in [(0, 0), (0, 1), (3, 0)] {
+                let mut buffer = vec![0xabu8; expected.len() + input.len() + 8];
+                buffer[source_start..source_start + input.len()].copy_from_slice(&input);
+                let capacity = buffer.len() - target_start;
+                assert_eq!(
+                    unsafe {
+                        nntmux_w25_account_auth_mail(
+                            4,
+                            buffer.as_ptr().add(source_start),
+                            input.len(),
+                            buffer.as_mut_ptr().add(target_start),
+                            capacity,
+                        )
+                    },
+                    expected.len() as i32
+                );
+                assert_eq!(
+                    &buffer[target_start..target_start + expected.len()],
+                    expected
+                );
+            }
+        }
+    }
+}
+
+/// Render account/authentication mail fields using length-prefixed byte frames.
+/// Returns bytes written, -1 for invalid input or panic, or the negated required
+/// length when capacity is insufficient. Errors leave output untouched. Input
+/// and output may overlap; rendering finishes before output is copied.
+///
+/// # Safety
+/// Both regions must be non-null, allocated for the stated extents, and fit
+/// isize without address overflow. Only byte alignment is required. The caller
+/// guarantees allocation validity for structurally valid non-null regions.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w25_account_auth_mail(
+    operation: u32,
+    input: *const u8,
+    len: usize,
+    out: *mut u8,
+    out_cap: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !cleaning_ffi_region_valid(input, len) || !cleaning_ffi_region_valid(out, out_cap) {
+            return -1;
+        }
+        let output = {
+            let input = unsafe { slice::from_raw_parts(input, len) };
+            match wave25_account_auth_mail::output(operation, input) {
+                Ok(output) => output,
+                Err(_) => return -1,
+            }
+        };
+        let Ok(needed) = i32::try_from(output.len()) else {
+            return -1;
+        };
+        if output.len() > out_cap {
+            return -needed;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(output.as_ptr(), out, output.len()) };
+        needed
+    }))
+    .unwrap_or(-1)
+}
