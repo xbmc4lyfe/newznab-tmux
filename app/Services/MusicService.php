@@ -14,8 +14,11 @@ use App\Models\Release;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Services\Releases\ReleaseBrowseService;
 use App\Support\MetadataSearchLookup;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use Throwable;
 
 /**
  * Music Service - Handles music browsing and lookup operations.
@@ -23,6 +26,16 @@ use Illuminate\Support\Facades\DB;
 class MusicService
 {
     protected const MATCH_PERCENT = 85;
+
+    private const string FFI_CDEF = <<<'C'
+        const char *nntmux_music_parse_artist(const char *input, size_t input_len);
+        C;
+
+    private static ?FFI $ffi = null;
+
+    private static bool $ffiResolved = false;
+
+    private static bool $useRustFfi = true;
 
     public bool $echooutput;
 
@@ -51,6 +64,11 @@ class MusicService
         $this->renamed = (int) app(ConfigurationProvider::class)->metadata()->musicLookup->value === 2 ? 'AND isrenamed = 1' : '';
 
         $this->failCache = [];
+    }
+
+    public static function setUseRustFfi(bool $use): void
+    {
+        self::$useRustFfi = $use;
     }
 
     /**
@@ -558,6 +576,47 @@ class MusicService
      */
     public function parseArtist(string $releaseName): array|false
     {
+        if (self::$useRustFfi) {
+            $native = self::parseArtistNative($releaseName);
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
+        return $this->parseArtistPhp($releaseName);
+    }
+
+    /**
+     * Rust `nntmux_music_parse_artist`; `null` when the library is unavailable or declines the input.
+     *
+     * @return array{year: string, name: string}|false|null
+     */
+    public static function parseArtistNative(string $releaseName): array|false|null
+    {
+        $ffi = self::$ffi ?? (self::$ffiResolved ? null : self::ffi());
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $parsed = $ffi->nntmux_music_parse_artist($releaseName, strlen($releaseName));
+        } catch (Throwable) {
+            return null;
+        }
+        if (! is_string($parsed)) {
+            return null;
+        }
+
+        return $parsed === '' ? false : ['year' => substr($parsed, 0, 4), 'name' => substr($parsed, 4)];
+    }
+
+    /**
+     * Native PHP `parseArtist()` implementation and fallback for inputs the Rust path declines.
+     *
+     * @return array<string, mixed>|false
+     */
+    protected function parseArtistPhp(string $releaseName): array|false
+    {
         if (preg_match('/(.+?)(\d{1,2} \d{1,2} )?\(?(19\d{2}|20[0-1][\d])\b/', $releaseName, $name)) {
             $result = [];
             $result['year'] = $name[3];
@@ -582,6 +641,16 @@ class MusicService
         }
 
         return false;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (! self::$ffiResolved) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('music_parse_artist', self::FFI_CDEF);
+            self::$ffiResolved = true;
+        }
+
+        return self::$ffi;
     }
 
     /**
