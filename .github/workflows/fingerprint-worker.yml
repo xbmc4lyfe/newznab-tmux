@@ -62,7 +62,7 @@ jobs:
         run: |
           cp .env.test .env
           composer install --prefer-dist --no-interaction --no-progress --no-scripts --no-plugins
-          rustup toolchain install 1.98.0 --profile minimal --component clippy,rustfmt
+          (rustc +1.98.0 --version && cargo +1.98.0 clippy --version && cargo +1.98.0 fmt --version) || rustup toolchain install 1.98.0 --profile minimal --component clippy,rustfmt
       - name: Initialize disposable database
         run: php tests/Fixtures/bootstrap-fingerprint-database.php
       - name: Launchd installer and private configuration tests
