@@ -30813,3 +30813,1284 @@ pub mod admin_anidb_book_media_commands {
         }
     }
 }
+/// Wave 30.4 helpers for the `FetchMovieByImdb`, `MovieReverifyMatches`, `MigrateAnimeCovers`,
+/// `ReprocessTvRelease` and `ReprocessUnmatchedTvReleases` console commands. Every export
+/// returns `-1` (or `-required` for an undersized buffer) to make the PHP caller fall back.
+pub mod movie_anime_tv_reprocess_commands {
+    use std::mem::size_of;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+    const DECLINE: isize = -1;
+    const DECLINE_I32: i32 = -1;
+
+    /// `TvLookupStatus::Pending`, `ShowNotFound` and `ParseFailed` backing values.
+    const TV_STATUS_PENDING: i64 = 0;
+    const TV_STATUS_SHOW_NOT_FOUND: i64 = -10;
+    const TV_STATUS_PARSE_FAILED: i64 = -100;
+
+    /// Percentages at or above this decline to PHP so the `%.14G` rendering stays plain decimal.
+    const MATCH_RATE_MAX_PERCENT: f64 = 1e10;
+    /// Integer operands above 2^53 lose precision as `f64`; PHP handles them.
+    const MATCH_RATE_MAX_OPERAND: i64 = 1 << 53;
+
+    #[inline]
+    unsafe fn valid_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null()
+            || !ptr.is_aligned()
+            || len > MAX_INPUT
+            || len > isize::MAX as usize
+            || (ptr as usize).checked_add(len).is_none()
+        {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn valid_out_buf(out_buf: *mut u8, out_cap: usize) -> bool {
+        !out_buf.is_null()
+            && out_buf.is_aligned()
+            && out_cap <= isize::MAX as usize
+            && (out_buf as usize).checked_add(out_cap).is_some()
+    }
+
+    #[inline]
+    fn valid_mut_slice<T>(ptr: *mut T, count: usize) -> bool {
+        if ptr.is_null() || !ptr.is_aligned() {
+            return false;
+        }
+        let Some(byte_len) = count.checked_mul(size_of::<T>()) else {
+            return false;
+        };
+        byte_len <= isize::MAX as usize && (ptr as usize).checked_add(byte_len).is_some()
+    }
+
+    #[inline]
+    fn flag(value: u32) -> Option<bool> {
+        match value {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+
+    /// PHP `trim()` default characters `" \t\n\r\0\x0B"`.
+    #[inline]
+    fn is_php_trim_ws(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\x0b' | b'\0')
+    }
+
+    #[inline]
+    fn trim_php_default_ws(mut bytes: &[u8]) -> &[u8] {
+        while let Some((&first, rest)) = bytes.split_first() {
+            if !is_php_trim_ws(first) {
+                break;
+            }
+            bytes = rest;
+        }
+        while let Some((&last, rest)) = bytes.split_last() {
+            if !is_php_trim_ws(last) {
+                break;
+            }
+            bytes = rest;
+        }
+        bytes
+    }
+
+    /// Writes `parts` back to back into `out_buf`, storing each part's length in `out_lens`
+    /// (when given) before the capacity check so callers can size a retry.
+    unsafe fn write_parts(
+        parts: &[&[u8]],
+        out_lens: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        let mut required = 0usize;
+        for part in parts {
+            let Some(next) = required.checked_add(part.len()) else {
+                return DECLINE;
+            };
+            required = next;
+        }
+        if required > isize::MAX as usize {
+            return DECLINE;
+        }
+        if !out_lens.is_null() {
+            let lens = unsafe { slice::from_raw_parts_mut(out_lens, parts.len()) };
+            for (slot, part) in lens.iter_mut().zip(parts) {
+                *slot = part.len();
+            }
+        }
+        if required == 0 {
+            return 0;
+        }
+        if required > out_cap {
+            return -(required as isize);
+        }
+        let dst = unsafe { slice::from_raw_parts_mut(out_buf, required) };
+        let mut offset = 0usize;
+        for part in parts {
+            dst[offset..offset + part.len()].copy_from_slice(part);
+            offset += part.len();
+        }
+        required as isize
+    }
+
+    /// `strtolower(trim($raw))`, a leading `tt` removed, then every non-digit byte removed.
+    fn imdb_digits(raw: &[u8]) -> Vec<u8> {
+        let trimmed = trim_php_default_ws(raw);
+        let body = match trimmed {
+            [a, b, rest @ ..] if a.eq_ignore_ascii_case(&b't') && b.eq_ignore_ascii_case(&b't') => {
+                rest
+            }
+            _ => trimmed,
+        };
+        body.iter().copied().filter(u8::is_ascii_digit).collect()
+    }
+
+    /// PHP `is_numeric()` followed by `(int)` for a string; `None` when not numeric.
+    fn php_numeric_string_to_int(raw: &[u8]) -> Option<i64> {
+        let is_ws = |b: u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\x0b' | b'\x0c');
+        let start = raw.iter().position(|&b| !is_ws(b))?;
+        let end = raw.iter().rposition(|&b| !is_ws(b))? + 1;
+        let core = &raw[start..end];
+
+        let mut idx = 0usize;
+        if matches!(core.first(), Some(b'+' | b'-')) {
+            idx = 1;
+        }
+        let int_start = idx;
+        while idx < core.len() && core[idx].is_ascii_digit() {
+            idx += 1;
+        }
+        let int_digits = idx - int_start;
+        let mut is_float = false;
+        let mut frac_digits = 0usize;
+        if idx < core.len() && core[idx] == b'.' {
+            is_float = true;
+            idx += 1;
+            let frac_start = idx;
+            while idx < core.len() && core[idx].is_ascii_digit() {
+                idx += 1;
+            }
+            frac_digits = idx - frac_start;
+        }
+        if int_digits == 0 && frac_digits == 0 {
+            return None;
+        }
+        if idx < core.len() && matches!(core[idx], b'e' | b'E') {
+            let mut exp_idx = idx + 1;
+            if matches!(core.get(exp_idx), Some(b'+' | b'-')) {
+                exp_idx += 1;
+            }
+            let exp_start = exp_idx;
+            while exp_idx < core.len() && core[exp_idx].is_ascii_digit() {
+                exp_idx += 1;
+            }
+            if exp_idx == exp_start {
+                return None;
+            }
+            is_float = true;
+            idx = exp_idx;
+        }
+        if idx != core.len() {
+            return None;
+        }
+
+        let text = std::str::from_utf8(core).ok()?;
+        if !is_float && let Ok(value) = text.parse::<i64>() {
+            return Some(value);
+        }
+        // PHP converts float-like (and overflowing integer) strings with `zend_dval_to_lval_cap()`.
+        let value = text.parse::<f64>().ok()?;
+        if !value.is_finite() {
+            return Some(0);
+        }
+        if value >= 9_223_372_036_854_775_808.0 {
+            return Some(i64::MAX);
+        }
+        if value < -9_223_372_036_854_775_808.0 {
+            return Some(i64::MIN);
+        }
+        Some(value as i64)
+    }
+
+    /// PHP 8.4+ `round($value, 2)` (`PHP_ROUND_HALF_UP`), returning the rounded value scaled by 100.
+    fn php_round2_scaled(value: f64) -> f64 {
+        const EXPONENT: f64 = 100.0;
+        if !value.is_finite() || value == 0.0 {
+            return value * EXPONENT;
+        }
+        let scaled = value * EXPONENT;
+        let integral = if value >= 0.0 {
+            scaled.floor()
+        } else {
+            scaled.ceil()
+        };
+        if integral / EXPONENT == value {
+            return integral;
+        }
+        let edge_case = ((integral + 0.5f64.copysign(integral)) / EXPONENT).abs();
+        if value.abs() >= edge_case {
+            integral + 1.0f64.copysign(integral)
+        } else {
+            integral
+        }
+    }
+
+    /// `$processed > 0 ? round(($matched / $processed) * 100, 2).'%' : '0%'`.
+    fn format_match_rate(matched: i64, processed: i64) -> Option<String> {
+        if processed <= 0 {
+            return Some("0%".to_string());
+        }
+        if !(0..=MATCH_RATE_MAX_OPERAND).contains(&matched) || processed > MATCH_RATE_MAX_OPERAND {
+            return None;
+        }
+        let pct = (matched as f64 / processed as f64) * 100.0;
+        if !pct.is_finite() || pct >= MATCH_RATE_MAX_PERCENT {
+            return None;
+        }
+        let hundredths = php_round2_scaled(pct) as i64;
+        let whole = hundredths / 100;
+        let frac = hundredths % 100;
+        Some(if frac == 0 {
+            format!("{whole}%")
+        } else if frac % 10 == 0 {
+            format!("{whole}.{}%", frac / 10)
+        } else {
+            format!("{whole}.{frac:02}%")
+        })
+    }
+
+    /// `FetchMovieByImdb::extractImdbDigits()` / `normalizeImdbId()`: writes the parsed digits and
+    /// sets `*out_valid` to 1 when they form a usable id (non-empty, at least 5 digits).
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_fetch_movie_by_imdb_normalize_id(
+        raw_ptr: *const u8,
+        raw_len: usize,
+        out_valid: *mut u32,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_mut_slice(out_valid, 1) || !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(raw) = (unsafe { valid_slice(raw_ptr, raw_len) }) else {
+                return DECLINE;
+            };
+            let digits = imdb_digits(raw);
+            unsafe {
+                *out_valid = u32::from(digits.len() >= 5);
+            }
+            unsafe { write_parts(&[&digits], std::ptr::null_mut(), out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `FetchMovieByImdb::buildMovieCacheKeys()`: the five provider cache keys, lengths in `out_lens[5]`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_fetch_movie_by_imdb_cache_keys(
+        imdb_ptr: *const u8,
+        imdb_len: usize,
+        out_lens: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_mut_slice(out_lens, 5) || !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(imdb) = (unsafe { valid_slice(imdb_ptr, imdb_len) }) else {
+                return DECLINE;
+            };
+            let mut prefixed = Vec::with_capacity(imdb.len() + 2);
+            prefixed.extend_from_slice(b"tt");
+            prefixed.extend_from_slice(imdb);
+            let tmdb_hash = crate::md5_hex_slice(&prefixed);
+            let plain_hash = crate::md5_hex_slice(imdb);
+
+            let tmdb = [b"tmdb_movie_".as_slice(), &tmdb_hash].concat();
+            let trakt = [b"trakt_movie_".as_slice(), &plain_hash].concat();
+            let imdb_key = [b"imdb_movie_".as_slice(), &plain_hash].concat();
+            let scrape = [b"imdb_scrape_id_".as_slice(), imdb].concat();
+            let omdb = [b"omdb_movie_".as_slice(), &plain_hash].concat();
+            unsafe {
+                write_parts(
+                    &[&tmdb, &trakt, &imdb_key, &scrape, &omdb],
+                    out_lens,
+                    out_buf,
+                    out_cap,
+                )
+            }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `FetchMovieByImdb::formatMovieDetailsLines()`: seven summary lines, lengths in `out_lens[7]`.
+    /// Each `has_*` flag is 0 for PHP `null` (rendered as the default) or 1 for the given bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_fetch_movie_by_imdb_format_details(
+        has_title: u32,
+        title_ptr: *const u8,
+        title_len: usize,
+        year_ptr: *const u8,
+        year_len: usize,
+        imdb_ptr: *const u8,
+        imdb_len: usize,
+        has_tmdb: u32,
+        tmdb_ptr: *const u8,
+        tmdb_len: usize,
+        has_trakt: u32,
+        trakt_ptr: *const u8,
+        trakt_len: usize,
+        has_rating: u32,
+        rating_ptr: *const u8,
+        rating_len: usize,
+        has_genre: u32,
+        genre_ptr: *const u8,
+        genre_len: usize,
+        has_cover: u32,
+        out_lens: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_mut_slice(out_lens, 7) || !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let (
+                Some(has_title),
+                Some(has_tmdb),
+                Some(has_trakt),
+                Some(has_rating),
+                Some(has_genre),
+                Some(has_cover),
+            ) = (
+                flag(has_title),
+                flag(has_tmdb),
+                flag(has_trakt),
+                flag(has_rating),
+                flag(has_genre),
+                flag(has_cover),
+            )
+            else {
+                return DECLINE;
+            };
+            let (
+                Some(title),
+                Some(year),
+                Some(imdb),
+                Some(tmdb),
+                Some(trakt),
+                Some(rating),
+                Some(genre),
+            ) = (unsafe {
+                (
+                    valid_slice(title_ptr, title_len),
+                    valid_slice(year_ptr, year_len),
+                    valid_slice(imdb_ptr, imdb_len),
+                    valid_slice(tmdb_ptr, tmdb_len),
+                    valid_slice(trakt_ptr, trakt_len),
+                    valid_slice(rating_ptr, rating_len),
+                    valid_slice(genre_ptr, genre_len),
+                )
+            })
+            else {
+                return DECLINE;
+            };
+            let or_na = |present: bool, value: &[u8]| -> Vec<u8> {
+                if present {
+                    value.to_vec()
+                } else {
+                    b"N/A".to_vec()
+                }
+            };
+
+            let title_line = [
+                b"Updated movie: ".as_slice(),
+                if has_title { title } else { b"Unknown Title" },
+                b" (",
+                year,
+                b")",
+            ]
+            .concat();
+            let imdb_line = [b"IMDb: tt".as_slice(), imdb].concat();
+            let tmdb_line = [b"TMDB ID: ".as_slice(), &or_na(has_tmdb, tmdb)].concat();
+            let trakt_line = [b"Trakt ID: ".as_slice(), &or_na(has_trakt, trakt)].concat();
+            let rating_line = [b"Rating: ".as_slice(), &or_na(has_rating, rating)].concat();
+            let genre_line = [b"Genre: ".as_slice(), &or_na(has_genre, genre)].concat();
+            let cover_line: &[u8] = if has_cover {
+                b"Cover: Yes"
+            } else {
+                b"Cover: No"
+            };
+            unsafe {
+                write_parts(
+                    &[
+                        &title_line,
+                        &imdb_line,
+                        &tmdb_line,
+                        &trakt_line,
+                        &rating_line,
+                        &genre_line,
+                        cover_line,
+                    ],
+                    out_lens,
+                    out_buf,
+                    out_cap,
+                )
+            }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `MovieReverifyMatches::normalizePositiveLimit()`: `kind` 0 = null, 1 = int (`int_value`),
+    /// 2 = string bytes. Returns 1 with `*out_limit` set, 0 for `null`, or -1 to decline.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_movie_reverify_normalize_limit(
+        kind: u32,
+        int_value: i64,
+        str_ptr: *const u8,
+        str_len: usize,
+        out_limit: *mut i64,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_mut_slice(out_limit, 1) {
+                return DECLINE_I32;
+            }
+            let resolved = match kind {
+                0 => None,
+                1 => Some(int_value),
+                2 => {
+                    let Some(raw) = (unsafe { valid_slice(str_ptr, str_len) }) else {
+                        return DECLINE_I32;
+                    };
+                    php_numeric_string_to_int(raw)
+                }
+                _ => return DECLINE_I32,
+            };
+            match resolved {
+                Some(limit) if limit > 0 => {
+                    unsafe {
+                        *out_limit = limit;
+                    }
+                    1
+                }
+                _ => 0,
+            }
+        }))
+        .unwrap_or(DECLINE_I32)
+    }
+
+    /// `MovieReverifyMatches::formatMismatchLine()`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_movie_reverify_format_mismatch_line(
+        release_id: i64,
+        search_name_ptr: *const u8,
+        search_name_len: usize,
+        imdb_ptr: *const u8,
+        imdb_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let (Some(search_name), Some(imdb)) = (unsafe {
+                (
+                    valid_slice(search_name_ptr, search_name_len),
+                    valid_slice(imdb_ptr, imdb_len),
+                )
+            }) else {
+                return DECLINE;
+            };
+            let head = format!("Mismatch: release {release_id} (");
+            unsafe {
+                write_parts(
+                    &[head.as_bytes(), search_name, b") matched to tt", imdb],
+                    std::ptr::null_mut(),
+                    out_buf,
+                    out_cap,
+                )
+            }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `MovieReverifyMatches::formatSummaryMessage()`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_movie_reverify_format_summary(
+        checked: i64,
+        skipped: i64,
+        mismatched: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let line = format!(
+                "Checked {checked} movie releases, skipped {skipped} unverifiable, found {mismatched} mismatches."
+            );
+            unsafe { write_parts(&[line.as_bytes()], std::ptr::null_mut(), out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `MovieReverifyMatches::formatOutcomeMessage()`; returns 0 when no message is printed.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_movie_reverify_format_outcome(
+        dry_run: u32,
+        mismatched: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(dry_run) = flag(dry_run) else {
+                return DECLINE;
+            };
+            if mismatched <= 0 {
+                return 0;
+            }
+            let line = if dry_run {
+                "Dry run: no changes made.".to_string()
+            } else {
+                format!("Reset imdbid/movieinfo_id for {mismatched} mismatched releases.")
+            };
+            unsafe { write_parts(&[line.as_bytes()], std::ptr::null_mut(), out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `MigrateAnimeCovers::resolveNewCoverFilename()`: matches `/^(\d+)\.jpg$/` (PCRE `$` also
+    /// accepts one trailing `\n`). Returns 0 for no match, otherwise writes `{id}-cover.jpg`
+    /// and the `(int)` id (saturating like PHP) to `*out_anidbid`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_migrate_anime_covers_resolve_filename(
+        filename_ptr: *const u8,
+        filename_len: usize,
+        out_anidbid: *mut i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_mut_slice(out_anidbid, 1) || !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(filename) = (unsafe { valid_slice(filename_ptr, filename_len) }) else {
+                return DECLINE;
+            };
+            let body = filename.strip_suffix(b"\n").unwrap_or(filename);
+            let Some(digits) = body.strip_suffix(b".jpg") else {
+                return 0;
+            };
+            if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+                return 0;
+            }
+            let anidbid = digits.iter().try_fold(0i64, |acc, &b| {
+                acc.checked_mul(10)?.checked_add(i64::from(b - b'0'))
+            });
+            unsafe {
+                *out_anidbid = anidbid.unwrap_or(i64::MAX);
+            }
+            unsafe {
+                write_parts(
+                    &[digits, b"-cover.jpg"],
+                    std::ptr::null_mut(),
+                    out_buf,
+                    out_cap,
+                )
+            }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `MigrateAnimeCovers::formatMigrationSummary()`: two lines for a dry run, one otherwise
+    /// (`out_lens[1]` is 0), lengths in `out_lens[2]`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_migrate_anime_covers_format_summary(
+        dry_run: u32,
+        renamed: i64,
+        skipped: i64,
+        out_lens: *mut usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_mut_slice(out_lens, 2) || !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(dry_run) = flag(dry_run) else {
+                return DECLINE;
+            };
+            let (first, second): (String, &[u8]) = if dry_run {
+                (
+                    format!(
+                        "\nDry run complete. Would rename {renamed} file(s), skipped {skipped}."
+                    ),
+                    b"Run without --dry-run to perform the migration.",
+                )
+            } else {
+                (
+                    format!("\nMigration complete. Renamed {renamed} file(s), skipped {skipped}."),
+                    b"",
+                )
+            };
+            unsafe { write_parts(&[first.as_bytes(), second], out_lens, out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `ReprocessTvRelease::truncateSearchName()`:
+    /// `mb_substr($s, 0, $max).(strlen($s) > $max ? '...' : '')`. Declines on invalid UTF-8
+    /// (mbstring substitutes `?`) and negative lengths.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_reprocess_tv_release_truncate_search_name(
+        search_name_ptr: *const u8,
+        search_name_len: usize,
+        max_chars: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) || max_chars < 0 {
+                return DECLINE;
+            }
+            let Some(raw) = (unsafe { valid_slice(search_name_ptr, search_name_len) }) else {
+                return DECLINE;
+            };
+            let Ok(text) = std::str::from_utf8(raw) else {
+                return DECLINE;
+            };
+            let max = usize::try_from(max_chars).unwrap_or(usize::MAX);
+            let prefix_end = text
+                .char_indices()
+                .nth(max)
+                .map_or(raw.len(), |(idx, _)| idx);
+            let suffix: &[u8] = if raw.len() > max { b"..." } else { b"" };
+            unsafe {
+                write_parts(
+                    &[&raw[..prefix_end], suffix],
+                    std::ptr::null_mut(),
+                    out_buf,
+                    out_cap,
+                )
+            }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `ReprocessTvRelease::projectFinalStateRow()` retry column: `$retryAt ?? '-'`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_reprocess_tv_release_final_state_retry_at(
+        has_retry_at: u32,
+        retry_at_ptr: *const u8,
+        retry_at_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(has_retry_at) = flag(has_retry_at) else {
+                return DECLINE;
+            };
+            let Some(retry_at) = (unsafe { valid_slice(retry_at_ptr, retry_at_len) }) else {
+                return DECLINE;
+            };
+            let value: &[u8] = if has_retry_at { retry_at } else { b"-" };
+            unsafe { write_parts(&[value], std::ptr::null_mut(), out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `ReprocessUnmatchedTvReleases::buildTargetStatuses()`: writes the status values and
+    /// returns their count (`-required` when `values_cap` is too small).
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_reprocess_unmatched_tv_target_statuses(
+        include_parse_failed: u32,
+        out_values: *mut i64,
+        values_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(include_parse_failed) = flag(include_parse_failed) else {
+                return DECLINE;
+            };
+            if !valid_mut_slice(out_values, values_cap) {
+                return DECLINE;
+            }
+            let statuses: &[i64] = if include_parse_failed {
+                &[
+                    TV_STATUS_PENDING,
+                    TV_STATUS_SHOW_NOT_FOUND,
+                    TV_STATUS_PARSE_FAILED,
+                ]
+            } else {
+                &[TV_STATUS_PENDING, TV_STATUS_SHOW_NOT_FOUND]
+            };
+            if statuses.len() > values_cap {
+                return -(statuses.len() as isize);
+            }
+            let dst = unsafe { slice::from_raw_parts_mut(out_values, statuses.len()) };
+            dst.copy_from_slice(statuses);
+            statuses.len() as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `ReprocessUnmatchedTvReleases::clampProcessCount()`: `$limit > 0 ? min($total, $limit) : $total`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_reprocess_unmatched_tv_clamp_process_count(
+        total_count: i64,
+        limit: i64,
+        out_count: *mut i64,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_mut_slice(out_count, 1) {
+                return DECLINE_I32;
+            }
+            unsafe {
+                *out_count = if limit > 0 {
+                    total_count.min(limit)
+                } else {
+                    total_count
+                };
+            }
+            0
+        }))
+        .unwrap_or(DECLINE_I32)
+    }
+
+    /// `ReprocessUnmatchedTvReleases::formatMatchRate()`; declines negative `matched`,
+    /// operands above 2^53 and rates of 1e10% or more.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_reprocess_unmatched_tv_format_match_rate(
+        matched: i64,
+        processed: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(rate) = format_match_rate(matched, processed) else {
+                return DECLINE;
+            };
+            unsafe { write_parts(&[rate.as_bytes()], std::ptr::null_mut(), out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn call_buf(f: impl FnOnce(*mut u8, usize) -> isize) -> Option<Vec<u8>> {
+            let mut buf = vec![0u8; 512];
+            let rc = f(buf.as_mut_ptr(), buf.len());
+            if rc < 0 {
+                return None;
+            }
+            buf.truncate(rc as usize);
+            Some(buf)
+        }
+
+        fn split(buf: &[u8], lens: &[usize]) -> Vec<String> {
+            let mut out = Vec::new();
+            let mut offset = 0;
+            for &len in lens {
+                out.push(String::from_utf8_lossy(&buf[offset..offset + len]).into_owned());
+                offset += len;
+            }
+            out
+        }
+
+        fn normalize_id(raw: &[u8]) -> (String, bool) {
+            let mut valid = 7u32;
+            let digits = call_buf(|b, c| unsafe {
+                nntmux_fetch_movie_by_imdb_normalize_id(raw.as_ptr(), raw.len(), &mut valid, b, c)
+            })
+            .unwrap();
+            (String::from_utf8(digits).unwrap(), valid == 1)
+        }
+
+        #[test]
+        fn imdb_id_normalization_matches_php() {
+            assert_eq!(normalize_id(b"tt1234567"), ("1234567".into(), true));
+            assert_eq!(normalize_id(b"  TT0133093\n"), ("0133093".into(), true));
+            assert_eq!(normalize_id(b"\0\x0b tt12-34-5 \r"), ("12345".into(), true));
+            assert_eq!(normalize_id(b"1234"), ("1234".into(), false));
+            assert_eq!(normalize_id(b""), (String::new(), false));
+            assert_eq!(normalize_id(b"\x0ctt1234567"), ("1234567".into(), true));
+            assert_eq!(normalize_id(b"ttt12345"), ("12345".into(), true));
+            assert_eq!(
+                normalize_id("tt１２３４５".as_bytes()),
+                (String::new(), false)
+            );
+        }
+
+        #[test]
+        fn cache_keys_hash_like_php() {
+            let mut lens = [0usize; 5];
+            let id = b"0133093";
+            let buf = call_buf(|b, c| unsafe {
+                nntmux_fetch_movie_by_imdb_cache_keys(
+                    id.as_ptr(),
+                    id.len(),
+                    lens.as_mut_ptr(),
+                    b,
+                    c,
+                )
+            })
+            .unwrap();
+            let keys = split(&buf, &lens);
+            let tmdb = String::from_utf8(crate::md5_hex_slice(b"tt0133093").to_vec()).unwrap();
+            let plain = String::from_utf8(crate::md5_hex_slice(id).to_vec()).unwrap();
+            assert_eq!(keys[0], format!("tmdb_movie_{tmdb}"));
+            assert_eq!(keys[1], format!("trakt_movie_{plain}"));
+            assert_eq!(keys[2], format!("imdb_movie_{plain}"));
+            assert_eq!(keys[3], "imdb_scrape_id_0133093");
+            assert_eq!(keys[4], format!("omdb_movie_{plain}"));
+        }
+
+        #[test]
+        fn movie_details_lines_use_defaults_for_null() {
+            let mut lens = [0usize; 7];
+            let e: &[u8] = b"";
+            let buf = call_buf(|b, c| unsafe {
+                nntmux_fetch_movie_by_imdb_format_details(
+                    0,
+                    e.as_ptr(),
+                    0,
+                    b"1999".as_ptr(),
+                    4,
+                    b"0133093".as_ptr(),
+                    7,
+                    1,
+                    b"603".as_ptr(),
+                    3,
+                    0,
+                    e.as_ptr(),
+                    0,
+                    1,
+                    b"8.7".as_ptr(),
+                    3,
+                    0,
+                    e.as_ptr(),
+                    0,
+                    1,
+                    lens.as_mut_ptr(),
+                    b,
+                    c,
+                )
+            })
+            .unwrap();
+            assert_eq!(
+                split(&buf, &lens),
+                [
+                    "Updated movie: Unknown Title (1999)",
+                    "IMDb: tt0133093",
+                    "TMDB ID: 603",
+                    "Trakt ID: N/A",
+                    "Rating: 8.7",
+                    "Genre: N/A",
+                    "Cover: Yes",
+                ]
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_fetch_movie_by_imdb_format_details(
+                        2,
+                        e.as_ptr(),
+                        0,
+                        e.as_ptr(),
+                        0,
+                        e.as_ptr(),
+                        0,
+                        0,
+                        e.as_ptr(),
+                        0,
+                        0,
+                        e.as_ptr(),
+                        0,
+                        0,
+                        e.as_ptr(),
+                        0,
+                        0,
+                        e.as_ptr(),
+                        0,
+                        0,
+                        lens.as_mut_ptr(),
+                        [0u8; 8].as_mut_ptr(),
+                        8,
+                    )
+                },
+                DECLINE
+            );
+        }
+
+        fn limit(raw: &[u8]) -> Option<i64> {
+            let mut out = 0i64;
+            match unsafe {
+                nntmux_movie_reverify_normalize_limit(2, 0, raw.as_ptr(), raw.len(), &mut out)
+            } {
+                1 => Some(out),
+                0 => None,
+                rc => panic!("unexpected rc {rc}"),
+            }
+        }
+
+        #[test]
+        fn limit_normalization_follows_php_numeric_strings() {
+            assert_eq!(limit(b"10"), Some(10));
+            assert_eq!(limit(b" 5 "), Some(5));
+            assert_eq!(limit(b"\x0c5\x0b"), Some(5));
+            assert_eq!(limit(b"1.9"), Some(1));
+            assert_eq!(limit(b"1e3"), Some(1000));
+            assert_eq!(limit(b"+.5e1"), Some(5));
+            assert_eq!(limit(b"1.e3"), Some(1000));
+            assert_eq!(limit(b"1e100"), Some(i64::MAX));
+            assert_eq!(limit(b"99999999999999999999"), Some(i64::MAX));
+            assert_eq!(
+                limit(b"9223372036854775806"),
+                Some(9_223_372_036_854_775_806)
+            );
+            assert_eq!(limit(b"1e400"), None);
+            assert_eq!(limit(b"0"), None);
+            assert_eq!(limit(b"-5"), None);
+            assert_eq!(limit(b"0.5"), None);
+            for bad in [
+                &b""[..],
+                b" ",
+                b"abc",
+                b"1e",
+                b"1e+",
+                b"+-1",
+                b"0x1A",
+                b"5\0",
+                b".",
+                b"1_000",
+                b"inf",
+            ] {
+                assert_eq!(limit(bad), None, "{bad:?}");
+            }
+            let mut out = 0i64;
+            assert_eq!(
+                unsafe {
+                    nntmux_movie_reverify_normalize_limit(1, 42, std::ptr::null(), 0, &mut out)
+                },
+                1
+            );
+            assert_eq!(out, 42);
+            assert_eq!(
+                unsafe {
+                    nntmux_movie_reverify_normalize_limit(0, 42, std::ptr::null(), 0, &mut out)
+                },
+                0
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_movie_reverify_normalize_limit(3, 42, std::ptr::null(), 0, &mut out)
+                },
+                DECLINE_I32
+            );
+        }
+
+        #[test]
+        fn reverify_messages() {
+            let line = call_buf(|b, c| unsafe {
+                nntmux_movie_reverify_format_mismatch_line(
+                    7,
+                    b"A (B)".as_ptr(),
+                    5,
+                    b"0133093".as_ptr(),
+                    7,
+                    b,
+                    c,
+                )
+            })
+            .unwrap();
+            assert_eq!(line, b"Mismatch: release 7 (A (B)) matched to tt0133093");
+            let summary =
+                call_buf(|b, c| unsafe { nntmux_movie_reverify_format_summary(10, 2, 3, b, c) })
+                    .unwrap();
+            assert_eq!(
+                summary,
+                b"Checked 10 movie releases, skipped 2 unverifiable, found 3 mismatches."
+            );
+            assert_eq!(
+                call_buf(|b, c| unsafe { nntmux_movie_reverify_format_outcome(1, 0, b, c) })
+                    .unwrap(),
+                b""
+            );
+            assert_eq!(
+                call_buf(|b, c| unsafe { nntmux_movie_reverify_format_outcome(1, 2, b, c) })
+                    .unwrap(),
+                b"Dry run: no changes made."
+            );
+            assert_eq!(
+                call_buf(|b, c| unsafe { nntmux_movie_reverify_format_outcome(0, 2, b, c) })
+                    .unwrap(),
+                b"Reset imdbid/movieinfo_id for 2 mismatched releases."
+            );
+        }
+
+        fn cover(name: &[u8]) -> Option<(i64, String)> {
+            let mut id = -5i64;
+            let out = call_buf(|b, c| unsafe {
+                nntmux_migrate_anime_covers_resolve_filename(
+                    name.as_ptr(),
+                    name.len(),
+                    &mut id,
+                    b,
+                    c,
+                )
+            })
+            .unwrap();
+            (!out.is_empty()).then(|| (id, String::from_utf8(out).unwrap()))
+        }
+
+        #[test]
+        fn anime_cover_filenames() {
+            assert_eq!(cover(b"123.jpg"), Some((123, "123-cover.jpg".into())));
+            assert_eq!(cover(b"007.jpg\n"), Some((7, "007-cover.jpg".into())));
+            assert_eq!(
+                cover(b"99999999999999999999.jpg"),
+                Some((i64::MAX, "99999999999999999999-cover.jpg".into()))
+            );
+            for bad in [
+                &b"123-cover.jpg"[..],
+                b".jpg",
+                b"12.JPG",
+                b"12.jpg\n\n",
+                b"a12.jpg",
+                b"12.jpeg",
+                b"",
+                "١٢.jpg".as_bytes(),
+            ] {
+                assert_eq!(cover(bad), None, "{bad:?}");
+            }
+            let mut lens = [9usize; 2];
+            let buf = call_buf(|b, c| unsafe {
+                nntmux_migrate_anime_covers_format_summary(0, 3, 1, lens.as_mut_ptr(), b, c)
+            })
+            .unwrap();
+            assert_eq!(
+                split(&buf, &lens),
+                ["\nMigration complete. Renamed 3 file(s), skipped 1.", ""]
+            );
+        }
+
+        fn truncate(raw: &[u8], max: i64) -> Option<Vec<u8>> {
+            call_buf(|b, c| unsafe {
+                nntmux_reprocess_tv_release_truncate_search_name(raw.as_ptr(), raw.len(), max, b, c)
+            })
+        }
+
+        #[test]
+        fn truncation_counts_chars_but_compares_bytes() {
+            assert_eq!(truncate(b"short", 60).unwrap(), b"short");
+            assert_eq!(
+                truncate(&[b'x'; 61], 60).unwrap(),
+                [&[b'x'; 60][..], b"..."].concat()
+            );
+            let multibyte = "é".repeat(31);
+            assert_eq!(
+                truncate(multibyte.as_bytes(), 60).unwrap(),
+                [multibyte.as_bytes(), b"..."].concat()
+            );
+            assert_eq!(truncate(b"abc", 0).unwrap(), b"...");
+            assert_eq!(truncate(b"\xff", 60), None);
+            assert_eq!(truncate(b"abc", -1), None);
+        }
+
+        #[test]
+        fn tv_reprocess_projections() {
+            assert_eq!(
+                call_buf(|b, c| unsafe {
+                    nntmux_reprocess_tv_release_final_state_retry_at(0, b"".as_ptr(), 0, b, c)
+                })
+                .unwrap(),
+                b"-"
+            );
+            let mut values = [0i64; 3];
+            assert_eq!(
+                unsafe { nntmux_reprocess_unmatched_tv_target_statuses(1, values.as_mut_ptr(), 3) },
+                3
+            );
+            assert_eq!(values, [0, -10, -100]);
+            assert_eq!(
+                unsafe { nntmux_reprocess_unmatched_tv_target_statuses(1, values.as_mut_ptr(), 2) },
+                -3
+            );
+            let mut count = 0i64;
+            assert_eq!(
+                unsafe { nntmux_reprocess_unmatched_tv_clamp_process_count(50, 10, &mut count) },
+                0
+            );
+            assert_eq!(count, 10);
+            assert_eq!(
+                unsafe { nntmux_reprocess_unmatched_tv_clamp_process_count(50, -3, &mut count) },
+                0
+            );
+            assert_eq!(count, 50);
+        }
+
+        #[test]
+        fn match_rate_rounds_like_php_8_4() {
+            let cases = [
+                ((1, 3), "33.33%"),
+                ((2, 3), "66.67%"),
+                ((1, 8), "12.5%"),
+                ((29, 200), "14.5%"),
+                ((1, 1), "100%"),
+                ((0, 5), "0%"),
+                ((5, 0), "0%"),
+                ((5, -1), "0%"),
+                ((7, 2), "350%"),
+                ((57, 200), "28.5%"),
+                ((1, 6), "16.67%"),
+                ((1, 7), "14.29%"),
+            ];
+            for ((matched, processed), expected) in cases {
+                assert_eq!(
+                    format_match_rate(matched, processed).as_deref(),
+                    Some(expected),
+                    "{matched}/{processed}"
+                );
+            }
+            assert_eq!(format_match_rate(-1, 5), None);
+            assert_eq!(format_match_rate(i64::MAX, 1), None);
+            assert_eq!(php_round2_scaled(0.285), 29.0);
+            assert_eq!(php_round2_scaled(1.005), 101.0);
+        }
+
+        #[test]
+        fn exports_reject_null_unaligned_and_small_buffers() {
+            let mut raw = [0u8; 32];
+            let unaligned_i64 = unsafe { raw.as_mut_ptr().add(1) }.cast::<i64>();
+            let unaligned_usize = unsafe { raw.as_mut_ptr().add(1) }.cast::<usize>();
+            let mut small = [b'Z'; 4];
+            let mut valid = 0u32;
+            unsafe {
+                assert_eq!(
+                    nntmux_fetch_movie_by_imdb_normalize_id(
+                        std::ptr::null(),
+                        0,
+                        &mut valid,
+                        small.as_mut_ptr(),
+                        4
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_fetch_movie_by_imdb_normalize_id(
+                        b"x".as_ptr(),
+                        1,
+                        &mut valid,
+                        std::ptr::null_mut(),
+                        4
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_fetch_movie_by_imdb_normalize_id(
+                        b"tt12345".as_ptr(),
+                        7,
+                        &mut valid,
+                        small.as_mut_ptr(),
+                        4
+                    ),
+                    -5
+                );
+                assert_eq!(
+                    nntmux_fetch_movie_by_imdb_cache_keys(
+                        b"1".as_ptr(),
+                        1,
+                        unaligned_usize,
+                        small.as_mut_ptr(),
+                        4
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_movie_reverify_normalize_limit(1, 1, std::ptr::null(), 0, unaligned_i64),
+                    DECLINE_I32
+                );
+                assert_eq!(
+                    nntmux_movie_reverify_normalize_limit(2, 1, std::ptr::null(), 0, &mut 0),
+                    DECLINE_I32
+                );
+                assert_eq!(
+                    nntmux_movie_reverify_format_summary(1, 1, 1, small.as_mut_ptr(), 4),
+                    -69
+                );
+                assert_eq!(
+                    nntmux_movie_reverify_format_outcome(2, 1, small.as_mut_ptr(), 4),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_migrate_anime_covers_resolve_filename(
+                        b"1.jpg".as_ptr(),
+                        5,
+                        unaligned_i64,
+                        small.as_mut_ptr(),
+                        4
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_migrate_anime_covers_format_summary(
+                        3,
+                        1,
+                        1,
+                        [0usize; 2].as_mut_ptr(),
+                        small.as_mut_ptr(),
+                        4
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_reprocess_tv_release_final_state_retry_at(
+                        2,
+                        b"".as_ptr(),
+                        0,
+                        small.as_mut_ptr(),
+                        4
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_reprocess_unmatched_tv_target_statuses(2, [0i64; 3].as_mut_ptr(), 3),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_reprocess_unmatched_tv_target_statuses(0, unaligned_i64, 2),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_reprocess_unmatched_tv_clamp_process_count(1, 1, unaligned_i64),
+                    DECLINE_I32
+                );
+                assert_eq!(
+                    nntmux_reprocess_unmatched_tv_format_match_rate(1, 3, small.as_mut_ptr(), 4),
+                    -6
+                );
+            }
+            assert_eq!(small, [b'Z'; 4]);
+        }
+    }
+}
