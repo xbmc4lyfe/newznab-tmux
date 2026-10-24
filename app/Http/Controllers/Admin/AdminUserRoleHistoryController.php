@@ -12,6 +12,18 @@ use Spatie\Permission\Models\Role;
 
 class AdminUserRoleHistoryController extends BasePageController
 {
+    private static ?bool $useWave29RustFfi = null;
+
+    public static function setUseRustFfi(?bool $useRustFfi): void
+    {
+        self::$useWave29RustFfi = $useRustFfi;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useWave29RustFfi ?? false;
+    }
+
     /**
      * Display user role history list
      */
@@ -24,14 +36,8 @@ class AdminUserRoleHistoryController extends BasePageController
         // Get all roles for filter
         $roles = Role::all()->pluck('name', 'id')->toArray();
 
-        $filters = [
-            'user_id' => $this->scalarInput($request, 'user_id'),
-            'username' => $this->scalarInput($request, 'username'),
-            'role_id' => $this->scalarInput($request, 'role_id'),
-            'change_reason' => $this->scalarInput($request, 'change_reason'),
-            'date_from' => $this->scalarInput($request, 'date_from'),
-            'date_to' => $this->scalarInput($request, 'date_to'),
-        ];
+        $filters = self::normalizeFilters($request->all());
+        $boundaries = self::dateBoundaries($filters['date_from'], $filters['date_to']);
 
         // Build query
         $query = UserRoleHistory::with(['user', 'oldRole', 'newRole', 'changedByUser'])
@@ -59,12 +65,12 @@ class AdminUserRoleHistoryController extends BasePageController
             $query->where('change_reason', 'like', '%'.$filters['change_reason'].'%');
         }
 
-        if ($filters['date_from'] !== '') {
-            $query->where('created_at', '>=', $filters['date_from'].' 00:00:00');
+        if ($boundaries['date_from'] !== null) {
+            $query->where('created_at', '>=', $boundaries['date_from']);
         }
 
-        if ($filters['date_to'] !== '') {
-            $query->where('created_at', '<=', $filters['date_to'].' 23:59:59');
+        if ($boundaries['date_to'] !== null) {
+            $query->where('created_at', '<=', $boundaries['date_to']);
         }
 
         // Pagination
@@ -107,5 +113,65 @@ class AdminUserRoleHistoryController extends BasePageController
         ]);
 
         return view('admin.user-role-history.show', $this->viewData);
+    }
+
+    /**
+     * @param  array<int|string, mixed>  $input
+     * @return array{user_id: string, username: string, role_id: string, change_reason: string, date_from: string, date_to: string}
+     */
+    public static function normalizeFilters(array $input): array
+    {
+        return self::usesRustFfi() ? self::normalizeFiltersNative($input) : self::normalizeFiltersPhp($input);
+    }
+
+    /**
+     * @param  array<int|string, mixed>  $input
+     * @return array{user_id: string, username: string, role_id: string, change_reason: string, date_from: string, date_to: string}
+     */
+    public static function normalizeFiltersPhp(array $input): array
+    {
+        $filters = [];
+        foreach (['user_id', 'username', 'role_id', 'change_reason', 'date_from', 'date_to'] as $key) {
+            $value = $input[$key] ?? '';
+            $filters[$key] = is_scalar($value) ? (string) $value : '';
+        }
+
+        return $filters;
+    }
+
+    /**
+     * @param  array<int|string, mixed>  $input
+     * @return array{user_id: string, username: string, role_id: string, change_reason: string, date_from: string, date_to: string}
+     */
+    public static function normalizeFiltersNative(array $input): array
+    {
+        return GdprRequestController::wave29Native(14, ['input' => $input]) ?? self::normalizeFiltersPhp($input);
+    }
+
+    /**
+     * @return array{date_from: string|null, date_to: string|null}
+     */
+    public static function dateBoundaries(string $from, string $to): array
+    {
+        return self::usesRustFfi() ? self::dateBoundariesNative($from, $to) : self::dateBoundariesPhp($from, $to);
+    }
+
+    /**
+     * @return array{date_from: string|null, date_to: string|null}
+     */
+    public static function dateBoundariesPhp(string $from, string $to): array
+    {
+        return [
+            'date_from' => $from === '' ? null : $from.' 00:00:00',
+            'date_to' => $to === '' ? null : $to.' 23:59:59',
+        ];
+    }
+
+    /**
+     * @return array{date_from: string|null, date_to: string|null}
+     */
+    public static function dateBoundariesNative(string $from, string $to): array
+    {
+        return GdprRequestController::wave29Native(15, ['date_from' => $from, 'date_to' => $to]) ?? self::dateBoundariesPhp($from, $to);
     }
 }
