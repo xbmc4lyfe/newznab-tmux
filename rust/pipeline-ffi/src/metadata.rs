@@ -14715,3 +14715,1027 @@ pub mod games_anidb_tmdb_fanart {
 }
 
 
+
+/// Wave 14 Slice 3: TvShowAdder, TV candidate/run-state/pipe helpers,
+/// RepairTvReleaseLinks matchers, and SteamGameData DTO transforms.
+///
+/// Every export validates raw pointers and lengths before building slices and
+/// runs its body under `catch_unwind`, so a panic becomes a decline (`-1`) and
+/// the PHP caller falls back to its native implementation.
+pub mod tv_adder_steam_dto {
+    use super::OutCursor;
+    use std::panic::{UnwindSafe, catch_unwind};
+    use std::slice;
+
+    const DECLINE: isize = -1;
+    const DECLINE_I64: i64 = -1;
+    const MAX_INPUT: usize = 4 << 20;
+
+    /// `TvShowAdder::normalizeId` rejected an IMDB id.
+    pub const INVALID_IMDB: i64 = -2;
+    /// `TvShowAdder::normalizeId` rejected a non-IMDB id.
+    pub const INVALID_POSITIVE: i64 = -3;
+    /// `TvShowAdder::videoColumnForSource` / `truncateTitle` sentinel.
+    pub const UNSUPPORTED_OR_UNCHANGED: isize = -2;
+
+    #[inline]
+    unsafe fn input<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null() || len > MAX_INPUT {
+            return None;
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn guard<F: FnOnce() -> isize + UnwindSafe>(f: F) -> isize {
+        catch_unwind(f).unwrap_or(DECLINE)
+    }
+
+    #[inline]
+    fn guard_i64<F: FnOnce() -> i64 + UnwindSafe>(f: F) -> i64 {
+        catch_unwind(f).unwrap_or(DECLINE_I64)
+    }
+
+    #[inline]
+    fn guard_i32<F: FnOnce() -> i32 + UnwindSafe>(f: F) -> i32 {
+        catch_unwind(f).unwrap_or(-1)
+    }
+
+    /// PHP `trim()` default character set: " \t\n\r\0\x0B".
+    #[inline]
+    fn is_php_trim_byte(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\0' | 0x0B)
+    }
+
+    fn php_trim_span(bytes: &[u8]) -> (usize, usize) {
+        let mut start = 0;
+        let mut end = bytes.len();
+        while start < end && is_php_trim_byte(bytes[start]) {
+            start += 1;
+        }
+        while end > start && is_php_trim_byte(bytes[end - 1]) {
+            end -= 1;
+        }
+        (start, end)
+    }
+
+    /// Returns the (start, len) span of the normalized id within `id`, or an error code.
+    pub fn normalize_id_span(source: &[u8], id: &[u8]) -> Result<(usize, usize), i64> {
+        let (start, end) = php_trim_span(id);
+        let trimmed = &id[start..end];
+        let all_digits = !trimmed.is_empty() && trimmed.iter().all(u8::is_ascii_digit);
+
+        if source == b"imdb" {
+            // /^tt?(\d{5,10})$/i
+            if let Some((&first, rest)) = trimmed.split_first()
+                && (first == b't' || first == b'T')
+            {
+                let skip = usize::from(matches!(rest.first(), Some(b't' | b'T')));
+                let digits = &rest[skip..];
+                if (5..=10).contains(&digits.len()) && digits.iter().all(u8::is_ascii_digit) {
+                    return Ok((start + 1 + skip, digits.len()));
+                }
+            }
+            if all_digits {
+                return Ok((start, trimmed.len()));
+            }
+            return Err(INVALID_IMDB);
+        }
+
+        // ctype_digit($id) && (int) $id > 0: PHP saturates overflow to PHP_INT_MAX.
+        if !all_digits || trimmed.iter().all(|&b| b == b'0') {
+            return Err(INVALID_POSITIVE);
+        }
+
+        Ok((start, trimmed.len()))
+    }
+
+    /// Success returns `(start << 32) | len` of the normalized substring of `id`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tv_show_adder_normalize_id(
+        source_ptr: *const u8,
+        source_len: usize,
+        id_ptr: *const u8,
+        id_len: usize,
+    ) -> i64 {
+        guard_i64(|| {
+            let (Some(source), Some(id)) = (unsafe { input(source_ptr, source_len) }, unsafe {
+                input(id_ptr, id_len)
+            }) else {
+                return DECLINE_I64;
+            };
+            match normalize_id_span(source, id) {
+                Ok((start, len)) => ((start as i64) << 32) | len as i64,
+                Err(code) => code,
+            }
+        })
+    }
+
+    pub const VIDEO_COLUMNS: [&[u8]; 5] = [b"tvdb", b"tvmaze", b"tmdb", b"trakt", b"imdb"];
+
+    /// Returns the index into `VIDEO_COLUMNS` or `-2` for an unsupported source.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tv_show_adder_video_column(
+        source_ptr: *const u8,
+        source_len: usize,
+    ) -> i32 {
+        guard_i32(|| {
+            let Some(source) = (unsafe { input(source_ptr, source_len) }) else {
+                return -1;
+            };
+            VIDEO_COLUMNS
+                .iter()
+                .position(|column| *column == source)
+                .map_or(UNSUPPORTED_OR_UNCHANGED as i32, |idx| idx as i32)
+        })
+    }
+
+    pub fn transient_delay(attempts: i64, provider_retry_after: i64) -> i64 {
+        let stepped = match attempts {
+            1 => 300,
+            2 => 900,
+            3 => 3600,
+            _ => 21600,
+        };
+        provider_retry_after.max(stepped)
+    }
+
+    pub fn episode_delay(attempts: i64) -> i64 {
+        match attempts {
+            1 => 3600,
+            2 => 21600,
+            3 => 86400,
+            4 => 259200,
+            _ => 604800,
+        }
+    }
+
+    /// `kind` 0 = `transientDelay`, 1 = `episodeDelay`; other kinds decline.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn nntmux_tv_candidate_backoff_seconds(
+        kind: i32,
+        attempts: i64,
+        provider_retry_after: i64,
+    ) -> i64 {
+        guard_i64(|| match kind {
+            0 => transient_delay(attempts, provider_retry_after),
+            1 => episode_delay(attempts),
+            _ => DECLINE_I64,
+        })
+    }
+
+    fn write_i64(out: &mut OutCursor<'_>, value: i64) {
+        if value < 0 {
+            out.push(b'-');
+        }
+        let mut n = value.unsigned_abs();
+        let mut digits = [0u8; 20];
+        let mut i = digits.len();
+        loop {
+            i -= 1;
+            digits[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        out.extend(&digits[i..]);
+    }
+
+    /// `kind` 0 = `refreshKey` (`tv:eps-refreshed:<lower provider>:<id>`; declines
+    /// non-ASCII providers because `mb_strtolower` is Unicode-aware), 1 =
+    /// `firstEpisodeLookup` key (`<provider>:<id>:<episodeKey>`).
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tv_run_state_episode_lookup_key(
+        kind: i32,
+        provider_ptr: *const u8,
+        provider_len: usize,
+        video_id: i64,
+        episode_key_ptr: *const u8,
+        episode_key_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        guard(|| {
+            let (Some(provider), Some(episode_key)) =
+                (unsafe { input(provider_ptr, provider_len) }, unsafe {
+                    input(episode_key_ptr, episode_key_len)
+                })
+            else {
+                return DECLINE;
+            };
+            let mut cursor = unsafe { OutCursor::new(out, cap) };
+            match kind {
+                0 => {
+                    if !provider.is_ascii() {
+                        return DECLINE;
+                    }
+                    cursor.extend(b"tv:eps-refreshed:");
+                    for &b in provider {
+                        cursor.push(b.to_ascii_lowercase());
+                    }
+                    cursor.push(b':');
+                    write_i64(&mut cursor, video_id);
+                }
+                1 => {
+                    cursor.extend(provider);
+                    cursor.push(b':');
+                    write_i64(&mut cursor, video_id);
+                    cursor.push(b':');
+                    cursor.extend(episode_key);
+                }
+                _ => return DECLINE,
+            }
+            cursor.finish()
+        })
+    }
+
+    /// Byte length of the first `chars` code points of valid UTF-8 `s`.
+    fn char_prefix_bytes(s: &str, chars: usize) -> usize {
+        s.char_indices().nth(chars).map_or(s.len(), |(idx, _)| idx)
+    }
+
+    /// Mirrors `AbstractTvProviderPipe::truncateTitle`: `-2` = unchanged, otherwise the
+    /// byte length of `mb_substr($title, 0, $maxLength - 3)` (caller appends "...").
+    pub fn truncate_title_prefix(title: &[u8], max_length: i64) -> Option<isize> {
+        let s = std::str::from_utf8(title).ok()?;
+        let count = if s.is_ascii() {
+            s.len()
+        } else {
+            s.chars().count()
+        } as i64;
+        if count <= max_length {
+            return Some(UNSUPPORTED_OR_UNCHANGED);
+        }
+        let length = max_length.saturating_sub(3);
+        // mb_substr with a negative length omits that many characters from the end.
+        let keep = if length >= 0 {
+            length.min(count)
+        } else {
+            (count + length).max(0)
+        } as usize;
+        let bytes = if s.is_ascii() {
+            keep
+        } else {
+            char_prefix_bytes(s, keep)
+        };
+        Some(bytes as isize)
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tv_pipe_truncate_title(
+        title_ptr: *const u8,
+        title_len: usize,
+        max_length: i64,
+    ) -> isize {
+        guard(|| {
+            let Some(title) = (unsafe { input(title_ptr, title_len) }) else {
+                return DECLINE;
+            };
+            truncate_title_prefix(title, max_length).unwrap_or(DECLINE)
+        })
+    }
+
+    pub const HAS_SEASON: u32 = 1;
+    pub const HAS_EPISODE: u32 = 2;
+    pub const HAS_AIRDATE: u32 = 4;
+
+    pub fn matches_episode(
+        flags: u32,
+        season: i64,
+        episode: i64,
+        airdate: &[u8],
+        series: i64,
+        episode_number: i64,
+        first_aired: &[u8],
+    ) -> bool {
+        let has_episode_numbers =
+            flags & HAS_SEASON != 0 && season >= 0 && flags & HAS_EPISODE != 0 && episode > 0;
+        if has_episode_numbers {
+            return season == series && episode == episode_number;
+        }
+        flags & HAS_AIRDATE != 0 && &first_aired[..first_aired.len().min(10)] == airdate
+    }
+
+    /// Mirrors `RepairTvReleaseLinks::matchesEpisode` for a non-null parsed release.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_repair_tv_matches_episode(
+        flags: u32,
+        season: i64,
+        episode: i64,
+        airdate_ptr: *const u8,
+        airdate_len: usize,
+        series: i64,
+        episode_number: i64,
+        first_aired_ptr: *const u8,
+        first_aired_len: usize,
+    ) -> i32 {
+        guard_i32(|| {
+            let (Some(airdate), Some(first_aired)) =
+                (unsafe { input(airdate_ptr, airdate_len) }, unsafe {
+                    input(first_aired_ptr, first_aired_len)
+                })
+            else {
+                return -1;
+            };
+            i32::from(matches_episode(
+                flags,
+                season,
+                episode,
+                airdate,
+                series,
+                episode_number,
+                first_aired,
+            ))
+        })
+    }
+
+    /// Mirrors `RepairTvReleaseLinks::capped`: a positive limit caps the count.
+    #[unsafe(no_mangle)]
+    pub extern "C" fn nntmux_repair_tv_capped(count: i64, limit: i64) -> i64 {
+        guard_i64(|| if limit > 0 { count.min(limit) } else { count })
+    }
+
+    // ---------------------------------------------------------------------
+    // SteamGameData: minimal JSON reader for the PHP-encoded DTO payload.
+    // ---------------------------------------------------------------------
+
+    #[derive(Clone, Copy)]
+    enum JVal<'a> {
+        Null,
+        /// Raw string body between the quotes, still JSON-escaped.
+        Str(&'a [u8]),
+        /// Raw integer token.
+        Int(&'a [u8]),
+        /// Raw array body: offsets of a string-only array.
+        StrArr(&'a [u8]),
+    }
+
+    struct Reader<'a> {
+        b: &'a [u8],
+        i: usize,
+    }
+
+    impl<'a> Reader<'a> {
+        fn ws(&mut self) {
+            while self.i < self.b.len() && matches!(self.b[self.i], b' ' | b'\t' | b'\n' | b'\r') {
+                self.i += 1;
+            }
+        }
+
+        fn eat(&mut self, c: u8) -> Option<()> {
+            self.ws();
+            (self.b.get(self.i) == Some(&c)).then(|| self.i += 1)
+        }
+
+        /// Scans a string token and returns its escaped body.
+        fn string(&mut self) -> Option<&'a [u8]> {
+            self.eat(b'"')?;
+            let start = self.i;
+            while self.i < self.b.len() {
+                match self.b[self.i] {
+                    b'"' => {
+                        let body = &self.b[start..self.i];
+                        self.i += 1;
+                        return Some(body);
+                    }
+                    b'\\' => {
+                        let esc = *self.b.get(self.i + 1)?;
+                        match esc {
+                            b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => self.i += 2,
+                            b'u' => {
+                                let hex = self.b.get(self.i + 2..self.i + 6)?;
+                                if !hex.iter().all(u8::is_ascii_hexdigit) {
+                                    return None;
+                                }
+                                self.i += 6;
+                            }
+                            _ => return None,
+                        }
+                    }
+                    c if c < 0x20 => return None,
+                    _ => self.i += 1,
+                }
+            }
+            None
+        }
+
+        fn int(&mut self) -> Option<&'a [u8]> {
+            self.ws();
+            let start = self.i;
+            if self.b.get(self.i) == Some(&b'-') {
+                self.i += 1;
+            }
+            let digits_start = self.i;
+            while self.i < self.b.len() && self.b[self.i].is_ascii_digit() {
+                self.i += 1;
+            }
+            let digits = &self.b[digits_start..self.i];
+            if digits.is_empty() || (digits.len() > 1 && digits[0] == b'0') {
+                return None;
+            }
+            // Floats/exponents are not produced for the DTO's int fields.
+            if matches!(self.b.get(self.i), Some(b'.' | b'e' | b'E')) {
+                return None;
+            }
+            Some(&self.b[start..self.i])
+        }
+
+        fn str_array(&mut self) -> Option<&'a [u8]> {
+            self.eat(b'[')?;
+            let start = self.i;
+            self.ws();
+            if self.b.get(self.i) == Some(&b']') {
+                let body = &self.b[start..self.i];
+                self.i += 1;
+                return Some(body);
+            }
+            loop {
+                self.string()?;
+                self.ws();
+                match self.b.get(self.i)? {
+                    b',' => self.i += 1,
+                    b']' => {
+                        let body = &self.b[start..self.i];
+                        self.i += 1;
+                        return Some(body);
+                    }
+                    _ => return None,
+                }
+            }
+        }
+
+        fn value(&mut self) -> Option<JVal<'a>> {
+            self.ws();
+            match *self.b.get(self.i)? {
+                b'"' => self.string().map(JVal::Str),
+                b'[' => self.str_array().map(JVal::StrArr),
+                b'n' => {
+                    if self.b.get(self.i..self.i + 4)? == b"null" {
+                        self.i += 4;
+                        Some(JVal::Null)
+                    } else {
+                        None
+                    }
+                }
+                b'-' | b'0'..=b'9' => self.int().map(JVal::Int),
+                _ => None,
+            }
+        }
+
+        fn end(&mut self) -> Option<()> {
+            self.ws();
+            (self.i == self.b.len()).then_some(())
+        }
+    }
+
+    /// Iterates the escaped string bodies of a validated string-only array body.
+    fn array_items(body: &[u8]) -> impl Iterator<Item = &[u8]> {
+        let mut reader = Reader { b: body, i: 0 };
+        std::iter::from_fn(move || {
+            reader.ws();
+            if reader.i < reader.b.len() && reader.b[reader.i] == b',' {
+                reader.i += 1;
+            }
+            reader.ws();
+            if reader.i >= reader.b.len() {
+                return None;
+            }
+            reader.string()
+        })
+    }
+
+    fn hex4(h: &[u8]) -> u32 {
+        h.iter().fold(0, |acc, &c| {
+            (acc << 4) | (c as char).to_digit(16).unwrap_or(0)
+        })
+    }
+
+    /// Decodes an escaped JSON string body; `None` for lone surrogates.
+    fn decode_into(body: &[u8], out: &mut Vec<u8>) -> Option<()> {
+        let mut i = 0;
+        while i < body.len() {
+            let c = body[i];
+            if c != b'\\' {
+                out.push(c);
+                i += 1;
+                continue;
+            }
+            let esc = body[i + 1];
+            i += 2;
+            let simple = match esc {
+                b'"' => b'"',
+                b'\\' => b'\\',
+                b'/' => b'/',
+                b'b' => 0x08,
+                b'f' => 0x0C,
+                b'n' => b'\n',
+                b'r' => b'\r',
+                b't' => b'\t',
+                b'u' => {
+                    let mut cp = hex4(&body[i..i + 4]);
+                    i += 4;
+                    if (0xD800..0xDC00).contains(&cp) {
+                        if body.get(i..i + 2)? != b"\\u" {
+                            return None;
+                        }
+                        let lo = hex4(body.get(i + 2..i + 6)?);
+                        if !(0xDC00..0xE000).contains(&lo) {
+                            return None;
+                        }
+                        i += 6;
+                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                    } else if (0xDC00..0xE000).contains(&cp) {
+                        return None;
+                    }
+                    let ch = char::from_u32(cp)?;
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                    continue;
+                }
+                _ => return None,
+            };
+            out.push(simple);
+        }
+        Some(())
+    }
+
+    /// PHP `empty()` on a `?string`: null, "" and "0" are empty.
+    fn php_empty(v: Option<JVal<'_>>) -> Option<bool> {
+        match v {
+            None | Some(JVal::Null) => Some(true),
+            Some(JVal::Str(body)) => {
+                if body.contains(&b'\\') {
+                    let mut buf = Vec::with_capacity(body.len());
+                    decode_into(body, &mut buf)?;
+                    Some(buf.is_empty() || buf == b"0")
+                } else {
+                    Some(body.is_empty() || body == b"0")
+                }
+            }
+            _ => None,
+        }
+    }
+
+    const MULTIPLAYER_CATEGORIES: [&[u8]; 5] = [
+        b"Multi-player",
+        b"Online Multi-Player",
+        b"Online Co-op",
+        b"Local Multi-Player",
+        b"Local Co-op",
+    ];
+
+    #[derive(Default)]
+    struct SteamFields<'a> {
+        title: Option<JVal<'a>>,
+        steam_id: Option<JVal<'a>>,
+        store_url: Option<JVal<'a>>,
+        publisher: Option<JVal<'a>>,
+        release_date: Option<JVal<'a>>,
+        description: Option<JVal<'a>>,
+        cover_url: Option<JVal<'a>>,
+        backdrop_url: Option<JVal<'a>>,
+        trailer_url: Option<JVal<'a>>,
+        metacritic_score: Option<JVal<'a>>,
+        genres: Option<JVal<'a>>,
+    }
+
+    fn parse_steam_object(json: &[u8]) -> Option<SteamFields<'_>> {
+        let mut r = Reader { b: json, i: 0 };
+        let mut f = SteamFields::default();
+        r.eat(b'{')?;
+        r.ws();
+        if r.b.get(r.i) == Some(&b'}') {
+            r.i += 1;
+        } else {
+            loop {
+                let key = r.string()?;
+                r.eat(b':')?;
+                let val = r.value()?;
+                let slot = match key {
+                    b"title" => &mut f.title,
+                    b"steamId" => &mut f.steam_id,
+                    b"storeUrl" => &mut f.store_url,
+                    b"publisher" => &mut f.publisher,
+                    b"releaseDate" => &mut f.release_date,
+                    b"description" => &mut f.description,
+                    b"coverUrl" => &mut f.cover_url,
+                    b"backdropUrl" => &mut f.backdrop_url,
+                    b"trailerUrl" => &mut f.trailer_url,
+                    b"metacriticScore" => &mut f.metacritic_score,
+                    b"genres" => &mut f.genres,
+                    _ => return None,
+                };
+                *slot = Some(val);
+                r.ws();
+                match r.b.get(r.i)? {
+                    b',' => r.i += 1,
+                    b'}' => {
+                        r.i += 1;
+                        break;
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        r.end()?;
+        Some(f)
+    }
+
+    fn emit_key(out: &mut OutCursor<'_>, key: &[u8], first: bool) {
+        if !first {
+            out.push(b',');
+        }
+        out.push(b'"');
+        out.extend(key);
+        out.extend(b"\":");
+    }
+
+    fn emit_str_body(out: &mut OutCursor<'_>, body: &[u8]) {
+        out.push(b'"');
+        out.extend(body);
+        out.push(b'"');
+    }
+
+    /// Emits a `?string` field, using `fallback` (already JSON-safe) when null.
+    fn emit_nullable(
+        out: &mut OutCursor<'_>,
+        v: Option<JVal<'_>>,
+        fallback: Option<&[u8]>,
+    ) -> Option<()> {
+        match (v?, fallback) {
+            (JVal::Str(body), _) => emit_str_body(out, body),
+            (JVal::Null, Some(fb)) => emit_str_body(out, fb),
+            (JVal::Null, None) => out.extend(b"null"),
+            _ => return None,
+        }
+        Some(())
+    }
+
+    fn emit_games_info(f: &SteamFields<'_>, out: &mut OutCursor<'_>) -> Option<()> {
+        let JVal::Str(title) = f.title? else {
+            return None;
+        };
+        let JVal::Int(steam_id) = f.steam_id? else {
+            return None;
+        };
+        let JVal::Str(store_url) = f.store_url? else {
+            return None;
+        };
+        let JVal::StrArr(genres) = f.genres? else {
+            return None;
+        };
+        let cover = php_empty(f.cover_url)?;
+        let backdrop = php_empty(f.backdrop_url)?;
+
+        out.push(b'{');
+        emit_key(out, b"title", true);
+        emit_str_body(out, title);
+        emit_key(out, b"asin", false);
+        emit_str_body(out, steam_id);
+        emit_key(out, b"url", false);
+        emit_str_body(out, store_url);
+        emit_key(out, b"publisher", false);
+        emit_nullable(out, f.publisher, Some(b"Unknown"))?;
+        emit_key(out, b"releasedate", false);
+        emit_nullable(out, f.release_date, None)?;
+        emit_key(out, b"review", false);
+        emit_nullable(out, f.description, Some(b"No description available"))?;
+        emit_key(out, b"cover", false);
+        out.push(if cover { b'0' } else { b'1' });
+        emit_key(out, b"backdrop", false);
+        out.push(if backdrop { b'0' } else { b'1' });
+        emit_key(out, b"trailer", false);
+        emit_nullable(out, f.trailer_url, Some(b""))?;
+        emit_key(out, b"classused", false);
+        out.extend(b"\"Steam\"");
+        emit_key(out, b"esrb", false);
+        match f.metacritic_score? {
+            JVal::Int(score) => emit_str_body(out, score),
+            JVal::Null => out.extend(b"\"Not Rated\""),
+            _ => return None,
+        }
+        emit_key(out, b"coverurl", false);
+        emit_nullable(out, f.cover_url, None)?;
+        emit_key(out, b"backdropurl", false);
+        emit_nullable(out, f.backdrop_url, None)?;
+        emit_key(out, b"genres", false);
+        out.push(b'"');
+        for (idx, item) in array_items(genres).enumerate() {
+            if idx > 0 {
+                out.push(b',');
+            }
+            out.extend(item);
+        }
+        out.push(b'"');
+        out.push(b'}');
+        Some(())
+    }
+
+    fn parse_top_array(json: &[u8]) -> Option<&[u8]> {
+        let mut r = Reader { b: json, i: 0 };
+        let body = r.str_array()?;
+        r.end()?;
+        Some(body)
+    }
+
+    fn has_multiplayer(json: &[u8]) -> Option<bool> {
+        let body = parse_top_array(json)?;
+        let mut scratch = Vec::new();
+        for item in array_items(body) {
+            let decoded: &[u8] = if item.contains(&b'\\') {
+                scratch.clear();
+                decode_into(item, &mut scratch)?;
+                &scratch
+            } else {
+                item
+            };
+            if MULTIPLAYER_CATEGORIES.contains(&decoded) {
+                return Some(true);
+            }
+        }
+        Some(false)
+    }
+
+    fn genres_string(json: &[u8], out: &mut OutCursor<'_>) -> Option<()> {
+        let body = parse_top_array(json)?;
+        let mut scratch = Vec::new();
+        for (idx, item) in array_items(body).enumerate() {
+            if idx > 0 {
+                out.extend(b", ");
+            }
+            if item.contains(&b'\\') {
+                scratch.clear();
+                decode_into(item, &mut scratch)?;
+                out.extend(&scratch);
+            } else {
+                out.extend(item);
+            }
+        }
+        Some(())
+    }
+
+    /// `mode` 0 = `toGamesInfoArray` (input: DTO object JSON, output: games info
+    /// JSON object), 1 = `hasMultiplayer` (input: categories JSON array, returns
+    /// 1/0), 2 = `getGenresString` (input: genres JSON array, output: raw bytes).
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_steam_game_data_transform_json(
+        mode: i32,
+        json_ptr: *const u8,
+        json_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        guard(|| {
+            let Some(json) = (unsafe { input(json_ptr, json_len) }) else {
+                return DECLINE;
+            };
+            match mode {
+                0 => {
+                    let Some(fields) = parse_steam_object(json) else {
+                        return DECLINE;
+                    };
+                    let mut cursor = unsafe { OutCursor::new(out, cap) };
+                    if emit_games_info(&fields, &mut cursor).is_none() {
+                        return DECLINE;
+                    }
+                    cursor.finish()
+                }
+                1 => has_multiplayer(json).map_or(DECLINE, isize::from),
+                2 => {
+                    let mut cursor = unsafe { OutCursor::new(out, cap) };
+                    if genres_string(json, &mut cursor).is_none() {
+                        return DECLINE;
+                    }
+                    // Output never exceeds the input length, which the PHP caller
+                    // always allocates, so a one-byte overflow cannot alias DECLINE.
+                    cursor.finish()
+                }
+                _ => DECLINE,
+            }
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn norm(source: &str, id: &str) -> Result<String, i64> {
+            normalize_id_span(source.as_bytes(), id.as_bytes())
+                .map(|(s, l)| id[s..s + l].to_string())
+        }
+
+        #[test]
+        fn normalize_id_matches_php() {
+            assert_eq!(norm("imdb", "tt0944947"), Ok("0944947".into()));
+            assert_eq!(norm("imdb", " T0944947\n"), Ok("0944947".into()));
+            assert_eq!(norm("imdb", "TT12345"), Ok("12345".into()));
+            assert_eq!(norm("imdb", "tt1234"), Err(INVALID_IMDB));
+            assert_eq!(norm("imdb", "1234"), Ok("1234".into()));
+            assert_eq!(norm("imdb", "ttt12345"), Err(INVALID_IMDB));
+            assert_eq!(norm("imdb", ""), Err(INVALID_IMDB));
+            assert_eq!(norm("tvdb", "000"), Err(INVALID_POSITIVE));
+            assert_eq!(norm("tvdb", "0012"), Ok("0012".into()));
+            assert_eq!(norm("tmdb", "-5"), Err(INVALID_POSITIVE));
+            assert_eq!(
+                norm("trakt", "99999999999999999999"),
+                Ok("99999999999999999999".into())
+            );
+
+            let r = unsafe {
+                nntmux_tv_show_adder_normalize_id(b"imdb".as_ptr(), 4, b" tt0944947".as_ptr(), 10)
+            };
+            assert_eq!((r >> 32, r & 0xFFFF_FFFF), (3, 7));
+            assert_eq!(
+                unsafe { nntmux_tv_show_adder_normalize_id(std::ptr::null(), 4, b"1".as_ptr(), 1) },
+                -1
+            );
+        }
+
+        #[test]
+        fn columns_backoff_and_capped() {
+            assert_eq!(
+                unsafe { nntmux_tv_show_adder_video_column(b"tmdb".as_ptr(), 4) },
+                2
+            );
+            assert_eq!(
+                unsafe { nntmux_tv_show_adder_video_column(b"tvrage".as_ptr(), 6) },
+                -2
+            );
+            assert_eq!(nntmux_tv_candidate_backoff_seconds(0, 1, 0), 300);
+            assert_eq!(nntmux_tv_candidate_backoff_seconds(0, 2, 5000), 5000);
+            assert_eq!(nntmux_tv_candidate_backoff_seconds(0, 0, -9), 21600);
+            assert_eq!(nntmux_tv_candidate_backoff_seconds(1, 4, 0), 259200);
+            assert_eq!(nntmux_tv_candidate_backoff_seconds(1, 9, 0), 604800);
+            assert_eq!(nntmux_tv_candidate_backoff_seconds(7, 1, 0), -1);
+            assert_eq!(nntmux_repair_tv_capped(50, 10), 10);
+            assert_eq!(nntmux_repair_tv_capped(50, 0), 50);
+        }
+
+        #[test]
+        fn lookup_keys_and_truncation() {
+            let mut buf = [0u8; 64];
+            let n = unsafe {
+                nntmux_tv_run_state_episode_lookup_key(
+                    0,
+                    b"TVMaze".as_ptr(),
+                    6,
+                    -42,
+                    std::ptr::null(),
+                    0,
+                    buf.as_mut_ptr(),
+                    64,
+                )
+            };
+            assert_eq!(&buf[..n as usize], b"tv:eps-refreshed:tvmaze:-42");
+            let n = unsafe {
+                nntmux_tv_run_state_episode_lookup_key(
+                    1,
+                    b"Tmdb".as_ptr(),
+                    4,
+                    7,
+                    b"1x2".as_ptr(),
+                    3,
+                    buf.as_mut_ptr(),
+                    64,
+                )
+            };
+            assert_eq!(&buf[..n as usize], b"Tmdb:7:1x2");
+            let n = unsafe {
+                nntmux_tv_run_state_episode_lookup_key(
+                    0,
+                    "Tëst".as_ptr(),
+                    5,
+                    1,
+                    std::ptr::null(),
+                    0,
+                    buf.as_mut_ptr(),
+                    64,
+                )
+            };
+            assert_eq!(n, -1);
+
+            assert_eq!(truncate_title_prefix(b"short", 45), Some(-2));
+            assert_eq!(truncate_title_prefix(b"abcdefgh", 5), Some(2));
+            assert_eq!(truncate_title_prefix("ééééé".as_bytes(), 4), Some(2));
+            assert_eq!(truncate_title_prefix(b"abcde", 2), Some(4));
+            assert_eq!(truncate_title_prefix(b"abcde", -10), Some(0));
+            assert_eq!(truncate_title_prefix(b"\xff\xfe", 1), None);
+        }
+
+        #[test]
+        fn matches_episode_rules() {
+            assert!(matches_episode(
+                HAS_SEASON | HAS_EPISODE,
+                1,
+                2,
+                b"",
+                1,
+                2,
+                b""
+            ));
+            assert!(!matches_episode(
+                HAS_SEASON | HAS_EPISODE,
+                1,
+                2,
+                b"",
+                1,
+                3,
+                b""
+            ));
+            assert!(matches_episode(
+                HAS_AIRDATE | HAS_SEASON,
+                0,
+                0,
+                b"2024-01-02",
+                0,
+                0,
+                b"2024-01-02 00:00:00"
+            ));
+            assert!(!matches_episode(
+                HAS_SEASON | HAS_EPISODE,
+                0,
+                0,
+                b"",
+                0,
+                0,
+                b""
+            ));
+            assert!(!matches_episode(0, 0, 0, b"", 0, 0, b""));
+        }
+
+        #[test]
+        fn steam_transforms() {
+            let json = br#"{"title":"Half-Life \"2\"","steamId":220,"storeUrl":"https://s/220","publisher":null,"releaseDate":"Nov 16, 2004","description":null,"coverUrl":"0","backdropUrl":"https://b","trailerUrl":null,"metacriticScore":96,"genres":["Action","Sci\u00e9"]}"#;
+            let mut buf = [0u8; 512];
+            let n = unsafe {
+                nntmux_steam_game_data_transform_json(
+                    0,
+                    json.as_ptr(),
+                    json.len(),
+                    buf.as_mut_ptr(),
+                    512,
+                )
+            };
+            let out = std::str::from_utf8(&buf[..n as usize]).unwrap();
+            assert!(out.contains(r#""publisher":"Unknown""#));
+            assert!(out.contains(r#""cover":0,"backdrop":1"#));
+            assert!(out.contains(r#""esrb":"96""#));
+            assert!(out.contains(r#""genres":"Action,Sci\u00e9""#));
+
+            let cats = br#"["Single-player","Online Co-op"]"#;
+            assert_eq!(
+                unsafe {
+                    nntmux_steam_game_data_transform_json(
+                        1,
+                        cats.as_ptr(),
+                        cats.len(),
+                        buf.as_mut_ptr(),
+                        512,
+                    )
+                },
+                1
+            );
+            let genres = br#"["Action","Sci\u00e9"]"#;
+            let n = unsafe {
+                nntmux_steam_game_data_transform_json(
+                    2,
+                    genres.as_ptr(),
+                    genres.len(),
+                    buf.as_mut_ptr(),
+                    512,
+                )
+            };
+            assert_eq!(&buf[..n as usize], "Action, Scié".as_bytes());
+            let bad = br#"[1,2]"#;
+            assert_eq!(
+                unsafe {
+                    nntmux_steam_game_data_transform_json(
+                        2,
+                        bad.as_ptr(),
+                        bad.len(),
+                        buf.as_mut_ptr(),
+                        512,
+                    )
+                },
+                -1
+            );
+            let lone = br#"["\ud800"]"#;
+            assert_eq!(
+                unsafe {
+                    nntmux_steam_game_data_transform_json(
+                        2,
+                        lone.as_ptr(),
+                        lone.len(),
+                        buf.as_mut_ptr(),
+                        512,
+                    )
+                },
+                -1
+            );
+        }
+    }
+}

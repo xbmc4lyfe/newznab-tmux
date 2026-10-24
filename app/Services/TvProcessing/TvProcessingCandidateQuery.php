@@ -7,6 +7,9 @@ namespace App\Services\TvProcessing;
 use App\Enums\TvLookupStatus;
 use App\Models\Category;
 use App\Models\Release;
+use App\Support\RustPipelineLibrary;
+use FFI;
+use Throwable;
 
 /**
  * SQL shared by the TV bucket dispatcher, the pipeline workers, the tmux ready-work
@@ -22,6 +25,37 @@ final class TvProcessingCandidateQuery
 
     /** Delay after a transient failure on a release whose show is already known. */
     public const int KNOWN_SHOW_TRANSIENT_DELAY = 900;
+
+    public const string FFI_CDEF = <<<'C'
+        int64_t nntmux_tv_candidate_backoff_seconds(int32_t kind, int64_t attempts, int64_t provider_retry_after);
+        C;
+
+    /** Null selects the benchmark-qualified production default (PHP; see RustTvShowAdderAndMetadataParityTest). */
+    private static ?bool $useRustFfi = null;
+
+    private static FFI|false|null $ffi = null;
+
+    public static function setUseRustFfi(?bool $use = true): void
+    {
+        self::$useRustFfi = $use;
+        if ($use === null) {
+            self::$ffi = null;
+        }
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? false;
+    }
+
+    private static function ffi(): ?FFI
+    {
+        if (self::$ffi === null) {
+            self::$ffi = RustPipelineLibrary::resolveDomain('metadata', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$ffi === false ? null : self::$ffi;
+    }
 
     public static function categoryCondition(): string
     {
@@ -59,6 +93,19 @@ final class TvProcessingCandidateQuery
 
     public static function transientDelay(int $attempts, int $providerRetryAfter = 0): int
     {
+        return self::usesRustFfi()
+            ? self::transientDelayNative($attempts, $providerRetryAfter)
+            : self::transientDelayPhp($attempts, $providerRetryAfter);
+    }
+
+    public static function transientDelayNative(int $attempts, int $providerRetryAfter = 0): int
+    {
+        return self::nativeBackoff(0, $attempts, $providerRetryAfter)
+            ?? self::transientDelayPhp($attempts, $providerRetryAfter);
+    }
+
+    public static function transientDelayPhp(int $attempts, int $providerRetryAfter = 0): int
+    {
         return max($providerRetryAfter, match ($attempts) {
             1 => 300,
             2 => 900,
@@ -69,6 +116,18 @@ final class TvProcessingCandidateQuery
 
     public static function episodeDelay(int $attempts): int
     {
+        return self::usesRustFfi()
+            ? self::episodeDelayNative($attempts)
+            : self::episodeDelayPhp($attempts);
+    }
+
+    public static function episodeDelayNative(int $attempts): int
+    {
+        return self::nativeBackoff(1, $attempts, 0) ?? self::episodeDelayPhp($attempts);
+    }
+
+    public static function episodeDelayPhp(int $attempts): int
+    {
         return match ($attempts) {
             1 => 3600,
             2 => 21600,
@@ -76,6 +135,22 @@ final class TvProcessingCandidateQuery
             4 => 259200,
             default => 604800,
         };
+    }
+
+    private static function nativeBackoff(int $kind, int $attempts, int $providerRetryAfter): ?int
+    {
+        if (($ffi = self::ffi()) === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $seconds = $ffi->nntmux_tv_candidate_backoff_seconds($kind, $attempts, $providerRetryAfter);
+        } catch (Throwable) {
+            return null;
+        }
+
+        // Valid kinds never yield a negative delay; -1 is the decline sentinel.
+        return \is_int($seconds) && $seconds >= 0 ? $seconds : null;
     }
 
     /**
