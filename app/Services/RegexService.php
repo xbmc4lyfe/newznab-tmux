@@ -10,6 +10,7 @@ use App\Models\CollectionRegex;
 use App\Models\Release;
 use App\Models\ReleaseNamingRegex;
 use App\Models\UsenetGroup;
+use App\Support\ReleaseNameDisplay;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
@@ -20,6 +21,8 @@ use Illuminate\Support\Facades\DB;
  */
 class RegexService
 {
+    public bool $useRustFfi = false;
+
     /**
      * The ID of the Regex input string matched or the generic name
      */
@@ -207,11 +210,7 @@ class RegexService
                             $string2 .= '<br/>'.$key.': '.$hit;
                         }
                     }
-                    $files = 0;
-                    if (preg_match('/[[(\s](\d{1,5})(\/|[\s_]of[\s_]|-)(\d{1,5})[])\s$:]/i', $row->name, $fileCount)) {
-                        $files = $fileCount[3];
-                    }
-                    $newCollectionHash = sha1($string.$row->fromname.$groupID.$files);
+                    $newCollectionHash = $this->collectionHash($row->name, $string, $row->fromname, $groupID);
                     $data['New hash: '.$newCollectionHash.$string2][$row->binaryhash] = [
                         'new_collection_hash' => $newCollectionHash,
                         'file_name' => $row->name,
@@ -376,6 +375,48 @@ class RegexService
      */
     protected function _groupQueryString(string $group_regex): string
     {
+        return $this->useRustFfi ? $this->groupQueryStringNative($group_regex) : $this->groupQueryStringPhp($group_regex);
+    }
+
+    public function groupQueryStringNative(string $groupRegex): string
+    {
+        $pattern = ReleaseNameDisplay::transformNative(0, $groupRegex);
+
+        return $pattern === null ? $this->groupQueryStringPhp($groupRegex) : ($pattern === '' ? '' : 'WHERE group_regex LIKE '.escapeString($pattern));
+    }
+
+    public function groupQueryStringPhp(string $group_regex): string
+    {
         return $group_regex ? ('WHERE group_regex LIKE '.escapeString('%'.$group_regex.'%')) : '';
+    }
+
+    public function collectionFileCountNative(string $subject): string
+    {
+        return ReleaseNameDisplay::transformNative(1, $subject) ?? $this->collectionFileCountPhp($subject);
+    }
+
+    public function collectionFileCountPhp(string $subject): string
+    {
+        return preg_match('/[[(\s](\d{1,5})(\/|[\s_]of[\s_]|-)(\d{1,5})[])\s$:]/i', $subject, $count) ? $count[3] : '0';
+    }
+
+    public function collectionHash(string $subject, string $name, string $poster, int $groupId): string
+    {
+        return $this->useRustFfi ? $this->collectionHashNative($subject, $name, $poster, $groupId) : $this->collectionHashPhp($subject, $name, $poster, $groupId);
+    }
+
+    public function collectionHashPhp(string $subject, string $name, string $poster, int $groupId): string
+    {
+        return sha1($name.$poster.$groupId.$this->collectionFileCountPhp($subject));
+    }
+
+    public function collectionHashNative(string $subject, string $name, string $poster, int $groupId): string
+    {
+        $input = '';
+        foreach ([$subject, $name, $poster, (string) $groupId] as $value) {
+            $input .= pack('V', strlen($value)).$value;
+        }
+
+        return ReleaseNameDisplay::transformNative(2, $input) ?? $this->collectionHashPhp($subject, $name, $poster, $groupId);
     }
 }

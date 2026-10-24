@@ -8,10 +8,14 @@ use App\Facades\Search;
 use App\Models\Category;
 use App\Models\Release;
 use App\Services\TvProcessing\TvProcessingCandidateQuery;
+use App\Support\ReleaseNameDisplay;
 use Illuminate\Console\Command;
 
 class NntmuxResetPostProcessing extends Command
 {
+    /** Null selects the benchmark-qualified default for each helper. */
+    public ?bool $useRustFfi = null;
+
     /**
      * @var array<string, mixed>
      */
@@ -160,10 +164,44 @@ class NntmuxResetPostProcessing extends Command
      * Handles comma-separated values, repeated options, casing, simple plurals,
      * and values provided as key=value (e.g. category=tv or the single-dash typo -category=tv).
      *
-     * @param  array<string, mixed>  $raw
+     * @param  array<array-key, mixed>  $raw
      * @return array<string, mixed>
      */
     private function normalizeCategories(array $raw): array
+    {
+        return ($this->useRustFfi ?? true) ? $this->normalizeCategoriesNative($raw) : $this->normalizeCategoriesPhp($raw);
+    }
+
+    /** @param array<array-key, mixed> $raw
+     * @return array<array-key, mixed>
+     */
+    public function normalizeCategoriesNative(array $raw): array
+    {
+        $input = '';
+        foreach ($raw as $value) {
+            if (is_array($value)) {
+                // Let PHP perform coercion once, including errors for nested options.
+                foreach ($value as $part) {
+                    if (! is_string($part)) {
+                        return $this->normalizeCategoriesPhp($raw);
+                    }
+                }
+                $value = implode(',', $value);
+            }
+            if (! is_string($value)) {
+                return $this->normalizeCategoriesPhp($raw);
+            }
+            $input .= pack('V', strlen($value)).$value;
+        }
+        $output = ReleaseNameDisplay::transformNative(6, $input);
+
+        return $output === null ? $this->normalizeCategoriesPhp($raw) : ($output === '' ? [] : explode("\0", $output));
+    }
+
+    /** @param array<array-key, mixed> $raw
+     * @return array<array-key, mixed>
+     */
+    public function normalizeCategoriesPhp(array $raw): array
     {
         $normalized = collect($raw)
             ->flatMap(function ($opt) {
@@ -199,10 +237,35 @@ class NntmuxResetPostProcessing extends Command
      * Return invalid categories from a normalized list.
      * Keeps 'all' as a special allowed token.
      *
-     * @param  array<string, mixed>  $normalized
+     * @param  array<array-key, mixed>  $normalized
      * @return array<int, string>
      */
     private function invalidCategories(array $normalized): array
+    {
+        return ($this->useRustFfi ?? false) ? $this->invalidCategoriesNative($normalized) : $this->invalidCategoriesPhp($normalized);
+    }
+
+    /** @param array<array-key, mixed> $normalized
+     * @return array<array-key, mixed>
+     */
+    public function invalidCategoriesNative(array $normalized): array
+    {
+        $input = '';
+        foreach ($normalized as $value) {
+            if (! is_string($value)) {
+                return $this->invalidCategoriesPhp($normalized);
+            }
+            $input .= pack('V', strlen($value)).$value;
+        }
+        $output = ReleaseNameDisplay::transformNative(7, $input);
+
+        return $output === null ? $this->invalidCategoriesPhp($normalized) : ($output === '' ? [] : explode("\0", $output));
+    }
+
+    /** @param array<array-key, mixed> $normalized
+     * @return array<array-key, mixed>
+     */
+    public function invalidCategoriesPhp(array $normalized): array
     {
         return collect($normalized)
             ->reject(function ($opt) {

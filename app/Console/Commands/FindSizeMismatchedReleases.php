@@ -7,11 +7,14 @@ namespace App\Console\Commands;
 use App\Models\Release;
 use App\Services\NameFixing\NameFixingService;
 use App\Services\NameFixing\ReleaseUpdateService;
+use App\Support\ReleaseNameDisplay;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 
 class FindSizeMismatchedReleases extends Command
 {
+    public bool $useRustFfi = false;
+
     protected $signature = 'nntmux:find-size-mismatches {--threshold=20} {--limit=100} {--season-pack} {--direction=any} {--rename}';
 
     protected $description = 'Find releases where size differs significantly from release_files total. Use --direction=bigger|smaller|any';
@@ -134,6 +137,16 @@ class FindSizeMismatchedReleases extends Command
     }
 
     private function stripDomainFromString(string $str): string
+    {
+        return $this->useRustFfi ? $this->stripDomainFromStringNative($str) : $this->stripDomainFromStringPhp($str);
+    }
+
+    public function stripDomainFromStringNative(string $str): string
+    {
+        return ReleaseNameDisplay::transformNative(5, $str) ?? $this->stripDomainFromStringPhp($str);
+    }
+
+    public function stripDomainFromStringPhp(string $str): string
     {
         return preg_replace("/www\.[^\s]+\.[a-z]{2,4}/i", '', $str);
     }
