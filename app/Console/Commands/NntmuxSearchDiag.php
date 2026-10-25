@@ -15,6 +15,14 @@ use Throwable;
 
 class NntmuxSearchDiag extends Command
 {
+    /**
+     * Rust stays opt-in for the Wave 39.5 summary: the FFI round trip misses the 1.5x gate; see
+     * tests/Unit/RustAdminSettingsMonitoringLogsReconcileW39ParityTest.php.
+     */
+    public const bool W395_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useW395RustFfi = null;
+
     protected $signature = 'nntmux:search-diag
                             {ids?* : Release numeric ids or guids}
                             {--name= : Match releases where name or searchname contains this substring (MySQL)}
@@ -22,6 +30,113 @@ class NntmuxSearchDiag extends Command
                             {--show-fields : Dump DB row and index document as JSON lines}';
 
     protected $description = 'Compare releases table rows to Manticore releases_rt documents (diagnostics)';
+
+    public static function useW395RustFfi(?bool $use = true): void
+    {
+        self::$useW395RustFfi = $use;
+    }
+
+    public static function usesW395RustFfi(): bool
+    {
+        return self::$useW395RustFfi ?? self::W395_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW395RustFfi(): void
+    {
+        self::$useW395RustFfi = null;
+    }
+
+    /**
+     * Summarizes search index shard diagnostics. A shard is online only when `online` is `true`;
+     * `docs` and `lag` count when they are integers (negative values as 0). Non-array entries are
+     * malformed and offline. Online shards whose lag exceeds `$maxLagDocs` are lagging; the cluster
+     * is ready with at least one shard, none offline and none lagging. Document totals saturate at
+     * PHP_INT_MAX and exclude malformed entries.
+     *
+     * @param  array<array-key, mixed>  $shardMetrics
+     * @return array{shards: int, online: int, offline: int, malformed: int, lagging: int, total_docs: int, max_lag: int, cluster_ready: bool}
+     */
+    public static function summarizeIndexShardHealth(array $shardMetrics, int $maxLagDocs = 500): array
+    {
+        return self::usesW395RustFfi()
+            ? self::summarizeIndexShardHealthNative($shardMetrics, $maxLagDocs)
+            : self::summarizeIndexShardHealthPhp($shardMetrics, $maxLagDocs);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $shardMetrics
+     * @return array{shards: int, online: int, offline: int, malformed: int, lagging: int, total_docs: int, max_lag: int, cluster_ready: bool}
+     */
+    private static function summarizeIndexShardHealthNative(array $shardMetrics, int $maxLagDocs): array
+    {
+        $parts = [(string) $maxLagDocs];
+        foreach ($shardMetrics as $shard) {
+            if (! \is_array($shard)) {
+                array_push($parts, 'm', '', '');
+
+                continue;
+            }
+            $docs = $shard['docs'] ?? null;
+            $lag = $shard['lag'] ?? null;
+            array_push($parts, ($shard['online'] ?? null) === true ? '1' : '0', \is_int($docs) ? (string) $docs : '', \is_int($lag) ? (string) $lag : '');
+        }
+        $fields = NntmuxSearchReconcile::evaluateW395Native(5, $parts);
+        if ($fields === null || \count($fields) !== 8) {
+            return self::summarizeIndexShardHealthPhp($shardMetrics, $maxLagDocs);
+        }
+
+        return [
+            'shards' => (int) $fields[0],
+            'online' => (int) $fields[1],
+            'offline' => (int) $fields[2],
+            'malformed' => (int) $fields[3],
+            'lagging' => (int) $fields[4],
+            'total_docs' => (int) $fields[5],
+            'max_lag' => (int) $fields[6],
+            'cluster_ready' => $fields[7] === '1',
+        ];
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $shardMetrics
+     * @return array{shards: int, online: int, offline: int, malformed: int, lagging: int, total_docs: int, max_lag: int, cluster_ready: bool}
+     */
+    private static function summarizeIndexShardHealthPhp(array $shardMetrics, int $maxLagDocs): array
+    {
+        $online = $offline = $malformed = $lagging = $total = $worst = 0;
+        foreach ($shardMetrics as $shard) {
+            if (! \is_array($shard)) {
+                $offline++;
+                $malformed++;
+
+                continue;
+            }
+            if (($shard['online'] ?? null) === true) {
+                $online++;
+                $lag = \is_int($shard['lag'] ?? null) ? max(0, $shard['lag']) : 0;
+                $worst = max($worst, $lag);
+                if ($lag > $maxLagDocs) {
+                    $lagging++;
+                }
+            } else {
+                $offline++;
+            }
+            $docs = \is_int($shard['docs'] ?? null) ? max(0, $shard['docs']) : 0;
+            $total = $docs > PHP_INT_MAX - $total ? PHP_INT_MAX : $total + $docs;
+        }
+        $count = \count($shardMetrics);
+
+        return [
+            'shards' => $count,
+            'online' => $online,
+            'offline' => $offline,
+            'malformed' => $malformed,
+            'lagging' => $lagging,
+            'total_docs' => $total,
+            'max_lag' => $worst,
+            'cluster_ready' => $count > 0 && $offline === 0 && $lagging === 0,
+        ];
+    }
 
     public function handle(ManticoreSearchDriver $manticore): int
     {

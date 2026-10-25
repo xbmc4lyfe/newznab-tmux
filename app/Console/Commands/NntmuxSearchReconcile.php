@@ -45,6 +45,22 @@ class NntmuxSearchReconcile extends Command
 
     private static bool $adoptParseSinceFfi = false;
 
+    public const string W395_FFI_CDEF = 'ptrdiff_t nntmux_w39_admin_settings_monitoring_logs_reconcile(uint32_t mode, const char *input, size_t input_len, char *out, size_t cap);';
+
+    /**
+     * Rust stays opt-in for the Wave 39.5 summary: the FFI round trip misses the 1.5x gate; see
+     * tests/Unit/RustAdminSettingsMonitoringLogsReconcileW39ParityTest.php.
+     */
+    public const bool W395_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useW395RustFfi = null;
+
+    private const int W395_NATIVE_MAX_PARTS = 1 << 20;
+
+    private const int W395_NATIVE_MAX_BYTES = 16 * 1024 * 1024;
+
+    private static FFI|false|null $w395Ffi = null;
+
     protected $signature = 'nntmux:search-reconcile
                             {--predb : Reconcile PreDB documents; requires --all}
                             {--since=24h : Only releases with adddate after this window (e.g. 24h, 7d)}
@@ -326,6 +342,218 @@ class NntmuxSearchReconcile extends Command
 
             return Carbon::now()->subHours(24);
         }
+    }
+
+    public static function useW395RustFfi(?bool $use = true): void
+    {
+        self::$useW395RustFfi = $use;
+    }
+
+    public static function usesW395RustFfi(): bool
+    {
+        return self::$useW395RustFfi ?? self::W395_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW395RustFfi(): void
+    {
+        self::$useW395RustFfi = null;
+    }
+
+    /**
+     * Plans an ID reconcile between MySQL release IDs and search index IDs. Only positive integers
+     * are valid (others count as invalid); both sides are deduplicated. Missing (DB only) and orphan
+     * (index only) IDs are sorted ascending and each repair list is capped at `$maxRepairs` (a
+     * negative cap plans nothing).
+     *
+     * @param  array<array-key, mixed>  $dbIds
+     * @param  array<array-key, mixed>  $indexIds
+     * @return array{db: int, index: int, invalid: int, missing_in_index: int, orphans_in_index: int, in_sync: int, planned_upserts: int, planned_deletes: int, upsert_ids: list<int>, delete_ids: list<int>, truncated: bool}
+     */
+    public static function planReconcileIdDiff(array $dbIds, array $indexIds, int $maxRepairs = 1000): array
+    {
+        return self::usesW395RustFfi()
+            ? self::planReconcileIdDiffNative($dbIds, $indexIds, $maxRepairs)
+            : self::planReconcileIdDiffPhp($dbIds, $indexIds, $maxRepairs);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $dbIds
+     * @param  array<array-key, mixed>  $indexIds
+     * @return array{db: int, index: int, invalid: int, missing_in_index: int, orphans_in_index: int, in_sync: int, planned_upserts: int, planned_deletes: int, upsert_ids: list<int>, delete_ids: list<int>, truncated: bool}
+     */
+    private static function planReconcileIdDiffNative(array $dbIds, array $indexIds, int $maxRepairs): array
+    {
+        $parts = [(string) $maxRepairs, (string) \count($dbIds)];
+        foreach ([$dbIds, $indexIds] as $ids) {
+            foreach ($ids as $id) {
+                $parts[] = \is_int($id) ? (string) $id : '';
+            }
+        }
+        $fields = self::evaluateW395Native(4, $parts);
+        if ($fields === null || \count($fields) < 8 || \count($fields) !== 8 + (int) $fields[6] + (int) $fields[7]) {
+            return self::planReconcileIdDiffPhp($dbIds, $indexIds, $maxRepairs);
+        }
+        $ids = array_map(intval(...), \array_slice($fields, 8));
+
+        return self::idDiffPlan(
+            (int) $fields[0],
+            (int) $fields[1],
+            (int) $fields[2],
+            (int) $fields[3],
+            (int) $fields[4],
+            (int) $fields[5],
+            \array_slice($ids, 0, (int) $fields[6]),
+            \array_slice($ids, (int) $fields[6]),
+        );
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $dbIds
+     * @param  array<array-key, mixed>  $indexIds
+     * @return array{db: int, index: int, invalid: int, missing_in_index: int, orphans_in_index: int, in_sync: int, planned_upserts: int, planned_deletes: int, upsert_ids: list<int>, delete_ids: list<int>, truncated: bool}
+     */
+    private static function planReconcileIdDiffPhp(array $dbIds, array $indexIds, int $maxRepairs): array
+    {
+        $invalid = 0;
+        $sets = [[], []];
+        foreach ([$dbIds, $indexIds] as $side => $ids) {
+            foreach ($ids as $id) {
+                if (\is_int($id) && $id > 0) {
+                    $sets[$side][$id] = true;
+                } else {
+                    $invalid++;
+                }
+            }
+        }
+        [$db, $index] = $sets;
+        $missing = array_keys(array_diff_key($db, $index));
+        $orphans = array_keys(array_diff_key($index, $db));
+        sort($missing);
+        sort($orphans);
+        $cap = max(0, $maxRepairs);
+
+        return self::idDiffPlan(
+            \count($db),
+            \count($index),
+            $invalid,
+            \count($missing),
+            \count($orphans),
+            \count($db) - \count($missing),
+            \array_slice($missing, 0, $cap),
+            \array_slice($orphans, 0, $cap),
+        );
+    }
+
+    /**
+     * @param  list<int>  $upserts
+     * @param  list<int>  $deletes
+     * @return array{db: int, index: int, invalid: int, missing_in_index: int, orphans_in_index: int, in_sync: int, planned_upserts: int, planned_deletes: int, upsert_ids: list<int>, delete_ids: list<int>, truncated: bool}
+     */
+    private static function idDiffPlan(int $db, int $index, int $invalid, int $missing, int $orphans, int $inSync, array $upserts, array $deletes): array
+    {
+        return [
+            'db' => $db,
+            'index' => $index,
+            'invalid' => $invalid,
+            'missing_in_index' => $missing,
+            'orphans_in_index' => $orphans,
+            'in_sync' => $inSync,
+            'planned_upserts' => \count($upserts),
+            'planned_deletes' => \count($deletes),
+            'upsert_ids' => $upserts,
+            'delete_ids' => $deletes,
+            'truncated' => \count($upserts) < $missing || \count($deletes) < $orphans,
+        ];
+    }
+
+    /**
+     * Shared Wave 39.5 bridge to `nntmux_w39_admin_settings_monitoring_logs_reconcile`. Returns the
+     * decoded result fields, or null when the library is missing, the input is too large or Rust
+     * declines (callers then use their PHP implementation).
+     *
+     * @param  list<string>  $parts
+     * @return list<string>|null
+     */
+    public static function evaluateW395Native(int $mode, array $parts): ?array
+    {
+        $ffi = self::w395Ffi();
+        if ($ffi === null || $mode < 0 || \count($parts) > self::W395_NATIVE_MAX_PARTS) {
+            return null;
+        }
+
+        try {
+            $input = pack('V', \count($parts));
+            foreach ($parts as $part) {
+                $input .= pack('V', \strlen($part)).$part;
+            }
+            if (\strlen($input) > self::W395_NATIVE_MAX_BYTES) {
+                return null;
+            }
+
+            $minBytes = \strlen($input) * 2 + 256;
+            for ($attempt = 0; $attempt < 2; $attempt++) {
+                $capacity = 0;
+                $out = RustPipelineLibrary::obtainScratch($ffi, $minBytes, $capacity);
+                if ($out === null) {
+                    return null;
+                }
+                $capacity = min($capacity, self::W395_NATIVE_MAX_BYTES);
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w39_admin_settings_monitoring_logs_reconcile($mode, $input, \strlen($input), $out, $capacity);
+                if (! \is_int($written)) {
+                    return null;
+                }
+                if ($written >= 4 && $written <= $capacity) {
+                    return self::unpackW395(FFI::string($out, $written));
+                }
+                if ($written > -4 || -$written <= $capacity || -$written > self::W395_NATIVE_MAX_BYTES) {
+                    return null;
+                }
+                $minBytes = -$written;
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        return null;
+    }
+
+    /** @return list<string>|null */
+    private static function unpackW395(string $packet): ?array
+    {
+        $length = \strlen($packet);
+        $header = unpack('V', $packet);
+        $count = \is_array($header) ? $header[1] : null;
+        if (! \is_int($count) || $count > intdiv($length - 4, 4)) {
+            return null;
+        }
+
+        $offset = 4;
+        $parts = [];
+        for ($i = 0; $i < $count; $i++) {
+            if ($offset + 4 > $length) {
+                return null;
+            }
+            $size = unpack('V', $packet, $offset);
+            $size = \is_array($size) ? $size[1] : null;
+            if (! \is_int($size) || $offset + 4 + $size > $length) {
+                return null;
+            }
+            $parts[] = substr($packet, $offset + 4, $size);
+            $offset += 4 + $size;
+        }
+
+        return $offset === $length ? $parts : null;
+    }
+
+    private static function w395Ffi(): ?FFI
+    {
+        if (self::$w395Ffi === null) {
+            $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+            self::$w395Ffi = RustPipelineLibrary::resolveDomain('search_w395', self::W395_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+        }
+
+        return self::$w395Ffi instanceof FFI ? self::$w395Ffi : null;
     }
 
     public static function setUseRustFfi(?bool $enabled): void
