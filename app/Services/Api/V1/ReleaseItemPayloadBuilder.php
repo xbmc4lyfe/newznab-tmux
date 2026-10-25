@@ -16,11 +16,23 @@ final class ReleaseItemPayloadBuilder
         ssize_t nntmux_release_item_rss_dates(const char *adddate_ptr, size_t adddate_len, const char *postdate_ptr, size_t postdate_len, char *out_buf, size_t out_cap);
         C;
 
+    /**
+     * The Wave 46.5 RSS timestamp batch defaults to Rust: every common and uncommon mean and p99 ratio
+     * cleared 1.5x (min 6.23/4.72/4.78/3.71x); see
+     * tests/Unit/RustApiV1V2PresenterPayloadRowsXmlContextW46ParityTest.php.
+     */
+    public const bool W465_RUST_FFI_DEFAULT = true;
+
+    /** Bytes of one `DATE_RSS` string with a four-digit year in UTC. */
+    private const int W465_RSS_LENGTH = 31;
+
     private static FFI|false|null $ffi = null;
 
     private static ?CData $outBuf64 = null;
 
     private static bool $useRustFfi = true;
+
+    private static ?bool $useW465RustFfi = null;
 
     private readonly string $serverUrl;
 
@@ -94,6 +106,76 @@ final class ReleaseItemPayloadBuilder
     public static function rfc2822FromUnixUtcPhp(int $timestamp): string
     {
         return date(DATE_RSS, $timestamp);
+    }
+
+    /** Pass null to restore {@see W465_RUST_FFI_DEFAULT}. */
+    public static function useW465RustFfi(?bool $enable = true): void
+    {
+        self::$useW465RustFfi = $enable;
+    }
+
+    public static function usesW465RustFfi(): bool
+    {
+        return self::$useW465RustFfi ?? self::W465_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW465RustFfi(): void
+    {
+        self::$useW465RustFfi = null;
+    }
+
+    /**
+     * {@see rfc2822FromUnixUtcPhp()} over a batch of timestamps, in order.
+     *
+     * @param  list<int>  $timestamps
+     * @return list<string>
+     */
+    public static function rfc2822FromUnixUtcBatch(array $timestamps): array
+    {
+        return self::usesW465RustFfi() ? self::rfc2822FromUnixUtcBatchNative($timestamps) : self::rfc2822FromUnixUtcBatchPhp($timestamps);
+    }
+
+    /**
+     * @param  list<int>  $timestamps
+     * @return list<string>
+     */
+    public static function rfc2822FromUnixUtcBatchPhp(array $timestamps): array
+    {
+        $dates = [];
+        foreach ($timestamps as $timestamp) {
+            $dates[] = date(DATE_RSS, $timestamp);
+        }
+
+        return $dates;
+    }
+
+    /**
+     * Rust formats UTC timestamps with years 1000-9999 and leaves NUL slots for PHP to format; other
+     * time zones and an unavailable library use PHP for the whole batch.
+     *
+     * @param  list<int>  $timestamps
+     * @return list<string>
+     */
+    public static function rfc2822FromUnixUtcBatchNative(array $timestamps): array
+    {
+        $count = \count($timestamps);
+        if ($count === 0 || \date_default_timezone_get() !== 'UTC') {
+            return self::rfc2822FromUnixUtcBatchPhp($timestamps);
+        }
+        $raw = ApiV1Presenter::evaluateW465Native(2, pack('q*', ...$timestamps), $count * self::W465_RSS_LENGTH);
+        if ($raw === null) {
+            return self::rfc2822FromUnixUtcBatchPhp($timestamps);
+        }
+        $dates = str_split($raw, self::W465_RSS_LENGTH);
+        if (str_contains($raw, "\0")) {
+            foreach ($dates as $index => $date) {
+                if ($date[0] === "\0") {
+                    $dates[$index] = date(DATE_RSS, $timestamps[$index]);
+                }
+            }
+        }
+
+        return $dates;
     }
 
     /**
