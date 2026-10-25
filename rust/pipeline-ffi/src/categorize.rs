@@ -34499,3 +34499,765 @@ pub mod predb_feeds_passable_w453 {
         }
     }
 }
+
+/// Wave 46.3 batch summaries for `AbstractCategorizer`, `AbstractCategorizationPipe`,
+/// `MiscSafetyNetPipe`, `ReleaseNameDisplay` and `AdminReleaseNames`. Every export takes the
+/// packed string list of [`with_strings`] (a blob plus little-endian `u32` lengths) and writes
+/// `0x1F`-separated decimals; an empty render declines the batch to PHP.
+pub mod categorizer_pipe_safety_net_display_names_w463 {
+    use super::categorizers_book_console_group_misc_movie_w423::{DECLINE, fields, with_strings};
+
+    /// `MiscSafetyNetPipe::W463_GROUP_PREFIX`.
+    const GROUP_PREFIX: &[u8] = b"group_name_";
+    /// `AbstractCategorizationPipe` confidence bands: stop, high, medium.
+    const STOP: f64 = 0.95;
+    const HIGH: f64 = 0.8;
+    const MEDIUM: f64 = 0.5;
+    /// `ReleaseNameDisplay` wrappers longer than this stay on PHP's PCRE path, as in cleaning.rs.
+    const MAX_DISPLAY_NAME: usize = 4096;
+    /// `cleanPhp()` quotes, in alternation order: `"` first, then the entities.
+    const QUOTES: [&[u8]; 4] = [b"\"", b"#34;", b"&#34;", b"&quot;"];
+
+    /// PHP `trim()` default character set.
+    #[inline]
+    fn is_trim(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B)
+    }
+
+    /// PCRE2 `\s` without UCP: space, TAB, LF, VT, FF and CR.
+    #[inline]
+    fn is_space(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | 0x0B | 0x0C | b'\r')
+    }
+
+    fn trim(bytes: &[u8]) -> &[u8] {
+        let start = bytes
+            .iter()
+            .position(|&b| !is_trim(b))
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|&b| !is_trim(b))
+            .map_or(start, |i| i + 1);
+        &bytes[start..end]
+    }
+
+    /// Separator bits for `.`, space, `_` and `[`/`(`, folded over 32-byte chunks without
+    /// branches so the scan vectorizes.
+    #[inline]
+    fn separator_bits(name: &[u8]) -> u8 {
+        let bits = |b: u8| {
+            u8::from(b == b'.')
+                | (u8::from(b == b' ') << 1)
+                | (u8::from(b == b'_') << 2)
+                | (u8::from((b == b'[') | (b == b'(')) << 3)
+        };
+        let (chunks, tail) = name.as_chunks::<32>();
+        let mut acc = 0u8;
+        for chunk in chunks {
+            acc |= chunk.iter().fold(0u8, |a, &b| a | bits(b));
+            if acc == 0x0F {
+                return acc;
+            }
+        }
+        tail.iter().fold(acc, |a, &b| a | bits(b))
+    }
+
+    /// `preg_match('/-[A-Za-z0-9]{2,15}\z/', $name) === 1`: the maximal trailing alphanumeric
+    /// run holds 2-15 bytes and follows a hyphen.
+    fn group_suffix(name: &[u8]) -> bool {
+        let run = name
+            .iter()
+            .rev()
+            .take_while(|b| b.is_ascii_alphanumeric())
+            .count();
+        (2..=15).contains(&run) && name.len() > run && name[name.len() - run - 1] == b'-'
+    }
+
+    /// `preg_match('/(?<![0-9])(?:19|20)[0-9]{2}(?![0-9])/', $name) === 1`. Each 32-byte
+    /// window is screened for a `1` or `2` without branches before candidates are checked.
+    fn has_year(name: &[u8]) -> bool {
+        let n = name.len();
+        if n < 4 {
+            return false;
+        }
+        let digit = |i: usize| name.get(i).is_some_and(u8::is_ascii_digit);
+        let hit = |i: usize| {
+            let (a, b) = (name[i], name[i + 1]);
+            ((a == b'1' && b == b'9') || (a == b'2' && b == b'0'))
+                && name[i + 2].is_ascii_digit()
+                && name[i + 3].is_ascii_digit()
+                && (i == 0 || !name[i - 1].is_ascii_digit())
+                && !digit(i + 4)
+        };
+        let last = n - 4;
+        let (chunks, _) = name[..=last].as_chunks::<32>();
+        for (index, chunk) in chunks.iter().enumerate() {
+            let candidate = chunk
+                .iter()
+                .fold(false, |acc, &b| acc | (b == b'1') | (b == b'2'));
+            if candidate && (index * 32..index * 32 + 32).any(hit) {
+                return true;
+            }
+        }
+        (chunks.len() * 32..=last).any(hit)
+    }
+
+    /// `AbstractCategorizer::summarizeReleaseNameShapeBatch()`: total, empty, dotted, spaced,
+    /// underscored, bracketed, group_suffix, year.
+    pub fn release_name_shape_batch(names: &[&[u8]]) -> Vec<u8> {
+        let mut counts = [0u64; 7];
+        for name in names {
+            counts[0] += u64::from(name.iter().all(|&b| is_trim(b)));
+            let bits = separator_bits(name);
+            for (slot, count) in counts[1..5].iter_mut().enumerate() {
+                *count += u64::from(bits >> slot & 1);
+            }
+            counts[5] += u64::from(group_suffix(name));
+            counts[6] += u64::from(has_year(name));
+        }
+        let mut values = Vec::with_capacity(8);
+        values.push(names.len() as u64);
+        values.extend_from_slice(&counts);
+        fields(&values)
+    }
+
+    /// `AbstractCategorizationPipe::summarizeSkipGuardConfidenceBatch()` over one item of packed
+    /// little-endian doubles: total, stop, high, medium, low, none, nan, invalid (always 0: PHP
+    /// declines non-numeric values before packing). Any other list shape declines.
+    pub fn pipe_confidence_batch(items: &[&[u8]]) -> Vec<u8> {
+        let [packed] = items else {
+            return Vec::new();
+        };
+        let (values, []) = packed.as_chunks::<8>() else {
+            return Vec::new();
+        };
+        let mut counts = [0u64; 6];
+        for value in values {
+            let c = f64::from_le_bytes(*value);
+            let slot = if c.is_nan() {
+                5
+            } else if c >= STOP {
+                0
+            } else if c >= HIGH {
+                1
+            } else if c >= MEDIUM {
+                2
+            } else if c > 0.0 {
+                3
+            } else {
+                4
+            };
+            counts[slot] += 1;
+        }
+        let mut values_out = Vec::with_capacity(8);
+        values_out.push(values.len() as u64);
+        values_out.extend_from_slice(&counts);
+        values_out.push(0);
+        fields(&values_out)
+    }
+
+    /// `MiscSafetyNetPipe::summarizeDowngradeBatch()`: the matched-by labels followed by one
+    /// flags item holding a byte per label (bit 0 low signal, bit 1 locked to misc). Writes total,
+    /// group_matched, low_signal, locked, downgrade; a missing or inconsistent flags item declines.
+    pub fn safety_net_downgrade_batch(items: &[&[u8]]) -> Vec<u8> {
+        let Some((flags, labels)) = items.split_last() else {
+            return Vec::new();
+        };
+        if flags.len() != labels.len() || flags.iter().any(|&f| f > 3) {
+            return Vec::new();
+        }
+        let mut counts = [0u64; 4];
+        for (label, &flag) in labels.iter().zip(*flags) {
+            let group = label.starts_with(GROUP_PREFIX);
+            let low = flag & 1 != 0;
+            let locked = flag & 2 != 0;
+            counts[0] += u64::from(group);
+            counts[1] += u64::from(low);
+            counts[2] += u64::from(locked);
+            counts[3] += u64::from(group && low && !locked);
+        }
+        fields(&[
+            labels.len() as u64,
+            counts[0],
+            counts[1],
+            counts[2],
+            counts[3],
+        ])
+    }
+
+    /// First position of `a`, `b` or `c`. Each 32-byte chunk is screened without branches so the
+    /// scan vectorizes; only a hit chunk is searched bytewise.
+    #[inline]
+    fn find_any3(bytes: &[u8], a: u8, b: u8, c: u8) -> Option<usize> {
+        let hit = |x: u8| (x == a) | (x == b) | (x == c);
+        let (chunks, tail) = bytes.as_chunks::<32>();
+        for (index, chunk) in chunks.iter().enumerate() {
+            if chunk.iter().fold(false, |acc, &x| acc | hit(x)) {
+                return chunk.iter().position(|&x| hit(x)).map(|i| index * 32 + i);
+            }
+        }
+        tail.iter()
+            .position(|&x| hit(x))
+            .map(|i| chunks.len() * 32 + i)
+    }
+
+    /// A `ReleaseNameDisplay::cleanPhp()` wrapper match: quote index into [`QUOTES`], whether
+    /// the yEnc suffix is present, and the untrimmed file group.
+    struct Wrapper<'a> {
+        quote: usize,
+        yenc: bool,
+        file: &'a [u8],
+    }
+
+    /// Matches the anchored `cleanPhp()` counter-and-quoted-file pattern on ASCII input. The
+    /// pattern is deterministic: the quote follows whitespace and an optional hyphen, the file runs
+    /// to the first matching quote (caseless), and only the anchored tail remains.
+    fn display_wrapper(s: &[u8]) -> Option<Wrapper<'_>> {
+        fn space(s: &[u8], p: &mut usize) {
+            while *p < s.len() && is_space(s[*p]) {
+                *p += 1;
+            }
+        }
+        fn digits(s: &[u8], p: &mut usize) -> bool {
+            let start = *p;
+            while *p < s.len() && s[*p].is_ascii_digit() {
+                *p += 1;
+            }
+            *p > start
+        }
+        fn take(s: &[u8], p: &mut usize, b: u8) -> bool {
+            let hit = s.get(*p) == Some(&b);
+            *p += usize::from(hit);
+            hit
+        }
+        fn at(s: &[u8], p: usize, needle: &[u8]) -> bool {
+            s.get(p..p + needle.len())
+                .is_some_and(|w| w.eq_ignore_ascii_case(needle))
+        }
+        let mut p = 0;
+        space(s, &mut p);
+        if !take(s, &mut p, b'[') {
+            return None;
+        }
+        space(s, &mut p);
+        if !digits(s, &mut p) {
+            return None;
+        }
+        space(s, &mut p);
+        if !take(s, &mut p, b'/') {
+            return None;
+        }
+        space(s, &mut p);
+        if !digits(s, &mut p) {
+            return None;
+        }
+        space(s, &mut p);
+        if !take(s, &mut p, b']') {
+            return None;
+        }
+        space(s, &mut p);
+        take(s, &mut p, b'-');
+        space(s, &mut p);
+        let quote = QUOTES.iter().position(|q| at(s, p, q))?;
+        let q = QUOTES[quote];
+        p += q.len();
+        let start = p;
+        // Quotes start with `"`, `#` or `&`, none of which has a case; only those bytes and line
+        // breaks can end the file group.
+        let first = q[0];
+        loop {
+            p += find_any3(&s[p..], first, b'\r', b'\n')?;
+            if s[p] != first || at(s, p, q) {
+                break;
+            }
+            p += 1;
+        }
+        if p == start || !at(s, p, q) {
+            return None;
+        }
+        let file = &s[start..p];
+        p += q.len();
+        space(s, &mut p);
+        let mut yenc = false;
+        if p < s.len() {
+            take(s, &mut p, b'-');
+            space(s, &mut p);
+            if !at(s, p, b"yenc") {
+                return None;
+            }
+            yenc = true;
+            p += 4;
+            let before = p;
+            space(s, &mut p);
+            if p > before && s.get(p) == Some(&b'(') {
+                p += 1;
+                if !digits(s, &mut p)
+                    || !take(s, &mut p, b'/')
+                    || !digits(s, &mut p)
+                    || !take(s, &mut p, b')')
+                {
+                    return None;
+                }
+            }
+            space(s, &mut p);
+        }
+        (p == s.len()).then_some(Wrapper { quote, yenc, file })
+    }
+
+    /// `ReleaseNameDisplay::cleanPhp()`; `None` keeps the name.
+    #[inline]
+    fn clean(s: &[u8]) -> &[u8] {
+        match display_wrapper(s) {
+            Some(Wrapper { file, .. }) if !trim(file).is_empty() => trim(file),
+            _ => s,
+        }
+    }
+
+    /// Whether Rust decides `cleanPhp()` for this name: ASCII (PCRE locale tables never matter)
+    /// and short enough to stay clear of PCRE resource limits.
+    #[inline]
+    fn display_decided(name: &[u8]) -> bool {
+        name.len() <= MAX_DISPLAY_NAME && name.is_ascii()
+    }
+
+    /// `ReleaseNameDisplay::summarizeDisplayWrapperBatch()`: total, empty, wrapped, blank_file,
+    /// entity, yenc. Non-ASCII or overlong names decline.
+    pub fn release_name_display_batch(names: &[&[u8]]) -> Vec<u8> {
+        let mut counts = [0u64; 5];
+        for name in names {
+            if !display_decided(name) {
+                return Vec::new();
+            }
+            if name.is_empty() {
+                counts[0] += 1;
+                continue;
+            }
+            let Some(wrapper) = display_wrapper(name) else {
+                continue;
+            };
+            let blank = trim(wrapper.file).is_empty();
+            counts[1] += u64::from(!blank);
+            counts[2] += u64::from(blank);
+            counts[3] += u64::from(wrapper.quote != 0);
+            counts[4] += u64::from(wrapper.yenc);
+        }
+        fields(&[
+            names.len() as u64,
+            counts[0],
+            counts[1],
+            counts[2],
+            counts[3],
+            counts[4],
+        ])
+    }
+
+    /// `AdminReleaseNames::summarizeNameDisplayBatch()` over `searchname`/`name` pairs: rows,
+    /// display_cleaned, original_cleaned, empty_display, secondary, escaped. An odd item count,
+    /// non-ASCII or overlong names decline.
+    pub fn admin_name_display_batch(items: &[&[u8]]) -> Vec<u8> {
+        let (pairs, []) = items.as_chunks::<2>() else {
+            return Vec::new();
+        };
+        let mut counts = [0u64; 5];
+        for [searchname, name] in pairs {
+            if !display_decided(searchname) || !display_decided(name) {
+                return Vec::new();
+            }
+            let display = clean(searchname);
+            let original = clean(name);
+            counts[0] += u64::from(display.len() != searchname.len());
+            counts[1] += u64::from(original.len() != name.len());
+            counts[2] += u64::from(display.is_empty());
+            counts[3] += u64::from(!original.is_empty() && original != display);
+            counts[4] += u64::from(
+                display
+                    .iter()
+                    .any(|b| matches!(b, b'&' | b'<' | b'>' | b'"' | b'\'')),
+            );
+        }
+        fields(&[
+            pairs.len() as u64,
+            counts[0],
+            counts[1],
+            counts[2],
+            counts[3],
+            counts[4],
+        ])
+    }
+
+    /// Runs [`with_strings`], mapping an empty render (a declined batch) to [`DECLINE`].
+    ///
+    /// # Safety
+    /// As for [`with_strings`].
+    #[inline]
+    unsafe fn with_decline(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+        render: fn(&[&[u8]]) -> Vec<u8>,
+    ) -> isize {
+        match unsafe {
+            with_strings(
+                blob_ptr, blob_len, lens_ptr, lens_len, out_buf, out_cap, render,
+            )
+        } {
+            0 => DECLINE,
+            n => n,
+        }
+    }
+
+    /// # Safety
+    /// `blob_ptr`/`lens_ptr` must be valid for their lengths in readable bytes, and `out_buf` must be
+    /// valid for `out_cap` writable bytes, not overlapping either input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w463_categorizer_release_name_shape_batch(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_decline(
+                blob_ptr,
+                blob_len,
+                lens_ptr,
+                lens_len,
+                out_buf,
+                out_cap,
+                release_name_shape_batch,
+            )
+        }
+    }
+
+    /// # Safety
+    /// `blob_ptr`/`lens_ptr` must be valid for their lengths in readable bytes, and `out_buf` must be
+    /// valid for `out_cap` writable bytes, not overlapping either input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w463_pipe_confidence_batch(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_decline(
+                blob_ptr,
+                blob_len,
+                lens_ptr,
+                lens_len,
+                out_buf,
+                out_cap,
+                pipe_confidence_batch,
+            )
+        }
+    }
+
+    /// # Safety
+    /// `blob_ptr`/`lens_ptr` must be valid for their lengths in readable bytes, and `out_buf` must be
+    /// valid for `out_cap` writable bytes, not overlapping either input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w463_safety_net_downgrade_batch(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_decline(
+                blob_ptr,
+                blob_len,
+                lens_ptr,
+                lens_len,
+                out_buf,
+                out_cap,
+                safety_net_downgrade_batch,
+            )
+        }
+    }
+
+    /// # Safety
+    /// `blob_ptr`/`lens_ptr` must be valid for their lengths in readable bytes, and `out_buf` must be
+    /// valid for `out_cap` writable bytes, not overlapping either input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w463_release_name_display_batch(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_decline(
+                blob_ptr,
+                blob_len,
+                lens_ptr,
+                lens_len,
+                out_buf,
+                out_cap,
+                release_name_display_batch,
+            )
+        }
+    }
+
+    /// # Safety
+    /// `blob_ptr`/`lens_ptr` must be valid for their lengths in readable bytes, and `out_buf` must be
+    /// valid for `out_cap` writable bytes, not overlapping either input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w463_admin_name_display_batch(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_decline(
+                blob_ptr,
+                blob_len,
+                lens_ptr,
+                lens_len,
+                out_buf,
+                out_cap,
+                admin_name_display_batch,
+            )
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::ptr;
+
+        type Export =
+            unsafe extern "C" fn(*const u8, usize, *const u8, usize, *mut u8, usize) -> isize;
+
+        fn text(bytes: &[u8]) -> String {
+            String::from_utf8_lossy(bytes).replace('\x1F', "|")
+        }
+
+        fn call(export: Export, items: &[&[u8]]) -> (isize, String) {
+            let blob = items.concat();
+            let lens: Vec<u8> = items
+                .iter()
+                .flat_map(|i| (i.len() as u32).to_le_bytes())
+                .collect();
+            let mut buf = vec![0u8; 256];
+            let n = unsafe {
+                export(
+                    blob.as_ptr(),
+                    blob.len(),
+                    lens.as_ptr(),
+                    lens.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            let rendered = if n > 0 {
+                text(&buf[..n as usize])
+            } else {
+                String::new()
+            };
+            (n, rendered)
+        }
+
+        fn packed(values: &[f64]) -> Vec<u8> {
+            values.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+
+        #[test]
+        fn w463_release_name_shape_counts() {
+            let long = format!("{}-GRP", "Movie.Title.".repeat(20));
+            let names: [&[u8]; 10] = [
+                b"Movie.Title.2024.1080p.WEB-GRP",
+                b"Show Name S01E02 [720p]",
+                b"Artist_-_Album-(CAT01)-WEB-FLAC-2019-GRP",
+                b"",
+                b" \t\0\x0B",
+                b"\x0C",
+                b"12024-x",
+                b"a-0123456789ABCDEF",
+                b"-GRP",
+                long.as_bytes(),
+            ];
+            let expected = "10|2|2|2|1|2|4|2";
+            assert_eq!(text(&release_name_shape_batch(&names)), expected);
+            assert_eq!(
+                call(nntmux_w463_categorizer_release_name_shape_batch, &names).1,
+                expected
+            );
+            assert_eq!(text(&release_name_shape_batch(&[])), "0|0|0|0|0|0|0|0");
+            assert!(group_suffix(b"x-ab"));
+            assert!(!group_suffix(b"x-a"));
+            assert!(!group_suffix(b"ab"));
+            assert!(!group_suffix(b"x-ab."));
+            assert!(has_year(b"1999"));
+            assert!(has_year(b"x.2000.y"));
+            assert!(!has_year(b"21999"));
+            assert!(!has_year(b"19999"));
+            assert!(!has_year(b"1899"));
+        }
+
+        #[test]
+        fn w463_pipe_confidence_counts() {
+            let values = packed(&[
+                0.95,
+                1.0,
+                0.9499,
+                0.8,
+                0.5,
+                0.79,
+                0.01,
+                0.0,
+                -0.0,
+                -1.0,
+                f64::NAN,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+            ]);
+            let expected = "13|3|2|2|1|4|1|0";
+            assert_eq!(text(&pipe_confidence_batch(&[&values])), expected);
+            assert_eq!(
+                call(nntmux_w463_pipe_confidence_batch, &[&values]).1,
+                expected
+            );
+            assert_eq!(text(&pipe_confidence_batch(&[b""])), "0|0|0|0|0|0|0|0");
+            assert!(pipe_confidence_batch(&[]).is_empty());
+            assert!(pipe_confidence_batch(&[b"1234567"]).is_empty());
+            assert!(pipe_confidence_batch(&[b"", b""]).is_empty());
+            assert_eq!(call(nntmux_w463_pipe_confidence_batch, &[]).0, DECLINE);
+        }
+
+        #[test]
+        fn w463_safety_net_downgrade_counts() {
+            let items: [&[u8]; 7] = [
+                b"group_name_tv",
+                b"group_name_movies",
+                b"group_name",
+                b"",
+                b"hash_md5",
+                b"group_name_x",
+                b"\x01\x03\x01\x01\x00\x00",
+            ];
+            let expected = "6|3|4|1|1";
+            assert_eq!(text(&safety_net_downgrade_batch(&items)), expected);
+            assert_eq!(
+                call(nntmux_w463_safety_net_downgrade_batch, &items).1,
+                expected
+            );
+            assert_eq!(text(&safety_net_downgrade_batch(&[b""])), "0|0|0|0|0");
+            assert!(safety_net_downgrade_batch(&[]).is_empty());
+            assert!(safety_net_downgrade_batch(&[b"group_name_x", b""]).is_empty());
+            assert!(safety_net_downgrade_batch(&[b"group_name_x", b"\x04"]).is_empty());
+        }
+
+        #[test]
+        fn w463_release_name_display_counts() {
+            let names: [&[u8]; 12] = [
+                b"[1/2] - \"file.part1.rar\" yEnc (1/50)",
+                b" [ 01 / 10 ] &quot;Show.S01E01.mkv&QUOT; - YENC",
+                b"[1/2] #34;a#34;",
+                b"[1/2] &#34;b&#34;\n",
+                b"[1/2] \" \" yEnc",
+                b"[1/2] \"file\" extra",
+                b"[1/2] \"file\" yEnc(1/2)",
+                b"[1/2] \"fi\nle\"",
+                b"[1/2] \"\"",
+                b"Plain.Release.Name-GRP",
+                b"",
+                b"[1/2] \"file\" yEnc (1/2) \x0C",
+            ];
+            let expected = "12|1|5|1|3|4";
+            assert_eq!(text(&release_name_display_batch(&names)), expected);
+            assert_eq!(
+                call(nntmux_w463_release_name_display_batch, &names).1,
+                expected
+            );
+            assert_eq!(clean(b"[1/2] \"  x.rar \""), b"x.rar");
+            assert_eq!(clean(b"[1/2] \" \""), b"[1/2] \" \"");
+            assert!(release_name_display_batch(&["[1/2] \"\u{e9}\"".as_bytes()]).is_empty());
+            let long = format!("[1/2] \"{}\"", "a".repeat(MAX_DISPLAY_NAME));
+            assert!(release_name_display_batch(&[long.as_bytes()]).is_empty());
+        }
+
+        #[test]
+        fn w463_admin_name_display_counts() {
+            let items: [&[u8]; 8] = [
+                b"[1/2] \"Movie.mkv\" yEnc",
+                b"[1/2] \"Movie.mkv\" yEnc",
+                b"Tom & Jerry",
+                b"[3/4] \"Tom.and.Jerry.rar\"",
+                b"",
+                b"",
+                b"Same",
+                b"Other",
+            ];
+            let expected = "4|1|2|1|2|1";
+            assert_eq!(text(&admin_name_display_batch(&items)), expected);
+            assert_eq!(
+                call(nntmux_w463_admin_name_display_batch, &items).1,
+                expected
+            );
+            assert_eq!(text(&admin_name_display_batch(&[])), "0|0|0|0|0|0");
+            assert!(admin_name_display_batch(&[b"x"]).is_empty());
+            assert!(admin_name_display_batch(&[b"x", "\u{e9}".as_bytes()]).is_empty());
+        }
+
+        #[test]
+        fn w463_exports_validate_inputs_and_capacity() {
+            let exports: [(Export, &[&[u8]]); 5] = [
+                (nntmux_w463_categorizer_release_name_shape_batch, &[b"x"]),
+                (
+                    nntmux_w463_pipe_confidence_batch,
+                    &[b"\0\0\0\0\0\0\xF0\x3F"],
+                ),
+                (nntmux_w463_safety_net_downgrade_batch, &[b"x", b"\x01"]),
+                (nntmux_w463_release_name_display_batch, &[b"x"]),
+                (nntmux_w463_admin_name_display_batch, &[b"x", b"y"]),
+            ];
+            for (export, items) in exports {
+                let blob = items.concat();
+                let lens: Vec<u8> = items
+                    .iter()
+                    .flat_map(|i| (i.len() as u32).to_le_bytes())
+                    .collect();
+                let (bp, bl, lp, ll) = (blob.as_ptr(), blob.len(), lens.as_ptr(), lens.len());
+                unsafe {
+                    let mut small = [b'Z'; 4];
+                    let needed = export(bp, bl, lp, ll, small.as_mut_ptr(), 2);
+                    assert!(needed < -2, "needed {needed}");
+                    assert_eq!(small, [b'Z'; 4]);
+                    let mut exact = vec![0u8; (-needed) as usize];
+                    assert_eq!(
+                        export(bp, bl, lp, ll, exact.as_mut_ptr(), exact.len()),
+                        -needed
+                    );
+                    let mut out = [0u8; 128];
+                    let (b, c) = (out.as_mut_ptr(), out.len());
+                    assert_eq!(export(bp, bl, lp, ll, ptr::null_mut(), 8), DECLINE);
+                    assert_eq!(export(ptr::null(), 0, lp, 0, b, c), DECLINE);
+                    assert_eq!(export(bp, bl, lp, ll - 1, b, c), DECLINE);
+                    let huge = u32::MAX.to_le_bytes();
+                    assert_eq!(export(bp, bl, huge.as_ptr(), 4, b, c), DECLINE);
+                    assert_eq!(export(bp, usize::MAX, lp, ll, b, c), DECLINE);
+                    let mut shared =
+                        *b"sample\x06\0\0\0..............................................";
+                    let p = shared.as_mut_ptr();
+                    assert_eq!(export(p, 6, p.add(6), 4, p.add(3), 40), DECLINE);
+                    assert_eq!(&shared[..10], b"sample\x06\0\0\0");
+                }
+            }
+        }
+    }
+}
