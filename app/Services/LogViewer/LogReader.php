@@ -6,6 +6,7 @@ namespace App\Services\LogViewer;
 
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Generator;
 use RuntimeException;
 use SplDoublyLinkedList;
@@ -31,6 +32,32 @@ class LogReader
         int64_t nntmux_logviewer_cap_len(size_t line_len, int64_t max_bytes);
         ssize_t nntmux_logviewer_split_backward(const char *buf, size_t len, char *out_buf, size_t out_cap);
         C;
+
+    /** Shared Wave 48.5 batch export for the log viewer and release search helpers. */
+    public const string W48_FFI_CDEF = 'int64_t nntmux_w48_logviewer_entry_file_repo_reader_release_search(uint32_t mode, const char *input, size_t input_len, char *out, size_t cap);';
+
+    /**
+     * Benchmark-gated default for {@see assembleRecordBatch()}: stays PHP because the p99 ratios fell
+     * below 1.5x (1.44x common, 1.46x uncommon) although means were about 1.9x; see
+     * tests/Unit/RustLogViewerEntryFileRepoReaderReleaseSearchW48ParityTest.php.
+     */
+    public const bool W48_LOG_READER_RUST_FFI_DEFAULT = false;
+
+    private const int W48_MAX_BYTES = 67_108_864;
+
+    /** Base byte offsets are clamped so line offsets never overflow. */
+    private const int W48_MAX_BASE_OFFSET = 1 << 48;
+
+    /** Page offsets and limits are clamped to this. */
+    private const int W48_MAX_PAGE = 1 << 40;
+
+    private static ?bool $useW48LogReaderRustFfi = null;
+
+    private static FFI|false|null $w48Ffi = null;
+
+    private static ?CData $w48Out = null;
+
+    private static int $w48OutCap = 0;
 
     private static bool $useRustFfi = true;
 
@@ -451,6 +478,257 @@ class LogReader
     public static function usesRustFfi(): bool
     {
         return self::$useRustFfi;
+    }
+
+    /** Pass null to restore {@see W48_LOG_READER_RUST_FFI_DEFAULT}. */
+    public static function useW48LogReaderRustFfi(?bool $enable = true): void
+    {
+        self::$useW48LogReaderRustFfi = $enable;
+    }
+
+    public static function usesW48LogReaderRustFfi(): bool
+    {
+        return self::$useW48LogReaderRustFfi ?? self::W48_LOG_READER_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW48LogReaderRustFfi(): void
+    {
+        self::$useW48LogReaderRustFfi = null;
+    }
+
+    /**
+     * Folds file lines (split on "\n", top to bottom, starting at byte $baseOffset) into newest-first
+     * records the way {@see latest()} walks them: a trailing empty line is ignored, each line drops its
+     * trailing "\r" bytes, and in $structured mode lines that do not match {@see LogEntry::W48_HEADER_PATTERN}
+     * join the header above them (lines above the first header form one orphan record). Every line keeps
+     * at most $maxBytes bytes, and continuation lines are dropped from the bottom while the kept
+     * continuation bytes (plus one newline each) exceed $maxBytes; kept_bytes counts one newline between
+     * joined lines. Per record: `[start, end,
+     * header_index, line_count, kept_bytes, truncated, severity, ordinal, in_page]`; records whose
+     * severity reaches $minSeverity get consecutive ordinals (others -1) and are in the page for ordinals
+     * in [$pageOffset, $pageOffset + $limit). The summary is `[records, matches, page_count, next_cursor,
+     * truncated_records]`, where next_cursor is the last page record's start while more matches follow
+     * (-1 otherwise).
+     *
+     * @param  list<string>  $lines
+     * @return array{records: list<list<int>>, summary: list<int>}
+     */
+    public static function assembleRecordBatch(array $lines, int $baseOffset, bool $structured, int $maxBytes, int $minSeverity, int $pageOffset, int $limit): array
+    {
+        return self::usesW48LogReaderRustFfi()
+            ? self::assembleRecordBatchNative($lines, $baseOffset, $structured, $maxBytes, $minSeverity, $pageOffset, $limit)
+            : self::assembleRecordBatchPhp($lines, $baseOffset, $structured, $maxBytes, $minSeverity, $pageOffset, $limit);
+    }
+
+    /**
+     * @param  list<string>  $lines
+     * @return array{records: list<list<int>>, summary: list<int>}
+     */
+    public static function assembleRecordBatchPhp(array $lines, int $baseOffset, bool $structured, int $maxBytes, int $minSeverity, int $pageOffset, int $limit): array
+    {
+        $cursor = min(max(0, $baseOffset), self::W48_MAX_BASE_OFFSET);
+        $maxBytes = max(1, $maxBytes);
+        $pageOffset = min(max(0, $pageOffset), self::W48_MAX_PAGE);
+        $pageEnd = $pageOffset + min(max(0, $limit), self::W48_MAX_PAGE);
+        $offsets = [];
+
+        foreach ($lines as $line) {
+            $offsets[] = $cursor;
+            $cursor += \strlen($line) + 1;
+        }
+
+        $last = \count($lines);
+        if ($last > 0 && $lines[$last - 1] === '') {
+            $last--;
+        }
+
+        $records = [];
+        $pending = [];
+        $head = 0;
+        $pendingBytes = 0;
+        $pendingTop = $pendingEnd = -1;
+        $pendingTruncated = false;
+
+        for ($index = $last - 1; $index >= 0; $index--) {
+            $raw = $lines[$index];
+            $line = rtrim($raw, "\r");
+            $length = \strlen($line);
+            $severity = $line !== '' && $line[0] === '[' && preg_match(LogEntry::W48_HEADER_PATTERN, $line, $match) === 1
+                ? LogEntry::W48_SEVERITY[$match[2]] ?? 0
+                : -1;
+            $lineEnd = $offsets[$index] + \strlen($raw);
+            $kept = min($length, $maxBytes);
+
+            if ($structured && $severity < 0) {
+                if ($pendingEnd < 0) {
+                    $pendingEnd = $lineEnd;
+                }
+                $pending[] = $kept;
+                $pendingBytes += $kept + 1;
+                $pendingTop = $offsets[$index];
+                $pendingTruncated = $pendingTruncated || $length > $maxBytes;
+
+                while ($pendingBytes > $maxBytes && \count($pending) - $head > 1) {
+                    $pendingBytes -= $pending[$head++] + 1;
+                    $pendingTruncated = true;
+                }
+
+                continue;
+            }
+
+            $records[] = [
+                $offsets[$index],
+                $pendingEnd >= 0 ? $pendingEnd : $lineEnd,
+                $severity >= 0 ? $index : -1,
+                1 + \count($pending) - $head,
+                $kept + $pendingBytes,
+                $length > $maxBytes || $pendingTruncated ? 1 : 0,
+                max(0, $severity),
+            ];
+            $pending = [];
+            $head = $pendingBytes = 0;
+            $pendingTop = $pendingEnd = -1;
+            $pendingTruncated = false;
+        }
+
+        if (\count($pending) > $head) {
+            $records[] = [$pendingTop, $pendingEnd, -1, \count($pending) - $head, $pendingBytes - 1, $pendingTruncated ? 1 : 0, 0];
+        }
+
+        $matches = $pageCount = $truncated = 0;
+        $lastStart = -1;
+
+        foreach ($records as $position => $record) {
+            $ordinal = -1;
+            $inPage = 0;
+
+            if ($record[6] >= $minSeverity) {
+                $ordinal = $matches++;
+
+                if ($ordinal >= $pageOffset && $ordinal < $pageEnd) {
+                    $inPage = 1;
+                    $pageCount++;
+                    $lastStart = $record[0];
+                }
+            }
+
+            $truncated += $record[5];
+            $records[$position][] = $ordinal;
+            $records[$position][] = $inPage;
+        }
+
+        return [
+            'records' => $records,
+            'summary' => [\count($records), $matches, $pageCount, $pageCount > 0 && $matches > $pageEnd ? $lastStart : -1, $truncated],
+        ];
+    }
+
+    /**
+     * @param  list<string>  $lines
+     * @return array{records: list<list<int>>, summary: list<int>}
+     */
+    public static function assembleRecordBatchNative(array $lines, int $baseOffset, bool $structured, int $maxBytes, int $minSeverity, int $pageOffset, int $limit): array
+    {
+        $count = \count($lines);
+        $raw = self::evaluateW48Native(
+            4,
+            pack('P*', $count, $baseOffset, $structured ? 1 : 0, $maxBytes, $minSeverity, $pageOffset, $limit).self::w48Strings($lines),
+            72 * $count + 40,
+        );
+        $length = $raw === null ? 0 : \strlen($raw);
+
+        if ($raw === null || $length < 40 || ($length - 40) % 72 !== 0) {
+            return self::assembleRecordBatchPhp($lines, $baseOffset, $structured, $maxBytes, $minSeverity, $pageOffset, $limit);
+        }
+
+        return [
+            'records' => self::w48Rows(substr($raw, 0, $length - 40), 9),
+            'summary' => self::w48Rows($raw, 5, $length - 40)[0],
+        ];
+    }
+
+    /**
+     * Exactly $fields packed little-endian i64 fields from a Wave 48.5 mode, or null.
+     *
+     * @return list<int>|null
+     */
+    public static function evaluateW48Fields(int $mode, string $input, int $fields): ?array
+    {
+        $raw = $fields < 0 ? null : self::evaluateW48Native($mode, $input, $fields * 8);
+
+        if ($raw === null || \strlen($raw) !== $fields * 8) {
+            return null;
+        }
+
+        return $fields === 0 ? [] : self::w48Rows($raw, $fields)[0];
+    }
+
+    /**
+     * Output (at most $capacity bytes of packed little-endian i64 fields) from a Wave 48.5 mode, or null
+     * to fall back to PHP.
+     */
+    public static function evaluateW48Native(int $mode, string $input, int $capacity): ?string
+    {
+        $ffi = self::w48Ffi();
+        $length = \strlen($input);
+
+        if ($ffi === null || $mode < 1 || $capacity < 0 || $capacity > self::W48_MAX_BYTES || $length > self::W48_MAX_BYTES) {
+            return null;
+        }
+
+        try {
+            if (self::$w48Out === null || $capacity > self::$w48OutCap) {
+                $cap = max(4096, $capacity);
+                self::$w48Out = $ffi->new('char['.$cap.']');
+                self::$w48OutCap = $cap;
+            }
+
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w48_logviewer_entry_file_repo_reader_release_search($mode, $input, $length, self::$w48Out, $capacity);
+
+            if (! \is_int($written) || $written < 0 || $written > $capacity) {
+                return null;
+            }
+
+            return $written === 0 ? '' : FFI::string(self::$w48Out, $written);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Rows of $width fields from packed output.
+     *
+     * @return list<list<int>>
+     */
+    public static function w48Rows(string $raw, int $width, int $offset = 0): array
+    {
+        $values = \strlen($raw) > $offset ? unpack('P*', $raw, $offset) : [];
+
+        /** @var list<list<int>> */
+        return \is_array($values) && $width > 0 ? array_chunk($values, $width) : [];
+    }
+
+    /**
+     * Length-prefixed strings: every byte length as an i64, then the concatenated bytes.
+     *
+     * @param  list<string>  $strings
+     */
+    public static function w48Strings(array $strings): string
+    {
+        return $strings === [] ? '' : pack('P*', ...array_map(\strlen(...), $strings)).implode('', $strings);
+    }
+
+    private static function w48Ffi(): ?FFI
+    {
+        if (self::$w48Ffi === null) {
+            $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+            self::$w48Ffi = RustPipelineLibrary::resolveDomain('search_w48', self::W48_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+            self::$w48Out = null;
+            self::$w48OutCap = 0;
+        }
+
+        return self::$w48Ffi instanceof FFI ? self::$w48Ffi : null;
     }
 
     private static function ffi(): ?FFI

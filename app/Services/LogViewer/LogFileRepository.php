@@ -19,6 +19,15 @@ class LogFileRepository
 {
     private const int STRUCTURE_SNIFF_BYTES = 8192;
 
+    /**
+     * Benchmark-gated default for {@see inventoryPathBatch()}: stays PHP because the common p99 ratio fell
+     * to 1.42x and 1.46x in two of six strict runs although means were about 1.75x; see
+     * tests/Unit/RustLogViewerEntryFileRepoReaderReleaseSearchW48ParityTest.php.
+     */
+    public const bool W48_LOG_FILE_REPOSITORY_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useW48LogFileRepositoryRustFfi = null;
+
     private string $directory;
 
     /**
@@ -32,6 +41,142 @@ class LogFileRepository
         $realDirectory = realpath($directory);
 
         $this->directory = $realDirectory === false ? $directory : $realDirectory;
+    }
+
+    /** Pass null to restore {@see W48_LOG_FILE_REPOSITORY_RUST_FFI_DEFAULT}. */
+    public static function useW48LogFileRepositoryRustFfi(?bool $enable = true): void
+    {
+        self::$useW48LogFileRepositoryRustFfi = $enable;
+    }
+
+    public static function usesW48LogFileRepositoryRustFfi(): bool
+    {
+        return self::$useW48LogFileRepositoryRustFfi ?? self::W48_LOG_FILE_REPOSITORY_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW48LogFileRepositoryRustFfi(): void
+    {
+        self::$useW48LogFileRepositoryRustFfi = null;
+    }
+
+    /**
+     * Guards and filters relative paths for the inventory. Each path is trimmed, loses its leading
+     * slashes and uses `/` separators. Per path: `[normalized_len, guard_flags, depth, glob_match,
+     * duplicate_of, accepted, path_fnv64]` — flags 1 `..` segment, 2 NUL byte, 4 absolute (leading slash
+     * or drive letter), 8 empty, 16 empty or `.` segment; depth counts `/`; glob_match tests the anchored
+     * $pattern (`?` one byte but `/`, `*` a run without `/`, `**` any run; an empty pattern matches
+     * everything); duplicate_of is the first index with the same normalized path (-1 for the first).
+     * Paths without flags that match and are not duplicates are accepted. The summary is `[accepted,
+     * rejected, duplicates, inventory_digest, max_depth]`: rejected counts flagged paths, the digest XORs
+     * the accepted hashes and max_depth is the deepest accepted path.
+     *
+     * @param  list<string>  $paths
+     * @return array{paths: list<list<int>>, summary: list<int>}
+     */
+    public static function inventoryPathBatch(array $paths, string $pattern): array
+    {
+        return self::usesW48LogFileRepositoryRustFfi() ? self::inventoryPathBatchNative($paths, $pattern) : self::inventoryPathBatchPhp($paths, $pattern);
+    }
+
+    /**
+     * @param  list<string>  $paths
+     * @return array{paths: list<list<int>>, summary: list<int>}
+     */
+    public static function inventoryPathBatchPhp(array $paths, string $pattern): array
+    {
+        $regex = $pattern === '' ? null : self::w48GlobRegex($pattern);
+        $seen = [];
+        $rows = [];
+        $accepted = $rejected = $duplicates = $digest = $maxDepth = 0;
+
+        foreach ($paths as $index => $path) {
+            $trimmed = trim($path);
+            $first = $trimmed[0] ?? '';
+            $drive = \strlen($trimmed) >= 2 && $trimmed[1] === ':' && ctype_alpha($first) && \ord($first) < 0x80;
+            $flags = $first === '/' || $first === '\\' || $drive ? 4 : 0;
+            $normalized = str_replace('\\', '/', ltrim($trimmed, '/\\'));
+
+            if ($normalized === '') {
+                $flags |= 8;
+            } else {
+                foreach (explode('/', $normalized) as $segment) {
+                    if ($segment === '..') {
+                        $flags |= 1;
+                    } elseif ($segment === '' || $segment === '.') {
+                        $flags |= 16;
+                    }
+                }
+                if (str_contains($normalized, "\0")) {
+                    $flags |= 2;
+                }
+            }
+
+            $depth = substr_count($normalized, '/');
+            $matched = $regex === null || preg_match($regex, $normalized) === 1;
+            $duplicate = $seen[$normalized] ??= $index;
+            $duplicate = $duplicate === $index ? -1 : $duplicate;
+            $hash = LogEntry::w48Hash64($normalized);
+            $ok = $flags === 0 && $matched && $duplicate < 0;
+
+            if ($ok) {
+                $accepted++;
+                $digest ^= $hash;
+                $maxDepth = max($maxDepth, $depth);
+            }
+            if ($flags !== 0) {
+                $rejected++;
+            }
+            if ($duplicate >= 0) {
+                $duplicates++;
+            }
+
+            $rows[] = [\strlen($normalized), $flags, $depth, $matched ? 1 : 0, $duplicate, $ok ? 1 : 0, $hash];
+        }
+
+        return ['paths' => $rows, 'summary' => [$accepted, $rejected, $duplicates, $digest, $maxDepth]];
+    }
+
+    /**
+     * @param  list<string>  $paths
+     * @return array{paths: list<list<int>>, summary: list<int>}
+     */
+    public static function inventoryPathBatchNative(array $paths, string $pattern): array
+    {
+        $count = \count($paths);
+        $bytes = 56 * $count + 40;
+        $raw = LogReader::evaluateW48Native(3, pack('P', $count).LogReader::w48Strings([$pattern, ...$paths]), $bytes);
+
+        if ($raw === null || \strlen($raw) !== $bytes) {
+            return self::inventoryPathBatchPhp($paths, $pattern);
+        }
+
+        return ['paths' => LogReader::w48Rows(substr($raw, 0, $bytes - 40), 7), 'summary' => LogReader::w48Rows($raw, 5, $bytes - 40)[0]];
+    }
+
+    /**
+     * Anchored regex for a glob: `**` any run, `*` a run without `/`, `?` one byte but `/`.
+     */
+    private static function w48GlobRegex(string $pattern): string
+    {
+        $regex = '';
+        $length = \strlen($pattern);
+
+        for ($at = 0; $at < $length; $at++) {
+            $byte = $pattern[$at];
+
+            if ($byte === '*' && ($pattern[$at + 1] ?? '') === '*') {
+                $regex .= '.*';
+                $at++;
+            } else {
+                $regex .= match ($byte) {
+                    '*' => '[^\/]*',
+                    '?' => '[^\/]',
+                    default => preg_quote($byte, '/'),
+                };
+            }
+        }
+
+        return '/\A'.$regex.'\z/s';
     }
 
     /**
