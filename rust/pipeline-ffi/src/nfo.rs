@@ -25618,3 +25618,641 @@ pub unsafe extern "C" fn nntmux_w36_nntp_fingerprint_exceptions_yenc(
     }))
     .unwrap_or(-1)
 }
+mod wave37_verification_capacity_prefile_singleton {
+    use super::{nfo_abi_range, yenc_ranges_overlap};
+    use std::slice;
+
+    pub(super) const MAX_INPUT: usize = 16 * 1024 * 1024;
+
+    /// Every count and byte total is clamped to `[0, 2^40]` so percentages cannot overflow.
+    const COUNT_MAX: i64 = 1 << 40;
+
+    const FINGERPRINT_HAS_ID: u32 = 1;
+    const FINGERPRINT_HAS_REASON: u32 = 2;
+    const PREFILE_HAS_LIMIT: u32 = 1;
+    const PREFILE_SHOW: u32 = 2;
+
+    const PARTIAL_DEFAULT_MAX_DEFERRALS: i64 = 10;
+    const PARTIAL_BASE_DELAY_MS: i64 = 1_000;
+    const PARTIAL_MAX_DELAY_MS: i64 = 300_000;
+
+    const SINGLETON_ID: i64 = 1;
+
+    /// PHP `trim()`'s default character list.
+    fn php_space(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x00)
+    }
+
+    /// The `[start, end)` range `trim()` keeps, or `None` when nothing remains.
+    fn trimmed(value: &[u8]) -> Option<(usize, usize)> {
+        let start = value.iter().position(|b| !php_space(*b))?;
+        let end = value.iter().rposition(|b| !php_space(*b))? + 1;
+        Some((start, end))
+    }
+
+    /// The trimmed message-id without one pair of enclosing angle brackets.
+    fn message_id(value: &[u8]) -> Option<(usize, usize)> {
+        let (mut start, mut end) = trimmed(value)?;
+        if end - start >= 2 && value[start] == b'<' && value[end - 1] == b'>' {
+            start += 1;
+            end -= 1;
+        }
+        (end > start).then_some((start, end))
+    }
+
+    /// `[present, start, len]` for an optional range.
+    fn range(value: Option<(usize, usize)>) -> [i64; 3] {
+        value.map_or([0, 0, 0], |(start, end)| {
+            [1, start as i64, (end - start) as i64]
+        })
+    }
+
+    /// `str_contains(strtolower($haystack), $needle)` for a lowercase ASCII needle.
+    fn contains_ascii_ci(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.len() >= needle.len()
+            && haystack
+                .windows(needle.len())
+                .any(|w| w.eq_ignore_ascii_case(needle))
+    }
+
+    fn count(value: i64) -> i64 {
+        value.clamp(0, COUNT_MAX)
+    }
+
+    fn percent(part: i64, whole: i64) -> i64 {
+        if whole > 0 { part * 100 / whole } else { 0 }
+    }
+
+    fn int(bytes: &[u8], index: usize) -> i64 {
+        let mut slot = [0u8; 8];
+        slot.copy_from_slice(&bytes[index * 8..index * 8 + 8]);
+        i64::from_ne_bytes(slot)
+    }
+
+    /// Exactly `count` leading slots, or `None` when the input is shorter or (when `exact`) longer.
+    fn slots(bytes: &[u8], count: usize, exact: bool) -> Option<Vec<i64>> {
+        let head = count.checked_mul(8)?;
+        if bytes.len() < head || (exact && bytes.len() != head) {
+            return None;
+        }
+        Some((0..count).map(|i| int(bytes, i)).collect())
+    }
+
+    /// `[has_id, id_start, id_len, has_reason, reason_start, reason_len, kind, probed,
+    /// missing, missing_percent, fully_missing, retryable]`; kind 0 disabled,
+    /// 1 unsupported, 2 missing, 3 timeout, 4 unknown.
+    pub(super) fn classify_fingerprint(
+        id: Option<&[u8]>,
+        reason: Option<&[u8]>,
+        probed: i64,
+        missing: i64,
+    ) -> Vec<i64> {
+        let text = reason.unwrap_or(b"");
+        let has = |needle: &[u8]| contains_ascii_ci(text, needle);
+        let kind = if has(b"disabled") {
+            0
+        } else if has(b"unsupported") || has(b"not supported") {
+            1
+        } else if has(b"missing") || has(b"not found") || has(b"430") {
+            2
+        } else if has(b"timed out") || has(b"timeout") {
+            3
+        } else {
+            4
+        };
+        let probed = count(probed);
+        let missing = count(missing).min(probed);
+        let mut out = Vec::with_capacity(12);
+        out.extend(range(id.and_then(message_id)));
+        out.extend(range(reason.and_then(trimmed)));
+        out.extend([
+            kind,
+            probed,
+            missing,
+            percent(missing, probed),
+            i64::from(probed > 0 && missing == probed),
+            i64::from(kind >= 3),
+        ]);
+        out
+    }
+
+    /// `[active, max, pending, max_pending, available_candidates, available_bytes,
+    /// candidates_full, bytes_full, utilization_percent, reason, at_capacity]`;
+    /// a zero limit is unlimited (available -1); reason 0 within_capacity,
+    /// 1 candidates, 2 bytes, 3 candidates_and_bytes.
+    pub(super) fn summarize_capacity(
+        active: i64,
+        max: i64,
+        pending: i64,
+        max_pending: i64,
+    ) -> Vec<i64> {
+        let [active, max, pending, max_pending] = [active, max, pending, max_pending].map(count);
+        let available = |used: i64, limit: i64| if limit > 0 { (limit - used).max(0) } else { -1 };
+        let utilization = |used: i64, limit: i64| percent(used, limit).min(1000);
+        let candidates_full = max > 0 && active >= max;
+        let bytes_full = max_pending > 0 && pending >= max_pending;
+        vec![
+            active,
+            max,
+            pending,
+            max_pending,
+            available(active, max),
+            available(pending, max_pending),
+            i64::from(candidates_full),
+            i64::from(bytes_full),
+            utilization(active, max).max(utilization(pending, max_pending)),
+            i64::from(candidates_full) | (i64::from(bytes_full) << 1),
+            i64::from(candidates_full || bytes_full),
+        ]
+    }
+
+    /// `[present, expected, min_percent, deferrals, max_deferrals, missing,
+    /// completion_percent, meets_threshold, deferrals_exhausted, action,
+    /// can_still_publish, retry_delay_ms]`; action 0 publish, 1 defer, 2 abandon,
+    /// 3 reject_empty.
+    pub(super) fn summarize_partial(
+        present: i64,
+        expected: i64,
+        min_percent: i64,
+        deferrals: i64,
+        max_deferrals: i64,
+    ) -> Vec<i64> {
+        let expected = count(expected);
+        let present = count(present).min(expected);
+        let min_percent = min_percent.clamp(1, 100);
+        let deferrals = count(deferrals);
+        let max_deferrals = if max_deferrals >= 1 {
+            max_deferrals.min(COUNT_MAX)
+        } else {
+            PARTIAL_DEFAULT_MAX_DEFERRALS
+        };
+        let completion = percent(present, expected);
+        let meets = expected > 0 && completion >= min_percent;
+        let exhausted = deferrals >= max_deferrals;
+        let action = if expected == 0 {
+            3
+        } else if meets {
+            0
+        } else if exhausted {
+            2
+        } else {
+            1
+        };
+        let delay = if action == 1 {
+            (PARTIAL_BASE_DELAY_MS << deferrals.min(9)).min(PARTIAL_MAX_DELAY_MS)
+        } else {
+            0
+        };
+        vec![
+            present,
+            expected,
+            min_percent,
+            deferrals,
+            max_deferrals,
+            expected - present,
+            completion,
+            i64::from(meets),
+            i64::from(exhausted),
+            action,
+            i64::from(action == 1),
+            delay,
+        ]
+    }
+
+    /// PHP 8 `is_numeric()` for a string: optional leading and trailing whitespace
+    /// (` \t\n\r\v\f`), an optional sign, a decimal with digits on at least one side
+    /// of an optional point, and an optional exponent with at least one digit.
+    pub(super) fn php_is_numeric(value: &[u8]) -> bool {
+        let space = |b: u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c);
+        let digits = |from: usize| {
+            value[from..]
+                .iter()
+                .position(|b| !b.is_ascii_digit())
+                .map_or(value.len(), |n| from + n)
+        };
+        let mut i = value.iter().position(|b| !space(*b)).unwrap_or(value.len());
+        if i < value.len() && matches!(value[i], b'+' | b'-') {
+            i += 1;
+        }
+        let int_end = digits(i);
+        let mut has_digits = int_end > i;
+        i = int_end;
+        if i < value.len() && value[i] == b'.' {
+            let frac_end = digits(i + 1);
+            has_digits |= frac_end > i + 1;
+            i = frac_end;
+        }
+        if !has_digits {
+            return false;
+        }
+        if i < value.len() && matches!(value[i], b'e' | b'E') {
+            let mut j = i + 1;
+            if j < value.len() && matches!(value[j], b'+' | b'-') {
+                j += 1;
+            }
+            let exp_end = digits(j);
+            if exp_end > j {
+                i = exp_end;
+            }
+        }
+        value[i..].iter().all(|b| space(*b))
+    }
+
+    /// `[valid, full, numeric, show, exit_code]` for `match:prefiles {limit} {--show}`.
+    pub(super) fn normalize_prefile(limit: Option<&[u8]>, show: bool) -> Vec<i64> {
+        let full = limit == Some(b"full");
+        let numeric = limit.is_some_and(php_is_numeric);
+        let valid = full || numeric;
+        vec![
+            i64::from(valid),
+            i64::from(full),
+            i64::from(numeric),
+            i64::from(show),
+            i64::from(!valid),
+        ]
+    }
+
+    /// `[row_count, singleton_rows, extra_rows, has_bounds, min_id, max_id, status,
+    /// needs_repair]`; status 0 ok, 1 empty, 2 missing, 3 duplicated, 4 extra_rows.
+    pub(super) fn summarize_singleton(bytes: &[u8]) -> Vec<i64> {
+        let mut rows = 0i64;
+        let mut singleton = 0i64;
+        let mut min = i64::MAX;
+        let mut max = i64::MIN;
+        for chunk in bytes.as_chunks::<8>().0 {
+            let id = i64::from_ne_bytes(*chunk);
+            rows += 1;
+            singleton += i64::from(id == SINGLETON_ID);
+            min = min.min(id);
+            max = max.max(id);
+        }
+        let status = if rows == 0 {
+            1
+        } else if singleton == 0 {
+            2
+        } else if singleton > 1 {
+            3
+        } else if rows > singleton {
+            4
+        } else {
+            0
+        };
+        let bounded = rows > 0;
+        vec![
+            rows,
+            singleton,
+            rows - singleton,
+            i64::from(bounded),
+            if bounded { min } else { 0 },
+            if bounded { max } else { 0 },
+            status,
+            i64::from(status != 0),
+        ]
+    }
+
+    /// Split the bytes after `head` into exactly `lengths`, covering the tail.
+    fn strings<'a>(bytes: &'a [u8], head: usize, lengths: &[i64]) -> Option<Vec<&'a [u8]>> {
+        let mut cursor = head;
+        let mut parts = Vec::with_capacity(lengths.len());
+        for &length in lengths {
+            let end = cursor.checked_add(usize::try_from(length).ok()?)?;
+            parts.push(bytes.get(cursor..end)?);
+            cursor = end;
+        }
+        (cursor == bytes.len()).then_some(parts)
+    }
+
+    pub(super) fn compute(operation: u32, flags: u32, bytes: &[u8]) -> Option<Vec<i64>> {
+        match operation {
+            0 => {
+                if flags & !(FINGERPRINT_HAS_ID | FINGERPRINT_HAS_REASON) != 0 {
+                    return None;
+                }
+                let head = slots(bytes, 4, false)?;
+                let has_id = flags & FINGERPRINT_HAS_ID != 0;
+                let has_reason = flags & FINGERPRINT_HAS_REASON != 0;
+                if (!has_id && head[0] != 0) || (!has_reason && head[1] != 0) {
+                    return None;
+                }
+                let parts = strings(bytes, 32, &head[..2])?;
+                Some(classify_fingerprint(
+                    has_id.then_some(parts[0]),
+                    has_reason.then_some(parts[1]),
+                    head[2],
+                    head[3],
+                ))
+            }
+            1 if flags == 0 => {
+                let s = slots(bytes, 4, true)?;
+                Some(summarize_capacity(s[0], s[1], s[2], s[3]))
+            }
+            2 if flags == 0 => {
+                let s = slots(bytes, 5, true)?;
+                Some(summarize_partial(s[0], s[1], s[2], s[3], s[4]))
+            }
+            3 => {
+                if flags & !(PREFILE_HAS_LIMIT | PREFILE_SHOW) != 0 {
+                    return None;
+                }
+                let has_limit = flags & PREFILE_HAS_LIMIT != 0;
+                if !has_limit && !bytes.is_empty() {
+                    return None;
+                }
+                Some(normalize_prefile(
+                    has_limit.then_some(bytes),
+                    flags & PREFILE_SHOW != 0,
+                ))
+            }
+            4 if flags == 0 && bytes.len().is_multiple_of(8) => Some(summarize_singleton(bytes)),
+            _ => None,
+        }
+    }
+
+    /// # Safety
+    /// See [`super::nntmux_w37_verification_capacity_prefile_singleton`].
+    pub(super) unsafe fn evaluate(
+        operation: u32,
+        flags: u32,
+        input: *const u8,
+        length: usize,
+        output: *mut u8,
+        capacity: usize,
+    ) -> i64 {
+        if !nfo_abi_range(input, length, false)
+            || !nfo_abi_range(output, capacity, false)
+            || length > MAX_INPUT
+            || yenc_ranges_overlap(input as usize, length, output as usize, capacity)
+        {
+            return -1;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, length) };
+        let Some(result) = compute(operation, flags, bytes) else {
+            return -1;
+        };
+        let Some(needed) = result.len().checked_mul(8) else {
+            return -1;
+        };
+        if needed > capacity {
+            return -(needed as i64);
+        }
+        let out = unsafe { slice::from_raw_parts_mut(output, needed) };
+        for (chunk, value) in out.as_chunks_mut::<8>().0.iter_mut().zip(&result) {
+            chunk.copy_from_slice(&value.to_ne_bytes());
+        }
+        needed as i64
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn pack(slots: &[i64], tail: &[&[u8]]) -> Vec<u8> {
+            let mut v: Vec<u8> = slots.iter().flat_map(|s| s.to_ne_bytes()).collect();
+            for t in tail {
+                v.extend_from_slice(t);
+            }
+            v
+        }
+
+        fn call(operation: u32, flags: u32, input: &[u8]) -> Option<Vec<i64>> {
+            let mut out = vec![0xa5u8; 512];
+            let probe = [0u8; 1];
+            let pointer = if input.is_empty() {
+                probe.as_ptr()
+            } else {
+                input.as_ptr()
+            };
+            let written = unsafe {
+                evaluate(
+                    operation,
+                    flags,
+                    pointer,
+                    input.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            if written < 0 {
+                assert_eq!(written, -1);
+                return None;
+            }
+            Some(
+                out[..written as usize]
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|c| i64::from_ne_bytes(*c))
+                    .collect(),
+            )
+        }
+
+        #[test]
+        fn w37_2_fingerprint_unavailable() {
+            let id = b" <abc@x> ";
+            let reason = b" Article NOT FOUND ";
+            assert_eq!(
+                call(0, 3, &pack(&[9, 19, 10, 4], &[id, reason])),
+                Some(vec![1, 2, 5, 1, 1, 17, 2, 10, 4, 40, 0, 0])
+            );
+            assert_eq!(
+                call(0, 0, &pack(&[0, 0, -5, 9], &[])),
+                Some(vec![0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 1])
+            );
+            assert_eq!(
+                call(0, 2, &pack(&[0, 7, i64::MAX, i64::MAX], &[b"timeout"])),
+                Some(vec![0, 0, 0, 1, 0, 7, 3, COUNT_MAX, COUNT_MAX, 100, 1, 1])
+            );
+            assert_eq!(call(0, 2, &pack(&[0, 12], &[])), None);
+            assert_eq!(
+                call(
+                    0,
+                    2,
+                    &pack(&[0, 3, 0, 0], &[b"Disabled+missing"[..3].as_ref()])
+                )
+                .unwrap()[6],
+                4
+            );
+            assert_eq!(
+                call(0, 2, &pack(&[0, 8, 0, 0], &[b"disabled"])).unwrap()[6],
+                0
+            );
+            assert_eq!(
+                call(0, 2, &pack(&[0, 13, 0, 0], &[b"not supported"])).unwrap()[6],
+                1
+            );
+            assert_eq!(
+                call(0, 1, &pack(&[2, 0, 0, 0], &[b"<>"])).unwrap()[..3],
+                [0, 0, 0]
+            );
+            // Absent strings must carry no bytes; lengths must cover the tail exactly.
+            assert_eq!(call(0, 0, &pack(&[1, 0, 0, 0], &[b"x"])), None);
+            assert_eq!(call(0, 1, &pack(&[2, 0, 0, 0], &[b"x"])), None);
+            assert_eq!(call(0, 1, &pack(&[-1, 0, 0, 0], &[])), None);
+            assert_eq!(call(0, 4, &pack(&[0, 0, 0, 0], &[])), None);
+        }
+
+        #[test]
+        fn w37_2_capacity_and_partial_publication() {
+            assert_eq!(
+                call(1, 0, &pack(&[8, 8, 900, 1000], &[])),
+                Some(vec![8, 8, 900, 1000, 0, 100, 1, 0, 100, 1, 1])
+            );
+            assert_eq!(
+                call(1, 0, &pack(&[-1, 0, i64::MAX, 1], &[])),
+                Some(vec![0, 0, COUNT_MAX, 1, -1, 0, 0, 1, 1000, 2, 1])
+            );
+            assert_eq!(
+                call(1, 0, &pack(&[1, 4, 1, 4], &[])).unwrap()[8..],
+                [25, 0, 0]
+            );
+            assert_eq!(call(1, 0, &pack(&[1, 1, 1, 1], &[])).unwrap()[9], 3);
+            assert_eq!(call(1, 1, &pack(&[0, 0, 0, 0], &[])), None);
+            assert_eq!(call(1, 0, &pack(&[0, 0, 0], &[])), None);
+            assert_eq!(call(1, 0, &pack(&[0, 0, 0, 0, 0], &[])), None);
+
+            assert_eq!(
+                call(2, 0, &pack(&[95, 100, 100, 2, 5], &[])),
+                Some(vec![95, 100, 100, 2, 5, 5, 95, 0, 0, 1, 1, 4000])
+            );
+            assert_eq!(
+                call(2, 0, &pack(&[200, 100, 0, 0, 0], &[])),
+                Some(vec![100, 100, 1, 0, 10, 0, 100, 1, 0, 0, 0, 0])
+            );
+            assert_eq!(call(2, 0, &pack(&[0, 0, 50, 0, 1], &[])).unwrap()[9], 3);
+            assert_eq!(
+                call(2, 0, &pack(&[1, 2, 99, 3, 3], &[])).unwrap()[9..],
+                [2, 0, 0]
+            );
+            assert_eq!(
+                call(2, 0, &pack(&[1, 2, 99, 40, i64::MAX], &[])).unwrap()[11],
+                300_000
+            );
+            assert_eq!(call(2, 2, &pack(&[0, 0, 0, 0, 0], &[])), None);
+        }
+
+        #[test]
+        fn w37_2_prefile_arguments_and_is_numeric() {
+            for (text, numeric) in [
+                ("1.e3", true),
+                (".5", true),
+                ("5.", true),
+                (".", false),
+                (" 1 ", true),
+                ("1 \0", false),
+                ("\x0b1\x0c", true),
+                ("+.5e-3", true),
+                ("1e", false),
+                ("1e+", false),
+                ("0x1A", false),
+                ("-", false),
+                ("1_000", false),
+                (" ", false),
+                ("", false),
+                ("--1", false),
+                ("1e5 ", true),
+                ("full", false),
+                ("1e5e", false),
+            ] {
+                assert_eq!(php_is_numeric(text.as_bytes()), numeric, "{text:?}");
+            }
+            assert_eq!(call(3, 1, b"full"), Some(vec![1, 1, 0, 0, 0]));
+            assert_eq!(call(3, 3, b" 25 "), Some(vec![1, 0, 1, 1, 0]));
+            assert_eq!(call(3, 3, b"Full"), Some(vec![0, 0, 0, 1, 1]));
+            assert_eq!(call(3, 2, b""), Some(vec![0, 0, 0, 1, 1]));
+            assert_eq!(call(3, 0, b"x"), None);
+            assert_eq!(call(3, 4, b""), None);
+        }
+
+        #[test]
+        fn w37_2_singleton_ids() {
+            assert_eq!(
+                call(4, 0, &pack(&[1], &[])),
+                Some(vec![1, 1, 0, 1, 1, 1, 0, 0])
+            );
+            assert_eq!(call(4, 0, &[]), Some(vec![0, 0, 0, 0, 0, 0, 1, 1]));
+            assert_eq!(
+                call(4, 0, &pack(&[5, -3], &[])),
+                Some(vec![2, 0, 2, 1, -3, 5, 2, 1])
+            );
+            assert_eq!(call(4, 0, &pack(&[1, 9, 1], &[])).unwrap()[6], 3);
+            assert_eq!(
+                call(4, 0, &pack(&[i64::MIN, 1, i64::MAX], &[])).unwrap()[4..],
+                [i64::MIN, i64::MAX, 4, 1]
+            );
+            assert_eq!(call(4, 0, &[0u8; 7]), None);
+            assert_eq!(call(4, 1, &[]), None);
+        }
+
+        #[test]
+        fn w37_2_abi_sentinels() {
+            assert_eq!(call(5, 0, &pack(&[0], &[])), None);
+            let input = pack(&[1, 1, 1, 1], &[]);
+            let mut out = [0x5au8; 128];
+            let run = |p: *const u8, len: usize, o: *mut u8, cap: usize| unsafe {
+                evaluate(1, 0, p, len, o, cap)
+            };
+            assert_eq!(run(std::ptr::null(), 0, out.as_mut_ptr(), out.len()), -1);
+            assert_eq!(
+                run(input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), MAX_INPUT + 1, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), usize::MAX, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            assert_eq!(run(input.as_ptr(), input.len(), out.as_mut_ptr(), 87), -88);
+            assert!(out.iter().all(|b| *b == 0x5a));
+            assert_eq!(run(input.as_ptr(), input.len(), out.as_mut_ptr(), 88), 88);
+            assert_eq!(i64::from_ne_bytes(out[72..80].try_into().unwrap()), 3);
+            let mut shared = [0u8; 160];
+            shared[..input.len()].copy_from_slice(&input);
+            let p = shared.as_mut_ptr();
+            assert_eq!(run(p, input.len(), unsafe { p.add(8) }, 88), -1);
+            assert_eq!(
+                unsafe {
+                    super::super::nntmux_w37_verification_capacity_prefile_singleton(
+                        1,
+                        0,
+                        input.as_ptr(),
+                        input.len(),
+                        out.as_mut_ptr(),
+                        out.len(),
+                    )
+                },
+                88
+            );
+        }
+    }
+}
+
+/// Evaluate one Wave 37.2 verification capacity, fingerprint-unavailable,
+/// partial-publication, `match:prefiles` argument or singleton-configuration
+/// helper over packed native-endian `i64` slots (op 0 also carries trailing
+/// string bytes, op 3 the raw limit, op 4 one slot per id). `flags` carries
+/// per-operation presence bits; unknown bits are rejected. Returns the byte count
+/// written (packed `i64` slots), the negated required capacity when `out_cap` is
+/// too small (nothing written), or -1 when the input is malformed.
+///
+/// # Safety
+/// Both ranges must be live, disjoint readable/writable allocations. Pointers must
+/// be non-null even for zero lengths; arithmetic checks cannot prove provenance.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w37_verification_capacity_prefile_singleton(
+    operation: u32,
+    flags: u32,
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> i64 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        wave37_verification_capacity_prefile_singleton::evaluate(
+            operation, flags, input, input_len, out_buf, out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
