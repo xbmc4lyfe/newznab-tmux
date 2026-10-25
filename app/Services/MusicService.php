@@ -25,6 +25,152 @@ use Throwable;
  */
 class MusicService
 {
+    /** Common p99 uncertainty crosses 1.5x; keep PHP until the gain is conclusive. */
+    public const bool W404_RUST_FFI_DEFAULT = false;
+
+    public const string W404_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w404_music_release_lookup_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private static ?bool $w404UseRustFfi = null;
+
+    private static FFI|false|null $w404Ffi = null;
+
+    public static function useW404RustFfi(?bool $use = true): void
+    {
+        self::$w404UseRustFfi = $use;
+        if ($use === null) {
+            self::$w404Ffi = null;
+        }
+    }
+
+    public static function usesW404RustFfi(): bool
+    {
+        return self::$w404UseRustFfi ?? self::W404_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW404RustFfi(): void
+    {
+        self::$w404UseRustFfi = null;
+        self::$w404Ffi = null;
+    }
+
+    /** @param list<list<string>> $rows
+     * @return array<string, int>|null
+     */
+    private static function w404Call(array $rows): ?array
+    {
+        try {
+            $input = serialize([$rows]);
+            if (strlen($input) > 16777216) {
+                return null;
+            }
+            self::$w404Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w404', self::W404_FFI_CDEF) ?? false;
+            $ffi = self::$w404Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            $capacity = 0;
+            $out = RustPipelineLibrary::obtainScratch($ffi, 2048, $capacity);
+            if ($out === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound (Declared by W404_FFI_CDEF.)
+            $written = $ffi->nntmux_w404_music_release_lookup_batch($input, strlen($input), $out, $capacity);
+            if (is_int($written) && $written < -1 && $written >= -16777216) {
+                $out = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($out === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound (Declared by W404_FFI_CDEF.)
+                $written = $ffi->nntmux_w404_music_release_lookup_batch($input, strlen($input), $out, $capacity);
+            }
+            if (! is_int($written) || $written <= 0 || $written > $capacity || $written > 16777216) {
+                return null;
+            }
+            $result = @unserialize(FFI::string($out, $written), ['allowed_classes' => false]);
+            $keys = ['total_candidates', 'lossless_flac_count', 'mp3_bitrate_count', 'has_year_count', 'artist_album_splitable_count'];
+            if (! is_array($result) || array_keys($result) !== $keys) {
+                return null;
+            }
+            $summary = [];
+            foreach ($keys as $key) {
+                $value = $result[$key];
+                if (! is_int($value) || $value < 0 || $value > count($rows)) {
+                    return null;
+                }
+                $summary[$key] = $value;
+            }
+
+            return $summary;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** Only integer and string fields participate; objects are never cast or serialized. */
+    private static function w404Text(mixed $value): string
+    {
+        return is_string($value) || is_int($value) ? trim((string) $value) : '';
+    }
+
+    /** @param array<array-key, mixed> $input
+     * @return list<list<string>>
+     */
+    private static function w404Rows(array $input): array
+    {
+        $rows = [];
+        foreach ($input as $row) {
+            $row = is_array($row) ? $row : [];
+            $rows[] = [self::w404Text($row['searchname'] ?? $row['title'] ?? null), self::w404Text($row['year'] ?? null)];
+        }
+
+        return $rows;
+    }
+
+    /**
+     * Summarize searchname (or title) and year fields. FLAC/MP3/bitrate and
+     * years use ASCII alphanumeric tokens; a year is 1000-2999. Splittable
+     * means the first hyphen has nonempty trimmed text on both sides.
+     *
+     * @param  array<array-key, mixed>  $releases
+     * @return array<string, int>
+     */
+    public static function summarizeMusicReleaseLookupBatch(array $releases): array
+    {
+        if (self::usesW404RustFfi()) {
+            $native = self::w404Call(self::w404Rows($releases));
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
+        return self::summarizeMusicReleaseLookupBatchPhp($releases);
+    }
+
+    /** @param array<array-key, mixed> $releases
+     * @return array<string, int>
+     */
+    public static function summarizeMusicReleaseLookupBatchPhp(array $releases): array
+    {
+        $summary = array_fill_keys(['total_candidates', 'lossless_flac_count', 'mp3_bitrate_count', 'has_year_count', 'artist_album_splitable_count'], 0);
+        $summary['total_candidates'] = count($releases);
+        foreach (self::w404Rows($releases) as [$title, $year]) {
+            $tokens = preg_split('/[^A-Z0-9]+/', strtoupper($title), -1, PREG_SPLIT_NO_EMPTY) ?: [];
+            $summary['lossless_flac_count'] += (int) in_array('FLAC', $tokens, true);
+            $summary['mp3_bitrate_count'] += (int) (array_intersect(['MP3', '128', '192', '256', '320'], $tokens) !== []);
+            $hasYear = preg_match('/\A[12][0-9]{3}\z/', $year) === 1;
+            foreach ($tokens as $token) {
+                $hasYear = $hasYear || preg_match('/\A[12][0-9]{3}\z/', $token) === 1;
+            }
+            $summary['has_year_count'] += (int) $hasYear;
+            $separator = strpos($title, '-');
+            $summary['artist_album_splitable_count'] += (int) ($separator !== false && trim(substr($title, 0, $separator)) !== '' && trim(substr($title, $separator + 1)) !== '');
+        }
+
+        return $summary;
+    }
+
     protected const MATCH_PERCENT = 85;
 
     private const string FFI_CDEF = <<<'C'

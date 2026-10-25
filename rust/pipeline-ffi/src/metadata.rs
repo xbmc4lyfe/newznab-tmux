@@ -38955,3 +38955,826 @@ mod w394_tests {
         }
     }
 }
+
+pub mod w404_metadata {
+    use super::{PhpKey, PhpNode, PhpSerParser, PhpSerWriter};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+
+    unsafe fn dispatch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+        summarize: fn(&[u8]) -> Option<Vec<u8>>,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if input.is_null()
+                || out.is_null()
+                || len > MAX_INPUT
+                || len > isize::MAX as usize
+                || cap > isize::MAX as usize
+            {
+                return -1;
+            }
+            let Some(input_end) = (input as usize).checked_add(len) else {
+                return -1;
+            };
+            let Some(out_end) = (out as usize).checked_add(cap) else {
+                return -1;
+            };
+            if len != 0 && cap != 0 && (input as usize) < out_end && (out as usize) < input_end {
+                return -1;
+            }
+            // Check both address spans and their overlap before borrowing caller memory.
+            let input = unsafe { std::slice::from_raw_parts(input, len) };
+            let Some(result) = summarize(input) else {
+                return -1;
+            };
+            let Ok(needed) = isize::try_from(result.len()) else {
+                return -1;
+            };
+            if result.len() > cap {
+                return -needed;
+            }
+            unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), out, result.len()) };
+            needed
+        }))
+        .unwrap_or(-1)
+    }
+
+    fn is_list(node: &PhpNode<'_>) -> bool {
+        node.is_arr()
+            && node
+                .items()
+                .iter()
+                .enumerate()
+                .all(|(i, (key, _))| *key == PhpKey::Int(i as i64))
+    }
+
+    fn summarize<const WIDTH: usize, const COUNTS: usize>(
+        input: &[u8],
+        keys: [&[u8]; COUNTS],
+        classify: fn([&[u8]; WIDTH]) -> [bool; COUNTS],
+    ) -> Option<Vec<u8>> {
+        let doc = PhpSerParser::parse_document(input)?;
+        if !is_list(&doc) || doc.items().len() != 1 {
+            return None;
+        }
+        let rows = &doc.items()[0].1;
+        if !is_list(rows) {
+            return None;
+        }
+        let mut counts = [0i64; COUNTS];
+        for (_, row) in rows.items() {
+            if !is_list(row) || row.items().len() != WIDTH {
+                return None;
+            }
+            let mut fields = [b"".as_slice(); WIDTH];
+            for (i, (_, node)) in row.items().iter().enumerate() {
+                fields[i] = node.as_str()?;
+            }
+            for (count, matched) in counts.iter_mut().zip(classify(fields)) {
+                *count += i64::from(matched);
+            }
+        }
+        let mut w = PhpSerWriter::new();
+        w.arr_open(COUNTS);
+        for (key, count) in keys.into_iter().zip(counts) {
+            w.key(key);
+            w.int(count);
+        }
+        w.arr_close();
+        Some(w.buf)
+    }
+
+    fn trim(value: &[u8]) -> &[u8] {
+        // PHP trim includes NUL and vertical tab, but excludes form feed.
+        let is_trim = |b: &u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b);
+        let start = value
+            .iter()
+            .position(|b| !is_trim(b))
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|b| !is_trim(b))
+            .map_or(start, |i| i + 1);
+        &value[start..end]
+    }
+
+    fn positive_decimal(value: &[u8]) -> bool {
+        !value.is_empty()
+            && value.iter().all(u8::is_ascii_digit)
+            && value.iter().any(|b| *b != b'0')
+    }
+
+    fn year(value: &[u8]) -> bool {
+        value.len() == 4 && matches!(value[0], b'1' | b'2') && value.iter().all(u8::is_ascii_digit)
+    }
+
+    fn tokens(value: &[u8]) -> impl Iterator<Item = &[u8]> {
+        value
+            .split(|b| !b.is_ascii_alphanumeric())
+            .filter(|s| !s.is_empty())
+    }
+
+    fn in_set(value: &[u8], set: &[&[u8]]) -> bool {
+        set.iter()
+            .any(|candidate| value.eq_ignore_ascii_case(candidate))
+    }
+
+    fn movie(input: &[u8]) -> Option<Vec<u8>> {
+        summarize(
+            input,
+            [
+                b"total_rows",
+                b"valid_imdb_id_count",
+                b"has_tmdb_id_count",
+                b"has_cover_count",
+                b"missing_year_count",
+                b"complete_record_count",
+            ],
+            |[imdb, tmdb, cover, y]| {
+                let digits = imdb.strip_prefix(b"tt").unwrap_or(imdb);
+                let imdb = (7..=10).contains(&digits.len()) && positive_decimal(digits);
+                let tmdb = positive_decimal(tmdb);
+                let cover = positive_decimal(cover);
+                let y = year(y);
+                [true, imdb, tmdb, cover, !y, imdb && tmdb && cover && y]
+            },
+        )
+    }
+
+    fn music(input: &[u8]) -> Option<Vec<u8>> {
+        summarize(
+            input,
+            [
+                b"total_candidates",
+                b"lossless_flac_count",
+                b"mp3_bitrate_count",
+                b"has_year_count",
+                b"artist_album_splitable_count",
+            ],
+            |[title, y]| {
+                let (mut flac, mut mp3, mut has_year) = (false, false, year(y));
+                for token in tokens(title) {
+                    flac |= token.eq_ignore_ascii_case(b"FLAC");
+                    mp3 |= in_set(token, &[b"MP3", b"128", b"192", b"256", b"320"]);
+                    has_year |= year(token);
+                }
+                let splitable = title.iter().position(|b| *b == b'-').is_some_and(|i| {
+                    !trim(&title[..i]).is_empty() && !trim(&title[i + 1..]).is_empty()
+                });
+                [true, flac, mp3, has_year, splitable]
+            },
+        )
+    }
+
+    fn valid_isbn(value: &[u8]) -> bool {
+        // Match BookIsbn::normalizePhp: discard every byte except ASCII digits and X/x.
+        let mut digits = [0u8; 13];
+        let mut len = 0;
+        for b in value
+            .iter()
+            .copied()
+            .filter(|b| b.is_ascii_digit() || matches!(b, b'X' | b'x'))
+        {
+            if len == digits.len() {
+                return false;
+            }
+            digits[len] = b.to_ascii_uppercase();
+            len += 1;
+        }
+        let digits = &digits[..len];
+        match len {
+            10 => {
+                if !digits[..9].iter().all(u8::is_ascii_digit)
+                    || !(digits[9].is_ascii_digit() || digits[9] == b'X')
+                {
+                    return false;
+                }
+                let sum: u32 = digits
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| {
+                        (if *b == b'X' { 10 } else { u32::from(b - b'0') }) * (10 - i as u32)
+                    })
+                    .sum();
+                sum % 11 == 0
+            }
+            13 => {
+                if !(digits.starts_with(b"978") || digits.starts_with(b"979"))
+                    || !digits.iter().all(u8::is_ascii_digit)
+                {
+                    return false;
+                }
+                let sum: u32 = digits
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| u32::from(b - b'0') * if i % 2 == 0 { 1 } else { 3 })
+                    .sum();
+                sum % 10 == 0
+            }
+            _ => false,
+        }
+    }
+
+    fn book(input: &[u8]) -> Option<Vec<u8>> {
+        summarize(
+            input,
+            [
+                b"total_rows",
+                b"valid_isbn_count",
+                b"has_author_count",
+                b"has_publish_date_count",
+                b"ebook_format_count",
+            ],
+            |[isbn, author, date, format]| {
+                [
+                    true,
+                    valid_isbn(isbn),
+                    !author.is_empty(),
+                    !date.is_empty(),
+                    in_set(
+                        format,
+                        &[b"EPUB", b"MOBI", b"AZW", b"AZW3", b"PDF", b"CBZ", b"CBR"],
+                    ),
+                ]
+            },
+        )
+    }
+
+    const NINTENDO: &[&[u8]] = &[
+        b"NINTENDO",
+        b"SWITCH",
+        b"WII",
+        b"WIIU",
+        b"GAMECUBE",
+        b"NGC",
+        b"N64",
+        b"NES",
+        b"SNES",
+        b"NDS",
+        b"DS",
+        b"3DS",
+        b"GBA",
+        b"GBC",
+        b"GAMEBOY",
+    ];
+    const PLAYSTATION: &[&[u8]] = &[
+        b"PLAYSTATION",
+        b"PSX",
+        b"PS1",
+        b"PS2",
+        b"PS3",
+        b"PS4",
+        b"PS5",
+        b"PSP",
+        b"PSV",
+        b"PSVITA",
+        b"VITA",
+    ];
+    const XBOX: &[&[u8]] = &[b"XBOX", b"X360", b"XONE", b"XSX", b"XSS"];
+    const HANDHELD: &[&[u8]] = &[
+        b"NDS", b"DS", b"3DS", b"GBA", b"GBC", b"GAMEBOY", b"PSP", b"PSV", b"PSVITA", b"VITA",
+    ];
+    const RETRO: &[&[u8]] = &[
+        b"NES",
+        b"SNES",
+        b"N64",
+        b"GAMEBOY",
+        b"GBA",
+        b"GBC",
+        b"PSX",
+        b"PS1",
+        b"DREAMCAST",
+        b"GENESIS",
+        b"MEGADRIVE",
+        b"SATURN",
+    ];
+    const REGIONS: &[&[u8]] = &[
+        b"USA",
+        b"EUR",
+        b"EUROPE",
+        b"JAP",
+        b"JPN",
+        b"JAPAN",
+        b"PAL",
+        b"NTSC",
+        b"REGIONFREE",
+    ];
+
+    fn console(input: &[u8]) -> Option<Vec<u8>> {
+        summarize(
+            input,
+            [
+                b"total_titles",
+                b"nintendo_count",
+                b"playstation_count",
+                b"xbox_count",
+                b"handheld_count",
+                b"retro_count",
+                b"region_tagged_count",
+                b"unknown_platform_count",
+            ],
+            |[title]| {
+                let mut family = [false; 5];
+                let mut region = false;
+                for token in tokens(title) {
+                    for (matched, set) in
+                        family
+                            .iter_mut()
+                            .zip([NINTENDO, PLAYSTATION, XBOX, HANDHELD, RETRO])
+                    {
+                        *matched |= in_set(token, set);
+                    }
+                    region |= in_set(token, REGIONS);
+                }
+                [
+                    true,
+                    family[0],
+                    family[1],
+                    family[2],
+                    family[3],
+                    family[4],
+                    region,
+                    !family.into_iter().any(|matched| matched),
+                ]
+            },
+        )
+    }
+
+    // Keep suffix recognition aligned with GamesService::SCENE_GROUPS, including
+    // group names containing punctuation rather than restricting these to tokens.
+    const SCENE_GROUPS: &[&[u8]] = &[
+        b"CODEX",
+        b"PLAZA",
+        b"GOG",
+        b"CPY",
+        b"HOODLUM",
+        b"EMPRESS",
+        b"RUNE",
+        b"TENOKE",
+        b"FLT",
+        b"RELOADED",
+        b"SKIDROW",
+        b"PROPHET",
+        b"RAZOR1911",
+        b"CORE",
+        b"REFLEX",
+        b"P2P",
+        b"GOLDBERG",
+        b"DARKSIDERS",
+        b"TINYISO",
+        b"DOGE",
+        b"ANOMALY",
+        b"ELAMIGOS",
+        b"FITGIRL",
+        b"DODI",
+        b"XATAB",
+        b"GOG-GAMES",
+        b"BLG",
+        b"RARGB",
+        b"CHRONOS",
+        b"FCKDRM",
+        b"I_KnoW",
+        b"STEAM",
+        b"PLAZA",
+        b"SPTGAMES",
+        b"DARKSiDERS",
+        b"TiNYiSO",
+        b"KaOs",
+        b"SiMPLEX",
+        b"ElAmigos",
+        b"FitGirl",
+        b"PROPHET",
+        b"ALI213",
+        b"FLTDOX",
+        b"3DMGAME",
+        b"POSTMORTEM",
+        b"VACE",
+        b"ROGUE",
+        b"OUTLAWS",
+    ];
+
+    fn pc_game(input: &[u8]) -> Option<Vec<u8>> {
+        summarize(
+            input,
+            [
+                b"total_entries",
+                b"scene_group_tagged_count",
+                b"update_patch_dlc_count",
+                b"repack_gog_steam_count",
+                b"eligible_lookup_count",
+            ],
+            |[title]| {
+                let scene = SCENE_GROUPS.iter().any(|group| {
+                    title.len() > group.len()
+                        && title[title.len() - group.len() - 1] == b'-'
+                        && title[title.len() - group.len()..].eq_ignore_ascii_case(group)
+                });
+                let (mut excluded, mut special) = (false, false);
+                for token in tokens(title) {
+                    excluded |= in_set(token, &[b"UPDATE", b"PATCH", b"DLC"]);
+                    special |= in_set(token, &[b"REPACK", b"GOG", b"STEAM"]);
+                }
+                [
+                    true,
+                    scene,
+                    excluded,
+                    special,
+                    !trim(title).is_empty() && !excluded,
+                ]
+            },
+        )
+    }
+
+    /// # Safety
+    /// The input and output must be live buffers covering their declared lengths.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w404_movie_metadata_completeness(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, movie) }
+    }
+
+    /// # Safety
+    /// The input and output must be live buffers covering their declared lengths.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w404_music_release_lookup_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, music) }
+    }
+
+    /// # Safety
+    /// The input and output must be live buffers covering their declared lengths.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w404_book_lookup_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, book) }
+    }
+
+    /// # Safety
+    /// The input and output must be live buffers covering their declared lengths.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w404_console_platform_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, console) }
+    }
+
+    /// # Safety
+    /// The input and output must be live buffers covering their declared lengths.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w404_pc_game_lookup_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, pc_game) }
+    }
+}
+
+#[cfg(test)]
+mod w404_tests {
+    use super::w404_metadata::*;
+    use super::{PhpKey, PhpSerParser, PhpSerWriter};
+
+    type Export = unsafe extern "C" fn(*const u8, usize, *mut u8, usize) -> isize;
+    const EXPORTS: [(Export, usize); 5] = [
+        (nntmux_w404_movie_metadata_completeness, 4),
+        (nntmux_w404_music_release_lookup_batch, 2),
+        (nntmux_w404_book_lookup_batch, 4),
+        (nntmux_w404_console_platform_batch, 1),
+        (nntmux_w404_pc_game_lookup_batch, 1),
+    ];
+
+    fn frame(rows: &[&[&[u8]]]) -> Vec<u8> {
+        let mut w = PhpSerWriter::new();
+        w.arr_open(1);
+        w.int(0);
+        w.arr_open(rows.len());
+        for (i, row) in rows.iter().enumerate() {
+            w.int(i as i64);
+            w.arr_open(row.len());
+            for (j, field) in row.iter().enumerate() {
+                w.int(j as i64);
+                w.str(field);
+            }
+            w.arr_close();
+        }
+        w.arr_close();
+        w.arr_close();
+        w.buf
+    }
+
+    fn output(export: Export, input: &[u8]) -> Vec<u8> {
+        let mut out = vec![b'Z'; 1024];
+        let written = unsafe { export(input.as_ptr(), input.len(), out.as_mut_ptr(), out.len()) };
+        assert!(written > 0, "export declined: {written}");
+        out.truncate(written as usize);
+        out
+    }
+
+    fn summary(export: Export, rows: &[&[&[u8]]], fields: &[(&[u8], i64)]) {
+        let result = output(export, &frame(rows));
+        let doc = PhpSerParser::parse_document(&result).unwrap();
+        assert_eq!(doc.items().len(), fields.len());
+        for ((key, value), (expected_key, expected_value)) in doc.items().iter().zip(fields) {
+            assert!(matches!(key, PhpKey::Str(k) if k == expected_key));
+            assert_eq!(value.as_int(), Some(*expected_value));
+        }
+    }
+
+    #[test]
+    fn w404_movie_counts_strict_identifiers_and_years() {
+        summary(
+            nntmux_w404_movie_metadata_completeness,
+            &[
+                &[b"tt1234567", b"01", b"9", b"1000"],
+                &[b"1234567890", b"000", b"1", b"2999"],
+                &[b"TT1234567", b"+1", b"-1", b"3000"],
+                &[b"tt0000000", b"1.0", b"1e2", b"0999"],
+                &[b"123456", b"1", b"0", b"2024x"],
+                &[b"12345678901", b"1", b"1", b"2024"],
+                &[
+                    b"tt0000000001",
+                    b"9999999999999999999999999",
+                    b"001",
+                    b"2000",
+                ],
+                &[b"tt1234567\0", b"", b"", b""],
+            ],
+            &[
+                (b"total_rows", 8),
+                (b"valid_imdb_id_count", 3),
+                (b"has_tmdb_id_count", 4),
+                (b"has_cover_count", 4),
+                (b"missing_year_count", 4),
+                (b"complete_record_count", 2),
+            ],
+        );
+    }
+
+    #[test]
+    fn w404_music_uses_ascii_tokens_and_php_trim_for_splits() {
+        summary(
+            nntmux_w404_music_release_lookup_batch,
+            &[
+                &[b"Artist - Album.2024.FLAC.MP3.320", b""],
+                &[b"Artist-Album_flac_128", b"1000"],
+                &[b"XFLAC MP320 320K 12024 A2024", b"2999"],
+                &[b"\0\x0b- album.192.0999", b"3000"],
+                &[b"artist-\t\n", b""],
+                &[b"\x0c-\x0c.256.2999", b""],
+                &[b"\xffflac\x80mp3\x00.2000", b""],
+                &[b"Title.3000.20240.0000", b""],
+            ],
+            &[
+                (b"total_candidates", 8),
+                (b"lossless_flac_count", 3),
+                (b"mp3_bitrate_count", 5),
+                (b"has_year_count", 5),
+                (b"artist_album_splitable_count", 3),
+            ],
+        );
+    }
+
+    #[test]
+    fn w404_books_match_isbn_normalize_php_and_exact_formats() {
+        summary(
+            nntmux_w404_book_lookup_batch,
+            &[
+                &[b"ISBN 978-0-306-40615-7!", b"Author", b"2024", b"ePuB"],
+                &[b"0 80442 957x", b"", b"", b"AZW3"],
+                &[b"0000000000", b"A", b"not-a-date", b"CBZ"],
+                &[b"9780306406158", b"", b"", b"PDFx"],
+                &[b"X306406152", b"", b"", b"mobi"],
+                &[b"0000000000000", b"", b"", b"azw"],
+                &[b"9791090636071", b"", b"", b"pdf"],
+                &[b"", b"", b"", b"cbr"],
+            ],
+            &[
+                (b"total_rows", 8),
+                (b"valid_isbn_count", 4),
+                (b"has_author_count", 2),
+                (b"has_publish_date_count", 2),
+                (b"ebook_format_count", 7),
+            ],
+        );
+    }
+
+    #[test]
+    fn w404_consoles_count_overlapping_families_and_region_tokens() {
+        summary(
+            nntmux_w404_console_platform_batch,
+            &[
+                &[b"Game.Switch.PS5.XBOX.USA"],
+                &[b"Game_DS_PSP_GBA_REGIONFREE"],
+                &[b"Dreamcast-Genesis-Megadrive-Saturn.PAL"],
+                &[b"PS50 Nintendos X3600 JAPANESE"],
+                &[b"\xffwiiu\0ntsc"],
+                &[b"GAMEBOY.JPN"],
+                &[b""],
+                &[b"psvita-europe"],
+            ],
+            &[
+                (b"total_titles", 8),
+                (b"nintendo_count", 4),
+                (b"playstation_count", 3),
+                (b"xbox_count", 1),
+                (b"handheld_count", 3),
+                (b"retro_count", 3),
+                (b"region_tagged_count", 6),
+                (b"unknown_platform_count", 2),
+            ],
+        );
+    }
+
+    #[test]
+    fn w404_pc_games_match_full_suffixes_and_distinct_tokens() {
+        summary(
+            nntmux_w404_pc_game_lookup_batch,
+            &[
+                &[b"Title-CODEX"],
+                &[b"Title.Update-GOG-GAMES"],
+                &[b"Title.PATCH-I_kNoW"],
+                &[b"Title.DLC-SiMPLEX"],
+                &[b"Title.REPACK.STEAM-GOG"],
+                &[b"Title.XUPDATE.DLCS-RUNE.extra"],
+                &[b"Title-CODEXX"],
+                &[b"\0 \t"],
+                &[b"Title-DARKSiDERS"],
+                &[b"Title-3DMGAME"],
+            ],
+            &[
+                (b"total_entries", 10),
+                (b"scene_group_tagged_count", 7),
+                (b"update_patch_dlc_count", 3),
+                (b"repack_gog_steam_count", 2),
+                (b"eligible_lookup_count", 6),
+            ],
+        );
+    }
+
+    #[test]
+    fn w404_all_exports_check_spans_and_preserve_output_on_failure() {
+        for (export, width) in EXPORTS {
+            let fields = vec![b"x".as_slice(); width];
+            let input = frame(&[&fields]);
+            let expected = output(export, &input);
+            let needed = expected.len();
+            let mut out = [b'Z'; 1024];
+            unsafe {
+                for cap in [0, 1, needed - 1] {
+                    assert_eq!(
+                        export(input.as_ptr(), input.len(), out.as_mut_ptr(), cap),
+                        -(needed as isize)
+                    );
+                    assert_eq!(out, [b'Z'; 1024]);
+                }
+                assert_eq!(
+                    export(input.as_ptr(), input.len(), out.as_mut_ptr(), needed),
+                    needed as isize
+                );
+                assert_eq!(&out[..needed], expected);
+                assert!(out[needed..].iter().all(|b| *b == b'Z'));
+                for (ptr, len) in [
+                    (std::ptr::null(), 0),
+                    (std::ptr::null(), input.len()),
+                    (input.as_ptr(), 16 * 1024 * 1024 + 1),
+                    (input.as_ptr(), isize::MAX as usize + 1),
+                    ((usize::MAX - 1) as *const u8, 8),
+                ] {
+                    out.fill(b'Z');
+                    assert_eq!(export(ptr, len, out.as_mut_ptr(), out.len()), -1);
+                    assert_eq!(out, [b'Z'; 1024]);
+                }
+                assert_eq!(
+                    export(input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                    -1
+                );
+                for (ptr, cap) in [
+                    (out.as_mut_ptr(), usize::MAX),
+                    ((usize::MAX - 1) as *mut u8, 8),
+                ] {
+                    assert_eq!(export(input.as_ptr(), input.len(), ptr, cap), -1);
+                    assert_eq!(out, [b'Z'; 1024]);
+                }
+                let mut overlap = vec![b'Z'; input.len() + 2048];
+                overlap[32..32 + input.len()].copy_from_slice(&input);
+                let original = overlap.clone();
+                for offset in [0, 32, 33, 32 + input.len() - 1] {
+                    assert_eq!(
+                        export(
+                            overlap.as_ptr().add(32),
+                            input.len(),
+                            overlap.as_mut_ptr().add(offset),
+                            1024
+                        ),
+                        -1
+                    );
+                    assert_eq!(overlap, original);
+                }
+                // Adjacent input/output spans are legal.
+                assert_eq!(
+                    export(
+                        overlap.as_ptr().add(32),
+                        input.len(),
+                        overlap.as_mut_ptr().add(32 + input.len()),
+                        1024
+                    ),
+                    needed as isize
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn w404_rejects_wrong_argument_list_shapes_types_and_depth() {
+        let mut deep = b"a:1:{i:0;".to_vec();
+        for _ in 0..130 {
+            deep.extend_from_slice(b"a:1:{i:0;");
+        }
+        deep.extend_from_slice(b"s:0:\"\";");
+        deep.extend(std::iter::repeat_n(b'}', 131));
+        for (export, width) in EXPORTS {
+            let mut out = [b'Z'; 1024];
+            let short = vec![b"".as_slice(); width - 1];
+            let long = vec![b"".as_slice(); width + 1];
+            let mut bad_field = frame(&[&vec![b"".as_slice(); width]]);
+            let pos = bad_field
+                .windows(7)
+                .position(|s| s == b"s:0:\"\";")
+                .unwrap();
+            bad_field.splice(pos..pos + 7, b"i:0;".iter().copied());
+            for malformed in [
+                b"".as_slice(),
+                b"N;",
+                b"a:1:{i:0;",
+                b"a:999999999999999999999:{}",
+                b"a:1:{i:0;a:0:{}}trailing",
+                b"a:0:{}",
+                b"a:1:{i:1;a:0:{}}",
+                b"a:2:{i:0;a:0:{}i:1;a:0:{}}",
+                b"a:1:{i:0;N;}",
+                b"a:1:{i:0;a:1:{i:2;a:0:{}}}",
+                b"a:1:{i:0;a:1:{s:1:\"x\";a:0:{}}}",
+                b"a:1:{i:0;a:1:{i:0;N;}}",
+                b"a:1:{i:0;a:1:{i:0;a:1:{i:1;s:0:\"\";}}}",
+                deep.as_slice(),
+                &frame(&[&short]),
+                &frame(&[&long]),
+                &bad_field,
+            ] {
+                assert_eq!(
+                    unsafe {
+                        export(
+                            malformed.as_ptr(),
+                            malformed.len(),
+                            out.as_mut_ptr(),
+                            out.len(),
+                        )
+                    },
+                    -1,
+                    "malformed frame accepted"
+                );
+                assert_eq!(out, [b'Z'; 1024]);
+            }
+            output(export, &frame(&[]));
+        }
+    }
+
+    #[test]
+    fn w404_all_exports_accept_exact_16mib_input() {
+        const LIMIT: usize = 16 * 1024 * 1024;
+        for (export, width) in EXPORTS {
+            let padding = vec![b'x'; LIMIT - 1024];
+            let mut fields = vec![b"".as_slice(); width];
+            fields[0] = &padding;
+            let preliminary = frame(&[&fields]);
+            let final_len = padding.len() + LIMIT - preliminary.len();
+            let padding = vec![b'x'; final_len];
+            fields[0] = &padding;
+            let input = frame(&[&fields]);
+            assert_eq!(input.len(), LIMIT);
+            output(export, &input);
+        }
+    }
+}
