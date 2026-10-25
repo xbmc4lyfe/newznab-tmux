@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Console\Commands;
 
+use App\Services\NNTP\NNTPService;
 use App\Services\Yenc\NativePayloadDecoder;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Config;
@@ -20,8 +21,24 @@ class YencDoctorCommand extends Command
 
     private const array BOOL_FIELDS = ['thread_safe', 'ffi_extension', 'library_present', 'native_available', 'hardware_crc32'];
 
+    /**
+     * Default for the Wave 38.2 toggle only; it stays false because the paired benchmark in
+     * tests/Unit/RustNntpServiceFingerprintDispatchCommandsParityTest.php is below 1.5x.
+     */
+    public const bool RUST_FFI_DEFAULT = false;
+
+    private const array W382_DECODERS = ['PHP', 'RapidYenc', 'unavailable'];
+
+    private const array W382_ERRORS = ['none', 'configuration', 'native_unusable'];
+
+    private const array W382_WARNINGS = ['none', 'php_fallback', 'stale_library'];
+
+    private const array W382_LIBRARY_STATES = ['unset', 'missing', 'loaded', 'unusable'];
+
     // Keep PHP as the production default until the Rust performance gate passes.
     private static ?bool $useRustFfi = null;
+
+    private static ?bool $useWave382RustFfi = null;
 
     public static function setUseRustFfi(?bool $useRustFfi): void
     {
@@ -145,6 +162,36 @@ class YencDoctorCommand extends Command
         return self::buildDiagnosticTableRowsPhp($report);
     }
 
+    public static function useWave382RustFfi(?bool $use): void
+    {
+        self::$useWave382RustFfi = $use;
+    }
+
+    public static function usesWave382RustFfi(): bool
+    {
+        return self::$useWave382RustFfi ?? self::RUST_FFI_DEFAULT;
+    }
+
+    public static function resetWave382RustFfi(): void
+    {
+        self::$useWave382RustFfi = null;
+    }
+
+    /**
+     * Summarize what handle() reports for one probe: the active decoder, the failing configuration (invalid mode, or
+     * native mode without a usable library) and its exit code, the non-JSON warning (PHP fallback or a library
+     * without hardware CRC32) when nothing failed, and whether the library is unset, missing, loaded or unusable.
+     *
+     * @return array{mode_valid: bool, active_decoder: string, error: string, exit_code: int, warning: string, library_state: string}
+     */
+    public static function summarizeDecoderReadiness(string $configuredMode, string $libraryPath, bool $ffiExtension, bool $libraryPresent,
+        bool $nativeAvailable, bool $hardwareCrc32): array
+    {
+        return (self::usesWave382RustFfi()
+            ? self::summarizeDecoderReadinessNative($configuredMode, $libraryPath, $ffiExtension, $libraryPresent, $nativeAvailable, $hardwareCrc32) : null)
+            ?? self::summarizeDecoderReadinessPhp($configuredMode, $libraryPath, $ffiExtension, $libraryPresent, $nativeAvailable, $hardwareCrc32);
+    }
+
     public function handle(): int
     {
         $mode = Config::string('yenc.decoder', 'auto');
@@ -208,6 +255,52 @@ class YencDoctorCommand extends Command
         }
 
         return self::SUCCESS;
+    }
+
+    /** @return array{mode_valid: bool, active_decoder: string, error: string, exit_code: int, warning: string, library_state: string} */
+    private static function summarizeDecoderReadinessPhp(string $configuredMode, string $libraryPath, bool $ffiExtension, bool $libraryPresent,
+        bool $nativeAvailable, bool $hardwareCrc32): array
+    {
+        $valid = self::isValidConfiguredModePhp($configuredMode);
+        $error = match (true) {
+            ! $valid => 'configuration',
+            $configuredMode === 'native' && ! $nativeAvailable => 'native_unusable',
+            default => 'none',
+        };
+
+        return ['mode_valid' => $valid, 'active_decoder' => self::resolveActiveDecoderPhp($configuredMode, $ffiExtension, $nativeAvailable),
+            'error' => $error, 'exit_code' => $error === 'none' ? self::SUCCESS : self::FAILURE,
+            'warning' => match (true) {
+                $error !== 'none' => 'none',
+                $configuredMode !== 'php' && ! $nativeAvailable => 'php_fallback',
+                $nativeAvailable && ! $hardwareCrc32 => 'stale_library',
+                default => 'none',
+            },
+            'library_state' => match (true) {
+                $libraryPath === '' => 'unset',
+                ! $libraryPresent => 'missing',
+                $nativeAvailable => 'loaded',
+                default => 'unusable',
+            }];
+    }
+
+    /** @return array{mode_valid: bool, active_decoder: string, error: string, exit_code: int, warning: string, library_state: string}|null */
+    private static function summarizeDecoderReadinessNative(string $configuredMode, string $libraryPath, bool $ffiExtension, bool $libraryPresent,
+        bool $nativeAvailable, bool $hardwareCrc32): ?array
+    {
+        $flags = ($ffiExtension ? 1 : 0) | ($libraryPresent ? 2 : 0) | ($nativeAvailable ? 4 : 0) | ($hardwareCrc32 ? 8 : 0) | ($libraryPath !== '' ? 16 : 0);
+        $slots = NNTPService::evaluateWave382Native(4, $flags, pack('q', strlen($configuredMode)).$configuredMode, 6);
+        if ($slots === null) {
+            return null;
+        }
+        [$valid, $active, $error, $exit, $warning, $library] = $slots;
+        if (($valid !== 0 && $valid !== 1) || ! isset(self::W382_DECODERS[$active], self::W382_ERRORS[$error], self::W382_WARNINGS[$warning], self::W382_LIBRARY_STATES[$library])
+            || $exit !== (int) ($error !== 0)) {
+            return null;
+        }
+
+        return ['mode_valid' => $valid === 1, 'active_decoder' => self::W382_DECODERS[$active], 'error' => self::W382_ERRORS[$error],
+            'exit_code' => $exit === 0 ? self::SUCCESS : self::FAILURE, 'warning' => self::W382_WARNINGS[$warning], 'library_state' => self::W382_LIBRARY_STATES[$library]];
     }
 
     private static function useRustFfi(): bool
