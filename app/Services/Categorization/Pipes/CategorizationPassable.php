@@ -4,11 +4,13 @@ declare(strict_types=1);
 
 namespace App\Services\Categorization\Pipes;
 
+use App\Models\Category;
 use App\Services\Categorization\CategorizationResult;
 use App\Services\Categorization\CategorizationService;
 use App\Services\Categorization\ReleaseContext;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 /**
@@ -495,5 +497,206 @@ class CategorizationPassable
         }
 
         return self::$w453RustFfiHandle === false ? null : self::$w453RustFfiHandle;
+    }
+
+    /** Wave 53.2 paired benchmarks decide this default; see RustCategorizationPipesAbstractBookPassableMiscMovieW53ParityTest. */
+    private const bool W53_RUST_FFI_DEFAULT = true;
+
+    private const string W53_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w532_passable_best_result_plan_batch(const char *labels, size_t labels_len, const char *ints, size_t ints_len, const char *confidences, size_t confidences_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * Wave 53 routing, binding and output buffer, kept in function-local statics. Operations:
+     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
+     * resolves the binding and 'out' returns `[binding, buffer, capacity]` with room for at
+     * least $val words (null without the library).
+     */
+    private static function w53RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w53', self::W53_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w53RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW53RustFfi(): bool
+    {
+        $enabled = self::w53RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W53_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with planBestResultBatch() routed to Rust ($enabled) or PHP, then restores the
+     * previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW53RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w53RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w53RustFfiState('set', $previous);
+        }
+    }
+
+    /** Wave 53.2 best-row field value while a passable still holds CategorizationResult::noMatch(). */
+    public const int W53_NO_BEST = 0xFFFFFF;
+
+    /**
+     * Batch replay of updateBestResult() as AbstractCategorizationPipe::handle() drives it. A new
+     * passable (best = noMatch()) starts whenever the group id differs from the previous row's;
+     * state bit 1 locks it to misc before the row; a row whose passable already stops (locked, or
+     * best confidence at least 0.95) is skipped. One word per row: `flags | best << 8 |
+     * crc32(matchedBy) << 32`, `best` being the row of the passable's current best result or
+     * W53_NO_BEST. Flags: 1 successful (rows not skipped), 2 replaced the best result, 4 stops
+     * after the row, 8 blocked by shouldOverride()'s protected misc guard, 16 protected misc
+     * result, 32 skipped, 64 first row of a passable. Passables, replacements, guard blocks,
+     * skips, passables that end stopped and the XXH64 digest of all earlier words follow.
+     *
+     * @param  list<int>  $categoryIds
+     * @param  list<float>  $confidences
+     * @param  list<string>  $matchedBy
+     * @param  list<int>  $groups
+     * @param  list<int>  $states
+     * @return list<int>
+     */
+    public static function planBestResultBatch(array $categoryIds, array $confidences, array $matchedBy, array $groups, array $states): array
+    {
+        return self::usesW53RustFfi()
+            ? self::planBestResultBatchNative($categoryIds, $confidences, $matchedBy, $groups, $states)
+            : self::planBestResultBatchPhp($categoryIds, $confidences, $matchedBy, $groups, $states);
+    }
+
+    /**
+     * @param  list<int>  $categoryIds
+     * @param  list<float>  $confidences
+     * @param  list<string>  $matchedBy
+     * @param  list<int>  $groups
+     * @param  list<int>  $states
+     * @return list<int>
+     */
+    public static function planBestResultBatchPhp(array $categoryIds, array $confidences, array $matchedBy, array $groups, array $states): array
+    {
+        [$categoryIds, $confidences, $groups, $states] = [array_values($categoryIds), array_values($confidences), array_values($groups), array_values($states)];
+        $out = [];
+        $passables = $replaced = $blocked = $skipped = $stopped = 0;
+        $previous = null;
+        $bestCategory = Category::OTHER_MISC;
+        $bestConfidence = 0.0;
+        $bestLabel = 'no_match';
+        $bestRow = self::W53_NO_BEST;
+        $locked = $stops = false;
+        foreach (array_values($matchedBy) as $i => $label) {
+            $category = $categoryIds[$i] ?? 0;
+            $confidence = (float) ($confidences[$i] ?? 0.0);
+            $group = $groups[$i] ?? 0;
+            $flags = ($category === Category::OTHER_HASHED || ($category === Category::OTHER_MISC && (str_starts_with($label, 'hash_') || str_starts_with($label, 'obfuscated_')
+                || str_starts_with($label, 'gibberish_') || $label === 'group_only_low_signal'))) ? 16 : 0;
+            if ($group !== $previous) {
+                $stopped += (int) ($previous !== null && $stops);
+                $previous = $group;
+                [$bestCategory, $bestConfidence, $bestLabel, $bestRow] = [Category::OTHER_MISC, 0.0, 'no_match', self::W53_NO_BEST];
+                $locked = false;
+                $passables++;
+                $flags |= 64;
+            }
+            $locked = $locked || (($states[$i] ?? 0) & 1) !== 0;
+            if ($locked || $bestConfidence >= 0.95) {
+                $flags |= 32;
+                $skipped++;
+            } elseif (! ($confidence <= 0) && ! ($category === Category::OTHER_MISC && $label === 'no_match')) {
+                $flags |= 1;
+                if ($category !== Category::OTHER_MISC && $category !== Category::OTHER_HASHED && $confidence < 0.6
+                    && ($bestCategory === Category::OTHER_HASHED || ($bestCategory === Category::OTHER_MISC && (str_starts_with($bestLabel, 'hash_') || str_starts_with($bestLabel, 'obfuscated_')
+                || str_starts_with($bestLabel, 'gibberish_') || $bestLabel === 'group_only_low_signal')))) {
+                    $flags |= 8;
+                    $blocked++;
+                } elseif ($confidence > $bestConfidence
+                    || ($confidence === $bestConfidence && $category !== Category::OTHER_MISC && $bestCategory === Category::OTHER_MISC)) {
+                    [$bestCategory, $bestConfidence, $bestLabel, $bestRow] = [$category, $confidence, $label, $i];
+                    $flags |= 2;
+                    $replaced++;
+                }
+            }
+            $stops = $locked || $bestConfidence >= 0.95;
+            $out[] = $flags | ($stops ? 4 : 0) | $bestRow << 8 | crc32($label) << 32;
+        }
+        $stopped += (int) ($previous !== null && $stops);
+        array_push($out, $passables, $replaced, $blocked, $skipped, $stopped);
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+        $out[] = $digest[1];
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, the lists differ in length or
+     * are not lists, or a label holds a NUL byte.
+     *
+     * @param  list<int>  $categoryIds
+     * @param  list<float>  $confidences
+     * @param  list<string>  $matchedBy
+     * @param  list<int>  $groups
+     * @param  list<int>  $states
+     * @return list<int>
+     */
+    public static function planBestResultBatchNative(array $categoryIds, array $confidences, array $matchedBy, array $groups, array $states): array
+    {
+        $count = \count($matchedBy);
+        $words = $count + 6;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w53RustFfiState('out', $words);
+        if ($state === null || \count($categoryIds) !== $count || \count($confidences) !== $count || \count($groups) !== $count || \count($states) !== $count
+            || ! array_is_list($matchedBy) || ! array_is_list($categoryIds) || ! array_is_list($confidences) || ! array_is_list($groups) || ! array_is_list($states)) {
+            return self::planBestResultBatchPhp($categoryIds, $confidences, $matchedBy, $groups, $states);
+        }
+        $labels = implode("\0", $matchedBy);
+        $ints = pack('P*', ...$categoryIds, ...$groups, ...$states);
+        $packed = pack('e*', ...$confidences);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W53_FFI_CDEF.)
+            $written = $ffi->nntmux_w532_passable_best_result_plan_batch($labels, \strlen($labels), $ints, \strlen($ints), $packed, \strlen($packed), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : self::planBestResultBatchPhp($categoryIds, $confidences, $matchedBy, $groups, $states);
     }
 }

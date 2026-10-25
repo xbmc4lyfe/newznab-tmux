@@ -10,6 +10,7 @@ use App\Services\Categorization\Categorizers\MovieCategorizer;
 use App\Services\Categorization\ReleaseContext;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 /**
@@ -397,5 +398,208 @@ class MoviePipe extends AbstractCategorizationPipe
         }
 
         return self::$w403RustFfiHandle === false ? null : self::$w403RustFfiHandle;
+    }
+
+    /** Wave 53.2 paired benchmarks decide this default; see RustCategorizationPipesAbstractBookPassableMiscMovieW53ParityTest. */
+    private const bool W53_RUST_FFI_DEFAULT = true;
+
+    private const string W53_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w532_movie_result_plan_batch(const char *labels, size_t labels_len, const char *categories, size_t categories_len, const char *confidences, size_t confidences_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * Wave 53 routing, binding and output buffer, kept in function-local statics. Operations:
+     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
+     * resolves the binding and 'out' returns `[binding, buffer, capacity]` with room for at
+     * least $val words (null without the library).
+     */
+    private static function w53RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w53', self::W53_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w53RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW53RustFfi(): bool
+    {
+        $enabled = self::w53RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W53_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with planMovieResultBatch() routed to Rust ($enabled) or PHP, then restores the
+     * previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW53RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w53RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w53RustFfiState('set', $previous);
+        }
+    }
+
+    /** Wave 53.2 sub-category histogram slots (0 out of domain, 11 other in-domain ids). */
+    private const array W53_SUBCATEGORIES = [
+        Category::MOVIE_FOREIGN => 1,
+        Category::MOVIE_OTHER => 2,
+        Category::MOVIE_SD => 3,
+        Category::MOVIE_HD => 4,
+        Category::MOVIE_UHD => 5,
+        Category::MOVIE_3D => 6,
+        Category::MOVIE_BLURAY => 7,
+        Category::MOVIE_DVD => 8,
+        Category::MOVIE_WEBDL => 9,
+        Category::MOVIE_X265 => 10,
+    ];
+
+    /** Wave 53.2 matched-by families in match order: prefix => [index, category the family assigns]. */
+    private const array W53_FAMILIES = [
+        'foreign_' => [1, Category::MOVIE_FOREIGN],
+        'uhd' => [2, Category::MOVIE_UHD],
+        'bluray' => [3, Category::MOVIE_BLURAY],
+        'dvd' => [4, Category::MOVIE_DVD],
+        'webdl' => [5, Category::MOVIE_WEBDL],
+        'hd' => [6, Category::MOVIE_HD],
+        'sd' => [7, Category::MOVIE_SD],
+        'cam' => [8, Category::MOVIE_OTHER],
+    ];
+
+    /**
+     * Batch result plan for Movie results, as evaluateResultPhp() grades them. One word per
+     * result: `mask | sub << 8 | family << 16 | crc32(matchedBy) << 32`. Mask: RESULT_SUCCESSFUL,
+     * RESULT_IN_DOMAIN and RESULT_TERMINAL, plus 8 when the matched-by family's category equals
+     * the result's. `sub` is the W53_SUBCATEGORIES slot (11 other in-domain ids, 0 out of
+     * domain); `family` the first W53_FAMILIES prefix of matchedBy (0 none). Successful,
+     * in-domain, terminal and agreeing counts, the first terminal row (-1 none), the 12-slot
+     * sub-category histogram and the XXH64 digest of all earlier words follow.
+     *
+     * @param  list<int>  $categoryIds
+     * @param  list<float>  $confidences
+     * @param  list<string>  $matchedBy
+     * @return list<int>
+     */
+    public static function planMovieResultBatch(array $categoryIds, array $confidences, array $matchedBy): array
+    {
+        return self::usesW53RustFfi()
+            ? self::planMovieResultBatchNative($categoryIds, $confidences, $matchedBy)
+            : self::planMovieResultBatchPhp($categoryIds, $confidences, $matchedBy);
+    }
+
+    /**
+     * @param  list<int>  $categoryIds
+     * @param  list<float>  $confidences
+     * @param  list<string>  $matchedBy
+     * @return list<int>
+     */
+    public static function planMovieResultBatchPhp(array $categoryIds, array $confidences, array $matchedBy): array
+    {
+        [$categoryIds, $confidences] = [array_values($categoryIds), array_values($confidences)];
+        $out = [];
+        $ok = $domain = $terminal = $agree = 0;
+        $firstTerminal = -1;
+        $histogram = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        foreach (array_values($matchedBy) as $i => $label) {
+            $category = $categoryIds[$i] ?? 0;
+            $confidence = (float) ($confidences[$i] ?? 0.0);
+            $success = ! ($confidence <= 0) && ! ($category === Category::OTHER_MISC && $label === 'no_match');
+            $inDomain = $category >= Category::MOVIE_ROOT && $category <= Category::MOVIE_ROOT + 999;
+            $stop = $confidence >= 0.95;
+            $sub = self::W53_SUBCATEGORIES[$category] ?? ($inDomain ? 11 : 0);
+            $family = 0;
+            $matches = false;
+            foreach (self::W53_FAMILIES as $prefix => [$index, $familyCategory]) {
+                if (str_starts_with($label, $prefix)) {
+                    $family = $index;
+                    $matches = $familyCategory === $category;
+                    break;
+                }
+            }
+            $ok += (int) $success;
+            $domain += (int) $inDomain;
+            $terminal += (int) $stop;
+            $agree += (int) $matches;
+            if ($stop && $firstTerminal < 0) {
+                $firstTerminal = $i;
+            }
+            $histogram[$sub]++;
+            $out[] = ($success ? self::RESULT_SUCCESSFUL : 0) | ($inDomain ? self::RESULT_IN_DOMAIN : 0) | ($stop ? self::RESULT_TERMINAL : 0) | ($matches ? 8 : 0)
+                | $sub << 8 | $family << 16 | crc32($label) << 32;
+        }
+        array_push($out, $ok, $domain, $terminal, $agree, $firstTerminal, ...$histogram);
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+        $out[] = $digest[1];
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, the lists differ in length or
+     * are not lists, or a label holds a NUL byte.
+     *
+     * @param  list<int>  $categoryIds
+     * @param  list<float>  $confidences
+     * @param  list<string>  $matchedBy
+     * @return list<int>
+     */
+    public static function planMovieResultBatchNative(array $categoryIds, array $confidences, array $matchedBy): array
+    {
+        $count = \count($matchedBy);
+        $words = $count + 18;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w53RustFfiState('out', $words);
+        if ($state === null || \count($categoryIds) !== $count || \count($confidences) !== $count
+            || ! array_is_list($matchedBy) || ! array_is_list($categoryIds) || ! array_is_list($confidences)) {
+            return self::planMovieResultBatchPhp($categoryIds, $confidences, $matchedBy);
+        }
+        $labels = implode("\0", $matchedBy);
+        $categories = pack('P*', ...$categoryIds);
+        $packed = pack('e*', ...$confidences);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W53_FFI_CDEF.)
+            $written = $ffi->nntmux_w532_movie_result_plan_batch($labels, \strlen($labels), $categories, \strlen($categories), $packed, \strlen($packed), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : self::planMovieResultBatchPhp($categoryIds, $confidences, $matchedBy);
     }
 }

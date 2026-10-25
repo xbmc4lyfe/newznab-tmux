@@ -39765,3 +39765,959 @@ pub mod wave52_2_binaries_collection_header_missed_part {
         }
     }
 }
+
+pub mod wave53_2_categorization_pipes_abstract_book_passable_misc_movie {
+    //! Wave 53.2 batch kernels for AbstractCategorizationPipe, BookPipe, CategorizationPassable,
+    //! MiscSafetyNetPipe and MoviePipe, in the Wave 49.2 framing: NUL-joined label columns
+    //! (exactly `count` entries), little-endian `i64` tables (whole columns back to back),
+    //! little-endian `f64` confidence columns, one `i64` word per item, a few summary words and
+    //! one XXH64 digest of the preceding words. Each export returns the word count, `-needed`
+    //! when `out_cap` (in words) is short, or -1 for a null output, a malformed batch, an output
+    //! overlapping an input or a panic.
+
+    use super::wave49_verification_admission_inventory_prep_repo_sample::{
+        FoldState, column, crc32, emit, ints, span,
+    };
+    use std::collections::HashSet;
+
+    /// `Category::OTHER_MISC` and `Category::OTHER_HASHED`.
+    const OTHER_MISC: i64 = 10;
+    const OTHER_HASHED: i64 = 20;
+    const NO_MATCH: &[u8] = b"no_match";
+    const LOW_SIGNAL: &[u8] = b"group_only_low_signal";
+    const STOP: f64 = 0.95;
+
+    /// No current best result (CategorizationResult::noMatch()) in a best-index field.
+    pub const NO_BEST: i64 = 0xFF_FFFF;
+
+    /// BookPipe sub-categories in histogram order, then matched-by families and the category
+    /// each family's categorizer assigns.
+    pub const BOOK_SUBCATEGORIES: &[i64] = &[7010, 7020, 7030, 7040, 7060, 7999];
+    pub const BOOK_FAMILIES: &[(&[u8], i64)] = &[
+        (b"comic_", 7030),
+        (b"manga", 7030),
+        (b"technical_", 7040),
+        (b"magazine_", 7010),
+        (b"ebook_", 7020),
+    ];
+    pub const MOVIE_SUBCATEGORIES: &[i64] =
+        &[2010, 2999, 2030, 2040, 2045, 2050, 2060, 2070, 2080, 2090];
+    pub const MOVIE_FAMILIES: &[(&[u8], i64)] = &[
+        (b"foreign_", 2010),
+        (b"uhd", 2045),
+        (b"bluray", 2060),
+        (b"dvd", 2070),
+        (b"webdl", 2080),
+        (b"hd", 2040),
+        (b"sd", 2030),
+        (b"cam", 2999),
+    ];
+
+    /// `flags | mid << 8 | crc << 32`.
+    #[inline]
+    fn tagged(flags: i64, mid: i64, crc: u32) -> i64 {
+        flags | mid << 8 | i64::from(crc) << 32
+    }
+
+    /// Exactly `count` little-endian doubles.
+    fn floats(bytes: &[u8], count: usize) -> Option<Vec<f64>> {
+        if bytes.len() != count.checked_mul(8)? {
+            return None;
+        }
+        Some(
+            bytes
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| f64::from_le_bytes(*c))
+                .collect(),
+        )
+    }
+
+    /// Exactly `columns` integer columns of `count` values each.
+    fn int_columns(bytes: &[u8], count: usize, columns: usize) -> Option<Vec<i64>> {
+        ints(bytes, count.checked_mul(columns)?)
+    }
+
+    /// `CategorizationResult::isSuccessfulPhp()`; NaN is never `<= 0`, so it succeeds.
+    #[inline]
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
+    fn successful(category: i64, confidence: f64, label: &[u8]) -> bool {
+        !(confidence <= 0.0) && !(category == OTHER_MISC && label == NO_MATCH)
+    }
+
+    /// `CategorizationResult::isProtectedMiscResultPhp()`.
+    #[inline]
+    fn protected(category: i64, label: &[u8]) -> bool {
+        category == OTHER_HASHED
+            || (category == OTHER_MISC
+                && (label.starts_with(b"hash_")
+                    || label.starts_with(b"obfuscated_")
+                    || label.starts_with(b"gibberish_")
+                    || label == LOW_SIGNAL))
+    }
+
+    /// 0 none, 1 low, 2 medium, 3 high, 4 stop, 5 NaN.
+    #[inline]
+    fn band(confidence: f64) -> i64 {
+        if confidence >= STOP {
+            4
+        } else if confidence >= 0.8 {
+            3
+        } else if confidence >= 0.5 {
+            2
+        } else if confidence > 0.0 {
+            1
+        } else if confidence <= 0.0 {
+            0
+        } else {
+            5
+        }
+    }
+
+    // ---- AbstractCategorizationPipe ----------------------------------------------------------
+
+    /// One word per pipe visit (`flags | band << 8 | crc32(matchedBy) << 32`), then skips,
+    /// successful results, protected misc results and the six band counts (none, low, medium,
+    /// high, stop, NaN). Flags: 1 evaluateSkipGuard() bypasses the pipe (state bit 1 locked to
+    /// misc, the confidence at least 0.95 or state bit 2 pipe skip), 2 successful result, 4 the
+    /// no-match sentinel, 8 protected misc result, 16 empty label.
+    pub fn pipe_guard_plan(
+        categories: &[i64],
+        confidences: &[f64],
+        labels: &[&[u8]],
+        states: &[i64],
+    ) -> Vec<i64> {
+        let n = labels.len();
+        let mut out = Vec::with_capacity(n + 9);
+        let (mut skips, mut ok, mut guarded) = (0i64, 0i64, 0i64);
+        let mut bands = [0i64; 6];
+        for (i, &label) in labels.iter().enumerate() {
+            let (category, confidence, state) = (categories[i], confidences[i], states[i]);
+            let skip = state & 1 != 0 || confidence >= STOP || state & 2 != 0;
+            let success = successful(category, confidence, label);
+            let shield = protected(category, label);
+            let b = band(confidence);
+            let flags = i64::from(skip)
+                | i64::from(success) << 1
+                | i64::from(category == OTHER_MISC && label == NO_MATCH) << 2
+                | i64::from(shield) << 3
+                | i64::from(label.is_empty()) << 4;
+            skips += i64::from(skip);
+            ok += i64::from(success);
+            guarded += i64::from(shield);
+            bands[b as usize] += 1;
+            out.push(tagged(flags, b, crc32(label)));
+        }
+        out.extend([skips, ok, guarded]);
+        out.extend(bands);
+        out
+    }
+
+    // ---- BookPipe / MoviePipe ----------------------------------------------------------------
+
+    /// One word per result (`mask | sub << 8 | family << 16 | crc32(matchedBy) << 32`), then
+    /// successful, in-domain, terminal and agreeing counts, the first terminal row (-1 none) and
+    /// the sub-category histogram (out of domain, each of `subcategories`, other in-domain).
+    /// Mask: the pipe's evaluateResultPhp() bits (1 successful, 2 in `root..=root + 999`,
+    /// 4 confidence at least 0.95), plus 8 when the family's category equals the result's.
+    /// `sub` is 1 + the position in `subcategories`, `len + 1` for other in-domain ids, else 0;
+    /// `family` is 1 + the first prefix in `families` that starts matchedBy, else 0.
+    pub fn result_plan(
+        categories: &[i64],
+        confidences: &[f64],
+        labels: &[&[u8]],
+        root: i64,
+        subcategories: &[i64],
+        families: &[(&[u8], i64)],
+    ) -> Vec<i64> {
+        let n = labels.len();
+        let slots = subcategories.len() + 2;
+        let mut out = Vec::with_capacity(n + 5 + slots);
+        let (mut ok, mut domain, mut terminal, mut agree) = (0i64, 0i64, 0i64, 0i64);
+        let mut first_terminal = -1i64;
+        let mut histogram = vec![0i64; slots];
+        for (i, &label) in labels.iter().enumerate() {
+            let (category, confidence) = (categories[i], confidences[i]);
+            let success = successful(category, confidence, label);
+            let in_domain = category >= root && category <= root + 999;
+            let stop = confidence >= STOP;
+            let sub = match subcategories.iter().position(|&c| c == category) {
+                Some(p) => p + 1,
+                None if in_domain => subcategories.len() + 1,
+                None => 0,
+            };
+            let (family, matches) = families
+                .iter()
+                .position(|(prefix, _)| label.starts_with(prefix))
+                .map_or((0, false), |p| (p + 1, families[p].1 == category));
+            let mask = i64::from(success)
+                | i64::from(in_domain) << 1
+                | i64::from(stop) << 2
+                | i64::from(matches) << 3;
+            ok += i64::from(success);
+            domain += i64::from(in_domain);
+            terminal += i64::from(stop);
+            agree += i64::from(matches);
+            if stop && first_terminal < 0 {
+                first_terminal = i as i64;
+            }
+            histogram[sub] += 1;
+            out.push(tagged(
+                mask | (family as i64) << 16,
+                sub as i64,
+                crc32(label),
+            ));
+        }
+        out.extend([ok, domain, terminal, agree, first_terminal]);
+        out.extend(histogram);
+        out
+    }
+
+    // ---- CategorizationPassable --------------------------------------------------------------
+
+    /// Replays updateBestResult() as AbstractCategorizationPipe::handle() drives it: a new
+    /// passable (best = noMatch()) starts whenever the group id differs from the previous row's,
+    /// state bit 1 locks it to misc before the row, and a row whose passable already stops
+    /// (locked, or best confidence at least 0.95) is skipped. One word per row
+    /// (`flags | best << 8 | crc32(matchedBy) << 32`, `best` being the row of the passable's
+    /// current best result or NO_BEST), then passables, replacements, protected-guard blocks,
+    /// skips and passables that end stopped. Flags: 1 successful (rows not skipped), 2 replaced
+    /// the best result, 4 stops after the row, 8 blocked by shouldOverride()'s protected misc
+    /// guard, 16 protected misc result, 32 skipped, 64 first row of a passable.
+    pub fn best_result_plan(
+        categories: &[i64],
+        confidences: &[f64],
+        labels: &[&[u8]],
+        groups: &[i64],
+        states: &[i64],
+    ) -> Vec<i64> {
+        let n = labels.len();
+        let mut out = Vec::with_capacity(n + 6);
+        let (mut passables, mut replaced, mut blocked, mut skipped, mut stopped) =
+            (0i64, 0i64, 0i64, 0i64, 0i64);
+        let mut previous: Option<i64> = None;
+        let mut best: (i64, f64, &[u8], i64) = (OTHER_MISC, 0.0, NO_MATCH, NO_BEST);
+        let mut locked = false;
+        let mut stops = false;
+        for (i, &label) in labels.iter().enumerate() {
+            let (category, confidence, group) = (categories[i], confidences[i], groups[i]);
+            let mut flags = i64::from(protected(category, label)) << 4;
+            if previous != Some(group) {
+                stopped += i64::from(previous.is_some() && stops);
+                previous = Some(group);
+                best = (OTHER_MISC, 0.0, NO_MATCH, NO_BEST);
+                locked = false;
+                passables += 1;
+                flags |= 64;
+            }
+            locked |= states[i] & 1 != 0;
+            if locked || best.1 >= STOP {
+                flags |= 32;
+                skipped += 1;
+            } else if successful(category, confidence, label) {
+                flags |= 1;
+                if category != OTHER_MISC
+                    && category != OTHER_HASHED
+                    && protected(best.0, best.2)
+                    && confidence < 0.6
+                {
+                    flags |= 8;
+                    blocked += 1;
+                } else if confidence > best.1
+                    || (confidence == best.1 && category != OTHER_MISC && best.0 == OTHER_MISC)
+                {
+                    best = (category, confidence, label, i as i64);
+                    flags |= 2;
+                    replaced += 1;
+                }
+            }
+            stops = locked || best.1 >= STOP;
+            flags |= i64::from(stops) << 2;
+            out.push(tagged(flags, best.3, crc32(label)));
+        }
+        stopped += i64::from(previous.is_some() && stops);
+        out.extend([passables, replaced, blocked, skipped, stopped]);
+        out
+    }
+
+    // ---- MiscSafetyNetPipe -------------------------------------------------------------------
+
+    /// Matched-by family: 5 the no-match label, 1 `group_name_`, 2 `hash`, 3 `gibberish_`
+    /// prefixes, 4 holds `fallback`, else 0.
+    #[inline]
+    fn misc_family(label: &[u8]) -> i64 {
+        if label == NO_MATCH {
+            5
+        } else if label.starts_with(b"group_name_") {
+            1
+        } else if label.starts_with(b"hash") {
+            2
+        } else if label.starts_with(b"gibberish_") {
+            3
+        } else if label.windows(8).any(|w| w == b"fallback") {
+            4
+        } else {
+            0
+        }
+    }
+
+    /// One word per passable (`flags | family << 8 | crc32(final matchedBy) << 32`), then
+    /// downgrades, passables locked afterwards, protected final results, distinct downgraded
+    /// labels and the six family counts. shouldDowngradeToMiscPhp() holds when state bit 1
+    /// (locked to misc) is clear, state bit 2 (miscAnalysis lowSignal) is set and matchedBy
+    /// starts with `group_name_`; a downgrade becomes (OTHER_MISC, `group_only_low_signal`) and
+    /// locks. Flags: 1 downgrade, 2 locked before, 4 low signal, 8 protected final result,
+    /// 16 locked after, 32 empty matchedBy. `family` classifies the incoming matchedBy.
+    pub fn safety_net_plan(categories: &[i64], labels: &[&[u8]], states: &[i64]) -> Vec<i64> {
+        let n = labels.len();
+        let mut out = Vec::with_capacity(n + 11);
+        let mut seen: HashSet<&[u8], FoldState> =
+            HashSet::with_capacity_and_hasher(n, FoldState::default());
+        let (mut downgrades, mut locked_after, mut shielded) = (0i64, 0i64, 0i64);
+        let mut families = [0i64; 6];
+        for (i, &label) in labels.iter().enumerate() {
+            let state = states[i];
+            let locked = state & 1 != 0;
+            let low = state & 2 != 0;
+            let family = misc_family(label);
+            let downgrade = !locked && low && family == 1;
+            let (category, final_label) = if downgrade {
+                seen.insert(label);
+                (OTHER_MISC, LOW_SIGNAL)
+            } else {
+                (categories[i], label)
+            };
+            let shield = protected(category, final_label);
+            let after = locked || downgrade;
+            let flags = i64::from(downgrade)
+                | i64::from(locked) << 1
+                | i64::from(low) << 2
+                | i64::from(shield) << 3
+                | i64::from(after) << 4
+                | i64::from(label.is_empty()) << 5;
+            downgrades += i64::from(downgrade);
+            locked_after += i64::from(after);
+            shielded += i64::from(shield);
+            families[family as usize] += 1;
+            out.push(tagged(flags, family, crc32(final_label)));
+        }
+        out.extend([downgrades, locked_after, shielded, seen.len() as i64]);
+        out.extend(families);
+        out
+    }
+
+    // ---- exports -----------------------------------------------------------------------------
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    /// `ints` holds the category ids and state bits as two whole columns; `confidences` the
+    /// little-endian doubles.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w532_pipe_guard_plan_batch(
+        labels: *const u8,
+        labels_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        confidences: *const u8,
+        confidences_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [
+            (labels, labels_len),
+            (ints, ints_len),
+            (confidences, confidences_len),
+        ];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let labels = column(span(labels, labels_len)?, count)?;
+                let table = int_columns(span(ints, ints_len)?, count, 2)?;
+                let confidences = floats(span(confidences, confidences_len)?, count)?;
+                let (categories, states) = table.split_at(count);
+                Some(pipe_guard_plan(categories, &confidences, &labels, states))
+            })
+        }
+    }
+
+    /// Shared body of the Book and Movie exports.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn result_export(
+        labels: *const u8,
+        labels_len: usize,
+        categories: *const u8,
+        categories_len: usize,
+        confidences: *const u8,
+        confidences_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+        root: i64,
+        subcategories: &[i64],
+        families: &[(&[u8], i64)],
+    ) -> isize {
+        let inputs = [
+            (labels, labels_len),
+            (categories, categories_len),
+            (confidences, confidences_len),
+        ];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let labels = column(span(labels, labels_len)?, count)?;
+                let categories = ints(span(categories, categories_len)?, count)?;
+                let confidences = floats(span(confidences, confidences_len)?, count)?;
+                Some(result_plan(
+                    &categories,
+                    &confidences,
+                    &labels,
+                    root,
+                    subcategories,
+                    families,
+                ))
+            })
+        }
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w532_book_result_plan_batch(
+        labels: *const u8,
+        labels_len: usize,
+        categories: *const u8,
+        categories_len: usize,
+        confidences: *const u8,
+        confidences_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            result_export(
+                labels,
+                labels_len,
+                categories,
+                categories_len,
+                confidences,
+                confidences_len,
+                count,
+                out,
+                out_cap,
+                7000,
+                BOOK_SUBCATEGORIES,
+                BOOK_FAMILIES,
+            )
+        }
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w532_movie_result_plan_batch(
+        labels: *const u8,
+        labels_len: usize,
+        categories: *const u8,
+        categories_len: usize,
+        confidences: *const u8,
+        confidences_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            result_export(
+                labels,
+                labels_len,
+                categories,
+                categories_len,
+                confidences,
+                confidences_len,
+                count,
+                out,
+                out_cap,
+                2000,
+                MOVIE_SUBCATEGORIES,
+                MOVIE_FAMILIES,
+            )
+        }
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    /// `ints` holds the category ids, group ids and state bits as three whole columns.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w532_passable_best_result_plan_batch(
+        labels: *const u8,
+        labels_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        confidences: *const u8,
+        confidences_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [
+            (labels, labels_len),
+            (ints, ints_len),
+            (confidences, confidences_len),
+        ];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let labels = column(span(labels, labels_len)?, count)?;
+                let table = int_columns(span(ints, ints_len)?, count, 3)?;
+                let confidences = floats(span(confidences, confidences_len)?, count)?;
+                let (categories, rest) = table.split_at(count);
+                let (groups, states) = rest.split_at(count);
+                Some(best_result_plan(
+                    categories,
+                    &confidences,
+                    &labels,
+                    groups,
+                    states,
+                ))
+            })
+        }
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    /// `ints` holds the category ids and state bits as two whole columns.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w532_misc_safety_net_plan_batch(
+        labels: *const u8,
+        labels_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(labels, labels_len), (ints, ints_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let labels = column(span(labels, labels_len)?, count)?;
+                let table = int_columns(span(ints, ints_len)?, count, 2)?;
+                let (categories, states) = table.split_at(count);
+                Some(safety_net_plan(categories, &labels, states))
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod w532_tests {
+        use super::super::wave49_verification_admission_inventory_prep_repo_sample::{
+            MAX_ITEMS, digest,
+        };
+        use super::*;
+
+        fn p(values: &[i64]) -> Vec<u8> {
+            values.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+
+        fn e(values: &[f64]) -> Vec<u8> {
+            values.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+
+        fn run(call: impl Fn(*mut i64, usize) -> isize) -> Vec<i64> {
+            let mut out = vec![0i64; 256];
+            let n = call(out.as_mut_ptr(), out.len());
+            assert!(n > 0, "export returned {n}");
+            out.truncate(n as usize);
+            let (body, last) = out.split_at(out.len() - 1);
+            assert_eq!(last[0], digest(body));
+            out.pop();
+            out
+        }
+
+        #[test]
+        fn w532_pipe_guard_plan_follows_documented_words() {
+            let w = pipe_guard_plan(
+                &[10, 2040, 10, 20, 7020, 10],
+                &[0.0, 0.97, 0.9, 0.55, f64::NAN, 0.3],
+                &[
+                    b"no_match",
+                    b"hd",
+                    b"hash_md5",
+                    b"",
+                    b"ebook_format",
+                    b"group_only_low_signal",
+                ],
+                &[0, 0, 1, 2, 0, 0],
+            );
+            assert_eq!(w[0], 4 | i64::from(crc32(b"no_match")) << 32);
+            assert_eq!(w[1], 1 | 2 | 4 << 8 | i64::from(crc32(b"hd")) << 32);
+            assert_eq!(w[2] & 0xFFFF_FFFF, 1 | 2 | 8 | 3 << 8);
+            assert_eq!(w[3], 1 | 2 | 8 | 16 | 2 << 8);
+            // NaN is never <= 0, so it counts as successful.
+            assert_eq!(w[4] & 0xFFFF_FFFF, 2 | 5 << 8);
+            assert_eq!(w[5] & 0xFFFF_FFFF, 2 | 8 | 1 << 8);
+            assert_eq!(&w[6..], &[3, 5, 3, 1, 1, 1, 1, 1, 1]);
+            assert_eq!(band(-0.0), 0);
+            assert_eq!(band(f64::INFINITY), 4);
+            assert_eq!(band(f64::NEG_INFINITY), 0);
+        }
+
+        #[test]
+        fn w532_result_plans_follow_documented_words() {
+            let labels: [&[u8]; 6] = [
+                b"comic_format",
+                b"manga",
+                b"ebook_pdf_format",
+                b"no_match",
+                b"technical_subject",
+                b"x",
+            ];
+            let w = result_plan(
+                &[7030, 7020, 7020, 10, 7500, 7999],
+                &[0.9, 0.85, 0.96, 0.0, 0.97, -1.0],
+                &labels,
+                7000,
+                BOOK_SUBCATEGORIES,
+                BOOK_FAMILIES,
+            );
+            assert_eq!(
+                w[0],
+                1 | 2 | 8 | 3 << 8 | 1 << 16 | i64::from(crc32(b"comic_format")) << 32
+            );
+            assert_eq!(w[1] & 0xFFFF_FFFF, 1 | 2 | 2 << 8 | 2 << 16);
+            assert_eq!(w[2] & 0xFFFF_FFFF, 1 | 2 | 4 | 8 | 2 << 8 | 5 << 16);
+            assert_eq!(w[3] & 0xFFFF_FFFF, 0);
+            assert_eq!(w[4] & 0xFFFF_FFFF, 1 | 2 | 4 | 7 << 8 | 3 << 16);
+            assert_eq!(w[5] & 0xFFFF_FFFF, 2 | 6 << 8);
+            assert_eq!(&w[6..11], &[4, 5, 2, 2, 2]);
+            assert_eq!(&w[11..], &[1, 0, 2, 1, 0, 0, 1, 1]);
+            // `hd` is found before `hd_webdl_fallback`'s own family would be.
+            let w = result_plan(
+                &[2040, 2045, 2000, i64::MAX, i64::MIN],
+                &[0.8, 0.95, 0.5, 1.0, 0.1],
+                &[b"hd_webdl_fallback", b"uhd", b"sd", b"cam", b""],
+                2000,
+                MOVIE_SUBCATEGORIES,
+                MOVIE_FAMILIES,
+            );
+            assert_eq!(w[0] & 0xFFFF_FFFF, 1 | 2 | 8 | 4 << 8 | 6 << 16);
+            assert_eq!(w[1] & 0xFFFF_FFFF, 1 | 2 | 4 | 8 | 5 << 8 | 2 << 16);
+            assert_eq!(w[2] & 0xFFFF_FFFF, 1 | 2 | 11 << 8 | 7 << 16);
+            assert_eq!(w[3] & 0xFFFF_FFFF, 1 | 4 | 8 << 16);
+            assert_eq!(w[4] & 0xFFFF_FFFF, 1);
+            assert_eq!(&w[5..10], &[5, 3, 2, 2, 1]);
+            assert_eq!(w.len(), 5 + 5 + 12);
+        }
+
+        #[test]
+        fn w532_best_result_plan_replays_update_best_result() {
+            let labels: [&[u8]; 8] = [
+                b"hash_md5",
+                b"hd",
+                b"hd",
+                b"uhd",
+                b"no_match",
+                b"x",
+                b"y",
+                b"z",
+            ];
+            let w = best_result_plan(
+                &[10, 2040, 2040, 2045, 10, 2030, 10, 2030],
+                &[0.7, 0.5, 0.7, 0.96, 0.99, 0.5, 0.5, 0.5],
+                &labels,
+                &[1, 1, 1, 1, 1, 2, 2, 3],
+                &[0, 0, 0, 0, 0, 0, 0, 1],
+            );
+            let low = |w: i64| w & 0xFFFF_FFFF;
+            assert_eq!(low(w[0]), 1 | 2 | 16 | 64);
+            // A weak non-misc result cannot displace a protected misc best.
+            assert_eq!(low(w[1]), 1 | 8);
+            assert_eq!(low(w[2]), 1 | 2 | 2 << 8);
+            assert_eq!(low(w[3]), 1 | 2 | 4 | 3 << 8);
+            assert_eq!(low(w[4]), 32 | 4 | 3 << 8);
+            assert_eq!(low(w[5]), 1 | 2 | 64 | 5 << 8);
+            // Equal confidence: a misc result never displaces a non-misc best.
+            assert_eq!(low(w[6]), 1 | 5 << 8);
+            assert_eq!(low(w[7]), 64 | 32 | 4 | NO_BEST << 8);
+            assert_eq!(&w[8..], &[3, 4, 1, 2, 2]);
+            // Equal confidence with a misc best lets the non-misc result in.
+            let w = best_result_plan(&[10, 2030], &[0.5, 0.5], &[b"a", b"b"], &[0, 0], &[0, 0]);
+            assert_eq!(w[1] & 0xFF, 1 | 2);
+        }
+
+        #[test]
+        fn w532_safety_net_plan_follows_documented_words() {
+            let w = safety_net_plan(
+                &[5010, 5010, 5010, 20, 10, 10, 3000],
+                &[
+                    b"group_name_tv",
+                    b"group_name_tv",
+                    b"group_name_tv",
+                    b"hash_md5",
+                    b"no_match",
+                    b"music_fallback",
+                    b"",
+                ],
+                &[2, 3, 0, 2, 2, 2, 1],
+            );
+            assert_eq!(
+                w[0],
+                1 | 4 | 8 | 16 | 1 << 8 | i64::from(crc32(LOW_SIGNAL)) << 32
+            );
+            assert_eq!(
+                w[1],
+                2 | 4 | 16 | 1 << 8 | i64::from(crc32(b"group_name_tv")) << 32
+            );
+            assert_eq!(w[2] & 0xFFFF_FFFF, 1 << 8);
+            assert_eq!(w[3] & 0xFFFF_FFFF, 4 | 8 | 2 << 8);
+            assert_eq!(w[4] & 0xFFFF_FFFF, 4 | 5 << 8);
+            assert_eq!(w[5] & 0xFFFF_FFFF, 4 | 4 << 8);
+            assert_eq!(w[6], 2 | 16 | 32);
+            assert_eq!(&w[7..], &[1, 3, 2, 1, 1, 3, 1, 0, 1, 1]);
+        }
+
+        #[test]
+        fn w532_exports_frame_and_guard_batches() {
+            let labels = b"a\0no_match";
+            let ints = p(&[2040, 10, 0, 1]);
+            let confs = e(&[0.9, 0.0]);
+            let w = run(|o, c| unsafe {
+                nntmux_w532_pipe_guard_plan_batch(
+                    labels.as_ptr(),
+                    labels.len(),
+                    ints.as_ptr(),
+                    ints.len(),
+                    confs.as_ptr(),
+                    confs.len(),
+                    2,
+                    o,
+                    c,
+                )
+            });
+            assert_eq!(
+                w,
+                pipe_guard_plan(&[2040, 10], &[0.9, 0.0], &[b"a", b"no_match"], &[0, 1])
+            );
+            let cats = p(&[7020, 2040]);
+            let w = run(|o, c| unsafe {
+                nntmux_w532_book_result_plan_batch(
+                    labels.as_ptr(),
+                    labels.len(),
+                    cats.as_ptr(),
+                    cats.len(),
+                    confs.as_ptr(),
+                    confs.len(),
+                    2,
+                    o,
+                    c,
+                )
+            });
+            let names: [&[u8]; 2] = [b"a", b"no_match"];
+            assert_eq!(
+                w,
+                result_plan(
+                    &[7020, 2040],
+                    &[0.9, 0.0],
+                    &names,
+                    7000,
+                    BOOK_SUBCATEGORIES,
+                    BOOK_FAMILIES
+                )
+            );
+            let w = run(|o, c| unsafe {
+                nntmux_w532_movie_result_plan_batch(
+                    labels.as_ptr(),
+                    labels.len(),
+                    cats.as_ptr(),
+                    cats.len(),
+                    confs.as_ptr(),
+                    confs.len(),
+                    2,
+                    o,
+                    c,
+                )
+            });
+            assert_eq!(
+                w,
+                result_plan(
+                    &[7020, 2040],
+                    &[0.9, 0.0],
+                    &names,
+                    2000,
+                    MOVIE_SUBCATEGORIES,
+                    MOVIE_FAMILIES
+                )
+            );
+            let table = p(&[2040, 10, 1, 1, 0, 0]);
+            let w = run(|o, c| unsafe {
+                nntmux_w532_passable_best_result_plan_batch(
+                    labels.as_ptr(),
+                    labels.len(),
+                    table.as_ptr(),
+                    table.len(),
+                    confs.as_ptr(),
+                    confs.len(),
+                    2,
+                    o,
+                    c,
+                )
+            });
+            assert_eq!(
+                w,
+                best_result_plan(&[2040, 10], &[0.9, 0.0], &names, &[1, 1], &[0, 0])
+            );
+            let w = run(|o, c| unsafe {
+                nntmux_w532_misc_safety_net_plan_batch(
+                    labels.as_ptr(),
+                    labels.len(),
+                    ints.as_ptr(),
+                    ints.len(),
+                    2,
+                    o,
+                    c,
+                )
+            });
+            assert_eq!(w, safety_net_plan(&[2040, 10], &names, &[0, 1]));
+
+            let mut out = [7i64; 32];
+            let o = out.as_mut_ptr();
+            let null = std::ptr::null::<u8>();
+            unsafe {
+                // Empty batches may pass null inputs; the word count is summary plus digest.
+                assert_eq!(
+                    nntmux_w532_pipe_guard_plan_batch(null, 0, null, 0, null, 0, 0, o, 32),
+                    10
+                );
+                assert_eq!(
+                    nntmux_w532_book_result_plan_batch(null, 0, null, 0, null, 0, 0, o, 32),
+                    14
+                );
+                assert_eq!(
+                    nntmux_w532_movie_result_plan_batch(null, 0, null, 0, null, 0, 0, o, 32),
+                    18
+                );
+                assert_eq!(
+                    nntmux_w532_passable_best_result_plan_batch(
+                        null, 0, null, 0, null, 0, 0, o, 32
+                    ),
+                    6
+                );
+                assert_eq!(
+                    nntmux_w532_misc_safety_net_plan_batch(null, 0, null, 0, 0, o, 32),
+                    11
+                );
+                // Null output, short capacity, ragged tables, null non-empty inputs, NUL-bearing
+                // labels and oversized counts are refused without writing.
+                out = [7; 32];
+                let o = out.as_mut_ptr();
+                let one = p(&[1, 0]);
+                let conf = e(&[0.5]);
+                let guard = |l: &[u8], i: &[u8], c: &[u8], n: usize, o: *mut i64, cap: usize| {
+                    nntmux_w532_pipe_guard_plan_batch(
+                        l.as_ptr(),
+                        l.len(),
+                        i.as_ptr(),
+                        i.len(),
+                        c.as_ptr(),
+                        c.len(),
+                        n,
+                        o,
+                        cap,
+                    )
+                };
+                assert_eq!(guard(b"a", &one, &conf, 1, std::ptr::null_mut(), 32), -1);
+                assert_eq!(guard(b"a", &one, &conf, 1, o, 9), -11);
+                assert_eq!(guard(b"a\0b", &one, &conf, 1, o, 32), -1);
+                assert_eq!(guard(b"a", &one[..8], &conf, 1, o, 32), -1);
+                assert_eq!(guard(b"a", &one, &conf[..4], 1, o, 32), -1);
+                assert_eq!(guard(b"a", &one, &conf, 2, o, 32), -1);
+                assert_eq!(
+                    nntmux_w532_pipe_guard_plan_batch(
+                        b"a".as_ptr(),
+                        1,
+                        null,
+                        16,
+                        conf.as_ptr(),
+                        8,
+                        1,
+                        o,
+                        32
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w532_book_result_plan_batch(
+                        b"a".as_ptr(),
+                        1,
+                        one.as_ptr(),
+                        16,
+                        conf.as_ptr(),
+                        8,
+                        1,
+                        o,
+                        32
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w532_movie_result_plan_batch(
+                        b"a".as_ptr(),
+                        1,
+                        one.as_ptr(),
+                        8,
+                        null,
+                        8,
+                        1,
+                        o,
+                        32
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w532_passable_best_result_plan_batch(
+                        b"a".as_ptr(),
+                        1,
+                        one.as_ptr(),
+                        16,
+                        conf.as_ptr(),
+                        8,
+                        1,
+                        o,
+                        32
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w532_misc_safety_net_plan_batch(
+                        b"a".as_ptr(),
+                        1,
+                        one.as_ptr(),
+                        16,
+                        MAX_ITEMS + 1,
+                        o,
+                        32
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w532_misc_safety_net_plan_batch(null, 1, one.as_ptr(), 16, 1, o, 32),
+                    -1
+                );
+                assert_eq!(out, [7; 32]);
+                // An output overlapping an input is refused.
+                let mut shared = [0i64; 32];
+                shared[0] = i64::from_le_bytes(*b"group_na");
+                let table = p(&[1, 2]);
+                assert_eq!(
+                    nntmux_w532_misc_safety_net_plan_batch(
+                        shared.as_ptr() as *const u8,
+                        8,
+                        table.as_ptr(),
+                        16,
+                        1,
+                        shared.as_mut_ptr(),
+                        32
+                    ),
+                    -1
+                );
+            }
+        }
+    }
+}
