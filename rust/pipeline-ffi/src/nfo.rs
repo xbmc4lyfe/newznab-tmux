@@ -38762,3 +38762,1006 @@ pub mod wave51_2_verification_manifest_nntp_reader_deferrals_payload {
         }
     }
 }
+
+pub mod wave52_2_binaries_collection_header_missed_part {
+    //! Wave 52.2 batch kernels for BinaryHandler, CollectionHandler, HeaderParser,
+    //! MissedPartHandler and PartHandler, in the Wave 49.2 framing: NUL-joined string columns
+    //! (exactly `count` entries), little-endian `i64` tables (whole columns back to back), fixed
+    //! `i64` words per item, a few summary words and one XXH64 digest of the preceding words.
+    //! Each export returns the word count, `-needed` when `out_cap` (in words) is short, or -1
+    //! for a null output, a malformed batch, an output overlapping an input or a panic.
+
+    use super::wave49_verification_admission_inventory_prep_repo_sample::{
+        FoldState, MAX_ITEMS, column, crc32, emit, ints, span,
+    };
+    use super::wave51_2_verification_manifest_nntp_reader_deferrals_payload::decimal;
+    use crate::cleaning::w48_proxy_verdict_captcha_breach_reglog::sha1 as sha1_soft;
+    use std::collections::hash_map::Entry;
+    use std::collections::{HashMap, HashSet};
+
+    type Map<K, V> = HashMap<K, V, FoldState>;
+
+    fn map<K, V>(n: usize) -> Map<K, V> {
+        HashMap::with_capacity_and_hasher(n, FoldState::default())
+    }
+
+    /// `flags | index << 8 | crc << 32`; batch indexes stay below MAX_ITEMS (2^20).
+    #[inline]
+    fn tagged(flags: i64, index: usize, crc: u32) -> i64 {
+        flags | (index as i64) << 8 | i64::from(crc) << 32
+    }
+
+    /// Appends PHP's decimal string of `v`.
+    fn push_int(buf: &mut Vec<u8>, v: i64) {
+        let mut tmp = [0u8; 20];
+        let mut n = v.unsigned_abs();
+        let mut i = tmp.len();
+        loop {
+            i -= 1;
+            tmp[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        if v < 0 {
+            buf.push(b'-');
+        }
+        buf.extend_from_slice(&tmp[i..]);
+    }
+
+    /// One SHA-1 block with the ARMv8 SHA1 instructions: twenty four-round groups over the
+    /// expanded schedule `W[i] = sha1su1(sha1su0(W[i-4], W[i-3], W[i-2]), W[i-1])`.
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "sha2")]
+    unsafe fn sha1_block_hw(state: &mut [u32; 5], block: &[u8; 64]) {
+        use std::arch::aarch64::{
+            vaddq_u32, vdupq_n_u32, vgetq_lane_u32, vld1q_u8, vld1q_u32, vreinterpretq_u32_u8,
+            vrev32q_u8, vsha1cq_u32, vsha1h_u32, vsha1mq_u32, vsha1pq_u32, vsha1su0q_u32,
+            vsha1su1q_u32, vst1q_u32,
+        };
+        const K: [u32; 4] = [0x5A82_7999, 0x6ED9_EBA1, 0x8F1B_BCDC, 0xCA62_C1D6];
+        // Every load reads 16 bytes inside the 64-byte block or the 5-word state.
+        unsafe {
+            let saved = vld1q_u32(state.as_ptr());
+            let mut abcd = saved;
+            let mut e = state[4];
+            let load =
+                |at: usize| vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(block.as_ptr().add(at))));
+            let mut w = [load(0), load(16), load(32), load(48)];
+            for group in 0..20 {
+                let slot = group & 3;
+                if group >= 4 {
+                    w[slot] = vsha1su1q_u32(
+                        vsha1su0q_u32(w[slot], w[(group + 1) & 3], w[(group + 2) & 3]),
+                        w[(group + 3) & 3],
+                    );
+                }
+                let tmp = vaddq_u32(w[slot], vdupq_n_u32(K[group / 5]));
+                let next = vsha1h_u32(vgetq_lane_u32::<0>(abcd));
+                abcd = match group / 5 {
+                    0 => vsha1cq_u32(abcd, e, tmp),
+                    2 => vsha1mq_u32(abcd, e, tmp),
+                    _ => vsha1pq_u32(abcd, e, tmp),
+                };
+                e = next;
+            }
+            vst1q_u32(state.as_mut_ptr(), vaddq_u32(abcd, saved));
+            state[4] = state[4].wrapping_add(e);
+        }
+    }
+
+    /// PHP `sha1($data, true)`: the ARMv8 SHA1 instructions when present, else the portable
+    /// digest.
+    pub fn sha1(data: &[u8]) -> [u8; 20] {
+        #[cfg(target_arch = "aarch64")]
+        if std::arch::is_aarch64_feature_detected!("sha2") {
+            let mut state = [
+                0x6745_2301u32,
+                0xEFCD_AB89,
+                0x98BA_DCFE,
+                0x1032_5476,
+                0xC3D2_E1F0,
+            ];
+            let (blocks, rest) = data.as_chunks::<64>();
+            let mut tail = [0u8; 128];
+            tail[..rest.len()].copy_from_slice(rest);
+            tail[rest.len()] = 0x80;
+            let tail_len = if rest.len() < 56 { 64 } else { 128 };
+            tail[tail_len - 8..tail_len].copy_from_slice(&((data.len() as u64) << 3).to_be_bytes());
+            let (padded, _) = tail[..tail_len].as_chunks::<64>();
+            for block in blocks.iter().chain(padded) {
+                // The feature was detected at runtime.
+                unsafe { sha1_block_hw(&mut state, block) };
+            }
+            let mut out = [0u8; 20];
+            for (chunk, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(state) {
+                chunk.copy_from_slice(&word.to_be_bytes());
+            }
+            return out;
+        }
+        sha1_soft(data)
+    }
+
+    /// Exactly `columns` integer columns of `count` values each.
+    fn int_columns(bytes: &[u8], count: usize, columns: usize) -> Option<Vec<i64>> {
+        ints(bytes, count.checked_mul(columns)?)
+    }
+
+    // ---- BinaryHandler -----------------------------------------------------------------------
+
+    /// One word per pending binary row (`flags | first << 8 | crc32(lookup key) << 32`, the
+    /// lookup key being `strtolower(hash) . ':' . collection`), then valid, unique and repeated
+    /// counts, case-folded hashes and files over their total. Flags: 1 hash of 32 hex digits,
+    /// 2 positive collection id, 4 repeated lookup key (valid rows only; `first` is the first row
+    /// with the key, else the row itself), 8 hash holding an uppercase byte, 16 file number
+    /// above a positive part total, 32 file number <= 0.
+    pub fn binary_key_plan(
+        hashes: &[&[u8]],
+        collections: &[i64],
+        files: &[i64],
+        totals: &[i64],
+    ) -> Vec<i64> {
+        let n = hashes.len();
+        let mut out = Vec::with_capacity(n + 6);
+        let mut first: Map<([u8; 32], i64), usize> = map(n);
+        let mut key = Vec::with_capacity(64);
+        let (mut valid, mut repeats, mut folded, mut over) = (0i64, 0i64, 0i64, 0i64);
+        for (i, &hash) in hashes.iter().enumerate() {
+            let (collection, file, total) = (collections[i], files[i], totals[i]);
+            key.clear();
+            key.extend(hash.iter().map(u8::to_ascii_lowercase));
+            key.push(b':');
+            push_int(&mut key, collection);
+            let hash_ok =
+                hash.len() == 32 && hash.iter().fold(true, |ok, b| ok & b.is_ascii_hexdigit());
+            let mut flags = i64::from(hash_ok) | i64::from(collection > 0) << 1;
+            let mut index = i;
+            if flags == 3 {
+                valid += 1;
+                let mut lower = [0u8; 32];
+                lower.copy_from_slice(&key[..32]);
+                match first.entry((lower, collection)) {
+                    Entry::Occupied(e) => {
+                        index = *e.get();
+                        flags |= 4;
+                        repeats += 1;
+                    }
+                    Entry::Vacant(e) => {
+                        e.insert(i);
+                    }
+                }
+            }
+            if key[..hash.len()] != *hash {
+                flags |= 8;
+                folded += 1;
+            }
+            if file <= 0 {
+                flags |= 32;
+            }
+            if total > 0 && file > total {
+                flags |= 16;
+                over += 1;
+            }
+            out.push(tagged(flags, index, crc32(&key)));
+        }
+        out.extend([valid, valid - repeats, repeats, folded, over]);
+        out
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    /// `ints` holds the collection ids, file numbers and part totals as three whole columns.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w522_binary_key_plan_batch(
+        hashes: *const u8,
+        hashes_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(hashes, hashes_len), (ints, ints_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let hashes = column(span(hashes, hashes_len)?, count)?;
+                let table = int_columns(span(ints, ints_len)?, count, 3)?;
+                let (collections, rest) = table.split_at(count);
+                let (files, totals) = rest.split_at(count);
+                Some(binary_key_plan(&hashes, collections, files, totals))
+            })
+        }
+    }
+
+    // ---- CollectionHandler -------------------------------------------------------------------
+
+    /// Two words per header (`flags | first << 8 | crc32(key) << 32`, then the first eight
+    /// bytes of sha1(key) as a big-endian signed word, key being `name . totalFiles`), then
+    /// unique keys, repeats, empty names and non-positive totals. Flags: 1 first occurrence,
+    /// 2 repeated key (`first` is the key's first row), 4 empty name, 8 total <= 0, 16 name
+    /// longer than 255 bytes.
+    pub fn collection_key_plan(names: &[&[u8]], totals: &[i64]) -> Vec<i64> {
+        let n = names.len();
+        let mut out = Vec::with_capacity(2 * n + 5);
+        let mut seen: Map<Vec<u8>, (usize, u32, i64)> = map(n);
+        let mut key = Vec::with_capacity(128);
+        let (mut repeats, mut empty, mut non_positive) = (0i64, 0i64, 0i64);
+        for (i, (&name, &total)) in names.iter().zip(totals).enumerate() {
+            key.clear();
+            key.extend_from_slice(name);
+            push_int(&mut key, total);
+            let mut flags = i64::from(name.is_empty()) << 2
+                | i64::from(total <= 0) << 3
+                | i64::from(name.len() > 255) << 4;
+            empty += i64::from(name.is_empty());
+            non_positive += i64::from(total <= 0);
+            let (first, crc, prefix) = if let Some(&hit) = seen.get(key.as_slice()) {
+                flags |= 2;
+                repeats += 1;
+                hit
+            } else {
+                flags |= 1;
+                let digest = sha1(&key);
+                let mut head = [0u8; 8];
+                head.copy_from_slice(&digest[..8]);
+                let hit = (i, crc32(&key), i64::from_be_bytes(head));
+                seen.insert(key.clone(), hit);
+                hit
+            };
+            out.push(tagged(flags, first, crc));
+            out.push(prefix);
+        }
+        out.extend([seen.len() as i64, repeats, empty, non_positive]);
+        out
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w522_collection_key_plan_batch(
+        names: *const u8,
+        names_len: usize,
+        totals: *const u8,
+        totals_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(names, names_len), (totals, totals_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let names = column(span(names, names_len)?, count)?;
+                let totals = ints(span(totals, totals_len)?, count)?;
+                Some(collection_key_plan(&names, &totals))
+            })
+        }
+    }
+
+    // ---- HeaderParser ------------------------------------------------------------------------
+
+    /// PCRE `\s` with the default (C) tables.
+    #[inline]
+    fn ws(b: u8) -> bool {
+        const MASK: u64 = 1 << b' ' | 1 << b'\t' | 1 << b'\n' | 1 << b'\r' | 1 << 0x0b | 1 << 0x0c;
+        b <= b' ' && MASK >> b & 1 == 1
+    }
+
+    /// `\((\d+)\/(\d+)\)` at `f`: the part and total digit ranges.
+    fn counter_at(s: &[u8], f: usize) -> Option<((usize, usize), (usize, usize))> {
+        let digits = |from: usize| {
+            from + s.get(from..).map_or(0, |rest| {
+                rest.iter().take_while(|b| b.is_ascii_digit()).count()
+            })
+        };
+        if s.get(f) != Some(&b'(') {
+            return None;
+        }
+        let part_end = digits(f + 1);
+        if part_end == f + 1 || s.get(part_end) != Some(&b'/') {
+            return None;
+        }
+        let total_end = digits(part_end + 1);
+        if total_end == part_end + 1 || s.get(total_end) != Some(&b')') {
+            return None;
+        }
+        Some(((f + 1, part_end), (part_end + 1, total_end)))
+    }
+
+    type Counter = (usize, (usize, usize), (usize, usize));
+
+    /// Byte ranges of the base name, the part digits and the total digits.
+    type SubjectMatch = ((usize, usize), (usize, usize), (usize, usize));
+
+    /// The smallest `e >= from` where `\s+\((\d+)\/(\d+)\)` matches. `\s+` must take its whole
+    /// run (the next byte, `(`, is not whitespace), so the first `(` after whitespace whose
+    /// counter matches decides, and `e` is the start of that run clipped to `from`.
+    fn next_counter(s: &[u8], from: usize) -> Option<Counter> {
+        let mut at = from.saturating_add(1);
+        while let Some(p) = s.get(at..)?.iter().position(|&b| b == b'(') {
+            let f = at + p;
+            if ws(s[f - 1])
+                && let Some((part, total)) = counter_at(s, f)
+            {
+                let mut e = f - 1;
+                while e > from && ws(s[e - 1]) {
+                    e -= 1;
+                }
+                return Some((e, part, total));
+            }
+            at = f + 1;
+        }
+        None
+    }
+
+    /// HeaderParser::SUBJECT_PATTERN `/^\s*(?!Usenet Index Post)(.+?)\s+\((\d+)\/(\d+)\)/`:
+    /// the base name range and the part and total digit ranges. `\s*` backtracks one byte at a
+    /// time (a shorter run moves the lookahead onto whitespace, where it passes), and the lazy
+    /// `.+?` takes the shortest base without LF.
+    pub fn subject_match(s: &[u8]) -> Option<SubjectMatch> {
+        let k = s.iter().take_while(|&&b| ws(b)).count();
+        // The first counter past the leading whitespace serves s = k and s = k - 1 alike.
+        let after = if k < s.len() {
+            next_counter(s, k + 1)
+        } else {
+            None
+        };
+        let inside = counter_at(s, k);
+        for start in (0..=k).rev() {
+            if start == k && s[k..].starts_with(b"Usenet Index Post") {
+                continue;
+            }
+            let found = match inside {
+                // Every start before k - 1 can end its base at the next whitespace byte, whose
+                // run reaches the counter at k.
+                Some((part, total)) if start + 2 <= k => Some((start + 1, part, total)),
+                _ => after,
+            };
+            // A base ending at start + 1 costs one byte; the two longer candidates are checked
+            // at most once each, so the scan stays linear.
+            if let Some((end, part, total)) = found
+                && !s[start..end].contains(&b'\n')
+            {
+                return Some(((start, end), part, total));
+            }
+        }
+        None
+    }
+
+    /// PHP `stripos($s, 'yEnc') !== false`.
+    fn has_yenc(s: &[u8]) -> bool {
+        // Setting bit 5 folds exactly `Y`, `E`, `N` and `C` onto the lowercase target bytes.
+        let target = u32::from_le_bytes(*b"yenc");
+        // A trailing `yEnc (n/m)` is the common hit, so the scan runs from the end.
+        s.windows(4)
+            .rev()
+            .any(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]) | 0x2020_2020 == target)
+    }
+
+    /// Three words per subject (`flags | min(len(base), 0xFFFFFF) << 8 | crc32(base) << 32`, the
+    /// part and the total as PHP `(int)`; all zero when the pattern does not match), then
+    /// matched, unmatched, yEnc-appended and multi-part counts and the largest matched total.
+    /// The base is capture 1 plus ` yEnc` when the subject lacks `yEnc` (any case). Flags:
+    /// 1 matched, 2 yEnc appended, 4 part above total, 8 part zero, 16 total of at least 2.
+    pub fn subject_plan(subjects: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(3 * subjects.len() + 6);
+        let mut base = Vec::with_capacity(256);
+        let (mut matched, mut appended, mut multi, mut max_total) = (0i64, 0i64, 0i64, 0i64);
+        for &subject in subjects {
+            let Some(((start, end), (p0, p1), (t0, t1))) = subject_match(subject) else {
+                out.extend([0, 0, 0]);
+                continue;
+            };
+            matched += 1;
+            base.clear();
+            base.extend_from_slice(&subject[start..end]);
+            let mut flags = 1;
+            if !has_yenc(subject) {
+                base.extend_from_slice(b" yEnc");
+                flags |= 2;
+                appended += 1;
+            }
+            let (part, total) = (decimal(&subject[p0..p1]), decimal(&subject[t0..t1]));
+            flags |= i64::from(part > total) << 2 | i64::from(part == 0) << 3;
+            if total >= 2 {
+                flags |= 16;
+                multi += 1;
+            }
+            max_total = max_total.max(total);
+            out.push(
+                flags | (base.len().min(0xFF_FFFF) as i64) << 8 | i64::from(crc32(&base)) << 32,
+            );
+            out.extend([part, total]);
+        }
+        let unmatched = subjects.len() as i64 - matched;
+        out.extend([matched, unmatched, appended, multi, max_total]);
+        out
+    }
+
+    /// # Safety
+    /// `subjects` must be readable for `subjects_len` bytes and `out` writable for `out_cap`
+    /// words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w522_header_subject_plan_batch(
+        subjects: *const u8,
+        subjects_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(subjects, subjects_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let subjects = column(span(subjects, subjects_len)?, count)?;
+                Some(subject_plan(&subjects))
+            })
+        }
+    }
+
+    // ---- MissedPartHandler -------------------------------------------------------------------
+
+    /// One flag byte per queued part, eight parts per word (part `i` in bits `8 * (i % 8)`),
+    /// then repaired, retryable, exhausted, duplicate, invalid and run counts and the smallest
+    /// and largest retryable numbers (0 for none). A number <= 0 is invalid (16); a repeated
+    /// number is a duplicate (8); otherwise a received number is repaired (1), a part whose next
+    /// attempt reaches max(1, max_tries) is exhausted (4) and the rest are retryable (2), with 32
+    /// marking a retryable part that starts a run of consecutive numbers.
+    pub fn missed_part_plan(
+        numbers: &[i64],
+        attempts: &[i64],
+        received: &[i64],
+        max_tries: i64,
+    ) -> Vec<i64> {
+        let mut out = vec![0i64; numbers.len().div_ceil(8)];
+        out.reserve(9);
+        let mut got = received.to_vec();
+        got.sort_unstable();
+        // Queue rows arrive ordered by number, so a number above every earlier one is new; the
+        // set is built from the earlier valid numbers only once an order break needs it.
+        let (mut top, mut seen) = (0i64, None::<HashSet<i64, FoldState>>);
+        let limit = max_tries.max(1) - 1;
+        let (mut repaired, mut retryable, mut exhausted) = (0i64, 0i64, 0i64);
+        let (mut duplicates, mut invalid, mut runs) = (0i64, 0i64, 0i64);
+        let (mut min, mut max, mut prev) = (0i64, 0i64, None::<i64>);
+        for (i, (&number, &tries)) in numbers.iter().zip(attempts).enumerate() {
+            let fresh = if number <= 0 {
+                false
+            } else if number > top {
+                top = number;
+                if let Some(set) = &mut seen {
+                    set.insert(number);
+                }
+                true
+            } else {
+                seen.get_or_insert_with(|| {
+                    let mut set =
+                        HashSet::with_capacity_and_hasher(numbers.len(), FoldState::default());
+                    set.extend(numbers[..i].iter().copied().filter(|&n| n > 0));
+                    set
+                })
+                .insert(number)
+            };
+            let word = if number <= 0 {
+                invalid += 1;
+                16
+            } else if !fresh {
+                duplicates += 1;
+                8
+            } else if got.binary_search(&number).is_ok() {
+                repaired += 1;
+                1
+            } else if tries >= limit {
+                exhausted += 1;
+                4
+            } else {
+                retryable += 1;
+                let mut flags = 2;
+                if prev.and_then(|p| p.checked_add(1)) != Some(number) {
+                    flags |= 32;
+                    runs += 1;
+                }
+                prev = Some(number);
+                if min == 0 || number < min {
+                    min = number;
+                }
+                max = max.max(number);
+                flags
+            };
+            out[i / 8] |= word << (8 * (i % 8));
+        }
+        out.extend([
+            repaired, retryable, exhausted, duplicates, invalid, runs, min, max,
+        ]);
+        out
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    /// `ints` holds the article numbers then the attempts as two whole columns.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_w522_missed_part_plan_batch(
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        received: *const u8,
+        received_len: usize,
+        received_count: usize,
+        max_tries: i64,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(ints, ints_len), (received, received_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                if received_count > MAX_ITEMS {
+                    return None;
+                }
+                let table = int_columns(span(ints, ints_len)?, count, 2)?;
+                let received = self::ints(span(received, received_len)?, received_count)?;
+                let (numbers, attempts) = table.split_at(count);
+                Some(missed_part_plan(numbers, attempts, &received, max_tries))
+            })
+        }
+    }
+
+    // ---- PartHandler -------------------------------------------------------------------------
+
+    /// PHP `trim()` with its default characters.
+    pub fn php_trim(s: &[u8]) -> &[u8] {
+        let strip = |b: &u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b);
+        let start = s.iter().position(|b| !strip(b)).unwrap_or(s.len());
+        let end = s.iter().rposition(|b| !strip(b)).map_or(start, |e| e + 1);
+        &s[start..end]
+    }
+
+    /// PartHandler::validationErrorPhp() message-id rule on a trimmed id.
+    fn message_id_ok(id: &[u8]) -> bool {
+        !id.is_empty()
+            && id.len() <= 255
+            && id
+                .iter()
+                .fold(true, |ok, &b| ok & (b.wrapping_sub(0x20) < 0x5F))
+    }
+
+    /// One word per part (`flags | winner << 8 | crc32(trim(message id)) << 32`), then valid,
+    /// bad part number, bad message id, surviving and replaced-or-dropped counts. Flags: 1 part
+    /// number <= 0, 2 invalid message id (only checked for a valid part number), 4 the row
+    /// survives deduplication on (binary id, part number), 8 the key repeats an earlier valid
+    /// row. A valid row's winner is its key's survivor under PartHandler::shouldPreferPhp()
+    /// (larger size, then smaller article number); an invalid row's winner is itself.
+    pub fn part_admission_plan(
+        ids: &[&[u8]],
+        binaries: &[i64],
+        parts: &[i64],
+        sizes: &[i64],
+        numbers: &[i64],
+    ) -> Vec<i64> {
+        let n = ids.len();
+        let mut out = Vec::with_capacity(n + 6);
+        let mut winners: Map<(i64, i64), usize> = map(n);
+        let (mut valid, mut bad_part, mut bad_id) = (0i64, 0i64, 0i64);
+        for (i, &raw) in ids.iter().enumerate() {
+            let id = php_trim(raw);
+            let crc = crc32(id);
+            let flags = if parts[i] <= 0 {
+                bad_part += 1;
+                1
+            } else if !message_id_ok(id) {
+                bad_id += 1;
+                2
+            } else {
+                valid += 1;
+                match winners.entry((binaries[i], parts[i])) {
+                    Entry::Occupied(mut e) => {
+                        let w = *e.get();
+                        // Both ids are non-empty, so the size and then the number decide.
+                        if sizes[i] > sizes[w] || sizes[i] == sizes[w] && numbers[i] < numbers[w] {
+                            e.insert(i);
+                        }
+                        8
+                    }
+                    Entry::Vacant(e) => {
+                        e.insert(i);
+                        0
+                    }
+                }
+            };
+            out.push(tagged(flags, i, crc));
+        }
+        for (i, word) in out.iter_mut().enumerate() {
+            if *word & 3 == 0 {
+                let w = winners[&(binaries[i], parts[i])];
+                *word = (*word & !0xFFFF_FF00) | (w as i64) << 8 | i64::from(w == i) << 2;
+            }
+        }
+        let survivors = winners.len() as i64;
+        out.extend([valid, bad_part, bad_id, survivors, valid - survivors]);
+        out
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    /// `ints` holds the binary ids, part numbers, sizes and article numbers as four whole
+    /// columns.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w522_part_admission_plan_batch(
+        ids: *const u8,
+        ids_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(ids, ids_len), (ints, ints_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let ids = column(span(ids, ids_len)?, count)?;
+                let table = int_columns(span(ints, ints_len)?, count, 4)?;
+                let (binaries, rest) = table.split_at(count);
+                let (parts, rest) = rest.split_at(count);
+                let (sizes, numbers) = rest.split_at(count);
+                Some(part_admission_plan(&ids, binaries, parts, sizes, numbers))
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod w522_tests {
+        use super::super::wave49_verification_admission_inventory_prep_repo_sample::digest;
+        use super::*;
+
+        fn p(values: &[i64]) -> Vec<u8> {
+            values.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+
+        fn run(call: impl Fn(*mut i64, usize) -> isize) -> Vec<i64> {
+            let mut out = vec![0i64; 256];
+            let n = call(out.as_mut_ptr(), out.len());
+            assert!(n > 0, "export returned {n}");
+            out.truncate(n as usize);
+            let (body, last) = out.split_at(out.len() - 1);
+            assert_eq!(last[0], digest(body));
+            out.pop();
+            out
+        }
+
+        fn base(s: &[u8]) -> Option<&[u8]> {
+            subject_match(s).map(|((a, b), _, _)| &s[a..b])
+        }
+
+        #[test]
+        fn w522_subject_pattern_matches_pcre_backtracking() {
+            assert_eq!(base(b"name.rar yEnc (12/45)"), Some(&b"name.rar yEnc"[..]));
+            assert_eq!(base(b"  a b  (1/2) (3/4)"), Some(&b"a b"[..]));
+            assert_eq!(base(b"Usenet Index Post x (1/2)"), None);
+            assert_eq!(
+                base(b" Usenet Index Post x (1/2)"),
+                Some(&b" Usenet Index Post x"[..])
+            );
+            assert_eq!(base(b"   (1/2)"), Some(&b" "[..]));
+            assert_eq!(base(b" (1/2)"), None);
+            assert_eq!(base(b"a\rb (1/2)"), Some(&b"a\rb"[..]));
+            assert_eq!(base(b"a\nb (1/2)"), None);
+            assert_eq!(base(b"a\n (1/2)"), Some(&b"a"[..]));
+            assert_eq!(base(b"\n\n (1/2)"), None);
+            assert_eq!(base(b"a (1/x) b (2/3)"), Some(&b"a (1/x) b"[..]));
+            assert_eq!(base(b"a (/2)"), None);
+            assert_eq!(base(b""), None);
+            let m = subject_match(b"x (007/12)").unwrap();
+            assert_eq!((m.1, m.2), ((3, 6), (7, 9)));
+        }
+
+        #[test]
+        fn w522_kernels_follow_documented_words() {
+            let w = subject_plan(&[b"a (1/2)", b"nope", b"b yenc (3/1)"]);
+            let a = b"a yEnc";
+            assert_eq!(w[0], 1 | 2 | 16 | 6 << 8 | i64::from(crc32(a)) << 32);
+            assert_eq!(&w[1..6], &[1, 2, 0, 0, 0]);
+            assert_eq!(w[6], 1 | 4 | 6 << 8 | i64::from(crc32(b"b yenc")) << 32);
+            assert_eq!(&w[9..], &[2, 1, 1, 1, 2]);
+
+            let h = b"0123456789ABCDEF0123456789abcdef";
+            let l = b"0123456789abcdef0123456789abcdef";
+            let w = binary_key_plan(
+                &[h, l, l, b"BAD"],
+                &[5, 5, 9, 0],
+                &[0, 0, 7, 3],
+                &[2, 2, 3, 1],
+            );
+            assert_eq!(w[0] & 0xFF, 1 | 2 | 8 | 32);
+            assert_eq!(w[1] & 0xFFFF_FFFF, 1 | 2 | 4 | 32);
+            assert_eq!(w[2] & 0xFF, 1 | 2 | 16);
+            assert_eq!(w[3] & 0xFFFF_FFFF, 3 << 8 | 8 | 16);
+            assert_eq!(w[3] >> 32 & 0xFFFF_FFFF, i64::from(crc32(b"bad:0")));
+            assert_eq!(&w[4..], &[3, 2, 1, 2, 2]);
+
+            let w = collection_key_plan(&[b"a1", b"a", b""], &[2, 12, 0]);
+            let digest = sha1_soft(b"a12");
+            assert_eq!(w[1], i64::from_be_bytes(digest[..8].try_into().unwrap()));
+            assert_eq!(w[2] & 0xFFFF_FFFF, 2);
+            assert_eq!(w[3], w[1]);
+            assert_eq!(w[4] & 0xFFFF_FFFF, 1 | 4 | 8 | 2 << 8);
+            assert_eq!(&w[6..], &[2, 1, 1, 1]);
+
+            let bytes = |w: &[i64], n: usize| -> Vec<i64> {
+                (0..n).map(|i| w[i / 8] >> (8 * (i % 8)) & 0xFF).collect()
+            };
+            let w = missed_part_plan(&[5, 6, 8, 6, 0, 9, 10], &[0, 0, 0, 0, 0, 2, 0], &[10], 3);
+            assert_eq!(bytes(&w, 7), [2 | 32, 2, 2 | 32, 8, 16, 4, 1]);
+            assert_eq!(&w[1..], &[1, 3, 1, 1, 1, 2, 5, 8]);
+            // Nine parts take two words; the ninth sits in the low byte of the second.
+            let w = missed_part_plan(&[1, 2, 3, 4, 5, 6, 7, 8, 10], &[0; 9], &[], 3);
+            assert_eq!(w[0], 0x0202_0202_0202_0222);
+            assert_eq!(w[1], 0x22);
+
+            let ids: [&[u8]; 5] = [b" <a> ", b"<b>", b"<c>", b"<d>\x01", b"<e>"];
+            let w = part_admission_plan(
+                &ids,
+                &[1, 1, 1, 1, 2],
+                &[1, 1, 1, 1, 0],
+                &[5, 9, 9, 1, 1],
+                &[3, 4, 2, 1, 1],
+            );
+            assert_eq!(w[0] & 0xFFFF_FFFF, 2 << 8);
+            assert_eq!(w[1] & 0xFFFF_FFFF, 8 | 2 << 8);
+            assert_eq!(w[2] & 0xFFFF_FFFF, 4 | 8 | 2 << 8);
+            assert_eq!(w[3] & 0xFFFF_FFFF, 2 | 3 << 8);
+            assert_eq!(w[4] & 0xFFFF_FFFF, 1 | 4 << 8);
+            assert_eq!(w[0] >> 32 & 0xFFFF_FFFF, i64::from(crc32(b"<a>")));
+            assert_eq!(&w[5..], &[3, 1, 1, 1, 2]);
+            assert_eq!(php_trim(b"\0\x0b x \t"), b"x");
+            assert_eq!(php_trim(b"\x0c"), b"\x0c");
+        }
+
+        #[test]
+        fn w522_exports_frame_and_guard_batches() {
+            let subjects = b"a (1/2)\0b";
+            let w = run(|o, c| unsafe {
+                nntmux_w522_header_subject_plan_batch(subjects.as_ptr(), subjects.len(), 2, o, c)
+            });
+            assert_eq!(w, subject_plan(&[b"a (1/2)", b"b"]));
+            let table = p(&[5, 0, 2]);
+            let w = run(|o, c| unsafe {
+                nntmux_w522_binary_key_plan_batch(b"h".as_ptr(), 1, table.as_ptr(), 24, 1, o, c)
+            });
+            assert_eq!(w, binary_key_plan(&[b"h"], &[5], &[0], &[2]));
+            let totals = p(&[3, 4]);
+            let w = run(|o, c| unsafe {
+                nntmux_w522_collection_key_plan_batch(
+                    b"a\0b".as_ptr(),
+                    3,
+                    totals.as_ptr(),
+                    16,
+                    2,
+                    o,
+                    c,
+                )
+            });
+            assert_eq!(w, collection_key_plan(&[b"a", b"b"], &[3, 4]));
+            let table = p(&[4, 5, 0, 1]);
+            let received = p(&[5]);
+            let w = run(|o, c| unsafe {
+                nntmux_w522_missed_part_plan_batch(
+                    table.as_ptr(),
+                    32,
+                    2,
+                    received.as_ptr(),
+                    8,
+                    1,
+                    3,
+                    o,
+                    c,
+                )
+            });
+            assert_eq!(w, missed_part_plan(&[4, 5], &[0, 1], &[5], 3));
+            let table = p(&[1, 1, 10, 7]);
+            let w = run(|o, c| unsafe {
+                nntmux_w522_part_admission_plan_batch(
+                    b"<m>".as_ptr(),
+                    3,
+                    table.as_ptr(),
+                    32,
+                    1,
+                    o,
+                    c,
+                )
+            });
+            assert_eq!(w, part_admission_plan(&[b"<m>"], &[1], &[1], &[10], &[7]));
+
+            let mut out = [7i64; 16];
+            let o = out.as_mut_ptr();
+            let null = std::ptr::null::<u8>();
+            unsafe {
+                // Empty batches may pass null inputs; the word count is summary plus digest.
+                assert_eq!(nntmux_w522_header_subject_plan_batch(null, 0, 0, o, 16), 6);
+                assert_eq!(
+                    nntmux_w522_binary_key_plan_batch(null, 0, null, 0, 0, o, 16),
+                    6
+                );
+                assert_eq!(
+                    nntmux_w522_collection_key_plan_batch(null, 0, null, 0, 0, o, 16),
+                    5
+                );
+                assert_eq!(
+                    nntmux_w522_missed_part_plan_batch(null, 0, 0, null, 0, 0, 3, o, 16),
+                    9
+                );
+                assert_eq!(
+                    nntmux_w522_missed_part_plan_batch(table.as_ptr(), 32, 2, null, 0, 0, 3, o, 9),
+                    -10
+                );
+                assert_eq!(
+                    nntmux_w522_part_admission_plan_batch(null, 0, null, 0, 0, o, 16),
+                    6
+                );
+                // Null output, short capacity, ragged tables, null non-empty inputs and wrong
+                // counts are refused without writing.
+                out = [7; 16];
+                let o = out.as_mut_ptr();
+                assert_eq!(
+                    nntmux_w522_header_subject_plan_batch(
+                        b"a".as_ptr(),
+                        1,
+                        1,
+                        std::ptr::null_mut(),
+                        16
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w522_header_subject_plan_batch(b"a".as_ptr(), 1, 1, o, 8),
+                    -9
+                );
+                assert_eq!(
+                    nntmux_w522_header_subject_plan_batch(b"a\0b".as_ptr(), 3, 1, o, 16),
+                    -1
+                );
+                assert_eq!(nntmux_w522_header_subject_plan_batch(null, 1, 1, o, 16), -1);
+                assert_eq!(
+                    nntmux_w522_binary_key_plan_batch(
+                        b"h".as_ptr(),
+                        1,
+                        table.as_ptr(),
+                        16,
+                        1,
+                        o,
+                        16
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w522_binary_key_plan_batch(b"h".as_ptr(), 1, null, 24, 1, o, 16),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w522_collection_key_plan_batch(
+                        b"a".as_ptr(),
+                        1,
+                        totals.as_ptr(),
+                        16,
+                        1,
+                        o,
+                        16
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w522_missed_part_plan_batch(
+                        table.as_ptr(),
+                        32,
+                        2,
+                        received.as_ptr(),
+                        8,
+                        2,
+                        3,
+                        o,
+                        16
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w522_missed_part_plan_batch(table.as_ptr(), 32, 2, null, 8, 1, 3, o, 16),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w522_missed_part_plan_batch(
+                        table.as_ptr(),
+                        32,
+                        2,
+                        null,
+                        0,
+                        MAX_ITEMS + 1,
+                        3,
+                        o,
+                        16
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w522_part_admission_plan_batch(
+                        b"<m>".as_ptr(),
+                        3,
+                        table.as_ptr(),
+                        24,
+                        1,
+                        o,
+                        16
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w522_part_admission_plan_batch(
+                        b"<m>".as_ptr(),
+                        3,
+                        table.as_ptr(),
+                        32,
+                        1,
+                        o,
+                        6
+                    ),
+                    -7
+                );
+                assert_eq!(
+                    nntmux_w522_part_admission_plan_batch(
+                        b"<m>".as_ptr(),
+                        3,
+                        table.as_ptr(),
+                        32,
+                        MAX_ITEMS + 1,
+                        o,
+                        16
+                    ),
+                    -1
+                );
+                assert_eq!(out, [7; 16]);
+                // An output overlapping an input is refused.
+                let mut shared = [0i64; 16];
+                shared[0] = i64::from_le_bytes(*b"a (1/2)\0");
+                assert_eq!(
+                    nntmux_w522_header_subject_plan_batch(
+                        shared.as_ptr() as *const u8,
+                        7,
+                        1,
+                        shared.as_mut_ptr(),
+                        16
+                    ),
+                    -1
+                );
+            }
+        }
+
+        #[test]
+        fn w522_sha1_matches_portable_digest() {
+            for len in [0usize, 1, 3, 55, 56, 63, 64, 65, 119, 120, 128, 200] {
+                let data: Vec<u8> = (0..len).map(|i| (i * 31 + 7) as u8).collect();
+                assert_eq!(sha1(&data), sha1_soft(&data), "len {len}");
+            }
+            assert_eq!(sha1(b"abc")[..4], [0xa9, 0x99, 0x3e, 0x36]);
+        }
+
+        #[test]
+        fn w522_numeric_edges_follow_php_casts() {
+            let huge = format!("a ({}/{})", "9".repeat(25), "9".repeat(400));
+            let w = subject_plan(&[huge.as_bytes()]);
+            assert_eq!(&w[1..3], &[i64::MAX, 0]);
+            assert_eq!(w[0] & 0xFF, 1 | 2 | 4);
+            let mut buf = Vec::new();
+            push_int(&mut buf, i64::MIN);
+            assert_eq!(buf, i64::MIN.to_string().as_bytes());
+            // max(1, PHP_INT_MIN) exhausts every non-negative attempt count.
+            let w = missed_part_plan(&[i64::MAX, 1], &[0, i64::MIN], &[], i64::MIN);
+            assert_eq!(w[0], 4 | (2 | 32) << 8);
+            // A run never continues past PHP_INT_MAX.
+            let w = missed_part_plan(&[i64::MAX, 1], &[0, 0], &[], 3);
+            assert_eq!(w[0], (2 | 32) | (2 | 32) << 8);
+            let w = missed_part_plan(&[7], &[i64::MAX], &[], i64::MAX);
+            assert_eq!(w[0], 4);
+            // Order breaks fall back to the set, which also holds the numbers seen before it.
+            let w = missed_part_plan(&[3, 9, 5, 3, 9, 10, 5, -1, 4], &[0; 9], &[4, 1], 3);
+            let flags: Vec<i64> = (0..9).map(|i| w[i / 8] >> (8 * (i % 8)) & 31).collect();
+            assert_eq!(flags, [2, 2, 2, 8, 8, 2, 8, 16, 1]);
+        }
+    }
+}
