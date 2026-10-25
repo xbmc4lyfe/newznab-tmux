@@ -25921,3 +25921,346 @@ mod w356_dto_provider_tests {
         assert_eq!(&output[72..], &[90; 8]);
     }
 }
+
+// Wave 36.6: tmux enum values, Horizon access, and failed-job count summaries.
+// Integers are native-endian i64 (PHP pack q); strings are u32 LE + raw bytes.
+// Enum input tags: 0 unsupported PHP type, 1 integer, 2 byte string. An enum
+// output is i64 case index (-1 for an unknown role) + one validity byte.
+const W366_MAX_BYTES: usize = 16_777_216;
+const W366_PANE_ROLES: [&[u8]; 20] = [
+    b"monitor",
+    b"binaries",
+    b"backfill",
+    b"releases",
+    b"sequential",
+    b"fix_names",
+    b"remove_crap",
+    b"post_additional",
+    b"post_tv",
+    b"post_metadata",
+    b"post_movies",
+    b"irc_scraper",
+    b"htop",
+    b"nmon",
+    b"vnstat",
+    b"tcptrack",
+    b"bandwidth_monitor",
+    b"mytop",
+    b"redis",
+    b"console",
+];
+
+fn w366_compute(operation: u8, bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut reader = W356Reader { bytes, offset: 0 };
+    let mut output = Vec::with_capacity(25);
+    match operation {
+        1..=3 => {
+            let tag = *reader.take(1)?.first()?;
+            let mut index = None;
+            match tag {
+                0 => {}
+                1 => {
+                    let value = reader.integer()?;
+                    if operation != 1 && (0..=if operation == 2 { 3 } else { 2 }).contains(&value) {
+                        index = Some(value);
+                    }
+                }
+                2 => {
+                    let value = reader.string()?;
+                    index = if operation == 1 {
+                        W366_PANE_ROLES
+                            .iter()
+                            .position(|role| *role == value)
+                            .map(|i| i as i64)
+                    } else if value.len() == 1
+                        && (b'0'..=if operation == 2 { b'3' } else { b'2' }).contains(&value[0])
+                    {
+                        Some((value[0] - b'0') as i64)
+                    } else {
+                        None
+                    };
+                }
+                _ => return None,
+            }
+            output.extend_from_slice(
+                &index
+                    .unwrap_or(if operation == 1 { -1 } else { 0 })
+                    .to_ne_bytes(),
+            );
+            output.push(u8::from(index.is_some()));
+        }
+        4 => {
+            let authenticated = *reader.take(1)?.first()?;
+            let admin = *reader.take(1)?.first()?;
+            if authenticated > 1 || admin > 1 {
+                return None;
+            }
+            let _user_id = reader.integer()?;
+            let local = u8::from(reader.string()? == b"local");
+            let gate = authenticated & admin;
+            output.extend_from_slice(&[authenticated, admin, local, gate, gate | local]);
+        }
+        5 => {
+            let total = reader.integer()?.max(0);
+            let hour = reader.integer()?.max(0);
+            let day = reader.integer()?.max(0);
+            for value in [total, hour, day] {
+                output.extend_from_slice(&value.to_ne_bytes());
+            }
+            output.push(u8::from(total > 0));
+        }
+        _ => return None,
+    }
+    (reader.offset == bytes.len()).then_some(output)
+}
+
+/// Returns bytes written, -required for insufficient capacity, or -1 for invalid
+/// operation/frame/range or a caught panic. Every negative return preserves all
+/// output bytes. The caller owns the output allocation; no terminator is written.
+///
+/// # Safety
+/// Both pointers must reference live readable/writable allocations of the declared
+/// lengths, at most 16 MiB each. They must be nonnull and their ranges must not
+/// overlap. Byte alignment suffices; numeric fields are copied before decoding.
+/// Pointer arithmetic validation cannot establish allocation ownership/liveness.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w366_tmux_horizon_failed_jobs(
+    operation: u8,
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        if !(1..=5).contains(&operation)
+            || input.is_null()
+            || out_buf.is_null()
+            || input_len > W366_MAX_BYTES
+            || out_cap > W366_MAX_BYTES
+        {
+            return -1;
+        }
+        let Some(input_end) = (input as usize).checked_add(input_len) else {
+            return -1;
+        };
+        let Some(output_end) = (out_buf as usize).checked_add(out_cap) else {
+            return -1;
+        };
+        if input_len != 0
+            && out_cap != 0
+            && (input as usize) < output_end
+            && (out_buf as usize) < input_end
+        {
+            return -1;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(input, input_len) };
+        let Some(result) = w366_compute(operation, bytes) else {
+            return -1;
+        };
+        if out_cap < result.len() {
+            return -(result.len() as isize);
+        }
+        unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), out_buf, result.len()) };
+        result.len() as isize
+    })
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod w366_tests {
+    use super::*;
+
+    fn string_frame(value: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![2];
+        w356_string(&mut bytes, value);
+        bytes
+    }
+
+    #[test]
+    fn exact_enum_values_and_integer_boundaries() {
+        for (i, role) in W366_PANE_ROLES.iter().enumerate() {
+            let output = w366_compute(1, &string_frame(role)).unwrap();
+            assert_eq!(&output[..8], &(i as i64).to_ne_bytes());
+            assert_eq!(output[8], 1);
+        }
+        for operation in 2..=3 {
+            for value in [i64::MIN, -1, 0, 1, 2, 3, 4, i64::MAX] {
+                let mut bytes = vec![1];
+                bytes.extend_from_slice(&value.to_ne_bytes());
+                let output = w366_compute(operation, &bytes).unwrap();
+                let valid = (0..=if operation == 2 { 3 } else { 2 }).contains(&value);
+                assert_eq!(output[8], u8::from(valid));
+                assert_eq!(
+                    &output[..8],
+                    &if valid { value } else { 0_i64 }.to_ne_bytes()
+                );
+            }
+            for value in [b"00".as_slice(), b" 1 ", b"+1", b"1\0", b"\xff", b""] {
+                assert_eq!(w366_compute(operation, &string_frame(value)).unwrap()[8], 0);
+            }
+        }
+        assert_eq!(w366_compute(1, &string_frame(b"MONITOR")).unwrap()[8], 0);
+        assert_eq!(w366_compute(1, &[0]).unwrap()[..8], (-1_i64).to_ne_bytes());
+    }
+
+    #[test]
+    fn access_and_counts_do_not_coerce_or_overflow() {
+        for authenticated in 0..=1 {
+            for admin in 0..=1 {
+                for environment in [b"local".as_slice(), b"LOCAL", b"local\0", b""] {
+                    let mut input = vec![authenticated, admin];
+                    input.extend_from_slice(&i64::MIN.to_ne_bytes());
+                    w356_string(&mut input, environment);
+                    let local = u8::from(environment == b"local");
+                    let gate = authenticated & admin;
+                    assert_eq!(
+                        w366_compute(4, &input).unwrap(),
+                        [authenticated, admin, local, gate, gate | local]
+                    );
+                }
+            }
+        }
+        let input: Vec<u8> = [i64::MIN, i64::MAX, -1]
+            .iter()
+            .flat_map(|v| v.to_ne_bytes())
+            .collect();
+        let output = w366_compute(5, &input).unwrap();
+        assert_eq!(&output[..8], &0_i64.to_ne_bytes());
+        assert_eq!(&output[8..16], &i64::MAX.to_ne_bytes());
+        assert_eq!(&output[16..24], &0_i64.to_ne_bytes());
+        assert_eq!(output[24], 0);
+    }
+
+    #[test]
+    fn invalid_abi_and_short_buffers_never_write() {
+        let mut horizon = vec![1, 1];
+        horizon.extend_from_slice(&0_i64.to_ne_bytes());
+        w356_string(&mut horizon, b"local");
+        let mut count = Vec::new();
+        for value in [i64::MAX, i64::MIN, 3] {
+            count.extend_from_slice(&value.to_ne_bytes());
+        }
+        for (op, input) in [
+            (1, string_frame(b"monitor")),
+            (2, string_frame(b"3")),
+            (3, string_frame(b"2")),
+            (4, horizon),
+            (5, count),
+        ] {
+            let expected = w366_compute(op, &input).unwrap();
+            let mut output = [90_u8; 64];
+            let call = |ptr, len, out, cap| unsafe {
+                nntmux_w366_tmux_horizon_failed_jobs(op, ptr, len, out, cap)
+            };
+            assert_eq!(
+                call(std::ptr::null(), input.len(), output.as_mut_ptr(), 64),
+                -1
+            );
+            assert_eq!(
+                call(input.as_ptr(), input.len(), std::ptr::null_mut(), 64),
+                -1
+            );
+            assert_eq!(
+                call(input.as_ptr(), usize::MAX, output.as_mut_ptr(), 64),
+                -1
+            );
+            assert_eq!(
+                call(input.as_ptr(), W366_MAX_BYTES + 1, output.as_mut_ptr(), 64),
+                -1
+            );
+            assert_eq!(
+                call(input.as_ptr(), input.len(), output.as_mut_ptr(), usize::MAX),
+                -1
+            );
+            assert_eq!(
+                call(
+                    input.as_ptr(),
+                    input.len(),
+                    output.as_mut_ptr(),
+                    W366_MAX_BYTES + 1
+                ),
+                -1
+            );
+            assert_eq!(
+                call(
+                    usize::MAX as *const u8,
+                    input.len(),
+                    output.as_mut_ptr(),
+                    64
+                ),
+                -1
+            );
+            assert_eq!(
+                call(input.as_ptr(), input.len(), usize::MAX as *mut u8, 64),
+                -1
+            );
+            assert_eq!(
+                call(input.as_ptr(), input.len(), output.as_mut_ptr(), 0),
+                -(expected.len() as isize)
+            );
+            assert_eq!(
+                call(
+                    input.as_ptr(),
+                    input.len(),
+                    output.as_mut_ptr(),
+                    expected.len() - 1
+                ),
+                -(expected.len() as isize)
+            );
+            for len in 0..input.len() {
+                assert_eq!(call(input.as_ptr(), len, output.as_mut_ptr(), 64), -1);
+            }
+            let mut extra = input.clone();
+            extra.push(0);
+            assert_eq!(
+                call(extra.as_ptr(), extra.len(), output.as_mut_ptr(), 64),
+                -1
+            );
+            assert_eq!(output, [90; 64]);
+            let mut overlapping = input.clone();
+            assert_eq!(
+                call(
+                    overlapping.as_ptr(),
+                    input.len(),
+                    overlapping.as_mut_ptr(),
+                    input.len()
+                ),
+                -1
+            );
+            assert_eq!(overlapping, input);
+            assert_eq!(
+                call(
+                    input.as_ptr(),
+                    input.len(),
+                    output.as_mut_ptr(),
+                    expected.len()
+                ),
+                expected.len() as isize
+            );
+            assert_eq!(&output[..expected.len()], &expected);
+            assert!(output[expected.len()..].iter().all(|b| *b == 90));
+        }
+        for (op, input) in [
+            (0, vec![]),
+            (6, vec![]),
+            (1, vec![3]),
+            (1, vec![2, 255, 255, 255, 255]),
+            (4, vec![2; 14]),
+        ] {
+            let mut out = [90_u8; 64];
+            assert_eq!(
+                unsafe {
+                    nntmux_w366_tmux_horizon_failed_jobs(
+                        op,
+                        input.as_ptr(),
+                        input.len(),
+                        out.as_mut_ptr(),
+                        64,
+                    )
+                },
+                -1
+            );
+            assert_eq!(out, [90; 64]);
+        }
+    }
+}
