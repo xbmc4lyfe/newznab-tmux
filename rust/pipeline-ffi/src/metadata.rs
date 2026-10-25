@@ -35896,3 +35896,993 @@ pub mod igdb_book_provider_metadata {
         }
     }
 }
+/// Wave 36.4: pure normalization/summary helpers for `TvProcessingServiceProvider`,
+/// `ForumServiceProvider`, `RouteServiceProvider`, `PrivacyPolicyController` and
+/// `TermsController`.
+///
+/// Outputs are `0x1F`-separated with `0x1E` alone for PHP `null`. Multi-field inputs arrive as
+/// one `0x1F`-separated buffer whose field count must match exactly. Unknown flag bits, a
+/// non-empty value behind a cleared presence flag or (for document summaries) any marker byte
+/// in the input decline with `-1` so PHP keeps its own implementation. A result that does not
+/// fit returns `-required` without touching `out_buf`.
+pub mod tv_forum_route_policy_helpers {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    pub const DECLINE: isize = -1;
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+    const MAX_PROVIDER_NAMES: usize = 4096;
+    const FIELD_SEP: u8 = 0x1F;
+    const NULL_MARK: u8 = 0x1E;
+    const TRIM_SET: &[u8] = b" \t\n\r\0\x0B\x0C";
+    const PROVIDER_ORDER: [&str; 5] = ["local", "tvdb", "tvmaze", "tmdb", "trakt"];
+    const POST_LENGTH_MIN: i64 = 1;
+    const POST_LENGTH_MAX: i64 = 65_535;
+    const RATE_LIMIT_MAX: i64 = 600;
+    const BUCKET_NAME_MAX: usize = 64;
+    const BUCKET_DEFAULT_NAME: &[u8] = b"global";
+    const BUCKET_DEFAULT_LIMIT: i64 = 60;
+    const BUCKET_LIMIT_MAX: i64 = 10_000;
+    const BUCKET_DECAY_SECONDS: &[u8] = b"60";
+    const BUCKET_HAS_NAME: u32 = 1;
+    const BUCKET_HAS_BY: u32 = 2;
+    const DOC_HAS_MARKDOWN: u32 = 1;
+    const DOC_HAS_TITLE: u32 = 2;
+    const DOC_DEFAULT_TITLE: &[u8] = b"NNTmux";
+    const EXCERPT_MAX: usize = 160;
+    const WORDS_PER_MINUTE: usize = 200;
+
+    unsafe fn valid_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null()
+            || len > MAX_INPUT
+            || len > isize::MAX as usize
+            || (ptr as usize).checked_add(len).is_none()
+        {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn valid_out_buf(out_buf: *mut u8, out_cap: usize) -> bool {
+        !out_buf.is_null()
+            && out_cap <= isize::MAX as usize
+            && (out_buf as usize).checked_add(out_cap).is_some()
+    }
+
+    /// Copies `bytes` into `out_buf`, returning the length or `-required` when it does not fit.
+    unsafe fn write_bytes(bytes: &[u8], out_buf: *mut u8, out_cap: usize) -> isize {
+        if bytes.len() > isize::MAX as usize {
+            return DECLINE;
+        }
+        if bytes.len() > out_cap {
+            return -(bytes.len() as isize);
+        }
+        if !bytes.is_empty() {
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len()) };
+        }
+        bytes.len() as isize
+    }
+
+    fn finish(encoded: Option<Vec<u8>>, out_buf: *mut u8, out_cap: usize) -> isize {
+        match encoded {
+            // Every encoding has at least three fields, so `-1` (DECLINE) never doubles as a
+            // "needs one byte" answer.
+            Some(bytes) => unsafe { write_bytes(&bytes, out_buf, out_cap) },
+            None => DECLINE,
+        }
+    }
+
+    /// Joins fields with the separator; `None` encodes PHP `null`.
+    fn encode(fields: &[Option<&[u8]>]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(fields.iter().map(|f| f.map_or(1, <[u8]>::len) + 1).sum());
+        for (i, field) in fields.iter().enumerate() {
+            if i > 0 {
+                out.push(FIELD_SEP);
+            }
+            out.extend_from_slice(field.unwrap_or(&[NULL_MARK]));
+        }
+        out
+    }
+
+    #[inline]
+    fn bool_bytes(value: bool) -> &'static [u8] {
+        if value { b"1" } else { b"0" }
+    }
+
+    #[inline]
+    fn flag(value: u32) -> Option<bool> {
+        match value {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+
+    /// PHP `trim($value, " \t\n\r\0\x0B\x0C")` on bytes.
+    fn trim_ws(value: &[u8]) -> &[u8] {
+        let start = value
+            .iter()
+            .position(|b| !TRIM_SET.contains(b))
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|b| !TRIM_SET.contains(b))
+            .map_or(start, |i| i + 1);
+        &value[start..end]
+    }
+
+    /// PHP `preg_replace('/[ \t\n\r\0\x0B\x0C]+/', ' ', $value)` appended to `out`.
+    fn push_collapsed(out: &mut Vec<u8>, value: &[u8]) {
+        let mut in_run = false;
+        for &b in value {
+            if TRIM_SET.contains(&b) {
+                if !in_run {
+                    out.push(b' ');
+                    in_run = true;
+                }
+            } else {
+                out.push(b);
+                in_run = false;
+            }
+        }
+    }
+
+    /// PHP `preg_replace('/[^a-z0-9]+/', $sep, strtolower($value))` with `$sep` possibly empty.
+    fn ascii_slug(value: &[u8], sep: Option<u8>) -> Vec<u8> {
+        let mut out = Vec::with_capacity(value.len());
+        let mut in_run = false;
+        for &b in value {
+            let b = b.to_ascii_lowercase();
+            if b.is_ascii_lowercase() || b.is_ascii_digit() {
+                out.push(b);
+                in_run = false;
+            } else if !in_run {
+                if let Some(sep) = sep {
+                    out.push(sep);
+                }
+                in_run = true;
+            }
+        }
+        out
+    }
+
+    fn trim_byte(value: &[u8], byte: u8) -> &[u8] {
+        let start = value.iter().position(|&b| b != byte).unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|&b| b != byte)
+            .map_or(start, |i| i + 1);
+        &value[start..end]
+    }
+
+    /// `TvProcessingServiceProvider::normalizeProviderPipelineOrderPhp()`:
+    /// `(duplicates, fallback_added, provider_count, providers..., ignored...)`.
+    pub fn provider_order_encode(
+        count: usize,
+        include_fallback: bool,
+        input: &[u8],
+    ) -> Option<Vec<u8>> {
+        if count > MAX_PROVIDER_NAMES || (count == 0 && !input.is_empty()) {
+            return None;
+        }
+        let names: Vec<&[u8]> = if count == 0 {
+            Vec::new()
+        } else {
+            input.split(|&b| b == FIELD_SEP).collect()
+        };
+        if names.len() != count {
+            return None;
+        }
+        let mut providers: Vec<&'static str> = Vec::with_capacity(PROVIDER_ORDER.len());
+        let mut ignored: Vec<Vec<u8>> = Vec::new();
+        let mut duplicates = 0usize;
+        for raw in names {
+            let key = ascii_slug(raw, None);
+            if key.is_empty() {
+                continue;
+            }
+            let key: &[u8] = match key.as_slice() {
+                b"localdb" => b"local",
+                b"thetvdb" => b"tvdb",
+                b"themoviedb" => b"tmdb",
+                other => other,
+            };
+            let Some(&known) = PROVIDER_ORDER.iter().find(|p| p.as_bytes() == key) else {
+                ignored.push(key.to_vec());
+                continue;
+            };
+            if providers.contains(&known) {
+                duplicates += 1;
+            } else {
+                providers.push(known);
+            }
+        }
+        let mut added = 0usize;
+        if include_fallback {
+            for known in PROVIDER_ORDER {
+                if !providers.contains(&known) {
+                    providers.push(known);
+                    added += 1;
+                }
+            }
+        }
+        let duplicates = duplicates.to_string();
+        let added = added.to_string();
+        let provider_count = providers.len().to_string();
+        let mut fields: Vec<Option<&[u8]>> =
+            Vec::with_capacity(3 + providers.len() + ignored.len());
+        fields.push(Some(duplicates.as_bytes()));
+        fields.push(Some(added.as_bytes()));
+        fields.push(Some(provider_count.as_bytes()));
+        fields.extend(providers.iter().map(|p| Some(p.as_bytes())));
+        fields.extend(ignored.iter().map(|i| Some(i.as_slice())));
+        Some(encode(&fields))
+    }
+
+    /// `ForumServiceProvider::summarizeForumPolicyConfigPhp()`: `(min_post_length,
+    /// max_post_length, rate_limit_per_minute, rate_limited, cooldown_seconds, allow_guest_read,
+    /// adjusted, summary)`.
+    pub fn forum_policy_encode(
+        min_len: i64,
+        max_len: i64,
+        rate: i64,
+        allow_guest_read: bool,
+    ) -> Vec<u8> {
+        let min = min_len.clamp(POST_LENGTH_MIN, POST_LENGTH_MAX);
+        let max = max_len.clamp(POST_LENGTH_MIN, POST_LENGTH_MAX).max(min);
+        let per_minute = rate.clamp(0, RATE_LIMIT_MAX);
+        let cooldown = if per_minute > 0 {
+            (60 + per_minute - 1) / per_minute
+        } else {
+            0
+        };
+        let adjusted = min != min_len || max != max_len || per_minute != rate;
+        let rate_text = if per_minute > 0 {
+            format!("{per_minute}/min")
+        } else {
+            "no rate limit".to_string()
+        };
+        let guests = if allow_guest_read {
+            "may read"
+        } else {
+            "must sign in"
+        };
+        let summary = format!("Posts {min}-{max} chars; {rate_text}; guests {guests}");
+        let (min, max, per_minute, cooldown) = (
+            min.to_string(),
+            max.to_string(),
+            per_minute.to_string(),
+            cooldown.to_string(),
+        );
+        encode(&[
+            Some(min.as_bytes()),
+            Some(max.as_bytes()),
+            Some(per_minute.as_bytes()),
+            Some(bool_bytes(per_minute != "0")),
+            Some(cooldown.as_bytes()),
+            Some(bool_bytes(allow_guest_read)),
+            Some(bool_bytes(adjusted)),
+            Some(summary.as_bytes()),
+        ])
+    }
+
+    /// `RouteServiceProvider::normalizeRateLimitBucketSpecPhp()`: `(name, per_minute, by, key,
+    /// decay_seconds, is_default_name, by_fallback)`. Input is `bucket_name`, `by_key`.
+    pub fn rate_limit_bucket_encode(flags: u32, per_minute: i64, input: &[u8]) -> Option<Vec<u8>> {
+        if flags & !(BUCKET_HAS_NAME | BUCKET_HAS_BY) != 0 {
+            return None;
+        }
+        let mut parts = input.split(|&b| b == FIELD_SEP);
+        let (Some(name), Some(by), None) = (parts.next(), parts.next(), parts.next()) else {
+            return None;
+        };
+        let has_name = flags & BUCKET_HAS_NAME != 0;
+        let has_by = flags & BUCKET_HAS_BY != 0;
+        if (!has_name && !name.is_empty()) || (!has_by && !by.is_empty()) {
+            return None;
+        }
+        let slug = ascii_slug(name, Some(b'-'));
+        let mut name = trim_byte(&slug, b'-');
+        if name.len() > BUCKET_NAME_MAX {
+            let cut = &name[..BUCKET_NAME_MAX];
+            let end = cut.iter().rposition(|&b| b != b'-').map_or(0, |i| i + 1);
+            name = &cut[..end];
+        }
+        let is_default_name = name.is_empty();
+        if is_default_name {
+            name = BUCKET_DEFAULT_NAME;
+        }
+        let limit = if per_minute <= 0 {
+            BUCKET_DEFAULT_LIMIT
+        } else {
+            per_minute.min(BUCKET_LIMIT_MAX)
+        };
+        let by_key = trim_ws(by).to_ascii_lowercase();
+        let (by, by_fallback): (&[u8], bool) = match by_key.as_slice() {
+            b"ip" if has_by => (b"ip", false),
+            b"user" if has_by => (b"user", false),
+            b"token" if has_by => (b"token", false),
+            _ => (b"ip", true),
+        };
+        let mut key = Vec::with_capacity(5 + name.len() + 1 + by.len());
+        key.extend_from_slice(b"rate:");
+        key.extend_from_slice(name);
+        key.push(b':');
+        key.extend_from_slice(by);
+        let limit = limit.to_string();
+        Some(encode(&[
+            Some(name),
+            Some(limit.as_bytes()),
+            Some(by),
+            Some(&key),
+            Some(BUCKET_DECAY_SECONDS),
+            Some(bool_bytes(is_default_name)),
+            Some(bool_bytes(by_fallback)),
+        ]))
+    }
+
+    pub const DOC_PRIVACY: u8 = 0;
+    pub const DOC_TERMS: u8 = 1;
+
+    /// `PrivacyPolicyController::summarizePolicyDocumentPhp()` and
+    /// `TermsController::summarizeTermsDocumentPhp()`: `(title, meta_title, meta_description,
+    /// first_heading, excerpt, headings, paragraphs, words, bytes, reading_minutes, has_content)`.
+    pub fn document_summary_encode(
+        kind: u8,
+        markdown: &[u8],
+        site_title: &[u8],
+    ) -> Option<Vec<u8>> {
+        if markdown.contains(&FIELD_SEP)
+            || markdown.contains(&NULL_MARK)
+            || site_title.contains(&FIELD_SEP)
+            || site_title.contains(&NULL_MARK)
+        {
+            return None;
+        }
+        let (title_suffix, description_prefix): (&[u8], &[u8]) = match kind {
+            DOC_PRIVACY => (b" - Privacy Policy", b"Privacy Policy for "),
+            DOC_TERMS => (b" - Terms and conditions", b"Terms and Conditions for "),
+            _ => return None,
+        };
+        let mut title = Vec::with_capacity(site_title.len());
+        push_collapsed(&mut title, trim_ws(site_title));
+        if title.is_empty() {
+            title = DOC_DEFAULT_TITLE.to_vec();
+        }
+
+        // Lines split on "\r\n", "\r" or "\n" exactly like PHP's str_replace + explode.
+        let mut headings = 0usize;
+        let mut paragraphs = 0usize;
+        let mut first_heading: Option<&[u8]> = None;
+        let mut first_paragraph: Vec<&[u8]> = Vec::new();
+        let mut in_paragraph = false;
+        let mut words = 0usize;
+        let mut rest = markdown;
+        loop {
+            let (line, next) = match rest.iter().position(|&b| b == b'\n' || b == b'\r') {
+                Some(i) => {
+                    let skip = if rest[i] == b'\r' && rest.get(i + 1) == Some(&b'\n') {
+                        2
+                    } else {
+                        1
+                    };
+                    (&rest[..i], Some(&rest[i + skip..]))
+                }
+                None => (rest, None),
+            };
+            words += line
+                .split(|b| TRIM_SET.contains(b))
+                .filter(|w| !w.is_empty())
+                .count();
+            let trimmed = trim_ws(line);
+            if trimmed.is_empty() {
+                in_paragraph = false;
+            } else if trimmed[0] == b'#' {
+                headings += 1;
+                if first_heading.is_none() {
+                    let text = trim_ws(trim_leading(trimmed, b'#'));
+                    if !text.is_empty() {
+                        first_heading = Some(text);
+                    }
+                }
+                in_paragraph = false;
+            } else {
+                if !in_paragraph {
+                    paragraphs += 1;
+                    in_paragraph = true;
+                }
+                if paragraphs == 1 {
+                    first_paragraph.push(trimmed);
+                }
+            }
+            match next {
+                Some(next) => rest = next,
+                None => break,
+            }
+        }
+
+        let excerpt = (!first_paragraph.is_empty()).then(|| {
+            let mut joined = Vec::new();
+            for (i, line) in first_paragraph.iter().enumerate() {
+                if i > 0 {
+                    joined.push(b' ');
+                }
+                push_collapsed(&mut joined, line);
+            }
+            truncate_excerpt(joined)
+        });
+
+        let normalized_bytes = trimmed_normalized_len(markdown);
+        let reading_minutes = words.div_ceil(WORDS_PER_MINUTE);
+        let mut meta_title = title.clone();
+        meta_title.extend_from_slice(title_suffix);
+        let meta_description = match &excerpt {
+            Some(e) => e.clone(),
+            None => [description_prefix, title.as_slice()].concat(),
+        };
+        let (headings, paragraphs, words, bytes, minutes) = (
+            headings.to_string(),
+            paragraphs.to_string(),
+            words.to_string(),
+            normalized_bytes.to_string(),
+            reading_minutes.to_string(),
+        );
+        Some(encode(&[
+            Some(&title),
+            Some(&meta_title),
+            Some(&meta_description),
+            first_heading,
+            excerpt.as_deref(),
+            Some(headings.as_bytes()),
+            Some(paragraphs.as_bytes()),
+            Some(words.as_bytes()),
+            Some(bytes.as_bytes()),
+            Some(minutes.as_bytes()),
+            Some(bool_bytes(normalized_bytes > 0)),
+        ]))
+    }
+
+    fn trim_leading(value: &[u8], byte: u8) -> &[u8] {
+        let start = value.iter().position(|&b| b != byte).unwrap_or(value.len());
+        &value[start..]
+    }
+
+    /// `strlen(trim(str_replace(["\r\n", "\r"], "\n", $markdown), WHITESPACE))`.
+    fn trimmed_normalized_len(markdown: &[u8]) -> usize {
+        let body = trim_ws(markdown);
+        body.len() - body.windows(2).filter(|w| w == b"\r\n").count()
+    }
+
+    /// Cuts to at most 160 bytes on a UTF-8 boundary, preferring the last space, then appends
+    /// `...`.
+    fn truncate_excerpt(text: Vec<u8>) -> Vec<u8> {
+        if text.len() <= EXCERPT_MAX {
+            return text;
+        }
+        let mut cut = EXCERPT_MAX;
+        while cut > 0 && text[cut] & 0xC0 == 0x80 {
+            cut -= 1;
+        }
+        let mut snippet = &text[..cut];
+        if let Some(space) = snippet.iter().rposition(|&b| b == b' ')
+            && space > 0
+        {
+            snippet = &snippet[..space];
+        }
+        let end = snippet
+            .iter()
+            .rposition(|&b| b != b' ')
+            .map_or(0, |i| i + 1);
+        let mut out = snippet[..end].to_vec();
+        out.extend_from_slice(b"...");
+        out
+    }
+
+    /// `TvProcessingServiceProvider::normalizeProviderPipelineOrder()`; input is the string
+    /// provider names joined with `0x1F` (`name_count` of them, empty input when zero).
+    ///
+    /// # Safety
+    /// Non-null input pointers must be readable for their lengths and `out_buf` writable for
+    /// `out_cap` bytes; null or oversized buffers decline with `-1`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w364_tv_provider_pipeline_order(
+        name_count: usize,
+        include_fallback: u32,
+        input_ptr: *const u8,
+        input_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(include_fallback) = flag(include_fallback) else {
+                return DECLINE;
+            };
+            let Some(input) = (unsafe { valid_slice(input_ptr, input_len) }) else {
+                return DECLINE;
+            };
+            finish(
+                provider_order_encode(name_count, include_fallback, input),
+                out_buf,
+                out_cap,
+            )
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `ForumServiceProvider::summarizeForumPolicyConfig()`; `allow_guest_read` is `0` or `1`.
+    ///
+    /// # Safety
+    /// `out_buf` must be writable for `out_cap` bytes; a null or oversized buffer declines with
+    /// `-1`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w364_forum_policy_summary(
+        min_post_length: i64,
+        max_post_length: i64,
+        rate_limit_per_minute: i64,
+        allow_guest_read: u32,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(allow_guest_read) = flag(allow_guest_read) else {
+                return DECLINE;
+            };
+            finish(
+                Some(forum_policy_encode(
+                    min_post_length,
+                    max_post_length,
+                    rate_limit_per_minute,
+                    allow_guest_read,
+                )),
+                out_buf,
+                out_cap,
+            )
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `RouteServiceProvider::normalizeRateLimitBucketSpec()`; input is `bucket_name`, `by_key`.
+    /// `flags` bit 0/1 mark a non-null bucket name and by-key (a cleared bit requires the
+    /// matching field to be empty).
+    ///
+    /// # Safety
+    /// Non-null input pointers must be readable for their lengths and `out_buf` writable for
+    /// `out_cap` bytes; null or oversized buffers decline with `-1`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w364_route_rate_limit_bucket(
+        flags: u32,
+        per_minute_limit: i64,
+        input_ptr: *const u8,
+        input_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(input) = (unsafe { valid_slice(input_ptr, input_len) }) else {
+                return DECLINE;
+            };
+            finish(
+                rate_limit_bucket_encode(flags, per_minute_limit, input),
+                out_buf,
+                out_cap,
+            )
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Shared body of the two document exports; `flags` bit 0/1 mark a non-null markdown body
+    /// and site title (a cleared bit requires the matching buffer to be empty).
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn document_export(
+        kind: u8,
+        flags: u32,
+        markdown_ptr: *const u8,
+        markdown_len: usize,
+        title_ptr: *const u8,
+        title_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) || flags & !(DOC_HAS_MARKDOWN | DOC_HAS_TITLE) != 0
+            {
+                return DECLINE;
+            }
+            let (Some(markdown), Some(title)) =
+                (unsafe { valid_slice(markdown_ptr, markdown_len) }, unsafe {
+                    valid_slice(title_ptr, title_len)
+                })
+            else {
+                return DECLINE;
+            };
+            if (flags & DOC_HAS_MARKDOWN == 0 && !markdown.is_empty())
+                || (flags & DOC_HAS_TITLE == 0 && !title.is_empty())
+            {
+                return DECLINE;
+            }
+            finish(
+                document_summary_encode(kind, markdown, title),
+                out_buf,
+                out_cap,
+            )
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `PrivacyPolicyController::summarizePolicyDocument()`.
+    ///
+    /// # Safety
+    /// Non-null input pointers must be readable for their lengths and `out_buf` writable for
+    /// `out_cap` bytes; null or oversized buffers decline with `-1`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w364_privacy_policy_summary(
+        flags: u32,
+        markdown_ptr: *const u8,
+        markdown_len: usize,
+        title_ptr: *const u8,
+        title_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            document_export(
+                DOC_PRIVACY,
+                flags,
+                markdown_ptr,
+                markdown_len,
+                title_ptr,
+                title_len,
+                out_buf,
+                out_cap,
+            )
+        }
+    }
+
+    /// `TermsController::summarizeTermsDocument()`.
+    ///
+    /// # Safety
+    /// Non-null input pointers must be readable for their lengths and `out_buf` writable for
+    /// `out_cap` bytes; null or oversized buffers decline with `-1`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w364_terms_summary(
+        flags: u32,
+        markdown_ptr: *const u8,
+        markdown_len: usize,
+        title_ptr: *const u8,
+        title_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            document_export(
+                DOC_TERMS,
+                flags,
+                markdown_ptr,
+                markdown_len,
+                title_ptr,
+                title_len,
+                out_buf,
+                out_cap,
+            )
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn s(bytes: Option<Vec<u8>>) -> Option<String> {
+            bytes.map(|b| String::from_utf8_lossy(&b).into_owned())
+        }
+
+        #[test]
+        fn provider_order_follows_php() {
+            assert_eq!(
+                s(provider_order_encode(
+                    4,
+                    true,
+                    b" TMDB \x1FTheTVDB\x1Ftmdb\x1Fimdb"
+                )),
+                Some("1\x1F3\x1F5\x1Ftmdb\x1Ftvdb\x1Flocal\x1Ftvmaze\x1Ftrakt\x1Fimdb".into())
+            );
+            assert_eq!(
+                s(provider_order_encode(
+                    3,
+                    false,
+                    b"Local_DB\x1F--\x1FTV-Maze"
+                )),
+                Some("0\x1F0\x1F2\x1Flocal\x1Ftvmaze".into())
+            );
+            assert_eq!(
+                s(provider_order_encode(0, false, b"")),
+                Some("0\x1F0\x1F0".into())
+            );
+            assert_eq!(
+                s(provider_order_encode(1, true, b"")),
+                Some("0\x1F5\x1F5\x1Flocal\x1Ftvdb\x1Ftvmaze\x1Ftmdb\x1Ftrakt".into())
+            );
+            assert_eq!(provider_order_encode(0, true, b"x"), None);
+            assert_eq!(provider_order_encode(2, true, b"x"), None);
+            assert_eq!(
+                provider_order_encode(MAX_PROVIDER_NAMES + 1, true, b"x"),
+                None
+            );
+        }
+
+        #[test]
+        fn forum_policy_follows_php() {
+            assert_eq!(
+                s(Some(forum_policy_encode(10, 5000, 6, true))),
+                Some("10\x1F5000\x1F6\x1F1\x1F10\x1F1\x1F0\x1FPosts 10-5000 chars; 6/min; guests may read".into())
+            );
+            assert_eq!(
+                s(Some(forum_policy_encode(i64::MIN, i64::MIN, i64::MAX, false))),
+                Some("1\x1F1\x1F600\x1F1\x1F1\x1F0\x1F1\x1FPosts 1-1 chars; 600/min; guests must sign in".into())
+            );
+            assert_eq!(
+                s(Some(forum_policy_encode(i64::MAX, 3, -4, true))),
+                Some("65535\x1F65535\x1F0\x1F0\x1F0\x1F1\x1F1\x1FPosts 65535-65535 chars; no rate limit; guests may read".into())
+            );
+            assert!(forum_policy_encode(1, 10, 7, true).starts_with(b"1\x1F10\x1F7\x1F1\x1F9\x1F"));
+        }
+
+        #[test]
+        fn rate_limit_bucket_follows_php() {
+            assert_eq!(
+                s(rate_limit_bucket_encode(3, 120, b" API  v2 \x1F User ")),
+                Some("api-v2\x1F120\x1Fuser\x1Frate:api-v2:user\x1F60\x1F0\x1F0".into())
+            );
+            assert_eq!(
+                s(rate_limit_bucket_encode(0, 0, b"\x1F")),
+                Some("global\x1F60\x1Fip\x1Frate:global:ip\x1F60\x1F1\x1F1".into())
+            );
+            assert_eq!(
+                s(rate_limit_bucket_encode(3, i64::MAX, b"!!\x1Fsession")),
+                Some("global\x1F10000\x1Fip\x1Frate:global:ip\x1F60\x1F1\x1F1".into())
+            );
+            let long = format!("{}-b", "a".repeat(63));
+            let input = format!("{long}\x1Ftoken");
+            assert_eq!(
+                s(rate_limit_bucket_encode(3, 1, input.as_bytes())),
+                Some(format!(
+                    "{a}\x1F1\x1Ftoken\x1Frate:{a}:token\x1F60\x1F0\x1F0",
+                    a = "a".repeat(63)
+                ))
+            );
+            assert_eq!(rate_limit_bucket_encode(4, 1, b"\x1F"), None);
+            assert_eq!(rate_limit_bucket_encode(0, 1, b"x\x1F"), None);
+            assert_eq!(rate_limit_bucket_encode(1, 1, b"x\x1Fip"), None);
+            assert_eq!(rate_limit_bucket_encode(3, 1, b"x"), None);
+            assert_eq!(rate_limit_bucket_encode(3, 1, b"x\x1Fy\x1Fz"), None);
+        }
+
+        #[test]
+        fn document_summary_follows_php() {
+            let md = b"# Privacy  Policy\r\n\r\nWe store\tlittle data.\nReally.\r\rSecond para\n## Next\n";
+            assert_eq!(
+                s(document_summary_encode(DOC_PRIVACY, md, b" My \t Site ")),
+                Some(
+                    "My Site\x1FMy Site - Privacy Policy\x1FWe store little data. Really.\x1FPrivacy  Policy\x1FWe store little data. Really.\x1F2\x1F2\x1F12\x1F69\x1F1\x1F1"
+                        .into()
+                )
+            );
+            assert_eq!(
+                s(document_summary_encode(DOC_TERMS, b"", b"")),
+                Some(
+                    "NNTmux\x1FNNTmux - Terms and conditions\x1FTerms and Conditions for NNTmux\x1F\x1E\x1F\x1E\x1F0\x1F0\x1F0\x1F0\x1F0\x1F0"
+                        .into()
+                )
+            );
+            assert_eq!(
+                s(document_summary_encode(DOC_TERMS, b"###\n#  T  \n", b"x")),
+                Some(
+                    "x\x1Fx - Terms and conditions\x1FTerms and Conditions for x\x1FT\x1F\x1E\x1F2\x1F0\x1F3\x1F8\x1F1\x1F1"
+                        .into()
+                )
+            );
+            let long = "word ".repeat(40);
+            let out = document_summary_encode(DOC_PRIVACY, long.as_bytes(), b"").unwrap();
+            let fields: Vec<&[u8]> = out.split(|&b| b == FIELD_SEP).collect();
+            assert_eq!(fields[4].len(), 159 + 3);
+            assert!(fields[4].ends_with(b"word..."));
+            let utf8 = "é".repeat(100);
+            let out = document_summary_encode(DOC_PRIVACY, utf8.as_bytes(), b"").unwrap();
+            let fields: Vec<&[u8]> = out.split(|&b| b == FIELD_SEP).collect();
+            assert_eq!(fields[4], [&utf8.as_bytes()[..160], b"..."].concat());
+            assert_eq!(document_summary_encode(2, b"", b""), None);
+            assert_eq!(document_summary_encode(DOC_PRIVACY, b"a\x1Fb", b""), None);
+            assert_eq!(document_summary_encode(DOC_PRIVACY, b"", b"\x1E"), None);
+        }
+
+        #[test]
+        fn exports_validate_arguments_and_capacity() {
+            let mut out = [0u8; 512];
+            let input = b"tvdb\x1Ftmdb";
+            let call = |count, fallback, ptr: *const u8, len, out: &mut [u8]| unsafe {
+                nntmux_w364_tv_provider_pipeline_order(
+                    count,
+                    fallback,
+                    ptr,
+                    len,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            let written = call(2, 0, input.as_ptr(), input.len(), &mut out);
+            assert_eq!(&out[..written as usize], b"0\x1F0\x1F2\x1Ftvdb\x1Ftmdb");
+            assert_eq!(call(2, 2, input.as_ptr(), input.len(), &mut out), DECLINE);
+            assert_eq!(call(0, 0, std::ptr::null(), 0, &mut out), DECLINE);
+            assert_eq!(call(1, 0, input.as_ptr(), MAX_INPUT + 1, &mut out), DECLINE);
+
+            let mut small = [b'Z'; 4];
+            let needed = call(2, 1, input.as_ptr(), input.len(), &mut small);
+            assert!(needed < DECLINE);
+            assert_eq!(small, [b'Z'; 4]);
+            let mut exact = vec![0u8; (-needed) as usize];
+            assert_eq!(call(2, 1, input.as_ptr(), input.len(), &mut exact), -needed);
+
+            unsafe {
+                assert_eq!(
+                    nntmux_w364_tv_provider_pipeline_order(
+                        0,
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        std::ptr::null_mut(),
+                        64
+                    ),
+                    DECLINE
+                );
+                assert!(
+                    nntmux_w364_forum_policy_summary(1, 2, 3, 1, out.as_mut_ptr(), out.len()) > 0
+                );
+                assert_eq!(
+                    nntmux_w364_forum_policy_summary(1, 2, 3, 2, out.as_mut_ptr(), out.len()),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w364_forum_policy_summary(1, 2, 3, 0, std::ptr::null_mut(), 0),
+                    DECLINE
+                );
+                let mut tiny = [b'Z'; 2];
+                assert!(
+                    nntmux_w364_forum_policy_summary(1, 2, 3, 0, tiny.as_mut_ptr(), tiny.len())
+                        < DECLINE
+                );
+                assert_eq!(tiny, [b'Z'; 2]);
+
+                assert!(
+                    nntmux_w364_route_rate_limit_bucket(
+                        3,
+                        5,
+                        b"a\x1Fip".as_ptr(),
+                        4,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ) > 0
+                );
+                assert_eq!(
+                    nntmux_w364_route_rate_limit_bucket(
+                        8,
+                        5,
+                        b"\x1F".as_ptr(),
+                        1,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w364_route_rate_limit_bucket(
+                        0,
+                        5,
+                        std::ptr::null(),
+                        0,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    DECLINE
+                );
+
+                let md = b"# T\nbody";
+                let written = nntmux_w364_privacy_policy_summary(
+                    3,
+                    md.as_ptr(),
+                    md.len(),
+                    b"S".as_ptr(),
+                    1,
+                    out.as_mut_ptr(),
+                    out.len(),
+                );
+                assert!(written > 0);
+                assert!(
+                    out[..written as usize].starts_with(b"S\x1FS - Privacy Policy\x1Fbody\x1FT")
+                );
+                let written = nntmux_w364_terms_summary(
+                    0,
+                    b"".as_ptr(),
+                    0,
+                    b"".as_ptr(),
+                    0,
+                    out.as_mut_ptr(),
+                    out.len(),
+                );
+                assert!(
+                    out[..written as usize].starts_with(b"NNTmux\x1FNNTmux - Terms and conditions")
+                );
+                assert_eq!(
+                    nntmux_w364_terms_summary(
+                        4,
+                        b"".as_ptr(),
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w364_terms_summary(
+                        0,
+                        md.as_ptr(),
+                        md.len(),
+                        b"".as_ptr(),
+                        0,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    DECLINE
+                );
+                assert!(
+                    nntmux_w364_terms_summary(
+                        2,
+                        b"".as_ptr(),
+                        0,
+                        b"S".as_ptr(),
+                        1,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ) > 0
+                );
+                assert_eq!(
+                    nntmux_w364_privacy_policy_summary(
+                        1,
+                        std::ptr::null(),
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w364_privacy_policy_summary(
+                        1,
+                        md.as_ptr(),
+                        md.len(),
+                        b"".as_ptr(),
+                        0,
+                        std::ptr::null_mut(),
+                        0
+                    ),
+                    DECLINE
+                );
+            }
+        }
+    }
+}
