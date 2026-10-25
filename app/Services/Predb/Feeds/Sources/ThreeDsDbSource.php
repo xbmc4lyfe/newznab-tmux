@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Predb\Feeds\Sources;
 
+use App\Services\Predb\Feeds\PredbFeedImporter;
 use App\Support\RustPipelineLibrary;
 use FFI;
 use Throwable;
@@ -15,6 +16,14 @@ final class ThreeDsDbSource extends CompleteXmlCatalogueSource
      * tests/Unit/RustPredbSourcesHttpNswdb3dsdbRateParityTest.php is below 1.5x.
      */
     public const bool THREE_DS_DB_RUST_FFI_DEFAULT = false;
+
+    /**
+     * Wave 46.2 production default for summarizeThreeDsDbIdBatch() is Rust: the paired benchmark in
+     * tests/Unit/RustPredbFeedsSrrdb3dsdbXrelNswdbImporterW46ParityTest.php measures 2.24-2.33x mean and 1.94-2.46x
+     * p99 on common pages and 2.09-2.12x mean and 1.80-2.12x p99 on uncommon batches. PHP stays the fallback when the
+     * library is unavailable.
+     */
+    public const bool W462_RUST_FFI_DEFAULT = true;
 
     /** Distinct from the parent HTTP feed, bounded feed and catalogue FFI constants. */
     private const string THREE_DS_DB_FFI_CDEF = <<<'C'
@@ -39,6 +48,10 @@ final class ThreeDsDbSource extends CompleteXmlCatalogueSource
     private static ?bool $threeDsDbUseRustFfi = null;
 
     private static FFI|false|null $threeDsDbFfi = null;
+
+    private static ?bool $w462RustFfiOverride = null;
+
+    private static FFI|false|null $w462RustFfiHandle = null;
 
     public function key(): string
     {
@@ -165,5 +178,101 @@ final class ThreeDsDbSource extends CompleteXmlCatalogueSource
         } catch (Throwable) {
             return null;
         }
+    }
+
+    /** Force the Wave 46.2 helper onto Rust (true) or PHP (false); null restores W462_RUST_FFI_DEFAULT. */
+    public static function useW462RustFfi(?bool $enable = true): void
+    {
+        self::$w462RustFfiOverride = $enable;
+    }
+
+    public static function usesW462RustFfi(): bool
+    {
+        return self::$w462RustFfiOverride ?? self::W462_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW462RustFfi(): void
+    {
+        self::$w462RustFfiOverride = null;
+        self::$w462RustFfiHandle = null;
+    }
+
+    /**
+     * Summarize 3dsdb catalogue IDs as parseXml() checks them: non-strings are invalid, IDs outside
+     * ^[1-9][0-9]*$ are malformed, IDs FILTER_VALIDATE_INT rejects overflow and repeated IDs are duplicates; the
+     * rest are accepted, with the largest accepted ID (0 without one).
+     *
+     * @param  array<array-key, mixed>  $ids
+     * @return array{total: int, invalid: int, malformed: int, overflow: int, duplicate: int, accepted: int, max_id: int}
+     */
+    public static function summarizeThreeDsDbIdBatch(array $ids): array
+    {
+        return (self::usesW462RustFfi() ? self::summarizeThreeDsDbIdBatchNative($ids) : null)
+            ?? self::summarizeThreeDsDbIdBatchPhp($ids);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $ids
+     * @return array{total: int, invalid: int, malformed: int, overflow: int, duplicate: int, accepted: int, max_id: int}
+     */
+    public static function summarizeThreeDsDbIdBatchPhp(array $ids): array
+    {
+        $summary = ['total' => \count($ids), 'invalid' => 0, 'malformed' => 0, 'overflow' => 0, 'duplicate' => 0, 'accepted' => 0, 'max_id' => 0];
+        $seen = [];
+        foreach ($ids as $id) {
+            if (! \is_string($id)) {
+                $summary['invalid']++;
+
+                continue;
+            }
+            if (preg_match('/^[1-9][0-9]*$/D', $id) !== 1) {
+                $summary['malformed']++;
+
+                continue;
+            }
+            $value = filter_var($id, FILTER_VALIDATE_INT);
+            if ($value === false) {
+                $summary['overflow']++;
+
+                continue;
+            }
+            if (isset($seen[$value])) {
+                $summary['duplicate']++;
+
+                continue;
+            }
+            $seen[$value] = true;
+            $summary['accepted']++;
+            $summary['max_id'] = max($summary['max_id'], $value);
+        }
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $ids
+     * @return array{total: int, invalid: int, malformed: int, overflow: int, duplicate: int, accepted: int, max_id: int}|null
+     */
+    public static function summarizeThreeDsDbIdBatchNative(array $ids): ?array
+    {
+        $values = PredbFeedImporter::w462Summary(self::w462RustFfi(), 1, $ids, 7);
+        if ($values === null) {
+            return null;
+        }
+        [$total, $invalid, $malformed, $overflow, $duplicate, $accepted, $max] = $values;
+        if ($total !== \count($ids) || min($values) < 0 || $invalid + $malformed + $overflow + $duplicate + $accepted !== $total
+            || ($max > 0) !== ($accepted > 0) || ($duplicate > 0 && $accepted === 0)) {
+            return null;
+        }
+
+        return ['total' => $total, 'invalid' => $invalid, 'malformed' => $malformed, 'overflow' => $overflow, 'duplicate' => $duplicate,
+            'accepted' => $accepted, 'max_id' => $max];
+    }
+
+    private static function w462RustFfi(): ?FFI
+    {
+        self::$w462RustFfiHandle ??= RustPipelineLibrary::resolveDomain(PredbFeedImporter::W462_FFI_DOMAIN, PredbFeedImporter::W462_FFI_CDEF) ?? false;
+
+        return self::$w462RustFfiHandle === false ? null : self::$w462RustFfiHandle;
     }
 }
