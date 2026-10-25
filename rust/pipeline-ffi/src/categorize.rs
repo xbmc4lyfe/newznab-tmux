@@ -33019,3 +33019,675 @@ pub mod categorizers_music_pc_tv_xxx_pipe_w433 {
         }
     }
 }
+
+/// Wave 44.3 batch summaries for `ReleaseContext` and the apibay, complete XML catalogue,
+/// crowdNFO and DATS PC ISO PreDB feed sources.
+///
+/// Reuses the Wave 42.3 packed string list contract: every export takes `blob` plus little-endian
+/// `u32` lengths and writes `0x1F`-separated decimals, returning the byte count, `-required`
+/// (without writing) when the output does not fit, or `-1` for invalid input.
+pub mod release_context_predb_feeds_w443 {
+    use super::categorizers_book_console_group_misc_movie_w423::{
+        NeedleSet, fields, first_class, with_strings,
+    };
+
+    /// PHP `trim()` default character set.
+    const TRIM_SET: &[u8] = b" \t\n\r\0\x0B";
+    /// `W443_MAX_TITLE_BYTES` in the catalogue and DATS sources.
+    const MAX_TITLE_BYTES: usize = 255;
+    /// UTF-8 horizontal ellipsis.
+    const ELLIPSIS: &[u8] = "\u{2026}".as_bytes();
+
+    /// `ReleaseContext::W443_CONTEXT_MARKERS` (adult, pack, web, foreign), then
+    /// `W443_PROPER_MARKERS`.
+    const CONTEXT_NEEDLES: NeedleSet<22> = NeedleSet::new([
+        (b"xxx", 0),
+        (b"onlyfans", 0),
+        (b"porn", 0),
+        (b"brazzers", 0),
+        (b"milf", 0),
+        (b"complete", 1),
+        (b"season", 1),
+        (b"collection", 1),
+        (b"boxset", 1),
+        (b"web-dl", 2),
+        (b"webrip", 2),
+        (b"web.dl", 2),
+        (b"amzn", 2),
+        (b"german", 3),
+        (b"french", 3),
+        (b"spanish", 3),
+        (b"italian", 3),
+        (b"nordic", 3),
+        (b"multi", 3),
+        (b"proper", 4),
+        (b"repack", 4),
+        (b"rerip", 4),
+    ]);
+    static CONTEXT_NEEDLE_SET: NeedleSet<22> = CONTEXT_NEEDLES;
+    const CONTEXT_CLASS_MASKS: [u32; 4] = [
+        CONTEXT_NEEDLES.class_mask(0),
+        CONTEXT_NEEDLES.class_mask(1),
+        CONTEXT_NEEDLES.class_mask(2),
+        CONTEXT_NEEDLES.class_mask(3),
+    ];
+    const PROPER_MASK: u32 = CONTEXT_NEEDLES.class_mask(4);
+
+    /// `ApibaySource::W443_P2P_GROUP_MARKERS` (yts, rarbg, eztv, galaxy), then
+    /// `W443_CAM_MARKERS`.
+    const APIBAY_NEEDLES: NeedleSet<11> = NeedleSet::new([
+        (b"yts", 0),
+        (b"yify", 0),
+        (b"rarbg", 1),
+        (b"eztv", 2),
+        (b"tgx", 3),
+        (b"torrentgalaxy", 3),
+        (b"galaxyrg", 3),
+        (b"hdcam", 4),
+        (b"camrip", 4),
+        (b"telesync", 4),
+        (b"hdts", 4),
+    ]);
+    static APIBAY_NEEDLE_SET: NeedleSet<11> = APIBAY_NEEDLES;
+    const APIBAY_CLASS_MASKS: [u32; 4] = [
+        APIBAY_NEEDLES.class_mask(0),
+        APIBAY_NEEDLES.class_mask(1),
+        APIBAY_NEEDLES.class_mask(2),
+        APIBAY_NEEDLES.class_mask(3),
+    ];
+    const CAM_MASK: u32 = APIBAY_NEEDLES.class_mask(4);
+
+    /// `DatsPcIsoSource::W443_ARCHIVE_MARKERS`.
+    const ARCHIVE_NEEDLES: NeedleSet<3> = NeedleSet::new([(b".zip", 0), (b".rar", 0), (b".7z", 0)]);
+    static ARCHIVE_NEEDLE_SET: NeedleSet<3> = ARCHIVE_NEEDLES;
+
+    fn trim(bytes: &[u8]) -> &[u8] {
+        let start = bytes
+            .iter()
+            .position(|b| !TRIM_SET.contains(b))
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|b| !TRIM_SET.contains(b))
+            .map_or(start, |i| i + 1);
+        &bytes[start..end]
+    }
+
+    /// Whether any byte satisfies `hit`. Each 32-byte chunk is folded without branches so the scan
+    /// vectorizes; the scan stops after the first chunk with a hit.
+    #[inline(always)]
+    fn any_byte(bytes: &[u8], hit: impl Fn(u8) -> bool + Copy) -> bool {
+        let (chunks, tail) = bytes.as_chunks::<32>();
+        for chunk in chunks {
+            if chunk.iter().fold(false, |acc, &b| acc | hit(b)) {
+                return true;
+            }
+        }
+        tail.iter().fold(false, |acc, &b| acc | hit(b))
+    }
+
+    /// `/[\x00-\x20\x7F]/`: ASCII whitespace, space or control.
+    #[inline]
+    fn has_space_or_control(bytes: &[u8]) -> bool {
+        any_byte(bytes, |b| (b <= 0x20) | (b == 0x7F))
+    }
+
+    /// `/[\x00-\x1F\x7F]/`: ASCII control.
+    #[inline]
+    fn has_control(bytes: &[u8]) -> bool {
+        any_byte(bytes, |b| (b < 0x20) | (b == 0x7F))
+    }
+
+    /// A space, slash or backslash.
+    #[inline]
+    fn has_path_or_space(bytes: &[u8]) -> bool {
+        any_byte(bytes, |b| (b == b' ') | (b == b'/') | (b == b'\\'))
+    }
+
+    /// `str_contains($title, '...') || str_contains($title, '…')`, folded over byte triples.
+    fn truncated(title: &[u8]) -> bool {
+        let (Some(second), Some(third)) = (title.get(1..), title.get(2..)) else {
+            return false;
+        };
+        title
+            .iter()
+            .zip(second)
+            .zip(third)
+            .fold(false, |acc, ((&a, &b), &c)| {
+                acc | ((a == b'.') & (b == b'.') & (c == b'.'))
+                    | ((a == ELLIPSIS[0]) & (b == ELLIPSIS[1]) & (c == ELLIPSIS[2]))
+            })
+    }
+
+    /// `/^[^.]+\.[^.]+(?:\.[^.]+)*-[A-Za-z0-9_]+$/D`: the group follows the last dash, and the
+    /// text before it holds at least two non-empty dot-separated segments.
+    fn scene_shaped(title: &[u8]) -> bool {
+        let Some(dash) = title.iter().rposition(|&b| b == b'-') else {
+            return false;
+        };
+        let (prefix, group) = (&title[..dash], &title[dash + 1..]);
+        if group.is_empty()
+            || any_byte(group, |b| !(b.is_ascii_alphanumeric() | (b == b'_')))
+            || prefix.first() == Some(&b'.')
+            || prefix.last() == Some(&b'.')
+        {
+            return false;
+        }
+        let Some(next) = prefix.get(1..) else {
+            return false;
+        };
+        // Some dot, and no empty segment between two dots.
+        let (dots, doubled) = prefix
+            .iter()
+            .zip(next)
+            .fold((prefix[0] == b'.', false), |(dots, doubled), (&a, &b)| {
+                (dots | (b == b'.'), doubled | ((a == b'.') & (b == b'.')))
+            });
+        dots && !doubled
+    }
+
+    /// `ReleaseContext::summarizeContextMarkerBatch()`: total, adult, pack, web, foreign,
+    /// unknown, proper.
+    pub fn context_marker_batch(names: &[&[u8]]) -> Vec<u8> {
+        let mut counts = [0u64; 5];
+        let mut proper = 0u64;
+        for name in names {
+            let matched = CONTEXT_NEEDLE_SET.matches(name);
+            counts[first_class(matched, &CONTEXT_CLASS_MASKS)] += 1;
+            proper += u64::from(matched & PROPER_MASK != 0);
+        }
+        fields(&[
+            names.len() as u64,
+            counts[0],
+            counts[1],
+            counts[2],
+            counts[3],
+            counts[4],
+            proper,
+        ])
+    }
+
+    /// `ApibaySource::summarizeApibayTitleBatch()`: total, empty, yts, rarbg, eztv, galaxy,
+    /// other, cam.
+    pub fn apibay_title_batch(titles: &[&[u8]]) -> Vec<u8> {
+        let mut empty = 0u64;
+        let mut counts = [0u64; 5];
+        let mut cam = 0u64;
+        for title in titles {
+            let title = trim(title);
+            if title.is_empty() {
+                empty += 1;
+                continue;
+            }
+            let matched = APIBAY_NEEDLE_SET.matches(title);
+            counts[first_class(matched, &APIBAY_CLASS_MASKS)] += 1;
+            cam += u64::from(matched & CAM_MASK != 0);
+        }
+        fields(&[
+            titles.len() as u64,
+            empty,
+            counts[0],
+            counts[1],
+            counts[2],
+            counts[3],
+            counts[4],
+            cam,
+        ])
+    }
+
+    /// `CompleteXmlCatalogueSource::summarizeCatalogueTitleBatch()`: total, accepted, missing,
+    /// nonliteral, overlength, normalized.
+    pub fn catalogue_title_batch(titles: &[&[u8]]) -> Vec<u8> {
+        let mut counts = [0u64; 5];
+        for raw in titles {
+            let title = trim(raw);
+            let slot = if title.is_empty() {
+                1
+            } else if has_space_or_control(title) {
+                2
+            } else if title.len() > MAX_TITLE_BYTES {
+                3
+            } else {
+                counts[4] += u64::from(title.len() != raw.len());
+                0
+            };
+            counts[slot] += 1;
+        }
+        fields(&[
+            titles.len() as u64,
+            counts[0],
+            counts[1],
+            counts[2],
+            counts[3],
+            counts[4],
+        ])
+    }
+
+    /// `CrowdnfoSource::summarizeCrowdnfoHeadingBatch()`: total, empty, nonliteral, truncated,
+    /// scene, other.
+    pub fn crowdnfo_heading_batch(titles: &[&[u8]]) -> Vec<u8> {
+        let mut counts = [0u64; 5];
+        for raw in titles {
+            let title = trim(raw);
+            let slot = if title.is_empty() {
+                0
+            } else if has_space_or_control(title) {
+                1
+            } else if truncated(title) {
+                2
+            } else if scene_shaped(title) {
+                3
+            } else {
+                4
+            };
+            counts[slot] += 1;
+        }
+        fields(&[
+            titles.len() as u64,
+            counts[0],
+            counts[1],
+            counts[2],
+            counts[3],
+            counts[4],
+        ])
+    }
+
+    /// `DatsPcIsoSource::summarizeRomNameBatch()`: total, literal, empty, overlength, control,
+    /// nonliteral, archive.
+    pub fn dats_rom_name_batch(names: &[&[u8]]) -> Vec<u8> {
+        let mut counts = [0u64; 5];
+        let mut archive = 0u64;
+        for name in names {
+            archive += u64::from(ARCHIVE_NEEDLE_SET.matches(name) != 0);
+            let slot = if name.is_empty() {
+                1
+            } else if name.len() > MAX_TITLE_BYTES {
+                2
+            } else if has_control(name) {
+                3
+            } else if has_path_or_space(name) {
+                4
+            } else {
+                0
+            };
+            counts[slot] += 1;
+        }
+        fields(&[
+            names.len() as u64,
+            counts[0],
+            counts[1],
+            counts[2],
+            counts[3],
+            counts[4],
+            archive,
+        ])
+    }
+
+    /// # Safety
+    /// `blob_ptr`/`lens_ptr` must be valid for their lengths in readable bytes, and `out_buf` must be
+    /// valid for `out_cap` writable bytes, not overlapping either input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w443_release_context_marker_batch(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_strings(
+                blob_ptr,
+                blob_len,
+                lens_ptr,
+                lens_len,
+                out_buf,
+                out_cap,
+                context_marker_batch,
+            )
+        }
+    }
+
+    /// # Safety
+    /// `blob_ptr`/`lens_ptr` must be valid for their lengths in readable bytes, and `out_buf` must be
+    /// valid for `out_cap` writable bytes, not overlapping either input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w443_apibay_title_batch(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_strings(
+                blob_ptr,
+                blob_len,
+                lens_ptr,
+                lens_len,
+                out_buf,
+                out_cap,
+                apibay_title_batch,
+            )
+        }
+    }
+
+    /// # Safety
+    /// `blob_ptr`/`lens_ptr` must be valid for their lengths in readable bytes, and `out_buf` must be
+    /// valid for `out_cap` writable bytes, not overlapping either input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w443_complete_xml_catalogue_title_batch(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_strings(
+                blob_ptr,
+                blob_len,
+                lens_ptr,
+                lens_len,
+                out_buf,
+                out_cap,
+                catalogue_title_batch,
+            )
+        }
+    }
+
+    /// # Safety
+    /// `blob_ptr`/`lens_ptr` must be valid for their lengths in readable bytes, and `out_buf` must be
+    /// valid for `out_cap` writable bytes, not overlapping either input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w443_crowdnfo_heading_batch(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_strings(
+                blob_ptr,
+                blob_len,
+                lens_ptr,
+                lens_len,
+                out_buf,
+                out_cap,
+                crowdnfo_heading_batch,
+            )
+        }
+    }
+
+    /// # Safety
+    /// `blob_ptr`/`lens_ptr` must be valid for their lengths in readable bytes, and `out_buf` must be
+    /// valid for `out_cap` writable bytes, not overlapping either input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w443_dats_pciso_rom_name_batch(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_strings(
+                blob_ptr,
+                blob_len,
+                lens_ptr,
+                lens_len,
+                out_buf,
+                out_cap,
+                dats_rom_name_batch,
+            )
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::ptr;
+
+        const DECLINE: isize = -1;
+        const MAX_INPUT: usize = 16 * 1024 * 1024;
+
+        type Export =
+            unsafe extern "C" fn(*const u8, usize, *const u8, usize, *mut u8, usize) -> isize;
+
+        const EXPORTS: [Export; 5] = [
+            nntmux_w443_release_context_marker_batch,
+            nntmux_w443_apibay_title_batch,
+            nntmux_w443_complete_xml_catalogue_title_batch,
+            nntmux_w443_crowdnfo_heading_batch,
+            nntmux_w443_dats_pciso_rom_name_batch,
+        ];
+
+        fn text(bytes: &[u8]) -> String {
+            String::from_utf8_lossy(bytes).replace('\x1F', "|")
+        }
+
+        fn call(export: Export, items: &[&[u8]]) -> String {
+            let blob = items.concat();
+            let lens: Vec<u8> = items
+                .iter()
+                .flat_map(|i| (i.len() as u32).to_le_bytes())
+                .collect();
+            let mut buf = vec![0u8; 256];
+            let n = unsafe {
+                export(
+                    blob.as_ptr(),
+                    blob.len(),
+                    lens.as_ptr(),
+                    lens.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(n > 0, "call declined: {n}");
+            text(&buf[..n as usize])
+        }
+
+        #[test]
+        fn w443_context_marker_counts() {
+            let names: [&[u8]; 9] = [
+                b"Brazzers.24.01.01.Model.XXX.1080p",
+                b"Show.Complete.Season.1.PROPER",
+                b"Show.S01E01.1080p.AMZN.WEB-DL",
+                b"Movie.2024.GERMAN.1080p.BluRay",
+                b"Movie.2024.MULTi.REPACK",
+                b"OnlyFans.Model.Season.Pack",
+                b"Plain.Name.RERIP",
+                b"Plain.Name",
+                b"",
+            ];
+            assert_eq!(text(&context_marker_batch(&names)), "9|2|1|1|2|3|3");
+            assert_eq!(text(&context_marker_batch(&[])), "0|0|0|0|0|0|0");
+            assert_eq!(
+                call(nntmux_w443_release_context_marker_batch, &names),
+                "9|2|1|1|2|3|3"
+            );
+        }
+
+        #[test]
+        fn w443_apibay_title_counts() {
+            let names: [&[u8]; 9] = [
+                b"Movie (2024) [1080p] [WEBRip] [YTS.MX]",
+                b"Movie.2024.1080p.WEBRip.x264-RARBG",
+                b"Show.S01E01.720p.HDTV.x264-EZTV",
+                b"Movie.2024.HDCAM.x264-TGx",
+                b"Movie.2024.HDTS.x264-GalaxyRG",
+                b"Movie.2024.TELESYNC-GRP",
+                b"Plain.Name",
+                b"  \t\0",
+                b"",
+            ];
+            assert_eq!(text(&apibay_title_batch(&names)), "9|2|1|1|1|2|2|3");
+            assert_eq!(
+                call(nntmux_w443_apibay_title_batch, &names),
+                "9|2|1|1|1|2|2|3"
+            );
+            assert_eq!(text(&apibay_title_batch(&[])), "0|0|0|0|0|0|0|0");
+        }
+
+        #[test]
+        fn w443_catalogue_title_counts() {
+            let long = vec![b'a'; 256];
+            let edge = vec![b'a'; 255];
+            let names: [&[u8]; 9] = [
+                b"Game.Title.USA.NSW-GRP",
+                b"  Game.Title.EUR-GRP\n",
+                b"Game Title",
+                b"Game\x7FTitle",
+                b"",
+                b" \t\r\0\x0B",
+                &long,
+                &edge,
+                b"\xc3\xa9t\xc3\xa9",
+            ];
+            assert_eq!(text(&catalogue_title_batch(&names)), "9|4|2|2|1|1");
+            assert_eq!(
+                call(nntmux_w443_complete_xml_catalogue_title_batch, &names),
+                "9|4|2|2|1|1"
+            );
+            // Form feed is not in trim()'s set, so it stays and makes the title nonliteral.
+            assert_eq!(text(&catalogue_title_batch(&[b"\x0CTitle"])), "1|0|0|1|0|0");
+        }
+
+        #[test]
+        fn w443_crowdnfo_heading_counts() {
+            let names: [&[u8]; 11] = [
+                b"Movie.Title.2024.1080p.WEB.H264-GRP",
+                b" Show.S01E01.720p-GRP_2 ",
+                b"Movie Title-GRP",
+                b"Movie.Title.20...-GRP",
+                "Movie.Title\u{2026}-GRP".as_bytes(),
+                b"Movie-GRP",
+                b"Movie..Title-GRP",
+                b"Movie.Title-",
+                b"Movie.Title-GR.P",
+                b".Movie.Title-GRP",
+                b"",
+            ];
+            assert_eq!(text(&crowdnfo_heading_batch(&names)), "11|1|1|2|2|5");
+            assert_eq!(
+                call(nntmux_w443_crowdnfo_heading_batch, &names),
+                "11|1|1|2|2|5"
+            );
+            assert!(scene_shaped(b"A-B.C-GRP"));
+            assert!(scene_shaped(b"\xc3\xa9.x-G"));
+            assert!(!scene_shaped(b"A.B-G-"));
+            assert!(!scene_shaped(b"A.B-G\xc3\xa9"));
+        }
+
+        #[test]
+        fn w443_dats_rom_name_counts() {
+            let long = vec![b'a'; 256];
+            let names: [&[u8]; 9] = [
+                b"Game.Title.1998.PC.ISO-GRP",
+                b"game-grp.ZIP",
+                b"disk1.rar",
+                b"",
+                &long,
+                b"Game\x01Title",
+                b"Game Title",
+                b"Game/Title.7z",
+                b"Game\\Title",
+            ];
+            assert_eq!(text(&dats_rom_name_batch(&names)), "9|3|1|1|1|3|3");
+            assert_eq!(
+                call(nntmux_w443_dats_pciso_rom_name_batch, &names),
+                "9|3|1|1|1|3|3"
+            );
+            assert_eq!(text(&dats_rom_name_batch(&[])), "0|0|0|0|0|0|0");
+        }
+
+        #[test]
+        fn w443_trim_and_helpers() {
+            assert_eq!(trim(b"  a b \0"), b"a b");
+            assert_eq!(trim(b" \t\n\r\0\x0B"), b"");
+            assert!(!has_space_or_control(b"\x80\xff"));
+            assert!(has_control(b"\x1F"));
+            assert!(!has_control(b" "));
+            assert!(truncated(b"ab..."));
+            assert!(truncated("x\u{2026}".as_bytes()));
+            assert!(!truncated(b".."));
+            assert!(!truncated(b"a.b..c"));
+            assert!(has_path_or_space(b"a\\b"));
+            assert!(!has_path_or_space(b"a.b-c"));
+            let long = [b'a'; 100];
+            assert!(!has_control(&long));
+            let mut late = [b'a'; 100];
+            late[70] = 0x7F;
+            assert!(has_control(&late));
+            assert!(has_space_or_control(&late));
+            for (title, shaped) in [
+                (&b"A.B-C"[..], true),
+                (b"A.B.C-D_1", true),
+                (b"A-B", false),
+                (b".A.B-C", false),
+                (b"A.B.-C", false),
+                (b"A..B-C", false),
+                (b"A.B-", false),
+                (b"A.B-C.D", false),
+                (b".-C", false),
+                (b"-C", false),
+            ] {
+                assert_eq!(scene_shaped(title), shaped, "{title:?}");
+            }
+        }
+
+        #[test]
+        fn w443_exports_validate_inputs_and_capacity() {
+            let x = b"x".as_ptr();
+            let lens1 = 1u32.to_le_bytes();
+            unsafe {
+                for export in EXPORTS {
+                    let mut small = [b'Z'; 4];
+                    let needed = export(x, 1, lens1.as_ptr(), 4, small.as_mut_ptr(), 2);
+                    assert!(needed < -2, "needed {needed}");
+                    assert_eq!(small, [b'Z'; 4]);
+                    let mut exact = vec![0u8; (-needed) as usize];
+                    assert_eq!(
+                        export(x, 1, lens1.as_ptr(), 4, exact.as_mut_ptr(), exact.len()),
+                        -needed
+                    );
+                    let mut short = vec![b'Z'; (-needed - 1) as usize];
+                    assert_eq!(
+                        export(x, 1, lens1.as_ptr(), 4, short.as_mut_ptr(), short.len()),
+                        needed
+                    );
+                    assert!(short.iter().all(|&b| b == b'Z'));
+
+                    let mut out = [0u8; 128];
+                    let (b, c) = (out.as_mut_ptr(), out.len());
+                    assert_eq!(export(x, 1, lens1.as_ptr(), 4, ptr::null_mut(), 8), DECLINE);
+                    assert_eq!(export(ptr::null(), 0, x, 0, b, c), DECLINE);
+                    assert_eq!(export(x, 0, ptr::null(), 0, b, c), DECLINE);
+                    assert_eq!(export(x, 1, lens1.as_ptr(), 3, b, c), DECLINE);
+                    assert_eq!(export(x, 0, lens1.as_ptr(), 4, b, c), DECLINE);
+                    let two = 2u32.to_le_bytes();
+                    assert_eq!(export(x, 1, two.as_ptr(), 4, b, c), DECLINE);
+                    let huge = u32::MAX.to_le_bytes();
+                    assert_eq!(export(x, 1, huge.as_ptr(), 4, b, c), DECLINE);
+                    assert_eq!(export(x, MAX_INPUT + 1, x, 0, b, c), DECLINE);
+                    assert_eq!(export(x, usize::MAX, x, 0, b, c), DECLINE);
+                    assert_eq!(export(x, 0, x, 0, usize::MAX as *mut u8, 8), DECLINE);
+                    assert_eq!(export(x, 0, x, 0, b, isize::MAX as usize + 1), DECLINE);
+                    let mut shared =
+                        *b"sample\x06\0\0\0..............................................";
+                    let p = shared.as_mut_ptr();
+                    assert_eq!(export(p, 6, p.add(6), 4, p.add(3), 40), DECLINE);
+                    assert_eq!(export(p, 6, p.add(6), 4, p.add(9), 40), DECLINE);
+                    assert_eq!(&shared[..10], b"sample\x06\0\0\0");
+                    assert!(export(p, 6, p.add(6), 4, p.add(10), 40) > 0);
+                    assert!(export(x, 0, x, 0, b, c) > 0);
+                }
+            }
+        }
+    }
+}
