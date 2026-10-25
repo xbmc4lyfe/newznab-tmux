@@ -6,6 +6,7 @@ namespace App\Services;
 
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Facades\Storage;
 use RuntimeException;
@@ -165,5 +166,142 @@ final class SiteLogoService
         }
 
         return self::$ffi === false ? null : self::$ffi;
+    }
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W51 parity test). */
+    private const bool W51_RUST_FFI_DEFAULT = true;
+
+    private const string W51_FFI_CDEF = 'ssize_t nntmux_w511_site_logo_unmanaged_batch(const char *paths, size_t paths_len, size_t count, int64_t *out, size_t out_cap);';
+
+    public static function usesW51RustFfi(): bool
+    {
+        $enabled = self::w51RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W51_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 51 batch routed to Rust or PHP, then restores the routing. */
+    public static function withW51RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w51RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w51RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Indices of the paths {@see isManagedPath()} rejects (those {@see delete()} skips), ascending.
+     *
+     * @param  list<string>  $paths
+     * @return list<int>
+     */
+    public static function unmanagedPathIndices(array $paths): array
+    {
+        return self::usesW51RustFfi() ? self::unmanagedPathIndicesNative($paths) : self::unmanagedPathIndicesPhp($paths);
+    }
+
+    /**
+     * @param  list<string>  $paths
+     * @return list<int>
+     */
+    public static function unmanagedPathIndicesPhp(array $paths): array
+    {
+        $indices = [];
+        foreach ($paths as $i => $path) {
+            if (! self::isManagedPathPhp($path)) {
+                $indices[] = $i;
+            }
+        }
+
+        return $indices;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or a path holds a NUL byte
+     * (Rust rejects the extra rows it splits into).
+     *
+     * @param  list<string>  $paths
+     * @return list<int>
+     */
+    public static function unmanagedPathIndicesNative(array $paths): array
+    {
+        $count = \count($paths);
+        $maxWords = $count;
+        $buffer = $count === 0 ? null : self::w51Buffer($maxWords);
+        if ($buffer === null) {
+            return self::unmanagedPathIndicesPhp($paths);
+        }
+        [$ffi, $out, $cap] = $buffer;
+        $joined = implode("\0", $paths);
+        try {
+            // @phpstan-ignore method.notFound
+            $words = self::w51Decode($out, $ffi->nntmux_w511_site_logo_unmanaged_batch($joined, \strlen($joined), $count, $out, $cap), $maxWords);
+        } catch (Throwable) {
+            $words = null;
+        }
+
+        return $words ?? self::unmanagedPathIndicesPhp($paths);
+    }
+
+    /**
+     * Lazily resolved binding plus the reusable output buffer sized for `$words` words.
+     *
+     * @return array{0: FFI, 1: CData, 2: int}|null
+     */
+    private static function w51Buffer(int $words): ?array
+    {
+        $buffer = self::w51RustFfiState('out', $words);
+
+        return \is_array($buffer) ? $buffer : null;
+    }
+
+    /** @return list<int>|null The `$written` words the export reported, or null when it declined. */
+    private static function w51Decode(CData $out, mixed $written, int $maxWords): ?array
+    {
+        if (! \is_int($written) || $written < 0 || $written > $maxWords) {
+            return null;
+        }
+        if ($written === 0) {
+            return [];
+        }
+        $decoded = unpack('P*', FFI::string($out, $written * 8));
+
+        /** @var list<int>|null */
+        return \is_array($decoded) ? array_values($decoded) : null;
+    }
+
+    /**
+     * Wave 51 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
+     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
+     */
+    private static function w51RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'out':
+                $ffi ??= RustPipelineLibrary::resolveDomain('admin_status_w51', self::W51_FFI_CDEF) ?? false;
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if (! $out instanceof CData || $outCap < $val) {
+                    $outCap = max(512, $val * 2);
+                    $out = $ffi->new("int64_t[{$outCap}]");
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled;
+        }
     }
 }
