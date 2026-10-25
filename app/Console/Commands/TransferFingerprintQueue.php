@@ -15,10 +15,18 @@ use Throwable;
 
 final class TransferFingerprintQueue extends Command
 {
+    /**
+     * Default for the Wave 39.2 toggle only; it stays false because the paired benchmark in
+     * tests/Unit/RustFingerprintBackfillTransferCandidateW39ParityTest.php is below 1.5x.
+     */
+    public const bool W392_RUST_FFI_DEFAULT = false;
+
     private const string RELEASE_ID_PATTERN = '/releaseId";i:([1-9][0-9]*);/';
 
     // Keep PHP as the production default: the JSON FFI round trip is slower than these helpers (< 1.5x).
     private static ?bool $useRustFfi = null;
+
+    private static ?bool $useW392RustFfi = null;
 
     protected $signature = 'releases:fingerprint-transfer {--limit=1000 : Maximum legacy jobs to transfer}
         {--import-legacy : Atomically import missing sources while transferring the existing backlog}
@@ -95,6 +103,34 @@ final class TransferFingerprintQueue extends Command
             : self::formatCompletionSummaryPhp($dryRun, $transferred);
     }
 
+    public static function useW392RustFfi(?bool $use): void
+    {
+        self::$useW392RustFfi = $use;
+    }
+
+    public static function usesW392RustFfi(): bool
+    {
+        return self::$useW392RustFfi ?? self::W392_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW392RustFfi(): void
+    {
+        self::$useW392RustFfi = null;
+    }
+
+    /**
+     * Plan one transfer window. Negative counts act as zero and the batch size is clamped like --limit, then cut to the
+     * free in-flight capacity. The window moves at most min(pending, capacity) items in up to $maxBatches batches;
+     * it is throttled when capacity is below the backlog and drains it when every pending item is planned.
+     *
+     * @return array{pending: int, available_capacity: int, batch_size: int, planned_batches: int, planned_items: int, remaining: int, throttled: bool, drain_complete: bool}
+     */
+    public static function planQueueTransferWindow(int $pendingCount, int $batchSize, int $maxBatches, int $inFlightCount, int $maxInFlight): array
+    {
+        return (self::usesW392RustFfi() ? self::planQueueTransferWindowNative($pendingCount, $batchSize, $maxBatches, $inFlightCount, $maxInFlight) : null)
+            ?? self::planQueueTransferWindowPhp($pendingCount, $batchSize, $maxBatches, $inFlightCount, $maxInFlight);
+    }
+
     public function handle(RedisManager $manager): int
     {
         $redis = $manager->connection('default');
@@ -158,6 +194,46 @@ final class TransferFingerprintQueue extends Command
         }
 
         throw new RuntimeException('Unexpected legacy payload; nothing was removed.');
+    }
+
+    /** @return array{pending: int, available_capacity: int, batch_size: int, planned_batches: int, planned_items: int, remaining: int, throttled: bool, drain_complete: bool} */
+    private static function planQueueTransferWindowPhp(int $pendingCount, int $batchSize, int $maxBatches, int $inFlightCount, int $maxInFlight): array
+    {
+        $pending = max(0, $pendingCount);
+        // Both operands are non-negative, so the subtraction cannot overflow.
+        $capacity = max(0, max(0, $maxInFlight) - max(0, $inFlightCount));
+        $size = min(self::clampBatchLimitPhp($batchSize), $capacity);
+        $budget = min($pending, $capacity);
+        $needed = $size > 0 ? intdiv($budget, $size) + ($budget % $size > 0 ? 1 : 0) : 0;
+        $batches = min(max(0, $maxBatches), $needed);
+
+        // Fewer batches than needed keeps $batches * $size below $budget.
+        return self::queueTransferWindow($pending, $capacity, $size, $batches, $batches === $needed ? $budget : $batches * $size);
+    }
+
+    /** @return array{pending: int, available_capacity: int, batch_size: int, planned_batches: int, planned_items: int, remaining: int, throttled: bool, drain_complete: bool}|null */
+    private static function planQueueTransferWindowNative(int $pendingCount, int $batchSize, int $maxBatches, int $inFlightCount, int $maxInFlight): ?array
+    {
+        $slots = BackfillReleaseFingerprintMetadata::evaluateW392Native(1, pack('q5', $pendingCount, $batchSize, $maxBatches, $inFlightCount, $maxInFlight), 8);
+        if ($slots === null) {
+            return null;
+        }
+        [$pending, $capacity, $size, $batches, $items, $remaining, $throttled, $drained] = $slots;
+        if ($pending !== max(0, $pendingCount) || $capacity !== max(0, max(0, $maxInFlight) - max(0, $inFlightCount))
+            || $size !== min(self::clampBatchLimitPhp($batchSize), $capacity) || $batches < 0 || $batches > max(0, $maxBatches)
+            || $items < 0 || $items > min($pending, $capacity) || $remaining !== $pending - $items
+            || $throttled !== (int) ($capacity < $pending) || $drained !== (int) ($items === $pending)) {
+            return null;
+        }
+
+        return self::queueTransferWindow($pending, $capacity, $size, $batches, $items);
+    }
+
+    /** @return array{pending: int, available_capacity: int, batch_size: int, planned_batches: int, planned_items: int, remaining: int, throttled: bool, drain_complete: bool} */
+    private static function queueTransferWindow(int $pending, int $capacity, int $size, int $batches, int $items): array
+    {
+        return ['pending' => $pending, 'available_capacity' => $capacity, 'batch_size' => $size, 'planned_batches' => $batches, 'planned_items' => $items,
+            'remaining' => $pending - $items, 'throttled' => $capacity < $pending, 'drain_complete' => $items === $pending];
     }
 
     private static function useRustFfi(): bool

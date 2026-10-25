@@ -10,10 +10,20 @@ use Illuminate\Support\Facades\DB;
 
 class ImportVerificationManifests extends Command
 {
+    /**
+     * Default for the Wave 39.2 toggle only; it stays false because the paired benchmark in
+     * tests/Unit/RustFingerprintBackfillTransferCandidateW39ParityTest.php is below 1.5x.
+     */
+    public const bool W392_RUST_FFI_DEFAULT = false;
+
     private const array SUMMARY_KEYS = ['imported', 'already', 'missing', 'invalid', 'conflict', 'unreferenced'];
+
+    private const int W392_GUID_LENGTH = 40;
 
     // Keep PHP as the production default until the Rust performance gate passes.
     private static ?bool $useRustFfi = null;
+
+    private static ?bool $useW392RustFfi = null;
 
     protected $signature = 'verification:import-manifests {--batch=1000 : Candidates read per page}
         {--limit=0 : Stop after this many manifests (0 = all)} {--since-id=0 : Start after this candidate ID}
@@ -114,6 +124,35 @@ class ImportVerificationManifests extends Command
         return is_string($result) ? $result : self::formatSummaryLinePhp($totals, $cursor);
     }
 
+    public static function useW392RustFfi(?bool $use): void
+    {
+        self::$useW392RustFfi = $use;
+    }
+
+    public static function usesW392RustFfi(): bool
+    {
+        return self::$useW392RustFfi ?? self::W392_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW392RustFfi(): void
+    {
+        self::$useW392RustFfi = null;
+    }
+
+    /**
+     * Validate manifest import records (`guid`, `segments`) in order. A record is an invalid GUID unless its GUID is 40
+     * lowercase hex characters, then a duplicate when that GUID appeared before, then below the minimum when its integer
+     * segment count (non-integers count as zero) is under max(0, $minSegments). Valid segment totals saturate at PHP_INT_MAX.
+     *
+     * @param  array<array-key, mixed>  $records
+     * @return array{records: int, valid: int, invalid_guid: int, below_min_segments: int, duplicate_guid: int, total_segments: int}
+     */
+    public static function summarizeManifestImportRecords(array $records, int $minSegments = 1): array
+    {
+        return (self::usesW392RustFfi() ? self::summarizeManifestImportRecordsNative($records, $minSegments) : null)
+            ?? self::summarizeManifestImportRecordsPhp($records, $minSegments);
+    }
+
     public function handle(ManifestStore $store): int
     {
         if (config('release_verification.manifest_storage') !== 'database') {
@@ -158,6 +197,87 @@ class ImportVerificationManifests extends Command
     private static function summaryCounts(array $totals): array
     {
         return array_map(static fn (string $key): int => (int) ($totals[$key] ?? 0), self::SUMMARY_KEYS);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $records
+     * @return array{records: int, valid: int, invalid_guid: int, below_min_segments: int, duplicate_guid: int, total_segments: int}
+     */
+    private static function summarizeManifestImportRecordsPhp(array $records, int $minSegments): array
+    {
+        $minSegments = max(0, $minSegments);
+        $counts = [0, 0, 0, 0];
+        $total = 0;
+        $seen = [];
+        foreach ($records as $record) {
+            [$guid, $segments] = self::manifestRecordFields($record);
+            if ($guid === null || \strlen($guid) !== self::W392_GUID_LENGTH || strspn($guid, '0123456789abcdef') !== self::W392_GUID_LENGTH) {
+                $counts[1]++;
+            } elseif (isset($seen[$guid])) {
+                $counts[3]++;
+            } else {
+                $seen[$guid] = true;
+                if ($segments < $minSegments) {
+                    $counts[2]++;
+                } else {
+                    $counts[0]++;
+                    $total = $total > PHP_INT_MAX - $segments ? PHP_INT_MAX : $total + $segments;
+                }
+            }
+        }
+
+        return self::manifestImportSummary(\count($records), $counts, $total);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $records
+     * @return array{records: int, valid: int, invalid_guid: int, below_min_segments: int, duplicate_guid: int, total_segments: int}|null
+     */
+    private static function summarizeManifestImportRecordsNative(array $records, int $minSegments): ?array
+    {
+        if (\count($records) * 2 + 2 > BackfillReleaseFingerprintMetadata::W392_MAX_INPUT / 8) {
+            return null;
+        }
+        $words = [$minSegments, \count($records)];
+        $guids = '';
+        foreach ($records as $record) {
+            [$guid, $segments] = self::manifestRecordFields($record);
+            $words[] = $guid === null ? -1 : \strlen($guid);
+            $words[] = $segments;
+            $guids .= $guid;
+        }
+        $slots = BackfillReleaseFingerprintMetadata::evaluateW392Native(2, pack('q*', ...$words).$guids, 6);
+        if ($slots === null) {
+            return null;
+        }
+        [$count, $valid, $invalid, $below, $duplicate, $total] = $slots;
+        if ($count !== \count($records) || min($valid, $invalid, $below, $duplicate, $total) < 0 || $valid + $invalid + $below + $duplicate !== $count) {
+            return null;
+        }
+
+        return self::manifestImportSummary($count, [$valid, $invalid, $below, $duplicate], $total);
+    }
+
+    /** @return array{?string, int} */
+    private static function manifestRecordFields(mixed $record): array
+    {
+        if (! \is_array($record)) {
+            return [null, 0];
+        }
+        $guid = $record['guid'] ?? null;
+        $segments = $record['segments'] ?? 0;
+
+        return [\is_string($guid) ? $guid : null, \is_int($segments) ? $segments : 0];
+    }
+
+    /**
+     * @param  array{int, int, int, int}  $counts  valid, invalid GUID, below minimum, duplicate
+     * @return array{records: int, valid: int, invalid_guid: int, below_min_segments: int, duplicate_guid: int, total_segments: int}
+     */
+    private static function manifestImportSummary(int $records, array $counts, int $total): array
+    {
+        return ['records' => $records, 'valid' => $counts[0], 'invalid_guid' => $counts[1], 'below_min_segments' => $counts[2],
+            'duplicate_guid' => $counts[3], 'total_segments' => $total];
     }
 
     private static function useRustFfi(): bool
