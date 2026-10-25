@@ -53,6 +53,22 @@ final class NzbUploadManifestService
 
     private static bool $useRustFfi = true;
 
+    /**
+     * Default for the Wave 40.2 toggle only; it stays false because the paired benchmark in
+     * tests/Unit/RustNzbServiceParserManifestWriteContentsW40ParityTest.php is below 1.5x.
+     */
+    public const bool W402_RUST_FFI_DEFAULT = false;
+
+    public const int STATUS_OK = 0;
+
+    public const int STATUS_EMPTY = 1;
+
+    public const int STATUS_OVER_BUDGET = 2;
+
+    public const int STATUS_COUNT_MISMATCH = 3;
+
+    private static ?bool $useW402RustFfi = null;
+
     public function __construct(private readonly Filesystem $filesystem) {}
 
     public static function setUseRustFfi(bool $use): void
@@ -1596,5 +1612,75 @@ final class NzbUploadManifestService
             || trim((string) pathinfo($filename, PATHINFO_FILENAME)) === '') {
             throw new RuntimeException("Unsafe {$extension} filename in upload manifest");
         }
+    }
+
+    public static function useW402RustFfi(?bool $use): void
+    {
+        self::$useW402RustFfi = $use;
+    }
+
+    public static function usesW402RustFfi(): bool
+    {
+        return self::$useW402RustFfi ?? self::W402_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW402RustFfi(): void
+    {
+        self::$useW402RustFfi = null;
+    }
+
+    /**
+     * Compare the declared and actual file counts (negatives as zero) and check max(0, $totalBytes) against
+     * max(0, $maxAllowedBytes). The delta is actual minus declared. The status is the first that applies of
+     * STATUS_EMPTY (no actual files), STATUS_OVER_BUDGET, STATUS_COUNT_MISMATCH and STATUS_OK.
+     *
+     * @return array{declared_files: int, actual_files: int, file_count_delta: int, counts_match: bool, within_byte_budget: bool, empty_manifest: bool, status: int}
+     */
+    public static function summarizeManifestHeaderBudget(int $declaredFiles, int $actualFiles, int $totalBytes, int $maxAllowedBytes = 107374182400): array
+    {
+        return (self::usesW402RustFfi() ? self::summarizeManifestHeaderBudgetNative($declaredFiles, $actualFiles, $totalBytes, $maxAllowedBytes) : null)
+            ?? self::summarizeManifestHeaderBudgetPhp($declaredFiles, $actualFiles, $totalBytes, $maxAllowedBytes);
+    }
+
+    /** @return array{declared_files: int, actual_files: int, file_count_delta: int, counts_match: bool, within_byte_budget: bool, empty_manifest: bool, status: int} */
+    private static function summarizeManifestHeaderBudgetPhp(int $declaredFiles, int $actualFiles, int $totalBytes, int $maxAllowedBytes): array
+    {
+        return self::manifestHeaderBudget(max(0, $declaredFiles), max(0, $actualFiles), max(0, $totalBytes) <= max(0, $maxAllowedBytes));
+    }
+
+    /** @return array{declared_files: int, actual_files: int, file_count_delta: int, counts_match: bool, within_byte_budget: bool, empty_manifest: bool, status: int}|null */
+    private static function summarizeManifestHeaderBudgetNative(int $declaredFiles, int $actualFiles, int $totalBytes, int $maxAllowedBytes): ?array
+    {
+        $slots = NzbService::evaluateW402Native(3, pack('q4', $declaredFiles, $actualFiles, $totalBytes, $maxAllowedBytes), 7);
+        if ($slots === null) {
+            return null;
+        }
+        [$declared, $actual, $delta, $matches, $within, $empty, $status] = $slots;
+        if (! \in_array($within, [0, 1], true)) {
+            return null;
+        }
+        $summary = self::manifestHeaderBudget($declared, $actual, $within === 1);
+        if ($declared !== max(0, $declaredFiles) || $actual !== max(0, $actualFiles) || $within !== (int) (max(0, $totalBytes) <= max(0, $maxAllowedBytes))
+            || [$delta, $matches, $empty, $status] !== [$summary['file_count_delta'], (int) $summary['counts_match'], (int) $summary['empty_manifest'], $summary['status']]) {
+            return null;
+        }
+
+        return $summary;
+    }
+
+    /** @return array{declared_files: int, actual_files: int, file_count_delta: int, counts_match: bool, within_byte_budget: bool, empty_manifest: bool, status: int} */
+    private static function manifestHeaderBudget(int $declared, int $actual, bool $within): array
+    {
+        // Both counts are non-negative, so the subtraction cannot overflow.
+        $delta = $actual - $declared;
+        $status = match (true) {
+            $actual === 0 => self::STATUS_EMPTY,
+            ! $within => self::STATUS_OVER_BUDGET,
+            $delta !== 0 => self::STATUS_COUNT_MISMATCH,
+            default => self::STATUS_OK,
+        };
+
+        return ['declared_files' => $declared, 'actual_files' => $actual, 'file_count_delta' => $delta, 'counts_match' => $delta === 0,
+            'within_byte_budget' => $within, 'empty_manifest' => $actual === 0, 'status' => $status];
     }
 }
