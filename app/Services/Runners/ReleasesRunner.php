@@ -7,12 +7,110 @@ namespace App\Services\Runners;
 use App\Models\UsenetGroup;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Services\NameFixing\NameFixingQueryService;
+use App\Support\RustPipelineLibrary;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use RuntimeException;
 
 class ReleasesRunner extends BaseRunner
 {
+    public const string W386_FFI_CDEF = 'ssize_t nntmux_w386_tmux_drain_stop_runners(uint8_t operation, uint8_t flags, const char *input, size_t input_len, char *out_buf, size_t out_cap);';
+
+    // Paired caller benchmarks must qualify before enabling this separate candidate.
+    private static ?bool $useRustW386 = null;
+
+    public static function setUseRustW386(?bool $enabled): void
+    {
+        self::$useRustW386 = $enabled;
+    }
+
+    public static function usesRustW386(): bool
+    {
+        return self::$useRustW386 ?? false;
+    }
+
+    private static function w386Transform(int $flags, string $input): ?string
+    {
+        $length = strlen($input);
+        if ($length > 16_777_216) {
+            return null;
+        }
+        $ffi = RustPipelineLibrary::resolveDomain('additional_w386', self::W386_FFI_CDEF);
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            $capacity = 0;
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, 256, $capacity);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w386_tmux_drain_stop_runners(5, $flags, $input, $length, $scratch, min($capacity, 16_777_216));
+            if (is_int($written) && $written < -1 && -$written <= 16_777_216) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($scratch === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w386_tmux_drain_stop_runners(5, $flags, $input, $length, $scratch, min($capacity, 16_777_216));
+            }
+            if (! is_int($written) || $written < 0 || $written > min($capacity, 16_777_216)) {
+                return null;
+            }
+
+            return $written === 0 ? '' : \FFI::string($scratch, $written);
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Unique ready-pass group IDs in first-insertion order, as in command keys.
+     *
+     * @param  list<int>  $groupIds
+     * @return list<int>
+     */
+    public static function readyGroupPlan(array $groupIds): array
+    {
+        return (self::usesRustW386() ? self::readyGroupPlanNative($groupIds) : null)
+            ?? self::readyGroupPlanPhp($groupIds);
+    }
+
+    /**
+     * @param  list<int>  $groupIds
+     * @return list<int>
+     */
+    public static function readyGroupPlanPhp(array $groupIds): array
+    {
+        $seen = [];
+        foreach ($groupIds as $id) {
+            $seen[$id] = true;
+        }
+
+        return array_keys($seen);
+    }
+
+    /**
+     * @param  list<int>  $groupIds
+     * @return list<int>|null
+     */
+    public static function readyGroupPlanNative(array $groupIds): ?array
+    {
+        $input = pack('V', count($groupIds));
+        foreach ($groupIds as $id) {
+            $input .= pack('q', $id);
+        }
+        $output = self::w386Transform(0, $input);
+        if ($output === null || strlen($output) < 4 || (strlen($output) - 4) % 8 !== 0) {
+            return null;
+        }
+        /** @var array<int, int> $decoded */
+        $decoded = unpack('q*', substr($output, 4));
+
+        return array_values($decoded);
+    }
+
     /** Seconds between the starts of one group's passes while a round still waits on slower groups; 0 disables. */
     private int $rollingInterval = 0;
 
