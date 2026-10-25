@@ -28945,3 +28945,909 @@ mod wave41_5_search_dto_query_cursor_page_media_codec {
         }
     }
 }
+
+/// Wave 42.5 search support helpers: outbox row batches
+/// (`SearchIndexOutboxDispatcher`), Elasticsearch host configuration batches
+/// (`ElasticsearchClientFactory`), Elasticsearch search response batches
+/// (`ElasticsearchResponseHelper`), Manticore host list batches
+/// (`ManticoreClientFactory`) and Manticore table name batches
+/// (`ManticoreIndexRegistry`). PHP marshals each call into count-prefixed,
+/// length-prefixed byte strings; results use the same framing.
+mod wave42_5_search_outbox_elastic_manticore_support {
+    use std::borrow::Cow;
+    use std::collections::{HashMap, HashSet};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const DECLINE: i32 = -1;
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+    const MAX_PARTS: usize = 1 << 20;
+    /// Characters stripped by PHP's default `trim()`.
+    const TRIM: &[u8] = b" \t\n\r\0\x0B";
+    /// Entity type aliases `SearchIndexOutboxDispatcher` routes to a
+    /// secondary search index.
+    const SECONDARY_TYPES: [&[u8]; 27] = [
+        b"music",
+        b"musicinfo",
+        b"music_info",
+        b"book",
+        b"books",
+        b"bookinfo",
+        b"book_info",
+        b"game",
+        b"games",
+        b"gamesinfo",
+        b"games_info",
+        b"console",
+        b"consoleinfo",
+        b"console_info",
+        b"steam",
+        b"steamapp",
+        b"steamapps",
+        b"steam_app",
+        b"steam_apps",
+        b"anime",
+        b"anidb",
+        b"anidbtitle",
+        b"anidbtitles",
+        b"anidb_title",
+        b"anidb_titles",
+        b"anidbinfo",
+        b"anidb_info",
+    ];
+
+    fn unpack(input: &[u8]) -> Option<Vec<&[u8]>> {
+        let count = u32::from_le_bytes(input.get(..4)?.try_into().ok()?) as usize;
+        if count > MAX_PARTS || count > (input.len() - 4) / 4 {
+            return None;
+        }
+        let mut cursor = 4usize;
+        let mut parts = Vec::with_capacity(count);
+        for _ in 0..count {
+            let length_end = cursor.checked_add(4)?;
+            let length =
+                u32::from_le_bytes(input.get(cursor..length_end)?.try_into().ok()?) as usize;
+            let end = length_end.checked_add(length)?;
+            parts.push(input.get(length_end..end)?);
+            cursor = end;
+        }
+        (cursor == input.len()).then_some(parts)
+    }
+
+    fn pack(parts: &[Vec<u8>]) -> Option<Vec<u8>> {
+        let count = u32::try_from(parts.len()).ok()?;
+        let size = parts.iter().try_fold(4usize, |size, part| {
+            u32::try_from(part.len()).ok()?;
+            size.checked_add(4)?.checked_add(part.len())
+        })?;
+        if size > i32::MAX as usize {
+            return None;
+        }
+        let mut out = Vec::with_capacity(size);
+        out.extend_from_slice(&count.to_le_bytes());
+        for part in parts {
+            out.extend_from_slice(&(part.len() as u32).to_le_bytes());
+            out.extend_from_slice(part);
+        }
+        Some(out)
+    }
+
+    /// Canonical decimal produced by PHP `(string) $int`.
+    fn integer(bytes: &[u8]) -> Option<i64> {
+        if bytes.is_empty() || bytes.len() > 20 {
+            return None;
+        }
+        let value: i64 = std::str::from_utf8(bytes).ok()?.parse().ok()?;
+        (value.to_string().as_bytes() == bytes).then_some(value)
+    }
+
+    /// Canonical non-negative integer used as an element count.
+    fn length(bytes: &[u8]) -> Option<usize> {
+        usize::try_from(integer(bytes)?).ok()
+    }
+
+    fn flag(bytes: &[u8]) -> Option<bool> {
+        match bytes {
+            b"1" => Some(true),
+            b"0" => Some(false),
+            _ => None,
+        }
+    }
+
+    fn text(value: i64) -> Vec<u8> {
+        value.to_string().into_bytes()
+    }
+
+    fn count(value: usize) -> Option<Vec<u8>> {
+        Some(text(i64::try_from(value).ok()?))
+    }
+
+    fn counts(values: &[usize]) -> Option<Vec<Vec<u8>>> {
+        values.iter().map(|value| count(*value)).collect()
+    }
+
+    /// PHP `trim()` with the default character list.
+    fn trim(bytes: &[u8]) -> &[u8] {
+        let start = bytes
+            .iter()
+            .position(|byte| !TRIM.contains(byte))
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|byte| !TRIM.contains(byte))
+            .map_or(start, |index| index + 1);
+        &bytes[start..end]
+    }
+
+    fn https_url(bytes: &[u8]) -> bool {
+        bytes
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"https://"))
+    }
+
+    /// `strtolower()` plus `str_replace(['-', ' '], '_', ...)`.
+    fn fold(bytes: &[u8]) -> Vec<u8> {
+        bytes
+            .iter()
+            .map(|byte| match byte {
+                b'-' | b' ' => b'_',
+                other => other.to_ascii_lowercase(),
+            })
+            .collect()
+    }
+
+    /// `SearchIndexOutboxDispatcher::normalizeEntityTypePhp()` for ASCII
+    /// input; `None` declines non-ASCII bytes (PHP `basename()` territory).
+    fn entity_type(raw: &[u8]) -> Option<Cow<'static, [u8]>> {
+        if !raw.is_ascii() {
+            return None;
+        }
+        let path: Vec<u8> = raw
+            .iter()
+            .map(|byte| match byte {
+                b'\\' => b'/',
+                other => other.to_ascii_lowercase(),
+            })
+            .collect();
+        let end = path
+            .iter()
+            .rposition(|byte| *byte != b'/')
+            .map_or(0, |i| i + 1);
+        let start = path[..end]
+            .iter()
+            .rposition(|byte| *byte == b'/')
+            .map_or(0, |i| i + 1);
+        let base = fold(&path[start..end]);
+        let alias: &'static [u8] = match base.as_slice() {
+            b"release" | b"releases" => b"release",
+            b"pre" | b"pres" | b"predb" | b"predbs" => b"predb",
+            b"movie" | b"movies" | b"movieinfo" | b"movie_info" => b"movie",
+            b"tv" | b"video" | b"videos" | b"tvshow" | b"tvshows" | b"tv_show" | b"tv_shows" => {
+                b"tvshow"
+            }
+            b"secondary" | b"secondary_search" | b"secondary_search_index" => b"secondary",
+            _ => return Some(Cow::Owned(base)),
+        };
+        Some(Cow::Borrowed(alias))
+    }
+
+    /// `SearchIndexOutboxDispatcher::normalizeActionPhp()` class index:
+    /// insert, upsert, update, delete, unknown.
+    fn action_class(raw: &[u8]) -> usize {
+        match fold(raw).as_slice() {
+            b"insert" | b"inserted" | b"create" | b"created" => 0,
+            b"upsert" | b"upserted" | b"replace" | b"replaced" | b"save" | b"saved" | b"index"
+            | b"indexed" => 1,
+            b"update" | b"updated" => 2,
+            b"delete" | b"deleted" | b"destroy" | b"destroyed" | b"remove" | b"removed" => 3,
+            _ => 4,
+        }
+    }
+
+    /// Mode 1 (`SearchIndexOutboxDispatcher::summarizeOutboxBatch`): `(kind,
+    /// entity_type, action, entity_id, row_id)...` -> `[rows, invalid,
+    /// missing_entity_id, inserts, upserts, updates, deletes,
+    /// unknown_actions, releases, predb, movies, tvshows, secondary,
+    /// other_types, distinct_documents, max_row_id]`. Rows without a positive
+    /// entity ID are skipped like `dispatchRow()` does; the maximum row ID
+    /// starts at 0.
+    fn outbox_rows(parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        let (rows, []) = parts.as_chunks::<5>() else {
+            return None;
+        };
+        let (mut invalid, mut missing, mut max_row) = (0usize, 0usize, 0i64);
+        let mut actions = [0usize; 5];
+        let mut types = [0usize; 6];
+        let mut documents = HashSet::new();
+        for [kind, raw_type, action, entity, row] in rows {
+            if !flag(kind)? {
+                invalid += 1;
+                continue;
+            }
+            let entity = integer(entity)?;
+            max_row = max_row.max(integer(row)?);
+            let normalized = entity_type(raw_type)?;
+            if entity <= 0 {
+                missing += 1;
+                continue;
+            }
+            actions[action_class(action)] += 1;
+            types[match normalized.as_ref() {
+                b"release" => 0,
+                b"predb" => 1,
+                b"movie" => 2,
+                b"tvshow" => 3,
+                b"secondary" => 4,
+                other if SECONDARY_TYPES.contains(&other) => 4,
+                _ => 5,
+            }] += 1;
+            documents.insert((normalized, entity));
+        }
+        let mut out = counts(&[rows.len(), invalid, missing])?;
+        out.extend(counts(&actions)?);
+        out.extend(counts(&types)?);
+        out.push(count(documents.len())?);
+        out.push(text(max_row));
+        Some(out)
+    }
+
+    /// Mode 2 (`ElasticsearchClientFactory::summarizeHostConfigBatch`):
+    /// `(kind, host, scheme, has_port, has_credentials)...` with `kind` `1`
+    /// for strings, `2` for arrays and `0` otherwise -> `[entries,
+    /// string_hosts, structured_hosts, skipped, https, with_port,
+    /// with_credentials, distinct_hostnames]`. Acceptance follows
+    /// `buildHostsPhp()`; a trimmed scheme of `""` or `"0"` means `http`.
+    fn host_configs(parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        let (entries, []) = parts.as_chunks::<5>() else {
+            return None;
+        };
+        let mut tallies = [0usize; 6];
+        let mut hostnames = HashSet::new();
+        for [kind, host, scheme, port, credentials] in entries {
+            let (port, credentials) = (flag(port)?, flag(credentials)?);
+            let host = trim(host);
+            match *kind {
+                b"1" if !host.is_empty() => {
+                    tallies[0] += 1;
+                    tallies[3] += usize::from(https_url(host));
+                }
+                b"2" if !host.is_empty() => {
+                    tallies[1] += 1;
+                    tallies[3] += usize::from(trim(scheme).eq_ignore_ascii_case(b"https"));
+                    tallies[4] += usize::from(port);
+                    tallies[5] += usize::from(credentials);
+                    hostnames.insert(host);
+                }
+                b"0" | b"1" | b"2" => tallies[2] += 1,
+                _ => return None,
+            }
+        }
+        let mut out = counts(&[entries.len()])?;
+        out.extend(counts(&tallies)?);
+        out.push(count(hostnames.len())?);
+        Some(out)
+    }
+
+    /// Mode 3 (`ElasticsearchResponseHelper::summarizeSearchResponseBatch`):
+    /// `kind` `0` for a non-array response, or `1, timed_out, failed_shards,
+    /// total, returned, id_count, id x id_count` -> `[responses, invalid,
+    /// timed_out, with_shard_failures, failed_shards, total_hits,
+    /// returned_hits, max_total, empty_responses, distinct_ids]`.
+    fn search_responses(parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        let (mut responses, mut invalid, mut timed_out, mut failing) = (0usize, 0, 0, 0);
+        let (mut failed, mut total, mut returned, mut max_total) = (0i64, 0i64, 0i64, 0i64);
+        let mut empty = 0usize;
+        let mut ids = HashSet::new();
+        let mut rest = parts;
+        while let Some((kind, tail)) = rest.split_first() {
+            responses += 1;
+            if !flag(kind)? {
+                invalid += 1;
+                rest = tail;
+                continue;
+            }
+            let [timed, shards, hits, page, id_count, tail @ ..] = tail else {
+                return None;
+            };
+            let id_count = length(id_count)?;
+            if id_count > tail.len() {
+                return None;
+            }
+            let (shards, hits, page) = (integer(shards)?, integer(hits)?, integer(page)?);
+            if shards < 0 || hits < 0 || page < 0 {
+                return None;
+            }
+            timed_out += usize::from(flag(timed)?);
+            failing += usize::from(shards > 0);
+            failed = failed.checked_add(shards)?;
+            total = total.checked_add(hits)?;
+            returned = returned.checked_add(page)?;
+            max_total = max_total.max(hits);
+            empty += usize::from(page == 0);
+            ids.extend(tail[..id_count].iter().copied());
+            rest = &tail[id_count..];
+        }
+        let mut out = counts(&[responses, invalid, timed_out, failing])?;
+        out.extend([text(failed), text(total), text(returned), text(max_total)]);
+        out.extend(counts(&[empty, ids.len()])?);
+        Some(out)
+    }
+
+    /// Mode 4 (`ManticoreClientFactory::summarizeHostListBatch`): `kind` `0`
+    /// for an unsupported list, `1, raw` for a comma-separated string, or `2,
+    /// n, item x n` for the truthy entries of an array, each tagged `s` (string
+    /// bytes follow), `a` (connection array) or `o` (other) -> `[lists,
+    /// invalid, empty_lists, hosts, structured_hosts, https_hosts,
+    /// distinct_hosts, max_hosts_per_list]`. String lists follow
+    /// `normalizeHostsPhp()`: trimmed, with `""` and `"0"` dropped.
+    fn host_lists(parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        let (mut lists, mut invalid, mut empty) = (0usize, 0usize, 0usize);
+        let (mut hosts, mut structured, mut https, mut widest) = (0usize, 0usize, 0usize, 0usize);
+        let mut distinct = HashSet::new();
+        let mut rest = parts;
+        while let Some((kind, tail)) = rest.split_first() {
+            lists += 1;
+            let mut found = 0usize;
+            match *kind {
+                b"0" => {
+                    invalid += 1;
+                    rest = tail;
+                    continue;
+                }
+                b"1" => {
+                    let (raw, tail) = tail.split_first()?;
+                    for host in raw.split(|byte| *byte == b',').map(trim) {
+                        if host.is_empty() || host == b"0" {
+                            continue;
+                        }
+                        found += 1;
+                        https += usize::from(https_url(host));
+                        distinct.insert(host);
+                    }
+                    rest = tail;
+                }
+                b"2" => {
+                    let (n, tail) = tail.split_first()?;
+                    let n = length(n)?;
+                    if n > tail.len() {
+                        return None;
+                    }
+                    for item in &tail[..n] {
+                        match item.split_first()? {
+                            (b's', host) if !host.is_empty() && host != b"0" => {
+                                https += usize::from(https_url(host));
+                                distinct.insert(host);
+                            }
+                            (b'a', []) => structured += 1,
+                            (b'o', []) => {}
+                            _ => return None,
+                        }
+                    }
+                    found = n;
+                    rest = &tail[n..];
+                }
+                _ => return None,
+            }
+            hosts += found;
+            empty += usize::from(found == 0);
+            widest = widest.max(found);
+        }
+        counts(&[
+            lists,
+            invalid,
+            empty,
+            hosts,
+            structured,
+            https,
+            distinct.len(),
+            widest,
+        ])
+    }
+
+    /// Logical name per table.
+    type TableMap<'a> = HashMap<&'a [u8], &'a [u8]>;
+
+    /// `(logical, table)` pairs keeping the first logical name per table.
+    fn table_map<'a>(parts: &'a [&'a [u8]]) -> Option<(TableMap<'a>, &'a [&'a [u8]])> {
+        let (n, tail) = parts.split_first()?;
+        let width = length(n)?.checked_mul(2)?;
+        if width > tail.len() {
+            return None;
+        }
+        let (pairs, []) = tail[..width].as_chunks::<2>() else {
+            return None;
+        };
+        let mut map = HashMap::with_capacity(pairs.len());
+        for [logical, table] in pairs {
+            map.entry(*table).or_insert(*logical);
+        }
+        Some((map, &tail[width..]))
+    }
+
+    /// Mode 5 (`ManticoreIndexRegistry::summarizeTableNameBatch`):
+    /// `[configured_count, (logical, table)..., default_count, (logical,
+    /// table)..., (kind, table)...]` -> `[tables, invalid, configured,
+    /// defaults, unresolved, distinct_logical]`. Resolution follows
+    /// `logicalNamePhp()`: configured tables first, then `*_rt` default
+    /// names, where a falsy (`""`/`"0"`) default logical name is unresolved.
+    fn table_names(parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        let (configured, rest) = table_map(parts)?;
+        let (defaults, rest) = table_map(rest)?;
+        let (tables, []) = rest.as_chunks::<2>() else {
+            return None;
+        };
+        let mut tallies = [0usize; 4];
+        let mut logical = HashSet::new();
+        for [kind, table] in tables {
+            if !flag(kind)? {
+                tallies[0] += 1;
+                continue;
+            }
+            if let Some(name) = configured.get(table) {
+                tallies[1] += 1;
+                logical.insert(*name);
+                continue;
+            }
+            match defaults.get(table) {
+                Some(name) if table.ends_with(b"_rt") && !name.is_empty() && *name != b"0" => {
+                    tallies[2] += 1;
+                    logical.insert(*name);
+                }
+                _ => tallies[3] += 1,
+            }
+        }
+        let mut out = counts(&[tables.len()])?;
+        out.extend(counts(&tallies)?);
+        out.push(count(logical.len())?);
+        Some(out)
+    }
+
+    fn transform(mode: u32, parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        match mode {
+            1 => outbox_rows(parts),
+            2 => host_configs(parts),
+            3 => search_responses(parts),
+            4 => host_lists(parts),
+            5 => table_names(parts),
+            _ => None,
+        }
+    }
+
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> Option<bool> {
+        if a_len == 0 || b_len == 0 {
+            return Some(false);
+        }
+        let a_end = a.checked_add(a_len)?;
+        let b_end = b.checked_add(b_len)?;
+        Some(a < b_end && b < a_end)
+    }
+
+    /// Dispatch count-prefixed, length-prefixed byte strings (little-endian
+    /// u32). Returns written bytes, `-needed` when `cap` is too small, or `-1`
+    /// for invalid input, mode, overlapping buffers or fields. Failure never
+    /// writes to the output buffer. Results are at least four bytes, so `-1`
+    /// never means "one byte needed".
+    ///
+    /// # Safety
+    /// Non-null pointers must refer to readable/writable allocations of the
+    /// declared lengths. Null pointers require zero length/capacity. Input and
+    /// output must not overlap.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w425_search_outbox_elastic_manticore_support(
+        mode: u32,
+        input: *const u8,
+        input_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if input_len > MAX_INPUT
+                || cap > isize::MAX as usize
+                || (input.is_null() && input_len != 0)
+                || (out.is_null() && cap != 0)
+            {
+                return DECLINE;
+            }
+            match overlaps(input as usize, input_len, out as usize, cap) {
+                Some(false) => {}
+                _ => return DECLINE,
+            }
+            let input = if input_len == 0 {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(input, input_len) }
+            };
+            let Some(parts) = unpack(input) else {
+                return DECLINE;
+            };
+            let Some(result) = transform(mode, &parts).and_then(|parts| pack(&parts)) else {
+                return DECLINE;
+            };
+            // `pack` bounds results by i32::MAX.
+            let needed = result.len() as i32;
+            if cap < result.len() || out.is_null() {
+                return -needed;
+            }
+            unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), out, result.len()) };
+            needed
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn packet(parts: &[&[u8]]) -> Vec<u8> {
+            pack(&parts.iter().map(|part| part.to_vec()).collect::<Vec<_>>()).unwrap()
+        }
+
+        fn raw(mode: u32, input: &[u8], out: &mut [u8]) -> i32 {
+            unsafe {
+                nntmux_w425_search_outbox_elastic_manticore_support(
+                    mode,
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            }
+        }
+
+        fn call(mode: u32, parts: &[&[u8]]) -> Option<Vec<String>> {
+            let input = packet(parts);
+            let mut out = vec![0u8; input.len() * 4 + 4096];
+            let written = raw(mode, &input, &mut out);
+            if written < 0 {
+                return None;
+            }
+            out.truncate(written as usize);
+            Some(
+                unpack(&out)?
+                    .into_iter()
+                    .map(|part| String::from_utf8(part.to_vec()).unwrap())
+                    .collect(),
+            )
+        }
+
+        fn strings(items: &[&str]) -> Option<Vec<String>> {
+            Some(items.iter().map(|item| (*item).to_owned()).collect())
+        }
+
+        #[test]
+        fn w425_normalizers_match_php() {
+            assert_eq!(
+                entity_type(b"App\\Models\\Release").as_deref(),
+                Some(&b"release"[..])
+            );
+            assert_eq!(entity_type(b"TV Shows").as_deref(), Some(&b"tvshow"[..]));
+            assert_eq!(entity_type(b"a/b//").as_deref(), Some(&b"b"[..]));
+            assert_eq!(entity_type(b"//").as_deref(), Some(&b""[..]));
+            assert_eq!(
+                entity_type(b"Music-Info").as_deref(),
+                Some(&b"music_info"[..])
+            );
+            assert_eq!(entity_type(b"caf\xc3\xa9"), None);
+            assert_eq!(action_class(b"Re-Moved"), 4);
+            assert_eq!(action_class(b"DESTROYED"), 3);
+            assert_eq!(action_class(b"index"), 1);
+            assert_eq!(trim(b"\0 a b\x0B\n"), b"a b");
+            assert_eq!(trim(b" \t "), b"");
+        }
+
+        #[test]
+        fn w425_outbox_batch() {
+            let parts: &[&[u8]] = &[
+                b"1",
+                b"releases",
+                b"Created",
+                b"5",
+                b"10", //
+                b"1",
+                b"App\\Models\\Release",
+                b"update",
+                b"5",
+                b"11", //
+                b"1",
+                b"predb",
+                b"delete",
+                b"0",
+                b"12", //
+                b"0",
+                b"",
+                b"",
+                b"0",
+                b"0", //
+                b"1",
+                b"movie_info",
+                b"saved",
+                b"7",
+                b"-3", //
+                b"1",
+                b"tv-show",
+                b"bogus",
+                b"8",
+                b"9", //
+                b"1",
+                b"secondary",
+                b"remove",
+                b"9",
+                b"1", //
+                b"1",
+                b"MusicInfo",
+                b"replace",
+                b"9",
+                b"2", //
+                b"1",
+                b"widgets",
+                b"insert",
+                b"9",
+                b"3",
+            ];
+            assert_eq!(
+                call(1, parts),
+                strings(&[
+                    "9", "1", "1", "2", "2", "1", "1", "1", "2", "0", "1", "1", "2", "1", "6", "12"
+                ])
+            );
+            assert_eq!(
+                call(1, &[]),
+                strings(&[
+                    "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0"
+                ])
+            );
+            assert_eq!(call(1, &[b"1", b"caf\xc3\xa9", b"x", b"1", b"1"]), None);
+            assert_eq!(call(1, &[b"1", b"r", b"x", b"01", b"1"]), None);
+            assert_eq!(call(1, &[b"2", b"r", b"x", b"1", b"1"]), None);
+            assert_eq!(call(1, &[b"1", b"r", b"x", b"1"]), None);
+        }
+
+        #[test]
+        fn w425_host_config_batch() {
+            let parts: &[&[u8]] = &[
+                b"1",
+                b" https://es:9200 ",
+                b"",
+                b"0",
+                b"0", //
+                b"1",
+                b" \t",
+                b"",
+                b"0",
+                b"0", //
+                b"0",
+                b"",
+                b"",
+                b"0",
+                b"0", //
+                b"2",
+                b" es1 ",
+                b" HTTPS ",
+                b"1",
+                b"1", //
+                b"2",
+                b"es1",
+                b"0",
+                b"0",
+                b"0", //
+                b"2",
+                b"",
+                b"https",
+                b"1",
+                b"1", //
+                b"2",
+                b"es2",
+                b"http",
+                b"1",
+                b"0",
+            ];
+            assert_eq!(
+                call(2, parts),
+                strings(&["7", "1", "3", "3", "2", "2", "1", "2"])
+            );
+            assert_eq!(
+                call(2, &[]),
+                strings(&["0", "0", "0", "0", "0", "0", "0", "0"])
+            );
+            assert_eq!(call(2, &[b"3", b"", b"", b"0", b"0"]), None);
+            assert_eq!(call(2, &[b"1", b"x", b"", b"2", b"0"]), None);
+            assert_eq!(call(2, &[b"1", b"x", b"", b"0"]), None);
+        }
+
+        #[test]
+        fn w425_search_response_batch() {
+            let parts: &[&[u8]] = &[
+                b"1", b"0", b"0", b"10", b"2", b"2", b"a", b"b", //
+                b"0", //
+                b"1", b"1", b"2", b"5", b"0", b"0", //
+                b"1", b"0", b"1", b"7", b"3", b"2", b"b", b"7",
+            ];
+            assert_eq!(
+                call(3, parts),
+                strings(&["4", "1", "1", "2", "3", "22", "5", "10", "1", "3"])
+            );
+            assert_eq!(
+                call(3, &[]),
+                strings(&["0", "0", "0", "0", "0", "0", "0", "0", "0", "0"])
+            );
+            assert_eq!(call(3, &[b"1", b"0", b"0", b"1", b"1", b"2", b"a"]), None);
+            assert_eq!(call(3, &[b"1", b"0", b"-1", b"1", b"1", b"0"]), None);
+            assert_eq!(call(3, &[b"1", b"0", b"0", b"1"]), None);
+            let max = i64::MAX.to_string();
+            let overflow: &[&[u8]] = &[
+                b"1",
+                b"0",
+                b"0",
+                max.as_bytes(),
+                b"0",
+                b"0",
+                b"1",
+                b"0",
+                b"0",
+                b"1",
+                b"0",
+                b"0",
+            ];
+            assert_eq!(call(3, overflow), None);
+        }
+
+        #[test]
+        fn w425_host_list_batch() {
+            let parts: &[&[u8]] = &[
+                b"1",
+                b" a:9308, ,0, https://b ,a:9308,", //
+                b"0",                               //
+                b"1",
+                b"  ", //
+                b"2",
+                b"3",
+                b"sHTTPS://c",
+                b"a",
+                b"o", //
+                b"2",
+                b"0",
+            ];
+            assert_eq!(
+                call(4, parts),
+                strings(&["5", "1", "2", "6", "1", "2", "3", "3"])
+            );
+            assert_eq!(
+                call(4, &[]),
+                strings(&["0", "0", "0", "0", "0", "0", "0", "0"])
+            );
+            assert_eq!(call(4, &[b"2", b"2", b"sa"]), None);
+            assert_eq!(call(4, &[b"2", b"1", b"s"]), None);
+            assert_eq!(call(4, &[b"2", b"1", b"ax"]), None);
+            assert_eq!(call(4, &[b"1"]), None);
+            assert_eq!(call(4, &[b"3"]), None);
+        }
+
+        #[test]
+        fn w425_table_name_batch() {
+            let parts: &[&[u8]] = &[
+                b"2",
+                b"releases",
+                b"my_releases",
+                b"other",
+                b"my_releases", //
+                b"3",
+                b"releases",
+                b"releases_rt",
+                b"0",
+                b"zero_rt",
+                b"predb",
+                b"predb_x", //
+                b"1",
+                b"my_releases",
+                b"1",
+                b"releases_rt",
+                b"1",
+                b"zero_rt",
+                b"1",
+                b"predb_x",
+                b"0",
+                b"",
+                b"1",
+                b"RELEASES_RT",
+            ];
+            assert_eq!(call(5, parts), strings(&["6", "1", "1", "1", "3", "1"]));
+            assert_eq!(
+                call(5, &[b"0", b"0"]),
+                strings(&["0", "0", "0", "0", "0", "0"])
+            );
+            assert_eq!(call(5, &[b"0"]), None);
+            assert_eq!(call(5, &[b"1", b"a"]), None);
+            assert_eq!(call(5, &[b"0", b"0", b"2", b"x"]), None);
+        }
+
+        #[test]
+        fn w425_malformed_null_overlap_and_capacity() {
+            let input = packet(&[b"0", b"", b"", b"0", b"0"]);
+            let mut big = vec![0u8; 256];
+            let written = raw(2, &input, &mut big);
+            assert!(written > 16);
+            let mut out = [0x5au8; 16];
+            assert_eq!(raw(2, &input, &mut out), -written);
+            assert_eq!(out, [0x5a; 16]);
+            unsafe {
+                assert_eq!(
+                    nntmux_w425_search_outbox_elastic_manticore_support(
+                        2,
+                        input.as_ptr(),
+                        input.len(),
+                        std::ptr::null_mut(),
+                        0
+                    ),
+                    -written
+                );
+                assert_eq!(
+                    nntmux_w425_search_outbox_elastic_manticore_support(
+                        2,
+                        std::ptr::null(),
+                        4,
+                        big.as_mut_ptr(),
+                        big.len()
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w425_search_outbox_elastic_manticore_support(
+                        2,
+                        input.as_ptr(),
+                        input.len(),
+                        std::ptr::null_mut(),
+                        8
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w425_search_outbox_elastic_manticore_support(
+                        2,
+                        input.as_ptr(),
+                        MAX_INPUT + 1,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w425_search_outbox_elastic_manticore_support(
+                        2,
+                        input.as_ptr(),
+                        input.len(),
+                        out.as_mut_ptr(),
+                        isize::MAX as usize + 1
+                    ),
+                    DECLINE
+                );
+                let mut shared = input.clone();
+                shared.resize(256, 0);
+                let shared_ptr = shared.as_mut_ptr();
+                assert_eq!(
+                    nntmux_w425_search_outbox_elastic_manticore_support(
+                        2,
+                        shared_ptr,
+                        input.len(),
+                        shared_ptr,
+                        256
+                    ),
+                    DECLINE
+                );
+                assert_eq!(&shared[..input.len()], &input[..]);
+            }
+            for mode in [0, 6, 99] {
+                assert_eq!(raw(mode, &input, &mut out), DECLINE);
+            }
+            assert_eq!(raw(2, &[], &mut out), DECLINE);
+            assert_eq!(raw(2, &[1, 0, 0], &mut out), DECLINE);
+            assert_eq!(raw(2, &[1, 0, 0, 0, 9, 0, 0, 0], &mut out), DECLINE);
+            assert_eq!(
+                raw(2, &[input.clone(), vec![0]].concat(), &mut out),
+                DECLINE
+            );
+            assert_eq!(raw(2, &[0xff, 0xff, 0xff, 0xff], &mut out), DECLINE);
+            assert_eq!(out, [0x5a; 16]);
+            assert_eq!(overlaps(usize::MAX - 1, 4, 0, 1), None);
+            assert_eq!(overlaps(0, 0, 0, 4), Some(false));
+        }
+    }
+}
