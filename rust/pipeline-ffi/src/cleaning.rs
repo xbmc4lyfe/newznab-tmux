@@ -36408,3 +36408,783 @@ pub mod w49_gdpr_audit_inventory_erasure_export_retention {
         }
     }
 }
+
+pub mod w501_status_probes_db_disk_nntp_result_queue {
+    //! Wave 50.1 batch kernels for the database, disk, NNTP, queue and `ProbeResult` status
+    //! probes. Every export reads NUL-joined string columns and little-endian `i64` tables,
+    //! writes fixed-width `i64` words into `out` and returns the word count, `SHORT_CAPACITY`
+    //! when `out_cap` (in words) is too small, or -1 for a malformed batch.
+    //!
+    //! Result words share one layout: `ok | impact << 1 | flag << 4 | min(2047, reasonLen) << 5
+    //! | responseTimeMs << 16` with impact codes `null = 0, none = 1, minor = 2, major = 3,
+    //! critical = 4`. A row whose `Str::limit()` reason holds non-ASCII bytes (multibyte width
+    //! rules) is written as `DECLINED` so PHP computes that row.
+
+    use super::w48_proxy_verdict_captcha_breach_reglog::rows;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    pub const MAX_INPUT: usize = 64 * 1024 * 1024;
+    pub const MAX_ITEMS: usize = 1 << 20;
+    pub const SHORT_CAPACITY: isize = -2;
+    pub const DECLINED: i64 = i64::MIN;
+
+    const CRITICAL: i64 = 4;
+    const MAJOR: i64 = 3;
+    const LIMIT: usize = 120;
+
+    /// Borrows a caller span; an empty span may be null and is never dereferenced.
+    unsafe fn span<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null() || len > MAX_INPUT {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
+    fn overlaps(input: (*const u8, usize), out: *mut i64, words: usize) -> bool {
+        let (a, a_len) = (input.0 as usize, input.1);
+        let (b, b_len) = (out as usize, words.saturating_mul(8));
+        a_len != 0 && b_len != 0 && a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
+    }
+
+    /// Validates the output window for `needed` words, lets `body` push them from the borrowed
+    /// inputs and copies the words to `out`.
+    unsafe fn run(
+        out: *mut i64,
+        out_cap: usize,
+        count: usize,
+        needed: usize,
+        inputs: &[(*const u8, usize)],
+        body: impl FnOnce(&[&[u8]], &mut Vec<i64>) -> bool,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out.is_null()
+                || !(out as usize).is_multiple_of(std::mem::align_of::<i64>())
+                || count > MAX_ITEMS
+                || out_cap > isize::MAX as usize / 8
+            {
+                return -1;
+            }
+            if needed > out_cap {
+                return SHORT_CAPACITY;
+            }
+            if inputs.iter().any(|&input| overlaps(input, out, needed)) {
+                return -1;
+            }
+            let mut spans = Vec::with_capacity(inputs.len());
+            for &(ptr, len) in inputs {
+                match unsafe { span(ptr, len) } {
+                    Some(bytes) => spans.push(bytes),
+                    None => return -1,
+                }
+            }
+            let mut words = Vec::with_capacity(needed);
+            if !body(&spans, &mut words) || words.len() != needed {
+                return -1;
+            }
+            // `needed` words were checked against `out_cap` above.
+            unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), out, needed) };
+            needed as isize
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Decodes exactly `count` little-endian `i64` values (`pack('P*', ...)`).
+    pub fn i64s(table: &[u8], count: usize) -> Option<Vec<i64>> {
+        if table.len() != count.checked_mul(8)? {
+            return None;
+        }
+        Some(
+            table
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|&c| i64::from_le_bytes(c))
+                .collect(),
+        )
+    }
+
+    /// Expands strictly ascending `u32` row indices (`pack('V*', ...array_keys($a, null, true))`)
+    /// into a per-row mask.
+    pub fn null_mask(table: &[u8], count: usize) -> Option<Vec<bool>> {
+        if !table.len().is_multiple_of(4) {
+            return None;
+        }
+        let mut mask = vec![false; count];
+        let mut next = 0usize;
+        for &c in table.as_chunks::<4>().0 {
+            let index = u32::from_le_bytes(c) as usize;
+            if index < next || index >= count {
+                return None;
+            }
+            mask[index] = true;
+            next = index + 1;
+        }
+        Some(mask)
+    }
+
+    /// PHP `(int) (($end - $start) / 1_000_000)`: exact integer division when the difference is
+    /// a whole number of milliseconds, otherwise double division truncated toward zero; an
+    /// overflowing subtraction is evaluated in doubles as PHP does.
+    pub fn php_elapsed_ms(start: i64, end: i64) -> i64 {
+        match end.checked_sub(start) {
+            Some(diff) if diff % 1_000_000 == 0 => diff / 1_000_000,
+            Some(diff) => (diff as f64 / 1_000_000.0) as i64,
+            None => ((end as f64 - start as f64) / 1_000_000.0) as i64,
+        }
+    }
+
+    /// Byte length and truncation flag of `Str::limit($message, 120)` for ASCII input; `None`
+    /// for non-ASCII input whose `mb_strwidth` rules PHP keeps.
+    pub fn limited(message: &[u8]) -> Option<(usize, bool)> {
+        if !message.is_ascii() {
+            return None;
+        }
+        if message.len() <= LIMIT {
+            return Some((message.len(), false));
+        }
+        let mut end = LIMIT;
+        while end > 0 && matches!(message[end - 1], b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B) {
+            end -= 1;
+        }
+        Some((end + 3, true))
+    }
+
+    pub fn word(ok: bool, impact: i64, flag: bool, reason_len: usize, ms: i64) -> i64 {
+        i64::from(ok)
+            | impact << 1
+            | i64::from(flag) << 4
+            | (reason_len.min(2047) as i64) << 5
+            | ms << 16
+    }
+
+    /// `DatabaseProbe` sample: connected (`error == None`) or `Database unreachable: ` failure.
+    pub fn database(start: i64, end: i64, error: Option<&[u8]>) -> i64 {
+        match error {
+            None => word(true, 0, false, 9, php_elapsed_ms(start, end)),
+            Some(message) => match limited(message) {
+                Some((len, truncated)) => word(false, CRITICAL, truncated, 22 + len, 0),
+                None => DECLINED,
+            },
+        }
+    }
+
+    /// PHP 8.4+ `round($value, 2)` (half away from zero with its pre-rounding edge check).
+    pub fn php_round2(value: f64) -> f64 {
+        if !value.is_finite() || value == 0.0 {
+            return value;
+        }
+        let exponent = 100.0;
+        let (mut integral, next) = if value >= 0.0 {
+            let t = (value * exponent).floor();
+            (t, t + 1.0)
+        } else {
+            let t = (value * exponent).ceil();
+            (t, t - 1.0)
+        };
+        if next / exponent == value {
+            integral = next;
+        }
+        if integral.abs() >= 1e16 {
+            return value;
+        }
+        let edge = ((integral + 0.5f64.copysign(integral)) / exponent).abs();
+        if value.abs() >= edge {
+            integral += 1.0f64.copysign(integral);
+        }
+        integral / exponent
+    }
+
+    fn decimal_digits(mut value: i64) -> usize {
+        let mut digits = 1;
+        while value >= 10 {
+            value /= 10;
+            digits += 1;
+        }
+        digits
+    }
+
+    /// `DiskProbe` mount: `(word, freeGb)` where the word is `verdict | min(0xFFFF, reasonLen)
+    /// << 2 | centiGb << 18`; `None` for negative byte counts.
+    pub fn disk(mount: &[u8], free_bytes: i64, warning: f64, critical: f64) -> Option<(i64, f64)> {
+        if free_bytes < 0 {
+            return None;
+        }
+        let gb = php_round2(free_bytes as f64 / 1_073_741_824.0);
+        let (verdict, fixed) = if gb <= critical {
+            (2, 29)
+        } else if gb <= warning {
+            (1, 33)
+        } else {
+            (0, 32)
+        };
+        let centi = (gb * 100.0).round() as i64;
+        let len = fixed + mount.len() + decimal_digits(centi / 100) + 3;
+        Some((verdict | (len.min(0xFFFF) as i64) << 2 | centi << 18, gb))
+    }
+
+    /// `NntpProbe` run: outcome bits 0-1 primary kind and 2-3 alternate kind (`0` connected,
+    /// `1` error object, else unknown; alternate `3` = not attempted).
+    pub fn nntp(
+        outcome: u8,
+        primary: &[u8],
+        alternate: &[u8],
+        start: i64,
+        end: i64,
+        check_alternate: bool,
+    ) -> i64 {
+        let (pk, ak) = (outcome & 3, outcome >> 2 & 3);
+        let attempted = ak != 3;
+        let flag = check_alternate && attempted;
+        let reason_len = |kind: u8, message: &[u8]| match kind {
+            0 => 9,
+            1 => message.len(),
+            _ => 25,
+        };
+        if pk != 0 {
+            return word(false, CRITICAL, flag, 21 + reason_len(pk, primary), 0);
+        }
+        if flag && ak != 0 {
+            return word(false, MAJOR, flag, 23 + reason_len(ak, alternate), 0);
+        }
+        let len = if check_alternate { 36 } else { 22 };
+        word(true, 0, flag, len, php_elapsed_ms(start, end))
+    }
+
+    pub fn impact_code(impact: Option<&[u8]>) -> i64 {
+        match impact {
+            None => 0,
+            Some(b"none") => 1,
+            Some(b"minor") => 2,
+            Some(b"major") => 3,
+            Some(b"critical") => 4,
+            Some(_) => 7,
+        }
+    }
+
+    /// `ProbeResult` summary row: `ok | impact << 1 | truncated << 4 | min(2047,
+    /// strlen(Str::limit($reason, 120))) << 5 | clamp(responseTimeMs, 0, 2^47 - 1) << 16`.
+    pub fn summary(ok: bool, response_ms: i64, impact: i64, reason: &[u8]) -> i64 {
+        match limited(reason) {
+            Some((len, truncated)) => word(
+                ok,
+                impact,
+                truncated,
+                len,
+                response_ms.clamp(0, 0x7FFF_FFFF_FFFF),
+            ),
+            None => DECLINED,
+        }
+    }
+
+    /// `QueueProbe` sample: reachable (`error == None`) or `Queue probe failed: ` failure; the
+    /// flag marks an empty metadata array (sync driver or failure).
+    pub fn queue(connection: &[u8], start: i64, end: i64, error: Option<&[u8]>) -> i64 {
+        match error {
+            None => {
+                let sync = connection == b"sync";
+                let len = if sync { 22 } else { 18 + connection.len() };
+                word(true, 0, sync, len, php_elapsed_ms(start, end))
+            }
+            Some(message) => match limited(message) {
+                Some((len, _)) => word(false, CRITICAL, true, 20 + len, 0),
+                None => DECLINED,
+            },
+        }
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w501_database_probe_summarize_batch(
+        starts: *const u8,
+        starts_len: usize,
+        ends: *const u8,
+        ends_len: usize,
+        errors: *const u8,
+        errors_len: usize,
+        nulls: *const u8,
+        nulls_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [
+            (starts, starts_len),
+            (ends, ends_len),
+            (errors, errors_len),
+            (nulls, nulls_len),
+        ];
+        unsafe {
+            run(out, out_cap, count, count, &inputs, |s, o| {
+                let (Some(starts), Some(ends), Some(errors), Some(nulls)) = (
+                    i64s(s[0], count),
+                    i64s(s[1], count),
+                    rows(s[2], count),
+                    null_mask(s[3], count),
+                ) else {
+                    return false;
+                };
+                for i in 0..count {
+                    let error = (!nulls[i]).then_some(errors[i]);
+                    o.push(database(starts[i], ends[i], error));
+                }
+                true
+            })
+        }
+    }
+
+    /// Writes one word per mount plus a trailing word holding the index of the first mount
+    /// with the lowest free space (-1 for an empty batch).
+    ///
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w501_disk_probe_evaluate_batch(
+        mounts: *const u8,
+        mounts_len: usize,
+        free_bytes: *const u8,
+        free_bytes_len: usize,
+        count: usize,
+        warning_gb: f64,
+        critical_gb: f64,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(mounts, mounts_len), (free_bytes, free_bytes_len)];
+        let needed = count.saturating_add(1);
+        unsafe {
+            run(out, out_cap, count, needed, &inputs, |s, o| {
+                let (Some(mounts), Some(bytes)) = (rows(s[0], count), i64s(s[1], count)) else {
+                    return false;
+                };
+                let mut worst: Option<(usize, f64)> = None;
+                for (i, (mount, &free)) in mounts.iter().zip(&bytes).enumerate() {
+                    let Some((word, gb)) = disk(mount, free, warning_gb, critical_gb) else {
+                        return false;
+                    };
+                    if worst.is_none_or(|(_, lowest)| gb < lowest) {
+                        worst = Some((i, gb));
+                    }
+                    o.push(word);
+                }
+                o.push(worst.map_or(-1, |(i, _)| i as i64));
+                true
+            })
+        }
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w501_nntp_probe_evaluate_batch(
+        outcomes: *const u8,
+        outcomes_len: usize,
+        primary: *const u8,
+        primary_len: usize,
+        alternate: *const u8,
+        alternate_len: usize,
+        starts: *const u8,
+        starts_len: usize,
+        ends: *const u8,
+        ends_len: usize,
+        count: usize,
+        check_alternate: u8,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [
+            (outcomes, outcomes_len),
+            (primary, primary_len),
+            (alternate, alternate_len),
+            (starts, starts_len),
+            (ends, ends_len),
+        ];
+        unsafe {
+            run(out, out_cap, count, count, &inputs, |s, o| {
+                if check_alternate > 1 || s[0].len() != count {
+                    return false;
+                }
+                let (Some(primary), Some(alternate), Some(starts), Some(ends)) = (
+                    rows(s[1], count),
+                    rows(s[2], count),
+                    i64s(s[3], count),
+                    i64s(s[4], count),
+                ) else {
+                    return false;
+                };
+                for i in 0..count {
+                    o.push(nntp(
+                        s[0][i],
+                        primary[i],
+                        alternate[i],
+                        starts[i],
+                        ends[i],
+                        check_alternate == 1,
+                    ));
+                }
+                true
+            })
+        }
+    }
+
+    /// Writes one summary word per result plus a trailing `failing | worstImpact << 32` word
+    /// (worst of the valid impact codes 0-4).
+    ///
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w501_probe_result_summarize_batch(
+        oks: *const u8,
+        oks_len: usize,
+        response_ms: *const u8,
+        response_ms_len: usize,
+        impacts: *const u8,
+        impacts_len: usize,
+        nulls: *const u8,
+        nulls_len: usize,
+        reasons: *const u8,
+        reasons_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [
+            (oks, oks_len),
+            (response_ms, response_ms_len),
+            (impacts, impacts_len),
+            (nulls, nulls_len),
+            (reasons, reasons_len),
+        ];
+        let needed = count.saturating_add(1);
+        unsafe {
+            run(out, out_cap, count, needed, &inputs, |s, o| {
+                if s[0].len() != count {
+                    return false;
+                }
+                let (Some(times), Some(impacts), Some(nulls), Some(reasons)) = (
+                    i64s(s[1], count),
+                    rows(s[2], count),
+                    null_mask(s[3], count),
+                    rows(s[4], count),
+                ) else {
+                    return false;
+                };
+                let (mut failing, mut worst) = (0i64, 0i64);
+                for i in 0..count {
+                    let ok = s[0][i] != 0;
+                    let impact = impact_code((!nulls[i]).then_some(impacts[i]));
+                    failing += i64::from(!ok);
+                    if impact <= CRITICAL {
+                        worst = worst.max(impact);
+                    }
+                    o.push(summary(ok, times[i], impact, reasons[i]));
+                }
+                o.push(failing | worst << 32);
+                true
+            })
+        }
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w501_queue_probe_evaluate_batch(
+        connections: *const u8,
+        connections_len: usize,
+        starts: *const u8,
+        starts_len: usize,
+        ends: *const u8,
+        ends_len: usize,
+        errors: *const u8,
+        errors_len: usize,
+        nulls: *const u8,
+        nulls_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [
+            (connections, connections_len),
+            (starts, starts_len),
+            (ends, ends_len),
+            (errors, errors_len),
+            (nulls, nulls_len),
+        ];
+        unsafe {
+            run(out, out_cap, count, count, &inputs, |s, o| {
+                let (Some(connections), Some(starts), Some(ends), Some(errors), Some(nulls)) = (
+                    rows(s[0], count),
+                    i64s(s[1], count),
+                    i64s(s[2], count),
+                    rows(s[3], count),
+                    null_mask(s[4], count),
+                ) else {
+                    return false;
+                };
+                for i in 0..count {
+                    let error = (!nulls[i]).then_some(errors[i]);
+                    o.push(queue(connections[i], starts[i], ends[i], error));
+                }
+                true
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn le(values: &[i64]) -> Vec<u8> {
+            values.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+
+        #[test]
+        fn elapsed_matches_php_division_semantics() {
+            assert_eq!(php_elapsed_ms(0, 3_000_000), 3);
+            assert_eq!(php_elapsed_ms(0, 2_999_999), 2);
+            assert_eq!(php_elapsed_ms(5_000_000, 0), -5);
+            assert_eq!(php_elapsed_ms(1, 0), 0);
+            assert_eq!(php_elapsed_ms(-1, i64::MAX), 9_223_372_036_854);
+            assert_eq!(php_elapsed_ms(i64::MIN, i64::MAX), 18_446_744_073_709);
+            assert_eq!(php_elapsed_ms(i64::MAX, i64::MIN), -18_446_744_073_709);
+        }
+
+        #[test]
+        fn limit_and_round_follow_php() {
+            assert_eq!(limited(b"boom"), Some((4, false)));
+            assert_eq!(limited(&[b'a'; 120]), Some((120, false)));
+            assert_eq!(limited(&[b'a'; 121]), Some((123, true)));
+            let mut spaced = vec![b'a'; 117];
+            spaced.extend_from_slice(b" \t\x0B ");
+            assert_eq!(limited(&spaced), Some((120, true)));
+            assert_eq!(limited(&[b' '; 200]), Some((3, true)));
+            assert_eq!(limited("é".as_bytes()), None);
+            assert_eq!(php_round2(0.285), 0.29);
+            assert_eq!(php_round2(1.005), 1.01);
+            assert_eq!(php_round2(0.29), 0.29);
+            assert_eq!(php_round2(-1.005), -1.01);
+            assert_eq!(php_round2(0.0), 0.0);
+        }
+
+        #[test]
+        fn row_words() {
+            assert_eq!(database(0, 12_500_000, None), 1 | 9 << 5 | 12 << 16);
+            assert_eq!(database(0, 0, Some(b"refused")), 4 << 1 | 29 << 5);
+            assert_eq!(database(0, 0, Some("ü".as_bytes())), DECLINED);
+            let (w, gb) = disk(b"/", 3 * 1_073_741_824, 5.0, 1.0).unwrap();
+            assert_eq!(
+                (w & 3, w >> 2 & 0xFFFF, w >> 18, gb),
+                (1, 33 + 1 + 4, 300, 3.0)
+            );
+            let (w, _) = disk(b"/data", 1_073_741_824 / 2, 5.0, 1.0).unwrap();
+            assert_eq!((w & 3, w >> 2 & 0xFFFF), (2, 29 + 5 + 4));
+            let (w, _) = disk(b"/", 12_345 * 1_073_741_824, 5.0, 1.0).unwrap();
+            assert_eq!((w & 3, w >> 2 & 0xFFFF), (0, 32 + 1 + 8));
+            assert!(disk(b"/", -1, 5.0, 1.0).is_none());
+            assert_eq!(
+                nntp(0, b"", b"", 0, 7_000_000, false),
+                1 | 22 << 5 | 7 << 16
+            );
+            assert_eq!(nntp(1, b"timeout", b"", 0, 0, false), 4 << 1 | 28 << 5);
+            assert_eq!(
+                nntp(1 << 2, b"", b"x", 0, 0, true),
+                3 << 1 | 1 << 4 | 24 << 5
+            );
+            assert_eq!(
+                nntp(2 | 1 << 2, b"", b"x", 0, 0, true),
+                4 << 1 | 1 << 4 | 46 << 5
+            );
+            assert_eq!(nntp(3 << 2, b"", b"", 0, 0, true), 1 | 36 << 5);
+            assert_eq!(summary(true, -5, 0, b"Connected"), 1 | 9 << 5);
+            assert_eq!(
+                summary(false, i64::MAX, 7, b"x"),
+                7 << 1 | 1 << 5 | 0x7FFF_FFFF_FFFF << 16
+            );
+            assert_eq!(queue(b"sync", 0, 0, None), 1 | 1 << 4 | 22 << 5);
+            assert_eq!(queue(b"redis", 0, 2_000_000, None), 1 | 23 << 5 | 2 << 16);
+            assert_eq!(queue(b"", 0, 0, Some(b"down")), 4 << 1 | 1 << 4 | 24 << 5);
+        }
+
+        #[test]
+        fn exports_guard_pointers_capacity_and_counts() {
+            let mut out = [0i64; 8];
+            let p = out.as_mut_ptr();
+            let null = std::ptr::null();
+            let times = le(&[0, 1_000_000]);
+            let t = times.as_ptr();
+            let nulls = 0u32.to_le_bytes();
+            let n = nulls.as_ptr();
+            let text = b"a\0b";
+            let s = text.as_ptr();
+            unsafe {
+                assert_eq!(
+                    nntmux_w501_database_probe_summarize_batch(
+                        null, 0, null, 0, null, 0, null, 0, 0, p, 8
+                    ),
+                    0
+                );
+                assert_eq!(
+                    nntmux_w501_database_probe_summarize_batch(t, 16, t, 16, s, 3, n, 4, 2, p, 8),
+                    2
+                );
+                assert_eq!(out[0], 1 | 9 << 5);
+                assert_eq!(out[1], 4 << 1 | 23 << 5);
+                assert_eq!(
+                    nntmux_w501_database_probe_summarize_batch(t, 16, t, 16, s, 3, n, 4, 2, p, 1),
+                    SHORT_CAPACITY
+                );
+                assert_eq!(
+                    nntmux_w501_database_probe_summarize_batch(t, 8, t, 16, s, 3, n, 4, 2, p, 8),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w501_database_probe_summarize_batch(
+                        null, 16, t, 16, s, 3, n, 4, 2, p, 8
+                    ),
+                    -1
+                );
+                let bad = 5u32.to_le_bytes();
+                assert_eq!(
+                    nntmux_w501_database_probe_summarize_batch(
+                        t,
+                        16,
+                        t,
+                        16,
+                        s,
+                        3,
+                        bad.as_ptr(),
+                        4,
+                        2,
+                        p,
+                        8
+                    ),
+                    -1
+                );
+                let nm = std::ptr::null_mut();
+                assert_eq!(
+                    nntmux_w501_database_probe_summarize_batch(t, 16, t, 16, s, 3, n, 4, 2, nm, 8),
+                    -1
+                );
+                let misaligned = (p as *mut u8).add(1) as *mut i64;
+                assert_eq!(
+                    nntmux_w501_database_probe_summarize_batch(
+                        t, 16, t, 16, s, 3, n, 4, 2, misaligned, 4
+                    ),
+                    -1
+                );
+                let overlap = out.as_ptr() as *const u8;
+                assert_eq!(
+                    nntmux_w501_database_probe_summarize_batch(
+                        overlap, 16, t, 16, s, 3, null, 0, 2, p, 8
+                    ),
+                    -1
+                );
+
+                let bytes = le(&[10 * 1_073_741_824, 1_073_741_824]);
+                let b = bytes.as_ptr();
+                assert_eq!(
+                    nntmux_w501_disk_probe_evaluate_batch(s, 3, b, 16, 2, 5.0, 1.0, p, 8),
+                    3
+                );
+                assert_eq!(out[2], 1);
+                assert_eq!(
+                    nntmux_w501_disk_probe_evaluate_batch(null, 0, null, 0, 0, 5.0, 1.0, p, 8),
+                    1
+                );
+                assert_eq!(out[0], -1);
+                assert_eq!(
+                    nntmux_w501_disk_probe_evaluate_batch(s, 3, b, 16, 2, 5.0, 1.0, p, 2),
+                    SHORT_CAPACITY
+                );
+                let negative = le(&[1, -1]);
+                assert_eq!(
+                    nntmux_w501_disk_probe_evaluate_batch(
+                        s,
+                        3,
+                        negative.as_ptr(),
+                        16,
+                        2,
+                        5.0,
+                        1.0,
+                        p,
+                        8
+                    ),
+                    -1
+                );
+
+                let outcomes = [0u8, 1];
+                let o = outcomes.as_ptr();
+                assert_eq!(
+                    nntmux_w501_nntp_probe_evaluate_batch(
+                        o, 2, s, 3, s, 3, t, 16, t, 16, 2, 0, p, 8
+                    ),
+                    2
+                );
+                assert_eq!(
+                    nntmux_w501_nntp_probe_evaluate_batch(
+                        o, 2, s, 3, s, 3, t, 16, t, 16, 2, 2, p, 8
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w501_nntp_probe_evaluate_batch(
+                        o, 1, s, 3, s, 3, t, 16, t, 16, 2, 0, p, 8
+                    ),
+                    -1
+                );
+
+                let impacts = b"minor\0";
+                assert_eq!(
+                    nntmux_w501_probe_result_summarize_batch(
+                        o,
+                        2,
+                        t,
+                        16,
+                        impacts.as_ptr(),
+                        6,
+                        null,
+                        0,
+                        s,
+                        3,
+                        2,
+                        p,
+                        8
+                    ),
+                    3
+                );
+                assert_eq!(out[2], 1 | 2 << 32);
+                assert_eq!(
+                    nntmux_w501_probe_result_summarize_batch(
+                        o,
+                        2,
+                        t,
+                        16,
+                        impacts.as_ptr(),
+                        6,
+                        null,
+                        0,
+                        s,
+                        3,
+                        2,
+                        p,
+                        2
+                    ),
+                    SHORT_CAPACITY
+                );
+
+                assert_eq!(
+                    nntmux_w501_queue_probe_evaluate_batch(s, 3, t, 16, t, 16, s, 3, n, 4, 2, p, 8),
+                    2
+                );
+                assert_eq!(out[0], 1 | 19 << 5);
+                assert_eq!(
+                    nntmux_w501_queue_probe_evaluate_batch(s, 3, t, 16, t, 16, s, 1, n, 4, 2, p, 8),
+                    -1
+                );
+            }
+        }
+    }
+}
