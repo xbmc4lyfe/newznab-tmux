@@ -24602,3 +24602,429 @@ pub unsafe extern "C" fn nntmux_w34_candidate_repository_nfo_processor(
     }))
     .unwrap_or(-1)
 }
+
+mod wave35_nzb_nfo_par2_exceptions_recovery {
+    use super::{nfo_abi_range, yenc_ranges_overlap};
+    use std::slice;
+
+    pub(super) const MAX_BYTES: usize = 16 * 1024 * 1024;
+
+    /// The NFO body limit enforced by upload staging and companion capture.
+    const NFO_LIMIT: i64 = 65_535;
+
+    /// The per-value NZB password metadata limit.
+    const PASSWORD_LIMIT: i64 = 4_096;
+
+    /// PHP `trim()`'s default character list.
+    fn php_space(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x00)
+    }
+
+    /// The `[start, end)` range `trim()` keeps.
+    fn trim_range(value: &[u8]) -> (usize, usize) {
+        let start = value
+            .iter()
+            .position(|b| !php_space(*b))
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|b| !php_space(*b))
+            .map_or(start, |i| i + 1);
+        (start, end)
+    }
+
+    /// `str_contains(strtolower($haystack), $needle)` for a lowercase ASCII needle.
+    fn contains_ascii_ci(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.len() >= needle.len()
+            && haystack
+                .windows(needle.len())
+                .any(|w| w.eq_ignore_ascii_case(needle))
+    }
+
+    /// The segment after the last `/` in `value[start..end)`.
+    fn base_segment(value: &[u8], start: usize, end: usize) -> usize {
+        value[start..end]
+            .iter()
+            .rposition(|b| *b == b'/')
+            .map_or(start, |i| start + i + 1)
+    }
+
+    /// `[kind, payload_bytes, within_limit]`; kind 0 empty, 1 oversize, 2 encoding, 3 invalid.
+    pub(super) fn classify_nfo_rejection(reason: &[u8], payload_bytes: i64) -> [i64; 3] {
+        let payload = payload_bytes.max(0);
+        let kind = if payload > NFO_LIMIT {
+            1
+        } else if payload == 0 && contains_ascii_ci(reason, b"empty") {
+            0
+        } else if contains_ascii_ci(reason, b"exceeds") || contains_ascii_ci(reason, b"size limit")
+        {
+            1
+        } else if contains_ascii_ci(reason, b"encoding") {
+            2
+        } else {
+            3
+        };
+        [
+            kind,
+            payload,
+            i64::from(payload >= 1 && payload <= NFO_LIMIT),
+        ]
+    }
+
+    /// `[attempt_start, attempt_len, has_recovered, recovered_start, recovered_len,
+    /// directory_start, directory_len, recoverable]`, ranges into each input.
+    pub(super) fn normalize_custody(
+        attempt: &[u8],
+        recovered: Option<&[u8]>,
+        directory: &[u8],
+    ) -> [i64; 8] {
+        let (attempt_start, attempt_end) = trim_range(attempt);
+        let recovered = recovered.and_then(|name| {
+            let (start, end) = trim_range(name);
+            let base = base_segment(name, start, end);
+            (end > base).then_some((base, end))
+        });
+        let (dir_start, mut dir_end) = trim_range(directory);
+        while dir_end > dir_start && directory[dir_end - 1] == b'/' {
+            dir_end -= 1;
+        }
+        let dir_base = base_segment(directory, dir_start, dir_end);
+        let (rec_start, rec_end) = recovered.unwrap_or((0, 0));
+        [
+            attempt_start as i64,
+            (attempt_end - attempt_start) as i64,
+            i64::from(recovered.is_some()),
+            rec_start as i64,
+            (rec_end - rec_start) as i64,
+            dir_base as i64,
+            (dir_end - dir_base) as i64,
+            i64::from(attempt_end > attempt_start && recovered.is_some() && dir_end > dir_base),
+        ]
+    }
+
+    /// `[kind, value_length, over_limit]`; kind 0 structure, 1 limit, 2 unknown.
+    pub(super) fn classify_password_rejection(reason: &[u8], value_length: i64) -> [i64; 3] {
+        let length = value_length.max(0);
+        let over = length > PASSWORD_LIMIT;
+        let kind = if contains_ascii_ci(reason, b"structure") {
+            0
+        } else if over || contains_ascii_ci(reason, b"limit") {
+            1
+        } else {
+            2
+        };
+        [kind, length, i64::from(over)]
+    }
+
+    /// `[status, category, retryable, message_start, message_len]`; category 0
+    /// client, 1 conflict, 2 server; an empty message range selects the default.
+    pub(super) fn normalize_upload_failure(message: &[u8], status: i64) -> [i64; 5] {
+        let status = if (400..=599).contains(&status) {
+            status
+        } else {
+            500
+        };
+        let category = match status {
+            409 => 1,
+            400..=499 => 0,
+            _ => 2,
+        };
+        let (start, end) = trim_range(message);
+        [
+            status,
+            category,
+            i64::from(status >= 500),
+            start as i64,
+            (end - start) as i64,
+        ]
+    }
+
+    /// `[outcome, terminal, retry, probes, articles, total_reads, articles_per_probe]`;
+    /// outcome 0 renamed, 1 no_match, 2 retryable, 3 deferred, -1 unknown.
+    pub(super) fn summarize_recovery(outcome: &[u8], probes: i64, articles: i64) -> [i64; 7] {
+        let code = match outcome {
+            b"renamed" => 0,
+            b"no_match" => 1,
+            b"retryable" => 2,
+            b"deferred" => 3,
+            _ => -1,
+        };
+        let probes = probes.max(0);
+        let articles = articles.max(0);
+        [
+            code,
+            i64::from(code == 0 || code == 1),
+            i64::from(code == 2),
+            probes,
+            articles,
+            probes.saturating_add(articles),
+            if probes > 0 { articles / probes } else { 0 },
+        ]
+    }
+
+    fn int(bytes: &[u8], index: usize) -> i64 {
+        let mut slot = [0u8; 8];
+        slot.copy_from_slice(&bytes[index * 8..index * 8 + 8]);
+        i64::from_ne_bytes(slot)
+    }
+
+    fn flag(bytes: &[u8], index: usize) -> Option<bool> {
+        match int(bytes, index) {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+
+    fn pack_ints(values: &[i64]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_ne_bytes()).collect()
+    }
+
+    /// Split the bytes after `head` into strings of the given lengths, which must
+    /// cover the tail exactly.
+    fn strings<'a>(bytes: &'a [u8], head: usize, lengths: &[i64]) -> Option<Vec<&'a [u8]>> {
+        let mut cursor = head;
+        let mut parts = Vec::with_capacity(lengths.len());
+        for &length in lengths {
+            let end = cursor.checked_add(usize::try_from(length).ok()?)?;
+            parts.push(bytes.get(cursor..end)?);
+            cursor = end;
+        }
+        (cursor == bytes.len()).then_some(parts)
+    }
+
+    fn compute(operation: u32, bytes: &[u8]) -> Option<Vec<u8>> {
+        let fixed = match operation {
+            0 | 2 | 3 => 1,
+            1 => 4,
+            4 => 2,
+            _ => return None,
+        };
+        if bytes.len() < fixed * 8 {
+            return None;
+        }
+        let tail = &bytes[fixed * 8..];
+        match operation {
+            0 => Some(pack_ints(&classify_nfo_rejection(tail, int(bytes, 0)))),
+            1 => {
+                let has_recovered = flag(bytes, 1)?;
+                let lengths = [int(bytes, 0), int(bytes, 2), int(bytes, 3)];
+                if !has_recovered && lengths[1] != 0 {
+                    return None;
+                }
+                let parts = strings(bytes, 32, &lengths)?;
+                Some(pack_ints(&normalize_custody(
+                    parts[0],
+                    has_recovered.then_some(parts[1]),
+                    parts[2],
+                )))
+            }
+            2 => Some(pack_ints(&classify_password_rejection(tail, int(bytes, 0)))),
+            3 => Some(pack_ints(&normalize_upload_failure(tail, int(bytes, 0)))),
+            4 => Some(pack_ints(&summarize_recovery(
+                tail,
+                int(bytes, 0),
+                int(bytes, 1),
+            ))),
+            _ => None,
+        }
+    }
+
+    /// # Safety
+    /// See [`super::nntmux_w35_nzb_nfo_par2_exceptions_recovery`].
+    pub(super) unsafe fn evaluate(
+        operation: u32,
+        input: *const u8,
+        length: usize,
+        output: *mut u8,
+        capacity: usize,
+    ) -> i64 {
+        if !nfo_abi_range(input, length, false)
+            || !nfo_abi_range(output, capacity, false)
+            || length > MAX_BYTES
+            || capacity > MAX_BYTES
+            || yenc_ranges_overlap(input as usize, length, output as usize, capacity)
+        {
+            return -1;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, length) };
+        let Some(result) = compute(operation, bytes) else {
+            return -1;
+        };
+        let needed = result.len() as i64;
+        if result.len() > capacity {
+            return -needed;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), output, result.len()) };
+        needed
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn call(operation: u32, input: &[u8]) -> Option<Vec<i64>> {
+            let mut out = vec![0xa5u8; 4096];
+            let probe = [0u8; 1];
+            let pointer = if input.is_empty() {
+                probe.as_ptr()
+            } else {
+                input.as_ptr()
+            };
+            let written =
+                unsafe { evaluate(operation, pointer, input.len(), out.as_mut_ptr(), out.len()) };
+            if written < 0 {
+                assert_eq!(written, -1);
+                return None;
+            }
+            Some(
+                out[..written as usize]
+                    .chunks_exact(8)
+                    .map(|c| i64::from_ne_bytes(c.try_into().unwrap()))
+                    .collect(),
+            )
+        }
+
+        fn with_string(slots: &[i64], strings: &[&[u8]]) -> Vec<u8> {
+            let mut v = pack_ints(slots);
+            for s in strings {
+                v.extend_from_slice(s);
+            }
+            v
+        }
+
+        #[test]
+        fn w35_2_nfo_and_password_rejections() {
+            let nfo =
+                |reason: &str, bytes: i64| call(0, &with_string(&[bytes], &[reason.as_bytes()]));
+            let captured = "Captured companion is empty or exceeds the NFO size limit";
+            assert_eq!(nfo(captured, 0), Some(vec![0, 0, 0]));
+            assert_eq!(nfo(captured, 70_000), Some(vec![1, 70_000, 0]));
+            assert_eq!(nfo(captured, 12), Some(vec![1, 12, 1]));
+            assert_eq!(nfo("Bad ENCODING", 65_535), Some(vec![2, 65_535, 1]));
+            assert_eq!(nfo("", -9), Some(vec![3, 0, 0]));
+            assert_eq!(nfo("EMPTY", i64::MIN), Some(vec![0, 0, 0]));
+            let password =
+                |reason: &str, length: i64| call(2, &with_string(&[length], &[reason.as_bytes()]));
+            assert_eq!(
+                password("Invalid NZB password metadata structure.", 0),
+                Some(vec![0, 0, 0])
+            );
+            assert_eq!(
+                password("NZB password metadata exceeds the supported limit.", 4_097),
+                Some(vec![1, 4_097, 1])
+            );
+            assert_eq!(password("other", 4_096), Some(vec![2, 4_096, 0]));
+            assert_eq!(password("other", 5_000), Some(vec![1, 5_000, 1]));
+            assert_eq!(call(0, &[1, 2, 3]), None);
+            assert_eq!(call(2, &[]), None);
+        }
+
+        #[test]
+        fn w35_2_custody_upload_and_recovery() {
+            let custody = |a: &str, r: Option<&str>, d: &str| {
+                call(
+                    1,
+                    &with_string(
+                        &[
+                            a.len() as i64,
+                            i64::from(r.is_some()),
+                            r.map_or(0, str::len) as i64,
+                            d.len() as i64,
+                        ],
+                        &[a.as_bytes(), r.unwrap_or("").as_bytes(), d.as_bytes()],
+                    ),
+                )
+            };
+            assert_eq!(
+                custody(" abc\n", Some("x/y.nzb "), "/p/q/ "),
+                Some(vec![1, 3, 1, 2, 5, 3, 1, 1])
+            );
+            assert_eq!(custody("", None, "q"), Some(vec![0, 0, 0, 0, 0, 0, 1, 0]));
+            assert_eq!(
+                custody("a", Some("dir/"), "///"),
+                Some(vec![0, 1, 0, 0, 0, 0, 0, 0])
+            );
+            assert_eq!(call(1, &with_string(&[0, 0, 1, 0], &[b"x"])), None);
+            assert_eq!(call(1, &with_string(&[0, 2, 0, 0], &[])), None);
+            assert_eq!(call(1, &with_string(&[-1, 0, 0, 0], &[])), None);
+            assert_eq!(call(1, &with_string(&[1, 0, 0, 0], &[b"ab"])), None);
+            let upload = |m: &str, s: i64| call(3, &with_string(&[s], &[m.as_bytes()]));
+            assert_eq!(upload(" Bad ", 400), Some(vec![400, 0, 0, 1, 3]));
+            assert_eq!(upload("dup", 409), Some(vec![409, 1, 0, 0, 3]));
+            assert_eq!(upload("", 503), Some(vec![503, 2, 1, 0, 0]));
+            assert_eq!(upload("x", 200), Some(vec![500, 2, 1, 0, 1]));
+            assert_eq!(upload("\0\t", i64::MIN), Some(vec![500, 2, 1, 2, 0]));
+            let recovery =
+                |o: &str, p: i64, a: i64| call(4, &with_string(&[p, a], &[o.as_bytes()]));
+            assert_eq!(recovery("renamed", 2, 9), Some(vec![0, 1, 0, 2, 9, 11, 4]));
+            assert_eq!(recovery("no_match", 0, 3), Some(vec![1, 1, 0, 0, 3, 3, 0]));
+            assert_eq!(
+                recovery("retryable", -1, -1),
+                Some(vec![2, 0, 1, 0, 0, 0, 0])
+            );
+            assert_eq!(
+                recovery("deferred", i64::MAX, i64::MAX),
+                Some(vec![3, 0, 0, i64::MAX, i64::MAX, i64::MAX, 1])
+            );
+            assert_eq!(recovery("Renamed", 1, 1), Some(vec![-1, 0, 0, 1, 1, 2, 1]));
+            assert_eq!(call(4, &pack_ints(&[1])), None);
+        }
+
+        #[test]
+        fn w35_2_abi_sentinels() {
+            assert_eq!(call(5, &pack_ints(&[0, 0])), None);
+            let input = with_string(&[1, 1], &[b"renamed"]);
+            let mut out = [0x5au8; 64];
+            let run = |p: *const u8, len: usize, o: *mut u8, cap: usize| unsafe {
+                evaluate(4, p, len, o, cap)
+            };
+            assert_eq!(run(std::ptr::null(), 0, out.as_mut_ptr(), out.len()), -1);
+            assert_eq!(
+                run(input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), MAX_BYTES + 1, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), input.len(), out.as_mut_ptr(), MAX_BYTES + 1),
+                -1
+            );
+            assert_eq!(run(input.as_ptr(), input.len(), out.as_mut_ptr(), 55), -56);
+            assert!(out.iter().all(|b| *b == 0x5a));
+            assert_eq!(run(input.as_ptr(), input.len(), out.as_mut_ptr(), 56), 56);
+            assert_eq!(i64::from_ne_bytes(out[40..48].try_into().unwrap()), 2);
+            let mut shared = [0u8; 64];
+            shared[..input.len()].copy_from_slice(&input);
+            let p = shared.as_mut_ptr();
+            assert_eq!(run(p, input.len(), unsafe { p.add(8) }, 56), -1);
+        }
+    }
+}
+
+/// Evaluate one Wave 35.2 NZB/NFO/PAR2 exception or recovery helper over packed
+/// native-endian `i64` slots followed by any variable-length string bytes.
+/// Returns the byte count written, the negated required capacity when `output`
+/// is too small (nothing written), or -1 when the input is malformed or outside
+/// the contract.
+///
+/// # Safety
+/// Both ranges must be live, disjoint readable/writable allocations. Pointers must
+/// be non-null even for zero lengths; arithmetic checks cannot prove provenance.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w35_nzb_nfo_par2_exceptions_recovery(
+    operation: u32,
+    input: *const u8,
+    length: usize,
+    output: *mut u8,
+    capacity: usize,
+) -> i64 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        wave35_nzb_nfo_par2_exceptions_recovery::evaluate(
+            operation, input, length, output, capacity,
+        )
+    }))
+    .unwrap_or(-1)
+}
