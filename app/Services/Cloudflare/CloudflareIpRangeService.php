@@ -530,4 +530,149 @@ class CloudflareIpRangeService
             throw new RuntimeException("Unable to persist the Cloudflare trusted proxy manifest to [{$path}].");
         }
     }
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W47 parity test). */
+    public const bool W47_CIDR_MATCH_RUST_FFI_DEFAULT = true;
+
+    public const string W47_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w47_cloudflare_cidr_match_batch(const char *addresses, size_t addresses_len, size_t address_count, const char *ranges, size_t ranges_len, size_t range_count, char *out, size_t cap);
+        C;
+
+    private static ?bool $w47CidrMatchRustFfi = null;
+
+    private static FFI|false|null $w47Ffi = null;
+
+    /** Null restores the benchmark default; setUseRustFfi() is untouched. */
+    public static function useW47CidrMatchRustFfi(?bool $enabled = true): void
+    {
+        self::$w47CidrMatchRustFfi = $enabled;
+    }
+
+    public static function usesW47CidrMatchRustFfi(): bool
+    {
+        return self::$w47CidrMatchRustFfi ?? self::W47_CIDR_MATCH_RUST_FFI_DEFAULT;
+    }
+
+    /** Restores the benchmark default and drops the cached library handle. */
+    public static function resetW47CidrMatchRustFfi(): void
+    {
+        self::$w47CidrMatchRustFfi = null;
+        self::$w47Ffi = null;
+    }
+
+    /**
+     * Verifies a CIDR table and matches addresses against it. The result holds one int per range
+     * (`prefix | host bits set << 8 | IPv6 << 9`, or -1 for an entry that is not
+     * `filter_var()`-valid `address/prefix` with a one-to-three digit prefix within the address
+     * width), then one per address: the index of the first valid range containing it, -1 for
+     * none, or -2 when it is not a valid IP. Families never cross (no IPv4-mapped matching).
+     *
+     * @param  list<string>  $addresses
+     * @param  list<string>  $ranges
+     * @return list<int>
+     */
+    public static function matchAddresses(array $addresses, array $ranges): array
+    {
+        return self::usesW47CidrMatchRustFfi() ? self::matchAddressesNative($addresses, $ranges) : self::matchAddressesPhp($addresses, $ranges);
+    }
+
+    /**
+     * @param  list<string>  $addresses
+     * @param  list<string>  $ranges
+     * @return list<int>
+     */
+    public static function matchAddressesPhp(array $addresses, array $ranges): array
+    {
+        $out = [];
+        $table = [];
+        foreach ($ranges as $cidr) {
+            $parts = explode('/', $cidr, 2);
+            $prefixText = $parts[1] ?? '';
+            $packed = $prefixText !== '' && \strlen($prefixText) <= 3 && ctype_digit($prefixText) && filter_var($parts[0], FILTER_VALIDATE_IP) !== false
+                ? inet_pton($parts[0])
+                : false;
+            $prefix = (int) $prefixText;
+            if ($packed === false || $prefix > \strlen($packed) * 8) {
+                $out[] = -1;
+
+                continue;
+            }
+            $full = $prefix >> 3;
+            $bits = $prefix & 7;
+            $mask = $bits === 0 ? 0 : (0xFF << (8 - $bits)) & 0xFF;
+            $hostBits = ($bits !== 0 && (\ord($packed[$full]) & ~$mask & 0xFF) !== 0)
+                || trim(substr($packed, $full + ($bits === 0 ? 0 : 1)), "\0") !== '';
+            $table[] = [\strlen($packed), $full, $mask, substr($packed, 0, $full), $bits === 0 ? 0 : \ord($packed[$full]) & $mask, \count($out)];
+            $out[] = $prefix | ($hostBits ? 256 : 0) | (\strlen($packed) === 16 ? 512 : 0);
+        }
+        foreach ($addresses as $address) {
+            $packed = filter_var($address, FILTER_VALIDATE_IP) === false ? false : inet_pton($address);
+            if ($packed === false) {
+                $out[] = -2;
+
+                continue;
+            }
+            $width = \strlen($packed);
+            $match = -1;
+            foreach ($table as [$length, $full, $mask, $head, $tail, $index]) {
+                if ($length === $width && strncmp($packed, $head, $full) === 0 && ($mask === 0 || (\ord($packed[$full]) & $mask) === $tail)) {
+                    $match = $index;
+
+                    break;
+                }
+            }
+            $out[] = $match;
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or an entry holds a NUL byte.
+     *
+     * @param  list<string>  $addresses
+     * @param  list<string>  $ranges
+     * @return list<int>
+     */
+    public static function matchAddressesNative(array $addresses, array $ranges): array
+    {
+        $addressCount = \count($addresses);
+        $rangeCount = \count($ranges);
+        if ($addressCount + $rangeCount === 0) {
+            return [];
+        }
+        $ffi = self::$w47Ffi instanceof FFI ? self::$w47Ffi : self::w47Ffi();
+        $joinedAddresses = implode("\0", $addresses);
+        $joinedRanges = implode("\0", $ranges);
+        if ($ffi === null
+            || substr_count($joinedAddresses, "\0") !== max(0, $addressCount - 1)
+            || substr_count($joinedRanges, "\0") !== max(0, $rangeCount - 1)) {
+            return self::matchAddressesPhp($addresses, $ranges);
+        }
+        $bytes = ($addressCount + $rangeCount) * 8;
+        try {
+            $cap = 0;
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, $bytes, $cap);
+            if ($scratch === null) {
+                return self::matchAddressesPhp($addresses, $ranges);
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w47_cloudflare_cidr_match_batch($joinedAddresses, \strlen($joinedAddresses), $addressCount, $joinedRanges, \strlen($joinedRanges), $rangeCount, $scratch, $cap);
+            $words = $written === $bytes ? unpack('P*', FFI::string($scratch, $bytes)) : false;
+        } catch (Throwable) {
+            $words = false;
+        }
+
+        /** @var list<int>|null $values */
+        $values = \is_array($words) ? array_values($words) : null;
+
+        return $values ?? self::matchAddressesPhp($addresses, $ranges);
+    }
+
+    private static function w47Ffi(): ?FFI
+    {
+        self::$w47Ffi ??= RustPipelineLibrary::resolveDomain('cleaning_w47', self::W47_FFI_CDEF) ?? false;
+
+        return self::$w47Ffi === false ? null : self::$w47Ffi;
+    }
 }
