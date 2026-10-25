@@ -27419,3 +27419,600 @@ pub unsafe extern "C" fn nntmux_w39_fingerprint_backfill_transfer_candidate(
     }))
     .unwrap_or(-1)
 }
+
+/// Wave 40.2: second-pass NZB storage, parser, contents, manifest header and write batch summaries.
+mod wave40_nzb_service_parser_manifest_write_contents {
+    use super::{nfo_abi_range, yenc_ranges_overlap};
+    use std::slice;
+
+    pub(super) const MAX_INPUT: usize = 16 * 1024 * 1024;
+
+    fn word(chunk: &[u8; 8]) -> i64 {
+        i64::from_ne_bytes(*chunk)
+    }
+
+    /// The whole input as native-endian `i64` slots; `None` unless it is an exact multiple of 8 bytes.
+    fn words(bytes: &[u8]) -> Option<Vec<i64>> {
+        let (chunks, rest) = bytes.as_chunks::<8>();
+        rest.is_empty().then(|| chunks.iter().map(word).collect())
+    }
+
+    /// `[lead, count]`, `count` rows of `WIDTH` slots whose first slot is a text length (-1 marks a non-string),
+    /// then the concatenated texts. Declared lengths must cover the tail exactly.
+    type Rows<'a, const WIDTH: usize> = (i64, Vec<(Option<&'a [u8]>, [i64; WIDTH])>);
+
+    fn text_rows<const WIDTH: usize>(bytes: &[u8]) -> Option<Rows<'_, WIDTH>> {
+        let (head, _) = bytes.get(..16)?.as_chunks::<8>();
+        let lead = word(&head[0]);
+        let count = usize::try_from(word(&head[1])).ok()?;
+        let table_end = count.checked_mul(WIDTH)?.checked_mul(8)?.checked_add(16)?;
+        let table = bytes.get(16..table_end)?;
+        let tail = &bytes[table_end..];
+        let mut offset = 0usize;
+        let mut out = Vec::with_capacity(count);
+        for row in table.as_chunks::<8>().0.as_chunks::<WIDTH>().0 {
+            let length = word(&row[0]);
+            let text = if length == -1 {
+                None
+            } else {
+                let end = offset.checked_add(usize::try_from(length).ok()?)?;
+                let text = tail.get(offset..end)?;
+                offset = end;
+                Some(text)
+            };
+            let mut values = [0i64; WIDTH];
+            for (value, chunk) in values.iter_mut().zip(row).skip(1) {
+                *value = word(chunk);
+            }
+            out.push((text, values));
+        }
+        (offset == tail.len()).then_some((lead, out))
+    }
+
+    /// Op 0: `NzbService::summarizeNzbStorageInventory` over `[min_gzip_bytes]` and `[has_guid, bytes]` pairs.
+    fn storage_inventory(bytes: &[u8]) -> Option<Vec<i64>> {
+        let slots = words(bytes)?;
+        let (head, rows) = slots.split_first()?;
+        if !rows.len().is_multiple_of(2) {
+            return None;
+        }
+        let threshold = (*head).max(0);
+        let (mut valid, mut missing, mut total) = (0i64, 0i64, 0i64);
+        for row in rows.as_chunks::<2>().0 {
+            let (has_guid, size) = (row[0], row[1].max(0));
+            match has_guid {
+                0 => missing += 1,
+                1 => {}
+                _ => return None,
+            }
+            valid += (size >= threshold) as i64;
+            total = total.saturating_add(size);
+        }
+        let entries = (rows.len() / 2) as i64;
+        Some(vec![entries, valid, entries - valid, missing, total])
+    }
+
+    /// Op 1: `NzbParserService::summarizeParsedFileSegments` over `[max_segments, files]` and, per file, a segment
+    /// count followed by that many `[number, bytes]` pairs.
+    fn parsed_segments(bytes: &[u8]) -> Option<Vec<i64>> {
+        let slots = words(bytes)?;
+        let (head, mut rest) = slots.split_at_checked(2)?;
+        let limit = head[0].max(0);
+        let files = usize::try_from(head[1]).ok()?;
+        let (mut complete, mut gapped, mut oversized, mut total) = (0i64, 0i64, 0i64, 0i64);
+        let mut seen: Vec<bool> = Vec::new();
+        for _ in 0..files {
+            let (&count, tail) = rest.split_first()?;
+            let count = usize::try_from(count).ok()?;
+            let (segments, tail) = tail.split_at_checked(count.checked_mul(2)?)?;
+            rest = tail;
+            let segments = segments.as_chunks::<2>().0;
+            for segment in segments {
+                total = total.saturating_add(segment[1].max(0));
+            }
+            if count as u64 > limit as u64 {
+                oversized += 1;
+                continue;
+            }
+            seen.clear();
+            seen.resize(count, false);
+            let mut ordered = count > 0;
+            for segment in segments {
+                let index = match usize::try_from(segment[0]) {
+                    Ok(number) if (1..=count).contains(&number) => number - 1,
+                    _ => {
+                        ordered = false;
+                        break;
+                    }
+                };
+                if std::mem::replace(&mut seen[index], true) {
+                    ordered = false;
+                    break;
+                }
+            }
+            if ordered {
+                complete += 1;
+            } else {
+                gapped += 1;
+            }
+        }
+        rest.is_empty()
+            .then(|| vec![files as i64, complete, gapped, oversized, total])
+    }
+
+    /// ASCII case-insensitive membership of `ext` in `names`.
+    fn ext_in(ext: &[u8], names: &[&[u8]]) -> bool {
+        names.iter().any(|name| ext.eq_ignore_ascii_case(name))
+    }
+
+    /// Mirrors `NzbContentsService::archiveMediaSlot`: 0 archive, 1 PAR2, 2 NFO/SFV, 3 media, 4 other.
+    fn member_slot(name: Option<&[u8]>) -> usize {
+        let Some(name) = name else {
+            return 4;
+        };
+        let Some(dot) = name.iter().rposition(|b| *b == b'.') else {
+            return 4;
+        };
+        let ext = &name[dot + 1..];
+        let digits = |s: &[u8]| s.iter().all(u8::is_ascii_digit);
+        if ext_in(ext, &[b"rar", b"7z"])
+            || (matches!(ext.len(), 3 | 4) && (ext[0] | 0x20) == b'r' && digits(&ext[1..]))
+            || (ext.len() == 3
+                && digits(ext)
+                && name[..dot].len() >= 3
+                && name[dot - 3..dot].eq_ignore_ascii_case(b".7z"))
+        {
+            0
+        } else if ext.eq_ignore_ascii_case(b"par2") {
+            1
+        } else if ext_in(ext, &[b"nfo", b"sfv"]) {
+            2
+        } else if ext_in(
+            ext,
+            &[
+                b"avi", b"flac", b"m2ts", b"m4a", b"m4v", b"mkv", b"mov", b"mp3", b"mp4", b"mpeg",
+                b"mpg", b"ogg", b"ts", b"wav", b"webm", b"wmv",
+            ],
+        ) {
+            3
+        } else {
+            4
+        }
+    }
+
+    /// Op 2: `NzbContentsService::summarizeArchiveMediaBreakdown` over `[0, count]`, `count` text lengths and the names.
+    fn archive_media(bytes: &[u8]) -> Option<Vec<i64>> {
+        let (lead, rows) = text_rows::<1>(bytes)?;
+        if lead != 0 {
+            return None;
+        }
+        let mut counts = [0i64; 5];
+        for (name, _) in &rows {
+            counts[member_slot(*name)] += 1;
+        }
+        let mut out = Vec::with_capacity(6);
+        out.push(rows.len() as i64);
+        out.extend_from_slice(&counts);
+        Some(out)
+    }
+
+    /// Op 3: `NzbUploadManifestService::summarizeManifestHeaderBudget` over `[declared, actual, total_bytes, max_bytes]`.
+    fn manifest_header(bytes: &[u8]) -> Option<Vec<i64>> {
+        let slots = words(bytes)?;
+        let &[declared, actual, total, max] = slots.as_slice() else {
+            return None;
+        };
+        let (declared, actual) = (declared.max(0), actual.max(0));
+        // Both operands are non-negative, so the subtraction cannot overflow.
+        let delta = actual - declared;
+        let within = total.max(0) <= max.max(0);
+        let status = if actual == 0 {
+            1
+        } else if !within {
+            2
+        } else if delta != 0 {
+            3
+        } else {
+            0
+        };
+        Some(vec![
+            declared,
+            actual,
+            delta,
+            (delta == 0) as i64,
+            within as i64,
+            (actual == 0) as i64,
+            status,
+        ])
+    }
+
+    /// Op 4: `DatabaseNzbStore::summarizeWriteBatchOutcomes` over `[warn_ms, count]`, rows of
+    /// `[status_len, bytes, latency_ms]` and the status texts.
+    fn write_outcomes(bytes: &[u8]) -> Option<Vec<i64>> {
+        let (warn, rows) = text_rows::<3>(bytes)?;
+        let warn = warn.max(0);
+        let (mut written, mut skipped, mut failed, mut slow, mut total) =
+            (0i64, 0i64, 0i64, 0i64, 0i64);
+        for (status, [_, size, latency]) in &rows {
+            match status {
+                Some(b"written") => {
+                    written += 1;
+                    total = total.saturating_add((*size).max(0));
+                }
+                Some(b"skipped_existing") => skipped += 1,
+                _ => failed += 1,
+            }
+            slow += (*latency > warn) as i64;
+        }
+        Some(vec![
+            rows.len() as i64,
+            written,
+            skipped,
+            failed,
+            slow,
+            total,
+        ])
+    }
+
+    fn compute(operation: u32, flags: u32, bytes: &[u8]) -> Option<Vec<i64>> {
+        if flags != 0 {
+            return None;
+        }
+        match operation {
+            0 => storage_inventory(bytes),
+            1 => parsed_segments(bytes),
+            2 => archive_media(bytes),
+            3 => manifest_header(bytes),
+            4 => write_outcomes(bytes),
+            _ => None,
+        }
+    }
+
+    /// # Safety
+    /// See [`super::nntmux_w40_nzb_service_parser_manifest_write_contents`].
+    pub(super) unsafe fn evaluate(
+        operation: u32,
+        flags: u32,
+        input: *const u8,
+        length: usize,
+        output: *mut u8,
+        capacity: usize,
+    ) -> i64 {
+        if !nfo_abi_range(input, length, false)
+            || !nfo_abi_range(output, capacity, false)
+            || length > MAX_INPUT
+            || capacity > isize::MAX as usize
+            || yenc_ranges_overlap(input as usize, length, output as usize, capacity)
+        {
+            return -1;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, length) };
+        let Some(result) = compute(operation, flags, bytes) else {
+            return -1;
+        };
+        let Some(needed) = result.len().checked_mul(8) else {
+            return -1;
+        };
+        if needed > capacity {
+            return -(needed as i64);
+        }
+        let out = unsafe { slice::from_raw_parts_mut(output, needed) };
+        for (chunk, value) in out.as_chunks_mut::<8>().0.iter_mut().zip(&result) {
+            chunk.copy_from_slice(&value.to_ne_bytes());
+        }
+        needed as i64
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn pack(slots: &[i64], tail: &[&[u8]]) -> Vec<u8> {
+            let mut v: Vec<u8> = slots.iter().flat_map(|s| s.to_ne_bytes()).collect();
+            for t in tail {
+                v.extend_from_slice(t);
+            }
+            v
+        }
+
+        fn call(operation: u32, flags: u32, input: &[u8]) -> Option<Vec<i64>> {
+            let mut out = vec![0xa5u8; 256];
+            let probe = [0u8; 1];
+            let pointer = if input.is_empty() {
+                probe.as_ptr()
+            } else {
+                input.as_ptr()
+            };
+            let written = unsafe {
+                evaluate(
+                    operation,
+                    flags,
+                    pointer,
+                    input.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            if written < 0 {
+                assert_eq!(written, -1);
+                return None;
+            }
+            Some(
+                out[..written as usize]
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(word)
+                    .collect(),
+            )
+        }
+
+        #[test]
+        fn w40_2_storage_inventory() {
+            assert_eq!(
+                call(0, 0, &pack(&[64, 1, 100, 0, 64, 1, 63, 1, -5], &[])),
+                Some(vec![4, 2, 2, 1, 227])
+            );
+            assert_eq!(
+                call(0, 0, &pack(&[-1, 1, 0, 0, i64::MIN], &[])),
+                Some(vec![2, 2, 0, 1, 0])
+            );
+            assert_eq!(
+                call(0, 0, &pack(&[1, 1, i64::MAX, 1, 1], &[])).unwrap()[4],
+                i64::MAX
+            );
+            assert_eq!(call(0, 0, &pack(&[64], &[])), Some(vec![0, 0, 0, 0, 0]));
+            assert_eq!(call(0, 0, &pack(&[64, 2, 1], &[])), None);
+            assert_eq!(call(0, 0, &pack(&[64, 1], &[])), None);
+            assert_eq!(call(0, 0, &pack(&[64], &[b"x"])), None);
+            assert_eq!(call(0, 0, &[]), None);
+        }
+
+        #[test]
+        fn w40_2_parsed_segments() {
+            assert_eq!(
+                call(
+                    1,
+                    0,
+                    &pack(
+                        &[
+                            2, 5, 2, 2, 10, 1, 20, 2, 1, 5, 3, 7, 0, 3, 1, 1, 2, 1, 3, 1, 1, 1, -4
+                        ],
+                        &[]
+                    )
+                ),
+                Some(vec![5, 2, 2, 1, 45])
+            );
+            assert_eq!(
+                call(1, 0, &pack(&[-3, 2, 0, 1, 1, 9], &[])),
+                Some(vec![2, 0, 1, 1, 9])
+            );
+            assert_eq!(
+                call(1, 0, &pack(&[5, 1, 2, 1, i64::MAX, 2, 1], &[])),
+                Some(vec![1, 1, 0, 0, i64::MAX])
+            );
+            assert_eq!(
+                call(1, 0, &pack(&[5, 1, 2, 2, 0, i64::MIN, 0], &[])),
+                Some(vec![1, 0, 1, 0, 0])
+            );
+            assert_eq!(call(1, 0, &pack(&[5, 0], &[])), Some(vec![0, 0, 0, 0, 0]));
+            assert_eq!(call(1, 0, &pack(&[5, 1], &[])), None);
+            assert_eq!(call(1, 0, &pack(&[5, 1, 2, 1, 1], &[])), None);
+            assert_eq!(call(1, 0, &pack(&[5, 1, -1], &[])), None);
+            assert_eq!(call(1, 0, &pack(&[5, -1], &[])), None);
+            assert_eq!(call(1, 0, &pack(&[5, 0, 0], &[])), None);
+            assert_eq!(call(1, 0, &pack(&[5, 1, i64::MAX], &[])), None);
+            assert_eq!(call(1, 0, &pack(&[5], &[])), None);
+        }
+
+        #[test]
+        fn w40_2_archive_media() {
+            let names: [&[u8]; 14] = [
+                b"a.part01.RAR",
+                b"a.r00",
+                b"a.r100",
+                b"a.7z",
+                b"a.7z.001",
+                b"a.001",
+                b"a.vol00+01.par2",
+                b"a.NFO",
+                b"a.sfv",
+                b"a.mkv",
+                b"a.Mp4",
+                b"noext",
+                b"a.r0",
+                b".7z.001",
+            ];
+            let mut slots = vec![0, names.len() as i64 + 1];
+            slots.extend(names.iter().map(|n| n.len() as i64));
+            slots.push(-1);
+            assert_eq!(
+                call(2, 0, &pack(&slots, &names)),
+                Some(vec![15, 6, 1, 2, 2, 4])
+            );
+            assert_eq!(
+                call(2, 0, &pack(&[0, 1, 2], &[b"7z"])),
+                Some(vec![1, 0, 0, 0, 0, 1])
+            );
+            assert_eq!(
+                call(2, 0, &pack(&[0, 1, 5], &[b"x.ts."])),
+                Some(vec![1, 0, 0, 0, 0, 1])
+            );
+            assert_eq!(
+                call(2, 0, &pack(&[0, 0], &[])),
+                Some(vec![0, 0, 0, 0, 0, 0])
+            );
+            assert_eq!(call(2, 0, &pack(&[1, 0], &[])), None);
+            assert_eq!(call(2, 0, &pack(&[0, 1, 3], &[b"ab"])), None);
+            assert_eq!(call(2, 0, &pack(&[0, 1, -2], &[])), None);
+            assert_eq!(call(2, 0, &pack(&[0, 0], &[b"x"])), None);
+            assert_eq!(call(2, 0, &pack(&[0], &[])), None);
+        }
+
+        #[test]
+        fn w40_2_manifest_header() {
+            assert_eq!(
+                call(3, 0, &pack(&[3, 3, 100, 1000], &[])),
+                Some(vec![3, 3, 0, 1, 1, 0, 0])
+            );
+            assert_eq!(
+                call(3, 0, &pack(&[5, 3, 100, 1000], &[])),
+                Some(vec![5, 3, -2, 0, 1, 0, 3])
+            );
+            assert_eq!(
+                call(3, 0, &pack(&[3, 3, 1001, 1000], &[])),
+                Some(vec![3, 3, 0, 1, 0, 0, 2])
+            );
+            assert_eq!(
+                call(3, 0, &pack(&[0, 0, 0, 0], &[])),
+                Some(vec![0, 0, 0, 1, 1, 1, 1])
+            );
+            assert_eq!(
+                call(3, 0, &pack(&[i64::MIN, i64::MAX, i64::MIN, i64::MIN], &[])),
+                Some(vec![0, i64::MAX, i64::MAX, 0, 1, 0, 3])
+            );
+            assert_eq!(
+                call(3, 0, &pack(&[i64::MAX, 1, i64::MAX, -1], &[])),
+                Some(vec![i64::MAX, 1, 1 - i64::MAX, 0, 0, 0, 2])
+            );
+            assert_eq!(call(3, 0, &pack(&[1, 2, 3], &[])), None);
+            assert_eq!(call(3, 0, &pack(&[1, 2, 3, 4, 5], &[])), None);
+        }
+
+        #[test]
+        fn w40_2_write_outcomes() {
+            assert_eq!(
+                call(
+                    4,
+                    0,
+                    &pack(
+                        &[
+                            1000,
+                            7,
+                            7,
+                            100,
+                            5,
+                            7,
+                            50,
+                            1001,
+                            16,
+                            999,
+                            2000,
+                            6,
+                            0,
+                            0,
+                            -1,
+                            0,
+                            0,
+                            7,
+                            -9,
+                            1000,
+                            7,
+                            i64::MAX,
+                            0
+                        ],
+                        &[
+                            b"written",
+                            b"written",
+                            b"skipped_existing",
+                            b"failed",
+                            b"Written",
+                            b"written"
+                        ]
+                    )
+                ),
+                Some(vec![7, 3, 1, 3, 2, i64::MAX])
+            );
+            assert_eq!(
+                call(4, 0, &pack(&[-5, 1, 6, 0, 1], &[b"failed"])),
+                Some(vec![1, 0, 0, 1, 1, 0])
+            );
+            assert_eq!(
+                call(4, 0, &pack(&[1, 0], &[])),
+                Some(vec![0, 0, 0, 0, 0, 0])
+            );
+            assert_eq!(call(4, 0, &pack(&[1, 1, 7, 0], &[b"written"])), None);
+            assert_eq!(call(4, 0, &pack(&[1, 1, 8, 0, 0], &[b"written"])), None);
+            assert_eq!(call(4, 0, &pack(&[1, 0], &[b"x"])), None);
+        }
+
+        #[test]
+        fn w40_2_abi_sentinels() {
+            assert_eq!(call(5, 0, &pack(&[0], &[])), None);
+            assert_eq!(call(u32::MAX, 0, &pack(&[0], &[])), None);
+            let input = pack(&[3, 3, 100, 1000], &[]);
+            let mut out = [0x5au8; 128];
+            let run = |p: *const u8, len: usize, o: *mut u8, cap: usize| unsafe {
+                evaluate(3, 0, p, len, o, cap)
+            };
+            assert_eq!(run(std::ptr::null(), 0, out.as_mut_ptr(), out.len()), -1);
+            assert_eq!(
+                run(input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), MAX_INPUT + 1, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), usize::MAX, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), input.len(), out.as_mut_ptr(), usize::MAX),
+                -1
+            );
+            for cap in [0, 1, 55] {
+                assert_eq!(run(input.as_ptr(), input.len(), out.as_mut_ptr(), cap), -56);
+            }
+            assert!(out.iter().all(|b| *b == 0x5a));
+            assert_eq!(run(input.as_ptr(), input.len(), out.as_mut_ptr(), 56), 56);
+            assert_eq!(word(&out[8..16].try_into().unwrap()), 3);
+            assert!(out[56..].iter().all(|b| *b == 0x5a));
+            let mut shared = [0u8; 160];
+            shared[..input.len()].copy_from_slice(&input);
+            let p = shared.as_mut_ptr();
+            assert_eq!(run(p, input.len(), unsafe { p.add(8) }, 56), -1);
+            let export = |op: u32, flags: u32, out: &mut [u8]| unsafe {
+                super::super::nntmux_w40_nzb_service_parser_manifest_write_contents(
+                    op,
+                    flags,
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert_eq!(export(3, 0, &mut out), 56);
+            assert_eq!(export(3, 1, &mut out), -1);
+            assert_eq!(export(1, 0, &mut out), -1);
+        }
+    }
+}
+
+/// Evaluate one Wave 40.2 helper over packed native-endian `i64` slots followed by any
+/// string bytes: op 0 summarizes NZB storage inventory entries, op 1 summarizes parsed NZB
+/// file segment inventories, op 2 classifies NZB member filenames, op 3 evaluates an NZB
+/// manifest header against its byte budget and op 4 summarizes NZB write batch outcomes.
+/// `flags` must be zero. Returns the byte count written, the negated required capacity
+/// when `out_cap` is too small (nothing written), or -1 when the input is malformed.
+///
+/// # Safety
+/// Both ranges must be live, disjoint readable/writable allocations. Pointers must
+/// be non-null even for zero lengths; arithmetic checks cannot prove provenance.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w40_nzb_service_parser_manifest_write_contents(
+    operation: u32,
+    flags: u32,
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> i64 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        wave40_nzb_service_parser_manifest_write_contents::evaluate(
+            operation, flags, input, input_len, out_buf, out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}

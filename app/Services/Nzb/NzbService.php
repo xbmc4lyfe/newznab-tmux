@@ -45,6 +45,170 @@ class NzbService
         return self::$useRustFfi;
     }
 
+    /** The Wave 40.2 export shared by the NZB service, parser, contents, manifest reader and write service helpers. */
+    public const string W402_FFI_CDEF = <<<'C'
+        int64_t nntmux_w40_nzb_service_parser_manifest_write_contents(
+            uint32_t operation,
+            uint32_t flags,
+            const char *input,
+            size_t input_len,
+            char *out_buf,
+            size_t out_cap
+        );
+        C;
+
+    public const string W402_FFI_DOMAIN = 'nfo_w402';
+
+    /**
+     * Default for the Wave 40.2 toggle only; it stays false because the paired benchmark in
+     * tests/Unit/RustNzbServiceParserManifestWriteContentsW40ParityTest.php is below 1.5x.
+     */
+    public const bool W402_RUST_FFI_DEFAULT = false;
+
+    public const int W402_MAX_INPUT = 16777216;
+
+    private static ?bool $useW402RustFfi = null;
+
+    public static function useW402RustFfi(?bool $use): void
+    {
+        self::$useW402RustFfi = $use;
+    }
+
+    public static function usesW402RustFfi(): bool
+    {
+        return self::$useW402RustFfi ?? self::W402_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW402RustFfi(): void
+    {
+        self::$useW402RustFfi = null;
+    }
+
+    /**
+     * Run one Wave 40.2 operation; null whenever the library, input or answer is unusable, so callers fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    public static function evaluateW402Native(int $operation, string $input, int $slots): ?array
+    {
+        try {
+            if ($operation < 0 || $slots < 1 || $input === '' || \strlen($input) > self::W402_MAX_INPUT) {
+                return null;
+            }
+            $ffi = RustPipelineLibrary::resolveDomain(self::W402_FFI_DOMAIN, self::W402_FFI_CDEF, getenv('NNTMUX_PIPELINE_FFI_LIB') ?: null);
+            if (! $ffi instanceof FFI) {
+                return null;
+            }
+            $needed = $slots * 8;
+            for ($attempt = 0; $attempt < 2; $attempt++) {
+                $capacity = 0;
+                $output = RustPipelineLibrary::obtainScratch($ffi, $needed, $capacity);
+                if ($output === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w40_nzb_service_parser_manifest_write_contents($operation, 0, $input, \strlen($input), $output, $capacity);
+                if (! \is_int($written) || $written === -1 || $written > $capacity) {
+                    return null;
+                }
+                if ($written < 0) {
+                    // Too small: retry once with the reported capacity.
+                    $needed = -$written;
+
+                    continue;
+                }
+                if ($written !== $slots * 8) {
+                    return null;
+                }
+                $values = array_values(unpack('q'.$slots, FFI::string($output, $written)) ?: []);
+
+                return \count($values) === $slots ? $values : null;
+            }
+        } catch (Throwable) {
+        }
+
+        return null;
+    }
+
+    /**
+     * Summarize NZB storage inventory entries (`guid`, `bytes`). A non-empty string guid is present, anything else is missing;
+     * bytes count only as integers, negatives as zero. Every entry is either gzip-sized (bytes >= max(0, $minGzipBytes)) or
+     * undersized, and the compressed bytes sum, saturating at PHP_INT_MAX.
+     *
+     * @param  array<array-key, mixed>  $entries
+     * @return array{entries: int, valid_gzip: int, undersized: int, missing_guid: int, total_compressed_bytes: int}
+     */
+    public static function summarizeNzbStorageInventory(array $entries, int $minGzipBytes = 64): array
+    {
+        return (self::usesW402RustFfi() ? self::summarizeNzbStorageInventoryNative($entries, $minGzipBytes) : null)
+            ?? self::summarizeNzbStorageInventoryPhp($entries, $minGzipBytes);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $entries
+     * @return array{entries: int, valid_gzip: int, undersized: int, missing_guid: int, total_compressed_bytes: int}
+     */
+    private static function summarizeNzbStorageInventoryPhp(array $entries, int $minGzipBytes): array
+    {
+        $threshold = max(0, $minGzipBytes);
+        $valid = $missing = $total = 0;
+        foreach ($entries as $entry) {
+            [$hasGuid, $bytes] = self::storageInventoryFields($entry);
+            $bytes = max(0, $bytes);
+            $missing += $hasGuid ? 0 : 1;
+            $valid += $bytes >= $threshold ? 1 : 0;
+            $total = $total > PHP_INT_MAX - $bytes ? PHP_INT_MAX : $total + $bytes;
+        }
+
+        return self::storageInventorySummary(\count($entries), $valid, $missing, $total);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $entries
+     * @return array{entries: int, valid_gzip: int, undersized: int, missing_guid: int, total_compressed_bytes: int}|null
+     */
+    private static function summarizeNzbStorageInventoryNative(array $entries, int $minGzipBytes): ?array
+    {
+        if (\count($entries) * 2 + 1 > self::W402_MAX_INPUT / 8) {
+            return null;
+        }
+        $words = [$minGzipBytes];
+        foreach ($entries as $entry) {
+            [$hasGuid, $bytes] = self::storageInventoryFields($entry);
+            $words[] = (int) $hasGuid;
+            $words[] = $bytes;
+        }
+        $slots = self::evaluateW402Native(0, pack('q*', ...$words), 5);
+        if ($slots === null) {
+            return null;
+        }
+        [$count, $valid, $undersized, $missing, $total] = $slots;
+        if ($count !== \count($entries) || min($valid, $undersized, $missing, $total) < 0 || $valid + $undersized !== $count || $missing > $count) {
+            return null;
+        }
+
+        return self::storageInventorySummary($count, $valid, $missing, $total);
+    }
+
+    /** @return array{bool, int} whether a non-empty string guid is present, and the bytes (0 unless an integer) */
+    private static function storageInventoryFields(mixed $entry): array
+    {
+        if (! \is_array($entry)) {
+            return [false, 0];
+        }
+        $guid = $entry['guid'] ?? null;
+        $bytes = $entry['bytes'] ?? 0;
+
+        return [\is_string($guid) && $guid !== '', \is_int($bytes) ? $bytes : 0];
+    }
+
+    /** @return array{entries: int, valid_gzip: int, undersized: int, missing_guid: int, total_compressed_bytes: int} */
+    private static function storageInventorySummary(int $entries, int $valid, int $missing, int $total): array
+    {
+        return ['entries' => $entries, 'valid_gzip' => $valid, 'undersized' => $entries - $valid, 'missing_guid' => $missing,
+            'total_compressed_bytes' => $total];
+    }
+
     public const NZB_NONE = 0; // Release has no NZB file yet.
 
     public const NZB_ADDED = 1; // Release had an NZB file created.

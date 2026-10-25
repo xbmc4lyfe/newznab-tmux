@@ -21,6 +21,14 @@ final class DatabaseNzbStore
     // Candidate helpers retain PHP defaults until every paired mean/p99 gate passes.
     private static bool $useRustFfi = false;
 
+    /**
+     * Default for the Wave 40.2 toggle only; it stays false because the paired benchmark in
+     * tests/Unit/RustNzbServiceParserManifestWriteContentsW40ParityTest.php is below 1.5x.
+     */
+    public const bool W402_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useW402RustFfi = null;
+
     public static function setUseRustFfi(bool $enabled): void
     {
         self::$useRustFfi = $enabled;
@@ -254,5 +262,116 @@ final class DatabaseNzbStore
         }
 
         return $xml !== '' && inflate_get_status($inflater) === ZLIB_STREAM_END && inflate_get_read_len($inflater) === $length ? $xml : false;
+    }
+
+    public static function useW402RustFfi(?bool $use): void
+    {
+        self::$useW402RustFfi = $use;
+    }
+
+    public static function usesW402RustFfi(): bool
+    {
+        return self::$useW402RustFfi ?? self::W402_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW402RustFfi(): void
+    {
+        self::$useW402RustFfi = null;
+    }
+
+    /**
+     * Summarize write results (`status`, `bytes`, `latency_ms`). Status `written` or `skipped_existing` (exact strings)
+     * count as such and anything else as failed. Integer bytes of written results sum, negatives as zero, saturating at
+     * PHP_INT_MAX; any result whose integer latency exceeds max(0, $warnLatencyMs) is slow.
+     *
+     * @param  array<array-key, mixed>  $results
+     * @return array{results: int, written: int, skipped_existing: int, failed: int, slow_writes: int, bytes_written: int}
+     */
+    public static function summarizeWriteBatchOutcomes(array $results, int $warnLatencyMs = 1000): array
+    {
+        return (self::usesW402RustFfi() ? self::summarizeWriteBatchOutcomesNative($results, $warnLatencyMs) : null)
+            ?? self::summarizeWriteBatchOutcomesPhp($results, $warnLatencyMs);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $results
+     * @return array{results: int, written: int, skipped_existing: int, failed: int, slow_writes: int, bytes_written: int}
+     */
+    private static function summarizeWriteBatchOutcomesPhp(array $results, int $warnLatencyMs): array
+    {
+        $warn = max(0, $warnLatencyMs);
+        $counts = [0, 0, 0, 0];
+        $total = 0;
+        foreach ($results as $result) {
+            [$status, $bytes, $latency] = self::writeResultFields($result);
+            $counts[match ($status) {
+                'written' => 0,
+                'skipped_existing' => 1,
+                default => 2,
+            }]++;
+            if ($status === 'written') {
+                $bytes = max(0, $bytes);
+                $total = $total > PHP_INT_MAX - $bytes ? PHP_INT_MAX : $total + $bytes;
+            }
+            $counts[3] += $latency > $warn ? 1 : 0;
+        }
+
+        return self::writeBatchSummary(\count($results), $counts, $total);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $results
+     * @return array{results: int, written: int, skipped_existing: int, failed: int, slow_writes: int, bytes_written: int}|null
+     */
+    private static function summarizeWriteBatchOutcomesNative(array $results, int $warnLatencyMs): ?array
+    {
+        $size = 16 + 24 * \count($results);
+        foreach ($results as $result) {
+            $status = self::writeResultFields($result)[0];
+            $size += $status === null ? 0 : \strlen($status);
+        }
+        if ($size > NzbService::W402_MAX_INPUT) {
+            return null;
+        }
+        $words = [$warnLatencyMs, \count($results)];
+        $tail = '';
+        foreach ($results as $result) {
+            [$status, $bytes, $latency] = self::writeResultFields($result);
+            array_push($words, $status === null ? -1 : \strlen($status), $bytes, $latency);
+            $tail .= $status ?? '';
+        }
+        $slots = NzbService::evaluateW402Native(4, pack('q*', ...$words).$tail, 6);
+        if ($slots === null) {
+            return null;
+        }
+        [$count, $written, $skipped, $failed, $slow, $total] = $slots;
+        if ($count !== \count($results) || min($written, $skipped, $failed, $slow, $total) < 0 || $written + $skipped + $failed !== $count || $slow > $count) {
+            return null;
+        }
+
+        return self::writeBatchSummary($count, [$written, $skipped, $failed, $slow], $total);
+    }
+
+    /** @return array{string|null, int, int} the status (null unless a string), bytes and latency (each 0 unless an integer) */
+    private static function writeResultFields(mixed $result): array
+    {
+        if (! \is_array($result)) {
+            return [null, 0, 0];
+        }
+        $status = $result['status'] ?? null;
+        $bytes = $result['bytes'] ?? 0;
+        $latency = $result['latency_ms'] ?? 0;
+
+        return [\is_string($status) ? $status : null, \is_int($bytes) ? $bytes : 0, \is_int($latency) ? $latency : 0];
+    }
+
+    /**
+     * @param  array{int, int, int, int}  $counts  written, skipped existing, failed, slow
+     * @return array{results: int, written: int, skipped_existing: int, failed: int, slow_writes: int, bytes_written: int}
+     */
+    private static function writeBatchSummary(int $results, array $counts, int $total): array
+    {
+        return ['results' => $results, 'written' => $counts[0], 'skipped_existing' => $counts[1], 'failed' => $counts[2], 'slow_writes' => $counts[3],
+            'bytes_written' => $total];
     }
 }
