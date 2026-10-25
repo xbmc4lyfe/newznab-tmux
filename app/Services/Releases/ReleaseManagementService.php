@@ -8,6 +8,7 @@ use App\Facades\Search;
 use App\Models\Release;
 use App\Services\Nzb\NzbService;
 use App\Services\ReleaseImageService;
+use App\Services\Search\Support\ManticoreSchemaInspector;
 use App\Support\ReleaseSearchIndexSync;
 use App\Support\RustPipelineLibrary;
 use FFI;
@@ -25,6 +26,14 @@ class ReleaseManagementService
     public static bool $useRustFfi = false;
 
     private static FFI|false|null $ffi = null;
+
+    /**
+     * Rust stays opt-in for the Wave 43.5 summary: the FFI round trip misses the 1.5x gate; see
+     * tests/Unit/RustManticoreSchemaReleaseBrowseDuplicateGroupMgmtW43ParityTest.php.
+     */
+    public const bool W43_RELEASE_MANAGEMENT_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useW43RustFfi = null;
 
     public function __construct() {}
 
@@ -315,6 +324,96 @@ class ReleaseManagementService
         }
 
         return $written === 0 ? null : FFI::string($scratch, $written);
+    }
+
+    /** Pass null to restore {@see W43_RELEASE_MANAGEMENT_RUST_FFI_DEFAULT}. */
+    public static function useW43RustFfi(?bool $enable = true): void
+    {
+        self::$useW43RustFfi = $enable;
+    }
+
+    public static function usesW43RustFfi(): bool
+    {
+        return self::$useW43RustFfi ?? self::W43_RELEASE_MANAGEMENT_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Summarizes export date filters as {@see formatExportDateBoundPhp()} formats them: `empty` dates
+     * and `malformed` ones (not three `/` pieces) yield no bound; `earliest` and `latest` are the
+     * byte-wise (`strcmp`) extremes of the formatted bounds, or `''` without any. Non-string dates
+     * are invalid.
+     *
+     * @param  array<array-key, mixed>  $dates
+     * @return array{dates: int, invalid: int, empty: int, malformed: int, formatted: int, distinct_bounds: int, earliest: string, latest: string}
+     */
+    public function summarizeExportDateBoundBatch(array $dates, bool $isEndOfDay = false): array
+    {
+        return self::usesW43RustFfi() ? $this->summarizeExportDateBoundBatchNative($dates, $isEndOfDay) : $this->summarizeExportDateBoundBatchPhp($dates, $isEndOfDay);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $dates
+     * @return array{dates: int, invalid: int, empty: int, malformed: int, formatted: int, distinct_bounds: int, earliest: string, latest: string}
+     */
+    public function summarizeExportDateBoundBatchPhp(array $dates, bool $isEndOfDay = false): array
+    {
+        $summary = ['dates' => \count($dates), 'invalid' => 0, 'empty' => 0, 'malformed' => 0, 'formatted' => 0, 'distinct_bounds' => 0, 'earliest' => '', 'latest' => ''];
+        $bounds = [];
+        foreach ($dates as $date) {
+            if (! \is_string($date)) {
+                $summary['invalid']++;
+
+                continue;
+            }
+            $bound = $this->formatExportDateBoundPhp($date, $isEndOfDay);
+            if ($bound === null) {
+                $summary[$date === '' ? 'empty' : 'malformed']++;
+
+                continue;
+            }
+            if ($summary['formatted'] === 0 || strcmp($bound, $summary['earliest']) < 0) {
+                $summary['earliest'] = $bound;
+            }
+            if ($summary['formatted'] === 0 || strcmp($bound, $summary['latest']) > 0) {
+                $summary['latest'] = $bound;
+            }
+            $summary['formatted']++;
+            $bounds[$bound] = true;
+        }
+        $summary['distinct_bounds'] = \count($bounds);
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $dates
+     * @return array{dates: int, invalid: int, empty: int, malformed: int, formatted: int, distinct_bounds: int, earliest: string, latest: string}
+     */
+    public function summarizeExportDateBoundBatchNative(array $dates, bool $isEndOfDay = false): array
+    {
+        $parts = [$isEndOfDay ? '1' : '0'];
+        foreach ($dates as $date) {
+            if (\is_string($date)) {
+                array_push($parts, '1', $date);
+            } else {
+                $parts[] = '0';
+            }
+        }
+        $fields = ManticoreSchemaInspector::evaluateW43Native(5, $parts);
+        if ($fields === null || \count($fields) !== 8) {
+            return $this->summarizeExportDateBoundBatchPhp($dates, $isEndOfDay);
+        }
+
+        return [
+            'dates' => (int) $fields[0],
+            'invalid' => (int) $fields[1],
+            'empty' => (int) $fields[2],
+            'malformed' => (int) $fields[3],
+            'formatted' => (int) $fields[4],
+            'distinct_bounds' => (int) $fields[5],
+            'earliest' => $fields[6],
+            'latest' => $fields[7],
+        ];
     }
 
     public static function setUseRustFfi(bool $useRustFfi): void

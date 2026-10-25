@@ -7,6 +7,7 @@ namespace App\Services\Releases;
 use App\Models\Release;
 use App\Services\Nzb\NzbService;
 use App\Services\ReleaseImageService;
+use App\Services\Search\Support\ManticoreSchemaInspector;
 use App\Support\RustPipelineLibrary;
 use FFI;
 use FFI\CData;
@@ -25,6 +26,14 @@ final class ReleaseDuplicateFinder
     private static FFI|false|null $ffi = null;
 
     private static ?CData $boundsBuf = null;
+
+    /**
+     * Rust stays opt-in for the Wave 43.5 summary: the FFI round trip misses the 1.5x gate; see
+     * tests/Unit/RustManticoreSchemaReleaseBrowseDuplicateGroupMgmtW43ParityTest.php.
+     */
+    public const bool W43_RELEASE_DUPLICATE_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useW43RustFfi = null;
 
     /**
      * @param  (callable(Release): bool)|null  $coversArticles
@@ -240,6 +249,115 @@ final class ReleaseDuplicateFinder
             2 => 'searchname_match',
             default => 'name_match_fallback',
         };
+    }
+
+    /** Pass null to restore {@see W43_RELEASE_DUPLICATE_RUST_FFI_DEFAULT}. */
+    public static function useW43RustFfi(?bool $enable = true): void
+    {
+        self::$useW43RustFfi = $enable;
+    }
+
+    public static function usesW43RustFfi(): bool
+    {
+        return self::$useW43RustFfi ?? self::W43_RELEASE_DUPLICATE_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Summarizes duplicate candidates the way {@see resolveReasonPhp()} labels them, plus how many
+     * fall inside {@see sizeBoundsPhp()} for the incoming size (`whereBetween` inclusive bounds) and
+     * how many distinct search names they carry. Candidates are attribute arrays or releases with
+     * scalar `predb_id`, `searchname` and `size`; anything else is invalid.
+     *
+     * @param  array<array-key, mixed>  $candidates
+     * @return array{candidates: int, invalid: int, predb_id_match: int, searchname_match: int, name_match_fallback: int, within_size_bounds: int, distinct_searchnames: int}
+     */
+    public function summarizeCandidateBatch(array $candidates, string $searchName, int $predbId, int $filesize, float $tolerance = 0.05): array
+    {
+        return self::usesW43RustFfi()
+            ? $this->summarizeCandidateBatchNative($candidates, $searchName, $predbId, $filesize, $tolerance)
+            : $this->summarizeCandidateBatchPhp($candidates, $searchName, $predbId, $filesize, $tolerance);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $candidates
+     * @return array{candidates: int, invalid: int, predb_id_match: int, searchname_match: int, name_match_fallback: int, within_size_bounds: int, distinct_searchnames: int}
+     */
+    public function summarizeCandidateBatchPhp(array $candidates, string $searchName, int $predbId, int $filesize, float $tolerance = 0.05): array
+    {
+        [$low, $high] = $this->sizeBoundsPhp($filesize, $tolerance);
+        $summary = ['candidates' => \count($candidates), 'invalid' => 0, 'predb_id_match' => 0, 'searchname_match' => 0, 'name_match_fallback' => 0, 'within_size_bounds' => 0, 'distinct_searchnames' => 0];
+        $names = [];
+        foreach ($candidates as $candidate) {
+            $fields = self::w43CandidateFields($candidate);
+            if ($fields === null) {
+                $summary['invalid']++;
+
+                continue;
+            }
+            [$dupPredbId, $dupSearchName, $size] = $fields;
+            if ($predbId > 0 && $dupPredbId === $predbId) {
+                $summary['predb_id_match']++;
+            } elseif ($searchName !== '' && $dupSearchName === $searchName) {
+                $summary['searchname_match']++;
+            } else {
+                $summary['name_match_fallback']++;
+            }
+            $summary['within_size_bounds'] += (int) ($size >= $low && $size <= $high);
+            $names[$dupSearchName] = true;
+        }
+        $summary['distinct_searchnames'] = \count($names);
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $candidates
+     * @return array{candidates: int, invalid: int, predb_id_match: int, searchname_match: int, name_match_fallback: int, within_size_bounds: int, distinct_searchnames: int}
+     */
+    public function summarizeCandidateBatchNative(array $candidates, string $searchName, int $predbId, int $filesize, float $tolerance = 0.05): array
+    {
+        [$low, $high] = $this->sizeBoundsPhp($filesize, $tolerance);
+        $parts = [$searchName, (string) $predbId, (string) $low, (string) $high];
+        foreach ($candidates as $candidate) {
+            $fields = self::w43CandidateFields($candidate);
+            if ($fields === null) {
+                $parts[] = '0';
+            } else {
+                array_push($parts, '1', (string) $fields[0], $fields[1], (string) $fields[2]);
+            }
+        }
+        $fields = ManticoreSchemaInspector::evaluateW43Native(3, $parts);
+        if ($fields === null || \count($fields) !== 7) {
+            return $this->summarizeCandidateBatchPhp($candidates, $searchName, $predbId, $filesize, $tolerance);
+        }
+
+        return [
+            'candidates' => (int) $fields[0],
+            'invalid' => (int) $fields[1],
+            'predb_id_match' => (int) $fields[2],
+            'searchname_match' => (int) $fields[3],
+            'name_match_fallback' => (int) $fields[4],
+            'within_size_bounds' => (int) $fields[5],
+            'distinct_searchnames' => (int) $fields[6],
+        ];
+    }
+
+    /** @return array{0: int, 1: string, 2: int}|null */
+    private static function w43CandidateFields(mixed $candidate): ?array
+    {
+        if ($candidate instanceof Release) {
+            $candidate = $candidate->getAttributes();
+        } elseif (! \is_array($candidate)) {
+            return null;
+        }
+        $predbId = $candidate['predb_id'] ?? null;
+        $searchName = $candidate['searchname'] ?? null;
+        $size = $candidate['size'] ?? null;
+        if ((! \is_scalar($predbId) && $predbId !== null) || (! \is_scalar($searchName) && $searchName !== null) || (! \is_scalar($size) && $size !== null)) {
+            return null;
+        }
+
+        return [(int) $predbId, (string) $searchName, (int) $size];
     }
 
     public static function setUseRustFfi(bool $useRustFfi): void
