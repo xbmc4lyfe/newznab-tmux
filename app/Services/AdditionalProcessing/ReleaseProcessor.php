@@ -59,6 +59,11 @@ class ReleaseProcessor
 
     private static bool $ffiResolved = false;
 
+    /** Wave 40.6 paired benchmarks decide this default; see RustArchiveExtractionMediaUsenetDownloadReleaseProcW40ParityTest. */
+    public const bool W406_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $w406UseRustFfi = null;
+
     /**
      * @var array<int, string>
      */
@@ -1876,5 +1881,116 @@ class ReleaseProcessor
         }
 
         return self::$ffi;
+    }
+
+    public static function useW406RustFfi(?bool $enabled): void
+    {
+        self::$w406UseRustFfi = $enabled;
+    }
+
+    public static function usesW406RustFfi(): bool
+    {
+        return self::$w406UseRustFfi ?? self::W406_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW406RustFfi(): void
+    {
+        self::$w406UseRustFfi = null;
+    }
+
+    /**
+     * Summarize a post-processing batch. Each outcome is an array whose string 'status' processed/ok counts as
+     * processed and failed/error as failed (compared exactly); 'passworded' and 'media_extracted' count only when
+     * exactly true. Elapsed time sums max(0, an integer 'elapsed_ms'), saturating at PHP_INT_MAX, and exhausts
+     * the budget once it reaches max(1, $budgetMs). Non-array outcomes only count toward the total.
+     *
+     * @param  array<array-key, mixed>  $releaseOutcomes
+     * @return array{total: int, processed: int, password_detected: int, media_extracted: int, failed: int, total_elapsed_ms: int, budget_exhausted: bool}
+     */
+    public static function summarizePostProcessBatchTelemetry(array $releaseOutcomes, int $budgetMs = 60000): array
+    {
+        return (self::usesW406RustFfi() ? self::summarizePostProcessBatchTelemetryNative($releaseOutcomes, $budgetMs) : null)
+            ?? self::summarizePostProcessBatchTelemetryPhp($releaseOutcomes, $budgetMs);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $releaseOutcomes
+     * @return array{total: int, processed: int, password_detected: int, media_extracted: int, failed: int, total_elapsed_ms: int, budget_exhausted: bool}
+     */
+    public static function summarizePostProcessBatchTelemetryPhp(array $releaseOutcomes, int $budgetMs = 60000): array
+    {
+        $processed = 0;
+        $passworded = 0;
+        $media = 0;
+        $failed = 0;
+        $elapsed = 0;
+        foreach ($releaseOutcomes as $outcome) {
+            [$flags, $status, $spent] = self::w406Outcome($outcome);
+            if ($status === 'processed' || $status === 'ok') {
+                $processed++;
+            } elseif ($status === 'failed' || $status === 'error') {
+                $failed++;
+            }
+            $passworded += $flags & 1;
+            $media += $flags >> 1;
+            if ($spent > 0) {
+                $elapsed = $elapsed > PHP_INT_MAX - $spent ? PHP_INT_MAX : $elapsed + $spent;
+            }
+        }
+
+        return [
+            'total' => \count($releaseOutcomes),
+            'processed' => $processed,
+            'password_detected' => $passworded,
+            'media_extracted' => $media,
+            'failed' => $failed,
+            'total_elapsed_ms' => $elapsed,
+            'budget_exhausted' => $elapsed >= max(1, $budgetMs),
+        ];
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $releaseOutcomes
+     * @return array{total: int, processed: int, password_detected: int, media_extracted: int, failed: int, total_elapsed_ms: int, budget_exhausted: bool}|null
+     */
+    public static function summarizePostProcessBatchTelemetryNative(array $releaseOutcomes, int $budgetMs = 60000): ?array
+    {
+        $total = \count($releaseOutcomes);
+        $frame = pack('qV', $budgetMs, $total);
+        foreach ($releaseOutcomes as $outcome) {
+            [$flags, $status, $spent] = self::w406Outcome($outcome);
+            $frame .= \chr($flags).ArchiveExtractionService::w406OptionalString($status).pack('q', $spent);
+        }
+        $slots = ArchiveExtractionService::w406Slots(4, $frame, 7);
+        if ($slots === null || $slots[0] !== $total || $slots[1] < 0 || $slots[4] < 0 || $total < $slots[1] + $slots[4]
+            || $slots[2] < 0 || $slots[2] > $total || $slots[3] < 0 || $slots[3] > $total || $slots[5] < 0 || ($slots[6] & ~1) !== 0) {
+            return null;
+        }
+
+        return [
+            'total' => $total,
+            'processed' => $slots[1],
+            'password_detected' => $slots[2],
+            'media_extracted' => $slots[3],
+            'failed' => $slots[4],
+            'total_elapsed_ms' => $slots[5],
+            'budget_exhausted' => $slots[6] === 1,
+        ];
+    }
+
+    /** @return array{0: int, 1: string|null, 2: int} Passworded (bit 0) and media (bit 1) flags, string status and elapsed ms. */
+    private static function w406Outcome(mixed $outcome): array
+    {
+        if (! \is_array($outcome)) {
+            return [0, null, 0];
+        }
+        $status = $outcome['status'] ?? null;
+        $elapsed = $outcome['elapsed_ms'] ?? null;
+
+        return [
+            (($outcome['passworded'] ?? null) === true ? 1 : 0) | (($outcome['media_extracted'] ?? null) === true ? 2 : 0),
+            \is_string($status) ? $status : null,
+            \is_int($elapsed) ? $elapsed : 0,
+        ];
     }
 }

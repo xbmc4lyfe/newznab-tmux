@@ -14,6 +14,9 @@ use Illuminate\Support\Facades\Log;
 
 final readonly class AdditionalWorkPlanner
 {
+    /** Wave 40.6 paired benchmarks decide this default; see RustArchiveExtractionMediaUsenetDownloadReleaseProcW40ParityTest. */
+    public const bool W406_RUST_FFI_DEFAULT = false;
+
     private const string DEFAULT_AUDIO_FILE_REGEX = '\.(AAC|AIFF|APE|AC3|ASF|DTS|FLAC|MKA|MKS|MP2|MP3|RA|OGG|OGM|W64|WAV|WMA)';
 
     private const string DEFAULT_IGNORE_BOOK_REGEX = '/\b(epub|lit|mobi|pdf|sipdf|html)\b.*\.rar(?!.{20,})/i';
@@ -963,5 +966,123 @@ final readonly class AdditionalWorkPlanner
         }
 
         $seenMessageIds[$messageId] = true;
+    }
+
+    public static function useW406RustFfi(?bool $enabled): void
+    {
+        self::w406Override(true, $enabled);
+    }
+
+    public static function usesW406RustFfi(): bool
+    {
+        return self::w406Override(false) ?? self::W406_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW406RustFfi(): void
+    {
+        self::w406Override(true, null);
+    }
+
+    /**
+     * Summarize work-queue candidates. Non-array candidates only count toward the total and arrays whose
+     * 'passworded' is exactly true are skipped. Every other candidate is eligible: a positive integer 'attempts'
+     * makes it a retry, otherwise an integer 'age_hours' within 0..24 makes it high-priority fresh. The selected
+     * batch is min(eligible, max(0, $maxBatchSize)).
+     *
+     * @param  array<array-key, mixed>  $candidates
+     * @return array{total_candidates: int, high_priority_fresh: int, retry_candidates: int, skipped_passworded: int, selected_batch: int}
+     */
+    public static function summarizeWorkQueuePriorityBatch(array $candidates, int $maxBatchSize = 100): array
+    {
+        return (self::usesW406RustFfi() ? self::summarizeWorkQueuePriorityBatchNative($candidates, $maxBatchSize) : null)
+            ?? self::summarizeWorkQueuePriorityBatchPhp($candidates, $maxBatchSize);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $candidates
+     * @return array{total_candidates: int, high_priority_fresh: int, retry_candidates: int, skipped_passworded: int, selected_batch: int}
+     */
+    public static function summarizeWorkQueuePriorityBatchPhp(array $candidates, int $maxBatchSize = 100): array
+    {
+        $fresh = 0;
+        $retry = 0;
+        $passworded = 0;
+        $eligible = 0;
+        foreach ($candidates as $candidate) {
+            [$flags, $attempts, $age] = self::w406Candidate($candidate);
+            if ($flags === 3) {
+                $passworded++;
+            } elseif ($flags === 1) {
+                $eligible++;
+                if ($attempts > 0) {
+                    $retry++;
+                } elseif ($age >= 0 && $age <= 24) {
+                    $fresh++;
+                }
+            }
+        }
+
+        return [
+            'total_candidates' => \count($candidates),
+            'high_priority_fresh' => $fresh,
+            'retry_candidates' => $retry,
+            'skipped_passworded' => $passworded,
+            'selected_batch' => min($eligible, max(0, $maxBatchSize)),
+        ];
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $candidates
+     * @return array{total_candidates: int, high_priority_fresh: int, retry_candidates: int, skipped_passworded: int, selected_batch: int}|null
+     */
+    public static function summarizeWorkQueuePriorityBatchNative(array $candidates, int $maxBatchSize = 100): ?array
+    {
+        $total = \count($candidates);
+        $frame = pack('qV', $maxBatchSize, $total);
+        foreach ($candidates as $candidate) {
+            [$flags, $attempts, $age] = self::w406Candidate($candidate);
+            $frame .= pack('Cqq', $flags, $attempts, $age);
+        }
+        $slots = ArchiveExtractionService::w406Slots(5, $frame, 5);
+        if ($slots === null || $slots[0] !== $total || $slots[1] < 0 || $slots[2] < 0 || $slots[3] < 0
+            || $total < $slots[1] + $slots[2] + $slots[3] || $slots[4] < 0 || $slots[4] > $total - $slots[3]) {
+            return null;
+        }
+
+        return [
+            'total_candidates' => $total,
+            'high_priority_fresh' => $slots[1],
+            'retry_candidates' => $slots[2],
+            'skipped_passworded' => $slots[3],
+            'selected_batch' => $slots[4],
+        ];
+    }
+
+    /** @return array{0: int, 1: int, 2: int} Flags (bit 0 array, bit 1 passworded), integer attempts and integer age in hours (-1 when absent). */
+    private static function w406Candidate(mixed $candidate): array
+    {
+        if (! \is_array($candidate)) {
+            return [0, 0, -1];
+        }
+        $attempts = $candidate['attempts'] ?? null;
+        $age = $candidate['age_hours'] ?? null;
+
+        return [
+            ($candidate['passworded'] ?? null) === true ? 3 : 1,
+            \is_int($attempts) ? $attempts : 0,
+            \is_int($age) ? $age : -1,
+        ];
+    }
+
+    /** Readonly classes cannot declare static properties, so the Wave 40.6 override lives in a function static. */
+    private static function w406Override(bool $write, ?bool $enabled = null): ?bool
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        if ($write) {
+            $override = $enabled;
+        }
+
+        return $override;
     }
 }
