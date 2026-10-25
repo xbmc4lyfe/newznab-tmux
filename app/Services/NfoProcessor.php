@@ -9,6 +9,8 @@ use App\Services\NNTP\NNTPService;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
+use InvalidArgumentException;
 use Throwable;
 
 class NfoProcessor
@@ -227,6 +229,170 @@ class NfoProcessor
             return $summary;
         } catch (Throwable) {
             return null;
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 51.4 batch helper
+    // ---------------------------------------------------------------------
+
+    /** Enabled: minimum of three paired runs cleared every 1.5x gate (common mean 2.64x, p99 1.90x; uncommon mean 2.52x, p99 2.33x); see RustIsbnOpenLibPar2ListProcessorNfoW51ParityTest. */
+    private const bool W51_RUST_FFI_DEFAULT = true;
+
+    public const string W51_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w514_nfo_candidate_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Candidate flags returned by nfoCandidateBatch(). */
+    public const int W51_EMPTY_NAME = 1;
+
+    public const int W51_NFO = 2;
+
+    public const int W51_DIZ = 4;
+
+    public const int W51_TXT = 8;
+
+    public const int W51_SAMPLE_PROOF = 16;
+
+    public const int W51_NESTED_PATH = 32;
+
+    private static ?bool $useW51RustFfi = null;
+
+    private static FFI|false|null $w51Ffi = null;
+
+    private static ?CData $w51Out = null;
+
+    private static int $w51OutCap = 0;
+
+    public static function usesW51RustFfi(): bool
+    {
+        return self::$useW51RustFfi ?? self::W51_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W51 batch dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW51RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$useW51RustFfi;
+        self::$useW51RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$useW51RustFfi = $previous;
+        }
+    }
+
+    /**
+     * Classify NFO candidate file names, two ints each: [flags, index of the first earlier name
+     * equal after trim() and strtolower(), or -1]. Flags follow summarizeNfoCandidateBatchPhp()
+     * on the trimmed name: 1 empty (never a duplicate), 2 nfo, 4 diz, 8 txt extension, 16
+     * SAMPLE/PROOF token, 32 slash path.
+     *
+     * @param  list<string>  $names
+     * @return list<int>
+     */
+    public static function nfoCandidateBatch(array $names): array
+    {
+        return self::usesW51RustFfi()
+            ? self::nfoCandidateBatchNative($names)
+            : self::nfoCandidateBatchPhp($names);
+    }
+
+    /**
+     * @param  list<string>  $names
+     * @return list<int>
+     */
+    public static function nfoCandidateBatchNative(array $names): array
+    {
+        self::w51AssertList($names);
+        if ($names === []) {
+            return [];
+        }
+
+        return self::w51Call(implode("\0", $names), '', \count($names))
+            ?? self::nfoCandidateBatchPhp($names);
+    }
+
+    /**
+     * @param  list<string>  $names
+     * @return list<int>
+     */
+    public static function nfoCandidateBatchPhp(array $names): array
+    {
+        self::w51AssertList($names);
+        $out = [];
+        $seen = [];
+        foreach ($names as $i => $raw) {
+            $entry = trim($raw);
+            if ($entry === '') {
+                array_push($out, self::W51_EMPTY_NAME, -1);
+
+                continue;
+            }
+            $first = $seen[strtolower($entry)] ??= $i;
+            $dot = strrpos($entry, '.');
+            $flags = match ($dot === false ? '' : strtolower(substr($entry, $dot + 1))) {
+                'nfo' => self::W51_NFO,
+                'diz' => self::W51_DIZ,
+                'txt' => self::W51_TXT,
+                default => 0,
+            };
+            if (preg_match('/(?<![A-Za-z0-9])(?:SAMPLE|PROOF)(?![A-Za-z0-9])/i', $entry) === 1) {
+                $flags |= self::W51_SAMPLE_PROOF;
+            }
+            if (strpbrk($entry, '/\\') !== false) {
+                $flags |= self::W51_NESTED_PATH;
+            }
+            array_push($out, $flags, $first === $i ? -1 : $first);
+        }
+
+        return $out;
+    }
+
+    /**
+     * One FFI crossing for the batch: NUL-joined names, two int64 words back per record. Null when
+     * the library is missing or declines.
+     *
+     * @return list<int>|null
+     */
+    private static function w51Call(string $text, string $ints, int $count): ?array
+    {
+        try {
+            self::$w51Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w51', self::W51_FFI_CDEF) ?? false;
+            $ffi = self::$w51Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            $need = $count * 2;
+            $out = self::$w51Out;
+            if ($out === null || self::$w51OutCap < $need) {
+                self::$w51OutCap = max(1024, $need);
+                $out = self::$w51Out = $ffi->new('int64_t['.self::$w51OutCap.']');
+            }
+            // @phpstan-ignore method.notFound (Declared by W51_FFI_CDEF.)
+            $written = $ffi->nntmux_w514_nfo_candidate_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, self::$w51OutCap);
+            if ($written !== $need) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $need * 8));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** @param array<array-key, mixed> $values */
+    private static function w51AssertList(array $values): void
+    {
+        if (! array_is_list($values)) {
+            throw new InvalidArgumentException('W51 batch input must be a list.');
         }
     }
 }
