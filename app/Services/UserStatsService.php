@@ -11,6 +11,7 @@ use App\Models\UserRequest;
 use App\Support\RustPipelineLibrary;
 use Carbon\Carbon;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\DB;
 use Throwable;
 
@@ -486,5 +487,198 @@ class UserStatsService
     private function minuteBucketExpression(): string
     {
         return self::resolveMinuteBucketExpression(DB::connection()->getDriverName());
+    }
+
+    /** Enabled: three paired runs cleared every 1.5x gate (common mean 4.01-4.16x, p99 3.28-3.56x; uncommon mean 3.44-3.57x, p99 2.62-2.90x); see RustSystemTempUserInactivityStatsSeriesW51ParityTest. */
+    private const bool W51_RUST_FFI_DEFAULT = true;
+
+    public const string W51_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w513_user_stats_per_day_batch(const char *blob, size_t blob_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    private static ?bool $useW51RustFfi = null;
+
+    private static FFI|false|null $w51Ffi = null;
+
+    private static ?CData $w51Out = null;
+
+    private static int $w51OutCap = 0;
+
+    public static function usesW51RustFfi(): bool
+    {
+        return self::$useW51RustFfi ?? self::W51_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 51 Rust path forced on or off, then restores the previous setting. */
+    public static function withW51RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$useW51RustFfi;
+        self::$useW51RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$useW51RustFfi = $previous;
+        }
+    }
+
+    /** Longest per-day window the Wave 51 helper fills (about a century). */
+    public const int W51_MAX_DAYS = 36_600;
+
+    /** Per-row and live counts are clamped to `[0, W51_MAX_COUNT]` so sums never overflow. */
+    public const int W51_MAX_COUNT = 1 << 32;
+
+    /**
+     * Folds raw `user_activity_stats_hourly` rows into the buildPerDaySeries() window: $days
+     * calendar days from $startDate (strict `Y-m-d`, at most W51_MAX_DAYS), each the sum of the
+     * rows whose `stat_hour` starts with that date, plus $liveCount on the last day. Counts read as
+     * `(int)` clamped to `[0, W51_MAX_COUNT]`. Two words per day (`YYYYMMDD`, count), then the
+     * window total and the in-window and skipped row counts. An invalid start or $days < 1 yields
+     * no days.
+     *
+     * @param  array<int, array<string, mixed>>  $hourly  stat_hour, count
+     * @return list<int>
+     */
+    public static function w51PerDaySeriesBatch(array $hourly, string $startDate, int $days, int $liveCount): array
+    {
+        return self::usesW51RustFfi()
+            ? self::w51PerDaySeriesBatchNative($hourly, $startDate, $days, $liveCount)
+            : self::w51PerDaySeriesBatchPhp($hourly, $startDate, $days, $liveCount);
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>>  $hourly
+     * @return list<int>
+     */
+    public static function w51PerDaySeriesBatchNative(array $hourly, string $startDate, int $days, int $liveCount): array
+    {
+        $count = \count($hourly);
+        $columns = self::w51Columns($hourly, ['stat_hour' => '', 'count' => 0]);
+        $span = max(0, min($days, self::W51_MAX_DAYS));
+        $blob = $count === 0 ? $startDate : implode("\0", $columns['stat_hour'])."\0".$startDate;
+
+        return self::w51Invoke($blob, pack('q*', $days, $liveCount, ...$columns['count']), $count, $span * 2 + 3)
+            ?? self::w51PerDaySeriesBatchPhp($hourly, $startDate, $days, $liveCount);
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>>  $hourly
+     * @return list<int>
+     */
+    public static function w51PerDaySeriesBatchPhp(array $hourly, string $startDate, int $days, int $liveCount): array
+    {
+        $days = min($days, self::W51_MAX_DAYS);
+        $valid = preg_match('/^(\d{4})-(\d{2})-(\d{2})$/D', $startDate, $m) === 1 && checkdate((int) $m[2], (int) $m[3], (int) $m[1]);
+        $keys = [];
+        if ($valid && $days >= 1) {
+            [$year, $month, $day] = [(int) $m[1], (int) $m[2], (int) $m[3]];
+            for ($i = 0; $i < $days; $i++) {
+                $keys[$year * 10_000 + $month * 100 + $day] = $i;
+                if (++$day > self::w51MonthDays($year, $month)) {
+                    $day = 1;
+                    if (++$month > 12) {
+                        $month = 1;
+                        $year++;
+                    }
+                }
+            }
+        }
+        $counts = array_fill(0, \count($keys), 0);
+        $inside = 0;
+        $skipped = 0;
+        foreach ($hourly as $row) {
+            $stamp = (string) ($row['stat_hour'] ?? '');
+            $slot = preg_match('/^(\d{4})-(\d{2})-(\d{2})/', $stamp, $d) === 1 ? ($keys[(int) ($d[1].$d[2].$d[3])] ?? null) : null;
+            if ($slot === null) {
+                $skipped++;
+
+                continue;
+            }
+            $counts[$slot] += max(0, min((int) ($row['count'] ?? 0), self::W51_MAX_COUNT));
+            $inside++;
+        }
+        if ($counts !== []) {
+            $counts[\count($counts) - 1] += max(0, min($liveCount, self::W51_MAX_COUNT));
+        }
+        $out = [];
+        foreach ($keys as $key => $slot) {
+            array_push($out, $key, $counts[$slot]);
+        }
+        array_push($out, array_sum($counts), $inside, $skipped);
+
+        return $out;
+    }
+
+    private static function w51MonthDays(int $year, int $month): int
+    {
+        return match ($month) {
+            2 => ($year % 4 === 0 && $year % 100 !== 0) || $year % 400 === 0 ? 29 : 28,
+            4, 6, 9, 11 => 30,
+            default => 31,
+        };
+    }
+
+    /**
+     * One column per key of $defaults. Rows missing a key read its default; present nulls stay
+     * null, which pack() and implode() read as 0 and '' like the defaults they replace.
+     *
+     * @param  array<int, array<string, mixed>>  $rows
+     * @param  array<string, mixed>  $defaults
+     * @return array<string, list<mixed>>
+     */
+    private static function w51Columns(array $rows, array $defaults): array
+    {
+        $count = \count($rows);
+        $columns = [];
+        foreach ($defaults as $key => $default) {
+            $column = array_column($rows, $key);
+            if (\count($column) !== $count) {
+                $filled = [];
+                foreach ($rows as $row) {
+                    $filled[] = $row + $defaults;
+                }
+                $columns = [];
+                foreach ($defaults as $name => $unused) {
+                    $columns[$name] = array_column($filled, $name);
+                }
+
+                return $columns;
+            }
+            $columns[$key] = $column;
+        }
+
+        return $columns;
+    }
+
+    /**
+     * Calls the Wave 51 export with NUL-joined strings and packed `i64` integers. Null when the
+     * library is missing, the call declines (for example a string holding a NUL byte) or it writes
+     * more than $cap words, so the caller falls back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w51Invoke(string $blob, string $ints, int $count, int $cap): ?array
+    {
+        self::$w51Ffi ??= RustPipelineLibrary::resolveDomain('categorize_w51', self::W51_FFI_CDEF) ?? false;
+        $ffi = self::$w51Ffi;
+        if ($ffi === false) {
+            return null;
+        }
+        try {
+            if (self::$w51Out === null || self::$w51OutCap < $cap) {
+                self::$w51OutCap = max(1024, $cap * 2);
+                self::$w51Out = $ffi->new('int64_t['.self::$w51OutCap.']');
+            }
+            // @phpstan-ignore method.notFound (Declared by W51_FFI_CDEF.)
+            $written = $ffi->nntmux_w513_user_stats_per_day_batch($blob, \strlen($blob), $ints, \strlen($ints), $count, self::$w51Out, self::$w51OutCap);
+            if (! \is_int($written) || $written <= 0 || $written > $cap) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string(self::$w51Out, $written * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }

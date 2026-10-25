@@ -7,6 +7,7 @@ namespace App\Services;
 use App\Models\SystemMetric;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\Log;
 use Throwable;
 
@@ -588,5 +589,204 @@ class SystemMetricsService
     public function cleanupOldMetrics(int $daysToKeep = 60): int
     {
         return SystemMetric::cleanupOldMetrics($daysToKeep);
+    }
+
+    /** Enabled: three paired runs cleared every 1.5x gate (common mean 7.46-7.84x, p99 5.71-6.99x; uncommon mean 5.68-5.91x, p99 4.22-4.76x); see RustSystemTempUserInactivityStatsSeriesW51ParityTest. */
+    private const bool W51_RUST_FFI_DEFAULT = true;
+
+    public const string W51_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w513_metric_hourly_bucket_batch(const char *blob, size_t blob_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    private static ?bool $useW51RustFfi = null;
+
+    private static FFI|false|null $w51Ffi = null;
+
+    private static ?CData $w51Out = null;
+
+    private static int $w51OutCap = 0;
+
+    public static function usesW51RustFfi(): bool
+    {
+        return self::$useW51RustFfi ?? self::W51_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 51 Rust path forced on or off, then restores the previous setting. */
+    public static function withW51RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$useW51RustFfi;
+        self::$useW51RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$useW51RustFfi = $previous;
+        }
+    }
+
+    /**
+     * Buckets raw `system_metrics` rows by hour, as getHourlyMetrics() groups them, in exact
+     * hundredths. One word per row: its bucket index in first-appearance order, or -1 when
+     * `recorded_at` is not a valid `Y-m-d H:i:s` (or `T`-separated) calendar timestamp or `value`
+     * is not a decimal with at most nine integer and two fractional digits. Then six words per
+     * bucket (hour key `YYYYMMDDHH`, row count, sum, average rounded half away from zero, min,
+     * max, all values in hundredths) and finally the bucket and invalid row counts. Values are
+     * read through their string form, so Carbon instances and floats behave as implode() sees them.
+     *
+     * @param  array<int, array<string, mixed>>  $rows  recorded_at, value
+     * @return list<int>
+     */
+    public static function w51HourlyBucketBatch(array $rows): array
+    {
+        return self::usesW51RustFfi() ? self::w51HourlyBucketBatchNative($rows) : self::w51HourlyBucketBatchPhp($rows);
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>>  $rows
+     * @return list<int>
+     */
+    public static function w51HourlyBucketBatchNative(array $rows): array
+    {
+        $count = \count($rows);
+        $columns = self::w51Columns($rows, ['recorded_at' => '', 'value' => '']);
+
+        return self::w51Invoke(
+            implode("\0", $columns['recorded_at'])."\0".implode("\0", $columns['value']),
+            '',
+            $count,
+            $count * 7 + 2,
+        )
+            ?? self::w51HourlyBucketBatchPhp($rows);
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>>  $rows
+     * @return list<int>
+     */
+    public static function w51HourlyBucketBatchPhp(array $rows): array
+    {
+        $out = [];
+        $slots = [];
+        $buckets = [];
+        $invalid = 0;
+        foreach ($rows as $row) {
+            $key = self::w51HourKey((string) ($row['recorded_at'] ?? ''));
+            $value = self::w51Centi((string) ($row['value'] ?? ''));
+            if ($key === null || $value === null) {
+                $invalid++;
+                $out[] = -1;
+
+                continue;
+            }
+            if (! isset($slots[$key])) {
+                $slots[$key] = \count($buckets);
+                $buckets[] = [$key, 0, 0, $value, $value];
+            }
+            $slot = $slots[$key];
+            $buckets[$slot][1]++;
+            $buckets[$slot][2] += $value;
+            $buckets[$slot][3] = min($buckets[$slot][3], $value);
+            $buckets[$slot][4] = max($buckets[$slot][4], $value);
+            $out[] = $slot;
+        }
+        foreach ($buckets as [$key, $n, $sum, $min, $max]) {
+            $average = intdiv(2 * abs($sum) + $n, 2 * $n);
+            array_push($out, $key, $n, $sum, $sum < 0 ? -$average : $average, $min, $max);
+        }
+        array_push($out, \count($buckets), $invalid);
+
+        return $out;
+    }
+
+    /** `YYYYMMDDHH` of a valid calendar timestamp, else null. */
+    private static function w51HourKey(string $stamp): ?int
+    {
+        if (preg_match('/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})$/D', $stamp, $m) !== 1) {
+            return null;
+        }
+        [$year, $month, $day, $hour] = [(int) $m[1], (int) $m[2], (int) $m[3], (int) $m[4]];
+        if (! checkdate($month, $day, $year) || $hour > 23 || (int) $m[5] > 59 || (int) $m[6] > 59) {
+            return null;
+        }
+
+        return $year * 1_000_000 + $month * 10_000 + $day * 100 + $hour;
+    }
+
+    /** Hundredths of a decimal with at most nine integer and two fractional digits, else null. */
+    private static function w51Centi(string $value): ?int
+    {
+        if (preg_match('/^(-?)(\d{1,9})(?:\.(\d{1,2}))?$/D', $value, $m) !== 1) {
+            return null;
+        }
+        $centi = (int) $m[2] * 100;
+        if (isset($m[3])) {
+            $centi += \strlen($m[3]) === 1 ? (int) $m[3] * 10 : (int) $m[3];
+        }
+
+        return $m[1] === '-' ? -$centi : $centi;
+    }
+
+    /**
+     * One column per key of $defaults. Rows missing a key read its default; present nulls stay
+     * null, which pack() and implode() read as 0 and '' like the defaults they replace.
+     *
+     * @param  array<int, array<string, mixed>>  $rows
+     * @param  array<string, mixed>  $defaults
+     * @return array<string, list<mixed>>
+     */
+    private static function w51Columns(array $rows, array $defaults): array
+    {
+        $count = \count($rows);
+        $columns = [];
+        foreach ($defaults as $key => $default) {
+            $column = array_column($rows, $key);
+            if (\count($column) !== $count) {
+                $filled = [];
+                foreach ($rows as $row) {
+                    $filled[] = $row + $defaults;
+                }
+                $columns = [];
+                foreach ($defaults as $name => $unused) {
+                    $columns[$name] = array_column($filled, $name);
+                }
+
+                return $columns;
+            }
+            $columns[$key] = $column;
+        }
+
+        return $columns;
+    }
+
+    /**
+     * Calls the Wave 51 export with NUL-joined strings and packed `i64` integers. Null when the
+     * library is missing, the call declines (for example a string holding a NUL byte) or it writes
+     * more than $cap words, so the caller falls back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w51Invoke(string $blob, string $ints, int $count, int $cap): ?array
+    {
+        self::$w51Ffi ??= RustPipelineLibrary::resolveDomain('categorize_w51', self::W51_FFI_CDEF) ?? false;
+        $ffi = self::$w51Ffi;
+        if ($ffi === false) {
+            return null;
+        }
+        try {
+            if (self::$w51Out === null || self::$w51OutCap < $cap) {
+                self::$w51OutCap = max(1024, $cap * 2);
+                self::$w51Out = $ffi->new('int64_t['.self::$w51OutCap.']');
+            }
+            // @phpstan-ignore method.notFound (Declared by W51_FFI_CDEF.)
+            $written = $ffi->nntmux_w513_metric_hourly_bucket_batch($blob, \strlen($blob), $ints, \strlen($ints), $count, self::$w51Out, self::$w51OutCap);
+            if (! \is_int($written) || $written <= 0 || $written > $cap) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string(self::$w51Out, $written * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }

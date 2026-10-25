@@ -39223,3 +39223,931 @@ pub mod tv_candidate_pipeline_tvmaze_tvdb_hydration_w503 {
         }
     }
 }
+
+/// Wave 51.3 batch kernels for `SystemMetricsService`, `TempWorkspaceService`,
+/// `UserInactivityEvaluator`, `UserStatsService` and `SeriesReleaseService`.
+///
+/// Every export takes NUL-joined string columns (`blob`), little-endian `i64` integers (`ints`) and
+/// a row `count`, writes fixed-width `i64` words to `out` and returns the word count, `-needed`
+/// when `out_cap` is too small, or [`DECLINE`] so PHP falls back to its reference implementation.
+pub mod system_temp_user_inactivity_stats_series_w513 {
+    use super::tv_pipes_api_abstract_localdb_parseinfo_tmdb_w483::{read_ints, split_exact};
+    use std::collections::HashMap;
+
+    /// Declines the batch to PHP.
+    pub const DECLINE: isize = -1;
+
+    /// Upper bound on `count`, so a corrupt count never drives a huge allocation.
+    const MAX_COUNT: usize = 1 << 24;
+    /// `UserStatsService::W51_MAX_DAYS`.
+    const MAX_DAYS: i64 = 36_600;
+    /// `UserStatsService::W51_MAX_COUNT`.
+    const MAX_STAT_COUNT: i64 = 1 << 32;
+
+    type Batch = fn(&[u8], &[i64], usize) -> Option<Vec<i64>>;
+
+    /// Integer value of an all-ASCII-digit slice (callers check the shape and length).
+    #[inline]
+    fn digits(s: &[u8]) -> i64 {
+        s.iter().fold(0i64, |v, &b| v * 10 + i64::from(b - b'0'))
+    }
+
+    #[inline]
+    fn all_digits(s: &[u8]) -> bool {
+        s.iter().all(u8::is_ascii_digit)
+    }
+
+    /// Days in month `m` of year `y` (0 for an invalid month), as PHP `checkdate()`.
+    fn month_days(y: i64, m: i64) -> i64 {
+        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+        match m {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if leap => 29,
+            2 => 28,
+            _ => 0,
+        }
+    }
+
+    /// PHP `checkdate($m, $d, $y)` for a four-digit year.
+    #[inline]
+    fn valid_date(y: i64, m: i64, d: i64) -> bool {
+        y >= 1 && d >= 1 && d <= month_days(y, m)
+    }
+
+    /// Days since 1970-01-01 of a proleptic Gregorian date.
+    fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = y.div_euclid(400);
+        let yoe = y - era * 400;
+        let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146_097 + doe - 719_468
+    }
+
+    /// `YYYYMMDD` of the proleptic Gregorian date `days` after 1970-01-01, as `gmdate('Ymd')`.
+    fn civil_key(days: i64) -> i64 {
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = yoe + era * 400 + i64::from(m <= 2);
+        y * 10_000 + m * 100 + d
+    }
+
+    /// `/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})$/D` as its six numbers.
+    fn datetime_parts(s: &[u8]) -> Option<[i64; 6]> {
+        if s.len() != 19
+            || s[4] != b'-'
+            || s[7] != b'-'
+            || !matches!(s[10], b' ' | b'T')
+            || s[13] != b':'
+            || s[16] != b':'
+        {
+            return None;
+        }
+        let fields = [
+            &s[..4],
+            &s[5..7],
+            &s[8..10],
+            &s[11..13],
+            &s[14..16],
+            &s[17..],
+        ];
+        if !fields.iter().all(|f| all_digits(f)) {
+            return None;
+        }
+        Some(fields.map(digits))
+    }
+
+    /// `/^(\d{4})-(\d{2})-(\d{2})$/D` passing `checkdate()`, as `(y, m, d)`.
+    fn strict_date(s: &[u8]) -> Option<(i64, i64, i64)> {
+        if s.len() != 10 || s[4] != b'-' || s[7] != b'-' {
+            return None;
+        }
+        let (y, m, d) = (&s[..4], &s[5..7], &s[8..]);
+        if !all_digits(y) || !all_digits(m) || !all_digits(d) {
+            return None;
+        }
+        let (y, m, d) = (digits(y), digits(m), digits(d));
+        valid_date(y, m, d).then_some((y, m, d))
+    }
+
+    /// `SystemMetricsService::w51HourKey()`: `YYYYMMDDHH` of a valid calendar timestamp.
+    fn hour_key(s: &[u8]) -> Option<i64> {
+        let [y, m, d, h, i, sec] = datetime_parts(s)?;
+        (valid_date(y, m, d) && h <= 23 && i <= 59 && sec <= 59)
+            .then_some(y * 1_000_000 + m * 10_000 + d * 100 + h)
+    }
+
+    /// `/^(-?)(\d{1,9})(?:\.(\d{1,2}))?$/D` in hundredths.
+    fn centi(s: &[u8]) -> Option<i64> {
+        let (negative, body) = match s.split_first() {
+            Some((b'-', rest)) => (true, rest),
+            _ => (false, s),
+        };
+        let (whole, frac) = match body.iter().position(|&b| b == b'.') {
+            Some(dot) => (&body[..dot], Some(&body[dot + 1..])),
+            None => (body, None),
+        };
+        if whole.is_empty() || whole.len() > 9 || !all_digits(whole) {
+            return None;
+        }
+        let mut value = digits(whole) * 100;
+        if let Some(frac) = frac {
+            if frac.is_empty() || frac.len() > 2 || !all_digits(frac) {
+                return None;
+            }
+            value += if frac.len() == 1 {
+                digits(frac) * 10
+            } else {
+                digits(frac)
+            };
+        }
+        Some(if negative { -value } else { value })
+    }
+
+    /// One bucket index per row (-1 invalid), then per bucket (first-appearance order) the hour key,
+    /// count, sum, half-away-from-zero average, min and max, then the bucket and invalid counts.
+    fn hourly_buckets(blob: &[u8], ints: &[i64], count: usize) -> Option<Vec<i64>> {
+        if !ints.is_empty() {
+            return None;
+        }
+        let pieces = split_exact(blob, count * 2)?;
+        let (stamps, values) = pieces.split_at(count);
+        let mut out = Vec::with_capacity(count + 2);
+        // (key, count, sum, min, max)
+        let mut buckets: Vec<(i64, i64, i64, i64, i64)> = Vec::new();
+        let mut index: HashMap<i64, usize> = HashMap::new();
+        let mut invalid = 0i64;
+        for (stamp, value) in stamps.iter().zip(values) {
+            let (Some(key), Some(v)) = (hour_key(stamp), centi(value)) else {
+                invalid += 1;
+                out.push(-1);
+                continue;
+            };
+            let slot = match buckets.last() {
+                Some(last) if last.0 == key => buckets.len() - 1,
+                _ => *index.entry(key).or_insert_with(|| {
+                    buckets.push((key, 0, 0, v, v));
+                    buckets.len() - 1
+                }),
+            };
+            let b = &mut buckets[slot];
+            b.1 += 1;
+            b.2 += v;
+            b.3 = b.3.min(v);
+            b.4 = b.4.max(v);
+            out.push(slot as i64);
+        }
+        out.reserve(buckets.len() * 6 + 2);
+        for &(key, n, sum, min, max) in &buckets {
+            let q = (2 * sum.abs() + n) / (2 * n);
+            out.extend_from_slice(&[key, n, sum, if sum < 0 { -q } else { q }, min, max]);
+        }
+        out.extend_from_slice(&[buckets.len() as i64, invalid]);
+        Some(out)
+    }
+
+    /// `$` without `D`: `s` ends with one of `tails` (ASCII case-insensitive), optionally followed
+    /// by one final newline.
+    fn ends_with_any(s: &[u8], tails: &[&[u8]]) -> bool {
+        let trimmed = s.strip_suffix(b"\n");
+        tails.iter().any(|t| {
+            let hit =
+                |v: &[u8]| v.len() >= t.len() && v[v.len() - t.len()..].eq_ignore_ascii_case(t);
+            hit(s) || trimmed.is_some_and(hit)
+        })
+    }
+
+    /// `/.*\.([rz]\d{2,}|rar|zipx?|0{0,2}1)($|[^a-z0-9])/i`.
+    fn is_compressed(s: &[u8]) -> bool {
+        let end = |j: usize| j >= s.len() || !s[j].is_ascii_alphanumeric();
+        let at = |j: usize, lit: &[u8]| {
+            s.len() >= j + lit.len() && s[j..j + lit.len()].eq_ignore_ascii_case(lit)
+        };
+        (0..s.len()).any(|i| {
+            if s[i] != b'.' {
+                return false;
+            }
+            let j = i + 1;
+            if j < s.len() && matches!(s[j] | 0x20, b'r' | b'z') {
+                let run = s[j + 1..].iter().take_while(|b| b.is_ascii_digit()).count();
+                if run >= 2 && end(j + 1 + run) {
+                    return true;
+                }
+            }
+            (at(j, b"rar") && end(j + 3))
+                || (at(j, b"zip")
+                    && (end(j + 3) || (matches!(s.get(j + 3), Some(b'x' | b'X')) && end(j + 4))))
+                || [&b"1"[..], b"01", b"001"]
+                    .iter()
+                    .any(|lit| at(j, lit) && end(j + lit.len()))
+        })
+    }
+
+    /// One word per path (action | flags << 4 | depth << 16) then the five flag counts.
+    fn file_classes(blob: &[u8], ints: &[i64], count: usize) -> Option<Vec<i64>> {
+        if !ints.is_empty() {
+            return None;
+        }
+        let paths = split_exact(blob, count)?;
+        let mut out = Vec::with_capacity(count + 5);
+        let mut totals = [0i64; 5];
+        for p in paths {
+            let flags = [
+                is_compressed(p),
+                ends_with_any(p, &[b"/.", b"\\.", b"/..", b"\\.."]),
+                ends_with_any(p, &[b".par2"]),
+                ends_with_any(p, &[b".nfo", b".inf", b".ofn", b".diz", b"info.txt"]),
+                ends_with_any(p, &[b".jpg", b".jpeg", b".png", b".webp"]),
+            ];
+            let mut bits = 0i64;
+            for (bit, &on) in flags.iter().enumerate() {
+                if on {
+                    bits |= 1 << bit;
+                    totals[bit] += 1;
+                }
+            }
+            let action = flags[1..]
+                .iter()
+                .position(|&on| on)
+                .map_or(0, |a| a as i64 + 1);
+            let depth = p.iter().filter(|&&b| b == b'/' || b == b'\\').count() as i64;
+            out.push(action | bits << 4 | depth << 16);
+        }
+        out.extend_from_slice(&totals);
+        Some(out)
+    }
+
+    /// `UserInactivityEvaluator::w51DateKey()`: the fourteen digits of a timestamp's shape.
+    fn date_key(s: &[u8]) -> Option<i64> {
+        let [y, m, d, h, i, sec] = datetime_parts(s)?;
+        Some(((((y * 100 + m) * 100 + d) * 100 + h) * 100 + i) * 100 + sec)
+    }
+
+    /// Two words per user (flags | rule << 4, last-seen key) then the purge and kept counts and the
+    /// oldest purged last-seen key.
+    fn purge_plan(blob: &[u8], ints: &[i64], count: usize) -> Option<Vec<i64>> {
+        if count == 0 || ints.len() != count {
+            return None;
+        }
+        let pieces = split_exact(blob, count * 5 + 1)?;
+        let threshold = date_key(pieces[count * 5]);
+        let stale = |v: Option<i64>| matches!((v, threshold), (Some(v), Some(t)) if v < t);
+        let mut out = Vec::with_capacity(count * 2 + 3);
+        let (mut purged, mut oldest) = (0i64, 0i64);
+        for (row, &grabs) in ints.iter().enumerate() {
+            let [created, updated, login, api, download] =
+                [0, 1, 2, 3, 4].map(|c| date_key(pieces[c * count + row]));
+            let login_stale = stale(login.or(created));
+            let api_stale = stale(api.or(created));
+            let (download_stale, rule) = if download.is_some() {
+                (stale(download), 0)
+            } else if grabs > 0 {
+                (stale(updated), 1)
+            } else {
+                (stale(created), 2)
+            };
+            let purge = login_stale && api_stale && download_stale;
+            let seen = [login, api, download, created]
+                .into_iter()
+                .flatten()
+                .max()
+                .unwrap_or(0);
+            if purge {
+                purged += 1;
+                oldest = if purged == 1 { seen } else { oldest.min(seen) };
+            }
+            let flags = i64::from(login_stale)
+                | i64::from(api_stale) << 1
+                | i64::from(download_stale) << 2
+                | i64::from(purge) << 3;
+            out.extend_from_slice(&[flags | rule << 4, seen]);
+        }
+        out.extend_from_slice(&[purged, count as i64 - purged, oldest]);
+        Some(out)
+    }
+
+    /// `[days, live, counts...]`: two words per day (`YYYYMMDD`, count) then the window total and
+    /// the in-window and skipped hourly row counts.
+    fn per_day_series(blob: &[u8], ints: &[i64], count: usize) -> Option<Vec<i64>> {
+        if ints.len() != count + 2 {
+            return None;
+        }
+        let pieces = split_exact(blob, count + 1)?;
+        let clamp = |v: i64| v.clamp(0, MAX_STAT_COUNT);
+        let (days, live) = (ints[0].min(MAX_DAYS), clamp(ints[1]));
+        let start = strict_date(pieces[count]).map(|(y, m, d)| days_from_civil(y, m, d));
+        let span = match start {
+            Some(_) if days >= 1 => days as usize,
+            _ => 0,
+        };
+        let mut counts = vec![0i64; span];
+        let (mut inside, mut skipped) = (0i64, 0i64);
+        for (stamp, &n) in pieces[..count].iter().zip(&ints[2..]) {
+            let slot = (stamp.len() >= 10 && stamp[4] == b'-' && stamp[7] == b'-')
+                .then(|| (&stamp[..4], &stamp[5..7], &stamp[8..10]))
+                .filter(|(y, m, d)| all_digits(y) && all_digits(m) && all_digits(d))
+                .map(|(y, m, d)| (digits(y), digits(m), digits(d)))
+                .filter(|&(y, m, d)| valid_date(y, m, d))
+                .and_then(|(y, m, d)| {
+                    let offset = days_from_civil(y, m, d) - start?;
+                    (offset >= 0 && (offset as usize) < span).then_some(offset as usize)
+                });
+            match slot {
+                Some(slot) => {
+                    counts[slot] += clamp(n);
+                    inside += 1;
+                }
+                None => skipped += 1,
+            }
+        }
+        if let Some(last) = counts.last_mut() {
+            *last += live;
+        }
+        let mut out = Vec::with_capacity(span * 2 + 3);
+        let base = start.unwrap_or(0);
+        let mut total = 0i64;
+        for (i, &n) in counts.iter().enumerate() {
+            total += n;
+            out.extend_from_slice(&[civil_key(base + i as i64), n]);
+        }
+        out.extend_from_slice(&[total, inside, skipped]);
+        Some(out)
+    }
+
+    /// `(int) $series` of a plain integer string (optional sign, digits, in range), else `None`.
+    fn plain_int(s: &[u8]) -> Option<i64> {
+        std::str::from_utf8(s).ok()?.parse().ok()
+    }
+
+    /// `[season]`: valid and season-match bitmaps (64 rows per word), the distinct season count,
+    /// ascending (season, count) pairs, the target-season count and the invalid count. Declines when
+    /// a valid row's series is not a plain integer string, leaving PHP's `(int)` rules to PHP.
+    fn fallback_seasons(blob: &[u8], ints: &[i64], count: usize) -> Option<Vec<i64>> {
+        if count == 0 || ints.len() != 1 {
+            return None;
+        }
+        let pieces = split_exact(blob, count * 2)?;
+        let target = ints[0];
+        let words = count.div_ceil(64);
+        let mut out = vec![0i64; words * 2];
+        let mut seasons: Vec<i64> = Vec::with_capacity(count);
+        let (mut matched, mut invalid) = (0i64, 0i64);
+        for row in 0..count {
+            let (series, episode) = (pieces[row], pieces[count + row]);
+            if series.is_empty() || episode.is_empty() || episode == b"0" {
+                invalid += 1;
+                continue;
+            }
+            let season = plain_int(series)?;
+            let bit = 1i64 << (row & 63);
+            out[row >> 6] |= bit;
+            if season == target {
+                out[words + (row >> 6)] |= bit;
+                matched += 1;
+            }
+            seasons.push(season);
+        }
+        seasons.sort_unstable();
+        let mut pairs: Vec<i64> = Vec::new();
+        for chunk in seasons.chunk_by(|a, b| a == b) {
+            pairs.extend_from_slice(&[chunk[0], chunk.len() as i64]);
+        }
+        out.reserve(pairs.len() + 3);
+        out.push((pairs.len() / 2) as i64);
+        out.extend_from_slice(&pairs);
+        out.extend_from_slice(&[matched, invalid]);
+        Some(out)
+    }
+
+    /// Validates the pointers, runs `body` under `catch_unwind` and copies its words to `out`.
+    ///
+    /// # Safety
+    /// `blob` and `ints` must be null or readable for their lengths, and `out` must be null or
+    /// writable for `out_cap` `i64` words that do not overlap either input.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run(
+        blob: *const u8,
+        blob_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+        body: Batch,
+    ) -> isize {
+        if out.is_null()
+            || (blob.is_null() && blob_len != 0)
+            || (ints.is_null() && ints_len != 0)
+            || blob_len > isize::MAX as usize
+            || ints_len > isize::MAX as usize
+            || out_cap > isize::MAX as usize / 8
+            || count > MAX_COUNT
+        {
+            return DECLINE;
+        }
+        let blob: &[u8] = if blob.is_null() {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(blob, blob_len) }
+        };
+        let ints: &[u8] = if ints.is_null() {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(ints, ints_len) }
+        };
+        let result = std::panic::catch_unwind(|| body(blob, &read_ints(ints)?, count));
+        let Ok(Some(values)) = result else {
+            return DECLINE;
+        };
+        if values.len() > out_cap {
+            return -(values.len() as isize);
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(values.as_ptr(), out, values.len());
+        }
+        values.len() as isize
+    }
+
+    /// `SystemMetricsService::w51HourlyBucketBatch()`.
+    ///
+    /// # Safety
+    /// As for [`run`].
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w513_metric_hourly_bucket_batch(
+        blob: *const u8,
+        blob_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            run(
+                blob,
+                blob_len,
+                ints,
+                ints_len,
+                count,
+                out,
+                out_cap,
+                hourly_buckets,
+            )
+        }
+    }
+
+    /// `TempWorkspaceService::w51ExtractedFileClassBatch()`.
+    ///
+    /// # Safety
+    /// As for [`run`].
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w513_temp_file_class_batch(
+        blob: *const u8,
+        blob_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            run(
+                blob,
+                blob_len,
+                ints,
+                ints_len,
+                count,
+                out,
+                out_cap,
+                file_classes,
+            )
+        }
+    }
+
+    /// `UserInactivityEvaluator::w51PurgePlanBatch()`.
+    ///
+    /// # Safety
+    /// As for [`run`].
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w513_user_purge_plan_batch(
+        blob: *const u8,
+        blob_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            run(
+                blob, blob_len, ints, ints_len, count, out, out_cap, purge_plan,
+            )
+        }
+    }
+
+    /// `UserStatsService::w51PerDaySeriesBatch()`.
+    ///
+    /// # Safety
+    /// As for [`run`].
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w513_user_stats_per_day_batch(
+        blob: *const u8,
+        blob_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            run(
+                blob,
+                blob_len,
+                ints,
+                ints_len,
+                count,
+                out,
+                out_cap,
+                per_day_series,
+            )
+        }
+    }
+
+    /// `SeriesReleaseService::w51FallbackSeasonBatch()`.
+    ///
+    /// # Safety
+    /// As for [`run`].
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w513_series_fallback_season_batch(
+        blob: *const u8,
+        blob_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            run(
+                blob,
+                blob_len,
+                ints,
+                ints_len,
+                count,
+                out,
+                out_cap,
+                fallback_seasons,
+            )
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::ptr;
+
+        fn packed(values: &[i64]) -> Vec<u8> {
+            values.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+
+        type Export = unsafe extern "C" fn(
+            *const u8,
+            usize,
+            *const u8,
+            usize,
+            usize,
+            *mut i64,
+            usize,
+        ) -> isize;
+
+        fn call(f: Export, blob: &[u8], ints: &[i64], count: usize) -> Result<Vec<i64>, isize> {
+            let ints = packed(ints);
+            let mut out = vec![0i64; 4096];
+            let written = unsafe {
+                f(
+                    blob.as_ptr(),
+                    blob.len(),
+                    ints.as_ptr(),
+                    ints.len(),
+                    count,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            if written < 0 {
+                return Err(written);
+            }
+            out.truncate(written as usize);
+            Ok(out)
+        }
+
+        #[test]
+        fn w513_calendar_helpers_round_trip() {
+            for days in [-719_162, -1, 0, 59, 11_016, 19_782, 2_932_896] {
+                let key = civil_key(days);
+                let (y, m, d) = (key / 10_000, key / 100 % 100, key % 100);
+                assert!(valid_date(y, m, d), "{key}");
+                assert_eq!(days_from_civil(y, m, d), days);
+            }
+            assert_eq!(civil_key(0), 19_700_101);
+            assert_eq!(civil_key(19_782), 20_240_229);
+            assert_eq!(strict_date(b"2024-02-29"), Some((2024, 2, 29)));
+            assert_eq!(strict_date(b"2023-02-29"), None);
+            assert_eq!(strict_date(b"0000-01-01"), None);
+            assert_eq!(hour_key(b"2024-02-29T23:59:59"), Some(2_024_022_923));
+            assert_eq!(hour_key(b"2024-02-29 24:00:00"), None);
+            assert_eq!(date_key(b"2024-13-45 99:99:99"), Some(20_241_345_999_999));
+            assert_eq!(date_key(b"2024-01-01 00:00:00\n"), None);
+        }
+
+        #[test]
+        fn w513_centi_parses_two_decimals() {
+            assert_eq!(centi(b"12.34"), Some(1_234));
+            assert_eq!(centi(b"12.5"), Some(1_250));
+            assert_eq!(centi(b"-0.05"), Some(-5));
+            assert_eq!(centi(b"999999999.99"), Some(99_999_999_999));
+            for bad in [
+                &b""[..],
+                b"-",
+                b".5",
+                b"1.",
+                b"1.234",
+                b"1e3",
+                b" 1",
+                b"+1",
+                b"1234567890",
+                b"--1",
+            ] {
+                assert_eq!(centi(bad), None, "{:?}", String::from_utf8_lossy(bad));
+            }
+        }
+
+        #[test]
+        fn w513_hourly_buckets_group_by_first_appearance() {
+            let blob = [
+                "2024-01-01 10:05:00\x002024-01-01 10:59:59\x002024-01-01 11:00:00\x00bad\x002024-01-01 10:30:00",
+                "10.5\x0020\x00-3\x001\x00x",
+            ]
+            .join("\0");
+            let out = call(
+                nntmux_w513_metric_hourly_bucket_batch,
+                blob.as_bytes(),
+                &[],
+                5,
+            )
+            .unwrap();
+            assert_eq!(out[..5], [0, 0, 1, -1, -1]);
+            assert_eq!(out[5..11], [2_024_010_110, 2, 3_050, 1_525, 1_050, 2_000]);
+            assert_eq!(out[11..17], [2_024_010_111, 1, -300, -300, -300, -300]);
+            assert_eq!(out[17..], [2, 2]);
+            assert_eq!(hourly_buckets(b"\x001.11\x00", &[], 1), None);
+            let two = "2024-01-01 10:00:00\x002024-01-01 10:00:00\x00-0.01\x00-0.02";
+            let out = call(
+                nntmux_w513_metric_hourly_bucket_batch,
+                two.as_bytes(),
+                &[],
+                2,
+            )
+            .unwrap();
+            assert_eq!(out[2..8], [2_024_010_110, 2, -3, -2, -2, -1]);
+        }
+
+        #[test]
+        fn w513_file_classes_follow_the_processor_regexes() {
+            assert!(is_compressed(b"a.r00"));
+            assert!(is_compressed(b"a.R123-x"));
+            assert!(!is_compressed(b"a.r1"));
+            assert!(!is_compressed(b"a.r00a"));
+            assert!(is_compressed(b"a.rar"));
+            assert!(is_compressed(b"x.ZIPX"));
+            assert!(is_compressed(b"x.zip.bak"));
+            assert!(!is_compressed(b"x.zipxx"));
+            assert!(is_compressed(b"a.001"));
+            assert!(is_compressed(b"a.01\n"));
+            assert!(!is_compressed(b"a.0001"));
+            assert!(!is_compressed(b"a.10"));
+            assert!(is_compressed(b"a.1.sfv"));
+            let blob = "sub/a.part01.rar\0b/.\0x.PAR2\n\0dir\\info.txt\0cover.JPEG\0plain.mkv";
+            let out = call(nntmux_w513_temp_file_class_batch, blob.as_bytes(), &[], 6).unwrap();
+            assert_eq!(out[0], 1 << 4 | 1 << 16);
+            assert_eq!(out[1], 1 | 2 << 4 | 1 << 16);
+            assert_eq!(out[2], 2 | 4 << 4);
+            assert_eq!(out[3], 3 | 8 << 4 | 1 << 16);
+            assert_eq!(out[4], 4 | 16 << 4);
+            assert_eq!(out[5], 0);
+            assert_eq!(out[6..], [1, 1, 1, 1, 1]);
+        }
+
+        #[test]
+        fn w513_purge_plan_mirrors_the_evaluator() {
+            let t = "2024-01-01 00:00:00";
+            let old = "2023-01-01 00:00:00";
+            let new = "2024-06-01 00:00:00";
+            // created, updated, login, api, download per user (column-major), then the threshold.
+            let columns = [
+                [old, old, old, new],
+                [old, new, "", ""],
+                ["", old, new, ""],
+                ["", "", "", ""],
+                ["", "", "", "bad"],
+            ];
+            let mut parts: Vec<&str> = columns.iter().flatten().copied().collect();
+            parts.push(t);
+            let blob = parts.join("\0");
+            let out = call(
+                nntmux_w513_user_purge_plan_batch,
+                blob.as_bytes(),
+                &[0, 3, 0, 0],
+                4,
+            )
+            .unwrap();
+            assert_eq!(out[0..2], [0b1111 | 2 << 4, 20_230_101_000_000]);
+            assert_eq!(out[2..4], [0b0011 | 1 << 4, 20_230_101_000_000]);
+            assert_eq!(out[4..6], [0b0110 | 2 << 4, 20_240_601_000_000]);
+            assert_eq!(out[6..8], [2 << 4, 20_240_601_000_000]);
+            assert_eq!(out[8..], [1, 3, 20_230_101_000_000]);
+            let bad_threshold = [&parts[..20], &["x"][..]].concat().join("\0");
+            let out = call(
+                nntmux_w513_user_purge_plan_batch,
+                bad_threshold.as_bytes(),
+                &[0, 3, 0, 0],
+                4,
+            )
+            .unwrap();
+            assert!(out[..8].iter().step_by(2).all(|&w| w & 0xF == 0));
+        }
+
+        #[test]
+        fn w513_per_day_series_fills_the_window() {
+            let blob = "2024-02-28 23:00:00\x002024-02-29 01:00:00\x002024-03-02 00:00:00\x00junk\x002024-02-29\x002024-02-28";
+            let out = call(
+                nntmux_w513_user_stats_per_day_batch,
+                blob.as_bytes(),
+                &[3, 7, 4, 5, 6, -9, 1],
+                5,
+            )
+            .unwrap();
+            assert_eq!(out, [20_240_228, 4, 20_240_229, 6, 20_240_301, 7, 17, 3, 2]);
+            let out = call(
+                nntmux_w513_user_stats_per_day_batch,
+                b"x\x00bad",
+                &[3, 7, 1],
+                1,
+            )
+            .unwrap();
+            assert_eq!(out, [0, 0, 1]);
+            let out = call(
+                nntmux_w513_user_stats_per_day_batch,
+                b"2024-01-01",
+                &[0, 7],
+                0,
+            )
+            .unwrap();
+            assert_eq!(out, [0, 0, 0]);
+            let out = call(
+                nntmux_w513_user_stats_per_day_batch,
+                b"2024-01-01",
+                &[1, i64::MAX],
+                0,
+            )
+            .unwrap();
+            assert_eq!(out, [20_240_101, MAX_STAT_COUNT, MAX_STAT_COUNT, 0, 0]);
+        }
+
+        #[test]
+        fn w513_fallback_seasons_group_valid_rows() {
+            let blob = "2\x00\x001\x002\x000\x00-7\x005\x003\x003\x000\x001\x002";
+            let out = call(
+                nntmux_w513_series_fallback_season_batch,
+                blob.as_bytes(),
+                &[2],
+                6,
+            )
+            .unwrap();
+            assert_eq!(out[0], 0b11_0101);
+            assert_eq!(out[1], 0b1);
+            assert_eq!(out[2..], [4, -7, 1, 0, 1, 1, 1, 2, 1, 1, 2]);
+            // A valid row whose series is not a plain integer string declines; an invalid one does not.
+            for (series, expected) in [(" 2", None), ("1e3", None), ("x", None), ("+2", Some(2))] {
+                let blob = format!("{series}\x001");
+                assert_eq!(
+                    fallback_seasons(blob.as_bytes(), &[2], 1).map(|o| o[3]),
+                    expected
+                );
+            }
+            assert!(fallback_seasons(b"x\x000", &[2], 1).is_some());
+            let rows = 130;
+            let blob = vec!["1"; rows * 2].join("\0");
+            let out = call(
+                nntmux_w513_series_fallback_season_batch,
+                blob.as_bytes(),
+                &[1],
+                rows,
+            )
+            .unwrap();
+            assert_eq!(out[..6], [-1, -1, 3, -1, -1, 3]);
+            assert_eq!(out[6..], [1, 1, rows as i64, rows as i64, 0]);
+        }
+
+        #[test]
+        fn w513_exports_guard_pointers_and_capacity() {
+            let mut out = [0i64; 16];
+            let o = out.as_mut_ptr();
+            let exports: [Export; 5] = [
+                nntmux_w513_metric_hourly_bucket_batch,
+                nntmux_w513_temp_file_class_batch,
+                nntmux_w513_user_purge_plan_batch,
+                nntmux_w513_user_stats_per_day_batch,
+                nntmux_w513_series_fallback_season_batch,
+            ];
+            for f in exports {
+                unsafe {
+                    assert_eq!(
+                        f(b"x".as_ptr(), 1, ptr::null(), 0, 1, ptr::null_mut(), 16),
+                        DECLINE
+                    );
+                    assert_eq!(f(ptr::null(), 1, ptr::null(), 0, 1, o, 16), DECLINE);
+                    assert_eq!(f(b"x".as_ptr(), 1, ptr::null(), 8, 1, o, 16), DECLINE);
+                    assert_eq!(
+                        f(ptr::null(), 0, ptr::null(), 0, MAX_COUNT + 1, o, 16),
+                        DECLINE
+                    );
+                    assert_eq!(
+                        f(b"x".as_ptr(), 1, b"1234567".as_ptr(), 7, 1, o, 16),
+                        DECLINE
+                    );
+                    assert_eq!(
+                        f(
+                            b"a\0b\0c\0d\0e\0f\0g".as_ptr(),
+                            13,
+                            ptr::null(),
+                            0,
+                            1,
+                            o,
+                            16
+                        ),
+                        DECLINE
+                    );
+                }
+            }
+            unsafe {
+                assert_eq!(
+                    nntmux_w513_temp_file_class_batch(ptr::null(), 0, ptr::null(), 0, 0, o, 16),
+                    5
+                );
+                assert_eq!(
+                    nntmux_w513_temp_file_class_batch(b"a".as_ptr(), 1, ptr::null(), 0, 1, o, 5),
+                    -6
+                );
+                assert_eq!(
+                    nntmux_w513_metric_hourly_bucket_batch(
+                        ptr::null(),
+                        0,
+                        ptr::null(),
+                        0,
+                        0,
+                        o,
+                        16
+                    ),
+                    2
+                );
+                // Extra integers or a zero-row purge plan decline.
+                assert_eq!(
+                    nntmux_w513_temp_file_class_batch(
+                        b"a".as_ptr(),
+                        1,
+                        packed(&[1]).as_ptr(),
+                        8,
+                        1,
+                        o,
+                        16
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w513_user_purge_plan_batch(b"t".as_ptr(), 1, ptr::null(), 0, 0, o, 16),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w513_series_fallback_season_batch(
+                        ptr::null(),
+                        0,
+                        ptr::null(),
+                        0,
+                        0,
+                        o,
+                        16
+                    ),
+                    DECLINE
+                );
+            }
+        }
+    }
+}
