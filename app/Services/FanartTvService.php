@@ -565,4 +565,159 @@ class FanartTvService
     {
         return Cache::forget('fanarttv_tv_'.$tvdbId);
     }
+
+    /** Disabled: common mean 1.29-1.45x, common p99 1.06-1.44x and uncommon mean 1.41-1.47x missed 1.5x in five paired runs; see the W43 parity test. */
+    public const bool W434_RUST_FFI_DEFAULT = false;
+
+    public const string W434_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w434_fanart_image_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private const array W434_SUMMARY_KEYS = ['total_images', 'empty_url_count', 'https_count', 'fanart_host_count', 'jpg_count', 'png_count', 'preview_count', 'query_count'];
+
+    private static ?bool $w434UseRustFfi = null;
+
+    private static FFI|false|null $w434Ffi = null;
+
+    /** Null restores the benchmark-qualified default. */
+    public static function useW434RustFfi(?bool $enable = true): void
+    {
+        self::$w434UseRustFfi = $enable;
+    }
+
+    public static function usesW434RustFfi(): bool
+    {
+        return self::$w434UseRustFfi ?? self::W434_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW434RustFfi(): void
+    {
+        self::$w434UseRustFfi = null;
+        self::$w434Ffi = null;
+    }
+
+    /**
+     * Summarize Fanart.TV artwork URLs: https scheme, fanart.tv hosts and
+     * /preview/ paths (ASCII case-insensitive), jpg/jpeg or png text after the
+     * last dot, and query strings. Entries come from strings, integers, or the
+     * url array field; other values (including objects) count as empty entries.
+     *
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeFanartImageBatch(array $entries): array
+    {
+        return self::usesW434RustFfi()
+            ? self::summarizeFanartImageBatchNative($entries)
+            : self::summarizeFanartImageBatchPhp($entries);
+    }
+
+    /**
+     * Rust summary; falls back to PHP when the library or input frame is unusable.
+     *
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeFanartImageBatchNative(array $entries): array
+    {
+        return self::w434Call(self::w434Entries($entries)) ?? self::summarizeFanartImageBatchPhp($entries);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeFanartImageBatchPhp(array $entries): array
+    {
+        $summary = array_fill_keys(self::W434_SUMMARY_KEYS, 0);
+        foreach (self::w434Entries($entries) as $entry) {
+            $summary['total_images']++;
+            $entry = trim($entry);
+            if ($entry === '') {
+                $summary['empty_url_count']++;
+
+                continue;
+            }
+            $dot = strrpos($entry, '.');
+            $extension = $dot === false ? '' : strtolower(substr($entry, $dot + 1));
+            $summary['https_count'] += (int) (strncasecmp($entry, 'https://', 8) === 0);
+            $summary['fanart_host_count'] += (int) (stripos($entry, 'fanart.tv/') !== false);
+            $summary['jpg_count'] += (int) ($extension === 'jpg' || $extension === 'jpeg');
+            $summary['png_count'] += (int) ($extension === 'png');
+            $summary['preview_count'] += (int) (stripos($entry, '/preview/') !== false);
+            $summary['query_count'] += (int) str_contains($entry, '?');
+        }
+
+        return $summary;
+    }
+
+    /** Only integer and string entries participate; objects are never cast or serialized.
+     *
+     * @param  array<array-key, mixed>  $input
+     * @return list<string>
+     */
+    private static function w434Entries(array $input): array
+    {
+        $entries = [];
+        foreach ($input as $item) {
+            if (is_array($item)) {
+                $item = $item['url'] ?? null;
+            }
+            $entries[] = is_string($item) || is_int($item) ? (string) $item : '';
+        }
+
+        return $entries;
+    }
+
+    /** @param list<string> $entries
+     * @return array<string, int>|null
+     */
+    private static function w434Call(array $entries): ?array
+    {
+        try {
+            $input = serialize([$entries]);
+            if (strlen($input) > 16777216) {
+                return null;
+            }
+            self::$w434Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w434', self::W434_FFI_CDEF) ?? false;
+            $ffi = self::$w434Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            $capacity = 0;
+            $out = RustPipelineLibrary::obtainScratch($ffi, 2048, $capacity);
+            if ($out === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound (Declared by W434_FFI_CDEF.)
+            $written = $ffi->nntmux_w434_fanart_image_batch($input, strlen($input), $out, $capacity);
+            if (is_int($written) && $written < -1 && $written >= -16777216) {
+                $out = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($out === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound (Declared by W434_FFI_CDEF.)
+                $written = $ffi->nntmux_w434_fanart_image_batch($input, strlen($input), $out, $capacity);
+            }
+            if (! is_int($written) || $written <= 0 || $written > $capacity || $written > 16777216) {
+                return null;
+            }
+            $result = @unserialize(FFI::string($out, $written), ['allowed_classes' => false]);
+            if (! is_array($result) || array_keys($result) !== self::W434_SUMMARY_KEYS || $result['total_images'] !== count($entries)) {
+                return null;
+            }
+            $summary = [];
+            foreach (self::W434_SUMMARY_KEYS as $key) {
+                $value = $result[$key];
+                if (! is_int($value) || $value < 0 || $value > count($entries)) {
+                    return null;
+                }
+                $summary[$key] = $value;
+            }
+
+            return $summary;
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }
