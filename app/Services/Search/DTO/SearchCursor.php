@@ -31,6 +31,20 @@ final class SearchCursor
 
     private static FFI|false|null $ffi = null;
 
+    public const string W415_FFI_CDEF = 'int32_t nntmux_w415_search_dto_query_cursor_page_media_codec(uint32_t mode, const char *input, size_t input_len, char *out, size_t cap);';
+
+    /**
+     * Rust stays opt-in for the Wave 41.5 summary: the FFI round trip misses the 1.5x gate; see
+     * tests/Unit/RustSearchDtoQueryCursorPageMediaCodecW41ParityTest.php.
+     */
+    public const bool W415_RUST_FFI_DEFAULT = false;
+
+    private const int W415_NATIVE_MAX_PARTS = 1 << 20;
+
+    private static ?bool $useW415RustFfi = null;
+
+    private static FFI|false|null $w415Ffi = null;
+
     /** @param list<int|float|string> $sortValues */
     public function __construct(
         public readonly array $sortValues,
@@ -210,6 +224,197 @@ final class SearchCursor
         }
 
         return $offset === $length ? $parts : null;
+    }
+
+    public static function useW415RustFfi(bool $enable = true): void
+    {
+        self::$useW415RustFfi = $enable;
+    }
+
+    public static function usesW415RustFfi(): bool
+    {
+        return self::$useW415RustFfi ?? self::W415_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW415RustFfi(): void
+    {
+        self::$useW415RustFfi = null;
+    }
+
+    /**
+     * Classifies a batch of cursors against one query, driver and index generation at $now, with the
+     * precedence of `classifyCursorMatchPhp()`. Non-cursor items are invalid. `max_valid_total` is the
+     * largest total of a valid cursor (0 when none); `earliest_expires_at` is the smallest expiry of
+     * any cursor (null when none).
+     *
+     * @param  array<array-key, mixed>  $cursors
+     * @return array{cursors: int, invalid: int, valid: int, expired: int, query_mismatch: int, driver_mismatch: int, generation_mismatch: int, max_valid_total: int, earliest_expires_at: int|null}
+     */
+    public static function summarizeCursorMatchBatch(array $cursors, string $queryHash, string $driver, string $indexGeneration, int $now): array
+    {
+        return self::usesW415RustFfi()
+            ? self::summarizeCursorMatchBatchNative($cursors, $queryHash, $driver, $indexGeneration, $now)
+            : self::summarizeCursorMatchBatchPhp($cursors, $queryHash, $driver, $indexGeneration, $now);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $cursors
+     * @return array{cursors: int, invalid: int, valid: int, expired: int, query_mismatch: int, driver_mismatch: int, generation_mismatch: int, max_valid_total: int, earliest_expires_at: int|null}
+     */
+    public static function summarizeCursorMatchBatchPhp(array $cursors, string $queryHash, string $driver, string $indexGeneration, int $now): array
+    {
+        $states = array_fill_keys(self::MATCH_STATES, 0);
+        $invalid = 0;
+        $maxTotal = 0;
+        $earliest = null;
+        foreach ($cursors as $cursor) {
+            if (! $cursor instanceof self) {
+                $invalid++;
+
+                continue;
+            }
+            $earliest = $earliest === null ? $cursor->expiresAt : min($earliest, $cursor->expiresAt);
+            $state = self::classifyCursorMatchPhp($cursor->queryHash, $cursor->driver, $cursor->indexGeneration, $cursor->expiresAt, $queryHash, $driver, $indexGeneration, $now);
+            $states[$state]++;
+            if ($state === 'valid') {
+                $maxTotal = max($maxTotal, $cursor->total);
+            }
+        }
+
+        return [
+            'cursors' => \count($cursors),
+            'invalid' => $invalid,
+            'valid' => $states['valid'],
+            'expired' => $states['expired'],
+            'query_mismatch' => $states['query_mismatch'],
+            'driver_mismatch' => $states['driver_mismatch'],
+            'generation_mismatch' => $states['generation_mismatch'],
+            'max_valid_total' => $maxTotal,
+            'earliest_expires_at' => $earliest,
+        ];
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $cursors
+     * @return array{cursors: int, invalid: int, valid: int, expired: int, query_mismatch: int, driver_mismatch: int, generation_mismatch: int, max_valid_total: int, earliest_expires_at: int|null}
+     */
+    public static function summarizeCursorMatchBatchNative(array $cursors, string $queryHash, string $driver, string $indexGeneration, int $now): array
+    {
+        $parts = [$queryHash, $driver, $indexGeneration, (string) $now];
+        foreach ($cursors as $cursor) {
+            if ($cursor instanceof self) {
+                array_push($parts, '1', $cursor->queryHash, $cursor->driver, $cursor->indexGeneration, (string) $cursor->expiresAt, (string) $cursor->total);
+            } else {
+                array_push($parts, '0', '', '', '', '0', '0');
+            }
+        }
+        $fields = self::evaluateW415Native(2, $parts);
+        if ($fields === null || \count($fields) !== 9) {
+            return self::summarizeCursorMatchBatchPhp($cursors, $queryHash, $driver, $indexGeneration, $now);
+        }
+
+        return [
+            'cursors' => (int) $fields[0],
+            'invalid' => (int) $fields[1],
+            'valid' => (int) $fields[2],
+            'expired' => (int) $fields[3],
+            'query_mismatch' => (int) $fields[4],
+            'driver_mismatch' => (int) $fields[5],
+            'generation_mismatch' => (int) $fields[6],
+            'max_valid_total' => (int) $fields[7],
+            'earliest_expires_at' => $fields[8] === '' ? null : (int) $fields[8],
+        ];
+    }
+
+    /**
+     * Shared Wave 41.5 bridge to `nntmux_w415_search_dto_query_cursor_page_media_codec`. Returns the
+     * decoded result fields, or null when the library is missing, the input is too large or Rust
+     * declines (callers then use their PHP implementation).
+     *
+     * @param  list<string>  $parts
+     * @return list<string>|null
+     */
+    public static function evaluateW415Native(int $mode, array $parts): ?array
+    {
+        $ffi = self::w415Ffi();
+        if ($ffi === null || $mode < 0 || \count($parts) > self::W415_NATIVE_MAX_PARTS) {
+            return null;
+        }
+
+        try {
+            $input = pack('V', \count($parts));
+            foreach ($parts as $part) {
+                $input .= pack('V', \strlen($part)).$part;
+            }
+            if (\strlen($input) > self::NATIVE_MAX_BYTES) {
+                return null;
+            }
+
+            $minBytes = 1024;
+            for ($attempt = 0; $attempt < 2; $attempt++) {
+                $capacity = 0;
+                $out = RustPipelineLibrary::obtainScratch($ffi, $minBytes, $capacity);
+                if ($out === null) {
+                    return null;
+                }
+                $capacity = min($capacity, self::NATIVE_MAX_BYTES);
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w415_search_dto_query_cursor_page_media_codec($mode, $input, \strlen($input), $out, $capacity);
+                if (! \is_int($written)) {
+                    return null;
+                }
+                if ($written >= 4 && $written <= $capacity) {
+                    return self::unpackW415(FFI::string($out, $written));
+                }
+                if ($written > -4 || -$written <= $capacity || -$written > self::NATIVE_MAX_BYTES) {
+                    return null;
+                }
+                $minBytes = -$written;
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        return null;
+    }
+
+    /** @return list<string>|null */
+    private static function unpackW415(string $packet): ?array
+    {
+        $length = \strlen($packet);
+        $header = unpack('V', $packet);
+        $count = \is_array($header) ? $header[1] : null;
+        if (! \is_int($count) || $count > intdiv($length - 4, 4)) {
+            return null;
+        }
+
+        $offset = 4;
+        $parts = [];
+        for ($i = 0; $i < $count; $i++) {
+            if ($offset + 4 > $length) {
+                return null;
+            }
+            $size = unpack('V', $packet, $offset);
+            $size = \is_array($size) ? $size[1] : null;
+            $offset += 4;
+            if (! \is_int($size) || $size > $length - $offset) {
+                return null;
+            }
+            $parts[] = substr($packet, $offset, $size);
+            $offset += $size;
+        }
+
+        return $offset === $length ? $parts : null;
+    }
+
+    private static function w415Ffi(): ?FFI
+    {
+        if (self::$w415Ffi === null) {
+            $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+            self::$w415Ffi = RustPipelineLibrary::resolveDomain('search_w415', self::W415_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+        }
+
+        return self::$w415Ffi instanceof FFI ? self::$w415Ffi : null;
     }
 
     private static function ffi(): ?FFI

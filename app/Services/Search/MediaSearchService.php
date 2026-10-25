@@ -8,6 +8,7 @@ use App\Facades\Search;
 use App\Models\MovieInfo;
 use App\Models\Release;
 use App\Models\Video;
+use App\Services\Search\DTO\SearchCursor;
 use App\Support\RustPipelineLibrary;
 use FFI;
 use Illuminate\Support\Facades\Cache;
@@ -50,6 +51,14 @@ class MediaSearchService
 
     private static FFI|false|null $ffi = null;
 
+    /**
+     * Rust stays opt-in for the Wave 41.5 summary: the FFI round trip misses the 1.5x gate; see
+     * tests/Unit/RustSearchDtoQueryCursorPageMediaCodecW41ParityTest.php.
+     */
+    public const bool W415_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useW415RustFfi = null;
+
     public static function setUseRustFfi(bool $useRustFfi): void
     {
         self::$useRustFfi = $useRustFfi;
@@ -62,6 +71,121 @@ class MediaSearchService
         }
 
         return self::$ffi === false ? null : self::$ffi;
+    }
+
+    public static function useW415RustFfi(bool $enable = true): void
+    {
+        self::$useW415RustFfi = $enable;
+    }
+
+    public static function usesW415RustFfi(): bool
+    {
+        return self::$useW415RustFfi ?? self::W415_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW415RustFfi(): void
+    {
+        self::$useW415RustFfi = null;
+    }
+
+    /**
+     * Summarizes external ID coverage of index rows with the `collectExternalIds()` rule (a field is
+     * present when it is not `empty()`), using the movie fields for `$type === 'movie'` and the TV
+     * fields otherwise. Non-array rows are invalid. `field_counts` is keyed by the release field in
+     * lookup priority order.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array{rows: int, invalid_rows: int, with_any: int, max_per_row: int, field_counts: array<string, int>}
+     */
+    public static function summarizeExternalIdCoverageBatch(array $rows, string $type = 'movie'): array
+    {
+        return self::usesW415RustFfi()
+            ? self::summarizeExternalIdCoverageBatchNative($rows, $type)
+            : self::summarizeExternalIdCoverageBatchPhp($rows, $type);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rows
+     * @return array{rows: int, invalid_rows: int, with_any: int, max_per_row: int, field_counts: array<string, int>}
+     */
+    public static function summarizeExternalIdCoverageBatchPhp(array $rows, string $type = 'movie'): array
+    {
+        $fields = $type === 'movie' ? self::MOVIE_EXTERNAL_ID_FIELDS : self::TV_EXTERNAL_ID_FIELDS;
+        $counts = array_fill_keys(array_values($fields), 0);
+        $invalid = 0;
+        $withAny = 0;
+        $maxPerRow = 0;
+        foreach ($rows as $row) {
+            if (! \is_array($row)) {
+                $invalid++;
+
+                continue;
+            }
+            $found = 0;
+            foreach ($fields as $source => $target) {
+                if (! empty($row[$source])) {
+                    $counts[$target]++;
+                    $found++;
+                }
+            }
+            $withAny += (int) ($found > 0);
+            $maxPerRow = max($maxPerRow, $found);
+        }
+
+        return [
+            'rows' => \count($rows),
+            'invalid_rows' => $invalid,
+            'with_any' => $withAny,
+            'max_per_row' => $maxPerRow,
+            'field_counts' => $counts,
+        ];
+    }
+
+    /**
+     * Rust receives integers and strings as tagged bytes; PHP decides `empty()` for other types.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array{rows: int, invalid_rows: int, with_any: int, max_per_row: int, field_counts: array<string, int>}
+     */
+    public static function summarizeExternalIdCoverageBatchNative(array $rows, string $type = 'movie'): array
+    {
+        $fields = $type === 'movie' ? self::MOVIE_EXTERNAL_ID_FIELDS : self::TV_EXTERNAL_ID_FIELDS;
+        $sources = array_keys($fields);
+        $width = \count($sources);
+        $parts = [(string) $width];
+        foreach ($rows as $row) {
+            if (! \is_array($row)) {
+                $parts[] = '0';
+                array_push($parts, ...array_fill(0, $width, 'z'));
+
+                continue;
+            }
+            $parts[] = '1';
+            foreach ($sources as $source) {
+                $value = $row[$source] ?? null;
+                $parts[] = match (true) {
+                    \is_string($value) => 's'.$value,
+                    \is_int($value) => 'i'.$value,
+                    default => $value ? 't' : 'z',
+                };
+            }
+        }
+        $result = SearchCursor::evaluateW415Native(4, $parts);
+        if ($result === null || \count($result) !== 4 + $width) {
+            return self::summarizeExternalIdCoverageBatchPhp($rows, $type);
+        }
+        $counts = [];
+        foreach (array_values($fields) as $i => $target) {
+            $counts[$target] = (int) $result[4 + $i];
+        }
+
+        return [
+            'rows' => (int) $result[0],
+            'invalid_rows' => (int) $result[1],
+            'with_any' => (int) $result[2],
+            'max_per_row' => (int) $result[3],
+            'field_counts' => $counts,
+        ];
     }
 
     /**
