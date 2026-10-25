@@ -251,4 +251,204 @@ final class ParsedTvRelease
     {
         return \strlen($this->country) === 2 ? $this->country : '';
     }
+
+    /**
+     * Wave 47.3 batch name normalization. Defaults to Rust: the paired benchmark cleared 1.5x on
+     * common and uncommon mean and p99; useW47ParsedReleaseRustFfi(false) selects PHP.
+     */
+    public const bool W47_PARSED_RELEASE_RUST_FFI_DEFAULT = true;
+
+    public const string W47_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w47_tv_parsed_release_batch(const char *blob, size_t blob_len, size_t count, char *out, size_t out_cap);
+        C;
+
+    /** Values written per name by w47NormalizeBatch(). */
+    public const int W47_FIELDS_PER_NAME = 7;
+
+    /** Two-letter country tokens recognised after the show name; the order matches the Rust table. */
+    public const array W47_COUNTRIES = [
+        'US' => true, 'UK' => true, 'CA' => true, 'AU' => true, 'NZ' => true, 'IE' => true, 'DE' => true,
+        'FR' => true, 'NL' => true, 'SE' => true, 'NO' => true, 'DK' => true, 'FI' => true, 'ES' => true,
+        'IT' => true, 'JP' => true, 'KR' => true, 'BR' => true, 'MX' => true, 'IN' => true,
+    ];
+
+    private static ?bool $w47RustFfiOverride = null;
+
+    private static FFI|false|null $w47RustFfiHandle = null;
+
+    /** Null restores W47_PARSED_RELEASE_RUST_FFI_DEFAULT. */
+    public static function useW47ParsedReleaseRustFfi(?bool $enable = true): void
+    {
+        self::$w47RustFfiOverride = $enable;
+        if ($enable === null) {
+            self::$w47RustFfiHandle = null;
+        }
+    }
+
+    public static function usesW47ParsedReleaseRustFfi(): bool
+    {
+        return self::$w47RustFfiOverride ?? self::W47_PARSED_RELEASE_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Seven values per name: season (-1 none), episode (-1 none, 0 season pack), airdate as
+     * YYYYMMDD (0 none), year (0 none), country as two packed bytes (0 none), clean-name token
+     * count and the FNV-1a 32 digest of the lowercase, space-joined clean name.
+     *
+     * @param  list<string>  $names
+     * @return list<int>
+     */
+    public static function w47NormalizeBatch(array $names): array
+    {
+        return self::usesW47ParsedReleaseRustFfi()
+            ? self::w47NormalizeBatchNative($names)
+            : self::w47NormalizeBatchPhp($names);
+    }
+
+    /**
+     * @param  list<string>  $names
+     * @return list<int>
+     */
+    public static function w47NormalizeBatchNative(array $names): array
+    {
+        $count = \count($names);
+        if ($count === 0) {
+            return [];
+        }
+        $blob = implode("\0", $names);
+        if (substr_count($blob, "\0") !== $count - 1 || ($ffi = self::w47RustFfi()) === null) {
+            return self::w47NormalizeBatchPhp($names);
+        }
+        try {
+            $bytes = $count * self::W47_FIELDS_PER_NAME * 8;
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, $bytes, $capacity);
+            if ($buffer === null) {
+                return self::w47NormalizeBatchPhp($names);
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w47_tv_parsed_release_batch($blob, \strlen($blob), $count, $buffer, $capacity);
+            if ($written !== $bytes) {
+                return self::w47NormalizeBatchPhp($names);
+            }
+            $values = unpack('P*', FFI::string($buffer, $bytes));
+            if ($values === false) {
+                return self::w47NormalizeBatchPhp($names);
+            }
+
+            /** @var list<int> */
+            return array_values($values);
+        } catch (Throwable) {
+            return self::w47NormalizeBatchPhp($names);
+        }
+    }
+
+    /**
+     * @param  list<string>  $names
+     * @return list<int>
+     */
+    public static function w47NormalizeBatchPhp(array $names): array
+    {
+        $out = [];
+        foreach ($names as $name) {
+            $tokens = preg_split('/[. _\-\[\]()]+/', $name, -1, PREG_SPLIT_NO_EMPTY);
+            if ($tokens === false) {
+                $tokens = [];
+            }
+            $season = -1;
+            $episode = -1;
+            $airdate = 0;
+            $year = 0;
+            $country = 0;
+            $nameOpen = true;
+            $clean = [];
+            $n = \count($tokens);
+            for ($i = 0; $i < $n;) {
+                $token = $tokens[$i];
+                $y = self::w47Year($token);
+                if ($y !== null && $airdate === 0 && $i + 2 < $n
+                    && ($month = self::w47TwoDigits($tokens[$i + 1], 12)) !== null
+                    && ($day = self::w47TwoDigits($tokens[$i + 2], 31)) !== null) {
+                    $airdate = $y * 10000 + $month * 100 + $day;
+                    $nameOpen = false;
+                    $i += 3;
+
+                    continue;
+                }
+                $i++;
+                if ($y !== null && ($clean !== [] || ! $nameOpen)) {
+                    if ($year === 0) {
+                        $year = $y;
+                    }
+                    $nameOpen = false;
+
+                    continue;
+                }
+                if ($season < 0) {
+                    if (preg_match('/\A[sS](\d{1,3})[eE](\d{1,4})/', $token, $m) === 1
+                        || preg_match('/\A(\d{1,2})[xX](\d{2,3})\z/', $token, $m) === 1) {
+                        $season = (int) $m[1];
+                        $episode = (int) $m[2];
+                        $nameOpen = false;
+
+                        continue;
+                    }
+                    if (preg_match('/\A[sS](\d{1,3})\z/', $token, $m) === 1) {
+                        $season = (int) $m[1];
+                        $episode = 0;
+                        $nameOpen = false;
+
+                        continue;
+                    }
+                }
+                if ($country === 0 && $clean !== [] && isset(self::W47_COUNTRIES[$token])) {
+                    $country = (\ord($token[0]) << 8) | \ord($token[1]);
+                    $nameOpen = false;
+
+                    continue;
+                }
+                if ($nameOpen) {
+                    $clean[] = strtolower($token);
+                }
+            }
+            array_push($out, $season, $episode, $airdate, $year, $country, \count($clean), self::w47Fnv(implode(' ', $clean)));
+        }
+
+        return $out;
+    }
+
+    private static function w47Year(string $token): ?int
+    {
+        return \strlen($token) === 4 && strspn($token, '0123456789') === 4
+            && (str_starts_with($token, '19') || str_starts_with($token, '20'))
+            ? (int) $token
+            : null;
+    }
+
+    private static function w47TwoDigits(string $token, int $max): ?int
+    {
+        if (\strlen($token) !== 2 || strspn($token, '0123456789') !== 2) {
+            return null;
+        }
+        $value = (int) $token;
+
+        return $value >= 1 && $value <= $max ? $value : null;
+    }
+
+    private static function w47Fnv(string $bytes): int
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('N', hash('fnv1a32', $bytes, true));
+
+        return $digest[1];
+    }
+
+    private static function w47RustFfi(): ?FFI
+    {
+        if (self::$w47RustFfiHandle === null) {
+            self::$w47RustFfiHandle = RustPipelineLibrary::resolveDomain('categorize_w47', self::W47_FFI_CDEF) ?? false;
+        }
+
+        return self::$w47RustFfiHandle === false ? null : self::$w47RustFfiHandle;
+    }
 }

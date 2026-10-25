@@ -35261,3 +35261,1132 @@ pub mod categorizer_pipe_safety_net_display_names_w463 {
         }
     }
 }
+
+/// Wave 47.3 batch helpers for `ParsedTvRelease`, `TvReleaseContext`, `TvProcessingPassable`,
+/// `TvProcessingResult` and `TvProcessingRunState`. Every export takes NUL-joined strings (laid
+/// out column-major where an item has several) plus, where needed, packed little-endian `i64`
+/// columns, and writes fixed-width little-endian `i64` values that PHP unpacks with
+/// `unpack('P*')`. A malformed batch returns `-1` so PHP falls back to its reference
+/// implementation; a short output buffer returns the negated byte count needed.
+pub mod tv_processing_parsed_context_passable_result_state_w473 {
+    /// Declines the batch to PHP.
+    pub const DECLINE: isize = -1;
+
+    const FNV_OFFSET: u32 = 0x811C_9DC5;
+    const FNV_PRIME: u32 = 0x0100_0193;
+    /// Independent FNV chains hashed together so their multiply latencies overlap.
+    const LANES: usize = 8;
+    /// `TvProcessingRunState::CIRCUIT_BREAKER_THRESHOLD`.
+    const BREAKER_THRESHOLD: i64 = 3;
+    /// `TvProcessingRunState::W47_BACKOFF_BASE` and `W47_BACKOFF_MAX`.
+    const BACKOFF_BASE: i64 = 60;
+    const BACKOFF_MAX: i64 = 3600;
+    /// `TvProcessingRunState::W47_MAX_TIMESTAMP`.
+    const MAX_TIMESTAMP: i64 = 1 << 52;
+    /// `TvProcessingResult::W47_MAX_RETRY_AFTER`.
+    const MAX_RETRY_AFTER: i64 = 1 << 31;
+    /// `ParsedTvRelease::W47_COUNTRIES`, in the same order.
+    const COUNTRIES: [&[u8; 2]; 20] = [
+        b"US", b"UK", b"CA", b"AU", b"NZ", b"IE", b"DE", b"FR", b"NL", b"SE", b"NO", b"DK", b"FI",
+        b"ES", b"IT", b"JP", b"KR", b"BR", b"MX", b"IN",
+    ];
+    /// `TvProcessingPassable::W47_PROVIDER_WEIGHTS`.
+    const PROVIDER_WEIGHTS: [(&[u8], i64); 6] = [
+        (b"tvdb", 95),
+        (b"tvmaze", 90),
+        (b"tmdb", 85),
+        (b"trakt", 80),
+        (b"local db", 75),
+        (b"existing", 70),
+    ];
+
+    #[inline]
+    fn fnv(mut h: u32, bytes: &[u8]) -> u32 {
+        for &b in bytes {
+            h = (h ^ u32::from(b)).wrapping_mul(FNV_PRIME);
+        }
+        h
+    }
+
+    /// Below this mean span length out-of-order execution already overlaps neighbouring chains.
+    const LANE_MIN_MEAN_LEN: usize = 48;
+
+    /// FNV-1a 32 of every `(start, end)` span of `arena`. Long spans are hashed [`LANES`] at a
+    /// time in length order, so each group shares a long common prefix and only short tails run
+    /// serially.
+    fn fnv_spans(arena: &[u8], spans: &[(usize, usize)]) -> Vec<u32> {
+        let total: usize = spans.iter().map(|&(a, b)| b - a).sum();
+        if total < LANE_MIN_MEAN_LEN * spans.len() {
+            return spans
+                .iter()
+                .map(|&(a, b)| fnv(FNV_OFFSET, &arena[a..b]))
+                .collect();
+        }
+        let mut out = vec![FNV_OFFSET; spans.len()];
+        let mut order: Vec<u32> = (0..spans.len() as u32).collect();
+        order.sort_unstable_by_key(|&i| {
+            let (a, b) = spans[i as usize];
+            b - a
+        });
+        for group in order.chunks(LANES) {
+            let mut lanes: [&[u8]; LANES] = [&[]; LANES];
+            for (lane, &i) in lanes.iter_mut().zip(group) {
+                let (a, b) = spans[i as usize];
+                *lane = &arena[a..b];
+            }
+            // Group spans are sorted, so the first is the shortest.
+            let common = lanes[0].len();
+            let mut h = [FNV_OFFSET; LANES];
+            if group.len() == LANES {
+                let heads: [&[u8]; LANES] = lanes.map(|l| &l[..common]);
+                #[allow(clippy::needless_range_loop)]
+                for j in 0..common {
+                    for l in 0..LANES {
+                        h[l] = (h[l] ^ u32::from(heads[l][j])).wrapping_mul(FNV_PRIME);
+                    }
+                }
+                for l in 0..LANES {
+                    h[l] = fnv(h[l], &lanes[l][common..]);
+                }
+            } else {
+                for l in 0..group.len() {
+                    h[l] = fnv(FNV_OFFSET, lanes[l]);
+                }
+            }
+            for (l, &i) in group.iter().enumerate() {
+                out[i as usize] = h[l];
+            }
+        }
+        out
+    }
+
+    /// Appends PHP `(string) $int`.
+    fn push_int(arena: &mut Vec<u8>, value: i64) {
+        let mut buf = [0u8; 20];
+        let mut i = buf.len();
+        let mut v = value.unsigned_abs();
+        loop {
+            i -= 1;
+            buf[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        if value < 0 {
+            arena.push(b'-');
+        }
+        arena.extend_from_slice(&buf[i..]);
+    }
+
+    /// Splits `blob` on NUL into exactly `count` pieces (an empty blob holds no pieces).
+    fn split_exact(blob: &[u8], count: usize) -> Option<Vec<&[u8]>> {
+        if count == 0 {
+            return blob.is_empty().then(Vec::new);
+        }
+        let mut parts = Vec::with_capacity(count);
+        parts.extend(blob.split(|&b| b == 0));
+        (parts.len() == count).then_some(parts)
+    }
+
+    /// Reads the whole buffer as little-endian `i64`s.
+    fn read_ints(bytes: &[u8]) -> Option<Vec<i64>> {
+        let (chunks, rest) = bytes.as_chunks::<8>();
+        rest.is_empty()
+            .then(|| chunks.iter().map(|c| i64::from_le_bytes(*c)).collect())
+    }
+
+    /// Marks the `null_count` item indices that follow `values[at..]`; returns the next offset.
+    fn null_mask(
+        values: &[i64],
+        at: usize,
+        null_count: i64,
+        count: usize,
+    ) -> Option<(Vec<bool>, usize)> {
+        let n = usize::try_from(null_count).ok()?;
+        let end = at.checked_add(n)?;
+        let mut mask = vec![false; count];
+        for &i in values.get(at..end)? {
+            *mask.get_mut(usize::try_from(i).ok()?)? = true;
+        }
+        Some((mask, end))
+    }
+
+    /// # Safety
+    /// `ptr` must be valid for `len` readable bytes unless it is null with `len == 0`.
+    #[inline]
+    unsafe fn input<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null() {
+            return (len == 0).then_some(&[]);
+        }
+        if len > isize::MAX as usize {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
+    /// # Safety
+    /// `out` must be valid for `cap` writable bytes and must not overlap any input.
+    unsafe fn emit(values: Option<Vec<i64>>, out: *mut u8, cap: usize) -> isize {
+        let Some(values) = values else {
+            return DECLINE;
+        };
+        let needed = values.len() * 8;
+        if needed == 0 || out.is_null() {
+            return DECLINE;
+        }
+        if cap < needed {
+            return -(needed as isize);
+        }
+        let dst = unsafe { std::slice::from_raw_parts_mut(out, needed) };
+        for (chunk, v) in dst.as_chunks_mut::<8>().0.iter_mut().zip(&values) {
+            chunk.copy_from_slice(&v.to_le_bytes());
+        }
+        needed as isize
+    }
+
+    fn all_digits(t: &[u8]) -> bool {
+        t.iter().all(u8::is_ascii_digit)
+    }
+
+    fn digits_value(t: &[u8]) -> i64 {
+        t.iter().fold(0i64, |a, &b| a * 10 + i64::from(b - b'0'))
+    }
+
+    fn year_of(t: &[u8]) -> Option<i64> {
+        (t.len() == 4 && all_digits(t) && (t.starts_with(b"19") || t.starts_with(b"20")))
+            .then(|| digits_value(t))
+    }
+
+    fn bounded_two_digits(t: &[u8], max: i64) -> Option<i64> {
+        if t.len() != 2 || !all_digits(t) {
+            return None;
+        }
+        let v = digits_value(t);
+        (1..=max).contains(&v).then_some(v)
+    }
+
+    /// `/\A[sS](\d{1,3})[eE](\d{1,4})/`, `/\A(\d{1,2})[xX](\d{2,3})\z/` or `/\A[sS]\d{1,3}\z/`
+    /// (season pack, episode 0).
+    fn episode_marker(t: &[u8]) -> Option<(i64, i64)> {
+        if let Some((&first, rest)) = t.split_first()
+            && (first == b's' || first == b'S')
+        {
+            let run = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+            if (1..=3).contains(&run) {
+                if run == rest.len() {
+                    return Some((digits_value(rest), 0));
+                }
+                if matches!(rest[run], b'e' | b'E') {
+                    let tail = &rest[run + 1..];
+                    let ep = tail
+                        .iter()
+                        .take(4)
+                        .take_while(|b| b.is_ascii_digit())
+                        .count();
+                    if ep > 0 {
+                        return Some((digits_value(&rest[..run]), digits_value(&tail[..ep])));
+                    }
+                }
+            }
+            return None;
+        }
+        let run = t.iter().take_while(|b| b.is_ascii_digit()).count();
+        if (1..=2).contains(&run) && t.len() > run && matches!(t[run], b'x' | b'X') {
+            let tail = &t[run + 1..];
+            if (2..=3).contains(&tail.len()) && all_digits(tail) {
+                return Some((digits_value(&t[..run]), digits_value(tail)));
+            }
+        }
+        None
+    }
+
+    fn country_of(t: &[u8]) -> Option<i64> {
+        let pair: &[u8; 2] = t.try_into().ok()?;
+        COUNTRIES
+            .contains(&pair)
+            .then(|| (i64::from(pair[0]) << 8) | i64::from(pair[1]))
+    }
+
+    #[inline]
+    fn is_name_separator(b: u8) -> bool {
+        matches!(b, b'.' | b' ' | b'_' | b'-' | b'[' | b']' | b'(' | b')')
+    }
+
+    /// `ParsedTvRelease::w47NormalizeBatchPhp()` for one name: season, episode, airdate, year,
+    /// country and clean-name token count. The lowercase clean name goes to `arena`.
+    fn parsed_release(
+        name: &[u8],
+        tokens: &mut Vec<(usize, usize)>,
+        arena: &mut Vec<u8>,
+    ) -> [i64; 6] {
+        tokens.clear();
+        let mut start = None;
+        for (p, &b) in name.iter().enumerate() {
+            match (is_name_separator(b), start) {
+                (true, Some(s)) => {
+                    tokens.push((s, p));
+                    start = None;
+                }
+                (false, None) => start = Some(p),
+                _ => {}
+            }
+        }
+        if let Some(s) = start {
+            tokens.push((s, name.len()));
+        }
+        let token = |i: usize| &name[tokens[i].0..tokens[i].1];
+        let (mut season, mut episode, mut airdate, mut year, mut country) = (-1i64, -1i64, 0, 0, 0);
+        let (mut name_open, mut token_count) = (true, 0i64);
+        let mut i = 0;
+        while i < tokens.len() {
+            let t = token(i);
+            let y = year_of(t);
+            if let Some(y) = y
+                && airdate == 0
+                && i + 2 < tokens.len()
+                && let (Some(m), Some(d)) = (
+                    bounded_two_digits(token(i + 1), 12),
+                    bounded_two_digits(token(i + 2), 31),
+                )
+            {
+                airdate = y * 10_000 + m * 100 + d;
+                name_open = false;
+                i += 3;
+                continue;
+            }
+            i += 1;
+            if let Some(y) = y
+                && (token_count > 0 || !name_open)
+            {
+                if year == 0 {
+                    year = y;
+                }
+                name_open = false;
+                continue;
+            }
+            if season < 0
+                && let Some((s, e)) = episode_marker(t)
+            {
+                season = s;
+                episode = e;
+                name_open = false;
+                continue;
+            }
+            if country == 0
+                && token_count > 0
+                && let Some(c) = country_of(t)
+            {
+                country = c;
+                name_open = false;
+                continue;
+            }
+            if name_open {
+                if token_count > 0 {
+                    arena.push(b' ');
+                }
+                arena.extend(t.iter().map(u8::to_ascii_lowercase));
+                token_count += 1;
+            }
+        }
+        [season, episode, airdate, year, country, token_count]
+    }
+
+    fn parsed_release_batch(blob: &[u8], count: usize) -> Option<Vec<i64>> {
+        let names = split_exact(blob, count)?;
+        let mut out = Vec::with_capacity(count * 7);
+        let mut arena = Vec::with_capacity(blob.len());
+        let mut spans = Vec::with_capacity(count);
+        let mut tokens = Vec::new();
+        for name in names {
+            let start = arena.len();
+            out.extend(parsed_release(name, &mut tokens, &mut arena));
+            out.push(0);
+            spans.push((start, arena.len()));
+        }
+        for (i, h) in fnv_spans(&arena, &spans).into_iter().enumerate() {
+            out[i * 7 + 6] = i64::from(h);
+        }
+        Some(out)
+    }
+
+    /// `TvReleaseContext::w47EligibilityBatchPhp()`: ints are column-major release id, groups id,
+    /// categories id, videos id and episode id.
+    fn release_context_batch(blob: &[u8], ints: &[u8], count: usize) -> Option<Vec<i64>> {
+        let names = split_exact(blob, count)?;
+        let ints = read_ints(ints)?;
+        if ints.len() != count.checked_mul(5)? {
+            return None;
+        }
+        let mut out = Vec::with_capacity(count * 4 + 2);
+        let (mut eligible, mut score_sum) = (0i64, 0i64);
+        let mut arena = Vec::with_capacity(blob.len());
+        let mut spans = Vec::with_capacity(count);
+        for (i, name) in names.iter().enumerate() {
+            let (release_id, groups_id, categories_id, videos_id, episodes_id) = (
+                ints[i],
+                ints[count + i],
+                ints[2 * count + i],
+                ints[3 * count + i],
+                ints[4 * count + i],
+            );
+            let start = arena.len();
+            let mut pending = false;
+            let mut non_ascii = false;
+            for &b in *name {
+                if matches!(b, b'.' | b'_' | b' ' | b'\t') {
+                    pending = true;
+                    continue;
+                }
+                if pending && arena.len() > start {
+                    arena.push(b' ');
+                }
+                pending = false;
+                non_ascii |= b >= 0x80;
+                arena.push(b.to_ascii_lowercase());
+            }
+            let norm = &arena[start..];
+            let marker = norm.iter().enumerate().any(|(p, &b)| {
+                if b != b's' || (p > 0 && norm[p - 1] != b' ') {
+                    return false;
+                }
+                let rest = &norm[p + 1..];
+                let s = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+                s > 0
+                    && rest.get(s) == Some(&b'e')
+                    && rest.get(s + 1).is_some_and(u8::is_ascii_digit)
+            });
+            let len = norm.len() as i64;
+            spans.push((start, arena.len()));
+            let short = len < 5;
+            let flags = i64::from((5000..=5999).contains(&categories_id))
+                | (i64::from(videos_id > 0) << 1)
+                | (i64::from(episodes_id > 0) << 2)
+                | (i64::from(marker) << 3)
+                | (i64::from(short) << 4)
+                | (i64::from(non_ascii) << 5)
+                | (i64::from(release_id <= 0) << 6)
+                | (i64::from(groups_id <= 0) << 7);
+            let score = if flags & 1 == 0 || flags & 64 != 0 {
+                0
+            } else {
+                let mut score = 50;
+                score += if marker { 30 } else { 0 };
+                score -= if short { 40 } else { 0 };
+                score += if videos_id > 0 { 0 } else { 10 };
+                score -= if episodes_id > 0 { 50 } else { 0 };
+                score -= if non_ascii { 10 } else { 0 };
+                score -= if groups_id <= 0 { 5 } else { 0 };
+                score.clamp(0, 100)
+            };
+            eligible += i64::from(score >= 50);
+            score_sum += score;
+            out.extend([len, 0, flags, score]);
+        }
+        for (i, h) in fnv_spans(&arena, &spans).into_iter().enumerate() {
+            out[i * 4 + 1] = i64::from(h);
+        }
+        out.extend([eligible, score_sum]);
+        Some(out)
+    }
+
+    /// `TvProcessingPassable::w47Weight()`.
+    fn provider_weight(provider: &[u8]) -> i64 {
+        if provider.is_empty() {
+            return 0;
+        }
+        PROVIDER_WEIGHTS
+            .iter()
+            .find(|(name, _)| provider.eq_ignore_ascii_case(name))
+            .map_or(50, |&(_, w)| w)
+    }
+
+    /// `TvProcessingPassable::w47TraceBatchPhp()`. Strings are every show provider, then every
+    /// matched provider, then all transient providers flattened. Ints are the parsed-null and
+    /// retry-null counts, then columns parse failed, season pack, video id, episode id, transient
+    /// count and max retry-after, then the null-parsed and null-retry item indices.
+    fn passable_batch(blob: &[u8], ints: &[u8], count: usize) -> Option<Vec<i64>> {
+        let ints = read_ints(ints)?;
+        let cols = 2usize.checked_add(count.checked_mul(6)?)?;
+        if ints.len() < cols {
+            return None;
+        }
+        let col = |c: usize, i: usize| ints[2 + c * count + i];
+        let (unparsed, at) = null_mask(&ints, cols, ints[0], count)?;
+        let (no_retry, end) = null_mask(&ints, at, ints[1], count)?;
+        if end != ints.len() {
+            return None;
+        }
+        let mut transient_total = 0usize;
+        for i in 0..count {
+            transient_total = transient_total.checked_add(usize::try_from(col(4, i)).ok()?)?;
+        }
+        let strings = split_exact(blob, count.checked_mul(2)?.checked_add(transient_total)?)?;
+        let mut out = Vec::with_capacity(count * 4 + 8);
+        let mut outcomes = [0i64; 6];
+        let (mut confidence_sum, mut max_retry) = (0i64, -1i64);
+        let mut arena = Vec::with_capacity(blob.len() + count * 4);
+        let mut spans = Vec::with_capacity(count);
+        let mut next = 2 * count;
+        let mut distinct: Vec<&[u8]> = Vec::new();
+        for i in 0..count {
+            let (show, matched) = (strings[i], strings[count + i]);
+            let n = col(4, i) as usize;
+            let transients = &strings[next..next + n];
+            next += n;
+            let (video_id, episode_id) = (col(2, i), col(3, i));
+            let outcome: i64 = if col(0, i) != 0 || unparsed[i] {
+                0
+            } else if episode_id > 0 {
+                1
+            } else if col(1, i) != 0 && video_id > 0 {
+                2
+            } else if video_id > 0 {
+                3
+            } else if n > 0 {
+                4
+            } else {
+                5
+            };
+            distinct.clear();
+            for t in transients {
+                if !distinct.contains(t) {
+                    distinct.push(t);
+                }
+            }
+            let distinct_count = distinct.len() as i64;
+            let confidence = match outcome {
+                1 => provider_weight(matched) - 5 * distinct_count,
+                2 => provider_weight(matched) - 15 - 5 * distinct_count,
+                3 => provider_weight(show) / 2 - 5 * distinct_count,
+                4 => 10,
+                _ => 0,
+            }
+            .clamp(0, 100);
+            let start = arena.len();
+            arena.push(b'0' + outcome as u8);
+            arena.extend_from_slice(show);
+            arena.push(0x1E);
+            arena.extend_from_slice(matched);
+            arena.push(0x1E);
+            for (k, t) in transients.iter().enumerate() {
+                if k > 0 {
+                    arena.push(0x1F);
+                }
+                arena.extend_from_slice(t);
+            }
+            spans.push((start, arena.len()));
+            outcomes[outcome as usize] += 1;
+            confidence_sum += confidence;
+            max_retry = max_retry.max(if no_retry[i] { -1 } else { col(5, i) });
+            out.extend([outcome, confidence, distinct_count, 0]);
+        }
+        for (i, h) in fnv_spans(&arena, &spans).into_iter().enumerate() {
+            out[i * 4 + 3] = i64::from(h);
+        }
+        out.extend(outcomes);
+        out.extend([confidence_sum, max_retry]);
+        Some(out)
+    }
+
+    /// `TvProcessingResult::W47_STATUS_CODES`.
+    fn status_code(status: &[u8]) -> i64 {
+        match status {
+            b"matched" => 1,
+            b"season_pack" => 2,
+            b"episode_missing" => 3,
+            b"not_found" => 4,
+            b"parse_failed" => 5,
+            b"transient" => 6,
+            b"skipped" => 7,
+            b"pending" => 8,
+            _ => 0,
+        }
+    }
+
+    /// `TvProcessingResult::w47AggregateBatchPhp()`. Strings are every status, then every
+    /// provider. Ints are the video-null, episode-null and retry-null counts, then columns video
+    /// id, episode id, retry-after and transient, then the three null index lists.
+    fn result_batch(blob: &[u8], ints: &[u8], count: usize) -> Option<Vec<i64>> {
+        let strings = split_exact(blob, count.checked_mul(2)?)?;
+        let ints = read_ints(ints)?;
+        let cols = 3usize.checked_add(count.checked_mul(4)?)?;
+        if ints.len() < cols {
+            return None;
+        }
+        let col = |c: usize, i: usize| ints[3 + c * count + i];
+        let (no_video, at) = null_mask(&ints, cols, ints[0], count)?;
+        let (no_episode, at) = null_mask(&ints, at, ints[1], count)?;
+        let (no_retry, end) = null_mask(&ints, at, ints[2], count)?;
+        if end != ints.len() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(count * 2 + 14);
+        let mut codes = [0i64; 9];
+        let (mut matched_show, mut transient, mut max_retry, mut retry_sum) =
+            (0i64, 0i64, -1i64, 0i64);
+        let mut shows: Vec<i64> = Vec::with_capacity(count);
+        let mut arena = Vec::with_capacity(blob.len() + count * 24);
+        let mut spans = Vec::with_capacity(count);
+        for i in 0..count {
+            let (status, provider) = (strings[i], strings[count + i]);
+            let (video_id, episode_id) = (col(0, i), col(1, i));
+            let code = status_code(status);
+            let start = arena.len();
+            arena.extend_from_slice(status);
+            arena.push(0x1F);
+            arena.extend_from_slice(provider);
+            arena.push(0x1F);
+            if !no_video[i] {
+                push_int(&mut arena, video_id);
+            }
+            arena.push(0x1F);
+            if !no_episode[i] {
+                push_int(&mut arena, episode_id);
+            }
+            spans.push((start, arena.len()));
+            codes[code as usize] += 1;
+            if !no_video[i] && video_id > 0 {
+                matched_show += i64::from(code == 1);
+                shows.push(video_id);
+            }
+            transient += i64::from(col(3, i) != 0);
+            if !no_retry[i] {
+                let r = col(2, i).clamp(0, MAX_RETRY_AFTER);
+                max_retry = max_retry.max(r);
+                retry_sum += r;
+            }
+            out.extend([code, 0]);
+        }
+        for (i, h) in fnv_spans(&arena, &spans).into_iter().enumerate() {
+            out[i * 2 + 1] = i64::from(h);
+        }
+        shows.sort_unstable();
+        shows.dedup();
+        out.extend(codes);
+        out.extend([
+            matched_show,
+            shows.len() as i64,
+            transient,
+            max_retry,
+            retry_sum,
+        ]);
+        Some(out)
+    }
+
+    /// `TvProcessingRunState::w47BackoffBatchPhp()`. Strings are every provider, then every
+    /// episode key. Ints are `now`, then columns video id, failures and last-failure time.
+    fn run_state_batch(blob: &[u8], ints: &[u8], count: usize) -> Option<Vec<i64>> {
+        let strings = split_exact(blob, count.checked_mul(2)?)?;
+        let ints = read_ints(ints)?;
+        if ints.len() != count.checked_mul(3)?.checked_add(1)? {
+            return None;
+        }
+        let col = |c: usize, i: usize| ints[1 + c * count + i];
+        let now = ints[0].clamp(0, MAX_TIMESTAMP);
+        let mut out = Vec::with_capacity(count * 4 + 3);
+        let (mut open, mut max_remaining) = (0i64, 0i64);
+        let mut arena = Vec::with_capacity(blob.len() + count * 24);
+        let mut spans = Vec::with_capacity(count);
+        let mut providers: Vec<(usize, usize)> = Vec::with_capacity(count);
+        for i in 0..count {
+            let (provider, episode_key) = (strings[i], strings[count + i]);
+            let (video_id, failures, last) = (
+                col(0, i),
+                col(1, i).max(0),
+                col(2, i).clamp(0, MAX_TIMESTAMP),
+            );
+            let start = arena.len();
+            arena.extend(provider.iter().map(u8::to_ascii_lowercase));
+            providers.push((start, arena.len()));
+            arena.push(b':');
+            push_int(&mut arena, video_id);
+            arena.push(b':');
+            arena.extend_from_slice(episode_key);
+            spans.push((start, arena.len()));
+            let window = if failures < BREAKER_THRESHOLD {
+                0
+            } else if failures - BREAKER_THRESHOLD >= 6 {
+                BACKOFF_MAX
+            } else {
+                BACKOFF_BASE << (failures - BREAKER_THRESHOLD)
+            };
+            let retry_at = if window > 0 { last + window } else { 0 };
+            let remaining = (retry_at - now).max(0);
+            open += i64::from(remaining > 0);
+            max_remaining = max_remaining.max(remaining);
+            out.extend([0, window, retry_at, remaining]);
+        }
+        for (i, h) in fnv_spans(&arena, &spans).into_iter().enumerate() {
+            out[i * 4] = i64::from(h);
+        }
+        let mut names: Vec<&[u8]> = providers.iter().map(|&(a, b)| &arena[a..b]).collect();
+        names.sort_unstable();
+        names.dedup();
+        out.extend([open, max_remaining, names.len() as i64]);
+        Some(out)
+    }
+
+    /// # Safety
+    /// `blob` must be valid for `blob_len` readable bytes and `out` for `out_cap` writable bytes,
+    /// not overlapping the input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w47_tv_parsed_release_batch(
+        blob: *const u8,
+        blob_len: usize,
+        count: usize,
+        out: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        let values = unsafe { input(blob, blob_len) }.and_then(|b| parsed_release_batch(b, count));
+        unsafe { emit(values, out, out_cap) }
+    }
+
+    /// A batch body over the string blob, the packed `i64` columns and the item count.
+    type Batch = fn(&[u8], &[u8], usize) -> Option<Vec<i64>>;
+
+    /// Shared body for the exports that take strings plus packed `i64` columns.
+    ///
+    /// # Safety
+    /// As for [`nntmux_w47_tv_release_context_batch`].
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn with_ints(
+        blob: *const u8,
+        blob_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut u8,
+        out_cap: usize,
+        run: Batch,
+    ) -> isize {
+        let values = match unsafe { (input(blob, blob_len), input(ints, ints_len)) } {
+            (Some(b), Some(i)) => run(b, i, count),
+            _ => None,
+        };
+        unsafe { emit(values, out, out_cap) }
+    }
+
+    /// # Safety
+    /// `blob`/`ints` must be valid for their lengths in readable bytes and `out` for `out_cap`
+    /// writable bytes, not overlapping either input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w47_tv_release_context_batch(
+        blob: *const u8,
+        blob_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_ints(
+                blob,
+                blob_len,
+                ints,
+                ints_len,
+                count,
+                out,
+                out_cap,
+                release_context_batch,
+            )
+        }
+    }
+
+    /// # Safety
+    /// As for [`nntmux_w47_tv_release_context_batch`].
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w47_tv_passable_trace_batch(
+        blob: *const u8,
+        blob_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_ints(
+                blob,
+                blob_len,
+                ints,
+                ints_len,
+                count,
+                out,
+                out_cap,
+                passable_batch,
+            )
+        }
+    }
+
+    /// # Safety
+    /// As for [`nntmux_w47_tv_release_context_batch`].
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w47_tv_result_aggregate_batch(
+        blob: *const u8,
+        blob_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_ints(
+                blob,
+                blob_len,
+                ints,
+                ints_len,
+                count,
+                out,
+                out_cap,
+                result_batch,
+            )
+        }
+    }
+
+    /// # Safety
+    /// As for [`nntmux_w47_tv_release_context_batch`].
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w47_tv_run_state_backoff_batch(
+        blob: *const u8,
+        blob_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_ints(
+                blob,
+                blob_len,
+                ints,
+                ints_len,
+                count,
+                out,
+                out_cap,
+                run_state_batch,
+            )
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::ptr;
+
+        fn packed(values: &[i64]) -> Vec<u8> {
+            values.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+
+        fn digest(bytes: &[u8]) -> i64 {
+            i64::from(fnv(FNV_OFFSET, bytes))
+        }
+
+        fn parsed(name: &[u8]) -> Vec<i64> {
+            parsed_release_batch(name, 1).unwrap()
+        }
+
+        #[test]
+        fn w473_fnv_lanes_and_int_formatting() {
+            assert_eq!(fnv(FNV_OFFSET, b""), 0x811C_9DC5);
+            assert_eq!(fnv(FNV_OFFSET, b"a"), 0xE40C_292C);
+            let arena: Vec<u8> = (0..=255u8).cycle().take(4000).collect();
+            let spans: Vec<(usize, usize)> =
+                (0..37).map(|i| (i * 7, i * 7 + (i * 53) % 300)).collect();
+            let expected: Vec<u32> = spans
+                .iter()
+                .map(|&(a, b)| fnv(FNV_OFFSET, &arena[a..b]))
+                .collect();
+            assert_eq!(fnv_spans(&arena, &spans), expected);
+            assert_eq!(fnv_spans(&arena, &spans[..3]), expected[..3]);
+            let short: Vec<(usize, usize)> = (0..20).map(|i| (i, i + i % 9)).collect();
+            let expected: Vec<u32> = short
+                .iter()
+                .map(|&(a, b)| fnv(FNV_OFFSET, &arena[a..b]))
+                .collect();
+            assert_eq!(fnv_spans(&arena, &short), expected);
+            assert!(fnv_spans(&arena, &[]).is_empty());
+            for (value, text) in [
+                (-120, "-120"),
+                (0, "0"),
+                (i64::MIN, "-9223372036854775808"),
+                (i64::MAX, "9223372036854775807"),
+            ] {
+                let mut arena = Vec::new();
+                push_int(&mut arena, value);
+                assert_eq!(arena, text.as_bytes());
+            }
+        }
+
+        #[test]
+        fn w473_parsed_release_tokens() {
+            assert_eq!(
+                parsed(b"The.Office.US.S05E14.720p.HDTV-GRP"),
+                [5, 14, 0, 0, (85 << 8) | 83, 2, digest(b"the office")]
+            );
+            assert_eq!(
+                parsed(b"Show Name 2024 01 15 [1080p]"),
+                [-1, -1, 20_240_115, 0, 0, 2, digest(b"show name")]
+            );
+            assert_eq!(
+                parsed(b"1923.2022.S01.COMPLETE"),
+                [1, 0, 0, 2022, 0, 1, digest(b"1923")]
+            );
+            assert_eq!(
+                parsed(b"Show_3x07_s0123e45678"),
+                [3, 7, 0, 0, 0, 1, digest(b"show")]
+            );
+            assert_eq!(parsed(b""), [-1, -1, 0, 0, 0, 0, digest(b"")]);
+            assert_eq!(episode_marker(b"s1234e5"), None);
+            assert_eq!(episode_marker(b"S01E"), None);
+            assert_eq!(episode_marker(b"S01E123456"), Some((1, 1234)));
+            assert_eq!(episode_marker(b"123x45"), None);
+            assert_eq!(episode_marker(b"12x4567"), None);
+            assert_eq!(country_of(b"us"), None);
+            assert!(parsed_release_batch(b"a\0b", 3).is_none());
+            assert_eq!(parsed_release_batch(b"", 0), Some(Vec::new()));
+            assert!(parsed_release_batch(b"x", 0).is_none());
+            let many = parsed_release_batch(b"A.S01E01\0B.B.S02E02\0\0C", 4).unwrap();
+            assert_eq!(many.len(), 28);
+            assert_eq!(many[13], digest(b"b b"));
+            assert_eq!(many[27], digest(b"c"));
+        }
+
+        #[test]
+        fn w473_release_context_scores() {
+            let names = b"  Show.Name.S01E02.720p \0x\0Caf\xC3\xA9 S1E1\0Movie.2020";
+            let ints = packed(&[
+                1, 2, 3, 0, 10, 0, 10, 10, 5030, 5040, 5000, 2000, 0, 7, 0, 0, 0, 0, 9, 0,
+            ]);
+            let out = release_context_batch(names, &ints, 4).unwrap();
+            assert_eq!(
+                out,
+                [
+                    21,
+                    digest(b"show name s01e02 720p"),
+                    1 | 8,
+                    90,
+                    1,
+                    digest(b"x"),
+                    1 | 2 | 16 | 128,
+                    5,
+                    10,
+                    digest(b"caf\xC3\xA9 s1e1"),
+                    1 | 4 | 8 | 32,
+                    30,
+                    10,
+                    digest(b"movie 2020"),
+                    64,
+                    0,
+                    1,
+                    125,
+                ]
+            );
+            assert!(release_context_batch(names, &ints[8..], 4).is_none());
+            assert_eq!(release_context_batch(b"", b"", 0), Some(vec![0, 0]));
+        }
+
+        #[test]
+        fn w473_passable_trace() {
+            // Show providers, matched providers, then flattened transients.
+            let blob = b"existing\0existing\0\0\0TVDB\0\0\0\0tvmaze\0tvmaze\0TMDB\0a";
+            #[rustfmt::skip]
+            let ints = packed(&[
+                1, 2,
+                0, 0, 0, 0, // parse failed
+                0, 0, 0, 0, // season pack
+                9, 4, 0, 0, // video id
+                77, 0, 0, 0, // episode id
+                0, 3, 1, 0, // transient count
+                0, 30, 5, 0, // max retry-after
+                3, // null parsed
+                0, 3, // null retry
+            ]);
+            let out = passable_batch(blob, &ints, 4).unwrap();
+            assert_eq!(out[..4], [1, 95, 0, digest(b"1existing\x1ETVDB\x1E")]);
+            assert_eq!(
+                out[4..8],
+                [
+                    3,
+                    25,
+                    2,
+                    digest(b"3existing\x1E\x1Etvmaze\x1Ftvmaze\x1FTMDB")
+                ]
+            );
+            assert_eq!(out[8..11], [4, 10, 1]);
+            assert_eq!(out[12..15], [0, 0, 0]);
+            assert_eq!(out[16..], [1, 1, 0, 1, 1, 0, 130, 30]);
+            assert_eq!(
+                passable_batch(b"", &packed(&[0, 0]), 0),
+                Some(vec![0, 0, 0, 0, 0, 0, 0, -1])
+            );
+            let one = |extra: &[i64]| {
+                let mut v = vec![0, 0, 0, 0, 0, 0, 0, -1];
+                v.extend(extra);
+                v
+            };
+            assert!(passable_batch(b"\0", &packed(&one(&[])), 1).is_some());
+            assert!(passable_batch(b"\0\0", &packed(&one(&[])), 1).is_none());
+            let mut bad = one(&[]);
+            bad[6] = -1;
+            assert!(passable_batch(b"\0", &packed(&bad), 1).is_none());
+            let mut idx = one(&[1]);
+            idx[0] = 1;
+            assert!(passable_batch(b"\0", &packed(&idx), 1).is_none());
+            assert!(passable_batch(b"\0", &packed(&one(&[0])), 1).is_none());
+        }
+
+        #[test]
+        fn w473_result_aggregate() {
+            let blob = b"matched\0transient\0matched\0weird\0TVDB\0\0TMDB\0";
+            #[rustfmt::skip]
+            let ints = packed(&[
+                1, 2, 2,
+                12, 0, 12, -4, // video id
+                34, 0, 35, 0, // episode id
+                0, 30, 0, 0, // retry-after
+                0, 1, 0, 0, // transient
+                1, // null video
+                1, 3, // null episode
+                0, 2, // null retry
+            ]);
+            let out = result_batch(blob, &ints, 4).unwrap();
+            assert_eq!(out[0], 1);
+            assert_eq!(out[1], digest(b"matched\x1FTVDB\x1F12\x1F34"));
+            assert_eq!(out[3], digest(b"transient\x1F\x1F\x1F"));
+            assert_eq!(out[7], digest(b"weird\x1F\x1F-4\x1F"));
+            assert_eq!(out[8..17], [1, 2, 0, 0, 0, 0, 1, 0, 0]);
+            assert_eq!(out[17..], [2, 1, 1, 30, 30]);
+            assert!(result_batch(b"a\0b\0c", &packed(&[0, 0, 0, 0, 0, 0, 0]), 1).is_none());
+            assert!(result_batch(b"a\0", &packed(&[0, 0, 1, 0, 0, 0, 0, 5]), 1).is_none());
+            assert!(result_batch(b"a\0", &packed(&[0, 0, 0, 0, 0, 0, 0, 0]), 1).is_none());
+        }
+
+        #[test]
+        fn w473_run_state_backoff() {
+            let blob = b"TVDB\0tvdb\0Trakt\0S01E01\0\0x";
+            let ints = packed(&[1000, 5, -2, 9, 4, 0, 99, 900, 0, 990]);
+            let out = run_state_batch(blob, &ints, 3).unwrap();
+            assert_eq!(out[..4], [digest(b"tvdb:5:S01E01"), 120, 1020, 20]);
+            assert_eq!(out[4..8], [digest(b"tvdb:-2:"), 0, 0, 0]);
+            assert_eq!(out[8..12], [digest(b"trakt:9:x"), 3600, 4590, 3590]);
+            assert_eq!(out[12..], [2, 3590, 2]);
+            assert!(run_state_batch(blob, &ints[8..], 3).is_none());
+            assert!(run_state_batch(b"a", &packed(&[0, 0, 0, 0]), 1).is_none());
+            assert_eq!(run_state_batch(b"", &packed(&[5]), 0), Some(vec![0, 0, 0]));
+        }
+
+        #[test]
+        fn w473_exports_validate_inputs_and_capacity() {
+            let mut out = [0u8; 64];
+            let o = out.as_mut_ptr();
+            unsafe {
+                assert_eq!(
+                    nntmux_w47_tv_parsed_release_batch(b"S01E02".as_ptr(), 6, 1, o, 64),
+                    56
+                );
+                assert_eq!(out[..8], 1i64.to_le_bytes());
+                assert_eq!(
+                    nntmux_w47_tv_parsed_release_batch(b"x".as_ptr(), 1, 1, o, 8),
+                    -56
+                );
+                assert_eq!(
+                    nntmux_w47_tv_parsed_release_batch(ptr::null(), 0, 0, o, 64),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w47_tv_parsed_release_batch(ptr::null(), 4, 1, o, 64),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w47_tv_parsed_release_batch(b"x".as_ptr(), 1, 1, ptr::null_mut(), 64),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w47_tv_parsed_release_batch(b"x".as_ptr(), usize::MAX, 1, o, 64),
+                    DECLINE
+                );
+                let ints = packed(&[0, 1, 0, 0]);
+                assert_eq!(
+                    nntmux_w47_tv_run_state_backoff_batch(
+                        b"a\0b".as_ptr(),
+                        3,
+                        ints.as_ptr(),
+                        32,
+                        1,
+                        o,
+                        64
+                    ),
+                    56
+                );
+                assert_eq!(
+                    nntmux_w47_tv_run_state_backoff_batch(
+                        b"a\0b".as_ptr(),
+                        3,
+                        ints.as_ptr(),
+                        31,
+                        1,
+                        o,
+                        64
+                    ),
+                    DECLINE
+                );
+                let result = packed(&[0, 0, 0, 0, 0, 0, 0]);
+                assert_eq!(
+                    nntmux_w47_tv_result_aggregate_batch(
+                        b"a\0"[..].as_ptr(),
+                        2,
+                        result.as_ptr(),
+                        56,
+                        1,
+                        o,
+                        64
+                    ),
+                    -(16 * 8)
+                );
+                let passable = packed(&[0, 0, 0, 0, 0, 0, 0, -1]);
+                assert_eq!(
+                    nntmux_w47_tv_passable_trace_batch(
+                        b"\0"[..].as_ptr(),
+                        1,
+                        passable.as_ptr(),
+                        64,
+                        1,
+                        o,
+                        64
+                    ),
+                    -96
+                );
+                let ctx = packed(&[1, 1, 5000, 0, 0]);
+                assert_eq!(
+                    nntmux_w47_tv_release_context_batch(
+                        b"abc".as_ptr(),
+                        3,
+                        ctx.as_ptr(),
+                        40,
+                        1,
+                        o,
+                        64
+                    ),
+                    48
+                );
+                assert_eq!(out[16..32], packed(&[17, 20])[..]);
+                assert_eq!(
+                    nntmux_w47_tv_release_context_batch(
+                        b"abc".as_ptr(),
+                        3,
+                        ptr::null(),
+                        40,
+                        1,
+                        o,
+                        64
+                    ),
+                    DECLINE
+                );
+            }
+        }
+    }
+}
