@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Console\Commands;
 
+use App\Services\NNTP\NNTPService;
+use App\Services\Nzb\DatabaseNzbStore;
 use App\Services\Nzb\NzbImportService;
 use App\Services\Nzb\NzbUploadManifestService;
 use Illuminate\Console\Command;
@@ -14,8 +16,22 @@ use Throwable;
 
 class ImportNzbs extends Command
 {
+    /**
+     * Default for the Wave 38.2 toggle only; it stays false because the paired benchmark in
+     * tests/Unit/RustNntpServiceFingerprintDispatchCommandsParityTest.php is below 1.5x.
+     */
+    public const bool RUST_FFI_DEFAULT = false;
+
+    private const array W382_KINDS = ['manifest', 'nzb_gz', 'nzb', 'other'];
+
+    private const array W382_SIZE_CLASSES = ['empty', 'small', 'normal', 'oversized'];
+
+    private const int W382_SMALL_NZB_BYTES = 1024;
+
     // Keep PHP as the production default until the Rust performance gate passes.
     private static ?bool $useRustFfi = null;
+
+    private static ?bool $useWave382RustFfi = null;
 
     /**
      * The name and signature of the console command.
@@ -122,6 +138,34 @@ class ImportNzbs extends Command
         return is_string($result) ? $result : self::formatCompletionSummaryPhp($imported, $failed, $skipped);
     }
 
+    public static function useWave382RustFfi(?bool $use): void
+    {
+        self::$useWave382RustFfi = $use;
+    }
+
+    public static function usesWave382RustFfi(): bool
+    {
+        return self::$useWave382RustFfi ?? self::RUST_FFI_DEFAULT;
+    }
+
+    public static function resetWave382RustFfi(): void
+    {
+        self::$useWave382RustFfi = null;
+    }
+
+    /**
+     * Classify one import candidate: the upload manifest first, then a case-insensitive ".nzb.gz" or ".nzb" suffix
+     * (the isImportableNzbFilename() rule), with the stem before that suffix and a size class of empty (<= 0),
+     * small (< 1 KiB), normal (<= DatabaseNzbStore::MAX_COMPRESSED_BYTES) or oversized.
+     *
+     * @return array{kind: string, importable: bool, compressed: bool, stem: string, size_class: string}
+     */
+    public static function summarizeImportFile(string $filename, int $sizeBytes, string $manifestFilename = NzbUploadManifestService::FILENAME): array
+    {
+        return (self::usesWave382RustFfi() ? self::summarizeImportFileNative($filename, $sizeBytes, $manifestFilename) : null)
+            ?? self::summarizeImportFilePhp($filename, $sizeBytes, $manifestFilename);
+    }
+
     /**
      * Execute the console command.
      */
@@ -176,6 +220,50 @@ class ImportNzbs extends Command
         } catch (Throwable $exception) {
             $this->error($exception->getMessage());
         }
+    }
+
+    /** @return array{kind: string, importable: bool, compressed: bool, stem: string, size_class: string} */
+    private static function summarizeImportFilePhp(string $filename, int $sizeBytes, string $manifestFilename): array
+    {
+        $lower = strtolower($filename);
+        [$kind, $suffix] = match (true) {
+            $filename === $manifestFilename => [0, 0],
+            str_ends_with($lower, '.nzb.gz') => [1, 7],
+            str_ends_with($lower, '.nzb') => [2, 4],
+            default => [3, 0],
+        };
+        $sizeClass = match (true) {
+            $sizeBytes <= 0 => 0,
+            $sizeBytes < self::W382_SMALL_NZB_BYTES => 1,
+            $sizeBytes <= DatabaseNzbStore::MAX_COMPRESSED_BYTES => 2,
+            default => 3,
+        };
+
+        return self::importFileSummary($kind, substr($filename, 0, strlen($filename) - $suffix), $sizeClass);
+    }
+
+    /** @return array{kind: string, importable: bool, compressed: bool, stem: string, size_class: string}|null */
+    private static function summarizeImportFileNative(string $filename, int $sizeBytes, string $manifestFilename): ?array
+    {
+        $slots = NNTPService::evaluateWave382Native(3, 0,
+            pack('q3', $sizeBytes, strlen($filename), strlen($manifestFilename)).$filename.$manifestFilename, 5);
+        if ($slots === null) {
+            return null;
+        }
+        [$kind, $importable, $compressed, $stem, $sizeClass] = $slots;
+        if (! isset(self::W382_KINDS[$kind], self::W382_SIZE_CLASSES[$sizeClass]) || $importable !== (int) ($kind === 1 || $kind === 2)
+            || $compressed !== (int) ($kind === 1) || $stem < 0 || $stem > strlen($filename)) {
+            return null;
+        }
+
+        return self::importFileSummary($kind, substr($filename, 0, $stem), $sizeClass);
+    }
+
+    /** @return array{kind: string, importable: bool, compressed: bool, stem: string, size_class: string} */
+    private static function importFileSummary(int $kind, string $stem, int $sizeClass): array
+    {
+        return ['kind' => self::W382_KINDS[$kind], 'importable' => $kind === 1 || $kind === 2, 'compressed' => $kind === 1, 'stem' => $stem,
+            'size_class' => self::W382_SIZE_CLASSES[$sizeClass]];
     }
 
     private static function useRustFfi(): bool
