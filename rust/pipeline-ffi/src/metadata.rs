@@ -33891,3 +33891,681 @@ pub mod media_catalogue_models {
         }
     }
 }
+/// Wave 33.4: attribute normalization for the `TvInfo`, `VideoAlias`, `ReleaseSubtitle`,
+/// `SteamApp` and `ReleaseNzbPassword` Eloquent models.
+///
+/// Multi-field string inputs arrive as one `0x1F`-separated buffer; outputs are
+/// `0x1F`-separated with booleans as `1`/`0`. Inputs that are not UTF-8 or that embed `0x1F` or
+/// `0x1E` decline with `-1` so PHP keeps its own implementation.
+pub mod tv_subtitle_steam_password_models {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+    use std::str;
+
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+    const DECLINE: isize = -1;
+    const FIELD_SEP: u8 = 0x1F;
+    const NULL_MARK: u8 = 0x1E;
+    const TRIM_SET: &[u8] = b" \t\n\r\0\x0B\x0C";
+    const U32_MAX: i64 = 4_294_967_295;
+
+    unsafe fn valid_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null()
+            || len > MAX_INPUT
+            || len > isize::MAX as usize
+            || (ptr as usize).checked_add(len).is_none()
+        {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn valid_out_buf(out_buf: *mut u8, out_cap: usize) -> bool {
+        !out_buf.is_null()
+            && out_cap <= isize::MAX as usize
+            && (out_buf as usize).checked_add(out_cap).is_some()
+    }
+
+    /// Copies `bytes` into `out_buf`, returning the length or `-required` when it does not fit.
+    unsafe fn write_bytes(bytes: &[u8], out_buf: *mut u8, out_cap: usize) -> isize {
+        if bytes.len() > isize::MAX as usize {
+            return DECLINE;
+        }
+        if bytes.len() > out_cap {
+            return -(bytes.len() as isize);
+        }
+        if !bytes.is_empty() {
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len()) };
+        }
+        bytes.len() as isize
+    }
+
+    /// Splits the wire buffer into exactly `expected` marker-free UTF-8 fields.
+    fn split_fields(input: &[u8], expected: usize) -> Option<Vec<&str>> {
+        let mut fields = Vec::with_capacity(expected);
+        for part in input.split(|&b| b == FIELD_SEP) {
+            if fields.len() == expected || part.contains(&NULL_MARK) {
+                return None;
+            }
+            fields.push(str::from_utf8(part).ok()?);
+        }
+        (fields.len() == expected).then_some(fields)
+    }
+
+    /// A single marker-free UTF-8 field.
+    fn single_field(input: &[u8]) -> Option<&str> {
+        if input.iter().any(|&b| b == FIELD_SEP || b == NULL_MARK) {
+            return None;
+        }
+        str::from_utf8(input).ok()
+    }
+
+    /// PHP `trim($value, " \t\n\r\0\x0B\x0C")`.
+    fn trim_ws(value: &str) -> &str {
+        value.trim_matches(|c: char| c.is_ascii() && TRIM_SET.contains(&(c as u8)))
+    }
+
+    /// PHP `preg_replace('/[ \t\n\r\x0B\x0C]+/', ' ', $value)`.
+    fn collapse_ws(value: &str) -> String {
+        let mut out = String::with_capacity(value.len());
+        let mut in_run = false;
+        for c in value.chars() {
+            if matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0B' | '\x0C') {
+                if !in_run {
+                    out.push(' ');
+                    in_run = true;
+                }
+            } else {
+                out.push(c);
+                in_run = false;
+            }
+        }
+        out
+    }
+
+    /// PHP `mb_substr($value, 0, $max, 'UTF-8')` for valid UTF-8.
+    fn char_prefix(value: &str, max: usize) -> &str {
+        match value.char_indices().nth(max) {
+            Some((index, _)) => &value[..index],
+            None => value,
+        }
+    }
+
+    /// Collapses whitespace runs, trims and keeps at most `max` characters.
+    fn clean_text(value: &str, max: usize) -> String {
+        char_prefix(trim_ws(&collapse_ws(value)), max).to_owned()
+    }
+
+    fn flag_bytes(value: bool) -> &'static [u8] {
+        if value { b"1" } else { b"0" }
+    }
+
+    fn encode(fields: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(fields.iter().map(|f| f.len() + 1).sum());
+        for (i, field) in fields.iter().enumerate() {
+            if i > 0 {
+                out.push(FIELD_SEP);
+            }
+            out.extend_from_slice(field);
+        }
+        out
+    }
+
+    /// `TvInfo::normalizeTvInfoAttributesPhp()` time zone rule: tz-database style ASCII or empty.
+    pub fn tv_info_local_zone(local_zone: &str) -> &str {
+        let zone = char_prefix(trim_ws(local_zone), 50);
+        let valid = zone
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'+' | b'-' | b'/'));
+        if valid { zone } else { "" }
+    }
+
+    /// `TvInfo::normalizeTvInfoAttributesPhp()`: `(videos_id, summary, publisher, localzone, image)`.
+    pub fn tv_info_attributes(
+        video_id: i64,
+        summary: &str,
+        publisher: &str,
+        local_zone: &str,
+        image: i64,
+    ) -> (i64, String, String, String, bool) {
+        (
+            video_id.clamp(0, U32_MAX),
+            trim_ws(summary).to_owned(),
+            clean_text(publisher, 50),
+            tv_info_local_zone(local_zone).to_owned(),
+            image > 0,
+        )
+    }
+
+    /// `VideoAlias::normalizeAliasPairPhp()`: `(videos_id, title, composite_key, is_valid)`.
+    pub fn video_alias_pair(video_id: i64, title: &str) -> (i64, String, String, bool) {
+        let id = video_id.clamp(0, U32_MAX);
+        let title = clean_text(title, 180);
+        let key = format!("{id}|{}", title.to_ascii_lowercase());
+        let valid = id > 0 && !title.is_empty();
+        (id, title, key, valid)
+    }
+
+    /// `ReleaseSubtitle::normalizeSubtitleTrackPhp()`:
+    /// `(releases_id, subsid, subslanguage, language_key, composite_key)`.
+    pub fn release_subtitle_track(
+        release_id: i64,
+        subs_id: i64,
+        language: &str,
+    ) -> (i64, i64, String, String, String) {
+        let release = release_id.clamp(0, U32_MAX);
+        let subs = subs_id.clamp(0, U32_MAX);
+        let language = clean_text(language, 50);
+        let key = language.to_ascii_lowercase();
+        (release, subs, language, key, format!("{release}:{subs}"))
+    }
+
+    /// `SteamApp::normalizeSteamAppRecordPhp()` slug: lowercase ASCII alphanumeric runs joined by `-`.
+    pub fn steam_app_slug(name: &str) -> String {
+        let mut slug = String::with_capacity(name.len());
+        let mut pending_dash = false;
+        for b in name.bytes() {
+            let b = b.to_ascii_lowercase();
+            if b.is_ascii_lowercase() || b.is_ascii_digit() {
+                if pending_dash && !slug.is_empty() {
+                    slug.push('-');
+                }
+                pending_dash = false;
+                slug.push(b as char);
+            } else {
+                pending_dash = true;
+            }
+        }
+        slug
+    }
+
+    /// `SteamApp::normalizeSteamAppRecordPhp()`: `(appid, name, slug, is_valid)`.
+    pub fn steam_app_record(app_id: i64, name: &str) -> (i64, String, String, bool) {
+        let id = app_id.clamp(0, U32_MAX);
+        let name = clean_text(name, 255);
+        let slug = steam_app_slug(&name);
+        let valid = id > 0 && !name.is_empty();
+        (id, name, slug, valid)
+    }
+
+    /// `ReleaseNzbPassword::normalizePasswordEntryPhp()`: `(releases_id, password, has_password)`.
+    pub fn release_nzb_password_entry(release_id: i64, password: &str) -> (i64, String, bool) {
+        let id = release_id.clamp(0, U32_MAX);
+        let password = char_prefix(trim_ws(password), 255).to_owned();
+        let has = !password.is_empty();
+        (id, password, has)
+    }
+
+    fn tv_info_encode(video_id: i64, image: i64, input: &[u8]) -> Option<Vec<u8>> {
+        let fields = split_fields(input, 3)?;
+        let (id, summary, publisher, zone, image) =
+            tv_info_attributes(video_id, fields[0], fields[1], fields[2], image);
+        let id = id.to_string();
+        Some(encode(&[
+            id.as_bytes(),
+            summary.as_bytes(),
+            publisher.as_bytes(),
+            zone.as_bytes(),
+            flag_bytes(image),
+        ]))
+    }
+
+    fn video_alias_encode(video_id: i64, input: &[u8]) -> Option<Vec<u8>> {
+        let (id, title, key, valid) = video_alias_pair(video_id, single_field(input)?);
+        let id = id.to_string();
+        Some(encode(&[
+            id.as_bytes(),
+            title.as_bytes(),
+            key.as_bytes(),
+            flag_bytes(valid),
+        ]))
+    }
+
+    fn release_subtitle_encode(release_id: i64, subs_id: i64, input: &[u8]) -> Option<Vec<u8>> {
+        let (release, subs, language, key, composite) =
+            release_subtitle_track(release_id, subs_id, single_field(input)?);
+        let release = release.to_string();
+        let subs = subs.to_string();
+        Some(encode(&[
+            release.as_bytes(),
+            subs.as_bytes(),
+            language.as_bytes(),
+            key.as_bytes(),
+            composite.as_bytes(),
+        ]))
+    }
+
+    fn steam_app_encode(app_id: i64, input: &[u8]) -> Option<Vec<u8>> {
+        let (id, name, slug, valid) = steam_app_record(app_id, single_field(input)?);
+        let id = id.to_string();
+        Some(encode(&[
+            id.as_bytes(),
+            name.as_bytes(),
+            slug.as_bytes(),
+            flag_bytes(valid),
+        ]))
+    }
+
+    fn release_nzb_password_encode(release_id: i64, input: &[u8]) -> Option<Vec<u8>> {
+        let (id, password, has) = release_nzb_password_entry(release_id, single_field(input)?);
+        let id = id.to_string();
+        Some(encode(&[
+            id.as_bytes(),
+            password.as_bytes(),
+            flag_bytes(has),
+        ]))
+    }
+
+    /// Validates the buffers under `catch_unwind` and writes the encoded result.
+    unsafe fn run(
+        input_ptr: *const u8,
+        input_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+        encode_fn: impl FnOnce(&[u8]) -> Option<Vec<u8>>,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(input) = (unsafe { valid_slice(input_ptr, input_len) }) else {
+                return DECLINE;
+            };
+            match encode_fn(input) {
+                Some(bytes) => unsafe { write_bytes(&bytes, out_buf, out_cap) },
+                None => DECLINE,
+            }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `TvInfo::normalizeTvInfoAttributes()`; input is `summary`, `publisher`, `localzone`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_tv_info_normalize_attributes(
+        video_id: i64,
+        image: i64,
+        input_ptr: *const u8,
+        input_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            run(input_ptr, input_len, out_buf, out_cap, |input| {
+                tv_info_encode(video_id, image, input)
+            })
+        }
+    }
+
+    /// `VideoAlias::normalizeAliasPair()`; input is the alias title.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_video_alias_normalize_pair(
+        video_id: i64,
+        title_ptr: *const u8,
+        title_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            run(title_ptr, title_len, out_buf, out_cap, |input| {
+                video_alias_encode(video_id, input)
+            })
+        }
+    }
+
+    /// `ReleaseSubtitle::normalizeSubtitleTrack()`; input is the subtitle language.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_release_subtitle_normalize_track(
+        release_id: i64,
+        subs_id: i64,
+        language_ptr: *const u8,
+        language_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            run(language_ptr, language_len, out_buf, out_cap, |input| {
+                release_subtitle_encode(release_id, subs_id, input)
+            })
+        }
+    }
+
+    /// `SteamApp::normalizeSteamAppRecord()`; input is the application name.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_steam_app_normalize_record(
+        app_id: i64,
+        name_ptr: *const u8,
+        name_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            run(name_ptr, name_len, out_buf, out_cap, |input| {
+                steam_app_encode(app_id, input)
+            })
+        }
+    }
+
+    /// `ReleaseNzbPassword::normalizePasswordEntry()`; input is the NZB password.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_release_nzb_password_normalize_entry(
+        release_id: i64,
+        password_ptr: *const u8,
+        password_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            run(password_ptr, password_len, out_buf, out_cap, |input| {
+                release_nzb_password_encode(release_id, input)
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn call(f: impl Fn(*mut u8, usize) -> isize) -> Result<Vec<String>, isize> {
+            let mut buf = vec![0u8; 4096];
+            let n = f(buf.as_mut_ptr(), buf.len());
+            if n < 0 {
+                return Err(n);
+            }
+            buf.truncate(n as usize);
+            Ok(buf
+                .split(|&b| b == FIELD_SEP)
+                .map(|f| String::from_utf8(f.to_vec()).unwrap())
+                .collect())
+        }
+
+        #[test]
+        fn text_helpers_match_php() {
+            assert_eq!(trim_ws("\0\x0B\x0C a b \t\r\n"), "a b");
+            assert_eq!(trim_ws("\u{a0}x\u{a0}"), "\u{a0}x\u{a0}");
+            assert_eq!(collapse_ws("a \t\n b\x0B\x0Cc\0d"), "a b c\0d");
+            assert_eq!(char_prefix("héllo", 2), "hé");
+            assert_eq!(clean_text("  The \t Wire  ", 50), "The Wire");
+            assert_eq!(split_fields(b"a\x1F\x1Fc", 3), Some(vec!["a", "", "c"]));
+            assert_eq!(split_fields(b"a\x1Fb", 3), None);
+            assert_eq!(split_fields(b"a\x1Fb\x1Fc\x1Fd", 3), None);
+            assert_eq!(split_fields(b"\x1E\x1Fb\x1Fc", 3), None);
+            assert_eq!(split_fields(b"\xff\x1Fb\x1Fc", 3), None);
+            assert_eq!(single_field(b"a\x1Fb"), None);
+            assert_eq!(single_field(b"\x1E"), None);
+            assert_eq!(single_field(b"\xc3"), None);
+            assert_eq!(single_field(b""), Some(""));
+        }
+
+        #[test]
+        fn tv_info_normalizes() {
+            let (id, summary, publisher, zone, image) =
+                tv_info_attributes(-3, "  A  show.\n", " HBO \t Max ", " America/New_York ", 5);
+            assert_eq!(id, 0);
+            assert_eq!(summary, "A  show.");
+            assert_eq!(publisher, "HBO Max");
+            assert_eq!(zone, "America/New_York");
+            assert!(image);
+            assert_eq!(tv_info_attributes(i64::MAX, "", "", "", 0).0, U32_MAX);
+            assert!(!tv_info_attributes(1, "", "", "", -1).4);
+            assert_eq!(tv_info_local_zone("Etc/GMT+5"), "Etc/GMT+5");
+            assert_eq!(tv_info_local_zone("Bad Zone"), "");
+            assert_eq!(tv_info_local_zone("Zürich"), "");
+            assert_eq!(tv_info_local_zone(&"A".repeat(60)), "A".repeat(50));
+            assert_eq!(
+                clean_text(&"é".repeat(80), 50).chars().count(),
+                50,
+                "publisher truncates to 50 characters"
+            );
+        }
+
+        #[test]
+        fn video_alias_normalizes() {
+            assert_eq!(
+                video_alias_pair(7, "  The  Office (US) "),
+                (
+                    7,
+                    "The Office (US)".into(),
+                    "7|the office (us)".into(),
+                    true
+                )
+            );
+            assert_eq!(video_alias_pair(-1, "x").3, false);
+            assert_eq!(video_alias_pair(1, "   ").3, false);
+            assert_eq!(video_alias_pair(1, &"ü".repeat(200)).1.chars().count(), 180);
+            assert_eq!(video_alias_pair(1, "ÄB").2, "1|Äb");
+        }
+
+        #[test]
+        fn release_subtitle_normalizes() {
+            assert_eq!(
+                release_subtitle_track(10, 2, "  Brazilian \t Portuguese "),
+                (
+                    10,
+                    2,
+                    "Brazilian Portuguese".into(),
+                    "brazilian portuguese".into(),
+                    "10:2".into()
+                )
+            );
+            assert_eq!(
+                release_subtitle_track(i64::MIN, i64::MAX, "").4,
+                "0:4294967295"
+            );
+        }
+
+        #[test]
+        fn steam_app_normalizes() {
+            assert_eq!(
+                steam_app_slug("Counter-Strike: Global Offensive"),
+                "counter-strike-global-offensive"
+            );
+            assert_eq!(steam_app_slug("--Half-Life 2--"), "half-life-2");
+            assert_eq!(steam_app_slug("Pokémon"), "pok-mon");
+            assert_eq!(steam_app_slug("進撃"), "");
+            assert_eq!(steam_app_slug(""), "");
+            assert_eq!(
+                steam_app_record(570, " Dota  2 "),
+                (570, "Dota 2".into(), "dota-2".into(), true)
+            );
+            assert!(!steam_app_record(0, "Dota").3);
+            assert!(!steam_app_record(5, "  ").3);
+        }
+
+        #[test]
+        fn release_nzb_password_normalizes() {
+            assert_eq!(
+                release_nzb_password_entry(3, "  p@ss  word\t"),
+                (3, "p@ss  word".into(), true)
+            );
+            assert!(!release_nzb_password_entry(3, " \0 ").2);
+            assert_eq!(
+                release_nzb_password_entry(1, &"ß".repeat(300))
+                    .1
+                    .chars()
+                    .count(),
+                255
+            );
+        }
+
+        #[test]
+        fn exports_encode_fields() {
+            let input = b"  Summary \x1F BBC  One \x1FEurope/London";
+            assert_eq!(
+                call(|b, c| unsafe {
+                    nntmux_tv_info_normalize_attributes(4, 1, input.as_ptr(), input.len(), b, c)
+                }),
+                Ok(vec![
+                    "4".into(),
+                    "Summary".into(),
+                    "BBC One".into(),
+                    "Europe/London".into(),
+                    "1".into()
+                ])
+            );
+            let title = b"Alias";
+            assert_eq!(
+                call(|b, c| unsafe {
+                    nntmux_video_alias_normalize_pair(9, title.as_ptr(), title.len(), b, c)
+                }),
+                Ok(vec![
+                    "9".into(),
+                    "Alias".into(),
+                    "9|alias".into(),
+                    "1".into()
+                ])
+            );
+            let lang = b"English";
+            assert_eq!(
+                call(|b, c| unsafe {
+                    nntmux_release_subtitle_normalize_track(1, 2, lang.as_ptr(), lang.len(), b, c)
+                }),
+                Ok(vec![
+                    "1".into(),
+                    "2".into(),
+                    "English".into(),
+                    "english".into(),
+                    "1:2".into()
+                ])
+            );
+            let name = b"Portal 2";
+            assert_eq!(
+                call(|b, c| unsafe {
+                    nntmux_steam_app_normalize_record(620, name.as_ptr(), name.len(), b, c)
+                }),
+                Ok(vec![
+                    "620".into(),
+                    "Portal 2".into(),
+                    "portal-2".into(),
+                    "1".into()
+                ])
+            );
+            let empty = b"";
+            assert_eq!(
+                call(|b, c| unsafe {
+                    nntmux_release_nzb_password_normalize_entry(5, empty.as_ptr(), 0, b, c)
+                }),
+                Ok(vec!["5".into(), "".into(), "0".into()])
+            );
+        }
+
+        #[test]
+        fn exports_validate_input_and_capacity() {
+            let ok = b"Alias";
+            let mut buf = [b'Z'; 4];
+            let rc = unsafe {
+                nntmux_video_alias_normalize_pair(
+                    1,
+                    ok.as_ptr(),
+                    ok.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(rc < DECLINE);
+            assert_eq!(buf, [b'Z'; 4]);
+            let mut big = vec![0u8; (-rc) as usize];
+            assert_eq!(
+                unsafe {
+                    nntmux_video_alias_normalize_pair(
+                        1,
+                        ok.as_ptr(),
+                        ok.len(),
+                        big.as_mut_ptr(),
+                        big.len(),
+                    )
+                },
+                -rc
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_video_alias_normalize_pair(
+                        1,
+                        std::ptr::null(),
+                        0,
+                        big.as_mut_ptr(),
+                        big.len(),
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_video_alias_normalize_pair(
+                        1,
+                        ok.as_ptr(),
+                        ok.len(),
+                        std::ptr::null_mut(),
+                        16,
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_tv_info_normalize_attributes(
+                        1,
+                        0,
+                        ok.as_ptr(),
+                        MAX_INPUT + 1,
+                        big.as_mut_ptr(),
+                        big.len(),
+                    )
+                },
+                DECLINE
+            );
+            let two = b"a\x1Fb";
+            assert_eq!(
+                call(|b, c| unsafe {
+                    nntmux_tv_info_normalize_attributes(1, 0, two.as_ptr(), two.len(), b, c)
+                }),
+                Err(DECLINE)
+            );
+            let marked = b"a\x1Fb";
+            let null_mark = b"x\x1Ey";
+            let bad = b"bad \xff";
+            for input in [&marked[..], &null_mark[..], &bad[..]] {
+                assert_eq!(
+                    call(|b, c| unsafe {
+                        nntmux_video_alias_normalize_pair(1, input.as_ptr(), input.len(), b, c)
+                    }),
+                    Err(DECLINE)
+                );
+                assert_eq!(
+                    call(|b, c| unsafe {
+                        nntmux_release_subtitle_normalize_track(
+                            1,
+                            1,
+                            input.as_ptr(),
+                            input.len(),
+                            b,
+                            c,
+                        )
+                    }),
+                    Err(DECLINE)
+                );
+                assert_eq!(
+                    call(|b, c| unsafe {
+                        nntmux_steam_app_normalize_record(1, input.as_ptr(), input.len(), b, c)
+                    }),
+                    Err(DECLINE)
+                );
+                assert_eq!(
+                    call(|b, c| unsafe {
+                        nntmux_release_nzb_password_normalize_entry(
+                            1,
+                            input.as_ptr(),
+                            input.len(),
+                            b,
+                            c,
+                        )
+                    }),
+                    Err(DECLINE)
+                );
+            }
+        }
+    }
+}
