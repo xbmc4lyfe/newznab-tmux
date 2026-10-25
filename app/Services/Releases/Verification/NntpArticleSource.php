@@ -10,6 +10,7 @@ use App\Services\YencService;
 use App\Support\RustPipelineLibrary;
 use Exception;
 use FFI;
+use FFI\CData;
 use RuntimeException;
 use Throwable;
 
@@ -441,5 +442,178 @@ final class NntpArticleSource implements ArticleSource
         if ($this->alternateConnected && $this->alternate !== null) {
             $this->disconnect($this->alternate);
         }
+    }
+
+    /** Wave 51.2 paired benchmarks decide this default; see RustVerificationManifestNntpReaderDeferralsPayloadW51ParityTest. */
+    private const bool W51_RUST_FFI_DEFAULT = true;
+
+    public const string W51_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w512_article_prefetch_plan_batch(const char *ids, size_t ids_len, size_t count, int64_t maximum_bytes, int64_t connections, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * Wave 51 routing, binding and output buffer, kept in function-local statics. Operations:
+     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
+     * resolves the binding and 'out' returns a buffer of at least $val words (its capacity
+     * through 'cap').
+     */
+    private static function w51RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w51', self::W51_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w51RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return $out;
+            case 'cap':
+                return $capacity;
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW51RustFfi(): bool
+    {
+        $enabled = self::w51RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W51_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with planPrefetchIds() routed to Rust ($enabled) or PHP, then restores the
+     * previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW51RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w51RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w51RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Batch prefetch plan for requested message-ids. One word per id over its trimmed form
+     * (NNTPService::verificationMessageId()): `flags | min(strlen, 0xFFFF) << 8 | batch << 24 |
+     * crc32(id) << 32` (flags: 1 valid, 2 brackets trimmed, 4 repeated valid id, 8 empty after
+     * trimming, 16 prefetched: the first valid occurrence, with its connection batch). Sizing
+     * follows prefetchSizingPhp() over the unique ids (no ids: no connections, zero window).
+     * Valid and unique counts, connections, window, the first invalid index (-1 for none) and
+     * the XXH64 digest of all earlier words follow.
+     *
+     * @param  list<string>  $ids
+     * @return list<int>
+     */
+    public static function planPrefetchIds(array $ids, int $maximumBytes, int $connections): array
+    {
+        return self::usesW51RustFfi()
+            ? self::planPrefetchIdsNative($ids, $maximumBytes, $connections)
+            : self::planPrefetchIdsPhp($ids, $maximumBytes, $connections);
+    }
+
+    /**
+     * @param  list<string>  $ids
+     * @return list<int>
+     */
+    public static function planPrefetchIdsPhp(array $ids, int $maximumBytes, int $connections): array
+    {
+        $out = $seen = $assigned = [];
+        $valid = 0;
+        $firstInvalid = -1;
+        foreach ($ids as $i => $raw) {
+            $id = trim($raw, '<>');
+            $flags = (int) (\strlen($id) !== \strlen($raw)) << 1 | (int) ($id === '') << 3;
+            if ($maximumBytes >= 1 && preg_match('/\A[^\s<>\x00-\x1f\x7f]+\z/D', $id) === 1) {
+                $flags |= 1;
+                $valid++;
+                if (isset($seen[$id])) {
+                    $flags |= 4;
+                } else {
+                    $seen[$id] = true;
+                    $flags |= 16;
+                    $assigned[] = $i;
+                }
+            } elseif ($firstInvalid < 0) {
+                $firstInvalid = $i;
+            }
+            $out[] = $flags | min(\strlen($id), 0xFFFF) << 8 | crc32($id) << 32;
+        }
+        $unique = \count($assigned);
+        ['connections' => $sockets, 'window' => $window] = $unique === 0 ? ['connections' => 0, 'window' => 0]
+            : self::prefetchSizingPhp($unique, $connections);
+        foreach ($assigned as $u => $row) {
+            $out[$row] |= intdiv($u, $window) << 24;
+        }
+        $out[] = $valid;
+        $out[] = $unique;
+        $out[] = $sockets;
+        $out[] = $window;
+        $out[] = $firstInvalid;
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+        $out[] = $digest[1];
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, the ids are not a list or an
+     * id holds a NUL byte.
+     *
+     * @param  list<string>  $ids
+     * @return list<int>
+     */
+    public static function planPrefetchIdsNative(array $ids, int $maximumBytes, int $connections): array
+    {
+        $count = \count($ids);
+        $ffi = $count === 0 ? null : self::w51RustFfiState('ffi');
+        if (! $ffi instanceof FFI || ! array_is_list($ids)) {
+            return self::planPrefetchIdsPhp($ids, $maximumBytes, $connections);
+        }
+        $joined = implode("\0", $ids);
+        $words = $count + 6;
+        $values = false;
+        try {
+            $out = self::w51RustFfiState('out', $words);
+            if ($out instanceof CData) {
+                // @phpstan-ignore method.notFound (Declared by W51_FFI_CDEF.)
+                $written = $ffi->nntmux_w512_article_prefetch_plan_batch($joined, \strlen($joined), $count, $maximumBytes, $connections, $out, self::w51RustFfiState('cap'));
+                $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+            }
+        } catch (Throwable) {
+            $values = false;
+        }
+
+        /** @var list<int>|null $result */
+        $result = \is_array($values) ? array_values($values) : null;
+
+        return $result ?? self::planPrefetchIdsPhp($ids, $maximumBytes, $connections);
     }
 }

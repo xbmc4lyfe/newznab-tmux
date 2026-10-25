@@ -8,6 +8,7 @@ use App\Services\YencService;
 use App\Support\RustPipelineLibrary;
 use dariusiii\rarinfo\Par2Info;
 use FFI;
+use FFI\CData;
 use RuntimeException;
 use Symfony\Component\Process\Process;
 use Throwable;
@@ -647,5 +648,180 @@ final class PayloadVerifier
         }
 
         return $process->getExitCode() ?? -1;
+    }
+
+    /** Wave 51.2 paired benchmarks decide this default; see RustVerificationManifestNntpReaderDeferralsPayloadW51ParityTest. */
+    private const bool W51_RUST_FFI_DEFAULT = true;
+
+    public const string W51_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w512_payload_required_name_batch(const char *subjects, size_t subjects_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * Wave 51 routing, binding and output buffer, kept in function-local statics. Operations:
+     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
+     * resolves the binding and 'out' returns a buffer of at least $val words (its capacity
+     * through 'cap').
+     */
+    private static function w51RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w51', self::W51_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w51RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return $out;
+            case 'cap':
+                return $capacity;
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW51RustFfi(): bool
+    {
+        $enabled = self::w51RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W51_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with planRequiredNames() routed to Rust ($enabled) or PHP, then restores the
+     * previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW51RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w51RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w51RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Batch requiredNamePhp() over file subjects. Two words per subject: `flags | min(strlen,
+     * 0xFFFF) << 8 | crc32(name) << 32` over the required name, or just the flags when it is
+     * unsafe (flags: 1 quoted name, 2 safe required name, 4 also validPar2FilenamePhp(),
+     * 8 repeated required name, 16 `.par2` suffix in any case), then the name's byte offset in
+     * the subject (-1 when unsafe). Safe, PAR2-safe, repeated and `.par2` counts and the XXH64
+     * digest of all earlier words follow.
+     *
+     * @param  list<string>  $subjects
+     * @return list<int>
+     */
+    public static function planRequiredNames(array $subjects): array
+    {
+        return self::usesW51RustFfi() ? self::planRequiredNamesNative($subjects) : self::planRequiredNamesPhp($subjects);
+    }
+
+    /**
+     * @param  list<string>  $subjects
+     * @return list<int>
+     */
+    public static function planRequiredNamesPhp(array $subjects): array
+    {
+        $out = $seen = [];
+        $valid = $par2 = $repeated = $suffixed = 0;
+        foreach ($subjects as $subject) {
+            $quoted = preg_match('/"([^"\r\n]+)"/', $subject, $match, PREG_OFFSET_CAPTURE) === 1;
+            [$name, $offset] = $quoted ? $match[1] : [$subject, 0];
+            $flags = (int) $quoted;
+            if ($name === '' || basename($name) !== $name || str_contains($name, '\\') || $name[0] === '.'
+                || $name[0] === '-' || preg_match('/[\x00-\x1f\x7f]/', $name)
+                || preg_match('/[\[\]]|yEnc/i', $name)) {
+                $out[] = $flags;
+                $out[] = -1;
+
+                continue;
+            }
+            $flags |= 2;
+            $valid++;
+            if (self::validPar2FilenamePhp($name)) {
+                $flags |= 4;
+                $par2++;
+            }
+            if (isset($seen[$name])) {
+                $flags |= 8;
+                $repeated++;
+            } else {
+                $seen[$name] = true;
+            }
+            if (\strlen($name) >= 5 && strcasecmp(substr($name, -5), '.par2') === 0) {
+                $flags |= 16;
+                $suffixed++;
+            }
+            $out[] = $flags | min(\strlen($name), 0xFFFF) << 8 | crc32($name) << 32;
+            $out[] = $offset;
+        }
+        $out[] = $valid;
+        $out[] = $par2;
+        $out[] = $repeated;
+        $out[] = $suffixed;
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+        $out[] = $digest[1];
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, the subjects are not a list or
+     * a subject holds a NUL byte.
+     *
+     * @param  list<string>  $subjects
+     * @return list<int>
+     */
+    public static function planRequiredNamesNative(array $subjects): array
+    {
+        $count = \count($subjects);
+        $ffi = $count === 0 ? null : self::w51RustFfiState('ffi');
+        if (! $ffi instanceof FFI || ! array_is_list($subjects)) {
+            return self::planRequiredNamesPhp($subjects);
+        }
+        $joined = implode("\0", $subjects);
+        $words = 2 * $count + 5;
+        $values = false;
+        try {
+            $out = self::w51RustFfiState('out', $words);
+            if ($out instanceof CData) {
+                // @phpstan-ignore method.notFound (Declared by W51_FFI_CDEF.)
+                $written = $ffi->nntmux_w512_payload_required_name_batch($joined, \strlen($joined), $count, $out, self::w51RustFfiState('cap'));
+                $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+            }
+        } catch (Throwable) {
+            $values = false;
+        }
+
+        /** @var list<int>|null $result */
+        $result = \is_array($values) ? array_values($values) : null;
+
+        return $result ?? self::planRequiredNamesPhp($subjects);
     }
 }
