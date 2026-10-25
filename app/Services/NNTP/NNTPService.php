@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services\NNTP;
 
 use App\Services\Configuration\ConfigurationProvider;
+use App\Services\RegexService;
 use App\Services\Releases\Verification\ArticleBudgetExceeded;
 use App\Services\Tmux\Tmux;
 use App\Services\Yenc\ArticleFrame;
@@ -176,6 +177,90 @@ class NNTPService extends NntpClient
 
         return ['message_id' => $ok ? $id : null, 'bracketed' => $ok ? '<'.$id.'>' : null, 'length' => \strlen($id), 'stripped_brackets' => $stripped,
             'first_invalid' => $firstInvalid, 'reason' => self::W382_ID_REASONS[$reason], 'within_budget' => $withinBudget];
+    }
+
+    /** Enabled: paired common/uncommon mean and p99 gains reach 1.5x in all five runs (min 2.69x; see the W46 parity test). */
+    public const bool W461_RUST_FFI_DEFAULT = true;
+
+    public const string W461_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w461_nntp_message_id_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private const array W461_SUMMARY_KEYS = ['total_ids', 'empty_id_count', 'valid_count', 'invalid_budget_count', 'empty_after_trim_count', 'invalid_byte_count', 'bracketed_count', 'within_budget_count', 'needs_format_count'];
+
+    private static ?bool $w461UseRustFfi = null;
+
+    private static \FFI|false|null $w461Ffi = null;
+
+    /** Null restores the benchmark default. */
+    public static function useW461RustFfi(?bool $enable = true): void
+    {
+        self::$w461UseRustFfi = $enable;
+    }
+
+    public static function usesW461RustFfi(): bool
+    {
+        return self::$w461UseRustFfi ?? self::W461_RUST_FFI_DEFAULT;
+    }
+
+    /** Restores the benchmark default and drops the cached library handle; the useRustFfi() toggle is untouched. */
+    public static function resetW461RustFfi(): void
+    {
+        self::$w461UseRustFfi = null;
+        self::$w461Ffi = null;
+    }
+
+    /**
+     * Summarizes message-ids with planVerificationMessageIdPhp() under one byte budget: valid ids, each
+     * rejection reason, ids that carried angle brackets, valid ids whose bracketed form fits the budget, and
+     * ids _formatMessageID() would still bracket.
+     * Entries come from strings, integers, or the first non-null message_id, id array field; other values
+     * (including objects) count as empty entries.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeMessageIdBatch(array $rows, int $maximumBytes): array
+    {
+        return self::usesW461RustFfi() ? self::summarizeMessageIdBatchNative($rows, $maximumBytes) : self::summarizeMessageIdBatchPhp($rows, $maximumBytes);
+    }
+
+    /**
+     * Rust summary; falls back to PHP when the library or input frame is unusable.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeMessageIdBatchNative(array $rows, int $maximumBytes): array
+    {
+        $values = RegexService::w461Invoke(self::$w461Ffi, self::W461_FFI_CDEF, 'nntmux_w461_nntp_message_id_batch', $rows, ['message_id', 'id'], \count(self::W461_SUMMARY_KEYS), pack('q', $maximumBytes));
+
+        return $values === null ? self::summarizeMessageIdBatchPhp($rows, $maximumBytes) : array_combine(self::W461_SUMMARY_KEYS, $values);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeMessageIdBatchPhp(array $rows, int $maximumBytes): array
+    {
+        $summary = array_fill_keys(self::W461_SUMMARY_KEYS, 0);
+        $reasons = ['ok' => 'valid_count', 'invalid_budget' => 'invalid_budget_count', 'empty' => 'empty_after_trim_count', 'invalid_byte' => 'invalid_byte_count'];
+        foreach (RegexService::w461Entries($rows, ['message_id', 'id']) as $entry) {
+            $summary['total_ids']++;
+            if ($entry === '') {
+                $summary['empty_id_count']++;
+
+                continue;
+            }
+            $plan = self::planVerificationMessageIdPhp($entry, $maximumBytes);
+            $summary[$reasons[$plan['reason']]]++;
+            $summary['bracketed_count'] += (int) ($plan['stripped_brackets'] > 0);
+            $summary['within_budget_count'] += (int) $plan['within_budget'];
+            $summary['needs_format_count'] += (int) ($entry[0] !== '<' || ! str_ends_with($entry, '>'));
+        }
+
+        return $summary;
     }
 
     public static function verificationMessageId(string $messageId, int $maximumBytes): string
