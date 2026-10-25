@@ -5,12 +5,40 @@ declare(strict_types=1);
 namespace App\Services\AdditionalProcessing\DTO;
 
 use App\Services\Par2FileList;
+use App\Support\RustPipelineLibrary;
+use FFI;
+use Throwable;
 
 /**
  * A file as the release's PAR2 index describes it.
  */
 final readonly class Par2FileEntry
 {
+    public const bool W44_RUST_FFI_DEFAULT = false;
+
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_w44_par2_normalize_entries(const char *input, size_t length, size_t count, char *output, size_t capacity);
+        C;
+
+    /** @return array{enabled: ?bool, ffi: FFI|false|null} */
+    private static function &w44State(): array
+    {
+        static $state = ['enabled' => null, 'ffi' => null];
+
+        return $state;
+    }
+
+    public static function useRustFfi(?bool $enable = true): void
+    {
+        $state = &self::w44State();
+        $state['enabled'] = $enable;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::w44State()['enabled'] ?? self::W44_RUST_FFI_DEFAULT;
+    }
+
     /**
      * @param  string  $hash16k  MD5 of the file's first 16 KiB, lower-case hex
      */
@@ -26,6 +54,15 @@ final readonly class Par2FileEntry
      */
     public static function listFromPar2Info(array $files): array
     {
+        return self::usesRustFfi() ? self::listFromPar2InfoNative($files) : self::listFromPar2InfoPhp($files);
+    }
+
+    /**
+     * @param  array<int|string, mixed>  $files
+     * @return list<self>
+     */
+    public static function listFromPar2InfoPhp(array $files): array
+    {
         $entries = [];
         foreach ($files as $file) {
             if (! is_array($file) || ! is_string($file['name'] ?? null) || (int) ($file['size'] ?? 0) <= 0) {
@@ -40,6 +77,79 @@ final readonly class Par2FileEntry
         }
 
         return $entries;
+    }
+
+    /**
+     * @param  array<int|string, mixed>  $files
+     * @return list<self>
+     */
+    public static function listFromPar2InfoNative(array $files, bool &$supported = false): array
+    {
+        $supported = false;
+        if (PHP_INT_SIZE !== 8) {
+            return self::listFromPar2InfoPhp($files);
+        }
+        // PHP owns mixed-value coercion: its integer casts and string conversion behavior
+        // must remain identical for unusual parser output as well as valid descriptors.
+        $input = '';
+        $count = 0;
+        $coerced = [];
+        $tooLarge = false;
+        foreach ($files as $file) {
+            if (! is_array($file) || ! is_string($file['name'] ?? null) || (int) ($file['size'] ?? 0) <= 0) {
+                continue;
+            }
+            $name = $file['name'];
+            $size = (int) $file['size'];
+            $hash = (string) ($file['hash_16K'] ?? '');
+            $coerced[] = ['name' => $name, 'size' => $size, 'hash_16K' => $hash];
+            if ($tooLarge || strlen($name) > 16_777_216 || strlen($hash) > 16_777_216 || strlen($input) + strlen($name) + strlen($hash) + 16 > 16_777_216) {
+                $tooLarge = true;
+
+                continue;
+            }
+            $input .= pack('VqV', strlen($name), $size, strlen($hash)).$name.$hash;
+            $count++;
+        }
+        if ($tooLarge) {
+            return self::listFromPar2InfoPhp($coerced);
+        }
+        if ($count === 0) {
+            $supported = true;
+
+            return [];
+        }
+        try {
+            $state = &self::w44State();
+            $state['ffi'] ??= RustPipelineLibrary::resolveDomain('w44_par2_file_entry', self::FFI_CDEF) ?? false;
+            if ($state['ffi'] === false) {
+                return self::listFromPar2InfoPhp($coerced);
+            }
+            $capacity = strlen($input);
+            $output = $state['ffi']->new('char['.$capacity.']');
+            // @phpstan-ignore method.notFound
+            $written = $state['ffi']->nntmux_w44_par2_normalize_entries($input, $capacity, $count, $output, $capacity);
+            if ($written !== $capacity) {
+                return self::listFromPar2InfoPhp($coerced);
+            }
+            $encoded = FFI::string($output, $written);
+            $entries = [];
+            $offset = 0;
+            for ($index = 0; $index < $count; $index++) {
+                $header = unpack('Vname/qsize/Vhash', $encoded, $offset);
+                if ($header === false || ! is_int($header['name']) || ! is_int($header['size']) || ! is_int($header['hash']) || $header['size'] <= 0) {
+                    return self::listFromPar2InfoPhp($coerced);
+                }
+                $offset += 16;
+                $entries[] = new self(substr($encoded, $offset, $header['name']), $header['size'], substr($encoded, $offset + $header['name'], $header['hash']));
+                $offset += $header['name'] + $header['hash'];
+            }
+            $supported = true;
+
+            return $entries;
+        } catch (Throwable) {
+            return self::listFromPar2InfoPhp($coerced);
+        }
     }
 
     /**
@@ -62,7 +172,7 @@ final readonly class Par2FileEntry
     {
         $parsed = Par2FileList::extractFilesPhp($data);
 
-        return $parsed === null ? [] : self::listFromPar2Info($parsed['files']);
+        return $parsed === null ? [] : self::listFromPar2InfoPhp($parsed['files']);
     }
 
     /**

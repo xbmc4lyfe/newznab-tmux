@@ -23,10 +23,37 @@ use Throwable;
  */
 class MediaSourceResolver
 {
+    public const bool W44_RUST_FFI_DEFAULT = true;
+
+    private static ?bool $w44RustFfi = null;
+
+    /** @var array<string, FFI|null> */
+    private static array $w44Libraries = [];
+
+    public static function useRustFfi(?bool $enabled): void
+    {
+        self::$w44RustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$w44RustFfi ?? self::W44_RUST_FFI_DEFAULT;
+    }
+
+    private function w44Ffi(): ?FFI
+    {
+        $key = $this->libraryPath === null ? 'default' : 'path:'.$this->libraryPath;
+        if (! array_key_exists($key, self::$w44Libraries)) {
+            self::$w44Libraries[$key] = RustPipelineLibrary::resolveDomain('w44_media_source_resolver', self::FFI_CDEF, $this->libraryPath);
+        }
+
+        return self::$w44Libraries[$key];
+    }
+
     private const string PAR2_SIGNATURE = "PAR2\0PKT";
 
     public const string FFI_CDEF = <<<'C'
-        ssize_t nntmux_media_source_rank_wanted_files_nul(const char *names, size_t names_len, const char *sizes, size_t sizes_len, const char *video_regex, size_t video_regex_len, size_t count, char *out_buf, size_t out_cap);
+        ssize_t nntmux_w44_media_source_rank_wanted_files_nul(const char *names, size_t names_len, const char *sizes, size_t sizes_len, const char *video_regex, size_t video_regex_len, size_t count, char *out_buf, size_t out_cap);
         C;
 
     public function __construct(
@@ -196,7 +223,7 @@ class MediaSourceResolver
      */
     public function wantedFiles(array $files): array
     {
-        return $this->wantedFilesNative($files);
+        return self::usesRustFfi() ? $this->wantedFilesNative($files) : $this->wantedFilesPhp($files);
     }
 
     /**
@@ -209,7 +236,7 @@ class MediaSourceResolver
     {
         $supported = false;
         $count = count($files);
-        $ffi = RustPipelineLibrary::resolveDomain('media_source_resolver', self::FFI_CDEF, $this->libraryPath);
+        $ffi = $this->w44Ffi();
         if ($ffi === null) {
             return $this->wantedFilesPhp($files);
         }
@@ -243,7 +270,7 @@ class MediaSourceResolver
 
         try {
             // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_media_source_rank_wanted_files_nul(
+            $written = $ffi->nntmux_w44_media_source_rank_wanted_files_nul(
                 $joinedNames,
                 strlen($joinedNames),
                 $packedSizes,
@@ -260,7 +287,7 @@ class MediaSourceResolver
                     return $this->wantedFilesPhp($files);
                 }
                 // @phpstan-ignore method.notFound
-                $written = $ffi->nntmux_media_source_rank_wanted_files_nul(
+                $written = $ffi->nntmux_w44_media_source_rank_wanted_files_nul(
                     $joinedNames,
                     strlen($joinedNames),
                     $packedSizes,

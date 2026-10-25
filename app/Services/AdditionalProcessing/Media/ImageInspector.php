@@ -12,14 +12,26 @@ use Throwable;
  * Decides whether a downloaded image is worth publishing as a release's sample picture:
  * a complete JPEG, PNG or WebP, large enough to show something, and not blank.
  *
- * isUsable() and isComplete() stay on native PHP: kernel open/fstat/read syscalls dominate
- * file-completeness checks and Zend's rtrim/str_contains is faster than FFI string marshaling
- * on 4 KiB tails, so the Rust candidates (isUsableNative(), isCompleteNative(),
- * isCompleteTailNative()) measure below the 1.5x adoption threshold
- * (see tests/Unit/RustImageInspectorFrameScorerParityTest.php).
+ * Wave 44 keeps file I/O and image decoding in PHP and optionally inspects the
+ * header/tail bytes through Rust. Its default is qualified against complete PHP
+ * caller timings in RustAdditionalDtoArchivePar2ImageInspectorSourceMapperW44ParityTest.
  */
 final class ImageInspector
 {
+    public const bool W44_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $w44RustFfi = null;
+
+    public static function useRustFfi(?bool $enabled): void
+    {
+        self::$w44RustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$w44RustFfi ?? self::W44_RUST_FFI_DEFAULT;
+    }
+
     /** Smallest width and height accepted; smaller images are icons and banners. */
     private const int MIN_EDGE = 150;
 
@@ -27,7 +39,7 @@ final class ImageInspector
     private const int MAX_MEASURED_PIXELS = 12_000_000;
 
     private const string FFI_CDEF = <<<'C'
-        int32_t nntmux_image_is_complete_tail(uint32_t type_code, uint64_t file_size, const char *head_or_tail_ptr, size_t head_or_tail_len);
+        int32_t nntmux_w44_image_is_complete_tail(uint32_t type_code, uint64_t file_size, const char *head_or_tail_ptr, size_t head_or_tail_len);
         int32_t nntmux_image_is_complete_file(const char *path_ptr, size_t path_len, uint32_t type_code);
         C;
 
@@ -93,18 +105,48 @@ final class ImageInspector
      */
     public function isComplete(string $path, int $type): bool
     {
-        return $this->isCompletePhp($path, $type);
+        if (! self::usesRustFfi() || ! in_array($type, [IMAGETYPE_JPEG, IMAGETYPE_PNG, IMAGETYPE_WEBP], true)) {
+            return $this->isCompletePhp($path, $type);
+        }
+
+        $size = (int) @filesize($path);
+        $handle = @fopen($path, 'rb');
+        if ($handle === false) {
+            return false;
+        }
+        try {
+            if ($size < 16) {
+                return false;
+            }
+            if ($type !== IMAGETYPE_WEBP) {
+                fseek($handle, max(0, $size - 4096));
+            }
+
+            return self::isCompleteTail($type, $size, (string) fread($handle, $type === IMAGETYPE_WEBP ? 8 : 4096));
+        } finally {
+            fclose($handle);
+        }
+    }
+
+    public static function isCompleteTail(int $type, int $fileSize, string $headOrTail): bool
+    {
+        return self::usesRustFfi()
+            ? self::isCompleteTailNative($type, $fileSize, $headOrTail)
+            : self::isCompleteTailPhp($type, $fileSize, $headOrTail);
     }
 
     public function isCompletePhp(string $path, int $type): bool
     {
         $size = (int) @filesize($path);
         $handle = @fopen($path, 'rb');
-        if ($handle === false || $size < 16) {
+        if ($handle === false) {
             return false;
         }
 
         try {
+            if ($size < 16) {
+                return false;
+            }
             if ($type === IMAGETYPE_WEBP) {
                 $header = (string) fread($handle, 8);
                 $declared = unpack('V', substr($header, 4, 4));
@@ -161,7 +203,7 @@ final class ImageInspector
 
         try {
             // @phpstan-ignore method.notFound
-            $status = $ffi->nntmux_image_is_complete_tail($type, $fileSize, $headOrTail, strlen($headOrTail));
+            $status = $ffi->nntmux_w44_image_is_complete_tail($type, $fileSize, $headOrTail, strlen($headOrTail));
         } catch (Throwable) {
             return self::isCompleteTailPhp($type, $fileSize, $headOrTail);
         }
@@ -199,7 +241,7 @@ final class ImageInspector
     {
         if (! self::$ffiResolved) {
             self::$ffiResolved = true;
-            self::$ffi = RustPipelineLibrary::resolveDomain('image_inspector', self::FFI_CDEF);
+            self::$ffi = RustPipelineLibrary::resolveDomain('w44_image_inspector', self::FFI_CDEF);
         }
 
         return self::$ffi;
