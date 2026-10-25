@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Verification;
 
+use App\Services\Par2PacketAccumulator;
 use dariusiii\rarinfo\Par2Info;
 
 /**
@@ -16,6 +17,30 @@ use dariusiii\rarinfo\Par2Info;
  */
 final class Par2ProofIdentity
 {
+    /**
+     * Default for the Wave 44.2 toggle only (summarizeProofIdentities); false because the paired benchmark in
+     * tests/Unit/RustPar2PacketMetadataProofPayloadSanitizerW44ParityTest.php is below 1.5x (common mean 0.46-0.53x).
+     */
+    public const bool W442_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useW442RustFfi = null;
+
+    /** Force the Wave 44.2 helper onto Rust (true) or PHP (false); null restores W442_RUST_FFI_DEFAULT. */
+    public static function useW442RustFfi(?bool $enable = true): void
+    {
+        self::$useW442RustFfi = $enable;
+    }
+
+    public static function usesW442RustFfi(): bool
+    {
+        return self::$useW442RustFfi ?? self::W442_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW442RustFfi(): void
+    {
+        self::$useW442RustFfi = null;
+    }
+
     /** @param list<array<string, mixed>> $packets */
     public static function fromPackets(array $packets): ?string
     {
@@ -81,5 +106,71 @@ final class Par2ProofIdentity
         }
 
         return hash('sha256', serialize(['par2-source-proof-v1', $set, $main, $descriptors, $checksums]));
+    }
+
+    /**
+     * Group fromPackets() results as a verifier sharing source proofs would: null is absent (no shareable proof), any
+     * other value that is not a lowercase SHA-256 hex digest is invalid, and proofs are grouped by identity to report
+     * their distinct count and the largest group that one successful verification covers.
+     *
+     * @param  array<array-key, mixed>  $identities
+     * @return array{identities: int, absent: int, invalid: int, proofs: int, distinct: int, largest_group: int}
+     */
+    public static function summarizeProofIdentities(array $identities): array
+    {
+        return (self::usesW442RustFfi() ? self::summarizeProofIdentitiesNative($identities) : null)
+            ?? self::summarizeProofIdentitiesPhp($identities);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $identities
+     * @return array{identities: int, absent: int, invalid: int, proofs: int, distinct: int, largest_group: int}
+     */
+    public static function summarizeProofIdentitiesPhp(array $identities): array
+    {
+        $absent = $invalid = $proofs = $largest = 0;
+        $groups = [];
+        foreach ($identities as $identity) {
+            if ($identity === null) {
+                $absent++;
+            } elseif (! \is_string($identity) || preg_match('/\A[0-9a-f]{64}\z/', $identity) !== 1) {
+                $invalid++;
+            } else {
+                $proofs++;
+                $groups[$identity] = ($groups[$identity] ?? 0) + 1;
+                $largest = max($largest, $groups[$identity]);
+            }
+        }
+
+        return ['identities' => \count($identities), 'absent' => $absent, 'invalid' => $invalid, 'proofs' => $proofs, 'distinct' => \count($groups), 'largest_group' => $largest];
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $identities
+     * @return array{identities: int, absent: int, invalid: int, proofs: int, distinct: int, largest_group: int}|null
+     */
+    public static function summarizeProofIdentitiesNative(array $identities): ?array
+    {
+        $slots = [];
+        $tail = [];
+        foreach ($identities as $identity) {
+            if (\is_string($identity)) {
+                array_push($slots, \strlen($identity), 0);
+                $tail[] = $identity;
+            } else {
+                array_push($slots, -1, $identity === null ? 1 : 2);
+            }
+        }
+        $values = Par2PacketAccumulator::evaluateW442Native(2, \count($identities), $slots, implode('', $tail), 6);
+        if ($values === null) {
+            return null;
+        }
+        [$count, $absent, $invalid, $proofs, $distinct, $largest] = $values;
+        if ($count !== \count($identities) || min($values) < 0 || $absent + $invalid + $proofs !== $count
+            || $distinct > $proofs || $largest > $proofs || ($proofs > 0) !== ($distinct > 0 && $largest > 0)) {
+            return null;
+        }
+
+        return ['identities' => $count, 'absent' => $absent, 'invalid' => $invalid, 'proofs' => $proofs, 'distinct' => $distinct, 'largest_group' => $largest];
     }
 }
