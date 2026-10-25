@@ -3842,4 +3842,132 @@ class ManticoreSearchDriver implements BulkReleaseIndexUpdater, PredbFilenameCan
 
         return array_keys($seen);
     }
+
+    /**
+     * Rust stays opt-in for the Wave 40.5 summary: the FFI round trip misses the 1.5x gate; see
+     * tests/Unit/RustManticoreElasticSearchServiceCircuitW40ParityTest.php.
+     */
+    public const bool W405_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useW405RustFfi = null;
+
+    public static function useW405RustFfi(?bool $use = true): void
+    {
+        self::$useW405RustFfi = $use;
+    }
+
+    public static function usesW405RustFfi(): bool
+    {
+        return self::$useW405RustFfi ?? self::W405_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW405RustFfi(): void
+    {
+        self::$useW405RustFfi = null;
+    }
+
+    /**
+     * Summarizes a Manticore bulk upsert batch. A document is valid when it is an array whose `id`
+     * is a positive integer; only valid documents are sized and chunked. A document is estimated at
+     * 2 bytes plus, for each scalar field, `strlen(key) + strlen(value) + 4` (ints and floats as
+     * `(string)`, booleans as `1`/`0`; null and array fields are skipped). Chunks pack documents
+     * greedily up to `$maxBatchBytes`, and an oversized document gets its own chunk.
+     *
+     * @param  array<array-key, mixed>  $documents
+     * @return array{total_documents: int, valid_id_count: int, invalid_id_count: int, estimated_bytes: int, exceeds_batch_limit: bool, chunk_count: int}
+     */
+    public static function summarizeManticoreBulkUpsertBatch(array $documents, int $maxBatchBytes = 8388608): array
+    {
+        return self::usesW405RustFfi()
+            ? self::summarizeManticoreBulkUpsertBatchNative($documents, $maxBatchBytes)
+            : self::summarizeManticoreBulkUpsertBatchPhp($documents, $maxBatchBytes);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $documents
+     * @return array{total_documents: int, valid_id_count: int, invalid_id_count: int, estimated_bytes: int, exceeds_batch_limit: bool, chunk_count: int}
+     */
+    private static function summarizeManticoreBulkUpsertBatchNative(array $documents, int $maxBatchBytes): array
+    {
+        $parts = [(string) $maxBatchBytes];
+        foreach ($documents as $document) {
+            if (! \is_array($document)) {
+                array_push($parts, '', '0');
+
+                continue;
+            }
+            $id = $document['id'] ?? null;
+            $fields = [];
+            foreach ($document as $key => $value) {
+                $encoded = self::scalarField($value);
+                if ($encoded !== null) {
+                    array_push($fields, (string) $key, $encoded);
+                }
+            }
+            array_push($parts, \is_int($id) ? (string) $id : '', (string) intdiv(\count($fields), 2), ...$fields);
+        }
+        $fields = SearchService::evaluateW405Native(1, $parts);
+        if ($fields === null || \count($fields) !== 6) {
+            return self::summarizeManticoreBulkUpsertBatchPhp($documents, $maxBatchBytes);
+        }
+
+        return [
+            'total_documents' => (int) $fields[0],
+            'valid_id_count' => (int) $fields[1],
+            'invalid_id_count' => (int) $fields[2],
+            'estimated_bytes' => (int) $fields[3],
+            'exceeds_batch_limit' => $fields[4] === '1',
+            'chunk_count' => (int) $fields[5],
+        ];
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $documents
+     * @return array{total_documents: int, valid_id_count: int, invalid_id_count: int, estimated_bytes: int, exceeds_batch_limit: bool, chunk_count: int}
+     */
+    private static function summarizeManticoreBulkUpsertBatchPhp(array $documents, int $maxBatchBytes): array
+    {
+        $valid = $invalid = $total = $chunks = $current = 0;
+        foreach ($documents as $document) {
+            if (! \is_array($document) || ! \is_int($document['id'] ?? null) || $document['id'] <= 0) {
+                $invalid++;
+
+                continue;
+            }
+            $valid++;
+            $bytes = 2;
+            foreach ($document as $key => $value) {
+                $encoded = self::scalarField($value);
+                if ($encoded !== null) {
+                    $bytes += \strlen((string) $key) + \strlen($encoded) + 4;
+                }
+            }
+            $total += $bytes;
+            if ($chunks === 0 || $current + $bytes > $maxBatchBytes) {
+                $chunks++;
+                $current = $bytes;
+            } else {
+                $current += $bytes;
+            }
+        }
+
+        return [
+            'total_documents' => \count($documents),
+            'valid_id_count' => $valid,
+            'invalid_id_count' => $invalid,
+            'estimated_bytes' => $total,
+            'exceeds_batch_limit' => $total > $maxBatchBytes,
+            'chunk_count' => $chunks,
+        ];
+    }
+
+    private static function scalarField(mixed $value): ?string
+    {
+        return match (true) {
+            \is_string($value) => $value,
+            \is_int($value), \is_float($value) => (string) $value,
+            \is_bool($value) => $value ? '1' : '0',
+            default => null,
+        };
+    }
 }
