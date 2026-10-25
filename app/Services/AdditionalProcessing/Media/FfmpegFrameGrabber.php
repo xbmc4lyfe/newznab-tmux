@@ -17,8 +17,23 @@ use Throwable;
  */
 class FfmpegFrameGrabber implements VideoFrameGrabber
 {
+    // Production adoption requires >= 1.5x mean and p99 on both W43 workloads.
+    public const bool W43_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $w43RustFfi = null;
+
+    public static function useRustFfi(?bool $enabled = true): void
+    {
+        self::$w43RustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$w43RustFfi ?? self::W43_RUST_FFI_DEFAULT;
+    }
+
     public const string FFI_CDEF = <<<'C'
-        double nntmux_ffmpeg_clock_seconds(const char *ptr, size_t len);
+        double nntmux_w436_ffmpeg_clock_seconds(const char *ptr, size_t len);
         C;
 
     private static ?FFI $ffi = null;
@@ -126,7 +141,7 @@ class FfmpegFrameGrabber implements VideoFrameGrabber
      */
     public static function clockSeconds(mixed $value): ?float
     {
-        return self::clockSecondsPhp($value);
+        return self::usesRustFfi() ? self::clockSecondsNative($value) : self::clockSecondsPhp($value);
     }
 
     public static function clockSecondsPhp(mixed $value): ?float
@@ -156,7 +171,7 @@ class FfmpegFrameGrabber implements VideoFrameGrabber
 
         try {
             // @phpstan-ignore method.notFound
-            $seconds = $ffi->nntmux_ffmpeg_clock_seconds($value, strlen($value));
+            $seconds = $ffi->nntmux_w436_ffmpeg_clock_seconds($value, strlen($value));
         } catch (Throwable) {
             return self::clockSecondsPhp($value);
         }

@@ -6260,6 +6260,581 @@ pub unsafe extern "C" fn nntmux_ffmpeg_clock_seconds(ptr: *const u8, len: usize)
     parse_ffmpeg_clock_seconds(value)
 }
 
+// Wave 43.6 has dedicated exports so its independently qualified PHP domains do
+// not change the behavior or adoption status of earlier callers.
+
+/// Parse only unambiguous PHP integer strings. Decimal/exponent conversion and
+/// overflow stay in PHP rather than silently using the older prefix parser.
+fn w436_range_integer(mut value: &[u8]) -> Option<i64> {
+    while value.first().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[1..];
+    }
+    while value.last().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[..value.len() - 1];
+    }
+    if value.is_empty() {
+        return Some(0);
+    }
+    let digits = if matches!(value[0], b'+' | b'-') {
+        &value[1..]
+    } else {
+        value
+    };
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(value).ok()?.parse().ok()
+}
+
+/// The six output slots and arguments match `nntmux_archived_media_range`.
+/// Returns -2 for arithmetic or PHP conversion cases that require fallback,
+/// -1 for invalid pointer/length arguments, otherwise 1 for an entry or 0 when
+/// its start is outside the downloaded data. Negative returns do not write.
+///
+/// # Safety
+/// Inputs must be readable for their lengths; `out_bounds` must be aligned and
+/// writable for six i64 values, without overlapping either input.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w436_archived_media_range(
+    range_ptr: *const u8,
+    range_len: usize,
+    name_ptr: *const u8,
+    name_len: usize,
+    file_size: i64,
+    next_offset: i64,
+    has_next_offset: u32,
+    data_len: i64,
+    max_sample_bytes: i64,
+    min_main_video_bytes: i64,
+    out_bounds: *mut i64,
+) -> i32 {
+    if (range_ptr.is_null() && range_len != 0)
+        || (name_ptr.is_null() && name_len != 0)
+        || range_len > isize::MAX as usize
+        || name_len > isize::MAX as usize
+        || out_bounds.is_null()
+    {
+        return -1;
+    }
+    let range = if range_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(range_ptr, range_len) }
+    };
+    let name = if name_len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(name_ptr, name_len) }
+    };
+    let (start_bytes, end_bytes) = match range.iter().position(|&b| b == b'-') {
+        Some(dash) => (&range[..dash], Some(&range[dash + 1..])),
+        None => (range, None),
+    };
+    let Some(start) = w436_range_integer(start_bytes) else {
+        return -2;
+    };
+    let end = match end_bytes {
+        Some(bytes) => match w436_range_integer(bytes) {
+            Some(end) => end,
+            None => return -2,
+        },
+        None => -1,
+    };
+    if data_len < 0 || max_sample_bytes < 0 {
+        return -2;
+    }
+    let volume_end = if has_next_offset != 0 && next_offset > start {
+        next_offset.checked_sub(1)
+    } else {
+        start.checked_add(file_size).and_then(|n| n.checked_sub(1))
+    };
+    let Some(volume_end) = volume_end else {
+        return -2;
+    };
+    let available = if data_len == 0 {
+        Some(0)
+    } else {
+        volume_end
+            .min(data_len - 1)
+            .checked_sub(start)
+            .and_then(|n| n.checked_add(1))
+    };
+    let Some(available) = available else {
+        return -2;
+    };
+    let head_len = available.min(max_sample_bytes);
+    // PHP substr interprets negative lengths relative to the end of the data;
+    // the older export's zero clamp is not equivalent for these entries.
+    if start < 0 || (start < data_len && head_len < 0) {
+        return -2;
+    }
+    let bounds = [
+        start,
+        end,
+        volume_end,
+        available,
+        head_len.max(0),
+        i64::from(has_sample_token(name) || file_size < min_main_video_bytes),
+    ];
+    unsafe { std::ptr::copy_nonoverlapping(bounds.as_ptr(), out_bounds, bounds.len()) };
+    i32::from(start < data_len)
+}
+
+/// Wave 43.6 container offsets; status and ABI match `nntmux_container_splice`.
+///
+/// # Safety
+/// Input buffers must be readable for their lengths and outputs aligned and
+/// writable, as required by `nntmux_container_splice`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w436_container_splice(
+    container_code: u8,
+    head_ptr: *const u8,
+    head_len: usize,
+    tail_ptr: *const u8,
+    tail_len: usize,
+    out_head_end: *mut usize,
+    out_tail_start: *mut usize,
+) -> i32 {
+    if head_len > isize::MAX as usize || tail_len > isize::MAX as usize {
+        return -1;
+    }
+    unsafe {
+        nntmux_container_splice(
+            container_code,
+            head_ptr,
+            head_len,
+            tail_ptr,
+            tail_len,
+            out_head_end,
+            out_tail_start,
+        )
+    }
+}
+
+/// Wave 43.6 clock parser; -1 means no positive clock and -2 requests fallback.
+///
+/// # Safety
+/// `ptr` must be readable for `len` bytes when `len` is nonzero.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w436_ffmpeg_clock_seconds(ptr: *const u8, len: usize) -> f64 {
+    if len > isize::MAX as usize {
+        return -2.0;
+    }
+    unsafe { nntmux_ffmpeg_clock_seconds(ptr, len) }
+}
+
+/// Wave 43.6 RGB luma statistics; ABI matches the media kernel.
+///
+/// # Safety
+/// `rgb_bytes_ptr` must be readable for `3 * pixel_count` bytes and both outputs
+/// must be aligned and writable, as required by the media kernel.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w436_frame_luma_stats_rgb(
+    rgb_bytes_ptr: *const u8,
+    pixel_count: usize,
+    out_mean: *mut f64,
+    out_stddev: *mut f64,
+) -> i32 {
+    if pixel_count > isize::MAX as usize / 3 {
+        return -1;
+    }
+    unsafe {
+        crate::media::nntmux_frame_luma_stats_rgb(rgb_bytes_ptr, pixel_count, out_mean, out_stddev)
+    }
+}
+
+/// Wave 43.6 uncompressed BMP luma statistics; ABI matches the media kernel.
+///
+/// # Safety
+/// `bmp_ptr` must be readable for `bmp_len` bytes and both outputs aligned and
+/// writable, as required by the media kernel.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w436_frame_luma_stats_bmp(
+    bmp_ptr: *const u8,
+    bmp_len: usize,
+    out_mean: *mut f64,
+    out_stddev: *mut f64,
+) -> i32 {
+    if bmp_len > isize::MAX as usize {
+        return -1;
+    }
+    unsafe { crate::media::nntmux_frame_luma_stats_bmp(bmp_ptr, bmp_len, out_mean, out_stddev) }
+}
+
+/// Wave 43.6 rank, or -2 when PHP filename semantics require fallback.
+///
+/// # Safety
+/// `ptr` must be readable for `len` bytes when `len` is nonzero.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w436_image_candidate_rank(ptr: *const u8, len: usize) -> i32 {
+    if (ptr.is_null() && len != 0) || len > isize::MAX as usize {
+        return -1;
+    }
+    let name = if len == 0 {
+        &[][..]
+    } else {
+        unsafe { slice::from_raw_parts(ptr, len) }
+    };
+    // PHP's quoted-name regex can skip an empty first pair and start a match
+    // at the second quote. The shared filename helper only tries the first.
+    if let Some(first) = name.iter().position(|&b| b == b'"') {
+        if name.get(first + 1) == Some(&b'"') {
+            return -2;
+        }
+    }
+    image_candidate_rank(name).unwrap_or(-2)
+}
+
+#[cfg(test)]
+mod w436_additional_media_tests {
+    use super::*;
+    use std::ptr::{null, null_mut};
+
+    fn archived(
+        range: &[u8],
+        size: i64,
+        next: Option<i64>,
+        data: i64,
+        max: i64,
+    ) -> (i32, [i64; 6]) {
+        let name = b"Movie.Sample.mkv";
+        let mut bounds = [123; 6];
+        let status = unsafe {
+            nntmux_w436_archived_media_range(
+                range.as_ptr(),
+                range.len(),
+                name.as_ptr(),
+                name.len(),
+                size,
+                next.unwrap_or(0),
+                u32::from(next.is_some()),
+                data,
+                max,
+                100,
+                bounds.as_mut_ptr(),
+            )
+        };
+        (status, bounds)
+    }
+
+    #[test]
+    fn archived_bounds_match_php_integer_and_volume_cases() {
+        assert_eq!(
+            archived(b"128-65663", 65536, Some(65664), 32768, 16384),
+            (1, [128, 65663, 65663, 32640, 16384, 1])
+        );
+        assert_eq!(
+            archived(b" +0010 - +0020 ", 30, None, 100, 100),
+            (1, [10, 20, 39, 30, 30, 1])
+        );
+        assert_eq!(
+            archived(b"10--20", 30, Some(10), 100, 100),
+            (1, [10, -20, 39, 30, 30, 1])
+        );
+        assert_eq!(
+            archived(b"-5", 30, None, 100, 100),
+            (1, [0, 5, 29, 30, 30, 1])
+        );
+        assert_eq!(
+            archived(b"10-", 30, None, 100, 0),
+            (1, [10, 0, 39, 30, 0, 1])
+        );
+        assert_eq!(
+            archived(b"", 30, None, 100, 100),
+            (1, [0, -1, 29, 30, 30, 1])
+        );
+        // rangeNative's zero-valued sentinel still returns parsed bounds.
+        assert_eq!(
+            archived(b"128-500", 0, None, 0, 0),
+            (0, [128, 500, 127, 0, 0, 1])
+        );
+        assert_eq!(archived(b"100-200", 30, None, 100, 100).0, 0);
+        assert_eq!(archived(b"10-20", 0, None, 100, 100).1[4], 0);
+    }
+
+    #[test]
+    fn archived_declines_non_php_prefix_conversion_and_negative_substr_lengths() {
+        for range in [
+            &b"1.5-20"[..],
+            &b"1e2-200"[..],
+            &b"10-2E3"[..],
+            &b"10foo-20"[..],
+            &b"9223372036854775808-20"[..],
+            &b"10--9223372036854775809"[..],
+            &b"+"[..],
+        ] {
+            assert_eq!(
+                archived(range, 30, None, 100, 100),
+                (-2, [123; 6]),
+                "{range:?}"
+            );
+        }
+        assert_eq!(archived(b"10-20", -1, None, 100, 100), (-2, [123; 6]));
+        assert_eq!(archived(b"10-20", 30, None, 100, -1), (-2, [123; 6]));
+        assert_eq!(archived(b"10-20", 30, None, -1, 100), (-2, [123; 6]));
+        assert_eq!(archived(b"1-20", i64::MAX, None, 100, 100), (-2, [123; 6]));
+        assert_eq!(archived(b"0-20", i64::MIN, None, 100, 100), (-2, [123; 6]));
+    }
+
+    #[test]
+    fn archived_sample_boundaries_and_invalid_pointers() {
+        let mut bounds = [123; 6];
+        for (name, size, expected) in [
+            (&b"movie.Sample.mkv"[..], 1000, 1),
+            (&b"movie.sample\n"[..], 1000, 1),
+            (&b"movie.samples.mkv"[..], 1000, 0),
+            (&b"movie.mkv"[..], 99, 1),
+        ] {
+            assert_eq!(
+                unsafe {
+                    nntmux_w436_archived_media_range(
+                        null(),
+                        0,
+                        name.as_ptr(),
+                        name.len(),
+                        size,
+                        0,
+                        0,
+                        100,
+                        50,
+                        100,
+                        bounds.as_mut_ptr(),
+                    )
+                },
+                1
+            );
+            assert_eq!(bounds[5], expected);
+        }
+        bounds = [123; 6];
+        for (range, range_len, name, name_len, output) in [
+            (null(), 1, null(), 0, bounds.as_mut_ptr()),
+            (null(), 0, null(), 1, bounds.as_mut_ptr()),
+            (null(), 0, null(), 0, null_mut()),
+            (b"x".as_ptr(), usize::MAX, null(), 0, bounds.as_mut_ptr()),
+        ] {
+            assert_eq!(
+                unsafe {
+                    nntmux_w436_archived_media_range(
+                        range, range_len, name, name_len, 10, 0, 0, 10, 10, 100, output,
+                    )
+                },
+                -1
+            );
+        }
+        assert_eq!(bounds, [123; 6]);
+    }
+
+    #[test]
+    fn splice_wrappers_preserve_offsets_and_no_match() {
+        let mut transport = vec![0; 188 * 4 + 6];
+        for i in 0..4 {
+            transport[5 + 188 * i] = 0x47;
+        }
+        for (code, head, tail, expected) in [
+            (
+                1,
+                &b"head\x1f\x43\xb6\x75"[..],
+                &b"tail\x1f\x43\xb6\x75"[..],
+                Some((4, 4)),
+            ),
+            (
+                2,
+                &b"LISTxxxxmovixxxx"[..],
+                &b"1xdc12wb34dc"[..],
+                Some((12, 4)),
+            ),
+            (3, &b""[..], &b"x\0\0\x01\xba"[..], Some((0, 1))),
+            (4, &b""[..], &transport[..], Some((0, 5))),
+            (5, &b"ignored"[..], &b"ignored"[..], None),
+            (1, &b"head"[..], &b"no marker"[..], None),
+            (2, &b"movixxxxLISTxxxxmovi"[..], &b"12wb"[..], None),
+        ] {
+            let (mut h, mut t) = (999, 999);
+            assert_eq!(
+                unsafe {
+                    nntmux_w436_container_splice(
+                        code,
+                        head.as_ptr(),
+                        head.len(),
+                        tail.as_ptr(),
+                        tail.len(),
+                        &mut h,
+                        &mut t,
+                    )
+                },
+                i32::from(expected.is_some())
+            );
+            assert_eq!((h, t), expected.unwrap_or((999, 999)));
+        }
+        let (mut h, mut t) = (999usize, 999usize);
+        for (head, head_len, tail, tail_len, output) in [
+            (null(), 1, null(), 0, &mut h as *mut usize),
+            (null(), 0, null(), 1, &mut h as *mut usize),
+            (null(), 0, null(), 0, null_mut()),
+            (b"x".as_ptr(), usize::MAX, null(), 0, &mut h as *mut usize),
+        ] {
+            assert_eq!(
+                unsafe {
+                    nntmux_w436_container_splice(1, head, head_len, tail, tail_len, output, &mut t)
+                },
+                -1
+            );
+        }
+        assert_eq!((h, t), (999, 999));
+    }
+
+    #[test]
+    fn clock_matches_php_regex_and_falls_back_for_large_hours() {
+        for (value, expected) in [
+            (&b"01:30:15.500"[..], 5415.5),
+            (&b"0:00:00.001\n"[..], 0.001),
+            (&b"1:99:99"[..], 9639.0),
+            (&b"000:00:01"[..], 1.0),
+            (&b"00:00:00.000"[..], -1.0),
+            (&b"1:2:03"[..], -1.0),
+            (&b" 1:02:03"[..], -1.0),
+            (&b"1:02:03\r\n"[..], -1.0),
+            (&b"1:02:03\n\n"[..], -1.0),
+            (&b"1:02:03."[..], -1.0),
+            (&b"1:02:03e1"[..], -1.0),
+            (&b"9999999999999999:00:00"[..], -2.0),
+        ] {
+            assert_eq!(
+                unsafe { nntmux_w436_ffmpeg_clock_seconds(value.as_ptr(), value.len()) },
+                expected
+            );
+        }
+        assert_eq!(unsafe { nntmux_w436_ffmpeg_clock_seconds(null(), 0) }, -1.0);
+        assert_eq!(unsafe { nntmux_w436_ffmpeg_clock_seconds(null(), 1) }, -2.0);
+        assert_eq!(
+            unsafe { nntmux_w436_ffmpeg_clock_seconds(b"x".as_ptr(), usize::MAX) },
+            -2.0
+        );
+    }
+
+    #[test]
+    fn luma_rgb_and_bmp_preserve_summation_order_and_padding() {
+        let rgb = [255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255];
+        let (mut mean, mut stddev) = (0.0, 0.0);
+        assert_eq!(
+            unsafe { nntmux_w436_frame_luma_stats_rgb(rgb.as_ptr(), 4, &mut mean, &mut stddev) },
+            1
+        );
+        let mut lumas = Vec::new();
+        for pixel in rgb.chunks_exact(3) {
+            lumas.push(
+                0.299 * f64::from(pixel[0])
+                    + 0.587 * f64::from(pixel[1])
+                    + 0.114 * f64::from(pixel[2]),
+            );
+        }
+        let expected_mean = lumas.iter().sum::<f64>() / 4.0;
+        let expected_stddev =
+            (lumas.iter().map(|l| l * l).sum::<f64>() / 4.0 - expected_mean * expected_mean).sqrt();
+        assert_eq!(mean.to_bits(), expected_mean.to_bits());
+        assert_eq!(stddev.to_bits(), expected_stddev.to_bits());
+        for height in [2i32, -2] {
+            let mut bmp = vec![0u8; 54 + 8 * 2];
+            bmp[..2].copy_from_slice(b"BM");
+            bmp[10..14].copy_from_slice(&54u32.to_le_bytes());
+            bmp[14..18].copy_from_slice(&40u32.to_le_bytes());
+            bmp[18..22].copy_from_slice(&2i32.to_le_bytes());
+            bmp[22..26].copy_from_slice(&height.to_le_bytes());
+            bmp[26..28].copy_from_slice(&1u16.to_le_bytes());
+            bmp[28..30].copy_from_slice(&24u16.to_le_bytes());
+            for y in 0..2 {
+                let row = if height > 0 { 1 - y } else { y };
+                for x in 0..2 {
+                    let src = (y * 2 + x) * 3;
+                    let dst = 54 + row * 8 + x * 3;
+                    bmp[dst..dst + 3].copy_from_slice(&[rgb[src + 2], rgb[src + 1], rgb[src]]);
+                }
+                bmp[54 + row * 8 + 6..54 + row * 8 + 8].fill(255);
+            }
+            let (mut bm, mut bs) = (0.0, 0.0);
+            assert_eq!(
+                unsafe {
+                    nntmux_w436_frame_luma_stats_bmp(bmp.as_ptr(), bmp.len(), &mut bm, &mut bs)
+                },
+                1
+            );
+            assert_eq!(
+                (bm.to_bits(), bs.to_bits()),
+                (mean.to_bits(), stddev.to_bits())
+            );
+            assert_eq!(
+                unsafe {
+                    nntmux_w436_frame_luma_stats_bmp(bmp.as_ptr(), bmp.len() - 1, &mut bm, &mut bs)
+                },
+                -1
+            );
+            bmp[28..30].copy_from_slice(&32u16.to_le_bytes());
+            assert_eq!(
+                unsafe {
+                    nntmux_w436_frame_luma_stats_bmp(bmp.as_ptr(), bmp.len(), &mut bm, &mut bs)
+                },
+                -1
+            );
+        }
+    }
+
+    #[test]
+    fn luma_invalid_inputs_preserve_outputs() {
+        let (mut mean, mut stddev) = (123.0, 456.0);
+        for (ptr, pixels, out) in [
+            (null(), 1, &mut mean as *mut f64),
+            (b"rgb".as_ptr(), 0, &mut mean as *mut f64),
+            (b"rgb".as_ptr(), usize::MAX, &mut mean as *mut f64),
+            (b"rgb".as_ptr(), 1, null_mut()),
+        ] {
+            assert_eq!(
+                unsafe { nntmux_w436_frame_luma_stats_rgb(ptr, pixels, out, &mut stddev) },
+                -1
+            );
+        }
+        for (ptr, len) in [
+            (null(), 54),
+            (b"BM".as_ptr(), 2),
+            (b"BM".as_ptr(), usize::MAX),
+        ] {
+            assert_eq!(
+                unsafe { nntmux_w436_frame_luma_stats_bmp(ptr, len, &mut mean, &mut stddev) },
+                -1
+            );
+        }
+        assert_eq!((mean, stddev), (123.0, 456.0));
+    }
+
+    #[test]
+    fn ranks_preserve_priority_basename_and_decline_ambiguous_quotes() {
+        for (name, expected) in [
+            (&b"cover.back.screens.jpg"[..], 0),
+            (&b"cover.back.jpg"[..], 3),
+            (&b"poster.jpg"[..], 1),
+            (&b"ordinary.jpg"[..], 2),
+            (&b"dir\\contact-sheet.jpg"[..], 0),
+            (&b"dir\\contact  sheet.jpg"[..], 0), // standalone sheet still matches
+            (&b"\"folder/CD12.jpg\" yEnc"[..], 3),
+            (&b"\"\"folder/cover.jpg\""[..], -2),
+            (&b"folder/"[..], -2),
+            (&b"\xffscreen.jpg"[..], -2),
+            (&b""[..], 2),
+        ] {
+            assert_eq!(
+                unsafe { nntmux_w436_image_candidate_rank(name.as_ptr(), name.len()) },
+                expected,
+                "{name:?}"
+            );
+        }
+        assert_eq!(unsafe { nntmux_w436_image_candidate_rank(null(), 0) }, 2);
+        assert_eq!(unsafe { nntmux_w436_image_candidate_rank(null(), 1) }, -1);
+        assert_eq!(
+            unsafe { nntmux_w436_image_candidate_rank(b"x".as_ptr(), usize::MAX) },
+            -1
+        );
+    }
+}
+
 /// Codec pretty-print code:
 /// 0 = unchanged, 1 = HEVC, 2 = h.264, 3 = MPEG-4, 4 = MPEG-2,
 /// 5 = MPEG-1, 6 = DivX, 7 = XviD, 8 = wmv
