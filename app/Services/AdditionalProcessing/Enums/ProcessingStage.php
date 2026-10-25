@@ -6,6 +6,7 @@ namespace App\Services\AdditionalProcessing\Enums;
 
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 enum ProcessingStage: string
@@ -232,5 +233,185 @@ enum ProcessingStage: string
         }
 
         return $ffi === false ? null : $ffi;
+    }
+
+    // Rust is the default only while the paired W50.6 benchmark clears 1.5x on all four metrics.
+    private const bool W50_RUST_FFI_DEFAULT = true;
+
+    public const string W50_FFI_CDEF = <<<'C'
+        int32_t nntmux_w506_processing_stage_batch(const char *values, size_t values_len, const char *value_twin, size_t value_twin_len, size_t count, int64_t *out, size_t out_count);
+        C;
+
+    public const int W50_STAGE_HEADER = 20;
+
+    private const int W50_MAX_ITEMS = 1_048_576;
+
+    public static function usesW50RustFfi(): bool
+    {
+        return self::w50RustFfiState() === true;
+    }
+
+    /**
+     * Run `$callback` with the Wave 50.6 Rust batch path forced on or off, then restore the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW50RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w50RustFfiState('swap', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w50RustFfiState('swap', $previous);
+        }
+    }
+
+    /**
+     * Resolve and rank a batch of stage names as `tryFromNormalizedPhp()`, `rankPhp()` and
+     * `labelPhp()` do (case 13 is an unresolved value).
+     *
+     * Layout: `[0]` count, `[1..14]` per case, `[15]` highest rank (-1 when none resolves) and
+     * `[16]` its first index, `[17]` 1 when the resolved ranks never decrease, `[18]` label bytes,
+     * `[19]` FNV-1a digest; then per value `case | (rank + 1) << 4 | label length << 8`.
+     *
+     * @param  array<array-key, string>  $values
+     * @return list<int>
+     */
+    public static function rankStageBatch(array $values): array
+    {
+        return (self::usesW50RustFfi() ? self::rankStageBatchNative($values) : null) ?? self::rankStageBatchPhp($values);
+    }
+
+    /**
+     * @param  array<array-key, string>  $values
+     * @return list<int>
+     */
+    public static function rankStageBatchPhp(array $values): array
+    {
+        $out = array_fill(0, self::W50_STAGE_HEADER, 0);
+        $out[0] = \count($values);
+        $out[15] = $out[16] = -1;
+        $out[17] = 1;
+        $last = -1;
+        $digest = 2_166_136_261;
+        $rows = [];
+        $index = 0;
+        foreach ($values as $value) {
+            $stage = self::tryFromNormalizedPhp($value);
+            if ($stage === null) {
+                [$case, $rank, $label] = [13, -1, 0];
+            } else {
+                [$case, $rank, $label] = [$stage->ordinal(), $stage->rankPhp(), \strlen($stage->labelPhp())];
+            }
+            $out[1 + $case]++;
+            if ($rank >= 0) {
+                if ($rank > $out[15]) {
+                    $out[15] = $rank;
+                    $out[16] = $index;
+                }
+                if ($rank < $last) {
+                    $out[17] = 0;
+                }
+                $last = $rank;
+            }
+            $out[18] += $label;
+            $row = $case | ($rank + 1) << 4 | $label << 8;
+            $digest = (($digest ^ $row) * 16_777_619) & 0xFFFFFFFF;
+            $rows[] = $row;
+            $index++;
+        }
+        $out[19] = $digest;
+
+        return [...$out, ...$rows];
+    }
+
+    /**
+     * Rust ranking, or null when PHP must compute it (unavailable library or rejected input).
+     *
+     * @param  array<array-key, string>  $values
+     * @return list<int>|null
+     */
+    public static function rankStageBatchNative(array $values): ?array
+    {
+        $values = array_values($values);
+        $count = \count($values);
+        $fields = self::W50_STAGE_HEADER + $count;
+        /** @var array{0: FFI, 1: CData}|null $binding */
+        $binding = $count <= self::W50_MAX_ITEMS ? self::w50RustFfiState('buffer', $fields) : null;
+        if ($binding === null) {
+            return null;
+        }
+        [$ffi, $out] = $binding;
+        [$joined, $twin] = self::w50Strings($values);
+        try {
+            // @phpstan-ignore method.notFound
+            $status = $ffi->nntmux_w506_processing_stage_batch($joined, \strlen($joined), $twin, \strlen($twin), $count, $out, $fields);
+            if ($status !== 1) {
+                return null;
+            }
+            $unpacked = unpack('P*', FFI::string($out, $fields * 8));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $unpacked === false ? null : array_values($unpacked);
+    }
+
+    /**
+     * Wave 50.6 routing: null reads the toggle, `swap` replaces it (null restores the default)
+     * and returns the previous value, `buffer` returns the cached binding and an output buffer
+     * of at least `$val` values. Enums and readonly classes cannot declare static properties,
+     * so the state lives in function-local statics.
+     */
+    private static function w50RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $enabled */
+        static $enabled = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $buffer */
+        static $buffer = null;
+        static $capacity = 0;
+        if ($op === null) {
+            return $enabled ?? self::W50_RUST_FFI_DEFAULT;
+        }
+        if ($op === 'swap') {
+            $previous = $enabled;
+            $enabled = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        $fields = \is_int($val) ? $val : 0;
+        try {
+            $ffi ??= RustPipelineLibrary::resolveDomain('additional_w50', self::W50_FFI_CDEF) ?? false;
+            if ($ffi === false) {
+                return null;
+            }
+            if ($buffer === null || $capacity < $fields) {
+                $capacity = max(256, $fields);
+                $buffer = $ffi->new('int64_t['.$capacity.']');
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $buffer === null ? null : [$ffi, $buffer];
+    }
+
+    /**
+     * NUL-joined values and, when one holds a NUL, the same list joined with 0x01 so Rust
+     * finds the separators where the two differ.
+     *
+     * @param  list<string>  $items
+     * @return array{0: string, 1: string}
+     */
+    private static function w50Strings(array $items): array
+    {
+        $joined = implode("\0", $items);
+
+        return $items !== [] && substr_count($joined, "\0") !== \count($items) - 1 ? [$joined, implode("\x01", $items)] : [$joined, ''];
     }
 }
