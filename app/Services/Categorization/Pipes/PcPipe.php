@@ -10,6 +10,7 @@ use App\Services\Categorization\Categorizers\PcCategorizer;
 use App\Services\Categorization\ReleaseContext;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 /**
@@ -462,5 +463,195 @@ class PcPipe extends AbstractCategorizationPipe
         }
 
         return self::$w413RustFfiHandle === false ? null : self::$w413RustFfiHandle;
+    }
+
+    /** Wave 54.3 paired benchmarks decide this default; see RustCategorizationPipesConsoleGroupMiscMusicPcW54ParityTest. */
+    private const bool W54_RUST_FFI_DEFAULT = true;
+
+    public const string W54_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w543_pc_platform_flag_batch(const char *blob, size_t blob_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Per uppercased token: `flags | platform << 16` (platform 1 Windows, 2 macOS, 3 Linux, 4 mobile); 32 crack, 64 installer or disc image, 128 BUILD. */
+    private const array W54_PC_TOKENS = [
+        'WIN' => 2 | 1 << 16, 'WINDOWS' => 2 | 1 << 16, 'WIN32' => 2 | 1 << 16,
+        'WIN64' => 2 | 1 << 16, 'WINALL' => 2 | 1 << 16, 'X64' => 2 | 1 << 16, 'X86' => 2 | 1 << 16,
+        'MAC' => 4 | 2 << 16, 'MACOS' => 4 | 2 << 16, 'MACOSX' => 4 | 2 << 16, 'OSX' => 4 | 2 << 16,
+        'DMG' => 4 | 2 << 16, 'LINUX' => 8 | 3 << 16, 'UBUNTU' => 8 | 3 << 16, 'DEB' => 8 | 3 << 16,
+        'RPM' => 8 | 3 << 16, 'ANDROID' => 16 | 4 << 16, 'APK' => 16 | 4 << 16,
+        'IOS' => 16 | 4 << 16, 'IPA' => 16 | 4 << 16, 'IPHONE' => 16 | 4 << 16,
+        'IPAD' => 16 | 4 << 16, 'CRACK' => 32, 'CRACKED' => 32, 'KEYGEN' => 32, 'PATCH' => 32,
+        'SERIAL' => 32, 'KEYMAKER' => 32, 'ACTIVATOR' => 32, 'LOADER' => 32, 'REGGED' => 32,
+        'KEYFILE' => 32, 'ISO' => 64, 'IMG' => 64, 'BIN' => 64, 'CUE' => 64, 'SETUP' => 64,
+        'INSTALLER' => 64, 'MSI' => 64, 'EXE' => 64, 'PORTABLE' => 64, 'BUILD' => 128,
+    ];
+
+    public static function usesW54RustFfi(): bool
+    {
+        $override = self::w54RustFfiState();
+
+        return \is_bool($override) ? $override : self::W54_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the Wave 54 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW54RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w54RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w54RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 54.3 PC platform flags. Per name `flags | platform << 16`, with flags 1 empty (after
+     * trim()), 2 Windows, 4 macOS, 8 Linux, 16 mobile, 32 crack, 64 installer or disc image and 128
+     * `V\d+`/BUILD version, and `platform` the first platform token's family (1 Windows, 2 macOS, 3
+     * Linux, 4 mobile; 0 without one); then the eight flag counts. Tokens are maximal ASCII
+     * alphanumeric runs compared case-insensitively.
+     *
+     * @param  array<array-key, string>  $names
+     * @return list<int>
+     */
+    public static function w54PcPlatformFlagBatch(array $names): array
+    {
+        return self::usesW54RustFfi() ? self::w54PcPlatformFlagBatchNative($names) : self::w54PcPlatformFlagBatchPhp($names);
+    }
+
+    /**
+     * @param  array<array-key, string>  $names
+     * @return list<int>
+     */
+    public static function w54PcPlatformFlagBatchNative(array $names): array
+    {
+        return self::w54Invoke($names, \count($names) + 8) ?? self::w54PcPlatformFlagBatchPhp($names);
+    }
+
+    /**
+     * @param  array<array-key, string>  $names
+     * @return list<int>
+     */
+    public static function w54PcPlatformFlagBatchPhp(array $names): array
+    {
+        $out = [];
+        $totals = [0, 0, 0, 0, 0, 0, 0, 0];
+        foreach ($names as $name) {
+            $name = trim((string) $name);
+            if ($name === '') {
+                $word = 1;
+            } else {
+                $flags = 0;
+                $platform = 0;
+                foreach (preg_split('/[^A-Za-z0-9]+/', strtoupper($name), -1, PREG_SPLIT_NO_EMPTY) ?: [] as $token) {
+                    $found = self::W54_PC_TOKENS[$token] ?? 0;
+                    if ($token[0] === 'V' && \strlen($token) > 1 && ctype_digit(substr($token, 1))) {
+                        $flags |= 128;
+                    }
+                    $flags |= $found & 0xFFFF;
+                    if ($platform === 0) {
+                        $platform = $found >> 16;
+                    }
+                }
+                $word = $flags | ($platform << 16);
+            }
+            $totals[0] += $word & 1;
+            $totals[1] += ($word >> 1) & 1;
+            $totals[2] += ($word >> 2) & 1;
+            $totals[3] += ($word >> 3) & 1;
+            $totals[4] += ($word >> 4) & 1;
+            $totals[5] += ($word >> 5) & 1;
+            $totals[6] += ($word >> 6) & 1;
+            $totals[7] += ($word >> 7) & 1;
+            $out[] = $word;
+        }
+        array_push($out, ...$totals);
+
+        return $out;
+    }
+
+    /**
+     * Wave 54 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out'
+     * returns an `int64_t` output buffer of at least $val words.
+     */
+    private static function w54RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('categorize_w54', self::W54_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w54RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 54.3 export with the NUL-joined $items. Null when the library is missing, the
+     * call declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>|null
+     */
+    private static function w54Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w54RustFfiState('ffi');
+            $out = self::w54RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $blob = implode("\0", $items);
+            if (substr_count($blob, "\0") !== max(0, \count($items) - 1)) {
+                // An item holds a NUL byte: substitute a space, which classifies identically (trim() strips both bytes and both split tokens).
+                $blob = implode("\0", str_replace("\0", ' ', $items));
+            }
+            // @phpstan-ignore method.notFound (Declared by W54_FFI_CDEF.)
+            $written = $ffi->nntmux_w543_pc_platform_flag_batch($blob, \strlen($blob), \count($items), $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }
