@@ -13,6 +13,7 @@ use Countable;
 use FFI;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
+use Throwable;
 
 class ApiReleaseRowCache
 {
@@ -410,5 +411,153 @@ class ApiReleaseRowCache
         }
 
         request()->attributes->set('nntmux.api_release_cache', $status);
+    }
+
+    public const string W53_FFI_CDEF = 'int64_t nntmux_w535_api_row_cache_leaf_fingerprint(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W53.5 parity test's QUALIFICATION). */
+    private const bool W53_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 53.5 routing and FFI cache, kept in function-local statics so readonly classes can use them too.
+     * Without $op it reports the routing; 'set' swaps the override for $val and returns the previous one;
+     * 'reset' replaces the cached handle with $val (null re-resolves, false disables); 'buffer' returns
+     * `[FFI, int64_t[], capacity]` with room for at least $val words, or null without the library.
+     */
+    private static function w53RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w53_5', self::W53_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W53_RUST_FFI_DEFAULT;
+        }
+    }
+
+    public static function usesW53RustFfi(): bool
+    {
+        return self::w53RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with leafFingerprintBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW53RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w53RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w53RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 53.5 Rust helper, or null to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w53Words(int $count, string $data, string $ints, int $words): ?array
+    {
+        try {
+            $handle = self::w53RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w535_api_row_cache_leaf_fingerprint($count, 0, $data, \strlen($data), $ints, \strlen($ints), $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('P*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Batch fingerprint of string leaves as {@see normalizePhp()} trims them. Three words per value:
+     * `[trimmed length, 1 when blank after trimming | 2 when trim() changed it, FNV-1a 64 of the trimmed
+     * value as a signed integer]`.
+     *
+     * @param  list<string>  $values
+     * @return list<int>
+     */
+    public static function leafFingerprintBatch(array $values): array
+    {
+        return self::usesW53RustFfi() ? self::leafFingerprintBatchNative($values) : self::leafFingerprintBatchPhp($values);
+    }
+
+    /**
+     * @param  list<string>  $values
+     * @return list<int>
+     */
+    public static function leafFingerprintBatchPhp(array $values): array
+    {
+        $out = [];
+        foreach ($values as $value) {
+            $trimmed = trim($value);
+            $length = \strlen($trimmed);
+            /** @var array{1: int} $hash */
+            $hash = unpack('J', hash('fnv1a64', $trimmed, true));
+            $out[] = $length;
+            $out[] = (int) ($length === 0) | (int) ($length !== \strlen($value)) << 1;
+            $out[] = $hash[1];
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch over the NUL-joined values; falls back to PHP without the library or when a value holds a NUL.
+     *
+     * @param  list<string>  $values
+     * @return list<int>
+     */
+    public static function leafFingerprintBatchNative(array $values): array
+    {
+        $count = \count($values);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w53Words($count, implode("\0", $values), '', 3 * $count) ?? self::leafFingerprintBatchPhp($values);
     }
 }
