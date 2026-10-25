@@ -48214,3 +48214,1242 @@ mod w494_tests {
         assert_eq!(rc, -1);
     }
 }
+
+/// Wave 50.4: book candidate states, Fanart.tv image ranks, forking timing-header parses,
+/// genre title keys and invitation ledgers, resolved for a whole batch in one call.
+///
+/// Every export reads `count` records: `cols` NUL-delimited byte columns stored column-major
+/// in `text` (`count * cols` fields, so `count * cols - 1` separators) and little-endian
+/// int64 values in `ints` (a fixed header followed by `per` values per record, row-major).
+/// It writes `words` int64 words per record to `out` and returns the number of words
+/// written, the negated word count needed when `out_cap` (in words) is too small, or `-1`
+/// for invalid input.
+pub mod w504_batch {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const MAX_BYTES: usize = 64 * 1024 * 1024;
+
+    const MAX_RECORDS: usize = 1 << 20;
+
+    /// Empty spans never touch the pointer: `from_raw_parts` on null is UB even for len 0.
+    unsafe fn span<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null() || len > MAX_BYTES {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> bool {
+        a_len != 0 && b_len != 0 && a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
+    }
+
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+
+    /// First NUL byte, eight bytes per step; the lowest flagged byte is exact.
+    #[inline]
+    fn find_nul(hay: &[u8]) -> Option<usize> {
+        let (chunks, tail) = hay.as_chunks::<8>();
+        for (i, chunk) in chunks.iter().enumerate() {
+            let word = u64::from_le_bytes(*chunk);
+            let found = word.wrapping_sub(LO) & !word & HI;
+            if found != 0 {
+                return Some(i * 8 + (found.trailing_zeros() / 8) as usize);
+            }
+        }
+        let done = chunks.len() * 8;
+        tail.iter().position(|c| *c == 0).map(|p| done + p)
+    }
+
+    struct Batch<'a> {
+        count: usize,
+        fields: Vec<&'a [u8]>,
+        head: Vec<i64>,
+        rows: &'a [[u8; 8]],
+        per: usize,
+    }
+
+    impl<'a> Batch<'a> {
+        #[inline(always)]
+        fn text(&self, col: usize, i: usize) -> &'a [u8] {
+            self.fields[col * self.count + i]
+        }
+
+        #[inline(always)]
+        fn int(&self, i: usize, k: usize) -> i64 {
+            i64::from_le_bytes(self.rows[i * self.per + k])
+        }
+    }
+
+    /// Record layout: text columns, header ints, ints per record and output words.
+    #[derive(Clone, Copy)]
+    struct Shape {
+        cols: usize,
+        head: usize,
+        per: usize,
+        words: usize,
+    }
+
+    type Body = fn(&Batch<'_>, &mut [i64]);
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run(
+        text: *const u8,
+        text_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+        shape: Shape,
+        body: Body,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out.is_null()
+                || !out.is_aligned()
+                || count > MAX_RECORDS
+                || out_cap > isize::MAX as usize / 8
+            {
+                return -1;
+            }
+            let out_bytes = out_cap * 8;
+            if overlaps(text as usize, text_len, out as usize, out_bytes)
+                || overlaps(ints as usize, ints_len, out as usize, out_bytes)
+            {
+                return -1;
+            }
+            let (Some(text), Some(ints)) = (unsafe { span(text, text_len) }, unsafe {
+                span(ints, ints_len)
+            }) else {
+                return -1;
+            };
+            if ints.len() != (shape.head + count * shape.per) * 8 {
+                return -1;
+            }
+            let (values, _) = ints.as_chunks::<8>();
+            let (head, rows) = values.split_at(shape.head);
+            let total = count * shape.cols;
+            let mut fields: Vec<&[u8]> = Vec::with_capacity(total);
+            if total == 0 {
+                if !text.is_empty() {
+                    return -1;
+                }
+            } else {
+                let mut rest = text;
+                while let Some(end) = find_nul(rest) {
+                    if fields.len() + 1 == total {
+                        return -1;
+                    }
+                    fields.push(&rest[..end]);
+                    rest = &rest[end + 1..];
+                }
+                fields.push(rest);
+                if fields.len() != total {
+                    return -1;
+                }
+            }
+            if count == 0 {
+                return 0;
+            }
+            let need = count * shape.words;
+            if need > out_cap {
+                return -(need.max(2) as isize);
+            }
+            // Non-null, aligned, within `out_cap` and disjoint from both inputs.
+            let out = unsafe { std::slice::from_raw_parts_mut(out, need) };
+            let batch = Batch {
+                count,
+                fields,
+                head: head.iter().map(|v| i64::from_le_bytes(*v)).collect(),
+                rows,
+                per: shape.per,
+            };
+            body(&batch, out);
+            need as isize
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// PHP trim() default set: space, tab, LF, CR, NUL and vertical tab.
+    #[inline(always)]
+    fn is_trim(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b)
+    }
+
+    /// trim() as `(offset, trimmed)`; an all-blank value reports its full length as offset.
+    fn trim(value: &[u8]) -> (usize, &[u8]) {
+        let start = value
+            .iter()
+            .position(|b| !is_trim(*b))
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|b| !is_trim(*b))
+            .map_or(start, |i| i + 1);
+        (start, &value[start..end])
+    }
+
+    #[inline(always)]
+    fn span_word(offset: usize, len: usize) -> i64 {
+        ((offset as i64) << 32) | len as i64
+    }
+
+    /// ASCII case-insensitive substring test (stripos() !== false).
+    fn contains_ci(hay: &[u8], needle: &[u8]) -> bool {
+        hay.len() >= needle.len()
+            && hay
+                .windows(needle.len())
+                .any(|w| w.eq_ignore_ascii_case(needle))
+    }
+
+    /// Decimal digits saturating at i64::MAX, as PHP's (int) cast of a digit string.
+    fn saturating_decimal(digits: &[u8]) -> i64 {
+        let mut value: i64 = 0;
+        for b in digits {
+            match value
+                .checked_mul(10)
+                .and_then(|v| v.checked_add(i64::from(b - b'0')))
+            {
+                Some(v) => value = v,
+                None => return i64::MAX,
+            }
+        }
+        value
+    }
+
+    #[inline(always)]
+    const fn repeat(byte: u8) -> u64 {
+        LO.wrapping_mul(byte as u64)
+    }
+
+    /// 0x80 in every ASCII uppercase byte of `w`.
+    #[inline(always)]
+    pub(crate) fn upper_bits(w: u64) -> u64 {
+        let heptets = w & !HI;
+        let ge_a = heptets.wrapping_add(repeat(0x80 - b'A'));
+        let gt_z = heptets.wrapping_add(repeat(0x7f - b'Z'));
+        (ge_a ^ gt_z) & !w & HI
+    }
+
+    /// Non-zero when `w` holds a space, control or DEL byte.
+    #[inline(always)]
+    pub(crate) fn control_bits(w: u64) -> u64 {
+        let heptets = w & !HI;
+        let low = !heptets.wrapping_add(repeat(0x80 - 0x21)) & !w & HI;
+        let del = w ^ repeat(0x7f);
+        low | (del.wrapping_sub(LO) & !del & HI)
+    }
+
+    /// One pass over `key`: an ASCII case-folded hash, whether it holds an uppercase letter
+    /// and whether it holds a space, control or DEL byte.
+    pub(crate) struct Scan {
+        pub(crate) hash: u64,
+        pub(crate) upper: bool,
+        pub(crate) control: bool,
+    }
+
+    const MIX: u64 = 0x9e37_79b9_7f4a_7c15;
+
+    pub(crate) fn scan(key: &[u8]) -> Scan {
+        let (chunks, tail) = key.as_chunks::<8>();
+        let mut hash = key.len() as u64;
+        let mut upper = 0;
+        let mut control = 0;
+        let mut step = |w: u64| {
+            let up = upper_bits(w);
+            upper |= up;
+            control |= control_bits(w);
+            hash = (hash ^ (w | (up >> 2))).wrapping_mul(MIX).rotate_left(29);
+        };
+        for chunk in chunks {
+            step(u64::from_le_bytes(*chunk));
+        }
+        if !tail.is_empty() {
+            let mut last = [b'a'; 8];
+            last[..tail.len()].copy_from_slice(tail);
+            step(u64::from_le_bytes(last));
+        }
+        Scan {
+            hash: (hash ^ (hash >> 32)).wrapping_mul(MIX),
+            upper: upper != 0,
+            control: control != 0,
+        }
+    }
+
+    /// Index of the first earlier key equal under ASCII case folding (strtolower()), or -1
+    /// for the first occurrence. Empty keys never match. Keys are compared, so hash
+    /// collisions cannot merge distinct keys.
+    fn first_seen(keys: &[&[u8]], hashes: &[u64], out: &mut [i64], stride: usize, at: usize) {
+        let size = (keys.len() * 2).next_power_of_two().max(4);
+        let mask = size - 1;
+        let mut slots = vec![u32::MAX; size];
+        for (i, key) in keys.iter().enumerate() {
+            let slot_out = &mut out[i * stride + at];
+            if key.is_empty() {
+                *slot_out = -1;
+                continue;
+            }
+            let hash = hashes[i];
+            let mut pos = (hash >> 7) as usize & mask;
+            *slot_out = loop {
+                let held = slots[pos];
+                if held == u32::MAX {
+                    slots[pos] = i as u32;
+                    break -1;
+                }
+                let j = held as usize;
+                if hashes[j] == hash && keys[j].eq_ignore_ascii_case(key) {
+                    break j as i64;
+                }
+                pos = (pos + 1) & mask;
+            };
+        }
+    }
+
+    // -------------------------------------------------------------------------------------
+    // BookProcessingCandidateQuery
+    // -------------------------------------------------------------------------------------
+
+    const BOOK_CATEGORY: i64 = 1;
+    const BOOK_SETTLED: i64 = 2;
+    const BOOK_METADATA: i64 = 4;
+    const BOOK_NORMALIZATION: i64 = 8;
+    const BOOK_WORK: i64 = 16;
+    const BOOK_PLACEHOLDER: i64 = 32;
+    const BOOK_EXHAUSTED: i64 = -3;
+
+    /// `LIKE 'N:/NZB%' OR LIKE 'N_NZB_%'`, bytewise and ASCII case-insensitive.
+    fn placeholder_name(name: &[u8]) -> bool {
+        name.len() >= 6
+            && name[0].eq_ignore_ascii_case(&b'n')
+            && ((name[1] == b':' && name[2] == b'/' && name[3..6].eq_ignore_ascii_case(b"nzb"))
+                || name[2..5].eq_ignore_ascii_case(b"nzb"))
+    }
+
+    /// `[flags, next retry delay or EXHAUSTED]` from (searchname, name), header
+    /// `[lookup mode, late flag, books root, books unknown, audiobook, max failures]` and
+    /// `[categories_id, isrenamed, has bookinfo, attempts, retry due, normalized, late
+    /// candidate, provider retry after]` per record.
+    fn book_candidate_state(b: &Batch<'_>, out: &mut [i64]) {
+        let [mode, late_flag, root, unknown, audiobook, max_failures] = [
+            b.head[0], b.head[1], b.head[2], b.head[3], b.head[4], b.head[5],
+        ];
+        for (i, slot) in out.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+            let category = b.int(i, 0);
+            let renamed = b.int(i, 1);
+            let attempts = b.int(i, 3);
+            let mut flags = 0;
+            if (category >= root && category <= unknown) || category == audiobook {
+                flags |= BOOK_CATEGORY;
+            }
+            if late_flag == 0 || b.int(i, 6) == 0 {
+                flags |= BOOK_SETTLED;
+            }
+            if placeholder_name(b.text(0, i)) || placeholder_name(b.text(1, i)) {
+                flags |= BOOK_PLACEHOLDER;
+            }
+            if mode > 0 {
+                if b.int(i, 2) == 0
+                    && attempts < max_failures
+                    && b.int(i, 4) != 0
+                    && (mode != 2 || renamed == 1)
+                {
+                    flags |= BOOK_METADATA;
+                }
+                if b.int(i, 5) == 0
+                    && ((mode != 2 && renamed == 0) || flags & BOOK_PLACEHOLDER != 0)
+                {
+                    flags |= BOOK_NORMALIZATION;
+                }
+            }
+            if flags & (BOOK_CATEGORY | BOOK_SETTLED) == BOOK_CATEGORY | BOOK_SETTLED
+                && flags & (BOOK_METADATA | BOOK_NORMALIZATION) != 0
+            {
+                flags |= BOOK_WORK;
+            }
+            let failures = attempts.saturating_add(1);
+            let delay = if failures >= max_failures {
+                BOOK_EXHAUSTED
+            } else {
+                b.int(i, 7).max(match failures {
+                    1 => 300,
+                    2 => 900,
+                    3 => 3600,
+                    _ => 21600,
+                })
+            };
+            *slot = [flags, delay];
+        }
+    }
+
+    // -------------------------------------------------------------------------------------
+    // FanartTvService
+    // -------------------------------------------------------------------------------------
+
+    const FANART_BEST: i64 = 1;
+    const FANART_NUMERIC: i64 = 2;
+    const FANART_HTTPS: i64 = 4;
+    const FANART_HOST: i64 = 8;
+    const FANART_PREVIEW: i64 = 16;
+    const FANART_JPG: i64 = 32;
+    const FANART_PNG: i64 = 64;
+    const FANART_EMPTY: i64 = 128;
+
+    /// `[likes, flags]` from (likes, url) and the group id per record. The first record with
+    /// the most likes in each run of equal group ids is flagged best.
+    fn fanart_image_rank(b: &Batch<'_>, out: &mut [i64]) {
+        let words = out.as_chunks_mut::<2>().0;
+        let mut run_start = 0;
+        let mut best = 0;
+        for i in 0..b.count {
+            let (_, likes) = trim(b.text(0, i));
+            let numeric = !likes.is_empty() && likes.iter().all(u8::is_ascii_digit);
+            let value = if numeric {
+                saturating_decimal(likes)
+            } else {
+                0
+            };
+            let mut flags = if numeric { FANART_NUMERIC } else { 0 };
+            let (_, url) = trim(b.text(1, i));
+            if url.is_empty() {
+                flags |= FANART_EMPTY;
+            } else {
+                if url.len() >= 8 && url[..8].eq_ignore_ascii_case(b"https://") {
+                    flags |= FANART_HTTPS;
+                }
+                if contains_ci(url, b"fanart.tv/") {
+                    flags |= FANART_HOST;
+                }
+                if contains_ci(url, b"/preview/") {
+                    flags |= FANART_PREVIEW;
+                }
+                if let Some(dot) = url.iter().rposition(|c| *c == b'.') {
+                    let ext = &url[dot + 1..];
+                    if ext.eq_ignore_ascii_case(b"jpg") || ext.eq_ignore_ascii_case(b"jpeg") {
+                        flags |= FANART_JPG;
+                    } else if ext.eq_ignore_ascii_case(b"png") {
+                        flags |= FANART_PNG;
+                    }
+                }
+            }
+            if i > run_start && b.int(i, 0) != b.int(i - 1, 0) {
+                words[best][1] |= FANART_BEST;
+                run_start = i;
+                best = i;
+            } else if i > run_start && value > words[best][0] {
+                best = i;
+            }
+            words[i] = [value, flags];
+        }
+        words[best][1] |= FANART_BEST;
+    }
+
+    // -------------------------------------------------------------------------------------
+    // ForkingService
+    // -------------------------------------------------------------------------------------
+
+    const WORK_TYPES: [&[u8]; 18] = [
+        b"backfill",
+        b"binaries",
+        b"fixRelNames_standard",
+        b"fixRelNames_predbft",
+        b"releases",
+        b"postProcess_add",
+        b"postProcess_ani",
+        b"postProcess_ama",
+        b"postProcess_boo",
+        b"postProcess_con",
+        b"postProcess_gam",
+        b"postProcess_mov",
+        b"postProcess_mus",
+        b"postProcess_nfo",
+        b"postProcess_tv",
+        b"safe_backfill",
+        b"safe_binaries",
+        b"update_per_group",
+    ];
+
+    const TIMING_PREFIX: &[u8] = b"Multi-processing for ";
+    const TIMING_FINISHED: &[u8] = b" finished in ";
+    const TIMING_SECONDS: &[u8] = b" seconds at ";
+    const NOT_A_HEADER: [i64; 4] = [-2, 0, 0, 0];
+
+    fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+        hay.windows(needle.len()).position(|w| w == needle)
+    }
+
+    /// `[work type index, -1 unknown or -2 not a header, elapsed seconds, task length,
+    /// date offset << 32 | date length]` from one timingHeader() line.
+    fn timing_header(line: &[u8]) -> [i64; 4] {
+        let line = line.strip_suffix(b"\n").unwrap_or(line);
+        let Some(body) = line.strip_prefix(TIMING_PREFIX) else {
+            return NOT_A_HEADER;
+        };
+        let Some(task_len) = find(body, TIMING_FINISHED) else {
+            return NOT_A_HEADER;
+        };
+        let rest = &body[task_len + TIMING_FINISHED.len()..];
+        let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+        if !(1..=18).contains(&digits) || !rest[digits..].starts_with(TIMING_SECONDS) {
+            return NOT_A_HEADER;
+        }
+        let date_start =
+            TIMING_PREFIX.len() + task_len + TIMING_FINISHED.len() + digits + TIMING_SECONDS.len();
+        if line.len() <= date_start || line.last() != Some(&b'.') {
+            return NOT_A_HEADER;
+        }
+        let task = &body[..task_len];
+        let index = WORK_TYPES
+            .iter()
+            .position(|t| *t == task)
+            .map_or(-1, |i| i as i64);
+        [
+            index,
+            saturating_decimal(&rest[..digits]),
+            task_len as i64,
+            span_word(date_start, line.len() - 1 - date_start),
+        ]
+    }
+
+    fn fork_timing_parse(b: &Batch<'_>, out: &mut [i64]) {
+        for (i, slot) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            *slot = timing_header(b.text(0, i));
+        }
+    }
+
+    // -------------------------------------------------------------------------------------
+    // GenreService
+    // -------------------------------------------------------------------------------------
+
+    const GENRE_EMPTY: i64 = 1;
+    const GENRE_MULTI: i64 = 2;
+    const GENRE_NON_ASCII: i64 = 4;
+    const GENRE_HYPHEN: i64 = 8;
+    const GENRE_DIGIT: i64 = 16;
+    const GENRE_MIXED_CASE: i64 = 32;
+    const GENRE_UPPER: i64 = 64;
+
+    #[inline(always)]
+    fn genre_separator(b: u8) -> bool {
+        matches!(b, b'/' | b',' | b'&' | b'|' | b';')
+    }
+
+    /// `[first earlier duplicate or -1, trimmed offset << 32 | length, flags | tokens << 8]`
+    /// per title.
+    fn genre_title_key(b: &Batch<'_>, out: &mut [i64]) {
+        let mut keys: Vec<&[u8]> = Vec::with_capacity(b.count);
+        let mut hashes: Vec<u64> = Vec::with_capacity(b.count);
+        for i in 0..b.count {
+            let raw = b.text(0, i);
+            let (offset, title) = trim(raw);
+            keys.push(title);
+            hashes.push(scan(title).hash);
+            let words = &mut out[i * 3..i * 3 + 3];
+            words[1] = span_word(offset, title.len());
+            if title.is_empty() {
+                words[2] = GENRE_EMPTY;
+                continue;
+            }
+            let (mut upper, mut lower, mut flags) = (false, false, 0);
+            for c in title {
+                match c {
+                    b'A'..=b'Z' => upper = true,
+                    b'a'..=b'z' => lower = true,
+                    b'0'..=b'9' => flags |= GENRE_DIGIT,
+                    b'-' => flags |= GENRE_HYPHEN,
+                    0x80..=0xff => flags |= GENRE_NON_ASCII,
+                    c if genre_separator(*c) => flags |= GENRE_MULTI,
+                    _ => {}
+                }
+            }
+            if upper {
+                flags |= GENRE_UPPER;
+                if lower {
+                    flags |= GENRE_MIXED_CASE;
+                }
+            }
+            let tokens = if flags & GENRE_MULTI == 0 {
+                1
+            } else {
+                title
+                    .split(|c| genre_separator(*c))
+                    .filter(|part| !trim(part).1.is_empty())
+                    .count() as i64
+            };
+            words[2] = flags | (tokens << 8);
+        }
+        first_seen(&keys, &hashes, out, 3, 0);
+    }
+
+    // -------------------------------------------------------------------------------------
+    // InvitationService
+    // -------------------------------------------------------------------------------------
+
+    const INVITE_VALID: i64 = 1;
+    const INVITE_EXPIRED: i64 = 2;
+    const INVITE_USED: i64 = 4;
+    const INVITE_CANCELLED: i64 = 8;
+    const INVITE_PLAUSIBLE: i64 = 16;
+    const INVITE_UNNORMALIZED: i64 = 32;
+
+    /// First `needle` byte, eight bytes per step; the lowest flagged byte is exact.
+    #[inline]
+    pub(crate) fn find_byte(hay: &[u8], needle: u8) -> Option<usize> {
+        let (chunks, tail) = hay.as_chunks::<8>();
+        for (i, chunk) in chunks.iter().enumerate() {
+            let word = u64::from_le_bytes(*chunk) ^ repeat(needle);
+            let found = word.wrapping_sub(LO) & !word & HI;
+            if found != 0 {
+                return Some(i * 8 + (found.trailing_zeros() / 8) as usize);
+            }
+        }
+        let done = chunks.len() * 8;
+        tail.iter().position(|c| *c == needle).map(|p| done + p)
+    }
+
+    /// One '@' after a non-empty local part and a dotted domain neither starting nor ending
+    /// in '.'; the caller rejects space, control and DEL bytes.
+    fn plausible_email(email: &[u8]) -> bool {
+        let Some(at) = find_byte(email, b'@') else {
+            return false;
+        };
+        let domain = &email[at + 1..];
+        at > 0
+            && domain.len() >= 3
+            && domain[0] != b'.'
+            && domain[domain.len() - 1] != b'.'
+            && !domain.contains(&b'@')
+            && domain.contains(&b'.')
+    }
+
+    /// `[state flags, first earlier row with the same normalized email or -1, trimmed
+    /// offset << 32 | length]` from the email, header `[now µs]` and `[is active,
+    /// expires at µs, has used at]` per record.
+    fn invitation_ledger(b: &Batch<'_>, out: &mut [i64]) {
+        let now = b.head[0];
+        let mut keys: Vec<&[u8]> = Vec::with_capacity(b.count);
+        let mut hashes: Vec<u64> = Vec::with_capacity(b.count);
+        for i in 0..b.count {
+            let raw = b.text(0, i);
+            let (offset, email) = trim(raw);
+            let scanned = scan(email);
+            keys.push(email);
+            hashes.push(scanned.hash);
+            let active = b.int(i, 0) != 0;
+            let expires = b.int(i, 1);
+            let used = b.int(i, 2) != 0;
+            let mut state = 0;
+            if active && expires > now && !used {
+                state |= INVITE_VALID;
+            }
+            if expires < now {
+                state |= INVITE_EXPIRED;
+            }
+            if used {
+                state |= INVITE_USED;
+            } else if !active {
+                state |= INVITE_CANCELLED;
+            }
+            if !scanned.control && plausible_email(email) {
+                state |= INVITE_PLAUSIBLE;
+            }
+            if email.len() != raw.len() || scanned.upper {
+                state |= INVITE_UNNORMALIZED;
+            }
+            out[i * 3] = state;
+            out[i * 3 + 2] = span_word(offset, email.len());
+        }
+        first_seen(&keys, &hashes, out, 3, 1);
+    }
+
+    macro_rules! export {
+        ($name:ident, $cols:literal, $head:literal, $per:literal, $words:literal, $body:ident) => {
+            /// # Safety
+            ///
+            /// `text` must point to `text_len` readable bytes, `ints` to `ints_len`
+            /// readable bytes and `out` to `out_cap` writable, aligned int64 words that
+            /// overlap neither input; null pointers are accepted only with zero lengths.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                text: *const u8,
+                text_len: usize,
+                ints: *const u8,
+                ints_len: usize,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                let shape = Shape {
+                    cols: $cols,
+                    head: $head,
+                    per: $per,
+                    words: $words,
+                };
+                unsafe {
+                    run(
+                        text, text_len, ints, ints_len, count, out, out_cap, shape, $body,
+                    )
+                }
+            }
+        };
+    }
+
+    export!(
+        nntmux_w504_book_candidate_state_batch,
+        2,
+        6,
+        8,
+        2,
+        book_candidate_state
+    );
+    export!(
+        nntmux_w504_fanart_image_rank_batch,
+        2,
+        0,
+        1,
+        2,
+        fanart_image_rank
+    );
+    export!(
+        nntmux_w504_fork_timing_parse_batch,
+        1,
+        0,
+        0,
+        4,
+        fork_timing_parse
+    );
+    export!(
+        nntmux_w504_genre_title_key_batch,
+        1,
+        0,
+        0,
+        3,
+        genre_title_key
+    );
+    export!(
+        nntmux_w504_invitation_ledger_batch,
+        1,
+        1,
+        3,
+        3,
+        invitation_ledger
+    );
+}
+
+#[cfg(test)]
+mod w504_tests {
+    use super::w504_batch::*;
+
+    type Export =
+        unsafe extern "C" fn(*const u8, usize, *const u8, usize, usize, *mut i64, usize) -> isize;
+
+    fn text(columns: &[&[&[u8]]]) -> Vec<u8> {
+        columns
+            .iter()
+            .flat_map(|column| column.iter())
+            .copied()
+            .collect::<Vec<_>>()
+            .join(&0u8)
+    }
+
+    fn ints(values: &[i64]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn call(export: Export, text: &[u8], ints: &[u8], count: usize, out: &mut [i64]) -> isize {
+        unsafe {
+            export(
+                text.as_ptr(),
+                text.len(),
+                ints.as_ptr(),
+                ints.len(),
+                count,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        }
+    }
+
+    fn words(
+        export: Export,
+        columns: &[&[&[u8]]],
+        values: &[i64],
+        count: usize,
+        per: usize,
+    ) -> Vec<i64> {
+        let mut out = vec![i64::MIN; count * per];
+        assert_eq!(
+            call(export, &text(columns), &ints(values), count, &mut out),
+            (count * per) as isize
+        );
+        out
+    }
+
+    const BOOK_HEAD: [i64; 6] = [1, 1, 7000, 7999, 3030, 5];
+
+    #[test]
+    fn w504_book_candidate_state_hand_cases() {
+        let searchnames: [&[u8]; 6] = [
+            b"Some.Book.epub",
+            b"n:/nzb/abc",
+            b"Book",
+            b"x",
+            b"NxNZB-a",
+            b"Audio",
+        ];
+        let names: [&[u8]; 6] = [b"a", b"", b"N_NZB_", b"N:/NZ", b"", b"b"];
+        #[rustfmt::skip]
+        let rows: [i64; 48] = [
+            7010, 1, 0, 0, 1, 0, 0, 0,
+            7999, 1, 0, 4, 1, 0, 0, 0,
+            6000, 1, 1, 1, 0, 1, 0, 1000,
+            3030, 0, 0, 0, 0, 1, 5, 0,
+            7000, 1, 0, i64::MAX, 1, 0, 0, 0,
+            3030, 0, 0, 2, 1, 1, 0, 7200,
+        ];
+        let mut values = BOOK_HEAD.to_vec();
+        values.extend_from_slice(&rows);
+        let out = words(
+            nntmux_w504_book_candidate_state_batch,
+            &[&searchnames, &names],
+            &values,
+            6,
+            2,
+        );
+        assert_eq!(
+            out,
+            vec![
+                1 | 2 | 4 | 16,
+                300,
+                1 | 2 | 4 | 8 | 16 | 32,
+                -3,
+                2 | 32,
+                1000,
+                1,
+                300,
+                1 | 2 | 32 | 8 | 16,
+                -3,
+                1 | 2 | 4 | 16,
+                7200,
+            ]
+        );
+        // Mode 0 never selects work; mode 2 needs renamed rows for metadata and placeholders
+        // for normalization.
+        let mut values = BOOK_HEAD.to_vec();
+        values[0] = 2;
+        values[1] = 0;
+        values.extend_from_slice(&rows);
+        let out = words(
+            nntmux_w504_book_candidate_state_batch,
+            &[&searchnames, &names],
+            &values,
+            6,
+            2,
+        );
+        assert_eq!(out[0], 1 | 2 | 4 | 16);
+        assert_eq!(out[2], 1 | 2 | 4 | 8 | 16 | 32);
+        assert_eq!(out[6], 1 | 2);
+        assert_eq!(out[10], 1 | 2);
+        let mut values = BOOK_HEAD.to_vec();
+        values[0] = 0;
+        values.extend_from_slice(&rows);
+        let out = words(
+            nntmux_w504_book_candidate_state_batch,
+            &[&searchnames, &names],
+            &values,
+            6,
+            2,
+        );
+        assert!(out.chunks(2).all(|w| w[0] & (4 | 8 | 16) == 0));
+    }
+
+    #[test]
+    fn w504_fanart_image_rank_hand_cases() {
+        let likes: [&[u8]; 7] = [
+            b"3",
+            b" 7 ",
+            b"7",
+            b"x1",
+            b"",
+            b"99999999999999999999",
+            b"0",
+        ];
+        let urls: [&[u8]; 7] = [
+            b"https://assets.FANART.tv/fanart/a.JPG",
+            b"http://x/preview/b.png",
+            b"",
+            b"  //cdn/c.jpeg?x  ",
+            b"\t",
+            b"https://assets.fanart.tv/d.webp",
+            b"plain",
+        ];
+        let out = words(
+            nntmux_w504_fanart_image_rank_batch,
+            &[&likes, &urls],
+            &[1, 1, 1, 2, 2, 3, 3],
+            7,
+            2,
+        );
+        assert_eq!(
+            out,
+            vec![
+                3,
+                2 | 4 | 8 | 32,
+                7,
+                1 | 2 | 16 | 64,
+                7,
+                2 | 128,
+                0,
+                1,
+                0,
+                128,
+                i64::MAX,
+                1 | 2 | 4 | 8,
+                0,
+                2,
+            ]
+        );
+    }
+
+    #[test]
+    fn w504_fork_timing_parse_hand_cases() {
+        let lines: [&[u8]; 8] = [
+            b"Multi-processing for backfill finished in 12 seconds at Sun, 25 Oct 2026 21:10:10 +0100.\n",
+            b"Multi-processing for custom finished in 0 seconds at .",
+            b"Multi-processing for  finished in 5 seconds at x.",
+            b"Multi-processing for releases finished in -1 seconds at x.",
+            b"Multi-processing for releases finished in 1 seconds at x",
+            b"multi-processing for releases finished in 1 seconds at x.",
+            b"Multi-processing for postProcess_tv finished in 1234567890123456789 seconds at x.",
+            b"Multi-processing for update_per_group finished in 007 seconds at a.b.\n\n",
+        ];
+        let out = words(nntmux_w504_fork_timing_parse_batch, &[&lines], &[], 8, 4);
+        let date = |offset: i64, len: i64| (offset << 32) | len;
+        assert_eq!(
+            out,
+            vec![
+                0,
+                12,
+                8,
+                date(56, 31),
+                -1,
+                0,
+                6,
+                date(53, 0),
+                -1,
+                5,
+                0,
+                date(47, 1),
+                -2,
+                0,
+                0,
+                0,
+                -2,
+                0,
+                0,
+                0,
+                -2,
+                0,
+                0,
+                0,
+                -2,
+                0,
+                0,
+                0,
+                -2,
+                0,
+                0,
+                0,
+            ]
+        );
+    }
+
+    #[test]
+    fn w504_genre_title_key_hand_cases() {
+        let titles: [&[u8]; 7] = [
+            b" Sci-Fi & Fantasy ",
+            b"sci-fi & fantasy",
+            b"",
+            b"Action",
+            b"ACTION",
+            "Caf\u{e9} 80s".as_bytes(),
+            b"a / / b;",
+        ];
+        let out = words(nntmux_w504_genre_title_key_batch, &[&titles], &[], 7, 3);
+        let span = |offset: i64, len: i64| (offset << 32) | len;
+        assert_eq!(
+            out,
+            vec![
+                -1,
+                span(1, 16),
+                2 | 8 | 32 | 64 | (2 << 8),
+                0,
+                span(0, 16),
+                2 | 8 | (2 << 8),
+                -1,
+                span(0, 0),
+                1,
+                -1,
+                span(0, 6),
+                32 | 64 | (1 << 8),
+                3,
+                span(0, 6),
+                64 | (1 << 8),
+                -1,
+                span(0, 9),
+                4 | 16 | 32 | 64 | (1 << 8),
+                -1,
+                span(0, 8),
+                2 | (2 << 8),
+            ]
+        );
+    }
+
+    #[test]
+    fn w504_invitation_ledger_hand_cases() {
+        let emails: [&[u8]; 6] = [
+            b" Alice@Example.com ",
+            b"alice@example.com",
+            b"bob@x",
+            b"",
+            b"c d@e.f",
+            b"@e.f",
+        ];
+        #[rustfmt::skip]
+        let rows: [i64; 18] = [
+            1, 200, 0,
+            1, 50, 0,
+            0, 100, 0,
+            0, 300, 1,
+            1, 100, 0,
+            1, i64::MIN, 0,
+        ];
+        let mut values = vec![100];
+        values.extend_from_slice(&rows);
+        let out = words(
+            nntmux_w504_invitation_ledger_batch,
+            &[&emails],
+            &values,
+            6,
+            3,
+        );
+        let span = |offset: i64, len: i64| (offset << 32) | len;
+        assert_eq!(
+            out,
+            vec![
+                1 | 16 | 32,
+                -1,
+                span(1, 17),
+                2 | 16,
+                0,
+                span(0, 17),
+                8,
+                -1,
+                span(0, 5),
+                4,
+                -1,
+                span(0, 0),
+                0,
+                -1,
+                span(0, 7),
+                2,
+                -1,
+                span(0, 4),
+            ]
+        );
+    }
+
+    const EXPORTS: [(Export, usize, usize, usize, usize); 5] = [
+        (nntmux_w504_book_candidate_state_batch, 2, 6, 8, 2),
+        (nntmux_w504_fanart_image_rank_batch, 2, 0, 1, 2),
+        (nntmux_w504_fork_timing_parse_batch, 1, 0, 0, 4),
+        (nntmux_w504_genre_title_key_batch, 1, 0, 0, 3),
+        (nntmux_w504_invitation_ledger_batch, 1, 1, 3, 3),
+    ];
+
+    #[test]
+    fn w504_raw_export_contract() {
+        for (export, cols, head, per, words_per) in EXPORTS {
+            let fields: Vec<&[u8]> = vec![&b"x"[..]; 2];
+            let columns: Vec<&[&[u8]]> = vec![&fields[..]; cols];
+            let good_text = text(&columns);
+            let good_ints = ints(&vec![1; head + 2 * per]);
+            let mut out = vec![i64::MIN; 2 * words_per];
+            assert_eq!(
+                call(export, &good_text, &good_ints, 2, &mut out),
+                (2 * words_per) as isize
+            );
+            // Empty batches need only the header.
+            assert_eq!(call(export, &[], &ints(&vec![0; head]), 0, &mut out), 0);
+            // Field and int counts must match exactly; NUL inside a field adds a field.
+            let mut extra = good_text.clone();
+            extra.extend_from_slice(b"\0y");
+            assert_eq!(call(export, &extra, &good_ints, 2, &mut out), -1);
+            if good_text.len() > 1 {
+                assert_eq!(call(export, &good_text[..1], &good_ints, 2, &mut out), -1);
+            }
+            assert_eq!(
+                call(
+                    export,
+                    &good_text,
+                    &good_ints[..good_ints.len().saturating_sub(8)],
+                    2,
+                    &mut out
+                ),
+                if head + 2 * per == 0 {
+                    2 * words_per as isize
+                } else {
+                    -1
+                }
+            );
+            // Null pointers: rejected with lengths, accepted without (no from_raw_parts on null).
+            unsafe {
+                assert_eq!(
+                    export(
+                        std::ptr::null(),
+                        4,
+                        good_ints.as_ptr(),
+                        good_ints.len(),
+                        2,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    export(
+                        good_text.as_ptr(),
+                        good_text.len(),
+                        std::ptr::null(),
+                        8,
+                        2,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    export(
+                        good_text.as_ptr(),
+                        good_text.len(),
+                        good_ints.as_ptr(),
+                        good_ints.len(),
+                        2,
+                        std::ptr::null_mut(),
+                        8
+                    ),
+                    -1
+                );
+                let head_ints = ints(&vec![0; head]);
+                let head_ptr = if head == 0 {
+                    std::ptr::null()
+                } else {
+                    head_ints.as_ptr()
+                };
+                assert_eq!(
+                    export(
+                        std::ptr::null(),
+                        0,
+                        head_ptr,
+                        head_ints.len(),
+                        0,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    0
+                );
+            }
+            // Capacity is reported in words and nothing is written when it is short.
+            let mut short = vec![i64::MIN; 2 * words_per - 1];
+            assert_eq!(
+                call(export, &good_text, &good_ints, 2, &mut short),
+                -((2 * words_per) as isize)
+            );
+            assert!(short.iter().all(|w| *w == i64::MIN));
+        }
+    }
+
+    #[test]
+    fn w504_overlapping_or_misaligned_output_is_rejected() {
+        let mut buffer = [0i64; 16];
+        let ptr = buffer.as_mut_ptr();
+        let rc = unsafe {
+            nntmux_w504_genre_title_key_batch(ptr.cast::<u8>(), 3, std::ptr::null(), 0, 1, ptr, 8)
+        };
+        assert_eq!(rc, -1);
+        let misaligned = unsafe { ptr.cast::<u8>().add(1).cast::<i64>() };
+        let rc = unsafe {
+            nntmux_w504_genre_title_key_batch(
+                b"x".as_ptr(),
+                1,
+                std::ptr::null(),
+                0,
+                1,
+                misaligned,
+                4,
+            )
+        };
+        assert_eq!(rc, -1);
+    }
+
+    #[test]
+    fn w504_word_masks_match_bytewise_checks() {
+        for byte in 0..=255u8 {
+            for at in 0..8 {
+                let mut bytes = [b'm'; 8];
+                bytes[at] = byte;
+                let w = u64::from_le_bytes(bytes);
+                assert_eq!(
+                    upper_bits(w) != 0,
+                    byte.is_ascii_uppercase(),
+                    "upper {byte:#x}"
+                );
+                assert_eq!(
+                    control_bits(w) != 0,
+                    byte <= 0x20 || byte == 0x7f,
+                    "control {byte:#x}"
+                );
+                let s = scan(&bytes);
+                let lowered = scan(&bytes.to_ascii_lowercase());
+                assert_eq!(s.hash, lowered.hash);
+                assert_eq!(s.upper, byte.is_ascii_uppercase());
+                assert_eq!(s.control, byte <= 0x20 || byte == 0x7f);
+            }
+        }
+        for len in 0..24 {
+            let key: Vec<u8> = (0..len).map(|i| b'A' + (i % 26) as u8).collect();
+            assert_eq!(scan(&key).hash, scan(&key.to_ascii_lowercase()).hash);
+            let mut hay = vec![b'x'; len];
+            for at in 0..len {
+                hay[at] = b'@';
+                assert_eq!(find_byte(&hay, b'@'), Some(at));
+                hay[at] = b'x';
+            }
+            assert_eq!(find_byte(&hay, b'@'), None);
+        }
+    }
+
+    #[test]
+    fn w504_duplicates_follow_ascii_case_folding_across_many_keys() {
+        let owned: Vec<Vec<u8>> = (0..600)
+            .map(|i| format!("Genre {}", i % 300).into_bytes())
+            .collect();
+        let mut titles: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
+        let upper = b"GENRE 7".to_vec();
+        titles.push(&upper);
+        let out = words(
+            nntmux_w504_genre_title_key_batch,
+            &[&titles],
+            &[],
+            titles.len(),
+            3,
+        );
+        for i in 0..600 {
+            assert_eq!(out[i * 3], if i < 300 { -1 } else { (i - 300) as i64 });
+        }
+        assert_eq!(out[600 * 3], 7);
+    }
+}
