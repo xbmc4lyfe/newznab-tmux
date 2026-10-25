@@ -6,6 +6,7 @@ namespace App\Services\LogViewer\Index;
 
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\Cache;
 use InvalidArgumentException;
 use Manticoresearch\Client;
@@ -32,11 +33,34 @@ class LogIndex
         int32_t nntmux_logviewer_valid_table_name(const char *name, size_t len);
         C;
 
+    /**
+     * Wave 47.5 batch export shared by LogIndex, LogIndexer, LogSearchCoordinator, ManticoreLogSearcher
+     * and LogSearcher; every mode returns little-endian i64 fields.
+     */
+    public const string W47_FFI_CDEF = 'int64_t nntmux_w47_logviewer_index_indexer_coordinator_manticore_searcher(uint32_t mode, const char *input, size_t input_len, char *out, size_t cap);';
+
+    /**
+     * Benchmark-gated default for {@see indexEntryRangeBatch()}: stays PHP because common p99 missed
+     * 1.5x (packing tuples and unpacking rows costs about as much as the PHP loop); see
+     * tests/Unit/RustLogViewerIndexIndexerCoordinatorManticoreSearcherW47ParityTest.php.
+     */
+    public const bool W47_LOG_INDEX_RUST_FFI_DEFAULT = false;
+
+    private const int W47_MAX_BYTES = 67108864;
+
     private static bool $useRustFfi = true;
 
     private static ?FFI $ffi = null;
 
     private static bool $ffiResolved = false;
+
+    private static ?bool $useW47LogIndexRustFfi = null;
+
+    private static FFI|false|null $w47Ffi = null;
+
+    private static ?CData $w47Out = null;
+
+    private static int $w47OutCap = 0;
 
     public function __construct(
         private readonly Client $client,
@@ -145,6 +169,203 @@ class LogIndex
         }
 
         return self::$ffi;
+    }
+
+    /** Pass null to restore {@see W47_LOG_INDEX_RUST_FFI_DEFAULT}. */
+    public static function useW47LogIndexRustFfi(?bool $enable = true): void
+    {
+        self::$useW47LogIndexRustFfi = $enable;
+    }
+
+    public static function usesW47LogIndexRustFfi(): bool
+    {
+        return self::$useW47LogIndexRustFfi ?? self::W47_LOG_INDEX_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW47LogIndexRustFfi(): void
+    {
+        self::$useW47LogIndexRustFfi = null;
+    }
+
+    /**
+     * Validates index entries `[file_id, byte_offset, byte_end, logged_at]` (in file order) and bounds
+     * the `before` cursors over them. Each entry gets its {@see documentId()} and flags: 1 offset fits
+     * the 40 offset bits, 2 end >= offset, 4 file id keeps the id positive, 8 starts at or after the
+     * previous entry's end, 16 has a timestamp; flags 1-8 make it valid. Each cursor gets the binary-search
+     * lower bound over the entry offsets, the valid entries below it and their newest `logged_at` (or 0).
+     *
+     * @param  list<array{int, int, int, int}>  $entries
+     * @param  list<int>  $cursors
+     * @return array{entries: list<list<int>>, ranges: list<list<int>>}
+     */
+    public static function indexEntryRangeBatch(array $entries, array $cursors): array
+    {
+        return self::usesW47LogIndexRustFfi() ? self::indexEntryRangeBatchNative($entries, $cursors) : self::indexEntryRangeBatchPhp($entries, $cursors);
+    }
+
+    /**
+     * @param  list<array{int, int, int, int}>  $entries
+     * @param  list<int>  $cursors
+     * @return array{entries: list<list<int>>, ranges: list<list<int>>}
+     */
+    public static function indexEntryRangeBatchPhp(array $entries, array $cursors): array
+    {
+        $rows = [];
+        $offsets = [];
+        $validBelow = [0];
+        $newestBelow = [0];
+        $valid = 0;
+        $newest = 0;
+        $previousEnd = null;
+
+        foreach ($entries as [$fileId, $offset, $end, $loggedAt]) {
+            $flags = ($offset >= 0 && $offset < 1 << self::OFFSET_BITS ? 1 : 0)
+                | ($end >= $offset ? 2 : 0)
+                | ($fileId >= 0 && $fileId < 1 << (63 - self::OFFSET_BITS) ? 4 : 0)
+                | ($previousEnd === null || $offset >= $previousEnd ? 8 : 0)
+                | ($loggedAt > 0 ? 16 : 0);
+            $previousEnd = $end;
+
+            if (($flags & 15) === 15) {
+                $valid++;
+                $newest = max($newest, $loggedAt);
+            }
+
+            $validBelow[] = $valid;
+            $newestBelow[] = $newest;
+            $offsets[] = $offset;
+            $rows[] = [($fileId << self::OFFSET_BITS) | $offset, $flags];
+        }
+
+        $ranges = [];
+        $count = \count($offsets);
+
+        foreach ($cursors as $cursor) {
+            $low = 0;
+            $high = $count;
+
+            while ($low < $high) {
+                $middle = ($low + $high) >> 1;
+
+                if ($offsets[$middle] < $cursor) {
+                    $low = $middle + 1;
+                } else {
+                    $high = $middle;
+                }
+            }
+
+            $ranges[] = [$low, $validBelow[$low], $newestBelow[$low]];
+        }
+
+        return ['entries' => $rows, 'ranges' => $ranges];
+    }
+
+    /**
+     * @param  list<array{int, int, int, int}>  $entries
+     * @param  list<int>  $cursors
+     * @return array{entries: list<list<int>>, ranges: list<list<int>>}
+     */
+    public static function indexEntryRangeBatchNative(array $entries, array $cursors): array
+    {
+        $count = \count($entries);
+        $flat = $count === 0 ? [] : array_merge(...$entries);
+
+        if (\count($flat) !== 4 * $count) {
+            return self::indexEntryRangeBatchPhp($entries, $cursors);
+        }
+
+        $raw = self::evaluateW47Native(1, pack('P*', $count, \count($cursors), ...$flat, ...$cursors), 16 * $count + 24 * \count($cursors));
+
+        if ($raw === null) {
+            return self::indexEntryRangeBatchPhp($entries, $cursors);
+        }
+
+        return [
+            'entries' => self::w47Rows(substr($raw, 0, 16 * $count), 2),
+            'ranges' => self::w47Rows($raw, 3, 16 * $count),
+        ];
+    }
+
+    /**
+     * Exactly $fields little-endian i64 values from a Wave 47.5 mode, or null to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    public static function evaluateW47Fields(int $mode, string $input, int $fields): ?array
+    {
+        $raw = $fields < 0 ? null : self::evaluateW47Native($mode, $input, $fields * 8);
+        $values = $raw === null ? false : ($raw === '' ? [] : unpack('P*', $raw));
+
+        /** @var list<int>|null */
+        return \is_array($values) ? array_values($values) : null;
+    }
+
+    /**
+     * Exactly $bytes of output (packed little-endian i64 fields) from a Wave 47.5 mode, or null to fall
+     * back to PHP.
+     */
+    public static function evaluateW47Native(int $mode, string $input, int $bytes): ?string
+    {
+        $ffi = self::w47Ffi();
+        $length = \strlen($input);
+
+        if ($ffi === null || $mode < 1 || $bytes < 0 || $bytes > self::W47_MAX_BYTES || $length > self::W47_MAX_BYTES) {
+            return null;
+        }
+
+        try {
+            if (self::$w47Out === null || $bytes > self::$w47OutCap) {
+                $cap = max(4096, $bytes);
+                self::$w47Out = $ffi->new('char['.$cap.']');
+                self::$w47OutCap = $cap;
+            }
+
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w47_logviewer_index_indexer_coordinator_manticore_searcher($mode, $input, $length, self::$w47Out, self::$w47OutCap);
+
+            if ($written !== $bytes) {
+                return null;
+            }
+
+            return $bytes === 0 ? '' : FFI::string(self::$w47Out, $bytes);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Rows of $width fields from packed output.
+     *
+     * @return list<list<int>>
+     */
+    public static function w47Rows(string $raw, int $width, int $offset = 0): array
+    {
+        $values = \strlen($raw) > $offset ? unpack('P*', $raw, $offset) : [];
+
+        /** @var list<list<int>> */
+        return \is_array($values) ? array_chunk($values, $width) : [];
+    }
+
+    /**
+     * NUL-joined strings; Rust declines the batch when a string holds a NUL (the piece count disagrees).
+     *
+     * @param  list<string>  $strings
+     */
+    public static function w47Joined(array $strings): string
+    {
+        return implode("\0", $strings);
+    }
+
+    private static function w47Ffi(): ?FFI
+    {
+        if (self::$w47Ffi === null) {
+            $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+            self::$w47Ffi = RustPipelineLibrary::resolveDomain('search_w47', self::W47_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+            self::$w47Out = null;
+            self::$w47OutCap = 0;
+        }
+
+        return self::$w47Ffi instanceof FFI ? self::$w47Ffi : null;
     }
 
     public function isEnabled(): bool

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\LogViewer;
 
+use App\Services\LogViewer\Index\LogIndex;
 use App\Support\RustPipelineLibrary;
 use FFI;
 use FFI\CData;
@@ -45,7 +46,19 @@ class LogSearcher
 
     private const int SCAN_LEVEL_HEADER = 2;
 
+    /**
+     * Benchmark-gated default for {@see filterLineWindowBatch()}: stays PHP because short common lines
+     * reached only parity with strpos (uncommon batches were about 2x); see
+     * tests/Unit/RustLogViewerIndexIndexerCoordinatorManticoreSearcherW47ParityTest.php.
+     */
+    public const bool W47_LOG_SEARCHER_RUST_FFI_DEFAULT = false;
+
+    /** Highlights per line, as `SearchQuery` caps them. */
+    private const int W47_MAX_HIGHLIGHTS = 200;
+
     private static bool $useRustFfi = true;
+
+    private static ?bool $useW47LogSearcherRustFfi = null;
 
     private static FFI|false|null $cachedFfi = null;
 
@@ -61,6 +74,119 @@ class LogSearcher
     public static function setUseRustFfi(bool $enabled): void
     {
         self::$useRustFfi = $enabled;
+    }
+
+    /** Pass null to restore {@see W47_LOG_SEARCHER_RUST_FFI_DEFAULT}. */
+    public static function useW47LogSearcherRustFfi(?bool $enable = true): void
+    {
+        self::$useW47LogSearcherRustFfi = $enable;
+    }
+
+    public static function usesW47LogSearcherRustFfi(): bool
+    {
+        return self::$useW47LogSearcherRustFfi ?? self::W47_LOG_SEARCHER_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW47LogSearcherRustFfi(): void
+    {
+        self::$useW47LogSearcherRustFfi = null;
+    }
+
+    /**
+     * Filters lines by a plain term and assembles context windows. Per line: `[matched, highlights,
+     * first_start, last_end, window]` — whether the term occurs (every line for an empty term), the
+     * non-overlapping highlight count (capped at 200, ASCII case folding unless $caseSensitive), the first
+     * highlight's start and the last one's end (-1 without one) and the id of the merged window of
+     * $context lines around matches that contains the line (-1 outside every window). Overlapping or
+     * adjacent windows merge; $context is clamped to 0..count.
+     *
+     * @param  list<string>  $lines
+     * @return list<list<int>>
+     */
+    public static function filterLineWindowBatch(array $lines, string $term, bool $caseSensitive, int $context): array
+    {
+        return self::usesW47LogSearcherRustFfi()
+            ? self::filterLineWindowBatchNative($lines, $term, $caseSensitive, $context)
+            : self::filterLineWindowBatchPhp($lines, $term, $caseSensitive, $context);
+    }
+
+    /**
+     * @param  list<string>  $lines
+     * @return list<list<int>>
+     */
+    public static function filterLineWindowBatchPhp(array $lines, string $term, bool $caseSensitive, int $context): array
+    {
+        $count = \count($lines);
+        $context = min(max(0, $context), $count);
+        $length = \strlen($term);
+        $rows = [];
+        $windows = [];
+        $current = -1;
+
+        foreach ($lines as $index => $line) {
+            $hits = 0;
+            $first = $last = -1;
+
+            if ($term !== '') {
+                $offset = 0;
+
+                while ($hits < self::W47_MAX_HIGHLIGHTS) {
+                    $position = $caseSensitive ? strpos($line, $term, $offset) : stripos($line, $term, $offset);
+
+                    if ($position === false) {
+                        break;
+                    }
+
+                    $hits++;
+
+                    if ($first < 0) {
+                        $first = $position;
+                    }
+
+                    $offset = $last = $position + $length;
+                }
+            }
+
+            $matched = $term === '' || $hits > 0;
+
+            if ($matched) {
+                $start = max(0, $index - $context);
+                $end = min($count - 1, $index + $context);
+
+                if ($current >= 0 && $start <= $windows[$current][1] + 1) {
+                    $windows[$current][1] = max($windows[$current][1], $end);
+                } else {
+                    $windows[++$current] = [$start, $end];
+                }
+            }
+
+            $rows[] = [$matched ? 1 : 0, $hits, $first, $last, -1];
+        }
+
+        foreach ($windows as $id => [$start, $end]) {
+            for ($index = $start; $index <= $end; $index++) {
+                $rows[$index][4] = $id;
+            }
+        }
+
+        return $rows;
+    }
+
+    /**
+     * @param  list<string>  $lines
+     * @return list<list<int>>
+     */
+    public static function filterLineWindowBatchNative(array $lines, string $term, bool $caseSensitive, int $context): array
+    {
+        $count = \count($lines);
+
+        if ($count === 0) {
+            return [];
+        }
+
+        $raw = LogIndex::evaluateW47Native(5, pack('P*', $count, $caseSensitive ? 1 : 0, $context).$term."\0".implode("\0", $lines), 40 * $count);
+
+        return $raw === null ? self::filterLineWindowBatchPhp($lines, $term, $caseSensitive, $context) : LogIndex::w47Rows($raw, 5);
     }
 
     /**
