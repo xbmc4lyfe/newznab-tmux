@@ -342,4 +342,179 @@ final class FrameQualityScorer
 
         return self::$ffi;
     }
+
+    // Rust is the default only while the paired W51.6 benchmark clears 1.5x on all four metrics.
+    private const bool W51_RUST_FFI_DEFAULT = true;
+
+    public const string W51_FFI_CDEF = <<<'C'
+        int32_t nntmux_w516_frame_luma_batch(const char *samples, size_t samples_len, const char *sample_lens, size_t sample_lens_len, size_t count, double min_stddev, double min_luma, double max_luma, int64_t *out, size_t out_count);
+        C;
+
+    public const int W51_FRAME_HEADER = 9;
+
+    private const int W51_MAX_ITEMS = 1_048_576;
+
+    private static ?bool $w51RustFfi = null;
+
+    private static FFI|false|null $w51Ffi = null;
+
+    private static ?CData $w51Out = null;
+
+    private static int $w51Capacity = 0;
+
+    /**
+     * Score a batch of RGB samples as `measureRgbPhp()` does and choose the frame `best()` would.
+     *
+     * Layout: `[0]` count, `[1]` valid samples, `[2]` blank ones (stddev below `$minStddev`),
+     * `[3]` non-blank ones of normal brightness, `[4]` best index (-1 when none), `[5]` and
+     * `[6]` its floor(mean * 1000) and floor(stddev * 1000), `[7]` invalid samples (empty or not
+     * whole RGB triplets), `[8]` FNV-1a digest; then per sample `valid | blank << 1 |
+     * normal << 2 | mean_milli << 4 | stddev_milli << 24` (0 when invalid).
+     *
+     * @param  array<array-key, string>  $samples
+     * @return list<int>
+     */
+    public static function scoreFrameBatch(array $samples, float $minStddev, float $minLuma, float $maxLuma): array
+    {
+        return (self::usesW51RustFfi() ? self::scoreFrameBatchNative($samples, $minStddev, $minLuma, $maxLuma) : null)
+            ?? self::scoreFrameBatchPhp($samples, $minStddev, $minLuma, $maxLuma);
+    }
+
+    /**
+     * @param  array<array-key, string>  $samples
+     * @return list<int>
+     */
+    public static function scoreFrameBatchPhp(array $samples, float $minStddev, float $minLuma, float $maxLuma): array
+    {
+        $samples = array_values($samples);
+        $out = [\count($samples), 0, 0, 0, -1, 0, 0, 0, 0];
+        $bestRank = null;
+        $digest = 2_166_136_261;
+        $rows = [];
+        foreach ($samples as $index => $sample) {
+            $measure = self::measureRgbPhp($sample);
+            $row = 0;
+            if ($measure === null) {
+                $out[7]++;
+            } else {
+                $blank = $measure['stddev'] < $minStddev;
+                $normal = $measure['mean'] >= $minLuma && $measure['mean'] <= $maxLuma;
+                $meanMilli = (int) floor($measure['mean'] * 1000.0);
+                $stddevMilli = (int) floor($measure['stddev'] * 1000.0);
+                $out[1]++;
+                if ($blank) {
+                    $out[2]++;
+                } else {
+                    $out[3] += (int) $normal;
+                    $rank = [$normal, $measure['stddev']];
+                    if ($bestRank === null || $rank > $bestRank) {
+                        $bestRank = $rank;
+                        $out[4] = $index;
+                        $out[5] = $meanMilli;
+                        $out[6] = $stddevMilli;
+                    }
+                }
+                $row = 1 | (int) $blank << 1 | (int) $normal << 2 | $meanMilli << 4 | $stddevMilli << 24;
+            }
+            $digest = (($digest ^ (($row ^ ($row >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+            $rows[] = $row;
+        }
+        $out[8] = $digest;
+
+        return [...$out, ...$rows];
+    }
+
+    /**
+     * Rust scoring, or null when PHP must compute it (unavailable library or rejected input).
+     *
+     * @param  array<array-key, string>  $samples
+     * @return list<int>|null
+     */
+    public static function scoreFrameBatchNative(array $samples, float $minStddev, float $minLuma, float $maxLuma): ?array
+    {
+        $samples = array_values($samples);
+        $count = \count($samples);
+        $fields = self::W51_FRAME_HEADER + $count;
+        $binding = $count <= self::W51_MAX_ITEMS ? self::w51Binding($fields) : null;
+        if ($binding === null) {
+            return null;
+        }
+        [$ffi, $out] = $binding;
+        $joined = implode('', $samples);
+        if (\strlen($joined) > 0xFFFFFFFF) {
+            return null;
+        }
+        $lens = $count === 0 ? '' : pack('V*', ...array_map(strlen(...), $samples));
+        try {
+            // @phpstan-ignore method.notFound
+            $status = $ffi->nntmux_w516_frame_luma_batch($joined, \strlen($joined), $lens, \strlen($lens), $count, $minStddev, $minLuma, $maxLuma, $out, $fields);
+
+            return self::w51Decode(\is_int($status) ? $status : -1, $out, $fields);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Run `$callback` with the Wave 51.6 Rust batch path forced on or off, then restore the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW51RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$w51RustFfi;
+        self::$w51RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$w51RustFfi = $previous;
+        }
+    }
+
+    public static function usesW51RustFfi(): bool
+    {
+        return self::$w51RustFfi ?? self::W51_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * The cached Wave 51.6 binding and an output buffer of at least `$fields` values, or null.
+     *
+     * @return array{0: FFI, 1: CData}|null
+     */
+    private static function w51Binding(int $fields): ?array
+    {
+        try {
+            self::$w51Ffi ??= RustPipelineLibrary::resolveDomain('additional_w51', self::W51_FFI_CDEF) ?? false;
+            if (self::$w51Ffi === false) {
+                return null;
+            }
+            $out = self::$w51Out;
+            if ($out === null || self::$w51Capacity < $fields) {
+                self::$w51Capacity = max(256, $fields);
+                $out = self::$w51Out = self::$w51Ffi->new('int64_t['.self::$w51Capacity.']');
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        return [self::$w51Ffi, $out];
+    }
+
+    /**
+     * Decode `$fields` output values after a successful Wave 51.6 call.
+     *
+     * @return list<int>|null
+     */
+    private static function w51Decode(int $status, CData $out, int $fields): ?array
+    {
+        if ($status !== 1) {
+            return null;
+        }
+        $values = unpack('P*', FFI::string($out, $fields * 8));
+
+        return $values === false ? null : array_values($values);
+    }
 }
