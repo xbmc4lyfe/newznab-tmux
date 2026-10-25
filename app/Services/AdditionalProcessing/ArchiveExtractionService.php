@@ -41,6 +41,21 @@ class ArchiveExtractionService
         int32_t nntmux_archive_detect_standalone_video(const char *data, size_t data_len);
         C;
 
+    public const string W406_FFI_CDEF = 'ssize_t nntmux_w406_archive_media_download_processor_planner(uint8_t operation, const char *input, size_t input_len, char *out_buf, size_t out_cap);';
+
+    /** Wave 40.6 paired benchmarks decide this default; see RustArchiveExtractionMediaUsenetDownloadReleaseProcW40ParityTest. */
+    public const bool W406_RUST_FFI_DEFAULT = false;
+
+    private const int W406_RUST_MAX_INPUT = 16_777_216;
+
+    /** Extensions of directly executable programs and scripts, compared ASCII case-insensitively. */
+    private const array W406_EXECUTABLE_EXTENSIONS = ['bat' => true, 'cmd' => true, 'com' => true, 'cpl' => true, 'exe' => true, 'jar' => true,
+        'js' => true, 'msi' => true, 'ps1' => true, 'scr' => true, 'sh' => true, 'vbs' => true];
+
+    private static ?bool $w406UseRustFfi = null;
+
+    private static FFI|false|null $w406Ffi = null;
+
     private const array STANDALONE_VIDEO_CODES = [
         1 => 'avi',
         2 => 'mkv',
@@ -1138,5 +1153,145 @@ class ArchiveExtractionService
         }
 
         Process::timeout(1800)->run($command);
+    }
+
+    public static function useW406RustFfi(?bool $enabled): void
+    {
+        self::$w406UseRustFfi = $enabled;
+    }
+
+    public static function usesW406RustFfi(): bool
+    {
+        return self::$w406UseRustFfi ?? self::W406_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW406RustFfi(): void
+    {
+        self::$w406UseRustFfi = null;
+        self::$w406Ffi = null;
+    }
+
+    /**
+     * Audit extracted archive member paths. A member is rejected when it is not a string, is empty, starts with
+     * '/' or '\\', contains a NUL byte, or has a '..' segment ('/' and '\\' both separate segments); the rest are
+     * safe relative paths. Every string member whose final extension is an executable or script type counts as
+     * executable, rejected or not. The listing exceeds the limit when it holds more than max(0, $maxEntries) members.
+     *
+     * @param  array<array-key, mixed>  $relativePaths
+     * @return array{total_entries: int, safe_relative: int, traversal_rejected: int, executable: int, exceeds_limit: bool}
+     */
+    public static function summarizeExtractedEntriesSafety(array $relativePaths, int $maxEntries = 500): array
+    {
+        return (self::usesW406RustFfi() ? self::summarizeExtractedEntriesSafetyNative($relativePaths, $maxEntries) : null)
+            ?? self::summarizeExtractedEntriesSafetyPhp($relativePaths, $maxEntries);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $relativePaths
+     * @return array{total_entries: int, safe_relative: int, traversal_rejected: int, executable: int, exceeds_limit: bool}
+     */
+    public static function summarizeExtractedEntriesSafetyPhp(array $relativePaths, int $maxEntries = 500): array
+    {
+        $rejected = 0;
+        $executable = 0;
+        foreach ($relativePaths as $path) {
+            if (! \is_string($path)) {
+                $rejected++;
+
+                continue;
+            }
+            $normalized = strtr($path, '\\', '/');
+            if ($path === '' || $normalized[0] === '/' || str_contains($path, "\0") || \in_array('..', explode('/', $normalized), true)) {
+                $rejected++;
+            }
+            $slash = strrpos($normalized, '/');
+            $name = $slash === false ? $normalized : substr($normalized, $slash + 1);
+            $dot = strrpos($name, '.');
+            if ($dot !== false && isset(self::W406_EXECUTABLE_EXTENSIONS[strtolower(substr($name, $dot + 1))])) {
+                $executable++;
+            }
+        }
+        $total = \count($relativePaths);
+
+        return [
+            'total_entries' => $total,
+            'safe_relative' => $total - $rejected,
+            'traversal_rejected' => $rejected,
+            'executable' => $executable,
+            'exceeds_limit' => $total > max(0, $maxEntries),
+        ];
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $relativePaths
+     * @return array{total_entries: int, safe_relative: int, traversal_rejected: int, executable: int, exceeds_limit: bool}|null
+     */
+    public static function summarizeExtractedEntriesSafetyNative(array $relativePaths, int $maxEntries = 500): ?array
+    {
+        $total = \count($relativePaths);
+        $frame = pack('qV', $maxEntries, $total);
+        foreach ($relativePaths as $path) {
+            $frame .= self::w406OptionalString($path);
+        }
+        $slots = self::w406Slots(1, $frame, 5);
+        if ($slots === null || $slots[0] !== $total || $slots[1] < 0 || $slots[2] < 0 || $total !== $slots[1] + $slots[2]
+            || $slots[3] < 0 || $slots[3] > $total || ($slots[4] & ~1) !== 0) {
+            return null;
+        }
+
+        return [
+            'total_entries' => $total,
+            'safe_relative' => $slots[1],
+            'traversal_rejected' => $slots[2],
+            'executable' => $slots[3],
+            'exceeds_limit' => $slots[4] === 1,
+        ];
+    }
+
+    /**
+     * Frames a value as a u32-LE length-prefixed string, or as the 0xFFFFFFFF marker when it is not a string.
+     *
+     * @internal
+     */
+    public static function w406OptionalString(mixed $value): string
+    {
+        return \is_string($value) ? pack('V', \strlen($value)).$value : pack('V', 0xFFFFFFFF);
+    }
+
+    /**
+     * Calls the Wave 40.6 export shared by the additional-processing helpers and decodes its fixed i64 slots.
+     * Every output fits the initial scratch buffer, so any negative or unexpected size falls back to PHP.
+     *
+     * @internal
+     *
+     * @return list<int>|null
+     */
+    public static function w406Slots(int $operation, string $input, int $slots): ?array
+    {
+        if (\strlen($input) > self::W406_RUST_MAX_INPUT) {
+            return null;
+        }
+        try {
+            self::$w406Ffi ??= RustPipelineLibrary::resolveDomain('additional_w406', self::W406_FFI_CDEF) ?? false;
+            if (self::$w406Ffi === false) {
+                return null;
+            }
+            $ffi = self::$w406Ffi;
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, $slots * 8, $capacity);
+            if ($buffer === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w406_archive_media_download_processor_planner($operation, $input, \strlen($input), $buffer, min($capacity, self::W406_RUST_MAX_INPUT));
+            if ($written !== $slots * 8) {
+                return null;
+            }
+            $values = unpack('q*', FFI::string($buffer, $written));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }
