@@ -6,6 +6,7 @@ namespace App\Services\Releases\Verification;
 
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Database\Connection;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
@@ -305,5 +306,193 @@ final class CandidatePreparationService
 
             return $query->whereIn('id', $ids)->update($values);
         });
+    }
+
+    /** Wave 49.2 paired benchmarks decide this default; see RustVerificationAdmissionInventoryPrepRepoSampleW49ParityTest. */
+    private const W49_RUST_FFI_DEFAULT = true;
+
+    public const string W49_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w49_candidate_preparation_batch(const char *statuses, size_t statuses_len, const char *reasons, size_t reasons_len, size_t count, int64_t max_bytes, int64_t batch_size, int64_t *out, size_t out_cap);
+        C;
+
+    private static ?bool $w49RustFfi = null;
+
+    private static FFI|false|null $w49Ffi = null;
+
+    private static ?CData $w49Out = null;
+
+    private static int $w49OutCap = 0;
+
+    public static function usesW49RustFfi(): bool
+    {
+        return self::$w49RustFfi ?? self::W49_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with planAssessmentUpdates() routed to Rust ($enabled) or PHP, then restores the previous
+     * routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW49RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$w49RustFfi;
+        self::$w49RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$w49RustFfi = $previous;
+        }
+    }
+
+    /**
+     * Batch plan of prepare()'s update stream for assessed rows. One word per row: `status code
+     * (0 ready, 1 waiting_upload, 2 header_rejected, 3 unknown, 4 other) | shape << 3 | 32 a
+     * waiting batch flushes before this row | 64 the waiting batch reached $batchSize and flushed
+     * | stored reason length << 8 | flushes so far << 32`, where shape holds
+     * PreparedCandidateUpdate's SHAPE_REASON (any status but ready) and SHAPE_RETRY (unknown) bits
+     * and the stored reason is truncateAssessmentReasonPhp($reason, $maxBytes) (lengths clamped to
+     * 2^24 - 1, flushes to 2^30 - 1). Consecutive waiting rows with the same stored reason share a
+     * batch; any other row flushes it first. Then total flushes, immediate updates, waiting rows
+     * and the XXH64 digest of all earlier words.
+     *
+     * @param  list<string>  $statuses
+     * @param  list<string|null>  $reasons
+     * @return list<int>
+     */
+    public static function planAssessmentUpdates(array $statuses, array $reasons, int $maxBytes = 2000, int $batchSize = self::WAITING_BATCH_SIZE): array
+    {
+        return self::usesW49RustFfi()
+            ? self::planAssessmentUpdatesNative($statuses, $reasons, $maxBytes, $batchSize)
+            : self::planAssessmentUpdatesPhp($statuses, $reasons, $maxBytes, $batchSize);
+    }
+
+    /**
+     * @param  list<string>  $statuses
+     * @param  list<string|null>  $reasons
+     * @return list<int>
+     */
+    public static function planAssessmentUpdatesPhp(array $statuses, array $reasons, int $maxBytes = 2000, int $batchSize = self::WAITING_BATCH_SIZE): array
+    {
+        $batch = max(1, $batchSize);
+        $out = [];
+        $group = '';
+        $pending = $flushes = $immediate = $waiting = 0;
+        foreach ($statuses as $i => $status) {
+            $shape = (int) ($status !== 'ready') | (int) ($status === 'unknown') << 1;
+            $text = ($shape & 1) !== 0 ? mb_strcut($reasons[$i] ?? '', 0, $maxBytes, 'UTF-8') : '';
+            $flags = 0;
+            if ($status === 'waiting_upload') {
+                if ($text !== $group) {
+                    if ($pending > 0) {
+                        $flushes++;
+                        $pending = 0;
+                        $flags |= 32;
+                    }
+                    $group = $text;
+                }
+                $pending++;
+                $waiting++;
+                if ($pending === $batch) {
+                    $flushes++;
+                    $pending = 0;
+                    $flags |= 64;
+                }
+            } else {
+                if ($pending > 0) {
+                    $flushes++;
+                    $pending = 0;
+                    $flags |= 32;
+                }
+                $immediate++;
+            }
+            $code = match ($status) {
+                'ready' => 0,
+                'waiting_upload' => 1,
+                'header_rejected' => 2,
+                'unknown' => 3,
+                default => 4,
+            };
+            $out[] = $code | $shape << 3 | $flags | min(\strlen($text), 0xFFFFFF) << 8 | min($flushes, 0x3FFFFFFF) << 32;
+        }
+        if ($pending > 0) {
+            $flushes++;
+        }
+        $out[] = $flushes;
+        $out[] = $immediate;
+        $out[] = $waiting;
+
+        return self::w49Digest($out);
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, the lists differ in length, a
+     * value holds a NUL byte or $maxBytes is negative.
+     *
+     * @param  list<string>  $statuses
+     * @param  list<string|null>  $reasons
+     * @return list<int>
+     */
+    public static function planAssessmentUpdatesNative(array $statuses, array $reasons, int $maxBytes = 2000, int $batchSize = self::WAITING_BATCH_SIZE): array
+    {
+        $count = \count($statuses);
+        $ffi = $count === 0 || $maxBytes < 0 ? null : (self::$w49Ffi instanceof FFI ? self::$w49Ffi : self::w49Ffi());
+        if ($ffi === null || \count($reasons) !== $count) {
+            return self::planAssessmentUpdatesPhp($statuses, $reasons, $maxBytes, $batchSize);
+        }
+        $joinedStatuses = implode("\0", $statuses);
+        $joinedReasons = implode("\0", $reasons);
+        $words = $count + 4;
+        $values = false;
+        // Rust rejects a column whose NUL count differs from $count - 1 (an embedded NUL byte).
+        try {
+            $out = self::w49Out($ffi, $words);
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w49_candidate_preparation_batch($joinedStatuses, \strlen($joinedStatuses), $joinedReasons, \strlen($joinedReasons), $count, $maxBytes, $batchSize, $out, self::$w49OutCap);
+            $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+        } catch (Throwable) {
+            $values = false;
+        }
+
+        /** @var list<int>|null $result */
+        $result = \is_array($values) ? array_values($values) : null;
+
+        return $result ?? self::planAssessmentUpdatesPhp($statuses, $reasons, $maxBytes, $batchSize);
+    }
+
+    private static function w49Ffi(): ?FFI
+    {
+        self::$w49Ffi ??= RustPipelineLibrary::resolveDomain('nfo_w49', self::W49_FFI_CDEF) ?? false;
+
+        return self::$w49Ffi === false ? null : self::$w49Ffi;
+    }
+
+    /** A reusable output buffer of at least $words `int64_t` words; FFI::new() throws on failure. */
+    private static function w49Out(FFI $ffi, int $words): CData
+    {
+        if (self::$w49Out === null || self::$w49OutCap < $words) {
+            self::$w49Out = $ffi->new('int64_t['.max(1024, $words).']');
+            self::$w49OutCap = max(1024, $words);
+        }
+
+        return self::$w49Out;
+    }
+
+    /**
+     * Appends the XXH64 digest of the words.
+     *
+     * @param  list<int>  $words
+     * @return list<int>
+     */
+    private static function w49Digest(array $words): array
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$words), true));
+        $words[] = $digest[1];
+
+        return $words;
     }
 }
