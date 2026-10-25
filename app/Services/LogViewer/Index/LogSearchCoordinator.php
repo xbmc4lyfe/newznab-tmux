@@ -22,6 +22,15 @@ use Throwable;
  */
 class LogSearchCoordinator
 {
+    /**
+     * Benchmark-gated default for {@see routeFileBatch()}: stays PHP because framing and decoding outweigh
+     * the cheap per-file checks (Rust was slower); see
+     * tests/Unit/RustLogViewerIndexIndexerCoordinatorManticoreSearcherW47ParityTest.php.
+     */
+    public const bool W47_LOG_SEARCH_COORDINATOR_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useW47LogSearchCoordinatorRustFfi = null;
+
     public function __construct(
         private readonly LogSearcher $grep,
         private readonly ManticoreLogSearcher $manticore,
@@ -129,6 +138,95 @@ class LogSearchCoordinator
         } catch (Throwable) {
             return null;
         }
+    }
+
+    /** Pass null to restore {@see W47_LOG_SEARCH_COORDINATOR_RUST_FFI_DEFAULT}. */
+    public static function useW47LogSearchCoordinatorRustFfi(?bool $enable = true): void
+    {
+        self::$useW47LogSearchCoordinatorRustFfi = $enable;
+    }
+
+    public static function usesW47LogSearchCoordinatorRustFfi(): bool
+    {
+        return self::$useW47LogSearchCoordinatorRustFfi ?? self::W47_LOG_SEARCH_COORDINATOR_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW47LogSearchCoordinatorRustFfi(): void
+    {
+        self::$useW47LogSearchCoordinatorRustFfi = null;
+    }
+
+    /**
+     * Routes files `[path, size, indexed_offset, indexed_at]` (offset -1 without a tracking row, indexed_at
+     * 0 when never indexed) like {@see search()}. Per file: `[route, state, indexed_bytes, indexed_before,
+     * first_index]` — 1 for Manticore when the index is usable and the file is caught up within
+     * $lagTolerance, the {@see LogIndexer::status()} state (0 none, 1 partial, 2 indexed), indexed bytes,
+     * the index cursor `min($before, indexed_offset)` (-1 off the index) and the position of the first
+     * file with the same path, which owns the result.
+     *
+     * @param  list<array{string, int, int, int}>  $files
+     * @return list<list<int>>
+     */
+    public static function routeFileBatch(array $files, bool $indexUsable, int $lagTolerance, ?int $before): array
+    {
+        return self::usesW47LogSearchCoordinatorRustFfi()
+            ? self::routeFileBatchNative($files, $indexUsable, $lagTolerance, $before)
+            : self::routeFileBatchPhp($files, $indexUsable, $lagTolerance, $before);
+    }
+
+    /**
+     * @param  list<array{string, int, int, int}>  $files
+     * @return list<list<int>>
+     */
+    public static function routeFileBatchPhp(array $files, bool $indexUsable, int $lagTolerance, ?int $before): array
+    {
+        $rows = [];
+        $first = [];
+        $index = 0;
+
+        foreach ($files as [$path, $size, $offset, $indexedAt]) {
+            $hasRow = $offset >= 0;
+            $state = ! $hasRow || $indexedAt <= 0 ? 0 : ($size - $offset <= $lagTolerance && $size >= $offset ? 2 : 1);
+            $route = $indexUsable && $state === 2;
+            $rows[] = [
+                $route ? 1 : 0,
+                $state,
+                $hasRow ? min($offset, $size) : 0,
+                $route ? ($before === null ? $offset : min($before, $offset)) : -1,
+                $first[$path] ??= $index,
+            ];
+            $index++;
+        }
+
+        return $rows;
+    }
+
+    /**
+     * @param  list<array{string, int, int, int}>  $files
+     * @return list<list<int>>
+     */
+    public static function routeFileBatchNative(array $files, bool $indexUsable, int $lagTolerance, ?int $before): array
+    {
+        $count = \count($files);
+
+        if ($count === 0) {
+            return [];
+        }
+
+        $paths = array_column($files, 0);
+        $sizes = array_column($files, 1);
+        $offsets = array_column($files, 2);
+        $indexedAt = array_column($files, 3);
+
+        if (\count($paths) !== $count || \count($sizes) !== $count || \count($offsets) !== $count || \count($indexedAt) !== $count) {
+            return self::routeFileBatchPhp($files, $indexUsable, $lagTolerance, $before);
+        }
+
+        $input = pack('P*', $count, $indexUsable ? 1 : 0, $lagTolerance, $before === null ? 0 : 1, $before ?? 0, ...$sizes, ...$offsets, ...$indexedAt)
+            .LogIndex::w47Joined($paths);
+        $raw = LogIndex::evaluateW47Native(3, $input, 40 * $count);
+
+        return $raw === null ? self::routeFileBatchPhp($files, $indexUsable, $lagTolerance, $before) : LogIndex::w47Rows($raw, 5);
     }
 
     /**

@@ -32,6 +32,18 @@ class ManticoreLogSearcher
 
     private const int CHANNEL_FACET_SIZE = 200;
 
+    /**
+     * Benchmark-gated default for {@see scoreHitBatch()}: stays PHP because mean and p99 stayed near 1.4x
+     * against memchr-backed strpos/stripos; see
+     * tests/Unit/RustLogViewerIndexIndexerCoordinatorManticoreSearcherW47ParityTest.php.
+     */
+    public const bool W47_MANTICORE_LOG_SEARCHER_RUST_FFI_DEFAULT = false;
+
+    /** Occurrences counted per string, as `SearchQuery` caps highlights. */
+    private const int W47_MAX_OCCURRENCES = 200;
+
+    private static ?bool $useW47ManticoreLogSearcherRustFfi = null;
+
     public function __construct(
         private readonly LogIndex $index,
         private readonly LogReader $reader,
@@ -266,6 +278,131 @@ class ManticoreLogSearcher
         } catch (Throwable) {
             return null;
         }
+    }
+
+    /** Pass null to restore {@see W47_MANTICORE_LOG_SEARCHER_RUST_FFI_DEFAULT}. */
+    public static function useW47ManticoreLogSearcherRustFfi(?bool $enable = true): void
+    {
+        self::$useW47ManticoreLogSearcherRustFfi = $enable;
+    }
+
+    public static function usesW47ManticoreLogSearcherRustFfi(): bool
+    {
+        return self::$useW47ManticoreLogSearcherRustFfi ?? self::W47_MANTICORE_LOG_SEARCHER_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW47ManticoreLogSearcherRustFfi(): void
+    {
+        self::$useW47ManticoreLogSearcherRustFfi = null;
+    }
+
+    /**
+     * Re-checks and scores index hits `[byte_offset, byte_end, line_no, level, channel, first_line, body]`.
+     * Per hit: `[offset, end, line, accepted, matched, score]` — the {@see hitPosition()} line (0 when not
+     * positive), whether the level and channel filters accept it (empty filters accept all), whether the
+     * term occurs in the entry text as {@see textMatches()} builds it (always for an empty term) and a
+     * score of 4 per first-line occurrence plus 1 per body occurrence (each capped at 200, ASCII case
+     * folding unless $caseSensitive).
+     *
+     * @param  list<array{int, int, int, string, string, string, string}>  $hits
+     * @param  list<string>  $levels
+     * @param  list<string>  $channels
+     * @return list<list<int>>
+     */
+    public static function scoreHitBatch(array $hits, string $term, bool $caseSensitive, array $levels, array $channels): array
+    {
+        return self::usesW47ManticoreLogSearcherRustFfi()
+            ? self::scoreHitBatchNative($hits, $term, $caseSensitive, $levels, $channels)
+            : self::scoreHitBatchPhp($hits, $term, $caseSensitive, $levels, $channels);
+    }
+
+    /**
+     * @param  list<array{int, int, int, string, string, string, string}>  $hits
+     * @param  list<string>  $levels
+     * @param  list<string>  $channels
+     * @return list<list<int>>
+     */
+    public static function scoreHitBatchPhp(array $hits, string $term, bool $caseSensitive, array $levels, array $channels): array
+    {
+        $rows = [];
+
+        foreach ($hits as [$offset, $end, $line, $level, $channel, $firstLine, $body]) {
+            $accepted = ($levels === [] || \in_array($level, $levels, true)) && ($channels === [] || \in_array($channel, $channels, true));
+
+            if ($term === '') {
+                $matched = 1;
+                $score = 0;
+            } else {
+                $text = $body === '' ? $firstLine : $firstLine."\n".$body;
+                $matched = ($caseSensitive ? str_contains($text, $term) : stripos($text, $term) !== false) ? 1 : 0;
+                $score = 4 * self::w47Occurrences($firstLine, $term, $caseSensitive) + self::w47Occurrences($body, $term, $caseSensitive);
+            }
+
+            $rows[] = [$offset, $end, $line > 0 ? $line : 0, $accepted ? 1 : 0, $matched, $score];
+        }
+
+        return $rows;
+    }
+
+    /**
+     * @param  list<array{int, int, int, string, string, string, string}>  $hits
+     * @param  list<string>  $levels
+     * @param  list<string>  $channels
+     * @return list<list<int>>
+     */
+    public static function scoreHitBatchNative(array $hits, string $term, bool $caseSensitive, array $levels, array $channels): array
+    {
+        $count = \count($hits);
+
+        if ($count === 0) {
+            return [];
+        }
+
+        $columns = [];
+
+        for ($column = 0; $column < 7; $column++) {
+            $columns[$column] = array_column($hits, $column);
+
+            if (\count($columns[$column]) !== $count) {
+                return self::scoreHitBatchPhp($hits, $term, $caseSensitive, $levels, $channels);
+            }
+        }
+
+        $strings = $term;
+
+        foreach ([$levels, $channels, $columns[3], $columns[4], $columns[5], $columns[6]] as $list) {
+            if ($list !== []) {
+                $strings .= "\0".implode("\0", $list);
+            }
+        }
+
+        $input = pack('P*', $count, $caseSensitive ? 1 : 0, \count($levels), \count($channels), ...$columns[0], ...$columns[1], ...$columns[2]).$strings;
+        $raw = LogIndex::evaluateW47Native(4, $input, 48 * $count);
+
+        return $raw === null ? self::scoreHitBatchPhp($hits, $term, $caseSensitive, $levels, $channels) : LogIndex::w47Rows($raw, 6);
+    }
+
+    /**
+     * Non-overlapping occurrences of a non-empty term, capped at {@see W47_MAX_OCCURRENCES}.
+     */
+    private static function w47Occurrences(string $text, string $term, bool $caseSensitive): int
+    {
+        $found = 0;
+        $offset = 0;
+        $length = \strlen($term);
+
+        while ($found < self::W47_MAX_OCCURRENCES) {
+            $position = $caseSensitive ? strpos($text, $term, $offset) : stripos($text, $term, $offset);
+
+            if ($position === false) {
+                break;
+            }
+
+            $found++;
+            $offset = $position + $length;
+        }
+
+        return $found;
     }
 
     /**

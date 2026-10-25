@@ -47,11 +47,24 @@ class LogIndexer
         ssize_t nntmux_logviewer_scrub_utf8(const char *input, size_t len, char *out_buf, size_t out_cap);
         C;
 
+    /**
+     * Benchmark-gated default for {@see scanChunkBatch()}: Rust cleared every 1.5x mean/p99 gate; see
+     * tests/Unit/RustLogViewerIndexIndexerCoordinatorManticoreSearcherW47ParityTest.php.
+     */
+    public const bool W47_LOG_INDEXER_RUST_FFI_DEFAULT = true;
+
+    /**
+     * A Monolog entry header with a date-time, channel and upper-case level (byte classes only).
+     */
+    private const string W47_HEADER_PATTERN = '/^\[[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}[^\]]*\] [A-Za-z0-9_.\-]+\.[A-Z]+:/';
+
     private static bool $useRustFfi = true;
 
     private static ?FFI $ffi = null;
 
     private static bool $ffiResolved = false;
+
+    private static ?bool $useW47LogIndexerRustFfi = null;
 
     public function __construct(
         private readonly LogIndex $index,
@@ -444,6 +457,105 @@ class LogIndexer
     public static function usesRustFfi(): bool
     {
         return self::$useRustFfi;
+    }
+
+    /** Pass null to restore {@see W47_LOG_INDEXER_RUST_FFI_DEFAULT}. */
+    public static function useW47LogIndexerRustFfi(?bool $enable = true): void
+    {
+        self::$useW47LogIndexerRustFfi = $enable;
+    }
+
+    public static function usesW47LogIndexerRustFfi(): bool
+    {
+        return self::$useW47LogIndexerRustFfi ?? self::W47_LOG_INDEXER_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW47LogIndexerRustFfi(): void
+    {
+        self::$useW47LogIndexerRustFfi = null;
+    }
+
+    /**
+     * Scans raw log chunks for entry boundaries. Per chunk: `[lines, headers, continuations, first_header,
+     * last_header, resume, longest_entry, crlf]` — complete lines, Monolog entry headers, stack-trace
+     * continuation lines (`#<digit>`, leading space/tab, `Stack trace:` or `[stacktrace]`), byte offsets of
+     * the first and last header (-1 without one), the offset after the last newline where the next read
+     * resumes, the longest header-to-header (or header-to-resume) span and lines ending in CR.
+     *
+     * @param  list<string>  $chunks
+     * @return list<list<int>>
+     */
+    public static function scanChunkBatch(array $chunks): array
+    {
+        return self::usesW47LogIndexerRustFfi() ? self::scanChunkBatchNative($chunks) : self::scanChunkBatchPhp($chunks);
+    }
+
+    /**
+     * @param  list<string>  $chunks
+     * @return list<list<int>>
+     */
+    public static function scanChunkBatchPhp(array $chunks): array
+    {
+        $rows = [];
+
+        foreach ($chunks as $chunk) {
+            $lines = explode("\n", $chunk);
+            array_pop($lines);
+            $headers = $continuations = $crlf = $longest = $offset = 0;
+            $first = $last = -1;
+
+            foreach ($lines as $line) {
+                if (str_ends_with($line, "\r")) {
+                    $crlf++;
+                }
+
+                $lead = $line[0] ?? '';
+
+                if ($lead === '[' && preg_match(self::W47_HEADER_PATTERN, $line) === 1) {
+                    $headers++;
+
+                    if ($first < 0) {
+                        $first = $offset;
+                    }
+
+                    if ($last >= 0) {
+                        $longest = max($longest, $offset - $last);
+                    }
+
+                    $last = $offset;
+                } elseif ($lead === ' ' || $lead === "\t" || ($lead === '#' && strspn($line, '0123456789', 1, 1) === 1)
+                    || str_starts_with($line, 'Stack trace:') || str_starts_with($line, '[stacktrace]')) {
+                    $continuations++;
+                }
+
+                $offset += \strlen($line) + 1;
+            }
+
+            if ($last >= 0) {
+                $longest = max($longest, $offset - $last);
+            }
+
+            $rows[] = [\count($lines), $headers, $continuations, $first, $last, $offset, $longest, $crlf];
+        }
+
+        return $rows;
+    }
+
+    /**
+     * @param  list<string>  $chunks
+     * @return list<list<int>>
+     */
+    public static function scanChunkBatchNative(array $chunks): array
+    {
+        $count = \count($chunks);
+
+        if ($count === 0) {
+            return [];
+        }
+
+        $raw = LogIndex::evaluateW47Native(2, pack('P', $count).LogIndex::w47Joined($chunks), 64 * $count);
+
+        return $raw === null ? self::scanChunkBatchPhp($chunks) : LogIndex::w47Rows($raw, 8);
     }
 
     private static function scrubNative(FFI $ffi, string $text): ?string
