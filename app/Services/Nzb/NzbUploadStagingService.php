@@ -370,4 +370,89 @@ final class NzbUploadStagingService
 
         return $folder;
     }
+
+    /**
+     * Default for the Wave 42.2 toggle only; enabled because the paired benchmark in
+     * tests/Unit/RustNzbSourceGuardInstallStagingXmlPar2W42ParityTest.php reaches 1.5x on every measure.
+     */
+    public const bool W422_RUST_FFI_DEFAULT = true;
+
+    private static ?bool $useW422RustFfi = null;
+
+    public static function useW422RustFfi(bool $enable = true): void
+    {
+        self::$useW422RustFfi = $enable;
+    }
+
+    public static function usesW422RustFfi(): bool
+    {
+        return self::$useW422RustFfi ?? self::W422_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW422RustFfi(): void
+    {
+        self::$useW422RustFfi = null;
+    }
+
+    /**
+     * Classify upload filenames the way validateFilenamePhp() would, without throwing: invalid (not a string), unsafe,
+     * wrong_extension or accepted, whose pathinfo basename byte lengths are summed.
+     *
+     * @param  array<array-key, mixed>  $filenames
+     * @return array{filenames: int, invalid: int, unsafe: int, wrong_extension: int, accepted: int, basename_bytes: int}
+     */
+    public static function summarizeUploadFilenames(array $filenames, string $expectedExtension = 'nzb'): array
+    {
+        return (self::usesW422RustFfi() ? self::summarizeUploadFilenamesNative($filenames, $expectedExtension) : null)
+            ?? self::summarizeUploadFilenamesPhp($filenames, $expectedExtension);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $filenames
+     * @return array{filenames: int, invalid: int, unsafe: int, wrong_extension: int, accepted: int, basename_bytes: int}
+     */
+    public static function summarizeUploadFilenamesPhp(array $filenames, string $expectedExtension = 'nzb'): array
+    {
+        $invalid = $unsafe = $wrong = $accepted = $bytes = 0;
+        foreach ($filenames as $filename) {
+            if (! \is_string($filename)) {
+                $invalid++;
+            } elseif ($filename === '' || $filename === '.' || $filename === '..' || strpbrk($filename, "/\\\0") !== false) {
+                $unsafe++;
+            } elseif (strtolower((string) pathinfo($filename, PATHINFO_EXTENSION)) !== $expectedExtension
+                || trim($basename = (string) pathinfo($filename, PATHINFO_FILENAME)) === '') {
+                $wrong++;
+            } else {
+                $accepted++;
+                $bytes += \strlen($basename);
+            }
+        }
+
+        return ['filenames' => \count($filenames), 'invalid' => $invalid, 'unsafe' => $unsafe, 'wrong_extension' => $wrong, 'accepted' => $accepted,
+            'basename_bytes' => $bytes];
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $filenames
+     * @return array{filenames: int, invalid: int, unsafe: int, wrong_extension: int, accepted: int, basename_bytes: int}|null
+     */
+    public static function summarizeUploadFilenamesNative(array $filenames, string $expectedExtension = 'nzb'): ?array
+    {
+        $texts = [];
+        foreach ($filenames as $filename) {
+            $texts[] = \is_string($filename) ? $filename : null;
+        }
+        $input = NzbSourceGuard::packW422Texts(\strlen($expectedExtension), $texts, $expectedExtension);
+        $slots = $input === null ? null : NzbSourceGuard::evaluateW422Native(2, $input, 6);
+        if ($slots === null) {
+            return null;
+        }
+        [$count, $invalid, $unsafe, $wrong, $accepted, $bytes] = $slots;
+        if ($count !== \count($filenames) || min($slots) < 0 || $invalid + $unsafe + $wrong + $accepted !== $count) {
+            return null;
+        }
+
+        return ['filenames' => $count, 'invalid' => $invalid, 'unsafe' => $unsafe, 'wrong_extension' => $wrong, 'accepted' => $accepted,
+            'basename_bytes' => $bytes];
+    }
 }
