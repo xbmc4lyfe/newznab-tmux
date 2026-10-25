@@ -407,4 +407,189 @@ class TvProcessingPassable
 
         return $returnValue;
     }
+
+    /**
+     * Wave 47.3 batch pipeline trace and match-confidence evaluation. Stays on PHP: the paired
+     * benchmark measured about 1.35x common and 1.1x uncommon, short of the 1.5x gate;
+     * useW47PassableRustFfi(true) keeps Rust available for parity.
+     */
+    public const bool W47_PASSABLE_RUST_FFI_DEFAULT = false;
+
+    public const string W47_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w47_tv_passable_trace_batch(const char *blob, size_t blob_len, const char *ints, size_t ints_len, size_t count, char *out, size_t out_cap);
+        C;
+
+    /** Values written per passable, followed by six outcome counts, the confidence sum and max retry-after. */
+    public const int W47_FIELDS_PER_PASSABLE = 4;
+
+    /** Match confidence by lowercase provider name; any other non-empty provider scores 50. */
+    public const array W47_PROVIDER_WEIGHTS = [
+        'tvdb' => 95,
+        'tvmaze' => 90,
+        'tmdb' => 85,
+        'trakt' => 80,
+        'local db' => 75,
+        'existing' => 70,
+    ];
+
+    private static ?bool $w47RustFfiOverride = null;
+
+    private static FFI|false|null $w47RustFfiHandle = null;
+
+    /** Null restores W47_PASSABLE_RUST_FFI_DEFAULT. */
+    public static function useW47PassableRustFfi(?bool $enable = true): void
+    {
+        self::$w47RustFfiOverride = $enable;
+        if ($enable === null) {
+            self::$w47RustFfiHandle = null;
+        }
+    }
+
+    public static function usesW47PassableRustFfi(): bool
+    {
+        return self::$w47RustFfiOverride ?? self::W47_PASSABLE_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Four values per passable: resolveFinalOutcome() code, 0-100 match confidence, distinct
+     * transient provider count and the FNV-1a 32 digest of the outcome digit followed by
+     * `show \x1E matched \x1E transients` (transients `\x1F`-joined). Then the count of each
+     * outcome code 0-5, the confidence sum and the max retry-after (-1 when none).
+     *
+     * @param  list<self>  $passables
+     * @return list<int>
+     */
+    public static function w47TraceBatch(array $passables): array
+    {
+        return self::usesW47PassableRustFfi()
+            ? self::w47TraceBatchNative($passables)
+            : self::w47TraceBatchPhp($passables);
+    }
+
+    /**
+     * @param  list<self>  $passables
+     * @return list<int>
+     */
+    public static function w47TraceBatchNative(array $passables): array
+    {
+        if (($ffi = self::w47RustFfi()) === null) {
+            return self::w47TraceBatchPhp($passables);
+        }
+        $count = \count($passables);
+        $transients = array_column($passables, 'transientProviders');
+        $flat = $transients === [] ? [] : array_merge(...$transients);
+        $blob = $count === 0 ? '' : implode("\0", array_column($passables, 'showProvider'))
+            ."\0".implode("\0", array_column($passables, 'matchedBy'));
+        if ($flat !== []) {
+            $blob .= "\0".implode("\0", $flat);
+        }
+        $pieces = 2 * $count + \count($flat);
+        if ($pieces > 0 && substr_count($blob, "\0") !== $pieces - 1) {
+            return self::w47TraceBatchPhp($passables);
+        }
+        try {
+            $retries = array_column($passables, 'maxRetryAfter');
+            $unparsed = array_keys(array_column($passables, 'parsed'), null, true);
+            $noRetry = array_keys($retries, null, true);
+            $packed = pack(
+                'q*',
+                \count($unparsed),
+                \count($noRetry),
+                ...array_column($passables, 'parseFailed'),
+                ...array_column($passables, 'seasonPack'),
+                ...array_column($passables, 'videoId'),
+                ...array_column($passables, 'episodeId'),
+                ...array_map(\count(...), $transients),
+                ...$retries,
+                ...$unparsed,
+                ...$noRetry,
+            );
+            $bytes = ($count * self::W47_FIELDS_PER_PASSABLE + 8) * 8;
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, $bytes, $capacity);
+            if ($buffer === null) {
+                return self::w47TraceBatchPhp($passables);
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w47_tv_passable_trace_batch($blob, \strlen($blob), $packed, \strlen($packed), $count, $buffer, $capacity);
+            if ($written !== $bytes) {
+                return self::w47TraceBatchPhp($passables);
+            }
+            $values = unpack('P*', FFI::string($buffer, $bytes));
+            if ($values === false) {
+                return self::w47TraceBatchPhp($passables);
+            }
+
+            /** @var list<int> */
+            return array_values($values);
+        } catch (Throwable) {
+            return self::w47TraceBatchPhp($passables);
+        }
+    }
+
+    /**
+     * @param  list<self>  $passables
+     * @return list<int>
+     */
+    public static function w47TraceBatchPhp(array $passables): array
+    {
+        $out = [];
+        $outcomes = [0, 0, 0, 0, 0, 0];
+        $confidenceSum = 0;
+        $maxRetry = -1;
+        foreach ($passables as $passable) {
+            $transient = $passable->transientProviders;
+            $outcome = self::resolveFinalOutcomePhp(
+                $passable->parseFailed,
+                $passable->parsed !== null,
+                $passable->videoId,
+                $passable->episodeId,
+                $passable->seasonPack,
+                $transient !== [],
+            );
+            $distinct = \count(array_unique($transient));
+            $matchedBy = (string) $passable->matchedBy;
+            $showProvider = (string) $passable->showProvider;
+            $confidence = match ($outcome) {
+                1 => self::w47Weight($matchedBy) - 5 * $distinct,
+                2 => self::w47Weight($matchedBy) - 15 - 5 * $distinct,
+                3 => intdiv(self::w47Weight($showProvider), 2) - 5 * $distinct,
+                4 => 10,
+                default => 0,
+            };
+            $confidence = max(0, min(100, $confidence));
+            $digest = self::w47Fnv($outcome.$showProvider."\x1E".$matchedBy."\x1E".implode("\x1F", $transient));
+            $outcomes[$outcome]++;
+            $confidenceSum += $confidence;
+            $maxRetry = max($maxRetry, $passable->maxRetryAfter ?? -1);
+            array_push($out, $outcome, $confidence, $distinct, $digest);
+        }
+        array_push($out, ...$outcomes);
+        $out[] = $confidenceSum;
+        $out[] = $maxRetry;
+
+        return $out;
+    }
+
+    private static function w47Weight(string $provider): int
+    {
+        return $provider === '' ? 0 : (self::W47_PROVIDER_WEIGHTS[strtolower($provider)] ?? 50);
+    }
+
+    private static function w47Fnv(string $bytes): int
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('N', hash('fnv1a32', $bytes, true));
+
+        return $digest[1];
+    }
+
+    private static function w47RustFfi(): ?FFI
+    {
+        if (self::$w47RustFfiHandle === null) {
+            self::$w47RustFfiHandle = RustPipelineLibrary::resolveDomain('categorize_w47', self::W47_FFI_CDEF) ?? false;
+        }
+
+        return self::$w47RustFfiHandle === false ? null : self::$w47RustFfiHandle;
+    }
 }
