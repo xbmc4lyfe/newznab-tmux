@@ -9,6 +9,8 @@ use App\Services\Categorization\CategorizationResult;
 use App\Services\Categorization\ReleaseContext;
 use App\Support\RustPipelineLibrary;
 use App\Traits\DetectsHashedNames;
+use FFI;
+use Throwable;
 
 /**
  * Categorizer for miscellaneous content and hash detection.
@@ -18,6 +20,49 @@ use App\Traits\DetectsHashedNames;
 class MiscCategorizer extends AbstractCategorizer
 {
     use DetectsHashedNames;
+
+    /**
+     * Wave 42.3 production default is Rust: the paired benchmark in
+     * tests/Unit/RustCategorizersBookConsoleGroupMiscMovieW42ParityTest.php measures at least 2.0x
+     * (mean and p99, common and uncommon batches). PHP stays the fallback when the library is
+     * unavailable.
+     * Named W423 so it stays distinct from other Rust FFI toggles.
+     */
+    public const bool W423_RUST_FFI_DEFAULT = true;
+
+    public const string W423_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w423_misc_content_batch(
+            const char *blob_ptr,
+            size_t blob_len,
+            const char *lens_ptr,
+            size_t lens_len,
+            char *out_buf,
+            size_t out_cap
+        );
+        C;
+
+    /** @var list<int> */
+    public const array W423_HASH_LENGTHS = [32, 40, 64];
+
+    public const string W423_HEX_DIGITS = '0123456789abcdefABCDEF';
+
+    /**
+     * Misc content marker substrings, in match order. The first class with a substring of the
+     * lowercased, trimmed release name wins.
+     *
+     * @var array<string, list<string>>
+     */
+    public const array W423_MISC_CONTENT_MARKERS = [
+        'archive' => ['.rar', '.zip', '.7z', '.par2', '.tar', '.001'],
+        'dataset' => ['dataset', '.csv', '.sql', 'dump', 'backup'],
+    ];
+
+    /** Exactly 6 0x1F-separated decimals of 1-19 digits. */
+    private const string W423_FIELDS_PATTERN = '/\A(?:\d{1,19}\x1F){5}\d{1,19}\z/';
+
+    private static ?bool $w423RustFfiOverride = null;
+
+    private static FFI|false|null $w423RustFfiHandle = null;
 
     /** @var array<int, string> */
     private const array SIGNAL_MARKER_BIT_MAP = [
@@ -434,5 +479,162 @@ class MiscCategorizer extends AbstractCategorizer
         };
 
         return [$analysis, $this->matched($categoryId, $confidence, $matchedBy, $debug)];
+    }
+
+    public static function useW423RustFfi(bool $enable = true): void
+    {
+        self::$w423RustFfiOverride = $enable;
+    }
+
+    public static function usesW423RustFfi(): bool
+    {
+        return self::$w423RustFfiOverride ?? self::W423_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW423RustFfi(): void
+    {
+        self::$w423RustFfiOverride = null;
+        self::$w423RustFfiHandle = null;
+    }
+
+    /**
+     * Misc content summary for a batch of release names. Each trim()med name adds to hash when it
+     * is all hex digits of a W423_HASH_LENGTHS length, else to its first W423_MISC_CONTENT_MARKERS
+     * class, else to other, and separately to empty when it trims to ''. Non-strings count as
+     * empty names.
+     *
+     * @param  array<array-key, mixed>  $releaseNames
+     * @return array{total: int, hash: int, archive: int, dataset: int, other: int, empty: int}
+     */
+    public static function summarizeMiscContentBatch(array $releaseNames): array
+    {
+        return (self::usesW423RustFfi() ? self::summarizeMiscContentBatchNative($releaseNames) : null)
+            ?? self::summarizeMiscContentBatchPhp($releaseNames);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $releaseNames
+     * @return array{total: int, hash: int, archive: int, dataset: int, other: int, empty: int}
+     */
+    public static function summarizeMiscContentBatchPhp(array $releaseNames): array
+    {
+        $classes = ['archive' => 0, 'dataset' => 0];
+        $hash = 0;
+        $other = 0;
+        $empty = 0;
+        foreach ($releaseNames as $releaseName) {
+            $name = trim(\is_string($releaseName) ? $releaseName : '');
+            $length = \strlen($name);
+            if ($length === 0) {
+                $empty++;
+            }
+            if (\in_array($length, self::W423_HASH_LENGTHS, true) && strspn($name, self::W423_HEX_DIGITS) === $length) {
+                $hash++;
+
+                continue;
+            }
+            $lower = strtolower($name);
+            foreach (self::W423_MISC_CONTENT_MARKERS as $class => $needles) {
+                foreach ($needles as $needle) {
+                    if (str_contains($lower, $needle)) {
+                        $classes[$class]++;
+
+                        continue 3;
+                    }
+                }
+            }
+            $other++;
+        }
+
+        return [
+            'total' => \count($releaseNames),
+            'hash' => $hash,
+            'archive' => $classes['archive'],
+            'dataset' => $classes['dataset'],
+            'other' => $other,
+            'empty' => $empty,
+        ];
+    }
+
+    /**
+     * Declines (null) for non-string items so PHP counts them.
+     *
+     * @param  array<array-key, mixed>  $releaseNames
+     * @return array{total: int, hash: int, archive: int, dataset: int, other: int, empty: int}|null
+     */
+    public static function summarizeMiscContentBatchNative(array $releaseNames): ?array
+    {
+        $lengths = [];
+        foreach ($releaseNames as $item) {
+            if (! \is_string($item)) {
+                return null;
+            }
+            $lengths[] = \strlen($item);
+        }
+        $blob = implode('', $releaseNames);
+        $lens = pack('V*', ...$lengths);
+        $fields = self::callW423Native($blob, $lens);
+        if ($fields === null) {
+            return null;
+        }
+
+        return [
+            'total' => (int) $fields[0],
+            'hash' => (int) $fields[1],
+            'archive' => (int) $fields[2],
+            'dataset' => (int) $fields[3],
+            'other' => (int) $fields[4],
+            'empty' => (int) $fields[5],
+        ];
+    }
+
+    /**
+     * Calls this class's Wave 42.3 export with the shared scratch buffer, retrying once at the size
+     * it asks for. Returns its fields only when they match W423_FIELDS_PATTERN: exactly the expected
+     * count of 1-19 digit decimals.
+     *
+     * @return list<string>|null
+     */
+    private static function callW423Native(string $blob, string $lens): ?array
+    {
+        $ffi = self::w423RustFfi();
+        if ($ffi === null) {
+            return null;
+        }
+
+        try {
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, 128, $capacity);
+            if ($buffer === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w423_misc_content_batch($blob, \strlen($blob), $lens, \strlen($lens), $buffer, $capacity);
+            if (\is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w423_misc_content_batch($blob, \strlen($blob), $lens, \strlen($lens), $buffer, $capacity);
+            }
+            if (! \is_int($written) || $written < 0 || $written > $capacity) {
+                return null;
+            }
+            $raw = FFI::string($buffer, $written);
+
+            return preg_match(self::W423_FIELDS_PATTERN, $raw) === 1 ? explode("\x1F", $raw) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private static function w423RustFfi(): ?FFI
+    {
+        if (self::$w423RustFfiHandle === null) {
+            self::$w423RustFfiHandle = RustPipelineLibrary::resolveDomain('categorize_w423', self::W423_FFI_CDEF) ?? false;
+        }
+
+        return self::$w423RustFfiHandle === false ? null : self::$w423RustFfiHandle;
     }
 }

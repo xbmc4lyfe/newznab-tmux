@@ -13,6 +13,48 @@ use Throwable;
 
 class ConsoleCategorizer extends AbstractCategorizer
 {
+    /**
+     * Wave 42.3 production default is Rust: the paired benchmark in
+     * tests/Unit/RustCategorizersBookConsoleGroupMiscMovieW42ParityTest.php measures at least 4.1x
+     * (mean and p99, common and uncommon batches). PHP stays the fallback when the library is
+     * unavailable.
+     * Named W423 so it stays distinct from other Rust FFI toggles.
+     */
+    public const bool W423_RUST_FFI_DEFAULT = true;
+
+    public const string W423_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w423_console_platform_batch(
+            const char *blob_ptr,
+            size_t blob_len,
+            const char *lens_ptr,
+            size_t lens_len,
+            char *out_buf,
+            size_t out_cap
+        );
+        C;
+
+    /**
+     * Console family marker substrings, in match order. The first family with a substring of the
+     * lowercased release name wins.
+     *
+     * @var array<string, list<string>>
+     */
+    public const array W423_CONSOLE_FAMILY_MARKERS = [
+        'playstation' => ['ps5', 'ps4', 'ps3', 'psvita', 'psp', 'playstation'],
+        'xbox' => ['xbox', 'x360', 'xbone', 'xbsx'],
+        'nintendo' => ['switch', 'nsw', 'wiiu', 'wii', '3ds', 'nds', 'nintendo'],
+    ];
+
+    /** @var list<string> */
+    public const array W423_REGION_MARKERS = ['pal', 'ntsc', 'usa', 'eur', 'jpn', 'region.free'];
+
+    /** Exactly 6 0x1F-separated decimals of 1-19 digits. */
+    private const string W423_FIELDS_PATTERN = '/\A(?:\d{1,19}\x1F){5}\d{1,19}\z/';
+
+    private static ?bool $w423RustFfiOverride = null;
+
+    private static FFI|false|null $w423RustFfiHandle = null;
+
     protected int $priority = 35;
 
     /**
@@ -300,5 +342,157 @@ CDEF;
         }
 
         return null;
+    }
+
+    public static function useW423RustFfi(bool $enable = true): void
+    {
+        self::$w423RustFfiOverride = $enable;
+    }
+
+    public static function usesW423RustFfi(): bool
+    {
+        return self::$w423RustFfiOverride ?? self::W423_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW423RustFfi(): void
+    {
+        self::$w423RustFfiOverride = null;
+        self::$w423RustFfiHandle = null;
+    }
+
+    /**
+     * Console platform summary for a batch of release names. Each lowercased name adds to its first
+     * W423_CONSOLE_FAMILY_MARKERS family, else to unknown, and separately to region when it holds
+     * any W423_REGION_MARKERS substring. Non-strings count as empty names.
+     *
+     * @param  array<array-key, mixed>  $releaseNames
+     * @return array{total: int, playstation: int, xbox: int, nintendo: int, unknown: int, region: int}
+     */
+    public static function summarizeConsolePlatformBatch(array $releaseNames): array
+    {
+        return (self::usesW423RustFfi() ? self::summarizeConsolePlatformBatchNative($releaseNames) : null)
+            ?? self::summarizeConsolePlatformBatchPhp($releaseNames);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $releaseNames
+     * @return array{total: int, playstation: int, xbox: int, nintendo: int, unknown: int, region: int}
+     */
+    public static function summarizeConsolePlatformBatchPhp(array $releaseNames): array
+    {
+        $families = ['playstation' => 0, 'xbox' => 0, 'nintendo' => 0];
+        $unknown = 0;
+        $region = 0;
+        foreach ($releaseNames as $releaseName) {
+            $name = strtolower(\is_string($releaseName) ? $releaseName : '');
+            foreach (self::W423_REGION_MARKERS as $needle) {
+                if (str_contains($name, $needle)) {
+                    $region++;
+
+                    break;
+                }
+            }
+            foreach (self::W423_CONSOLE_FAMILY_MARKERS as $family => $needles) {
+                foreach ($needles as $needle) {
+                    if (str_contains($name, $needle)) {
+                        $families[$family]++;
+
+                        continue 3;
+                    }
+                }
+            }
+            $unknown++;
+        }
+
+        return [
+            'total' => \count($releaseNames),
+            'playstation' => $families['playstation'],
+            'xbox' => $families['xbox'],
+            'nintendo' => $families['nintendo'],
+            'unknown' => $unknown,
+            'region' => $region,
+        ];
+    }
+
+    /**
+     * Declines (null) for non-string items so PHP counts them.
+     *
+     * @param  array<array-key, mixed>  $releaseNames
+     * @return array{total: int, playstation: int, xbox: int, nintendo: int, unknown: int, region: int}|null
+     */
+    public static function summarizeConsolePlatformBatchNative(array $releaseNames): ?array
+    {
+        $lengths = [];
+        foreach ($releaseNames as $item) {
+            if (! \is_string($item)) {
+                return null;
+            }
+            $lengths[] = \strlen($item);
+        }
+        $blob = implode('', $releaseNames);
+        $lens = pack('V*', ...$lengths);
+        $fields = self::callW423Native($blob, $lens);
+        if ($fields === null) {
+            return null;
+        }
+
+        return [
+            'total' => (int) $fields[0],
+            'playstation' => (int) $fields[1],
+            'xbox' => (int) $fields[2],
+            'nintendo' => (int) $fields[3],
+            'unknown' => (int) $fields[4],
+            'region' => (int) $fields[5],
+        ];
+    }
+
+    /**
+     * Calls this class's Wave 42.3 export with the shared scratch buffer, retrying once at the size
+     * it asks for. Returns its fields only when they match W423_FIELDS_PATTERN: exactly the expected
+     * count of 1-19 digit decimals.
+     *
+     * @return list<string>|null
+     */
+    private static function callW423Native(string $blob, string $lens): ?array
+    {
+        $ffi = self::w423RustFfi();
+        if ($ffi === null) {
+            return null;
+        }
+
+        try {
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, 128, $capacity);
+            if ($buffer === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w423_console_platform_batch($blob, \strlen($blob), $lens, \strlen($lens), $buffer, $capacity);
+            if (\is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w423_console_platform_batch($blob, \strlen($blob), $lens, \strlen($lens), $buffer, $capacity);
+            }
+            if (! \is_int($written) || $written < 0 || $written > $capacity) {
+                return null;
+            }
+            $raw = FFI::string($buffer, $written);
+
+            return preg_match(self::W423_FIELDS_PATTERN, $raw) === 1 ? explode("\x1F", $raw) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private static function w423RustFfi(): ?FFI
+    {
+        if (self::$w423RustFfiHandle === null) {
+            self::$w423RustFfiHandle = RustPipelineLibrary::resolveDomain('categorize_w423', self::W423_FFI_CDEF) ?? false;
+        }
+
+        return self::$w423RustFfiHandle === false ? null : self::$w423RustFfiHandle;
     }
 }
