@@ -39011,3 +39011,861 @@ mod w536_additional_batch_tests {
         assert_eq!((status, out[0]), (1, 0));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 54.6: AdditionalProcessing batch helpers (`nntmux_w546_*`) for
+// AdditionalBatchResult, AdditionalWorkPlan, DownloadedArchive,
+// MediaSourceHints and MediaSourcePlan. One crossing per batch: strings are
+// NUL-joined (or concatenated with `pack('V*')` lengths when one holds a NUL),
+// integer columns are machine-order `int64_t`, and the result is fixed-width
+// `int64_t` words (read with `unpack('P*')`). Every export returns 1, -1 for
+// invalid input (PHP then computes the batch) or -2 when `out` is null,
+// misaligned or too small, and leaves `out` untouched unless it returns 1.
+// ---------------------------------------------------------------------------
+
+/// Parts-per-million scale of the Wave 54.6 ratios.
+const W546_PPM: i64 = 1_000_000;
+
+/// Saturation of a 20-bit count field.
+const W546_COUNT_CAP: i64 = (1 << 20) - 1;
+
+/// Saturation of a 24-bit article field.
+const W546_ARTICLE_CAP: i64 = (1 << 24) - 1;
+
+/// Default decoded bytes per article (`MediaSourcePlan`'s W48 default).
+const W546_DEFAULT_PART: i64 = 716_800;
+
+/// Largest article part size a coverage batch accepts.
+const W546_PART_CAP: i64 = 1 << 30;
+
+#[inline]
+fn w546_count(value: i64) -> i64 {
+    value.clamp(0, W546_COUNT_CAP)
+}
+
+/// Validates the output pointer before any input is read, so a null `out`
+/// reports -2 even for an empty batch, then runs `compute` under `w49_run`.
+unsafe fn w546_run(
+    out: *mut i64,
+    out_cap: usize,
+    compute: impl FnOnce() -> Option<Vec<i64>>,
+) -> i32 {
+    if out.is_null() || !w17_aligned(out.cast_const(), out_cap) {
+        return -2;
+    }
+    // SAFETY: forwarded output contract.
+    unsafe { w49_run(out, out_cap, compute) }
+}
+
+/// First index of the strictly greatest (`greater`) value, -1 when none.
+#[inline]
+fn w546_pick(best: &mut (i64, i64), index: usize, value: i64, greater: bool) {
+    if best.0 < 0 || (greater && value > best.1) || (!greater && value < best.1) {
+        *best = (index as i64, value);
+    }
+}
+
+// --- AdditionalBatchResult::summarizeRunBatch -------------------------------
+
+pub(crate) const W546_RUN_HEADER: usize = 13;
+
+/// Six columns per run (claimed, attempted, successful, artifact releases,
+/// elapsed microseconds, peak memory bytes). Counts clamp to 0..2^20-1, time
+/// and memory to 0..2^40-1. `[0]` count, `[1..=5]` claimed / attempted /
+/// successful / artifacts / elapsed totals (capped at 2^62), `[6]` peak memory
+/// and `[7]` its first run (-1 when none), `[8]` fastest run by throughput
+/// (first; -1 when no run attempted anything in measurable time), `[9]` slowest
+/// run by mean release time (-1 when none attempted), `[10]` flagged runs,
+/// `[11]` mean success ppm over runs that attempted releases, `[12]` FNV-1a
+/// digest; then two words per run: `throughput | flags << 40` (releases per
+/// 1,000 seconds, capped at 2^40-1; flags bit 0 claimed but nothing attempted,
+/// bit 1 more attempted than claimed, bit 2 more successful than attempted,
+/// bit 3 more artifact releases than successful, bit 4 attempts in zero time)
+/// and `success | yield << 20 | mean_ms << 40` (ppm, ppm, capped at 2^20-1).
+pub(crate) fn w546_run_batch(ints: &[i64], count: usize) -> Vec<i64> {
+    let mut out = vec![0i64; W546_RUN_HEADER + 2 * count];
+    out[0] = count as i64;
+    let (mut peak, mut fastest, mut slowest) = ((-1i64, 0i64), (-1i64, 0i64), (-1i64, 0i64));
+    let (mut success_sum, mut success_runs) = (0i64, 0i64);
+    for at in 0..count {
+        let claimed = w546_count(ints[at]);
+        let attempted = w546_count(ints[count + at]);
+        let successful = w546_count(ints[2 * count + at]);
+        let artifacts = w546_count(ints[3 * count + at]);
+        let elapsed = w47_clamp(ints[4 * count + at]);
+        let memory = w47_clamp(ints[5 * count + at]);
+        for (slot, value) in [claimed, attempted, successful, artifacts, elapsed]
+            .into_iter()
+            .enumerate()
+        {
+            out[1 + slot] = w47_add(out[1 + slot], value);
+        }
+        w546_pick(&mut peak, at, memory, true);
+        let throughput = if elapsed > 0 {
+            (attempted * 1_000_000_000 / elapsed).min(W47_VALUE_CAP)
+        } else {
+            0
+        };
+        if attempted > 0 && elapsed > 0 {
+            w546_pick(&mut fastest, at, throughput, true);
+        }
+        let (success, mean_ms) = if attempted > 0 {
+            (
+                (successful * W546_PPM / attempted).min(W546_PPM),
+                (elapsed / (attempted * 1000)).min(W546_COUNT_CAP),
+            )
+        } else {
+            (0, 0)
+        };
+        if attempted > 0 {
+            w546_pick(&mut slowest, at, mean_ms, true);
+            success_sum += success;
+            success_runs += 1;
+        }
+        let artifact_yield = if successful > 0 {
+            (artifacts * W546_PPM / successful).min(W546_PPM)
+        } else {
+            0
+        };
+        let flags = i64::from(claimed > 0 && attempted == 0)
+            | i64::from(attempted > claimed) << 1
+            | i64::from(successful > attempted) << 2
+            | i64::from(artifacts > successful) << 3
+            | i64::from(attempted > 0 && elapsed == 0) << 4;
+        out[10] += i64::from(flags != 0);
+        out[W546_RUN_HEADER + 2 * at] = throughput | flags << 40;
+        out[W546_RUN_HEADER + 2 * at + 1] = success | artifact_yield << 20 | mean_ms << 40;
+    }
+    out[6] = peak.1;
+    out[7] = peak.0;
+    out[8] = fastest.0;
+    out[9] = slowest.0;
+    if success_runs > 0 {
+        out[11] = success_sum / success_runs;
+    }
+    out[12] = w526_digest(&out[W546_RUN_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w546_run_summary_batch(
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let ints = w47_ints(w15_input(ints, ints_len)?, 6, count)?;
+            Some(w546_run_batch(&ints, count))
+        })
+    }
+}
+
+// --- AdditionalWorkPlan::summarizePlanBatch ---------------------------------
+
+pub(crate) const W546_PLAN_HEADER: usize = 15;
+
+/// Work units per sample, image, archive, probe, PAR2 index candidate and main
+/// video, plus the media-info and audio-info message bonuses.
+const W546_PLAN_WEIGHTS: [i64; 6] = [2, 1, 8, 4, 2, 5];
+
+/// Ten columns per plan: samples, JPG message IDs, archive candidates, probe
+/// candidates, PAR2 index candidates, main videos, image candidates, book
+/// files, duplicate message IDs (all clamped to 0..2^20-1) and flags (bit 0
+/// media-info message, bit 1 audio-info message, bit 2 book flood, bit 3 the
+/// probe is the only file). `[0]` count, `[1]` plans with supported candidates
+/// (`hasSupportedCandidates()`), `[2]` without, `[3..=10]` plans per stage
+/// (archive, sample, thumbnail, media info, audio, probe, PAR2, book), `[11]`
+/// work units total, `[12]` first heaviest plan (-1 when none), `[13]` book
+/// floods, `[14]` FNV-1a digest; then per plan `stages | tier << 8 | units <<
+/// 10 | duplicate_ppm << 40` (tier 3 archives and main video, 2 either, 1 other
+/// supported, 0 unsupported; duplicate ppm of samples, JPG IDs and duplicates).
+pub(crate) fn w546_plan_batch(ints: &[i64], count: usize) -> Vec<i64> {
+    let mut out = vec![0i64; W546_PLAN_HEADER + count];
+    out[0] = count as i64;
+    let mut heaviest = (-1i64, 0i64);
+    for at in 0..count {
+        let column = |c: usize| w546_count(ints[c * count + at]);
+        let (samples, jpgs, archives, probes) = (column(0), column(1), column(2), column(3));
+        let (par2, videos, images, books, duplicates) =
+            (column(4), column(5), column(6), column(7), column(8));
+        let flags = ints[9 * count + at];
+        let (media, audio, flood) = (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0);
+        let supported = archives > 0 || samples > 0 || jpgs > 0 || media || audio || probes > 0;
+        let stages = i64::from(archives > 0)
+            | i64::from(samples > 0) << 1
+            | i64::from(jpgs > 0 || images > 0) << 2
+            | i64::from(media) << 3
+            | i64::from(audio) << 4
+            | i64::from(probes > 0) << 5
+            | i64::from(par2 > 0) << 6
+            | i64::from(books > 0 && !flood) << 7;
+        let tier = match (archives > 0, videos > 0) {
+            (true, true) => 3,
+            (true, false) | (false, true) => 2,
+            _ => i64::from(supported),
+        };
+        let [w_sample, w_image, w_archive, w_probe, w_par2, w_video] = W546_PLAN_WEIGHTS;
+        let units = samples * w_sample
+            + (jpgs + images) * w_image
+            + archives * w_archive
+            + probes * w_probe
+            + par2 * w_par2
+            + videos * w_video
+            + i64::from(media) * 3
+            + i64::from(audio) * 2
+            + if flood { 0 } else { books };
+        let listed = samples + jpgs + duplicates;
+        let duplicate_ppm = if listed > 0 {
+            duplicates * W546_PPM / listed
+        } else {
+            0
+        };
+        out[if supported { 1 } else { 2 }] += 1;
+        for stage in 0..8 {
+            out[3 + stage] += (stages >> stage) & 1;
+        }
+        out[11] = w47_add(out[11], units);
+        w546_pick(&mut heaviest, at, units, true);
+        out[13] += i64::from(flood);
+        out[W546_PLAN_HEADER + at] = stages | tier << 8 | units << 10 | duplicate_ppm << 40;
+    }
+    out[12] = heaviest.0;
+    out[14] = w526_digest(&out[W546_PLAN_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w546_plan_summary_batch(
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let ints = w47_ints(w15_input(ints, ints_len)?, 10, count)?;
+            Some(w546_plan_batch(&ints, count))
+        })
+    }
+}
+
+// --- DownloadedArchive::summarizeListingBatch -------------------------------
+
+pub(crate) const W546_LISTING_HEADER: usize = 17;
+
+/// Listing class of a file name: 0 video, 1 audio, 2 image, 3 NFO, 4 other
+/// text, 5 PAR2, 6 archive, 7 other. The extension is the text after the last
+/// dot, ASCII lower-cased; three-digit and `r` plus two-digit extensions are
+/// archive volumes.
+pub(crate) fn w546_listing_class(name: &[u8]) -> i64 {
+    let Some(dot) = name.iter().rposition(|&byte| byte == b'.') else {
+        return 7;
+    };
+    let ext = &name[dot + 1..];
+    if ext.is_empty() || ext.len() > 4 {
+        return 7;
+    }
+    let mut lower = [0u8; 4];
+    for (slot, byte) in lower.iter_mut().zip(ext) {
+        *slot = byte.to_ascii_lowercase();
+    }
+    match &lower[..ext.len()] {
+        b"mkv" | b"mp4" | b"avi" | b"m4v" | b"mov" | b"wmv" | b"ts" | b"m2ts" | b"mpg"
+        | b"mpeg" | b"vob" | b"webm" => 0,
+        b"mp3" | b"flac" | b"m4a" | b"aac" | b"ogg" | b"wav" | b"wma" | b"ape" => 1,
+        b"jpg" | b"jpeg" | b"png" | b"gif" | b"webp" | b"bmp" => 2,
+        b"nfo" => 3,
+        b"txt" | b"diz" | b"sfv" => 4,
+        b"par2" => 5,
+        b"rar" | b"zip" | b"7z" => 6,
+        [b'r', a, b] if a.is_ascii_digit() && b.is_ascii_digit() => 6,
+        [a, b, c] if a.is_ascii_digit() && b.is_ascii_digit() && c.is_ascii_digit() => 6,
+        _ => 7,
+    }
+}
+
+/// Path separators (`/` or `\\`) in `name`, eight bytes at a time with the
+/// exact per-byte zero test of `w466_split()`.
+#[inline]
+fn w546_separators(name: &[u8]) -> i64 {
+    const LOW7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    const SLASH: u64 = 0x2f2f_2f2f_2f2f_2f2f;
+    const BACKSLASH: u64 = 0x5c5c_5c5c_5c5c_5c5c;
+    let zeros = |word: u64| !(((word & LOW7).wrapping_add(LOW7)) | word) & HIGH;
+    let (words, tail) = name.as_chunks::<8>();
+    let mut found = 0u32;
+    for word in words {
+        let word = u64::from_le_bytes(*word);
+        found += (zeros(word ^ SLASH) | zeros(word ^ BACKSLASH)).count_ones();
+    }
+    found as i64
+        + tail
+            .iter()
+            .filter(|&&byte| byte == b'/' || byte == b'\\')
+            .count() as i64
+}
+
+/// `fileSummaryPhp()` plus name classes over one listing. Per file a name, a
+/// size (clamped to 0..2^40-1) and flags (bit 0 directory, bit 1 passworded;
+/// higher bits ignored). `[0]` count, `[1]` files, `[2]` directories, `[3]`
+/// file bytes (capped at 2^62), `[4]` 1 when a file is passworded, `[5..=12]`
+/// files per class, `[13]` first largest file (-1 when none), `[14]` first NFO
+/// file (-1 when none), `[15]` deepest path (separators `/` or `\`, capped at
+/// 255), `[16]` FNV-1a digest; then per entry `class | depth << 4 | flags << 12
+/// | size << 14` (class 8 for directories).
+pub(crate) fn w546_listing_batch(names: &[&[u8]], ints: &[i64]) -> Vec<i64> {
+    let count = names.len();
+    let mut out = vec![0i64; W546_LISTING_HEADER + count];
+    out[0] = count as i64;
+    out[14] = -1;
+    let mut largest = (-1i64, 0i64);
+    for (at, name) in names.iter().enumerate() {
+        let size = w47_clamp(ints[at]);
+        let flags = ints[count + at] & 3;
+        let depth = w546_separators(name).min(255);
+        out[15] = out[15].max(depth);
+        let class = if flags & 1 != 0 {
+            out[2] += 1;
+            8
+        } else {
+            let class = w546_listing_class(name);
+            out[1] += 1;
+            out[3] = w47_add(out[3], size);
+            out[4] |= flags >> 1;
+            out[5 + class as usize] += 1;
+            w546_pick(&mut largest, at, size, true);
+            if class == 3 && out[14] < 0 {
+                out[14] = at as i64;
+            }
+            class
+        };
+        out[W546_LISTING_HEADER + at] = class | depth << 4 | flags << 12 | size << 14;
+    }
+    out[13] = largest.0;
+    out[16] = w526_digest(&out[W546_LISTING_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w546_listing_summary_batch(
+    names: *const u8,
+    names_len: usize,
+    name_lens: *const u8,
+    name_lens_len: usize,
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let names = w47_items(
+                w15_input(names, names_len)?,
+                w15_input(name_lens, name_lens_len)?,
+                count,
+            )?;
+            let ints = w47_ints(w15_input(ints, ints_len)?, 2, count)?;
+            Some(w546_listing_batch(&names, &ints))
+        })
+    }
+}
+
+// --- MediaSourceHints::normalizeHintBatch -----------------------------------
+
+pub(crate) const W546_HINT_HEADER: usize = 15;
+
+/// `SourcePosition` backing value code: 0 complete, 1 head, 2 mid, 3 other.
+#[inline]
+fn w546_position(value: &[u8]) -> i64 {
+    match value {
+        b"complete" => 0,
+        b"head" => 1,
+        b"mid" => 2,
+        _ => 3,
+    }
+}
+
+/// `headPhp()` normalization and `availableFractionPhp()` per hint. Per hint a
+/// position value, a real size (0 or less is unknown; capped at 2^40-1) and
+/// available bytes (clamped to 0..2^40-1). Heads whose real size is covered
+/// become complete; other values are kept as heads. `[0]` count, `[1..=4]`
+/// input values per code, `[5..=7]` normalized complete / head / mid, `[8]`
+/// promoted heads, `[9]` partial hints without a real size, `[10]` available
+/// total and `[11]` missing total (capped at 2^62), `[12]` mean fraction ppm of
+/// hints with a fraction, `[13]` first lowest fraction (-1 when none), `[14]`
+/// FNV-1a digest; then per hint `normalized | code << 2 | (ppm + 1) << 4 |
+/// flags << 24 | missing_kib << 28` (ppm + 1 is 0 when the fraction is null;
+/// flags bit 0 promoted, bit 1 unknown real size, bit 2 nothing available, bit
+/// 3 more available than real; missing KiB rounded up).
+pub(crate) fn w546_hint_batch(positions: &[&[u8]], ints: &[i64]) -> Vec<i64> {
+    let count = positions.len();
+    let mut out = vec![0i64; W546_HINT_HEADER + count];
+    out[0] = count as i64;
+    let mut lowest = (-1i64, 0i64);
+    let (mut ppm_sum, mut ppm_count) = (0i64, 0i64);
+    for (at, value) in positions.iter().enumerate() {
+        let code = w546_position(value);
+        let real = ints[at].min(W47_VALUE_CAP);
+        let available = w47_clamp(ints[count + at]);
+        let known = real > 0;
+        let promoted = code == 1 && known && available >= real;
+        let normalized = match code {
+            0 => 0,
+            2 => 2,
+            _ if promoted => 0,
+            _ => 1,
+        };
+        // Mid hints drop the real size (`mid()` stores null).
+        let sized = known && normalized != 2;
+        let ppm = if normalized == 0 {
+            Some(W546_PPM)
+        } else if sized && available > 0 {
+            Some((available * W546_PPM / real).min(W546_PPM))
+        } else {
+            None
+        };
+        let missing = if normalized != 0 && sized {
+            (real - available).max(0)
+        } else {
+            0
+        };
+        let flags = i64::from(promoted)
+            | i64::from(normalized != 0 && !sized) << 1
+            | i64::from(available == 0) << 2
+            | i64::from(known && available > real) << 3;
+        out[1 + code as usize] += 1;
+        out[5 + normalized as usize] += 1;
+        out[8] += i64::from(promoted);
+        out[9] += i64::from(normalized != 0 && !sized);
+        out[10] = w47_add(out[10], available);
+        out[11] = w47_add(out[11], missing);
+        if let Some(ppm) = ppm {
+            ppm_sum += ppm;
+            ppm_count += 1;
+            w546_pick(&mut lowest, at, ppm, false);
+        }
+        out[W546_HINT_HEADER + at] = normalized
+            | code << 2
+            | ppm.map_or(0, |ppm| ppm + 1) << 4
+            | flags << 24
+            | ((missing + 1023) / 1024) << 28;
+    }
+    if ppm_count > 0 {
+        out[12] = ppm_sum / ppm_count;
+    }
+    out[13] = lowest.0;
+    out[14] = w526_digest(&out[W546_HINT_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w546_hint_normalize_batch(
+    positions: *const u8,
+    positions_len: usize,
+    position_lens: *const u8,
+    position_lens_len: usize,
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let positions = w47_items(
+                w15_input(positions, positions_len)?,
+                w15_input(position_lens, position_lens_len)?,
+                count,
+            )?;
+            let ints = w47_ints(w15_input(ints, ints_len)?, 2, count)?;
+            Some(w546_hint_batch(&positions, &ints))
+        })
+    }
+}
+
+// --- MediaSourcePlan::articleCoverageBatch ----------------------------------
+
+pub(crate) const W546_COVERAGE_HEADER: usize = 14;
+
+/// Article coverage of mapped files. Three columns per file: NZB source index,
+/// real size (clamped to 0..2^40-1) and articles posted (clamped to
+/// 0..2^20-1); `part` is decoded bytes per article (0 or less uses 716,800;
+/// capped at 2^30). The first file of a source index counts, later ones are
+/// flagged duplicates and left out of the totals. `[0]` count, `[1]` part size,
+/// `[2]` distinct source indexes, `[3]` duplicates, `[4]` real bytes, `[5]`
+/// expected, `[6]` posted and `[7]` missing articles (capped at 2^62), `[8]`
+/// complete, `[9]` short and `[10]` unknown-size files, `[11]` first worst
+/// coverage (-1 when none), `[12]` mean coverage ppm of sized files, `[13]`
+/// FNV-1a digest; then two words per file: `expected | missing << 24 | flags <<
+/// 48` (both capped at 2^24-1; flags bit 0 duplicate, bit 1 negative source
+/// index, bit 2 more posted than expected, bit 3 unknown size, bit 4 complete)
+/// and `ppm | tail << 20` (bytes in the last article).
+pub(crate) fn w546_coverage_batch(ints: &[i64], count: usize, part: i64) -> Vec<i64> {
+    let part = if part <= 0 {
+        W546_DEFAULT_PART
+    } else {
+        part.min(W546_PART_CAP)
+    };
+    let mut out = vec![0i64; W546_COVERAGE_HEADER + 2 * count];
+    out[0] = count as i64;
+    out[1] = part;
+    let mut seen: std::collections::HashSet<i64, std::hash::BuildHasherDefault<W536Hasher>> =
+        std::collections::HashSet::with_capacity_and_hasher(count, Default::default());
+    let mut worst = (-1i64, 0i64);
+    let (mut ppm_sum, mut ppm_count) = (0i64, 0i64);
+    for at in 0..count {
+        let source = ints[at];
+        let real = w47_clamp(ints[count + at]);
+        let posted = w546_count(ints[2 * count + at]);
+        let duplicate = !seen.insert(source);
+        let expected = if real > 0 {
+            (real + part - 1) / part
+        } else {
+            0
+        };
+        let missing = (expected - posted).max(0);
+        let ppm = if expected > 0 {
+            (posted.min(expected) * W546_PPM / expected).min(W546_PPM)
+        } else if posted > 0 {
+            W546_PPM
+        } else {
+            0
+        };
+        let tail = if expected > 0 {
+            real - (expected - 1) * part
+        } else {
+            0
+        };
+        let complete = expected > 0 && missing == 0;
+        let flags = i64::from(duplicate)
+            | i64::from(source < 0) << 1
+            | i64::from(posted > expected) << 2
+            | i64::from(real == 0) << 3
+            | i64::from(complete) << 4;
+        if !duplicate {
+            out[2] += 1;
+            out[4] = w47_add(out[4], real);
+            out[5] = w47_add(out[5], expected);
+            out[6] = w47_add(out[6], posted);
+            out[7] = w47_add(out[7], missing);
+            out[8] += i64::from(complete);
+            out[9] += i64::from(expected > 0 && missing > 0);
+            out[10] += i64::from(real == 0);
+            if expected > 0 {
+                ppm_sum += ppm;
+                ppm_count += 1;
+                w546_pick(&mut worst, at, ppm, false);
+            }
+        } else {
+            out[3] += 1;
+        }
+        out[W546_COVERAGE_HEADER + 2 * at] =
+            expected.min(W546_ARTICLE_CAP) | missing.min(W546_ARTICLE_CAP) << 24 | flags << 48;
+        out[W546_COVERAGE_HEADER + 2 * at + 1] = ppm | tail << 20;
+    }
+    out[11] = worst.0;
+    if ppm_count > 0 {
+        out[12] = ppm_sum / ppm_count;
+    }
+    out[13] = w526_digest(&out[W546_COVERAGE_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_cap` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w546_article_coverage_batch(
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    part_size: i64,
+    out: *mut i64,
+    out_cap: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w546_run(out, out_cap, || {
+            let ints = w47_ints(w15_input(ints, ints_len)?, 3, count)?;
+            Some(w546_coverage_batch(&ints, count, part_size))
+        })
+    }
+}
+
+#[cfg(test)]
+mod w546_additional_batch_tests {
+    use super::*;
+    use std::ptr::{null, null_mut};
+
+    fn packed(values: &[i64]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn w546_run_batch_reports_throughput_rows() {
+        // claimed, attempted, successful, artifacts, elapsed micros, memory for three runs.
+        let ints = [
+            10, 0, 4, //
+            8, 0, 6, //
+            6, 0, 7, //
+            3, 0, 9, //
+            2_000_000, 0, 0, //
+            500, 900, 900,
+        ];
+        let out = w546_run_batch(&ints, 3);
+        assert_eq!(
+            &out[..12],
+            &[3, 14, 14, 13, 12, 2_000_000, 900, 1, 0, 0, 1, 875_000]
+        );
+        let base = W546_RUN_HEADER;
+        assert_eq!(out[base], 4_000);
+        assert_eq!(out[base + 1], 750_000 | 500_000 << 20 | 250 << 40);
+        assert_eq!(out[base + 2], 0);
+        assert_eq!(out[base + 4], 1 << 41 | 1 << 42 | 1 << 43 | 1 << 44);
+        assert_eq!(out[base + 5], 1_000_000 | 1_000_000 << 20);
+        assert_eq!(out[12], w526_digest(&out[base..]));
+        let empty = w546_run_batch(&[], 0);
+        assert_eq!(&empty[..12], &[0, 0, 0, 0, 0, 0, 0, -1, -1, -1, 0, 0]);
+    }
+
+    #[test]
+    fn w546_plan_batch_mirrors_supported_candidates() {
+        // samples, jpgs, archives, probes, par2, videos, images, books, duplicates, flags.
+        let ints = [
+            2, 0, 0, //
+            1, 0, 0, //
+            3, 0, 0, //
+            0, 0, 1, //
+            1, 0, 0, //
+            1, 0, 0, //
+            0, 0, 0, //
+            0, 5, 0, //
+            2, 0, 0, //
+            1, 4, 8,
+        ];
+        let out = w546_plan_batch(&ints, 3);
+        assert_eq!(&out[..14], &[3, 2, 1, 1, 1, 1, 1, 0, 1, 1, 0, 43, 0, 1]);
+        let base = W546_PLAN_HEADER;
+        let units = 2 * 2 + 1 + 3 * 8 + 2 + 5 + 3;
+        assert_eq!(
+            out[base],
+            0b0100_1111 | 3 << 8 | units << 10 | 400_000 << 40
+        );
+        assert_eq!(out[base + 1], 0);
+        assert_eq!(out[base + 2], 0b0010_0000 | 1 << 8 | 4 << 10);
+    }
+
+    #[test]
+    fn w546_listing_class_and_batch() {
+        for (name, class) in [
+            (&b"Movie.MKV"[..], 0),
+            (b"a.flac", 1),
+            (b"cover.JPeG", 2),
+            (b"info.nfo", 3),
+            (b"x.sfv", 4),
+            (b"x.vol01+02.PAR2", 5),
+            (b"x.r07", 6),
+            (b"x.001", 6),
+            (b"x.7z", 6),
+            (b"x.rx7", 7),
+            (b"x.ts\0", 7),
+            (b"noext", 7),
+            (b"x.", 7),
+            (b"dir.v1/file", 7),
+        ] {
+            assert_eq!(
+                w546_listing_class(name),
+                class,
+                "{}",
+                String::from_utf8_lossy(name)
+            );
+        }
+        for name in [
+            &b""[..],
+            b"/",
+            b"a/b\\c/d",
+            b"////////\\\\\\\\x/",
+            b"\xaf\xdc/\x2f\x5c\x00",
+            b"\xaf\xaf\xdc\xdc/a\\b\xafxx/\\\x2e\x2f\x5c\xaf",
+        ] {
+            let slow = name
+                .iter()
+                .filter(|&&byte| byte == b'/' || byte == b'\\')
+                .count() as i64;
+            assert_eq!(w546_separators(name), slow);
+        }
+        let names: [&[u8]; 4] = [b"d/sub", b"d/sub/a.nfo", b"d\\b.mkv", b"c.rar"];
+        let out = w546_listing_batch(&names, &[99, 10, 400, 400, 1, 0, 0, 2]);
+        assert_eq!(
+            &out[..16],
+            &[4, 3, 1, 810, 1, 1, 0, 0, 1, 0, 0, 1, 0, 2, 1, 2]
+        );
+        let base = W546_LISTING_HEADER;
+        assert_eq!(out[base], 8 | 1 << 4 | 1 << 12 | 99 << 14);
+        assert_eq!(out[base + 3], 6 | 2 << 12 | 400 << 14);
+    }
+
+    #[test]
+    fn w546_hint_batch_normalizes_heads() {
+        let positions: [&[u8]; 5] = [b"head", b"head", b"mid", b"complete", b"HEAD"];
+        let out = w546_hint_batch(&positions, &[100, 4096, 100, 0, -5, 150, 0, 50, 7, 3]);
+        assert_eq!(
+            &out[..14],
+            &[5, 1, 2, 1, 1, 2, 2, 1, 1, 2, 210, 4096, 1_000_000, 0]
+        );
+        let base = W546_HINT_HEADER;
+        assert_eq!(out[base], 1 << 2 | 1_000_001 << 4 | 1 << 24 | 1 << 27);
+        assert_eq!(out[base + 1], 1 | 1 << 2 | 1 << 26 | 4 << 28);
+        assert_eq!(out[base + 2], 2 | 2 << 2 | 1 << 25);
+        assert_eq!(out[base + 4], 1 | 3 << 2 | 1 << 25);
+    }
+
+    #[test]
+    fn w546_coverage_batch_flags_duplicates_and_tails() {
+        // source indexes, real sizes, posted articles.
+        let ints = [3, 3, -1, 0, 2_500, 1_000, 0, 7, 2, 2, 4, 9];
+        let out = w546_coverage_batch(&ints, 4, 1_000);
+        assert_eq!(
+            &out[..13],
+            &[4, 1_000, 3, 1, 2_507, 4, 15, 1, 1, 1, 1, 0, 833_333]
+        );
+        let base = W546_COVERAGE_HEADER;
+        assert_eq!(out[base], 3 | 1 << 24);
+        assert_eq!(out[base + 1], 666_666 | 500 << 20);
+        assert_eq!(out[base + 2], 1 | 1 << 48 | 1 << 50 | 1 << 52);
+        assert_eq!(out[base + 4], 1 << 49 | 1 << 50 | 1 << 51);
+        assert_eq!(out[base + 5], 1_000_000);
+        assert_eq!(out[base + 6], 1 | 1 << 50 | 1 << 52);
+        assert_eq!(out[base + 7], 1_000_000 | 7 << 20);
+        assert_eq!(w546_coverage_batch(&[], 0, 0)[1], W546_DEFAULT_PART);
+        assert_eq!(w546_coverage_batch(&[], 0, i64::MAX)[1], W546_PART_CAP);
+    }
+
+    #[test]
+    fn w546_exports_validate_pointers_and_capacity() {
+        let mut out = [0i64; 64];
+        let ints = packed(&[1, 1, 1, 1, 1000, 5]);
+        let status = unsafe {
+            nntmux_w546_run_summary_batch(ints.as_ptr(), ints.len(), 1, out.as_mut_ptr(), 64)
+        };
+        assert_eq!((status, out[0]), (1, 1));
+        // Null output, short output and short input.
+        let status =
+            unsafe { nntmux_w546_run_summary_batch(ints.as_ptr(), ints.len(), 1, null_mut(), 64) };
+        assert_eq!(status, -2);
+        let status = unsafe {
+            nntmux_w546_run_summary_batch(ints.as_ptr(), ints.len(), 1, out.as_mut_ptr(), 4)
+        };
+        assert_eq!(status, -2);
+        let status = unsafe {
+            nntmux_w546_run_summary_batch(ints.as_ptr(), ints.len() - 8, 1, out.as_mut_ptr(), 64)
+        };
+        assert_eq!(status, -1);
+        // Null input with a length is rejected; null empty input is an empty batch.
+        let status = unsafe { nntmux_w546_plan_summary_batch(null(), 80, 1, out.as_mut_ptr(), 64) };
+        assert_eq!(status, -1);
+        out.fill(7);
+        for status in unsafe {
+            [
+                nntmux_w546_run_summary_batch(null(), 0, 0, out.as_mut_ptr(), 64),
+                nntmux_w546_plan_summary_batch(null(), 0, 0, out.as_mut_ptr(), 64),
+                nntmux_w546_listing_summary_batch(
+                    null(),
+                    0,
+                    null(),
+                    0,
+                    null(),
+                    0,
+                    0,
+                    out.as_mut_ptr(),
+                    64,
+                ),
+                nntmux_w546_hint_normalize_batch(
+                    null(),
+                    0,
+                    null(),
+                    0,
+                    null(),
+                    0,
+                    0,
+                    out.as_mut_ptr(),
+                    64,
+                ),
+                nntmux_w546_article_coverage_batch(null(), 0, 0, 0, out.as_mut_ptr(), 64),
+            ]
+        } {
+            assert_eq!((status, out[0]), (1, 0));
+        }
+        // Names with lengths, and a mismatched name count.
+        let names = b"a.nfob.mkv";
+        let lens = packed(&[]);
+        let lengths: Vec<u8> = [5u32, 5].iter().flat_map(|len| len.to_le_bytes()).collect();
+        let ints = packed(&[1, 2, 0, 0]);
+        let status = unsafe {
+            nntmux_w546_listing_summary_batch(
+                names.as_ptr(),
+                names.len(),
+                lengths.as_ptr(),
+                lengths.len(),
+                ints.as_ptr(),
+                ints.len(),
+                2,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!((status, out[1], out[14]), (1, 2, 0));
+        let joined = b"head\0mid\0complete";
+        let status = unsafe {
+            nntmux_w546_hint_normalize_batch(
+                joined.as_ptr(),
+                joined.len(),
+                lens.as_ptr(),
+                0,
+                ints.as_ptr(),
+                ints.len(),
+                2,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!(status, -1);
+        let ints = packed(&[0; 6]);
+        let status = unsafe {
+            nntmux_w546_article_coverage_batch(
+                ints.as_ptr(),
+                ints.len(),
+                2,
+                -9,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!((status, out[1]), (1, W546_DEFAULT_PART));
+    }
+}
