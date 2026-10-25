@@ -9,6 +9,7 @@ use App\Services\TvProcessing\Providers\TraktProvider;
 use App\Support\MetadataSources;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 /**
@@ -43,6 +44,153 @@ class TraktPipe extends AbstractApiProviderPipe
     private static FFI|false|null $ffi = null;
 
     protected int $priority = 50;
+
+    /** Wave 49.3 batch default (benchmark-gated; see tests/Unit/RustTvPipesTraktTvMazeTvdbAbstractBaseProviderW49ParityTest.php). */
+    private const W49_RUST_FFI_DEFAULT = true;
+
+    public const string W49_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w49_tv_trakt_ids_batch(const char *blob, size_t blob_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    private static ?bool $useW49RustFfi = null;
+
+    private static FFI|false|null $w49Ffi = null;
+
+    private static ?CData $w49Out = null;
+
+    private static int $w49OutCap = 0;
+
+    public static function usesW49RustFfi(): bool
+    {
+        return self::$useW49RustFfi ?? self::W49_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 49 Rust path forced on or off, then restores the previous setting. */
+    public static function withW49RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$useW49RustFfi;
+        self::$useW49RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$useW49RustFfi = $previous;
+        }
+    }
+
+    /**
+     * Five values per Trakt search result: the trakt id (negative ids read as 0), the imdb number
+     * from a trailing `tt` plus 6+ digits (-1 beyond 18 digits, 0 without one), the year (from a
+     * `YYYY-MM-DD` first_aired prefix, else `year` clamped to [0, 9999]), flags (1 trakt, 2 tvdb,
+     * 4 tmdb, 8 imdb, 16 tvrage ids present, 32 title had a ` (19xx)`/` (20xx)` suffix, 64 empty
+     * normalized title) and the FNV-1a hash of the normalized title without that suffix. Then the
+     * resolvable (trakt id) count, the fully linked (trakt, tvdb, tmdb and imdb) count and the
+     * first resolvable index (-1 when none). Missing keys read as '' or 0.
+     *
+     * @param  list<array<string, mixed>>  $results  title, first_aired, imdb, year, trakt, tvdb, tmdb, tvrage
+     * @return list<int>
+     */
+    public static function w49IdsBatch(array $results): array
+    {
+        return self::usesW49RustFfi() ? self::w49IdsBatchNative($results) : self::w49IdsBatchPhp($results);
+    }
+
+    /**
+     * @param  list<array<string, mixed>>  $results
+     * @return list<int>
+     */
+    public static function w49IdsBatchNative(array $results): array
+    {
+        $strings = self::w48Columns($results, ['title' => '', 'first_aired' => '', 'imdb' => '']);
+        $ints = self::w48Columns($results, ['year' => 0, 'trakt' => 0, 'tvdb' => 0, 'tmdb' => 0, 'tvrage' => 0]);
+        $count = \count($results);
+
+        return self::w49Invoke(
+            implode("\0", array_merge(...array_values($strings))),
+            pack('q*', ...array_merge(...array_values($ints))),
+            $count,
+            $count * 5 + 3,
+        )
+            ?? self::w49IdsBatchPhp($results);
+    }
+
+    /**
+     * @param  list<array<string, mixed>>  $results
+     * @return list<int>
+     */
+    public static function w49IdsBatchPhp(array $results): array
+    {
+        $out = [];
+        $resolvable = 0;
+        $linked = 0;
+        $first = -1;
+        $index = 0;
+        foreach ($results as $item) {
+            $title = (string) ($item['title'] ?? '');
+            $stripped = (string) preg_replace('/ \((19|20)\d{2}\)$/D', '', $title);
+            $normalized = self::w48Normalize($stripped);
+            $trakt = max(0, (int) ($item['trakt'] ?? 0));
+            $imdb = preg_match('/tt(\d{6,})$/iD', (string) ($item['imdb'] ?? ''), $m) === 1
+                ? (\strlen($m[1]) <= 18 ? (int) $m[1] : -1)
+                : 0;
+            $year = preg_match('/^(\d{4})-\d{2}-\d{2}/', (string) ($item['first_aired'] ?? ''), $m) === 1
+                ? (int) $m[1]
+                : max(0, min(9999, (int) ($item['year'] ?? 0)));
+            $flags = ($trakt > 0 ? 1 : 0)
+                | ((int) ($item['tvdb'] ?? 0) > 0 ? 2 : 0)
+                | ((int) ($item['tmdb'] ?? 0) > 0 ? 4 : 0)
+                | ($imdb > 0 ? 8 : 0)
+                | ((int) ($item['tvrage'] ?? 0) > 0 ? 16 : 0)
+                | ($stripped !== $title ? 32 : 0)
+                | ($normalized === '' ? 64 : 0);
+            if ($trakt > 0) {
+                $resolvable++;
+                if ($first < 0) {
+                    $first = $index;
+                }
+            }
+            if (($flags & 15) === 15) {
+                $linked++;
+            }
+            array_push($out, $trakt, $imdb, $year, $flags, self::w48Fnv($normalized));
+            $index++;
+        }
+        array_push($out, $resolvable, $linked, $first);
+
+        return $out;
+    }
+
+    /**
+     * Calls the Wave 49 export with NUL-joined row-major strings and packed `i64` integers. Null
+     * when the library is missing or the call declines (for example a string holding a NUL byte),
+     * so the caller falls back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w49Invoke(string $blob, string $ints, int $count, int $words): ?array
+    {
+        self::$w49Ffi ??= RustPipelineLibrary::resolveDomain('categorize_w49', self::W49_FFI_CDEF) ?? false;
+        $ffi = self::$w49Ffi;
+        if ($ffi === false) {
+            return null;
+        }
+        try {
+            if (self::$w49Out === null || self::$w49OutCap < $words) {
+                self::$w49OutCap = max(1024, $words * 2);
+                self::$w49Out = $ffi->new('int64_t['.self::$w49OutCap.']');
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w49_tv_trakt_ids_batch($blob, \strlen($blob), $ints, \strlen($ints), $count, self::$w49Out, self::$w49OutCap);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string(self::$w49Out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
 
     public static function setUseRustFfi(?bool $use = true): void
     {
