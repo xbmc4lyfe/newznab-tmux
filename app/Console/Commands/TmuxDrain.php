@@ -11,6 +11,7 @@ use App\Services\Runners\BaseRunner;
 use App\Services\Tmux\TmuxCommand;
 use App\Services\Tmux\TmuxPaneManager;
 use App\Services\Tmux\TmuxSessionManager;
+use App\Support\RustPipelineLibrary;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Process;
 use RuntimeException;
@@ -18,6 +19,85 @@ use Throwable;
 
 class TmuxDrain extends Command
 {
+    public const string W386_FFI_CDEF = 'ssize_t nntmux_w386_tmux_drain_stop_runners(uint8_t operation, uint8_t flags, const char *input, size_t input_len, char *out_buf, size_t out_cap);';
+
+    // Paired caller benchmarks must qualify before enabling this separate candidate.
+    private static ?bool $useRustW386 = null;
+
+    public static function setUseRustW386(?bool $enabled): void
+    {
+        self::$useRustW386 = $enabled;
+    }
+
+    public static function usesRustW386(): bool
+    {
+        return self::$useRustW386 ?? false;
+    }
+
+    private static function w386Transform(int $flags, string $input): ?string
+    {
+        $length = strlen($input);
+        if ($length > 16_777_216) {
+            return null;
+        }
+        $ffi = RustPipelineLibrary::resolveDomain('additional_w386', self::W386_FFI_CDEF);
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            $capacity = 0;
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, 256, $capacity);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w386_tmux_drain_stop_runners(1, $flags, $input, $length, $scratch, min($capacity, 16_777_216));
+            if (is_int($written) && $written < -1 && -$written <= 16_777_216) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($scratch === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w386_tmux_drain_stop_runners(1, $flags, $input, $length, $scratch, min($capacity, 16_777_216));
+            }
+            if (! is_int($written) || $written < 0 || $written > min($capacity, 16_777_216)) {
+                return null;
+            }
+
+            return $written === 0 ? '' : \FFI::string($scratch, $written);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Optional operation tokens must contain 1–128 ASCII letters, digits, _ or -.
+     *
+     * @return array{present: bool, valid: bool}
+     */
+    public static function summarizeDrainToken(string $token): array
+    {
+        return (self::usesRustW386() ? self::summarizeDrainTokenNative($token) : null)
+            ?? self::summarizeDrainTokenPhp($token);
+    }
+
+    /** @return array{present: bool, valid: bool} */
+    public static function summarizeDrainTokenPhp(string $token): array
+    {
+        return ['present' => $token !== '', 'valid' => preg_match('/\A[A-Za-z0-9_-]{1,128}\z/', $token) === 1];
+    }
+
+    /** @return array{present: bool, valid: bool}|null */
+    public static function summarizeDrainTokenNative(string $token): ?array
+    {
+        $output = self::w386Transform(0, pack('V', strlen($token)).$token);
+        if ($output === null || strlen($output) !== 2) {
+            return null;
+        }
+
+        return ['present' => $output[0] === "\1", 'valid' => $output[1] === "\1"];
+    }
+
     private static ?bool $useRustFfi = null;
 
     public static function setUseRustFfi(?bool $enabled): void

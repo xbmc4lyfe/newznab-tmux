@@ -26562,3 +26562,301 @@ mod w376_tests {
         }
     }
 }
+
+// Wave 38.6: pure plans only; strings are byte-preserving u32-LE frames,
+// integers are native-endian i64, and flags are restricted to op 2's wait bit.
+const W386_MAX_INPUT: usize = 16_777_216;
+
+fn w386_compute(operation: u8, flags: u8, input: &[u8]) -> Option<Vec<u8>> {
+    if !(1..=5).contains(&operation) || flags > 1 || (operation != 2 && flags != 0) {
+        return None;
+    }
+    let mut reader = W356Reader {
+        bytes: input,
+        offset: 0,
+    };
+    let mut output = Vec::new();
+    match operation {
+        1 => {
+            let token = reader.string()?;
+            let valid = (1..=128).contains(&token.len())
+                && token
+                    .iter()
+                    .all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-');
+            output.extend_from_slice(&[u8::from(!token.is_empty()), u8::from(valid)]);
+        }
+        2 | 4 => {
+            let count = reader.count()?;
+            // Each string needs at least its four-byte length; reject huge counts
+            // before allocation or iteration. The input itself is already bounded.
+            if count > input.len().checked_sub(reader.offset)? / 4 {
+                return None;
+            }
+            output.extend_from_slice(&(count as u32).to_le_bytes());
+            for _ in 0..count {
+                let value = reader.string()?;
+                if operation == 2 {
+                    output.push(u8::from(
+                        flags == 0 || value == b"monitor" || value == b"irc_scraper",
+                    ));
+                } else {
+                    w356_string(&mut output, &value[..value.len().min(1)]);
+                }
+            }
+        }
+        3 => {
+            let limit = reader.integer()?;
+            let queued = reader.integer()?.max(0);
+            let chunk = if limit <= 0 {
+                1000
+            } else if queued >= limit {
+                0
+            } else {
+                (limit - queued).min(1000)
+            };
+            output.extend_from_slice(&chunk.to_ne_bytes());
+        }
+        5 => {
+            let count = reader.count()?;
+            if count > input.len().checked_sub(reader.offset)? / 8 {
+                return None;
+            }
+            let mut seen = std::collections::HashSet::new();
+            output.extend_from_slice(&0_u32.to_le_bytes());
+            for _ in 0..count {
+                let id = reader.integer()?;
+                if seen.insert(id) {
+                    output.extend_from_slice(&id.to_ne_bytes());
+                }
+            }
+            output[..4].copy_from_slice(&(seen.len() as u32).to_le_bytes());
+        }
+        _ => return None,
+    }
+    (reader.offset == input.len() && output.len() <= W386_MAX_INPUT).then_some(output)
+}
+
+/// Returns bytes written, -required for a short buffer, or -1 for invalid input.
+/// All valid outputs have at least two bytes, keeping -1 unambiguous. No negative
+/// return writes output and no NUL terminator is appended.
+///
+/// # Safety
+/// Both pointers must be nonnull and designate live readable/writable allocations
+/// of the declared sizes. Ranges must not overlap and sizes must be <= MAX_INPUT.
+/// The checks cannot establish allocation ownership or liveness. Alignment is one.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w386_tmux_drain_stop_runners(
+    operation: u8,
+    flags: u8,
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !(1..=5).contains(&operation)
+            || flags > 1
+            || (operation != 2 && flags != 0)
+            || input.is_null()
+            || out_buf.is_null()
+            || input_len > W386_MAX_INPUT
+            || out_cap > W386_MAX_INPUT
+        {
+            return -1;
+        }
+        let Some(input_end) = (input as usize).checked_add(input_len) else {
+            return -1;
+        };
+        let Some(output_end) = (out_buf as usize).checked_add(out_cap) else {
+            return -1;
+        };
+        if input_len != 0
+            && out_cap != 0
+            && (input as usize) < output_end
+            && (out_buf as usize) < input_end
+        {
+            return -1;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(input, input_len) };
+        let Some(result) = w386_compute(operation, flags, bytes) else {
+            return -1;
+        };
+        if out_cap < result.len() {
+            return -(result.len() as isize);
+        }
+        unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), out_buf, result.len()) };
+        result.len() as isize
+    }))
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod w386_tests {
+    use super::*;
+
+    fn strings(values: &[&[u8]]) -> Vec<u8> {
+        let mut frame = (values.len() as u32).to_le_bytes().to_vec();
+        for value in values {
+            w356_string(&mut frame, value);
+        }
+        frame
+    }
+
+    fn fixtures() -> Vec<(u8, u8, Vec<u8>, Vec<u8>)> {
+        let mut token = Vec::new();
+        w356_string(&mut token, b"AZ09_-");
+        let mut groups = 4_u32.to_le_bytes().to_vec();
+        let mut unique = 3_u32.to_le_bytes().to_vec();
+        for id in [i64::MIN, 0, i64::MIN, i64::MAX] {
+            groups.extend_from_slice(&id.to_ne_bytes());
+        }
+        for id in [i64::MIN, 0, i64::MAX] {
+            unique.extend_from_slice(&id.to_ne_bytes());
+        }
+        vec![
+            (1, 0, token, vec![1, 1]),
+            (
+                2,
+                1,
+                strings(&[b"monitor", b"irc_scraper", b"releases", b"MONITOR"]),
+                vec![4, 0, 0, 0, 1, 1, 0, 0],
+            ),
+            (
+                3,
+                0,
+                [10_i64.to_ne_bytes(), 7_i64.to_ne_bytes()].concat(),
+                3_i64.to_ne_bytes().to_vec(),
+            ),
+            (
+                4,
+                0,
+                strings(&[b"", b"abc", b"\0abc", b"\xffx", "日本語".as_bytes()]),
+                strings(&[b"", b"a", b"\0", b"\xff", b"\xe6"]),
+            ),
+            (5, 0, groups, unique),
+        ]
+    }
+
+    #[test]
+    fn w386_literal_contracts() {
+        for (op, flags, input, output) in fixtures() {
+            assert_eq!(w386_compute(op, flags, &input), Some(output));
+        }
+        for token in [
+            b"".as_slice(),
+            b"a b",
+            b"a\n",
+            b"a\0",
+            b"\xff",
+            &[b'a'; 129],
+        ] {
+            let mut input = Vec::new();
+            w356_string(&mut input, token);
+            assert_eq!(
+                w386_compute(1, 0, &input),
+                Some(vec![u8::from(!token.is_empty()), 0])
+            );
+        }
+        let mut token = Vec::new();
+        w356_string(&mut token, &[b'a'; 128]);
+        assert_eq!(w386_compute(1, 0, &token), Some(vec![1, 1]));
+        for (limit, queued, expected) in [
+            (0_i64, i64::MAX, 1000_i64),
+            (-1, -1, 1000),
+            (10, 11, 0),
+            (i64::MAX, i64::MIN, 1000),
+            (i64::MAX, i64::MAX, 0),
+            (10, 0, 10),
+        ] {
+            let input = [limit.to_ne_bytes(), queued.to_ne_bytes()].concat();
+            assert_eq!(
+                w386_compute(3, 0, &input),
+                Some(expected.to_ne_bytes().to_vec())
+            );
+        }
+        for op in [2, 4, 5] {
+            assert_eq!(
+                w386_compute(op, 0, &0_u32.to_le_bytes()),
+                Some(0_u32.to_le_bytes().to_vec())
+            );
+        }
+    }
+
+    #[test]
+    fn w386_ffi_validation_and_retry_never_write_on_negative() {
+        for (op, flags, input, expected) in fixtures() {
+            let mut out = [90_u8; 256];
+            let call = |p, len, o, cap, flag| unsafe {
+                nntmux_w386_tmux_drain_stop_runners(op, flag, p, len, o, cap)
+            };
+            let invalid = [
+                (std::ptr::null(), input.len(), out.as_mut_ptr(), 256),
+                (input.as_ptr(), input.len(), std::ptr::null_mut(), 256),
+                (input.as_ptr(), W386_MAX_INPUT + 1, out.as_mut_ptr(), 256),
+                (
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    W386_MAX_INPUT + 1,
+                ),
+                (usize::MAX as *const u8, input.len(), out.as_mut_ptr(), 256),
+                (input.as_ptr(), input.len(), usize::MAX as *mut u8, 256),
+                (out.as_ptr(), input.len(), out.as_mut_ptr(), 256),
+            ];
+            for (p, len, o, cap) in invalid {
+                assert_eq!(call(p, len, o, cap, flags), -1);
+                assert_eq!(out, [90; 256]);
+            }
+            for len in 0..input.len() {
+                assert_eq!(call(input.as_ptr(), len, out.as_mut_ptr(), 256, flags), -1);
+                assert_eq!(out, [90; 256]);
+            }
+            let mut trailing = input.clone();
+            trailing.push(0);
+            assert_eq!(
+                call(
+                    trailing.as_ptr(),
+                    trailing.len(),
+                    out.as_mut_ptr(),
+                    256,
+                    flags
+                ),
+                -1
+            );
+            for flag in 0..=255 {
+                if flag > 1 || (op != 2 && flag != 0) {
+                    assert_eq!(
+                        call(input.as_ptr(), input.len(), out.as_mut_ptr(), 256, flag),
+                        -1
+                    );
+                    assert_eq!(out, [90; 256]);
+                }
+            }
+            for cap in [0, 1, expected.len() - 1] {
+                assert_eq!(
+                    call(input.as_ptr(), input.len(), out.as_mut_ptr(), cap, flags),
+                    -(expected.len() as isize)
+                );
+                assert_eq!(out, [90; 256]);
+            }
+            assert_eq!(
+                call(
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    expected.len(),
+                    flags
+                ),
+                expected.len() as isize
+            );
+            assert_eq!(&out[..expected.len()], expected.as_slice());
+            assert!(out[expected.len()..].iter().all(|b| *b == 90));
+        }
+        for op in [0, 6, 255] {
+            assert_eq!(w386_compute(op, 0, b""), None);
+        }
+        for op in [1, 2, 4, 5] {
+            assert_eq!(w386_compute(op, 0, &u32::MAX.to_le_bytes()), None);
+        }
+    }
+}
