@@ -2064,4 +2064,185 @@ class MovieService
             $profile,
         )->success;
     }
+
+    // ---------------------------------------------------------------------
+    // Wave 53.4 batch helper
+    // ---------------------------------------------------------------------
+
+    /** Enabled: minimum of three paired runs cleared every 1.5x gate (common mean 3.73x, p99 2.90x; uncommon mean 3.85x, p99 2.68x); see RustAnidbArchiveMovieBrowseMovieServiceIgdbExW53ParityTest. */
+    private const bool W53_RUST_FFI_DEFAULT = true;
+
+    public const string W53_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w534_movie_metadata_row_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * Per-row metadata completeness for many movies at once, with the
+     * summarizeMovieMetadataCompletenessPhp() rules on trimmed values. `$fields` holds four
+     * strings per movie ([imdbid, tmdbid, cover, year]); each movie yields four words: flags
+     * (1 valid IMDb id, 2 TMDb id, 4 cover, 8 year, 16 complete), the IMDb number, the TMDb id
+     * (saturating like an (int) cast) and the year, each -1 when invalid.
+     *
+     * @param  list<string>  $fields
+     * @return list<int>
+     */
+    public static function movieMetadataRowBatch(array $fields): array
+    {
+        return self::usesW53RustFfi()
+            ? self::movieMetadataRowBatchNative($fields)
+            : self::movieMetadataRowBatchPhp($fields);
+    }
+
+    /**
+     * @param  list<string>  $fields
+     * @return list<int>
+     */
+    public static function movieMetadataRowBatchNative(array $fields): array
+    {
+        self::w53AssertRows($fields);
+        if ($fields === []) {
+            return [];
+        }
+
+        return self::w53Call(implode("\0", $fields), '', intdiv(\count($fields), 4), 4)
+            ?? self::movieMetadataRowBatchPhp($fields);
+    }
+
+    /**
+     * @param  list<string>  $fields
+     * @return list<int>
+     */
+    public static function movieMetadataRowBatchPhp(array $fields): array
+    {
+        self::w53AssertRows($fields);
+        $out = [];
+        for ($i = 0, $n = \count($fields); $i < $n; $i += 4) {
+            $imdb = trim($fields[$i]);
+            $tmdb = trim($fields[$i + 1]);
+            $cover = trim($fields[$i + 2]);
+            $year = trim($fields[$i + 3]);
+            $validImdb = preg_match('/\A(?:tt)?[0-9]{7,10}\z/', $imdb) === 1 && strspn($imdb, 't0') !== \strlen($imdb);
+            $hasTmdb = preg_match('/\A[0-9]+\z/', $tmdb) === 1 && strspn($tmdb, '0') !== \strlen($tmdb);
+            $hasCover = preg_match('/\A[0-9]+\z/', $cover) === 1 && strspn($cover, '0') !== \strlen($cover);
+            $hasYear = preg_match('/\A[12][0-9]{3}\z/', $year) === 1;
+            $flags = ($validImdb ? 1 : 0) | ($hasTmdb ? 2 : 0) | ($hasCover ? 4 : 0) | ($hasYear ? 8 : 0);
+            array_push(
+                $out,
+                $flags === 15 ? 31 : $flags,
+                $validImdb ? (int) (str_starts_with($imdb, 'tt') ? substr($imdb, 2) : $imdb) : -1,
+                $hasTmdb ? (int) $tmdb : -1,
+                $hasYear ? (int) $year : -1,
+            );
+        }
+
+        return $out;
+    }
+
+    /** @param array<array-key, mixed> $fields */
+    private static function w53AssertRows(array $fields): void
+    {
+        self::w53AssertList($fields);
+        if (\count($fields) % 4 !== 0) {
+            throw new \InvalidArgumentException('Expected four movie metadata fields per row.');
+        }
+    }
+
+    public static function usesW53RustFfi(): bool
+    {
+        $enabled = self::w53RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W53_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W53 batch dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW53RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w53RustFfiState('enabled');
+        self::w53RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w53RustFfiState('enabled', $previous);
+        }
+    }
+
+    /** @param array<array-key, mixed> $values */
+    private static function w53AssertList(array $values): void
+    {
+        if (! array_is_list($values)) {
+            throw new \InvalidArgumentException('W53 batch input must be a list.');
+        }
+    }
+
+    /**
+     * One FFI crossing for the batch: NUL-joined text fields and packed int64 columns in,
+     * `$words` int64 words back per record. Null when the library is missing or declines
+     * (a value holding a NUL byte adds a field, which the export rejects).
+     *
+     * @return list<int>|null
+     */
+    private static function w53Call(string $text, string $ints, int $count, int $words): ?array
+    {
+        try {
+            $state = self::w53RustFfiState();
+            $ffi = $state['ffi'] ?? null;
+            if ($ffi === null) {
+                $ffi = RustPipelineLibrary::resolveDomain('metadata_w53', self::W53_FFI_CDEF) ?? false;
+                self::w53RustFfiState('ffi', $ffi);
+            }
+            if (! $ffi instanceof FFI) {
+                return null;
+            }
+            $need = $count * $words;
+            $out = $state['out'] ?? null;
+            $cap = $state['cap'] ?? 0;
+            if (! $out instanceof CData || ! \is_int($cap) || $cap < $need) {
+                $cap = max(1024, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w53RustFfiState('out', $out);
+                self::w53RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W53_FFI_CDEF.)
+            $written = $ffi->nntmux_w534_movie_metadata_row_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, $cap);
+            if ($written !== $need) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $need * 8));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * W53 routing override and cached binding plus reusable output buffer, kept in a function
+     * static: no arguments returns the state, one argument reads a key ('reset' clears
+     * everything) and two arguments write a key.
+     */
+    private static function w53RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+        }
+
+        return $state[$op] ?? null;
+    }
 }

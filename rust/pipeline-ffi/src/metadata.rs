@@ -51363,3 +51363,1001 @@ mod w524_tests {
         assert_eq!(&out[4..], &[1 | 4, 0, span(0, 100_000), -1]);
     }
 }
+
+// =========================================================================================
+// Wave 53.4 batch helpers: AnidbService episode markers, ArchiveProcessingService entry
+// classes, MovieBrowseService facet rows, MovieService metadata rows and IgdbHttpException
+// failure classes. Each export reuses the Wave 50.4 column runner: PHP joins text fields with
+// NUL bytes and packs integer columns with pack('P*'); Rust writes fixed-width int64 words
+// per record that PHP decodes with a single unpack('P*').
+// =========================================================================================
+
+pub mod w534_batch {
+    use super::w504_batch::{Batch, Shape, is_trim, run, span_word, trim};
+
+    /// PCRE `\s` without the u modifier: space, \t, \n, \v, \f and \r.
+    #[inline(always)]
+    fn is_space(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+    }
+
+    /// PCRE `\w` without the u modifier.
+    #[inline(always)]
+    fn is_word(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_'
+    }
+
+    /// PCRE `\b` after a word character ending at `at`.
+    #[inline(always)]
+    fn boundary_at(s: &[u8], at: usize) -> bool {
+        s.get(at).is_none_or(|b| !is_word(*b))
+    }
+
+    #[inline(always)]
+    fn digits(s: &[u8], from: usize) -> usize {
+        s.get(from..).map_or(0, |rest| {
+            rest.iter().take_while(|c| c.is_ascii_digit()).count()
+        })
+    }
+
+    #[inline(always)]
+    fn ci_at(s: &[u8], at: usize, needle: &[u8]) -> bool {
+        s.get(at..at.saturating_add(needle.len()))
+            .is_some_and(|w| w.eq_ignore_ascii_case(needle))
+    }
+
+    /// Decimal digits saturating at i64::MAX, as PHP's (int) cast of a digit string.
+    fn sat_dec(d: &[u8]) -> i64 {
+        let mut value: i64 = 0;
+        for b in d {
+            match value
+                .checked_mul(10)
+                .and_then(|v| v.checked_add(i64::from(b - b'0')))
+            {
+                Some(v) => value = v,
+                None => return i64::MAX,
+            }
+        }
+        value
+    }
+
+    /// The digits `0*(\d{1,max})` captures from a whole digit run, or None when it fails.
+    fn zero_padded(run: &[u8], max: usize) -> Option<&[u8]> {
+        if run.is_empty() {
+            return None;
+        }
+        let zeros = run.iter().take_while(|c| **c == b'0').count();
+        let from = if zeros == run.len() { zeros - 1 } else { zeros };
+        (run.len() - from <= max).then(|| &run[from..])
+    }
+
+    /// Row-major field `k` of a batch whose text columns hold consecutive record fields.
+    #[inline(always)]
+    fn field<'a>(b: &Batch<'a>, k: usize) -> &'a [u8] {
+        b.text(k / b.count, k % b.count)
+    }
+
+    // -------------------------------------------------------------------------------------
+    // AnidbService: episode markers, in extractBaseTitlePhp() priority order
+    // -------------------------------------------------------------------------------------
+
+    /// `\G\[[^\]]+\]\s*` repeated from the start.
+    fn leading_groups(s: &[u8]) -> i64 {
+        let mut pos = 0;
+        let mut groups = 0;
+        while s.get(pos) == Some(&b'[') {
+            match s[pos + 1..].iter().position(|c| *c == b']') {
+                Some(close) if close > 0 => pos += close + 2,
+                _ => break,
+            }
+            while s.get(pos).is_some_and(|b| is_space(*b)) {
+                pos += 1;
+            }
+            groups += 1;
+        }
+        groups
+    }
+
+    /// `\sS(\d+)E(\d+)` / `\s(\d+)x(\d+)` at whitespace `i` (case-insensitive): the second number.
+    #[inline(always)]
+    fn pair_at(s: &[u8], i: usize, season: bool) -> Option<i64> {
+        let mut p = i + 1;
+        if season {
+            if !matches!(s.get(p), Some(b'S' | b's')) {
+                return None;
+            }
+            p += 1;
+        }
+        let a = digits(s, p);
+        if a == 0 {
+            return None;
+        }
+        let sep = p + a;
+        let want = if season { b'e' } else { b'x' };
+        if s.get(sep).is_none_or(|c| *c | 0x20 != want) {
+            return None;
+        }
+        let b = digits(s, sep + 1);
+        (b > 0).then(|| sat_dec(&s[sep + 1..sep + 1 + b]))
+    }
+
+    /// `\s-\s*(\d{1,3})\b` at whitespace `i`.
+    #[inline(always)]
+    fn dash_at(s: &[u8], i: usize) -> Option<i64> {
+        if s.get(i + 1) != Some(&b'-') {
+            return None;
+        }
+        let mut p = i + 2;
+        while s.get(p).is_some_and(|b| is_space(*b)) {
+            p += 1;
+        }
+        let run = digits(s, p);
+        ((1..=3).contains(&run) && boundary_at(s, p + run)).then(|| sat_dec(&s[p..p + run]))
+    }
+
+    /// `\sE(?:p(?:isode)?)?\s*0*(\d{1,3})\b` at whitespace `i` (case-insensitive).
+    /// Backtracking into the optional groups cannot help: a shorter prefix leaves `p`/`i`
+    /// where a digit is needed.
+    #[inline(always)]
+    fn episode_at(s: &[u8], i: usize) -> Option<i64> {
+        if !matches!(s.get(i + 1), Some(b'E' | b'e')) {
+            return None;
+        }
+        let mut p = i + 2;
+        if matches!(s.get(p), Some(b'P' | b'p')) {
+            p += 1;
+            if ci_at(s, p, b"isode") {
+                p += 5;
+            }
+        }
+        while s.get(p).is_some_and(|b| is_space(*b)) {
+            p += 1;
+        }
+        let run = digits(s, p);
+        if !boundary_at(s, p + run) {
+            return None;
+        }
+        zero_padded(&s[p..p + run], 3).map(sat_dec)
+    }
+
+    /// Leftmost match of each whitespace-anchored marker in one pass, in priority order
+    /// (SxxEyy, NxM, " - NN", E/Ep/Episode); stops once the top-priority marker is found.
+    fn spaced_markers(s: &[u8]) -> Option<(i64, usize, i64)> {
+        let mut found: [Option<(usize, i64)>; 4] = [None; 4];
+        for i in 0..s.len() {
+            if !is_space(s[i]) {
+                continue;
+            }
+            if let Some(ep) = pair_at(s, i, true) {
+                found[0] = Some((i, ep));
+                break;
+            }
+            if found[1].is_none() {
+                found[1] = pair_at(s, i, false).map(|ep| (i, ep));
+            }
+            if found[2].is_none() {
+                found[2] = dash_at(s, i).map(|ep| (i, ep));
+            }
+            if found[3].is_none() {
+                found[3] = episode_at(s, i).map(|ep| (i, ep));
+            }
+        }
+        found
+            .iter()
+            .zip(1..)
+            .find_map(|(m, kind)| m.map(|(at, ep)| (kind, at, ep)))
+    }
+
+    const KEYWORDS: [&[u8]; 5] = [
+        b"movie",
+        b"ova",
+        b"complete series",
+        b"complete",
+        b"full series",
+    ];
+
+    /// `\b(?:Movie|OVA|Complete Series|Complete|Full Series)\b` (case-insensitive).
+    fn keyword_marker(s: &[u8]) -> Option<usize> {
+        (0..s.len()).find(|&k| {
+            matches!(s[k] | 0x20, b'm' | b'o' | b'c' | b'f')
+                && (k == 0 || !is_word(s[k - 1]))
+                && KEYWORDS
+                    .iter()
+                    .any(|w| ci_at(s, k, w) && boundary_at(s, k + w.len()))
+        })
+    }
+
+    const QUALITY: [&[u8]; 9] = [
+        b"bd", b"bdrip", b"bluray", b"blu-ray", b"hevc", b"x264", b"x265", b"h264", b"h265",
+    ];
+
+    /// `\[(?:BD|BDRip|BluRay|Blu-Ray|\d{3,4}[ipx]|HEVC|x264|x265|H264|H265)\]` (case-insensitive).
+    fn quality_marker(s: &[u8]) -> Option<usize> {
+        (0..s.len()).find(|&k| {
+            if s[k] != b'[' {
+                return false;
+            }
+            let run = digits(s, k + 1);
+            if (3..=4).contains(&run) {
+                return matches!(
+                    s.get(k + 1 + run),
+                    Some(b'i' | b'p' | b'x' | b'I' | b'P' | b'X')
+                ) && s.get(k + 2 + run) == Some(&b']');
+            }
+            QUALITY
+                .iter()
+                .any(|w| ci_at(s, k + 1, w) && s.get(k + 1 + w.len()) == Some(&b']'))
+        })
+    }
+
+    /// `[kind, offset, episode, leading groups]` after strtr($name, '_.', '  ').
+    fn anidb_episode_marker(b: &Batch<'_>, out: &mut [i64]) {
+        let mut s: Vec<u8> = Vec::new();
+        for (i, slot) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            s.clear();
+            s.extend(b.text(0, i).iter().map(|c| match c {
+                b'_' | b'.' => b' ',
+                c => *c,
+            }));
+            let s = s.as_slice();
+            let (kind, offset, episode) = if let Some(marker) = spaced_markers(s) {
+                marker
+            } else if let Some(at) = keyword_marker(s) {
+                (5, at, -1)
+            } else if let Some(at) = quality_marker(s) {
+                (6, at, -1)
+            } else {
+                (0, s.len(), -1)
+            };
+            *slot = [kind, offset as i64, episode, leading_groups(s)];
+        }
+    }
+
+    // -------------------------------------------------------------------------------------
+    // ArchiveProcessingService: entry class, volume index and flags
+    // -------------------------------------------------------------------------------------
+
+    /// fileNameClassPhp() codes: other 0, video 1, audio 2, image 3, text 4, par2 5, archive 6.
+    const EXTENSIONS: [(&[u8], i64); 34] = [
+        (b"mkv", 1),
+        (b"mp4", 1),
+        (b"avi", 1),
+        (b"m4v", 1),
+        (b"mov", 1),
+        (b"wmv", 1),
+        (b"ts", 1),
+        (b"m2ts", 1),
+        (b"mpg", 1),
+        (b"mpeg", 1),
+        (b"vob", 1),
+        (b"webm", 1),
+        (b"mp3", 2),
+        (b"flac", 2),
+        (b"m4a", 2),
+        (b"aac", 2),
+        (b"ogg", 2),
+        (b"wav", 2),
+        (b"wma", 2),
+        (b"ape", 2),
+        (b"jpg", 3),
+        (b"jpeg", 3),
+        (b"png", 3),
+        (b"gif", 3),
+        (b"webp", 3),
+        (b"bmp", 3),
+        (b"nfo", 4),
+        (b"txt", 4),
+        (b"diz", 4),
+        (b"sfv", 4),
+        (b"par2", 5),
+        (b"rar", 6),
+        (b"zip", 6),
+        (b"7z", 6),
+    ];
+
+    fn entry_class(ext: Option<&[u8]>) -> i64 {
+        let Some(ext) = ext else { return 0 };
+        if let Some((_, code)) = EXTENSIONS.iter().find(|(e, _)| ext.eq_ignore_ascii_case(e)) {
+            return *code;
+        }
+        let numbered = ext.len() == 3
+            && (ext[0].is_ascii_digit() || matches!(ext[0], b'r' | b'R'))
+            && ext[1].is_ascii_digit()
+            && ext[2].is_ascii_digit();
+        if numbered { 6 } else { 0 }
+    }
+
+    /// `\.part0*(\d{1,4})\.rar\z`, then `rar` 0, `rNN` NN + 1 and `NNN` NNN.
+    fn entry_volume(name: &[u8], ext: Option<&[u8]>) -> i64 {
+        let n = name.len();
+        if n >= 4 && name[n - 4..].eq_ignore_ascii_case(b".rar") {
+            let body = &name[..n - 4];
+            let run = body.iter().rev().take_while(|c| c.is_ascii_digit()).count();
+            let start = body.len() - run;
+            if run > 0
+                && start >= 5
+                && body[start - 5..start].eq_ignore_ascii_case(b".part")
+                && let Some(captured) = zero_padded(&body[start..], 4)
+            {
+                return sat_dec(captured);
+            }
+        }
+        match ext {
+            Some(e) if e.eq_ignore_ascii_case(b"rar") => 0,
+            Some(e) if e.len() == 3 && e[1].is_ascii_digit() && e[2].is_ascii_digit() => {
+                if matches!(e[0], b'r' | b'R') {
+                    sat_dec(&e[1..]) + 1
+                } else if e[0].is_ascii_digit() {
+                    sat_dec(e)
+                } else {
+                    -1
+                }
+            }
+            _ => -1,
+        }
+    }
+
+    #[inline(always)]
+    fn is_token_edge(b: u8) -> bool {
+        matches!(b, b'/' | b'\\' | b'.' | b'_' | b' ' | b'-')
+    }
+
+    /// `(?:\A|[/\\._ -])(?:sample|proof)(?:[/\\._ -]|\z)` (case-insensitive).
+    fn has_sample_token(name: &[u8]) -> bool {
+        (0..name.len()).any(|k| {
+            (k == 0 || is_token_edge(name[k - 1]))
+                && [&b"sample"[..], &b"proof"[..]].iter().any(|w| {
+                    ci_at(name, k, w) && name.get(k + w.len()).is_none_or(|c| is_token_edge(*c))
+                })
+        })
+    }
+
+    /// `[class, volume, flags]`; flags: 1 sample/proof token, 2 directory part, 4 dot-file.
+    fn archive_entry_class(b: &Batch<'_>, out: &mut [i64]) {
+        for (i, slot) in out.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+            let name = b.text(0, i);
+            let ext = name
+                .iter()
+                .rposition(|c| *c == b'.')
+                .map(|dot| &name[dot + 1..]);
+            let slash = name.iter().rposition(|c| matches!(c, b'/' | b'\\'));
+            let base_at = slash.map_or(0, |p| p + 1);
+            let flags = i64::from(has_sample_token(name))
+                | if slash.is_some() { 2 } else { 0 }
+                | if name.get(base_at) == Some(&b'.') {
+                    4
+                } else {
+                    0
+                };
+            *slot = [entry_class(ext), entry_volume(name, ext), flags];
+        }
+    }
+
+    // -------------------------------------------------------------------------------------
+    // MovieBrowseService: per-row browse facets
+    // -------------------------------------------------------------------------------------
+
+    /// getGenres() names in W48_GENRE_BITS order.
+    const GENRES: [&[u8]; 26] = [
+        b"action",
+        b"adventure",
+        b"animation",
+        b"biography",
+        b"comedy",
+        b"crime",
+        b"documentary",
+        b"drama",
+        b"family",
+        b"fantasy",
+        b"film-noir",
+        b"game-show",
+        b"history",
+        b"horror",
+        b"music",
+        b"musical",
+        b"mystery",
+        b"news",
+        b"reality-tv",
+        b"romance",
+        b"sci-fi",
+        b"sport",
+        b"talk-show",
+        b"thriller",
+        b"war",
+        b"western",
+    ];
+
+    /// w48RatingTenths(): D, DD, D.D or DD.D as tenths, at most 10.0.
+    fn rating_tenths(rating: &[u8]) -> i64 {
+        let (whole, tenth) = match rating.iter().position(|c| *c == b'.') {
+            Some(dot) => (&rating[..dot], &rating[dot + 1..]),
+            None => (rating, &b"0"[..]),
+        };
+        if whole.is_empty()
+            || whole.len() > 2
+            || !whole.iter().all(u8::is_ascii_digit)
+            || tenth.len() != 1
+            || !tenth[0].is_ascii_digit()
+        {
+            return -1;
+        }
+        let value = sat_dec(whole) * 10 + i64::from(tenth[0] - b'0');
+        if value <= 100 { value } else { -1 }
+    }
+
+    /// `[rating tenths or -1, year or 0, genre mask, known genres, unknown genres]`.
+    fn movie_facet_row(b: &Batch<'_>, out: &mut [i64]) {
+        for (i, slot) in out.as_chunks_mut::<5>().0.iter_mut().enumerate() {
+            let year = field(b, 3 * i);
+            let year = if year.len() == 4
+                && year.iter().all(u8::is_ascii_digit)
+                && (year.starts_with(b"19") || year.starts_with(b"20"))
+            {
+                sat_dec(year)
+            } else {
+                0
+            };
+            let rating = rating_tenths(trim(field(b, 3 * i + 1)).1);
+            let (mut mask, mut known, mut unknown) = (0i64, 0i64, 0i64);
+            for token in field(b, 3 * i + 2).split(|c| matches!(c, b',' | b'|' | b'/')) {
+                let token = trim(token).1;
+                if token.is_empty() {
+                    continue;
+                }
+                match GENRES.iter().position(|g| token.eq_ignore_ascii_case(g)) {
+                    None => unknown += 1,
+                    Some(bit) if mask & (1 << bit) == 0 => {
+                        mask |= 1 << bit;
+                        known += 1;
+                    }
+                    Some(_) => {}
+                }
+            }
+            *slot = [rating, year, mask, known, unknown];
+        }
+    }
+
+    // -------------------------------------------------------------------------------------
+    // MovieService: per-row metadata completeness
+    // -------------------------------------------------------------------------------------
+
+    /// `\A[0-9]+\z` and not all zeros, as its saturating value; -1 otherwise.
+    fn positive_decimal(value: &[u8]) -> i64 {
+        if value.is_empty()
+            || !value.iter().all(u8::is_ascii_digit)
+            || value.iter().all(|c| *c == b'0')
+        {
+            -1
+        } else {
+            sat_dec(value)
+        }
+    }
+
+    /// `[flags, imdb number or -1, tmdb id or -1, year or -1]`; flags: 1 imdb, 2 tmdb, 4 cover,
+    /// 8 year, 16 complete.
+    fn movie_metadata_row(b: &Batch<'_>, out: &mut [i64]) {
+        for (i, slot) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let imdb = trim(field(b, 4 * i)).1;
+            let digits = imdb.strip_prefix(b"tt").unwrap_or(imdb);
+            let imdb = if (7..=10).contains(&digits.len())
+                && digits.iter().all(u8::is_ascii_digit)
+                && digits.iter().any(|c| *c != b'0')
+            {
+                sat_dec(digits)
+            } else {
+                -1
+            };
+            let tmdb = positive_decimal(trim(field(b, 4 * i + 1)).1);
+            let cover = positive_decimal(trim(field(b, 4 * i + 2)).1) >= 0;
+            let year = trim(field(b, 4 * i + 3)).1;
+            let year = if year.len() == 4
+                && matches!(year[0], b'1' | b'2')
+                && year.iter().all(u8::is_ascii_digit)
+            {
+                sat_dec(year)
+            } else {
+                -1
+            };
+            let mut flags = i64::from(imdb >= 0)
+                | i64::from(tmdb >= 0) << 1
+                | i64::from(cover) << 2
+                | i64::from(year >= 0) << 3;
+            if flags == 15 {
+                flags |= 16;
+            }
+            *slot = [flags, imdb, tmdb, year];
+        }
+    }
+
+    // -------------------------------------------------------------------------------------
+    // IgdbHttpException: failure classes
+    // -------------------------------------------------------------------------------------
+
+    /// IgdbHttpException::WHITESPACE: PHP trim()'s set plus form feed.
+    #[inline(always)]
+    fn is_igdb_space(b: u8) -> bool {
+        is_trim(b) || b == 0x0c
+    }
+
+    fn igdb_trim(value: &[u8]) -> (usize, &[u8]) {
+        let start = value
+            .iter()
+            .position(|b| !is_igdb_space(*b))
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|b| !is_igdb_space(*b))
+            .map_or(start, |i| i + 1);
+        (start, &value[start..end])
+    }
+
+    /// strlen("IGDB request failed with HTTP status ").
+    const GENERIC_PREFIX: usize = 37;
+
+    /// `[category | retryable << 4 | blank << 5, message span, final message length, body
+    /// excerpt span or -1]`; categories: transport 0, auth 1, not_found 2, timeout 3,
+    /// rate_limited 4, client 5, server 6, unknown 7.
+    fn igdb_failure_class(b: &Batch<'_>, out: &mut [i64]) {
+        for (i, slot) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let status = b.int(i, 0);
+            let (category, retryable) = match status {
+                0 => (0, true),
+                401 | 403 => (1, false),
+                404 => (2, false),
+                408 => (3, true),
+                429 => (4, true),
+                400..=499 => (5, false),
+                500..=599 => (6, true),
+                _ => (7, false),
+            };
+            let (lead, message) = igdb_trim(b.text(0, i));
+            let length = if message.is_empty() {
+                GENERIC_PREFIX + status.to_string().len()
+            } else {
+                // Each whitespace run collapses to one space.
+                message
+                    .iter()
+                    .enumerate()
+                    .filter(|(k, c)| !is_igdb_space(**c) || !is_igdb_space(message[k - 1]))
+                    .count()
+            };
+            let (body_at, body) = igdb_trim(b.text(1, i));
+            let excerpt = if body.is_empty() {
+                -1
+            } else {
+                span_word(body_at, body.len().min(256))
+            };
+            *slot = [
+                category | i64::from(retryable) << 4 | i64::from(message.is_empty()) << 5,
+                span_word(lead, message.len()),
+                length as i64,
+                excerpt,
+            ];
+        }
+    }
+
+    macro_rules! export {
+        ($name:ident, $cols:literal, $per:literal, $words:literal, $body:ident) => {
+            /// # Safety
+            ///
+            /// `text` must point to `text_len` readable bytes, `ints` to `ints_len` readable
+            /// bytes and `out` to `out_cap` writable, aligned int64 words that overlap neither
+            /// input; null pointers are accepted only with zero lengths. The runner rejects a
+            /// null or misaligned output, null inputs with non-zero lengths, overlapping
+            /// buffers and field/int counts that do not match `count` before slicing, reports
+            /// `-needed` for a short output without writing, and maps panics to -1.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                text: *const u8,
+                text_len: usize,
+                ints: *const u8,
+                ints_len: usize,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                let shape = Shape {
+                    cols: $cols,
+                    head: 0,
+                    per: $per,
+                    words: $words,
+                };
+                unsafe {
+                    run(
+                        text, text_len, ints, ints_len, count, out, out_cap, shape, $body,
+                    )
+                }
+            }
+        };
+    }
+
+    export!(
+        nntmux_w534_anidb_episode_marker_batch,
+        1,
+        0,
+        4,
+        anidb_episode_marker
+    );
+    export!(
+        nntmux_w534_archive_entry_class_batch,
+        1,
+        0,
+        3,
+        archive_entry_class
+    );
+    export!(nntmux_w534_movie_facet_row_batch, 3, 0, 5, movie_facet_row);
+    export!(
+        nntmux_w534_movie_metadata_row_batch,
+        4,
+        0,
+        4,
+        movie_metadata_row
+    );
+    export!(
+        nntmux_w534_igdb_failure_class_batch,
+        2,
+        1,
+        4,
+        igdb_failure_class
+    );
+}
+
+#[cfg(test)]
+mod w534_tests {
+    use super::w534_batch::*;
+
+    type Export =
+        unsafe extern "C" fn(*const u8, usize, *const u8, usize, usize, *mut i64, usize) -> isize;
+
+    fn call(export: Export, text: &[u8], ints: &[u8], count: usize, out: &mut [i64]) -> isize {
+        unsafe {
+            export(
+                text.as_ptr(),
+                text.len(),
+                ints.as_ptr(),
+                ints.len(),
+                count,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        }
+    }
+
+    /// Row-major fields, `per` per record.
+    fn rows(export: Export, fields: &[&[u8]], per: usize, words: usize) -> Vec<i64> {
+        let count = fields.len() / per;
+        let text = fields.join(&0u8);
+        let mut out = vec![i64::MIN; count * words];
+        assert_eq!(
+            call(export, &text, &[], count, &mut out),
+            (count * words) as isize
+        );
+        out
+    }
+
+    fn span(offset: i64, len: i64) -> i64 {
+        (offset << 32) | len
+    }
+
+    #[test]
+    fn w534_anidb_episode_marker_hand_cases() {
+        let names: [&[u8]; 16] = [
+            b"[SubsPlease] Frieren - 12 (1080p) [ABCD1234].mkv",
+            b"Show.Name.S02E07.1080p.WEB",
+            b"Show Name 3x09 Title",
+            b"[Grp][Other]  Title Ep 05 [BD]",
+            b"Title Episode 007",
+            b"Title E0000",
+            b"Title E00012",
+            b"Title - 1234",
+            b"Title - 12v2",
+            b"Some Title Movie 2019",
+            b"Complete Series Box",
+            b"Name [1080p] [x264]",
+            b"Name [BDRip]",
+            b"plain",
+            b"",
+            b"[] Title -  7",
+        ];
+        let out = rows(nntmux_w534_anidb_episode_marker_batch, &names, 1, 4);
+        let expected: [[i64; 4]; 16] = [
+            [3, 20, 12, 1],
+            [1, 9, 7, 0],
+            [2, 9, 9, 0],
+            [4, 19, 5, 2],
+            [4, 5, 7, 0],
+            [4, 5, 0, 0],
+            [4, 5, 12, 0],
+            [0, 12, -1, 0],
+            [0, 12, -1, 0],
+            [5, 11, -1, 0],
+            [5, 0, -1, 0],
+            [6, 5, -1, 0],
+            [6, 5, -1, 0],
+            [0, 5, -1, 0],
+            [0, 0, -1, 0],
+            [3, 8, 7, 0],
+        ];
+        assert_eq!(out.as_chunks::<4>().0, &expected[..]);
+    }
+
+    #[test]
+    fn w534_archive_entry_class_hand_cases() {
+        let names: [&[u8]; 12] = [
+            b"movie.part01.rar",
+            b"movie.PART0000.RAR",
+            b"movie.part12345.rar",
+            b"movie.r00",
+            b"movie.R17",
+            b"movie.007",
+            b"dir/Sample/clip.mkv",
+            b"x\\.hidden.nfo",
+            b"proof.jpg",
+            b"samples.txt",
+            b"noext",
+            b"archive.7Z",
+        ];
+        let out = rows(nntmux_w534_archive_entry_class_batch, &names, 1, 3);
+        let expected: [[i64; 3]; 12] = [
+            [6, 1, 0],
+            [6, 0, 0],
+            [6, 0, 0],
+            [6, 1, 0],
+            [6, 18, 0],
+            [6, 7, 0],
+            [1, -1, 3],
+            [4, -1, 6],
+            [3, -1, 1],
+            [4, -1, 0],
+            [0, -1, 0],
+            [6, -1, 0],
+        ];
+        assert_eq!(out.as_chunks::<3>().0, &expected[..]);
+    }
+
+    #[test]
+    fn w534_movie_facet_row_hand_cases() {
+        let fields: [&[u8]; 15] = [
+            b"1999",
+            b" 8.7 ",
+            b"Action, Sci-Fi|action/Unknown",
+            b"2105",
+            b"10.0",
+            b"",
+            b"20xx",
+            b"10.1",
+            b" , drama ,",
+            b"19999",
+            b"7",
+            b"FILM-NOIR",
+            b"2001",
+            b"7.25",
+            b"x/y",
+        ];
+        let out = rows(nntmux_w534_movie_facet_row_batch, &fields, 3, 5);
+        let expected: [[i64; 5]; 5] = [
+            [87, 1999, 1 | 1 << 20, 2, 1],
+            [100, 0, 0, 0, 0],
+            [-1, 0, 1 << 7, 1, 0],
+            [70, 0, 1 << 10, 1, 0],
+            [-1, 2001, 0, 0, 2],
+        ];
+        assert_eq!(out.as_chunks::<5>().0, &expected[..]);
+    }
+
+    #[test]
+    fn w534_movie_metadata_row_hand_cases() {
+        let fields: [&[u8]; 16] = [
+            b" tt0111161 ",
+            b"278",
+            b"1",
+            b"1994",
+            b"tt0000000",
+            b"000",
+            b"0",
+            b"3000",
+            b"1234567890",
+            b"99999999999999999999999",
+            b"x",
+            b"2999",
+            b"TT0111161",
+            b"",
+            b"12",
+            b" 1000\n",
+        ];
+        let out = rows(nntmux_w534_movie_metadata_row_batch, &fields, 4, 4);
+        let expected: [[i64; 4]; 4] = [
+            [31, 111_161, 278, 1994],
+            [0, -1, -1, -1],
+            [1 | 2 | 8, 1_234_567_890, i64::MAX, 2999],
+            [4 | 8, -1, -1, 1000],
+        ];
+        assert_eq!(out.as_chunks::<4>().0, &expected[..]);
+    }
+
+    #[test]
+    fn w534_igdb_failure_class_hand_cases() {
+        let statuses: [i64; 6] = [0, 403, 429, 418, 503, -7];
+        let messages: [&[u8]; 6] = [
+            b"  boom \t\x0c bang  ",
+            b"",
+            b"\x0c",
+            b"teapot",
+            b"a  b",
+            b" x ",
+        ];
+        let bodies: [&[u8]; 6] = [b"", b"  {}  ", &[b'z'; 300], b"\x0c", b"err", b""];
+        let mut fields: Vec<&[u8]> = messages.to_vec();
+        fields.extend_from_slice(&bodies);
+        let text = fields.join(&0u8);
+        let ints: Vec<u8> = statuses.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mut out = vec![i64::MIN; 24];
+        assert_eq!(
+            call(
+                nntmux_w534_igdb_failure_class_batch,
+                &text,
+                &ints,
+                6,
+                &mut out
+            ),
+            24
+        );
+        let expected: [[i64; 4]; 6] = [
+            [16, span(2, 12), 9, -1],
+            [1 | 32, span(0, 0), 40, span(2, 2)],
+            [4 | 16 | 32, span(1, 0), 40, span(0, 256)],
+            [5, span(0, 6), 6, -1],
+            [6 | 16, span(0, 4), 3, span(0, 3)],
+            [7, span(1, 1), 1, -1],
+        ];
+        assert_eq!(out.as_chunks::<4>().0, &expected[..]);
+        // The generic message counts the sign of a negative status.
+        let mut one = vec![0; 4];
+        let neg = (-7i64).to_le_bytes();
+        assert_eq!(
+            call(
+                nntmux_w534_igdb_failure_class_batch,
+                b"\0",
+                &neg,
+                1,
+                &mut one
+            ),
+            4
+        );
+        assert_eq!(one[2], 39);
+    }
+
+    /// (export, text columns, ints per record, words per record).
+    const EXPORTS: [(Export, usize, usize, usize); 5] = [
+        (nntmux_w534_anidb_episode_marker_batch, 1, 0, 4),
+        (nntmux_w534_archive_entry_class_batch, 1, 0, 3),
+        (nntmux_w534_movie_facet_row_batch, 3, 0, 5),
+        (nntmux_w534_movie_metadata_row_batch, 4, 0, 4),
+        (nntmux_w534_igdb_failure_class_batch, 2, 1, 4),
+    ];
+
+    #[test]
+    fn w534_raw_export_contract() {
+        for (export, cols, per, words) in EXPORTS {
+            let text = vec![b'a'; 2 * cols]
+                .iter()
+                .map(|c| vec![*c])
+                .collect::<Vec<_>>()
+                .join(&0u8);
+            let ints: Vec<u8> = vec![7i64; 2 * per]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            let mut out = vec![i64::MIN; 2 * words];
+            unsafe {
+                // Null output, and null inputs with non-zero lengths, are rejected.
+                assert_eq!(
+                    export(
+                        text.as_ptr(),
+                        text.len(),
+                        ints.as_ptr(),
+                        ints.len(),
+                        2,
+                        std::ptr::null_mut(),
+                        64
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    export(
+                        std::ptr::null(),
+                        text.len(),
+                        ints.as_ptr(),
+                        ints.len(),
+                        2,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    -1
+                );
+                if per > 0 {
+                    assert_eq!(
+                        export(
+                            text.as_ptr(),
+                            text.len(),
+                            std::ptr::null(),
+                            ints.len(),
+                            2,
+                            out.as_mut_ptr(),
+                            out.len()
+                        ),
+                        -1
+                    );
+                }
+                // Empty batches accept null inputs and write nothing.
+                assert_eq!(
+                    export(
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                        0,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    0
+                );
+                // An output overlapping an input is rejected.
+                let mut shared = vec![0i64; 64];
+                let base = shared.as_mut_ptr();
+                assert_eq!(
+                    export(base.cast(), 8, ints.as_ptr(), ints.len(), 2, base, 64),
+                    -1
+                );
+            }
+            assert!(out.iter().all(|w| *w == i64::MIN));
+            // A NUL byte inside a value adds a field and is rejected.
+            let mut extra = text.clone();
+            extra.extend_from_slice(b"\0b");
+            assert_eq!(call(export, &extra, &ints, 2, &mut out), -1);
+            assert_eq!(
+                call(export, &text[..text.len() - 2], &ints, 2, &mut out),
+                -1
+            );
+            if per > 0 {
+                assert_eq!(call(export, &text, &ints[8..], 2, &mut out), -1);
+            }
+            // A short output reports the needed words without writing.
+            let mut short = vec![i64::MIN; 2 * words - 1];
+            assert_eq!(
+                call(export, &text, &ints, 2, &mut short),
+                -((2 * words) as isize)
+            );
+            assert!(short.iter().all(|w| *w == i64::MIN));
+            assert_eq!(
+                call(export, &text, &ints, 2, &mut out),
+                (2 * words) as isize
+            );
+            assert!(out.iter().all(|w| *w != i64::MIN));
+        }
+    }
+
+    #[test]
+    fn w534_long_and_binary_inputs_stay_bounded() {
+        let long = [b' '; 200_000]
+            .iter()
+            .chain(b"S1E2".iter())
+            .copied()
+            .collect::<Vec<u8>>();
+        let binary: Vec<u8> = (1u8..=255).collect();
+        for (export, cols, per, words) in EXPORTS {
+            for value in [&long[..], &binary[..]] {
+                let fields = vec![value; cols];
+                let text = fields.join(&0u8);
+                let ints: Vec<u8> = vec![500i64; per]
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect();
+                let mut out = vec![i64::MIN; words];
+                assert_eq!(call(export, &text, &ints, 1, &mut out), words as isize);
+            }
+        }
+        let out = rows(nntmux_w534_anidb_episode_marker_batch, &[&long], 1, 4);
+        assert_eq!(out, vec![1, 199_999, 2, 0]);
+    }
+}
