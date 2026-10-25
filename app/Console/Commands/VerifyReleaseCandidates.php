@@ -37,10 +37,22 @@ class VerifyReleaseCandidates extends Command
     /** Scratch records one terminal-cleanup pass reads. */
     private const int TERMINAL_SCRATCH_PAGE = 100;
 
+    /**
+     * Default for the Wave 39.2 toggle only; it stays false because the paired benchmark in
+     * tests/Unit/RustFingerprintBackfillTransferCandidateW39ParityTest.php is below 1.5x.
+     */
+    public const bool W392_RUST_FFI_DEFAULT = false;
+
     /** Rust stays opt-in: the FFI round trip is slower than this PHP helper (< 1.5x). */
     private const bool RUST_FFI_DEFAULT = false;
 
+    /** Outcome codes by bucket: verified, retryable while attempts remain, permanent failure and deferred. */
+    private const array W392_OUTCOME_BUCKETS = ['complete' => 0, 'repaired' => 0, 'sampled' => 0, 'unknown' => 1, 'unrepairable' => 3, 'failed' => 3,
+        'deferred' => 4];
+
     private static ?bool $useRustFfi = null;
+
+    private static ?bool $useW392RustFfi = null;
 
     protected $signature = 'releases:verify-candidates {--limit=1 : Maximum candidates in this run} {--slot=0 : Worker slot; zero selects a free slot} {--max-seconds=0 : Stop claiming after this duration; finish the active candidate} {--no-summary : Skip global candidate status counts} {--diagnostics : Log bounded natural verification run counters and timings}';
 
@@ -106,6 +118,103 @@ class VerifyReleaseCandidates extends Command
         }
 
         return self::normalizeScratchCursorPhp($decodedCursor, $maxHostScratchId, $exhausted, $fetchedCount, $lastProcessedId);
+    }
+
+    public static function useW392RustFfi(?bool $use): void
+    {
+        self::$useW392RustFfi = $use;
+    }
+
+    public static function usesW392RustFfi(): bool
+    {
+        return self::$useW392RustFfi ?? self::W392_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW392RustFfi(): void
+    {
+        self::$useW392RustFfi = null;
+    }
+
+    /**
+     * Bucket verification outcomes (`code`, `attempts`): complete, repaired and sampled are verified; unknown is retryable
+     * while its integer attempts (non-integers count as zero) stay below max(0, $retryBudget) and exhausted after that;
+     * unrepairable and failed are permanent; deferred is deferred; any other or non-string code is unrecognized.
+     *
+     * @param  array<array-key, mixed>  $outcomes
+     * @return array{outcomes: int, verified: int, retryable: int, exhausted: int, permanent_failure: int, deferred: int, unrecognized: int}
+     */
+    public static function summarizeCandidateVerificationOutcomes(array $outcomes, int $retryBudget = 3): array
+    {
+        return (self::usesW392RustFfi() ? self::summarizeCandidateVerificationOutcomesNative($outcomes, $retryBudget) : null)
+            ?? self::summarizeCandidateVerificationOutcomesPhp($outcomes, $retryBudget);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $outcomes
+     * @return array{outcomes: int, verified: int, retryable: int, exhausted: int, permanent_failure: int, deferred: int, unrecognized: int}
+     */
+    private static function summarizeCandidateVerificationOutcomesPhp(array $outcomes, int $retryBudget): array
+    {
+        $budget = max(0, $retryBudget);
+        $counts = [0, 0, 0, 0, 0, 0];
+        foreach ($outcomes as $outcome) {
+            [$code, $attempts] = self::outcomeFields($outcome);
+            $bucket = $code === null ? 5 : (self::W392_OUTCOME_BUCKETS[$code] ?? 5);
+            $counts[$bucket === 1 && $attempts >= $budget ? 2 : $bucket]++;
+        }
+
+        return self::verificationOutcomeSummary(\count($outcomes), $counts);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $outcomes
+     * @return array{outcomes: int, verified: int, retryable: int, exhausted: int, permanent_failure: int, deferred: int, unrecognized: int}|null
+     */
+    private static function summarizeCandidateVerificationOutcomesNative(array $outcomes, int $retryBudget): ?array
+    {
+        if (\count($outcomes) * 2 + 2 > BackfillReleaseFingerprintMetadata::W392_MAX_INPUT / 8) {
+            return null;
+        }
+        $words = [$retryBudget, \count($outcomes)];
+        $codes = '';
+        foreach ($outcomes as $outcome) {
+            [$code, $attempts] = self::outcomeFields($outcome);
+            $words[] = $code === null ? -1 : \strlen($code);
+            $words[] = $attempts;
+            $codes .= $code;
+        }
+        $slots = BackfillReleaseFingerprintMetadata::evaluateW392Native(4, pack('q*', ...$words).$codes, 7);
+        if ($slots === null) {
+            return null;
+        }
+        $count = array_shift($slots);
+        if ($count !== \count($outcomes) || min($slots) < 0 || array_sum($slots) !== $count) {
+            return null;
+        }
+
+        return self::verificationOutcomeSummary($count, $slots);
+    }
+
+    /** @return array{?string, int} */
+    private static function outcomeFields(mixed $outcome): array
+    {
+        if (! \is_array($outcome)) {
+            return [null, 0];
+        }
+        $code = $outcome['code'] ?? null;
+        $attempts = $outcome['attempts'] ?? 0;
+
+        return [\is_string($code) ? $code : null, \is_int($attempts) ? $attempts : 0];
+    }
+
+    /**
+     * @param  list<int>  $counts  verified, retryable, exhausted, permanent failure, deferred, unrecognized
+     * @return array{outcomes: int, verified: int, retryable: int, exhausted: int, permanent_failure: int, deferred: int, unrecognized: int}
+     */
+    private static function verificationOutcomeSummary(int $outcomes, array $counts): array
+    {
+        return ['outcomes' => $outcomes, 'verified' => $counts[0], 'retryable' => $counts[1], 'exhausted' => $counts[2],
+            'permanent_failure' => $counts[3], 'deferred' => $counts[4], 'unrecognized' => $counts[5]];
     }
 
     /** @param array<array-key, mixed>|null $cursor */
