@@ -42411,3 +42411,1183 @@ mod w434_tests {
         }
     }
 }
+pub mod w444_metadata {
+    use super::{PhpKey, PhpNode, PhpSerParser, PhpSerWriter};
+    use std::collections::HashSet;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+
+    unsafe fn dispatch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+        summarize: fn(&[u8]) -> Option<Vec<u8>>,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if input.is_null()
+                || out.is_null()
+                || len > MAX_INPUT
+                || len > isize::MAX as usize
+                || cap > isize::MAX as usize
+            {
+                return -1;
+            }
+            let Some(input_end) = (input as usize).checked_add(len) else {
+                return -1;
+            };
+            let Some(out_end) = (out as usize).checked_add(cap) else {
+                return -1;
+            };
+            if len != 0 && cap != 0 && (input as usize) < out_end && (out as usize) < input_end {
+                return -1;
+            }
+            // Both spans and their overlap are checked before borrowing caller memory.
+            let input = unsafe { std::slice::from_raw_parts(input, len) };
+            let Some(result) = summarize(input) else {
+                return -1;
+            };
+            let Ok(needed) = isize::try_from(result.len()) else {
+                return -1;
+            };
+            if result.len() > cap {
+                return -needed;
+            }
+            unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), out, result.len()) };
+            needed
+        }))
+        .unwrap_or(-1)
+    }
+
+    fn is_list(node: &PhpNode<'_>) -> bool {
+        node.is_arr()
+            && node
+                .items()
+                .iter()
+                .enumerate()
+                .all(|(i, (key, _))| *key == PhpKey::Int(i as i64))
+    }
+
+    /// Decodes `[list<string>]`, trims each entry and writes `keys => counts`.
+    fn summarize<const COUNTS: usize>(
+        input: &[u8],
+        keys: [&[u8]; COUNTS],
+        mut classify: impl FnMut(&[u8]) -> [bool; COUNTS],
+    ) -> Option<Vec<u8>> {
+        let doc = PhpSerParser::parse_document(input)?;
+        if !is_list(&doc) || doc.items().len() != 1 {
+            return None;
+        }
+        let rows = &doc.items()[0].1;
+        if !is_list(rows) {
+            return None;
+        }
+        let mut counts = [0i64; COUNTS];
+        for (_, row) in rows.items() {
+            let entry = trim(row.as_str()?);
+            for (count, matched) in counts.iter_mut().zip(classify(entry)) {
+                *count += i64::from(matched);
+            }
+        }
+        let mut w = PhpSerWriter::new();
+        w.arr_open(COUNTS);
+        for (key, count) in keys.into_iter().zip(counts) {
+            w.key(key);
+            w.int(count);
+        }
+        w.arr_close();
+        Some(w.buf)
+    }
+
+    /// PHP trim(): space, tab, LF, CR, NUL and vertical tab (not form feed).
+    fn is_trim(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b)
+    }
+
+    fn trim(value: &[u8]) -> &[u8] {
+        let start = value
+            .iter()
+            .position(|b| !is_trim(*b))
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|b| !is_trim(*b))
+            .map_or(start, |i| i + 1);
+        &value[start..end]
+    }
+
+    /// PCRE `\s` without UTF mode.
+    fn is_space(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+    }
+
+    /// PCRE `\w` without UTF mode.
+    fn is_word(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_'
+    }
+
+    fn wb_before(value: &[u8], at: usize) -> bool {
+        at == 0 || !is_word(value[at - 1])
+    }
+
+    fn wb_after(value: &[u8], at: usize) -> bool {
+        value.get(at).is_none_or(|b| !is_word(*b))
+    }
+
+    /// `hay[at..]` starts with `prefix`, ASCII case-insensitively.
+    fn starts_ci(hay: &[u8], at: usize, prefix: &[u8]) -> bool {
+        hay.get(at..at + prefix.len())
+            .is_some_and(|s| s.eq_ignore_ascii_case(prefix))
+    }
+
+    fn ends_ci(hay: &[u8], suffix: &[u8]) -> bool {
+        hay.len() >= suffix.len() && hay[hay.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+    }
+
+    fn digit_run(value: &[u8], at: usize) -> usize {
+        value
+            .get(at..)
+            .map_or(0, |s| s.iter().take_while(|b| b.is_ascii_digit()).count())
+    }
+
+    fn skip_spaces(value: &[u8], mut at: usize) -> usize {
+        while value.get(at).is_some_and(|b| is_space(*b)) {
+            at += 1;
+        }
+        at
+    }
+
+    fn trim_spaces_end(value: &[u8]) -> &[u8] {
+        let end = value
+            .iter()
+            .rposition(|b| !is_space(*b))
+            .map_or(0, |i| i + 1);
+        &value[..end]
+    }
+
+    /// Maximal `\w` runs with their start offsets.
+    fn word_runs(value: &[u8]) -> impl Iterator<Item = (usize, &[u8])> {
+        let mut i = 0;
+        std::iter::from_fn(move || {
+            while i < value.len() && !is_word(value[i]) {
+                i += 1;
+            }
+            if i >= value.len() {
+                return None;
+            }
+            let start = i;
+            while i < value.len() && is_word(value[i]) {
+                i += 1;
+            }
+            Some((start, &value[start..i]))
+        })
+    }
+
+    /// ASCII-uppercases tokens of up to 16 bytes; longer tokens match no keyword.
+    fn upper<'b>(token: &[u8], buf: &'b mut [u8; 16]) -> &'b [u8] {
+        if token.len() > buf.len() {
+            return &[];
+        }
+        for (dst, src) in buf.iter_mut().zip(token) {
+            *dst = src.to_ascii_uppercase();
+        }
+        &buf[..token.len()]
+    }
+
+    // SteamService: release title tags as cleanTitle()/normalizeTitle() see them.
+
+    /// `SteamService::SCENE_GROUPS`, uppercased.
+    const SCENE_GROUPS: [&[u8]; 39] = [
+        b"CODEX",
+        b"PLAZA",
+        b"GOG",
+        b"CPY",
+        b"HOODLUM",
+        b"EMPRESS",
+        b"RUNE",
+        b"TENOKE",
+        b"FLT",
+        b"RELOADED",
+        b"SKIDROW",
+        b"PROPHET",
+        b"RAZOR1911",
+        b"CORE",
+        b"REFLEX",
+        b"P2P",
+        b"GOLDBERG",
+        b"DARKSIDERS",
+        b"TINYISO",
+        b"DOGE",
+        b"ANOMALY",
+        b"ELAMIGOS",
+        b"FITGIRL",
+        b"DODI",
+        b"XATAB",
+        b"CHRONOS",
+        b"FCKDRM",
+        b"I_KNOW",
+        b"KAOS",
+        b"SIMPLEX",
+        b"ALI213",
+        b"FLTDOX",
+        b"3DMGAME",
+        b"POSTMORTEM",
+        b"VACE",
+        b"ROGUE",
+        b"OUTLAWS",
+        b"DARKSIIDERS",
+        b"ONLINEFIX",
+    ];
+
+    /// `[-_]\s*(?:GROUPS)\s*\z`, case-insensitive.
+    fn steam_scene_suffix(title: &[u8]) -> bool {
+        let body = trim_spaces_end(title);
+        SCENE_GROUPS.iter().any(|group| {
+            ends_ci(body, group)
+                && matches!(
+                    trim_spaces_end(&body[..body.len() - group.len()]).last(),
+                    Some(b'-' | b'_')
+                )
+        })
+    }
+
+    /// `\bv?\d+(?:\.\d+){2,}\b` anchored at the start of a word run.
+    fn steam_version_at(title: &[u8], i: usize) -> bool {
+        let mut at = i;
+        if matches!(title[at], b'v' | b'V') {
+            at += 1;
+        }
+        let n = digit_run(title, at);
+        if n == 0 {
+            return false;
+        }
+        at += n;
+        let mut groups = 0;
+        while title.get(at) == Some(&b'.') {
+            let d = digit_run(title, at + 1);
+            if d == 0 {
+                break;
+            }
+            groups += 1;
+            at += 1 + d;
+        }
+        // A third group leaves a `.` after the second, which is itself a boundary.
+        groups >= 3 || (groups == 2 && wb_after(title, at))
+    }
+
+    fn steam_titles(input: &[u8]) -> Option<Vec<u8>> {
+        summarize(
+            input,
+            [
+                b"total_titles",
+                b"empty_title_count",
+                b"scene_group_count",
+                b"edition_tag_count",
+                b"release_tag_count",
+                b"platform_tag_count",
+                b"version_count",
+                b"bracket_count",
+                b"extension_count",
+                b"url_encoded_count",
+                b"roman_numeral_count",
+            ],
+            |title| {
+                let mut flags = [false; 11];
+                flags[0] = true;
+                if title.is_empty() {
+                    flags[1] = true;
+                    return flags;
+                }
+                flags[2] = steam_scene_suffix(title);
+                let mut buf = [0u8; 16];
+                for (start, run) in word_runs(title) {
+                    match upper(run, &mut buf) {
+                        b"GOTY" | b"EDITION" | b"REMASTERED" | b"DEFINITIVE" | b"DELUXE"
+                        | b"ULTIMATE" | b"COMPLETE" | b"ANNIVERSARY" | b"ENHANCED" | b"SPECIAL"
+                        | b"COLLECTOR" | b"COLLECTORS" | b"GOLD" | b"PREMIUM" | b"LEGENDARY"
+                        | b"STANDARD" | b"DIGITAL" => flags[3] = true,
+                        b"PC" | b"WIN" | b"WINDOWS" | b"X86" | b"X64" | b"X32" => flags[5] = true,
+                        b"XX" | b"XIX" | b"XVIII" | b"XVII" | b"XVI" | b"XV" | b"XIV" | b"XIII"
+                        | b"XII" | b"XI" | b"X" | b"IX" | b"VIII" | b"VII" | b"VI" | b"V"
+                        | b"IV" | b"III" | b"II" => flags[10] = true,
+                        _ => {}
+                    }
+                    // `\b(?:TAGS)\d*\b`: no tag ends in a digit, so strip the digit tail.
+                    let stem =
+                        run.len() - run.iter().rev().take_while(|b| b.is_ascii_digit()).count();
+                    if matches!(
+                        upper(&run[..stem], &mut buf),
+                        b"REPACK"
+                            | b"RIP"
+                            | b"ISO"
+                            | b"PROPER"
+                            | b"UPDATE"
+                            | b"DLC"
+                            | b"INCL"
+                            | b"MULTI"
+                            | b"CRACK"
+                            | b"CRACKFIX"
+                            | b"FIX"
+                            | b"PATCH"
+                            | b"HOTFIX"
+                            | b"BETA"
+                            | b"ALPHA"
+                            | b"DEMO"
+                            | b"PREORDER"
+                    ) {
+                        flags[4] = true;
+                    }
+                    if !flags[6] && steam_version_at(title, start) {
+                        flags[6] = true;
+                    }
+                }
+                flags[7] = title.iter().any(|b| matches!(b, b'[' | b'(' | b'{'));
+                flags[8] = title.iter().rposition(|b| *b == b'.').is_some_and(|dot| {
+                    let mut buf = [0u8; 16];
+                    matches!(
+                        upper(&title[dot + 1..], &mut buf),
+                        b"ZIP"
+                            | b"RAR"
+                            | b"7Z"
+                            | b"ISO"
+                            | b"NFO"
+                            | b"SFV"
+                            | b"EXE"
+                            | b"MKV"
+                            | b"MP4"
+                            | b"AVI"
+                    )
+                });
+                flags[9] = title
+                    .windows(3)
+                    .any(|w| w[0] == b'%' && w[1].is_ascii_hexdigit() && w[2].is_ascii_hexdigit());
+                flags
+            },
+        )
+    }
+
+    // TmdbProvider: show names as getShowInfo()/formatShowInfo() see them.
+
+    fn tmdb_show_names(input: &[u8]) -> Option<Vec<u8>> {
+        summarize(
+            input,
+            [
+                b"total_names",
+                b"empty_name_count",
+                b"year_suffix_count",
+                b"imdb_id_count",
+                b"article_prefix_count",
+                b"colon_count",
+                b"parenthetical_count",
+                b"non_ascii_count",
+                b"numeric_count",
+            ],
+            |name| {
+                // `# \((19|20)\d{2}\)$#`: trimmed names never end in a newline.
+                let year = name.len() >= 7 && {
+                    let t = &name[name.len() - 7..];
+                    t[..2] == *b" ("
+                        && (t[2..4] == *b"19" || t[2..4] == *b"20")
+                        && t[4..6].iter().all(u8::is_ascii_digit)
+                        && t[6] == b')'
+                };
+                // `/tt\d{6,}$/i`
+                let digits = name.iter().rev().take_while(|b| b.is_ascii_digit()).count();
+                let imdb = digits >= 6 && ends_ci(&name[..name.len() - digits], b"tt");
+                let article = [&b"the"[..], b"a", b"an"].iter().any(|word| {
+                    starts_ci(name, 0, word) && name.get(word.len()).is_some_and(|b| is_space(*b))
+                });
+                [
+                    true,
+                    name.is_empty(),
+                    year,
+                    imdb,
+                    article,
+                    name.contains(&b':'),
+                    name.contains(&b'('),
+                    !name.is_ascii(),
+                    name.iter().any(u8::is_ascii_digit),
+                ]
+            },
+        )
+    }
+
+    // RefreshAnimeData: extractTitleFromSearchname() rule cascade.
+
+    const LANGUAGE_CODES: [&[u8]; 18] = [
+        b"ENG", b"JAP", b"JPN", b"SUB", b"DUB", b"MULTI", b"RAW", b"HARDSUB", b"SOFTSUB",
+        b"HARDDUB", b"SOFTDUB", b"ITA", b"SPA", b"FRE", b"GER", b"RUS", b"CHI", b"KOR",
+    ];
+
+    /// Bytes between `s[open]` and the next `close`, when there is one.
+    fn enclosed(s: &[u8], open: usize, close: u8) -> Option<&[u8]> {
+        let rest = &s[open + 1..];
+        rest.iter()
+            .position(|b| *b == close)
+            .map(|end| &rest[..end])
+    }
+
+    fn is_language(content: &[u8]) -> bool {
+        LANGUAGE_CODES
+            .iter()
+            .any(|code| content.eq_ignore_ascii_case(code))
+    }
+
+    /// Separator folding, whitespace collapse, leading group strip and
+    /// language tag replacement; returns (normalized, group stripped, tag replaced).
+    fn anime_normalize(entry: &[u8]) -> (Vec<u8>, bool, bool) {
+        // str_replace(['_', '.'], ' ') then preg_replace('/\s+/', ' ') then trim().
+        let mut folded = Vec::with_capacity(entry.len());
+        for &b in entry {
+            let b = if matches!(b, b'_' | b'.') { b' ' } else { b };
+            if is_space(b) {
+                if folded.last() != Some(&b' ') {
+                    folded.push(b' ');
+                }
+            } else {
+                folded.push(b);
+            }
+        }
+        let s = trim(&folded);
+        // `^(?:\[[^\]]+\]\s*)+`
+        let mut at = 0;
+        while s.get(at) == Some(&b'[') {
+            match enclosed(s, at, b']') {
+                Some(content) if !content.is_empty() => {
+                    at = skip_spaces(s, at + content.len() + 2);
+                }
+                _ => break,
+            }
+        }
+        let group = at > 0;
+        let s = trim(&s[at..]);
+        // `\[(?:CODES)\]` and `\((?:CODES)\)` both become a space.
+        let mut out = Vec::with_capacity(s.len());
+        let mut language = false;
+        let mut i = 0;
+        while i < s.len() {
+            let close = match s[i] {
+                b'[' => Some(b']'),
+                b'(' => Some(b')'),
+                _ => None,
+            };
+            if let Some(content) = close.and_then(|c| enclosed(s, i, c))
+                && is_language(content)
+            {
+                out.push(b' ');
+                language = true;
+                i += content.len() + 2;
+                continue;
+            }
+            out.push(s[i]);
+            i += 1;
+        }
+        (out, group, language)
+    }
+
+    /// `\sS\d+E\d+` (rule 0) and `\s\d+x\d+` (rule 1), case-insensitive.
+    fn anime_pair(s: &[u8], lead: Option<u8>, mid: u8) -> bool {
+        (0..s.len()).any(|i| {
+            if !is_space(s[i]) {
+                return false;
+            }
+            let mut at = i + 1;
+            if let Some(lead) = lead {
+                if s.get(at).is_none_or(|b| b.to_ascii_lowercase() != lead) {
+                    return false;
+                }
+                at += 1;
+            }
+            let n = digit_run(s, at);
+            n > 0
+                && s.get(at + n).is_some_and(|b| b.to_ascii_lowercase() == mid)
+                && digit_run(s, at + n + 1) > 0
+        })
+    }
+
+    /// `\s-\s*(\d{1,3})\b`
+    fn anime_dash_number(s: &[u8]) -> bool {
+        (0..s.len()).any(|i| {
+            if !is_space(s[i]) || s.get(i + 1) != Some(&b'-') {
+                return false;
+            }
+            let at = skip_spaces(s, i + 2);
+            let n = digit_run(s, at);
+            (1..=3).contains(&n) && wb_after(s, at + n)
+        })
+    }
+
+    /// `\sE(?:p(?:isode)?)?\s*0*(\d{1,3})\b`, case-insensitive.
+    fn anime_episode(s: &[u8]) -> bool {
+        (0..s.len()).any(|i| {
+            if !is_space(s[i]) || !s.get(i + 1).is_some_and(|b| matches!(b, b'e' | b'E')) {
+                return false;
+            }
+            let after = [
+                Some(i + 2),
+                starts_ci(s, i + 2, b"p").then_some(i + 3),
+                starts_ci(s, i + 2, b"pisode").then_some(i + 8),
+            ];
+            after.into_iter().flatten().any(|at| {
+                let at = skip_spaces(s, at);
+                let n = digit_run(s, at);
+                // 0* absorbs leading zeros, leaving one to three digits before the boundary.
+                let zeros = s[at..at + n].iter().take_while(|b| **b == b'0').count();
+                n > 0 && n - zeros.min(n - 1) <= 3 && wb_after(s, at + n)
+            })
+        })
+    }
+
+    /// `\b(Movie|OVA|Complete Series|Complete|Full Series)\b`, case-insensitive.
+    fn anime_keyword(s: &[u8]) -> bool {
+        (0..s.len()).any(|i| {
+            is_word(s[i])
+                && wb_before(s, i)
+                && [
+                    &b"movie"[..],
+                    b"ova",
+                    b"complete series",
+                    b"complete",
+                    b"full series",
+                ]
+                .iter()
+                .any(|word| starts_ci(s, i, word) && wb_after(s, i + word.len()))
+        })
+    }
+
+    /// `\[(?:BD|BDRip|BluRay|Blu-Ray|\d{3,4}[ipx]|HEVC|x264|x265|H264|H265)\]`, case-insensitive.
+    fn anime_bracket_quality(s: &[u8]) -> bool {
+        (0..s.len()).any(|i| {
+            if s[i] != b'[' {
+                return false;
+            }
+            let Some(content) = enclosed(s, i, b']') else {
+                return false;
+            };
+            let mut buf = [0u8; 16];
+            let token = upper(content, &mut buf);
+            matches!(
+                token,
+                b"BD"
+                    | b"BDRIP"
+                    | b"BLURAY"
+                    | b"BLU-RAY"
+                    | b"HEVC"
+                    | b"X264"
+                    | b"X265"
+                    | b"H264"
+                    | b"H265"
+            ) || ((4..=5).contains(&token.len())
+                && token[..token.len() - 1].iter().all(u8::is_ascii_digit)
+                && matches!(token[token.len() - 1], b'I' | b'P' | b'X'))
+        })
+    }
+
+    fn anime_rule(s: &[u8]) -> usize {
+        if anime_pair(s, Some(b's'), b'e') {
+            0
+        } else if anime_pair(s, None, b'x') {
+            1
+        } else if anime_dash_number(s) {
+            2
+        } else if anime_episode(s) {
+            3
+        } else if anime_keyword(s) {
+            4
+        } else if anime_bracket_quality(s) {
+            5
+        } else {
+            6
+        }
+    }
+
+    fn anime_searchnames(input: &[u8]) -> Option<Vec<u8>> {
+        summarize(
+            input,
+            [
+                b"total_searchnames",
+                b"empty_searchname_count",
+                b"group_tag_count",
+                b"language_tag_count",
+                b"sxxexx_count",
+                b"cross_count",
+                b"dash_number_count",
+                b"episode_count",
+                b"keyword_count",
+                b"bracket_quality_count",
+                b"whole_title_count",
+            ],
+            |name| {
+                let mut flags = [false; 11];
+                flags[0] = true;
+                if name.is_empty() {
+                    flags[1] = true;
+                    return flags;
+                }
+                let (s, group, language) = anime_normalize(name);
+                flags[2] = group;
+                flags[3] = language;
+                flags[4 + anime_rule(&s)] = true;
+                flags
+            },
+        )
+    }
+
+    // BookIsbn: normalizePhp()/toIsbn13Php() canonical identifiers.
+
+    fn isbn10_valid(isbn: &[u8]) -> bool {
+        isbn[..9].iter().all(u8::is_ascii_digit)
+            && (isbn[9].is_ascii_digit() || isbn[9] == b'X')
+            && isbn
+                .iter()
+                .enumerate()
+                .map(|(i, b)| {
+                    let digit = if *b == b'X' { 10 } else { u32::from(b - b'0') };
+                    digit * (10 - i as u32)
+                })
+                .sum::<u32>()
+                % 11
+                == 0
+    }
+
+    fn isbn13_valid(isbn: &[u8]) -> bool {
+        (isbn.starts_with(b"978") || isbn.starts_with(b"979"))
+            && isbn.iter().all(u8::is_ascii_digit)
+            && isbn13_sum(isbn).is_multiple_of(10)
+    }
+
+    fn isbn13_sum(digits: &[u8]) -> u32 {
+        digits
+            .iter()
+            .enumerate()
+            .map(|(i, b)| u32::from(b - b'0') * if i % 2 == 0 { 1 } else { 3 })
+            .sum()
+    }
+
+    fn isbn_values(input: &[u8]) -> Option<Vec<u8>> {
+        let mut seen: HashSet<[u8; 13]> = HashSet::new();
+        summarize(
+            input,
+            [
+                b"total_values",
+                b"empty_value_count",
+                b"isbn10_count",
+                b"isbn13_count",
+                b"invalid_count",
+                b"duplicate_count",
+                b"isbn10_convertible_count",
+                b"x_check_digit_count",
+            ],
+            move |value| {
+                let mut flags = [false; 8];
+                flags[0] = true;
+                if value.is_empty() {
+                    flags[1] = true;
+                    return flags;
+                }
+                // normalizePhp(): keep [0-9Xx], uppercased.
+                let (mut kept, mut len) = ([0u8; 13], 0usize);
+                for b in value {
+                    if b.is_ascii_digit() || matches!(b, b'x' | b'X') {
+                        if len < kept.len() {
+                            kept[len] = b.to_ascii_uppercase();
+                        }
+                        len += 1;
+                    }
+                }
+                let canonical = if len == 10 && isbn10_valid(&kept[..10]) {
+                    flags[2] = true;
+                    flags[6] = true;
+                    flags[7] = kept[9] == b'X';
+                    // toIsbn13Php(): 978 + the first nine digits + a fresh check digit.
+                    let mut isbn13 = [0u8; 13];
+                    isbn13[..3].copy_from_slice(b"978");
+                    isbn13[3..12].copy_from_slice(&kept[..9]);
+                    isbn13[12] = b'0' + ((10 - isbn13_sum(&isbn13[..12]) % 10) % 10) as u8;
+                    isbn13
+                } else if len == 13 && isbn13_valid(&kept) {
+                    flags[3] = true;
+                    flags[6] = kept.starts_with(b"978");
+                    kept
+                } else {
+                    flags[4] = true;
+                    return flags;
+                };
+                flags[5] = !seen.insert(canonical);
+                flags
+            },
+        )
+    }
+
+    // Utf8: byte-level inspection matching mb_check_encoding().
+
+    fn utf8_values(input: &[u8]) -> Option<Vec<u8>> {
+        summarize(
+            input,
+            [
+                b"total_values",
+                b"empty_value_count",
+                b"ascii_count",
+                b"valid_multibyte_count",
+                b"invalid_utf8_count",
+                b"control_char_count",
+                b"bom_count",
+                b"mojibake_count",
+            ],
+            |value| {
+                if value.is_empty() {
+                    return [true, true, false, false, false, false, false, false];
+                }
+                let ascii = value.is_ascii();
+                let valid = ascii || std::str::from_utf8(value).is_ok();
+                [
+                    true,
+                    false,
+                    ascii,
+                    !ascii && valid,
+                    !valid,
+                    value
+                        .iter()
+                        .any(|b| matches!(b, 0..=8 | 0x0b | 0x0c | 0x0e..=0x1f | 0x7f)),
+                    value.starts_with(b"\xef\xbb\xbf"),
+                    value
+                        .windows(2)
+                        .any(|w| w == b"\xc3\x83" || w == b"\xc3\x82"),
+                ]
+            },
+        )
+    }
+
+    /// # Safety
+    /// The input and output must be live buffers covering their declared lengths.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w444_steam_title_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, steam_titles) }
+    }
+
+    /// # Safety
+    /// The input and output must be live buffers covering their declared lengths.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w444_tmdb_show_name_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, tmdb_show_names) }
+    }
+
+    /// # Safety
+    /// The input and output must be live buffers covering their declared lengths.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w444_anime_searchname_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, anime_searchnames) }
+    }
+
+    /// # Safety
+    /// The input and output must be live buffers covering their declared lengths.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w444_isbn_value_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, isbn_values) }
+    }
+
+    /// # Safety
+    /// The input and output must be live buffers covering their declared lengths.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w444_utf8_value_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, utf8_values) }
+    }
+}
+
+#[cfg(test)]
+mod w444_tests {
+    use super::w444_metadata::*;
+    use super::{PhpKey, PhpSerParser, PhpSerWriter};
+
+    type Export = unsafe extern "C" fn(*const u8, usize, *mut u8, usize) -> isize;
+    const EXPORTS: [Export; 5] = [
+        nntmux_w444_steam_title_batch,
+        nntmux_w444_tmdb_show_name_batch,
+        nntmux_w444_anime_searchname_batch,
+        nntmux_w444_isbn_value_batch,
+        nntmux_w444_utf8_value_batch,
+    ];
+
+    fn frame(entries: &[&[u8]]) -> Vec<u8> {
+        let mut w = PhpSerWriter::new();
+        w.arr_open(1);
+        w.int(0);
+        w.arr_open(entries.len());
+        for (i, entry) in entries.iter().enumerate() {
+            w.int(i as i64);
+            w.str(entry);
+        }
+        w.arr_close();
+        w.arr_close();
+        w.buf
+    }
+
+    fn output(export: Export, input: &[u8]) -> Vec<u8> {
+        let mut out = vec![b'Z'; 1024];
+        let written = unsafe { export(input.as_ptr(), input.len(), out.as_mut_ptr(), out.len()) };
+        assert!(written > 0, "export declined: {written}");
+        out.truncate(written as usize);
+        out
+    }
+
+    fn summary(export: Export, entries: &[&[u8]], fields: &[(&[u8], i64)]) {
+        let result = output(export, &frame(entries));
+        let doc = PhpSerParser::parse_document(&result).unwrap();
+        assert_eq!(doc.items().len(), fields.len());
+        for ((key, value), (expected_key, expected_value)) in doc.items().iter().zip(fields) {
+            assert!(
+                matches!(key, PhpKey::Str(k) if k == expected_key),
+                "key mismatch for {}",
+                String::from_utf8_lossy(expected_key)
+            );
+            assert_eq!(
+                value.as_int(),
+                Some(*expected_value),
+                "{}",
+                String::from_utf8_lossy(expected_key)
+            );
+        }
+    }
+
+    #[test]
+    fn w444_steam_titles_count_groups_tags_and_versions() {
+        summary(
+            nntmux_w444_steam_title_batch,
+            &[
+                b"Cyberpunk.2077.Ultimate.Edition.v2.12.1-GOG",
+                b"Game Name - PLAZA ",
+                b"Game_I_KNOW",
+                b"[PC] Game (2020) {x64}",
+                b"Game.REPACK2.zip",
+                b"Game CRACKFIX",
+                b"Game.Repacked",
+                b"Final Fantasy XVI",
+                b"Rocky IIII",
+                b"Foo%20Bar",
+                b"Foo%2",
+                b"Game v1.2",
+                b"Game 1.2.3a",
+                b"Game.1.2.3.4b",
+                b"",
+                b" \t",
+                b"Doom.Eternal.Deluxe-CODEX.iso",
+                b"Hades II",
+                b"",
+                b"2077",
+            ],
+            &[
+                (b"total_titles", 20),
+                (b"empty_title_count", 3),
+                (b"scene_group_count", 3),
+                (b"edition_tag_count", 2),
+                (b"release_tag_count", 3),
+                (b"platform_tag_count", 1),
+                (b"version_count", 2),
+                (b"bracket_count", 1),
+                (b"extension_count", 2),
+                (b"url_encoded_count", 1),
+                (b"roman_numeral_count", 2),
+            ],
+        );
+    }
+
+    #[test]
+    fn w444_tmdb_show_names_count_years_ids_and_articles() {
+        summary(
+            nntmux_w444_tmdb_show_name_batch,
+            &[
+                b"Breaking Bad (2008)",
+                b"Doctor Who (2005) ",
+                b"Show (2101)",
+                b"Show(2020)",
+                b"The Office",
+                b"the-office",
+                b"An Idiot Abroad",
+                b"A",
+                b"tt0903747",
+                b"imdb TT123456",
+                b"tt12345",
+                b"Star Trek: Discovery",
+                b"Pok\xc3\xa9mon",
+                b"",
+                b"The Wire",
+                b"Dark (2017)",
+                b"Lost",
+                b"1999",
+                b"",
+            ],
+            &[
+                (b"total_names", 19),
+                (b"empty_name_count", 2),
+                (b"year_suffix_count", 3),
+                (b"imdb_id_count", 2),
+                (b"article_prefix_count", 3),
+                (b"colon_count", 1),
+                (b"parenthetical_count", 5),
+                (b"non_ascii_count", 1),
+                (b"numeric_count", 9),
+            ],
+        );
+    }
+
+    #[test]
+    fn w444_anime_searchnames_follow_the_extraction_cascade() {
+        summary(
+            nntmux_w444_anime_searchname_batch,
+            &[
+                b"[SubsPlease] Frieren - 12 (1080p) [ENG].mkv",
+                b"Show.S01E02.720p",
+                b"Show 1x05",
+                b"Show_-_007",
+                b"Show - 1234",
+                b"Show Ep 007",
+                b"Show Episode0012",
+                b"Show E0000",
+                b"Show E1234",
+                b"Show The Movie",
+                b"Show Complete Series",
+                b"Show [BD]",
+                b"Show [1080p]",
+                b"Show[ENG]S01E01",
+                b"[Grp][Two] Title",
+                b"[] Title",
+                b"Plain Title",
+                b"",
+                b"Show OVA",
+                b"Show [x265]",
+                b"12",
+            ],
+            &[
+                (b"total_searchnames", 21),
+                (b"empty_searchname_count", 1),
+                (b"group_tag_count", 2),
+                (b"language_tag_count", 2),
+                (b"sxxexx_count", 2),
+                (b"cross_count", 1),
+                (b"dash_number_count", 2),
+                (b"episode_count", 3),
+                (b"keyword_count", 3),
+                (b"bracket_quality_count", 3),
+                (b"whole_title_count", 6),
+            ],
+        );
+    }
+
+    #[test]
+    fn w444_isbn_values_dedupe_by_canonical_isbn13() {
+        summary(
+            nntmux_w444_isbn_value_batch,
+            &[
+                b"978-0-306-40615-7",
+                b"0-306-40615-2",
+                b"ISBN 0306406152",
+                b"080442957x",
+                b"9780804429573",
+                b"9790000000001",
+                b"9780306406158",
+                b"123",
+                b"OCLC",
+                b"",
+                b"978-0-8044-2957-3",
+                b"0306406152",
+                b"",
+                b"306406152",
+            ],
+            &[
+                (b"total_values", 14),
+                (b"empty_value_count", 2),
+                (b"isbn10_count", 4),
+                (b"isbn13_count", 4),
+                (b"invalid_count", 4),
+                (b"duplicate_count", 5),
+                (b"isbn10_convertible_count", 7),
+                (b"x_check_digit_count", 1),
+            ],
+        );
+    }
+
+    #[test]
+    fn w444_utf8_values_match_mb_check_encoding() {
+        summary(
+            nntmux_w444_utf8_value_batch,
+            &[
+                b"plain",
+                b"caf\xc3\xa9",
+                "日本語".as_bytes(),
+                b"\xff\xfe",
+                b"\xed\xa0\x80",
+                b"\xc0\xaf",
+                b"\xf4\x90\x80\x80",
+                b"a\x01b",
+                b"a\x7f",
+                b"tab\there",
+                b"\xef\xbb\xbfBOM",
+                "Ã©".as_bytes(),
+                b"\xc3\x82\xa0",
+                b"\0",
+                b"",
+                b"x\x1f",
+                b"ok",
+                b"0",
+                b"",
+            ],
+            &[
+                (b"total_values", 19),
+                (b"empty_value_count", 3),
+                (b"ascii_count", 7),
+                (b"valid_multibyte_count", 4),
+                (b"invalid_utf8_count", 5),
+                (b"control_char_count", 3),
+                (b"bom_count", 1),
+                (b"mojibake_count", 2),
+            ],
+        );
+    }
+
+    #[test]
+    fn w444_all_exports_check_spans_and_preserve_output_on_failure() {
+        for export in EXPORTS {
+            let input = frame(&[b"x"]);
+            let expected = output(export, &input);
+            let needed = expected.len();
+            let mut out = [b'Z'; 1024];
+            unsafe {
+                for cap in [0, 1, needed - 1] {
+                    assert_eq!(
+                        export(input.as_ptr(), input.len(), out.as_mut_ptr(), cap),
+                        -(needed as isize)
+                    );
+                    assert_eq!(out, [b'Z'; 1024]);
+                }
+                assert_eq!(
+                    export(input.as_ptr(), input.len(), out.as_mut_ptr(), needed),
+                    needed as isize
+                );
+                assert_eq!(&out[..needed], expected);
+                assert!(out[needed..].iter().all(|b| *b == b'Z'));
+                for (ptr, len) in [
+                    (std::ptr::null(), 0),
+                    (std::ptr::null(), input.len()),
+                    (input.as_ptr(), 16 * 1024 * 1024 + 1),
+                    (input.as_ptr(), isize::MAX as usize + 1),
+                    ((usize::MAX - 1) as *const u8, 8),
+                ] {
+                    out.fill(b'Z');
+                    assert_eq!(export(ptr, len, out.as_mut_ptr(), out.len()), -1);
+                    assert_eq!(out, [b'Z'; 1024]);
+                }
+                assert_eq!(
+                    export(input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                    -1
+                );
+                for (ptr, cap) in [
+                    (out.as_mut_ptr(), usize::MAX),
+                    ((usize::MAX - 1) as *mut u8, 8),
+                ] {
+                    assert_eq!(export(input.as_ptr(), input.len(), ptr, cap), -1);
+                    assert_eq!(out, [b'Z'; 1024]);
+                }
+                let mut overlap = vec![b'Z'; input.len() + 2048];
+                overlap[32..32 + input.len()].copy_from_slice(&input);
+                let original = overlap.clone();
+                for offset in [0, 32, 33, 32 + input.len() - 1] {
+                    assert_eq!(
+                        export(
+                            overlap.as_ptr().add(32),
+                            input.len(),
+                            overlap.as_mut_ptr().add(offset),
+                            1024
+                        ),
+                        -1
+                    );
+                    assert_eq!(overlap, original);
+                }
+                // Adjacent input/output spans are legal.
+                assert_eq!(
+                    export(
+                        overlap.as_ptr().add(32),
+                        input.len(),
+                        overlap.as_mut_ptr().add(32 + input.len()),
+                        1024
+                    ),
+                    needed as isize
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn w444_rejects_malformed_frames_and_non_string_entries() {
+        let mut deep = b"a:1:{i:0;".to_vec();
+        for _ in 0..130 {
+            deep.extend_from_slice(b"a:1:{i:0;");
+        }
+        deep.extend_from_slice(b"s:0:\"\";");
+        deep.extend(std::iter::repeat_n(b'}', 131));
+        for export in EXPORTS {
+            let mut out = [b'Z'; 1024];
+            for malformed in [
+                b"".as_slice(),
+                b"N;",
+                b"a:1:{i:0;",
+                b"a:999999999999999999999:{}",
+                b"a:1:{i:0;a:0:{}}trailing",
+                b"a:0:{}",
+                b"a:1:{i:1;a:0:{}}",
+                b"a:2:{i:0;a:0:{}i:1;a:0:{}}",
+                b"a:1:{i:0;N;}",
+                b"a:1:{i:0;a:1:{i:2;s:0:\"\";}}",
+                b"a:1:{i:0;a:1:{s:1:\"x\";s:0:\"\";}}",
+                b"a:1:{i:0;a:1:{i:0;N;}}",
+                b"a:1:{i:0;a:1:{i:0;i:5;}}",
+                b"a:1:{i:0;a:1:{i:0;a:0:{}}}",
+                b"a:1:{i:0;a:1:{i:0;s:5:\"x\";}}",
+                deep.as_slice(),
+            ] {
+                assert_eq!(
+                    unsafe {
+                        export(
+                            malformed.as_ptr(),
+                            malformed.len(),
+                            out.as_mut_ptr(),
+                            out.len(),
+                        )
+                    },
+                    -1,
+                    "{}",
+                    String::from_utf8_lossy(malformed)
+                );
+                assert_eq!(out, [b'Z'; 1024]);
+            }
+            let empty = output(export, &frame(&[]));
+            let doc = PhpSerParser::parse_document(&empty).unwrap();
+            assert!(doc.items().iter().all(|(_, v)| v.as_int() == Some(0)));
+        }
+    }
+}

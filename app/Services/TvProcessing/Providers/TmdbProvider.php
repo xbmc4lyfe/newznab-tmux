@@ -392,4 +392,159 @@ class TmdbProvider extends AbstractTvProvider
             'summary' => TmdbClient::getString($episode, 'overview'),
         ];
     }
+
+    /** Disabled: seven paired runs missed the 1.5x common p99 gate (min common mean 1.73x, p99 1.17x; uncommon mean 2.88x, p99 2.33x; see the W44 parity test). */
+    public const bool W444_RUST_FFI_DEFAULT = false;
+
+    public const string W444_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w444_tmdb_show_name_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private const array W444_SUMMARY_KEYS = ['total_names', 'empty_name_count', 'year_suffix_count', 'imdb_id_count', 'article_prefix_count', 'colon_count', 'parenthetical_count', 'non_ascii_count', 'numeric_count'];
+
+    private static ?bool $w444UseRustFfi = null;
+
+    private static FFI|false|null $w444Ffi = null;
+
+    /** Null restores the benchmark-qualified default. */
+    public static function useW444RustFfi(?bool $enable = true): void
+    {
+        self::$w444UseRustFfi = $enable;
+    }
+
+    public static function usesW444RustFfi(): bool
+    {
+        return self::$w444UseRustFfi ?? self::W444_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW444RustFfi(): void
+    {
+        self::$w444UseRustFfi = null;
+        self::$w444Ffi = null;
+    }
+
+    /**
+     * Summarize TMDB show names as getShowInfo()/formatShowInfo() see them:
+     * the " (19xx|20xx)" suffix getShowInfo() strips, a trailing tt\d{6,} IMDB
+     * id, a leading the/a/an article, colons, parentheses, non-ASCII bytes and
+     * digits. Entries come from strings, integers, or the name, original_name
+     * or title field; other values count as empty.
+     *
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeTmdbShowNameBatch(array $entries): array
+    {
+        return self::usesW444RustFfi()
+            ? self::summarizeTmdbShowNameBatchNative($entries)
+            : self::summarizeTmdbShowNameBatchPhp($entries);
+    }
+
+    /**
+     * Rust summary; falls back to PHP when the library or input frame is unusable.
+     *
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeTmdbShowNameBatchNative(array $entries): array
+    {
+        return self::w444Call(self::w444Entries($entries)) ?? self::summarizeTmdbShowNameBatchPhp($entries);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeTmdbShowNameBatchPhp(array $entries): array
+    {
+        $summary = array_fill_keys(self::W444_SUMMARY_KEYS, 0);
+        foreach (self::w444Entries($entries) as $name) {
+            $summary['total_names']++;
+            $name = trim($name);
+            if ($name === '') {
+                $summary['empty_name_count']++;
+
+                continue;
+            }
+            $summary['year_suffix_count'] += (int) (preg_match('# \((?:19|20)\d{2}\)$#', $name) === 1);
+            $summary['imdb_id_count'] += (int) (preg_match('/tt\d{6,}$/i', $name) === 1);
+            $summary['article_prefix_count'] += (int) (preg_match('/^(?:the|a|an)\s/i', $name) === 1);
+            $summary['colon_count'] += (int) str_contains($name, ':');
+            $summary['parenthetical_count'] += (int) str_contains($name, '(');
+            $summary['non_ascii_count'] += (int) (preg_match('/[\x80-\xFF]/', $name) === 1);
+            $summary['numeric_count'] += (int) (strpbrk($name, '0123456789') !== false);
+        }
+
+        return $summary;
+    }
+
+    /** Only integer and string entries participate; objects are never cast or serialized.
+     *
+     * @param  array<array-key, mixed>  $input
+     * @return list<string>
+     */
+    private static function w444Entries(array $input): array
+    {
+        $entries = [];
+        foreach ($input as $item) {
+            if (is_array($item)) {
+                $item = $item['name'] ?? $item['original_name'] ?? $item['title'] ?? null;
+            }
+            $entries[] = is_string($item) || is_int($item) ? (string) $item : '';
+        }
+
+        return $entries;
+    }
+
+    /** @param list<string> $entries
+     * @return array<string, int>|null
+     */
+    private static function w444Call(array $entries): ?array
+    {
+        try {
+            $input = serialize([$entries]);
+            if (strlen($input) > 16777216) {
+                return null;
+            }
+            self::$w444Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w444', self::W444_FFI_CDEF) ?? false;
+            $ffi = self::$w444Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            $capacity = 0;
+            $out = RustPipelineLibrary::obtainScratch($ffi, 2048, $capacity);
+            if ($out === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound (Declared by W444_FFI_CDEF.)
+            $written = $ffi->nntmux_w444_tmdb_show_name_batch($input, strlen($input), $out, $capacity);
+            if (is_int($written) && $written < -1 && $written >= -16777216) {
+                $out = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($out === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound (Declared by W444_FFI_CDEF.)
+                $written = $ffi->nntmux_w444_tmdb_show_name_batch($input, strlen($input), $out, $capacity);
+            }
+            if (! is_int($written) || $written <= 0 || $written > $capacity || $written > 16777216) {
+                return null;
+            }
+            $result = @unserialize(FFI::string($out, $written), ['allowed_classes' => false]);
+            if (! is_array($result) || array_keys($result) !== self::W444_SUMMARY_KEYS || $result['total_names'] !== count($entries)) {
+                return null;
+            }
+            $summary = [];
+            foreach (self::W444_SUMMARY_KEYS as $key) {
+                $value = $result[$key];
+                if (! is_int($value) || $value < 0 || $value > count($entries)) {
+                    return null;
+                }
+                $summary[$key] = $value;
+            }
+
+            return $summary;
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }
