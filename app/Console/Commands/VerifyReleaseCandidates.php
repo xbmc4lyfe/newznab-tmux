@@ -6,6 +6,7 @@ namespace App\Console\Commands;
 
 use App\Services\NNTP\NNTPService;
 use App\Services\Releases\Verification\AuditReleaseDeletion;
+use App\Services\Releases\Verification\CandidatePreparationService;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\CandidateSampleBatch;
 use App\Services\Releases\Verification\LeaseHeartbeat;
@@ -31,9 +32,87 @@ use Throwable;
 
 class VerifyReleaseCandidates extends Command
 {
+    public const string FFI_CDEF = CandidatePreparationService::FFI_CDEF;
+
+    /** Scratch records one terminal-cleanup pass reads. */
+    private const int TERMINAL_SCRATCH_PAGE = 100;
+
+    /** Rust stays opt-in: the FFI round trip is slower than this PHP helper (< 1.5x). */
+    private const bool RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useRustFfi = null;
+
     protected $signature = 'releases:verify-candidates {--limit=1 : Maximum candidates in this run} {--slot=0 : Worker slot; zero selects a free slot} {--max-seconds=0 : Stop claiming after this duration; finish the active candidate} {--no-summary : Skip global candidate status counts} {--diagnostics : Log bounded natural verification run counters and timings}';
 
     protected $description = 'Spot check bounded articles before publishing complete candidate NZBs';
+
+    public static function setUseRustFfi(?bool $use): void
+    {
+        self::$useRustFfi = $use;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? self::RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * The terminal-scratch checkpoint after a pass that began at $decodedCursor: the last processed record and
+     * the pass's ceiling (the host's highest scratch ID when the cursor had none), or zeros once a short page
+     * that was not cut off, or the ceiling itself, shows the inventory was scanned through.
+     *
+     * @param  array<array-key, mixed>|null  $decodedCursor
+     * @return array{after: int, ceiling: int}
+     */
+    public static function normalizeScratchCursor(?array $decodedCursor, int $maxHostScratchId, bool $exhausted, int $fetchedCount, int $lastProcessedId): array
+    {
+        return self::usesRustFfi()
+            ? self::normalizeScratchCursorNative($decodedCursor, $maxHostScratchId, $exhausted, $fetchedCount, $lastProcessedId)
+            : self::normalizeScratchCursorPhp($decodedCursor, $maxHostScratchId, $exhausted, $fetchedCount, $lastProcessedId);
+    }
+
+    /**
+     * @param  array<array-key, mixed>|null  $decodedCursor
+     * @return array{after: int, ceiling: int}
+     */
+    public static function normalizeScratchCursorPhp(?array $decodedCursor, int $maxHostScratchId, bool $exhausted, int $fetchedCount, int $lastProcessedId): array
+    {
+        $after = max(0, self::cursorField($decodedCursor, 'after'), $lastProcessedId);
+        $ceiling = max(0, self::cursorField($decodedCursor, 'ceiling'));
+        if ($ceiling === 0) {
+            $ceiling = $maxHostScratchId;
+        }
+        if ((! $exhausted && $fetchedCount < self::TERMINAL_SCRATCH_PAGE) || $after >= $ceiling) {
+            return ['after' => 0, 'ceiling' => 0];
+        }
+
+        return ['after' => $after, 'ceiling' => $ceiling];
+    }
+
+    /**
+     * @param  array<array-key, mixed>|null  $decodedCursor
+     * @return array{after: int, ceiling: int}
+     */
+    public static function normalizeScratchCursorNative(?array $decodedCursor, int $maxHostScratchId, bool $exhausted, int $fetchedCount, int $lastProcessedId): array
+    {
+        // PHP's own (int) casts of the decoded values cross the boundary; Rust applies the bounds and reset.
+        $result = CandidatePreparationService::evaluateNative(2, pack('q6', self::cursorField($decodedCursor, 'after'), self::cursorField($decodedCursor, 'ceiling'),
+            $maxHostScratchId, (int) $exhausted, $fetchedCount, $lastProcessedId));
+        if ($result !== null && \strlen($result) === 16) {
+            $slots = array_values(unpack('q2', $result) ?: []);
+            if (\count($slots) === 2 && \is_int($slots[0]) && \is_int($slots[1])) {
+                return ['after' => $slots[0], 'ceiling' => $slots[1]];
+            }
+        }
+
+        return self::normalizeScratchCursorPhp($decodedCursor, $maxHostScratchId, $exhausted, $fetchedCount, $lastProcessedId);
+    }
+
+    /** @param array<array-key, mixed>|null $cursor */
+    private static function cursorField(?array $cursor, string $key): int
+    {
+        return (int) ($cursor[$key] ?? 0);
+    }
 
     public function handle(CandidateRepository $repository, ManifestStore $store, VerifiedReleasePublisher $publisher, ScratchInventory $scratchInventory, ScratchBudget $scratchBudget): int
     {
@@ -323,7 +402,7 @@ class VerifyReleaseCandidates extends Command
         // Another host's directories are not here; only their owner can prove them absent.
         $entries = DB::table('release_verification_scratch')->where('host', ScratchInventory::host())
             ->where('id', '>', $after)->where('id', '<=', $ceiling)
-            ->orderBy('id')->limit(100)->get();
+            ->orderBy('id')->limit(self::TERMINAL_SCRATCH_PAGE)->get();
         if ($entries->isEmpty() && $ceiling === 0) {
             return;
         }
@@ -387,10 +466,8 @@ class VerifyReleaseCandidates extends Command
                 $locks->releaseCandidate();
             }
         }
-        if ((! $exhausted && $entries->count() < 100) || $after >= $ceiling) {
-            $after = 0;
-            $ceiling = 0;
-        }
+        // $after only advanced past the cursor's, and $ceiling is the cursor's or the host's highest ID.
+        ['after' => $after, 'ceiling' => $ceiling] = self::normalizeScratchCursor(\is_array($cursor) ? $cursor : null, $ceiling, $exhausted, $entries->count(), $after);
         $checkpoint = json_encode(['after' => $after, 'ceiling' => $ceiling], JSON_THROW_ON_ERROR);
         if (file_put_contents($cursorPath.'.tmp', $checkpoint, LOCK_EX) === false || ! rename($cursorPath.'.tmp', $cursorPath)) {
             throw new RuntimeException('Cannot checkpoint terminal scratch cleanup.');

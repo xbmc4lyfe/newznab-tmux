@@ -16,6 +16,22 @@ use Throwable;
 /** One preparation run's UPDATE cache; session settings and binding values stay caller-owned. */
 final class PreparedCandidateUpdate
 {
+    public const string FFI_CDEF = CandidatePreparationService::FFI_CDEF;
+
+    /** Update shapes: status and header flag only (a ready promotion). */
+    public const int SHAPE_STATUS = 0;
+
+    /** Bit: the update also stores a diagnostic reason. */
+    public const int SHAPE_REASON = 1;
+
+    /** Bit: the update also schedules the next attempt. */
+    public const int SHAPE_RETRY = 2;
+
+    /** Rust stays opt-in: the FFI round trip is slower than this PHP helper (< 1.5x). */
+    private const bool RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useRustFfi = null;
+
     private static ?Closure $macro = null;
 
     private ?PDO $pdo = null;
@@ -32,6 +48,40 @@ final class PreparedCandidateUpdate
     public function __construct(private readonly Connection $connection)
     {
         self::registerMacro();
+    }
+
+    public static function setUseRustFfi(?bool $use): void
+    {
+        self::$useRustFfi = $use;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? self::RUST_FFI_DEFAULT;
+    }
+
+    /** The SHAPE_* bits of one candidate update's optional columns. */
+    public static function classifyUpdateShape(bool $hasReason, bool $hasNextAttempt): int
+    {
+        return self::usesRustFfi() ? self::classifyUpdateShapeNative($hasReason, $hasNextAttempt) : self::classifyUpdateShapePhp($hasReason, $hasNextAttempt);
+    }
+
+    public static function classifyUpdateShapePhp(bool $hasReason, bool $hasNextAttempt): int
+    {
+        return ($hasReason ? self::SHAPE_REASON : 0) | ($hasNextAttempt ? self::SHAPE_RETRY : 0);
+    }
+
+    public static function classifyUpdateShapeNative(bool $hasReason, bool $hasNextAttempt): int
+    {
+        $result = CandidatePreparationService::evaluateNative(4, pack('q2', (int) $hasReason, (int) $hasNextAttempt));
+        if ($result !== null && \strlen($result) === 8) {
+            $shape = unpack('q', $result)[1] ?? null;
+            if (\is_int($shape) && $shape >= 0 && $shape <= (self::SHAPE_REASON | self::SHAPE_RETRY)) {
+                return $shape;
+            }
+        }
+
+        return self::classifyUpdateShapePhp($hasReason, $hasNextAttempt);
     }
 
     /** @param array<string, mixed> $values */
