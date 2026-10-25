@@ -37866,3 +37866,899 @@ pub mod wave50_2_verification_db_lock_dirty_fetched_file_lock_heartbeat {
         }
     }
 }
+
+pub mod wave51_2_verification_manifest_nntp_reader_deferrals_payload {
+    //! Wave 51.2 batch kernels for ManifestStore, NntpArticleSource, NzbManifestReader,
+    //! OversizedCollectionDeferrals and PayloadVerifier, in the Wave 49.2 framing: NUL-joined
+    //! string columns (exactly `count` entries), little-endian `i64` tables, fixed `i64` words
+    //! per item, a few summary words and one XXH64 digest of the preceding words. Each export
+    //! returns the word count, `-needed` when `out_cap` (in words) is short, or -1 for a null
+    //! output, a malformed batch or a panic.
+
+    use super::wave49_verification_admission_inventory_prep_repo_sample::{
+        FoldState, column, crc32, emit, ints, span,
+    };
+    use std::collections::HashSet;
+
+    type Set<T> = HashSet<T, FoldState>;
+
+    fn set<T>(n: usize) -> Set<T> {
+        HashSet::with_capacity_and_hasher(n, FoldState::default())
+    }
+
+    /// `flags | min(len, 0xFFFF) << 8 | crc32(bytes) << 32`.
+    #[inline]
+    fn tagged(flags: i64, bytes: &[u8]) -> i64 {
+        flags | (bytes.len().min(0xFFFF) as i64) << 8 | i64::from(crc32(bytes)) << 32
+    }
+
+    // ---- ManifestStore -----------------------------------------------------------------------
+
+    /// ManifestStore::assertNamePhp(): `/\A[0-9a-f]{64}\.json\.gz\z/`.
+    pub fn manifest_name(name: &[u8]) -> bool {
+        name.len() == 72
+            && name[64..] == *b".json.gz"
+            && name[..64]
+                .iter()
+                .fold(true, |ok, &b| ok & matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }
+
+    /// One word per manifest reference (`flags | min(len, 0xFFFF) << 8 | crc32(name) << 32`),
+    /// then valid, repeated and admitted counts, admitted bytes and the exceeded index (-1 for
+    /// none). Flags: 1 valid name, 2 repeated name, 4 non-positive size, 8 admitted, 16 first
+    /// refusal. Valid first occurrences with a positive size are admitted in order against
+    /// max(0, budget) until one no longer fits, which closes admission for the rest.
+    pub fn import_plan(names: &[&[u8]], sizes: &[i64], max_total: i64) -> Vec<i64> {
+        let n = names.len();
+        let mut out = Vec::with_capacity(n + 6);
+        let mut seen: Set<&[u8]> = set(n);
+        let budget = max_total.max(0);
+        let (mut valid, mut repeated, mut admitted, mut bytes, mut exceeded) =
+            (0i64, 0i64, 0i64, 0i64, -1i64);
+        for (i, (&name, &size)) in names.iter().zip(sizes).enumerate() {
+            let mut flags = i64::from(manifest_name(name));
+            valid += flags;
+            if !seen.insert(name) {
+                flags |= 2;
+                repeated += 1;
+            }
+            if size <= 0 {
+                flags |= 4;
+            } else if flags & 3 == 1 && exceeded < 0 {
+                // `bytes` never exceeds `budget`, so the difference cannot overflow.
+                if size <= budget - bytes {
+                    bytes += size;
+                    admitted += 1;
+                    flags |= 8;
+                } else {
+                    exceeded = i as i64;
+                    flags |= 16;
+                }
+            }
+            out.push(tagged(flags, name));
+        }
+        out.extend([valid, repeated, admitted, bytes, exceeded]);
+        out
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_w512_manifest_import_plan_batch(
+        names: *const u8,
+        names_len: usize,
+        sizes: *const u8,
+        sizes_len: usize,
+        count: usize,
+        max_total_bytes: i64,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(names, names_len), (sizes, sizes_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let names = column(span(names, names_len)?, count)?;
+                let sizes = ints(span(sizes, sizes_len)?, count)?;
+                Some(import_plan(&names, &sizes, max_total_bytes))
+            })
+        }
+    }
+
+    // ---- NntpArticleSource -------------------------------------------------------------------
+
+    /// PHP `trim($id, '<>')`.
+    pub fn trim_angles(id: &[u8]) -> &[u8] {
+        let angle = |b: &u8| matches!(b, b'<' | b'>');
+        let start = id.iter().position(|b| !angle(b)).unwrap_or(id.len());
+        let end = id.iter().rposition(|b| !angle(b)).map_or(start, |e| e + 1);
+        &id[start..end]
+    }
+
+    /// NNTPService::verificationMessageId(): `/\A[^\s<>\x00-\x1f\x7f]+\z/D` in the C locale.
+    fn id_bytes_ok(id: &[u8]) -> bool {
+        id.iter().fold(true, |ok, &b| {
+            ok & (b > 0x20 && b != 0x7f && b != b'<' && b != b'>')
+        })
+    }
+
+    /// One word per requested id (`flags | min(len, 0xFFFF) << 8 | batch << 24 | crc32(id) << 32`
+    /// over the trimmed id), then valid and unique counts, the prefetch connection count and
+    /// window and the first invalid index (-1 for none). Flags: 1 valid, 2 brackets trimmed,
+    /// 4 repeated valid id, 8 empty after trimming, 16 prefetched (first valid occurrence, its
+    /// connection batch in bits 24-31). Sizing follows NntpArticleSource::prefetchSizingPhp()
+    /// over the unique ids; no ids means no connections and a zero window.
+    pub fn prefetch_plan(ids: &[&[u8]], maximum_bytes: i64, connections: i64) -> Vec<i64> {
+        let n = ids.len();
+        let mut out = Vec::with_capacity(n + 6);
+        let mut seen: Set<&[u8]> = set(n);
+        let mut assigned = Vec::with_capacity(n);
+        let (mut valid, mut first_invalid) = (0i64, -1i64);
+        for (i, &raw) in ids.iter().enumerate() {
+            let id = trim_angles(raw);
+            let mut flags = i64::from(id.len() != raw.len()) << 1 | i64::from(id.is_empty()) << 3;
+            if maximum_bytes >= 1 && !id.is_empty() && id_bytes_ok(id) {
+                flags |= 1;
+                valid += 1;
+                if seen.insert(id) {
+                    flags |= 16;
+                    assigned.push(i);
+                } else {
+                    flags |= 4;
+                }
+            } else if first_invalid < 0 {
+                first_invalid = i as i64;
+            }
+            out.push(tagged(flags, id));
+        }
+        let unique = assigned.len() as i64;
+        let (conns, window) = if unique == 0 {
+            (0, 0)
+        } else {
+            let c = unique.min(connections.clamp(1, 8));
+            (c, (unique + c - 1) / c)
+        };
+        for (u, &row) in assigned.iter().enumerate() {
+            out[row] |= (u as i64 / window) << 24;
+        }
+        out.extend([valid, unique, conns, window, first_invalid]);
+        out
+    }
+
+    /// # Safety
+    /// `ids` must be readable for `ids_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w512_article_prefetch_plan_batch(
+        ids: *const u8,
+        ids_len: usize,
+        count: usize,
+        maximum_bytes: i64,
+        connections: i64,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(ids, ids_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let ids = column(span(ids, ids_len)?, count)?;
+                Some(prefetch_plan(&ids, maximum_bytes, connections))
+            })
+        }
+    }
+
+    // ---- NzbManifestReader -------------------------------------------------------------------
+
+    /// PCRE `\s` with the default (C) tables.
+    #[inline]
+    fn ws(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
+    }
+
+    /// PHP `(int)` of an ASCII digit run: finite overflow clamps to PHP_INT_MAX, while a run
+    /// that overflows a double to infinity converts to zero.
+    pub fn decimal(digits: &[u8]) -> i64 {
+        if digits.len() >= 309
+            && std::str::from_utf8(digits)
+                .ok()
+                .and_then(|text| text.parse::<f64>().ok())
+                .is_some_and(f64::is_infinite)
+        {
+            return 0;
+        }
+        digits.iter().fold(0i64, |n, &d| {
+            n.saturating_mul(10).saturating_add(i64::from(d - b'0'))
+        })
+    }
+
+    /// The trailing `\s*\(\d+\/(\d+)\)\s*$` counter: where it starts (with its preceding
+    /// whitespace) and its total.
+    pub fn part_suffix(subject: &[u8]) -> Option<(usize, i64)> {
+        let mut end = subject.len();
+        while end > 0 && ws(subject[end - 1]) {
+            end -= 1;
+        }
+        if end == 0 || subject[end - 1] != b')' {
+            return None;
+        }
+        let total_end = end - 1;
+        let mut pos = total_end;
+        while pos > 0 && subject[pos - 1].is_ascii_digit() {
+            pos -= 1;
+        }
+        if pos == total_end || pos == 0 || subject[pos - 1] != b'/' {
+            return None;
+        }
+        let total = decimal(&subject[pos..total_end]);
+        pos -= 1;
+        let index_end = pos;
+        while pos > 0 && subject[pos - 1].is_ascii_digit() {
+            pos -= 1;
+        }
+        if pos == index_end || pos == 0 || subject[pos - 1] != b'(' {
+            return None;
+        }
+        pos -= 1;
+        while pos > 0 && ws(subject[pos - 1]) {
+            pos -= 1;
+        }
+        Some((pos, total))
+    }
+
+    /// NzbManifestReader::declaredFileCount().
+    pub fn declared_count(subject: &[u8]) -> i64 {
+        // Complete same-quote spans are removed; a span never crosses CR or LF.
+        let mut outside = Vec::with_capacity(subject.len());
+        let mut pos = 0;
+        while pos < subject.len() {
+            let quote = subject[pos];
+            if matches!(quote, b'\'' | b'"') {
+                let close = subject[pos + 1..]
+                    .iter()
+                    .position(|&b| b == quote || matches!(b, b'\r' | b'\n'));
+                if let Some(at) = close
+                    && subject[pos + 1 + at] == quote
+                {
+                    pos += at + 2;
+                    continue;
+                }
+            }
+            outside.push(quote);
+            pos += 1;
+        }
+        let end = part_suffix(&outside).map_or(outside.len(), |(start, _)| start);
+        let bytes = &outside[..end];
+        let mut expected = 0;
+        pos = 0;
+        while pos < bytes.len() {
+            if !matches!(bytes[pos], b'[' | b'(') || (pos > 0 && !ws(bytes[pos - 1])) {
+                pos += 1;
+                continue;
+            }
+            let index_start = pos + 1;
+            let mut cursor = index_start;
+            while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+                cursor += 1;
+            }
+            if cursor == index_start || bytes.get(cursor) != Some(&b'/') {
+                pos += 1;
+                continue;
+            }
+            let index = decimal(&bytes[index_start..cursor]);
+            cursor += 1;
+            let total_start = cursor;
+            while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+                cursor += 1;
+            }
+            if cursor > total_start
+                && bytes.get(cursor).is_some_and(|b| matches!(b, b']' | b')'))
+                && (cursor + 1 == bytes.len() || ws(bytes[cursor + 1]))
+            {
+                let total = decimal(&bytes[total_start..cursor]);
+                if total > 0 && index <= total {
+                    expected = expected.max(total);
+                }
+                pos = cursor + 1;
+            } else {
+                pos += 1;
+            }
+        }
+        expected
+    }
+
+    /// Three words per file subject: its declared file count, its trailing part total (-1 for
+    /// none), then `repeated | min(len, 0x7FFFFFFF) << 1 | crc32(stem) << 32` over the subject
+    /// without its trailing counter. The batch's largest declared count, the number of subjects
+    /// with a counter and the repeated count follow.
+    pub fn subjects(subjects: &[&[u8]]) -> Vec<i64> {
+        let n = subjects.len();
+        let mut out = Vec::with_capacity(n * 3 + 4);
+        let mut seen: Set<&[u8]> = set(n);
+        let (mut expected, mut suffixed, mut repeated) = (0i64, 0i64, 0i64);
+        for &subject in subjects {
+            let declared = declared_count(subject);
+            expected = expected.max(declared);
+            let (stem, parts) = match part_suffix(subject) {
+                Some((start, total)) => {
+                    suffixed += 1;
+                    (&subject[..start], total)
+                }
+                None => (subject, -1),
+            };
+            let again = !seen.insert(subject);
+            repeated += i64::from(again);
+            out.extend([
+                declared,
+                parts,
+                i64::from(again)
+                    | (stem.len().min(0x7FFF_FFFF) as i64) << 1
+                    | i64::from(crc32(stem)) << 32,
+            ]);
+        }
+        out.extend([expected, suffixed, repeated]);
+        out
+    }
+
+    /// # Safety
+    /// `subjects` must be readable for `subjects_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w512_nzb_subject_batch(
+        subjects: *const u8,
+        subjects_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(subjects, subjects_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let rows = column(span(subjects, subjects_len)?, count)?;
+                Some(self::subjects(&rows))
+            })
+        }
+    }
+
+    // ---- OversizedCollectionDeferrals --------------------------------------------------------
+
+    pub const FIRST_BACKOFF_SECONDS: i64 = 21_600;
+    pub const MAX_BACKOFF_SECONDS: i64 = 604_800;
+
+    /// Columns of deferral records with each id's current collection hash (empty when the
+    /// collection is gone).
+    pub struct Deferrals<'a> {
+        pub ids: &'a [i64],
+        pub budgets: &'a [i64],
+        pub attempts: &'a [i64],
+        pub current: &'a [&'a [u8]],
+        pub recorded: &'a [&'a [u8]],
+        pub retry_after: &'a [&'a [u8]],
+    }
+
+    /// Two words per record (`flags | crc32(recorded hash) << 32`, then the backoff seconds a
+    /// new over-budget failure would record), then deferred, unlocked, stale and repeated
+    /// counts. Flags: 1 current hash matches, 2 recorded budget at least the current one,
+    /// 4 retry_after later than now (bytewise), 8 still deferred (1, 2 and 4), 16 unlocked by
+    /// a raised budget, 32 stale (dropped as archived, deleted or replaced), 64 repeated id,
+    /// 128 same hash and budget (the attempt count continues; negative counts read as zero).
+    pub fn deferrals(rows: &Deferrals<'_>, budget: i64, now: &[u8]) -> Vec<i64> {
+        let n = rows.ids.len();
+        let mut out = Vec::with_capacity(n * 2 + 5);
+        let mut seen: Set<i64> = set(n);
+        let (mut deferred, mut unlocked, mut stale, mut repeated) = (0i64, 0i64, 0i64, 0i64);
+        for i in 0..n {
+            let (recorded, recorded_budget) = (rows.recorded[i], rows.budgets[i]);
+            let matches = !rows.current[i].is_empty() && rows.current[i] == recorded;
+            let mut flags = i64::from(matches)
+                | i64::from(recorded_budget >= budget) << 1
+                | i64::from(rows.retry_after[i] > now) << 2;
+            if flags & 7 == 7 {
+                flags |= 8;
+                deferred += 1;
+            }
+            if matches && recorded_budget < budget {
+                flags |= 16;
+                unlocked += 1;
+            }
+            if !matches {
+                flags |= 32;
+                stale += 1;
+            }
+            if !seen.insert(rows.ids[i]) {
+                flags |= 64;
+                repeated += 1;
+            }
+            let same = matches && recorded_budget == budget;
+            let exponent = if same {
+                flags |= 128;
+                rows.attempts[i].clamp(0, 10)
+            } else {
+                0
+            };
+            out.push(flags | i64::from(crc32(recorded)) << 32);
+            out.push((FIRST_BACKOFF_SECONDS << exponent).min(MAX_BACKOFF_SECONDS));
+        }
+        out.extend([deferred, unlocked, stale, repeated]);
+        out
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    /// `ints` holds the id, recorded budget and attempt columns and `strings` the current hash,
+    /// recorded hash and retry_after columns, `count` entries each.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_w512_oversized_deferral_batch(
+        ints_ptr: *const u8,
+        ints_len: usize,
+        strings: *const u8,
+        strings_len: usize,
+        count: usize,
+        budget: i64,
+        now: *const u8,
+        now_len: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(ints_ptr, ints_len), (strings, strings_len), (now, now_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let table = ints(span(ints_ptr, ints_len)?, count.checked_mul(3)?)?;
+                let columns = column(span(strings, strings_len)?, count.checked_mul(3)?)?;
+                let now = span(now, now_len)?;
+                let rows = Deferrals {
+                    ids: &table[..count],
+                    budgets: &table[count..2 * count],
+                    attempts: &table[2 * count..],
+                    current: &columns[..count],
+                    recorded: &columns[count..2 * count],
+                    retry_after: &columns[2 * count..],
+                };
+                Some(deferrals(&rows, budget, now))
+            })
+        }
+    }
+
+    // ---- PayloadVerifier ---------------------------------------------------------------------
+
+    /// PayloadVerifier::requiredNamePhp() with the name's position: whether `/"([^"\r\n]+)"/`
+    /// matched, the name's byte range and whether it is a safe required name.
+    pub fn required_name(subject: &[u8]) -> (bool, usize, usize, bool) {
+        let (mut quoted, mut start, mut end) = (false, 0, subject.len());
+        for (at, &b) in subject.iter().enumerate() {
+            if b != b'"' {
+                continue;
+            }
+            let rest = &subject[at + 1..];
+            if let Some(close) = rest.iter().position(|b| matches!(b, b'"' | b'\r' | b'\n'))
+                && close > 0
+                && rest[close] == b'"'
+            {
+                (quoted, start, end) = (true, at + 1, at + 1 + close);
+                break;
+            }
+        }
+        let name = &subject[start..end];
+        let valid = !name.is_empty()
+            && !matches!(name[0], b'.' | b'-')
+            && !name
+                .iter()
+                .any(|&b| b < 32 || matches!(b, 127 | b'/' | b'\\' | b'[' | b']'))
+            && !name.windows(4).any(|w| w.eq_ignore_ascii_case(b"yenc"));
+        (quoted, start, end, valid)
+    }
+
+    /// PayloadVerifier::validPar2FilenamePhp().
+    pub fn par2_filename(name: &[u8]) -> bool {
+        !name.is_empty()
+            && name.len() <= 200
+            && !matches!(name[0], b'.' | b'-')
+            && !name
+                .iter()
+                .any(|&b| b < 32 || matches!(b, 127 | b'/' | b'\\'))
+            && std::str::from_utf8(name).is_ok()
+    }
+
+    /// Two words per subject (`flags | min(len, 0xFFFF) << 8 | crc32(name) << 32` over the
+    /// required name, or an empty one when unsafe, then the name's byte offset or -1), then
+    /// valid, PAR2-safe, repeated and `.par2` counts. Flags: 1 quoted name, 2 safe required
+    /// name, 4 also a safe PAR2 filename, 8 repeated required name, 16 `.par2` suffix (any case).
+    pub fn required_names(subjects: &[&[u8]]) -> Vec<i64> {
+        let n = subjects.len();
+        let mut out = Vec::with_capacity(n * 2 + 5);
+        let mut seen: Set<&[u8]> = set(n);
+        let (mut valid, mut par2, mut repeated, mut suffixed) = (0i64, 0i64, 0i64, 0i64);
+        for &subject in subjects {
+            let (quoted, start, end, safe) = required_name(subject);
+            let mut flags = i64::from(quoted);
+            if !safe {
+                out.extend([flags, -1]);
+                continue;
+            }
+            let name = &subject[start..end];
+            flags |= 2;
+            valid += 1;
+            if par2_filename(name) {
+                flags |= 4;
+                par2 += 1;
+            }
+            if !seen.insert(name) {
+                flags |= 8;
+                repeated += 1;
+            }
+            if name.len() >= 5 && name[name.len() - 5..].eq_ignore_ascii_case(b".par2") {
+                flags |= 16;
+                suffixed += 1;
+            }
+            out.extend([tagged(flags, name), start as i64]);
+        }
+        out.extend([valid, par2, repeated, suffixed]);
+        out
+    }
+
+    /// # Safety
+    /// `subjects` must be readable for `subjects_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w512_payload_required_name_batch(
+        subjects: *const u8,
+        subjects_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(subjects, subjects_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let rows = column(span(subjects, subjects_len)?, count)?;
+                Some(required_names(&rows))
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::wave49_verification_admission_inventory_prep_repo_sample::digest;
+        use super::*;
+
+        fn p(values: &[i64]) -> Vec<u8> {
+            values.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+
+        fn run(call: impl Fn(*mut i64, usize) -> isize) -> Vec<i64> {
+            let mut out = vec![0i64; 512];
+            let written = call(out.as_mut_ptr(), out.len());
+            assert!(written > 0, "export refused the batch: {written}");
+            out.truncate(written as usize);
+            assert_eq!(out[out.len() - 1], digest(&out[..out.len() - 1]));
+            out.pop();
+            out
+        }
+
+        fn hash(seed: u8) -> Vec<u8> {
+            let mut name: Vec<u8> = (0..64)
+                .map(|i| b"0123456789abcdef"[(usize::from(seed) * 7 + i) % 16])
+                .collect();
+            name.extend_from_slice(b".json.gz");
+            name
+        }
+
+        #[test]
+        fn w512_helpers_match_php() {
+            assert!(manifest_name(&hash(1)));
+            let mut upper = hash(1);
+            upper[0] = b'A';
+            assert!(!manifest_name(&upper));
+            assert!(!manifest_name(&hash(1)[..71]));
+            assert_eq!(trim_angles(b"<<a@b>>"), b"a@b");
+            assert_eq!(trim_angles(b"<>"), b"");
+            assert_eq!(trim_angles(b"a<b"), b"a<b");
+            assert_eq!(decimal(b"0009"), 9);
+            assert_eq!(decimal(b"99999999999999999999"), i64::MAX);
+            assert_eq!(decimal(&[b'9'; 400]), 0);
+            assert_eq!(decimal(&[b'9'; 308]), i64::MAX);
+            assert_eq!(part_suffix(b"a (1/5) \n"), Some((1, 5)));
+            assert_eq!(part_suffix(b"(1/5)"), Some((0, 5)));
+            assert_eq!(part_suffix(b"a(/5)"), None);
+            assert_eq!(declared_count(b"[01/12] \"x [1/99].rar\" yEnc (1/5)"), 12);
+            assert_eq!(declared_count(b"x [3/2] (4/7)"), 0);
+            assert_eq!(declared_count(b"x(1/3) [2/4]"), 4);
+            assert_eq!(declared_count(b"\"open [1/9]"), 9);
+            assert_eq!(declared_count(b"'a\n' [1/6]"), 6);
+            assert_eq!(required_name(b"[1/2] \"a.rar\" yEnc"), (true, 7, 12, true));
+            assert_eq!(required_name(b"\"\" \"x\""), (true, 2, 3, true));
+            assert_eq!(required_name(b"\"a\nb\" \".x\""), (true, 5, 6, true));
+            assert!(!required_name(b"plain yenc").3);
+            assert!(required_name(b"plain.bin").3);
+            assert!(par2_filename(b"a.par2"));
+            assert!(!par2_filename(&[b'a'; 201]));
+            assert!(!par2_filename(b"\xff.par2"));
+        }
+
+        #[test]
+        fn w512_import_plan_admits_in_order() {
+            let (a, b, c, d, e) = (hash(1), hash(2), hash(3), hash(4), hash(5));
+            let names: Vec<&[u8]> = vec![&a, &b, &a, b"bad", &c, &d, &e];
+            let w = import_plan(&names, &[10, 0, 5, 7, 20, 3, 1], 25);
+            let flags: Vec<i64> = w[..7].iter().map(|x| x & 0xFF).collect();
+            assert_eq!(flags, [9, 5, 3, 0, 17, 1, 1]);
+            assert_eq!((w[0] >> 8) & 0xFFFF, 72);
+            assert_eq!(w[0] >> 32 & 0xFFFF_FFFF, i64::from(crc32(&a)));
+            assert_eq!(&w[7..], [6, 1, 1, 10, 4]);
+            let negative = import_plan(&[&a], &[1], -5);
+            assert_eq!(&negative[1..], [1, 0, 0, 0, 0]);
+            assert_eq!(negative[0] & 0xFF, 17);
+        }
+
+        #[test]
+        fn w512_prefetch_plan_assigns_batches() {
+            let ids: Vec<&[u8]> = vec![b"<a@x>", b"b@x", b"a@x", b"<>", b"c d", b"c@x", b"d@x"];
+            let w = prefetch_plan(&ids, 100, 3);
+            let flags: Vec<i64> = w[..7].iter().map(|x| x & 0xFF).collect();
+            assert_eq!(flags, [19, 17, 5, 10, 0, 17, 17]);
+            let batches: Vec<i64> = w[..7].iter().map(|x| (x >> 24) & 0xFF).collect();
+            assert_eq!(batches, [0, 0, 0, 0, 0, 1, 1]);
+            assert_eq!(w[0] >> 32 & 0xFFFF_FFFF, i64::from(crc32(b"a@x")));
+            assert_eq!(&w[7..], [5, 4, 3, 2, 3]);
+            let none = prefetch_plan(&ids, 0, 3);
+            assert_eq!(&none[7..], [0, 0, 0, 0, 0]);
+        }
+
+        #[test]
+        fn w512_subjects_follow_reader() {
+            let rows: Vec<&[u8]> =
+                vec![b"[1/3] \"a.rar\" yEnc (1/50)", b"no counter", b"no counter"];
+            let w = subjects(&rows);
+            assert_eq!(&w[..2], [3, 50]);
+            assert_eq!(
+                w[2],
+                18 << 1 | i64::from(crc32(b"[1/3] \"a.rar\" yEnc")) << 32
+            );
+            assert_eq!(&w[3..5], [0, -1]);
+            assert_eq!(w[8] & 1, 1);
+            assert_eq!(&w[9..], [3, 1, 1]);
+        }
+
+        #[test]
+        fn w512_deferrals_classify_records() {
+            let current: Vec<&[u8]> = vec![b"h1", b"h2", b"", b"h4", b"h1"];
+            let recorded: Vec<&[u8]> = vec![b"h1", b"hx", b"", b"h4", b"h1"];
+            let retry: Vec<&[u8]> =
+                vec![b"2026-02", b"2026-02", b"2026-02", b"2025-12", b"2026-02"];
+            let rows = Deferrals {
+                ids: &[1, 2, 3, 4, 1],
+                budgets: &[100, 100, 100, 50, 100],
+                attempts: &[2, 0, 0, 99, -4],
+                current: &current,
+                recorded: &recorded,
+                retry_after: &retry,
+            };
+            let w = deferrals(&rows, 100, b"2026-01");
+            let flags: Vec<i64> = (0..5).map(|i| w[i * 2] & 0xFF).collect();
+            assert_eq!(flags, [15 | 128, 38, 38, 17, 15 | 64 | 128]);
+            let backoff: Vec<i64> = (0..5).map(|i| w[i * 2 + 1]).collect();
+            assert_eq!(backoff, [86_400, 21_600, 21_600, 21_600, 21_600]);
+            assert_eq!(w[0] >> 32 & 0xFFFF_FFFF, i64::from(crc32(b"h1")));
+            assert_eq!(&w[10..], [2, 1, 2, 1]);
+            let long = Deferrals {
+                attempts: &[9, 0, 0, 0, 0],
+                ..rows
+            };
+            assert_eq!(deferrals(&long, 100, b"2026-01")[1], MAX_BACKOFF_SECONDS);
+        }
+
+        #[test]
+        fn w512_required_names_flag_par2() {
+            let rows: Vec<&[u8]> = vec![
+                b"\"a.PAR2\" yEnc",
+                b"x [1/2] yEnc",
+                b"a.PAR2",
+                b"\"\xff.bin\"",
+            ];
+            let w = required_names(&rows);
+            assert_eq!(w[0] & 0xFF, 1 | 2 | 4 | 16);
+            assert_eq!(w[1], 1);
+            assert_eq!(&w[2..4], [0, -1]);
+            assert_eq!(w[4] & 0xFF, 2 | 4 | 8 | 16);
+            assert_eq!(w[5], 0);
+            assert_eq!(w[6] & 0xFF, 1 | 2);
+            assert_eq!(&w[8..], [3, 2, 1, 2]);
+        }
+
+        #[test]
+        fn w512_exports_round_trip_and_guard_inputs() {
+            let a = hash(1);
+            let mut names = a.clone();
+            names.extend_from_slice(b"\0bad");
+            let sizes = p(&[4, 5]);
+            let w = run(|o, c| unsafe {
+                nntmux_w512_manifest_import_plan_batch(
+                    names.as_ptr(),
+                    names.len(),
+                    sizes.as_ptr(),
+                    16,
+                    2,
+                    100,
+                    o,
+                    c,
+                )
+            });
+            assert_eq!(w, import_plan(&[&a, b"bad"], &[4, 5], 100));
+            let ids = b"<a@x>\0b@x";
+            let w = run(|o, c| unsafe {
+                nntmux_w512_article_prefetch_plan_batch(ids.as_ptr(), ids.len(), 2, 9, 1, o, c)
+            });
+            assert_eq!(w, prefetch_plan(&[b"<a@x>", b"b@x"], 9, 1));
+            let subjects = b"a (1/2)\0b";
+            let w = run(|o, c| unsafe {
+                nntmux_w512_nzb_subject_batch(subjects.as_ptr(), subjects.len(), 2, o, c)
+            });
+            assert_eq!(w, self::subjects(&[b"a (1/2)", b"b"]));
+            let table = p(&[1, 2, 10, 10, 0, 1]);
+            let strings = b"h\0g\0h\0h\0z\0a";
+            let w = run(|o, c| unsafe {
+                nntmux_w512_oversized_deferral_batch(
+                    table.as_ptr(),
+                    48,
+                    strings.as_ptr(),
+                    strings.len(),
+                    2,
+                    10,
+                    b"m".as_ptr(),
+                    1,
+                    o,
+                    c,
+                )
+            });
+            assert_eq!(w.len(), 8);
+            assert_eq!(w[0] & 0xFF, 15 | 128);
+            let w = run(|o, c| unsafe {
+                nntmux_w512_payload_required_name_batch(b"\"a\"".as_ptr(), 3, 1, o, c)
+            });
+            assert_eq!(w, required_names(&[b"\"a\""]));
+
+            let mut out = [0i64; 16];
+            unsafe {
+                // Null output, short capacity, wrong counts and null non-empty inputs are refused.
+                assert_eq!(
+                    nntmux_w512_payload_required_name_batch(
+                        b"a".as_ptr(),
+                        1,
+                        1,
+                        std::ptr::null_mut(),
+                        16
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w512_payload_required_name_batch(
+                        b"a".as_ptr(),
+                        1,
+                        1,
+                        out.as_mut_ptr(),
+                        6
+                    ),
+                    -7
+                );
+                assert_eq!(
+                    nntmux_w512_payload_required_name_batch(
+                        b"a\0b".as_ptr(),
+                        3,
+                        1,
+                        out.as_mut_ptr(),
+                        16
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w512_payload_required_name_batch(
+                        std::ptr::null(),
+                        1,
+                        1,
+                        out.as_mut_ptr(),
+                        16
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w512_payload_required_name_batch(
+                        std::ptr::null(),
+                        0,
+                        0,
+                        out.as_mut_ptr(),
+                        16
+                    ),
+                    5
+                );
+                assert_eq!(
+                    nntmux_w512_nzb_subject_batch(std::ptr::null(), 0, 0, out.as_mut_ptr(), 16),
+                    4
+                );
+                assert_eq!(
+                    nntmux_w512_article_prefetch_plan_batch(
+                        std::ptr::null(),
+                        0,
+                        0,
+                        1,
+                        1,
+                        out.as_mut_ptr(),
+                        16
+                    ),
+                    6
+                );
+                assert_eq!(
+                    nntmux_w512_manifest_import_plan_batch(
+                        b"a".as_ptr(),
+                        1,
+                        sizes.as_ptr(),
+                        4,
+                        1,
+                        1,
+                        out.as_mut_ptr(),
+                        16
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w512_oversized_deferral_batch(
+                        table.as_ptr(),
+                        40,
+                        strings.as_ptr(),
+                        strings.len(),
+                        2,
+                        10,
+                        b"m".as_ptr(),
+                        1,
+                        out.as_mut_ptr(),
+                        16,
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w512_oversized_deferral_batch(
+                        table.as_ptr(),
+                        48,
+                        strings.as_ptr(),
+                        strings.len(),
+                        2,
+                        10,
+                        std::ptr::null(),
+                        1,
+                        out.as_mut_ptr(),
+                        16,
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w512_oversized_deferral_batch(
+                        table.as_ptr(),
+                        48,
+                        strings.as_ptr(),
+                        7,
+                        2,
+                        10,
+                        b"m".as_ptr(),
+                        1,
+                        out.as_mut_ptr(),
+                        16,
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w512_article_prefetch_plan_batch(b"a".as_ptr(), 1, super::super::wave49_verification_admission_inventory_prep_repo_sample::MAX_ITEMS + 1, 1, 1, out.as_mut_ptr(), 16),
+                    -1
+                );
+                // An output overlapping an input is refused.
+                let mut shared = [0i64; 8];
+                shared[0] = i64::from_le_bytes(*b"\"a\"\0\0\0\0\0");
+                assert_eq!(
+                    nntmux_w512_payload_required_name_batch(
+                        shared.as_ptr() as *const u8,
+                        3,
+                        1,
+                        shared.as_mut_ptr(),
+                        8
+                    ),
+                    -1
+                );
+            }
+        }
+    }
+}
