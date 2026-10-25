@@ -1258,4 +1258,165 @@ class SteamService
     {
         return self::titleMatchingStringNative('nntmux_steam_build_like_pattern', $title);
     }
+
+    /** Enabled: seven paired runs cleared 1.5x on every gate (min common mean 2.26x, p99 1.68x; uncommon mean 2.82x, p99 2.35x; see the W44 parity test). */
+    public const bool W444_RUST_FFI_DEFAULT = true;
+
+    public const string W444_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w444_steam_title_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private const array W444_SUMMARY_KEYS = ['total_titles', 'empty_title_count', 'scene_group_count', 'edition_tag_count', 'release_tag_count', 'platform_tag_count', 'version_count', 'bracket_count', 'extension_count', 'url_encoded_count', 'roman_numeral_count'];
+
+    private static ?bool $w444UseRustFfi = null;
+
+    private static FFI|false|null $w444Ffi = null;
+
+    /** Null restores the benchmark-qualified default. */
+    public static function useW444RustFfi(?bool $enable = true): void
+    {
+        self::$w444UseRustFfi = $enable;
+    }
+
+    public static function usesW444RustFfi(): bool
+    {
+        return self::$w444UseRustFfi ?? self::W444_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW444RustFfi(): void
+    {
+        self::$w444UseRustFfi = null;
+        self::$w444Ffi = null;
+    }
+
+    /**
+     * Summarize release titles as cleanTitle()/normalizeTitle() see them:
+     * a trailing [-_] SCENE_GROUPS suffix, edition, RELEASE_TAGS (with a digit
+     * tail), platform and roman numeral words, dotted versions with three or
+     * more parts, brackets, archive/video extensions and %XX escapes. Entries
+     * come from strings, integers, or the title, name or searchname field;
+     * other values count as empty. PCRE runs without /u, so \b, \s and /i
+     * are ASCII-only.
+     *
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeSteamTitleBatch(array $entries): array
+    {
+        return self::usesW444RustFfi()
+            ? self::summarizeSteamTitleBatchNative($entries)
+            : self::summarizeSteamTitleBatchPhp($entries);
+    }
+
+    /**
+     * Rust summary; falls back to PHP when the library or input frame is unusable.
+     *
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeSteamTitleBatchNative(array $entries): array
+    {
+        return self::w444Call(self::w444Entries($entries)) ?? self::summarizeSteamTitleBatchPhp($entries);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeSteamTitleBatchPhp(array $entries): array
+    {
+        $summary = array_fill_keys(self::W444_SUMMARY_KEYS, 0);
+        $groups = '/[-_]\s*(?:'.implode('|', array_map(static fn (string $group): string => preg_quote($group, '/'), self::SCENE_GROUPS)).')\s*\z/i';
+        $releases = '/\b(?:'.implode('|', array_map(static fn (string $tag): string => preg_quote($tag, '/'), self::RELEASE_TAGS)).')\d*\b/i';
+        foreach (self::w444Entries($entries) as $title) {
+            $summary['total_titles']++;
+            $title = trim($title);
+            if ($title === '') {
+                $summary['empty_title_count']++;
+
+                continue;
+            }
+            $summary['scene_group_count'] += (int) (preg_match($groups, $title) === 1);
+            $summary['edition_tag_count'] += (int) (preg_match('/\b(?:GOTY|Edition|Remastered|Definitive|Deluxe|Ultimate|Complete|Anniversary|Enhanced|Special|Collectors?|Gold|Premium|Legendary|Standard|Digital)\b/i', $title) === 1);
+            $summary['release_tag_count'] += (int) (preg_match($releases, $title) === 1);
+            $summary['platform_tag_count'] += (int) (preg_match('/\b(?:pc|win|windows|x86|x64|x32)\b/i', $title) === 1);
+            $summary['version_count'] += (int) (preg_match('/\bv?\d+(?:\.\d+){2,}\b/i', $title) === 1);
+            $summary['bracket_count'] += (int) (strpbrk($title, '[({') !== false);
+            $summary['extension_count'] += (int) (preg_match('/\.(?:zip|rar|7z|iso|nfo|sfv|exe|mkv|mp4|avi)\z/i', $title) === 1);
+            $summary['url_encoded_count'] += (int) (preg_match('/%[0-9A-Fa-f]{2}/', $title) === 1);
+            $summary['roman_numeral_count'] += (int) (preg_match('/\b(?:xx|xix|xviii|xvii|xvi|xv|xiv|xiii|xii|xi|x|ix|viii|vii|vi|v|iv|iii|ii)\b/i', $title) === 1);
+        }
+
+        return $summary;
+    }
+
+    /** Only integer and string entries participate; objects are never cast or serialized.
+     *
+     * @param  array<array-key, mixed>  $input
+     * @return list<string>
+     */
+    private static function w444Entries(array $input): array
+    {
+        $entries = [];
+        foreach ($input as $item) {
+            if (is_array($item)) {
+                $item = $item['title'] ?? $item['name'] ?? $item['searchname'] ?? null;
+            }
+            $entries[] = is_string($item) || is_int($item) ? (string) $item : '';
+        }
+
+        return $entries;
+    }
+
+    /** @param list<string> $entries
+     * @return array<string, int>|null
+     */
+    private static function w444Call(array $entries): ?array
+    {
+        try {
+            $input = serialize([$entries]);
+            if (strlen($input) > 16777216) {
+                return null;
+            }
+            self::$w444Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w444', self::W444_FFI_CDEF) ?? false;
+            $ffi = self::$w444Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            $capacity = 0;
+            $out = RustPipelineLibrary::obtainScratch($ffi, 2048, $capacity);
+            if ($out === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound (Declared by W444_FFI_CDEF.)
+            $written = $ffi->nntmux_w444_steam_title_batch($input, strlen($input), $out, $capacity);
+            if (is_int($written) && $written < -1 && $written >= -16777216) {
+                $out = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($out === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound (Declared by W444_FFI_CDEF.)
+                $written = $ffi->nntmux_w444_steam_title_batch($input, strlen($input), $out, $capacity);
+            }
+            if (! is_int($written) || $written <= 0 || $written > $capacity || $written > 16777216) {
+                return null;
+            }
+            $result = @unserialize(FFI::string($out, $written), ['allowed_classes' => false]);
+            if (! is_array($result) || array_keys($result) !== self::W444_SUMMARY_KEYS || $result['total_titles'] !== count($entries)) {
+                return null;
+            }
+            $summary = [];
+            foreach (self::W444_SUMMARY_KEYS as $key) {
+                $value = $result[$key];
+                if (! is_int($value) || $value < 0 || $value > count($entries)) {
+                    return null;
+                }
+                $summary[$key] = $value;
+            }
+
+            return $summary;
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }

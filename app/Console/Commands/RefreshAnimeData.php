@@ -9,8 +9,10 @@ use App\Models\Category;
 use App\Models\Release;
 use App\Services\PopulateAniListService;
 use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
+use Throwable;
 
 class RefreshAnimeData extends Command
 {
@@ -585,5 +587,171 @@ class RefreshAnimeData extends Command
 
         // Record this request timestamp (after all delays)
         $this->requestTimestamps[] = $now;
+    }
+
+    /** Enabled: seven paired runs cleared 1.5x on every gate (min common mean 1.94x, p99 1.63x; uncommon mean 2.06x, p99 1.96x; see the W44 parity test). */
+    public const bool W444_RUST_FFI_DEFAULT = true;
+
+    public const string W444_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w444_anime_searchname_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private const array W444_SUMMARY_KEYS = ['total_searchnames', 'empty_searchname_count', 'group_tag_count', 'language_tag_count', 'sxxexx_count', 'cross_count', 'dash_number_count', 'episode_count', 'keyword_count', 'bracket_quality_count', 'whole_title_count'];
+
+    private static ?bool $w444UseRustFfi = null;
+
+    private static FFI|false|null $w444Ffi = null;
+
+    /** Null restores the benchmark-qualified default. */
+    public static function useW444RustFfi(?bool $enable = true): void
+    {
+        self::$w444UseRustFfi = $enable;
+    }
+
+    public static function usesW444RustFfi(): bool
+    {
+        return self::$w444UseRustFfi ?? self::W444_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW444RustFfi(): void
+    {
+        self::$w444UseRustFfi = null;
+        self::$w444Ffi = null;
+    }
+
+    /**
+     * Summarize release searchnames by the extractTitleFromSearchname() rule
+     * that applies after its separator folding, whitespace collapse, leading
+     * [Group] strip and [LANG]/(LANG) replacement (fixEncoding() aside):
+     * SxxExx, NxNN, " - NNN", " E/Ep/Episode NNN", Movie/OVA/Complete keywords,
+     * a bracketed BD/resolution/codec tag, or the whole title. Entries come
+     * from strings, integers, or the searchname, name or title field; other
+     * values count as empty.
+     *
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeAnimeSearchnameBatch(array $entries): array
+    {
+        return self::usesW444RustFfi()
+            ? self::summarizeAnimeSearchnameBatchNative($entries)
+            : self::summarizeAnimeSearchnameBatchPhp($entries);
+    }
+
+    /**
+     * Rust summary; falls back to PHP when the library or input frame is unusable.
+     *
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeAnimeSearchnameBatchNative(array $entries): array
+    {
+        return self::w444Call(self::w444Entries($entries)) ?? self::summarizeAnimeSearchnameBatchPhp($entries);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeAnimeSearchnameBatchPhp(array $entries): array
+    {
+        $summary = array_fill_keys(self::W444_SUMMARY_KEYS, 0);
+        $languages = 'ENG|JAP|JPN|SUB|DUB|MULTI|RAW|HARDSUB|SOFTSUB|HARDDUB|SOFTDUB|ITA|SPA|FRE|GER|RUS|CHI|KOR';
+        foreach (self::w444Entries($entries) as $name) {
+            $summary['total_searchnames']++;
+            $name = trim($name);
+            if ($name === '') {
+                $summary['empty_searchname_count']++;
+
+                continue;
+            }
+            $s = trim((string) preg_replace('/\s+/', ' ', str_replace(['_', '.'], ' ', $name)));
+            $s = trim((string) preg_replace('/^(?:\[[^\]]+\]\s*)+/', '', $s, -1, $groups));
+            $s = (string) preg_replace(['/\[(?:'.$languages.')\]/i', '/\((?:'.$languages.')\)/i'], ' ', $s, -1, $tags);
+            $summary['group_tag_count'] += (int) ($groups > 0);
+            $summary['language_tag_count'] += (int) ($tags > 0);
+            $rule = match (true) {
+                preg_match('/\sS\d+E\d+/i', $s) === 1 => 'sxxexx_count',
+                preg_match('/\s\d+x\d+/i', $s) === 1 => 'cross_count',
+                preg_match('/\s-\s*(\d{1,3})\b/', $s) === 1 => 'dash_number_count',
+                preg_match('/\sE(?:p(?:isode)?)?\s*0*(\d{1,3})\b/i', $s) === 1 => 'episode_count',
+                preg_match('/\b(Movie|OVA|Complete Series|Complete|Full Series)\b/i', $s) === 1 => 'keyword_count',
+                preg_match('/\[(?:BD|BDRip|BluRay|Blu-Ray|\d{3,4}[ipx]|HEVC|x264|x265|H264|H265)\]/i', $s) === 1 => 'bracket_quality_count',
+                default => 'whole_title_count',
+            };
+            $summary[$rule]++;
+        }
+
+        return $summary;
+    }
+
+    /** Only integer and string entries participate; objects are never cast or serialized.
+     *
+     * @param  array<array-key, mixed>  $input
+     * @return list<string>
+     */
+    private static function w444Entries(array $input): array
+    {
+        $entries = [];
+        foreach ($input as $item) {
+            if (is_array($item)) {
+                $item = $item['searchname'] ?? $item['name'] ?? $item['title'] ?? null;
+            }
+            $entries[] = is_string($item) || is_int($item) ? (string) $item : '';
+        }
+
+        return $entries;
+    }
+
+    /** @param list<string> $entries
+     * @return array<string, int>|null
+     */
+    private static function w444Call(array $entries): ?array
+    {
+        try {
+            $input = serialize([$entries]);
+            if (strlen($input) > 16777216) {
+                return null;
+            }
+            self::$w444Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w444', self::W444_FFI_CDEF) ?? false;
+            $ffi = self::$w444Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            $capacity = 0;
+            $out = RustPipelineLibrary::obtainScratch($ffi, 2048, $capacity);
+            if ($out === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound (Declared by W444_FFI_CDEF.)
+            $written = $ffi->nntmux_w444_anime_searchname_batch($input, strlen($input), $out, $capacity);
+            if (is_int($written) && $written < -1 && $written >= -16777216) {
+                $out = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($out === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound (Declared by W444_FFI_CDEF.)
+                $written = $ffi->nntmux_w444_anime_searchname_batch($input, strlen($input), $out, $capacity);
+            }
+            if (! is_int($written) || $written <= 0 || $written > $capacity || $written > 16777216) {
+                return null;
+            }
+            $result = @unserialize(FFI::string($out, $written), ['allowed_classes' => false]);
+            if (! is_array($result) || array_keys($result) !== self::W444_SUMMARY_KEYS || $result['total_searchnames'] !== count($entries)) {
+                return null;
+            }
+            $summary = [];
+            foreach (self::W444_SUMMARY_KEYS as $key) {
+                $value = $result[$key];
+                if (! is_int($value) || $value < 0 || $value > count($entries)) {
+                    return null;
+                }
+                $summary[$key] = $value;
+            }
+
+            return $summary;
+        } catch (Throwable) {
+            return null;
+        }
     }
 }
