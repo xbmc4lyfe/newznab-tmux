@@ -24689,3 +24689,521 @@ mod wave35_5_search_provider_facade_facets {
         }
     }
 }
+/// Wave 36.5: login attempt input, registration input, password reset lookup,
+/// 2FA disable payload and password-confirmation redirect destination.
+mod wave36_5_auth_requests_confirm_password {
+    const DECLINE: isize = -1;
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+    const MAX_PARTS: usize = 64;
+    /// Bytes stripped by PHP's default `trim()`.
+    const PHP_TRIM: &[u8] = b" \t\n\r\0\x0B";
+    /// `RegistrationStatus` cases; unknown values fail closed.
+    const STATUS_OPEN: i64 = 0;
+    const STATUS_INVITE: i64 = 1;
+    const STATUS_CLOSED: i64 = 2;
+    const REDIRECT_MAX_BYTES: usize = 2048;
+
+    fn unpack(input: &[u8]) -> Option<Vec<&[u8]>> {
+        let count = u32::from_le_bytes(input.get(..4)?.try_into().ok()?) as usize;
+        if count > MAX_PARTS || count > (input.len() - 4) / 4 {
+            return None;
+        }
+        let mut cursor = 4usize;
+        let mut parts = Vec::with_capacity(count);
+        for _ in 0..count {
+            let length_end = cursor.checked_add(4)?;
+            let length =
+                u32::from_le_bytes(input.get(cursor..length_end)?.try_into().ok()?) as usize;
+            let end = length_end.checked_add(length)?;
+            parts.push(input.get(length_end..end)?);
+            cursor = end;
+        }
+        (cursor == input.len()).then_some(parts)
+    }
+
+    fn pack(parts: &[Vec<u8>]) -> Option<Vec<u8>> {
+        let count = u32::try_from(parts.len()).ok()?;
+        let size = parts.iter().try_fold(4usize, |size, part| {
+            u32::try_from(part.len()).ok()?;
+            size.checked_add(4)?.checked_add(part.len())
+        })?;
+        if size > isize::MAX as usize {
+            return None;
+        }
+        let mut out = Vec::with_capacity(size);
+        out.extend_from_slice(&count.to_le_bytes());
+        for part in parts {
+            out.extend_from_slice(&(part.len() as u32).to_le_bytes());
+            out.extend_from_slice(part);
+        }
+        Some(out)
+    }
+
+    /// Canonical decimal produced by PHP `(string) $int`.
+    fn integer(bytes: &[u8]) -> Option<i64> {
+        let value: i64 = std::str::from_utf8(bytes).ok()?.parse().ok()?;
+        (value.to_string().as_bytes() == bytes).then_some(value)
+    }
+
+    fn php_trim(bytes: &[u8]) -> &[u8] {
+        let start = bytes
+            .iter()
+            .position(|b| !PHP_TRIM.contains(b))
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|b| !PHP_TRIM.contains(b))
+            .map_or(start, |i| i + 1);
+        &bytes[start..end]
+    }
+
+    fn flag(bytes: &[u8]) -> Option<bool> {
+        match bytes {
+            b"0" => Some(false),
+            b"1" => Some(true),
+            _ => None,
+        }
+    }
+
+    fn flag_bytes(value: bool) -> Vec<u8> {
+        if value { b"1".to_vec() } else { b"0".to_vec() }
+    }
+
+    fn text(value: i64) -> Vec<u8> {
+        value.to_string().into_bytes()
+    }
+
+    /// PHP passes a nullable string as a `0`/`1` flag plus its bytes; null carries no bytes.
+    fn nullable<'a>(present: &[u8], value: &'a [u8]) -> Option<Option<&'a [u8]>> {
+        match flag(present)? {
+            true => Some(Some(value)),
+            false if value.is_empty() => Some(None),
+            false => None,
+        }
+    }
+
+    /// Trimmed value, or None when null or blank.
+    fn trimmed<'a>(present: &[u8], value: &'a [u8]) -> Option<Option<&'a [u8]>> {
+        Some(
+            nullable(present, value)?
+                .map(php_trim)
+                .filter(|v| !v.is_empty()),
+        )
+    }
+
+    fn push_nullable(out: &mut Vec<Vec<u8>>, value: Option<Vec<u8>>) {
+        out.push(flag_bytes(value.is_some()));
+        out.push(value.unwrap_or_default());
+    }
+
+    /// A same-origin absolute path: `/` but not `//` or `/\`, no backslashes or control bytes.
+    fn local_path(path: &[u8]) -> bool {
+        !path.is_empty()
+            && path.len() <= REDIRECT_MAX_BYTES
+            && path[0] == b'/'
+            && !matches!(path.get(1), Some(b'/'))
+            && !path.iter().any(|&b| b == b'\\' || b < 0x20 || b == 0x7F)
+    }
+
+    fn transform(mode: u32, parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        Some(match (mode, parts) {
+            // LoginLoginRequest::normalizeLoginAttemptInput.
+            (
+                1,
+                [
+                    login_set,
+                    login,
+                    remember,
+                    captcha_set,
+                    captcha,
+                    require_captcha,
+                ],
+            ) => {
+                let login = nullable(login_set, login)?.map_or(&[][..], php_trim);
+                let remember = flag(remember)?;
+                let captcha = trimmed(captcha_set, captcha)?;
+                let require_captcha = flag(require_captcha)?;
+                let valid = !login.is_empty() && (!require_captcha || captcha.is_some());
+                let mut out = Vec::with_capacity(6);
+                out.push(login.to_vec());
+                out.push(flag_bytes(remember));
+                push_nullable(&mut out, captcha.map(<[u8]>::to_vec));
+                out.push(flag_bytes(captcha.is_some()));
+                out.push(flag_bytes(valid));
+                out
+            }
+            // RegisterRegisterRequest::normalizeRegistrationInput.
+            (2, [user_set, user, email_set, email, token_set, token, status]) => {
+                let username = nullable(user_set, user)?.map_or(&[][..], php_trim);
+                let email = nullable(email_set, email)?
+                    .map_or(&[][..], php_trim)
+                    .to_ascii_lowercase();
+                let token = trimmed(token_set, token)?;
+                let status = match integer(status)? {
+                    s @ (STATUS_OPEN | STATUS_INVITE | STATUS_CLOSED) => s,
+                    _ => STATUS_CLOSED,
+                };
+                let allowed = status == STATUS_OPEN || (status == STATUS_INVITE && token.is_some());
+                let mut out = Vec::with_capacity(9);
+                out.push(username.to_vec());
+                out.push(email);
+                push_nullable(&mut out, token.map(<[u8]>::to_vec));
+                out.push(text(status));
+                out.push(flag_bytes(status == STATUS_INVITE));
+                out.push(flag_bytes(status == STATUS_CLOSED));
+                out.push(flag_bytes(allowed));
+                out
+            }
+            // ShowLinkRequestFormForgotPasswordRequest::normalizeResetLookupInput.
+            (3, [email_set, email, key_set, key, captcha_set, captcha]) => {
+                let email = trimmed(email_set, email)?.map(<[u8]>::to_ascii_lowercase);
+                let key = trimmed(key_set, key)?
+                    .filter(|key| key.iter().all(u8::is_ascii_alphanumeric))
+                    .map(<[u8]>::to_ascii_lowercase);
+                let captcha = trimmed(captcha_set, captcha)?;
+                let lookup: &[u8] = match (&email, &key) {
+                    (Some(_), _) => b"email",
+                    (None, Some(_)) => b"apikey",
+                    (None, None) => b"none",
+                };
+                let mut out = Vec::with_capacity(7);
+                push_nullable(&mut out, email);
+                push_nullable(&mut out, key);
+                out.push(lookup.to_vec());
+                push_nullable(&mut out, captcha.map(<[u8]>::to_vec));
+                out
+            }
+            // Disable2faPasswordSecurityRequest::normalizeDisable2faPayload: passwords are never trimmed.
+            (4, [password_set, password, min_length]) => {
+                let password = nullable(password_set, password)?.unwrap_or_default();
+                let min_length = integer(min_length)?.max(0);
+                let bytes = i64::try_from(password.len()).ok()?;
+                let present = !password.is_empty();
+                let meets = bytes >= min_length;
+                let valid = present && meets && !password.contains(&0);
+                vec![
+                    flag_bytes(present),
+                    text(bytes),
+                    text(min_length),
+                    flag_bytes(meets),
+                    flag_bytes(valid),
+                ]
+            }
+            // ConfirmPasswordController::normalizeRedirectDestination.
+            (5, [intended_set, intended, default]) => {
+                let intended = nullable(intended_set, intended)?.map(php_trim);
+                let (path, used_default) = match intended {
+                    Some(path) if local_path(path) => (path, false),
+                    _ => {
+                        let default = php_trim(default);
+                        (if local_path(default) { default } else { b"/" }, true)
+                    }
+                };
+                vec![
+                    path.to_vec(),
+                    flag_bytes(used_default),
+                    flag_bytes(path.contains(&b'#')),
+                ]
+            }
+            _ => return None,
+        })
+    }
+
+    /// Dispatch count-prefixed, length-prefixed byte strings (little-endian
+    /// u32). Returns written bytes, `-needed` when `cap` is too small, or `-1`
+    /// for invalid input. Failure never writes to the output buffer. Results
+    /// are at least four bytes, so `-1` never means "one byte needed".
+    ///
+    /// # Safety
+    /// Non-null pointers must refer to readable/writable allocations of the
+    /// declared lengths. Null pointers require zero length/capacity. Input and
+    /// output may overlap; the result is fully owned before any output write.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w36_auth_requests_confirm_password(
+        mode: u32,
+        input: *const u8,
+        input_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        std::panic::catch_unwind(|| {
+            if input_len > MAX_INPUT
+                || cap > isize::MAX as usize
+                || (input.is_null() && input_len != 0)
+                || (out.is_null() && cap != 0)
+            {
+                return DECLINE;
+            }
+            let input = if input_len == 0 {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(input, input_len) }
+            };
+            let Some(parts) = unpack(input) else {
+                return DECLINE;
+            };
+            let Some(result) = transform(mode, &parts).and_then(|parts| pack(&parts)) else {
+                return DECLINE;
+            };
+            if cap < result.len() || out.is_null() {
+                return -(result.len() as isize);
+            }
+            unsafe { std::ptr::copy(result.as_ptr(), out, result.len()) };
+            result.len() as isize
+        })
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn packet(parts: &[&[u8]]) -> Vec<u8> {
+            pack(&parts.iter().map(|part| part.to_vec()).collect::<Vec<_>>()).unwrap()
+        }
+
+        fn call(mode: u32, parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+            let input = packet(parts);
+            let mut out = vec![0u8; input.len() * 2 + 512];
+            let written = unsafe {
+                nntmux_w36_auth_requests_confirm_password(
+                    mode,
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            if written < 0 {
+                return None;
+            }
+            out.truncate(written as usize);
+            Some(unpack(&out)?.into_iter().map(<[u8]>::to_vec).collect())
+        }
+
+        fn strings(items: &[&str]) -> Vec<Vec<u8>> {
+            items.iter().map(|item| item.as_bytes().to_vec()).collect()
+        }
+
+        #[test]
+        fn login_attempt_input() {
+            assert_eq!(
+                call(
+                    1,
+                    &[b"1", b" alice@example.test\n", b"1", b"1", b" tok ", b"1"]
+                )
+                .unwrap(),
+                strings(&["alice@example.test", "1", "1", "tok", "1", "1"])
+            );
+            assert_eq!(
+                call(1, &[b"0", b"", b"0", b"0", b"", b"0"]).unwrap(),
+                strings(&["", "0", "0", "", "0", "0"])
+            );
+            assert_eq!(
+                call(1, &[b"1", b"bob", b"0", b"1", b" \t", b"1"]).unwrap(),
+                strings(&["bob", "0", "0", "", "0", "0"])
+            );
+            assert_eq!(
+                call(1, &[b"1", b"bob", b"0", b"0", b"", b"0"]).unwrap(),
+                strings(&["bob", "0", "0", "", "0", "1"])
+            );
+            assert_eq!(call(1, &[b"0", b"x", b"0", b"0", b"", b"0"]), None);
+            assert_eq!(call(1, &[b"1", b"x", b"2", b"0", b"", b"0"]), None);
+            assert_eq!(call(1, &[b"1", b"x", b"0", b"0", b""]), None);
+        }
+
+        #[test]
+        fn registration_input() {
+            assert_eq!(
+                call(
+                    2,
+                    &[
+                        b"1",
+                        b" Alice ",
+                        b"1",
+                        b" Alice@Example.TEST ",
+                        b"0",
+                        b"",
+                        b"0"
+                    ]
+                )
+                .unwrap(),
+                strings(&["Alice", "alice@example.test", "0", "", "0", "0", "0", "1"])
+            );
+            assert_eq!(
+                call(2, &[b"0", b"", b"0", b"", b"1", b" abc ", b"1"]).unwrap(),
+                strings(&["", "", "1", "abc", "1", "1", "0", "1"])
+            );
+            assert_eq!(
+                call(2, &[b"0", b"", b"0", b"", b"1", b"\t", b"1"]).unwrap(),
+                strings(&["", "", "0", "", "1", "1", "0", "0"])
+            );
+            assert_eq!(
+                call(2, &[b"0", b"", b"0", b"", b"0", b"", b"7"]).unwrap(),
+                strings(&["", "", "0", "", "2", "0", "1", "0"])
+            );
+            assert_eq!(
+                call(2, &[b"0", b"", b"1", b"\xc3\x89A", b"0", b"", b"-1"]).unwrap()[1],
+                b"\xc3\x89a".to_vec()
+            );
+            assert_eq!(call(2, &[b"0", b"", b"0", b"", b"0", b"", b"01"]), None);
+            assert_eq!(call(2, &[b"0", b"", b"0", b"", b"0", b""]), None);
+        }
+
+        #[test]
+        fn reset_lookup_input() {
+            assert_eq!(
+                call(3, &[b"1", b" A@B.Test ", b"1", b"ABC123", b"1", b"c"]).unwrap(),
+                strings(&["1", "a@b.test", "1", "abc123", "email", "1", "c"])
+            );
+            assert_eq!(
+                call(3, &[b"1", b" ", b"1", b" ABC ", b"0", b""]).unwrap(),
+                strings(&["0", "", "1", "abc", "apikey", "0", ""])
+            );
+            assert_eq!(
+                call(3, &[b"0", b"", b"1", b"ab-c", b"0", b""]).unwrap(),
+                strings(&["0", "", "0", "", "none", "0", ""])
+            );
+            assert_eq!(call(3, &[b"0", b"", b"0", b"", b"0", b"x"]), None);
+        }
+
+        #[test]
+        fn disable_2fa_payload() {
+            assert_eq!(
+                call(4, &[b"1", b" secret1 ", b"8"]).unwrap(),
+                strings(&["1", "9", "8", "1", "1"])
+            );
+            assert_eq!(
+                call(4, &[b"1", b"short", b"8"]).unwrap(),
+                strings(&["1", "5", "8", "0", "0"])
+            );
+            assert_eq!(
+                call(4, &[b"0", b"", b"-5"]).unwrap(),
+                strings(&["0", "0", "0", "1", "0"])
+            );
+            assert_eq!(
+                call(4, &[b"1", b"abcdefgh\0", b"8"]).unwrap(),
+                strings(&["1", "9", "8", "1", "0"])
+            );
+            assert_eq!(call(4, &[b"1", b"x", b"8.0"]), None);
+            assert_eq!(call(4, &[b"1", b"x"]), None);
+        }
+
+        #[test]
+        fn redirect_destination() {
+            assert_eq!(
+                call(5, &[b"1", b" /profile#security ", b"/"]).unwrap(),
+                strings(&["/profile#security", "0", "1"])
+            );
+            assert_eq!(
+                call(5, &[b"1", b"//evil.test", b"/home"]).unwrap(),
+                strings(&["/home", "1", "0"])
+            );
+            assert_eq!(
+                call(5, &[b"1", b"/\\evil.test", b"https://x"]).unwrap(),
+                strings(&["/", "1", "0"])
+            );
+            assert_eq!(
+                call(5, &[b"1", b"https://evil.test/", b"/"]).unwrap(),
+                strings(&["/", "1", "0"])
+            );
+            assert_eq!(
+                call(5, &[b"1", b"/a\nb", b"/"]).unwrap(),
+                strings(&["/", "1", "0"])
+            );
+            assert_eq!(
+                call(5, &[b"0", b"", b" /x "]).unwrap(),
+                strings(&["/x", "1", "0"])
+            );
+            let long = [b"/".as_slice(), &[b'a'; REDIRECT_MAX_BYTES]].concat();
+            assert_eq!(call(5, &[b"1", &long, b"/"]).unwrap()[0], b"/".to_vec());
+            assert_eq!(call(5, &[b"0", b"x", b"/"]), None);
+        }
+
+        #[test]
+        fn malformed_null_and_capacity() {
+            let input = packet(&[b"0", b"", b"/"]);
+            let mut out = [0x5a_u8; 128];
+            for (ptr, len, dst, cap) in [
+                (std::ptr::null(), 1, out.as_mut_ptr(), out.len()),
+                (input.as_ptr(), input.len(), std::ptr::null_mut(), 8),
+                (input.as_ptr(), MAX_INPUT + 1, out.as_mut_ptr(), out.len()),
+                (input.as_ptr(), input.len(), out.as_mut_ptr(), usize::MAX),
+            ] {
+                assert_eq!(
+                    unsafe { nntmux_w36_auth_requests_confirm_password(5, ptr, len, dst, cap) },
+                    DECLINE
+                );
+            }
+            for bad in [
+                vec![],
+                vec![1, 0, 0],
+                vec![1, 0, 0, 0, 9, 0, 0, 0],
+                vec![65, 0, 0, 0],
+            ] {
+                assert_eq!(
+                    unsafe {
+                        nntmux_w36_auth_requests_confirm_password(
+                            5,
+                            bad.as_ptr(),
+                            bad.len(),
+                            out.as_mut_ptr(),
+                            out.len(),
+                        )
+                    },
+                    DECLINE
+                );
+            }
+            for mode in [0u32, 6, 99] {
+                assert_eq!(
+                    unsafe {
+                        nntmux_w36_auth_requests_confirm_password(
+                            mode,
+                            input.as_ptr(),
+                            input.len(),
+                            out.as_mut_ptr(),
+                            out.len(),
+                        )
+                    },
+                    DECLINE
+                );
+            }
+            assert_eq!(out, [0x5a; 128]);
+            let full = call(5, &[b"0", b"", b"/"])
+                .map(|parts| pack(&parts).unwrap().len())
+                .unwrap();
+            for cap in [0usize, 1, full - 1] {
+                let dst = if cap == 0 {
+                    std::ptr::null_mut()
+                } else {
+                    out.as_mut_ptr()
+                };
+                assert_eq!(
+                    unsafe {
+                        nntmux_w36_auth_requests_confirm_password(
+                            5,
+                            input.as_ptr(),
+                            input.len(),
+                            dst,
+                            cap,
+                        )
+                    },
+                    -(full as isize)
+                );
+            }
+            assert_eq!(out, [0x5a; 128]);
+            let mut alias = input.clone();
+            alias.resize(full.max(input.len()), 0);
+            let written = unsafe {
+                nntmux_w36_auth_requests_confirm_password(
+                    5,
+                    alias.as_ptr(),
+                    input.len(),
+                    alias.as_mut_ptr(),
+                    alias.len(),
+                )
+            };
+            assert_eq!(written, full as isize);
+        }
+    }
+}
