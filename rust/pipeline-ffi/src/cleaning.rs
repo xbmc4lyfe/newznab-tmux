@@ -40058,3 +40058,970 @@ pub mod w531_obfuscation_blacklist_cat_pipeline_result_service {
         }
     }
 }
+
+pub mod w541_header_storage_collection_cleanup_gdpr_app_collector {
+    //! Wave 54.1 batch kernels for rollback cleanup hash summaries, collection deletion id
+    //! plans, collection subject feature masks, GDPR notification plans and runtime version
+    //! codes. Every export reads NUL-joined string columns or little-endian `i64` tables,
+    //! writes fixed-width `i64` words into `out` and returns the word count, `SHORT_CAPACITY`
+    //! when `out_cap` (in words) is below the export's worst case, or -1 for a malformed batch
+    //! (a string column whose rows hold NUL bytes splits into extra rows and is malformed).
+
+    use super::w48_proxy_verdict_captcha_breach_reglog::rows;
+    use super::w501_status_probes_db_disk_nntp_result_queue::i64s;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    pub const MAX_INPUT: usize = 64 * 1024 * 1024;
+    pub const MAX_ITEMS: usize = 1 << 20;
+    pub const SHORT_CAPACITY: isize = -2;
+    /// `[hashes, sha1, md5, mixed_case, invalid, distinct, statements]`.
+    pub const HASH_SUMMARY_WORDS: usize = 7;
+    /// `[ids, invalid, distinct, duplicates, runs, chunks, min_id, max_id]`.
+    pub const ID_PLAN_WORDS: usize = 8;
+    /// `[rows, requester_mails, admin_copies, unknown_events, unknown_types, blank_recipients,
+    /// malformed_recipients, deliverable]`.
+    pub const NOTIFICATION_PLAN_WORDS: usize = 8;
+
+    pub const FEATURE_YENC_SUFFIX: i64 = 1;
+    pub const FEATURE_SIZE_TAG: i64 = 2;
+    pub const FEATURE_FILE_COUNTER: i64 = 4;
+    pub const FEATURE_QUOTED_NAME: i64 = 8;
+    pub const FEATURE_PAR2: i64 = 16;
+    pub const FEATURE_RAR_PART: i64 = 32;
+    pub const FEATURE_PART_COUNTER: i64 = 64;
+
+    /// Version component width: `major << 40 | minor << 20 | patch`.
+    pub const VERSION_SHIFT: u32 = 20;
+
+    /// Borrows a caller span; an empty span may be null and is never dereferenced.
+    unsafe fn span<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null() || len > MAX_INPUT {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
+    fn overlaps(input: (*const u8, usize), out: *mut i64, words: usize) -> bool {
+        let (a, a_len) = (input.0 as usize, input.1);
+        let (b, b_len) = (out as usize, words.saturating_mul(8));
+        a_len != 0 && b_len != 0 && a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
+    }
+
+    /// Validates the output window for at most `max_words` words, lets `body` push them from
+    /// the borrowed inputs and copies the pushed words to `out`.
+    unsafe fn run(
+        out: *mut i64,
+        out_cap: usize,
+        count: usize,
+        max_words: usize,
+        inputs: &[(*const u8, usize)],
+        body: impl FnOnce(&[&[u8]], &mut Vec<i64>) -> bool,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out.is_null()
+                || !(out as usize).is_multiple_of(std::mem::align_of::<i64>())
+                || count > MAX_ITEMS
+                || out_cap > isize::MAX as usize / 8
+            {
+                return -1;
+            }
+            if max_words > out_cap {
+                return SHORT_CAPACITY;
+            }
+            if inputs.iter().any(|&input| overlaps(input, out, max_words)) {
+                return -1;
+            }
+            let mut spans = Vec::with_capacity(inputs.len());
+            for &(ptr, len) in inputs {
+                match unsafe { span(ptr, len) } {
+                    Some(bytes) => spans.push(bytes),
+                    None => return -1,
+                }
+            }
+            let mut words = Vec::with_capacity(max_words);
+            if !body(&spans, &mut words) || words.len() > max_words {
+                return -1;
+            }
+            // At most `max_words` words, checked against `out_cap` above.
+            unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), out, words.len()) };
+            words.len() as isize
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// `ceil(count / size)` for a non-negative count and a positive size.
+    fn chunks(count: i64, size: i64) -> i64 {
+        count / size + i64::from(count % size != 0)
+    }
+
+    /// Hash classes: 0 invalid, 1 lowercase SHA-1 (40), 2 lowercase MD5 (32), 3 mixed case.
+    fn hash_class(hash: &[u8]) -> u8 {
+        if hash.len() != 32 && hash.len() != 40 {
+            return 0;
+        }
+        // Branchless so the fixed-width loop vectorizes.
+        let (mut bad, mut upper) = (0u8, 0u8);
+        for &b in hash {
+            let digit = b.wrapping_sub(b'0') < 10;
+            let lower = b.wrapping_sub(b'a') < 6;
+            let up = b.wrapping_sub(b'A') < 6;
+            bad |= u8::from(!(digit | lower | up));
+            upper |= u8::from(up);
+        }
+        match (bad, upper, hash.len()) {
+            (0, 0, 40) => 1,
+            (0, 0, _) => 2,
+            (0, _, _) => 3,
+            _ => 0,
+        }
+    }
+
+    fn slot_hash(key: &[u8]) -> u64 {
+        // Valid keys hold at least 32 bytes.
+        let a = u64::from_le_bytes(key[..8].try_into().unwrap_or_default());
+        let b = u64::from_le_bytes(key[8..16].try_into().unwrap_or_default());
+        let c = u64::from_le_bytes(key[key.len() - 8..].try_into().unwrap_or_default());
+        (a ^ b.rotate_left(23) ^ c.rotate_left(41)).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    }
+
+    /// The [`HASH_SUMMARY_WORDS`] summary of rollback cleanup collection hashes: distinct
+    /// counts the lowercase hashes and statements is three DELETEs per `max(1, max_rows)`
+    /// distinct hashes.
+    pub fn hash_summary(hashes: &[&[u8]], max_rows: i64) -> [i64; HASH_SUMMARY_WORDS] {
+        let mut s = [0i64; HASH_SUMMARY_WORDS];
+        s[0] = hashes.len() as i64;
+        let slots = (hashes.len() * 2).next_power_of_two().max(16);
+        let shift = 64 - slots.trailing_zeros();
+        let mut table = vec![u32::MAX; slots];
+        for (i, &hash) in hashes.iter().enumerate() {
+            let class = hash_class(hash);
+            s[match class {
+                1 => 1,
+                2 => 2,
+                3 => 3,
+                _ => 4,
+            }] += 1;
+            if class != 1 && class != 2 {
+                continue;
+            }
+            let mut slot = (slot_hash(hash) >> shift) as usize;
+            loop {
+                let held = table[slot];
+                if held == u32::MAX {
+                    table[slot] = i as u32;
+                    s[5] += 1;
+                    break;
+                }
+                if hashes[held as usize] == hash {
+                    break;
+                }
+                slot = (slot + 1) & (slots - 1);
+            }
+        }
+        s[6] = chunks(s[5], max_rows.max(1)) * 3;
+        s
+    }
+
+    /// The [`ID_PLAN_WORDS`] plan of collection ids to delete: ids at or below 0 are invalid,
+    /// runs counts maximal consecutive runs of the sorted distinct valid ids, chunks is
+    /// `ceil(distinct / max(1, chunk_size))`, and min/max are 0 without a valid id.
+    pub fn id_plan(ids: &[i64], chunk_size: i64) -> [i64; ID_PLAN_WORDS] {
+        let mut valid: Vec<i64> = ids.iter().copied().filter(|&id| id > 0).collect();
+        let valid_count = valid.len() as i64;
+        valid.sort_unstable();
+        valid.dedup();
+        let mut runs = 0i64;
+        let mut prev: Option<i64> = None;
+        for &id in &valid {
+            if prev.and_then(|p| p.checked_add(1)) != Some(id) {
+                runs += 1;
+            }
+            prev = Some(id);
+        }
+        let distinct = valid.len() as i64;
+        [
+            ids.len() as i64,
+            ids.len() as i64 - valid_count,
+            distinct,
+            valid_count - distinct,
+            runs,
+            chunks(distinct, chunk_size.max(1)),
+            valid.first().copied().unwrap_or(0),
+            valid.last().copied().unwrap_or(0),
+        ]
+    }
+
+    fn ci_at(s: &[u8], at: usize, lower: &[u8]) -> bool {
+        s.get(at..at + lower.len())
+            .is_some_and(|w| w.eq_ignore_ascii_case(lower))
+    }
+
+    /// The end of a non-empty ASCII digit run starting at `at`, if any.
+    fn digits_end(s: &[u8], at: usize) -> Option<usize> {
+        let n = s
+            .get(at..)?
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        (n > 0).then_some(at + n)
+    }
+
+    /// `\d+\/\d+` then `close` starting at `at`.
+    fn counter_at(s: &[u8], at: usize, close: u8) -> bool {
+        let Some(end) = digits_end(s, at) else {
+            return false;
+        };
+        if s.get(end) != Some(&b'/') {
+            return false;
+        }
+        digits_end(s, end + 1).is_some_and(|e| s.get(e) == Some(&close))
+    }
+
+    /// `\.(?:par2|vol\d+\+\d+)` (case-insensitive) with the dot at `at`.
+    fn par2_at(s: &[u8], at: usize) -> bool {
+        if ci_at(s, at + 1, b"par2") {
+            return true;
+        }
+        if !ci_at(s, at + 1, b"vol") {
+            return false;
+        }
+        digits_end(s, at + 4)
+            .is_some_and(|e| s.get(e) == Some(&b'+') && digits_end(s, e + 1).is_some())
+    }
+
+    /// `\.part\d+\.rar` (case-insensitive) with the dot at `at`.
+    fn rar_part_at(s: &[u8], at: usize) -> bool {
+        ci_at(s, at + 1, b"part") && digits_end(s, at + 5).is_some_and(|e| ci_at(s, e, b".rar"))
+    }
+
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const LOW7: u64 = 0x7F7F_7F7F_7F7F_7F7F;
+
+    /// The high bit of exactly the `byte` bytes of `v`.
+    fn byte_eq(v: u64, byte: u8) -> u64 {
+        let x = v ^ (u64::from(byte) * LO);
+        !(((x & LOW7).wrapping_add(LOW7)) | x | LOW7)
+    }
+
+    /// The SWAR trigger bytes still needed for the features missing from `mask`: `[`, `(`, `"`,
+    /// `.` and `b`/`B` (a size tag ends `\d [kmg]b`).
+    fn triggers(v: u64, mask: i64) -> u64 {
+        let mut m = 0;
+        if mask & FEATURE_FILE_COUNTER == 0 {
+            m |= byte_eq(v, b'[');
+        }
+        if mask & FEATURE_PART_COUNTER == 0 {
+            m |= byte_eq(v, b'(');
+        }
+        if mask & FEATURE_QUOTED_NAME == 0 {
+            m |= byte_eq(v, b'"');
+        }
+        if mask & (FEATURE_PAR2 | FEATURE_RAR_PART) != FEATURE_PAR2 | FEATURE_RAR_PART {
+            m |= byte_eq(v, b'.');
+        }
+        if mask & FEATURE_SIZE_TAG == 0 {
+            // Only `B` and `b` OR 0x20 to `b`.
+            m |= byte_eq(v | (0x20 * LO), b'b');
+        }
+        m
+    }
+
+    /// Applies the trigger byte at `i`; `last_quote` tracks the previous `"`.
+    fn visit(s: &[u8], i: usize, mask: &mut i64, last_quote: &mut Option<usize>) {
+        match s[i] {
+            b'[' => {
+                if *mask & FEATURE_FILE_COUNTER == 0 && counter_at(s, i + 1, b']') {
+                    *mask |= FEATURE_FILE_COUNTER;
+                }
+            }
+            b'(' => {
+                if *mask & FEATURE_PART_COUNTER == 0 && counter_at(s, i + 1, b')') {
+                    *mask |= FEATURE_PART_COUNTER;
+                }
+            }
+            b'"' => {
+                if last_quote.is_some_and(|l| i > l + 1) {
+                    *mask |= FEATURE_QUOTED_NAME;
+                }
+                *last_quote = Some(i);
+            }
+            b'.' => {
+                if *mask & FEATURE_PAR2 == 0 && par2_at(s, i) {
+                    *mask |= FEATURE_PAR2;
+                }
+                if *mask & FEATURE_RAR_PART == 0 && rar_part_at(s, i) {
+                    *mask |= FEATURE_RAR_PART;
+                }
+            }
+            b'b' | b'B'
+                if i >= 3
+                    && matches!(s[i - 1], b'k' | b'K' | b'm' | b'M' | b'g' | b'G')
+                    && s[i - 2] == b' '
+                    && s[i - 3].is_ascii_digit() =>
+            {
+                *mask |= FEATURE_SIZE_TAG;
+            }
+            _ => {}
+        }
+    }
+
+    /// The `FEATURE_*` mask of one collection subject (see the PHP patterns in
+    /// CollectionsCleaningService::subjectFeatureMasksPhp()), from one SWAR pass over its
+    /// trigger bytes that drops each trigger once its features are found.
+    pub fn subject_features(s: &[u8]) -> i64 {
+        const ALL: i64 = 127;
+        let mut mask = 0;
+        if s.len() >= 4 && s[s.len() - 4..].eq_ignore_ascii_case(b"yenc") {
+            mask |= FEATURE_YENC_SUFFIX;
+        }
+        let mut last_quote: Option<usize> = None;
+        let (words, tail) = s.as_chunks::<8>();
+        for (w, chunk) in words.iter().enumerate() {
+            let mut m = triggers(u64::from_le_bytes(*chunk), mask);
+            while m != 0 {
+                visit(
+                    s,
+                    w * 8 + (m.trailing_zeros() / 8) as usize,
+                    &mut mask,
+                    &mut last_quote,
+                );
+                m &= m - 1;
+            }
+            if mask | FEATURE_YENC_SUFFIX == ALL {
+                return mask;
+            }
+        }
+        if !tail.is_empty() {
+            // Zero padding never matches a trigger byte.
+            let mut last = [0u8; 8];
+            last[..tail.len()].copy_from_slice(tail);
+            let mut m = triggers(u64::from_le_bytes(last), mask);
+            while m != 0 {
+                visit(
+                    s,
+                    words.len() * 8 + (m.trailing_zeros() / 8) as usize,
+                    &mut mask,
+                    &mut last_quote,
+                );
+                m &= m - 1;
+            }
+        }
+        mask
+    }
+
+    const TYPES: [&[u8]; 4] = [b"export", b"erasure", b"rectification", b"restriction"];
+    const EVENTS: [&[u8]; 4] = [
+        b"submitted",
+        b"export_ready",
+        b"erasure_completed",
+        b"rejected",
+    ];
+
+    fn space(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0)
+    }
+
+    /// PHP `trim()` with its default character list.
+    fn trim(s: &[u8]) -> &[u8] {
+        let start = s.iter().position(|&b| !space(b)).unwrap_or(s.len());
+        let end = s.iter().rposition(|&b| !space(b)).map_or(start, |e| e + 1);
+        &s[start..end]
+    }
+
+    /// A trimmed, non-empty email with the `local@domain.tld` shape: one `@` after a non-empty
+    /// local part, no whitespace, and a last `.` that is neither the first byte of the domain
+    /// nor the last byte.
+    fn shaped(email: &[u8]) -> bool {
+        let Some(at) = email.iter().position(|&b| b == b'@') else {
+            return false;
+        };
+        at > 0
+            && !email[at + 1..].contains(&b'@')
+            && !email.iter().any(|&b| space(b))
+            && email
+                .iter()
+                .rposition(|&b| b == b'.')
+                .is_some_and(|dot| dot > at + 1 && dot < email.len() - 1)
+    }
+
+    /// The [`NOTIFICATION_PLAN_WORDS`] plan of GDPR request notifications given request types,
+    /// events and requester emails (see GdprNotificationService::planNotificationBatchPhp()).
+    pub fn notification_plan(
+        types: &[&[u8]],
+        events: &[&[u8]],
+        recipients: &[&[u8]],
+    ) -> [i64; NOTIFICATION_PLAN_WORDS] {
+        let mut s = [0i64; NOTIFICATION_PLAN_WORDS];
+        s[0] = types.len() as i64;
+        for ((&ty, &event), &recipient) in types.iter().zip(events).zip(recipients) {
+            let email = trim(recipient);
+            let ok = !email.is_empty() && shaped(email);
+            s[5] += i64::from(email.is_empty());
+            s[6] += i64::from(!email.is_empty() && !ok);
+            s[4] += i64::from(!TYPES.contains(&ty));
+            if !EVENTS.contains(&event) {
+                s[3] += 1;
+                continue;
+            }
+            s[1] += 1;
+            s[7] += i64::from(ok);
+            s[2] += i64::from(ty == b"erasure" && event == b"submitted");
+        }
+        s
+    }
+
+    /// A 1-6 digit run at `at` (longer runs stop after six digits, like greedy `\d{1,6}`).
+    fn component(s: &[u8], at: usize) -> Option<(i64, usize)> {
+        let n = s
+            .get(at..)?
+            .iter()
+            .take(6)
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        (n > 0).then(|| {
+            (
+                s[at..at + n]
+                    .iter()
+                    .fold(0i64, |v, &b| v * 10 + i64::from(b - b'0')),
+                at + n,
+            )
+        })
+    }
+
+    /// PHP `preg_match('/\A[vV]?(\d{1,6})(?:\.(\d{1,6}))?(?:\.(\d{1,6}))?/', ...)` encoded as
+    /// `major << 40 | minor << 20 | patch`, or -1 without a match.
+    pub fn version_code(s: &[u8]) -> i64 {
+        let start = usize::from(matches!(s.first(), Some(b'v' | b'V')));
+        let Some((major, mut at)) = component(s, start) else {
+            return -1;
+        };
+        let mut parts = [0i64; 2];
+        for part in &mut parts {
+            if s.get(at) != Some(&b'.') {
+                break;
+            }
+            let Some((value, end)) = component(s, at + 1) else {
+                break;
+            };
+            *part = value;
+            at = end;
+        }
+        (major << (2 * VERSION_SHIFT)) | (parts[0] << VERSION_SHIFT) | parts[1]
+    }
+
+    /// Writes the [`HASH_SUMMARY_WORDS`] summary of NUL-joined collection hashes.
+    ///
+    /// # Safety
+    /// `hashes` must be readable for `hashes_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w541_cleanup_hash_summary_batch(
+        hashes: *const u8,
+        hashes_len: usize,
+        count: usize,
+        max_rows: i64,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(hashes, hashes_len)];
+        unsafe {
+            run(out, out_cap, count, HASH_SUMMARY_WORDS, &inputs, |s, o| {
+                let Some(hashes) = rows(s[0], count) else {
+                    return false;
+                };
+                o.extend_from_slice(&hash_summary(&hashes, max_rows));
+                true
+            })
+        }
+    }
+
+    /// Writes the [`ID_PLAN_WORDS`] plan of an `i64` table of `count` collection ids.
+    ///
+    /// # Safety
+    /// `ids` must be readable for `ids_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w541_deletion_id_plan_batch(
+        ids: *const u8,
+        ids_len: usize,
+        count: usize,
+        chunk_size: i64,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(ids, ids_len)];
+        unsafe {
+            run(out, out_cap, count, ID_PLAN_WORDS, &inputs, |s, o| {
+                let Some(ids) = i64s(s[0], count) else {
+                    return false;
+                };
+                o.extend_from_slice(&id_plan(&ids, chunk_size));
+                true
+            })
+        }
+    }
+
+    /// Writes one `FEATURE_*` mask per NUL-joined subject; `out_cap` must hold `count`.
+    ///
+    /// # Safety
+    /// `subjects` must be readable for `subjects_len` bytes and `out` writable for `out_cap`
+    /// words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w541_subject_feature_mask_batch(
+        subjects: *const u8,
+        subjects_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(subjects, subjects_len)];
+        unsafe {
+            run(out, out_cap, count, count, &inputs, |s, o| {
+                let Some(subjects) = rows(s[0], count) else {
+                    return false;
+                };
+                o.extend(subjects.into_iter().map(subject_features));
+                true
+            })
+        }
+    }
+
+    /// Writes the [`NOTIFICATION_PLAN_WORDS`] plan of `count` NUL-joined types, events and
+    /// recipients.
+    ///
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w541_gdpr_notification_plan_batch(
+        types: *const u8,
+        types_len: usize,
+        events: *const u8,
+        events_len: usize,
+        recipients: *const u8,
+        recipients_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [
+            (types, types_len),
+            (events, events_len),
+            (recipients, recipients_len),
+        ];
+        unsafe {
+            run(
+                out,
+                out_cap,
+                count,
+                NOTIFICATION_PLAN_WORDS,
+                &inputs,
+                |s, o| {
+                    let (Some(types), Some(events), Some(recipients)) =
+                        (rows(s[0], count), rows(s[1], count), rows(s[2], count))
+                    else {
+                        return false;
+                    };
+                    o.extend_from_slice(&notification_plan(&types, &events, &recipients));
+                    true
+                },
+            )
+        }
+    }
+
+    /// Writes one version code (or -1) per NUL-joined version string; `out_cap` must hold
+    /// `count`.
+    ///
+    /// # Safety
+    /// `versions` must be readable for `versions_len` bytes and `out` writable for `out_cap`
+    /// words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w541_version_code_batch(
+        versions: *const u8,
+        versions_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(versions, versions_len)];
+        unsafe {
+            run(out, out_cap, count, count, &inputs, |s, o| {
+                let Some(versions) = rows(s[0], count) else {
+                    return false;
+                };
+                o.extend(versions.into_iter().map(version_code));
+                true
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn le(values: &[i64]) -> Vec<u8> {
+            values.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+
+        /// Per-position ports of the PHP patterns, the oracle for the one-pass scanner.
+        fn naive_features(s: &[u8]) -> i64 {
+            let mut mask = 0;
+            if s.len() >= 4 && s[s.len() - 4..].eq_ignore_ascii_case(b"yenc") {
+                mask |= FEATURE_YENC_SUFFIX;
+            }
+            for i in 0..s.len() {
+                if s[i].is_ascii_digit() {
+                    // `\d+(?:[.,]\d+)? [kmg]b`: any match ends with a digit then ` [kmg]b`.
+                    let mut j = i;
+                    while j < s.len() && s[j].is_ascii_digit() {
+                        j += 1;
+                    }
+                    let mut ends = vec![j];
+                    if j < s.len() && matches!(s[j], b'.' | b',') {
+                        let k = digits_end(s, j + 1);
+                        if let Some(k) = k {
+                            ends.push(k);
+                        }
+                    }
+                    for e in ends {
+                        if s.get(e) == Some(&b' ')
+                            && s.get(e + 1)
+                                .is_some_and(|b| b"kmg".contains(&b.to_ascii_lowercase()))
+                            && s.get(e + 2).is_some_and(|b| b.eq_ignore_ascii_case(&b'b'))
+                        {
+                            mask |= FEATURE_SIZE_TAG;
+                        }
+                    }
+                }
+                if s[i] == b'[' && counter_at(s, i + 1, b']') {
+                    mask |= FEATURE_FILE_COUNTER;
+                }
+                if s[i] == b'(' && counter_at(s, i + 1, b')') {
+                    mask |= FEATURE_PART_COUNTER;
+                }
+                if s[i] == b'"' {
+                    let close = s[i + 1..].iter().position(|&b| b == b'"');
+                    if close.is_some_and(|c| c > 0) {
+                        mask |= FEATURE_QUOTED_NAME;
+                    }
+                }
+                if s[i] == b'.' {
+                    if par2_at(s, i) {
+                        mask |= FEATURE_PAR2;
+                    }
+                    if rar_part_at(s, i) {
+                        mask |= FEATURE_RAR_PART;
+                    }
+                }
+            }
+            mask
+        }
+
+        #[test]
+        fn w541_hash_summary_classifies_and_dedupes() {
+            let sha = b"0123456789abcdef0123456789abcdef01234567";
+            let md5 = b"0123456789abcdef0123456789abcdef";
+            let upper = b"0123456789ABCDEF0123456789abcdef";
+            let hashes: Vec<&[u8]> = vec![
+                sha,
+                md5,
+                sha,
+                upper,
+                b"xyz",
+                b"",
+                md5,
+                b"0123456789abcdef0123456789abcdeg",
+            ];
+            assert_eq!(hash_summary(&hashes, 1), [8, 2, 2, 1, 3, 2, 6]);
+            assert_eq!(hash_summary(&hashes, 0), [8, 2, 2, 1, 3, 2, 6]);
+            assert_eq!(hash_summary(&hashes, 500), [8, 2, 2, 1, 3, 2, 3]);
+            assert_eq!(hash_summary(&[], 500), [0, 0, 0, 0, 0, 0, 0]);
+            // Many distinct keys sharing prefixes still dedupe exactly.
+            let keys: Vec<String> = (0..600).map(|i| format!("{:032x}", i % 300)).collect();
+            let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_bytes()).collect();
+            assert_eq!(hash_summary(&refs, 100)[5], 300);
+        }
+
+        #[test]
+        fn w541_id_plan_counts_runs_and_chunks() {
+            assert_eq!(
+                id_plan(&[5, 3, 4, 4, 10, 0, -2, 12, 11], 2),
+                [9, 2, 6, 1, 2, 3, 3, 12]
+            );
+            assert_eq!(id_plan(&[], 0), [0, 0, 0, 0, 0, 0, 0, 0]);
+            assert_eq!(id_plan(&[0, -1], 10), [2, 2, 0, 0, 0, 0, 0, 0]);
+            assert_eq!(
+                id_plan(&[i64::MAX, i64::MAX - 1, 1], -5),
+                [3, 0, 3, 0, 2, 3, 1, i64::MAX]
+            );
+        }
+
+        #[test]
+        fn w541_subject_features_match_naive_oracle() {
+            let cases: [&[u8]; 14] = [
+                b"[01/10] - \"Movie.part01.rar\" yEnc (1/50) 12.5 MB",
+                b"Show - \"Show.vol00+01.PAR2\" yEnc (3/3)",
+                b"x.vol1+ y.vol+2 z.Vol12+3",
+                b"\"\" \"a\"",
+                b"\"\"\"",
+                b"1 kB",
+                b"1,5 GB 2 xb",
+                b"[1/] [/2] [1/2",
+                b"(1/2]",
+                b"yENC",
+                b"enc",
+                b".PART7.RAR",
+                b".part.rar",
+                b"",
+            ];
+            for case in cases {
+                assert_eq!(subject_features(case), naive_features(case), "{case:?}");
+            }
+            assert_eq!(subject_features(cases[0]), 2 | 4 | 8 | 32 | 64);
+            assert_eq!(subject_features(cases[2]), FEATURE_PAR2);
+            // Pseudo-random byte soup over the trigger alphabet.
+            let alphabet = b"0123[]()\"./+ kmgbKMGBpartvol2yEnc";
+            let mut state = 0x2545_F491_4F6C_DD1Du64;
+            for _ in 0..4000 {
+                let len = (state % 40) as usize;
+                let s: Vec<u8> = (0..len)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        alphabet[(state % alphabet.len() as u64) as usize]
+                    })
+                    .collect();
+                assert_eq!(subject_features(&s), naive_features(&s), "{s:?}");
+            }
+        }
+
+        #[test]
+        fn w541_notification_plan_follows_php_rules() {
+            let types: [&[u8]; 6] = [
+                b"erasure",
+                b"export",
+                b"Erasure",
+                b"erasure",
+                b"restriction",
+                b"export",
+            ];
+            let events: [&[u8]; 6] = [
+                b"submitted",
+                b"export_ready",
+                b"submitted",
+                b"unknown",
+                b"rejected",
+                b"rejected",
+            ];
+            let recipients: [&[u8]; 6] =
+                [b" a@x.io\n", b" \t", b"b@x.io", b"", b"c@x", b"a b@x.io"];
+            assert_eq!(
+                notification_plan(&types, &events, &recipients),
+                [6, 5, 1, 1, 1, 2, 2, 2]
+            );
+            for (email, ok) in [
+                (&b"a@b.c"[..], true),
+                (b"@b.c", false),
+                (b"a@@b.c", false),
+                (b"a@b@c.d", false),
+                (b"a@.c", false),
+                (b"a@b.", false),
+                (b"a.b@c", false),
+                (b"a@b.c.", false),
+                (b"a@b..c", true),
+                (b"a\x0bb@c.d", false),
+            ] {
+                assert_eq!(shaped(email), ok, "{email:?}");
+            }
+            assert_eq!(trim(b" \t\x0ba b\r\n"), b"a b");
+            assert_eq!(trim(b" \t"), b"");
+        }
+
+        #[test]
+        fn w541_version_codes_match_regex() {
+            let code = |a: i64, b: i64, c: i64| (a << 40) | (b << 20) | c;
+            assert_eq!(version_code(b"8.5.12"), code(8, 5, 12));
+            assert_eq!(version_code(b"v13.1"), code(13, 1, 0));
+            assert_eq!(version_code(b"V2"), code(2, 0, 0));
+            assert_eq!(version_code(b"1234567.1"), code(123_456, 0, 0));
+            assert_eq!(version_code(b"1.2.3.4-dev"), code(1, 2, 3));
+            assert_eq!(version_code(b"1..2"), code(1, 0, 0));
+            assert_eq!(version_code(b"1.x.3"), code(1, 0, 0));
+            assert_eq!(
+                version_code(b"999999.999999.999999"),
+                code(999_999, 999_999, 999_999)
+            );
+            assert_eq!(version_code(b"vv1"), -1);
+            assert_eq!(version_code(b" 1"), -1);
+            assert_eq!(version_code(b""), -1);
+        }
+
+        #[test]
+        fn w541_exports_guard_pointers_capacity_and_counts() {
+            let mut out = [0i64; 64];
+            let p = out.as_mut_ptr();
+            let null = std::ptr::null();
+            unsafe {
+                let hashes = b"0123456789abcdef0123456789abcdef\0zz";
+                assert_eq!(
+                    nntmux_w541_cleanup_hash_summary_batch(
+                        hashes.as_ptr(),
+                        hashes.len(),
+                        2,
+                        500,
+                        p,
+                        7
+                    ),
+                    7
+                );
+                assert_eq!(&out[..7], &[2, 0, 1, 0, 1, 1, 3]);
+                assert_eq!(
+                    nntmux_w541_cleanup_hash_summary_batch(
+                        hashes.as_ptr(),
+                        hashes.len(),
+                        2,
+                        500,
+                        p,
+                        6
+                    ),
+                    SHORT_CAPACITY
+                );
+                assert_eq!(
+                    nntmux_w541_cleanup_hash_summary_batch(
+                        hashes.as_ptr(),
+                        hashes.len(),
+                        3,
+                        500,
+                        p,
+                        7
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w541_cleanup_hash_summary_batch(null, 0, 0, 500, p, 7),
+                    7
+                );
+                assert_eq!(
+                    nntmux_w541_cleanup_hash_summary_batch(null, 4, 1, 500, p, 7),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w541_cleanup_hash_summary_batch(
+                        hashes.as_ptr(),
+                        hashes.len(),
+                        2,
+                        500,
+                        std::ptr::null_mut(),
+                        7
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w541_cleanup_hash_summary_batch(
+                        hashes.as_ptr(),
+                        hashes.len(),
+                        2,
+                        500,
+                        p.cast::<u8>().add(1).cast::<i64>(),
+                        7
+                    ),
+                    -1
+                );
+
+                let ids = le(&[3, 1, 2]);
+                assert_eq!(
+                    nntmux_w541_deletion_id_plan_batch(ids.as_ptr(), 24, 3, 2, p, 8),
+                    8
+                );
+                assert_eq!(&out[..8], &[3, 0, 3, 0, 1, 2, 1, 3]);
+                assert_eq!(
+                    nntmux_w541_deletion_id_plan_batch(ids.as_ptr(), 24, 3, 2, p, 7),
+                    SHORT_CAPACITY
+                );
+                assert_eq!(
+                    nntmux_w541_deletion_id_plan_batch(ids.as_ptr(), 16, 3, 2, p, 8),
+                    -1
+                );
+                assert_eq!(nntmux_w541_deletion_id_plan_batch(null, 8, 1, 2, p, 8), -1);
+
+                let subjects = b"a.part1.rar\0b";
+                assert_eq!(
+                    nntmux_w541_subject_feature_mask_batch(
+                        subjects.as_ptr(),
+                        subjects.len(),
+                        2,
+                        p,
+                        2
+                    ),
+                    2
+                );
+                assert_eq!(&out[..2], &[FEATURE_RAR_PART, 0]);
+                assert_eq!(
+                    nntmux_w541_subject_feature_mask_batch(
+                        subjects.as_ptr(),
+                        subjects.len(),
+                        2,
+                        p,
+                        1
+                    ),
+                    SHORT_CAPACITY
+                );
+                assert_eq!(
+                    nntmux_w541_subject_feature_mask_batch(
+                        subjects.as_ptr(),
+                        subjects.len(),
+                        1,
+                        p,
+                        2
+                    ),
+                    -1
+                );
+
+                let (types, events, recipients) =
+                    (b"erasure\0export", b"submitted\0x", b"a@b.c\0b");
+                let plan = |count: usize, cap: usize, ev: &[u8]| {
+                    nntmux_w541_gdpr_notification_plan_batch(
+                        types.as_ptr(),
+                        types.len(),
+                        ev.as_ptr(),
+                        ev.len(),
+                        recipients.as_ptr(),
+                        recipients.len(),
+                        count,
+                        p,
+                        cap,
+                    )
+                };
+                assert_eq!(plan(2, 8, events), 8);
+                assert_eq!(&out[..8], &[2, 1, 1, 1, 0, 0, 1, 1]);
+                assert_eq!(plan(2, 7, events), SHORT_CAPACITY);
+                assert_eq!(plan(2, 8, b"submitted"), -1);
+                assert_eq!(
+                    nntmux_w541_gdpr_notification_plan_batch(null, 0, null, 0, null, 0, 0, p, 8),
+                    8
+                );
+
+                let versions = b"8.5.12\0nope";
+                assert_eq!(
+                    nntmux_w541_version_code_batch(versions.as_ptr(), versions.len(), 2, p, 2),
+                    2
+                );
+                assert_eq!(&out[..2], &[(8 << 40) | (5 << 20) | 12, -1]);
+                assert_eq!(
+                    nntmux_w541_version_code_batch(versions.as_ptr(), versions.len(), 2, p, 1),
+                    SHORT_CAPACITY
+                );
+                assert_eq!(nntmux_w541_version_code_batch(null, 3, 1, p, 2), -1);
+
+                // An output window overlapping an input is refused.
+                let mut shared = le(&[0; 16]);
+                let overlap = shared.as_mut_ptr();
+                assert_eq!(
+                    nntmux_w541_deletion_id_plan_batch(overlap, 8, 1, 2, overlap.cast::<i64>(), 8),
+                    -1
+                );
+            }
+        }
+    }
+}
