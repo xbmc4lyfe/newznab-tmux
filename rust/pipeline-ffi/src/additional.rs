@@ -10029,14 +10029,24 @@ fn nat_compare_left(a: &[u8], ap: &mut usize, b: &[u8], bp: &mut usize) -> i32 {
 
 /// PHP `strnatcmp_ex()` under the C locale; bytes past the end read as the zend_string NUL.
 pub(crate) fn php_strnatcmp(a: &[u8], b: &[u8], fold_case: bool) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-
     if a.is_empty() || b.is_empty() {
         return a.len().cmp(&b.len());
     }
+    php_strnatcmp_from(a, b, fold_case, true)
+}
+
+/// The `strnatcmp_ex()` loop over non-empty `a` and `b`; `leading` is false when resuming
+/// after a compared byte, where PHP no longer skips leading zeros.
+fn php_strnatcmp_from(
+    a: &[u8],
+    b: &[u8],
+    fold_case: bool,
+    mut leading: bool,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
     let (aend, bend) = (a.len(), b.len());
     let (mut ap, mut bp) = (0usize, 0usize);
-    let mut leading = true;
     loop {
         let mut ca = nat_at(a, ap);
         let mut cb = nat_at(b, bp);
@@ -36976,5 +36986,926 @@ mod w516_additional_batch_tests {
             )
         };
         assert_eq!((status, out[0], out[1]), (1, 0, 1));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wave 52.6: AdditionalProcessing batch helpers (`nntmux_w526_*`) for
+// ArchiveCandidate, MediaArticleFetcher, MediaSourceStage, MediaToolFactory and
+// ThumbnailFrameSelector. Same conventions as Wave 51.6: one crossing per batch,
+// NUL-joined strings (plus, when a value holds a NUL, the same list joined with
+// 0x01), machine-order `int64_t` / `double` columns in, fixed-width `int64_t`
+// rows out (read with `unpack('P*')`). Every export returns 1, -1 for invalid
+// input (PHP then computes the batch) or -2 when `out` is null, misaligned or
+// too small, and leaves `out` untouched unless it returns 1.
+// ---------------------------------------------------------------------------
+
+/// Machine-order doubles, `count` of them (PHP `pack('e*')` on little-endian hosts).
+fn w526_floats(packed: &[u8], count: usize) -> Option<Vec<f64>> {
+    if count > W47_MAX_ITEMS || packed.len() != count.checked_mul(8)? {
+        return None;
+    }
+    Some(w466_f64s(packed)?.collect())
+}
+
+/// FNV-1a digest over folded non-negative rows.
+#[inline]
+fn w526_digest(rows: &[i64]) -> i64 {
+    i64::from(rows.iter().fold(W47_FNV_OFFSET, |digest, &row| {
+        w47_fnv(digest, w516_fold(row))
+    }))
+}
+
+/// Multiplicative word hasher for the batch dedupe maps (keys are caller data,
+/// but a batch is bounded and collisions only cost time).
+#[derive(Default)]
+struct W526Hasher(u64);
+
+impl std::hash::Hasher for W526Hasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let (words, tail) = bytes.as_chunks::<8>();
+        for word in words {
+            self.write_u64(u64::from_le_bytes(*word));
+        }
+        let mut last = [0u8; 8];
+        last[..tail.len()].copy_from_slice(tail);
+        self.write_u64(u64::from_le_bytes(last) ^ (tail.len() as u64) << 59);
+    }
+
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, value: usize) {
+        self.write_u64(value as u64);
+    }
+
+    #[inline]
+    fn write_i64(&mut self, value: i64) {
+        self.write_u64(value as u64);
+    }
+
+    #[inline]
+    fn write_u8(&mut self, value: u8) {
+        self.write_u64(u64::from(value));
+    }
+}
+
+type W526Map<K> = std::collections::HashMap<K, usize, std::hash::BuildHasherDefault<W526Hasher>>;
+
+/// Length of the byte-identical prefix of `a` and `b`, a word at a time.
+#[inline]
+fn w526_common_prefix(a: &[u8], b: &[u8]) -> usize {
+    let len = a.len().min(b.len());
+    let mut at = 0;
+    while at + 8 <= len {
+        let diff = u64::from_le_bytes(a[at..at + 8].try_into().unwrap())
+            ^ u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+        if diff != 0 {
+            return at + (diff.trailing_zeros() / 8) as usize;
+        }
+        at += 8;
+    }
+    while at < len && a[at] == b[at] {
+        at += 1;
+    }
+    at
+}
+
+/// `php_strnatcmp(a, b, true)`, resumed after their shared prefix. PHP walks a
+/// byte-identical prefix in lockstep, so at a cut `p >= 1` whose byte `p - 1` is
+/// neither a digit nor a space (no digit run, whitespace skip or leading-zero
+/// skip can cross it) both strings start a fresh, non-leading iteration at `p`,
+/// with PHP's end-of-string checks applying to the remainders.
+fn w526_natcasecmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    if a.is_empty() || b.is_empty() {
+        return a.len().cmp(&b.len());
+    }
+    let mut cut = w526_common_prefix(a, b);
+    while cut > 0 && (a[cut - 1].is_ascii_digit() || c_isspace(a[cut - 1])) {
+        cut -= 1;
+    }
+    if cut == 0 {
+        return php_strnatcmp_from(a, b, true, true);
+    }
+    let (a, b) = (&a[cut..], &b[cut..]);
+    if a.is_empty() || b.is_empty() {
+        return a.len().cmp(&b.len());
+    }
+    php_strnatcmp_from(a, b, true, false)
+}
+
+// --- ArchiveCandidate::volumeSetGroupBatch -----------------------------------
+
+pub(crate) const W526_ARCHIVE_HEADER: usize = 8;
+
+/// `volumeSetKeyPhp()`'s family (0 rar, 1 7z, 2 zip, 3 split, 4 file) and the
+/// key text after its `family:` prefix, for an already extracted file name.
+fn w526_volume_set(name: &[u8]) -> (u8, &[u8]) {
+    if let Some(stem) = match_rar_family_suffix(name) {
+        (0, stem)
+    } else if let Some(stem) = match_7z_family_suffix(name) {
+        (1, stem)
+    } else if let Some(stem) = match_zip_family_suffix(name) {
+        (2, stem)
+    } else if let Some(stem) = match_split_family_suffix(name) {
+        (3, stem)
+    } else {
+        (4, name)
+    }
+}
+
+/// `volumeSetKeyPhp()` over every subject, grouped. `[0]` count, `[1]` distinct
+/// volume sets, `[2..=6]` subjects per family (rar, 7z, zip, split, file), `[7]`
+/// FNV-1a digest; then per subject `family | leader << 3`, where `leader` is
+/// the index of the first subject with the same key. None, so PHP groups them,
+/// when a subject holds a vertical tab: PCRE's `\s` matches it, but the shared
+/// `archive_candidate_file_name_into()` space class does not.
+pub(crate) fn w526_archive_batch(subjects: &[&[u8]]) -> Option<Vec<i64>> {
+    if subjects.iter().any(|subject| subject.contains(&0x0B)) {
+        return None;
+    }
+    let count = subjects.len();
+    let mut out = vec![0i64; W526_ARCHIVE_HEADER + count];
+    out[0] = count as i64;
+    let names: Vec<Vec<u8>> = subjects
+        .iter()
+        .map(|subject| archive_candidate_file_name_vec(subject))
+        .collect();
+    let mut leaders: W526Map<(u8, &[u8])> =
+        W526Map::with_capacity_and_hasher(count, Default::default());
+    for (index, name) in names.iter().enumerate() {
+        let (family, stem) = w526_volume_set(name);
+        out[2 + usize::from(family)] += 1;
+        let leader = *leaders.entry((family, stem)).or_insert(index);
+        out[1] += i64::from(leader == index);
+        out[W526_ARCHIVE_HEADER + index] = i64::from(family) | (leader as i64) << 3;
+    }
+    out[7] = w526_digest(&out[W526_ARCHIVE_HEADER..]);
+    Some(out)
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_count` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w526_archive_volume_set_batch(
+    subjects: *const u8,
+    subjects_len: usize,
+    subject_twin: *const u8,
+    subject_twin_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w49_run(out, out_count, || {
+            let subjects = w49_items(
+                w15_input(subjects, subjects_len)?,
+                w15_input(subject_twin, subject_twin_len)?,
+                count,
+            )?;
+            w526_archive_batch(&subjects)
+        })
+    }
+}
+
+// --- MediaArticleFetcher::planAppendBatch ------------------------------------
+
+pub(crate) const W526_FETCH_HEADER: usize = 9;
+
+/// `append()`'s acceptance loop over articles that all download: `ints` holds
+/// the data lengths, then the yEnc offsets (negative for a copy without a yEnc
+/// header) of `names.len()` articles, both clamped to 0..2^40-1 like
+/// `expected`. `[0]` count, `[1]` first segment, `[2]` first segment not
+/// appended, `[3]` bytes appended, `[4]` stop reason (0 out of segments, 1 byte
+/// limit, 2 no offset, 3 offset mismatch), `[5]` next expected offset (-1 for
+/// none), `[6]` safe witness names, `[7]` whether a direct-video witness may be
+/// recorded, `[8]` FNV-1a digest; then per article `appended | safe_name << 1 |
+/// witness << 2 | chunk << 3`.
+pub(crate) fn w526_fetch_batch(
+    names: &[&[u8]],
+    ints: &[i64],
+    from: i64,
+    expected: Option<i64>,
+    max_bytes: i64,
+) -> Vec<i64> {
+    let count = names.len();
+    let (lengths, offsets) = ints.split_at(count);
+    let mut out = vec![0i64; W526_FETCH_HEADER + count];
+    out[0] = count as i64;
+    for (index, name) in names.iter().enumerate() {
+        if w16_safe_witness_name(name) {
+            out[6] += 1;
+            out[W526_FETCH_HEADER + index] = 2;
+        }
+    }
+    let start = if max_bytes > 0 {
+        from.max(0)
+    } else {
+        count as i64
+    };
+    let mut expected = expected.map(w47_clamp);
+    let (mut index, mut written) = (start, 0i64);
+    let reason = loop {
+        if index >= count as i64 {
+            break 0;
+        }
+        if written >= max_bytes {
+            break 1;
+        }
+        let at = index as usize;
+        let length = w47_clamp(lengths[at]);
+        let raw = offsets[at];
+        let offset = if raw >= 0 {
+            w47_clamp(raw)
+        } else if index == 0 && expected == Some(0) {
+            0
+        } else {
+            break 2;
+        };
+        if expected.is_some_and(|value| value != offset) {
+            break 3;
+        }
+        let chunk = (max_bytes - written).min(length);
+        let row = &mut out[W526_FETCH_HEADER + at];
+        let witness = index == 0 && expected == Some(0) && raw == 0 && *row & 2 != 0;
+        *row |= 1 | i64::from(witness) << 2 | chunk << 3;
+        out[7] |= i64::from(witness);
+        written += chunk;
+        expected = Some(offset + length);
+        index += 1;
+    };
+    out[1] = start;
+    out[2] = index;
+    out[3] = written;
+    out[4] = reason;
+    out[5] = expected.unwrap_or(-1);
+    out[8] = w526_digest(&out[W526_FETCH_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_count` values.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_w526_fetcher_append_plan_batch(
+    names: *const u8,
+    names_len: usize,
+    name_twin: *const u8,
+    name_twin_len: usize,
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    from: i64,
+    expected: i64,
+    has_expected: i32,
+    max_bytes: i64,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w49_run(out, out_count, || {
+            let names = w49_items(
+                w15_input(names, names_len)?,
+                w15_input(name_twin, name_twin_len)?,
+                count,
+            )?;
+            let ints = w47_ints(w15_input(ints, ints_len)?, 2, count)?;
+            Some(w526_fetch_batch(
+                &names,
+                &ints,
+                from,
+                (has_expected != 0).then_some(expected),
+                max_bytes,
+            ))
+        })
+    }
+}
+
+// --- MediaSourceStage::middleVolumeBatch -------------------------------------
+
+pub(crate) const W526_MIDDLE_HEADER: usize = 4;
+
+/// `middleVolume()` over candidate titles and source indexes: candidates of the
+/// head's source are dropped and the rest sorted with a stable
+/// `strnatcasecmp()`. `[0]` count, `[1]` kept, `[2]` input index of the middle
+/// kept title (-1 when none is kept), `[3]` FNV-1a digest; then per candidate
+/// its 1-based sorted position (0 when dropped). None, so PHP sorts, when
+/// `ascii_only` is set and a title holds a non-ASCII byte.
+pub(crate) fn w526_middle_batch(
+    titles: &[&[u8]],
+    indexes: &[i64],
+    head: i64,
+    ascii_only: bool,
+) -> Option<Vec<i64>> {
+    if ascii_only && titles.iter().any(|title| !title.is_ascii()) {
+        return None;
+    }
+    let count = titles.len();
+    let mut out = vec![0i64; W526_MIDDLE_HEADER + count];
+    out[0] = count as i64;
+    let mut order: Vec<usize> = (0..count).filter(|&at| indexes[at] != head).collect();
+    order.sort_by(|&a, &b| w526_natcasecmp(titles[a], titles[b]));
+    out[1] = order.len() as i64;
+    out[2] = order.get(order.len() / 2).map_or(-1, |&at| at as i64);
+    for (position, &at) in order.iter().enumerate() {
+        out[W526_MIDDLE_HEADER + at] = position as i64 + 1;
+    }
+    out[3] = w526_digest(&out[W526_MIDDLE_HEADER..]);
+    Some(out)
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_count` values.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_w526_source_middle_volume_batch(
+    titles: *const u8,
+    titles_len: usize,
+    title_twin: *const u8,
+    title_twin_len: usize,
+    indexes: *const u8,
+    indexes_len: usize,
+    count: usize,
+    head: i64,
+    ascii_only: i32,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w49_run(out, out_count, || {
+            let titles = w49_items(
+                w15_input(titles, titles_len)?,
+                w15_input(title_twin, title_twin_len)?,
+                count,
+            )?;
+            let indexes = w47_ints(w15_input(indexes, indexes_len)?, 1, count)?;
+            w526_middle_batch(&titles, &indexes, head, ascii_only != 0)
+        })
+    }
+}
+
+// --- MediaToolFactory::driverConfigurationBatch ------------------------------
+
+pub(crate) const W526_TOOL_HEADER: usize = 5;
+
+/// `driverConfigurationPhp()` over (timeout, ffmpeg, ffprobe) rows, where an
+/// empty path stands for `false` or `""` (neither sets a binary). `[0]` count,
+/// `[1]` distinct configurations, `[2]` rows setting ffmpeg, `[3]` rows setting
+/// ffprobe, `[4]` FNV-1a digest; then per row `mask | leader << 2` (`mask` bit
+/// 0 ffmpeg, bit 1 ffprobe; `leader` the first row with the same configuration).
+pub(crate) fn w526_tool_batch(ffmpeg: &[&[u8]], ffprobe: &[&[u8]], timeouts: &[i64]) -> Vec<i64> {
+    let count = ffmpeg.len();
+    let mut out = vec![0i64; W526_TOOL_HEADER + count];
+    out[0] = count as i64;
+    let mut leaders: W526Map<(i64, &[u8], &[u8])> =
+        W526Map::with_capacity_and_hasher(count.min(64), Default::default());
+    for index in 0..count {
+        let (binary, probe) = (ffmpeg[index], ffprobe[index]);
+        let mask = i64::from(!binary.is_empty()) | i64::from(!probe.is_empty()) << 1;
+        out[2] += mask & 1;
+        out[3] += mask >> 1;
+        let leader = *leaders
+            .entry((timeouts[index], binary, probe))
+            .or_insert(index);
+        out[1] += i64::from(leader == index);
+        out[W526_TOOL_HEADER + index] = mask | (leader as i64) << 2;
+    }
+    out[4] = w526_digest(&out[W526_TOOL_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_count` values.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_w526_tool_driver_batch(
+    ffmpeg: *const u8,
+    ffmpeg_len: usize,
+    ffmpeg_twin: *const u8,
+    ffmpeg_twin_len: usize,
+    ffprobe: *const u8,
+    ffprobe_len: usize,
+    ffprobe_twin: *const u8,
+    ffprobe_twin_len: usize,
+    timeouts: *const u8,
+    timeouts_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w49_run(out, out_count, || {
+            let ffmpeg = w49_items(
+                w15_input(ffmpeg, ffmpeg_len)?,
+                w15_input(ffmpeg_twin, ffmpeg_twin_len)?,
+                count,
+            )?;
+            let ffprobe = w49_items(
+                w15_input(ffprobe, ffprobe_len)?,
+                w15_input(ffprobe_twin, ffprobe_twin_len)?,
+                count,
+            )?;
+            let timeouts = w47_ints(w15_input(timeouts, timeouts_len)?, 1, count)?;
+            Some(w526_tool_batch(&ffmpeg, &ffprobe, &timeouts))
+        })
+    }
+}
+
+// --- ThumbnailFrameSelector::windowBatch -------------------------------------
+
+pub(crate) const W526_WINDOW_HEADER: usize = 6;
+
+/// Longest duration, in seconds, a window treats as known.
+const W526_MAX_DURATION: f64 = 1e9;
+
+/// `windowPhp()` over probe results. `ints` holds five columns of
+/// `durations.len()` values: hint position (1 head, 2 mid, 3 complete, anything
+/// else no hints), bit rate, hinted available bytes, real size and file size,
+/// clamped to 0..2^40-1 (0 meaning unknown for bit rate and real size). A
+/// duration outside 0..=1e9 (or NaN) is unknown; `attempts` is clamped to
+/// 1..=1,000,000. `[0]` count, `[1]` mid rows, `[2]` rows with a retry from 0
+/// (start after 0), `[3]` other rows starting and spaced at 0, `[4]` latest
+/// start (ms), `[5]` FNV-1a digest; then per row `start_ms << 2 | path` (0 mid,
+/// 1 duration and fraction, 2 bit rate, 3 duration alone) and `spacing_ms`,
+/// each the PHP-rounded seconds times 1000, rounded.
+pub(crate) fn w526_window_batch(ints: &[i64], durations: &[f64], attempts: i64) -> Vec<i64> {
+    use crate::cleaning::wave31_benchmark_binaries_cbp_reset_commands::php_round;
+    let count = durations.len();
+    let attempts = attempts.clamp(1, 1_000_000) as f64;
+    let mut out = vec![0i64; W526_WINDOW_HEADER + 2 * count];
+    out[0] = count as i64;
+    for (at, &duration) in durations.iter().enumerate() {
+        let position = ints[at];
+        let (start, spacing, path) = if position == 2 {
+            out[1] += 1;
+            (0, 0, 0)
+        } else {
+            let hinted = (1..=3).contains(&position);
+            let bit_rate = w47_clamp(ints[count + at]);
+            let hint_bytes = w47_clamp(ints[2 * count + at]);
+            let real_size = w47_clamp(ints[3 * count + at]);
+            let file_size = w47_clamp(ints[4 * count + at]);
+            let known = (0.0..=W526_MAX_DURATION).contains(&duration);
+            let fraction = match position {
+                3 => Some(1.0),
+                1 if real_size > 0 && hint_bytes > 0 => {
+                    w15_php_int_div(hint_bytes, real_size).map(|value| value.min(1.0))
+                }
+                _ => None,
+            };
+            let available = if hint_bytes > 0 {
+                hint_bytes
+            } else {
+                file_size
+            };
+            let (playable, path) = match fraction {
+                Some(fraction) if known => (
+                    duration * fraction * if fraction < 1.0 { 0.85 } else { 1.0 },
+                    1,
+                ),
+                _ if hinted && bit_rate > 0 && available > 0 => (
+                    w15_php_int_div(available * 8, bit_rate).unwrap_or(0.0) * 0.85,
+                    2,
+                ),
+                _ => (if known { duration } else { 0.0 }, 3),
+            };
+            let from = php_round(playable * 0.25, 3);
+            let gap = php_round((playable - from) / attempts, 3);
+            let start = php_round(from * 1000.0, 0) as i64;
+            let spacing = php_round(gap * 1000.0, 0) as i64;
+            out[2] += i64::from(start > 0);
+            out[3] += i64::from(start == 0 && spacing == 0);
+            out[4] = out[4].max(start);
+            (start, spacing, path)
+        };
+        out[W526_WINDOW_HEADER + 2 * at] = start << 2 | path;
+        out[W526_WINDOW_HEADER + 2 * at + 1] = spacing;
+    }
+    out[5] = w526_digest(&out[W526_WINDOW_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_count` values.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_w526_thumbnail_window_batch(
+    ints: *const u8,
+    ints_len: usize,
+    durations: *const u8,
+    durations_len: usize,
+    count: usize,
+    attempts: i64,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w49_run(out, out_count, || {
+            let ints = w47_ints(w15_input(ints, ints_len)?, 5, count)?;
+            let durations = w526_floats(w15_input(durations, durations_len)?, count)?;
+            Some(w526_window_batch(&ints, &durations, attempts))
+        })
+    }
+}
+
+#[cfg(test)]
+mod w526_additional_batch_tests {
+    use super::*;
+    use std::ptr::{null, null_mut};
+
+    fn packed(values: &[i64]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn w526_archive_batch_groups_volume_sets() {
+        let subjects: [&[u8]; 6] = [
+            b"[01/10] - \"Movie.part01.rar\" yEnc (1/50)",
+            b"Movie.part02.rar yEnc (1/50)",
+            b"\"movie.r00\" yEnc",
+            b"\"movie.zip\" yEnc",
+            b"\"0123456789abcdef0123456789abcdef.12\"",
+            b"plain file.nfo",
+        ];
+        let out = w526_archive_batch(&subjects).unwrap();
+        assert_eq!(&out[..7], &[6, 4, 3, 0, 1, 1, 1]);
+        let rows = &out[W526_ARCHIVE_HEADER..];
+        assert_eq!(rows, &[0, 0, 0, 2 | 3 << 3, 3 | 4 << 3, 4 | 5 << 3]);
+        assert_eq!(out[7], w526_digest(rows));
+        assert_eq!(
+            w526_archive_batch(&[]),
+            Some(vec![0, 0, 0, 0, 0, 0, 0, W47_FNV_OFFSET as i64])
+        );
+        // PCRE's \s matches a vertical tab; the shared name parser does not, so PHP decides.
+        assert!(w526_archive_batch(&[b"-\x0b\t"]).is_none());
+    }
+
+    #[test]
+    fn w526_fetch_batch_follows_append_loop() {
+        let names: [&[u8]; 4] = [b"video.mkv", b".hidden", b"a/b", "caf\u{e9}.mp4".as_bytes()];
+        // Contiguous articles of 100 bytes, a 250-byte limit.
+        let ints = [100, 100, 100, 100, 0, 100, 200, 300];
+        let out = w526_fetch_batch(&names, &ints, 0, Some(0), 250);
+        assert_eq!(&out[..8], &[4, 0, 3, 250, 1, 300, 2, 1]);
+        let rows = &out[W526_FETCH_HEADER..];
+        assert_eq!(rows, &[1 | 2 | 4 | 100 << 3, 1 | 100 << 3, 1 | 50 << 3, 2]);
+        // An offset mismatch stops before the article.
+        let out = w526_fetch_batch(
+            &names,
+            &[100, 100, 100, 100, 0, 150, 200, 300],
+            0,
+            Some(0),
+            1000,
+        );
+        assert_eq!((out[2], out[3], out[4], out[5]), (1, 100, 3, 100));
+        // A cached copy is only placed as the file's first article.
+        let out = w526_fetch_batch(
+            &names,
+            &[100, 100, 100, 100, -1, -1, 200, 300],
+            0,
+            Some(0),
+            1000,
+        );
+        assert_eq!((out[2], out[4], out[7]), (1, 2, 0));
+        let out = w526_fetch_batch(
+            &names,
+            &[100, 100, 100, 100, 5, 105, 205, 305],
+            2,
+            None,
+            1000,
+        );
+        assert_eq!(
+            (out[1], out[2], out[3], out[4], out[5]),
+            (2, 4, 200, 0, 405)
+        );
+        let out = w526_fetch_batch(&names, &[100; 8], 0, Some(0), 0);
+        assert_eq!((out[1], out[2], out[3], out[4], out[5]), (4, 4, 0, 0, 0));
+        let out = w526_fetch_batch(&[], &[], -5, None, 10);
+        assert_eq!((out[1], out[2], out[4], out[5]), (0, 0, 0, -1));
+    }
+
+    #[test]
+    fn w526_middle_batch_skips_head_and_sorts_naturally() {
+        let titles: [&[u8]; 5] = [
+            b"set.part10.rar",
+            b"set.part2.rar",
+            b"SET.part1.rar",
+            b"head.rar",
+            b"set.part3.rar",
+        ];
+        let out = w526_middle_batch(&titles, &[7, 8, 9, 1, 10], 1, false).unwrap();
+        assert_eq!(&out[..3], &[5, 4, 4]);
+        assert_eq!(&out[W526_MIDDLE_HEADER..], &[4, 2, 1, 0, 3]);
+        let out = w526_middle_batch(&titles[3..4], &[1], 1, false).unwrap();
+        assert_eq!(&out[..3], &[1, 0, -1]);
+        assert!(w526_middle_batch(&[b"caf\xc3\xa9"], &[0], 1, true).is_none());
+        assert!(w526_middle_batch(&[b"caf\xc3\xa9"], &[0], 1, false).is_some());
+    }
+
+    #[test]
+    fn w526_natcasecmp_matches_php_strnatcmp() {
+        let alphabet = b"aAbZ.-_ 0012399\t\n\x0b\x00rRp";
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound as u64) as usize
+        };
+        for _ in 0..200_000 {
+            let prefix: Vec<u8> = (0..next(12))
+                .map(|_| alphabet[next(alphabet.len())])
+                .collect();
+            let mut a = prefix.clone();
+            let mut b = prefix;
+            a.extend((0..next(6)).map(|_| alphabet[next(alphabet.len())]));
+            b.extend((0..next(6)).map(|_| alphabet[next(alphabet.len())]));
+            assert_eq!(
+                w526_natcasecmp(&a, &b),
+                php_strnatcmp(&a, &b, true),
+                "{:?} {:?}",
+                String::from_utf8_lossy(&a),
+                String::from_utf8_lossy(&b)
+            );
+        }
+        for (a, b) in [
+            (&b"set.part010.rar"[..], &b"set.part10.rar"[..]),
+            (b"x 1", b"x  01"),
+            (b"a0", b"a00"),
+            (b"abc", b"abc"),
+            (b"abc", b"abcd"),
+            (b"abc.", b"abc"),
+            (b"0001", b"01"),
+        ] {
+            assert_eq!(w526_natcasecmp(a, b), php_strnatcmp(a, b, true));
+            assert_eq!(w526_natcasecmp(b, a), php_strnatcmp(b, a, true));
+        }
+    }
+
+    #[test]
+    fn w526_hasher_maps_distinct_keys() {
+        let mut map: W526Map<(i64, &[u8], &[u8])> = W526Map::default();
+        assert_eq!(*map.entry((1, b"ab", b"")).or_insert(0), 0);
+        assert_eq!(*map.entry((1, b"a", b"b")).or_insert(1), 1);
+        assert_eq!(*map.entry((1, b"ab", b"")).or_insert(2), 0);
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn w526_tool_batch_masks_and_dedupes() {
+        let ffmpeg: [&[u8]; 4] = [
+            b"/usr/bin/ffmpeg",
+            b"",
+            b"/usr/bin/ffmpeg",
+            b"/usr/bin/ffmpeg",
+        ];
+        let ffprobe: [&[u8]; 4] = [
+            b"/usr/bin/ffprobe",
+            b"/usr/bin/ffprobe",
+            b"/usr/bin/ffprobe",
+            b"",
+        ];
+        let out = w526_tool_batch(&ffmpeg, &ffprobe, &[60, 60, 60, 60]);
+        assert_eq!(&out[..4], &[4, 3, 3, 3]);
+        assert_eq!(&out[W526_TOOL_HEADER..], &[3, 2 | 1 << 2, 3, 1 | 3 << 2]);
+        let out = w526_tool_batch(&ffmpeg[..2], &ffprobe[..2], &[60, 30]);
+        assert_eq!(out[1], 2);
+    }
+
+    #[test]
+    fn w526_window_batch_matches_php_window() {
+        // Head with a fraction, mid, complete without duration (bit rate), no hints.
+        let durations = [100.0, 50.0, -1.0, 40.0];
+        let ints = [
+            1, 2, 3, 0, // positions
+            0, 0, 1_000_000, 0, // bit rates
+            500, 0, 0, 0, // hinted bytes
+            1000, 0, 0, 0, // real sizes
+            0, 0, 2_000_000, 9, // file sizes
+        ];
+        let out = w526_window_batch(&ints, &durations, 3);
+        assert_eq!(&out[..5], &[4, 1, 3, 0, 10_625]);
+        let rows = &out[W526_WINDOW_HEADER..];
+        // 100 * 0.5 * 0.85 = 42.5 -> from 10.625, spacing round(31.875 / 3, 3) = 10.625.
+        assert_eq!(&rows[..2], &[10_625 << 2 | 1, 10_625]);
+        assert_eq!(&rows[2..4], &[0, 0]);
+        // 2,000,000 * 8 / 1,000,000 * 0.85 = 13.6 -> 3.4 and 3.4.
+        assert_eq!(&rows[4..6], &[3_400 << 2 | 2, 3_400]);
+        assert_eq!(&rows[6..8], &[10_000 << 2 | 3, 10_000]);
+        let out = w526_window_batch(&[0, 0, 0, 0, 0], &[f64::NAN], 0);
+        assert_eq!(&out[..5], &[1, 0, 0, 1, 0]);
+    }
+
+    #[test]
+    fn w526_exports_validate_pointers_and_capacity() {
+        let mut out = [7i64; 64];
+        let subjects = b"a.rar\0b.rar";
+        let call = |out: *mut i64, cap: usize| unsafe {
+            nntmux_w526_archive_volume_set_batch(
+                subjects.as_ptr(),
+                subjects.len(),
+                null(),
+                0,
+                2,
+                out,
+                cap,
+            )
+        };
+        assert_eq!(call(null_mut(), 64), -2);
+        assert_eq!(call(out.as_mut_ptr(), 3), -2);
+        assert_eq!(out[0], 7);
+        assert_eq!(call(out.as_mut_ptr(), 64), 1);
+        assert_eq!((out[0], out[1]), (2, 2));
+        let status = unsafe {
+            nntmux_w526_archive_volume_set_batch(null(), 5, null(), 0, 1, out.as_mut_ptr(), 64)
+        };
+        assert_eq!(status, -1);
+        let status = unsafe {
+            nntmux_w526_archive_volume_set_batch(null(), 0, null(), 0, 0, out.as_mut_ptr(), 64)
+        };
+        assert_eq!((status, out[0]), (1, 0));
+        let status = unsafe {
+            nntmux_w526_archive_volume_set_batch(
+                subjects.as_ptr(),
+                subjects.len(),
+                null(),
+                0,
+                3,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!(status, -1);
+
+        let names = b"video.mkv";
+        let ints = packed(&[10, 0]);
+        let status = unsafe {
+            nntmux_w526_fetcher_append_plan_batch(
+                names.as_ptr(),
+                names.len(),
+                null(),
+                0,
+                ints.as_ptr(),
+                ints.len(),
+                1,
+                0,
+                0,
+                1,
+                100,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!((status, out[3], out[7]), (1, 10, 1));
+        let status = unsafe {
+            nntmux_w526_fetcher_append_plan_batch(
+                names.as_ptr(),
+                names.len(),
+                null(),
+                0,
+                ints.as_ptr(),
+                8,
+                1,
+                0,
+                0,
+                1,
+                100,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!(status, -1);
+
+        let titles = b"b\0a";
+        let indexes = packed(&[1, 2]);
+        let status = unsafe {
+            nntmux_w526_source_middle_volume_batch(
+                titles.as_ptr(),
+                titles.len(),
+                null(),
+                0,
+                indexes.as_ptr(),
+                indexes.len(),
+                2,
+                9,
+                1,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!((status, out[1], out[2]), (1, 2, 0));
+        let twin = b"b\x01a";
+        let joined = b"b\0a";
+        let status = unsafe {
+            nntmux_w526_source_middle_volume_batch(
+                joined.as_ptr(),
+                joined.len(),
+                twin.as_ptr(),
+                twin.len(),
+                indexes.as_ptr(),
+                indexes.len(),
+                2,
+                9,
+                0,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!(status, 1);
+
+        let ffmpeg = b"ffmpeg\0";
+        let ffprobe = b"\0ffprobe";
+        let timeouts = packed(&[60, 60]);
+        let status = unsafe {
+            nntmux_w526_tool_driver_batch(
+                ffmpeg.as_ptr(),
+                ffmpeg.len(),
+                null(),
+                0,
+                ffprobe.as_ptr(),
+                ffprobe.len(),
+                null(),
+                0,
+                timeouts.as_ptr(),
+                timeouts.len(),
+                2,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!((status, out[1], out[5], out[6]), (1, 2, 1, 2 | 1 << 2));
+        let status = unsafe {
+            nntmux_w526_tool_driver_batch(
+                ffmpeg.as_ptr(),
+                ffmpeg.len(),
+                null(),
+                0,
+                ffprobe.as_ptr(),
+                ffprobe.len(),
+                null(),
+                0,
+                timeouts.as_ptr(),
+                timeouts.len(),
+                2,
+                out.as_mut_ptr().wrapping_byte_add(1),
+                8,
+            )
+        };
+        assert_eq!(status, -2);
+
+        let ints = packed(&[1, 0, 100, 1000, 0]);
+        let durations = 10.0f64.to_ne_bytes();
+        let status = unsafe {
+            nntmux_w526_thumbnail_window_batch(
+                ints.as_ptr(),
+                ints.len(),
+                durations.as_ptr(),
+                8,
+                1,
+                3,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!((status, out[0]), (1, 1));
+        let status = unsafe {
+            nntmux_w526_thumbnail_window_batch(
+                ints.as_ptr(),
+                ints.len(),
+                durations.as_ptr(),
+                4,
+                1,
+                3,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!(status, -1);
+        let status = unsafe {
+            nntmux_w526_thumbnail_window_batch(null(), 0, null(), 0, 0, 3, out.as_mut_ptr(), 64)
+        };
+        assert_eq!((status, out[0]), (1, 0));
     }
 }

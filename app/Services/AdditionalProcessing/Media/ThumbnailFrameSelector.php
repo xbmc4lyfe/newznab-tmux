@@ -288,4 +288,238 @@ class ThumbnailFrameSelector
 
         return self::$ffi;
     }
+
+    // Rust is the default only while the paired W52.6 benchmark clears 1.5x on all four metrics.
+    private const bool W52_RUST_FFI_DEFAULT = true;
+
+    public const string W52_FFI_CDEF = <<<'C'
+        int32_t nntmux_w526_thumbnail_window_batch(const char *ints, size_t ints_len, const char *durations, size_t durations_len, size_t count, int64_t attempts, int64_t *out, size_t out_count);
+        C;
+
+    public const int W52_WINDOW_HEADER = 6;
+
+    /** `windowBatch()` position codes; any other code means no hints. */
+    public const int W52_POSITION_HEAD = 1;
+
+    public const int W52_POSITION_MID = 2;
+
+    public const int W52_POSITION_COMPLETE = 3;
+
+    private const int W52_VALUE_CAP = (1 << 40) - 1;
+
+    private const float W52_MAX_DURATION = 1e9;
+
+    private const int W52_MAX_ATTEMPTS = 1_000_000;
+
+    private const int W52_MAX_ITEMS = 1_048_576;
+
+    private static ?bool $w52RustFfi = null;
+
+    private static FFI|false|null $w52Ffi = null;
+
+    private static ?CData $w52Out = null;
+
+    private static int $w52Capacity = 0;
+
+    /**
+     * `windowPhp()` over already probed sources, in milliseconds.
+     *
+     * Per source: a position code (`W52_POSITION_*`), the probed duration (outside 0..1e9 or NaN
+     * when unknown), the probed bit rate, the hinted available bytes, the hinted real size and
+     * the file size; byte counts and bit rates are clamped to 0..2^40-1, where 0 is an unknown
+     * bit rate or real size. Missing values are unknown or 0. `$attempts` is clamped to
+     * 1..1,000,000. Layout: `[0]` count, `[1]` mid sources, `[2]` windows starting after 0 (so
+     * retried from 0), `[3]` other windows starting and spaced at 0, `[4]` latest start, `[5]`
+     * FNV-1a digest; then per source `start << 2 | path` (0 mid, 1 duration and available
+     * fraction, 2 bit rate, 3 duration alone) and the spacing, each `(int) round($seconds * 1000)`
+     * of the rounded window.
+     *
+     * @param  array<array-key, int>  $positions
+     * @param  array<array-key, float>  $durations
+     * @param  array<array-key, int>  $bitRates
+     * @param  array<array-key, int>  $hintBytes
+     * @param  array<array-key, int>  $realSizes
+     * @param  array<array-key, int>  $fileSizes
+     * @return list<int>
+     */
+    public static function windowBatch(array $positions, array $durations, array $bitRates, array $hintBytes, array $realSizes, array $fileSizes, int $attempts): array
+    {
+        return (self::usesW52RustFfi() ? self::windowBatchNative($positions, $durations, $bitRates, $hintBytes, $realSizes, $fileSizes, $attempts) : null)
+            ?? self::windowBatchPhp($positions, $durations, $bitRates, $hintBytes, $realSizes, $fileSizes, $attempts);
+    }
+
+    /**
+     * @param  array<array-key, int>  $positions
+     * @param  array<array-key, float>  $durations
+     * @param  array<array-key, int>  $bitRates
+     * @param  array<array-key, int>  $hintBytes
+     * @param  array<array-key, int>  $realSizes
+     * @param  array<array-key, int>  $fileSizes
+     * @return list<int>
+     */
+    public static function windowBatchPhp(array $positions, array $durations, array $bitRates, array $hintBytes, array $realSizes, array $fileSizes, int $attempts): array
+    {
+        $positions = array_values($positions);
+        $durations = array_values($durations);
+        $bitRates = array_values($bitRates);
+        $hintBytes = array_values($hintBytes);
+        $realSizes = array_values($realSizes);
+        $fileSizes = array_values($fileSizes);
+        $attempts = min(max($attempts, 1), self::W52_MAX_ATTEMPTS);
+        $out = [\count($positions), 0, 0, 0, 0, 0];
+        $rows = [];
+        foreach ($positions as $index => $position) {
+            if ($position === self::W52_POSITION_MID) {
+                $out[1]++;
+                $rows[] = 0;
+                $rows[] = 0;
+
+                continue;
+            }
+            $bitRate = min(max($bitRates[$index] ?? 0, 0), self::W52_VALUE_CAP);
+            $hinted = min(max($hintBytes[$index] ?? 0, 0), self::W52_VALUE_CAP);
+            $realSize = min(max($realSizes[$index] ?? 0, 0), self::W52_VALUE_CAP);
+            $fileSize = min(max($fileSizes[$index] ?? 0, 0), self::W52_VALUE_CAP);
+            $duration = (float) ($durations[$index] ?? -1.0);
+            $known = $duration >= 0.0 && $duration <= self::W52_MAX_DURATION;
+            $fraction = match (true) {
+                $position === self::W52_POSITION_COMPLETE => 1.0,
+                $position === self::W52_POSITION_HEAD && $realSize > 0 && $hinted > 0 => min(1.0, $hinted / $realSize),
+                default => null,
+            };
+            $available = $hinted > 0 ? $hinted : $fileSize;
+            if ($known && $fraction !== null) {
+                $playable = $duration * $fraction * ($fraction < 1.0 ? self::PLAYABLE_MARGIN : 1.0);
+                $path = 1;
+            } elseif ($position >= self::W52_POSITION_HEAD && $position <= self::W52_POSITION_COMPLETE && $bitRate > 0 && $available > 0) {
+                $playable = $available * 8 / $bitRate * self::PLAYABLE_MARGIN;
+                $path = 2;
+            } else {
+                $playable = $known ? $duration : 0.0;
+                $path = 3;
+            }
+            $from = round($playable * self::START_FRACTION, 3);
+            $start = (int) round($from * 1000.0);
+            $spacing = (int) round(round(($playable - $from) / $attempts, 3) * 1000.0);
+            if ($start > 0) {
+                $out[2]++;
+            } elseif ($spacing === 0) {
+                $out[3]++;
+            }
+            $out[4] = max($out[4], $start);
+            $rows[] = $start << 2 | $path;
+            $rows[] = $spacing;
+        }
+        $digest = 2_166_136_261;
+        foreach ($rows as $row) {
+            $digest = (($digest ^ (($row ^ ($row >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+        }
+        $out[5] = $digest;
+
+        return [...$out, ...$rows];
+    }
+
+    /**
+     * Rust windows, or null when PHP must compute them (unavailable library or invalid input).
+     *
+     * @param  array<array-key, int>  $positions
+     * @param  array<array-key, float>  $durations
+     * @param  array<array-key, int>  $bitRates
+     * @param  array<array-key, int>  $hintBytes
+     * @param  array<array-key, int>  $realSizes
+     * @param  array<array-key, int>  $fileSizes
+     * @return list<int>|null
+     */
+    public static function windowBatchNative(array $positions, array $durations, array $bitRates, array $hintBytes, array $realSizes, array $fileSizes, int $attempts): ?array
+    {
+        $count = \count($positions);
+        $fields = self::W52_WINDOW_HEADER + 2 * $count;
+        $binding = $count <= self::W52_MAX_ITEMS ? self::w52Binding($fields) : null;
+        if ($binding === null) {
+            return null;
+        }
+        [$ffi, $out] = $binding;
+        $ints = pack(
+            'q*',
+            ...array_values($positions),
+            ...self::w52Column($bitRates, $count, 0),
+            ...self::w52Column($hintBytes, $count, 0),
+            ...self::w52Column($realSizes, $count, 0),
+            ...self::w52Column($fileSizes, $count, 0),
+        );
+        $packed = pack('e*', ...self::w52Column($durations, $count, -1.0));
+        try {
+            // @phpstan-ignore method.notFound
+            $status = $ffi->nntmux_w526_thumbnail_window_batch($ints, \strlen($ints), $packed, \strlen($packed), $count, $attempts, $out, $fields);
+            if ($status !== 1) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $fields * 8));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Run `$callback` with the Wave 52.6 Rust batch path forced on or off, then restore the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW52RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$w52RustFfi;
+        self::$w52RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$w52RustFfi = $previous;
+        }
+    }
+
+    public static function usesW52RustFfi(): bool
+    {
+        return self::$w52RustFfi ?? self::W52_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * `$values` as a list of exactly `$count` values, padded with `$missing`.
+     *
+     * @template T of int|float
+     *
+     * @param  array<array-key, T>  $values
+     * @param  T  $missing
+     * @return list<T>
+     */
+    private static function w52Column(array $values, int $count, int|float $missing): array
+    {
+        return \count($values) === $count ? array_values($values) : array_pad(\array_slice(array_values($values), 0, $count), $count, $missing);
+    }
+
+    /**
+     * The cached Wave 52.6 binding and an output buffer of at least `$fields` values, or null.
+     *
+     * @return array{0: FFI, 1: CData}|null
+     */
+    private static function w52Binding(int $fields): ?array
+    {
+        try {
+            self::$w52Ffi ??= RustPipelineLibrary::resolveDomain('additional_w52', self::W52_FFI_CDEF) ?? false;
+            if (self::$w52Ffi === false) {
+                return null;
+            }
+            if (self::$w52Out === null || self::$w52Capacity < $fields) {
+                self::$w52Capacity = max(256, $fields);
+                self::$w52Out = self::$w52Ffi->new('int64_t['.self::$w52Capacity.']');
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        return [self::$w52Ffi, self::$w52Out];
+    }
 }
