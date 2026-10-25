@@ -301,4 +301,113 @@ final readonly class BinariesConfig
 
         return $ffi === false ? null : $ffi;
     }
+
+    /**
+     * PHP stays the default for summarizeChunkSettingsBatch(): the paired benchmark in
+     * tests/Unit/RustBinariesConfigServiceHandlerHeaderW41ParityTest.php does not clear 1.5x.
+     */
+    public const bool W411_RUST_FFI_DEFAULT = false;
+
+    private const array W411_CHUNK_KEYS = ['configs', 'invalid_rows', 'non_positive', 'header_exceeds_sql', 'over_cap', 'obfuscation_disabled', 'max_sql_chunk'];
+
+    /**
+     * Summarizes candidate chunk settings rows (`headerChunkSize`, `sqlChunkSize`, `perArticleObfuscationMinArticles`):
+     * a row whose header or SQL chunk is not a positive int (or 1-18 digit string) is non-positive; otherwise a header
+     * chunk above the SQL chunk exceeds it, an SQL chunk above `$sqlCap` is over the cap, and the largest SQL chunk is
+     * reported (0 when none). An obfuscation minimum of 0 disables the filter; non-array rows are invalid.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeChunkSettingsBatch(array $rows, int $sqlCap = 10000): array
+    {
+        return (self::usesW411RustFfi() ? self::summarizeChunkSettingsBatchNative($rows, $sqlCap) : null)
+            ?? self::summarizeChunkSettingsBatchPhp($rows, $sqlCap);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeChunkSettingsBatchPhp(array $rows, int $sqlCap = 10000): array
+    {
+        $summary = array_fill_keys(self::W411_CHUNK_KEYS, 0);
+        $summary['configs'] = \count($rows);
+        foreach ($rows as $row) {
+            if (! \is_array($row)) {
+                $summary['invalid_rows']++;
+
+                continue;
+            }
+            $header = BinariesService::w411Int($row['headerChunkSize'] ?? null);
+            $sql = BinariesService::w411Int($row['sqlChunkSize'] ?? null);
+            if ($header === null || $sql === null || $header <= 0 || $sql <= 0) {
+                $summary['non_positive']++;
+            } else {
+                $summary['header_exceeds_sql'] += (int) ($header > $sql);
+                $summary['over_cap'] += (int) ($sql > $sqlCap);
+                $summary['max_sql_chunk'] = max($summary['max_sql_chunk'], $sql);
+            }
+            $summary['obfuscation_disabled'] += (int) (BinariesService::w411Int($row['perArticleObfuscationMinArticles'] ?? null) === 0);
+        }
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>|null
+     */
+    public static function summarizeChunkSettingsBatchNative(array $rows, int $sqlCap = 10000): ?array
+    {
+        $words = [$sqlCap, \count($rows)];
+        $blob = [];
+        foreach ($rows as $row) {
+            if (\is_array($row)) {
+                BinariesService::w411PackRow($words, $blob, [$row['headerChunkSize'] ?? null, $row['sqlChunkSize'] ?? null,
+                    $row['perArticleObfuscationMinArticles'] ?? null]);
+            } else {
+                $words[] = 0;
+            }
+        }
+        $values = BinariesService::w411Invoke(self::w411FfiSlot(), 1, $words, $blob);
+
+        return $values !== null && \count($values) === \count(self::W411_CHUNK_KEYS) ? array_combine(self::W411_CHUNK_KEYS, $values) : null;
+    }
+
+    public static function useW411RustFfi(bool $enable = true): void
+    {
+        self::w411ToggleState($enable, true);
+    }
+
+    public static function usesW411RustFfi(): bool
+    {
+        return self::w411ToggleState() ?? self::W411_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW411RustFfi(): void
+    {
+        self::w411ToggleState(null, true);
+        $slot = &self::w411FfiSlot();
+        $slot = null;
+    }
+
+    private static function w411ToggleState(?bool $next = null, bool $write = false): ?bool
+    {
+        // Readonly classes cannot declare static properties.
+        static $useRustFfi = null;
+        if ($write) {
+            $useRustFfi = $next;
+        }
+
+        return $useRustFfi;
+    }
+
+    /** The cached Wave 41.1 library handle, by reference (readonly classes cannot declare static properties). */
+    private static function &w411FfiSlot(): FFI|false|null
+    {
+        static $ffi = null;
+
+        return $ffi;
+    }
 }

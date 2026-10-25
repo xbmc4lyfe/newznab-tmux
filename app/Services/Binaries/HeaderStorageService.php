@@ -687,4 +687,100 @@ final class HeaderStorageService
             Log::debug('Unable to record ingestion activity: '.$e->getMessage());
         }
     }
+
+    /**
+     * PHP stays the default for summarizeStorageChunkBatch(): the paired benchmark in
+     * tests/Unit/RustBinariesConfigServiceHandlerHeaderW41ParityTest.php does not clear 1.5x.
+     */
+    public const bool W411_RUST_FFI_DEFAULT = false;
+
+    private const array W411_STORAGE_KEYS = ['headers', 'invalid_rows', 'chunks', 'missing_message_id', 'bad_bytes', 'oversized_subject', 'total_bytes'];
+
+    private static ?bool $w411UseRustFfi = null;
+
+    private static FFI|false|null $w411Ffi = null;
+
+    /**
+     * Summarizes a header storage batch (`Message-ID`, `Bytes`, `Subject`): the batch splits into ceil(rows /
+     * max(1, `$chunkSize`)) chunks, a message id that is not a string or trim()s to '' is missing, a byte count that is
+     * not a non-negative int (or 1-18 digit string) is bad and other counts add to the total (saturating at
+     * PHP_INT_MAX), and string subjects longer than 255 bytes are oversized. Non-array rows are invalid.
+     *
+     * @param  array<array-key, mixed>  $headers
+     * @return array<string, int>
+     */
+    public static function summarizeStorageChunkBatch(array $headers, int $chunkSize = 500): array
+    {
+        return (self::usesW411RustFfi() ? self::summarizeStorageChunkBatchNative($headers, $chunkSize) : null)
+            ?? self::summarizeStorageChunkBatchPhp($headers, $chunkSize);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $headers
+     * @return array<string, int>
+     */
+    public static function summarizeStorageChunkBatchPhp(array $headers, int $chunkSize = 500): array
+    {
+        $summary = array_fill_keys(self::W411_STORAGE_KEYS, 0);
+        $rows = \count($headers);
+        $size = max(1, $chunkSize);
+        $summary['headers'] = $rows;
+        $summary['chunks'] = intdiv($rows, $size) + (int) ($rows % $size !== 0);
+        foreach ($headers as $header) {
+            if (! \is_array($header)) {
+                $summary['invalid_rows']++;
+
+                continue;
+            }
+            $messageId = $header['Message-ID'] ?? null;
+            $summary['missing_message_id'] += (int) (! \is_string($messageId) || trim($messageId) === '');
+            $bytes = BinariesService::w411Int($header['Bytes'] ?? null);
+            if ($bytes === null || $bytes < 0) {
+                $summary['bad_bytes']++;
+            } else {
+                $total = $summary['total_bytes'];
+                $summary['total_bytes'] = $bytes > PHP_INT_MAX - $total ? PHP_INT_MAX : $total + $bytes;
+            }
+            $subject = $header['Subject'] ?? null;
+            $summary['oversized_subject'] += (int) (\is_string($subject) && \strlen($subject) > 255);
+        }
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $headers
+     * @return array<string, int>|null
+     */
+    public static function summarizeStorageChunkBatchNative(array $headers, int $chunkSize = 500): ?array
+    {
+        $words = [$chunkSize, \count($headers)];
+        $blob = [];
+        foreach ($headers as $header) {
+            if (\is_array($header)) {
+                BinariesService::w411PackRow($words, $blob, [$header['Message-ID'] ?? null, $header['Bytes'] ?? null, $header['Subject'] ?? null]);
+            } else {
+                $words[] = 0;
+            }
+        }
+        $values = BinariesService::w411Invoke(self::$w411Ffi, 5, $words, $blob);
+
+        return $values !== null && \count($values) === \count(self::W411_STORAGE_KEYS) ? array_combine(self::W411_STORAGE_KEYS, $values) : null;
+    }
+
+    public static function useW411RustFfi(bool $enable = true): void
+    {
+        self::$w411UseRustFfi = $enable;
+    }
+
+    public static function usesW411RustFfi(): bool
+    {
+        return self::$w411UseRustFfi ?? self::W411_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW411RustFfi(): void
+    {
+        self::$w411UseRustFfi = null;
+        self::$w411Ffi = null;
+    }
 }
