@@ -26153,3 +26153,643 @@ mod wave37_5_search_index_offset_worker_command {
         }
     }
 }
+
+/// Wave 38.5: pure planners behind the `Search` facade, the base `Controller`,
+/// `GuestLayout`, `AdminPageController` and `AdminStatusController`.
+mod wave38_5_search_facade_controller_guest_layout {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const DECLINE: isize = -1;
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+    const MAX_PARTS: usize = 4096;
+    /// Bytes stripped by PHP's default `trim()`.
+    const PHP_TRIM: &[u8] = b" \t\n\r\0\x0B";
+    /// Whitespace runs collapsed by the phrase/meta normalizers.
+    const COLLAPSE: &[u8] = b" \t\n\r\0\x0B\x0C";
+    const SEARCH_DEFAULT_LIMIT: i64 = 1000;
+    const SEARCH_MAX_LIMIT: i64 = 10_000;
+    const PAGE_MAX_DIGITS: usize = 18;
+    const DEFAULT_APP_NAME: &[u8] = b"NNTmux";
+    const DEFAULT_DESCRIPTION_BYTES: i64 = 160;
+    const MAX_DESCRIPTION_BYTES: i64 = 1000;
+    /// `ServiceStatusEnum` cases in declaration order with their severity.
+    const SERVICE_STATUSES: [(&[u8], i64); 5] = [
+        (b"operational", 0),
+        (b"degraded", 1),
+        (b"partial_outage", 3),
+        (b"major_outage", 4),
+        (b"maintenance", 2),
+    ];
+    const INCIDENT_STATUSES: [&[u8]; 4] =
+        [b"investigating", b"identified", b"monitoring", b"resolved"];
+    const INCIDENT_IMPACTS: [&[u8]; 4] = [b"none", b"minor", b"major", b"critical"];
+
+    fn unpack(input: &[u8]) -> Option<Vec<&[u8]>> {
+        let count = u32::from_le_bytes(input.get(..4)?.try_into().ok()?) as usize;
+        if count > MAX_PARTS || count > (input.len() - 4) / 4 {
+            return None;
+        }
+        let mut cursor = 4usize;
+        let mut parts = Vec::with_capacity(count);
+        for _ in 0..count {
+            let length_end = cursor.checked_add(4)?;
+            let length =
+                u32::from_le_bytes(input.get(cursor..length_end)?.try_into().ok()?) as usize;
+            let end = length_end.checked_add(length)?;
+            parts.push(input.get(length_end..end)?);
+            cursor = end;
+        }
+        (cursor == input.len()).then_some(parts)
+    }
+
+    fn pack(parts: &[Vec<u8>]) -> Option<Vec<u8>> {
+        let count = u32::try_from(parts.len()).ok()?;
+        let size = parts.iter().try_fold(4usize, |size, part| {
+            u32::try_from(part.len()).ok()?;
+            size.checked_add(4)?.checked_add(part.len())
+        })?;
+        if size > isize::MAX as usize {
+            return None;
+        }
+        let mut out = Vec::with_capacity(size);
+        out.extend_from_slice(&count.to_le_bytes());
+        for part in parts {
+            out.extend_from_slice(&(part.len() as u32).to_le_bytes());
+            out.extend_from_slice(part);
+        }
+        Some(out)
+    }
+
+    /// Canonical decimal produced by PHP `(string) $int`.
+    fn integer(bytes: &[u8]) -> Option<i64> {
+        let value: i64 = std::str::from_utf8(bytes).ok()?.parse().ok()?;
+        (value.to_string().as_bytes() == bytes).then_some(value)
+    }
+
+    fn flag(bytes: &[u8]) -> Option<bool> {
+        match bytes {
+            b"0" => Some(false),
+            b"1" => Some(true),
+            _ => None,
+        }
+    }
+
+    fn text(value: i64) -> Vec<u8> {
+        value.to_string().into_bytes()
+    }
+
+    fn bit(value: bool) -> Vec<u8> {
+        if value { b"1".to_vec() } else { b"0".to_vec() }
+    }
+
+    fn php_trim(bytes: &[u8]) -> &[u8] {
+        let start = bytes
+            .iter()
+            .position(|b| !PHP_TRIM.contains(b))
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|b| !PHP_TRIM.contains(b))
+            .map_or(start, |i| i + 1);
+        &bytes[start..end]
+    }
+
+    /// `implode(' ', preg_split('/[ \t\n\r\x00\x0B\x0C]+/', $s, -1, PREG_SPLIT_NO_EMPTY))`.
+    fn collapse(bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes.len());
+        for word in bytes
+            .split(|b| COLLAPSE.contains(b))
+            .filter(|word| !word.is_empty())
+        {
+            if !out.is_empty() {
+                out.push(b' ');
+            }
+            out.extend_from_slice(word);
+        }
+        out
+    }
+
+    /// Trimmed all-digit string of 1..=18 bytes (`strspn` digits, no sign).
+    fn digits(bytes: &[u8]) -> Option<i64> {
+        let trimmed = php_trim(bytes);
+        if trimmed.is_empty()
+            || trimmed.len() > PAGE_MAX_DIGITS
+            || !trimmed.iter().all(u8::is_ascii_digit)
+        {
+            return None;
+        }
+        trimmed.iter().try_fold(0i64, |acc, d| {
+            acc.checked_mul(10)?.checked_add(i64::from(d - b'0'))
+        })
+    }
+
+    /// Mode 1: `Search::planSearchPhrases`.
+    fn search_phrases(is_array: &[u8], limit: &[u8], phrases: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        if !flag(is_array)? && phrases.len() != 1 {
+            return None;
+        }
+        let limit = integer(limit)?;
+        let limit = if limit < 1 {
+            SEARCH_DEFAULT_LIMIT
+        } else {
+            limit.min(SEARCH_MAX_LIMIT)
+        };
+        let mut kept: Vec<Vec<u8>> = Vec::with_capacity(phrases.len());
+        let mut seen: Vec<Vec<u8>> = Vec::with_capacity(phrases.len());
+        let (mut empty, mut duplicates) = (0i64, 0i64);
+        for phrase in phrases {
+            let phrase = collapse(phrase);
+            if phrase.is_empty() {
+                empty += 1;
+                continue;
+            }
+            let key = phrase.to_ascii_lowercase();
+            if seen.contains(&key) {
+                duplicates += 1;
+                continue;
+            }
+            seen.push(key);
+            kept.push(phrase);
+        }
+        let mut out = Vec::with_capacity(4 + kept.len());
+        out.push(text(limit));
+        out.push(text(empty));
+        out.push(text(duplicates));
+        out.push(kept.join(&b' '));
+        out.extend(kept);
+        Some(out)
+    }
+
+    /// Mode 2: `Controller::planControllerPagination`.
+    fn pagination(parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        let [page, per_page, total, default, max] = parts else {
+            return None;
+        };
+        let (total, default, max) = (integer(total)?, integer(default)?, integer(max)?);
+        let max = max.max(1);
+        let default = default.max(1).min(max);
+        let requested = digits(per_page);
+        let per = match requested {
+            None | Some(0) => default,
+            Some(n) => n.min(max),
+        };
+        let mut clamped = requested.is_some_and(|n| n > max);
+        let total = total.max(0);
+        let last = (total / per + i64::from(total % per > 0)).max(1);
+        let page = match digits(page) {
+            None | Some(0) => 1,
+            Some(p) if p > last => {
+                clamped = true;
+                last
+            }
+            Some(p) => p,
+        };
+        Some(vec![
+            text(page),
+            text(per),
+            text((page - 1) * per),
+            text(last),
+            bit(clamped),
+        ])
+    }
+
+    /// Mode 3: `GuestLayout::planGuestLayoutMeta`.
+    fn guest_meta(parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        let [title, description, app_name, max] = parts else {
+            return None;
+        };
+        let max = integer(max)?;
+        let max = if max < 1 {
+            DEFAULT_DESCRIPTION_BYTES
+        } else {
+            max.min(MAX_DESCRIPTION_BYTES)
+        } as usize;
+        let title = collapse(title);
+        let mut app = collapse(app_name);
+        if app.is_empty() {
+            app = DEFAULT_APP_NAME.to_vec();
+        }
+        let meta_title = if title.is_empty() || title.eq_ignore_ascii_case(&app) {
+            app.clone()
+        } else {
+            [title.as_slice(), b" - ", app.as_slice()].concat()
+        };
+        let mut description = collapse(description);
+        let truncated = description.len() > max;
+        if truncated {
+            let mut cut = max;
+            while cut > 0 && description[cut] & 0xC0 == 0x80 {
+                cut -= 1;
+            }
+            description.truncate(cut);
+            while description.last() == Some(&b' ') {
+                description.pop();
+            }
+            description.extend_from_slice(b"...");
+        }
+        Some(vec![title, meta_title, description, bit(truncated)])
+    }
+
+    /// Mode 4: `AdminPageController::summarizeServiceStatuses`.
+    fn service_summary(statuses: &[&[u8]]) -> Vec<Vec<u8>> {
+        let mut counts = [0i64; SERVICE_STATUSES.len()];
+        let (mut unknown, mut worst) = (0i64, 0usize);
+        for status in statuses {
+            let status = php_trim(status).to_ascii_lowercase();
+            match SERVICE_STATUSES
+                .iter()
+                .position(|(value, _)| *value == status)
+            {
+                Some(slot) => {
+                    counts[slot] += 1;
+                    if SERVICE_STATUSES[slot].1 > SERVICE_STATUSES[worst].1 {
+                        worst = slot;
+                    }
+                }
+                None => unknown += 1,
+            }
+        }
+        let severity = SERVICE_STATUSES[worst].1;
+        let mut out = Vec::with_capacity(10);
+        out.push(text(statuses.len() as i64));
+        out.extend(counts.iter().map(|c| text(*c)));
+        out.push(text(unknown));
+        out.push(SERVICE_STATUSES[worst].0.to_vec());
+        out.push(text(severity));
+        out.push(bit(unknown == 0 && severity == 0));
+        out
+    }
+
+    /// Mode 5: `AdminStatusController::validateIncidentPayload`.
+    fn incident_payload(parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        let [status, impact, ids @ ..] = parts else {
+            return None;
+        };
+        let pick = |value: &[u8], allowed: &[&[u8]]| -> Option<Vec<u8>> {
+            let value = php_trim(value).to_ascii_lowercase();
+            allowed.contains(&value.as_slice()).then_some(value)
+        };
+        let status = pick(status, &INCIDENT_STATUSES);
+        let impact = pick(impact, &INCIDENT_IMPACTS);
+        let mut accepted: Vec<i64> = Vec::with_capacity(ids.len());
+        let mut rejected = 0i64;
+        for id in ids {
+            match digits(id) {
+                Some(id) if id > 0 => accepted.push(id),
+                _ => rejected += 1,
+            }
+        }
+        accepted.sort_unstable();
+        accepted.dedup();
+        let valid = status.is_some() && impact.is_some() && !accepted.is_empty();
+        let resolved = status.as_deref() == Some(b"resolved".as_slice());
+        let mut out = Vec::with_capacity(8 + accepted.len());
+        out.push(bit(valid));
+        out.push(bit(status.is_some()));
+        out.push(status.unwrap_or_default());
+        out.push(bit(impact.is_some()));
+        out.push(impact.unwrap_or_default());
+        out.push(bit(resolved));
+        out.push(text(rejected));
+        out.extend(accepted.into_iter().map(text));
+        Some(out)
+    }
+
+    fn transform(mode: u32, parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        match (mode, parts) {
+            (1, [is_array, limit, phrases @ ..]) => search_phrases(is_array, limit, phrases),
+            (2, _) => pagination(parts),
+            (3, _) => guest_meta(parts),
+            (4, _) => Some(service_summary(parts)),
+            (5, _) => incident_payload(parts),
+            _ => None,
+        }
+    }
+
+    /// Dispatch count-prefixed, length-prefixed byte strings (little-endian
+    /// u32). Returns written bytes, `-needed` when `cap` is too small, or `-1`
+    /// for invalid input, mode or flags. Failure never writes to the output
+    /// buffer. Results are at least four bytes, so `-1` never means "one byte
+    /// needed".
+    ///
+    /// # Safety
+    /// Non-null pointers must refer to readable/writable allocations of the
+    /// declared lengths. Null pointers require zero length/capacity. Input and
+    /// output may overlap; the result is fully owned before any output write.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w38_search_facade_controller_guest_layout(
+        mode: u32,
+        input: *const u8,
+        input_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if input_len > MAX_INPUT
+                || cap > isize::MAX as usize
+                || (input.is_null() && input_len != 0)
+                || (out.is_null() && cap != 0)
+            {
+                return DECLINE;
+            }
+            let input = if input_len == 0 {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(input, input_len) }
+            };
+            let Some(parts) = unpack(input) else {
+                return DECLINE;
+            };
+            let Some(result) = transform(mode, &parts).and_then(|parts| pack(&parts)) else {
+                return DECLINE;
+            };
+            if cap < result.len() || out.is_null() {
+                return -(result.len() as isize);
+            }
+            unsafe { std::ptr::copy(result.as_ptr(), out, result.len()) };
+            result.len() as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn packet(parts: &[&[u8]]) -> Vec<u8> {
+            pack(&parts.iter().map(|part| part.to_vec()).collect::<Vec<_>>()).unwrap()
+        }
+
+        fn call(mode: u32, parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+            let input = packet(parts);
+            let mut out = vec![0u8; input.len() * 4 + 4096];
+            let written = unsafe {
+                nntmux_w38_search_facade_controller_guest_layout(
+                    mode,
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            if written < 0 {
+                return None;
+            }
+            out.truncate(written as usize);
+            Some(unpack(&out)?.into_iter().map(<[u8]>::to_vec).collect())
+        }
+
+        fn strings(items: &[&str]) -> Vec<Vec<u8>> {
+            items.iter().map(|item| item.as_bytes().to_vec()).collect()
+        }
+
+        #[test]
+        fn w38_search_phrases_plan() {
+            assert_eq!(
+                call(
+                    1,
+                    &[
+                        b"1",
+                        b"0",
+                        b"  Foo\t Bar ",
+                        b"",
+                        b"foo bar",
+                        b"\x0Bbaz\x0C",
+                        b" \0 "
+                    ]
+                )
+                .unwrap(),
+                strings(&["1000", "2", "1", "Foo Bar baz", "Foo Bar", "baz"])
+            );
+            assert_eq!(
+                call(1, &[b"0", b"99999", b"x"]).unwrap(),
+                strings(&["10000", "0", "0", "x", "x"])
+            );
+            assert_eq!(
+                call(1, &[b"1", b"5"]).unwrap(),
+                strings(&["5", "0", "0", ""])
+            );
+            assert_eq!(call(1, &[b"0", b"5"]), None);
+            assert_eq!(call(1, &[b"0", b"5", b"a", b"b"]), None);
+            assert_eq!(call(1, &[b"2", b"5", b"a"]), None);
+            assert_eq!(call(1, &[b"1", b"05", b"a"]), None);
+            assert_eq!(call(1, &[b"1"]), None);
+        }
+
+        #[test]
+        fn w38_controller_pagination_plan() {
+            assert_eq!(
+                call(2, &[b" 3 ", b"25", b"101", b"50", b"100"]).unwrap(),
+                strings(&["3", "25", "50", "5", "0"])
+            );
+            assert_eq!(
+                call(2, &[b"99", b"500", b"0", b"50", b"100"]).unwrap(),
+                strings(&["1", "100", "0", "1", "1"])
+            );
+            assert_eq!(
+                call(2, &[b"-2", b"x", b"-5", b"500", b"0"]).unwrap(),
+                strings(&["1", "1", "0", "1", "0"])
+            );
+            let max = i64::MAX.to_string();
+            assert_eq!(
+                call(
+                    2,
+                    &[
+                        b"999999999999999999",
+                        b"0",
+                        max.as_bytes(),
+                        b"7",
+                        max.as_bytes()
+                    ]
+                )
+                .unwrap(),
+                strings(&[
+                    "999999999999999999",
+                    "7",
+                    "6999999999999999986",
+                    "1317624576693539401",
+                    "0"
+                ])
+            );
+            assert_eq!(
+                call(2, &[b"1000000000000000000", b"0", b"10", b"5", b"5"]).unwrap()[0],
+                b"1".to_vec()
+            );
+            assert_eq!(call(2, &[b"1", b"1", b"x", b"1", b"1"]), None);
+            assert_eq!(call(2, &[b"1", b"1", b"1", b"1"]), None);
+        }
+
+        #[test]
+        fn w38_guest_layout_meta_plan() {
+            assert_eq!(
+                call(3, &[b" Log\tin ", b"Welcome  back", b"", b"0"]).unwrap(),
+                strings(&["Log in", "Log in - NNTmux", "Welcome back", "0"])
+            );
+            assert_eq!(
+                call(3, &[b"nntmux", b"", b" NNTmux ", b"160"]).unwrap(),
+                strings(&["nntmux", "NNTmux", "", "0"])
+            );
+            assert_eq!(
+                call(3, &[b"", b"abc def ghi", b"Site", b"4"]).unwrap(),
+                strings(&["", "Site", "abc...", "1"])
+            );
+            assert_eq!(
+                call(3, &[b"", "aé".as_bytes(), b"S", b"2"]).unwrap()[2],
+                b"a...".to_vec()
+            );
+            assert_eq!(
+                call(3, &[b"", b"x", b"S", b"9999999"]).unwrap()[3],
+                b"0".to_vec()
+            );
+            assert_eq!(call(3, &[b"", b"", b"", b"+1"]), None);
+            assert_eq!(call(3, &[b"", b"", b""]), None);
+        }
+
+        #[test]
+        fn w38_service_status_summary() {
+            assert_eq!(
+                call(
+                    4,
+                    &[b"operational", b" Degraded ", b"maintenance", b"bogus"]
+                )
+                .unwrap(),
+                strings(&["4", "1", "1", "0", "0", "1", "1", "maintenance", "2", "0"])
+            );
+            assert_eq!(
+                call(4, &[b"maintenance", b"PARTIAL_OUTAGE", b"major_outage"]).unwrap(),
+                strings(&["3", "0", "0", "1", "1", "1", "0", "major_outage", "4", "0"])
+            );
+            assert_eq!(
+                call(4, &[]).unwrap(),
+                strings(&["0", "0", "0", "0", "0", "0", "0", "operational", "0", "1"])
+            );
+        }
+
+        #[test]
+        fn w38_incident_payload_plan() {
+            assert_eq!(
+                call(
+                    5,
+                    &[
+                        b" Resolved",
+                        b"MAJOR",
+                        b"3",
+                        b" 1 ",
+                        b"3",
+                        b"0",
+                        b"x",
+                        b"-2",
+                        b"007"
+                    ]
+                )
+                .unwrap(),
+                strings(&["1", "1", "resolved", "1", "major", "1", "3", "1", "3", "7"])
+            );
+            assert_eq!(
+                call(5, &[b"open", b"none"]).unwrap(),
+                strings(&["0", "0", "", "1", "none", "0", "0"])
+            );
+            assert_eq!(
+                call(5, &[b"monitoring", b"severe", b"1234567890123456789"]).unwrap(),
+                strings(&["0", "1", "monitoring", "0", "", "0", "1"])
+            );
+            assert_eq!(call(5, &[b"resolved"]), None);
+        }
+
+        #[test]
+        fn w38_malformed_null_and_capacity() {
+            let input = packet(&[b"1", b"1000", b"alpha", b"beta"]);
+            let mut out = [0x5a_u8; 16];
+            for (ptr, len, dst, cap) in [
+                (std::ptr::null(), 1, out.as_mut_ptr(), out.len()),
+                (input.as_ptr(), input.len(), std::ptr::null_mut(), 8),
+                (input.as_ptr(), MAX_INPUT + 1, out.as_mut_ptr(), out.len()),
+                (input.as_ptr(), input.len(), out.as_mut_ptr(), usize::MAX),
+            ] {
+                assert_eq!(
+                    unsafe {
+                        nntmux_w38_search_facade_controller_guest_layout(1, ptr, len, dst, cap)
+                    },
+                    DECLINE
+                );
+            }
+            let too_many = [
+                (MAX_PARTS as u32 + 1).to_le_bytes().to_vec(),
+                vec![0; 4 * (MAX_PARTS + 1)],
+            ]
+            .concat();
+            for bad in [
+                vec![],
+                vec![1, 0, 0],
+                vec![1, 0, 0, 0, 9, 0, 0, 0],
+                vec![65, 0, 0, 0],
+                too_many,
+            ] {
+                assert_eq!(
+                    unsafe {
+                        nntmux_w38_search_facade_controller_guest_layout(
+                            4,
+                            bad.as_ptr(),
+                            bad.len(),
+                            out.as_mut_ptr(),
+                            out.len(),
+                        )
+                    },
+                    DECLINE
+                );
+            }
+            for mode in [0u32, 6, 99, u32::MAX] {
+                assert_eq!(
+                    unsafe {
+                        nntmux_w38_search_facade_controller_guest_layout(
+                            mode,
+                            input.as_ptr(),
+                            input.len(),
+                            out.as_mut_ptr(),
+                            out.len(),
+                        )
+                    },
+                    DECLINE
+                );
+            }
+            assert_eq!(out, [0x5a; 16]);
+            let full = pack(&call(1, &[b"1", b"1000", b"alpha", b"beta"]).unwrap())
+                .unwrap()
+                .len();
+            assert!(full > out.len());
+            for cap in [0usize, 1, out.len()] {
+                let dst = if cap == 0 {
+                    std::ptr::null_mut()
+                } else {
+                    out.as_mut_ptr()
+                };
+                assert_eq!(
+                    unsafe {
+                        nntmux_w38_search_facade_controller_guest_layout(
+                            1,
+                            input.as_ptr(),
+                            input.len(),
+                            dst,
+                            cap,
+                        )
+                    },
+                    -(full as isize)
+                );
+            }
+            assert_eq!(out, [0x5a; 16]);
+            let mut alias = input.clone();
+            alias.resize(full.max(input.len()), 0);
+            let written = unsafe {
+                nntmux_w38_search_facade_controller_guest_layout(
+                    1,
+                    alias.as_ptr(),
+                    input.len(),
+                    alias.as_mut_ptr(),
+                    alias.len(),
+                )
+            };
+            assert_eq!(written, full as isize);
+            assert_eq!(unpack(&alias[..full]).unwrap()[3], b"alpha beta");
+        }
+    }
+}

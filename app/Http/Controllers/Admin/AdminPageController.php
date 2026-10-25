@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Http\Controllers\Admin;
 
+use App\Enums\ServiceStatusEnum;
+use App\Facades\Search;
 use App\Http\Controllers\BasePageController;
 use App\Http\Controllers\GetNzbController;
 use App\Services\AdminDashboardSnapshotService;
@@ -21,6 +23,14 @@ class AdminPageController extends BasePageController
     private static bool $useRustFfi = false;
 
     public const string FFI_CDEF = GetNzbController::FFI_CDEF;
+
+    /**
+     * Rust stays opt-in for the Wave 38.5 status summary: the FFI round trip is slower than PHP
+     * (< 1.5x); see tests/Unit/RustSearchFacadeControllerGuestLayoutParityTest.php.
+     */
+    public const bool ADMIN_PAGE_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useAdminPageRustFfi = null;
 
     public static function setUseRustFfi(?bool $useRustFfi): void
     {
@@ -184,6 +194,94 @@ class AdminPageController extends BasePageController
         $result = GetNzbController::transformNative(15, [$range]);
 
         return is_array($result) ? $result : self::metricWindowPhp($range);
+    }
+
+    public static function useAdminPageRustFfi(?bool $use = true): void
+    {
+        self::$useAdminPageRustFfi = $use;
+    }
+
+    public static function usesAdminPageRustFfi(): bool
+    {
+        return self::$useAdminPageRustFfi ?? self::ADMIN_PAGE_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetAdminPageRustFfi(): void
+    {
+        self::$useAdminPageRustFfi = null;
+    }
+
+    /**
+     * Summarizes service health values (trimmed, ASCII lowercased) per `ServiceStatusEnum` case in
+     * declaration order. Unrecognized values count as unknown; the overall status is the worst known
+     * severity (operational when none), and `all_operational` needs no unknown and no degradation.
+     *
+     * @param  list<string>  $statuses
+     * @return array{total: int, counts: array<string, int>, unknown: int, overall: string, severity: int, all_operational: bool}
+     */
+    public static function summarizeServiceStatuses(array $statuses): array
+    {
+        return self::usesAdminPageRustFfi() ? self::summarizeServiceStatusesNative($statuses) : self::summarizeServiceStatusesPhp($statuses);
+    }
+
+    /**
+     * @param  list<string>  $statuses
+     * @return array{total: int, counts: array<string, int>, unknown: int, overall: string, severity: int, all_operational: bool}
+     */
+    private static function summarizeServiceStatusesNative(array $statuses): array
+    {
+        $cases = ServiceStatusEnum::cases();
+        $fields = Search::evaluateNative(4, $statuses);
+        if ($fields === null || \count($fields) !== \count($cases) + 5) {
+            return self::summarizeServiceStatusesPhp($statuses);
+        }
+
+        $counts = [];
+        foreach ($cases as $slot => $case) {
+            $counts[$case->value] = (int) $fields[1 + $slot];
+        }
+        $tail = \count($cases) + 1;
+
+        return [
+            'total' => (int) $fields[0],
+            'counts' => $counts,
+            'unknown' => (int) $fields[$tail],
+            'overall' => $fields[$tail + 1],
+            'severity' => (int) $fields[$tail + 2],
+            'all_operational' => $fields[$tail + 3] === '1',
+        ];
+    }
+
+    /**
+     * @param  list<string>  $statuses
+     * @return array{total: int, counts: array<string, int>, unknown: int, overall: string, severity: int, all_operational: bool}
+     */
+    private static function summarizeServiceStatusesPhp(array $statuses): array
+    {
+        $counts = array_fill_keys(array_column(ServiceStatusEnum::cases(), 'value'), 0);
+        $unknown = 0;
+        $worst = ServiceStatusEnum::Operational;
+        foreach ($statuses as $status) {
+            $case = ServiceStatusEnum::tryFrom(strtolower(trim($status)));
+            if ($case === null) {
+                $unknown++;
+
+                continue;
+            }
+            $counts[$case->value]++;
+            if ($case->severityPhp() > $worst->severityPhp()) {
+                $worst = $case;
+            }
+        }
+
+        return [
+            'total' => \count($statuses),
+            'counts' => $counts,
+            'unknown' => $unknown,
+            'overall' => $worst->value,
+            'severity' => $worst->severityPhp(),
+            'all_operational' => $unknown === 0 && $worst->severityPhp() === 0,
+        ];
     }
 
     protected UserStatsService $userStatsService;
