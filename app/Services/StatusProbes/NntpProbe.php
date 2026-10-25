@@ -11,6 +11,7 @@ use App\Support\RustPipelineLibrary;
 use FFI;
 use FFI\CData;
 use Illuminate\Support\Str;
+use InvalidArgumentException;
 use Throwable;
 
 class NntpProbe implements ServiceProbeInterface
@@ -477,5 +478,181 @@ class NntpProbe implements ServiceProbeInterface
         }
 
         return true;
+    }
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W50 parity test). */
+    private const W50_RUST_FFI_DEFAULT = true;
+
+    private const string W50_FFI_CDEF = 'ssize_t nntmux_w501_nntp_probe_evaluate_batch(const char *outcomes, size_t outcomes_len, const char *primary, size_t primary_len, const char *alternate, size_t alternate_len, const char *starts, size_t starts_len, const char *ends, size_t ends_len, size_t count, uint8_t check_alternate, int64_t *out, size_t out_cap);';
+
+    public static function usesW50RustFfi(): bool
+    {
+        $enabled = self::w50RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W50_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 50 batch routed to Rust or PHP, then restores the routing. */
+    public static function withW50RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w50RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w50RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Batch evaluation of probe runs. Outcome bits 0-1 hold the primary attempt kind and bits
+     * 2-3 the alternate kind (0 connected, 1 error object, 2 unknown result; alternate 3 = not
+     * attempted); the messages are the error objects' messages and the start/end pair times the
+     * primary attempt. One word per run describes the ProbeResult `evaluateConnections()`
+     * returns: `ok | impact << 1 | alternateChecked << 4 | min(2047, strlen(reason)) << 5 |
+     * responseTimeMs << 16` (impact codes: null 0, none 1, minor 2, major 3, critical 4).
+     *
+     * @param  list<int>  $outcomes
+     * @param  list<string>  $primaryMessages
+     * @param  list<string>  $alternateMessages
+     * @param  list<int>  $startNs
+     * @param  list<int>  $endNs
+     * @return list<int>
+     */
+    public static function evaluateProbeBatch(array $outcomes, array $primaryMessages, array $alternateMessages, array $startNs, array $endNs, bool $checkAlternate): array
+    {
+        return self::usesW50RustFfi()
+            ? self::evaluateProbeBatchNative($outcomes, $primaryMessages, $alternateMessages, $startNs, $endNs, $checkAlternate)
+            : self::evaluateProbeBatchPhp($outcomes, $primaryMessages, $alternateMessages, $startNs, $endNs, $checkAlternate);
+    }
+
+    /**
+     * @param  list<int>  $outcomes
+     * @param  list<string>  $primaryMessages
+     * @param  list<string>  $alternateMessages
+     * @param  list<int>  $startNs
+     * @param  list<int>  $endNs
+     * @return list<int>
+     */
+    public static function evaluateProbeBatchPhp(array $outcomes, array $primaryMessages, array $alternateMessages, array $startNs, array $endNs, bool $checkAlternate): array
+    {
+        self::w50Count($outcomes, $primaryMessages, $alternateMessages, $startNs, $endNs);
+        $words = [];
+        foreach ($outcomes as $i => $outcome) {
+            $primaryKind = $outcome & 3;
+            $alternateKind = $outcome >> 2 & 3;
+            $primary = self::classifyConnectionAttemptPhp($primaryKind === 0, $primaryKind === 1, $primaryMessages[$i], $startNs[$i], $endNs[$i]);
+            $alternate = $alternateKind === 3 ? null : self::classifyConnectionAttemptPhp($alternateKind === 0, $alternateKind === 1, $alternateMessages[$i], 0, 0);
+            $words[] = self::evaluateConnectionsPhp($primary, $checkAlternate, $alternate)->w50Word($checkAlternate && $alternate !== null);
+        }
+
+        return $words;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or a message holds a NUL byte.
+     *
+     * @param  list<int>  $outcomes
+     * @param  list<string>  $primaryMessages
+     * @param  list<string>  $alternateMessages
+     * @param  list<int>  $startNs
+     * @param  list<int>  $endNs
+     * @return list<int>
+     */
+    public static function evaluateProbeBatchNative(array $outcomes, array $primaryMessages, array $alternateMessages, array $startNs, array $endNs, bool $checkAlternate): array
+    {
+        $count = self::w50Count($outcomes, $primaryMessages, $alternateMessages, $startNs, $endNs);
+        $ffi = $count === 0 ? null : self::w50Ffi();
+        if ($ffi === null) {
+            return self::evaluateProbeBatchPhp($outcomes, $primaryMessages, $alternateMessages, $startNs, $endNs, $checkAlternate);
+        }
+        $kinds = pack('C*', ...$outcomes);
+        $primary = implode("\0", $primaryMessages);
+        $alternate = implode("\0", $alternateMessages);
+        $starts = pack('P*', ...$startNs);
+        $ends = pack('P*', ...$endNs);
+        try {
+            $words = self::w50Words($count, static fn (CData $out, int $cap): mixed => $ffi->nntmux_w501_nntp_probe_evaluate_batch( // @phpstan-ignore method.notFound
+                $kinds, \strlen($kinds), $primary, \strlen($primary), $alternate, \strlen($alternate), $starts, \strlen($starts), $ends, \strlen($ends), $count, $checkAlternate ? 1 : 0, $out, $cap));
+        } catch (Throwable) {
+            $words = null;
+        }
+
+        return $words ?? self::evaluateProbeBatchPhp($outcomes, $primaryMessages, $alternateMessages, $startNs, $endNs, $checkAlternate);
+    }
+
+    /**
+     * @param  array<mixed>  ...$columns
+     */
+    private static function w50Count(array ...$columns): int
+    {
+        $count = \count($columns[0]);
+        foreach ($columns as $column) {
+            if (\count($column) !== $count) {
+                throw new InvalidArgumentException('Status probe batch columns must have the same length.');
+            }
+        }
+
+        return $count;
+    }
+
+    private static function w50Ffi(): ?FFI
+    {
+        $ffi = self::w50RustFfiState('ffi');
+
+        return $ffi instanceof FFI ? $ffi : null;
+    }
+
+    /**
+     * Wave 50 routing override (`set`), lazily resolved binding (`ffi`) and reusable `int64_t`
+     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
+     */
+    private static function w50RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('status_probes_w50', self::W50_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if (! $out instanceof CData || $outCap < $val) {
+                    $outCap = max(512, $val * 2);
+                    $out = $ffi->new("int64_t[{$outCap}]");
+                }
+
+                return [$out, $outCap];
+            default:
+                return $enabled;
+        }
+    }
+
+    /**
+     * Copies `$words` output words out of the reusable buffer after `$call` filled it.
+     *
+     * @param  callable(CData, int): mixed  $call  Receives the buffer and its capacity in words.
+     * @return list<int>|null
+     */
+    private static function w50Words(int $words, callable $call): ?array
+    {
+        $buffer = self::w50RustFfiState('out', $words);
+        if (! \is_array($buffer) || ! $buffer[0] instanceof CData || $call($buffer[0], $buffer[1]) !== $words) {
+            return null;
+        }
+        $decoded = unpack('P*', FFI::string($buffer[0], $words * 8));
+
+        /** @var list<int>|null */
+        return \is_array($decoded) ? array_values($decoded) : null;
     }
 }
