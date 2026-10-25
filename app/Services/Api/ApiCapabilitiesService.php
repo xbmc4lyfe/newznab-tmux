@@ -16,6 +16,7 @@ use FFI;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Schema;
+use Throwable;
 
 final class ApiCapabilitiesService
 {
@@ -406,5 +407,183 @@ final class ApiCapabilitiesService
                 'is_open' => $status['is_open'],
             ];
         });
+    }
+
+    public const string W53_FFI_CDEF = 'int64_t nntmux_w535_api_capabilities_param_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W53.5 parity test's QUALIFICATION). */
+    private const bool W53_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 53.5 routing and FFI cache, kept in function-local statics so readonly classes can use them too.
+     * Without $op it reports the routing; 'set' swaps the override for $val and returns the previous one;
+     * 'reset' replaces the cached handle with $val (null re-resolves, false disables); 'buffer' returns
+     * `[FFI, int64_t[], capacity]` with room for at least $val words, or null without the library.
+     */
+    private static function w53RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w53_5', self::W53_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W53_RUST_FFI_DEFAULT;
+        }
+    }
+
+    public static function usesW53RustFfi(): bool
+    {
+        return self::w53RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with supportedParamPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW53RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w53RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w53RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 53.5 Rust helper, or null to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w53Words(int $count, string $data, string $ints, int $words): ?array
+    {
+        try {
+            $handle = self::w53RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w535_api_capabilities_param_plan($count, 0, $data, \strlen($data), $ints, \strlen($ints), $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('P*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Batch plan of comma-separated parameter lists against the search functions {@see searchingPhp()}
+     * advertises for `$version`, paired by index with `$functions`. Four words per function: `[1-based
+     * advertised ordinal or 0 when unknown, parameter names, supported names, index of the first
+     * unsupported name or -1]`. Names are trimmed and lowercased; empty names are skipped.
+     *
+     * @param  list<string>  $functions
+     * @param  list<string>  $paramLists
+     * @return list<int>
+     */
+    public static function supportedParamPlanBatch(int $version, array $functions, array $paramLists): array
+    {
+        return self::usesW53RustFfi() ? self::supportedParamPlanBatchNative($version, $functions, $paramLists) : self::supportedParamPlanBatchPhp($version, $functions, $paramLists);
+    }
+
+    /**
+     * @param  list<string>  $functions
+     * @param  list<string>  $paramLists
+     * @return list<int>
+     */
+    public static function supportedParamPlanBatchPhp(int $version, array $functions, array $paramLists): array
+    {
+        static $tables = [];
+        $tables[$version] ??= [
+            array_flip(array_keys(self::searchingPhp($version))),
+            array_map(static fn (array $function): array => array_flip(explode(',', $function['supportedParams'])), self::searchingPhp($version)),
+        ];
+        [$ordinals, $allowed] = $tables[$version];
+        $out = [];
+        foreach ($functions as $i => $function) {
+            $list = $paramLists[$i] ?? '';
+            $set = $allowed[$function] ?? null;
+            $total = $supported = 0;
+            $first = -1;
+            if ($list !== '') {
+                foreach (explode(',', $list) as $name) {
+                    $name = strtolower(trim($name));
+                    if ($name === '') {
+                        continue;
+                    }
+                    if ($set !== null && isset($set[$name])) {
+                        $supported++;
+                    } elseif ($first < 0) {
+                        $first = $total;
+                    }
+                    $total++;
+                }
+            }
+            $out[] = $set === null ? 0 : $ordinals[$function] + 1;
+            $out[] = $total;
+            $out[] = $supported;
+            $out[] = $first;
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch over the NUL-joined functions then parameter lists; falls back to PHP without the
+     * library, for mismatched lists or when a value holds a NUL.
+     *
+     * @param  list<string>  $functions
+     * @param  list<string>  $paramLists
+     * @return list<int>
+     */
+    public static function supportedParamPlanBatchNative(int $version, array $functions, array $paramLists): array
+    {
+        $count = \count($functions);
+        if ($count === 0) {
+            return [];
+        }
+        if ($count !== \count($paramLists) || ! array_is_list($functions) || ! array_is_list($paramLists)) {
+            return self::supportedParamPlanBatchPhp($version, $functions, $paramLists);
+        }
+
+        return self::w53Words($count, implode("\0", $functions)."\0".implode("\0", $paramLists), pack('P', $version), 4 * $count)
+            ?? self::supportedParamPlanBatchPhp($version, $functions, $paramLists);
     }
 }
