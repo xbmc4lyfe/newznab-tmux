@@ -36886,3 +36886,697 @@ pub mod tv_forum_route_policy_helpers {
         }
     }
 }
+/// Wave 37.4: release GUID batch, details lookup plan, bounded feed body read plan and
+/// srrDB/xREL page plan helpers mirrored from PHP.
+pub mod release_details_feed_source_helpers {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    pub const DECLINE: isize = -1;
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+    const MAX_GUIDS: usize = 1 << 20;
+    const FIELD_SEP: u8 = 0x1F;
+    /// PHP `trim()` default character set.
+    const TRIM_SET: &[u8] = b" \t\n\r\0\x0B";
+    const DETAILS_HAS_IMDB: u32 = 1;
+    const READ_CHUNK: i64 = 8192;
+    const SRRDB_PAGE_SIZE: i64 = 45;
+    const SRRDB_MAX_PAGE: i64 = i64::MAX / SRRDB_PAGE_SIZE + 1;
+    const XREL_MIN_PAGE_SIZE: i64 = 5;
+    const XREL_MAX_PAGE_SIZE: i64 = 100;
+
+    unsafe fn valid_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null()
+            || len > MAX_INPUT
+            || len > isize::MAX as usize
+            || (ptr as usize).checked_add(len).is_none()
+        {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn valid_out_buf(out_buf: *mut u8, out_cap: usize) -> bool {
+        !out_buf.is_null()
+            && out_cap <= isize::MAX as usize
+            && (out_buf as usize).checked_add(out_cap).is_some()
+    }
+
+    /// Copies the encoding into `out_buf`, returning its length or `-required` without writing
+    /// when it does not fit. Every encoding has at least three fields, so `-1` never doubles as a
+    /// "needs one byte" answer.
+    fn finish(encoded: Option<Vec<u8>>, out_buf: *mut u8, out_cap: usize) -> isize {
+        let Some(bytes) = encoded else {
+            return DECLINE;
+        };
+        if bytes.len() > isize::MAX as usize {
+            return DECLINE;
+        }
+        if bytes.len() > out_cap {
+            return -(bytes.len() as isize);
+        }
+        if !bytes.is_empty() {
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len()) };
+        }
+        bytes.len() as isize
+    }
+
+    fn encode(fields: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(fields.iter().map(|f| f.len() + 1).sum());
+        for (i, field) in fields.iter().enumerate() {
+            if i > 0 {
+                out.push(FIELD_SEP);
+            }
+            out.extend_from_slice(field);
+        }
+        out
+    }
+
+    #[inline]
+    fn bool_bytes(value: bool) -> &'static [u8] {
+        if value { b"1" } else { b"0" }
+    }
+
+    #[inline]
+    fn flag(value: u32) -> Option<bool> {
+        match value {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+
+    /// PHP `trim($value)` on bytes.
+    fn trim_ws(value: &[u8]) -> &[u8] {
+        let start = value
+            .iter()
+            .position(|b| !TRIM_SET.contains(b))
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|b| !TRIM_SET.contains(b))
+            .map_or(start, |i| i + 1);
+        &value[start..end]
+    }
+
+    /// Lowercase hex UUID (`8-4-4-4-12`) or legacy 40-character SHA-1 GUID.
+    fn guid_shape(guid: &[u8]) -> bool {
+        match guid.len() {
+            36 => guid.iter().enumerate().all(|(i, &b)| match i {
+                8 | 13 | 18 | 23 => b == b'-',
+                _ => b.is_ascii_digit() || (b'a'..=b'f').contains(&b),
+            }),
+            40 => guid
+                .iter()
+                .all(|&b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            _ => false,
+        }
+    }
+
+    /// `Release::normalizeGuidBatch()`; input is the GUIDs joined with `0x1F` (`count` of them,
+    /// empty input when zero). Emits `valid`, `invalid`, `duplicates`, then each unique GUID.
+    fn guid_batch_encode(count: usize, input: &[u8]) -> Option<Vec<u8>> {
+        if count > MAX_GUIDS || (count == 0 && !input.is_empty()) {
+            return None;
+        }
+        let mut unique: Vec<Vec<u8>> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let (mut invalid, mut duplicates, mut parts) = (0usize, 0usize, 0usize);
+        if count > 0 {
+            for part in input.split(|&b| b == FIELD_SEP) {
+                parts += 1;
+                if parts > count {
+                    return None;
+                }
+                let guid = trim_ws(part).to_ascii_lowercase();
+                if !guid_shape(&guid) {
+                    invalid += 1;
+                } else if seen.contains(&guid) {
+                    duplicates += 1;
+                } else {
+                    seen.insert(guid.clone());
+                    unique.push(guid);
+                }
+            }
+        }
+        if parts != count {
+            return None;
+        }
+        let (valid, invalid, duplicates) = (
+            unique.len().to_string(),
+            invalid.to_string(),
+            duplicates.to_string(),
+        );
+        let mut fields: Vec<&[u8]> =
+            vec![valid.as_bytes(), invalid.as_bytes(), duplicates.as_bytes()];
+        fields.extend(unique.iter().map(Vec::as_slice));
+        Some(encode(&fields))
+    }
+
+    /// `DetailsController::planDetailsLookups()`: emits the lookup count, the lookup bitmask
+    /// (video, movie, game, music, book, console, anidb) and the meta description.
+    /// 309+ significant digits may overflow `strtod` to INF, which PHP's `(int)` maps to 0;
+    /// decline (`None`) so PHP handles those inputs directly.
+    fn details_plan_encode(
+        ids: [i64; 6],
+        imdb: Option<&[u8]>,
+        searchname: &[u8],
+    ) -> Option<Vec<u8>> {
+        let [videos, games, music, book, console, anidb] = ids;
+        let movie = match imdb {
+            None => false,
+            Some(id) => {
+                let mut significant = 0usize;
+                for &b in id {
+                    if b.is_ascii_digit() && (significant > 0 || b != b'0') {
+                        significant += 1;
+                    }
+                }
+                if significant > 308 {
+                    return None;
+                }
+                significant > 0
+            }
+        };
+        let wanted = [
+            videos > 0,
+            movie,
+            games > 0,
+            music > 0,
+            book > 0,
+            console > 0,
+            anidb > 0,
+        ];
+        let mask = wanted.iter().enumerate().fold(
+            0u32,
+            |mask, (i, &on)| if on { mask | (1 << i) } else { mask },
+        );
+        let (count, mask) = (mask.count_ones().to_string(), mask.to_string());
+        let meta = [b"View NZB for ".as_slice(), searchname].concat();
+        Some(encode(&[count.as_bytes(), mask.as_bytes(), &meta]))
+    }
+
+    /// `BoundedHttpFeedSource::planBoundedBodyRead()`: emits supported, gzip, limits valid, next
+    /// read size, remaining decoded budget, over limit and the normalized encoding.
+    fn body_read_encode(encoding: &[u8], maximum: i64, received: i64) -> Vec<u8> {
+        let encoding = trim_ws(encoding).to_ascii_lowercase();
+        let supported = matches!(encoding.as_slice(), b"" | b"identity" | b"gzip");
+        let gzip = encoding == b"gzip";
+        let valid = (1..i64::MAX).contains(&maximum);
+        let received = received.max(0);
+        let (next, budget, over) = if valid {
+            (
+                (maximum + 1 - received).clamp(0, READ_CHUNK),
+                (maximum - received).max(0),
+                received > maximum,
+            )
+        } else {
+            (0, 0, false)
+        };
+        let (next, budget) = (next.to_string(), budget.to_string());
+        encode(&[
+            bool_bytes(supported),
+            bool_bytes(gzip),
+            bool_bytes(valid),
+            next.as_bytes(),
+            budget.as_bytes(),
+            bool_bytes(over),
+            &encoding,
+        ])
+    }
+
+    /// `SrrdbSource::planSrrdbPage()`: emits page, skip, clamped and the page URL.
+    fn srrdb_page_encode(endpoint: &[u8], page: i64) -> Vec<u8> {
+        let clamped_page = page.clamp(1, SRRDB_MAX_PAGE);
+        let skip = (clamped_page - 1) * SRRDB_PAGE_SIZE;
+        let end = endpoint
+            .iter()
+            .rposition(|&b| b != b'/')
+            .map_or(0, |i| i + 1);
+        let mut url = endpoint[..end].to_vec();
+        if clamped_page > 1 {
+            url.extend_from_slice(b"/skip:");
+            url.extend_from_slice(skip.to_string().as_bytes());
+        }
+        let (page_text, skip) = (clamped_page.to_string(), skip.to_string());
+        encode(&[
+            page_text.as_bytes(),
+            skip.as_bytes(),
+            bool_bytes(clamped_page != page),
+            &url,
+        ])
+    }
+
+    /// `XrelSource::planXrelPage()`: emits per-page, page, past end, JSON field count, key and
+    /// entry source.
+    fn xrel_page_encode(page_size: i64, page: i64, total_pages: i64, p2p: bool) -> Vec<u8> {
+        let per_page = page_size.clamp(XREL_MIN_PAGE_SIZE, XREL_MAX_PAGE_SIZE);
+        let past_end = total_pages > 0 && page > total_pages;
+        let (per_page, page) = (per_page.to_string(), page.max(1).to_string());
+        let (fields, key, source): (&[u8], &[u8], &[u8]) = if p2p {
+            (b"3", b"xrel_p2p", b"xrel-p2p")
+        } else {
+            (b"2", b"xrel", b"xrel")
+        };
+        encode(&[
+            per_page.as_bytes(),
+            page.as_bytes(),
+            bool_bytes(past_end),
+            fields,
+            key,
+            source,
+        ])
+    }
+
+    /// `Release::normalizeGuidBatch()`.
+    ///
+    /// # Safety
+    /// Non-null input pointers must be readable for their lengths and `out_buf` writable for
+    /// `out_cap` bytes; null or oversized buffers decline with `-1`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w374_release_guid_batch(
+        count: usize,
+        input_ptr: *const u8,
+        input_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(input) = (unsafe { valid_slice(input_ptr, input_len) }) else {
+                return DECLINE;
+            };
+            finish(guid_batch_encode(count, input), out_buf, out_cap)
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `DetailsController::planDetailsLookups()`; `flags` bit 0 marks a non-null IMDb id (a
+    /// cleared bit requires an empty IMDb buffer).
+    ///
+    /// # Safety
+    /// Non-null input pointers must be readable for their lengths and `out_buf` writable for
+    /// `out_cap` bytes; null or oversized buffers decline with `-1`.
+    #[allow(clippy::too_many_arguments)]
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w374_details_lookup_plan(
+        videos_id: i64,
+        gamesinfo_id: i64,
+        musicinfo_id: i64,
+        bookinfo_id: i64,
+        consoleinfo_id: i64,
+        anidb_id: i64,
+        flags: u32,
+        imdb_ptr: *const u8,
+        imdb_len: usize,
+        name_ptr: *const u8,
+        name_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) || flags & !DETAILS_HAS_IMDB != 0 {
+                return DECLINE;
+            }
+            let (Some(imdb), Some(name)) = (unsafe { valid_slice(imdb_ptr, imdb_len) }, unsafe {
+                valid_slice(name_ptr, name_len)
+            }) else {
+                return DECLINE;
+            };
+            if flags & DETAILS_HAS_IMDB == 0 && !imdb.is_empty() {
+                return DECLINE;
+            }
+            let Some(total) = imdb_len.checked_add(name_len) else {
+                return DECLINE;
+            };
+            if total > MAX_INPUT {
+                return DECLINE;
+            }
+            let imdb = (flags & DETAILS_HAS_IMDB != 0).then_some(imdb);
+            let ids = [
+                videos_id,
+                gamesinfo_id,
+                musicinfo_id,
+                bookinfo_id,
+                consoleinfo_id,
+                anidb_id,
+            ];
+            finish(details_plan_encode(ids, imdb, name), out_buf, out_cap)
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `BoundedHttpFeedSource::planBoundedBodyRead()`.
+    ///
+    /// # Safety
+    /// Non-null input pointers must be readable for their lengths and `out_buf` writable for
+    /// `out_cap` bytes; null or oversized buffers decline with `-1`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w374_bounded_body_read_plan(
+        maximum_body_bytes: i64,
+        received_bytes: i64,
+        encoding_ptr: *const u8,
+        encoding_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(encoding) = (unsafe { valid_slice(encoding_ptr, encoding_len) }) else {
+                return DECLINE;
+            };
+            finish(
+                Some(body_read_encode(
+                    encoding,
+                    maximum_body_bytes,
+                    received_bytes,
+                )),
+                out_buf,
+                out_cap,
+            )
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `SrrdbSource::planSrrdbPage()`.
+    ///
+    /// # Safety
+    /// Non-null input pointers must be readable for their lengths and `out_buf` writable for
+    /// `out_cap` bytes; null or oversized buffers decline with `-1`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w374_srrdb_page_plan(
+        page: i64,
+        endpoint_ptr: *const u8,
+        endpoint_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(endpoint) = (unsafe { valid_slice(endpoint_ptr, endpoint_len) }) else {
+                return DECLINE;
+            };
+            finish(Some(srrdb_page_encode(endpoint, page)), out_buf, out_cap)
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `XrelSource::planXrelPage()`; `p2p` is `0` or `1`.
+    ///
+    /// # Safety
+    /// `out_buf` must be writable for `out_cap` bytes; a null or oversized buffer declines with
+    /// `-1`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w374_xrel_page_plan(
+        page_size: i64,
+        page: i64,
+        total_pages: i64,
+        p2p: u32,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(p2p) = flag(p2p) else {
+                return DECLINE;
+            };
+            finish(
+                Some(xrel_page_encode(page_size, page, total_pages, p2p)),
+                out_buf,
+                out_cap,
+            )
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn s(bytes: Option<Vec<u8>>) -> Option<String> {
+            bytes.map(|b| String::from_utf8_lossy(&b).into_owned())
+        }
+
+        const UUID: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        const SHA: &str = "da39a3ee5e6b4b0d3255bfef95601890afd80709";
+
+        #[test]
+        fn w374_guid_batch_follows_php() {
+            let input = format!(
+                " {}\x1F{}\x1F{UUID}\x1Fnot-a-guid\x1F\x1F{SHA}\x0B",
+                UUID.to_uppercase(),
+                UUID
+            );
+            assert_eq!(
+                s(guid_batch_encode(6, input.as_bytes())),
+                Some(format!("2\x1F2\x1F2\x1F{UUID}\x1F{SHA}"))
+            );
+            assert_eq!(s(guid_batch_encode(0, b"")), Some("0\x1F0\x1F0".into()));
+            assert_eq!(s(guid_batch_encode(1, b"")), Some("0\x1F1\x1F0".into()));
+            assert_eq!(guid_batch_encode(0, b"x"), None);
+            assert_eq!(guid_batch_encode(2, b"x"), None);
+            assert_eq!(guid_batch_encode(1, b"a\x1Fb"), None);
+            assert_eq!(guid_batch_encode(MAX_GUIDS + 1, b""), None);
+            // Hyphens must sit at the UUID positions; \x0C is not in PHP's default trim set.
+            assert!(!guid_shape(b"0f8fad5bd-9cb-469f-a165-70867728950e"));
+            assert_eq!(
+                s(guid_batch_encode(1, format!("{UUID}\x0C").as_bytes())),
+                Some("0\x1F1\x1F0".into())
+            );
+        }
+
+        #[test]
+        fn w374_details_plan_follows_php() {
+            assert_eq!(
+                s(details_plan_encode(
+                    [1, 0, 3, -1, 0, 9],
+                    Some(b"tt0111161"),
+                    b"Some.Release"
+                )),
+                Some("4\x1F75\x1FView NZB for Some.Release".into())
+            );
+            assert_eq!(
+                s(details_plan_encode([0; 6], Some(b"tt0000000"), b"")),
+                Some("0\x1F0\x1FView NZB for ".into())
+            );
+            assert_eq!(
+                s(details_plan_encode([i64::MAX; 6], None, b"a\x1Fb")),
+                Some("6\x1F125\x1FView NZB for a\x1Fb".into())
+            );
+            assert_eq!(
+                details_plan_encode([0; 6], Some(&[b'9'; 309]), b"x"),
+                None
+            );
+        }
+
+        #[test]
+        fn w374_body_read_follows_php() {
+            assert_eq!(
+                s(Some(body_read_encode(b" GZip \n", 1_048_576, 0))),
+                Some("1\x1F1\x1F1\x1F8192\x1F1048576\x1F0\x1Fgzip".into())
+            );
+            assert_eq!(
+                s(Some(body_read_encode(b"br", 10, 7))),
+                Some("0\x1F0\x1F1\x1F4\x1F3\x1F0\x1Fbr".into())
+            );
+            assert_eq!(
+                s(Some(body_read_encode(b"", 10, 11))),
+                Some("1\x1F0\x1F1\x1F0\x1F0\x1F1\x1F".into())
+            );
+            assert_eq!(
+                s(Some(body_read_encode(b"IDENTITY", i64::MAX, i64::MIN))),
+                Some("1\x1F0\x1F0\x1F0\x1F0\x1F0\x1Fidentity".into())
+            );
+            assert_eq!(
+                s(Some(body_read_encode(b"x", i64::MAX - 1, -5))),
+                Some("0\x1F0\x1F1\x1F8192\x1F9223372036854775806\x1F0\x1Fx".into())
+            );
+        }
+
+        #[test]
+        fn w374_srrdb_page_follows_php() {
+            assert_eq!(
+                s(Some(srrdb_page_encode(b"https://x/v1/search//", 3))),
+                Some("3\x1F90\x1F0\x1Fhttps://x/v1/search/skip:90".into())
+            );
+            assert_eq!(
+                s(Some(srrdb_page_encode(b"https://x", -4))),
+                Some("1\x1F0\x1F1\x1Fhttps://x".into())
+            );
+            assert_eq!(
+                s(Some(srrdb_page_encode(b"///", 1))),
+                Some("1\x1F0\x1F0\x1F".into())
+            );
+            let out = s(Some(srrdb_page_encode(b"e", i64::MAX))).unwrap();
+            assert_eq!(
+                out,
+                format!(
+                    "{SRRDB_MAX_PAGE}\x1F{}\x1F1\x1Fe/skip:{}",
+                    (SRRDB_MAX_PAGE - 1) * 45,
+                    (SRRDB_MAX_PAGE - 1) * 45
+                )
+            );
+        }
+
+        #[test]
+        fn w374_xrel_page_follows_php() {
+            assert_eq!(
+                s(Some(xrel_page_encode(100, 3, 2, false))),
+                Some("100\x1F3\x1F1\x1F2\x1Fxrel\x1Fxrel".into())
+            );
+            assert_eq!(
+                s(Some(xrel_page_encode(1, -7, 0, true))),
+                Some("5\x1F1\x1F0\x1F3\x1Fxrel_p2p\x1Fxrel-p2p".into())
+            );
+            assert_eq!(
+                s(Some(xrel_page_encode(i64::MAX, i64::MAX, -1, true))),
+                Some(format!(
+                    "100\x1F{}\x1F0\x1F3\x1Fxrel_p2p\x1Fxrel-p2p",
+                    i64::MAX
+                ))
+            );
+        }
+
+        #[test]
+        fn w374_exports_validate_arguments_and_capacity() {
+            let mut out = [0u8; 256];
+            let input = format!("{UUID}\x1F{SHA}");
+            let call = |count, ptr: *const u8, len, out: &mut [u8]| unsafe {
+                nntmux_w374_release_guid_batch(count, ptr, len, out.as_mut_ptr(), out.len())
+            };
+            let written = call(2, input.as_ptr(), input.len(), &mut out);
+            assert_eq!(
+                &out[..written as usize],
+                format!("2\x1F0\x1F0\x1F{UUID}\x1F{SHA}").as_bytes()
+            );
+            assert_eq!(call(3, input.as_ptr(), input.len(), &mut out), DECLINE);
+            assert_eq!(call(0, std::ptr::null(), 0, &mut out), DECLINE);
+            assert_eq!(call(1, input.as_ptr(), MAX_INPUT + 1, &mut out), DECLINE);
+            let mut small = [b'Z'; 4];
+            let needed = call(2, input.as_ptr(), input.len(), &mut small);
+            assert!(needed < DECLINE);
+            assert_eq!(small, [b'Z'; 4]);
+            let mut exact = vec![0u8; (-needed) as usize];
+            assert_eq!(call(2, input.as_ptr(), input.len(), &mut exact), -needed);
+
+            unsafe {
+                assert_eq!(
+                    nntmux_w374_release_guid_batch(0, b"".as_ptr(), 0, std::ptr::null_mut(), 8),
+                    DECLINE
+                );
+                let details = |flags, imdb: &[u8], out: &mut [u8]| {
+                    nntmux_w374_details_lookup_plan(
+                        1,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        flags,
+                        imdb.as_ptr(),
+                        imdb.len(),
+                        b"n".as_ptr(),
+                        1,
+                        out.as_mut_ptr(),
+                        out.len(),
+                    )
+                };
+                let written = details(1, b"tt1", &mut out);
+                assert_eq!(&out[..written as usize], b"2\x1F3\x1FView NZB for n");
+                assert_eq!(details(2, b"", &mut out), DECLINE);
+                assert_eq!(details(0, b"tt1", &mut out), DECLINE);
+                let mut tiny = [b'Z'; 2];
+                assert!(details(0, b"", &mut tiny) < DECLINE);
+                assert_eq!(tiny, [b'Z'; 2]);
+                assert_eq!(
+                    nntmux_w374_details_lookup_plan(
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    DECLINE
+                );
+
+                assert!(
+                    nntmux_w374_bounded_body_read_plan(
+                        10,
+                        0,
+                        b"gzip".as_ptr(),
+                        4,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ) > 0
+                );
+                assert_eq!(
+                    nntmux_w374_bounded_body_read_plan(
+                        10,
+                        0,
+                        std::ptr::null(),
+                        0,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    DECLINE
+                );
+                assert!(
+                    nntmux_w374_bounded_body_read_plan(
+                        10,
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        tiny.as_mut_ptr(),
+                        2
+                    ) < DECLINE
+                );
+
+                let written =
+                    nntmux_w374_srrdb_page_plan(2, b"e/".as_ptr(), 2, out.as_mut_ptr(), out.len());
+                assert_eq!(&out[..written as usize], b"2\x1F45\x1F0\x1Fe/skip:45");
+                assert_eq!(
+                    nntmux_w374_srrdb_page_plan(
+                        2,
+                        std::ptr::null(),
+                        0,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w374_srrdb_page_plan(2, b"e".as_ptr(), 1, std::ptr::null_mut(), 0),
+                    DECLINE
+                );
+
+                assert!(nntmux_w374_xrel_page_plan(10, 1, 0, 1, out.as_mut_ptr(), out.len()) > 0);
+                assert_eq!(
+                    nntmux_w374_xrel_page_plan(10, 1, 0, 2, out.as_mut_ptr(), out.len()),
+                    DECLINE
+                );
+                assert!(nntmux_w374_xrel_page_plan(10, 1, 0, 0, tiny.as_mut_ptr(), 2) < DECLINE);
+                assert_eq!(tiny, [b'Z'; 2]);
+            }
+        }
+    }
+}

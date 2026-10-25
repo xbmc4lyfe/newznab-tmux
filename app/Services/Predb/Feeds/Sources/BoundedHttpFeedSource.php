@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Services\Predb\Feeds\Sources;
 
+use App\Support\RustPipelineLibrary;
+use FFI;
 use GuzzleHttp\Psr7\NoSeekStream;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\RequestException;
@@ -17,6 +19,33 @@ use Throwable;
  */
 abstract class BoundedHttpFeedSource extends HttpFeedSource
 {
+    /**
+     * Production default stays false: the paired benchmark in
+     * tests/Unit/RustReleaseModelDetailsFeedSourceParityTest.php is below 1.5x.
+     */
+    public const bool RUST_FFI_DEFAULT = false;
+
+    /** Distinct from subclass FFI_CDEF constants (Nima4kSource declares its own). */
+    private const string BOUNDED_FEED_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w374_bounded_body_read_plan(
+            int64_t maximum_body_bytes,
+            int64_t received_bytes,
+            const char *encoding,
+            size_t encoding_len,
+            char *out_buf,
+            size_t out_cap
+        );
+        C;
+
+    private const int BOUNDED_FEED_READ_CHUNK = 8192;
+
+    private const string BOUNDED_FEED_FIELD_SEPARATOR = "\x1F";
+
+    /** Shared by every subclass: only this class's methods touch the private toggle. */
+    private static ?bool $boundedFeedUseRustFfi = null;
+
+    private static FFI|false|null $boundedFeedFfi = null;
+
     public function __construct(
         string $endpoint,
         int $pageSize = 100,
@@ -142,5 +171,115 @@ abstract class BoundedHttpFeedSource extends HttpFeedSource
         } while ($offset < strlen($body));
 
         return $decoded;
+    }
+
+    public static function useRustFfi(?bool $enabled = true): void
+    {
+        self::$boundedFeedUseRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$boundedFeedUseRustFfi ?? self::RUST_FFI_DEFAULT;
+    }
+
+    public static function resetRustFfi(): void
+    {
+        self::$boundedFeedUseRustFfi = null;
+        self::$boundedFeedFfi = null;
+    }
+
+    /**
+     * Plans the next downloadBody() read: the normalized Content-Encoding and whether it is
+     * accepted, the next wire read size (up to one byte past the cap), the remaining decoded
+     * budget and whether the bytes received so far already exceed the cap.
+     *
+     * @return array{encoding: string, supported: bool, gzip: bool, limits_valid: bool, next_read: int, remaining_budget: int, over_limit: bool}
+     */
+    public static function planBoundedBodyRead(string $contentEncoding, int $maximumBodyBytes, int $receivedBytes): array
+    {
+        return self::usesRustFfi()
+            ? self::planBoundedBodyReadNative($contentEncoding, $maximumBodyBytes, $receivedBytes)
+            : self::planBoundedBodyReadPhp($contentEncoding, $maximumBodyBytes, $receivedBytes);
+    }
+
+    /**
+     * @return array{encoding: string, supported: bool, gzip: bool, limits_valid: bool, next_read: int, remaining_budget: int, over_limit: bool}
+     */
+    private static function planBoundedBodyReadNative(string $contentEncoding, int $maximumBodyBytes, int $receivedBytes): array
+    {
+        $output = self::callBoundedFeedNative([$maximumBodyBytes, $receivedBytes, $contentEncoding, strlen($contentEncoding)], strlen($contentEncoding) + 64);
+        // The encoding is the last field and may itself contain the separator.
+        $fields = $output === null ? [] : explode(self::BOUNDED_FEED_FIELD_SEPARATOR, $output, 7);
+        if (count($fields) !== 7) {
+            return self::planBoundedBodyReadPhp($contentEncoding, $maximumBodyBytes, $receivedBytes);
+        }
+
+        return [
+            'encoding' => $fields[6],
+            'supported' => $fields[0] === '1',
+            'gzip' => $fields[1] === '1',
+            'limits_valid' => $fields[2] === '1',
+            'next_read' => (int) $fields[3],
+            'remaining_budget' => (int) $fields[4],
+            'over_limit' => $fields[5] === '1',
+        ];
+    }
+
+    /**
+     * @return array{encoding: string, supported: bool, gzip: bool, limits_valid: bool, next_read: int, remaining_budget: int, over_limit: bool}
+     */
+    private static function planBoundedBodyReadPhp(string $contentEncoding, int $maximumBodyBytes, int $receivedBytes): array
+    {
+        $encoding = strtolower(trim($contentEncoding));
+        $valid = $maximumBodyBytes >= 1 && $maximumBodyBytes < PHP_INT_MAX;
+        $received = max(0, $receivedBytes);
+
+        return [
+            'encoding' => $encoding,
+            'supported' => in_array($encoding, ['', 'identity', 'gzip'], true),
+            'gzip' => $encoding === 'gzip',
+            'limits_valid' => $valid,
+            'next_read' => $valid ? max(0, min(self::BOUNDED_FEED_READ_CHUNK, $maximumBodyBytes + 1 - $received)) : 0,
+            'remaining_budget' => $valid ? max(0, $maximumBodyBytes - $received) : 0,
+            'over_limit' => $valid && $received > $maximumBodyBytes,
+        ];
+    }
+
+    /**
+     * @param  list<int|string>  $args
+     */
+    private static function callBoundedFeedNative(array $args, int $hint): ?string
+    {
+        self::$boundedFeedFfi ??= RustPipelineLibrary::resolveDomain('metadata_w374', self::BOUNDED_FEED_FFI_CDEF) ?? false;
+        if (self::$boundedFeedFfi === false) {
+            return null;
+        }
+        $ffi = self::$boundedFeedFfi;
+
+        try {
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, $hint, $capacity);
+            if ($buffer === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w374_bounded_body_read_plan(...[...$args, $buffer, $capacity]);
+            if (is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w374_bounded_body_read_plan(...[...$args, $buffer, $capacity]);
+            }
+            if (! is_int($written) || $written < 0 || $written > $capacity) {
+                return null;
+            }
+
+            return FFI::string($buffer, $written);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }
