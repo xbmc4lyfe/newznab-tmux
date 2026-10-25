@@ -44,6 +44,43 @@ class ReleaseSearchService
 
     private static bool $useRustFfi = true;
 
+    /** Wave 48.5 batch export shared with the log viewer helpers. */
+    public const string W48_FFI_CDEF = 'int64_t nntmux_w48_logviewer_entry_file_repo_reader_release_search(uint32_t mode, const char *input, size_t input_len, char *out, size_t cap);';
+
+    /**
+     * Benchmark-gated default for {@see normalizeSearchRequestBatch()}: Rust cleared every 1.5x mean/p99
+     * gate (min 1.96x); see tests/Unit/RustLogViewerEntryFileRepoReaderReleaseSearchW48ParityTest.php.
+     */
+    public const bool W48_RELEASE_SEARCH_SERVICE_RUST_FFI_DEFAULT = true;
+
+    /** Size buckets in bytes, as {@see resolveSizeRangeBoundsPhp()} resolves them. */
+    private const array W48_SIZE_BYTES = [
+        1 => 104_857_600,
+        2 => 209_715_200,
+        3 => 524_288_000,
+        4 => 1_048_576_000,
+        5 => 2_097_152_000,
+        6 => 3_145_728_000,
+        7 => 4_194_304_000,
+        8 => 8_388_608_000,
+        9 => 16_777_216_000,
+        10 => 33_554_432_000,
+        11 => 67_108_864_000,
+    ];
+
+    /** Day filters are capped at a century. */
+    private const int W48_MAX_DAYS = 36_500;
+
+    private const int W48_MAX_BYTES = 67_108_864;
+
+    private static ?bool $useW48ReleaseSearchServiceRustFfi = null;
+
+    private static FFI|false|null $w48Ffi = null;
+
+    private static ?CData $w48Out = null;
+
+    private static int $w48OutCap = 0;
+
     private const CACHE_VERSION_KEY = 'releases:cache_version';
 
     private const SEARCH_INDEX_BUFFER_PAGES = 10;
@@ -67,6 +104,169 @@ class ReleaseSearchService
     public static function usesRustFfi(): bool
     {
         return self::$useRustFfi;
+    }
+
+    /** Pass null to restore {@see W48_RELEASE_SEARCH_SERVICE_RUST_FFI_DEFAULT}. */
+    public static function useW48ReleaseSearchServiceRustFfi(?bool $enable = true): void
+    {
+        self::$useW48ReleaseSearchServiceRustFfi = $enable;
+    }
+
+    public static function usesW48ReleaseSearchServiceRustFfi(): bool
+    {
+        return self::$useW48ReleaseSearchServiceRustFfi ?? self::W48_RELEASE_SEARCH_SERVICE_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW48ReleaseSearchServiceRustFfi(): void
+    {
+        self::$useW48ReleaseSearchServiceRustFfi = null;
+    }
+
+    /**
+     * Normalizes `[term, category, size_from, size_to, days_new, days_old]` search requests. Per request:
+     * `[normalized_len, terms, negated_terms, dropped_terms, size_min, size_max, days_new, days_old,
+     * category, category_root, cache_key_fnv64]` — the term is normalized like
+     * {@see normalizeMysqlFallbackPhrasePhp()} and split on spaces; words with leading `!` are negated,
+     * words shorter than two bytes (after the `!`) are dropped, and the positive and negated words are
+     * sorted and deduplicated. Size buckets resolve like {@see resolveSizeRangeBoundsPhp()} (0 unknown)
+     * and day filters are -1 when negative or capped at 36500; both pairs are swapped when reversed.
+     * Positive categories keep their root (thousands), others become -1. The cache key hashes
+     * `positive|negated|category|size_min|size_max|days_new|days_old` with FNV-1a 64.
+     *
+     * @param  list<array{string, int, int, int, int, int}>  $requests
+     * @return list<list<int>>
+     */
+    public static function normalizeSearchRequestBatch(array $requests): array
+    {
+        return self::usesW48ReleaseSearchServiceRustFfi() ? self::normalizeSearchRequestBatchNative($requests) : self::normalizeSearchRequestBatchPhp($requests);
+    }
+
+    /**
+     * @param  list<array{string, int, int, int, int, int}>  $requests
+     * @return list<list<int>>
+     */
+    public static function normalizeSearchRequestBatchPhp(array $requests): array
+    {
+        $rows = [];
+
+        foreach ($requests as [$term, $category, $sizeFrom, $sizeTo, $daysNew, $daysOld]) {
+            $normalized = trim((string) preg_replace('/\s+/', ' ', str_replace(['.', '-', '_'], ' ', strtolower(trim($term)))));
+            $positive = $negative = [];
+            $dropped = 0;
+
+            if ($normalized !== '') {
+                foreach (explode(' ', $normalized) as $token) {
+                    $negated = str_starts_with($token, '!');
+                    $word = $negated ? ltrim($token, '!') : $token;
+
+                    if (\strlen($word) < 2) {
+                        $dropped++;
+                    } elseif ($negated) {
+                        $negative[] = $word;
+                    } else {
+                        $positive[] = $word;
+                    }
+                }
+            }
+
+            $positive = array_values(array_unique($positive, SORT_STRING));
+            $negative = array_values(array_unique($negative, SORT_STRING));
+            sort($positive, SORT_STRING);
+            sort($negative, SORT_STRING);
+
+            $sizeMin = self::W48_SIZE_BYTES[$sizeFrom] ?? 0;
+            $sizeMax = self::W48_SIZE_BYTES[$sizeTo] ?? 0;
+            if ($sizeMin > 0 && $sizeMax > 0 && $sizeMin > $sizeMax) {
+                [$sizeMin, $sizeMax] = [$sizeMax, $sizeMin];
+            }
+
+            $newest = $daysNew < 0 ? -1 : min($daysNew, self::W48_MAX_DAYS);
+            $oldest = $daysOld < 0 ? -1 : min($daysOld, self::W48_MAX_DAYS);
+            if ($newest >= 0 && $oldest >= 0 && $newest > $oldest) {
+                [$newest, $oldest] = [$oldest, $newest];
+            }
+
+            [$category, $root] = $category > 0 ? [$category, intdiv($category, 1000) * 1000] : [-1, -1];
+            /** @var array{1: int} $hash */
+            $hash = unpack('J', hash('fnv1a64', implode(' ', $positive).'|'.implode(' ', $negative)."|{$category}|{$sizeMin}|{$sizeMax}|{$newest}|{$oldest}", true));
+
+            $rows[] = [\strlen($normalized), \count($positive), \count($negative), $dropped, $sizeMin, $sizeMax, $newest, $oldest, $category, $root, $hash[1]];
+        }
+
+        return $rows;
+    }
+
+    /**
+     * @param  list<array{string, int, int, int, int, int}>  $requests
+     * @return list<list<int>>
+     */
+    public static function normalizeSearchRequestBatchNative(array $requests): array
+    {
+        $count = \count($requests);
+
+        if ($count === 0) {
+            return [];
+        }
+
+        $terms = array_column($requests, 0);
+        $input = pack(
+            'P*',
+            $count,
+            ...array_column($requests, 1),
+            ...array_column($requests, 2),
+            ...array_column($requests, 3),
+            ...array_column($requests, 4),
+            ...array_column($requests, 5),
+        ).pack('P*', ...array_map(\strlen(...), $terms)).implode('', $terms);
+        $raw = self::evaluateW48Native(5, $input, 88 * $count);
+
+        if ($raw === null || \strlen($raw) !== 88 * $count) {
+            return self::normalizeSearchRequestBatchPhp($requests);
+        }
+
+        $values = unpack('P*', $raw);
+
+        /** @var list<list<int>> */
+        return \is_array($values) ? array_chunk($values, 11) : self::normalizeSearchRequestBatchPhp($requests);
+    }
+
+    /**
+     * Output (at most $capacity bytes) from a Wave 48.5 mode, or null to fall back to PHP.
+     */
+    public static function evaluateW48Native(int $mode, string $input, int $capacity): ?string
+    {
+        if (self::$w48Ffi === null) {
+            $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+            self::$w48Ffi = RustPipelineLibrary::resolveDomain('search_w48', self::W48_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+            self::$w48Out = null;
+            self::$w48OutCap = 0;
+        }
+
+        $ffi = self::$w48Ffi;
+        $length = \strlen($input);
+
+        if (! $ffi instanceof FFI || $mode < 1 || $capacity < 0 || $capacity > self::W48_MAX_BYTES || $length > self::W48_MAX_BYTES) {
+            return null;
+        }
+
+        try {
+            if (self::$w48Out === null || $capacity > self::$w48OutCap) {
+                $cap = max(4096, $capacity);
+                self::$w48Out = $ffi->new('char['.$cap.']');
+                self::$w48OutCap = $cap;
+            }
+
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w48_logviewer_entry_file_repo_reader_release_search($mode, $input, $length, self::$w48Out, $capacity);
+
+            if (! \is_int($written) || $written < 0 || $written > $capacity) {
+                return null;
+            }
+
+            return $written === 0 ? '' : FFI::string(self::$w48Out, $written);
+        } catch (Throwable) {
+            return null;
+        }
     }
 
     /**
