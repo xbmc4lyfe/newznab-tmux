@@ -6,9 +6,11 @@ namespace App\Services;
 
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use InvalidArgumentException;
 use Throwable;
 
 /**
@@ -718,6 +720,210 @@ class FanartTvService
             return $summary;
         } catch (Throwable) {
             return null;
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 50.4 batch helper
+    // ---------------------------------------------------------------------
+
+    /** Enabled: minimum of three paired runs cleared every 1.5x gate (common mean 2.25x, p99 2.24x; uncommon mean 3.19x, p99 2.75x); see RustBookCandidateFanartForkingGenreInvitationW50ParityTest. */
+    private const bool W50_RUST_FFI_DEFAULT = true;
+
+    public const string W50_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w504_fanart_image_rank_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Image flags returned by rankImageBatch(). */
+    public const int W50_BEST = 1;
+
+    public const int W50_NUMERIC_LIKES = 2;
+
+    public const int W50_HTTPS = 4;
+
+    public const int W50_FANART_HOST = 8;
+
+    public const int W50_PREVIEW = 16;
+
+    public const int W50_JPG = 32;
+
+    public const int W50_PNG = 64;
+
+    public const int W50_EMPTY_URL = 128;
+
+    private static ?bool $useW50RustFfi = null;
+
+    private static FFI|false|null $w50Ffi = null;
+
+    private static ?CData $w50Out = null;
+
+    private static int $w50OutCap = 0;
+
+    public static function usesW50RustFfi(): bool
+    {
+        return self::$useW50RustFfi ?? self::W50_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W50 batch dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW50RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$useW50RustFfi;
+        self::$useW50RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$useW50RustFfi = $previous;
+        }
+    }
+
+    /**
+     * Rank Fanart.TV image entries, two ints each: [likes, flags]. Likes are the trimmed
+     * value when it is all ASCII digits (saturating at PHP_INT_MAX, flag 2), otherwise 0.
+     * Consecutive entries with the same group id form one artwork list; its first entry
+     * with the most likes (the selectBestPosterUrl() stable-sort pick) gets flag 1.
+     *
+     * URL flags on the trimmed URL: 4 https:// prefix, 8 contains fanart.tv/, 16 contains
+     * /preview/ (all ASCII case-insensitive), 32 jpg/jpeg or 64 png text after the last
+     * dot, 128 empty.
+     *
+     * @param  list<int>  $groups
+     * @param  list<string>  $likes
+     * @param  list<string>  $urls
+     * @return list<int>
+     */
+    public static function rankImageBatch(array $groups, array $likes, array $urls): array
+    {
+        return self::usesW50RustFfi()
+            ? self::rankImageBatchNative($groups, $likes, $urls)
+            : self::rankImageBatchPhp($groups, $likes, $urls);
+    }
+
+    /**
+     * @param  list<int>  $groups
+     * @param  list<string>  $likes
+     * @param  list<string>  $urls
+     * @return list<int>
+     */
+    public static function rankImageBatchNative(array $groups, array $likes, array $urls): array
+    {
+        self::w50AssertColumns($groups, $likes, $urls);
+        if ($groups === []) {
+            return [];
+        }
+
+        return self::w50Call(implode("\0", $likes)."\0".implode("\0", $urls), pack('P*', ...$groups), \count($groups))
+            ?? self::rankImageBatchPhp($groups, $likes, $urls);
+    }
+
+    /**
+     * @param  list<int>  $groups
+     * @param  list<string>  $likes
+     * @param  list<string>  $urls
+     * @return list<int>
+     */
+    public static function rankImageBatchPhp(array $groups, array $likes, array $urls): array
+    {
+        self::w50AssertColumns($groups, $likes, $urls);
+        $out = [];
+        $best = 0;
+        $bestLikes = 0;
+        foreach ($groups as $i => $group) {
+            $like = trim($likes[$i]);
+            $numeric = $like !== '' && ctype_digit($like);
+            // (int) saturates digit strings beyond PHP_INT_MAX.
+            $value = $numeric ? (int) $like : 0;
+            $flags = $numeric ? self::W50_NUMERIC_LIKES : 0;
+            $url = trim($urls[$i]);
+            if ($url === '') {
+                $flags |= self::W50_EMPTY_URL;
+            } else {
+                if (strncasecmp($url, 'https://', 8) === 0) {
+                    $flags |= self::W50_HTTPS;
+                }
+                if (stripos($url, 'fanart.tv/') !== false) {
+                    $flags |= self::W50_FANART_HOST;
+                }
+                if (stripos($url, '/preview/') !== false) {
+                    $flags |= self::W50_PREVIEW;
+                }
+                $dot = strrpos($url, '.');
+                if ($dot !== false) {
+                    $extension = strtolower(substr($url, $dot + 1));
+                    if ($extension === 'jpg' || $extension === 'jpeg') {
+                        $flags |= self::W50_JPG;
+                    } elseif ($extension === 'png') {
+                        $flags |= self::W50_PNG;
+                    }
+                }
+            }
+            if ($i > 0 && $group !== $groups[$i - 1]) {
+                $out[$best * 2 + 1] |= self::W50_BEST;
+                $best = $i;
+                $bestLikes = $value;
+            } elseif ($i === 0 || $value > $bestLikes) {
+                $best = $i;
+                $bestLikes = $value;
+            }
+            $out[] = $value;
+            $out[] = $flags;
+        }
+        if ($out !== []) {
+            $out[$best * 2 + 1] |= self::W50_BEST;
+        }
+
+        return $out;
+    }
+
+    /**
+     * One FFI crossing for the batch: NUL-joined text columns, little-endian int64 group ids,
+     * two int64 words back per record. Null when the library is missing or declines.
+     *
+     * @return list<int>|null
+     */
+    private static function w50Call(string $text, string $ints, int $count): ?array
+    {
+        try {
+            self::$w50Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w50', self::W50_FFI_CDEF) ?? false;
+            $ffi = self::$w50Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            $need = $count * 2;
+            $out = self::$w50Out;
+            if ($out === null || self::$w50OutCap < $need) {
+                self::$w50OutCap = max(1024, $need);
+                $out = self::$w50Out = $ffi->new('int64_t['.self::$w50OutCap.']');
+            }
+            // @phpstan-ignore method.notFound (Declared by W50_FFI_CDEF.)
+            $written = $ffi->nntmux_w504_fanart_image_rank_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, self::$w50OutCap);
+            if ($written !== $need) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $need * 8));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * @param  array<array-key, mixed>  ...$columns
+     */
+    private static function w50AssertColumns(array ...$columns): void
+    {
+        $count = \count($columns[0]);
+        foreach ($columns as $column) {
+            if (\count($column) !== $count || ! array_is_list($column)) {
+                throw new InvalidArgumentException('W50 batch columns must be lists of equal length.');
+            }
         }
     }
 }

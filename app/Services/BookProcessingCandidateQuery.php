@@ -8,6 +8,8 @@ use App\Models\Category;
 use App\Models\Release;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
+use InvalidArgumentException;
 use Throwable;
 
 final class BookProcessingCandidateQuery
@@ -217,6 +219,206 @@ final class BookProcessingCandidateQuery
             return FFI::string($buffer, $written);
         } catch (Throwable) {
             return null;
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 50.4 batch helper
+    // ---------------------------------------------------------------------
+
+    /** Enabled: minimum of three paired runs cleared every 1.5x gate (common mean 2.71x, p99 1.99x; uncommon mean 2.87x, p99 2.67x); see RustBookCandidateFanartForkingGenreInvitationW50ParityTest. */
+    private const bool W50_RUST_FFI_DEFAULT = true;
+
+    public const string W50_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w504_book_candidate_state_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Candidate flags returned by candidateStateBatch(). */
+    public const int W50_CATEGORY = 1;
+
+    public const int W50_SETTLED = 2;
+
+    public const int W50_METADATA = 4;
+
+    public const int W50_NORMALIZATION = 8;
+
+    public const int W50_WORK = 16;
+
+    public const int W50_PLACEHOLDER = 32;
+
+    private const int W50_SCALARS = 8;
+
+    private static ?bool $useW50RustFfi = null;
+
+    private static FFI|false|null $w50Ffi = null;
+
+    private static ?CData $w50Out = null;
+
+    private static int $w50OutCap = 0;
+
+    public static function usesW50RustFfi(): bool
+    {
+        return self::$useW50RustFfi ?? self::W50_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W50 batch dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW50RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$useW50RustFfi;
+        self::$useW50RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$useW50RustFfi = $previous;
+        }
+    }
+
+    /**
+     * Evaluate the SQL candidate predicates for a batch of fetched releases, two ints each:
+     * [flags, next retry delay]. Each release supplies eight ints in $scalars
+     * ([categories_id, isrenamed, has bookinfo_id 0/1, book_lookup_attempts, retry due 0/1
+     * (book_lookup_retry_at NULL or past), normalized 0/1 (book_name_normalized_at set),
+     * late candidate 0/1 (late_article_candidate_id set), provider retry after]) plus its
+     * searchname and name.
+     *
+     * Flags mirror categoryCondition() (1), settledCondition() (2), metadataCondition() (4),
+     * normalizationCondition() (8) and workCondition() (16); 32 marks a placeholder name
+     * (LIKE 'N:/NZB%' or 'N_NZB_%', bytewise, ASCII case-insensitive). The delay is
+     * retryDelay() for one more failure, or EXHAUSTED once that failure reaches MAX_FAILURES.
+     *
+     * @param  list<int>  $scalars
+     * @param  list<string>  $searchnames
+     * @param  list<string>  $names
+     * @return list<int>
+     */
+    public static function candidateStateBatch(int $lookupMode, bool $hasLateArticleFlag, array $scalars, array $searchnames, array $names): array
+    {
+        return self::usesW50RustFfi()
+            ? self::candidateStateBatchNative($lookupMode, $hasLateArticleFlag, $scalars, $searchnames, $names)
+            : self::candidateStateBatchPhp($lookupMode, $hasLateArticleFlag, $scalars, $searchnames, $names);
+    }
+
+    /**
+     * @param  list<int>  $scalars
+     * @param  list<string>  $searchnames
+     * @param  list<string>  $names
+     * @return list<int>
+     */
+    public static function candidateStateBatchNative(int $lookupMode, bool $hasLateArticleFlag, array $scalars, array $searchnames, array $names): array
+    {
+        self::w50AssertShape($scalars, $searchnames, $names);
+        if ($searchnames === []) {
+            return [];
+        }
+        $ints = pack('P*', $lookupMode, (int) $hasLateArticleFlag, Category::BOOKS_ROOT, Category::BOOKS_UNKNOWN, Category::MUSIC_AUDIOBOOK, self::MAX_FAILURES, ...$scalars);
+
+        return self::w50Call(implode("\0", $searchnames)."\0".implode("\0", $names), $ints, \count($searchnames))
+            ?? self::candidateStateBatchPhp($lookupMode, $hasLateArticleFlag, $scalars, $searchnames, $names);
+    }
+
+    /**
+     * @param  list<int>  $scalars
+     * @param  list<string>  $searchnames
+     * @param  list<string>  $names
+     * @return list<int>
+     */
+    public static function candidateStateBatchPhp(int $lookupMode, bool $hasLateArticleFlag, array $scalars, array $searchnames, array $names): array
+    {
+        self::w50AssertShape($scalars, $searchnames, $names);
+        $out = [];
+        $at = 0;
+        foreach ($searchnames as $i => $searchname) {
+            $category = $scalars[$at];
+            $renamed = $scalars[$at + 1];
+            $attempts = $scalars[$at + 3];
+            $flags = 0;
+            if (($category >= Category::BOOKS_ROOT && $category <= Category::BOOKS_UNKNOWN) || $category === Category::MUSIC_AUDIOBOOK) {
+                $flags |= self::W50_CATEGORY;
+            }
+            if (! $hasLateArticleFlag || $scalars[$at + 6] === 0) {
+                $flags |= self::W50_SETTLED;
+            }
+            if (self::w50Placeholder($searchname) || self::w50Placeholder($names[$i])) {
+                $flags |= self::W50_PLACEHOLDER;
+            }
+            if ($lookupMode > 0) {
+                if ($scalars[$at + 2] === 0 && $attempts < self::MAX_FAILURES && $scalars[$at + 4] !== 0 && ($lookupMode !== 2 || $renamed === 1)) {
+                    $flags |= self::W50_METADATA;
+                }
+                if ($scalars[$at + 5] === 0 && (($lookupMode !== 2 && $renamed === 0) || ($flags & self::W50_PLACEHOLDER) !== 0)) {
+                    $flags |= self::W50_NORMALIZATION;
+                }
+            }
+            if (($flags & 3) === 3 && ($flags & 12) !== 0) {
+                $flags |= self::W50_WORK;
+            }
+            $failures = $attempts < PHP_INT_MAX ? $attempts + 1 : PHP_INT_MAX;
+            $out[] = $flags;
+            $out[] = $failures >= self::MAX_FAILURES ? self::EXHAUSTED : self::retryDelayPhp($failures, $scalars[$at + 7]);
+            $at += self::W50_SCALARS;
+        }
+
+        return $out;
+    }
+
+    /** LIKE 'N:/NZB%' OR LIKE 'N_NZB_%' under a case-insensitive collation, compared bytewise. */
+    private static function w50Placeholder(string $name): bool
+    {
+        return isset($name[5]) && ($name[0] === 'N' || $name[0] === 'n')
+            && (strncasecmp(substr($name, 2, 3), 'nzb', 3) === 0 || strncasecmp($name, 'n:/nzb', 6) === 0);
+    }
+
+    /**
+     * One FFI crossing for the batch: NUL-joined text columns, little-endian int64 header and
+     * scalars, two int64 words back per record. Null when the library is missing or declines.
+     *
+     * @return list<int>|null
+     */
+    private static function w50Call(string $text, string $ints, int $count): ?array
+    {
+        try {
+            self::$w50Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w50', self::W50_FFI_CDEF) ?? false;
+            $ffi = self::$w50Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            $need = $count * 2;
+            $out = self::$w50Out;
+            if ($out === null || self::$w50OutCap < $need) {
+                self::$w50OutCap = max(1024, $need);
+                $out = self::$w50Out = $ffi->new('int64_t['.self::$w50OutCap.']');
+            }
+            // @phpstan-ignore method.notFound (Declared by W50_FFI_CDEF.)
+            $written = $ffi->nntmux_w504_book_candidate_state_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, self::$w50OutCap);
+            if ($written !== $need) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $need * 8));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $scalars
+     * @param  array<array-key, mixed>  $searchnames
+     * @param  array<array-key, mixed>  $names
+     */
+    private static function w50AssertShape(array $scalars, array $searchnames, array $names): void
+    {
+        $count = \count($searchnames);
+        if (! array_is_list($scalars) || ! array_is_list($searchnames) || ! array_is_list($names)
+            || \count($names) !== $count || \count($scalars) !== $count * self::W50_SCALARS) {
+            throw new InvalidArgumentException('W50 book candidate batches need list columns of equal length and eight scalars per release.');
         }
     }
 }
