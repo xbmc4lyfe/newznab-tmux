@@ -30776,3 +30776,850 @@ mod wave43_5_manticore_schema_release_browse_duplicate_group_mgmt {
         }
     }
 }
+
+/// Wave 44.5 log viewer, Prometheus and search document helpers: Manticore
+/// match-expression batches (`LogIndexQuery`), Monolog line batches
+/// (`LogEntryParser`), plain-term highlight batches (`SearchQuery`), label
+/// and help escape batches (`TextFormatter`) and plain search name batches
+/// (`ReleaseSearchIndexDocument`). PHP sends a count, the little-endian u32
+/// length of every part and then the concatenated parts; results are i64
+/// counters in a fixed order per mode.
+mod wave44_5_log_index_parser_search_prometheus_doc {
+    use std::borrow::Cow;
+    use std::collections::HashSet;
+    use std::hash::{BuildHasherDefault, Hasher};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const DECLINE: i64 = -1;
+    const MAX_INPUT: usize = 64 * 1024 * 1024;
+    const MAX_PARTS: usize = 1 << 22;
+    /// Characters stripped by PHP's default `trim()`.
+    const TRIM: &[u8] = b" \t\n\r\0\x0B";
+    /// `LogEntryParser::LEVELS`, uppercased as Monolog writes them.
+    const LEVELS: [&[u8]; 8] = [
+        b"DEBUG",
+        b"INFO",
+        b"NOTICE",
+        b"WARNING",
+        b"ERROR",
+        b"CRITICAL",
+        b"ALERT",
+        b"EMERGENCY",
+    ];
+
+    /// Word-at-a-time FNV-style hasher for the per-call distinct sets; each set
+    /// lives for one call, so SipHash's flooding resistance is not needed.
+    #[derive(Default)]
+    struct WordHasher(u64);
+
+    impl Hasher for WordHasher {
+        fn write(&mut self, bytes: &[u8]) {
+            const PRIME: u64 = 0x0000_0100_0000_01B3;
+            let (words, tail) = bytes.as_chunks::<8>();
+            let mut hash = self.0 ^ 0xCBF2_9CE4_8422_2325;
+            for word in words {
+                hash = (hash ^ u64::from_le_bytes(*word)).wrapping_mul(PRIME);
+            }
+            let mut last = [0u8; 8];
+            last[..tail.len()].copy_from_slice(tail);
+            hash = (hash ^ u64::from_le_bytes(last)).wrapping_mul(PRIME);
+            self.0 = (hash ^ (hash >> 29)).wrapping_mul(PRIME) ^ (bytes.len() as u64);
+        }
+
+        fn write_usize(&mut self, value: usize) {
+            self.0 = (self.0 ^ value as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+
+        fn finish(&self) -> u64 {
+            self.0 ^ (self.0 >> 32)
+        }
+    }
+
+    type Distinct<T> = HashSet<T, BuildHasherDefault<WordHasher>>;
+
+    fn distinct<T>(capacity: usize) -> Distinct<T> {
+        HashSet::with_capacity_and_hasher(capacity.min(4096), Default::default())
+    }
+
+    /// Splits `[count][len; count][bytes...]` without copying.
+    fn unpack(input: &[u8]) -> Option<Vec<&[u8]>> {
+        let count = u32::from_le_bytes(input.get(..4)?.try_into().ok()?) as usize;
+        if count > MAX_PARTS || count > (input.len() - 4) / 4 {
+            return None;
+        }
+        let lengths = input.get(4..4 + count * 4)?;
+        let mut cursor = 4 + count * 4;
+        let mut parts = Vec::with_capacity(count);
+        for chunk in lengths.as_chunks::<4>().0 {
+            let length = u32::from_le_bytes(*chunk) as usize;
+            let end = cursor.checked_add(length)?;
+            parts.push(input.get(cursor..end)?);
+            cursor = end;
+        }
+        (cursor == input.len()).then_some(parts)
+    }
+
+    /// Canonical decimal produced by PHP `(string) $int`.
+    fn integer(bytes: &[u8]) -> Option<i64> {
+        if bytes.is_empty() || bytes.len() > 20 {
+            return None;
+        }
+        let value: i64 = std::str::from_utf8(bytes).ok()?.parse().ok()?;
+        (value.to_string().as_bytes() == bytes).then_some(value)
+    }
+
+    fn flag(bytes: &[u8]) -> Option<bool> {
+        match bytes {
+            b"1" => Some(true),
+            b"0" => Some(false),
+            _ => None,
+        }
+    }
+
+    fn counts(values: &[usize]) -> Option<Vec<i64>> {
+        values
+            .iter()
+            .map(|value| i64::try_from(*value).ok())
+            .collect()
+    }
+
+    /// PHP `trim()` with the default character list.
+    fn trim(bytes: &[u8]) -> &[u8] {
+        let start = bytes
+            .iter()
+            .position(|byte| !TRIM.contains(byte))
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|byte| !TRIM.contains(byte))
+            .map_or(start, |index| index + 1);
+        &bytes[start..end]
+    }
+
+    /// PCRE `\s` without the `u` modifier.
+    fn space(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | 0x0B | 0x0C | b'\r')
+    }
+
+    /// PCRE `\w` without the `u` modifier.
+    fn word(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || byte == b'_'
+    }
+
+    // ---- Mode 1: LogIndexQuery::matchExpression() ------------------------
+
+    /// `LogIndexQuery::matchExpression()` for ASCII terms: the expression and
+    /// the number of kept, dropped, prefixed and suffixed tokens.
+    fn match_expression(term: &[u8], min_infix: usize) -> (Option<Vec<u8>>, [usize; 4]) {
+        let tokens: Vec<&[u8]> = term
+            .split(|byte| !word(*byte))
+            .filter(|token| !token.is_empty())
+            .collect();
+        if tokens.is_empty() {
+            return (None, [0; 4]);
+        }
+        let last = tokens.len() - 1;
+        let starts = term.first().is_some_and(|byte| word(*byte));
+        let ends = term.last().is_some_and(|byte| word(*byte));
+        let (mut kept, mut dropped, mut prefixed, mut suffixed) = (0usize, 0usize, 0usize, 0usize);
+        let mut out = Vec::with_capacity(term.len() + 4);
+        for (index, token) in tokens.iter().enumerate() {
+            let prefix = index == 0 && starts;
+            let suffix = index == last && ends;
+            if (prefix || suffix) && token.len() < min_infix {
+                dropped += 1;
+                continue;
+            }
+            if kept > 0 {
+                out.push(b' ');
+            }
+            if prefix {
+                out.push(b'*');
+                prefixed += 1;
+            }
+            out.extend(token.iter().map(u8::to_ascii_lowercase));
+            if suffix {
+                out.push(b'*');
+                suffixed += 1;
+            }
+            kept += 1;
+        }
+        if kept == 0 {
+            return (None, [0, dropped, 0, 0]);
+        }
+        if kept > 1 {
+            out.insert(0, b'"');
+            out.push(b'"');
+        }
+        (Some(out), [kept, dropped, prefixed, suffixed])
+    }
+
+    /// Fields: supported, phrases, tokens, dropped, prefix_wildcards,
+    /// suffix_wildcards, max_tokens, distinct_expressions. Non-ASCII terms
+    /// need Unicode classes and case mapping, so they decline the batch.
+    fn match_expressions(parts: &[&[u8]]) -> Option<Vec<i64>> {
+        let (min_infix, terms) = parts.split_first()?;
+        let min_infix = usize::try_from(integer(min_infix)?).ok()?;
+        if terms.iter().any(|term| !term.is_ascii()) {
+            return None;
+        }
+        let mut totals = [0usize; 7];
+        let mut distinct: Distinct<Vec<u8>> = distinct(terms.len());
+        for term in terms {
+            let (expression, [kept, dropped, prefixed, suffixed]) =
+                match_expression(term, min_infix);
+            totals[3] += dropped;
+            if let Some(expression) = expression {
+                totals[0] += 1;
+                totals[1] += usize::from(kept > 1);
+                totals[2] += kept;
+                totals[4] += prefixed;
+                totals[5] += suffixed;
+                totals[6] = totals[6].max(kept);
+                distinct.insert(expression);
+            }
+        }
+        let mut out = counts(&totals)?;
+        out.push(i64::try_from(distinct.len()).ok()?);
+        Some(out)
+    }
+
+    // ---- Mode 2: LogEntryParser headers and plain timestamps -------------
+
+    fn digits(bytes: &[u8], at: usize, count: usize) -> bool {
+        bytes
+            .get(at..at + count)
+            .is_some_and(|run| run.iter().all(u8::is_ascii_digit))
+    }
+
+    /// `\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}` at `at`.
+    fn timestamp(bytes: &[u8], at: usize) -> bool {
+        let at_is = |offset: usize, expected: &[u8]| {
+            bytes
+                .get(at + offset)
+                .is_some_and(|byte| expected.contains(byte))
+        };
+        digits(bytes, at, 4)
+            && at_is(4, b"-")
+            && digits(bytes, at + 5, 2)
+            && at_is(7, b"-")
+            && digits(bytes, at + 8, 2)
+            && at_is(10, b"T ")
+            && digits(bytes, at + 11, 2)
+            && at_is(13, b":")
+            && digits(bytes, at + 14, 2)
+            && at_is(16, b":")
+            && digits(bytes, at + 17, 2)
+    }
+
+    /// `LogEntryParser::HEADER_PATTERN`: the channel, the raw level and the
+    /// message length of a Monolog header line.
+    fn parse_header(line: &[u8]) -> Option<(&[u8], &[u8], usize)> {
+        if line.first() != Some(&b'[') || !timestamp(line, 1) {
+            return None;
+        }
+        let at = |index: usize| line.get(index).copied();
+        let mut i = 20;
+        if at(i) == Some(b'.') {
+            i += 1;
+            let start = i;
+            while at(i).is_some_and(|byte| byte.is_ascii_digit()) {
+                i += 1;
+            }
+            if i == start {
+                return None;
+            }
+        }
+        match at(i) {
+            Some(b'+' | b'-') => {
+                if !digits(line, i + 1, 2) {
+                    return None;
+                }
+                i += 3;
+                if at(i) == Some(b':') {
+                    i += 1;
+                }
+                if !digits(line, i, 2) {
+                    return None;
+                }
+                i += 2;
+            }
+            Some(b'Z') => i += 1,
+            _ => {}
+        }
+        if at(i) != Some(b']') {
+            return None;
+        }
+        i += 1;
+        let spaces = i;
+        while at(i).is_some_and(space) {
+            i += 1;
+        }
+        if i == spaces {
+            return None;
+        }
+        let run_start = i;
+        while at(i).is_some_and(|byte| word(byte) || byte == b'.' || byte == b'-') {
+            i += 1;
+        }
+        if at(i) != Some(b':') {
+            return None;
+        }
+        let run = &line[run_start..i];
+        let dot = run.iter().rposition(|byte| *byte == b'.')?;
+        let (channel, level) = (&run[..dot], &run[dot + 1..]);
+        if channel.is_empty() || level.is_empty() || !level.iter().all(u8::is_ascii_uppercase) {
+            return None;
+        }
+        let mut message = i + 1;
+        if at(message).is_some_and(space) {
+            message += 1;
+        }
+        Some((channel, level, line.len() - message))
+    }
+
+    /// `LogEntryParser::PLAIN_TIMESTAMP_PATTERN`.
+    fn plain_timestamp(line: &[u8]) -> bool {
+        let mut i = line
+            .iter()
+            .position(|byte| !space(*byte))
+            .unwrap_or(line.len());
+        if line.get(i) == Some(&b'[') {
+            i += 1;
+        }
+        timestamp(line, i)
+    }
+
+    /// Fields: headers, one count per level, unknown_level, plain_timestamps,
+    /// blank, distinct_channels, max_message_bytes.
+    fn log_lines(lines: &[&[u8]]) -> Option<Vec<i64>> {
+        let mut totals = [0usize; 14];
+        let mut channels: Distinct<&[u8]> = distinct(16);
+        for line in lines {
+            if let Some((channel, level, message)) = parse_header(line) {
+                totals[0] += 1;
+                match LEVELS.iter().position(|known| *known == level) {
+                    Some(index) => totals[1 + index] += 1,
+                    None => totals[9] += 1,
+                }
+                channels.insert(channel);
+                totals[13] = totals[13].max(message);
+            } else if plain_timestamp(line) {
+                totals[10] += 1;
+            } else if trim(line).is_empty() {
+                totals[11] += 1;
+            }
+        }
+        totals[12] = channels.len();
+        counts(&totals)
+    }
+
+    // ---- Mode 3: SearchQuery::plainRanges() ------------------------------
+
+    const LANES: u64 = 0x0101_0101_0101_0101;
+    const HIGHS: u64 = 0x8080_8080_8080_8080;
+
+    /// `strpos()` / `stripos()` (ASCII folding) from `from`. Eight start
+    /// positions are screened at a time by comparing the needle's first and
+    /// last bytes (SWAR); every flagged lane is verified in order, so the
+    /// first verified lane is the leftmost match.
+    fn find(hay: &[u8], needle: &[u8], from: usize, fold: bool) -> Option<usize> {
+        let width = needle.len();
+        let last = hay.len().checked_sub(width)?;
+        let fold_byte = |byte: u8| {
+            if fold {
+                byte.to_ascii_lowercase()
+            } else {
+                byte
+            }
+        };
+        let (first, final_byte) = (fold_byte(needle[0]), fold_byte(needle[width - 1]));
+        // OR-ing 0x20 folds only letters, so non-letters compare exactly.
+        let mask = |byte: u8| {
+            u64::from(if fold && byte.is_ascii_lowercase() {
+                0x20u8
+            } else {
+                0
+            })
+        };
+        let (first_lanes, first_mask) = (LANES * u64::from(first), LANES * mask(first));
+        let (last_lanes, last_mask) = (LANES * u64::from(final_byte), LANES * mask(final_byte));
+        let matches_at = |at: usize| {
+            let candidate = &hay[at..at + width];
+            if fold {
+                candidate.eq_ignore_ascii_case(needle)
+            } else {
+                candidate == needle
+            }
+        };
+        let word = |at: usize| u64::from_le_bytes(hay[at..at + 8].try_into().unwrap_or([0; 8]));
+        let mut i = from;
+        while i + 7 <= last {
+            let lanes = ((word(i) | first_mask) ^ first_lanes)
+                | ((word(i + width - 1) | last_mask) ^ last_lanes);
+            // Exact for the lowest zero lane; higher lanes may be false
+            // positives, never false negatives, and are verified below.
+            let mut zero = lanes.wrapping_sub(LANES) & !lanes & HIGHS;
+            while zero != 0 {
+                let at = i + (zero.trailing_zeros() / 8) as usize;
+                if matches_at(at) {
+                    return Some(at);
+                }
+                zero &= zero - 1;
+            }
+            i += 8;
+        }
+        while i <= last {
+            if fold_byte(hay[i]) == first && matches_at(i) {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Fields: matched, highlights, highlighted_bytes, max_highlights,
+    /// capped_lines.
+    fn line_matches(parts: &[&[u8]]) -> Option<Vec<i64>> {
+        let [term, case_sensitive, limit, lines @ ..] = parts else {
+            return None;
+        };
+        if term.is_empty() {
+            return None;
+        }
+        let fold = !flag(case_sensitive)?;
+        let limit = usize::try_from(integer(limit)?)
+            .ok()
+            .filter(|limit| *limit > 0)?;
+        let mut totals = [0usize; 5];
+        for line in lines {
+            let mut found = 0usize;
+            let mut offset = 0usize;
+            while found < limit {
+                let Some(position) = find(line, term, offset, fold) else {
+                    break;
+                };
+                found += 1;
+                offset = position + term.len();
+            }
+            totals[0] += usize::from(found > 0);
+            totals[1] += found;
+            totals[2] += found * term.len();
+            totals[3] = totals[3].max(found);
+            totals[4] += usize::from(found >= limit);
+        }
+        counts(&totals)
+    }
+
+    // ---- Mode 4: TextFormatter label and help escaping -------------------
+
+    /// Fields: label_escaped, help_escaped, backslashes, quotes, newlines,
+    /// input_bytes, label_bytes, help_bytes, distinct_values.
+    fn escapes(values: &[&[u8]]) -> Option<Vec<i64>> {
+        let mut totals = [0usize; 8];
+        let mut distinct: Distinct<&[u8]> = distinct(values.len());
+        for value in values {
+            let (mut backslashes, mut quotes, mut newlines) = (0usize, 0usize, 0usize);
+            for byte in value.iter() {
+                match byte {
+                    b'\\' => backslashes += 1,
+                    b'"' => quotes += 1,
+                    b'\n' => newlines += 1,
+                    _ => {}
+                }
+            }
+            totals[0] += usize::from(backslashes + quotes + newlines > 0);
+            totals[1] += usize::from(backslashes + newlines > 0);
+            totals[2] += backslashes;
+            totals[3] += quotes;
+            totals[4] += newlines;
+            totals[5] += value.len();
+            totals[6] += value.len() + backslashes + quotes + newlines;
+            totals[7] += value.len() + backslashes + newlines;
+            distinct.insert(value);
+        }
+        let mut out = counts(&totals)?;
+        out.push(i64::try_from(distinct.len()).ok()?);
+        Some(out)
+    }
+
+    // ---- Mode 5: ReleaseSearchIndexDocument::plainSearchName() -----------
+
+    fn separator(byte: u8) -> bool {
+        matches!(byte, b'.' | b'_' | b'-')
+    }
+
+    /// `trim(preg_replace('/[._-]+/', ' ', $value))` and the replacement count.
+    fn plain_search_name(value: &[u8]) -> (Cow<'_, [u8]>, usize) {
+        if !value.iter().any(|byte| separator(*byte)) {
+            return (Cow::Borrowed(trim(value)), 0);
+        }
+        let mut out = Vec::with_capacity(value.len());
+        let mut runs = 0usize;
+        let mut in_run = false;
+        for byte in value {
+            if separator(*byte) {
+                if !in_run {
+                    out.push(b' ');
+                    runs += 1;
+                    in_run = true;
+                }
+            } else {
+                out.push(*byte);
+                in_run = false;
+            }
+        }
+        let trimmed = trim(&out);
+        if trimmed.len() == out.len() {
+            (Cow::Owned(out), runs)
+        } else {
+            (Cow::Owned(trimmed.to_vec()), runs)
+        }
+    }
+
+    /// Fields: changed, empty, separator_runs, plain_bytes, max_plain_bytes,
+    /// distinct_plain.
+    fn plain_search_names(values: &[&[u8]]) -> Option<Vec<i64>> {
+        let mut totals = [0usize; 5];
+        let mut distinct: Distinct<Cow<'_, [u8]>> = distinct(values.len());
+        for value in values {
+            let (plain, runs) = plain_search_name(value);
+            totals[0] += usize::from(plain.as_ref() != *value);
+            totals[1] += usize::from(plain.is_empty());
+            totals[2] += runs;
+            totals[3] += plain.len();
+            totals[4] = totals[4].max(plain.len());
+            distinct.insert(plain);
+        }
+        let mut out = counts(&totals)?;
+        out.push(i64::try_from(distinct.len()).ok()?);
+        Some(out)
+    }
+
+    fn transform(mode: u32, parts: &[&[u8]]) -> Option<Vec<i64>> {
+        match mode {
+            1 => match_expressions(parts),
+            2 => log_lines(parts),
+            3 => line_matches(parts),
+            4 => escapes(parts),
+            5 => plain_search_names(parts),
+            _ => None,
+        }
+    }
+
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> Option<bool> {
+        if a_len == 0 || b_len == 0 {
+            return Some(false);
+        }
+        let a_end = a.checked_add(a_len)?;
+        let b_end = b.checked_add(b_len)?;
+        Some(a < b_end && b < a_end)
+    }
+
+    /// Summarize a count-prefixed, length-table framed batch (little-endian
+    /// u32 count, then one u32 length per part, then the parts). Writes the
+    /// mode's i64 counters to `out` and returns how many were written,
+    /// `-needed` when `cap` (in elements) is too small, or `-1` for invalid
+    /// input, mode, overlapping buffers or a declined batch. Failure never
+    /// writes to `out`; every mode writes at least five counters, so `-1`
+    /// never means "one counter needed".
+    ///
+    /// # Safety
+    /// Non-null pointers must refer to a readable allocation of `input_len`
+    /// bytes and a writable allocation of `cap` i64 values. Null pointers
+    /// require zero length/capacity. Input and output must not overlap.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w445_log_index_parser_search_prometheus_doc(
+        mode: u32,
+        input: *const u8,
+        input_len: usize,
+        out: *mut i64,
+        cap: usize,
+    ) -> i64 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if input_len > MAX_INPUT
+                || cap > (isize::MAX as usize) / 8
+                || (input.is_null() && input_len != 0)
+                || (out.is_null() && cap != 0)
+                || !(out as usize).is_multiple_of(std::mem::align_of::<i64>())
+            {
+                return DECLINE;
+            }
+            match overlaps(input as usize, input_len, out as usize, cap * 8) {
+                Some(false) => {}
+                _ => return DECLINE,
+            }
+            let input = if input_len == 0 {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(input, input_len) }
+            };
+            let Some(parts) = unpack(input) else {
+                return DECLINE;
+            };
+            let Some(result) = transform(mode, &parts) else {
+                return DECLINE;
+            };
+            // At most 14 counters per mode.
+            let needed = result.len() as i64;
+            if cap < result.len() || out.is_null() {
+                return -needed;
+            }
+            unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), out, result.len()) };
+            needed
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn packet(parts: &[&[u8]]) -> Vec<u8> {
+            let mut out = (parts.len() as u32).to_le_bytes().to_vec();
+            for part in parts {
+                out.extend_from_slice(&(part.len() as u32).to_le_bytes());
+            }
+            for part in parts {
+                out.extend_from_slice(part);
+            }
+            out
+        }
+
+        fn raw(mode: u32, input: &[u8], out: &mut [i64]) -> i64 {
+            unsafe {
+                nntmux_w445_log_index_parser_search_prometheus_doc(
+                    mode,
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            }
+        }
+
+        fn call(mode: u32, parts: &[&[u8]]) -> Option<Vec<i64>> {
+            let input = packet(parts);
+            let mut out = vec![0i64; 32];
+            let written = raw(mode, &input, &mut out);
+            if written < 0 {
+                return None;
+            }
+            out.truncate(written as usize);
+            Some(out)
+        }
+
+        fn expression(term: &str) -> Option<String> {
+            match_expression(term.as_bytes(), 3)
+                .0
+                .map(|bytes| String::from_utf8(bytes).unwrap())
+        }
+
+        #[test]
+        fn w445_match_expression_mirrors_php() {
+            assert_eq!(
+                expression("Jobs\\ReindexRel").as_deref(),
+                Some("\"*jobs reindexrel*\"")
+            );
+            assert_eq!(expression("error").as_deref(), Some("*error*"));
+            assert_eq!(expression(" error ").as_deref(), Some("error"));
+            assert_eq!(expression("ab").as_deref(), None);
+            assert_eq!(expression("ab cd").as_deref(), None);
+            assert_eq!(expression("ab cd ef").as_deref(), Some("cd"));
+            assert_eq!(expression("ab cdef").as_deref(), Some("cdef*"));
+            assert_eq!(expression("").as_deref(), None);
+            assert_eq!(expression("...").as_deref(), None);
+            assert_eq!(expression("-a-").as_deref(), Some("a"));
+            assert_eq!(
+                call(1, &[b"3", b"Jobs\\ReindexRel", b"ab", b"error", b"error"]),
+                Some(vec![3, 1, 4, 1, 3, 3, 2, 2])
+            );
+            assert_eq!(call(1, &[b"3", "caf\u{e9}".as_bytes()]), None);
+            assert_eq!(call(1, &[b"03", b"x"]), None);
+            assert_eq!(call(1, &[]), None);
+        }
+
+        #[test]
+        fn w445_log_lines_mirror_header_pattern() {
+            let header = |line: &str| {
+                parse_header(line.as_bytes()).map(|(channel, level, message)| {
+                    (
+                        String::from_utf8(channel.to_vec()).unwrap(),
+                        String::from_utf8(level.to_vec()).unwrap(),
+                        message,
+                    )
+                })
+            };
+            assert_eq!(
+                header("[2026-10-06 18:11:29] local.ERROR: boom {}"),
+                Some(("local".into(), "ERROR".into(), 7))
+            );
+            assert_eq!(
+                header("[2026-10-06T18:11:29.123456+02:00]\t a.b-c.INFO:x"),
+                Some(("a.b-c".into(), "INFO".into(), 1))
+            );
+            assert_eq!(
+                header("[2026-10-06 18:11:29Z] x.TRACE:  y\n"),
+                Some(("x".into(), "TRACE".into(), 3))
+            );
+            assert_eq!(
+                header("[2026-10-06 18:11:29+0530] x.A:"),
+                Some(("x".into(), "A".into(), 0))
+            );
+            for bad in [
+                "[2026-10-06 18:11:29]local.ERROR: x",
+                "[2026-10-06 18:11:29] .ERROR: x",
+                "[2026-10-06 18:11:29] local.Error: x",
+                "[2026-10-06 18:11:29] local.ERROR x",
+                "[2026-10-06 18:11:29] local.: x",
+                "[2026-10-06 18:11:29.] local.ERROR: x",
+                "[2026-10-06 18:11:29+05:3] local.ERROR: x",
+                "[2026-10-06 18:11] local.ERROR: x",
+                " [2026-10-06 18:11:29] local.ERROR: x",
+                "[2026-10-06 18:11:29] local.ERROR.x: y",
+            ] {
+                assert_eq!(header(bad), None, "{bad}");
+            }
+            assert!(plain_timestamp(b" \t[2026-10-06 18:11:29 x"));
+            assert!(plain_timestamp(b"2026-10-06T18:11:29"));
+            assert!(!plain_timestamp(b"[[2026-10-06 18:11:29"));
+            assert_eq!(
+                call(
+                    2,
+                    &[
+                        b"[2026-10-06 18:11:29] local.ERROR: boom",
+                        b"[2026-10-06 18:11:29] local.DEBUG: a",
+                        b"[2026-10-06 18:11:29] queue.TRACE: abc",
+                        b"2026-10-06 18:11:29 console",
+                        b" \t\0",
+                        b"#0 trace",
+                    ]
+                ),
+                Some(vec![3, 1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 2, 4])
+            );
+        }
+
+        #[test]
+        fn w445_line_matches_mirror_strpos() {
+            assert_eq!(find(b"aXbxc", b"x", 0, true), Some(1));
+            assert_eq!(find(b"aXbxc", b"x", 0, false), Some(3));
+            assert_eq!(find(b"aXbxc", b"x", 4, false), None);
+            assert_eq!(find(b"ab", b"abc", 0, false), None);
+            assert_eq!(
+                call(3, &[b"aa", b"0", b"200", b"AAAAa", b"b", b""]),
+                Some(vec![1, 2, 4, 2, 0])
+            );
+            assert_eq!(
+                call(3, &[b"a", b"1", b"2", b"aaa", b"Aa"]),
+                Some(vec![2, 3, 3, 2, 1])
+            );
+            assert_eq!(call(3, &[b"", b"1", b"2", b"x"]), None);
+            assert_eq!(call(3, &[b"a", b"2", b"2"]), None);
+            assert_eq!(call(3, &[b"a", b"1", b"0"]), None);
+        }
+
+        #[test]
+        fn w445_swar_find_matches_naive_search() {
+            let naive = |hay: &[u8], needle: &[u8], from: usize, fold: bool| {
+                (from..=hay.len().checked_sub(needle.len())?).find(|&at| {
+                    let candidate = &hay[at..at + needle.len()];
+                    if fold {
+                        candidate.eq_ignore_ascii_case(needle)
+                    } else {
+                        candidate == needle
+                    }
+                })
+            };
+            let alphabet = b"aAbB@`[{zZ\x00\xff\xc1\xe1 ";
+            let mut state = 0x2545_F491_4F6C_DD1Du64;
+            let mut next = |bound: usize| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state % bound as u64) as usize
+            };
+            for _ in 0..20_000 {
+                let hay: Vec<u8> = (0..next(70))
+                    .map(|_| alphabet[next(alphabet.len())])
+                    .collect();
+                let needle: Vec<u8> = (0..1 + next(4))
+                    .map(|_| alphabet[next(alphabet.len())])
+                    .collect();
+                let from = next(hay.len() + 2);
+                for fold in [false, true] {
+                    assert_eq!(
+                        find(&hay, &needle, from, fold),
+                        naive(&hay, &needle, from, fold),
+                        "{hay:?} {needle:?} {from} {fold}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn w445_escapes_and_plain_names() {
+            assert_eq!(
+                call(4, &[b"plain", b"a\\b\"c\nd", b"plain", b"\""]),
+                Some(vec![2, 1, 1, 2, 1, 18, 22, 20, 3])
+            );
+            let plain = |value: &str| {
+                let (plain, runs) = plain_search_name(value.as_bytes());
+                (String::from_utf8(plain.into_owned()).unwrap(), runs)
+            };
+            assert_eq!(plain("Show.Name_S01-E01"), ("Show Name S01 E01".into(), 3));
+            assert_eq!(plain("..a--b__"), ("a b".into(), 3));
+            assert_eq!(plain(" x "), ("x".into(), 0));
+            assert_eq!(plain("._-"), (String::new(), 1));
+            assert_eq!(
+                call(5, &[b"A.B", b"A B", b"", b"-"]),
+                Some(vec![2, 2, 2, 6, 3, 2])
+            );
+        }
+
+        #[test]
+        fn w445_abi_declines_invalid_input_and_reports_capacity() {
+            let input = packet(&[b"a"]);
+            let mut small = [0i64; 4];
+            assert_eq!(raw(4, &input, &mut small), -9);
+            assert_eq!(small, [0; 4]);
+            let mut out = [0i64; 16];
+            for mode in [0, 6, 99] {
+                assert_eq!(raw(mode, &input, &mut out), DECLINE);
+            }
+            assert_eq!(raw(4, b"", &mut out), DECLINE);
+            assert_eq!(raw(4, b"\x01\x00\x00", &mut out), DECLINE);
+            assert_eq!(
+                raw(4, b"\x01\x00\x00\x00\x09\x00\x00\x00", &mut out),
+                DECLINE
+            );
+            let mut trailing = input.clone();
+            trailing.push(0);
+            assert_eq!(raw(4, &trailing, &mut out), DECLINE);
+            assert_eq!(raw(4, b"\xff\xff\xff\xff", &mut out), DECLINE);
+            assert_eq!(raw(4, &packet(&[]), &mut out), 9);
+            let null = unsafe {
+                nntmux_w445_log_index_parser_search_prometheus_doc(
+                    4,
+                    input.as_ptr(),
+                    input.len(),
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!(null, -9);
+            let bad = unsafe {
+                nntmux_w445_log_index_parser_search_prometheus_doc(
+                    4,
+                    std::ptr::null(),
+                    4,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert_eq!(bad, DECLINE);
+            assert_eq!(overlaps(10, 5, 14, 1), Some(true));
+            assert_eq!(overlaps(10, 5, 15, 1), Some(false));
+            assert_eq!(overlaps(usize::MAX - 1, 4, 0, 1), None);
+        }
+    }
+}

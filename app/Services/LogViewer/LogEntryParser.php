@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\LogViewer;
 
+use App\Support\ReleaseSearchIndexDocument;
 use App\Support\RustPipelineLibrary;
 use FFI;
 use FFI\CData;
@@ -42,7 +43,15 @@ class LogEntryParser
 
     private const string PLAIN_TIMESTAMP_PATTERN = '/^\s*\[?(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})/';
 
+    /**
+     * The Wave 44.5 summary defaults to Rust: every common and uncommon mean and p99 ratio cleared 1.5x;
+     * see tests/Unit/RustLogViewerIndexParserSearchPrometheusDocW44ParityTest.php.
+     */
+    public const bool W445_RUST_FFI_DEFAULT = true;
+
     private static FFI|false|null $ffi = null;
+
+    private static ?bool $useW445RustFfi = null;
 
     private static ?CData $buf = null;
 
@@ -103,6 +112,83 @@ class LogEntryParser
     public function plainTimestampPhp(string $line): ?string
     {
         return preg_match(self::PLAIN_TIMESTAMP_PATTERN, $line, $matches) === 1 ? $matches[1] : null;
+    }
+
+    /** Pass null to restore {@see W445_RUST_FFI_DEFAULT}. */
+    public static function useW445RustFfi(?bool $enable = true): void
+    {
+        self::$useW445RustFfi = $enable;
+    }
+
+    public static function usesW445RustFfi(): bool
+    {
+        return self::$useW445RustFfi ?? self::W445_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW445RustFfi(): void
+    {
+        self::$useW445RustFfi = null;
+    }
+
+    /**
+     * Summarizes raw lines as {@see parseHeaderPhp()} and {@see plainTimestampPhp()} read them: `headers`
+     * with one count per level (`unknown_level` for other levels), `distinct_channels` and
+     * `max_message_bytes`; header-less lines count as `plain_timestamps` or, when trim() leaves nothing,
+     * `blank`. Non-strings are invalid.
+     *
+     * @param  array<array-key, mixed>  $lines
+     * @return array{lines: int, invalid: int, headers: int, debug: int, info: int, notice: int, warning: int, error: int, critical: int, alert: int, emergency: int, unknown_level: int, plain_timestamps: int, blank: int, distinct_channels: int, max_message_bytes: int}
+     */
+    public function summarizeLogLineBatch(array $lines): array
+    {
+        return self::usesW445RustFfi() ? $this->summarizeLogLineBatchNative($lines) : $this->summarizeLogLineBatchPhp($lines);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $lines
+     * @return array{lines: int, invalid: int, headers: int, debug: int, info: int, notice: int, warning: int, error: int, critical: int, alert: int, emergency: int, unknown_level: int, plain_timestamps: int, blank: int, distinct_channels: int, max_message_bytes: int}
+     */
+    public function summarizeLogLineBatchPhp(array $lines): array
+    {
+        $summary = ['lines' => \count($lines), 'invalid' => 0, 'headers' => 0, 'debug' => 0, 'info' => 0, 'notice' => 0, 'warning' => 0, 'error' => 0, 'critical' => 0, 'alert' => 0, 'emergency' => 0, 'unknown_level' => 0, 'plain_timestamps' => 0, 'blank' => 0, 'distinct_channels' => 0, 'max_message_bytes' => 0];
+        $channels = [];
+        foreach ($lines as $line) {
+            if (! \is_string($line)) {
+                $summary['invalid']++;
+
+                continue;
+            }
+            $header = $this->parseHeaderPhp($line);
+            if ($header !== null) {
+                $summary['headers']++;
+                $summary[$header['level'] ?? 'unknown_level']++;
+                $channels[$header['channel']] = true;
+                $summary['max_message_bytes'] = max($summary['max_message_bytes'], \strlen($header['message']));
+            } elseif ($this->plainTimestampPhp($line) !== null) {
+                $summary['plain_timestamps']++;
+            } elseif (trim($line) === '') {
+                $summary['blank']++;
+            }
+        }
+        $summary['distinct_channels'] = \count($channels);
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $lines
+     * @return array{lines: int, invalid: int, headers: int, debug: int, info: int, notice: int, warning: int, error: int, critical: int, alert: int, emergency: int, unknown_level: int, plain_timestamps: int, blank: int, distinct_channels: int, max_message_bytes: int}
+     */
+    public function summarizeLogLineBatchNative(array $lines): array
+    {
+        $strings = array_values(array_filter($lines, 'is_string'));
+        $fields = ReleaseSearchIndexDocument::evaluateW445Native(2, $strings, 14);
+        if ($fields === null) {
+            return $this->summarizeLogLineBatchPhp($lines);
+        }
+
+        return ['lines' => \count($lines), 'invalid' => \count($lines) - \count($strings)]
+            + array_combine(['headers', ...self::LEVELS, 'unknown_level', 'plain_timestamps', 'blank', 'distinct_channels', 'max_message_bytes'], $fields);
     }
 
     /**
