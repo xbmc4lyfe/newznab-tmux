@@ -14,6 +14,7 @@ use App\Services\TempWorkspaceService;
 use App\Support\RustPipelineLibrary;
 use Exception;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Log;
 use Throwable;
@@ -623,5 +624,214 @@ class AdditionalProcessingOrchestrator
             'budget_exhausted' => $slots[5] === 1,
             'invalid' => $slots[6],
         ];
+    }
+
+    // Rust is the default only while the paired W51.6 benchmark clears 1.5x on all four metrics.
+    private const bool W51_RUST_FFI_DEFAULT = true;
+
+    public const string W51_FFI_CDEF = <<<'C'
+        int32_t nntmux_w516_release_run_batch(const char *guids, size_t guids_len, const char *guid_twin, size_t guid_twin_len, const char *ints, size_t ints_len, size_t count, size_t token_len, int64_t slow_ns, int64_t *out, size_t out_count);
+        C;
+
+    public const int W51_RUN_HEADER = 28;
+
+    private const int W51_TOTAL_CAP = 1 << 62;
+
+    private const array W51_HEX_BUCKETS = [
+        '0' => 0, '1' => 1, '2' => 2, '3' => 3, '4' => 4, '5' => 5, '6' => 6, '7' => 7,
+        '8' => 8, '9' => 9, 'a' => 10, 'b' => 11, 'c' => 12, 'd' => 13, 'e' => 14, 'f' => 15,
+    ];
+
+    private const int W51_MAX_ITEMS = 1_048_576;
+
+    private static ?bool $w51RustFfi = null;
+
+    private static FFI|false|null $w51Ffi = null;
+
+    private static ?CData $w51Out = null;
+
+    private static int $w51Capacity = 0;
+
+    /**
+     * Account a batch of processed releases as {@see self::processReleases()} sees them.
+     *
+     * `$ids` sets the row count; missing GUIDs are '' and missing clocks 0. Start and end
+     * `hrtime()` nanoseconds are clamped to 0..2^62 and elapsed time to at least 0. Layout:
+     * `[0]` count, `[1]` `batchDispositionPhp(true, count)`, `[2]` claims to clear
+     * (`shouldClearClaimPhp()`), `[3]` repeated ids, `[4]` distinct ids, `[5]` GUIDs that are
+     * not 40 hex digits, `[6]` releases taking at least `$slowNs` (when positive), `[7]` total
+     * elapsed (saturating at 2^62), `[8]` longest elapsed, `[9]` its first index (-1 when
+     * empty), `[10..26]` per GUID bucket (0-f, then other), `[27]` FNV-1a digest; then per release
+     * `clear | repeated << 1 | well_formed << 2 | slow << 3 | bucket << 4 | elapsed_us << 9`.
+     *
+     * @param  array<array-key, int>  $ids
+     * @param  array<array-key, string>  $guids
+     * @param  array<array-key, int>  $startedNs
+     * @param  array<array-key, int>  $endedNs
+     * @return list<int>
+     */
+    public static function summarizeReleaseRunBatch(array $ids, array $guids, array $startedNs, array $endedNs, string $claimToken, int $slowNs): array
+    {
+        return (self::usesW51RustFfi() ? self::summarizeReleaseRunBatchNative($ids, $guids, $startedNs, $endedNs, $claimToken, $slowNs) : null)
+            ?? self::summarizeReleaseRunBatchPhp($ids, $guids, $startedNs, $endedNs, $claimToken, $slowNs);
+    }
+
+    /**
+     * @param  array<array-key, int>  $ids
+     * @param  array<array-key, string>  $guids
+     * @param  array<array-key, int>  $startedNs
+     * @param  array<array-key, int>  $endedNs
+     * @return list<int>
+     */
+    public static function summarizeReleaseRunBatchPhp(array $ids, array $guids, array $startedNs, array $endedNs, string $claimToken, int $slowNs): array
+    {
+        $ids = array_values($ids);
+        $guids = array_values($guids);
+        $startedNs = array_values($startedNs);
+        $endedNs = array_values($endedNs);
+        $count = \count($ids);
+        $out = array_fill(0, self::W51_RUN_HEADER, 0);
+        $out[0] = $count;
+        $out[1] = self::batchDispositionPhp(true, $count);
+        $out[9] = -1;
+        $seen = $rows = [];
+        $digest = 2_166_136_261;
+        foreach ($ids as $index => $id) {
+            $guid = $guids[$index] ?? '';
+            $elapsed = max(0, min(max($endedNs[$index] ?? 0, 0), self::W51_TOTAL_CAP) - min(max($startedNs[$index] ?? 0, 0), self::W51_TOTAL_CAP));
+            $clear = self::shouldClearClaimPhp($claimToken, $id);
+            $repeated = isset($seen[$id]);
+            $seen[$id] = true;
+            $wellFormed = \strlen($guid) === 40 && ctype_xdigit($guid);
+            $slow = $slowNs > 0 && $elapsed >= $slowNs;
+            $bucket = self::W51_HEX_BUCKETS[strtolower(substr($guid, 0, 1))] ?? 16;
+            $out[2] += (int) $clear;
+            $out[3] += (int) $repeated;
+            $out[5] += (int) ! $wellFormed;
+            $out[6] += (int) $slow;
+            $out[7] = $elapsed > self::W51_TOTAL_CAP - $out[7] ? self::W51_TOTAL_CAP : $out[7] + $elapsed;
+            if ($index === 0 || $elapsed > $out[8]) {
+                $out[8] = $elapsed;
+                $out[9] = $index;
+            }
+            $out[10 + $bucket]++;
+            $row = (int) $clear | (int) $repeated << 1 | (int) $wellFormed << 2 | (int) $slow << 3 | $bucket << 4 | intdiv($elapsed, 1000) << 9;
+            $digest = (($digest ^ (($row ^ ($row >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+            $rows[] = $row;
+        }
+        $out[4] = $count - $out[3];
+        $out[27] = $digest;
+
+        return [...$out, ...$rows];
+    }
+
+    /**
+     * Rust accounting, or null when PHP must compute it (unavailable library, mismatched
+     * columns or rejected input).
+     *
+     * @param  array<array-key, int>  $ids
+     * @param  array<array-key, string>  $guids
+     * @param  array<array-key, int>  $startedNs
+     * @param  array<array-key, int>  $endedNs
+     * @return list<int>|null
+     */
+    public static function summarizeReleaseRunBatchNative(array $ids, array $guids, array $startedNs, array $endedNs, string $claimToken, int $slowNs): ?array
+    {
+        $count = \count($ids);
+        $fields = self::W51_RUN_HEADER + $count;
+        $binding = $count <= self::W51_MAX_ITEMS && \count($guids) === $count && \count($startedNs) === $count && \count($endedNs) === $count
+            ? self::w51Binding($fields)
+            : null;
+        if ($binding === null) {
+            return null;
+        }
+        [$ffi, $out] = $binding;
+        [$joined, $twin] = self::w51Strings($guids);
+        try {
+            $packed = pack('q*', ...$ids, ...$startedNs, ...$endedNs);
+            // @phpstan-ignore method.notFound
+            $status = $ffi->nntmux_w516_release_run_batch($joined, \strlen($joined), $twin, \strlen($twin), $packed, \strlen($packed), $count, \strlen($claimToken), $slowNs, $out, $fields);
+
+            return self::w51Decode(\is_int($status) ? $status : -1, $out, $fields);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Run `$callback` with the Wave 51.6 Rust batch path forced on or off, then restore the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW51RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$w51RustFfi;
+        self::$w51RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$w51RustFfi = $previous;
+        }
+    }
+
+    public static function usesW51RustFfi(): bool
+    {
+        return self::$w51RustFfi ?? self::W51_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * The cached Wave 51.6 binding and an output buffer of at least `$fields` values, or null.
+     *
+     * @return array{0: FFI, 1: CData}|null
+     */
+    private static function w51Binding(int $fields): ?array
+    {
+        try {
+            self::$w51Ffi ??= RustPipelineLibrary::resolveDomain('additional_w51', self::W51_FFI_CDEF) ?? false;
+            if (self::$w51Ffi === false) {
+                return null;
+            }
+            $out = self::$w51Out;
+            if ($out === null || self::$w51Capacity < $fields) {
+                self::$w51Capacity = max(256, $fields);
+                $out = self::$w51Out = self::$w51Ffi->new('int64_t['.self::$w51Capacity.']');
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        return [self::$w51Ffi, $out];
+    }
+
+    /**
+     * Decode `$fields` output values after a successful Wave 51.6 call.
+     *
+     * @return list<int>|null
+     */
+    private static function w51Decode(int $status, CData $out, int $fields): ?array
+    {
+        if ($status !== 1) {
+            return null;
+        }
+        $values = unpack('P*', FFI::string($out, $fields * 8));
+
+        return $values === false ? null : array_values($values);
+    }
+
+    /**
+     * NUL-joined values and, when one holds a NUL, the same list joined with 0x01 so Rust
+     * finds the separators where the two differ.
+     *
+     * @param  array<array-key, string>  $items
+     * @return array{0: string, 1: string}
+     */
+    private static function w51Strings(array $items): array
+    {
+        $joined = implode("\0", $items);
+
+        return $items !== [] && substr_count($joined, "\0") !== \count($items) - 1 ? [$joined, implode("\x01", $items)] : [$joined, ''];
     }
 }

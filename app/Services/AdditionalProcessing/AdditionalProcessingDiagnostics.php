@@ -8,6 +8,7 @@ use App\Services\Configuration\ConfigurationProvider;
 use App\Services\Runners\PostProcessRunner;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
 use Throwable;
@@ -454,5 +455,201 @@ final class AdditionalProcessingDiagnostics
             'oversized' => $slots[4],
             'invalid' => $slots[5],
         ];
+    }
+
+    // Rust is the default only while the paired W51.6 benchmark clears 1.5x on all four metrics.
+    private const bool W51_RUST_FFI_DEFAULT = true;
+
+    public const string W51_FFI_CDEF = <<<'C'
+        int32_t nntmux_w516_claim_index_batch(const char *names, size_t names_len, const char *name_twin, size_t name_twin_len, const char *columns, size_t columns_len, const char *column_twin, size_t column_twin_len, const char *counts, size_t counts_len, size_t count, int64_t *out, size_t out_count);
+        C;
+
+    public const int W51_INDEX_HEADER = 8;
+
+    private const int W51_MAX_ITEMS = 1_048_576;
+
+    private static ?bool $w51RustFfi = null;
+
+    private static FFI|false|null $w51Ffi = null;
+
+    private static ?CData $w51Out = null;
+
+    private static int $w51Capacity = 0;
+
+    /**
+     * Check a batch of schema indexes against the claim-queue column order, comparing
+     * columns after `strtolower()` as {@see self::indexes()} does.
+     *
+     * `$columnLists[$i]` holds the columns of `$names[$i]` (missing lists are empty). Layout:
+     * `[0]` count, `[1]` exact matches, `[2]` last exact index (the one `inspect()` reports,
+     * -1 when none), `[3]` longest leading run of required columns, `[4]` first index with it
+     * (-1 when 0), `[5]` indexes holding every required column, `[6]` total columns, `[7]`
+     * FNV-1a digest; then per index `exact | prefix << 1 | required_present << 4 | named << 7 |
+     * columns << 8` (columns clamped to 2^20-1).
+     *
+     * @param  array<array-key, string>  $names
+     * @param  array<array-key, list<string>>  $columnLists
+     * @return list<int>
+     */
+    public static function matchClaimIndexBatch(array $names, array $columnLists): array
+    {
+        return (self::usesW51RustFfi() ? self::matchClaimIndexBatchNative($names, $columnLists) : null) ?? self::matchClaimIndexBatchPhp($names, $columnLists);
+    }
+
+    /**
+     * @param  array<array-key, string>  $names
+     * @param  array<array-key, list<string>>  $columnLists
+     * @return list<int>
+     */
+    public static function matchClaimIndexBatchPhp(array $names, array $columnLists): array
+    {
+        $names = array_values($names);
+        $columnLists = array_values($columnLists);
+        $out = [\count($names), 0, -1, 0, -1, 0, 0, 0];
+        $digest = 2_166_136_261;
+        $rows = [];
+        foreach ($names as $index => $name) {
+            $columns = array_map(strtolower(...), array_values($columnLists[$index] ?? []));
+            $prefix = 0;
+            foreach (self::REQUIRED_CLAIM_INDEX_COLUMNS as $position => $required) {
+                if (($columns[$position] ?? null) !== $required) {
+                    break;
+                }
+                $prefix++;
+            }
+            $exact = $columns === self::REQUIRED_CLAIM_INDEX_COLUMNS;
+            $present = \count(array_intersect(self::REQUIRED_CLAIM_INDEX_COLUMNS, $columns));
+            $total = \count($columns);
+            if ($exact) {
+                $out[1]++;
+                $out[2] = $index;
+            }
+            if ($prefix > $out[3]) {
+                $out[3] = $prefix;
+                $out[4] = $index;
+            }
+            $out[5] += (int) ($present === \count(self::REQUIRED_CLAIM_INDEX_COLUMNS));
+            $out[6] += $total;
+            $row = (int) $exact | $prefix << 1 | $present << 4 | (int) ($name !== '') << 7 | min($total, 0xFFFFF) << 8;
+            $digest = (($digest ^ $row) * 16_777_619) & 0xFFFFFFFF;
+            $rows[] = $row;
+        }
+        $out[7] = $digest;
+
+        return [...$out, ...$rows];
+    }
+
+    /**
+     * Rust matching, or null when PHP must compute it (unavailable library, mismatched lists or
+     * rejected input).
+     *
+     * @param  array<array-key, string>  $names
+     * @param  array<array-key, list<string>>  $columnLists
+     * @return list<int>|null
+     */
+    public static function matchClaimIndexBatchNative(array $names, array $columnLists): ?array
+    {
+        $names = array_values($names);
+        $count = \count($names);
+        $fields = self::W51_INDEX_HEADER + $count;
+        $binding = $count <= self::W51_MAX_ITEMS && \count($columnLists) === $count ? self::w51Binding($fields) : null;
+        if ($binding === null) {
+            return null;
+        }
+        [$ffi, $out] = $binding;
+        $columnLists = array_values($columnLists);
+        $counts = array_map(\count(...), $columnLists);
+        $columns = array_merge(...$columnLists);
+        if (\count($columns) !== array_sum($counts)) {
+            return null;
+        }
+        [$joinedNames, $nameTwin] = self::w51Strings($names);
+        [$joinedColumns, $columnTwin] = self::w51Strings($columns);
+        $packed = pack('q*', ...$counts);
+        try {
+            // @phpstan-ignore method.notFound
+            $status = $ffi->nntmux_w516_claim_index_batch($joinedNames, \strlen($joinedNames), $nameTwin, \strlen($nameTwin), $joinedColumns, \strlen($joinedColumns), $columnTwin, \strlen($columnTwin), $packed, \strlen($packed), $count, $out, $fields);
+
+            return self::w51Decode(\is_int($status) ? $status : -1, $out, $fields);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Run `$callback` with the Wave 51.6 Rust batch path forced on or off, then restore the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW51RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$w51RustFfi;
+        self::$w51RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$w51RustFfi = $previous;
+        }
+    }
+
+    public static function usesW51RustFfi(): bool
+    {
+        return self::$w51RustFfi ?? self::W51_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * The cached Wave 51.6 binding and an output buffer of at least `$fields` values, or null.
+     *
+     * @return array{0: FFI, 1: CData}|null
+     */
+    private static function w51Binding(int $fields): ?array
+    {
+        try {
+            self::$w51Ffi ??= RustPipelineLibrary::resolveDomain('additional_w51', self::W51_FFI_CDEF) ?? false;
+            if (self::$w51Ffi === false) {
+                return null;
+            }
+            $out = self::$w51Out;
+            if ($out === null || self::$w51Capacity < $fields) {
+                self::$w51Capacity = max(256, $fields);
+                $out = self::$w51Out = self::$w51Ffi->new('int64_t['.self::$w51Capacity.']');
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        return [self::$w51Ffi, $out];
+    }
+
+    /**
+     * Decode `$fields` output values after a successful Wave 51.6 call.
+     *
+     * @return list<int>|null
+     */
+    private static function w51Decode(int $status, CData $out, int $fields): ?array
+    {
+        if ($status !== 1) {
+            return null;
+        }
+        $values = unpack('P*', FFI::string($out, $fields * 8));
+
+        return $values === false ? null : array_values($values);
+    }
+
+    /**
+     * NUL-joined values and, when one holds a NUL, the same list joined with 0x01 so Rust
+     * finds the separators where the two differ.
+     *
+     * @param  array<array-key, string>  $items
+     * @return array{0: string, 1: string}
+     */
+    private static function w51Strings(array $items): array
+    {
+        $joined = implode("\0", $items);
+
+        return $items !== [] && substr_count($joined, "\0") !== \count($items) - 1 ? [$joined, implode("\x01", $items)] : [$joined, ''];
     }
 }
