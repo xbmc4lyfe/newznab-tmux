@@ -318,4 +318,132 @@ final class ReleaseSearchSyncCoordinator
     {
         return \is_array($row) && \is_int($row['op'] ?? null) && $row['op'] >= self::OP_BEGIN && $row['op'] <= self::OP_FINISH && \is_int($row['release_id'] ?? null);
     }
+
+    /** Enabled: three paired runs cleared every 1.5x gate (common mean 3.19-3.51x, p99 2.67-10.23x; uncommon mean 3.36-3.49x, p99 2.70-3.00x); see RustReleaseFileArchiveProcessorSyncUsenetW52ParityTest. */
+    private const bool W52_RUST_FFI_DEFAULT = true;
+
+    public const string W52_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w523_search_sync_decide_batch(const char *blob, size_t blob_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    private static ?bool $useW52RustFfi = null;
+
+    private static FFI|false|null $w52Ffi = null;
+
+    private static ?CData $w52Out = null;
+
+    private static int $w52OutCap = 0;
+
+    public static function usesW52RustFfi(): bool
+    {
+        return self::$useW52RustFfi ?? self::W52_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 52 Rust path forced on or off, then restores the previous setting. */
+    public static function withW52RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$useW52RustFfi;
+        self::$useW52RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$useW52RustFfi = $previous;
+        }
+    }
+
+    /**
+     * Folds decidePhp() over a sequence of `(op, releaseId)` events from the given scope state. One
+     * `[flags, sync]` pair per event, where flags are 1 pending, 2 scope set and 4 a release to
+     * synchronize (sync is that release, else 0), then the final `[hasScope, scope, pending]`.
+     *
+     * @param  array<int, int>  $ops
+     * @param  array<int, int>  $releaseIds
+     * @return list<int>
+     *
+     * @throws InvalidArgumentException for an unknown operation or mismatched columns
+     */
+    public static function w52DecideSequenceBatch(array $ops, array $releaseIds, bool $coalesce = true, ?int $scope = null, bool $pending = false): array
+    {
+        return self::usesW52RustFfi()
+            ? self::w52DecideSequenceBatchNative($ops, $releaseIds, $coalesce, $scope, $pending)
+            : self::w52DecideSequenceBatchPhp($ops, $releaseIds, $coalesce, $scope, $pending);
+    }
+
+    /**
+     * @param  array<int, int>  $ops
+     * @param  array<int, int>  $releaseIds
+     * @return list<int>
+     */
+    public static function w52DecideSequenceBatchNative(array $ops, array $releaseIds, bool $coalesce = true, ?int $scope = null, bool $pending = false): array
+    {
+        $count = \count($ops);
+        if (\count($releaseIds) !== $count) {
+            return self::w52DecideSequenceBatchPhp($ops, $releaseIds, $coalesce, $scope, $pending);
+        }
+        if (! array_is_list($ops) || ! array_is_list($releaseIds)) {
+            $ops = array_values($ops);
+            $releaseIds = array_values($releaseIds);
+        }
+        $ints = pack('q*', (int) $coalesce, (int) ($scope !== null), $scope ?? 0, (int) $pending, ...$ops, ...$releaseIds);
+
+        return self::w52Invoke('', $ints, $count, 2 * $count + 3)
+            ?? self::w52DecideSequenceBatchPhp($ops, $releaseIds, $coalesce, $scope, $pending);
+    }
+
+    /**
+     * @param  array<int, int>  $ops
+     * @param  array<int, int>  $releaseIds
+     * @return list<int>
+     */
+    public static function w52DecideSequenceBatchPhp(array $ops, array $releaseIds, bool $coalesce = true, ?int $scope = null, bool $pending = false): array
+    {
+        if (\count($releaseIds) !== \count($ops)) {
+            throw new InvalidArgumentException('Search sync operations and release ids must have the same length.');
+        }
+        $releaseIds = array_values($releaseIds);
+        $out = [];
+        foreach (array_values($ops) as $i => $op) {
+            [$scope, $pending, $sync] = self::decidePhp((int) $op, $coalesce, $scope, $pending, (int) $releaseIds[$i]);
+            $out[] = (int) $pending | ($scope !== null ? 2 : 0) | ($sync !== null ? 4 : 0);
+            $out[] = $sync ?? 0;
+        }
+        $out[] = (int) ($scope !== null);
+        $out[] = $scope ?? 0;
+        $out[] = (int) $pending;
+
+        return $out;
+    }
+
+    /**
+     * Calls the Wave 52 export with NUL-joined strings and packed `i64` integers. Null when the
+     * library is missing, the call declines (for example a string holding a NUL byte) or it writes
+     * more than $cap words, so the caller falls back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w52Invoke(string $blob, string $ints, int $count, int $cap): ?array
+    {
+        self::$w52Ffi ??= RustPipelineLibrary::resolveDomain('categorize_w52', self::W52_FFI_CDEF) ?? false;
+        $ffi = self::$w52Ffi;
+        if ($ffi === false) {
+            return null;
+        }
+        try {
+            if (self::$w52Out === null || self::$w52OutCap < $cap) {
+                self::$w52OutCap = max(1024, $cap * 2);
+                self::$w52Out = $ffi->new('int64_t['.self::$w52OutCap.']');
+            }
+            // @phpstan-ignore method.notFound (Declared by W52_FFI_CDEF.)
+            $written = $ffi->nntmux_w523_search_sync_decide_batch($blob, \strlen($blob), $ints, \strlen($ints), $count, self::$w52Out, self::$w52OutCap);
+            if (! \is_int($written) || $written <= 0 || $written > $cap) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string(self::$w52Out, $written * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }
