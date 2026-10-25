@@ -28171,3 +28171,777 @@ mod wave40_5_manticore_elastic_search_service_circuit {
         }
     }
 }
+
+/// Wave 41.5 second-pass search DTO helpers: sort specification batches
+/// (`ReleaseSearchQuery`), cursor match batches (`SearchCursor`), result page
+/// batches (`SearchPage`), external ID coverage (`MediaSearchService`) and
+/// decoded cursor payload batches (`SearchCursorCodec`). PHP marshals each
+/// call into count-prefixed, length-prefixed byte strings; results use the
+/// same framing.
+mod wave41_5_search_dto_query_cursor_page_media_codec {
+    use std::collections::HashSet;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const DECLINE: i32 = -1;
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+    const MAX_PARTS: usize = 1 << 20;
+    /// Most external ID fields a coverage row may carry.
+    const MAX_ID_FIELDS: usize = 63;
+    /// `ReleaseSearchQuery::normalizedSortField()` allow-list; index 0 is the
+    /// fallback field.
+    const SORT_FIELDS: [&[u8]; 8] = [
+        b"postdate_ts",
+        b"adddate_ts",
+        b"size",
+        b"totalpart",
+        b"grabs",
+        b"comments",
+        b"categories_id",
+        b"id",
+    ];
+
+    fn unpack(input: &[u8]) -> Option<Vec<&[u8]>> {
+        let count = u32::from_le_bytes(input.get(..4)?.try_into().ok()?) as usize;
+        if count > MAX_PARTS || count > (input.len() - 4) / 4 {
+            return None;
+        }
+        let mut cursor = 4usize;
+        let mut parts = Vec::with_capacity(count);
+        for _ in 0..count {
+            let length_end = cursor.checked_add(4)?;
+            let length =
+                u32::from_le_bytes(input.get(cursor..length_end)?.try_into().ok()?) as usize;
+            let end = length_end.checked_add(length)?;
+            parts.push(input.get(length_end..end)?);
+            cursor = end;
+        }
+        (cursor == input.len()).then_some(parts)
+    }
+
+    fn pack(parts: &[Vec<u8>]) -> Option<Vec<u8>> {
+        let count = u32::try_from(parts.len()).ok()?;
+        let size = parts.iter().try_fold(4usize, |size, part| {
+            u32::try_from(part.len()).ok()?;
+            size.checked_add(4)?.checked_add(part.len())
+        })?;
+        if size > i32::MAX as usize {
+            return None;
+        }
+        let mut out = Vec::with_capacity(size);
+        out.extend_from_slice(&count.to_le_bytes());
+        for part in parts {
+            out.extend_from_slice(&(part.len() as u32).to_le_bytes());
+            out.extend_from_slice(part);
+        }
+        Some(out)
+    }
+
+    /// Canonical decimal produced by PHP `(string) $int`.
+    fn integer(bytes: &[u8]) -> Option<i64> {
+        if bytes.is_empty() || bytes.len() > 20 {
+            return None;
+        }
+        let value: i64 = std::str::from_utf8(bytes).ok()?.parse().ok()?;
+        (value.to_string().as_bytes() == bytes).then_some(value)
+    }
+
+    fn flag(bytes: &[u8]) -> Option<bool> {
+        match bytes {
+            b"1" => Some(true),
+            b"0" => Some(false),
+            _ => None,
+        }
+    }
+
+    fn text(value: i64) -> Vec<u8> {
+        value.to_string().into_bytes()
+    }
+
+    fn count(value: usize) -> Option<Vec<u8>> {
+        Some(text(i64::try_from(value).ok()?))
+    }
+
+    /// Mode 1 (`ReleaseSearchQuery::summarizeSortSpecBatch`): `(kind,
+    /// field, direction)...` with `kind` `1` for array specs, `0` otherwise
+    /// and non-string values sent empty -> `[specs, invalid, known_fields,
+    /// fallback_fields, asc, desc, distinct_fields]`. Unknown fields normalize
+    /// to `postdate_ts`; only an ASCII case-insensitive `asc` is ascending.
+    fn sort_specs(parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        let (specs, []) = parts.as_chunks::<3>() else {
+            return None;
+        };
+        let (mut invalid, mut known, mut asc, mut seen) = (0usize, 0usize, 0usize, 0u8);
+        for [kind, field, direction] in specs {
+            if !flag(kind)? {
+                invalid += 1;
+                continue;
+            }
+            let index = SORT_FIELDS.iter().position(|name| name == field);
+            known += usize::from(index.is_some());
+            seen |= 1 << index.unwrap_or(0);
+            asc += usize::from(direction.eq_ignore_ascii_case(b"asc"));
+        }
+        let valid = specs.len() - invalid;
+        Some(vec![
+            count(specs.len())?,
+            count(invalid)?,
+            count(known)?,
+            count(valid - known)?,
+            count(asc)?,
+            count(valid - asc)?,
+            count(seen.count_ones() as usize)?,
+        ])
+    }
+
+    /// Mode 2 (`SearchCursor::summarizeCursorMatchBatch`): `[query, driver,
+    /// generation, now, (kind, query, driver, generation, expires,
+    /// total)...]` -> `[cursors, invalid, valid, expired, query_mismatch,
+    /// driver_mismatch, generation_mismatch, max_valid_total,
+    /// earliest_expires_at]`. Classification follows
+    /// `SearchCursor::classifyCursorMatchPhp()`; the maximum total starts at
+    /// 0 and the earliest expiry is empty when no cursor was given.
+    fn cursor_matches(parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        let [query, driver, generation, now, rest @ ..] = parts else {
+            return None;
+        };
+        let now = integer(now)?;
+        let (cursors, []) = rest.as_chunks::<6>() else {
+            return None;
+        };
+        let mut states = [0usize; 5];
+        let (mut invalid, mut max_total, mut earliest) = (0usize, 0i64, None::<i64>);
+        for [
+            kind,
+            cursor_query,
+            cursor_driver,
+            cursor_generation,
+            expires,
+            total,
+        ] in cursors
+        {
+            if !flag(kind)? {
+                invalid += 1;
+                continue;
+            }
+            let expires = integer(expires)?;
+            let total = integer(total)?;
+            earliest = Some(earliest.map_or(expires, |current| current.min(expires)));
+            let state = if expires < now {
+                1
+            } else if cursor_query != query {
+                2
+            } else if cursor_driver != driver {
+                3
+            } else if cursor_generation != generation {
+                4
+            } else {
+                max_total = max_total.max(total);
+                0
+            };
+            states[state] += 1;
+        }
+        let mut out = vec![count(cursors.len())?, count(invalid)?];
+        for state in states {
+            out.push(count(state)?);
+        }
+        out.push(text(max_total));
+        out.push(earliest.map_or_else(Vec::new, text));
+        Some(out)
+    }
+
+    /// Mode 3 (`SearchPage::summarizePageBatch`): `(kind, available, fuzzy,
+    /// has_more, total, driver, ids)...` with `ids` as little-endian 64-bit
+    /// integers -> `[pages, invalid, available, fuzzy, has_more, id_count,
+    /// distinct_ids, max_total, distinct_drivers]`. The maximum total starts
+    /// at 0.
+    fn pages(parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        let (pages, []) = parts.as_chunks::<7>() else {
+            return None;
+        };
+        let (mut invalid, mut available, mut fuzzy, mut more) = (0usize, 0usize, 0usize, 0usize);
+        let mut max_total = 0i64;
+        let id_count = pages
+            .iter()
+            .filter(|page| page[0] == b"1")
+            .try_fold(0usize, |total, page| total.checked_add(page[6].len() / 8))?;
+        let mut ids = HashSet::with_capacity(id_count);
+        let mut drivers = HashSet::new();
+        for [
+            kind,
+            page_available,
+            page_fuzzy,
+            page_more,
+            total,
+            driver,
+            page_ids,
+        ] in pages
+        {
+            if !flag(kind)? {
+                invalid += 1;
+                continue;
+            }
+            available += usize::from(flag(page_available)?);
+            fuzzy += usize::from(flag(page_fuzzy)?);
+            more += usize::from(flag(page_more)?);
+            max_total = max_total.max(integer(total)?);
+            drivers.insert(*driver);
+            let (chunks, []) = page_ids.as_chunks::<8>() else {
+                return None;
+            };
+            ids.extend(chunks.iter().map(|id| i64::from_le_bytes(*id)));
+        }
+        Some(vec![
+            count(pages.len())?,
+            count(invalid)?,
+            count(available)?,
+            count(fuzzy)?,
+            count(more)?,
+            count(id_count)?,
+            count(ids.len())?,
+            text(max_total),
+            count(drivers.len())?,
+        ])
+    }
+
+    /// Whether a tagged value is non-empty in PHP's `empty()` sense: `t`/`z`
+    /// carry PHP's verdict for other types, `i` a canonical integer and `s`
+    /// raw string bytes (`""` and `"0"` are empty).
+    fn present(value: &[u8]) -> Option<bool> {
+        let (tag, rest) = value.split_first()?;
+        match (tag, rest) {
+            (b't', []) => Some(true),
+            (b'z', []) => Some(false),
+            (b'i', digits) => Some(integer(digits)? != 0),
+            (b's', bytes) => Some(!bytes.is_empty() && bytes != b"0"),
+            _ => None,
+        }
+    }
+
+    /// Mode 4 (`MediaSearchService::summarizeExternalIdCoverageBatch`):
+    /// `[field_count, (kind, value x field_count)...]` -> `[rows, invalid,
+    /// with_any, max_per_row, count x field_count]`.
+    fn external_id_coverage(parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        let (fields, rest) = parts.split_first()?;
+        let fields = usize::try_from(integer(fields)?).ok()?;
+        if !(1..=MAX_ID_FIELDS).contains(&fields) {
+            return None;
+        }
+        let width = fields + 1;
+        if rest.len() % width != 0 {
+            return None;
+        }
+        let mut counts = vec![0usize; fields];
+        let (mut invalid, mut with_any, mut max_per_row) = (0usize, 0usize, 0usize);
+        for row in rest.chunks_exact(width) {
+            if !flag(row[0])? {
+                invalid += 1;
+                continue;
+            }
+            let mut found = 0usize;
+            for (slot, value) in counts.iter_mut().zip(&row[1..]) {
+                if present(value)? {
+                    *slot += 1;
+                    found += 1;
+                }
+            }
+            with_any += usize::from(found > 0);
+            max_per_row = max_per_row.max(found);
+        }
+        let mut out = vec![
+            count(rest.len() / width)?,
+            count(invalid)?,
+            count(with_any)?,
+            count(max_per_row)?,
+        ];
+        for value in counts {
+            out.push(count(value)?);
+        }
+        Some(out)
+    }
+
+    /// Mode 5 (`SearchCursorCodec::summarizePayloadBatch`): `[now, (kind,
+    /// expires, sort_count, driver)...]` -> `[payloads, invalid_shape,
+    /// expired, accepted, sort_values, max_sort_width, distinct_drivers]`.
+    /// Sort and driver statistics cover accepted payloads only.
+    fn payloads(parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        let (now, rest) = parts.split_first()?;
+        let now = integer(now)?;
+        let (payloads, []) = rest.as_chunks::<4>() else {
+            return None;
+        };
+        let (mut invalid, mut expired, mut accepted) = (0usize, 0usize, 0usize);
+        let (mut values, mut widest) = (0i64, 0i64);
+        let mut drivers = HashSet::new();
+        for [kind, expires, sort_count, driver] in payloads {
+            if !flag(kind)? {
+                invalid += 1;
+                continue;
+            }
+            let sort_count = integer(sort_count)?;
+            if sort_count < 0 {
+                return None;
+            }
+            if integer(expires)? < now {
+                expired += 1;
+                continue;
+            }
+            accepted += 1;
+            values = values.checked_add(sort_count)?;
+            widest = widest.max(sort_count);
+            drivers.insert(*driver);
+        }
+        Some(vec![
+            count(payloads.len())?,
+            count(invalid)?,
+            count(expired)?,
+            count(accepted)?,
+            text(values),
+            text(widest),
+            count(drivers.len())?,
+        ])
+    }
+
+    fn transform(mode: u32, parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        match mode {
+            1 => sort_specs(parts),
+            2 => cursor_matches(parts),
+            3 => pages(parts),
+            4 => external_id_coverage(parts),
+            5 => payloads(parts),
+            _ => None,
+        }
+    }
+
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> Option<bool> {
+        if a_len == 0 || b_len == 0 {
+            return Some(false);
+        }
+        let a_end = a.checked_add(a_len)?;
+        let b_end = b.checked_add(b_len)?;
+        Some(a < b_end && b < a_end)
+    }
+
+    /// Dispatch count-prefixed, length-prefixed byte strings (little-endian
+    /// u32). Returns written bytes, `-needed` when `cap` is too small, or `-1`
+    /// for invalid input, mode, overlapping buffers or fields. Failure never
+    /// writes to the output buffer. Results are at least four bytes, so `-1`
+    /// never means "one byte needed".
+    ///
+    /// # Safety
+    /// Non-null pointers must refer to readable/writable allocations of the
+    /// declared lengths. Null pointers require zero length/capacity. Input and
+    /// output must not overlap.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w415_search_dto_query_cursor_page_media_codec(
+        mode: u32,
+        input: *const u8,
+        input_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if input_len > MAX_INPUT
+                || cap > isize::MAX as usize
+                || (input.is_null() && input_len != 0)
+                || (out.is_null() && cap != 0)
+            {
+                return DECLINE;
+            }
+            match overlaps(input as usize, input_len, out as usize, cap) {
+                Some(false) => {}
+                _ => return DECLINE,
+            }
+            let input = if input_len == 0 {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(input, input_len) }
+            };
+            let Some(parts) = unpack(input) else {
+                return DECLINE;
+            };
+            let Some(result) = transform(mode, &parts).and_then(|parts| pack(&parts)) else {
+                return DECLINE;
+            };
+            // `pack` bounds results by i32::MAX.
+            let needed = result.len() as i32;
+            if cap < result.len() || out.is_null() {
+                return -needed;
+            }
+            unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), out, result.len()) };
+            needed
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn packet(parts: &[&[u8]]) -> Vec<u8> {
+            pack(&parts.iter().map(|part| part.to_vec()).collect::<Vec<_>>()).unwrap()
+        }
+
+        fn call(mode: u32, parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+            let input = packet(parts);
+            let mut out = vec![0u8; input.len() * 4 + 4096];
+            let written = unsafe {
+                nntmux_w415_search_dto_query_cursor_page_media_codec(
+                    mode,
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            if written < 0 {
+                return None;
+            }
+            out.truncate(written as usize);
+            Some(unpack(&out)?.into_iter().map(<[u8]>::to_vec).collect())
+        }
+
+        fn strings(items: &[&str]) -> Vec<Vec<u8>> {
+            items.iter().map(|item| item.as_bytes().to_vec()).collect()
+        }
+
+        fn ids(values: &[i64]) -> Vec<u8> {
+            values.iter().flat_map(|id| id.to_le_bytes()).collect()
+        }
+
+        #[test]
+        fn w415_sort_spec_batch() {
+            let parts: &[&[u8]] = &[
+                b"1", b"size", b"ASC", b"1", b"bogus", b"desc", b"1", b"", b"", b"0", b"", b"",
+                b"1", b"size", b"aSc", b"1", b"Size", b"asc ",
+            ];
+            assert_eq!(
+                call(1, parts),
+                Some(strings(&["6", "1", "2", "3", "2", "3", "2"]))
+            );
+            assert_eq!(
+                call(1, &[]),
+                Some(strings(&["0", "0", "0", "0", "0", "0", "0"]))
+            );
+            assert_eq!(call(1, &[b"2", b"id", b"asc"]), None);
+            assert_eq!(call(1, &[b"1", b"id"]), None);
+        }
+
+        #[test]
+        fn w415_cursor_match_batch() {
+            let parts: &[&[u8]] = &[
+                b"q",
+                b"manticore",
+                b"g1",
+                b"100",
+                b"1",
+                b"q",
+                b"manticore",
+                b"g1",
+                b"100",
+                b"42",
+                b"1",
+                b"q",
+                b"manticore",
+                b"g1",
+                b"99",
+                b"500",
+                b"1",
+                b"x",
+                b"manticore",
+                b"g1",
+                b"200",
+                b"7",
+                b"1",
+                b"q",
+                b"elastic",
+                b"g1",
+                b"200",
+                b"7",
+                b"1",
+                b"q",
+                b"manticore",
+                b"g2",
+                b"200",
+                b"7",
+                b"0",
+                b"",
+                b"",
+                b"",
+                b"0",
+                b"0",
+                b"1",
+                b"q",
+                b"manticore",
+                b"g1",
+                b"300",
+                b"-5",
+            ];
+            assert_eq!(
+                call(2, parts),
+                Some(strings(&["7", "1", "2", "1", "1", "1", "1", "42", "99"]))
+            );
+            let mut empty = strings(&["0", "0", "0", "0", "0", "0", "0", "0"]);
+            empty.push(Vec::new());
+            assert_eq!(call(2, &[b"q", b"d", b"g", b"0"]), Some(empty));
+            assert_eq!(call(2, &[b"q", b"d", b"g", b"01"]), None);
+            assert_eq!(call(2, &[b"q", b"d", b"g"]), None);
+        }
+
+        #[test]
+        fn w415_page_batch() {
+            let first = ids(&[1, 2, 3, -1]);
+            let second = ids(&[3, 4, i64::MIN]);
+            let parts: Vec<&[u8]> = vec![
+                b"1",
+                b"1",
+                b"0",
+                b"1",
+                b"10",
+                b"manticore",
+                &first,
+                b"1",
+                b"0",
+                b"1",
+                b"0",
+                b"-4",
+                b"elastic",
+                &second,
+                b"0",
+                b"",
+                b"",
+                b"",
+                b"",
+                b"",
+                b"",
+                b"1",
+                b"1",
+                b"1",
+                b"1",
+                b"3",
+                b"manticore",
+                b"",
+            ];
+            assert_eq!(
+                call(3, &parts),
+                Some(strings(&["4", "1", "2", "2", "2", "7", "6", "10", "2"]))
+            );
+            assert_eq!(
+                call(3, &[]),
+                Some(strings(&["0", "0", "0", "0", "0", "0", "0", "0", "0"]))
+            );
+            assert_eq!(
+                call(3, &[b"1", b"1", b"1", b"1", b"3", b"m", b"1234567"]),
+                None
+            );
+            assert_eq!(call(3, &[b"1", b"2", b"1", b"1", b"3", b"m", b""]), None);
+        }
+
+        #[test]
+        fn w415_external_id_coverage() {
+            let parts: &[&[u8]] = &[
+                b"3",
+                b"1",
+                b"s0012345",
+                b"i0",
+                b"z",
+                b"1",
+                b"s0",
+                b"s",
+                b"t",
+                b"0",
+                b"z",
+                b"z",
+                b"z",
+                b"1",
+                b"i-5",
+                b"s 0",
+                b"i7",
+                b"1",
+                b"z",
+                b"z",
+                b"z",
+            ];
+            assert_eq!(
+                call(4, parts),
+                Some(strings(&["5", "1", "3", "3", "2", "1", "2"]))
+            );
+            assert_eq!(
+                call(4, &[b"3"]),
+                Some(strings(&["0", "0", "0", "0", "0", "0", "0"]))
+            );
+            assert_eq!(call(4, &[b"0"]), None);
+            assert_eq!(call(4, &[b"64"]), None);
+            assert_eq!(call(4, &[b"1", b"1", b"tt"]), None);
+            assert_eq!(call(4, &[b"1", b"1", b"i+1"]), None);
+            assert_eq!(call(4, &[b"1", b"1", b""]), None);
+            assert_eq!(call(4, &[b"2", b"1", b"z"]), None);
+        }
+
+        #[test]
+        fn w415_payload_batch() {
+            let parts: &[&[u8]] = &[
+                b"100",
+                b"1",
+                b"100",
+                b"2",
+                b"manticore",
+                b"1",
+                b"99",
+                b"5",
+                b"manticore",
+                b"0",
+                b"",
+                b"",
+                b"",
+                b"1",
+                b"500",
+                b"0",
+                b"elastic",
+                b"1",
+                b"9223372036854775807",
+                b"3",
+                b"manticore",
+            ];
+            assert_eq!(
+                call(5, parts),
+                Some(strings(&["5", "1", "1", "3", "5", "3", "2"]))
+            );
+            assert_eq!(call(5, &[b"1", b"1", b"5", b"-1", b""]), None);
+            assert_eq!(call(5, &[b"1", b"1", b"5"]), None);
+            assert_eq!(call(5, &[]), None);
+            let max = i64::MAX.to_string();
+            let overflow: &[&[u8]] =
+                &[b"0", b"1", b"1", max.as_bytes(), b"", b"1", b"1", b"1", b""];
+            assert_eq!(call(5, overflow), None);
+        }
+
+        #[test]
+        fn w415_malformed_null_overlap_and_capacity() {
+            let input = packet(&[b"1", b"id", b"asc"]);
+            let (ptr, len) = (input.as_ptr(), input.len());
+            let mut out = [0x5au8; 16];
+            let mut big = vec![0u8; 256];
+            let written = unsafe {
+                nntmux_w415_search_dto_query_cursor_page_media_codec(
+                    1,
+                    ptr,
+                    len,
+                    big.as_mut_ptr(),
+                    big.len(),
+                )
+            };
+            assert!(written > 16);
+            unsafe {
+                assert_eq!(
+                    nntmux_w415_search_dto_query_cursor_page_media_codec(
+                        1,
+                        ptr,
+                        len,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    -written
+                );
+                assert_eq!(
+                    nntmux_w415_search_dto_query_cursor_page_media_codec(
+                        1,
+                        ptr,
+                        len,
+                        std::ptr::null_mut(),
+                        0
+                    ),
+                    -written
+                );
+                assert_eq!(
+                    nntmux_w415_search_dto_query_cursor_page_media_codec(
+                        1,
+                        std::ptr::null(),
+                        4,
+                        big.as_mut_ptr(),
+                        big.len()
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w415_search_dto_query_cursor_page_media_codec(
+                        1,
+                        ptr,
+                        len,
+                        std::ptr::null_mut(),
+                        8
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w415_search_dto_query_cursor_page_media_codec(
+                        1,
+                        ptr,
+                        MAX_INPUT + 1,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w415_search_dto_query_cursor_page_media_codec(
+                        1,
+                        ptr,
+                        len,
+                        out.as_mut_ptr(),
+                        isize::MAX as usize + 1
+                    ),
+                    DECLINE
+                );
+                for mode in [0, 6, 99] {
+                    assert_eq!(
+                        nntmux_w415_search_dto_query_cursor_page_media_codec(
+                            mode,
+                            ptr,
+                            len,
+                            out.as_mut_ptr(),
+                            out.len()
+                        ),
+                        DECLINE
+                    );
+                }
+                let trailing = [input.clone(), vec![0]].concat();
+                assert_eq!(
+                    nntmux_w415_search_dto_query_cursor_page_media_codec(
+                        1,
+                        trailing.as_ptr(),
+                        trailing.len(),
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    DECLINE
+                );
+                let mut shared = input.clone();
+                shared.resize(256, 0);
+                let shared_ptr = shared.as_mut_ptr();
+                assert_eq!(
+                    nntmux_w415_search_dto_query_cursor_page_media_codec(
+                        1,
+                        shared_ptr,
+                        len,
+                        shared_ptr.add(len - 1),
+                        64
+                    ),
+                    DECLINE
+                );
+                assert_eq!(&shared[..len], &input[..]);
+                assert_eq!(
+                    nntmux_w415_search_dto_query_cursor_page_media_codec(
+                        1,
+                        shared_ptr,
+                        len,
+                        shared_ptr.add(len),
+                        written as usize
+                    ),
+                    written
+                );
+            }
+            assert_eq!(out, [0x5a; 16]);
+            assert_eq!(overlaps(usize::MAX - 1, 4, 0, 1), None);
+        }
+    }
+}

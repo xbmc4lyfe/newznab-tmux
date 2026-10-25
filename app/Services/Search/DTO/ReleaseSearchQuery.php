@@ -23,6 +23,17 @@ final class ReleaseSearchQuery
     private static bool $useRustFfi = true;
 
     /**
+     * Rust stays opt-in for the Wave 41.5 summary: the FFI round trip misses the 1.5x gate; see
+     * tests/Unit/RustSearchDtoQueryCursorPageMediaCodecW41ParityTest.php.
+     */
+    public const bool W415_RUST_FFI_DEFAULT = false;
+
+    /** The `normalizedSortField()` allow-list; the first entry is the fallback. */
+    private const array W415_SORT_FIELDS = ['postdate_ts', 'adddate_ts', 'size', 'totalpart', 'grabs', 'comments', 'categories_id', 'id'];
+
+    private static ?bool $useW415RustFfi = null;
+
+    /**
      * @param  array<string, mixed>|string|null  $phrases
      * @param  list<int>|null  $categoryIds
      * @param  list<int>  $excludedCategoryIds
@@ -298,6 +309,104 @@ final class ReleaseSearchQuery
         } catch (Throwable) {
             return null;
         }
+    }
+
+    public static function useW415RustFfi(bool $enable = true): void
+    {
+        self::$useW415RustFfi = $enable;
+    }
+
+    public static function usesW415RustFfi(): bool
+    {
+        return self::$useW415RustFfi ?? self::W415_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW415RustFfi(): void
+    {
+        self::$useW415RustFfi = null;
+    }
+
+    /**
+     * Summarizes a batch of `['sort_field' => ..., 'sort_dir' => ...]` specs with the rules of
+     * `normalizedSortField()` and `normalizedSortDirection()`. Non-array specs are invalid; a missing
+     * or non-string field falls back to `postdate_ts`, and only an (ASCII case-insensitive) `asc`
+     * string direction is ascending. `distinct_fields` counts the normalized fields of valid specs.
+     *
+     * @param  array<array-key, mixed>  $specs
+     * @return array{specs: int, invalid_specs: int, known_fields: int, fallback_fields: int, asc: int, desc: int, distinct_fields: int}
+     */
+    public static function summarizeSortSpecBatch(array $specs): array
+    {
+        return self::usesW415RustFfi() ? self::summarizeSortSpecBatchNative($specs) : self::summarizeSortSpecBatchPhp($specs);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $specs
+     * @return array{specs: int, invalid_specs: int, known_fields: int, fallback_fields: int, asc: int, desc: int, distinct_fields: int}
+     */
+    public static function summarizeSortSpecBatchPhp(array $specs): array
+    {
+        $invalid = 0;
+        $known = 0;
+        $asc = 0;
+        $distinct = [];
+        foreach ($specs as $spec) {
+            if (! \is_array($spec)) {
+                $invalid++;
+
+                continue;
+            }
+            $field = $spec['sort_field'] ?? null;
+            $direction = $spec['sort_dir'] ?? null;
+            $isKnown = \is_string($field) && \in_array($field, self::W415_SORT_FIELDS, true);
+            $known += (int) $isKnown;
+            $distinct[$isKnown ? $field : self::W415_SORT_FIELDS[0]] = true;
+            $asc += (int) (\is_string($direction) && strtolower($direction) === 'asc');
+        }
+        $valid = \count($specs) - $invalid;
+
+        return [
+            'specs' => \count($specs),
+            'invalid_specs' => $invalid,
+            'known_fields' => $known,
+            'fallback_fields' => $valid - $known,
+            'asc' => $asc,
+            'desc' => $valid - $asc,
+            'distinct_fields' => \count($distinct),
+        ];
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $specs
+     * @return array{specs: int, invalid_specs: int, known_fields: int, fallback_fields: int, asc: int, desc: int, distinct_fields: int}
+     */
+    public static function summarizeSortSpecBatchNative(array $specs): array
+    {
+        $parts = [];
+        foreach ($specs as $spec) {
+            if (! \is_array($spec)) {
+                array_push($parts, '0', '', '');
+
+                continue;
+            }
+            $field = $spec['sort_field'] ?? null;
+            $direction = $spec['sort_dir'] ?? null;
+            array_push($parts, '1', \is_string($field) ? $field : '', \is_string($direction) ? $direction : '');
+        }
+        $fields = SearchCursor::evaluateW415Native(1, $parts);
+        if ($fields === null || \count($fields) !== 7) {
+            return self::summarizeSortSpecBatchPhp($specs);
+        }
+
+        return [
+            'specs' => (int) $fields[0],
+            'invalid_specs' => (int) $fields[1],
+            'known_fields' => (int) $fields[2],
+            'fallback_fields' => (int) $fields[3],
+            'asc' => (int) $fields[4],
+            'desc' => (int) $fields[5],
+            'distinct_fields' => (int) $fields[6],
+        ];
     }
 
     private static function resolveFfi(): ?FFI
