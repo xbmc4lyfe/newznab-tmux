@@ -36740,3 +36740,1526 @@ mod wave49_5_monitoring_bounded_metric_family_exporter_snapshot_jwt {
         }
     }
 }
+
+/// Wave 50.5 batch helpers for `RedisProbe`, `SearchProbe`, `ServiceProbeRegistry`,
+/// `SearchCursorCodec` and `SearchFailureTracker`.
+///
+/// Every entry point shares the Wave 49.5 ABI: `count` records, a reserved
+/// `flags` word (must be 0), a NUL-delimited string buffer (`data`), a
+/// little-endian i64 table (`ints`) and a fixed-width i64 output (`out`,
+/// `out_cap` words). Each returns the words written, `-needed` when `out_cap`
+/// is too small (outputs hold at least two words per record, so never -1), or
+/// `-1` (decline: invalid input or overlapping buffers). Declines and capacity
+/// errors never write to `out`. A record whose first output word is -1 (where
+/// documented) must be computed by PHP.
+mod wave50_5_probes_redis_search_registry_cursor_failure {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const DECLINE: i64 = -1;
+    /// First output word of a record PHP must compute.
+    const PATCH: i64 = -1;
+    const MAX_INPUT: usize = 64 * 1024 * 1024;
+    const MAX_RECORDS: usize = 1 << 20;
+    const XXH_P1: u64 = 0x9E37_79B1_85EB_CA87;
+    const XXH_P2: u64 = 0xC2B2_AE3D_27D4_EB4F;
+    const XXH_P3: u64 = 0x1656_67B1_9E37_79F9;
+    const XXH_P4: u64 = 0x85EB_CA77_C2B2_AE63;
+    const XXH_P5: u64 = 0x27D4_EB2F_1656_67C5;
+    const LOW_BITS: u64 = 0x0101_0101_0101_0101;
+    const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+    const REDIS_CONNECTED: &[u8] = b"Connected";
+    const REDIS_UNEXPECTED: &[u8] = b"Redis ping returned unexpected response";
+    const REDIS_UNREACHABLE: &[u8] = b"Redis unreachable: ";
+    const SEARCH_FAILED: &[u8] = b"Search check failed: ";
+    const UNKNOWN_PROBE: &[u8] = b"Unknown probe identifier \"";
+
+    fn xxh_round(acc: u64, lane: u64) -> u64 {
+        acc.wrapping_add(lane.wrapping_mul(XXH_P2))
+            .rotate_left(31)
+            .wrapping_mul(XXH_P1)
+    }
+
+    fn xxh_merge(acc: u64, lane: u64) -> u64 {
+        (acc ^ xxh_round(0, lane))
+            .wrapping_mul(XXH_P1)
+            .wrapping_add(XXH_P4)
+    }
+
+    fn le64(bytes: &[u8]) -> u64 {
+        u64::from_le_bytes(bytes[..8].try_into().unwrap_or([0; 8]))
+    }
+
+    /// PHP `hash('xxh64')` (seed 0) read back with `unpack('J')`.
+    fn xxh64(input: &[u8]) -> i64 {
+        let mut rest = input;
+        let mut hash = if input.len() >= 32 {
+            let mut lanes = [
+                XXH_P1.wrapping_add(XXH_P2),
+                XXH_P2,
+                0,
+                0u64.wrapping_sub(XXH_P1),
+            ];
+            let (stripes, tail) = input.as_chunks::<32>();
+            for stripe in stripes {
+                for (index, lane) in lanes.iter_mut().enumerate() {
+                    *lane = xxh_round(*lane, le64(&stripe[index * 8..]));
+                }
+            }
+            rest = tail;
+            let mut hash = lanes[0]
+                .rotate_left(1)
+                .wrapping_add(lanes[1].rotate_left(7))
+                .wrapping_add(lanes[2].rotate_left(12))
+                .wrapping_add(lanes[3].rotate_left(18));
+            for lane in lanes {
+                hash = xxh_merge(hash, lane);
+            }
+            hash
+        } else {
+            XXH_P5
+        };
+        hash = hash.wrapping_add(input.len() as u64);
+        while rest.len() >= 8 {
+            hash ^= xxh_round(0, le64(rest));
+            hash = hash
+                .rotate_left(27)
+                .wrapping_mul(XXH_P1)
+                .wrapping_add(XXH_P4);
+            rest = &rest[8..];
+        }
+        if rest.len() >= 4 {
+            let lane = u32::from_le_bytes(rest[..4].try_into().unwrap_or([0; 4]));
+            hash ^= u64::from(lane).wrapping_mul(XXH_P1);
+            hash = hash
+                .rotate_left(23)
+                .wrapping_mul(XXH_P2)
+                .wrapping_add(XXH_P3);
+            rest = &rest[4..];
+        }
+        for &byte in rest {
+            hash ^= u64::from(byte).wrapping_mul(XXH_P5);
+            hash = hash.rotate_left(11).wrapping_mul(XXH_P1);
+        }
+        hash ^= hash >> 33;
+        hash = hash.wrapping_mul(XXH_P2);
+        hash ^= hash >> 29;
+        hash = hash.wrapping_mul(XXH_P3);
+        hash ^= hash >> 32;
+        hash as i64
+    }
+
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> Option<bool> {
+        if a_len == 0 || b_len == 0 {
+            return Some(false);
+        }
+        let a_end = a.checked_add(a_len)?;
+        let b_end = b.checked_add(b_len)?;
+        Some(a < b_end && b < a_end)
+    }
+
+    /// Word-at-a-time search for the first NUL byte.
+    fn find_nul(haystack: &[u8]) -> Option<usize> {
+        let (words, _) = haystack.as_chunks::<8>();
+        for (index, word) in words.iter().enumerate() {
+            let value = u64::from_le_bytes(*word);
+            let found = value.wrapping_sub(LOW_BITS) & !value & HIGH_BITS;
+            if found != 0 {
+                return Some(index * 8 + (found.trailing_zeros() / 8) as usize);
+            }
+        }
+        let tail = words.len() * 8;
+        haystack[tail..]
+            .iter()
+            .position(|&byte| byte == 0)
+            .map(|position| tail + position)
+    }
+
+    /// Splits `data` on NUL into exactly `expected` fields.
+    fn split_fields(data: &[u8], expected: usize) -> Option<Vec<&[u8]>> {
+        if expected == 0 {
+            return data.is_empty().then(Vec::new);
+        }
+        let mut fields = Vec::with_capacity(expected);
+        let mut rest = data;
+        while fields.len() + 1 < expected {
+            let at = find_nul(rest)?;
+            fields.push(&rest[..at]);
+            rest = &rest[at + 1..];
+        }
+        if find_nul(rest).is_some() {
+            return None;
+        }
+        fields.push(rest);
+        Some(fields)
+    }
+
+    fn read_ints(bytes: &[u8]) -> Option<Vec<i64>> {
+        let (chunks, tail) = bytes.as_chunks::<8>();
+        tail.is_empty().then(|| {
+            chunks
+                .iter()
+                .map(|chunk| i64::from_le_bytes(*chunk))
+                .collect()
+        })
+    }
+
+    /// A count or length read from the int table.
+    fn table_len(value: i64, max: usize) -> Option<usize> {
+        usize::try_from(value).ok().filter(|&len| len <= max)
+    }
+
+    /// Error message indices (unique, below `count`): one flag per record.
+    fn index_flags(indices: &[i64], count: usize) -> Option<Vec<bool>> {
+        let mut flags = vec![false; count];
+        for &index in indices {
+            let slot = flags.get_mut(usize::try_from(index).ok()?)?;
+            if *slot {
+                return None;
+            }
+            *slot = true;
+        }
+        Some(flags)
+    }
+
+    /// Validates the shared ABI, runs `body` and copies its words to `out`.
+    ///
+    /// # Safety
+    /// See the entry points.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run(
+        count: usize,
+        flags: i64,
+        data: *const u8,
+        data_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        out: *mut i64,
+        out_cap: usize,
+        words_per_record: usize,
+        leading: usize,
+        body: impl FnOnce(&[u8], &[i64], &mut Vec<i64>) -> Option<()>,
+    ) -> i64 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if flags != 0
+                || count > MAX_RECORDS
+                || data_len > MAX_INPUT
+                || ints_len > MAX_INPUT
+                || out_cap > MAX_INPUT
+                || (data.is_null() && data_len != 0)
+                || (ints.is_null() && ints_len != 0)
+                || (out.is_null() && out_cap != 0)
+                || (!out.is_null() && !out.is_aligned())
+            {
+                return DECLINE;
+            }
+            let Some(out_bytes) = out_cap.checked_mul(8) else {
+                return DECLINE;
+            };
+            for (pointer, len) in [(data as usize, data_len), (ints as usize, ints_len)] {
+                if overlaps(pointer, len, out as usize, out_bytes) != Some(false) {
+                    return DECLINE;
+                }
+            }
+            let data = if data_len == 0 || data.is_null() {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(data, data_len) }
+            };
+            let ints = if ints_len == 0 || ints.is_null() {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(ints, ints_len) }
+            };
+            let Some(table) = read_ints(ints) else {
+                return DECLINE;
+            };
+            let needed = leading + count * words_per_record;
+            let mut words = Vec::with_capacity(needed);
+            if body(data, &table, &mut words).is_none() || words.len() != needed {
+                return DECLINE;
+            }
+            if out_cap < needed {
+                return -(needed as i64);
+            }
+            if needed > 0 {
+                unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), out, needed) };
+            }
+            needed as i64
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    fn push_int(out: &mut Vec<u8>, value: i64) {
+        let mut digits = [0u8; 20];
+        let mut at = digits.len();
+        let mut magnitude = value.unsigned_abs();
+        loop {
+            at -= 1;
+            digits[at] = b'0' + (magnitude % 10) as u8;
+            magnitude /= 10;
+            if magnitude == 0 {
+                break;
+            }
+        }
+        if value < 0 {
+            out.push(b'-');
+        }
+        out.extend_from_slice(&digits[at..]);
+    }
+
+    /// PHP `(int) (($end - $start) / 1_000_000)`; None when the subtraction leaves
+    /// the integer range (PHP then divides a float).
+    fn elapsed_ms(start: i64, end: i64) -> Option<i64> {
+        let diff = end.checked_sub(start)?;
+        Some(if diff % 1_000_000 == 0 {
+            diff / 1_000_000
+        } else {
+            (diff as f64 / 1_000_000.0) as i64
+        })
+    }
+
+    /// `$prefix.Str::limit($error, 120)` for ASCII errors; None defers to PHP's
+    /// `mb_strwidth()`.
+    fn failure_reason(out: &mut Vec<u8>, prefix: &[u8], error: &[u8]) -> Option<()> {
+        if !error.is_ascii() {
+            return None;
+        }
+        out.clear();
+        out.extend_from_slice(prefix);
+        if error.len() <= 120 {
+            out.extend_from_slice(error);
+        } else {
+            let mut body = &error[..120];
+            while let [rest @ .., b' ' | b'\t' | b'\n' | b'\r' | b'\0' | b'\x0b'] = body {
+                body = rest;
+            }
+            out.extend_from_slice(body);
+            out.extend_from_slice(b"...");
+        }
+        Some(())
+    }
+
+    /// Counts a record PHP must compute in the leading word and fills its row.
+    fn patch(words: &mut Vec<i64>, width: usize) {
+        words[0] += 1;
+        words.push(PATCH);
+        words.resize(words.len() + width - 1, 0);
+    }
+
+    fn reason_words(words: &mut Vec<i64>, code: i64, elapsed: i64, reason: &[u8]) {
+        words.extend([code, elapsed, reason.len() as i64, xxh64(reason)]);
+    }
+
+    /// `RedisProbe::probeOutcomeBatch()`: `ints` is `[errors, trues,
+    /// true indices.., starts.., ends.., error indices..]`; `data` holds every
+    /// pong then every error message. 4 words per probe: `[code (0 connected,
+    /// 1 unexpected response, 2 unreachable, -1 PHP), elapsed ms, reason
+    /// length, xxh64(reason)]`.
+    fn redis_outcome(count: usize, data: &[u8], table: &[i64], words: &mut Vec<i64>) -> Option<()> {
+        let (&errors, rest) = table.split_first()?;
+        let (&trues, rest) = rest.split_first()?;
+        let errors = table_len(errors, count)?;
+        let trues = table_len(trues, count)?;
+        if rest.len() != trues + 2 * count + errors {
+            return None;
+        }
+        let (true_indices, rest) = rest.split_at(trues);
+        let (starts, rest) = rest.split_at(count);
+        let (ends, error_indices) = rest.split_at(count);
+        let is_true = index_flags(true_indices, count)?;
+        let failed = index_flags(error_indices, count)?;
+        let fields = split_fields(data, count + errors)?;
+        let (pongs, messages) = fields.split_at(count);
+        let mut messages = messages.iter();
+        let mut reason = Vec::with_capacity(160);
+        words.push(0);
+        for index in 0..count {
+            if failed[index] {
+                let message = messages.next()?;
+                match failure_reason(&mut reason, REDIS_UNREACHABLE, message) {
+                    Some(()) => reason_words(words, 2, 0, &reason),
+                    None => patch(words, 4),
+                }
+                continue;
+            }
+            let Some(elapsed) = elapsed_ms(starts[index], ends[index]) else {
+                patch(words, 4);
+                continue;
+            };
+            let pong = pongs[index];
+            if is_true[index] || pong == b"+PONG" || pong.eq_ignore_ascii_case(b"PONG") {
+                reason_words(words, 0, elapsed, REDIS_CONNECTED);
+            } else {
+                reason_words(words, 1, elapsed, REDIS_UNEXPECTED);
+            }
+        }
+        Some(())
+    }
+
+    /// `SearchProbe::availabilityOutcomeBatch()`: `ints` is `[errors,
+    /// available flags (0/1).., starts.., ends.., error indices..]`; `data`
+    /// holds every driver then every error message. 4 words per probe:
+    /// `[code (0 available, 2 unavailable, 3 check failed, -1 PHP), elapsed ms,
+    /// reason length, xxh64(reason)]`.
+    fn search_outcome(
+        count: usize,
+        data: &[u8],
+        table: &[i64],
+        words: &mut Vec<i64>,
+    ) -> Option<()> {
+        let (&errors, rest) = table.split_first()?;
+        let errors = table_len(errors, count)?;
+        if rest.len() != 3 * count + errors {
+            return None;
+        }
+        let (available, rest) = rest.split_at(count);
+        let (starts, rest) = rest.split_at(count);
+        let (ends, error_indices) = rest.split_at(count);
+        if available.iter().any(|&flag| !matches!(flag, 0 | 1)) {
+            return None;
+        }
+        let failed = index_flags(error_indices, count)?;
+        let fields = split_fields(data, count + errors)?;
+        let (drivers, messages) = fields.split_at(count);
+        let mut messages = messages.iter();
+        let mut reason = Vec::with_capacity(160);
+        words.push(0);
+        for index in 0..count {
+            if failed[index] {
+                let message = messages.next()?;
+                match failure_reason(&mut reason, SEARCH_FAILED, message) {
+                    Some(()) => reason_words(words, 3, 0, &reason),
+                    None => patch(words, 4),
+                }
+                continue;
+            }
+            let Some(elapsed) = elapsed_ms(starts[index], ends[index]) else {
+                patch(words, 4);
+                continue;
+            };
+            reason.clear();
+            reason.extend_from_slice(b"Search driver \"");
+            reason.extend_from_slice(drivers[index]);
+            if available[index] == 1 {
+                reason.extend_from_slice(b"\" available");
+                reason_words(words, 0, elapsed, &reason);
+            } else {
+                reason.extend_from_slice(b"\" unavailable");
+                reason_words(words, 2, elapsed, &reason);
+            }
+        }
+        Some(())
+    }
+
+    /// `ServiceProbeRegistry::resolveProbeBatch()`: `ints` is `[known]`;
+    /// `data` holds every identifier then every known identifier. 3 words per
+    /// identifier: `[first known index or -1, reason length, xxh64(reason)]`,
+    /// with reason length and digest 0 for a known identifier.
+    fn registry_resolve(
+        count: usize,
+        data: &[u8],
+        table: &[i64],
+        words: &mut Vec<i64>,
+    ) -> Option<()> {
+        let [known] = *table else {
+            return None;
+        };
+        let known = table_len(known, MAX_RECORDS)?;
+        let fields = split_fields(data, count.checked_add(known)?)?;
+        let (identifiers, known) = fields.split_at(count);
+        let mut reason = Vec::with_capacity(64);
+        for identifier in identifiers {
+            if let Some(position) = known.iter().position(|candidate| candidate == identifier) {
+                words.extend([position as i64, 0, 0]);
+                continue;
+            }
+            reason.clear();
+            reason.extend_from_slice(UNKNOWN_PROBE);
+            reason.extend_from_slice(identifier);
+            reason.push(b'"');
+            words.extend([-1, reason.len() as i64, xxh64(&reason)]);
+        }
+        Some(())
+    }
+
+    /// A JSON value in the subset Rust decodes: containers nest at most two
+    /// deep (root and one level of scalars).
+    #[derive(Clone, Copy)]
+    enum Json<'a> {
+        Null,
+        Bool(bool),
+        Int(i64),
+        Float,
+        /// Raw bytes between the quotes and whether they hold escapes.
+        Str(&'a [u8], bool),
+        /// Range of scalar elements in `JsonParser::elements`.
+        Array(usize, usize),
+        Object,
+    }
+
+    struct JsonParser<'a> {
+        input: &'a [u8],
+        at: usize,
+        /// Elements of arrays one level below the root.
+        elements: Vec<Json<'a>>,
+        /// Root object members in input order.
+        members: Vec<(&'a [u8], bool, Json<'a>)>,
+    }
+
+    impl<'a> JsonParser<'a> {
+        fn ws(&mut self) {
+            while let Some(b' ' | b'\t' | b'\n' | b'\r') = self.input.get(self.at) {
+                self.at += 1;
+            }
+        }
+
+        fn hex4(&mut self) -> Option<u32> {
+            let digits = self.input.get(self.at..self.at + 4)?;
+            let mut code = 0;
+            for &digit in digits {
+                code = code * 16 + char::from(digit).to_digit(16)?;
+            }
+            self.at += 4;
+            Some(code)
+        }
+
+        /// Validates a string like PHP's scanner (control bytes, escapes,
+        /// surrogate pairs, UTF-8). None when PHP must decide.
+        fn string(&mut self) -> Option<Json<'a>> {
+            self.at += 1;
+            let start = self.at;
+            let mut escaped = false;
+            let mut ascii = true;
+            loop {
+                // Skips 8 plain ASCII bytes at a time (no quote, backslash, control or high byte).
+                while let Some(chunk) = self.input.get(self.at..self.at + 8) {
+                    let word = le64(chunk);
+                    let quote = word ^ (LOW_BITS * u64::from(b'"'));
+                    let backslash = word ^ (LOW_BITS * u64::from(b'\\'));
+                    let special = (word.wrapping_sub(LOW_BITS * 0x20)
+                        | quote.wrapping_sub(LOW_BITS) & !quote
+                        | backslash.wrapping_sub(LOW_BITS) & !backslash
+                        | word)
+                        & HIGH_BITS;
+                    if special != 0 {
+                        break;
+                    }
+                    self.at += 8;
+                }
+                let byte = *self.input.get(self.at)?;
+                match byte {
+                    b'"' => break,
+                    b'\\' => {
+                        escaped = true;
+                        self.at += 1;
+                        match *self.input.get(self.at)? {
+                            b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => self.at += 1,
+                            b'u' => {
+                                self.at += 1;
+                                let code = self.hex4()?;
+                                if (0xD800..0xDC00).contains(&code) {
+                                    if self.input.get(self.at..self.at + 2)? != b"\\u" {
+                                        return None;
+                                    }
+                                    self.at += 2;
+                                    if !(0xDC00..0xE000).contains(&self.hex4()?) {
+                                        return None;
+                                    }
+                                } else if (0xDC00..0xE000).contains(&code) {
+                                    return None;
+                                }
+                            }
+                            _ => return None,
+                        }
+                    }
+                    0..=0x1F => return None,
+                    0x80.. => {
+                        ascii = false;
+                        self.at += 1;
+                    }
+                    _ => self.at += 1,
+                }
+            }
+            let raw = &self.input[start..self.at];
+            self.at += 1;
+            if !ascii {
+                std::str::from_utf8(raw).ok()?;
+            }
+            Some(Json::Str(raw, escaped))
+        }
+
+        fn number(&mut self) -> Option<Json<'a>> {
+            let start = self.at;
+            if self.input[self.at] == b'-' {
+                self.at += 1;
+            }
+            match *self.input.get(self.at)? {
+                b'0' => self.at += 1,
+                b'1'..=b'9' => {
+                    while self.input.get(self.at).is_some_and(u8::is_ascii_digit) {
+                        self.at += 1;
+                    }
+                }
+                _ => return None,
+            }
+            let mut float = false;
+            if self.input.get(self.at) == Some(&b'.') {
+                self.at += 1;
+                if !self.input.get(self.at).is_some_and(u8::is_ascii_digit) {
+                    return None;
+                }
+                while self.input.get(self.at).is_some_and(u8::is_ascii_digit) {
+                    self.at += 1;
+                }
+                float = true;
+            }
+            if let Some(b'e' | b'E') = self.input.get(self.at) {
+                self.at += 1;
+                if let Some(b'+' | b'-') = self.input.get(self.at) {
+                    self.at += 1;
+                }
+                if !self.input.get(self.at).is_some_and(u8::is_ascii_digit) {
+                    return None;
+                }
+                while self.input.get(self.at).is_some_and(u8::is_ascii_digit) {
+                    self.at += 1;
+                }
+                float = true;
+            }
+            if float {
+                return Some(Json::Float);
+            }
+            // Integers outside the i64 range decode to floats, as in PHP.
+            let negative = self.input[start] == b'-';
+            let digits = &self.input[start + usize::from(negative)..self.at];
+            if digits.len() > 19 {
+                return Some(Json::Float);
+            }
+            let magnitude = digits
+                .iter()
+                .fold(0u64, |acc, &digit| acc * 10 + u64::from(digit - b'0'));
+            Some(match (negative, i64::try_from(magnitude)) {
+                (false, Ok(int)) => Json::Int(int),
+                (true, Ok(int)) => Json::Int(-int),
+                (true, Err(_)) if magnitude == 1 << 63 => Json::Int(i64::MIN),
+                _ => Json::Float,
+            })
+        }
+
+        fn literal(&mut self, word: &[u8], value: Json<'a>) -> Option<Json<'a>> {
+            if self.input.get(self.at..self.at + word.len())? != word {
+                return None;
+            }
+            self.at += word.len();
+            Some(value)
+        }
+
+        fn value(&mut self, depth: usize) -> Option<Json<'a>> {
+            self.ws();
+            match *self.input.get(self.at)? {
+                b'"' => self.string(),
+                b'-' | b'0'..=b'9' => self.number(),
+                b't' => self.literal(b"true", Json::Bool(true)),
+                b'f' => self.literal(b"false", Json::Bool(false)),
+                b'n' => self.literal(b"null", Json::Null),
+                b'[' if depth < 2 => {
+                    self.at += 1;
+                    let start = self.elements.len();
+                    self.ws();
+                    if self.input.get(self.at) == Some(&b']') {
+                        self.at += 1;
+                        return Some(Json::Array(start, 0));
+                    }
+                    loop {
+                        let element = self.value(depth + 1)?;
+                        if depth == 1 {
+                            self.elements.push(element);
+                        }
+                        self.ws();
+                        match *self.input.get(self.at)? {
+                            b',' => self.at += 1,
+                            b']' => {
+                                self.at += 1;
+                                return Some(Json::Array(start, self.elements.len() - start));
+                            }
+                            _ => return None,
+                        }
+                    }
+                }
+                b'{' if depth < 2 => {
+                    self.at += 1;
+                    self.ws();
+                    if self.input.get(self.at) == Some(&b'}') {
+                        self.at += 1;
+                        return Some(Json::Object);
+                    }
+                    loop {
+                        self.ws();
+                        if self.input.get(self.at) != Some(&b'"') {
+                            return None;
+                        }
+                        let Json::Str(key, escaped) = self.string()? else {
+                            return None;
+                        };
+                        self.ws();
+                        if self.input.get(self.at) != Some(&b':') {
+                            return None;
+                        }
+                        self.at += 1;
+                        let member = self.value(depth + 1)?;
+                        if depth == 0 {
+                            self.members.push((key, escaped, member));
+                        }
+                        self.ws();
+                        match *self.input.get(self.at)? {
+                            b',' => self.at += 1,
+                            b'}' => {
+                                self.at += 1;
+                                return Some(Json::Object);
+                            }
+                            _ => return None,
+                        }
+                    }
+                }
+                _ => None,
+            }
+        }
+    }
+
+    /// Appends the decoded bytes of a validated JSON string.
+    fn unescape(out: &mut Vec<u8>, raw: &[u8]) {
+        let mut at = 0;
+        while at < raw.len() {
+            let byte = raw[at];
+            if byte != b'\\' {
+                out.push(byte);
+                at += 1;
+                continue;
+            }
+            let escape = raw[at + 1];
+            at += 2;
+            let simple = match escape {
+                b'b' => 8,
+                b'f' => 12,
+                b'n' => b'\n',
+                b'r' => b'\r',
+                b't' => b'\t',
+                b'u' => 0,
+                other => other,
+            };
+            if escape != b'u' {
+                out.push(simple);
+                continue;
+            }
+            let hex = |at: usize| {
+                raw[at..at + 4].iter().fold(0u32, |acc, &digit| {
+                    acc * 16 + char::from(digit).to_digit(16).unwrap_or(0)
+                })
+            };
+            let mut code = hex(at);
+            at += 4;
+            if (0xD800..0xDC00).contains(&code) {
+                code = 0x10000 + ((code - 0xD800) << 10) + (hex(at + 2) - 0xDC00);
+                at += 6;
+            }
+            let mut buffer = [0u8; 4];
+            let ch = char::from_u32(code).unwrap_or('\u{FFFD}');
+            out.extend_from_slice(ch.encode_utf8(&mut buffer).as_bytes());
+        }
+    }
+
+    /// PHP `(int) ($value ?? 0)`; None when PHP must cast. Strings are cast
+    /// only when they are an optional `-` and 1 to 18 ASCII digits.
+    fn cast_int(value: Option<Json>) -> Option<i64> {
+        match value {
+            None | Some(Json::Null) => Some(0),
+            Some(Json::Int(int)) => Some(int),
+            Some(Json::Bool(flag)) => Some(i64::from(flag)),
+            Some(Json::Str(raw, false)) => {
+                let (negative, digits) = match raw {
+                    [b'-', digits @ ..] => (true, digits),
+                    digits => (false, digits),
+                };
+                if digits.is_empty()
+                    || digits.len() > 18
+                    || !digits.iter().all(u8::is_ascii_digit)
+                {
+                    return None;
+                }
+                let magnitude = digits
+                    .iter()
+                    .fold(0i64, |acc, &digit| acc * 10 + i64::from(digit - b'0'));
+                Some(if negative { -magnitude } else { magnitude })
+            }
+            _ => None,
+        }
+    }
+
+    /// Slot of a cursor payload key: sort, expires, total, query, driver, generation.
+    fn cursor_slot(key: &[u8]) -> Option<usize> {
+        match key {
+            b"sort" => Some(0),
+            b"expires" => Some(1),
+            b"total" => Some(2),
+            b"query" => Some(3),
+            b"driver" => Some(4),
+            b"generation" => Some(5),
+            _ => None,
+        }
+    }
+
+    /// One cursor payload: `[status (0 accepted, 2 invalid or expired, -1
+    /// PHP), total, expires, sort width, xxh64(record)]`.
+    fn cursor_payload<'a>(
+        parser: &mut JsonParser<'a>,
+        json: &'a [u8],
+        now: i64,
+        record: &mut Vec<u8>,
+        scratch: &mut Vec<u8>,
+    ) -> Option<[i64; 5]> {
+        const REJECTED: [i64; 5] = [2, 0, 0, 0, 0];
+        parser.input = json;
+        parser.at = 0;
+        parser.elements.clear();
+        parser.members.clear();
+        let root = parser.value(0)?;
+        parser.ws();
+        if parser.at != json.len() {
+            return None;
+        }
+        if !matches!(root, Json::Object) {
+            return Some(REJECTED);
+        }
+        // Duplicate keys keep the last value, as json_decode() does.
+        let mut slots: [Option<Json>; 6] = [None; 6];
+        for &(raw, escaped, value) in &parser.members {
+            let slot = if escaped {
+                scratch.clear();
+                unescape(scratch, raw);
+                cursor_slot(scratch)
+            } else {
+                cursor_slot(raw)
+            };
+            if let Some(slot) = slot {
+                slots[slot] = Some(value);
+            }
+        }
+        let [sort, expires, total, query, driver, generation] = slots;
+        let (start, width) = match sort {
+            Some(Json::Array(start, width)) => (start, width),
+            Some(Json::Object) => return None,
+            _ => return Some(REJECTED),
+        };
+        let expires = cast_int(expires)?;
+        if expires < now {
+            return Some(REJECTED);
+        }
+        let total = cast_int(total)?;
+        let fields = [query, driver, generation];
+        record.clear();
+        push_int(record, total);
+        record.push(b'\n');
+        push_int(record, expires);
+        record.push(b'\n');
+        for field in fields {
+            match field {
+                None | Some(Json::Null) | Some(Json::Bool(false)) => {
+                    record.extend_from_slice(b"0\n")
+                }
+                Some(Json::Bool(true)) => record.extend_from_slice(b"1\n1"),
+                Some(Json::Int(int)) => {
+                    scratch.clear();
+                    push_int(scratch, int);
+                    push_int(record, scratch.len() as i64);
+                    record.push(b'\n');
+                    record.extend_from_slice(scratch);
+                }
+                Some(Json::Str(raw, escaped)) => {
+                    scratch.clear();
+                    if escaped {
+                        unescape(scratch, raw);
+                    } else {
+                        scratch.extend_from_slice(raw);
+                    }
+                    push_int(record, scratch.len() as i64);
+                    record.push(b'\n');
+                    record.extend_from_slice(scratch);
+                }
+                _ => return None,
+            }
+        }
+        for &element in &parser.elements[start..start + width] {
+            match element {
+                Json::Int(int) => {
+                    record.push(b'i');
+                    push_int(record, int);
+                    record.push(b'\n');
+                }
+                Json::Str(raw, escaped) => {
+                    scratch.clear();
+                    if escaped {
+                        unescape(scratch, raw);
+                    } else {
+                        scratch.extend_from_slice(raw);
+                    }
+                    record.push(b's');
+                    push_int(record, scratch.len() as i64);
+                    record.push(b'\n');
+                    record.extend_from_slice(scratch);
+                }
+                Json::Null => record.extend_from_slice(b"xNULL\n"),
+                Json::Bool(true) => record.extend_from_slice(b"xtrue\n"),
+                Json::Bool(false) => record.extend_from_slice(b"xfalse\n"),
+                _ => return None,
+            }
+        }
+        Some([0, total, expires, width as i64, xxh64(record)])
+    }
+
+    /// `SearchCursorCodec::decodePayloadBatch()`: `ints` is `[now]`; `data`
+    /// holds every payload. 5 words per payload (see [`cursor_payload`]).
+    fn cursor_decode(count: usize, data: &[u8], table: &[i64], words: &mut Vec<i64>) -> Option<()> {
+        let [now] = *table else {
+            return None;
+        };
+        let payloads = split_fields(data, count)?;
+        let mut parser = JsonParser {
+            input: data,
+            at: 0,
+            elements: Vec::with_capacity(16),
+            members: Vec::with_capacity(16),
+        };
+        let mut record = Vec::with_capacity(256);
+        let mut scratch = Vec::with_capacity(64);
+        words.push(0);
+        for payload in payloads {
+            match cursor_payload(&mut parser, payload, now, &mut record, &mut scratch) {
+                Some(row) => words.extend(row),
+                None => patch(words, 5),
+            }
+        }
+        Some(())
+    }
+
+    /// `SearchFailureTracker::failureWindowBatch()`: `ints` is `[threshold,
+    /// now, cooldown, counts.., baselines.., opened-at..]`. 2 words per record:
+    /// `[failed since | reached threshold << 1 | state (0 closed, 1 open,
+    /// 2 half-open) << 2 | allow probe << 4 | trip on next failure << 5,
+    /// remaining cooldown seconds]`.
+    fn failure_window(
+        count: usize,
+        data: &[u8],
+        table: &[i64],
+        words: &mut Vec<i64>,
+    ) -> Option<()> {
+        if !data.is_empty() || table.len() != 3 + 3 * count {
+            return None;
+        }
+        let (&[threshold, now, cooldown], columns) = table.split_first_chunk::<3>()?;
+        let (counts, rest) = columns.split_at(count);
+        let (baselines, opened) = rest.split_at(count);
+        let clamped = threshold.max(1);
+        let cooldown = cooldown.max(0);
+        for index in 0..count {
+            let failures = counts[index];
+            let mut flags = i64::from(failures != baselines[index])
+                | i64::from(threshold > 0 && failures >= threshold) << 1;
+            let positive = failures.max(0);
+            if positive < clamped {
+                flags |= i64::from(positive >= clamped - 1) << 5;
+                words.extend([flags, 0]);
+                continue;
+            }
+            let opened_at = opened[index];
+            let elapsed = if opened_at > now {
+                0
+            } else {
+                now.saturating_sub(opened_at)
+            };
+            let remaining = (cooldown - elapsed).max(0);
+            flags |= if remaining == 0 {
+                2 << 2 | 1 << 4 | 1 << 5
+            } else {
+                1 << 2
+            };
+            words.extend([flags, remaining]);
+        }
+        Some(())
+    }
+
+    /// `RedisProbe::probeOutcomeBatch()` (see [`redis_outcome`]).
+    ///
+    /// # Safety
+    /// Non-null pointers must refer to readable allocations of `data_len` and
+    /// `ints_len` bytes and a writable, aligned allocation of `out_cap` i64
+    /// words. Null pointers require zero length/capacity. Inputs and output
+    /// must not overlap.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w505_redis_probe_outcome(
+        count: usize,
+        flags: i64,
+        data: *const u8,
+        data_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> i64 {
+        unsafe {
+            run(
+                count,
+                flags,
+                data,
+                data_len,
+                ints,
+                ints_len,
+                out,
+                out_cap,
+                4,
+                1,
+                |data, table, words| redis_outcome(count, data, table, words),
+            )
+        }
+    }
+
+    /// `SearchProbe::availabilityOutcomeBatch()` (see [`search_outcome`]).
+    ///
+    /// # Safety
+    /// As for [`nntmux_w505_redis_probe_outcome`].
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w505_search_probe_outcome(
+        count: usize,
+        flags: i64,
+        data: *const u8,
+        data_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> i64 {
+        unsafe {
+            run(
+                count,
+                flags,
+                data,
+                data_len,
+                ints,
+                ints_len,
+                out,
+                out_cap,
+                4,
+                1,
+                |data, table, words| search_outcome(count, data, table, words),
+            )
+        }
+    }
+
+    /// `ServiceProbeRegistry::resolveProbeBatch()` (see [`registry_resolve`]).
+    ///
+    /// # Safety
+    /// As for [`nntmux_w505_redis_probe_outcome`].
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w505_service_probe_registry_resolve(
+        count: usize,
+        flags: i64,
+        data: *const u8,
+        data_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> i64 {
+        unsafe {
+            run(
+                count,
+                flags,
+                data,
+                data_len,
+                ints,
+                ints_len,
+                out,
+                out_cap,
+                3,
+                0,
+                |data, table, words| registry_resolve(count, data, table, words),
+            )
+        }
+    }
+
+    /// `SearchCursorCodec::decodePayloadBatch()` (see [`cursor_decode`]).
+    ///
+    /// # Safety
+    /// As for [`nntmux_w505_redis_probe_outcome`].
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w505_search_cursor_decode(
+        count: usize,
+        flags: i64,
+        data: *const u8,
+        data_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> i64 {
+        unsafe {
+            run(
+                count,
+                flags,
+                data,
+                data_len,
+                ints,
+                ints_len,
+                out,
+                out_cap,
+                5,
+                1,
+                |data, table, words| cursor_decode(count, data, table, words),
+            )
+        }
+    }
+
+    /// `SearchFailureTracker::failureWindowBatch()` (see [`failure_window`]).
+    ///
+    /// # Safety
+    /// As for [`nntmux_w505_redis_probe_outcome`].
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w505_search_failure_window(
+        count: usize,
+        flags: i64,
+        data: *const u8,
+        data_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> i64 {
+        unsafe {
+            run(
+                count,
+                flags,
+                data,
+                data_len,
+                ints,
+                ints_len,
+                out,
+                out_cap,
+                2,
+                0,
+                |data, table, words| failure_window(count, data, table, words),
+            )
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        type Entry = unsafe extern "C" fn(
+            usize,
+            i64,
+            *const u8,
+            usize,
+            *const u8,
+            usize,
+            *mut i64,
+            usize,
+        ) -> i64;
+
+        fn pack(values: &[i64]) -> Vec<u8> {
+            values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect()
+        }
+
+        fn call(entry: Entry, count: usize, data: &[u8], table: &[i64]) -> Result<Vec<i64>, i64> {
+            let table = pack(table);
+            let mut out = vec![0i64; 4096];
+            let written = unsafe {
+                entry(
+                    count,
+                    0,
+                    data.as_ptr(),
+                    data.len(),
+                    table.as_ptr(),
+                    table.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            if written < 0 {
+                return Err(written);
+            }
+            out.truncate(written as usize);
+            Ok(out)
+        }
+
+        fn reason(code: i64, elapsed: i64, text: &[u8]) -> Vec<i64> {
+            vec![code, elapsed, text.len() as i64, xxh64(text)]
+        }
+
+        #[test]
+        fn w505_xxh64_matches_reference_vectors() {
+            assert_eq!(xxh64(b"") as u64, 0xEF46_DB37_51D8_E999);
+            assert_eq!(xxh64(b"abc") as u64, 0x44BC_2CF5_AD77_0999);
+            assert_eq!(
+                xxh64(b"Nobody inspects the spammish repetition") as u64,
+                0xFBCE_A83C_8A37_8BF1
+            );
+        }
+
+        #[test]
+        fn w505_elapsed_follows_php_division() {
+            assert_eq!(elapsed_ms(0, 5_000_000), Some(5));
+            assert_eq!(elapsed_ms(0, 5_999_999), Some(5));
+            assert_eq!(elapsed_ms(10, 0), Some(0));
+            assert_eq!(elapsed_ms(0, -2_500_000), Some(-2));
+            assert_eq!(elapsed_ms(i64::MIN, i64::MAX), None);
+            assert_eq!(
+                elapsed_ms(0, i64::MAX),
+                Some((i64::MAX as f64 / 1e6) as i64)
+            );
+        }
+
+        #[test]
+        fn w505_redis_outcomes_match_php_rules() {
+            let entry: Entry = nntmux_w505_redis_probe_outcome;
+            // pongs: true (index 0), "+PONG", "pong", "+pong", "", errors at 5 and 6.
+            let long = format!("{}   \tz", "e".repeat(117));
+            let data = format!("1\0+PONG\0pong\0+pong\0\0\0\0boom\0{long}");
+            let starts = [0, 0, 0, 0, 0, 0, 0];
+            let ends = [
+                1_000_000, 2_500_000, 3_000_000, 4_000_000, 5_000_000, 6_000_000, 7_000_000,
+            ];
+            let mut table = vec![2, 1, 0];
+            table.extend(starts);
+            table.extend(ends);
+            table.extend([5, 6]);
+            let words = call(entry, 7, data.as_bytes(), &table).unwrap();
+            let mut expected = vec![0];
+            expected.extend(reason(0, 1, REDIS_CONNECTED));
+            expected.extend(reason(0, 2, REDIS_CONNECTED));
+            expected.extend(reason(0, 3, REDIS_CONNECTED));
+            expected.extend(reason(1, 4, REDIS_UNEXPECTED));
+            expected.extend(reason(1, 5, REDIS_UNEXPECTED));
+            expected.extend(reason(2, 0, b"Redis unreachable: boom"));
+            let trimmed = format!("Redis unreachable: {}...", "e".repeat(117));
+            expected.extend(reason(2, 0, trimmed.as_bytes()));
+            assert_eq!(words, expected);
+
+            // Non-ASCII errors and overflowing timings are left to PHP.
+            let table = [1, 0, i64::MIN, 0, i64::MAX, 0, 1];
+            let words = call(entry, 2, "PONG\0\0caf\u{e9}".as_bytes(), &table).unwrap();
+            assert_eq!(words, vec![2, PATCH, 0, 0, 0, PATCH, 0, 0, 0]);
+            // Indices out of range, duplicated or a field count mismatch decline.
+            assert_eq!(call(entry, 1, b"x", &[0, 1, 1, 0, 0]), Err(DECLINE));
+            assert_eq!(
+                call(entry, 2, b"x\0y\0e\0f", &[2, 0, 0, 0, 0, 0, 1, 1]),
+                Err(DECLINE)
+            );
+            assert_eq!(call(entry, 1, b"x\0y", &[0, 0, 0, 0]), Err(DECLINE));
+            assert_eq!(call(entry, 0, b"", &[0, 0]), Ok(vec![0]));
+        }
+
+        #[test]
+        fn w505_search_outcomes_match_php_rules() {
+            let entry: Entry = nntmux_w505_search_probe_outcome;
+            let table = [1, 1, 0, 1, 0, 0, 0, 3_000_000, 4_500_000, 0, 2];
+            let words = call(entry, 3, b"manticore\0elastic\0x\0timeout", &table).unwrap();
+            let mut expected = vec![0];
+            expected.extend(reason(0, 3, b"Search driver \"manticore\" available"));
+            expected.extend(reason(2, 4, b"Search driver \"elastic\" unavailable"));
+            expected.extend(reason(3, 0, b"Search check failed: timeout"));
+            assert_eq!(words, expected);
+            assert_eq!(call(entry, 1, b"m", &[0, 2, 0, 0]), Err(DECLINE));
+        }
+
+        #[test]
+        fn w505_registry_resolves_first_known_index() {
+            let entry: Entry = nntmux_w505_service_probe_registry_resolve;
+            let words = call(entry, 3, b"redis\0nope\0\0database\0redis\0redis", &[3]).unwrap();
+            let text = b"Unknown probe identifier \"nope\"";
+            let empty = b"Unknown probe identifier \"\"";
+            assert_eq!(
+                words,
+                vec![
+                    1,
+                    0,
+                    0,
+                    -1,
+                    text.len() as i64,
+                    xxh64(text),
+                    -1,
+                    empty.len() as i64,
+                    xxh64(empty)
+                ]
+            );
+            assert_eq!(call(entry, 1, b"a", &[]), Err(DECLINE));
+            assert_eq!(
+                call(entry, 1, b"a", &[0]),
+                Ok(vec![-1, 28, xxh64(b"Unknown probe identifier \"a\"")])
+            );
+        }
+
+        #[test]
+        fn w505_cursor_payloads_follow_json_decode() {
+            let entry: Entry = nntmux_w505_search_cursor_decode;
+            let decode = |json: &str| {
+                let words = call(entry, 1, json.as_bytes(), &[100]).unwrap();
+                assert_eq!(words[0], i64::from(words[1] == PATCH));
+                words[1..].to_vec()
+            };
+            let record = b"7\n200\n1\nq5\nmanti1\ng" as &[u8];
+            let mut full = record.to_vec();
+            full.extend_from_slice(b"i-3\ns2\nabxNULL\nxtrue\n");
+            assert_eq!(
+                decode(
+                    r#"{"sort":[-3,"ab",null,true],"total":7,"query":"q","driver":"manti","generation":"g","expires":200}"#
+                ),
+                vec![0, 7, 200, 4, xxh64(&full)]
+            );
+            // Escapes, duplicate keys (the escaped `sort` key wins), bool/int/missing casts.
+            let words = decode(
+                r#"{"sort":[9],"sort":["\ud83d\ude00"],"total":true,"query":5,"expires":100,"generation":"\u00e9\n\"","s\u006frt":["x"]}"#,
+            );
+            let record = b"1\n100\n1\n50\n4\n\xc3\xa9\n\"s1\nx";
+            assert_eq!(words, vec![0, 1, 100, 1, xxh64(record)]);
+            for rejected in [
+                r#"{"sort":1,"expires":500}"#,
+                r#"[1]"#,
+                "5",
+                r#"{"sort":[],"expires":99}"#,
+                "null",
+                r#"{"sort":null}"#,
+                " 1.5 ",
+            ] {
+                assert_eq!(decode(rejected), vec![2, 0, 0, 0, 0], "{rejected}");
+            }
+            for patched in [
+                "",
+                "{",
+                r#"{"sort":[1.5],"expires":500}"#,
+                r#"{"sort":{"a":1},"expires":500}"#,
+                r#"{"sort":[[1]],"expires":500}"#,
+                r#"{"sort":[],"expires":" 500"}"#,
+                r#"{"sort":[],"expires":"5e2"}"#,
+                r#"{"sort":[],"expires":"1234567890123456789"}"#,
+                r#"{"sort":[],"expires":"\u0035"}"#,
+                r#"{"sort":[],"expires":500,"query":[]}"#,
+                r#"{"sort":["\ud800"]}"#,
+                r#"{"sort":[01]}"#,
+                "{\"sort\":[\"\x01\"]}",
+                r#"{"sort":[],"expires":500} x"#,
+                r#"{"sort":[],"expires":1e3}"#,
+                r#"{"sort":[9223372036854775808],"expires":500}"#,
+            ] {
+                assert_eq!(decode(patched), vec![PATCH, 0, 0, 0, 0], "{patched}");
+            }
+            assert_eq!(
+                decode(r#"{"sort":[],"expires":500,"x":{"y":[1]}}"#)[0],
+                PATCH
+            );
+            assert_eq!(decode(r#"{"sort":[],"expires":500,"x":{"y":1}}"#)[0], 0);
+            // Plain numeric strings cast like PHP's `(int)`.
+            assert_eq!(
+                decode(r#"{"sort":[],"expires":"0500","total":"-07"}"#),
+                vec![0, -7, 500, 0, xxh64(b"-7\n500\n0\n0\n0\n")]
+            );
+            assert_eq!(
+                call(entry, 2, b"{}\0[]", &[0]).unwrap(),
+                vec![0, 2, 0, 0, 0, 0, 2, 0, 0, 0, 0]
+            );
+            assert_eq!(call(entry, 1, b"{}", &[]), Err(DECLINE));
+        }
+
+        #[test]
+        fn w505_cursor_unescape_matches_expected_bytes() {
+            let mut out = Vec::new();
+            unescape(&mut out, br#"a\"\\\/\b\f\n\r\t\u00e9\ud83d\ude00"#);
+            assert_eq!(out, "a\"\\/\u{8}\u{c}\n\r\t\u{e9}\u{1f600}".as_bytes());
+        }
+
+        #[test]
+        fn w505_failure_window_matches_php_rules() {
+            let entry: Entry = nntmux_w505_search_failure_window;
+            let words = call(
+                entry,
+                5,
+                b"",
+                &[
+                    3,
+                    1_000,
+                    60,
+                    0,
+                    2,
+                    3,
+                    5,
+                    -4,
+                    0,
+                    2,
+                    0,
+                    5,
+                    0,
+                    0,
+                    0,
+                    970,
+                    900,
+                    i64::MIN,
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                words,
+                vec![
+                    0,
+                    0,
+                    1 << 5,
+                    0,
+                    1 | 2 | 1 << 2,
+                    30,
+                    2 | 2 << 2 | 1 << 4 | 1 << 5,
+                    0,
+                    1,
+                    0
+                ]
+            );
+            // A non-positive threshold never trips reachedThreshold but clamps to 1.
+            let words = call(entry, 1, b"", &[0, 10, -5, 1, 1, 20]).unwrap();
+            assert_eq!(words, vec![2 << 2 | 1 << 4 | 1 << 5, 0]);
+            assert_eq!(call(entry, 1, b"x", &[0, 10, 5, 1, 1, 20]), Err(DECLINE));
+            assert_eq!(call(entry, 1, b"", &[0, 10, 5, 1, 1]), Err(DECLINE));
+        }
+
+        #[test]
+        fn w505_abi_guards_pointers_capacity_and_overlap() {
+            let entries: [(Entry, &[u8], Vec<i64>); 5] = [
+                (nntmux_w505_redis_probe_outcome, b"PONG", vec![0, 0, 0, 0]),
+                (nntmux_w505_search_probe_outcome, b"m", vec![0, 1, 0, 0]),
+                (
+                    nntmux_w505_service_probe_registry_resolve,
+                    b"redis",
+                    vec![0],
+                ),
+                (nntmux_w505_search_cursor_decode, b"{}", vec![0]),
+                (
+                    nntmux_w505_search_failure_window,
+                    b"",
+                    vec![1, 0, 0, 0, 0, 0],
+                ),
+            ];
+            for (entry, data, table) in entries {
+                let full = call(entry, 1, data, &table).unwrap();
+                let bytes = pack(&table);
+                let mut small = vec![7i64; 1];
+                let invoke = |out: *mut i64, cap: usize, flags: i64, data_ptr: *const u8| unsafe {
+                    entry(
+                        1,
+                        flags,
+                        data_ptr,
+                        data.len(),
+                        bytes.as_ptr(),
+                        bytes.len(),
+                        out,
+                        cap,
+                    )
+                };
+                let needed = invoke(small.as_mut_ptr(), 1, 0, data.as_ptr());
+                assert_eq!(needed, -(full.len() as i64));
+                assert_eq!(small, vec![7]);
+                assert_eq!(invoke(std::ptr::null_mut(), 0, 0, data.as_ptr()), needed);
+                assert_eq!(invoke(std::ptr::null_mut(), 4, 0, data.as_ptr()), DECLINE);
+                let mut out = vec![0i64; 8];
+                assert_eq!(invoke(out.as_mut_ptr(), 8, 1, data.as_ptr()), DECLINE);
+                if !data.is_empty() {
+                    assert_eq!(invoke(out.as_mut_ptr(), 8, 0, std::ptr::null()), DECLINE);
+                }
+                let misaligned = unsafe { (out.as_mut_ptr() as *mut u8).add(1) as *mut i64 };
+                assert_eq!(invoke(misaligned, 4, 0, data.as_ptr()), DECLINE);
+                // Input inside the output buffer.
+                let mut shared = vec![0i64; 16];
+                let alias = shared.as_ptr() as *const u8;
+                let overlap = unsafe {
+                    entry(
+                        1,
+                        0,
+                        alias,
+                        1,
+                        bytes.as_ptr(),
+                        bytes.len(),
+                        shared.as_mut_ptr(),
+                        16,
+                    )
+                };
+                assert_eq!(overlap, DECLINE);
+                // A ragged int table declines.
+                let ragged = unsafe {
+                    entry(
+                        1,
+                        0,
+                        data.as_ptr(),
+                        data.len(),
+                        bytes.as_ptr(),
+                        bytes.len() - 1,
+                        out.as_mut_ptr(),
+                        8,
+                    )
+                };
+                assert_eq!(ragged, DECLINE);
+            }
+        }
+
+        #[test]
+        fn w505_random_cursor_payloads_never_panic() {
+            let pieces: [&[u8]; 24] = [
+                b"{",
+                b"}",
+                b"[",
+                b"]",
+                b",",
+                b":",
+                b"\"sort\"",
+                b"\"expires\"",
+                b"\"total\"",
+                b"\"query\"",
+                b"1",
+                b"-0",
+                b"1.5",
+                b"\"a\\u00e9\"",
+                b"\"\\ud800\"",
+                b"null",
+                b"true",
+                b" ",
+                b"\"",
+                b"\\",
+                b"9999999999999999999",
+                b"\xff",
+                b"\xc3\xa9",
+                b"e",
+            ];
+            let mut seed = 0x5eed_u64;
+            let mut record = Vec::new();
+            let mut scratch = Vec::new();
+            let jsons: Vec<Vec<u8>> = (0..20_000)
+                .map(|_| {
+                    let mut json = Vec::new();
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    for step in 0..(seed % 14) {
+                        json.extend_from_slice(pieces[((seed >> (step * 4)) % 24) as usize]);
+                    }
+                    json
+                })
+                .collect();
+            let mut parser = JsonParser {
+                input: b"",
+                at: 0,
+                elements: Vec::new(),
+                members: Vec::new(),
+            };
+            for json in &jsons {
+                let _ = cursor_payload(&mut parser, json, 0, &mut record, &mut scratch);
+            }
+        }
+    }
+}

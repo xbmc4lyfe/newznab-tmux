@@ -438,4 +438,181 @@ class RedisProbe implements ServiceProbeInterface
 
         return true;
     }
+
+    public const string W50_FFI_CDEF = 'int64_t nntmux_w505_redis_probe_outcome(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /**
+     * Disabled: the common-path gains stay below 1.5x because the per-record PHP work is cheaper than packing
+     * and decoding the batch (see RustProbesRedisSearchRegistryCursorFailureW50ParityTest::QUALIFICATION).
+     */
+    private const W50_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $w50RustFfi = null;
+
+    private static FFI|false|null $w50Ffi = null;
+
+    private static ?CData $w50Out = null;
+
+    private static int $w50OutCap = 0;
+
+    public static function usesW50RustFfi(): bool
+    {
+        return self::$w50RustFfi ?? self::W50_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the Wave 50.5 batch helper routed to Rust ($enabled) or PHP, then restores the previous
+     * routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW50RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$w50RustFfi;
+        self::$w50RustFfi = $enabled;
+
+        try {
+            return $callback();
+        } finally {
+            self::$w50RustFfi = $previous;
+        }
+    }
+
+    /** PHP `hash('xxh64')` of $value read as a signed big-endian word, as the Rust helper reports it. */
+    private static function w50Digest(string $value): int
+    {
+        /** @var array{1: int} $unpacked */
+        $unpacked = unpack('J', hash('xxh64', $value, true));
+
+        return $unpacked[1];
+    }
+
+    /**
+     * Batch outcome of probe() for many pings. Four words per probe, aligned with $pongs: `[code (0 connected,
+     * 1 unexpected response, 2 unreachable), responseTimeMs, reason length, xxh64(reason)]`, following
+     * evaluatePingResponsePhp() and, for a probe whose ping threw ($errors holds its message),
+     * formatUnreachableResultPhp().
+     *
+     * @param  list<string|bool|null>  $pongs
+     * @param  list<int>  $startNs
+     * @param  list<int>  $endNs
+     * @param  array<int, string>  $errors  probe index => exception message
+     * @return list<int>
+     */
+    public static function probeOutcomeBatch(array $pongs, array $startNs, array $endNs, array $errors = []): array
+    {
+        return self::usesW50RustFfi()
+            ? self::probeOutcomeBatchNative($pongs, $startNs, $endNs, $errors)
+            : self::probeOutcomeBatchPhp($pongs, $startNs, $endNs, $errors);
+    }
+
+    /**
+     * @param  list<string|bool|null>  $pongs
+     * @param  list<int>  $startNs
+     * @param  list<int>  $endNs
+     * @param  array<int, string>  $errors
+     * @return list<int>
+     */
+    public static function probeOutcomeBatchPhp(array $pongs, array $startNs, array $endNs, array $errors = []): array
+    {
+        static $connected = null;
+        static $unexpected = null;
+        $connected ??= self::w50Digest('Connected');
+        $unexpected ??= self::w50Digest('Redis ping returned unexpected response');
+        $out = [];
+        foreach ($pongs as $i => $pong) {
+            if (isset($errors[$i])) {
+                $reason = 'Redis unreachable: '.Str::limit($errors[$i], 120);
+                array_push($out, 2, 0, \strlen($reason), self::w50Digest($reason));
+
+                continue;
+            }
+            $elapsed = (int) (($endNs[$i] - $startNs[$i]) / 1_000_000);
+            if ($pong === true || $pong === '+PONG' || strtoupper((string) $pong) === 'PONG') {
+                array_push($out, 0, $elapsed, 9, $connected);
+            } else {
+                array_push($out, 1, $elapsed, 39, $unexpected);
+            }
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, the columns differ in length or a value holds
+     * a NUL byte, and computes non-ASCII errors and overflowing timings with PHP.
+     *
+     * @param  list<string|bool|null>  $pongs
+     * @param  list<int>  $startNs
+     * @param  list<int>  $endNs
+     * @param  array<int, string>  $errors
+     * @return list<int>
+     */
+    public static function probeOutcomeBatchNative(array $pongs, array $startNs, array $endNs, array $errors = []): array
+    {
+        $count = \count($pongs);
+        if ($count === 0 || \count($startNs) !== $count || \count($endNs) !== $count || ! array_is_list($pongs)) {
+            return self::probeOutcomeBatchPhp($pongs, $startNs, $endNs, $errors);
+        }
+        // NUL-delimited pongs then errors; true pongs travel as indices because implode() renders them "1".
+        $trues = array_keys($pongs, true, true);
+        $data = $errors === [] ? implode("\0", $pongs) : implode("\0", $pongs)."\0".implode("\0", $errors);
+        $words = self::w50Words($count, $data, pack('P*', \count($errors), \count($trues), ...$trues, ...$startNs, ...$endNs, ...array_keys($errors)), 4 * $count, $patches);
+        if ($words === null) {
+            return self::probeOutcomeBatchPhp($pongs, $startNs, $endNs, $errors);
+        }
+        if ($patches > 0) {
+            foreach (array_keys($words, -1, true) as $key) {
+                if ($key % 4 === 0) {
+                    $i = intdiv($key, 4);
+                    [$words[$key], $words[$key + 1], $words[$key + 2], $words[$key + 3]] = self::probeOutcomeBatchPhp([$pongs[$i]], [$startNs[$i]], [$endNs[$i]], isset($errors[$i]) ? [$errors[$i]] : []);
+                }
+            }
+        }
+
+        return $words;
+    }
+
+    /**
+     * Exactly $words output words from the Wave 50.5 Rust helper, or null to fall back to PHP. The helper
+     * leads with the number of rows PHP must compute, returned in $patches.
+     *
+     * @return list<int>|null
+     */
+    private static function w50Words(int $count, string $data, string $ints, int $words, ?int &$patches = null): ?array
+    {
+        if (self::$w50Ffi === null) {
+            $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+            self::$w50Ffi = RustPipelineLibrary::resolveDomain('search_w50', self::W50_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+            self::$w50Out = null;
+            self::$w50OutCap = 0;
+        }
+        $ffi = self::$w50Ffi;
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+
+        try {
+            if (self::$w50Out === null || $words >= self::$w50OutCap) {
+                $cap = max(1024, $words + 1);
+                self::$w50Out = $ffi->new('int64_t['.$cap.']');
+                self::$w50OutCap = $cap;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w505_redis_probe_outcome($count, 0, $data, \strlen($data), $ints, \strlen($ints), self::$w50Out, self::$w50OutCap);
+            if ($written !== $words + 1) {
+                return null;
+            }
+            $patches = self::$w50Out[0];
+            /** @var array<int, int>|false $values */
+            $values = unpack('P*', FFI::string(self::$w50Out, $written * 8), 8);
+
+            return \is_array($values) ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }

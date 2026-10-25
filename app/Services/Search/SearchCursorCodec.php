@@ -7,6 +7,7 @@ namespace App\Services\Search;
 use App\Services\Search\DTO\SearchCursor;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Contracts\Encryption\DecryptException;
 use Illuminate\Contracts\Encryption\Encrypter;
 use InvalidArgumentException;
@@ -315,5 +316,193 @@ final readonly class SearchCursorCodec
         }
 
         return null;
+    }
+
+    public const string W50_FFI_CDEF = 'int64_t nntmux_w505_search_cursor_decode(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W50.5 parity test's QUALIFICATION). */
+    private const W50_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 50.5 state; readonly classes cannot declare static properties. Ops: null reads the toggle, `set`
+     * stores it and returns the previous value, `ffi` reads and `setFfi` replaces the cached library handle
+     * (null re-resolves, false disables), and `words` runs the Rust helper for `[count, data, ints, words]`,
+     * returning `[rows PHP must compute, exactly that many output words]` or null.
+     */
+    private static function w50RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $cap = 0;
+
+        switch ($op) {
+            case null:
+                return $enabled;
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'ffi':
+                return $ffi;
+            case 'setFfi':
+                $ffi = $val;
+                $out = null;
+                $cap = 0;
+
+                return null;
+        }
+
+        /** @var array{int, string, string, int} $val */
+        [$count, $data, $ints, $words] = $val;
+        if ($ffi === null) {
+            $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+            $ffi = RustPipelineLibrary::resolveDomain('search_w50', self::W50_FFI_CDEF, is_string($path) && $path !== '' ? $path : null) ?? false;
+            $out = null;
+            $cap = 0;
+        }
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+
+        try {
+            if (! $out instanceof CData || $words >= $cap) {
+                $cap = max(1024, $words + 1);
+                $out = $ffi->new('int64_t['.$cap.']');
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w505_search_cursor_decode($count, 0, $data, strlen($data), $ints, strlen($ints), $out, $cap);
+            if ($written !== $words + 1) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('P*', FFI::string($out, $written * 8), 8);
+
+            return is_array($values) ? [$out[0], array_values($values)] : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    public static function usesW50RustFfi(): bool
+    {
+        $enabled = self::w50RustFfiState();
+
+        return is_bool($enabled) ? $enabled : self::W50_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with decodePayloadBatch() routed to Rust ($enabled) or PHP, then restores the previous
+     * routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW50RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w50RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w50RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Decodes many decrypted cursor payloads with the rules of decodePayloadPhp() at $now. Five words per
+     * payload: `[status, total, expires, sort width, xxh64(record)]`; status 0 accepts the payload, 1 is
+     * malformed JSON, 2 an invalid shape or an expired cursor and 3 an array query/driver/generation (which
+     * PHP's string cast rejects); rejected payloads have four zero words. The record is `total\nexpires\n`,
+     * then query, driver and generation as `length\nbytes`, then each sort value as `i<int>\n`,
+     * `s<length>\n<bytes>` or `x<var_export()>\n`.
+     *
+     * @param  list<string>  $payloads
+     * @return list<int>
+     */
+    public static function decodePayloadBatch(array $payloads, int $now): array
+    {
+        return self::usesW50RustFfi() ? self::decodePayloadBatchNative($payloads, $now) : self::decodePayloadBatchPhp($payloads, $now);
+    }
+
+    /**
+     * @param  list<string>  $payloads
+     * @return list<int>
+     */
+    public static function decodePayloadBatchPhp(array $payloads, int $now): array
+    {
+        $out = [];
+        foreach ($payloads as $json) {
+            try {
+                $payload = json_decode($json, true, flags: JSON_THROW_ON_ERROR);
+            } catch (\JsonException) {
+                array_push($out, 1, 0, 0, 0, 0);
+
+                continue;
+            }
+            if (! is_array($payload) || ! is_array($payload['sort'] ?? null) || ($expires = (int) ($payload['expires'] ?? 0)) < $now) {
+                array_push($out, 2, 0, 0, 0, 0);
+
+                continue;
+            }
+            $query = $payload['query'] ?? '';
+            $driver = $payload['driver'] ?? '';
+            $generation = $payload['generation'] ?? '';
+            if (is_array($query) || is_array($driver) || is_array($generation)) {
+                array_push($out, 3, 0, 0, 0, 0);
+
+                continue;
+            }
+            $total = (int) ($payload['total'] ?? 0);
+            $query = (string) $query;
+            $driver = (string) $driver;
+            $generation = (string) $generation;
+            $record = $total."\n".$expires."\n".strlen($query)."\n".$query.strlen($driver)."\n".$driver.strlen($generation)."\n".$generation;
+            foreach ($payload['sort'] as $value) {
+                $record .= match (true) {
+                    is_int($value) => 'i'.$value."\n",
+                    is_string($value) => 's'.strlen($value)."\n".$value,
+                    default => 'x'.var_export($value, true)."\n",
+                };
+            }
+            /** @var array{1: int} $digest */
+            $digest = unpack('J', hash('xxh64', $record, true));
+            array_push($out, 0, $total, $expires, count($payload['sort']), $digest[1]);
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or a payload holds a NUL byte, and decodes
+     * payloads outside the Rust JSON subset (malformed JSON, floats, nested values, non-integer casts) with PHP.
+     *
+     * @param  list<string>  $payloads
+     * @return list<int>
+     */
+    public static function decodePayloadBatchNative(array $payloads, int $now): array
+    {
+        $count = count($payloads);
+        if ($count === 0 || ! array_is_list($payloads)) {
+            return self::decodePayloadBatchPhp($payloads, $now);
+        }
+        /** @var array{int, list<int>}|null $result */
+        $result = self::w50RustFfiState('words', [$count, implode("\0", $payloads), pack('P', $now), 5 * $count]);
+        if ($result === null) {
+            return self::decodePayloadBatchPhp($payloads, $now);
+        }
+        [$patches, $words] = $result;
+        if ($patches > 0) {
+            foreach (array_keys($words, -1, true) as $key) {
+                if ($key % 5 === 0) {
+                    [$words[$key], $words[$key + 1], $words[$key + 2], $words[$key + 3], $words[$key + 4]] = self::decodePayloadBatchPhp([$payloads[intdiv($key, 5)]], $now);
+                }
+            }
+        }
+
+        return $words;
     }
 }
