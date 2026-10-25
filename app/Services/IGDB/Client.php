@@ -7,6 +7,7 @@ namespace App\Services\IGDB;
 use App\Services\IGDB\Exceptions\IgdbHttpException;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Http;
 use Throwable;
@@ -648,5 +649,218 @@ class Client
         } catch (Throwable) {
             return null;
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 54.4 batch helper
+    // ---------------------------------------------------------------------
+
+    /** Enabled: minimum of three paired runs cleared every 1.5x gate (common mean 2.85x, p99 1.85x; uncommon mean 2.79x, p99 2.02x); see RustXxxPipeIgdbClientCompanyGamePlatformW54ParityTest. */
+    private const bool W54_RUST_FFI_DEFAULT = true;
+
+    public const string W54_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w544_igdb_request_row_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** W47_ENDPOINTS keys by code. */
+    private const array W54_ENDPOINT_CODES = ['age_ratings' => 1, 'alternative_names' => 2, 'artworks' => 3, 'collections' => 4, 'companies' => 5, 'covers' => 6, 'external_games' => 7, 'franchises' => 8, 'game_modes' => 9, 'game_videos' => 10, 'games' => 11, 'genres' => 12, 'involved_companies' => 13, 'multiquery' => 14, 'platform_logos' => 15, 'platforms' => 16, 'release_dates' => 17, 'screenshots' => 18, 'search' => 19, 'themes' => 20, 'websites' => 21];
+
+    private const string W54_ENDPOINT_TRIM = " \t\n\r\0\x0B/";
+
+    /**
+     * summarizeRequestBatchPhp() per request instead of as totals. Each (endpoint, expires_in,
+     * status) yields four words: the endpoint trimmed of whitespace and slashes as a span
+     * (offset << 32 | length), its flags (W47_ENDPOINTS code 1-21, else 0 | 32 empty | 64 nested
+     * | 128 outside [a-z0-9_/]), computeTokenTtl() of a strict 1-9 digit expires_in (else 3600)
+     * and the status as class (rate_limited 1, server 2, client 3, success 4, other 0) | 16 when
+     * retryable | the 100-999 code (else 0) << 8.
+     *
+     * @param  list<string>  $endpoints
+     * @param  list<string>  $expiresIn
+     * @param  list<int>  $statuses
+     * @return list<int>
+     */
+    public static function requestRowBatch(array $endpoints, array $expiresIn, array $statuses): array
+    {
+        return self::usesW54RustFfi()
+            ? self::requestRowBatchNative($endpoints, $expiresIn, $statuses)
+            : self::requestRowBatchPhp($endpoints, $expiresIn, $statuses);
+    }
+
+    /**
+     * @param  list<string>  $endpoints
+     * @param  list<string>  $expiresIn
+     * @param  list<int>  $statuses
+     * @return list<int>
+     */
+    public static function requestRowBatchNative(array $endpoints, array $expiresIn, array $statuses): array
+    {
+        $count = self::w54AssertColumns($endpoints, $expiresIn, $statuses);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w54Call(implode("\0", $endpoints)."\0".implode("\0", $expiresIn), pack('P*', ...$statuses), $count, 4)
+            ?? self::requestRowBatchPhp($endpoints, $expiresIn, $statuses);
+    }
+
+    /**
+     * @param  list<string>  $endpoints
+     * @param  list<string>  $expiresIn
+     * @param  list<int>  $statuses
+     * @return list<int>
+     */
+    public static function requestRowBatchPhp(array $endpoints, array $expiresIn, array $statuses): array
+    {
+        self::w54AssertColumns($endpoints, $expiresIn, $statuses);
+        $out = [];
+        foreach ($endpoints as $i => $endpoint) {
+            $trimmed = trim($endpoint, self::W54_ENDPOINT_TRIM);
+            $flags = $trimmed === ''
+                ? 32
+                : (self::W54_ENDPOINT_CODES[$trimmed] ?? 0)
+                    | (str_contains($trimmed, '/') ? 64 : 0)
+                    | (strspn($trimmed, 'abcdefghijklmnopqrstuvwxyz0123456789_/') !== \strlen($trimmed) ? 128 : 0);
+            $expires = $expiresIn[$i];
+            $seconds = \strlen($expires) <= 9 && ctype_digit($expires) ? (int) $expires : 3600;
+            $status = $statuses[$i];
+            $code = $status >= 100 && $status <= 999 ? $status : 0;
+            $class = intdiv($code, 100);
+            $category = $code === 429 ? 1 : match ($class) {
+                5 => 2,
+                4 => 3,
+                2 => 4,
+                default => 0,
+            };
+            $retryable = $code === 0 || $code === 408 || $code === 429 || $class === 5;
+            array_push(
+                $out,
+                strspn($endpoint, self::W54_ENDPOINT_TRIM) << 32 | \strlen($trimmed),
+                $flags,
+                max(60, $seconds - 60),
+                $category | ($retryable ? 16 : 0) | $code << 8,
+            );
+        }
+
+        return $out;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $first
+     * @param  array<array-key, mixed>  $second
+     * @param  array<array-key, mixed>  $third
+     */
+    private static function w54AssertColumns(array $first, array $second, array $third): int
+    {
+        self::w54AssertList($first);
+        self::w54AssertList($second);
+        self::w54AssertList($third);
+        $count = \count($first);
+        if (\count($second) !== $count || \count($third) !== $count) {
+            throw new \InvalidArgumentException('W54 batch columns must have the same length.');
+        }
+
+        return $count;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $values
+     */
+    private static function w54AssertList(array $values): void
+    {
+        if (! array_is_list($values)) {
+            throw new \InvalidArgumentException('W54 batch input must be a list.');
+        }
+    }
+
+    public static function usesW54RustFfi(): bool
+    {
+        $enabled = self::w54RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W54_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W54 batch dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW54RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w54RustFfiState('enabled');
+        self::w54RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w54RustFfiState('enabled', $previous);
+        }
+    }
+
+    /**
+     * One FFI crossing for the batch: NUL-joined text columns and packed int64 columns in,
+     * `$words` int64 words back per record. Null when the library is missing or declines
+     * (a value holding a NUL byte adds a field, which the export rejects).
+     *
+     * @return list<int>|null
+     */
+    private static function w54Call(string $text, string $ints, int $count, int $words): ?array
+    {
+        try {
+            $state = self::w54RustFfiState();
+            $ffi = $state['ffi'] ?? null;
+            if ($ffi === null) {
+                $ffi = RustPipelineLibrary::resolveDomain('metadata_w54', self::W54_FFI_CDEF) ?? false;
+                self::w54RustFfiState('ffi', $ffi);
+            }
+            if (! $ffi instanceof FFI) {
+                return null;
+            }
+            $need = $count * $words;
+            $out = $state['out'] ?? null;
+            $cap = $state['cap'] ?? 0;
+            if (! $out instanceof CData || ! \is_int($cap) || $cap < $need) {
+                $cap = max(1024, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w54RustFfiState('out', $out);
+                self::w54RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W54_FFI_CDEF.)
+            $written = $ffi->nntmux_w544_igdb_request_row_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, $cap);
+            if ($written !== $need) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $need * 8));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * W54 routing override and cached binding plus reusable output buffer, kept in a function
+     * static: no arguments returns the state, one argument reads a key ('reset' clears
+     * everything) and two arguments write a key.
+     */
+    private static function w54RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+        }
+
+        return $state[$op] ?? null;
     }
 }
