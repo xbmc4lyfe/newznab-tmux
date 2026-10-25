@@ -28743,3 +28743,812 @@ pub mod predb_match_exception_identity_transactions {
         }
     }
 }
+/// Wave 39.3: second-pass pure planning/summary helpers for `ForwardVerifiedPublications`,
+/// `ReleaseVerificationBarrier`, `ReleaseVerificationPublicationBatchController`,
+/// `ReleaseVerificationPublicationController` and `MiscPipe`.
+///
+/// Outputs are `0x1F`-separated fields (always at least five, so a result never collides with
+/// DECLINE). String lists arrive as one concatenated blob plus packed little-endian `u32` lengths;
+/// integer lists as packed little-endian `i64`. Unknown flag bits, null pointers, oversized or
+/// inconsistent inputs and output buffers overlapping an input decline with `-1` so PHP keeps its
+/// own implementation. A result that does not fit returns `-required` without touching `out_buf`.
+pub mod verification_barrier_forward_pub_controllers {
+    use std::collections::HashSet;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    pub const DECLINE: isize = -1;
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+    const FIELD_SEP: u8 = 0x1F;
+    /// PHP `trim()` default character set.
+    const TRIM_SET: &[u8] = b" \t\n\r\0\x0B";
+    /// The barrier polls its workers every 200 ms.
+    const BARRIER_POLL_MS: i64 = 200;
+    const MAX_RETRY_AFTER: i64 = 3600;
+    const HASH_MIN_LENGTH: usize = 16;
+    const IDEMPOTENT_REPLAY: u32 = 1;
+    const REPLAY_METRIC_OFFSET: i64 = 16;
+    const UNKNOWN_METRIC_CODE: i64 = 255;
+
+    /// Publication outcome codes, in `ReleaseVerificationPublicationController::PUBLICATION_OUTCOME_CODES` order:
+    /// (label, HTTP status, retryable).
+    const OUTCOMES: [(&[u8], i64, bool); 10] = [
+        (b"published", 200, false),
+        (b"filtered", 200, false),
+        (b"metadata_review", 200, false),
+        (b"deferred", 409, true),
+        (b"stale", 409, false),
+        (b"paused", 409, true),
+        (b"retry", 409, true),
+        (b"invalid", 409, false),
+        (b"error", 409, false),
+        (b"unresolved", 200, false),
+    ];
+
+    unsafe fn valid_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null()
+            || len > MAX_INPUT
+            || len > isize::MAX as usize
+            || (ptr as usize).checked_add(len).is_none()
+        {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn valid_out_buf(out_buf: *mut u8, out_cap: usize) -> bool {
+        !out_buf.is_null()
+            && out_cap <= isize::MAX as usize
+            && (out_buf as usize).checked_add(out_cap).is_some()
+    }
+
+    /// Whether `[a, a + a_len)` and `[b, b + b_len)` share a byte (empty ranges never do).
+    #[inline]
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> bool {
+        if a_len == 0 || b_len == 0 {
+            return false;
+        }
+        match (a.checked_add(a_len), b.checked_add(b_len)) {
+            (Some(a_end), Some(b_end)) => a < b_end && b < a_end,
+            _ => true,
+        }
+    }
+
+    /// Copies `bytes` into `out_buf`, returning the length or `-required` when it does not fit.
+    unsafe fn write_bytes(bytes: &[u8], out_buf: *mut u8, out_cap: usize) -> isize {
+        if bytes.len() > isize::MAX as usize {
+            return DECLINE;
+        }
+        if bytes.len() > out_cap {
+            return -(bytes.len() as isize);
+        }
+        if !bytes.is_empty() {
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len()) };
+        }
+        bytes.len() as isize
+    }
+
+    struct Fields(Vec<u8>);
+
+    impl Fields {
+        fn new(capacity: usize) -> Self {
+            Fields(Vec::with_capacity(capacity))
+        }
+
+        fn raw(&mut self, value: &[u8]) -> &mut Self {
+            if !self.0.is_empty() {
+                self.0.push(FIELD_SEP);
+            }
+            self.0.extend_from_slice(value);
+            self
+        }
+
+        fn int(&mut self, value: i64) -> &mut Self {
+            let mut digits = [0u8; 20];
+            self.raw(decimal(value, &mut digits))
+        }
+
+        fn flag(&mut self, value: bool) -> &mut Self {
+            self.raw(if value { b"1" } else { b"0" })
+        }
+    }
+
+    /// Allocation-free decimal rendering of `value` into `buf`.
+    fn decimal(value: i64, buf: &mut [u8; 20]) -> &[u8] {
+        let mut n = value.unsigned_abs();
+        let mut i = buf.len();
+        loop {
+            i -= 1;
+            buf[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        if value < 0 {
+            i -= 1;
+            buf[i] = b'-';
+        }
+        &buf[i..]
+    }
+
+    /// Splits `blob` by packed little-endian `u32` lengths; the lengths must cover it exactly.
+    fn split_blob<'a>(blob: &'a [u8], lens: &[u8]) -> Option<Vec<&'a [u8]>> {
+        if !lens.len().is_multiple_of(4) {
+            return None;
+        }
+        let mut out = Vec::with_capacity(lens.len() / 4);
+        let mut offset = 0usize;
+        for chunk in lens.as_chunks::<4>().0 {
+            let len = u32::from_le_bytes(*chunk) as usize;
+            let end = offset.checked_add(len)?;
+            if end > blob.len() {
+                return None;
+            }
+            out.push(&blob[offset..end]);
+            offset = end;
+        }
+        (offset == blob.len()).then_some(out)
+    }
+
+    /// PHP `trim($value)` with its default character set.
+    fn trim_default(value: &[u8]) -> &[u8] {
+        let start = value
+            .iter()
+            .position(|b| !TRIM_SET.contains(b))
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|b| !TRIM_SET.contains(b))
+            .map_or(start, |i| i + 1);
+        &value[start..end]
+    }
+
+    /// `ForwardVerifiedPublications::summarizeForwardingCyclePhp()`.
+    pub fn forwarding_cycle(statuses: &[&[u8]], max_consecutive_failures: i64) -> Vec<u8> {
+        let (mut forwarded, mut duplicates, mut settled, mut transient, mut failures) =
+            (0i64, 0i64, 0i64, 0i64, 0i64);
+        let (mut streak, mut longest) = (0i64, 0i64);
+        for status in statuses {
+            let failed = match *status {
+                b"published" => {
+                    forwarded += 1;
+                    false
+                }
+                b"stale" => {
+                    duplicates += 1;
+                    false
+                }
+                b"filtered" | b"metadata_review" | b"unresolved" | b"no_release" | b"deferred" => {
+                    settled += 1;
+                    false
+                }
+                b"transport" | b"paused" | b"retry" => {
+                    transient += 1;
+                    true
+                }
+                _ => {
+                    failures += 1;
+                    true
+                }
+            };
+            if failed {
+                streak += 1;
+                longest = longest.max(streak);
+            } else {
+                streak = 0;
+            }
+        }
+        let halt = max_consecutive_failures > 0 && streak >= max_consecutive_failures;
+        let mut out = Fields::new(64);
+        out.int(statuses.len() as i64)
+            .int(forwarded)
+            .int(duplicates)
+            .int(settled)
+            .int(transient)
+            .int(failures)
+            .int(streak)
+            .int(longest)
+            .flag(halt);
+        out.0
+    }
+
+    /// `ReleaseVerificationBarrier::evaluateBarrierReleaseQuorumPhp()`.
+    pub fn barrier_quorum(
+        total: i64,
+        ready: i64,
+        failed: i64,
+        elapsed_ms: i64,
+        timeout_ms: i64,
+    ) -> Vec<u8> {
+        let total = total.max(0);
+        let ready = ready.clamp(0, total);
+        let failed = failed.clamp(0, total - ready);
+        let elapsed = elapsed_ms.max(0);
+        let timeout = timeout_ms.max(0);
+        let pending = total - ready - failed;
+        let has_failed = failed > 0;
+        let quorum = !has_failed && pending == 0;
+        let timed_out = !quorum && elapsed >= timeout;
+        let state: &[u8] = if has_failed {
+            b"failed"
+        } else if quorum {
+            b"quorum"
+        } else if timed_out {
+            b"timed_out"
+        } else {
+            b"waiting"
+        };
+        let wait = if state == b"waiting" {
+            BARRIER_POLL_MS.min(timeout - elapsed)
+        } else {
+            0
+        };
+        let mut out = Fields::new(64);
+        out.int(total)
+            .int(ready)
+            .int(failed)
+            .int(pending)
+            .flag(quorum)
+            .flag(timed_out)
+            .flag(has_failed)
+            .int(wait)
+            .raw(state);
+        out.0
+    }
+
+    /// `ReleaseVerificationPublicationBatchController::summarizeBatchEnvelopeValidationPhp()`;
+    /// `ids` holds each item's claim ID, zero for a malformed item.
+    pub fn batch_envelope(ids: &[i64], max_batch_items: i64) -> Vec<u8> {
+        let max = max_batch_items.max(1);
+        let mut seen: HashSet<i64> = HashSet::with_capacity(ids.len());
+        let (mut malformed, mut duplicates) = (0i64, 0i64);
+        for &id in ids {
+            if id < 1 {
+                malformed += 1;
+            } else if !seen.insert(id) {
+                duplicates += 1;
+            }
+        }
+        let total = ids.len() as i64;
+        let valid = total - malformed;
+        let oversized = total > max;
+        let accepted = if oversized { 0 } else { valid - duplicates };
+        let mut out = Fields::new(64);
+        out.int(total)
+            .int(valid)
+            .int(duplicates)
+            .int(malformed)
+            .flag(oversized)
+            .int(accepted)
+            .int(max);
+        out.0
+    }
+
+    /// `ReleaseVerificationPublicationController::classifyPublicationResponseCodePhp()`.
+    pub fn publication_response(outcome_code: i64, replay: bool, retry_after: i64) -> Vec<u8> {
+        let mut out = Fields::new(48);
+        let Some(&(label, status, retryable)) = usize::try_from(outcome_code)
+            .ok()
+            .and_then(|code| OUTCOMES.get(code))
+        else {
+            out.int(500)
+                .int(0)
+                .flag(false)
+                .int(UNKNOWN_METRIC_CODE)
+                .flag(false)
+                .raw(b"unknown");
+            return out.0;
+        };
+        let idempotent = replay && status == 200;
+        let retry = if retryable {
+            retry_after.clamp(1, MAX_RETRY_AFTER)
+        } else {
+            0
+        };
+        out.int(status)
+            .int(retry)
+            .flag(idempotent)
+            .int(outcome_code + if idempotent { REPLAY_METRIC_OFFSET } else { 0 })
+            .flag(true)
+            .raw(label);
+        if idempotent {
+            out.0.extend_from_slice(b"_replay");
+        }
+        out.0
+    }
+
+    /// `MiscPipe::summarizeMiscPipeDecisionMetricsPhp()`.
+    pub fn misc_pipe_metrics(subjects: &[&[u8]], min_length: i64) -> Vec<u8> {
+        let (mut too_short, mut hash_like, mut upper_heavy) = (0i64, 0i64, 0i64);
+        for subject in subjects {
+            let trimmed = trim_default(subject);
+            if (trimmed.len() as i64) < min_length {
+                too_short += 1;
+                continue;
+            }
+            if trimmed.len() >= HASH_MIN_LENGTH && trimmed.iter().all(u8::is_ascii_hexdigit) {
+                hash_like += 1;
+                continue;
+            }
+            let (mut letters, mut upper) = (0usize, 0usize);
+            for &b in trimmed {
+                if b.is_ascii_uppercase() {
+                    upper += 1;
+                    letters += 1;
+                } else if b.is_ascii_lowercase() {
+                    letters += 1;
+                }
+            }
+            if letters >= 4 && upper * 10 >= letters * 8 {
+                upper_heavy += 1;
+            }
+        }
+        let total = subjects.len() as i64;
+        let mut out = Fields::new(48);
+        out.int(total)
+            .int(too_short)
+            .int(hash_like)
+            .int(upper_heavy)
+            .int(total - too_short - hash_like);
+        out.0
+    }
+
+    /// # Safety
+    /// `blob_ptr`/`lens_ptr` must be valid for their lengths in readable bytes, and `out_buf` must be
+    /// valid for `out_cap` writable bytes, not overlapping either input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w393_forwarding_cycle_summary(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        max_consecutive_failures: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap)
+                || overlaps(out_buf as usize, out_cap, blob_ptr as usize, blob_len)
+                || overlaps(out_buf as usize, out_cap, lens_ptr as usize, lens_len)
+            {
+                return DECLINE;
+            }
+            let (Some(blob), Some(lens)) = (unsafe { valid_slice(blob_ptr, blob_len) }, unsafe {
+                valid_slice(lens_ptr, lens_len)
+            }) else {
+                return DECLINE;
+            };
+            let Some(statuses) = split_blob(blob, lens) else {
+                return DECLINE;
+            };
+            unsafe {
+                write_bytes(
+                    &forwarding_cycle(&statuses, max_consecutive_failures),
+                    out_buf,
+                    out_cap,
+                )
+            }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// # Safety
+    /// `out_buf` must be valid for `out_cap` writable bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w393_barrier_release_quorum(
+        total: i64,
+        ready: i64,
+        failed: i64,
+        elapsed_ms: i64,
+        timeout_ms: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            unsafe {
+                write_bytes(
+                    &barrier_quorum(total, ready, failed, elapsed_ms, timeout_ms),
+                    out_buf,
+                    out_cap,
+                )
+            }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// # Safety
+    /// `ids_ptr` must be valid for `ids_len` readable bytes (packed little-endian `i64`), and
+    /// `out_buf` must be valid for `out_cap` writable bytes, not overlapping the input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w393_batch_envelope_summary(
+        ids_ptr: *const u8,
+        ids_len: usize,
+        max_batch_items: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap)
+                || overlaps(out_buf as usize, out_cap, ids_ptr as usize, ids_len)
+                || !ids_len.is_multiple_of(8)
+            {
+                return DECLINE;
+            }
+            let Some(raw) = (unsafe { valid_slice(ids_ptr, ids_len) }) else {
+                return DECLINE;
+            };
+            let ids: Vec<i64> = raw
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| i64::from_le_bytes(*c))
+                .collect();
+            unsafe { write_bytes(&batch_envelope(&ids, max_batch_items), out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// # Safety
+    /// `out_buf` must be valid for `out_cap` writable bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w393_publication_response_code(
+        outcome_code: i64,
+        flags: u32,
+        retry_after: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if flags & !IDEMPOTENT_REPLAY != 0 || !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            unsafe {
+                write_bytes(
+                    &publication_response(
+                        outcome_code,
+                        flags & IDEMPOTENT_REPLAY != 0,
+                        retry_after,
+                    ),
+                    out_buf,
+                    out_cap,
+                )
+            }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// # Safety
+    /// `blob_ptr`/`lens_ptr` must be valid for their lengths in readable bytes, and `out_buf` must be
+    /// valid for `out_cap` writable bytes, not overlapping either input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w393_misc_pipe_decision_metrics(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        min_length: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap)
+                || overlaps(out_buf as usize, out_cap, blob_ptr as usize, blob_len)
+                || overlaps(out_buf as usize, out_cap, lens_ptr as usize, lens_len)
+            {
+                return DECLINE;
+            }
+            let (Some(blob), Some(lens)) = (unsafe { valid_slice(blob_ptr, blob_len) }, unsafe {
+                valid_slice(lens_ptr, lens_len)
+            }) else {
+                return DECLINE;
+            };
+            let Some(subjects) = split_blob(blob, lens) else {
+                return DECLINE;
+            };
+            unsafe { write_bytes(&misc_pipe_metrics(&subjects, min_length), out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::ptr;
+
+        fn text(bytes: &[u8]) -> String {
+            String::from_utf8_lossy(bytes).replace('\x1F', "|")
+        }
+
+        fn call(f: impl Fn(*mut u8, usize) -> isize) -> String {
+            let mut buf = vec![0u8; 256];
+            let n = f(buf.as_mut_ptr(), buf.len());
+            assert!(n > 0, "call declined: {n}");
+            text(&buf[..n as usize])
+        }
+
+        fn packed(items: &[&[u8]]) -> (Vec<u8>, Vec<u8>) {
+            let blob = items.concat();
+            let lens = items
+                .iter()
+                .flat_map(|i| (i.len() as u32).to_le_bytes())
+                .collect();
+            (blob, lens)
+        }
+
+        #[test]
+        fn w393_forwarding_cycle_counts_and_streaks() {
+            let statuses: [&[u8]; 9] = [
+                b"published",
+                b"transport",
+                b"error",
+                b"stale",
+                b"filtered",
+                b"paused",
+                b"bogus",
+                b"retry",
+                b"",
+            ];
+            assert_eq!(text(&forwarding_cycle(&statuses, 3)), "9|1|1|1|3|3|4|4|1");
+            assert_eq!(text(&forwarding_cycle(&statuses, 5)), "9|1|1|1|3|3|4|4|0");
+            assert_eq!(text(&forwarding_cycle(&statuses, 0)), "9|1|1|1|3|3|4|4|0");
+            assert_eq!(text(&forwarding_cycle(&[], 3)), "0|0|0|0|0|0|0|0|0");
+            let (blob, lens) = packed(&statuses);
+            let got = call(|b, c| unsafe {
+                nntmux_w393_forwarding_cycle_summary(
+                    blob.as_ptr(),
+                    blob.len(),
+                    lens.as_ptr(),
+                    lens.len(),
+                    3,
+                    b,
+                    c,
+                )
+            });
+            assert_eq!(got, "9|1|1|1|3|3|4|4|1");
+        }
+
+        #[test]
+        fn w393_barrier_quorum_states() {
+            assert_eq!(
+                text(&barrier_quorum(4, 4, 0, 10, 900)),
+                "4|4|0|0|1|0|0|0|quorum"
+            );
+            assert_eq!(
+                text(&barrier_quorum(4, 2, 0, 850, 900)),
+                "4|2|0|2|0|0|0|50|waiting"
+            );
+            assert_eq!(
+                text(&barrier_quorum(4, 2, 0, 10, 900)),
+                "4|2|0|2|0|0|0|200|waiting"
+            );
+            assert_eq!(
+                text(&barrier_quorum(4, 2, 0, 900, 900)),
+                "4|2|0|2|0|1|0|0|timed_out"
+            );
+            assert_eq!(
+                text(&barrier_quorum(4, 2, 9, 0, 900)),
+                "4|2|2|0|0|0|1|0|failed"
+            );
+            assert_eq!(
+                text(&barrier_quorum(-1, 9, 9, -5, -5)),
+                "0|0|0|0|1|0|0|0|quorum"
+            );
+            assert_eq!(
+                text(&barrier_quorum(
+                    i64::MAX,
+                    i64::MIN,
+                    i64::MAX,
+                    i64::MIN,
+                    i64::MAX
+                )),
+                format!("{}|0|{}|0|0|0|1|0|failed", i64::MAX, i64::MAX)
+            );
+            let got =
+                call(|b, c| unsafe { nntmux_w393_barrier_release_quorum(1, 0, 0, 0, 1, b, c) });
+            assert_eq!(got, "1|0|0|1|0|0|0|1|waiting");
+        }
+
+        #[test]
+        fn w393_batch_envelope_counts() {
+            assert_eq!(
+                text(&batch_envelope(&[1, 2, 2, 0, -3, 1], 250)),
+                "6|4|2|2|0|2|250"
+            );
+            assert_eq!(text(&batch_envelope(&[1, 2, 3], 2)), "3|3|0|0|1|0|2");
+            assert_eq!(text(&batch_envelope(&[], i64::MIN)), "0|0|0|0|0|0|1");
+            let raw: Vec<u8> = [5i64, 5, 0].iter().flat_map(|v| v.to_le_bytes()).collect();
+            let got = call(|b, c| unsafe {
+                nntmux_w393_batch_envelope_summary(raw.as_ptr(), raw.len(), 250, b, c)
+            });
+            assert_eq!(got, "3|2|1|1|0|1|250");
+        }
+
+        #[test]
+        fn w393_publication_response_codes() {
+            assert_eq!(
+                text(&publication_response(0, false, 0)),
+                "200|0|0|0|1|published"
+            );
+            assert_eq!(
+                text(&publication_response(0, true, 9)),
+                "200|0|1|16|1|published_replay"
+            );
+            assert_eq!(
+                text(&publication_response(5, true, 0)),
+                "409|1|0|5|1|paused"
+            );
+            assert_eq!(
+                text(&publication_response(3, false, 99999)),
+                "409|3600|0|3|1|deferred"
+            );
+            assert_eq!(
+                text(&publication_response(7, false, 5)),
+                "409|0|0|7|1|invalid"
+            );
+            assert_eq!(
+                text(&publication_response(10, false, 5)),
+                "500|0|0|255|0|unknown"
+            );
+            assert_eq!(
+                text(&publication_response(-1, true, 5)),
+                "500|0|0|255|0|unknown"
+            );
+            assert_eq!(
+                text(&publication_response(i64::MIN, true, i64::MIN)),
+                "500|0|0|255|0|unknown"
+            );
+            let got = call(|b, c| unsafe { nntmux_w393_publication_response_code(6, 1, 30, b, c) });
+            assert_eq!(got, "409|30|0|6|1|retry");
+        }
+
+        #[test]
+        fn w393_misc_pipe_metrics_counts() {
+            let subjects: [&[u8]; 7] = [
+                b"short",
+                b"  0123456789abcdef0123  ",
+                b"THE.MOVIE.NAME.2024",
+                b"Some.Show.S01E02.720p",
+                b"\0\t\n\x0B  ",
+                b"0123456789ABCDEF",
+                b"0123456789abcde",
+            ];
+            assert_eq!(text(&misc_pipe_metrics(&subjects, 8)), "7|2|2|1|3");
+            assert_eq!(text(&misc_pipe_metrics(&subjects, 0)), "7|0|2|1|5");
+            assert_eq!(text(&misc_pipe_metrics(&subjects, i64::MAX)), "7|7|0|0|0");
+            let (blob, lens) = packed(&subjects);
+            let got = call(|b, c| unsafe {
+                nntmux_w393_misc_pipe_decision_metrics(
+                    blob.as_ptr(),
+                    blob.len(),
+                    lens.as_ptr(),
+                    lens.len(),
+                    8,
+                    b,
+                    c,
+                )
+            });
+            assert_eq!(got, "7|2|2|1|3");
+        }
+
+        #[test]
+        fn w393_exports_validate_inputs_and_capacity() {
+            let x = b"x".as_ptr();
+            let lens1 = 1u32.to_le_bytes();
+            unsafe {
+                let mut small = [b'Z'; 4];
+                let needed =
+                    nntmux_w393_barrier_release_quorum(4, 4, 0, 0, 1, small.as_mut_ptr(), 4);
+                assert_eq!(needed, -("4|4|0|0|1|0|0|0|quorum".len() as isize));
+                assert_eq!(small, [b'Z'; 4]);
+                let needed = nntmux_w393_forwarding_cycle_summary(
+                    x,
+                    1,
+                    lens1.as_ptr(),
+                    4,
+                    3,
+                    small.as_mut_ptr(),
+                    0,
+                );
+                assert!(needed < -1);
+                assert_eq!(small, [b'Z'; 4]);
+
+                let mut out = [0u8; 128];
+                let (b, c) = (out.as_mut_ptr(), out.len());
+                // Null output and inputs decline.
+                assert_eq!(
+                    nntmux_w393_barrier_release_quorum(0, 0, 0, 0, 0, ptr::null_mut(), 8),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w393_publication_response_code(0, 0, 0, ptr::null_mut(), 8),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w393_forwarding_cycle_summary(ptr::null(), 0, x, 0, 3, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w393_forwarding_cycle_summary(x, 0, ptr::null(), 0, 3, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w393_misc_pipe_decision_metrics(ptr::null(), 0, x, 0, 8, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w393_batch_envelope_summary(ptr::null(), 0, 8, b, c),
+                    DECLINE
+                );
+                // Unknown flags, ragged lengths and inconsistent blobs decline.
+                assert_eq!(
+                    nntmux_w393_publication_response_code(0, 2, 0, b, c),
+                    DECLINE
+                );
+                assert_eq!(nntmux_w393_batch_envelope_summary(x, 1, 8, b, c), DECLINE);
+                assert_eq!(
+                    nntmux_w393_forwarding_cycle_summary(x, 1, lens1.as_ptr(), 3, 3, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w393_forwarding_cycle_summary(x, 0, lens1.as_ptr(), 4, 3, b, c),
+                    DECLINE
+                );
+                let two = 2u32.to_le_bytes();
+                assert_eq!(
+                    nntmux_w393_misc_pipe_decision_metrics(x, 1, two.as_ptr(), 4, 8, b, c),
+                    DECLINE
+                );
+                let huge = u32::MAX.to_le_bytes();
+                assert_eq!(
+                    nntmux_w393_misc_pipe_decision_metrics(x, 1, huge.as_ptr(), 4, 8, b, c),
+                    DECLINE
+                );
+                // Oversized inputs decline.
+                assert_eq!(
+                    nntmux_w393_misc_pipe_decision_metrics(x, MAX_INPUT + 1, x, 0, 8, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w393_batch_envelope_summary(x, MAX_INPUT + 8, 8, b, c),
+                    DECLINE
+                );
+                // An output buffer overlapping an input declines without writing.
+                let mut shared =
+                    *b"published\x09\0\0\0................................................";
+                let p = shared.as_mut_ptr();
+                assert_eq!(
+                    nntmux_w393_forwarding_cycle_summary(p, 9, p.add(9), 4, 3, p.add(4), 40),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w393_forwarding_cycle_summary(p, 9, p.add(9), 4, 3, p.add(12), 40),
+                    DECLINE
+                );
+                assert_eq!(&shared[..9], b"published");
+                assert!(
+                    nntmux_w393_forwarding_cycle_summary(p, 9, p.add(9), 4, 3, p.add(13), 40) > 0
+                );
+                // Empty lists are valid.
+                assert!(nntmux_w393_forwarding_cycle_summary(x, 0, x, 0, 3, b, c) > 0);
+                assert!(nntmux_w393_misc_pipe_decision_metrics(x, 0, x, 0, 8, b, c) > 0);
+                assert!(nntmux_w393_batch_envelope_summary(x, 0, 8, b, c) > 0);
+            }
+        }
+
+        #[test]
+        fn w393_overlap_helper() {
+            assert!(!overlaps(10, 0, 10, 5));
+            assert!(overlaps(10, 5, 14, 1));
+            assert!(!overlaps(10, 5, 15, 1));
+            assert!(overlaps(usize::MAX, 2, 0, 1));
+        }
+    }
+}

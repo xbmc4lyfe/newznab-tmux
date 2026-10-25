@@ -15,6 +15,8 @@ use App\Services\Releases\Verification\RemotePublicationService;
 use App\Services\Releases\Verification\RemoteReleasePublisher;
 use App\Services\Releases\Verification\VerificationResult;
 use App\Services\Releases\Verification\VerificationWorkerLocks;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Console\Command;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Support\Facades\DB;
@@ -66,6 +68,43 @@ class ForwardVerifiedPublications extends Command
     private const bool RUST_FFI_DEFAULT = false;
 
     private static ?bool $useRustFfi = null;
+
+    /**
+     * Wave 39.3 production default stays false: the paired benchmark in
+     * tests/Unit/RustVerificationBarrierForwardPubControllersW39ParityTest.php is below 1.5x.
+     * Named W393 so it stays distinct from this class's existing Rust FFI toggle.
+     */
+    public const bool W393_RUST_FFI_DEFAULT = false;
+
+    public const string W393_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w393_forwarding_cycle_summary(
+            const char *blob_ptr,
+            size_t blob_len,
+            const char *lens_ptr,
+            size_t lens_len,
+            int64_t max_consecutive_failures,
+            char *out_buf,
+            size_t out_cap
+        );
+        C;
+
+    /** How a forwarding cycle counts each item status; any other status is a failure. */
+    public const array FORWARDING_CYCLE_KINDS = [
+        PublicationOutcome::PUBLISHED => 'forwarded',
+        PublicationOutcome::STALE => 'duplicates',
+        PublicationOutcome::FILTERED => 'settled',
+        PublicationOutcome::METADATA_REVIEW => 'settled',
+        PublicationOutcome::UNRESOLVED => 'settled',
+        PublicationOutcome::NO_RELEASE => 'settled',
+        PublicationOutcome::DEFERRED => 'settled',
+        PublicationOutcome::TRANSPORT => 'transient_errors',
+        PublicationOutcome::PAUSED => 'transient_errors',
+        PublicationOutcome::RETRY => 'transient_errors',
+    ];
+
+    private static ?bool $w393RustFfiOverride = null;
+
+    private static FFI|false|null $w393RustFfiHandle = null;
 
     protected $signature = 'releases:forward-verified-publications {--slot=1 : Forwarder number, 1 to RELEASE_VERIFICATION_PUBLISH_FORWARDERS} {--max-seconds=0 : Stop taking work after this duration; zero uses RELEASE_VERIFICATION_PUBLISH_FORWARDER_SECONDS} {--passes=0 : Stop after this many loop passes (zero runs until the deadline)} {--diagnostics : Log a bounded run summary}';
 
@@ -856,5 +895,156 @@ class ForwardVerifiedPublications extends Command
         return DB::table('release_verification_candidates')->where('id', $entry->claim['id'])->where('version', $entry->claim['version'])
             ->where('manifest_hash', $entry->claim['manifest_hash'])->whereIn('status', [PublicationOutcome::FILTERED, PublicationOutcome::METADATA_REVIEW])
             ->whereNull('release_id')->exists();
+    }
+
+    public static function useW393RustFfi(?bool $enabled): void
+    {
+        self::$w393RustFfiOverride = $enabled;
+    }
+
+    public static function usesW393RustFfi(): bool
+    {
+        return self::$w393RustFfiOverride ?? self::W393_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW393RustFfi(): void
+    {
+        self::$w393RustFfiOverride = null;
+        self::$w393RustFfiHandle = null;
+    }
+
+    /**
+     * Summarizes the item statuses of one forwarding cycle, in order: published items were forwarded,
+     * stale ones were already published under another claim, terminal answers are settled, and
+     * transport/paused/retry are transient. Transient errors and failures (any other status) extend
+     * the failure streak; a cycle ending in at least $maxConsecutiveFailures of them (when positive)
+     * recommends halting.
+     *
+     * @param  array<array-key, mixed>  $batchResults
+     * @return array{total: int, forwarded: int, duplicates: int, settled: int, transient_errors: int, failures: int, consecutive_failures: int, longest_failure_streak: int, halt_recommended: bool}
+     */
+    public static function summarizeForwardingCycle(array $batchResults, int $maxConsecutiveFailures = 3): array
+    {
+        return (self::usesW393RustFfi() ? self::summarizeForwardingCycleNative($batchResults, $maxConsecutiveFailures) : null)
+            ?? self::summarizeForwardingCyclePhp($batchResults, $maxConsecutiveFailures);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $batchResults
+     * @return array{total: int, forwarded: int, duplicates: int, settled: int, transient_errors: int, failures: int, consecutive_failures: int, longest_failure_streak: int, halt_recommended: bool}
+     */
+    public static function summarizeForwardingCyclePhp(array $batchResults, int $maxConsecutiveFailures = 3): array
+    {
+        $counts = ['forwarded' => 0, 'duplicates' => 0, 'settled' => 0, 'transient_errors' => 0, 'failures' => 0];
+        $streak = 0;
+        $longest = 0;
+        foreach ($batchResults as $status) {
+            $kind = is_string($status) ? (self::FORWARDING_CYCLE_KINDS[$status] ?? 'failures') : 'failures';
+            $counts[$kind]++;
+            if ($kind === 'transient_errors' || $kind === 'failures') {
+                $longest = max($longest, ++$streak);
+            } else {
+                $streak = 0;
+            }
+        }
+
+        return [
+            'total' => count($batchResults),
+            ...$counts,
+            'consecutive_failures' => $streak,
+            'longest_failure_streak' => $longest,
+            'halt_recommended' => $maxConsecutiveFailures > 0 && $streak >= $maxConsecutiveFailures,
+        ];
+    }
+
+    /**
+     * Declines (null) for non-string statuses so PHP counts them.
+     *
+     * @param  array<array-key, mixed>  $batchResults
+     * @return array{total: int, forwarded: int, duplicates: int, settled: int, transient_errors: int, failures: int, consecutive_failures: int, longest_failure_streak: int, halt_recommended: bool}|null
+     */
+    public static function summarizeForwardingCycleNative(array $batchResults, int $maxConsecutiveFailures = 3): ?array
+    {
+        $lengths = [];
+        foreach ($batchResults as $status) {
+            if (! is_string($status)) {
+                return null;
+            }
+            $lengths[] = strlen($status);
+        }
+        $blob = implode('', $batchResults);
+        $lens = pack('V*', ...$lengths);
+        $fields = self::callW393Native('nntmux_w393_forwarding_cycle_summary', [$blob, strlen($blob), $lens, strlen($lens), $maxConsecutiveFailures], 128, 9, 9);
+        if ($fields === null || ! in_array($fields[8], ['0', '1'], true)) {
+            return null;
+        }
+
+        return [
+            'total' => (int) $fields[0],
+            'forwarded' => (int) $fields[1],
+            'duplicates' => (int) $fields[2],
+            'settled' => (int) $fields[3],
+            'transient_errors' => (int) $fields[4],
+            'failures' => (int) $fields[5],
+            'consecutive_failures' => (int) $fields[6],
+            'longest_failure_streak' => (int) $fields[7],
+            'halt_recommended' => $fields[8] === '1',
+        ];
+    }
+
+    /**
+     * Calls a Wave 39.3 export with the shared scratch buffer, retrying once at the size it asks for.
+     * Returns its fields only when there are exactly $fieldCount and the first $digitFields are decimal.
+     *
+     * @param  list<int|string>  $args  arguments preceding the caller-owned output buffer
+     * @return list<string>|null
+     */
+    private static function callW393Native(string $symbol, array $args, int $minBytes, int $fieldCount, int $digitFields): ?array
+    {
+        $ffi = self::w393RustFfi();
+        if ($ffi === null) {
+            return null;
+        }
+
+        try {
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, $minBytes, $capacity);
+            if ($buffer === null) {
+                return null;
+            }
+            $written = $ffi->$symbol(...[...$args, $buffer, $capacity]);
+            if (is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return null;
+                }
+                $written = $ffi->$symbol(...[...$args, $buffer, $capacity]);
+            }
+            if (! is_int($written) || $written < 0 || $written > $capacity) {
+                return null;
+            }
+            $fields = explode("\x1F", FFI::string($buffer, $written));
+            if (count($fields) !== $fieldCount) {
+                return null;
+            }
+            for ($i = 0; $i < $digitFields; $i++) {
+                if (strlen($fields[$i]) > 19 || ! ctype_digit($fields[$i])) {
+                    return null;
+                }
+            }
+
+            return $fields;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private static function w393RustFfi(): ?FFI
+    {
+        if (self::$w393RustFfiHandle === null) {
+            self::$w393RustFfiHandle = RustPipelineLibrary::resolveDomain('categorize_w393', self::W393_FFI_CDEF) ?? false;
+        }
+
+        return self::$w393RustFfiHandle === false ? null : self::$w393RustFfiHandle;
     }
 }
