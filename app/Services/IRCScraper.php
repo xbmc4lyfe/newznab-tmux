@@ -350,6 +350,16 @@ class IRCScraper extends IRCClient
             }
         }
 
+        return self::parseBotMessageFieldsPhp($message);
+    }
+
+    /**
+     * PHP branch of parseBotMessage(): the same captures, request ID and nuke status fields.
+     *
+     * @return array<string, string>|null
+     */
+    protected static function parseBotMessageFieldsPhp(string $message): ?array
+    {
         $hits = self::parseBotMessagePhp($message);
 
         if ($hits === null) {
@@ -636,5 +646,93 @@ class IRCScraper extends IRCClient
                 'files' => '',
                 'filename' => '',
             ];
+    }
+
+    /** Enabled: paired common/uncommon mean and p99 gains reach 1.5x in all nine runs (min 3.12x; see the W44 parity test). */
+    public const bool W441_RUST_FFI_DEFAULT = true;
+
+    public const string W441_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w441_irc_scraper_bot_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private const array W441_SUMMARY_KEYS = ['total_messages', 'empty_message_count', 'bot_message_count', 'request_id_count', 'filename_count', 'nuke_tag_count', 'nuke_status_count', 'update_count'];
+
+    private static ?bool $w441UseRustFfi = null;
+
+    private static FFI|false|null $w441Ffi = null;
+
+    /** Null restores the benchmark default; independent of the IRCClient toggle. */
+    public static function useW441RustFfi(?bool $enable = true): void
+    {
+        self::$w441UseRustFfi = $enable;
+    }
+
+    public static function usesW441RustFfi(): bool
+    {
+        return self::$w441UseRustFfi ?? self::W441_RUST_FFI_DEFAULT;
+    }
+
+    /** Restores the benchmark default and drops the cached library handle; earlier toggles are untouched. */
+    public static function resetW441RustFfi(): void
+    {
+        self::$w441UseRustFfi = null;
+        self::$w441Ffi = null;
+    }
+
+    /**
+     * Summarizes channel messages with parseBotMessageFieldsPhp(): bot announcements, those with a
+     * request ID, a filename, a nuke tag (any accepted variant), a mapped nuke status, and UPD
+     * announcements. Entries come from strings, integers, or the first non-null message, line array
+     * field; other values (including objects) count as empty entries.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeBotMessageBatch(array $rows): array
+    {
+        return self::usesW441RustFfi() ? self::summarizeBotMessageBatchNative($rows) : self::summarizeBotMessageBatchPhp($rows);
+    }
+
+    /**
+     * Rust summary; falls back to PHP when the library or input frame is unusable, a message holds
+     * NUL, or the native matcher exhausts its backtracking budget.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeBotMessageBatchNative(array $rows): array
+    {
+        $values = XrefService::w441Invoke(self::$w441Ffi, self::W441_FFI_CDEF, 'nntmux_w441_irc_scraper_bot_batch', $rows, ['message', 'line'], \count(self::W441_SUMMARY_KEYS));
+
+        return $values === null ? self::summarizeBotMessageBatchPhp($rows) : array_combine(self::W441_SUMMARY_KEYS, $values);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeBotMessageBatchPhp(array $rows): array
+    {
+        $summary = array_fill_keys(self::W441_SUMMARY_KEYS, 0);
+        foreach (XrefService::w441Entries($rows, ['message', 'line']) as $entry) {
+            $summary['total_messages']++;
+            if ($entry === '') {
+                $summary['empty_message_count']++;
+
+                continue;
+            }
+            $hits = self::parseBotMessageFieldsPhp($entry);
+            if ($hits === null) {
+                continue;
+            }
+            $summary['bot_message_count']++;
+            $summary['request_id_count'] += (int) ($hits['req_id'] !== '');
+            $summary['filename_count'] += (int) (($hits['filename'] ?? '') !== '');
+            $summary['nuke_tag_count'] += (int) (($hits['nuked'] ?? '') !== '');
+            $summary['nuke_status_count'] += (int) ($hits['nuke_status'] !== '');
+            $summary['update_count'] += (int) (strncasecmp($entry, 'UPD', 3) === 0);
+        }
+
+        return $summary;
     }
 }

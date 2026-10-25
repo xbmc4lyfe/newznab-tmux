@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Yenc;
 
+use App\Services\XrefService;
 use App\Support\RustPipelineLibrary;
 use FFI;
 use Throwable;
@@ -91,7 +92,8 @@ final readonly class ArticleFrame
         return self::parsePhp($text, $parseTrailerFields);
     }
 
-    private static function parsePhp(string $text, bool $parseTrailerFields = true): ?self
+    /** Pure-PHP reference parser behind parse(); also the YencService Wave 44.1 PHP summary. */
+    public static function parsePhp(string $text, bool $parseTrailerFields = true): ?self
     {
         $offset = 0;
         while (($begin = self::findControl($text, '=ybegin', $offset)) !== false) {
@@ -225,5 +227,104 @@ final readonly class ArticleFrame
         }
 
         return $fields;
+    }
+
+    /** Enabled: paired common/uncommon mean and p99 gains reach 1.5x in all nine runs (min 3.27x; see the W44 parity test). */
+    public const bool W441_RUST_FFI_DEFAULT = true;
+
+    public const string W441_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w441_yenc_article_frame_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private const array W441_SUMMARY_KEYS = ['total_articles', 'empty_article_count', 'frame_count', 'part_line_count', 'header_part_count', 'crc32_trailer_count', 'pcrc32_trailer_count'];
+
+    /** @return array{enabled: ?bool, ffi: FFI|false|null} */
+    private static function &w441State(): array
+    {
+        // Readonly classes cannot declare static properties; a static local holds the toggle.
+        static $state = ['enabled' => null, 'ffi' => null];
+
+        return $state;
+    }
+
+    /** Null restores the benchmark default. */
+    public static function useW441RustFfi(?bool $enable = true): void
+    {
+        $state = &self::w441State();
+        $state['enabled'] = $enable;
+    }
+
+    public static function usesW441RustFfi(): bool
+    {
+        return self::w441State()['enabled'] ?? self::W441_RUST_FFI_DEFAULT;
+    }
+
+    /** Restores the benchmark default and drops the cached library handle; earlier toggles are untouched. */
+    public static function resetW441RustFfi(): void
+    {
+        $state = &self::w441State();
+        $state = ['enabled' => null, 'ffi' => null];
+    }
+
+    /** Cached Wave 44.1 library handle: null before resolution, false when unavailable. */
+    public static function w441Ffi(): FFI|false|null
+    {
+        return self::w441State()['ffi'];
+    }
+
+    /**
+     * Summarizes article texts with parsePhp(): complete frames, frames with an `=ypart` line, a header
+     * `part` field, and trailer `crc32` and `pcrc32` fields.
+     * Entries come from strings, integers, or the first non-null body, text array field; other values
+     * (including objects) count as empty entries.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeArticleFrameBatch(array $rows): array
+    {
+        return self::usesW441RustFfi() ? self::summarizeArticleFrameBatchNative($rows) : self::summarizeArticleFrameBatchPhp($rows);
+    }
+
+    /**
+     * Rust summary; falls back to PHP when the library or input frame is unusable.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeArticleFrameBatchNative(array $rows): array
+    {
+        $state = &self::w441State();
+        $values = XrefService::w441Invoke($state['ffi'], self::W441_FFI_CDEF, 'nntmux_w441_yenc_article_frame_batch', $rows, ['body', 'text'], \count(self::W441_SUMMARY_KEYS));
+
+        return $values === null ? self::summarizeArticleFrameBatchPhp($rows) : array_combine(self::W441_SUMMARY_KEYS, $values);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeArticleFrameBatchPhp(array $rows): array
+    {
+        $summary = array_fill_keys(self::W441_SUMMARY_KEYS, 0);
+        foreach (XrefService::w441Entries($rows, ['body', 'text']) as $entry) {
+            $summary['total_articles']++;
+            if ($entry === '') {
+                $summary['empty_article_count']++;
+
+                continue;
+            }
+            $frame = self::parsePhp($entry);
+            if ($frame === null) {
+                continue;
+            }
+            $summary['frame_count']++;
+            $summary['part_line_count'] += (int) ($frame->part !== null);
+            $summary['header_part_count'] += (int) isset($frame->header['part']);
+            $summary['crc32_trailer_count'] += (int) isset($frame->trailer['crc32']);
+            $summary['pcrc32_trailer_count'] += (int) isset($frame->trailer['pcrc32']);
+        }
+
+        return $summary;
     }
 }

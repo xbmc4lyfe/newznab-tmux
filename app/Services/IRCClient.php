@@ -817,12 +817,23 @@ class IRCClient
     /** @return list<string>|null */
     protected function parseInboundLinePhp(string $line): ?array
     {
+        return self::w441ParseInboundLinePhp($line, $this->_stripControlCharactersPhp(...));
+    }
+
+    /**
+     * Shared PHP grammar for parseInboundLinePhp() and the Wave 44.1 summary.
+     *
+     * @param  callable(string): string  $strip
+     * @return list<string>|null
+     */
+    private static function w441ParseInboundLinePhp(string $line, callable $strip): ?array
+    {
         if (preg_match('/^PING\s*:(.+?)$/', $line, $hits)) {
             return ['P', $hits[1]];
         }
         if (preg_match(
             '/^:(?P<nickname>.+?)!.+?\s+PRIVMSG\s+(?P<channel>#.+?)\s+:\s*(?P<message>.+?)\s*$/',
-            $this->_stripControlCharactersPhp($line),
+            $strip($line),
             $hits
         )) {
             return ['M', $hits['nickname'], $hits['channel'], $hits['message']];
@@ -866,6 +877,11 @@ class IRCClient
      */
     protected function _stripControlCharactersPhp(string $text): string
     {
+        return self::w441StripControlCharactersPhp($text);
+    }
+
+    private static function w441StripControlCharactersPhp(string $text): string
+    {
         $result = preg_replace(
             [
                 '/\x03\d{1,2}(?:,\d{1,2})?/', // Color code with foreground and optional background
@@ -885,5 +901,91 @@ class IRCClient
         );
 
         return is_string($result) ? $result : $text;
+    }
+
+    /** Enabled: paired common/uncommon mean and p99 gains reach 1.5x in all nine runs (min 2.32x; see the W44 parity test). */
+    public const bool W441_RUST_FFI_DEFAULT = true;
+
+    public const string W441_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w441_irc_client_line_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private const array W441_SUMMARY_KEYS = ['total_lines', 'empty_line_count', 'ping_count', 'privmsg_count', 'control_char_count', 'oversized_line_count'];
+
+    private static ?bool $w441UseRustFfi = null;
+
+    private static FFI|false|null $w441Ffi = null;
+
+    /** Null restores the benchmark default. */
+    public static function useW441RustFfi(?bool $enable = true): void
+    {
+        self::$w441UseRustFfi = $enable;
+    }
+
+    public static function usesW441RustFfi(): bool
+    {
+        return self::$w441UseRustFfi ?? self::W441_RUST_FFI_DEFAULT;
+    }
+
+    /** Restores the benchmark default and drops the cached library handle; earlier toggles are untouched. */
+    public static function resetW441RustFfi(): void
+    {
+        self::$w441UseRustFfi = null;
+        self::$w441Ffi = null;
+    }
+
+    /**
+     * Summarizes received lines (CRLF already removed) with parseInboundLinePhp(): PING and PRIVMSG
+     * lines, lines holding a control code _stripControlCharactersPhp() removes, and lines over the
+     * 8701-byte _readFrameTooLong() payload allowance.
+     * Entries come from strings, integers, or the first non-null line, message array field; other values
+     * (including objects) count as empty entries.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeInboundLineBatch(array $rows): array
+    {
+        return self::usesW441RustFfi() ? self::summarizeInboundLineBatchNative($rows) : self::summarizeInboundLineBatchPhp($rows);
+    }
+
+    /**
+     * Rust summary; falls back to PHP when the library or input frame is unusable, or a line holds NUL.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeInboundLineBatchNative(array $rows): array
+    {
+        $values = XrefService::w441Invoke(self::$w441Ffi, self::W441_FFI_CDEF, 'nntmux_w441_irc_client_line_batch', $rows, ['line', 'message'], \count(self::W441_SUMMARY_KEYS));
+
+        return $values === null ? self::summarizeInboundLineBatchPhp($rows) : array_combine(self::W441_SUMMARY_KEYS, $values);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeInboundLineBatchPhp(array $rows): array
+    {
+        $strip = self::w441StripControlCharactersPhp(...);
+        $summary = array_fill_keys(self::W441_SUMMARY_KEYS, 0);
+        foreach (XrefService::w441Entries($rows, ['line', 'message']) as $entry) {
+            $summary['total_lines']++;
+            if ($entry === '') {
+                $summary['empty_line_count']++;
+
+                continue;
+            }
+            // Strip once: the PRIVMSG match and the control-code count share the result.
+            $stripped = $strip($entry);
+            $kind = self::w441ParseInboundLinePhp($entry, static fn (): string => $stripped)[0] ?? null;
+            $summary['ping_count'] += (int) ($kind === 'P');
+            $summary['privmsg_count'] += (int) ($kind === 'M');
+            $summary['control_char_count'] += (int) ($stripped !== $entry);
+            $summary['oversized_line_count'] += (int) (\strlen($entry) > 8701);
+        }
+
+        return $summary;
     }
 }
