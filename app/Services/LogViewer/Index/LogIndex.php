@@ -500,4 +500,162 @@ class LogIndex
 
         return $counts;
     }
+
+    public const string W54_FFI_CDEF = 'int64_t nntmux_w545_log_index_header_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W54.5 parity test's QUALIFICATION). */
+    private const bool W54_RUST_FFI_DEFAULT = true;
+
+    /** Index entry `level` ordinals of the PSR-3 levels. */
+    private const array W54_LEVELS = ['debug' => 1, 'info' => 2, 'notice' => 3, 'warning' => 4, 'error' => 5, 'critical' => 6, 'alert' => 7, 'emergency' => 8];
+
+    /**
+     * Wave 54.5 routing and FFI cache, kept in function-local statics. Without $op it reports the routing;
+     * 'set' swaps the override for $val and returns the previous one; 'reset' replaces the cached handle
+     * with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]` with room
+     * for at least $val words, or null without the library.
+     */
+    private static function w54RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w54_5', self::W54_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W54_RUST_FFI_DEFAULT;
+        }
+    }
+
+    public static function usesW54RustFfi(): bool
+    {
+        return self::w54RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with headerPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW54RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w54RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w54RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 54.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w54Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w54RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w545_log_index_header_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('P*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Batch parse of Laravel entry headers `[Y-m-d H:i:s...] channel.LEVEL: ` for index documents. Four
+     * words per first line: `[logged_at (UTC), level (1 debug ... 8 emergency, 0 other), channel length,
+     * message offset]`; `[0, 0, 0, 0]` without a header or with an out-of-range (or pre-1970) stamp.
+     *
+     * @param  list<string>  $lines
+     * @return list<int>
+     */
+    public static function headerPlanBatch(array $lines): array
+    {
+        return self::usesW54RustFfi() ? self::headerPlanBatchNative($lines) : self::headerPlanBatchPhp($lines);
+    }
+
+    /**
+     * @param  list<string>  $lines
+     * @return list<int>
+     */
+    public static function headerPlanBatchPhp(array $lines): array
+    {
+        $out = [];
+        foreach ($lines as $line) {
+            if (preg_match('/^\[(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})[^\]]*\] (\w+)\.(\w+): /', $line, $m) !== 1) {
+                array_push($out, 0, 0, 0, 0);
+
+                continue;
+            }
+            [$year, $month, $day, $hour, $minute, $second] = [(int) $m[1], (int) $m[2], (int) $m[3], (int) $m[4], (int) $m[5], (int) $m[6]];
+            if ($year < 1970 || $month < 1 || $month > 12 || $day < 1 || $day > 31 || $hour > 23 || $minute > 59 || $second > 59) {
+                array_push($out, 0, 0, 0, 0);
+
+                continue;
+            }
+            array_push($out, (int) gmmktime($hour, $minute, $second, $month, $day, $year), self::W54_LEVELS[strtolower($m[8])] ?? 0, \strlen($m[7]), \strlen($m[0]));
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch over the NUL-joined values; falls back to PHP without the library or when a value holds
+     * a NUL.
+     *
+     * @param  list<string>  $lines
+     * @return list<int>
+     */
+    public static function headerPlanBatchNative(array $lines): array
+    {
+        $count = \count($lines);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w54Words($count, implode("\0", $lines), 4 * $count) ?? self::headerPlanBatchPhp($lines);
+    }
 }

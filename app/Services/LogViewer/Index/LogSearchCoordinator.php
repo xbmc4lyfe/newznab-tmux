@@ -289,4 +289,156 @@ class LogSearchCoordinator
 
         return $indexed;
     }
+
+    public const string W54_FFI_CDEF = 'int64_t nntmux_w545_log_search_path_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W54.5 parity test's QUALIFICATION). */
+    private const bool W54_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 54.5 routing and FFI cache, kept in function-local statics. Without $op it reports the routing;
+     * 'set' swaps the override for $val and returns the previous one; 'reset' replaces the cached handle
+     * with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]` with room
+     * for at least $val words, or null without the library.
+     */
+    private static function w54RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w54_5', self::W54_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W54_RUST_FFI_DEFAULT;
+        }
+    }
+
+    public static function usesW54RustFfi(): bool
+    {
+        return self::w54RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with pathPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW54RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w54RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w54RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 54.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w54Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w54RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w545_log_search_path_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('P*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Batch shape of searched log paths. Four words per path: `[basename offset, daily date as Ymd from a
+     * `name-Y-m-d.log[.gz]` basename (or 0), flags (1 `.log`, 2 `.gz`, 4 hidden basename), position of the
+     * first path with the same bytes, which owns the result]`.
+     *
+     * @param  list<string>  $paths
+     * @return list<int>
+     */
+    public static function pathPlanBatch(array $paths): array
+    {
+        return self::usesW54RustFfi() ? self::pathPlanBatchNative($paths) : self::pathPlanBatchPhp($paths);
+    }
+
+    /**
+     * @param  list<string>  $paths
+     * @return list<int>
+     */
+    public static function pathPlanBatchPhp(array $paths): array
+    {
+        $out = [];
+        $first = [];
+        $index = 0;
+        foreach ($paths as $path) {
+            $slash = strrpos($path, '/');
+            $offset = $slash === false ? 0 : $slash + 1;
+            $base = substr($path, $offset);
+            $date = preg_match('/-(\d{4})-(\d{2})-(\d{2})\.log(?:\.gz)?\z/', $base, $m) === 1 ? (int) ($m[1].$m[2].$m[3]) : 0;
+            $flags = (str_ends_with($base, '.log') ? 1 : 0) | (str_ends_with($base, '.gz') ? 2 : 0) | (str_starts_with($base, '.') ? 4 : 0);
+            array_push($out, $offset, $date, $flags, $first[$path] ??= $index);
+            $index++;
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch over the NUL-joined values; falls back to PHP without the library or when a value holds
+     * a NUL.
+     *
+     * @param  list<string>  $paths
+     * @return list<int>
+     */
+    public static function pathPlanBatchNative(array $paths): array
+    {
+        $count = \count($paths);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w54Words($count, implode("\0", $paths), 4 * $count) ?? self::pathPlanBatchPhp($paths);
+    }
 }

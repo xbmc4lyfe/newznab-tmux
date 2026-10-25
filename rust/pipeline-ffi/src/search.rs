@@ -41763,3 +41763,854 @@ mod wave53_5_api_capabilities_row_cache_usage_xml_failed_jobs {
         }
     }
 }
+
+mod wave54_5_api_user_resolver_v1_presenter_release_rows_log_index_coord {
+    use std::collections::HashMap;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const DECLINE: i64 = -1;
+    const MAX_INPUT: usize = 64 * 1024 * 1024;
+    const MAX_RECORDS: usize = 1 << 20;
+
+    /// Every Wave 54.5 helper returns four words per record.
+    const WIDTH: usize = 4;
+
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> Option<bool> {
+        if a_len == 0 || b_len == 0 {
+            return Some(false);
+        }
+        let a_end = a.checked_add(a_len)?;
+        let b_end = b.checked_add(b_len)?;
+        Some(a < b_end && b < a_end)
+    }
+
+    const LOW_BITS: u64 = 0x0101_0101_0101_0101;
+    const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+
+    /// Word-at-a-time search for one byte; the lowest flagged byte is exact
+    /// because borrows only propagate upwards.
+    fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
+        let splat = LOW_BITS.wrapping_mul(u64::from(needle));
+        let (words, _) = haystack.as_chunks::<8>();
+        for (index, word) in words.iter().enumerate() {
+            let x = u64::from_le_bytes(*word) ^ splat;
+            let found = x.wrapping_sub(LOW_BITS) & !x & HIGH_BITS;
+            if found != 0 {
+                return Some(index * 8 + (found.trailing_zeros() / 8) as usize);
+            }
+        }
+        let tail = words.len() * 8;
+        haystack[tail..]
+            .iter()
+            .position(|&b| b == needle)
+            .map(|at| tail + at)
+    }
+
+    /// Splits `data` on NUL into exactly `expected` fields.
+    fn split_fields(data: &[u8], expected: usize) -> Option<Vec<&[u8]>> {
+        if expected == 0 {
+            return data.is_empty().then(Vec::new);
+        }
+        let mut fields = Vec::with_capacity(expected);
+        let mut rest = data;
+        while let Some(at) = memchr(0, rest) {
+            if fields.len() + 1 == expected {
+                return None;
+            }
+            fields.push(&rest[..at]);
+            rest = &rest[at + 1..];
+        }
+        fields.push(rest);
+        (fields.len() == expected).then_some(fields)
+    }
+
+    /// PHP `trim()` default characters.
+    fn is_trim(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b)
+    }
+
+    fn trim(bytes: &[u8]) -> &[u8] {
+        let start = bytes
+            .iter()
+            .position(|&b| !is_trim(b))
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|&b| !is_trim(b))
+            .map_or(start, |at| at + 1);
+        &bytes[start..end]
+    }
+
+    /// PCRE `\w` without Unicode properties: ASCII letters, digits and `_`.
+    fn is_word(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || byte == b'_'
+    }
+
+    /// Validates the shared ABI, runs `body` over the NUL-joined records and copies its words to `out`.
+    ///
+    /// # Safety
+    /// See the entry points.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run(
+        count: usize,
+        flags: i64,
+        data: *const u8,
+        data_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        out: *mut i64,
+        out_cap: usize,
+        body: impl FnOnce(&[&[u8]], &mut Vec<i64>),
+    ) -> i64 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if flags != 0
+                || count > MAX_RECORDS
+                || data_len > MAX_INPUT
+                || ints_len != 0
+                || out_cap > MAX_INPUT
+                || (data.is_null() && data_len != 0)
+                || (out.is_null() && out_cap != 0)
+                || (!out.is_null() && !out.is_aligned())
+            {
+                return DECLINE;
+            }
+            let _ = ints;
+            let Some(out_bytes) = out_cap.checked_mul(8) else {
+                return DECLINE;
+            };
+            if overlaps(data as usize, data_len, out as usize, out_bytes) != Some(false) {
+                return DECLINE;
+            }
+            let data = if data_len == 0 || data.is_null() {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(data, data_len) }
+            };
+            let Some(fields) = split_fields(data, count) else {
+                return DECLINE;
+            };
+            let needed = count * WIDTH;
+            let mut words = Vec::with_capacity(needed);
+            body(&fields, &mut words);
+            if words.len() != needed {
+                return DECLINE;
+            }
+            if out_cap < needed {
+                return -(needed as i64);
+            }
+            if needed > 0 {
+                unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), out, needed) };
+            }
+            needed as i64
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    const HEX: u8 = 1;
+    const OTHER: u8 = 2;
+    const CONTROL: u8 = 4;
+
+    /// Token byte classes: [`HEX`] digits, [`OTHER`] non-alphanumeric and [`CONTROL`] bytes.
+    const TOKEN_CLASS: [u8; 256] = {
+        let mut table = [0u8; 256];
+        let mut b = 0;
+        while b < 256 {
+            let byte = b as u8;
+            table[b] = if byte.is_ascii_hexdigit() {
+                HEX
+            } else if byte.is_ascii_alphanumeric() {
+                0
+            } else if byte < 0x20 || byte == 0x7f {
+                OTHER | CONTROL
+            } else {
+                OTHER
+            };
+            b += 1;
+        }
+        table
+    };
+
+    /// `ApiUserResolver::tokenPlanBatch()`: `[version, trimmed length, flags, non-alphanumeric
+    /// trimmed bytes]`. Version: 0 empty, 1 blank (v1 lookup), 2 filled (v2 lookup). Flags: 1 trimmed
+    /// token is all hex, 2 trimmed length 32, 4 padded, 8 holds a control byte.
+    fn token_plan(token: &[u8], words: &mut Vec<i64>) {
+        let trimmed = trim(token);
+        let version = if token.is_empty() {
+            0
+        } else if trimmed.is_empty() {
+            1
+        } else {
+            2
+        };
+        // Padding is trim() bytes: every one but the space is a control byte.
+        let mut control =
+            trimmed.len() != token.len() && token.iter().any(|&b| b != b' ' && is_trim(b));
+        let (mut hex, mut other) = (HEX, 0i64);
+        let mut any = 0u8;
+        for &b in trimmed {
+            let class = TOKEN_CLASS[usize::from(b)];
+            hex &= class;
+            any |= class;
+            other += i64::from(class >> 1 & 1);
+        }
+        control |= any & CONTROL != 0;
+        let flags = i64::from(!trimmed.is_empty() && hex != 0)
+            | i64::from(trimmed.len() == 32) << 1
+            | i64::from(trimmed.len() != token.len()) << 2
+            | i64::from(control) << 3;
+        words.extend_from_slice(&[version, trimmed.len() as i64, flags, other]);
+    }
+
+    /// Longest integer item `ApiV1Presenter::parameterPlanBatch()` parses (`\d{1,18}`).
+    const MAX_DIGITS: usize = 18;
+
+    /// `ApiV1Presenter::parameterPlanBatch()`: `[trimmed length, kind, items, max integer]`. Kind: 0
+    /// blank, 1 one integer, 2 integer list, 3 other (items count the commas plus one).
+    fn parameter_plan(value: &[u8], words: &mut Vec<i64>) {
+        let trimmed = trim(value);
+        if trimmed.is_empty() {
+            words.extend_from_slice(&[0, 0, 0, 0]);
+            return;
+        }
+        let (mut items, mut max, mut integers) = (0i64, 0i64, true);
+        for item in trimmed.split(|&b| b == b',') {
+            items += 1;
+            if integers
+                && !item.is_empty()
+                && item.len() <= MAX_DIGITS
+                && item.iter().all(u8::is_ascii_digit)
+            {
+                let parsed = item
+                    .iter()
+                    .fold(0i64, |acc, &b| acc * 10 + i64::from(b - b'0'));
+                max = max.max(parsed);
+            } else {
+                integers = false;
+            }
+        }
+        let kind = match (integers, items) {
+            (false, _) => 3,
+            (true, 1) => 1,
+            (true, _) => 2,
+        };
+        words.extend_from_slice(&[
+            trimmed.len() as i64,
+            kind,
+            items,
+            if integers { max } else { 0 },
+        ]);
+    }
+
+    fn is_name_separator(byte: u8) -> bool {
+        matches!(byte, b'.' | b'_' | b'-' | b' ')
+    }
+
+    /// Resolution of a lower-cased release name token, or 0.
+    fn resolution(token: &[u8]) -> i64 {
+        if token.len() > 5 {
+            return 0;
+        }
+        let mut lower = [0u8; 5];
+        for (slot, &b) in lower.iter_mut().zip(token) {
+            *slot = b.to_ascii_lowercase();
+        }
+        match &lower[..token.len()] {
+            b"2160p" | b"4k" | b"uhd" => 2160,
+            b"1080p" | b"1080i" => 1080,
+            b"720p" => 720,
+            b"576p" => 576,
+            b"480p" => 480,
+            _ => 0,
+        }
+    }
+
+    /// `ReleaseRows::searchNamePlanBatch()`: `[tokens, year, resolution, flags]` over the `[._\- ]+`
+    /// separated tokens. Year: the first 19xx/20xx token; resolution: the first resolution token.
+    /// Flags: 1 non-ASCII byte, 2 PROPER/REPACK token, 4 `-GROUP` suffix.
+    fn search_name_plan(name: &[u8], words: &mut Vec<i64>) {
+        let (mut tokens, mut year, mut resolved, mut flags) = (0i64, 0i64, 0i64, 0i64);
+        for token in name.split(|&b| is_name_separator(b)) {
+            if token.is_empty() {
+                continue;
+            }
+            tokens += 1;
+            if year == 0
+                && token.len() == 4
+                && (token.starts_with(b"19") || token.starts_with(b"20"))
+                && token.iter().all(u8::is_ascii_digit)
+            {
+                year = token
+                    .iter()
+                    .fold(0i64, |acc, &b| acc * 10 + i64::from(b - b'0'));
+            }
+            if resolved == 0 {
+                resolved = resolution(token);
+            }
+            if token.len() == 6
+                && (token.eq_ignore_ascii_case(b"proper") || token.eq_ignore_ascii_case(b"repack"))
+            {
+                flags |= 2;
+            }
+        }
+        if !name.is_ascii() {
+            flags |= 1;
+        }
+        let group = name
+            .iter()
+            .rposition(|b| !b.is_ascii_alphanumeric())
+            .map_or(0, |at| at + 1);
+        if group < name.len() && group > 0 && name[group - 1] == b'-' {
+            flags |= 4;
+        }
+        words.extend_from_slice(&[tokens, year, resolved, flags]);
+    }
+
+    fn digits(bytes: &[u8]) -> Option<i64> {
+        bytes.iter().try_fold(0i64, |acc, &b| {
+            b.is_ascii_digit().then(|| acc * 10 + i64::from(b - b'0'))
+        })
+    }
+
+    /// Days since 1970-01-01 of a proleptic Gregorian date (Howard Hinnant's `days_from_civil`).
+    fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+        let year = if month <= 2 { year - 1 } else { year };
+        let era = year.div_euclid(400);
+        let yoe = year - era * 400;
+        let mp = (month + 9) % 12;
+        let doy = (153 * mp + 2) / 5 + day - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146_097 + doe - 719_468
+    }
+
+    fn level(name: &[u8]) -> i64 {
+        const LEVELS: [&[u8]; 8] = [
+            b"debug",
+            b"info",
+            b"notice",
+            b"warning",
+            b"error",
+            b"critical",
+            b"alert",
+            b"emergency",
+        ];
+        LEVELS
+            .iter()
+            .position(|level| level.eq_ignore_ascii_case(name))
+            .map_or(0, |at| at as i64 + 1)
+    }
+
+    /// The Laravel header `[Y-m-d H:i:s…] channel.LEVEL: ` as `[logged_at, level, channel length,
+    /// message offset]`, or None without a valid header.
+    fn header(line: &[u8]) -> Option<[i64; 4]> {
+        let stamp = line.get(..20)?;
+        if stamp[0] != b'['
+            || stamp[5] != b'-'
+            || stamp[8] != b'-'
+            || !matches!(stamp[11], b' ' | b'T')
+            || stamp[14] != b':'
+            || stamp[17] != b':'
+        {
+            return None;
+        }
+        let year = digits(&stamp[1..5])?;
+        let month = digits(&stamp[6..8])?;
+        let day = digits(&stamp[9..11])?;
+        let hour = digits(&stamp[12..14])?;
+        let minute = digits(&stamp[15..17])?;
+        let second = digits(&stamp[18..20])?;
+        if year < 1970
+            || !(1..=12).contains(&month)
+            || !(1..=31).contains(&day)
+            || hour > 23
+            || minute > 59
+            || second > 59
+        {
+            return None;
+        }
+        let close = 20 + memchr(b']', &line[20..])?;
+        let rest = line.get(close + 1..)?.strip_prefix(b" ")?;
+        let channel = rest.iter().position(|&b| !is_word(b))?;
+        if channel == 0 || rest[channel] != b'.' {
+            return None;
+        }
+        let after = &rest[channel + 1..];
+        let name = after.iter().position(|&b| !is_word(b))?;
+        if name == 0 || !after[name..].starts_with(b": ") {
+            return None;
+        }
+        let offset = line.len() - after.len() + name + 2;
+        let logged_at =
+            days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second;
+        Some([
+            logged_at,
+            level(&after[..name]),
+            channel as i64,
+            offset as i64,
+        ])
+    }
+
+    /// `LogIndex::headerPlanBatch()` (see [`header`]); `[0, 0, 0, 0]` without a header.
+    fn header_plan(line: &[u8], words: &mut Vec<i64>) {
+        words.extend_from_slice(&header(line).unwrap_or([0; 4]));
+    }
+
+    /// The `Y-m-d` of a daily `name-Y-m-d.log[.gz]` basename as `Ymd`, or 0.
+    fn daily_date(base: &[u8]) -> i64 {
+        let stem = base
+            .strip_suffix(b".log")
+            .or_else(|| base.strip_suffix(b".log.gz"));
+        let Some(stem) = stem else {
+            return 0;
+        };
+        let Some(date) = stem.len().checked_sub(11).map(|at| &stem[at..]) else {
+            return 0;
+        };
+        if date[0] != b'-' || date[5] != b'-' || date[8] != b'-' {
+            return 0;
+        }
+        match (
+            digits(&date[1..5]),
+            digits(&date[6..8]),
+            digits(&date[9..11]),
+        ) {
+            (Some(year), Some(month), Some(day)) => year * 10_000 + month * 100 + day,
+            _ => 0,
+        }
+    }
+
+    /// `LogSearchCoordinator::pathPlanBatch()`: `[basename offset, daily date, flags, first index]`.
+    /// Flags: 1 `.log`, 2 `.gz`, 4 hidden basename. The first index is the position of the first
+    /// path with the same bytes.
+    fn path_plans(fields: &[&[u8]], words: &mut Vec<i64>) {
+        let mut first: HashMap<&[u8], i64> = HashMap::with_capacity(fields.len());
+        for (index, &path) in fields.iter().enumerate() {
+            let offset = path.iter().rposition(|&b| b == b'/').map_or(0, |at| at + 1);
+            let base = &path[offset..];
+            let flags = i64::from(base.ends_with(b".log"))
+                | i64::from(base.ends_with(b".gz")) << 1
+                | i64::from(base.first() == Some(&b'.')) << 2;
+            let owner = *first.entry(path).or_insert(index as i64);
+            words.extend_from_slice(&[offset as i64, daily_date(base), flags, owner]);
+        }
+    }
+
+    /// Runs a per-record plan over every field.
+    fn each(plan: fn(&[u8], &mut Vec<i64>)) -> impl FnOnce(&[&[u8]], &mut Vec<i64>) {
+        move |fields, words| {
+            for field in fields {
+                plan(field, words);
+            }
+        }
+    }
+
+    macro_rules! entry {
+        ($(#[$doc:meta])* $name:ident, $body:expr) => {
+            $(#[$doc])*
+            ///
+            /// `data` holds `count` NUL-joined records; `ints` must be empty. Returns the words
+            /// written, `-needed` when `out_cap` is too small, or -1 for invalid input.
+            ///
+            /// # Safety
+            /// Non-null pointers must refer to a readable allocation of `data_len` bytes and a
+            /// writable, aligned allocation of `out_cap` i64 words. Null pointers require zero
+            /// length/capacity. Input and output must not overlap.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                count: usize,
+                flags: i64,
+                data: *const u8,
+                data_len: usize,
+                ints: *const u8,
+                ints_len: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> i64 {
+                unsafe { run(count, flags, data, data_len, ints, ints_len, out, out_cap, $body) }
+            }
+        };
+    }
+
+    entry!(
+        /// `ApiUserResolver::tokenPlanBatch()` (see [`token_plan`]).
+        nntmux_w545_api_user_token_plan, each(token_plan)
+    );
+    entry!(
+        /// `ApiV1Presenter::parameterPlanBatch()` (see [`parameter_plan`]).
+        nntmux_w545_api_v1_parameter_plan, each(parameter_plan)
+    );
+    entry!(
+        /// `ReleaseRows::searchNamePlanBatch()` (see [`search_name_plan`]).
+        nntmux_w545_release_rows_search_name_plan, each(search_name_plan)
+    );
+    entry!(
+        /// `LogIndex::headerPlanBatch()` (see [`header_plan`]).
+        nntmux_w545_log_index_header_plan, each(header_plan)
+    );
+    entry!(
+        /// `LogSearchCoordinator::pathPlanBatch()` (see [`path_plans`]).
+        nntmux_w545_log_search_path_plan, path_plans
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        type Entry = unsafe extern "C" fn(
+            usize,
+            i64,
+            *const u8,
+            usize,
+            *const u8,
+            usize,
+            *mut i64,
+            usize,
+        ) -> i64;
+
+        const ENTRIES: [Entry; 5] = [
+            nntmux_w545_api_user_token_plan,
+            nntmux_w545_api_v1_parameter_plan,
+            nntmux_w545_release_rows_search_name_plan,
+            nntmux_w545_log_index_header_plan,
+            nntmux_w545_log_search_path_plan,
+        ];
+
+        fn call(entry: Entry, records: &[&[u8]]) -> Result<Vec<i64>, i64> {
+            let data = records.join(&0u8);
+            let mut out = vec![0i64; 4096];
+            let written = unsafe {
+                entry(
+                    records.len(),
+                    0,
+                    data.as_ptr(),
+                    data.len(),
+                    std::ptr::null(),
+                    0,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            if written < 0 {
+                return Err(written);
+            }
+            out.truncate(written as usize);
+            Ok(out)
+        }
+
+        #[test]
+        fn w545_token_plans_classify_credentials() {
+            let hex = b"0123456789abcdef0123456789ABCDEF";
+            let words = call(
+                nntmux_w545_api_user_token_plan,
+                &[hex, b"", b" \t", b" abc-def \n", b"x\x01y", b"tok_en"],
+            )
+            .unwrap();
+            assert_eq!(
+                words,
+                [
+                    2, 32, 3, 0, //
+                    0, 0, 0, 0, //
+                    1, 0, 12, 0, //
+                    2, 7, 12, 1, //
+                    2, 3, 8, 1, //
+                    2, 6, 0, 1,
+                ]
+            );
+        }
+
+        #[test]
+        fn w545_parameter_plans_parse_integer_lists() {
+            let words = call(
+                nntmux_w545_api_v1_parameter_plan,
+                &[
+                    b" 5030,5040 ",
+                    b"100",
+                    b"",
+                    b" \n",
+                    b"1,,2",
+                    b"tt123,x",
+                    b"1234567890123456789",
+                    b"999999999999999999",
+                    b"-1",
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                words,
+                [
+                    9,
+                    2,
+                    2,
+                    5040, //
+                    3,
+                    1,
+                    1,
+                    100, //
+                    0,
+                    0,
+                    0,
+                    0, //
+                    0,
+                    0,
+                    0,
+                    0, //
+                    4,
+                    3,
+                    3,
+                    0, //
+                    7,
+                    3,
+                    2,
+                    0, //
+                    19,
+                    3,
+                    1,
+                    0, //
+                    18,
+                    1,
+                    1,
+                    999_999_999_999_999_999, //
+                    2,
+                    3,
+                    1,
+                    0,
+                ]
+            );
+        }
+
+        #[test]
+        fn w545_search_name_plans_tokenize_release_names() {
+            let words = call(
+                nntmux_w545_release_rows_search_name_plan,
+                &[
+                    b"The.Show.S01E02.2019.1080p.WEB-DL-GRP",
+                    b"Movie 1999 2020 4K PROPER",
+                    "T\u{e9}l\u{e9}..__--".as_bytes(),
+                    b"",
+                    b"-GRP",
+                    b"name-",
+                    b"a-b.2160P",
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                words,
+                [
+                    8, 2019, 1080, 4, //
+                    5, 1999, 2160, 2, //
+                    1, 0, 0, 1, //
+                    0, 0, 0, 0, //
+                    1, 0, 0, 4, //
+                    1, 0, 0, 0, //
+                    3, 0, 2160, 0,
+                ]
+            );
+        }
+
+        #[test]
+        fn w545_header_plans_parse_laravel_headers() {
+            let words = call(
+                nntmux_w545_log_index_header_plan,
+                &[
+                    b"[2024-01-02 03:04:05] production.ERROR: boom",
+                    b"[1970-01-01T00:00:00.123456+00:00] local.Debug: x",
+                    b"[2024-02-31 00:00:00] app.custom: y",
+                    b"[2024-13-01 00:00:00] app.INFO: y",
+                    b"[1969-12-31 23:59:59] app.INFO: y",
+                    b"[2024-01-02 03:04:05] production.ERROR:boom",
+                    b"[2024-01-02 03:04:05] .ERROR: x",
+                    b"[2024-01-02 03:04:05",
+                    b"plain line",
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                words,
+                [
+                    1_704_164_645,
+                    5,
+                    10,
+                    40, //
+                    0,
+                    1,
+                    5,
+                    48, //
+                    1_709_337_600,
+                    0,
+                    3,
+                    34, //
+                    0,
+                    0,
+                    0,
+                    0, //
+                    0,
+                    0,
+                    0,
+                    0, //
+                    0,
+                    0,
+                    0,
+                    0, //
+                    0,
+                    0,
+                    0,
+                    0, //
+                    0,
+                    0,
+                    0,
+                    0, //
+                    0,
+                    0,
+                    0,
+                    0,
+                ]
+            );
+        }
+
+        #[test]
+        fn w545_path_plans_find_daily_files_and_owners() {
+            let words = call(
+                nntmux_w545_log_search_path_plan,
+                &[
+                    b"/var/log/laravel-2024-01-02.log",
+                    b"/var/log/laravel.log",
+                    b"/var/log/laravel-2024-01-02.log",
+                    b"archive/worker-2023-12-31.log.gz",
+                    b".hidden.log",
+                    b"",
+                    b"x-2024-01-0a.log",
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                words,
+                [
+                    9, 20_240_102, 1, 0, //
+                    9, 0, 1, 1, //
+                    9, 20_240_102, 1, 0, //
+                    8, 20_231_231, 2, 3, //
+                    0, 0, 5, 4, //
+                    0, 0, 0, 5, //
+                    0, 0, 1, 6,
+                ]
+            );
+        }
+
+        #[test]
+        fn w545_abi_declines_and_reports_capacity() {
+            for entry in ENTRIES {
+                let data = b"abc";
+                let mut out = [7i64; 4];
+                let small = unsafe {
+                    entry(
+                        1,
+                        0,
+                        data.as_ptr(),
+                        3,
+                        std::ptr::null(),
+                        0,
+                        out.as_mut_ptr(),
+                        3,
+                    )
+                };
+                assert_eq!(small, -4);
+                assert_eq!(out, [7; 4]);
+                let null_out = unsafe {
+                    entry(
+                        1,
+                        0,
+                        data.as_ptr(),
+                        3,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                };
+                assert_eq!(null_out, -4);
+                let cases: [(usize, i64, *const u8, usize, usize, *mut i64, usize); 5] = [
+                    (1, 0, std::ptr::null(), 3, 0, out.as_mut_ptr(), 4),
+                    (1, 0, data.as_ptr(), 3, 0, std::ptr::null_mut(), 4),
+                    (1, 1, data.as_ptr(), 3, 0, out.as_mut_ptr(), 4),
+                    (1, 0, data.as_ptr(), 3, 8, out.as_mut_ptr(), 4),
+                    (2, 0, data.as_ptr(), 3, 0, out.as_mut_ptr(), 4),
+                ];
+                let ints = [0u8; 8];
+                for (count, flags, ptr, len, ints_len, out_ptr, cap) in cases {
+                    let declined = unsafe {
+                        entry(
+                            count,
+                            flags,
+                            ptr,
+                            len,
+                            ints.as_ptr(),
+                            ints_len,
+                            out_ptr,
+                            cap,
+                        )
+                    };
+                    assert_eq!(declined, DECLINE);
+                }
+                let empty = unsafe {
+                    entry(
+                        0,
+                        0,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                };
+                assert_eq!(empty, 0);
+                let shared = out.as_mut_ptr();
+                let overlap =
+                    unsafe { entry(1, 0, shared.cast::<u8>(), 8, std::ptr::null(), 0, shared, 4) };
+                assert_eq!(overlap, DECLINE);
+                assert_eq!(call(entry, &[b""]).unwrap().len(), 4);
+            }
+        }
+
+        #[test]
+        fn w545_civil_days_match_known_dates() {
+            assert_eq!(days_from_civil(1970, 1, 1), 0);
+            assert_eq!(days_from_civil(2000, 3, 1), 11_017);
+            assert_eq!(days_from_civil(2024, 2, 29), 19_782);
+            assert_eq!(days_from_civil(2024, 2, 31), days_from_civil(2024, 3, 2));
+        }
+
+        #[test]
+        fn w545_random_inputs_never_panic() {
+            let mut seed = 0x545_u64;
+            let mut next = move || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed
+            };
+            let alphabet = [
+                0u8, b',', b' ', b':', b'[', b']', b'-', b'.', b'/', b'_', b'\n', 0xff, 0xc3, b'1',
+                b'9', b'2', b'0', b'T', b'g', b'l',
+            ];
+            for round in 0..20_000 {
+                let data: Vec<u8> = (0..next() % 48)
+                    .map(|_| alphabet[(next() % 20) as usize])
+                    .collect();
+                let count = (next() % 5) as usize;
+                let mut out = vec![0i64; 32];
+                let _ = unsafe {
+                    ENTRIES[round % 5](
+                        count,
+                        0,
+                        data.as_ptr(),
+                        data.len(),
+                        std::ptr::null(),
+                        0,
+                        out.as_mut_ptr(),
+                        out.len(),
+                    )
+                };
+            }
+        }
+    }
+}
