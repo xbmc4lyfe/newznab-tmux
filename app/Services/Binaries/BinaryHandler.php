@@ -7,6 +7,7 @@ namespace App\Services\Binaries;
 use App\Support\RustPipelineLibrary;
 use App\Support\SqlError;
 use App\Support\Utf8;
+use FFI\CData;
 use Illuminate\Support\Facades\DB;
 
 /**
@@ -697,5 +698,189 @@ final class BinaryHandler
     {
         self::$w411UseRustFfi = null;
         self::$w411Ffi = null;
+    }
+
+    /** Wave 52.2 paired benchmarks decide this default; see RustBinariesCollectionHeaderMissedPartHandlerW52ParityTest. */
+    private const bool W52_RUST_FFI_DEFAULT = true;
+
+    public const string W52_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w522_binary_key_plan_batch(const char *hashes, size_t hashes_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * Wave 52 routing, binding and output buffer, kept in function-local statics. Operations:
+     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
+     * resolves the binding and 'out' returns `[binding, buffer, capacity]` with room for at
+     * least $val words (null without the library).
+     */
+    private static function w52RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w52', self::W52_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w52RustFfiState('ffi');
+                    $buffer = $resolved instanceof \FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW52RustFfi(): bool
+    {
+        $enabled = self::w52RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W52_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with planBinaryKeys() routed to Rust ($enabled) or PHP, then restores the
+     * previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW52RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w52RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w52RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Batch lookup-key plan for pending binary rows, as getOrCreateBinaries() groups them. One word
+     * per row: `flags | first << 8 | crc32(strtolower(hash) . ':' . collection) << 32`. Flags: 1 hash
+     * of 32 hex digits, 2 positive collection id, 4 repeated lookup key (valid rows only; `first`
+     * is the first row with that key, else the row itself), 8 hash holding an uppercase byte, 16 file
+     * number above a positive part total, 32 file number <= 0. Valid, unique and repeated counts,
+     * case-folded hashes, files over their total and the XXH64 digest of all earlier words follow.
+     *
+     * @param  list<string>  $hashes
+     * @param  list<int>  $collectionIds
+     * @param  list<int>  $fileNumbers
+     * @param  list<int>  $totalParts
+     * @return list<int>
+     */
+    public static function planBinaryKeys(array $hashes, array $collectionIds, array $fileNumbers, array $totalParts): array
+    {
+        return self::usesW52RustFfi()
+            ? self::planBinaryKeysNative($hashes, $collectionIds, $fileNumbers, $totalParts)
+            : self::planBinaryKeysPhp($hashes, $collectionIds, $fileNumbers, $totalParts);
+    }
+
+    /**
+     * @param  list<string>  $hashes
+     * @param  list<int>  $collectionIds
+     * @param  list<int>  $fileNumbers
+     * @param  list<int>  $totalParts
+     * @return list<int>
+     */
+    public static function planBinaryKeysPhp(array $hashes, array $collectionIds, array $fileNumbers, array $totalParts): array
+    {
+        $out = $first = [];
+        $valid = $repeats = $folded = $over = 0;
+        foreach ($hashes as $i => $hash) {
+            $collection = $collectionIds[$i] ?? 0;
+            $file = $fileNumbers[$i] ?? 0;
+            $total = $totalParts[$i] ?? 0;
+            $lower = strtolower($hash);
+            $key = $lower.':'.$collection;
+            $hashOk = \strlen($hash) === 32 && strspn($hash, '0123456789abcdefABCDEF') === 32;
+            $flags = ($hashOk ? 1 : 0) | ($collection > 0 ? 2 : 0);
+            $index = $i;
+            if ($flags === 3) {
+                $valid++;
+                if (isset($first[$key])) {
+                    $index = $first[$key];
+                    $flags |= 4;
+                    $repeats++;
+                } else {
+                    $first[$key] = $i;
+                }
+            }
+            if ($lower !== $hash) {
+                $flags |= 8;
+                $folded++;
+            }
+            if ($file <= 0) {
+                $flags |= 32;
+            }
+            if ($total > 0 && $file > $total) {
+                $flags |= 16;
+                $over++;
+            }
+            $out[] = $flags | $index << 8 | crc32($key) << 32;
+        }
+        $out[] = $valid;
+        $out[] = $valid - $repeats;
+        $out[] = $repeats;
+        $out[] = $folded;
+        $out[] = $over;
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+        $out[] = $digest[1];
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, the columns differ in length or
+     * are not lists, or a hash holds a NUL byte.
+     *
+     * @param  list<string>  $hashes
+     * @param  list<int>  $collectionIds
+     * @param  list<int>  $fileNumbers
+     * @param  list<int>  $totalParts
+     * @return list<int>
+     */
+    public static function planBinaryKeysNative(array $hashes, array $collectionIds, array $fileNumbers, array $totalParts): array
+    {
+        $count = \count($hashes);
+        $words = $count + 6;
+        /** @var array{\FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w52RustFfiState('out', $words);
+        if ($state === null || \count($collectionIds) !== $count || \count($fileNumbers) !== $count || \count($totalParts) !== $count
+            || ! array_is_list($hashes) || ! array_is_list($collectionIds) || ! array_is_list($fileNumbers) || ! array_is_list($totalParts)) {
+            return self::planBinaryKeysPhp($hashes, $collectionIds, $fileNumbers, $totalParts);
+        }
+        [$ffi, $out, $cap] = $state;
+        $joined = implode("\0", $hashes);
+        $ints = pack('P*', ...$collectionIds, ...$fileNumbers, ...$totalParts);
+        try {
+            // @phpstan-ignore method.notFound (Declared by W52_FFI_CDEF.)
+            $written = $ffi->nntmux_w522_binary_key_plan_batch($joined, \strlen($joined), $ints, \strlen($ints), $count, $out, $cap);
+        } catch (\Throwable) {
+            $written = -1;
+        }
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', \FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : self::planBinaryKeysPhp($hashes, $collectionIds, $fileNumbers, $totalParts);
     }
 }

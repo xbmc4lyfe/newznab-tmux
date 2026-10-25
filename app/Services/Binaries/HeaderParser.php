@@ -7,6 +7,7 @@ namespace App\Services\Binaries;
 use App\Services\BlacklistService;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 
 /**
  * Parses and filters raw NNTP headers.
@@ -556,5 +557,172 @@ final class HeaderParser
     {
         self::$w411UseRustFfi = null;
         self::$w411Ffi = null;
+    }
+
+    /** Wave 52.2 paired benchmarks decide this default; see RustBinariesCollectionHeaderMissedPartHandlerW52ParityTest. */
+    private const bool W52_RUST_FFI_DEFAULT = true;
+
+    public const string W52_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w522_header_subject_plan_batch(const char *subjects, size_t subjects_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * Wave 52 routing, binding and output buffer, kept in function-local statics. Operations:
+     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
+     * resolves the binding and 'out' returns `[binding, buffer, capacity]` with room for at
+     * least $val words (null without the library).
+     */
+    private static function w52RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w52', self::W52_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w52RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW52RustFfi(): bool
+    {
+        $enabled = self::w52RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W52_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with planSubjects() routed to Rust ($enabled) or PHP, then restores the
+     * previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW52RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w52RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w52RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Batch SUBJECT_PATTERN plan, as parse() splits subjects. Three words per subject: `flags |
+     * min(strlen(base), 0xFFFFFF) << 8 | crc32(base) << 32`, then `(int)` of the part and of the
+     * total (all three zero when the pattern does not match). The base is capture 1, plus ` yEnc`
+     * when the subject lacks `yEnc` in any case. Flags: 1 matched, 2 yEnc appended, 4 part above
+     * total, 8 part zero, 16 total of at least 2. Matched, unmatched, yEnc-appended and multi-part
+     * counts, the largest matched total and the XXH64 digest of all earlier words follow.
+     *
+     * @param  list<string>  $subjects
+     * @return list<int>
+     */
+    public static function planSubjects(array $subjects): array
+    {
+        return self::usesW52RustFfi() ? self::planSubjectsNative($subjects) : self::planSubjectsPhp($subjects);
+    }
+
+    /**
+     * @param  list<string>  $subjects
+     * @return list<int>
+     */
+    public static function planSubjectsPhp(array $subjects): array
+    {
+        $out = [];
+        $matched = $appended = $multi = $maxTotal = 0;
+        foreach ($subjects as $subject) {
+            if (preg_match(self::SUBJECT_PATTERN, $subject, $matches) !== 1) {
+                $out[] = 0;
+                $out[] = 0;
+                $out[] = 0;
+
+                continue;
+            }
+            $matched++;
+            $base = $matches[1];
+            $flags = 1;
+            if (stripos($subject, 'yEnc') === false) {
+                $base .= ' yEnc';
+                $flags |= 2;
+                $appended++;
+            }
+            $part = (int) $matches[2];
+            $total = (int) $matches[3];
+            $flags |= ($part > $total ? 4 : 0) | ($part === 0 ? 8 : 0);
+            if ($total >= 2) {
+                $flags |= 16;
+                $multi++;
+            }
+            $maxTotal = max($maxTotal, $total);
+            $out[] = $flags | min(\strlen($base), 0xFFFFFF) << 8 | crc32($base) << 32;
+            $out[] = $part;
+            $out[] = $total;
+        }
+        $out[] = $matched;
+        $out[] = \count($subjects) - $matched;
+        $out[] = $appended;
+        $out[] = $multi;
+        $out[] = $maxTotal;
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+        $out[] = $digest[1];
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, the input is not a list or a
+     * subject holds a NUL byte.
+     *
+     * @param  list<string>  $subjects
+     * @return list<int>
+     */
+    public static function planSubjectsNative(array $subjects): array
+    {
+        $count = \count($subjects);
+        $words = 3 * $count + 6;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w52RustFfiState('out', $words);
+        if ($state === null || ! array_is_list($subjects)) {
+            return self::planSubjectsPhp($subjects);
+        }
+        [$ffi, $out, $cap] = $state;
+        $joined = implode("\0", $subjects);
+        try {
+            // @phpstan-ignore method.notFound (Declared by W52_FFI_CDEF.)
+            $written = $ffi->nntmux_w522_header_subject_plan_batch($joined, \strlen($joined), $count, $out, $cap);
+        } catch (\Throwable) {
+            $written = -1;
+        }
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : self::planSubjectsPhp($subjects);
     }
 }
