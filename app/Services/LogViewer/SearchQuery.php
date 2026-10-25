@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\LogViewer;
 
+use App\Support\ReleaseSearchIndexDocument;
 use App\Support\RustPipelineLibrary;
 use Carbon\CarbonImmutable;
 use FFI;
@@ -20,6 +21,13 @@ use Throwable;
  */
 final readonly class SearchQuery
 {
+    /**
+     * Rust stays opt-in for the Wave 44.5 summary: uncommon p99 missed 1.5x because the framing copy of
+     * large batches competes with memchr-backed strpos; see
+     * tests/Unit/RustLogViewerIndexParserSearchPrometheusDocW44ParityTest.php.
+     */
+    public const bool W445_RUST_FFI_DEFAULT = false;
+
     private const string DELIMITER = "\x01";
 
     /**
@@ -239,6 +247,95 @@ final readonly class SearchQuery
 
         /** @var list<array{int, int}> */
         return array_chunk($flat, 2);
+    }
+
+    /** Pass null to restore {@see W445_RUST_FFI_DEFAULT}. */
+    public static function useW445RustFfi(?bool $enable = true): void
+    {
+        $state = &self::w445State();
+        $state['enabled'] = $enable;
+    }
+
+    public static function usesW445RustFfi(): bool
+    {
+        return self::w445State()['enabled'] ?? self::W445_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW445RustFfi(): void
+    {
+        self::useW445RustFfi(null);
+    }
+
+    /**
+     * Summarizes how this query matches and highlights lines: `matched` lines ({@see matches()}),
+     * `highlights` and `highlighted_bytes` from {@see segments()}' ranges, `max_highlights` per line and
+     * `capped_lines` that reached the highlight limit. Non-strings are invalid. Rust serves plain terms;
+     * regex and level-only queries run in PHP.
+     *
+     * @param  array<array-key, mixed>  $lines
+     * @return array{lines: int, invalid: int, matched: int, highlights: int, highlighted_bytes: int, max_highlights: int, capped_lines: int}
+     */
+    public function summarizeLineMatchBatch(array $lines): array
+    {
+        return self::usesW445RustFfi() ? $this->summarizeLineMatchBatchNative($lines) : $this->summarizeLineMatchBatchPhp($lines);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $lines
+     * @return array{lines: int, invalid: int, matched: int, highlights: int, highlighted_bytes: int, max_highlights: int, capped_lines: int}
+     */
+    public function summarizeLineMatchBatchPhp(array $lines): array
+    {
+        $summary = ['lines' => \count($lines), 'invalid' => 0, 'matched' => 0, 'highlights' => 0, 'highlighted_bytes' => 0, 'max_highlights' => 0, 'capped_lines' => 0];
+        foreach ($lines as $line) {
+            if (! \is_string($line)) {
+                $summary['invalid']++;
+
+                continue;
+            }
+            $summary['matched'] += (int) $this->matches($line);
+            $ranges = $this->hasTerm() ? ($this->regex ? $this->regexRanges($line) : $this->plainRanges($line)) : [];
+            $found = \count($ranges);
+            $summary['highlights'] += $found;
+            foreach ($ranges as [, $length]) {
+                $summary['highlighted_bytes'] += $length;
+            }
+            $summary['max_highlights'] = max($summary['max_highlights'], $found);
+            $summary['capped_lines'] += (int) ($found >= self::MAX_HIGHLIGHTS);
+        }
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $lines
+     * @return array{lines: int, invalid: int, matched: int, highlights: int, highlighted_bytes: int, max_highlights: int, capped_lines: int}
+     */
+    public function summarizeLineMatchBatchNative(array $lines): array
+    {
+        if (! $this->hasTerm() || $this->regex) {
+            return $this->summarizeLineMatchBatchPhp($lines);
+        }
+        $strings = array_values(array_filter($lines, 'is_string'));
+        $fields = ReleaseSearchIndexDocument::evaluateW445Native(3, [$this->term, $this->caseSensitive ? '1' : '0', (string) self::MAX_HIGHLIGHTS, ...$strings], 5);
+        if ($fields === null) {
+            return $this->summarizeLineMatchBatchPhp($lines);
+        }
+
+        return ['lines' => \count($lines), 'invalid' => \count($lines) - \count($strings)]
+            + array_combine(['matched', 'highlights', 'highlighted_bytes', 'max_highlights', 'capped_lines'], $fields);
+    }
+
+    /**
+     * Readonly classes cannot declare static properties, so the Wave 44.5 toggle lives here.
+     *
+     * @return array{enabled: ?bool}
+     */
+    private static function &w445State(): array
+    {
+        static $state = ['enabled' => null];
+
+        return $state;
     }
 
     /**
