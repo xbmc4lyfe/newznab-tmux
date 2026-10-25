@@ -26860,3 +26860,431 @@ mod w386_tests {
         }
     }
 }
+
+// Wave 39.6: second-pass verification plans. Integers are native-endian i64,
+// op 5's statuses are byte-preserving u32-LE length-prefixed strings, and flags
+// carry only op 5's include-in-flight bit. Every output is a fixed run of i64 slots.
+const W396_MAX_INPUT: usize = 16_777_216;
+
+/// Candidate status codes accepted by op 3 (0..=6); 4..=6 are terminal.
+const W396_TRANSITIONS: [u8; 7] = [
+    0b100_0010, // waiting -> verifying, expired
+    0b110_1100, // verifying -> ready, retry, rejected, expired
+    0b011_1000, // ready -> retry, published, rejected
+    0b110_0010, // retry -> verifying, rejected, expired
+    0, 0, 0,
+];
+
+fn w396_ints<const N: usize>(reader: &mut W356Reader<'_>) -> Option<[i64; N]> {
+    let mut values = [0_i64; N];
+    for value in &mut values {
+        *value = reader.integer()?;
+    }
+    Some(values)
+}
+
+fn w396_compute(operation: u8, flags: u8, input: &[u8]) -> Option<Vec<u8>> {
+    if !(1..=5).contains(&operation) || flags > 1 || (operation != 5 && flags != 0) {
+        return None;
+    }
+    let mut reader = W356Reader {
+        bytes: input,
+        offset: 0,
+    };
+    let slots: Vec<i64> = match operation {
+        1 => {
+            let [total, available, age, min_age, max_age, min_permille] = w396_ints(&mut reader)?;
+            let total = total.max(0);
+            let available = available.clamp(0, total);
+            let permille = if total == 0 {
+                0
+            } else {
+                (i128::from(available) * 1000 / i128::from(total)) as i64
+            };
+            // 0 too_young, 1 eligible, 2 expired; action 0 wait, 1 release, 2 discard.
+            let state = if age < min_age.max(0) {
+                0
+            } else if max_age > 0 && age > max_age {
+                2
+            } else {
+                1
+            };
+            let met = total > 0 && permille >= min_permille.clamp(0, 1000);
+            let action = match (state, met) {
+                (0, _) | (1, false) => 0,
+                (_, true) => 1,
+                _ => 2,
+            };
+            vec![total, available, permille, state, i64::from(met), action]
+        }
+        2 => {
+            let [budget, count] = w396_ints(&mut reader)?;
+            let budget = budget.max(0);
+            let count = usize::try_from(count).ok()?;
+            if count > input.len().checked_sub(reader.offset)? / 8 {
+                return None;
+            }
+            let (mut non_empty, mut empty, mut bytes, mut exceeded, mut accepted) =
+                (0_i64, 0_i64, 0_i64, -1_i64, 0_i64);
+            for index in 0..count {
+                let size = reader.integer()?;
+                if size <= 0 {
+                    empty += 1;
+                    continue;
+                }
+                non_empty += 1;
+                if exceeded < 0 {
+                    // bytes <= budget, so the difference cannot overflow.
+                    if size <= budget - bytes {
+                        bytes += size;
+                        accepted += 1;
+                    } else {
+                        exceeded = index as i64;
+                    }
+                }
+            }
+            vec![count as i64, non_empty, empty, bytes, exceeded, accepted]
+        }
+        3 => {
+            let [current, target, attempts, max_attempts] = w396_ints(&mut reader)?;
+            let attempts = attempts.max(0);
+            let exhausted = attempts >= max_attempts.max(1);
+            let known = |status: i64| (0..=6).contains(&status);
+            // 0 none, 1 unknown_status, 2 terminal_current, 3 unchanged, 4 not_permitted, 5 attempts_exhausted.
+            let reason = if !known(current) || !known(target) {
+                1
+            } else if current >= 4 {
+                2
+            } else if current == target {
+                3
+            } else if W396_TRANSITIONS[current as usize] & (1 << target) == 0 {
+                4
+            } else if (target == 1 || target == 3) && exhausted {
+                5
+            } else {
+                0
+            };
+            let next = if reason == 0 && target == 1 {
+                attempts + 1
+            } else {
+                attempts
+            };
+            vec![
+                i64::from(reason == 0),
+                i64::from(known(target) && target >= 4),
+                i64::from(exhausted),
+                next,
+                reason,
+            ]
+        }
+        4 => {
+            let [acquired, ttl, now, margin] = w396_ints(&mut reader)?;
+            let expires = acquired.saturating_add(ttl.max(0));
+            let expired = now >= expires;
+            let remaining = if expired {
+                0
+            } else {
+                expires.saturating_sub(now)
+            };
+            let renew = !expired && remaining <= margin.max(0);
+            vec![
+                expires,
+                remaining,
+                i64::from(expired),
+                i64::from(renew),
+                i64::from(!expired && now >= acquired),
+            ]
+        }
+        5 => {
+            let chunk = reader.integer()?.max(1);
+            let count = reader.count()?;
+            // Each status needs at least its four-byte length; reject huge counts first.
+            if count > input.len().checked_sub(reader.offset)? / 4 {
+                return None;
+            }
+            let (mut eligible, mut in_flight, mut verified, mut other) =
+                (0_i64, 0_i64, 0_i64, 0_i64);
+            for _ in 0..count {
+                match reader.string()? {
+                    b"dirty" | b"stale" | b"expired" | b"unknown" => eligible += 1,
+                    b"verifying" if flags == 1 => eligible += 1,
+                    b"verifying" => in_flight += 1,
+                    b"ready" => verified += 1,
+                    _ => other += 1,
+                }
+            }
+            let chunks = eligible / chunk + i64::from(eligible % chunk != 0);
+            vec![count as i64, eligible, in_flight, verified, other, chunks]
+        }
+        _ => return None,
+    };
+    if reader.offset != input.len() {
+        return None;
+    }
+    Some(slots.iter().flat_map(|slot| slot.to_ne_bytes()).collect())
+}
+
+/// Returns bytes written, -required for a short buffer, or -1 for invalid input.
+/// All valid outputs are at least 40 bytes, keeping -1 unambiguous. No negative
+/// return writes output and no NUL terminator is appended.
+///
+/// # Safety
+/// Both pointers must be nonnull and designate live readable/writable allocations
+/// of the declared sizes. Ranges must not overlap and sizes must be <= MAX_INPUT.
+/// The checks cannot establish allocation ownership or liveness. Alignment is one.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w396_verification_store_prelock_manifest_reset(
+    operation: u8,
+    flags: u8,
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !(1..=5).contains(&operation)
+            || flags > 1
+            || (operation != 5 && flags != 0)
+            || input.is_null()
+            || out_buf.is_null()
+            || input_len > W396_MAX_INPUT
+            || out_cap > W396_MAX_INPUT
+            || input_len > isize::MAX as usize
+            || out_cap > isize::MAX as usize
+        {
+            return -1;
+        }
+        let Some(input_end) = (input as usize).checked_add(input_len) else {
+            return -1;
+        };
+        let Some(output_end) = (out_buf as usize).checked_add(out_cap) else {
+            return -1;
+        };
+        if input_end > isize::MAX as usize || output_end > isize::MAX as usize {
+            return -1;
+        }
+        if input_len != 0
+            && out_cap != 0
+            && (input as usize) < output_end
+            && (out_buf as usize) < input_end
+        {
+            return -1;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(input, input_len) };
+        let Some(result) = w396_compute(operation, flags, bytes) else {
+            return -1;
+        };
+        if out_cap < result.len() {
+            return -(result.len() as isize);
+        }
+        unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), out_buf, result.len()) };
+        result.len() as isize
+    }))
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod w396_tests {
+    use super::*;
+
+    fn ints(values: &[i64]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_ne_bytes()).collect()
+    }
+
+    fn statuses(chunk: i64, values: &[&[u8]]) -> Vec<u8> {
+        let mut frame = ints(&[chunk]);
+        frame.extend_from_slice(&(values.len() as u32).to_le_bytes());
+        for value in values {
+            w356_string(&mut frame, value);
+        }
+        frame
+    }
+
+    fn fixtures() -> Vec<(u8, u8, Vec<u8>, Vec<u8>)> {
+        vec![
+            (
+                1,
+                0,
+                ints(&[200, 191, 3600, 600, 86_400, 950]),
+                ints(&[200, 191, 955, 1, 1, 1]),
+            ),
+            (
+                2,
+                0,
+                ints(&[100, 5, 40, 0, 50, -3, 20]),
+                ints(&[5, 3, 2, 90, 4, 2]),
+            ),
+            (3, 0, ints(&[0, 1, 2, 5]), ints(&[1, 0, 0, 3, 0])),
+            (
+                4,
+                0,
+                ints(&[1_000, 30_000, 27_000, 5_000]),
+                ints(&[31_000, 4_000, 0, 1, 1]),
+            ),
+            (
+                5,
+                1,
+                statuses(
+                    2,
+                    &[
+                        b"dirty",
+                        b"verifying",
+                        b"ready",
+                        b"waiting_upload",
+                        b"STALE",
+                    ],
+                ),
+                ints(&[5, 2, 0, 1, 2, 1]),
+            ),
+        ]
+    }
+
+    #[test]
+    fn w396_literal_contracts() {
+        for (op, flags, input, output) in fixtures() {
+            assert_eq!(w396_compute(op, flags, &input), Some(output));
+        }
+        // Exact permille for totals past i64::MAX / 1000, and an empty collection never completes.
+        assert_eq!(
+            w396_compute(1, 0, &ints(&[i64::MAX, i64::MAX - 1, 0, 0, 0, 1000])),
+            Some(ints(&[i64::MAX, i64::MAX - 1, 999, 1, 0, 0]))
+        );
+        assert_eq!(
+            w396_compute(1, 0, &ints(&[0, 5, 0, 0, 0, 0])),
+            Some(ints(&[0, 0, 0, 1, 0, 0]))
+        );
+        assert_eq!(
+            w396_compute(1, 0, &ints(&[10, 2, 100, 0, 50, 900])),
+            Some(ints(&[10, 2, 200, 2, 0, 2]))
+        );
+        assert_eq!(
+            w396_compute(1, 0, &ints(&[10, 10, -5, i64::MIN, 0, i64::MAX])),
+            Some(ints(&[10, 10, 1000, 0, 1, 0]))
+        );
+        assert_eq!(
+            w396_compute(2, 0, &ints(&[i64::MIN, 0])),
+            Some(ints(&[0, 0, 0, 0, -1, 0]))
+        );
+        assert_eq!(
+            w396_compute(2, 0, &ints(&[i64::MAX, 2, i64::MAX, 1])),
+            Some(ints(&[2, 2, 0, i64::MAX, 1, 1]))
+        );
+        for (input, expected) in [
+            ([7, 1, 0, 5], [0, 0, 0, 0, 1]),
+            ([4, 5, 0, 5], [0, 1, 0, 0, 2]),
+            ([1, 1, 0, 5], [0, 0, 0, 0, 3]),
+            ([0, 2, 0, 5], [0, 0, 0, 0, 4]),
+            ([3, 1, 5, 5], [0, 0, 1, 5, 5]),
+            ([1, 3, i64::MAX, i64::MIN], [0, 0, 1, i64::MAX, 5]),
+            ([2, 4, -9, 0], [1, 1, 0, 0, 0]),
+            ([3, 1, i64::MAX - 1, i64::MAX], [1, 0, 0, i64::MAX, 0]),
+        ] {
+            assert_eq!(w396_compute(3, 0, &ints(&input)), Some(ints(&expected)));
+        }
+        for (input, expected) in [
+            (
+                [i64::MAX, i64::MAX, i64::MIN, 0],
+                [i64::MAX, i64::MAX, 0, 0, 0],
+            ),
+            ([0, -5, 0, -5], [0, 0, 1, 0, 0]),
+            ([10, 5, 0, 0], [15, 15, 0, 0, 0]),
+            ([0, 10, 4, i64::MAX], [10, 6, 0, 1, 1]),
+        ] {
+            assert_eq!(w396_compute(4, 0, &ints(&input)), Some(ints(&expected)));
+        }
+        assert_eq!(
+            w396_compute(
+                5,
+                0,
+                &statuses(i64::MAX, &[b"verifying", b"stale", b"\xff"])
+            ),
+            Some(ints(&[3, 1, 1, 0, 1, 1]))
+        );
+        assert_eq!(
+            w396_compute(5, 0, &statuses(-1, &[])),
+            Some(ints(&[0, 0, 0, 0, 0, 0]))
+        );
+    }
+
+    #[test]
+    fn w396_ffi_validation_and_retry_never_write_on_negative() {
+        for (op, flags, input, expected) in fixtures() {
+            let mut out = [90_u8; 256];
+            let call = |p, len, o, cap, flag| unsafe {
+                nntmux_w396_verification_store_prelock_manifest_reset(op, flag, p, len, o, cap)
+            };
+            let invalid = [
+                (std::ptr::null(), input.len(), out.as_mut_ptr(), 256),
+                (input.as_ptr(), input.len(), std::ptr::null_mut(), 256),
+                (input.as_ptr(), W396_MAX_INPUT + 1, out.as_mut_ptr(), 256),
+                (
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    W396_MAX_INPUT + 1,
+                ),
+                (input.as_ptr(), usize::MAX, out.as_mut_ptr(), 256),
+                (input.as_ptr(), input.len(), out.as_mut_ptr(), usize::MAX),
+                (usize::MAX as *const u8, input.len(), out.as_mut_ptr(), 256),
+                (input.as_ptr(), input.len(), usize::MAX as *mut u8, 256),
+                (out.as_ptr(), input.len(), out.as_mut_ptr(), 256),
+            ];
+            for (p, len, o, cap) in invalid {
+                assert_eq!(call(p, len, o, cap, flags), -1);
+                assert_eq!(out, [90; 256]);
+            }
+            for len in 0..input.len() {
+                assert_eq!(call(input.as_ptr(), len, out.as_mut_ptr(), 256, flags), -1);
+                assert_eq!(out, [90; 256]);
+            }
+            let mut trailing = input.clone();
+            trailing.push(0);
+            assert_eq!(
+                call(
+                    trailing.as_ptr(),
+                    trailing.len(),
+                    out.as_mut_ptr(),
+                    256,
+                    flags
+                ),
+                -1
+            );
+            for flag in 0..=255 {
+                if flag > 1 || (op != 5 && flag != 0) {
+                    assert_eq!(
+                        call(input.as_ptr(), input.len(), out.as_mut_ptr(), 256, flag),
+                        -1
+                    );
+                    assert_eq!(out, [90; 256]);
+                }
+            }
+            for cap in [0, 1, expected.len() - 1] {
+                assert_eq!(
+                    call(input.as_ptr(), input.len(), out.as_mut_ptr(), cap, flags),
+                    -(expected.len() as isize)
+                );
+                assert_eq!(out, [90; 256]);
+            }
+            assert_eq!(
+                call(
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    expected.len(),
+                    flags
+                ),
+                expected.len() as isize
+            );
+            assert_eq!(&out[..expected.len()], expected.as_slice());
+            assert!(out[expected.len()..].iter().all(|b| *b == 90));
+        }
+        for op in [0, 6, 255] {
+            assert_eq!(w396_compute(op, 0, b""), None);
+        }
+        assert_eq!(w396_compute(2, 0, &ints(&[0, -1])), None);
+        assert_eq!(w396_compute(2, 0, &ints(&[0, i64::MAX])), None);
+        let mut huge = ints(&[1]);
+        huge.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(w396_compute(5, 0, &huge), None);
+    }
+}
