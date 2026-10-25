@@ -498,4 +498,231 @@ final class ImageCandidate
 
         return $buffer === null ? null : [$ffi, $buffer];
     }
+
+    // PHP stays the default: the paired W53.6 benchmark keeps uncommon p99 below 1.5x (copying long ID
+    // lists across FFI costs about as much as the deduplication PHP does natively).
+    private const bool W53_RUST_FFI_DEFAULT = false;
+
+    public const string W53_FFI_CDEF = <<<'C'
+        int32_t nntmux_w536_message_id_plan_batch(const char *ids, size_t ids_len, const char *id_twin, size_t id_twin_len, const char *counts, size_t counts_len, size_t count, int64_t *out, size_t out_count);
+        C;
+
+    public const int W53_MESSAGE_HEADER = 8;
+
+    /** Saturation of a 14-bit row count. */
+    private const int W53_FIELD_CAP = 16_383;
+
+    private const int W53_MAX_ITEMS = 1_048_576;
+
+    /**
+     * `normalizeCandidateDescriptorPhp()`'s message-ID cleanup over candidates, plus cross-candidate sharing.
+     *
+     * IDs are trimmed; empty ones and repeats within a candidate are dropped. Layout: `[0]`
+     * candidates, `[1]` IDs, `[2]` kept IDs, `[3]` distinct IDs, `[4]` candidates without a kept ID,
+     * `[5]` candidates sharing an ID with an earlier candidate, `[6]` most IDs kept by one candidate,
+     * `[7]` FNV-1a digest; then per candidate `kept | dropped << 14 | shared << 28 | leader << 42`,
+     * the counts saturating at 2^14-1 and `leader` the earliest candidate it shares an ID with
+     * (itself when none). Rust handles up to 2^20 candidates and IDs; PHP computes larger batches.
+     *
+     * @param  array<array-key, array<array-key, string>>  $messageIdLists
+     * @return list<int>
+     */
+    public static function messageIdPlanBatch(array $messageIdLists): array
+    {
+        return (self::usesW53RustFfi() ? self::messageIdPlanBatchNative($messageIdLists) : null)
+            ?? self::messageIdPlanBatchPhp($messageIdLists);
+    }
+
+    /**
+     * @param  array<array-key, array<array-key, string>>  $messageIdLists
+     * @return list<int>
+     */
+    public static function messageIdPlanBatchPhp(array $messageIdLists): array
+    {
+        $cap = self::W53_FIELD_CAP;
+        $out = array_fill(0, self::W53_MESSAGE_HEADER, 0);
+        $digest = 2_166_136_261;
+        $first = $last = $rows = [];
+        $candidate = 0;
+        foreach ($messageIdLists as $ids) {
+            $kept = $dropped = $shared = 0;
+            $leader = $candidate;
+            foreach ($ids as $id) {
+                $id = trim($id);
+                if ($id === '') {
+                    $dropped++;
+
+                    continue;
+                }
+                $seen = $last[$id] ?? null;
+                if ($seen === null) {
+                    $first[$id] = $last[$id] = $candidate;
+                    $kept++;
+                    $out[3]++;
+                } elseif ($seen === $candidate) {
+                    $dropped++;
+                } else {
+                    $last[$id] = $candidate;
+                    $kept++;
+                    $shared++;
+                    if ($first[$id] < $leader) {
+                        $leader = $first[$id];
+                    }
+                }
+            }
+            $out[1] += \count($ids);
+            $out[2] += $kept;
+            if ($kept === 0) {
+                $out[4]++;
+            }
+            if ($shared > 0) {
+                $out[5]++;
+            }
+            if ($kept > $out[6]) {
+                $out[6] = $kept;
+            }
+            $row = min($kept, $cap) | min($dropped, $cap) << 14 | min($shared, $cap) << 28 | $leader << 42;
+            $digest = (($digest ^ (($row ^ ($row >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+            $rows[] = $row;
+            $candidate++;
+        }
+        $out[0] = $candidate;
+        $out[7] = $digest;
+
+        return [...$out, ...$rows];
+    }
+
+    /**
+     * Rust plans, or null when PHP must compute them (unavailable library or rejected input).
+     *
+     * @param  array<array-key, array<array-key, string>>  $messageIdLists
+     * @return list<int>|null
+     */
+    public static function messageIdPlanBatchNative(array $messageIdLists): ?array
+    {
+        $lists = array_is_list($messageIdLists) ? $messageIdLists : array_values($messageIdLists);
+        $count = \count($lists);
+        $counts = [];
+        foreach ($lists as $ids) {
+            $counts[] = \count($ids);
+        }
+        $ids = $lists === [] ? [] : array_merge(...$lists);
+        if (\count($ids) !== array_sum($counts)) {
+            // array_merge() collapsed string keys repeated across candidates.
+            $ids = [];
+            foreach ($lists as $list) {
+                foreach ($list as $id) {
+                    $ids[] = $id;
+                }
+            }
+        }
+        if ($count > self::W53_MAX_ITEMS || \count($ids) > self::W53_MAX_ITEMS) {
+            return null;
+        }
+        $packed = pack('q*', ...$counts);
+        $fields = self::W53_MESSAGE_HEADER + $count;
+        $plan = static fn (string $joined, string $twin): ?array => self::w53Call(
+            $fields,
+            // @phpstan-ignore method.notFound
+            static fn (FFI $ffi, CData $out): mixed => $ffi->nntmux_w536_message_id_plan_batch($joined, \strlen($joined), $twin, \strlen($twin), $packed, \strlen($packed), $count, $out, $fields),
+        );
+        // IDs are joined with "\0\x01"; Rust rejects the batch when an ID holds that pair (it then
+        // splits into too many items), and it is resent NUL-joined with the same list joined with 0x01.
+        $result = $plan(implode("\0\x01", $ids), '');
+        if ($result !== null || $ids === [] || self::w53RustFfiState('binding', $fields) === null) {
+            return $result;
+        }
+
+        return $plan(implode("\0", $ids), implode("\x01", $ids));
+    }
+
+    /**
+     * Run `$callback` with the Wave 53.6 Rust batch path forced on or off, then restore the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW53RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w53RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w53RustFfiState('set', $previous);
+        }
+    }
+
+    public static function usesW53RustFfi(): bool
+    {
+        $forced = self::w53RustFfiState();
+
+        return \is_bool($forced) ? $forced : self::W53_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Wave 53.6 routing and binding, kept in function statics. No `$op` returns the forced routing (null
+     * for the default); `'set'` replaces it with `$val` and returns the previous value; `'binding'`
+     * returns the cached `additional_w53` binding and an output buffer of at least `$val` values, or null.
+     */
+    private static function w53RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $enabled */
+        static $enabled = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $buffer */
+        static $buffer = null;
+        static $capacity = 0;
+        if ($op === 'set') {
+            $previous = $enabled;
+            $enabled = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op !== 'binding') {
+            return $enabled;
+        }
+        $fields = \is_int($val) ? $val : 0;
+        try {
+            $ffi ??= RustPipelineLibrary::resolveDomain('additional_w53', self::W53_FFI_CDEF) ?? false;
+            if ($ffi === false) {
+                return null;
+            }
+            if ($buffer === null || $capacity < $fields) {
+                $capacity = max(256, $fields);
+                $buffer = $ffi->new('int64_t['.$capacity.']');
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $buffer === null ? null : [$ffi, $buffer];
+    }
+
+    /**
+     * The batch's `$fields` output words from one Wave 53.6 call, or null when PHP must compute it.
+     *
+     * @param  callable(FFI, CData): mixed  $call
+     * @return list<int>|null
+     */
+    private static function w53Call(int $fields, callable $call): ?array
+    {
+        /** @var array{0: FFI, 1: CData}|null $binding */
+        $binding = self::w53RustFfiState('binding', $fields);
+        if ($binding === null) {
+            return null;
+        }
+        try {
+            if ($call($binding[0], $binding[1]) !== 1) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($binding[1], $fields * 8));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $values === false ? null : array_values($values);
+    }
 }

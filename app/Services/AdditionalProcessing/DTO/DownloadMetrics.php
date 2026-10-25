@@ -286,4 +286,219 @@ final class DownloadMetrics
     {
         return \count($values) === $count && array_is_list($values) ? $values : array_pad(\array_slice(array_values($values), 0, $count), $count, 0);
     }
+
+    // Rust is the default only while the paired W53.6 benchmark clears 1.5x on all four metrics.
+    private const bool W53_RUST_FFI_DEFAULT = true;
+
+    public const string W53_FFI_CDEF = <<<'C'
+        int32_t nntmux_w536_transfer_efficiency_batch(const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_count);
+        C;
+
+    public const int W53_TRANSFER_HEADER = 12;
+
+    private const int W53_MAX_ITEMS = 1_048_576;
+
+    /**
+     * `summarizeTransferEfficiencyPhp()` over counter rows, as integer parts per million.
+     *
+     * Counters are clamped to [0, 2^40) and totals to 2^62; missing counters are 0. Layout: `[0]`
+     * count, `[1..6]` logical/network/cache-hit/downloaded/reused/media totals, `[7]` requests saved
+     * (logical minus network, never negative), `[8]` mean cache-hit ppm, `[9]` mean byte-reuse ppm,
+     * `[10]` flagged rows, `[11]` FNV-1a digest; then per row `cache | reuse << 20 | media << 40 |
+     * flags << 60`, where flag bit 0 is logical requests without network requests, bit 1 more hits
+     * than logical requests and bit 2 more media bytes than downloaded bytes.
+     *
+     * @param  array<array-key, int>  $logicalRequests
+     * @param  array<array-key, int>  $networkRequests
+     * @param  array<array-key, int>  $cacheHits
+     * @param  array<array-key, int>  $bytesDownloaded
+     * @param  array<array-key, int>  $bytesReused
+     * @param  array<array-key, int>  $mediaBytesDownloaded
+     * @return list<int>
+     */
+    public static function transferEfficiencyBatch(array $logicalRequests, array $networkRequests, array $cacheHits, array $bytesDownloaded, array $bytesReused, array $mediaBytesDownloaded): array
+    {
+        return (self::usesW53RustFfi() ? self::transferEfficiencyBatchNative($logicalRequests, $networkRequests, $cacheHits, $bytesDownloaded, $bytesReused, $mediaBytesDownloaded) : null)
+            ?? self::transferEfficiencyBatchPhp($logicalRequests, $networkRequests, $cacheHits, $bytesDownloaded, $bytesReused, $mediaBytesDownloaded);
+    }
+
+    /**
+     * @param  array<array-key, int>  $logicalRequests
+     * @param  array<array-key, int>  $networkRequests
+     * @param  array<array-key, int>  $cacheHits
+     * @param  array<array-key, int>  $bytesDownloaded
+     * @param  array<array-key, int>  $bytesReused
+     * @param  array<array-key, int>  $mediaBytesDownloaded
+     * @return list<int>
+     */
+    public static function transferEfficiencyBatchPhp(array $logicalRequests, array $networkRequests, array $cacheHits, array $bytesDownloaded, array $bytesReused, array $mediaBytesDownloaded): array
+    {
+        $logicalRequests = array_values($logicalRequests);
+        $networkRequests = array_values($networkRequests);
+        $cacheHits = array_values($cacheHits);
+        $bytesDownloaded = array_values($bytesDownloaded);
+        $bytesReused = array_values($bytesReused);
+        $mediaBytesDownloaded = array_values($mediaBytesDownloaded);
+        $count = \count($logicalRequests);
+        $cap = self::W47_VALUE_CAP;
+        $totalCap = self::W47_TOTAL_CAP;
+        $out = array_fill(0, self::W53_TRANSFER_HEADER, 0);
+        $out[0] = $count;
+        $cacheSum = $reuseSum = 0;
+        $digest = 2_166_136_261;
+        $rows = [];
+        for ($i = 0; $i < $count; $i++) {
+            $logical = min(max($logicalRequests[$i], 0), $cap);
+            $network = min(max($networkRequests[$i] ?? 0, 0), $cap);
+            $hits = min(max($cacheHits[$i] ?? 0, 0), $cap);
+            $downloaded = min(max($bytesDownloaded[$i] ?? 0, 0), $cap);
+            $reused = min(max($bytesReused[$i] ?? 0, 0), $cap);
+            $media = min(max($mediaBytesDownloaded[$i] ?? 0, 0), $cap);
+            $out[1] = min($out[1] + $logical, $totalCap);
+            $out[2] = min($out[2] + $network, $totalCap);
+            $out[3] = min($out[3] + $hits, $totalCap);
+            $out[4] = min($out[4] + $downloaded, $totalCap);
+            $out[5] = min($out[5] + $reused, $totalCap);
+            $out[6] = min($out[6] + $media, $totalCap);
+            $out[7] = min($out[7] + max($logical - $network, 0), $totalCap);
+            $cache = $logical > 0 ? min(intdiv($hits * 1_000_000, $logical), 1_000_000) : 0;
+            $total = $downloaded + $reused;
+            $reuse = $total > 0 ? intdiv($reused * 1_000_000, $total) : 0;
+            $share = $downloaded > 0 ? min(intdiv($media * 1_000_000, $downloaded), 1_000_000) : 0;
+            $flags = ($logical > 0 && $network === 0 ? 1 : 0) | ($hits > $logical ? 2 : 0) | ($media > $downloaded ? 4 : 0);
+            $cacheSum += $cache;
+            $reuseSum += $reuse;
+            if ($flags !== 0) {
+                $out[10]++;
+            }
+            $row = $cache | $reuse << 20 | $share << 40 | $flags << 60;
+            $digest = (($digest ^ (($row ^ ($row >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+            $rows[] = $row;
+        }
+        if ($count > 0) {
+            $out[8] = intdiv($cacheSum, $count);
+            $out[9] = intdiv($reuseSum, $count);
+        }
+        $out[11] = $digest;
+
+        return [...$out, ...$rows];
+    }
+
+    /**
+     * Rust summaries, or null when PHP must compute them (unavailable library or rejected input).
+     *
+     * @param  array<array-key, int>  $logicalRequests
+     * @param  array<array-key, int>  $networkRequests
+     * @param  array<array-key, int>  $cacheHits
+     * @param  array<array-key, int>  $bytesDownloaded
+     * @param  array<array-key, int>  $bytesReused
+     * @param  array<array-key, int>  $mediaBytesDownloaded
+     * @return list<int>|null
+     */
+    public static function transferEfficiencyBatchNative(array $logicalRequests, array $networkRequests, array $cacheHits, array $bytesDownloaded, array $bytesReused, array $mediaBytesDownloaded): ?array
+    {
+        $count = \count($logicalRequests);
+        if ($count > self::W53_MAX_ITEMS) {
+            return null;
+        }
+        $ints = pack(
+            'q*',
+            ...self::w47Fit($logicalRequests, $count), ...self::w47Fit($networkRequests, $count), ...self::w47Fit($cacheHits, $count),
+            ...self::w47Fit($bytesDownloaded, $count), ...self::w47Fit($bytesReused, $count), ...self::w47Fit($mediaBytesDownloaded, $count),
+        );
+        $fields = self::W53_TRANSFER_HEADER + $count;
+
+        // @phpstan-ignore method.notFound
+        return self::w53Call($fields, static fn (FFI $ffi, CData $out): mixed => $ffi->nntmux_w536_transfer_efficiency_batch($ints, \strlen($ints), $count, $out, $fields));
+    }
+
+    /**
+     * Run `$callback` with the Wave 53.6 Rust batch path forced on or off, then restore the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW53RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w53RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w53RustFfiState('set', $previous);
+        }
+    }
+
+    public static function usesW53RustFfi(): bool
+    {
+        $forced = self::w53RustFfiState();
+
+        return \is_bool($forced) ? $forced : self::W53_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Wave 53.6 routing and binding, kept in function statics. No `$op` returns the forced routing (null
+     * for the default); `'set'` replaces it with `$val` and returns the previous value; `'binding'`
+     * returns the cached `additional_w53` binding and an output buffer of at least `$val` values, or null.
+     */
+    private static function w53RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $enabled */
+        static $enabled = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $buffer */
+        static $buffer = null;
+        static $capacity = 0;
+        if ($op === 'set') {
+            $previous = $enabled;
+            $enabled = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op !== 'binding') {
+            return $enabled;
+        }
+        $fields = \is_int($val) ? $val : 0;
+        try {
+            $ffi ??= RustPipelineLibrary::resolveDomain('additional_w53', self::W53_FFI_CDEF) ?? false;
+            if ($ffi === false) {
+                return null;
+            }
+            if ($buffer === null || $capacity < $fields) {
+                $capacity = max(256, $fields);
+                $buffer = $ffi->new('int64_t['.$capacity.']');
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $buffer === null ? null : [$ffi, $buffer];
+    }
+
+    /**
+     * The batch's `$fields` output words from one Wave 53.6 call, or null when PHP must compute it.
+     *
+     * @param  callable(FFI, CData): mixed  $call
+     * @return list<int>|null
+     */
+    private static function w53Call(int $fields, callable $call): ?array
+    {
+        /** @var array{0: FFI, 1: CData}|null $binding */
+        $binding = self::w53RustFfiState('binding', $fields);
+        if ($binding === null) {
+            return null;
+        }
+        try {
+            if ($call($binding[0], $binding[1]) !== 1) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($binding[1], $fields * 8));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $values === false ? null : array_values($values);
+    }
 }
