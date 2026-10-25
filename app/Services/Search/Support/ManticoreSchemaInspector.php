@@ -16,11 +16,29 @@ final class ManticoreSchemaInspector
         ssize_t nntmux_manticore_schema_missing_settings_nul(const char *actual_nul, size_t actual_len, size_t actual_count, const char *expected_nul, size_t expected_len, size_t expected_count, char *out_buf, size_t out_cap);
         C;
 
+    public const string W43_FFI_CDEF = 'int32_t nntmux_w435_manticore_release_browse_duplicate_group_mgmt(uint32_t mode, const char *input, size_t input_len, char *out, size_t cap);';
+
+    /**
+     * Rust stays opt-in for the Wave 43.5 summary: the FFI round trip misses the 1.5x gate; see
+     * tests/Unit/RustManticoreSchemaReleaseBrowseDuplicateGroupMgmtW43ParityTest.php.
+     */
+    public const bool W43_MANTICORE_SCHEMA_RUST_FFI_DEFAULT = false;
+
+    private const int W43_NATIVE_MAX_PARTS = 1 << 20;
+
+    private const int W43_NATIVE_MAX_BYTES = 16777216;
+
+    private const string SETTING_LINE = '/^\s*([a-z0-9_]+)\s*=\s*[\'\"]?([^\'\"]+?)[\'\"]?\s*$/i';
+
     private static FFI|false|null $ffi = null;
 
     private static ?CData $outBuf1024 = null;
 
     private static bool $useRustFfi = true;
+
+    private static ?bool $useW43RustFfi = null;
+
+    private static FFI|false|null $w43Ffi = null;
 
     public static function setUseRustFfi(bool $enabled): void
     {
@@ -427,6 +445,213 @@ final class ManticoreSchemaInspector
         return ['missing' => $missing, 'incompatible' => $incompatible];
     }
 
+    /** Pass null to restore {@see W43_MANTICORE_SCHEMA_RUST_FFI_DEFAULT}. */
+    public static function useW43RustFfi(?bool $enable = true): void
+    {
+        self::$useW43RustFfi = $enable;
+    }
+
+    public static function usesW43RustFfi(): bool
+    {
+        return self::$useW43RustFfi ?? self::W43_MANTICORE_SCHEMA_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Summarizes `SHOW TABLE SETTINGS` blobs as {@see normalizeSettings()} parses them. `lines` counts
+     * `\R`-separated lines, `settings` the lines that parse, `distinct_keys` and `max_settings_per_blob`
+     * the lowercased keys, and `compliant_blobs` the blobs for which {@see missingSettingsPhp()} reports
+     * nothing missing. Non-string blobs are invalid.
+     *
+     * @param  array<array-key, mixed>  $blobs
+     * @param  array<array-key, scalar|\Stringable|null>  $expected
+     * @return array{blobs: int, invalid: int, lines: int, settings: int, distinct_keys: int, max_settings_per_blob: int, compliant_blobs: int}
+     */
+    public static function summarizeSettingsBlobBatch(array $blobs, array $expected = []): array
+    {
+        return self::usesW43RustFfi() ? self::summarizeSettingsBlobBatchNative($blobs, $expected) : self::summarizeSettingsBlobBatchPhp($blobs, $expected);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $blobs
+     * @param  array<array-key, scalar|\Stringable|null>  $expected
+     * @return array{blobs: int, invalid: int, lines: int, settings: int, distinct_keys: int, max_settings_per_blob: int, compliant_blobs: int}
+     */
+    public static function summarizeSettingsBlobBatchPhp(array $blobs, array $expected = []): array
+    {
+        $wanted = [];
+        foreach ($expected as $setting => $value) {
+            $wanted[] = [strtolower((string) $setting), strtolower((string) $value)];
+        }
+        $invalid = 0;
+        $lines = 0;
+        $matched = 0;
+        $widest = 0;
+        $compliant = 0;
+        $keys = [];
+        foreach ($blobs as $blob) {
+            if (! \is_string($blob)) {
+                $invalid++;
+
+                continue;
+            }
+            $settings = [];
+            foreach (preg_split('/\R/', $blob) ?: [] as $line) {
+                $lines++;
+                if (preg_match(self::SETTING_LINE, $line, $match) === 1) {
+                    $matched++;
+                    $settings[strtolower($match[1])] = strtolower(trim($match[2]));
+                }
+            }
+            $widest = max($widest, \count($settings));
+            $ok = 1;
+            foreach ($wanted as [$setting, $value]) {
+                if (! isset($settings[$setting]) || $settings[$setting] !== $value) {
+                    $ok = 0;
+                    break;
+                }
+            }
+            $compliant += $ok;
+            $keys += $settings;
+        }
+
+        return [
+            'blobs' => \count($blobs),
+            'invalid' => $invalid,
+            'lines' => $lines,
+            'settings' => $matched,
+            'distinct_keys' => \count($keys),
+            'max_settings_per_blob' => $widest,
+            'compliant_blobs' => $compliant,
+        ];
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $blobs
+     * @param  array<array-key, scalar|\Stringable|null>  $expected
+     * @return array{blobs: int, invalid: int, lines: int, settings: int, distinct_keys: int, max_settings_per_blob: int, compliant_blobs: int}
+     */
+    public static function summarizeSettingsBlobBatchNative(array $blobs, array $expected = []): array
+    {
+        $parts = [(string) \count($expected)];
+        foreach ($expected as $setting => $value) {
+            if (! \is_scalar($value) && $value !== null) {
+                return self::summarizeSettingsBlobBatchPhp($blobs, $expected);
+            }
+            array_push($parts, (string) $setting, (string) $value);
+        }
+        foreach ($blobs as $blob) {
+            if (\is_string($blob)) {
+                array_push($parts, '1', $blob);
+            } else {
+                $parts[] = '0';
+            }
+        }
+        $fields = self::evaluateW43Native(1, $parts);
+        if ($fields === null || \count($fields) !== 7) {
+            return self::summarizeSettingsBlobBatchPhp($blobs, $expected);
+        }
+
+        return [
+            'blobs' => (int) $fields[0],
+            'invalid' => (int) $fields[1],
+            'lines' => (int) $fields[2],
+            'settings' => (int) $fields[3],
+            'distinct_keys' => (int) $fields[4],
+            'max_settings_per_blob' => (int) $fields[5],
+            'compliant_blobs' => (int) $fields[6],
+        ];
+    }
+
+    /**
+     * Shared Wave 43.5 bridge for the search and release summaries; null means the library is
+     * unavailable or declined the packet, so callers fall back to PHP.
+     *
+     * @param  list<string>  $parts
+     * @return list<string>|null
+     */
+    public static function evaluateW43Native(int $mode, array $parts): ?array
+    {
+        $ffi = self::w43Ffi();
+        if ($ffi === null || $mode < 0 || \count($parts) > self::W43_NATIVE_MAX_PARTS) {
+            return null;
+        }
+
+        try {
+            $input = pack('V', \count($parts));
+            foreach ($parts as $part) {
+                $input .= pack('V', \strlen($part)).$part;
+            }
+            if (\strlen($input) > self::W43_NATIVE_MAX_BYTES) {
+                return null;
+            }
+
+            $minBytes = 1024;
+            for ($attempt = 0; $attempt < 2; $attempt++) {
+                $capacity = 0;
+                $out = RustPipelineLibrary::obtainScratch($ffi, $minBytes, $capacity);
+                if ($out === null) {
+                    return null;
+                }
+                $capacity = min($capacity, self::W43_NATIVE_MAX_BYTES);
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w435_manticore_release_browse_duplicate_group_mgmt($mode, $input, \strlen($input), $out, $capacity);
+                if (! \is_int($written)) {
+                    return null;
+                }
+                if ($written >= 4 && $written <= $capacity) {
+                    return self::unpackW43(FFI::string($out, $written));
+                }
+                if ($written > -4 || -$written <= $capacity || -$written > self::W43_NATIVE_MAX_BYTES) {
+                    return null;
+                }
+                $minBytes = -$written;
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        return null;
+    }
+
+    /** @return list<string>|null */
+    private static function unpackW43(string $packet): ?array
+    {
+        $length = \strlen($packet);
+        $header = unpack('V', $packet);
+        $count = \is_array($header) ? $header[1] : null;
+        if (! \is_int($count) || $count > intdiv($length - 4, 4)) {
+            return null;
+        }
+
+        $offset = 4;
+        $parts = [];
+        for ($i = 0; $i < $count; $i++) {
+            if ($offset + 4 > $length) {
+                return null;
+            }
+            $size = unpack('V', $packet, $offset);
+            $size = \is_array($size) ? $size[1] : null;
+            $offset += 4;
+            if (! \is_int($size) || $size > $length - $offset) {
+                return null;
+            }
+            $parts[] = substr($packet, $offset, $size);
+            $offset += $size;
+        }
+
+        return $offset === $length ? $parts : null;
+    }
+
+    private static function w43Ffi(): ?FFI
+    {
+        if (self::$w43Ffi === null) {
+            $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+            self::$w43Ffi = RustPipelineLibrary::resolveDomain('search_w435', self::W43_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+        }
+
+        return self::$w43Ffi instanceof FFI ? self::$w43Ffi : null;
+    }
+
     private static function resolveFfi(): ?FFI
     {
         if (self::$ffi !== null) {
@@ -471,7 +696,7 @@ final class ManticoreSchemaInspector
             if (is_string($key) && ! is_array($value)) {
                 if (strtolower($key) === 'settings' && is_string($value)) {
                     foreach (preg_split('/\R/', $value) ?: [] as $line) {
-                        if (preg_match('/^\s*([a-z0-9_]+)\s*=\s*[\'\"]?([^\'\"]+?)[\'\"]?\s*$/i', $line, $match) === 1) {
+                        if (preg_match(self::SETTING_LINE, $line, $match) === 1) {
                             $settings[strtolower($match[1])] = strtolower(trim($match[2]));
                         }
                     }
