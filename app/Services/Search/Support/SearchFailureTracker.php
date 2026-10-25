@@ -7,6 +7,8 @@ namespace App\Services\Search\Support;
 use App\Services\Search\SearchService;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
+use Throwable;
 
 /**
  * Counts search-engine query failures within the current request or job.
@@ -238,5 +240,154 @@ final class SearchFailureTracker
             'remaining_cooldown_seconds' => $remaining,
             'trip_on_next_failure' => $halfOpen,
         ];
+    }
+
+    public const string W50_FFI_CDEF = 'int64_t nntmux_w505_search_failure_window(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /**
+     * Disabled: the common-path gains stay below 1.5x because the per-record PHP work is cheaper than packing
+     * and decoding the batch (see RustProbesRedisSearchRegistryCursorFailureW50ParityTest::QUALIFICATION).
+     */
+    private const W50_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $w50RustFfi = null;
+
+    private static FFI|false|null $w50Ffi = null;
+
+    private static ?CData $w50Out = null;
+
+    private static int $w50OutCap = 0;
+
+    public static function usesW50RustFfi(): bool
+    {
+        return self::$w50RustFfi ?? self::W50_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the Wave 50.5 batch helper routed to Rust ($enabled) or PHP, then restores the previous
+     * routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW50RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$w50RustFfi;
+        self::$w50RustFfi = $enabled;
+
+        try {
+            return $callback();
+        } finally {
+            self::$w50RustFfi = $previous;
+        }
+    }
+
+    /**
+     * Evaluates many tracker snapshots against one threshold, clock and cooldown. Two words per snapshot,
+     * aligned with $counts: `[failedSince($baseline) | reachedThreshold($threshold) << 1 | state (0 closed,
+     * 1 open, 2 half_open) << 2 | allow_probe << 4 | trip_on_next_failure << 5, remaining_cooldown_seconds]`,
+     * with the rules of failedSincePhp(), reachedThresholdPhp() and evaluateCircuitStateWindow().
+     *
+     * @param  list<int>  $counts
+     * @param  list<int>  $baselines
+     * @param  list<int>  $openedAtUnix
+     * @return list<int>
+     */
+    public static function failureWindowBatch(array $counts, array $baselines, array $openedAtUnix, int $threshold, int $nowUnix, int $cooldownSeconds = 60): array
+    {
+        return self::usesW50RustFfi()
+            ? self::failureWindowBatchNative($counts, $baselines, $openedAtUnix, $threshold, $nowUnix, $cooldownSeconds)
+            : self::failureWindowBatchPhp($counts, $baselines, $openedAtUnix, $threshold, $nowUnix, $cooldownSeconds);
+    }
+
+    /**
+     * @param  list<int>  $counts
+     * @param  list<int>  $baselines
+     * @param  list<int>  $openedAtUnix
+     * @return list<int>
+     */
+    public static function failureWindowBatchPhp(array $counts, array $baselines, array $openedAtUnix, int $threshold, int $nowUnix, int $cooldownSeconds = 60): array
+    {
+        $clamped = max(1, $threshold);
+        $cooldown = max(0, $cooldownSeconds);
+        $out = [];
+        foreach ($counts as $i => $count) {
+            $flags = (int) ($count !== $baselines[$i]) | (int) ($threshold > 0 && $count >= $threshold) << 1;
+            $failures = max(0, $count);
+            if ($failures < $clamped) {
+                array_push($out, $flags | (int) ($failures >= $clamped - 1) << 5, 0);
+
+                continue;
+            }
+            $openedAt = $openedAtUnix[$i];
+            $elapsed = match (true) {
+                $openedAt > $nowUnix => 0,
+                $openedAt < 0 && $nowUnix > PHP_INT_MAX + $openedAt => PHP_INT_MAX,
+                default => $nowUnix - $openedAt,
+            };
+            $remaining = max(0, $cooldown - $elapsed);
+            array_push($out, $flags | ($remaining === 0 ? 0b111000 : 0b100), $remaining);
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or the columns differ in length.
+     *
+     * @param  list<int>  $counts
+     * @param  list<int>  $baselines
+     * @param  list<int>  $openedAtUnix
+     * @return list<int>
+     */
+    public static function failureWindowBatchNative(array $counts, array $baselines, array $openedAtUnix, int $threshold, int $nowUnix, int $cooldownSeconds = 60): array
+    {
+        $count = \count($counts);
+        if ($count === 0 || \count($baselines) !== $count || \count($openedAtUnix) !== $count) {
+            return self::failureWindowBatchPhp($counts, $baselines, $openedAtUnix, $threshold, $nowUnix, $cooldownSeconds);
+        }
+
+        return self::w50Words($count, '', pack('P*', $threshold, $nowUnix, $cooldownSeconds, ...$counts, ...$baselines, ...$openedAtUnix), 2 * $count)
+            ?? self::failureWindowBatchPhp($counts, $baselines, $openedAtUnix, $threshold, $nowUnix, $cooldownSeconds);
+    }
+
+    /**
+     * Exactly $words output words from the Wave 50.5 Rust helper, or null to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w50Words(int $count, string $data, string $ints, int $words): ?array
+    {
+        if (self::$w50Ffi === null) {
+            $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+            self::$w50Ffi = RustPipelineLibrary::resolveDomain('search_w50', self::W50_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+            self::$w50Out = null;
+            self::$w50OutCap = 0;
+        }
+        $ffi = self::$w50Ffi;
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+
+        try {
+            if (self::$w50Out === null || $words > self::$w50OutCap) {
+                $cap = max(1024, $words);
+                self::$w50Out = $ffi->new('int64_t['.$cap.']');
+                self::$w50OutCap = $cap;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w505_search_failure_window($count, 0, $data, \strlen($data), $ints, \strlen($ints), self::$w50Out, self::$w50OutCap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('P*', FFI::string(self::$w50Out, $words * 8));
+
+            return \is_array($values) ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
     }
 }
