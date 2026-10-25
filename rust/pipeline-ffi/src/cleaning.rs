@@ -25903,3 +25903,708 @@ mod wave37_1_fix_names_reset_verify_tests {
         assert_eq!(&out[24..], &[0x5a; 16]);
     }
 }
+
+// Wave 38.1: per-article obfuscation gate/router sample summaries, admin release-name render
+// batches, post-processing category reset plans and admin bulk group-add plans. Integers are
+// native-endian i64 (PHP pack `q`); a string is an i64 byte length (-1 = PHP non-string)
+// followed by its raw bytes. Booleans travel in the `flags` word.
+pub mod wave38_1_obfuscation_gate_router_admin_names {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    pub const DECLINE: isize = -1;
+    pub const MAX_INPUT: usize = 16 * 1024 * 1024;
+
+    pub const OP_GATE_SAMPLE: u32 = 1;
+    pub const OP_ROUTER_COSTS: u32 = 2;
+    pub const OP_RENDER_BATCH: u32 = 3;
+    pub const OP_CATEGORY_RESET: u32 = 4;
+    pub const OP_BULK_ADD_PLAN: u32 = 5;
+
+    /// `PerArticleObfuscationRouter::COSTS`: [PHP base ns, PHP tenths of a ns per byte, Rust
+    /// base ns, Rust tenths of a ns per byte] by sampled class.
+    const COSTS: [[i64; 4]; 3] = [[210, 5, 265, 10], [80, 80, 110, 39], [1350, 60, 330, 37]];
+    const PREDICTED_SPEEDUP_PERCENT: i64 = 200;
+    const MAX_SUBJECT_LENGTH: i64 = 512;
+    /// `NntmuxResetPostProcessing::$allowedCategories`, in order; step codes index this list.
+    pub const CATEGORIES: [&[u8]; 8] = [
+        b"music", b"console", b"movie", b"game", b"tv", b"adult", b"book", b"misc",
+    ];
+    /// Categories whose reset also refreshes the search index (movie, tv, misc).
+    const REINDEXING_CATEGORIES: [usize; 3] = [2, 4, 7];
+
+    /// Flag bits accepted by each operation; any other bit declines.
+    pub fn allowed_flags(operation: u32) -> Option<u32> {
+        match operation {
+            OP_GATE_SAMPLE | OP_ROUTER_COSTS => Some(0),
+            OP_RENDER_BATCH | OP_CATEGORY_RESET => Some(0b1),
+            OP_BULK_ADD_PLAN => Some(0b111),
+            _ => None,
+        }
+    }
+
+    struct Reader<'a> {
+        bytes: &'a [u8],
+        offset: usize,
+    }
+
+    impl<'a> Reader<'a> {
+        fn take(&mut self, count: usize) -> Option<&'a [u8]> {
+            let end = self.offset.checked_add(count)?;
+            let value = self.bytes.get(self.offset..end)?;
+            self.offset = end;
+            Some(value)
+        }
+
+        fn integer(&mut self) -> Option<i64> {
+            Some(i64::from_ne_bytes(self.take(8)?.try_into().ok()?))
+        }
+
+        fn string(&mut self) -> Option<Option<&'a [u8]>> {
+            match self.integer()? {
+                -1 => Some(None),
+                len if len < 0 => None,
+                len => Some(Some(self.take(usize::try_from(len).ok()?)?)),
+            }
+        }
+
+        fn required_string(&mut self) -> Option<&'a [u8]> {
+            self.string()?
+        }
+
+        /// A list length whose entries each need at least `min_entry` bytes.
+        fn count(&mut self, min_entry: usize) -> Option<usize> {
+            let count = usize::try_from(self.integer()?).ok()?;
+            (count <= (self.bytes.len() - self.offset) / min_entry).then_some(count)
+        }
+    }
+
+    fn put_int(out: &mut Vec<u8>, value: i64) {
+        out.extend_from_slice(&value.to_ne_bytes());
+    }
+
+    fn put_string(out: &mut Vec<u8>, value: &[u8]) {
+        put_int(out, value.len() as i64);
+        out.extend_from_slice(value);
+    }
+
+    /// PCRE's non-UTF `\s`.
+    fn is_space(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// `PerArticleObfuscationGate::summarizeSubjectSamplePhp()`:
+    /// `[samples, strings, hits, may_carry_part_counts]`.
+    pub fn gate_sample(subjects: &[Option<&[u8]>]) -> [i64; 4] {
+        let strings = subjects.iter().flatten().count() as i64;
+        let hits = subjects
+            .iter()
+            .flatten()
+            .filter(|s| contains(s, b" ("))
+            .count() as i64;
+        [subjects.len() as i64, strings, hits, i64::from(hits >= 4)]
+    }
+
+    /// Whether `subject` holds a run of 16+ ASCII alphanumerics before byte `end`.
+    fn has_token(subject: &[u8], end: usize) -> bool {
+        let mut run = 0;
+        for &b in &subject[..end] {
+            if b.is_ascii_alphanumeric() {
+                run += 1;
+                if run >= 16 {
+                    return true;
+                }
+            } else {
+                run = 0;
+            }
+        }
+        false
+    }
+
+    /// `PerArticleObfuscationRouter::classifySample()`: 0 no part count, 1 a part count only,
+    /// 2 a candidate (first whitespace-led `(n/total)` with total >= 2 and a 16+ token before it).
+    pub fn classify_sample(subject: Option<&[u8]>) -> usize {
+        let Some(s) = subject else { return 0 };
+        if s.starts_with(b"Usenet Index Post") {
+            return 0;
+        }
+        let digits = |from: usize| {
+            s.get(from..)
+                .map_or(0, |t| t.iter().take_while(|b| b.is_ascii_digit()).count())
+        };
+        for open in s
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| **b == b'(')
+            .map(|(i, _)| i)
+        {
+            if open == 0 || !is_space(s[open - 1]) {
+                continue;
+            }
+            let part = digits(open + 1);
+            let total_at = open + 2 + part;
+            if part == 0 || s.get(total_at - 1) != Some(&b'/') {
+                continue;
+            }
+            let total = digits(total_at);
+            if total == 0 || s.get(total_at + total) != Some(&b')') {
+                continue;
+            }
+            let value = &s[total_at..total_at + total];
+            let significant = &value[value.iter().take_while(|b| **b == b'0').count()..];
+            let at_least_two =
+                significant.len() > 1 || significant.first().is_some_and(|d| *d >= b'2');
+            return if at_least_two && has_token(s, open) {
+                2
+            } else {
+                1
+            };
+        }
+        0
+    }
+
+    /// `PerArticleObfuscationRouter::summarizeSampleCostsPhp()`: `[no_part_count, part_count,
+    /// candidates, php_ns, rust_ns, max_length, predicts_speedup, within_subject_limit]`.
+    pub fn router_costs(subjects: &[Option<&[u8]>]) -> [i64; 8] {
+        let mut classes = [0_i64; 3];
+        let (mut php, mut rust, mut max_length) = (0_i64, 0_i64, 0_i64);
+        for subject in subjects {
+            let class = classify_sample(*subject);
+            let bytes = subject.map_or(0, |s| s.len() as i64);
+            let [php_base, php_per_byte, rust_base, rust_per_byte] = COSTS[class];
+            classes[class] += 1;
+            php += php_base + php_per_byte * bytes / 10;
+            rust += rust_base + rust_per_byte * bytes / 10;
+            max_length = max_length.max(bytes);
+        }
+        [
+            classes[0],
+            classes[1],
+            classes[2],
+            php,
+            rust,
+            max_length,
+            i64::from(php * 100 >= rust * PREDICTED_SPEEDUP_PERCENT),
+            i64::from(max_length <= MAX_SUBJECT_LENGTH),
+        ]
+    }
+
+    /// RFC 3986 unreserved bytes.
+    fn is_unreserved(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~')
+    }
+
+    /// `AdminReleaseNames::summarizeRenderBatchPhp()`: `[rows, native_eligible,
+    /// unreserved_guids, invalid_rows, identical_names, name_bytes]`; each row is
+    /// `[searchname, name, guid]`.
+    pub fn render_batch(rows: &[[Option<&[u8]>; 3]], native: bool) -> [i64; 6] {
+        let (mut unreserved, mut invalid, mut identical, mut bytes) = (0, 0, 0, 0);
+        for [searchname, name, guid] in rows {
+            if guid.is_some_and(|g| !g.is_empty() && g.iter().all(|b| is_unreserved(*b))) {
+                unreserved += 1;
+            }
+            if searchname.is_none() || name.is_none() || guid.is_none() {
+                invalid += 1;
+            }
+            if let (Some(a), Some(b)) = (searchname, name)
+                && a == b
+            {
+                identical += 1;
+            }
+            bytes += searchname.map_or(0, |s| s.len() as i64) + name.map_or(0, |s| s.len() as i64);
+        }
+        [
+            rows.len() as i64,
+            i64::from(native && rows.len() >= 16),
+            unreserved,
+            invalid,
+            identical,
+            bytes,
+        ]
+    }
+
+    /// `NntmuxResetPostProcessing::planCategoryResetPhp()`: `(action, reindexes_search,
+    /// invalid, steps)` where action is 1 refuse_environment, 2 invalid, 3 full, 4 categories
+    /// and steps index [`CATEGORIES`].
+    pub fn category_reset<'a>(
+        environment: &[u8],
+        first_option: Option<&[u8]>,
+        normalized: &[&'a [u8]],
+    ) -> (i64, bool, Vec<&'a [u8]>, Vec<i64>) {
+        if environment != b"local" && first_option != Some(b"misc") {
+            return (1, false, Vec::new(), Vec::new());
+        }
+        let index = |c: &[u8]| CATEGORIES.iter().position(|known| *known == c);
+        let invalid: Vec<&[u8]> = normalized
+            .iter()
+            .copied()
+            .filter(|c| index(c).is_none() && *c != b"all")
+            .collect();
+        if !invalid.is_empty() {
+            return (2, false, invalid, Vec::new());
+        }
+        if normalized.is_empty() || normalized.contains(&&b"all"[..]) {
+            return (3, true, Vec::new(), Vec::new());
+        }
+        let steps: Vec<usize> = normalized.iter().filter_map(|c| index(c)).collect();
+        let reindexes = steps.iter().any(|s| REINDEXING_CATEGORIES.contains(s));
+        (
+            4,
+            reindexes,
+            Vec::new(),
+            steps.into_iter().map(|s| s as i64).collect(),
+        )
+    }
+
+    /// `preg_match('/^\s*$/m', $list) === 1`: some line is empty or all whitespace. PCRE's
+    /// multiline `^` does not match after a final newline, so that empty tail never counts.
+    pub fn blank_group_list(list: &[u8]) -> bool {
+        let body = match list {
+            [rest @ .., b'\n'] => rest,
+            _ => list,
+        };
+        body.split(|b| *b == b'\n')
+            .any(|line| line.iter().all(|b| is_space(*b)))
+    }
+
+    /// `AdminGroupController::normalizeBulkAddPlanPhp()`:
+    /// `[submit, runs, blank_list, active, backfill]`.
+    pub fn bulk_add_plan(
+        action: &[u8],
+        filter: Option<&[u8]>,
+        active: Option<i64>,
+        backfill: Option<i64>,
+    ) -> [i64; 5] {
+        let submit = action == b"submit";
+        [
+            i64::from(submit),
+            i64::from(submit && filter.is_some_and(|f| !f.is_empty())),
+            i64::from(filter.is_some_and(blank_group_list)),
+            active.unwrap_or(1),
+            backfill.unwrap_or(1),
+        ]
+    }
+
+    fn read_subjects<'a>(reader: &mut Reader<'a>) -> Option<Vec<Option<&'a [u8]>>> {
+        let count = reader.count(8)?;
+        let mut subjects = Vec::with_capacity(count);
+        for _ in 0..count {
+            subjects.push(reader.string()?);
+        }
+        Some(subjects)
+    }
+
+    pub fn compute(operation: u32, flags: u32, bytes: &[u8]) -> Option<Vec<u8>> {
+        if flags & !allowed_flags(operation)? != 0 {
+            return None;
+        }
+        let flag = |bit: u32| flags & (1 << bit) != 0;
+        let mut reader = Reader { bytes, offset: 0 };
+        let mut out = Vec::new();
+        match operation {
+            OP_GATE_SAMPLE => {
+                for value in gate_sample(&read_subjects(&mut reader)?) {
+                    put_int(&mut out, value);
+                }
+            }
+            OP_ROUTER_COSTS => {
+                for value in router_costs(&read_subjects(&mut reader)?) {
+                    put_int(&mut out, value);
+                }
+            }
+            OP_RENDER_BATCH => {
+                let count = reader.count(24)?;
+                let mut rows = Vec::with_capacity(count);
+                for _ in 0..count {
+                    rows.push([reader.string()?, reader.string()?, reader.string()?]);
+                }
+                for value in render_batch(&rows, flag(0)) {
+                    put_int(&mut out, value);
+                }
+            }
+            OP_CATEGORY_RESET => {
+                let environment = reader.required_string()?;
+                let first = reader.required_string()?;
+                if !flag(0) && !first.is_empty() {
+                    return None;
+                }
+                let count = reader.count(8)?;
+                let mut normalized = Vec::with_capacity(count);
+                for _ in 0..count {
+                    normalized.push(reader.required_string()?);
+                }
+                let (action, reindexes, invalid, steps) =
+                    category_reset(environment, flag(0).then_some(first), &normalized);
+                for value in [
+                    action,
+                    i64::from(reindexes),
+                    invalid.len() as i64,
+                    steps.len() as i64,
+                ] {
+                    put_int(&mut out, value);
+                }
+                for value in invalid {
+                    put_string(&mut out, value);
+                }
+                for step in steps {
+                    put_int(&mut out, step);
+                }
+            }
+            OP_BULK_ADD_PLAN => {
+                let action = reader.required_string()?;
+                let filter = reader.required_string()?;
+                let (active, backfill) = (reader.integer()?, reader.integer()?);
+                if (!flag(0) && !filter.is_empty())
+                    || (!flag(1) && active != 0)
+                    || (!flag(2) && backfill != 0)
+                {
+                    return None;
+                }
+                let plan = bulk_add_plan(
+                    action,
+                    flag(0).then_some(filter),
+                    flag(1).then_some(active),
+                    flag(2).then_some(backfill),
+                );
+                for value in plan {
+                    put_int(&mut out, value);
+                }
+            }
+            _ => return None,
+        }
+        if reader.offset != bytes.len() || out.len() > MAX_INPUT {
+            return None;
+        }
+        Some(out)
+    }
+
+    /// Returns bytes written, `-required` when `out_cap` is too small, or -1 for an unknown
+    /// operation or flag bit, a malformed frame, invalid/overlapping pointer ranges or a caught
+    /// panic. Negative returns never modify `out_buf`; the caller owns both buffers.
+    ///
+    /// # Safety
+    /// `input` must be readable for `input_len` bytes and `out_buf` writable for `out_cap`
+    /// bytes. Both pointers must be nonnull and the ranges must not overlap.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w381_obfuscation_gate_router_admin_names(
+        operation: u32,
+        flags: u32,
+        input: *const u8,
+        input_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if allowed_flags(operation).is_none_or(|allowed| flags & !allowed != 0)
+                || input.is_null()
+                || out_buf.is_null()
+                || input_len > MAX_INPUT
+                || out_cap > isize::MAX as usize
+            {
+                return DECLINE;
+            }
+            let Some(input_end) = (input as usize).checked_add(input_len) else {
+                return DECLINE;
+            };
+            let Some(out_end) = (out_buf as usize).checked_add(out_cap) else {
+                return DECLINE;
+            };
+            if input_len != 0
+                && out_cap != 0
+                && (input as usize) < out_end
+                && (out_buf as usize) < input_end
+            {
+                return DECLINE;
+            }
+            let bytes = if input_len == 0 {
+                &[][..]
+            } else {
+                unsafe { slice::from_raw_parts(input, input_len) }
+            };
+            let Some(result) = compute(operation, flags, bytes) else {
+                return DECLINE;
+            };
+            if result.len() > out_cap {
+                return -(result.len() as isize);
+            }
+            unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), out_buf, result.len()) };
+            result.len() as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+}
+
+#[cfg(test)]
+mod wave38_1_obfuscation_gate_router_admin_names_tests {
+    use super::wave38_1_obfuscation_gate_router_admin_names::*;
+
+    fn string(out: &mut Vec<u8>, value: Option<&[u8]>) {
+        match value {
+            Some(bytes) => {
+                out.extend_from_slice(&(bytes.len() as i64).to_ne_bytes());
+                out.extend_from_slice(bytes);
+            }
+            None => out.extend_from_slice(&(-1_i64).to_ne_bytes()),
+        }
+    }
+
+    fn list(values: &[Option<&[u8]>]) -> Vec<u8> {
+        let mut out = (values.len() as i64).to_ne_bytes().to_vec();
+        for value in values {
+            string(&mut out, *value);
+        }
+        out
+    }
+
+    fn ints(values: &[i64]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_ne_bytes()).collect()
+    }
+
+    #[test]
+    fn w381_gate_sample_counts_part_count_markers() {
+        let subjects: [Option<&[u8]>; 6] = [
+            Some(b"a (1/2)"),
+            Some(b"b (x"),
+            None,
+            Some(b"c(1/2)"),
+            Some(b" ("),
+            Some(b"x ( y"),
+        ];
+        assert_eq!(gate_sample(&subjects), [6, 5, 4, 1]);
+        assert_eq!(gate_sample(&subjects[..3]), [3, 2, 2, 0]);
+        assert_eq!(gate_sample(&[]), [0, 0, 0, 0]);
+        assert_eq!(
+            compute(OP_GATE_SAMPLE, 0, &list(&subjects)),
+            Some(ints(&[6, 5, 4, 1]))
+        );
+    }
+
+    #[test]
+    fn w381_router_classifies_like_php() {
+        let token = b"ABCDEFGHIJKLMNOP";
+        let candidate = [&token[..], b" file.rar (1/20)"].concat();
+        assert_eq!(classify_sample(Some(&candidate)), 2);
+        assert_eq!(classify_sample(Some(b"short name (1/20)")), 1);
+        assert_eq!(classify_sample(Some(&[&token[..], b" (1/1)"].concat())), 1);
+        assert_eq!(classify_sample(Some(&[&token[..], b" (1/02)"].concat())), 2);
+        assert_eq!(
+            classify_sample(Some(&[&token[..], b" (1/001)"].concat())),
+            1
+        );
+        assert_eq!(classify_sample(Some(&[&token[..], b"(1/20)"].concat())), 0);
+        assert_eq!(classify_sample(Some(&[&token[..], b" (/20)"].concat())), 0);
+        assert_eq!(classify_sample(Some(&[&token[..], b" (1/20"].concat())), 0);
+        assert_eq!(classify_sample(Some(&[&token[..], b" (1/"].concat())), 0);
+        assert_eq!(classify_sample(Some(b"(1/2) x (")), 0);
+        assert_eq!(classify_sample(Some(b"x\x0b(1/9) (2/3)")), 1);
+        assert_eq!(
+            classify_sample(Some(
+                &[b"Usenet Index Post ", &token[..], b" (1/20)"].concat()
+            )),
+            0
+        );
+        assert_eq!(
+            classify_sample(Some(
+                &[b" Usenet Index Post ", &token[..], b" (1/20)"].concat()
+            )),
+            2
+        );
+        assert_eq!(
+            classify_sample(Some(
+                &[&token[..], b" (x) (1/99999999999999999999999)"].concat()
+            )),
+            2
+        );
+        assert_eq!(classify_sample(None), 0);
+
+        let subjects: [Option<&[u8]>; 3] = [Some(&candidate), None, Some(b"plain")];
+        let plan = router_costs(&subjects);
+        assert_eq!(&plan[..3], &[2, 0, 1]);
+        assert_eq!(plan[3], 1350 + 60 * 32 / 10 + 210 + 210 + 5 * 5 / 10);
+        assert_eq!(plan[4], 330 + 37 * 32 / 10 + 265 + 265 + 10 * 5 / 10);
+        assert_eq!(&plan[5..], &[32, 0, 1]);
+        let long = vec![b'a'; 513];
+        assert_eq!(router_costs(&[Some(&long)])[5..], [513, 0, 0]);
+    }
+
+    #[test]
+    fn w381_render_batch_summarizes_rows() {
+        let rows: [[Option<&[u8]>; 3]; 4] = [
+            [Some(b"A.B"), Some(b"A.B"), Some(b"abc-1._~")],
+            [Some(b"A"), Some(b"B"), Some(b"a/b")],
+            [None, Some(b"B"), Some(b"")],
+            [Some(b""), Some(b""), None],
+        ];
+        assert_eq!(render_batch(&rows, true), [4, 0, 1, 2, 2, 9]);
+        let many = vec![rows[0]; 16];
+        assert_eq!(render_batch(&many, true)[..2], [16, 1]);
+        assert_eq!(render_batch(&many, false)[..2], [16, 0]);
+    }
+
+    #[test]
+    fn w381_category_reset_plans_match_php() {
+        assert_eq!(
+            category_reset(b"production", None, &[b"tv"]),
+            (1, false, vec![], vec![])
+        );
+        assert_eq!(
+            category_reset(b"production", Some(b"misc"), &[b"misc"]),
+            (4, true, vec![], vec![7])
+        );
+        assert_eq!(
+            category_reset(b"production", Some(b"Misc"), &[b"misc"]).0,
+            1
+        );
+        assert_eq!(
+            category_reset(b"local", None, &[b"tv", b"foo", b"all", b"bar"]),
+            (2, false, vec![&b"foo"[..], b"bar"], vec![])
+        );
+        assert_eq!(
+            category_reset(b"local", None, &[]),
+            (3, true, vec![], vec![])
+        );
+        assert_eq!(
+            category_reset(b"local", None, &[b"tv", b"all"]),
+            (3, true, vec![], vec![])
+        );
+        assert_eq!(
+            category_reset(b"local", None, &[b"adult", b"book", b"console"]),
+            (4, false, vec![], vec![5, 6, 1])
+        );
+        let mut frame = Vec::new();
+        string(&mut frame, Some(b"local"));
+        string(&mut frame, Some(b""));
+        frame.extend(list(&[Some(b"movie"), Some(b"x")]));
+        let mut expected = ints(&[2, 0, 1, 0]);
+        string(&mut expected, Some(b"x"));
+        assert_eq!(compute(OP_CATEGORY_RESET, 0, &frame), Some(expected));
+    }
+
+    #[test]
+    fn w381_bulk_add_plan_matches_preg_blank_line() {
+        for (list, blank) in [
+            (&b""[..], true),
+            (b"abc", false),
+            (b"abc\n", false),
+            (b"\nabc", true),
+            (b"a\n\nb", true),
+            (b"a\n \nb", true),
+            (b"a\n \r", true),
+            (b"a\r\nb", false),
+            (b" ", true),
+            (b"\n", true),
+            (b"a\n\x0b", true),
+            (b"\xa0", false),
+            (b"a\n\n", true),
+        ] {
+            assert_eq!(blank_group_list(list), blank, "{list:?}");
+        }
+        assert_eq!(
+            bulk_add_plan(b"submit", Some(b"alt.*"), None, Some(0)),
+            [1, 1, 0, 1, 0]
+        );
+        assert_eq!(
+            bulk_add_plan(b"submit", Some(b""), Some(5), None),
+            [1, 0, 1, 5, 1]
+        );
+        assert_eq!(bulk_add_plan(b"view", None, None, None), [0, 0, 0, 1, 1]);
+    }
+
+    #[test]
+    fn w381_malformed_frames_and_flags_decline() {
+        for operation in [0, 6, u32::MAX] {
+            assert!(compute(operation, 0, &[]).is_none());
+        }
+        assert!(compute(OP_GATE_SAMPLE, 1, &list(&[])).is_none());
+        assert!(compute(OP_ROUTER_COSTS, 1, &list(&[])).is_none());
+        assert!(compute(OP_RENDER_BATCH, 2, &ints(&[0])).is_none());
+        assert!(compute(OP_CATEGORY_RESET, 2, &[]).is_none());
+        assert!(compute(OP_BULK_ADD_PLAN, 8, &[]).is_none());
+        assert!(compute(OP_GATE_SAMPLE, 0, &[]).is_none());
+        assert!(compute(OP_GATE_SAMPLE, 0, &ints(&[-1])).is_none());
+        assert!(compute(OP_GATE_SAMPLE, 0, &ints(&[i64::MAX])).is_none());
+        assert!(compute(OP_GATE_SAMPLE, 0, &ints(&[1, -2])).is_none());
+        assert!(compute(OP_GATE_SAMPLE, 0, &ints(&[1, 5])).is_none());
+        assert!(compute(OP_GATE_SAMPLE, 0, &ints(&[0, 0])).is_none());
+        assert!(compute(OP_RENDER_BATCH, 0, &ints(&[1, -1, -1])).is_none());
+        let mut reset = Vec::new();
+        string(&mut reset, Some(b"local"));
+        string(&mut reset, Some(b"misc"));
+        reset.extend(ints(&[0]));
+        assert!(compute(OP_CATEGORY_RESET, 0, &reset).is_none());
+        assert!(compute(OP_CATEGORY_RESET, 1, &reset).is_some());
+        let mut nulls = Vec::new();
+        string(&mut nulls, Some(b"local"));
+        string(&mut nulls, Some(b""));
+        nulls.extend(ints(&[1, -1]));
+        assert!(compute(OP_CATEGORY_RESET, 0, &nulls).is_none());
+        let mut bulk = Vec::new();
+        string(&mut bulk, Some(b"submit"));
+        string(&mut bulk, Some(b"x"));
+        bulk.extend(ints(&[0, 0]));
+        assert!(compute(OP_BULK_ADD_PLAN, 0, &bulk).is_none());
+        assert!(compute(OP_BULK_ADD_PLAN, 1, &bulk).is_some());
+        let mut active = Vec::new();
+        string(&mut active, Some(b"submit"));
+        string(&mut active, Some(b""));
+        active.extend(ints(&[3, 0]));
+        assert!(compute(OP_BULK_ADD_PLAN, 0, &active).is_none());
+        assert!(compute(OP_BULK_ADD_PLAN, 0b10, &active).is_some());
+        active.extend(ints(&[4]));
+        assert!(compute(OP_BULK_ADD_PLAN, 0b10, &active).is_none());
+        assert!(compute(OP_BULK_ADD_PLAN, 0b100, &[]).is_none());
+    }
+
+    #[test]
+    fn w381_export_validates_pointers_and_capacity_without_partial_writes() {
+        let input = list(&[Some(b"a (1)"), None]);
+        let call = |op, flags, ptr, len, out, cap| unsafe {
+            nntmux_w381_obfuscation_gate_router_admin_names(op, flags, ptr, len, out, cap)
+        };
+        let mut out = [0x5a_u8; 48];
+        let (ptr, len) = (input.as_ptr(), input.len());
+        assert_eq!(call(1, 0, ptr, len, out.as_mut_ptr(), 31), -32);
+        assert_eq!(call(1, 0, ptr, len, out.as_mut_ptr(), 0), -32);
+        assert_eq!(call(0, 0, ptr, len, out.as_mut_ptr(), 48), DECLINE);
+        assert_eq!(call(6, 0, ptr, len, out.as_mut_ptr(), 48), DECLINE);
+        assert_eq!(call(1, 1, ptr, len, out.as_mut_ptr(), 48), DECLINE);
+        assert_eq!(
+            call(1, 0, std::ptr::null(), len, out.as_mut_ptr(), 48),
+            DECLINE
+        );
+        assert_eq!(call(1, 0, ptr, len, std::ptr::null_mut(), 48), DECLINE);
+        assert_eq!(
+            call(1, 0, ptr, MAX_INPUT + 1, out.as_mut_ptr(), 48),
+            DECLINE
+        );
+        assert_eq!(call(1, 0, ptr, len, out.as_mut_ptr(), usize::MAX), DECLINE);
+        assert_eq!(
+            call(1, 0, usize::MAX as *const u8, 16, out.as_mut_ptr(), 48),
+            DECLINE
+        );
+        assert_eq!(call(1, 0, ptr, len, usize::MAX as *mut u8, 48), DECLINE);
+        assert_eq!(call(1, 0, ptr, len - 1, out.as_mut_ptr(), 48), DECLINE);
+        assert_eq!(out, [0x5a; 48]);
+        let mut overlapping = input.clone();
+        assert_eq!(
+            call(
+                1,
+                0,
+                overlapping.as_ptr(),
+                len,
+                overlapping.as_mut_ptr(),
+                len
+            ),
+            DECLINE
+        );
+        assert_eq!(overlapping, input);
+
+        assert_eq!(call(1, 0, ptr, len, out.as_mut_ptr(), 48), 32);
+        assert_eq!(&out[..32], ints(&[2, 1, 1, 0]).as_slice());
+        assert_eq!(&out[32..], &[0x5a; 16]);
+    }
+}
