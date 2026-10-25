@@ -38001,3 +38001,915 @@ pub mod w511_admin_dashboard_redis_reg_logo_status {
         }
     }
 }
+
+pub mod w521_backfill_binaries_config_service_header_storage {
+    //! Wave 52.1 batch kernels for backfill settings dates, backfill article `Date` headers,
+    //! existing-group scan range ends, the nearest XOVER overview row and header storage validation.
+    //! Every export reads NUL-joined string columns or little-endian `i64` tables, writes
+    //! fixed-width `i64` words into `out` and returns the word count, `SHORT_CAPACITY` when
+    //! `out_cap` (in words) is below the export's worst case, or -1 for a malformed batch (a
+    //! string column whose rows hold NUL bytes splits into extra rows and is malformed).
+
+    use super::w48_proxy_verdict_captcha_breach_reglog::rows;
+    use super::w501_status_probes_db_disk_nntp_result_queue::i64s;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    pub const MAX_INPUT: usize = 64 * 1024 * 1024;
+    pub const MAX_ITEMS: usize = 1 << 20;
+    /// Largest article number (and `maxHeaders`) the scan range kernel accepts.
+    pub const MAX_ARTICLE: i64 = 1 << 53;
+    /// Largest message buffer the scan range kernel accepts.
+    pub const MAX_BUFFER: i64 = 1 << 31;
+    pub const SHORT_CAPACITY: isize = -2;
+
+    /// Weekday names by `days_from_civil(..).rem_euclid(7)` (1970-01-01 was a Thursday).
+    const WEEKDAYS: [&[u8]; 7] = [b"Thu", b"Fri", b"Sat", b"Sun", b"Mon", b"Tue", b"Wed"];
+    const MONTHS: [&[u8]; 12] = [
+        b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov",
+        b"Dec",
+    ];
+
+    /// Borrows a caller span; an empty span may be null and is never dereferenced.
+    unsafe fn span<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null() || len > MAX_INPUT {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
+    fn overlaps(input: (*const u8, usize), out: *mut i64, words: usize) -> bool {
+        let (a, a_len) = (input.0 as usize, input.1);
+        let (b, b_len) = (out as usize, words.saturating_mul(8));
+        a_len != 0 && b_len != 0 && a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
+    }
+
+    /// Validates the output window for at most `max_words` words, lets `body` push them from
+    /// the borrowed inputs and copies the pushed words to `out`.
+    unsafe fn run(
+        out: *mut i64,
+        out_cap: usize,
+        count: usize,
+        max_words: usize,
+        inputs: &[(*const u8, usize)],
+        body: impl FnOnce(&[&[u8]], &mut Vec<i64>) -> bool,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out.is_null()
+                || !(out as usize).is_multiple_of(std::mem::align_of::<i64>())
+                || count > MAX_ITEMS
+                || out_cap > isize::MAX as usize / 8
+            {
+                return -1;
+            }
+            if max_words > out_cap {
+                return SHORT_CAPACITY;
+            }
+            if inputs.iter().any(|&input| overlaps(input, out, max_words)) {
+                return -1;
+            }
+            let mut spans = Vec::with_capacity(inputs.len());
+            for &(ptr, len) in inputs {
+                match unsafe { span(ptr, len) } {
+                    Some(bytes) => spans.push(bytes),
+                    None => return -1,
+                }
+            }
+            let mut words = Vec::with_capacity(max_words);
+            if !body(&spans, &mut words) || words.len() > max_words {
+                return -1;
+            }
+            // At most `max_words` words, checked against `out_cap` above.
+            unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), out, words.len()) };
+            words.len() as isize
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Days since 1970-01-01 of a proleptic Gregorian date (Howard Hinnant's algorithm).
+    pub fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+        let y = if month <= 2 { year - 1 } else { year };
+        let era = y.div_euclid(400);
+        let yoe = y - era * 400;
+        let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146_097 + doe - 719_468
+    }
+
+    fn days_in_month(year: i64, month: i64) -> i64 {
+        match month {
+            2 if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 => 29,
+            2 => 28,
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        }
+    }
+
+    /// PHP `checkdate($month, $day, $year)`.
+    pub fn checkdate(month: i64, day: i64, year: i64) -> bool {
+        (1..=32767).contains(&year)
+            && (1..=12).contains(&month)
+            && day >= 1
+            && day <= days_in_month(year, month)
+    }
+
+    /// The value of a short all-ASCII-digit span, or `None` for any other byte or an empty span.
+    fn digits(bytes: &[u8]) -> Option<i64> {
+        if bytes.is_empty() || bytes.len() > 18 {
+            return None;
+        }
+        bytes.iter().try_fold(0i64, |v, &b| {
+            b.is_ascii_digit().then(|| v * 10 + i64::from(b - b'0'))
+        })
+    }
+
+    /// `preg_match('/^(\d{4})-(\d{2})-(\d{2})$/D')` plus `checkdate()`: the epoch day of a
+    /// valid safe backfill date.
+    pub fn safe_date_days(date: &[u8]) -> Option<i64> {
+        if date.len() != 10 || date[4] != b'-' || date[7] != b'-' {
+            return None;
+        }
+        let (year, month, day) = (
+            digits(&date[..4])?,
+            digits(&date[5..7])?,
+            digits(&date[8..])?,
+        );
+        checkdate(month, day, year).then(|| days_from_civil(year, month, day))
+    }
+
+    /// `strtotime()` of the RFC 5322 shape NNTP servers send, `[Www, ]D Mon YYYY HH:MM:SS
+    /// ZONE` with `ZONE` one of `GMT`, `UTC` or `+HHMM`/`-HHMM` (optionally followed by ` (UTC)`
+    /// or ` (GMT)`). `None` for any other shape, an out-of-range field or a weekday that does
+    /// not match the date (strtotime() would move to the next such weekday): the caller falls
+    /// back to `strtotime()` for those rows.
+    pub fn article_date(date: &[u8]) -> Option<i64> {
+        let mut p = date;
+        let mut weekday = None;
+        if p.len() > 5 && p[3] == b',' && p[4] == b' ' {
+            weekday = Some(WEEKDAYS.iter().position(|w| *w == &p[..3])?);
+            p = &p[5..];
+        }
+        let day_len = if p.len() > 1 && p[1].is_ascii_digit() {
+            2
+        } else {
+            1
+        };
+        let day = digits(p.get(..day_len)?)?;
+        p = p.get(day_len..)?;
+        if p.len() < 22 || p[0] != b' ' || p[4] != b' ' || p[9] != b' ' {
+            return None;
+        }
+        let month = MONTHS.iter().position(|m| *m == &p[1..4])? as i64 + 1;
+        let year = digits(&p[5..9])?;
+        let t = &p[10..18];
+        if t[2] != b':' || t[5] != b':' || p[18] != b' ' {
+            return None;
+        }
+        let (hour, minute, second) = (digits(&t[..2])?, digits(&t[3..5])?, digits(&t[6..])?);
+        let offset = match &p[19..] {
+            b"GMT" | b"UTC" => 0,
+            zone => {
+                let zone = match zone.len() {
+                    5 => zone,
+                    11 if matches!(&zone[5..], b" (UTC)" | b" (GMT)") => &zone[..5],
+                    _ => return None,
+                };
+                let sign = match zone[0] {
+                    b'+' => 1,
+                    b'-' => -1,
+                    _ => return None,
+                };
+                let (oh, om) = (digits(&zone[1..3])?, digits(&zone[3..])?);
+                if oh > 14 || om > 59 {
+                    return None;
+                }
+                sign * (oh * 3600 + om * 60)
+            }
+        };
+        if !(1000..=9999).contains(&year)
+            || day < 1
+            || day > days_in_month(year, month)
+            || hour > 23
+            || minute > 59
+            || second > 59
+        {
+            return None;
+        }
+        let days = days_from_civil(year, month, day);
+        if weekday.is_some_and(|w| w != days.rem_euclid(7) as usize) {
+            return None;
+        }
+        Some(days * 86_400 + hour * 3600 + minute * 60 + second - offset)
+    }
+
+    /// `filter_var($value, FILTER_VALIDATE_INT)` without options: trims ` \t\r\v\n`, accepts
+    /// `0`, `+0`, `-0` and an optionally signed decimal without leading zeros that fits an
+    /// `i64` (php_filter_int() / php_filter_parse_int()).
+    pub fn filter_int(value: &[u8]) -> Option<i64> {
+        let ws = |b: &u8| matches!(b, b' ' | b'\t' | b'\r' | 0x0B | b'\n');
+        let start = value.iter().position(|b| !ws(b))?;
+        let end = value.iter().rposition(|b| !ws(b))? + 1;
+        let p = &value[start..end];
+        if p[0] == b'0' {
+            return (p.len() == 1).then_some(0);
+        }
+        let (negative, digits) = match p[0] {
+            b'-' => (true, &p[1..]),
+            b'+' => (false, &p[1..]),
+            _ => (false, p),
+        };
+        if digits == b"0" {
+            return Some(0);
+        }
+        let (&head, tail) = digits.split_first()?;
+        if !(b'1'..=b'9').contains(&head) || tail.len() > 19 {
+            return None;
+        }
+        let mut value = i64::from(head - b'0');
+        if negative {
+            value = -value;
+        }
+        for &b in tail {
+            if !b.is_ascii_digit() {
+                return None;
+            }
+            let digit = i64::from(b - b'0');
+            value = if !negative && value <= (i64::MAX - digit) / 10 {
+                value * 10 + digit
+            } else if negative && value >= (i64::MIN + digit) / 10 {
+                value * 10 - digit
+            } else {
+                return None;
+            };
+        }
+        Some(value)
+    }
+
+    /// One value word per row followed by the indices of the rows `parse` declines.
+    fn values_then_exceptions(
+        values: &[&[u8]],
+        parse: impl Fn(&[u8]) -> Option<i64>,
+        out: &mut Vec<i64>,
+    ) {
+        let mut exceptions = Vec::new();
+        for (i, value) in values.iter().enumerate() {
+            match parse(value) {
+                Some(v) => out.push(v),
+                None => {
+                    out.push(0);
+                    exceptions.push(i as i64);
+                }
+            }
+        }
+        out.extend(exceptions);
+    }
+
+    /// `BinariesService::nearestOverviewRow()`'s choice over the rows' `Number` values: the
+    /// index of the lowest (`upward`) or highest number, the first on ties; -1 for no rows and
+    /// -2 when a number fails `filter_var(.., FILTER_VALIDATE_INT)` or leaves `[low, high]`.
+    pub fn nearest_overview(numbers: &[&[u8]], low: i64, high: i64, upward: bool) -> i64 {
+        let mut nearest: Option<(usize, i64)> = None;
+        for (i, raw) in numbers.iter().enumerate() {
+            let Some(number) = filter_int(raw).filter(|n| (low..=high).contains(n)) else {
+                return -2;
+            };
+            if nearest.is_none_or(|(_, best)| if upward { number < best } else { number > best }) {
+                nearest = Some((i, number));
+            }
+        }
+        nearest.map_or(-1, |(i, _)| i as i64)
+    }
+
+    /// `BinariesService::existingHeaderRangePhp($first, $newest, $buffer, $limit)['last']` for
+    /// article numbers in `[0, MAX_ARTICLE]`, a buffer in `[1, MAX_BUFFER]` and a limit in
+    /// `[0, MAX_ARTICLE]`, where every intermediate is an exact integer; `None` outside them.
+    pub fn scan_range_end(first: i64, newest: i64, buffer: i64, limit: i64) -> Option<i64> {
+        if !(0..=MAX_ARTICLE).contains(&first)
+            || !(0..=MAX_ARTICLE).contains(&newest)
+            || !(1..=MAX_BUFFER).contains(&buffer)
+            || !(0..=MAX_ARTICLE).contains(&limit)
+        {
+            return None;
+        }
+        let count = newest - first;
+        // round(.., 0, PHP_ROUND_HALF_DOWN) of a half moves toward zero, like `/`.
+        let leave = if count > buffer * 2 {
+            count % buffer + buffer
+        } else {
+            count / 2
+        };
+        let mut last = (newest - leave).max(first);
+        if limit > 0 && limit < last - first {
+            last = first + limit;
+        }
+        Some(last)
+    }
+
+    /// Bytes `0x20..=0x7E` only, without a data-dependent exit so the loop vectorizes.
+    fn printable(bytes: &[u8]) -> bool {
+        bytes
+            .iter()
+            .fold(true, |ok, &b| ok & (b.wrapping_sub(0x20) < 0x5F))
+    }
+
+    /// `PartHandler::validationErrorPhp()` as a code: 1 for a part number below 1, 2 for a
+    /// `trim()`med Message-ID that is empty, longer than 255 bytes or not printable ASCII,
+    /// otherwise 0.
+    pub fn header_validation(part: i64, message_id: &[u8]) -> i64 {
+        if part <= 0 {
+            return 1;
+        }
+        let trimmed = |b: &u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B);
+        let id = match message_id.iter().position(|b| !trimmed(b)) {
+            Some(start) => {
+                let end = message_id
+                    .iter()
+                    .rposition(|b| !trimmed(b))
+                    .unwrap_or(start);
+                &message_id[start..=end]
+            }
+            None => &[][..],
+        };
+        if id.is_empty() || id.len() > 255 || !printable(id) {
+            2
+        } else {
+            0
+        }
+    }
+
+    /// Writes one epoch-day word per safe backfill date followed by the indices of the
+    /// invalid dates (whose value words are 0); `out_cap` must hold `2 * count`.
+    ///
+    /// # Safety
+    /// `dates` must be readable for `dates_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w521_backfill_config_date_days_batch(
+        dates: *const u8,
+        dates_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(dates, dates_len)];
+        let max_words = count.saturating_mul(2);
+        unsafe {
+            run(out, out_cap, count, max_words, &inputs, |s, o| {
+                let Some(dates) = rows(s[0], count) else {
+                    return false;
+                };
+                values_then_exceptions(&dates, safe_date_days, o);
+                true
+            })
+        }
+    }
+
+    /// Writes one timestamp word per article `Date` header followed by the indices of the
+    /// rows needing `strtotime()` (whose value words are 0); `out_cap` must hold `2 * count`.
+    ///
+    /// # Safety
+    /// `dates` must be readable for `dates_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w521_backfill_article_date_batch(
+        dates: *const u8,
+        dates_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(dates, dates_len)];
+        let max_words = count.saturating_mul(2);
+        unsafe {
+            run(out, out_cap, count, max_words, &inputs, |s, o| {
+                let Some(dates) = rows(s[0], count) else {
+                    return false;
+                };
+                values_then_exceptions(&dates, article_date, o);
+                true
+            })
+        }
+    }
+
+    /// Writes one scan range end per (first, newest) row; `out_cap` must hold `count`, and a
+    /// row or setting outside the exact-integer domain makes the batch malformed.
+    ///
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w521_binaries_config_scan_range_end_batch(
+        firsts: *const u8,
+        firsts_len: usize,
+        newests: *const u8,
+        newests_len: usize,
+        count: usize,
+        message_buffer: i64,
+        max_headers: i64,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(firsts, firsts_len), (newests, newests_len)];
+        unsafe {
+            run(out, out_cap, count, count, &inputs, |s, o| {
+                let (Some(firsts), Some(newests)) = (i64s(s[0], count), i64s(s[1], count)) else {
+                    return false;
+                };
+                for (&first, &newest) in firsts.iter().zip(&newests) {
+                    match scan_range_end(first, newest, message_buffer, max_headers) {
+                        Some(last) => o.push(last),
+                        None => return false,
+                    }
+                }
+                true
+            })
+        }
+    }
+
+    /// Writes the [`nearest_overview`] word for the XOVER rows' numbers (`upward` is 0 or 1);
+    /// `out_cap` must hold one word.
+    ///
+    /// # Safety
+    /// `numbers` must be readable for `numbers_len` bytes and `out` writable for `out_cap`
+    /// words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w521_binaries_overview_nearest_batch(
+        numbers: *const u8,
+        numbers_len: usize,
+        count: usize,
+        low: i64,
+        high: i64,
+        upward: u32,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(numbers, numbers_len)];
+        unsafe {
+            run(out, out_cap, count, 1, &inputs, |s, o| {
+                let Some(numbers) = rows(s[0], count) else {
+                    return false;
+                };
+                if upward > 1 {
+                    return false;
+                }
+                o.push(nearest_overview(&numbers, low, high, upward == 1));
+                true
+            })
+        }
+    }
+
+    /// Writes `[ones, code-1 indices..., code-2 indices...]` (`ones` counts the code-1 rows) so
+    /// PHP rebuilds the codes with `array_fill_keys()`; `out_cap` must hold `count + 1`. An
+    /// empty `parts` table means every part number is positive.
+    ///
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w521_header_storage_validation_batch(
+        parts: *const u8,
+        parts_len: usize,
+        message_ids: *const u8,
+        message_ids_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(parts, parts_len), (message_ids, message_ids_len)];
+        let max_words = count.saturating_add(1);
+        unsafe {
+            run(out, out_cap, count, max_words, &inputs, |s, o| {
+                let parts = if s[0].is_empty() {
+                    vec![1; count]
+                } else {
+                    match i64s(s[0], count) {
+                        Some(parts) => parts,
+                        None => return false,
+                    }
+                };
+                let Some(ids) = rows(s[1], count) else {
+                    return false;
+                };
+                o.push(0);
+                let mut twos = Vec::new();
+                for (i, (&part, id)) in parts.iter().zip(ids).enumerate() {
+                    match header_validation(part, id) {
+                        1 => o.push(i as i64),
+                        2 => twos.push(i as i64),
+                        _ => {}
+                    }
+                }
+                o[0] = o.len() as i64 - 1;
+                o.extend(twos);
+                true
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn le(values: &[i64]) -> Vec<u8> {
+            values.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+
+        #[test]
+        fn w521_safe_dates_follow_checkdate() {
+            assert_eq!(safe_date_days(b"1970-01-01"), Some(0));
+            assert_eq!(safe_date_days(b"2012-08-14"), Some(15_566));
+            assert_eq!(safe_date_days(b"2024-02-29"), Some(19_782));
+            assert_eq!(safe_date_days(b"0001-01-01"), Some(-719_162));
+            for bad in [
+                &b"2023-02-29"[..],
+                b"0000-01-01",
+                b"2012-13-01",
+                b"2012-00-10",
+                b"2012-8-14",
+                b"2012-08-14 ",
+                b"2012/08/14",
+                b"",
+                b"20120814xx",
+                b"1900-02-29",
+            ] {
+                assert_eq!(safe_date_days(bad), None, "{bad:?}");
+            }
+        }
+
+        #[test]
+        fn w521_article_dates_match_strtotime_values() {
+            assert_eq!(
+                article_date(b"Sun, 25 Oct 2026 22:30:33 +0100"),
+                Some(1_792_963_833)
+            );
+            assert_eq!(
+                article_date(b"25 Oct 2026 22:30:33 +0100"),
+                Some(1_792_963_833)
+            );
+            assert_eq!(
+                article_date(b"5 Oct 2026 22:30:33 GMT"),
+                Some(1_791_239_433)
+            );
+            assert_eq!(
+                article_date(b"05 Oct 2026 22:30:33 UTC"),
+                Some(1_791_239_433)
+            );
+            assert_eq!(
+                article_date(b"Sun, 25 Oct 2026 22:30:33 +0000 (UTC)"),
+                Some(1_792_967_433)
+            );
+            assert_eq!(
+                article_date(b"Sun, 25 Oct 2026 22:30:33 -1459"),
+                Some(1_793_021_373)
+            );
+            assert_eq!(
+                article_date(b"Wed, 01 Jan 1000 00:00:00 +0000"),
+                Some(-30_610_224_000)
+            );
+            assert_eq!(
+                article_date(b"29 Feb 2024 23:59:59 -1400"),
+                Some(1_709_301_599)
+            );
+            for unsupported in [
+                &b"Mon, 25 Oct 2026 22:30:33 +0100"[..],
+                b"31 Feb 2026 00:00:00 +0000",
+                b"1 jan 2026 00:00:00 +0000",
+                b"1 Jan 2026 24:00:00 +0000",
+                b"1 Jan 2026 00:00:60 +0000",
+                b"1 Jan 2026 00:00:00 +1500",
+                b"1 Jan 2026 00:00:00 +0099",
+                b"Sun,  25 Oct 2026 22:30:33 +0100",
+                b"1 Jan 2026 00:00:00 Z",
+                b"1 Jan 2026 00:00:00 +0000 (EST)",
+                b"1 Jan 999 00:00:00 +0000",
+                b"",
+                b"Sun, ",
+                b"2026-10-25 22:30:33",
+            ] {
+                assert_eq!(article_date(unsupported), None, "{unsupported:?}");
+            }
+        }
+
+        #[test]
+        fn w521_filter_int_matches_php_filter_int() {
+            for (value, expected) in [
+                (&b"0"[..], Some(0)),
+                (b"+0", Some(0)),
+                (b"-0", Some(0)),
+                (b" \t42\r\n", Some(42)),
+                (b"\x0B-7\x0B", Some(-7)),
+                (b"9223372036854775807", Some(i64::MAX)),
+                (b"-9223372036854775808", Some(i64::MIN)),
+                (b"9223372036854775808", None),
+                (b"-9223372036854775809", None),
+                (b"00", None),
+                (b"007", None),
+                (b"+07", None),
+                (b"", None),
+                (b"   ", None),
+                (b"-", None),
+                (b"+", None),
+                (b"1e3", None),
+                (b"12 3", None),
+                (b"\x0C1", None),
+                (b"1\0", None),
+                (b"0x1A", None),
+                (b"10000000000000000000", None),
+                (b"--1", None),
+                (b" 0 ", Some(0)),
+            ] {
+                assert_eq!(filter_int(value), expected, "{value:?}");
+            }
+        }
+
+        #[test]
+        fn w521_nearest_overview_matches_php() {
+            let rows = |v: &[&'static [u8]]| v.to_vec();
+            assert_eq!(
+                nearest_overview(&rows(&[b"15", b"12", b" 12", b"20"]), 10, 20, true),
+                1
+            );
+            assert_eq!(
+                nearest_overview(&rows(&[b"15", b"20", b"+20"]), 10, 20, false),
+                1
+            );
+            assert_eq!(nearest_overview(&[], 10, 20, true), -1);
+            assert_eq!(nearest_overview(&rows(&[b"15", b"21"]), 10, 20, true), -2);
+            assert_eq!(nearest_overview(&rows(&[b"15", b"012"]), 10, 20, true), -2);
+            assert_eq!(nearest_overview(&rows(&[b"-0"]), 0, 0, true), 0);
+        }
+
+        #[test]
+        fn w521_scan_range_ends_match_existing_header_range() {
+            assert_eq!(scan_range_end(100, 200, 20, 0), Some(180));
+            assert_eq!(scan_range_end(100, 130, 20, 0), Some(115));
+            assert_eq!(scan_range_end(100, 131, 20, 0), Some(116));
+            assert_eq!(scan_range_end(100, 200, 20, 5), Some(105));
+            assert_eq!(scan_range_end(200, 100, 20, 0), Some(200));
+            assert_eq!(scan_range_end(5, 5, 1, 0), Some(5));
+            assert_eq!(scan_range_end(-1, 5, 1, 0), None);
+            assert_eq!(scan_range_end(1, MAX_ARTICLE + 1, 1, 0), None);
+            assert_eq!(scan_range_end(1, 5, 0, 0), None);
+            assert_eq!(scan_range_end(1, 5, 1, -1), None);
+        }
+
+        #[test]
+        fn w521_header_validation_matches_part_handler() {
+            assert_eq!(header_validation(1, b"<a@b>"), 0);
+            assert_eq!(header_validation(0, b"<a@b>"), 1);
+            assert_eq!(header_validation(-5, b""), 1);
+            assert_eq!(header_validation(1, b" \t<a@b>\r\n"), 0);
+            assert_eq!(header_validation(1, b"  \x0B "), 2);
+            assert_eq!(header_validation(1, b""), 2);
+            assert_eq!(header_validation(1, b"<a\x7F@b>"), 2);
+            assert_eq!(header_validation(1, "<é@b>".as_bytes()), 2);
+            assert_eq!(header_validation(1, &[b'a'; 255]), 0);
+            assert_eq!(header_validation(1, &[b'a'; 256]), 2);
+        }
+
+        #[test]
+        fn w521_exports_guard_pointers_capacity_and_counts() {
+            let mut out = [0i64; 16];
+            let p = out.as_mut_ptr();
+            let null = std::ptr::null();
+            unsafe {
+                let dates = b"2012-08-14\0bad";
+                assert_eq!(
+                    nntmux_w521_backfill_config_date_days_batch(
+                        dates.as_ptr(),
+                        dates.len(),
+                        2,
+                        p,
+                        8
+                    ),
+                    3
+                );
+                assert_eq!(&out[..3], &[15_566, 0, 1]);
+                assert_eq!(
+                    nntmux_w521_backfill_config_date_days_batch(
+                        dates.as_ptr(),
+                        dates.len(),
+                        2,
+                        p,
+                        3
+                    ),
+                    SHORT_CAPACITY
+                );
+                assert_eq!(
+                    nntmux_w521_backfill_config_date_days_batch(
+                        dates.as_ptr(),
+                        dates.len(),
+                        1,
+                        p,
+                        8
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w521_backfill_config_date_days_batch(null, 0, 0, p, 0),
+                    0
+                );
+                assert_eq!(
+                    nntmux_w521_backfill_config_date_days_batch(null, 4, 1, p, 8),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w521_backfill_config_date_days_batch(
+                        dates.as_ptr(),
+                        dates.len(),
+                        2,
+                        std::ptr::null_mut(),
+                        8
+                    ),
+                    -1
+                );
+                let header = b"5 Oct 2026 22:30:33 GMT";
+                assert_eq!(
+                    nntmux_w521_backfill_article_date_batch(header.as_ptr(), header.len(), 1, p, 8),
+                    1
+                );
+                assert_eq!(out[0], 1_791_239_433);
+                let (firsts, newests) = (le(&[100, 100]), le(&[200, 130]));
+                assert_eq!(
+                    nntmux_w521_binaries_config_scan_range_end_batch(
+                        firsts.as_ptr(),
+                        firsts.len(),
+                        newests.as_ptr(),
+                        newests.len(),
+                        2,
+                        20,
+                        0,
+                        p,
+                        8
+                    ),
+                    2
+                );
+                assert_eq!(&out[..2], &[180, 115]);
+                assert_eq!(
+                    nntmux_w521_binaries_config_scan_range_end_batch(
+                        firsts.as_ptr(),
+                        firsts.len(),
+                        newests.as_ptr(),
+                        newests.len(),
+                        2,
+                        20,
+                        0,
+                        p,
+                        1
+                    ),
+                    SHORT_CAPACITY
+                );
+                assert_eq!(
+                    nntmux_w521_binaries_config_scan_range_end_batch(
+                        firsts.as_ptr(),
+                        firsts.len(),
+                        newests.as_ptr(),
+                        newests.len(),
+                        2,
+                        0,
+                        0,
+                        p,
+                        8
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w521_binaries_config_scan_range_end_batch(
+                        firsts.as_ptr(),
+                        8,
+                        newests.as_ptr(),
+                        newests.len(),
+                        2,
+                        20,
+                        0,
+                        p,
+                        8
+                    ),
+                    -1
+                );
+                let numbers = b"12\0 11\0-0";
+                assert_eq!(
+                    nntmux_w521_binaries_overview_nearest_batch(
+                        numbers.as_ptr(),
+                        numbers.len(),
+                        3,
+                        0,
+                        20,
+                        1,
+                        p,
+                        8
+                    ),
+                    1
+                );
+                assert_eq!(out[0], 2);
+                assert_eq!(
+                    nntmux_w521_binaries_overview_nearest_batch(
+                        numbers.as_ptr(),
+                        numbers.len(),
+                        3,
+                        0,
+                        20,
+                        0,
+                        p,
+                        8
+                    ),
+                    1
+                );
+                assert_eq!(out[0], 0);
+                assert_eq!(
+                    nntmux_w521_binaries_overview_nearest_batch(
+                        numbers.as_ptr(),
+                        numbers.len(),
+                        3,
+                        0,
+                        20,
+                        2,
+                        p,
+                        8
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w521_binaries_overview_nearest_batch(
+                        numbers.as_ptr(),
+                        numbers.len(),
+                        3,
+                        0,
+                        20,
+                        1,
+                        p,
+                        0
+                    ),
+                    SHORT_CAPACITY
+                );
+                let parts = le(&[1, 0, 1]);
+                let ids = b"<a@b>\0<c@d>\0";
+                assert_eq!(
+                    nntmux_w521_header_storage_validation_batch(
+                        parts.as_ptr(),
+                        parts.len(),
+                        ids.as_ptr(),
+                        ids.len(),
+                        3,
+                        p,
+                        8
+                    ),
+                    3
+                );
+                assert_eq!(&out[..3], &[1, 1, 2]);
+                assert_eq!(
+                    nntmux_w521_header_storage_validation_batch(
+                        null,
+                        0,
+                        ids.as_ptr(),
+                        ids.len(),
+                        3,
+                        p,
+                        8
+                    ),
+                    2
+                );
+                assert_eq!(&out[..2], &[0, 2]);
+                assert_eq!(
+                    nntmux_w521_header_storage_validation_batch(
+                        parts.as_ptr(),
+                        parts.len(),
+                        ids.as_ptr(),
+                        ids.len(),
+                        3,
+                        p,
+                        3
+                    ),
+                    SHORT_CAPACITY
+                );
+                assert_eq!(
+                    nntmux_w521_header_storage_validation_batch(
+                        parts.as_ptr(),
+                        8,
+                        ids.as_ptr(),
+                        ids.len(),
+                        3,
+                        p,
+                        8
+                    ),
+                    -1
+                );
+                // An output window overlapping an input is refused.
+                let mut shared = le(&[1, 2, 3, 4]);
+                let overlap = shared.as_mut_ptr();
+                assert_eq!(
+                    nntmux_w521_binaries_config_scan_range_end_batch(
+                        overlap,
+                        8,
+                        overlap,
+                        8,
+                        1,
+                        20,
+                        0,
+                        overlap.cast::<i64>(),
+                        4
+                    ),
+                    -1
+                );
+            }
+        }
+    }
+}
