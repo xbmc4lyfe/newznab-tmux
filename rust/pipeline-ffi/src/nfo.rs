@@ -26851,3 +26851,571 @@ pub unsafe extern "C" fn nntmux_w38_nntp_service_fingerprint_dispatch_commands(
     }))
     .unwrap_or(-1)
 }
+mod wave39_fingerprint_backfill_transfer_candidate {
+    use super::{nfo_abi_range, yenc_ranges_overlap};
+    use std::collections::HashSet;
+    use std::slice;
+
+    pub(super) const MAX_INPUT: usize = 16 * 1024 * 1024;
+
+    /// Mirrors `TransferFingerprintQueue::clampBatchLimitPhp`.
+    const TRANSFER_BATCH_MAX: i64 = 10_000;
+    const GUID_LEN: usize = 40;
+
+    fn word(chunk: &[u8; 8]) -> i64 {
+        i64::from_ne_bytes(*chunk)
+    }
+
+    /// The whole input as native-endian `i64` slots; `None` unless it is an exact multiple of 8 bytes.
+    fn words(bytes: &[u8]) -> Option<Vec<i64>> {
+        let (chunks, rest) = bytes.as_chunks::<8>();
+        rest.is_empty().then(|| chunks.iter().map(word).collect())
+    }
+
+    /// `[lead, count]`, `count` pairs of `[text_len, value]` and the concatenated texts. A length of -1 marks a
+    /// non-string; declared lengths must cover the tail exactly.
+    type Records<'a> = (i64, Vec<(Option<&'a [u8]>, i64)>);
+
+    fn records(bytes: &[u8]) -> Option<Records<'_>> {
+        let (head, _) = bytes.get(..16)?.as_chunks::<8>();
+        let lead = word(&head[0]);
+        let count = usize::try_from(word(&head[1])).ok()?;
+        let table_end = count.checked_mul(16)?.checked_add(16)?;
+        let table = bytes.get(16..table_end)?;
+        let tail = &bytes[table_end..];
+        let mut offset = 0usize;
+        let mut out = Vec::with_capacity(count);
+        for pair in table.as_chunks::<8>().0.as_chunks::<2>().0 {
+            let length = word(&pair[0]);
+            let text = if length == -1 {
+                None
+            } else {
+                let end = offset.checked_add(usize::try_from(length).ok()?)?;
+                let text = tail.get(offset..end)?;
+                offset = end;
+                Some(text)
+            };
+            out.push((text, word(&pair[1])));
+        }
+        (offset == tail.len()).then_some((lead, out))
+    }
+
+    /// Op 0: `BackfillReleaseFingerprintMetadata::summarizeBackfillProgressWindow` over
+    /// `[target_rows, invalid_chunks]` and five slots per chunk: scanned, updated, missing NZB, corrupt XML, duration.
+    fn backfill_progress(bytes: &[u8]) -> Option<Vec<i64>> {
+        let slots = words(bytes)?;
+        let (head, rows) = slots.split_at_checked(2)?;
+        let target = head[0].max(1);
+        let invalid = head[1];
+        if invalid < 0 || !rows.len().is_multiple_of(5) {
+            return None;
+        }
+        let (mut scanned, mut updated, mut missing, mut corrupt, mut duration) =
+            (0i64, 0i64, 0i64, 0i64, 0i64);
+        for row in rows.as_chunks::<5>().0 {
+            scanned = scanned.saturating_add(row[0].max(0));
+            updated = updated.saturating_add(row[1].max(0));
+            missing = missing.saturating_add(row[2].max(0));
+            corrupt = corrupt.saturating_add(row[3].max(0));
+            duration = duration.max(row[4]);
+        }
+        Some(vec![
+            (rows.len() / 5) as i64,
+            invalid,
+            scanned,
+            updated,
+            missing,
+            corrupt,
+            duration,
+            target,
+            // target >= 1 and updated >= 0, so the subtraction cannot overflow.
+            (target - updated).max(0),
+            (updated >= target) as i64,
+        ])
+    }
+
+    /// Op 1: `TransferFingerprintQueue::planQueueTransferWindow` over
+    /// `[pending, batch_size, max_batches, in_flight, max_in_flight]`.
+    fn transfer_window(bytes: &[u8]) -> Option<Vec<i64>> {
+        let slots = words(bytes)?;
+        let &[pending, batch, max_batches, in_flight, max_in_flight] = slots.as_slice() else {
+            return None;
+        };
+        let pending = pending.max(0);
+        let batch = batch.clamp(1, TRANSFER_BATCH_MAX);
+        let max_batches = max_batches.max(0);
+        // Both operands are non-negative, so the subtraction cannot overflow.
+        let capacity = (max_in_flight.max(0) - in_flight.max(0)).max(0);
+        let size = batch.min(capacity);
+        let budget = pending.min(capacity);
+        let needed = if size > 0 {
+            budget / size + (budget % size > 0) as i64
+        } else {
+            0
+        };
+        let batches = max_batches.min(needed);
+        // batches < needed keeps batches * size below budget.
+        let items = if batches == needed {
+            budget
+        } else {
+            batches * size
+        };
+        Some(vec![
+            pending,
+            capacity,
+            size,
+            batches,
+            items,
+            pending - items,
+            (capacity < pending) as i64,
+            (items == pending) as i64,
+        ])
+    }
+
+    fn is_guid(text: &[u8]) -> bool {
+        text.len() == GUID_LEN && text.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }
+
+    /// Op 2: `ImportVerificationManifests::summarizeManifestImportRecords` over records of `[guid, segments]`.
+    fn manifest_records(bytes: &[u8]) -> Option<Vec<i64>> {
+        let (min_segments, rows) = records(bytes)?;
+        let min_segments = min_segments.max(0);
+        let (mut valid, mut invalid, mut below, mut duplicate, mut segments) =
+            (0i64, 0i64, 0i64, 0i64, 0i64);
+        let mut seen: HashSet<&[u8]> = HashSet::with_capacity(rows.len());
+        for &(guid, count) in &rows {
+            match guid {
+                Some(guid) if is_guid(guid) => {
+                    if !seen.insert(guid) {
+                        duplicate += 1;
+                    } else if count < min_segments {
+                        below += 1;
+                    } else {
+                        valid += 1;
+                        segments = segments.saturating_add(count);
+                    }
+                }
+                _ => invalid += 1,
+            }
+        }
+        Some(vec![
+            rows.len() as i64,
+            valid,
+            invalid,
+            below,
+            duplicate,
+            segments,
+        ])
+    }
+
+    /// Op 3: `PrepareReleaseCandidates::summarizeCandidatePreparationBatch` over `[max_bytes]` and `[parts, size]` pairs.
+    fn candidate_batch(bytes: &[u8]) -> Option<Vec<i64>> {
+        let slots = words(bytes)?;
+        let (head, rows) = slots.split_first()?;
+        if !rows.len().is_multiple_of(2) {
+            return None;
+        }
+        let max_bytes = (*head).max(0);
+        let (mut ready, mut empty, mut oversized, mut invalid, mut eligible) =
+            (0i64, 0i64, 0i64, 0i64, 0i64);
+        for row in rows.as_chunks::<2>().0 {
+            let (parts, size) = (row[0], row[1]);
+            if size < 0 {
+                invalid += 1;
+            } else if parts <= 0 {
+                empty += 1;
+            } else if size > max_bytes {
+                oversized += 1;
+            } else {
+                ready += 1;
+                eligible = eligible.saturating_add(size);
+            }
+        }
+        Some(vec![
+            (rows.len() / 2) as i64,
+            ready,
+            empty,
+            oversized,
+            invalid,
+            eligible,
+        ])
+    }
+
+    /// Op 4: `VerifyReleaseCandidates::summarizeCandidateVerificationOutcomes` over records of `[verdict, attempts]`.
+    fn verification_outcomes(bytes: &[u8]) -> Option<Vec<i64>> {
+        let (budget, rows) = records(bytes)?;
+        let budget = budget.max(0);
+        let mut counts = [0i64; 6];
+        for &(verdict, attempts) in &rows {
+            let slot = match verdict {
+                Some(b"complete" | b"repaired" | b"sampled") => 0,
+                Some(b"unknown") if attempts < budget => 1,
+                Some(b"unknown") => 2,
+                Some(b"unrepairable" | b"failed") => 3,
+                Some(b"deferred") => 4,
+                _ => 5,
+            };
+            counts[slot] += 1;
+        }
+        let mut out = Vec::with_capacity(7);
+        out.push(rows.len() as i64);
+        out.extend_from_slice(&counts);
+        Some(out)
+    }
+
+    fn compute(operation: u32, flags: u32, bytes: &[u8]) -> Option<Vec<i64>> {
+        if flags != 0 {
+            return None;
+        }
+        match operation {
+            0 => backfill_progress(bytes),
+            1 => transfer_window(bytes),
+            2 => manifest_records(bytes),
+            3 => candidate_batch(bytes),
+            4 => verification_outcomes(bytes),
+            _ => None,
+        }
+    }
+
+    /// # Safety
+    /// See [`super::nntmux_w39_fingerprint_backfill_transfer_candidate`].
+    pub(super) unsafe fn evaluate(
+        operation: u32,
+        flags: u32,
+        input: *const u8,
+        length: usize,
+        output: *mut u8,
+        capacity: usize,
+    ) -> i64 {
+        if !nfo_abi_range(input, length, false)
+            || !nfo_abi_range(output, capacity, false)
+            || length > MAX_INPUT
+            || capacity > isize::MAX as usize
+            || yenc_ranges_overlap(input as usize, length, output as usize, capacity)
+        {
+            return -1;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, length) };
+        let Some(result) = compute(operation, flags, bytes) else {
+            return -1;
+        };
+        let Some(needed) = result.len().checked_mul(8) else {
+            return -1;
+        };
+        if needed > capacity {
+            return -(needed as i64);
+        }
+        let out = unsafe { slice::from_raw_parts_mut(output, needed) };
+        for (chunk, value) in out.as_chunks_mut::<8>().0.iter_mut().zip(&result) {
+            chunk.copy_from_slice(&value.to_ne_bytes());
+        }
+        needed as i64
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        const GUID_A: &[u8] = b"0123456789abcdef0123456789abcdef01234567";
+        const GUID_B: &[u8] = b"fedcba9876543210fedcba9876543210fedcba98";
+
+        fn pack(slots: &[i64], tail: &[&[u8]]) -> Vec<u8> {
+            let mut v: Vec<u8> = slots.iter().flat_map(|s| s.to_ne_bytes()).collect();
+            for t in tail {
+                v.extend_from_slice(t);
+            }
+            v
+        }
+
+        fn call(operation: u32, flags: u32, input: &[u8]) -> Option<Vec<i64>> {
+            let mut out = vec![0xa5u8; 256];
+            let probe = [0u8; 1];
+            let pointer = if input.is_empty() {
+                probe.as_ptr()
+            } else {
+                input.as_ptr()
+            };
+            let written = unsafe {
+                evaluate(
+                    operation,
+                    flags,
+                    pointer,
+                    input.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            if written < 0 {
+                assert_eq!(written, -1);
+                return None;
+            }
+            Some(
+                out[..written as usize]
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(word)
+                    .collect(),
+            )
+        }
+
+        #[test]
+        fn w39_2_backfill_progress() {
+            assert_eq!(
+                call(
+                    0,
+                    0,
+                    &pack(&[1000, 0, 500, 400, 3, 1, 120, 600, 600, 0, 2, 340], &[])
+                ),
+                Some(vec![2, 0, 1100, 1000, 3, 3, 340, 1000, 0, 1])
+            );
+            assert_eq!(
+                call(0, 0, &pack(&[0, 2, -5, -1, -1, -1, -9], &[])),
+                Some(vec![1, 2, 0, 0, 0, 0, 0, 1, 1, 0])
+            );
+            assert_eq!(
+                call(0, 0, &pack(&[i64::MIN, 0], &[])),
+                Some(vec![0, 0, 0, 0, 0, 0, 0, 1, 1, 0])
+            );
+            assert_eq!(
+                call(
+                    0,
+                    0,
+                    &pack(
+                        &[i64::MAX, 0, i64::MAX, i64::MAX, 0, 0, 0, 1, 1, 0, 0, 0],
+                        &[]
+                    )
+                )
+                .unwrap()[2..4],
+                [i64::MAX, i64::MAX]
+            );
+            assert_eq!(call(0, 0, &pack(&[1, 0, 1, 2, 3, 4], &[])), None);
+            assert_eq!(call(0, 0, &pack(&[1, -1], &[])), None);
+            assert_eq!(call(0, 0, &pack(&[1], &[])), None);
+            assert_eq!(call(0, 0, &pack(&[1, 0], &[b"x"])), None);
+        }
+
+        #[test]
+        fn w39_2_transfer_window() {
+            assert_eq!(
+                call(1, 0, &pack(&[5000, 1000, 3, 0, 10_000], &[])),
+                Some(vec![5000, 10_000, 1000, 3, 3000, 2000, 0, 0])
+            );
+            assert_eq!(
+                call(1, 0, &pack(&[2500, 1000, 10, 0, 10_000], &[])),
+                Some(vec![2500, 10_000, 1000, 3, 2500, 0, 0, 1])
+            );
+            assert_eq!(
+                call(1, 0, &pack(&[100, 50, 10, 90, 100], &[])),
+                Some(vec![100, 10, 10, 1, 10, 90, 1, 0])
+            );
+            assert_eq!(
+                call(1, 0, &pack(&[100, 50, 10, 100, 100], &[])),
+                Some(vec![100, 0, 0, 0, 0, 100, 1, 0])
+            );
+            assert_eq!(
+                call(1, 0, &pack(&[0, 0, 0, 0, 0], &[])),
+                Some(vec![0, 0, 0, 0, 0, 0, 0, 1])
+            );
+            assert_eq!(
+                call(
+                    1,
+                    0,
+                    &pack(&[i64::MAX, i64::MAX, i64::MAX, i64::MIN, i64::MAX], &[])
+                ),
+                Some(vec![
+                    i64::MAX,
+                    i64::MAX,
+                    10_000,
+                    i64::MAX / 10_000 + 1,
+                    i64::MAX,
+                    0,
+                    0,
+                    1
+                ])
+            );
+            assert_eq!(
+                call(1, 0, &pack(&[i64::MAX, 7, 2, 0, i64::MAX], &[])).unwrap()[3..6],
+                [2, 14, i64::MAX - 14]
+            );
+            assert_eq!(call(1, 0, &pack(&[1, 2, 3, 4], &[])), None);
+            assert_eq!(call(1, 0, &pack(&[1, 2, 3, 4, 5, 6], &[])), None);
+            assert_eq!(call(1, 1, &pack(&[1, 2, 3, 4, 5], &[])), None);
+        }
+
+        #[test]
+        fn w39_2_manifest_records() {
+            let upper = b"0123456789ABCDEF0123456789abcdef01234567";
+            assert_eq!(
+                call(
+                    2,
+                    0,
+                    &pack(
+                        &[2, 6, 40, 5, 40, 9, 40, 1, -1, 7, 40, 3, 3, 9],
+                        &[GUID_A, GUID_A, GUID_B, upper, b"abc"]
+                    )
+                ),
+                Some(vec![6, 1, 3, 1, 1, 5])
+            );
+            assert_eq!(
+                call(2, 0, &pack(&[-4, 1, 40, -2], &[GUID_A])),
+                Some(vec![1, 0, 0, 1, 0, 0])
+            );
+            assert_eq!(
+                call(
+                    2,
+                    0,
+                    &pack(&[0, 2, 40, i64::MAX, 40, i64::MAX], &[GUID_A, GUID_B])
+                ),
+                Some(vec![2, 2, 0, 0, 0, i64::MAX])
+            );
+            assert_eq!(
+                call(2, 0, &pack(&[1, 0], &[])),
+                Some(vec![0, 0, 0, 0, 0, 0])
+            );
+            assert_eq!(call(2, 0, &pack(&[1, 1, 40, 1], &[])), None);
+            assert_eq!(call(2, 0, &pack(&[1, 1, 0, 1], &[b"x"])), None);
+            assert_eq!(call(2, 0, &pack(&[1, 1, -2, 1], &[])), None);
+            assert_eq!(call(2, 0, &pack(&[1, 2, -1, 1], &[])), None);
+            assert_eq!(call(2, 0, &pack(&[1, -1], &[])), None);
+            assert_eq!(call(2, 0, &pack(&[1], &[])), None);
+        }
+
+        #[test]
+        fn w39_2_candidate_batch() {
+            assert_eq!(
+                call(
+                    3,
+                    0,
+                    &pack(&[100, 3, 50, 0, 10, 2, 101, 1, -1, 4, 0, -7, 100], &[])
+                ),
+                Some(vec![6, 2, 2, 1, 1, 50])
+            );
+            assert_eq!(
+                call(3, 0, &pack(&[-1, 1, 0, 1, 1], &[])),
+                Some(vec![2, 1, 0, 1, 0, 0])
+            );
+            assert_eq!(
+                call(3, 0, &pack(&[i64::MAX, 1, i64::MAX, 1, 1], &[])).unwrap()[5],
+                i64::MAX
+            );
+            assert_eq!(call(3, 0, &pack(&[5], &[])), Some(vec![0, 0, 0, 0, 0, 0]));
+            assert_eq!(call(3, 0, &pack(&[5, 1], &[])), None);
+            assert_eq!(call(3, 0, &[]), None);
+        }
+
+        #[test]
+        fn w39_2_verification_outcomes() {
+            assert_eq!(
+                call(
+                    4,
+                    0,
+                    &pack(
+                        &[3, 9, 8, 0, 8, 9, 7, 0, 7, 2, 7, 3, 12, 1, 8, 0, -1, 0, 6, 0],
+                        &[
+                            b"complete",
+                            b"repaired",
+                            b"sampled",
+                            b"unknown",
+                            b"unknown",
+                            b"unrepairable",
+                            b"deferred",
+                            b"failed"
+                        ]
+                    )
+                ),
+                Some(vec![9, 3, 1, 1, 2, 1, 1])
+            );
+            assert_eq!(
+                call(4, 0, &pack(&[-3, 1, 7, -5], &[b"unknown"])),
+                Some(vec![1, 0, 1, 0, 0, 0, 0])
+            );
+            assert_eq!(
+                call(4, 0, &pack(&[1, 1, 7, i64::MIN], &[b"Unknown"])),
+                Some(vec![1, 0, 0, 0, 0, 0, 1])
+            );
+            assert_eq!(call(4, 0, &pack(&[1, 1, 7, 0], &[b"unknow"])), None);
+            assert_eq!(call(4, 0, &pack(&[1, 0], &[b"x"])), None);
+        }
+
+        #[test]
+        fn w39_2_abi_sentinels() {
+            assert_eq!(call(5, 0, &pack(&[0], &[])), None);
+            assert_eq!(call(u32::MAX, 0, &pack(&[0], &[])), None);
+            let input = pack(&[1, 2, 3, 4, 5], &[]);
+            let mut out = [0x5au8; 128];
+            let run = |p: *const u8, len: usize, o: *mut u8, cap: usize| unsafe {
+                evaluate(1, 0, p, len, o, cap)
+            };
+            assert_eq!(run(std::ptr::null(), 0, out.as_mut_ptr(), out.len()), -1);
+            assert_eq!(
+                run(input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), MAX_INPUT + 1, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), usize::MAX, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), input.len(), out.as_mut_ptr(), usize::MAX),
+                -1
+            );
+            for cap in [0, 1, 63] {
+                assert_eq!(run(input.as_ptr(), input.len(), out.as_mut_ptr(), cap), -64);
+            }
+            assert!(out.iter().all(|b| *b == 0x5a));
+            assert_eq!(run(input.as_ptr(), input.len(), out.as_mut_ptr(), 64), 64);
+            assert_eq!(word(&out[8..16].try_into().unwrap()), 1);
+            assert!(out[64..].iter().all(|b| *b == 0x5a));
+            let mut shared = [0u8; 160];
+            shared[..input.len()].copy_from_slice(&input);
+            let p = shared.as_mut_ptr();
+            assert_eq!(run(p, input.len(), unsafe { p.add(8) }, 64), -1);
+            let export = |op: u32, flags: u32, out: &mut [u8]| unsafe {
+                super::super::nntmux_w39_fingerprint_backfill_transfer_candidate(
+                    op,
+                    flags,
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert_eq!(export(1, 0, &mut out), 64);
+            assert_eq!(export(1, 1, &mut out), -1);
+            assert_eq!(export(0, 0, &mut out), -1);
+        }
+    }
+}
+
+/// Evaluate one Wave 39.2 helper over packed native-endian `i64` slots followed by any
+/// string bytes: op 0 summarizes a fingerprint backfill progress window, op 1 plans a
+/// fingerprint queue transfer window, op 2 summarizes verification manifest import
+/// records, op 3 summarizes a candidate preparation batch and op 4 summarizes candidate
+/// verification outcomes. `flags` must be zero. Returns the byte count written, the
+/// negated required capacity when `out_cap` is too small (nothing written), or -1 when
+/// the input is malformed.
+///
+/// # Safety
+/// Both ranges must be live, disjoint readable/writable allocations. Pointers must
+/// be non-null even for zero lengths; arithmetic checks cannot prove provenance.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w39_fingerprint_backfill_transfer_candidate(
+    operation: u32,
+    flags: u32,
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> i64 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        wave39_fingerprint_backfill_transfer_candidate::evaluate(
+            operation, flags, input, input_len, out_buf, out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
