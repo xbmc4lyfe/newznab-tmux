@@ -38263,3 +38263,1744 @@ mod wave50_5_probes_redis_search_registry_cursor_failure {
         }
     }
 }
+
+/// Wave 51.5 batch helpers for `MediaSearchService`, `SearchIndexOutboxDispatcher`,
+/// `SearchService`, `ReleaseSearchQuery` and `SearchCursor`.
+///
+/// Every entry point shares the Wave 50.5 ABI: `count` records, a reserved
+/// `flags` word (must be 0), a byte buffer (`data`, NUL-delimited or
+/// length-prefixed by the int table, as documented per helper), a
+/// little-endian i64 table (`ints`) and a fixed-width i64 output (`out`,
+/// `out_cap` words) that leads with the number of records PHP must compute.
+/// Each returns the words written, `-needed` when `out_cap` is too small, or
+/// `-1` (decline: invalid input or overlapping buffers). Callers never pass
+/// `count == 0`, so `needed` is at least five words and never collides with
+/// the decline code. Declines and capacity errors never write to `out`. A
+/// record whose first output word is -1 must be computed by PHP.
+mod wave51_5_search_media_outbox_service_query_cursor {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const DECLINE: i64 = -1;
+    /// First output word of a record PHP must compute.
+    const PATCH: i64 = -1;
+    const MAX_INPUT: usize = 64 * 1024 * 1024;
+    const MAX_RECORDS: usize = 1 << 20;
+    const XXH_P1: u64 = 0x9E37_79B1_85EB_CA87;
+    const XXH_P2: u64 = 0xC2B2_AE3D_27D4_EB4F;
+    const XXH_P3: u64 = 0x1656_67B1_9E37_79F9;
+    const XXH_P4: u64 = 0x85EB_CA77_C2B2_AE63;
+    const XXH_P5: u64 = 0x27D4_EB2F_1656_67C5;
+    const LOW_BITS: u64 = 0x0101_0101_0101_0101;
+    const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+    const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
+    const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
+    /// `MediaSearchService::MOVIE_EXTERNAL_ID_FIELDS` / `TV_EXTERNAL_ID_FIELDS` targets.
+    const MOVIE_TARGETS: [&[u8]; 3] = [b"imdbid", b"tmdbid", b"traktid"];
+    const TV_TARGETS: [&[u8]; 4] = [b"tvdb", b"traktid", b"tvmaze", b"tvrage"];
+    /// `SecondarySearchIndex` values in case order (ordinal = position + 1).
+    const SECONDARY_INDEXES: [&[u8]; 6] =
+        [b"music", b"books", b"games", b"console", b"steam", b"anime"];
+    /// `ReleaseSearchQuery::W415_SORT_FIELDS`.
+    const SORT_FIELDS: [&[u8]; 8] = [
+        b"postdate_ts",
+        b"adddate_ts",
+        b"size",
+        b"totalpart",
+        b"grabs",
+        b"comments",
+        b"categories_id",
+        b"id",
+    ];
+
+    fn xxh_round(acc: u64, lane: u64) -> u64 {
+        acc.wrapping_add(lane.wrapping_mul(XXH_P2))
+            .rotate_left(31)
+            .wrapping_mul(XXH_P1)
+    }
+
+    fn xxh_merge(acc: u64, lane: u64) -> u64 {
+        (acc ^ xxh_round(0, lane))
+            .wrapping_mul(XXH_P1)
+            .wrapping_add(XXH_P4)
+    }
+
+    fn le64(bytes: &[u8]) -> u64 {
+        u64::from_le_bytes(bytes[..8].try_into().unwrap_or([0; 8]))
+    }
+
+    /// PHP `hash('xxh64')` (seed 0) read back with `unpack('J')`.
+    fn xxh64(input: &[u8]) -> i64 {
+        let mut rest = input;
+        let mut hash = if input.len() >= 32 {
+            let mut lanes = [
+                XXH_P1.wrapping_add(XXH_P2),
+                XXH_P2,
+                0,
+                0u64.wrapping_sub(XXH_P1),
+            ];
+            let (stripes, tail) = input.as_chunks::<32>();
+            for stripe in stripes {
+                for (index, lane) in lanes.iter_mut().enumerate() {
+                    *lane = xxh_round(*lane, le64(&stripe[index * 8..]));
+                }
+            }
+            rest = tail;
+            let mut hash = lanes[0]
+                .rotate_left(1)
+                .wrapping_add(lanes[1].rotate_left(7))
+                .wrapping_add(lanes[2].rotate_left(12))
+                .wrapping_add(lanes[3].rotate_left(18));
+            for lane in lanes {
+                hash = xxh_merge(hash, lane);
+            }
+            hash
+        } else {
+            XXH_P5
+        };
+        hash = hash.wrapping_add(input.len() as u64);
+        while rest.len() >= 8 {
+            hash ^= xxh_round(0, le64(rest));
+            hash = hash
+                .rotate_left(27)
+                .wrapping_mul(XXH_P1)
+                .wrapping_add(XXH_P4);
+            rest = &rest[8..];
+        }
+        if rest.len() >= 4 {
+            let lane = u32::from_le_bytes(rest[..4].try_into().unwrap_or([0; 4]));
+            hash ^= u64::from(lane).wrapping_mul(XXH_P1);
+            hash = hash
+                .rotate_left(23)
+                .wrapping_mul(XXH_P2)
+                .wrapping_add(XXH_P3);
+            rest = &rest[4..];
+        }
+        for &byte in rest {
+            hash ^= u64::from(byte).wrapping_mul(XXH_P5);
+            hash = hash.rotate_left(11).wrapping_mul(XXH_P1);
+        }
+        hash ^= hash >> 33;
+        hash = hash.wrapping_mul(XXH_P2);
+        hash ^= hash >> 29;
+        hash = hash.wrapping_mul(XXH_P3);
+        hash ^= hash >> 32;
+        hash as i64
+    }
+
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> Option<bool> {
+        if a_len == 0 || b_len == 0 {
+            return Some(false);
+        }
+        let a_end = a.checked_add(a_len)?;
+        let b_end = b.checked_add(b_len)?;
+        Some(a < b_end && b < a_end)
+    }
+
+    /// Word-at-a-time search for the first NUL byte.
+    fn find_nul(haystack: &[u8]) -> Option<usize> {
+        let (words, _) = haystack.as_chunks::<8>();
+        for (index, word) in words.iter().enumerate() {
+            let value = u64::from_le_bytes(*word);
+            let found = value.wrapping_sub(LOW_BITS) & !value & HIGH_BITS;
+            if found != 0 {
+                return Some(index * 8 + (found.trailing_zeros() / 8) as usize);
+            }
+        }
+        let tail = words.len() * 8;
+        haystack[tail..]
+            .iter()
+            .position(|&byte| byte == 0)
+            .map(|position| tail + position)
+    }
+
+    /// Splits `data` on NUL into exactly `expected` fields.
+    fn split_fields(data: &[u8], expected: usize) -> Option<Vec<&[u8]>> {
+        if expected == 0 {
+            return data.is_empty().then(Vec::new);
+        }
+        let mut fields = Vec::with_capacity(expected);
+        let mut rest = data;
+        while fields.len() + 1 < expected {
+            let at = find_nul(rest)?;
+            fields.push(&rest[..at]);
+            rest = &rest[at + 1..];
+        }
+        if find_nul(rest).is_some() {
+            return None;
+        }
+        fields.push(rest);
+        Some(fields)
+    }
+
+    fn read_ints(bytes: &[u8]) -> Option<Vec<i64>> {
+        let (chunks, tail) = bytes.as_chunks::<8>();
+        tail.is_empty().then(|| {
+            chunks
+                .iter()
+                .map(|chunk| i64::from_le_bytes(*chunk))
+                .collect()
+        })
+    }
+
+    /// Sequential reader over the int table.
+    struct Ints<'a> {
+        table: &'a [i64],
+        at: usize,
+    }
+
+    impl Ints<'_> {
+        fn next(&mut self) -> Option<i64> {
+            let value = *self.table.get(self.at)?;
+            self.at += 1;
+            Some(value)
+        }
+
+        fn done(&self) -> bool {
+            self.at == self.table.len()
+        }
+    }
+
+    /// Sequential reader over length-prefixed byte fields.
+    struct Bytes<'a> {
+        data: &'a [u8],
+        at: usize,
+    }
+
+    impl<'a> Bytes<'a> {
+        fn take(&mut self, len: i64) -> Option<&'a [u8]> {
+            let len = usize::try_from(len).ok()?;
+            let end = self.at.checked_add(len)?;
+            let field = self.data.get(self.at..end)?;
+            self.at = end;
+            Some(field)
+        }
+
+        fn done(&self) -> bool {
+            self.at == self.data.len()
+        }
+    }
+
+    /// Validates the shared ABI, runs `body` and copies its words to `out`.
+    ///
+    /// # Safety
+    /// See the entry points.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run(
+        count: usize,
+        flags: i64,
+        data: *const u8,
+        data_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        out: *mut i64,
+        out_cap: usize,
+        words_per_record: usize,
+        body: impl FnOnce(&[u8], &[i64], &mut Vec<i64>) -> Option<()>,
+    ) -> i64 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if flags != 0
+                || count > MAX_RECORDS
+                || data_len > MAX_INPUT
+                || ints_len > MAX_INPUT
+                || out_cap > MAX_INPUT
+                || (data.is_null() && data_len != 0)
+                || (ints.is_null() && ints_len != 0)
+                || (out.is_null() && out_cap != 0)
+                || (!out.is_null() && !out.is_aligned())
+            {
+                return DECLINE;
+            }
+            let Some(out_bytes) = out_cap.checked_mul(8) else {
+                return DECLINE;
+            };
+            for (pointer, len) in [(data as usize, data_len), (ints as usize, ints_len)] {
+                if overlaps(pointer, len, out as usize, out_bytes) != Some(false) {
+                    return DECLINE;
+                }
+            }
+            let data = if data_len == 0 || data.is_null() {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(data, data_len) }
+            };
+            let ints = if ints_len == 0 || ints.is_null() {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(ints, ints_len) }
+            };
+            let Some(table) = read_ints(ints) else {
+                return DECLINE;
+            };
+            let needed = 1 + count * words_per_record;
+            let mut words = Vec::with_capacity(needed);
+            words.push(0);
+            if body(data, &table, &mut words).is_none() || words.len() != needed {
+                return DECLINE;
+            }
+            if out_cap < needed {
+                return -(needed as i64);
+            }
+            unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), out, needed) };
+            needed as i64
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    fn patch(words: &mut Vec<i64>, width: usize) {
+        words[0] += 1;
+        words.push(PATCH);
+        words.resize(words.len() + width - 1, 0);
+    }
+
+    fn push_int(out: &mut Vec<u8>, value: i64) {
+        let mut digits = [0u8; 20];
+        let mut at = digits.len();
+        let mut magnitude = value.unsigned_abs();
+        loop {
+            at -= 1;
+            digits[at] = b'0' + (magnitude % 10) as u8;
+            magnitude /= 10;
+            if magnitude == 0 {
+                break;
+            }
+        }
+        if value < 0 {
+            out.push(b'-');
+        }
+        out.extend_from_slice(&digits[at..]);
+    }
+
+    /// PHP `trim()` default characters.
+    fn is_trim(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b)
+    }
+
+    fn trim(bytes: &[u8]) -> &[u8] {
+        let start = bytes
+            .iter()
+            .position(|&b| !is_trim(b))
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|&b| !is_trim(b))
+            .map_or(start, |at| at + 1);
+        &bytes[start..end]
+    }
+
+    /// PHP `(int) $string` for the shapes Rust can decide exactly: a signed
+    /// decimal prefix of at most 18 digits not followed by `.`, `e` or `E`, or
+    /// a string without any numeric prefix (0). None leaves the cast to PHP.
+    fn int_cast(bytes: &[u8]) -> Option<i64> {
+        let Some(&first) = bytes.first() else {
+            return Some(0);
+        };
+        if !(first.is_ascii_digit() || first == b'+' || first == b'-') {
+            return (!matches!(first, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c | b'.'))
+                .then_some(0);
+        }
+        let negative = first == b'-';
+        let digits = if first.is_ascii_digit() {
+            bytes
+        } else {
+            &bytes[1..]
+        };
+        let len = digits.iter().take_while(|b| b.is_ascii_digit()).count();
+        if len == 0 || len > 18 || matches!(digits.get(len), Some(b'.' | b'e' | b'E')) {
+            return None;
+        }
+        let magnitude = digits[..len]
+            .iter()
+            .fold(0i64, |acc, &b| acc * 10 + i64::from(b - b'0'));
+        Some(if negative { -magnitude } else { magnitude })
+    }
+
+    /// PHP `urlencode()` (RFC 1738, as `http_build_query()` encodes values).
+    fn url_encode(out: &mut Vec<u8>, bytes: &[u8]) {
+        let mut start = 0;
+        for (at, &byte) in bytes.iter().enumerate() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_') {
+                continue;
+            }
+            out.extend_from_slice(&bytes[start..at]);
+            start = at + 1;
+            if byte == b' ' {
+                out.push(b'+');
+            } else {
+                out.extend_from_slice(&[
+                    b'%',
+                    HEX_UPPER[usize::from(byte >> 4)],
+                    HEX_UPPER[usize::from(byte & 15)],
+                ]);
+            }
+        }
+        out.extend_from_slice(&bytes[start..]);
+    }
+
+    /// A JSON scalar of PHP `json_encode()` output; containers and floats are `Other`.
+    #[derive(Clone, Copy)]
+    enum Token<'a> {
+        Int(i64),
+        /// Bytes between the quotes of a string without escapes.
+        Str(&'a [u8]),
+        /// Raw bytes between the quotes of a string with escapes (undecoded).
+        Esc(&'a [u8]),
+        True,
+        False,
+        Null,
+        Other,
+    }
+
+    /// Strict reader for PHP `json_encode()` output (no whitespace).
+    struct Json<'a> {
+        input: &'a [u8],
+        at: usize,
+    }
+
+    impl<'a> Json<'a> {
+        fn peek(&self) -> Option<u8> {
+            self.input.get(self.at).copied()
+        }
+
+        fn eat(&mut self, byte: u8) -> Option<()> {
+            (self.peek()? == byte).then(|| self.at += 1)
+        }
+
+        fn literal(&mut self, word: &[u8], token: Token<'a>) -> Option<Token<'a>> {
+            let end = self.at.checked_add(word.len())?;
+            (self.input.get(self.at..end)? == word).then(|| {
+                self.at = end;
+                token
+            })
+        }
+
+        /// A string token: its raw bytes and whether it holds escapes.
+        fn string(&mut self) -> Option<(&'a [u8], bool)> {
+            self.eat(b'"')?;
+            let start = self.at;
+            let mut escaped = false;
+            loop {
+                let rest = self.input.get(self.at..)?;
+                let at = rest.iter().position(|&b| b == b'"' || b == b'\\')?;
+                self.at += at;
+                if rest[at] == b'"' {
+                    break;
+                }
+                escaped = true;
+                self.at += 2;
+            }
+            let raw = &self.input[start..self.at];
+            self.at += 1;
+            Some((raw, escaped))
+        }
+
+        fn string_token(&mut self) -> Option<Token<'a>> {
+            let (raw, escaped) = self.string()?;
+            Some(if escaped {
+                Token::Esc(raw)
+            } else {
+                Token::Str(raw)
+            })
+        }
+
+        fn number(&mut self) -> Option<Token<'a>> {
+            let negative = self.eat(b'-').is_some();
+            let digits = self.at;
+            let mut value = 0i64;
+            let mut overflow = false;
+            while let Some(byte) = self.peek().filter(u8::is_ascii_digit) {
+                let digit = i64::from(byte - b'0');
+                let next = value.checked_mul(10).and_then(|v| {
+                    if negative {
+                        v.checked_sub(digit)
+                    } else {
+                        v.checked_add(digit)
+                    }
+                });
+                overflow |= next.is_none();
+                value = next.unwrap_or(0);
+                self.at += 1;
+            }
+            if self.at == digits {
+                return None;
+            }
+            if matches!(self.peek(), Some(b'.' | b'e' | b'E')) {
+                while self.peek().is_some_and(|b| {
+                    b.is_ascii_digit() || matches!(b, b'.' | b'e' | b'E' | b'+' | b'-')
+                }) {
+                    self.at += 1;
+                }
+                return Some(Token::Other);
+            }
+            (!overflow).then_some(Token::Int(value))
+        }
+
+        fn value(&mut self, depth: usize) -> Option<Token<'a>> {
+            match self.peek()? {
+                b'"' => self.string_token(),
+                b't' => self.literal(b"true", Token::True),
+                b'f' => self.literal(b"false", Token::False),
+                b'n' => self.literal(b"null", Token::Null),
+                b'[' | b'{' => {
+                    self.skip(depth)?;
+                    Some(Token::Other)
+                }
+                b'-' | b'0'..=b'9' => self.number(),
+                _ => None,
+            }
+        }
+
+        fn skip(&mut self, depth: usize) -> Option<()> {
+            if depth > 64 {
+                return None;
+            }
+            let object = self.peek()? == b'{';
+            let close = if object { b'}' } else { b']' };
+            self.at += 1;
+            if self.eat(close).is_some() {
+                return Some(());
+            }
+            loop {
+                if object {
+                    self.string()?;
+                    self.eat(b':')?;
+                }
+                self.value(depth + 1)?;
+                if self.eat(close).is_some() {
+                    return Some(());
+                }
+                self.eat(b',')?;
+            }
+        }
+
+        /// The elements of an array, `Other` for nested containers.
+        fn array(&mut self, out: &mut Vec<Token<'a>>) -> Option<()> {
+            self.eat(b'[')?;
+            if self.eat(b']').is_some() {
+                return Some(());
+            }
+            loop {
+                out.push(self.value(1)?);
+                if self.eat(b']').is_some() {
+                    return Some(());
+                }
+                self.eat(b',')?;
+            }
+        }
+    }
+
+    fn hex4(bytes: &[u8]) -> Option<u32> {
+        bytes
+            .iter()
+            .try_fold(0u32, |acc, &b| Some(acc << 4 | char::from(b).to_digit(16)?))
+    }
+
+    /// Decodes the raw bytes of a JSON string into `out`.
+    fn unescape(raw: &[u8], out: &mut Vec<u8>) -> Option<()> {
+        out.clear();
+        let mut at = 0;
+        while at < raw.len() {
+            let byte = raw[at];
+            if byte != b'\\' {
+                out.push(byte);
+                at += 1;
+                continue;
+            }
+            let escape = *raw.get(at + 1)?;
+            at += 2;
+            let decoded = match escape {
+                b'"' | b'\\' | b'/' => escape,
+                b'b' => 0x08,
+                b'f' => 0x0c,
+                b'n' => b'\n',
+                b'r' => b'\r',
+                b't' => b'\t',
+                b'u' => {
+                    let unit = hex4(raw.get(at..at + 4)?)?;
+                    at += 4;
+                    let point = match unit {
+                        0xD800..0xDC00 => {
+                            if raw.get(at..at + 2)? != b"\\u" {
+                                return None;
+                            }
+                            let low = hex4(raw.get(at + 2..at + 6)?)?;
+                            at += 6;
+                            if !(0xDC00..0xE000).contains(&low) {
+                                return None;
+                            }
+                            0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00)
+                        }
+                        0xDC00..0xE000 => return None,
+                        _ => unit,
+                    };
+                    let mut buffer = [0u8; 4];
+                    out.extend_from_slice(
+                        char::from_u32(point)?.encode_utf8(&mut buffer).as_bytes(),
+                    );
+                    continue;
+                }
+                _ => return None,
+            };
+            out.push(decoded);
+        }
+        Some(())
+    }
+
+    /// One media ID field: an int, string bytes, true, empty (null, false, 0,
+    /// "" or "0") or another value PHP must handle.
+    #[derive(Clone, Copy)]
+    enum Value<'a> {
+        Int(i64),
+        Text(&'a [u8]),
+        True,
+        Empty,
+        Other,
+    }
+
+    /// One `externalIdPlanBatch()` row; None when PHP must compute it.
+    fn media_row(
+        targets: &[&[u8]],
+        values: &[Value<'_>],
+        movie: bool,
+        key: &mut Vec<u8>,
+        filter: &mut Vec<u8>,
+    ) -> Option<[i64; 4]> {
+        key.clear();
+        filter.clear();
+        let (mut mask, mut found, mut primary) = (0i64, 0i64, 0i64);
+        for (index, (target, value)) in targets.iter().zip(values).enumerate() {
+            match *value {
+                Value::Int(0) | Value::Empty => continue,
+                Value::Text(text) if text.is_empty() || text == b"0" => continue,
+                Value::Other => return None,
+                _ => {}
+            }
+            if found > 0 {
+                key.push(b'&');
+                filter.push(b'\n');
+            }
+            key.extend_from_slice(target);
+            key.push(b'=');
+            filter.extend_from_slice(target);
+            filter.push(b':');
+            let as_string = *target == b"imdbid";
+            let cast = match *value {
+                Value::Int(value) => {
+                    push_int(key, value);
+                    Some(value)
+                }
+                Value::Text(text) => {
+                    url_encode(key, text);
+                    int_cast(text)
+                }
+                _ => {
+                    key.push(b'1');
+                    Some(1)
+                }
+            };
+            match (as_string, *value) {
+                (true, Value::Text(text)) => filter.extend_from_slice(text),
+                (true, Value::True) => filter.push(b'1'),
+                (true, Value::Int(value)) => push_int(filter, value),
+                _ => push_int(filter, cast?),
+            }
+            if found == 0 {
+                primary = cast?;
+            }
+            mask |= 1 << index;
+            found += 1;
+        }
+        let route = if found > 0 {
+            0
+        } else if movie {
+            1
+        } else {
+            2
+        };
+        Some([
+            mask | found << 8 | route << 12 | (key.len() as i64) << 20,
+            primary,
+            xxh64(key),
+            xxh64(filter),
+        ])
+    }
+
+    /// `MediaSearchService::externalIdPlanBatch()`. `ints` starts with `[movie
+    /// (1) or TV (0), mode]`. Mode 1 (columns): `ints` continues with the
+    /// number of non-array rows and their ascending positions, and `data` is
+    /// `json_encode()` of one list per field holding that field of every array
+    /// row. Mode 0 (rows): `ints` continues per row with a tag (0 not an array,
+    /// 1 row, 2 PHP computes), then for tags 1 and 2 one (kind, value) pair per
+    /// field; kinds are 0 int, 1 string (value = byte length, bytes appended to
+    /// `data`), 2 null/false and 3 true. 4 words per row: `[presence mask | ID
+    /// count << 8 | route << 12 | key length << 20 (not an array: 1 << 16),
+    /// (int) first ID, xxh64(key), xxh64(filter terms)]`, the key being
+    /// `http_build_query()` of the collected IDs and the filter terms the
+    /// driver's `field:typed value` pairs (imdbid as a string, other IDs cast
+    /// to int) joined by newlines.
+    fn media_plan(count: usize, data: &[u8], table: &[i64], words: &mut Vec<i64>) -> Option<()> {
+        let mut ints = Ints { table, at: 0 };
+        let (targets, movie): (&[&[u8]], bool) = match ints.next()? {
+            1 => (&MOVIE_TARGETS, true),
+            0 => (&TV_TARGETS, false),
+            _ => return None,
+        };
+        let width = targets.len();
+        let mut key = Vec::with_capacity(96);
+        let mut filter = Vec::with_capacity(96);
+        let emit = |words: &mut Vec<i64>, row: Option<[i64; 4]>| match row {
+            Some(row) => words.extend(row),
+            None => patch(words, 4),
+        };
+        if ints.next()? == 1 {
+            let invalid = usize::try_from(ints.next()?).ok().filter(|&n| n <= count)?;
+            let positions = table.get(ints.at..ints.at.checked_add(invalid)?)?;
+            ints.at += invalid;
+            let rows = count - invalid;
+            let mut json = Json { input: data, at: 0 };
+            let mut columns: Vec<Vec<Token<'_>>> = Vec::with_capacity(width);
+            json.eat(b'[')?;
+            for index in 0..width {
+                if index > 0 {
+                    json.eat(b',')?;
+                }
+                let mut column = Vec::with_capacity(rows);
+                json.array(&mut column)?;
+                if column.len() != rows {
+                    return None;
+                }
+                columns.push(column);
+            }
+            json.eat(b']')?;
+            if json.at != data.len() || !ints.done() {
+                return None;
+            }
+            let mut scratch: [Vec<u8>; 4] = Default::default();
+            let (mut next_invalid, mut row) = (0, 0);
+            for position in 0..count {
+                if positions.get(next_invalid) == Some(&(position as i64)) {
+                    next_invalid += 1;
+                    words.extend([1 << 16, 0, 0, 0]);
+                    continue;
+                }
+                let mut decoded = true;
+                for (index, buffer) in scratch.iter_mut().enumerate().take(width) {
+                    if let Token::Esc(raw) = columns[index][row] {
+                        decoded &= unescape(raw, buffer).is_some();
+                    }
+                }
+                let mut values = [Value::Empty; 4];
+                for (index, value) in values.iter_mut().enumerate().take(width) {
+                    *value = match columns[index][row] {
+                        Token::Int(int) => Value::Int(int),
+                        Token::Str(raw) => Value::Text(raw),
+                        Token::Esc(_) => Value::Text(&scratch[index]),
+                        Token::True => Value::True,
+                        Token::False | Token::Null => Value::Empty,
+                        Token::Other => Value::Other,
+                    };
+                }
+                row += 1;
+                emit(
+                    words,
+                    decoded
+                        .then(|| media_row(targets, &values[..width], movie, &mut key, &mut filter))
+                        .flatten(),
+                );
+            }
+            return (next_invalid == invalid && row == rows).then_some(());
+        }
+        let mut bytes = Bytes { data, at: 0 };
+        let mut values = [Value::Empty; 4];
+        for _ in 0..count {
+            let tag = ints.next()?;
+            if tag == 0 {
+                words.extend([1 << 16, 0, 0, 0]);
+                continue;
+            }
+            if tag != 1 && tag != 2 {
+                return None;
+            }
+            for value in values.iter_mut().take(width) {
+                let kind = ints.next()?;
+                let field = ints.next()?;
+                *value = match kind {
+                    0 => Value::Int(field),
+                    1 => Value::Text(bytes.take(field)?),
+                    2 => Value::Empty,
+                    3 => Value::True,
+                    _ => return None,
+                };
+            }
+            emit(
+                words,
+                (tag == 1)
+                    .then(|| media_row(targets, &values[..width], movie, &mut key, &mut filter))
+                    .flatten(),
+            );
+        }
+        (ints.done() && bytes.done()).then_some(())
+    }
+
+    /// `SearchIndexOutboxDispatcher::normalizeActionPhp()` into `out`; returns
+    /// the action code (0 insert, 1 upsert, 2 update, 3 delete, 4 other).
+    fn normalize_action(action: &[u8], out: &mut Vec<u8>) -> i64 {
+        out.clear();
+        out.extend(action.iter().map(|&b| match b {
+            b'-' | b' ' => b'_',
+            _ => b.to_ascii_lowercase(),
+        }));
+        let (canonical, code): (&[u8], i64) = match out.as_slice() {
+            b"insert" | b"inserted" | b"create" | b"created" => (b"insert", 0),
+            b"upsert" | b"upserted" | b"replace" | b"replaced" | b"save" | b"saved" | b"index"
+            | b"indexed" => (b"upsert", 1),
+            b"update" | b"updated" => (b"update", 2),
+            b"delete" | b"deleted" | b"destroy" | b"destroyed" | b"remove" | b"removed" => {
+                (b"delete", 3)
+            }
+            _ => return 4,
+        };
+        out.clear();
+        out.extend_from_slice(canonical);
+        code
+    }
+
+    /// `SearchIndexOutboxDispatcher::normalizeEntityTypePhp()` for ASCII input
+    /// into `out`; returns the type class (0 release, 1 predb, 2 movie, 3
+    /// tvshow, 4 secondary, 5 secondary index alias, 6 other) and the
+    /// `SecondarySearchIndex` ordinal (1-6, 0 none).
+    fn normalize_type(entity_type: &[u8], out: &mut Vec<u8>) -> (i64, i64) {
+        out.clear();
+        // basename() after mapping `\` to `/`: drop trailing slashes, keep the last segment.
+        let is_slash = |b: &u8| *b == b'/' || *b == b'\\';
+        let end = entity_type
+            .iter()
+            .rposition(|b| !is_slash(b))
+            .map_or(0, |at| at + 1);
+        let start = entity_type[..end]
+            .iter()
+            .rposition(is_slash)
+            .map_or(0, |at| at + 1);
+        out.extend(entity_type[start..end].iter().map(|&b| match b {
+            b'-' | b' ' => b'_',
+            _ => b.to_ascii_lowercase(),
+        }));
+        let (canonical, class): (&[u8], i64) = match out.as_slice() {
+            b"release" | b"releases" => (b"release", 0),
+            b"pre" | b"pres" | b"predb" | b"predbs" => (b"predb", 1),
+            b"movie" | b"movies" | b"movieinfo" | b"movie_info" => (b"movie", 2),
+            b"tv" | b"video" | b"videos" | b"tvshow" | b"tvshows" | b"tv_show" | b"tv_shows" => {
+                (b"tvshow", 3)
+            }
+            b"secondary" | b"secondary_search" | b"secondary_search_index" => (b"secondary", 4),
+            other => {
+                let ordinal = match other {
+                    b"music" | b"musicinfo" | b"music_info" => 1,
+                    b"book" | b"books" | b"bookinfo" | b"book_info" => 2,
+                    b"game" | b"games" | b"gamesinfo" | b"games_info" => 3,
+                    b"console" | b"consoleinfo" | b"console_info" => 4,
+                    b"steam" | b"steamapp" | b"steamapps" | b"steam_app" | b"steam_apps" => 5,
+                    b"anime" | b"anidb" | b"anidbtitle" | b"anidbtitles" | b"anidb_title"
+                    | b"anidb_titles" | b"anidbinfo" | b"anidb_info" => 6,
+                    _ => 0,
+                };
+                return (if ordinal > 0 { 5 } else { 6 }, ordinal);
+            }
+        };
+        out.clear();
+        out.extend_from_slice(canonical);
+        (class, 0)
+    }
+
+    /// `SearchIndexOutboxDispatcher::routeOutboxBatch()`: `data` is every
+    /// entity type, then every action (NUL-delimited); `ints` holds the entity
+    /// IDs. 5 words per row: `[action code | type class << 3 | secondary
+    /// ordinal << 6, document key length, xxh64(document key), normalized
+    /// action length, xxh64(normalized action)]`; non-ASCII types are PHP's.
+    fn outbox_route(count: usize, data: &[u8], table: &[i64], words: &mut Vec<i64>) -> Option<()> {
+        if table.len() != count {
+            return None;
+        }
+        let fields = split_fields(data, 2 * count)?;
+        let (types, actions) = fields.split_at(count);
+        let mut action = Vec::with_capacity(32);
+        let mut entity_type = Vec::with_capacity(32);
+        let mut key = Vec::with_capacity(48);
+        for index in 0..count {
+            if !types[index].is_ascii() {
+                patch(words, 5);
+                continue;
+            }
+            let code = normalize_action(actions[index], &mut action);
+            let (class, ordinal) = normalize_type(types[index], &mut entity_type);
+            key.clear();
+            if ordinal > 0 {
+                key.extend_from_slice(b"secondary:");
+                key.extend_from_slice(SECONDARY_INDEXES[(ordinal - 1) as usize]);
+            } else {
+                key.extend_from_slice(&entity_type);
+            }
+            key.push(b':');
+            push_int(&mut key, table[index]);
+            words.extend([
+                code | class << 3 | ordinal << 6,
+                key.len() as i64,
+                xxh64(&key),
+                action.len() as i64,
+                xxh64(&action),
+            ]);
+        }
+        Some(())
+    }
+
+    /// `ManticoreSearchDriver::escapeStringPhp()`: the sequential
+    /// `str_replace()` table in one pass (a `--` pair becomes `\\-\-`), then
+    /// `rtrim('-!')` and `trim()`.
+    fn manticore_escape(input: &[u8], out: &mut Vec<u8>) {
+        out.clear();
+        if input.is_empty() || input == b"*" || input == b"0" {
+            return;
+        }
+        let mut at = 0;
+        while at < input.len() {
+            let byte = input[at];
+            match byte {
+                b'\\' => out.extend_from_slice(b"\\\\"),
+                b'(' | b')' | b'@' | b'~' | b'"' | b'&' | b'/' | b'$' | b'=' | b'\'' | b'['
+                | b']' | b'!' => out.extend_from_slice(&[b'\\', byte]),
+                b'-' if input.get(at + 1) == Some(&b'-') => {
+                    out.extend_from_slice(b"\\\\-\\-");
+                    at += 1;
+                }
+                b'-' => out.extend_from_slice(b"\\-"),
+                _ => out.push(byte),
+            }
+            at += 1;
+        }
+        let end = out
+            .iter()
+            .rposition(|&b| b != b'-' && b != b'!')
+            .map_or(0, |at| at + 1);
+        out.truncate(end);
+        let trimmed = trim(out);
+        let (start, len) = (
+            trimmed.as_ptr() as usize - out.as_ptr() as usize,
+            trimmed.len(),
+        );
+        out.copy_within(start..start + len, 0);
+        out.truncate(len);
+    }
+
+    /// `ElasticSearchDriver::escapeStringPhp()`: dots become spaces, then
+    /// `trim()` and `preg_replace('/\s+/', ' ')` (PCRE `\s`: HT, LF, VT, FF,
+    /// CR, space).
+    fn elastic_escape(input: &[u8], out: &mut Vec<u8>) {
+        out.clear();
+        if input.is_empty() || input == b"*" || input == b"0" {
+            return;
+        }
+        let trimmed = {
+            let start = input
+                .iter()
+                .position(|&b| !is_trim(b) && b != b'.')
+                .unwrap_or(input.len());
+            let end = input
+                .iter()
+                .rposition(|&b| !is_trim(b) && b != b'.')
+                .map_or(start, |at| at + 1);
+            &input[start..end]
+        };
+        let mut space = false;
+        for &byte in trimmed {
+            if matches!(byte, b'.' | b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') {
+                space = true;
+            } else {
+                if space {
+                    out.push(b' ');
+                    space = false;
+                }
+                out.push(byte);
+            }
+        }
+        if space {
+            out.push(b' ');
+        }
+    }
+
+    /// `SearchService::escapeQueryBatch()`: `data` holds the queries
+    /// (NUL-delimited), `ints` is empty. 4 words per query: `[Manticore length,
+    /// xxh64(Manticore escape), Elasticsearch length, xxh64(Elasticsearch
+    /// escape)]`.
+    fn escape_queries(
+        count: usize,
+        data: &[u8],
+        table: &[i64],
+        words: &mut Vec<i64>,
+    ) -> Option<()> {
+        if !table.is_empty() {
+            return None;
+        }
+        let mut manticore = Vec::with_capacity(128);
+        let mut elastic = Vec::with_capacity(128);
+        for query in split_fields(data, count)? {
+            manticore_escape(query, &mut manticore);
+            elastic_escape(query, &mut elastic);
+            words.extend([
+                manticore.len() as i64,
+                xxh64(&manticore),
+                elastic.len() as i64,
+                xxh64(&elastic),
+            ]);
+        }
+        Some(())
+    }
+
+    /// `filter_var($value, FILTER_VALIDATE_INT)` of a string, kept when non-negative.
+    fn range_bound(value: &[u8]) -> i64 {
+        let is_space = |b: &u8| matches!(*b, b' ' | b'\t' | b'\r' | 0x0b | b'\n');
+        let start = value
+            .iter()
+            .position(|b| !is_space(b))
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|b| !is_space(b))
+            .map_or(start, |at| at + 1);
+        let trimmed = &value[start..end];
+        let (negative, digits) = match trimmed.first() {
+            Some(b'-') => (true, &trimmed[1..]),
+            Some(b'+') => (false, &trimmed[1..]),
+            _ => (false, trimmed),
+        };
+        if digits == b"0" {
+            return 0;
+        }
+        if negative || digits.is_empty() || !(b'1'..=b'9').contains(&digits[0]) {
+            return -1;
+        }
+        let mut total = 0i64;
+        for &byte in digits {
+            if !byte.is_ascii_digit() {
+                return -1;
+            }
+            let Some(next) = total
+                .checked_mul(10)
+                .and_then(|v| v.checked_add(i64::from(byte - b'0')))
+            else {
+                return -1;
+            };
+            total = next;
+        }
+        total
+    }
+
+    /// `ReleaseSearchQuery::normalizeRequestBatch()`: `data` holds every media
+    /// unique ID, sort field, sort direction, min ID and max ID (column after
+    /// column, NUL-delimited); `ints` is empty. 5 words per request: `[sort
+    /// field index | known << 3 | ascending << 4, min ID (-1 null), max ID (-1
+    /// null), media ID length (-1 null), xxh64(media ID) (0 null)]`.
+    fn release_query(count: usize, data: &[u8], table: &[i64], words: &mut Vec<i64>) -> Option<()> {
+        if !table.is_empty() {
+            return None;
+        }
+        let fields = split_fields(data, 5 * count)?;
+        let (media, rest) = fields.split_at(count);
+        let (sort_fields, rest) = rest.split_at(count);
+        let (sort_dirs, rest) = rest.split_at(count);
+        let (min_ids, max_ids) = rest.split_at(count);
+        for index in 0..count {
+            let field = SORT_FIELDS
+                .iter()
+                .position(|known| *known == sort_fields[index]);
+            let asc = sort_dirs[index].eq_ignore_ascii_case(b"asc");
+            let flags =
+                field.unwrap_or(0) as i64 | i64::from(field.is_some()) << 3 | i64::from(asc) << 4;
+            let id = trim(media[index]);
+            let (len, digest) = if id.is_empty() || id == b"-1" {
+                (-1, 0)
+            } else {
+                (id.len() as i64, xxh64(id))
+            };
+            words.extend([
+                flags,
+                range_bound(min_ids[index]),
+                range_bound(max_ids[index]),
+                len,
+                digest,
+            ]);
+        }
+        Some(())
+    }
+
+    /// PHP `json_encode()` (default flags) of a string; false on invalid UTF-8.
+    fn json_string(out: &mut Vec<u8>, bytes: &[u8]) -> bool {
+        out.push(b'"');
+        if bytes.is_ascii() {
+            let mut start = 0;
+            for (at, &byte) in bytes.iter().enumerate() {
+                if byte >= 0x20 && !matches!(byte, b'"' | b'\\' | b'/') {
+                    continue;
+                }
+                out.extend_from_slice(&bytes[start..at]);
+                json_ascii(out, byte);
+                start = at + 1;
+            }
+            out.extend_from_slice(&bytes[start..]);
+        } else {
+            let Ok(text) = std::str::from_utf8(bytes) else {
+                return false;
+            };
+            for ch in text.chars() {
+                if ch.is_ascii() {
+                    json_ascii(out, ch as u8);
+                } else {
+                    let mut units = [0u16; 2];
+                    for &unit in ch.encode_utf16(&mut units).iter() {
+                        out.extend_from_slice(b"\\u");
+                        for shift in [12, 8, 4, 0] {
+                            out.push(HEX_LOWER[usize::from((unit >> shift) & 15)]);
+                        }
+                    }
+                }
+            }
+        }
+        out.push(b'"');
+        true
+    }
+
+    fn json_ascii(out: &mut Vec<u8>, byte: u8) {
+        match byte {
+            b'"' => out.extend_from_slice(b"\\\""),
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            b'/' => out.extend_from_slice(b"\\/"),
+            0x08 => out.extend_from_slice(b"\\b"),
+            0x0c => out.extend_from_slice(b"\\f"),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            0..0x20 => out.extend_from_slice(&[
+                b'\\',
+                b'u',
+                b'0',
+                b'0',
+                HEX_LOWER[usize::from(byte >> 4)],
+                HEX_LOWER[usize::from(byte & 15)],
+            ]),
+            _ => out.push(byte),
+        }
+    }
+
+    /// Appends a cursor payload (`SearchCursorCodec::encodePayloadPhp()`)
+    /// whose strings are already JSON-encoded.
+    fn cursor_payload(
+        out: &mut Vec<u8>,
+        sort: &[u8],
+        total: i64,
+        strings: [&[u8]; 3],
+        expires: i64,
+    ) {
+        out.clear();
+        out.extend_from_slice(b"{\"sort\":");
+        out.extend_from_slice(sort);
+        out.extend_from_slice(b",\"total\":");
+        push_int(out, total);
+        for (name, value) in [&b",\"query\":"[..], b",\"driver\":", b",\"generation\":"]
+            .into_iter()
+            .zip(strings)
+        {
+            out.extend_from_slice(name);
+            out.extend_from_slice(value);
+        }
+        out.extend_from_slice(b",\"expires\":");
+        push_int(out, expires);
+        out.push(b'}');
+    }
+
+    /// `SearchCursor::resumePlanBatch()`: `data` is `json_encode()` of every
+    /// cursor's sort values, then (NUL-delimited) the expected query hash,
+    /// driver and generation, then every cursor's query hash, every driver and
+    /// every generation; `ints` is `[now, renewed expiry, expires..,
+    /// totals..]`. 6 words per cursor: `[match state | sort width << 3, resume
+    /// offset, payload length, xxh64(payload), renewed payload length,
+    /// xxh64(renewed payload)]`, the payload being
+    /// `SearchCursorCodec::encodePayloadPhp()` of the cursor and the renewed
+    /// payload that of the cursor rebound to the expected strings and the
+    /// renewed expiry (length -1 and digest 0 when `json_encode()` fails).
+    /// Cursors with float, nested or non-list sort values (or one string sort
+    /// value with escapes or a cast PHP must decide) are PHP's.
+    fn cursor_plan(count: usize, data: &[u8], table: &[i64], words: &mut Vec<i64>) -> Option<()> {
+        if table.len() != 2 + 2 * count {
+            return None;
+        }
+        let fields = split_fields(data, 4 + 3 * count)?;
+        let (&[now, renewed], rest) = table.split_first_chunk::<2>()?;
+        let (expires, totals) = rest.split_at(count);
+        let expected = [fields[1], fields[2], fields[3]];
+        let (queries, rest) = fields[4..].split_at(count);
+        let (drivers, generations) = rest.split_at(count);
+        let mut encoded_expected: [Vec<u8>; 3] = Default::default();
+        let mut expected_ok = [true; 3];
+        for slot in 0..3 {
+            expected_ok[slot] = json_string(&mut encoded_expected[slot], expected[slot]);
+        }
+        let expected_valid = expected_ok == [true; 3];
+        let mut json = Json {
+            input: fields[0],
+            at: 0,
+        };
+        let mut values = Vec::with_capacity(8);
+        let mut payload = Vec::with_capacity(256);
+        let mut encoded: [Vec<u8>; 3] = Default::default();
+        json.eat(b'[')?;
+        for index in 0..count {
+            if index > 0 {
+                json.eat(b',')?;
+            }
+            let start = json.at;
+            values.clear();
+            let list = json.peek()? == b'[';
+            if list {
+                json.array(&mut values)?;
+            } else {
+                json.value(0)?;
+            }
+            let sort = &json.input[start..json.at];
+            let offset = match values.as_slice() {
+                _ if !list
+                    || values
+                        .iter()
+                        .any(|v| !matches!(v, Token::Int(_) | Token::Str(_) | Token::Esc(_))) =>
+                {
+                    None
+                }
+                [Token::Int(value)] => Some((*value).max(0)),
+                [Token::Str(raw)] => int_cast(raw).map(|v| v.max(0)),
+                [_] => None,
+                _ => Some(0),
+            };
+            let Some(offset) = offset else {
+                patch(words, 6);
+                continue;
+            };
+            let strings = [queries[index], drivers[index], generations[index]];
+            let mut valid = true;
+            let mut matches = [false; 3];
+            for slot in 0..3 {
+                matches[slot] = strings[slot] == expected[slot];
+                valid &= if matches[slot] {
+                    expected_ok[slot]
+                } else {
+                    encoded[slot].clear();
+                    json_string(&mut encoded[slot], strings[slot])
+                };
+            }
+            let state = if expires[index] < now {
+                1
+            } else if !matches[0] {
+                2
+            } else if !matches[1] {
+                3
+            } else if !matches[2] {
+                4
+            } else {
+                0
+            };
+            let pick = |slot: usize| -> &[u8] {
+                if matches[slot] {
+                    &encoded_expected[slot]
+                } else {
+                    &encoded[slot]
+                }
+            };
+            words.push(state | (values.len() as i64) << 3);
+            words.push(offset);
+            if valid {
+                cursor_payload(
+                    &mut payload,
+                    sort,
+                    totals[index],
+                    [pick(0), pick(1), pick(2)],
+                    expires[index],
+                );
+                words.extend([payload.len() as i64, xxh64(&payload)]);
+            } else {
+                words.extend([-1, 0]);
+            }
+            if expected_valid {
+                let [query, driver, generation] = &encoded_expected;
+                cursor_payload(
+                    &mut payload,
+                    sort,
+                    totals[index],
+                    [query, driver, generation],
+                    renewed,
+                );
+                words.extend([payload.len() as i64, xxh64(&payload)]);
+            } else {
+                words.extend([-1, 0]);
+            }
+        }
+        json.eat(b']')?;
+        (json.at == json.input.len()).then_some(())
+    }
+
+    macro_rules! entry {
+        ($(#[$doc:meta])* $name:ident, $width:expr, $body:ident) => {
+            $(#[$doc])*
+            ///
+            /// # Safety
+            /// Non-null pointers must refer to readable allocations of
+            /// `data_len` and `ints_len` bytes and a writable, aligned
+            /// allocation of `out_cap` i64 words. Null pointers require zero
+            /// length/capacity. Inputs and output must not overlap.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                count: usize,
+                flags: i64,
+                data: *const u8,
+                data_len: usize,
+                ints: *const u8,
+                ints_len: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> i64 {
+                unsafe {
+                    run(count, flags, data, data_len, ints, ints_len, out, out_cap, $width, |data, table, words| {
+                        $body(count, data, table, words)
+                    })
+                }
+            }
+        };
+    }
+
+    entry!(
+        /// `MediaSearchService::externalIdPlanBatch()` (see [`media_plan`]).
+        nntmux_w515_media_external_id_plan, 4, media_plan
+    );
+    entry!(
+        /// `SearchIndexOutboxDispatcher::routeOutboxBatch()` (see [`outbox_route`]).
+        nntmux_w515_outbox_route, 5, outbox_route
+    );
+    entry!(
+        /// `SearchService::escapeQueryBatch()` (see [`escape_queries`]).
+        nntmux_w515_search_escape_queries, 4, escape_queries
+    );
+    entry!(
+        /// `ReleaseSearchQuery::normalizeRequestBatch()` (see [`release_query`]).
+        nntmux_w515_release_query_normalize, 5, release_query
+    );
+    entry!(
+        /// `SearchCursor::resumePlanBatch()` (see [`cursor_plan`]).
+        nntmux_w515_search_cursor_resume_plan, 6, cursor_plan
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        type Entry = unsafe extern "C" fn(
+            usize,
+            i64,
+            *const u8,
+            usize,
+            *const u8,
+            usize,
+            *mut i64,
+            usize,
+        ) -> i64;
+
+        fn pack(values: &[i64]) -> Vec<u8> {
+            values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect()
+        }
+
+        fn call(entry: Entry, count: usize, data: &[u8], table: &[i64]) -> Result<Vec<i64>, i64> {
+            let table = pack(table);
+            let mut out = vec![0i64; 4096];
+            let written = unsafe {
+                entry(
+                    count,
+                    0,
+                    data.as_ptr(),
+                    data.len(),
+                    table.as_ptr(),
+                    table.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            if written < 0 {
+                return Err(written);
+            }
+            out.truncate(written as usize);
+            Ok(out)
+        }
+
+        fn text(words: &[i64], bytes: &[u8]) -> bool {
+            words == [bytes.len() as i64, xxh64(bytes)]
+        }
+
+        #[test]
+        fn w515_xxh64_matches_reference_vectors() {
+            assert_eq!(xxh64(b"") as u64, 0xEF46_DB37_51D8_E999);
+            assert_eq!(xxh64(b"abc") as u64, 0x44BC_2CF5_AD77_0999);
+            assert_eq!(
+                xxh64(b"Nobody inspects the spammish repetition") as u64,
+                0xFBCE_A83C_8A37_8BF1
+            );
+        }
+
+        #[test]
+        fn w515_int_cast_follows_php_or_defers() {
+            assert_eq!(int_cast(b""), Some(0));
+            assert_eq!(int_cast(b"0042"), Some(42));
+            assert_eq!(int_cast(b"-7x"), Some(-7));
+            assert_eq!(int_cast(b"+9"), Some(9));
+            assert_eq!(int_cast(b"tt0111161"), Some(0));
+            assert_eq!(int_cast(b"0x1A"), Some(0));
+            assert_eq!(int_cast(b" 12"), None);
+            assert_eq!(int_cast(b"1.5"), None);
+            assert_eq!(int_cast(b"1e3"), None);
+            assert_eq!(int_cast(b".5"), None);
+            assert_eq!(int_cast(b"-"), None);
+            assert_eq!(int_cast(b"1234567890123456789"), None);
+        }
+
+        #[test]
+        fn w515_media_plan_collects_ids_and_builds_query_keys() {
+            let entry: Entry = nntmux_w515_media_external_id_plan;
+            let key = |flags: i64, bytes: &[u8]| flags | (bytes.len() as i64) << 20;
+            // Row mode, movie rows: [int 111, "0", null], not an array, ["", "tt9", true], [0, null, false].
+            let words = call(
+                entry,
+                4,
+                b"0tt9",
+                &[
+                    1, 0, 1, 0, 111, 1, 1, 2, 0, 0, 1, 1, 0, 1, 3, 3, 0, 1, 0, 0, 2, 0, 2, 0,
+                ],
+            )
+            .unwrap();
+            let expected = vec![
+                0,
+                key(1 | 1 << 8, b"imdbid=111"),
+                111,
+                xxh64(b"imdbid=111"),
+                xxh64(b"imdbid:111"),
+                1 << 16,
+                0,
+                0,
+                0,
+                key(2 | 4 | 2 << 8, b"tmdbid=tt9&traktid=1"),
+                0,
+                xxh64(b"tmdbid=tt9&traktid=1"),
+                xxh64(b"tmdbid:0\ntraktid:1"),
+                1 << 12,
+                0,
+                xxh64(b""),
+                xxh64(b""),
+            ];
+            assert_eq!(words, expected);
+            // Column mode gives the same words (row 1 is not an array).
+            let json = br#"[[111,"",0],["0","tt9",null],[null,true,false]]"#;
+            assert_eq!(call(entry, 4, json, &[1, 1, 1, 1]).unwrap(), expected);
+            // imdbid keeps its string form in the filter terms.
+            let words = call(entry, 1, br#"[["0042x"],[7],["12abc"]]"#, &[1, 1, 0]).unwrap();
+            assert_eq!(words[4], xxh64(b"imdbid:0042x\ntmdbid:7\ntraktid:12"));
+            // TV route, URL encoding and JSON escapes; a leading-space ID is PHP's to cast.
+            let json = br#"[["a b\/\u00e9"," 7","\ud83d\ude00"],[null,null,null],[null,null,null],[null,null,1.5]]"#;
+            let words = call(entry, 3, json, &[0, 1, 0]).unwrap();
+            assert_eq!(words[0], 2);
+            assert_eq!(
+                words[1..5],
+                [
+                    key(1 | 1 << 8, b"tvdb=a+b%2F%C3%A9"),
+                    0,
+                    xxh64(b"tvdb=a+b%2F%C3%A9"),
+                    xxh64(b"tvdb:0")
+                ]
+            );
+            assert_eq!(words[5], PATCH);
+            assert_eq!(words[9], PATCH);
+            let words = call(entry, 1, b"", &[0, 0, 1, 2, 0, 2, 0, 2, 0, 2, 0]).unwrap();
+            assert_eq!(words, vec![0, 2 << 12, 0, xxh64(b""), xxh64(b"")]);
+            // Trailing bytes or ints, short columns and bad positions decline.
+            assert_eq!(
+                call(entry, 1, b"x", &[1, 0, 1, 2, 0, 2, 0, 2, 0]),
+                Err(DECLINE)
+            );
+            assert_eq!(call(entry, 1, b"", &[1, 0, 1, 0, 0]), Err(DECLINE));
+            assert_eq!(call(entry, 1, b"", &[2, 0]), Err(DECLINE));
+            assert_eq!(
+                call(entry, 2, br#"[[1],[2],[3]]"#, &[1, 1, 0]),
+                Err(DECLINE)
+            );
+            assert_eq!(
+                call(entry, 2, br#"[[1],[2],[3]]"#, &[1, 1, 1, 5]),
+                Err(DECLINE)
+            );
+            assert_eq!(
+                call(entry, 1, br#"[[1],[2],[3]] "#, &[1, 1, 0]),
+                Err(DECLINE)
+            );
+        }
+
+        #[test]
+        fn w515_outbox_route_normalizes_types_actions_and_keys() {
+            let entry: Entry = nntmux_w515_outbox_route;
+            let data = b"App\\Models\\Release\0Music-Info\0secondary\0Steam Apps/\0widget\0R\xc3\xa9lease\0Created\0SAVE\0removed\0bogus action\0update\0delete";
+            let words = call(entry, 6, data, &[5, 6, 7, 8, -9, 10]).unwrap();
+            assert_eq!(words[0], 1);
+            let row = |index: usize| &words[1 + index * 5..6 + index * 5];
+            assert_eq!(row(0)[0], 0);
+            assert!(text(&row(0)[1..3], b"release:5"));
+            assert!(text(&row(0)[3..5], b"insert"));
+            assert_eq!(row(1)[0], 1 | 5 << 3 | 1 << 6);
+            assert!(text(&row(1)[1..3], b"secondary:music:6"));
+            assert_eq!(row(2)[0], 3 | 4 << 3);
+            assert!(text(&row(2)[1..3], b"secondary:7"));
+            assert_eq!(row(3)[0], 4 | 5 << 3 | 5 << 6);
+            assert!(text(&row(3)[1..3], b"secondary:steam:8"));
+            assert!(text(&row(3)[3..5], b"bogus_action"));
+            assert_eq!(row(4)[0], 2 | 6 << 3);
+            assert!(text(&row(4)[1..3], b"widget:-9"));
+            assert_eq!(row(5)[0], PATCH);
+            assert_eq!(call(entry, 1, b"a", &[1]), Err(DECLINE));
+            assert_eq!(call(entry, 1, b"a\0b", &[]), Err(DECLINE));
+        }
+
+        #[test]
+        fn w515_escapes_follow_driver_rules() {
+            let mut out = Vec::new();
+            for (input, expected) in [
+                (&b"*"[..], &b""[..]),
+                (b"0", b""),
+                (b"a--b", b"a\\\\-\\-b"),
+                (b"a---b", b"a\\\\-\\-\\-b"),
+                (b"x(y)@z!", b"x\\(y\\)\\@z\\"),
+                (b" \\path/to ", b"\\\\path\\/to"),
+                (b"end-", b"end\\"),
+                (b"\0 trim \x0b", b"trim"),
+            ] {
+                manticore_escape(input, &mut out);
+                assert_eq!(out, expected, "{:?}", String::from_utf8_lossy(input));
+            }
+            for (input, expected) in [
+                (&b"..Movie.2024..1080p.."[..], &b"Movie 2024 1080p"[..]),
+                (b"\x0ca\t\n b\x0c", b" a b "),
+                (b"a\0.b", b"a\0 b"),
+                (b"*", b""),
+            ] {
+                elastic_escape(input, &mut out);
+                assert_eq!(out, expected, "{:?}", String::from_utf8_lossy(input));
+            }
+            let words = call(nntmux_w515_search_escape_queries, 2, b"a.b\0--", &[]).unwrap();
+            assert!(text(&words[1..3], b"a.b"));
+            assert!(text(&words[3..5], b"a b"));
+            assert!(text(&words[5..7], b"\\\\-\\"));
+            assert_eq!(
+                call(nntmux_w515_search_escape_queries, 1, b"a", &[1]),
+                Err(DECLINE)
+            );
+        }
+
+        #[test]
+        fn w515_release_query_normalizes_requests() {
+            assert_eq!(range_bound(b"0"), 0);
+            assert_eq!(range_bound(b"-0"), 0);
+            assert_eq!(range_bound(b"+12"), 12);
+            assert_eq!(range_bound(b" \t42\n"), 42);
+            assert_eq!(range_bound(b"042"), -1);
+            assert_eq!(range_bound(b"-4"), -1);
+            assert_eq!(range_bound(b"9223372036854775807"), i64::MAX);
+            assert_eq!(range_bound(b"9223372036854775808"), -1);
+            assert_eq!(range_bound(b"1 2"), -1);
+            assert_eq!(range_bound(b""), -1);
+            let data = b" abc \0-1\0size\0bogus\0ASC\0desc\x01\012\0x\0\x0b\0 7 ";
+            let words = call(nntmux_w515_release_query_normalize, 2, data, &[]).unwrap();
+            assert_eq!(words[1..4], [2 | 1 << 3 | 1 << 4, 12, -1]);
+            assert!(text(&words[4..6], b"abc"));
+            assert_eq!(words[6..11], [0, -1, 7, -1, 0]);
+            assert_eq!(
+                call(nntmux_w515_release_query_normalize, 1, b"a\0b", &[]),
+                Err(DECLINE)
+            );
+        }
+
+        #[test]
+        fn w515_cursor_plan_classifies_and_encodes_payloads() {
+            let entry: Entry = nntmux_w515_search_cursor_resume_plan;
+            // valid [17, "a/\u{e9}"], driver mismatch ["5"], expired with invalid UTF-8, float sort, object sort.
+            let data = b"[[17,\"a\\/\\u00e9\"],[\"5\"],[],[1.5],{\"a\":1}]\0qh\0drv\0g1\0qh\0qh\0qh\0qh\0qh\0drv\0es\0drv\xff\0drv\0drv\0g1\0g1\0g1\0g1\0g1";
+            let table = [100, 1100, 200, 100, 50, 300, 300, 9, 3, 0, 1, 2];
+            let words = call(entry, 5, data, &table).unwrap();
+            assert_eq!(words[0], 2);
+            let payload = br#"{"sort":[17,"a\/\u00e9"],"total":9,"query":"qh","driver":"drv","generation":"g1","expires":200}"#;
+            let renewed = br#"{"sort":[17,"a\/\u00e9"],"total":9,"query":"qh","driver":"drv","generation":"g1","expires":1100}"#;
+            assert_eq!(
+                words[1..7],
+                [
+                    2 << 3,
+                    0,
+                    payload.len() as i64,
+                    xxh64(payload),
+                    renewed.len() as i64,
+                    xxh64(renewed)
+                ]
+            );
+            let driver = br#"{"sort":["5"],"total":3,"query":"qh","driver":"es","generation":"g1","expires":100}"#;
+            assert_eq!(
+                words[7..11],
+                [3 | 1 << 3, 5, driver.len() as i64, xxh64(driver)]
+            );
+            let empty = br#"{"sort":[],"total":0,"query":"qh","driver":"drv","generation":"g1","expires":1100}"#;
+            assert_eq!(
+                words[13..19],
+                [1, 0, -1, 0, empty.len() as i64, xxh64(empty)]
+            );
+            assert_eq!(words[19], PATCH);
+            assert_eq!(words[25], PATCH);
+            // Invalid expected strings fail every renewed payload.
+            let words = call(entry, 1, b"[[1]]\0q\0d\xff\0g\0q\0d\0g", &[0, 5, 9, 1]).unwrap();
+            let own =
+                br#"{"sort":[1],"total":1,"query":"q","driver":"d","generation":"g","expires":9}"#;
+            assert_eq!(
+                words[1..7],
+                [3 | 1 << 3, 1, own.len() as i64, xxh64(own), -1, 0]
+            );
+            // Ragged tables, missing strings and trailing JSON decline.
+            assert_eq!(
+                call(entry, 1, b"[[]]\0a\0b\0c\0a\0b\0c", &[0, 0, 0]),
+                Err(DECLINE)
+            );
+            assert_eq!(
+                call(entry, 1, b"[[]]\0a\0b\0c\0a\0b", &[0, 0, 0, 0]),
+                Err(DECLINE)
+            );
+            assert_eq!(
+                call(entry, 1, b"[[]] \0a\0b\0c\0a\0b\0c", &[0, 0, 0, 0]),
+                Err(DECLINE)
+            );
+            assert_eq!(
+                call(entry, 1, b"[[],[]]\0a\0b\0c\0a\0b\0c", &[0, 0, 0, 0]),
+                Err(DECLINE)
+            );
+            let mut emoji = Vec::new();
+            assert!(json_string(&mut emoji, "\u{1f600}\u{1}\u{7f}".as_bytes()));
+            assert_eq!(emoji, b"\"\\ud83d\\ude00\\u0001\x7f\"");
+            let mut decoded = Vec::new();
+            assert!(unescape(br#"\ud83d\ude00\/\"\u0000x"#, &mut decoded).is_some());
+            assert_eq!(decoded, "\u{1f600}/\"\0x".as_bytes());
+            assert!(unescape(br#"\ud83dx"#, &mut decoded).is_none());
+            assert!(unescape(br#"\q"#, &mut decoded).is_none());
+        }
+
+        #[test]
+        fn w515_abi_guards_pointers_capacity_and_overlap() {
+            let entries: [(Entry, &[u8], Vec<i64>); 5] = [
+                (
+                    nntmux_w515_media_external_id_plan,
+                    b"",
+                    vec![1, 0, 1, 2, 0, 2, 0, 2, 0],
+                ),
+                (nntmux_w515_outbox_route, b"release\0insert", vec![1]),
+                (nntmux_w515_search_escape_queries, b"abc", vec![]),
+                (
+                    nntmux_w515_release_query_normalize,
+                    b"a\0b\0c\0d\0e",
+                    vec![],
+                ),
+                (
+                    nntmux_w515_search_cursor_resume_plan,
+                    b"[[1]]\0q\0d\0g\0q\0d\0g",
+                    vec![0, 0, 5, 1],
+                ),
+            ];
+            for (entry, data, table) in entries {
+                let full = call(entry, 1, data, &table).unwrap();
+                let bytes = pack(&table);
+                let mut small = vec![7i64; 1];
+                let invoke = |out: *mut i64, cap: usize, flags: i64, data_ptr: *const u8| unsafe {
+                    entry(
+                        1,
+                        flags,
+                        data_ptr,
+                        data.len(),
+                        bytes.as_ptr(),
+                        bytes.len(),
+                        out,
+                        cap,
+                    )
+                };
+                let needed = invoke(small.as_mut_ptr(), 1, 0, data.as_ptr());
+                assert_eq!(needed, -(full.len() as i64));
+                assert!(needed < -1);
+                assert_eq!(small, vec![7]);
+                assert_eq!(invoke(std::ptr::null_mut(), 0, 0, data.as_ptr()), needed);
+                assert_eq!(invoke(std::ptr::null_mut(), 4, 0, data.as_ptr()), DECLINE);
+                let mut out = vec![0i64; 8];
+                assert_eq!(invoke(out.as_mut_ptr(), 8, 1, data.as_ptr()), DECLINE);
+                if !data.is_empty() {
+                    assert_eq!(invoke(out.as_mut_ptr(), 8, 0, std::ptr::null()), DECLINE);
+                }
+                let misaligned = unsafe { (out.as_mut_ptr() as *mut u8).add(1) as *mut i64 };
+                assert_eq!(invoke(misaligned, 4, 0, data.as_ptr()), DECLINE);
+                let mut shared = vec![0i64; 16];
+                let alias = shared.as_ptr() as *const u8;
+                let overlap = unsafe {
+                    entry(
+                        1,
+                        0,
+                        alias,
+                        1,
+                        bytes.as_ptr(),
+                        bytes.len(),
+                        shared.as_mut_ptr(),
+                        16,
+                    )
+                };
+                assert_eq!(overlap, DECLINE);
+                let ragged = unsafe {
+                    entry(
+                        1,
+                        0,
+                        data.as_ptr(),
+                        data.len(),
+                        [0u8; 3].as_ptr(),
+                        3,
+                        out.as_mut_ptr(),
+                        8,
+                    )
+                };
+                assert_eq!(ragged, DECLINE);
+            }
+        }
+
+        #[test]
+        fn w515_random_inputs_never_panic() {
+            let mut seed = 0x515_u64;
+            let mut next = move || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed
+            };
+            let entries: [Entry; 5] = [
+                nntmux_w515_media_external_id_plan,
+                nntmux_w515_outbox_route,
+                nntmux_w515_search_escape_queries,
+                nntmux_w515_release_query_normalize,
+                nntmux_w515_search_cursor_resume_plan,
+            ];
+            for round in 0..5_000 {
+                let data: Vec<u8> = (0..next() % 24)
+                    .map(|_| [0u8, b'-', b'.', b' ', b'a', 0xc3, 0xa9, 0xff][(next() % 8) as usize])
+                    .collect();
+                let table: Vec<i64> = (0..next() % 24)
+                    .map(|_| [0, 1, 2, 3, -1, i64::MAX, i64::MIN, 4][(next() % 8) as usize])
+                    .collect();
+                let _ = call(entries[round % 5], (next() % 4) as usize, &data, &table);
+            }
+        }
+    }
+}

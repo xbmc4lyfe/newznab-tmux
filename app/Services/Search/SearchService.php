@@ -16,9 +16,11 @@ use App\Services\Search\DTO\ReleaseSearchQuery;
 use App\Services\Search\DTO\SearchPage;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Manager;
+use Throwable;
 
 /**
  * Search Service Manager - handles driver resolution for search functionality.
@@ -248,7 +250,7 @@ class SearchService extends Manager implements SearchServiceInterface
                 }
                 $minBytes = -$written;
             }
-        } catch (\Throwable) {
+        } catch (Throwable) {
             return null;
         }
 
@@ -328,7 +330,7 @@ class SearchService extends Manager implements SearchServiceInterface
     /**
      * @param  list<int>  $values
      */
-    public static function ffiInt64Array(FFI $ffi, array $values): ?FFI\CData
+    public static function ffiInt64Array(FFI $ffi, array $values): ?CData
     {
         $count = \count($values);
         if ($count === 0) {
@@ -345,7 +347,7 @@ class SearchService extends Manager implements SearchServiceInterface
     /**
      * @param  list<int>  $values
      */
-    public static function ffiInt32Array(FFI $ffi, array $values): ?FFI\CData
+    public static function ffiInt32Array(FFI $ffi, array $values): ?CData
     {
         $count = \count($values);
         if ($count === 0) {
@@ -688,7 +690,7 @@ class SearchService extends Manager implements SearchServiceInterface
                     throw new \LogicException('The search driver changed to one without bulk release updates.');
                 }
                 $failed = $driver->updateReleases($releaseIds);
-            } catch (\Throwable $e) {
+            } catch (Throwable $e) {
                 Log::error('Search: deferred release index flush failed: '.$e->getMessage(), ['releases' => count($releaseIds)]);
                 $this->handDeferredReleasesToRepair($releaseIds);
 
@@ -808,7 +810,7 @@ class SearchService extends Manager implements SearchServiceInterface
                         ->orWhere('next_attempt_at', '<=', $now);
                 })
                 ->update($lease) > 0;
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             Log::debug('Search: unable to record a deferred release index update', [
                 'release_id' => $releaseId,
                 'error' => $e->getMessage(),
@@ -839,7 +841,7 @@ class SearchService extends Manager implements SearchServiceInterface
                 ->where('last_error', $this->deferralToken)
                 ->where('attempts', 0)
                 ->delete();
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             Log::debug('Search: unable to clear deferred release index markers', [
                 'releases' => count($releaseIds),
                 'error' => $e->getMessage(),
@@ -861,7 +863,7 @@ class SearchService extends Manager implements SearchServiceInterface
                 ->where('operation', self::DEFERRED_RELEASE_OPERATION)
                 ->where('last_error', $this->deferralToken)
                 ->update(['next_attempt_at' => now(), 'updated_at' => now()]);
-        } catch (\Throwable $e) {
+        } catch (Throwable $e) {
             Log::debug('Search: unable to hand deferred releases to repair', [
                 'releases' => count($releaseIds),
                 'error' => $e->getMessage(),
@@ -1296,5 +1298,137 @@ class SearchService extends Manager implements SearchServiceInterface
     public function searchAnimeTitle(string $query, int $limit = 100): array
     {
         return $this->driver()->searchAnimeTitle($query, $limit);
+    }
+
+    public const string W51_FFI_CDEF = 'int64_t nntmux_w515_search_escape_queries(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W51.5 parity test's QUALIFICATION). */
+    private const bool W51_RUST_FFI_DEFAULT = true;
+
+    private static ?bool $w51RustFfi = null;
+
+    private static FFI|false|null $w51Ffi = null;
+
+    private static ?CData $w51Out = null;
+
+    private static int $w51OutCap = 0;
+
+    public static function usesW51RustFfi(): bool
+    {
+        return self::$w51RustFfi ?? self::W51_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with escapeQueryBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW51RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$w51RustFfi;
+        self::$w51RustFfi = $enabled;
+
+        try {
+            return $callback();
+        } finally {
+            self::$w51RustFfi = $previous;
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 51.5 Rust helper, or null to fall back to PHP. The helper
+     * leads with the number of rows PHP must compute, returned in $patches.
+     *
+     * @return list<int>|null
+     */
+    private static function w51Words(int $count, string $data, string $ints, int $words, ?int &$patches = null): ?array
+    {
+        if (self::$w51Ffi === null) {
+            $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+            self::$w51Ffi = RustPipelineLibrary::resolveDomain('search_w51', self::W51_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+            self::$w51Out = null;
+            self::$w51OutCap = 0;
+        }
+        $ffi = self::$w51Ffi;
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+
+        try {
+            if (self::$w51Out === null || $words >= self::$w51OutCap) {
+                $cap = max(1024, $words + 1);
+                self::$w51Out = $ffi->new('int64_t['.$cap.']');
+                self::$w51OutCap = $cap;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w515_search_escape_queries($count, 0, $data, \strlen($data), $ints, \strlen($ints), self::$w51Out, self::$w51OutCap);
+            if ($written !== $words + 1) {
+                return null;
+            }
+            $patches = self::$w51Out[0];
+            /** @var array<int, int>|false $values */
+            $values = unpack('P*', FFI::string(self::$w51Out, $written * 8), 8);
+
+            return \is_array($values) ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** PHP `hash('xxh64')` of $value read as a signed big-endian word, as the Rust helper reports it. */
+    private static function w51Digest(string $value): int
+    {
+        /** @var array{1: int} $unpacked */
+        $unpacked = unpack('J', hash('xxh64', $value, true));
+
+        return $unpacked[1];
+    }
+
+    /**
+     * Batch escape of user queries for both drivers: ManticoreSearchDriver::escapeStringPhp() and
+     * ElasticSearchDriver::escapeStringPhp(). Four words per query: `[Manticore length,
+     * xxh64(Manticore escape), Elasticsearch length, xxh64(Elasticsearch escape)]`.
+     *
+     * @param  list<string>  $queries
+     * @return list<int>
+     */
+    public static function escapeQueryBatch(array $queries): array
+    {
+        return self::usesW51RustFfi() ? self::escapeQueryBatchNative($queries) : self::escapeQueryBatchPhp($queries);
+    }
+
+    /**
+     * @param  list<string>  $queries
+     * @return list<int>
+     */
+    public static function escapeQueryBatchPhp(array $queries): array
+    {
+        $out = [];
+        foreach ($queries as $query) {
+            $manticore = ManticoreSearchDriver::escapeStringPhp($query);
+            $elastic = ElasticSearchDriver::escapeStringPhp($query);
+            array_push($out, \strlen($manticore), self::w51Digest($manticore), \strlen($elastic), self::w51Digest($elastic));
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or a query holds a NUL byte.
+     *
+     * @param  list<string>  $queries
+     * @return list<int>
+     */
+    public static function escapeQueryBatchNative(array $queries): array
+    {
+        $count = \count($queries);
+        if ($count === 0 || ! array_is_list($queries)) {
+            return self::escapeQueryBatchPhp($queries);
+        }
+
+        return self::w51Words($count, implode("\0", $queries), '', 4 * $count) ?? self::escapeQueryBatchPhp($queries);
     }
 }
