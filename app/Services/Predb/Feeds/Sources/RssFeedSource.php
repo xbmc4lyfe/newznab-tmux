@@ -29,6 +29,18 @@ final class RssFeedSource extends BoundedHttpFeedSource
         ssize_t nntmux_predb_xml_rss(const char *xml, size_t len, uint32_t flags, size_t page_size, char *out_buf, size_t out_cap);
         C;
 
+    /**
+     * Wave 45.2 production default for summarizeItemTitleBatch() is PHP: the paired benchmark in
+     * tests/Unit/RustPredbFeedsNzedbPredatabaseRssSceneArchiveSasW45ParityTest.php measures 0.94-0.96x mean and
+     * 0.84-1.02x p99 for common default-flag pages, though spaced, size-stripped uncommon batches reach 3.94-4.23x
+     * mean and 2.94-5.05x p99.
+     */
+    public const bool W452_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $w452RustFfiOverride = null;
+
+    private static FFI|false|null $w452RustFfiHandle = null;
+
     private static FFI|false|null $native = null;
 
     public function __construct(
@@ -224,5 +236,111 @@ final class RssFeedSource extends BoundedHttpFeedSource
         } catch (Throwable) {
             return null;
         }
+    }
+
+    /** Force the Wave 45.2 helper onto Rust (true) or PHP (false); null restores W452_RUST_FFI_DEFAULT. */
+    public static function useW452RustFfi(?bool $enable = true): void
+    {
+        self::$w452RustFfiOverride = $enable;
+    }
+
+    public static function usesW452RustFfi(): bool
+    {
+        return self::$w452RustFfiOverride ?? self::W452_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW452RustFfi(): void
+    {
+        self::$w452RustFfiOverride = null;
+        self::$w452RustFfiHandle = null;
+    }
+
+    /**
+     * Summarize item titles as parseXml() normalizes them: non-strings are invalid; trim(), then the display-size
+     * suffix strip and dotted() when enabled (stripped and eztv count the titles each step changed); empty and
+     * spaced titles are skipped, and accepted titles that differ from the input count as changed.
+     *
+     * @param  array<array-key, mixed>  $titles
+     * @return array{total: int, invalid: int, stripped: int, eztv: int, empty: int, spaced: int, accepted: int, changed: int}
+     */
+    public static function summarizeItemTitleBatch(array $titles, bool $spacedTitles = false, bool $stripDisplaySizeSuffix = false): array
+    {
+        return (self::usesW452RustFfi() ? self::summarizeItemTitleBatchNative($titles, $spacedTitles, $stripDisplaySizeSuffix) : null)
+            ?? self::summarizeItemTitleBatchPhp($titles, $spacedTitles, $stripDisplaySizeSuffix);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $titles
+     * @return array{total: int, invalid: int, stripped: int, eztv: int, empty: int, spaced: int, accepted: int, changed: int}
+     */
+    public static function summarizeItemTitleBatchPhp(array $titles, bool $spacedTitles = false, bool $stripDisplaySizeSuffix = false): array
+    {
+        $summary = ['total' => \count($titles), 'invalid' => 0, 'stripped' => 0, 'eztv' => 0, 'empty' => 0, 'spaced' => 0, 'accepted' => 0, 'changed' => 0];
+        foreach ($titles as $text) {
+            if (! \is_string($text)) {
+                $summary['invalid']++;
+
+                continue;
+            }
+            $title = trim($text);
+            if ($stripDisplaySizeSuffix) {
+                $stripped = preg_replace('/ \x{2013} [0-9]+(?:\.[0-9]+)? (?:MB|GB)$/u', '', $title) ?? $title;
+                if ($stripped !== $title) {
+                    $summary['stripped']++;
+                    $title = $stripped;
+                }
+            }
+            if ($spacedTitles) {
+                // dotted(), split to count the dropped EZTV tag.
+                $base = trim($title);
+                $untagged = (string) preg_replace('/\s+EZTV$/i', '', $base);
+                if ($untagged !== $base) {
+                    $summary['eztv']++;
+                }
+                $title = (string) preg_replace('/\s+/', '.', $untagged);
+            }
+            if ($title === '') {
+                $summary['empty']++;
+            } elseif (str_contains($title, ' ')) {
+                $summary['spaced']++;
+            } else {
+                $summary['accepted']++;
+                if ($title !== $text) {
+                    $summary['changed']++;
+                }
+            }
+        }
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $titles
+     * @return array{total: int, invalid: int, stripped: int, eztv: int, empty: int, spaced: int, accepted: int, changed: int}|null
+     */
+    public static function summarizeItemTitleBatchNative(array $titles, bool $spacedTitles = false, bool $stripDisplaySizeSuffix = false): ?array
+    {
+        $packed = PredatabaseSource::packW452Items($titles);
+        $flags = ($spacedTitles ? 1 : 0) | ($stripDisplaySizeSuffix ? 2 : 0);
+        $values = $packed === null ? null : PredatabaseSource::callW452Native(self::w452RustFfi(), 2 | $packed[2], $flags, $packed[0], $packed[1], 8);
+        if ($values === null) {
+            return null;
+        }
+        [$total, $invalid, $stripped, $eztv, $empty, $spaced, $accepted, $changed] = $values;
+        if ($total !== \count($titles) || min($values) < 0 || $invalid + $empty + $spaced + $accepted !== $total
+            || $stripped + $invalid > $total || $eztv + $invalid > $total || $changed > $accepted
+            || (! $stripDisplaySizeSuffix && $stripped > 0) || (! $spacedTitles && $eztv > 0) || ($spacedTitles && $spaced > 0)) {
+            return null;
+        }
+
+        return ['total' => $total, 'invalid' => $invalid, 'stripped' => $stripped, 'eztv' => $eztv, 'empty' => $empty, 'spaced' => $spaced,
+            'accepted' => $accepted, 'changed' => $changed];
+    }
+
+    private static function w452RustFfi(): ?FFI
+    {
+        self::$w452RustFfiHandle ??= RustPipelineLibrary::resolveDomain(PredatabaseSource::W452_FFI_DOMAIN, PredatabaseSource::W452_FFI_CDEF) ?? false;
+
+        return self::$w452RustFfiHandle === false ? null : self::$w452RustFfiHandle;
     }
 }

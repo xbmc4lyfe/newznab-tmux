@@ -28,6 +28,18 @@ final class SceneArchiveSqlSource implements CompleteCatalogueSource
         ssize_t nntmux_predb_scene_sql_parse_insert(const char *input, size_t len, uint32_t mode, char *output, size_t cap);
         C;
 
+    /**
+     * Wave 45.2 production default for summarizeEligibilityBatch() is PHP: the paired benchmark in
+     * tests/Unit/RustPredbFeedsNzedbPredatabaseRssSceneArchiveSasW45ParityTest.php measures 1.72-1.88x mean but
+     * 1.37-2.38x p99 on common pages and 1.50-2.02x p99 on uncommon dumps, so p99 does not clear 1.5x in
+     * every round.
+     */
+    public const bool W452_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $w452RustFfiOverride = null;
+
+    private static FFI|false|null $w452RustFfiHandle = null;
+
     private static FFI|false|null $native = null;
 
     /** @var resource|null */
@@ -153,7 +165,7 @@ final class SceneArchiveSqlSource implements CompleteCatalogueSource
                         $this->pending = $native === '' ? [] : explode("\0", substr($native, 0, -1));
                     } else {
                         foreach ($this->rows($statement) as $row) {
-                            if ($this->eligibilityReason($row) === null) {
+                            if (self::eligibilityReason($row) === null) {
                                 $this->pending[] = (string) $row[2];
                             }
                         }
@@ -279,7 +291,7 @@ final class SceneArchiveSqlSource implements CompleteCatalogueSource
                                     throw new RuntimeException('SCENE_ARCHIVE_SQL duplicate scratch exceeds its bounds or could not be written.');
                                 }
                             }
-                            $reason = $this->eligibilityReason($row);
+                            $reason = self::eligibilityReason($row);
                             if ($reason !== null) {
                                 $rejected[$reason] = ($rejected[$reason] ?? 0) + 1;
                             } else {
@@ -544,8 +556,8 @@ final class SceneArchiveSqlSource implements CompleteCatalogueSource
         }
     }
 
-    /** @param list<string|null> $row */
-    private function eligibilityReason(array $row): ?string
+    /** @param array<int, string|null> $row */
+    private static function eligibilityReason(array $row): ?string
     {
         $title = (string) $row[2];
         if (preg_match("/^[A-Za-z0-9_.()&'+,-]+-[A-Za-z0-9_]+$/D", $title) !== 1) {
@@ -637,5 +649,140 @@ final class SceneArchiveSqlSource implements CompleteCatalogueSource
         $this->lastPage = [];
         $this->activeFrame = null;
         $this->scratchBytes = $this->frameBytes = $this->cursorPage = $this->pendingOffset = 0;
+    }
+
+    /** Force the Wave 45.2 helper onto Rust (true) or PHP (false); null restores W452_RUST_FFI_DEFAULT. */
+    public static function useW452RustFfi(?bool $enable = true): void
+    {
+        self::$w452RustFfiOverride = $enable;
+    }
+
+    public static function usesW452RustFfi(): bool
+    {
+        return self::$w452RustFfiOverride ?? self::W452_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW452RustFfi(): void
+    {
+        self::$w452RustFfiOverride = null;
+        self::$w452RustFfiHandle = null;
+    }
+
+    /**
+     * Summarize parsed INSERT rows as eligibilityReason() admits them, reading the title (index 2) and group
+     * (index 3): non-arrays and rows whose title or group is neither a string nor null are invalid; eligible
+     * titles also count their distinct strtolower() identities.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array{total: int, invalid: int, noncanonical_title: int, group_conflict: int, eligible: int, distinct: int}
+     */
+    public static function summarizeEligibilityBatch(array $rows): array
+    {
+        return (self::usesW452RustFfi() ? self::summarizeEligibilityBatchNative($rows) : null)
+            ?? self::summarizeEligibilityBatchPhp($rows);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rows
+     * @return array{total: int, invalid: int, noncanonical_title: int, group_conflict: int, eligible: int, distinct: int}
+     */
+    public static function summarizeEligibilityBatchPhp(array $rows): array
+    {
+        $summary = ['total' => \count($rows), 'invalid' => 0, 'noncanonical_title' => 0, 'group_conflict' => 0, 'eligible' => 0, 'distinct' => 0];
+        $titles = [];
+        foreach ($rows as $row) {
+            $title = \is_array($row) ? ($row[2] ?? null) : null;
+            $group = \is_array($row) ? ($row[3] ?? null) : null;
+            if (! \is_array($row) || ($title !== null && ! \is_string($title)) || ($group !== null && ! \is_string($group))) {
+                $summary['invalid']++;
+
+                continue;
+            }
+            $reason = self::eligibilityReason([2 => $title, 3 => $group]);
+            if ($reason !== null) {
+                $summary[$reason]++;
+
+                continue;
+            }
+            $summary['eligible']++;
+            $titles[strtolower((string) $title)] = true;
+        }
+        $summary['distinct'] = \count($titles);
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rows
+     * @return array{total: int, invalid: int, noncanonical_title: int, group_conflict: int, eligible: int, distinct: int}|null
+     */
+    public static function summarizeEligibilityBatchNative(array $rows): ?array
+    {
+        // String titles and groups go NUL-delimited; any other row or field needs the length table.
+        $fields = [];
+        foreach ($rows as $row) {
+            if (! \is_array($row) || ! \is_string($row[2] ?? null) || ! \is_string($row[3] ?? null)) {
+                $fields = [];
+
+                break;
+            }
+            $fields[] = $row[2];
+            $fields[] = $row[3];
+        }
+        $blob = null;
+        if ($fields !== []) {
+            $blob = implode("\0", $fields);
+            if (substr_count($blob, "\0") !== \count($fields) - 1) {
+                $blob = null;
+            }
+        }
+        $lens = '';
+        $operation = 3 | PredatabaseSource::W452_DELIMITED;
+        if ($blob === null) {
+            $lengths = [];
+            $parts = [];
+            foreach ($rows as $row) {
+                $title = \is_array($row) ? ($row[2] ?? null) : null;
+                $group = \is_array($row) ? ($row[3] ?? null) : null;
+                if (! \is_array($row) || ($title !== null && ! \is_string($title)) || ($group !== null && ! \is_string($group))) {
+                    array_push($lengths, PredatabaseSource::W452_INVALID, PredatabaseSource::W452_INVALID);
+
+                    continue;
+                }
+                $lengths[] = $title === null ? PredatabaseSource::W452_NULL : \strlen($title);
+                $lengths[] = $group === null ? PredatabaseSource::W452_NULL : \strlen($group);
+                if ($title !== null) {
+                    $parts[] = $title;
+                }
+                if ($group !== null) {
+                    $parts[] = $group;
+                }
+            }
+            $blob = implode('', $parts);
+            $lens = pack('V*', ...$lengths);
+            $operation = 3;
+        }
+        if (\strlen($blob) > PredatabaseSource::W452_MAX_INPUT || \strlen($lens) > PredatabaseSource::W452_MAX_INPUT) {
+            return null;
+        }
+        $values = PredatabaseSource::callW452Native(self::w452RustFfi(), $operation, 0, $blob, $lens, 6);
+        if ($values === null) {
+            return null;
+        }
+        [$total, $invalid, $noncanonical, $conflict, $eligible, $distinct] = $values;
+        if ($total !== \count($rows) || min($values) < 0 || $invalid + $noncanonical + $conflict + $eligible !== $total
+            || $distinct > $eligible || ($distinct > 0) !== ($eligible > 0)) {
+            return null;
+        }
+
+        return ['total' => $total, 'invalid' => $invalid, 'noncanonical_title' => $noncanonical, 'group_conflict' => $conflict,
+            'eligible' => $eligible, 'distinct' => $distinct];
+    }
+
+    private static function w452RustFfi(): ?FFI
+    {
+        self::$w452RustFfiHandle ??= RustPipelineLibrary::resolveDomain(PredatabaseSource::W452_FFI_DOMAIN, PredatabaseSource::W452_FFI_CDEF) ?? false;
+
+        return self::$w452RustFfiHandle === false ? null : self::$w452RustFfiHandle;
     }
 }
