@@ -44,6 +44,39 @@ class PredbFeedSourceFactory
 
     private static FFI|false|null $ffi = null;
 
+    /**
+     * Wave 48.2 production default for classifySourceKeyBatch() is Rust: the paired benchmark in
+     * tests/Unit/RustPredbEntryFactoryBoundedHttpUpdateLockW48ParityTest.php measures 5.78-6.14x mean and 4.13-5.23x p99 on common batches and 6.08-7.21x mean and 4.80-10.45x p99 on uncommon batches.
+     * PHP stays the fallback when the library is unavailable or a key holds a NUL byte.
+     */
+    public const bool W48_SOURCE_KEY_RUST_FFI_DEFAULT = true;
+
+    public const string W48_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w48_predb_source_key_batch(const char *blob, size_t blob_len, const char *aux, size_t aux_len, int64_t count, int64_t reserved, char *out_buf, size_t out_cap);
+        C;
+
+    private const array W48_SOURCE_KEY_KEYS = ['total', 'blank', 'resolved', 'unknown', 'exact', 'normalized', 'duplicate', 'distinct', 'dedicated',
+        'rss', 'file', 'map_category', 'publication_dates_only', 'spaced_titles', 'strip_display_size_suffix', 'bounded_body', 'extra_config', 'p2p',
+        'tier_local', 'tier_rss', 'tier_standard', 'tier_api', 'first_unknown_index', 'source_mask', 'key_bytes', 'digest'];
+
+    /**
+     * Per makeOne() key: [availableKeysPhp() index, kind (0 dedicated, 1 RSS, 2 local file), option flags, rate tier]. Flags: 1
+     * mapCategory, 2 publicationDatesOnly, 4 spacedTitles, 8 stripDisplaySizeSuffix, 16 bounded body, 32 extra config, 64 p2p.
+     */
+    private const array W48_SOURCES = ['predb_club' => [0, 0, 0, 2], 'predb_net' => [1, 0, 0, 2], 'predb_me' => [2, 1, 16, 1],
+        'predb_org' => [3, 0, 0, 2], 'predatabase' => [4, 0, 32, 3], 'srrdb' => [5, 0, 32, 3], 'xrel' => [6, 0, 0, 3], 'xrel_p2p' => [7, 0, 64, 3],
+        'scnsrc_me' => [8, 1, 21, 1], 'eztv' => [9, 1, 20, 1], 'predb_ovh' => [10, 0, 0, 2], 'apibay' => [11, 0, 0, 2], 'nfodb' => [12, 1, 19, 1],
+        'one_techno' => [13, 1, 19, 1], 'one_gabba' => [14, 1, 19, 1], 'ddlvalley' => [15, 1, 18, 1], 'hdencode' => [16, 1, 26, 1],
+        'hdencode_tv' => [17, 1, 26, 1], 'mp3scene' => [18, 1, 18, 1], 'nima4k' => [19, 0, 0, 2], 'gload' => [20, 1, 18, 1],
+        'hdworld' => [21, 1, 18, 1], 'g4u' => [22, 0, 0, 2], 'nswdb' => [23, 0, 0, 2], '3dsdb' => [24, 0, 0, 2], 'gabber' => [25, 0, 0, 2],
+        'movieblog' => [26, 1, 18, 1], 'scnlog' => [27, 1, 19, 1], 'knaben' => [28, 0, 0, 2], 'crowdnfo' => [29, 0, 0, 2],
+        'seriousaboutsound' => [30, 0, 0, 2], 'dats_pciso_1998' => [31, 0, 0, 2], 'nzedb_archive' => [32, 0, 0, 2],
+        'scene_archive_sql' => [33, 2, 32, 0]];
+
+    private static ?bool $w48SourceKeyRustFfiOverride = null;
+
+    private static FFI|false|null $w48SourceKeyRustFfiHandle = null;
+
     public static function enableRustFfi(): void
     {
         self::$useRustFfi = true;
@@ -128,6 +161,122 @@ class PredbFeedSourceFactory
     public function isAvailableKeyPhp(string $key): bool
     {
         return in_array($key, $this->availableKeysPhp(), true);
+    }
+
+    /** Force the Wave 48.2 key classifier onto Rust (true) or PHP (false); null restores W48_SOURCE_KEY_RUST_FFI_DEFAULT. */
+    public static function useW48SourceKeyRustFfi(?bool $enable = true): void
+    {
+        self::$w48SourceKeyRustFfiOverride = $enable;
+    }
+
+    public static function usesW48SourceKeyRustFfi(): bool
+    {
+        return self::$w48SourceKeyRustFfiOverride ?? self::W48_SOURCE_KEY_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW48SourceKeyRustFfi(): void
+    {
+        self::$w48SourceKeyRustFfiOverride = null;
+        self::$w48SourceKeyRustFfiHandle = null;
+    }
+
+    /**
+     * Classify configured feed keys the way make() would build them: blank, exact, normalized (trimmed, lower-cased,
+     * dashes and spaces as underscores, at most 32 bytes) or unknown keys, repeated sources, each distinct source's kind,
+     * option flags and rate tier, the first unknown index, a bit mask of the resolved sources and an FNV-1a digest of
+     * every key's status, source index and trimmed length in order.
+     *
+     * @param  list<string>  $keys
+     * @return array<string, int>
+     */
+    public static function classifySourceKeyBatch(array $keys): array
+    {
+        return (self::usesW48SourceKeyRustFfi() ? self::classifySourceKeyBatchNative($keys) : null) ?? self::classifySourceKeyBatchPhp($keys);
+    }
+
+    /**
+     * @param  list<string>  $keys
+     * @return array<string, int>
+     */
+    public static function classifySourceKeyBatchPhp(array $keys): array
+    {
+        $c = array_fill(0, \count(self::W48_SOURCE_KEY_KEYS), 0);
+        $c[22] = -1;
+        $mask = 0;
+        $stream = '';
+        foreach (array_values($keys) as $i => $raw) {
+            $c[0]++;
+            $key = trim($raw);
+            $length = \strlen($key);
+            $c[24] += $length;
+            $entry = null;
+            if ($length === 0) {
+                $c[1]++;
+                $status = 0;
+            } elseif (($entry = self::W48_SOURCES[$raw] ?? null) !== null) {
+                $c[4]++;
+                $status = 1;
+            } elseif ($length <= 32 && ($entry = self::W48_SOURCES[strtolower(strtr($key, '- ', '__'))] ?? null) !== null) {
+                $c[5]++;
+                $status = 2;
+            } else {
+                $c[3]++;
+                if ($c[22] < 0) {
+                    $c[22] = $i;
+                }
+                $status = 3;
+            }
+            $index = -1;
+            if ($entry !== null) {
+                [$index, $kind, $flags, $tier] = $entry;
+                $c[2]++;
+                if (($mask >> $index & 1) === 1) {
+                    $c[6]++;
+                } else {
+                    $mask |= 1 << $index;
+                    $c[7]++;
+                    $c[8 + $kind]++;
+                    for ($bit = 0; $bit < 7; $bit++) {
+                        $c[11 + $bit] += $flags >> $bit & 1;
+                    }
+                    $c[18 + $tier]++;
+                }
+            }
+            $stream .= pack('CCV', $status, $index & 0xFF, $length);
+        }
+        $c[23] = $mask;
+        $c[25] = PredbFeedEntry::w48Fnv($stream);
+
+        return array_combine(self::W48_SOURCE_KEY_KEYS, $c);
+    }
+
+    /**
+     * Null when the library is missing, a key holds a NUL byte or the batch exceeds the native limits.
+     *
+     * @param  list<string>  $keys
+     * @return array<string, int>|null
+     */
+    public static function classifySourceKeyBatchNative(array $keys): ?array
+    {
+        $count = \count($keys);
+        $ffi = self::w48SourceKeyRustFfi();
+        if ($ffi === null || $count > PredbFeedEntry::W48_MAX_ITEMS) {
+            return null;
+        }
+        $values = PredbFeedEntry::callW48Native($ffi, 'nntmux_w48_predb_source_key_batch', implode("\0", $keys), '', $count, 0,
+            \count(self::W48_SOURCE_KEY_KEYS));
+        if ($values === null || $values[0] !== $count || $count !== $values[1] + $values[2] + $values[3]) {
+            return null;
+        }
+
+        return array_combine(self::W48_SOURCE_KEY_KEYS, $values);
+    }
+
+    private static function w48SourceKeyRustFfi(): ?FFI
+    {
+        self::$w48SourceKeyRustFfiHandle ??= RustPipelineLibrary::resolveDomain(PredbFeedEntry::W48_FFI_DOMAIN, self::W48_FFI_CDEF) ?? false;
+
+        return self::$w48SourceKeyRustFfiHandle === false ? null : self::$w48SourceKeyRustFfiHandle;
     }
 
     /**
