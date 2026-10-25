@@ -263,4 +263,116 @@ final class NzbArticleCoverage
 
         return $ids;
     }
+
+    /**
+     * Default for the Wave 41.2 toggle only; it stays false because the paired benchmark in
+     * tests/Unit/RustNzbSyncNfoImportCoverageCandidateW41ParityTest.php is below 1.5x.
+     */
+    public const bool W412_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useW412RustFfi = null;
+
+    public static function useW412RustFfi(bool $enable = true): void
+    {
+        self::$useW412RustFfi = $enable;
+    }
+
+    public static function usesW412RustFfi(): bool
+    {
+        return self::$useW412RustFfi ?? self::W412_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW412RustFfi(): void
+    {
+        self::$useW412RustFfi = null;
+    }
+
+    /**
+     * Summarize article coverage candidates (`required`, `covered`). A candidate is invalid unless `required` is a
+     * positive integer; `covered` counts only as an integer, clamped to [0, required]. Valid candidates are full,
+     * partial or none, and acceptable when at most max(0, $tolerance) articles are missing. The required and missing
+     * totals saturate at PHP_INT_MAX.
+     *
+     * @param  array<array-key, mixed>  $candidates
+     * @return array{candidates: int, full: int, partial: int, none: int, invalid: int, acceptable: int, total_required: int, total_missing: int, max_missing: int}
+     */
+    public static function summarizeCoverageCandidates(array $candidates, int $tolerance = 0): array
+    {
+        return (self::usesW412RustFfi() ? self::summarizeCoverageCandidatesNative($candidates, $tolerance) : null)
+            ?? self::summarizeCoverageCandidatesPhp($candidates, $tolerance);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $candidates
+     * @return array{candidates: int, full: int, partial: int, none: int, invalid: int, acceptable: int, total_required: int, total_missing: int, max_missing: int}
+     */
+    public static function summarizeCoverageCandidatesPhp(array $candidates, int $tolerance = 0): array
+    {
+        $tolerance = max(0, $tolerance);
+        $full = $partial = $none = $invalid = $acceptable = $required = $missing = $maxMissing = 0;
+        foreach ($candidates as $candidate) {
+            [$need, $covered] = self::coverageCandidateFields($candidate);
+            if ($need <= 0) {
+                $invalid++;
+
+                continue;
+            }
+            $covered = min(max(0, $covered), $need);
+            // 0 <= covered <= need, so the subtraction cannot overflow.
+            $gap = $need - $covered;
+            if ($gap === 0) {
+                $full++;
+            } elseif ($covered === 0) {
+                $none++;
+            } else {
+                $partial++;
+            }
+            $acceptable += $gap <= $tolerance ? 1 : 0;
+            $required = $required > PHP_INT_MAX - $need ? PHP_INT_MAX : $required + $need;
+            $missing = $missing > PHP_INT_MAX - $gap ? PHP_INT_MAX : $missing + $gap;
+            $maxMissing = max($maxMissing, $gap);
+        }
+
+        return ['candidates' => \count($candidates), 'full' => $full, 'partial' => $partial, 'none' => $none, 'invalid' => $invalid,
+            'acceptable' => $acceptable, 'total_required' => $required, 'total_missing' => $missing, 'max_missing' => $maxMissing];
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $candidates
+     * @return array{candidates: int, full: int, partial: int, none: int, invalid: int, acceptable: int, total_required: int, total_missing: int, max_missing: int}|null
+     */
+    public static function summarizeCoverageCandidatesNative(array $candidates, int $tolerance = 0): ?array
+    {
+        if (\count($candidates) * 2 + 1 > DirectorySyncBridge::W412_MAX_INPUT / 8) {
+            return null;
+        }
+        $words = [$tolerance];
+        foreach ($candidates as $candidate) {
+            array_push($words, ...self::coverageCandidateFields($candidate));
+        }
+        $slots = DirectorySyncBridge::evaluateW412Native(2, pack('q*', ...$words), 9);
+        if ($slots === null) {
+            return null;
+        }
+        [$count, $full, $partial, $none, $invalid, $acceptable, $required, $missing, $maxMissing] = $slots;
+        if ($count !== \count($candidates) || min($slots) < 0 || $full + $partial + $none + $invalid !== $count || $acceptable > $count - $invalid
+            || $maxMissing > $missing) {
+            return null;
+        }
+
+        return ['candidates' => $count, 'full' => $full, 'partial' => $partial, 'none' => $none, 'invalid' => $invalid,
+            'acceptable' => $acceptable, 'total_required' => $required, 'total_missing' => $missing, 'max_missing' => $maxMissing];
+    }
+
+    /** @return array{int, int} the required and covered counts, each 0 unless an integer */
+    private static function coverageCandidateFields(mixed $candidate): array
+    {
+        if (! \is_array($candidate)) {
+            return [0, 0];
+        }
+        $required = $candidate['required'] ?? 0;
+        $covered = $candidate['covered'] ?? 0;
+
+        return [\is_int($required) ? $required : 0, \is_int($covered) ? $covered : 0];
+    }
 }

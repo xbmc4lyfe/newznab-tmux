@@ -374,4 +374,123 @@ final class NzbCreationCandidateQuery
 
         return 'CASE id '.implode(' ', $cases).' ELSE '.count($ids).' END';
     }
+
+    /**
+     * Default for the Wave 41.2 toggle only; it stays false because the paired benchmark in
+     * tests/Unit/RustNzbSyncNfoImportCoverageCandidateW41ParityTest.php is below 1.5x.
+     */
+    public const bool W412_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useW412RustFfi = null;
+
+    public static function useW412RustFfi(bool $enable = true): void
+    {
+        self::$useW412RustFfi = $enable;
+    }
+
+    public static function usesW412RustFfi(): bool
+    {
+        return self::$useW412RustFfi ?? self::W412_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW412RustFfi(): void
+    {
+        self::$useW412RustFfi = null;
+    }
+
+    /**
+     * Summarize an NZB creation claim window over candidates (`id`, `claimed_at` Unix seconds). Ids are valid only as
+     * positive integers; repeats of a valid id are duplicates. Every candidate's claim is unclaimed (null or missing),
+     * future (after $now), stale (claimed at least max(0, $ttlSeconds) before $now), fresh, or malformed (any other
+     * value). A valid id is admissible when its first occurrence is unclaimed or stale.
+     *
+     * @param  array<array-key, mixed>  $candidates
+     * @return array{candidates: int, invalid_ids: int, duplicate_ids: int, unclaimed: int, fresh: int, stale: int, future: int, malformed_claims: int, admissible: int}
+     */
+    public static function summarizeClaimWindow(array $candidates, int $now, int $ttlSeconds): array
+    {
+        return (self::usesW412RustFfi() ? self::summarizeClaimWindowNative($candidates, $now, $ttlSeconds) : null)
+            ?? self::summarizeClaimWindowPhp($candidates, $now, $ttlSeconds);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $candidates
+     * @return array{candidates: int, invalid_ids: int, duplicate_ids: int, unclaimed: int, fresh: int, stale: int, future: int, malformed_claims: int, admissible: int}
+     */
+    public static function summarizeClaimWindowPhp(array $candidates, int $now, int $ttlSeconds): array
+    {
+        $ttl = max(0, $ttlSeconds);
+        $invalid = $duplicates = $unclaimed = $fresh = $stale = $future = $malformed = $admissible = 0;
+        $seen = [];
+        foreach ($candidates as $candidate) {
+            [$id, $kind, $claimed] = self::claimWindowFields($candidate);
+            if ($kind === 0) {
+                $unclaimed++;
+                $open = true;
+            } elseif ($kind === 2) {
+                $malformed++;
+                $open = false;
+            } elseif ($claimed > $now) {
+                $future++;
+                $open = false;
+            } elseif ($claimed < 0 ? $now >= $ttl + $claimed : $now - $claimed >= $ttl) {
+                // Both forms avoid overflow: ttl + claimed stays in range for a negative claim, now - claimed for the rest.
+                $stale++;
+                $open = true;
+            } else {
+                $fresh++;
+                $open = false;
+            }
+            if ($id <= 0) {
+                $invalid++;
+            } elseif (isset($seen[$id])) {
+                $duplicates++;
+            } else {
+                $seen[$id] = true;
+                $admissible += $open ? 1 : 0;
+            }
+        }
+
+        return ['candidates' => \count($candidates), 'invalid_ids' => $invalid, 'duplicate_ids' => $duplicates, 'unclaimed' => $unclaimed, 'fresh' => $fresh,
+            'stale' => $stale, 'future' => $future, 'malformed_claims' => $malformed, 'admissible' => $admissible];
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $candidates
+     * @return array{candidates: int, invalid_ids: int, duplicate_ids: int, unclaimed: int, fresh: int, stale: int, future: int, malformed_claims: int, admissible: int}|null
+     */
+    public static function summarizeClaimWindowNative(array $candidates, int $now, int $ttlSeconds): ?array
+    {
+        if (\count($candidates) * 3 + 2 > DirectorySyncBridge::W412_MAX_INPUT / 8) {
+            return null;
+        }
+        $words = [$now, $ttlSeconds];
+        foreach ($candidates as $candidate) {
+            array_push($words, ...self::claimWindowFields($candidate));
+        }
+        $slots = DirectorySyncBridge::evaluateW412Native(3, pack('q*', ...$words), 9);
+        if ($slots === null) {
+            return null;
+        }
+        [$count, $invalid, $duplicates, $unclaimed, $fresh, $stale, $future, $malformed, $admissible] = $slots;
+        if ($count !== \count($candidates) || min($slots) < 0 || $unclaimed + $fresh + $stale + $future + $malformed !== $count
+            || $invalid + $duplicates + $admissible > $count) {
+            return null;
+        }
+
+        return ['candidates' => $count, 'invalid_ids' => $invalid, 'duplicate_ids' => $duplicates, 'unclaimed' => $unclaimed, 'fresh' => $fresh,
+            'stale' => $stale, 'future' => $future, 'malformed_claims' => $malformed, 'admissible' => $admissible];
+    }
+
+    /** @return array{int, 0|1|2, int} the id (0 unless an integer), claim kind (0 none, 1 timestamp, 2 malformed) and timestamp */
+    private static function claimWindowFields(mixed $candidate): array
+    {
+        if (! \is_array($candidate)) {
+            return [0, 0, 0];
+        }
+        $id = $candidate['id'] ?? 0;
+        $claimed = $candidate['claimed_at'] ?? null;
+
+        return [\is_int($id) ? $id : 0, $claimed === null ? 0 : (\is_int($claimed) ? 1 : 2), \is_int($claimed) ? $claimed : 0];
+    }
 }

@@ -28016,3 +28016,617 @@ pub unsafe extern "C" fn nntmux_w40_nzb_service_parser_manifest_write_contents(
     }))
     .unwrap_or(-1)
 }
+
+/// Wave 41.2: directory sync attempts, NFO import payloads, article coverage candidates, NZB creation claim
+/// windows and NZB import status batches.
+mod wave41_nzb_sync_nfo_import_coverage_candidate {
+    use super::{nfo_abi_range, yenc_ranges_overlap};
+    use std::slice;
+
+    pub(super) const MAX_INPUT: usize = 16 * 1024 * 1024;
+
+    /// Import status texts in output slot order, mirroring `NzbImportStatus` values.
+    const IMPORT_STATUSES: [&[u8]; 8] = [
+        b"inserted",
+        b"queued",
+        b"metadata_ignored",
+        b"metadata_deferred",
+        b"duplicate",
+        b"blacklisted",
+        b"nogroup",
+        b"failed",
+    ];
+
+    type Slot = [u8; 8];
+
+    fn word(chunk: &Slot) -> i64 {
+        i64::from_ne_bytes(*chunk)
+    }
+
+    /// `HEAD` leading slots, then rows of exactly `WIDTH` slots covering the rest of the input.
+    fn fixed_rows<const HEAD: usize, const WIDTH: usize>(
+        bytes: &[u8],
+    ) -> Option<([i64; HEAD], &[[Slot; WIDTH]])> {
+        let (slots, rest) = bytes.as_chunks::<8>();
+        if !rest.is_empty() || slots.len() < HEAD {
+            return None;
+        }
+        let (head, body) = slots.split_at(HEAD);
+        let (rows, extra) = body.as_chunks::<WIDTH>();
+        if !extra.is_empty() {
+            return None;
+        }
+        let mut lead = [0i64; HEAD];
+        for (value, chunk) in lead.iter_mut().zip(head) {
+            *value = word(chunk);
+        }
+        Some((lead, rows))
+    }
+
+    /// `[lead, count]`, `count` rows of `WIDTH` slots whose first slot is a text length (-1 marks a non-string),
+    /// then the concatenated texts. Declared lengths must cover the tail exactly.
+    fn text_rows<const WIDTH: usize>(
+        bytes: &[u8],
+    ) -> Option<(i64, Vec<(Option<&[u8]>, [i64; WIDTH])>)> {
+        let (head, _) = bytes.get(..16)?.as_chunks::<8>();
+        let lead = word(&head[0]);
+        let count = usize::try_from(word(&head[1])).ok()?;
+        let table_end = count.checked_mul(WIDTH)?.checked_mul(8)?.checked_add(16)?;
+        let table = bytes.get(16..table_end)?;
+        let tail = &bytes[table_end..];
+        let mut offset = 0usize;
+        let mut out = Vec::with_capacity(count);
+        for row in table.as_chunks::<8>().0.as_chunks::<WIDTH>().0 {
+            let length = word(&row[0]);
+            let text = if length == -1 {
+                None
+            } else {
+                let end = offset.checked_add(usize::try_from(length).ok()?)?;
+                let text = tail.get(offset..end)?;
+                offset = end;
+                Some(text)
+            };
+            let mut values = [0i64; WIDTH];
+            for (value, chunk) in values.iter_mut().zip(row) {
+                *value = word(chunk);
+            }
+            out.push((text, values));
+        }
+        (offset == tail.len()).then_some((lead, out))
+    }
+
+    /// Op 0: `DirectorySyncBridge::summarizeDirectorySyncAttempts` over `[slow_ms]` and rows of
+    /// `[has_function, extension_loaded, synced (-1 none, 0 false, 1 true), elapsed_ms]`.
+    fn sync_attempts(bytes: &[u8]) -> Option<Vec<i64>> {
+        let ([slow_ms], rows) = fixed_rows::<1, 4>(bytes)?;
+        let threshold = slow_ms.max(0);
+        let (mut ok, mut failed, mut unsupported, mut slow, mut total, mut max) =
+            (0i64, 0i64, 0i64, 0i64, 0i64, 0i64);
+        for row in rows {
+            let (function, extension, synced) = (word(&row[0]), word(&row[1]), word(&row[2]));
+            let elapsed = word(&row[3]).max(0);
+            if !matches!(function, 0 | 1)
+                || !matches!(extension, 0 | 1)
+                || !(-1..=1).contains(&synced)
+            {
+                return None;
+            }
+            if function == 0 || extension == 0 {
+                unsupported += 1;
+            } else if synced == 1 {
+                ok += 1;
+            } else {
+                failed += 1;
+            }
+            slow += (elapsed > threshold) as i64;
+            total = total.saturating_add(elapsed);
+            max = max.max(elapsed);
+        }
+        Some(vec![
+            rows.len() as i64,
+            ok,
+            failed,
+            unsupported,
+            slow,
+            total,
+            max,
+        ])
+    }
+
+    /// Op 1: `NfoImportService::summarizeNfoImportPayloads` over `[max_bytes, count]`, rows of
+    /// `[nfo_len, guid_valid]` and the NFO payloads.
+    fn nfo_payloads(bytes: &[u8]) -> Option<Vec<i64>> {
+        let (max_bytes, rows) = text_rows::<2>(bytes)?;
+        let limit = max_bytes.max(0) as u64;
+        let (mut accepted, mut missing, mut empty, mut oversized, mut binary, mut total) =
+            (0i64, 0i64, 0i64, 0i64, 0i64, 0i64);
+        for (payload, [_, guid]) in &rows {
+            if !matches!(guid, 0 | 1) {
+                return None;
+            }
+            match payload {
+                _ if *guid == 0 => missing += 1,
+                None | Some([]) => empty += 1,
+                Some(text) if text.len() as u64 > limit => oversized += 1,
+                Some(text) if text.contains(&0) => binary += 1,
+                Some(text) => {
+                    accepted += 1;
+                    total = total.saturating_add(text.len() as i64);
+                }
+            }
+        }
+        Some(vec![
+            rows.len() as i64,
+            accepted,
+            missing,
+            empty,
+            oversized,
+            binary,
+            total,
+        ])
+    }
+
+    /// Op 2: `NzbArticleCoverage::summarizeCoverageCandidates` over `[tolerance]` and rows of
+    /// `[required, covered]`; a non-positive required count marks an invalid candidate.
+    fn coverage_candidates(bytes: &[u8]) -> Option<Vec<i64>> {
+        let ([tolerance], rows) = fixed_rows::<1, 2>(bytes)?;
+        let tolerance = tolerance.max(0);
+        let (mut full, mut partial, mut none, mut invalid, mut acceptable) =
+            (0i64, 0i64, 0i64, 0i64, 0i64);
+        let (mut required_total, mut missing_total, mut max_missing) = (0i64, 0i64, 0i64);
+        for row in rows {
+            let required = word(&row[0]);
+            if required <= 0 {
+                invalid += 1;
+                continue;
+            }
+            let covered = word(&row[1]).clamp(0, required);
+            // 0 <= covered <= required, so the subtraction cannot overflow.
+            let missing = required - covered;
+            if covered == required {
+                full += 1;
+            } else if covered == 0 {
+                none += 1;
+            } else {
+                partial += 1;
+            }
+            acceptable += (missing <= tolerance) as i64;
+            required_total = required_total.saturating_add(required);
+            missing_total = missing_total.saturating_add(missing);
+            max_missing = max_missing.max(missing);
+        }
+        Some(vec![
+            rows.len() as i64,
+            full,
+            partial,
+            none,
+            invalid,
+            acceptable,
+            required_total,
+            missing_total,
+            max_missing,
+        ])
+    }
+
+    /// Op 3: `NzbCreationCandidateQuery::summarizeClaimWindow` over `[now, ttl_seconds]` and rows of
+    /// `[id (non-positive is invalid), claim_kind (0 none, 1 timestamp, 2 malformed), claimed_at]`.
+    fn claim_window(bytes: &[u8]) -> Option<Vec<i64>> {
+        let ([now, ttl], rows) = fixed_rows::<2, 3>(bytes)?;
+        let ttl = i128::from(ttl.max(0));
+        let (mut unclaimed, mut fresh, mut stale, mut future, mut malformed) =
+            (0i64, 0i64, 0i64, 0i64, 0i64);
+        let mut ids: Vec<(i64, usize, bool)> = Vec::with_capacity(rows.len());
+        let mut invalid = 0i64;
+        for (index, row) in rows.iter().enumerate() {
+            let (id, kind, claimed) = (word(&row[0]), word(&row[1]), word(&row[2]));
+            let open = match kind {
+                0 => {
+                    unclaimed += 1;
+                    true
+                }
+                1 if claimed > now => {
+                    future += 1;
+                    false
+                }
+                1 if i128::from(now) - i128::from(claimed) >= ttl => {
+                    stale += 1;
+                    true
+                }
+                1 => {
+                    fresh += 1;
+                    false
+                }
+                2 => {
+                    malformed += 1;
+                    false
+                }
+                _ => return None,
+            };
+            if id > 0 {
+                ids.push((id, index, open));
+            } else {
+                invalid += 1;
+            }
+        }
+        ids.sort_unstable_by_key(|&(id, index, _)| (id, index));
+        let (mut duplicates, mut admissible) = (0i64, 0i64);
+        let mut previous: Option<i64> = None;
+        for &(id, _, open) in &ids {
+            if previous == Some(id) {
+                duplicates += 1;
+            } else {
+                admissible += open as i64;
+                previous = Some(id);
+            }
+        }
+        Some(vec![
+            rows.len() as i64,
+            invalid,
+            duplicates,
+            unclaimed,
+            fresh,
+            stale,
+            future,
+            malformed,
+            admissible,
+        ])
+    }
+
+    /// Op 4: `NzbImportService::summarizeImportStatusBatch` over `[0, count]`, rows of `[status_len, bytes]`
+    /// and the status texts.
+    fn import_statuses(bytes: &[u8]) -> Option<Vec<i64>> {
+        let (lead, rows) = text_rows::<2>(bytes)?;
+        if lead != 0 {
+            return None;
+        }
+        let mut counts = [0i64; 9];
+        let mut inserted_bytes = 0i64;
+        for (status, [_, size]) in &rows {
+            let slot = status
+                .and_then(|text| IMPORT_STATUSES.iter().position(|known| *known == text))
+                .unwrap_or(8);
+            counts[slot] += 1;
+            if slot == 0 {
+                inserted_bytes = inserted_bytes.saturating_add((*size).max(0));
+            }
+        }
+        let mut out = Vec::with_capacity(11);
+        out.push(rows.len() as i64);
+        out.extend_from_slice(&counts);
+        out.push(inserted_bytes);
+        Some(out)
+    }
+
+    fn compute(operation: u32, flags: u32, bytes: &[u8]) -> Option<Vec<i64>> {
+        if flags != 0 {
+            return None;
+        }
+        match operation {
+            0 => sync_attempts(bytes),
+            1 => nfo_payloads(bytes),
+            2 => coverage_candidates(bytes),
+            3 => claim_window(bytes),
+            4 => import_statuses(bytes),
+            _ => None,
+        }
+    }
+
+    /// # Safety
+    /// See [`super::nntmux_w412_nzb_sync_nfo_import_coverage_candidate`].
+    pub(super) unsafe fn evaluate(
+        operation: u32,
+        flags: u32,
+        input: *const u8,
+        length: usize,
+        output: *mut u8,
+        capacity: usize,
+    ) -> i32 {
+        if !nfo_abi_range(input, length, false)
+            || !nfo_abi_range(output, capacity, false)
+            || length > MAX_INPUT
+            || capacity > isize::MAX as usize
+            || yenc_ranges_overlap(input as usize, length, output as usize, capacity)
+        {
+            return -1;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, length) };
+        let Some(result) = compute(operation, flags, bytes) else {
+            return -1;
+        };
+        // Every answer has at most 11 slots, so the byte count always fits an i32.
+        let needed = result.len() * 8;
+        if needed > capacity {
+            return -(needed as i32);
+        }
+        let out = unsafe { slice::from_raw_parts_mut(output, needed) };
+        for (chunk, value) in out.as_chunks_mut::<8>().0.iter_mut().zip(&result) {
+            chunk.copy_from_slice(&value.to_ne_bytes());
+        }
+        needed as i32
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn pack(slots: &[i64], tail: &[&[u8]]) -> Vec<u8> {
+            let mut v: Vec<u8> = slots.iter().flat_map(|s| s.to_ne_bytes()).collect();
+            for t in tail {
+                v.extend_from_slice(t);
+            }
+            v
+        }
+
+        fn call(operation: u32, input: &[u8]) -> Option<Vec<i64>> {
+            let mut out = vec![0xa5u8; 256];
+            let probe = [0u8; 1];
+            let pointer = if input.is_empty() {
+                probe.as_ptr()
+            } else {
+                input.as_ptr()
+            };
+            let written = unsafe {
+                evaluate(
+                    operation,
+                    0,
+                    pointer,
+                    input.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            if written < 0 {
+                assert_eq!(written, -1);
+                return None;
+            }
+            Some(
+                out[..written as usize]
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(word)
+                    .collect(),
+            )
+        }
+
+        #[test]
+        fn w41_2_sync_attempts() {
+            assert_eq!(
+                call(
+                    0,
+                    &pack(
+                        &[
+                            250, 1, 1, 1, 10, 1, 1, 0, 300, 1, 1, -1, 250, 0, 1, 1, 5, 1, 0, 1, -7
+                        ],
+                        &[]
+                    )
+                ),
+                Some(vec![5, 1, 2, 2, 1, 565, 300])
+            );
+            assert_eq!(
+                call(0, &pack(&[-5, 1, 1, 1, 0, 1, 1, 1, 1], &[])),
+                Some(vec![2, 2, 0, 0, 1, 1, 1])
+            );
+            assert_eq!(
+                call(0, &pack(&[0, 1, 1, 1, i64::MAX, 1, 1, 1, i64::MAX], &[])),
+                Some(vec![2, 2, 0, 0, 2, i64::MAX, i64::MAX])
+            );
+            assert_eq!(call(0, &pack(&[250], &[])), Some(vec![0, 0, 0, 0, 0, 0, 0]));
+            assert_eq!(call(0, &pack(&[250, 2, 1, 1, 0], &[])), None);
+            assert_eq!(call(0, &pack(&[250, 1, -1, 1, 0], &[])), None);
+            assert_eq!(call(0, &pack(&[250, 1, 1, 2, 0], &[])), None);
+            assert_eq!(call(0, &pack(&[250, 1, 1, 1], &[])), None);
+            assert_eq!(call(0, &pack(&[250], &[b"x"])), None);
+            assert_eq!(call(0, &[]), None);
+        }
+
+        #[test]
+        fn w41_2_nfo_payloads() {
+            assert_eq!(
+                call(
+                    1,
+                    &pack(
+                        &[4, 7, 3, 1, 2, 1, 0, 1, -1, 1, 5, 1, 3, 0, 3, 1],
+                        &[b"abc", b"\x00x", b"", b"abcde", b"xyz", b"\xdb\xb0\x0a"]
+                    )
+                ),
+                Some(vec![7, 2, 1, 2, 1, 1, 6])
+            );
+            assert_eq!(
+                call(1, &pack(&[-1, 1, 1, 1], &[b"a"])),
+                Some(vec![1, 0, 0, 0, 1, 0, 0])
+            );
+            assert_eq!(
+                call(1, &pack(&[0, 0], &[])),
+                Some(vec![0, 0, 0, 0, 0, 0, 0])
+            );
+            assert_eq!(call(1, &pack(&[4, 1, 1, 2], &[b"a"])), None);
+            assert_eq!(call(1, &pack(&[4, 1, 2, 1], &[b"a"])), None);
+            assert_eq!(call(1, &pack(&[4, 1, -2, 1], &[])), None);
+            assert_eq!(call(1, &pack(&[4, 0], &[b"x"])), None);
+            assert_eq!(call(1, &pack(&[4, -1], &[])), None);
+            assert_eq!(call(1, &pack(&[4], &[])), None);
+        }
+
+        #[test]
+        fn w41_2_coverage_candidates() {
+            assert_eq!(
+                call(
+                    2,
+                    &pack(&[1, 10, 10, 10, 9, 10, 0, 10, -3, 0, 5, -2, 1, 4, 99], &[])
+                ),
+                Some(vec![7, 2, 1, 2, 2, 3, 44, 21, 10])
+            );
+            assert_eq!(
+                call(2, &pack(&[-9, i64::MAX, 0, i64::MAX, 1], &[])),
+                Some(vec![2, 0, 1, 1, 0, 0, i64::MAX, i64::MAX, i64::MAX])
+            );
+            assert_eq!(
+                call(2, &pack(&[i64::MAX, 3, i64::MIN], &[])),
+                Some(vec![1, 0, 0, 1, 0, 1, 3, 3, 3])
+            );
+            assert_eq!(
+                call(2, &pack(&[0], &[])),
+                Some(vec![0, 0, 0, 0, 0, 0, 0, 0, 0])
+            );
+            assert_eq!(call(2, &pack(&[0, 1], &[])), None);
+            assert_eq!(call(2, &pack(&[0], &[b"x"])), None);
+            assert_eq!(call(2, &[]), None);
+        }
+
+        #[test]
+        fn w41_2_claim_window() {
+            assert_eq!(
+                call(
+                    3,
+                    &pack(
+                        &[
+                            1000, 100, 1, 0, 0, 2, 1, 950, 3, 1, 900, 4, 1, 1001, 5, 2, 0, 1, 1,
+                            500, 0, 0, 0, -4, 1, 1, 3, 0, 0
+                        ],
+                        &[]
+                    )
+                ),
+                Some(vec![9, 2, 2, 3, 1, 3, 1, 1, 2])
+            );
+            assert_eq!(
+                call(
+                    3,
+                    &pack(&[i64::MAX, -5, 1, 1, i64::MIN, 2, 1, i64::MAX], &[])
+                ),
+                Some(vec![2, 0, 0, 0, 0, 2, 0, 0, 2])
+            );
+            assert_eq!(
+                call(
+                    3,
+                    &pack(&[i64::MIN, i64::MAX, 1, 1, i64::MIN, 1, 0, 0], &[])
+                ),
+                Some(vec![2, 0, 1, 1, 1, 0, 0, 0, 0])
+            );
+            assert_eq!(
+                call(3, &pack(&[0, 0], &[])),
+                Some(vec![0, 0, 0, 0, 0, 0, 0, 0, 0])
+            );
+            assert_eq!(call(3, &pack(&[0, 0, 1, 3, 0], &[])), None);
+            assert_eq!(call(3, &pack(&[0, 0, 1, 0], &[])), None);
+            assert_eq!(call(3, &pack(&[0], &[])), None);
+        }
+
+        #[test]
+        fn w41_2_import_statuses() {
+            let texts: [&[u8]; 10] = [
+                b"inserted",
+                b"queued",
+                b"metadata_ignored",
+                b"metadata_deferred",
+                b"duplicate",
+                b"blacklisted",
+                b"nogroup",
+                b"failed",
+                b"Inserted",
+                b"inserted",
+            ];
+            let mut slots = vec![0, texts.len() as i64 + 1];
+            for (index, text) in texts.iter().enumerate() {
+                slots.push(text.len() as i64);
+                slots.push(if index == 9 { -5 } else { 100 });
+            }
+            slots.extend([-1, 7]);
+            assert_eq!(
+                call(4, &pack(&slots, &texts)),
+                Some(vec![11, 2, 1, 1, 1, 1, 1, 1, 1, 2, 100])
+            );
+            assert_eq!(
+                call(
+                    4,
+                    &pack(&[0, 2, 8, i64::MAX, 8, 1], &[b"inserted", b"inserted"])
+                ),
+                Some(vec![2, 2, 0, 0, 0, 0, 0, 0, 0, 0, i64::MAX])
+            );
+            assert_eq!(call(4, &pack(&[0, 0], &[])), Some(vec![0; 11]));
+            assert_eq!(call(4, &pack(&[1, 0], &[])), None);
+            assert_eq!(call(4, &pack(&[0, 1, 9, 0], &[b"inserted"])), None);
+            assert_eq!(call(4, &pack(&[0, 1, 8], &[b"inserted"])), None);
+            assert_eq!(call(4, &pack(&[0, 0], &[b"x"])), None);
+        }
+
+        #[test]
+        fn w41_2_abi_sentinels() {
+            assert_eq!(call(5, &pack(&[0], &[])), None);
+            assert_eq!(call(u32::MAX, &pack(&[0], &[])), None);
+            let input = pack(&[1, 10, 10], &[]);
+            let mut out = [0x5au8; 128];
+            let run = |p: *const u8, len: usize, o: *mut u8, cap: usize| unsafe {
+                evaluate(2, 0, p, len, o, cap)
+            };
+            assert_eq!(run(std::ptr::null(), 0, out.as_mut_ptr(), out.len()), -1);
+            assert_eq!(
+                run(input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), MAX_INPUT + 1, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), usize::MAX, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), input.len(), out.as_mut_ptr(), usize::MAX),
+                -1
+            );
+            for cap in [0, 1, 71] {
+                assert_eq!(run(input.as_ptr(), input.len(), out.as_mut_ptr(), cap), -72);
+            }
+            assert!(out.iter().all(|b| *b == 0x5a));
+            assert_eq!(run(input.as_ptr(), input.len(), out.as_mut_ptr(), 72), 72);
+            assert_eq!(word(&out[8..16].try_into().unwrap()), 1);
+            assert!(out[72..].iter().all(|b| *b == 0x5a));
+            let mut shared = [0u8; 160];
+            shared[..input.len()].copy_from_slice(&input);
+            let p = shared.as_mut_ptr();
+            assert_eq!(run(p, input.len(), unsafe { p.add(8) }, 72), -1);
+            let export = |op: u32, flags: u32, out: &mut [u8]| unsafe {
+                super::super::nntmux_w412_nzb_sync_nfo_import_coverage_candidate(
+                    op,
+                    flags,
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert_eq!(export(2, 0, &mut out), 72);
+            assert_eq!(export(2, 1, &mut out), -1);
+            assert_eq!(export(0, 0, &mut out), -1);
+        }
+    }
+}
+
+/// Evaluate one Wave 41.2 helper over packed native-endian `i64` slots followed by any
+/// string bytes: op 0 summarizes directory sync attempts, op 1 summarizes NFO import
+/// payloads, op 2 summarizes article coverage candidates, op 3 summarizes an NZB creation
+/// claim window and op 4 tallies NZB import statuses. `flags` must be zero. Returns the
+/// byte count written, the negated required capacity when `out_cap` is too small (nothing
+/// written), or -1 when the input is malformed.
+///
+/// # Safety
+/// Both ranges must be live, disjoint readable/writable allocations. Pointers must
+/// be non-null even for zero lengths; arithmetic checks cannot prove provenance.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w412_nzb_sync_nfo_import_coverage_candidate(
+    operation: u32,
+    flags: u32,
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        wave41_nzb_sync_nfo_import_coverage_candidate::evaluate(
+            operation, flags, input, input_len, out_buf, out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
