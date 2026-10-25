@@ -35196,3 +35196,1547 @@ mod wave48_5_logviewer_entry_file_repo_reader_release_search {
         }
     }
 }
+
+
+
+
+
+
+
+
+
+/// Wave 49.5 batch helpers for `BoundedMetricQuery`, `MetricFamily`,
+/// `PrometheusMetricsExporter`, `TmuxMetricsSnapshot` and `GrafanaJwtIssuer`.
+///
+/// Every entry point shares one ABI: `count` records, a `flags` word, a
+/// NUL-delimited string buffer (`data`), a little-endian i64 table (`ints`)
+/// and a fixed-width i64 output (`out`, `out_cap` words). Each returns the
+/// words written, `-needed` when `out_cap` is too small (outputs always hold
+/// at least two words per record, so never -1), or `-1` (decline: invalid
+/// input, overlapping buffers, or a record PHP must handle). Declines and
+/// capacity errors never write to `out`.
+mod wave49_5_monitoring_bounded_metric_family_exporter_snapshot_jwt {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const DECLINE: i64 = -1;
+    const MAX_INPUT: usize = 64 * 1024 * 1024;
+    const MAX_RECORDS: usize = 1 << 20;
+    const XXH_P1: u64 = 0x9E37_79B1_85EB_CA87;
+    const XXH_P2: u64 = 0xC2B2_AE3D_27D4_EB4F;
+    const XXH_P3: u64 = 0x1656_67B1_9E37_79F9;
+    const XXH_P4: u64 = 0x85EB_CA77_C2B2_AE63;
+    const XXH_P5: u64 = 0x27D4_EB2F_1656_67C5;
+    const MARIA_PREFIX: &[u8] = b"SET STATEMENT max_statement_time=2 FOR ";
+    const MYSQL_SELECT: &[u8] = b"select /*+ MAX_EXECUTION_TIME(2000) */";
+    const JOB_SEGMENT: &[u8] = b"/metrics/job/";
+    /// `base64url('{"alg":"RS256","typ":"JWT"}')`.
+    const JWT_HEADER: &[u8] = b"eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9";
+    const HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
+    const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
+    const B64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+    fn xxh_round(acc: u64, lane: u64) -> u64 {
+        acc.wrapping_add(lane.wrapping_mul(XXH_P2))
+            .rotate_left(31)
+            .wrapping_mul(XXH_P1)
+    }
+
+    fn xxh_merge(acc: u64, lane: u64) -> u64 {
+        (acc ^ xxh_round(0, lane))
+            .wrapping_mul(XXH_P1)
+            .wrapping_add(XXH_P4)
+    }
+
+    fn le64(bytes: &[u8]) -> u64 {
+        u64::from_le_bytes(bytes[..8].try_into().unwrap_or([0; 8]))
+    }
+
+    /// PHP `hash('xxh64')` (seed 0) read back with `unpack('J')`.
+    fn xxh64(input: &[u8]) -> i64 {
+        let mut rest = input;
+        let mut hash = if input.len() >= 32 {
+            let mut lanes = [
+                XXH_P1.wrapping_add(XXH_P2),
+                XXH_P2,
+                0,
+                0u64.wrapping_sub(XXH_P1),
+            ];
+            let (stripes, tail) = input.as_chunks::<32>();
+            for stripe in stripes {
+                for (index, lane) in lanes.iter_mut().enumerate() {
+                    *lane = xxh_round(*lane, le64(&stripe[index * 8..]));
+                }
+            }
+            rest = tail;
+            let mut hash = lanes[0]
+                .rotate_left(1)
+                .wrapping_add(lanes[1].rotate_left(7))
+                .wrapping_add(lanes[2].rotate_left(12))
+                .wrapping_add(lanes[3].rotate_left(18));
+            for lane in lanes {
+                hash = xxh_merge(hash, lane);
+            }
+            hash
+        } else {
+            XXH_P5
+        };
+        hash = hash.wrapping_add(input.len() as u64);
+        while rest.len() >= 8 {
+            hash ^= xxh_round(0, le64(rest));
+            hash = hash
+                .rotate_left(27)
+                .wrapping_mul(XXH_P1)
+                .wrapping_add(XXH_P4);
+            rest = &rest[8..];
+        }
+        if rest.len() >= 4 {
+            let lane = u32::from_le_bytes(rest[..4].try_into().unwrap_or([0; 4]));
+            hash ^= u64::from(lane).wrapping_mul(XXH_P1);
+            hash = hash
+                .rotate_left(23)
+                .wrapping_mul(XXH_P2)
+                .wrapping_add(XXH_P3);
+            rest = &rest[4..];
+        }
+        for &byte in rest {
+            hash ^= u64::from(byte).wrapping_mul(XXH_P5);
+            hash = hash.rotate_left(11).wrapping_mul(XXH_P1);
+        }
+        hash ^= hash >> 33;
+        hash = hash.wrapping_mul(XXH_P2);
+        hash ^= hash >> 29;
+        hash = hash.wrapping_mul(XXH_P3);
+        hash ^= hash >> 32;
+        hash as i64
+    }
+
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> Option<bool> {
+        if a_len == 0 || b_len == 0 {
+            return Some(false);
+        }
+        let a_end = a.checked_add(a_len)?;
+        let b_end = b.checked_add(b_len)?;
+        Some(a < b_end && b < a_end)
+    }
+
+    const LOW_BITS: u64 = 0x0101_0101_0101_0101;
+    const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+
+    /// Word-at-a-time search for the first NUL byte; the lowest flagged byte
+    /// is exact because borrows only propagate upwards.
+    fn find_nul(haystack: &[u8]) -> Option<usize> {
+        let (words, _) = haystack.as_chunks::<8>();
+        for (index, word) in words.iter().enumerate() {
+            let value = u64::from_le_bytes(*word);
+            let found = value.wrapping_sub(LOW_BITS) & !value & HIGH_BITS;
+            if found != 0 {
+                return Some(index * 8 + (found.trailing_zeros() / 8) as usize);
+            }
+        }
+        let tail = words.len() * 8;
+        haystack[tail..]
+            .iter()
+            .position(|&byte| byte == 0)
+            .map(|position| tail + position)
+    }
+
+    /// Splits `data` on NUL into exactly `expected` fields.
+    fn split_fields(data: &[u8], expected: usize) -> Option<Vec<&[u8]>> {
+        if expected == 0 {
+            return data.is_empty().then(Vec::new);
+        }
+        let mut fields = Vec::with_capacity(expected);
+        let mut rest = data;
+        while fields.len() + 1 < expected {
+            let at = find_nul(rest)?;
+            fields.push(&rest[..at]);
+            rest = &rest[at + 1..];
+        }
+        if find_nul(rest).is_some() {
+            return None;
+        }
+        fields.push(rest);
+        Some(fields)
+    }
+
+    fn read_ints(bytes: &[u8], expected: usize) -> Option<Vec<i64>> {
+        if bytes.len() != expected.checked_mul(8)? {
+            return None;
+        }
+        Some(
+            bytes
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|chunk| i64::from_le_bytes(*chunk))
+                .collect(),
+        )
+    }
+
+    /// Validates the shared ABI, runs `body` and copies its words to `out`.
+    ///
+    /// # Safety
+    /// See the entry points.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run(
+        count: usize,
+        data: *const u8,
+        data_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        out: *mut i64,
+        out_cap: usize,
+        words_per_record: usize,
+        body: impl FnOnce(&[u8], &[u8], &mut Vec<i64>) -> Option<()>,
+    ) -> i64 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if count > MAX_RECORDS
+                || data_len > MAX_INPUT
+                || ints_len > MAX_INPUT
+                || out_cap > MAX_INPUT
+                || (data.is_null() && data_len != 0)
+                || (ints.is_null() && ints_len != 0)
+                || (out.is_null() && out_cap != 0)
+                || (!out.is_null() && !out.is_aligned())
+            {
+                return DECLINE;
+            }
+            let Some(out_bytes) = out_cap.checked_mul(8) else {
+                return DECLINE;
+            };
+            for (pointer, len) in [(data as usize, data_len), (ints as usize, ints_len)] {
+                if overlaps(pointer, len, out as usize, out_bytes) != Some(false) {
+                    return DECLINE;
+                }
+            }
+            let data = if data_len == 0 {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(data, data_len) }
+            };
+            let ints = if ints_len == 0 {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(ints, ints_len) }
+            };
+            if count == 0 {
+                return if data.is_empty() && ints.is_empty() {
+                    0
+                } else {
+                    DECLINE
+                };
+            }
+            let needed = count * words_per_record;
+            let mut words = Vec::with_capacity(needed);
+            if body(data, ints, &mut words).is_none() || words.len() != needed {
+                return DECLINE;
+            }
+            if out_cap < needed {
+                return -(needed as i64);
+            }
+            unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), out, needed) };
+            needed as i64
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    fn is_word(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || byte == b'_'
+    }
+
+    const ID_LEAD: u8 = 1;
+    const ID_DIGIT: u8 = 2;
+    const ID_COLON: u8 = 4;
+
+    /// Identifier byte classes: letters and `_` lead, digits follow, `:` only in metric names.
+    const ID_CLASS: [u8; 256] = {
+        let mut table = [0u8; 256];
+        let mut byte = 0;
+        while byte < 256 {
+            let b = byte as u8;
+            table[byte] = if b.is_ascii_alphabetic() || b == b'_' {
+                ID_LEAD
+            } else if b.is_ascii_digit() {
+                ID_DIGIT
+            } else if b == b':' {
+                ID_COLON
+            } else {
+                0
+            };
+            byte += 1;
+        }
+        table
+    };
+
+    /// `preg_match('/^[first][rest]*$/')` without `D`: `$` also matches before
+    /// one trailing newline. `colon` admits `:` anywhere (metric names).
+    fn matches_identifier(value: &[u8], colon: bool) -> bool {
+        let body = value.strip_suffix(b"\n").unwrap_or(value);
+        let Some((&first, rest)) = body.split_first() else {
+            return false;
+        };
+        let extra = if colon { ID_COLON } else { 0 };
+        ID_CLASS[usize::from(first)] & (ID_LEAD | extra) != 0
+            && rest
+                .iter()
+                .all(|&byte| ID_CLASS[usize::from(byte)] & (ID_LEAD | ID_DIGIT | extra) != 0)
+    }
+
+    /// Per SQL: `[rewritten, rewritten_len, xxh64(rewritten)]` for
+    /// `BoundedMetricQuery::rewriteSqlPhp()`. Declines when a MySQL `select`
+    /// is followed by a non-ASCII byte (PCRE `\b` depends on the locale).
+    fn bounded_rewrite(
+        count: usize,
+        is_maria: bool,
+        data: &[u8],
+        words: &mut Vec<i64>,
+    ) -> Option<()> {
+        let mut buffer = Vec::with_capacity(1024);
+        for sql in split_fields(data, count)? {
+            let select = sql.len() >= 6 && sql[..6].eq_ignore_ascii_case(b"select");
+            let (prefix, tail) = if is_maria {
+                (MARIA_PREFIX, sql)
+            } else if select && sql.get(6).is_some_and(|&byte| byte >= 0x80) {
+                return None;
+            } else if select && sql.get(6).is_none_or(|&byte| !is_word(byte)) {
+                (MYSQL_SELECT, &sql[6..])
+            } else {
+                words.extend([0, sql.len() as i64, xxh64(sql)]);
+                continue;
+            };
+            buffer.clear();
+            buffer.extend_from_slice(prefix);
+            buffer.extend_from_slice(tail);
+            words.extend([1, buffer.len() as i64, xxh64(&buffer)]);
+        }
+        Some(())
+    }
+
+    /// Per definition (columns: every name, every type, then every
+    /// definition's label names in order; label counts in `ints`):
+    /// `[status, type_code, label_count, first_invalid_label, xxh64(name),
+    /// xxh64(name{label,label})]`.
+    fn metric_definitions(
+        count: usize,
+        data: &[u8],
+        ints: &[u8],
+        words: &mut Vec<i64>,
+    ) -> Option<()> {
+        let label_counts = read_ints(ints, count)?;
+        let mut fields_total = count.checked_mul(2)?;
+        for &labels in &label_counts {
+            fields_total = fields_total.checked_add(usize::try_from(labels).ok()?)?;
+        }
+        if fields_total > MAX_INPUT {
+            return None;
+        }
+        let fields = split_fields(data, fields_total)?;
+        let (names, rest) = fields.split_at(count);
+        let (kinds, all_labels) = rest.split_at(count);
+        let mut schema = Vec::with_capacity(256);
+        let mut at = 0;
+        for ((&name, &kind), labels) in names.iter().zip(kinds).zip(label_counts) {
+            let labels = &all_labels[at..at + labels as usize];
+            at += labels.len();
+            let bad = labels
+                .iter()
+                .position(|label| !matches_identifier(label, false))
+                .map_or(-1, |index| index as i64);
+            let type_code = match kind {
+                b"gauge" => 0,
+                b"counter" => 1,
+                _ => -1,
+            };
+            let status = if !matches_identifier(name, true) {
+                1
+            } else if type_code < 0 {
+                2
+            } else if bad >= 0 {
+                3
+            } else {
+                0
+            };
+            schema.clear();
+            schema.extend_from_slice(name);
+            schema.push(b'{');
+            for (index, label) in labels.iter().enumerate() {
+                if index > 0 {
+                    schema.push(b',');
+                }
+                schema.extend_from_slice(label);
+            }
+            schema.push(b'}');
+            words.extend([
+                status,
+                type_code,
+                labels.len() as i64,
+                bad,
+                xxh64(name),
+                xxh64(&schema),
+            ]);
+        }
+        Some(())
+    }
+
+    /// Index of the `n`-th (0-based) non-continuation byte, or `body.len()`;
+    /// counts whole words while the target lies beyond them.
+    fn nth_char_start(body: &[u8], n: usize) -> usize {
+        let (mut seen, mut at) = (0usize, 0usize);
+        for word in body.as_chunks::<8>().0 {
+            let value = u64::from_le_bytes(*word);
+            let leads = 8 - (value & !(value << 1) & HIGH_BITS).count_ones() as usize;
+            if seen + leads > n {
+                break;
+            }
+            seen += leads;
+            at += 8;
+        }
+        for (index, &byte) in body[at..].iter().enumerate() {
+            if byte & 0xC0 != 0x80 {
+                if seen == n {
+                    return at + index;
+                }
+                seen += 1;
+            }
+        }
+        body.len()
+    }
+
+    /// Byte length of `mb_substr($body, 0, $max)` for UTF-8; `None` when an
+    /// invalid sequence falls inside the kept prefix (PHP substitutes `?`).
+    fn utf8_prefix_len(body: &[u8], max_chars: i64) -> Option<usize> {
+        if max_chars <= 0 {
+            return Some(0);
+        }
+        let max_chars = usize::try_from(max_chars).unwrap_or(usize::MAX);
+        let end = if body.len() <= max_chars {
+            body.len()
+        } else {
+            nth_char_start(body, max_chars)
+        };
+        if std::str::from_utf8(&body[..end]).is_ok() {
+            return Some(end);
+        }
+        let valid = match std::str::from_utf8(body) {
+            Ok(_) => body.len(),
+            Err(error) => error.valid_up_to(),
+        };
+        let kept = nth_char_start(&body[..valid], max_chars);
+        (kept < valid
+            || body[..valid]
+                .iter()
+                .filter(|&&byte| byte & 0xC0 != 0x80)
+                .count()
+                == max_chars)
+            .then_some(kept)
+    }
+
+    /// Per target (columns: every base URL, every job, every body; max chars
+    /// in `ints`): `[url_len, xxh64(url), truncated_len, xxh64(truncated)]`.
+    fn push_targets(count: usize, data: &[u8], ints: &[u8], words: &mut Vec<i64>) -> Option<()> {
+        let max_chars = read_ints(ints, count)?;
+        let fields = split_fields(data, count.checked_mul(3)?)?;
+        let (bases, rest) = fields.split_at(count);
+        let (jobs, bodies) = rest.split_at(count);
+        let mut url = Vec::with_capacity(256);
+        for (((&base, &job), &body), max) in bases.iter().zip(jobs).zip(bodies).zip(max_chars) {
+            url.clear();
+            url.extend_from_slice(base);
+            url.extend_from_slice(JOB_SEGMENT);
+            for &byte in job {
+                if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+                    url.push(byte);
+                } else {
+                    url.extend_from_slice(&[
+                        b'%',
+                        HEX_UPPER[usize::from(byte >> 4)],
+                        HEX_UPPER[usize::from(byte & 0x0F)],
+                    ]);
+                }
+            }
+            let kept = &body[..utf8_prefix_len(body, max)?];
+            words.extend([
+                url.len() as i64,
+                xxh64(&url),
+                kept.len() as i64,
+                xxh64(kept),
+            ]);
+        }
+        Some(())
+    }
+
+    fn all_digits(bytes: &[u8]) -> usize {
+        bytes
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count()
+    }
+
+    fn is_numeric_space(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C)
+    }
+
+    /// PHP `is_numeric($value) ? $value + 0 : null` as `[kind, payload]`:
+    /// kind 0 non-numeric, 1 int (payload value), 2 float (payload IEEE bits).
+    fn numeric_value(value: &[u8]) -> [i64; 2] {
+        let start = value
+            .iter()
+            .take_while(|&&byte| is_numeric_space(byte))
+            .count();
+        let mut end = value.len();
+        while end > start && is_numeric_space(value[end - 1]) {
+            end -= 1;
+        }
+        let token = &value[start..end];
+        let unsigned = match token.first() {
+            Some(b'-' | b'+') => &token[1..],
+            _ => token,
+        };
+        let int_digits = all_digits(unsigned);
+        let mut at = int_digits;
+        let mut is_float = false;
+        if unsigned.get(at) == Some(&b'.') {
+            let fraction = all_digits(&unsigned[at + 1..]);
+            if int_digits == 0 && fraction == 0 {
+                return [0, 0];
+            }
+            at += 1 + fraction;
+            is_float = true;
+        } else if int_digits == 0 {
+            return [0, 0];
+        }
+        if matches!(unsigned.get(at), Some(b'e' | b'E')) {
+            let sign = usize::from(matches!(unsigned.get(at + 1), Some(b'-' | b'+')));
+            let exponent = all_digits(&unsigned[(at + 1 + sign).min(unsigned.len())..]);
+            if exponent == 0 {
+                return [0, 0];
+            }
+            at += 1 + sign + exponent;
+            is_float = true;
+        }
+        if at != unsigned.len() {
+            return [0, 0];
+        }
+        if !is_float {
+            let negative = token[0] == b'-';
+            let digits = unsigned.trim_ascii_start();
+            let digits = &digits[digits.iter().take_while(|&&byte| byte == b'0').count()..];
+            if digits.len() <= 19 {
+                let magnitude = digits
+                    .iter()
+                    .fold(0u64, |acc, &byte| acc * 10 + u64::from(byte - b'0'));
+                if negative && magnitude <= 1u64 << 63 {
+                    return [1, (magnitude as i64).wrapping_neg()];
+                }
+                if !negative && magnitude <= i64::MAX as u64 {
+                    return [1, magnitude as i64];
+                }
+            }
+        }
+        let float = match fast_float(unsigned) {
+            Some(float) if token[0] == b'-' => -float,
+            Some(float) => float,
+            None => match std::str::from_utf8(token).map(str::parse::<f64>) {
+                Ok(Ok(float)) => float,
+                _ => return [0, 0],
+            },
+        };
+        [2, (float + 0.0).to_bits() as i64]
+    }
+
+    /// Exact powers of ten representable in an f64.
+    const POW10: [f64; 23] = [
+        1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16,
+        1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
+    ];
+
+    /// Clinger's fast path for a validated unsigned decimal: with at most 15
+    /// significant digits and a power of ten up to 1e22, one IEEE multiply or
+    /// divide is correctly rounded. `None` defers to the full parser.
+    fn fast_float(unsigned: &[u8]) -> Option<f64> {
+        let (mut mantissa, mut digits, mut scale) = (0u64, 0usize, 0i64);
+        let mut fraction = false;
+        let mut at = 0;
+        while let Some(&byte) = unsigned.get(at) {
+            match byte {
+                b'0'..=b'9' => {
+                    if mantissa != 0 || byte != b'0' {
+                        digits += 1;
+                        if digits > 15 {
+                            return None;
+                        }
+                    }
+                    mantissa = mantissa * 10 + u64::from(byte - b'0');
+                    scale -= i64::from(fraction);
+                }
+                b'.' => fraction = true,
+                _ => break,
+            }
+            at += 1;
+        }
+        if at < unsigned.len() {
+            let exponent = &unsigned[at + 1..];
+            let (negative, exponent) = match exponent.first() {
+                Some(b'-') => (true, &exponent[1..]),
+                Some(b'+') => (false, &exponent[1..]),
+                _ => (false, exponent),
+            };
+            if exponent.len() > 4 {
+                return None;
+            }
+            let value = exponent
+                .iter()
+                .fold(0i64, |acc, &byte| acc * 10 + i64::from(byte - b'0'));
+            scale += if negative { -value } else { value };
+        }
+        if mantissa == 0 {
+            return Some(0.0);
+        }
+        let power = *POW10.get(usize::try_from(scale.unsigned_abs()).ok()?)?;
+        let mantissa = mantissa as f64;
+        Some(if scale >= 0 {
+            mantissa * power
+        } else {
+            mantissa / power
+        })
+    }
+
+    /// Columnar output: every kind, then every payload.
+    fn numeric_values(count: usize, data: &[u8], words: &mut Vec<i64>) -> Option<()> {
+        words.resize(count.checked_mul(2)?, 0);
+        let (kinds, payloads) = words.split_at_mut(count);
+        let mut rest = data;
+        for (index, (kind, payload)) in kinds.iter_mut().zip(payloads).enumerate() {
+            let value = if index + 1 == count {
+                if find_nul(rest).is_some() {
+                    return None;
+                }
+                rest
+            } else {
+                let at = find_nul(rest)?;
+                let value = &rest[..at];
+                rest = &rest[at + 1..];
+                value
+            };
+            [*kind, *payload] = numeric_value(value);
+        }
+        Some(())
+    }
+
+    /// Whether any byte of `word` may need a JSON escape: a control byte,
+    /// `"`, `\\` or a non-ASCII byte. False positives only take the slow path.
+    fn json_word_needs_escape(word: u64) -> bool {
+        let quote = word ^ (LOW_BITS * u64::from(b'"'));
+        let backslash = word ^ (LOW_BITS * u64::from(b'\\'));
+        let control = word.wrapping_sub(LOW_BITS * 0x20) & !word;
+        let quote = quote.wrapping_sub(LOW_BITS) & !quote;
+        let backslash = backslash.wrapping_sub(LOW_BITS) & !backslash;
+        (control | quote | backslash | word) & HIGH_BITS != 0
+    }
+
+    /// `json_encode($string, JSON_UNESCAPED_SLASHES)` with its quotes.
+    fn json_string(out: &mut Vec<u8>, value: &str) {
+        let bytes = value.as_bytes();
+        out.reserve(bytes.len() + 2);
+        out.push(b'"');
+        let (mut start, mut at) = (0, 0);
+        while at < bytes.len() {
+            if at + 8 <= bytes.len() && !json_word_needs_escape(le64(&bytes[at..])) {
+                at += 8;
+                continue;
+            }
+            let byte = bytes[at];
+            if (0x20..0x80).contains(&byte) && byte != b'"' && byte != b'\\' {
+                at += 1;
+                continue;
+            }
+            out.extend_from_slice(&bytes[start..at]);
+            if byte < 0x80 {
+                match byte {
+                    b'"' => out.extend_from_slice(b"\\\""),
+                    b'\\' => out.extend_from_slice(b"\\\\"),
+                    0x08 => out.extend_from_slice(b"\\b"),
+                    0x0C => out.extend_from_slice(b"\\f"),
+                    b'\n' => out.extend_from_slice(b"\\n"),
+                    b'\r' => out.extend_from_slice(b"\\r"),
+                    b'\t' => out.extend_from_slice(b"\\t"),
+                    _ => out.extend_from_slice(&[
+                        b'\\',
+                        b'u',
+                        b'0',
+                        b'0',
+                        HEX_LOWER[usize::from(byte >> 4)],
+                        HEX_LOWER[usize::from(byte & 0x0F)],
+                    ]),
+                }
+                at += 1;
+            } else {
+                let ch = value[at..].chars().next().unwrap_or('\u{fffd}');
+                let mut units = [0u16; 2];
+                for &unit in ch.encode_utf16(&mut units).iter() {
+                    out.extend_from_slice(&[
+                        b'\\',
+                        b'u',
+                        HEX_LOWER[usize::from(unit >> 12)],
+                        HEX_LOWER[usize::from((unit >> 8) & 0x0F)],
+                        HEX_LOWER[usize::from((unit >> 4) & 0x0F)],
+                        HEX_LOWER[usize::from(unit & 0x0F)],
+                    ]);
+                }
+                at += ch.len_utf8();
+            }
+            start = at;
+        }
+        out.extend_from_slice(&bytes[start..]);
+        out.push(b'"');
+    }
+
+    fn json_int(out: &mut Vec<u8>, value: i64) {
+        let mut digits = [0u8; 20];
+        let mut at = digits.len();
+        let mut magnitude = value.unsigned_abs();
+        loop {
+            at -= 1;
+            digits[at] = b'0' + (magnitude % 10) as u8;
+            magnitude /= 10;
+            if magnitude == 0 {
+                break;
+            }
+        }
+        if value < 0 {
+            out.push(b'-');
+        }
+        out.extend_from_slice(&digits[at..]);
+    }
+
+    /// base64url digit pairs for every 12-bit group.
+    const B64URL_PAIRS: [[u8; 2]; 4096] = {
+        let mut table = [[0u8; 2]; 4096];
+        let mut index = 0;
+        while index < 4096 {
+            table[index] = [B64URL[index >> 6], B64URL[index & 0x3F]];
+            index += 1;
+        }
+        table
+    };
+
+    /// Appends base64url (no padding) of `input`.
+    fn base64url(out: &mut Vec<u8>, input: &[u8]) {
+        let (chunks, tail) = input.as_chunks::<3>();
+        let start = out.len();
+        out.resize(start + chunks.len() * 4, 0);
+        for (quad, &[a, b, c]) in out[start..].as_chunks_mut::<4>().0.iter_mut().zip(chunks) {
+            let word = (u32::from(a) << 16 | u32::from(b) << 8 | u32::from(c)) as usize;
+            let [first, second] = B64URL_PAIRS[word >> 12];
+            let [third, fourth] = B64URL_PAIRS[word & 0xFFF];
+            *quad = [first, second, third, fourth];
+        }
+        match *tail {
+            [a] => out.extend_from_slice(&[
+                B64URL[usize::from(a >> 2)],
+                B64URL[usize::from((a & 0x03) << 4)],
+            ]),
+            [a, b] => {
+                let word = u16::from(a) << 8 | u16::from(b);
+                out.extend_from_slice(&[
+                    B64URL[usize::from(word >> 10)],
+                    B64URL[usize::from((word >> 4) & 0x3F)],
+                    B64URL[usize::from((word << 2) & 0x3F)],
+                ]);
+            }
+            _ => {}
+        }
+    }
+
+    /// Per token (columns: every username, email, role, issuer, audience and
+    /// jti; `ints` every issued-at then every expiry): `[status, claims_len,
+    /// signing_input_len, xxh64(signing_input)]`; status -1 (other words 0)
+    /// when a claim is not valid UTF-8. Declines when `now - 30` would leave
+    /// the integer range.
+    fn jwt_signing(count: usize, data: &[u8], ints: &[u8], words: &mut Vec<i64>) -> Option<()> {
+        let times = read_ints(ints, count.checked_mul(2)?)?;
+        let fields = split_fields(data, count.checked_mul(6)?)?;
+        let (nows, expiries) = times.split_at(count);
+        let mut claims = Vec::with_capacity(512);
+        let mut signing = Vec::with_capacity(1024);
+        for (index, (&now, &expires_at)) in nows.iter().zip(expiries).enumerate() {
+            let nbf = now.checked_sub(30)?;
+            let mut strings = [""; 6];
+            let mut valid = true;
+            for (column, slot) in strings.iter_mut().enumerate() {
+                match std::str::from_utf8(fields[column * count + index]) {
+                    Ok(text) => *slot = text,
+                    Err(_) => valid = false,
+                }
+            }
+            if !valid {
+                words.extend([-1, 0, 0, 0]);
+                continue;
+            }
+            let [username, email, role, issuer, audience, jti] = strings;
+            claims.clear();
+            claims.extend_from_slice(b"{\"sub\":");
+            json_string(&mut claims, username);
+            let escaped_username = 7..claims.len();
+            claims.extend_from_slice(b",\"email\":");
+            json_string(&mut claims, email);
+            claims.extend_from_slice(b",\"name\":");
+            claims.extend_from_within(escaped_username);
+            for (key, value) in [
+                (",\"role\":", role),
+                (",\"iss\":", issuer),
+                (",\"aud\":", audience),
+            ] {
+                claims.extend_from_slice(key.as_bytes());
+                json_string(&mut claims, value);
+            }
+            for (key, value) in [
+                (",\"iat\":", now),
+                (",\"nbf\":", nbf),
+                (",\"exp\":", expires_at),
+            ] {
+                claims.extend_from_slice(key.as_bytes());
+                json_int(&mut claims, value);
+            }
+            claims.extend_from_slice(b",\"jti\":");
+            json_string(&mut claims, jti);
+            claims.push(b'}');
+
+            signing.clear();
+            signing.extend_from_slice(JWT_HEADER);
+            signing.push(b'.');
+            base64url(&mut signing, &claims);
+            words.extend([
+                0,
+                claims.len() as i64,
+                signing.len() as i64,
+                xxh64(&signing),
+            ]);
+        }
+        Some(())
+    }
+
+    /// `BoundedMetricQuery::rewritePlanBatch()`: `flags` is 1 for MariaDB, 0
+    /// for MySQL; `data` holds `count` SQL strings; 3 words per SQL.
+    ///
+    /// # Safety
+    /// Non-null pointers must refer to readable allocations of `data_len` and
+    /// `ints_len` bytes and a writable, aligned allocation of `out_cap` i64
+    /// words. Null pointers require zero length/capacity. Inputs and output
+    /// must not overlap.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w49_bounded_metric_query_rewrite_plan(
+        count: usize,
+        flags: i64,
+        data: *const u8,
+        data_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> i64 {
+        unsafe {
+            run(
+                count,
+                data,
+                data_len,
+                ints,
+                ints_len,
+                out,
+                out_cap,
+                3,
+                |data, ints, words| {
+                    if !ints.is_empty() || !matches!(flags, 0 | 1) {
+                        return None;
+                    }
+                    bounded_rewrite(count, flags == 1, data, words)
+                },
+            )
+        }
+    }
+
+    /// `MetricFamily::definitionCheckBatch()`: `data` holds each definition's
+    /// name, type and label names; `ints` one label count per definition;
+    /// 6 words per definition. `flags` must be 0.
+    ///
+    /// # Safety
+    /// As for [`nntmux_w49_bounded_metric_query_rewrite_plan`].
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w49_metric_family_definition_check(
+        count: usize,
+        flags: i64,
+        data: *const u8,
+        data_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> i64 {
+        unsafe {
+            run(
+                count,
+                data,
+                data_len,
+                ints,
+                ints_len,
+                out,
+                out_cap,
+                6,
+                |data, ints, words| {
+                    if flags != 0 {
+                        return None;
+                    }
+                    metric_definitions(count, data, ints, words)
+                },
+            )
+        }
+    }
+
+    /// `PrometheusMetricsExporter::pushTargetBatch()`: `data` holds each
+    /// target's base URL, job and error body; `ints` one max char count per
+    /// target; 4 words per target. `flags` must be 0.
+    ///
+    /// # Safety
+    /// As for [`nntmux_w49_bounded_metric_query_rewrite_plan`].
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w49_prometheus_exporter_push_target(
+        count: usize,
+        flags: i64,
+        data: *const u8,
+        data_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> i64 {
+        unsafe {
+            run(
+                count,
+                data,
+                data_len,
+                ints,
+                ints_len,
+                out,
+                out_cap,
+                4,
+                |data, ints, words| {
+                    if flags != 0 {
+                        return None;
+                    }
+                    push_targets(count, data, ints, words)
+                },
+            )
+        }
+    }
+
+    /// `TmuxMetricsSnapshot::numericValueBatch()`: `data` holds `count`
+    /// values; 2 words per value (all kinds, then all payloads). `flags` must be 0 and `ints` empty.
+    ///
+    /// # Safety
+    /// As for [`nntmux_w49_bounded_metric_query_rewrite_plan`].
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w49_tmux_metrics_snapshot_numeric(
+        count: usize,
+        flags: i64,
+        data: *const u8,
+        data_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> i64 {
+        unsafe {
+            run(
+                count,
+                data,
+                data_len,
+                ints,
+                ints_len,
+                out,
+                out_cap,
+                2,
+                |data, ints, words| {
+                    if flags != 0 || !ints.is_empty() {
+                        return None;
+                    }
+                    numeric_values(count, data, words)
+                },
+            )
+        }
+    }
+
+    /// `GrafanaJwtIssuer::signingDigestBatch()`: `data` holds each token's
+    /// username, email, role, issuer, audience and jti; `ints` each token's
+    /// issued-at and expiry timestamps; 4 words per token. `flags` must be 0.
+    ///
+    /// # Safety
+    /// As for [`nntmux_w49_bounded_metric_query_rewrite_plan`].
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w49_grafana_jwt_signing_digest(
+        count: usize,
+        flags: i64,
+        data: *const u8,
+        data_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> i64 {
+        unsafe {
+            run(
+                count,
+                data,
+                data_len,
+                ints,
+                ints_len,
+                out,
+                out_cap,
+                4,
+                |data, ints, words| {
+                    if flags != 0 {
+                        return None;
+                    }
+                    jwt_signing(count, data, ints, words)
+                },
+            )
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        type Entry = unsafe extern "C" fn(
+            usize,
+            i64,
+            *const u8,
+            usize,
+            *const u8,
+            usize,
+            *mut i64,
+            usize,
+        ) -> i64;
+
+        fn ints(values: &[i64]) -> Vec<u8> {
+            values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect()
+        }
+
+        fn call(
+            entry: Entry,
+            count: usize,
+            flags: i64,
+            data: &[u8],
+            table: &[i64],
+        ) -> Result<Vec<i64>, i64> {
+            let table = ints(table);
+            let mut out = vec![0i64; 4096];
+            let written = unsafe {
+                entry(
+                    count,
+                    flags,
+                    data.as_ptr(),
+                    data.len(),
+                    table.as_ptr(),
+                    table.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            if written < 0 {
+                return Err(written);
+            }
+            out.truncate(written as usize);
+            Ok(out)
+        }
+
+        fn b64url(input: &[u8]) -> Vec<u8> {
+            let mut out = Vec::new();
+            for chunk in input.chunks(3) {
+                let mut word = 0u32;
+                for (index, &byte) in chunk.iter().enumerate() {
+                    word |= u32::from(byte) << (16 - 8 * index);
+                }
+                for index in 0..=chunk.len() {
+                    out.push(B64URL[(word >> (18 - 6 * index)) as usize & 0x3F]);
+                }
+            }
+            out
+        }
+
+        #[test]
+        fn w49_xxh64_matches_reference_vectors() {
+            assert_eq!(xxh64(b"") as u64, 0xEF46_DB37_51D8_E999);
+            assert_eq!(xxh64(b"a") as u64, 0xD24E_C4F1_A98C_6E5B);
+            assert_eq!(xxh64(b"abc") as u64, 0x44BC_2CF5_AD77_0999);
+            assert_eq!(
+                xxh64(b"Nobody inspects the spammish repetition") as u64,
+                0xFBCE_A83C_8A37_8BF1
+            );
+        }
+
+        #[test]
+        fn w49_bounded_rewrite_matches_php_rules() {
+            let entry: Entry = nntmux_w49_bounded_metric_query_rewrite_plan;
+            let maria = call(entry, 2, 1, b"select 1\0", &[]).unwrap();
+            assert_eq!(
+                &maria[..3],
+                &[
+                    1,
+                    47,
+                    xxh64(b"SET STATEMENT max_statement_time=2 FOR select 1")
+                ]
+            );
+            assert_eq!(&maria[3..], &[1, 39, xxh64(MARIA_PREFIX)]);
+            let mysql = call(
+                entry,
+                5,
+                0,
+                b"SELECT count(*) from t\0selected\0select\0 select 1\0select_x",
+                &[],
+            )
+            .unwrap();
+            let rewritten = b"select /*+ MAX_EXECUTION_TIME(2000) */ count(*) from t";
+            assert_eq!(&mysql[..3], &[1, rewritten.len() as i64, xxh64(rewritten)]);
+            assert_eq!(&mysql[3..6], &[0, 8, xxh64(b"selected")]);
+            assert_eq!(
+                &mysql[6..9],
+                &[1, MYSQL_SELECT.len() as i64, xxh64(MYSQL_SELECT)]
+            );
+            assert_eq!(&mysql[9..12], &[0, 9, xxh64(b" select 1")]);
+            assert_eq!(&mysql[12..], &[0, 8, xxh64(b"select_x")]);
+            assert_eq!(call(entry, 1, 0, b"select\xc3\xa9", &[]), Err(DECLINE));
+            assert_eq!(call(entry, 1, 1, b"select\xc3\xa9", &[]).unwrap()[0], 1);
+            assert_eq!(call(entry, 1, 2, b"x", &[]), Err(DECLINE));
+            assert_eq!(call(entry, 1, 0, b"x", &[1]), Err(DECLINE));
+        }
+
+        #[test]
+        fn w49_metric_definitions_follow_regex_and_type_rules() {
+            let entry: Entry = nntmux_w49_metric_family_definition_check;
+            let data = b"nntmux_up\0a:b\x009x\0x\0y\n\0gauge\0counter\0gauge\0summary\0gauge\0job\0queue\0bad-label\0_ok\0z\n";
+            let words = call(entry, 5, 0, data, &[2, 2, 0, 0, 1]).unwrap();
+            let rows: Vec<&[i64]> = words.chunks(6).collect();
+            assert_eq!(
+                rows[0],
+                &[
+                    0,
+                    0,
+                    2,
+                    -1,
+                    xxh64(b"nntmux_up"),
+                    xxh64(b"nntmux_up{job,queue}")
+                ]
+            );
+            assert_eq!(
+                rows[1],
+                &[3, 1, 2, 0, xxh64(b"a:b"), xxh64(b"a:b{bad-label,_ok}")]
+            );
+            assert_eq!(rows[2], &[1, 0, 0, -1, xxh64(b"9x"), xxh64(b"9x{}")]);
+            assert_eq!(rows[3], &[2, -1, 0, -1, xxh64(b"x"), xxh64(b"x{}")]);
+            assert_eq!(rows[4], &[0, 0, 1, -1, xxh64(b"y\n"), xxh64(b"y\n{z\n}")]);
+            assert!(matches_identifier(b":a9", true));
+            assert!(!matches_identifier(b":a9", false));
+            assert!(!matches_identifier(b"9a", true));
+            assert!(!matches_identifier(b"\xc3\xa9", true));
+            assert!(!matches_identifier(b"", true));
+            assert!(!matches_identifier(b"\n", true));
+            assert!(!matches_identifier(b"a\n\n", true));
+            assert!(!matches_identifier(b"a:", false));
+            assert_eq!(call(entry, 1, 0, b"x\0gauge", &[1]), Err(DECLINE));
+            assert_eq!(call(entry, 1, 0, b"x\0gauge", &[-1]), Err(DECLINE));
+            assert_eq!(call(entry, 1, 0, b"x\0gauge", &[]), Err(DECLINE));
+        }
+
+        #[test]
+        fn w49_push_targets_encode_and_truncate() {
+            let entry: Entry = nntmux_w49_prometheus_exporter_push_target;
+            let data = b"http://pg:9091\0b\0\0nntmux app/\xc3\xa9\0j\0\0h\xc3\xa9llo w\xc3\xb6rld\0abc\xff\0\xff";
+            let words = call(entry, 3, 0, data, &[3, 3, 0]).unwrap();
+            let url = b"http://pg:9091/metrics/job/nntmux%20app%2F%C3%A9";
+            assert_eq!(
+                &words[..4],
+                &[url.len() as i64, xxh64(url), 4, xxh64("hél".as_bytes())]
+            );
+            assert_eq!(
+                &words[4..8],
+                &[15, xxh64(b"b/metrics/job/j"), 3, xxh64(b"abc")]
+            );
+            assert_eq!(&words[8..], &[13, xxh64(JOB_SEGMENT), 0, xxh64(b"")]);
+            assert_eq!(call(entry, 1, 0, b"b\0j\0a\xff", &[2]), Err(DECLINE));
+            assert_eq!(utf8_prefix_len("é".as_bytes(), i64::MAX), Some(2));
+            let long = "aé€😀".repeat(9);
+            for max in 0..=36 {
+                let expected: usize = long.chars().take(max).map(char::len_utf8).sum();
+                assert_eq!(
+                    utf8_prefix_len(long.as_bytes(), max as i64),
+                    Some(expected),
+                    "{max}"
+                );
+                let mut broken = long.as_bytes()[..expected].to_vec();
+                broken.extend_from_slice(b"\xff\xfeabcdefgh");
+                assert_eq!(
+                    utf8_prefix_len(&broken, max as i64),
+                    Some(expected),
+                    "{max}"
+                );
+                assert_eq!(utf8_prefix_len(&broken, max as i64 + 1), None, "{max}");
+            }
+            assert_eq!(utf8_prefix_len(b"abc", 1), Some(1));
+        }
+
+        #[test]
+        fn w49_numeric_values_follow_is_numeric() {
+            let float = |value: f64| [2, value.to_bits() as i64];
+            let cases: &[(&[u8], [i64; 2])] = &[
+                (b"42", [1, 42]),
+                (b" \t\n\r\x0b\x0c-17 \n", [1, -17]),
+                (b"+5", [1, 5]),
+                (b"-0", [1, 0]),
+                (b"0007", [1, 7]),
+                (b"9223372036854775807", [1, i64::MAX]),
+                (b"-9223372036854775808", [1, i64::MIN]),
+                (b"9223372036854775808", float(9_223_372_036_854_775_808.0)),
+                (b"000000000000000000000000001", [1, 1]),
+                (b"1.5", float(1.5)),
+                (b"-0.0", float(0.0)),
+                (b".5", float(0.5)),
+                (b"5.", float(5.0)),
+                (b"1e3", float(1000.0)),
+                (b"1.E-2", float(0.01)),
+                (b"1e999", float(f64::INFINITY)),
+                (b"0.1", float(0.1)),
+                (b"-123.456e-7", float(-123.456e-7)),
+                (b"999999999999999.9", float(999_999_999_999_999.9)),
+                (b"1e22", float(1e22)),
+                (b"1e23", float(1e23)),
+                (b"0e99999", float(0.0)),
+                (b"123456789012345678.5", float(123_456_789_012_345_678.5)),
+                (b"", [0, 0]),
+                (b" ", [0, 0]),
+                (b".", [0, 0]),
+                (b"-", [0, 0]),
+                (b"1e", [0, 0]),
+                (b"1e+", [0, 0]),
+                (b"0x1A", [0, 0]),
+                (b"1 2", [0, 0]),
+                (b"--1", [0, 0]),
+                (b"inf", [0, 0]),
+                (b"1_000", [0, 0]),
+                (b"\xc2\xa01", [0, 0]),
+            ];
+            for (value, expected) in cases {
+                assert_eq!(
+                    numeric_value(value),
+                    *expected,
+                    "{:?}",
+                    String::from_utf8_lossy(value)
+                );
+            }
+            let entry: Entry = nntmux_w49_tmux_metrics_snapshot_numeric;
+            assert_eq!(
+                call(entry, 3, 0, b"1\0x\0 2.5", &[]).unwrap(),
+                vec![1, 0, 2, 1, 0, 2.5f64.to_bits() as i64]
+            );
+            assert_eq!(call(entry, 1, 0, b"", &[]).unwrap(), vec![0, 0]);
+            assert_eq!(call(entry, 2, 0, b"1", &[]), Err(DECLINE));
+            assert_eq!(call(entry, 1, 0, b"1\0", &[]), Err(DECLINE));
+        }
+
+        #[test]
+        fn w49_json_string_fast_path_matches_per_byte_escape() {
+            let mut state = 0x1234_5678_9ABC_DEF1u64;
+            let pieces = [
+                "a", "Z", "/", "\"", "\\", "\n", "\t", "\u{1}", "\u{1f}", "\u{7f}", "é", "€", "😀",
+                " ", "~",
+            ];
+            for _ in 0..5000 {
+                let mut value = String::new();
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                for step in 0..(state % 40) {
+                    value.push_str(
+                        pieces[((state >> (step % 50)) as usize + step as usize) % pieces.len()],
+                    );
+                }
+                let mut fast = Vec::new();
+                json_string(&mut fast, &value);
+                let mut slow = vec![b'"'];
+                for ch in value.chars() {
+                    match ch {
+                        '"' => slow.extend_from_slice(b"\\\""),
+                        '\\' => slow.extend_from_slice(b"\\\\"),
+                        '\n' => slow.extend_from_slice(b"\\n"),
+                        '\t' => slow.extend_from_slice(b"\\t"),
+                        '\u{20}'..='\u{7f}' => slow.push(ch as u8),
+                        _ => {
+                            let mut units = [0u16; 2];
+                            for unit in ch.encode_utf16(&mut units) {
+                                slow.extend_from_slice(format!("\\u{unit:04x}").as_bytes());
+                            }
+                        }
+                    }
+                }
+                slow.push(b'"');
+                assert_eq!(fast, slow, "{value:?}");
+            }
+        }
+
+        #[test]
+        fn w49_jwt_signing_input_matches_reference() {
+            let entry: Entry = nntmux_w49_grafana_jwt_signing_digest;
+            let data = "al/ice\0a\"b\\c@x\0Viewer\0https://nntmux.test\0grafana\0\u{1}é😀\x7f";
+            let words = call(
+                entry,
+                1,
+                0,
+                data.as_bytes(),
+                &[1_761_393_600, 1_761_394_500],
+            )
+            .unwrap();
+            let claims = "{\"sub\":\"al/ice\",\"email\":\"a\\\"b\\\\c@x\",\"name\":\"al/ice\",\"role\":\"Viewer\",\"iss\":\"https://nntmux.test\",\"aud\":\"grafana\",\"iat\":1761393600,\"nbf\":1761393570,\"exp\":1761394500,\"jti\":\"\\u0001\\u00e9\\ud83d\\ude00\x7f\"}";
+            let mut signing = JWT_HEADER.to_vec();
+            signing.push(b'.');
+            signing.extend(b64url(claims.as_bytes()));
+            assert_eq!(b64url(br#"{"alg":"RS256","typ":"JWT"}"#), JWT_HEADER);
+            assert_eq!(
+                words,
+                vec![
+                    0,
+                    claims.len() as i64,
+                    signing.len() as i64,
+                    xxh64(&signing)
+                ]
+            );
+            for len in 0..8 {
+                let input: Vec<u8> = (0..len).map(|index| (index * 37 + 250) as u8).collect();
+                let mut encoded = Vec::new();
+                base64url(&mut encoded, &input);
+                assert_eq!(encoded, b64url(&input));
+            }
+            let mut text = Vec::new();
+            json_int(&mut text, i64::MIN);
+            assert_eq!(text, b"-9223372036854775808");
+            let invalid = call(entry, 1, 0, b"\xff\0\0\0\0\0", &[0, 0]).unwrap();
+            assert_eq!(invalid, vec![-1, 0, 0, 0]);
+            assert_eq!(
+                call(entry, 1, 0, b"\0\0\0\0\0", &[i64::MIN + 29, 0]),
+                Err(DECLINE)
+            );
+            assert_eq!(call(entry, 1, 0, b"\0\0\0\0\0", &[0]), Err(DECLINE));
+        }
+
+        #[test]
+        fn w49_abi_guards_pointers_capacity_and_overlap() {
+            let entries: [(Entry, &[u8], &[i64]); 5] = [
+                (
+                    nntmux_w49_bounded_metric_query_rewrite_plan,
+                    b"select 1",
+                    &[],
+                ),
+                (nntmux_w49_metric_family_definition_check, b"a\0gauge", &[0]),
+                (
+                    nntmux_w49_prometheus_exporter_push_target,
+                    b"b\0j\0body",
+                    &[4],
+                ),
+                (nntmux_w49_tmux_metrics_snapshot_numeric, b"1", &[]),
+                (
+                    nntmux_w49_grafana_jwt_signing_digest,
+                    b"u\0e\0r\0i\0a\0j",
+                    &[1, 2],
+                ),
+            ];
+            for (entry, data, table) in entries {
+                let table = ints(table);
+                let full = call(entry, 1, 0, data, &ints_back(&table)).unwrap();
+                let mut small = vec![7i64; 1];
+                let needed = unsafe {
+                    entry(
+                        1,
+                        0,
+                        data.as_ptr(),
+                        data.len(),
+                        table.as_ptr(),
+                        table.len(),
+                        small.as_mut_ptr(),
+                        1,
+                    )
+                };
+                assert_eq!(needed, -(full.len() as i64));
+                assert_eq!(small, vec![7]);
+                let probe = unsafe {
+                    entry(
+                        1,
+                        0,
+                        data.as_ptr(),
+                        data.len(),
+                        table.as_ptr(),
+                        table.len(),
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                };
+                assert_eq!(probe, needed);
+                assert_eq!(
+                    unsafe {
+                        entry(
+                            1,
+                            0,
+                            data.as_ptr(),
+                            data.len(),
+                            table.as_ptr(),
+                            table.len(),
+                            std::ptr::null_mut(),
+                            4,
+                        )
+                    },
+                    DECLINE
+                );
+                assert_eq!(
+                    unsafe {
+                        entry(
+                            1,
+                            0,
+                            std::ptr::null(),
+                            4,
+                            table.as_ptr(),
+                            table.len(),
+                            small.as_mut_ptr(),
+                            1,
+                        )
+                    },
+                    DECLINE
+                );
+                assert_eq!(
+                    unsafe {
+                        entry(
+                            1,
+                            0,
+                            data.as_ptr(),
+                            data.len(),
+                            std::ptr::null(),
+                            8,
+                            small.as_mut_ptr(),
+                            1,
+                        )
+                    },
+                    DECLINE
+                );
+                assert_eq!(
+                    unsafe {
+                        entry(
+                            0,
+                            0,
+                            std::ptr::null(),
+                            0,
+                            std::ptr::null(),
+                            0,
+                            std::ptr::null_mut(),
+                            0,
+                        )
+                    },
+                    0
+                );
+                assert_eq!(
+                    unsafe {
+                        entry(
+                            0,
+                            0,
+                            data.as_ptr(),
+                            data.len(),
+                            std::ptr::null(),
+                            0,
+                            std::ptr::null_mut(),
+                            0,
+                        )
+                    },
+                    DECLINE
+                );
+                assert_eq!(
+                    unsafe {
+                        entry(
+                            MAX_RECORDS + 1,
+                            0,
+                            data.as_ptr(),
+                            data.len(),
+                            table.as_ptr(),
+                            table.len(),
+                            small.as_mut_ptr(),
+                            1,
+                        )
+                    },
+                    DECLINE
+                );
+                let mut shared = vec![0i64; 64];
+                shared[0] = i64::from_le_bytes(*b"1\0\0\0\0\0\0\0");
+                let pointer = shared.as_mut_ptr();
+                assert_eq!(
+                    unsafe { entry(1, 0, pointer.cast(), 1, std::ptr::null(), 0, pointer, 64) },
+                    DECLINE
+                );
+                let mut bytes = vec![0u8; 80];
+                let unaligned = unsafe { bytes.as_mut_ptr().add(1) }.cast::<i64>();
+                assert_eq!(
+                    unsafe {
+                        entry(
+                            1,
+                            0,
+                            data.as_ptr(),
+                            data.len(),
+                            table.as_ptr(),
+                            table.len(),
+                            unaligned,
+                            8,
+                        )
+                    },
+                    DECLINE
+                );
+            }
+        }
+
+        fn ints_back(bytes: &[u8]) -> Vec<i64> {
+            bytes
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|chunk| i64::from_le_bytes(*chunk))
+                .collect()
+        }
+
+        #[test]
+        fn w49_random_numeric_values_agree_with_reference_parse() {
+            let mut state = 0x9E37_79B9_7F4A_7C15u64;
+            let mut next = |bound: usize| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state % bound as u64) as usize
+            };
+            let alphabet = b"0123456789.eE+- x";
+            for _ in 0..20_000 {
+                let value: Vec<u8> = (0..next(12))
+                    .map(|_| alphabet[next(alphabet.len())])
+                    .collect();
+                let [kind, payload] = numeric_value(&value);
+                let text = std::str::from_utf8(&value).unwrap().trim_matches(' ');
+                match kind {
+                    0 => {}
+                    1 => assert_eq!(
+                        text.trim_start_matches('+').parse::<i64>().ok(),
+                        Some(payload),
+                        "{text:?}"
+                    ),
+                    _ => assert_eq!(
+                        (text.parse::<f64>().unwrap() + 0.0).to_bits() as i64,
+                        payload,
+                        "{text:?}"
+                    ),
+                }
+            }
+        }
+    }
+}
