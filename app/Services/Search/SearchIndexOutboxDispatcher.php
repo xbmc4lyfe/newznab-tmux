@@ -9,6 +9,7 @@ use App\Facades\Search;
 use App\Services\Search\Support\ElasticsearchResponseHelper;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\Log;
 use JsonException;
 use stdClass;
@@ -694,5 +695,189 @@ final class SearchIndexOutboxDispatcher
             'entity_type' => $entityType,
             'entity_id' => $entityId,
         ]);
+    }
+
+    public const string W51_FFI_CDEF = 'int64_t nntmux_w515_outbox_route(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W51.5 parity test's QUALIFICATION). */
+    private const bool W51_RUST_FFI_DEFAULT = true;
+
+    private static ?bool $w51RustFfi = null;
+
+    private static FFI|false|null $w51Ffi = null;
+
+    private static ?CData $w51Out = null;
+
+    private static int $w51OutCap = 0;
+
+    public static function usesW51RustFfi(): bool
+    {
+        return self::$w51RustFfi ?? self::W51_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with routeOutboxBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW51RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$w51RustFfi;
+        self::$w51RustFfi = $enabled;
+
+        try {
+            return $callback();
+        } finally {
+            self::$w51RustFfi = $previous;
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 51.5 Rust helper, or null to fall back to PHP. The helper
+     * leads with the number of rows PHP must compute, returned in $patches.
+     *
+     * @return list<int>|null
+     */
+    private static function w51Words(int $count, string $data, string $ints, int $words, ?int &$patches = null): ?array
+    {
+        if (self::$w51Ffi === null) {
+            $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+            self::$w51Ffi = RustPipelineLibrary::resolveDomain('search_w51', self::W51_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+            self::$w51Out = null;
+            self::$w51OutCap = 0;
+        }
+        $ffi = self::$w51Ffi;
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+
+        try {
+            if (self::$w51Out === null || $words >= self::$w51OutCap) {
+                $cap = max(1024, $words + 1);
+                self::$w51Out = $ffi->new('int64_t['.$cap.']');
+                self::$w51OutCap = $cap;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w515_outbox_route($count, 0, $data, \strlen($data), $ints, \strlen($ints), self::$w51Out, self::$w51OutCap);
+            if ($written !== $words + 1) {
+                return null;
+            }
+            $patches = self::$w51Out[0];
+            /** @var array<int, int>|false $values */
+            $values = unpack('P*', FFI::string(self::$w51Out, $written * 8), 8);
+
+            return \is_array($values) ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** PHP `hash('xxh64')` of $value read as a signed big-endian word, as the Rust helper reports it. */
+    private static function w51Digest(string $value): int
+    {
+        /** @var array{1: int} $unpacked */
+        $unpacked = unpack('J', hash('xxh64', $value, true));
+
+        return $unpacked[1];
+    }
+
+    /** `SecondarySearchIndex` ordinals reported by routeOutboxBatch(). */
+    private const array W51_SECONDARY_ORDINALS = ['music' => 1, 'books' => 2, 'games' => 3, 'console' => 4, 'steam' => 5, 'anime' => 6];
+
+    /**
+     * Batch routing of outbox rows without payloads, with the rules of normalizeActionPhp(),
+     * normalizeEntityTypePhp() and documentKeyPhp(). Five words per row: `[action (0 insert, 1 upsert,
+     * 2 update, 3 delete, 4 other) | type class (0 release, 1 predb, 2 movie, 3 tvshow, 4 secondary,
+     * 5 secondary index alias, 6 other) << 3 | SecondarySearchIndex ordinal (1-6, 0 none) << 6, document key
+     * length, xxh64(document key), normalized action length, xxh64(normalized action)]`.
+     *
+     * @param  list<string>  $types
+     * @param  list<string>  $actions
+     * @param  list<int>  $entityIds
+     * @return list<int>
+     */
+    public static function routeOutboxBatch(array $types, array $actions, array $entityIds): array
+    {
+        return self::usesW51RustFfi() ? self::routeOutboxBatchNative($types, $actions, $entityIds) : self::routeOutboxBatchPhp($types, $actions, $entityIds);
+    }
+
+    /**
+     * @param  list<string>  $types
+     * @param  list<string>  $actions
+     * @param  list<int>  $entityIds
+     * @return list<int>
+     */
+    public static function routeOutboxBatchPhp(array $types, array $actions, array $entityIds): array
+    {
+        $out = [];
+        foreach ($types as $i => $type) {
+            $action = self::normalizeActionPhp($actions[$i]);
+            $type = self::normalizeEntityTypePhp($type);
+            $index = self::secondaryIndexFromEntityType($type);
+            $key = $index !== null ? 'secondary:'.$index->value.':'.$entityIds[$i] : $type.':'.$entityIds[$i];
+            $code = match ($action) {
+                'insert' => 0,
+                'upsert' => 1,
+                'update' => 2,
+                'delete' => 3,
+                default => 4,
+            };
+            $class = match ($type) {
+                'release' => 0,
+                'predb' => 1,
+                'movie' => 2,
+                'tvshow' => 3,
+                'secondary' => 4,
+                default => $index !== null ? 5 : 6,
+            };
+            $ordinal = $index !== null ? self::W51_SECONDARY_ORDINALS[$index->value] : 0;
+            array_push($out, $code | $class << 3 | $ordinal << 6, \strlen($key), self::w51Digest($key), \strlen($action), self::w51Digest($action));
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, the columns differ in length or a value
+     * holds a NUL byte, and computes rows with non-ASCII entity types with PHP.
+     *
+     * @param  list<string>  $types
+     * @param  list<string>  $actions
+     * @param  list<int>  $entityIds
+     * @return list<int>
+     */
+    public static function routeOutboxBatchNative(array $types, array $actions, array $entityIds): array
+    {
+        $count = \count($types);
+        if ($count === 0 || \count($actions) !== $count || \count($entityIds) !== $count || ! array_is_list($types) || ! array_is_list($actions)) {
+            return self::routeOutboxBatchPhp($types, $actions, $entityIds);
+        }
+        $words = self::w51Words($count, implode("\0", $types)."\0".implode("\0", $actions), pack('P*', ...$entityIds), 5 * $count, $patches);
+        if ($words === null) {
+            return self::routeOutboxBatchPhp($types, $actions, $entityIds);
+        }
+        if ($patches > 0) {
+            $keys = $patchTypes = $patchActions = $patchIds = [];
+            foreach (array_keys($words, -1, true) as $key) {
+                if ($key % 5 === 0) {
+                    $i = intdiv($key, 5);
+                    $keys[] = $key;
+                    $patchTypes[] = $types[$i];
+                    $patchActions[] = $actions[$i];
+                    $patchIds[] = $entityIds[$i];
+                }
+            }
+            $fixed = self::routeOutboxBatchPhp($patchTypes, $patchActions, $patchIds);
+            foreach ($keys as $n => $key) {
+                for ($word = 0; $word < 5; $word++) {
+                    $words[$key + $word] = $fixed[5 * $n + $word];
+                }
+            }
+        }
+
+        return $words;
     }
 }

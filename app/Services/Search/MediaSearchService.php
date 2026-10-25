@@ -11,7 +11,9 @@ use App\Models\Video;
 use App\Services\Search\DTO\SearchCursor;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\Cache;
+use Throwable;
 
 /**
  * Service for optimized media searches using search indexes.
@@ -605,5 +607,230 @@ class MediaSearchService
         }
 
         return $result;
+    }
+
+    public const string W51_FFI_CDEF = 'int64_t nntmux_w515_media_external_id_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W51.5 parity test's QUALIFICATION). */
+    private const bool W51_RUST_FFI_DEFAULT = true;
+
+    private static ?bool $w51RustFfi = null;
+
+    private static FFI|false|null $w51Ffi = null;
+
+    private static ?CData $w51Out = null;
+
+    private static int $w51OutCap = 0;
+
+    public static function usesW51RustFfi(): bool
+    {
+        return self::$w51RustFfi ?? self::W51_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with externalIdPlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW51RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$w51RustFfi;
+        self::$w51RustFfi = $enabled;
+
+        try {
+            return $callback();
+        } finally {
+            self::$w51RustFfi = $previous;
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 51.5 Rust helper, or null to fall back to PHP. The helper
+     * leads with the number of rows PHP must compute, returned in $patches.
+     *
+     * @return list<int>|null
+     */
+    private static function w51Words(int $count, string $data, string $ints, int $words, ?int &$patches = null): ?array
+    {
+        if (self::$w51Ffi === null) {
+            $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+            self::$w51Ffi = RustPipelineLibrary::resolveDomain('search_w51', self::W51_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+            self::$w51Out = null;
+            self::$w51OutCap = 0;
+        }
+        $ffi = self::$w51Ffi;
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+
+        try {
+            if (self::$w51Out === null || $words >= self::$w51OutCap) {
+                $cap = max(1024, $words + 1);
+                self::$w51Out = $ffi->new('int64_t['.$cap.']');
+                self::$w51OutCap = $cap;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w515_media_external_id_plan($count, 0, $data, \strlen($data), $ints, \strlen($ints), self::$w51Out, self::$w51OutCap);
+            if ($written !== $words + 1) {
+                return null;
+            }
+            $patches = self::$w51Out[0];
+            /** @var array<int, int>|false $values */
+            $values = unpack('P*', FFI::string(self::$w51Out, $written * 8), 8);
+
+            return \is_array($values) ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** PHP `hash('xxh64')` of $value read as a signed big-endian word, as the Rust helper reports it. */
+    private static function w51Digest(string $value): int
+    {
+        /** @var array{1: int} $unpacked */
+        $unpacked = unpack('J', hash('xxh64', $value, true));
+
+        return $unpacked[1];
+    }
+
+    /**
+     * Batch lookup plan for index rows: the IDs collectExternalIdsPhp() keeps for `$type` (movie fields for
+     * 'movie', TV fields otherwise) and the searchMediaRoutePhp() route. Four words per row: `[presence mask
+     * (bit = field priority) | ID count << 8 | route (0 external, 1 movie, 2 tv) << 12 | key length << 20,
+     * (int) first ID, xxh64(key), xxh64(filter terms)]`. The key is `http_build_query()` of the collected
+     * IDs; the filter terms are the release-index `field:value` pairs the search driver queries for them
+     * (imdbid as a string, other IDs cast to int), joined by newlines. A non-array row is
+     * `[1 << 16, 0, 0, 0]`.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return list<int>
+     */
+    public static function externalIdPlanBatch(array $rows, string $type = 'movie'): array
+    {
+        return self::usesW51RustFfi() ? self::externalIdPlanBatchNative($rows, $type) : self::externalIdPlanBatchPhp($rows, $type);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rows
+     * @return list<int>
+     */
+    public static function externalIdPlanBatchPhp(array $rows, string $type = 'movie'): array
+    {
+        $fields = $type === 'movie' ? self::MOVIE_EXTERNAL_ID_FIELDS : self::TV_EXTERNAL_ID_FIELDS;
+        $titleRoute = self::searchMediaRoutePhp([], $type) === 'movie' ? 1 : 2;
+        $out = [];
+        foreach ($rows as $row) {
+            if (! \is_array($row)) {
+                array_push($out, 1 << 16, 0, 0, 0);
+
+                continue;
+            }
+            $ids = self::collectExternalIdsPhp($row, $fields);
+            $mask = 0;
+            $bit = 1;
+            foreach ($fields as $target) {
+                if (\array_key_exists($target, $ids)) {
+                    $mask |= $bit;
+                }
+                $bit <<= 1;
+            }
+            $terms = [];
+            foreach ($ids as $field => $value) {
+                $terms[] = $field.':'.($field === 'imdbid' ? (string) $value : (int) $value);
+            }
+            $count = \count($ids);
+            $key = http_build_query($ids);
+            $route = self::searchMediaRoutePhp($ids, $type) === 'external' ? 0 : $titleRoute;
+            array_push($out, $mask | $count << 8 | $route << 12 | \strlen($key) << 20, $count > 0 ? (int) reset($ids) : 0, self::w51Digest($key), self::w51Digest(implode("\n", $terms)));
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing. Rows that all hold every field travel as one
+     * `json_encode()` of the field columns, others field by field. Rows holding values other than integers,
+     * strings, booleans and null (or a first ID string PHP must cast) are computed with PHP.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return list<int>
+     */
+    public static function externalIdPlanBatchNative(array $rows, string $type = 'movie'): array
+    {
+        $count = \count($rows);
+        if ($count === 0) {
+            return self::externalIdPlanBatchPhp($rows, $type);
+        }
+        $fields = $type === 'movie' ? self::MOVIE_EXTERNAL_ID_FIELDS : self::TV_EXTERNAL_ID_FIELDS;
+        $list = array_values($rows);
+        $arrays = array_filter($list, '\is_array');
+        $columns = [];
+        foreach ($fields as $source => $target) {
+            $column = array_column($arrays, $source);
+            if (\count($column) !== \count($arrays)) {
+                $columns = null;
+
+                break;
+            }
+            $columns[] = $column;
+        }
+        $json = $columns === null ? false : json_encode($columns);
+        if ($json !== false) {
+            $invalid = \count($arrays) === $count ? [] : array_keys(array_diff_key($list, $arrays));
+            $words = self::w51Words($count, $json, pack('P*', $type === 'movie' ? 1 : 0, 1, \count($invalid), ...$invalid), 4 * $count, $patches);
+        } else {
+            $ints = [$type === 'movie' ? 1 : 0, 0];
+            $data = '';
+            foreach ($list as $row) {
+                if (! \is_array($row)) {
+                    $ints[] = 0;
+
+                    continue;
+                }
+                $at = \count($ints);
+                $ints[] = 1;
+                foreach ($fields as $source => $target) {
+                    $value = $row[$source] ?? null;
+                    if (\is_int($value)) {
+                        $ints[] = 0;
+                        $ints[] = $value;
+                    } elseif (\is_string($value)) {
+                        $ints[] = 1;
+                        $ints[] = \strlen($value);
+                        $data .= $value;
+                    } else {
+                        if ($value !== null && ! \is_bool($value)) {
+                            $ints[$at] = 2;
+                        }
+                        $ints[] = $value === true ? 3 : 2;
+                        $ints[] = 0;
+                    }
+                }
+            }
+            $words = self::w51Words($count, $data, pack('P*', ...$ints), 4 * $count, $patches);
+        }
+        if ($words === null) {
+            return self::externalIdPlanBatchPhp($rows, $type);
+        }
+        if ($patches > 0) {
+            $keys = $patchRows = [];
+            foreach (array_keys($words, -1, true) as $key) {
+                if ($key % 4 === 0) {
+                    $keys[] = $key;
+                    $patchRows[] = $list[intdiv($key, 4)];
+                }
+            }
+            $fixed = self::externalIdPlanBatchPhp($patchRows, $type);
+            foreach ($keys as $n => $key) {
+                for ($word = 0; $word < 4; $word++) {
+                    $words[$key + $word] = $fixed[4 * $n + $word];
+                }
+            }
+        }
+
+        return $words;
     }
 }
