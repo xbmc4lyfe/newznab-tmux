@@ -370,4 +370,196 @@ class GamesTitleParser
             return null;
         }
     }
+
+    /** Enabled: five paired runs cleared 1.5x on every gate (min common mean 4.06x, p99 2.94x; uncommon mean 5.17x, p99 4.30x; see the W43 parity test). */
+    public const bool W434_RUST_FFI_DEFAULT = true;
+
+    public const string W434_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w434_game_release_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private const array W434_SUMMARY_KEYS = ['total_releases', 'empty_title_count', 'scene_group_count', 'edition_tag_count', 'version_tag_count', 'update_patch_count', 'release_tag_count', 'multi_language_count', 'dlc_count', 'bracket_tag_count'];
+
+    private static ?bool $w434UseRustFfi = null;
+
+    private static FFI|false|null $w434Ffi = null;
+
+    /** Null restores the benchmark-qualified default. */
+    public static function useW434RustFfi(?bool $enable = true): void
+    {
+        self::$w434UseRustFfi = $enable;
+    }
+
+    public static function usesW434RustFfi(): bool
+    {
+        return self::$w434UseRustFfi ?? self::W434_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW434RustFfi(): void
+    {
+        self::$w434UseRustFfi = null;
+        self::$w434Ffi = null;
+    }
+
+    /**
+     * Summarize game release names: a trailing "-GROUP" naming an alphanumeric
+     * SCENE_GROUPS member, and ASCII alphanumeric tokens for editions, v\d+
+     * versions, update/patch/hotfix, repack/rip/iso/crack/proper, MULTI\d+ and
+     * DLC (all case-insensitive), plus bracket or parenthesis tags. Entries come
+     * from strings, integers, or the searchname, name or title array field;
+     * other values (including objects) count as empty entries.
+     *
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeGameReleaseBatch(array $entries): array
+    {
+        return self::usesW434RustFfi()
+            ? self::summarizeGameReleaseBatchNative($entries)
+            : self::summarizeGameReleaseBatchPhp($entries);
+    }
+
+    /**
+     * Rust summary; falls back to PHP when the library or input frame is unusable.
+     *
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeGameReleaseBatchNative(array $entries): array
+    {
+        return self::w434Call(self::w434Entries($entries)) ?? self::summarizeGameReleaseBatchPhp($entries);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeGameReleaseBatchPhp(array $entries): array
+    {
+        $summary = array_fill_keys(self::W434_SUMMARY_KEYS, 0);
+        $groups = self::w434SceneGroups();
+        foreach (self::w434Entries($entries) as $entry) {
+            $summary['total_releases']++;
+            $entry = trim($entry);
+            if ($entry === '') {
+                $summary['empty_title_count']++;
+
+                continue;
+            }
+            $flags = 0;
+            foreach (preg_split('/[^A-Za-z0-9]+/', $entry, -1, PREG_SPLIT_NO_EMPTY) ?: [] as $token) {
+                if (($token[0] === 'v' || $token[0] === 'V') && ctype_digit(substr($token, 1))) {
+                    $flags |= 16;
+                } elseif (strncasecmp($token, 'multi', 5) === 0 && ctype_digit(substr($token, 5))) {
+                    $flags |= 32;
+                } else {
+                    $flags |= self::W434_GAME_KEYWORDS[strtoupper($token)] ?? 0;
+                }
+            }
+            $summary['scene_group_count'] += (int) (preg_match('/-[ ]*([A-Za-z0-9]+)\z/', $entry, $m) === 1 && isset($groups[strtoupper($m[1])]));
+            $summary['edition_tag_count'] += (int) (($flags & 1) !== 0);
+            $summary['version_tag_count'] += (int) (($flags & 16) !== 0);
+            $summary['update_patch_count'] += (int) (($flags & 2) !== 0);
+            $summary['release_tag_count'] += (int) (($flags & 4) !== 0);
+            $summary['multi_language_count'] += (int) (($flags & 32) !== 0);
+            $summary['dlc_count'] += (int) (($flags & 8) !== 0);
+            $summary['bracket_tag_count'] += (int) (strpbrk($entry, '[(') !== false);
+        }
+
+        return $summary;
+    }
+
+    /** Uppercase keyword => flag (1 edition, 2 update, 4 release, 8 DLC). */
+    private const array W434_GAME_KEYWORDS = [
+        'GOTY' => 1, 'REMASTERED' => 1, 'DEFINITIVE' => 1, 'DELUXE' => 1, 'ULTIMATE' => 1, 'COMPLETE' => 1, 'ANNIVERSARY' => 1,
+        'UPDATE' => 2, 'PATCH' => 2, 'HOTFIX' => 2,
+        'REPACK' => 4, 'RIP' => 4, 'ISO' => 4, 'CRACK' => 4, 'CRACKFIX' => 4, 'PROPER' => 4,
+        'DLC' => 8, 'DLCS' => 8,
+    ];
+
+    /** @return array<string, true> Uppercased alphanumeric SCENE_GROUPS members. */
+    private static function w434SceneGroups(): array
+    {
+        static $groups = null;
+        if ($groups === null) {
+            $groups = [];
+            foreach (self::SCENE_GROUPS as $group) {
+                if (ctype_alnum($group)) {
+                    $groups[strtoupper($group)] = true;
+                }
+            }
+        }
+
+        return $groups;
+    }
+
+    /** Only integer and string entries participate; objects are never cast or serialized.
+     *
+     * @param  array<array-key, mixed>  $input
+     * @return list<string>
+     */
+    private static function w434Entries(array $input): array
+    {
+        $entries = [];
+        foreach ($input as $item) {
+            if (is_array($item)) {
+                $item = $item['searchname'] ?? $item['name'] ?? $item['title'] ?? null;
+            }
+            $entries[] = is_string($item) || is_int($item) ? (string) $item : '';
+        }
+
+        return $entries;
+    }
+
+    /** @param list<string> $entries
+     * @return array<string, int>|null
+     */
+    private static function w434Call(array $entries): ?array
+    {
+        try {
+            $input = serialize([$entries]);
+            if (strlen($input) > 16777216) {
+                return null;
+            }
+            self::$w434Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w434', self::W434_FFI_CDEF) ?? false;
+            $ffi = self::$w434Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            $capacity = 0;
+            $out = RustPipelineLibrary::obtainScratch($ffi, 2048, $capacity);
+            if ($out === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound (Declared by W434_FFI_CDEF.)
+            $written = $ffi->nntmux_w434_game_release_batch($input, strlen($input), $out, $capacity);
+            if (is_int($written) && $written < -1 && $written >= -16777216) {
+                $out = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($out === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound (Declared by W434_FFI_CDEF.)
+                $written = $ffi->nntmux_w434_game_release_batch($input, strlen($input), $out, $capacity);
+            }
+            if (! is_int($written) || $written <= 0 || $written > $capacity || $written > 16777216) {
+                return null;
+            }
+            $result = @unserialize(FFI::string($out, $written), ['allowed_classes' => false]);
+            if (! is_array($result) || array_keys($result) !== self::W434_SUMMARY_KEYS || $result['total_releases'] !== count($entries)) {
+                return null;
+            }
+            $summary = [];
+            foreach (self::W434_SUMMARY_KEYS as $key) {
+                $value = $result[$key];
+                if (! is_int($value) || $value < 0 || $value > count($entries)) {
+                    return null;
+                }
+                $summary[$key] = $value;
+            }
+
+            return $summary;
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }

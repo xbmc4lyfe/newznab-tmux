@@ -324,4 +324,164 @@ class GenreService
         Cache::forget('disabled_genres');
         // Clear other genre caches by pattern if needed
     }
+
+    /** Disabled: common mean 1.45-1.49x and p99 1.21-1.39x missed 1.5x in five paired runs; uncommon passed (mean >= 1.65x, p99 >= 1.50x). See the W43 parity test. */
+    public const bool W434_RUST_FFI_DEFAULT = false;
+
+    public const string W434_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w434_genre_title_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private const array W434_SUMMARY_KEYS = ['total_genres', 'empty_title_count', 'duplicate_title_count', 'multi_genre_count', 'non_ascii_count', 'hyphenated_count', 'numeric_count', 'mixed_case_count'];
+
+    private static ?bool $w434UseRustFfi = null;
+
+    private static FFI|false|null $w434Ffi = null;
+
+    /** Null restores the benchmark-qualified default. */
+    public static function useW434RustFfi(?bool $enable = true): void
+    {
+        self::$w434UseRustFfi = $enable;
+    }
+
+    public static function usesW434RustFfi(): bool
+    {
+        return self::$w434UseRustFfi ?? self::W434_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW434RustFfi(): void
+    {
+        self::$w434UseRustFfi = null;
+        self::$w434Ffi = null;
+    }
+
+    /**
+     * Summarize genre titles: trimmed titles whose strtolower() form (the
+     * normalizeGenresMap() value) repeats an earlier one, combined genres
+     * (/ , & | ;), bytes above 0x7F, hyphens, digits and mixed ASCII case.
+     * Entries come from strings, integers, or the title or genre array field;
+     * other values (including objects) count as empty entries.
+     *
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeGenreTitleBatch(array $entries): array
+    {
+        return self::usesW434RustFfi()
+            ? self::summarizeGenreTitleBatchNative($entries)
+            : self::summarizeGenreTitleBatchPhp($entries);
+    }
+
+    /**
+     * Rust summary; falls back to PHP when the library or input frame is unusable.
+     *
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeGenreTitleBatchNative(array $entries): array
+    {
+        return self::w434Call(self::w434Entries($entries)) ?? self::summarizeGenreTitleBatchPhp($entries);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeGenreTitleBatchPhp(array $entries): array
+    {
+        $summary = array_fill_keys(self::W434_SUMMARY_KEYS, 0);
+        $seen = [];
+        foreach (self::w434Entries($entries) as $entry) {
+            $summary['total_genres']++;
+            $entry = trim($entry);
+            if ($entry === '') {
+                $summary['empty_title_count']++;
+
+                continue;
+            }
+            $lower = strtolower($entry);
+            if (isset($seen[$lower])) {
+                $summary['duplicate_title_count']++;
+            } else {
+                $seen[$lower] = true;
+            }
+            $summary['multi_genre_count'] += (int) (strpbrk($entry, '/,&|;') !== false);
+            $summary['non_ascii_count'] += (int) (preg_match('/[\x80-\xFF]/', $entry) === 1);
+            $summary['hyphenated_count'] += (int) str_contains($entry, '-');
+            $summary['numeric_count'] += (int) (strpbrk($entry, '0123456789') !== false);
+            $summary['mixed_case_count'] += (int) ($lower !== $entry && strtoupper($entry) !== $entry);
+        }
+
+        return $summary;
+    }
+
+    /** Only integer and string entries participate; objects are never cast or serialized.
+     *
+     * @param  array<array-key, mixed>  $input
+     * @return list<string>
+     */
+    private static function w434Entries(array $input): array
+    {
+        $entries = [];
+        foreach ($input as $item) {
+            if (is_array($item)) {
+                $item = $item['title'] ?? $item['genre'] ?? null;
+            }
+            $entries[] = is_string($item) || is_int($item) ? (string) $item : '';
+        }
+
+        return $entries;
+    }
+
+    /** @param list<string> $entries
+     * @return array<string, int>|null
+     */
+    private static function w434Call(array $entries): ?array
+    {
+        try {
+            $input = serialize([$entries]);
+            if (strlen($input) > 16777216) {
+                return null;
+            }
+            self::$w434Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w434', self::W434_FFI_CDEF) ?? false;
+            $ffi = self::$w434Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            $capacity = 0;
+            $out = RustPipelineLibrary::obtainScratch($ffi, 2048, $capacity);
+            if ($out === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound (Declared by W434_FFI_CDEF.)
+            $written = $ffi->nntmux_w434_genre_title_batch($input, strlen($input), $out, $capacity);
+            if (is_int($written) && $written < -1 && $written >= -16777216) {
+                $out = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($out === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound (Declared by W434_FFI_CDEF.)
+                $written = $ffi->nntmux_w434_genre_title_batch($input, strlen($input), $out, $capacity);
+            }
+            if (! is_int($written) || $written <= 0 || $written > $capacity || $written > 16777216) {
+                return null;
+            }
+            $result = @unserialize(FFI::string($out, $written), ['allowed_classes' => false]);
+            if (! is_array($result) || array_keys($result) !== self::W434_SUMMARY_KEYS || $result['total_genres'] !== count($entries)) {
+                return null;
+            }
+            $summary = [];
+            foreach (self::W434_SUMMARY_KEYS as $key) {
+                $value = $result[$key];
+                if (! is_int($value) || $value < 0 || $value > count($entries)) {
+                    return null;
+                }
+                $summary[$key] = $value;
+            }
+
+            return $summary;
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }
