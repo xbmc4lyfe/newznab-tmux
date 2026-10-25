@@ -16,6 +16,7 @@ use App\Services\TvProcessing\Providers\TvMazeProvider;
 use App\Support\RustPipelineLibrary;
 use DariusIII\TVMaze\TVShow;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use InvalidArgumentException;
@@ -611,5 +612,164 @@ class TvShowAdder
         }
 
         return $id;
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 49.4 batch helper
+    // ---------------------------------------------------------------------
+
+    /** Enabled: minimum of three paired runs cleared every 1.5x gate (common mean 2.62x, p99 2.29x; uncommon mean 3.10x, p99 3.08x); see RustTvProvidersLocalDbTraktOutcomePosterAdderW49ParityTest. */
+    private const bool W49_RUST_FFI_DEFAULT = true;
+
+    public const string W49_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w49_tv_show_adder_request_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    private static ?bool $useW49RustFfi = null;
+
+    private static FFI|false|null $w49Ffi = null;
+
+    private static ?CData $w49Out = null;
+
+    private static int $w49OutCap = 0;
+
+    public static function usesW49RustFfi(): bool
+    {
+        return self::$useW49RustFfi ?? self::W49_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W49 batch dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW49RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$useW49RustFfi;
+        self::$useW49RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$useW49RustFfi = $previous;
+        }
+    }
+
+    /**
+     * add() request normalization for a batch: two ints per request, [column, id].
+     *
+     * The column indexes SUPPORTED_SOURCES for strtolower(trim(source)) (-1 when unsupported).
+     * The id word is normalizeIdPhp()'s result as offset << 32 | length within the raw id, or
+     * -2 for an invalid IMDB id and -3 for an id that isn't a positive integer.
+     *
+     * @param  list<string>  $sources
+     * @param  list<string>  $ids
+     * @return list<int>
+     */
+    public static function normalizeRequestBatch(array $sources, array $ids): array
+    {
+        return self::usesW49RustFfi()
+            ? self::normalizeRequestBatchNative($sources, $ids)
+            : self::normalizeRequestBatchPhp($sources, $ids);
+    }
+
+    /**
+     * @param  list<string>  $sources
+     * @param  list<string>  $ids
+     * @return list<int>
+     */
+    public static function normalizeRequestBatchNative(array $sources, array $ids): array
+    {
+        self::w49AssertColumns($sources, $ids);
+        if ($sources === []) {
+            return [];
+        }
+
+        return self::w49Call(implode("\0", $sources)."\0".implode("\0", $ids), '', \count($sources))
+            ?? self::normalizeRequestBatchPhp($sources, $ids);
+    }
+
+    /**
+     * @param  list<string>  $sources
+     * @param  list<string>  $ids
+     * @return list<int>
+     */
+    public static function normalizeRequestBatchPhp(array $sources, array $ids): array
+    {
+        self::w49AssertColumns($sources, $ids);
+        $out = [];
+        foreach ($sources as $i => $source) {
+            $column = match (strtolower(trim($source))) {
+                'tvdb' => 0,
+                'tvmaze' => 1,
+                'tmdb' => 2,
+                'trakt' => 3,
+                'imdb' => 4,
+                default => -1,
+            };
+            $raw = $ids[$i];
+            $id = trim($raw);
+            $offset = strspn($raw, " \t\n\r\0\x0B");
+            if ($column === 4) {
+                if (preg_match('/^tt?(\d{5,10})$/i', $id, $match, PREG_OFFSET_CAPTURE) === 1) {
+                    $word = (($offset + $match[1][1]) << 32) | \strlen($match[1][0]);
+                } else {
+                    $word = ctype_digit($id) ? ($offset << 32) | \strlen($id) : -2;
+                }
+            } else {
+                $word = ctype_digit($id) && (int) $id > 0 ? ($offset << 32) | \strlen($id) : -3;
+            }
+            array_push($out, $column, $word);
+        }
+
+        return $out;
+    }
+
+    /**
+     * One FFI crossing for the batch: NUL-joined text columns, little-endian int64 scalars,
+     * 2 int64 words back per record. Null when the library is missing or declines.
+     *
+     * @return list<int>|null
+     */
+    private static function w49Call(string $text, string $ints, int $count): ?array
+    {
+        try {
+            self::$w49Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w49', self::W49_FFI_CDEF) ?? false;
+            $ffi = self::$w49Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            $need = $count * 2;
+            $out = self::$w49Out;
+            if ($out === null || self::$w49OutCap < $need) {
+                self::$w49OutCap = max(1024, $need);
+                $out = self::$w49Out = $ffi->new('int64_t['.self::$w49OutCap.']');
+            }
+            // @phpstan-ignore method.notFound (Declared by W49_FFI_CDEF.)
+            $written = $ffi->nntmux_w49_tv_show_adder_request_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, self::$w49OutCap);
+            if ($written !== $need) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $need * 8));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * @param  array<array-key, mixed>  ...$columns
+     */
+    private static function w49AssertColumns(array ...$columns): void
+    {
+        $count = \count($columns[0]);
+        foreach ($columns as $column) {
+            if (\count($column) !== $count || ! array_is_list($column)) {
+                throw new InvalidArgumentException('W49 batch columns must be lists of equal length.');
+            }
+        }
     }
 }

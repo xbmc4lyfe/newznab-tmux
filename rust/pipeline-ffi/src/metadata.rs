@@ -47326,3 +47326,891 @@ mod w484_tests {
         }
     }
 }
+
+/// Wave 49.4: TV local DB show keys, Trakt ids/images, lookup outcomes, poster picks and
+/// show-adder requests, resolved for a whole batch in one call.
+///
+/// Every export reads `count` records: `COLS` NUL-delimited byte columns stored column-major
+/// in `text` (`count * COLS` fields, so `count * COLS - 1` separators) and `INTS`
+/// little-endian int64 values per record stored row-major in `ints`. It writes `WORDS`
+/// int64 words per record to `out` and returns the number of words written, the negated
+/// word count needed when `out_cap` (in words) is too small, or `-1` for invalid input.
+pub mod w494_tv {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const MAX_BYTES: usize = 64 * 1024 * 1024;
+
+    const MAX_RECORDS: usize = 1 << 20;
+
+    /// Empty spans never touch the pointer: `from_raw_parts` on null is UB even for len 0.
+    unsafe fn span<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null() || len > MAX_BYTES {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+
+    /// High bit set in every byte of `word` equal to `needle`; the lowest flag is exact.
+    #[inline(always)]
+    fn flag(word: u64, needle: u8) -> u64 {
+        let x = word ^ LO.wrapping_mul(u64::from(needle));
+        x.wrapping_sub(LO) & !x & HI
+    }
+
+    /// First byte equal to `a` or `b`, eight bytes per step.
+    #[inline]
+    fn find2(hay: &[u8], a: u8, b: u8) -> Option<usize> {
+        let (chunks, tail) = hay.as_chunks::<8>();
+        for (i, chunk) in chunks.iter().enumerate() {
+            let word = u64::from_le_bytes(*chunk);
+            let found = flag(word, a) | flag(word, b);
+            if found != 0 {
+                return Some(i * 8 + (found.trailing_zeros() / 8) as usize);
+            }
+        }
+        let done = chunks.len() * 8;
+        tail.iter()
+            .position(|c| *c == a || *c == b)
+            .map(|p| done + p)
+    }
+
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> bool {
+        a_len != 0 && b_len != 0 && a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
+    }
+
+    type Row<const COLS: usize, const INTS: usize, const WORDS: usize> =
+        fn(&[&[u8]; COLS], &[i64; INTS], &mut [i64; WORDS]);
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run<const COLS: usize, const INTS: usize, const WORDS: usize>(
+        text: *const u8,
+        text_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+        row: Row<COLS, INTS, WORDS>,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out.is_null()
+                || !out.is_aligned()
+                || count > MAX_RECORDS
+                || out_cap > isize::MAX as usize / 8
+            {
+                return -1;
+            }
+            let out_bytes = out_cap * 8;
+            if overlaps(text as usize, text_len, out as usize, out_bytes)
+                || overlaps(ints as usize, ints_len, out as usize, out_bytes)
+            {
+                return -1;
+            }
+            let (Some(text), Some(ints)) = (unsafe { span(text, text_len) }, unsafe {
+                span(ints, ints_len)
+            }) else {
+                return -1;
+            };
+            if ints.len() != count * INTS * 8 {
+                return -1;
+            }
+            let total = count * COLS;
+            let mut fields: Vec<&[u8]> = Vec::with_capacity(total);
+            if total == 0 {
+                if !text.is_empty() {
+                    return -1;
+                }
+            } else {
+                let mut rest = text;
+                while let Some(end) = find2(rest, 0, 0) {
+                    if fields.len() + 1 == total {
+                        return -1;
+                    }
+                    fields.push(&rest[..end]);
+                    rest = &rest[end + 1..];
+                }
+                fields.push(rest);
+                if fields.len() != total {
+                    return -1;
+                }
+            }
+            if count == 0 {
+                return 0;
+            }
+            let need = count * WORDS;
+            if need > out_cap {
+                return -(need.max(2) as isize);
+            }
+            // Non-null, aligned, within `out_cap` and disjoint from both inputs.
+            let out = unsafe { std::slice::from_raw_parts_mut(out, need) };
+            let (words, _) = out.as_chunks_mut::<WORDS>();
+            let (values, _) = ints.as_chunks::<8>();
+            for (i, slot) in words.iter_mut().enumerate() {
+                let cols: [&[u8]; COLS] = std::array::from_fn(|c| fields[c * count + i]);
+                let nums: [i64; INTS] =
+                    std::array::from_fn(|k| i64::from_le_bytes(values[i * INTS + k]));
+                row(&cols, &nums, slot);
+            }
+            need as isize
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// PHP trim() default set: space, tab, LF, CR, NUL and vertical tab.
+    #[inline(always)]
+    fn is_trim(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b)
+    }
+
+    /// trim() as `(offset, trimmed)`.
+    fn trim(value: &[u8]) -> (usize, &[u8]) {
+        let start = value
+            .iter()
+            .position(|b| !is_trim(*b))
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|b| !is_trim(*b))
+            .map_or(start, |i| i + 1);
+        (start, &value[start..end])
+    }
+
+    fn decimal(digits: &[u8]) -> i64 {
+        digits
+            .iter()
+            .fold(0i64, |n, b| n * 10 + i64::from(b - b'0'))
+    }
+
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    #[inline(always)]
+    fn fnv(hash: u64, byte: u8) -> u64 {
+        (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
+    }
+
+    /// LocalDbProvider: `[key hash, year, flags]` from (name, country) and the explicit year.
+    fn local_db_show_key(cols: &[&[u8]; 2], ints: &[i64; 1], out: &mut [i64; 3]) {
+        let (_, name) = trim(cols[0]);
+        let mut flags = i64::from(!name.is_empty());
+        let mut base = name;
+        let mut year = 0;
+        let end = name.len() - usize::from(name.last() == Some(&b')'));
+        if end >= 5 {
+            let digits = &name[end - 4..end];
+            if digits.iter().all(u8::is_ascii_digit)
+                && (digits.starts_with(b"19") || digits.starts_with(b"20"))
+                && matches!(name[end - 5], b' ' | b'.' | b'(')
+            {
+                base = &name[..end - 5];
+                year = decimal(digits);
+                flags |= 2;
+            }
+        }
+        if ints[0] > 0 {
+            year = ints[0];
+            flags |= 4;
+        }
+        let mut tokens = base
+            .split(|b| !b.is_ascii_alphanumeric())
+            .filter(|token| !token.is_empty())
+            .peekable();
+        let mut first = tokens.next();
+        if first.is_some_and(|token| token.eq_ignore_ascii_case(b"the")) && tokens.peek().is_some()
+        {
+            first = tokens.next();
+        }
+        let mut hash = 0;
+        if let Some(first) = first {
+            let mut h = FNV_OFFSET;
+            for (n, token) in std::iter::once(first).chain(tokens).enumerate() {
+                if n > 0 {
+                    h = fnv(h, b' ');
+                }
+                for b in token {
+                    h = fnv(h, b.to_ascii_lowercase());
+                }
+            }
+            hash = h as i64;
+        }
+        let (_, country) = trim(cols[1]);
+        if let [a, b] = country
+            && a.is_ascii_alphabetic()
+            && b.is_ascii_alphabetic()
+        {
+            flags |= 8
+                | (i64::from(a.to_ascii_uppercase()) << 24)
+                | (i64::from(b.to_ascii_uppercase()) << 16);
+        }
+        *out = [hash, year, flags];
+    }
+
+    /// TraktProvider: `[imdb number, image kind]` from (ids.imdb, image URL).
+    fn trakt_ids(cols: &[&[u8]; 2], _: &[i64; 0], out: &mut [i64; 2]) {
+        // PCRE `$` also matches before one final newline.
+        let imdb = cols[0].strip_suffix(b"\n").unwrap_or(cols[0]);
+        let digits = imdb.iter().rev().take_while(|b| b.is_ascii_digit()).count();
+        let start = imdb.len() - digits;
+        let number = if digits >= 6
+            && start >= 2
+            && imdb[start - 2].eq_ignore_ascii_case(&b't')
+            && imdb[start - 1].eq_ignore_ascii_case(&b't')
+        {
+            if digits > 18 {
+                -1
+            } else {
+                decimal(&imdb[start..])
+            }
+        } else {
+            0
+        };
+        let url = cols[1];
+        let image = if url.is_empty() {
+            0
+        } else if url.starts_with(b"http") {
+            1
+        } else {
+            2 | ((url.iter().take_while(|b| **b == b'/').count() as i64) << 2)
+        };
+        *out = [number, image];
+    }
+
+    const PENDING: i64 = 0;
+    const SHOW_NOT_FOUND: i64 = -10;
+    const EPISODE_MISSING: i64 = -11;
+    const SEASON_PACK: i64 = -12;
+    const PARSE_FAILED: i64 = -100;
+    const MAX_TRANSIENT_ATTEMPTS: i64 = 8;
+    const MAX_EPISODE_ATTEMPTS: i64 = 6;
+    const KNOWN_SHOW_TRANSIENT_DELAY: i64 = 900;
+
+    fn transient_delay(attempts: i64, retry_after: i64) -> i64 {
+        retry_after.max(match attempts {
+            1 => 300,
+            2 => 900,
+            3 => 3600,
+            _ => 21600,
+        })
+    }
+
+    fn episode_delay(attempts: i64) -> i64 {
+        match attempts {
+            1 => 3600,
+            2 => 21600,
+            3 => 86400,
+            4 => 259_200,
+            _ => 604_800,
+        }
+    }
+
+    /// TvLookupOutcomeWriter: `[tv_episodes_id, attempts, retry delay or -1, flags]` from the
+    /// status and `[prev video, prev status, prev attempts, video, episode, transient, retry
+    /// after]`. Flags: 1 link changed, 2 bump the browse cache, 4 videos_id is the input video.
+    fn outcome_resolve(cols: &[&[u8]; 1], ints: &[i64; 7], out: &mut [i64; 4]) {
+        let [
+            prev_video,
+            prev_status,
+            prev_attempts,
+            video,
+            episode,
+            transient,
+            retry_after,
+        ] = *ints;
+        let next = prev_attempts.saturating_add(1);
+        let (video, status, attempts, delay) = match cols[0] {
+            b"matched" => (video, episode, 0, -1),
+            b"season_pack" => (video, SEASON_PACK, 0, -1),
+            b"episode_missing" => {
+                let attempts = if prev_status == EPISODE_MISSING {
+                    next
+                } else {
+                    1
+                };
+                let delay = if transient != 0 {
+                    retry_after.max(KNOWN_SHOW_TRANSIENT_DELAY)
+                } else if attempts < MAX_EPISODE_ATTEMPTS {
+                    episode_delay(attempts)
+                } else {
+                    -1
+                };
+                (video, EPISODE_MISSING, attempts, delay)
+            }
+            b"transient" => {
+                let attempts = if prev_status == PENDING { next } else { 1 };
+                if attempts >= MAX_TRANSIENT_ATTEMPTS {
+                    (0, SHOW_NOT_FOUND, 0, -1)
+                } else {
+                    (0, PENDING, attempts, transient_delay(attempts, retry_after))
+                }
+            }
+            b"parse_failed" => (0, PARSE_FAILED, 0, -1),
+            _ => (0, SHOW_NOT_FOUND, 0, -1),
+        };
+        let keeps_video = matches!(cols[0], b"matched" | b"season_pack" | b"episode_missing");
+        let changed = video != prev_video || (status != prev_status && status.max(prev_status) > 0);
+        let bump = changed && matches!(cols[0], b"matched" | b"season_pack");
+        *out = [
+            status,
+            attempts,
+            delay,
+            i64::from(changed) | (i64::from(bump) << 1) | (i64::from(keeps_video) << 2),
+        ];
+    }
+
+    /// TvPosterResolver: `[chosen index or -1, offset << 32 | length, validity mask]` from
+    /// the provider, TMDB and Fanart.tv candidates.
+    fn poster_pick(cols: &[&[u8]; 3], _: &[i64; 0], out: &mut [i64; 3]) {
+        let mut chosen = -1;
+        let mut span = 0;
+        let mut mask = 0;
+        for (index, candidate) in cols.iter().enumerate() {
+            let (offset, url) = trim(candidate);
+            if url.is_empty() {
+                continue;
+            }
+            mask |= 8 << index;
+            let rest = if url.len() >= 8 && url[..8].eq_ignore_ascii_case(b"https://") {
+                8
+            } else if url.len() >= 7 && url[..7].eq_ignore_ascii_case(b"http://") {
+                7
+            } else if url.starts_with(b"//") {
+                2
+            } else {
+                continue;
+            };
+            if url.get(rest).is_none_or(|b| *b == b'/') {
+                continue;
+            }
+            let path = &url[..find2(url, b'?', b'#').unwrap_or(url.len())];
+            let image = [&b".jpg"[..], b".jpeg", b".png", b".webp"]
+                .iter()
+                .any(|ext| {
+                    path.len() >= ext.len()
+                        && path[path.len() - ext.len()..].eq_ignore_ascii_case(ext)
+                });
+            if !image {
+                continue;
+            }
+            mask |= 1 << index;
+            if chosen < 0 {
+                chosen = index as i64;
+                span = ((offset as i64) << 32) | url.len() as i64;
+            }
+        }
+        *out = [chosen, span, mask];
+    }
+
+    const SOURCES: [&[u8]; 5] = [b"tvdb", b"tvmaze", b"tmdb", b"trakt", b"imdb"];
+
+    const INVALID_IMDB: i64 = -2;
+    const INVALID_POSITIVE: i64 = -3;
+
+    /// TvShowAdder: `[video column index or -1, id offset << 32 | length or error]` from
+    /// (source, external id).
+    fn show_adder_request(cols: &[&[u8]; 2], _: &[i64; 0], out: &mut [i64; 2]) {
+        let (_, source) = trim(cols[0]);
+        let column = SOURCES
+            .iter()
+            .position(|name| source.eq_ignore_ascii_case(name))
+            .map_or(-1, |i| i as i64);
+        let (offset, id) = trim(cols[1]);
+        let digits = |value: &[u8]| !value.is_empty() && value.iter().all(u8::is_ascii_digit);
+        let span = |start: usize, len: usize| ((start as i64) << 32) | len as i64;
+        let id_word = if column == 4 {
+            let skip = match id {
+                [t1, t2, ..]
+                    if t1.eq_ignore_ascii_case(&b't') && t2.eq_ignore_ascii_case(&b't') =>
+                {
+                    2
+                }
+                [t1, ..] if t1.eq_ignore_ascii_case(&b't') => 1,
+                _ => 0,
+            };
+            if skip > 0 && (5..=10).contains(&(id.len() - skip)) && digits(&id[skip..]) {
+                span(offset + skip, id.len() - skip)
+            } else if digits(id) {
+                span(offset, id.len())
+            } else {
+                INVALID_IMDB
+            }
+        } else if digits(id) && id.iter().any(|b| *b != b'0') {
+            span(offset, id.len())
+        } else {
+            INVALID_POSITIVE
+        };
+        *out = [column, id_word];
+    }
+
+    macro_rules! export {
+        ($name:ident, $cols:literal, $ints:literal, $words:literal, $row:ident) => {
+            /// # Safety
+            ///
+            /// `text` must point to `text_len` readable bytes, `ints` to `ints_len`
+            /// readable bytes and `out` to `out_cap` writable, aligned int64 words that
+            /// overlap neither input; null pointers are accepted only with zero lengths.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                text: *const u8,
+                text_len: usize,
+                ints: *const u8,
+                ints_len: usize,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                unsafe {
+                    run::<$cols, $ints, $words>(
+                        text, text_len, ints, ints_len, count, out, out_cap, $row,
+                    )
+                }
+            }
+        };
+    }
+
+    export!(
+        nntmux_w49_tv_local_db_show_key_batch,
+        2,
+        1,
+        3,
+        local_db_show_key
+    );
+    export!(nntmux_w49_tv_trakt_ids_batch, 2, 0, 2, trakt_ids);
+    export!(
+        nntmux_w49_tv_outcome_resolve_batch,
+        1,
+        7,
+        4,
+        outcome_resolve
+    );
+    export!(nntmux_w49_tv_poster_pick_batch, 3, 0, 3, poster_pick);
+    export!(
+        nntmux_w49_tv_show_adder_request_batch,
+        2,
+        0,
+        2,
+        show_adder_request
+    );
+}
+
+#[cfg(test)]
+mod w494_tests {
+    use super::w494_tv::*;
+
+    type Export =
+        unsafe extern "C" fn(*const u8, usize, *const u8, usize, usize, *mut i64, usize) -> isize;
+
+    fn text(columns: &[&[&[u8]]]) -> Vec<u8> {
+        let fields: Vec<&[u8]> = columns.iter().flat_map(|c| c.iter().copied()).collect();
+        fields.join(&0u8)
+    }
+
+    fn ints(values: &[i64]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn call(export: Export, text: &[u8], ints: &[u8], count: usize, out: &mut [i64]) -> isize {
+        unsafe {
+            export(
+                text.as_ptr(),
+                text.len(),
+                ints.as_ptr(),
+                ints.len(),
+                count,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        }
+    }
+
+    fn words(
+        export: Export,
+        columns: &[&[&[u8]]],
+        values: &[i64],
+        count: usize,
+        per: usize,
+    ) -> Vec<i64> {
+        let mut out = vec![i64::MIN; count * per + 3];
+        assert_eq!(
+            call(export, &text(columns), &ints(values), count, &mut out),
+            (count * per) as isize
+        );
+        assert!(
+            out[count * per..].iter().all(|w| *w == i64::MIN),
+            "wrote past the batch"
+        );
+        out.truncate(count * per);
+        out
+    }
+
+    fn fnv(key: &[u8]) -> i64 {
+        key.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+            (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
+        }) as i64
+    }
+
+    #[test]
+    fn w494_local_db_show_keys() {
+        let names: [&[u8]; 6] = [
+            b"  The Office (US) (2005) ",
+            b"Doctor.Who.2005",
+            b"the",
+            b"",
+            b"Show (2019",
+            b"Caf\xc3\xa9  Noir!",
+        ];
+        let countries: [&[u8]; 6] = [b" us ", b"GB", b"usa", b"", b"g1", b"fr"];
+        let out = words(
+            nntmux_w49_tv_local_db_show_key_batch,
+            &[&names, &countries],
+            &[0, 1963, 0, 0, -5, 0],
+            6,
+            3,
+        );
+        let flags =
+            |base: i64, c: &[u8; 2]| base | 8 | (i64::from(c[0]) << 24) | (i64::from(c[1]) << 16);
+        assert_eq!(&out[0..3], &[fnv(b"office us"), 2005, flags(3, b"US")]);
+        assert_eq!(&out[3..6], &[fnv(b"doctor who"), 1963, flags(7, b"GB")]);
+        assert_eq!(&out[6..9], &[fnv(b"the"), 0, 1]);
+        assert_eq!(&out[9..12], &[0, 0, 0]);
+        assert_eq!(&out[12..15], &[fnv(b"show"), 2019, 3]);
+        assert_eq!(&out[15..18], &[fnv(b"caf noir"), 0, flags(1, b"FR")]);
+    }
+
+    #[test]
+    fn w494_trakt_ids_and_images() {
+        let imdb: [&[u8]; 6] = [
+            b"tt0944947",
+            b"TT12345678\n",
+            b"tt12345",
+            b"x",
+            b"tt1234567890123456789",
+            b"att0123456",
+        ];
+        let images: [&[u8]; 6] = [
+            b"https://a/p.jpg",
+            b"//walter.trakt.tv/p.jpg",
+            b"",
+            b"walter/p",
+            b"http",
+            b"///x",
+        ];
+        let out = words(nntmux_w49_tv_trakt_ids_batch, &[&imdb, &images], &[], 6, 2);
+        assert_eq!(
+            out,
+            [
+                944_947,
+                1,
+                12_345_678,
+                2 | (2 << 2),
+                0,
+                0,
+                0,
+                2,
+                -1,
+                1,
+                123_456,
+                2 | (3 << 2)
+            ]
+        );
+    }
+
+    #[test]
+    fn w494_outcomes_follow_resolve_outcome() {
+        let statuses: [&[u8]; 7] = [
+            b"matched",
+            b"season_pack",
+            b"episode_missing",
+            b"episode_missing",
+            b"transient",
+            b"transient",
+            b"bogus",
+        ];
+        let values = [
+            5, 0, 3, 7, 42, 0, 0, //
+            7, 42, 0, 7, 0, 0, 0, //
+            7, -11, 2, 7, 0, 0, 0, //
+            7, -11, 5, 7, 0, 1, 30, //
+            0, 0, 2, 0, 0, 1, 5000, //
+            0, 0, 7, 0, 0, 1, 0, //
+            0, -10, 0, 0, 0, 0, 0,
+        ];
+        let out = words(
+            nntmux_w49_tv_outcome_resolve_batch,
+            &[&statuses],
+            &values,
+            7,
+            4,
+        );
+        assert_eq!(
+            out,
+            [
+                42, 0, -1, 7, //
+                -12, 0, -1, 7, //
+                -11, 3, 86_400, 4, //
+                -11, 6, 900, 4, //
+                0, 3, 5000, 0, //
+                -10, 0, -1, 0, //
+                -10, 0, -1, 0,
+            ]
+        );
+        let saturated = words(
+            nntmux_w49_tv_outcome_resolve_batch,
+            &[&[b"transient"]],
+            &[0, 0, i64::MAX, 0, 0, 0, 0],
+            1,
+            4,
+        );
+        assert_eq!(saturated, [-10, 0, -1, 0]);
+        // A previously linked release that is no longer found unlinks without a cache bump.
+        let unlinked = words(
+            nntmux_w49_tv_outcome_resolve_batch,
+            &[&[b"not_found"]],
+            &[9, 77, 0, 9, 0, 0, 0],
+            1,
+            4,
+        );
+        assert_eq!(unlinked, [-10, 0, -1, 1]);
+    }
+
+    #[test]
+    fn w494_poster_pick_prefers_first_valid_image() {
+        let provider: [&[u8]; 4] = [
+            b" https://img/a.JPG?x=1 ",
+            b"https:///a.jpg",
+            b"",
+            b"ftp://x/a.png",
+        ];
+        let tmdb: [&[u8]; 4] = [
+            b"https://b/b.png",
+            b"//cdn/b.webp#f",
+            b"",
+            b"HTTP://x/y.jpeg",
+        ];
+        let fanart: [&[u8]; 4] = [b"", b"x", b"\t", b"http://x?.png"];
+        let out = words(
+            nntmux_w49_tv_poster_pick_batch,
+            &[&provider, &tmdb, &fanart],
+            &[],
+            4,
+            3,
+        );
+        assert_eq!(
+            out,
+            [
+                0,
+                (1 << 32) | 21,
+                0b011_011,
+                1,
+                14,
+                0b111_010,
+                -1,
+                0,
+                0,
+                1,
+                15,
+                0b111_010
+            ]
+        );
+    }
+
+    #[test]
+    fn w494_show_adder_requests() {
+        let sources: [&[u8]; 7] = [
+            b" TVDB ", b"imdb", b"imdb", b"imdb", b"tmdb", b"netflix", b"IMDb",
+        ];
+        let ids: [&[u8]; 7] = [
+            b" 81189 ",
+            b"tt0944947",
+            b"T12345",
+            b"tt123",
+            b"000",
+            b"12",
+            b"0944947123456",
+        ];
+        let out = words(
+            nntmux_w49_tv_show_adder_request_batch,
+            &[&sources, &ids],
+            &[],
+            7,
+            2,
+        );
+        assert_eq!(
+            out,
+            [
+                0,
+                (1 << 32) | 5,
+                4,
+                (2 << 32) | 7,
+                4,
+                (1 << 32) | 5,
+                4,
+                -2,
+                2,
+                -3,
+                -1,
+                2,
+                4,
+                13
+            ]
+        );
+    }
+
+    const EXPORTS: [(Export, usize, usize, usize); 5] = [
+        (nntmux_w49_tv_local_db_show_key_batch, 2, 1, 3),
+        (nntmux_w49_tv_trakt_ids_batch, 2, 0, 2),
+        (nntmux_w49_tv_outcome_resolve_batch, 1, 7, 4),
+        (nntmux_w49_tv_poster_pick_batch, 3, 0, 3),
+        (nntmux_w49_tv_show_adder_request_batch, 2, 0, 2),
+    ];
+
+    #[test]
+    fn w494_inputs_are_validated_before_writing() {
+        for (export, cols, per_ints, per) in EXPORTS {
+            let mut out = [i64::MIN; 32];
+            let good_text = vec![0u8; cols * 2 - 1];
+            let good_ints = ints(&vec![1; per_ints * 2]);
+            // Field count, int width and stray text mismatches.
+            assert_eq!(call(export, &good_text[1..], &good_ints, 2, &mut out), -1);
+            assert_eq!(
+                call(
+                    export,
+                    &[good_text.as_slice(), &[0]].concat(),
+                    &good_ints,
+                    2,
+                    &mut out
+                ),
+                -1
+            );
+            assert_eq!(
+                call(
+                    export,
+                    &good_text,
+                    &[good_ints.as_slice(), &[0]].concat(),
+                    2,
+                    &mut out
+                ),
+                -1
+            );
+            assert_eq!(call(export, b"x", &[], 0, &mut out), -1);
+            // Null pointers: rejected with a length, accepted when empty.
+            unsafe {
+                assert_eq!(
+                    export(
+                        std::ptr::null(),
+                        1,
+                        std::ptr::null(),
+                        0,
+                        1,
+                        out.as_mut_ptr(),
+                        32
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    export(
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                        0,
+                        out.as_mut_ptr(),
+                        32
+                    ),
+                    0
+                );
+                assert_eq!(
+                    export(
+                        good_text.as_ptr(),
+                        good_text.len(),
+                        good_ints.as_ptr(),
+                        good_ints.len(),
+                        2,
+                        std::ptr::null_mut(),
+                        32
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    export(
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                        0,
+                        std::ptr::null_mut(),
+                        0
+                    ),
+                    -1
+                );
+                // Misaligned output.
+                let raw = out.as_mut_ptr().cast::<u8>().add(1).cast::<i64>();
+                assert_eq!(
+                    export(
+                        good_text.as_ptr(),
+                        good_text.len(),
+                        good_ints.as_ptr(),
+                        good_ints.len(),
+                        2,
+                        raw,
+                        8
+                    ),
+                    -1
+                );
+            }
+            // Capacity is reported in words.
+            assert_eq!(
+                call(export, &good_text, &good_ints, 2, &mut out[..per * 2 - 1]),
+                -((per * 2) as isize)
+            );
+            assert!(out.iter().all(|w| *w == i64::MIN));
+            assert_eq!(
+                call(export, &good_text, &good_ints, 2, &mut out),
+                (per * 2) as isize
+            );
+        }
+    }
+
+    #[test]
+    fn w494_split_matches_std_split_for_every_offset() {
+        // Exercises the eight-byte search across chunk boundaries and high bytes.
+        for len in 0..40 {
+            for at in 0..len {
+                let mut row = vec![0xffu8; len];
+                row[at] = 0;
+                if at + 9 < len {
+                    row[at + 9] = 0;
+                }
+                let fields: Vec<&[u8]> = row.split(|b| *b == 0).collect();
+                let names: Vec<&[u8]> = vec![&b"x"[..]; fields.len()];
+                let text = text(&[&fields, &names]);
+                let mut out = vec![0i64; fields.len() * 2];
+                let count = fields.len();
+                assert_eq!(
+                    call(nntmux_w49_tv_trakt_ids_batch, &text, &[], count, &mut out),
+                    (count * 2) as isize
+                );
+                let short = &text[..text.len() - 2];
+                assert_eq!(
+                    call(nntmux_w49_tv_trakt_ids_batch, short, &[], count, &mut out),
+                    -1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn w494_overlapping_output_is_rejected() {
+        let mut buffer = [0i64; 8];
+        let ptr = buffer.as_mut_ptr();
+        let rc = unsafe {
+            nntmux_w49_tv_trakt_ids_batch(ptr.cast::<u8>(), 3, std::ptr::null(), 0, 1, ptr, 8)
+        };
+        assert_eq!(rc, -1);
+    }
+}
