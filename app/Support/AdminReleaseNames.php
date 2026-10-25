@@ -24,6 +24,33 @@ final class AdminReleaseNames
 
     private const int RUST_MAX_INPUT = 16_777_216;
 
+    /**
+     * Wave 46.3 production default is Rust: the paired benchmark in
+     * tests/Unit/RustAbstractCategorizerPipeSafetyNetDisplayNamesW46ParityTest.php measures
+     * 5.24-5.61x mean / 4.66-5.96x p99 on the common 32-row batch and 8.60-9.03x mean /
+     * 5.62-6.85x p99 on the uncommon 2000-row batch. PHP decides batches Rust declines.
+     * Named W463 so it stays distinct from the class's existing Rust paths.
+     */
+    public const bool W463_RUST_FFI_DEFAULT = true;
+
+    public const string W463_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w463_admin_name_display_batch(
+            const char *blob_ptr,
+            size_t blob_len,
+            const char *lens_ptr,
+            size_t lens_len,
+            char *out_buf,
+            size_t out_cap
+        );
+        C;
+
+    /** Exactly 6 0x1F-separated decimals of 1-19 digits. */
+    private const string W463_FIELDS_PATTERN = '/\A(?:\d{1,19}\x1F){5}\d{1,19}\z/';
+
+    private static ?bool $w463RustFfiOverride = null;
+
+    private static FFI|false|null $w463RustFfiHandle = null;
+
     private static ?bool $useRustFfi = null;
 
     private static FFI|false|null $ffi = null;
@@ -228,5 +255,171 @@ final class AdminReleaseNames
         } catch (Throwable) {
             return null;
         }
+    }
+
+    /**
+     * Enables (true) or disables (false) the Wave 46.3 Rust helper; null restores
+     * W463_RUST_FFI_DEFAULT.
+     */
+    public static function useW463RustFfi(?bool $enable = true): void
+    {
+        self::$w463RustFfiOverride = $enable;
+    }
+
+    public static function usesW463RustFfi(): bool
+    {
+        return self::$w463RustFfiOverride ?? self::W463_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW463RustFfi(): void
+    {
+        self::$w463RustFfiOverride = null;
+        self::$w463RustFfiHandle = null;
+    }
+
+    /**
+     * Name display summary for a batch of `searchname`/`name` rows as render() presents them:
+     * rows whose search name or original name ReleaseNameDisplay::cleanPhp() changes, rows whose
+     * cleaned search name is empty, rows that render the secondary original-name line, and rows
+     * whose cleaned search name needs HTML escaping. Missing or non-string fields count as empty.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array{rows: int, display_cleaned: int, original_cleaned: int, empty_display: int, secondary: int, escaped: int}
+     */
+    public static function summarizeNameDisplayBatch(array $rows): array
+    {
+        return (self::usesW463RustFfi() ? self::summarizeNameDisplayBatchNative($rows) : null)
+            ?? self::summarizeNameDisplayBatchPhp($rows);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rows
+     * @return array{rows: int, display_cleaned: int, original_cleaned: int, empty_display: int, secondary: int, escaped: int}
+     */
+    public static function summarizeNameDisplayBatchPhp(array $rows): array
+    {
+        $displayCleaned = $originalCleaned = $emptyDisplay = $secondary = $escaped = 0;
+        foreach ($rows as $row) {
+            [$searchname, $name] = self::renderBatchFields($row);
+            $searchname = \is_string($searchname) ? $searchname : '';
+            $name = \is_string($name) ? $name : '';
+            $display = ReleaseNameDisplay::cleanPhp($searchname);
+            $original = ReleaseNameDisplay::cleanPhp($name);
+            $escapedDisplay = e($display);
+            $displayCleaned += (int) ($display !== $searchname);
+            $originalCleaned += (int) ($original !== $name);
+            $emptyDisplay += (int) ($display === '');
+            $secondary += (int) ($original !== '' && e($original) !== $escapedDisplay);
+            $escaped += (int) ($escapedDisplay !== $display);
+        }
+
+        return [
+            'rows' => \count($rows),
+            'display_cleaned' => $displayCleaned,
+            'original_cleaned' => $originalCleaned,
+            'empty_display' => $emptyDisplay,
+            'secondary' => $secondary,
+            'escaped' => $escaped,
+        ];
+    }
+
+    /**
+     * Sends each row as a search name/name pair. Declines (null) when PCRE limits differ from their
+     * defaults and when the library is unavailable; Rust also declines whole batches holding a
+     * non-ASCII or 4096+ byte name, so escaping substitutions and PCRE locale tables stay on PHP.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array{rows: int, display_cleaned: int, original_cleaned: int, empty_display: int, secondary: int, escaped: int}|null
+     */
+    public static function summarizeNameDisplayBatchNative(array $rows): ?array
+    {
+        if (! self::w463PcreAtDefaults()) {
+            return null;
+        }
+        $parts = [];
+        $lengths = [];
+        foreach ($rows as $row) {
+            $searchname = \is_array($row) ? ($row['searchname'] ?? '') : '';
+            $name = \is_array($row) ? ($row['name'] ?? '') : '';
+            $searchname = \is_string($searchname) ? $searchname : '';
+            $name = \is_string($name) ? $name : '';
+            $parts[] = $searchname;
+            $parts[] = $name;
+            $lengths[] = \strlen($searchname);
+            $lengths[] = \strlen($name);
+        }
+        $fields = self::callW463Native(implode('', $parts), pack('V*', ...$lengths));
+        if ($fields === null) {
+            return null;
+        }
+
+        return [
+            'rows' => (int) $fields[0],
+            'display_cleaned' => (int) $fields[1],
+            'original_cleaned' => (int) $fields[2],
+            'empty_display' => (int) $fields[3],
+            'secondary' => (int) $fields[4],
+            'escaped' => (int) $fields[5],
+        ];
+    }
+
+    /**
+     * Whether PCRE runs with the limits Rust mirrors; restricted resources keep PHP's failure
+     * behavior.
+     */
+    private static function w463PcreAtDefaults(): bool
+    {
+        return (int) ini_get('pcre.backtrack_limit') >= 1000000
+            && (int) ini_get('pcre.recursion_limit') >= 100000
+            && ini_get('pcre.jit') === '1';
+    }
+
+    /**
+     * Calls the Wave 46.3 export with the shared scratch buffer, retrying once at the size it asks
+     * for. Returns its fields only when they match W463_FIELDS_PATTERN.
+     *
+     * @return list<string>|null
+     */
+    private static function callW463Native(string $blob, string $lens): ?array
+    {
+        $ffi = self::w463RustFfi();
+        if ($ffi === null) {
+            return null;
+        }
+
+        try {
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, 192, $capacity);
+            if ($buffer === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w463_admin_name_display_batch($blob, \strlen($blob), $lens, \strlen($lens), $buffer, $capacity);
+            if (\is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w463_admin_name_display_batch($blob, \strlen($blob), $lens, \strlen($lens), $buffer, $capacity);
+            }
+            if (! \is_int($written) || $written < 0 || $written > $capacity) {
+                return null;
+            }
+            $raw = FFI::string($buffer, $written);
+
+            return preg_match(self::W463_FIELDS_PATTERN, $raw) === 1 ? explode("\x1F", $raw) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private static function w463RustFfi(): ?FFI
+    {
+        if (self::$w463RustFfiHandle === null) {
+            self::$w463RustFfiHandle = RustPipelineLibrary::resolveDomain('categorize_w463', self::W463_FFI_CDEF) ?? false;
+        }
+
+        return self::$w463RustFfiHandle === false ? null : self::$w463RustFfiHandle;
     }
 }
