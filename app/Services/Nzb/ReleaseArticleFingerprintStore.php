@@ -97,4 +97,108 @@ final class ReleaseArticleFingerprintStore
 
         return is_array($result) ? $result : null;
     }
+
+    /**
+     * Default for the Wave 43.2 toggle only; it stays false because the paired benchmark in
+     * tests/Unit/RustNzbPar2ResultFingerprintStoreWorkerQueueW43ParityTest.php is below 1.5x.
+     */
+    public const bool W432_RUST_FFI_DEFAULT = false;
+
+    /** The canonical NzbArticleFingerprint value: a lowercase SHA-1 hex digest. */
+    public const string W432_CANONICAL_FINGERPRINT = '/\A[0-9a-f]{40}\z/';
+
+    private static ?bool $useW432RustFfi = null;
+
+    /** Force the Wave 43.2 helper onto Rust (true) or PHP (false); null restores W432_RUST_FFI_DEFAULT. */
+    public static function useW432RustFfi(?bool $enable = true): void
+    {
+        self::$useW432RustFfi = $enable;
+    }
+
+    public static function usesW432RustFfi(): bool
+    {
+        return self::$useW432RustFfi ?? self::W432_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW432RustFfi(): void
+    {
+        self::$useW432RustFfi = null;
+    }
+
+    /**
+     * Classify fingerprints before storage, as store() treats them: null is absent (no update), any other non-string is
+     * invalid, and every string is stored byte for byte; stored values are canonical (lowercase 40-hex), noncanonical_hex
+     * (40 hex digits with an uppercase letter), empty or other, with their distinct count and summed bytes.
+     *
+     * @param  array<array-key, mixed>  $fingerprints
+     * @return array{fingerprints: int, absent: int, invalid: int, stored: int, canonical: int, noncanonical_hex: int, empty: int, other: int, distinct: int, payload_bytes: int}
+     */
+    public static function summarizeFingerprintBatch(array $fingerprints): array
+    {
+        return (self::usesW432RustFfi() ? self::summarizeFingerprintBatchNative($fingerprints) : null)
+            ?? self::summarizeFingerprintBatchPhp($fingerprints);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $fingerprints
+     * @return array{fingerprints: int, absent: int, invalid: int, stored: int, canonical: int, noncanonical_hex: int, empty: int, other: int, distinct: int, payload_bytes: int}
+     */
+    public static function summarizeFingerprintBatchPhp(array $fingerprints): array
+    {
+        $absent = $invalid = $stored = $canonical = $noncanonical = $empty = $other = $bytes = 0;
+        $seen = [];
+        foreach ($fingerprints as $fingerprint) {
+            if ($fingerprint === null) {
+                $absent++;
+            } elseif (! \is_string($fingerprint)) {
+                $invalid++;
+            } else {
+                $stored++;
+                $bytes += \strlen($fingerprint);
+                $seen[$fingerprint] = true;
+                if ($fingerprint === '') {
+                    $empty++;
+                } elseif (preg_match(self::W432_CANONICAL_FINGERPRINT, $fingerprint) === 1) {
+                    $canonical++;
+                } elseif (\strlen($fingerprint) === 40 && ctype_xdigit($fingerprint)) {
+                    $noncanonical++;
+                } else {
+                    $other++;
+                }
+            }
+        }
+
+        return ['fingerprints' => \count($fingerprints), 'absent' => $absent, 'invalid' => $invalid, 'stored' => $stored, 'canonical' => $canonical,
+            'noncanonical_hex' => $noncanonical, 'empty' => $empty, 'other' => $other, 'distinct' => \count($seen), 'payload_bytes' => $bytes];
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $fingerprints
+     * @return array{fingerprints: int, absent: int, invalid: int, stored: int, canonical: int, noncanonical_hex: int, empty: int, other: int, distinct: int, payload_bytes: int}|null
+     */
+    public static function summarizeFingerprintBatchNative(array $fingerprints): ?array
+    {
+        $slots = [];
+        $tail = [];
+        foreach ($fingerprints as $fingerprint) {
+            if (\is_string($fingerprint)) {
+                array_push($slots, \strlen($fingerprint), 0);
+                $tail[] = $fingerprint;
+            } else {
+                array_push($slots, -1, $fingerprint === null ? 1 : 2);
+            }
+        }
+        $values = Par2CandidateRecoveryResult::evaluateW432Native(1, \count($fingerprints), $slots, implode('', $tail), 10);
+        if ($values === null) {
+            return null;
+        }
+        [$count, $absent, $invalid, $stored, $canonical, $noncanonical, $empty, $other, $distinct, $bytes] = $values;
+        if ($count !== \count($fingerprints) || min($values) < 0 || $absent + $invalid + $stored !== $count
+            || $canonical + $noncanonical + $empty + $other !== $stored || $distinct > $stored || ($stored > 0) !== ($distinct > 0)) {
+            return null;
+        }
+
+        return ['fingerprints' => $count, 'absent' => $absent, 'invalid' => $invalid, 'stored' => $stored, 'canonical' => $canonical,
+            'noncanonical_hex' => $noncanonical, 'empty' => $empty, 'other' => $other, 'distinct' => $distinct, 'payload_bytes' => $bytes];
+    }
 }
