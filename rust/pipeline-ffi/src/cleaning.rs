@@ -33652,9 +33652,9 @@ pub mod w48_proxy_verdict_captcha_breach_reglog {
         table
     };
 
-    struct Json<'a> {
-        s: &'a [u8],
-        i: usize,
+    pub(crate) struct Json<'a> {
+        pub(crate) s: &'a [u8],
+        pub(crate) i: usize,
     }
 
     impl Json<'_> {
@@ -33725,7 +33725,7 @@ pub mod w48_proxy_verdict_captcha_breach_reglog {
         /// Validates the string at `"` like PHP's scanner (UTF-8, control bytes, escapes and
         /// UTF-16 surrogate pairs), appending the decoded bytes to `out` when given. True when
         /// the string held an escape.
-        fn string(&mut self, mut out: Option<&mut Vec<u8>>) -> Option<bool> {
+        pub(crate) fn string(&mut self, mut out: Option<&mut Vec<u8>>) -> Option<bool> {
             let s = self.s;
             let mut i = self.i + 1;
             let mut seg = i;
@@ -35086,6 +35086,1325 @@ pub mod w48_proxy_verdict_captcha_breach_reglog {
                 )
             };
             assert_eq!(n, -1);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wave 49.1: GdprAuditService, GdprDataInventory, GdprErasureService,
+// GdprExportService and GdprRetentionService batch kernels.
+// ---------------------------------------------------------------------------
+
+pub mod w49_gdpr_audit_inventory_erasure_export_retention {
+    //! Wave 49.1 batch kernels for the GDPR services. Every export reads NUL-joined columns,
+    //! writes a fixed number of `i64` words per record into `out` and returns the word count,
+    //! `SHORT_CAPACITY` when `out_cap` (in words) is too small, or -1 for a malformed batch.
+
+    use super::w47_irc_stream_cloudflare_proxy::php_trim;
+    use super::w48_proxy_verdict_captcha_breach_reglog::{Json, MAX_JSON_DEPTH, crc32, rows};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::OnceLock;
+
+    pub const MAX_INPUT: usize = 64 * 1024 * 1024;
+    pub const MAX_ITEMS: usize = 1 << 20;
+    pub const SHORT_CAPACITY: isize = -2;
+
+    /// Borrows a caller span; an empty span may be null and is never dereferenced.
+    unsafe fn span<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null() || len > MAX_INPUT {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
+    fn overlaps(input: (*const u8, usize), out: *mut i64, words: usize) -> bool {
+        let (a, a_len) = (input.0 as usize, input.1);
+        let (b, b_len) = (out as usize, words.saturating_mul(8));
+        a_len != 0 && b_len != 0 && a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
+    }
+
+    /// Validates the output window for `count * per_item` words, lets `body` push them and
+    /// copies the words to `out`.
+    unsafe fn run(
+        out: *mut i64,
+        out_cap: usize,
+        count: usize,
+        per_item: usize,
+        inputs: &[(*const u8, usize)],
+        body: impl FnOnce(&mut Vec<i64>) -> bool,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out.is_null()
+                || !(out as usize).is_multiple_of(std::mem::align_of::<i64>())
+                || count > MAX_ITEMS
+                || out_cap > isize::MAX as usize / 8
+            {
+                return -1;
+            }
+            let needed = count * per_item;
+            if needed > out_cap {
+                return SHORT_CAPACITY;
+            }
+            if inputs.iter().any(|&input| overlaps(input, out, needed)) {
+                return -1;
+            }
+            let mut words = Vec::with_capacity(needed);
+            if !body(&mut words) || words.len() != needed {
+                return -1;
+            }
+            // `needed` words were checked against `out_cap` above.
+            unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), out, needed) };
+            needed as isize
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// The integer a PHP array-key string becomes (`"0"`, or an optional `-` then `1-9` and
+    /// digits within i64); None when it stays a string key.
+    pub fn int_key(name: &[u8]) -> Option<i64> {
+        let (negative, digits) = match name {
+            [b'-', rest @ ..] => (true, rest),
+            _ => (false, name),
+        };
+        match digits {
+            [b'0'] => return (!negative).then_some(0),
+            [b'1'..=b'9', rest @ ..] if rest.iter().all(u8::is_ascii_digit) => {}
+            _ => return None,
+        }
+        digits.iter().try_fold(0i64, |v, &d| {
+            let d = i64::from(d - b'0');
+            if negative {
+                v.checked_mul(10)?.checked_sub(d)
+            } else {
+                v.checked_mul(10)?.checked_add(d)
+            }
+        })
+    }
+
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGHS: u64 = 0x8080_8080_8080_8080;
+
+    /// Flags (at least) the lowest zero byte of `x`; bytes above it may be false positives.
+    fn zero_bytes(x: u64) -> u64 {
+        x.wrapping_sub(ONES) & !x & HIGHS
+    }
+
+    fn hex4(s: &[u8], at: usize) -> Option<u32> {
+        let h = s.get(at..at + 4)?;
+        h.iter()
+            .try_fold(0u32, |v, &b| Some(v << 4 | (b as char).to_digit(16)?))
+    }
+
+    /// Length of the well-formed UTF-8 sequence at `s[i]` (a byte >= 0x80), as PHP's JSON
+    /// scanner accepts it.
+    fn utf8_len(s: &[u8], i: usize) -> Option<usize> {
+        let (len, lo, hi) = match s[i] {
+            0xC2..=0xDF => (2, 0x80, 0xBF),
+            0xE0 => (3, 0xA0, 0xBF),
+            0xE1..=0xEC | 0xEE | 0xEF => (3, 0x80, 0xBF),
+            0xED => (3, 0x80, 0x9F),
+            0xF0 => (4, 0x90, 0xBF),
+            0xF1..=0xF3 => (4, 0x80, 0xBF),
+            0xF4 => (4, 0x80, 0x8F),
+            _ => return None,
+        };
+        let tail = s.get(i + 1..i + len)?;
+        ((lo..=hi).contains(&tail[0]) && tail[1..].iter().all(|b| (0x80..=0xBF).contains(b)))
+            .then_some(len)
+    }
+
+    /// Validating scanner for the grammar PHP's `json_decode()` accepts at its default depth.
+    struct Scan<'a> {
+        s: &'a [u8],
+        i: usize,
+    }
+
+    impl Scan<'_> {
+        fn ws(&mut self) {
+            while let Some(b' ' | b'\t' | b'\n' | b'\r') = self.s.get(self.i) {
+                self.i += 1;
+            }
+        }
+
+        fn peek(&self) -> Option<u8> {
+            self.s.get(self.i).copied()
+        }
+
+        /// Validates the string at `"` (UTF-8, control bytes, escapes and UTF-16 surrogate
+        /// pairs) and steps past it. True when it held an escape.
+        fn string(&mut self) -> Option<bool> {
+            let s = self.s;
+            let mut i = self.i + 1;
+            let mut escaped = false;
+            loop {
+                while let Some(chunk) = s.get(i..i + 8) {
+                    let x = u64::from_le_bytes(chunk.try_into().ok()?);
+                    let stop = zero_bytes(x ^ (ONES * u64::from(b'"')))
+                        | zero_bytes(x ^ (ONES * u64::from(b'\\')))
+                        | (x.wrapping_sub(ONES * 0x20) & !x & HIGHS)
+                        | (x & HIGHS);
+                    if stop != 0 {
+                        i += (stop.trailing_zeros() / 8) as usize;
+                        break;
+                    }
+                    i += 8;
+                }
+                match *s.get(i)? {
+                    b'"' => {
+                        self.i = i + 1;
+                        return Some(escaped);
+                    }
+                    b'\\' => {
+                        escaped = true;
+                        i += self.escape(i)?;
+                    }
+                    0..=0x1F => return None,
+                    0x80.. => i += utf8_len(s, i)?,
+                    _ => i += 1,
+                }
+            }
+        }
+
+        fn escape(&self, i: usize) -> Option<usize> {
+            match *self.s.get(i + 1)? {
+                b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => Some(2),
+                b'u' => {
+                    let hi = hex4(self.s, i + 2)?;
+                    if (0xD800..0xDC00).contains(&hi) {
+                        if self.s.get(i + 6..i + 8) != Some(b"\\u") {
+                            return None;
+                        }
+                        (0xDC00..0xE000)
+                            .contains(&hex4(self.s, i + 8)?)
+                            .then_some(12)
+                    } else {
+                        (!(0xDC00..0xE000).contains(&hi)).then_some(6)
+                    }
+                }
+                _ => None,
+            }
+        }
+
+        fn digits(&self, mut i: usize) -> usize {
+            while matches!(self.s.get(i), Some(b'0'..=b'9')) {
+                i += 1;
+            }
+            i
+        }
+
+        fn number(&mut self) -> Option<()> {
+            let mut i = self.i + usize::from(self.peek() == Some(b'-'));
+            match self.s.get(i)? {
+                b'0' => i += 1,
+                b'1'..=b'9' => i = self.digits(i + 1),
+                _ => return None,
+            }
+            if self.s.get(i) == Some(&b'.') {
+                let end = self.digits(i + 1);
+                if end == i + 1 {
+                    return None;
+                }
+                i = end;
+            }
+            if matches!(self.s.get(i), Some(b'e' | b'E')) {
+                i += 1;
+                if matches!(self.s.get(i), Some(b'+' | b'-')) {
+                    i += 1;
+                }
+                let end = self.digits(i);
+                if end == i {
+                    return None;
+                }
+                i = end;
+            }
+            self.i = i;
+            Some(())
+        }
+
+        fn literal(&mut self, word: &[u8]) -> Option<()> {
+            self.s[self.i..]
+                .starts_with(word)
+                .then(|| self.i += word.len())
+        }
+
+        /// Validates one value with `depth` containers already open.
+        fn value(&mut self, depth: usize) -> Option<()> {
+            match self.peek()? {
+                b'{' | b'[' => self.container(depth),
+                b'"' => self.string().map(drop),
+                b't' => self.literal(b"true"),
+                b'f' => self.literal(b"false"),
+                b'n' => self.literal(b"null"),
+                _ => self.number(),
+            }
+        }
+
+        fn container(&mut self, depth: usize) -> Option<()> {
+            if depth >= MAX_JSON_DEPTH {
+                return None;
+            }
+            let close = if self.s[self.i] == b'{' { b'}' } else { b']' };
+            self.i += 1;
+            self.ws();
+            if self.peek()? == close {
+                self.i += 1;
+                return Some(());
+            }
+            loop {
+                if close == b'}' {
+                    self.key()?;
+                }
+                self.value(depth + 1)?;
+                if !self.next(close)? {
+                    return Some(());
+                }
+            }
+        }
+
+        /// Reads a member key and its `:`; true when the key held an escape.
+        fn key(&mut self) -> Option<bool> {
+            if self.peek()? != b'"' {
+                return None;
+            }
+            let escaped = self.string()?;
+            self.ws();
+            if self.peek()? != b':' {
+                return None;
+            }
+            self.i += 1;
+            self.ws();
+            Some(escaped)
+        }
+
+        /// After a member: true at `,` (consumed), false at `close` (consumed).
+        fn next(&mut self, close: u8) -> Option<bool> {
+            self.ws();
+            let b = self.peek()?;
+            self.i += 1;
+            if b == b',' {
+                self.ws();
+                Some(true)
+            } else {
+                (b == close).then_some(false)
+            }
+        }
+    }
+
+    /// Bytes of a decoded key or string: a range of the input, or of `Doc::arena` once an
+    /// escape had to be decoded.
+    #[derive(Clone, Copy, Default)]
+    struct Span {
+        start: usize,
+        end: usize,
+        arena: bool,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Kind {
+        Other,
+        True,
+        Str,
+    }
+
+    #[derive(Clone, Copy)]
+    struct Member {
+        hash: u64,
+        key: Span,
+        kind: Kind,
+        value: Span,
+    }
+
+    fn key_hash(key: &[u8]) -> u64 {
+        let (chunks, rest) = key.as_chunks::<8>();
+        let mut h = 0x9E37_79B9_7F4A_7C15 ^ key.len() as u64;
+        for chunk in chunks {
+            h = (h ^ u64::from_le_bytes(*chunk))
+                .wrapping_mul(0xFF51_AFD7_ED55_8CCD)
+                .rotate_left(29);
+        }
+        let tail = rest.iter().rev().fold(0u64, |v, &b| v << 8 | u64::from(b));
+        (h ^ tail).wrapping_mul(0xC4CE_B9FE_1A85_EC53)
+    }
+
+    /// A key looked up in every document of a batch.
+    pub struct Needle<'a> {
+        bytes: &'a [u8],
+        hash: u64,
+        index: Option<i64>,
+    }
+
+    impl<'a> Needle<'a> {
+        pub fn new(bytes: &'a [u8]) -> Self {
+            Self {
+                bytes,
+                hash: key_hash(bytes),
+                index: int_key(bytes),
+            }
+        }
+    }
+
+    /// Members up to this count are deduplicated and searched linearly.
+    const LINEAR_MEMBERS: usize = 16;
+
+    /// Top-level shape of PHP's `json_decode($json, true)`: whether it is an array, its
+    /// `count()` and, for objects, the keys with the last value each one received.
+    #[derive(Default)]
+    pub struct Doc<'a> {
+        pub is_array: bool,
+        is_list: bool,
+        pub count: usize,
+        s: &'a [u8],
+        arena: Vec<u8>,
+        members: Vec<Member>,
+        sorted: Vec<(u64, usize)>,
+    }
+
+    impl<'a> Doc<'a> {
+        fn bytes(&self, span: Span) -> &[u8] {
+            let source = if span.arena { &self.arena[..] } else { self.s };
+            &source[span.start..span.end]
+        }
+
+        /// Decodes the escaped string at `at` into the arena.
+        fn decode(&mut self, at: usize) -> Option<Span> {
+            let start = self.arena.len();
+            Json { s: self.s, i: at }.string(Some(&mut self.arena))?;
+            Some(Span {
+                start,
+                end: self.arena.len(),
+                arena: true,
+            })
+        }
+
+        /// Parses `json`, decoding the string values of keys accepted by `keep`.
+        pub fn parse(&mut self, json: &'a [u8], keep: impl Fn(&[u8]) -> bool) {
+            self.is_array = false;
+            self.is_list = false;
+            self.count = 0;
+            self.s = json;
+            self.arena.clear();
+            self.members.clear();
+            let mut p = Scan { s: json, i: 0 };
+            p.ws();
+            let open = p.peek();
+            let parsed = match open {
+                Some(b'{') => self.object(&mut p, &keep),
+                Some(b'[') => self.list(&mut p),
+                _ => p.value(0),
+            };
+            p.ws();
+            if parsed.is_some() && p.i == json.len() && matches!(open, Some(b'{' | b'[')) {
+                self.is_array = true;
+                self.is_list = open == Some(b'[');
+                if !self.is_list {
+                    self.dedupe();
+                }
+            } else {
+                self.count = 0;
+                self.members.clear();
+            }
+        }
+
+        fn list(&mut self, p: &mut Scan) -> Option<()> {
+            p.i += 1;
+            p.ws();
+            if p.peek()? == b']' {
+                p.i += 1;
+                return Some(());
+            }
+            loop {
+                p.value(1)?;
+                self.count += 1;
+                if !p.next(b']')? {
+                    return Some(());
+                }
+            }
+        }
+
+        fn object(&mut self, p: &mut Scan, keep: &impl Fn(&[u8]) -> bool) -> Option<()> {
+            p.i += 1;
+            p.ws();
+            if p.peek()? == b'}' {
+                p.i += 1;
+                return Some(());
+            }
+            loop {
+                let at = p.i;
+                let escaped = p.string()?;
+                let key = if escaped {
+                    self.decode(at)?
+                } else {
+                    Span {
+                        start: at + 1,
+                        end: p.i - 1,
+                        arena: false,
+                    }
+                };
+                p.ws();
+                if p.peek()? != b':' {
+                    return None;
+                }
+                p.i += 1;
+                p.ws();
+                let at = p.i;
+                let mut value = Span::default();
+                let kind = if p.peek()? == b'"' && keep(self.bytes(key)) {
+                    value = if p.string()? {
+                        self.decode(at)?
+                    } else {
+                        Span {
+                            start: at + 1,
+                            end: p.i - 1,
+                            arena: false,
+                        }
+                    };
+                    Kind::Str
+                } else {
+                    p.value(1)?;
+                    if &json_slice(p, at) == b"true" {
+                        Kind::True
+                    } else {
+                        Kind::Other
+                    }
+                };
+                let hash = key_hash(self.bytes(key));
+                self.members.push(Member {
+                    hash,
+                    key,
+                    kind,
+                    value,
+                });
+                if !p.next(b'}')? {
+                    return Some(());
+                }
+            }
+        }
+
+        fn same(&self, a: &Member, b: &Member) -> bool {
+            a.hash == b.hash && self.bytes(a.key) == self.bytes(b.key)
+        }
+
+        /// Counts distinct keys; large objects also get a hash index for lookups.
+        fn dedupe(&mut self) {
+            let n = self.members.len();
+            if n <= LINEAR_MEMBERS {
+                let m = &self.members;
+                self.count = (0..n)
+                    .filter(|&i| !m[i + 1..].iter().any(|later| self.same(&m[i], later)))
+                    .count();
+                return;
+            }
+            let mut sorted = std::mem::take(&mut self.sorted);
+            sorted.clear();
+            sorted.extend(self.members.iter().enumerate().map(|(i, m)| (m.hash, i)));
+            sorted.sort_unstable();
+            let mut count = 0;
+            for (k, &(hash, i)) in sorted.iter().enumerate() {
+                let superseded = sorted[k + 1..]
+                    .iter()
+                    .take_while(|&&(h, _)| h == hash)
+                    .any(|&(_, j)| self.same(&self.members[i], &self.members[j]));
+                count += usize::from(!superseded);
+            }
+            self.sorted = sorted;
+            self.count = count;
+        }
+
+        fn find(&self, needle: &Needle) -> Option<&Member> {
+            if !self.is_array || self.is_list {
+                return None;
+            }
+            let matches = |m: &Member| m.hash == needle.hash && self.bytes(m.key) == needle.bytes;
+            if self.members.len() <= LINEAR_MEMBERS {
+                return self.members.iter().rev().find(|m| matches(m));
+            }
+            let from = self.sorted.partition_point(|&(h, _)| h < needle.hash);
+            self.sorted[from..]
+                .iter()
+                .take_while(|&&(h, _)| h == needle.hash)
+                .filter(|&&(_, i)| matches(&self.members[i]))
+                .map(|&(_, i)| i)
+                .max()
+                .map(|i| &self.members[i])
+        }
+
+        /// PHP `array_key_exists($needle, $decoded)`.
+        pub fn has(&self, needle: &Needle) -> bool {
+            if self.is_list {
+                return needle
+                    .index
+                    .is_some_and(|i| i >= 0 && (i as u64) < self.count as u64);
+            }
+            self.find(needle).is_some()
+        }
+
+        /// `$decoded[$needle] === true`.
+        pub fn is_true(&self, needle: &Needle) -> bool {
+            self.find(needle).is_some_and(|m| m.kind == Kind::True)
+        }
+
+        /// The decoded string at `$decoded[$needle]` for a key accepted by `keep`.
+        pub fn string(&self, needle: &Needle) -> Option<&[u8]> {
+            self.find(needle)
+                .filter(|m| m.kind == Kind::Str)
+                .map(|m| self.bytes(m.value))
+        }
+    }
+
+    fn json_slice<'s>(p: &Scan<'s>, at: usize) -> &'s [u8] {
+        &p.s[at..p.i]
+    }
+
+    fn cap(n: usize, max: usize) -> i64 {
+        n.min(max) as i64
+    }
+
+    /// GdprAuditService event codes 0..4; any other event is 15.
+    pub const AUDIT_EVENTS: [&[u8]; 5] = [
+        b"request_submitted",
+        b"request_rejected",
+        b"export_generated",
+        b"erasure_soft_delete",
+        b"erasure_force_delete",
+    ];
+
+    /// Metadata keys whose presence sets bits 24..32 of an audit word.
+    pub const AUDIT_KEYS: [&[u8]; 9] = [
+        b"subject",
+        b"force_delete",
+        b"retained_records",
+        b"path",
+        b"expires_at",
+        b"gdpr_minimized",
+        b"email",
+        b"ip_address",
+        b"host",
+    ];
+
+    pub fn audit_needles() -> [Needle<'static>; 9] {
+        AUDIT_KEYS.map(Needle::new)
+    }
+
+    /// GdprAuditService::summarizeAuditRowsPhp() for one row; `keys` from audit_needles().
+    pub fn audit<'a>(
+        doc: &mut Doc<'a>,
+        keys: &[Needle; 9],
+        event: &[u8],
+        metadata: &'a [u8],
+    ) -> (i64, i64) {
+        doc.parse(metadata, |k| k == b"subject");
+        let code = AUDIT_EVENTS
+            .iter()
+            .position(|e| *e == event)
+            .map_or(15, |i| i as i64);
+        let mut word = code | i64::from(doc.is_array) << 4 | cap(event.len(), 255) << 40;
+        let mut subject_crc = -1;
+        if doc.is_array {
+            word |= cap(doc.count, 0xFFFF) << 8;
+            for (bit, key) in keys.iter().enumerate() {
+                if doc.has(key) {
+                    word |= 1 << (24 + bit);
+                }
+            }
+            if let Some(subject) = doc.string(&keys[0]) {
+                subject_crc = crc32(subject);
+                if subject.starts_with(b"deleted_user_") {
+                    word |= 1 << 33;
+                }
+            }
+            if doc.is_true(&keys[1]) {
+                word |= 1 << 34;
+            }
+            if word >> 30 & 7 != 0 {
+                word |= 1 << 48;
+            }
+        }
+        (word, subject_crc)
+    }
+
+    /// Keys GdprErasureService::sanitizeMetadataPhp() unsets.
+    pub const ERASURE_REMOVED_KEYS: [&[u8]; 3] = [b"email", b"ip_address", b"host"];
+
+    /// The removed keys, then `gdpr_minimized`.
+    pub fn erasure_needles() -> [Needle<'static>; 4] {
+        let [email, ip, host] = ERASURE_REMOVED_KEYS;
+        [email, ip, host, b"gdpr_minimized"].map(Needle::new)
+    }
+
+    /// GdprErasureService::planMetadataMinimizationPhp() for one metadata value; `keys` from
+    /// erasure_needles().
+    pub fn erasure<'a>(doc: &mut Doc<'a>, keys: &[Needle; 4], metadata: &'a [u8]) -> i64 {
+        doc.parse(metadata, |_| false);
+        let mut mask = 0;
+        let mut removed = 0;
+        for (bit, key) in keys[..3].iter().enumerate() {
+            if doc.has(key) {
+                mask |= 1 << bit;
+                removed += 1;
+            }
+        }
+        let flagged = doc.has(&keys[3]);
+        let flagged_true = doc.is_true(&keys[3]);
+        let result = doc.count - removed + usize::from(!flagged);
+        i64::from(doc.is_array)
+            | mask << 1
+            | i64::from(flagged) << 4
+            | i64::from(flagged_true) << 5
+            | cap(doc.count, 0xFFFF) << 8
+            | cap(result, 0xFFFF) << 24
+            | i64::from(removed == 0 && flagged_true) << 40
+            | cap(metadata.len(), 0x7FFFF) << 44
+    }
+
+    /// GdprExportService::planRowRedactionsPhp() for one JSON row.
+    pub fn export<'a>(doc: &mut Doc<'a>, row: &'a [u8], columns: &[Needle]) -> i64 {
+        doc.parse(row, |_| false);
+        let mut matched = 0;
+        let mut mask = 0i64;
+        for (i, column) in columns.iter().enumerate() {
+            if doc.has(column) {
+                matched += 1;
+                if i < 32 {
+                    mask |= 1 << i;
+                }
+            }
+        }
+        i64::from(doc.is_array) | cap(doc.count, 0xFFFF) << 1 | cap(matched, 127) << 17 | mask << 24
+    }
+
+    /// GdprDataInventory::erasableTablesPhp(): table, user-column code, has `extra`.
+    const ERASABLE: [(&[u8], i64, bool); 14] = [
+        (b"user_requests", 1, false),
+        (b"user_downloads", 1, false),
+        (b"dnzb_failures", 1, false),
+        (b"users_releases", 1, false),
+        (b"user_series", 1, false),
+        (b"user_movies", 1, false),
+        (b"user_excluded_categories", 1, false),
+        (b"user_invitations", 2, false),
+        (b"trusted_devices", 2, false),
+        (b"password_securities", 2, false),
+        (b"passkeys", 3, true),
+        (b"model_has_permissions", 4, true),
+        (b"model_has_roles", 4, true),
+        (b"role_promotion_stats", 2, false),
+    ];
+
+    /// anonymizedTablesPhp(): table, user-column code.
+    const ANONYMIZED: [(&[u8], i64); 2] = [(b"release_comments", 1), (b"release_reports", 1)];
+
+    /// exportTablesPhp(): key, table, user-column code, order-by code.
+    const EXPORT: [(&[u8], &[u8], i64, i64); 18] = [
+        (b"user_requests", b"user_requests", 1, 1),
+        (b"user_downloads", b"user_downloads", 1, 1),
+        (b"dnzb_failures", b"dnzb_failures", 1, 0),
+        (b"users_releases", b"users_releases", 1, 2),
+        (b"user_series", b"user_series", 1, 0),
+        (b"user_movies", b"user_movies", 1, 0),
+        (
+            b"user_excluded_categories",
+            b"user_excluded_categories",
+            1,
+            0,
+        ),
+        (b"user_invitations", b"user_invitations", 2, 2),
+        (b"release_comments", b"release_comments", 1, 2),
+        (b"release_reports", b"release_reports", 1, 2),
+        (b"invitations_sent", b"invitations", 5, 2),
+        (b"invitations_used", b"invitations", 6, 3),
+        (b"trusted_devices", b"trusted_devices", 2, 2),
+        (b"role_history", b"user_role_history", 2, 2),
+        (b"promotion_stats", b"role_promotion_stats", 2, 2),
+        (b"gdpr_requests", b"gdpr_requests", 2, 2),
+        (b"gdpr_consents", b"gdpr_consents", 2, 2),
+        (b"gdpr_audit_logs", b"gdpr_audit_logs", 2, 2),
+    ];
+
+    /// retainedRecordsPhp(): table, erasure-action code.
+    const RETAINED: [(&[u8], i64); 5] = [
+        (b"payments", 1),
+        (b"paypal_payments", 2),
+        (b"user_activities", 2),
+        (b"gdpr_audit_logs", 2),
+        (b"user_role_history", 2),
+    ];
+
+    /// GdprDataInventory::w49TableWords() for one normalized table name.
+    pub fn table_word(name: &[u8]) -> i64 {
+        let mut word = 0;
+        let mut column = 0;
+        if let Some(i) = ERASABLE.iter().position(|e| e.0 == name) {
+            word |= 1 | (i as i64 + 1) << 8 | i64::from(ERASABLE[i].2) << 28;
+            column = ERASABLE[i].1;
+        }
+        if let Some(a) = ANONYMIZED.iter().find(|a| a.0 == name) {
+            word |= 2;
+            if column == 0 {
+                column = a.1;
+            }
+        }
+        let mut exports = 0;
+        let mut order = 0;
+        for (i, &(key, table, col, by)) in EXPORT.iter().enumerate() {
+            if key == name || table == name {
+                if exports == 0 {
+                    word |= (i as i64 + 1) << 16;
+                    if column == 0 {
+                        column = col;
+                    }
+                    order = by;
+                }
+                exports += 1;
+            }
+        }
+        if exports > 0 {
+            word |= 4 | exports.min(7) << 21;
+        }
+        if let Some(r) = RETAINED.iter().find(|r| r.0 == name) {
+            word |= 8 | r.1 << 36;
+        }
+        word | column << 24 | order << 32
+    }
+
+    /// Longest table name the lookup buckets hold; longer names match nothing.
+    const MAX_TABLE: usize = 32;
+
+    /// Inventoried tables and their words, bucketed by name length.
+    type TableBuckets = [Vec<(&'static [u8], i64)>; MAX_TABLE + 1];
+
+    fn table_words() -> &'static TableBuckets {
+        static WORDS: OnceLock<TableBuckets> = OnceLock::new();
+        WORDS.get_or_init(|| {
+            let mut buckets: TableBuckets = std::array::from_fn(|_| Vec::new());
+            let names = ERASABLE
+                .iter()
+                .map(|e| e.0)
+                .chain(ANONYMIZED.iter().map(|a| a.0))
+                .chain(EXPORT.iter().flat_map(|e| [e.0, e.1]))
+                .chain(RETAINED.iter().map(|r| r.0));
+            for name in names {
+                let bucket = &mut buckets[name.len()];
+                if !bucket.iter().any(|&(known, _)| known == name) {
+                    bucket.push((name, table_word(name)));
+                }
+            }
+            buckets
+        })
+    }
+
+    /// The part of `raw` that `trim(strtolower(trim($raw)))` keeps after the last `.`, with
+    /// backticks and double quotes trimmed from both ends; lowercasing moves no boundary, so
+    /// the caller compares case-insensitively instead of copying.
+    pub fn normalize_table(raw: &[u8]) -> &[u8] {
+        let trimmed = php_trim(raw);
+        let start = trimmed
+            .iter()
+            .rposition(|&b| b == b'.')
+            .map_or(0, |dot| dot + 1);
+        let mut name = &trimmed[start..];
+        while let [b'`' | b'"', rest @ ..] = name {
+            name = rest;
+        }
+        while let [rest @ .., b'`' | b'"'] = name {
+            name = rest;
+        }
+        name
+    }
+
+    /// GdprDataInventory::classifyTablesPhp() for one raw table name.
+    pub fn inventory(raw: &[u8]) -> i64 {
+        let name = normalize_table(raw);
+        let word = table_words()
+            .get(name.len())
+            .and_then(|bucket| {
+                bucket
+                    .iter()
+                    .find(|&&(known, _)| known.eq_ignore_ascii_case(name))
+            })
+            .map_or(0, |&(_, word)| word);
+        let changed = name.len() != raw.len() || name.iter().any(u8::is_ascii_uppercase);
+        word | cap(name.len(), 255) << 40 | i64::from(changed) << 48
+    }
+
+    /// User id of a `gdpr/exports/user-{id}-{14 digits}-{12 alphanumerics}.json` path, with
+    /// `{id}` as `[1-9][0-9]{0,17}`.
+    pub fn canonical_export_path(path: &[u8]) -> Option<i64> {
+        let rest = path
+            .strip_prefix(b"gdpr/exports/user-")?
+            .strip_suffix(b".json")?;
+        let (head, random) = rest.split_at(rest.len().checked_sub(12)?);
+        if !random.iter().all(u8::is_ascii_alphanumeric) {
+            return None;
+        }
+        let head = head.strip_suffix(b"-")?;
+        let (head, stamp) = head.split_at(head.len().checked_sub(14)?);
+        if !stamp.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        let id = head.strip_suffix(b"-")?;
+        match id {
+            [b'1'..=b'9', rest @ ..] if rest.len() <= 17 && rest.iter().all(u8::is_ascii_digit) => {
+                int_key(id)
+            }
+            _ => None,
+        }
+    }
+
+    /// GdprRetentionService::evaluatePurgeBatchPhp() for one request.
+    pub fn retention(disk: &[u8], path: &[u8], expires: Option<i64>, now: i64) -> (i64, i64) {
+        let defaulted = disk.is_empty() || disk == b"0";
+        let resolved: &[u8] = if defaulted { b"local" } else { disk };
+        let purge = !path.is_empty() && expires.is_some_and(|at| at < now);
+        let user = canonical_export_path(path);
+        let traversal = path.split(|&b| b == b'/').any(|segment| segment == b"..");
+        let word = i64::from(purge)
+            | i64::from(defaulted) << 1
+            | i64::from(resolved == b"local") << 2
+            | i64::from(!path.is_empty()) << 3
+            | i64::from(expires.is_some()) << 4
+            | i64::from(user.is_some()) << 5
+            | i64::from(purge && user.is_some()) << 6
+            | i64::from(traversal) << 7
+            | cap(path.len(), 0xFFFF) << 8
+            | cap(resolved.len(), 255) << 24;
+        (word, user.unwrap_or(-1))
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w49_gdpr_audit_summarize_batch(
+        events: *const u8,
+        events_len: usize,
+        metadata: *const u8,
+        metadata_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(events, events_len), (metadata, metadata_len)];
+        unsafe {
+            run(out, out_cap, count, 2, &inputs, |o| {
+                let (Some(events), Some(metadata)) =
+                    (span(events, events_len), span(metadata, metadata_len))
+                else {
+                    return false;
+                };
+                let (Some(events), Some(metadata)) = (rows(events, count), rows(metadata, count))
+                else {
+                    return false;
+                };
+                let mut doc = Doc::default();
+                let keys = audit_needles();
+                for (event, meta) in events.iter().zip(&metadata) {
+                    let (word, subject) = audit(&mut doc, &keys, event, meta);
+                    o.push(word);
+                    o.push(subject);
+                }
+                true
+            })
+        }
+    }
+
+    /// # Safety
+    /// `names` must be readable for `names_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w49_gdpr_inventory_classify_batch(
+        names: *const u8,
+        names_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            run(out, out_cap, count, 1, &[(names, names_len)], |o| {
+                let Some(names) = span(names, names_len).and_then(|n| rows(n, count)) else {
+                    return false;
+                };
+                o.extend(names.iter().map(|name| inventory(name)));
+                true
+            })
+        }
+    }
+
+    /// # Safety
+    /// `metadata` must be readable for `metadata_len` bytes and `out` writable for `out_cap`
+    /// words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w49_gdpr_erasure_metadata_plan_batch(
+        metadata: *const u8,
+        metadata_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            run(out, out_cap, count, 1, &[(metadata, metadata_len)], |o| {
+                let Some(metadata) = span(metadata, metadata_len).and_then(|m| rows(m, count))
+                else {
+                    return false;
+                };
+                let mut doc = Doc::default();
+                let keys = erasure_needles();
+                o.extend(metadata.iter().map(|meta| erasure(&mut doc, &keys, meta)));
+                true
+            })
+        }
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w49_gdpr_export_redaction_plan_batch(
+        rows_ptr: *const u8,
+        rows_len: usize,
+        count: usize,
+        columns: *const u8,
+        columns_len: usize,
+        column_count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(rows_ptr, rows_len), (columns, columns_len)];
+        unsafe {
+            run(out, out_cap, count, 1, &inputs, |o| {
+                let (Some(data), Some(columns)) =
+                    (span(rows_ptr, rows_len), span(columns, columns_len))
+                else {
+                    return false;
+                };
+                if column_count > MAX_ITEMS {
+                    return false;
+                }
+                let (Some(data), Some(columns)) = (rows(data, count), rows(columns, column_count))
+                else {
+                    return false;
+                };
+                let columns: Vec<Needle> = columns.into_iter().map(Needle::new).collect();
+                let mut doc = Doc::default();
+                o.extend(data.iter().map(|row| export(&mut doc, row, &columns)));
+                true
+            })
+        }
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    /// `expires` holds `count` little-endian i64 epochs; `null_expires` little-endian u32
+    /// indexes whose epoch is absent.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w49_gdpr_retention_purge_batch(
+        disks: *const u8,
+        disks_len: usize,
+        paths: *const u8,
+        paths_len: usize,
+        expires: *const u8,
+        expires_len: usize,
+        null_expires: *const u8,
+        null_len: usize,
+        count: usize,
+        now: i64,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [
+            (disks, disks_len),
+            (paths, paths_len),
+            (expires, expires_len),
+            (null_expires, null_len),
+        ];
+        unsafe {
+            run(out, out_cap, count, 2, &inputs, |o| {
+                let (Some(disks), Some(paths), Some(expires), Some(nulls)) = (
+                    span(disks, disks_len),
+                    span(paths, paths_len),
+                    span(expires, expires_len),
+                    span(null_expires, null_len),
+                ) else {
+                    return false;
+                };
+                if expires.len() != count * 8 || !nulls.len().is_multiple_of(4) {
+                    return false;
+                }
+                let (Some(disks), Some(paths)) = (rows(disks, count), rows(paths, count)) else {
+                    return false;
+                };
+                let mut present = vec![true; count];
+                for index in nulls.as_chunks::<4>().0 {
+                    match present.get_mut(u32::from_le_bytes(*index) as usize) {
+                        Some(slot) => *slot = false,
+                        None => return false,
+                    }
+                }
+                for (i, (disk, path)) in disks.iter().zip(&paths).enumerate() {
+                    let at = expires[i * 8..i * 8 + 8].try_into().map(i64::from_le_bytes);
+                    let Ok(at) = at else {
+                        return false;
+                    };
+                    let (word, user) = retention(disk, path, present[i].then_some(at), now);
+                    o.push(word);
+                    o.push(user);
+                }
+                true
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn doc(json: &str) -> Doc<'_> {
+            let mut d = Doc::default();
+            d.parse(json.as_bytes(), |k| k == b"subject");
+            d
+        }
+
+        fn n(key: &str) -> Needle<'_> {
+            Needle::new(key.as_bytes())
+        }
+
+        #[test]
+        fn int_keys_follow_php_numeric_string_rules() {
+            assert_eq!(int_key(b"0"), Some(0));
+            assert_eq!(int_key(b"17"), Some(17));
+            assert_eq!(int_key(b"-5"), Some(-5));
+            assert_eq!(int_key(b"9223372036854775807"), Some(i64::MAX));
+            assert_eq!(int_key(b"-9223372036854775808"), Some(i64::MIN));
+            for s in [
+                "",
+                "-",
+                "-0",
+                "01",
+                "1.0",
+                " 1",
+                "1 ",
+                "9223372036854775808",
+                "+1",
+            ] {
+                assert_eq!(int_key(s.as_bytes()), None, "{s}");
+            }
+        }
+
+        #[test]
+        fn doc_matches_json_decode_shapes() {
+            let d = doc(r#"{"a":1,"a":true,"b":null,"subject":"deleted_user_7"}"#);
+            assert!(d.is_array && d.count == 3);
+            assert!(d.is_true(&n("a")) && d.has(&n("b")) && !d.has(&n("c")));
+            assert_eq!(d.string(&n("subject")), Some(&b"deleted_user_7"[..]));
+            let d = doc(r#"{"\u0065mail":"x","email":false,"":1}"#);
+            assert_eq!(d.count, 2);
+            assert!(d.has(&n("email")) && d.has(&n("")) && !d.is_true(&n("email")));
+            let d = doc(r#"{"s\u0075bject":"a\nb","subject":"c","subject":"d\u00e9"}"#);
+            assert_eq!(d.count, 1);
+            assert_eq!(d.string(&n("subject")), Some("dé".as_bytes()));
+            let wide: String = (0..40).map(|i| format!("\"k{i}\":{i},")).collect();
+            let wide = format!("{{{wide}\"k7\":true,\"k39\":1}}");
+            let d = doc(&wide);
+            assert_eq!(d.count, 40);
+            assert!(d.is_true(&n("k7")) && !d.is_true(&n("k8")));
+            assert!(d.has(&n("k39")) && !d.has(&n("k40")));
+            let d = doc(" [1, [2], {\"a\":3}] ");
+            assert!(d.is_array && d.count == 3);
+            assert!(d.has(&n("0")) && d.has(&n("2")) && !d.has(&n("3")) && !d.has(&n("-0")));
+            for bad in [
+                "", "null", "\"s\"", "1", "{", "[1,]", "{\"a\"}", "{'a':1}", "TRUE", "[1] x",
+            ] {
+                let d = doc(bad);
+                assert!(!d.is_array && d.count == 0 && !d.has(&n("a")), "{bad}");
+            }
+            let deep = |n: usize| "[".repeat(n) + &"]".repeat(n);
+            assert!(doc(&deep(511)).is_array);
+            assert!(!doc(&deep(512)).is_array);
+            assert!(doc(&format!("{{\"a\":{}}}", deep(510))).is_array);
+            assert!(!doc(&format!("{{\"a\":{}}}", deep(511))).is_array);
+        }
+
+        #[test]
+        fn audit_erasure_and_export_words() {
+            let mut d = Doc::default();
+            let keys = audit_needles();
+            let (word, crc) = audit(
+                &mut d,
+                &keys,
+                b"erasure_force_delete",
+                br#"{"force_delete":true,"retained_records":[],"email":"a@b"}"#,
+            );
+            assert_eq!(word & 15, 4);
+            assert_eq!(word >> 8 & 0xFFFF, 3);
+            assert_eq!(word >> 24 & 0x1FF, 0b001000110);
+            assert_eq!(word >> 34 & 1, 1);
+            assert_eq!(word >> 48 & 1, 1);
+            assert_eq!(crc, -1);
+            let (word, crc) = audit(&mut d, &keys, b"x", br#"{"subject":"deleted_user_1"}"#);
+            assert_eq!((word & 15, word >> 33 & 1), (15, 1));
+            assert_eq!(crc, crc32(b"deleted_user_1"));
+
+            let keys = erasure_needles();
+            let word = erasure(
+                &mut d,
+                &keys,
+                br#"{"email":1,"host":2,"gdpr_minimized":true,"k":0}"#,
+            );
+            assert_eq!(word & 0x3F, 1 | 0b101 << 1 | 1 << 4 | 1 << 5);
+            assert_eq!((word >> 8 & 0xFFFF, word >> 24 & 0xFFFF), (4, 2));
+            assert_eq!(word >> 40 & 1, 0);
+            assert_eq!(erasure(&mut d, &keys, b"") >> 24 & 0xFFFF, 1);
+            let flagged = erasure(&mut d, &keys, br#"{"gdpr_minimized":true}"#);
+            assert_eq!(flagged >> 40 & 1, 1);
+
+            let cols = [n("password"), n("1"), n("password")];
+            let word = export(&mut d, br#"{"password":"x","1":2}"#, &cols);
+            assert_eq!(word, 1 | 2 << 1 | 3 << 17 | 0b111 << 24);
+            assert_eq!(
+                export(&mut d, b"[0,1]", &cols),
+                1 | 2 << 1 | 1 << 17 | 0b010 << 24
+            );
+        }
+
+        #[test]
+        fn inventory_and_retention_words() {
+            let word = inventory(b" `NNTMUX`.`Trusted_Devices` ");
+            assert_eq!(word & 15, 1 | 4);
+            assert_eq!(word >> 8 & 31, 9);
+            assert_eq!(word >> 16 & 31, 13);
+            assert_eq!((word >> 24 & 15, word >> 32 & 15), (2, 2));
+            assert_eq!(word >> 40 & 255, 15);
+            assert_eq!(word >> 48, 1);
+            let word = inventory(b"invitations");
+            assert_eq!((word & 15, word >> 21 & 7, word >> 24 & 15), (4, 2, 5));
+            assert_eq!(inventory(b"gdpr_audit_logs") & 15, 12);
+            assert_eq!(inventory(b"passkeys") >> 28 & 1, 1);
+            assert_eq!(inventory(b"unknown"), 7 << 40);
+
+            let path = b"gdpr/exports/user-42-20261025120000-AbCdEf123456.json";
+            assert_eq!(canonical_export_path(path), Some(42));
+            for bad in [
+                &b"gdpr/exports/user-042-20261025120000-AbCdEf123456.json"[..],
+                b"gdpr/exports/user-42-2026102512000-AbCdEf123456.json",
+                b"gdpr/exports/user-42-20261025120000-AbCdEf12345_.json",
+                b"gdpr/exports/user--20261025120000-AbCdEf123456.json",
+                b"gdpr/exports/user-1234567890123456789-20261025120000-AbCdEf123456.json",
+                b"x",
+            ] {
+                assert_eq!(canonical_export_path(bad), None);
+            }
+            let (word, user) = retention(b"0", path, Some(5), 10);
+            assert_eq!(word & 0xFF, 0b0111_1111);
+            assert_eq!(user, 42);
+            let (word, user) = retention(b"s3", b"a/../b", None, 10);
+            assert_eq!(word & 0xFF, 0b1000_1000);
+            assert_eq!((word >> 24 & 255, user), (2, -1));
+        }
+
+        #[test]
+        fn exports_guard_pointers_capacity_and_counts() {
+            let mut out = [0i64; 8];
+            let p = out.as_mut_ptr();
+            let null = std::ptr::null();
+            unsafe {
+                assert_eq!(
+                    nntmux_w49_gdpr_inventory_classify_batch(null, 0, 0, p, 8),
+                    0
+                );
+                assert_eq!(
+                    nntmux_w49_gdpr_inventory_classify_batch(null, 0, 1, p, 8),
+                    1
+                );
+                assert_eq!(
+                    nntmux_w49_gdpr_inventory_classify_batch(null, 3, 1, p, 8),
+                    -1
+                );
+                let names = b"a\0b";
+                let n = names.as_ptr();
+                assert_eq!(nntmux_w49_gdpr_inventory_classify_batch(n, 3, 2, p, 8), 2);
+                assert_eq!(nntmux_w49_gdpr_inventory_classify_batch(n, 3, 3, p, 8), -1);
+                assert_eq!(
+                    nntmux_w49_gdpr_inventory_classify_batch(n, 3, 2, p, 1),
+                    SHORT_CAPACITY
+                );
+                let nm = std::ptr::null_mut();
+                assert_eq!(nntmux_w49_gdpr_inventory_classify_batch(n, 3, 2, nm, 8), -1);
+                let misaligned = (p as *mut u8).add(1) as *mut i64;
+                assert_eq!(
+                    nntmux_w49_gdpr_inventory_classify_batch(n, 3, 2, misaligned, 4),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w49_gdpr_audit_summarize_batch(n, 3, n, 3, 2, p, 4),
+                    4
+                );
+                assert_eq!(
+                    nntmux_w49_gdpr_audit_summarize_batch(n, 3, n, 1, 2, p, 4),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w49_gdpr_audit_summarize_batch(n, 3, n, 3, 2, p, 3),
+                    SHORT_CAPACITY
+                );
+                assert_eq!(
+                    nntmux_w49_gdpr_erasure_metadata_plan_batch(n, 3, 2, p, 8),
+                    2
+                );
+                assert_eq!(
+                    nntmux_w49_gdpr_erasure_metadata_plan_batch(null, 1, 1, p, 8),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w49_gdpr_export_redaction_plan_batch(n, 3, 2, n, 1, 1, p, 8),
+                    2
+                );
+                assert_eq!(
+                    nntmux_w49_gdpr_export_redaction_plan_batch(n, 3, 2, null, 0, 0, p, 8),
+                    2
+                );
+                assert_eq!(
+                    nntmux_w49_gdpr_export_redaction_plan_batch(n, 3, 2, null, 0, 1, p, 8),
+                    2
+                );
+                assert_eq!(
+                    nntmux_w49_gdpr_export_redaction_plan_batch(n, 3, 2, n, 3, 1, p, 8),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w49_gdpr_export_redaction_plan_batch(n, 3, 2, null, 2, 1, p, 8),
+                    -1
+                );
+                let epochs = [1i64, 2].map(i64::to_le_bytes).concat();
+                let e = epochs.as_ptr();
+                let nulls = 1u32.to_le_bytes();
+                let call = |len: usize, nulls: &[u8], cap: usize, out: *mut i64| {
+                    nntmux_w49_gdpr_retention_purge_batch(
+                        n,
+                        3,
+                        n,
+                        3,
+                        e,
+                        len,
+                        nulls.as_ptr(),
+                        nulls.len(),
+                        2,
+                        5,
+                        out,
+                        cap,
+                    )
+                };
+                assert_eq!(call(16, &nulls, 4, p), 4);
+                assert_eq!(out[0] & 0x11, 0x11);
+                assert_eq!(out[2] >> 4 & 1, 0);
+                assert_eq!(call(8, &nulls, 4, p), -1);
+                assert_eq!(call(16, &2u32.to_le_bytes(), 4, p), -1);
+                assert_eq!(call(16, &[1, 0], 4, p), -1);
+                assert_eq!(call(16, &[], 3, p), SHORT_CAPACITY);
+                let overlap = out.as_ptr() as *const u8;
+                assert_eq!(
+                    nntmux_w49_gdpr_erasure_metadata_plan_batch(overlap, 1, 1, p, 8),
+                    -1
+                );
+            }
         }
     }
 }
