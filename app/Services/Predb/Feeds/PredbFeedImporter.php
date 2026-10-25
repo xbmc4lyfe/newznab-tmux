@@ -39,6 +39,43 @@ class PredbFeedImporter
     private static FFI|false|null $ffi = null;
 
     /**
+     * Wave 46.2 production default for summarizeTitleBatch() is Rust: the paired benchmark in
+     * tests/Unit/RustPredbFeedsSrrdb3dsdbXrelNswdbImporterW46ParityTest.php measures 4.67-4.91x mean and 3.76-6.67x
+     * p99 on common pages and 8.07-9.92x mean and 6.00-7.23x p99 on uncommon batches. PHP stays the fallback when the
+     * library is unavailable, a title is not ASCII or it is invalid UTF-8.
+     */
+    public const bool W462_RUST_FFI_DEFAULT = true;
+
+    /** Wave 46.2 export shared by the srrDB, 3dsdb, xREL and nswdb sources and this importer. */
+    public const string W462_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w462_predb_feed_batch(
+            uint32_t operation,
+            uint32_t flags,
+            const char *blob,
+            size_t blob_len,
+            const char *lens,
+            size_t lens_len,
+            char *out_buf,
+            size_t out_cap
+        );
+        C;
+
+    public const string W462_FFI_DOMAIN = 'predb_feeds_w462';
+
+    /** Native input cap for the blob and for the length table. */
+    public const int W462_MAX_INPUT = 16777216;
+
+    /** Length sentinel for a null or non-string item. */
+    public const int W462_NULL = 0xFFFFFFFF;
+
+    /** Operation bit for a NUL-separated blob of strings without a length table. */
+    public const int W462_DELIMITED = 0x100;
+
+    private static ?bool $w462RustFfiOverride = null;
+
+    private static FFI|false|null $w462RustFfiHandle = null;
+
+    /**
      * Dry runs record what they would have written, so later pages and overlapping feeds in the
      * same run are counted as updates/skips rather than as more inserts.
      *
@@ -534,5 +571,220 @@ class PredbFeedImporter
         }
 
         return $changes;
+    }
+
+    /** Force the Wave 46.2 helper onto Rust (true) or PHP (false); null restores W462_RUST_FFI_DEFAULT. */
+    public static function useW462RustFfi(?bool $enable = true): void
+    {
+        self::$w462RustFfiOverride = $enable;
+    }
+
+    public static function usesW462RustFfi(): bool
+    {
+        return self::$w462RustFfiOverride ?? self::W462_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW462RustFfi(): void
+    {
+        self::$w462RustFfiOverride = null;
+        self::$w462RustFfiHandle = null;
+    }
+
+    /**
+     * Summarize entry titles as importEntry() admits them: non-strings are invalid; trimmed titles are then empty,
+     * over 255 characters (mb_strlen()) or candidates, counting those trim() changed and the duplicates of an
+     * earlier candidate under PredbSearchDocument::exactValue().
+     *
+     * @param  array<array-key, mixed>  $titles
+     * @return array{total: int, invalid: int, empty: int, overlength: int, padded: int, duplicate: int, accepted: int}
+     */
+    public static function summarizeTitleBatch(array $titles): array
+    {
+        return (self::usesW462RustFfi() ? self::summarizeTitleBatchNative($titles) : null)
+            ?? self::summarizeTitleBatchPhp($titles);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $titles
+     * @return array{total: int, invalid: int, empty: int, overlength: int, padded: int, duplicate: int, accepted: int}
+     */
+    public static function summarizeTitleBatchPhp(array $titles): array
+    {
+        $summary = ['total' => \count($titles), 'invalid' => 0, 'empty' => 0, 'overlength' => 0, 'padded' => 0, 'duplicate' => 0, 'accepted' => 0];
+        $seen = [];
+        foreach ($titles as $text) {
+            if (! \is_string($text)) {
+                $summary['invalid']++;
+
+                continue;
+            }
+            $title = trim($text);
+            if ($title === '') {
+                $summary['empty']++;
+
+                continue;
+            }
+            if (mb_strlen($title) > 255) {
+                $summary['overlength']++;
+
+                continue;
+            }
+            if ($title !== $text) {
+                $summary['padded']++;
+            }
+            $identity = PredbSearchDocument::exactValue($title);
+            if (isset($seen[$identity])) {
+                $summary['duplicate']++;
+
+                continue;
+            }
+            $seen[$identity] = true;
+            $summary['accepted']++;
+        }
+
+        return $summary;
+    }
+
+    /**
+     * Null when the library is missing or a title within the limit is not ASCII (Unicode folding stays in PHP).
+     *
+     * @param  array<array-key, mixed>  $titles
+     * @return array{total: int, invalid: int, empty: int, overlength: int, padded: int, duplicate: int, accepted: int}|null
+     */
+    public static function summarizeTitleBatchNative(array $titles): ?array
+    {
+        $values = self::w462Summary(self::w462RustFfi(), 4, $titles, 7);
+        if ($values === null) {
+            return null;
+        }
+        [$total, $invalid, $empty, $overlength, $padded, $duplicate, $accepted] = $values;
+        if ($total !== \count($titles) || min($values) < 0 || $invalid + $empty + $overlength + $duplicate + $accepted !== $total
+            || $padded > $duplicate + $accepted || ($duplicate > 0 && $accepted === 0)) {
+            return null;
+        }
+
+        return ['total' => $total, 'invalid' => $invalid, 'empty' => $empty, 'overlength' => $overlength, 'padded' => $padded,
+            'duplicate' => $duplicate, 'accepted' => $accepted];
+    }
+
+    /**
+     * @internal Summarize $items with Wave 46.2 op $operation, or null when the library is missing or the op declines
+     * the batch. Items go NUL-joined (W462_DELIMITED) with the positions of non-strings as a u32 table; when a
+     * string holds a NUL byte the split no longer matches the batch, so it is retried with the length table.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return list<int>|null
+     */
+    public static function w462Summary(?FFI $ffi, int $operation, array $items, int $slots): ?array
+    {
+        $packed = self::packW462Items($items);
+        if ($ffi === null || $packed === null) {
+            return null;
+        }
+        $values = self::callW462Native($ffi, $operation | $packed[2], $packed[0], $packed[1], $slots);
+        if ($packed[2] !== 0 && ($values === null ? $packed[1] !== '' : $values[0] !== \count($items))) {
+            $packed = self::packW462Lengths($items);
+            $values = $packed === null ? null : self::callW462Native($ffi, $operation, $packed[0], $packed[1], $slots);
+        }
+
+        return $values;
+    }
+
+    /**
+     * @internal The Wave 46.2 delimited layout: a non-empty batch joined by NUL with every non-string as an empty
+     * item, its position listed in a little-endian u32 table. Null when a part exceeds W462_MAX_INPUT.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return array{0: string, 1: string, 2: int}|null
+     */
+    public static function packW462Items(array $items): ?array
+    {
+        if ($items === []) {
+            return ['', '', 0];
+        }
+        $nulls = [];
+        $strings = $items;
+        $index = 0;
+        foreach ($items as $key => $item) {
+            if (! \is_string($item)) {
+                $nulls[] = $index;
+                $strings[$key] = '';
+            }
+            $index++;
+        }
+        $blob = implode("\0", $strings);
+        if (\strlen($blob) > self::W462_MAX_INPUT || \count($nulls) * 4 > self::W462_MAX_INPUT) {
+            return null;
+        }
+
+        return [$blob, $nulls === [] ? '' : pack('V*', ...$nulls), self::W462_DELIMITED];
+    }
+
+    /**
+     * @internal The Wave 46.2 length layout: the strings concatenated with one little-endian u32 length per item
+     * (W462_NULL for a non-string). Null when a part exceeds W462_MAX_INPUT.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return array{0: string, 1: string, 2: int}|null
+     */
+    public static function packW462Lengths(array $items): ?array
+    {
+        $lengths = [];
+        foreach ($items as $item) {
+            $lengths[] = \is_string($item) ? \strlen($item) : self::W462_NULL;
+        }
+        $blob = implode('', array_filter($items, \is_string(...)));
+        if (\strlen($blob) > self::W462_MAX_INPUT || \count($lengths) * 4 > self::W462_MAX_INPUT) {
+            return null;
+        }
+
+        return [$blob, $lengths === [] ? '' : pack('V*', ...$lengths), 0];
+    }
+
+    /**
+     * @internal Call the Wave 46.2 export through the shared scratch buffer, retrying once at the size it asks for.
+     * Returns exactly $slots counters, or null when the library is missing or the op declines the batch.
+     *
+     * @return list<int>|null
+     */
+    public static function callW462Native(?FFI $ffi, int $operation, string $blob, string $lens, int $slots): ?array
+    {
+        if ($ffi === null || $slots < 1) {
+            return null;
+        }
+
+        try {
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, $slots * 8, $capacity);
+            if ($buffer === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w462_predb_feed_batch($operation, 0, $blob, \strlen($blob), $lens, \strlen($lens), $buffer, $capacity);
+            if (\is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w462_predb_feed_batch($operation, 0, $blob, \strlen($blob), $lens, \strlen($lens), $buffer, $capacity);
+            }
+            if (! \is_int($written) || $written !== $slots * 8 || $written > $capacity) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('q'.$slots, FFI::string($buffer, $written));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private static function w462RustFfi(): ?FFI
+    {
+        self::$w462RustFfiHandle ??= RustPipelineLibrary::resolveDomain(self::W462_FFI_DOMAIN, self::W462_FFI_CDEF) ?? false;
+
+        return self::$w462RustFfiHandle === false ? null : self::$w462RustFfiHandle;
     }
 }
