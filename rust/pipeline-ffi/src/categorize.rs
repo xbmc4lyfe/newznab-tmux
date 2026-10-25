@@ -30462,3 +30462,1064 @@ pub mod categorization_group_name_fixer_w403 {
         }
     }
 }
+
+/// Wave 41.3 batch telemetry helpers for `CategorizationPipeline`, `CategorizationResult`,
+/// `MusicPipe`, `PcPipe` and `TvPipe`. Every export takes a packed string list (blob plus
+/// little-endian `u32` lengths), writes `0x1F`-separated decimal fields and returns the byte count,
+/// `-required` (without writing) when `out_cap` is too small, or `-1` for invalid input.
+pub mod categorization_pipeline_result_music_pc_tv_w413 {
+    use std::collections::HashSet;
+    use std::hash::{BuildHasherDefault, Hasher};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    pub const DECLINE: isize = -1;
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+    const FIELD_SEP: u8 = 0x1F;
+    /// PHP `trim()` default character set.
+    const TRIM_SET: &[u8] = b" \t\n\r\0\x0B";
+    /// `CategorizationPipeline::W413_MAX_RELEASE_NAME_LENGTH`.
+    const MAX_RELEASE_NAME_LENGTH: usize = 255;
+    const MIN_GROUP_SUFFIX_LENGTH: usize = 2;
+    const MAX_GROUP_SUFFIX_LENGTH: usize = 15;
+
+    /// Substring needles tagged with their class, searched in one pass per name.
+    pub struct NeedleSet<const N: usize> {
+        needles: [(&'static [u8], usize); N],
+        by_first_byte: [u32; 256],
+        by_second_byte: [u32; 256],
+    }
+
+    impl<const N: usize> NeedleSet<N> {
+        /// Every needle must be lowercase and at least two bytes long; at most 32 needles fit the
+        /// masks. The byte tables index both cases so names are matched without lowercasing them.
+        const fn new(needles: [(&'static [u8], usize); N]) -> Self {
+            assert!(N <= 32);
+            let mut by_first_byte = [0u32; 256];
+            let mut by_second_byte = [0u32; 256];
+            let mut k = 0;
+            while k < N {
+                let needle = needles[k].0;
+                assert!(needle.len() >= 2);
+                let mut j = 0;
+                while j < needle.len() {
+                    assert!(!needle[j].is_ascii_uppercase());
+                    j += 1;
+                }
+                let (first, second) = (needle[0], needle[1]);
+                by_first_byte[first as usize] |= 1 << k;
+                by_first_byte[first.to_ascii_uppercase() as usize] |= 1 << k;
+                by_second_byte[second as usize] |= 1 << k;
+                by_second_byte[second.to_ascii_uppercase() as usize] |= 1 << k;
+                k += 1;
+            }
+            NeedleSet {
+                needles,
+                by_first_byte,
+                by_second_byte,
+            }
+        }
+
+        /// Bitmask of the needles belonging to `class`.
+        const fn class_mask(&self, class: usize) -> u32 {
+            let mut mask = 0u32;
+            let mut k = 0;
+            while k < N {
+                if self.needles[k].1 == class {
+                    mask |= 1 << k;
+                }
+                k += 1;
+            }
+            mask
+        }
+
+        /// Bitmask of the needles that occur anywhere in `name`, ignoring ASCII case like a
+        /// `str_contains()` over PHP 8.2+ `strtolower($name)`.
+        fn matches(&self, name: &[u8]) -> u32 {
+            let Some((&first, rest)) = name.split_first() else {
+                return 0;
+            };
+            let mut matched = 0u32;
+            // Needles whose first byte is the previous byte; `i` is where that byte sits.
+            let mut pending = self.by_first_byte[first as usize];
+            for (i, &b) in rest.iter().enumerate() {
+                let mut candidates = pending & self.by_second_byte[b as usize] & !matched;
+                pending = self.by_first_byte[b as usize];
+                while candidates != 0 {
+                    let k = candidates.trailing_zeros() as usize;
+                    candidates &= candidates - 1;
+                    let needle = self.needles[k].0;
+                    if name
+                        .get(i..i + needle.len())
+                        .is_some_and(|window| window.eq_ignore_ascii_case(needle))
+                    {
+                        matched |= 1 << k;
+                    }
+                }
+            }
+            matched
+        }
+    }
+
+    /// `MusicPipe::W413_AUDIO_FORMAT_MARKERS` (lossless, lossy, video) then the discography marker.
+    const AUDIO_NEEDLES: NeedleSet<17> = NeedleSet::new([
+        (b"flac", 0),
+        (b"lossless", 0),
+        (b"alac", 0),
+        (b"24bit", 0),
+        (b"hi-res", 0),
+        (b"mp3", 1),
+        (b"aac", 1),
+        (b"ogg", 1),
+        (b"opus", 1),
+        (b"320kbps", 1),
+        (b"vbr", 1),
+        (b"mvid", 2),
+        (b"musicvideo", 2),
+        (b"music.video", 2),
+        (b"concert", 2),
+        (b"live.at", 2),
+        (b"discography", 3),
+    ]);
+    static AUDIO_NEEDLE_SET: NeedleSet<17> = AUDIO_NEEDLES;
+    const AUDIO_CLASSES: usize = 3;
+    const AUDIO_CLASS_MASKS: [u32; AUDIO_CLASSES] = [
+        AUDIO_NEEDLES.class_mask(0),
+        AUDIO_NEEDLES.class_mask(1),
+        AUDIO_NEEDLES.class_mask(2),
+    ];
+    const DISCOGRAPHY_MASK: u32 = AUDIO_NEEDLES.class_mask(3);
+
+    /// `PcPipe::W413_PLATFORM_MARKERS` (mac, linux, mobile, windows), then the disc image and crack
+    /// markers.
+    const PC_NEEDLES: NeedleSet<25> = NeedleSet::new([
+        (b"macos", 0),
+        (b"osx", 0),
+        (b"mac.os", 0),
+        (b".dmg", 0),
+        (b"linux", 1),
+        (b".deb", 1),
+        (b".rpm", 1),
+        (b"appimage", 1),
+        (b"android", 2),
+        (b".apk", 2),
+        (b"ios.", 2),
+        (b".ipa", 2),
+        (b"win64", 3),
+        (b"win32", 3),
+        (b"windows", 3),
+        (b"x64", 3),
+        (b"x86", 3),
+        (b".iso", 4),
+        (b".img", 4),
+        (b".bin", 4),
+        (b".cue", 4),
+        (b"crack", 5),
+        (b"keygen", 5),
+        (b"patch", 5),
+        (b"serial", 5),
+    ]);
+    static PC_NEEDLE_SET: NeedleSet<25> = PC_NEEDLES;
+    const PC_PLATFORMS: usize = 4;
+    const PC_PLATFORM_MASKS: [u32; PC_PLATFORMS] = [
+        PC_NEEDLES.class_mask(0),
+        PC_NEEDLES.class_mask(1),
+        PC_NEEDLES.class_mask(2),
+        PC_NEEDLES.class_mask(3),
+    ];
+    const DISC_IMAGE_MASK: u32 = PC_NEEDLES.class_mask(4);
+    const CRACKED_MASK: u32 = PC_NEEDLES.class_mask(5);
+
+    unsafe fn valid_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null()
+            || len > MAX_INPUT
+            || len > isize::MAX as usize
+            || (ptr as usize).checked_add(len).is_none()
+        {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn valid_out_buf(out_buf: *mut u8, out_cap: usize) -> bool {
+        !out_buf.is_null()
+            && out_cap <= isize::MAX as usize
+            && (out_buf as usize).checked_add(out_cap).is_some()
+    }
+
+    /// Whether `[a, a + a_len)` and `[b, b + b_len)` share a byte (empty ranges never do).
+    #[inline]
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> bool {
+        if a_len == 0 || b_len == 0 {
+            return false;
+        }
+        match (a.checked_add(a_len), b.checked_add(b_len)) {
+            (Some(a_end), Some(b_end)) => a < b_end && b < a_end,
+            _ => true,
+        }
+    }
+
+    /// Copies `bytes` into `out_buf`, returning the length or `-required` when it does not fit.
+    unsafe fn write_bytes(bytes: &[u8], out_buf: *mut u8, out_cap: usize) -> isize {
+        if bytes.len() > isize::MAX as usize {
+            return DECLINE;
+        }
+        if bytes.len() > out_cap {
+            return -(bytes.len() as isize);
+        }
+        if !bytes.is_empty() {
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len()) };
+        }
+        bytes.len() as isize
+    }
+
+    /// Renders `values` as `0x1F`-separated decimals.
+    fn fields(values: &[i64]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(values.len() * 4);
+        for (i, &value) in values.iter().enumerate() {
+            if i > 0 {
+                out.push(FIELD_SEP);
+            }
+            let mut digits = [0u8; 20];
+            out.extend_from_slice(decimal(value, &mut digits));
+        }
+        out
+    }
+
+    /// Allocation-free decimal rendering of `value` into `buf`.
+    fn decimal(value: i64, buf: &mut [u8; 20]) -> &[u8] {
+        let mut n = value.unsigned_abs();
+        let mut i = buf.len();
+        loop {
+            i -= 1;
+            buf[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        if value < 0 {
+            i -= 1;
+            buf[i] = b'-';
+        }
+        &buf[i..]
+    }
+
+    /// Splits `blob` by packed little-endian `u32` lengths; the lengths must cover it exactly.
+    fn split_blob<'a>(blob: &'a [u8], lens: &[u8]) -> Option<Vec<&'a [u8]>> {
+        let (chunks, []) = lens.as_chunks::<4>() else {
+            return None;
+        };
+        let mut items = Vec::with_capacity(chunks.len());
+        let mut offset = 0usize;
+        for chunk in chunks {
+            let len = u32::from_le_bytes(*chunk) as usize;
+            let end = offset.checked_add(len)?;
+            items.push(blob.get(offset..end)?);
+            offset = end;
+        }
+        (offset == blob.len()).then_some(items)
+    }
+
+    fn trim_set<'a>(bytes: &'a [u8], set: &[u8]) -> &'a [u8] {
+        let start = bytes
+            .iter()
+            .position(|b| !set.contains(b))
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|b| !set.contains(b))
+            .map_or(start, |i| i + 1);
+        &bytes[start..end]
+    }
+
+    /// Bytes per block in the vectorizable scans below.
+    const BLOCK: usize = 16;
+
+    /// Counts of `.` and ` ` in `bytes`, in blocks the compiler can vectorize.
+    fn count_dots_spaces(bytes: &[u8]) -> (usize, usize) {
+        let (blocks, tail) = bytes.as_chunks::<BLOCK>();
+        let (mut dots, mut spaces) = (0usize, 0usize);
+        for block in blocks {
+            let (mut d, mut s) = (0u8, 0u8);
+            for &b in block {
+                d += u8::from(b == b'.');
+                s += u8::from(b == b' ');
+            }
+            dots += usize::from(d);
+            spaces += usize::from(s);
+        }
+        for &b in tail {
+            dots += usize::from(b == b'.');
+            spaces += usize::from(b == b' ');
+        }
+        (dots, spaces)
+    }
+
+    /// Last index of `needle` in `bytes`, skipping whole blocks that lack it.
+    fn last_index_of(bytes: &[u8], needle: u8) -> Option<usize> {
+        let (head, blocks) = bytes.as_rchunks::<BLOCK>();
+        for (index, block) in blocks.iter().enumerate().rev() {
+            if block.iter().fold(false, |found, &b| found | (b == needle)) {
+                return block
+                    .iter()
+                    .rposition(|&b| b == needle)
+                    .map(|at| head.len() + index * BLOCK + at);
+            }
+        }
+        head.iter().rposition(|&b| b == needle)
+    }
+
+    /// `CategorizationPipeline::summarizeReleaseNameShapeBatchPhp()`.
+    pub fn release_name_shape(names: &[&[u8]]) -> Vec<u8> {
+        let (mut empty, mut dotted, mut spaced, mut compact) = (0i64, 0i64, 0i64, 0i64);
+        let (mut group_suffix, mut overlong, mut total_bytes, mut max_length) =
+            (0i64, 0i64, 0i64, 0i64);
+        for raw in names {
+            let name = trim_set(raw, TRIM_SET);
+            let length = name.len() as i64;
+            total_bytes += length;
+            max_length = max_length.max(length);
+            if name.is_empty() {
+                empty += 1;
+                continue;
+            }
+            let (dots, spaces) = count_dots_spaces(name);
+            if dots > spaces {
+                dotted += 1;
+            } else if spaces > 0 {
+                spaced += 1;
+            } else {
+                compact += 1;
+            }
+            if let Some(dash) = last_index_of(name, b'-') {
+                let suffix = &name[dash + 1..];
+                if (MIN_GROUP_SUFFIX_LENGTH..=MAX_GROUP_SUFFIX_LENGTH).contains(&suffix.len())
+                    && suffix.iter().all(u8::is_ascii_alphanumeric)
+                {
+                    group_suffix += 1;
+                }
+            }
+            if name.len() > MAX_RELEASE_NAME_LENGTH {
+                overlong += 1;
+            }
+        }
+        fields(&[
+            names.len() as i64,
+            empty,
+            dotted,
+            spaced,
+            compact,
+            group_suffix,
+            overlong,
+            total_bytes,
+            max_length,
+        ])
+    }
+
+    /// Word-at-a-time FNV-style hasher for the distinct-label set; the labels are not
+    /// attacker-sensitive and the set never outlives one call.
+    #[derive(Default)]
+    struct LabelHasher(u64);
+
+    impl Hasher for LabelHasher {
+        fn write(&mut self, bytes: &[u8]) {
+            const PRIME: u64 = 0x0000_0100_0000_01B3;
+            let (words, tail) = bytes.as_chunks::<8>();
+            let mut hash = self.0 ^ 0xCBF2_9CE4_8422_2325;
+            for word in words {
+                hash = (hash ^ u64::from_le_bytes(*word)).wrapping_mul(PRIME);
+            }
+            let mut last = [0u8; 8];
+            last[..tail.len()].copy_from_slice(tail);
+            hash = (hash ^ u64::from_le_bytes(last)).wrapping_mul(PRIME);
+            self.0 = (hash ^ (hash >> 29)).wrapping_mul(PRIME) ^ (bytes.len() as u64);
+        }
+
+        fn write_usize(&mut self, value: usize) {
+            self.0 = (self.0 ^ value as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+
+        fn finish(&self) -> u64 {
+            self.0 ^ (self.0 >> 32)
+        }
+    }
+
+    /// `CategorizationResult::summarizeMatchedByBatchPhp()`.
+    pub fn matched_by_batch(labels: &[&[u8]]) -> Vec<u8> {
+        // no_match, none, hash_, obfuscated_, gibberish_, group_only_low_signal, other, empty.
+        let mut counts = [0i64; 8];
+        let mut seen: HashSet<&[u8], BuildHasherDefault<LabelHasher>> =
+            HashSet::with_capacity_and_hasher(labels.len().min(4096), Default::default());
+        for &label in labels {
+            seen.insert(label);
+            let slot = match label {
+                b"" => 7,
+                b"no_match" => 0,
+                b"none" => 1,
+                b"group_only_low_signal" => 5,
+                _ if label.starts_with(b"hash_") => 2,
+                _ if label.starts_with(b"obfuscated_") => 3,
+                _ if label.starts_with(b"gibberish_") => 4,
+                _ => 6,
+            };
+            counts[slot] += 1;
+        }
+        let mut values = Vec::with_capacity(10);
+        values.push(labels.len() as i64);
+        values.extend_from_slice(&counts);
+        values.push(seen.len() as i64);
+        fields(&values)
+    }
+
+    /// `MusicPipe::summarizeAudioFormatBatchPhp()`.
+    pub fn audio_format_batch(names: &[&[u8]]) -> Vec<u8> {
+        let mut classes = [0i64; AUDIO_CLASSES];
+        let (mut unknown, mut discography) = (0i64, 0i64);
+        for name in names {
+            let matched = AUDIO_NEEDLE_SET.matches(name);
+            match AUDIO_CLASS_MASKS.iter().position(|&m| matched & m != 0) {
+                Some(class) => classes[class] += 1,
+                None => unknown += 1,
+            }
+            discography += i64::from(matched & DISCOGRAPHY_MASK != 0);
+        }
+        fields(&[
+            names.len() as i64,
+            classes[0],
+            classes[1],
+            classes[2],
+            unknown,
+            discography,
+        ])
+    }
+
+    /// `PcPipe::summarizePcPlatformBatchPhp()`.
+    pub fn pc_platform_batch(names: &[&[u8]]) -> Vec<u8> {
+        let mut platforms = [0i64; PC_PLATFORMS];
+        let (mut unknown, mut disc_image, mut cracked) = (0i64, 0i64, 0i64);
+        for name in names {
+            let matched = PC_NEEDLE_SET.matches(name);
+            match PC_PLATFORM_MASKS.iter().position(|&m| matched & m != 0) {
+                Some(platform) => platforms[platform] += 1,
+                None => unknown += 1,
+            }
+            disc_image += i64::from(matched & DISC_IMAGE_MASK != 0);
+            cracked += i64::from(matched & CRACKED_MASK != 0);
+        }
+        // Field order follows the PHP result: windows, mac, linux, mobile.
+        fields(&[
+            names.len() as i64,
+            platforms[3],
+            platforms[0],
+            platforms[1],
+            platforms[2],
+            unknown,
+            disc_image,
+            cracked,
+        ])
+    }
+
+    /// `b` is `c` in either ASCII case (`c` must be a lowercase letter).
+    #[inline]
+    fn is_letter(b: u8, c: u8) -> bool {
+        b | 0x20 == c
+    }
+
+    #[inline]
+    fn is_token_sep(b: u8) -> bool {
+        matches!(b, b' ' | b'.' | b'_' | b'-')
+    }
+
+    /// Length of the ASCII digit run starting at `at`.
+    fn digit_run(s: &[u8], at: usize) -> usize {
+        s.get(at..).map_or(0, |rest| {
+            rest.iter().take_while(|b| b.is_ascii_digit()).count()
+        })
+    }
+
+    fn parse_digits(digits: &[u8]) -> i64 {
+        digits
+            .iter()
+            .fold(0i64, |acc, &d| acc * 10 + i64::from(d - b'0'))
+    }
+
+    /// `TvPipe::W413_DAILY_PATTERN` anchored at `i` (the caller checks the leading `1`/`2`).
+    fn daily_at(s: &[u8], i: usize) -> bool {
+        let Some(d) = s.get(i..i + 10) else {
+            return false;
+        };
+        if !((d[0] == b'1' && d[1] == b'9') || (d[0] == b'2' && d[1] == b'0'))
+            || !d[2].is_ascii_digit()
+            || !d[3].is_ascii_digit()
+            || !is_token_sep(d[4])
+            || !is_token_sep(d[7])
+            || (i > 0 && s[i - 1].is_ascii_digit())
+        {
+            return false;
+        }
+        let month = (d[5] == b'0' && (b'1'..=b'9').contains(&d[6]))
+            || (d[5] == b'1' && (b'0'..=b'2').contains(&d[6]));
+        let day = (d[8] == b'0' && (b'1'..=b'9').contains(&d[9]))
+            || ((d[8] == b'1' || d[8] == b'2') && d[9].is_ascii_digit())
+            || (d[8] == b'3' && (d[9] == b'0' || d[9] == b'1'));
+        month && day && !s.get(i + 10).is_some_and(u8::is_ascii_digit)
+    }
+
+    /// What one release name holds, by `TvPipe::summarizeEpisodeTokenBatchPhp()` precedence.
+    #[derive(Debug, PartialEq)]
+    enum EpisodeToken {
+        Episode(i64, i64),
+        Daily,
+        SeasonPack,
+        None,
+    }
+
+    /// Checks the `s`/`S` at `i`: `Some(token)` for an episode token, else whether it starts a
+    /// season pack token.
+    fn season_at(s: &[u8], i: usize) -> Result<EpisodeToken, bool> {
+        if i > 0 && s[i - 1].is_ascii_alphanumeric() {
+            return Err(false);
+        }
+        let run = digit_run(s, i + 1);
+        if !(1..=2).contains(&run) {
+            return Err(false);
+        }
+        let season_end = i + 1 + run;
+        let mut j = season_end;
+        if s.get(j).copied().is_some_and(is_token_sep) {
+            j += 1;
+        }
+        if s.get(j).is_some_and(|&b| is_letter(b, b'e')) {
+            let episode_run = digit_run(s, j + 1);
+            if (1..=3).contains(&episode_run) {
+                return Ok(EpisodeToken::Episode(
+                    parse_digits(&s[i + 1..season_end]),
+                    parse_digits(&s[j + 1..j + 1 + episode_run]),
+                ));
+            }
+        }
+        Err(!s.get(season_end).is_some_and(|&b| is_letter(b, b'e')))
+    }
+
+    #[inline]
+    fn is_alnum(b: u8) -> bool {
+        ((b | 0x20).wrapping_sub(b'a') < 26) | (b.wrapping_sub(b'0') < 10)
+    }
+
+    /// Whether `b` after `prev` can start an episode or season token (`s`/`S` behind a non-word
+    /// byte) or a daily date (`1`/`2` behind a non-digit). Branch-free so blocks vectorize.
+    #[inline]
+    fn starts_token(prev: u8, b: u8) -> bool {
+        (is_letter(b, b's') & !is_alnum(prev))
+            | (((b == b'1') | (b == b'2')) & (prev.wrapping_sub(b'0') >= 10))
+    }
+
+    /// Checks a token start at `i`: `Some` for an episode token (which wins outright), else records
+    /// whether it starts a daily date or season pack.
+    fn visit_token(s: &[u8], i: usize, daily: &mut bool, pack: &mut bool) -> Option<EpisodeToken> {
+        if is_letter(s[i], b's') {
+            match season_at(s, i) {
+                Ok(token) => return Some(token),
+                Err(is_pack) => *pack |= is_pack,
+            }
+        } else if !*daily {
+            *daily = daily_at(s, i);
+        }
+        None
+    }
+
+    /// One pass over `s` (raw case): the leftmost episode token wins outright, else any daily
+    /// date, else any season pack token. Blocks without a token start are skipped whole.
+    fn episode_token(s: &[u8]) -> EpisodeToken {
+        let (mut daily, mut pack) = (false, false);
+        // Position 0 has no predecessor; a space (neither word byte nor digit) stands in for it.
+        if let Some(&first) = s.first()
+            && starts_token(b' ', first)
+            && let Some(token) = visit_token(s, 0, &mut daily, &mut pack)
+        {
+            return token;
+        }
+        let mut start = 1;
+        while start + BLOCK <= s.len() {
+            let prev: &[u8; BLOCK] = s[start - 1..start - 1 + BLOCK]
+                .try_into()
+                .unwrap_or(&[0; BLOCK]);
+            let cur: &[u8; BLOCK] = s[start..start + BLOCK].try_into().unwrap_or(&[0; BLOCK]);
+            // Bit k marks a token start at `start + k`; only those positions are visited.
+            let mut starts = prev
+                .iter()
+                .zip(cur)
+                .enumerate()
+                .fold(0u32, |mask, (k, (&p, &b))| {
+                    mask | (u32::from(starts_token(p, b)) << k)
+                });
+            while starts != 0 {
+                let i = start + starts.trailing_zeros() as usize;
+                starts &= starts - 1;
+                if let Some(token) = visit_token(s, i, &mut daily, &mut pack) {
+                    return token;
+                }
+            }
+            start += BLOCK;
+        }
+        for i in start..s.len() {
+            if starts_token(s[i - 1], s[i])
+                && let Some(token) = visit_token(s, i, &mut daily, &mut pack)
+            {
+                return token;
+            }
+        }
+        if daily {
+            EpisodeToken::Daily
+        } else if pack {
+            EpisodeToken::SeasonPack
+        } else {
+            EpisodeToken::None
+        }
+    }
+
+    /// `TvPipe::summarizeEpisodeTokenBatchPhp()`.
+    pub fn episode_token_batch(names: &[&[u8]]) -> Vec<u8> {
+        let (mut episode, mut daily, mut season_pack, mut none) = (0i64, 0i64, 0i64, 0i64);
+        let (mut max_season, mut max_episode) = (0i64, 0i64);
+        for name in names {
+            match episode_token(name) {
+                EpisodeToken::Episode(season, ep) => {
+                    episode += 1;
+                    max_season = max_season.max(season);
+                    max_episode = max_episode.max(ep);
+                }
+                EpisodeToken::Daily => daily += 1,
+                EpisodeToken::SeasonPack => season_pack += 1,
+                EpisodeToken::None => none += 1,
+            }
+        }
+        fields(&[
+            names.len() as i64,
+            episode,
+            daily,
+            season_pack,
+            none,
+            max_season,
+            max_episode,
+        ])
+    }
+
+    /// Validates a packed string list and the output buffer, then writes `render(items)`.
+    unsafe fn with_strings(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+        render: fn(&[&[u8]]) -> Vec<u8>,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap)
+                || overlaps(out_buf as usize, out_cap, blob_ptr as usize, blob_len)
+                || overlaps(out_buf as usize, out_cap, lens_ptr as usize, lens_len)
+            {
+                return DECLINE;
+            }
+            let (Some(blob), Some(lens)) = (unsafe { valid_slice(blob_ptr, blob_len) }, unsafe {
+                valid_slice(lens_ptr, lens_len)
+            }) else {
+                return DECLINE;
+            };
+            let Some(items) = split_blob(blob, lens) else {
+                return DECLINE;
+            };
+            unsafe { write_bytes(&render(&items), out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// # Safety
+    /// `blob_ptr`/`lens_ptr` must be valid for their lengths in readable bytes, and `out_buf` must be
+    /// valid for `out_cap` writable bytes, not overlapping either input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w413_release_name_shape_batch(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_strings(
+                blob_ptr,
+                blob_len,
+                lens_ptr,
+                lens_len,
+                out_buf,
+                out_cap,
+                release_name_shape,
+            )
+        }
+    }
+
+    /// # Safety
+    /// `blob_ptr`/`lens_ptr` must be valid for their lengths in readable bytes, and `out_buf` must be
+    /// valid for `out_cap` writable bytes, not overlapping either input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w413_matched_by_batch(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_strings(
+                blob_ptr,
+                blob_len,
+                lens_ptr,
+                lens_len,
+                out_buf,
+                out_cap,
+                matched_by_batch,
+            )
+        }
+    }
+
+    /// # Safety
+    /// `blob_ptr`/`lens_ptr` must be valid for their lengths in readable bytes, and `out_buf` must be
+    /// valid for `out_cap` writable bytes, not overlapping either input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w413_audio_format_batch(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_strings(
+                blob_ptr,
+                blob_len,
+                lens_ptr,
+                lens_len,
+                out_buf,
+                out_cap,
+                audio_format_batch,
+            )
+        }
+    }
+
+    /// # Safety
+    /// `blob_ptr`/`lens_ptr` must be valid for their lengths in readable bytes, and `out_buf` must be
+    /// valid for `out_cap` writable bytes, not overlapping either input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w413_pc_platform_batch(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_strings(
+                blob_ptr,
+                blob_len,
+                lens_ptr,
+                lens_len,
+                out_buf,
+                out_cap,
+                pc_platform_batch,
+            )
+        }
+    }
+
+    /// # Safety
+    /// `blob_ptr`/`lens_ptr` must be valid for their lengths in readable bytes, and `out_buf` must be
+    /// valid for `out_cap` writable bytes, not overlapping either input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w413_episode_token_batch(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_strings(
+                blob_ptr,
+                blob_len,
+                lens_ptr,
+                lens_len,
+                out_buf,
+                out_cap,
+                episode_token_batch,
+            )
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::ptr;
+
+        type Export =
+            unsafe extern "C" fn(*const u8, usize, *const u8, usize, *mut u8, usize) -> isize;
+
+        const EXPORTS: [Export; 5] = [
+            nntmux_w413_release_name_shape_batch,
+            nntmux_w413_matched_by_batch,
+            nntmux_w413_audio_format_batch,
+            nntmux_w413_pc_platform_batch,
+            nntmux_w413_episode_token_batch,
+        ];
+
+        fn text(bytes: &[u8]) -> String {
+            String::from_utf8_lossy(bytes).replace('\x1F', "|")
+        }
+
+        fn packed(items: &[&[u8]]) -> (Vec<u8>, Vec<u8>) {
+            let blob = items.concat();
+            let lens = items
+                .iter()
+                .flat_map(|i| (i.len() as u32).to_le_bytes())
+                .collect();
+            (blob, lens)
+        }
+
+        fn call(export: Export, items: &[&[u8]]) -> String {
+            let (blob, lens) = packed(items);
+            let mut buf = vec![0u8; 256];
+            let n = unsafe {
+                export(
+                    blob.as_ptr(),
+                    blob.len(),
+                    lens.as_ptr(),
+                    lens.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(n > 0, "call declined: {n}");
+            text(&buf[..n as usize])
+        }
+
+        #[test]
+        fn w413_release_name_shape_counts() {
+            let long = [b'a'; 256];
+            let names: [&[u8]; 9] = [
+                b"Movie.Title.2024.1080p.BluRay.x264-GRP",
+                b"  Some Show S01E01 720p-Group  ",
+                b"Compact_Name",
+                b"\t\n\0",
+                b"",
+                b"Two Words.Here",
+                b"name-x",
+                b"ends-with-dash-",
+                &long,
+            ];
+            assert_eq!(text(&release_name_shape(&names)), "9|2|1|2|4|2|1|368|256");
+            assert_eq!(text(&release_name_shape(&[])), "0|0|0|0|0|0|0|0|0");
+            assert_eq!(
+                call(nntmux_w413_release_name_shape_batch, &names),
+                "9|2|1|2|4|2|1|368|256"
+            );
+        }
+
+        #[test]
+        fn w413_matched_by_counts() {
+            let labels: [&[u8]; 11] = [
+                b"no_match",
+                b"none",
+                b"hash_md5",
+                b"hash_",
+                b"obfuscated_pattern",
+                b"gibberish_long",
+                b"group_only_low_signal",
+                b"group_only_low_signal_x",
+                b"",
+                b"tv_episode",
+                b"tv_episode",
+            ];
+            assert_eq!(text(&matched_by_batch(&labels)), "11|1|1|2|1|1|1|3|1|10");
+            assert_eq!(text(&matched_by_batch(&[])), "0|0|0|0|0|0|0|0|0|0");
+            assert_eq!(
+                call(nntmux_w413_matched_by_batch, &labels),
+                "11|1|1|2|1|1|1|3|1|10"
+            );
+        }
+
+        #[test]
+        fn w413_audio_format_counts() {
+            let names: [&[u8]; 7] = [
+                b"Artist-Album-2024-FLAC",
+                b"Artist - Album (2024) [MP3 320kbps]",
+                b"Artist-Discography-MP3",
+                b"Artist.Live.At.Wembley.MVID",
+                b"Artist - Album FLAC + MP3",
+                b"Some.Random.Thing",
+                b"",
+            ];
+            assert_eq!(text(&audio_format_batch(&names)), "7|2|2|1|2|1");
+            assert_eq!(text(&audio_format_batch(&[])), "0|0|0|0|0|0");
+            assert_eq!(call(nntmux_w413_audio_format_batch, &names), "7|2|2|1|2|1");
+        }
+
+        #[test]
+        fn w413_pc_platform_counts() {
+            let names: [&[u8]; 7] = [
+                b"Adobe.Photoshop.2024.Win64.Cracked",
+                b"Some.App.v1.MacOS.x64.dmg",
+                b"Tool.v2.Linux.x64",
+                b"Game.Android.APK",
+                b"Office.2021.x86.ISO",
+                b"Plain.Software.Name",
+                b"Keygen.Only",
+            ];
+            assert_eq!(text(&pc_platform_batch(&names)), "7|2|1|1|1|2|1|2");
+            assert_eq!(text(&pc_platform_batch(&[])), "0|0|0|0|0|0|0|0");
+            assert_eq!(
+                call(nntmux_w413_pc_platform_batch, &names),
+                "7|2|1|1|1|2|1|2"
+            );
+        }
+
+        #[test]
+        fn w413_episode_token_counts() {
+            let names: [&[u8]; 12] = [
+                b"Show.S01E02.720p",
+                b"show s3.e104 x",
+                b"Show.S12-E7",
+                b"Show.2024.05.17.Guest",
+                b"Show.S02.Complete",
+                b"Show.S123E01",
+                b"xS01E01",
+                b"Show.S01E1234",
+                b"Show.2024.13.01",
+                b"12024.05.17",
+                b"Show S1",
+                b"",
+            ];
+            // S123E01 / xS01E01 / S01E1234 hold no episode; "s01e1234" is no pack either.
+            assert_eq!(text(&episode_token_batch(&names)), "12|3|1|2|6|12|104");
+            assert_eq!(text(&episode_token_batch(&[])), "0|0|0|0|0|0|0");
+            assert_eq!(
+                call(nntmux_w413_episode_token_batch, &names),
+                "12|3|1|2|6|12|104"
+            );
+            // The leftmost episode token supplies the season and episode.
+            assert_eq!(
+                text(&episode_token_batch(&[b"a.s02e05.s09e99"])),
+                "1|1|0|0|0|2|5"
+            );
+            assert!(daily_at(b"1999-12-31", 0));
+            assert!(!daily_at(b"1999-12-32", 0));
+            assert!(!daily_at(b"2000.00.10", 0));
+            assert!(!daily_at(b"2000.01.105", 0));
+        }
+
+        #[test]
+        fn w413_block_scans_match_across_boundaries_and_case() {
+            // Tokens, markers and dashes straddling the 16-byte scan blocks, in either case.
+            for pad in 0..40 {
+                let filler = "x".repeat(pad);
+                let episode = format!("{filler}.S07E123.{filler}");
+                assert_eq!(
+                    episode_token(episode.as_bytes()),
+                    EpisodeToken::Episode(7, 123),
+                    "{episode}"
+                );
+                let daily = format!("{filler} 2019_02_28 {filler}");
+                assert_eq!(
+                    episode_token(daily.as_bytes()),
+                    EpisodeToken::Daily,
+                    "{daily}"
+                );
+                let pack = format!("{filler}-s4-{filler}");
+                assert_eq!(
+                    episode_token(pack.as_bytes()),
+                    EpisodeToken::SeasonPack,
+                    "{pack}"
+                );
+                let named = format!("{filler}.Album.FLAC.WIN64-Grp");
+                assert_eq!(
+                    text(&audio_format_batch(&[named.as_bytes()])),
+                    "1|1|0|0|0|0"
+                );
+                assert_eq!(
+                    text(&pc_platform_batch(&[named.as_bytes()])),
+                    "1|1|0|0|0|0|0|0"
+                );
+                assert_eq!(last_index_of(named.as_bytes(), b'-'), Some(named.len() - 4));
+                let dashed = format!("{filler}-. .{filler}");
+                assert_eq!(count_dots_spaces(dashed.as_bytes()), (2, 1));
+                assert_eq!(last_index_of(dashed.as_bytes(), b'-'), Some(pad));
+            }
+            assert_eq!(episode_token(b"S01E02"), EpisodeToken::Episode(1, 2));
+            assert_eq!(episode_token(b"1S01E02"), EpisodeToken::None);
+            assert_eq!(last_index_of(b"", b'-'), None);
+            assert_eq!(last_index_of(b"-a-b-c-d-e-f-g-h-i-j", b'-'), Some(18));
+        }
+
+        #[test]
+        fn w413_exports_validate_inputs_and_capacity() {
+            let x = b"x".as_ptr();
+            let lens1 = 1u32.to_le_bytes();
+            unsafe {
+                for export in EXPORTS {
+                    let mut small = [b'Z'; 4];
+                    let needed = export(x, 1, lens1.as_ptr(), 4, small.as_mut_ptr(), 2);
+                    assert!(needed < -2, "needed {needed}");
+                    assert_eq!(small, [b'Z'; 4]);
+                    let mut exact = vec![0u8; (-needed) as usize];
+                    assert_eq!(
+                        export(x, 1, lens1.as_ptr(), 4, exact.as_mut_ptr(), exact.len()),
+                        -needed
+                    );
+
+                    let mut out = [0u8; 128];
+                    let (b, c) = (out.as_mut_ptr(), out.len());
+                    assert_eq!(export(x, 1, lens1.as_ptr(), 4, ptr::null_mut(), 8), DECLINE);
+                    assert_eq!(export(ptr::null(), 0, x, 0, b, c), DECLINE);
+                    assert_eq!(export(x, 0, ptr::null(), 0, b, c), DECLINE);
+                    // Ragged lengths and inconsistent blobs decline.
+                    assert_eq!(export(x, 1, lens1.as_ptr(), 3, b, c), DECLINE);
+                    assert_eq!(export(x, 0, lens1.as_ptr(), 4, b, c), DECLINE);
+                    let two = 2u32.to_le_bytes();
+                    assert_eq!(export(x, 1, two.as_ptr(), 4, b, c), DECLINE);
+                    let huge = u32::MAX.to_le_bytes();
+                    assert_eq!(export(x, 1, huge.as_ptr(), 4, b, c), DECLINE);
+                    // Oversized inputs and wrapping ranges decline.
+                    assert_eq!(export(x, MAX_INPUT + 1, x, 0, b, c), DECLINE);
+                    assert_eq!(export(x, usize::MAX, x, 0, b, c), DECLINE);
+                    assert_eq!(export(x, 0, x, 0, usize::MAX as *mut u8, 8), DECLINE);
+                    // An output buffer overlapping an input declines without writing.
+                    let mut shared =
+                        *b"sample\x06\0\0\0..............................................";
+                    let p = shared.as_mut_ptr();
+                    assert_eq!(export(p, 6, p.add(6), 4, p.add(3), 40), DECLINE);
+                    assert_eq!(export(p, 6, p.add(6), 4, p.add(9), 40), DECLINE);
+                    assert_eq!(&shared[..10], b"sample\x06\0\0\0");
+                    assert!(export(p, 6, p.add(6), 4, p.add(10), 40) > 0);
+                    // Empty lists are valid.
+                    assert!(export(x, 0, x, 0, b, c) > 0);
+                }
+            }
+        }
+
+        #[test]
+        fn w413_overlap_helper() {
+            assert!(!overlaps(10, 0, 10, 5));
+            assert!(overlaps(10, 5, 14, 1));
+            assert!(!overlaps(10, 5, 15, 1));
+            assert!(overlaps(usize::MAX, 2, 0, 1));
+        }
+    }
+}
