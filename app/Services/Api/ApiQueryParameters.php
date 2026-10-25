@@ -30,6 +30,15 @@ final class ApiQueryParameters
         int64_t nntmux_series_resolve_season(const char *input_ptr, size_t input_len);
         C;
 
+    /**
+     * The Wave 45.5 sort summary defaults to Rust: every common and uncommon mean and p99 ratio cleared
+     * 1.5x (min 2.36/2.05/3.19/2.90x); see
+     * tests/Unit/RustApiCapabilitiesCanonicalizerQueryCacheUsageW45ParityTest.php.
+     */
+    public const bool W455_RUST_FFI_DEFAULT = true;
+
+    private const string SORT_PATTERN = '/^(cat|name|size|files|stats|posted)_(asc|desc)$/';
+
     private static FFI|false|null $ffi = null;
 
     private static ?CData $outBuf512 = null;
@@ -41,6 +50,8 @@ final class ApiQueryParameters
     private static bool $adoptSortFfi = false;
 
     private static bool $adoptHasValidSortFfi = false;
+
+    private static ?bool $useW455RustFfi = null;
 
     public static function setUseRustFfi(?bool $enabled): void
     {
@@ -369,7 +380,84 @@ final class ApiQueryParameters
     public function hasValidSortPhp(Request $request): bool
     {
         return ! $request->has('sort')
-            || preg_match('/^(cat|name|size|files|stats|posted)_(asc|desc)$/', $this->sortPhp($request)) === 1;
+            || preg_match(self::SORT_PATTERN, $this->sortPhp($request)) === 1;
+    }
+
+    /** Pass null to restore {@see W455_RUST_FFI_DEFAULT}. */
+    public static function useW455RustFfi(?bool $enable = true): void
+    {
+        self::$useW455RustFfi = $enable;
+    }
+
+    public static function usesW455RustFfi(): bool
+    {
+        return self::$useW455RustFfi ?? self::W455_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW455RustFfi(): void
+    {
+        self::$useW455RustFfi = null;
+    }
+
+    /**
+     * Summarizes {@see sortPhp()} and {@see hasValidSortPhp()} over raw scalar `sort` inputs (cast to
+     * string): `changed` and `empty` normalized values, `valid` sorts split by direction and column, and
+     * `distinct_sorts`. Non-scalar values are invalid.
+     *
+     * @param  array<array-key, mixed>  $values
+     * @return array{values: int, invalid: int, changed: int, empty: int, valid: int, asc: int, desc: int, cat: int, name: int, size: int, files: int, stats: int, posted: int, distinct_sorts: int}
+     */
+    public static function summarizeSortBatch(array $values): array
+    {
+        return self::usesW455RustFfi() ? self::summarizeSortBatchNative($values) : self::summarizeSortBatchPhp($values);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $values
+     * @return array{values: int, invalid: int, changed: int, empty: int, valid: int, asc: int, desc: int, cat: int, name: int, size: int, files: int, stats: int, posted: int, distinct_sorts: int}
+     */
+    public static function summarizeSortBatchPhp(array $values): array
+    {
+        $summary = ['values' => \count($values), 'invalid' => 0, 'changed' => 0, 'empty' => 0, 'valid' => 0, 'asc' => 0, 'desc' => 0, 'cat' => 0, 'name' => 0, 'size' => 0, 'files' => 0, 'stats' => 0, 'posted' => 0, 'distinct_sorts' => 0];
+        $distinct = [];
+        foreach ($values as $value) {
+            if (! \is_scalar($value)) {
+                $summary['invalid']++;
+
+                continue;
+            }
+            $raw = (string) $value;
+            $sort = strtolower(trim($raw));
+            $summary['changed'] += (int) ($sort !== $raw);
+            $summary['empty'] += (int) ($sort === '');
+            if (preg_match(self::SORT_PATTERN, $sort, $match) === 1) {
+                /** @var 'cat'|'name'|'size'|'files'|'stats'|'posted' $column */
+                $column = $match[1];
+                $summary['valid']++;
+                $summary[$match[2] === 'asc' ? 'asc' : 'desc']++;
+                $summary[$column]++;
+            }
+            $distinct[$sort] = true;
+        }
+        $summary['distinct_sorts'] = \count($distinct);
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $values
+     * @return array{values: int, invalid: int, changed: int, empty: int, valid: int, asc: int, desc: int, cat: int, name: int, size: int, files: int, stats: int, posted: int, distinct_sorts: int}
+     */
+    public static function summarizeSortBatchNative(array $values): array
+    {
+        $sources = ApiInputCanonicalizer::scalarStrings($values);
+        $fields = ApiInputCanonicalizer::evaluateW455Native(3, $sources, 12);
+        if ($fields === null) {
+            return self::summarizeSortBatchPhp($values);
+        }
+
+        return ['values' => \count($values), 'invalid' => \count($values) - \count($sources)]
+            + array_combine(['changed', 'empty', 'valid', 'asc', 'desc', 'cat', 'name', 'size', 'files', 'stats', 'posted', 'distinct_sorts'], $fields);
     }
 
     private static function resolveFfi(): ?FFI

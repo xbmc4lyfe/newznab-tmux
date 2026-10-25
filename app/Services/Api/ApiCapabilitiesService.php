@@ -29,6 +29,13 @@ final class ApiCapabilitiesService
         ssize_t nntmux_api_capabilities_searching(int32_t version, char *out, size_t cap);
         C;
 
+    /**
+     * Rust stays opt-in for the Wave 45.5 supported parameter summary: framing the request keys costs
+     * more than PHP's array_intersect_key() (min 0.84/0.87/0.56/0.64x); see
+     * tests/Unit/RustApiCapabilitiesCanonicalizerQueryCacheUsageW45ParityTest.php.
+     */
+    public const bool W455_RUST_FFI_DEFAULT = false;
+
     /** @var array<string, string> */
     private const array SEARCHING_V1 = [
         'search' => 'q,group,minsize,maxsize,maxage,cat,limit,offset,attrs,extended,del,sort',
@@ -52,6 +59,8 @@ final class ApiCapabilitiesService
     public static bool $useRustFfi = false;
 
     private static FFI|false|null $ffi = null;
+
+    private static ?bool $useW455RustFfi = null;
 
     public function __construct(
         private readonly RegistrationStatusService $registrationStatus,
@@ -211,6 +220,103 @@ final class ApiCapabilitiesService
         }
 
         return $functions;
+    }
+
+    /** Pass null to restore {@see W455_RUST_FFI_DEFAULT}. */
+    public static function useW455RustFfi(?bool $enable = true): void
+    {
+        self::$useW455RustFfi = $enable;
+    }
+
+    public static function usesW455RustFfi(): bool
+    {
+        return self::$useW455RustFfi ?? self::W455_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW455RustFfi(): void
+    {
+        self::$useW455RustFfi = null;
+    }
+
+    /**
+     * Summarizes request inputs against the search functions {@see searchingPhp()} advertises for
+     * `$version`: `known_functions` / `unknown_functions` by the string `t` value, `parameters` (every
+     * key but `t`), `supported_parameters` listed for the function, `unsupported_parameters`,
+     * `fully_supported` requests, `max_parameters` and `distinct_functions`. Non-array requests and
+     * requests without a string `t` are invalid.
+     *
+     * @param  array<array-key, mixed>  $requests
+     * @return array{requests: int, invalid: int, known_functions: int, unknown_functions: int, parameters: int, supported_parameters: int, unsupported_parameters: int, fully_supported: int, max_parameters: int, distinct_functions: int}
+     */
+    public static function summarizeSupportedParameterBatch(int $version, array $requests): array
+    {
+        return self::usesW455RustFfi() ? self::summarizeSupportedParameterBatchNative($version, $requests) : self::summarizeSupportedParameterBatchPhp($version, $requests);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $requests
+     * @return array{requests: int, invalid: int, known_functions: int, unknown_functions: int, parameters: int, supported_parameters: int, unsupported_parameters: int, fully_supported: int, max_parameters: int, distinct_functions: int}
+     */
+    public static function summarizeSupportedParameterBatchPhp(int $version, array $requests): array
+    {
+        $summary = ['requests' => \count($requests), 'invalid' => 0, 'known_functions' => 0, 'unknown_functions' => 0, 'parameters' => 0, 'supported_parameters' => 0, 'unsupported_parameters' => 0, 'fully_supported' => 0, 'max_parameters' => 0, 'distinct_functions' => 0];
+        // `t` is never a supported parameter, so intersecting keys skips it.
+        $allowed = array_map(static fn (array $function): array => array_flip(explode(',', $function['supportedParams'])), self::searchingPhp($version));
+        $distinct = [];
+        foreach ($requests as $request) {
+            if (! \is_array($request) || ! \is_string($request['t'] ?? null)) {
+                $summary['invalid']++;
+
+                continue;
+            }
+            $function = $request['t'];
+            $distinct[$function] = true;
+            $count = \count($request) - 1;
+            $summary['parameters'] += $count;
+            $summary['max_parameters'] = max($summary['max_parameters'], $count);
+            if (! isset($allowed[$function])) {
+                $summary['unknown_functions']++;
+                $summary['unsupported_parameters'] += $count;
+
+                continue;
+            }
+            $supported = \count(array_intersect_key($request, $allowed[$function]));
+            $summary['known_functions']++;
+            $summary['supported_parameters'] += $supported;
+            $summary['unsupported_parameters'] += $count - $supported;
+            $summary['fully_supported'] += (int) ($supported === $count);
+        }
+        $summary['distinct_functions'] = \count($distinct);
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $requests
+     * @return array{requests: int, invalid: int, known_functions: int, unknown_functions: int, parameters: int, supported_parameters: int, unsupported_parameters: int, fully_supported: int, max_parameters: int, distinct_functions: int}
+     */
+    public static function summarizeSupportedParameterBatchNative(int $version, array $requests): array
+    {
+        $parts = [(string) $version];
+        $invalid = 0;
+        foreach ($requests as $request) {
+            if (! \is_array($request) || ! \is_string($request['t'] ?? null)) {
+                $invalid++;
+
+                continue;
+            }
+            // Rust splits the keys on NUL and declines the batch when a key held one.
+            $parts[] = $request['t'];
+            $parts[] = (string) \count($request);
+            $parts[] = implode("\0", array_keys($request));
+        }
+        $fields = ApiInputCanonicalizer::evaluateW455Native(1, $parts, 8);
+        if ($fields === null) {
+            return self::summarizeSupportedParameterBatchPhp($version, $requests);
+        }
+
+        return ['requests' => \count($requests), 'invalid' => $invalid]
+            + array_combine(['known_functions', 'unknown_functions', 'parameters', 'supported_parameters', 'unsupported_parameters', 'fully_supported', 'max_parameters', 'distinct_functions'], $fields);
     }
 
     /** @return list<array<string, mixed>> */

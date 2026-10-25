@@ -26,6 +26,13 @@ final class ApiUsageService
         C;
 
     /**
+     * Rust stays opt-in for the Wave 45.5 audit entry summary: PHP's http_build_query() and mb_substr()
+     * are already native, so framing caps the gain (min 1.38/1.29/1.24/1.13x); see
+     * tests/Unit/RustApiCapabilitiesCanonicalizerQueryCacheUsageW45ParityTest.php.
+     */
+    public const bool W455_RUST_FFI_DEFAULT = false;
+
+    /**
      * Only these filter parameters are written to `user_requests.request`;
      * credentials and unknown fields never are (the column ends up in GDPR exports).
      */
@@ -43,6 +50,8 @@ final class ApiUsageService
 
     /** Matches the `user_requests.request` varchar(255) column. */
     private const AUDIT_MAX_LENGTH = 255;
+
+    private static ?bool $useW455RustFfi = null;
 
     private ApiInputCanonicalizer $inputCanonicalizer;
 
@@ -216,6 +225,16 @@ final class ApiUsageService
      */
     public static function auditEntryFromPhp(string $path, array $parameters): string
     {
+        return mb_substr(self::untruncatedAuditEntry($path, $parameters), 0, self::AUDIT_MAX_LENGTH);
+    }
+
+    /**
+     * The audit entry before the column-length cut.
+     *
+     * @param  array<array-key, mixed>  $parameters
+     */
+    private static function untruncatedAuditEntry(string $path, array $parameters): string
+    {
         $audited = [];
         foreach ($parameters as $key => $value) {
             if (is_string($value)) {
@@ -232,7 +251,7 @@ final class ApiUsageService
             $entry .= '?'.http_build_query($audited, '', '&', PHP_QUERY_RFC3986);
         }
 
-        return mb_substr($entry, 0, self::AUDIT_MAX_LENGTH);
+        return $entry;
     }
 
     /**
@@ -280,5 +299,121 @@ final class ApiUsageService
         } catch (Throwable) {
             return null;
         }
+    }
+
+    /** Pass null to restore {@see W455_RUST_FFI_DEFAULT}. */
+    public static function useW455RustFfi(?bool $enable = true): void
+    {
+        self::$useW455RustFfi = $enable;
+    }
+
+    public static function usesW455RustFfi(): bool
+    {
+        return self::$useW455RustFfi ?? self::W455_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW455RustFfi(): void
+    {
+        self::$useW455RustFfi = null;
+    }
+
+    /**
+     * Summarizes {@see auditEntryFromPhp()} over `['path' => string, 'parameters' => array]` entries:
+     * audited string `values`, `null_values` kept as empty, `skipped_values`, `truncated_values` beyond
+     * the per-value limit, `truncated_entries` beyond the column limit, `entry_bytes`, `max_entry_bytes`
+     * and `distinct_entries`. Other entries are invalid. Rust needs a UTF-8 mbstring encoding and valid
+     * UTF-8 paths and values; otherwise the batch runs in PHP.
+     *
+     * @param  array<array-key, mixed>  $entries
+     * @return array{entries: int, invalid: int, values: int, null_values: int, skipped_values: int, truncated_values: int, truncated_entries: int, entry_bytes: int, max_entry_bytes: int, distinct_entries: int}
+     */
+    public static function summarizeAuditEntryBatch(array $entries): array
+    {
+        return self::usesW455RustFfi() ? self::summarizeAuditEntryBatchNative($entries) : self::summarizeAuditEntryBatchPhp($entries);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $entries
+     * @return array{entries: int, invalid: int, values: int, null_values: int, skipped_values: int, truncated_values: int, truncated_entries: int, entry_bytes: int, max_entry_bytes: int, distinct_entries: int}
+     */
+    public static function summarizeAuditEntryBatchPhp(array $entries): array
+    {
+        $summary = ['entries' => count($entries), 'invalid' => 0, 'values' => 0, 'null_values' => 0, 'skipped_values' => 0, 'truncated_values' => 0, 'truncated_entries' => 0, 'entry_bytes' => 0, 'max_entry_bytes' => 0, 'distinct_entries' => 0];
+        $distinct = [];
+        foreach ($entries as $entry) {
+            $path = is_array($entry) ? ($entry['path'] ?? null) : null;
+            $parameters = is_array($entry) ? ($entry['parameters'] ?? null) : null;
+            if (! is_string($path) || ! is_array($parameters)) {
+                $summary['invalid']++;
+
+                continue;
+            }
+            foreach ($parameters as $value) {
+                if (is_string($value)) {
+                    $summary['values']++;
+                    $summary['truncated_values'] += (int) (mb_strlen($value) > self::AUDIT_VALUE_MAX_LENGTH);
+                } elseif ($value === null) {
+                    $summary['null_values']++;
+                } else {
+                    $summary['skipped_values']++;
+                }
+            }
+            $full = self::untruncatedAuditEntry($path, $parameters);
+            $audit = mb_substr($full, 0, self::AUDIT_MAX_LENGTH);
+            $summary['truncated_entries'] += (int) (mb_strlen($full) > self::AUDIT_MAX_LENGTH);
+            $summary['entry_bytes'] += strlen($audit);
+            $summary['max_entry_bytes'] = max($summary['max_entry_bytes'], strlen($audit));
+            $distinct[$audit] = true;
+        }
+        $summary['distinct_entries'] = count($distinct);
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $entries
+     * @return array{entries: int, invalid: int, values: int, null_values: int, skipped_values: int, truncated_values: int, truncated_entries: int, entry_bytes: int, max_entry_bytes: int, distinct_entries: int}
+     */
+    public static function summarizeAuditEntryBatchNative(array $entries): array
+    {
+        if (mb_internal_encoding() !== 'UTF-8') {
+            return self::summarizeAuditEntryBatchPhp($entries);
+        }
+        $summary = ['entries' => count($entries), 'invalid' => 0, 'values' => 0, 'null_values' => 0, 'skipped_values' => 0, 'truncated_values' => 0, 'truncated_entries' => 0, 'entry_bytes' => 0, 'max_entry_bytes' => 0, 'distinct_entries' => 0];
+        $parts = [];
+        foreach ($entries as $entry) {
+            $path = is_array($entry) ? ($entry['path'] ?? null) : null;
+            $parameters = is_array($entry) ? ($entry['parameters'] ?? null) : null;
+            if (! is_string($path) || ! is_array($parameters)) {
+                $summary['invalid']++;
+
+                continue;
+            }
+            $strings = 0;
+            $nulls = 0;
+            foreach ($parameters as $value) {
+                if (is_string($value)) {
+                    $strings++;
+                } elseif ($value === null) {
+                    $nulls++;
+                }
+            }
+            $summary['values'] += $strings;
+            $summary['null_values'] += $nulls;
+            $summary['skipped_values'] += count($parameters) - $strings - $nulls;
+            $audited = $strings === count($parameters) ? $parameters : array_filter($parameters, static fn (mixed $value): bool => is_string($value) || $value === null);
+            // Rust splits keys and values on NUL and declines the batch when one held a NUL.
+            $parts[] = $path;
+            $parts[] = (string) count($audited);
+            $parts[] = implode("\0", array_keys($audited));
+            $parts[] = implode("\0", $audited);
+        }
+        $fields = ApiInputCanonicalizer::evaluateW455Native(5, $parts, 5);
+        if ($fields === null) {
+            return self::summarizeAuditEntryBatchPhp($entries);
+        }
+        [$summary['truncated_values'], $summary['truncated_entries'], $summary['entry_bytes'], $summary['max_entry_bytes'], $summary['distinct_entries']] = $fields;
+
+        return $summary;
     }
 }
