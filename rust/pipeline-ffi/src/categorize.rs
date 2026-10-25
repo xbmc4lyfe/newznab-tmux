@@ -23413,3 +23413,705 @@ pub mod multiprocessing_admin_controllers {
         }
     }
 }
+/// Wave 33.3: attribute normalization for the `RootCategory`, `ShortGroup`, `ReleasesGroups`,
+/// `Country` and `ParHash` Eloquent models.
+///
+/// Multi-field string inputs arrive as one buffer of `0x1F`-separated fields. Outputs are
+/// `0x1F`-separated with `0x1E` alone for PHP `null`. Text that is not UTF-8 or that embeds either
+/// marker byte declines with `-1` so PHP keeps its own implementation.
+pub mod category_group_parhash_models {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+    use std::str;
+
+    pub const DECLINE: isize = -1;
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+    const FIELD_SEP: u8 = 0x1F;
+    const NULL_MARK: u8 = 0x1E;
+    const TRIM_SET: &[u8] = b" \t\n\r\0\x0B\x0C";
+    const U32_MAX: i64 = 4_294_967_295;
+    const TEXT_MAX: usize = 255;
+    const PAR2_HASH_LEN: usize = 32;
+
+    /// `Category::STATUS_INACTIVE`, `STATUS_ACTIVE` and `STATUS_DISABLED`.
+    const STATUS_INACTIVE: i64 = 0;
+    const STATUS_ACTIVE: i64 = 1;
+    const STATUS_DISABLED: i64 = 2;
+
+    unsafe fn valid_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null()
+            || len > MAX_INPUT
+            || len > isize::MAX as usize
+            || (ptr as usize).checked_add(len).is_none()
+        {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn valid_out_buf(out_buf: *mut u8, out_cap: usize) -> bool {
+        !out_buf.is_null()
+            && out_cap <= isize::MAX as usize
+            && (out_buf as usize).checked_add(out_cap).is_some()
+    }
+
+    /// Copies `bytes` into `out_buf`, returning the length or `-required` when it does not fit.
+    unsafe fn write_bytes(bytes: &[u8], out_buf: *mut u8, out_cap: usize) -> isize {
+        if bytes.len() > isize::MAX as usize {
+            return DECLINE;
+        }
+        if bytes.len() > out_cap {
+            return -(bytes.len() as isize);
+        }
+        if !bytes.is_empty() {
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len()) };
+        }
+        bytes.len() as isize
+    }
+
+    fn finish(encoded: Option<Vec<u8>>, out_buf: *mut u8, out_cap: usize) -> isize {
+        match encoded {
+            Some(bytes) => unsafe { write_bytes(&bytes, out_buf, out_cap) },
+            None => DECLINE,
+        }
+    }
+
+    fn has_marker(bytes: &[u8]) -> bool {
+        bytes.iter().any(|&b| b == FIELD_SEP || b == NULL_MARK)
+    }
+
+    /// Validates one text field: UTF-8 without wire markers.
+    fn text_field(bytes: &[u8]) -> Option<&str> {
+        if has_marker(bytes) {
+            return None;
+        }
+        str::from_utf8(bytes).ok()
+    }
+
+    /// Joins fields with the separator; `None` encodes PHP `null`.
+    fn encode(fields: &[Option<&[u8]>]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(fields.iter().map(|f| f.map_or(1, <[u8]>::len) + 1).sum());
+        for (i, field) in fields.iter().enumerate() {
+            if i > 0 {
+                out.push(FIELD_SEP);
+            }
+            out.extend_from_slice(field.unwrap_or(&[NULL_MARK]));
+        }
+        out
+    }
+
+    #[inline]
+    fn bool_bytes(value: bool) -> &'static [u8] {
+        if value { b"1" } else { b"0" }
+    }
+
+    /// PHP `trim($value, " \t\n\r\0\x0B\x0C")`.
+    fn trim_ws(value: &str) -> &str {
+        value.trim_matches(|c: char| c.is_ascii() && TRIM_SET.contains(&(c as u8)))
+    }
+
+    /// PHP `preg_replace('/[ \t\n\r\x0B\x0C]+/', ' ', $value)`.
+    fn collapse_ws(value: &str) -> String {
+        let mut out = String::with_capacity(value.len());
+        let mut in_run = false;
+        for c in value.chars() {
+            if matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0B' | '\x0C') {
+                if !in_run {
+                    out.push(' ');
+                    in_run = true;
+                }
+            } else {
+                out.push(c);
+                in_run = false;
+            }
+        }
+        out
+    }
+
+    /// PHP `mb_substr($value, 0, $max, 'UTF-8')` for valid UTF-8.
+    fn char_prefix(value: &str, max: usize) -> &str {
+        match value.char_indices().nth(max) {
+            Some((index, _)) => &value[..index],
+            None => value,
+        }
+    }
+
+    /// `mb_substr(trim(preg_replace(collapse, ' ', $value)), 0, 255)`.
+    pub fn clean_text(value: &str) -> String {
+        char_prefix(trim_ws(&collapse_ws(value)), TEXT_MAX).to_owned()
+    }
+
+    #[inline]
+    fn in_u32_id_range(value: i64) -> bool {
+        (1..=U32_MAX).contains(&value)
+    }
+
+    /// `RootCategory::normalizeRootCategoryAttributesPhp()`:
+    /// `(id, title, status, disablepreview, is_active, title_key)`.
+    pub fn root_category_attributes(
+        id: i64,
+        title: &str,
+        status: i64,
+        disable_preview: i64,
+    ) -> (i64, String, i64, i64, bool, String) {
+        let title = clean_text(title);
+        let status = match status {
+            STATUS_INACTIVE | STATUS_ACTIVE | STATUS_DISABLED => status,
+            _ => STATUS_INACTIVE,
+        };
+        let key = title.to_ascii_lowercase();
+        (
+            id.max(0),
+            title,
+            status,
+            i64::from(disable_preview != 0),
+            status == STATUS_ACTIVE,
+            key,
+        )
+    }
+
+    /// `ShortGroup::normalizeArticleWatermarkRangePhp()`:
+    /// `(name, first_record, last_record, article_count, is_valid)`.
+    pub fn short_group_watermark(
+        name: &str,
+        first: i64,
+        last: i64,
+    ) -> (String, i64, i64, i64, bool) {
+        let name = char_prefix(trim_ws(name), TEXT_MAX).to_ascii_lowercase();
+        let first = first.max(0);
+        let last = last.max(0);
+        let count = if first > 0 && last >= first {
+            last - first + 1
+        } else {
+            0
+        };
+        let valid = !name.is_empty() && count > 0;
+        (name, first, last, count, valid)
+    }
+
+    /// `ReleasesGroups::normalizeCompositeMappingPhp()`:
+    /// `(releases_id, groups_id, composite_key, is_valid)`.
+    pub fn releases_groups_mapping(release_id: i64, group_id: i64) -> (i64, i64, String, bool) {
+        let release = release_id.clamp(0, U32_MAX);
+        let group = group_id.clamp(0, U32_MAX);
+        (
+            release,
+            group,
+            format!("{release}:{group}"),
+            in_u32_id_range(release_id) && in_u32_id_range(group_id),
+        )
+    }
+
+    /// `Country::normalizeIsoCountryRecordPhp()`:
+    /// `(iso_3166_2, name, full_name, is_valid)`.
+    pub fn country_record(
+        iso: &str,
+        name: &str,
+        full_name: Option<&str>,
+    ) -> (Option<String>, String, Option<String>, bool) {
+        let iso = trim_ws(iso);
+        let iso = (iso.len() == 2 && iso.bytes().all(|b| b.is_ascii_alphabetic()))
+            .then(|| iso.to_ascii_uppercase());
+        let name = clean_text(name);
+        let full_name = full_name.map(clean_text).filter(|f| !f.is_empty());
+        let valid = iso.is_some() && !name.is_empty();
+        (iso, name, full_name, valid)
+    }
+
+    /// `ParHash::normalizePar2Hash16kPhp()`: `(releases_id, hash, is_valid)`.
+    pub fn par2_hash_16k(release_id: i64, hash: &[u8]) -> (i64, Option<String>, bool) {
+        let hash = (hash.len() == PAR2_HASH_LEN && hash.iter().all(u8::is_ascii_hexdigit))
+            .then(|| String::from_utf8_lossy(hash).to_ascii_lowercase());
+        let valid = hash.is_some() && in_u32_id_range(release_id);
+        (release_id.clamp(0, U32_MAX), hash, valid)
+    }
+
+    fn root_category_encode(
+        id: i64,
+        status: i64,
+        disable_preview: i64,
+        title: &[u8],
+    ) -> Option<Vec<u8>> {
+        let title = text_field(title)?;
+        let (id, title, status, preview, active, key) =
+            root_category_attributes(id, title, status, disable_preview);
+        let id = id.to_string();
+        let status = status.to_string();
+        let preview = preview.to_string();
+        Some(encode(&[
+            Some(id.as_bytes()),
+            Some(title.as_bytes()),
+            Some(status.as_bytes()),
+            Some(preview.as_bytes()),
+            Some(bool_bytes(active)),
+            Some(key.as_bytes()),
+        ]))
+    }
+
+    fn short_group_encode(first: i64, last: i64, name: &[u8]) -> Option<Vec<u8>> {
+        let name = text_field(name)?;
+        let (name, first, last, count, valid) = short_group_watermark(name, first, last);
+        let first = first.to_string();
+        let last = last.to_string();
+        let count = count.to_string();
+        Some(encode(&[
+            Some(name.as_bytes()),
+            Some(first.as_bytes()),
+            Some(last.as_bytes()),
+            Some(count.as_bytes()),
+            Some(bool_bytes(valid)),
+        ]))
+    }
+
+    fn releases_groups_encode(release_id: i64, group_id: i64) -> Vec<u8> {
+        let (release, group, key, valid) = releases_groups_mapping(release_id, group_id);
+        let release = release.to_string();
+        let group = group.to_string();
+        encode(&[
+            Some(release.as_bytes()),
+            Some(group.as_bytes()),
+            Some(key.as_bytes()),
+            Some(bool_bytes(valid)),
+        ])
+    }
+
+    fn country_encode(has_full_name: bool, input: &[u8]) -> Option<Vec<u8>> {
+        let mut parts = input.split(|&b| b == FIELD_SEP);
+        let (Some(iso), Some(name), Some(full), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return None;
+        };
+        let iso = text_field(iso)?;
+        let name = text_field(name)?;
+        let full = text_field(full)?;
+        if !has_full_name && !full.is_empty() {
+            return None;
+        }
+        let (iso, name, full, valid) = country_record(iso, name, has_full_name.then_some(full));
+        Some(encode(&[
+            iso.as_deref().map(str::as_bytes),
+            Some(name.as_bytes()),
+            full.as_deref().map(str::as_bytes),
+            Some(bool_bytes(valid)),
+        ]))
+    }
+
+    fn par2_hash_encode(release_id: i64, hash: &[u8]) -> Vec<u8> {
+        let (release, hash, valid) = par2_hash_16k(release_id, hash);
+        let release = release.to_string();
+        encode(&[
+            Some(release.as_bytes()),
+            hash.as_deref().map(str::as_bytes),
+            Some(bool_bytes(valid)),
+        ])
+    }
+
+    /// `RootCategory::normalizeRootCategoryAttributes()`; input is the raw title.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_root_category_normalize_attributes(
+        id: i64,
+        status: i64,
+        disable_preview: i64,
+        title_ptr: *const u8,
+        title_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(title) = (unsafe { valid_slice(title_ptr, title_len) }) else {
+                return DECLINE;
+            };
+            finish(
+                root_category_encode(id, status, disable_preview, title),
+                out_buf,
+                out_cap,
+            )
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `ShortGroup::normalizeArticleWatermarkRange()`; input is the raw group name.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_short_group_normalize_watermark(
+        first_record: i64,
+        last_record: i64,
+        name_ptr: *const u8,
+        name_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(name) = (unsafe { valid_slice(name_ptr, name_len) }) else {
+                return DECLINE;
+            };
+            finish(
+                short_group_encode(first_record, last_record, name),
+                out_buf,
+                out_cap,
+            )
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `ReleasesGroups::normalizeCompositeMapping()`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_releases_groups_normalize_mapping(
+        release_id: i64,
+        group_id: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            finish(
+                Some(releases_groups_encode(release_id, group_id)),
+                out_buf,
+                out_cap,
+            )
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `Country::normalizeIsoCountryRecord()`; input is `iso`, `name`, `full_name`.
+    /// `has_full_name` is `0` for PHP `null` (its field must then be empty) or `1`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_country_normalize_iso_record(
+        has_full_name: u32,
+        input_ptr: *const u8,
+        input_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let has_full_name = match has_full_name {
+                0 => false,
+                1 => true,
+                _ => return DECLINE,
+            };
+            let Some(input) = (unsafe { valid_slice(input_ptr, input_len) }) else {
+                return DECLINE;
+            };
+            finish(country_encode(has_full_name, input), out_buf, out_cap)
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `ParHash::normalizePar2Hash16k()`; the hash is arbitrary bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_par_hash_normalize_16k(
+        release_id: i64,
+        hash_ptr: *const u8,
+        hash_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(hash) = (unsafe { valid_slice(hash_ptr, hash_len) }) else {
+                return DECLINE;
+            };
+            finish(Some(par2_hash_encode(release_id, hash)), out_buf, out_cap)
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::ptr;
+
+        fn call(f: impl Fn(*mut u8, usize) -> isize) -> Result<Vec<u8>, isize> {
+            let mut buf = vec![0u8; 1024];
+            let rc = f(buf.as_mut_ptr(), buf.len());
+            if rc < 0 {
+                return Err(rc);
+            }
+            buf.truncate(rc as usize);
+            Ok(buf)
+        }
+
+        fn fields(out: &[u8]) -> Vec<Option<String>> {
+            out.split(|&b| b == FIELD_SEP)
+                .map(|f| (f != [NULL_MARK]).then(|| String::from_utf8(f.to_vec()).unwrap()))
+                .collect()
+        }
+
+        fn s(v: &str) -> Option<String> {
+            Some(v.to_owned())
+        }
+
+        #[test]
+        fn root_category_rules() {
+            assert_eq!(
+                root_category_attributes(2000, "  Movies \t HD ", 1, 5),
+                (
+                    2000,
+                    s("Movies HD").unwrap(),
+                    1,
+                    1,
+                    true,
+                    s("movies hd").unwrap()
+                )
+            );
+            assert_eq!(root_category_attributes(-3, "", 7, 0).0, 0);
+            assert_eq!(root_category_attributes(1, "x", 7, 0).2, STATUS_INACTIVE);
+            assert_eq!(root_category_attributes(1, "x", 2, 0).2, STATUS_DISABLED);
+            assert!(!root_category_attributes(1, "x", 2, 0).4);
+            assert_eq!(root_category_attributes(1, "Ä", 1, 0).5, "Ä");
+            assert_eq!(
+                root_category_attributes(1, &"é".repeat(300), 1, 0)
+                    .1
+                    .chars()
+                    .count(),
+                255
+            );
+        }
+
+        #[test]
+        fn short_group_rules() {
+            assert_eq!(
+                short_group_watermark(" Alt.Binaries.Teevee\n", 100, 199),
+                (s("alt.binaries.teevee").unwrap(), 100, 199, 100, true)
+            );
+            assert_eq!(short_group_watermark("a.b", 0, 50).3, 0);
+            assert_eq!(short_group_watermark("a.b", 10, 5).3, 0);
+            assert!(!short_group_watermark("", 1, 1).4);
+            assert_eq!(
+                short_group_watermark("a.b", -5, -1),
+                (s("a.b").unwrap(), 0, 0, 0, false)
+            );
+            assert_eq!(short_group_watermark("a.b", 1, i64::MAX).3, i64::MAX);
+        }
+
+        #[test]
+        fn mapping_country_and_hash_rules() {
+            assert_eq!(
+                releases_groups_mapping(5, 9),
+                (5, 9, s("5:9").unwrap(), true)
+            );
+            assert_eq!(
+                releases_groups_mapping(i64::MAX, -1),
+                (U32_MAX, 0, format!("{U32_MAX}:0"), false)
+            );
+            assert!(!releases_groups_mapping(U32_MAX + 1, 1).3);
+
+            assert_eq!(
+                country_record(" gb ", " United  Kingdom ", Some("  ")),
+                (s("GB"), s("United Kingdom").unwrap(), None, true)
+            );
+            assert_eq!(country_record("GBR", "x", None).0, None);
+            assert_eq!(country_record("g1", "x", None).0, None);
+            assert_eq!(country_record("ÄB", "x", None).0, None);
+            assert!(!country_record("US", " ", None).3);
+
+            let upper = b"0123456789ABCDEF0123456789abcdef";
+            assert_eq!(
+                par2_hash_16k(7, upper),
+                (7, s("0123456789abcdef0123456789abcdef"), true)
+            );
+            assert_eq!(par2_hash_16k(7, b"xyz"), (7, None, false));
+            assert_eq!(par2_hash_16k(0, upper).2, false);
+            assert_eq!(par2_hash_16k(-1, &[0xff; 32]), (0, None, false));
+        }
+
+        #[test]
+        fn exports_encode_fields() {
+            let title = b" Movies ";
+            let out = call(|b, c| unsafe {
+                nntmux_root_category_normalize_attributes(
+                    2000,
+                    1,
+                    0,
+                    title.as_ptr(),
+                    title.len(),
+                    b,
+                    c,
+                )
+            })
+            .unwrap();
+            assert_eq!(
+                fields(&out),
+                vec![s("2000"), s("Movies"), s("1"), s("0"), s("1"), s("movies")]
+            );
+
+            let name = b"Alt.Binaries.X";
+            let out = call(|b, c| unsafe {
+                nntmux_short_group_normalize_watermark(1, 10, name.as_ptr(), name.len(), b, c)
+            })
+            .unwrap();
+            assert_eq!(
+                fields(&out),
+                vec![s("alt.binaries.x"), s("1"), s("10"), s("10"), s("1")]
+            );
+
+            let out = call(|b, c| unsafe { nntmux_releases_groups_normalize_mapping(3, 4, b, c) })
+                .unwrap();
+            assert_eq!(fields(&out), vec![s("3"), s("4"), s("3:4"), s("1")]);
+
+            let input = b"us\x1FUnited States\x1F";
+            let out = call(|b, c| unsafe {
+                nntmux_country_normalize_iso_record(0, input.as_ptr(), input.len(), b, c)
+            })
+            .unwrap();
+            assert_eq!(
+                fields(&out),
+                vec![s("US"), s("United States"), None, s("1")]
+            );
+
+            let hash = b"\x1F\x1E";
+            let out = call(|b, c| unsafe {
+                nntmux_par_hash_normalize_16k(9, hash.as_ptr(), hash.len(), b, c)
+            })
+            .unwrap();
+            assert_eq!(fields(&out), vec![s("9"), None, s("0")]);
+        }
+
+        #[test]
+        fn exports_reject_malformed_input_and_respect_capacity() {
+            let mut small = [b'Z'; 4];
+            let title = b"Movies";
+            let rc = unsafe {
+                nntmux_root_category_normalize_attributes(
+                    1,
+                    1,
+                    0,
+                    title.as_ptr(),
+                    title.len(),
+                    small.as_mut_ptr(),
+                    small.len(),
+                )
+            };
+            assert!(rc < DECLINE);
+            assert_eq!(small, [b'Z'; 4]);
+            let mut big = vec![0u8; (-rc) as usize];
+            assert_eq!(
+                unsafe {
+                    nntmux_root_category_normalize_attributes(
+                        1,
+                        1,
+                        0,
+                        title.as_ptr(),
+                        title.len(),
+                        big.as_mut_ptr(),
+                        big.len(),
+                    )
+                },
+                -rc
+            );
+            let rc =
+                unsafe { nntmux_releases_groups_normalize_mapping(1, 2, small.as_mut_ptr(), 2) };
+            assert!(rc < DECLINE);
+            assert_eq!(small, [b'Z'; 4]);
+
+            for bad in [&b"\xff"[..], b"a\x1Fb", b"\x1E"] {
+                assert_eq!(
+                    call(|b, c| unsafe {
+                        nntmux_root_category_normalize_attributes(
+                            1,
+                            1,
+                            0,
+                            bad.as_ptr(),
+                            bad.len(),
+                            b,
+                            c,
+                        )
+                    }),
+                    Err(DECLINE)
+                );
+                assert_eq!(
+                    call(|b, c| unsafe {
+                        nntmux_short_group_normalize_watermark(1, 1, bad.as_ptr(), bad.len(), b, c)
+                    }),
+                    Err(DECLINE)
+                );
+            }
+            for (flag, input) in [
+                (0, &b"us\x1Fname\x1Fx"[..]),
+                (2, b"us\x1Fname\x1F"),
+                (1, b"us\x1Fname"),
+                (1, b"us\x1Fname\x1Ffull\x1Fextra"),
+                (1, b"us\x1F\xff\x1F"),
+                (1, b"u\x1Es\x1Fname\x1F"),
+            ] {
+                assert_eq!(
+                    call(|b, c| unsafe {
+                        nntmux_country_normalize_iso_record(flag, input.as_ptr(), input.len(), b, c)
+                    }),
+                    Err(DECLINE)
+                );
+            }
+
+            unsafe {
+                assert_eq!(
+                    nntmux_root_category_normalize_attributes(
+                        1,
+                        1,
+                        0,
+                        ptr::null(),
+                        0,
+                        big.as_mut_ptr(),
+                        big.len()
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_short_group_normalize_watermark(
+                        1,
+                        1,
+                        title.as_ptr(),
+                        title.len(),
+                        ptr::null_mut(),
+                        16
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_releases_groups_normalize_mapping(1, 1, ptr::null_mut(), 16),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_country_normalize_iso_record(
+                        0,
+                        ptr::null(),
+                        0,
+                        big.as_mut_ptr(),
+                        big.len()
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_par_hash_normalize_16k(1, ptr::null(), 0, big.as_mut_ptr(), big.len()),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_par_hash_normalize_16k(
+                        1,
+                        title.as_ptr(),
+                        MAX_INPUT + 1,
+                        big.as_mut_ptr(),
+                        big.len()
+                    ),
+                    DECLINE
+                );
+            }
+        }
+    }
+}
