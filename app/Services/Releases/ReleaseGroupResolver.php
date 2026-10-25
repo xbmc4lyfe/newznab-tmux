@@ -5,12 +5,21 @@ declare(strict_types=1);
 namespace App\Services\Releases;
 
 use App\Models\UsenetGroup;
+use App\Services\Search\Support\ManticoreSchemaInspector;
 use App\Support\RustPipelineLibrary;
 use FFI;
 use Throwable;
 
 final class ReleaseGroupResolver
 {
+    /**
+     * Rust stays opt-in for the Wave 43.5 summary: the FFI round trip misses the 1.5x gate; see
+     * tests/Unit/RustManticoreSchemaReleaseBrowseDuplicateGroupMgmtW43ParityTest.php.
+     */
+    public const bool W43_RELEASE_GROUP_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useW43RustFfi = null;
+
     /**
      * Resolve valid crosspost names, retaining the inactive defaults used by release processing.
      *
@@ -94,6 +103,104 @@ final class ReleaseGroupResolver
             'first_record' => (int) $fields[3], 'last_record' => (int) $fields[4],
             'active' => (int) $fields[5], 'backfill' => (int) $fields[6],
             'minfilestoformrelease' => $fields[7], 'minsizetoformrelease' => $fields[8],
+        ];
+    }
+
+    /** Pass null to restore {@see W43_RELEASE_GROUP_RUST_FFI_DEFAULT}. */
+    public static function useW43RustFfi(?bool $enable = true): void
+    {
+        self::$useW43RustFfi = $enable;
+    }
+
+    public static function usesW43RustFfi(): bool
+    {
+        return self::$useW43RustFfi ?? self::W43_RELEASE_GROUP_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Summarizes crosspost names through the pure steps of {@see idsByName()}: exact duplicates are
+     * dropped, {@see UsenetGroup::isValidGroupPhp()} rejects or normalizes (`aliased` counts expanded
+     * `a.b.` prefixes) and names over 255 bytes are too long. Non-string names are invalid.
+     *
+     * @param  array<array-key, mixed>  $names
+     * @return array{names: int, invalid: int, duplicates: int, valid: int, rejected: int, too_long: int, aliased: int, distinct_groups: int, max_group_length: int}
+     */
+    public static function summarizeCrosspostNameBatch(array $names): array
+    {
+        return self::usesW43RustFfi() ? self::summarizeCrosspostNameBatchNative($names) : self::summarizeCrosspostNameBatchPhp($names);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $names
+     * @return array{names: int, invalid: int, duplicates: int, valid: int, rejected: int, too_long: int, aliased: int, distinct_groups: int, max_group_length: int}
+     */
+    public static function summarizeCrosspostNameBatchPhp(array $names): array
+    {
+        $summary = ['names' => \count($names), 'invalid' => 0, 'duplicates' => 0, 'valid' => 0, 'rejected' => 0, 'too_long' => 0, 'aliased' => 0, 'distinct_groups' => 0, 'max_group_length' => 0];
+        $seen = [];
+        $groups = [];
+        foreach ($names as $name) {
+            if (! \is_string($name)) {
+                $summary['invalid']++;
+
+                continue;
+            }
+            if (isset($seen[$name])) {
+                $summary['duplicates']++;
+
+                continue;
+            }
+            $seen[$name] = true;
+            $group = UsenetGroup::isValidGroupPhp($name);
+            if (! \is_string($group)) {
+                $summary['rejected']++;
+
+                continue;
+            }
+            if (\strlen($group) > 255) {
+                $summary['too_long']++;
+
+                continue;
+            }
+            $summary['valid']++;
+            $summary['aliased'] += (int) ($group !== $name);
+            $summary['max_group_length'] = max($summary['max_group_length'], \strlen($group));
+            $groups[$group] = true;
+        }
+        $summary['distinct_groups'] = \count($groups);
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $names
+     * @return array{names: int, invalid: int, duplicates: int, valid: int, rejected: int, too_long: int, aliased: int, distinct_groups: int, max_group_length: int}
+     */
+    public static function summarizeCrosspostNameBatchNative(array $names): array
+    {
+        $parts = [];
+        foreach ($names as $name) {
+            if (\is_string($name)) {
+                array_push($parts, '1', $name);
+            } else {
+                $parts[] = '0';
+            }
+        }
+        $fields = ManticoreSchemaInspector::evaluateW43Native(4, $parts);
+        if ($fields === null || \count($fields) !== 9) {
+            return self::summarizeCrosspostNameBatchPhp($names);
+        }
+
+        return [
+            'names' => (int) $fields[0],
+            'invalid' => (int) $fields[1],
+            'duplicates' => (int) $fields[2],
+            'valid' => (int) $fields[3],
+            'rejected' => (int) $fields[4],
+            'too_long' => (int) $fields[5],
+            'aliased' => (int) $fields[6],
+            'distinct_groups' => (int) $fields[7],
+            'max_group_length' => (int) $fields[8],
         ];
     }
 

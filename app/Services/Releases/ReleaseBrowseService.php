@@ -9,6 +9,7 @@ use App\Models\Category;
 use App\Models\Release;
 use App\Models\UsenetGroup;
 use App\Services\Configuration\ConfigurationProvider;
+use App\Services\Search\Support\ManticoreSchemaInspector;
 use App\Support\ReleaseSearchIndexDocument;
 use App\Support\RustPipelineLibrary;
 use FFI;
@@ -39,6 +40,14 @@ class ReleaseBrowseService
     public const PASSWD_NONE = 0; // No password.
 
     public const PASSWD_RAR = 1; // Definitely passworded.
+
+    /**
+     * Rust stays opt-in for the Wave 43.5 summary: the FFI round trip misses the 1.5x gate; see
+     * tests/Unit/RustManticoreSchemaReleaseBrowseDuplicateGroupMgmtW43ParityTest.php.
+     */
+    public const bool W43_RELEASE_BROWSE_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useW43RustFfi = null;
 
     // Every candidate missed at least one 1.5x workload gate; see the parity benchmark.
     private static bool $useRustFfi = false;
@@ -672,6 +681,81 @@ class ReleaseBrowseService
         };
 
         return [$orderField, isset($orderArr[1]) && preg_match('/^(asc|desc)$/i', $orderArr[1]) ? $orderArr[1] : 'desc'];
+    }
+
+    /** Pass null to restore {@see W43_RELEASE_BROWSE_RUST_FFI_DEFAULT}. */
+    public static function useW43RustFfi(?bool $enable = true): void
+    {
+        self::$useW43RustFfi = $enable;
+    }
+
+    public static function usesW43RustFfi(): bool
+    {
+        return self::$useW43RustFfi ?? self::W43_RELEASE_BROWSE_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Summarizes browse orders as {@see getBrowseOrderPhp()} resolves them: one count per resolved
+     * column, the resolved direction (`asc`/`desc`, any case), `explicit_direction` for orders whose
+     * direction segment was honoured, `index_sortable` for columns the search index can sort and
+     * `distinct_orders` for distinct column/direction pairs. Non-string orders are invalid.
+     *
+     * @param  array<array-key, mixed>  $orderBys
+     * @return array{orders: int, invalid: int, categories_id: int, searchname: int, size: int, totalpart: int, grabs: int, comments: int, adddate: int, postdate: int, asc: int, desc: int, explicit_direction: int, index_sortable: int, distinct_orders: int}
+     */
+    public function summarizeBrowseOrderBatch(array $orderBys): array
+    {
+        return self::usesW43RustFfi() ? $this->summarizeBrowseOrderBatchNative($orderBys) : $this->summarizeBrowseOrderBatchPhp($orderBys);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $orderBys
+     * @return array{orders: int, invalid: int, categories_id: int, searchname: int, size: int, totalpart: int, grabs: int, comments: int, adddate: int, postdate: int, asc: int, desc: int, explicit_direction: int, index_sortable: int, distinct_orders: int}
+     */
+    public function summarizeBrowseOrderBatchPhp(array $orderBys): array
+    {
+        $summary = ['orders' => \count($orderBys), 'invalid' => 0, 'categories_id' => 0, 'searchname' => 0, 'size' => 0, 'totalpart' => 0, 'grabs' => 0, 'comments' => 0, 'adddate' => 0, 'postdate' => 0, 'asc' => 0, 'desc' => 0, 'explicit_direction' => 0, 'index_sortable' => 0, 'distinct_orders' => 0];
+        $distinct = [];
+        foreach ($orderBys as $orderBy) {
+            if (! \is_string($orderBy)) {
+                $summary['invalid']++;
+
+                continue;
+            }
+            [$field, $direction] = $this->getBrowseOrderPhp($orderBy);
+            $segments = explode('_', $orderBy === '' ? 'posted_desc' : $orderBy);
+            $summary[$field]++;
+            $summary[strncasecmp($direction, 'a', 1) === 0 ? 'asc' : 'desc']++;
+            $summary['explicit_direction'] += (int) (isset($segments[1]) && preg_match('/^(asc|desc)$/i', $segments[1]) === 1);
+            $summary['index_sortable'] += (int) ($this->browseOrderToIndexSortField($field) !== null);
+            $distinct[$field."\0".$direction] = true;
+        }
+        $summary['distinct_orders'] = \count($distinct);
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $orderBys
+     * @return array{orders: int, invalid: int, categories_id: int, searchname: int, size: int, totalpart: int, grabs: int, comments: int, adddate: int, postdate: int, asc: int, desc: int, explicit_direction: int, index_sortable: int, distinct_orders: int}
+     */
+    public function summarizeBrowseOrderBatchNative(array $orderBys): array
+    {
+        $parts = [];
+        foreach ($orderBys as $orderBy) {
+            if (\is_string($orderBy)) {
+                array_push($parts, '1', $orderBy);
+            } else {
+                $parts[] = '0';
+            }
+        }
+        $fields = ManticoreSchemaInspector::evaluateW43Native(2, $parts);
+        if ($fields === null || \count($fields) !== 15) {
+            return $this->summarizeBrowseOrderBatchPhp($orderBys);
+        }
+        $keys = ['orders', 'invalid', 'categories_id', 'searchname', 'size', 'totalpart', 'grabs', 'comments', 'adddate', 'postdate', 'asc', 'desc', 'explicit_direction', 'index_sortable', 'distinct_orders'];
+
+        return array_combine($keys, array_map(intval(...), $fields));
     }
 
     /**

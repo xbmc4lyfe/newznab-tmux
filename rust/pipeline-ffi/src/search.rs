@@ -29851,3 +29851,928 @@ mod wave42_5_search_outbox_elastic_manticore_support {
         }
     }
 }
+
+/// Wave 43.5 search and release helpers: Manticore `SHOW TABLE SETTINGS`
+/// blob batches (`ManticoreSchemaInspector`), browse order batches
+/// (`ReleaseBrowseService`), duplicate candidate batches
+/// (`ReleaseDuplicateFinder`), crosspost group name batches
+/// (`ReleaseGroupResolver`) and export date bound batches
+/// (`ReleaseManagementService`). PHP marshals each call into count-prefixed,
+/// length-prefixed byte strings; results use the same framing.
+mod wave43_5_manticore_schema_release_browse_duplicate_group_mgmt {
+    use std::collections::{HashMap, HashSet};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const DECLINE: i32 = -1;
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+    const MAX_PARTS: usize = 1 << 20;
+    /// Characters stripped by PHP's default `trim()`.
+    const TRIM: &[u8] = b" \t\n\r\0\x0B";
+    /// Longest group name `ReleaseGroupResolver::filterValidNames()` keeps.
+    const MAX_GROUP_NAME: usize = 255;
+
+    fn unpack(input: &[u8]) -> Option<Vec<&[u8]>> {
+        let count = u32::from_le_bytes(input.get(..4)?.try_into().ok()?) as usize;
+        if count > MAX_PARTS || count > (input.len() - 4) / 4 {
+            return None;
+        }
+        let mut cursor = 4usize;
+        let mut parts = Vec::with_capacity(count);
+        for _ in 0..count {
+            let length_end = cursor.checked_add(4)?;
+            let length =
+                u32::from_le_bytes(input.get(cursor..length_end)?.try_into().ok()?) as usize;
+            let end = length_end.checked_add(length)?;
+            parts.push(input.get(length_end..end)?);
+            cursor = end;
+        }
+        (cursor == input.len()).then_some(parts)
+    }
+
+    fn pack(parts: &[Vec<u8>]) -> Option<Vec<u8>> {
+        let count = u32::try_from(parts.len()).ok()?;
+        let size = parts.iter().try_fold(4usize, |size, part| {
+            u32::try_from(part.len()).ok()?;
+            size.checked_add(4)?.checked_add(part.len())
+        })?;
+        if size > i32::MAX as usize {
+            return None;
+        }
+        let mut out = Vec::with_capacity(size);
+        out.extend_from_slice(&count.to_le_bytes());
+        for part in parts {
+            out.extend_from_slice(&(part.len() as u32).to_le_bytes());
+            out.extend_from_slice(part);
+        }
+        Some(out)
+    }
+
+    /// Canonical decimal produced by PHP `(string) $int`.
+    fn integer(bytes: &[u8]) -> Option<i64> {
+        if bytes.is_empty() || bytes.len() > 20 {
+            return None;
+        }
+        let value: i64 = std::str::from_utf8(bytes).ok()?.parse().ok()?;
+        (value.to_string().as_bytes() == bytes).then_some(value)
+    }
+
+    /// Canonical non-negative integer used as an element count.
+    fn length(bytes: &[u8]) -> Option<usize> {
+        usize::try_from(integer(bytes)?).ok()
+    }
+
+    fn flag(bytes: &[u8]) -> Option<bool> {
+        match bytes {
+            b"1" => Some(true),
+            b"0" => Some(false),
+            _ => None,
+        }
+    }
+
+    fn count(value: usize) -> Option<Vec<u8>> {
+        Some(i64::try_from(value).ok()?.to_string().into_bytes())
+    }
+
+    fn counts(values: &[usize]) -> Option<Vec<Vec<u8>>> {
+        values.iter().map(|value| count(*value)).collect()
+    }
+
+    /// PHP `trim()` with the default character list.
+    fn trim(bytes: &[u8]) -> &[u8] {
+        let start = bytes
+            .iter()
+            .position(|byte| !TRIM.contains(byte))
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|byte| !TRIM.contains(byte))
+            .map_or(start, |index| index + 1);
+        &bytes[start..end]
+    }
+
+    /// PCRE `\s` without the `u` modifier.
+    fn space(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | 0x0B | 0x0C | b'\r')
+    }
+
+    fn quote(byte: u8) -> bool {
+        byte == b'\'' || byte == b'"'
+    }
+
+    /// `preg_split('/\R/', $blob)` without the `u` modifier: `\r\n`, `\n`,
+    /// `\v`, `\f`, `\r` and `\x85` each end a line.
+    fn lines(blob: &[u8]) -> Vec<&[u8]> {
+        let mut out = Vec::new();
+        let (mut start, mut i) = (0usize, 0usize);
+        while i < blob.len() {
+            match blob[i] {
+                b'\r' if blob.get(i + 1) == Some(&b'\n') => {
+                    out.push(&blob[start..i]);
+                    i += 2;
+                    start = i;
+                }
+                b'\n' | 0x0B | 0x0C | b'\r' | 0x85 => {
+                    out.push(&blob[start..i]);
+                    i += 1;
+                    start = i;
+                }
+                _ => i += 1,
+            }
+        }
+        out.push(&blob[start..]);
+        out
+    }
+
+    /// One `ManticoreSchemaInspector::normalizeSettings()` line:
+    /// `/^\s*([a-z0-9_]+)\s*=\s*['"]?([^'"]+?)['"]?\s*$/i`, returning the
+    /// lowercased key and `strtolower(trim($value))`. The value search follows
+    /// PCRE backtracking order: the widest whitespace run after `=`, an
+    /// optional opening quote, then the shortest quote-free value whose tail is
+    /// an optional quote and whitespace.
+    fn setting(line: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+        let len = line.len();
+        let mut i = line.iter().position(|b| !space(*b)).unwrap_or(len);
+        let key_start = i;
+        while i < len && (line[i].is_ascii_alphanumeric() || line[i] == b'_') {
+            i += 1;
+        }
+        if i == key_start {
+            return None;
+        }
+        let key = line[key_start..i].to_ascii_lowercase();
+        while i < len && space(line[i]) {
+            i += 1;
+        }
+        if line.get(i) != Some(&b'=') {
+            return None;
+        }
+        let q = i + 1;
+        // `blank[i]`: `line[i..]` is `\s*` followed by the end (`$`).
+        let mut blank = vec![false; len + 1];
+        blank[len] = true;
+        for index in (0..len).rev() {
+            blank[index] = space(line[index]) && blank[index + 1];
+        }
+        let tail = |e: usize| blank[e] || (e < len && quote(line[e]) && blank[e + 1]);
+        let scan = |p: usize| -> Option<usize> {
+            let mut e = p;
+            while e < len && !quote(line[e]) {
+                e += 1;
+                if tail(e) {
+                    return Some(e);
+                }
+            }
+            None
+        };
+        let mut k = q;
+        while k < len && space(line[k]) {
+            k += 1;
+        }
+        let found = if k < len && quote(line[k]) {
+            scan(k + 1).map(|e| (k + 1, e))
+        } else {
+            scan(k).map(|e| (k, e))
+        };
+        // Backtracking `\s*` lets the value start inside the whitespace run;
+        // only its last character can succeed, and only when the rest of the
+        // line is a lone quote or nothing.
+        let (p, e) = match found {
+            Some(span) => span,
+            None if k > q && tail(k) => (k - 1, k),
+            None => return None,
+        };
+        Some((key, trim(&line[p..e]).to_ascii_lowercase()))
+    }
+
+    /// Mode 1 (`ManticoreSchemaInspector::summarizeSettingsBlobBatch`):
+    /// `n, (key, value) x n` expected settings followed by `kind` `0` for a
+    /// non-string blob or `1, blob` -> `[blobs, invalid, lines, settings,
+    /// distinct_keys, max_settings_per_blob, compliant_blobs]`.
+    fn settings_blobs(parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        let (n, rest) = parts.split_first()?;
+        let n = length(n)?;
+        let pairs = n.checked_mul(2)?;
+        if pairs > rest.len() {
+            return None;
+        }
+        let expected: Vec<(Vec<u8>, Vec<u8>)> = rest[..pairs]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|[key, value]| (key.to_ascii_lowercase(), value.to_ascii_lowercase()))
+            .collect();
+        let mut rest = &rest[pairs..];
+        let (mut blobs, mut invalid, mut line_count, mut matched) = (0usize, 0, 0, 0);
+        let (mut widest, mut compliant) = (0usize, 0usize);
+        let mut keys: HashSet<Vec<u8>> = HashSet::new();
+        while let Some((kind, tail)) = rest.split_first() {
+            blobs += 1;
+            if !flag(kind)? {
+                invalid += 1;
+                rest = tail;
+                continue;
+            }
+            let (blob, tail) = tail.split_first()?;
+            rest = tail;
+            let mut settings: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+            for line in lines(blob) {
+                line_count += 1;
+                if let Some((key, value)) = setting(line) {
+                    matched += 1;
+                    settings.insert(key, value);
+                }
+            }
+            widest = widest.max(settings.len());
+            compliant += usize::from(
+                expected
+                    .iter()
+                    .all(|(key, value)| settings.get(key) == Some(value)),
+            );
+            keys.extend(settings.into_keys());
+        }
+        counts(&[
+            blobs,
+            invalid,
+            line_count,
+            matched,
+            keys.len(),
+            widest,
+            compliant,
+        ])
+    }
+
+    /// Mode 2 (`ReleaseBrowseService::summarizeBrowseOrderBatch`): `kind` `0`
+    /// for a non-string order or `1, order` -> `[orders, invalid,
+    /// categories_id, searchname, size, totalpart, grabs, comments, adddate,
+    /// postdate, asc, desc, explicit_direction, index_sortable,
+    /// distinct_orders]`, following `getBrowseOrderPhp()`.
+    fn browse_orders(parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        let (mut orders, mut invalid) = (0usize, 0usize);
+        let mut fields = [0usize; 8];
+        let (mut asc, mut desc, mut explicit) = (0usize, 0usize, 0usize);
+        let mut distinct: HashSet<(usize, &[u8])> = HashSet::new();
+        let mut rest = parts;
+        while let Some((kind, tail)) = rest.split_first() {
+            orders += 1;
+            if !flag(kind)? {
+                invalid += 1;
+                rest = tail;
+                continue;
+            }
+            let (order, tail) = tail.split_first()?;
+            rest = tail;
+            let order: &[u8] = if order.is_empty() {
+                b"posted_desc"
+            } else {
+                order
+            };
+            let mut segments = order.split(|byte| *byte == b'_');
+            let field = match segments.next().unwrap_or_default() {
+                b"cat" => 0,
+                b"name" => 1,
+                b"size" => 2,
+                b"files" => 3,
+                b"stats" => 4,
+                b"comments" => 5,
+                b"added" => 6,
+                _ => 7,
+            };
+            let direction: &[u8] = match segments.next() {
+                Some(raw) => {
+                    let core = raw.strip_suffix(b"\n").unwrap_or(raw);
+                    if core.eq_ignore_ascii_case(b"asc") || core.eq_ignore_ascii_case(b"desc") {
+                        explicit += 1;
+                        raw
+                    } else {
+                        b"desc"
+                    }
+                }
+                None => b"desc",
+            };
+            fields[field] += 1;
+            if direction[0].eq_ignore_ascii_case(&b'a') {
+                asc += 1;
+            } else {
+                desc += 1;
+            }
+            distinct.insert((field, direction));
+        }
+        let mut out = counts(&[orders, invalid])?;
+        out.extend(counts(&fields)?);
+        out.extend(counts(&[
+            asc,
+            desc,
+            explicit,
+            orders - invalid - fields[1],
+            distinct.len(),
+        ])?);
+        Some(out)
+    }
+
+    /// Mode 3 (`ReleaseDuplicateFinder::summarizeCandidateBatch`):
+    /// `search_name, predb_id, low_size, high_size` followed by `kind` `0` for
+    /// an unsupported candidate or `1, predb_id, searchname, size` ->
+    /// `[candidates, invalid, predb_id_match, searchname_match,
+    /// name_match_fallback, within_size_bounds, distinct_searchnames]`,
+    /// following `resolveReasonPhp()` and the `whereBetween('size', ...)`
+    /// bounds.
+    fn duplicate_candidates(parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        let [search_name, predb_id, low, high, rest @ ..] = parts else {
+            return None;
+        };
+        let (predb_id, low, high) = (integer(predb_id)?, integer(low)?, integer(high)?);
+        let (mut candidates, mut invalid, mut within) = (0usize, 0usize, 0usize);
+        let mut reasons = [0usize; 3];
+        let mut names: HashSet<&[u8]> = HashSet::new();
+        let mut rest = rest;
+        while let Some((kind, tail)) = rest.split_first() {
+            candidates += 1;
+            if !flag(kind)? {
+                invalid += 1;
+                rest = tail;
+                continue;
+            }
+            let [dup_predb, dup_name, size, tail @ ..] = tail else {
+                return None;
+            };
+            rest = tail;
+            let (dup_predb, size) = (integer(dup_predb)?, integer(size)?);
+            reasons[if predb_id > 0 && dup_predb == predb_id {
+                0
+            } else if !search_name.is_empty() && dup_name == search_name {
+                1
+            } else {
+                2
+            }] += 1;
+            within += usize::from(low <= size && size <= high);
+            names.insert(dup_name);
+        }
+        let mut out = counts(&[candidates, invalid])?;
+        out.extend(counts(&reasons)?);
+        out.extend(counts(&[within, names.len()])?);
+        Some(out)
+    }
+
+    /// `UsenetGroup::isValidGroupPhp()`: `/^([\w\-]+\.)+[\w\-]+$/i` (one
+    /// final `\n` allowed by `$`), then a case-insensitive `a.b.` prefix
+    /// expands to `alt.binaries.`. Returns the normalized name and whether the
+    /// prefix was expanded.
+    fn valid_group(name: &[u8]) -> Option<(Vec<u8>, bool)> {
+        let core = name.strip_suffix(b"\n").unwrap_or(name);
+        let mut segments = 0usize;
+        for segment in core.split(|byte| *byte == b'.') {
+            if segment.is_empty()
+                || !segment
+                    .iter()
+                    .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_' || *byte == b'-')
+            {
+                return None;
+            }
+            segments += 1;
+        }
+        if segments < 2 {
+            return None;
+        }
+        if name.len() >= 4 && name[..4].eq_ignore_ascii_case(b"a.b.") {
+            let mut out = b"alt.binaries.".to_vec();
+            out.extend_from_slice(&name[4..]);
+            Some((out, true))
+        } else {
+            Some((name.to_vec(), false))
+        }
+    }
+
+    /// Mode 4 (`ReleaseGroupResolver::summarizeCrosspostNameBatch`): `kind`
+    /// `0` for a non-string name or `1, name` -> `[names, invalid, duplicates,
+    /// valid, rejected, too_long, aliased, distinct_groups,
+    /// max_group_length]`, following the pure steps of `idsByName()`.
+    fn crosspost_names(parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        let (mut names, mut invalid, mut duplicates) = (0usize, 0usize, 0usize);
+        let (mut valid, mut rejected, mut too_long, mut aliased) = (0usize, 0, 0, 0);
+        let mut widest = 0usize;
+        let mut seen: HashSet<&[u8]> = HashSet::new();
+        let mut groups: HashSet<Vec<u8>> = HashSet::new();
+        let mut rest = parts;
+        while let Some((kind, tail)) = rest.split_first() {
+            names += 1;
+            if !flag(kind)? {
+                invalid += 1;
+                rest = tail;
+                continue;
+            }
+            let (name, tail) = tail.split_first()?;
+            rest = tail;
+            if !seen.insert(name) {
+                duplicates += 1;
+                continue;
+            }
+            let Some((group, expanded)) = valid_group(name) else {
+                rejected += 1;
+                continue;
+            };
+            if group.len() > MAX_GROUP_NAME {
+                too_long += 1;
+                continue;
+            }
+            valid += 1;
+            aliased += usize::from(expanded);
+            widest = widest.max(group.len());
+            groups.insert(group);
+        }
+        counts(&[
+            names,
+            invalid,
+            duplicates,
+            valid,
+            rejected,
+            too_long,
+            aliased,
+            groups.len(),
+            widest,
+        ])
+    }
+
+    /// Mode 5 (`ReleaseManagementService::summarizeExportDateBoundBatch`):
+    /// `end_of_day` followed by `kind` `0` for a non-string date or `1, date`
+    /// -> `[dates, invalid, empty, malformed, formatted, distinct_bounds,
+    /// earliest, latest]`, following `formatExportDateBoundPhp()`; the bounds
+    /// compare as bytes (`strcmp`) and are empty when nothing was formatted.
+    fn export_dates(parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        let (end_of_day, rest) = parts.split_first()?;
+        let suffix: &[u8] = if flag(end_of_day)? {
+            b"23:59:59"
+        } else {
+            b"00:00:00"
+        };
+        let (mut dates, mut invalid, mut empty, mut malformed) = (0usize, 0usize, 0usize, 0usize);
+        let mut bounds: HashSet<Vec<u8>> = HashSet::new();
+        let (mut earliest, mut latest): (Option<Vec<u8>>, Option<Vec<u8>>) = (None, None);
+        let mut formatted = 0usize;
+        let mut rest = rest;
+        while let Some((kind, tail)) = rest.split_first() {
+            dates += 1;
+            if !flag(kind)? {
+                invalid += 1;
+                rest = tail;
+                continue;
+            }
+            let (date, tail) = tail.split_first()?;
+            rest = tail;
+            if date.is_empty() {
+                empty += 1;
+                continue;
+            }
+            let pieces: Vec<&[u8]> = date.split(|byte| *byte == b'/').collect();
+            let [day, month, year] = pieces.as_slice() else {
+                malformed += 1;
+                continue;
+            };
+            let mut bound = Vec::with_capacity(date.len() + suffix.len());
+            bound.extend_from_slice(year);
+            bound.push(b'-');
+            bound.extend_from_slice(month);
+            bound.push(b'-');
+            bound.extend_from_slice(day);
+            bound.extend_from_slice(suffix);
+            formatted += 1;
+            if earliest.as_ref().is_none_or(|current| bound < *current) {
+                earliest = Some(bound.clone());
+            }
+            if latest.as_ref().is_none_or(|current| bound > *current) {
+                latest = Some(bound.clone());
+            }
+            bounds.insert(bound);
+        }
+        let mut out = counts(&[dates, invalid, empty, malformed, formatted, bounds.len()])?;
+        out.push(earliest.unwrap_or_default());
+        out.push(latest.unwrap_or_default());
+        Some(out)
+    }
+
+    fn transform(mode: u32, parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        match mode {
+            1 => settings_blobs(parts),
+            2 => browse_orders(parts),
+            3 => duplicate_candidates(parts),
+            4 => crosspost_names(parts),
+            5 => export_dates(parts),
+            _ => None,
+        }
+    }
+
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> Option<bool> {
+        if a_len == 0 || b_len == 0 {
+            return Some(false);
+        }
+        let a_end = a.checked_add(a_len)?;
+        let b_end = b.checked_add(b_len)?;
+        Some(a < b_end && b < a_end)
+    }
+
+    /// Dispatch count-prefixed, length-prefixed byte strings (little-endian
+    /// u32). Returns written bytes, `-needed` when `cap` is too small, or `-1`
+    /// for invalid input, mode, overlapping buffers or fields. Failure never
+    /// writes to the output buffer. Results are at least four bytes, so `-1`
+    /// never means "one byte needed".
+    ///
+    /// # Safety
+    /// Non-null pointers must refer to readable/writable allocations of the
+    /// declared lengths. Null pointers require zero length/capacity. Input and
+    /// output must not overlap.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w435_manticore_release_browse_duplicate_group_mgmt(
+        mode: u32,
+        input: *const u8,
+        input_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> i32 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if input_len > MAX_INPUT
+                || cap > isize::MAX as usize
+                || (input.is_null() && input_len != 0)
+                || (out.is_null() && cap != 0)
+            {
+                return DECLINE;
+            }
+            match overlaps(input as usize, input_len, out as usize, cap) {
+                Some(false) => {}
+                _ => return DECLINE,
+            }
+            let input = if input_len == 0 {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(input, input_len) }
+            };
+            let Some(parts) = unpack(input) else {
+                return DECLINE;
+            };
+            let Some(result) = transform(mode, &parts).and_then(|parts| pack(&parts)) else {
+                return DECLINE;
+            };
+            // `pack` bounds results by i32::MAX.
+            let needed = result.len() as i32;
+            if cap < result.len() || out.is_null() {
+                return -needed;
+            }
+            unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), out, result.len()) };
+            needed
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn packet(parts: &[&[u8]]) -> Vec<u8> {
+            pack(&parts.iter().map(|part| part.to_vec()).collect::<Vec<_>>()).unwrap()
+        }
+
+        fn raw(mode: u32, input: &[u8], out: &mut [u8]) -> i32 {
+            unsafe {
+                nntmux_w435_manticore_release_browse_duplicate_group_mgmt(
+                    mode,
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            }
+        }
+
+        fn call(mode: u32, parts: &[&[u8]]) -> Option<Vec<String>> {
+            let input = packet(parts);
+            let mut out = vec![0u8; input.len() * 4 + 4096];
+            let written = raw(mode, &input, &mut out);
+            if written < 0 {
+                return None;
+            }
+            out.truncate(written as usize);
+            Some(
+                unpack(&out)?
+                    .into_iter()
+                    .map(|part| String::from_utf8(part.to_vec()).unwrap())
+                    .collect(),
+            )
+        }
+
+        fn strings(items: &[&str]) -> Option<Vec<String>> {
+            Some(items.iter().map(|item| (*item).to_owned()).collect())
+        }
+
+        fn parsed(line: &str) -> Option<(String, String)> {
+            setting(line.as_bytes()).map(|(key, value)| {
+                (
+                    String::from_utf8(key).unwrap(),
+                    String::from_utf8(value).unwrap(),
+                )
+            })
+        }
+
+        #[test]
+        fn w435_setting_lines_follow_pcre_backtracking() {
+            let pair = |key: &str, value: &str| Some((key.to_owned(), value.to_owned()));
+            assert_eq!(parsed("min_infix_len = 2"), pair("min_infix_len", "2"));
+            assert_eq!(parsed("  Exact_Words='1' "), pair("exact_words", "1"));
+            assert_eq!(parsed("a = \"x y\"  "), pair("a", "x y"));
+            assert_eq!(parsed("a=b\"c"), None);
+            assert_eq!(parsed("a=\"\""), None);
+            assert_eq!(parsed("a=  \"\""), None);
+            assert_eq!(parsed("a = \"x\" \""), None);
+            assert_eq!(parsed("a= x \"  "), pair("a", "x"));
+            assert_eq!(parsed("a=\" "), pair("a", ""));
+            assert_eq!(parsed("a =  \""), pair("a", ""));
+            assert_eq!(parsed("a=  "), pair("a", ""));
+            assert_eq!(parsed("a="), None);
+            assert_eq!(parsed("a=\0X\0"), pair("a", "x"));
+            assert_eq!(parsed("a b=1"), None);
+            assert_eq!(parsed("=1"), None);
+            assert_eq!(parsed("k-1=2"), None);
+            assert_eq!(
+                lines(b"a\x85b\x0cc\x0bd\r\ne\rf\ng"),
+                vec![
+                    &b"a"[..],
+                    &b"b"[..],
+                    &b"c"[..],
+                    &b"d"[..],
+                    &b"e"[..],
+                    &b"f"[..],
+                    &b"g"[..]
+                ]
+            );
+            assert_eq!(lines(b""), vec![&b""[..]]);
+        }
+
+        #[test]
+        fn w435_settings_blob_batch() {
+            assert_eq!(
+                call(
+                    1,
+                    &[
+                        b"2",
+                        b"MIN_INFIX_LEN",
+                        b"2",
+                        b"index_field_lengths",
+                        b"1",
+                        b"1",
+                        b"min_infix_len = 2\nindex_field_lengths = 1\r\nmorphology = 'stem_en'",
+                        b"1",
+                        b"min_infix_len = 3\nmin_infix_len = 2",
+                        b"0",
+                        b"1",
+                        b"",
+                    ]
+                ),
+                strings(&["4", "1", "6", "5", "3", "3", "1"])
+            );
+            assert_eq!(
+                call(1, &[b"0"]),
+                strings(&["0", "0", "0", "0", "0", "0", "0"])
+            );
+            assert_eq!(call(1, &[b"1", b"k"]), None);
+            assert_eq!(call(1, &[b"0", b"2"]), None);
+            assert_eq!(call(1, &[b"0", b"1"]), None);
+        }
+
+        #[test]
+        fn w435_browse_order_batch() {
+            assert_eq!(
+                call(
+                    2,
+                    &[
+                        b"1",
+                        b"",
+                        b"1",
+                        b"name_ASC",
+                        b"1",
+                        b"cat_up",
+                        b"1",
+                        b"size",
+                        b"0",
+                        b"1",
+                        b"files_desc\n",
+                        b"1",
+                        b"posted_asc_x",
+                        b"1",
+                        b"name_ASC",
+                    ]
+                ),
+                strings(&[
+                    "8", "1", "1", "2", "1", "1", "0", "0", "0", "2", "3", "4", "5", "5", "6"
+                ])
+            );
+            assert_eq!(call(2, &[b"2", b"x"]), None);
+            assert_eq!(call(2, &[b"1"]), None);
+        }
+
+        #[test]
+        fn w435_duplicate_candidate_batch() {
+            assert_eq!(
+                call(
+                    3,
+                    &[
+                        b"Show.S01",
+                        b"7",
+                        b"95",
+                        b"105",
+                        b"1",
+                        b"7",
+                        b"Other",
+                        b"100",
+                        b"1",
+                        b"0",
+                        b"Show.S01",
+                        b"94",
+                        b"1",
+                        b"3",
+                        b"x",
+                        b"105",
+                        b"0",
+                        b"1",
+                        b"7",
+                        b"Show.S01",
+                        b"-1",
+                    ]
+                ),
+                strings(&["5", "1", "2", "1", "1", "2", "3"])
+            );
+            assert_eq!(
+                call(3, &[b"", b"0", b"0", b"0", b"1", b"0", b"", b"0"]),
+                strings(&["1", "0", "0", "0", "1", "1", "1"])
+            );
+            assert_eq!(call(3, &[b"", b"+1", b"0", b"0"]), None);
+            assert_eq!(call(3, &[b"", b"1", b"0", b"0", b"1", b"1"]), None);
+        }
+
+        #[test]
+        fn w435_crosspost_name_batch() {
+            let long = format!("a.b.{}", "x".repeat(244));
+            assert_eq!(
+                call(
+                    4,
+                    &[
+                        b"1",
+                        b"a.b.teevee",
+                        b"1",
+                        b"A.B.teevee",
+                        b"1",
+                        b"a.b.teevee",
+                        b"1",
+                        b"alt.binaries.teevee",
+                        b"1",
+                        b"nodot",
+                        b"0",
+                        b"1",
+                        b"bad..dots",
+                        b"1",
+                        b"x.y\n",
+                        b"1",
+                        long.as_bytes(),
+                    ]
+                ),
+                strings(&["9", "1", "1", "4", "2", "1", "2", "2", "19"])
+            );
+            assert_eq!(valid_group(b"x.y\n\n"), None);
+            assert_eq!(valid_group(b".x.y"), None);
+            assert_eq!(valid_group(b"x-1._y").map(|v| v.1), Some(false));
+            assert_eq!(call(4, &[b"1"]), None);
+        }
+
+        #[test]
+        fn w435_export_date_batch() {
+            assert_eq!(
+                call(
+                    5,
+                    &[
+                        b"0",
+                        b"1",
+                        b"01/02/2024",
+                        b"1",
+                        b"",
+                        b"1",
+                        b"1/2",
+                        b"0",
+                        b"1",
+                        b"31/12/2023",
+                        b"1",
+                        b"01/02/2024",
+                        b"1",
+                        b"a/b/c/d",
+                    ]
+                ),
+                strings(&[
+                    "7",
+                    "1",
+                    "1",
+                    "2",
+                    "3",
+                    "2",
+                    "2023-12-3100:00:00",
+                    "2024-02-0100:00:00"
+                ])
+            );
+            assert_eq!(
+                call(5, &[b"1", b"1", b"//"]),
+                strings(&["1", "0", "0", "0", "1", "1", "--23:59:59", "--23:59:59"])
+            );
+            assert_eq!(
+                call(5, &[b"1"]),
+                strings(&["0", "0", "0", "0", "0", "0", "", ""])
+            );
+            assert_eq!(call(5, &[]), None);
+            assert_eq!(call(5, &[b"2"]), None);
+        }
+
+        #[test]
+        fn w435_malformed_null_overlap_and_capacity() {
+            let input = packet(&[b"1", b"1", b"01/02/2024"]);
+            let mut big = vec![0u8; 256];
+            let written = raw(5, &input, &mut big);
+            assert!(written > 16);
+            let mut out = [0x5au8; 16];
+            assert_eq!(raw(5, &input, &mut out), -written);
+            assert_eq!(out, [0x5a; 16]);
+            unsafe {
+                assert_eq!(
+                    nntmux_w435_manticore_release_browse_duplicate_group_mgmt(
+                        5,
+                        input.as_ptr(),
+                        input.len(),
+                        std::ptr::null_mut(),
+                        0
+                    ),
+                    -written
+                );
+                assert_eq!(
+                    nntmux_w435_manticore_release_browse_duplicate_group_mgmt(
+                        5,
+                        std::ptr::null(),
+                        4,
+                        big.as_mut_ptr(),
+                        big.len()
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w435_manticore_release_browse_duplicate_group_mgmt(
+                        5,
+                        input.as_ptr(),
+                        input.len(),
+                        std::ptr::null_mut(),
+                        8
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w435_manticore_release_browse_duplicate_group_mgmt(
+                        5,
+                        input.as_ptr(),
+                        MAX_INPUT + 1,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w435_manticore_release_browse_duplicate_group_mgmt(
+                        5,
+                        input.as_ptr(),
+                        input.len(),
+                        out.as_mut_ptr(),
+                        isize::MAX as usize + 1
+                    ),
+                    DECLINE
+                );
+                let mut shared = input.clone();
+                shared.resize(256, 0);
+                let shared_ptr = shared.as_mut_ptr();
+                assert_eq!(
+                    nntmux_w435_manticore_release_browse_duplicate_group_mgmt(
+                        5,
+                        shared_ptr,
+                        input.len(),
+                        shared_ptr,
+                        256
+                    ),
+                    DECLINE
+                );
+                assert_eq!(&shared[..input.len()], &input[..]);
+            }
+            for mode in [0, 6, 99] {
+                assert_eq!(raw(mode, &input, &mut out), DECLINE);
+            }
+            assert_eq!(raw(5, &[], &mut out), DECLINE);
+            assert_eq!(raw(5, &[1, 0, 0], &mut out), DECLINE);
+            assert_eq!(raw(5, &[1, 0, 0, 0, 9, 0, 0, 0], &mut out), DECLINE);
+            assert_eq!(
+                raw(5, &[input.clone(), vec![0]].concat(), &mut out),
+                DECLINE
+            );
+            assert_eq!(raw(5, &[0xff, 0xff, 0xff, 0xff], &mut out), DECLINE);
+            assert_eq!(out, [0x5a; 16]);
+            assert_eq!(overlaps(usize::MAX - 1, 4, 0, 1), None);
+            assert_eq!(overlaps(0, 0, 0, 4), Some(false));
+        }
+    }
+}
