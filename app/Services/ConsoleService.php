@@ -33,6 +33,157 @@ use Throwable;
  */
 class ConsoleService
 {
+    /** Qualified by paired common/uncommon mean and p99 benchmarks (including p99 rank bounds). */
+    public const bool W404_RUST_FFI_DEFAULT = true;
+
+    public const string W404_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w404_console_platform_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private static ?bool $w404UseRustFfi = null;
+
+    private static FFI|false|null $w404Ffi = null;
+
+    public static function useW404RustFfi(?bool $use = true): void
+    {
+        self::$w404UseRustFfi = $use;
+        if ($use === null) {
+            self::$w404Ffi = null;
+        }
+    }
+
+    public static function usesW404RustFfi(): bool
+    {
+        return self::$w404UseRustFfi ?? self::W404_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW404RustFfi(): void
+    {
+        self::$w404UseRustFfi = null;
+        self::$w404Ffi = null;
+    }
+
+    /** @param list<list<string>> $rows
+     * @return array<string, int>|null
+     */
+    private static function w404Call(array $rows): ?array
+    {
+        try {
+            $input = serialize([$rows]);
+            if (strlen($input) > 16777216) {
+                return null;
+            }
+            self::$w404Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w404', self::W404_FFI_CDEF) ?? false;
+            $ffi = self::$w404Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            $capacity = 0;
+            $out = RustPipelineLibrary::obtainScratch($ffi, 2048, $capacity);
+            if ($out === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound (Declared by W404_FFI_CDEF.)
+            $written = $ffi->nntmux_w404_console_platform_batch($input, strlen($input), $out, $capacity);
+            if (is_int($written) && $written < -1 && $written >= -16777216) {
+                $out = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($out === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound (Declared by W404_FFI_CDEF.)
+                $written = $ffi->nntmux_w404_console_platform_batch($input, strlen($input), $out, $capacity);
+            }
+            if (! is_int($written) || $written <= 0 || $written > $capacity || $written > 16777216) {
+                return null;
+            }
+            $result = @unserialize(FFI::string($out, $written), ['allowed_classes' => false]);
+            $keys = ['total_titles', 'nintendo_count', 'playstation_count', 'xbox_count', 'handheld_count', 'retro_count', 'region_tagged_count', 'unknown_platform_count'];
+            if (! is_array($result) || array_keys($result) !== $keys) {
+                return null;
+            }
+            $summary = [];
+            foreach ($keys as $key) {
+                $value = $result[$key];
+                if (! is_int($value) || $value < 0 || $value > count($rows)) {
+                    return null;
+                }
+                $summary[$key] = $value;
+            }
+
+            return $summary;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** Only integer and string fields participate; objects are never cast or serialized. */
+    private static function w404Text(mixed $value): string
+    {
+        return is_string($value) || is_int($value) ? trim((string) $value) : '';
+    }
+
+    /** @param array<array-key, mixed> $input
+     * @return list<list<string>>
+     */
+    private static function w404Rows(array $input): array
+    {
+        $rows = [];
+        foreach ($input as $row) {
+            $rows[] = [self::w404Text($row)];
+        }
+
+        return $rows;
+    }
+
+    /**
+     * Summarize a list of titles using ASCII alphanumeric platform/region
+     * tokens. Families overlap: NDS counts as Nintendo and Handheld, for example.
+     * Unknown means no family matched; malformed values count as empty titles.
+     *
+     * @param  array<array-key, mixed>  $titles
+     * @return array<string, int>
+     */
+    public static function summarizeConsolePlatformBatch(array $titles): array
+    {
+        if (self::usesW404RustFfi()) {
+            $native = self::w404Call(self::w404Rows($titles));
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
+        return self::summarizeConsolePlatformBatchPhp($titles);
+    }
+
+    /** @param array<array-key, mixed> $titles
+     * @return array<string, int>
+     */
+    public static function summarizeConsolePlatformBatchPhp(array $titles): array
+    {
+        $summary = array_fill_keys(['total_titles', 'nintendo_count', 'playstation_count', 'xbox_count', 'handheld_count', 'retro_count', 'region_tagged_count', 'unknown_platform_count'], 0);
+        $summary['total_titles'] = count($titles);
+        $families = [
+            'nintendo_count' => ['NINTENDO', 'SWITCH', 'WII', 'WIIU', 'GAMECUBE', 'NGC', 'N64', 'NES', 'SNES', 'NDS', 'DS', '3DS', 'GBA', 'GBC', 'GAMEBOY'],
+            'playstation_count' => ['PLAYSTATION', 'PSX', 'PS1', 'PS2', 'PS3', 'PS4', 'PS5', 'PSP', 'PSV', 'PSVITA', 'VITA'],
+            'xbox_count' => ['XBOX', 'X360', 'XONE', 'XSX', 'XSS'],
+            'handheld_count' => ['NDS', 'DS', '3DS', 'GBA', 'GBC', 'GAMEBOY', 'PSP', 'PSV', 'PSVITA', 'VITA'],
+            'retro_count' => ['NES', 'SNES', 'N64', 'GAMEBOY', 'GBA', 'GBC', 'PSX', 'PS1', 'DREAMCAST', 'GENESIS', 'MEGADRIVE', 'SATURN'],
+        ];
+        foreach (self::w404Rows($titles) as [$title]) {
+            $tokens = preg_split('/[^A-Z0-9]+/', strtoupper($title), -1, PREG_SPLIT_NO_EMPTY) ?: [];
+            $known = false;
+            foreach ($families as $key => $platforms) {
+                $matched = array_intersect($platforms, $tokens) !== [];
+                $summary[$key] += (int) $matched;
+                $known = $known || $matched;
+            }
+            $summary['region_tagged_count'] += (int) (array_intersect(['USA', 'EUR', 'EUROPE', 'JAP', 'JPN', 'JAPAN', 'PAL', 'NTSC', 'REGIONFREE'], $tokens) !== []);
+            $summary['unknown_platform_count'] += (int) ! $known;
+        }
+
+        return $summary;
+    }
+
     public const int CONS_UPROC = 0; // Release has not been processed.
 
     public const int CONS_NTFND = -2;

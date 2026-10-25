@@ -36,6 +36,156 @@ use Throwable;
  */
 class GamesService
 {
+    /** Qualified by paired common/uncommon mean and p99 benchmarks (including p99 rank bounds). */
+    public const bool W404_RUST_FFI_DEFAULT = true;
+
+    public const string W404_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w404_pc_game_lookup_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private static ?bool $w404UseRustFfi = null;
+
+    private static FFI|false|null $w404Ffi = null;
+
+    public static function useW404RustFfi(?bool $use = true): void
+    {
+        self::$w404UseRustFfi = $use;
+        if ($use === null) {
+            self::$w404Ffi = null;
+        }
+    }
+
+    public static function usesW404RustFfi(): bool
+    {
+        return self::$w404UseRustFfi ?? self::W404_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW404RustFfi(): void
+    {
+        self::$w404UseRustFfi = null;
+        self::$w404Ffi = null;
+    }
+
+    /** @param list<list<string>> $rows
+     * @return array<string, int>|null
+     */
+    private static function w404Call(array $rows): ?array
+    {
+        try {
+            $input = serialize([$rows]);
+            if (strlen($input) > 16777216) {
+                return null;
+            }
+            self::$w404Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w404', self::W404_FFI_CDEF) ?? false;
+            $ffi = self::$w404Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            $capacity = 0;
+            $out = RustPipelineLibrary::obtainScratch($ffi, 2048, $capacity);
+            if ($out === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound (Declared by W404_FFI_CDEF.)
+            $written = $ffi->nntmux_w404_pc_game_lookup_batch($input, strlen($input), $out, $capacity);
+            if (is_int($written) && $written < -1 && $written >= -16777216) {
+                $out = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($out === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound (Declared by W404_FFI_CDEF.)
+                $written = $ffi->nntmux_w404_pc_game_lookup_batch($input, strlen($input), $out, $capacity);
+            }
+            if (! is_int($written) || $written <= 0 || $written > $capacity || $written > 16777216) {
+                return null;
+            }
+            $result = @unserialize(FFI::string($out, $written), ['allowed_classes' => false]);
+            $keys = ['total_entries', 'scene_group_tagged_count', 'update_patch_dlc_count', 'repack_gog_steam_count', 'eligible_lookup_count'];
+            if (! is_array($result) || array_keys($result) !== $keys) {
+                return null;
+            }
+            $summary = [];
+            foreach ($keys as $key) {
+                $value = $result[$key];
+                if (! is_int($value) || $value < 0 || $value > count($rows)) {
+                    return null;
+                }
+                $summary[$key] = $value;
+            }
+
+            return $summary;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** Only integer and string fields participate; objects are never cast or serialized. */
+    private static function w404Text(mixed $value): string
+    {
+        return is_string($value) || is_int($value) ? trim((string) $value) : '';
+    }
+
+    /** @param array<array-key, mixed> $input
+     * @return list<list<string>>
+     */
+    private static function w404Rows(array $input): array
+    {
+        $rows = [];
+        foreach ($input as $row) {
+            $row = is_array($row) ? $row : [];
+            $rows[] = [self::w404Text($row['searchname'] ?? $row['title'] ?? null)];
+        }
+
+        return $rows;
+    }
+
+    /**
+     * Summarize searchname (or title) fields. Scene groups require a -GROUP
+     * suffix; UPDATE/PATCH/DLC and REPACK/GOG/STEAM use whole ASCII tokens.
+     * Eligible means a nonempty title without UPDATE, PATCH or DLC tokens.
+     *
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizePcGameLookupBatch(array $entries): array
+    {
+        if (self::usesW404RustFfi()) {
+            $native = self::w404Call(self::w404Rows($entries));
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
+        return self::summarizePcGameLookupBatchPhp($entries);
+    }
+
+    /** @param array<array-key, mixed> $entries
+     * @return array<string, int>
+     */
+    public static function summarizePcGameLookupBatchPhp(array $entries): array
+    {
+        $summary = array_fill_keys(['total_entries', 'scene_group_tagged_count', 'update_patch_dlc_count', 'repack_gog_steam_count', 'eligible_lookup_count'], 0);
+        $summary['total_entries'] = count($entries);
+        foreach (self::w404Rows($entries) as [$title]) {
+            $upper = strtoupper($title);
+            $tokens = preg_split('/[^A-Z0-9]+/', $upper, -1, PREG_SPLIT_NO_EMPTY) ?: [];
+            $scene = false;
+            foreach (self::SCENE_GROUPS as $group) {
+                if (str_ends_with($upper, '-'.strtoupper($group))) {
+                    $scene = true;
+                    break;
+                }
+            }
+            $update = array_intersect(['UPDATE', 'PATCH', 'DLC'], $tokens) !== [];
+            $summary['scene_group_tagged_count'] += (int) $scene;
+            $summary['update_patch_dlc_count'] += (int) $update;
+            $summary['repack_gog_steam_count'] += (int) (array_intersect(['REPACK', 'GOG', 'STEAM'], $tokens) !== []);
+            $summary['eligible_lookup_count'] += (int) ($title !== '' && ! $update);
+        }
+
+        return $summary;
+    }
+
     public const string FFI_CDEF = <<<'C'
         ssize_t nntmux_games_service_clean_game_reg(const char *ptr, size_t len, char *out, size_t cap);
         ssize_t nntmux_games_service_parse_title(const char *ptr, size_t len, char *out, size_t cap);
