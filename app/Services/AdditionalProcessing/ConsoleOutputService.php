@@ -6,6 +6,7 @@ namespace App\Services\AdditionalProcessing;
 
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 /**
@@ -442,5 +443,199 @@ class ConsoleOutputService
             'truncated' => $slots[5] === 1,
             'invalid' => $slots[6],
         ];
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 52.4 batch helper
+    // ---------------------------------------------------------------------
+
+    /** Enabled: minimum of three paired runs cleared every 1.5x gate (common mean 2.62x, p99 1.79x; uncommon mean 2.02x, p99 1.74x); see RustWorkPlannerArchiveConfigConsoleMediaExtractW52ParityTest. */
+    private const bool W52_RUST_FFI_DEFAULT = true;
+
+    public const string W52_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w524_console_line_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** consoleLineBatch() flags. */
+    public const int W52_LINE_BLANK = 1;
+
+    public const int W52_LINE_ANSI = 2;
+
+    public const int W52_LINE_CARRIAGE_RETURN = 4;
+
+    public const int W52_LINE_NEWLINE_END = 8;
+
+    public const int W52_LINE_ERROR = 16;
+
+    public const int W52_LINE_WARNING = 32;
+
+    private const string W52_CSI_PATTERN = '/\x1b\[[0-9;?]*[ -\/]*[@-~]/';
+
+    /**
+     * Measure console output lines, three ints each: [flags, bytes left after stripping ANSI
+     * CSI sequences, newline count]. Flags: 1 blank after trim(), 2 holds a CSI sequence, 4
+     * carriage return (progress redraw), 8 ends with a newline, 16 'error' and 32 'warn'
+     * (ASCII case-insensitive).
+     *
+     * @param  list<string>  $lines
+     * @return list<int>
+     */
+    public static function consoleLineBatch(array $lines): array
+    {
+        return self::usesW52RustFfi()
+            ? self::consoleLineBatchNative($lines)
+            : self::consoleLineBatchPhp($lines);
+    }
+
+    /**
+     * @param  list<string>  $lines
+     * @return list<int>
+     */
+    public static function consoleLineBatchNative(array $lines): array
+    {
+        self::w52AssertList($lines);
+        if ($lines === []) {
+            return [];
+        }
+
+        [$text, $twin] = self::w52Text($lines);
+
+        return self::w52Call($text, $twin, \count($lines))
+            ?? self::consoleLineBatchPhp($lines);
+    }
+
+    /**
+     * @param  list<string>  $lines
+     * @return list<int>
+     */
+    public static function consoleLineBatchPhp(array $lines): array
+    {
+        self::w52AssertList($lines);
+        $out = [];
+        foreach ($lines as $line) {
+            $visible = (string) preg_replace(self::W52_CSI_PATTERN, '', $line, -1, $escapes);
+            $out[] = (trim($line) === '' ? self::W52_LINE_BLANK : 0)
+                | ($escapes > 0 ? self::W52_LINE_ANSI : 0)
+                | (str_contains($line, "\r") ? self::W52_LINE_CARRIAGE_RETURN : 0)
+                | (str_ends_with($line, "\n") ? self::W52_LINE_NEWLINE_END : 0)
+                | (stripos($line, 'error') !== false ? self::W52_LINE_ERROR : 0)
+                | (stripos($line, 'warn') !== false ? self::W52_LINE_WARNING : 0);
+            $out[] = \strlen($visible);
+            $out[] = substr_count($line, "\n");
+        }
+
+        return $out;
+    }
+
+    public static function usesW52RustFfi(): bool
+    {
+        $enabled = self::w52RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W52_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W52 batch dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW52RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w52RustFfiState('enabled');
+        self::w52RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w52RustFfiState('enabled', $previous);
+        }
+    }
+
+    /**
+     * One FFI crossing for the batch: encoded text and packed int64 columns in, 3 int64
+     * words back per record. Null when the library is missing or declines.
+     *
+     * @return list<int>|null
+     */
+    private static function w52Call(string $text, string $ints, int $count): ?array
+    {
+        try {
+            $state = self::w52RustFfiState();
+            $ffi = $state['ffi'] ?? null;
+            if ($ffi === null) {
+                $ffi = RustPipelineLibrary::resolveDomain('metadata_w52', self::W52_FFI_CDEF) ?? false;
+                self::w52RustFfiState('ffi', $ffi);
+            }
+            if (! $ffi instanceof FFI) {
+                return null;
+            }
+            $need = $count * 3;
+            $out = $state['out'] ?? null;
+            $cap = $state['cap'] ?? 0;
+            if (! $out instanceof CData || ! \is_int($cap) || $cap < $need) {
+                $cap = max(1024, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w52RustFfiState('out', $out);
+                self::w52RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W52_FFI_CDEF.)
+            $written = $ffi->nntmux_w524_console_line_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, $cap);
+            if ($written !== $need) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $need * 8));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Text column encoding: NUL-joined values and, when a value holds a NUL byte, the same
+     * values joined with 0x01 so Rust finds the separators where the two buffers differ.
+     *
+     * @param  list<string>  $values
+     * @return array{0: string, 1: string}
+     */
+    private static function w52Text(array $values): array
+    {
+        $joined = implode("\0", $values);
+
+        return [$joined, substr_count($joined, "\0") === \count($values) - 1 ? '' : implode("\x01", $values)];
+    }
+
+    /** @param array<array-key, mixed> $values */
+    private static function w52AssertList(array $values): void
+    {
+        if (! array_is_list($values)) {
+            throw new \InvalidArgumentException('W52 batch input must be a list.');
+        }
+    }
+
+    /**
+     * W52 routing override and cached binding. Readonly classes cannot declare static
+     * properties, so they live in a function static: no arguments returns the state, one
+     * argument reads a key ('reset' clears everything) and two arguments write a key.
+     */
+    private static function w52RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+        }
+
+        return $state[$op] ?? null;
     }
 }
