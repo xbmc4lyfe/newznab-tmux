@@ -24115,3 +24115,1088 @@ pub mod category_group_parhash_models {
         }
     }
 }
+/// Wave 34.3: pure normalization helpers for the `GdprAuditLog`, `GdprConsent`,
+/// `PasswordSecurity`, `RoleExpirationEmail` and `RegistrationConfiguration` Eloquent models.
+///
+/// Multi-field string inputs arrive as one buffer of `0x1F`-separated fields. Outputs are
+/// `0x1F`-separated with `0x1E` alone for PHP `null`. Inputs that embed either marker byte, carry
+/// unknown flag bits or (where PHP uses `mb_*`) are not UTF-8 decline with `-1` so PHP keeps its own
+/// implementation. A result that does not fit returns `-required` without touching `out_buf`.
+pub mod gdpr_security_registration_models {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+    use std::str;
+
+    pub const DECLINE: isize = -1;
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+    const FIELD_SEP: u8 = 0x1F;
+    const NULL_MARK: u8 = 0x1E;
+    const TRIM_SET: &[u8] = b" \t\n\r\0\x0B\x0C";
+    const SLUG_MAX: usize = 64;
+    const POLICY_MAX: usize = 64;
+    const IP_MAX: usize = 45;
+    const SECRET_MIN: usize = 16;
+    const SECRET_MAX: usize = 128;
+    const MAX_TIMESTAMP: i64 = 253_402_300_799;
+    const DAY: i64 = 86_400;
+    const WEEK: i64 = 7 * DAY;
+    const MONTH: i64 = 30 * DAY;
+
+    const AUDIT_HAS_REQUEST: u32 = 1;
+    const AUDIT_HAS_USER: u32 = 2;
+    const AUDIT_HAS_ACTOR: u32 = 4;
+    const CONSENT_HAS_POLICY: u32 = 1;
+    const CONSENT_HAS_IP: u32 = 2;
+    const CONSENT_HAS_CONSENTED: u32 = 4;
+    const CONSENT_HAS_WITHDRAWN: u32 = 8;
+    const EXPIRY_DAY_SENT: u32 = 1;
+    const EXPIRY_WEEK_SENT: u32 = 2;
+    const EXPIRY_MONTH_SENT: u32 = 4;
+
+    pub const STATUS_GRANTED: &str = "granted";
+    pub const STATUS_WITHDRAWN: &str = "withdrawn";
+
+    /// `RegistrationStatus::Open`, `Invite` and `Closed`.
+    pub const REGISTRATION_OPEN: i64 = 0;
+    pub const REGISTRATION_INVITE: i64 = 1;
+    pub const REGISTRATION_CLOSED: i64 = 2;
+
+    unsafe fn valid_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null()
+            || len > MAX_INPUT
+            || len > isize::MAX as usize
+            || (ptr as usize).checked_add(len).is_none()
+        {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn valid_out_buf(out_buf: *mut u8, out_cap: usize) -> bool {
+        !out_buf.is_null()
+            && out_cap <= isize::MAX as usize
+            && (out_buf as usize).checked_add(out_cap).is_some()
+    }
+
+    /// Copies `bytes` into `out_buf`, returning the length or `-required` when it does not fit.
+    unsafe fn write_bytes(bytes: &[u8], out_buf: *mut u8, out_cap: usize) -> isize {
+        if bytes.len() > isize::MAX as usize {
+            return DECLINE;
+        }
+        if bytes.len() > out_cap {
+            return -(bytes.len() as isize);
+        }
+        if !bytes.is_empty() {
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len()) };
+        }
+        bytes.len() as isize
+    }
+
+    fn finish(encoded: Option<Vec<u8>>, out_buf: *mut u8, out_cap: usize) -> isize {
+        match encoded {
+            // A one-byte result is impossible for these multi-field encodings, so `-1` (DECLINE)
+            // never doubles as a "needs one byte" answer.
+            Some(bytes) => unsafe { write_bytes(&bytes, out_buf, out_cap) },
+            None => DECLINE,
+        }
+    }
+
+    /// Splits `input` into exactly `N` fields, declining on a wrong count or any null marker.
+    fn split_fields<const N: usize>(input: &[u8]) -> Option<[&[u8]; N]> {
+        if input.contains(&NULL_MARK) {
+            return None;
+        }
+        let mut out: [&[u8]; N] = [&[]; N];
+        let mut parts = input.split(|&b| b == FIELD_SEP);
+        for slot in &mut out {
+            *slot = parts.next()?;
+        }
+        parts.next().is_none().then_some(out)
+    }
+
+    /// Joins fields with the separator; `None` encodes PHP `null`.
+    fn encode(fields: &[Option<&[u8]>]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(fields.iter().map(|f| f.map_or(1, <[u8]>::len) + 1).sum());
+        for (i, field) in fields.iter().enumerate() {
+            if i > 0 {
+                out.push(FIELD_SEP);
+            }
+            out.extend_from_slice(field.unwrap_or(&[NULL_MARK]));
+        }
+        out
+    }
+
+    #[inline]
+    fn bool_bytes(value: bool) -> &'static [u8] {
+        if value { b"1" } else { b"0" }
+    }
+
+    /// PHP `trim($value, " \t\n\r\0\x0B\x0C")` on bytes.
+    fn trim_ws(value: &[u8]) -> &[u8] {
+        let start = value
+            .iter()
+            .position(|b| !TRIM_SET.contains(b))
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|b| !TRIM_SET.contains(b))
+            .map_or(start, |i| i + 1);
+        &value[start..end]
+    }
+
+    fn trim_byte(value: &[u8], byte: u8) -> &[u8] {
+        let start = value.iter().position(|&b| b != byte).unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|&b| b != byte)
+            .map_or(start, |i| i + 1);
+        &value[start..end]
+    }
+
+    /// PHP `rtrim(substr(trim(preg_replace('/[^<allowed>]+/', '_', strtolower(trim($v))), '_'), 0, 64), '_')`.
+    fn slug(value: &[u8], allow_dot: bool) -> Vec<u8> {
+        let mut replaced = Vec::with_capacity(value.len());
+        let mut in_run = false;
+        for &b in trim_ws(value) {
+            let b = b.to_ascii_lowercase();
+            if b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || (allow_dot && b == b'.')
+            {
+                replaced.push(b);
+                in_run = false;
+            } else if !in_run {
+                replaced.push(b'_');
+                in_run = true;
+            }
+        }
+        let trimmed = trim_byte(&replaced, b'_');
+        let cut = &trimmed[..trimmed.len().min(SLUG_MAX)];
+        let end = cut.iter().rposition(|&b| b != b'_').map_or(0, |i| i + 1);
+        cut[..end].to_vec()
+    }
+
+    /// PHP `mb_substr($value, 0, $max, 'UTF-8')` for valid UTF-8.
+    fn char_prefix(value: &str, max: usize) -> &str {
+        match value.char_indices().nth(max) {
+            Some((index, _)) => &value[..index],
+            None => value,
+        }
+    }
+
+    fn id_bytes(id: Option<i64>) -> Option<String> {
+        id.map(|v| v.to_string())
+    }
+
+    /// `GdprAuditLog::normalizeAuditRecordPhp()`:
+    /// `(gdpr_request_id, user_id, actor_id, event, description, is_self_service, is_valid)`.
+    pub struct AuditRecord<'a> {
+        pub request_id: Option<i64>,
+        pub user_id: Option<i64>,
+        pub actor_id: Option<i64>,
+        pub event: Vec<u8>,
+        pub description: &'a [u8],
+        pub is_self_service: bool,
+        pub is_valid: bool,
+    }
+
+    pub fn audit_record<'a>(
+        event: &[u8],
+        description: &'a [u8],
+        request_id: Option<i64>,
+        user_id: Option<i64>,
+        actor_id: Option<i64>,
+    ) -> AuditRecord<'a> {
+        let request_id = request_id.filter(|&v| v > 0);
+        let user_id = user_id.filter(|&v| v > 0);
+        let actor_id = actor_id.filter(|&v| v > 0);
+        let event = slug(event, true);
+        let description = trim_ws(description);
+        AuditRecord {
+            request_id,
+            user_id,
+            actor_id,
+            is_self_service: user_id.is_some() && user_id == actor_id,
+            is_valid: !event.is_empty() && !description.is_empty(),
+            event,
+            description,
+        }
+    }
+
+    /// `GdprConsent::normalizeConsentStatePhp()`:
+    /// `(consent_type, status, policy_version, ip_address, is_active, is_valid)`.
+    pub struct ConsentState {
+        pub consent_type: Vec<u8>,
+        pub status: &'static str,
+        pub policy_version: Option<String>,
+        pub ip_address: Option<Vec<u8>>,
+        pub is_active: bool,
+        pub is_valid: bool,
+    }
+
+    pub fn consent_state(
+        consent_type: &[u8],
+        status: &[u8],
+        policy_version: Option<&str>,
+        ip_address: Option<&[u8]>,
+        consented_at: Option<i64>,
+        withdrawn_at: Option<i64>,
+        now: i64,
+    ) -> ConsentState {
+        let consent_type = slug(consent_type, false);
+        let status = match trim_ws(status).to_ascii_lowercase().as_slice() {
+            b"granted" => STATUS_GRANTED,
+            b"withdrawn" => STATUS_WITHDRAWN,
+            _ => match (withdrawn_at, consented_at) {
+                (Some(w), Some(c)) if w >= c => STATUS_WITHDRAWN,
+                (Some(_), None) => STATUS_WITHDRAWN,
+                _ => STATUS_GRANTED,
+            },
+        };
+        let policy_version = policy_version
+            .map(|p| {
+                let trimmed = trim_ws(p.as_bytes());
+                // Trimming ASCII bytes from valid UTF-8 keeps it valid.
+                let trimmed = str::from_utf8(trimmed).unwrap_or_default();
+                char_prefix(trimmed, POLICY_MAX).to_owned()
+            })
+            .filter(|p| !p.is_empty());
+        let ip_address = ip_address
+            .map(|ip| trim_ws(ip).to_ascii_lowercase())
+            .filter(|ip| {
+                !ip.is_empty()
+                    && ip.len() <= IP_MAX
+                    && ip.iter().all(|&b| {
+                        b.is_ascii_digit() || (b'a'..=b'f').contains(&b) || b == b'.' || b == b':'
+                    })
+            });
+        let granted = status == STATUS_GRANTED;
+        let is_active =
+            granted && consented_at.is_some_and(|c| c <= now && withdrawn_at.is_none_or(|w| w < c));
+        let is_valid = !consent_type.is_empty()
+            && if granted {
+                consented_at.is_some()
+            } else {
+                withdrawn_at.is_some()
+            };
+        ConsentState {
+            consent_type,
+            status,
+            policy_version,
+            ip_address,
+            is_active,
+            is_valid,
+        }
+    }
+
+    /// `PasswordSecurity::normalizeTwoFactorStatePhp()`:
+    /// `(google2fa_secret, google2fa_enable, is_configured, needs_verification)`.
+    pub fn two_factor_state(
+        secret: Option<&[u8]>,
+        enabled: bool,
+    ) -> (Option<Vec<u8>>, bool, bool, bool) {
+        let secret = secret.and_then(|raw| {
+            let mut candidate: Vec<u8> = raw
+                .iter()
+                .filter(|&&b| !TRIM_SET.contains(&b) && b != b'-')
+                .map(u8::to_ascii_uppercase)
+                .collect();
+            while candidate.last() == Some(&b'=') {
+                candidate.pop();
+            }
+            let valid = (SECRET_MIN..=SECRET_MAX).contains(&candidate.len())
+                && candidate
+                    .iter()
+                    .all(|&b| b.is_ascii_uppercase() || (b'2'..=b'7').contains(&b));
+            valid.then_some(candidate)
+        });
+        let configured = secret.is_some();
+        (
+            secret,
+            enabled && configured,
+            configured,
+            configured && !enabled,
+        )
+    }
+
+    /// `RoleExpirationEmail::expiryWarningPlanPhp()`:
+    /// `(seconds_remaining, is_expired, due_period, day, week, month)`.
+    pub fn expiry_warning_plan(
+        expires_at: i64,
+        now: i64,
+        day_sent: bool,
+        week_sent: bool,
+        month_sent: bool,
+    ) -> (i64, bool, Option<&'static str>, bool, bool, bool) {
+        let remaining = expires_at.clamp(0, MAX_TIMESTAMP) - now.clamp(0, MAX_TIMESTAMP);
+        let window = match remaining {
+            r if r <= 0 => None,
+            r if r <= DAY => Some(("day", day_sent)),
+            r if r <= WEEK => Some(("week", week_sent)),
+            r if r <= MONTH => Some(("month", month_sent)),
+            _ => None,
+        };
+        let due = window.and_then(|(period, sent)| (!sent).then_some(period));
+        (
+            remaining,
+            remaining <= 0,
+            due,
+            day_sent || due == Some("day"),
+            week_sent || due == Some("week"),
+            month_sent || due == Some("month"),
+        )
+    }
+
+    pub fn registration_label(status: i64) -> &'static str {
+        match status {
+            REGISTRATION_OPEN => "Open",
+            REGISTRATION_INVITE => "Invite",
+            _ => "Closed",
+        }
+    }
+
+    /// `RegistrationConfiguration::normalizeRegistrationStatusPhp()`:
+    /// `(status, label, is_valid, allows_registration, requires_invite, can_register)`.
+    pub fn registration_status(
+        raw: &[u8],
+        has_valid_invite: bool,
+    ) -> (i64, &'static str, bool, bool, bool, bool) {
+        let value = trim_ws(raw).to_ascii_lowercase();
+        let parsed = if !value.is_empty() && value.iter().all(u8::is_ascii_digit) {
+            match trim_leading_zeros(&value) {
+                [] => Some(REGISTRATION_OPEN),
+                [d @ b'0'..=b'2'] => Some(i64::from(d - b'0')),
+                _ => None,
+            }
+        } else {
+            match value.as_slice() {
+                b"open" => Some(REGISTRATION_OPEN),
+                b"invite" => Some(REGISTRATION_INVITE),
+                b"closed" => Some(REGISTRATION_CLOSED),
+                _ => None,
+            }
+        };
+        let status = parsed.unwrap_or(REGISTRATION_CLOSED);
+        (
+            status,
+            registration_label(status),
+            parsed.is_some(),
+            status != REGISTRATION_CLOSED,
+            status == REGISTRATION_INVITE,
+            status == REGISTRATION_OPEN || (status == REGISTRATION_INVITE && has_valid_invite),
+        )
+    }
+
+    fn trim_leading_zeros(value: &[u8]) -> &[u8] {
+        let start = value.iter().position(|&b| b != b'0').unwrap_or(value.len());
+        &value[start..]
+    }
+
+    fn audit_encode(flags: u32, ids: [i64; 3], input: &[u8]) -> Option<Vec<u8>> {
+        if flags & !(AUDIT_HAS_REQUEST | AUDIT_HAS_USER | AUDIT_HAS_ACTOR) != 0 {
+            return None;
+        }
+        let [event, description] = split_fields::<2>(input)?;
+        let record = audit_record(
+            event,
+            description,
+            (flags & AUDIT_HAS_REQUEST != 0).then_some(ids[0]),
+            (flags & AUDIT_HAS_USER != 0).then_some(ids[1]),
+            (flags & AUDIT_HAS_ACTOR != 0).then_some(ids[2]),
+        );
+        let request = id_bytes(record.request_id);
+        let user = id_bytes(record.user_id);
+        let actor = id_bytes(record.actor_id);
+        Some(encode(&[
+            request.as_deref().map(str::as_bytes),
+            user.as_deref().map(str::as_bytes),
+            actor.as_deref().map(str::as_bytes),
+            Some(&record.event),
+            Some(record.description),
+            Some(bool_bytes(record.is_self_service)),
+            Some(bool_bytes(record.is_valid)),
+        ]))
+    }
+
+    fn consent_encode(
+        flags: u32,
+        consented_at: i64,
+        withdrawn_at: i64,
+        now: i64,
+        input: &[u8],
+    ) -> Option<Vec<u8>> {
+        if flags
+            & !(CONSENT_HAS_POLICY | CONSENT_HAS_IP | CONSENT_HAS_CONSENTED | CONSENT_HAS_WITHDRAWN)
+            != 0
+        {
+            return None;
+        }
+        let [consent_type, status, policy, ip] = split_fields::<4>(input)?;
+        let has_policy = flags & CONSENT_HAS_POLICY != 0;
+        let has_ip = flags & CONSENT_HAS_IP != 0;
+        if (!has_policy && !policy.is_empty()) || (!has_ip && !ip.is_empty()) {
+            return None;
+        }
+        let policy = if has_policy {
+            Some(str::from_utf8(policy).ok()?)
+        } else {
+            None
+        };
+        let state = consent_state(
+            consent_type,
+            status,
+            policy,
+            has_ip.then_some(ip),
+            (flags & CONSENT_HAS_CONSENTED != 0).then_some(consented_at),
+            (flags & CONSENT_HAS_WITHDRAWN != 0).then_some(withdrawn_at),
+            now,
+        );
+        Some(encode(&[
+            Some(&state.consent_type),
+            Some(state.status.as_bytes()),
+            state.policy_version.as_deref().map(str::as_bytes),
+            state.ip_address.as_deref(),
+            Some(bool_bytes(state.is_active)),
+            Some(bool_bytes(state.is_valid)),
+        ]))
+    }
+
+    fn two_factor_encode(has_secret: bool, enabled: bool, secret: &[u8]) -> Option<Vec<u8>> {
+        if !has_secret && !secret.is_empty() {
+            return None;
+        }
+        let (secret, enable, configured, needs) =
+            two_factor_state(has_secret.then_some(secret), enabled);
+        Some(encode(&[
+            secret.as_deref(),
+            Some(bool_bytes(enable)),
+            Some(bool_bytes(configured)),
+            Some(bool_bytes(needs)),
+        ]))
+    }
+
+    fn expiry_encode(flags: u32, expires_at: i64, now: i64) -> Option<Vec<u8>> {
+        if flags & !(EXPIRY_DAY_SENT | EXPIRY_WEEK_SENT | EXPIRY_MONTH_SENT) != 0 {
+            return None;
+        }
+        let (remaining, expired, due, day, week, month) = expiry_warning_plan(
+            expires_at,
+            now,
+            flags & EXPIRY_DAY_SENT != 0,
+            flags & EXPIRY_WEEK_SENT != 0,
+            flags & EXPIRY_MONTH_SENT != 0,
+        );
+        let remaining = remaining.to_string();
+        Some(encode(&[
+            Some(remaining.as_bytes()),
+            Some(bool_bytes(expired)),
+            due.map(str::as_bytes),
+            Some(bool_bytes(day)),
+            Some(bool_bytes(week)),
+            Some(bool_bytes(month)),
+        ]))
+    }
+
+    fn registration_encode(has_valid_invite: bool, raw: &[u8]) -> Vec<u8> {
+        let (status, label, valid, allows, requires, can) =
+            registration_status(raw, has_valid_invite);
+        let status = status.to_string();
+        encode(&[
+            Some(status.as_bytes()),
+            Some(label.as_bytes()),
+            Some(bool_bytes(valid)),
+            Some(bool_bytes(allows)),
+            Some(bool_bytes(requires)),
+            Some(bool_bytes(can)),
+        ])
+    }
+
+    #[inline]
+    fn flag(value: u32) -> Option<bool> {
+        match value {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+
+    /// `GdprAuditLog::normalizeAuditRecord()`; input is `event`, `description`.
+    /// `flags` bit 0/1/2 mark a non-null request/user/actor id.
+    ///
+    /// # Safety
+    /// Non-null input pointers must be readable for their lengths and `out_buf` writable for
+    /// `out_cap` bytes; null or oversized buffers decline with `-1`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_gdpr_audit_log_normalize_record(
+        flags: u32,
+        request_id: i64,
+        user_id: i64,
+        actor_id: i64,
+        input_ptr: *const u8,
+        input_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(input) = (unsafe { valid_slice(input_ptr, input_len) }) else {
+                return DECLINE;
+            };
+            finish(
+                audit_encode(flags, [request_id, user_id, actor_id], input),
+                out_buf,
+                out_cap,
+            )
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `GdprConsent::normalizeConsentState()`; input is `consent_type`, `status`,
+    /// `policy_version`, `ip_address`. `flags` bit 0/1/2/3 mark a non-null policy version,
+    /// IP address, consent time and withdrawal time; an absent text field must be empty.
+    ///
+    /// # Safety
+    /// Non-null input pointers must be readable for their lengths and `out_buf` writable for
+    /// `out_cap` bytes; null or oversized buffers decline with `-1`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_gdpr_consent_normalize_state(
+        flags: u32,
+        consented_at: i64,
+        withdrawn_at: i64,
+        now: i64,
+        input_ptr: *const u8,
+        input_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(input) = (unsafe { valid_slice(input_ptr, input_len) }) else {
+                return DECLINE;
+            };
+            finish(
+                consent_encode(flags, consented_at, withdrawn_at, now, input),
+                out_buf,
+                out_cap,
+            )
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `PasswordSecurity::normalizeTwoFactorState()`; the secret is arbitrary bytes.
+    /// `has_secret` is `0` for PHP `null` (the secret must then be empty) or `1`.
+    ///
+    /// # Safety
+    /// Non-null input pointers must be readable for their lengths and `out_buf` writable for
+    /// `out_cap` bytes; null or oversized buffers decline with `-1`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_password_security_normalize_two_factor(
+        has_secret: u32,
+        enabled: u32,
+        secret_ptr: *const u8,
+        secret_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let (Some(has_secret), Some(enabled)) = (flag(has_secret), flag(enabled)) else {
+                return DECLINE;
+            };
+            let Some(secret) = (unsafe { valid_slice(secret_ptr, secret_len) }) else {
+                return DECLINE;
+            };
+            finish(
+                two_factor_encode(has_secret, enabled, secret),
+                out_buf,
+                out_cap,
+            )
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `RoleExpirationEmail::expiryWarningPlan()`; `flags` bit 0/1/2 mark the day/week/month
+    /// warnings as already sent.
+    ///
+    /// # Safety
+    /// Non-null input pointers must be readable for their lengths and `out_buf` writable for
+    /// `out_cap` bytes; null or oversized buffers decline with `-1`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_role_expiration_email_warning_plan(
+        flags: u32,
+        expires_at: i64,
+        now: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            finish(expiry_encode(flags, expires_at, now), out_buf, out_cap)
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `RegistrationConfiguration::normalizeRegistrationStatus()`; the raw status is arbitrary
+    /// bytes. `has_valid_invite` is `0` or `1`.
+    ///
+    /// # Safety
+    /// Non-null input pointers must be readable for their lengths and `out_buf` writable for
+    /// `out_cap` bytes; null or oversized buffers decline with `-1`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_registration_configuration_normalize_status(
+        has_valid_invite: u32,
+        raw_ptr: *const u8,
+        raw_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(has_valid_invite) = flag(has_valid_invite) else {
+                return DECLINE;
+            };
+            let Some(raw) = (unsafe { valid_slice(raw_ptr, raw_len) }) else {
+                return DECLINE;
+            };
+            finish(
+                Some(registration_encode(has_valid_invite, raw)),
+                out_buf,
+                out_cap,
+            )
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::ptr;
+
+        fn call(f: impl Fn(*mut u8, usize) -> isize) -> Result<Vec<u8>, isize> {
+            let mut buf = vec![0u8; 1024];
+            let rc = f(buf.as_mut_ptr(), buf.len());
+            if rc < 0 {
+                return Err(rc);
+            }
+            buf.truncate(rc as usize);
+            Ok(buf)
+        }
+
+        fn fields(out: &[u8]) -> Vec<Option<String>> {
+            out.split(|&b| b == FIELD_SEP)
+                .map(|f| (f != [NULL_MARK]).then(|| String::from_utf8_lossy(f).into_owned()))
+                .collect()
+        }
+
+        fn s(v: &str) -> Option<String> {
+            Some(v.to_owned())
+        }
+
+        #[test]
+        fn audit_rules() {
+            let r = audit_record(
+                b"  Export Requested!! ",
+                b"\tdone \n",
+                Some(3),
+                Some(9),
+                Some(9),
+            );
+            assert_eq!(r.event, b"export_requested");
+            assert_eq!(r.description, b"done");
+            assert_eq!(
+                (r.request_id, r.user_id, r.actor_id),
+                (Some(3), Some(9), Some(9))
+            );
+            assert!(r.is_self_service && r.is_valid);
+            let r = audit_record(b"__a.b__", b" ", Some(0), Some(-1), None);
+            assert_eq!(r.event, b"a.b");
+            assert_eq!((r.request_id, r.user_id), (None, None));
+            assert!(!r.is_self_service && !r.is_valid);
+            assert_eq!(
+                audit_record(b"\xc3\xa9vent", b"x", None, None, None).event,
+                b"vent"
+            );
+            let long = [b'a'; 63].iter().chain(b"!b").copied().collect::<Vec<_>>();
+            assert_eq!(
+                audit_record(&long, b"x", None, None, None).event,
+                vec![b'a'; 63]
+            );
+        }
+
+        #[test]
+        fn consent_rules() {
+            let c = consent_state(
+                b" Essential Cookies ",
+                b" GRANTED ",
+                Some(" v2 "),
+                Some(b" 10.0.0.1 "),
+                Some(10),
+                None,
+                20,
+            );
+            assert_eq!(c.consent_type, b"essential_cookies");
+            assert_eq!(
+                (c.status, c.policy_version.as_deref()),
+                (STATUS_GRANTED, Some("v2"))
+            );
+            assert_eq!(c.ip_address.as_deref(), Some(&b"10.0.0.1"[..]));
+            assert!(c.is_active && c.is_valid);
+            assert!(!consent_state(b"t", b"granted", None, None, Some(30), None, 20).is_active);
+            assert!(consent_state(b"t", b"granted", None, None, Some(30), Some(5), 40).is_active);
+            assert!(!consent_state(b"t", b"granted", None, None, Some(30), Some(30), 40).is_active);
+            assert_eq!(
+                consent_state(b"t", b"?", None, None, Some(1), Some(1), 4).status,
+                STATUS_WITHDRAWN
+            );
+            assert_eq!(
+                consent_state(b"t", b"?", None, None, Some(2), Some(1), 4).status,
+                STATUS_GRANTED
+            );
+            assert_eq!(
+                consent_state(b"t", b"", None, None, None, Some(1), 4).status,
+                STATUS_WITHDRAWN
+            );
+            assert!(!consent_state(b"t", b"withdrawn", None, None, Some(1), None, 4).is_valid);
+            assert_eq!(
+                consent_state(b"t", b"x", Some("  "), Some(b"FE80::1"), None, None, 0)
+                    .policy_version,
+                None
+            );
+            assert_eq!(
+                consent_state(b"t", b"x", None, Some(b"FE80::1"), None, None, 0)
+                    .ip_address
+                    .as_deref(),
+                Some(&b"fe80::1"[..])
+            );
+            assert_eq!(
+                consent_state(b"t", b"x", None, Some(b"host.example"), None, None, 0).ip_address,
+                None
+            );
+            let policy = "é".repeat(70);
+            assert_eq!(
+                consent_state(b"t", b"x", Some(&policy), None, None, None, 0)
+                    .policy_version
+                    .unwrap()
+                    .chars()
+                    .count(),
+                64
+            );
+        }
+
+        #[test]
+        fn two_factor_expiry_and_registration_rules() {
+            assert_eq!(
+                two_factor_state(Some(b" abcd efgh-ijkl mnop== "), true),
+                (Some(b"ABCDEFGHIJKLMNOP".to_vec()), true, true, false)
+            );
+            assert_eq!(
+                two_factor_state(Some(b"ABCDEFGHIJKLMNO"), true),
+                (None, false, false, false)
+            );
+            assert_eq!(two_factor_state(Some(b"ABCDEFGHIJKLMNO1"), false).0, None);
+            assert_eq!(two_factor_state(Some(b"ABCDEFGH=IJKLMNOP"), false).0, None);
+            assert_eq!(
+                two_factor_state(Some(b"ABCDEFGHIJKLMNOP"), false),
+                (Some(b"ABCDEFGHIJKLMNOP".to_vec()), false, true, true)
+            );
+            assert_eq!(two_factor_state(None, true), (None, false, false, false));
+
+            assert_eq!(
+                expiry_warning_plan(100, 100, false, false, false),
+                (0, true, None, false, false, false)
+            );
+            assert_eq!(
+                expiry_warning_plan(DAY, 0, false, false, false),
+                (DAY, false, Some("day"), true, false, false)
+            );
+            assert_eq!(expiry_warning_plan(DAY, 0, true, false, false).2, None);
+            assert_eq!(
+                expiry_warning_plan(WEEK, 0, false, false, false).2,
+                Some("week")
+            );
+            assert_eq!(
+                expiry_warning_plan(MONTH, 0, false, false, false).2,
+                Some("month")
+            );
+            assert_eq!(
+                expiry_warning_plan(MONTH + 1, 0, false, false, false).2,
+                None
+            );
+            assert_eq!(
+                expiry_warning_plan(i64::MAX, i64::MIN, false, false, false).0,
+                MAX_TIMESTAMP
+            );
+            assert_eq!(
+                expiry_warning_plan(i64::MIN, i64::MAX, false, false, false).0,
+                -MAX_TIMESTAMP
+            );
+
+            assert_eq!(
+                registration_status(b" 1 ", true),
+                (1, "Invite", true, true, true, true)
+            );
+            assert_eq!(registration_status(b"invite", false).5, false);
+            assert_eq!(
+                registration_status(b"OPEN", false),
+                (0, "Open", true, true, false, true)
+            );
+            assert_eq!(registration_status(b"000", false).0, 0);
+            assert_eq!(registration_status(b"002", false).0, 2);
+            assert_eq!(
+                registration_status(b"3", true),
+                (2, "Closed", false, false, false, false)
+            );
+            assert_eq!(registration_status(b"", true).2, false);
+            assert_eq!(registration_status(b"-1", true).2, false);
+            assert_eq!(registration_status(b"99999999999999999999", true).2, false);
+        }
+
+        #[test]
+        fn exports_encode_fields() {
+            let input = b"Export\x1F done ";
+            let out = call(|b, c| unsafe {
+                nntmux_gdpr_audit_log_normalize_record(
+                    3,
+                    4,
+                    5,
+                    6,
+                    input.as_ptr(),
+                    input.len(),
+                    b,
+                    c,
+                )
+            })
+            .unwrap();
+            assert_eq!(
+                fields(&out),
+                vec![s("4"), s("5"), None, s("export"), s("done"), s("0"), s("1")]
+            );
+
+            let input = b"essential_cookies\x1Fgranted\x1F\x1F";
+            let out = call(|b, c| unsafe {
+                nntmux_gdpr_consent_normalize_state(4, 10, 0, 20, input.as_ptr(), input.len(), b, c)
+            })
+            .unwrap();
+            assert_eq!(
+                fields(&out),
+                vec![
+                    s("essential_cookies"),
+                    s("granted"),
+                    None,
+                    None,
+                    s("1"),
+                    s("1")
+                ]
+            );
+
+            let secret = b"abcdefghijklmnop";
+            let out = call(|b, c| unsafe {
+                nntmux_password_security_normalize_two_factor(
+                    1,
+                    1,
+                    secret.as_ptr(),
+                    secret.len(),
+                    b,
+                    c,
+                )
+            })
+            .unwrap();
+            assert_eq!(
+                fields(&out),
+                vec![s("ABCDEFGHIJKLMNOP"), s("1"), s("1"), s("0")]
+            );
+
+            let out =
+                call(|b, c| unsafe { nntmux_role_expiration_email_warning_plan(0, 1000, 0, b, c) })
+                    .unwrap();
+            assert_eq!(
+                fields(&out),
+                vec![s("1000"), s("0"), s("day"), s("1"), s("0"), s("0")]
+            );
+
+            let raw = b"closed";
+            let out = call(|b, c| unsafe {
+                nntmux_registration_configuration_normalize_status(0, raw.as_ptr(), raw.len(), b, c)
+            })
+            .unwrap();
+            assert_eq!(
+                fields(&out),
+                vec![s("2"), s("Closed"), s("1"), s("0"), s("0"), s("0")]
+            );
+        }
+
+        #[test]
+        fn exports_reject_malformed_input_and_respect_capacity() {
+            let mut small = [b'Z'; 4];
+            let raw = b"open";
+            let rc = unsafe {
+                nntmux_registration_configuration_normalize_status(
+                    0,
+                    raw.as_ptr(),
+                    raw.len(),
+                    small.as_mut_ptr(),
+                    small.len(),
+                )
+            };
+            assert!(rc < DECLINE);
+            assert_eq!(small, [b'Z'; 4]);
+            let mut big = vec![0u8; (-rc) as usize];
+            let rc2 = unsafe {
+                nntmux_registration_configuration_normalize_status(
+                    0,
+                    raw.as_ptr(),
+                    raw.len(),
+                    big.as_mut_ptr(),
+                    big.len(),
+                )
+            };
+            assert_eq!(rc2, -rc);
+            let rc = unsafe {
+                nntmux_role_expiration_email_warning_plan(0, 5, 0, small.as_mut_ptr(), 0)
+            };
+            assert!(rc < DECLINE);
+            assert_eq!(small, [b'Z'; 4]);
+
+            for (flags, input) in [
+                (0u32, &b"a\x1Fb\x1Fc"[..]),
+                (0, b"only"),
+                (0, b"a\x1Eb\x1Fc"),
+                (8, b"a\x1Fb"),
+            ] {
+                assert_eq!(
+                    call(|b, c| unsafe {
+                        nntmux_gdpr_audit_log_normalize_record(
+                            flags,
+                            0,
+                            0,
+                            0,
+                            input.as_ptr(),
+                            input.len(),
+                            b,
+                            c,
+                        )
+                    }),
+                    Err(DECLINE)
+                );
+            }
+            for (flags, input) in [
+                (0u32, &b"t\x1Fs\x1Fv1\x1F"[..]),
+                (0, b"t\x1Fs\x1F\x1F1.2.3.4"),
+                (1, b"t\x1Fs\x1F\xff\x1F"),
+                (16, b"t\x1Fs\x1F\x1F"),
+                (0, b"t\x1Fs\x1F\x1F\x1F"),
+                (0, b"t\x1Fs\x1F"),
+                (0, b"t\x1E\x1Fs\x1F\x1F"),
+            ] {
+                assert_eq!(
+                    call(|b, c| unsafe {
+                        nntmux_gdpr_consent_normalize_state(
+                            flags,
+                            0,
+                            0,
+                            0,
+                            input.as_ptr(),
+                            input.len(),
+                            b,
+                            c,
+                        )
+                    }),
+                    Err(DECLINE)
+                );
+            }
+            let secret = b"ABCDEFGHIJKLMNOP";
+            for (has, enabled, len) in [(0u32, 0u32, secret.len()), (2, 0, 0), (1, 2, secret.len())]
+            {
+                assert_eq!(
+                    call(|b, c| unsafe {
+                        nntmux_password_security_normalize_two_factor(
+                            has,
+                            enabled,
+                            secret.as_ptr(),
+                            len,
+                            b,
+                            c,
+                        )
+                    }),
+                    Err(DECLINE)
+                );
+            }
+            assert_eq!(
+                call(|b, c| unsafe { nntmux_role_expiration_email_warning_plan(8, 0, 0, b, c) }),
+                Err(DECLINE)
+            );
+            assert_eq!(
+                call(|b, c| unsafe {
+                    nntmux_registration_configuration_normalize_status(
+                        2,
+                        raw.as_ptr(),
+                        raw.len(),
+                        b,
+                        c,
+                    )
+                }),
+                Err(DECLINE)
+            );
+
+            unsafe {
+                let (b, c) = (big.as_mut_ptr(), big.len());
+                assert_eq!(
+                    nntmux_gdpr_audit_log_normalize_record(0, 0, 0, 0, ptr::null(), 0, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_gdpr_consent_normalize_state(0, 0, 0, 0, ptr::null(), 0, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_password_security_normalize_two_factor(0, 0, ptr::null(), 0, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_registration_configuration_normalize_status(0, ptr::null(), 0, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_role_expiration_email_warning_plan(0, 0, 0, ptr::null_mut(), 64),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_registration_configuration_normalize_status(
+                        0,
+                        raw.as_ptr(),
+                        raw.len(),
+                        ptr::null_mut(),
+                        64
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_registration_configuration_normalize_status(
+                        0,
+                        raw.as_ptr(),
+                        MAX_INPUT + 1,
+                        b,
+                        c
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_role_expiration_email_warning_plan(0, 0, 0, b, isize::MAX as usize + 1),
+                    DECLINE
+                );
+            }
+        }
+    }
+}
