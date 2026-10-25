@@ -12,6 +12,8 @@ use App\Services\Nzb\NzbService;
 use App\Services\Nzb\NzbSourceGuard;
 use App\Services\Releases\ReleaseGroupResolver;
 use App\Support\NzbPasswordMetadata;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Carbon;
@@ -25,6 +27,18 @@ use Throwable;
 
 final class CandidateRepository
 {
+    public const string FFI_CDEF = 'int64_t nntmux_w34_candidate_repository_nfo_processor(uint32_t operation,const char *input,size_t length,char *output,size_t capacity);';
+
+    private const int NATIVE_MAX_BYTES = 16777216;
+
+    /**
+     * Rust stays opt-in: the FFI round trip is slower than these PHP helpers (< 1.5x); see
+     * tests/Unit/RustCandidateRepositoryNfoProcessorParityTest.php.
+     */
+    private const bool RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useRustFfi = null;
+
     private const string PARTIAL_QUEUED = 'Upload stopped growing before it was complete; queued for partial publication.';
 
     private const string PARTIAL_DEFERRED = 'Partial publication deferred: ';
@@ -51,6 +65,153 @@ final class CandidateRepository
 
     public function __construct(private readonly ManifestStore $store, private readonly CollectionCleanupService $cleanup,
         private readonly VerificationLedger $ledger = new VerificationLedger) {}
+
+    public static function setUseRustFfi(?bool $use): void
+    {
+        self::$useRustFfi = $use;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? self::RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run one Wave 34.2 helper (operations 0-6) in the Rust library over packed native-endian slots.
+     * Null when the library is missing, the input is outside the contract, or Rust declines it.
+     */
+    public static function evaluateNative(int $operation, string $input): ?string
+    {
+        try {
+            if ($operation < 0 || $input === '' || \strlen($input) > self::NATIVE_MAX_BYTES) {
+                return null;
+            }
+            $ffi = RustPipelineLibrary::resolveDomain('nfo', self::FFI_CDEF, getenv('NNTMUX_PIPELINE_FFI_LIB') ?: null);
+            if (! $ffi instanceof FFI) {
+                return null;
+            }
+            $capacity = 0;
+            $output = RustPipelineLibrary::obtainScratch($ffi, 256, $capacity);
+            if ($output === null) {
+                return null;
+            }
+            $capacity = min($capacity, self::NATIVE_MAX_BYTES);
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w34_candidate_repository_nfo_processor($operation, $input, \strlen($input), $output, $capacity);
+            if (\is_int($written) && $written < -1 && -$written > $capacity && -$written <= self::NATIVE_MAX_BYTES) {
+                $output = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($output === null) {
+                    return null;
+                }
+                $capacity = min($capacity, self::NATIVE_MAX_BYTES);
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w34_candidate_repository_nfo_processor($operation, $input, \strlen($input), $output, $capacity);
+            }
+            if (! \is_int($written) || $written < 0 || $written > $capacity) {
+                return null;
+            }
+
+            return $written === 0 ? '' : FFI::string($output, $written);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Native-endian `i64` slots of a helper result, or null unless it holds exactly $count of them.
+     *
+     * @return list<int>|null
+     */
+    public static function nativeSlots(?string $result, int $count): ?array
+    {
+        if ($result === null || \strlen($result) !== $count * 8) {
+            return null;
+        }
+        $slots = array_values(unpack('q'.$count, $result) ?: []);
+
+        return \count($slots) === $count ? $slots : null;
+    }
+
+    /**
+     * The order-independent digest of an upload's article ids: SHA-256 over the sorted ids, newline-joined.
+     *
+     * @param  list<string>  $ids
+     */
+    public static function articleIdentityDigest(array $ids): string
+    {
+        return self::usesRustFfi() ? self::articleIdentityDigestNative($ids) : self::articleIdentityDigestPhp($ids);
+    }
+
+    /** @param list<string> $ids */
+    public static function articleIdentityDigestPhp(array $ids): string
+    {
+        sort($ids);
+
+        return hash('sha256', implode("\n", $ids));
+    }
+
+    /** @param list<string> $ids */
+    public static function articleIdentityDigestNative(array $ids): string
+    {
+        $lengths = array_map(strlen(...), $ids);
+        $result = self::evaluateNative(0, pack('q*', \count($ids), ...$lengths).implode('', $ids));
+        if ($result !== null && \strlen($result) === 64 && strspn($result, '0123456789abcdef') === 64) {
+            return $result;
+        }
+
+        return self::articleIdentityDigestPhp($ids);
+    }
+
+    /**
+     * A stalled upload not yet tried as a partial, or queued for that try: its last new article is no older
+     * than $cutoff, and it waits for its upload without a deferred partial attempt or is queued for one.
+     */
+    public static function isOwedPartialAttempt(?string $lastUniqueAt, string $cutoff, string $status, ?string $reason): bool
+    {
+        return self::usesRustFfi() ? self::isOwedPartialAttemptNative($lastUniqueAt, $cutoff, $status, $reason)
+            : self::isOwedPartialAttemptPhp($lastUniqueAt, $cutoff, $status, $reason);
+    }
+
+    public static function isOwedPartialAttemptPhp(?string $lastUniqueAt, string $cutoff, string $status, ?string $reason): bool
+    {
+        return $lastUniqueAt >= $cutoff
+            && (($status === 'waiting_upload' && ! str_starts_with((string) ($reason ?? ''), self::PARTIAL_DEFERRED))
+                || ($status === 'ready' && $reason === self::PARTIAL_QUEUED));
+    }
+
+    public static function isOwedPartialAttemptNative(?string $lastUniqueAt, string $cutoff, string $status, ?string $reason): bool
+    {
+        $slots = self::nativeSlots(self::evaluateNative(1, pack('q6', (int) ($lastUniqueAt !== null), \strlen($lastUniqueAt ?? ''), \strlen($cutoff),
+            \strlen($status), (int) ($reason !== null), \strlen($reason ?? '')).$lastUniqueAt.$cutoff.$status.$reason), 1);
+        if ($slots !== null && \in_array($slots[0], [0, 1], true)) {
+            return $slots[0] === 1;
+        }
+
+        return self::isOwedPartialAttemptPhp($lastUniqueAt, $cutoff, $status, $reason);
+    }
+
+    /** Whether pending candidate bytes leave room under the capacity, less its reserve (a tenth, at most 32 MiB). */
+    public static function hasPendingCapacity(int $pendingBytes, int $capacity): bool
+    {
+        return self::usesRustFfi() ? self::hasPendingCapacityNative($pendingBytes, $capacity) : self::hasPendingCapacityPhp($pendingBytes, $capacity);
+    }
+
+    public static function hasPendingCapacityPhp(int $pendingBytes, int $capacity): bool
+    {
+        $reserve = min(33554432, (int) ($capacity / 10));
+
+        return $pendingBytes < $capacity - $reserve;
+    }
+
+    public static function hasPendingCapacityNative(int $pendingBytes, int $capacity): bool
+    {
+        $slots = self::nativeSlots(self::evaluateNative(2, pack('q2', $pendingBytes, $capacity)), 1);
+        if ($slots !== null && \in_array($slots[0], [0, 1], true)) {
+            return $slots[0] === 1;
+        }
+
+        return self::hasPendingCapacityPhp($pendingBytes, $capacity);
+    }
 
     public function archive(int $collectionId): void
     {
@@ -920,9 +1081,7 @@ final class CandidateRepository
      */
     private static function owedPartialAttempt(object $row): bool
     {
-        return $row->last_unique_at >= self::owedPartialCutoff()
-            && (($row->status === 'waiting_upload' && ! str_starts_with((string) ($row->reason ?? ''), self::PARTIAL_DEFERRED))
-                || ($row->status === 'ready' && $row->reason === self::PARTIAL_QUEUED));
+        return self::isOwedPartialAttempt($row->last_unique_at, self::owedPartialCutoff(), $row->status, $row->reason);
     }
 
     /** Uploads whose last new article is older than this are no longer owed a partial attempt. */
@@ -1029,9 +1188,8 @@ final class CandidateRepository
                 $ids[] = $file['key'].':'.$part['number'].':'.$part['messageid'].':'.$part['bytes'];
             }
         }
-        sort($ids);
 
-        return hash('sha256', implode("\n", $ids));
+        return self::articleIdentityDigest($ids);
     }
 
     /** An upload whose missing files or articles have stopped arriving may publish as partial. */
@@ -1131,10 +1289,8 @@ final class CandidateRepository
             return true;
         }
 
-        $capacity = (int) config('release_verification.pending_bytes');
-        $reserve = min(33554432, (int) ($capacity / 10));
-
-        return (int) DB::table('release_verification_state')->where('id', 1)->value('pending_bytes') < $capacity - $reserve;
+        return self::hasPendingCapacity((int) DB::table('release_verification_state')->where('id', 1)->value('pending_bytes'),
+            (int) config('release_verification.pending_bytes'));
     }
 
     /** @return array<string, mixed> */

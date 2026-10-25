@@ -24039,3 +24039,566 @@ pub unsafe extern "C" fn nntmux_w33_release_verification_preparation(
     }))
     .unwrap_or(-1)
 }
+
+/// Wave 34.2 pure helpers for release verification candidates, fetched articles,
+/// remote publication items, PAR2 candidate checkpoints and NFO processing: the
+/// candidate article-identity digest, owed partial-attempt classification and
+/// pending-capacity check, remote claim identity normalization, PAR2 checkpoint
+/// progress, fetched-article transfer summaries and NFO lookup flags. Inputs and
+/// outputs are packed native-endian `i64` slots; variable strings follow their
+/// slots as raw bytes, with their lengths in the slots.
+mod wave34_candidate_repository_nfo_processor {
+    use super::{nfo_abi_range, yenc_ranges_overlap};
+    use std::slice;
+
+    pub(super) const MAX_BYTES: usize = 16 * 1024 * 1024;
+
+    const PARTIAL_QUEUED: &[u8] =
+        b"Upload stopped growing before it was complete; queued for partial publication.";
+
+    const PARTIAL_DEFERRED: &[u8] = b"Partial publication deferred: ";
+
+    /// Conservative superset of PHP numeric strings: any string PHP 8 could
+    /// compare numerically consists only of these bytes. Callers decline such
+    /// inputs so every comparison left here is PHP's binary string comparison.
+    fn maybe_php_numeric(value: &[u8]) -> bool {
+        value.iter().all(|b| {
+            matches!(
+                b,
+                b'0'..=b'9'
+                    | b'.'
+                    | b'+'
+                    | b'-'
+                    | b'e'
+                    | b'E'
+                    | b' '
+                    | b'\t'
+                    | b'\n'
+                    | b'\r'
+                    | 0x0b
+                    | 0x0c
+            )
+        })
+    }
+
+    /// `hash('sha256', implode("\n", sort($ids)))` for ids PHP sorts bytewise.
+    pub(super) fn article_identity_digest(ids: &mut [&[u8]]) -> Option<[u8; 64]> {
+        if ids.iter().any(|id| maybe_php_numeric(id)) {
+            return None;
+        }
+        ids.sort_unstable();
+        let total = ids.iter().map(|id| id.len() + 1).sum::<usize>();
+        let mut joined = Vec::with_capacity(total);
+        for (index, id) in ids.iter().enumerate() {
+            if index > 0 {
+                joined.push(b'\n');
+            }
+            joined.extend_from_slice(id);
+        }
+        Some(crate::predb::sha256_hex_slice(&joined))
+    }
+
+    /// `CandidateRepository::owedPartialAttempt()`; `None` declines numeric strings.
+    pub(super) fn owed_partial_attempt(
+        last_unique_at: Option<&[u8]>,
+        cutoff: &[u8],
+        status: &[u8],
+        reason: Option<&[u8]>,
+    ) -> Option<bool> {
+        // PHP compares null with a string as the empty string.
+        let recent = match last_unique_at {
+            Some(last) if maybe_php_numeric(last) && maybe_php_numeric(cutoff) => return None,
+            Some(last) => last >= cutoff,
+            None => cutoff.is_empty(),
+        };
+        Some(
+            recent
+                && ((status == b"waiting_upload"
+                    && !reason.unwrap_or_default().starts_with(PARTIAL_DEFERRED))
+                    || (status == b"ready" && reason == Some(PARTIAL_QUEUED))),
+        )
+    }
+
+    /// `$pending < $capacity - min(33554432, (int) ($capacity / 10))`.
+    pub(super) fn has_pending_capacity(pending: i64, capacity: i64) -> Option<bool> {
+        // PHP's integer division yields an int only when exact, else a float.
+        let tenth = if capacity % 10 == 0 {
+            capacity / 10
+        } else {
+            (capacity as f64 / 10.0) as i64
+        };
+        Some(pending < capacity.checked_sub(tenth.min(33_554_432))?)
+    }
+
+    /// A canonical decimal integer (`(string) $int` output); anything else declines.
+    pub(super) fn canonical_integer(value: &[u8]) -> Option<i64> {
+        let digits = value.strip_prefix(b"-").unwrap_or(value);
+        let negative = digits.len() != value.len();
+        if digits.is_empty()
+            || digits.len() > 19
+            || !digits.iter().all(u8::is_ascii_digit)
+            || (digits[0] == b'0' && (digits.len() > 1 || negative))
+        {
+            return None;
+        }
+        let magnitude = digits
+            .iter()
+            .fold(0i128, |acc, d| acc * 10 + i128::from(d - b'0'));
+        i64::try_from(if negative { -magnitude } else { magnitude }).ok()
+    }
+
+    /// `[blocked, resumable, remaining, retries, complete]`.
+    pub(super) fn checkpoint_progress(
+        next_segment: i64,
+        retry_count: i64,
+        has_state: bool,
+        blocked: bool,
+        segment_count: i64,
+    ) -> [i64; 5] {
+        let next = next_segment.max(0);
+        let count = segment_count.max(0);
+        let retries = retry_count.max(0);
+        let remaining = if count > next { count - next } else { 0 };
+        [
+            i64::from(blocked),
+            i64::from(!blocked && (next > 0 || retries > 0 || has_state)),
+            remaining,
+            retries,
+            i64::from(!blocked && remaining == 0 && retries == 0),
+        ]
+    }
+
+    /// `[raw, decoded, overhead, end_present, end, within_file, final_part]`
+    /// with `final_part` -1 when the total part count is unknown.
+    pub(super) fn transfer_summary(
+        raw_bytes: i64,
+        size: i64,
+        offset: i64,
+        decoded_bytes: i64,
+        part: i64,
+        total_parts: Option<i64>,
+    ) -> [i64; 7] {
+        let raw = raw_bytes.max(0);
+        let decoded = decoded_bytes.max(0);
+        let end = if offset >= 0 {
+            offset.checked_add(decoded)
+        } else {
+            None
+        };
+        [
+            raw,
+            decoded,
+            raw - decoded,
+            i64::from(end.is_some()),
+            end.unwrap_or(0),
+            i64::from(end.is_some_and(|end| end <= size)),
+            total_parts.map_or(-1, |total| i64::from(part == total)),
+        ]
+    }
+
+    /// Bit 0: IMDB lookups; bit 1: TV lookups.
+    pub(super) fn lookup_flags(movie: i64, tv: i64) -> i64 {
+        i64::from(movie != 0) | (i64::from(tv != 0) << 1)
+    }
+
+    fn int(bytes: &[u8], index: usize) -> i64 {
+        let mut slot = [0u8; 8];
+        slot.copy_from_slice(&bytes[index * 8..index * 8 + 8]);
+        i64::from_ne_bytes(slot)
+    }
+
+    fn flag(bytes: &[u8], index: usize) -> Option<bool> {
+        match int(bytes, index) {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+
+    fn pack_ints(values: &[i64]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_ne_bytes()).collect()
+    }
+
+    /// Split the bytes after `head` into strings of the given lengths, which must
+    /// cover the tail exactly.
+    fn strings<'a>(bytes: &'a [u8], head: usize, lengths: &[i64]) -> Option<Vec<&'a [u8]>> {
+        let mut cursor = head;
+        let mut parts = Vec::with_capacity(lengths.len());
+        for &length in lengths {
+            let end = cursor.checked_add(usize::try_from(length).ok()?)?;
+            parts.push(bytes.get(cursor..end)?);
+            cursor = end;
+        }
+        (cursor == bytes.len()).then_some(parts)
+    }
+
+    fn compute(operation: u32, bytes: &[u8]) -> Option<Vec<u8>> {
+        let fixed = match operation {
+            0 => 1,
+            1 => 6,
+            2 => 2,
+            3 => 2,
+            4 => 5,
+            5 => 7,
+            6 => 2,
+            _ => return None,
+        };
+        if bytes.len() < fixed * 8 {
+            return None;
+        }
+        match operation {
+            0 => {
+                let count = usize::try_from(int(bytes, 0)).ok()?;
+                let head = count.checked_add(1)?.checked_mul(8)?;
+                if head > bytes.len() {
+                    return None;
+                }
+                let lengths: Vec<i64> = (1..=count).map(|i| int(bytes, i)).collect();
+                let mut ids = strings(bytes, head, &lengths)?;
+                Some(article_identity_digest(&mut ids)?.to_vec())
+            }
+            1 => {
+                let has_last = flag(bytes, 0)?;
+                let has_reason = flag(bytes, 4)?;
+                let lengths = [int(bytes, 1), int(bytes, 2), int(bytes, 3), int(bytes, 5)];
+                if (!has_last && lengths[0] != 0) || (!has_reason && lengths[3] != 0) {
+                    return None;
+                }
+                let parts = strings(bytes, 48, &lengths)?;
+                let owed = owed_partial_attempt(
+                    has_last.then_some(parts[0]),
+                    parts[1],
+                    parts[2],
+                    has_reason.then_some(parts[3]),
+                )?;
+                Some(pack_ints(&[i64::from(owed)]))
+            }
+            2 if bytes.len() == 16 => Some(pack_ints(&[i64::from(has_pending_capacity(
+                int(bytes, 0),
+                int(bytes, 1),
+            )?)])),
+            3 => {
+                let parts = strings(bytes, 16, &[int(bytes, 0), int(bytes, 1)])?;
+                Some(pack_ints(&[
+                    canonical_integer(parts[0])?,
+                    canonical_integer(parts[1])?,
+                ]))
+            }
+            4 if bytes.len() == 40 => Some(pack_ints(&checkpoint_progress(
+                int(bytes, 0),
+                int(bytes, 1),
+                flag(bytes, 2)?,
+                flag(bytes, 3)?,
+                int(bytes, 4),
+            ))),
+            5 if bytes.len() == 56 => {
+                let total = flag(bytes, 5)?.then_some(int(bytes, 6));
+                if total.is_none() && int(bytes, 6) != 0 {
+                    return None;
+                }
+                Some(pack_ints(&transfer_summary(
+                    int(bytes, 0),
+                    int(bytes, 1),
+                    int(bytes, 2),
+                    int(bytes, 3),
+                    int(bytes, 4),
+                    total,
+                )))
+            }
+            6 if bytes.len() == 16 => {
+                Some(pack_ints(&[lookup_flags(int(bytes, 0), int(bytes, 1))]))
+            }
+            _ => None,
+        }
+    }
+
+    /// # Safety
+    /// See [`super::nntmux_w34_candidate_repository_nfo_processor`].
+    pub(super) unsafe fn evaluate(
+        operation: u32,
+        input: *const u8,
+        length: usize,
+        output: *mut u8,
+        capacity: usize,
+    ) -> i64 {
+        if !nfo_abi_range(input, length, false)
+            || !nfo_abi_range(output, capacity, false)
+            || length > MAX_BYTES
+            || capacity > MAX_BYTES
+            || yenc_ranges_overlap(input as usize, length, output as usize, capacity)
+        {
+            return -1;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, length) };
+        let Some(result) = compute(operation, bytes) else {
+            return -1;
+        };
+        let needed = result.len() as i64;
+        if result.len() > capacity {
+            return -needed;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), output, result.len()) };
+        needed
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn call(operation: u32, input: &[u8]) -> Option<Vec<u8>> {
+            let mut out = vec![0xa5u8; 4096];
+            let probe = [0u8; 1];
+            let pointer = if input.is_empty() {
+                probe.as_ptr()
+            } else {
+                input.as_ptr()
+            };
+            let written =
+                unsafe { evaluate(operation, pointer, input.len(), out.as_mut_ptr(), out.len()) };
+            if written < 0 {
+                assert_eq!(written, -1);
+                return None;
+            }
+            Some(out[..written as usize].to_vec())
+        }
+
+        fn ints(bytes: Vec<u8>) -> Vec<i64> {
+            bytes
+                .chunks_exact(8)
+                .map(|c| i64::from_ne_bytes(c.try_into().unwrap()))
+                .collect()
+        }
+
+        fn with_strings(slots: &[i64], strings: &[&[u8]]) -> Vec<u8> {
+            let mut v = pack_ints(slots);
+            for s in strings {
+                v.extend_from_slice(s);
+            }
+            v
+        }
+
+        fn digest(ids: &[&[u8]]) -> Option<Vec<u8>> {
+            let mut slots = vec![ids.len() as i64];
+            slots.extend(ids.iter().map(|id| id.len() as i64));
+            call(0, &with_strings(&slots, ids))
+        }
+
+        #[test]
+        fn w34_2_article_identity_digest() {
+            // hash('sha256', "a:1:<m>:5\nb:2:<n>:7") after sorting.
+            let sorted = crate::predb::sha256_hex_slice(b"a:1:<m>:5\nb:2:<n>:7");
+            assert_eq!(digest(&[b"b:2:<n>:7", b"a:1:<m>:5"]).unwrap(), sorted);
+            assert_eq!(digest(&[]).unwrap(), crate::predb::sha256_hex_slice(b""));
+            assert_eq!(
+                digest(&[b"x\nz", b"x"]).unwrap(),
+                crate::predb::sha256_hex_slice(b"x\nx\nz")
+            );
+            // Numeric-looking ids sort numerically in PHP: declined.
+            assert_eq!(digest(&[b"10", b"9:a"]), None);
+            assert_eq!(digest(&[b""]), None);
+            assert_eq!(call(0, &pack_ints(&[1, 3])), None);
+            assert_eq!(call(0, &with_strings(&[1, 2], &[b"abc"])), None);
+            assert_eq!(call(0, &pack_ints(&[-1])), None);
+            assert_eq!(call(0, &pack_ints(&[i64::MAX])), None);
+        }
+
+        fn owed(
+            last: Option<&str>,
+            cutoff: &str,
+            status: &str,
+            reason: Option<&str>,
+        ) -> Option<bool> {
+            let input = with_strings(
+                &[
+                    i64::from(last.is_some()),
+                    last.map_or(0, str::len) as i64,
+                    cutoff.len() as i64,
+                    status.len() as i64,
+                    i64::from(reason.is_some()),
+                    reason.map_or(0, str::len) as i64,
+                ],
+                &[
+                    last.unwrap_or("").as_bytes(),
+                    cutoff.as_bytes(),
+                    status.as_bytes(),
+                    reason.unwrap_or("").as_bytes(),
+                ],
+            );
+            call(1, &input).map(|b| ints(b)[0] == 1)
+        }
+
+        #[test]
+        fn w34_2_owed_partial_attempt() {
+            let cut = "2026-10-20 00:00:00";
+            let late = Some("2026-10-21 00:00:00");
+            let queued = std::str::from_utf8(PARTIAL_QUEUED).unwrap();
+            assert_eq!(owed(late, cut, "waiting_upload", None), Some(true));
+            assert_eq!(owed(late, cut, "waiting_upload", Some("x")), Some(true));
+            assert_eq!(
+                owed(
+                    late,
+                    cut,
+                    "waiting_upload",
+                    Some("Partial publication deferred: no")
+                ),
+                Some(false)
+            );
+            assert_eq!(owed(late, cut, "ready", Some(queued)), Some(true));
+            assert_eq!(owed(late, cut, "ready", None), Some(false));
+            assert_eq!(owed(Some(cut), cut, "waiting_upload", None), Some(true));
+            assert_eq!(
+                owed(Some("2026-10-19 23:59:59"), cut, "waiting_upload", None),
+                Some(false)
+            );
+            assert_eq!(owed(None, cut, "waiting_upload", None), Some(false));
+            assert_eq!(owed(None, "", "waiting_upload", None), Some(true));
+            assert_eq!(owed(late, cut, "pending", None), Some(false));
+            assert_eq!(owed(Some("10"), "9", "ready", None), None);
+            let mut bad = with_strings(&[0, 1, 0, 0, 0, 0], &[b"x"]);
+            assert_eq!(call(1, &bad), None);
+            bad = with_strings(&[2, 0, 0, 0, 0, 0], &[]);
+            assert_eq!(call(1, &bad), None);
+        }
+
+        #[test]
+        fn w34_2_capacity_and_claim_identity() {
+            let capacity = |p: i64, c: i64| call(2, &pack_ints(&[p, c])).map(|b| ints(b)[0]);
+            assert_eq!(capacity(0, 100), Some(1));
+            assert_eq!(capacity(90, 100), Some(0));
+            assert_eq!(capacity(89, 100), Some(1));
+            assert_eq!(capacity(0, 0), Some(0));
+            assert_eq!(capacity(-1, 0), Some(1));
+            assert_eq!(capacity(i64::MIN, i64::MIN), Some(1));
+            assert_eq!(capacity(i64::MAX - 33_554_433, i64::MAX), Some(1));
+            assert_eq!(capacity(0, 15), Some(1));
+            assert_eq!(capacity(14, 15), Some(0));
+            assert_eq!(call(2, &pack_ints(&[1])), None);
+            let claim = |id: &str, version: &str| {
+                call(
+                    3,
+                    &with_strings(
+                        &[id.len() as i64, version.len() as i64],
+                        &[id.as_bytes(), version.as_bytes()],
+                    ),
+                )
+                .map(ints)
+            };
+            assert_eq!(claim("42", "7"), Some(vec![42, 7]));
+            assert_eq!(claim("0", "-3"), Some(vec![0, -3]));
+            assert_eq!(
+                claim("9223372036854775807", "-9223372036854775808"),
+                Some(vec![i64::MAX, i64::MIN])
+            );
+            for bad in [
+                "",
+                "-",
+                "-0",
+                "007",
+                "1e3",
+                " 1",
+                "1 ",
+                "+1",
+                "9223372036854775808",
+                "12345678901234567890",
+            ] {
+                assert_eq!(claim(bad, "1"), None, "{bad}");
+            }
+            assert_eq!(call(3, &with_strings(&[1, 1], &[b"1"])), None);
+        }
+
+        #[test]
+        fn w34_2_checkpoint_transfer_and_lookup() {
+            let progress = |v: [i64; 5]| call(4, &pack_ints(&v)).map(ints);
+            assert_eq!(progress([0, 0, 0, 0, 10]), Some(vec![0, 0, 10, 0, 0]));
+            assert_eq!(progress([4, 2, 1, 0, 10]), Some(vec![0, 1, 6, 2, 0]));
+            assert_eq!(progress([10, 0, 1, 0, 10]), Some(vec![0, 1, 0, 0, 1]));
+            assert_eq!(progress([10, 0, 1, 1, 10]), Some(vec![1, 0, 0, 0, 0]));
+            assert_eq!(
+                progress([i64::MIN, i64::MIN, 0, 0, i64::MAX]),
+                Some(vec![0, 0, i64::MAX, 0, 0])
+            );
+            assert_eq!(progress([0, 0, 0, 0, i64::MIN]), Some(vec![0, 0, 0, 0, 1]));
+            assert_eq!(progress([0, 0, 2, 0, 0]), None);
+            let transfer = |v: [i64; 7]| call(5, &pack_ints(&v)).map(ints);
+            assert_eq!(
+                transfer([1200, 5000, 1000, 1024, 2, 1, 5]),
+                Some(vec![1200, 1024, 176, 1, 2024, 1, 0])
+            );
+            assert_eq!(
+                transfer([10, 100, 90, 20, 5, 1, 5]),
+                Some(vec![10, 20, -10, 1, 110, 0, 1])
+            );
+            assert_eq!(
+                transfer([-5, 0, -1, -9, 1, 0, 0]),
+                Some(vec![0, 0, 0, 0, 0, 0, -1])
+            );
+            assert_eq!(
+                transfer([0, i64::MAX, i64::MAX, 1, 1, 0, 0]),
+                Some(vec![0, 1, -1, 0, 0, 0, -1])
+            );
+            assert_eq!(transfer([0, 0, 0, 0, 1, 0, 3]), None);
+            assert_eq!(transfer([0, 0, 0, 0, 1, 2, 3]), None);
+            for (m, t, expected) in [(0, 0, 0), (1, 0, 1), (0, 2, 2), (-1, 7, 3)] {
+                assert_eq!(call(6, &pack_ints(&[m, t])).map(ints), Some(vec![expected]));
+            }
+            assert_eq!(call(6, &pack_ints(&[1, 1, 1])), None);
+        }
+
+        #[test]
+        fn w34_2_abi_sentinels() {
+            assert_eq!(call(7, &pack_ints(&[0, 0])), None);
+            assert_eq!(call(4, &pack_ints(&[0; 4])), None);
+            assert_eq!(call(0, &[]), None);
+            let input = pack_ints(&[1, 1]);
+            let mut out = [0x5au8; 16];
+            let run = |p: *const u8, len: usize, o: *mut u8, cap: usize| unsafe {
+                evaluate(6, p, len, o, cap)
+            };
+            assert_eq!(run(std::ptr::null(), 0, out.as_mut_ptr(), out.len()), -1);
+            assert_eq!(
+                run(input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), MAX_BYTES + 1, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), input.len(), out.as_mut_ptr(), MAX_BYTES + 1),
+                -1
+            );
+            assert_eq!(run(input.as_ptr(), input.len(), out.as_mut_ptr(), 7), -8);
+            assert!(out.iter().all(|b| *b == 0x5a));
+            assert_eq!(run(input.as_ptr(), input.len(), out.as_mut_ptr(), 8), 8);
+            assert_eq!(i64::from_ne_bytes(out[..8].try_into().unwrap()), 3);
+            let mut shared = [0u8; 32];
+            shared[..16].copy_from_slice(&input);
+            let p = shared.as_mut_ptr();
+            assert_eq!(run(p, 16, unsafe { p.add(8) }, 16), -1);
+        }
+    }
+}
+
+/// Evaluate one Wave 34.2 helper over packed native-endian `i64` slots followed
+/// by any variable-length string bytes. Returns the byte count written, the
+/// negated required capacity when `output` is too small (nothing written), or -1
+/// when the input is malformed, outside the contract or declined.
+///
+/// # Safety
+/// Both ranges must be live, disjoint readable/writable allocations. Pointers must
+/// be non-null even for zero lengths; arithmetic checks cannot prove provenance.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w34_candidate_repository_nfo_processor(
+    operation: u32,
+    input: *const u8,
+    length: usize,
+    output: *mut u8,
+    capacity: usize,
+) -> i64 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        wave34_candidate_repository_nfo_processor::evaluate(
+            operation, input, length, output, capacity,
+        )
+    }))
+    .unwrap_or(-1)
+}
