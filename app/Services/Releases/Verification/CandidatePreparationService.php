@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Verification;
 
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Database\Connection;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
@@ -15,7 +17,90 @@ final class CandidatePreparationService
 {
     private const WAITING_BATCH_SIZE = 25;
 
+    public const string FFI_CDEF = 'int64_t nntmux_w33_release_verification_preparation(uint32_t operation,const char *input,size_t length,char *output,size_t capacity);';
+
+    private const int NATIVE_MAX_BYTES = 16777216;
+
+    /**
+     * Rust stays opt-in: the FFI round trip is slower than these PHP helpers (< 1.5x); see
+     * tests/Unit/RustReleaseVerificationPreparationParityTest.php.
+     */
+    private const bool RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useRustFfi = null;
+
     public function __construct(private readonly ManifestStore $store, private readonly CandidateHeaderInventory $inventory) {}
+
+    public static function setUseRustFfi(?bool $use): void
+    {
+        self::$useRustFfi = $use;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? self::RUST_FFI_DEFAULT;
+    }
+
+    /** The stored assessment reason: at most $maxBytes bytes, never splitting a UTF-8 sequence. */
+    public static function truncateAssessmentReason(?string $reason, int $maxBytes = 2000): string
+    {
+        return self::usesRustFfi() ? self::truncateAssessmentReasonNative($reason, $maxBytes) : self::truncateAssessmentReasonPhp($reason, $maxBytes);
+    }
+
+    public static function truncateAssessmentReasonPhp(?string $reason, int $maxBytes = 2000): string
+    {
+        return mb_strcut($reason ?? '', 0, $maxBytes, 'UTF-8');
+    }
+
+    public static function truncateAssessmentReasonNative(?string $reason, int $maxBytes = 2000): string
+    {
+        // A negative length counts back from the end, which only mb_strcut() itself implements.
+        $result = $maxBytes < 0 ? null : self::evaluateNative(3, pack('q', $maxBytes).($reason ?? ''));
+
+        return $result !== null && \strlen($result) <= $maxBytes && str_starts_with($reason ?? '', $result)
+            ? $result : self::truncateAssessmentReasonPhp($reason, $maxBytes);
+    }
+
+    /**
+     * Shared Wave 33.2 bridge over packed native-endian 8-byte slots. Returns the raw output bytes, or
+     * null when Rust declined the input or is unavailable.
+     */
+    public static function evaluateNative(int $operation, string $input): ?string
+    {
+        try {
+            if ($operation < 0 || $input === '' || \strlen($input) > self::NATIVE_MAX_BYTES) {
+                return null;
+            }
+            $ffi = RustPipelineLibrary::resolveDomain('nfo', self::FFI_CDEF, getenv('NNTMUX_PIPELINE_FFI_LIB') ?: null);
+            if (! $ffi instanceof FFI) {
+                return null;
+            }
+            $capacity = 0;
+            $output = RustPipelineLibrary::obtainScratch($ffi, min(self::NATIVE_MAX_BYTES, max(256, \strlen($input))), $capacity);
+            if ($output === null) {
+                return null;
+            }
+            $capacity = min($capacity, self::NATIVE_MAX_BYTES);
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w33_release_verification_preparation($operation, $input, \strlen($input), $output, $capacity);
+            if (\is_int($written) && $written < -1 && -$written > $capacity && -$written <= self::NATIVE_MAX_BYTES) {
+                $output = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($output === null) {
+                    return null;
+                }
+                $capacity = min($capacity, self::NATIVE_MAX_BYTES);
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w33_release_verification_preparation($operation, $input, \strlen($input), $output, $capacity);
+            }
+            if (! \is_int($written) || $written < 0 || $written > $capacity) {
+                return null;
+            }
+
+            return $written === 0 ? '' : FFI::string($output, $written);
+        } catch (Throwable) {
+            return null;
+        }
+    }
 
     /**
      * @param  (callable(bool): bool)|null  $preferPending
@@ -100,7 +185,7 @@ final class CandidatePreparationService
                             $diagnostics?->finish('read_assessment', $assessmentStarted);
                         }
                         if ($assessment['status'] === 'waiting_upload') {
-                            $reason = mb_strcut($assessment['reason'] ?? '', 0, 2000, 'UTF-8');
+                            $reason = self::truncateAssessmentReason($assessment['reason'] ?? null);
                             if ($waitingReason !== $reason) {
                                 $changed += $this->flushWaiting($waiting, $waitingReason, $cutoff, $diagnostics);
                                 $waitingReason = $reason;
@@ -118,11 +203,12 @@ final class CandidatePreparationService
                         try {
                             $values = ['status' => $assessment['status'], 'header_check_pending' => false];
                             // Preserve a valid candidate's NNTP backoff and diagnostic reason.
-                            if ($assessment['status'] !== 'ready') {
-                                $values['reason'] = mb_strcut($assessment['reason'] ?? '', 0, 2000, 'UTF-8');
-                                if ($assessment['status'] === 'unknown') {
-                                    $values['next_attempt_at'] = now()->addSeconds((int) config('release_verification.retry_seconds'));
-                                }
+                            $shape = PreparedCandidateUpdate::classifyUpdateShape($assessment['status'] !== 'ready', $assessment['status'] === 'unknown');
+                            if (($shape & PreparedCandidateUpdate::SHAPE_REASON) !== 0) {
+                                $values['reason'] = self::truncateAssessmentReason($assessment['reason'] ?? null);
+                            }
+                            if (($shape & PreparedCandidateUpdate::SHAPE_RETRY) !== 0) {
+                                $values['next_attempt_at'] = now()->addSeconds((int) config('release_verification.retry_seconds'));
                             }
                             $query = DB::table('release_verification_candidates')->where('id', $row->id)
                                 ->where('version', $row->version)->where('manifest_path', $row->manifest_path)

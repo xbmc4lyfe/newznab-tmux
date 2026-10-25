@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Console\Commands;
 
+use App\Services\Releases\Verification\CandidatePreparationService;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Services\Releases\Verification\LeaseLostException;
 use App\Services\Releases\Verification\PublicationForwarderDiagnostics;
@@ -59,6 +60,13 @@ class ForwardVerifiedPublications extends Command
     /** Wait steps between looks at the outbox for a filled batch (about a quarter second). */
     private const int LINGER_FILL_STEPS = 5;
 
+    public const string FFI_CDEF = CandidatePreparationService::FFI_CDEF;
+
+    /** Rust stays opt-in: the FFI round trip is slower than these PHP helpers (< 1.5x). */
+    private const bool RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useRustFfi = null;
+
     protected $signature = 'releases:forward-verified-publications {--slot=1 : Forwarder number, 1 to RELEASE_VERIFICATION_PUBLISH_FORWARDERS} {--max-seconds=0 : Stop taking work after this duration; zero uses RELEASE_VERIFICATION_PUBLISH_FORWARDER_SECONDS} {--passes=0 : Stop after this many loop passes (zero runs until the deadline)} {--diagnostics : Log a bounded run summary}';
 
     protected $description = 'Publish verified candidates handed off by this host\'s workers to the primary in batches';
@@ -102,6 +110,73 @@ class ForwardVerifiedPublications extends Command
 
     /** @var array<string, int> Unix seconds of each entry's last lease renewal, by file name. */
     private array $beats = [];
+
+    public static function setUseRustFfi(?bool $use): void
+    {
+        self::$useRustFfi = $use;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? self::RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Milliseconds a batch may still linger for its oldest due entry: no longer than the linger, never past the
+     * entry's age limit less a margin (half the limit for short limits), and never past the moment a backed-off
+     * entry becomes due. Zero or less sends at once.
+     */
+    public static function computeLingerBudgetMs(float $wallSeconds, float $oldestSeconds, ?float $wakeSeconds, int $lingerMs, float $maxAgeSeconds,
+        float $marginSeconds = self::LINGER_AGE_MARGIN_SECONDS): float
+    {
+        return self::usesRustFfi()
+            ? self::computeLingerBudgetMsNative($wallSeconds, $oldestSeconds, $wakeSeconds, $lingerMs, $maxAgeSeconds, $marginSeconds)
+            : self::computeLingerBudgetMsPhp($wallSeconds, $oldestSeconds, $wakeSeconds, $lingerMs, $maxAgeSeconds, $marginSeconds);
+    }
+
+    public static function computeLingerBudgetMsPhp(float $wallSeconds, float $oldestSeconds, ?float $wakeSeconds, int $lingerMs, float $maxAgeSeconds,
+        float $marginSeconds = self::LINGER_AGE_MARGIN_SECONDS): float
+    {
+        $margin = min($marginSeconds, $maxAgeSeconds / 2);
+        $age = max(0.0, $wallSeconds - $oldestSeconds);
+        $budget = (min($lingerMs / 1000.0, $maxAgeSeconds - $margin) - $age) * 1000.0;
+        if ($wakeSeconds !== null) {
+            $budget = min($budget, ($wakeSeconds - $wallSeconds) * 1000.0);
+        }
+
+        return $budget;
+    }
+
+    public static function computeLingerBudgetMsNative(float $wallSeconds, float $oldestSeconds, ?float $wakeSeconds, int $lingerMs, float $maxAgeSeconds,
+        float $marginSeconds = self::LINGER_AGE_MARGIN_SECONDS): float
+    {
+        $result = CandidatePreparationService::evaluateNative(0, pack('d2', $wallSeconds, $oldestSeconds).pack('q', (int) ($wakeSeconds !== null))
+            .pack('d', $wakeSeconds ?? 0.0).pack('q', $lingerMs).pack('d2', $maxAgeSeconds, $marginSeconds));
+        $budget = $result !== null && \strlen($result) === 8 ? (unpack('d', $result)[1] ?? null) : null;
+
+        return \is_float($budget) ? $budget : self::computeLingerBudgetMsPhp($wallSeconds, $oldestSeconds, $wakeSeconds, $lingerMs, $maxAgeSeconds, $marginSeconds);
+    }
+
+    /** Seconds before a requeued entry is due again: the explicit delay, else exponential backoff capped at $maxBackoff. */
+    public static function computeRetryBackoffSeconds(int $failures, ?float $explicitDelay = null, float $maxBackoff = 30.0): float
+    {
+        return self::usesRustFfi()
+            ? self::computeRetryBackoffSecondsNative($failures, $explicitDelay, $maxBackoff)
+            : self::computeRetryBackoffSecondsPhp($failures, $explicitDelay, $maxBackoff);
+    }
+
+    public static function computeRetryBackoffSecondsPhp(int $failures, ?float $explicitDelay = null, float $maxBackoff = 30.0): float
+    {
+        return $explicitDelay ?? min($maxBackoff, 2.0 ** ($failures + 1));
+    }
+
+    public static function computeRetryBackoffSecondsNative(int $failures, ?float $explicitDelay = null, float $maxBackoff = 30.0): float
+    {
+        $result = CandidatePreparationService::evaluateNative(1, pack('q2', $failures, (int) ($explicitDelay !== null)).pack('d2', $explicitDelay ?? 0.0, $maxBackoff));
+        $backoff = $result !== null && \strlen($result) === 8 ? (unpack('d', $result)[1] ?? null) : null;
+
+        return \is_float($backoff) ? $backoff : self::computeRetryBackoffSecondsPhp($failures, $explicitDelay, $maxBackoff);
+    }
 
     public function handle(RemoteReleasePublisher $publisher): int
     {
@@ -311,12 +386,8 @@ class ForwardVerifiedPublications extends Command
         if ($survey['urgent'] || $survey['retried'] || $survey['oldest'] === null || $survey['fresh'] >= $this->limit || $this->outboxFull()) {
             return true;
         }
-        $age = max(0.0, $wall - $survey['oldest']);
         // Never past the moment a backed-off entry becomes due or any waiting entry nears its age limit.
-        $budget = (min($this->lingerMs / 1000.0, $maxAge - $margin) - $age) * 1000.0;
-        if ($survey['wake'] !== null) {
-            $budget = min($budget, ($survey['wake'] - $wall) * 1000.0);
-        }
+        $budget = self::computeLingerBudgetMs($wall, $survey['oldest'], $survey['wake'], $this->lingerMs, $maxAge);
         if ($budget <= 0.0) {
             return true;
         }
@@ -732,7 +803,7 @@ class ForwardVerifiedPublications extends Command
             return;
         }
         $this->diagnostics?->requeued();
-        $this->outbox->requeue($entry->withFailure($now + ($delay ?? min(30.0, 2.0 ** ($entry->failures() + 1))), $counted,
+        $this->outbox->requeue($entry->withFailure($now + self::computeRetryBackoffSeconds($entry->failures(), $delay), $counted,
             heartbeatAt: isset($this->beats[$entry->name]) ? (float) $this->beats[$entry->name] : null));
     }
 

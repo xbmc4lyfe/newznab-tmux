@@ -23550,3 +23550,492 @@ pub unsafe extern "C" fn nntmux_w32_nzb_sync_verification_publication(
     }))
     .unwrap_or(-1)
 }
+
+/// Wave 33.2 pure helpers for release verification preparation: the forwarder's
+/// linger budget and retry backoff, the terminal-scratch cursor checkpoint, UTF-8
+/// byte-safe reason truncation, prepared update shapes and the publication
+/// prelock summary. Inputs and outputs are packed native-endian 8-byte slots
+/// (`i64` or `f64` per operation), so floats cross the boundary bit-exactly;
+/// truncation appends the raw reason bytes after its single `i64` slot.
+mod wave33_release_verification_preparation {
+    use super::{nfo_abi_range, yenc_ranges_overlap};
+    use std::slice;
+
+    pub(super) const MAX_BYTES: usize = 16 * 1024 * 1024;
+
+    /// PHP 8.5 `min($a, $b)` on floats: `$b` wins ties, signed zeros and NaN.
+    fn php_min(a: f64, b: f64) -> f64 {
+        if a < b { a } else { b }
+    }
+
+    /// PHP 8.5 `max($a, $b)` on floats: `$a` wins ties; `$b` wins NaN.
+    fn php_max(a: f64, b: f64) -> f64 {
+        if a >= b { a } else { b }
+    }
+
+    pub(super) fn linger_budget_ms(
+        wall: f64,
+        oldest: f64,
+        wake: Option<f64>,
+        linger_ms: i64,
+        max_age: f64,
+        margin: f64,
+    ) -> f64 {
+        let margin = php_min(margin, max_age / 2.0);
+        let age = php_max(0.0, wall - oldest);
+        let budget = (php_min(linger_ms as f64 / 1000.0, max_age - margin) - age) * 1000.0;
+        match wake {
+            Some(wake) => php_min(budget, (wake - wall) * 1000.0),
+            None => budget,
+        }
+    }
+
+    pub(super) fn retry_backoff_seconds(
+        failures: i64,
+        delay: Option<f64>,
+        max_backoff: f64,
+    ) -> f64 {
+        if let Some(delay) = delay {
+            return delay;
+        }
+        // PHP promotes an overflowing `$failures + 1` to float.
+        let exponent = failures
+            .checked_add(1)
+            .map_or(failures as f64 + 1.0, |e| e as f64);
+        php_min(max_backoff, 2.0f64.powf(exponent))
+    }
+
+    /// The checkpoint a terminal-scratch pass persists: `[after, ceiling]`, both
+    /// zero once the host's inventory was scanned through to its ceiling.
+    pub(super) fn scratch_cursor(
+        after: i64,
+        ceiling: i64,
+        max_host_id: i64,
+        exhausted: bool,
+        fetched: i64,
+        last_processed: i64,
+    ) -> [i64; 2] {
+        let after = after.max(0).max(last_processed);
+        let mut ceiling = ceiling.max(0);
+        if ceiling == 0 {
+            ceiling = max_host_id;
+        }
+        if (!exhausted && fetched < 100) || after >= ceiling {
+            return [0, 0];
+        }
+        [after, ceiling]
+    }
+
+    /// `mb_strcut($reason, 0, $max, 'UTF-8')` for a non-negative `$max`.
+    pub(super) fn truncate_reason(reason: &[u8], max: usize) -> &[u8] {
+        if max >= reason.len() {
+            return reason;
+        }
+        let mut end = max;
+        while end > 0 && reason[end] & 0xC0 == 0x80 {
+            end -= 1;
+        }
+        &reason[..end]
+    }
+
+    pub(super) fn update_shape(has_reason: bool, has_next_attempt: bool) -> i64 {
+        i64::from(has_reason) | (i64::from(has_next_attempt) << 1)
+    }
+
+    /// `[size_known, archive_known, policy, coverage, count_present, count, locked_steps]`
+    /// with policy 0 unknown / 1 accepted / 2 rejected and coverage 0 unknown /
+    /// 1 skipped / 2 unusable / 3 none / 4 required.
+    pub(super) fn prelock_summary(
+        size: Option<i64>,
+        archived: bool,
+        policy_known: bool,
+        rejected: bool,
+        coverage_known: bool,
+        count: Option<i64>,
+    ) -> [i64; 7] {
+        let policy = match (policy_known, rejected) {
+            (false, _) => 0,
+            (true, false) => 1,
+            (true, true) => 2,
+        };
+        let coverage = match (coverage_known, count) {
+            (true, None) => 2,
+            (true, Some(c)) if c <= 0 => 3,
+            (true, Some(_)) => 4,
+            (false, _) if policy == 2 => 1,
+            (false, _) => 0,
+        };
+        let count = if coverage_known { count } else { None };
+        let steps = i64::from(size.is_none())
+            + i64::from(!archived)
+            + i64::from(!policy_known)
+            + i64::from(coverage == 0);
+        [
+            i64::from(size.is_some()),
+            i64::from(archived),
+            policy,
+            coverage,
+            i64::from(count.is_some()),
+            count.map_or(0, |c| c.max(0)),
+            steps,
+        ]
+    }
+
+    fn int(slots: &[[u8; 8]], index: usize) -> i64 {
+        i64::from_ne_bytes(slots[index])
+    }
+
+    fn float(slots: &[[u8; 8]], index: usize) -> f64 {
+        f64::from_ne_bytes(slots[index])
+    }
+
+    fn flag(slots: &[[u8; 8]], index: usize) -> Option<bool> {
+        match int(slots, index) {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+
+    fn optional<T>(present: Option<bool>, value: T) -> Option<Option<T>> {
+        present.map(|p| p.then_some(value))
+    }
+
+    fn pack_ints(values: &[i64]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_ne_bytes()).collect()
+    }
+
+    fn compute(operation: u32, bytes: &[u8]) -> Option<Vec<u8>> {
+        let slot_count = match operation {
+            0 => 7,
+            1 => 4,
+            2 => 6,
+            3 => 1,
+            4 => 2,
+            5 => 8,
+            _ => return None,
+        };
+        let head = slot_count * 8;
+        if bytes.len() < head || (operation != 3 && bytes.len() != head) {
+            return None;
+        }
+        let slots: Vec<[u8; 8]> = bytes[..head]
+            .chunks_exact(8)
+            .map(|c| c.try_into().unwrap_or([0; 8]))
+            .collect();
+        match operation {
+            0 => {
+                let wake = optional(flag(&slots, 2), float(&slots, 3))?;
+                let budget = linger_budget_ms(
+                    float(&slots, 0),
+                    float(&slots, 1),
+                    wake,
+                    int(&slots, 4),
+                    float(&slots, 5),
+                    float(&slots, 6),
+                );
+                Some(budget.to_ne_bytes().to_vec())
+            }
+            1 => {
+                let delay = optional(flag(&slots, 1), float(&slots, 2))?;
+                let backoff = retry_backoff_seconds(int(&slots, 0), delay, float(&slots, 3));
+                Some(backoff.to_ne_bytes().to_vec())
+            }
+            2 => Some(pack_ints(&scratch_cursor(
+                int(&slots, 0),
+                int(&slots, 1),
+                int(&slots, 2),
+                flag(&slots, 3)?,
+                int(&slots, 4),
+                int(&slots, 5),
+            ))),
+            3 => {
+                let max = usize::try_from(int(&slots, 0)).ok()?;
+                Some(truncate_reason(&bytes[head..], max).to_vec())
+            }
+            4 => Some(pack_ints(&[update_shape(
+                flag(&slots, 0)?,
+                flag(&slots, 1)?,
+            )])),
+            _ => Some(pack_ints(&prelock_summary(
+                optional(flag(&slots, 0), int(&slots, 1))?,
+                flag(&slots, 2)?,
+                flag(&slots, 3)?,
+                flag(&slots, 4)?,
+                flag(&slots, 5)?,
+                optional(flag(&slots, 6), int(&slots, 7))?,
+            ))),
+        }
+    }
+
+    /// # Safety
+    /// See [`super::nntmux_w33_release_verification_preparation`].
+    pub(super) unsafe fn evaluate(
+        operation: u32,
+        input: *const u8,
+        length: usize,
+        output: *mut u8,
+        capacity: usize,
+    ) -> i64 {
+        if !nfo_abi_range(input, length, false)
+            || !nfo_abi_range(output, capacity, false)
+            || length > MAX_BYTES
+            || capacity > MAX_BYTES
+            || yenc_ranges_overlap(input as usize, length, output as usize, capacity)
+        {
+            return -1;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, length) };
+        let Some(result) = compute(operation, bytes) else {
+            return -1;
+        };
+        let needed = result.len() as i64;
+        if result.len() > capacity {
+            return -needed;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), output, result.len()) };
+        needed
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn slots_i(values: &[i64]) -> Vec<u8> {
+            pack_ints(values)
+        }
+
+        fn call(operation: u32, input: &[u8]) -> Option<Vec<u8>> {
+            let mut out = vec![0xa5u8; 4096];
+            // A zero-length input still needs a live pointer.
+            let probe = [0u8; 1];
+            let pointer = if input.is_empty() {
+                probe.as_ptr()
+            } else {
+                input.as_ptr()
+            };
+            let written =
+                unsafe { evaluate(operation, pointer, input.len(), out.as_mut_ptr(), out.len()) };
+            if written < 0 {
+                assert_eq!(written, -1);
+                return None;
+            }
+            Some(out[..written as usize].to_vec())
+        }
+
+        fn f(bytes: Vec<u8>) -> f64 {
+            f64::from_ne_bytes(bytes[..8].try_into().unwrap())
+        }
+
+        fn ints(bytes: Vec<u8>) -> Vec<i64> {
+            bytes
+                .chunks_exact(8)
+                .map(|c| i64::from_ne_bytes(c.try_into().unwrap()))
+                .collect()
+        }
+
+        fn linger(
+            wall: f64,
+            oldest: f64,
+            wake: Option<f64>,
+            ms: i64,
+            age: f64,
+            margin: f64,
+        ) -> Vec<u8> {
+            let mut v = Vec::new();
+            v.extend(wall.to_ne_bytes());
+            v.extend(oldest.to_ne_bytes());
+            v.extend(i64::from(wake.is_some()).to_ne_bytes());
+            v.extend(wake.unwrap_or(0.0).to_ne_bytes());
+            v.extend(ms.to_ne_bytes());
+            v.extend(age.to_ne_bytes());
+            v.extend(margin.to_ne_bytes());
+            v
+        }
+
+        #[test]
+        fn w33_2_linger_budget() {
+            assert_eq!(
+                f(call(0, &linger(100.0, 99.5, None, 2000, 240.0, 60.0)).unwrap()),
+                1500.0
+            );
+            assert_eq!(
+                f(call(0, &linger(100.0, 99.5, Some(100.25), 2000, 240.0, 60.0)).unwrap()),
+                250.0
+            );
+            // Short age limits keep half of the limit as their margin.
+            assert_eq!(
+                f(call(0, &linger(100.0, 100.0, None, 60000, 30.0, 60.0)).unwrap()),
+                15000.0
+            );
+            // A clock that ran backwards never lengthens the wait.
+            assert_eq!(
+                f(call(0, &linger(100.0, 120.0, None, 500, 240.0, 60.0)).unwrap()),
+                500.0
+            );
+            assert!(f(call(0, &linger(100.0, 50.0, None, 500, 240.0, 60.0)).unwrap()) < 0.0);
+            assert!(f(call(0, &linger(f64::NAN, 1.0, None, 500, 240.0, 60.0)).unwrap()).is_nan());
+            let mut bad = linger(1.0, 1.0, Some(1.0), 1, 1.0, 1.0);
+            bad[16] = 2;
+            assert_eq!(call(0, &bad), None);
+        }
+
+        #[test]
+        fn w33_2_retry_backoff() {
+            let input = |failures: i64, delay: Option<f64>, max: f64| {
+                let mut v = slots_i(&[failures, i64::from(delay.is_some())]);
+                v.extend(delay.unwrap_or(0.0).to_ne_bytes());
+                v.extend(max.to_ne_bytes());
+                v
+            };
+            for (failures, delay, max, expected) in [
+                (0, None, 30.0, 2.0),
+                (1, None, 30.0, 4.0),
+                (3, None, 30.0, 16.0),
+                (4, None, 30.0, 30.0),
+                (-1, None, 30.0, 1.0),
+                (-3000, None, 30.0, 0.0),
+                (i64::MAX, None, 30.0, 30.0),
+                (2, Some(1.0), 30.0, 1.0),
+                (2, Some(-5.5), 30.0, -5.5),
+            ] {
+                assert_eq!(
+                    f(call(1, &input(failures, delay, max)).unwrap()),
+                    expected,
+                    "{failures}"
+                );
+            }
+            assert_eq!(
+                f(call(1, &input(i64::MAX, None, f64::INFINITY)).unwrap()),
+                f64::INFINITY
+            );
+            assert_eq!(call(1, &slots_i(&[0, 3, 0, 0])), None);
+        }
+
+        #[test]
+        fn w33_2_scratch_cursor() {
+            for (input, expected) in [
+                ([0, 0, 500, 0, 100, 100], [100, 500]),
+                ([0, 0, 500, 0, 40, 40], [0, 0]),
+                ([0, 0, 500, 1, 40, 40], [40, 500]),
+                ([10, 50, 900, 0, 100, 50], [0, 0]),
+                ([-5, -9, 0, 1, 0, 0], [0, 0]),
+                ([-5, -9, -1, 1, 0, -7], [0, 0]),
+                ([3, 0, 9, 1, 0, -7], [3, 9]),
+                ([7, 300, 900, 0, 100, 3], [7, 300]),
+            ] {
+                assert_eq!(
+                    ints(call(2, &slots_i(&input)).unwrap()),
+                    expected,
+                    "{input:?}"
+                );
+            }
+            assert_eq!(call(2, &slots_i(&[0, 0, 0, 2, 0, 0])), None);
+        }
+
+        #[test]
+        fn w33_2_reason_truncation() {
+            let cut = |max: i64, reason: &[u8]| {
+                let mut v = slots_i(&[max]);
+                v.extend_from_slice(reason);
+                call(3, &v)
+            };
+            assert_eq!(cut(2000, b"plain").unwrap(), b"plain");
+            assert_eq!(cut(0, b"plain").unwrap(), b"");
+            assert_eq!(
+                cut(3, "a\u{e9}\u{e9}".as_bytes()).unwrap(),
+                "a\u{e9}".as_bytes()
+            );
+            assert_eq!(cut(2, "a\u{e9}".as_bytes()).unwrap(), b"a");
+            assert_eq!(
+                cut(4, "\u{1f600}x".as_bytes()).unwrap(),
+                "\u{1f600}".as_bytes()
+            );
+            assert_eq!(cut(3, "\u{1f600}".as_bytes()).unwrap(), b"");
+            assert_eq!(cut(2, b"\x80\x80\x80").unwrap(), b"");
+            assert_eq!(cut(1, b"\xff\x80").unwrap(), b"");
+            assert_eq!(cut(1, b"\xff\x41").unwrap(), b"\xff");
+            assert_eq!(cut(5, b"").unwrap(), b"");
+            assert_eq!(cut(-1, b"abc"), None);
+            assert_eq!(call(3, &[1, 2, 3]), None);
+        }
+
+        #[test]
+        fn w33_2_update_shape_and_prelock() {
+            for (a, b, expected) in [(0, 0, 0), (1, 0, 1), (0, 1, 2), (1, 1, 3)] {
+                assert_eq!(ints(call(4, &slots_i(&[a, b])).unwrap()), [expected]);
+            }
+            assert_eq!(call(4, &slots_i(&[1, -1])), None);
+            assert_eq!(call(4, &slots_i(&[1, 1, 1])), None);
+            for (input, expected) in [
+                ([1, 10, 1, 1, 0, 1, 1, 3], [1, 1, 1, 4, 1, 3, 0]),
+                ([0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 4]),
+                ([1, 5, 1, 1, 1, 0, 0, 0], [1, 1, 2, 1, 0, 0, 0]),
+                ([1, 5, 1, 1, 0, 1, 0, 9], [1, 1, 1, 2, 0, 0, 0]),
+                ([1, 5, 0, 1, 0, 1, 1, 0], [1, 0, 1, 3, 1, 0, 1]),
+                ([1, 5, 1, 1, 0, 1, 1, -4], [1, 1, 1, 3, 1, 0, 0]),
+                ([0, 7, 1, 0, 1, 0, 1, 2], [0, 1, 0, 0, 0, 0, 3]),
+            ] {
+                assert_eq!(
+                    ints(call(5, &slots_i(&input)).unwrap()),
+                    expected,
+                    "{input:?}"
+                );
+            }
+            assert_eq!(call(5, &slots_i(&[2, 0, 0, 0, 0, 0, 0, 0])), None);
+        }
+
+        #[test]
+        fn w33_2_abi_sentinels() {
+            assert_eq!(call(6, &slots_i(&[0, 0])), None);
+            assert_eq!(call(0, &slots_i(&[0; 6])), None);
+            assert_eq!(call(0, &[]), None);
+            let input = slots_i(&[1, 1]);
+            let mut out = [0x5au8; 16];
+            let run = |p: *const u8, len: usize, o: *mut u8, cap: usize| unsafe {
+                evaluate(4, p, len, o, cap)
+            };
+            assert_eq!(run(std::ptr::null(), 0, out.as_mut_ptr(), out.len()), -1);
+            assert_eq!(
+                run(input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), MAX_BYTES + 1, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            assert_eq!(run(input.as_ptr(), input.len(), out.as_mut_ptr(), 7), -8);
+            assert!(out.iter().all(|b| *b == 0x5a));
+            assert_eq!(run(input.as_ptr(), input.len(), out.as_mut_ptr(), 8), 8);
+            assert_eq!(i64::from_ne_bytes(out[..8].try_into().unwrap()), 3);
+            let mut shared = [0u8; 32];
+            shared[..16].copy_from_slice(&input);
+            let p = shared.as_mut_ptr();
+            assert_eq!(run(p, 16, unsafe { p.add(8) }, 16), -1);
+        }
+    }
+}
+
+/// Evaluate one Wave 33.2 helper over packed native-endian 8-byte slots. Returns
+/// the byte count written, the negated required capacity when `output` is too
+/// small (nothing written), or -1 when the input is malformed or outside the
+/// contract.
+///
+/// # Safety
+/// Both ranges must be live, disjoint readable/writable allocations. Pointers must
+/// be non-null even for zero lengths; arithmetic checks cannot prove provenance.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w33_release_verification_preparation(
+    operation: u32,
+    input: *const u8,
+    length: usize,
+    output: *mut u8,
+    capacity: usize,
+) -> i64 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        wave33_release_verification_preparation::evaluate(
+            operation, input, length, output, capacity,
+        )
+    }))
+    .unwrap_or(-1)
+}
