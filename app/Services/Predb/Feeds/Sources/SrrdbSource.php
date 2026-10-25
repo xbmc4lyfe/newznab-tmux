@@ -5,9 +5,11 @@ declare(strict_types=1);
 namespace App\Services\Predb\Feeds\Sources;
 
 use App\Services\Predb\Feeds\PredbFeedEntry;
+use App\Support\RustPipelineLibrary;
 use Carbon\CarbonImmutable;
 use DateTimeImmutable;
 use DateTimeZone;
+use FFI;
 use RuntimeException;
 use Throwable;
 
@@ -20,6 +22,31 @@ final class SrrdbSource extends HttpFeedSource
 {
     /** srrDB returns a fixed 45 results per search page. */
     public const int PAGE_SIZE = 45;
+
+    /**
+     * Production default stays false: the paired benchmark in
+     * tests/Unit/RustReleaseModelDetailsFeedSourceParityTest.php is below 1.5x.
+     */
+    public const bool RUST_FFI_DEFAULT = false;
+
+    private const string SRRDB_PAGE_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w374_srrdb_page_plan(
+            int64_t page,
+            const char *endpoint,
+            size_t endpoint_len,
+            char *out_buf,
+            size_t out_cap
+        );
+        C;
+
+    /** intdiv(PHP_INT_MAX, PAGE_SIZE) + 1: the last page whose skip offset fits an int. */
+    private const int SRRDB_MAX_PLANNED_PAGE = 204963823041217241;
+
+    private const string SRRDB_FIELD_SEPARATOR = "\x1F";
+
+    private static ?bool $srrdbUseRustFfi = null;
+
+    private static FFI|false|null $srrdbFfi = null;
 
     /** @var array<string, DateTimeZone|false> Zones whose local dates may skip Carbon's parser. */
     private static array $zones = [];
@@ -128,6 +155,100 @@ final class SrrdbSource extends HttpFeedSource
 
         try {
             return CarbonImmutable::createFromFormat('Y-m-d H:i:s', trim($value), $this->timezone)?->utc();
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    public static function useRustFfi(?bool $enabled = true): void
+    {
+        self::$srrdbUseRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$srrdbUseRustFfi ?? self::RUST_FFI_DEFAULT;
+    }
+
+    public static function resetRustFfi(): void
+    {
+        self::$srrdbUseRustFfi = null;
+        self::$srrdbFfi = null;
+    }
+
+    /**
+     * Plans the request for a page: the page clamped to 1 and to the last page whose skip offset
+     * fits an int, that offset and the pageUrl() it produces.
+     *
+     * @return array{url: string, page: int, skip: int, clamped: bool}
+     */
+    public static function planSrrdbPage(string $endpoint, int $page): array
+    {
+        return self::usesRustFfi() ? self::planSrrdbPageNative($endpoint, $page) : self::planSrrdbPagePhp($endpoint, $page);
+    }
+
+    /**
+     * @return array{url: string, page: int, skip: int, clamped: bool}
+     */
+    private static function planSrrdbPageNative(string $endpoint, int $page): array
+    {
+        $output = self::callSrrdbNative([$page, $endpoint, strlen($endpoint)], strlen($endpoint) + 64);
+        // The URL is the last field and may itself contain the separator.
+        $fields = $output === null ? [] : explode(self::SRRDB_FIELD_SEPARATOR, $output, 4);
+        if (count($fields) !== 4) {
+            return self::planSrrdbPagePhp($endpoint, $page);
+        }
+
+        return ['url' => $fields[3], 'page' => (int) $fields[0], 'skip' => (int) $fields[1], 'clamped' => $fields[2] === '1'];
+    }
+
+    /**
+     * @return array{url: string, page: int, skip: int, clamped: bool}
+     */
+    private static function planSrrdbPagePhp(string $endpoint, int $page): array
+    {
+        $planned = max(1, min(self::SRRDB_MAX_PLANNED_PAGE, $page));
+
+        return [
+            'url' => self::pageUrl($endpoint, $planned),
+            'page' => $planned,
+            'skip' => ($planned - 1) * self::PAGE_SIZE,
+            'clamped' => $planned !== $page,
+        ];
+    }
+
+    /**
+     * @param  list<int|string>  $args
+     */
+    private static function callSrrdbNative(array $args, int $hint): ?string
+    {
+        self::$srrdbFfi ??= RustPipelineLibrary::resolveDomain('metadata_w374', self::SRRDB_PAGE_FFI_CDEF) ?? false;
+        if (self::$srrdbFfi === false) {
+            return null;
+        }
+        $ffi = self::$srrdbFfi;
+
+        try {
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, $hint, $capacity);
+            if ($buffer === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w374_srrdb_page_plan(...[...$args, $buffer, $capacity]);
+            if (is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w374_srrdb_page_plan(...[...$args, $buffer, $capacity]);
+            }
+            if (! is_int($written) || $written < 0 || $written > $capacity) {
+                return null;
+            }
+
+            return FFI::string($buffer, $written);
         } catch (Throwable) {
             return null;
         }
