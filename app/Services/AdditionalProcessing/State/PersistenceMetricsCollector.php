@@ -17,6 +17,12 @@ final class PersistenceMetricsCollector
         int32_t nntmux_pmc_apply(int32_t event, int32_t has_scope, int64_t scope_id, int64_t arg_id, double arg_ms, int64_t *counters, size_t counter_count, double *milliseconds);
         C;
 
+    public const bool W466_RUST_FFI_DEFAULT = false;
+
+    public const string W466_FFI_CDEF = <<<'C'
+        int32_t nntmux_w466_pmc_apply_batch(const char *integers, size_t integers_len, const char *milliseconds, size_t milliseconds_len, size_t count, int32_t has_scope, int64_t scope_id, int64_t statements, double total_ms, int64_t requests, int64_t executions, int64_t *out, size_t out_count, double *out_ms);
+        C;
+
     public const int EVENT_DATABASE_STATEMENT = 0;
 
     public const int EVENT_SEARCH_SYNC_REQUEST = 1;
@@ -31,6 +37,14 @@ final class PersistenceMetricsCollector
     private static ?CData $counters = null;
 
     private static ?CData $milliseconds = null;
+
+    private static ?bool $w466RustFfi = null;
+
+    private static FFI|false|null $w466Ffi = null;
+
+    private static ?CData $w466Counters = null;
+
+    private static ?CData $w466Milliseconds = null;
 
     private ?int $releaseId = null;
 
@@ -54,6 +68,33 @@ final class PersistenceMetricsCollector
         }
 
         return self::$ffi === false ? null : self::$ffi;
+    }
+
+    private static function w466Ffi(): ?FFI
+    {
+        if (self::$w466Ffi === null) {
+            self::$w466Ffi = RustPipelineLibrary::resolveDomain('additional', self::W466_FFI_CDEF) ?? false;
+        }
+
+        return self::$w466Ffi === false ? null : self::$w466Ffi;
+    }
+
+    public static function useW466RustFfi(?bool $enabled): void
+    {
+        self::$w466RustFfi = $enabled;
+    }
+
+    public static function usesW466RustFfi(): bool
+    {
+        return self::$w466RustFfi ?? self::W466_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW466RustFfi(): void
+    {
+        self::$w466RustFfi = null;
+        self::$w466Ffi = null;
+        self::$w466Counters = null;
+        self::$w466Milliseconds = null;
     }
 
     public function beginReleaseScope(int $releaseId): void
@@ -184,6 +225,99 @@ final class PersistenceMetricsCollector
         } catch (Throwable) {
             return self::applyEventPhp($event, $scope, $releaseId, $milliseconds, $counters);
         }
+    }
+
+    /**
+     * Fold `[event, release id, milliseconds]` rows through applyEvent() in order, with
+     * `(int)`/`(float)` casts. The variadic signature lets PHP enforce array rows.
+     *
+     * @param  array{0: int, 1: float, 2: int, 3: int}  $counters
+     * @param  array<array-key, mixed>  ...$events
+     * @return array{0: int, 1: float, 2: int, 3: int}
+     */
+    public static function applyEvents(?int $scope, array $counters, array ...$events): array
+    {
+        return (self::usesW466RustFfi() ? self::eventsNative($scope, $counters, $events) : null)
+            ?? self::eventsPhp($scope, $counters, $events);
+    }
+
+    /**
+     * @param  array{0: int, 1: float, 2: int, 3: int}  $counters
+     * @param  array<array-key, mixed>  ...$events
+     * @return array{0: int, 1: float, 2: int, 3: int}
+     */
+    public static function applyEventsPhp(?int $scope, array $counters, array ...$events): array
+    {
+        return self::eventsPhp($scope, $counters, $events);
+    }
+
+    /**
+     * Rust fold, or null when PHP must apply the rows (rows without all three columns,
+     * an unknown event, counter overflow or an unavailable library).
+     *
+     * @param  array{0: int, 1: float, 2: int, 3: int}  $counters
+     * @param  array<array-key, mixed>  ...$events
+     * @return array{0: int, 1: float, 2: int, 3: int}|null
+     */
+    public static function applyEventsNative(?int $scope, array $counters, array ...$events): ?array
+    {
+        return self::eventsNative($scope, $counters, $events);
+    }
+
+    /**
+     * @param  array{0: int, 1: float, 2: int, 3: int}  $counters
+     * @param  array<array-key, array<array-key, mixed>>  $events
+     * @return array{0: int, 1: float, 2: int, 3: int}
+     */
+    private static function eventsPhp(?int $scope, array $counters, array $events): array
+    {
+        foreach ($events as $row) {
+            [$event, $releaseId, $milliseconds] = $row;
+            $counters = self::applyEventPhp((int) $event, $scope, (int) $releaseId, (float) $milliseconds, $counters);
+        }
+
+        return $counters;
+    }
+
+    /**
+     * @param  array{0: int, 1: float, 2: int, 3: int}  $counters
+     * @param  array<array-key, array<array-key, mixed>>  $events
+     * @return array{0: int, 1: float, 2: int, 3: int}|null
+     */
+    private static function eventsNative(?int $scope, array $counters, array $events): ?array
+    {
+        $ffi = self::$w466Ffi instanceof FFI ? self::$w466Ffi : self::w466Ffi();
+        if ($ffi === null || ! \is_int($counters[0]) || ! \is_float($counters[1]) || ! \is_int($counters[2]) || ! \is_int($counters[3])) {
+            return null;
+        }
+        if ($events === []) {
+            return $counters;
+        }
+        $count = \count($events);
+        $kinds = array_column($events, 0);
+        $ids = array_column($events, 1);
+        $milliseconds = array_column($events, 2);
+        if (\count($kinds) !== $count || \count($ids) !== $count || \count($milliseconds) !== $count) {
+            return null;
+        }
+        // pack() reads values with the same conversions as the (int)/(float) casts:
+        // event kinds then release IDs as int64, milliseconds as doubles.
+        $integers = pack('q*', ...$kinds, ...$ids);
+        $milliseconds = pack('e*', ...$milliseconds);
+
+        try {
+            $out = self::$w466Counters ??= $ffi->new('int64_t[3]');
+            $total = self::$w466Milliseconds ??= $ffi->new('double[1]');
+            // @phpstan-ignore method.notFound
+            $status = $ffi->nntmux_w466_pmc_apply_batch(
+                $integers, \strlen($integers), $milliseconds, \strlen($milliseconds), $count,
+                $scope === null ? 0 : 1, $scope ?? 0, $counters[0], $counters[1], $counters[2], $counters[3], $out, 3, $total,
+            );
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $status === 1 ? [$out[0], $total[0], $out[1], $out[2]] : null;
     }
 
     private function record(int $event, int $releaseId, float $milliseconds): void
