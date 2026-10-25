@@ -33978,3 +33978,1598 @@ pub unsafe extern "C" fn nntmux_w47_fingerprint_candidate_batch(
     })
     .unwrap_or(-1)
 }
+
+/// Wave 48.2 batch helpers for the PreDB feed entry normaliser, the feed source factory, the bounded
+/// and plain HTTP feed sources and the NNTmux update lock. Every export shares one signature: a
+/// NUL-joined string blob, an auxiliary little-endian `i64` table, two integer parameters and an
+/// output buffer that receives fixed-width little-endian `i64` counters.
+mod wave48_predb_entry_factory_bounded_http_update_lock {
+    use super::{nfo_abi_range, php_trim, yenc_ranges_overlap};
+    use std::collections::HashSet;
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    use std::slice;
+    use std::sync::OnceLock;
+
+    pub(super) const MAX_INPUT: usize = 16 * 1024 * 1024;
+    pub(super) const MAX_ITEMS: usize = 65_536;
+    /// Counter slots written by each export, indexed by operation.
+    pub(super) const SLOTS: [usize; 5] = [30, 26, 29, 30, 17];
+    /// Largest byte budget, payload cap or timestamp the helpers accept, so every sum stays exact.
+    const MAX_SPAN: i64 = 1 << 40;
+    /// json_decode() depth the update-lock helper mirrors: containers nest at most 15 deep.
+    const JSON_DEPTH: usize = 16;
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    const MIX: u64 = 0x9e37_79b9_7f4a_7c15;
+
+    /// Multiply-fold hasher seeded once per process for the short distinct-value keys.
+    #[derive(Clone, Copy)]
+    struct Seeded(u64);
+
+    impl Default for Seeded {
+        fn default() -> Self {
+            static SEED: OnceLock<u64> = OnceLock::new();
+            Seeded(*SEED.get_or_init(|| RandomState::new().hash_one(0x48_5eed_u64)))
+        }
+    }
+
+    impl BuildHasher for Seeded {
+        type Hasher = Mix;
+
+        fn build_hasher(&self) -> Mix {
+            Mix(self.0)
+        }
+    }
+
+    struct Mix(u64);
+
+    #[inline]
+    fn fold(a: u64, b: u64) -> u64 {
+        let product = u128::from(a) * u128::from(b);
+        product as u64 ^ (product >> 64) as u64
+    }
+
+    impl Hasher for Mix {
+        #[inline]
+        fn write(&mut self, bytes: &[u8]) {
+            let (chunks, tail) = bytes.as_chunks::<8>();
+            let mut hash = self.0;
+            for chunk in chunks {
+                hash = fold(hash ^ u64::from_le_bytes(*chunk), MIX);
+            }
+            if !tail.is_empty() {
+                let mut word = [0u8; 8];
+                word[..tail.len()].copy_from_slice(tail);
+                hash = fold(hash ^ u64::from_le_bytes(word), MIX);
+            }
+            self.0 = hash;
+        }
+
+        #[inline]
+        fn write_u64(&mut self, value: u64) {
+            self.0 = fold(self.0 ^ value, MIX);
+        }
+
+        #[inline]
+        fn write_usize(&mut self, value: usize) {
+            self.write_u64(value as u64);
+        }
+
+        #[inline]
+        fn finish(&self) -> u64 {
+            fold(self.0, MIX ^ 0x2d35_8dcc_aa6c_78a5)
+        }
+    }
+
+    type Set<T> = HashSet<T, Seeded>;
+
+    fn set<T>(capacity: usize) -> Set<T> {
+        HashSet::with_capacity_and_hasher(capacity, Seeded::default())
+    }
+
+    /// Incremental FNV-1a 64, matching PHP's hash('fnv1a64') over the concatenated records.
+    struct Fnv(u64);
+
+    impl Fnv {
+        fn new() -> Self {
+            Fnv(FNV_OFFSET)
+        }
+
+        #[inline]
+        fn bytes(&mut self, bytes: &[u8]) {
+            let mut hash = self.0;
+            for &b in bytes {
+                hash = (hash ^ u64::from(b)).wrapping_mul(FNV_PRIME);
+            }
+            self.0 = hash;
+        }
+
+        #[inline]
+        fn byte(&mut self, b: u8) {
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(FNV_PRIME);
+        }
+
+        #[inline]
+        fn i64(&mut self, value: i64) {
+            self.bytes(&value.to_le_bytes());
+        }
+
+        fn finish(&self) -> i64 {
+            self.0 as i64
+        }
+    }
+
+    /// Split `blob` on NUL into exactly `pieces` strings; None when a string itself held a NUL.
+    fn split_exact(blob: &[u8], pieces: usize) -> Option<Vec<&[u8]>> {
+        if pieces == 0 {
+            return blob.is_empty().then(Vec::new);
+        }
+        let mut out = Vec::with_capacity(pieces);
+        for part in blob.split(|&b| b == 0) {
+            if out.len() == pieces {
+                return None;
+            }
+            out.push(part);
+        }
+        (out.len() == pieces).then_some(out)
+    }
+
+    fn read_i64s(bytes: &[u8]) -> Option<Vec<i64>> {
+        let (chunks, tail) = bytes.as_chunks::<8>();
+        tail.is_empty()
+            .then(|| chunks.iter().map(|c| i64::from_le_bytes(*c)).collect())
+    }
+
+    /// PHP trim($s, " \t").
+    fn trim_sp(mut s: &[u8]) -> &[u8] {
+        while let [b' ' | b'\t', rest @ ..] = s {
+            s = rest;
+        }
+        while let [rest @ .., b' ' | b'\t'] = s {
+            s = rest;
+        }
+        s
+    }
+
+    fn all_digits(s: &[u8]) -> bool {
+        s.iter().all(u8::is_ascii_digit)
+    }
+
+    /// Decimal value of 1..=18 ASCII digits.
+    fn digits_value(s: &[u8]) -> i64 {
+        s.iter()
+            .fold(0i64, |acc, &b| acc * 10 + i64::from(b - b'0'))
+    }
+
+    fn lower(s: &[u8]) -> Vec<u8> {
+        s.to_ascii_lowercase()
+    }
+
+    // ---- PredbFeedEntry::summarizeEntryBatch() -------------------------------------------------
+
+    fn category_class(category: &[u8]) -> usize {
+        if category.is_empty() {
+            return 0;
+        }
+        let end = category
+            .iter()
+            .position(|b| matches!(b, b'-' | b'/' | b' ' | b'.' | b'_' | b':'))
+            .unwrap_or(category.len());
+        let prefix = &category[..end];
+        if prefix.len() > 6 {
+            return 8;
+        }
+        let mut buf = [0u8; 6];
+        for (d, s) in buf.iter_mut().zip(prefix) {
+            *d = s.to_ascii_uppercase();
+        }
+        match &buf[..prefix.len()] {
+            b"TV" => 1,
+            b"MOVIE" | b"MOVIES" | b"X264" | b"X265" | b"BLURAY" | b"DVDR" | b"XVID" | b"UHD"
+            | b"BD" => 2,
+            b"MP3" | b"FLAC" | b"MUSIC" | b"MVID" | b"AUDIO" => 3,
+            b"GAMES" | b"GAME" | b"PS4" | b"PS5" | b"NSW" | b"XBOX" | b"PC" | b"WII" => 4,
+            b"APPS" | b"APP" | b"0DAY" | b"ISO" => 5,
+            b"XXX" => 6,
+            b"EBOOK" | b"EBOOKS" | b"BOOK" | b"BOOKS" | b"ABOOK" => 7,
+            _ => 8,
+        }
+    }
+
+    /// `/^([0-9]{1,6})(?:\.([0-9]{1,2}))?([KMG]B)$/i` in whole KB; -1 when empty, -2 when invalid.
+    fn size_kb(size: &[u8]) -> i64 {
+        if size.is_empty() {
+            return -1;
+        }
+        let whole = size.iter().take_while(|b| b.is_ascii_digit()).count();
+        if whole == 0 || whole > 6 {
+            return -2;
+        }
+        let mut hundredths = digits_value(&size[..whole]) * 100;
+        let mut pos = whole;
+        if size.get(pos) == Some(&b'.') {
+            let frac = size[pos + 1..]
+                .iter()
+                .take_while(|b| b.is_ascii_digit())
+                .count();
+            if frac == 0 || frac > 2 {
+                return -2;
+            }
+            let digits = &size[pos + 1..pos + 1 + frac];
+            hundredths += if frac == 1 {
+                digits_value(digits) * 10
+            } else {
+                digits_value(digits)
+            };
+            pos += 1 + frac;
+        }
+        let unit = match &size[pos..] {
+            [k, b'b' | b'B'] => match k {
+                b'k' | b'K' => 1,
+                b'm' | b'M' => 1024,
+                b'g' | b'G' => 1_048_576,
+                _ => return -2,
+            },
+            _ => return -2,
+        };
+        hundredths * unit / 100
+    }
+
+    fn entry(blob: &[u8], aux: &[u8]) -> Option<Vec<i64>> {
+        let nuked = read_i64s(aux)?;
+        let n = nuked.len();
+        if n > MAX_ITEMS {
+            return None;
+        }
+        let parts = split_exact(blob, n * 5)?;
+        let (titles, rest) = parts.split_at(n);
+        let (sources, rest) = rest.split_at(n);
+        let (categories, rest) = rest.split_at(n);
+        let (sizes, files) = rest.split_at(n);
+        let mut c = vec![0i64; SLOTS[0]];
+        let mut titles_seen: Set<Vec<u8>> = set(n);
+        let mut sources_seen: Set<Vec<u8>> = set(n);
+        let mut digest = Fnv::new();
+        for i in 0..n {
+            c[0] += 1;
+            let title = php_trim(titles[i]);
+            let mut flags = 0u8;
+            let mut key = Vec::new();
+            if title.is_empty() {
+                c[2] += 1;
+            } else {
+                c[1] += 1;
+                c[6] += title.len() as i64;
+                key = title
+                    .iter()
+                    .map(|&b| match b {
+                        b' ' | b'_' => b'.',
+                        _ => b.to_ascii_lowercase(),
+                    })
+                    .collect();
+                if titles_seen.contains(&key) {
+                    c[3] += 1;
+                    flags |= 1;
+                } else {
+                    titles_seen.insert(key.clone());
+                }
+                if !title.contains(&b'-') {
+                    c[4] += 1;
+                    flags |= 2;
+                }
+                if title.iter().any(|&b| b == b' ' || b == b'\t') {
+                    c[5] += 1;
+                    flags |= 4;
+                }
+            }
+            let source = php_trim(sources[i]);
+            if source.is_empty() {
+                c[8] += 1;
+            } else {
+                sources_seen.insert(lower(source));
+            }
+            let category = category_class(php_trim(categories[i]));
+            c[9 + category] += 1;
+            let kb = size_kb(php_trim(sizes[i]));
+            match kb {
+                -1 => c[18] += 1,
+                -2 => c[19] += 1,
+                _ => {
+                    c[20] += kb;
+                    c[21] = c[21].max(kb);
+                }
+            }
+            let count = php_trim(files[i]);
+            let file_count = if count.is_empty() {
+                c[22] += 1;
+                -1
+            } else if count.len() <= 9 && all_digits(count) {
+                let value = digits_value(count);
+                if value == 0 {
+                    c[22] += 1;
+                    -1
+                } else {
+                    c[24] += value;
+                    value
+                }
+            } else {
+                c[23] += 1;
+                -2
+            };
+            let nuke: u8 = match nuked[i] {
+                0 => 0,
+                2 | 4 | 5 => 1,
+                1 | 3 => 2,
+                _ => 3,
+            };
+            c[25 + nuke as usize] += 1;
+            digest.bytes(&[flags, category as u8, nuke]);
+            digest.i64(kb);
+            digest.i64(file_count);
+            digest.bytes(&key);
+            digest.byte(0);
+        }
+        c[7] = sources_seen.len() as i64;
+        c[29] = digest.finish();
+        Some(c)
+    }
+
+    // ---- PredbFeedSourceFactory::classifySourceKeyBatch() ------------------------------------
+
+    /// (index, kind 0 dedicated / 1 rss / 2 file, capability flags, rate-limit tier) per feed key.
+    fn source_entry(key: &[u8]) -> Option<(u8, u8, u8, u8)> {
+        Some(match key {
+            b"predb_club" => (0, 0, 0, 2),
+            b"predb_net" => (1, 0, 0, 2),
+            b"predb_me" => (2, 1, 16, 1),
+            b"predb_org" => (3, 0, 0, 2),
+            b"predatabase" => (4, 0, 32, 3),
+            b"srrdb" => (5, 0, 32, 3),
+            b"xrel" => (6, 0, 0, 3),
+            b"xrel_p2p" => (7, 0, 64, 3),
+            b"scnsrc_me" => (8, 1, 21, 1),
+            b"eztv" => (9, 1, 20, 1),
+            b"predb_ovh" => (10, 0, 0, 2),
+            b"apibay" => (11, 0, 0, 2),
+            b"nfodb" => (12, 1, 19, 1),
+            b"one_techno" => (13, 1, 19, 1),
+            b"one_gabba" => (14, 1, 19, 1),
+            b"ddlvalley" => (15, 1, 18, 1),
+            b"hdencode" => (16, 1, 26, 1),
+            b"hdencode_tv" => (17, 1, 26, 1),
+            b"mp3scene" => (18, 1, 18, 1),
+            b"nima4k" => (19, 0, 0, 2),
+            b"gload" => (20, 1, 18, 1),
+            b"hdworld" => (21, 1, 18, 1),
+            b"g4u" => (22, 0, 0, 2),
+            b"nswdb" => (23, 0, 0, 2),
+            b"3dsdb" => (24, 0, 0, 2),
+            b"gabber" => (25, 0, 0, 2),
+            b"movieblog" => (26, 1, 18, 1),
+            b"scnlog" => (27, 1, 19, 1),
+            b"knaben" => (28, 0, 0, 2),
+            b"crowdnfo" => (29, 0, 0, 2),
+            b"seriousaboutsound" => (30, 0, 0, 2),
+            b"dats_pciso_1998" => (31, 0, 0, 2),
+            b"nzedb_archive" => (32, 0, 0, 2),
+            b"scene_archive_sql" => (33, 2, 32, 0),
+            _ => return None,
+        })
+    }
+
+    fn source_keys(blob: &[u8], count: i64) -> Option<Vec<i64>> {
+        let n = usize::try_from(count).ok().filter(|&n| n <= MAX_ITEMS)?;
+        let keys = split_exact(blob, n)?;
+        let mut c = vec![0i64; SLOTS[1]];
+        c[22] = -1;
+        let mut mask = 0i64;
+        let mut digest = Fnv::new();
+        let mut normalized = [0u8; 32];
+        for (i, raw) in keys.iter().enumerate() {
+            c[0] += 1;
+            let key = php_trim(raw);
+            c[24] += key.len() as i64;
+            let (status, entry) = if key.is_empty() {
+                c[1] += 1;
+                (0u8, None)
+            } else if let Some(entry) = source_entry(raw) {
+                c[4] += 1;
+                (1, Some(entry))
+            } else {
+                let found = (key.len() <= normalized.len())
+                    .then(|| {
+                        let buf = &mut normalized[..key.len()];
+                        for (d, &s) in buf.iter_mut().zip(key) {
+                            *d = match s {
+                                b'-' | b' ' => b'_',
+                                _ => s.to_ascii_lowercase(),
+                            };
+                        }
+                        source_entry(buf)
+                    })
+                    .flatten();
+                match found {
+                    Some(entry) => {
+                        c[5] += 1;
+                        (2, Some(entry))
+                    }
+                    None => {
+                        c[3] += 1;
+                        if c[22] < 0 {
+                            c[22] = i as i64;
+                        }
+                        (3, None)
+                    }
+                }
+            };
+            let index = match entry {
+                Some((index, kind, flags, tier)) => {
+                    c[2] += 1;
+                    if mask >> index & 1 == 1 {
+                        c[6] += 1;
+                    } else {
+                        mask |= 1 << index;
+                        c[7] += 1;
+                        c[8 + kind as usize] += 1;
+                        for bit in 0..7 {
+                            if flags >> bit & 1 == 1 {
+                                c[11 + bit] += 1;
+                            }
+                        }
+                        c[18 + tier as usize] += 1;
+                    }
+                    index as i8
+                }
+                None => -1,
+            };
+            digest.bytes(&[status, index as u8]);
+            digest.bytes(&(key.len() as u32).to_le_bytes());
+        }
+        c[23] = mask;
+        c[25] = digest.finish();
+        Some(c)
+    }
+
+    // ---- BoundedHttpFeedSource::planBoundedResponseBatch() -----------------------------------
+
+    fn rtrim_cr(mut line: &[u8]) -> &[u8] {
+        while let [rest @ .., b'\r'] = line {
+            line = rest;
+        }
+        line
+    }
+
+    /// `/^HTTP\/[0-9.]+ ([1-5][0-9]{2})(?: |$)/D`, or 0 when the status line does not match.
+    fn status_line(line: &[u8]) -> i64 {
+        let Some(rest) = line.strip_prefix(b"HTTP/") else {
+            return 0;
+        };
+        let version = rest
+            .iter()
+            .take_while(|&&b| b.is_ascii_digit() || b == b'.')
+            .count();
+        if version == 0 {
+            return 0;
+        }
+        match &rest[version..] {
+            [b' ', a @ b'1'..=b'5', b @ b'0'..=b'9', d @ b'0'..=b'9', tail @ ..]
+                if tail.is_empty() || tail[0] == b' ' =>
+            {
+                i64::from(a - b'0') * 100 + i64::from(b - b'0') * 10 + i64::from(d - b'0')
+            }
+            _ => 0,
+        }
+    }
+
+    fn bounded(blob: &[u8], aux: &[u8], maximum: i64) -> Option<Vec<i64>> {
+        let received = read_i64s(aux)?;
+        let n = received.len();
+        if n > MAX_ITEMS {
+            return None;
+        }
+        let blocks = split_exact(blob, n)?;
+        let max = maximum.clamp(1, MAX_SPAN);
+        let mut c = vec![0i64; SLOTS[2]];
+        c[19] = -1;
+        c[23] = -1;
+        let mut digest = Fnv::new();
+        for (i, block) in blocks.iter().enumerate() {
+            c[0] += 1;
+            let mut lines = block.split(|&b| b == b'\n');
+            let status = status_line(rtrim_cr(lines.next().unwrap_or(b"")));
+            if status == 0 {
+                c[1] += 1;
+                digest.bytes(&[0, 0, 0, 0]);
+                digest.i64(0);
+                continue;
+            }
+            let mut encoding: &[u8] = b"";
+            let mut length = -1i64;
+            let (mut length_invalid, mut conflict, mut chunked) = (false, false, false);
+            let mut retry = -1i64;
+            let mut retry_date = false;
+            for line in lines {
+                let line = rtrim_cr(line);
+                if line.is_empty() {
+                    continue;
+                }
+                let Some(colon) = line.iter().position(|&b| b == b':') else {
+                    c[27] += 1;
+                    continue;
+                };
+                let name = trim_sp(&line[..colon]);
+                if name.is_empty() {
+                    c[27] += 1;
+                    continue;
+                }
+                c[26] += 1;
+                let value = trim_sp(&line[colon + 1..]);
+                if name.eq_ignore_ascii_case(b"content-encoding") {
+                    encoding = value;
+                } else if name.eq_ignore_ascii_case(b"content-length") {
+                    if !value.is_empty() && value.len() <= 15 && all_digits(value) {
+                        let v = digits_value(value);
+                        if length >= 0 && length != v {
+                            conflict = true;
+                        }
+                        length = v;
+                    } else {
+                        length_invalid = true;
+                    }
+                } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
+                    chunked = value.len() >= 7
+                        && value[value.len() - 7..].eq_ignore_ascii_case(b"chunked");
+                } else if name.eq_ignore_ascii_case(b"retry-after") {
+                    if !value.is_empty() && value.len() <= 9 && all_digits(value) {
+                        retry = digits_value(value);
+                        retry_date = false;
+                    } else if !value.is_empty() {
+                        retry = -1;
+                        retry_date = true;
+                    }
+                }
+            }
+            let got = received[i].max(0);
+            let declared = if chunked || length_invalid || conflict {
+                -1
+            } else {
+                length
+            };
+            let gzip = encoding.eq_ignore_ascii_case(b"gzip");
+            let supported =
+                encoding.is_empty() || gzip || encoding.eq_ignore_ascii_case(b"identity");
+            let mut flags = 0u8;
+            if gzip {
+                c[13] += 1;
+                flags |= 1;
+            }
+            if chunked {
+                c[14] += 1;
+                flags |= 2;
+            }
+            if declared >= 0 {
+                c[16] += 1;
+                c[19] = c[19].max(declared);
+                flags |= 4;
+            }
+            if length_invalid {
+                c[17] += 1;
+                flags |= 8;
+            }
+            if conflict {
+                c[18] += 1;
+                flags |= 16;
+            }
+            if retry >= 0 {
+                flags |= 32;
+            }
+            if retry_date {
+                flags |= 64;
+            }
+            if !supported {
+                c[15] += 1;
+                flags |= 128;
+            }
+            if (200..600).contains(&status) {
+                c[9 + (status / 100 - 2) as usize] += 1;
+            }
+            let mut next_read = 0i64;
+            let outcome: u8 = if (200..300).contains(&status) {
+                if !supported {
+                    c[3] += 1;
+                    2
+                } else if got > max || declared > max {
+                    c[4] += 1;
+                    3
+                } else {
+                    c[2] += 1;
+                    next_read = (max + 1 - got).clamp(0, 8192);
+                    c[20] += next_read;
+                    c[21] += max - got;
+                    1
+                }
+            } else if status == 429 {
+                c[5] += 1;
+                4
+            } else if status >= 500 {
+                c[6] += 1;
+                5
+            } else if status >= 400 {
+                c[7] += 1;
+                6
+            } else {
+                c[8] += 1;
+                7
+            };
+            if outcome == 4 || outcome == 5 {
+                if retry >= 0 {
+                    c[22] += 1;
+                    c[23] = c[23].max(retry);
+                    c[24] += retry;
+                } else if retry_date {
+                    c[25] += 1;
+                }
+            }
+            digest.byte(outcome);
+            digest.bytes(&(status as u16).to_le_bytes());
+            digest.byte(flags);
+            digest.i64(next_read);
+        }
+        c[28] = digest.finish();
+        Some(c)
+    }
+
+    // ---- HttpFeedSource::preflightRequestBatch() ---------------------------------------------
+
+    /// (state 0 absent / 1 invalid / 2 strong / 3 weak, opaque tag including its quotes).
+    fn etag(raw: &[u8]) -> (u8, &[u8]) {
+        let tag = trim_sp(raw);
+        if tag.is_empty() {
+            return (0, b"");
+        }
+        let (weak, opaque) = match tag.strip_prefix(b"W/") {
+            Some(rest) => (true, rest),
+            None => (false, tag),
+        };
+        match opaque {
+            [b'"', inner @ .., b'"'] if inner.iter().all(|&b| b > 0x20 && b != b'"' && b != 0x7f) => {
+                (if weak { 3 } else { 2 }, opaque)
+            }
+            _ => (1, b""),
+        }
+    }
+
+    /// (status 0 valid / 1 invalid / 2 unsupported scheme, flags, lowercase host).
+    fn url(raw: &[u8]) -> (u8, u8, Vec<u8>) {
+        let url = php_trim(raw);
+        let Some(pos) = url.windows(3).position(|w| w == b"://") else {
+            return (1, 0, Vec::new());
+        };
+        let scheme = &url[..pos];
+        let https = scheme.eq_ignore_ascii_case(b"https");
+        if !https && !scheme.eq_ignore_ascii_case(b"http") {
+            return (2, 0, Vec::new());
+        }
+        let rest = &url[pos + 3..];
+        let end = rest
+            .iter()
+            .position(|&b| matches!(b, b'/' | b'?' | b'#'))
+            .unwrap_or(rest.len());
+        let (mut authority, tail) = rest.split_at(end);
+        let mut flags = u8::from(https);
+        if let Some(at) = authority.iter().rposition(|&b| b == b'@') {
+            flags |= 2;
+            authority = &authority[at + 1..];
+        }
+        let (host, port): (&[u8], &[u8]) = if authority.first() == Some(&b'[') {
+            let Some(close) = authority.iter().position(|&b| b == b']') else {
+                return (1, 0, Vec::new());
+            };
+            let (host, after) = authority.split_at(close + 1);
+            let port = match after {
+                [] => after,
+                [b':', port @ ..] => port,
+                _ => return (1, 0, Vec::new()),
+            };
+            let inner = &host[1..host.len() - 1];
+            if inner.is_empty()
+                || !inner
+                    .iter()
+                    .all(|&b| b.is_ascii_hexdigit() || b == b':' || b == b'.')
+            {
+                return (1, 0, Vec::new());
+            }
+            flags |= 8;
+            (host, port)
+        } else {
+            let (host, port) = match authority.iter().rposition(|&b| b == b':') {
+                Some(colon) => (&authority[..colon], &authority[colon + 1..]),
+                None => (authority, &b""[..]),
+            };
+            let edge = |b: Option<&u8>| matches!(b, Some(b'.' | b'-'));
+            if host.is_empty()
+                || host.len() > 253
+                || !host
+                    .iter()
+                    .all(|&b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+                || edge(host.first())
+                || edge(host.last())
+            {
+                return (1, 0, Vec::new());
+            }
+            if host.iter().all(|&b| b.is_ascii_digit() || b == b'.') {
+                flags |= 4;
+            }
+            (host, port)
+        };
+        if !port.is_empty() {
+            if port.len() > 5 || !all_digits(port) {
+                return (1, 0, Vec::new());
+            }
+            let value = digits_value(port);
+            if !(1..=65535).contains(&value) {
+                return (1, 0, Vec::new());
+            }
+            if value != if https { 443 } else { 80 } {
+                flags |= 16;
+            }
+        }
+        if tail.contains(&b'?') {
+            flags |= 32;
+        }
+        (0, flags, lower(host))
+    }
+
+    fn preflight(blob: &[u8], aux: &[u8], maximum: i64) -> Option<Vec<i64>> {
+        if aux.len() % 16 != 0 {
+            return None;
+        }
+        let table = read_i64s(aux)?;
+        let n = table.len() / 2;
+        if n > MAX_ITEMS {
+            return None;
+        }
+        let (statuses, payloads) = table.split_at(n);
+        let parts = split_exact(blob, n * 3)?;
+        let (urls, rest) = parts.split_at(n);
+        let (etags, cached) = rest.split_at(n);
+        let max = maximum.clamp(1, MAX_SPAN);
+        let mut c = vec![0i64; SLOTS[3]];
+        let mut hosts: Set<Vec<u8>> = set(n);
+        let mut digest = Fnv::new();
+        for i in 0..n {
+            c[0] += 1;
+            let (state, flags, host) = url(urls[i]);
+            if state != 0 {
+                c[if state == 1 { 2 } else { 3 }] += 1;
+                digest.bytes(&[state, 0, 0, 0, 0, 0, 0, 0]);
+                continue;
+            }
+            c[1] += 1;
+            for bit in 0..6 {
+                if flags >> bit & 1 == 1 {
+                    c[4 + bit] += 1;
+                }
+            }
+            c[11] += host.len() as i64;
+            let host_len = host.len() as u32;
+            hosts.insert(host);
+            let status = statuses[i];
+            let class: u8 = if (200..300).contains(&status) {
+                1
+            } else if status == 304 {
+                2
+            } else if status == 429 {
+                3
+            } else if status == 0 || (500..600).contains(&status) {
+                4
+            } else if (400..500).contains(&status) {
+                5
+            } else {
+                6
+            };
+            c[11 + class as usize] += 1;
+            let (tag, tag_opaque) = etag(etags[i]);
+            let (stored, stored_opaque) = etag(cached[i]);
+            match tag {
+                1 => c[20] += 1,
+                2 => c[18] += 1,
+                3 => c[19] += 1,
+                _ => {}
+            }
+            if stored >= 2 {
+                c[21] += 1;
+            }
+            let hit = tag >= 2 && stored >= 2 && tag_opaque == stored_opaque;
+            if hit {
+                c[22] += 1;
+            }
+            if class == 1 {
+                let payload = payloads[i];
+                if payload <= 0 {
+                    c[26] += 1;
+                } else if payload > max {
+                    c[27] += 1;
+                } else {
+                    c[28] += payload;
+                    if hit {
+                        c[25] += 1;
+                    }
+                }
+            } else if class == 2 {
+                if stored >= 2 && (tag == 0 || hit) {
+                    c[23] += 1;
+                } else {
+                    c[24] += 1;
+                }
+            }
+            digest.bytes(&[0, flags, class, tag | stored << 2 | u8::from(hit) << 4]);
+            digest.bytes(&host_len.to_le_bytes());
+        }
+        c[10] = hosts.len() as i64;
+        c[29] = digest.finish();
+        Some(c)
+    }
+
+    // ---- NntmuxUpdateLock::evaluateLockBatch() -----------------------------------------------
+
+    /// A top-level lock field after `$decoded[$key] ?? null`.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Field {
+        Missing,
+        Int(i64),
+        Other,
+    }
+
+    enum Value {
+        Null,
+        Int(i64),
+        Str(usize, usize, bool),
+        Other,
+    }
+
+    #[derive(Default)]
+    struct Lock {
+        pid: Option<Field>,
+        started: Option<Field>,
+        ttl: Option<Field>,
+        host: Option<Option<Vec<u8>>>,
+    }
+
+    /// Strict RFC 8259 parser matching json_decode($payload, true, 16) acceptance.
+    struct Json<'a> {
+        s: &'a [u8],
+        i: usize,
+    }
+
+    fn hex4(s: &[u8], at: usize) -> Option<u32> {
+        let digits = s.get(at..at + 4)?;
+        let mut value = 0u32;
+        for &b in digits {
+            value = value * 16 + (b as char).to_digit(16)?;
+        }
+        Some(value)
+    }
+
+    impl Json<'_> {
+        fn ws(&mut self) {
+            while let Some(b' ' | b'\t' | b'\n' | b'\r') = self.s.get(self.i) {
+                self.i += 1;
+            }
+        }
+
+        fn literal(&mut self, word: &[u8]) -> Option<()> {
+            (self.s.get(self.i..self.i + word.len())? == word).then(|| self.i += word.len())
+        }
+
+        /// Validates a string at the opening quote; returns its raw content range and whether it
+        /// holds escapes.
+        fn string(&mut self) -> Option<(usize, usize, bool)> {
+            self.i += 1;
+            let start = self.i;
+            let mut escaped = false;
+            loop {
+                match *self.s.get(self.i)? {
+                    b'"' => break,
+                    b'\\' => {
+                        escaped = true;
+                        match *self.s.get(self.i + 1)? {
+                            b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => self.i += 2,
+                            b'u' => {
+                                let unit = hex4(self.s, self.i + 2)?;
+                                self.i += 6;
+                                if (0xD800..0xDC00).contains(&unit) {
+                                    if self.s.get(self.i..self.i + 2)? != b"\\u" {
+                                        return None;
+                                    }
+                                    let low = hex4(self.s, self.i + 2)?;
+                                    if !(0xDC00..0xE000).contains(&low) {
+                                        return None;
+                                    }
+                                    self.i += 6;
+                                } else if (0xDC00..0xE000).contains(&unit) {
+                                    return None;
+                                }
+                            }
+                            _ => return None,
+                        }
+                    }
+                    0..=0x1f => return None,
+                    _ => self.i += 1,
+                }
+            }
+            let end = self.i;
+            self.i += 1;
+            std::str::from_utf8(&self.s[start..end]).ok()?;
+            Some((start, end, escaped))
+        }
+
+        fn number(&mut self) -> Option<Value> {
+            let start = self.i;
+            if self.s.get(self.i) == Some(&b'-') {
+                self.i += 1;
+            }
+            match *self.s.get(self.i)? {
+                b'0' => self.i += 1,
+                b'1'..=b'9' => self.digits(),
+                _ => return None,
+            }
+            let mut float = false;
+            if self.s.get(self.i) == Some(&b'.') {
+                self.i += 1;
+                if !self.s.get(self.i)?.is_ascii_digit() {
+                    return None;
+                }
+                self.digits();
+                float = true;
+            }
+            if let Some(b'e' | b'E') = self.s.get(self.i) {
+                self.i += 1;
+                if let Some(b'+' | b'-') = self.s.get(self.i) {
+                    self.i += 1;
+                }
+                if !self.s.get(self.i)?.is_ascii_digit() {
+                    return None;
+                }
+                self.digits();
+                float = true;
+            }
+            if float {
+                return Some(Value::Other);
+            }
+            // SAFETY-free: the range holds only ASCII sign and digits.
+            let text = std::str::from_utf8(&self.s[start..self.i]).ok()?;
+            Some(text.parse::<i64>().map_or(Value::Other, Value::Int))
+        }
+
+        fn digits(&mut self) {
+            while self.s.get(self.i).is_some_and(u8::is_ascii_digit) {
+                self.i += 1;
+            }
+        }
+
+        fn value(&mut self, depth: usize) -> Option<Value> {
+            self.ws();
+            match *self.s.get(self.i)? {
+                b'{' => self.object(depth + 1, None).map(|()| Value::Other),
+                b'[' => self.array(depth + 1).map(|()| Value::Other),
+                b'"' => self.string().map(|(a, b, e)| Value::Str(a, b, e)),
+                b't' => self.literal(b"true").map(|()| Value::Other),
+                b'f' => self.literal(b"false").map(|()| Value::Other),
+                b'n' => self.literal(b"null").map(|()| Value::Null),
+                b'-' | b'0'..=b'9' => self.number(),
+                _ => None,
+            }
+        }
+
+        fn array(&mut self, depth: usize) -> Option<()> {
+            if depth >= JSON_DEPTH {
+                return None;
+            }
+            self.i += 1;
+            self.ws();
+            if self.s.get(self.i) == Some(&b']') {
+                self.i += 1;
+                return Some(());
+            }
+            loop {
+                self.value(depth)?;
+                self.ws();
+                match *self.s.get(self.i)? {
+                    b',' => self.i += 1,
+                    b']' => {
+                        self.i += 1;
+                        return Some(());
+                    }
+                    _ => return None,
+                }
+            }
+        }
+
+        fn object(&mut self, depth: usize, mut top: Option<&mut Lock>) -> Option<()> {
+            if depth >= JSON_DEPTH {
+                return None;
+            }
+            self.i += 1;
+            self.ws();
+            if self.s.get(self.i) == Some(&b'}') {
+                self.i += 1;
+                return Some(());
+            }
+            loop {
+                self.ws();
+                if self.s.get(self.i) != Some(&b'"') {
+                    return None;
+                }
+                let (start, end, escaped) = self.string()?;
+                self.ws();
+                if self.s.get(self.i) != Some(&b':') {
+                    return None;
+                }
+                self.i += 1;
+                let value = self.value(depth)?;
+                if let Some(lock) = top.as_deref_mut() {
+                    let key = if escaped {
+                        decode(&self.s[start..end])
+                    } else {
+                        self.s[start..end].to_vec()
+                    };
+                    let field = || match value {
+                        Value::Null => Field::Missing,
+                        Value::Int(v) => Field::Int(v),
+                        _ => Field::Other,
+                    };
+                    match key.as_slice() {
+                        b"pid" => lock.pid = Some(field()),
+                        b"started_at" => lock.started = Some(field()),
+                        b"ttl" => lock.ttl = Some(field()),
+                        b"host" => {
+                            lock.host = Some(match value {
+                                Value::Str(a, b, true) => Some(decode(&self.s[a..b])),
+                                Value::Str(a, b, false) => Some(self.s[a..b].to_vec()),
+                                _ => None,
+                            })
+                        }
+                        _ => {}
+                    }
+                }
+                self.ws();
+                match *self.s.get(self.i)? {
+                    b',' => self.i += 1,
+                    b'}' => {
+                        self.i += 1;
+                        return Some(());
+                    }
+                    _ => return None,
+                }
+            }
+        }
+    }
+
+    /// Decodes the escapes of a string body already validated by `Json::string`.
+    fn decode(raw: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(raw.len());
+        let mut i = 0;
+        while i < raw.len() {
+            if raw[i] != b'\\' {
+                out.push(raw[i]);
+                i += 1;
+                continue;
+            }
+            let simple = match raw[i + 1] {
+                b'b' => Some(8),
+                b'f' => Some(12),
+                b'n' => Some(b'\n'),
+                b'r' => Some(b'\r'),
+                b't' => Some(b'\t'),
+                b'u' => None,
+                other => Some(other),
+            };
+            if let Some(b) = simple {
+                out.push(b);
+                i += 2;
+                continue;
+            }
+            let mut code = hex4(raw, i + 2).unwrap_or(0);
+            i += 6;
+            if (0xD800..0xDC00).contains(&code) {
+                let low = hex4(raw, i + 2).unwrap_or(0xDC00);
+                code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+                i += 6;
+            }
+            let ch = char::from_u32(code).unwrap_or('\u{FFFD}');
+            out.extend_from_slice(ch.encode_utf8(&mut [0u8; 4]).as_bytes());
+        }
+        out
+    }
+
+    /// The top-level fields of a lock payload, or None when json_decode() would not return an array.
+    fn parse_lock(payload: &[u8]) -> Option<Lock> {
+        let mut json = Json { s: payload, i: 0 };
+        let mut lock = Lock::default();
+        json.ws();
+        match *json.s.get(json.i)? {
+            b'{' => json.object(1, Some(&mut lock))?,
+            b'[' => json.array(1)?,
+            _ => return None,
+        }
+        json.ws();
+        (json.i == payload.len()).then_some(lock)
+    }
+
+    fn update_lock(blob: &[u8], aux: &[u8], now: i64, ttl: i64) -> Option<Vec<i64>> {
+        let table = read_i64s(aux)?;
+        let [current_pid, count] = table.as_slice() else {
+            return None;
+        };
+        let n = usize::try_from(*count).ok().filter(|&n| n <= MAX_ITEMS)?;
+        let payloads = split_exact(blob, n)?;
+        let now = now.clamp(0, MAX_SPAN);
+        let ttl = ttl.clamp(1, 1 << 31);
+        let mut c = vec![0i64; SLOTS[4]];
+        c[13] = -1;
+        c[14] = -1;
+        let mut hosts: Set<Vec<u8>> = set(n);
+        let mut digest = Fnv::new();
+        for payload in payloads {
+            c[0] += 1;
+            c[15] += payload.len() as i64;
+            let Some(lock) = parse_lock(payload) else {
+                c[1] += 1;
+                digest.byte(0);
+                digest.i64(0);
+                digest.i64(0);
+                continue;
+            };
+            let missing = Some(Field::Missing);
+            let (mut pid_value, mut age_value) = (0i64, 0i64);
+            let status: u8 = match lock.pid.unwrap_or(Field::Missing) {
+                Field::Missing => 1,
+                Field::Int(pid) if pid >= 1 => {
+                    pid_value = pid;
+                    match lock.started.or(missing).unwrap_or(Field::Missing) {
+                        Field::Missing => 3,
+                        Field::Int(started) if (1..=MAX_SPAN).contains(&started) => {
+                            let mut effective = ttl;
+                            if let Some(Field::Int(custom)) = lock.ttl
+                                && (1..=604_800).contains(&custom)
+                            {
+                                c[10] += 1;
+                                effective = custom;
+                            }
+                            if started > now + 300 {
+                                5
+                            } else {
+                                let age = now - started;
+                                age_value = age;
+                                c[13] = c[13].max(age);
+                                if age > effective {
+                                    6
+                                } else if pid == *current_pid {
+                                    7
+                                } else {
+                                    let remaining = effective - age;
+                                    c[14] = if c[14] < 0 {
+                                        remaining
+                                    } else {
+                                        c[14].min(remaining)
+                                    };
+                                    8
+                                }
+                            }
+                        }
+                        _ => 4,
+                    }
+                }
+                _ => 2,
+            };
+            c[status as usize + 1] += 1;
+            if status < 3 {
+                pid_value = 0;
+            }
+            if let Some(Some(host)) = lock.host {
+                let host = php_trim(&host);
+                if !host.is_empty() {
+                    c[11] += 1;
+                    hosts.insert(host.to_vec());
+                }
+            }
+            digest.byte(status);
+            digest.i64(pid_value);
+            digest.i64(age_value);
+        }
+        c[12] = hosts.len() as i64;
+        c[16] = digest.finish();
+        Some(c)
+    }
+
+    pub(super) fn compute(
+        operation: u8,
+        blob: &[u8],
+        aux: &[u8],
+        param_a: i64,
+        param_b: i64,
+    ) -> Option<Vec<i64>> {
+        match operation {
+            0 if param_a == 0 && param_b == 0 => entry(blob, aux),
+            1 if aux.is_empty() && param_b == 0 => source_keys(blob, param_a),
+            2 if param_b == 0 => bounded(blob, aux, param_a),
+            3 if param_b == 0 => preflight(blob, aux, param_a),
+            4 => update_lock(blob, aux, param_a, param_b),
+            _ => None,
+        }
+    }
+
+    /// # Safety
+    /// See [`super::nntmux_w48_predb_entry_batch`].
+    #[allow(clippy::too_many_arguments)]
+    pub(super) unsafe fn evaluate(
+        operation: u8,
+        blob: *const u8,
+        blob_len: usize,
+        aux: *const u8,
+        aux_len: usize,
+        param_a: i64,
+        param_b: i64,
+        output: *mut u8,
+        capacity: usize,
+    ) -> isize {
+        if !nfo_abi_range(blob, blob_len, false)
+            || !nfo_abi_range(aux, aux_len, false)
+            || !nfo_abi_range(output, capacity, false)
+            || blob_len > MAX_INPUT
+            || aux_len > MAX_INPUT
+            || yenc_ranges_overlap(blob as usize, blob_len, output as usize, capacity)
+            || yenc_ranges_overlap(aux as usize, aux_len, output as usize, capacity)
+        {
+            return -1;
+        }
+        let blob = unsafe { slice::from_raw_parts(blob, blob_len) };
+        let aux = unsafe { slice::from_raw_parts(aux, aux_len) };
+        let Some(result) = compute(operation, blob, aux, param_a, param_b) else {
+            return -1;
+        };
+        let needed = result.len() * 8;
+        if needed > capacity {
+            return -(needed as isize);
+        }
+        let out = unsafe { slice::from_raw_parts_mut(output, needed) };
+        for (chunk, value) in out.as_chunks_mut::<8>().0.iter_mut().zip(&result) {
+            chunk.copy_from_slice(&value.to_le_bytes());
+        }
+        needed as isize
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn fnv_of(bytes: &[u8]) -> i64 {
+            let mut f = Fnv::new();
+            f.bytes(bytes);
+            f.finish()
+        }
+
+        fn joined(items: &[&[u8]]) -> Vec<u8> {
+            items.join(&0u8)
+        }
+
+        fn i64s(values: &[i64]) -> Vec<u8> {
+            values.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+
+        #[test]
+        fn nfo_w48_fnv_and_split_match_php() {
+            assert_eq!(fnv_of(b""), -3_750_763_034_362_895_579);
+            assert_eq!(fnv_of(b"foobar"), -8_821_353_812_377_114_648);
+            assert_eq!(split_exact(b"", 0), Some(vec![]));
+            assert_eq!(split_exact(b"a", 0), None);
+            assert_eq!(split_exact(b"", 1), Some(vec![&b""[..]]));
+            assert_eq!(split_exact(b"a\0b", 2), Some(vec![&b"a"[..], &b"b"[..]]));
+            assert_eq!(split_exact(b"a\0b\0c", 2), None);
+            assert_eq!(split_exact(b"a", 2), None);
+            assert_eq!(read_i64s(&[0; 7]), None);
+            assert_eq!(trim_sp(b" \t a b\t "), b"a b");
+        }
+
+        #[test]
+        fn nfo_w48_entry_parses_sizes_categories_and_files() {
+            assert_eq!(size_kb(b""), -1);
+            assert_eq!(size_kb(b"1MB"), 1024);
+            assert_eq!(size_kb(b"1.5mb"), 1536);
+            assert_eq!(size_kb(b"1.05GB"), 1_101_004);
+            assert_eq!(size_kb(b"512KB"), 512);
+            assert_eq!(size_kb(b"999999.99GB"), 1_048_575_989_514);
+            for bad in [&b"1234567MB"[..], b"1.234MB", b"1.MB", b".5MB", b"1 MB", b"1TB", b"1M", b"MB", b"1MBx"] {
+                assert_eq!(size_kb(bad), -2, "{bad:?}");
+            }
+            assert_eq!(category_class(b""), 0);
+            assert_eq!(category_class(b"tv-hd"), 1);
+            assert_eq!(category_class(b"X264/HD"), 2);
+            assert_eq!(category_class(b"Flac"), 3);
+            assert_eq!(category_class(b"-TV"), 8);
+            assert_eq!(category_class(b"BLURAYS"), 8);
+            let blob = joined(&[
+                b" The.Show.S01E01-GRP ", b"the show s01e01-grp", b"", b"Plain Title",
+                b"PreDB", b"predb ", b"", b"xrel",
+                b"TV-HD", b"tv", b"", b"Apps",
+                b"1.5MB", b"700KB", b"", b"bad",
+                b"12", b"0", b"", b"x1",
+            ]);
+            let out = entry(&blob, &i64s(&[0, 2, 9, 3])).unwrap();
+            assert_eq!(&out[..29], &[
+                4, 3, 1, 1, 1, 2, 49, 2, 1, 1, 2, 0, 0, 0, 1, 0, 0, 0, 1, 1, 2236, 1536, 2, 1, 12, 1, 1,
+                1, 1,
+            ]);
+            assert_eq!(entry(b"a\0b\0c\0d\0e\0f", &i64s(&[0])), None);
+            assert_eq!(entry(b"", b"").unwrap()[0], 0);
+            assert_eq!(entry(b"", &[0; 7]), None);
+        }
+
+        #[test]
+        fn nfo_w48_source_keys_resolve_exact_and_normalized() {
+            let blob = joined(&[b"srrdb", b" XREL-P2P ", b"srrdb", b"", b"nope", b"Scene Archive Sql"]);
+            let out = source_keys(&blob, 6).unwrap();
+            assert_eq!(&out[..25], &[
+                6, 1, 4, 1, 2, 2, 1, 3, 2, 0, 1, 0, 0, 0, 0, 0, 2, 1, 1, 0, 0, 2, 4,
+                (1 << 5) | (1 << 7) | (1 << 33), 39,
+            ]);
+            assert_eq!(source_keys(b"", 0).unwrap()[22], -1);
+            assert_eq!(source_keys(b"a", 0), None);
+            assert_eq!(source_keys(b"a", -1), None);
+            assert_eq!(compute(1, b"a", b"x", 1, 0), None);
+        }
+
+        #[test]
+        fn nfo_w48_bounded_responses_classify_headers() {
+            assert_eq!(status_line(b"HTTP/1.1 200 OK"), 200);
+            assert_eq!(status_line(b"HTTP/2 429"), 429);
+            for bad in [&b"HTTP/ 200"[..], b"HTTP/1.1 600", b"HTTP/1.1 2000", b"http/1.1 200", b"HTTP/1.1  200", b"HTTP/1.1 099"] {
+                assert_eq!(status_line(bad), 0, "{bad:?}");
+            }
+            let blob = joined(&[
+                b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nContent-Encoding: GZIP\r\n",
+                b"HTTP/1.1 503\r\nRetry-After: 120\r\nbroken\r\n: x\r\n",
+                b"HTTP/1.1 200\r\nTransfer-Encoding: Chunked\r\nContent-Encoding: br",
+                b"garbage",
+                b"HTTP/1.1 200\nContent-Length: 5\nContent-Length: 6",
+            ]);
+            let out = bounded(&blob, &i64s(&[4, 0, 0, 0, 200]), 100).unwrap();
+            assert_eq!(out[0..9], [5, 1, 1, 1, 1, 0, 1, 0, 0]);
+            assert_eq!(out[9..13], [3, 0, 0, 1]);
+            assert_eq!(out[13..20], [1, 1, 1, 1, 0, 1, 10]);
+            assert_eq!(out[20..28], [97, 96, 1, 120, 120, 0, 7, 2]);
+        }
+
+        #[test]
+        fn nfo_w48_preflight_validates_urls_and_etags() {
+            assert_eq!(url(b"https://u:p@Example.COM:8443/a?b").0, 0);
+            assert_eq!(url(b"https://u:p@Example.COM:8443/a?b").1, 1 | 2 | 16 | 32);
+            assert_eq!(url(b"https://u:p@Example.COM:8443/a?b").2, b"example.com");
+            assert_eq!(url(b"http://[::1]:80/").1, 8);
+            assert_eq!(url(b"http://10.0.0.1").1, 4);
+            assert_eq!(url(b"ftp://x").0, 2);
+            for bad in [&b"x"[..], b"http://", b"http://-a.b", b"http://a:0", b"http://a:99999", b"http://[::1", b"http://[]", b"http://[::1]x", b"http://a_b"] {
+                assert_eq!(url(bad).0, 1, "{bad:?}");
+            }
+            assert_eq!(etag(b" W/\"abc\" "), (3, &b"\"abc\""[..]));
+            assert_eq!(etag(b"\"\""), (2, &b"\"\""[..]));
+            assert_eq!(etag(b"\"a b\"").0, 1);
+            assert_eq!(etag(b"\"").0, 1);
+            assert_eq!(etag(b"").0, 0);
+        }
+
+        #[test]
+        fn nfo_w48_update_lock_parses_json_like_php() {
+            let ok = |s: &[u8]| parse_lock(s).is_some();
+            for good in [&b"{}"[..], b" [ ] ", b"{\"pid\":5}", b"[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]", b"{\"a\":\"\\ud83d\\ude00\"}", b"\r\n{}\n"] {
+                assert!(ok(good), "{good:?}");
+            }
+            for bad in [&b""[..], b"1", b"null", b"[1,]", b"{\"a\"}", b"[01]", b"[1.]", b"[\"\\ud800\"]", b"[\"\\udc00\"]",
+                b"[\"\t\"]", b"[TRUE]", b"{}{}", b"[[[[[[[[[[[[[[[[1]]]]]]]]]]]]]]]]", b"[\"\xff\"]", b"[\"\\x\"]"] {
+                assert!(!ok(bad), "{bad:?}");
+            }
+            let lock = parse_lock(b"{\"p\\u0069d\":1,\"pid\":7,\"host\":\" h\\u00e9 \",\"started_at\":9223372036854775808}").unwrap();
+            assert!(lock.pid == Some(Field::Int(7)));
+            assert!(lock.started == Some(Field::Other));
+            assert_eq!(lock.host, Some(Some(" h\u{e9} ".as_bytes().to_vec())));
+            let blob = joined(&[
+                b"{\"pid\":10,\"started_at\":1000}",
+                b"{\"pid\":11,\"started_at\":100,\"ttl\":50}",
+                b"{\"pid\":12,\"started_at\":1100,\"host\":\"a\"}",
+                b"{\"pid\":13,\"started_at\":1500}",
+                b"{\"pid\":0}",
+                b"{\"host\":\"a\"}",
+                b"nope",
+            ]);
+            let out = update_lock(&blob, &i64s(&[12, 7]), 1100, 600).unwrap();
+            assert_eq!(&out[..13], &[7, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 2, 1]);
+            assert_eq!(out[13..15], [1000, 500]);
+            assert_eq!(update_lock(b"", &i64s(&[1]), 0, 0), None);
+        }
+
+        #[test]
+        fn nfo_w48_exports_validate_capacity_and_ranges() {
+            let mut out = [0u8; 512];
+            let exports: [unsafe extern "C" fn(*const u8, usize, *const u8, usize, i64, i64, *mut u8, usize) -> isize; 5] = [
+                super::super::nntmux_w48_predb_entry_batch,
+                super::super::nntmux_w48_predb_source_key_batch,
+                super::super::nntmux_w48_bounded_response_batch,
+                super::super::nntmux_w48_http_preflight_batch,
+                super::super::nntmux_w48_update_lock_batch,
+            ];
+            let lock_aux = i64s(&[1, 0]);
+            for (op, export) in exports.iter().enumerate() {
+                let aux: &[u8] = if op == 4 { &lock_aux } else { b"" };
+                let want = (SLOTS[op] * 8) as isize;
+                let call = |out: *mut u8, cap: usize| unsafe {
+                    export(b"".as_ptr(), 0, aux.as_ptr(), aux.len(), 0, 0, out, cap)
+                };
+                assert_eq!(call(out.as_mut_ptr(), 8), -want);
+                assert_eq!(call(out.as_mut_ptr(), 512), want);
+                assert_eq!(call(std::ptr::null_mut(), 512), -1);
+                assert_eq!(unsafe { export(std::ptr::null(), 0, aux.as_ptr(), aux.len(), 0, 0, out.as_mut_ptr(), 512) }, -1);
+            }
+            let mut shared = [b'x'; 512];
+            let p = shared.as_mut_ptr();
+            assert_eq!(unsafe { evaluate(1, p, 1, p, 0, 1, 0, p, 208) }, -1);
+            assert_eq!(unsafe { evaluate(1, p, 1, p, 0, 1, 0, p.add(8), 208) }, 208);
+            assert_eq!(compute(9, b"", b"", 0, 0), None);
+            assert_eq!(compute(0, b"", b"", 1, 0), None);
+        }
+    }
+}
+
+/// Wave 48.2 PredbFeedEntry::summarizeEntryBatch(): `blob` holds the NUL-joined titles, sources,
+/// categories, sizes and file counts (five columns of equal length) and `aux` one little-endian i64
+/// nuke state per entry; both integer parameters must be zero. Writes 30 little-endian `i64`
+/// counters and returns the byte count, the negated required capacity when `out_cap` is too small
+/// (nothing written), or -1 for malformed input.
+///
+/// # Safety
+/// Both input ranges and the output must be live allocations of the given lengths, the output must not
+/// overlap either input, and pointers must be non-null even for zero lengths.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_w48_predb_entry_batch(
+    blob: *const u8,
+    blob_len: usize,
+    aux: *const u8,
+    aux_len: usize,
+    reserved_a: i64,
+    reserved_b: i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| unsafe {
+        wave48_predb_entry_factory_bounded_http_update_lock::evaluate(
+            0, blob, blob_len, aux, aux_len, reserved_a, reserved_b, out_buf, out_cap,
+        )
+    })
+    .unwrap_or(-1)
+}
+
+/// Wave 48.2 PredbFeedSourceFactory::classifySourceKeyBatch(): `blob` holds `count` NUL-joined feed
+/// keys and `aux` must be empty, as must `reserved`. Writes 26 `i64` counters; see
+/// [`nntmux_w48_predb_entry_batch`] for the return and safety contract.
+///
+/// # Safety
+/// As for [`nntmux_w48_predb_entry_batch`].
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_w48_predb_source_key_batch(
+    blob: *const u8,
+    blob_len: usize,
+    aux: *const u8,
+    aux_len: usize,
+    count: i64,
+    reserved: i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| unsafe {
+        wave48_predb_entry_factory_bounded_http_update_lock::evaluate(
+            1, blob, blob_len, aux, aux_len, count, reserved, out_buf, out_cap,
+        )
+    })
+    .unwrap_or(-1)
+}
+
+/// Wave 48.2 BoundedHttpFeedSource::planBoundedResponseBatch(): `blob` holds the NUL-joined raw
+/// response header blocks, `aux` one little-endian i64 received byte count per block and
+/// `maximum_body_bytes` the wire cap (clamped to 1..=2^40); `reserved` must be zero. Writes 29 `i64`
+/// counters; see [`nntmux_w48_predb_entry_batch`] for the return and safety contract.
+///
+/// # Safety
+/// As for [`nntmux_w48_predb_entry_batch`].
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_w48_bounded_response_batch(
+    blob: *const u8,
+    blob_len: usize,
+    aux: *const u8,
+    aux_len: usize,
+    maximum_body_bytes: i64,
+    reserved: i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| unsafe {
+        wave48_predb_entry_factory_bounded_http_update_lock::evaluate(
+            2,
+            blob,
+            blob_len,
+            aux,
+            aux_len,
+            maximum_body_bytes,
+            reserved,
+            out_buf,
+            out_cap,
+        )
+    })
+    .unwrap_or(-1)
+}
+
+/// Wave 48.2 HttpFeedSource::preflightRequestBatch(): `blob` holds the NUL-joined URLs, response
+/// ETags and cached ETags (three columns of equal length), `aux` the little-endian i64 statuses
+/// followed by the i64 payload sizes, and `maximum_payload_bytes` the payload cap (clamped to
+/// 1..=2^40); `reserved` must be zero. Writes 30 `i64` counters; see
+/// [`nntmux_w48_predb_entry_batch`] for the return and safety contract.
+///
+/// # Safety
+/// As for [`nntmux_w48_predb_entry_batch`].
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_w48_http_preflight_batch(
+    blob: *const u8,
+    blob_len: usize,
+    aux: *const u8,
+    aux_len: usize,
+    maximum_payload_bytes: i64,
+    reserved: i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| unsafe {
+        wave48_predb_entry_factory_bounded_http_update_lock::evaluate(
+            3,
+            blob,
+            blob_len,
+            aux,
+            aux_len,
+            maximum_payload_bytes,
+            reserved,
+            out_buf,
+            out_cap,
+        )
+    })
+    .unwrap_or(-1)
+}
+
+/// Wave 48.2 NntmuxUpdateLock::evaluateLockBatch(): `blob` holds the NUL-joined lock-file payloads
+/// and `aux` the little-endian i64 current PID followed by the i64 payload count; `now` is clamped to
+/// 0..=2^40 and `ttl_seconds` to 1..=2^31. Writes 17 `i64` counters; see
+/// [`nntmux_w48_predb_entry_batch`] for the return and safety contract.
+///
+/// # Safety
+/// As for [`nntmux_w48_predb_entry_batch`].
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_w48_update_lock_batch(
+    blob: *const u8,
+    blob_len: usize,
+    aux: *const u8,
+    aux_len: usize,
+    now: i64,
+    ttl_seconds: i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| unsafe {
+        wave48_predb_entry_factory_bounded_http_update_lock::evaluate(
+            4, blob, blob_len, aux, aux_len, now, ttl_seconds, out_buf, out_cap,
+        )
+    })
+    .unwrap_or(-1)
+}

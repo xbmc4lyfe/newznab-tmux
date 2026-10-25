@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services;
 
+use App\Services\Predb\Feeds\PredbFeedEntry;
 use App\Support\RustPipelineLibrary;
 use Closure;
 use FFI;
@@ -26,6 +27,33 @@ CDEF;
     private static ?bool $useRustFfi = null;
 
     private static FFI|false|null $ffi = null;
+
+    /**
+     * Wave 48.2 production default for evaluateLockBatch() is Rust: the paired benchmark in
+     * tests/Unit/RustPredbEntryFactoryBoundedHttpUpdateLockW48ParityTest.php measures 1.97-2.17x mean and 1.97-2.61x p99 on common batches and 2.75-3.05x mean and 2.50-3.24x p99 on uncommon batches.
+     * PHP stays the fallback when the library is unavailable or a payload holds a NUL byte.
+     */
+    public const bool W48_LOCK_RUST_FFI_DEFAULT = true;
+
+    public const string W48_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w48_update_lock_batch(const char *blob, size_t blob_len, const char *aux, size_t aux_len, int64_t now, int64_t ttl_seconds, char *out_buf, size_t out_cap);
+        C;
+
+    /** Largest timestamp the Wave 48.2 lock evaluator accepts, so every age stays exact. */
+    private const int W48_LOCK_MAX_SPAN = 1 << 40;
+
+    /** Lock files may start up to this many seconds in the future (clock skew) before they count as future. */
+    private const int W48_LOCK_SKEW = 300;
+
+    /** Longest per-lock ttl override honoured, in seconds. */
+    private const int W48_LOCK_MAX_TTL = 604800;
+
+    private const array W48_LOCK_KEYS = ['total', 'invalid_json', 'missing_pid', 'invalid_pid', 'missing_started_at', 'invalid_started_at', 'future',
+        'stale', 'own', 'held', 'custom_ttl', 'with_host', 'distinct_hosts', 'max_age', 'min_remaining', 'payload_bytes', 'digest'];
+
+    private static ?bool $w48LockRustFfiOverride = null;
+
+    private static FFI|false|null $w48LockRustFfiHandle = null;
 
     public static function usesRustFfi(): bool
     {
@@ -110,6 +138,141 @@ CDEF;
         }
 
         return self::additionalResult(5, [$commandName], value: $elapsedSeconds)[0] ?? self::formatWaitingMessagePhp($commandName, $elapsedSeconds);
+    }
+
+    /** Force the Wave 48.2 lock evaluator onto Rust (true) or PHP (false); null restores W48_LOCK_RUST_FFI_DEFAULT. */
+    public static function useW48LockRustFfi(?bool $enable = true): void
+    {
+        self::$w48LockRustFfiOverride = $enable;
+    }
+
+    public static function usesW48LockRustFfi(): bool
+    {
+        return self::$w48LockRustFfiOverride ?? self::W48_LOCK_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW48LockRustFfi(): void
+    {
+        self::$w48LockRustFfiOverride = null;
+        self::$w48LockRustFfiHandle = null;
+    }
+
+    /**
+     * Evaluate a batch of JSON lock-file payloads (json_decode() depth 16) for $currentPid at $now (clamped to 0..2^40)
+     * with a default $ttlSeconds (clamped to 1..2^31) that a payload's own ttl of 1-604800 seconds overrides: invalid
+     * JSON, missing or invalid pid and started_at, locks started over 300 seconds in the future, stale locks, locks this
+     * process owns and locks held by another, distinct hosts, the oldest age and the shortest remaining hold, payload
+     * bytes and an FNV-1a digest of every payload's status, pid and age in order.
+     *
+     * @param  list<string>  $payloads
+     * @return array<string, int>
+     */
+    public static function evaluateLockBatch(array $payloads, int $currentPid, int $now, int $ttlSeconds = 3600): array
+    {
+        return (self::usesW48LockRustFfi() ? self::evaluateLockBatchNative($payloads, $currentPid, $now, $ttlSeconds) : null)
+            ?? self::evaluateLockBatchPhp($payloads, $currentPid, $now, $ttlSeconds);
+    }
+
+    /**
+     * @param  list<string>  $payloads
+     * @return array<string, int>
+     */
+    public static function evaluateLockBatchPhp(array $payloads, int $currentPid, int $now, int $ttlSeconds = 3600): array
+    {
+        $now = max(0, min(self::W48_LOCK_MAX_SPAN, $now));
+        $ttl = max(1, min(1 << 31, $ttlSeconds));
+        $c = array_fill(0, \count(self::W48_LOCK_KEYS), 0);
+        $c[13] = $c[14] = -1;
+        $hosts = [];
+        $stream = '';
+        foreach ($payloads as $payload) {
+            $c[0]++;
+            $c[15] += \strlen($payload);
+            $decoded = json_decode($payload, true, 16);
+            if (! \is_array($decoded)) {
+                $c[1]++;
+                $stream .= pack('Cx16', 0);
+
+                continue;
+            }
+            $pid = $decoded['pid'] ?? null;
+            $started = $decoded['started_at'] ?? null;
+            $pidValue = $age = 0;
+            if ($pid === null) {
+                $status = 1;
+            } elseif (! \is_int($pid) || $pid < 1) {
+                $status = 2;
+            } elseif ($started === null) {
+                $status = 3;
+                $pidValue = $pid;
+            } elseif (! \is_int($started) || $started < 1 || $started > self::W48_LOCK_MAX_SPAN) {
+                $status = 4;
+                $pidValue = $pid;
+            } else {
+                $pidValue = $pid;
+                $effective = $ttl;
+                $custom = $decoded['ttl'] ?? null;
+                if (\is_int($custom) && $custom >= 1 && $custom <= self::W48_LOCK_MAX_TTL) {
+                    $c[10]++;
+                    $effective = $custom;
+                }
+                if ($started > $now + self::W48_LOCK_SKEW) {
+                    $status = 5;
+                } else {
+                    $age = $now - $started;
+                    $c[13] = max($c[13], $age);
+                    if ($age > $effective) {
+                        $status = 6;
+                    } elseif ($pid === $currentPid) {
+                        $status = 7;
+                    } else {
+                        $remaining = $effective - $age;
+                        $c[14] = $c[14] < 0 ? $remaining : min($c[14], $remaining);
+                        $status = 8;
+                    }
+                }
+            }
+            $c[$status + 1]++;
+            $host = $decoded['host'] ?? null;
+            if (\is_string($host) && ($host = trim($host)) !== '') {
+                $c[11]++;
+                $hosts[$host] = true;
+            }
+            $stream .= pack('CPP', $status, $pidValue, $age);
+        }
+        $c[12] = \count($hosts);
+        $c[16] = PredbFeedEntry::w48Fnv($stream);
+
+        return array_combine(self::W48_LOCK_KEYS, $c);
+    }
+
+    /**
+     * Null when the library is missing, a payload holds a NUL byte or the batch exceeds the native limits.
+     *
+     * @param  list<string>  $payloads
+     * @return array<string, int>|null
+     */
+    public static function evaluateLockBatchNative(array $payloads, int $currentPid, int $now, int $ttlSeconds = 3600): ?array
+    {
+        $count = \count($payloads);
+        $ffi = self::w48LockRustFfi();
+        if ($ffi === null || $count > PredbFeedEntry::W48_MAX_ITEMS) {
+            return null;
+        }
+        $values = PredbFeedEntry::callW48Native($ffi, 'nntmux_w48_update_lock_batch', implode("\0", $payloads), pack('q2', $currentPid, $count),
+            $now, $ttlSeconds, \count(self::W48_LOCK_KEYS));
+        if ($values === null || $values[0] !== $count || array_sum(\array_slice($values, 1, 9)) !== $count) {
+            return null;
+        }
+
+        return array_combine(self::W48_LOCK_KEYS, $values);
+    }
+
+    private static function w48LockRustFfi(): ?FFI
+    {
+        self::$w48LockRustFfiHandle ??= RustPipelineLibrary::resolveDomain(PredbFeedEntry::W48_FFI_DOMAIN, self::W48_FFI_CDEF) ?? false;
+
+        return self::$w48LockRustFfiHandle === false ? null : self::$w48LockRustFfiHandle;
     }
 
     /** @var resource|null */
