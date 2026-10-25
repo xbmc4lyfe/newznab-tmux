@@ -902,4 +902,146 @@ class TmdbClient
 
         return $value ?? $default;
     }
+
+    /** Enabled: seven paired runs cleared 1.5x on every gate (min common mean 2.22x, p99 1.53x; uncommon mean 2.13x, p99 2.05x; see the W46 parity test). */
+    public const bool W464_RUST_FFI_DEFAULT = true;
+
+    public const string W464_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w464_tmdb_image_path_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private const array W464_SUMMARY_KEYS = ['total_entries', 'empty_count', 'rooted_count', 'absolute_url_count', 'jpeg_count', 'png_count', 'svg_count', 'canonical_count', 'unsafe_char_count', 'double_slash_count', 'traversal_count'];
+
+    /** unpack() format for the eleven little-endian int64 counters, in W464_SUMMARY_KEYS order. */
+    private const string W464_UNPACK = 'Ptotal_entries/Pempty_count/Prooted_count/Pabsolute_url_count/Pjpeg_count/Ppng_count/Psvg_count/Pcanonical_count/Punsafe_char_count/Pdouble_slash_count/Ptraversal_count';
+
+    private static ?bool $w464UseRustFfi = null;
+
+    private static FFI|false|null $w464Ffi = null;
+
+    /** Null restores the benchmark-qualified default. */
+    public static function useW464RustFfi(?bool $enable = true): void
+    {
+        self::$w464UseRustFfi = $enable;
+    }
+
+    public static function usesW464RustFfi(): bool
+    {
+        return self::$w464UseRustFfi ?? self::W464_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW464RustFfi(): void
+    {
+        self::$w464UseRustFfi = null;
+        self::$w464Ffi = null;
+    }
+
+    /**
+     * Summarize image paths as getImageUrl() sees them (untrimmed; '' and
+     * '0' are empty): rooted paths, absolute URLs, JPEG/PNG/SVG extensions,
+     * canonical /<alnum>.<ext> paths, bytes outside [A-Za-z0-9._/-], double
+     * slashes and .. segments. Entries come from strings, integers, or the
+     * file_path, poster_path, backdrop_path, profile_path, still_path or
+     * logo_path field; other values count as empty.
+     *
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeTmdbImagePathBatch(array $entries): array
+    {
+        return self::usesW464RustFfi()
+            ? self::summarizeTmdbImagePathBatchNative($entries)
+            : self::summarizeTmdbImagePathBatchPhp($entries);
+    }
+
+    /**
+     * Rust summary; falls back to PHP when the library or input frame is unusable.
+     *
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeTmdbImagePathBatchNative(array $entries): array
+    {
+        return self::w464Call(self::w464Entries($entries)) ?? self::summarizeTmdbImagePathBatchPhp($entries);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeTmdbImagePathBatchPhp(array $entries): array
+    {
+        $summary = array_fill_keys(self::W464_SUMMARY_KEYS, 0);
+        foreach (self::w464Entries($entries) as $entry) {
+            $summary['total_entries']++;
+            if ($entry === '' || $entry === '0') {
+                $summary['empty_count']++;
+
+                continue;
+            }
+            $summary['rooted_count'] += (int) ($entry[0] === '/');
+            $summary['absolute_url_count'] += (int) (preg_match('#\A[Hh][Tt][Tt][Pp][Ss]?://#', $entry) === 1);
+            $summary['jpeg_count'] += (int) (preg_match('/\.[Jj][Pp][Ee]?[Gg]\z/', $entry) === 1);
+            $summary['png_count'] += (int) (preg_match('/\.[Pp][Nn][Gg]\z/', $entry) === 1);
+            $summary['svg_count'] += (int) (preg_match('/\.[Ss][Vv][Gg]\z/', $entry) === 1);
+            $summary['canonical_count'] += (int) (preg_match('#\A/[A-Za-z0-9]+\.(?:jpg|png|svg)\z#', $entry) === 1);
+            $summary['unsafe_char_count'] += (int) (preg_match('#[^A-Za-z0-9._/-]#', $entry) === 1);
+            $summary['double_slash_count'] += (int) str_contains($entry, '//');
+            $summary['traversal_count'] += (int) str_contains($entry, '..');
+        }
+
+        return $summary;
+    }
+
+    /** Only integer and string entries participate; objects are never cast or serialized.
+     *
+     * @param  array<array-key, mixed>  $input
+     * @return list<string>
+     */
+    private static function w464Entries(array $input): array
+    {
+        $entries = [];
+        foreach ($input as $item) {
+            if (is_array($item)) {
+                $item = $item['file_path'] ?? $item['poster_path'] ?? $item['backdrop_path'] ?? $item['profile_path'] ?? $item['still_path'] ?? $item['logo_path'] ?? null;
+            }
+            $entries[] = is_string($item) || is_int($item) ? (string) $item : '';
+        }
+
+        return $entries;
+    }
+
+    /** @param list<string> $entries
+     * @return array<string, int>|null
+     */
+    private static function w464Call(array $entries): ?array
+    {
+        try {
+            $input = serialize($entries);
+            if (strlen($input) > 16777216) {
+                return null;
+            }
+            self::$w464Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w464', self::W464_FFI_CDEF) ?? false;
+            $ffi = self::$w464Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            // obtainScratch() returns at least the 88 bytes requested.
+            $out = RustPipelineLibrary::obtainScratch($ffi, 88);
+            // @phpstan-ignore method.notFound (Declared by W464_FFI_CDEF.)
+            if ($out === null || $ffi->nntmux_w464_tmdb_image_path_batch($input, strlen($input), $out, 88) !== 88) {
+                return null;
+            }
+            /** @var array<string, int>|false $summary */
+            $summary = unpack(self::W464_UNPACK, FFI::string($out, 88));
+            $total = count($entries);
+            if ($summary === false || $summary['total_entries'] !== $total || min($summary) < 0 || max($summary) > $total) {
+                return null;
+            }
+
+            return $summary;
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }
