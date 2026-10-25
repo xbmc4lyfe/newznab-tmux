@@ -129,6 +129,168 @@ class AnidbService
         return ['elapsed_seconds' => $elapsed, 'required_wait_seconds' => $required, 'remaining_sleep_seconds' => $remaining, 'backoff_multiplier' => $multiplier, 'ready_to_request' => $remaining === 0];
     }
 
+    /** Enabled: seven paired runs cleared 1.5x on every gate (min common mean 2.69x, p99 1.69x; uncommon mean 3.53x, p99 2.82x; see the W45 parity test). */
+    public const bool W454_RUST_FFI_DEFAULT = true;
+
+    public const string W454_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w454_anidb_title_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private const array W454_SUMMARY_KEYS = ['total_titles', 'empty_title_count', 'bracket_tag_count', 'paren_tag_count', 'language_tag_count', 'adult_tag_count', 'date_code_count', 'quality_tag_count', 'release_tag_count', 'sxxexx_count', 'trailing_number_count', 'episode_suffix_count', 'volume_suffix_count', 'mojibake_count'];
+
+    private static ?bool $w454UseRustFfi = null;
+
+    private static FFI|false|null $w454Ffi = null;
+
+    /** Null restores the benchmark-qualified default. */
+    public static function useW454RustFfi(?bool $enable = true): void
+    {
+        self::$w454UseRustFfi = $enable;
+    }
+
+    public static function usesW454RustFfi(): bool
+    {
+        return self::$w454UseRustFfi ?? self::W454_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW454RustFfi(): void
+    {
+        self::$w454UseRustFfi = null;
+        self::$w454Ffi = null;
+    }
+
+    /**
+     * Summarize raw anime titles by the tag families cleanTitlePhp() strips:
+     * bracket/parenthesis tags, language, adult, six-digit date, quality and
+     * release words, SxxEyy markers, trailing numbers, E/Ep/Episode and Vol/Ch
+     * suffixes, and the mojibake fixEncodingPhp() repairs. Titles are trimmed
+     * first; entries come from strings, integers, or the title, name or
+     * searchname field, and other values count as empty. PCRE runs without /u,
+     * so \b, \s and /i are ASCII-only.
+     *
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeAnidbTitleBatch(array $entries): array
+    {
+        return self::usesW454RustFfi()
+            ? self::summarizeAnidbTitleBatchNative($entries)
+            : self::summarizeAnidbTitleBatchPhp($entries);
+    }
+
+    /**
+     * Rust summary; falls back to PHP when the library or input frame is unusable.
+     *
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeAnidbTitleBatchNative(array $entries): array
+    {
+        return self::w454Call(self::w454Entries($entries)) ?? self::summarizeAnidbTitleBatchPhp($entries);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeAnidbTitleBatchPhp(array $entries): array
+    {
+        $summary = array_fill_keys(self::W454_SUMMARY_KEYS, 0);
+        foreach (self::w454Entries($entries) as $title) {
+            $summary['total_titles']++;
+            $title = trim($title);
+            if ($title === '') {
+                $summary['empty_title_count']++;
+
+                continue;
+            }
+            $summary['bracket_tag_count'] += (int) (preg_match('/\[[^\]]+\]/', $title) === 1);
+            $summary['paren_tag_count'] += (int) (preg_match('/\([^)]+\)/', $title) === 1);
+            $summary['language_tag_count'] += (int) (preg_match('/\b(?:ENG|JAP|JPN|SUB|DUB|MULTI|RAW|HARDSUB|SOFTSUB|HARDDUB|SOFTDUB|ITA|SPA|FRE|GER|RUS|CHI|KOR)\b/i', $title) === 1);
+            $summary['adult_tag_count'] += (int) (preg_match('/\b(?:JAV|Uncensored|Censored|Mosaic|Mosaic-less|HD|SD|FHD|UHD)\b/i', $title) === 1);
+            $summary['date_code_count'] += (int) (preg_match('/\b\d{6}\b/', $title) === 1);
+            $summary['quality_tag_count'] += (int) (preg_match('/\b(?:480p|720p|1080p|2160p|4K|BD|BDRip|BluRay|Blu-Ray|HEVC|x264|x265|H264|H265|WEB|WEBRip|DVDRip|TVRip)\b/i', $title) === 1);
+            $summary['release_tag_count'] += (int) (preg_match('/\b(?:PROPER|REPACK|RIP|ISO|CRACK|BETA|ALPHA|FINAL|COMPLETE|FULL)\b/i', $title) === 1);
+            $summary['sxxexx_count'] += (int) (preg_match('/\sS\d+E\d+/i', $title) === 1);
+            $summary['trailing_number_count'] += (int) (preg_match('/(?:[-_]|\s)\s*\d{1,4}\z/', $title) === 1);
+            $summary['episode_suffix_count'] += (int) (preg_match('/\sE(?:p(?:isode)?)?\s*0*\d{1,4}\z/i', $title) === 1);
+            $summary['volume_suffix_count'] += (int) (preg_match('/\s(?:Vol|Ch)\.?\s*\d*\z/i', $title) === 1);
+            $summary['mojibake_count'] += (int) (str_contains($title, "\xc3\x83") || str_contains($title, "\xc3\x82"));
+        }
+
+        return $summary;
+    }
+
+    /** Only integer and string entries participate; objects are never cast or serialized.
+     *
+     * @param  array<array-key, mixed>  $input
+     * @return list<string>
+     */
+    private static function w454Entries(array $input): array
+    {
+        $entries = [];
+        foreach ($input as $item) {
+            if (is_array($item)) {
+                $item = $item['title'] ?? $item['name'] ?? $item['searchname'] ?? null;
+            }
+            $entries[] = is_string($item) || is_int($item) ? (string) $item : '';
+        }
+
+        return $entries;
+    }
+
+    /** @param list<string> $entries
+     * @return array<string, int>|null
+     */
+    private static function w454Call(array $entries): ?array
+    {
+        try {
+            $input = serialize([$entries]);
+            if (strlen($input) > 16777216) {
+                return null;
+            }
+            self::$w454Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w454', self::W454_FFI_CDEF) ?? false;
+            $ffi = self::$w454Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            $capacity = 0;
+            $out = RustPipelineLibrary::obtainScratch($ffi, 2048, $capacity);
+            if ($out === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound (Declared by W454_FFI_CDEF.)
+            $written = $ffi->nntmux_w454_anidb_title_batch($input, strlen($input), $out, $capacity);
+            if (is_int($written) && $written < -1 && $written >= -16777216) {
+                $out = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($out === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound (Declared by W454_FFI_CDEF.)
+                $written = $ffi->nntmux_w454_anidb_title_batch($input, strlen($input), $out, $capacity);
+            }
+            if (! is_int($written) || $written <= 0 || $written > $capacity || $written > 16777216) {
+                return null;
+            }
+            $result = @unserialize(FFI::string($out, $written), ['allowed_classes' => false]);
+            if (! is_array($result) || array_keys($result) !== self::W454_SUMMARY_KEYS || $result['total_titles'] !== count($entries)) {
+                return null;
+            }
+            $summary = [];
+            foreach (self::W454_SUMMARY_KEYS as $key) {
+                $value = $result[$key];
+                if (! is_int($value) || $value < 0 || $value > count($entries)) {
+                    return null;
+                }
+                $summary[$key] = $value;
+            }
+
+            return $summary;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
     public const string FFI_CDEF = <<<'C'
         ssize_t nntmux_anidb_clean_title(const char *ptr, size_t len, char *out, size_t cap);
         ssize_t nntmux_anidb_extract_base_title(const char *ptr, size_t len, char *out, size_t cap);
