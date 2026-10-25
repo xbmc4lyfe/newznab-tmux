@@ -9,12 +9,58 @@ use App\Services\Categorization\CategorizationService;
 use App\Services\Categorization\ReleaseContext;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use Throwable;
 
 /**
  * Passable object that travels through the categorization pipeline.
  */
 class CategorizationPassable
 {
+    /**
+     * Wave 45.3 production default stays PHP: the paired benchmark in
+     * tests/Unit/RustPredbFeedsG4uGabberKnabenNima4kPassableW45ParityTest.php measures 1.53-1.64x
+     * mean but 1.21-1.52x p99 on the common 32-label batch (fixed FFI marshaling dominates the
+     * cheap prefix checks), below the 1.5x gate, although uncommon batches reach 1.9-2.9x.
+     * useW453RustFfi(true) keeps the Rust helper available for parity and benchmarks.
+     * Named W453 so it stays distinct from the class's existing native paths.
+     */
+    public const bool W453_RUST_FFI_DEFAULT = false;
+
+    public const string W453_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w453_categorization_passable_matched_by_batch(
+            const char *blob_ptr,
+            size_t blob_len,
+            const char *lens_ptr,
+            size_t lens_len,
+            char *out_buf,
+            size_t out_cap
+        );
+        C;
+
+    /** CategorizationResult::noMatch() label. */
+    public const string W453_NO_MATCH_LABEL = 'no_match';
+
+    /**
+     * Matched-by label prefixes, in match order.
+     *
+     * @var array<string, string>
+     */
+    public const array W453_LABEL_PREFIXES = [
+        'group_name' => 'group_name_',
+        'hash' => 'hash',
+        'gibberish' => 'gibberish_',
+    ];
+
+    /** Substring marking a fallback categorizer label. */
+    public const string W453_FALLBACK_MARKER = 'fallback';
+
+    /** Exactly 8 0x1F-separated decimals of 1-19 digits. */
+    private const string W453_FIELDS_PATTERN = '/\A(?:\d{1,19}\x1F){7}\d{1,19}\z/';
+
+    private static ?bool $w453RustFfiOverride = null;
+
+    private static FFI|false|null $w453RustFfiHandle = null;
+
     public static bool $useRustFfi = false;
 
     public ReleaseContext $context;
@@ -288,5 +334,166 @@ class CategorizationPassable
                 'categorizer_details' => $this->bestResult->debug,
             ],
         ];
+    }
+
+    /**
+     * Enables (true) or disables (false) the Wave 45.3 Rust helper; null restores
+     * W453_RUST_FFI_DEFAULT.
+     */
+    public static function useW453RustFfi(?bool $enable = true): void
+    {
+        self::$w453RustFfiOverride = $enable;
+    }
+
+    public static function usesW453RustFfi(): bool
+    {
+        return self::$w453RustFfiOverride ?? self::W453_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW453RustFfi(): void
+    {
+        self::$w453RustFfiOverride = null;
+        self::$w453RustFfiHandle = null;
+    }
+
+    /**
+     * Matched-by label summary for a batch of best results: an empty label is empty, the exact
+     * W453_NO_MATCH_LABEL is no_match, others add to their first W453_LABEL_PREFIXES class, else
+     * to other. Labels holding W453_FALLBACK_MARKER also count as fallback. Non-strings count as
+     * empty.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return array{total: int, empty: int, no_match: int, group_name: int, hash: int, gibberish: int, other: int, fallback: int}
+     */
+    public static function summarizeMatchedByBatch(array $items): array
+    {
+        return (self::usesW453RustFfi() ? self::summarizeMatchedByBatchNative($items) : null)
+            ?? self::summarizeMatchedByBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $items
+     * @return array{total: int, empty: int, no_match: int, group_name: int, hash: int, gibberish: int, other: int, fallback: int}
+     */
+    public static function summarizeMatchedByBatchPhp(array $items): array
+    {
+        $counts = ['empty' => 0, 'no_match' => 0, 'group_name' => 0, 'hash' => 0, 'gibberish' => 0, 'other' => 0];
+        $fallback = 0;
+        foreach ($items as $item) {
+            $label = \is_string($item) ? $item : '';
+            $fallback += (int) str_contains($label, self::W453_FALLBACK_MARKER);
+            if ($label === '') {
+                $counts['empty']++;
+
+                continue;
+            }
+            if ($label === self::W453_NO_MATCH_LABEL) {
+                $counts['no_match']++;
+
+                continue;
+            }
+            foreach (self::W453_LABEL_PREFIXES as $class => $prefix) {
+                if (str_starts_with($label, $prefix)) {
+                    $counts[$class]++;
+
+                    continue 2;
+                }
+            }
+            $counts['other']++;
+        }
+
+        return [
+            'total' => \count($items),
+            'empty' => $counts['empty'],
+            'no_match' => $counts['no_match'],
+            'group_name' => $counts['group_name'],
+            'hash' => $counts['hash'],
+            'gibberish' => $counts['gibberish'],
+            'other' => $counts['other'],
+            'fallback' => $fallback,
+        ];
+    }
+
+    /**
+     * Declines (null) for non-string items, and whenever Rust leaves a character class to PCRE2,
+     * so PHP counts them.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return array{total: int, empty: int, no_match: int, group_name: int, hash: int, gibberish: int, other: int, fallback: int}|null
+     */
+    public static function summarizeMatchedByBatchNative(array $items): ?array
+    {
+        $lengths = [];
+        foreach ($items as $item) {
+            if (! \is_string($item)) {
+                return null;
+            }
+            $lengths[] = \strlen($item);
+        }
+        $fields = self::callW453Native(implode('', $items), pack('V*', ...$lengths));
+        if ($fields === null) {
+            return null;
+        }
+
+        return [
+            'total' => (int) $fields[0],
+            'empty' => (int) $fields[1],
+            'no_match' => (int) $fields[2],
+            'group_name' => (int) $fields[3],
+            'hash' => (int) $fields[4],
+            'gibberish' => (int) $fields[5],
+            'other' => (int) $fields[6],
+            'fallback' => (int) $fields[7],
+        ];
+    }
+
+    /**
+     * Calls this class's Wave 45.3 export with the shared scratch buffer, retrying once at the size
+     * it asks for. Returns its fields only when they match W453_FIELDS_PATTERN: exactly the expected
+     * count of 1-19 digit decimals.
+     *
+     * @return list<string>|null
+     */
+    private static function callW453Native(string $blob, string $lens): ?array
+    {
+        $ffi = self::w453RustFfi();
+        if ($ffi === null) {
+            return null;
+        }
+
+        try {
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, 128, $capacity);
+            if ($buffer === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w453_categorization_passable_matched_by_batch($blob, \strlen($blob), $lens, \strlen($lens), $buffer, $capacity);
+            if (\is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w453_categorization_passable_matched_by_batch($blob, \strlen($blob), $lens, \strlen($lens), $buffer, $capacity);
+            }
+            if (! \is_int($written) || $written < 0 || $written > $capacity) {
+                return null;
+            }
+            $raw = FFI::string($buffer, $written);
+
+            return preg_match(self::W453_FIELDS_PATTERN, $raw) === 1 ? explode("\x1F", $raw) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private static function w453RustFfi(): ?FFI
+    {
+        if (self::$w453RustFfiHandle === null) {
+            self::$w453RustFfiHandle = RustPipelineLibrary::resolveDomain('categorize_w453', self::W453_FFI_CDEF) ?? false;
+        }
+
+        return self::$w453RustFfiHandle === false ? null : self::$w453RustFfiHandle;
     }
 }

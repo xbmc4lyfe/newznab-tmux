@@ -33691,3 +33691,811 @@ pub mod release_context_predb_feeds_w443 {
         }
     }
 }
+/// Wave 45.3 batch summaries for the G4U, Gabber, KNABEN and NIMA4K PreDB feed sources and the
+/// `CategorizationPassable` matched-by labels.
+///
+/// Reuses the Wave 42.3 packed string list contract: every export takes `blob` plus little-endian
+/// `u32` lengths and writes `0x1F`-separated decimals, returning the byte count, `-required`
+/// (without writing) when the output does not fit, or `-1` for invalid input or when a name holds
+/// a non-ASCII character whose `\s`/`\p{Z}`/`\p{C}` class is left to PHP's PCRE2 tables.
+pub mod predb_feeds_passable_w453 {
+    use super::categorizers_book_console_group_misc_movie_w423::{DECLINE, fields, with_strings};
+    use std::borrow::Cow;
+    use std::collections::HashSet;
+
+    /// PHP `trim()` default character set.
+    const TRIM_SET: &[u8] = b" \t\n\r\0\x0B";
+    /// `W453_MAX_TITLE_CHARS` in the G4U, Gabber and KNABEN sources (`mb_strlen()` characters).
+    const MAX_TITLE_CHARS: usize = 255;
+    /// UTF-8 horizontal ellipsis.
+    const ELLIPSIS: &[u8] = "\u{2026}".as_bytes();
+    /// `CategorizationPassable::W453_NO_MATCH_LABEL`.
+    const NO_MATCH: &[u8] = b"no_match";
+    /// `CategorizationPassable::W453_LABEL_PREFIXES` (group_name, hash, gibberish), in match order.
+    const LABEL_PREFIXES: [&[u8]; 3] = [b"group_name_", b"hash", b"gibberish_"];
+    /// `CategorizationPassable::W453_FALLBACK_MARKER`.
+    const FALLBACK: &[u8] = b"fallback";
+
+    fn trim(bytes: &[u8]) -> &[u8] {
+        let start = bytes
+            .iter()
+            .position(|b| !TRIM_SET.contains(b))
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|b| !TRIM_SET.contains(b))
+            .map_or(start, |i| i + 1);
+        &bytes[start..end]
+    }
+
+    /// Whether any byte satisfies `hit`, folding each 32-byte chunk without branches so the scan
+    /// vectorizes.
+    #[inline(always)]
+    fn any_byte(bytes: &[u8], hit: impl Fn(u8) -> bool + Copy) -> bool {
+        let (chunks, tail) = bytes.as_chunks::<32>();
+        for chunk in chunks {
+            if chunk.iter().fold(false, |acc, &b| acc | hit(b)) {
+                return true;
+            }
+        }
+        tail.iter().fold(false, |acc, &b| acc | hit(b))
+    }
+
+    /// Class of a non-ASCII character under `/[\s\p{Z}\p{C}]/u`: `Some(false)` for letters and
+    /// punctuation whose class is stable across Unicode versions, `Some(true)` for permanent
+    /// controls, separators, format, private-use and noncharacter code points, else `None`.
+    #[inline]
+    fn non_ascii_class(c: u32) -> Option<bool> {
+        match c {
+            0x00A1..=0x00AC
+            | 0x00AE..=0x017F
+            | 0x2010..=0x2027
+            | 0x3041..=0x3096
+            | 0x30A1..=0x30FA
+            | 0x4E00..=0x9FA5
+            | 0xAC00..=0xD7A3 => Some(false),
+            0x0080..=0x00A0
+            | 0x00AD
+            | 0x1680
+            | 0x2000..=0x200F
+            | 0x2028..=0x202F
+            | 0x205F..=0x2064
+            | 0x3000
+            | 0xE000..=0xF8FF
+            | 0xFDD0..=0xFDEF
+            | 0xFEFF
+            | 0xFFF9..=0xFFFB
+            | 0xE0001
+            | 0xE0020..=0xE007F
+            | 0xF0000..=0x10FFFF => Some(true),
+            _ if c & 0xFFFE == 0xFFFE => Some(true),
+            _ => None,
+        }
+    }
+
+    /// `preg_match('/[\s\p{Z}\p{C}]/u', $s) !== 0` plus `mb_strlen($s, 'UTF-8')`:
+    /// `Some((nonliteral, chars))`, where invalid UTF-8 is nonliteral (`preg_match()` fails), or
+    /// `None` when a character's class needs PCRE2. The count is only meaningful when literal.
+    fn literal_scan(s: &[u8]) -> Option<(bool, usize)> {
+        if s.is_ascii() {
+            return Some((any_byte(s, |b| (b <= 0x20) | (b == 0x7F)), s.len()));
+        }
+        let Ok(text) = std::str::from_utf8(s) else {
+            return Some((true, 0));
+        };
+        let mut unknown = false;
+        let mut chars = 0;
+        for c in text.chars() {
+            chars += 1;
+            let code = c as u32;
+            let nonliteral = if code < 0x80 {
+                (code <= 0x20) | (code == 0x7F)
+            } else {
+                match non_ascii_class(code) {
+                    Some(hit) => hit,
+                    None => {
+                        unknown = true;
+                        false
+                    }
+                }
+            };
+            if nonliteral {
+                return Some((true, chars));
+            }
+        }
+        (!unknown).then_some((false, chars))
+    }
+
+    /// `mb_strtolower($s, 'UTF-8')` for literal names accepted by [`literal_scan`].
+    fn lower(s: &[u8]) -> Cow<'_, [u8]> {
+        if s.is_ascii() {
+            if any_byte(s, |b| b.is_ascii_uppercase()) {
+                return Cow::Owned(s.to_ascii_lowercase());
+            }
+            return Cow::Borrowed(s);
+        }
+        let text = std::str::from_utf8(s).unwrap_or_default();
+        let mut out = String::with_capacity(s.len());
+        for c in text.chars() {
+            out.extend(c.to_lowercase());
+        }
+        Cow::Owned(out.into_bytes())
+    }
+
+    /// `str_contains($title, '...') || str_contains($title, '…')`, folded over byte triples.
+    fn truncated(title: &[u8]) -> bool {
+        let (Some(second), Some(third)) = (title.get(1..), title.get(2..)) else {
+            return false;
+        };
+        title
+            .iter()
+            .zip(second)
+            .zip(third)
+            .fold(false, |acc, ((&a, &b), &c)| {
+                acc | ((a == b'.') & (b == b'.') & (c == b'.'))
+                    | ((a == ELLIPSIS[0]) & (b == ELLIPSIS[1]) & (c == ELLIPSIS[2]))
+            })
+    }
+
+    /// `preg_match('/^[^.]+\.[^.]+(?:\.[^.]+)*$/uD', $title) === 1` for valid UTF-8: some dot,
+    /// none leading or trailing, and no empty segment between two dots.
+    fn dotted(title: &[u8]) -> bool {
+        let (Some(&first), Some(&last)) = (title.first(), title.last()) else {
+            return false;
+        };
+        if first == b'.' || last == b'.' {
+            return false;
+        }
+        let (dots, doubled) = title
+            .iter()
+            .zip(&title[1..])
+            .fold((false, false), |(dots, doubled), (&a, &b)| {
+                (dots | (a == b'.'), doubled | ((a == b'.') & (b == b'.')))
+            });
+        dots && !doubled
+    }
+
+    /// `preg_match(Nima4kSource::FORBIDDEN_CHARACTERS, $s) !== 0`: C0 controls other than TAB,
+    /// LF and CR, DEL, C1 controls and noncharacters; invalid UTF-8 also counts (`preg_match()`
+    /// fails).
+    fn forbidden(s: &[u8]) -> bool {
+        let control = |b: u8| {
+            (b <= 0x08) | (b == 0x0B) | (b == 0x0C) | ((0x0E..=0x1F).contains(&b)) | (b == 0x7F)
+        };
+        if s.is_ascii() {
+            return any_byte(s, control);
+        }
+        let Ok(text) = std::str::from_utf8(s) else {
+            return true;
+        };
+        text.chars().any(|c| {
+            let code = c as u32;
+            if code < 0x80 {
+                control(code as u8)
+            } else {
+                (0x80..=0x9F).contains(&code)
+                    || (0xFDD0..=0xFDEF).contains(&code)
+                    || code & 0xFFFE == 0xFFFE
+            }
+        })
+    }
+
+    /// `str_contains($label, W453_FALLBACK_MARKER)`. Each 32-position chunk is filtered on the
+    /// marker's first and last bytes without branches so the scan vectorizes; candidates are then
+    /// compared in full.
+    fn contains_fallback(label: &[u8]) -> bool {
+        let n = FALLBACK.len();
+        let Some(last) = label.len().checked_sub(n) else {
+            return false;
+        };
+        let (first, final_byte) = (FALLBACK[0], FALLBACK[n - 1]);
+        let hit = |j: usize| label[j] == first && &label[j..j + n] == FALLBACK;
+        // Both views hold `last + 1` bytes: position `j` pairs `label[j]` with `label[j + n - 1]`.
+        let (firsts, lasts) = (&label[..=last], &label[n - 1..]);
+        let (first_chunks, _) = firsts.as_chunks::<32>();
+        let (last_chunks, _) = lasts.as_chunks::<32>();
+        for (index, (fc, lc)) in first_chunks.iter().zip(last_chunks).enumerate() {
+            let candidate = fc.iter().zip(lc).fold(false, |acc, (&a, &b)| {
+                acc | ((a == first) & (b == final_byte))
+            });
+            if candidate && (index * 32..index * 32 + 32).any(hit) {
+                return true;
+            }
+        }
+        (first_chunks.len() * 32..=last).any(hit)
+    }
+
+    /// Literal-name slots shared by G4U and Gabber: 0 literal, 1 empty, 2 nonliteral,
+    /// 3 overlength; `None` declines.
+    #[inline]
+    fn literal_slot(name: &[u8]) -> Option<usize> {
+        if name.is_empty() {
+            return Some(1);
+        }
+        let (nonliteral, chars) = literal_scan(name)?;
+        Some(if nonliteral {
+            2
+        } else if chars > MAX_TITLE_CHARS {
+            3
+        } else {
+            0
+        })
+    }
+
+    /// `G4uSource::summarizeG4uCardTitleBatch()`: total, literal, empty, nonliteral, overlength.
+    /// Empty output declines.
+    pub fn g4u_card_title_batch(titles: &[&[u8]]) -> Vec<u8> {
+        let mut counts = [0u64; 4];
+        for title in titles {
+            let Some(slot) = literal_slot(title) else {
+                return Vec::new();
+            };
+            counts[slot] += 1;
+        }
+        fields(&[
+            titles.len() as u64,
+            counts[0],
+            counts[1],
+            counts[2],
+            counts[3],
+        ])
+    }
+
+    /// `GabberSource::summarizeGabberDirectoryNameBatch()`: total, literal, empty, nonliteral,
+    /// overlength, duplicate (literal names whose `mb_strtolower()` identity repeats).
+    /// Empty output declines.
+    pub fn gabber_directory_name_batch(names: &[&[u8]]) -> Vec<u8> {
+        let mut counts = [0u64; 4];
+        let mut seen: HashSet<Cow<'_, [u8]>> = HashSet::with_capacity(names.len());
+        let mut duplicate = 0u64;
+        for name in names {
+            let Some(slot) = literal_slot(name) else {
+                return Vec::new();
+            };
+            counts[slot] += 1;
+            if slot == 0 {
+                duplicate += u64::from(!seen.insert(lower(name)));
+            }
+        }
+        fields(&[
+            names.len() as u64,
+            counts[0],
+            counts[1],
+            counts[2],
+            counts[3],
+            duplicate,
+        ])
+    }
+
+    /// `KnabenSource::summarizeKnabenTitleBatch()`: total, accepted, empty, truncated,
+    /// nonliteral, overlength. Empty output declines.
+    pub fn knaben_title_batch(titles: &[&[u8]]) -> Vec<u8> {
+        let mut counts = [0u64; 5];
+        for title in titles {
+            let slot = if title.is_empty() {
+                1
+            } else if truncated(title) {
+                2
+            } else {
+                match literal_scan(title) {
+                    Some((true, _)) => 3,
+                    // An undecided character still loses to a failed dotted shape.
+                    None if !dotted(title) => 3,
+                    None => return Vec::new(),
+                    Some((false, _)) if !dotted(title) => 3,
+                    Some((false, chars)) if chars > MAX_TITLE_CHARS => 4,
+                    Some(_) => 0,
+                }
+            };
+            counts[slot] += 1;
+        }
+        fields(&[
+            titles.len() as u64,
+            counts[0],
+            counts[1],
+            counts[2],
+            counts[3],
+            counts[4],
+        ])
+    }
+
+    /// `Nima4kSource::summarizeNima4kTitleBatch()`: total, literal, empty, nonliteral, normalized
+    /// (literal titles `trim()` changed), forbidden (raw titles matching `FORBIDDEN_CHARACTERS`).
+    /// Empty output declines.
+    pub fn nima4k_title_batch(titles: &[&[u8]]) -> Vec<u8> {
+        let mut counts = [0u64; 3];
+        let mut normalized = 0u64;
+        let mut forbidden_count = 0u64;
+        for raw in titles {
+            forbidden_count += u64::from(forbidden(raw));
+            let title = trim(raw);
+            let slot = if title.is_empty() {
+                1
+            } else {
+                match literal_scan(title) {
+                    Some((true, _)) => 2,
+                    Some((false, _)) => 0,
+                    None => return Vec::new(),
+                }
+            };
+            counts[slot] += 1;
+            normalized += u64::from(slot == 0 && title.len() != raw.len());
+        }
+        fields(&[
+            titles.len() as u64,
+            counts[0],
+            counts[1],
+            counts[2],
+            normalized,
+            forbidden_count,
+        ])
+    }
+
+    /// `CategorizationPassable::summarizeMatchedByBatch()`: total, empty, no_match, group_name,
+    /// hash, gibberish, other, fallback.
+    pub fn passable_matched_by_batch(labels: &[&[u8]]) -> Vec<u8> {
+        let mut counts = [0u64; 6];
+        let mut fallback = 0u64;
+        for label in labels {
+            let slot = if label.is_empty() {
+                0
+            } else if *label == NO_MATCH {
+                1
+            } else {
+                LABEL_PREFIXES
+                    .iter()
+                    .position(|prefix| label.starts_with(prefix))
+                    .map_or(5, |i| i + 2)
+            };
+            counts[slot] += 1;
+            fallback += u64::from(contains_fallback(label));
+        }
+        fields(&[
+            labels.len() as u64,
+            counts[0],
+            counts[1],
+            counts[2],
+            counts[3],
+            counts[4],
+            counts[5],
+            fallback,
+        ])
+    }
+
+    /// Runs [`with_strings`], mapping an empty render (a declined batch) to [`DECLINE`].
+    ///
+    /// # Safety
+    /// As for [`with_strings`].
+    #[inline]
+    unsafe fn with_decline(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+        render: fn(&[&[u8]]) -> Vec<u8>,
+    ) -> isize {
+        match unsafe {
+            with_strings(
+                blob_ptr, blob_len, lens_ptr, lens_len, out_buf, out_cap, render,
+            )
+        } {
+            0 => DECLINE,
+            n => n,
+        }
+    }
+
+    /// # Safety
+    /// `blob_ptr`/`lens_ptr` must be valid for their lengths in readable bytes, and `out_buf` must be
+    /// valid for `out_cap` writable bytes, not overlapping either input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w453_g4u_card_title_batch(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_decline(
+                blob_ptr,
+                blob_len,
+                lens_ptr,
+                lens_len,
+                out_buf,
+                out_cap,
+                g4u_card_title_batch,
+            )
+        }
+    }
+
+    /// # Safety
+    /// `blob_ptr`/`lens_ptr` must be valid for their lengths in readable bytes, and `out_buf` must be
+    /// valid for `out_cap` writable bytes, not overlapping either input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w453_gabber_directory_name_batch(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_decline(
+                blob_ptr,
+                blob_len,
+                lens_ptr,
+                lens_len,
+                out_buf,
+                out_cap,
+                gabber_directory_name_batch,
+            )
+        }
+    }
+
+    /// # Safety
+    /// `blob_ptr`/`lens_ptr` must be valid for their lengths in readable bytes, and `out_buf` must be
+    /// valid for `out_cap` writable bytes, not overlapping either input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w453_knaben_title_batch(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_decline(
+                blob_ptr,
+                blob_len,
+                lens_ptr,
+                lens_len,
+                out_buf,
+                out_cap,
+                knaben_title_batch,
+            )
+        }
+    }
+
+    /// # Safety
+    /// `blob_ptr`/`lens_ptr` must be valid for their lengths in readable bytes, and `out_buf` must be
+    /// valid for `out_cap` writable bytes, not overlapping either input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w453_nima4k_title_batch(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_decline(
+                blob_ptr,
+                blob_len,
+                lens_ptr,
+                lens_len,
+                out_buf,
+                out_cap,
+                nima4k_title_batch,
+            )
+        }
+    }
+
+    /// # Safety
+    /// `blob_ptr`/`lens_ptr` must be valid for their lengths in readable bytes, and `out_buf` must be
+    /// valid for `out_cap` writable bytes, not overlapping either input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w453_categorization_passable_matched_by_batch(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_decline(
+                blob_ptr,
+                blob_len,
+                lens_ptr,
+                lens_len,
+                out_buf,
+                out_cap,
+                passable_matched_by_batch,
+            )
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::ptr;
+
+        const MAX_INPUT: usize = 16 * 1024 * 1024;
+
+        type Export =
+            unsafe extern "C" fn(*const u8, usize, *const u8, usize, *mut u8, usize) -> isize;
+
+        const EXPORTS: [Export; 5] = [
+            nntmux_w453_g4u_card_title_batch,
+            nntmux_w453_gabber_directory_name_batch,
+            nntmux_w453_knaben_title_batch,
+            nntmux_w453_nima4k_title_batch,
+            nntmux_w453_categorization_passable_matched_by_batch,
+        ];
+
+        fn text(bytes: &[u8]) -> String {
+            String::from_utf8_lossy(bytes).replace('\x1F', "|")
+        }
+
+        fn call(export: Export, items: &[&[u8]]) -> isize {
+            let blob = items.concat();
+            let lens: Vec<u8> = items
+                .iter()
+                .flat_map(|i| (i.len() as u32).to_le_bytes())
+                .collect();
+            let mut buf = vec![0u8; 256];
+            unsafe {
+                export(
+                    blob.as_ptr(),
+                    blob.len(),
+                    lens.as_ptr(),
+                    lens.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            }
+        }
+
+        fn call_text(export: Export, items: &[&[u8]]) -> String {
+            let blob = items.concat();
+            let lens: Vec<u8> = items
+                .iter()
+                .flat_map(|i| (i.len() as u32).to_le_bytes())
+                .collect();
+            let mut buf = vec![0u8; 256];
+            let n = unsafe {
+                export(
+                    blob.as_ptr(),
+                    blob.len(),
+                    lens.as_ptr(),
+                    lens.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(n > 0, "call declined: {n}");
+            text(&buf[..n as usize])
+        }
+
+        #[test]
+        fn w453_g4u_card_title_counts() {
+            let long = vec![b'a'; 256];
+            let edge = "\u{e9}".repeat(255);
+            let names: [&[u8]; 9] = [
+                b"Game.Title-GRP",
+                b"Game_Title_v1.2-GRP",
+                b"",
+                b"Game Title",
+                b"Game\x7FTitle",
+                b"Bad\xffUTF8",
+                &long,
+                edge.as_bytes(),
+                "Spiel\u{a0}Titel".as_bytes(),
+            ];
+            assert_eq!(text(&g4u_card_title_batch(&names)), "9|3|1|4|1");
+            assert_eq!(
+                call_text(nntmux_w453_g4u_card_title_batch, &names),
+                "9|3|1|4|1"
+            );
+            assert_eq!(text(&g4u_card_title_batch(&[])), "0|0|0|0|0");
+            // An undecided character declines the batch.
+            let greek = "\u{3b1}\u{3b2}".as_bytes();
+            assert!(g4u_card_title_batch(&[greek]).is_empty());
+            assert_eq!(call(nntmux_w453_g4u_card_title_batch, &[greek]), DECLINE);
+            // A definite separator elsewhere still decides it.
+            let mixed = "\u{3b1} b".as_bytes();
+            assert_eq!(text(&g4u_card_title_batch(&[mixed])), "1|0|0|1|0");
+        }
+
+        #[test]
+        fn w453_gabber_directory_name_counts() {
+            let names: [&[u8]; 9] = [
+                b"Artist-Title-WEB-2024-GRP",
+                b"ARTIST-TITLE-WEB-2024-GRP",
+                b"artist-title-web-2024-grp",
+                "\u{c9}t\u{e9}-GRP".as_bytes(),
+                "\u{e9}t\u{e9}-grp".as_bytes(),
+                b"Other-Title-GRP",
+                b"",
+                b"Two Words",
+                b"Other-Title-GRP",
+            ];
+            assert_eq!(text(&gabber_directory_name_batch(&names)), "9|7|1|1|0|4");
+            assert_eq!(
+                call_text(nntmux_w453_gabber_directory_name_batch, &names),
+                "9|7|1|1|0|4"
+            );
+            // Nonliteral names never join the identity set.
+            assert_eq!(
+                text(&gabber_directory_name_batch(&[b"a b", b"a b"])),
+                "2|0|0|2|0|0"
+            );
+            assert_eq!(&*lower("\u{130}".as_bytes()), "i\u{307}".as_bytes());
+        }
+
+        #[test]
+        fn w453_knaben_title_counts() {
+            let long = format!("{}.x", "a".repeat(254));
+            let names: [&[u8]; 11] = [
+                b"Movie.Title.2024.1080p.WEB.H264-GRP",
+                b"Movie.Title.20...",
+                "Movie.Title\u{2026}".as_bytes(),
+                b"Movie Title.2024",
+                b"MovieTitle",
+                b".Movie.Title",
+                b"Movie..Title",
+                b"Movie.Title.",
+                long.as_bytes(),
+                b"",
+                b"Bad.\xff",
+            ];
+            assert_eq!(text(&knaben_title_batch(&names)), "11|1|1|2|6|1");
+            assert_eq!(
+                call_text(nntmux_w453_knaben_title_batch, &names),
+                "11|1|1|2|6|1"
+            );
+            // An undecided character loses to a failed dotted shape, else declines.
+            assert_eq!(
+                text(&knaben_title_batch(&["\u{3b1}\u{3b2}".as_bytes()])),
+                "1|0|0|0|1|0"
+            );
+            assert!(knaben_title_batch(&["\u{3b1}.\u{3b2}".as_bytes()]).is_empty());
+        }
+
+        #[test]
+        fn w453_nima4k_title_counts() {
+            let names: [&[u8]; 9] = [
+                b"Movie.Title.2024.2160p.UHD.BluRay-GRP",
+                b"  Movie.Title.2024-GRP\n",
+                b"",
+                b" \t\0",
+                b"Movie Title",
+                b"Movie\x01Title",
+                b"\x0CMovie",
+                "Movie\u{fdd0}".as_bytes(),
+                b"Bad\xff",
+            ];
+            assert_eq!(text(&nima4k_title_batch(&names)), "9|2|2|5|1|5");
+            assert_eq!(
+                call_text(nntmux_w453_nima4k_title_batch, &names),
+                "9|2|2|5|1|5"
+            );
+            assert!(forbidden("\u{9f}".as_bytes()));
+            assert!(forbidden("\u{10ffff}".as_bytes()));
+            assert!(!forbidden(b"\t\r\n"));
+            assert!(!forbidden("\u{a0}\u{fffd}".as_bytes()));
+        }
+
+        #[test]
+        fn w453_passable_matched_by_counts() {
+            let labels: [&[u8]; 10] = [
+                b"",
+                b"no_match",
+                b"no_match_x",
+                b"group_name_tv",
+                b"group_name",
+                b"hash_md5",
+                b"hash",
+                b"gibberish_zero_vowels",
+                b"hd_webdl_fallback",
+                b"fallback",
+            ];
+            assert_eq!(
+                text(&passable_matched_by_batch(&labels)),
+                "10|1|1|1|2|1|4|2"
+            );
+            assert_eq!(
+                call_text(
+                    nntmux_w453_categorization_passable_matched_by_batch,
+                    &labels
+                ),
+                "10|1|1|1|2|1|4|2"
+            );
+            assert_eq!(text(&passable_matched_by_batch(&[])), "0|0|0|0|0|0|0|0");
+            let long = format!("{}fallback{}", "x".repeat(40), "y".repeat(40));
+            for (label, hit) in [
+                (&b"fallbac"[..], false),
+                (b"fallback", true),
+                (b"ffallbackk", true),
+                (long.as_bytes(), true),
+                (&long.as_bytes()[..47], false),
+                (&long.as_bytes()[41..], false),
+            ] {
+                assert_eq!(contains_fallback(label), hit, "{label:?}");
+            }
+            for offset in 0..70 {
+                let mut label = vec![b'f'; 80];
+                label[offset..offset + 8].copy_from_slice(FALLBACK);
+                assert!(contains_fallback(&label), "{offset}");
+                label[offset + 7] = b'K';
+                assert!(!contains_fallback(&label), "{offset}");
+            }
+        }
+
+        #[test]
+        fn w453_helpers() {
+            assert_eq!(trim(b"  a b \0"), b"a b");
+            assert!(dotted(b"a.b"));
+            assert!(dotted(b"a.b.c"));
+            assert!(!dotted(b"a"));
+            assert!(!dotted(b"."));
+            assert!(!dotted(b"a..b"));
+            assert!(truncated(b"ab..."));
+            assert!(!truncated(b".."));
+            assert_eq!(literal_scan(b"abc"), Some((false, 3)));
+            assert_eq!(literal_scan(b"a\x0Bc"), Some((true, 3)));
+            assert_eq!(literal_scan("\u{e9}".as_bytes()), Some((false, 1)));
+            assert_eq!(literal_scan("\u{2028}".as_bytes()), Some((true, 1)));
+            assert_eq!(literal_scan("\u{1fffe}".as_bytes()), Some((true, 1)));
+            assert_eq!(literal_scan("\u{3b1}".as_bytes()), None);
+            let mut late = [b'a'; 100];
+            late[70] = 0x7F;
+            assert_eq!(literal_scan(&late), Some((true, 100)));
+        }
+
+        #[test]
+        fn w453_exports_validate_inputs_and_capacity() {
+            let x = b"x".as_ptr();
+            let lens1 = 1u32.to_le_bytes();
+            unsafe {
+                for export in EXPORTS {
+                    let mut small = [b'Z'; 4];
+                    let needed = export(x, 1, lens1.as_ptr(), 4, small.as_mut_ptr(), 2);
+                    assert!(needed < -2, "needed {needed}");
+                    assert_eq!(small, [b'Z'; 4]);
+                    let mut exact = vec![0u8; (-needed) as usize];
+                    assert_eq!(
+                        export(x, 1, lens1.as_ptr(), 4, exact.as_mut_ptr(), exact.len()),
+                        -needed
+                    );
+                    let mut short = vec![b'Z'; (-needed - 1) as usize];
+                    assert_eq!(
+                        export(x, 1, lens1.as_ptr(), 4, short.as_mut_ptr(), short.len()),
+                        needed
+                    );
+                    assert!(short.iter().all(|&b| b == b'Z'));
+
+                    let mut out = [0u8; 128];
+                    let (b, c) = (out.as_mut_ptr(), out.len());
+                    assert_eq!(export(x, 1, lens1.as_ptr(), 4, ptr::null_mut(), 8), DECLINE);
+                    assert_eq!(export(ptr::null(), 0, x, 0, b, c), DECLINE);
+                    assert_eq!(export(x, 0, ptr::null(), 0, b, c), DECLINE);
+                    assert_eq!(export(x, 1, lens1.as_ptr(), 3, b, c), DECLINE);
+                    assert_eq!(export(x, 0, lens1.as_ptr(), 4, b, c), DECLINE);
+                    let two = 2u32.to_le_bytes();
+                    assert_eq!(export(x, 1, two.as_ptr(), 4, b, c), DECLINE);
+                    let huge = u32::MAX.to_le_bytes();
+                    assert_eq!(export(x, 1, huge.as_ptr(), 4, b, c), DECLINE);
+                    assert_eq!(export(x, MAX_INPUT + 1, x, 0, b, c), DECLINE);
+                    assert_eq!(export(x, usize::MAX, x, 0, b, c), DECLINE);
+                    assert_eq!(export(x, 0, x, 0, usize::MAX as *mut u8, 8), DECLINE);
+                    assert_eq!(export(x, 0, x, 0, b, isize::MAX as usize + 1), DECLINE);
+                    let mut shared =
+                        *b"sample\x06\0\0\0..............................................";
+                    let p = shared.as_mut_ptr();
+                    assert_eq!(export(p, 6, p.add(6), 4, p.add(3), 40), DECLINE);
+                    assert_eq!(export(p, 6, p.add(6), 4, p.add(9), 40), DECLINE);
+                    assert_eq!(&shared[..10], b"sample\x06\0\0\0");
+                    assert!(export(p, 6, p.add(6), 4, p.add(10), 40) > 0);
+                    assert!(export(x, 0, x, 0, b, c) > 0);
+                }
+            }
+        }
+    }
+}

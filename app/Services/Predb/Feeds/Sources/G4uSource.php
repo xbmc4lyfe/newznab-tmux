@@ -13,6 +13,7 @@ use DOMText;
 use DOMXPath;
 use FFI;
 use RuntimeException;
+use Throwable;
 
 /**
  * Latest-only public game catalogue. Names come from literal card fields, never editorial titles.
@@ -20,6 +21,37 @@ use RuntimeException;
  */
 final class G4uSource extends BoundedHttpFeedSource
 {
+    /**
+     * Wave 45.3 production default stays PHP: the paired benchmark in
+     * tests/Unit/RustPredbFeedsG4uGabberKnabenNima4kPassableW45ParityTest.php measures 1.73-2.16x
+     * mean but 0.94-2.35x p99 on the common 32-title batch (fixed FFI marshaling is close to the
+     * whole PHP cost), below the 1.5x gate, although uncommon batches reach 3.7-5.4x.
+     * useW453RustFfi(true) keeps the Rust helper available for parity and benchmarks.
+     * Named W453 so it stays distinct from the class's existing native paths.
+     */
+    public const bool W453_RUST_FFI_DEFAULT = false;
+
+    public const string W453_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w453_g4u_card_title_batch(
+            const char *blob_ptr,
+            size_t blob_len,
+            const char *lens_ptr,
+            size_t lens_len,
+            char *out_buf,
+            size_t out_cap
+        );
+        C;
+
+    /** mb_strlen() character limit for a literal card title. */
+    public const int W453_MAX_TITLE_CHARS = 255;
+
+    /** Exactly 5 0x1F-separated decimals of 1-19 digits. */
+    private const string W453_FIELDS_PATTERN = '/\A(?:\d{1,19}\x1F){4}\d{1,19}\z/';
+
+    private static ?bool $w453RustFfiOverride = null;
+
+    private static FFI|false|null $w453RustFfiHandle = null;
+
     private const NATIVE_CDEF = <<<'C'
         int32_t nntmux_predb_html_validate_numeric_refs(const char *html, size_t len, uint32_t mode);
         C;
@@ -210,5 +242,151 @@ final class G4uSource extends BoundedHttpFeedSource
     private function classToken(string $class): string
     {
         return 'contains(concat(" ", normalize-space(@class), " "), " '.$class.' ")';
+    }
+
+    /**
+     * Enables (true) or disables (false) the Wave 45.3 Rust helper; null restores
+     * W453_RUST_FFI_DEFAULT.
+     */
+    public static function useW453RustFfi(?bool $enable = true): void
+    {
+        self::$w453RustFfiOverride = $enable;
+    }
+
+    public static function usesW453RustFfi(): bool
+    {
+        return self::$w453RustFfiOverride ?? self::W453_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW453RustFfi(): void
+    {
+        self::$w453RustFfiOverride = null;
+        self::$w453RustFfiHandle = null;
+    }
+
+    /**
+     * Literal card title summary, using cardTitle()'s rules in a fixed order: an empty title is
+     * empty, one holding `\s`, `\p{Z}` or `\p{C}` (or invalid UTF-8) is nonliteral, one over
+     * W453_MAX_TITLE_CHARS characters is overlength, else literal. Non-strings count as empty.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return array{total: int, literal: int, empty: int, nonliteral: int, overlength: int}
+     */
+    public static function summarizeG4uCardTitleBatch(array $items): array
+    {
+        return (self::usesW453RustFfi() ? self::summarizeG4uCardTitleBatchNative($items) : null)
+            ?? self::summarizeG4uCardTitleBatchPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $items
+     * @return array{total: int, literal: int, empty: int, nonliteral: int, overlength: int}
+     */
+    public static function summarizeG4uCardTitleBatchPhp(array $items): array
+    {
+        $literal = 0;
+        $empty = 0;
+        $nonliteral = 0;
+        $overlength = 0;
+        foreach ($items as $item) {
+            $title = \is_string($item) ? $item : '';
+            if ($title === '') {
+                $empty++;
+            } elseif (preg_match('/[\s\p{Z}\p{C}]/u', $title) !== 0) {
+                $nonliteral++;
+            } elseif (mb_strlen($title, 'UTF-8') > self::W453_MAX_TITLE_CHARS) {
+                $overlength++;
+            } else {
+                $literal++;
+            }
+        }
+
+        return [
+            'total' => \count($items),
+            'literal' => $literal,
+            'empty' => $empty,
+            'nonliteral' => $nonliteral,
+            'overlength' => $overlength,
+        ];
+    }
+
+    /**
+     * Declines (null) for non-string items, and whenever Rust leaves a character class to PCRE2,
+     * so PHP counts them.
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return array{total: int, literal: int, empty: int, nonliteral: int, overlength: int}|null
+     */
+    public static function summarizeG4uCardTitleBatchNative(array $items): ?array
+    {
+        $lengths = [];
+        foreach ($items as $item) {
+            if (! \is_string($item)) {
+                return null;
+            }
+            $lengths[] = \strlen($item);
+        }
+        $fields = self::callW453Native(implode('', $items), pack('V*', ...$lengths));
+        if ($fields === null) {
+            return null;
+        }
+
+        return [
+            'total' => (int) $fields[0],
+            'literal' => (int) $fields[1],
+            'empty' => (int) $fields[2],
+            'nonliteral' => (int) $fields[3],
+            'overlength' => (int) $fields[4],
+        ];
+    }
+
+    /**
+     * Calls this class's Wave 45.3 export with the shared scratch buffer, retrying once at the size
+     * it asks for. Returns its fields only when they match W453_FIELDS_PATTERN: exactly the expected
+     * count of 1-19 digit decimals.
+     *
+     * @return list<string>|null
+     */
+    private static function callW453Native(string $blob, string $lens): ?array
+    {
+        $ffi = self::w453RustFfi();
+        if ($ffi === null) {
+            return null;
+        }
+
+        try {
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, 128, $capacity);
+            if ($buffer === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w453_g4u_card_title_batch($blob, \strlen($blob), $lens, \strlen($lens), $buffer, $capacity);
+            if (\is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w453_g4u_card_title_batch($blob, \strlen($blob), $lens, \strlen($lens), $buffer, $capacity);
+            }
+            if (! \is_int($written) || $written < 0 || $written > $capacity) {
+                return null;
+            }
+            $raw = FFI::string($buffer, $written);
+
+            return preg_match(self::W453_FIELDS_PATTERN, $raw) === 1 ? explode("\x1F", $raw) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private static function w453RustFfi(): ?FFI
+    {
+        if (self::$w453RustFfiHandle === null) {
+            self::$w453RustFfiHandle = RustPipelineLibrary::resolveDomain('categorize_w453', self::W453_FFI_CDEF) ?? false;
+        }
+
+        return self::$w453RustFfiHandle === false ? null : self::$w453RustFfiHandle;
     }
 }
