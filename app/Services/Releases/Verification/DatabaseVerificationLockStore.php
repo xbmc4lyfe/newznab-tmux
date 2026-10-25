@@ -6,6 +6,7 @@ namespace App\Services\Releases\Verification;
 
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Database\Connection;
 use Illuminate\Support\Facades\DB;
 use RuntimeException;
@@ -385,5 +386,185 @@ final class DatabaseVerificationLockStore extends VerificationLockStore
     private function connectionName(): string
     {
         return $this->connection ?? (string) config('database.default');
+    }
+
+    /** Wave 50.2 paired benchmarks decide this default; see RustVerificationDbLockDirtyFetchedFileLockHeartbeatW50ParityTest. */
+    private const W50_RUST_FFI_DEFAULT = true;
+
+    public const string W50_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w502_verification_lock_keys_batch(const char *prefix, size_t prefix_len, const char *names, size_t names_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * Wave 50 routing, binding and output buffer, kept in function-local statics. Operations:
+     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
+     * resolves the binding and 'out' returns a buffer of at least $val words (its capacity
+     * through 'cap').
+     */
+    private static function w50RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w50', self::W50_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w50RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return $out;
+            case 'cap':
+                return $capacity;
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW50RustFfi(): bool
+    {
+        $enabled = self::w50RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W50_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with planLockKeys() routed to Rust ($enabled) or PHP, then
+     * restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW50RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w50RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w50RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Batch lock-key plan for one database scope. Two words per name: `flags | keyLength << 8 |
+     * extra << 24` (flags: 1 key fits 64 bytes, 2 known group with extra = its member count,
+     * 4 in-range stripe `group.N` with extra = N, 8 repeated name, 16 empty name; the length is
+     * clamped to 65535), then `crc32(key)`. Fitting, duplicate and stripe counts and the XXH64
+     * digest of all earlier words follow.
+     *
+     * @param  list<string>  $names
+     * @return list<int>
+     */
+    public static function planLockKeys(string $scope, array $names): array
+    {
+        return self::usesW50RustFfi() ? self::planLockKeysNative($scope, $names) : self::planLockKeysPhp($scope, $names);
+    }
+
+    /**
+     * @param  list<string>  $names
+     * @return list<int>
+     */
+    public static function planLockKeysPhp(string $scope, array $names): array
+    {
+        $prefix = 'nnv:'.substr(sha1($scope), 0, 12).':';
+        $out = $seen = [];
+        $fits = $duplicates = $members = 0;
+        foreach ($names as $name) {
+            $key = $prefix.$name;
+            $length = \strlen($key);
+            $flags = $extra = 0;
+            if ($length <= 64) {
+                $flags = 1;
+                $fits++;
+            }
+            $group = self::MEMBERS[$name] ?? 0;
+            if ($group > 0) {
+                $flags |= 2;
+                $extra = $group;
+            } elseif (($dot = strrpos($name, '.')) !== false) {
+                $count = self::MEMBERS[substr($name, 0, $dot)] ?? 0;
+                $digits = substr($name, $dot + 1);
+                $width = \strlen($digits);
+                if ($count > 0 && $width > 0 && $width <= 4 && strspn($digits, '0123456789') === $width
+                    && ($width === 1 || $digits[0] !== '0') && (int) $digits < $count) {
+                    $flags |= 4;
+                    $extra = (int) $digits;
+                    $members++;
+                }
+            }
+            if (isset($seen[$name])) {
+                $flags |= 8;
+                $duplicates++;
+            } else {
+                $seen[$name] = true;
+            }
+            if ($name === '') {
+                $flags |= 16;
+            }
+            $out[] = $flags | min($length, 0xFFFF) << 8 | $extra << 24;
+            $out[] = crc32($key);
+        }
+        $out[] = $fits;
+        $out[] = $duplicates;
+        $out[] = $members;
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+        $out[] = $digest[1];
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, $names is not a list or a name
+     * holds a NUL byte.
+     *
+     * @param  list<string>  $names
+     * @return list<int>
+     */
+    public static function planLockKeysNative(string $scope, array $names): array
+    {
+        $count = \count($names);
+        $ffi = $count === 0 ? null : self::w50RustFfiState('ffi');
+        if (! $ffi instanceof FFI || ! array_is_list($names)) {
+            return self::planLockKeysPhp($scope, $names);
+        }
+        $prefix = 'nnv:'.substr(sha1($scope), 0, 12).':';
+        $joined = implode("\0", $names);
+        $words = 2 * $count + 4;
+        $values = false;
+        // Rust rejects a column whose NUL count differs from $count - 1 (an embedded NUL byte).
+        try {
+            $out = self::w50RustFfiState('out', $words);
+            if ($out instanceof CData) {
+                // @phpstan-ignore method.notFound (Declared by W50_FFI_CDEF.)
+                $written = $ffi->nntmux_w502_verification_lock_keys_batch($prefix, \strlen($prefix), $joined, \strlen($joined), $count, $out, self::w50RustFfiState('cap'));
+                $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+            }
+        } catch (Throwable) {
+            $values = false;
+        }
+
+        /** @var list<int>|null $result */
+        $result = \is_array($values) ? array_values($values) : null;
+
+        return $result ?? self::planLockKeysPhp($scope, $names);
     }
 }

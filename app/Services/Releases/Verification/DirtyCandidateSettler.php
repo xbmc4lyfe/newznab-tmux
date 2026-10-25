@@ -7,6 +7,7 @@ namespace App\Services\Releases\Verification;
 use App\Services\CollectionCleanupService;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -224,5 +225,217 @@ final class DirtyCandidateSettler
         $result = self::computeNative(32, [$identity])['value'] ?? null;
 
         return is_string($result) ? $result : null;
+    }
+
+    /** Wave 50.2 paired benchmarks decide this default; see RustVerificationDbLockDirtyFetchedFileLockHeartbeatW50ParityTest. */
+    private const W50_RUST_FFI_DEFAULT = true;
+
+    public const string W50_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w502_dirty_candidate_settle_batch(const char *ids, size_t ids_len, const char *identities, size_t identities_len, const char *ats, size_t ats_len, size_t count, const char *after_at, size_t after_at_len, int64_t after_id, int64_t has_after, const char *upper_at, size_t upper_at_len, int64_t upper_id, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * Wave 50 routing, binding and output buffer, kept in function-local statics. Operations:
+     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
+     * resolves the binding and 'out' returns a buffer of at least $val words (its capacity
+     * through 'cap').
+     */
+    private static function w50RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w50', self::W50_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w50RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return $out;
+            case 'cap':
+                return $capacity;
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW50RustFfi(): bool
+    {
+        $enabled = self::w50RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W50_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with classifyDirtyRows() routed to Rust ($enabled) or PHP, then
+     * restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW50RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w50RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w50RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Batch classification of dirty candidate rows against a sweep window. Two words per row:
+     * `flags | crc32(identity) << 32` (flags: 1 valid source hash, 2 after the resume cursor or
+     * no cursor, 4 at or before the upper bound, 8 both, 16 repeated hash, 32 repeated id,
+     * 64 settleable: in window, valid and not repeated), then the decoded hash's first eight
+     * bytes as a little-endian word (0 when invalid). Times compare bytewise (strcmp), ties by
+     * id. In-window, settleable and duplicate counts, the last in-window index (-1 for none) and
+     * the XXH64 digest of all earlier words follow.
+     *
+     * @param  list<int>  $ids
+     * @param  list<string>  $identities
+     * @param  list<string>  $nextAttemptAts
+     * @param  array{at: string, id: int}|null  $after
+     * @param  array{at: string, id: int}  $upper
+     * @return list<int>
+     */
+    public static function classifyDirtyRows(array $ids, array $identities, array $nextAttemptAts, ?array $after, array $upper): array
+    {
+        return self::usesW50RustFfi()
+            ? self::classifyDirtyRowsNative($ids, $identities, $nextAttemptAts, $after, $upper)
+            : self::classifyDirtyRowsPhp($ids, $identities, $nextAttemptAts, $after, $upper);
+    }
+
+    /**
+     * @param  list<int>  $ids
+     * @param  list<string>  $identities
+     * @param  list<string>  $nextAttemptAts
+     * @param  array{at: string, id: int}|null  $after
+     * @param  array{at: string, id: int}  $upper
+     * @return list<int>
+     */
+    public static function classifyDirtyRowsPhp(array $ids, array $identities, array $nextAttemptAts, ?array $after, array $upper): array
+    {
+        $out = $hashes = $seenIds = [];
+        $window = $settle = $duplicates = 0;
+        $last = -1;
+        foreach ($ids as $i => $id) {
+            $identity = $identities[$i] ?? '';
+            $at = $nextAttemptAts[$i] ?? '';
+            $valid = \strlen($identity) === 40 && ctype_xdigit($identity);
+            $flags = (int) $valid;
+            if ($after === null) {
+                $flags |= 2;
+            } else {
+                $order = strcmp($at, $after['at']);
+                $flags |= (int) ($order > 0 || ($order === 0 && $id > $after['id'])) << 1;
+            }
+            $order = strcmp($at, $upper['at']);
+            $flags |= (int) ($order < 0 || ($order === 0 && $id <= $upper['id'])) << 2;
+            if (($flags & 6) === 6) {
+                $flags |= 8;
+            }
+            $prefix = 0;
+            if ($valid) {
+                $hash = (string) hex2bin($identity);
+                if (isset($hashes[$hash])) {
+                    $flags |= 16;
+                } else {
+                    $hashes[$hash] = true;
+                }
+                /** @var array{1: int} $head */
+                $head = unpack('P', $hash);
+                $prefix = $head[1];
+            }
+            if (isset($seenIds[$id])) {
+                $flags |= 32;
+            } else {
+                $seenIds[$id] = true;
+            }
+            if (($flags & 0x30) !== 0) {
+                $duplicates++;
+            }
+            if (($flags & 8) !== 0) {
+                $window++;
+                $last = $i;
+                if (($flags & 0x31) === 1) {
+                    $flags |= 64;
+                    $settle++;
+                }
+            }
+            $out[] = $flags | crc32($identity) << 32;
+            $out[] = $prefix;
+        }
+        $out[] = $window;
+        $out[] = $settle;
+        $out[] = $duplicates;
+        $out[] = $last;
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+        $out[] = $digest[1];
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, the lists differ in length or
+     * are not lists, or an identity or time holds a NUL byte.
+     *
+     * @param  list<int>  $ids
+     * @param  list<string>  $identities
+     * @param  list<string>  $nextAttemptAts
+     * @param  array{at: string, id: int}|null  $after
+     * @param  array{at: string, id: int}  $upper
+     * @return list<int>
+     */
+    public static function classifyDirtyRowsNative(array $ids, array $identities, array $nextAttemptAts, ?array $after, array $upper): array
+    {
+        $count = \count($ids);
+        $ffi = $count === 0 ? null : self::w50RustFfiState('ffi');
+        if (! $ffi instanceof FFI || \count($identities) !== $count || \count($nextAttemptAts) !== $count
+            || ! array_is_list($ids) || ! array_is_list($identities) || ! array_is_list($nextAttemptAts)) {
+            return self::classifyDirtyRowsPhp($ids, $identities, $nextAttemptAts, $after, $upper);
+        }
+        $joinedIdentities = implode("\0", $identities);
+        $joinedAts = implode("\0", $nextAttemptAts);
+        $afterAt = $after['at'] ?? '';
+        $words = 2 * $count + 5;
+        $values = false;
+        try {
+            $out = self::w50RustFfiState('out', $words);
+            if ($out instanceof CData) {
+                $packed = pack('P*', ...$ids);
+                // @phpstan-ignore method.notFound (Declared by W50_FFI_CDEF.)
+                $written = $ffi->nntmux_w502_dirty_candidate_settle_batch($packed, \strlen($packed), $joinedIdentities, \strlen($joinedIdentities), $joinedAts, \strlen($joinedAts), $count,
+                    $afterAt, \strlen($afterAt), $after['id'] ?? 0, (int) ($after !== null), $upper['at'], \strlen($upper['at']), $upper['id'], $out, self::w50RustFfiState('cap'));
+                $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+            }
+        } catch (\Throwable) {
+            $values = false;
+        }
+
+        /** @var list<int>|null $result */
+        $result = \is_array($values) ? array_values($values) : null;
+
+        return $result ?? self::classifyDirtyRowsPhp($ids, $identities, $nextAttemptAts, $after, $upper);
     }
 }
