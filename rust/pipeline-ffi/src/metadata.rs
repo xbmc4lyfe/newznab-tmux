@@ -37580,3 +37580,733 @@ pub mod release_details_feed_source_helpers {
         }
     }
 }
+/// Wave 38.4: HTTP feed request plan, NSWDB/3DSDB catalogue page plan, feed rate-limit backoff
+/// plan and movie browse filter plan helpers mirrored from PHP.
+pub mod predb_sources_rate_movie_helpers {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    pub const DECLINE: isize = -1;
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+    const FIELD_SEP: u8 = 0x1F;
+    /// PHP `trim()` default character set.
+    const TRIM_SET: &[u8] = b" \t\n\r\0\x0B";
+    const HTTP_CONNECT_TIMEOUT_CAP: i64 = 10;
+    const HTTP_ATTEMPTS: &[u8] = b"2";
+    const HTTP_RETRY_SLEEP_MS: &[u8] = b"500";
+    const CATALOGUE_MAX_RECORDS: i64 = 5000;
+    const RATE_LIMIT_MAX_BACKOFF: i64 = 900;
+    const RATE_LIMIT_BASE_BACKOFF: i64 = 15;
+    const RATE_LIMIT_MAX_EXPONENT: i64 = 7;
+    const RATE_LIMIT_GIVE_UP_AFTER: i64 = 5;
+    const RATE_LIMIT_REASON_BYTES: usize = 120;
+    const RATE_LIMIT_MARKERS: [&[u8]; 4] = [
+        b"rate limit",
+        b"ratelimit",
+        b"too many requests",
+        b"throttl",
+    ];
+    const MOVIE_BROWSE_FIELDS: [&[u8]; 7] = [
+        b"title",
+        b"director",
+        b"actors",
+        b"genre",
+        b"rating",
+        b"year",
+        b"imdb",
+    ];
+
+    unsafe fn valid_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null()
+            || len > MAX_INPUT
+            || len > isize::MAX as usize
+            || (ptr as usize).checked_add(len).is_none()
+        {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn valid_out_buf(out_buf: *mut u8, out_cap: usize) -> bool {
+        !out_buf.is_null()
+            && out_cap <= isize::MAX as usize
+            && (out_buf as usize).checked_add(out_cap).is_some()
+    }
+
+    /// Copies the encoding into `out_buf`, returning its length or `-required` without writing
+    /// when it does not fit. Every encoding has at least four fields, so `-1` never doubles as a
+    /// "needs one byte" answer.
+    fn finish(bytes: Vec<u8>, out_buf: *mut u8, out_cap: usize) -> isize {
+        if bytes.len() > isize::MAX as usize {
+            return DECLINE;
+        }
+        if bytes.len() > out_cap {
+            return -(bytes.len() as isize);
+        }
+        if !bytes.is_empty() {
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len()) };
+        }
+        bytes.len() as isize
+    }
+
+    fn encode(fields: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(fields.iter().map(|f| f.len() + 1).sum());
+        for (i, field) in fields.iter().enumerate() {
+            if i > 0 {
+                out.push(FIELD_SEP);
+            }
+            out.extend_from_slice(field);
+        }
+        out
+    }
+
+    #[inline]
+    fn bool_bytes(value: bool) -> &'static [u8] {
+        if value { b"1" } else { b"0" }
+    }
+
+    #[inline]
+    fn flag(value: u32) -> Option<bool> {
+        match value {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+
+    /// PHP `trim($value)` on bytes.
+    fn trim_ws(value: &[u8]) -> &[u8] {
+        let start = value
+            .iter()
+            .position(|b| !TRIM_SET.contains(b))
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|b| !TRIM_SET.contains(b))
+            .map_or(start, |i| i + 1);
+        &value[start..end]
+    }
+
+    /// PHP `stripslashes()`: drops each backslash, keeps the escaped byte (`\0` becomes NUL) and
+    /// drops a trailing lone backslash.
+    fn strip_slashes(value: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(value.len());
+        let mut bytes = value.iter();
+        while let Some(&b) = bytes.next() {
+            if b != b'\\' {
+                out.push(b);
+            } else if let Some(&next) = bytes.next() {
+                out.push(if next == b'0' { 0 } else { next });
+            }
+        }
+        out
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.len() >= needle.len() && haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// `HttpFeedSource::planHttpFeedRequest()`: emits timeout, connect timeout, attempts, retry
+    /// sleep, retryable, rate limited, client error and the trimmed user agent.
+    fn http_feed_encode(
+        timeout: i64,
+        status: i64,
+        connection_error: bool,
+        user_agent: &[u8],
+    ) -> Vec<u8> {
+        let retryable = connection_error || (500..600).contains(&status);
+        let rate_limited = !connection_error && status == 429;
+        let client_error = !connection_error && (400..500).contains(&status);
+        let (timeout_text, connect) = (
+            timeout.to_string(),
+            timeout.min(HTTP_CONNECT_TIMEOUT_CAP).to_string(),
+        );
+        encode(&[
+            timeout_text.as_bytes(),
+            connect.as_bytes(),
+            HTTP_ATTEMPTS,
+            HTTP_RETRY_SLEEP_MS,
+            bool_bytes(retryable),
+            bool_bytes(rate_limited),
+            bool_bytes(client_error),
+            trim_ws(user_agent),
+        ])
+    }
+
+    /// `NswdbSource::planNswdbPage()` / `ThreeDsDbSource::planThreeDsDbPage()`: emits key, label,
+    /// log prefix, valid page, page count, past end, offset, length and clamped entry count.
+    fn catalogue_page_encode(
+        three_ds: bool,
+        entry_count: i64,
+        page_size: i64,
+        page: i64,
+    ) -> Vec<u8> {
+        let (key, label, prefix): (&[u8], &[u8], &[u8]) = if three_ds {
+            (b"3dsdb", b"3dsdb.com", b"3DSDB")
+        } else {
+            (b"nswdb", b"nswdb.com", b"NSWDB")
+        };
+        let entries = entry_count.clamp(0, CATALOGUE_MAX_RECORDS);
+        let size = page_size.max(1);
+        let page_count = if entries == 0 {
+            0
+        } else {
+            (entries - 1) / size + 1
+        };
+        let valid = page >= 1;
+        let past_end = valid && page > page_count;
+        let (offset, length) = if valid && !past_end {
+            let offset = (page - 1) * size;
+            (offset, size.min(entries - offset))
+        } else {
+            (0, 0)
+        };
+        let (page_count, offset, length, entries) = (
+            page_count.to_string(),
+            offset.to_string(),
+            length.to_string(),
+            entries.to_string(),
+        );
+        encode(&[
+            key,
+            label,
+            prefix,
+            bool_bytes(valid),
+            page_count.as_bytes(),
+            bool_bytes(past_end),
+            offset.as_bytes(),
+            length.as_bytes(),
+            entries.as_bytes(),
+        ])
+    }
+
+    /// `FeedRateLimitedException::planRateLimitBackoff()`: emits throttled, attempt, backoff
+    /// seconds, give up and the trimmed reason (first 120 bytes).
+    fn rate_limit_encode(message: &[u8], attempt: i64, retry_after: i64) -> Vec<u8> {
+        let lower = message.to_ascii_lowercase();
+        let throttled = RATE_LIMIT_MARKERS.iter().any(|m| contains(&lower, m));
+        let attempt = attempt.max(1);
+        let backoff = if retry_after > 0 {
+            retry_after.min(RATE_LIMIT_MAX_BACKOFF)
+        } else {
+            let exponent = attempt.min(RATE_LIMIT_MAX_EXPONENT) - 1;
+            (RATE_LIMIT_BASE_BACKOFF << exponent).min(RATE_LIMIT_MAX_BACKOFF)
+        };
+        let reason = trim_ws(message);
+        let reason = &reason[..reason.len().min(RATE_LIMIT_REASON_BYTES)];
+        let (attempt_text, backoff) = (attempt.to_string(), backoff.to_string());
+        encode(&[
+            bool_bytes(throttled),
+            attempt_text.as_bytes(),
+            backoff.as_bytes(),
+            bool_bytes(attempt > RATE_LIMIT_GIVE_UP_AFTER),
+            reason,
+        ])
+    }
+
+    /// PHP `preg_match('/^(19|20)\d{2}$/', $value)`: `$` also matches before a final newline.
+    fn browse_year(value: &[u8]) -> bool {
+        let digits = match value {
+            [rest @ .., b'\n'] if rest.len() == 4 => rest,
+            _ if value.len() == 4 => value,
+            _ => return false,
+        };
+        (digits.starts_with(b"19") || digits.starts_with(b"20"))
+            && digits[2].is_ascii_digit()
+            && digits[3].is_ascii_digit()
+    }
+
+    /// `MovieBrowseService::planMovieBrowseFilter()`: emits applied, operator, column and the
+    /// unescaped comparison value (LIKE patterns include their `%` wildcards).
+    fn movie_browse_encode(field: &[u8], value: &[u8]) -> Vec<u8> {
+        let skip = || encode(&[b"0", b"", b"", b""]);
+        if !MOVIE_BROWSE_FIELDS.contains(&field) || value.is_empty() || value == b"0" {
+            return skip();
+        }
+        let mut stripped = strip_slashes(value);
+        let column = [
+            b"m.".as_slice(),
+            if field == b"imdb" { b"imdbid" } else { field },
+        ]
+        .concat();
+        match field {
+            b"year" if !browse_year(&stripped) => skip(),
+            b"year" | b"imdb" => encode(&[b"1", b"=", &column, &stripped]),
+            _ => {
+                if field == b"rating" {
+                    stripped.push(b'.');
+                }
+                let pattern = [b"%".as_slice(), &stripped, b"%"].concat();
+                encode(&[b"1", b"LIKE", &column, &pattern])
+            }
+        }
+    }
+
+    /// `HttpFeedSource::planHttpFeedRequest()`; `connection_error` is `0` or `1`.
+    ///
+    /// # Safety
+    /// Non-null input pointers must be readable for their lengths and `out_buf` writable for
+    /// `out_cap` bytes; null or oversized buffers and invalid flags decline with `-1`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w384_http_feed_request_plan(
+        timeout: i64,
+        status: i64,
+        connection_error: u32,
+        user_agent_ptr: *const u8,
+        user_agent_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(connection_error) = flag(connection_error) else {
+                return DECLINE;
+            };
+            let Some(user_agent) = (unsafe { valid_slice(user_agent_ptr, user_agent_len) }) else {
+                return DECLINE;
+            };
+            finish(
+                http_feed_encode(timeout, status, connection_error, user_agent),
+                out_buf,
+                out_cap,
+            )
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `NswdbSource::planNswdbPage()` (`source` `0`) and `ThreeDsDbSource::planThreeDsDbPage()`
+    /// (`source` `1`).
+    ///
+    /// # Safety
+    /// `out_buf` must be writable for `out_cap` bytes; a null or oversized buffer and an unknown
+    /// source decline with `-1`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w384_catalogue_page_plan(
+        source: u32,
+        entry_count: i64,
+        page_size: i64,
+        page: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(three_ds) = flag(source) else {
+                return DECLINE;
+            };
+            finish(
+                catalogue_page_encode(three_ds, entry_count, page_size, page),
+                out_buf,
+                out_cap,
+            )
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `FeedRateLimitedException::planRateLimitBackoff()`.
+    ///
+    /// # Safety
+    /// Non-null input pointers must be readable for their lengths and `out_buf` writable for
+    /// `out_cap` bytes; null or oversized buffers decline with `-1`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w384_rate_limit_backoff_plan(
+        attempt: i64,
+        retry_after: i64,
+        message_ptr: *const u8,
+        message_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(message) = (unsafe { valid_slice(message_ptr, message_len) }) else {
+                return DECLINE;
+            };
+            finish(
+                rate_limit_encode(message, attempt, retry_after),
+                out_buf,
+                out_cap,
+            )
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `MovieBrowseService::planMovieBrowseFilter()`.
+    ///
+    /// # Safety
+    /// Non-null input pointers must be readable for their lengths and `out_buf` writable for
+    /// `out_cap` bytes; null or oversized buffers decline with `-1`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w384_movie_browse_filter_plan(
+        field_ptr: *const u8,
+        field_len: usize,
+        value_ptr: *const u8,
+        value_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let (Some(field), Some(value)) =
+                (unsafe { valid_slice(field_ptr, field_len) }, unsafe {
+                    valid_slice(value_ptr, value_len)
+                })
+            else {
+                return DECLINE;
+            };
+            match field_len.checked_add(value_len) {
+                Some(total) if total <= MAX_INPUT => {}
+                _ => return DECLINE,
+            }
+            finish(movie_browse_encode(field, value), out_buf, out_cap)
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn s(bytes: Vec<u8>) -> String {
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+
+        #[test]
+        fn w384_http_feed_follows_php() {
+            assert_eq!(
+                s(http_feed_encode(
+                    15,
+                    503,
+                    false,
+                    b" NNTmux-PreDB-Importer/1.0\n"
+                )),
+                "15\x1F10\x1F2\x1F500\x1F1\x1F0\x1F0\x1FNNTmux-PreDB-Importer/1.0"
+            );
+            assert_eq!(
+                s(http_feed_encode(5, 429, false, b"")),
+                "5\x1F5\x1F2\x1F500\x1F0\x1F1\x1F1\x1F"
+            );
+            assert_eq!(
+                s(http_feed_encode(i64::MIN, 429, true, b"a\x1Fb")),
+                format!(
+                    "{}\x1F{}\x1F2\x1F500\x1F1\x1F0\x1F0\x1Fa\x1Fb",
+                    i64::MIN,
+                    i64::MIN
+                )
+            );
+            assert_eq!(
+                s(http_feed_encode(i64::MAX, 600, false, b"\x0C")),
+                format!("{}\x1F10\x1F2\x1F500\x1F0\x1F0\x1F0\x1F\x0C", i64::MAX)
+            );
+        }
+
+        #[test]
+        fn w384_catalogue_page_follows_php() {
+            assert_eq!(
+                s(catalogue_page_encode(false, 250, 100, 3)),
+                "nswdb\x1Fnswdb.com\x1FNSWDB\x1F1\x1F3\x1F0\x1F200\x1F50\x1F250"
+            );
+            assert_eq!(
+                s(catalogue_page_encode(true, 250, 100, 4)),
+                "3dsdb\x1F3dsdb.com\x1F3DSDB\x1F1\x1F3\x1F1\x1F0\x1F0\x1F250"
+            );
+            assert_eq!(
+                s(catalogue_page_encode(false, 0, 100, 1)),
+                "nswdb\x1Fnswdb.com\x1FNSWDB\x1F1\x1F0\x1F1\x1F0\x1F0\x1F0"
+            );
+            assert_eq!(
+                s(catalogue_page_encode(true, i64::MAX, i64::MIN, 0)),
+                "3dsdb\x1F3dsdb.com\x1F3DSDB\x1F0\x1F5000\x1F0\x1F0\x1F0\x1F5000"
+            );
+            assert_eq!(
+                s(catalogue_page_encode(false, 5000, i64::MAX, 1)),
+                "nswdb\x1Fnswdb.com\x1FNSWDB\x1F1\x1F1\x1F0\x1F0\x1F5000\x1F5000"
+            );
+            assert_eq!(
+                s(catalogue_page_encode(false, 5000, 1, 5000)),
+                "nswdb\x1Fnswdb.com\x1FNSWDB\x1F1\x1F5000\x1F0\x1F4999\x1F1\x1F5000"
+            );
+        }
+
+        #[test]
+        fn w384_rate_limit_follows_php() {
+            assert_eq!(
+                s(rate_limit_encode(b"  Rate Limit exceeded\n", 1, 0)),
+                "1\x1F1\x1F15\x1F0\x1FRate Limit exceeded"
+            );
+            assert_eq!(
+                s(rate_limit_encode(b"TOO MANY REQUESTS", i64::MIN, 30)),
+                "1\x1F1\x1F30\x1F0\x1FTOO MANY REQUESTS"
+            );
+            assert_eq!(
+                s(rate_limit_encode(b"ok", 6, i64::MAX)),
+                "0\x1F6\x1F900\x1F1\x1Fok"
+            );
+            assert_eq!(
+                s(rate_limit_encode(b"Throttled", i64::MAX, -5)),
+                format!("1\x1F{}\x1F900\x1F1\x1FThrottled", i64::MAX)
+            );
+            assert_eq!(s(rate_limit_encode(b"", 6, 0)), "0\x1F6\x1F480\x1F1\x1F");
+            let long = [b'x'; 200];
+            assert_eq!(
+                rate_limit_encode(&long, 2, 0).len(),
+                "0\x1F2\x1F30\x1F0\x1F".len() + 120
+            );
+            // Non-ASCII bytes are never folded, matching PHP 8 strtolower().
+            assert_eq!(
+                s(rate_limit_encode("RÄTE LIMIT".as_bytes(), 1, 0))[..1],
+                *"0"
+            );
+        }
+
+        #[test]
+        fn w384_movie_browse_follows_php() {
+            assert_eq!(
+                s(movie_browse_encode(b"title", b"Alien")),
+                "1\x1FLIKE\x1Fm.title\x1F%Alien%"
+            );
+            assert_eq!(
+                s(movie_browse_encode(b"rating", b"7")),
+                "1\x1FLIKE\x1Fm.rating\x1F%7.%"
+            );
+            assert_eq!(
+                s(movie_browse_encode(b"imdb", b"tt\\0123")),
+                "1\x1F=\x1Fm.imdbid\x1Ftt\x00123"
+            );
+            assert_eq!(
+                s(movie_browse_encode(b"year", b"1999")),
+                "1\x1F=\x1Fm.year\x1F1999"
+            );
+            assert_eq!(
+                s(movie_browse_encode(b"year", b"2024\n")),
+                "1\x1F=\x1Fm.year\x1F2024\n"
+            );
+            assert_eq!(s(movie_browse_encode(b"year", b"1899")), "0\x1F\x1F\x1F");
+            assert_eq!(
+                s(movie_browse_encode(b"year", b"19\\99")),
+                "1\x1F=\x1Fm.year\x1F1999"
+            );
+            assert_eq!(s(movie_browse_encode(b"genre", b"0")), "0\x1F\x1F\x1F");
+            assert_eq!(s(movie_browse_encode(b"genre", b"")), "0\x1F\x1F\x1F");
+            assert_eq!(s(movie_browse_encode(b"Genre", b"x")), "0\x1F\x1F\x1F");
+            assert_eq!(
+                s(movie_browse_encode(b"actors", b"\\")),
+                "1\x1FLIKE\x1Fm.actors\x1F%%"
+            );
+            assert_eq!(
+                s(movie_browse_encode(b"director", b"a\\\\b\\")),
+                "1\x1FLIKE\x1Fm.director\x1F%a\\b%"
+            );
+        }
+
+        #[test]
+        fn w384_exports_validate_arguments_and_capacity() {
+            let mut out = [0u8; 256];
+            let mut tiny = [b'Z'; 3];
+            unsafe {
+                let written = nntmux_w384_http_feed_request_plan(
+                    15,
+                    200,
+                    0,
+                    b"ua".as_ptr(),
+                    2,
+                    out.as_mut_ptr(),
+                    out.len(),
+                );
+                assert_eq!(
+                    &out[..written as usize],
+                    b"15\x1F10\x1F2\x1F500\x1F0\x1F0\x1F0\x1Fua"
+                );
+                assert_eq!(
+                    nntmux_w384_http_feed_request_plan(
+                        15,
+                        200,
+                        2,
+                        b"ua".as_ptr(),
+                        2,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w384_http_feed_request_plan(
+                        15,
+                        200,
+                        0,
+                        std::ptr::null(),
+                        0,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w384_http_feed_request_plan(
+                        15,
+                        200,
+                        0,
+                        b"ua".as_ptr(),
+                        MAX_INPUT + 1,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w384_http_feed_request_plan(
+                        15,
+                        200,
+                        0,
+                        b"ua".as_ptr(),
+                        2,
+                        std::ptr::null_mut(),
+                        64
+                    ),
+                    DECLINE
+                );
+                let needed = nntmux_w384_http_feed_request_plan(
+                    15,
+                    200,
+                    0,
+                    b"ua".as_ptr(),
+                    2,
+                    tiny.as_mut_ptr(),
+                    tiny.len(),
+                );
+                assert_eq!(needed, -(written));
+                assert_eq!(tiny, [b'Z'; 3]);
+
+                let written =
+                    nntmux_w384_catalogue_page_plan(1, 10, 3, 2, out.as_mut_ptr(), out.len());
+                assert_eq!(
+                    &out[..written as usize],
+                    b"3dsdb\x1F3dsdb.com\x1F3DSDB\x1F1\x1F4\x1F0\x1F3\x1F3\x1F10"
+                );
+                assert_eq!(
+                    nntmux_w384_catalogue_page_plan(2, 10, 3, 2, out.as_mut_ptr(), out.len()),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w384_catalogue_page_plan(0, 10, 3, 2, std::ptr::null_mut(), 0),
+                    DECLINE
+                );
+                assert!(
+                    nntmux_w384_catalogue_page_plan(0, 10, 3, 2, tiny.as_mut_ptr(), tiny.len())
+                        < DECLINE
+                );
+                assert_eq!(tiny, [b'Z'; 3]);
+
+                let written = nntmux_w384_rate_limit_backoff_plan(
+                    3,
+                    0,
+                    b"slow down".as_ptr(),
+                    9,
+                    out.as_mut_ptr(),
+                    out.len(),
+                );
+                assert_eq!(&out[..written as usize], b"0\x1F3\x1F60\x1F0\x1Fslow down");
+                assert_eq!(
+                    nntmux_w384_rate_limit_backoff_plan(
+                        3,
+                        0,
+                        std::ptr::null(),
+                        0,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    DECLINE
+                );
+                assert!(
+                    nntmux_w384_rate_limit_backoff_plan(
+                        3,
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        tiny.as_mut_ptr(),
+                        tiny.len()
+                    ) < DECLINE
+                );
+                assert_eq!(tiny, [b'Z'; 3]);
+
+                let written = nntmux_w384_movie_browse_filter_plan(
+                    b"year".as_ptr(),
+                    4,
+                    b"2001".as_ptr(),
+                    4,
+                    out.as_mut_ptr(),
+                    out.len(),
+                );
+                assert_eq!(&out[..written as usize], b"1\x1F=\x1Fm.year\x1F2001");
+                assert_eq!(
+                    nntmux_w384_movie_browse_filter_plan(
+                        std::ptr::null(),
+                        0,
+                        b"".as_ptr(),
+                        0,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w384_movie_browse_filter_plan(
+                        b"".as_ptr(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w384_movie_browse_filter_plan(
+                        b"x".as_ptr(),
+                        MAX_INPUT,
+                        b"y".as_ptr(),
+                        1,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    DECLINE
+                );
+                let needed = nntmux_w384_movie_browse_filter_plan(
+                    b"x".as_ptr(),
+                    1,
+                    b"y".as_ptr(),
+                    1,
+                    tiny.as_mut_ptr(),
+                    tiny.len(),
+                );
+                assert_eq!(needed, -4);
+                assert_eq!(tiny, [b'Z'; 3]);
+                let mut exact = [0u8; 4];
+                assert_eq!(
+                    nntmux_w384_movie_browse_filter_plan(
+                        b"x".as_ptr(),
+                        1,
+                        b"y".as_ptr(),
+                        1,
+                        exact.as_mut_ptr(),
+                        4
+                    ),
+                    4
+                );
+                assert_eq!(&exact, b"0\x1F\x1F\x1F");
+            }
+        }
+    }
+}
