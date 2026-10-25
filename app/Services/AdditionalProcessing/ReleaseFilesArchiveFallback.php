@@ -472,4 +472,150 @@ class ReleaseFilesArchiveFallback
 
         return self::$ffi;
     }
+
+    // Wave 42.6 is independent of every earlier FFI toggle.
+    public const bool W426_RUST_FFI_DEFAULT = false;
+
+    private const string W426_FFI_CDEF = 'int32_t nntmux_w426_additional_file_manager_fallback_sync_sevenzip(uint8_t operation, const char *input, size_t input_len, char *output, size_t output_cap);';
+
+    /** @return array{enabled: ?bool, ffi: FFI|false|null} */
+    private static function &w426State(): array
+    {
+        // A static local also supports readonly configuration objects.
+        static $state = ['enabled' => null, 'ffi' => null];
+
+        return $state;
+    }
+
+    public static function useW426RustFfi(bool $enable = true): void
+    {
+        $state = &self::w426State();
+        $state['enabled'] = $enable;
+    }
+
+    public static function usesW426RustFfi(): bool
+    {
+        return self::w426State()['enabled'] ?? self::W426_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW426RustFfi(): void
+    {
+        $state = &self::w426State();
+        $state = ['enabled' => null, 'ffi' => null];
+    }
+
+    /** @return list<int>|null */
+    private static function w426Slots(int $operation, string $input, int $count): ?array
+    {
+        if (PHP_INT_SIZE !== 8 || \strlen($input) > 16_777_216) {
+            return null;
+        }
+        try {
+            $state = &self::w426State();
+            $state['ffi'] ??= RustPipelineLibrary::resolveDomain('additional', self::W426_FFI_CDEF) ?? false;
+            if ($state['ffi'] === false) {
+                return null;
+            }
+            $bytes = $count * 8;
+            $buffer = $state['ffi']->new('char['.$bytes.']');
+            // @phpstan-ignore method.notFound
+            $written = $state['ffi']->nntmux_w426_additional_file_manager_fallback_sync_sevenzip($operation, $input, \strlen($input), $buffer, $bytes);
+            if ($written !== $bytes) {
+                return null;
+            }
+            $values = unpack('q*', FFI::string($buffer, $bytes));
+            if ($values === false || \count($values) !== $count) {
+                return null;
+            }
+            $values = array_values($values);
+            foreach ($values as $index => $value) {
+                if (! \is_int($value) || ($value < 0 && ! ($operation === 3 && $index === 7))) {
+                    return null;
+                }
+            }
+
+            return $values;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private static function w426Add(int $a, int $b): int
+    {
+        return $a > PHP_INT_MAX - $b ? PHP_INT_MAX : $a + $b;
+    }
+
+    /**
+     * Count image candidates, unencrypted candidates and stored candidates without extracting archives.
+     * Integer sums saturate at PHP_INT_MAX; malformed rows are counted without coercion.
+     *
+     * @param  array<array-key, mixed>  $files
+     * @return array{total: int, images: int, usable_images: int, stored_images: int, total_bytes: int, invalid: int}
+     */
+    public static function summarizeArchiveFallbackBatch(array $files): array
+    {
+        return self::usesW426RustFfi()
+            ? self::summarizeArchiveFallbackBatchNative($files)
+            : self::summarizeArchiveFallbackBatchPhp($files);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $files
+     * @return array{total: int, images: int, usable_images: int, stored_images: int, total_bytes: int, invalid: int}
+     */
+    public static function summarizeArchiveFallbackBatchPhp(array $files): array
+    {
+        $result = ['total' => \count($files), 'images' => 0, 'usable_images' => 0, 'stored_images' => 0, 'total_bytes' => 0, 'invalid' => 0];
+        foreach ($files as $row) {
+            if (! self::w426ValidRow($row)) {
+                $result['invalid']++;
+
+                continue;
+            }
+            if (self::isArchiveImageNamePhp($row['name'])) {
+                $result['images']++;
+                if ($row['pass'] === 0) {
+                    $result['usable_images']++;
+                    $result['stored_images'] += (int) $row['stored'];
+                    $result['total_bytes'] = self::w426Add($result['total_bytes'], $row['size']);
+                }
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $files
+     * @return array{total: int, images: int, usable_images: int, stored_images: int, total_bytes: int, invalid: int}
+     */
+    public static function summarizeArchiveFallbackBatchNative(array $files): array
+    {
+        $total = \count($files);
+        if (PHP_INT_SIZE !== 8 || $total > 100_000) {
+            return self::summarizeArchiveFallbackBatchPhp($files);
+        }
+        $frame = pack('qV', 0, $total);
+        foreach ($files as $row) {
+            if (! self::w426ValidRow($row)) {
+                return self::summarizeArchiveFallbackBatchPhp($files);
+            }
+            if (\strlen($row['name']) > 16_777_216 - 14 - \strlen($frame)) {
+                return self::summarizeArchiveFallbackBatchPhp($files);
+            }
+            $frame .= pack('qCCV', $row['size'], $row['pass'], (int) $row['stored'], \strlen($row['name'])).$row['name'];
+        }
+        $slots = self::w426Slots(2, $frame, 6);
+        if ($slots === null || $slots[0] !== $total || $slots[1] > $total || $slots[2] > $slots[1] || $slots[3] > $slots[2] || $slots[5] !== 0) {
+            return self::summarizeArchiveFallbackBatchPhp($files);
+        }
+
+        return ['total' => $slots[0], 'images' => $slots[1], 'usable_images' => $slots[2], 'stored_images' => $slots[3], 'total_bytes' => $slots[4], 'invalid' => $slots[5]];
+    }
+
+    /** @phpstan-assert-if-true array{name: string, size: int, pass: int, stored: bool} $row */
+    private static function w426ValidRow(mixed $row): bool
+    {
+        return \is_array($row) && \is_string($row['name'] ?? null) && \is_int($row['size'] ?? null) && $row['size'] >= 0 && \is_int($row['pass'] ?? null) && \in_array($row['pass'], [0, 1], true) && \is_bool($row['stored'] ?? null);
+    }
 }
