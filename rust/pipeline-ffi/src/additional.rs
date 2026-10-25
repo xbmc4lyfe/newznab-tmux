@@ -32935,3 +32935,1328 @@ mod w476_additional_dto_batch_tests {
         assert_eq!((out[2], out[W47_VOLUME_HEADER]), (1, 1 << 4 | 2 << 8));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 48.6: AdditionalProcessing DTO batch helpers (`nntmux_w48_*`) for
+// ImageCandidate, MappedNzbFile, MediaSourceHints, MediaSourcePlan and
+// PersistenceMetrics. They reuse the Wave 47 conventions: one crossing per
+// 64-128 item batch, NUL-joined strings or `pack('V*')` lengths, machine-order
+// `int64_t` columns and fixed-width `int64_t` rows read back with
+// `unpack('P*')`. Every export returns 1, -1 for invalid input or -2 when `out`
+// is too small or misaligned, and leaves `out` untouched unless it returns 1.
+// ---------------------------------------------------------------------------
+
+/// Image dimension clamp, so an area and an aspect product fit an integer.
+const W48_DIMENSION_CAP: i64 = 1_000_000;
+/// Bytes of an image head that feed the byte histogram.
+const W48_ENTROPY_WINDOW: usize = 4096;
+/// Largest value whose `* 1_000_000` fits an integer.
+const W48_PPM_CAP: i64 = 9_223_372_036_854;
+/// Default decoded article size when a plan has none.
+const W48_DEFAULT_PART: i64 = 716_800;
+const W48_PART_CAP: i64 = 1 << 30;
+const W48_PROBE_CAP: i64 = 1 << 34;
+
+/// Indices ordered by descending score, then ascending index.
+fn w48_rank(scores: &[i64]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..scores.len()).collect();
+    order.sort_by(|&a, &b| scores[b].cmp(&scores[a]).then(a.cmp(&b)));
+    order
+}
+
+#[inline]
+fn w48_be16(bytes: &[u8], at: usize) -> i64 {
+    i64::from(u16::from_be_bytes([bytes[at], bytes[at + 1]]))
+}
+
+#[inline]
+fn w48_le16(bytes: &[u8], at: usize) -> i64 {
+    i64::from(u16::from_le_bytes([bytes[at], bytes[at + 1]]))
+}
+
+#[inline]
+fn w48_le24(bytes: &[u8], at: usize) -> i64 {
+    i64::from(bytes[at]) | i64::from(bytes[at + 1]) << 8 | i64::from(bytes[at + 2]) << 16
+}
+
+/// PHP `strpos()` of one byte from `from`.
+#[inline]
+fn w48_find(haystack: &[u8], byte: u8, from: usize) -> Option<usize> {
+    haystack
+        .get(from..)?
+        .iter()
+        .position(|&candidate| candidate == byte)
+        .map(|at| at + from)
+}
+
+/// PHP `trim()` with its default character set.
+fn w48_trim(value: &[u8]) -> &[u8] {
+    let blank = |byte: &u8| matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B);
+    let start = value
+        .iter()
+        .position(|byte| !blank(byte))
+        .unwrap_or(value.len());
+    let end = value
+        .iter()
+        .rposition(|byte| !blank(byte))
+        .map_or(start, |at| at + 1);
+    &value[start..end]
+}
+
+/// PHP `rtrim($value, '0123456789')`.
+fn w48_strip_digits(value: &[u8]) -> &[u8] {
+    let end = value
+        .iter()
+        .rposition(|byte| !byte.is_ascii_digit())
+        .map_or(0, |at| at + 1);
+    &value[..end]
+}
+
+// --- ImageCandidate::scoreImageBatch -----------------------------------------
+
+pub(crate) const W48_IMAGE_HEADER: usize = 12;
+pub(crate) const W48_IMAGE_WIDTH: usize = 6;
+
+/// Image format of a downloaded head: 0 unknown, 1 JPEG, 2 PNG, 3 GIF, 4 WebP, 5 BMP.
+pub(crate) fn w48_image_format(head: &[u8]) -> usize {
+    if head.starts_with(b"\xFF\xD8\xFF") {
+        1
+    } else if head.starts_with(b"\x89PNG\r\n\x1A\n") {
+        2
+    } else if head.starts_with(b"GIF87a") || head.starts_with(b"GIF89a") {
+        3
+    } else if head.starts_with(b"RIFF") && head.get(8..12) == Some(b"WEBP") {
+        4
+    } else if head.starts_with(b"BM") {
+        5
+    } else {
+        0
+    }
+}
+
+/// Width and height from the first JPEG start-of-frame segment.
+fn w48_jpeg_dimensions(head: &[u8]) -> (i64, i64) {
+    let mut at = 2usize;
+    while at + 4 <= head.len() {
+        if head[at] != 0xFF {
+            break;
+        }
+        let marker = head[at + 1];
+        if marker == 0xFF {
+            at += 1;
+            continue;
+        }
+        if marker == 0xD8 || marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+            at += 2;
+            continue;
+        }
+        if marker == 0xD9 || marker == 0xDA {
+            break;
+        }
+        let length = w48_be16(head, at + 2) as usize;
+        if length < 2 {
+            break;
+        }
+        if (0xC0..=0xCF).contains(&marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) {
+            if at + 9 <= head.len() {
+                return (w48_be16(head, at + 7), w48_be16(head, at + 5));
+            }
+            break;
+        }
+        at += 2 + length;
+    }
+    (0, 0)
+}
+
+/// Header dimensions, each clamped to 1,000,000; 0 when the head does not show them.
+pub(crate) fn w48_image_dimensions(format: usize, head: &[u8]) -> (i64, i64) {
+    let len = head.len();
+    let (width, height) = match format {
+        1 => w48_jpeg_dimensions(head),
+        2 if len >= 24 && &head[12..16] == b"IHDR" => (
+            i64::from(u32::from_be_bytes([head[16], head[17], head[18], head[19]])),
+            i64::from(u32::from_be_bytes([head[20], head[21], head[22], head[23]])),
+        ),
+        3 if len >= 10 => (w48_le16(head, 6), w48_le16(head, 8)),
+        4 if len >= 16 => match &head[12..16] {
+            b"VP8 " if len >= 30 => (w48_le16(head, 26) & 0x3FFF, w48_le16(head, 28) & 0x3FFF),
+            b"VP8L" if len >= 25 => {
+                let bits = |at: usize| i64::from(head[at]);
+                (
+                    1 + (bits(21) | (bits(22) & 0x3F) << 8),
+                    1 + (bits(22) >> 6 | bits(23) << 2 | (bits(24) & 0x0F) << 10),
+                )
+            }
+            b"VP8X" if len >= 30 => (1 + w48_le24(head, 24), 1 + w48_le24(head, 27)),
+            _ => (0, 0),
+        },
+        5 if len >= 26 => (
+            i64::from(i32::from_le_bytes([head[18], head[19], head[20], head[21]])).abs(),
+            i64::from(i32::from_le_bytes([head[22], head[23], head[24], head[25]])).abs(),
+        ),
+        _ => (0, 0),
+    };
+    (width.min(W48_DIMENSION_CAP), height.min(W48_DIMENSION_CAP))
+}
+
+/// Distinct byte values and collision probability (ppm) of the first 4 KiB.
+pub(crate) fn w48_byte_entropy(head: &[u8]) -> (i64, i64) {
+    let window = &head[..head.len().min(W48_ENTROPY_WINDOW)];
+    if window.is_empty() {
+        return (0, 0);
+    }
+    let mut histogram = [0i64; 256];
+    for &byte in window {
+        histogram[byte as usize] += 1;
+    }
+    let (mut distinct, mut squares) = (0i64, 0i64);
+    for &count in &histogram {
+        distinct += i64::from(count > 0);
+        squares += count * count;
+    }
+    let n = window.len() as i64;
+    (distinct, squares * 1_000_000 / (n * n))
+}
+
+/// Extension code of a lowercased image name, numbered as the formats.
+fn w48_image_extension(lower: &[u8]) -> i64 {
+    match w47_extension(lower).0 {
+        b"jpg" | b"jpeg" => 1,
+        b"png" => 2,
+        b"gif" => 3,
+        b"webp" => 4,
+        b"bmp" => 5,
+        _ => 0,
+    }
+}
+
+/// Layout: `[0]` count, `[1..=6]` format counts, `[7]` with dimensions, `[8]`
+/// covers, `[9]` samples, `[10]` best index or -1, `[11]` FNV-1a digest of
+/// `format | kind << 4 | shape << 8`; then per item `format | extension << 4 |
+/// kind << 8 | shape << 12 | mismatch << 16`, width, height, aspect permille,
+/// `distinct << 32 | collision ppm` and score; then the indices best first.
+pub(crate) fn w48_score_images(names: &[&[u8]], heads: &[&[u8]], sizes: &[i64]) -> Vec<i64> {
+    const COVER: [&[u8]; 4] = [b"cover", b"front", b"poster", b"folder"];
+    const SAMPLE: [&[u8]; 5] = [b"sample", b"screen", b"thumb", b"proof", b"back"];
+    let count = names.len();
+    let mut out = vec![0i64; W48_IMAGE_HEADER + (W48_IMAGE_WIDTH + 1) * count];
+    out[0] = count as i64;
+    out[10] = -1;
+    let mut scores = Vec::with_capacity(count);
+    let mut digest = W47_FNV_OFFSET;
+    let mut lower = Vec::new();
+    for index in 0..count {
+        let head = heads[index];
+        let format = w48_image_format(head);
+        let (width, height) = w48_image_dimensions(format, head);
+        let (distinct, collision) = w48_byte_entropy(head);
+        w47_lower_into(names[index], &mut lower);
+        let extension = w48_image_extension(&lower);
+        let mismatch = extension != 0 && format != 0 && extension != format as i64;
+        let kind: u32 = if w47_contains_any(&lower, &SAMPLE) {
+            1
+        } else if w47_contains_any(&lower, &COVER) {
+            2
+        } else {
+            0
+        };
+        let dimensions = width > 0 && height > 0;
+        let aspect = if dimensions { width * 1000 / height } else { 0 };
+        let shape: u32 = if !dimensions {
+            0
+        } else if aspect < 900 {
+            1
+        } else if aspect <= 1100 {
+            2
+        } else {
+            3
+        };
+        let mut score = if format != 0 { 1000 } else { 0 };
+        if dimensions {
+            score += (width * height).min(50_000_000) / 10_000;
+            if width < 100 || height < 100 {
+                score -= 1500;
+            }
+        }
+        if kind == 2 {
+            score += if shape == 1 && aspect >= 550 {
+                3000
+            } else {
+                1500
+            };
+        } else if kind == 1 {
+            score -= 2000;
+        }
+        if mismatch {
+            score -= 500;
+        }
+        if head.len() >= 64 && distinct < 32 {
+            score -= 800;
+        }
+        if collision > 200_000 {
+            score -= 400;
+        }
+        score += (sizes[index].max(0) >> 10).min(4096) >> 3;
+        out[1 + format] += 1;
+        out[7] += i64::from(dimensions);
+        out[8] += i64::from(kind == 2);
+        out[9] += i64::from(kind == 1);
+        digest = w47_fnv(digest, format as u32 | kind << 4 | shape << 8);
+        let row = W48_IMAGE_HEADER + W48_IMAGE_WIDTH * index;
+        out[row] = format as i64
+            | extension << 4
+            | i64::from(kind) << 8
+            | i64::from(shape) << 12
+            | i64::from(mismatch) << 16;
+        out[row + 1] = width;
+        out[row + 2] = height;
+        out[row + 3] = aspect;
+        out[row + 4] = distinct << 32 | collision;
+        out[row + 5] = score;
+        scores.push(score);
+    }
+    let order = w48_rank(&scores);
+    if let Some(&best) = order.first() {
+        out[10] = best as i64;
+    }
+    out[11] = i64::from(digest);
+    let base = W48_IMAGE_HEADER + W48_IMAGE_WIDTH * count;
+    for (position, index) in order.into_iter().enumerate() {
+        out[base + position] = index as i64;
+    }
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_count` values.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_w48_image_score(
+    names: *const u8,
+    names_len: usize,
+    name_lens: *const u8,
+    name_lens_len: usize,
+    heads: *const u8,
+    heads_len: usize,
+    head_lens: *const u8,
+    head_lens_len: usize,
+    sizes: *const u8,
+    sizes_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        let values = (|| {
+            let names = w47_items(
+                w15_input(names, names_len)?,
+                w15_input(name_lens, name_lens_len)?,
+                count,
+            )?;
+            let heads = w47_items(
+                w15_input(heads, heads_len)?,
+                w15_input(head_lens, head_lens_len)?,
+                count,
+            )?;
+            let sizes = w47_ints(w15_input(sizes, sizes_len)?, 1, count)?;
+            Some(w48_score_images(&names, &heads, &sizes))
+        })();
+        // SAFETY: forwarded output contract.
+        unsafe { w47_finish(out, out_count, values) }
+    })
+    .unwrap_or(-1)
+}
+
+// --- MappedNzbFile::mapFileBatch ----------------------------------------------
+
+pub(crate) const W48_MAP_HEADER: usize = 12;
+pub(crate) const W48_MAP_WIDTH: usize = 6;
+
+/// A 1-6 digit counter, or `None`.
+fn w48_counter(digits: &[u8]) -> Option<i64> {
+    (w47_digits(digits) && digits.len() <= 6).then(|| w47_parse(digits))
+}
+
+/// `a/b` between `open` and the first `close` after it, as PHP's `strpos()` pair finds it.
+fn w48_counter_pair(subject: &[u8], open: Option<usize>, close: u8) -> (i64, i64) {
+    let Some(open) = open else {
+        return (0, 0);
+    };
+    let (Some(slash), Some(end)) = (
+        w48_find(subject, b'/', open),
+        w48_find(subject, close, open),
+    ) else {
+        return (0, 0);
+    };
+    if slash > end {
+        return (0, 0);
+    }
+    match (
+        w48_counter(&subject[open + 1..slash]),
+        w48_counter(&subject[slash + 1..end]),
+    ) {
+        (Some(part), Some(total)) => (part, total),
+        _ => (0, 0),
+    }
+}
+
+/// The quoted yEnc file name, else the trimmed subject.
+pub(crate) fn w48_subject_name(subject: &[u8]) -> &[u8] {
+    if let Some(first) = w48_find(subject, b'"', 0)
+        && let Some(second) = w48_find(subject, b'"', first + 1)
+        && second > first + 1
+    {
+        return &subject[first + 1..second];
+    }
+    w48_trim(subject)
+}
+
+/// Layout: `[0]` count, `[1]` exact, `[2]` case-insensitive and `[3]` unique-size
+/// matches, `[4]` unmapped, `[5]` complete, `[6]` incomplete and `[7]` unknown
+/// segment totals, `[8]` NZB bytes, `[9]` mapped PAR2 bytes, `[10]` ordered
+/// bytes, `[11]` FNV-1a digest of `kind | min(file number, 65535) << 4`; then per
+/// item the PAR2 index or -1, `kind | rank << 4`, `file << 32 | files`, segment
+/// ppm, byte offset and NZB-minus-PAR2 size; then the file order. Kinds: 3 exact
+/// name, 2 case-insensitive name, 1 unique size, 0 none. A PAR2 entry maps once.
+pub(crate) fn w48_map_files(
+    subjects: &[&[u8]],
+    ints: &[i64],
+    par2_names: &[&[u8]],
+    par2_sizes: &[i64],
+) -> Vec<i64> {
+    use std::collections::HashMap;
+    let count = subjects.len();
+    let (sizes, rest) = ints.split_at(count);
+    let (present, totals) = rest.split_at(count);
+    let mut out = vec![0i64; W48_MAP_HEADER + (W48_MAP_WIDTH + 1) * count];
+    out[0] = count as i64;
+    let mut exact: HashMap<&[u8], usize> = HashMap::with_capacity(par2_names.len());
+    let mut folded: HashMap<Vec<u8>, usize> = HashMap::with_capacity(par2_names.len());
+    let mut par2_by_size: HashMap<i64, (usize, usize)> = HashMap::with_capacity(par2_names.len());
+    for (entry, (&name, &size)) in par2_names.iter().zip(par2_sizes).enumerate() {
+        exact.entry(name).or_insert(entry);
+        folded.entry(name.to_ascii_lowercase()).or_insert(entry);
+        par2_by_size.entry(w47_clamp(size)).or_insert((0, entry)).0 += 1;
+    }
+    let real: Vec<i64> = par2_sizes.iter().map(|&size| w47_clamp(size)).collect();
+    let nzb: Vec<i64> = sizes.iter().map(|&size| w47_clamp(size)).collect();
+    let mut nzb_by_size: HashMap<i64, usize> = HashMap::with_capacity(count);
+    for &size in &nzb {
+        *nzb_by_size.entry(size).or_insert(0) += 1;
+    }
+    let names: Vec<&[u8]> = subjects
+        .iter()
+        .map(|subject| w48_subject_name(subject))
+        .collect();
+    let mut claimed = vec![false; par2_names.len()];
+    let mut matched: Vec<Option<(usize, i64)>> = vec![None; count];
+    let mut lower = Vec::new();
+    for index in 0..count {
+        let mut found = exact.get(names[index]).map(|&entry| (entry, 3));
+        if found.is_none_or(|(entry, _)| claimed[entry]) {
+            w47_lower_into(names[index], &mut lower);
+            found = folded.get(&lower).map(|&entry| (entry, 2));
+        }
+        if let Some((entry, kind)) = found
+            && !claimed[entry]
+        {
+            claimed[entry] = true;
+            matched[index] = Some((entry, kind));
+        }
+    }
+    for index in 0..count {
+        let size = nzb[index];
+        if matched[index].is_some() || size <= 0 || nzb_by_size.get(&size) != Some(&1) {
+            continue;
+        }
+        if let Some(&(1, entry)) = par2_by_size.get(&size)
+            && !claimed[entry]
+        {
+            claimed[entry] = true;
+            matched[index] = Some((entry, 1));
+        }
+    }
+    let mut keys = Vec::with_capacity(count);
+    let mut digest = W47_FNV_OFFSET;
+    let (mut nzb_total, mut mapped_total) = (0i64, 0i64);
+    for index in 0..count {
+        let subject = subjects[index];
+        let (file, files) = w48_counter_pair(subject, w48_find(subject, b'[', 0), b']');
+        let (_, subject_total) = w48_counter_pair(
+            subject,
+            subject.iter().rposition(|&byte| byte == b'('),
+            b')',
+        );
+        let total = if totals[index] > 0 {
+            w47_clamp(totals[index])
+        } else {
+            subject_total
+        };
+        let have = present[index].clamp(0, total);
+        let ppm = if total > 0 {
+            have * 1_000_000 / total
+        } else {
+            0
+        };
+        out[if total == 0 {
+            7
+        } else if have == total {
+            5
+        } else {
+            6
+        }] += 1;
+        let kind = matched[index].map_or(0, |(_, kind)| kind);
+        out[match kind {
+            3 => 1,
+            2 => 2,
+            1 => 3,
+            _ => 4,
+        }] += 1;
+        nzb_total = w47_add(nzb_total, nzb[index]);
+        let row = W48_MAP_HEADER + W48_MAP_WIDTH * index;
+        match matched[index] {
+            Some((entry, _)) => {
+                mapped_total = w47_add(mapped_total, real[entry]);
+                out[row] = entry as i64;
+                out[row + 5] = nzb[index] - real[entry];
+            }
+            None => out[row] = -1,
+        }
+        out[row + 1] = kind | kind.min(2) << 4;
+        out[row + 2] = file << 32 | files;
+        out[row + 3] = ppm;
+        digest = w47_fnv(digest, kind as u32 | (file.min(65_535) as u32) << 4);
+        keys.push(if file > 0 { file } else { 1_000_000 });
+    }
+    let mut order: Vec<usize> = (0..count).collect();
+    order.sort_by(|&a, &b| {
+        keys[a]
+            .cmp(&keys[b])
+            .then_with(|| names[a].cmp(names[b]))
+            .then(a.cmp(&b))
+    });
+    let mut offset = 0i64;
+    let base = W48_MAP_HEADER + W48_MAP_WIDTH * count;
+    for (position, &index) in order.iter().enumerate() {
+        out[W48_MAP_HEADER + W48_MAP_WIDTH * index + 4] = offset;
+        let bytes = matched[index].map_or(nzb[index], |(entry, _)| real[entry]);
+        offset = w47_add(offset, bytes);
+        out[base + position] = index as i64;
+    }
+    out[8] = nzb_total;
+    out[9] = mapped_total;
+    out[10] = offset;
+    out[11] = i64::from(digest);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_count` values.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_w48_nzb_file_map(
+    subjects: *const u8,
+    subjects_len: usize,
+    subject_lens: *const u8,
+    subject_lens_len: usize,
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    names: *const u8,
+    names_len: usize,
+    name_lens: *const u8,
+    name_lens_len: usize,
+    par2_sizes: *const u8,
+    par2_sizes_len: usize,
+    par2_count: usize,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        let values = (|| {
+            let subjects = w47_items(
+                w15_input(subjects, subjects_len)?,
+                w15_input(subject_lens, subject_lens_len)?,
+                count,
+            )?;
+            let ints = w47_ints(w15_input(ints, ints_len)?, 3, count)?;
+            let names = w47_items(
+                w15_input(names, names_len)?,
+                w15_input(name_lens, name_lens_len)?,
+                par2_count,
+            )?;
+            let par2_sizes = w47_ints(w15_input(par2_sizes, par2_sizes_len)?, 1, par2_count)?;
+            Some(w48_map_files(&subjects, &ints, &names, &par2_sizes))
+        })();
+        // SAFETY: forwarded output contract.
+        unsafe { w47_finish(out, out_count, values) }
+    })
+    .unwrap_or(-1)
+}
+
+// --- MediaSourceHints::extractHintBatch ---------------------------------------
+
+pub(crate) const W48_HINT_HEADER: usize = 12;
+pub(crate) const W48_HINT_WIDTH: usize = 4;
+const W48_CODEC_WEIGHT: [i64; 7] = [0, 10, 300, 500, 400, 200, 50];
+
+/// Hints of one name: codec, container, audio, source, flags, height, channels, score, tokens.
+pub(crate) fn w48_media_hint(lower: &[u8]) -> [i64; 9] {
+    let (mut codec, mut audio, mut source, mut flags) = (0i64, 0i64, 0i64, 0i64);
+    let (mut height, mut channels, mut tokens) = (0i64, 0i64, 0i64);
+    let mut previous: &[u8] = &[];
+    for token in lower
+        .split(|byte| !byte.is_ascii_lowercase() && !byte.is_ascii_digit())
+        .filter(|token| !token.is_empty())
+    {
+        tokens += 1;
+        let base = w48_strip_digits(token);
+        if codec == 0 {
+            codec = match token {
+                b"x265" | b"h265" | b"hevc" => 3,
+                b"x264" | b"h264" | b"avc" => 2,
+                b"av1" => 4,
+                b"vp9" => 5,
+                b"xvid" | b"divx" => 1,
+                b"mpeg2" => 6,
+                b"265" if previous == b"h" => 3,
+                b"264" if previous == b"h" => 2,
+                _ => 0,
+            };
+        }
+        if token == b"4k" || token == b"uhd" {
+            height = height.max(2160);
+        } else if (4..=5).contains(&token.len())
+            && matches!(token[token.len() - 1], b'p' | b'i')
+            && w47_digits(&token[..token.len() - 1])
+        {
+            let value = w47_parse(&token[..token.len() - 1]);
+            if (240..=4320).contains(&value) {
+                height = height.max(value);
+            }
+        }
+        let sound = if token == b"mp3" {
+            1
+        } else {
+            match base {
+                b"truehd" => 9,
+                b"flac" => 8,
+                b"dtsx" => 7,
+                b"hd" if w48_strip_digits(previous) == b"dts" => 7,
+                b"dts" => 6,
+                b"ddp" | b"eac" => 5,
+                b"dd" | b"ac" => 4,
+                b"opus" => 3,
+                b"aac" => 2,
+                _ => 0,
+            }
+        };
+        audio = audio.max(sound);
+        if base == b"atmos" {
+            flags |= 4;
+        }
+        if base == b"hdr" || token == b"hdr10plus" {
+            flags |= 1;
+        }
+        if token == b"dv" || token == b"dovi" {
+            flags |= 2;
+        }
+        if token == b"sample" {
+            flags |= 8;
+        }
+        if token == b"proper" || token == b"repack" {
+            flags |= 16;
+        }
+        source = source.max(match token {
+            b"remux" => 6,
+            b"bluray" | b"bdrip" | b"brrip" => 5,
+            b"webdl" => 4,
+            b"dl" if previous == b"web" => 4,
+            b"webrip" | b"web" => 3,
+            b"hdtv" => 2,
+            b"dvdrip" => 1,
+            _ => 0,
+        });
+        if (token == b"0" || token == b"1")
+            && let Some(&last) = previous.last()
+            && (b'1'..=b'9').contains(&last)
+        {
+            channels = channels.max(i64::from(last - b'0') + i64::from(token == b"1"));
+        }
+        previous = token;
+    }
+    let container = match w47_extension(lower).0 {
+        b"mkv" => 1,
+        b"mp4" => 2,
+        b"avi" => 3,
+        b"ts" => 4,
+        b"m2ts" => 5,
+        b"wmv" => 6,
+        b"mov" => 7,
+        b"webm" => 8,
+        b"mpg" | b"mpeg" => 9,
+        b"m4v" => 10,
+        _ => 0,
+    };
+    let score = height * 10
+        + W48_CODEC_WEIGHT[codec as usize]
+        + audio * 40
+        + source * 100
+        + if flags & 1 != 0 { 200 } else { 0 }
+        + if flags & 2 != 0 { 100 } else { 0 }
+        + if flags & 4 != 0 { 80 } else { 0 }
+        + if flags & 16 != 0 { 30 } else { 0 }
+        + match container {
+            0 => 0,
+            1 => 50,
+            2 => 40,
+            _ => 10,
+        }
+        + channels * 5
+        - if flags & 8 != 0 { 5000 } else { 0 };
+    [
+        codec, container, audio, source, flags, height, channels, score, tokens,
+    ]
+}
+
+/// Layout: `[0]` count, `[1]` no resolution, `[2]` below 720, `[3]` 720-1079,
+/// `[4]` 1080-2159, `[5]` 2160 and up, `[6]` HEVC/AV1, `[7]` HDR or Dolby
+/// Vision, `[8]` samples, `[9]` best index or -1, `[10]` tokens, `[11]` FNV-1a
+/// digest of `codec | container << 4 | audio << 8 | source << 12`; then per item
+/// `codec | container << 8 | audio << 16 | source << 24 | flags << 32`, height,
+/// channels and score; then the indices best first. Flags: 1 HDR, 2 Dolby
+/// Vision, 4 Atmos, 8 sample, 16 proper/repack.
+pub(crate) fn w48_extract_hints(names: &[&[u8]]) -> Vec<i64> {
+    let count = names.len();
+    let mut out = vec![0i64; W48_HINT_HEADER + (W48_HINT_WIDTH + 1) * count];
+    out[0] = count as i64;
+    out[9] = -1;
+    let mut scores = Vec::with_capacity(count);
+    let mut digest = W47_FNV_OFFSET;
+    let mut lower = Vec::new();
+    for (index, name) in names.iter().enumerate() {
+        w47_lower_into(name, &mut lower);
+        let [
+            codec,
+            container,
+            audio,
+            source,
+            flags,
+            height,
+            channels,
+            score,
+            tokens,
+        ] = w48_media_hint(&lower);
+        out[match height {
+            0 => 1,
+            _ if height < 720 => 2,
+            _ if height < 1080 => 3,
+            _ if height < 2160 => 4,
+            _ => 5,
+        }] += 1;
+        out[6] += i64::from(codec == 3 || codec == 4);
+        out[7] += i64::from(flags & 3 != 0);
+        out[8] += i64::from(flags & 8 != 0);
+        out[10] += tokens;
+        digest = w47_fnv(
+            digest,
+            (codec | container << 4 | audio << 8 | source << 12) as u32,
+        );
+        let row = W48_HINT_HEADER + W48_HINT_WIDTH * index;
+        out[row] = codec | container << 8 | audio << 16 | source << 24 | flags << 32;
+        out[row + 1] = height;
+        out[row + 2] = channels;
+        out[row + 3] = score;
+        scores.push(score);
+    }
+    let order = w48_rank(&scores);
+    if let Some(&best) = order.first() {
+        out[9] = best as i64;
+    }
+    out[11] = i64::from(digest);
+    let base = W48_HINT_HEADER + W48_HINT_WIDTH * count;
+    for (position, index) in order.into_iter().enumerate() {
+        out[base + position] = index as i64;
+    }
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_count` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w48_media_hint_extract(
+    names: *const u8,
+    names_len: usize,
+    name_lens: *const u8,
+    name_lens_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        let values = (|| {
+            let names = w47_items(
+                w15_input(names, names_len)?,
+                w15_input(name_lens, name_lens_len)?,
+                count,
+            )?;
+            Some(w48_extract_hints(&names))
+        })();
+        // SAFETY: forwarded output contract.
+        unsafe { w47_finish(out, out_count, values) }
+    })
+    .unwrap_or(-1)
+}
+
+// --- MediaSourcePlan::planSliceBatch ------------------------------------------
+
+pub(crate) const W48_SLICE_HEADER: usize = 12;
+pub(crate) const W48_SLICE_WIDTH: usize = 5;
+const W48_SLICE_BASE: [i64; 4] = [3_000_000, 2_000_000, 1_500_000, 1_000_000];
+
+/// Candidate windows `(start, end, cost, value)` per strategy (complete, head,
+/// mid, tail); `None` when the strategy does not apply.
+pub(crate) fn w48_slice_candidates(
+    real: i64,
+    available: i64,
+    part: i64,
+    probe: i64,
+) -> [Option<(i64, i64, i64, i64)>; 4] {
+    let down = |value: i64| value - value % part;
+    let up = |value: i64| down(value + part - 1);
+    let window = |strategy: usize, start: i64, end: i64, cost: i64| {
+        let value = W48_SLICE_BASE[strategy] + ((end - start) >> 20).min(500_000)
+            - (cost >> 14).min(1_400_000);
+        Some((start, end, cost, value))
+    };
+    let slice = |strategy: usize, start: i64, end: i64| {
+        let overlap = (available.min(end) - start).max(0);
+        window(strategy, start, end, end - start - overlap)
+    };
+    let known = real > 0;
+    let head_end = if known {
+        up(probe).min(real)
+    } else {
+        up(probe)
+    };
+    let mut candidates = [
+        None,
+        window(1, 0, head_end, (head_end - available).max(0)),
+        None,
+        None,
+    ];
+    if known {
+        candidates[0] = window(0, 0, real, (real - available).max(0));
+        if real > probe {
+            let start = down(real / 2 - probe / 2);
+            candidates[2] = slice(2, start, (start + up(probe)).min(real));
+            candidates[3] = slice(3, down(real - probe), real);
+        }
+    }
+    candidates
+}
+
+/// Layout: `[0]` count, `[1..=5]` chosen complete/head/mid/tail/none, `[6]` cost,
+/// `[7]` budget left, `[8]` planned bytes, `[9]` unknown sizes, `[10]` FNV-1a
+/// digest of `strategy | min(segments, 4095) << 4`, `[11]` files whose best
+/// window did not fit; then per file `strategy | segments << 8`, start, end,
+/// cost and value; then the planning order. Files are planned by descending best
+/// value; each takes its highest-value window that fits the remaining budget.
+pub(crate) fn w48_plan_slices(ints: &[i64], budget: i64, probe: i64) -> Vec<i64> {
+    let count = ints.len() / 3;
+    let (reals, rest) = ints.split_at(count);
+    let (available, parts) = rest.split_at(count);
+    let probe = probe.clamp(1, W48_PROBE_CAP);
+    let mut out = vec![0i64; W48_SLICE_HEADER + (W48_SLICE_WIDTH + 1) * count];
+    out[0] = count as i64;
+    let mut candidates = Vec::with_capacity(count);
+    let mut best = Vec::with_capacity(count);
+    let mut part_sizes = Vec::with_capacity(count);
+    for index in 0..count {
+        let real = w47_clamp(reals[index]);
+        let part = if parts[index] > 0 {
+            parts[index].min(W48_PART_CAP)
+        } else {
+            W48_DEFAULT_PART
+        };
+        out[9] += i64::from(real == 0);
+        let options = w48_slice_candidates(real, w47_clamp(available[index]), part, probe);
+        best.push(
+            options
+                .iter()
+                .flatten()
+                .map(|option| option.3)
+                .max()
+                .unwrap_or(0),
+        );
+        candidates.push(options);
+        part_sizes.push(part);
+    }
+    let order = w48_rank(&best);
+    let mut remaining = budget.clamp(0, W47_TOTAL_CAP);
+    let (mut spent, mut planned) = (0i64, 0i64);
+    let mut digest = W47_FNV_OFFSET;
+    for &index in &order {
+        let mut chosen: Option<(usize, (i64, i64, i64, i64))> = None;
+        for (strategy, option) in candidates[index].iter().enumerate() {
+            if let Some(option) = *option
+                && option.2 <= remaining
+                && chosen.is_none_or(|(_, current)| option.3 > current.3)
+            {
+                chosen = Some((strategy, option));
+            }
+        }
+        let row = W48_SLICE_HEADER + W48_SLICE_WIDTH * index;
+        let (strategy, segments) = match chosen {
+            Some((strategy, (start, end, cost, value))) => {
+                remaining -= cost;
+                spent = w47_add(spent, cost);
+                planned = w47_add(planned, end - start);
+                let part = part_sizes[index];
+                let segments = (end + part - 1) / part - start / part;
+                out[11] += i64::from(value != best[index]);
+                out[row + 1] = start;
+                out[row + 2] = end;
+                out[row + 3] = cost;
+                out[row + 4] = value;
+                (strategy as i64, segments)
+            }
+            None => {
+                out[11] += 1;
+                (4, 0)
+            }
+        };
+        out[1 + strategy as usize] += 1;
+        out[row] = strategy | segments << 8;
+        digest = w47_fnv(digest, (strategy | segments.min(4095) << 4) as u32);
+    }
+    out[6] = spent;
+    out[7] = remaining;
+    out[8] = planned;
+    out[10] = i64::from(digest);
+    let base = W48_SLICE_HEADER + W48_SLICE_WIDTH * count;
+    for (position, index) in order.into_iter().enumerate() {
+        out[base + position] = index as i64;
+    }
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_count` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w48_media_slice_plan(
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    budget: i64,
+    probe: i64,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        let values = (|| {
+            let ints = w47_ints(w15_input(ints, ints_len)?, 3, count)?;
+            Some(w48_plan_slices(&ints, budget, probe))
+        })();
+        // SAFETY: forwarded output contract.
+        unsafe { w47_finish(out, out_count, values) }
+    })
+    .unwrap_or(-1)
+}
+
+// --- PersistenceMetrics::aggregateWriteTelemetryBatch -------------------------
+
+pub(crate) const W48_WRITE_FIELDS: usize = 32;
+
+/// Sum, min, max, mean and nearest-rank p50/p95/p99 of clamped latencies.
+fn w48_latency_stats(values: &mut [i64], out: &mut [i64]) {
+    let count = values.len();
+    out[0] = values.iter().fold(0i64, |sum, &value| w47_add(sum, value));
+    if count == 0 {
+        return;
+    }
+    values.sort_unstable();
+    let rank = |percent: usize| values[(percent * count).div_ceil(100) - 1];
+    out[1] = values[0];
+    out[2] = values[count - 1];
+    out[3] = out[0] / count as i64;
+    out[4] = rank(50);
+    out[5] = rank(95);
+    out[6] = rank(99);
+}
+
+/// Layout: `[0]` count, `[1..=7]` database and `[8..=14]` disk latency sum, min,
+/// max, mean, p50, p95 and p99, `[15]` artifacts, `[16]` bytes, `[17]` bytes and
+/// `[18]` artifacts per second over the window, `[19]` bytes per artifact, `[20]`
+/// slow writes (combined latency above the threshold), `[21]` longest slow
+/// streak, `[22..=26]` combined <1ms/<10ms/<100ms/<1s/longer, `[27]` first
+/// slowest index or -1, `[28]` database share ppm, `[29]` mean artifacts per
+/// write, `[30]` writes without artifacts, `[31]` FNV-1a digest of `bucket |
+/// slow << 3 | min(artifacts, 255) << 4`. Values are clamped to [0, 2^40).
+pub(crate) fn w48_write_telemetry(ints: &[i64], window: i64, slow: i64) -> Vec<i64> {
+    let count = ints.len() / 4;
+    let mut out = vec![0i64; W48_WRITE_FIELDS];
+    out[0] = count as i64;
+    out[27] = -1;
+    let mut database: Vec<i64> = ints[..count]
+        .iter()
+        .map(|&value| w47_clamp(value))
+        .collect();
+    let mut disk: Vec<i64> = ints[count..2 * count]
+        .iter()
+        .map(|&value| w47_clamp(value))
+        .collect();
+    let (mut artifacts, mut bytes, mut streak, mut max) = (0i64, 0i64, 0i64, -1i64);
+    let mut digest = W47_FNV_OFFSET;
+    for index in 0..count {
+        let produced = w47_clamp(ints[2 * count + index]);
+        artifacts = w47_add(artifacts, produced);
+        bytes = w47_add(bytes, w47_clamp(ints[3 * count + index]));
+        out[30] += i64::from(produced == 0);
+        let combined = database[index] + disk[index];
+        let late = slow > 0 && combined > slow;
+        if late {
+            out[20] += 1;
+            streak += 1;
+            out[21] = out[21].max(streak);
+        } else {
+            streak = 0;
+        }
+        if combined > max {
+            max = combined;
+            out[27] = index as i64;
+        }
+        let bucket = [1_000, 10_000, 100_000, 1_000_000]
+            .iter()
+            .take_while(|&&limit| combined >= limit)
+            .count();
+        out[22 + bucket] += 1;
+        digest = w47_fnv(
+            digest,
+            bucket as u32 | u32::from(late) << 3 | (produced.min(255) as u32) << 4,
+        );
+    }
+    w48_latency_stats(&mut database, &mut out[1..8]);
+    w48_latency_stats(&mut disk, &mut out[8..15]);
+    out[15] = artifacts;
+    out[16] = bytes;
+    if window > 0 {
+        out[17] = bytes.min(W47_THROUGHPUT_BYTES_CAP) * 1_000_000 / window;
+        out[18] = artifacts.min(W47_THROUGHPUT_BYTES_CAP) * 1_000_000 / window;
+    }
+    if artifacts > 0 {
+        out[19] = bytes / artifacts;
+    }
+    let total = out[1] + out[8];
+    if total > 0 {
+        let share = if total <= W48_PPM_CAP {
+            out[1] * 1_000_000 / total
+        } else {
+            out[1] / (total / 1_000_000)
+        };
+        out[28] = share.min(1_000_000);
+    }
+    if count > 0 {
+        out[29] = artifacts / count as i64;
+    }
+    out[31] = i64::from(digest);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_count` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w48_persistence_telemetry(
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    window_micros: i64,
+    slow_micros: i64,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        let values = (|| {
+            let ints = w47_ints(w15_input(ints, ints_len)?, 4, count)?;
+            Some(w48_write_telemetry(&ints, window_micros, slow_micros))
+        })();
+        // SAFETY: forwarded output contract.
+        unsafe { w47_finish(out, out_count, values) }
+    })
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod w486_additional_dto_batch_tests {
+    use super::*;
+    use std::ptr::null;
+
+    fn joined(items: &[&[u8]]) -> Vec<u8> {
+        items.join(&0u8)
+    }
+
+    fn packed(values: &[i64]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect()
+    }
+
+    fn lens(items: &[&[u8]]) -> Vec<u8> {
+        items
+            .iter()
+            .flat_map(|item| (item.len() as u32).to_le_bytes())
+            .collect()
+    }
+
+    fn jpeg(width: u16, height: u16) -> Vec<u8> {
+        let mut head =
+            b"\xFF\xD8\xFF\xE0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00".to_vec();
+        head.extend_from_slice(b"\xFF\xC0\x00\x11\x08");
+        head.extend_from_slice(&height.to_be_bytes());
+        head.extend_from_slice(&width.to_be_bytes());
+        head.extend_from_slice(b"\x03\x01\x22\x00\x02\x11\x01\x03\x11\x01");
+        head
+    }
+
+    #[test]
+    fn image_formats_dimensions_and_entropy() {
+        assert_eq!(w48_image_format(&jpeg(1, 1)), 1);
+        assert_eq!(w48_image_dimensions(1, &jpeg(640, 480)), (640, 480));
+        let png = b"\x89PNG\r\n\x1A\n\x00\x00\x00\x0DIHDR\xFF\xFF\xFF\xFF\x00\x00\x00\x02";
+        assert_eq!(w48_image_format(png), 2);
+        assert_eq!(w48_image_dimensions(2, png), (W48_DIMENSION_CAP, 2));
+        assert_eq!(w48_image_dimensions(3, b"GIF89a\x50\x00\x3C\x00"), (80, 60));
+        let mut bmp = b"BM".to_vec();
+        bmp.resize(18, 0);
+        bmp.extend_from_slice(&800i32.to_le_bytes());
+        bmp.extend_from_slice(&(-600i32).to_le_bytes());
+        assert_eq!(
+            w48_image_dimensions(w48_image_format(&bmp), &bmp),
+            (800, 600)
+        );
+        let mut vp8x = b"RIFF\x1E\x00\x00\x00WEBPVP8X\x0A\x00\x00\x00\x10\x00\x00\x00".to_vec();
+        vp8x.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0x01, 0x00, 0x00]);
+        assert_eq!(w48_image_format(&vp8x), 4);
+        assert_eq!(w48_image_dimensions(4, &vp8x), (W48_DIMENSION_CAP, 2));
+        // Fill bytes, restart markers and a progressive frame.
+        let progressive = b"\xFF\xD8\xFF\xFF\xFF\xD0\xFF\xC2\x00\x11\x08\x00\x10\x00\x20";
+        assert_eq!(w48_image_dimensions(1, progressive), (32, 16));
+        assert_eq!(w48_image_dimensions(1, b"\xFF\xD8\xFF\xE0\x00\x01"), (0, 0));
+        assert_eq!(w48_byte_entropy(b"GARBAGE"), (5, 224_489));
+        assert_eq!(w48_byte_entropy(&[]), (0, 0));
+    }
+
+    #[test]
+    fn image_scores_rank_covers_first() {
+        let names: [&[u8]; 3] = [b"Movie.cover.jpg", b"screen1.jpg", b"unknown.bin"];
+        let (cover, screen) = (jpeg(600, 900), jpeg(1280, 720));
+        let heads: [&[u8]; 3] = [&cover, &screen, b"GARBAGE"];
+        let out = w48_score_images(&names, &heads, &[204_800, 102_400, 0]);
+        assert_eq!(&out[..11], &[3, 1, 2, 0, 0, 0, 0, 2, 1, 1, 0]);
+        let row = &out[W48_IMAGE_HEADER..W48_IMAGE_HEADER + W48_IMAGE_WIDTH];
+        assert_eq!(&row[..4], &[1 | 1 << 4 | 2 << 8 | 1 << 12, 600, 900, 666]);
+        assert_eq!(&out[W48_IMAGE_HEADER + 3 * W48_IMAGE_WIDTH..], &[0, 2, 1]);
+        assert_eq!(w48_score_images(&[], &[], &[]), {
+            let mut empty = vec![0i64; W48_IMAGE_HEADER];
+            empty[10] = -1;
+            empty[11] = i64::from(W47_FNV_OFFSET);
+            empty
+        });
+    }
+
+    #[test]
+    fn subject_parsing_and_file_mapping() {
+        assert_eq!(w48_subject_name(b"[1/2] - \"a.rar\" yEnc (1/5)"), b"a.rar");
+        assert_eq!(w48_subject_name(b" \"\" plain \x0B"), b"\"\" plain");
+        assert_eq!(w48_counter_pair(b"[12/34]", Some(0), b']'), (12, 34));
+        assert_eq!(w48_counter_pair(b"[1234567/3]", Some(0), b']'), (0, 0));
+        assert_eq!(w48_counter_pair(b"[1]/2", Some(0), b']'), (0, 0));
+        let subjects: [&[u8]; 3] = [
+            b"[2/3] - \"b.rar\" yEnc (1/4)",
+            b"[1/3] - \"A.RAR\" yEnc (1/4)",
+            b"[3/3] - \"x.bin\" yEnc (1/4)",
+        ];
+        let ints = [500, 400, 300, 4, 3, 0, 0, 0, 0];
+        let names: [&[u8]; 3] = [b"b.rar", b"a.rar", b"real.mkv"];
+        let out = w48_map_files(&subjects, &ints, &names, &[450, 350, 250]);
+        assert_eq!(&out[..11], &[3, 1, 1, 0, 1, 1, 2, 0, 1200, 800, 1100]);
+        assert_eq!(
+            &out[W48_MAP_HEADER..W48_MAP_HEADER + W48_MAP_WIDTH],
+            &[0, 3 | 2 << 4, 2 << 32 | 3, 1_000_000, 350, 50]
+        );
+        assert_eq!(&out[W48_MAP_HEADER + 3 * W48_MAP_WIDTH..], &[1, 0, 2]);
+        // A PAR2 entry maps once; a duplicated size is never unique.
+        let subjects: [&[u8]; 3] = [b"\"x\"", b"\"x\"", b"\"y\""];
+        let out = w48_map_files(
+            &subjects,
+            &[9, 9, 7, 0, 0, 0, 0, 0, 0],
+            &[b"x", b"z"],
+            &[1, 7],
+        );
+        assert_eq!(&out[1..5], &[1, 0, 1, 1]);
+    }
+
+    #[test]
+    fn media_hints_score_and_rank() {
+        let hint = w48_media_hint(b"movie.2024.1080p.bluray.x264.dts-hd.ma.5.1-grp.mkv");
+        assert_eq!(hint, [2, 1, 7, 5, 0, 1080, 6, 11_960, 12]);
+        let hint = w48_media_hint(b"x.4k.web-dl.ddp5.1.h.265.hdr10plus.dovi.atmos.repack-sample");
+        assert_eq!(&hint[..7], &[3, 0, 5, 4, 1 | 2 | 4 | 8 | 16, 2160, 6]);
+        assert_eq!(w48_media_hint(b"9999p.239p.4321p.mp4.mp3")[5], 0);
+        let names: [&[u8]; 2] = [
+            b"Movie.2024.1080p.BluRay.x264.DTS-HD.MA.5.1-GRP.mkv",
+            b"Movie.2024.2160p.WEB-DL.DDP5.1.HDR.H.265-GRP-sample.mp4",
+        ];
+        let out = w48_extract_hints(&names);
+        assert_eq!(&out[..11], &[2, 0, 0, 0, 1, 1, 1, 1, 1, 1, 25]);
+        assert_eq!(&out[W48_HINT_HEADER + 2 * W48_HINT_WIDTH..], &[1, 0]);
+    }
+
+    #[test]
+    fn slice_plans_respect_the_budget() {
+        let ints = [
+            4_000_000, 0, 10_000_000, 4_000_000, 100, 1_000_000, 1_000_000, 0, 1_000_000,
+        ];
+        let out = w48_plan_slices(&ints, 2_500_000, 2_000_000);
+        assert_eq!(
+            [&out[..10], &out[11..12]].concat(),
+            [3, 1, 1, 0, 0, 1, 1_000_000, 1_500_000, 6_000_000, 1, 2]
+        );
+        assert_eq!(
+            &out[W48_SLICE_HEADER..W48_SLICE_HEADER + W48_SLICE_WIDTH],
+            &[4 << 8, 0, 4_000_000, 0, 3_000_003]
+        );
+        assert_eq!(&out[W48_SLICE_HEADER + 3 * W48_SLICE_WIDTH..], &[0, 2, 1]);
+        let extremes = w48_plan_slices(&[i64::MAX, i64::MIN, i64::MAX], i64::MAX, i64::MAX);
+        assert_eq!((extremes[0], extremes[1]), (1, 1));
+    }
+
+    #[test]
+    fn write_telemetry_folds_latencies() {
+        let ints = [
+            100,
+            300,
+            2_000,
+            -7,
+            900,
+            50,
+            500_000,
+            20,
+            2,
+            0,
+            5,
+            1,
+            4096,
+            0,
+            1 << 20,
+            10,
+        ];
+        let out = w48_write_telemetry(&ints, 1_000_000, 1_000);
+        assert_eq!(
+            &out[..31],
+            &[
+                4, 2_400, 0, 2_000, 600, 100, 2_000, 2_000, 500_970, 20, 500_000, 125_242, 50,
+                500_000, 500_000, 8, 1_052_682, 1_052_682, 8, 131_585, 1, 1, 2, 1, 0, 1, 0, 2,
+                4_767, 2, 1
+            ]
+        );
+        let extremes = w48_write_telemetry(&[i64::MAX, i64::MAX, i64::MAX, i64::MAX], i64::MAX, 1);
+        assert_eq!((extremes[1], extremes[28]), (W47_VALUE_CAP, 500_000));
+    }
+
+    #[test]
+    fn exports_validate_inputs_and_outputs() {
+        let mut out = vec![0i64; 64];
+        let ints = packed(&[1, 2, 3, 4]);
+        let call = |out: &mut [i64], count: usize, cap: usize| unsafe {
+            nntmux_w48_persistence_telemetry(
+                ints.as_ptr(),
+                ints.len(),
+                count,
+                1,
+                1,
+                out.as_mut_ptr(),
+                cap,
+            )
+        };
+        assert_eq!(call(&mut out, 1, 64), 1);
+        assert_eq!(out[0], 1);
+        assert_eq!(call(&mut out, 2, 64), -1);
+        assert_eq!(call(&mut out, 1, 8), -2);
+
+        let names = joined(&[b"a.jpg", b"b.png"]);
+        let heads: [&[u8]; 2] = [b"\xFF\xD8\xFF", b"\x00\x01"];
+        let (head_bytes, head_lens) = (heads.concat(), lens(&heads));
+        let sizes = packed(&[1, 2]);
+        let status = unsafe {
+            nntmux_w48_image_score(
+                names.as_ptr(),
+                names.len(),
+                null(),
+                0,
+                head_bytes.as_ptr(),
+                head_bytes.len(),
+                head_lens.as_ptr(),
+                head_lens.len(),
+                sizes.as_ptr(),
+                sizes.len(),
+                2,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!((status, out[0], out[1], out[2]), (1, 2, 1, 1));
+
+        let names = joined(&[b"x.1080p.mkv", b"y"]);
+        let status = unsafe {
+            nntmux_w48_media_hint_extract(
+                names.as_ptr(),
+                names.len(),
+                null(),
+                0,
+                3,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!(status, -1);
+
+        let subjects = joined(&[b"\"a\""]);
+        let map_ints = packed(&[5, 0, 0]);
+        let par2 = joined(&[b"a"]);
+        let par2_sizes = packed(&[4]);
+        let status = unsafe {
+            nntmux_w48_nzb_file_map(
+                subjects.as_ptr(),
+                subjects.len(),
+                null(),
+                0,
+                map_ints.as_ptr(),
+                map_ints.len(),
+                1,
+                par2.as_ptr(),
+                par2.len(),
+                null(),
+                0,
+                par2_sizes.as_ptr(),
+                par2_sizes.len(),
+                1,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!((status, out[1], out[W48_MAP_HEADER]), (1, 1, 0));
+
+        let plan = packed(&[0, 0, 0]);
+        let status = unsafe {
+            nntmux_w48_media_slice_plan(plan.as_ptr(), plan.len(), 1, 0, 0, out.as_mut_ptr(), 64)
+        };
+        assert_eq!((status, out[5]), (1, 1));
+    }
+}
