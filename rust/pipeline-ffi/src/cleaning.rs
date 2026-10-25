@@ -22261,3 +22261,784 @@ mod wave32_table_account_gdpr_cleanup_commands_tests {
         }
     }
 }
+
+/// Wave 33.1: normalization helpers for the `Binary`, `BinaryBlacklist`, `Collection`,
+/// `MissedPart` and `Part` Eloquent models.
+///
+/// String inputs arrive as one buffer of `0x1F`-separated fields. Outputs are `0x1F`-separated
+/// decimal integers and strings, with `0x1E` alone for PHP `null`. Inputs that are not UTF-8,
+/// embed either marker byte or carry a non-boolean flag decline with `-1` so PHP keeps its own
+/// implementation.
+pub mod wave33_binary_part_collection_models {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+    use std::str;
+
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+    const DECLINE: isize = -1;
+    const FIELD_SEP: u8 = 0x1F;
+    const NULL_MARK: u8 = 0x1E;
+    const TRIM_SET: &[u8] = b" \t\n\r\0\x0B\x0C";
+    const U32_MAX: i64 = 4_294_967_295;
+    const TINYINT_MAX: i64 = 255;
+
+    unsafe fn valid_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null()
+            || len > MAX_INPUT
+            || len > isize::MAX as usize
+            || (ptr as usize).checked_add(len).is_none()
+        {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn valid_out_buf(out_buf: *mut u8, out_cap: usize) -> bool {
+        !out_buf.is_null()
+            && out_cap <= isize::MAX as usize
+            && (out_buf as usize).checked_add(out_cap).is_some()
+    }
+
+    #[inline]
+    fn flag(value: u32) -> Option<bool> {
+        match value {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+
+    /// Copies `bytes` into `out_buf`, returning the length or `-required` when it does not fit.
+    unsafe fn write_bytes(bytes: &[u8], out_buf: *mut u8, out_cap: usize) -> isize {
+        if bytes.len() > isize::MAX as usize {
+            return DECLINE;
+        }
+        if bytes.len() > out_cap {
+            return -(bytes.len() as isize);
+        }
+        if !bytes.is_empty() {
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len()) };
+        }
+        bytes.len() as isize
+    }
+
+    fn finish(encoded: Option<Vec<u8>>, out_buf: *mut u8, out_cap: usize) -> isize {
+        match encoded {
+            Some(bytes) => unsafe { write_bytes(&bytes, out_buf, out_cap) },
+            None => DECLINE,
+        }
+    }
+
+    /// Splits the wire buffer into exactly `expected` UTF-8 fields.
+    fn split_fields(input: &[u8], expected: usize) -> Option<Vec<&str>> {
+        if input.contains(&NULL_MARK) {
+            return None;
+        }
+        let mut fields = Vec::with_capacity(expected);
+        for part in input.split(|&b| b == FIELD_SEP) {
+            if fields.len() == expected {
+                return None;
+            }
+            fields.push(str::from_utf8(part).ok()?);
+        }
+        (fields.len() == expected).then_some(fields)
+    }
+
+    /// PHP `trim($value, " \t\n\r\0\x0B\x0C")`.
+    fn trim_ws(value: &str) -> &str {
+        value.trim_matches(|c: char| c.is_ascii() && TRIM_SET.contains(&(c as u8)))
+    }
+
+    /// PHP `preg_replace('/[ \t\n\r\x0B\x0C]+/', ' ', $value)`.
+    fn collapse_ws(value: &str) -> String {
+        let mut out = String::with_capacity(value.len());
+        let mut in_run = false;
+        for c in value.chars() {
+            if matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0B' | '\x0C') {
+                if !in_run {
+                    out.push(' ');
+                    in_run = true;
+                }
+            } else {
+                out.push(c);
+                in_run = false;
+            }
+        }
+        out
+    }
+
+    /// PHP `mb_substr($value, 0, $max, 'UTF-8')` for valid UTF-8.
+    fn char_prefix(value: &str, max: usize) -> &str {
+        match value.char_indices().nth(max) {
+            Some((index, _)) => &value[..index],
+            None => value,
+        }
+    }
+
+    fn bool_field(value: bool) -> &'static [u8] {
+        if value { b"1" } else { b"0" }
+    }
+
+    /// Joins fields with the separator (`None` encodes PHP `null`).
+    fn encode(fields: &[Option<&[u8]>]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(64);
+        for (i, field) in fields.iter().enumerate() {
+            if i > 0 {
+                out.push(FIELD_SEP);
+            }
+            out.extend_from_slice(field.unwrap_or(&[NULL_MARK]));
+        }
+        out
+    }
+
+    fn encode_ints(values: &[i64]) -> Vec<u8> {
+        let texts: Vec<String> = values.iter().map(i64::to_string).collect();
+        let fields: Vec<Option<&[u8]>> = texts.iter().map(|t| Some(t.as_bytes())).collect();
+        encode(&fields)
+    }
+
+    /// `Binary::normalizePartProgressPhp()`:
+    /// `[totalparts, currentparts, partsize, partcheck, missing, basis_points, complete, avg]`.
+    pub fn binary_part_progress(
+        total: i64,
+        current: i64,
+        part_size: i64,
+        part_check: bool,
+    ) -> [i64; 8] {
+        let total = total.clamp(0, U32_MAX);
+        let current = current.clamp(0, total);
+        let part_size = part_size.max(0);
+        let complete = total > 0 && current >= total;
+        let basis_points = if total > 0 {
+            current * 10_000 / total
+        } else {
+            0
+        };
+        let average = if current > 0 { part_size / current } else { 0 };
+        [
+            total,
+            current,
+            part_size,
+            i64::from(part_check || complete),
+            total - current,
+            basis_points,
+            i64::from(complete),
+            average,
+        ]
+    }
+
+    fn msgcol_field(msg_col: i64) -> &'static str {
+        match msg_col {
+            2 => "from",
+            3 => "messageid",
+            _ => "subject",
+        }
+    }
+
+    /// `BinaryBlacklist::normalizeBlacklistRuleAttributesPhp()`:
+    /// `(groupname, regex, msgcol, optype, status, field, composite_key)`.
+    pub fn blacklist_rule(
+        group_name: Option<&str>,
+        regex: &str,
+        msg_col: i64,
+        op_type: i64,
+        status: i64,
+    ) -> (Option<String>, String, i64, i64, i64, &'static str, String) {
+        let group = group_name
+            .map(trim_ws)
+            .filter(|g| !g.is_empty())
+            .map(|g| char_prefix(g, 255).to_ascii_lowercase());
+        let regex = trim_ws(regex).to_owned();
+        let msg_col = if (1..=3).contains(&msg_col) {
+            msg_col
+        } else {
+            1
+        };
+        let op_type = if op_type == 2 { 2 } else { 1 };
+        let status = i64::from(status == 1);
+        let key = format!(
+            "{}|{op_type}|{msg_col}|{regex}",
+            group.as_deref().unwrap_or("*")
+        );
+        (
+            group,
+            regex,
+            msg_col,
+            op_type,
+            status,
+            msgcol_field(msg_col),
+            key,
+        )
+    }
+
+    /// `Collection::normalizeCollectionSummaryPhp()`:
+    /// `(subject, fromname, totalfiles, filesize, filecheck, average_file_size, summary_key)`.
+    pub fn collection_summary(
+        subject: &str,
+        from_name: &str,
+        total_files: i64,
+        file_size: i64,
+        file_check: bool,
+    ) -> (String, String, i64, i64, i64, i64, String) {
+        let subject = char_prefix(trim_ws(&collapse_ws(subject)), 255).to_owned();
+        let from_name = char_prefix(trim_ws(from_name), 255).to_owned();
+        let total_files = total_files.clamp(0, U32_MAX);
+        let file_size = file_size.max(0);
+        let average = if total_files > 0 {
+            file_size / total_files
+        } else {
+            0
+        };
+        let key = format!(
+            "{}|{}|{total_files}",
+            subject.to_ascii_lowercase(),
+            from_name.to_ascii_lowercase()
+        );
+        (
+            subject,
+            from_name,
+            total_files,
+            file_size,
+            i64::from(file_check),
+            average,
+            key,
+        )
+    }
+
+    /// `MissedPart::normalizeMissedPartRetryStatePhp()`:
+    /// `[numberid, groups_id, attempts, max_attempts, remaining, should_retry, next_attempts]`.
+    pub fn missed_part_retry(
+        number_id: i64,
+        group_id: i64,
+        attempts: i64,
+        max_attempts: i64,
+    ) -> [i64; 7] {
+        let number_id = number_id.max(0);
+        let group_id = group_id.max(0);
+        let attempts = attempts.clamp(0, TINYINT_MAX);
+        let max_attempts = max_attempts.clamp(1, TINYINT_MAX);
+        [
+            number_id,
+            group_id,
+            attempts,
+            max_attempts,
+            (max_attempts - attempts).max(0),
+            i64::from(attempts < max_attempts),
+            (attempts + 1).min(TINYINT_MAX),
+        ]
+    }
+
+    /// `Part::normalizePartSegmentPhp()`:
+    /// `(binaries_id, messageid, number, partnumber, size, valid)`.
+    pub fn part_segment(
+        binaries_id: i64,
+        message_id: &str,
+        number: i64,
+        part_number: i64,
+        size: i64,
+    ) -> (i64, String, i64, i64, i64, bool) {
+        let mut message = trim_ws(message_id);
+        if message.len() >= 2 && message.starts_with('<') && message.ends_with('>') {
+            message = trim_ws(&message[1..message.len() - 1]);
+        }
+        let message = char_prefix(message, 255).to_owned();
+        let binaries_id = binaries_id.max(0);
+        let part_number = part_number.max(0);
+        let valid = !message.is_empty() && part_number > 0 && binaries_id > 0;
+        (
+            binaries_id,
+            message,
+            number.max(0),
+            part_number,
+            size.max(0),
+            valid,
+        )
+    }
+
+    fn blacklist_encode(
+        group_is_null: bool,
+        input: &[u8],
+        msg_col: i64,
+        op_type: i64,
+        status: i64,
+    ) -> Option<Vec<u8>> {
+        let fields = split_fields(input, 2)?;
+        if group_is_null && !fields[0].is_empty() {
+            return None;
+        }
+        let group = (!group_is_null).then_some(fields[0]);
+        let (group, regex, msg_col, op_type, status, field, key) =
+            blacklist_rule(group, fields[1], msg_col, op_type, status);
+        let ints = [msg_col.to_string(), op_type.to_string(), status.to_string()];
+        Some(encode(&[
+            group.as_deref().map(str::as_bytes),
+            Some(regex.as_bytes()),
+            Some(ints[0].as_bytes()),
+            Some(ints[1].as_bytes()),
+            Some(ints[2].as_bytes()),
+            Some(bool_field(group.is_none())),
+            Some(field.as_bytes()),
+            Some(key.as_bytes()),
+        ]))
+    }
+
+    fn collection_encode(
+        input: &[u8],
+        total_files: i64,
+        file_size: i64,
+        file_check: bool,
+    ) -> Option<Vec<u8>> {
+        let fields = split_fields(input, 2)?;
+        let (subject, from_name, total, size, check, average, key) =
+            collection_summary(fields[0], fields[1], total_files, file_size, file_check);
+        let ints = [
+            total.to_string(),
+            size.to_string(),
+            check.to_string(),
+            average.to_string(),
+        ];
+        Some(encode(&[
+            Some(subject.as_bytes()),
+            Some(from_name.as_bytes()),
+            Some(ints[0].as_bytes()),
+            Some(ints[1].as_bytes()),
+            Some(ints[2].as_bytes()),
+            Some(ints[3].as_bytes()),
+            Some(key.as_bytes()),
+        ]))
+    }
+
+    fn part_encode(
+        binaries_id: i64,
+        input: &[u8],
+        number: i64,
+        part_number: i64,
+        size: i64,
+    ) -> Option<Vec<u8>> {
+        let fields = split_fields(input, 1)?;
+        let (binaries_id, message, number, part_number, size, valid) =
+            part_segment(binaries_id, fields[0], number, part_number, size);
+        let key = format!("{binaries_id}:{part_number}");
+        let ints = [
+            binaries_id.to_string(),
+            number.to_string(),
+            part_number.to_string(),
+            size.to_string(),
+        ];
+        Some(encode(&[
+            Some(ints[0].as_bytes()),
+            Some(message.as_bytes()),
+            Some(ints[1].as_bytes()),
+            Some(ints[2].as_bytes()),
+            Some(ints[3].as_bytes()),
+            Some(bool_field(valid)),
+            Some(key.as_bytes()),
+        ]))
+    }
+
+    /// `Binary::normalizePartProgress()`; output is eight decimal integers.
+    ///
+    /// # Safety
+    /// `out_buf` must be valid for writes of `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w33_binary_normalize_part_progress(
+        total_parts: i64,
+        current_parts: i64,
+        part_size: i64,
+        part_check: u32,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let encoded = flag(part_check).map(|check| {
+                encode_ints(&binary_part_progress(
+                    total_parts,
+                    current_parts,
+                    part_size,
+                    check,
+                ))
+            });
+            finish(encoded, out_buf, out_cap)
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `BinaryBlacklist::normalizeBlacklistRuleAttributes()`; input is `groupname`, `regex`.
+    ///
+    /// # Safety
+    /// `input_ptr` must be valid for reads of `input_len` bytes and `out_buf` for writes of
+    /// `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w33_binary_blacklist_normalize_rule(
+        group_is_null: u32,
+        msg_col: i64,
+        op_type: i64,
+        status: i64,
+        input_ptr: *const u8,
+        input_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(input) = (unsafe { valid_slice(input_ptr, input_len) }) else {
+                return DECLINE;
+            };
+            let encoded = flag(group_is_null)
+                .and_then(|is_null| blacklist_encode(is_null, input, msg_col, op_type, status));
+            finish(encoded, out_buf, out_cap)
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `Collection::normalizeCollectionSummary()`; input is `subject`, `fromname`.
+    ///
+    /// # Safety
+    /// `input_ptr` must be valid for reads of `input_len` bytes and `out_buf` for writes of
+    /// `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w33_collection_normalize_summary(
+        total_files: i64,
+        file_size: i64,
+        file_check: u32,
+        input_ptr: *const u8,
+        input_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(input) = (unsafe { valid_slice(input_ptr, input_len) }) else {
+                return DECLINE;
+            };
+            let encoded = flag(file_check)
+                .and_then(|check| collection_encode(input, total_files, file_size, check));
+            finish(encoded, out_buf, out_cap)
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `MissedPart::normalizeMissedPartRetryState()`; output is seven decimal integers.
+    ///
+    /// # Safety
+    /// `out_buf` must be valid for writes of `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w33_missed_part_normalize_retry_state(
+        number_id: i64,
+        group_id: i64,
+        attempts: i64,
+        max_attempts: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let state = missed_part_retry(number_id, group_id, attempts, max_attempts);
+            unsafe { write_bytes(&encode_ints(&state), out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `Part::normalizePartSegment()`; input is the raw `messageid`.
+    ///
+    /// # Safety
+    /// `input_ptr` must be valid for reads of `input_len` bytes and `out_buf` for writes of
+    /// `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w33_part_normalize_segment(
+        binaries_id: i64,
+        number: i64,
+        part_number: i64,
+        size: i64,
+        input_ptr: *const u8,
+        input_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(input) = (unsafe { valid_slice(input_ptr, input_len) }) else {
+                return DECLINE;
+            };
+            finish(
+                part_encode(binaries_id, input, number, part_number, size),
+                out_buf,
+                out_cap,
+            )
+        }))
+        .unwrap_or(DECLINE)
+    }
+}
+
+#[cfg(test)]
+mod wave33_binary_part_collection_models_tests {
+    use super::wave33_binary_part_collection_models::*;
+
+    fn call(f: impl Fn(*mut u8, usize) -> isize) -> Vec<u8> {
+        let needed = f(std::ptr::NonNull::<u8>::dangling().as_ptr(), 0);
+        assert!(needed < -1 || needed == 0, "unexpected {needed}");
+        let mut out = vec![0_u8; (-needed) as usize];
+        let written = f(out.as_mut_ptr(), out.len());
+        assert_eq!(written, out.len() as isize);
+        out
+    }
+
+    #[test]
+    fn binary_progress_clamps_and_reports_completion() {
+        assert_eq!(
+            binary_part_progress(10, 4, 1000, false),
+            [10, 4, 1000, 0, 6, 4000, 0, 250]
+        );
+        assert_eq!(
+            binary_part_progress(10, 12, -5, false),
+            [10, 10, 0, 1, 0, 10000, 1, 0]
+        );
+        assert_eq!(
+            binary_part_progress(0, 3, 9, true),
+            [0, 0, 9, 1, 0, 0, 0, 0]
+        );
+        assert_eq!(binary_part_progress(3, 1, 10, false)[5], 3333);
+        assert_eq!(
+            binary_part_progress(i64::MAX, i64::MAX, i64::MAX, false)[0],
+            4_294_967_295
+        );
+        assert_eq!(
+            binary_part_progress(i64::MIN, i64::MIN, i64::MIN, false),
+            [0; 8]
+        );
+        let out = call(|buf, cap| unsafe {
+            nntmux_w33_binary_normalize_part_progress(10, 4, 1000, 0, buf, cap)
+        });
+        assert_eq!(out, b"10\x1f4\x1f1000\x1f0\x1f6\x1f4000\x1f0\x1f250");
+        let mut target = [0_u8; 64];
+        assert_eq!(
+            unsafe {
+                nntmux_w33_binary_normalize_part_progress(1, 1, 1, 2, target.as_mut_ptr(), 64)
+            },
+            -1
+        );
+    }
+
+    #[test]
+    fn blacklist_rule_normalizes_fields() {
+        let (group, regex, msg, op, status, field, key) =
+            blacklist_rule(Some("  ALT.Binaries.TEST "), " ^foo$ ", 2, 2, 1);
+        assert_eq!(group.as_deref(), Some("alt.binaries.test"));
+        assert_eq!(regex, "^foo$");
+        assert_eq!((msg, op, status, field), (2, 2, 1, "from"));
+        assert_eq!(key, "alt.binaries.test|2|2|^foo$");
+        let (group, _, msg, op, status, field, key) = blacklist_rule(Some(" \t"), "x", 9, 0, 7);
+        assert_eq!(group, None);
+        assert_eq!((msg, op, status, field), (1, 1, 0, "subject"));
+        assert_eq!(key, "*|1|1|x");
+        let input = b"\x1fabc";
+        let out = call(|buf, cap| unsafe {
+            nntmux_w33_binary_blacklist_normalize_rule(
+                1,
+                3,
+                1,
+                1,
+                input.as_ptr(),
+                input.len(),
+                buf,
+                cap,
+            )
+        });
+        assert_eq!(
+            out,
+            b"\x1e\x1fabc\x1f3\x1f1\x1f1\x1f1\x1fmessageid\x1f*|1|3|abc"
+        );
+        let mut target = [0_u8; 64];
+        for bad in [
+            &b"x\x1fy"[..],
+            b"onlyone",
+            b"a\x1fb\x1fc",
+            b"\x1e\x1fy",
+            b"\xff\x1fy",
+        ] {
+            assert_eq!(
+                unsafe {
+                    nntmux_w33_binary_blacklist_normalize_rule(
+                        1,
+                        1,
+                        1,
+                        1,
+                        bad.as_ptr(),
+                        bad.len(),
+                        target.as_mut_ptr(),
+                        64,
+                    )
+                },
+                -1
+            );
+        }
+    }
+
+    #[test]
+    fn collection_summary_collapses_and_keys() {
+        let (subject, from, total, size, check, avg, key) =
+            collection_summary("  My \t Post  [1/5] ", " Poster@Example ", 5, 1001, true);
+        assert_eq!(subject, "My Post [1/5]");
+        assert_eq!(from, "Poster@Example");
+        assert_eq!((total, size, check, avg), (5, 1001, 1, 200));
+        assert_eq!(key, "my post [1/5]|poster@example|5");
+        let (subject, _, total, size, _, avg, _) =
+            collection_summary(&"é".repeat(300), "", -1, -1, false);
+        assert_eq!(subject.chars().count(), 255);
+        assert_eq!((total, size, avg), (0, 0, 0));
+    }
+
+    #[test]
+    fn missed_part_retry_state_bounds() {
+        assert_eq!(missed_part_retry(100, 7, 2, 5), [100, 7, 2, 5, 3, 1, 3]);
+        assert_eq!(missed_part_retry(-1, -1, 9, 3), [0, 0, 9, 3, 0, 0, 10]);
+        assert_eq!(missed_part_retry(1, 1, 999, 0), [1, 1, 255, 1, 0, 0, 255]);
+        assert_eq!(missed_part_retry(1, 1, -4, 999), [1, 1, 0, 255, 255, 1, 1]);
+    }
+
+    #[test]
+    fn part_segment_strips_brackets() {
+        assert_eq!(
+            part_segment(5, " <abc@news> ", 10, 2, 700),
+            (5, "abc@news".to_owned(), 10, 2, 700, true)
+        );
+        assert_eq!(
+            part_segment(0, "<>", -1, -1, -1),
+            (0, String::new(), 0, 0, 0, false)
+        );
+        assert_eq!(part_segment(1, "<", 1, 1, 1).1, "<");
+        assert_eq!(part_segment(1, "< x >", 1, 1, 1).1, "x");
+        let input = b"<id@x>";
+        let out = call(|buf, cap| unsafe {
+            nntmux_w33_part_normalize_segment(9, 1, 3, 400, input.as_ptr(), input.len(), buf, cap)
+        });
+        assert_eq!(out, b"9\x1fid@x\x1f1\x1f3\x1f400\x1f1\x1f9:3");
+    }
+
+    #[test]
+    fn exports_reject_bad_regions_and_leave_short_output_untouched() {
+        let input = b"subject\x1ffrom";
+        let mut target = vec![0xab_u8; 64];
+        unsafe {
+            let needed = nntmux_w33_collection_normalize_summary(
+                1,
+                1,
+                0,
+                input.as_ptr(),
+                input.len(),
+                target.as_mut_ptr(),
+                0,
+            );
+            assert!(needed < -1);
+            for capacity in [1, (-needed) as usize - 1] {
+                assert_eq!(
+                    nntmux_w33_collection_normalize_summary(
+                        1,
+                        1,
+                        0,
+                        input.as_ptr(),
+                        input.len(),
+                        target.as_mut_ptr(),
+                        capacity,
+                    ),
+                    needed
+                );
+                assert!(target.iter().all(|byte| *byte == 0xab));
+            }
+            assert_eq!(
+                nntmux_w33_collection_normalize_summary(
+                    1,
+                    1,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    target.as_mut_ptr(),
+                    64
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_w33_collection_normalize_summary(
+                    1,
+                    1,
+                    0,
+                    input.as_ptr(),
+                    input.len(),
+                    std::ptr::null_mut(),
+                    64
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_w33_collection_normalize_summary(
+                    1,
+                    1,
+                    0,
+                    input.as_ptr(),
+                    usize::MAX,
+                    target.as_mut_ptr(),
+                    64
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_w33_collection_normalize_summary(
+                    1,
+                    1,
+                    3,
+                    input.as_ptr(),
+                    input.len(),
+                    target.as_mut_ptr(),
+                    64
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_w33_part_normalize_segment(
+                    1,
+                    1,
+                    1,
+                    1,
+                    input.as_ptr(),
+                    input.len(),
+                    target.as_mut_ptr(),
+                    64
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_w33_missed_part_normalize_retry_state(1, 1, 1, 1, std::ptr::null_mut(), 64),
+                -1
+            );
+            assert!(target.iter().all(|byte| *byte == 0xab));
+            let written = nntmux_w33_missed_part_normalize_retry_state(
+                1,
+                2,
+                0,
+                3,
+                target.as_mut_ptr().add(1),
+                63,
+            );
+            assert_eq!(
+                &target[1..1 + written as usize],
+                b"1\x1f2\x1f0\x1f3\x1f3\x1f1\x1f1"
+            );
+            assert_eq!(target[0], 0xab);
+        }
+    }
+}
