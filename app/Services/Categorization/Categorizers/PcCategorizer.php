@@ -16,6 +16,50 @@ use Throwable;
  */
 class PcCategorizer extends AbstractCategorizer
 {
+    /**
+     * Wave 43.3 production default is Rust: the paired benchmark in
+     * tests/Unit/RustCategorizersMusicPcTvXxxPipeW43ParityTest.php measures at least 3.3x
+     * (mean and p99, common and uncommon batches). PHP stays the fallback when the library is
+     * unavailable.
+     * Named W433 so it stays distinct from other Rust FFI toggles.
+     */
+    public const bool W433_RUST_FFI_DEFAULT = true;
+
+    public const string W433_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w433_pc_platform_batch(
+            const char *blob_ptr,
+            size_t blob_len,
+            const char *lens_ptr,
+            size_t lens_len,
+            char *out_buf,
+            size_t out_cap
+        );
+        C;
+
+    /**
+     * PC platform marker substrings, in match order. The first class with a substring of the
+     * lowercased release name wins.
+     *
+     * @var array<string, list<string>>
+     */
+    public const array W433_PC_PLATFORM_MARKERS = [
+        'phone' => ['iphone', 'ipad', 'android', '.apk', '.ipa'],
+        'mac' => ['macos', 'mac.os', 'osx', '.dmg'],
+        'game' => ['pc.game', 'pcgame', 'steamrip', 'codex', 'plaza', 'fitgirl', 'gog'],
+        'iso' => ['.iso', '.img', 'dvd9'],
+        'zeroday' => ['keygen', 'win64', 'win32', 'x64', 'x86', 'portable', 'incl.crack'],
+    ];
+
+    /** @var list<string> */
+    public const array W433_MULTI_MARKERS = ['multi'];
+
+    /** Exactly 8 0x1F-separated decimals of 1-19 digits. */
+    private const string W433_FIELDS_PATTERN = '/\A(?:\d{1,19}\x1F){7}\d{1,19}\z/';
+
+    private static ?bool $w433RustFfiOverride = null;
+
+    private static FFI|false|null $w433RustFfiHandle = null;
+
     protected int $priority = 30;
 
     // Common PC game release groups (matched at end of release name only)
@@ -288,5 +332,195 @@ CDEF;
         }
 
         return null;
+    }
+
+    /**
+     * Enables (true) or disables (false) the Wave 43.3 Rust helper; null restores
+     * W433_RUST_FFI_DEFAULT.
+     */
+    public static function useW433RustFfi(?bool $enable = true): void
+    {
+        self::$w433RustFfiOverride = $enable;
+    }
+
+    public static function usesW433RustFfi(): bool
+    {
+        return self::$w433RustFfiOverride ?? self::W433_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW433RustFfi(): void
+    {
+        self::$w433RustFfiOverride = null;
+        self::$w433RustFfiHandle = null;
+    }
+
+    /**
+     * PC platform summary for a batch of release names. Each lowercased name adds to its first
+     * W433_PC_PLATFORM_MARKERS class, else to unknown, and separately to multi when it holds any
+     * W433_MULTI_MARKERS entry. Non-strings count as empty names.
+     *
+     * @param  array<array-key, mixed>  $releaseNames
+     * @return array{total: int, phone: int, mac: int, game: int, iso: int, zeroday: int, unknown: int, multi: int}
+     */
+    public static function summarizePcPlatformBatch(array $releaseNames): array
+    {
+        return (self::usesW433RustFfi() ? self::summarizePcPlatformBatchNative($releaseNames) : null)
+            ?? self::summarizePcPlatformBatchPhp($releaseNames);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $releaseNames
+     * @return array{total: int, phone: int, mac: int, game: int, iso: int, zeroday: int, unknown: int, multi: int}
+     */
+    public static function summarizePcPlatformBatchPhp(array $releaseNames): array
+    {
+        $phone = 0;
+        $mac = 0;
+        $game = 0;
+        $iso = 0;
+        $zeroday = 0;
+        $unknown = 0;
+        $multiCount = 0;
+        foreach ($releaseNames as $releaseName) {
+            $name = strtolower(\is_string($releaseName) ? $releaseName : '');
+            foreach (self::W433_MULTI_MARKERS as $needle) {
+                if (str_contains($name, $needle)) {
+                    $multiCount++;
+
+                    break;
+                }
+            }
+            foreach (self::W433_PC_PLATFORM_MARKERS['phone'] as $needle) {
+                if (str_contains($name, $needle)) {
+                    $phone++;
+
+                    continue 2;
+                }
+            }
+            foreach (self::W433_PC_PLATFORM_MARKERS['mac'] as $needle) {
+                if (str_contains($name, $needle)) {
+                    $mac++;
+
+                    continue 2;
+                }
+            }
+            foreach (self::W433_PC_PLATFORM_MARKERS['game'] as $needle) {
+                if (str_contains($name, $needle)) {
+                    $game++;
+
+                    continue 2;
+                }
+            }
+            foreach (self::W433_PC_PLATFORM_MARKERS['iso'] as $needle) {
+                if (str_contains($name, $needle)) {
+                    $iso++;
+
+                    continue 2;
+                }
+            }
+            foreach (self::W433_PC_PLATFORM_MARKERS['zeroday'] as $needle) {
+                if (str_contains($name, $needle)) {
+                    $zeroday++;
+
+                    continue 2;
+                }
+            }
+            $unknown++;
+        }
+
+        return [
+            'total' => \count($releaseNames),
+            'phone' => $phone,
+            'mac' => $mac,
+            'game' => $game,
+            'iso' => $iso,
+            'zeroday' => $zeroday,
+            'unknown' => $unknown,
+            'multi' => $multiCount,
+        ];
+    }
+
+    /**
+     * Declines (null) for non-string items so PHP counts them.
+     *
+     * @param  array<array-key, mixed>  $releaseNames
+     * @return array{total: int, phone: int, mac: int, game: int, iso: int, zeroday: int, unknown: int, multi: int}|null
+     */
+    public static function summarizePcPlatformBatchNative(array $releaseNames): ?array
+    {
+        $lengths = [];
+        foreach ($releaseNames as $item) {
+            if (! \is_string($item)) {
+                return null;
+            }
+            $lengths[] = \strlen($item);
+        }
+        $blob = implode('', $releaseNames);
+        $lens = pack('V*', ...$lengths);
+        $fields = self::callW433Native($blob, $lens);
+        if ($fields === null) {
+            return null;
+        }
+
+        return [
+            'total' => (int) $fields[0],
+            'phone' => (int) $fields[1],
+            'mac' => (int) $fields[2],
+            'game' => (int) $fields[3],
+            'iso' => (int) $fields[4],
+            'zeroday' => (int) $fields[5],
+            'unknown' => (int) $fields[6],
+            'multi' => (int) $fields[7],
+        ];
+    }
+
+    /**
+     * Calls this class's Wave 43.3 export with the shared scratch buffer, retrying once at the size
+     * it asks for. Returns its fields only when they match W433_FIELDS_PATTERN: exactly the expected
+     * count of 1-19 digit decimals.
+     *
+     * @return list<string>|null
+     */
+    private static function callW433Native(string $blob, string $lens): ?array
+    {
+        $ffi = self::w433RustFfi();
+        if ($ffi === null) {
+            return null;
+        }
+
+        try {
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, 128, $capacity);
+            if ($buffer === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w433_pc_platform_batch($blob, \strlen($blob), $lens, \strlen($lens), $buffer, $capacity);
+            if (\is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w433_pc_platform_batch($blob, \strlen($blob), $lens, \strlen($lens), $buffer, $capacity);
+            }
+            if (! \is_int($written) || $written < 0 || $written > $capacity) {
+                return null;
+            }
+            $raw = FFI::string($buffer, $written);
+
+            return preg_match(self::W433_FIELDS_PATTERN, $raw) === 1 ? explode("\x1F", $raw) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private static function w433RustFfi(): ?FFI
+    {
+        if (self::$w433RustFfiHandle === null) {
+            self::$w433RustFfiHandle = RustPipelineLibrary::resolveDomain('categorize_w433', self::W433_FFI_CDEF) ?? false;
+        }
+
+        return self::$w433RustFfiHandle === false ? null : self::$w433RustFfiHandle;
     }
 }
