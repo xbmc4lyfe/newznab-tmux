@@ -24475,3 +24475,635 @@ mod wave35_ingestion_tmux_enums_cleanup_models_tests {
         }
     }
 }
+
+// Wave 36.1: GDPR purge plan, API quota decision, auth event audit payloads and
+// user observer registration plans. Integers are native-endian i64 (PHP pack `q`);
+// a string is an i64 byte length (-1 = PHP null) followed by its raw bytes.
+pub mod wave36_1_user_gdpr_auth_events_provider {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    pub const DECLINE: isize = -1;
+    const MAX_BYTES: usize = 16 * 1024 * 1024;
+    /// PHP's default `trim()` set: " \t\n\r\0\x0B".
+    const TRIM_SET: &[u8] = b" \t\n\r\0\x0B";
+    const MAX_IP_BYTES: usize = 45;
+    const MAX_ENDPOINT_BYTES: usize = 255;
+    const MAX_USER_AGENT_BYTES: usize = 512;
+
+    struct Reader<'a> {
+        bytes: &'a [u8],
+        offset: usize,
+    }
+
+    impl<'a> Reader<'a> {
+        fn take(&mut self, count: usize) -> Option<&'a [u8]> {
+            let end = self.offset.checked_add(count)?;
+            let value = self.bytes.get(self.offset..end)?;
+            self.offset = end;
+            Some(value)
+        }
+
+        fn integer(&mut self) -> Option<i64> {
+            Some(i64::from_ne_bytes(self.take(8)?.try_into().ok()?))
+        }
+
+        fn flag(&mut self) -> Option<bool> {
+            match self.integer()? {
+                0 => Some(false),
+                1 => Some(true),
+                _ => None,
+            }
+        }
+
+        fn string(&mut self) -> Option<Option<&'a [u8]>> {
+            match self.integer()? {
+                -1 => Some(None),
+                len if len < 0 => None,
+                len => Some(Some(self.take(usize::try_from(len).ok()?)?)),
+            }
+        }
+    }
+
+    fn put_int(out: &mut Vec<u8>, value: i64) {
+        out.extend_from_slice(&value.to_ne_bytes());
+    }
+
+    fn trim_with<'a>(mut s: &'a [u8], set: &[u8]) -> &'a [u8] {
+        while let Some((first, rest)) = s.split_first() {
+            if !set.contains(first) {
+                break;
+            }
+            s = rest;
+        }
+        while let Some((last, rest)) = s.split_last() {
+            if !set.contains(last) {
+                break;
+            }
+            s = rest;
+        }
+        s
+    }
+
+    /// `GdprPurgeExpiredExports::summarizePurgePlanPhp()`:
+    /// `[retention, candidates, deleted, failed, skipped, status, has_failures]` where
+    /// status is 0 idle, 1 complete, 2 partial, 3 failed.
+    pub fn purge_plan(retention: i64, candidates: i64, deleted: i64, failed: i64) -> [i64; 7] {
+        let retention = retention.max(0);
+        let candidates = candidates.max(0);
+        let deleted = deleted.max(0).min(candidates);
+        let failed = failed.max(0).min(candidates - deleted);
+        let skipped = candidates - deleted - failed;
+        let status = if candidates == 0 {
+            0
+        } else if deleted == candidates {
+            1
+        } else if deleted > 0 {
+            2
+        } else {
+            3
+        };
+        [
+            retention,
+            candidates,
+            deleted,
+            failed,
+            skipped,
+            status,
+            i64::from(failed > 0),
+        ]
+    }
+
+    /// `User::summarizeApiQuotaDecisionPhp()`:
+    /// `[current, max, allowed, unlimited, remaining (-1 = null), reason]` where reason is
+    /// 0 unverified, 1 admin, 2 within_quota, 3 quota_exhausted.
+    pub fn api_quota(current: i64, max: i64, is_admin: bool, is_verified: bool) -> [i64; 6] {
+        let current = current.max(0);
+        let max = max.max(0);
+        if !is_verified {
+            return [current, max, 0, 0, 0, 0];
+        }
+        if is_admin {
+            return [current, max, 1, 1, -1, 1];
+        }
+        let allowed = current < max;
+        [
+            current,
+            max,
+            i64::from(allowed),
+            0,
+            (max - current).max(0),
+            if allowed { 2 } else { 3 },
+        ]
+    }
+
+    fn is_ipv4(ip: &[u8]) -> bool {
+        let mut parts = 0;
+        for part in ip.split(|b| *b == b'.') {
+            parts += 1;
+            if parts > 4
+                || part.is_empty()
+                || part.len() > 3
+                || !part.iter().all(u8::is_ascii_digit)
+                || (part[0] == b'0' && part.len() > 1)
+            {
+                return false;
+            }
+            let value = part
+                .iter()
+                .fold(0_u32, |acc, b| acc * 10 + u32::from(b - b'0'));
+            if value > 255 {
+                return false;
+            }
+        }
+        parts == 4
+    }
+
+    /// Expects lowercase input, like the PHP reference after `strtolower()`.
+    fn is_ipv6(ip: &[u8]) -> bool {
+        let halves: Vec<&[u8]> = match ip.windows(2).position(|w| w == b"::") {
+            Some(at) => {
+                let rest = &ip[at + 2..];
+                if rest.windows(2).any(|w| w == b"::") {
+                    return false;
+                }
+                vec![&ip[..at], rest]
+            }
+            None => vec![ip],
+        };
+        let last = halves.len() - 1;
+        let mut groups = 0;
+        for (h, half) in halves.iter().enumerate() {
+            if half.is_empty() {
+                continue;
+            }
+            let parts: Vec<&[u8]> = half.split(|b| *b == b':').collect();
+            let final_part = parts.len() - 1;
+            for (i, part) in parts.iter().enumerate() {
+                if h == last && i == final_part && part.contains(&b'.') {
+                    if !is_ipv4(part) {
+                        return false;
+                    }
+                    groups += 2;
+                    continue;
+                }
+                if part.is_empty()
+                    || part.len() > 4
+                    || !part
+                        .iter()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+                {
+                    return false;
+                }
+                groups += 1;
+            }
+        }
+        if halves.len() == 2 {
+            groups <= 7
+        } else {
+            groups == 8
+        }
+    }
+
+    /// `UserAccessedApi::normalizeIpAddressPhp()`: `(ip, version)`; version 0 means null.
+    pub fn ip_address(raw: Option<&[u8]>) -> (Option<Vec<u8>>, i64) {
+        let ip = trim_with(raw.unwrap_or_default(), TRIM_SET);
+        if ip.is_empty() || ip.len() > MAX_IP_BYTES {
+            return (None, 0);
+        }
+        if is_ipv4(ip) {
+            return (Some(ip.to_vec()), 4);
+        }
+        let lower = ip.to_ascii_lowercase();
+        if is_ipv6(&lower) {
+            return (Some(lower), 6);
+        }
+        (None, 0)
+    }
+
+    /// `UserAccessedApi::normalizeAccessAuditPayloadPhp()` endpoint: `(path, has_query)`.
+    pub fn endpoint(raw: Option<&[u8]>) -> (Vec<u8>, bool) {
+        let trimmed = trim_with(raw.unwrap_or_default(), TRIM_SET);
+        let cut = trimmed
+            .iter()
+            .position(|b| *b == b'?' || *b == b'#')
+            .unwrap_or(trimmed.len());
+        let path = trim_with(trim_with(&trimmed[..cut], TRIM_SET), b"/");
+        let mut out = Vec::with_capacity(path.len() + 1);
+        out.push(b'/');
+        out.extend_from_slice(path);
+        out.truncate(MAX_ENDPOINT_BYTES);
+        (out, cut < trimmed.len())
+    }
+
+    /// `UserLoggedIn::normalizeLoginAuditPayloadPhp()` user agent: `(agent, family)` where
+    /// family is 0 unknown, 1 bot, 2 cli, 3 browser, 4 other.
+    pub fn user_agent(raw: Option<&[u8]>) -> (Option<Vec<u8>>, i64) {
+        let mut collapsed = Vec::with_capacity(raw.map_or(0, <[u8]>::len));
+        let mut in_run = false;
+        for &b in raw.unwrap_or_default() {
+            if b <= 0x20 || b == 0x7F {
+                if !in_run {
+                    collapsed.push(b' ');
+                }
+                in_run = true;
+            } else {
+                collapsed.push(b);
+                in_run = false;
+            }
+        }
+        let mut agent = trim_with(&collapsed, b" ").to_vec();
+        if agent.len() > MAX_USER_AGENT_BYTES {
+            agent.truncate(MAX_USER_AGENT_BYTES);
+            let keep = trim_with(&agent, b" ").len();
+            agent.truncate(keep);
+        }
+        if agent.is_empty() {
+            return (None, 0);
+        }
+        let lower = agent.to_ascii_lowercase();
+        let contains = |needle: &[u8]| lower.windows(needle.len()).any(|w| w == needle);
+        let family = if [b"bot".as_slice(), b"crawler", b"spider"]
+            .iter()
+            .any(|n| contains(n))
+        {
+            1
+        } else if [
+            b"curl/".as_slice(),
+            b"wget/",
+            b"python-requests/",
+            b"httpie/",
+            b"go-http-client/",
+        ]
+        .iter()
+        .any(|p| lower.starts_with(p))
+        {
+            2
+        } else if contains(b"mozilla/") {
+            3
+        } else {
+            4
+        };
+        (Some(agent), family)
+    }
+
+    fn is_class_name(name: &[u8]) -> bool {
+        name.split(|b| *b == b'\\').all(|segment| {
+            segment
+                .first()
+                .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_' || *b >= 0x80)
+                && segment
+                    .iter()
+                    .all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b >= 0x80)
+        })
+    }
+
+    /// `UserServiceProvider::normalizeObserverRegistrationPlanPhp()`:
+    /// `(observers, invalid, duplicates)`; `None` entries are PHP non-strings.
+    pub fn observer_plan<'a>(names: &[Option<&'a [u8]>]) -> (Vec<&'a [u8]>, i64, i64) {
+        let mut seen = std::collections::HashSet::new();
+        let mut observers = Vec::new();
+        let (mut invalid, mut duplicates) = (0, 0);
+        for name in names {
+            let Some(name) = name else {
+                invalid += 1;
+                continue;
+            };
+            let mut name = trim_with(name, TRIM_SET);
+            while let Some(rest) = name.strip_prefix(b"\\") {
+                name = rest;
+            }
+            if name.is_empty() || !is_class_name(name) {
+                invalid += 1;
+                continue;
+            }
+            if !seen.insert(name.to_ascii_lowercase()) {
+                duplicates += 1;
+                continue;
+            }
+            observers.push(name);
+        }
+        (observers, invalid, duplicates)
+    }
+
+    fn put_string(out: &mut Vec<u8>, value: Option<&[u8]>) {
+        match value {
+            Some(bytes) => {
+                put_int(out, bytes.len() as i64);
+                out.extend_from_slice(bytes);
+            }
+            None => put_int(out, -1),
+        }
+    }
+
+    pub fn compute(operation: u8, bytes: &[u8]) -> Option<Vec<u8>> {
+        let mut reader = Reader { bytes, offset: 0 };
+        let mut out = Vec::new();
+        match operation {
+            1 => {
+                let values = [
+                    reader.integer()?,
+                    reader.integer()?,
+                    reader.integer()?,
+                    reader.integer()?,
+                ];
+                for value in purge_plan(values[0], values[1], values[2], values[3]) {
+                    put_int(&mut out, value);
+                }
+            }
+            2 => {
+                let (current, max) = (reader.integer()?, reader.integer()?);
+                let (is_admin, is_verified) = (reader.flag()?, reader.flag()?);
+                for value in api_quota(current, max, is_admin, is_verified) {
+                    put_int(&mut out, value);
+                }
+            }
+            3 => {
+                let user_id = reader.integer()?.max(0);
+                let (ip, version) = ip_address(reader.string()?);
+                let (path, has_query) = endpoint(reader.string()?);
+                put_int(&mut out, user_id);
+                put_int(&mut out, version);
+                put_int(&mut out, i64::from(has_query));
+                put_string(&mut out, ip.as_deref());
+                put_string(&mut out, Some(&path));
+            }
+            4 => {
+                let user_id = reader.integer()?.max(0);
+                let via_remember = reader.flag()?;
+                let (ip, version) = ip_address(reader.string()?);
+                let (agent, family) = user_agent(reader.string()?);
+                put_int(&mut out, user_id);
+                put_int(&mut out, version);
+                put_int(&mut out, i64::from(via_remember));
+                put_int(&mut out, family);
+                put_string(&mut out, ip.as_deref());
+                put_string(&mut out, agent.as_deref());
+            }
+            5 => {
+                let enabled = reader.flag()?;
+                let count = usize::try_from(reader.integer()?).ok()?;
+                // Every entry needs at least its 8-byte length prefix.
+                if count > (bytes.len() - reader.offset) / 8 {
+                    return None;
+                }
+                let mut names = Vec::with_capacity(count);
+                for _ in 0..count {
+                    names.push(reader.string()?);
+                }
+                let (observers, invalid, duplicates) = observer_plan(&names);
+                let observers = if enabled { observers } else { Vec::new() };
+                put_int(&mut out, i64::from(enabled));
+                put_int(&mut out, invalid);
+                put_int(&mut out, duplicates);
+                put_int(&mut out, observers.len() as i64);
+                for observer in observers {
+                    put_string(&mut out, Some(observer));
+                }
+            }
+            _ => return None,
+        }
+        if reader.offset != bytes.len() || out.len() > MAX_BYTES {
+            return None;
+        }
+        Some(out)
+    }
+
+    /// Returns bytes written, `-required` when `out_cap` is too small, or -1 for an unknown
+    /// operation, malformed frame, invalid/overlapping pointer ranges or a caught panic.
+    /// Negative returns never modify `out_buf`; the caller owns both buffers.
+    ///
+    /// # Safety
+    /// `input` must be readable for `input_len` bytes and `out_buf` writable for `out_cap`
+    /// bytes. Both pointers must be nonnull and the ranges must not overlap.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w361_user_gdpr_auth(
+        operation: u8,
+        input: *const u8,
+        input_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !(1..=5).contains(&operation)
+                || input.is_null()
+                || out_buf.is_null()
+                || input_len > MAX_BYTES
+                || out_cap > MAX_BYTES
+            {
+                return DECLINE;
+            }
+            let Some(input_end) = (input as usize).checked_add(input_len) else {
+                return DECLINE;
+            };
+            let Some(out_end) = (out_buf as usize).checked_add(out_cap) else {
+                return DECLINE;
+            };
+            if input_len != 0
+                && out_cap != 0
+                && (input as usize) < out_end
+                && (out_buf as usize) < input_end
+            {
+                return DECLINE;
+            }
+            let bytes = if input_len == 0 {
+                &[][..]
+            } else {
+                unsafe { slice::from_raw_parts(input, input_len) }
+            };
+            let Some(result) = compute(operation, bytes) else {
+                return DECLINE;
+            };
+            if result.len() > out_cap {
+                return -(result.len() as isize);
+            }
+            unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), out_buf, result.len()) };
+            result.len() as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+}
+
+#[cfg(test)]
+mod wave36_1_user_gdpr_auth_events_provider_tests {
+    use super::wave36_1_user_gdpr_auth_events_provider::*;
+
+    fn frame(ints: &[i64], strings: &[Option<&[u8]>]) -> Vec<u8> {
+        let mut out: Vec<u8> = ints.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        for value in strings {
+            match value {
+                Some(bytes) => {
+                    out.extend_from_slice(&(bytes.len() as i64).to_ne_bytes());
+                    out.extend_from_slice(bytes);
+                }
+                None => out.extend_from_slice(&(-1_i64).to_ne_bytes()),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn purge_plan_and_quota_match_php() {
+        assert_eq!(purge_plan(-5, 0, 3, 3), [0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(purge_plan(30, 10, 10, 0), [30, 10, 10, 0, 0, 1, 0]);
+        assert_eq!(purge_plan(30, 10, 4, 9), [30, 10, 4, 6, 0, 2, 1]);
+        assert_eq!(purge_plan(30, 10, 0, 2), [30, 10, 0, 2, 8, 3, 1]);
+        assert_eq!(
+            purge_plan(i64::MAX, i64::MAX, i64::MIN, i64::MAX),
+            [i64::MAX, i64::MAX, 0, i64::MAX, 0, 3, 1]
+        );
+
+        assert_eq!(api_quota(5, 10, true, false), [5, 10, 0, 0, 0, 0]);
+        assert_eq!(api_quota(50, 10, true, true), [50, 10, 1, 1, -1, 1]);
+        assert_eq!(api_quota(3, 10, false, true), [3, 10, 1, 0, 7, 2]);
+        assert_eq!(api_quota(10, 10, false, true), [10, 10, 0, 0, 0, 3]);
+        assert_eq!(
+            api_quota(i64::MIN, i64::MAX, false, true),
+            [0, i64::MAX, 1, 0, i64::MAX, 2]
+        );
+    }
+
+    #[test]
+    fn ip_endpoint_and_agent_match_php() {
+        assert_eq!(
+            ip_address(Some(b" 10.0.0.1\n")),
+            (Some(b"10.0.0.1".to_vec()), 4)
+        );
+        assert_eq!(ip_address(Some(b"010.0.0.1")), (None, 0));
+        assert_eq!(ip_address(Some(b"256.0.0.1")), (None, 0));
+        assert_eq!(ip_address(Some(b"1.2.3")), (None, 0));
+        assert_eq!(ip_address(Some(b"::")), (Some(b"::".to_vec()), 6));
+        assert_eq!(
+            ip_address(Some(b"::FFFF:1.2.3.4")),
+            (Some(b"::ffff:1.2.3.4".to_vec()), 6)
+        );
+        assert_eq!(ip_address(Some(b"1:2:3:4:5:6:7:8")).1, 6);
+        assert_eq!(ip_address(Some(b"1:2:3:4:5:6:7:8:9")), (None, 0));
+        assert_eq!(ip_address(Some(b"1::2::3")), (None, 0));
+        assert_eq!(ip_address(Some(b":::")), (None, 0));
+        assert_eq!(ip_address(Some(b"1.2.3.4::")), (None, 0));
+        assert_eq!(ip_address(None), (None, 0));
+
+        assert_eq!(endpoint(None), (b"/".to_vec(), false));
+        assert_eq!(
+            endpoint(Some(b" //api/v2/search/ ?t=1")),
+            (b"/api/v2/search".to_vec(), true)
+        );
+        assert_eq!(endpoint(Some(b"#frag")), (b"/".to_vec(), true));
+        assert_eq!(endpoint(Some(&[b'a'; 400])).0.len(), 255);
+
+        assert_eq!(user_agent(None), (None, 0));
+        assert_eq!(user_agent(Some(b"\t\x7f ")), (None, 0));
+        assert_eq!(
+            user_agent(Some(b" Mozilla/5.0\t\t(X11)\x00 ")),
+            (Some(b"Mozilla/5.0 (X11)".to_vec()), 3)
+        );
+        assert_eq!(user_agent(Some(b"curl/8.1")).1, 2);
+        assert_eq!(user_agent(Some(b"x curl/8.1")).1, 4);
+        assert_eq!(user_agent(Some(b"Googlebot/2.1 Mozilla/5.0")).1, 1);
+        let mut long = vec![b'a'; 511];
+        long.extend_from_slice(b"  b");
+        assert_eq!(user_agent(Some(&long)).0.unwrap().len(), 511);
+    }
+
+    #[test]
+    fn observer_plan_matches_php() {
+        let names: [Option<&[u8]>; 7] = [
+            Some(b" \\App\\Observers\\UserObserver "),
+            Some(b"app\\observers\\userobserver"),
+            None,
+            Some(b"1Bad"),
+            Some(b"App\\"),
+            Some(b"_Ok\xc3\xa9"),
+            Some(b""),
+        ];
+        let (observers, invalid, duplicates) = observer_plan(&names);
+        assert_eq!(
+            observers,
+            vec![b"App\\Observers\\UserObserver".as_slice(), b"_Ok\xc3\xa9"]
+        );
+        assert_eq!((invalid, duplicates), (4, 1));
+
+        let disabled = frame(&[0, 1], &[Some(b"A")]);
+        assert_eq!(compute(5, &disabled), Some(frame(&[0, 0, 0, 0], &[])));
+    }
+
+    #[test]
+    fn malformed_frames_decline() {
+        for operation in 0..=6 {
+            assert!(compute(operation, &[]).is_none());
+        }
+        assert!(compute(1, &frame(&[1, 2, 3], &[])).is_none());
+        assert!(compute(1, &frame(&[1, 2, 3, 4, 5], &[])).is_none());
+        assert!(compute(2, &frame(&[1, 2, 2, 1], &[])).is_none());
+        assert!(compute(3, &frame(&[1, -2], &[])).is_none());
+        assert!(compute(3, &frame(&[1, i64::MAX], &[])).is_none());
+        assert!(compute(4, &frame(&[1, 0], &[None])).is_none());
+        assert!(compute(5, &frame(&[1, i64::MAX], &[])).is_none());
+        assert!(compute(5, &frame(&[1, -1], &[])).is_none());
+        assert!(compute(5, &frame(&[1, 2], &[None])).is_none());
+        assert!(compute(5, &frame(&[1, 0], &[None])).is_none());
+    }
+
+    #[test]
+    fn export_validates_pointers_and_capacity_without_partial_writes() {
+        let input = frame(&[30, 10, 4, 9], &[]);
+        let call =
+            |op, ptr, len, out, cap| unsafe { nntmux_w361_user_gdpr_auth(op, ptr, len, out, cap) };
+        let mut out = [0x5a_u8; 64];
+        assert_eq!(
+            call(1, input.as_ptr(), input.len(), out.as_mut_ptr(), 55),
+            -56
+        );
+        assert_eq!(
+            call(0, input.as_ptr(), input.len(), out.as_mut_ptr(), 64),
+            DECLINE
+        );
+        assert_eq!(
+            call(6, input.as_ptr(), input.len(), out.as_mut_ptr(), 64),
+            DECLINE
+        );
+        assert_eq!(
+            call(1, std::ptr::null(), input.len(), out.as_mut_ptr(), 64),
+            DECLINE
+        );
+        assert_eq!(
+            call(1, input.as_ptr(), input.len(), std::ptr::null_mut(), 64),
+            DECLINE
+        );
+        assert_eq!(
+            call(1, input.as_ptr(), usize::MAX, out.as_mut_ptr(), 64),
+            DECLINE
+        );
+        assert_eq!(
+            call(1, input.as_ptr(), input.len(), out.as_mut_ptr(), usize::MAX),
+            DECLINE
+        );
+        assert_eq!(
+            call(1, usize::MAX as *const u8, 32, out.as_mut_ptr(), 64),
+            DECLINE
+        );
+        assert_eq!(
+            call(1, input.as_ptr(), input.len(), usize::MAX as *mut u8, 64),
+            DECLINE
+        );
+        assert_eq!(
+            call(1, input.as_ptr(), input.len() - 1, out.as_mut_ptr(), 64),
+            DECLINE
+        );
+        assert_eq!(out, [0x5a; 64]);
+        let mut overlapping = input.clone();
+        assert_eq!(
+            call(1, overlapping.as_ptr(), 32, overlapping.as_mut_ptr(), 32),
+            DECLINE
+        );
+        assert_eq!(overlapping, input);
+
+        assert_eq!(
+            call(1, input.as_ptr(), input.len(), out.as_mut_ptr(), 64),
+            56
+        );
+        assert_eq!(&out[..56], compute(1, &input).unwrap().as_slice());
+        assert_eq!(&out[56..], &[0x5a; 8]);
+    }
+}
