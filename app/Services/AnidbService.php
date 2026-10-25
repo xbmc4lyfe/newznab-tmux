@@ -8,6 +8,7 @@ use App\Models\AnidbTitle;
 use App\Models\Category;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Contracts\Pagination\LengthAwarePaginator;
 use Illuminate\Support\Facades\DB;
 use Throwable;
@@ -710,5 +711,178 @@ class AnidbService
         } catch (Throwable) {
             return null;
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 53.4 batch helper
+    // ---------------------------------------------------------------------
+
+    /** Enabled: minimum of three paired runs cleared every 1.5x gate (common mean 2.83x, p99 2.17x; uncommon mean 2.45x, p99 2.00x); see RustAnidbArchiveMovieBrowseMovieServiceIgdbExW53ParityTest. */
+    private const bool W53_RUST_FFI_DEFAULT = true;
+
+    public const string W53_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w534_anidb_episode_marker_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * Episode markers for many release names at once, checked in extractBaseTitlePhp() priority
+     * order after strtr($name, '_.', '  '). Each name yields four words: the marker kind (0 none,
+     * 1 " SxxEyy", 2 " NxM", 3 " - NN", 4 " E/Ep/Episode NN", 5 a Movie/OVA/Complete keyword,
+     * 6 a quality [tag]), the marker's byte offset (the name length when none), the episode
+     * number (-1 for kinds 0, 5 and 6) and the number of leading [group] tags.
+     *
+     * @param  list<string>  $names
+     * @return list<int>
+     */
+    public static function anidbEpisodeMarkerBatch(array $names): array
+    {
+        return self::usesW53RustFfi()
+            ? self::anidbEpisodeMarkerBatchNative($names)
+            : self::anidbEpisodeMarkerBatchPhp($names);
+    }
+
+    /**
+     * @param  list<string>  $names
+     * @return list<int>
+     */
+    public static function anidbEpisodeMarkerBatchNative(array $names): array
+    {
+        self::w53AssertList($names);
+        if ($names === []) {
+            return [];
+        }
+
+        return self::w53Call(implode("\0", $names), '', \count($names), 4)
+            ?? self::anidbEpisodeMarkerBatchPhp($names);
+    }
+
+    /**
+     * @param  list<string>  $names
+     * @return list<int>
+     */
+    public static function anidbEpisodeMarkerBatchPhp(array $names): array
+    {
+        self::w53AssertList($names);
+        $out = [];
+        foreach ($names as $name) {
+            $s = strtr($name, '_.', '  ');
+            if (preg_match('/\sS\d+E(\d+)/i', $s, $m, PREG_OFFSET_CAPTURE) === 1) {
+                array_push($out, 1, $m[0][1], (int) $m[1][0]);
+            } elseif (preg_match('/\s\d+x(\d+)/i', $s, $m, PREG_OFFSET_CAPTURE) === 1) {
+                array_push($out, 2, $m[0][1], (int) $m[1][0]);
+            } elseif (preg_match('/\s-\s*(\d{1,3})\b/', $s, $m, PREG_OFFSET_CAPTURE) === 1) {
+                array_push($out, 3, $m[0][1], (int) $m[1][0]);
+            } elseif (preg_match('/\sE(?:p(?:isode)?)?\s*0*(\d{1,3})\b/i', $s, $m, PREG_OFFSET_CAPTURE) === 1) {
+                array_push($out, 4, $m[0][1], (int) $m[1][0]);
+            } elseif (preg_match('/\b(?:Movie|OVA|Complete Series|Complete|Full Series)\b/i', $s, $m, PREG_OFFSET_CAPTURE) === 1) {
+                array_push($out, 5, $m[0][1], -1);
+            } elseif (preg_match('/\[(?:BD|BDRip|BluRay|Blu-Ray|\d{3,4}[ipx]|HEVC|x264|x265|H264|H265)\]/i', $s, $m, PREG_OFFSET_CAPTURE) === 1) {
+                array_push($out, 6, $m[0][1], -1);
+            } else {
+                array_push($out, 0, \strlen($s), -1);
+            }
+            $out[] = (int) preg_match_all('/\G\[[^\]]+\]\s*/', $s);
+        }
+
+        return $out;
+    }
+
+    public static function usesW53RustFfi(): bool
+    {
+        $enabled = self::w53RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W53_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W53 batch dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW53RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w53RustFfiState('enabled');
+        self::w53RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w53RustFfiState('enabled', $previous);
+        }
+    }
+
+    /** @param array<array-key, mixed> $values */
+    private static function w53AssertList(array $values): void
+    {
+        if (! array_is_list($values)) {
+            throw new \InvalidArgumentException('W53 batch input must be a list.');
+        }
+    }
+
+    /**
+     * One FFI crossing for the batch: NUL-joined text fields and packed int64 columns in,
+     * `$words` int64 words back per record. Null when the library is missing or declines
+     * (a value holding a NUL byte adds a field, which the export rejects).
+     *
+     * @return list<int>|null
+     */
+    private static function w53Call(string $text, string $ints, int $count, int $words): ?array
+    {
+        try {
+            $state = self::w53RustFfiState();
+            $ffi = $state['ffi'] ?? null;
+            if ($ffi === null) {
+                $ffi = RustPipelineLibrary::resolveDomain('metadata_w53', self::W53_FFI_CDEF) ?? false;
+                self::w53RustFfiState('ffi', $ffi);
+            }
+            if (! $ffi instanceof FFI) {
+                return null;
+            }
+            $need = $count * $words;
+            $out = $state['out'] ?? null;
+            $cap = $state['cap'] ?? 0;
+            if (! $out instanceof CData || ! \is_int($cap) || $cap < $need) {
+                $cap = max(1024, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w53RustFfiState('out', $out);
+                self::w53RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W53_FFI_CDEF.)
+            $written = $ffi->nntmux_w534_anidb_episode_marker_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, $cap);
+            if ($written !== $need) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $need * 8));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * W53 routing override and cached binding plus reusable output buffer, kept in a function
+     * static: no arguments returns the state, one argument reads a key ('reset' clears
+     * everything) and two arguments write a key.
+     */
+    private static function w53RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+        }
+
+        return $state[$op] ?? null;
     }
 }
