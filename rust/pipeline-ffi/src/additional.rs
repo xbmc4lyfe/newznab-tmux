@@ -37909,3 +37909,1105 @@ mod w526_additional_batch_tests {
         assert_eq!((status, out[0]), (1, 0));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 53.6: AdditionalProcessing batch helpers (`nntmux_w536_*`) for
+// DownloadMetrics, ImageCandidate, MappedNzbFile, PersistenceMetrics and
+// MediaByteBudget. Same conventions as Wave 52.6: one crossing per batch,
+// NUL-joined strings (plus, when a value holds a NUL, the same list joined with
+// 0x01), machine-order `int64_t` / `double` columns in, fixed-width `int64_t`
+// rows out (read with `unpack('P*')`). Every export returns 1, -1 for invalid
+// input (PHP then computes the batch) or -2 when `out` is null, misaligned or
+// too small, and leaves `out` untouched unless it returns 1.
+// ---------------------------------------------------------------------------
+
+/// Parts-per-million scale of the Wave 53.6 ratios.
+const W536_PPM: i64 = 1_000_000;
+
+/// Saturation of a 14-bit row field.
+const W536_FIELD_CAP: i64 = (1 << 14) - 1;
+
+/// Saturation of a 20-bit row field.
+const W536_LENGTH_CAP: usize = (1 << 20) - 1;
+
+/// Longest database time, in milliseconds, a load row keeps (its microseconds fit 2^50).
+const W536_MS_CAP: f64 = 1e12;
+
+const W536_P0: u64 = 0xa076_1d64_78bd_642f;
+const W536_P1: u64 = 0xe703_7ed1_a0b4_28db;
+const W536_P2: u64 = 0x8ebc_6af0_9c88_c6e3;
+const W536_P3: u64 = 0x5899_65cc_7537_4cc3;
+
+/// Folded 64x64->128-bit multiply.
+#[inline]
+fn w536_mum(a: u64, b: u64) -> u64 {
+    let product = u128::from(a) * u128::from(b);
+    (product as u64) ^ ((product >> 64) as u64)
+}
+
+#[inline]
+fn w536_word(bytes: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
+}
+
+/// Seeded byte-string hash for the Wave 53.6 dedupe tables: one folded multiply
+/// per 16 bytes, over four independent lanes for keys longer than 64 bytes, so
+/// long message IDs and names hash several times faster than word-at-a-time.
+/// Keys are caller data, but a batch is bounded and collisions only cost time.
+fn w536_hash(bytes: &[u8], seed: u64) -> u64 {
+    let mut hash = seed ^ W536_P0 ^ (bytes.len() as u64).wrapping_mul(W536_P1);
+    let mut rest = bytes;
+    if bytes.len() > 64 {
+        let (blocks, tail) = bytes.as_chunks::<64>();
+        let mut lanes = [hash, hash ^ W536_P1, hash ^ W536_P2, hash ^ W536_P3];
+        for block in blocks {
+            for (lane, value) in lanes.iter_mut().enumerate() {
+                *value = w536_mum(
+                    w536_word(block, 16 * lane) ^ W536_P1,
+                    w536_word(block, 16 * lane + 8) ^ *value,
+                );
+            }
+        }
+        hash = w536_mum(lanes[0] ^ lanes[1], lanes[2] ^ lanes[3] ^ W536_P2);
+        rest = tail;
+    }
+    while rest.len() > 16 {
+        hash = w536_mum(w536_word(rest, 0) ^ W536_P1, w536_word(rest, 8) ^ hash);
+        rest = &rest[16..];
+    }
+    // The last 1..=16 bytes as two (possibly overlapping) loads; the length is
+    // already in the seed.
+    let size = rest.len();
+    let (low, high) = if size >= 8 {
+        (w536_word(rest, 0), w536_word(rest, size - 8))
+    } else if size >= 4 {
+        let half = |at: usize| u64::from(u32::from_le_bytes(rest[at..at + 4].try_into().unwrap()));
+        (half(0) << 32 | half(size - 4), 0)
+    } else if size > 0 {
+        (
+            u64::from(rest[0]) << 16 | u64::from(rest[size / 2]) << 8 | u64::from(rest[size - 1]),
+            0,
+        )
+    } else {
+        (0, 0)
+    };
+    w536_mum(low ^ W536_P2, high ^ hash)
+}
+
+/// `std::hash::Hasher` over `w536_hash()` for the Wave 53.6 hash maps.
+#[derive(Default)]
+struct W536Hasher(u64);
+
+impl std::hash::Hasher for W536Hasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        self.0 = w536_hash(bytes, self.0);
+    }
+
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.0 = w536_mum(self.0 ^ value ^ W536_P1, W536_P0);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, value: usize) {
+        self.write_u64(value as u64);
+    }
+
+    #[inline]
+    fn write_i64(&mut self, value: i64) {
+        self.write_u64(value as u64);
+    }
+
+    #[inline]
+    fn write_u8(&mut self, value: u8) {
+        self.write_u64(u64::from(value));
+    }
+}
+
+type W536Map<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<W536Hasher>>;
+
+/// PHP `trim()` with its default character list.
+#[inline]
+fn w536_trim(bytes: &[u8]) -> &[u8] {
+    let space = |byte: &u8| matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0B);
+    match (bytes.first(), bytes.last()) {
+        (Some(first), Some(last)) if !space(first) && !space(last) => return bytes,
+        _ => {}
+    }
+    let start = bytes
+        .iter()
+        .position(|byte| !space(byte))
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|byte| !space(byte))
+        .map_or(start, |at| at + 1);
+    &bytes[start..end]
+}
+
+// --- DownloadMetrics::transferEfficiencyBatch -------------------------------
+
+pub(crate) const W536_TRANSFER_HEADER: usize = 12;
+
+/// `summarizeTransferEfficiencyPhp()` over counter rows as integer ppm ratios.
+/// `ints` holds six columns (logical requests, network requests, cache hits,
+/// bytes downloaded, bytes reused, media bytes), each clamped to 0..2^40-1.
+/// `[0]` count, `[1..=6]` column totals (capped at 2^62), `[7]` requests saved
+/// (logical minus network, never negative), `[8]` mean cache-hit ppm, `[9]`
+/// mean byte-reuse ppm, `[10]` flagged rows, `[11]` FNV-1a digest; then per row
+/// `cache | reuse << 20 | media << 40 | flags << 60` (flag bit 0 logical
+/// requests without network ones, bit 1 more hits than logical requests, bit 2
+/// more media bytes than downloaded bytes).
+pub(crate) fn w536_transfer_batch(ints: &[i64], count: usize) -> Vec<i64> {
+    let mut out = vec![0i64; W536_TRANSFER_HEADER + count];
+    out[0] = count as i64;
+    let (mut cache_sum, mut reuse_sum) = (0i64, 0i64);
+    for at in 0..count {
+        let logical = w47_clamp(ints[at]);
+        let network = w47_clamp(ints[count + at]);
+        let hits = w47_clamp(ints[2 * count + at]);
+        let downloaded = w47_clamp(ints[3 * count + at]);
+        let reused = w47_clamp(ints[4 * count + at]);
+        let media = w47_clamp(ints[5 * count + at]);
+        for (slot, value) in [logical, network, hits, downloaded, reused, media]
+            .into_iter()
+            .enumerate()
+        {
+            out[1 + slot] = w47_add(out[1 + slot], value);
+        }
+        out[7] = w47_add(out[7], (logical - network).max(0));
+        let cache = if logical > 0 {
+            (hits * W536_PPM / logical).min(W536_PPM)
+        } else {
+            0
+        };
+        let total = downloaded + reused;
+        let reuse = if total > 0 {
+            reused * W536_PPM / total
+        } else {
+            0
+        };
+        let share = if downloaded > 0 {
+            (media * W536_PPM / downloaded).min(W536_PPM)
+        } else {
+            0
+        };
+        let flags = i64::from(logical > 0 && network == 0)
+            | i64::from(hits > logical) << 1
+            | i64::from(media > downloaded) << 2;
+        cache_sum += cache;
+        reuse_sum += reuse;
+        out[10] += i64::from(flags != 0);
+        out[W536_TRANSFER_HEADER + at] = cache | reuse << 20 | share << 40 | flags << 60;
+    }
+    if count > 0 {
+        out[8] = cache_sum / count as i64;
+        out[9] = reuse_sum / count as i64;
+    }
+    out[11] = w526_digest(&out[W536_TRANSFER_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_count` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w536_transfer_efficiency_batch(
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w49_run(out, out_count, || {
+            let ints = w47_ints(w15_input(ints, ints_len)?, 6, count)?;
+            Some(w536_transfer_batch(&ints, count))
+        })
+    }
+}
+
+// --- ImageCandidate::messageIdPlanBatch --------------------------------------
+
+pub(crate) const W536_MESSAGE_HEADER: usize = 8;
+
+/// A `W536Table` slot, live only while `generation` matches the table's. The
+/// key is `joined[start..start + len]` of the batch that stored it.
+#[derive(Clone, Copy, Default)]
+struct W536Slot {
+    generation: u32,
+    tag: u32,
+    start: u32,
+    len: u32,
+    first: u32,
+    last: u32,
+}
+
+/// Open-addressing (linear probing, load at most 2/3) message-ID table reused
+/// across batches: a new generation empties it without clearing, so a warm
+/// batch allocates nothing for deduplication.
+#[derive(Default)]
+pub(crate) struct W536Table {
+    slots: Vec<W536Slot>,
+    generation: u32,
+}
+
+/// Slots a thread keeps between batches; a larger table is released after use.
+const W536_RETAINED_SLOTS: usize = 1 << 16;
+
+impl W536Table {
+    /// Starts a generation for `items` keys and returns the probe mask.
+    fn begin(&mut self, items: usize) -> usize {
+        let want = (items.max(8) * 3 / 2).next_power_of_two();
+        if self.slots.len() < want {
+            self.slots = vec![W536Slot::default(); want];
+            self.generation = 0;
+        }
+        if self.generation == u32::MAX {
+            self.slots.fill(W536Slot::default());
+            self.generation = 0;
+        }
+        self.generation += 1;
+        want - 1
+    }
+
+    fn end(&mut self) {
+        if self.slots.len() > W536_RETAINED_SLOTS {
+            *self = Self::default();
+        }
+    }
+}
+
+thread_local! {
+    static W536_TABLE: std::cell::RefCell<W536Table> = std::cell::RefCell::new(W536Table::default());
+}
+
+/// Items joined with the two-byte separator `\0\x01`, each a subslice of
+/// `joined`. PHP sends this form unless an item holds the pair (it cannot
+/// overlap itself, so every occurrence is then a separator); an item holding it
+/// splits into extra items, which `w536_message_batch()` rejects by count.
+struct W536PairItems<'a> {
+    joined: &'a [u8],
+    start: usize,
+    scan: usize,
+    done: bool,
+}
+
+fn w536_pair_items(joined: &[u8]) -> W536PairItems<'_> {
+    W536PairItems {
+        joined,
+        start: 0,
+        scan: 0,
+        done: false,
+    }
+}
+
+impl<'a> Iterator for W536PairItems<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        const LOW7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+        const HIGH: u64 = 0x8080_8080_8080_8080;
+        if self.done {
+            return None;
+        }
+        let joined = self.joined;
+        let mut at = self.scan;
+        loop {
+            // The next NUL at or after `at`, a word at a time.
+            let zero = loop {
+                if at + 8 <= joined.len() {
+                    let word = w536_word(joined, at);
+                    let zeros = !(((word & LOW7).wrapping_add(LOW7)) | word) & HIGH;
+                    if zeros != 0 {
+                        break Some(at + (zeros.trailing_zeros() / 8) as usize);
+                    }
+                    at += 8;
+                } else {
+                    break joined[at..]
+                        .iter()
+                        .position(|&byte| byte == 0)
+                        .map(|offset| at + offset);
+                }
+            };
+            match zero {
+                Some(zero) if joined.get(zero + 1) == Some(&1) => {
+                    let item = &joined[self.start..zero];
+                    self.start = zero + 2;
+                    self.scan = zero + 2;
+                    return Some(item);
+                }
+                Some(zero) => at = zero + 1,
+                None => {
+                    self.done = true;
+                    return Some(&joined[self.start..]);
+                }
+            }
+        }
+    }
+}
+
+/// `normalizeCandidateDescriptorPhp()`'s message-ID cleanup over candidates,
+/// plus cross-candidate sharing. `ids` yields every candidate's IDs in order,
+/// each a subslice of `joined` (`counts[c]` of them). `[0]` candidates, `[1]`
+/// IDs, `[2]` kept IDs, `[3]` distinct IDs, `[4]` candidates without a kept
+/// ID, `[5]` candidates sharing an ID with an earlier one, `[6]` most IDs kept
+/// by a candidate, `[7]` FNV-1a digest; then per candidate `kept | dropped <<
+/// 14 | shared << 28 | leader << 42`, the counts saturating at 2^14-1 (dropped
+/// IDs are empty or repeated within the candidate) and `leader` the earliest
+/// candidate it shares an ID with (itself when none). None when a count is
+/// negative, the items do not match the counts, there are over 2^20
+/// candidates or IDs, or `joined` reaches 4 GiB.
+pub(crate) fn w536_message_batch<'a>(
+    joined: &'a [u8],
+    ids: impl IntoIterator<Item = &'a [u8]>,
+    counts: &[i64],
+    table: &mut W536Table,
+) -> Option<Vec<i64>> {
+    if u32::try_from(joined.len()).is_err() || counts.len() > W47_MAX_ITEMS {
+        return None;
+    }
+    let mut items = 0usize;
+    for &listed in counts {
+        items = items.checked_add(usize::try_from(listed).ok()?)?;
+    }
+    if items > W47_MAX_ITEMS {
+        return None;
+    }
+    let count = counts.len();
+    let mut out = vec![0i64; W536_MESSAGE_HEADER + count];
+    out[0] = count as i64;
+    let mask = table.begin(items);
+    let generation = table.generation;
+    let slots = &mut table.slots[..=mask];
+    let base = joined.as_ptr() as usize;
+    let mut ids = ids.into_iter();
+    for (candidate, &listed) in counts.iter().enumerate() {
+        let (listed, at) = (listed as usize, candidate as u32);
+        let (mut kept, mut dropped, mut shared, mut leader) = (0i64, 0i64, 0i64, at);
+        for _ in 0..listed {
+            let id = w536_trim(ids.next()?);
+            if id.is_empty() {
+                dropped += 1;
+                continue;
+            }
+            let start = (id.as_ptr() as usize).checked_sub(base)?;
+            if start + id.len() > joined.len() {
+                return None;
+            }
+            let hash = w536_hash(id, 0);
+            let (tag, len) = ((hash >> 32) as u32, id.len() as u32);
+            let mut index = hash as usize & mask;
+            loop {
+                let slot = &mut slots[index];
+                if slot.generation != generation {
+                    *slot = W536Slot {
+                        generation,
+                        tag,
+                        start: start as u32,
+                        len,
+                        first: at,
+                        last: at,
+                    };
+                    kept += 1;
+                    out[3] += 1;
+                    break;
+                }
+                if slot.tag == tag
+                    && slot.len == len
+                    && joined[slot.start as usize..(slot.start + len) as usize] == *id
+                {
+                    if slot.last == at {
+                        dropped += 1;
+                    } else {
+                        slot.last = at;
+                        kept += 1;
+                        shared += 1;
+                        leader = leader.min(slot.first);
+                    }
+                    break;
+                }
+                index = (index + 1) & mask;
+            }
+        }
+        out[1] += listed as i64;
+        out[2] += kept;
+        out[4] += i64::from(kept == 0);
+        out[5] += i64::from(shared > 0);
+        out[6] = out[6].max(kept);
+        out[W536_MESSAGE_HEADER + candidate] = kept.min(W536_FIELD_CAP)
+            | dropped.min(W536_FIELD_CAP) << 14
+            | shared.min(W536_FIELD_CAP) << 28
+            | i64::from(leader) << 42;
+    }
+    if ids.next().is_some() {
+        return None;
+    }
+    out[7] = w526_digest(&out[W536_MESSAGE_HEADER..]);
+    Some(out)
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_count` values.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_w536_message_id_plan_batch(
+    ids: *const u8,
+    ids_len: usize,
+    id_twin: *const u8,
+    id_twin_len: usize,
+    counts: *const u8,
+    counts_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w49_run(out, out_count, || {
+            let counts = w47_ints(w15_input(counts, counts_len)?, 1, count)?;
+            let (joined, twin) = (w15_input(ids, ids_len)?, w15_input(id_twin, id_twin_len)?);
+            let mut items = 0usize;
+            for &listed in &counts {
+                items = items.checked_add(usize::try_from(listed).ok()?)?;
+            }
+            W536_TABLE.with(|table| {
+                let mut table = table.try_borrow_mut().ok()?;
+                let out = (|| {
+                    if items == 0 {
+                        // No IDs, so nothing may be joined.
+                        return if joined.is_empty() && twin.is_empty() {
+                            w536_message_batch(joined, [], &counts, &mut table)
+                        } else {
+                            None
+                        };
+                    }
+                    if twin.is_empty() {
+                        return w536_message_batch(
+                            joined,
+                            w536_pair_items(joined),
+                            &counts,
+                            &mut table,
+                        );
+                    }
+                    let ids = w49_items(joined, twin, items)?;
+                    w536_message_batch(joined, ids, &counts, &mut table)
+                })();
+                table.end();
+                out
+            })
+        })
+    }
+}
+
+// --- MappedNzbFile::summarizeMappingBatch ------------------------------------
+
+pub(crate) const W536_MAPPING_HEADER: usize = 9;
+
+/// `summarizeMappingPhp()`'s confidence rank: 2 verified, 1 unique-size, else 0.
+fn w536_confidence_rank(value: &[u8]) -> i64 {
+    let value = w536_trim(value);
+    let matches = |target: &[u8]| {
+        value.len() == target.len()
+            && value.iter().zip(target).all(|(&byte, &want)| {
+                let byte = byte.to_ascii_lowercase();
+                (if byte == b'_' { b'-' } else { byte }) == want
+            })
+    };
+    if matches(b"verified") {
+        2
+    } else if matches(b"unique-size") {
+        1
+    } else {
+        0
+    }
+}
+
+/// `summarizeMappingPhp()` over mapped files, grouped by trimmed name. `ints`
+/// holds the source indexes, then the file sizes, both clamped to 0..2^40-1.
+/// `[0]` count, `[1]` verified, `[2]` unique-size, `[3]` unknown, `[4]` total
+/// size of ranked files (capped at 2^62), `[5]` distinct names, `[6]` empty
+/// names, `[7]` distinct source indexes, `[8]` FNV-1a digest; then per file
+/// `rank | name_len << 2 | leader << 22` (`name_len` the trimmed length,
+/// saturating at 2^20-1; `leader` the first file with the same trimmed name).
+pub(crate) fn w536_mapping_batch(names: &[&[u8]], confidences: &[&[u8]], ints: &[i64]) -> Vec<i64> {
+    let count = names.len();
+    let mut out = vec![0i64; W536_MAPPING_HEADER + count];
+    out[0] = count as i64;
+    let mut leaders: W536Map<&[u8], usize> =
+        W536Map::with_capacity_and_hasher(count, Default::default());
+    let mut sources: W536Map<i64, ()> =
+        W536Map::with_capacity_and_hasher(count.min(64), Default::default());
+    for at in 0..count {
+        let rank = w536_confidence_rank(confidences[at]);
+        out[match rank {
+            2 => 1,
+            1 => 2,
+            _ => 3,
+        }] += 1;
+        if rank > 0 {
+            out[4] = w47_add(out[4], w47_clamp(ints[count + at]));
+        }
+        let name = w536_trim(names[at]);
+        out[6] += i64::from(name.is_empty());
+        let leader = *leaders.entry(name).or_insert(at);
+        out[5] += i64::from(leader == at);
+        let source = w47_clamp(ints[at]);
+        sources.insert(source, ());
+        out[W536_MAPPING_HEADER + at] =
+            rank | (name.len().min(W536_LENGTH_CAP) as i64) << 2 | (leader as i64) << 22;
+    }
+    out[7] = sources.len() as i64;
+    out[8] = w526_digest(&out[W536_MAPPING_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_count` values.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_w536_mapping_summary_batch(
+    names: *const u8,
+    names_len: usize,
+    name_twin: *const u8,
+    name_twin_len: usize,
+    confidences: *const u8,
+    confidences_len: usize,
+    confidence_twin: *const u8,
+    confidence_twin_len: usize,
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w49_run(out, out_count, || {
+            let names = w49_items(
+                w15_input(names, names_len)?,
+                w15_input(name_twin, name_twin_len)?,
+                count,
+            )?;
+            let confidences = w49_items(
+                w15_input(confidences, confidences_len)?,
+                w15_input(confidence_twin, confidence_twin_len)?,
+                count,
+            )?;
+            let ints = w47_ints(w15_input(ints, ints_len)?, 2, count)?;
+            Some(w536_mapping_batch(&names, &confidences, &ints))
+        })
+    }
+}
+
+// --- PersistenceMetrics::summarizeLoadBatch ----------------------------------
+
+pub(crate) const W536_LOAD_HEADER: usize = 10;
+
+/// `summarizeDatabaseAndSearchLoadPhp()` over load rows in microseconds. `ints`
+/// holds three columns (statements, search requests, search executions), each
+/// clamped to 0..2^40-1; a non-finite or non-positive time counts as 0 and a
+/// longer one is capped at 1e12 ms. `[0]` count, `[1]` statements, `[2]`
+/// database microseconds, `[3]` search requests, `[4]` search executions,
+/// `[5]` coalesced requests (totals capped at 2^62), `[6]` slow rows (mean at
+/// least `slow_micros` when that is positive), `[7]` largest mean, `[8]` rows
+/// with statements, `[9]` FNV-1a digest; then per row the truncated mean
+/// statement microseconds and `slow | (executions > requests) << 1 |
+/// coalesced << 2`.
+pub(crate) fn w536_load_batch(ints: &[i64], millis: &[f64], slow_micros: i64) -> Vec<i64> {
+    let count = millis.len();
+    let mut out = vec![0i64; W536_LOAD_HEADER + 2 * count];
+    out[0] = count as i64;
+    for (at, &ms) in millis.iter().enumerate() {
+        let statements = w47_clamp(ints[at]);
+        let requests = w47_clamp(ints[count + at]);
+        let executions = w47_clamp(ints[2 * count + at]);
+        let ms = if ms.is_finite() && ms > 0.0 {
+            ms.min(W536_MS_CAP)
+        } else {
+            0.0
+        };
+        let micros = ms * 1000.0;
+        let mean = if statements > 0 {
+            (micros / statements as f64) as i64
+        } else {
+            0
+        };
+        let coalesced = (requests - executions).max(0);
+        let slow = i64::from(slow_micros > 0 && mean >= slow_micros);
+        out[1] = w47_add(out[1], statements);
+        out[2] = w47_add(out[2], micros as i64);
+        out[3] = w47_add(out[3], requests);
+        out[4] = w47_add(out[4], executions);
+        out[5] = w47_add(out[5], coalesced);
+        out[6] += slow;
+        out[7] = out[7].max(mean);
+        out[8] += i64::from(statements > 0);
+        out[W536_LOAD_HEADER + 2 * at] = mean;
+        out[W536_LOAD_HEADER + 2 * at + 1] =
+            slow | i64::from(executions > requests) << 1 | coalesced << 2;
+    }
+    out[9] = w526_digest(&out[W536_LOAD_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_count` values.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_w536_load_summary_batch(
+    ints: *const u8,
+    ints_len: usize,
+    millis: *const u8,
+    millis_len: usize,
+    count: usize,
+    slow_micros: i64,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w49_run(out, out_count, || {
+            let ints = w47_ints(w15_input(ints, ints_len)?, 3, count)?;
+            let millis = w526_floats(w15_input(millis, millis_len)?, count)?;
+            Some(w536_load_batch(&ints, &millis, slow_micros))
+        })
+    }
+}
+
+// --- MediaByteBudget::spendPlanBatch -----------------------------------------
+
+pub(crate) const W536_SPEND_HEADER: usize = 10;
+
+/// `clampRequestBytesPhp()` then `spend()` over a request sequence. The limit
+/// and starting spend are clamped to 0..=2^62, requests to 0..2^40-1. `[0]`
+/// count, `[1]` limit, `[2]` starting spend, `[3]` final spend, `[4]` bytes
+/// granted, `[5]` requests `allowsPhp()` accepts whole, `[6]` requests granted
+/// short, `[7]` first request after which the budget is exhausted (-1 for
+/// none), `[8]` final utilization ppm (`utilizationPhp()` times 1e6,
+/// truncated), `[9]` FNV-1a digest; then per request `allowed | short << 1 |
+/// exhausted << 2 | granted << 3`.
+pub(crate) fn w536_spend_batch(requests: &[i64], limit: i64, spent: i64) -> Vec<i64> {
+    let count = requests.len();
+    let limit = limit.clamp(0, W47_TOTAL_CAP);
+    let mut spent = spent.clamp(0, W47_TOTAL_CAP);
+    let mut out = vec![0i64; W536_SPEND_HEADER + count];
+    out[0] = count as i64;
+    out[1] = limit;
+    out[2] = spent;
+    out[7] = -1;
+    for (at, &request) in requests.iter().enumerate() {
+        let request = w47_clamp(request);
+        let allowed = spent + request <= limit;
+        let granted = request.min((limit - spent).max(0));
+        spent += granted;
+        let exhausted = spent >= limit;
+        out[4] += granted;
+        out[5] += i64::from(allowed);
+        out[6] += i64::from(granted < request);
+        if exhausted && out[7] < 0 {
+            out[7] = at as i64;
+        }
+        out[W536_SPEND_HEADER + at] = i64::from(allowed)
+            | i64::from(granted < request) << 1
+            | i64::from(exhausted) << 2
+            | granted << 3;
+    }
+    out[3] = spent;
+    out[8] = if spent >= limit {
+        W536_PPM
+    } else {
+        (spent as f64 / limit as f64 * 1e6) as i64
+    };
+    out[9] = w526_digest(&out[W536_SPEND_HEADER..]);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_count` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w536_budget_spend_batch(
+    requests: *const u8,
+    requests_len: usize,
+    count: usize,
+    limit: i64,
+    spent: i64,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w49_run(out, out_count, || {
+            let requests = w47_ints(w15_input(requests, requests_len)?, 1, count)?;
+            Some(w536_spend_batch(&requests, limit, spent))
+        })
+    }
+}
+
+#[cfg(test)]
+mod w536_additional_batch_tests {
+    use super::*;
+    use std::ptr::{null, null_mut};
+
+    fn packed(values: &[i64]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn w536_trim_matches_php_default_list() {
+        assert_eq!(w536_trim(b" \t\n\r\0\x0Bab c\x0B\0 "), b"ab c");
+        assert_eq!(w536_trim(b" \x0C "), b"\x0C");
+        assert_eq!(w536_trim(b"  "), b"");
+        assert_eq!(w536_trim(b""), b"");
+    }
+
+    #[test]
+    fn w536_transfer_batch_reports_ppm_rows() {
+        // logical, network, hits, downloaded, reused, media for three rows.
+        let ints = [
+            10, 0, 4, // logical
+            4, 0, 9, // network
+            6, 0, 9, // hits
+            1000, 0, 100, // downloaded
+            1000, 0, 0, // reused
+            250, 0, 400, // media
+        ];
+        let out = w536_transfer_batch(&ints, 3);
+        assert_eq!(&out[..8], &[3, 14, 13, 15, 1100, 1000, 650, 6]);
+        let rows = &out[W536_TRANSFER_HEADER..];
+        assert_eq!(rows[0], 600_000 | 500_000 << 20 | 250_000 << 40);
+        assert_eq!(rows[1], 0);
+        assert_eq!(rows[2], 1_000_000 | 1_000_000 << 40 | (2 | 4) << 60);
+        assert_eq!(out[8], 1_600_000 / 3);
+        assert_eq!(out[9], 500_000 / 3);
+        assert_eq!(out[10], 1);
+        assert_eq!(out[11], w526_digest(rows));
+        let extreme = w536_transfer_batch(
+            &[i64::MAX, i64::MIN, i64::MAX, i64::MAX, i64::MAX, i64::MAX],
+            1,
+        );
+        let row = extreme[W536_TRANSFER_HEADER];
+        assert_eq!(row & 0xF_FFFF, 1_000_000);
+        assert_eq!(row >> 60, 1);
+        assert!(row >= 0);
+        assert_eq!(
+            w536_transfer_batch(&[], 0),
+            vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, W47_FNV_OFFSET as i64]
+        );
+    }
+
+    /// Runs `w536_message_batch()` over `ids` joined with `\0\x01`.
+    fn message_plan(ids: &[&[u8]], counts: &[i64], table: &mut W536Table) -> Option<Vec<i64>> {
+        let joined = ids.join(&b"\0\x01"[..]);
+        w536_message_batch(&joined, w536_pair_items(&joined), counts, table)
+    }
+
+    #[test]
+    fn w536_message_batch_dedupes_and_shares() {
+        let mut table = W536Table::default();
+        let ids: [&[u8]; 6] = [b" <a@x> ", b"<b@x>", b"<a@x>", b"<b@x>", b"\t", b"<c@x>"];
+        // candidate 0: three IDs, candidate 1: empty, candidate 2: three IDs.
+        let out = message_plan(&ids, &[3, 0, 3], &mut table).unwrap();
+        assert_eq!(&out[..7], &[3, 6, 4, 3, 1, 1, 2]);
+        let rows = &out[W536_MESSAGE_HEADER..];
+        assert_eq!(rows, &[2 | 1 << 14, 1 << 42, 2 | 1 << 14 | 1 << 28]);
+        assert_eq!(out[7], w526_digest(rows));
+        // A reused table starts empty for every batch.
+        assert_eq!(message_plan(&ids, &[3, 0, 3], &mut table), Some(out));
+        assert!(message_plan(&ids, &[3, 0, 2], &mut table).is_none());
+        assert!(message_plan(&ids, &[3, 1, 3], &mut table).is_none());
+        assert!(message_plan(&ids, &[3, -1, 3], &mut table).is_none());
+        assert!(message_plan(&ids, &[9], &mut table).is_none());
+        assert_eq!(
+            w536_message_batch(b"", [], &[], &mut table).unwrap()[..7],
+            [0, 0, 0, 0, 0, 0, 0]
+        );
+        // Items must be subslices of `joined`.
+        assert!(w536_message_batch(b"<a>", [&b"<b>"[..]], &[1], &mut table).is_none());
+        // Colliding probes and a generation wrap keep exact answers.
+        let many: Vec<Vec<u8>> = (0..300)
+            .map(|n| format!("<{}@x>", n % 120).into_bytes())
+            .collect();
+        let many: Vec<&[u8]> = many.iter().map(Vec::as_slice).collect();
+        let first = message_plan(&many, &[100, 100, 100], &mut table).unwrap();
+        assert_eq!(&first[..7], &[3, 300, 300, 120, 0, 2, 100]);
+        table.generation = u32::MAX;
+        assert_eq!(
+            message_plan(&many, &[100, 100, 100], &mut table),
+            Some(first)
+        );
+        assert_eq!(table.generation, 1);
+    }
+
+    #[test]
+    fn w536_pair_items_split_on_separators() {
+        fn split(joined: &[u8]) -> Vec<&[u8]> {
+            w536_pair_items(joined).collect()
+        }
+        assert_eq!(split(b""), [&b""[..]]);
+        let joined = b"a\0\0\x01\x01b\0\x01\0\x01c\0d-long-item\0\x01\0";
+        assert_eq!(
+            split(joined),
+            [&b"a\0"[..], b"\x01b", b"", b"c\0d-long-item", b"\0"]
+        );
+        assert_eq!(split(b"\0\x01"), [&b""[..], b""]);
+        assert_eq!(split(b"0123456\0\x01abcdef"), [&b"0123456"[..], b"abcdef"]);
+    }
+
+    #[test]
+    fn w536_mapping_batch_ranks_and_groups() {
+        assert_eq!(w536_confidence_rank(b" VERIFIED\n"), 2);
+        assert_eq!(w536_confidence_rank(b"Unique_Size"), 1);
+        assert_eq!(w536_confidence_rank(b"unique-size "), 1);
+        assert_eq!(w536_confidence_rank(b"unique size"), 0);
+        assert_eq!(w536_confidence_rank(b"verified."), 0);
+        assert_eq!(w536_confidence_rank(b""), 0);
+        let names: [&[u8]; 4] = [b" a.mkv", b"a.mkv ", b"", b"b.nfo"];
+        let confidences: [&[u8]; 4] = [b"verified", b"unique_size", b"bogus", b"VERIFIED"];
+        let ints = [3, 3, -1, 7, 100, -5, 50, i64::MAX];
+        let out = w536_mapping_batch(&names, &confidences, &ints);
+        assert_eq!(&out[..8], &[4, 2, 1, 1, 100 + W47_VALUE_CAP, 3, 1, 3]);
+        let rows = &out[W536_MAPPING_HEADER..];
+        assert_eq!(
+            rows,
+            &[2 | 5 << 2, 1 | 5 << 2, 2 << 22, 2 | 5 << 2 | 3 << 22]
+        );
+        assert_eq!(out[8], w526_digest(rows));
+    }
+
+    #[test]
+    fn w536_load_batch_reports_means() {
+        let ints = [4, 0, 3, 10, 5, 2, 7, 9, 2];
+        let millis = [10.0, 5.0, f64::NAN];
+        let out = w536_load_batch(&ints, &millis, 2000);
+        assert_eq!(&out[..9], &[3, 7, 15_000, 17, 18, 3, 1, 2500, 2]);
+        let rows = &out[W536_LOAD_HEADER..];
+        assert_eq!(rows, &[2500, 1 | 3 << 2, 0, 2, 0, 0]);
+        assert_eq!(out[9], w526_digest(rows));
+        let capped = w536_load_batch(&[1, 0, 0], &[f64::MAX], 0);
+        assert_eq!(capped[W536_LOAD_HEADER], 1_000_000_000_000_000);
+        let negative = w536_load_batch(&[1, 0, 0], &[-0.0], 1);
+        assert_eq!(negative[W536_LOAD_HEADER], 0);
+    }
+
+    #[test]
+    fn w536_spend_batch_simulates_budget() {
+        let out = w536_spend_batch(&[40, -5, 70, 10, 0], 100, 0);
+        assert_eq!(&out[..9], &[5, 100, 0, 100, 100, 3, 2, 2, 1_000_000]);
+        let rows = &out[W536_SPEND_HEADER..];
+        assert_eq!(rows, &[1 | 40 << 3, 1, 2 | 4 | 60 << 3, 2 | 4, 1 | 4]);
+        assert_eq!(out[9], w526_digest(rows));
+        let partial = w536_spend_batch(&[1], 3, 0);
+        assert_eq!(partial[8], 333_333);
+        assert_eq!(partial[7], -1);
+        let zero = w536_spend_batch(&[], -9, i64::MAX);
+        assert_eq!(
+            &zero[..9],
+            &[0, 0, W47_TOTAL_CAP, W47_TOTAL_CAP, 0, 0, 0, -1, 1_000_000]
+        );
+    }
+
+    #[test]
+    fn w536_exports_validate_pointers_and_capacity() {
+        let mut out = [7i64; 64];
+        let ints = packed(&[1, 1, 1, 1, 1, 1]);
+        let status = unsafe {
+            nntmux_w536_transfer_efficiency_batch(
+                ints.as_ptr(),
+                ints.len(),
+                1,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!((status, out[0]), (1, 1));
+        let status = unsafe {
+            nntmux_w536_transfer_efficiency_batch(ints.as_ptr(), ints.len(), 1, null_mut(), 64)
+        };
+        assert_eq!(status, -2);
+        let status = unsafe {
+            nntmux_w536_transfer_efficiency_batch(ints.as_ptr(), ints.len(), 1, out.as_mut_ptr(), 4)
+        };
+        assert_eq!(status, -2);
+        let status =
+            unsafe { nntmux_w536_transfer_efficiency_batch(null(), 48, 1, out.as_mut_ptr(), 64) };
+        assert_eq!(status, -1);
+        let status =
+            unsafe { nntmux_w536_transfer_efficiency_batch(null(), 0, 0, out.as_mut_ptr(), 64) };
+        assert_eq!((status, out[0]), (1, 0));
+
+        let ids = b"<a>\0\x01<b>\0\x01<a>";
+        let counts = packed(&[2, 0, 1]);
+        let status = unsafe {
+            nntmux_w536_message_id_plan_batch(
+                ids.as_ptr(),
+                ids.len(),
+                null(),
+                0,
+                counts.as_ptr(),
+                counts.len(),
+                3,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!((status, out[0], out[3], out[5]), (1, 3, 2, 1));
+        let ids = b"<a>\0<b>\0<a>";
+        let twin = b"<a>\x01<b>\x01<a>";
+        let status = unsafe {
+            nntmux_w536_message_id_plan_batch(
+                ids.as_ptr(),
+                ids.len(),
+                twin.as_ptr(),
+                twin.len(),
+                counts.as_ptr(),
+                counts.len(),
+                3,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!(status, 1);
+        let bad = packed(&[2, -1, 1]);
+        let status = unsafe {
+            nntmux_w536_message_id_plan_batch(
+                ids.as_ptr(),
+                ids.len(),
+                null(),
+                0,
+                bad.as_ptr(),
+                bad.len(),
+                3,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!(status, -1);
+        let status = unsafe {
+            nntmux_w536_message_id_plan_batch(
+                null(),
+                0,
+                null(),
+                0,
+                null(),
+                0,
+                0,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!((status, out[0]), (1, 0));
+
+        let names = b"a\0b";
+        let confidences = b"verified\0x";
+        let ints = packed(&[0, 1, 5, 6]);
+        let status = unsafe {
+            nntmux_w536_mapping_summary_batch(
+                names.as_ptr(),
+                names.len(),
+                null(),
+                0,
+                confidences.as_ptr(),
+                confidences.len(),
+                null(),
+                0,
+                ints.as_ptr(),
+                ints.len(),
+                2,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!((status, out[0], out[1], out[4]), (1, 2, 1, 5));
+        let status = unsafe {
+            nntmux_w536_mapping_summary_batch(
+                names.as_ptr(),
+                names.len(),
+                null(),
+                0,
+                confidences.as_ptr(),
+                confidences.len(),
+                null(),
+                0,
+                ints.as_ptr(),
+                ints.len(),
+                3,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!(status, -1);
+
+        let ints = packed(&[2, 3, 1]);
+        let millis = 4.0f64.to_le_bytes();
+        let status = unsafe {
+            nntmux_w536_load_summary_batch(
+                ints.as_ptr(),
+                ints.len(),
+                millis.as_ptr(),
+                8,
+                1,
+                0,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!((status, out[0], out[W536_LOAD_HEADER]), (1, 1, 2000));
+        let status = unsafe {
+            nntmux_w536_load_summary_batch(
+                ints.as_ptr(),
+                ints.len(),
+                null(),
+                8,
+                1,
+                0,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!(status, -1);
+
+        let requests = packed(&[5, 5]);
+        let status = unsafe {
+            nntmux_w536_budget_spend_batch(
+                requests.as_ptr(),
+                requests.len(),
+                2,
+                8,
+                0,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!((status, out[0], out[3]), (1, 2, 8));
+        let status = unsafe {
+            nntmux_w536_budget_spend_batch(
+                requests.as_ptr(),
+                requests.len(),
+                2,
+                8,
+                0,
+                out.as_mut_ptr(),
+                11,
+            )
+        };
+        assert_eq!(status, -2);
+        let status =
+            unsafe { nntmux_w536_budget_spend_batch(null(), 0, 0, 8, 0, out.as_mut_ptr(), 64) };
+        assert_eq!((status, out[0]), (1, 0));
+    }
+}
