@@ -477,4 +477,192 @@ final readonly class Par2FileMapper
             && is_array($entry['segments'] ?? null)
             && $entry['segments'] !== [];
     }
+
+    public const string W52_FFI_CDEF = 'int64_t nntmux_w525_par2_candidate_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W52.5 parity test's QUALIFICATION). */
+    private const bool W52_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 52.5 routing and FFI cache, kept in function-local statics so readonly classes can use them too.
+     * Without $op it reports the routing; 'set' swaps the override for $val and returns the previous one;
+     * 'reset' replaces the cached handle with $val (null re-resolves, false disables); 'buffer' returns
+     * `[FFI, int64_t[], capacity]` with room for at least $val words, or null without the library.
+     */
+    private static function w52RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w52_5', self::W52_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W52_RUST_FFI_DEFAULT;
+        }
+    }
+
+    public static function usesW52RustFfi(): bool
+    {
+        return self::w52RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with candidatePlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW52RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w52RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w52RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 52.5 Rust helper, or null to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w52Words(int $count, string $data, string $ints, int $words): ?array
+    {
+        try {
+            $handle = self::w52RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w525_par2_candidate_plan($count, 0, $data, \strlen($data), $ints, \strlen($ints), $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('P*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Batch candidateIndexesPhp() summary for every PAR2 entry at once. Three words per entry:
+     * `[candidate count, first candidate source index, last candidate source index]`, the indexes -1
+     * without a candidate.
+     *
+     * @param  array<int|string, mixed>  $nzbContents
+     * @param  list<Par2FileEntry>  $files
+     * @return list<int>
+     */
+    public static function candidatePlanBatch(array $nzbContents, array $files, ?int $articlePartSize = null): array
+    {
+        return self::usesW52RustFfi()
+            ? self::candidatePlanBatchNative($nzbContents, $files, $articlePartSize)
+            : self::candidatePlanBatchPhp($nzbContents, $files, $articlePartSize);
+    }
+
+    /**
+     * @param  array<int|string, mixed>  $nzbContents
+     * @param  list<Par2FileEntry>  $files
+     * @return list<int>
+     */
+    public static function candidatePlanBatchPhp(array $nzbContents, array $files, ?int $articlePartSize = null): array
+    {
+        $sources = self::w52Sources($nzbContents);
+        $checkSegments = $articlePartSize !== null && $articlePartSize > 0;
+        $out = [];
+        foreach ($files as $file) {
+            $found = 0;
+            $first = $last = -1;
+            for ($index = 0, $end = \count($sources); $index < $end; $index += 3) {
+                $ratio = $file->size / $sources[$index + 1];
+                if ($ratio < self::MIN_SIZE_RATIO || $ratio > self::MAX_SIZE_RATIO) {
+                    continue;
+                }
+                if ($checkSegments && (int) ceil($file->size / $articlePartSize) !== $sources[$index + 2]) {
+                    continue;
+                }
+                $found++;
+                if ($first < 0) {
+                    $first = $sources[$index];
+                }
+                $last = $sources[$index];
+            }
+            array_push($out, $found, $first, $last);
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch over `[part size, source count, (index, posted size, segments)…, file size…]`; falls back to
+     * PHP without the library or when a size exceeds 2^53 (where PHP's float division is not exact).
+     *
+     * @param  array<int|string, mixed>  $nzbContents
+     * @param  list<Par2FileEntry>  $files
+     * @return list<int>
+     */
+    public static function candidatePlanBatchNative(array $nzbContents, array $files, ?int $articlePartSize = null): array
+    {
+        $count = \count($files);
+        if ($count === 0) {
+            return [];
+        }
+        $sources = self::w52Sources($nzbContents);
+        $ints = pack('P*', $articlePartSize ?? 0, intdiv(\count($sources), 3), ...$sources, ...array_column($files, 'size'));
+
+        return self::w52Words($count, '', $ints, 3 * $count)
+            ?? self::candidatePlanBatchPhp($nzbContents, $files, $articlePartSize);
+    }
+
+    /**
+     * Source index, posted size and segment count of every single-file NZB entry, flattened.
+     *
+     * @param  array<int|string, mixed>  $nzbContents
+     * @return list<int>
+     */
+    private static function w52Sources(array $nzbContents): array
+    {
+        $sources = [];
+        foreach (array_values($nzbContents) as $sourceIndex => $entry) {
+            if (\is_array($entry) && (int) ($entry['filecount'] ?? 1) === 1 && (int) ($entry['size'] ?? 0) > 0
+                && \is_array($entry['segments'] ?? null) && $entry['segments'] !== []) {
+                array_push($sources, $sourceIndex, (int) $entry['size'], \count($entry['segments']));
+            }
+        }
+
+        return $sources;
+    }
 }

@@ -374,4 +374,176 @@ final class SevenZipListingParser
     {
         return \is_array($row) && \is_string($row['name'] ?? null) && $row['name'] !== '' && preg_match('/[\x00-\x1F\x7F]|\xC2[\x80-\x9F]/', $row['name']) === 0 && \is_int($row['size'] ?? null) && $row['size'] >= 0 && \is_int($row['pass'] ?? null) && \in_array($row['pass'], [0, 1], true) && \is_int($row['compressed'] ?? null) && \in_array($row['compressed'], [0, 1], true);
     }
+
+    public const string W52_FFI_CDEF = 'int64_t nntmux_w525_sevenzip_line_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W52.5 parity test's QUALIFICATION). */
+    private const bool W52_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 52.5 routing and FFI cache, kept in function-local statics so readonly classes can use them too.
+     * Without $op it reports the routing; 'set' swaps the override for $val and returns the previous one;
+     * 'reset' replaces the cached handle with $val (null re-resolves, false disables); 'buffer' returns
+     * `[\FFI, int64_t[], capacity]` with room for at least $val words, or null without the library.
+     */
+    private static function w52RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w52_5', self::W52_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof \FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W52_RUST_FFI_DEFAULT;
+        }
+    }
+
+    public static function usesW52RustFfi(): bool
+    {
+        return self::w52RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with linePlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW52RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w52RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w52RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 52.5 Rust helper, or null to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w52Words(int $count, string $data, string $ints, int $words): ?array
+    {
+        try {
+            $handle = self::w52RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w525_sevenzip_line_plan($count, 0, $data, \strlen($data), $ints, \strlen($ints), $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('P*', \FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    /** Property ordinals reported by linePlanBatch(). */
+    private const array W52_KEY_ORDINALS = ['Path' => 1, 'Size' => 2, 'Modified' => 3, 'Attributes' => 4, 'CRC' => 5, 'Encrypted' => 6, 'Method' => 7, 'Folder' => 8];
+
+    /**
+     * Batch line plan with line()'s rules. Four words per line: `[kind | key ordinal << 2, key length, value
+     * offset, value length]`, where kind 0 is a blank line, 1 a line without a separator, 2 a key the parser
+     * rejects and 3 an accepted key; the ordinal (W52_KEY_ORDINALS, else 0) is only set for kind 3. One
+     * trailing CR is dropped before the line is read; spans are byte offsets into the line.
+     *
+     * @param  list<string>  $lines
+     * @return list<int>
+     */
+    public static function linePlanBatch(array $lines): array
+    {
+        return self::usesW52RustFfi() ? self::linePlanBatchNative($lines) : self::linePlanBatchPhp($lines);
+    }
+
+    /**
+     * @param  list<string>  $lines
+     * @return list<int>
+     */
+    public static function linePlanBatchPhp(array $lines): array
+    {
+        $out = [];
+        foreach ($lines as $line) {
+            if (str_ends_with($line, "\r")) {
+                $line = substr($line, 0, -1);
+            }
+            $length = \strlen($line);
+            if (strspn($line, " \t") === $length) {
+                array_push($out, 0, 0, 0, 0);
+
+                continue;
+            }
+            $separator = strpos($line, ' = ');
+            if ($separator !== false) {
+                $keyLength = $separator;
+                $valueOffset = $separator + 3;
+            } elseif (str_ends_with($line, ' =')) {
+                $keyLength = $length - 2;
+                $valueOffset = $length;
+            } else {
+                array_push($out, 1, 0, 0, 0);
+
+                continue;
+            }
+            $key = substr($line, 0, $keyLength);
+            $kind = preg_match('/^[A-Za-z][A-Za-z0-9 ()._-]*$/', $key) === 1 ? 3 | (self::W52_KEY_ORDINALS[$key] ?? 0) << 2 : 2;
+            array_push($out, $kind, $keyLength, $valueOffset, $length - $valueOffset);
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch over NUL-delimited lines; falls back to PHP when the library is missing or a line holds a
+     * NUL byte.
+     *
+     * @param  list<string>  $lines
+     * @return list<int>
+     */
+    public static function linePlanBatchNative(array $lines): array
+    {
+        $count = \count($lines);
+        if ($count === 0) {
+            return [];
+        }
+        $data = implode("\0", $lines);
+
+        return (substr_count($data, "\0") === $count - 1 ? self::w52Words($count, $data, '', 4 * $count) : null)
+            ?? self::linePlanBatchPhp($lines);
+    }
 }
