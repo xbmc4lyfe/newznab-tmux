@@ -48,11 +48,19 @@ class MediaExtractionService
         ssize_t nntmux_rfm_audio_release_title(const char *performer_ptr, size_t performer_len, const char *album_ptr, size_t album_len, const char *date_ptr, size_t date_len, int32_t has_date, const char *ext_ptr, size_t ext_len, char *out_ptr, size_t out_cap);
         C;
 
+    /** Wave 40.6 paired benchmarks decide this default; see RustArchiveExtractionMediaUsenetDownloadReleaseProcW40ParityTest. */
+    public const bool W406_RUST_FFI_DEFAULT = false;
+
+    /** Resolution tiers indexed by the Wave 40.6 export's tier code. */
+    private const array W406_RESOLUTION_TIERS = ['sd', 'hd_720', 'fhd_1080', 'uhd_4k', 'invalid'];
+
     private static ?FFI $ffi = null;
 
     private static bool $ffiResolved = false;
 
     private static bool $useRustFfi = true;
+
+    private static ?bool $w406UseRustFfi = null;
 
     private static ?CData $audioTagSpan = null;
 
@@ -547,6 +555,71 @@ class MediaExtractionService
     public static function useRustFfi(bool $use): void
     {
         self::$useRustFfi = $use;
+    }
+
+    public static function useW406RustFfi(?bool $enabled): void
+    {
+        self::$w406UseRustFfi = $enabled;
+    }
+
+    public static function usesW406RustFfi(): bool
+    {
+        return self::$w406UseRustFfi ?? self::W406_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW406RustFfi(): void
+    {
+        self::$w406UseRustFfi = null;
+    }
+
+    /**
+     * Classify probed media metrics. Non-positive dimensions are invalid; otherwise the tier is uhd_4k from 3840
+     * wide or 2160 high, fhd_1080 from 1920 or 1080, hd_720 from 1280 or 720, else sd. A duration is valid within
+     * 1 ms..24 h, six or more channels are surround, and a sample needs a valid duration of at least 10 s, valid
+     * dimensions and a positive video bitrate.
+     *
+     * @return array{resolution_tier: string, valid_duration: bool, surround_audio: bool, sample_eligible: bool}
+     */
+    public static function summarizeMediaProbeMetrics(int $durationMs, int $width, int $height, int $videoBitrateKbps, int $audioChannels): array
+    {
+        return (self::usesW406RustFfi() ? self::summarizeMediaProbeMetricsNative($durationMs, $width, $height, $videoBitrateKbps, $audioChannels) : null)
+            ?? self::summarizeMediaProbeMetricsPhp($durationMs, $width, $height, $videoBitrateKbps, $audioChannels);
+    }
+
+    /** @return array{resolution_tier: string, valid_duration: bool, surround_audio: bool, sample_eligible: bool} */
+    public static function summarizeMediaProbeMetricsPhp(int $durationMs, int $width, int $height, int $videoBitrateKbps, int $audioChannels): array
+    {
+        $tier = match (true) {
+            $width <= 0 || $height <= 0 => 'invalid',
+            $width >= 3840 || $height >= 2160 => 'uhd_4k',
+            $width >= 1920 || $height >= 1080 => 'fhd_1080',
+            $width >= 1280 || $height >= 720 => 'hd_720',
+            default => 'sd',
+        };
+        $validDuration = $durationMs > 0 && $durationMs <= 86_400_000;
+
+        return [
+            'resolution_tier' => $tier,
+            'valid_duration' => $validDuration,
+            'surround_audio' => $audioChannels >= 6,
+            'sample_eligible' => $validDuration && $durationMs >= 10_000 && $tier !== 'invalid' && $videoBitrateKbps > 0,
+        ];
+    }
+
+    /** @return array{resolution_tier: string, valid_duration: bool, surround_audio: bool, sample_eligible: bool}|null */
+    public static function summarizeMediaProbeMetricsNative(int $durationMs, int $width, int $height, int $videoBitrateKbps, int $audioChannels): ?array
+    {
+        $slots = ArchiveExtractionService::w406Slots(2, pack('q5', $durationMs, $width, $height, $videoBitrateKbps, $audioChannels), 4);
+        if ($slots === null || ! isset(self::W406_RESOLUTION_TIERS[$slots[0]]) || ($slots[1] & ~1) !== 0 || ($slots[2] & ~1) !== 0 || ($slots[3] & ~1) !== 0) {
+            return null;
+        }
+
+        return [
+            'resolution_tier' => self::W406_RESOLUTION_TIERS[$slots[0]],
+            'valid_duration' => $slots[1] === 1,
+            'surround_audio' => $slots[2] === 1,
+            'sample_eligible' => $slots[3] === 1,
+        ];
     }
 
     private static function rustFfi(?string $libraryPath = null): ?FFI

@@ -27288,3 +27288,547 @@ mod w396_tests {
         assert_eq!(w396_compute(5, 0, &huge), None);
     }
 }
+
+// Wave 40.6: second-pass archive, media, download, batch and work-queue summaries.
+// Integers are native-endian i64; counts and string lengths are u32-LE, and a
+// W406_NOT_STRING length marks a PHP value that is not a string. Every output
+// is a fixed run of i64 slots.
+const W406_MAX_INPUT: usize = 16_777_216;
+const W406_NOT_STRING: usize = u32::MAX as usize;
+const W406_EXECUTABLE_EXTENSIONS: [&[u8]; 12] = [
+    b"bat", b"cmd", b"com", b"cpl", b"exe", b"jar", b"js", b"msi", b"ps1", b"scr", b"sh", b"vbs",
+];
+
+/// Reads an optional string: None at end of input, Some(None) for a non-string.
+fn w406_optional_string<'a>(reader: &mut W356Reader<'a>) -> Option<Option<&'a [u8]>> {
+    let size = reader.count()?;
+    if size == W406_NOT_STRING {
+        return Some(None);
+    }
+    Some(Some(reader.take(size)?))
+}
+
+/// Reads the leading i64 parameter and a u32 count no larger than the remaining
+/// input allows at `min_entry` bytes per entry.
+fn w406_header(reader: &mut W356Reader<'_>, min_entry: usize) -> Option<(i64, usize)> {
+    let parameter = reader.integer()?;
+    let count = reader.count()?;
+    if count > reader.bytes.len().checked_sub(reader.offset)? / min_entry {
+        return None;
+    }
+    Some((parameter, count))
+}
+
+fn w406_unsafe_path(path: &[u8]) -> bool {
+    matches!(path.first(), None | Some(b'/') | Some(b'\\'))
+        || path.contains(&0)
+        || path
+            .split(|b| *b == b'/' || *b == b'\\')
+            .any(|segment| segment == b"..")
+}
+
+fn w406_executable(path: &[u8]) -> bool {
+    let base = path
+        .rsplit(|b| *b == b'/' || *b == b'\\')
+        .next()
+        .unwrap_or(path);
+    let Some(dot) = base.iter().rposition(|b| *b == b'.') else {
+        return false;
+    };
+    let extension = &base[dot + 1..];
+    W406_EXECUTABLE_EXTENSIONS
+        .iter()
+        .any(|known| extension.eq_ignore_ascii_case(known))
+}
+
+fn w406_compute(operation: u8, input: &[u8]) -> Option<Vec<u8>> {
+    let mut reader = W356Reader {
+        bytes: input,
+        offset: 0,
+    };
+    let slots: Vec<i64> = match operation {
+        1 => {
+            let (max_entries, count) = w406_header(&mut reader, 4)?;
+            let (mut rejected, mut executable) = (0_i64, 0_i64);
+            for _ in 0..count {
+                match w406_optional_string(&mut reader)? {
+                    None => rejected += 1,
+                    Some(path) => {
+                        rejected += i64::from(w406_unsafe_path(path));
+                        executable += i64::from(w406_executable(path));
+                    }
+                }
+            }
+            let total = count as i64;
+            vec![
+                total,
+                total - rejected,
+                rejected,
+                executable,
+                i64::from(total > max_entries.max(0)),
+            ]
+        }
+        2 => {
+            let [duration, width, height, bitrate, channels] = w396_ints(&mut reader)?;
+            // 0 sd, 1 hd_720, 2 fhd_1080, 3 uhd_4k, 4 invalid.
+            let tier = if width <= 0 || height <= 0 {
+                4
+            } else if width >= 3840 || height >= 2160 {
+                3
+            } else if width >= 1920 || height >= 1080 {
+                2
+            } else if width >= 1280 || height >= 720 {
+                1
+            } else {
+                0
+            };
+            let valid_duration = duration > 0 && duration <= 86_400_000;
+            vec![
+                tier,
+                i64::from(valid_duration),
+                i64::from(channels >= 6),
+                i64::from(valid_duration && duration >= 10_000 && tier != 4 && bitrate > 0),
+            ]
+        }
+        3 => {
+            let (max_missing, count) = w406_header(&mut reader, 12)?;
+            let (mut downloaded, mut missing, mut transient, mut bytes) =
+                (0_i64, 0_i64, 0_i64, 0_i64);
+            for _ in 0..count {
+                let status = w406_optional_string(&mut reader)?;
+                let size = reader.integer()?;
+                match status {
+                    Some(b"ok" | b"downloaded") => {
+                        downloaded += 1;
+                        bytes = bytes.saturating_add(size.max(0));
+                    }
+                    Some(b"missing" | b"not_found") => missing += 1,
+                    Some(b"timeout" | b"error" | b"retry") => transient += 1,
+                    _ => {}
+                }
+            }
+            vec![
+                count as i64,
+                downloaded,
+                missing,
+                transient,
+                bytes,
+                i64::from(missing > max_missing.max(0)),
+            ]
+        }
+        4 => {
+            let (budget, count) = w406_header(&mut reader, 13)?;
+            let (mut processed, mut passworded, mut media, mut failed, mut elapsed) =
+                (0_i64, 0_i64, 0_i64, 0_i64, 0_i64);
+            for _ in 0..count {
+                let flags = reader.take(1)?[0];
+                if flags > 3 {
+                    return None;
+                }
+                let status = w406_optional_string(&mut reader)?;
+                let spent = reader.integer()?;
+                match status {
+                    Some(b"processed" | b"ok") => processed += 1,
+                    Some(b"failed" | b"error") => failed += 1,
+                    _ => {}
+                }
+                passworded += i64::from(flags & 1);
+                media += i64::from(flags >> 1);
+                elapsed = elapsed.saturating_add(spent.max(0));
+            }
+            vec![
+                count as i64,
+                processed,
+                passworded,
+                media,
+                failed,
+                elapsed,
+                i64::from(elapsed >= budget.max(1)),
+            ]
+        }
+        5 => {
+            let (max_batch, count) = w406_header(&mut reader, 17)?;
+            let (mut fresh, mut retry, mut passworded, mut eligible) = (0_i64, 0_i64, 0_i64, 0_i64);
+            for _ in 0..count {
+                // bit 0: the candidate is an array; bit 1: it is passworded (arrays only).
+                let flags = reader.take(1)?[0];
+                let [attempts, age_hours] = w396_ints(&mut reader)?;
+                match flags {
+                    0 => {}
+                    1 => {
+                        eligible += 1;
+                        if attempts > 0 {
+                            retry += 1;
+                        } else if (0..=24).contains(&age_hours) {
+                            fresh += 1;
+                        }
+                    }
+                    3 => passworded += 1,
+                    _ => return None,
+                }
+            }
+            vec![
+                count as i64,
+                fresh,
+                retry,
+                passworded,
+                eligible.min(max_batch.max(0)),
+            ]
+        }
+        _ => return None,
+    };
+    if reader.offset != input.len() {
+        return None;
+    }
+    Some(slots.iter().flat_map(|slot| slot.to_ne_bytes()).collect())
+}
+
+/// Returns bytes written, -required for a short buffer, or -1 for invalid input.
+/// All valid outputs are at least 32 bytes, keeping -1 unambiguous. No negative
+/// return writes output and no NUL terminator is appended.
+///
+/// # Safety
+/// Both pointers must be nonnull and designate live readable/writable allocations
+/// of the declared sizes. Ranges must not overlap and sizes must be <= MAX_INPUT.
+/// The checks cannot establish allocation ownership or liveness. Alignment is one.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w406_archive_media_download_processor_planner(
+    operation: u8,
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !(1..=5).contains(&operation)
+            || input.is_null()
+            || out_buf.is_null()
+            || input_len > W406_MAX_INPUT
+            || out_cap > W406_MAX_INPUT
+            || input_len > isize::MAX as usize
+            || out_cap > isize::MAX as usize
+        {
+            return -1;
+        }
+        let Some(input_end) = (input as usize).checked_add(input_len) else {
+            return -1;
+        };
+        let Some(output_end) = (out_buf as usize).checked_add(out_cap) else {
+            return -1;
+        };
+        if input_end > isize::MAX as usize || output_end > isize::MAX as usize {
+            return -1;
+        }
+        if input_len != 0
+            && out_cap != 0
+            && (input as usize) < output_end
+            && (out_buf as usize) < input_end
+        {
+            return -1;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(input, input_len) };
+        let Some(result) = w406_compute(operation, bytes) else {
+            return -1;
+        };
+        if out_cap < result.len() {
+            return -(result.len() as isize);
+        }
+        unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), out_buf, result.len()) };
+        result.len() as isize
+    }))
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod w406_tests {
+    use super::*;
+
+    fn ints(values: &[i64]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_ne_bytes()).collect()
+    }
+
+    fn header(parameter: i64, count: usize) -> Vec<u8> {
+        let mut frame = ints(&[parameter]);
+        frame.extend_from_slice(&(count as u32).to_le_bytes());
+        frame
+    }
+
+    fn optional(frame: &mut Vec<u8>, value: Option<&[u8]>) {
+        match value {
+            Some(bytes) => w356_string(frame, bytes),
+            None => frame.extend_from_slice(&u32::MAX.to_le_bytes()),
+        }
+    }
+
+    fn paths(max: i64, values: &[Option<&[u8]>]) -> Vec<u8> {
+        let mut frame = header(max, values.len());
+        for value in values {
+            optional(&mut frame, *value);
+        }
+        frame
+    }
+
+    fn segments(max: i64, values: &[(Option<&[u8]>, i64)]) -> Vec<u8> {
+        let mut frame = header(max, values.len());
+        for (status, bytes) in values {
+            optional(&mut frame, *status);
+            frame.extend_from_slice(&bytes.to_ne_bytes());
+        }
+        frame
+    }
+
+    fn outcomes(budget: i64, values: &[(u8, Option<&[u8]>, i64)]) -> Vec<u8> {
+        let mut frame = header(budget, values.len());
+        for (flags, status, elapsed) in values {
+            frame.push(*flags);
+            optional(&mut frame, *status);
+            frame.extend_from_slice(&elapsed.to_ne_bytes());
+        }
+        frame
+    }
+
+    fn candidates(max: i64, values: &[(u8, i64, i64)]) -> Vec<u8> {
+        let mut frame = header(max, values.len());
+        for (flags, attempts, age) in values {
+            frame.push(*flags);
+            frame.extend_from_slice(&ints(&[*attempts, *age]));
+        }
+        frame
+    }
+
+    fn fixtures() -> Vec<(u8, Vec<u8>, Vec<u8>)> {
+        vec![
+            (
+                1,
+                paths(
+                    3,
+                    &[
+                        Some(b"movie/movie.mkv"),
+                        Some(b"../etc/passwd"),
+                        Some(b"/abs/run.SH"),
+                        Some(b"setup.exe"),
+                        None,
+                    ],
+                ),
+                ints(&[5, 2, 3, 2, 1]),
+            ),
+            (
+                2,
+                ints(&[5_400_000, 1920, 1080, 8_000, 6]),
+                ints(&[2, 1, 1, 1]),
+            ),
+            (
+                3,
+                segments(
+                    1,
+                    &[
+                        (Some(b"ok"), 700_000),
+                        (Some(b"missing"), 0),
+                        (Some(b"timeout"), 5),
+                        (Some(b"downloaded"), -4),
+                        (Some(b"not_found"), 0),
+                        (None, 9),
+                    ],
+                ),
+                ints(&[6, 2, 2, 1, 700_000, 1]),
+            ),
+            (
+                4,
+                outcomes(
+                    100,
+                    &[
+                        (1, Some(b"processed"), 40),
+                        (2, Some(b"ok"), 30),
+                        (0, Some(b"failed"), -5),
+                        (3, None, 30),
+                    ],
+                ),
+                ints(&[4, 2, 2, 2, 1, 100, 1]),
+            ),
+            (
+                5,
+                candidates(
+                    2,
+                    &[
+                        (1, 0, 3),
+                        (1, 2, 3),
+                        (3, 0, 1),
+                        (0, 0, 0),
+                        (1, 0, 48),
+                        (1, -1, -1),
+                    ],
+                ),
+                ints(&[6, 1, 1, 1, 2]),
+            ),
+        ]
+    }
+
+    #[test]
+    fn w406_literal_contracts() {
+        for (op, input, output) in fixtures() {
+            assert_eq!(w406_compute(op, &input), Some(output));
+        }
+        // Path rules: empty, NUL, backslash roots and segments, and extension-only names.
+        assert_eq!(
+            w406_compute(
+                1,
+                &paths(
+                    i64::MIN,
+                    &[
+                        Some(b""),
+                        Some(b"a\0b"),
+                        Some(b"\\root"),
+                        Some(b"a\\..\\b"),
+                        Some(b"a..b/c"),
+                        Some(b"dir.exe/readme"),
+                        Some(b".JS"),
+                        Some(b"x."),
+                    ],
+                ),
+            ),
+            Some(ints(&[8, 4, 4, 1, 1]))
+        );
+        assert_eq!(
+            w406_compute(1, &paths(0, &[])),
+            Some(ints(&[0, 0, 0, 0, 0]))
+        );
+        for (input, expected) in [
+            ([0, 3840, 2160, 1, 2], [3, 0, 0, 0]),
+            ([86_400_001, 1280, 1, 1, 8], [1, 0, 1, 0]),
+            ([9_999, 640, 480, 1, 0], [0, 1, 0, 0]),
+            ([10_000, 640, 0, 1, 0], [4, 1, 0, 0]),
+            ([10_000, 1, 720, 0, 6], [1, 1, 1, 0]),
+            (
+                [i64::MAX, i64::MAX, i64::MIN, i64::MAX, i64::MIN],
+                [4, 0, 0, 0],
+            ),
+        ] {
+            assert_eq!(w406_compute(2, &ints(&input)), Some(ints(&expected)));
+        }
+        assert_eq!(
+            w406_compute(
+                3,
+                &segments(
+                    i64::MIN,
+                    &[(Some(b"ok"), i64::MAX), (Some(b"ok"), 1), (Some(b"OK"), 1)]
+                )
+            ),
+            Some(ints(&[3, 2, 0, 0, i64::MAX, 0]))
+        );
+        assert_eq!(
+            w406_compute(3, &segments(-1, &[(Some(b"missing"), 0)])),
+            Some(ints(&[1, 0, 1, 0, 0, 1]))
+        );
+        assert_eq!(
+            w406_compute(4, &outcomes(i64::MIN, &[])),
+            Some(ints(&[0, 0, 0, 0, 0, 0, 0]))
+        );
+        assert_eq!(
+            w406_compute(
+                4,
+                &outcomes(
+                    i64::MAX,
+                    &[(0, Some(b"x"), i64::MAX), (0, Some(b"error"), 1)]
+                )
+            ),
+            Some(ints(&[2, 0, 0, 0, 1, i64::MAX, 1]))
+        );
+        assert_eq!(
+            w406_compute(
+                5,
+                &candidates(i64::MIN, &[(1, 0, 0), (1, 0, 24), (1, i64::MIN, 25)])
+            ),
+            Some(ints(&[3, 2, 0, 0, 0]))
+        );
+        assert_eq!(
+            w406_compute(5, &candidates(i64::MAX, &[(1, 0, 0), (1, 0, 24)])),
+            Some(ints(&[2, 2, 0, 0, 2]))
+        );
+    }
+
+    #[test]
+    fn w406_ffi_validation_and_retry_never_write_on_negative() {
+        for (op, input, expected) in fixtures() {
+            let mut out = [90_u8; 256];
+            let call = |p, len, o, cap| unsafe {
+                nntmux_w406_archive_media_download_processor_planner(op, p, len, o, cap)
+            };
+            let invalid = [
+                (std::ptr::null(), input.len(), out.as_mut_ptr(), 256),
+                (input.as_ptr(), input.len(), std::ptr::null_mut(), 256),
+                (input.as_ptr(), W406_MAX_INPUT + 1, out.as_mut_ptr(), 256),
+                (
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    W406_MAX_INPUT + 1,
+                ),
+                (input.as_ptr(), usize::MAX, out.as_mut_ptr(), 256),
+                (input.as_ptr(), input.len(), out.as_mut_ptr(), usize::MAX),
+                (usize::MAX as *const u8, input.len(), out.as_mut_ptr(), 256),
+                (input.as_ptr(), input.len(), usize::MAX as *mut u8, 256),
+                (out.as_ptr(), input.len(), out.as_mut_ptr(), 256),
+            ];
+            for (p, len, o, cap) in invalid {
+                assert_eq!(call(p, len, o, cap), -1);
+                assert_eq!(out, [90; 256]);
+            }
+            for len in 0..input.len() {
+                assert_eq!(call(input.as_ptr(), len, out.as_mut_ptr(), 256), -1);
+                assert_eq!(out, [90; 256]);
+            }
+            let mut trailing = input.clone();
+            trailing.push(0);
+            assert_eq!(
+                call(trailing.as_ptr(), trailing.len(), out.as_mut_ptr(), 256),
+                -1
+            );
+            for cap in [0, 1, expected.len() - 1] {
+                assert_eq!(
+                    call(input.as_ptr(), input.len(), out.as_mut_ptr(), cap),
+                    -(expected.len() as isize)
+                );
+                assert_eq!(out, [90; 256]);
+            }
+            assert_eq!(
+                call(
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    expected.len()
+                ),
+                expected.len() as isize
+            );
+            assert_eq!(&out[..expected.len()], expected.as_slice());
+            assert!(out[expected.len()..].iter().all(|b| *b == 90));
+        }
+        for op in [0, 6, 255] {
+            let mut out = [90_u8; 64];
+            let input = ints(&[0; 5]);
+            assert_eq!(
+                unsafe {
+                    nntmux_w406_archive_media_download_processor_planner(
+                        op,
+                        input.as_ptr(),
+                        input.len(),
+                        out.as_mut_ptr(),
+                        64,
+                    )
+                },
+                -1
+            );
+            assert_eq!(out, [90; 64]);
+            assert_eq!(w406_compute(op, b""), None);
+        }
+        for op in [1, 3, 4, 5] {
+            assert_eq!(w406_compute(op, &header(0, u32::MAX as usize)), None);
+        }
+        assert_eq!(w406_compute(4, &outcomes(0, &[(4, None, 0)])), None);
+        assert_eq!(w406_compute(5, &candidates(0, &[(2, 0, 0)])), None);
+        assert_eq!(w406_compute(5, &candidates(0, &[(4, 0, 0)])), None);
+        // A declared string length past the end of input is rejected, not read.
+        let mut short = header(0, 1);
+        short.extend_from_slice(&(100_u32).to_le_bytes());
+        assert_eq!(w406_compute(1, &short), None);
+    }
+}

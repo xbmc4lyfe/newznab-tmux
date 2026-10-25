@@ -34,6 +34,11 @@ class UsenetDownloadService
 
     private static bool $useRustFfi = true;
 
+    /** Wave 40.6 paired benchmarks decide this default; see RustArchiveExtractionMediaUsenetDownloadReleaseProcW40ParityTest. */
+    public const bool W406_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $w406UseRustFfi = null;
+
     private const int MAX_CACHE_ENTRIES = 4;
 
     private const int MAX_CACHE_ENTRY_BYTES = 8_388_608;
@@ -718,5 +723,117 @@ class UsenetDownloadService
     public function meetsMinimumSize(string $data, int $minimumBytes = 40): bool
     {
         return strlen($data) > $minimumBytes;
+    }
+
+    public static function useW406RustFfi(?bool $enabled): void
+    {
+        self::$w406UseRustFfi = $enabled;
+    }
+
+    public static function usesW406RustFfi(): bool
+    {
+        return self::$w406UseRustFfi ?? self::W406_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW406RustFfi(): void
+    {
+        self::$w406UseRustFfi = null;
+    }
+
+    /**
+     * Summarize NNTP segment outcomes. Each outcome is an array whose string 'status' is ok/downloaded,
+     * missing/not_found or timeout/error/retry (compared exactly); other values only count toward the total.
+     * Downloaded segments add max(0, an integer 'bytes'), saturating at PHP_INT_MAX. The window aborts once
+     * more than max(0, $maxMissingSegments) articles are missing.
+     *
+     * @param  array<array-key, mixed>  $segmentOutcomes
+     * @return array{total_segments: int, downloaded: int, missing_articles: int, transient_errors: int, downloaded_bytes: int, abort_threshold_exceeded: bool}
+     */
+    public static function summarizeSegmentDownloadWindow(array $segmentOutcomes, int $maxMissingSegments = 2): array
+    {
+        return (self::usesW406RustFfi() ? self::summarizeSegmentDownloadWindowNative($segmentOutcomes, $maxMissingSegments) : null)
+            ?? self::summarizeSegmentDownloadWindowPhp($segmentOutcomes, $maxMissingSegments);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $segmentOutcomes
+     * @return array{total_segments: int, downloaded: int, missing_articles: int, transient_errors: int, downloaded_bytes: int, abort_threshold_exceeded: bool}
+     */
+    public static function summarizeSegmentDownloadWindowPhp(array $segmentOutcomes, int $maxMissingSegments = 2): array
+    {
+        $downloaded = 0;
+        $missing = 0;
+        $transient = 0;
+        $bytes = 0;
+        foreach ($segmentOutcomes as $outcome) {
+            [$status, $size] = self::w406Segment($outcome);
+            switch ($status) {
+                case 'ok':
+                case 'downloaded':
+                    $downloaded++;
+                    if ($size > 0) {
+                        $bytes = $bytes > PHP_INT_MAX - $size ? PHP_INT_MAX : $bytes + $size;
+                    }
+                    break;
+                case 'missing':
+                case 'not_found':
+                    $missing++;
+                    break;
+                case 'timeout':
+                case 'error':
+                case 'retry':
+                    $transient++;
+                    break;
+            }
+        }
+
+        return [
+            'total_segments' => \count($segmentOutcomes),
+            'downloaded' => $downloaded,
+            'missing_articles' => $missing,
+            'transient_errors' => $transient,
+            'downloaded_bytes' => $bytes,
+            'abort_threshold_exceeded' => $missing > max(0, $maxMissingSegments),
+        ];
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $segmentOutcomes
+     * @return array{total_segments: int, downloaded: int, missing_articles: int, transient_errors: int, downloaded_bytes: int, abort_threshold_exceeded: bool}|null
+     */
+    public static function summarizeSegmentDownloadWindowNative(array $segmentOutcomes, int $maxMissingSegments = 2): ?array
+    {
+        $total = \count($segmentOutcomes);
+        $frame = pack('qV', $maxMissingSegments, $total);
+        foreach ($segmentOutcomes as $outcome) {
+            [$status, $size] = self::w406Segment($outcome);
+            $frame .= ArchiveExtractionService::w406OptionalString($status).pack('q', $size);
+        }
+        $slots = ArchiveExtractionService::w406Slots(3, $frame, 6);
+        if ($slots === null || $slots[0] !== $total || $slots[1] < 0 || $slots[2] < 0 || $slots[3] < 0
+            || $total < $slots[1] + $slots[2] + $slots[3] || $slots[4] < 0 || ($slots[5] & ~1) !== 0) {
+            return null;
+        }
+
+        return [
+            'total_segments' => $total,
+            'downloaded' => $slots[1],
+            'missing_articles' => $slots[2],
+            'transient_errors' => $slots[3],
+            'downloaded_bytes' => $slots[4],
+            'abort_threshold_exceeded' => $slots[5] === 1,
+        ];
+    }
+
+    /** @return array{0: string|null, 1: int} The outcome's string status and integer byte count, if any. */
+    private static function w406Segment(mixed $outcome): array
+    {
+        if (! \is_array($outcome)) {
+            return [null, 0];
+        }
+        $status = $outcome['status'] ?? null;
+        $size = $outcome['bytes'] ?? null;
+
+        return [\is_string($status) ? $status : null, \is_int($size) ? $size : 0];
     }
 }
