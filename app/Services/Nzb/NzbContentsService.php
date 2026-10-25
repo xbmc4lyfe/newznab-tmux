@@ -49,6 +49,18 @@ class NzbContentsService
 
     private static FFI|false|null $ffi = null;
 
+    /**
+     * Default for the Wave 40.2 toggle only; it stays false because the paired benchmark in
+     * tests/Unit/RustNzbServiceParserManifestWriteContentsW40ParityTest.php is below 1.5x.
+     */
+    public const bool W402_RUST_FFI_DEFAULT = false;
+
+    /** Fixed lower-case extensions for {@see summarizeArchiveMediaBreakdown()}: 0 archive, 1 PAR2, 2 NFO/SFV, 3 media. */
+    private const array W402_EXTENSION_SLOTS = ['rar' => 0, '7z' => 0, 'par2' => 1, 'nfo' => 2, 'sfv' => 2, 'avi' => 3, 'flac' => 3, 'm2ts' => 3, 'm4a' => 3,
+        'm4v' => 3, 'mkv' => 3, 'mov' => 3, 'mp3' => 3, 'mp4' => 3, 'mpeg' => 3, 'mpg' => 3, 'ogg' => 3, 'ts' => 3, 'wav' => 3, 'webm' => 3, 'wmv' => 3];
+
+    private static ?bool $useW402RustFfi = null;
+
     protected NzbService $nzbService;
 
     protected NzbParserService $parserService;
@@ -486,6 +498,109 @@ class NzbContentsService
     public static function setUseRustFfi(bool $enabled): void
     {
         self::$useRustFfi = $enabled;
+    }
+
+    public static function useW402RustFfi(?bool $use): void
+    {
+        self::$useW402RustFfi = $use;
+    }
+
+    public static function usesW402RustFfi(): bool
+    {
+        return self::$useW402RustFfi ?? self::W402_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW402RustFfi(): void
+    {
+        self::$useW402RustFfi = null;
+    }
+
+    /**
+     * Classify NZB member filenames by the ASCII case-insensitive text after their last dot: `rar`, `7z`, `r` plus two or
+     * three digits, or three digits after `.7z` are archive volumes; then `par2` is recovery, `nfo`/`sfv` text and a known
+     * media extension media. Non-strings, names without a dot and every other extension are other.
+     *
+     * @param  array<array-key, mixed>  $filenames
+     * @return array{members: int, archive: int, par2: int, text: int, media: int, other: int}
+     */
+    public static function summarizeArchiveMediaBreakdown(array $filenames): array
+    {
+        return (self::usesW402RustFfi() ? self::summarizeArchiveMediaBreakdownNative($filenames) : null)
+            ?? self::summarizeArchiveMediaBreakdownPhp($filenames);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $filenames
+     * @return array{members: int, archive: int, par2: int, text: int, media: int, other: int}
+     */
+    private static function summarizeArchiveMediaBreakdownPhp(array $filenames): array
+    {
+        $counts = [0, 0, 0, 0, 0];
+        foreach ($filenames as $filename) {
+            $counts[self::archiveMediaSlot($filename)]++;
+        }
+
+        return self::archiveMediaSummary(\count($filenames), $counts);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $filenames
+     * @return array{members: int, archive: int, par2: int, text: int, media: int, other: int}|null
+     */
+    private static function summarizeArchiveMediaBreakdownNative(array $filenames): ?array
+    {
+        $size = 16 + 8 * \count($filenames);
+        foreach ($filenames as $filename) {
+            $size += \is_string($filename) ? \strlen($filename) : 0;
+        }
+        if ($size > NzbService::W402_MAX_INPUT) {
+            return null;
+        }
+        $words = [0, \count($filenames)];
+        $tail = '';
+        foreach ($filenames as $filename) {
+            $words[] = \is_string($filename) ? \strlen($filename) : -1;
+            $tail .= \is_string($filename) ? $filename : '';
+        }
+        $slots = NzbService::evaluateW402Native(2, pack('q*', ...$words).$tail, 6);
+        if ($slots === null) {
+            return null;
+        }
+        [$count, $archive, $par2, $text, $media, $other] = $slots;
+        if ($count !== \count($filenames) || min($archive, $par2, $text, $media, $other) < 0 || $archive + $par2 + $text + $media + $other !== $count) {
+            return null;
+        }
+
+        return self::archiveMediaSummary($count, [$archive, $par2, $text, $media, $other]);
+    }
+
+    /** 0 archive, 1 PAR2, 2 NFO/SFV, 3 media, 4 other. */
+    private static function archiveMediaSlot(mixed $filename): int
+    {
+        $dot = \is_string($filename) ? strrpos($filename, '.') : false;
+        if ($dot === false) {
+            return 4;
+        }
+        $extension = strtolower(substr($filename, $dot + 1));
+        if (isset(self::W402_EXTENSION_SLOTS[$extension])) {
+            return self::W402_EXTENSION_SLOTS[$extension];
+        }
+        // `r` plus two or three digits, or three digits after `.7z`, is an archive volume.
+        if (preg_match('/\A(r\d\d\d?|\d\d\d)\z/', $extension) === 1
+            && ($extension[0] === 'r' || ($dot >= 3 && strtolower(substr($filename, $dot - 3, 3)) === '.7z'))) {
+            return 0;
+        }
+
+        return 4;
+    }
+
+    /**
+     * @param  array{int, int, int, int, int}  $counts  archive, PAR2, text, media, other
+     * @return array{members: int, archive: int, par2: int, text: int, media: int, other: int}
+     */
+    private static function archiveMediaSummary(int $members, array $counts): array
+    {
+        return ['members' => $members, 'archive' => $counts[0], 'par2' => $counts[1], 'text' => $counts[2], 'media' => $counts[3], 'other' => $counts[4]];
     }
 
     /**

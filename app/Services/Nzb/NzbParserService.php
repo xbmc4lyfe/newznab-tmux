@@ -29,6 +29,135 @@ class NzbParserService
     private static FFI|false|null $nfoFfi = null;
 
     /**
+     * Default for the Wave 40.2 toggle only; it stays false because the paired benchmark in
+     * tests/Unit/RustNzbServiceParserManifestWriteContentsW40ParityTest.php is below 1.5x.
+     */
+    public const bool W402_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useW402RustFfi = null;
+
+    public static function useW402RustFfi(?bool $use): void
+    {
+        self::$useW402RustFfi = $use;
+    }
+
+    public static function usesW402RustFfi(): bool
+    {
+        return self::$useW402RustFfi ?? self::W402_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW402RustFfi(): void
+    {
+        self::$useW402RustFfi = null;
+    }
+
+    /**
+     * Summarize parsed NZB files whose `segments` hold `number`/`bytes` entries; a non-array file or segment list counts as
+     * no segments. A file with more than max(0, $maxSegmentsPerFile) segments is oversized; otherwise it is complete when its
+     * integer numbers are exactly 1..n in any order (n >= 1) and gapped when not. Integer segment bytes from every file sum,
+     * negatives as zero, saturating at PHP_INT_MAX.
+     *
+     * @param  array<array-key, mixed>  $files
+     * @return array{files: int, complete: int, gapped: int, oversized: int, total_segment_bytes: int}
+     */
+    public static function summarizeParsedFileSegments(array $files, int $maxSegmentsPerFile = 10000): array
+    {
+        return (self::usesW402RustFfi() ? self::summarizeParsedFileSegmentsNative($files, $maxSegmentsPerFile) : null)
+            ?? self::summarizeParsedFileSegmentsPhp($files, $maxSegmentsPerFile);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $files
+     * @return array{files: int, complete: int, gapped: int, oversized: int, total_segment_bytes: int}
+     */
+    private static function summarizeParsedFileSegmentsPhp(array $files, int $maxSegmentsPerFile): array
+    {
+        $limit = max(0, $maxSegmentsPerFile);
+        $counts = [0, 0, 0];
+        $total = 0;
+        foreach ($files as $file) {
+            $segments = self::parsedFileSegments($file);
+            $count = \count($segments);
+            $seen = [];
+            $ordered = $count > 0;
+            foreach ($segments as $segment) {
+                [$number, $bytes] = self::parsedSegmentFields($segment);
+                $bytes = max(0, $bytes);
+                $total = $total > PHP_INT_MAX - $bytes ? PHP_INT_MAX : $total + $bytes;
+                if ($ordered && ($number < 1 || $number > $count || isset($seen[$number]))) {
+                    $ordered = false;
+                }
+                $seen[$number] = true;
+            }
+            $counts[$count > $limit ? 2 : ($ordered ? 0 : 1)]++;
+        }
+
+        return self::parsedFileSegmentsSummary(\count($files), $counts, $total);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $files
+     * @return array{files: int, complete: int, gapped: int, oversized: int, total_segment_bytes: int}|null
+     */
+    private static function summarizeParsedFileSegmentsNative(array $files, int $maxSegmentsPerFile): ?array
+    {
+        $size = 2 + \count($files);
+        foreach ($files as $file) {
+            $size += 2 * \count(self::parsedFileSegments($file));
+        }
+        if ($size > NzbService::W402_MAX_INPUT / 8) {
+            return null;
+        }
+        $words = [$maxSegmentsPerFile, \count($files)];
+        foreach ($files as $file) {
+            $segments = self::parsedFileSegments($file);
+            $words[] = \count($segments);
+            foreach ($segments as $segment) {
+                [$words[], $words[]] = self::parsedSegmentFields($segment);
+            }
+        }
+        $slots = NzbService::evaluateW402Native(1, pack('q*', ...$words), 5);
+        if ($slots === null) {
+            return null;
+        }
+        [$count, $complete, $gapped, $oversized, $total] = $slots;
+        if ($count !== \count($files) || min($complete, $gapped, $oversized, $total) < 0 || $complete + $gapped + $oversized !== $count) {
+            return null;
+        }
+
+        return self::parsedFileSegmentsSummary($count, [$complete, $gapped, $oversized], $total);
+    }
+
+    /** @return array<array-key, mixed> */
+    private static function parsedFileSegments(mixed $file): array
+    {
+        $segments = \is_array($file) ? ($file['segments'] ?? null) : null;
+
+        return \is_array($segments) ? $segments : [];
+    }
+
+    /** @return array{int, int} the segment number and bytes, each 0 unless an integer */
+    private static function parsedSegmentFields(mixed $segment): array
+    {
+        if (! \is_array($segment)) {
+            return [0, 0];
+        }
+        $number = $segment['number'] ?? 0;
+        $bytes = $segment['bytes'] ?? 0;
+
+        return [\is_int($number) ? $number : 0, \is_int($bytes) ? $bytes : 0];
+    }
+
+    /**
+     * @param  array{int, int, int}  $counts  complete, gapped, oversized
+     * @return array{files: int, complete: int, gapped: int, oversized: int, total_segment_bytes: int}
+     */
+    private static function parsedFileSegmentsSummary(int $files, array $counts, int $total): array
+    {
+        return ['files' => $files, 'complete' => $counts[0], 'gapped' => $counts[1], 'oversized' => $counts[2], 'total_segment_bytes' => $total];
+    }
+
+    /**
      * Retrieve various information on an NZB file (the subject, # of pars,
      * file extensions, file sizes, file completion, group names, # of parts).
      *
