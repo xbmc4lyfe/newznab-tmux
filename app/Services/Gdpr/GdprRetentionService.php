@@ -8,6 +8,7 @@ use App\Models\GdprRequest;
 use App\Support\RustPipelineLibrary;
 use DateTimeInterface;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Storage;
 use Throwable;
@@ -294,5 +295,144 @@ CDEF;
         self::$ffi = $ffi ?? false;
 
         return $ffi;
+    }
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W49 parity test). */
+    private const W49_RUST_FFI_DEFAULT = true;
+
+    private const string W49_FFI_CDEF = 'ssize_t nntmux_w49_gdpr_retention_purge_batch(const char *disks, size_t disks_len, const char *paths, size_t paths_len, const char *expires, size_t expires_len, const char *null_expires, size_t null_len, size_t count, int64_t now, int64_t *out, size_t out_cap);';
+
+    private static ?bool $useW49RustFfi = null;
+
+    private static FFI|false|null $w49Ffi = null;
+
+    private static ?CData $w49Out = null;
+
+    private static int $w49OutCap = 0;
+
+    public static function usesW49RustFfi(): bool
+    {
+        return self::$useW49RustFfi ?? self::W49_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 49 batch routed to Rust or PHP, then restores the routing. */
+    public static function withW49RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$useW49RustFfi;
+        self::$useW49RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$useW49RustFfi = $previous;
+        }
+    }
+
+    /** Paths formatExportPath() produces; group 1 is the user id. */
+    public const string W49_EXPORT_PATH = '#^gdpr/exports/user-([1-9][0-9]{0,17})-[0-9]{14}-[A-Za-z0-9]{12}\.json$#D';
+
+    /**
+     * Batch purge evaluation for export requests, mirroring resolveExportPurgeTargetPhp() and
+     * checking each path against W49_EXPORT_PATH. Two words per request: `shouldPurge |
+     * diskDefaulted << 1 | diskIsLocal << 2 | hasPath << 3 | hasExpiry << 4 | canonicalPath << 5
+     * | safePurge << 6 | dotDotSegment << 7 | pathLength << 8 | diskLength << 24`, then the
+     * user id from a canonical path or -1. Lengths saturate at 0xFFFF and 255.
+     *
+     * @param  list<?string>  $disks
+     * @param  list<?string>  $paths
+     * @param  list<?int>  $expiresAt  Expiry epochs, parallel to $paths.
+     * @return list<int>
+     */
+    public static function evaluatePurgeBatch(array $disks, array $paths, array $expiresAt, int $nowEpoch): array
+    {
+        return self::usesW49RustFfi()
+            ? self::evaluatePurgeBatchNative($disks, $paths, $expiresAt, $nowEpoch)
+            : self::evaluatePurgeBatchPhp($disks, $paths, $expiresAt, $nowEpoch);
+    }
+
+    /**
+     * @param  list<?string>  $disks
+     * @param  list<?string>  $paths
+     * @param  list<?int>  $expiresAt
+     * @return list<int>
+     */
+    public static function evaluatePurgeBatchPhp(array $disks, array $paths, array $expiresAt, int $nowEpoch): array
+    {
+        $out = [];
+        foreach ($paths as $i => $path) {
+            $disk = $disks[$i] ?? null;
+            $expires = $expiresAt[$i] ?? null;
+            $path ??= '';
+            $defaulted = $disk === null || $disk === '' || $disk === '0';
+            $resolved = $defaulted ? 'local' : $disk;
+            $purge = $path !== '' && $expires !== null && $expires < $nowEpoch;
+            $canonical = preg_match(self::W49_EXPORT_PATH, $path, $match) === 1;
+            $out[] = (int) $purge | (int) $defaulted << 1 | (int) ($resolved === 'local') << 2 | (int) ($path !== '') << 3
+                | (int) ($expires !== null) << 4 | (int) $canonical << 5 | (int) ($purge && $canonical) << 6
+                | (int) str_contains('/'.$path.'/', '/../') << 7 | min(0xFFFF, \strlen($path)) << 8 | min(255, \strlen($resolved)) << 24;
+            $out[] = $canonical ? (int) $match[1] : -1;
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, the lists differ in length or
+     * a disk or path holds a NUL byte.
+     *
+     * @param  list<?string>  $disks
+     * @param  list<?string>  $paths
+     * @param  list<?int>  $expiresAt
+     * @return list<int>
+     */
+    public static function evaluatePurgeBatchNative(array $disks, array $paths, array $expiresAt, int $nowEpoch): array
+    {
+        $count = \count($paths);
+        $ffi = $count === 0 ? null : self::w49Ffi();
+        $packedDisks = implode("\0", $disks);
+        $packedPaths = implode("\0", $paths);
+        if ($ffi === null || \count($disks) !== $count || \count($expiresAt) !== $count) {
+            return self::evaluatePurgeBatchPhp($disks, $paths, $expiresAt, $nowEpoch);
+        }
+        $epochs = pack('P*', ...$expiresAt);
+        $nulls = pack('V*', ...array_keys($expiresAt, null, true));
+        try {
+            $words = self::w49Words($ffi, $count * 2, static fn (CData $out, int $cap): mixed => $ffi->nntmux_w49_gdpr_retention_purge_batch( // @phpstan-ignore method.notFound
+                $packedDisks, \strlen($packedDisks), $packedPaths, \strlen($packedPaths), $epochs, \strlen($epochs),
+                $nulls, \strlen($nulls), $count, $nowEpoch, $out, $cap));
+        } catch (Throwable) {
+            $words = null;
+        }
+
+        return $words ?? self::evaluatePurgeBatchPhp($disks, $paths, $expiresAt, $nowEpoch);
+    }
+
+    private static function w49Ffi(): ?FFI
+    {
+        self::$w49Ffi ??= RustPipelineLibrary::resolveDomain('gdpr_w49', self::W49_FFI_CDEF) ?? false;
+
+        return self::$w49Ffi === false ? null : self::$w49Ffi;
+    }
+
+    /**
+     * Copies `$words` output words out of a reusable `int64_t` buffer after `$call` filled it.
+     *
+     * @param  callable(CData, int): mixed  $call  Receives the buffer and its capacity in words.
+     * @return list<int>|null
+     */
+    private static function w49Words(FFI $ffi, int $words, callable $call): ?array
+    {
+        $buffer = self::$w49Out;
+        if ($buffer === null || self::$w49OutCap < $words) {
+            $cap = max(512, $words * 2);
+            $buffer = self::$w49Out = $ffi->new("int64_t[{$cap}]");
+            self::$w49OutCap = $cap;
+        }
+        if ($call($buffer, self::$w49OutCap) !== $words) {
+            return null;
+        }
+        $decoded = unpack('P*', FFI::string($buffer, $words * 8));
+
+        /** @var list<int>|null */
+        return \is_array($decoded) ? array_values($decoded) : null;
     }
 }

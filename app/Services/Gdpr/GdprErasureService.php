@@ -626,4 +626,139 @@ class GdprErasureService
 
         return true;
     }
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W49 parity test). */
+    private const W49_RUST_FFI_DEFAULT = true;
+
+    private const string W49_FFI_CDEF = 'ssize_t nntmux_w49_gdpr_erasure_metadata_plan_batch(const char *metadata, size_t metadata_len, size_t count, int64_t *out, size_t out_cap);';
+
+    private static ?bool $useW49RustFfi = null;
+
+    private static FFI|false|null $w49Ffi = null;
+
+    private static ?CData $w49Out = null;
+
+    private static int $w49OutCap = 0;
+
+    public static function usesW49RustFfi(): bool
+    {
+        return self::$useW49RustFfi ?? self::W49_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 49 batch routed to Rust or PHP, then restores the routing. */
+    public static function withW49RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$useW49RustFfi;
+        self::$useW49RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$useW49RustFfi = $previous;
+        }
+    }
+
+    /** Keys sanitizeMetadataPhp() unsets, as bits 1-3 of a plan word. */
+    public const array W49_REMOVED_KEYS = ['email', 'ip_address', 'host'];
+
+    /**
+     * Batch minimization plan for stored activity metadata, mirroring sanitizeMetadataPhp() on
+     * each JSON value. One word per value: `isArray | removedKeys << 1 | hadGdprMinimized << 4 |
+     * gdprMinimizedTrue << 5 | count << 8 | sanitizedCount << 24 | alreadyMinimized << 40 |
+     * jsonLength << 44`; counts saturate at 0xFFFF and the length at 0x7FFFF.
+     *
+     * @param  list<?string>  $metadata
+     * @return list<int>
+     */
+    public static function planMetadataMinimization(array $metadata): array
+    {
+        return self::usesW49RustFfi()
+            ? self::planMetadataMinimizationNative($metadata)
+            : self::planMetadataMinimizationPhp($metadata);
+    }
+
+    /**
+     * @param  list<?string>  $metadata
+     * @return list<int>
+     */
+    public static function planMetadataMinimizationPhp(array $metadata): array
+    {
+        $out = [];
+        foreach ($metadata as $json) {
+            $json ??= '';
+            $decoded = json_decode($json, true);
+            $isArray = \is_array($decoded);
+            if (! $isArray) {
+                $decoded = [];
+            }
+            $mask = $removed = 0;
+            foreach (self::W49_REMOVED_KEYS as $bit => $key) {
+                if (\array_key_exists($key, $decoded)) {
+                    $mask |= 1 << $bit;
+                    $removed++;
+                }
+            }
+            $flagged = \array_key_exists('gdpr_minimized', $decoded);
+            $flaggedTrue = $flagged && $decoded['gdpr_minimized'] === true;
+            $count = \count($decoded);
+            $out[] = (int) $isArray | $mask << 1 | (int) $flagged << 4 | (int) $flaggedTrue << 5
+                | min(0xFFFF, $count) << 8 | min(0xFFFF, $count - $removed + (int) ! $flagged) << 24
+                | (int) ($removed === 0 && $flaggedTrue) << 40 | min(0x7FFFF, \strlen($json)) << 44;
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or a value holds a NUL byte.
+     *
+     * @param  list<?string>  $metadata
+     * @return list<int>
+     */
+    public static function planMetadataMinimizationNative(array $metadata): array
+    {
+        $count = \count($metadata);
+        $ffi = $count === 0 ? null : self::w49Ffi();
+        $packed = implode("\0", $metadata);
+        if ($ffi === null) {
+            return self::planMetadataMinimizationPhp($metadata);
+        }
+        try {
+            $words = self::w49Words($ffi, $count, static fn (CData $out, int $cap): mixed => $ffi->nntmux_w49_gdpr_erasure_metadata_plan_batch( // @phpstan-ignore method.notFound
+                $packed, \strlen($packed), $count, $out, $cap));
+        } catch (Throwable) {
+            $words = null;
+        }
+
+        return $words ?? self::planMetadataMinimizationPhp($metadata);
+    }
+
+    private static function w49Ffi(): ?FFI
+    {
+        self::$w49Ffi ??= RustPipelineLibrary::resolveDomain('gdpr_w49', self::W49_FFI_CDEF) ?? false;
+
+        return self::$w49Ffi === false ? null : self::$w49Ffi;
+    }
+
+    /**
+     * Copies `$words` output words out of a reusable `int64_t` buffer after `$call` filled it.
+     *
+     * @param  callable(CData, int): mixed  $call  Receives the buffer and its capacity in words.
+     * @return list<int>|null
+     */
+    private static function w49Words(FFI $ffi, int $words, callable $call): ?array
+    {
+        $buffer = self::$w49Out;
+        if ($buffer === null || self::$w49OutCap < $words) {
+            $cap = max(512, $words * 2);
+            $buffer = self::$w49Out = $ffi->new("int64_t[{$cap}]");
+            self::$w49OutCap = $cap;
+        }
+        if ($call($buffer, self::$w49OutCap) !== $words) {
+            return null;
+        }
+        $decoded = unpack('P*', FFI::string($buffer, $words * 8));
+
+        /** @var list<int>|null */
+        return \is_array($decoded) ? array_values($decoded) : null;
+    }
 }

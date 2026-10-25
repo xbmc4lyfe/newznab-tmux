@@ -10,6 +10,7 @@ use App\Models\User;
 use App\Models\UserActivity;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
@@ -389,5 +390,140 @@ class GdprExportService
         }
 
         return $data;
+    }
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W49 parity test). */
+    private const W49_RUST_FFI_DEFAULT = true;
+
+    private const string W49_FFI_CDEF = 'ssize_t nntmux_w49_gdpr_export_redaction_plan_batch(const char *rows, size_t rows_len, size_t count, const char *columns, size_t columns_len, size_t column_count, int64_t *out, size_t out_cap);';
+
+    private static ?bool $useW49RustFfi = null;
+
+    private static FFI|false|null $w49Ffi = null;
+
+    private static ?CData $w49Out = null;
+
+    private static int $w49OutCap = 0;
+
+    public static function usesW49RustFfi(): bool
+    {
+        return self::$useW49RustFfi ?? self::W49_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 49 batch routed to Rust or PHP, then restores the routing. */
+    public static function withW49RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$useW49RustFfi;
+        self::$useW49RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$useW49RustFfi = $previous;
+        }
+    }
+
+    /**
+     * Batch redaction plan for JSON-encoded export rows, mirroring redactRowDataPhp() on each
+     * `json_decode($row, true)` (a non-array row counts as `[]`). One word per row: `isArray |
+     * count << 1 | matchedColumns << 17 | columnMask << 24`, where bit i of the mask marks
+     * `array_key_exists($redactedColumns[i], $row)` for the first 32 columns and the match count
+     * (saturating at 127) covers every column; the row count saturates at 0xFFFF.
+     *
+     * @param  list<string>  $rows
+     * @param  list<string>  $redactedColumns
+     * @return list<int>
+     */
+    public static function planRowRedactions(array $rows, array $redactedColumns): array
+    {
+        return self::usesW49RustFfi()
+            ? self::planRowRedactionsNative($rows, $redactedColumns)
+            : self::planRowRedactionsPhp($rows, $redactedColumns);
+    }
+
+    /**
+     * @param  list<string>  $rows
+     * @param  list<string>  $redactedColumns
+     * @return list<int>
+     */
+    public static function planRowRedactionsPhp(array $rows, array $redactedColumns): array
+    {
+        $out = [];
+        foreach ($rows as $row) {
+            $data = json_decode($row, true);
+            $isArray = \is_array($data);
+            if (! $isArray) {
+                $data = [];
+            }
+            $mask = $matched = 0;
+            foreach ($redactedColumns as $index => $column) {
+                if (\array_key_exists($column, $data)) {
+                    $matched++;
+                    if ($index < 32) {
+                        $mask |= 1 << $index;
+                    }
+                }
+            }
+            $out[] = (int) $isArray | min(0xFFFF, \count($data)) << 1 | min(127, $matched) << 17 | $mask << 24;
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or a row or column holds a NUL
+     * byte.
+     *
+     * @param  list<string>  $rows
+     * @param  list<string>  $redactedColumns
+     * @return list<int>
+     */
+    public static function planRowRedactionsNative(array $rows, array $redactedColumns): array
+    {
+        $count = \count($rows);
+        $columnCount = \count($redactedColumns);
+        $ffi = $count === 0 ? null : self::w49Ffi();
+        $packedRows = implode("\0", $rows);
+        $packedColumns = implode("\0", $redactedColumns);
+        if ($ffi === null) {
+            return self::planRowRedactionsPhp($rows, $redactedColumns);
+        }
+        try {
+            $words = self::w49Words($ffi, $count, static fn (CData $out, int $cap): mixed => $ffi->nntmux_w49_gdpr_export_redaction_plan_batch( // @phpstan-ignore method.notFound
+                $packedRows, \strlen($packedRows), $count, $packedColumns, \strlen($packedColumns), $columnCount, $out, $cap));
+        } catch (Throwable) {
+            $words = null;
+        }
+
+        return $words ?? self::planRowRedactionsPhp($rows, $redactedColumns);
+    }
+
+    private static function w49Ffi(): ?FFI
+    {
+        self::$w49Ffi ??= RustPipelineLibrary::resolveDomain('gdpr_w49', self::W49_FFI_CDEF) ?? false;
+
+        return self::$w49Ffi === false ? null : self::$w49Ffi;
+    }
+
+    /**
+     * Copies `$words` output words out of a reusable `int64_t` buffer after `$call` filled it.
+     *
+     * @param  callable(CData, int): mixed  $call  Receives the buffer and its capacity in words.
+     * @return list<int>|null
+     */
+    private static function w49Words(FFI $ffi, int $words, callable $call): ?array
+    {
+        $buffer = self::$w49Out;
+        if ($buffer === null || self::$w49OutCap < $words) {
+            $cap = max(512, $words * 2);
+            $buffer = self::$w49Out = $ffi->new("int64_t[{$cap}]");
+            self::$w49OutCap = $cap;
+        }
+        if ($call($buffer, self::$w49OutCap) !== $words) {
+            return null;
+        }
+        $decoded = unpack('P*', FFI::string($buffer, $words * 8));
+
+        /** @var list<int>|null */
+        return \is_array($decoded) ? array_values($decoded) : null;
     }
 }

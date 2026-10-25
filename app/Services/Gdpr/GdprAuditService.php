@@ -9,6 +9,7 @@ use App\Models\GdprRequest;
 use App\Models\User;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 class GdprAuditService
@@ -235,5 +236,161 @@ CDEF;
         self::$ffi = $ffi ?? false;
 
         return $ffi;
+    }
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W49 parity test). */
+    private const W49_RUST_FFI_DEFAULT = true;
+
+    private const string W49_FFI_CDEF = 'ssize_t nntmux_w49_gdpr_audit_summarize_batch(const char *events, size_t events_len, const char *metadata, size_t metadata_len, size_t count, int64_t *out, size_t out_cap);';
+
+    private static ?bool $useW49RustFfi = null;
+
+    private static FFI|false|null $w49Ffi = null;
+
+    private static ?CData $w49Out = null;
+
+    private static int $w49OutCap = 0;
+
+    public static function usesW49RustFfi(): bool
+    {
+        return self::$useW49RustFfi ?? self::W49_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 49 batch routed to Rust or PHP, then restores the routing. */
+    public static function withW49RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$useW49RustFfi;
+        self::$useW49RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$useW49RustFfi = $previous;
+        }
+    }
+
+    /** Known audit events => code (bits 0-3 of an audit word); any other event is 15. */
+    public const array W49_AUDIT_EVENTS = [
+        'request_submitted' => 0,
+        'request_rejected' => 1,
+        'export_generated' => 2,
+        'erasure_soft_delete' => 3,
+        'erasure_force_delete' => 4,
+    ];
+
+    /** Metadata keys whose presence sets bits 24-32 of an audit word. */
+    public const array W49_AUDIT_KEYS = ['subject', 'force_delete', 'retained_records', 'path', 'expires_at', 'gdpr_minimized', 'email', 'ip_address', 'host'];
+
+    /**
+     * Batch summary of stored audit rows. Two words per row: `eventCode | isArray << 4 |
+     * count << 8 | keyPresence << 24 | deletedUserSubject << 33 | forceDelete << 34 |
+     * eventLength << 40 | hasPii << 48`, then crc32 of a string `subject` or -1. Metadata is
+     * read as `json_decode($json, true)`; counts saturate at 0xFFFF and lengths at 255.
+     *
+     * @param  list<string>  $events
+     * @param  list<?string>  $metadata  JSON metadata column values, parallel to $events.
+     * @return list<int>
+     */
+    public static function summarizeAuditRows(array $events, array $metadata): array
+    {
+        return self::usesW49RustFfi()
+            ? self::summarizeAuditRowsNative($events, $metadata)
+            : self::summarizeAuditRowsPhp($events, $metadata);
+    }
+
+    /**
+     * @param  list<string>  $events
+     * @param  list<?string>  $metadata
+     * @return list<int>
+     */
+    public static function summarizeAuditRowsPhp(array $events, array $metadata): array
+    {
+        $out = [];
+        foreach ($events as $i => $event) {
+            $decoded = json_decode($metadata[$i] ?? '', true);
+            $word = (self::W49_AUDIT_EVENTS[$event] ?? 15) | min(255, \strlen($event)) << 40;
+            $subjectCrc = -1;
+            if (\is_array($decoded)) {
+                $word |= 16 | min(0xFFFF, \count($decoded)) << 8;
+                foreach (self::W49_AUDIT_KEYS as $bit => $key) {
+                    if (\array_key_exists($key, $decoded)) {
+                        $word |= 1 << (24 + $bit);
+                    }
+                }
+                $subject = $decoded['subject'] ?? null;
+                if (\is_string($subject)) {
+                    $subjectCrc = crc32($subject);
+                    if (str_starts_with($subject, 'deleted_user_')) {
+                        $word |= 1 << 33;
+                    }
+                }
+                if (($decoded['force_delete'] ?? null) === true) {
+                    $word |= 1 << 34;
+                }
+                if (($word >> 30 & 7) !== 0) {
+                    $word |= 1 << 48;
+                }
+            }
+            $out[] = $word;
+            $out[] = $subjectCrc;
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, the lists differ in length or
+     * a value holds a NUL byte.
+     *
+     * @param  list<string>  $events
+     * @param  list<?string>  $metadata
+     * @return list<int>
+     */
+    public static function summarizeAuditRowsNative(array $events, array $metadata): array
+    {
+        $count = \count($events);
+        $ffi = $count === 0 ? null : self::w49Ffi();
+        $packedEvents = implode("\0", $events);
+        $packedMetadata = implode("\0", $metadata);
+        if ($ffi === null || \count($metadata) !== $count) {
+            return self::summarizeAuditRowsPhp($events, $metadata);
+        }
+        try {
+            $words = self::w49Words($ffi, $count * 2, static fn (CData $out, int $cap): mixed => $ffi->nntmux_w49_gdpr_audit_summarize_batch( // @phpstan-ignore method.notFound
+                $packedEvents, \strlen($packedEvents), $packedMetadata, \strlen($packedMetadata), $count, $out, $cap));
+        } catch (Throwable) {
+            $words = null;
+        }
+
+        return $words ?? self::summarizeAuditRowsPhp($events, $metadata);
+    }
+
+    private static function w49Ffi(): ?FFI
+    {
+        self::$w49Ffi ??= RustPipelineLibrary::resolveDomain('gdpr_w49', self::W49_FFI_CDEF) ?? false;
+
+        return self::$w49Ffi === false ? null : self::$w49Ffi;
+    }
+
+    /**
+     * Copies `$words` output words out of a reusable `int64_t` buffer after `$call` filled it.
+     *
+     * @param  callable(CData, int): mixed  $call  Receives the buffer and its capacity in words.
+     * @return list<int>|null
+     */
+    private static function w49Words(FFI $ffi, int $words, callable $call): ?array
+    {
+        $buffer = self::$w49Out;
+        if ($buffer === null || self::$w49OutCap < $words) {
+            $cap = max(512, $words * 2);
+            $buffer = self::$w49Out = $ffi->new("int64_t[{$cap}]");
+            self::$w49OutCap = $cap;
+        }
+        if ($call($buffer, self::$w49OutCap) !== $words) {
+            return null;
+        }
+        $decoded = unpack('P*', FFI::string($buffer, $words * 8));
+
+        /** @var list<int>|null */
+        return \is_array($decoded) ? array_values($decoded) : null;
     }
 }
