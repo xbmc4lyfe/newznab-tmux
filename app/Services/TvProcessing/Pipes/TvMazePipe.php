@@ -8,6 +8,7 @@ use App\Services\TvProcessing\Providers\AbstractTvProvider;
 use App\Services\TvProcessing\Providers\TvMazeProvider;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 /**
@@ -42,6 +43,155 @@ class TvMazePipe extends AbstractApiProviderPipe
     private static FFI|false|null $ffi = null;
 
     protected int $priority = 30;
+
+    /** Wave 49.3 batch default (benchmark-gated; see tests/Unit/RustTvPipesTraktTvMazeTvdbAbstractBaseProviderW49ParityTest.php). */
+    private const W49_RUST_FFI_DEFAULT = true;
+
+    public const string W49_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w49_tv_tvmaze_episode_batch(const char *blob, size_t blob_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    private static ?bool $useW49RustFfi = null;
+
+    private static FFI|false|null $w49Ffi = null;
+
+    private static ?CData $w49Out = null;
+
+    private static int $w49OutCap = 0;
+
+    public static function usesW49RustFfi(): bool
+    {
+        return self::$useW49RustFfi ?? self::W49_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 49 Rust path forced on or off, then restores the previous setting. */
+    public static function withW49RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$useW49RustFfi;
+        self::$useW49RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$useW49RustFfi = $previous;
+        }
+    }
+
+    /**
+     * Five values per TVMaze episode: the series and episode (negatives read as 0), the airdate as
+     * `YYYYMMDD` (a trimmed, valid `YYYY-MM-DD` with a non-zero year, else 0), the kind (0 dropped:
+     * no episode number and no airdate; 1 new numbered episode; 2 new special keyed by airdate;
+     * 3 duplicate key) and the type (0 regular or empty, 1 significant_special,
+     * 2 insignificant_special, 3 other). Then the numbered, special, dropped and duplicate counts
+     * and the max series. Missing keys read as '' or 0.
+     *
+     * @param  list<array<string, mixed>>  $episodes  airdate, type, season, number
+     * @return list<int>
+     */
+    public static function w49EpisodeBatch(array $episodes): array
+    {
+        return self::usesW49RustFfi() ? self::w49EpisodeBatchNative($episodes) : self::w49EpisodeBatchPhp($episodes);
+    }
+
+    /**
+     * @param  list<array<string, mixed>>  $episodes
+     * @return list<int>
+     */
+    public static function w49EpisodeBatchNative(array $episodes): array
+    {
+        $strings = self::w48Columns($episodes, ['airdate' => '', 'type' => '']);
+        $ints = self::w48Columns($episodes, ['season' => 0, 'number' => 0]);
+        $count = \count($episodes);
+
+        return self::w49Invoke(
+            implode("\0", array_merge($strings['airdate'], $strings['type'])),
+            pack('q*', ...$ints['season'], ...$ints['number']),
+            $count,
+            $count * 5 + 5,
+        )
+            ?? self::w49EpisodeBatchPhp($episodes);
+    }
+
+    /**
+     * @param  list<array<string, mixed>>  $episodes
+     * @return list<int>
+     */
+    public static function w49EpisodeBatchPhp(array $episodes): array
+    {
+        $out = [];
+        $seen = [];
+        $numbered = 0;
+        $specials = 0;
+        $dropped = 0;
+        $duplicates = 0;
+        $maxSeries = 0;
+        foreach ($episodes as $item) {
+            $series = max(0, (int) ($item['season'] ?? 0));
+            $number = max(0, (int) ($item['number'] ?? 0));
+            $airdate = 0;
+            if (preg_match('/^(\d{4})-(\d{2})-(\d{2})$/D', trim((string) ($item['airdate'] ?? '')), $m) === 1
+                && (int) $m[1] > 0 && checkdate((int) $m[2], (int) $m[3], (int) $m[1])) {
+                $airdate = (int) $m[1] * 10000 + (int) $m[2] * 100 + (int) $m[3];
+            }
+            if ($number === 0 && $airdate === 0) {
+                $kind = 0;
+                $dropped++;
+            } else {
+                $key = $number > 0 ? $series.'x'.$number : '@'.$airdate;
+                if (isset($seen[$key])) {
+                    $kind = 3;
+                    $duplicates++;
+                } else {
+                    $seen[$key] = true;
+                    $kind = $number > 0 ? 1 : 2;
+                    $number > 0 ? $numbered++ : $specials++;
+                }
+            }
+            $type = match ((string) ($item['type'] ?? '')) {
+                'regular', '' => 0,
+                'significant_special' => 1,
+                'insignificant_special' => 2,
+                default => 3,
+            };
+            $maxSeries = max($maxSeries, $series);
+            array_push($out, $series, $number, $airdate, $kind, $type);
+        }
+        array_push($out, $numbered, $specials, $dropped, $duplicates, $maxSeries);
+
+        return $out;
+    }
+
+    /**
+     * Calls the Wave 49 export with NUL-joined row-major strings and packed `i64` integers. Null
+     * when the library is missing or the call declines (for example a string holding a NUL byte),
+     * so the caller falls back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w49Invoke(string $blob, string $ints, int $count, int $words): ?array
+    {
+        self::$w49Ffi ??= RustPipelineLibrary::resolveDomain('categorize_w49', self::W49_FFI_CDEF) ?? false;
+        $ffi = self::$w49Ffi;
+        if ($ffi === false) {
+            return null;
+        }
+        try {
+            if (self::$w49Out === null || self::$w49OutCap < $words) {
+                self::$w49OutCap = max(1024, $words * 2);
+                self::$w49Out = $ffi->new('int64_t['.self::$w49OutCap.']');
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w49_tv_tvmaze_episode_batch($blob, \strlen($blob), $ints, \strlen($ints), $count, self::$w49Out, self::$w49OutCap);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string(self::$w49Out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
 
     public static function setUseRustFfi(?bool $use = true): void
     {

@@ -75,6 +75,193 @@ abstract class AbstractTvProvider extends BaseVideoProvider
 
     private static int $scoreCap = 0;
 
+    /** Wave 49.3 batch default (benchmark-gated; see tests/Unit/RustTvPipesTraktTvMazeTvdbAbstractBaseProviderW49ParityTest.php). */
+    private const W49_RUST_FFI_DEFAULT = false;
+
+    public const string W49_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w49_tv_provider_show_fields_batch(const char *blob, size_t blob_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    private static ?bool $useW49RustFfi = null;
+
+    private static FFI|false|null $w49Ffi = null;
+
+    private static ?CData $w49Out = null;
+
+    private static int $w49OutCap = 0;
+
+    public static function usesW49RustFfi(): bool
+    {
+        return self::$useW49RustFfi ?? self::W49_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 49 Rust path forced on or off, then restores the previous setting. */
+    public static function withW49RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$useW49RustFfi;
+        self::$useW49RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$useW49RustFfi = $previous;
+        }
+    }
+
+    /**
+     * Four values per show payload, normalized as update() does: the imdb number (optional string;
+     * '' or '0' read as 0, `[tt]` plus 6-18 digits as the number, anything else -1), the country
+     * (trimmed; '' is 0, two letters the uppercase code with UK as GB packed as
+     * `ord(a) << 8 | ord(b)`, anything longer -1 for a countryCode() lookup), the positive site-id
+     * mask (1 tvdb, 2 trakt, 4 tvrage, 8 tvmaze, 16 tmdb) and the non-empty field mask (1 summary,
+     * 2 publisher, 4 localzone). Then the imdb count, the country-lookup count, the OR of the site
+     * masks and the count with all three fields. Missing keys read as '' or 0.
+     *
+     * @param  list<array<string, mixed>>  $shows  imdb, country, summary, publisher, localzone, tvdb, trakt, tvrage, tvmaze, tmdb
+     * @return list<int>
+     */
+    public static function w49ShowFieldsBatch(array $shows): array
+    {
+        return self::usesW49RustFfi() ? self::w49ShowFieldsBatchNative($shows) : self::w49ShowFieldsBatchPhp($shows);
+    }
+
+    /**
+     * @param  list<array<string, mixed>>  $shows
+     * @return list<int>
+     */
+    public static function w49ShowFieldsBatchNative(array $shows): array
+    {
+        $count = \count($shows);
+
+        return self::w49Invoke(
+            implode("\0", self::w49Columns($shows, ['imdb' => '', 'country' => '', 'summary' => '', 'publisher' => '', 'localzone' => ''])),
+            pack('q*', ...self::w49Columns($shows, ['tvdb' => 0, 'trakt' => 0, 'tvrage' => 0, 'tvmaze' => 0, 'tmdb' => 0])),
+            $count,
+            $count * 4 + 4,
+        )
+            ?? self::w49ShowFieldsBatchPhp($shows);
+    }
+
+    /**
+     * @param  list<array<string, mixed>>  $shows
+     * @return list<int>
+     */
+    public static function w49ShowFieldsBatchPhp(array $shows): array
+    {
+        $out = [];
+        $withImdb = 0;
+        $lookups = 0;
+        $sites = 0;
+        $complete = 0;
+        foreach ($shows as $show) {
+            $imdbRaw = self::w49Optional((string) ($show['imdb'] ?? ''));
+            $imdb = match (true) {
+                $imdbRaw === '' || $imdbRaw === '0' => 0,
+                preg_match('/^(?:tt)?(\d{6,18})$/iD', $imdbRaw, $m) === 1 => (int) $m[1],
+                default => -1,
+            };
+            $country = trim((string) ($show['country'] ?? ''));
+            if ($country === '') {
+                $code = 0;
+            } elseif (\strlen($country) === 2) {
+                $upper = strtoupper($country);
+                $upper = $upper === 'UK' ? 'GB' : $upper;
+                $code = ord($upper[0]) << 8 | ord($upper[1]);
+            } else {
+                $code = -1;
+            }
+            $siteMask = 0;
+            foreach (['tvdb', 'trakt', 'tvrage', 'tvmaze', 'tmdb'] as $bit => $column) {
+                if ((int) ($show[$column] ?? 0) > 0) {
+                    $siteMask |= 1 << $bit;
+                }
+            }
+            $fieldMask = (self::w49Optional((string) ($show['summary'] ?? '')) !== '' ? 1 : 0)
+                | (self::w49Optional((string) ($show['publisher'] ?? '')) !== '' ? 2 : 0)
+                | (self::w49Optional((string) ($show['localzone'] ?? '')) !== '' ? 4 : 0);
+            if ($imdb > 0) {
+                $withImdb++;
+            }
+            if ($code === -1) {
+                $lookups++;
+            }
+            $sites |= $siteMask;
+            if ($fieldMask === 7) {
+                $complete++;
+            }
+            array_push($out, $imdb, $code, $siteMask, $fieldMask);
+        }
+        array_push($out, $withImdb, $lookups, $sites, $complete);
+
+        return $out;
+    }
+
+    /**
+     * The columns keyed like $defaults, concatenated column after column; a column with a missing
+     * key fills its defaults item by item.
+     *
+     * @param  list<array<string, mixed>>  $items
+     * @param  array<string, int|string>  $defaults
+     * @return list<mixed>
+     */
+    private static function w49Columns(array $items, array $defaults): array
+    {
+        $count = \count($items);
+        $columns = [];
+        foreach ($defaults as $key => $default) {
+            $column = array_column($items, $key);
+            if (\count($column) !== $count) {
+                $column = [];
+                foreach ($items as $item) {
+                    $column[] = $item[$key] ?? $default;
+                }
+            }
+            $columns[] = $column;
+        }
+
+        return array_merge(...$columns);
+    }
+
+    /** normalizeOptionalString() for a string, without the instance. */
+    private static function w49Optional(string $value): string
+    {
+        $value = trim($value);
+
+        return $value === "''" ? '' : $value;
+    }
+
+    /**
+     * Calls the Wave 49 export with NUL-joined row-major strings and packed `i64` integers. Null
+     * when the library is missing or the call declines (for example a string holding a NUL byte),
+     * so the caller falls back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w49Invoke(string $blob, string $ints, int $count, int $words): ?array
+    {
+        self::$w49Ffi ??= RustPipelineLibrary::resolveDomain('categorize_w49', self::W49_FFI_CDEF) ?? false;
+        $ffi = self::$w49Ffi;
+        if ($ffi === false) {
+            return null;
+        }
+        try {
+            if (self::$w49Out === null || self::$w49OutCap < $words) {
+                self::$w49OutCap = max(1024, $words * 2);
+                self::$w49Out = $ffi->new('int64_t['.self::$w49OutCap.']');
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w49_tv_provider_show_fields_batch($blob, \strlen($blob), $ints, \strlen($ints), $count, self::$w49Out, self::$w49OutCap);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string(self::$w49Out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
     /**
      * @string Path to Save Images
      */
