@@ -29598,3 +29598,523 @@ pub unsafe extern "C" fn nntmux_w426_additional_file_manager_fallback_sync_seven
     }))
     .unwrap_or(-1)
 }
+// Wave 44.6: DTO normalization and media helpers. These entry points only inspect
+// caller-owned byte buffers; filesystem access remains in the PHP callers.
+const W44_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+fn w44_buffer_valid(ptr: *const u8, len: usize) -> bool {
+    len <= W44_MAX_BYTES
+        && (!ptr.is_null() || len == 0)
+        && (ptr as usize).checked_add(len).is_some()
+}
+
+unsafe fn w44_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+    if !w44_buffer_valid(ptr, len) {
+        return None;
+    }
+    Some(if len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(ptr, len) }
+    })
+}
+
+/// Lowercase the PHP-coerced hash bytes in length-framed PAR2 entries. Each record
+/// contains LE u32 name length, native-endian i64 size, LE u32 hash length, then
+/// the name and hash bytes. NUL and non-UTF8 bytes are retained. Returns byte
+/// length, -1 for malformed input, or a negative required capacity (at most -4).
+/// No output is written until the complete frame is validated.
+///
+/// # Safety
+/// Nonempty input/output buffers must be valid for their stated lengths and must
+/// not overlap. The count is the exact number of records in the input.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w44_par2_normalize_entries(
+    input: *const u8,
+    input_len: usize,
+    count: usize,
+    output: *mut u8,
+    output_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(data) = (unsafe { w44_slice(input, input_len) }) else {
+            return -1;
+        };
+        if !w44_buffer_valid(output, output_cap) || count > input_len / 16 {
+            return -1;
+        }
+        let mut offset = 0usize;
+        for _ in 0..count {
+            let Some(header) = data.get(offset..offset + 16) else {
+                return -1;
+            };
+            let name_len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
+            let size = i64::from_ne_bytes(header[4..12].try_into().unwrap());
+            let hash_len = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+            let Some(end) = offset
+                .checked_add(16)
+                .and_then(|v| v.checked_add(name_len))
+                .and_then(|v| v.checked_add(hash_len))
+            else {
+                return -1;
+            };
+            if size <= 0 || end > data.len() {
+                return -1;
+            }
+            offset = end;
+        }
+        if offset != input_len {
+            return -1;
+        }
+        if output_cap < input_len {
+            return -(input_len.max(4) as isize);
+        }
+        if input_len == 0 {
+            return 0;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(input, output, input_len);
+        }
+        let out = unsafe { slice::from_raw_parts_mut(output, input_len) };
+        offset = 0;
+        for _ in 0..count {
+            let name_len =
+                u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+            let hash_len =
+                u32::from_le_bytes(data[offset + 12..offset + 16].try_into().unwrap()) as usize;
+            offset += 16 + name_len;
+            out[offset..offset + hash_len].make_ascii_lowercase();
+            offset += hash_len;
+        }
+        input_len as isize
+    }))
+    .unwrap_or(-1)
+}
+
+/// # Safety
+/// Buffers must be valid for their stated lengths, with non-overlapping output.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w44_archive_candidate_file_name(
+    input: *const u8,
+    input_len: usize,
+    output: *mut u8,
+    output_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(subject) = (unsafe { w44_slice(input, input_len) }) else {
+            return -1;
+        };
+        if !w44_buffer_valid(output, output_cap) {
+            return -1;
+        }
+        let mut out = unsafe { OutCursor::new(output, output_cap) };
+        archive_candidate_file_name_into(subject, &mut out);
+        if out.pos <= output_cap {
+            out.pos as isize
+        } else {
+            -(out.pos.max(4) as isize)
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// # Safety
+/// Buffers must be valid for their stated lengths, with non-overlapping output.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w44_archive_candidate_volume_set_key(
+    input: *const u8,
+    input_len: usize,
+    output: *mut u8,
+    output_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Some(subject) = (unsafe { w44_slice(input, input_len) }) else {
+            return -1;
+        };
+        if !w44_buffer_valid(output, output_cap) {
+            return -1;
+        }
+        let name = archive_candidate_file_name_vec(subject);
+        let mut out = unsafe { OutCursor::new(output, output_cap) };
+        archive_candidate_volume_set_key_into(&name, &mut out);
+        if out.pos <= output_cap {
+            out.pos as isize
+        } else {
+            -(out.pos.max(4) as isize)
+        }
+    }))
+    .unwrap_or(-1)
+}
+
+/// # Safety
+/// The byte buffer must be valid for the stated length.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w44_image_is_complete_tail(
+    type_code: u32,
+    file_size: u64,
+    bytes: *const u8,
+    length: usize,
+) -> i32 {
+    if !w44_buffer_valid(bytes, length) {
+        return -1;
+    }
+    // The existing helper does bounded, allocation-free header/tail inspection.
+    unsafe { crate::media::nntmux_image_is_complete_tail(type_code, file_size, bytes, length) }
+}
+
+/// Uses the established rank protocol: NUL-separated names, native i64 sizes,
+/// and a supported video extension expression; returns LE u32 indexes.
+/// # Safety
+/// Buffers must be valid for their stated lengths, with non-overlapping output.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w44_media_source_rank_wanted_files_nul(
+    names: *const u8,
+    names_len: usize,
+    sizes: *const u8,
+    sizes_len: usize,
+    regex: *const u8,
+    regex_len: usize,
+    count: usize,
+    output: *mut u8,
+    capacity: usize,
+) -> isize {
+    if !w44_buffer_valid(names, names_len)
+        || !w44_buffer_valid(sizes, sizes_len)
+        || !w44_buffer_valid(regex, regex_len)
+        || !w44_buffer_valid(output, capacity)
+        || count > W44_MAX_BYTES / 8
+        || (count > 0 && (sizes.is_null() || regex.is_null()))
+    {
+        return -1;
+    }
+    unsafe {
+        nntmux_media_source_rank_wanted_files_nul(
+            names, names_len, sizes, sizes_len, regex, regex_len, count, output, capacity,
+        )
+    }
+}
+
+/// # Safety
+/// Buffers must be valid for their stated lengths, with non-overlapping output.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w44_par2_map_files(
+    sources: *const u8,
+    sources_len: usize,
+    files: *const u8,
+    files_len: usize,
+    verified: *const u8,
+    verified_len: usize,
+    part_size: i64,
+    output: *mut u8,
+    capacity: usize,
+) -> isize {
+    if !w44_buffer_valid(sources, sources_len)
+        || !w44_buffer_valid(files, files_len)
+        || !w44_buffer_valid(verified, verified_len)
+        || !w44_buffer_valid(output, capacity)
+    {
+        return -1;
+    }
+    unsafe {
+        nntmux_par2_map_files(
+            sources,
+            sources_len,
+            files,
+            files_len,
+            verified,
+            verified_len,
+            part_size,
+            output,
+            capacity,
+        )
+    }
+}
+
+/// # Safety
+/// Buffers must be valid for their stated lengths, with non-overlapping output.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w44_par2_candidate_indexes(
+    sources: *const u8,
+    sources_len: usize,
+    file_size: i64,
+    part_size: i64,
+    output: *mut u8,
+    capacity: usize,
+) -> isize {
+    if !w44_buffer_valid(sources, sources_len) || !w44_buffer_valid(output, capacity) {
+        return -1;
+    }
+    unsafe {
+        nntmux_par2_candidate_indexes(sources, sources_len, file_size, part_size, output, capacity)
+    }
+}
+
+#[cfg(test)]
+mod wave44_dto_media_tests {
+    use super::*;
+
+    fn record(name: &[u8], size: i64, hash: &[u8]) -> Vec<u8> {
+        let mut result = Vec::new();
+        result.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        result.extend_from_slice(&size.to_ne_bytes());
+        result.extend_from_slice(&(hash.len() as u32).to_le_bytes());
+        result.extend_from_slice(name);
+        result.extend_from_slice(hash);
+        result
+    }
+
+    #[test]
+    fn normalization_preserves_binary_names_and_only_lowercases_hashes() {
+        let input = [
+            record(b"\0Film\xff.mkv", i64::MAX, b"ABCD\0\xff"),
+            record(b"", 1, b""),
+        ]
+        .concat();
+        let expected = [
+            record(b"\0Film\xff.mkv", i64::MAX, b"abcd\0\xff"),
+            record(b"", 1, b""),
+        ]
+        .concat();
+        let mut output = vec![99; input.len()];
+        assert_eq!(
+            unsafe {
+                nntmux_w44_par2_normalize_entries(
+                    input.as_ptr(),
+                    input.len(),
+                    2,
+                    output.as_mut_ptr(),
+                    output.len(),
+                )
+            },
+            input.len() as isize
+        );
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn normalization_rejects_bad_frames_without_writing() {
+        let valid = record(b"file", 5, b"AB");
+        let mut out = [42; 128];
+        for (input, count) in [
+            (&valid[..valid.len() - 1], 1),
+            (&valid[..], 2),
+            (&valid[..], 0),
+            (&record(b"x", 0, b"")[..], 1),
+        ] {
+            assert_eq!(
+                unsafe {
+                    nntmux_w44_par2_normalize_entries(
+                        input.as_ptr(),
+                        input.len(),
+                        count,
+                        out.as_mut_ptr(),
+                        out.len(),
+                    )
+                },
+                -1
+            );
+            assert_eq!(out, [42; 128]);
+        }
+        assert_eq!(
+            unsafe {
+                nntmux_w44_par2_normalize_entries(
+                    valid.as_ptr(),
+                    valid.len(),
+                    1,
+                    out.as_mut_ptr(),
+                    1,
+                )
+            },
+            -(valid.len() as isize)
+        );
+        assert_eq!(out, [42; 128]);
+        assert_eq!(
+            unsafe {
+                nntmux_w44_par2_normalize_entries(
+                    std::ptr::null(),
+                    1,
+                    1,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_w44_par2_normalize_entries(std::ptr::null(), 0, 0, std::ptr::null_mut(), 0)
+            },
+            0
+        );
+    }
+
+    #[test]
+    fn archive_classification_handles_binary_and_short_output() {
+        let title = b"\"Movie\0.part01.RAR\" yEnc (1/9)";
+        let mut out = [0; 128];
+        let len = unsafe {
+            nntmux_w44_archive_candidate_volume_set_key(
+                title.as_ptr(),
+                title.len(),
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(&out[..len as usize], b"rar:movie\0");
+        assert!(
+            unsafe {
+                nntmux_w44_archive_candidate_file_name(
+                    title.as_ptr(),
+                    title.len(),
+                    out.as_mut_ptr(),
+                    1,
+                )
+            } < -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_w44_archive_candidate_file_name(
+                    std::ptr::null(),
+                    1,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            },
+            -1
+        );
+    }
+
+    #[test]
+    fn image_headers_reject_malformed_inputs() {
+        let jpeg = b"\xff\xd9\r\n\0";
+        assert_eq!(
+            unsafe { nntmux_w44_image_is_complete_tail(2, 16, jpeg.as_ptr(), jpeg.len()) },
+            1
+        );
+        assert_eq!(
+            unsafe { nntmux_w44_image_is_complete_tail(3, 15, b"IEND".as_ptr(), 4) },
+            0
+        );
+        assert_eq!(
+            unsafe { nntmux_w44_image_is_complete_tail(18, 32, b"RIFF\x18\0\0\0".as_ptr(), 8) },
+            1
+        );
+        assert_eq!(
+            unsafe { nntmux_w44_image_is_complete_tail(18, 32, b"RIFF".as_ptr(), 4) },
+            0
+        );
+        assert_eq!(
+            unsafe { nntmux_w44_image_is_complete_tail(1, 32, jpeg.as_ptr(), jpeg.len()) },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_w44_image_is_complete_tail(2, 32, std::ptr::null(), 1) },
+            -1
+        );
+    }
+
+    #[test]
+    fn mapping_and_ranking_validate_and_report_short_output() {
+        let sources: Vec<u8> = [7_i64, 100, 1]
+            .into_iter()
+            .flat_map(i64::to_ne_bytes)
+            .collect();
+        let file = 100_i64.to_ne_bytes();
+        let mut out = [0; 32];
+        assert_eq!(
+            unsafe {
+                nntmux_w44_par2_map_files(
+                    sources.as_ptr(),
+                    sources.len(),
+                    file.as_ptr(),
+                    file.len(),
+                    std::ptr::null(),
+                    0,
+                    100,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            },
+            8
+        );
+        assert_eq!(
+            &out[..8],
+            &[7_u32.to_ne_bytes(), 0_u32.to_ne_bytes()].concat()
+        );
+        assert!(
+            unsafe {
+                nntmux_w44_par2_candidate_indexes(
+                    sources.as_ptr(),
+                    sources.len(),
+                    100,
+                    100,
+                    out.as_mut_ptr(),
+                    1,
+                )
+            } < -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_w44_par2_candidate_indexes(
+                    sources.as_ptr(),
+                    23,
+                    100,
+                    100,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            },
+            -1
+        );
+        let names = b"Movie.mkv\0Cover.jpg";
+        let sizes = [100_i64.to_ne_bytes(), 50_i64.to_ne_bytes()].concat();
+        let regex = br"\.(mkv|mp4)";
+        assert_eq!(
+            unsafe {
+                nntmux_w44_media_source_rank_wanted_files_nul(
+                    names.as_ptr(),
+                    names.len(),
+                    sizes.as_ptr(),
+                    sizes.len(),
+                    regex.as_ptr(),
+                    regex.len(),
+                    2,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            },
+            8
+        );
+        assert!(
+            unsafe {
+                nntmux_w44_media_source_rank_wanted_files_nul(
+                    names.as_ptr(),
+                    names.len(),
+                    sizes.as_ptr(),
+                    sizes.len(),
+                    regex.as_ptr(),
+                    regex.len(),
+                    2,
+                    out.as_mut_ptr(),
+                    1,
+                )
+            } < -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_w44_media_source_rank_wanted_files_nul(
+                    names.as_ptr(),
+                    names.len(),
+                    sizes.as_ptr(),
+                    7,
+                    regex.as_ptr(),
+                    regex.len(),
+                    2,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            },
+            -1
+        );
+    }
+}

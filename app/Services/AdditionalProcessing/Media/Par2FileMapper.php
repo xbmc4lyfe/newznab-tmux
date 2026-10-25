@@ -9,6 +9,7 @@ use App\Services\AdditionalProcessing\DTO\Par2FileEntry;
 use App\Services\AdditionalProcessing\Enums\MappingConfidence;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use Throwable;
 
 /**
  * Matches the files of an NZB to the real names in its PAR2 index.
@@ -21,6 +22,37 @@ use FFI;
  */
 final readonly class Par2FileMapper
 {
+    public const bool W44_RUST_FFI_DEFAULT = false;
+
+    /** @return array{enabled: ?bool, libraries: array<string, FFI|null>} */
+    private static function &w44State(): array
+    {
+        static $state = ['enabled' => null, 'libraries' => []];
+
+        return $state;
+    }
+
+    public static function useRustFfi(?bool $enabled): void
+    {
+        self::w44State()['enabled'] = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::w44State()['enabled'] ?? self::W44_RUST_FFI_DEFAULT;
+    }
+
+    private function w44Ffi(): ?FFI
+    {
+        $state = &self::w44State();
+        $key = $this->libraryPath === null ? 'default' : 'path:'.$this->libraryPath;
+        if (! array_key_exists($key, $state['libraries'])) {
+            $state['libraries'][$key] = RustPipelineLibrary::resolveDomain('w44_par2_mapper', self::FFI_CDEF, $this->libraryPath);
+        }
+
+        return $state['libraries'][$key];
+    }
+
     /** Smallest real size, relative to the posted size, still taken as the same file. */
     private const float MIN_SIZE_RATIO = 0.90;
 
@@ -28,10 +60,8 @@ final readonly class Par2FileMapper
     private const float MAX_SIZE_RATIO = 1.001;
 
     private const string FFI_CDEF = <<<'C'
-        ssize_t nntmux_par2_map_files(const char *sources, size_t sources_len, const char *files, size_t files_len, const char *verified, size_t verified_len, int64_t article_part_size, char *out_buf, size_t out_cap);
-        ssize_t nntmux_par2_candidate_indexes(const char *sources, size_t sources_len, int64_t file_size, int64_t article_part_size, char *out_buf, size_t out_cap);
-        ssize_t nntmux_nzb_extract_message_ids_nul(const char *group, size_t group_len, const char *titles, size_t titles_len, const char *seg_flags, size_t seg_flags_len, size_t count, uint32_t config_flags, char *out_buf, size_t out_cap);
-        ssize_t nntmux_nzb_source_file_inventory(const char *xml, size_t xml_len, size_t expected_file_count, char *out_buf, size_t out_cap);
+        ssize_t nntmux_w44_par2_map_files(const char *sources, size_t sources_len, const char *files, size_t files_len, const char *verified, size_t verified_len, int64_t article_part_size, char *out_buf, size_t out_cap);
+        ssize_t nntmux_w44_par2_candidate_indexes(const char *sources, size_t sources_len, int64_t file_size, int64_t article_part_size, char *out_buf, size_t out_cap);
         C;
 
     public function __construct(
@@ -46,11 +76,31 @@ final readonly class Par2FileMapper
      */
     public function map(array $nzbContents, array $files, ?int $articlePartSize = null, array $verified = []): array
     {
-        $ffi = RustPipelineLibrary::resolveDomain('additional_nzb_par2', self::FFI_CDEF, $this->libraryPath);
+        return self::usesRustFfi()
+            ? $this->mapNative($nzbContents, $files, $articlePartSize, $verified)
+            : $this->mapPhp($nzbContents, $files, $articlePartSize, $verified);
+    }
+
+    /**
+     * @param  array<int|string, mixed>  $nzbContents
+     * @param  list<Par2FileEntry>  $files
+     * @param  array<int, Par2FileEntry>  $verified
+     * @return array<int, MappedNzbFile>
+     */
+    public function mapNative(array $nzbContents, array $files, ?int $articlePartSize = null, array $verified = [], bool &$supported = false): array
+    {
+        $supported = false;
+        $ffi = $this->w44Ffi();
         if ($ffi !== null) {
-            $rustMapped = $this->mapRust($ffi, $nzbContents, $files, $articlePartSize, $verified);
-            if ($rustMapped !== null) {
-                return $rustMapped;
+            try {
+                $mapped = $this->mapRust($ffi, $nzbContents, $files, $articlePartSize, $verified);
+                if ($mapped !== null) {
+                    $supported = true;
+
+                    return $mapped;
+                }
+            } catch (Throwable) {
+                // An unavailable or incompatible accelerator retains PHP behavior.
             }
         }
 
@@ -164,11 +214,29 @@ final readonly class Par2FileMapper
      */
     public function candidateIndexes(array $nzbContents, Par2FileEntry $file, ?int $articlePartSize = null): array
     {
-        $ffi = RustPipelineLibrary::resolveDomain('additional_nzb_par2', self::FFI_CDEF, $this->libraryPath);
+        return self::usesRustFfi()
+            ? $this->candidateIndexesNative($nzbContents, $file, $articlePartSize)
+            : $this->candidateIndexesPhp($nzbContents, $file, $articlePartSize);
+    }
+
+    /**
+     * @param  array<int|string, mixed>  $nzbContents
+     * @return list<int>
+     */
+    public function candidateIndexesNative(array $nzbContents, Par2FileEntry $file, ?int $articlePartSize = null, bool &$supported = false): array
+    {
+        $supported = false;
+        $ffi = $this->w44Ffi();
         if ($ffi !== null) {
-            $rustIndexes = $this->candidateIndexesRust($ffi, $nzbContents, $file, $articlePartSize);
-            if ($rustIndexes !== null) {
-                return $rustIndexes;
+            try {
+                $indexes = $this->candidateIndexesRust($ffi, $nzbContents, $file, $articlePartSize);
+                if ($indexes !== null) {
+                    $supported = true;
+
+                    return $indexes;
+                }
+            } catch (Throwable) {
+                // An unavailable or incompatible accelerator retains PHP behavior.
             }
         }
 
@@ -243,7 +311,7 @@ final readonly class Par2FileMapper
                 }
 
                 // @phpstan-ignore method.notFound
-                $written = $ffi->nntmux_par2_map_files(
+                $written = $ffi->nntmux_w44_par2_map_files(
                     $packedSources,
                     strlen($packedSources),
                     $packedFiles,
@@ -263,7 +331,7 @@ final readonly class Par2FileMapper
                         return null;
                     }
                     // @phpstan-ignore method.notFound
-                    $written = $ffi->nntmux_par2_map_files(
+                    $written = $ffi->nntmux_w44_par2_map_files(
                         $packedSources,
                         strlen($packedSources),
                         $packedFiles,
@@ -325,7 +393,7 @@ final readonly class Par2FileMapper
         }
 
         // @phpstan-ignore method.notFound
-        $written = $ffi->nntmux_par2_candidate_indexes(
+        $written = $ffi->nntmux_w44_par2_candidate_indexes(
             $packedSources,
             strlen($packedSources),
             $file->size,
@@ -342,7 +410,7 @@ final readonly class Par2FileMapper
                 return null;
             }
             // @phpstan-ignore method.notFound
-            $written = $ffi->nntmux_par2_candidate_indexes(
+            $written = $ffi->nntmux_w44_par2_candidate_indexes(
                 $packedSources,
                 strlen($packedSources),
                 $file->size,
