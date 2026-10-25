@@ -6,6 +6,7 @@ namespace App\Services\Backfill;
 
 use App\Models\UsenetGroup;
 use App\Services\Binaries\BinariesService;
+use App\Services\Binaries\HeaderStorageTransaction;
 use App\Services\Configuration\ProcessingRuntimeStateRepository;
 use App\Services\NNTP\NNTPService;
 use App\Services\Releases\Verification\CandidateRepository;
@@ -512,5 +513,105 @@ final class BackfillService
         $last = $previousFirst - 1;
 
         return [max($last - $buffer + 1, $target), $last];
+    }
+
+    /**
+     * PHP stays the default for summarizeBackfillChunkPlanBatch(): the paired benchmark in
+     * tests/Unit/RustBinariesTransactionMissedPartBackfillW42ParityTest.php does not clear 1.5x.
+     */
+    public const bool W421_RUST_FFI_DEFAULT = false;
+
+    private const array W421_CHUNK_KEYS = ['groups', 'invalid_rows', 'bad_bounds', 'exhausted', 'runnable', 'total_chunks', 'total_articles',
+        'max_chunks'];
+
+    private static ?bool $w421UseRustFfi = null;
+
+    private static FFI|false|null $w421Ffi = null;
+
+    /**
+     * Summarizes backfill chunk plans (`first_record`, `target`, `oldest`): a bound that is not a non-negative int (or
+     * 1-18 digit string) is bad; like validateTargetPost(), a target at or above the first record, or a first record
+     * at or below the oldest server article, is exhausted. A runnable group backfills `first_record - max(target,
+     * oldest)` articles in ceil(articles / max(1, `$buffer`)) backfillChunk() steps; the totals saturate at
+     * PHP_INT_MAX and the largest step count is reported. Non-array rows are invalid.
+     *
+     * @param  array<array-key, mixed>  $groups
+     * @return array<string, int>
+     */
+    public static function summarizeBackfillChunkPlanBatch(array $groups, int $buffer = self::DEFAULT_ARTICLE_COUNT): array
+    {
+        return (self::usesW421RustFfi() ? self::summarizeBackfillChunkPlanBatchNative($groups, $buffer) : null)
+            ?? self::summarizeBackfillChunkPlanBatchPhp($groups, $buffer);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $groups
+     * @return array<string, int>
+     */
+    public static function summarizeBackfillChunkPlanBatchPhp(array $groups, int $buffer = self::DEFAULT_ARTICLE_COUNT): array
+    {
+        $summary = array_fill_keys(self::W421_CHUNK_KEYS, 0);
+        $summary['groups'] = \count($groups);
+        $size = max(1, $buffer);
+        foreach ($groups as $group) {
+            if (! \is_array($group)) {
+                $summary['invalid_rows']++;
+
+                continue;
+            }
+            $first = BinariesService::w411Int($group['first_record'] ?? null);
+            $target = BinariesService::w411Int($group['target'] ?? null);
+            $oldest = BinariesService::w411Int($group['oldest'] ?? null);
+            if ($first === null || $target === null || $oldest === null || min($first, $target, $oldest) < 0) {
+                $summary['bad_bounds']++;
+            } elseif ($target >= $first || $first <= $oldest) {
+                $summary['exhausted']++;
+            } else {
+                $summary['runnable']++;
+                $articles = $first - max($target, $oldest);
+                $chunks = HeaderStorageTransaction::w421Chunks($articles, $size);
+                $summary['total_chunks'] = HeaderStorageTransaction::w421SaturatingAdd($summary['total_chunks'], $chunks);
+                $summary['total_articles'] = HeaderStorageTransaction::w421SaturatingAdd($summary['total_articles'], $articles);
+                $summary['max_chunks'] = max($summary['max_chunks'], $chunks);
+            }
+        }
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $groups
+     * @return array<string, int>|null
+     */
+    public static function summarizeBackfillChunkPlanBatchNative(array $groups, int $buffer = self::DEFAULT_ARTICLE_COUNT): ?array
+    {
+        $words = [$buffer, \count($groups)];
+        $blob = [];
+        foreach ($groups as $group) {
+            if (\is_array($group)) {
+                BinariesService::w411PackRow($words, $blob, [$group['first_record'] ?? null, $group['target'] ?? null, $group['oldest'] ?? null]);
+            } else {
+                $words[] = 0;
+            }
+        }
+        $values = HeaderStorageTransaction::w421Invoke(self::$w421Ffi, 5, $words, $blob);
+
+        return $values !== null && \count($values) === \count(self::W421_CHUNK_KEYS) ? array_combine(self::W421_CHUNK_KEYS, $values) : null;
+    }
+
+    public static function useW421RustFfi(bool $enable = true): void
+    {
+        self::$w421UseRustFfi = $enable;
+    }
+
+    public static function usesW421RustFfi(): bool
+    {
+        return self::$w421UseRustFfi ?? self::W421_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW421RustFfi(): void
+    {
+        self::$w421UseRustFfi = null;
+        self::$w421Ffi = null;
     }
 }

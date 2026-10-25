@@ -320,4 +320,179 @@ final class HeaderStorageTransaction
             DB::statement('DELETE FROM collections WHERE noise = ?', [$this->batchNoise]);
         }
     }
+
+    public const string W421_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w421_binaries_transaction_missed_part_backfill(uint32_t operation, uint32_t flags, const char *input, size_t input_len, char *out_buf, size_t out_cap);
+        C;
+
+    /**
+     * Rust is the default for summarizeCleanupPlanBatch(): the paired benchmark in
+     * tests/Unit/RustBinariesTransactionMissedPartBackfillW42ParityTest.php clears 1.5x on every workload.
+     */
+    public const bool W421_RUST_FFI_DEFAULT = true;
+
+    private const int W421_RUST_MAX_INPUT = 16_777_216;
+
+    private const array W421_CLEANUP_KEYS = ['batches', 'invalid_rows', 'bad_counts', 'inserted', 'all', 'hashes', 'noise', 'statements'];
+
+    private static ?bool $w421UseRustFfi = null;
+
+    private static FFI|false|null $w421Ffi = null;
+
+    /**
+     * Summarizes rollback cleanup plans (`binaries`, `inserted`, `all`, `hashes` id counts): a row with a count that
+     * is not a non-negative int (or 1-18 digit string) has bad counts; otherwise cleanupStrategyPhp() picks its
+     * strategy and the plan issues two DELETEs per `max(1, $maxRows)` binary ids plus three per chunk of the chosen
+     * collection ids (three for the noise marker), totalled with saturation at PHP_INT_MAX. Non-array rows are invalid.
+     *
+     * @param  array<array-key, mixed>  $batches
+     * @return array<string, int>
+     */
+    public static function summarizeCleanupPlanBatch(array $batches, int $maxRows = self::MAX_SQL_ROWS_PER_STATEMENT): array
+    {
+        return (self::usesW421RustFfi() ? self::summarizeCleanupPlanBatchNative($batches, $maxRows) : null)
+            ?? self::summarizeCleanupPlanBatchPhp($batches, $maxRows);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $batches
+     * @return array<string, int>
+     */
+    public static function summarizeCleanupPlanBatchPhp(array $batches, int $maxRows = self::MAX_SQL_ROWS_PER_STATEMENT): array
+    {
+        $summary = array_fill_keys(self::W421_CLEANUP_KEYS, 0);
+        $summary['batches'] = \count($batches);
+        $size = max(1, $maxRows);
+        foreach ($batches as $batch) {
+            if (! \is_array($batch)) {
+                $summary['invalid_rows']++;
+
+                continue;
+            }
+            $binaries = BinariesService::w411Int($batch['binaries'] ?? null);
+            $inserted = BinariesService::w411Int($batch['inserted'] ?? null);
+            $all = BinariesService::w411Int($batch['all'] ?? null);
+            $hashes = BinariesService::w411Int($batch['hashes'] ?? null);
+            if ($binaries === null || $inserted === null || $all === null || $hashes === null || min($binaries, $inserted, $all, $hashes) < 0) {
+                $summary['bad_counts']++;
+
+                continue;
+            }
+            $strategy = self::cleanupStrategyPhp($inserted, $all, $hashes);
+            $summary[$strategy]++;
+            $collections = match ($strategy) {
+                'inserted' => self::w421Chunks($inserted, $size),
+                'all' => self::w421Chunks($all, $size),
+                'hashes' => self::w421Chunks($hashes, $size),
+                default => 1,
+            };
+            $statements = self::w421SaturatingAdd($summary['statements'], self::w421SaturatingMul(self::w421Chunks($binaries, $size), 2));
+            $summary['statements'] = self::w421SaturatingAdd($statements, self::w421SaturatingMul($collections, 3));
+        }
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $batches
+     * @return array<string, int>|null
+     */
+    public static function summarizeCleanupPlanBatchNative(array $batches, int $maxRows = self::MAX_SQL_ROWS_PER_STATEMENT): ?array
+    {
+        $words = [$maxRows, \count($batches)];
+        $blob = [];
+        foreach ($batches as $batch) {
+            if (\is_array($batch)) {
+                BinariesService::w411PackRow($words, $blob, [$batch['binaries'] ?? null, $batch['inserted'] ?? null, $batch['all'] ?? null, $batch['hashes'] ?? null]);
+            } else {
+                $words[] = 0;
+            }
+        }
+        $values = self::w421Invoke(self::$w421Ffi, 1, $words, $blob);
+
+        return $values !== null && \count($values) === \count(self::W421_CLEANUP_KEYS) ? array_combine(self::W421_CLEANUP_KEYS, $values) : null;
+    }
+
+    public static function useW421RustFfi(bool $enable = true): void
+    {
+        self::$w421UseRustFfi = $enable;
+    }
+
+    public static function usesW421RustFfi(): bool
+    {
+        return self::$w421UseRustFfi ?? self::W421_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW421RustFfi(): void
+    {
+        self::$w421UseRustFfi = null;
+        self::$w421Ffi = null;
+    }
+
+    /** ceil($count / $size) for a non-negative count and a positive size. */
+    public static function w421Chunks(int $count, int $size): int
+    {
+        return intdiv($count, $size) + (int) ($count % $size !== 0);
+    }
+
+    /** Adds two non-negative ints, saturating at PHP_INT_MAX. */
+    public static function w421SaturatingAdd(int $total, int $value): int
+    {
+        return $value > PHP_INT_MAX - $total ? PHP_INT_MAX : $total + $value;
+    }
+
+    /** Multiplies a non-negative int by a positive factor, saturating at PHP_INT_MAX. */
+    private static function w421SaturatingMul(int $value, int $factor): int
+    {
+        return $value > intdiv(PHP_INT_MAX, $factor) ? PHP_INT_MAX : $value * $factor;
+    }
+
+    /**
+     * Calls the Wave 42.1 export with a Wave 41.1-style frame (see BinariesService::w411PackRow()), retrying once
+     * with a larger scratch buffer when it reports `-required`; `$ffi` is the caller's cached library handle.
+     * Returns the decoded ints or null to fall back.
+     *
+     * @param  list<int>  $words
+     * @param  list<string>  $blob
+     * @return list<int>|null
+     */
+    public static function w421Invoke(FFI|false|null &$ffi, int $operation, array $words, array $blob): ?array
+    {
+        $input = pack('q', \count($words)).pack('q*', ...$words).implode('', $blob);
+        if (\strlen($input) > self::W421_RUST_MAX_INPUT) {
+            return null;
+        }
+        try {
+            $ffi ??= RustPipelineLibrary::resolveDomain('cleaning_w421', self::W421_FFI_CDEF) ?? false;
+            if ($ffi === false) {
+                return null;
+            }
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, 1024, $capacity);
+            if ($buffer === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w421_binaries_transaction_missed_part_backfill($operation, 0, $input, \strlen($input), $buffer, $capacity);
+            if (\is_int($written) && $written < -1) {
+                if (-$written <= $capacity || -$written > self::W421_RUST_MAX_INPUT) {
+                    return null;
+                }
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w421_binaries_transaction_missed_part_backfill($operation, 0, $input, \strlen($input), $buffer, $capacity);
+            }
+            if (! \is_int($written) || $written <= 0 || $written > $capacity || $written % 8 !== 0) {
+                return null;
+            }
+            $values = unpack('q*', FFI::string($buffer, $written));
+
+            return $values === false ? null : array_values($values);
+        } catch (\Throwable) {
+            return null;
+        }
+    }
 }
