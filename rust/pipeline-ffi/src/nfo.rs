@@ -29249,3 +29249,637 @@ pub unsafe extern "C" fn nntmux_w422_nzb_source_guard_install_staging_xml_par2(
     }))
     .unwrap_or(-1)
 }
+
+mod wave43_nzb_par2_result_fingerprint_store_worker_queue {
+    use super::{nfo_abi_range, yenc_ranges_overlap};
+    use std::collections::HashSet;
+    use std::slice;
+
+    pub(super) const MAX_INPUT: usize = 16 * 1024 * 1024;
+
+    /// `RustArticleFingerprintWorker::add()` closes the worker for a longer Message-ID.
+    const MAX_MESSAGE_ID: i64 = 16 * 1024 * 1024;
+
+    /// The worker's write buffer; a full buffer is flushed before more frames are queued.
+    const WORKER_BUFFER: i64 = 65_536;
+
+    type Slot = [u8; 8];
+
+    fn word(chunk: &Slot) -> i64 {
+        i64::from_ne_bytes(*chunk)
+    }
+
+    type TextRow<'a, const TEXTS: usize> = [Option<&'a [u8]>; TEXTS];
+
+    /// `[lead, count]`, `count` rows of `WIDTH` slots whose first `TEXTS` slots are text lengths
+    /// (-1 marks a non-string), then the texts in row order. Declared lengths must cover the tail
+    /// exactly.
+    #[allow(clippy::type_complexity)]
+    fn text_table<const WIDTH: usize, const TEXTS: usize>(
+        bytes: &[u8],
+    ) -> Option<Vec<(TextRow<'_, TEXTS>, [i64; WIDTH])>> {
+        let (head, _) = bytes.get(..16)?.as_chunks::<8>();
+        if word(&head[0]) != 0 {
+            return None;
+        }
+        let count = usize::try_from(word(&head[1])).ok()?;
+        let table_end = count.checked_mul(WIDTH)?.checked_mul(8)?.checked_add(16)?;
+        let table = bytes.get(16..table_end)?;
+        let tail = &bytes[table_end..];
+        let mut offset = 0usize;
+        let mut out = Vec::with_capacity(count);
+        for row in table.as_chunks::<8>().0.as_chunks::<WIDTH>().0 {
+            let mut values = [0i64; WIDTH];
+            for (value, chunk) in values.iter_mut().zip(row) {
+                *value = word(chunk);
+            }
+            let mut texts = [None; TEXTS];
+            for (text, &length) in texts.iter_mut().zip(&values) {
+                if length != -1 {
+                    let end = offset.checked_add(usize::try_from(length).ok()?)?;
+                    *text = Some(tail.get(offset..end)?);
+                    offset = end;
+                }
+            }
+            out.push((texts, values));
+        }
+        (offset == tail.len()).then_some(out)
+    }
+
+    /// Op 0: `Par2CandidateRecoveryResult::summarizeRecoveryBatch` over rows of
+    /// `[outcome_len, probes, articles]` and the outcome values, applying
+    /// `summarizeRecoveryMetricsPhp()` to every row.
+    fn recovery_batch(bytes: &[u8]) -> Option<Vec<i64>> {
+        let rows = text_table::<3, 1>(bytes)?;
+        // invalid, unknown, renamed, no_match, retryable, deferred, terminal, retry
+        let mut counts = [0i64; 8];
+        let (mut probes_sum, mut articles_sum, mut reads_sum, mut max_ratio) =
+            (0i64, 0i64, 0i64, 0i64);
+        for ([outcome], [_, probes, articles]) in &rows {
+            let Some(outcome) = outcome else {
+                counts[0] += 1;
+                continue;
+            };
+            let slot = match *outcome {
+                b"renamed" => 2,
+                b"no_match" => 3,
+                b"retryable" => 4,
+                b"deferred" => 5,
+                _ => 1,
+            };
+            counts[slot] += 1;
+            counts[6] += matches!(slot, 2 | 3) as i64;
+            counts[7] += (slot == 4) as i64;
+            let (probes, articles) = ((*probes).max(0), (*articles).max(0));
+            probes_sum = probes_sum.saturating_add(probes);
+            articles_sum = articles_sum.saturating_add(articles);
+            reads_sum = reads_sum.saturating_add(probes.saturating_add(articles));
+            if probes > 0 {
+                max_ratio = max_ratio.max(articles / probes);
+            }
+        }
+        let mut out = Vec::with_capacity(13);
+        out.push(rows.len() as i64);
+        out.extend_from_slice(&counts);
+        out.extend_from_slice(&[probes_sum, articles_sum, reads_sum, max_ratio]);
+        Some(out)
+    }
+
+    /// Op 1: `ReleaseArticleFingerprintStore::summarizeFingerprintBatch` over rows of
+    /// `[length, kind]` (kind 0 string, 1 null, 2 any other type) and the strings.
+    fn fingerprint_batch(bytes: &[u8]) -> Option<Vec<i64>> {
+        let rows = text_table::<2, 1>(bytes)?;
+        // absent, invalid, stored, canonical, noncanonical_hex, empty, other
+        let mut counts = [0i64; 7];
+        let mut distinct: HashSet<&[u8]> = HashSet::with_capacity(rows.len());
+        let mut payload_bytes = 0i64;
+        for ([text], [_, kind]) in &rows {
+            let value = match (kind, text) {
+                (0, Some(value)) => *value,
+                (1, None) => {
+                    counts[0] += 1;
+                    continue;
+                }
+                (2, None) => {
+                    counts[1] += 1;
+                    continue;
+                }
+                _ => return None,
+            };
+            counts[2] += 1;
+            payload_bytes += value.len() as i64;
+            distinct.insert(value);
+            let slot = if value.is_empty() {
+                5
+            } else if value.len() == 40
+                && value
+                    .iter()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+            {
+                3
+            } else if value.len() == 40 && value.iter().all(u8::is_ascii_hexdigit) {
+                4
+            } else {
+                6
+            };
+            counts[slot] += 1;
+        }
+        let mut out = Vec::with_capacity(10);
+        out.push(rows.len() as i64);
+        out.extend_from_slice(&counts);
+        out.extend_from_slice(&[distinct.len() as i64, payload_bytes]);
+        Some(out)
+    }
+
+    /// Op 2: `RustArticleFingerprintWorker::summarizeAddFrames` over rows of `[length]` (-1 for a
+    /// non-string) with no text tail, replaying `add()` against a worker that starts open.
+    fn worker_frames(bytes: &[u8]) -> Option<Vec<i64>> {
+        let rows = text_table::<1, 0>(bytes)?;
+        let (mut invalid, mut framed, mut empty, mut oversized, mut dropped) =
+            (0i64, 0i64, 0i64, 0i64, 0i64);
+        let (mut open, mut unsupported, mut frame_bytes) = (true, 0i64, 0i64);
+        for (_, [length]) in &rows {
+            match *length {
+                -1 => invalid += 1,
+                length if length < -1 => return None,
+                length if length > MAX_MESSAGE_ID => {
+                    oversized += 1;
+                    if open {
+                        unsupported = 1;
+                    }
+                    open = false;
+                }
+                length if open => {
+                    framed += 1;
+                    empty += (length == 0) as i64;
+                    frame_bytes += 5 + length;
+                }
+                _ => dropped += 1,
+            }
+        }
+        Some(vec![
+            rows.len() as i64,
+            invalid,
+            framed,
+            empty,
+            oversized,
+            dropped,
+            unsupported,
+            frame_bytes,
+            frame_bytes / WORKER_BUFFER,
+        ])
+    }
+
+    /// PHP `trim()` with its default character list.
+    fn php_trim(text: &[u8]) -> &[u8] {
+        let keep = |b: &u8| !matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b);
+        let start = text.iter().position(keep).unwrap_or(text.len());
+        let end = text.iter().rposition(keep).map_or(start, |end| end + 1);
+        &text[start..end]
+    }
+
+    /// The first match of `/<[^>]+>/` (bytes, not UTF-8 aware).
+    fn first_angle_id(text: &[u8]) -> Option<&[u8]> {
+        let mut from = 0;
+        while let Some(open) = text[from..]
+            .iter()
+            .position(|&b| b == b'<')
+            .map(|i| from + i)
+        {
+            let close = open + 1 + text[open + 1..].iter().position(|&b| b == b'>')?;
+            if close > open + 1 {
+                return Some(&text[open..=close]);
+            }
+            from = open + 1;
+        }
+        None
+    }
+
+    /// Op 3: `CompactFingerprintCollector::summarizeIdentityStatuses` over rows of
+    /// `[requested_len, header_len, response_len]` and those texts, as `identityStatus()` judges them.
+    fn identity_statuses(bytes: &[u8]) -> Option<Vec<i64>> {
+        let rows = text_table::<3, 3>(bytes)?;
+        // invalid, confirmed, unconfirmed, header_mismatch, status_mismatch
+        let mut counts = [0i64; 5];
+        let mut want = Vec::new();
+        for ([requested, header, response], _) in &rows {
+            let Some(requested) = requested else {
+                if header.is_some() || response.is_some() {
+                    return None;
+                }
+                counts[0] += 1;
+                continue;
+            };
+            let start = requested
+                .iter()
+                .position(|&b| b != b'<' && b != b'>')
+                .unwrap_or(requested.len());
+            let end = requested
+                .iter()
+                .rposition(|&b| b != b'<' && b != b'>')
+                .map_or(start, |end| end + 1);
+            want.clear();
+            want.push(b'<');
+            want.extend_from_slice(&requested[start..end]);
+            want.push(b'>');
+            let slot = match header.map(php_trim) {
+                None | Some([]) => 2,
+                Some(header) if header != want.as_slice() => 3,
+                _ => match response.and_then(first_angle_id) {
+                    Some(id) if id != want.as_slice() => 4,
+                    _ => 1,
+                },
+            };
+            counts[slot] += 1;
+        }
+        let mut out = Vec::with_capacity(6);
+        out.push(rows.len() as i64);
+        out.extend_from_slice(&counts);
+        Some(out)
+    }
+
+    /// Op 4: `DatabaseFingerprintQueue::summarizeEnqueueDecisions` over rows of
+    /// `[job_digest_len, status_len, digest_len, flags]` (flags bit 0 force, bit 1 job present, or
+    /// exactly 4 for an invalid row with no texts) and those texts, as `shouldSkipPhp()` decides.
+    fn enqueue_decisions(bytes: &[u8]) -> Option<Vec<i64>> {
+        let rows = text_table::<4, 3>(bytes)?;
+        // invalid, missing_job, digest_changed, skipped, forced, skipped_while_forced
+        let mut counts = [0i64; 6];
+        for ([job_digest, status, digest], [_, _, _, flags]) in &rows {
+            if *flags == 4 {
+                if job_digest.is_some() || status.is_some() || digest.is_some() {
+                    return None;
+                }
+                counts[0] += 1;
+                continue;
+            }
+            if !(0..=3).contains(flags) {
+                return None;
+            }
+            let (force, has_job) = (flags & 1 == 1, flags & 2 == 2);
+            let Some(digest) = digest else {
+                return None;
+            };
+            match (has_job, job_digest, status) {
+                (false, None, None) => counts[1] += 1,
+                (true, Some(job_digest), Some(status)) => {
+                    if job_digest != digest {
+                        counts[2] += 1;
+                    } else if !force {
+                        counts[3] += 1;
+                    } else if matches!(*status, b"pending" | b"processing") {
+                        counts[3] += 1;
+                        counts[5] += 1;
+                    } else {
+                        counts[4] += 1;
+                    }
+                }
+                _ => return None,
+            }
+        }
+        let mut out = Vec::with_capacity(7);
+        out.push(rows.len() as i64);
+        out.extend_from_slice(&counts);
+        Some(out)
+    }
+
+    fn compute(operation: u32, flags: u32, bytes: &[u8]) -> Option<Vec<i64>> {
+        if flags != 0 {
+            return None;
+        }
+        match operation {
+            0 => recovery_batch(bytes),
+            1 => fingerprint_batch(bytes),
+            2 => worker_frames(bytes),
+            3 => identity_statuses(bytes),
+            4 => enqueue_decisions(bytes),
+            _ => None,
+        }
+    }
+
+    /// # Safety
+    /// See [`super::nntmux_w432_nzb_par2_result_fingerprint_store_worker_queue`].
+    pub(super) unsafe fn evaluate(
+        operation: u32,
+        flags: u32,
+        input: *const u8,
+        length: usize,
+        output: *mut u8,
+        capacity: usize,
+    ) -> i32 {
+        if !nfo_abi_range(input, length, false)
+            || !nfo_abi_range(output, capacity, false)
+            || length > MAX_INPUT
+            || capacity > isize::MAX as usize
+            || yenc_ranges_overlap(input as usize, length, output as usize, capacity)
+        {
+            return -1;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, length) };
+        let Some(result) = compute(operation, flags, bytes) else {
+            return -1;
+        };
+        // Every answer has at most 13 slots, so the byte count always fits an i32.
+        let needed = result.len() * 8;
+        if needed > capacity {
+            return -(needed as i32);
+        }
+        let out = unsafe { slice::from_raw_parts_mut(output, needed) };
+        for (chunk, value) in out.as_chunks_mut::<8>().0.iter_mut().zip(&result) {
+            chunk.copy_from_slice(&value.to_ne_bytes());
+        }
+        needed as i32
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// `[0, rows]`, the row slots, then the texts.
+        fn table(rows: usize, slots: &[i64], tail: &[&[u8]]) -> Vec<u8> {
+            let mut v: Vec<u8> = [0, rows as i64]
+                .iter()
+                .chain(slots)
+                .flat_map(|s| s.to_ne_bytes())
+                .collect();
+            for t in tail {
+                v.extend_from_slice(t);
+            }
+            v
+        }
+
+        fn len(text: Option<&[u8]>) -> i64 {
+            text.map_or(-1, |t| t.len() as i64)
+        }
+
+        fn call(operation: u32, input: &[u8]) -> Option<Vec<i64>> {
+            let mut out = vec![0xa5u8; 256];
+            let probe = [0u8; 1];
+            let pointer = if input.is_empty() {
+                probe.as_ptr()
+            } else {
+                input.as_ptr()
+            };
+            let written = unsafe {
+                evaluate(
+                    operation,
+                    0,
+                    pointer,
+                    input.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            if written < 0 {
+                assert_eq!(written, -1);
+                return None;
+            }
+            Some(
+                out[..written as usize]
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(word)
+                    .collect(),
+            )
+        }
+
+        #[test]
+        fn w43_2_recovery_batch() {
+            let rows: [(Option<&[u8]>, i64, i64); 8] = [
+                (Some(b"renamed"), 2, 7),
+                (Some(b"no_match"), -3, 5),
+                (Some(b"retryable"), 4, -1),
+                (Some(b"deferred"), 0, 9),
+                (Some(b"Renamed"), 1, 1),
+                (Some(b""), 1, 0),
+                (None, 99, 99),
+                (Some(b"renamed"), i64::MAX, i64::MAX),
+            ];
+            let mut slots = vec![];
+            let mut tail: Vec<&[u8]> = vec![];
+            for (outcome, probes, articles) in &rows {
+                slots.extend([len(*outcome), *probes, *articles]);
+                tail.extend(outcome.iter());
+            }
+            assert_eq!(
+                call(0, &table(rows.len(), &slots, &tail)),
+                Some(vec![
+                    8,
+                    1,
+                    2,
+                    2,
+                    1,
+                    1,
+                    1,
+                    3,
+                    1,
+                    i64::MAX,
+                    i64::MAX,
+                    i64::MAX,
+                    3
+                ])
+            );
+            assert_eq!(call(0, &table(0, &[], &[])), Some(vec![0; 13]));
+            assert_eq!(call(0, &table(1, &[3, 0, 0], &[b"ab"])), None);
+            assert_eq!(call(0, &table(1, &[-2, 0, 0], &[])), None);
+            let mut lead = table(0, &[], &[]);
+            lead[0] = 1;
+            assert_eq!(call(0, &lead), None);
+        }
+
+        #[test]
+        fn w43_2_fingerprint_batch() {
+            let canonical = b"0123456789abcdef0123456789abcdef01234567";
+            let upper = b"0123456789ABCDEF0123456789abcdef01234567";
+            let input = table(
+                7,
+                &[40, 0, 40, 0, 40, 0, -1, 1, -1, 2, 0, 0, 3, 0],
+                &[canonical, canonical, upper, b"", b"xyz"],
+            );
+            assert_eq!(call(1, &input), Some(vec![7, 1, 1, 5, 2, 1, 1, 1, 4, 123]));
+            assert_eq!(call(1, &table(0, &[], &[])), Some(vec![0; 10]));
+            assert_eq!(call(1, &table(1, &[-1, 0], &[])), None);
+            assert_eq!(call(1, &table(1, &[1, 1], &[b"a"])), None);
+            assert_eq!(call(1, &table(1, &[1, 3], &[b"a"])), None);
+        }
+
+        #[test]
+        fn w43_2_worker_frames() {
+            let max = MAX_MESSAGE_ID;
+            assert_eq!(
+                call(2, &table(7, &[10, 0, -1, max, max + 1, 3, max + 1], &[])),
+                Some(vec![
+                    7,
+                    1,
+                    3,
+                    1,
+                    2,
+                    1,
+                    1,
+                    25 + max,
+                    (25 + max) / WORKER_BUFFER
+                ])
+            );
+            assert_eq!(call(2, &table(0, &[], &[])), Some(vec![0; 9]));
+            assert_eq!(call(2, &table(1, &[-2], &[])), None);
+            assert_eq!(call(2, &table(1, &[1], &[b"x"])), None);
+        }
+
+        #[test]
+        fn w43_2_identity_statuses() {
+            type Row<'a> = [Option<&'a [u8]>; 3];
+            let rows: [Row<'_>; 9] = [
+                [
+                    Some(b"a@b"),
+                    Some(b" <a@b>\n"),
+                    Some(b"220 0 <a@b> article"),
+                ],
+                [Some(b"<<a@b>>"), Some(b"<a@b>"), None],
+                [Some(b"a@b"), Some(b"<A@b>"), None],
+                [Some(b"a@b"), Some(b" \t"), None],
+                [Some(b"a@b"), None, Some(b"220 <a@b>")],
+                [Some(b"a@b"), Some(b"<a@b>"), Some(b"220 <> <<x>> <a@b>")],
+                [Some(b"a@b"), Some(b"<a@b>"), Some(b"220 <> no id")],
+                [Some(b""), Some(b"<>"), None],
+                [None, None, None],
+            ];
+            let mut slots = vec![];
+            let mut tail: Vec<&[u8]> = vec![];
+            for row in &rows {
+                slots.extend(row.iter().map(|t| len(*t)));
+                tail.extend(row.iter().flatten());
+            }
+            assert_eq!(
+                call(3, &table(rows.len(), &slots, &tail)),
+                Some(vec![9, 1, 4, 2, 1, 1])
+            );
+            assert_eq!(first_angle_id(b"x <> <<y>> z"), Some(&b"<<y>"[..]));
+            assert_eq!(first_angle_id(b"<a"), None);
+            assert_eq!(first_angle_id(b"<>>"), None);
+            assert_eq!(call(3, &table(1, &[-1, 1, -1], &[b"x"])), None);
+            assert_eq!(call(3, &table(0, &[], &[])), Some(vec![0; 6]));
+        }
+
+        #[test]
+        fn w43_2_enqueue_decisions() {
+            let input = table(
+                7,
+                &[
+                    1, 7, 1, 2, // same digest, not forced → skipped
+                    1, 7, 1, 3, // same digest, forced, pending → skipped while forced
+                    1, 4, 1, 3, // same digest, forced, done → forced
+                    1, 7, 1, 2, // changed digest
+                    -1, -1, 1, 0, // missing job
+                    -1, -1, -1, 4, // invalid
+                    1, 10, 1, 3, // forced, processing → skipped while forced
+                ],
+                &[
+                    b"a",
+                    b"pending",
+                    b"a",
+                    b"a",
+                    b"pending",
+                    b"a",
+                    b"a",
+                    b"done",
+                    b"a",
+                    b"a",
+                    b"pending",
+                    b"b",
+                    b"a",
+                    b"a",
+                    b"processing",
+                    b"a",
+                ],
+            );
+            assert_eq!(call(4, &input), Some(vec![7, 1, 1, 1, 3, 1, 2]));
+            assert_eq!(call(4, &table(0, &[], &[])), Some(vec![0; 7]));
+            assert_eq!(call(4, &table(1, &[-1, -1, 1, 2], &[b"a"])), None);
+            assert_eq!(call(4, &table(1, &[1, 1, 1, 0], &[b"abc"])), None);
+            assert_eq!(call(4, &table(1, &[-1, -1, -1, 0], &[])), None);
+            assert_eq!(call(4, &table(1, &[-1, -1, 1, 8], &[b"a"])), None);
+            assert_eq!(call(4, &table(1, &[-1, -1, 1, 4], &[b"a"])), None);
+        }
+
+        #[test]
+        fn w43_2_abi_sentinels() {
+            assert_eq!(call(5, &table(0, &[], &[])), None);
+            assert_eq!(call(u32::MAX, &table(0, &[], &[])), None);
+            assert_eq!(call(0, &[0u8; 8]), None);
+            let input = table(1, &[3], &[]);
+            let mut out = [0x5au8; 128];
+            let run = |p: *const u8, len: usize, o: *mut u8, cap: usize| unsafe {
+                evaluate(2, 0, p, len, o, cap)
+            };
+            assert_eq!(run(std::ptr::null(), 0, out.as_mut_ptr(), out.len()), -1);
+            assert_eq!(
+                run(input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), MAX_INPUT + 1, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), usize::MAX, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), input.len(), out.as_mut_ptr(), usize::MAX),
+                -1
+            );
+            for cap in [0, 1, 71] {
+                assert_eq!(run(input.as_ptr(), input.len(), out.as_mut_ptr(), cap), -72);
+            }
+            assert!(out.iter().all(|b| *b == 0x5a));
+            assert_eq!(run(input.as_ptr(), input.len(), out.as_mut_ptr(), 72), 72);
+            assert_eq!(word(&out[56..64].try_into().unwrap()), 8);
+            assert!(out[72..].iter().all(|b| *b == 0x5a));
+            let mut shared = [0u8; 160];
+            shared[..input.len()].copy_from_slice(&input);
+            let p = shared.as_mut_ptr();
+            assert_eq!(run(p, input.len(), unsafe { p.add(8) }, 72), -1);
+            let export = |op: u32, flags: u32, out: &mut [u8]| unsafe {
+                super::super::nntmux_w432_nzb_par2_result_fingerprint_store_worker_queue(
+                    op,
+                    flags,
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert_eq!(export(2, 0, &mut out), 72);
+            assert_eq!(export(2, 1, &mut out), -1);
+            assert_eq!(export(0, 0, &mut out), -1);
+        }
+    }
+}
+
+/// Evaluate one Wave 43.2 helper over packed native-endian `i64` slots `[0, rows]`, the row
+/// slots and any string bytes: op 0 summarizes PAR2 candidate recovery results, op 1 classifies
+/// article fingerprints before storage, op 2 replays fingerprint worker `add()` framing, op 3
+/// judges fetched article identities and op 4 tallies fingerprint enqueue decisions. `flags`
+/// must be zero. Returns the byte count written, the negated required capacity when `out_cap`
+/// is too small (nothing written), or -1 when the input is malformed.
+///
+/// # Safety
+/// Both ranges must be live, disjoint readable/writable allocations. Pointers must
+/// be non-null even for zero lengths; arithmetic checks cannot prove provenance.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w432_nzb_par2_result_fingerprint_store_worker_queue(
+    operation: u32,
+    flags: u32,
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        wave43_nzb_par2_result_fingerprint_store_worker_queue::evaluate(
+            operation, flags, input, input_len, out_buf, out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
