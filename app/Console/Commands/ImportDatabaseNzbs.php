@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Console\Commands;
 
+use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\DatabaseNzbStore;
 use App\Services\Nzb\NzbSourceGuard;
 use Illuminate\Console\Command;
@@ -19,8 +20,16 @@ final class ImportDatabaseNzbs extends Command
 
     protected $description = 'Copy retained NZBs into the shared database without adding historical fingerprint work; preserve originals';
 
+    /**
+     * Default for the Wave 38.2 toggle only; it stays false because the paired benchmark in
+     * tests/Unit/RustNntpServiceFingerprintDispatchCommandsParityTest.php is below 1.5x.
+     */
+    public const bool RUST_FFI_DEFAULT = false;
+
     // Keep PHP as the production default until the Rust performance gate passes.
     private static ?bool $useRustFfi = null;
+
+    private static ?bool $useWave382RustFfi = null;
 
     public static function setUseRustFfi(?bool $useRustFfi): void
     {
@@ -110,6 +119,35 @@ final class ImportDatabaseNzbs extends Command
         return is_string($result) ? $result : self::formatSummaryLinePhp($dryRun, $processed, $imported, $alreadyInDb, $missingFile, $readFailed, $cursor);
     }
 
+    public static function useWave382RustFfi(?bool $use): void
+    {
+        self::$useWave382RustFfi = $use;
+    }
+
+    public static function usesWave382RustFfi(): bool
+    {
+        return self::$useWave382RustFfi ?? self::RUST_FFI_DEFAULT;
+    }
+
+    public static function resetWave382RustFfi(): void
+    {
+        self::$useWave382RustFfi = null;
+    }
+
+    /**
+     * Summarize one batch of release ids against the resume cursor (negative reads as zero) and the clamped limit:
+     * ids at or below the cursor and ids not above the last accepted id are skipped, scanning stops once limit ids
+     * were accepted (truncated when ids remain), and next_cursor is the last accepted id.
+     *
+     * @param  list<int>  $releaseIds
+     * @return array{processed: int, accepted: int, below_cursor: int, out_of_order: int, truncated: bool, next_cursor: int, span: int}
+     */
+    public static function summarizeImportBatch(int $cursor, int $limit, array $releaseIds): array
+    {
+        return (self::usesWave382RustFfi() ? self::summarizeImportBatchNative($cursor, $limit, $releaseIds) : null)
+            ?? self::summarizeImportBatchPhp($cursor, $limit, $releaseIds);
+    }
+
     public function handle(): int
     {
         $roots = array_map(static fn (string $path): string => rtrim($path, '/'), $this->option('root'));
@@ -194,6 +232,60 @@ final class ImportDatabaseNzbs extends Command
             }
         }
         throw new RuntimeException('Legacy NZB is missing.');
+    }
+
+    /**
+     * @param  list<int>  $releaseIds
+     * @return array{processed: int, accepted: int, below_cursor: int, out_of_order: int, truncated: bool, next_cursor: int, span: int}
+     */
+    private static function summarizeImportBatchPhp(int $cursor, int $limit, array $releaseIds): array
+    {
+        $cursor = max(0, $cursor);
+        $limit = self::clampLimitPhp($limit);
+        $processed = $accepted = $below = $outOfOrder = 0;
+        $truncated = false;
+        $previous = $cursor;
+        foreach ($releaseIds as $id) {
+            if ($accepted === $limit) {
+                $truncated = true;
+                break;
+            }
+            $processed++;
+            if ($id <= $cursor) {
+                $below++;
+            } elseif ($id <= $previous) {
+                $outOfOrder++;
+            } else {
+                $accepted++;
+                $previous = $id;
+            }
+        }
+
+        return ['processed' => $processed, 'accepted' => $accepted, 'below_cursor' => $below, 'out_of_order' => $outOfOrder,
+            'truncated' => $truncated, 'next_cursor' => $previous, 'span' => $previous - $cursor];
+    }
+
+    /**
+     * @param  list<int>  $releaseIds
+     * @return array{processed: int, accepted: int, below_cursor: int, out_of_order: int, truncated: bool, next_cursor: int, span: int}|null
+     */
+    private static function summarizeImportBatchNative(int $cursor, int $limit, array $releaseIds): ?array
+    {
+        if (count($releaseIds) > 2097150) {
+            return null;
+        }
+        $slots = NNTPService::evaluateWave382Native(2, 0, pack('q2', $cursor, $limit).pack('q*', ...$releaseIds), 7);
+        if ($slots === null) {
+            return null;
+        }
+        [$processed, $accepted, $below, $outOfOrder, $truncated, $next, $span] = $slots;
+        if ($processed < 0 || $processed > count($releaseIds) || $accepted + $below + $outOfOrder !== $processed
+            || ($truncated !== 0 && $truncated !== 1) || $next < max(0, $cursor) || $span !== $next - max(0, $cursor)) {
+            return null;
+        }
+
+        return ['processed' => $processed, 'accepted' => $accepted, 'below_cursor' => $below, 'out_of_order' => $outOfOrder,
+            'truncated' => $truncated === 1, 'next_cursor' => $next, 'span' => $span];
     }
 
     private static function useRustFfi(): bool

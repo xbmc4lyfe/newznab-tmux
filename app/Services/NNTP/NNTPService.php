@@ -10,6 +10,7 @@ use App\Services\Tmux\Tmux;
 use App\Services\Yenc\ArticleFrame;
 use App\Services\Yenc\YencPart;
 use App\Services\YencService;
+use App\Support\RustPipelineLibrary;
 use DariusIII\NetNntp\Client as NntpClient;
 use DariusIII\NetNntp\Error as NntpError;
 use DariusIII\NetNntp\Protocol\ResponseCode;
@@ -28,6 +29,154 @@ class NNTPService extends NntpClient
 
     /** @var array<string, true> */
     private static array $reportedVerificationFramerFailures = [];
+
+    /** The Wave 38.2 export shared by the NNTP, fingerprint dispatch and import/yEnc command helpers. */
+    public const string W382_FFI_CDEF = <<<'C'
+        int64_t nntmux_w38_nntp_service_fingerprint_dispatch_commands(
+            uint32_t operation,
+            uint32_t flags,
+            const char *input,
+            size_t input_len,
+            char *out_buf,
+            size_t out_cap
+        );
+        C;
+
+    public const string W382_FFI_DOMAIN = 'nfo_w382';
+
+    /**
+     * Production default stays false: the paired benchmark in
+     * tests/Unit/RustNntpServiceFingerprintDispatchCommandsParityTest.php is below 1.5x.
+     */
+    public const bool RUST_FFI_DEFAULT = false;
+
+    private const int W382_MAX_INPUT = 16777216;
+
+    /** Bytes a trimmed verification message-id may not contain: the verificationMessageId() pattern in the C locale. */
+    private const string W382_INVALID_ID_BYTES = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x20\x7f<>";
+
+    private const array W382_ID_REASONS = ['ok', 'invalid_budget', 'empty', 'invalid_byte'];
+
+    private static ?bool $useRustFfi = null;
+
+    public static function useRustFfi(?bool $use): void
+    {
+        self::$useRustFfi = $use;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? self::RUST_FFI_DEFAULT;
+    }
+
+    public static function resetRustFfi(): void
+    {
+        self::$useRustFfi = null;
+    }
+
+    /**
+     * Plan a verification message-id without throwing: every leading/trailing angle bracket is trimmed (as
+     * verificationMessageId() does), then the id is rejected for a budget below one byte, an empty remainder or a
+     * control, space, DEL or inner bracket byte, in that order. within_budget reports whether the bracketed id fits.
+     *
+     * @return array{message_id: ?string, bracketed: ?string, length: int, stripped_brackets: int, first_invalid: int, reason: string, within_budget: bool}
+     */
+    public static function planVerificationMessageId(string $messageId, int $maximumBytes): array
+    {
+        return (self::usesRustFfi() ? self::planVerificationMessageIdNative($messageId, $maximumBytes) : null)
+            ?? self::planVerificationMessageIdPhp($messageId, $maximumBytes);
+    }
+
+    /**
+     * Run one Wave 38.2 Rust operation over packed native-endian slots and string bytes and return its `$slots`
+     * result slots; null when the library is missing, the input is out of contract or the call fails, so callers
+     * fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    public static function evaluateWave382Native(int $operation, int $flags, string $input, int $slots): ?array
+    {
+        try {
+            if ($operation < 0 || $flags < 0 || $slots < 1 || $input === '' || \strlen($input) > self::W382_MAX_INPUT) {
+                return null;
+            }
+            $ffi = RustPipelineLibrary::resolveDomain(self::W382_FFI_DOMAIN, self::W382_FFI_CDEF, getenv('NNTMUX_PIPELINE_FFI_LIB') ?: null);
+            if (! $ffi instanceof \FFI) {
+                return null;
+            }
+            $needed = $slots * 8;
+            for ($attempt = 0; $attempt < 2; $attempt++) {
+                $capacity = 0;
+                $output = RustPipelineLibrary::obtainScratch($ffi, $needed, $capacity);
+                if ($output === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w38_nntp_service_fingerprint_dispatch_commands($operation, $flags, $input, \strlen($input), $output, $capacity);
+                if (! \is_int($written) || $written === -1 || $written > $capacity) {
+                    return null;
+                }
+                if ($written < 0) {
+                    // Too small: retry once with the reported capacity.
+                    $needed = -$written;
+
+                    continue;
+                }
+                if ($written !== $slots * 8) {
+                    return null;
+                }
+                $values = array_values(unpack('q'.$slots, \FFI::string($output, $written)) ?: []);
+
+                return \count($values) === $slots ? $values : null;
+            }
+        } catch (\Throwable) {
+        }
+
+        return null;
+    }
+
+    /** @return array{message_id: ?string, bracketed: ?string, length: int, stripped_brackets: int, first_invalid: int, reason: string, within_budget: bool} */
+    private static function planVerificationMessageIdPhp(string $messageId, int $maximumBytes): array
+    {
+        $id = trim($messageId, '<>');
+        $length = \strlen($id);
+        $span = strcspn($id, self::W382_INVALID_ID_BYTES);
+        $firstInvalid = $span < $length ? $span : -1;
+        $reason = match (true) {
+            $maximumBytes < 1 => 1,
+            $length === 0 => 2,
+            $firstInvalid >= 0 => 3,
+            default => 0,
+        };
+
+        return self::verificationMessageIdPlan($id, \strlen($messageId) - $length, $firstInvalid, $reason, $reason === 0 && $length + 2 <= $maximumBytes);
+    }
+
+    /** @return array{message_id: ?string, bracketed: ?string, length: int, stripped_brackets: int, first_invalid: int, reason: string, within_budget: bool}|null */
+    private static function planVerificationMessageIdNative(string $messageId, int $maximumBytes): ?array
+    {
+        $slots = self::evaluateWave382Native(0, 0, pack('q', $maximumBytes).$messageId, 6);
+        if ($slots === null) {
+            return null;
+        }
+        [$start, $length, $reason, $firstInvalid, $stripped, $within] = $slots;
+        $total = \strlen($messageId);
+        if ($start < 0 || $length < 0 || $start > $total - $length || $stripped !== $total - $length || ! isset(self::W382_ID_REASONS[$reason])
+            || $firstInvalid < -1 || $firstInvalid >= max(1, $length) || ($within !== 0 && $within !== 1)) {
+            return null;
+        }
+
+        return self::verificationMessageIdPlan(substr($messageId, $start, $length), $stripped, $firstInvalid, $reason, $within === 1);
+    }
+
+    /** @return array{message_id: ?string, bracketed: ?string, length: int, stripped_brackets: int, first_invalid: int, reason: string, within_budget: bool} */
+    private static function verificationMessageIdPlan(string $id, int $stripped, int $firstInvalid, int $reason, bool $withinBudget): array
+    {
+        $ok = $reason === 0;
+
+        return ['message_id' => $ok ? $id : null, 'bracketed' => $ok ? '<'.$id.'>' : null, 'length' => \strlen($id), 'stripped_brackets' => $stripped,
+            'first_invalid' => $firstInvalid, 'reason' => self::W382_ID_REASONS[$reason], 'within_budget' => $withinBudget];
+    }
 
     public static function verificationMessageId(string $messageId, int $maximumBytes): string
     {

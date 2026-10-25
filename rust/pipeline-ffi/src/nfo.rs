@@ -26256,3 +26256,598 @@ pub unsafe extern "C" fn nntmux_w37_verification_capacity_prefile_singleton(
     }))
     .unwrap_or(-1)
 }
+
+mod wave38_nntp_service_fingerprint_dispatch_commands {
+    use super::{nfo_abi_range, yenc_ranges_overlap};
+    use std::slice;
+
+    pub(super) const MAX_INPUT: usize = 16 * 1024 * 1024;
+
+    const DISPATCH_FORCE: u32 = 1;
+    const DISPATCH_HAS_WORKER: u32 = 2;
+
+    const YENC_FFI_EXTENSION: u32 = 1;
+    const YENC_LIBRARY_PRESENT: u32 = 2;
+    const YENC_NATIVE_AVAILABLE: u32 = 4;
+    const YENC_HARDWARE_CRC32: u32 = 8;
+    const YENC_LIBRARY_CONFIGURED: u32 = 16;
+    const YENC_FLAGS: u32 = 31;
+
+    const IMPORT_LIMIT_MAX: i64 = 10_000;
+    const SMALL_NZB_BYTES: i64 = 1_024;
+    /// Mirrors `DatabaseNzbStore::MAX_COMPRESSED_BYTES`.
+    const OVERSIZED_NZB_BYTES: i64 = 33_554_432;
+
+    /// Split `count` leading native-endian `i64` slots from the trailing bytes.
+    fn split(bytes: &[u8], count: usize) -> Option<(Vec<i64>, &[u8])> {
+        let head = count.checked_mul(8)?;
+        if bytes.len() < head {
+            return None;
+        }
+        let (slots, tail) = bytes.split_at(head);
+        Some((
+            slots
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| i64::from_ne_bytes(*c))
+                .collect(),
+            tail,
+        ))
+    }
+
+    /// Split the trailing bytes into strings whose declared lengths cover the tail exactly.
+    fn strings<'a>(tail: &'a [u8], lengths: &[i64]) -> Option<Vec<&'a [u8]>> {
+        let mut out = Vec::with_capacity(lengths.len());
+        let mut offset = 0usize;
+        for &length in lengths {
+            let length = usize::try_from(length).ok()?;
+            let end = offset.checked_add(length)?;
+            out.push(tail.get(offset..end)?);
+            offset = end;
+        }
+        (offset == tail.len()).then_some(out)
+    }
+
+    /// PHP `trim()` span for an arbitrary byte set: `(start, length)`, `(0, 0)` when nothing remains.
+    fn trim_span(bytes: &[u8], strip: impl Fn(u8) -> bool) -> (usize, usize) {
+        let Some(start) = bytes.iter().position(|b| !strip(*b)) else {
+            return (0, 0);
+        };
+        let end = bytes.iter().rposition(|b| !strip(*b)).map_or(start, |e| e + 1);
+        (start, end - start)
+    }
+
+    fn php_trim_default(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b)
+    }
+
+    fn ends_with_ignore_case(name: &[u8], suffix: &[u8]) -> bool {
+        name.len() >= suffix.len() && name[name.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+    }
+
+    /// Op 0: `NNTPService::planVerificationMessageId` over `[maximum_bytes] + id`.
+    fn plan_message_id(bytes: &[u8]) -> Option<Vec<i64>> {
+        let (slots, id) = split(bytes, 1)?;
+        let maximum = slots[0];
+        let (start, length) = trim_span(id, |b| b == b'<' || b == b'>');
+        let stripped = &id[start..start + length];
+        let first_invalid = stripped
+            .iter()
+            .position(|b| *b <= 0x20 || *b == 0x7f || *b == b'<' || *b == b'>')
+            .map_or(-1, |p| p as i64);
+        let reason = if maximum < 1 {
+            1
+        } else if length == 0 {
+            2
+        } else if first_invalid >= 0 {
+            3
+        } else {
+            0
+        };
+        let within = reason == 0 && (length as i64) + 2 <= maximum;
+        Some(vec![
+            start as i64,
+            length as i64,
+            reason,
+            first_invalid,
+            (id.len() - length) as i64,
+            within as i64,
+        ])
+    }
+
+    /// Op 1: `FingerprintDispatch::planEnqueue` over `[release_id, generation_len, worker_len] + strings`.
+    fn plan_enqueue(flags: u32, bytes: &[u8]) -> Option<Vec<i64>> {
+        if flags & !(DISPATCH_FORCE | DISPATCH_HAS_WORKER) != 0 {
+            return None;
+        }
+        let (slots, tail) = split(bytes, 3)?;
+        let has_worker = flags & DISPATCH_HAS_WORKER != 0;
+        if !has_worker && slots[2] != 0 {
+            return None;
+        }
+        let parts = strings(tail, &slots[1..3])?;
+        let (generation_start, generation_len) = trim_span(parts[0], php_trim_default);
+        let force = flags & DISPATCH_FORCE != 0;
+        let (route, reason) = if slots[0] < 1 {
+            (2, 4)
+        } else if !has_worker || parts[1] == b"rust" {
+            (0, if force { 1 } else { 0 })
+        } else {
+            (1, if generation_len > 0 { 2 } else { 3 })
+        };
+        Some(vec![
+            route,
+            reason,
+            generation_start as i64,
+            generation_len as i64,
+            (route == 0 && force) as i64,
+            (route == 1 && generation_len > 0) as i64,
+        ])
+    }
+
+    /// Op 2: `ImportDatabaseNzbs::summarizeImportBatch` over `[cursor, limit, ids...]`.
+    fn summarize_batch(bytes: &[u8]) -> Option<Vec<i64>> {
+        if !bytes.len().is_multiple_of(8) {
+            return None;
+        }
+        let (slots, tail) = split(bytes, 2)?;
+        let cursor = slots[0].max(0);
+        let limit = slots[1].clamp(1, IMPORT_LIMIT_MAX);
+        let (mut processed, mut accepted, mut below, mut out_of_order, mut truncated) =
+            (0i64, 0i64, 0i64, 0i64, 0i64);
+        let mut previous = cursor;
+        for chunk in tail.as_chunks::<8>().0 {
+            if accepted == limit {
+                truncated = 1;
+                break;
+            }
+            let id = i64::from_ne_bytes(*chunk);
+            processed += 1;
+            if id <= cursor {
+                below += 1;
+            } else if id <= previous {
+                out_of_order += 1;
+            } else {
+                accepted += 1;
+                previous = id;
+            }
+        }
+        Some(vec![
+            processed,
+            accepted,
+            below,
+            out_of_order,
+            truncated,
+            previous,
+            previous - cursor,
+        ])
+    }
+
+    /// Op 3: `ImportNzbs::summarizeImportFile` over `[size, name_len, manifest_len] + strings`.
+    fn summarize_file(bytes: &[u8]) -> Option<Vec<i64>> {
+        let (slots, tail) = split(bytes, 3)?;
+        let parts = strings(tail, &slots[1..3])?;
+        let name = parts[0];
+        let (kind, suffix) = if name == parts[1] {
+            (0, 0)
+        } else if ends_with_ignore_case(name, b".nzb.gz") {
+            (1, 7)
+        } else if ends_with_ignore_case(name, b".nzb") {
+            (2, 4)
+        } else {
+            (3, 0)
+        };
+        let size = slots[0];
+        let size_class = if size <= 0 {
+            0
+        } else if size < SMALL_NZB_BYTES {
+            1
+        } else if size <= OVERSIZED_NZB_BYTES {
+            2
+        } else {
+            3
+        };
+        Some(vec![
+            kind,
+            (kind == 1 || kind == 2) as i64,
+            (kind == 1) as i64,
+            (name.len() - suffix) as i64,
+            size_class,
+        ])
+    }
+
+    /// Op 4: `YencDoctorCommand::summarizeDecoderReadiness` over `[mode_len] + mode`.
+    fn summarize_readiness(flags: u32, bytes: &[u8]) -> Option<Vec<i64>> {
+        if flags & !YENC_FLAGS != 0 {
+            return None;
+        }
+        let (slots, mode) = split(bytes, 1)?;
+        if usize::try_from(slots[0]).ok()? != mode.len() {
+            return None;
+        }
+        let ffi = flags & YENC_FFI_EXTENSION != 0;
+        let native = flags & YENC_NATIVE_AVAILABLE != 0;
+        let valid = matches!(mode, b"auto" | b"php" | b"native");
+        let active = if !valid {
+            2
+        } else if mode == b"php" {
+            0
+        } else if ffi && native {
+            1
+        } else if mode == b"native" {
+            2
+        } else {
+            0
+        };
+        let error = if !valid {
+            1
+        } else if mode == b"native" && !native {
+            2
+        } else {
+            0
+        };
+        let warning = if error != 0 {
+            0
+        } else if mode != b"php" && !native {
+            1
+        } else if native && flags & YENC_HARDWARE_CRC32 == 0 {
+            2
+        } else {
+            0
+        };
+        let library = if flags & YENC_LIBRARY_CONFIGURED == 0 {
+            0
+        } else if flags & YENC_LIBRARY_PRESENT == 0 {
+            1
+        } else if native {
+            2
+        } else {
+            3
+        };
+        Some(vec![
+            valid as i64,
+            active,
+            error,
+            (error != 0) as i64,
+            warning,
+            library,
+        ])
+    }
+
+    fn compute(operation: u32, flags: u32, bytes: &[u8]) -> Option<Vec<i64>> {
+        match operation {
+            0 if flags == 0 => plan_message_id(bytes),
+            1 => plan_enqueue(flags, bytes),
+            2 if flags == 0 => summarize_batch(bytes),
+            3 if flags == 0 => summarize_file(bytes),
+            4 => summarize_readiness(flags, bytes),
+            _ => None,
+        }
+    }
+
+    /// # Safety
+    /// See [`super::nntmux_w38_nntp_service_fingerprint_dispatch_commands`].
+    pub(super) unsafe fn evaluate(
+        operation: u32,
+        flags: u32,
+        input: *const u8,
+        length: usize,
+        output: *mut u8,
+        capacity: usize,
+    ) -> i64 {
+        if !nfo_abi_range(input, length, false)
+            || !nfo_abi_range(output, capacity, false)
+            || length > MAX_INPUT
+            || capacity > isize::MAX as usize
+            || yenc_ranges_overlap(input as usize, length, output as usize, capacity)
+        {
+            return -1;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, length) };
+        let Some(result) = compute(operation, flags, bytes) else {
+            return -1;
+        };
+        let Some(needed) = result.len().checked_mul(8) else {
+            return -1;
+        };
+        if needed > capacity {
+            return -(needed as i64);
+        }
+        let out = unsafe { slice::from_raw_parts_mut(output, needed) };
+        for (chunk, value) in out.as_chunks_mut::<8>().0.iter_mut().zip(&result) {
+            chunk.copy_from_slice(&value.to_ne_bytes());
+        }
+        needed as i64
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn pack(slots: &[i64], tail: &[&[u8]]) -> Vec<u8> {
+            let mut v: Vec<u8> = slots.iter().flat_map(|s| s.to_ne_bytes()).collect();
+            for t in tail {
+                v.extend_from_slice(t);
+            }
+            v
+        }
+
+        fn call(operation: u32, flags: u32, input: &[u8]) -> Option<Vec<i64>> {
+            let mut out = vec![0xa5u8; 256];
+            let probe = [0u8; 1];
+            let pointer = if input.is_empty() {
+                probe.as_ptr()
+            } else {
+                input.as_ptr()
+            };
+            let written = unsafe {
+                evaluate(
+                    operation,
+                    flags,
+                    pointer,
+                    input.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            if written < 0 {
+                assert_eq!(written, -1);
+                return None;
+            }
+            Some(
+                out[..written as usize]
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|c| i64::from_ne_bytes(*c))
+                    .collect(),
+            )
+        }
+
+        #[test]
+        fn w38_2_message_id_plan() {
+            assert_eq!(
+                call(0, 0, &pack(&[512], &[b"<<abc@x>>"])),
+                Some(vec![2, 5, 0, -1, 4, 1])
+            );
+            assert_eq!(
+                call(0, 0, &pack(&[7], &[b"abc@x"])),
+                Some(vec![0, 5, 0, -1, 0, 1])
+            );
+            assert_eq!(call(0, 0, &pack(&[6], &[b"abc@x"])).unwrap()[5], 0);
+            assert_eq!(
+                call(0, 0, &pack(&[0], &[b"a b"])),
+                Some(vec![0, 3, 1, 1, 0, 0])
+            );
+            assert_eq!(
+                call(0, 0, &pack(&[9], &[b"<>><"])),
+                Some(vec![0, 0, 2, -1, 4, 0])
+            );
+            assert_eq!(call(0, 0, &pack(&[9], &[])), Some(vec![0, 0, 2, -1, 0, 0]));
+            assert_eq!(
+                call(0, 0, &pack(&[9], &[b"<a<b\x7f>"])),
+                Some(vec![1, 4, 3, 1, 2, 0])
+            );
+            assert_eq!(call(0, 0, &pack(&[9], &[b"\xff\xc3\xa9"])).unwrap()[2], 0);
+            assert_eq!(call(0, 0, &pack(&[9], &[b" a"])).unwrap()[3], 0);
+            assert_eq!(
+                call(0, 0, &pack(&[i64::MAX], &[b"a"])).unwrap()[5],
+                1
+            );
+            assert_eq!(call(0, 0, &[0u8; 7]), None);
+            assert_eq!(call(0, 1, &pack(&[9], &[b"a"])), None);
+        }
+
+        #[test]
+        fn w38_2_dispatch_plan() {
+            assert_eq!(
+                call(1, 0, &pack(&[5, 4, 0], &[b" g1\n"])),
+                Some(vec![0, 0, 1, 2, 0, 0])
+            );
+            assert_eq!(
+                call(1, 1, &pack(&[5, 0, 0], &[])),
+                Some(vec![0, 1, 0, 0, 1, 0])
+            );
+            assert_eq!(
+                call(1, 3, &pack(&[5, 2, 4], &[b"g2", b"rust"])),
+                Some(vec![0, 1, 0, 2, 1, 0])
+            );
+            assert_eq!(
+                call(1, 3, &pack(&[5, 2, 3], &[b"g2", b"php"])),
+                Some(vec![1, 2, 0, 2, 0, 1])
+            );
+            assert_eq!(
+                call(1, 2, &pack(&[5, 1, 4], &[b" ", b"Rust"])),
+                Some(vec![1, 3, 0, 0, 0, 0])
+            );
+            assert_eq!(
+                call(1, 1, &pack(&[0, 0, 0], &[])),
+                Some(vec![2, 4, 0, 0, 0, 0])
+            );
+            assert_eq!(call(1, 1, &pack(&[i64::MIN, 0, 0], &[])).unwrap()[0], 2);
+            assert_eq!(call(1, 0, &pack(&[1, 0, 1], &[b"x"])), None);
+            assert_eq!(call(1, 2, &pack(&[1, 2, 0], &[b"x"])), None);
+            assert_eq!(call(1, 2, &pack(&[1, -1, 2], &[b"x"])), None);
+            assert_eq!(call(1, 2, &pack(&[1, 0, 0], &[b"x"])), None);
+            assert_eq!(call(1, 4, &pack(&[1, 0, 0], &[])), None);
+            assert_eq!(call(1, 0, &pack(&[1, 0], &[])), None);
+        }
+
+        #[test]
+        fn w38_2_import_batch() {
+            assert_eq!(
+                call(2, 0, &pack(&[10, 1000, 11, 12, 20], &[])),
+                Some(vec![3, 3, 0, 0, 0, 20, 10])
+            );
+            assert_eq!(
+                call(2, 0, &pack(&[10, 2, 9, 11, 11, 10, 15, 16], &[])),
+                Some(vec![5, 2, 2, 1, 1, 15, 5])
+            );
+            assert_eq!(
+                call(2, 0, &pack(&[-5, 0, 1, 2], &[])),
+                Some(vec![1, 1, 0, 0, 1, 1, 1])
+            );
+            assert_eq!(
+                call(2, 0, &pack(&[i64::MIN, i64::MAX], &[])),
+                Some(vec![0, 0, 0, 0, 0, 0, 0])
+            );
+            assert_eq!(
+                call(2, 0, &pack(&[0, 5, i64::MAX, i64::MIN], &[])),
+                Some(vec![2, 1, 1, 0, 0, i64::MAX, i64::MAX])
+            );
+            assert_eq!(call(2, 0, &pack(&[0], &[])), None);
+            assert_eq!(call(2, 0, &pack(&[0, 1], &[b"x"])), None);
+            assert_eq!(call(2, 1, &pack(&[0, 1], &[])), None);
+        }
+
+        #[test]
+        fn w38_2_import_file() {
+            assert_eq!(
+                call(3, 0, &pack(&[4096, 8, 4], &[b"a.NZB.gz", b"m.js"])),
+                Some(vec![1, 1, 1, 1, 2])
+            );
+            assert_eq!(
+                call(3, 0, &pack(&[1, 5, 4], &[b"b.nzb", b"m.js"])),
+                Some(vec![2, 1, 0, 1, 1])
+            );
+            assert_eq!(
+                call(3, 0, &pack(&[0, 4, 4], &[b"m.js", b"m.js"])),
+                Some(vec![0, 0, 0, 4, 0])
+            );
+            assert_eq!(
+                call(3, 0, &pack(&[33_554_433, 3, 0], &[b"nzb"])),
+                Some(vec![3, 0, 0, 3, 3])
+            );
+            assert_eq!(
+                call(3, 0, &pack(&[33_554_432, 0, 0], &[])),
+                Some(vec![0, 0, 0, 0, 2])
+            );
+            assert_eq!(call(3, 0, &pack(&[1023, 4, 1], &[b".nzb", b"x"])).unwrap(), vec![2, 1, 0, 0, 1]);
+            assert_eq!(call(3, 0, &pack(&[1, 1, 1], &[b"x"])), None);
+            assert_eq!(call(3, 1, &pack(&[1, 0, 0], &[])), None);
+        }
+
+        #[test]
+        fn w38_2_decoder_readiness() {
+            assert_eq!(
+                call(4, 31, &pack(&[4], &[b"auto"])),
+                Some(vec![1, 1, 0, 0, 0, 2])
+            );
+            assert_eq!(
+                call(4, 23, &pack(&[4], &[b"auto"])),
+                Some(vec![1, 1, 0, 0, 2, 2])
+            );
+            assert_eq!(
+                call(4, 0, &pack(&[4], &[b"auto"])),
+                Some(vec![1, 0, 0, 0, 1, 0])
+            );
+            assert_eq!(
+                call(4, 16, &pack(&[6], &[b"native"])),
+                Some(vec![1, 2, 2, 1, 0, 1])
+            );
+            assert_eq!(
+                call(4, 18, &pack(&[3], &[b"php"])),
+                Some(vec![1, 0, 0, 0, 0, 3])
+            );
+            assert_eq!(
+                call(4, 31, &pack(&[4], &[b"Auto"])),
+                Some(vec![0, 2, 1, 1, 0, 2])
+            );
+            assert_eq!(call(4, 0, &pack(&[0], &[])).unwrap()[..3], [0, 2, 1]);
+            assert_eq!(call(4, 4, &pack(&[6], &[b"native"])).unwrap()[..5], [1, 2, 0, 0, 2]);
+            assert_eq!(call(4, 32, &pack(&[0], &[])), None);
+            assert_eq!(call(4, 0, &pack(&[1], &[])), None);
+            assert_eq!(call(4, 0, &pack(&[-1], &[])), None);
+        }
+
+        #[test]
+        fn w38_2_abi_sentinels() {
+            assert_eq!(call(5, 0, &pack(&[0], &[])), None);
+            assert_eq!(call(u32::MAX, 0, &pack(&[0], &[])), None);
+            let input = pack(&[1, 2, 3], &[]);
+            let mut out = [0x5au8; 128];
+            let run = |p: *const u8, len: usize, o: *mut u8, cap: usize| unsafe {
+                evaluate(2, 0, p, len, o, cap)
+            };
+            assert_eq!(run(std::ptr::null(), 0, out.as_mut_ptr(), out.len()), -1);
+            assert_eq!(
+                run(input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), MAX_INPUT + 1, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), usize::MAX, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            for cap in [0, 1, 55] {
+                assert_eq!(run(input.as_ptr(), input.len(), out.as_mut_ptr(), cap), -56);
+            }
+            assert!(out.iter().all(|b| *b == 0x5a));
+            assert_eq!(run(input.as_ptr(), input.len(), out.as_mut_ptr(), 56), 56);
+            assert_eq!(i64::from_ne_bytes(out[40..48].try_into().unwrap()), 3);
+            assert!(out[56..].iter().all(|b| *b == 0x5a));
+            let mut shared = [0u8; 160];
+            shared[..input.len()].copy_from_slice(&input);
+            let p = shared.as_mut_ptr();
+            assert_eq!(run(p, input.len(), unsafe { p.add(8) }, 56), -1);
+            assert_eq!(
+                unsafe {
+                    super::super::nntmux_w38_nntp_service_fingerprint_dispatch_commands(
+                        2,
+                        0,
+                        input.as_ptr(),
+                        input.len(),
+                        out.as_mut_ptr(),
+                        out.len(),
+                    )
+                },
+                56
+            );
+            assert_eq!(
+                unsafe {
+                    super::super::nntmux_w38_nntp_service_fingerprint_dispatch_commands(
+                        2,
+                        1,
+                        input.as_ptr(),
+                        input.len(),
+                        out.as_mut_ptr(),
+                        out.len(),
+                    )
+                },
+                -1
+            );
+        }
+    }
+}
+
+/// Evaluate one Wave 38.2 helper over packed native-endian `i64` slots followed by
+/// any string bytes: op 0 plans an NNTP verification message-id, op 1 plans a
+/// fingerprint enqueue route, op 2 summarizes a database NZB import batch, op 3
+/// classifies an NZB import file and op 4 summarizes yEnc decoder readiness.
+/// `flags` carries per-operation boolean bits; unknown bits are rejected. Returns
+/// the byte count written, the negated required capacity when `out_cap` is too
+/// small (nothing written), or -1 when the input is malformed.
+///
+/// # Safety
+/// Both ranges must be live, disjoint readable/writable allocations. Pointers must
+/// be non-null even for zero lengths; arithmetic checks cannot prove provenance.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w38_nntp_service_fingerprint_dispatch_commands(
+    operation: u32,
+    flags: u32,
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> i64 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        wave38_nntp_service_fingerprint_dispatch_commands::evaluate(
+            operation, flags, input, input_len, out_buf, out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
