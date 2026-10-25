@@ -307,4 +307,180 @@ class ArchiveProcessingService
     {
         return $this->archiveInfo->extractFile($name, $destPath);
     }
+
+    // ---------------------------------------------------------------------
+    // Wave 53.4 batch helper
+    // ---------------------------------------------------------------------
+
+    /** Enabled: minimum of three paired runs cleared every 1.5x gate (common mean 4.24x, p99 3.36x; uncommon mean 3.91x, p99 2.64x); see RustAnidbArchiveMovieBrowseMovieServiceIgdbExW53ParityTest. */
+    private const bool W53_RUST_FFI_DEFAULT = true;
+
+    public const string W53_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w534_archive_entry_class_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** fileNameClassPhp() classes as archiveEntryClassBatch() codes. */
+    private const array W53_CLASS_CODES = ['other' => 0, 'video' => 1, 'audio' => 2, 'image' => 3, 'text' => 4, 'par2' => 5, 'archive' => 6];
+
+    /**
+     * Classify many archive entry names at once. Each name yields three words: its
+     * fileNameClassPhp() class code (other 0, video 1, audio 2, image 3, text 4, par2 5,
+     * archive 6), its volume index (`.partN.rar` N, `.rar` 0, `.rNN` NN + 1, `.NNN` NNN, else -1)
+     * and flags: 1 a sample/proof path token, 2 a directory part, 4 a dot-file base name.
+     *
+     * @param  list<string>  $names
+     * @return list<int>
+     */
+    public static function archiveEntryClassBatch(array $names): array
+    {
+        return self::usesW53RustFfi()
+            ? self::archiveEntryClassBatchNative($names)
+            : self::archiveEntryClassBatchPhp($names);
+    }
+
+    /**
+     * @param  list<string>  $names
+     * @return list<int>
+     */
+    public static function archiveEntryClassBatchNative(array $names): array
+    {
+        self::w53AssertList($names);
+        if ($names === []) {
+            return [];
+        }
+
+        return self::w53Call(implode("\0", $names), '', \count($names), 3)
+            ?? self::archiveEntryClassBatchPhp($names);
+    }
+
+    /**
+     * @param  list<string>  $names
+     * @return list<int>
+     */
+    public static function archiveEntryClassBatchPhp(array $names): array
+    {
+        self::w53AssertList($names);
+        $out = [];
+        foreach ($names as $name) {
+            $out[] = self::W53_CLASS_CODES[self::fileNameClassPhp($name)];
+            if (preg_match('/\.part0*(\d{1,4})\.rar\z/i', $name, $m) === 1) {
+                $out[] = (int) $m[1];
+            } else {
+                $dot = strrpos($name, '.');
+                $extension = $dot === false ? '' : strtolower(substr($name, $dot + 1));
+                $out[] = match (true) {
+                    $dot === false => -1,
+                    $extension === 'rar' => 0,
+                    preg_match('/\Ar\d{2}\z/', $extension) === 1 => (int) substr($extension, 1) + 1,
+                    preg_match('/\A\d{3}\z/', $extension) === 1 => (int) $extension,
+                    default => -1,
+                };
+            }
+            $slash = strrpos(strtr($name, '\\', '/'), '/');
+            $out[] = (preg_match('/(?:\A|[\/\\\\._ -])(?:sample|proof)(?:[\/\\\\._ -]|\z)/i', $name) === 1 ? 1 : 0)
+                | ($slash === false ? 0 : 2)
+                | (($name[$slash === false ? 0 : $slash + 1] ?? '') === '.' ? 4 : 0);
+        }
+
+        return $out;
+    }
+
+    public static function usesW53RustFfi(): bool
+    {
+        $enabled = self::w53RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W53_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W53 batch dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW53RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w53RustFfiState('enabled');
+        self::w53RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w53RustFfiState('enabled', $previous);
+        }
+    }
+
+    /** @param array<array-key, mixed> $values */
+    private static function w53AssertList(array $values): void
+    {
+        if (! array_is_list($values)) {
+            throw new \InvalidArgumentException('W53 batch input must be a list.');
+        }
+    }
+
+    /**
+     * One FFI crossing for the batch: NUL-joined text fields and packed int64 columns in,
+     * `$words` int64 words back per record. Null when the library is missing or declines
+     * (a value holding a NUL byte adds a field, which the export rejects).
+     *
+     * @return list<int>|null
+     */
+    private static function w53Call(string $text, string $ints, int $count, int $words): ?array
+    {
+        try {
+            $state = self::w53RustFfiState();
+            $ffi = $state['ffi'] ?? null;
+            if ($ffi === null) {
+                $ffi = RustPipelineLibrary::resolveDomain('metadata_w53', self::W53_FFI_CDEF) ?? false;
+                self::w53RustFfiState('ffi', $ffi);
+            }
+            if (! $ffi instanceof FFI) {
+                return null;
+            }
+            $need = $count * $words;
+            $out = $state['out'] ?? null;
+            $cap = $state['cap'] ?? 0;
+            if (! $out instanceof CData || ! \is_int($cap) || $cap < $need) {
+                $cap = max(1024, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w53RustFfiState('out', $out);
+                self::w53RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W53_FFI_CDEF.)
+            $written = $ffi->nntmux_w534_archive_entry_class_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, $cap);
+            if ($written !== $need) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $need * 8));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * W53 routing override and cached binding plus reusable output buffer, kept in a function
+     * static: no arguments returns the state, one argument reads a key ('reset' clears
+     * everything) and two arguments write a key.
+     */
+    private static function w53RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+        }
+
+        return $state[$op] ?? null;
+    }
 }

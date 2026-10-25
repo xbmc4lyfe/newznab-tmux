@@ -6,6 +6,7 @@ namespace App\Services\IGDB\Exceptions;
 
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use RuntimeException;
 use Throwable;
 
@@ -183,5 +184,209 @@ class IgdbHttpException extends RuntimeException
         }
 
         return self::$ffi === false ? null : self::$ffi;
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 53.4 batch helper
+    // ---------------------------------------------------------------------
+
+    /** Enabled: minimum of three paired runs cleared every 1.5x gate (common mean 3.02x, p99 2.29x; uncommon mean 2.67x, p99 2.06x); see RustAnidbArchiveMovieBrowseMovieServiceIgdbExW53ParityTest. */
+    private const bool W53_RUST_FFI_DEFAULT = true;
+
+    public const string W53_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w534_igdb_failure_class_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * classifyHttpFailurePhp() for many failures at once, as offsets instead of copies. Each
+     * failure yields four words: the category code (transport 0, auth 1, not_found 2, timeout 3,
+     * rate_limited 4, client 5, server 6, unknown 7) | 16 when retryable | 32 when the message is
+     * blank, the trimmed message span (offset << 32 | length), the final message length and the
+     * body excerpt span, or -1 when the body is null or blank.
+     *
+     * @param  list<int>  $statusCodes
+     * @param  list<string>  $messages
+     * @param  list<?string>  $bodies
+     * @return list<int>
+     */
+    public static function classifyHttpFailureBatch(array $statusCodes, array $messages, array $bodies): array
+    {
+        return self::usesW53RustFfi()
+            ? self::classifyHttpFailureBatchNative($statusCodes, $messages, $bodies)
+            : self::classifyHttpFailureBatchPhp($statusCodes, $messages, $bodies);
+    }
+
+    /**
+     * @param  list<int>  $statusCodes
+     * @param  list<string>  $messages
+     * @param  list<?string>  $bodies
+     * @return list<int>
+     */
+    public static function classifyHttpFailureBatchNative(array $statusCodes, array $messages, array $bodies): array
+    {
+        $count = self::w53AssertColumns($statusCodes, $messages, $bodies);
+        if ($count === 0) {
+            return [];
+        }
+
+        // Messages then bodies; implode() writes a null body as ''.
+        return self::w53Call(implode("\0", $messages)."\0".implode("\0", $bodies), pack('P*', ...$statusCodes), $count, 4)
+            ?? self::classifyHttpFailureBatchPhp($statusCodes, $messages, $bodies);
+    }
+
+    /**
+     * @param  list<int>  $statusCodes
+     * @param  list<string>  $messages
+     * @param  list<?string>  $bodies
+     * @return list<int>
+     */
+    public static function classifyHttpFailureBatchPhp(array $statusCodes, array $messages, array $bodies): array
+    {
+        self::w53AssertColumns($statusCodes, $messages, $bodies);
+        $out = [];
+        foreach ($statusCodes as $i => $statusCode) {
+            $category = match (true) {
+                $statusCode === 0 => 16,
+                $statusCode === 401, $statusCode === 403 => 1,
+                $statusCode === 404 => 2,
+                $statusCode === 408 => 3 | 16,
+                $statusCode === 429 => 4 | 16,
+                $statusCode >= 400 && $statusCode <= 499 => 5,
+                $statusCode >= 500 && $statusCode <= 599 => 6 | 16,
+                default => 7,
+            };
+            $message = $messages[$i];
+            $trimmed = trim($message, self::WHITESPACE);
+            $body = $bodies[$i] ?? '';
+            $excerpt = trim($body, self::WHITESPACE);
+            array_push(
+                $out,
+                $trimmed === '' ? $category | 32 : $category,
+                strspn($message, self::WHITESPACE) << 32 | \strlen($trimmed),
+                $trimmed === ''
+                    ? \strlen("IGDB request failed with HTTP status {$statusCode}")
+                    : \strlen(preg_replace('/[ \t\n\r\0\x0B\x0C]+/', ' ', $trimmed) ?? ''),
+                $excerpt === '' ? -1 : strspn($body, self::WHITESPACE) << 32 | min(\strlen($excerpt), self::BODY_EXCERPT_MAX),
+            );
+        }
+
+        return $out;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $statusCodes
+     * @param  array<array-key, mixed>  $messages
+     * @param  array<array-key, mixed>  $bodies
+     */
+    private static function w53AssertColumns(array $statusCodes, array $messages, array $bodies): int
+    {
+        self::w53AssertList($statusCodes);
+        self::w53AssertList($messages);
+        self::w53AssertList($bodies);
+        $count = \count($statusCodes);
+        if (\count($messages) !== $count || \count($bodies) !== $count) {
+            throw new \InvalidArgumentException('W53 failure columns must have the same length.');
+        }
+
+        return $count;
+    }
+
+    public static function usesW53RustFfi(): bool
+    {
+        $enabled = self::w53RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W53_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W53 batch dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW53RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w53RustFfiState('enabled');
+        self::w53RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w53RustFfiState('enabled', $previous);
+        }
+    }
+
+    /** @param array<array-key, mixed> $values */
+    private static function w53AssertList(array $values): void
+    {
+        if (! array_is_list($values)) {
+            throw new \InvalidArgumentException('W53 batch input must be a list.');
+        }
+    }
+
+    /**
+     * One FFI crossing for the batch: NUL-joined text fields and packed int64 columns in,
+     * `$words` int64 words back per record. Null when the library is missing or declines
+     * (a value holding a NUL byte adds a field, which the export rejects).
+     *
+     * @return list<int>|null
+     */
+    private static function w53Call(string $text, string $ints, int $count, int $words): ?array
+    {
+        try {
+            $state = self::w53RustFfiState();
+            $ffi = $state['ffi'] ?? null;
+            if ($ffi === null) {
+                $ffi = RustPipelineLibrary::resolveDomain('metadata_w53', self::W53_FFI_CDEF) ?? false;
+                self::w53RustFfiState('ffi', $ffi);
+            }
+            if (! $ffi instanceof FFI) {
+                return null;
+            }
+            $need = $count * $words;
+            $out = $state['out'] ?? null;
+            $cap = $state['cap'] ?? 0;
+            if (! $out instanceof CData || ! \is_int($cap) || $cap < $need) {
+                $cap = max(1024, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w53RustFfiState('out', $out);
+                self::w53RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W53_FFI_CDEF.)
+            $written = $ffi->nntmux_w534_igdb_failure_class_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, $cap);
+            if ($written !== $need) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $need * 8));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * W53 routing override and cached binding plus reusable output buffer, kept in a function
+     * static: no arguments returns the state, one argument reads a key ('reset' clears
+     * everything) and two arguments write a key.
+     */
+    private static function w53RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+        }
+
+        return $state[$op] ?? null;
     }
 }
