@@ -14,6 +14,7 @@ use App\Services\Releases\ReleaseGroupResolver;
 use App\Support\NzbPasswordMetadata;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Database\Query\Builder;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Carbon;
@@ -1949,5 +1950,178 @@ final class CandidateRepository
                 $this->store->deleteIfUnreferenced($candidate->manifest_path);
             });
         }, 5);
+    }
+
+    /** Wave 49.2 paired benchmarks decide this default; see RustVerificationAdmissionInventoryPrepRepoSampleW49ParityTest. */
+    private const W49_RUST_FFI_DEFAULT = true;
+
+    public const string W49_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w49_candidate_repository_partial_batch(const char *lasts, size_t lasts_len, const char *statuses, size_t statuses_len, const char *reasons, size_t reasons_len, size_t count, const char *owed, size_t owed_len, const char *hold, size_t hold_len, int64_t *out, size_t out_cap);
+        C;
+
+    private static ?bool $w49RustFfi = null;
+
+    private static FFI|false|null $w49Ffi = null;
+
+    private static ?CData $w49Out = null;
+
+    private static int $w49OutCap = 0;
+
+    public static function usesW49RustFfi(): bool
+    {
+        return self::$w49RustFfi ?? self::W49_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with classifyPartialPromotions() routed to Rust ($enabled) or PHP, then restores the previous
+     * routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW49RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$w49RustFfi;
+        self::$w49RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$w49RustFfi = $previous;
+        }
+    }
+
+    /**
+     * Batch classification of waiting candidates for promotePartial() and expiry. One word per
+     * row: `action (0 deferred to expiry: reason starts with the deferred prefix or last unique
+     * article older than $owedCutoff, 1 eligible: older than $holdCutoff, 2 still held) | 4
+     * isOwedPartialAttemptPhp() | 8 deferred prefix | 16 queued reason | 32 last >= $owedCutoff |
+     * 64 last < $holdCutoff | 128 waiting_upload | 256 ready`, compared with PHP's operators
+     * (null as ''). Then eligible, deferred, held and owed counts and the XXH64 digest of all
+     * earlier words.
+     *
+     * @param  list<string|null>  $lastUniqueAts
+     * @param  list<string>  $statuses
+     * @param  list<string|null>  $reasons
+     * @return list<int>
+     */
+    public static function classifyPartialPromotions(array $lastUniqueAts, array $statuses, array $reasons, string $owedCutoff, string $holdCutoff): array
+    {
+        return self::usesW49RustFfi()
+            ? self::classifyPartialPromotionsNative($lastUniqueAts, $statuses, $reasons, $owedCutoff, $holdCutoff)
+            : self::classifyPartialPromotionsPhp($lastUniqueAts, $statuses, $reasons, $owedCutoff, $holdCutoff);
+    }
+
+    /**
+     * @param  list<string|null>  $lastUniqueAts
+     * @param  list<string>  $statuses
+     * @param  list<string|null>  $reasons
+     * @return list<int>
+     */
+    public static function classifyPartialPromotionsPhp(array $lastUniqueAts, array $statuses, array $reasons, string $owedCutoff, string $holdCutoff): array
+    {
+        $out = [];
+        $eligible = $deferred = $held = $owed = 0;
+        foreach ($lastUniqueAts as $i => $last) {
+            $status = $statuses[$i] ?? '';
+            $reason = $reasons[$i] ?? null;
+            $isDeferred = str_starts_with((string) ($reason ?? ''), self::PARTIAL_DEFERRED);
+            $queued = $reason === self::PARTIAL_QUEUED;
+            $geOwed = $last >= $owedCutoff;
+            $ltHold = $last < $holdCutoff;
+            $waiting = $status === 'waiting_upload';
+            $ready = $status === 'ready';
+            $owes = $geOwed && (($waiting && ! $isDeferred) || ($ready && $queued));
+            if ($isDeferred || ! $geOwed) {
+                $action = 0;
+                $deferred++;
+            } elseif ($ltHold) {
+                $action = 1;
+                $eligible++;
+            } else {
+                $action = 2;
+                $held++;
+            }
+            $owed += (int) $owes;
+            $out[] = $action | (int) $owes << 2 | (int) $isDeferred << 3 | (int) $queued << 4 | (int) $geOwed << 5
+                | (int) $ltHold << 6 | (int) $waiting << 7 | (int) $ready << 8;
+        }
+        $out[] = $eligible;
+        $out[] = $deferred;
+        $out[] = $held;
+        $out[] = $owed;
+
+        return self::w49Digest($out);
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, the lists differ in length, a
+     * value holds a NUL byte or a comparison may be numeric.
+     *
+     * @param  list<string|null>  $lastUniqueAts
+     * @param  list<string>  $statuses
+     * @param  list<string|null>  $reasons
+     * @return list<int>
+     */
+    public static function classifyPartialPromotionsNative(array $lastUniqueAts, array $statuses, array $reasons, string $owedCutoff, string $holdCutoff): array
+    {
+        $count = \count($lastUniqueAts);
+        $ffi = $count === 0 ? null : (self::$w49Ffi instanceof FFI ? self::$w49Ffi : self::w49Ffi());
+        if ($ffi === null || \count($statuses) !== $count || \count($reasons) !== $count) {
+            return self::classifyPartialPromotionsPhp($lastUniqueAts, $statuses, $reasons, $owedCutoff, $holdCutoff);
+        }
+        $joinedLasts = implode("\0", $lastUniqueAts);
+        $joinedStatuses = implode("\0", $statuses);
+        $joinedReasons = implode("\0", $reasons);
+        $words = $count + 5;
+        $values = false;
+        // Rust rejects a column whose NUL count differs from $count - 1 (an embedded NUL byte).
+        try {
+            $out = self::w49Out($ffi, $words);
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w49_candidate_repository_partial_batch($joinedLasts, \strlen($joinedLasts), $joinedStatuses, \strlen($joinedStatuses), $joinedReasons, \strlen($joinedReasons), $count, $owedCutoff, \strlen($owedCutoff), $holdCutoff, \strlen($holdCutoff), $out, self::$w49OutCap);
+            $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+        } catch (Throwable) {
+            $values = false;
+        }
+
+        /** @var list<int>|null $result */
+        $result = \is_array($values) ? array_values($values) : null;
+
+        return $result ?? self::classifyPartialPromotionsPhp($lastUniqueAts, $statuses, $reasons, $owedCutoff, $holdCutoff);
+    }
+
+    private static function w49Ffi(): ?FFI
+    {
+        self::$w49Ffi ??= RustPipelineLibrary::resolveDomain('nfo_w49', self::W49_FFI_CDEF) ?? false;
+
+        return self::$w49Ffi === false ? null : self::$w49Ffi;
+    }
+
+    /** A reusable output buffer of at least $words `int64_t` words; FFI::new() throws on failure. */
+    private static function w49Out(FFI $ffi, int $words): CData
+    {
+        if (self::$w49Out === null || self::$w49OutCap < $words) {
+            self::$w49Out = $ffi->new('int64_t['.max(1024, $words).']');
+            self::$w49OutCap = max(1024, $words);
+        }
+
+        return self::$w49Out;
+    }
+
+    /**
+     * Appends the XXH64 digest of the words.
+     *
+     * @param  list<int>  $words
+     * @return list<int>
+     */
+    private static function w49Digest(array $words): array
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$words), true));
+        $words[] = $digest[1];
+
+        return $words;
     }
 }
