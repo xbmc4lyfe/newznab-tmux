@@ -28,8 +28,11 @@ use Throwable;
  */
 class MediaSourceStage
 {
+    public const bool W45_RUST_FFI_DEFAULT = false;
+
     public const string FFI_CDEF = <<<'C'
         int64_t nntmux_media_middle_volume_index(const char *titles, size_t len, size_t count);
+        int32_t nntmux_w45_source_has_work(int32_t enabled, int64_t seconds, int32_t found, int32_t password, int32_t unavailable, int32_t archived, int32_t main);
         C;
 
     private const float POSTED_SIZE_TO_REAL_SIZE = 0.97;
@@ -38,7 +41,17 @@ class MediaSourceStage
 
     private static bool $ffiResolved = false;
 
-    private static bool $useRustFfi = true;
+    private static bool $useRustFfi = self::W45_RUST_FFI_DEFAULT;
+
+    public static function useW45RustFfi(?bool $enabled): void
+    {
+        self::$useRustFfi = $enabled ?? self::W45_RUST_FFI_DEFAULT;
+    }
+
+    public static function usesW45RustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
 
     public function __construct(
         private readonly ProcessingConfiguration $config,
@@ -51,12 +64,49 @@ class MediaSourceStage
 
     public function hasWork(ReleaseProcessingContext $context): bool
     {
+        if (! self::$useRustFfi) {
+            return $this->hasWorkPhp($context);
+        }
+
+        return $this->hasWorkNative($context) ?? $this->hasWorkPhp($context);
+    }
+
+    public function hasWorkPhp(ReleaseProcessingContext $context): bool
+    {
         return $this->config->processThumbnails
             && $this->config->mediaStageMaxSeconds > 0
             && ! $context->foundSample
             && ! $context->releaseHasPassword
             && ! $context->groupUnavailable
             && ($context->archivedMedia !== [] || $this->mainVideoIndexes($context) !== []);
+    }
+
+    public function hasWorkNative(ReleaseProcessingContext $context): ?bool
+    {
+        $ffi = self::rustFfi();
+        if ($ffi === null) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $result = $ffi->nntmux_w45_source_has_work(
+                (int) $this->config->processThumbnails,
+                $this->config->mediaStageMaxSeconds,
+                (int) $context->foundSample,
+                (int) $context->releaseHasPassword,
+                (int) $context->groupUnavailable,
+                (int) ($context->archivedMedia !== []),
+                (int) ($this->mainVideoIndexes($context) !== []),
+            );
+        } catch (Throwable) {
+            return null;
+        }
+
+        return match ($result) {
+            0 => false,
+            1 => true,
+            default => null,
+        };
     }
 
     public function run(ReleaseProcessingContext $context): void
@@ -303,9 +353,9 @@ class MediaSourceStage
      */
     public static function middleVolumeIndex(array $titles): ?int
     {
-        // Retains the native PHP path: typical sets of 8-20 volumes measured 1.07x mean /
-        // 0.91x p99 (80-200 volumes: 2.48x / 2.79x); see middleVolumeIndexNative().
-        return self::middleVolumeIndexPhp($titles);
+        // Wave 45 caller benchmarks retain PHP by default; larger sets alone
+        // cannot qualify the common-path mean and p99 adoption gate.
+        return self::$useRustFfi ? self::middleVolumeIndexNative($titles) : self::middleVolumeIndexPhp($titles);
     }
 
     /**
@@ -340,6 +390,9 @@ class MediaSourceStage
             return self::middleVolumeIndexPhp($titles);
         }
         $joined = implode("\0", $titles);
+        if (substr_count($joined, "\0") !== $count - 1) {
+            return self::middleVolumeIndexPhp($titles);
+        }
         if ($asciiOnly && preg_match('/[\x80-\xff]/', $joined) === 1) {
             return self::middleVolumeIndexPhp($titles);
         }
@@ -360,9 +413,9 @@ class MediaSourceStage
     /**
      * Toggle the Rust helpers; disabled, every *Native method falls back to PHP.
      */
-    public static function useRustFfi(bool $use): void
+    public static function useRustFfi(?bool $use): void
     {
-        self::$useRustFfi = $use;
+        self::useW45RustFfi($use);
     }
 
     private static function rustFfi(): ?FFI
