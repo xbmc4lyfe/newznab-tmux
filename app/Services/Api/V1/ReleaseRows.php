@@ -16,6 +16,15 @@ final class ReleaseRows
     private const string FFI_CDEF = 'int64_t nntmux_api_release_rows_total(const char *input, size_t len);';
 
     /**
+     * The Wave 46.5 `_totalrows` summary defaults to Rust: every common and uncommon mean and p99 ratio
+     * cleared 1.5x (min 2.39/1.78/3.63/2.83x); see
+     * tests/Unit/RustApiV1V2PresenterPayloadRowsXmlContextW46ParityTest.php.
+     */
+    public const bool W465_RUST_FFI_DEFAULT = true;
+
+    private static ?bool $useW465RustFfi = null;
+
+    /**
      * @var list<mixed>|null
      */
     private ?array $rows = null;
@@ -145,6 +154,89 @@ final class ReleaseRows
         }
 
         return \is_int($total) && $total !== PHP_INT_MIN ? $total : null;
+    }
+
+    /** Pass null to restore {@see W465_RUST_FFI_DEFAULT}. */
+    public static function useW465RustFfi(?bool $enable = true): void
+    {
+        self::$useW465RustFfi = $enable;
+    }
+
+    public static function usesW465RustFfi(): bool
+    {
+        return self::$useW465RustFfi ?? self::W465_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW465RustFfi(): void
+    {
+        self::$useW465RustFfi = null;
+    }
+
+    /**
+     * Summarizes {@see totalRowsFromPhp()} over string `_totalrows` projection values: `numeric` values
+     * (is_numeric()), `zero` and `negative` totals, `max_total`/`min_total` (0 without strings) and
+     * `distinct_totals`. Non-string values are invalid.
+     *
+     * @param  array<array-key, mixed>  $values
+     * @return array{values: int, invalid: int, numeric: int, zero: int, negative: int, max_total: int, min_total: int, distinct_totals: int}
+     */
+    public static function summarizeTotalRowsBatch(array $values): array
+    {
+        return self::usesW465RustFfi() ? self::summarizeTotalRowsBatchNative($values) : self::summarizeTotalRowsBatchPhp($values);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $values
+     * @return array{values: int, invalid: int, numeric: int, zero: int, negative: int, max_total: int, min_total: int, distinct_totals: int}
+     */
+    public static function summarizeTotalRowsBatchPhp(array $values): array
+    {
+        $summary = ['values' => \count($values), 'invalid' => 0, 'numeric' => 0, 'zero' => 0, 'negative' => 0, 'max_total' => 0, 'min_total' => 0, 'distinct_totals' => 0];
+        $distinct = [];
+        $max = null;
+        $min = null;
+        foreach ($values as $value) {
+            if (! \is_string($value)) {
+                $summary['invalid']++;
+
+                continue;
+            }
+            $total = self::totalRowsFromPhp($value, 0);
+            $summary['numeric'] += (int) is_numeric($value);
+            $summary['zero'] += (int) ($total === 0);
+            $summary['negative'] += (int) ($total < 0);
+            $max = $max === null ? $total : max($max, $total);
+            $min = $min === null ? $total : min($min, $total);
+            $distinct[$total] = true;
+        }
+        $summary['max_total'] = $max ?? 0;
+        $summary['min_total'] = $min ?? 0;
+        $summary['distinct_totals'] = \count($distinct);
+
+        return $summary;
+    }
+
+    /**
+     * Rust declines float forms, integer overflow and strings holding a NUL; PHP then serves the batch.
+     *
+     * @param  array<array-key, mixed>  $values
+     * @return array{values: int, invalid: int, numeric: int, zero: int, negative: int, max_total: int, min_total: int, distinct_totals: int}
+     */
+    public static function summarizeTotalRowsBatchNative(array $values): array
+    {
+        $strings = [];
+        foreach ($values as $value) {
+            if (\is_string($value)) {
+                $strings[] = $value;
+            }
+        }
+        $fields = ApiV1Presenter::evaluateW465Counters(3, ApiV1Presenter::w465Joined($strings), 6);
+        if ($fields === null) {
+            return self::summarizeTotalRowsBatchPhp($values);
+        }
+
+        return ['values' => \count($values), 'invalid' => \count($values) - \count($strings)]
+            + array_combine(['numeric', 'zero', 'negative', 'max_total', 'min_total', 'distinct_totals'], $fields);
     }
 
     private function value(mixed $row, string $key): mixed
