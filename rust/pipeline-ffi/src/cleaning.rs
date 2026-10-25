@@ -28257,3 +28257,537 @@ mod wave40_1_collection_cleaning_remover_blacklist_tests {
         assert_eq!(&out[48..], &[0x5a; 16]);
     }
 }
+
+// Wave 41.1: second-pass summaries for binaries chunk settings, scan article ranges, binary
+// record batches, parsed header batches and header storage chunks. Frames use the Wave 39.1
+// encoding: an i64 word count, that many native-endian i64 words and a byte blob, with one
+// array/other marker per row followed by its values.
+pub mod wave41_1_binaries_config_service_handler_header {
+    use std::collections::HashSet;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    use super::php_trim_ascii;
+    use super::wave39_1_admin_regex_category_release_blacklist::{Frame, Value};
+
+    pub const DECLINE: isize = -1;
+    pub const MAX_INPUT: usize = 16 * 1024 * 1024;
+
+    pub const OP_CHUNK_SETTINGS: u32 = 1;
+    pub const OP_SCAN_RANGES: u32 = 2;
+    pub const OP_BINARY_RECORDS: u32 = 3;
+    pub const OP_HEADER_BATCH: u32 = 4;
+    pub const OP_STORAGE_CHUNKS: u32 = 5;
+
+    fn with_total(count: usize, counts: &[i64]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(counts.len() + 1);
+        out.push(count as i64);
+        out.extend_from_slice(counts);
+        out
+    }
+
+    fn missing(value: Value) -> bool {
+        value
+            .str()
+            .is_none_or(|text| php_trim_ascii(text).is_empty())
+    }
+
+    /// `BinariesConfig::summarizeChunkSettingsBatchPhp()`.
+    fn chunk_settings(frame: &mut Frame) -> Option<Vec<i64>> {
+        let sql_cap = frame.int()?;
+        let count = frame.count()?;
+        let mut counts = [0_i64; 6];
+        let [invalid, non_positive, exceeds, over_cap, disabled, max_sql] = &mut counts;
+        for _ in 0..count {
+            if !frame.row()? {
+                *invalid += 1;
+                continue;
+            }
+            let (header, sql, obfuscation) = (frame.value()?, frame.value()?, frame.value()?);
+            match (header.int(), sql.int()) {
+                (Some(header), Some(sql)) if header > 0 && sql > 0 => {
+                    *exceeds += i64::from(header > sql);
+                    *over_cap += i64::from(sql > sql_cap);
+                    *max_sql = (*max_sql).max(sql);
+                }
+                _ => *non_positive += 1,
+            }
+            *disabled += i64::from(obfuscation.int() == Some(0));
+        }
+        Some(with_total(count, &counts))
+    }
+
+    /// `BinariesService::summarizeScanRangeBatchPhp()`.
+    fn scan_ranges(frame: &mut Frame) -> Option<Vec<i64>> {
+        let max_headers = frame.int()?;
+        let count = frame.count()?;
+        let mut counts = [0_i64; 6];
+        let [invalid, negative, empty, valid, capped, total] = &mut counts;
+        for _ in 0..count {
+            if !frame.row()? {
+                *invalid += 1;
+                continue;
+            }
+            let (first, last) = (frame.value()?, frame.value()?);
+            let (Some(first), Some(last)) = (first.int(), last.int()) else {
+                *invalid += 1;
+                continue;
+            };
+            if first < 0 || last < 0 {
+                *negative += 1;
+            } else if last < first {
+                *empty += 1;
+            } else {
+                *valid += 1;
+                let span = (last - first).saturating_add(1);
+                *capped += i64::from(max_headers > 0 && span > max_headers);
+                *total = total.saturating_add(span);
+            }
+        }
+        Some(with_total(count, &counts))
+    }
+
+    /// A 32-byte lowercase hexadecimal MD5 digest.
+    fn md5_hex(hash: &[u8]) -> bool {
+        hash.len() == 32
+            && hash
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    }
+
+    /// `BinaryHandler::summarizeBinaryRecordBatchPhp()`.
+    fn binary_records(frame: &mut Frame) -> Option<Vec<i64>> {
+        let count = frame.count()?;
+        let mut counts = [0_i64; 6];
+        let mut seen: HashSet<(i64, &[u8])> = HashSet::new();
+        let [
+            invalid,
+            bad_hash,
+            bad_collection,
+            duplicates,
+            over_total,
+            total,
+        ] = &mut counts;
+        for _ in 0..count {
+            if !frame.row()? {
+                *invalid += 1;
+                continue;
+            }
+            let (hash, collection, parts, number) = (
+                frame.value()?,
+                frame.value()?,
+                frame.value()?,
+                frame.value()?,
+            );
+            let hash = hash.str().filter(|hash| md5_hex(hash));
+            let collection = collection.int().filter(|id| *id > 0);
+            *bad_hash += i64::from(hash.is_none());
+            *bad_collection += i64::from(collection.is_none());
+            if let (Some(hash), Some(collection)) = (hash, collection) {
+                *duplicates += i64::from(!seen.insert((collection, hash)));
+            }
+            let parts = parts.int();
+            if let (Some(parts), Some(number)) = (parts, number.int()) {
+                *over_total += i64::from(parts > 0 && number > parts);
+            }
+            if let Some(parts) = parts.filter(|parts| *parts > 0) {
+                *total = total.saturating_add(parts);
+            }
+        }
+        Some(with_total(count, &counts))
+    }
+
+    /// PCRE `\(\d+\/\d+\)` without `/u`: ASCII digits only.
+    pub fn part_counter(subject: &[u8]) -> bool {
+        let digits = |from: usize| {
+            subject[from..]
+                .iter()
+                .take_while(|byte| byte.is_ascii_digit())
+                .count()
+        };
+        subject.iter().enumerate().any(|(open, byte)| {
+            if *byte != b'(' {
+                return false;
+            }
+            let first = digits(open + 1);
+            let slash = open + 1 + first;
+            if first == 0 || subject.get(slash) != Some(&b'/') {
+                return false;
+            }
+            let second = digits(slash + 1);
+            second > 0 && subject.get(slash + 1 + second) == Some(&b')')
+        })
+    }
+
+    /// `stripos($subject, 'yenc') !== false`.
+    pub fn has_yenc(subject: &[u8]) -> bool {
+        subject
+            .windows(4)
+            .any(|window| window.eq_ignore_ascii_case(b"yenc"))
+    }
+
+    /// `HeaderParser::summarizeHeaderBatchPhp()`.
+    fn header_batch(frame: &mut Frame) -> Option<Vec<i64>> {
+        let count = frame.count()?;
+        let mut counts = [0_i64; 7];
+        let mut any = false;
+        let [invalid, no_subject, yenc, counter, bad_number, min, max] = &mut counts;
+        for _ in 0..count {
+            if !frame.row()? {
+                *invalid += 1;
+                continue;
+            }
+            let (subject, number) = (frame.value()?, frame.value()?);
+            *no_subject += i64::from(missing(subject));
+            if let Some(subject) = subject.str() {
+                *yenc += i64::from(has_yenc(subject));
+                *counter += i64::from(part_counter(subject));
+            }
+            match number.int() {
+                Some(number) if number > 0 => {
+                    if any {
+                        *min = (*min).min(number);
+                        *max = (*max).max(number);
+                    } else {
+                        (*min, *max, any) = (number, number, true);
+                    }
+                }
+                _ => *bad_number += 1,
+            }
+        }
+        Some(with_total(count, &counts))
+    }
+
+    /// `HeaderStorageService::summarizeStorageChunkBatchPhp()`.
+    fn storage_chunks(frame: &mut Frame) -> Option<Vec<i64>> {
+        let size = frame.int()?.max(1);
+        let count = frame.count()?;
+        let rows = count as i64;
+        let mut counts = [0_i64; 6];
+        let [invalid, chunks, no_id, bad_bytes, oversized, total] = &mut counts;
+        *chunks = rows / size + i64::from(rows % size != 0);
+        for _ in 0..count {
+            if !frame.row()? {
+                *invalid += 1;
+                continue;
+            }
+            let (message_id, bytes, subject) = (frame.value()?, frame.value()?, frame.value()?);
+            *no_id += i64::from(missing(message_id));
+            match bytes.int() {
+                Some(bytes) if bytes >= 0 => *total = total.saturating_add(bytes),
+                _ => *bad_bytes += 1,
+            }
+            *oversized += i64::from(subject.str().is_some_and(|subject| subject.len() > 255));
+        }
+        Some(with_total(count, &counts))
+    }
+
+    pub fn compute(operation: u32, flags: u32, bytes: &[u8]) -> Option<Vec<u8>> {
+        if flags != 0 {
+            return None;
+        }
+        let mut frame = Frame::new(bytes)?;
+        let values = match operation {
+            OP_CHUNK_SETTINGS => chunk_settings(&mut frame)?,
+            OP_SCAN_RANGES => scan_ranges(&mut frame)?,
+            OP_BINARY_RECORDS => binary_records(&mut frame)?,
+            OP_HEADER_BATCH => header_batch(&mut frame)?,
+            OP_STORAGE_CHUNKS => storage_chunks(&mut frame)?,
+            _ => return None,
+        };
+        if !frame.done() || values.len().checked_mul(8)? > MAX_INPUT {
+            return None;
+        }
+        Some(values.iter().flat_map(|v| v.to_ne_bytes()).collect())
+    }
+
+    /// Returns bytes written, `-required` when `out_cap` is too small, or -1 for an unknown
+    /// operation, a nonzero flag word, a malformed frame, invalid/overlapping pointer ranges or a
+    /// caught panic. Negative returns never modify `out_buf`; the caller owns both buffers.
+    ///
+    /// # Safety
+    /// `input` must be readable for `input_len` bytes and `out_buf` writable for `out_cap`
+    /// bytes. Both pointers must be nonnull and the ranges must not overlap.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w411_binaries_config_service_handler_header(
+        operation: u32,
+        flags: u32,
+        input: *const u8,
+        input_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !(OP_CHUNK_SETTINGS..=OP_STORAGE_CHUNKS).contains(&operation)
+                || flags != 0
+                || input.is_null()
+                || out_buf.is_null()
+                || input_len > MAX_INPUT
+                || out_cap > isize::MAX as usize
+            {
+                return DECLINE;
+            }
+            let Some(input_end) = (input as usize).checked_add(input_len) else {
+                return DECLINE;
+            };
+            let Some(out_end) = (out_buf as usize).checked_add(out_cap) else {
+                return DECLINE;
+            };
+            if input_len != 0
+                && out_cap != 0
+                && (input as usize) < out_end
+                && (out_buf as usize) < input_end
+            {
+                return DECLINE;
+            }
+            let bytes = if input_len == 0 {
+                &[][..]
+            } else {
+                unsafe { slice::from_raw_parts(input, input_len) }
+            };
+            let Some(result) = compute(operation, flags, bytes) else {
+                return DECLINE;
+            };
+            if result.len() > out_cap {
+                return -(result.len() as isize);
+            }
+            unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), out_buf, result.len()) };
+            result.len() as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+}
+
+#[cfg(test)]
+mod wave41_1_binaries_config_service_handler_header_tests {
+    use super::wave39_1_admin_regex_category_release_blacklist::Value;
+    use super::wave41_1_binaries_config_service_handler_header::*;
+
+    #[derive(Default)]
+    struct Builder {
+        words: Vec<i64>,
+        blob: Vec<u8>,
+    }
+
+    impl Builder {
+        fn int(mut self, value: i64) -> Self {
+            self.words.push(value);
+            self
+        }
+
+        fn value(mut self, value: Value) -> Self {
+            match value {
+                Value::Other => self.words.push(-1),
+                Value::Int(v) => self.words.extend([-2, v]),
+                Value::Float(v) => {
+                    self.words.push(-3);
+                    self.blob.extend(v.to_ne_bytes());
+                }
+                Value::Str(s) => {
+                    self.words.push(s.len() as i64);
+                    self.blob.extend_from_slice(s);
+                }
+            }
+            self
+        }
+
+        fn row(self, fields: &[Value]) -> Self {
+            fields.iter().fold(self.int(1), |b, v| b.value(*v))
+        }
+
+        fn build(&self) -> Vec<u8> {
+            let mut out = (self.words.len() as i64).to_ne_bytes().to_vec();
+            out.extend(self.words.iter().flat_map(|w| w.to_ne_bytes()));
+            out.extend_from_slice(&self.blob);
+            out
+        }
+    }
+
+    fn run(operation: u32, builder: &Builder) -> Vec<i64> {
+        compute(operation, 0, &builder.build())
+            .expect("frame accepted")
+            .chunks(8)
+            .map(|c| i64::from_ne_bytes(c.try_into().unwrap()))
+            .collect()
+    }
+
+    use Value::{Float, Int, Other, Str};
+
+    const HASH: &[u8] = b"0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn w411_chunk_settings_flag_rows() {
+        let frame = Builder::default()
+            .int(1_000)
+            .int(6)
+            .row(&[Int(500), Int(500), Int(16)])
+            .row(&[Str(b"800"), Str(b"400"), Str(b"0")])
+            .row(&[Int(10), Int(2_000), Int(0)])
+            .row(&[Int(0), Int(500), Other])
+            .row(&[Float(5.0), Int(5), Int(1)])
+            .int(0);
+        assert_eq!(run(OP_CHUNK_SETTINGS, &frame), [6, 1, 2, 1, 1, 2, 2_000]);
+    }
+
+    #[test]
+    fn w411_scan_ranges_count_spans() {
+        let frame = Builder::default()
+            .int(100)
+            .int(7)
+            .row(&[Int(10), Int(19)])
+            .row(&[Str(b"5"), Str(b"500")])
+            .row(&[Int(20), Int(19)])
+            .row(&[Int(-1), Int(5)])
+            .row(&[Int(1), Str(b"x")])
+            .row(&[Int(0), Int(i64::MAX)])
+            .int(0);
+        assert_eq!(run(OP_SCAN_RANGES, &frame), [7, 2, 1, 1, 3, 2, i64::MAX]);
+        let none = Builder::default().int(0).int(1).row(&[Int(1), Int(500)]);
+        assert_eq!(run(OP_SCAN_RANGES, &none), [1, 0, 0, 0, 1, 0, 500]);
+    }
+
+    #[test]
+    fn w411_binary_records_detect_duplicates() {
+        let frame = Builder::default()
+            .int(7)
+            .row(&[Str(HASH), Int(1), Int(10), Int(3)])
+            .row(&[Str(HASH), Str(b"1"), Str(b"10"), Int(11)])
+            .row(&[Str(HASH), Int(2), Int(5), Int(1)])
+            .row(&[
+                Str(b"0123456789ABCDEF0123456789abcdef"),
+                Int(1),
+                Int(0),
+                Int(1),
+            ])
+            .row(&[Str(HASH), Int(0), Int(-4), Other])
+            .row(&[Other, Other, Int(i64::MAX), Int(1)])
+            .int(0);
+        assert_eq!(run(OP_BINARY_RECORDS, &frame), [7, 1, 2, 2, 1, 1, i64::MAX]);
+    }
+
+    #[test]
+    fn w411_part_counter_and_yenc_match_php() {
+        assert!(part_counter(b"a (1/2)"));
+        assert!(part_counter(b"(1/2) (x"));
+        assert!(part_counter(b"((12/345)"));
+        assert!(!part_counter(b"(1/2"));
+        assert!(!part_counter(b"(/2)"));
+        assert!(!part_counter(b"(1/)"));
+        assert!(!part_counter(b"(1 /2)"));
+        assert!(!part_counter(b"("));
+        assert!(!part_counter(b""));
+        assert!(has_yenc(b"x YeNc"));
+        assert!(!has_yenc(b"yen"));
+        assert!(!has_yenc("ÿENC".as_bytes()));
+    }
+
+    #[test]
+    fn w411_header_batch_summarizes_subjects() {
+        let frame = Builder::default()
+            .int(6)
+            .row(&[Str(b"Show - \"a.rar\" yEnc (1/50)"), Int(100)])
+            .row(&[Str(b" \t"), Str(b"7")])
+            .row(&[Other, Int(0)])
+            .row(&[Str(b"no counter YENC"), Int(250)])
+            .row(&[Str(b"(3/4)"), Float(9.0)])
+            .int(0);
+        assert_eq!(run(OP_HEADER_BATCH, &frame), [6, 1, 2, 2, 2, 2, 7, 250]);
+        let empty = Builder::default().int(1).row(&[Str(b"x"), Int(-1)]);
+        assert_eq!(run(OP_HEADER_BATCH, &empty), [1, 0, 0, 0, 0, 1, 0, 0]);
+    }
+
+    #[test]
+    fn w411_storage_chunks_count_payloads() {
+        let long = [b'a'; 256];
+        let frame = Builder::default()
+            .int(2)
+            .int(5)
+            .row(&[Str(b"<a@b>"), Int(100), Str(b"s")])
+            .row(&[Str(b" "), Str(b"20"), Str(&long)])
+            .row(&[Other, Int(-1), Str(&long[..255])])
+            .row(&[Str(b"<c@d>"), Int(i64::MAX), Other])
+            .int(0);
+        assert_eq!(run(OP_STORAGE_CHUNKS, &frame), [5, 1, 3, 2, 1, 1, i64::MAX]);
+        let zero = Builder::default().int(0).int(0);
+        assert_eq!(run(OP_STORAGE_CHUNKS, &zero), [0, 0, 0, 0, 0, 0, 0]);
+        let max = Builder::default().int(i64::MAX).int(1).int(0);
+        assert_eq!(run(OP_STORAGE_CHUNKS, &max), [1, 1, 1, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn w411_malformed_frames_decline() {
+        let empty = Builder::default().int(0).build();
+        for operation in [0, 6, u32::MAX] {
+            assert!(compute(operation, 0, &empty).is_none());
+        }
+        assert!(compute(OP_BINARY_RECORDS, 1, &empty).is_none());
+        assert!(compute(OP_BINARY_RECORDS, 0, &[]).is_none());
+        assert!(compute(OP_BINARY_RECORDS, 0, &i64::MAX.to_ne_bytes()).is_none());
+        assert!(compute(OP_BINARY_RECORDS, 0, &Builder::default().int(-1).build()).is_none());
+        assert!(
+            compute(
+                OP_BINARY_RECORDS,
+                0,
+                &Builder::default().int(2).int(0).build()
+            )
+            .is_none()
+        );
+        assert!(
+            compute(
+                OP_BINARY_RECORDS,
+                0,
+                &Builder::default().int(1).int(2).build()
+            )
+            .is_none()
+        );
+        let mut trailing = empty.clone();
+        trailing.push(0);
+        assert!(compute(OP_BINARY_RECORDS, 0, &trailing).is_none());
+        let short = Builder::default().int(1).int(1).int(5).int(-1).build();
+        assert!(compute(OP_HEADER_BATCH, 0, &short).is_none());
+        let bad_tag = Builder::default().int(1).int(1).int(-9).int(-1).build();
+        assert!(compute(OP_HEADER_BATCH, 0, &bad_tag).is_none());
+        assert!(compute(OP_SCAN_RANGES, 0, &empty).is_none());
+        assert!(compute(OP_BINARY_RECORDS, 0, &empty).is_some());
+    }
+
+    #[test]
+    fn w411_export_validates_pointers_and_capacity_without_partial_writes() {
+        let input = Builder::default().int(0).build();
+        let call = |op, flags, ptr, len, out, cap| unsafe {
+            nntmux_w411_binaries_config_service_handler_header(op, flags, ptr, len, out, cap)
+        };
+        let mut out = [0x5a_u8; 64];
+        let (ptr, len) = (input.as_ptr(), input.len());
+        assert_eq!(call(3, 0, ptr, len, out.as_mut_ptr(), 55), -56);
+        assert_eq!(call(3, 0, ptr, len, out.as_mut_ptr(), 0), -56);
+        assert_eq!(call(0, 0, ptr, len, out.as_mut_ptr(), 64), DECLINE);
+        assert_eq!(call(6, 0, ptr, len, out.as_mut_ptr(), 64), DECLINE);
+        assert_eq!(call(3, 1, ptr, len, out.as_mut_ptr(), 64), DECLINE);
+        assert_eq!(
+            call(3, 0, std::ptr::null(), len, out.as_mut_ptr(), 64),
+            DECLINE
+        );
+        assert_eq!(call(3, 0, ptr, len, std::ptr::null_mut(), 64), DECLINE);
+        assert_eq!(
+            call(3, 0, ptr, MAX_INPUT + 1, out.as_mut_ptr(), 64),
+            DECLINE
+        );
+        assert_eq!(call(3, 0, ptr, len, out.as_mut_ptr(), usize::MAX), DECLINE);
+        assert_eq!(
+            call(3, 0, usize::MAX as *const u8, 16, out.as_mut_ptr(), 64),
+            DECLINE
+        );
+        assert_eq!(call(3, 0, ptr, len, usize::MAX as *mut u8, 64), DECLINE);
+        assert_eq!(call(3, 0, ptr, len - 1, out.as_mut_ptr(), 64), DECLINE);
+        assert_eq!(out, [0x5a; 64]);
+        let mut overlapping = input.clone();
+        let overlap_ptr = overlapping.as_mut_ptr();
+        assert_eq!(call(3, 0, overlap_ptr, len, overlap_ptr, 64), DECLINE);
+        assert_eq!(overlapping, input);
+
+        assert_eq!(call(3, 0, ptr, len, out.as_mut_ptr(), 64), 56);
+        assert_eq!(&out[..56], &[0_u8; 56][..]);
+        assert_eq!(&out[56..], &[0x5a; 8]);
+    }
+}

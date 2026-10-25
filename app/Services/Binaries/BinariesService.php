@@ -1407,4 +1407,193 @@ class BinariesService
 
         return $probe === $current ? null : $probe;
     }
+
+    public const string W411_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w411_binaries_config_service_handler_header(uint32_t operation, uint32_t flags, const char *input, size_t input_len, char *out_buf, size_t out_cap);
+        C;
+
+    /**
+     * PHP stays the default for summarizeScanRangeBatch(): the paired benchmark in
+     * tests/Unit/RustBinariesConfigServiceHandlerHeaderW41ParityTest.php does not clear 1.5x.
+     */
+    public const bool W411_RUST_FFI_DEFAULT = false;
+
+    private const int W411_RUST_MAX_INPUT = 16_777_216;
+
+    private const array W411_RANGE_KEYS = ['ranges', 'invalid_rows', 'negative', 'empty', 'valid', 'capped', 'total_articles'];
+
+    private static ?bool $w411UseRustFfi = null;
+
+    private static FFI|false|null $w411Ffi = null;
+
+    /**
+     * Summarizes scan article ranges (`first`, `last`): rows whose bounds are not ints (or 1-18 digit strings) are
+     * invalid, a negative bound is negative, `last < first` is empty, and other rows are valid. A valid range spans
+     * `last - first + 1` articles (saturating at PHP_INT_MAX), is capped when `$maxHeaders` is positive and smaller
+     * than the span, and adds the span to the article total (saturating).
+     *
+     * @param  array<array-key, mixed>  $ranges
+     * @return array<string, int>
+     */
+    public static function summarizeScanRangeBatch(array $ranges, int $maxHeaders = 0): array
+    {
+        return (self::usesW411RustFfi() ? self::summarizeScanRangeBatchNative($ranges, $maxHeaders) : null)
+            ?? self::summarizeScanRangeBatchPhp($ranges, $maxHeaders);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $ranges
+     * @return array<string, int>
+     */
+    public static function summarizeScanRangeBatchPhp(array $ranges, int $maxHeaders = 0): array
+    {
+        $summary = array_fill_keys(self::W411_RANGE_KEYS, 0);
+        $summary['ranges'] = \count($ranges);
+        foreach ($ranges as $range) {
+            $first = \is_array($range) ? self::w411Int($range['first'] ?? null) : null;
+            $last = \is_array($range) ? self::w411Int($range['last'] ?? null) : null;
+            if ($first === null || $last === null) {
+                $summary['invalid_rows']++;
+            } elseif ($first < 0 || $last < 0) {
+                $summary['negative']++;
+            } elseif ($last < $first) {
+                $summary['empty']++;
+            } else {
+                $summary['valid']++;
+                $span = $last - $first;
+                $span = $span === PHP_INT_MAX ? PHP_INT_MAX : $span + 1;
+                $summary['capped'] += (int) ($maxHeaders > 0 && $span > $maxHeaders);
+                $total = $summary['total_articles'];
+                $summary['total_articles'] = $span > PHP_INT_MAX - $total ? PHP_INT_MAX : $total + $span;
+            }
+        }
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $ranges
+     * @return array<string, int>|null
+     */
+    public static function summarizeScanRangeBatchNative(array $ranges, int $maxHeaders = 0): ?array
+    {
+        $words = [$maxHeaders, \count($ranges)];
+        $blob = [];
+        foreach ($ranges as $range) {
+            if (\is_array($range)) {
+                self::w411PackRow($words, $blob, [$range['first'] ?? null, $range['last'] ?? null]);
+            } else {
+                $words[] = 0;
+            }
+        }
+        $values = self::w411Invoke(self::$w411Ffi, 2, $words, $blob);
+
+        return $values !== null && \count($values) === \count(self::W411_RANGE_KEYS) ? array_combine(self::W411_RANGE_KEYS, $values) : null;
+    }
+
+    public static function useW411RustFfi(bool $enable = true): void
+    {
+        self::$w411UseRustFfi = $enable;
+    }
+
+    public static function usesW411RustFfi(): bool
+    {
+        return self::$w411UseRustFfi ?? self::W411_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW411RustFfi(): void
+    {
+        self::$w411UseRustFfi = null;
+        self::$w411Ffi = null;
+    }
+
+    /** Wave 41.1 int reading: an int, or a string of an optional `-` and 1-18 ASCII digits. */
+    public static function w411Int(mixed $value): ?int
+    {
+        if (\is_int($value)) {
+            return $value;
+        }
+        if (! \is_string($value)) {
+            return null;
+        }
+        $digits = $value !== '' && $value[0] === '-' ? substr($value, 1) : $value;
+        $length = \strlen($digits);
+
+        return $length >= 1 && $length <= 18 && strspn($digits, '0123456789') === $length ? (int) $value : null;
+    }
+
+    /**
+     * Appends an array row to a Wave 41.1 frame: marker 1, then per value its string length (bytes to the blob),
+     * -2 and the int, -3 and a float's 8 bytes, or -1.
+     *
+     * @param  list<int>  $words
+     * @param  list<string>  $blob
+     * @param  list<mixed>  $values
+     */
+    public static function w411PackRow(array &$words, array &$blob, array $values): void
+    {
+        $words[] = 1;
+        foreach ($values as $value) {
+            if (\is_string($value)) {
+                $words[] = \strlen($value);
+                $blob[] = $value;
+            } elseif (\is_int($value)) {
+                $words[] = -2;
+                $words[] = $value;
+            } elseif (\is_float($value)) {
+                $words[] = -3;
+                $blob[] = pack('d', $value);
+            } else {
+                $words[] = -1;
+            }
+        }
+    }
+
+    /**
+     * Calls the Wave 41.1 export with a frame, retrying once with a larger scratch buffer when it reports
+     * `-required`; `$ffi` is the caller's cached library handle. Returns the decoded ints or null to fall back.
+     *
+     * @param  list<int>  $words
+     * @param  list<string>  $blob
+     * @return list<int>|null
+     */
+    public static function w411Invoke(FFI|false|null &$ffi, int $operation, array $words, array $blob): ?array
+    {
+        $input = pack('q', \count($words)).pack('q*', ...$words).implode('', $blob);
+        if (\strlen($input) > self::W411_RUST_MAX_INPUT) {
+            return null;
+        }
+        try {
+            $ffi ??= RustPipelineLibrary::resolveDomain('cleaning_w411', self::W411_FFI_CDEF) ?? false;
+            if ($ffi === false) {
+                return null;
+            }
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, 1024, $capacity);
+            if ($buffer === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w411_binaries_config_service_handler_header($operation, 0, $input, \strlen($input), $buffer, $capacity);
+            if (\is_int($written) && $written < -1) {
+                if (-$written <= $capacity || -$written > self::W411_RUST_MAX_INPUT) {
+                    return null;
+                }
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w411_binaries_config_service_handler_header($operation, 0, $input, \strlen($input), $buffer, $capacity);
+            }
+            if (! \is_int($written) || $written <= 0 || $written > $capacity || $written % 8 !== 0) {
+                return null;
+            }
+            $values = unpack('q*', FFI::string($buffer, $written));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }

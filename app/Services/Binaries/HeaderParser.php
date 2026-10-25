@@ -456,4 +456,105 @@ final class HeaderParser
 
         return $result;
     }
+
+    /**
+     * PHP stays the default for summarizeHeaderBatch(): the paired benchmark in
+     * tests/Unit/RustBinariesConfigServiceHandlerHeaderW41ParityTest.php does not clear 1.5x.
+     */
+    public const bool W411_RUST_FFI_DEFAULT = false;
+
+    private const array W411_HEADER_KEYS = ['headers', 'invalid_rows', 'missing_subject', 'yenc', 'part_counter', 'bad_number', 'min_number', 'max_number'];
+
+    private static ?bool $w411UseRustFfi = null;
+
+    private static FFI|false|null $w411Ffi = null;
+
+    /**
+     * Summarizes overview headers (`Subject`, `Number`): a subject that is not a string or trim()s to '' is missing,
+     * string subjects containing `yenc` (ASCII case-insensitive) or a `(digits/digits)` part counter are counted, and
+     * article numbers that are not positive ints (or 1-18 digit strings) are bad; the smallest and largest good
+     * numbers are reported (0 when none). Non-array rows are invalid.
+     *
+     * @param  array<array-key, mixed>  $headers
+     * @return array<string, int>
+     */
+    public static function summarizeHeaderBatch(array $headers): array
+    {
+        return (self::usesW411RustFfi() ? self::summarizeHeaderBatchNative($headers) : null)
+            ?? self::summarizeHeaderBatchPhp($headers);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $headers
+     * @return array<string, int>
+     */
+    public static function summarizeHeaderBatchPhp(array $headers): array
+    {
+        $summary = array_fill_keys(self::W411_HEADER_KEYS, 0);
+        $summary['headers'] = \count($headers);
+        $min = null;
+        $max = 0;
+        foreach ($headers as $header) {
+            if (! \is_array($header)) {
+                $summary['invalid_rows']++;
+
+                continue;
+            }
+            $subject = $header['Subject'] ?? null;
+            if (\is_string($subject)) {
+                $summary['missing_subject'] += (int) (trim($subject) === '');
+                $summary['yenc'] += (int) (stripos($subject, 'yenc') !== false);
+                $summary['part_counter'] += (int) preg_match('/\(\d+\/\d+\)/', $subject);
+            } else {
+                $summary['missing_subject']++;
+            }
+            $number = BinariesService::w411Int($header['Number'] ?? null);
+            if ($number === null || $number <= 0) {
+                $summary['bad_number']++;
+            } else {
+                $min = $min === null ? $number : min($min, $number);
+                $max = max($max, $number);
+            }
+        }
+        $summary['min_number'] = $min ?? 0;
+        $summary['max_number'] = $max;
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $headers
+     * @return array<string, int>|null
+     */
+    public static function summarizeHeaderBatchNative(array $headers): ?array
+    {
+        $words = [\count($headers)];
+        $blob = [];
+        foreach ($headers as $header) {
+            if (\is_array($header)) {
+                BinariesService::w411PackRow($words, $blob, [$header['Subject'] ?? null, $header['Number'] ?? null]);
+            } else {
+                $words[] = 0;
+            }
+        }
+        $values = BinariesService::w411Invoke(self::$w411Ffi, 4, $words, $blob);
+
+        return $values !== null && \count($values) === \count(self::W411_HEADER_KEYS) ? array_combine(self::W411_HEADER_KEYS, $values) : null;
+    }
+
+    public static function useW411RustFfi(bool $enable = true): void
+    {
+        self::$w411UseRustFfi = $enable;
+    }
+
+    public static function usesW411RustFfi(): bool
+    {
+        return self::$w411UseRustFfi ?? self::W411_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW411RustFfi(): void
+    {
+        self::$w411UseRustFfi = null;
+        self::$w411Ffi = null;
+    }
 }
