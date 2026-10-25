@@ -560,4 +560,146 @@ class ItunesService
             return null;
         }
     }
+
+    /** Enabled: seven paired runs cleared 1.5x on every gate (min common mean 3.16x, p99 2.49x; uncommon mean 2.97x, p99 2.88x; see the W46 parity test). */
+    public const bool W464_RUST_FFI_DEFAULT = true;
+
+    public const string W464_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w464_itunes_artwork_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private const array W464_SUMMARY_KEYS = ['total_entries', 'empty_count', 'resizable_count', 'bb_suffix_count', 'https_count', 'mzstatic_count', 'jpeg_count', 'png_count', 'whitespace_count', 'non_ascii_count', 'query_count'];
+
+    /** unpack() format for the eleven little-endian int64 counters, in W464_SUMMARY_KEYS order. */
+    private const string W464_UNPACK = 'Ptotal_entries/Pempty_count/Presizable_count/Pbb_suffix_count/Phttps_count/Pmzstatic_count/Pjpeg_count/Ppng_count/Pwhitespace_count/Pnon_ascii_count/Pquery_count';
+
+    private static ?bool $w464UseRustFfi = null;
+
+    private static FFI|false|null $w464Ffi = null;
+
+    /** Null restores the benchmark-qualified default. */
+    public static function useW464RustFfi(?bool $enable = true): void
+    {
+        self::$w464UseRustFfi = $enable;
+    }
+
+    public static function usesW464RustFfi(): bool
+    {
+        return self::$w464UseRustFfi ?? self::W464_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW464RustFfi(): void
+    {
+        self::$w464UseRustFfi = null;
+        self::$w464Ffi = null;
+    }
+
+    /**
+     * Summarize artwork URLs as getHighResCover() sees them (untrimmed; ''
+     * and '0' are empty): size tokens its rewrite replaces, bb suffixes,
+     * https and mzstatic hosts, JPEG/PNG extensions, whitespace, non-ASCII
+     * bytes and query strings. Entries come from strings, integers, or the
+     * artworkUrl100, artworkUrl60 or artworkUrl30 field; other values count
+     * as empty. Byte classes are ASCII-only.
+     *
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeItunesArtworkBatch(array $entries): array
+    {
+        return self::usesW464RustFfi()
+            ? self::summarizeItunesArtworkBatchNative($entries)
+            : self::summarizeItunesArtworkBatchPhp($entries);
+    }
+
+    /**
+     * Rust summary; falls back to PHP when the library or input frame is unusable.
+     *
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeItunesArtworkBatchNative(array $entries): array
+    {
+        return self::w464Call(self::w464Entries($entries)) ?? self::summarizeItunesArtworkBatchPhp($entries);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeItunesArtworkBatchPhp(array $entries): array
+    {
+        $summary = array_fill_keys(self::W464_SUMMARY_KEYS, 0);
+        foreach (self::w464Entries($entries) as $entry) {
+            $summary['total_entries']++;
+            if ($entry === '' || $entry === '0') {
+                $summary['empty_count']++;
+
+                continue;
+            }
+            $summary['resizable_count'] += (int) (preg_match('/[0-9]+x[0-9]+(?:bb)?\./', $entry) === 1);
+            $summary['bb_suffix_count'] += (int) (preg_match('/[0-9]+x[0-9]+bb\./', $entry) === 1);
+            $summary['https_count'] += (int) str_starts_with($entry, 'https://');
+            $summary['mzstatic_count'] += (int) str_contains($entry, '.mzstatic.com/');
+            $summary['jpeg_count'] += (int) (preg_match('/\.[Jj][Pp][Ee]?[Gg]\z/', $entry) === 1);
+            $summary['png_count'] += (int) (preg_match('/\.[Pp][Nn][Gg]\z/', $entry) === 1);
+            $summary['whitespace_count'] += (int) (preg_match('/[ \t\n\r\x0b\f]/', $entry) === 1);
+            $summary['non_ascii_count'] += (int) (preg_match('/[\x80-\xff]/', $entry) === 1);
+            $summary['query_count'] += (int) str_contains($entry, '?');
+        }
+
+        return $summary;
+    }
+
+    /** Only integer and string entries participate; objects are never cast or serialized.
+     *
+     * @param  array<array-key, mixed>  $input
+     * @return list<string>
+     */
+    private static function w464Entries(array $input): array
+    {
+        $entries = [];
+        foreach ($input as $item) {
+            if (is_array($item)) {
+                $item = $item['artworkUrl100'] ?? $item['artworkUrl60'] ?? $item['artworkUrl30'] ?? null;
+            }
+            $entries[] = is_string($item) || is_int($item) ? (string) $item : '';
+        }
+
+        return $entries;
+    }
+
+    /** @param list<string> $entries
+     * @return array<string, int>|null
+     */
+    private static function w464Call(array $entries): ?array
+    {
+        try {
+            $input = serialize($entries);
+            if (strlen($input) > 16777216) {
+                return null;
+            }
+            self::$w464Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w464', self::W464_FFI_CDEF) ?? false;
+            $ffi = self::$w464Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            // obtainScratch() returns at least the 88 bytes requested.
+            $out = RustPipelineLibrary::obtainScratch($ffi, 88);
+            // @phpstan-ignore method.notFound (Declared by W464_FFI_CDEF.)
+            if ($out === null || $ffi->nntmux_w464_itunes_artwork_batch($input, strlen($input), $out, 88) !== 88) {
+                return null;
+            }
+            /** @var array<string, int>|false $summary */
+            $summary = unpack(self::W464_UNPACK, FFI::string($out, 88));
+            $total = count($entries);
+            if ($summary === false || $summary['total_entries'] !== $total || min($summary) < 0 || max($summary) > $total) {
+                return null;
+            }
+
+            return $summary;
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }

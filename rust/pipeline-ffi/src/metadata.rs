@@ -44377,3 +44377,756 @@ mod w454_tests {
         }
     }
 }
+
+pub mod w464_metadata {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+
+    /// Every W464 summary has eleven counters, written as little-endian `int64_t[11]`.
+    pub const COUNTS: usize = 11;
+
+    pub const OUTPUT_BYTES: usize = COUNTS * 8;
+
+    type Counts = [i64; COUNTS];
+
+    unsafe fn dispatch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+        summarize: fn(&[u8]) -> Option<Counts>,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if input.is_null()
+                || out.is_null()
+                || len > MAX_INPUT
+                || len > isize::MAX as usize
+                || cap > isize::MAX as usize
+            {
+                return -1;
+            }
+            let Some(input_end) = (input as usize).checked_add(len) else {
+                return -1;
+            };
+            let Some(out_end) = (out as usize).checked_add(cap) else {
+                return -1;
+            };
+            if len != 0 && cap != 0 && (input as usize) < out_end && (out as usize) < input_end {
+                return -1;
+            }
+            // Both spans and their overlap are checked before borrowing caller memory.
+            let input = unsafe { std::slice::from_raw_parts(input, len) };
+            let Some(counts) = summarize(input) else {
+                return -1;
+            };
+            if cap < OUTPUT_BYTES {
+                return -(OUTPUT_BYTES as isize);
+            }
+            let mut bytes = [0u8; OUTPUT_BYTES];
+            for (chunk, count) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(counts) {
+                chunk.copy_from_slice(&count.to_le_bytes());
+            }
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, OUTPUT_BYTES) };
+            OUTPUT_BYTES as isize
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Canonical decimal (`0` or no leading zero) of at most 18 digits, then `term`.
+    fn number(input: &[u8], at: &mut usize, term: u8) -> Option<usize> {
+        let digits = input
+            .get(*at..)?
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        if digits == 0 || digits > 18 || (digits > 1 && input[*at] == b'0') {
+            return None;
+        }
+        let value = input[*at..*at + digits]
+            .iter()
+            .fold(0usize, |n, b| n * 10 + usize::from(b - b'0'));
+        *at += digits;
+        (input.get(*at) == Some(&term)).then(|| *at += 1)?;
+        Some(value)
+    }
+
+    fn literal(input: &[u8], at: &mut usize, lit: &[u8]) -> Option<()> {
+        (input.get(*at..*at + lit.len())? == lit).then(|| *at += lit.len())
+    }
+
+    /// Streams PHP `serialize(list<string>)` (`a:N:{i:0;s:L:"…";…}`), whose
+    /// length prefixes let entries be borrowed without a document tree.
+    fn summarize(input: &[u8], classify: fn(&[u8], &mut Counts)) -> Option<Counts> {
+        let mut at = 0;
+        literal(input, &mut at, b"a:")?;
+        let rows = number(input, &mut at, b':')?;
+        literal(input, &mut at, b"{")?;
+        // Every row needs at least `i:K;s:0:"";` (11 bytes).
+        if rows > input.len() / 11 {
+            return None;
+        }
+        let mut counts = [0i64; COUNTS];
+        for index in 0..rows {
+            literal(input, &mut at, b"i:")?;
+            if number(input, &mut at, b';')? != index {
+                return None;
+            }
+            literal(input, &mut at, b"s:")?;
+            let len = number(input, &mut at, b':')?;
+            literal(input, &mut at, b"\"")?;
+            let entry = input.get(at..at.checked_add(len)?)?;
+            at += len;
+            literal(input, &mut at, b"\";")?;
+            counts[0] += 1;
+            classify(entry, &mut counts);
+        }
+        literal(input, &mut at, b"}")?;
+        (at == input.len()).then_some(counts)
+    }
+
+    /// PHP trim(): space, tab, LF, CR, NUL and vertical tab (not form feed).
+    fn trim(value: &[u8]) -> &[u8] {
+        let is_trim = |b: &u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b);
+        let start = value
+            .iter()
+            .position(|b| !is_trim(b))
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|b| !is_trim(b))
+            .map_or(start, |i| i + 1);
+        &value[start..end]
+    }
+
+    const SPACE: u16 = 1;
+    const DIGIT: u16 = 2;
+    const UPPER: u16 = 4;
+    const LOWER: u16 = 8;
+    const HIGH: u16 = 16;
+    /// `:`, `!` and `&`.
+    const PUNCT: u16 = 32;
+    const QUESTION: u16 = 64;
+    const AT: u16 = 128;
+    const DASH: u16 = 256;
+    /// `.`, `_` and `/`.
+    const PATH: u16 = 512;
+    /// Every other byte, so a mask shows any byte outside the named classes.
+    const OTHER: u16 = 1024;
+    const ALNUM: u16 = DIGIT | UPPER | LOWER;
+
+    const CLASS: [u16; 256] = {
+        let mut table = [OTHER; 256];
+        let mut b = 0;
+        while b < 256 {
+            let c = b as u8;
+            table[b] = match c {
+                b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r' => SPACE,
+                b'0'..=b'9' => DIGIT,
+                b'A'..=b'Z' => UPPER,
+                b'a'..=b'z' => LOWER,
+                0x80..=0xff => HIGH,
+                b':' | b'!' | b'&' => PUNCT,
+                b'?' => QUESTION,
+                b'@' => AT,
+                b'-' => DASH,
+                b'.' | b'_' | b'/' => PATH,
+                _ => OTHER,
+            };
+            b += 1;
+        }
+        table
+    };
+
+    #[inline(always)]
+    fn class(b: u8) -> u16 {
+        CLASS[b as usize]
+    }
+
+    /// Union of the byte classes in `value`.
+    #[inline(always)]
+    fn mask(value: &[u8]) -> u16 {
+        value.iter().fold(0, |m, b| m | class(*b))
+    }
+
+    /// `[ \t\n\r\x0b\f]`.
+    #[inline(always)]
+    fn is_space(b: u8) -> bool {
+        class(b) == SPACE
+    }
+
+    /// Substring search anchored on the needle's first byte.
+    fn contains(hay: &[u8], needle: &[u8]) -> bool {
+        let Some(last) = hay.len().checked_sub(needle.len()) else {
+            return false;
+        };
+        let (first, rest) = (needle[0], &needle[1..]);
+        let mut i = 0;
+        while let Some(p) = hay[i..=last].iter().position(|b| *b == first) {
+            let at = i + p;
+            if &hay[at + 1..at + needle.len()] == rest {
+                return true;
+            }
+            i = at + 1;
+            if i > last {
+                break;
+            }
+        }
+        false
+    }
+
+    #[inline(always)]
+    fn has_pair(hay: &[u8], a: u8, b: u8) -> bool {
+        hay.windows(2).any(|w| w[0] == a && w[1] == b)
+    }
+
+    fn starts_ci(hay: &[u8], prefix: &[u8]) -> bool {
+        hay.len() >= prefix.len() && hay[..prefix.len()].eq_ignore_ascii_case(prefix)
+    }
+
+    fn ends_ci(hay: &[u8], suffix: &[u8]) -> bool {
+        hay.len() >= suffix.len() && hay[hay.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+    }
+
+    #[inline(always)]
+    fn mark(counts: &mut Counts, slot: usize, matched: bool) {
+        counts[slot] += i64::from(matched);
+    }
+
+    // ImdbScraper: search queries, suggestion titles and api.imdbapi.dev types.
+
+    const IMDB_TV_TYPES: [&[u8]; 11] = [
+        b"tvseries",
+        b"tv_series",
+        b"tv mini series",
+        b"tv_mini_series",
+        b"tvminiseries",
+        b"tvspecial",
+        b"tv_special",
+        b"tvmovie",
+        b"tv_movie",
+        b"tvepisode",
+        b"tv_episode",
+    ];
+
+    fn imdb_text(raw: &[u8], counts: &mut Counts) {
+        let t = trim(raw);
+        if t.is_empty() {
+            counts[1] += 1;
+            return;
+        }
+        // normalizeSearchSlug() keeps `[A-Za-z0-9 ]`, trims and turns inner spaces into `_`.
+        let (mut alnum, mut gap, mut multi_word, mut stripped) = (false, false, false, false);
+        for b in t {
+            if class(*b) & ALNUM != 0 {
+                multi_word |= gap;
+                alnum = true;
+            } else if *b == b' ' {
+                gap |= alnum;
+            } else {
+                stripped = true;
+            }
+        }
+        // `(?:19|20)[0-9]{2}`
+        mark(
+            counts,
+            2,
+            t.windows(4).any(|w| {
+                ((w[0] == b'1' && w[1] == b'9') || (w[0] == b'2' && w[1] == b'0'))
+                    && w[2].is_ascii_digit()
+                    && w[3].is_ascii_digit()
+            }),
+        );
+        // `tt[0-9]{5}`
+        mark(
+            counts,
+            3,
+            t.windows(7)
+                .any(|w| w[0] == b't' && w[1] == b't' && w[2..].iter().all(u8::is_ascii_digit)),
+        );
+        mark(counts, 4, !alnum);
+        mark(counts, 5, multi_word);
+        mark(counts, 6, stripped);
+        mark(counts, 7, contains(t, b"._V1_"));
+        // isWafResponse() markers, ASCII case-insensitive; `window.awsWafCookieDomainList`
+        // contains `awswaf`. `| 0x20` folds only the ASCII letters these arms test.
+        mark(
+            counts,
+            8,
+            (0..t.len()).any(|i| {
+                let rest = &t[i..];
+                match t[i] | 0x20 {
+                    b'c' => starts_ci(rest, b"captcha") || starts_ci(rest, b"challenge.js"),
+                    b'a' => starts_ci(rest, b"awswaf"),
+                    b'w' => starts_ci(rest, b"window.gokuprops"),
+                    _ => false,
+                }
+            }),
+        );
+        mark(
+            counts,
+            9,
+            (7..=14).contains(&t.len())
+                && IMDB_TV_TYPES.iter().any(|ty| t.eq_ignore_ascii_case(ty)),
+        );
+        mark(counts, 10, t.len() > 255);
+    }
+
+    // ItunesService: artworkUrl100 values getHighResCover() rewrites.
+
+    /// `[0-9]+x[0-9]+(?:bb)?\.` and `[0-9]+x[0-9]+bb\.`.
+    fn itunes_size_tokens(u: &[u8]) -> (bool, bool) {
+        let mut any = false;
+        let mut i = 0;
+        while let Some(p) = u[i..].iter().position(|b| *b == b'x') {
+            let at = i + p;
+            i = at + 1;
+            if at == 0 || !u[at - 1].is_ascii_digit() {
+                continue;
+            }
+            let digits = u[i..].iter().take_while(|b| b.is_ascii_digit()).count();
+            let rest = &u[i + digits..];
+            if digits > 0 && rest.starts_with(b"bb.") {
+                return (true, true);
+            }
+            any |= digits > 0 && rest.first() == Some(&b'.');
+        }
+        (any, false)
+    }
+
+    fn itunes_artwork(u: &[u8], counts: &mut Counts) {
+        // empty(): '' and '0'.
+        if u.is_empty() || u == b"0" {
+            counts[1] += 1;
+            return;
+        }
+        let (resizable, bb) = itunes_size_tokens(u);
+        let m = mask(u);
+        mark(counts, 2, resizable);
+        mark(counts, 3, bb);
+        mark(counts, 4, u.starts_with(b"https://"));
+        mark(counts, 5, contains(u, b".mzstatic.com/"));
+        mark(counts, 6, ends_ci(u, b".jpg") || ends_ci(u, b".jpeg"));
+        mark(counts, 7, ends_ci(u, b".png"));
+        mark(counts, 8, m & SPACE != 0);
+        mark(counts, 9, m & HIGH != 0);
+        mark(counts, 10, m & QUESTION != 0);
+    }
+
+    // TraktService: ids formatMediaId() trims and routes to formatImdbId() or Str::slug().
+
+    fn trakt_media_id(raw: &[u8], counts: &mut Counts) {
+        let t = trim(raw);
+        if t.is_empty() {
+            counts[1] += 1;
+            return;
+        }
+        let m = mask(t);
+        let prefixed = starts_ci(t, b"tt");
+        let numeric = m == DIGIT;
+        mark(counts, 2, prefixed);
+        // formatImdbIdPhp() succeeds exactly when six or more digits remain.
+        mark(
+            counts,
+            3,
+            prefixed && t.iter().filter(|b| b.is_ascii_digit()).count() >= 6,
+        );
+        mark(counts, 4, numeric);
+        mark(counts, 5, numeric && t.iter().any(|b| *b != b'0'));
+        // `\A[a-z0-9]+(?:-[a-z0-9]+)*\z`
+        mark(
+            counts,
+            6,
+            m & !(LOWER | DIGIT | DASH) == 0
+                && t[0] != b'-'
+                && t[t.len() - 1] != b'-'
+                && !has_pair(t, b'-', b'-'),
+        );
+        mark(counts, 7, m & UPPER != 0);
+        mark(counts, 8, m & SPACE != 0);
+        mark(counts, 9, m & AT != 0);
+        mark(counts, 10, m & HIGH != 0);
+    }
+
+    // TmdbClient: image paths getImageUrl() prefixes.
+
+    fn tmdb_image_path(p: &[u8], counts: &mut Counts) {
+        if p.is_empty() || p == b"0" {
+            counts[1] += 1;
+            return;
+        }
+        mark(counts, 2, p[0] == b'/');
+        mark(
+            counts,
+            3,
+            starts_ci(p, b"http://") || starts_ci(p, b"https://"),
+        );
+        mark(counts, 4, ends_ci(p, b".jpg") || ends_ci(p, b".jpeg"));
+        mark(counts, 5, ends_ci(p, b".png"));
+        mark(counts, 6, ends_ci(p, b".svg"));
+        // `\A/[A-Za-z0-9]+\.(?:jpg|png|svg)\z`
+        let stem = p[1..]
+            .iter()
+            .take_while(|b| b.is_ascii_alphanumeric())
+            .count();
+        mark(
+            counts,
+            7,
+            p[0] == b'/' && stem > 0 && matches!(&p[1 + stem..], b".jpg" | b".png" | b".svg"),
+        );
+        // `[^A-Za-z0-9._/-]`
+        mark(counts, 8, mask(p) & !(ALNUM | DASH | PATH) != 0);
+        mark(counts, 9, has_pair(p, b'/', b'/'));
+        mark(counts, 10, has_pair(p, b'.', b'.'));
+    }
+
+    // TvMazeClient: AKA names extractAkaNames() keeps when non-empty.
+
+    const TVMAZE_COUNTRIES: [&[u8]; 7] = [b"US", b"UK", b"AU", b"CA", b"NZ", b"JP", b"KR"];
+
+    fn tvmaze_aka_name(name: &[u8], counts: &mut Counts) {
+        if name.is_empty() {
+            counts[1] += 1;
+            return;
+        }
+        let t = trim(name);
+        mark(counts, 2, t.is_empty());
+        mark(counts, 3, t.len() != name.len());
+        // `\A(?:[Tt][Hh][Ee]|[Aa][Nn]?)[ \t\n\r\x0b\f]`
+        let space_at = |i: usize| t.get(i).is_some_and(|b| is_space(*b));
+        mark(
+            counts,
+            4,
+            (starts_ci(t, b"the") && space_at(3))
+                || (starts_ci(t, b"an") && space_at(2))
+                || (starts_ci(t, b"a") && space_at(1)),
+        );
+        let n = t.len();
+        // `\([0-9]{4}\)\z`
+        mark(
+            counts,
+            5,
+            n >= 6
+                && t[n - 6] == b'('
+                && t[n - 5..n - 1].iter().all(u8::is_ascii_digit)
+                && t[n - 1] == b')',
+        );
+        // `\((?:US|UK|AU|CA|NZ|JP|KR)\)\z`
+        mark(
+            counts,
+            6,
+            n >= 4
+                && t[n - 4] == b'('
+                && t[n - 1] == b')'
+                && TVMAZE_COUNTRIES.contains(&&t[n - 3..n - 1]),
+        );
+        let m = mask(t);
+        mark(counts, 7, m & (PUNCT | QUESTION) != 0);
+        mark(counts, 8, m & DIGIT != 0);
+        mark(counts, 9, m & HIGH != 0);
+        mark(
+            counts,
+            10,
+            m & SPACE != 0 && t.windows(2).any(|w| is_space(w[0]) && is_space(w[1])),
+        );
+    }
+
+    macro_rules! export {
+        ($name:ident, $classify:ident) => {
+            /// # Safety
+            /// The input and output must be live buffers covering their declared lengths.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                input: *const u8,
+                len: usize,
+                out: *mut u8,
+                cap: usize,
+            ) -> isize {
+                unsafe { dispatch(input, len, out, cap, |input| summarize(input, $classify)) }
+            }
+        };
+    }
+
+    export!(nntmux_w464_imdb_search_text_batch, imdb_text);
+    export!(nntmux_w464_itunes_artwork_batch, itunes_artwork);
+    export!(nntmux_w464_trakt_media_id_batch, trakt_media_id);
+    export!(nntmux_w464_tmdb_image_path_batch, tmdb_image_path);
+    export!(nntmux_w464_tvmaze_aka_name_batch, tvmaze_aka_name);
+}
+
+#[cfg(test)]
+mod w464_tests {
+    use super::w464_metadata::*;
+
+    type Export = unsafe extern "C" fn(*const u8, usize, *mut u8, usize) -> isize;
+    const EXPORTS: [Export; 5] = [
+        nntmux_w464_imdb_search_text_batch,
+        nntmux_w464_itunes_artwork_batch,
+        nntmux_w464_trakt_media_id_batch,
+        nntmux_w464_tmdb_image_path_batch,
+        nntmux_w464_tvmaze_aka_name_batch,
+    ];
+
+    /// PHP `serialize(list<string>)`.
+    fn frame(entries: &[&[u8]]) -> Vec<u8> {
+        let mut wire = format!("a:{}:{{", entries.len()).into_bytes();
+        for (i, entry) in entries.iter().enumerate() {
+            wire.extend_from_slice(format!("i:{i};s:{}:\"", entry.len()).as_bytes());
+            wire.extend_from_slice(entry);
+            wire.extend_from_slice(b"\";");
+        }
+        wire.push(b'}');
+        wire
+    }
+
+    fn counts(export: Export, entries: &[&[u8]]) -> [i64; COUNTS] {
+        let input = frame(entries);
+        let mut out = [b'Z'; 256];
+        let written = unsafe { export(input.as_ptr(), input.len(), out.as_mut_ptr(), out.len()) };
+        assert_eq!(written, OUTPUT_BYTES as isize);
+        assert!(out[OUTPUT_BYTES..].iter().all(|b| *b == b'Z'));
+        let mut result = [0i64; COUNTS];
+        for (value, chunk) in result.iter_mut().zip(out.chunks_exact(8)) {
+            *value = i64::from_le_bytes(chunk.try_into().unwrap());
+        }
+        result
+    }
+
+    #[test]
+    fn w464_imdb_search_text_counts() {
+        let long = [b'a'; 256];
+        assert_eq!(
+            counts(
+                nntmux_w464_imdb_search_text_batch,
+                &[
+                    b"The Matrix 1999",
+                    b"  tt0133093 ",
+                    b"tt1234",
+                    b"Am\xc3\xa9lie (2001)",
+                    b"!!!",
+                    b"",
+                    b" \t",
+                    b"tvSeries",
+                    b"TV Mini Series",
+                    b"tvseriesx",
+                    b"https://m.media-amazon.com/images/M/x._V1_UX182.jpg",
+                    b"window.awsWafCookieDomainList",
+                    b"Please solve the CAPTCHA",
+                    b"Window.GokuProps",
+                    b"one ",
+                    b"a !b",
+                    b"2100 1899 2019",
+                    &long,
+                ]
+            ),
+            [18, 2, 3, 1, 1, 6, 6, 1, 3, 2, 1]
+        );
+    }
+
+    #[test]
+    fn w464_itunes_artwork_counts() {
+        assert_eq!(
+            counts(
+                nntmux_w464_itunes_artwork_batch,
+                &[
+                    b"https://is1-ssl.mzstatic.com/image/thumb/Music/v4/ab/100x100bb.jpg",
+                    b"http://a1.mzstatic.com/us/r30/60x60.JPEG",
+                    b"https://x/100x100b.jpg",
+                    b"https://x/x100bb.png",
+                    b"0",
+                    b"",
+                    b"00",
+                    b" https://x/1x2bb.png?x=1",
+                    b"caf\xc3\xa9/12x34",
+                    b"9x9bb.9x9.",
+                ]
+            ),
+            [10, 2, 4, 3, 3, 2, 3, 1, 1, 1, 1]
+        );
+    }
+
+    #[test]
+    fn w464_trakt_media_id_counts() {
+        assert_eq!(
+            counts(
+                nntmux_w464_trakt_media_id_batch,
+                &[
+                    b"tt0137523",
+                    b" TT12345 ",
+                    b"tt-12-34-56",
+                    b"12345",
+                    b"000",
+                    b"breaking-bad",
+                    b"-bad",
+                    b"bad--show",
+                    b"Breaking Bad",
+                    b"me@home",
+                    b"caf\xc3\xa9",
+                    b"",
+                    b"\x0c",
+                ]
+            ),
+            [13, 1, 3, 2, 2, 1, 5, 2, 2, 1, 1]
+        );
+    }
+
+    #[test]
+    fn w464_tmdb_image_path_counts() {
+        assert_eq!(
+            counts(
+                nntmux_w464_tmdb_image_path_batch,
+                &[
+                    b"/kqjL17yufvn9OVLyXYpvtyrFfak.jpg",
+                    b"/abc.PNG",
+                    b"/logo.svg",
+                    b"https://image.tmdb.org/t/p/w500/x.jpeg",
+                    b"0",
+                    b"",
+                    b"//double.jpg",
+                    b"/../etc/passwd",
+                    b"/with space.jpg",
+                    b"/a_b.jpg",
+                ]
+            ),
+            [10, 2, 7, 1, 5, 1, 1, 2, 2, 2, 1]
+        );
+    }
+
+    #[test]
+    fn w464_tvmaze_aka_name_counts() {
+        assert_eq!(
+            counts(
+                nntmux_w464_tvmaze_aka_name_batch,
+                &[
+                    b"The Office (US)",
+                    b" An Idiot Abroad ",
+                    b"A  Show",
+                    b"Doctor Who (2005)",
+                    b"Castle (UK) ",
+                    b"",
+                    b"   ",
+                    b"Theory",
+                    b"Kaz\xc3\xa1n: Rising!",
+                    b"Show (us)",
+                    b"(1234)",
+                ]
+            ),
+            [11, 1, 1, 3, 3, 2, 2, 1, 2, 1, 1]
+        );
+    }
+
+    #[test]
+    fn w464_all_exports_check_spans_and_preserve_output_on_failure() {
+        for export in EXPORTS {
+            let input = frame(&[b"x"]);
+            let mut out = [b'Z'; 256];
+            unsafe {
+                for cap in [0, 1, OUTPUT_BYTES - 1] {
+                    assert_eq!(
+                        export(input.as_ptr(), input.len(), out.as_mut_ptr(), cap),
+                        -(OUTPUT_BYTES as isize)
+                    );
+                    assert_eq!(out, [b'Z'; 256]);
+                }
+                assert_eq!(
+                    export(input.as_ptr(), input.len(), out.as_mut_ptr(), OUTPUT_BYTES),
+                    OUTPUT_BYTES as isize
+                );
+                assert!(out[OUTPUT_BYTES..].iter().all(|b| *b == b'Z'));
+                for (ptr, len) in [
+                    (std::ptr::null(), 0),
+                    (std::ptr::null(), input.len()),
+                    (input.as_ptr(), 16 * 1024 * 1024 + 1),
+                    (input.as_ptr(), isize::MAX as usize + 1),
+                    ((usize::MAX - 1) as *const u8, 8),
+                ] {
+                    out.fill(b'Z');
+                    assert_eq!(export(ptr, len, out.as_mut_ptr(), out.len()), -1);
+                    assert_eq!(out, [b'Z'; 256]);
+                }
+                assert_eq!(
+                    export(input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                    -1
+                );
+                for (ptr, cap) in [
+                    (out.as_mut_ptr(), usize::MAX),
+                    ((usize::MAX - 1) as *mut u8, 8),
+                ] {
+                    assert_eq!(export(input.as_ptr(), input.len(), ptr, cap), -1);
+                    assert_eq!(out, [b'Z'; 256]);
+                }
+                let mut overlap = vec![b'Z'; input.len() + 512];
+                overlap[32..32 + input.len()].copy_from_slice(&input);
+                let original = overlap.clone();
+                for offset in [0, 32, 33, 32 + input.len() - 1] {
+                    assert_eq!(
+                        export(
+                            overlap.as_ptr().add(32),
+                            input.len(),
+                            overlap.as_mut_ptr().add(offset),
+                            256
+                        ),
+                        -1
+                    );
+                    assert_eq!(overlap, original);
+                }
+                // Adjacent input/output spans are legal.
+                assert_eq!(
+                    export(
+                        overlap.as_ptr().add(32),
+                        input.len(),
+                        overlap.as_mut_ptr().add(32 + input.len()),
+                        256
+                    ),
+                    OUTPUT_BYTES as isize
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn w464_rejects_malformed_frames() {
+        for export in EXPORTS {
+            let mut out = [b'Z'; 256];
+            for malformed in [
+                b"".as_slice(),
+                b"N;",
+                b"a:1:{i:0;",
+                b"a:01:{i:0;s:0:\"\";}",
+                b"a:999999999999999999999:{}",
+                b"a:1:{i:0;s:0:\"\";}trailing",
+                b"a:1:{i:1;s:0:\"\";}",
+                b"a:1:{i:00;s:0:\"\";}",
+                b"a:1:{i:0;N;}",
+                b"a:1:{i:0;i:5;}",
+                b"a:1:{s:1:\"x\";s:0:\"\";}",
+                b"a:1:{i:0;a:0:{}}",
+                b"a:1:{i:0;s:5:\"x\";}",
+                b"a:1:{i:0;s:1:\"xy\";}",
+                b"a:1:{i:0;s:-1:\"\";}",
+                b"a:2:{i:0;s:0:\"\";}",
+                b"a:0:{i:0;s:0:\"\";}",
+                b"a:1:{i:0;s:0:\"\";",
+                b"a:1:{a:1:{i:0;s:0:\"\";}}",
+            ] {
+                assert_eq!(
+                    unsafe {
+                        export(
+                            malformed.as_ptr(),
+                            malformed.len(),
+                            out.as_mut_ptr(),
+                            out.len(),
+                        )
+                    },
+                    -1,
+                    "{}",
+                    String::from_utf8_lossy(malformed)
+                );
+                assert_eq!(out, [b'Z'; 256]);
+            }
+            assert_eq!(counts(export, &[]), [0; COUNTS]);
+            // Entries may embed quotes, NULs and frame syntax.
+            assert_eq!(counts(export, &[b"\";}i:1;s:0:\"\0"])[0], 1);
+        }
+    }
+}
