@@ -28,6 +28,14 @@ final class ManticoreClientFactory
     private static bool $adoptParseHostFfi = false;
 
     /**
+     * Rust stays opt-in for the Wave 42.5 summary: the FFI round trip misses the 1.5x gate; see
+     * tests/Unit/RustSearchOutboxElasticManticoreSupportW42ParityTest.php.
+     */
+    public const bool W425_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useW425RustFfi = null;
+
+    /**
      * Build a Manticore PHP client from app config.
      *
      * @param  array<string, mixed>  $config
@@ -327,6 +335,125 @@ final class ManticoreClientFactory
         }
 
         return array_values(array_filter(array_map('trim', explode(',', $hosts))));
+    }
+
+    public static function useW425RustFfi(bool $enable = true): void
+    {
+        self::$useW425RustFfi = $enable;
+    }
+
+    public static function usesW425RustFfi(): bool
+    {
+        return self::$useW425RustFfi ?? self::W425_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW425RustFfi(): void
+    {
+        self::$useW425RustFfi = null;
+    }
+
+    /**
+     * Summarizes host lists as {@see normalizeHostsPhp()} returns them. Lists that are neither strings
+     * nor arrays are invalid; `empty_lists` counts valid lists without hosts. `https_hosts` and
+     * `distinct_hosts` cover string hosts (ASCII case-insensitive `https://` prefix, exact bytes).
+     *
+     * @param  array<array-key, mixed>  $hostLists
+     * @return array{lists: int, invalid: int, empty_lists: int, hosts: int, structured_hosts: int, https_hosts: int, distinct_hosts: int, max_hosts_per_list: int}
+     */
+    public static function summarizeHostListBatch(array $hostLists): array
+    {
+        return self::usesW425RustFfi() ? self::summarizeHostListBatchNative($hostLists) : self::summarizeHostListBatchPhp($hostLists);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $hostLists
+     * @return array{lists: int, invalid: int, empty_lists: int, hosts: int, structured_hosts: int, https_hosts: int, distinct_hosts: int, max_hosts_per_list: int}
+     */
+    public static function summarizeHostListBatchPhp(array $hostLists): array
+    {
+        $invalid = 0;
+        $empty = 0;
+        $hosts = 0;
+        $structured = 0;
+        $https = 0;
+        $widest = 0;
+        $distinct = [];
+        foreach ($hostLists as $list) {
+            if (! \is_string($list) && ! \is_array($list)) {
+                $invalid++;
+
+                continue;
+            }
+            $normalized = self::normalizeHostsPhp($list);
+            $found = \count($normalized);
+            foreach ($normalized as $host) {
+                if (\is_string($host)) {
+                    $https += (int) (strncasecmp($host, 'https://', 8) === 0);
+                    $distinct[$host] = true;
+                } elseif (\is_array($host)) {
+                    $structured++;
+                }
+            }
+            $hosts += $found;
+            $empty += (int) ($found === 0);
+            $widest = max($widest, $found);
+        }
+
+        return [
+            'lists' => \count($hostLists),
+            'invalid' => $invalid,
+            'empty_lists' => $empty,
+            'hosts' => $hosts,
+            'structured_hosts' => $structured,
+            'https_hosts' => $https,
+            'distinct_hosts' => \count($distinct),
+            'max_hosts_per_list' => $widest,
+        ];
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $hostLists
+     * @return array{lists: int, invalid: int, empty_lists: int, hosts: int, structured_hosts: int, https_hosts: int, distinct_hosts: int, max_hosts_per_list: int}
+     */
+    public static function summarizeHostListBatchNative(array $hostLists): array
+    {
+        $parts = [];
+        foreach ($hostLists as $list) {
+            if (\is_string($list)) {
+                array_push($parts, '1', $list);
+
+                continue;
+            }
+            if (! \is_array($list)) {
+                $parts[] = '0';
+
+                continue;
+            }
+            $items = array_filter($list);
+            array_push($parts, '2', (string) \count($items));
+            foreach ($items as $item) {
+                $parts[] = match (true) {
+                    \is_string($item) => 's'.$item,
+                    \is_array($item) => 'a',
+                    default => 'o',
+                };
+            }
+        }
+        $fields = ElasticsearchResponseHelper::evaluateW425Native(4, $parts);
+        if ($fields === null || \count($fields) !== 8) {
+            return self::summarizeHostListBatchPhp($hostLists);
+        }
+
+        return [
+            'lists' => (int) $fields[0],
+            'invalid' => (int) $fields[1],
+            'empty_lists' => (int) $fields[2],
+            'hosts' => (int) $fields[3],
+            'structured_hosts' => (int) $fields[4],
+            'https_hosts' => (int) $fields[5],
+            'distinct_hosts' => (int) $fields[6],
+            'max_hosts_per_list' => (int) $fields[7],
+        ];
     }
 
     /**

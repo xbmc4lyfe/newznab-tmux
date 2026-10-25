@@ -12,6 +12,14 @@ use Throwable;
 final class ManticoreIndexRegistry
 {
     /**
+     * Rust stays opt-in for the Wave 42.5 summary: the FFI round trip misses the 1.5x gate; see
+     * tests/Unit/RustSearchOutboxElasticManticoreSupportW42ParityTest.php.
+     */
+    public const bool W425_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useW425RustFfi = null;
+
+    /**
      * @return array<string, array{settings: array<string, int|string>, columns: array<string, array<string, mixed>>}>
      */
     public static function definitions(): array
@@ -171,6 +179,118 @@ final class ManticoreIndexRegistry
         return $names;
     }
 
+    public static function useW425RustFfi(bool $enable = true): void
+    {
+        self::$useW425RustFfi = $enable;
+    }
+
+    public static function usesW425RustFfi(): bool
+    {
+        return self::$useW425RustFfi ?? self::W425_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW425RustFfi(): void
+    {
+        self::$useW425RustFfi = null;
+    }
+
+    /**
+     * Resolves a batch of table names with the precedence of {@see logicalNamePhp()}: the first
+     * configured logical name whose table matches, then the default `*_rt` table names. Non-string
+     * tables are invalid; `distinct_logical` counts the distinct resolved logical names.
+     *
+     * @param  array<array-key, mixed>  $tables
+     * @param  array<array-key, mixed>  $configuredIndexes
+     * @return array{tables: int, invalid: int, configured: int, defaults: int, unresolved: int, distinct_logical: int}
+     */
+    public static function summarizeTableNameBatch(array $tables, array $configuredIndexes = []): array
+    {
+        return self::usesW425RustFfi()
+            ? self::summarizeTableNameBatchNative($tables, $configuredIndexes)
+            : self::summarizeTableNameBatchPhp($tables, $configuredIndexes);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $tables
+     * @param  array<array-key, mixed>  $configuredIndexes
+     * @return array{tables: int, invalid: int, configured: int, defaults: int, unresolved: int, distinct_logical: int}
+     */
+    public static function summarizeTableNameBatchPhp(array $tables, array $configuredIndexes = []): array
+    {
+        $configured = self::w425FirstLogicalByTable($configuredIndexes);
+        $defaults = self::w425FirstLogicalByTable(self::defaultTableNames());
+        $invalid = 0;
+        $fromConfig = 0;
+        $fromDefaults = 0;
+        $unresolved = 0;
+        $logical = [];
+        foreach ($tables as $table) {
+            if (! \is_string($table)) {
+                $invalid++;
+
+                continue;
+            }
+            if (isset($configured[$table])) {
+                $fromConfig++;
+                $logical[$configured[$table]] = true;
+
+                continue;
+            }
+            $name = str_ends_with($table, '_rt') ? ($defaults[$table] ?? '') : '';
+            if ($name === '' || $name === '0') {
+                $unresolved++;
+
+                continue;
+            }
+            $fromDefaults++;
+            $logical[$name] = true;
+        }
+
+        return [
+            'tables' => \count($tables),
+            'invalid' => $invalid,
+            'configured' => $fromConfig,
+            'defaults' => $fromDefaults,
+            'unresolved' => $unresolved,
+            'distinct_logical' => \count($logical),
+        ];
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $tables
+     * @param  array<array-key, mixed>  $configuredIndexes
+     * @return array{tables: int, invalid: int, configured: int, defaults: int, unresolved: int, distinct_logical: int}
+     */
+    public static function summarizeTableNameBatchNative(array $tables, array $configuredIndexes = []): array
+    {
+        $parts = [];
+        foreach ([$configuredIndexes, self::defaultTableNames()] as $map) {
+            $pairs = [];
+            foreach ($map as $name => $table) {
+                if (\is_string($table)) {
+                    array_push($pairs, (string) $name, $table);
+                }
+            }
+            array_push($parts, (string) intdiv(\count($pairs), 2), ...$pairs);
+        }
+        foreach ($tables as $table) {
+            array_push($parts, ...(\is_string($table) ? ['1', $table] : ['0', '']));
+        }
+        $fields = ElasticsearchResponseHelper::evaluateW425Native(5, $parts);
+        if ($fields === null || \count($fields) !== 6) {
+            return self::summarizeTableNameBatchPhp($tables, $configuredIndexes);
+        }
+
+        return [
+            'tables' => (int) $fields[0],
+            'invalid' => (int) $fields[1],
+            'configured' => (int) $fields[2],
+            'defaults' => (int) $fields[3],
+            'unresolved' => (int) $fields[4],
+            'distinct_logical' => (int) $fields[5],
+        ];
+    }
+
     /** @return array<string, int|string> */
     private static function fullTextSettings(): array
     {
@@ -194,5 +314,24 @@ final class ManticoreIndexRegistry
         }
 
         return $definitions;
+    }
+
+    /**
+     * First logical name (as a string) for every string table, matching `logicalNamePhp()`'s
+     * first-match scan.
+     *
+     * @param  array<array-key, mixed>  $map
+     * @return array<string, string>
+     */
+    private static function w425FirstLogicalByTable(array $map): array
+    {
+        $byTable = [];
+        foreach ($map as $name => $table) {
+            if (\is_string($table) && ! isset($byTable[$table])) {
+                $byTable[$table] = (string) $name;
+            }
+        }
+
+        return $byTable;
     }
 }

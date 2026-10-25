@@ -6,6 +6,7 @@ namespace App\Services\Search;
 
 use App\Enums\SecondarySearchIndex;
 use App\Facades\Search;
+use App\Services\Search\Support\ElasticsearchResponseHelper;
 use App\Support\RustPipelineLibrary;
 use FFI;
 use Illuminate\Support\Facades\Log;
@@ -24,6 +25,22 @@ final class SearchIndexOutboxDispatcher
 {
     // Every candidate missed at least one 1.5x workload gate; see the parity benchmark.
     private static bool $useRustFfi = false;
+
+    /**
+     * Rust stays opt-in for the Wave 42.5 summary: the FFI round trip misses the 1.5x gate; see
+     * tests/Unit/RustSearchOutboxElasticManticoreSupportW42ParityTest.php.
+     */
+    public const bool W425_RUST_FFI_DEFAULT = false;
+
+    /** Normalized entity types {@see secondaryIndexFromEntityType()} routes to a secondary index. */
+    private const array W425_SECONDARY_TYPES = [
+        'music', 'musicinfo', 'music_info', 'book', 'books', 'bookinfo', 'book_info',
+        'game', 'games', 'gamesinfo', 'games_info', 'console', 'consoleinfo', 'console_info',
+        'steam', 'steamapp', 'steamapps', 'steam_app', 'steam_apps',
+        'anime', 'anidb', 'anidbtitle', 'anidbtitles', 'anidb_title', 'anidb_titles', 'anidbinfo', 'anidb_info',
+    ];
+
+    private static ?bool $useW425RustFfi = null;
 
     public static function setUseRustFfi(bool $enabled): void
     {
@@ -519,6 +536,155 @@ final class SearchIndexOutboxDispatcher
         }
 
         return $payload;
+    }
+
+    public static function useW425RustFfi(bool $enable = true): void
+    {
+        self::$useW425RustFfi = $enable;
+    }
+
+    public static function usesW425RustFfi(): bool
+    {
+        return self::$useW425RustFfi ?? self::W425_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW425RustFfi(): void
+    {
+        self::$useW425RustFfi = null;
+    }
+
+    /**
+     * Summarizes how {@see dispatchRow()} would route a batch of outbox rows without dispatching,
+     * logging or decoding payloads. Non-objects and rows whose `entity_type` or `action` is neither
+     * scalar nor null are invalid. The entity ID comes from a numeric `entity_id` only; rows without a
+     * positive one count as `missing_entity_id` and are not classified. `secondary` covers the
+     * `secondary` type and every secondary index alias; `distinct_documents` counts distinct
+     * normalized type and entity ID pairs. `max_row_id` covers every valid row and starts at 0.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array{rows: int, invalid: int, missing_entity_id: int, inserts: int, upserts: int, updates: int, deletes: int, unknown_actions: int, releases: int, predb: int, movies: int, tvshows: int, secondary: int, other_types: int, distinct_documents: int, max_row_id: int}
+     */
+    public static function summarizeOutboxBatch(array $rows): array
+    {
+        return self::usesW425RustFfi() ? self::summarizeOutboxBatchNative($rows) : self::summarizeOutboxBatchPhp($rows);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rows
+     * @return array{rows: int, invalid: int, missing_entity_id: int, inserts: int, upserts: int, updates: int, deletes: int, unknown_actions: int, releases: int, predb: int, movies: int, tvshows: int, secondary: int, other_types: int, distinct_documents: int, max_row_id: int}
+     */
+    public static function summarizeOutboxBatchPhp(array $rows): array
+    {
+        $invalid = 0;
+        $missing = 0;
+        $maxRowId = 0;
+        $actions = ['insert' => 0, 'upsert' => 0, 'update' => 0, 'delete' => 0, 'unknown' => 0];
+        $types = ['release' => 0, 'predb' => 0, 'movie' => 0, 'tvshow' => 0, 'secondary' => 0, 'other' => 0];
+        $documents = [];
+        foreach ($rows as $row) {
+            $fields = self::w425RowFields($row);
+            if ($fields === null) {
+                $invalid++;
+
+                continue;
+            }
+            [$type, $action, $entityId, $rowId] = $fields;
+            $maxRowId = max($maxRowId, $rowId);
+            if ($entityId <= 0) {
+                $missing++;
+
+                continue;
+            }
+            $action = self::normalizeActionPhp($action);
+            $actions[isset($actions[$action]) ? $action : 'unknown']++;
+            $type = self::normalizeEntityTypePhp($type);
+            $types[match (true) {
+                isset($types[$type]) && $type !== 'other' => $type,
+                \in_array($type, self::W425_SECONDARY_TYPES, true) => 'secondary',
+                default => 'other',
+            }]++;
+            $documents[$type.':'.$entityId] = true;
+        }
+
+        return [
+            'rows' => \count($rows),
+            'invalid' => $invalid,
+            'missing_entity_id' => $missing,
+            'inserts' => $actions['insert'],
+            'upserts' => $actions['upsert'],
+            'updates' => $actions['update'],
+            'deletes' => $actions['delete'],
+            'unknown_actions' => $actions['unknown'],
+            'releases' => $types['release'],
+            'predb' => $types['predb'],
+            'movies' => $types['movie'],
+            'tvshows' => $types['tvshow'],
+            'secondary' => $types['secondary'],
+            'other_types' => $types['other'],
+            'distinct_documents' => \count($documents),
+            'max_row_id' => $maxRowId,
+        ];
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rows
+     * @return array{rows: int, invalid: int, missing_entity_id: int, inserts: int, upserts: int, updates: int, deletes: int, unknown_actions: int, releases: int, predb: int, movies: int, tvshows: int, secondary: int, other_types: int, distinct_documents: int, max_row_id: int}
+     */
+    public static function summarizeOutboxBatchNative(array $rows): array
+    {
+        $parts = [];
+        foreach ($rows as $row) {
+            $fields = self::w425RowFields($row);
+            if ($fields === null) {
+                array_push($parts, '0', '', '', '0', '0');
+
+                continue;
+            }
+            array_push($parts, '1', $fields[0], $fields[1], (string) $fields[2], (string) $fields[3]);
+        }
+        $fields = ElasticsearchResponseHelper::evaluateW425Native(1, $parts);
+        if ($fields === null || \count($fields) !== 16) {
+            return self::summarizeOutboxBatchPhp($rows);
+        }
+
+        return [
+            'rows' => (int) $fields[0],
+            'invalid' => (int) $fields[1],
+            'missing_entity_id' => (int) $fields[2],
+            'inserts' => (int) $fields[3],
+            'upserts' => (int) $fields[4],
+            'updates' => (int) $fields[5],
+            'deletes' => (int) $fields[6],
+            'unknown_actions' => (int) $fields[7],
+            'releases' => (int) $fields[8],
+            'predb' => (int) $fields[9],
+            'movies' => (int) $fields[10],
+            'tvshows' => (int) $fields[11],
+            'secondary' => (int) $fields[12],
+            'other_types' => (int) $fields[13],
+            'distinct_documents' => (int) $fields[14],
+            'max_row_id' => (int) $fields[15],
+        ];
+    }
+
+    /**
+     * Raw entity type, raw action, entity ID and row ID of a summarizable row.
+     *
+     * @return array{string, string, int, int}|null
+     */
+    private static function w425RowFields(mixed $row): ?array
+    {
+        if (! \is_object($row)) {
+            return null;
+        }
+        $type = $row->entity_type ?? null;
+        $action = $row->action ?? null;
+        if (($type !== null && ! \is_scalar($type)) || ($action !== null && ! \is_scalar($action))) {
+            return null;
+        }
+        $entityId = $row->entity_id ?? null;
+
+        return [(string) $type, (string) $action, is_numeric($entityId) ? (int) $entityId : 0, self::rowId($row)];
     }
 
     private static function logUnknownAction(string $action, string $entityType, int $entityId): void
