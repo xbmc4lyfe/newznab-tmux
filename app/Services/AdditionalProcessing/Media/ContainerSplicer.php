@@ -168,4 +168,228 @@ final class ContainerSplicer
 
         return self::$ffi;
     }
+
+    // PHP stays the default: the paired W50.6 benchmark p99 fell below 1.5x in repeated runs.
+    private const bool W50_RUST_FFI_DEFAULT = false;
+
+    public const string W50_FFI_CDEF = <<<'C'
+        int32_t nntmux_w506_container_splice_batch(const char *heads, size_t heads_len, const char *head_lens, size_t head_lens_len, const char *mids, size_t mids_len, const char *mid_lens, size_t mid_lens_len, const char *mid_sizes, size_t mid_sizes_len, const char *codes, size_t codes_len, size_t count, int64_t *out, size_t out_count);
+        C;
+
+    public const int W50_SPLICE_HEADER = 8;
+
+    public const int W50_SPLICE_ROW = 3;
+
+    private const int W50_MAX_ITEMS = 1_048_576;
+
+    private const int W50_TOTAL_CAP = 1 << 62;
+
+    /** Bytes of a transport stream mid the resume scan can read (five 192-byte packets). */
+    private const int W50_TRANSPORT_WINDOW = 960;
+
+    /** Container backing value => code (case index + 1); 0 is none. */
+    private const array W50_CONTAINER_CODES = ['matroska' => 1, 'avi' => 2, 'mpeg' => 3, 'mpegts' => 4, 'mov' => 5, 'asf' => 6, 'ogg' => 7];
+
+    public static function usesW50RustFfi(): bool
+    {
+        return self::w50RustFfiState() === true;
+    }
+
+    /**
+     * Run `$callback` with the Wave 50.6 Rust batch path forced on or off, then restore the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW50RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w50RustFfiState('swap', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w50RustFfiState('swap', $previous);
+        }
+    }
+
+    /**
+     * Plan a batch of splices as `splicePhp()` does, as offsets: a spliced copy is
+     * `substr($head, 0, head end).substr($mid, mid start)`. Containers, heads and mids are
+     * matched by position (a missing head or mid is empty).
+     *
+     * Layout: `[0]` count, `[1]` spliced, `[2]` supported without a resume point, `[3]`
+     * unsupported, `[4]` joined bytes, `[5]` largest joined length and `[6]` its first index (-1
+     * when none), `[7]` FNV-1a digest; then three values per pair: `status | code << 4` (1
+     * spliced, 0 no resume point, 2 unsupported; code is the case index + 1, 0 for none), the
+     * head end and the mid start (both 0 unless spliced).
+     *
+     * @param  array<array-key, string>  $heads
+     * @param  array<array-key, string>  $mids
+     * @param  array<array-key, VideoContainer|null>  $containers
+     * @return list<int>
+     */
+    public static function planSpliceBatch(array $heads, array $mids, array $containers): array
+    {
+        return (self::usesW50RustFfi() ? self::planSpliceBatchNative($heads, $mids, $containers) : null) ?? self::planSpliceBatchPhp($heads, $mids, $containers);
+    }
+
+    /**
+     * @param  array<array-key, string>  $heads
+     * @param  array<array-key, string>  $mids
+     * @param  array<array-key, VideoContainer|null>  $containers
+     * @return list<int>
+     */
+    public static function planSpliceBatchPhp(array $heads, array $mids, array $containers): array
+    {
+        $heads = array_values($heads);
+        $mids = array_values($mids);
+        $out = array_fill(0, self::W50_SPLICE_HEADER, 0);
+        $out[0] = \count($containers);
+        $out[6] = -1;
+        $digest = 2_166_136_261;
+        $rows = [];
+        foreach (array_values($containers) as $index => $container) {
+            $head = $heads[$index] ?? '';
+            $mid = $mids[$index] ?? '';
+            $code = $container === null ? 0 : self::W50_CONTAINER_CODES[$container->value];
+            $offsets = match ($container) {
+                VideoContainer::Matroska => ($headEnd = strpos($head, self::MATROSKA_CLUSTER)) === false || ($midStart = strpos($mid, self::MATROSKA_CLUSTER)) === false
+                    ? null : [$headEnd, $midStart],
+                VideoContainer::MpegTransport => ($midStart = VideoContainer::transportStreamOffsetPhp($mid)) === null ? null : [0, $midStart],
+                VideoContainer::MpegProgram => ($midStart = strpos($mid, self::MPEG_PACK_START)) === false ? null : [0, $midStart],
+                VideoContainer::Avi => ($movi = strpos($head, 'movi')) === false || $movi < 8 || substr($head, $movi - 8, 4) !== 'LIST'
+                    || preg_match('/\d\d(?:dc|db|wb)/', $mid, $chunk, PREG_OFFSET_CAPTURE) !== 1
+                    ? null : [$movi + 4, $chunk[0][1]],
+                default => false,
+            };
+            if ($offsets === false) {
+                $out[3]++;
+                $row = [2 | $code << 4, 0, 0];
+            } elseif ($offsets === null) {
+                $out[2]++;
+                $row = [$code << 4, 0, 0];
+            } else {
+                $out[1]++;
+                $joined = $offsets[0] + \strlen($mid) - $offsets[1];
+                $out[4] = $joined > self::W50_TOTAL_CAP - $out[4] ? self::W50_TOTAL_CAP : $out[4] + $joined;
+                if ($joined > $out[5] || $out[6] < 0) {
+                    $out[5] = $joined;
+                    $out[6] = $index;
+                }
+                $row = [1 | $code << 4, $offsets[0], $offsets[1]];
+            }
+            $digest = (($digest ^ $row[0]) * 16_777_619) & 0xFFFFFFFF;
+            array_push($rows, ...$row);
+        }
+        $out[7] = $digest;
+
+        return [...$out, ...$rows];
+    }
+
+    /**
+     * Rust plan, or null when PHP must compute it (unavailable library or rejected input).
+     * Only the bytes a container's resume point needs cross: heads for Matroska and AVI, mids
+     * for the four spliceable containers, cut to the scan window for MPEG transport streams,
+     * with their full lengths.
+     *
+     * @param  array<array-key, string>  $heads
+     * @param  array<array-key, string>  $mids
+     * @param  array<array-key, VideoContainer|null>  $containers
+     * @return list<int>|null
+     */
+    public static function planSpliceBatchNative(array $heads, array $mids, array $containers): ?array
+    {
+        $count = \count($containers);
+        $fields = self::W50_SPLICE_HEADER + self::W50_SPLICE_ROW * $count;
+        /** @var array{0: FFI, 1: CData}|null $binding */
+        $binding = $count <= self::W50_MAX_ITEMS ? self::w50RustFfiState('buffer', $fields) : null;
+        if ($binding === null) {
+            return null;
+        }
+        [$ffi, $out] = $binding;
+        $heads = array_values($heads);
+        $mids = array_values($mids);
+        $codes = '';
+        $headParts = $midParts = $headLens = $midLens = $midSizes = [];
+        foreach (array_values($containers) as $index => $container) {
+            $code = $container === null ? 0 : self::W50_CONTAINER_CODES[$container->value];
+            $codes .= \chr($code);
+            $head = $code === 1 || $code === 2 ? $heads[$index] ?? '' : '';
+            $mid = $code >= 1 && $code <= 4 ? $mids[$index] ?? '' : '';
+            $midSizes[] = \strlen($mid);
+            if ($code === 4 && \strlen($mid) > self::W50_TRANSPORT_WINDOW) {
+                $mid = substr($mid, 0, self::W50_TRANSPORT_WINDOW);
+            }
+            $headParts[] = $head;
+            $midParts[] = $mid;
+            $headLens[] = \strlen($head);
+            $midLens[] = \strlen($mid);
+        }
+        if ($count > 0 && max(max($headLens), max($midLens)) > 0xFFFFFFFF) {
+            return null;
+        }
+        $headJoined = implode('', $headParts);
+        $midJoined = implode('', $midParts);
+        $headLenPack = pack('V*', ...$headLens);
+        $midLenPack = pack('V*', ...$midLens);
+        $midSizePack = pack('q*', ...$midSizes);
+        try {
+            // @phpstan-ignore method.notFound
+            $status = $ffi->nntmux_w506_container_splice_batch(
+                $headJoined, \strlen($headJoined), $headLenPack, \strlen($headLenPack),
+                $midJoined, \strlen($midJoined), $midLenPack, \strlen($midLenPack), $midSizePack, \strlen($midSizePack),
+                $codes, \strlen($codes), $count, $out, $fields,
+            );
+            if ($status !== 1) {
+                return null;
+            }
+            $unpacked = unpack('P*', FFI::string($out, $fields * 8));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $unpacked === false ? null : array_values($unpacked);
+    }
+
+    /**
+     * Wave 50.6 routing: null reads the toggle, `swap` replaces it (null restores the default)
+     * and returns the previous value, `buffer` returns the cached binding and an output buffer
+     * of at least `$val` values. Enums and readonly classes cannot declare static properties,
+     * so the state lives in function-local statics.
+     */
+    private static function w50RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $enabled */
+        static $enabled = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $buffer */
+        static $buffer = null;
+        static $capacity = 0;
+        if ($op === null) {
+            return $enabled ?? self::W50_RUST_FFI_DEFAULT;
+        }
+        if ($op === 'swap') {
+            $previous = $enabled;
+            $enabled = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        $fields = \is_int($val) ? $val : 0;
+        try {
+            $ffi ??= RustPipelineLibrary::resolveDomain('additional_w50', self::W50_FFI_CDEF) ?? false;
+            if ($ffi === false) {
+                return null;
+            }
+            if ($buffer === null || $capacity < $fields) {
+                $capacity = max(256, $fields);
+                $buffer = $ffi->new('int64_t['.$capacity.']');
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $buffer === null ? null : [$ffi, $buffer];
+    }
 }

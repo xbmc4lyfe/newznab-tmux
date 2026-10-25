@@ -375,4 +375,220 @@ class ArchivedMediaSlicer
 
         return [self::$ffi, self::$boundsBuf, self::$boundsPtr];
     }
+
+    // Rust is the default only while the paired W50.6 benchmark clears 1.5x on all four metrics.
+    private const bool W50_RUST_FFI_DEFAULT = false;
+
+    public const string W50_FFI_CDEF = <<<'C'
+        int32_t nntmux_w506_archived_media_slice_batch(const char *ranges, size_t ranges_len, const char *range_twin, size_t range_twin_len, const char *names, size_t names_len, const char *name_twin, size_t name_twin_len, const char *ints, size_t ints_len, size_t count, int64_t data_len, int64_t max_sample_bytes, int64_t min_main_video_bytes, int64_t *out, size_t out_count);
+        C;
+
+    public const int W50_SLICE_HEADER = 9;
+
+    public const int W50_SLICE_ROW = 5;
+
+    private const int W50_MAX_ITEMS = 1_048_576;
+
+    private const int W50_TOTAL_CAP = 1 << 62;
+
+    public static function usesW50RustFfi(): bool
+    {
+        return self::w50RustFfiState() === true;
+    }
+
+    /**
+     * Run `$callback` with the Wave 50.6 Rust batch path forced on or off, then restore the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW50RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w50RustFfiState('swap', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w50RustFfiState('swap', $previous);
+        }
+    }
+
+    /**
+     * Plan the cut of a batch of stored video entries of one downloaded volume as `rangePhp()`
+     * and `entryForPhp()` do, without copying any bytes.
+     *
+     * Layout: `[0]` count, `[1]` entries starting in the data, `[2]` entries outside it, `[3]`
+     * samples, `[4]` main videos in the data, `[5]` head bytes (saturating at 2^62), `[6]` index
+     * and `[7]` size of the largest main video in the data (first on ties; -1 and 0 when none),
+     * `[8]` FNV-1a digest; then five values per entry: range start, range end, in-volume end,
+     * head length (0 outside the data) and `in data | sample << 1 | has next offset << 2`.
+     *
+     * @param  array<array-key, array{name: string, size: int, range: string, next_offset: int|null}>  $files
+     * @return list<int|float>
+     */
+    public static function planSliceBatch(array $files, int $dataLen, int $maxSampleBytes, int $minMainVideoBytes): array
+    {
+        return (self::usesW50RustFfi() ? self::planSliceBatchNative($files, $dataLen, $maxSampleBytes, $minMainVideoBytes) : null)
+            ?? self::planSliceBatchPhp($files, $dataLen, $maxSampleBytes, $minMainVideoBytes);
+    }
+
+    /**
+     * @param  array<array-key, array{name: string, size: int, range: string, next_offset: int|null}>  $files
+     * @return list<int|float>
+     */
+    public static function planSliceBatchPhp(array $files, int $dataLen, int $maxSampleBytes, int $minMainVideoBytes): array
+    {
+        $out = array_fill(0, self::W50_SLICE_HEADER, 0);
+        $out[0] = \count($files);
+        $out[6] = -1;
+        $digest = 2_166_136_261;
+        $rows = [];
+        $index = 0;
+        foreach ($files as $file) {
+            $bounds = explode('-', (string) $file['range'], 2);
+            $start = (int) $bounds[0];
+            $end = (int) ($bounds[1] ?? -1);
+            $size = (int) $file['size'];
+            $next = $file['next_offset'];
+            $inVolumeEnd = $next !== null && $next > $start ? $next - 1 : $start + $size - 1;
+            $available = min($inVolumeEnd, $dataLen - 1) - $start + 1;
+            $sample = preg_match('/(?:^|[\\\\\/._ -])sample(?:[\\\\\/._ -]|$)/i', (string) $file['name']) === 1
+                || $size < $minMainVideoBytes;
+            $head = 0;
+            if ($start < $dataLen) {
+                // strlen(substr($data, $start, $take)) for a volume of $dataLen bytes.
+                $take = min($available, $maxSampleBytes);
+                $rest = $dataLen - $start;
+                $head = $take >= 0 ? min($take, $rest) : max(0, $rest + $take);
+                $out[1]++;
+                $out[5] = $head > self::W50_TOTAL_CAP - $out[5] ? self::W50_TOTAL_CAP : $out[5] + $head;
+                if (! $sample) {
+                    $out[4]++;
+                    if ($out[6] < 0 || $size > $out[7]) {
+                        $out[6] = $index;
+                        $out[7] = $size;
+                    }
+                }
+                $flags = 1;
+            } else {
+                $out[2]++;
+                $flags = 0;
+            }
+            $out[3] += $sample ? 1 : 0;
+            $flags |= ($sample ? 2 : 0) | ($next !== null ? 4 : 0);
+            $digest = (($digest ^ $flags) * 16_777_619) & 0xFFFFFFFF;
+            array_push($rows, $start, $end, $inVolumeEnd, $head, $flags);
+            $index++;
+        }
+        $out[8] = $digest;
+
+        return [...$out, ...$rows];
+    }
+
+    /**
+     * Rust plan, or null when PHP must compute it (unavailable library, a range PHP converts
+     * through a float, or an overflowing offset).
+     *
+     * @param  array<array-key, array{name: string, size: int, range: string, next_offset: int|null}>  $files
+     * @return list<int>|null
+     */
+    public static function planSliceBatchNative(array $files, int $dataLen, int $maxSampleBytes, int $minMainVideoBytes): ?array
+    {
+        $count = \count($files);
+        $fields = self::W50_SLICE_HEADER + self::W50_SLICE_ROW * $count;
+        /** @var array{0: FFI, 1: CData}|null $binding */
+        $binding = $count <= self::W50_MAX_ITEMS ? self::w50RustFfiState('buffer', $fields) : null;
+        if ($binding === null) {
+            return null;
+        }
+        [$ffi, $out] = $binding;
+        // Columns are gathered natively; a file without one of the four keys stays in PHP.
+        $ranges = array_column($files, 'range');
+        $names = array_column($files, 'name');
+        $sizes = array_column($files, 'size');
+        $nexts = array_column($files, 'next_offset');
+        if (\count($ranges) !== $count || \count($names) !== $count || \count($sizes) !== $count || \count($nexts) !== $count) {
+            return null;
+        }
+        $flags = $count === 0 ? [] : array_fill(0, $count, 1);
+        foreach (array_keys($nexts, null, true) as $index) {
+            $flags[$index] = 0;
+        }
+        [$rangeJoined, $rangeTwin] = self::w50Strings($ranges);
+        [$nameJoined, $nameTwin] = self::w50Strings($names);
+        // pack() reads a null next offset as 0; its flag is 0.
+        $ints = pack('q*', ...$sizes, ...$nexts, ...$flags);
+        try {
+            // @phpstan-ignore method.notFound
+            $status = $ffi->nntmux_w506_archived_media_slice_batch(
+                $rangeJoined, \strlen($rangeJoined), $rangeTwin, \strlen($rangeTwin),
+                $nameJoined, \strlen($nameJoined), $nameTwin, \strlen($nameTwin),
+                $ints, \strlen($ints), $count, $dataLen, $maxSampleBytes, $minMainVideoBytes, $out, $fields,
+            );
+            if ($status !== 1) {
+                return null;
+            }
+            $unpacked = unpack('P*', FFI::string($out, $fields * 8));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $unpacked === false ? null : array_values($unpacked);
+    }
+
+    /**
+     * Wave 50.6 routing: null reads the toggle, `swap` replaces it (null restores the default)
+     * and returns the previous value, `buffer` returns the cached binding and an output buffer
+     * of at least `$val` values. Enums and readonly classes cannot declare static properties,
+     * so the state lives in function-local statics.
+     */
+    private static function w50RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $enabled */
+        static $enabled = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $buffer */
+        static $buffer = null;
+        static $capacity = 0;
+        if ($op === null) {
+            return $enabled ?? self::W50_RUST_FFI_DEFAULT;
+        }
+        if ($op === 'swap') {
+            $previous = $enabled;
+            $enabled = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        $fields = \is_int($val) ? $val : 0;
+        try {
+            $ffi ??= RustPipelineLibrary::resolveDomain('additional_w50', self::W50_FFI_CDEF) ?? false;
+            if ($ffi === false) {
+                return null;
+            }
+            if ($buffer === null || $capacity < $fields) {
+                $capacity = max(256, $fields);
+                $buffer = $ffi->new('int64_t['.$capacity.']');
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $buffer === null ? null : [$ffi, $buffer];
+    }
+
+    /**
+     * NUL-joined values and, when one holds a NUL, the same list joined with 0x01 so Rust
+     * finds the separators where the two differ.
+     *
+     * @param  list<string>  $items
+     * @return array{0: string, 1: string}
+     */
+    private static function w50Strings(array $items): array
+    {
+        $joined = implode("\0", $items);
+
+        return $items !== [] && substr_count($joined, "\0") !== \count($items) - 1 ? [$joined, implode("\x01", $items)] : [$joined, ''];
+    }
 }
