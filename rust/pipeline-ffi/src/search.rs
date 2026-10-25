@@ -26793,3 +26793,672 @@ mod wave38_5_search_facade_controller_guest_layout {
         }
     }
 }
+
+/// Wave 39.5: second-pass admin settings, monitoring, log viewer and search
+/// reconcile/diag summaries (`AdminSettingsController::summarizeSettingsDiff`,
+/// `AdminMonitoringController::summarizeQueueLatencySnapshots`,
+/// `AdminLogViewerController::summarizeLogLevelDistribution`,
+/// `NntmuxSearchReconcile::planReconcileIdDiff` and
+/// `NntmuxSearchDiag::summarizeIndexShardHealth`).
+mod wave39_5_admin_settings_monitoring_logs_reconcile {
+    use std::collections::{HashMap, HashSet};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const DECLINE: isize = -1;
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+    const MAX_PARTS: usize = 1 << 20;
+    /// Bytes stripped by PHP's default `trim()`.
+    const PHP_TRIM: &[u8] = b" \t\n\r\0\x0B";
+    /// Samples above one day are rejected as invalid.
+    const MAX_LATENCY_MS: i64 = 86_400_000;
+    /// PSR-3 levels in ascending severity.
+    const LOG_LEVELS: [&[u8]; 8] = [
+        b"debug",
+        b"info",
+        b"notice",
+        b"warning",
+        b"error",
+        b"critical",
+        b"alert",
+        b"emergency",
+    ];
+
+    fn unpack(input: &[u8]) -> Option<Vec<&[u8]>> {
+        let count = u32::from_le_bytes(input.get(..4)?.try_into().ok()?) as usize;
+        if count > MAX_PARTS || count > (input.len() - 4) / 4 {
+            return None;
+        }
+        let mut cursor = 4usize;
+        let mut parts = Vec::with_capacity(count);
+        for _ in 0..count {
+            let length_end = cursor.checked_add(4)?;
+            let length =
+                u32::from_le_bytes(input.get(cursor..length_end)?.try_into().ok()?) as usize;
+            let end = length_end.checked_add(length)?;
+            parts.push(input.get(length_end..end)?);
+            cursor = end;
+        }
+        (cursor == input.len()).then_some(parts)
+    }
+
+    fn pack(parts: &[Vec<u8>]) -> Option<Vec<u8>> {
+        let count = u32::try_from(parts.len()).ok()?;
+        let size = parts.iter().try_fold(4usize, |size, part| {
+            u32::try_from(part.len()).ok()?;
+            size.checked_add(4)?.checked_add(part.len())
+        })?;
+        if size > isize::MAX as usize {
+            return None;
+        }
+        let mut out = Vec::with_capacity(size);
+        out.extend_from_slice(&count.to_le_bytes());
+        for part in parts {
+            out.extend_from_slice(&(part.len() as u32).to_le_bytes());
+            out.extend_from_slice(part);
+        }
+        Some(out)
+    }
+
+    /// Canonical decimal produced by PHP `(string) $int`.
+    fn integer(bytes: &[u8]) -> Option<i64> {
+        if bytes.is_empty() || bytes.len() > 20 {
+            return None;
+        }
+        let value: i64 = std::str::from_utf8(bytes).ok()?.parse().ok()?;
+        (value.to_string().as_bytes() == bytes).then_some(value)
+    }
+
+    fn text(value: i64) -> Vec<u8> {
+        value.to_string().into_bytes()
+    }
+
+    fn bit(value: bool) -> Vec<u8> {
+        if value { b"1".to_vec() } else { b"0".to_vec() }
+    }
+
+    fn php_trim(bytes: &[u8]) -> &[u8] {
+        let start = bytes
+            .iter()
+            .position(|b| !PHP_TRIM.contains(b))
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|b| !PHP_TRIM.contains(b))
+            .map_or(start, |i| i + 1);
+        &bytes[start..end]
+    }
+
+    /// Mode 1: `[current_count, (key, value) x current_count, (key, value)...]`
+    /// -> `[total, changed, unchanged, unknown, empty]`.
+    fn settings_diff(parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        let (count, rest) = parts.split_first()?;
+        let count = usize::try_from(integer(count)?).ok()?;
+        let current_len = count.checked_mul(2)?;
+        if current_len > rest.len() || (rest.len() - current_len) % 2 != 0 {
+            return None;
+        }
+        let (current, submitted) = rest.split_at(current_len);
+        let mut known: HashMap<&[u8], &[u8]> = HashMap::with_capacity(count);
+        for pair in current.chunks_exact(2) {
+            known.insert(pair[0], pair[1]);
+        }
+        let (mut changed, mut unchanged, mut unknown, mut empty) = (0i64, 0i64, 0i64, 0i64);
+        for pair in submitted.chunks_exact(2) {
+            match known.get(pair[0]) {
+                None => unknown += 1,
+                Some(value) if *value == pair[1] => unchanged += 1,
+                Some(_) => changed += 1,
+            }
+            if php_trim(pair[1]).is_empty() {
+                empty += 1;
+            }
+        }
+        Some(vec![
+            text((submitted.len() / 2) as i64),
+            text(changed),
+            text(unchanged),
+            text(unknown),
+            text(empty),
+        ])
+    }
+
+    /// Mode 2: `[sla_ms, sample...]` -> `[count, valid, invalid, min, max,
+    /// sum, breaches, healthy]` (`min`/`max` empty without valid samples).
+    fn queue_latency(parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        let (sla, samples) = parts.split_first()?;
+        let sla = integer(sla)?;
+        let (mut valid, mut invalid, mut breaches, mut sum) = (0i64, 0i64, 0i64, 0i64);
+        let (mut min, mut max) = (i64::MAX, i64::MIN);
+        for sample in samples {
+            match integer(sample) {
+                Some(ms) if (0..=MAX_LATENCY_MS).contains(&ms) => {
+                    valid += 1;
+                    sum = sum.checked_add(ms)?;
+                    min = min.min(ms);
+                    max = max.max(ms);
+                    if ms > sla {
+                        breaches += 1;
+                    }
+                }
+                _ => invalid += 1,
+            }
+        }
+        let bound = |value: i64| if valid > 0 { text(value) } else { Vec::new() };
+        Some(vec![
+            text(samples.len() as i64),
+            text(valid),
+            text(invalid),
+            bound(min),
+            bound(max),
+            text(sum),
+            text(breaches),
+            bit(invalid == 0 && breaches == 0),
+        ])
+    }
+
+    fn log_level(raw: &[u8]) -> Option<usize> {
+        let level = php_trim(raw);
+        LOG_LEVELS
+            .iter()
+            .position(|name| level.eq_ignore_ascii_case(name))
+    }
+
+    /// Mode 3: `[min_severity, level...]` -> `[total, debug..emergency x8,
+    /// unknown, highest (-1 when none), min_index, at_or_above]`.
+    fn log_levels(parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        let (min_severity, levels) = parts.split_first()?;
+        let min_index = log_level(min_severity).unwrap_or(0);
+        let mut counts = [0i64; 8];
+        let mut unknown = 0i64;
+        let mut highest = -1i64;
+        let mut at_or_above = 0i64;
+        for level in levels {
+            match log_level(level) {
+                Some(index) => {
+                    counts[index] += 1;
+                    highest = highest.max(index as i64);
+                    if index >= min_index {
+                        at_or_above += 1;
+                    }
+                }
+                None => unknown += 1,
+            }
+        }
+        let mut out = Vec::with_capacity(13);
+        out.push(text(levels.len() as i64));
+        out.extend(counts.iter().map(|count| text(*count)));
+        out.push(text(unknown));
+        out.push(text(highest));
+        out.push(text(min_index as i64));
+        out.push(text(at_or_above));
+        Some(out)
+    }
+
+    fn positive_id(raw: &[u8]) -> Option<i64> {
+        integer(raw).filter(|id| *id > 0)
+    }
+
+    /// Mode 4: `[max_repairs, db_count, db_id x db_count, index_id...]` ->
+    /// `[db_unique, index_unique, invalid, missing, orphans, in_sync,
+    /// upsert_count, delete_count, upsert_id..., delete_id...]`.
+    fn reconcile_diff(parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        let [max_repairs, db_count, rest @ ..] = parts else {
+            return None;
+        };
+        let cap = usize::try_from(integer(max_repairs)?.max(0)).unwrap_or(usize::MAX);
+        let db_count = usize::try_from(integer(db_count)?).ok()?;
+        if db_count > rest.len() {
+            return None;
+        }
+        let (db_raw, index_raw) = rest.split_at(db_count);
+        let mut invalid = 0i64;
+        let mut collect = |raw: &[&[u8]]| -> HashSet<i64> {
+            let mut set = HashSet::with_capacity(raw.len());
+            for id in raw {
+                match positive_id(id) {
+                    Some(id) => {
+                        set.insert(id);
+                    }
+                    None => invalid += 1,
+                }
+            }
+            set
+        };
+        let db = collect(db_raw);
+        let index = collect(index_raw);
+        let mut missing: Vec<i64> = db.difference(&index).copied().collect();
+        let mut orphans: Vec<i64> = index.difference(&db).copied().collect();
+        missing.sort_unstable();
+        orphans.sort_unstable();
+        let in_sync = db.len() - missing.len();
+        let upserts = &missing[..missing.len().min(cap)];
+        let deletes = &orphans[..orphans.len().min(cap)];
+        let mut out = Vec::with_capacity(8 + upserts.len() + deletes.len());
+        out.push(text(db.len() as i64));
+        out.push(text(index.len() as i64));
+        out.push(text(invalid));
+        out.push(text(missing.len() as i64));
+        out.push(text(orphans.len() as i64));
+        out.push(text(in_sync as i64));
+        out.push(text(upserts.len() as i64));
+        out.push(text(deletes.len() as i64));
+        out.extend(upserts.iter().map(|id| text(*id)));
+        out.extend(deletes.iter().map(|id| text(*id)));
+        Some(out)
+    }
+
+    /// Non-negative canonical integer; anything else counts as zero.
+    fn metric(raw: &[u8]) -> i64 {
+        if raw.is_empty() {
+            return 0;
+        }
+        integer(raw).map_or(0, |value| value.max(0))
+    }
+
+    /// Mode 5: `[max_lag, (state, docs, lag)...]` with state `1` online, `0`
+    /// offline or `m` malformed -> `[shards, online, offline, malformed,
+    /// lagging, total_docs (saturating), max_lag_seen, ready]`.
+    fn shard_health(parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        let (max_lag, shards) = parts.split_first()?;
+        let max_lag = integer(max_lag)?;
+        if shards.len() % 3 != 0 {
+            return None;
+        }
+        let (mut online, mut offline, mut malformed, mut lagging) = (0i64, 0i64, 0i64, 0i64);
+        let (mut total, mut worst) = (0i64, 0i64);
+        for shard in shards.chunks_exact(3) {
+            match shard[0] {
+                b"1" => {
+                    online += 1;
+                    let lag = metric(shard[2]);
+                    worst = worst.max(lag);
+                    if lag > max_lag {
+                        lagging += 1;
+                    }
+                }
+                b"0" => offline += 1,
+                b"m" => {
+                    offline += 1;
+                    malformed += 1;
+                    continue;
+                }
+                _ => return None,
+            }
+            total = total.saturating_add(metric(shard[1]));
+        }
+        let count = (shards.len() / 3) as i64;
+        Some(vec![
+            text(count),
+            text(online),
+            text(offline),
+            text(malformed),
+            text(lagging),
+            text(total),
+            text(worst),
+            bit(count > 0 && offline == 0 && lagging == 0),
+        ])
+    }
+
+    fn transform(mode: u32, parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        match mode {
+            1 => settings_diff(parts),
+            2 => queue_latency(parts),
+            3 => log_levels(parts),
+            4 => reconcile_diff(parts),
+            5 => shard_health(parts),
+            _ => None,
+        }
+    }
+
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> Option<bool> {
+        if a_len == 0 || b_len == 0 {
+            return Some(false);
+        }
+        let a_end = a.checked_add(a_len)?;
+        let b_end = b.checked_add(b_len)?;
+        Some(a < b_end && b < a_end)
+    }
+
+    /// Dispatch count-prefixed, length-prefixed byte strings (little-endian
+    /// u32). Returns written bytes, `-needed` when `cap` is too small, or `-1`
+    /// for invalid input, mode, overlapping buffers or fields. Failure never
+    /// writes to the output buffer. Results are at least four bytes, so `-1`
+    /// never means "one byte needed".
+    ///
+    /// # Safety
+    /// Non-null pointers must refer to readable/writable allocations of the
+    /// declared lengths. Null pointers require zero length/capacity. Input and
+    /// output must not overlap.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w39_admin_settings_monitoring_logs_reconcile(
+        mode: u32,
+        input: *const u8,
+        input_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if input_len > MAX_INPUT
+                || input_len > isize::MAX as usize
+                || cap > isize::MAX as usize
+                || (input.is_null() && input_len != 0)
+                || (out.is_null() && cap != 0)
+            {
+                return DECLINE;
+            }
+            match overlaps(input as usize, input_len, out as usize, cap) {
+                Some(false) => {}
+                _ => return DECLINE,
+            }
+            let input = if input_len == 0 {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(input, input_len) }
+            };
+            let Some(parts) = unpack(input) else {
+                return DECLINE;
+            };
+            let Some(result) = transform(mode, &parts).and_then(|parts| pack(&parts)) else {
+                return DECLINE;
+            };
+            if cap < result.len() || out.is_null() {
+                return -(result.len() as isize);
+            }
+            unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), out, result.len()) };
+            result.len() as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn packet(parts: &[&[u8]]) -> Vec<u8> {
+            pack(&parts.iter().map(|part| part.to_vec()).collect::<Vec<_>>()).unwrap()
+        }
+
+        fn call(mode: u32, parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+            let input = packet(parts);
+            let mut out = vec![0u8; input.len() * 4 + 4096];
+            let written = unsafe {
+                nntmux_w39_admin_settings_monitoring_logs_reconcile(
+                    mode,
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            if written < 0 {
+                return None;
+            }
+            out.truncate(written as usize);
+            Some(unpack(&out)?.into_iter().map(<[u8]>::to_vec).collect())
+        }
+
+        fn strings(items: &[&str]) -> Vec<Vec<u8>> {
+            items.iter().map(|item| item.as_bytes().to_vec()).collect()
+        }
+
+        #[test]
+        fn w39_settings_diff_summary() {
+            assert_eq!(
+                call(
+                    1,
+                    &[
+                        b"3", b"title", b"NNTmux", b"limit", b"10", b"motd", b"", b"title",
+                        b"NNTmux", b"limit", b"20", b"motd", b" \t", b"bogus", b"", b"0", b"x"
+                    ]
+                )
+                .unwrap(),
+                strings(&["5", "2", "1", "2", "2"])
+            );
+            assert_eq!(
+                call(1, &[b"0"]).unwrap(),
+                strings(&["0", "0", "0", "0", "0"])
+            );
+            assert_eq!(call(1, &[b"2", b"a", b"1"]), None);
+            assert_eq!(call(1, &[b"0", b"a"]), None);
+            assert_eq!(call(1, &[b"-1"]), None);
+            assert_eq!(call(1, &[]), None);
+        }
+
+        #[test]
+        fn w39_queue_latency_summary() {
+            assert_eq!(
+                call(2, &[b"5000", b"10", b"5001", b"250", b"5000"]).unwrap(),
+                strings(&["4", "4", "0", "10", "5001", "10261", "1", "0"])
+            );
+            assert_eq!(
+                call(2, &[b"100", b"-1", b"x", b"86400001", b"07", b"3"]).unwrap(),
+                strings(&["5", "1", "4", "3", "3", "3", "0", "0"])
+            );
+            assert_eq!(
+                call(2, &[b"-5"]).unwrap(),
+                strings(&["0", "0", "0", "", "", "0", "0", "1"])
+            );
+            assert_eq!(call(2, &[b"+5", b"1"]), None);
+            assert_eq!(call(2, &[]), None);
+        }
+
+        #[test]
+        fn w39_log_level_distribution() {
+            assert_eq!(
+                call(
+                    3,
+                    &[
+                        b" Warning ",
+                        b"debug",
+                        b"INFO",
+                        b"warning",
+                        b"error\n",
+                        b"trace",
+                        b"",
+                        b"emergency"
+                    ]
+                )
+                .unwrap(),
+                strings(&[
+                    "7", "1", "1", "0", "1", "1", "0", "0", "1", "2", "7", "3", "3"
+                ])
+            );
+            assert_eq!(
+                call(3, &[b"bogus", b"notice"]).unwrap(),
+                strings(&[
+                    "1", "0", "0", "1", "0", "0", "0", "0", "0", "0", "2", "0", "1"
+                ])
+            );
+            assert_eq!(
+                call(3, &[b"debug"]).unwrap(),
+                strings(&[
+                    "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "-1", "0", "0"
+                ])
+            );
+            assert_eq!(call(3, &[]), None);
+        }
+
+        #[test]
+        fn w39_reconcile_id_diff_plan() {
+            assert_eq!(
+                call(
+                    4,
+                    &[
+                        b"2", b"6", b"5", b"3", b"1", b"3", b"9", b"0", b"3", b"7", b"8", b"x",
+                        b"6"
+                    ]
+                )
+                .unwrap(),
+                strings(&["4", "4", "2", "3", "3", "1", "2", "2", "1", "5", "6", "7"])
+            );
+            assert_eq!(
+                call(4, &[b"-3", b"1", b"1", b"2"]).unwrap(),
+                strings(&["1", "1", "0", "1", "1", "0", "0", "0"])
+            );
+            assert_eq!(
+                call(4, &[b"1000", b"0"]).unwrap(),
+                strings(&["0", "0", "0", "0", "0", "0", "0", "0"])
+            );
+            assert_eq!(call(4, &[b"1", b"3", b"1"]), None);
+            assert_eq!(call(4, &[b"1"]), None);
+            assert_eq!(call(4, &[b"01", b"0"]), None);
+        }
+
+        #[test]
+        fn w39_index_shard_health() {
+            assert_eq!(
+                call(
+                    5,
+                    &[
+                        b"500", b"1", b"100", b"0", b"1", b"40", b"501", b"0", b"7", b"0", b"m",
+                        b"", b""
+                    ]
+                )
+                .unwrap(),
+                strings(&["4", "2", "2", "1", "1", "147", "501", "0"])
+            );
+            let max = i64::MAX.to_string();
+            assert_eq!(
+                call(
+                    5,
+                    &[
+                        b"10",
+                        b"1",
+                        max.as_bytes(),
+                        b"-4",
+                        b"1",
+                        b"5",
+                        b"x",
+                        b"1",
+                        b"",
+                        b"10"
+                    ]
+                )
+                .unwrap(),
+                strings(&["3", "3", "0", "0", "0", &max, "10", "1"])
+            );
+            assert_eq!(
+                call(5, &[b"0"]).unwrap(),
+                strings(&["0", "0", "0", "0", "0", "0", "0", "0"])
+            );
+            assert_eq!(call(5, &[b"0", b"2", b"1", b"1"]), None);
+            assert_eq!(call(5, &[b"0", b"1", b"1"]), None);
+            assert_eq!(call(5, &[]), None);
+        }
+
+        #[test]
+        fn w39_malformed_null_overlap_and_capacity() {
+            let input = packet(&[b"5000", b"1", b"2", b"3"]);
+            let mut out = [0x5a_u8; 16];
+            for (ptr, len, dst, cap) in [
+                (std::ptr::null(), 1, out.as_mut_ptr(), out.len()),
+                (input.as_ptr(), input.len(), std::ptr::null_mut(), 8),
+                (input.as_ptr(), MAX_INPUT + 1, out.as_mut_ptr(), out.len()),
+                (input.as_ptr(), input.len(), out.as_mut_ptr(), usize::MAX),
+            ] {
+                assert_eq!(
+                    unsafe {
+                        nntmux_w39_admin_settings_monitoring_logs_reconcile(2, ptr, len, dst, cap)
+                    },
+                    DECLINE
+                );
+            }
+            let too_many = [
+                (MAX_PARTS as u32 + 1).to_le_bytes().to_vec(),
+                vec![0; 4 * (MAX_PARTS + 1)],
+            ]
+            .concat();
+            for bad in [
+                vec![],
+                vec![1, 0, 0],
+                vec![1, 0, 0, 0, 9, 0, 0, 0],
+                vec![65, 0, 0, 0],
+                too_many,
+            ] {
+                assert_eq!(
+                    unsafe {
+                        nntmux_w39_admin_settings_monitoring_logs_reconcile(
+                            2,
+                            bad.as_ptr(),
+                            bad.len(),
+                            out.as_mut_ptr(),
+                            out.len(),
+                        )
+                    },
+                    DECLINE
+                );
+            }
+            for mode in [0u32, 6, 99, u32::MAX] {
+                assert_eq!(
+                    unsafe {
+                        nntmux_w39_admin_settings_monitoring_logs_reconcile(
+                            mode,
+                            input.as_ptr(),
+                            input.len(),
+                            out.as_mut_ptr(),
+                            out.len(),
+                        )
+                    },
+                    DECLINE
+                );
+            }
+            assert_eq!(out, [0x5a; 16]);
+            let full = pack(&call(2, &[b"5000", b"1", b"2", b"3"]).unwrap())
+                .unwrap()
+                .len();
+            assert!(full > out.len());
+            for cap in [0usize, 1, out.len()] {
+                let dst = if cap == 0 {
+                    std::ptr::null_mut()
+                } else {
+                    out.as_mut_ptr()
+                };
+                assert_eq!(
+                    unsafe {
+                        nntmux_w39_admin_settings_monitoring_logs_reconcile(
+                            2,
+                            input.as_ptr(),
+                            input.len(),
+                            dst,
+                            cap,
+                        )
+                    },
+                    -(full as isize)
+                );
+            }
+            assert_eq!(out, [0x5a; 16]);
+            // Overlapping input/output buffers decline without writing.
+            let mut alias = input.clone();
+            alias.resize(full.max(input.len()) + 8, 0x77);
+            let snapshot = alias.clone();
+            for offset in [0usize, 4, input.len() - 1] {
+                let written = unsafe {
+                    nntmux_w39_admin_settings_monitoring_logs_reconcile(
+                        2,
+                        alias.as_ptr(),
+                        input.len(),
+                        alias.as_mut_ptr().add(offset),
+                        alias.len() - offset,
+                    )
+                };
+                assert_eq!(written, DECLINE);
+            }
+            assert_eq!(alias, snapshot);
+            // Adjacent (non-overlapping) buffers are accepted.
+            let mut adjacent = input.clone();
+            adjacent.resize(input.len() + full, 0);
+            let written = unsafe {
+                nntmux_w39_admin_settings_monitoring_logs_reconcile(
+                    2,
+                    adjacent.as_ptr(),
+                    input.len(),
+                    adjacent.as_mut_ptr().add(input.len()),
+                    full,
+                )
+            };
+            assert_eq!(written, full as isize);
+            assert_eq!(unpack(&adjacent[input.len()..]).unwrap()[0], b"3");
+            assert_eq!(overlaps(usize::MAX - 1, 4, 0, 1), None);
+        }
+    }
+}

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Http\Controllers\Admin;
 
+use App\Console\Commands\NntmuxSearchReconcile;
 use App\Http\Controllers\BasePageController;
 use App\Http\Controllers\GetNzbController;
 use App\Http\Requests\Admin\AdminLogFacetsRequest;
@@ -29,6 +30,19 @@ class AdminLogViewerController extends BasePageController
 {
     // Keep PHP as the production default until the Rust performance gate passes.
     private static bool $useRustFfi = false;
+
+    /**
+     * Rust stays opt-in for the Wave 39.5 summary: the FFI round trip misses the 1.5x gate; see
+     * tests/Unit/RustAdminSettingsMonitoringLogsReconcileW39ParityTest.php.
+     */
+    public const bool W395_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useW395RustFfi = null;
+
+    /** PSR-3 log levels in ascending severity. */
+    public const array LOG_LEVELS = ['debug', 'info', 'notice', 'warning', 'error', 'critical', 'alert', 'emergency'];
+
+    private const array LOG_LEVEL_INDEX = ['debug' => 0, 'info' => 1, 'notice' => 2, 'warning' => 3, 'error' => 4, 'critical' => 5, 'alert' => 6, 'emergency' => 7];
 
     public const string FFI_CDEF = GetNzbController::FFI_CDEF;
 
@@ -77,6 +91,105 @@ class AdminLogViewerController extends BasePageController
         $result = GetNzbController::transformNative(10, [$guardMinutes]);
 
         return is_string($result) ? $result : self::deleteConflictMessagePhp($guardMinutes);
+    }
+
+    public static function useW395RustFfi(?bool $use = true): void
+    {
+        self::$useW395RustFfi = $use;
+    }
+
+    public static function usesW395RustFfi(): bool
+    {
+        return self::$useW395RustFfi ?? self::W395_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW395RustFfi(): void
+    {
+        self::$useW395RustFfi = null;
+    }
+
+    /**
+     * Counts PSR-3 levels after trim() and ASCII lowercasing; anything else (including non-strings)
+     * is unknown. An unknown minimum severity falls back to `debug`. `highest_index` is -1 when no
+     * known level was seen.
+     *
+     * @param  array<array-key, mixed>  $levels
+     * @return array{total: int, counts: array<string, int>, unknown: int, highest: ?string, highest_index: int, min_severity: string, at_or_above: int}
+     */
+    public static function summarizeLogLevelDistribution(array $levels, string $minSeverity = 'debug'): array
+    {
+        return self::usesW395RustFfi()
+            ? self::summarizeLogLevelDistributionNative($levels, $minSeverity)
+            : self::summarizeLogLevelDistributionPhp($levels, $minSeverity);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $levels
+     * @return array{total: int, counts: array<string, int>, unknown: int, highest: ?string, highest_index: int, min_severity: string, at_or_above: int}
+     */
+    private static function summarizeLogLevelDistributionNative(array $levels, string $minSeverity): array
+    {
+        $parts = [$minSeverity];
+        foreach ($levels as $level) {
+            $parts[] = \is_string($level) ? $level : '';
+        }
+        $fields = NntmuxSearchReconcile::evaluateW395Native(3, $parts);
+        if ($fields === null || \count($fields) !== 13) {
+            return self::summarizeLogLevelDistributionPhp($levels, $minSeverity);
+        }
+
+        return self::levelSummary(
+            (int) $fields[0],
+            array_map(intval(...), \array_slice($fields, 1, 8)),
+            (int) $fields[9],
+            (int) $fields[10],
+            (int) $fields[11],
+            (int) $fields[12],
+        );
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $levels
+     * @return array{total: int, counts: array<string, int>, unknown: int, highest: ?string, highest_index: int, min_severity: string, at_or_above: int}
+     */
+    private static function summarizeLogLevelDistributionPhp(array $levels, string $minSeverity): array
+    {
+        $minIndex = self::LOG_LEVEL_INDEX[strtolower(trim($minSeverity))] ?? 0;
+        $counts = array_fill(0, 8, 0);
+        $unknown = $atOrAbove = 0;
+        $highest = -1;
+        foreach ($levels as $level) {
+            $index = \is_string($level) ? (self::LOG_LEVEL_INDEX[strtolower(trim($level))] ?? null) : null;
+            if ($index === null) {
+                $unknown++;
+
+                continue;
+            }
+            $counts[$index]++;
+            $highest = max($highest, $index);
+            if ($index >= $minIndex) {
+                $atOrAbove++;
+            }
+        }
+
+        return self::levelSummary(\count($levels), $counts, $unknown, $highest, $minIndex, $atOrAbove);
+    }
+
+    /**
+     * @param  array<int, int>  $counts
+     * @return array{total: int, counts: array<string, int>, unknown: int, highest: ?string, highest_index: int, min_severity: string, at_or_above: int}
+     */
+    private static function levelSummary(int $total, array $counts, int $unknown, int $highest, int $minIndex, int $atOrAbove): array
+    {
+        return [
+            'total' => $total,
+            'counts' => array_combine(self::LOG_LEVELS, array_values($counts)),
+            'unknown' => $unknown,
+            'highest' => self::LOG_LEVELS[$highest] ?? null,
+            'highest_index' => $highest,
+            'min_severity' => self::LOG_LEVELS[$minIndex] ?? 'debug',
+            'at_or_above' => $atOrAbove,
+        ];
     }
 
     private const int JSON_OPTIONS = JSON_INVALID_UTF8_SUBSTITUTE | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE;
