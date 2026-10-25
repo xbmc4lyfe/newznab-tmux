@@ -40564,3 +40564,855 @@ mod w414_tests {
         }
     }
 }
+/// Wave 42.4 pure CPU batch summaries for the music, NFO and PAR2 services.
+/// Each export reads `serialize([list<string>])`, trims each entry with PHP
+/// trim semantics and writes `serialize(array<string, int>)`.
+pub mod w424_processors {
+    use super::{PhpKey, PhpNode, PhpSerParser, PhpSerWriter};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+
+    unsafe fn dispatch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+        summarize: fn(&[u8]) -> Option<Vec<u8>>,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if input.is_null()
+                || out.is_null()
+                || len > MAX_INPUT
+                || len > isize::MAX as usize
+                || cap > isize::MAX as usize
+            {
+                return -1;
+            }
+            let Some(input_end) = (input as usize).checked_add(len) else {
+                return -1;
+            };
+            let Some(out_end) = (out as usize).checked_add(cap) else {
+                return -1;
+            };
+            if len != 0 && cap != 0 && (input as usize) < out_end && (out as usize) < input_end {
+                return -1;
+            }
+            // Both spans and their overlap are checked before borrowing caller memory.
+            let input = unsafe { std::slice::from_raw_parts(input, len) };
+            let Some(result) = summarize(input) else {
+                return -1;
+            };
+            let Ok(needed) = isize::try_from(result.len()) else {
+                return -1;
+            };
+            if result.len() > cap {
+                return -needed;
+            }
+            unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), out, result.len()) };
+            needed
+        }))
+        .unwrap_or(-1)
+    }
+
+    fn is_list(node: &PhpNode<'_>) -> bool {
+        node.is_arr()
+            && node
+                .items()
+                .iter()
+                .enumerate()
+                .all(|(i, (key, _))| *key == PhpKey::Int(i as i64))
+    }
+
+    fn summarize<const COUNTS: usize>(
+        input: &[u8],
+        keys: [&[u8]; COUNTS],
+        classify: fn(&[u8]) -> [bool; COUNTS],
+    ) -> Option<Vec<u8>> {
+        let doc = PhpSerParser::parse_document(input)?;
+        if !is_list(&doc) || doc.items().len() != 1 {
+            return None;
+        }
+        let rows = &doc.items()[0].1;
+        if !is_list(rows) {
+            return None;
+        }
+        let mut counts = [0i64; COUNTS];
+        for (_, row) in rows.items() {
+            let entry = trim(row.as_str()?);
+            for (count, matched) in counts.iter_mut().zip(classify(entry)) {
+                *count += i64::from(matched);
+            }
+        }
+        let mut w = PhpSerWriter::new();
+        w.arr_open(COUNTS);
+        for (key, count) in keys.into_iter().zip(counts) {
+            w.key(key);
+            w.int(count);
+        }
+        w.arr_close();
+        Some(w.buf)
+    }
+
+    fn trim(value: &[u8]) -> &[u8] {
+        // PHP trim includes NUL and vertical tab, but excludes form feed.
+        let is_trim = |b: &u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b);
+        let start = value
+            .iter()
+            .position(|b| !is_trim(b))
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|b| !is_trim(b))
+            .map_or(start, |i| i + 1);
+        &value[start..end]
+    }
+
+    fn tokens(value: &[u8]) -> impl Iterator<Item = &[u8]> {
+        value
+            .split(|b| !b.is_ascii_alphanumeric())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// ASCII-uppercases tokens of up to 16 bytes; longer tokens match no keyword.
+    fn upper<'b>(token: &[u8], buf: &'b mut [u8; 16]) -> &'b [u8] {
+        if token.len() > buf.len() {
+            return &[];
+        }
+        for (dst, src) in buf.iter_mut().zip(token) {
+            *dst = src.to_ascii_uppercase();
+        }
+        &buf[..token.len()]
+    }
+
+    fn year(token: &[u8]) -> bool {
+        token.len() == 4
+            && (token.starts_with(b"19") || token.starts_with(b"20"))
+            && token.iter().all(u8::is_ascii_digit)
+    }
+
+    fn digits(value: &[u8]) -> usize {
+        value.iter().take_while(|b| b.is_ascii_digit()).count()
+    }
+
+    fn trailing_digits(value: &[u8]) -> usize {
+        value
+            .iter()
+            .rev()
+            .take_while(|b| b.is_ascii_digit())
+            .count()
+    }
+
+    /// `hit` is non-zero for some byte of the chunk. A max reduction over
+    /// non-short-circuiting byte flags vectorizes; boolean folds stay scalar.
+    #[inline(always)]
+    fn chunk_hit(chunk: &[u8], hit: impl Fn(u8) -> u8) -> bool {
+        chunk.iter().fold(0u8, |m, &b| m.max(hit(b))) != 0
+    }
+
+    fn has_path(value: &[u8]) -> bool {
+        value
+            .chunks(32)
+            .any(|chunk| chunk_hit(chunk, |b| u8::from(b == b'/') | u8::from(b == b'\\')))
+    }
+
+    /// Some maximal ASCII alphanumeric run equals one of `words` (ASCII
+    /// case-insensitive); `first` holds the lowercase first bytes of `words`.
+    fn has_word(value: &[u8], first: [u8; 2], words: &[&[u8]]) -> bool {
+        const CHUNK: usize = 32;
+        let starts = |b: u8| u8::from(b | 0x20 == first[0]) | u8::from(b | 0x20 == first[1]);
+        let boundary = |at: usize| value.get(at).is_none_or(|b| !b.is_ascii_alphanumeric());
+        for (n, chunk) in value.chunks(CHUNK).enumerate() {
+            if !chunk_hit(chunk, starts) {
+                continue;
+            }
+            for i in n * CHUNK..n * CHUNK + chunk.len() {
+                if starts(value[i]) != 0
+                    && (i == 0 || boundary(i - 1))
+                    && words
+                        .iter()
+                        .any(|w| starts_ci(value, i, w) && boundary(i + w.len()))
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Text after the last dot, or empty without a dot.
+    fn extension(value: &[u8]) -> &[u8] {
+        value
+            .iter()
+            .rposition(|b| *b == b'.')
+            .map_or(&[][..], |i| &value[i + 1..])
+    }
+
+    fn basename(value: &[u8]) -> &[u8] {
+        value
+            .iter()
+            .rposition(|b| matches!(b, b'/' | b'\\'))
+            .map_or(value, |i| &value[i + 1..])
+    }
+
+    fn stem(base: &[u8]) -> &[u8] {
+        base.iter()
+            .rposition(|b| *b == b'.')
+            .map_or(base, |i| &base[..i])
+    }
+
+    fn ext_in(ext: &[u8], set: &[&[u8]]) -> bool {
+        set.iter().any(|e| ext.eq_ignore_ascii_case(e))
+    }
+
+    /// `hay[..at]` ends with `prefix`, ASCII case-insensitively.
+    fn ends_ci(hay: &[u8], at: usize, prefix: &[u8]) -> bool {
+        at >= prefix.len() && hay[at - prefix.len()..at].eq_ignore_ascii_case(prefix)
+    }
+
+    /// `hay[at..]` starts with `suffix`, ASCII case-insensitively.
+    fn starts_ci(hay: &[u8], at: usize, suffix: &[u8]) -> bool {
+        hay.get(at..at + suffix.len())
+            .is_some_and(|s| s.eq_ignore_ascii_case(suffix))
+    }
+
+    const LOSSLESS: u8 = 1;
+    const LOSSY: u8 = 2;
+    const BITRATE: u8 = 4;
+    const SOURCE: u8 = 8;
+    const COMPILATION: u8 = 16;
+    const YEAR: u8 = 32;
+
+    fn music_token(token: &[u8]) -> u8 {
+        match token {
+            b"FLAC" | b"ALAC" | b"WAV" | b"APE" | b"WV" | b"DSD" | b"DSF" | b"AIFF" => LOSSLESS,
+            b"MP3" | b"AAC" | b"OGG" | b"OPUS" | b"M4A" | b"WMA" => LOSSY,
+            b"CBR" | b"VBR" => BITRATE,
+            b"CD" | b"CDDA" | b"CDM" | b"CDS" | b"CDR" | b"WEB" | b"VINYL" | b"LP" | b"VLS"
+            | b"SACD" | b"DVDA" | b"TAPE" => SOURCE,
+            b"VA" | b"OST" | b"SOUNDTRACK" | b"DISCOGRAPHY" | b"COMPILATION" | b"ANTHOLOGY" => {
+                COMPILATION
+            }
+            _ => 0,
+        }
+    }
+
+    /// `^(?:\d{2,3}K(?:BPS)?|V[0-2])$`, case-insensitive.
+    fn bitrate_token(token: &[u8]) -> bool {
+        let n = digits(token);
+        if (2..=3).contains(&n) {
+            let rest = &token[n..];
+            rest.eq_ignore_ascii_case(b"K") || rest.eq_ignore_ascii_case(b"KBPS")
+        } else {
+            token.len() == 2 && matches!(token[0], b'v' | b'V') && matches!(token[1], b'0'..=b'2')
+        }
+    }
+
+    fn music(input: &[u8]) -> Option<Vec<u8>> {
+        summarize(
+            input,
+            [
+                b"total_releases",
+                b"empty_title_count",
+                b"lossless_count",
+                b"lossy_count",
+                b"bitrate_tagged_count",
+                b"source_tagged_count",
+                b"compilation_count",
+                b"year_tagged_count",
+            ],
+            |title| {
+                let (mut flags, mut buf) = (0u8, [0u8; 16]);
+                for token in tokens(title) {
+                    flags |= music_token(upper(token, &mut buf));
+                    flags |= if bitrate_token(token) { BITRATE } else { 0 };
+                    flags |= if year(token) { YEAR } else { 0 };
+                }
+                [
+                    true,
+                    title.is_empty(),
+                    flags & LOSSLESS != 0,
+                    flags & LOSSY != 0,
+                    flags & BITRATE != 0,
+                    flags & SOURCE != 0,
+                    flags & COMPILATION != 0,
+                    flags & YEAR != 0,
+                ]
+            },
+        )
+    }
+
+    fn nfo_candidates(input: &[u8]) -> Option<Vec<u8>> {
+        summarize(
+            input,
+            [
+                b"total_files",
+                b"empty_name_count",
+                b"nfo_count",
+                b"diz_count",
+                b"txt_count",
+                b"sample_proof_count",
+                b"nested_path_count",
+            ],
+            |name| {
+                let ext = extension(name);
+                let sample = has_word(name, [b's', b'p'], &[b"sample", b"proof"]);
+                [
+                    true,
+                    name.is_empty(),
+                    ext.eq_ignore_ascii_case(b"nfo"),
+                    ext.eq_ignore_ascii_case(b"diz"),
+                    ext.eq_ignore_ascii_case(b"txt"),
+                    sample,
+                    has_path(name),
+                ]
+            },
+        )
+    }
+
+    /// Checks the link patterns anchored at `nfo[i]`: the slash after
+    /// `imdb.com`, the first slash of `https?://` and the `v` of `thetvdb.com`
+    /// or `tvmaze.com` (all ASCII case-insensitive).
+    fn nfo_anchor(nfo: &[u8], i: usize, links: &mut [bool; 3]) {
+        match nfo[i] {
+            b'/' => {
+                links[0] = links[0]
+                    || (ends_ci(nfo, i, b"imdb.com")
+                        && starts_ci(nfo, i, b"/title/tt")
+                        && digits(&nfo[i + 9..]) >= 7);
+                links[2] = links[2]
+                    || (i > 0
+                        && nfo[i - 1] == b':'
+                        && nfo.get(i + 1) == Some(&b'/')
+                        && (ends_ci(nfo, i - 1, b"http") || ends_ci(nfo, i - 1, b"https")));
+            }
+            b'v' | b'V' => {
+                links[1] = links[1]
+                    || (ends_ci(nfo, i, b"thet") && starts_ci(nfo, i, b"vdb.com"))
+                    || (ends_ci(nfo, i, b"t") && starts_ci(nfo, i, b"vmaze.com"));
+            }
+            _ => {}
+        }
+    }
+
+    /// Finds `imdb\.com/title/tt\d{7}`, `thetvdb.com` or `tvmaze.com`, and
+    /// `https?://`; 32-byte chunks without an anchor byte are skipped.
+    fn nfo_links(nfo: &[u8]) -> [bool; 3] {
+        const CHUNK: usize = 32;
+        let mut links = [false; 3];
+        let chunks = nfo.chunks_exact(CHUNK);
+        let tail = nfo.len() - chunks.remainder().len();
+        for (n, chunk) in chunks.enumerate() {
+            if chunk_hit(chunk, |b| u8::from(b == b'/') | u8::from(b | 0x20 == b'v')) {
+                for i in n * CHUNK..(n + 1) * CHUNK {
+                    nfo_anchor(nfo, i, &mut links);
+                }
+                if links == [true; 3] {
+                    return links;
+                }
+            }
+        }
+        for i in tail..nfo.len() {
+            nfo_anchor(nfo, i, &mut links);
+        }
+        links
+    }
+
+    /// At least `wanted` newlines; per-chunk byte lanes avoid widening counts.
+    fn newlines_at_least(value: &[u8], wanted: usize) -> bool {
+        let mut seen = 0usize;
+        for chunk in value.chunks(64) {
+            seen += usize::from(chunk.iter().fold(0u8, |n, &b| n + u8::from(b == b'\n')));
+            if seen >= wanted {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn nfo_contents(input: &[u8]) -> Option<Vec<u8>> {
+        summarize(
+            input,
+            [
+                b"total_nfos",
+                b"empty_nfo_count",
+                b"imdb_link_count",
+                b"tv_link_count",
+                b"url_count",
+                b"high_ascii_count",
+                b"multi_line_count",
+            ],
+            |nfo| {
+                let [imdb, tv, url] = nfo_links(nfo);
+                [
+                    true,
+                    nfo.is_empty(),
+                    imdb,
+                    tv,
+                    url,
+                    !nfo.is_ascii(),
+                    newlines_at_least(nfo, 10),
+                ]
+            },
+        )
+    }
+
+    fn par2_file_list(input: &[u8]) -> Option<Vec<u8>> {
+        summarize(
+            input,
+            [
+                b"total_files",
+                b"empty_name_count",
+                b"par2_count",
+                b"rar_volume_count",
+                b"split_archive_count",
+                b"video_count",
+                b"sample_count",
+                b"path_count",
+            ],
+            |name| {
+                let ext = extension(name);
+                let rar_volume = ext.eq_ignore_ascii_case(b"rar")
+                    || (ext.len() == 3
+                        && matches!(ext[0], b'r' | b'R')
+                        && ext[1..].iter().all(u8::is_ascii_digit));
+                let split = (ext.len() == 3 && ext.iter().all(u8::is_ascii_digit))
+                    || ext_in(ext, &[b"7z", b"zip"]);
+                [
+                    true,
+                    name.is_empty(),
+                    ext.eq_ignore_ascii_case(b"par2"),
+                    rar_volume,
+                    split,
+                    ext_in(
+                        ext,
+                        &[
+                            b"mkv", b"mp4", b"avi", b"m2ts", b"ts", b"wmv", b"mov", b"mpg", b"vob",
+                        ],
+                    ),
+                    has_word(name, [b's', b's'], &[b"sample"]),
+                    has_path(name),
+                ]
+            },
+        )
+    }
+
+    /// `\.vol\d+\+\d+\.par2\z`, case-insensitive.
+    fn par2_volume(name: &[u8]) -> bool {
+        let Some(rest) = name.len().checked_sub(5).map(|n| &name[..n]) else {
+            return false;
+        };
+        if !name[rest.len()..].eq_ignore_ascii_case(b".par2") {
+            return false;
+        }
+        let blocks = trailing_digits(rest);
+        if blocks == 0 || rest[..rest.len() - blocks].last() != Some(&b'+') {
+            return false;
+        }
+        let rest = &rest[..rest.len() - blocks - 1];
+        let start = trailing_digits(rest);
+        let rest = &rest[..rest.len() - start];
+        start > 0 && rest.len() >= 4 && rest[rest.len() - 4..].eq_ignore_ascii_case(b".vol")
+    }
+
+    fn par2_rename_candidates(input: &[u8]) -> Option<Vec<u8>> {
+        summarize(
+            input,
+            [
+                b"total_files",
+                b"empty_name_count",
+                b"hex_hash_name_count",
+                b"obfuscated_name_count",
+                b"release_like_count",
+                b"par2_volume_count",
+                b"executable_count",
+            ],
+            |name| {
+                let base = basename(name);
+                let stem = stem(base);
+                [
+                    true,
+                    name.is_empty(),
+                    matches!(stem.len(), 32 | 40) && stem.iter().all(u8::is_ascii_hexdigit),
+                    stem.len() >= 16 && stem.iter().all(u8::is_ascii_alphanumeric),
+                    stem.iter().filter(|b| **b == b'.').count() >= 2 && stem.contains(&b'-'),
+                    par2_volume(name),
+                    ext_in(
+                        extension(base),
+                        &[
+                            b"exe", b"bat", b"cmd", b"scr", b"com", b"vbs", b"js", b"ps1", b"msi",
+                            b"lnk",
+                        ],
+                    ),
+                ]
+            },
+        )
+    }
+
+    /// # Safety
+    /// The input and output must be live buffers covering their declared lengths.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w424_music_release_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, music) }
+    }
+
+    /// # Safety
+    /// The input and output must be live buffers covering their declared lengths.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w424_nfo_candidate_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, nfo_candidates) }
+    }
+
+    /// # Safety
+    /// The input and output must be live buffers covering their declared lengths.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w424_nfo_content_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, nfo_contents) }
+    }
+
+    /// # Safety
+    /// The input and output must be live buffers covering their declared lengths.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w424_par2_file_list_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, par2_file_list) }
+    }
+
+    /// # Safety
+    /// The input and output must be live buffers covering their declared lengths.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w424_par2_rename_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, par2_rename_candidates) }
+    }
+}
+
+#[cfg(test)]
+mod w424_tests {
+    use super::w424_processors::*;
+    use super::{PhpKey, PhpSerParser, PhpSerWriter};
+
+    type Export = unsafe extern "C" fn(*const u8, usize, *mut u8, usize) -> isize;
+    const EXPORTS: [Export; 5] = [
+        nntmux_w424_music_release_batch,
+        nntmux_w424_nfo_candidate_batch,
+        nntmux_w424_nfo_content_batch,
+        nntmux_w424_par2_file_list_batch,
+        nntmux_w424_par2_rename_batch,
+    ];
+
+    fn frame(titles: &[&[u8]]) -> Vec<u8> {
+        let mut w = PhpSerWriter::new();
+        w.arr_open(1);
+        w.int(0);
+        w.arr_open(titles.len());
+        for (i, title) in titles.iter().enumerate() {
+            w.int(i as i64);
+            w.str(title);
+        }
+        w.arr_close();
+        w.arr_close();
+        w.buf
+    }
+
+    fn output(export: Export, input: &[u8]) -> Vec<u8> {
+        let mut out = vec![b'Z'; 1024];
+        let written = unsafe { export(input.as_ptr(), input.len(), out.as_mut_ptr(), out.len()) };
+        assert!(written > 0, "export declined: {written}");
+        out.truncate(written as usize);
+        out
+    }
+
+    fn summary(export: Export, titles: &[&[u8]], fields: &[(&[u8], i64)]) {
+        let result = output(export, &frame(titles));
+        let doc = PhpSerParser::parse_document(&result).unwrap();
+        assert_eq!(doc.items().len(), fields.len());
+        for ((key, value), (expected_key, expected_value)) in doc.items().iter().zip(fields) {
+            assert!(
+                matches!(key, PhpKey::Str(k) if k == expected_key),
+                "key mismatch for {}",
+                String::from_utf8_lossy(expected_key)
+            );
+            assert_eq!(
+                value.as_int(),
+                Some(*expected_value),
+                "{}",
+                String::from_utf8_lossy(expected_key)
+            );
+        }
+    }
+
+    #[test]
+    fn w424_music_counts_formats_bitrates_sources_and_years() {
+        summary(
+            nntmux_w424_music_release_batch,
+            &[
+                b"Artist-Album-(CD)-FLAC-2021-GRP",
+                b"VA-Hits.320kbps.MP3.WEB.1999",
+                b"Artist - Album V0 Vinyl",
+                b"OST.Score.1234K.aac",
+                b" \0\t",
+                b"Artist.DISCOGRAPHY.24BIT.VBR",
+                b"Artist.CDDA.3000",
+            ],
+            &[
+                (b"total_releases", 7),
+                (b"empty_title_count", 1),
+                (b"lossless_count", 1),
+                (b"lossy_count", 2),
+                (b"bitrate_tagged_count", 3),
+                (b"source_tagged_count", 4),
+                (b"compilation_count", 3),
+                (b"year_tagged_count", 2),
+            ],
+        );
+    }
+
+    #[test]
+    fn w424_nfo_candidates_count_extensions_samples_and_paths() {
+        summary(
+            nntmux_w424_nfo_candidate_batch,
+            &[
+                b"release.NFO",
+                b"file_id.diz",
+                b"dir/readme.txt",
+                b"proof\\sample.jpg",
+                b"nfo",
+                b"",
+                b"Release.Sample.nfo.bak",
+            ],
+            &[
+                (b"total_files", 7),
+                (b"empty_name_count", 1),
+                (b"nfo_count", 1),
+                (b"diz_count", 1),
+                (b"txt_count", 1),
+                (b"sample_proof_count", 2),
+                (b"nested_path_count", 2),
+            ],
+        );
+    }
+
+    #[test]
+    fn w424_nfo_contents_count_links_art_and_lines() {
+        let lines = b"a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk";
+        summary(
+            nntmux_w424_nfo_content_batch,
+            &[
+                b"See HTTPS://WWW.IMDB.COM/title/TT1234567/",
+                b"imdb.com/title/tt123456 imdb.com/title/tt7654321",
+                b"http://thetvdb.com/x \xdb\xb2",
+                b"TVMAZE.com",
+                lines,
+                b"\n\n\n\n\n\n\n\n\n\nx",
+                b" \0",
+            ],
+            &[
+                (b"total_nfos", 7),
+                (b"empty_nfo_count", 1),
+                (b"imdb_link_count", 2),
+                (b"tv_link_count", 2),
+                (b"url_count", 2),
+                (b"high_ascii_count", 1),
+                (b"multi_line_count", 1),
+            ],
+        );
+    }
+
+    #[test]
+    fn w424_par2_file_list_counts_archives_videos_and_paths() {
+        summary(
+            nntmux_w424_par2_file_list_batch,
+            &[
+                b"movie.par2",
+                b"movie.part01.RAR",
+                b"movie.r07",
+                b"movie.7z.001",
+                b"Sample/movie-sample.mkv",
+                b"movie.rx1",
+                b"",
+                b"movie.ZIP",
+            ],
+            &[
+                (b"total_files", 8),
+                (b"empty_name_count", 1),
+                (b"par2_count", 1),
+                (b"rar_volume_count", 2),
+                (b"split_archive_count", 2),
+                (b"video_count", 1),
+                (b"sample_count", 1),
+                (b"path_count", 1),
+            ],
+        );
+    }
+
+    #[test]
+    fn w424_par2_rename_counts_hashes_obfuscation_and_volumes() {
+        summary(
+            nntmux_w424_par2_rename_batch,
+            &[
+                b"0123456789abcdef0123456789ABCDEF.mkv",
+                b"dir/Show.S01E01.720p-GRP.mkv",
+                b"abcdefghijklmnop",
+                b"Movie.vol07+08.PAR2",
+                b"Movie.vol+08.par2",
+                b"setup.EXE",
+                b"a.exe/file",
+                b"",
+            ],
+            &[
+                (b"total_files", 8),
+                (b"empty_name_count", 1),
+                (b"hex_hash_name_count", 1),
+                (b"obfuscated_name_count", 2),
+                (b"release_like_count", 1),
+                (b"par2_volume_count", 1),
+                (b"executable_count", 1),
+            ],
+        );
+    }
+
+    #[test]
+    fn w424_all_exports_check_spans_and_preserve_output_on_failure() {
+        for export in EXPORTS {
+            let input = frame(&[b"x"]);
+            let expected = output(export, &input);
+            let needed = expected.len();
+            let mut out = [b'Z'; 1024];
+            unsafe {
+                for cap in [0, 1, needed - 1] {
+                    assert_eq!(
+                        export(input.as_ptr(), input.len(), out.as_mut_ptr(), cap),
+                        -(needed as isize)
+                    );
+                    assert_eq!(out, [b'Z'; 1024]);
+                }
+                assert_eq!(
+                    export(input.as_ptr(), input.len(), out.as_mut_ptr(), needed),
+                    needed as isize
+                );
+                assert_eq!(&out[..needed], expected);
+                assert!(out[needed..].iter().all(|b| *b == b'Z'));
+                for (ptr, len) in [
+                    (std::ptr::null(), 0),
+                    (std::ptr::null(), input.len()),
+                    (input.as_ptr(), 16 * 1024 * 1024 + 1),
+                    (input.as_ptr(), isize::MAX as usize + 1),
+                    ((usize::MAX - 1) as *const u8, 8),
+                ] {
+                    out.fill(b'Z');
+                    assert_eq!(export(ptr, len, out.as_mut_ptr(), out.len()), -1);
+                    assert_eq!(out, [b'Z'; 1024]);
+                }
+                assert_eq!(
+                    export(input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                    -1
+                );
+                for (ptr, cap) in [
+                    (out.as_mut_ptr(), usize::MAX),
+                    ((usize::MAX - 1) as *mut u8, 8),
+                ] {
+                    assert_eq!(export(input.as_ptr(), input.len(), ptr, cap), -1);
+                    assert_eq!(out, [b'Z'; 1024]);
+                }
+                let mut overlap = vec![b'Z'; input.len() + 2048];
+                overlap[32..32 + input.len()].copy_from_slice(&input);
+                let original = overlap.clone();
+                for offset in [0, 32, 33, 32 + input.len() - 1] {
+                    assert_eq!(
+                        export(
+                            overlap.as_ptr().add(32),
+                            input.len(),
+                            overlap.as_mut_ptr().add(offset),
+                            1024
+                        ),
+                        -1
+                    );
+                    assert_eq!(overlap, original);
+                }
+                // Adjacent input/output spans are legal.
+                assert_eq!(
+                    export(
+                        overlap.as_ptr().add(32),
+                        input.len(),
+                        overlap.as_mut_ptr().add(32 + input.len()),
+                        1024
+                    ),
+                    needed as isize
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn w424_rejects_malformed_frames_and_non_string_entries() {
+        let mut deep = b"a:1:{i:0;".to_vec();
+        for _ in 0..130 {
+            deep.extend_from_slice(b"a:1:{i:0;");
+        }
+        deep.extend_from_slice(b"s:0:\"\";");
+        deep.extend(std::iter::repeat_n(b'}', 131));
+        for export in EXPORTS {
+            let mut out = [b'Z'; 1024];
+            for malformed in [
+                b"".as_slice(),
+                b"N;",
+                b"a:1:{i:0;",
+                b"a:999999999999999999999:{}",
+                b"a:1:{i:0;a:0:{}}trailing",
+                b"a:0:{}",
+                b"a:1:{i:1;a:0:{}}",
+                b"a:2:{i:0;a:0:{}i:1;a:0:{}}",
+                b"a:1:{i:0;N;}",
+                b"a:1:{i:0;a:1:{i:2;s:0:\"\";}}",
+                b"a:1:{i:0;a:1:{s:1:\"x\";s:0:\"\";}}",
+                b"a:1:{i:0;a:1:{i:0;N;}}",
+                b"a:1:{i:0;a:1:{i:0;i:5;}}",
+                b"a:1:{i:0;a:1:{i:0;a:0:{}}}",
+                b"a:1:{i:0;a:1:{i:0;s:5:\"x\";}}",
+                deep.as_slice(),
+            ] {
+                assert_eq!(
+                    unsafe {
+                        export(
+                            malformed.as_ptr(),
+                            malformed.len(),
+                            out.as_mut_ptr(),
+                            out.len(),
+                        )
+                    },
+                    -1,
+                    "{}",
+                    String::from_utf8_lossy(malformed)
+                );
+                assert_eq!(out, [b'Z'; 1024]);
+            }
+            let empty = output(export, &frame(&[]));
+            let doc = PhpSerParser::parse_document(&empty).unwrap();
+            assert!(doc.items().iter().all(|(_, v)| v.as_int() == Some(0)));
+        }
+    }
+}

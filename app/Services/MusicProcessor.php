@@ -179,4 +179,172 @@ class MusicProcessor
 
         return self::$ffi === false ? null : self::$ffi;
     }
+
+    /** Enabled: paired common and uncommon mean/p99 gains all reach 1.5x in five runs (see the W42 parity test). */
+    public const bool W424_RUST_FFI_DEFAULT = true;
+
+    public const string W424_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w424_music_release_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private const array W424_SUMMARY_KEYS = ['total_releases', 'empty_title_count', 'lossless_count', 'lossy_count', 'bitrate_tagged_count', 'source_tagged_count', 'compilation_count', 'year_tagged_count'];
+
+    private const array W424_MUSIC_TOKENS = [
+        'FLAC' => 1, 'ALAC' => 1, 'WAV' => 1, 'APE' => 1, 'WV' => 1, 'DSD' => 1, 'DSF' => 1, 'AIFF' => 1,
+        'MP3' => 2, 'AAC' => 2, 'OGG' => 2, 'OPUS' => 2, 'M4A' => 2, 'WMA' => 2,
+        'CBR' => 4, 'VBR' => 4,
+        'CD' => 8, 'CDDA' => 8, 'CDM' => 8, 'CDS' => 8, 'CDR' => 8, 'WEB' => 8, 'VINYL' => 8, 'LP' => 8, 'VLS' => 8, 'SACD' => 8, 'DVDA' => 8, 'TAPE' => 8,
+        'VA' => 16, 'OST' => 16, 'SOUNDTRACK' => 16, 'DISCOGRAPHY' => 16, 'COMPILATION' => 16, 'ANTHOLOGY' => 16,
+    ];
+
+    private static ?bool $w424UseRustFfi = null;
+
+    private static FFI|false|null $w424Ffi = null;
+
+    public static function useW424RustFfi(bool $enable = true): void
+    {
+        self::$w424UseRustFfi = $enable;
+    }
+
+    public static function usesW424RustFfi(): bool
+    {
+        return self::$w424UseRustFfi ?? self::W424_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW424RustFfi(): void
+    {
+        self::$w424UseRustFfi = null;
+        self::$w424Ffi = null;
+    }
+
+    /**
+     * Summarize music release titles: lossless and lossy format tokens,
+     * bitrate tokens (CBR, VBR, V0-V2, 2-3 digit K or KBPS), media source
+     * tokens, compilation tokens and 19xx/20xx year tokens. Tokens are
+     * maximal ASCII alphanumeric runs compared case-insensitively.
+     * Entries come from strings, integers, or the searchname, name or title array
+     * field; other values (including objects) count as empty entries.
+     *
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeMusicReleaseBatch(array $entries): array
+    {
+        return self::usesW424RustFfi()
+            ? self::summarizeMusicReleaseBatchNative($entries)
+            : self::summarizeMusicReleaseBatchPhp($entries);
+    }
+
+    /**
+     * Rust summary; falls back to PHP when the library or input frame is unusable.
+     *
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeMusicReleaseBatchNative(array $entries): array
+    {
+        return self::w424Call(self::w424Entries($entries)) ?? self::summarizeMusicReleaseBatchPhp($entries);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeMusicReleaseBatchPhp(array $entries): array
+    {
+        $summary = array_fill_keys(self::W424_SUMMARY_KEYS, 0);
+        foreach (self::w424Entries($entries) as $entry) {
+            $summary['total_releases']++;
+            $entry = trim($entry);
+            if ($entry === '') {
+                $summary['empty_title_count']++;
+
+                continue;
+            }
+            $flags = 0;
+            foreach (preg_split('/[^A-Za-z0-9]+/', strtoupper($entry), -1, PREG_SPLIT_NO_EMPTY) ?: [] as $token) {
+                $flags |= self::W424_MUSIC_TOKENS[$token] ?? 0;
+                $flags |= preg_match('/^(?:\d{2,3}K(?:BPS)?|V[0-2])\z/', $token) === 1 ? 4 : 0;
+                $flags |= preg_match('/^(?:19|20)\d{2}\z/', $token) === 1 ? 32 : 0;
+            }
+            $summary['lossless_count'] += $flags & 1;
+            $summary['lossy_count'] += ($flags >> 1) & 1;
+            $summary['bitrate_tagged_count'] += ($flags >> 2) & 1;
+            $summary['source_tagged_count'] += ($flags >> 3) & 1;
+            $summary['compilation_count'] += ($flags >> 4) & 1;
+            $summary['year_tagged_count'] += ($flags >> 5) & 1;
+        }
+
+        return $summary;
+    }
+
+    /** Only integer and string entries participate; objects are never cast or serialized.
+     *
+     * @param  array<array-key, mixed>  $input
+     * @return list<string>
+     */
+    private static function w424Entries(array $input): array
+    {
+        $entries = [];
+        foreach ($input as $item) {
+            if (is_array($item)) {
+                $item = $item['searchname'] ?? $item['name'] ?? $item['title'] ?? null;
+            }
+            $entries[] = is_string($item) || is_int($item) ? (string) $item : '';
+        }
+
+        return $entries;
+    }
+
+    /** @param list<string> $entries
+     * @return array<string, int>|null
+     */
+    private static function w424Call(array $entries): ?array
+    {
+        try {
+            $input = serialize([$entries]);
+            if (strlen($input) > 16777216) {
+                return null;
+            }
+            self::$w424Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w424', self::W424_FFI_CDEF) ?? false;
+            $ffi = self::$w424Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            $capacity = 0;
+            $out = RustPipelineLibrary::obtainScratch($ffi, 2048, $capacity);
+            if ($out === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound (Declared by W424_FFI_CDEF.)
+            $written = $ffi->nntmux_w424_music_release_batch($input, strlen($input), $out, $capacity);
+            if (is_int($written) && $written < -1 && $written >= -16777216) {
+                $out = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($out === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound (Declared by W424_FFI_CDEF.)
+                $written = $ffi->nntmux_w424_music_release_batch($input, strlen($input), $out, $capacity);
+            }
+            if (! is_int($written) || $written <= 0 || $written > $capacity || $written > 16777216) {
+                return null;
+            }
+            $result = @unserialize(FFI::string($out, $written), ['allowed_classes' => false]);
+            if (! is_array($result) || array_keys($result) !== self::W424_SUMMARY_KEYS || $result['total_releases'] !== count($entries)) {
+                return null;
+            }
+            $summary = [];
+            foreach (self::W424_SUMMARY_KEYS as $key) {
+                $value = $result[$key];
+                if (! is_int($value) || $value < 0 || $value > count($entries)) {
+                    return null;
+                }
+                $summary[$key] = $value;
+            }
+
+            return $summary;
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }
