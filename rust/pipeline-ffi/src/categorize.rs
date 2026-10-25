@@ -27807,3 +27807,939 @@ pub mod predb_check_rebuild_suggestions_import {
         }
     }
 }
+/// Wave 38.3: pure summary/plan helpers for `IncompletePredbMatchException`,
+/// `MiscSafetyNetPipe` (PreDB transaction plans), `FindSizeMismatchedReleases`,
+/// `AdminCategoryRegexesController` and `AdminCollectionRegexesController`.
+///
+/// Outputs are `0x1F`-separated fields. Caller strings are emitted last (length-prefixed when
+/// followed by another string) so they may contain any byte. Unknown flag bits, null pointers,
+/// oversized inputs and text for an absent string decline with `-1` so PHP keeps its own
+/// implementation. A result that does not fit returns `-required` without touching `out_buf`.
+pub mod predb_match_exception_identity_transactions {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    pub const DECLINE: isize = -1;
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+    const FIELD_SEP: u8 = 0x1F;
+    const TRIM_SET: &[u8] = b" \t\n\r\0\x0B\x0C";
+    const PCRE_SPACE: &[u8] = b" \t\n\r\x0B\x0C";
+    const MODIFIER_SET: &[u8] = b"imsxuADSUXJnr \n\r";
+    const MAX_COUNT: i64 = 1_000_000;
+    const DEFAULT_THRESHOLD: i64 = 20;
+    const DEFAULT_LIMIT: i64 = 100;
+    const MAX_SIZE_BYTES: i64 = 1 << 48;
+    const MAX_THRESHOLD_BP: i64 = 100_000_000;
+
+    const INCOMPLETE_PREFIX: &[u8] = b"PreDB fulltext matching is incomplete: ";
+    /// `IncompletePredbMatchException` details raised by name fixing, with their reason codes.
+    const INCOMPLETE_REASONS: [(&[u8], &[u8]); 5] = [
+        (
+            b"the search driver does not support candidate paging.",
+            b"paging_unsupported",
+        ),
+        (
+            b"the 210-candidate scan budget was reached.",
+            b"scan_budget",
+        ),
+        (b"invalid candidate page boundaries.", b"page_boundaries"),
+        (
+            b"candidate IDs did not advance in order.",
+            b"candidate_order",
+        ),
+        (
+            b"current release evidence could not be completely confirmed.",
+            b"evidence_unconfirmed",
+        ),
+    ];
+
+    /// `OwnsPredbIdentityTransactions` failure messages: (message, reason, discard context).
+    const TRANSACTION_FAILURES: [(&[u8], &[u8], bool); 10] = [
+        (
+            b"PreDB identity requires a clean transaction context.",
+            b"dirty_transaction",
+            false,
+        ),
+        (
+            b"PreDB identity requires a clean callback context.",
+            b"dirty_callbacks",
+            false,
+        ),
+        (
+            b"PreDB identity cannot own the callback boundary.",
+            b"callback_boundary",
+            false,
+        ),
+        (
+            b"PreDB identity callback manager changed.",
+            b"callback_manager_changed",
+            false,
+        ),
+        (
+            b"PreDB identity connection ownership changed.",
+            b"ownership_changed",
+            false,
+        ),
+        (
+            b"PreDB identity connection cleanup failed; discard this context.",
+            b"connection_unusable",
+            true,
+        ),
+        (
+            b"PreDB identity cleanup failed; discard this context.",
+            b"cleanup_failed",
+            true,
+        ),
+        (
+            b"PreDB identity rollback callback progress is uncertain.",
+            b"rollback_uncertain",
+            false,
+        ),
+        (
+            b"PreDB identity cleanup did not finish.",
+            b"cleanup_incomplete",
+            false,
+        ),
+        (
+            b"Unsupported PreDB identity callback manager.",
+            b"unsupported_manager",
+            false,
+        ),
+    ];
+
+    const COMMITTED: u32 = 1;
+    const CONCURRENCY: u32 = 2;
+    const BODY_FAILED: u32 = 4;
+    const HAS_THRESHOLD: u32 = 1;
+    const HAS_LIMIT: u32 = 2;
+    const HAS_DIRECTION: u32 = 4;
+    const RENAME: u32 = 8;
+
+    unsafe fn valid_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null()
+            || len > MAX_INPUT
+            || len > isize::MAX as usize
+            || (ptr as usize).checked_add(len).is_none()
+        {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    /// An optional caller string: absent strings must have zero length (the pointer may be null).
+    unsafe fn optional_slice<'a>(
+        present: bool,
+        ptr: *const u8,
+        len: usize,
+    ) -> Option<Option<&'a [u8]>> {
+        if present {
+            unsafe { valid_slice(ptr, len) }.map(Some)
+        } else if len == 0 {
+            Some(None)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn valid_out_buf(out_buf: *mut u8, out_cap: usize) -> bool {
+        !out_buf.is_null()
+            && out_cap <= isize::MAX as usize
+            && (out_buf as usize).checked_add(out_cap).is_some()
+    }
+
+    /// Copies `bytes` into `out_buf`, returning the length or `-required` when it does not fit.
+    unsafe fn write_bytes(bytes: &[u8], out_buf: *mut u8, out_cap: usize) -> isize {
+        if bytes.len() > isize::MAX as usize {
+            return DECLINE;
+        }
+        if bytes.len() > out_cap {
+            return -(bytes.len() as isize);
+        }
+        if !bytes.is_empty() {
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len()) };
+        }
+        bytes.len() as isize
+    }
+
+    /// Field writer; every encoding has at least three fields, so a one-byte result (which would
+    /// collide with DECLINE as "needs one byte") is impossible.
+    struct Fields(Vec<u8>);
+
+    impl Fields {
+        fn new(capacity: usize) -> Self {
+            Fields(Vec::with_capacity(capacity))
+        }
+
+        fn raw(&mut self, value: &[u8]) -> &mut Self {
+            if !self.0.is_empty() {
+                self.0.push(FIELD_SEP);
+            }
+            self.0.extend_from_slice(value);
+            self
+        }
+
+        fn int(&mut self, value: i64) -> &mut Self {
+            self.raw(value.to_string().as_bytes())
+        }
+
+        fn flag(&mut self, value: bool) -> &mut Self {
+            self.raw(if value { b"1" } else { b"0" })
+        }
+    }
+
+    /// PHP `trim($value, " \t\n\r\0\x0B\x0C")` on bytes.
+    fn trim_ws(value: &[u8]) -> &[u8] {
+        let start = value
+            .iter()
+            .position(|b| !TRIM_SET.contains(b))
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|b| !TRIM_SET.contains(b))
+            .map_or(start, |i| i + 1);
+        &value[start..end]
+    }
+
+    /// `IncompletePredbMatchException::summarizeIncompleteMatchPhp()`.
+    pub fn incomplete_match(message: &[u8]) -> Vec<u8> {
+        let mut out = Fields::new(32 + message.len());
+        let Some(detail) = message.strip_prefix(INCOMPLETE_PREFIX) else {
+            out.flag(false).raw(b"foreign").raw(b"");
+            return out.0;
+        };
+        let reason = INCOMPLETE_REASONS
+            .iter()
+            .find(|(known, _)| *known == detail)
+            .map_or(&b"other"[..], |(_, reason)| reason);
+        out.flag(true).raw(reason).raw(detail);
+        out.0
+    }
+
+    /// `MiscSafetyNetPipe::planPredbTransactionRetryPhp()`.
+    pub fn transaction_retry(attempt: i64, attempts: i64, flags: u32) -> Vec<u8> {
+        let committed = flags & COMMITTED != 0;
+        let mut out = Fields::new(40);
+        if committed {
+            out.raw(b"rethrow_committed")
+                .flag(false)
+                .int(attempt)
+                .flag(false);
+            return out.0;
+        }
+        let retry = attempt < attempts && flags & CONCURRENCY != 0;
+        out.raw(if retry { b"retry" } else { b"rethrow" })
+            .flag(true)
+            .int(if retry { attempt + 1 } else { attempt })
+            .flag(flags & BODY_FAILED != 0);
+        out.0
+    }
+
+    /// `MiscSafetyNetPipe::classifyPredbTransactionFailurePhp()`.
+    pub fn transaction_failure(message: &[u8]) -> Vec<u8> {
+        let mut out = Fields::new(40);
+        match TRANSACTION_FAILURES
+            .iter()
+            .find(|(known, _, _)| *known == message)
+        {
+            Some((_, reason, discard)) => out.flag(true).raw(reason).flag(*discard),
+            None => out.flag(false).raw(b"foreign").flag(false),
+        };
+        out.0
+    }
+
+    /// `FindSizeMismatchedReleases::parseSizeMismatchCount()`: (valid, value).
+    fn parse_count(value: Option<&[u8]>, default: i64) -> (bool, i64) {
+        let Some(raw) = value else {
+            return (true, default);
+        };
+        let t = trim_ws(raw);
+        if t.is_empty() || !t.iter().all(u8::is_ascii_digit) {
+            return (false, default);
+        }
+        let start = t.iter().position(|&b| b != b'0').unwrap_or(t.len());
+        let significant = &t[start..];
+        if significant.len() > 7 {
+            return (true, MAX_COUNT);
+        }
+        let value = significant
+            .iter()
+            .fold(0i64, |acc, &b| acc * 10 + i64::from(b - b'0'));
+        (true, value.min(MAX_COUNT))
+    }
+
+    /// `FindSizeMismatchedReleases::planSizeMismatchQueryPhp()`.
+    pub fn size_mismatch_plan(
+        threshold: Option<&[u8]>,
+        limit: Option<&[u8]>,
+        direction: Option<&[u8]>,
+        rename: bool,
+    ) -> Vec<u8> {
+        let (threshold_valid, threshold) = parse_count(threshold, DEFAULT_THRESHOLD);
+        let (limit_valid, limit) = parse_count(limit, DEFAULT_LIMIT);
+        let known = match direction {
+            None => true,
+            Some(d) => d == b"bigger" || d == b"smaller" || d == b"any",
+        };
+        let normalized: &[u8] = match direction {
+            Some(b"bigger") => b"bigger",
+            Some(b"smaller") => b"smaller",
+            _ => b"any",
+        };
+        let mut out = Fields::new(64);
+        out.flag(threshold_valid)
+            .int(threshold)
+            .flag(limit_valid)
+            .int(limit)
+            .flag(limit > 0)
+            .raw(normalized)
+            .flag(known)
+            .raw(if rename {
+                b"releases.id"
+            } else {
+                b"diff_percent"
+            })
+            .raw(if rename { b"asc" } else { b"desc" });
+        out.0
+    }
+
+    /// `FindSizeMismatchedReleases::classifySizeDifferencePhp()`.
+    pub fn size_difference(direction: &[u8], release: i64, files: i64, threshold: i64) -> Vec<u8> {
+        let mut out = Fields::new(48);
+        let known = direction == b"bigger" || direction == b"smaller" || direction == b"any";
+        if !known
+            || !(0..=MAX_SIZE_BYTES).contains(&release)
+            || !(0..=MAX_SIZE_BYTES).contains(&files)
+            || !(0..=MAX_THRESHOLD_BP).contains(&threshold)
+        {
+            out.flag(false)
+                .flag(false)
+                .int(0)
+                .int(0)
+                .raw(b"none")
+                .flag(false);
+            return out.0;
+        }
+        let diff = release - files;
+        let measurable = release > 0;
+        let points = if measurable {
+            diff * 10_000 / release
+        } else {
+            0
+        };
+        let mismatch = measurable
+            && match direction {
+                b"bigger" => diff > 0 && points > threshold,
+                b"smaller" => diff < 0 && -points > threshold,
+                _ => points.abs() > threshold,
+            };
+        let sign: &[u8] = match diff {
+            d if d > 0 => b"bigger",
+            d if d < 0 => b"smaller",
+            _ => b"equal",
+        };
+        out.flag(true)
+            .flag(measurable)
+            .int(diff)
+            .int(points)
+            .raw(sign)
+            .flag(mismatch);
+        out.0
+    }
+
+    /// `AdminCategoryRegexesController::planRegexListFilterPhp()`.
+    pub fn regex_list_filter(group: &[u8]) -> Vec<u8> {
+        let filtered = !group.is_empty();
+        let wildcards = group.iter().any(|&b| b == b'%' || b == b'_');
+        let mut pattern = Vec::with_capacity(group.len() + 2);
+        let mut escaped = Vec::with_capacity(group.len() * 2 + 2);
+        if filtered {
+            pattern.push(b'%');
+            pattern.extend_from_slice(group);
+            pattern.push(b'%');
+            escaped.push(b'%');
+            for &b in group {
+                if b == b'\\' || b == b'%' || b == b'_' {
+                    escaped.push(b'\\');
+                }
+                escaped.push(b);
+            }
+            escaped.push(b'%');
+        }
+        let mut out = Fields::new(24 + pattern.len() + escaped.len());
+        out.flag(filtered)
+            .flag(wildcards)
+            .int(group.len() as i64)
+            .int(pattern.len() as i64)
+            .raw(&pattern)
+            .raw(&escaped);
+        out.0
+    }
+
+    /// Named capture openings outside backslash escapes: `(?<name>`, `(?'name'` and `(?P<name>`.
+    fn named_groups(body: &[u8]) -> i64 {
+        let mut count = 0i64;
+        let mut i = 0;
+        while i < body.len() {
+            match body[i] {
+                b'\\' => {
+                    i += 2;
+                    continue;
+                }
+                b'(' if body.get(i + 1) == Some(&b'?') => match body.get(i + 2) {
+                    Some(b'\'') => count += 1,
+                    Some(b'<') if matches!(body.get(i + 3), Some(c) if *c != b'=' && *c != b'!') => {
+                        count += 1
+                    }
+                    Some(b'P') if body.get(i + 3) == Some(&b'<') => count += 1,
+                    _ => {}
+                },
+                _ => {}
+            }
+            i += 1;
+        }
+        count
+    }
+
+    /// `AdminCollectionRegexesController::summarizeRegexPatternPhp()`.
+    pub fn regex_pattern(regex: &[u8]) -> Vec<u8> {
+        let mut out = Fields::new(48);
+        let start = regex
+            .iter()
+            .position(|b| !PCRE_SPACE.contains(b))
+            .unwrap_or(regex.len());
+        let delimiter = match regex.get(start) {
+            Some(&d) if !d.is_ascii_alphanumeric() && d != b'\\' && d != 0 => d,
+            _ => {
+                out.flag(false)
+                    .int(-1)
+                    .flag(false)
+                    .int(0)
+                    .flag(false)
+                    .int(0)
+                    .raw(b"");
+                return out.0;
+            }
+        };
+        let closing = match delimiter {
+            b'(' => b')',
+            b'[' => b']',
+            b'{' => b'}',
+            b'<' => b'>',
+            d => d,
+        };
+        let rest = &regex[start + 1..];
+        let mut end = None;
+        let mut depth = 1usize;
+        let mut i = 0;
+        while i < rest.len() {
+            let b = rest[i];
+            if b == b'\\' && i + 1 < rest.len() {
+                i += 2;
+                continue;
+            }
+            if b == closing {
+                if closing == delimiter {
+                    end = Some(i);
+                    break;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(i);
+                    break;
+                }
+            } else if b == delimiter {
+                depth += 1;
+            }
+            i += 1;
+        }
+        let (body, modifiers, closed) = match end {
+            Some(j) => (&rest[..j], &rest[j + 1..], true),
+            None => (rest, &b""[..], false),
+        };
+        let modifiers_valid = closed && modifiers.iter().all(|b| MODIFIER_SET.contains(b));
+        out.flag(true)
+            .int(i64::from(delimiter))
+            .flag(closed)
+            .int(body.len() as i64)
+            .flag(modifiers_valid)
+            .int(named_groups(body))
+            .raw(modifiers);
+        out.0
+    }
+
+    /// # Safety
+    /// `message_ptr` must be valid for `message_len` readable bytes, and `out_buf` must be valid
+    /// for `out_cap` writable bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w383_incomplete_match_summary(
+        message_ptr: *const u8,
+        message_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(message) = (unsafe { valid_slice(message_ptr, message_len) }) else {
+                return DECLINE;
+            };
+            unsafe { write_bytes(&incomplete_match(message), out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// # Safety
+    /// `out_buf` must be valid for `out_cap` writable bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w383_predb_transaction_retry(
+        flags: u32,
+        attempt: i64,
+        attempts: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if flags & !(COMMITTED | CONCURRENCY | BODY_FAILED) != 0
+                || !valid_out_buf(out_buf, out_cap)
+            {
+                return DECLINE;
+            }
+            unsafe {
+                write_bytes(
+                    &transaction_retry(attempt, attempts, flags),
+                    out_buf,
+                    out_cap,
+                )
+            }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// # Safety
+    /// `message_ptr` must be valid for `message_len` readable bytes, and `out_buf` must be valid
+    /// for `out_cap` writable bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w383_predb_transaction_failure(
+        message_ptr: *const u8,
+        message_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(message) = (unsafe { valid_slice(message_ptr, message_len) }) else {
+                return DECLINE;
+            };
+            unsafe { write_bytes(&transaction_failure(message), out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// # Safety
+    /// Each string pointer must be valid for its length when its flag is set, and `out_buf` must
+    /// be valid for `out_cap` writable bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w383_size_mismatch_plan(
+        flags: u32,
+        threshold_ptr: *const u8,
+        threshold_len: usize,
+        limit_ptr: *const u8,
+        limit_len: usize,
+        direction_ptr: *const u8,
+        direction_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if flags & !(HAS_THRESHOLD | HAS_LIMIT | HAS_DIRECTION | RENAME) != 0
+                || !valid_out_buf(out_buf, out_cap)
+            {
+                return DECLINE;
+            }
+            let Some(threshold) = (unsafe {
+                optional_slice(flags & HAS_THRESHOLD != 0, threshold_ptr, threshold_len)
+            }) else {
+                return DECLINE;
+            };
+            let Some(limit) =
+                (unsafe { optional_slice(flags & HAS_LIMIT != 0, limit_ptr, limit_len) })
+            else {
+                return DECLINE;
+            };
+            let Some(direction) = (unsafe {
+                optional_slice(flags & HAS_DIRECTION != 0, direction_ptr, direction_len)
+            }) else {
+                return DECLINE;
+            };
+            let plan = size_mismatch_plan(threshold, limit, direction, flags & RENAME != 0);
+            unsafe { write_bytes(&plan, out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// # Safety
+    /// `direction_ptr` must be valid for `direction_len` readable bytes, and `out_buf` must be
+    /// valid for `out_cap` writable bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w383_size_difference(
+        direction_ptr: *const u8,
+        direction_len: usize,
+        release_bytes: i64,
+        files_bytes: i64,
+        threshold_bp: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(direction) = (unsafe { valid_slice(direction_ptr, direction_len) }) else {
+                return DECLINE;
+            };
+            let summary = size_difference(direction, release_bytes, files_bytes, threshold_bp);
+            unsafe { write_bytes(&summary, out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// # Safety
+    /// `group_ptr` must be valid for `group_len` readable bytes, and `out_buf` must be valid for
+    /// `out_cap` writable bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w383_regex_list_filter(
+        group_ptr: *const u8,
+        group_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(group) = (unsafe { valid_slice(group_ptr, group_len) }) else {
+                return DECLINE;
+            };
+            unsafe { write_bytes(&regex_list_filter(group), out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// # Safety
+    /// `regex_ptr` must be valid for `regex_len` readable bytes, and `out_buf` must be valid for
+    /// `out_cap` writable bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w383_regex_pattern_summary(
+        regex_ptr: *const u8,
+        regex_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(regex) = (unsafe { valid_slice(regex_ptr, regex_len) }) else {
+                return DECLINE;
+            };
+            unsafe { write_bytes(&regex_pattern(regex), out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::ptr;
+
+        fn call(f: impl Fn(*mut u8, usize) -> isize) -> Result<String, isize> {
+            let mut buf = vec![0u8; 1024];
+            let rc = f(buf.as_mut_ptr(), buf.len());
+            if rc < 0 {
+                return Err(rc);
+            }
+            buf.truncate(rc as usize);
+            Ok(String::from_utf8_lossy(&buf).replace('\x1F', "|"))
+        }
+
+        fn text(
+            f: unsafe extern "C" fn(*const u8, usize, *mut u8, usize) -> isize,
+            s: &[u8],
+        ) -> String {
+            call(|b, c| unsafe { f(s.as_ptr(), s.len(), b, c) }).unwrap()
+        }
+
+        #[test]
+        fn w383_incomplete_match_reasons() {
+            let f = nntmux_w383_incomplete_match_summary;
+            assert_eq!(
+                text(f, b"PreDB fulltext matching is incomplete: the 210-candidate scan budget was reached."),
+                "1|scan_budget|the 210-candidate scan budget was reached."
+            );
+            assert_eq!(
+                text(f, b"PreDB fulltext matching is incomplete: candidate IDs did not advance in order."),
+                "1|candidate_order|candidate IDs did not advance in order."
+            );
+            assert_eq!(
+                text(f, b"PreDB fulltext matching is incomplete: x"),
+                "1|other|x"
+            );
+            assert_eq!(
+                text(f, b"PreDB fulltext matching is incomplete: "),
+                "1|other|"
+            );
+            assert_eq!(text(f, b"boom"), "0|foreign|");
+            assert_eq!(text(f, b""), "0|foreign|");
+        }
+
+        #[test]
+        fn w383_transaction_retry_mirrors_catch_block() {
+            let plan = |flags, a, n| {
+                call(|b, c| unsafe { nntmux_w383_predb_transaction_retry(flags, a, n, b, c) })
+                    .unwrap()
+            };
+            assert_eq!(plan(1 | 2 | 4, 1, 3), "rethrow_committed|0|1|0");
+            assert_eq!(plan(2, 1, 3), "retry|1|2|0");
+            assert_eq!(plan(2 | 4, 2, 3), "retry|1|3|1");
+            assert_eq!(plan(2, 3, 3), "rethrow|1|3|0");
+            assert_eq!(plan(0, 1, 3), "rethrow|1|1|0");
+            assert_eq!(plan(4, 1, 1), "rethrow|1|1|1");
+            assert_eq!(
+                plan(2, i64::MAX, i64::MAX),
+                format!("rethrow|1|{}|0", i64::MAX)
+            );
+            assert_eq!(
+                plan(2, i64::MIN, i64::MAX),
+                format!("retry|1|{}|0", i64::MIN + 1)
+            );
+        }
+
+        #[test]
+        fn w383_transaction_failures() {
+            let f = nntmux_w383_predb_transaction_failure;
+            assert_eq!(
+                text(f, b"PreDB identity cleanup failed; discard this context."),
+                "1|cleanup_failed|1"
+            );
+            assert_eq!(
+                text(f, b"Unsupported PreDB identity callback manager."),
+                "1|unsupported_manager|0"
+            );
+            assert_eq!(
+                text(f, b"PreDB identity cleanup did not finish. "),
+                "0|foreign|0"
+            );
+        }
+
+        fn plan(t: Option<&[u8]>, l: Option<&[u8]>, d: Option<&[u8]>, rename: bool) -> String {
+            let mut flags = if rename { RENAME } else { 0 };
+            let (tp, tl) = t.map_or((ptr::null(), 0), |v| {
+                flags |= HAS_THRESHOLD;
+                (v.as_ptr(), v.len())
+            });
+            let (lp, ll) = l.map_or((ptr::null(), 0), |v| {
+                flags |= HAS_LIMIT;
+                (v.as_ptr(), v.len())
+            });
+            let (dp, dl) = d.map_or((ptr::null(), 0), |v| {
+                flags |= HAS_DIRECTION;
+                (v.as_ptr(), v.len())
+            });
+            call(|b, c| unsafe {
+                nntmux_w383_size_mismatch_plan(flags, tp, tl, lp, ll, dp, dl, b, c)
+            })
+            .unwrap()
+        }
+
+        #[test]
+        fn w383_size_mismatch_plan_parses_options() {
+            assert_eq!(
+                plan(None, None, None, false),
+                "1|20|1|100|1|any|1|diff_percent|desc"
+            );
+            assert_eq!(
+                plan(Some(b" 007 "), Some(b"0"), Some(b"bigger"), true),
+                "1|7|1|0|0|bigger|1|releases.id|asc"
+            );
+            assert_eq!(
+                plan(Some(b"-5"), Some(b"99999999"), Some(b"Smaller"), false),
+                "0|20|1|1000000|1|any|0|diff_percent|desc"
+            );
+            assert_eq!(
+                plan(Some(b""), Some(b"1e3"), Some(b"smaller"), false),
+                "0|20|0|100|1|smaller|1|diff_percent|desc"
+            );
+            assert_eq!(
+                plan(Some(b"0001000001"), Some(b"000"), Some(b"any"), false),
+                "1|1000000|1|0|0|any|1|diff_percent|desc"
+            );
+        }
+
+        #[test]
+        fn w383_size_difference_integer_basis_points() {
+            let diff = |d: &[u8], r, f, t| {
+                call(|b, c| unsafe {
+                    nntmux_w383_size_difference(d.as_ptr(), d.len(), r, f, t, b, c)
+                })
+                .unwrap()
+            };
+            assert_eq!(diff(b"any", 1000, 700, 2000), "1|1|300|3000|bigger|1");
+            assert_eq!(
+                diff(b"smaller", 1000, 1300, 2000),
+                "1|1|-300|-3000|smaller|1"
+            );
+            assert_eq!(
+                diff(b"bigger", 1000, 1300, 2000),
+                "1|1|-300|-3000|smaller|0"
+            );
+            assert_eq!(diff(b"any", 3, 2, 3333), "1|1|1|3333|bigger|0");
+            assert_eq!(diff(b"any", 0, 5, 0), "1|0|-5|0|smaller|0");
+            assert_eq!(diff(b"any", 7, 7, 0), "1|1|0|0|equal|0");
+            assert_eq!(diff(b"up", 1, 1, 0), "0|0|0|0|none|0");
+            assert_eq!(diff(b"any", -1, 1, 0), "0|0|0|0|none|0");
+            assert_eq!(diff(b"any", MAX_SIZE_BYTES + 1, 1, 0), "0|0|0|0|none|0");
+            assert_eq!(diff(b"any", 1, 1, MAX_THRESHOLD_BP + 1), "0|0|0|0|none|0");
+            assert_eq!(
+                diff(b"any", MAX_SIZE_BYTES, 0, MAX_THRESHOLD_BP),
+                format!("1|1|{}|10000|bigger|0", MAX_SIZE_BYTES)
+            );
+        }
+
+        #[test]
+        fn w383_regex_filter_and_pattern() {
+            let f = nntmux_w383_regex_list_filter;
+            assert_eq!(text(f, b""), "0|0|0|0||");
+            assert_eq!(text(f, b"a_b%\\"), "1|1|5|7|%a_b%\\%|%a\\_b\\%\\\\%");
+            let p = nntmux_w383_regex_pattern_summary;
+            assert_eq!(
+                text(p, b"/^(?P<name>a)(?<x>b)(?'y'c)(?<=d)(?<!e)\\(?<z>/iu"),
+                "1|47|1|44|1|3|iu"
+            );
+            assert_eq!(text(p, b"  {a{b}c}x "), "1|123|1|5|1|0|x ");
+            assert_eq!(text(p, b"#a\\#b"), "1|35|0|4|0|0|");
+            assert_eq!(text(p, b"(a)e"), "1|40|1|1|0|0|e");
+            assert_eq!(text(p, b"abc"), "0|-1|0|0|0|0|");
+            assert_eq!(text(p, b"\\a\\"), "0|-1|0|0|0|0|");
+            assert_eq!(text(p, b" \t"), "0|-1|0|0|0|0|");
+            assert_eq!(text(p, b"//"), "1|47|1|0|1|0|");
+            assert_eq!(text(p, b"/a\\"), "1|47|0|2|0|0|");
+            assert_eq!(text(p, b"/(?</"), "1|47|1|3|1|0|");
+        }
+
+        #[test]
+        fn w383_exports_validate_pointers_flags_and_capacity() {
+            let mut small = [b'Z'; 4];
+            let msg = b"boom";
+            let rc = unsafe {
+                nntmux_w383_incomplete_match_summary(msg.as_ptr(), msg.len(), small.as_mut_ptr(), 4)
+            };
+            assert_eq!(rc, -10);
+            assert_eq!(small, [b'Z'; 4]);
+            let mut big = vec![0u8; 10];
+            let rc2 = unsafe {
+                nntmux_w383_incomplete_match_summary(msg.as_ptr(), msg.len(), big.as_mut_ptr(), 10)
+            };
+            assert_eq!(rc2, 10);
+            let rc = unsafe { nntmux_w383_predb_transaction_retry(0, 1, 1, small.as_mut_ptr(), 0) };
+            assert!(rc < DECLINE);
+            assert_eq!(small, [b'Z'; 4]);
+
+            let mut out = vec![0u8; 256];
+            let (b, c) = (out.as_mut_ptr(), out.len());
+            let x = b"x".as_ptr();
+            unsafe {
+                assert_eq!(
+                    nntmux_w383_incomplete_match_summary(ptr::null(), 0, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w383_incomplete_match_summary(x, MAX_INPUT + 1, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w383_incomplete_match_summary(x, 1, ptr::null_mut(), 8),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w383_incomplete_match_summary(x, 1, b, isize::MAX as usize + 1),
+                    DECLINE
+                );
+                assert_eq!(nntmux_w383_predb_transaction_retry(8, 1, 1, b, c), DECLINE);
+                assert_eq!(
+                    nntmux_w383_predb_transaction_retry(0, 1, 1, ptr::null_mut(), 8),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w383_predb_transaction_failure(ptr::null(), 0, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w383_size_mismatch_plan(
+                        16,
+                        ptr::null(),
+                        0,
+                        ptr::null(),
+                        0,
+                        ptr::null(),
+                        0,
+                        b,
+                        c
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w383_size_mismatch_plan(
+                        1,
+                        ptr::null(),
+                        0,
+                        ptr::null(),
+                        0,
+                        ptr::null(),
+                        0,
+                        b,
+                        c
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w383_size_mismatch_plan(0, ptr::null(), 0, x, 1, ptr::null(), 0, b, c),
+                    DECLINE
+                );
+                assert!(
+                    nntmux_w383_size_mismatch_plan(
+                        8,
+                        ptr::null(),
+                        0,
+                        ptr::null(),
+                        0,
+                        ptr::null(),
+                        0,
+                        b,
+                        c
+                    ) > 0
+                );
+                assert_eq!(
+                    nntmux_w383_size_difference(ptr::null(), 0, 1, 1, 1, b, c),
+                    DECLINE
+                );
+                assert_eq!(nntmux_w383_regex_list_filter(ptr::null(), 0, b, c), DECLINE);
+                assert_eq!(
+                    nntmux_w383_regex_list_filter(x, 1, ptr::null_mut(), 8),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w383_regex_pattern_summary(ptr::null(), 0, b, c),
+                    DECLINE
+                );
+                assert!(nntmux_w383_regex_pattern_summary(x, 0, b, c) > 0);
+            }
+        }
+    }
+}
