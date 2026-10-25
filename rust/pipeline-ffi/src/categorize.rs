@@ -30972,7 +30972,7 @@ pub mod categorization_pipeline_result_music_pc_tv_w413 {
 
     /// What one release name holds, by `TvPipe::summarizeEpisodeTokenBatchPhp()` precedence.
     #[derive(Debug, PartialEq)]
-    enum EpisodeToken {
+    pub(super) enum EpisodeToken {
         Episode(i64, i64),
         Daily,
         SeasonPack,
@@ -31035,7 +31035,7 @@ pub mod categorization_pipeline_result_music_pc_tv_w413 {
 
     /// One pass over `s` (raw case): the leftmost episode token wins outright, else any daily
     /// date, else any season pack token. Blocks without a token start are skipped whole.
-    fn episode_token(s: &[u8]) -> EpisodeToken {
+    pub(super) fn episode_token(s: &[u8]) -> EpisodeToken {
         let (mut daily, mut pack) = (false, false);
         // Position 0 has no predecessor; a space (neither word byte nor digit) stands in for it.
         if let Some(&first) = s.first()
@@ -40703,6 +40703,662 @@ pub mod release_file_archive_processor_sync_usenet_w523 {
                         16
                     ),
                     4
+                );
+            }
+        }
+    }
+}
+
+/// Wave 53.3 per-record batches for `TvPipe`, `BookService`, `BooksProcessor`,
+/// `ConsolesProcessor` and `GamesProcessor`. Each export takes `count` NUL-joined strings and
+/// writes fixed-width `i64` words: one or two per record, then a trailer of counts.
+pub mod tv_book_service_books_consoles_games_w533 {
+    use super::categorization_pipeline_result_music_pc_tv_w413::{EpisodeToken, episode_token};
+    use super::{book_extract_isbn, book_looks_obfuscated};
+    use std::ptr;
+
+    /// Declines the batch to PHP.
+    pub const DECLINE: isize = -1;
+
+    /// Marks a `BookService` row that PHP must classify (any non-ASCII byte).
+    pub const ROW_DECLINED: i64 = -1;
+
+    /// Upper bound on `count`, so a corrupt count never drives a huge allocation.
+    const MAX_COUNT: usize = 1 << 24;
+
+    type Batch = fn(&[&[u8]]) -> Vec<i64>;
+
+    /// Splits `blob` on NUL into exactly `count` pieces (an empty blob holds no pieces).
+    fn split_exact(blob: &[u8], count: usize) -> Option<Vec<&[u8]>> {
+        if count == 0 {
+            return blob.is_empty().then(Vec::new);
+        }
+        let mut parts = Vec::with_capacity(count);
+        for part in blob.split(|&b| b == 0) {
+            if parts.len() == count {
+                return None;
+            }
+            parts.push(part);
+        }
+        (parts.len() == count).then_some(parts)
+    }
+
+    /// PHP `trim()`: space, tab, LF, CR, NUL and vertical tab (not form feed).
+    fn trim(value: &[u8]) -> &[u8] {
+        let is_trim = |b: &u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b);
+        let start = value
+            .iter()
+            .position(|b| !is_trim(b))
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|b| !is_trim(b))
+            .map_or(start, |i| i + 1);
+        &value[start..end]
+    }
+
+    /// `preg_split('/[^A-Za-z0-9]+/', ..., PREG_SPLIT_NO_EMPTY)`.
+    fn tokens(value: &[u8]) -> impl Iterator<Item = &[u8]> {
+        value
+            .split(|b| !b.is_ascii_alphanumeric())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// ASCII-uppercases tokens of up to 16 bytes; longer tokens match no keyword.
+    fn upper<'b>(token: &[u8], buf: &'b mut [u8; 16]) -> &'b [u8] {
+        if token.len() > buf.len() {
+            return &[];
+        }
+        for (dst, src) in buf.iter_mut().zip(token) {
+            *dst = src.to_ascii_uppercase();
+        }
+        &buf[..token.len()]
+    }
+
+    /// Decimal value of an all-digit token (callers bound the length).
+    fn number(token: &[u8]) -> i64 {
+        token.iter().fold(0i64, |n, b| n * 10 + i64::from(b - b'0'))
+    }
+
+    /// `^(?:19|20)\d\d$`, returning the year or 0.
+    fn year(token: &[u8]) -> i64 {
+        if token.len() == 4
+            && (token.starts_with(b"19") || token.starts_with(b"20"))
+            && token.iter().all(u8::is_ascii_digit)
+        {
+            number(token)
+        } else {
+            0
+        }
+    }
+
+    /// `^MULTI\d*$`, case-insensitive.
+    fn multi_language(token: &[u8]) -> bool {
+        token.len() >= 5
+            && token[..5].eq_ignore_ascii_case(b"MULTI")
+            && token[5..].iter().all(u8::is_ascii_digit)
+    }
+
+    /// `TvPipe::w53EpisodeTokenBatchPhp()`: per name `kind | season << 2 | episode << 16`
+    /// (kind 0 none, 1 episode, 2 daily, 3 season pack), then the episode, daily, season-pack
+    /// and none counts.
+    fn episode_tokens(names: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(names.len() + 4);
+        let mut totals = [0i64; 4];
+        for name in names {
+            let word = match episode_token(name) {
+                EpisodeToken::Episode(season, episode) => 1 | (season << 2) | (episode << 16),
+                EpisodeToken::Daily => 2,
+                EpisodeToken::SeasonPack => 3,
+                EpisodeToken::None => 0,
+            };
+            totals[(word & 3) as usize] += 1;
+            out.push(word);
+        }
+        out.extend([totals[1], totals[2], totals[3], totals[0]]);
+        out
+    }
+
+    /// `BookService::w53SubjectIsbnBatchPhp()`: per name `[flags, isbn]` with flags 1 obfuscated
+    /// subject, 2 ISBN-10, 4 ISBN-13 and 8 an `X` check digit (then `isbn` holds the first nine
+    /// digits), then the obfuscated, ISBN-10 and ISBN-13 counts. Non-ASCII names write
+    /// `[ROW_DECLINED, 0]` and stay out of the counts.
+    fn subject_isbns(names: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(names.len() * 2 + 3);
+        let mut totals = [0i64; 3];
+        for name in names {
+            if !name.is_ascii() {
+                out.extend([ROW_DECLINED, 0]);
+                continue;
+            }
+            let mut flags = i64::from(book_looks_obfuscated(name));
+            let mut value = 0i64;
+            if let Some(isbn) = book_extract_isbn(name) {
+                let digits = isbn.as_bytes();
+                let (kind, check_x) = (
+                    if digits.len() == 13 { 4 } else { 2 },
+                    matches!(digits.last(), Some(b'X' | b'x')),
+                );
+                flags |= kind | if check_x { 8 } else { 0 };
+                value = number(&digits[..digits.len() - usize::from(check_x)]);
+                totals[if kind == 4 { 2 } else { 1 }] += 1;
+            }
+            totals[0] += flags & 1;
+            out.extend([flags, value]);
+        }
+        out.extend(totals);
+        out
+    }
+
+    fn book_token(token: &[u8]) -> i64 {
+        match token {
+            b"EPUB" | b"MOBI" | b"AZW" | b"AZW3" | b"PDF" | b"KF8" | b"LIT" | b"FB2" | b"DJVU" => 2,
+            b"AUDIOBOOK" | b"AUDIOBOOKS" | b"M4B" | b"UNABRIDGED" | b"ABRIDGED" | b"MP3" => 4,
+            b"CBR" | b"CBZ" | b"CB7" | b"COMIC" | b"COMICS" => 8,
+            b"MAGAZINE" | b"MAGAZINES" | b"ISSUE" | b"WEEKLY" | b"MONTHLY" => 16,
+            b"RETAIL" => 32,
+            _ => 0,
+        }
+    }
+
+    /// Adds each set flag bit `1 << k` (k < N) of `word` to `totals[k]`.
+    fn tally<const N: usize>(totals: &mut [i64; N], word: i64) {
+        for (k, total) in totals.iter_mut().enumerate() {
+            *total += (word >> k) & 1;
+        }
+    }
+
+    /// `BooksProcessor::w53BookTitleFlagBatchPhp()`: per trimmed title `flags | year << 8` with
+    /// flags 1 empty, 2 ebook, 4 audiobook, 8 comic, 16 magazine and 32 retail, and the first
+    /// 19xx/20xx token as `year`; then the six flag counts and the year-tagged count.
+    fn book_titles(titles: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(titles.len() + 7);
+        let mut totals = [0i64; 6];
+        let mut years = 0i64;
+        for title in titles {
+            let title = trim(title);
+            let word = if title.is_empty() {
+                1
+            } else {
+                let (mut flags, mut first_year, mut buf) = (0i64, 0i64, [0u8; 16]);
+                for token in tokens(title) {
+                    flags |= book_token(upper(token, &mut buf));
+                    if first_year == 0 {
+                        first_year = year(token);
+                    }
+                }
+                years += i64::from(first_year != 0);
+                flags | (first_year << 8)
+            };
+            tally(&mut totals, word);
+            out.push(word);
+        }
+        out.extend(totals);
+        out.push(years);
+        out
+    }
+
+    /// A platform token's code: its 1-based position in `ConsolesProcessor::W414_PLATFORM_TOKENS`.
+    fn console_platform(token: &[u8]) -> i64 {
+        match token {
+            b"NINTENDO" => 1,
+            b"SWITCH" => 2,
+            b"NSW" => 3,
+            b"WII" => 4,
+            b"WIIU" => 5,
+            b"NDS" => 6,
+            b"3DS" => 7,
+            b"GBA" => 8,
+            b"NES" => 9,
+            b"SNES" => 10,
+            b"N64" => 11,
+            b"NGC" => 12,
+            b"GAMECUBE" => 13,
+            b"PSX" => 14,
+            b"PS1" => 15,
+            b"PS2" => 16,
+            b"PS3" => 17,
+            b"PS4" => 18,
+            b"PS5" => 19,
+            b"PSP" => 20,
+            b"PSV" => 21,
+            b"VITA" => 22,
+            b"XBOX" => 23,
+            b"X360" => 24,
+            b"XBOXONE" => 25,
+            b"XONE" => 26,
+            b"XSX" => 27,
+            b"DREAMCAST" => 28,
+            b"GENESIS" => 29,
+            b"MEGADRIVE" => 30,
+            b"SATURN" => 31,
+            _ => 0,
+        }
+    }
+
+    /// `ConsolesProcessor::W53_CONSOLE_TOKEN_FLAGS`.
+    fn console_token(token: &[u8]) -> i64 {
+        match token {
+            b"USA" | b"EUR" | b"EUROPE" | b"JPN" | b"JAP" | b"JAPAN" | b"PAL" | b"NTSC"
+            | b"NTSCU" | b"NTSCJ" | b"ASIA" | b"KOR" | b"REGIONFREE" => 4,
+            b"ISO" | b"NSP" | b"XCI" | b"CIA" | b"WBFS" | b"RVZ" | b"CSO" | b"CHD" | b"PKG"
+            | b"NSZ" | b"XCZ" => 16,
+            b"UPDATE" | b"DLC" | b"PATCH" => 32,
+            _ => match console_platform(token) {
+                0 => 0,
+                code => 2 | (code << 8),
+            },
+        }
+    }
+
+    /// `ConsolesProcessor::w53ConsoleTitleFlagBatchPhp()`: per trimmed title `flags | code << 8`
+    /// with flags 1 empty, 2 platform, 4 region, 8 MULTI<n>, 16 dump format and 32
+    /// update/DLC/patch, and the first platform token's `code`; then the six flag counts.
+    fn console_titles(titles: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(titles.len() + 6);
+        let mut totals = [0i64; 6];
+        for title in titles {
+            let title = trim(title);
+            let word = if title.is_empty() {
+                1
+            } else {
+                let (mut flags, mut code, mut buf) = (0i64, 0i64, [0u8; 16]);
+                for token in tokens(title) {
+                    let found = console_token(upper(token, &mut buf));
+                    flags |= (found & 0xff) | if multi_language(token) { 8 } else { 0 };
+                    if code == 0 {
+                        code = found >> 8;
+                    }
+                }
+                flags | (code << 8)
+            };
+            tally(&mut totals, word);
+            out.push(word);
+        }
+        out.extend(totals);
+        out
+    }
+
+    /// `^V\d+$` (case-insensitive) or the BUILD token.
+    fn version_token(token: &[u8]) -> bool {
+        (matches!(token.first(), Some(b'v' | b'V'))
+            && token.len() > 1
+            && token[1..].iter().all(u8::is_ascii_digit))
+            || token.eq_ignore_ascii_case(b"BUILD")
+    }
+
+    fn game_token(token: &[u8]) -> i64 {
+        match token {
+            b"CRACK" | b"CRACKFIX" | b"CRACKED" | b"FIX" | b"HOTFIX" | b"READNFO" => 4,
+            b"REPACK" | b"RIP" | b"FITGIRL" | b"DODI" => 16,
+            _ => 0,
+        }
+    }
+
+    /// Length of a `-[A-Za-z0-9_]{1,20}\z` suffix, or 0.
+    fn group_suffix(title: &[u8]) -> i64 {
+        let run = title
+            .iter()
+            .rev()
+            .take_while(|b| b.is_ascii_alphanumeric() || **b == b'_')
+            .count();
+        if (1..=20).contains(&run) && title.len() > run && title[title.len() - run - 1] == b'-' {
+            run as i64
+        } else {
+            0
+        }
+    }
+
+    /// `GamesProcessor::w53GameTitleFlagBatchPhp()`: per trimmed title `flags | group << 8` with
+    /// flags 1 empty, 2 V<n>/BUILD version, 4 crack/fix, 8 MULTI<n>, 16 repack and 32 group
+    /// suffix, and the `-GROUP` suffix length as `group`; then the six flag counts.
+    fn game_titles(titles: &[&[u8]]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(titles.len() + 6);
+        let mut totals = [0i64; 6];
+        for title in titles {
+            let title = trim(title);
+            let word = if title.is_empty() {
+                1
+            } else {
+                let (mut flags, mut buf) = (0i64, [0u8; 16]);
+                for token in tokens(title) {
+                    flags |= game_token(upper(token, &mut buf))
+                        | if version_token(token) { 2 } else { 0 }
+                        | if multi_language(token) { 8 } else { 0 };
+                }
+                let group = group_suffix(title);
+                flags | if group > 0 { 32 | (group << 8) } else { 0 }
+            };
+            tally(&mut totals, word);
+            out.push(word);
+        }
+        out.extend(totals);
+        out
+    }
+
+    /// Validates the buffers, runs `body` without unwinding into PHP and copies its words.
+    /// Returns the word count, `-needed` when `out_cap` is too small, or [`DECLINE`].
+    ///
+    /// # Safety
+    /// Non-null pointers must be valid for their lengths (`out` for `out_cap` `i64`s).
+    unsafe fn run(
+        blob: *const u8,
+        blob_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+        body: Batch,
+    ) -> isize {
+        if out.is_null()
+            || (blob.is_null() && blob_len != 0)
+            || blob_len > isize::MAX as usize
+            || out_cap > isize::MAX as usize / 8
+            || count > MAX_COUNT
+        {
+            return DECLINE;
+        }
+        let blob: &[u8] = if blob.is_null() {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(blob, blob_len) }
+        };
+        let result = std::panic::catch_unwind(|| Some(body(&split_exact(blob, count)?)));
+        let Ok(Some(values)) = result else {
+            return DECLINE;
+        };
+        if values.len() > out_cap {
+            return -(values.len() as isize);
+        }
+        unsafe {
+            ptr::copy_nonoverlapping(values.as_ptr(), out, values.len());
+        }
+        values.len() as isize
+    }
+
+    macro_rules! w533_export {
+        ($(#[$doc:meta])* $name:ident => $body:ident) => {
+            $(#[$doc])*
+            ///
+            /// # Safety
+            /// As for [`run`].
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                blob: *const u8,
+                blob_len: usize,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                unsafe { run(blob, blob_len, count, out, out_cap, $body) }
+            }
+        };
+    }
+
+    w533_export!(
+        /// `TvPipe::w53EpisodeTokenBatch()`.
+        nntmux_w533_tv_episode_token_batch => episode_tokens
+    );
+    w533_export!(
+        /// `BookService::w53SubjectIsbnBatch()`.
+        nntmux_w533_book_subject_isbn_batch => subject_isbns
+    );
+    w533_export!(
+        /// `BooksProcessor::w53BookTitleFlagBatch()`.
+        nntmux_w533_book_title_flag_batch => book_titles
+    );
+    w533_export!(
+        /// `ConsolesProcessor::w53ConsoleTitleFlagBatch()`.
+        nntmux_w533_console_title_flag_batch => console_titles
+    );
+    w533_export!(
+        /// `GamesProcessor::w53GameTitleFlagBatch()`.
+        nntmux_w533_game_title_flag_batch => game_titles
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        type Export = unsafe extern "C" fn(*const u8, usize, usize, *mut i64, usize) -> isize;
+
+        const EXPORTS: [Export; 5] = [
+            nntmux_w533_tv_episode_token_batch,
+            nntmux_w533_book_subject_isbn_batch,
+            nntmux_w533_book_title_flag_batch,
+            nntmux_w533_console_title_flag_batch,
+            nntmux_w533_game_title_flag_batch,
+        ];
+
+        fn call(f: Export, items: &[&[u8]]) -> Result<Vec<i64>, isize> {
+            let blob = items.join(&0u8);
+            let mut out = vec![0i64; 4096];
+            let written = unsafe {
+                f(
+                    blob.as_ptr(),
+                    blob.len(),
+                    items.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            if written < 0 {
+                return Err(written);
+            }
+            out.truncate(written as usize);
+            Ok(out)
+        }
+
+        #[test]
+        fn w533_split_exact_counts_pieces() {
+            assert_eq!(split_exact(b"", 0), Some(vec![]));
+            assert_eq!(split_exact(b"x", 0), None);
+            assert_eq!(split_exact(b"", 1), Some(vec![&b""[..]]));
+            assert_eq!(split_exact(b"a\0b", 2), Some(vec![&b"a"[..], &b"b"[..]]));
+            assert_eq!(split_exact(b"a\0b\0c", 2), None);
+            assert_eq!(split_exact(b"a", 2), None);
+        }
+
+        #[test]
+        fn w533_episode_tokens_report_kind_season_and_episode() {
+            let out = call(
+                nntmux_w533_tv_episode_token_batch,
+                &[
+                    b"Show.Name.S01E02.720p-GRP",
+                    b"Show.2024.03.15.HDTV",
+                    b"Show.S03.Complete",
+                    b"Movie.2019.1080p",
+                    b"",
+                    b"x.s99E999.y",
+                    b"Show.S1E2.and.S05E10",
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                out,
+                [
+                    1 | 1 << 2 | 2 << 16,
+                    2,
+                    3,
+                    0,
+                    0,
+                    1 | 99 << 2 | 999 << 16,
+                    1 | 1 << 2 | 2 << 16,
+                    3,
+                    1,
+                    1,
+                    2
+                ]
+            );
+        }
+
+        #[test]
+        fn w533_subject_isbns_flag_obfuscation_and_isbn_shapes() {
+            let out = call(
+                nntmux_w533_book_subject_isbn_batch,
+                &[
+                    b"N:/NZB [1/1] Book",
+                    b"Author - Title (978-0-306-40615-7) epub",
+                    b"Old Book 0-8044-2957-X",
+                    b"posted by someone 9780306406158",
+                    b"na\xefve 9780306406157",
+                    b"plain",
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                out,
+                [
+                    1,
+                    0,
+                    4,
+                    9_780_306_406_157,
+                    2 | 8,
+                    80_442_957,
+                    1,
+                    0,
+                    ROW_DECLINED,
+                    0,
+                    0,
+                    0,
+                    2,
+                    1,
+                    1
+                ]
+            );
+        }
+
+        #[test]
+        fn w533_book_titles_flag_formats_and_first_year() {
+            let out = call(
+                nntmux_w533_book_title_flag_batch,
+                &[
+                    b"Author - Title (2019) RETAIL EPUB",
+                    b"  \t",
+                    b"Comic.Issue.12.CBZ.1999.2005",
+                    b"Audiobook MP3 unabridged",
+                    b"averyveryverylongtokenepub-epub",
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                out,
+                [
+                    2 | 32 | 2019 << 8,
+                    1,
+                    8 | 16 | 1999 << 8,
+                    4,
+                    2,
+                    1,
+                    2,
+                    1,
+                    1,
+                    1,
+                    1,
+                    2
+                ]
+            );
+        }
+
+        #[test]
+        fn w533_console_titles_flag_tokens_and_platform_code() {
+            let out = call(
+                nntmux_w533_console_title_flag_batch,
+                &[
+                    b"Game.USA.PS4.Switch-GRP",
+                    b"Game.EUR.MULTI5.NSP.Update",
+                    b"",
+                    b"Saturn.multi",
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                out,
+                [
+                    2 | 4 | 18 << 8,
+                    4 | 8 | 16 | 32,
+                    1,
+                    2 | 8 | 31 << 8,
+                    1,
+                    2,
+                    2,
+                    2,
+                    1,
+                    1
+                ]
+            );
+        }
+
+        #[test]
+        fn w533_game_titles_flag_tokens_and_group_suffix() {
+            let out = call(
+                nntmux_w533_game_title_flag_batch,
+                &[
+                    b"Game.v1.2.3.MULTI10-CODEX",
+                    b"Game.Build.123.Crackfix.REPACK-FitGirl",
+                    b"Game-abcdefghijklmnopqrstu",
+                    b" ",
+                ],
+            )
+            .unwrap();
+            assert_eq!(
+                out,
+                [
+                    2 | 8 | 32 | 5 << 8,
+                    2 | 4 | 16 | 32 | 7 << 8,
+                    0,
+                    1,
+                    1,
+                    2,
+                    1,
+                    1,
+                    1,
+                    2
+                ]
+            );
+        }
+
+        #[test]
+        fn w533_exports_guard_pointers_and_capacity() {
+            let mut out = [0i64; 64];
+            let o = out.as_mut_ptr();
+            for f in EXPORTS {
+                unsafe {
+                    assert_eq!(f(b"x".as_ptr(), 1, 1, ptr::null_mut(), 64), DECLINE);
+                    assert_eq!(f(ptr::null(), 1, 1, o, 64), DECLINE);
+                    assert_eq!(f(ptr::null(), 0, MAX_COUNT + 1, o, 64), DECLINE);
+                    assert_eq!(f(b"x".as_ptr(), 1, 1, o, usize::MAX), DECLINE);
+                    assert_eq!(f(b"a\0b".as_ptr(), 3, 1, o, 64), DECLINE);
+                    assert_eq!(f(b"a".as_ptr(), 1, 2, o, 64), DECLINE);
+                    assert_eq!(f(b"x".as_ptr(), 1, 0, o, 64), DECLINE);
+                    assert!(f(ptr::null(), 0, 0, o, 64) > 0);
+                    assert!(f(ptr::null(), 0, 1, o, 64) > 0);
+                    assert!(f(b"x".as_ptr(), 1, 1, o, 1) < -1);
+                }
+            }
+            unsafe {
+                assert_eq!(
+                    nntmux_w533_tv_episode_token_batch(ptr::null(), 0, 0, o, 64),
+                    4
+                );
+                assert_eq!(
+                    nntmux_w533_book_subject_isbn_batch(ptr::null(), 0, 0, o, 64),
+                    3
+                );
+                assert_eq!(
+                    nntmux_w533_book_title_flag_batch(ptr::null(), 0, 0, o, 64),
+                    7
+                );
+                assert_eq!(
+                    nntmux_w533_console_title_flag_batch(ptr::null(), 0, 0, o, 64),
+                    6
+                );
+                assert_eq!(
+                    nntmux_w533_game_title_flag_batch(ptr::null(), 0, 0, o, 64),
+                    6
+                );
+                assert_eq!(
+                    nntmux_w533_book_subject_isbn_batch(b"x".as_ptr(), 1, 1, o, 4),
+                    -5
                 );
             }
         }
