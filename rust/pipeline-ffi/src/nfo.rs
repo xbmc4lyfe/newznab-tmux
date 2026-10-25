@@ -28630,3 +28630,622 @@ pub unsafe extern "C" fn nntmux_w412_nzb_sync_nfo_import_coverage_candidate(
     }))
     .unwrap_or(-1)
 }
+
+mod wave42_nzb_source_guard_install_staging_xml_par2 {
+    use super::{nfo_abi_range, yenc_ranges_overlap};
+    use std::slice;
+
+    pub(super) const MAX_INPUT: usize = 16 * 1024 * 1024;
+
+    type Slot = [u8; 8];
+
+    fn word(chunk: &Slot) -> i64 {
+        i64::from_ne_bytes(*chunk)
+    }
+
+    type TextRow<'a, const TEXTS: usize> = [Option<&'a [u8]>; TEXTS];
+
+    /// `[lead, count]`, `count` rows of `WIDTH` slots whose first `TEXTS` slots are text lengths
+    /// (-1 marks a non-string), then the texts in row order. With `PREFIX`, `lead` is the length of
+    /// one more text placed before them. Declared lengths must cover the tail exactly.
+    #[allow(clippy::type_complexity)]
+    fn text_table<const WIDTH: usize, const TEXTS: usize, const PREFIX: bool>(
+        bytes: &[u8],
+    ) -> Option<(i64, &[u8], Vec<(TextRow<'_, TEXTS>, [i64; WIDTH])>)> {
+        let (head, _) = bytes.get(..16)?.as_chunks::<8>();
+        let lead = word(&head[0]);
+        let count = usize::try_from(word(&head[1])).ok()?;
+        let table_end = count.checked_mul(WIDTH)?.checked_mul(8)?.checked_add(16)?;
+        let table = bytes.get(16..table_end)?;
+        let tail = &bytes[table_end..];
+        let mut offset = if PREFIX {
+            usize::try_from(lead).ok()?
+        } else {
+            0
+        };
+        let prefix = tail.get(..offset)?;
+        let mut out = Vec::with_capacity(count);
+        for row in table.as_chunks::<8>().0.as_chunks::<WIDTH>().0 {
+            let mut values = [0i64; WIDTH];
+            for (value, chunk) in values.iter_mut().zip(row) {
+                *value = word(chunk);
+            }
+            let mut texts = [None; TEXTS];
+            for (text, &length) in texts.iter_mut().zip(&values) {
+                if length != -1 {
+                    let end = offset.checked_add(usize::try_from(length).ok()?)?;
+                    *text = Some(tail.get(offset..end)?);
+                    offset = end;
+                }
+            }
+            out.push((texts, values));
+        }
+        (offset == tail.len()).then_some((lead, prefix, out))
+    }
+
+    /// `NzbSourceGuard::STAGED_NAME`: the GUID length of `<guid>.nzb.gz.c<digits>-<16 hex>.next`.
+    fn staged_guid_len(name: &[u8]) -> Option<usize> {
+        const SUFFIX: &[u8] = b".next";
+        const MARK: &[u8] = b".nzb.gz.c";
+        let n = name.len();
+        if n < 1 + MARK.len() + 1 + 1 + 16 + SUFFIX.len() || !name.ends_with(SUFFIX) {
+            return None;
+        }
+        let hex_end = n - SUFFIX.len();
+        let hex_start = hex_end - 16;
+        if !name[hex_start..hex_end]
+            .iter()
+            .all(|&b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || name[hex_start - 1] != b'-'
+        {
+            return None;
+        }
+        let digits_end = hex_start - 1;
+        let mut digits_start = digits_end;
+        while digits_start > 0 && name[digits_start - 1].is_ascii_digit() {
+            digits_start -= 1;
+        }
+        if digits_start == digits_end || digits_start < MARK.len() + 1 {
+            return None;
+        }
+        let guid_end = digits_start - MARK.len();
+        if &name[guid_end..digits_start] != MARK || name[..guid_end].contains(&b'\n') {
+            return None;
+        }
+        Some(guid_end)
+    }
+
+    /// `/^[a-zA-Z0-9_-]{1,40}\.nzb(\.gz)?$/D`: the canonical basename of a retained source.
+    fn canonical_source(name: &[u8]) -> bool {
+        let guid = name
+            .strip_suffix(b".nzb.gz")
+            .or_else(|| name.strip_suffix(b".nzb"));
+        guid.is_some_and(|guid| {
+            (1..=40).contains(&guid.len())
+                && guid
+                    .iter()
+                    .all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        })
+    }
+
+    /// Op 0: `NzbSourceGuard::summarizeStagedNameBatch` over `[0, count]`, rows of `[name_len]` and the names.
+    fn staged_names(bytes: &[u8]) -> Option<Vec<i64>> {
+        let (lead, _, rows) = text_table::<1, 1, false>(bytes)?;
+        if lead != 0 {
+            return None;
+        }
+        let (mut invalid, mut staged, mut canonical, mut other, mut guid_bytes, mut max_guid) =
+            (0i64, 0i64, 0i64, 0i64, 0i64, 0i64);
+        for ([name], _) in &rows {
+            let Some(name) = name else {
+                invalid += 1;
+                continue;
+            };
+            if let Some(length) = staged_guid_len(name) {
+                staged += 1;
+                guid_bytes += length as i64;
+                max_guid = max_guid.max(length as i64);
+            } else if canonical_source(name) {
+                canonical += 1;
+            } else {
+                other += 1;
+            }
+        }
+        Some(vec![
+            rows.len() as i64,
+            invalid,
+            staged,
+            canonical,
+            other,
+            guid_bytes,
+            max_guid,
+        ])
+    }
+
+    /// The directory prefix `normalizeSourcePathPairPhp()` compares: through the last `/`, else empty.
+    fn parent(path: &[u8]) -> &[u8] {
+        path.iter()
+            .rposition(|&b| b == b'/')
+            .map_or(&[][..], |slash| &path[..=slash])
+    }
+
+    /// Op 1: `NzbSourceInstallation::summarizeSourcePathPairs` over `[0, count]`, rows of
+    /// `[source_len, destination_len]` and both paths of every row.
+    fn path_pairs(bytes: &[u8]) -> Option<Vec<i64>> {
+        let (lead, _, rows) = text_table::<2, 2, false>(bytes)?;
+        if lead != 0 {
+            return None;
+        }
+        let mut counts = [0i64; 6];
+        for ([source, destination], _) in &rows {
+            let (Some(source), Some(destination)) = (source, destination) else {
+                counts[0] += 1;
+                continue;
+            };
+            let sibling = !source.is_empty()
+                && !destination.is_empty()
+                && parent(source) == parent(destination);
+            counts[if source == destination {
+                1
+            } else if sibling {
+                2
+            } else {
+                3
+            }] += 1;
+            counts[4] += sibling as i64;
+            counts[5] += (source.is_empty() || destination.is_empty()) as i64;
+        }
+        let mut out = Vec::with_capacity(7);
+        out.push(rows.len() as i64);
+        out.extend_from_slice(&counts);
+        Some(out)
+    }
+
+    /// Op 2: `NzbUploadStagingService::summarizeUploadFilenames` over `[extension_len, count]`, rows of
+    /// `[name_len]`, then the expected extension followed by the names.
+    fn upload_filenames(bytes: &[u8]) -> Option<Vec<i64>> {
+        let (_, expected, rows) = text_table::<1, 1, true>(bytes)?;
+        let (mut invalid, mut unsafe_names, mut wrong, mut accepted, mut basename_bytes) =
+            (0i64, 0i64, 0i64, 0i64, 0i64);
+        for ([name], _) in &rows {
+            let Some(name) = name else {
+                invalid += 1;
+                continue;
+            };
+            if name.is_empty()
+                || *name == b"."
+                || *name == b".."
+                || name.iter().any(|&b| matches!(b, b'/' | b'\\' | 0))
+            {
+                unsafe_names += 1;
+                continue;
+            }
+            let (basename, extension) = match name.iter().rposition(|&b| b == b'.') {
+                Some(dot) => (&name[..dot], &name[dot + 1..]),
+                None => (*name, &[][..]),
+            };
+            let trimmed = basename
+                .iter()
+                .any(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b));
+            if extension.len() == expected.len()
+                && extension
+                    .iter()
+                    .zip(expected)
+                    .all(|(a, b)| a.to_ascii_lowercase() == *b)
+                && trimmed
+            {
+                accepted += 1;
+                basename_bytes += basename.len() as i64;
+            } else {
+                wrong += 1;
+            }
+        }
+        Some(vec![
+            rows.len() as i64,
+            invalid,
+            unsafe_names,
+            wrong,
+            accepted,
+            basename_bytes,
+        ])
+    }
+
+    /// Op 3: `NzbXmlElements::summarizeMetadataTypes` over `[head_count, count]`, rows of `[type_len]` and the types.
+    fn metadata_types(bytes: &[u8]) -> Option<Vec<i64>> {
+        let (head_count, _, rows) = text_table::<1, 1, false>(bytes)?;
+        let (mut invalid, mut password, mut like, mut empty, mut other) =
+            (0i64, 0i64, 0i64, 0i64, 0i64);
+        for ([kind], _) in &rows {
+            match kind {
+                None => invalid += 1,
+                Some(b"password") => password += 1,
+                Some(text) if text.eq_ignore_ascii_case(b"password") => like += 1,
+                Some([]) => empty += 1,
+                Some(_) => other += 1,
+            }
+        }
+        let rejected = if head_count > 1 { password } else { 0 };
+        Some(vec![
+            rows.len() as i64,
+            invalid,
+            password,
+            like,
+            empty,
+            other,
+            rejected,
+        ])
+    }
+
+    /// Op 4: `Par2CandidateRecovery::summarizePartOffsets` over `[size]` and rows of
+    /// `[valid (0/1), begin, end]`, walking the decoded offset from zero.
+    fn part_offsets(bytes: &[u8]) -> Option<Vec<i64>> {
+        let (slots, rest) = bytes.as_chunks::<8>();
+        if !rest.is_empty() || slots.is_empty() {
+            return None;
+        }
+        let size = word(&slots[0]);
+        let (rows, extra) = slots[1..].as_chunks::<3>();
+        if !extra.is_empty() {
+            return None;
+        }
+        let mut counts = [0i64; 5];
+        let mut offset = 0i64;
+        for row in rows {
+            let (valid, begin, end) = (word(&row[0]), word(&row[1]), word(&row[2]));
+            let slot = match valid {
+                0 => 0,
+                1 if begin < 1 || end < begin || end > size => 4,
+                1 if begin <= offset => 3,
+                1 if begin == offset + 1 => {
+                    offset = end;
+                    1
+                }
+                1 => 2,
+                _ => return None,
+            };
+            counts[slot] += 1;
+        }
+        let mut out = Vec::with_capacity(8);
+        out.push(rows.len() as i64);
+        out.extend_from_slice(&counts);
+        out.push(offset);
+        out.push(size.max(0) - offset);
+        Some(out)
+    }
+
+    fn compute(operation: u32, flags: u32, bytes: &[u8]) -> Option<Vec<i64>> {
+        if flags != 0 {
+            return None;
+        }
+        match operation {
+            0 => staged_names(bytes),
+            1 => path_pairs(bytes),
+            2 => upload_filenames(bytes),
+            3 => metadata_types(bytes),
+            4 => part_offsets(bytes),
+            _ => None,
+        }
+    }
+
+    /// # Safety
+    /// See [`super::nntmux_w422_nzb_source_guard_install_staging_xml_par2`].
+    pub(super) unsafe fn evaluate(
+        operation: u32,
+        flags: u32,
+        input: *const u8,
+        length: usize,
+        output: *mut u8,
+        capacity: usize,
+    ) -> i32 {
+        if !nfo_abi_range(input, length, false)
+            || !nfo_abi_range(output, capacity, false)
+            || length > MAX_INPUT
+            || capacity > isize::MAX as usize
+            || yenc_ranges_overlap(input as usize, length, output as usize, capacity)
+        {
+            return -1;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, length) };
+        let Some(result) = compute(operation, flags, bytes) else {
+            return -1;
+        };
+        // Every answer has at most 8 slots, so the byte count always fits an i32.
+        let needed = result.len() * 8;
+        if needed > capacity {
+            return -(needed as i32);
+        }
+        let out = unsafe { slice::from_raw_parts_mut(output, needed) };
+        for (chunk, value) in out.as_chunks_mut::<8>().0.iter_mut().zip(&result) {
+            chunk.copy_from_slice(&value.to_ne_bytes());
+        }
+        needed as i32
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn pack(slots: &[i64], tail: &[&[u8]]) -> Vec<u8> {
+            let mut v: Vec<u8> = slots.iter().flat_map(|s| s.to_ne_bytes()).collect();
+            for t in tail {
+                v.extend_from_slice(t);
+            }
+            v
+        }
+
+        /// `[lead, count]`, one length slot per text (`None` packs -1) and the present texts.
+        fn texts(lead: i64, prefix: &[u8], items: &[Option<&[u8]>]) -> Vec<u8> {
+            let mut slots = vec![lead, items.len() as i64];
+            slots.extend(items.iter().map(|t| t.map_or(-1, |t| t.len() as i64)));
+            let mut tail: Vec<&[u8]> = vec![prefix];
+            tail.extend(items.iter().flatten());
+            pack(&slots, &tail)
+        }
+
+        fn call(operation: u32, input: &[u8]) -> Option<Vec<i64>> {
+            let mut out = vec![0xa5u8; 256];
+            let probe = [0u8; 1];
+            let pointer = if input.is_empty() {
+                probe.as_ptr()
+            } else {
+                input.as_ptr()
+            };
+            let written = unsafe {
+                evaluate(
+                    operation,
+                    0,
+                    pointer,
+                    input.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            if written < 0 {
+                assert_eq!(written, -1);
+                return None;
+            }
+            Some(
+                out[..written as usize]
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(word)
+                    .collect(),
+            )
+        }
+
+        #[test]
+        fn w42_2_staged_names() {
+            let names: [Option<&[u8]>; 9] = [
+                Some(b"abc.nzb.gz.c12-0123456789abcdef.next"),
+                Some(b"a.b.nzb.gz.c1.nzb.gz.c7-ffffffffffffffff.next"),
+                Some(b"abc.nzb.gz"),
+                Some(b"abc.nzb"),
+                Some(b"abc.nzb.gz.c12-0123456789ABCDEF.next"),
+                Some(b"a\nb.nzb.gz.c1-0123456789abcdef.next"),
+                Some(b""),
+                None,
+                Some(b"0123456789012345678901234567890123456789x.nzb"),
+            ];
+            assert_eq!(
+                call(0, &texts(0, b"", &names)),
+                Some(vec![9, 1, 2, 2, 4, 3 + 13, 13])
+            );
+            assert_eq!(
+                call(
+                    0,
+                    &texts(0, b"", &[Some(b".nzb.gz.c1-0123456789abcdef.next")])
+                ),
+                Some(vec![1, 0, 0, 0, 1, 0, 0])
+            );
+            assert_eq!(call(0, &texts(0, b"", &[])), Some(vec![0; 7]));
+            assert_eq!(call(0, &texts(1, b"", &[])), None);
+            assert_eq!(call(0, &pack(&[0, 1, 3], &[b"ab"])), None);
+            assert_eq!(call(0, &pack(&[0, 1, -2], &[])), None);
+            assert_eq!(call(0, &pack(&[0, 0], &[b"x"])), None);
+            assert_eq!(call(0, &pack(&[0], &[])), None);
+        }
+
+        #[test]
+        fn w42_2_path_pairs() {
+            type Pair<'a> = (Option<&'a [u8]>, Option<&'a [u8]>);
+            let rows: [Pair<'_>; 7] = [
+                (Some(b"/a/x.nzb.gz"), Some(b"/a/x.nzb.gz")),
+                (Some(b"/a/x.nzb.gz"), Some(b"/a/x.next")),
+                (Some(b"/a/x.nzb.gz"), Some(b"/b/x.next")),
+                (Some(b"x"), Some(b"y")),
+                (Some(b""), Some(b"y")),
+                (Some(b""), Some(b"")),
+                (None, Some(b"y")),
+            ];
+            let mut slots = vec![0, rows.len() as i64];
+            let mut tail: Vec<&[u8]> = vec![];
+            for (s, d) in &rows {
+                slots.push(s.map_or(-1, |t| t.len() as i64));
+                slots.push(d.map_or(-1, |t| t.len() as i64));
+                tail.extend(s.iter().chain(d.iter()));
+            }
+            assert_eq!(
+                call(1, &pack(&slots, &tail)),
+                Some(vec![7, 1, 2, 2, 2, 3, 2])
+            );
+            assert_eq!(call(1, &pack(&[0, 0], &[])), Some(vec![0; 7]));
+            assert_eq!(call(1, &pack(&[0, 1, 1], &[b"a"])), None);
+            assert_eq!(call(1, &pack(&[0, 1, 1, 1], &[b"a"])), None);
+        }
+
+        #[test]
+        fn w42_2_upload_filenames() {
+            let names: [Option<&[u8]>; 13] = [
+                Some(b"movie.nzb"),
+                Some(b"movie.NZB"),
+                Some(b"a.b.nzb"),
+                Some(b".nzb"),
+                Some(b" \t.nzb"),
+                Some(b"movie.nfo"),
+                Some(b"nzb"),
+                Some(b""),
+                Some(b".."),
+                Some(b"a/b.nzb"),
+                Some(b"a\\b.nzb"),
+                Some(b"a\0.nzb"),
+                None,
+            ];
+            assert_eq!(
+                call(2, &texts(3, b"nzb", &names)),
+                Some(vec![13, 1, 5, 4, 3, 5 + 5 + 3])
+            );
+            assert_eq!(
+                call(2, &texts(3, b"NZB", &[Some(b"a.NZB")])),
+                Some(vec![1, 0, 0, 1, 0, 0])
+            );
+            assert_eq!(
+                call(2, &texts(0, b"", &[Some(b"a."), Some(b"a")])),
+                Some(vec![2, 0, 0, 0, 2, 2])
+            );
+            assert_eq!(call(2, &texts(0, b"", &[])), Some(vec![0; 6]));
+            assert_eq!(call(2, &pack(&[4, 0], &[b"nzb"])), None);
+            assert_eq!(call(2, &pack(&[-1, 0], &[])), None);
+            assert_eq!(call(2, &pack(&[3, 0], &[b"nzbx"])), None);
+        }
+
+        #[test]
+        fn w42_2_metadata_types() {
+            let kinds: [Option<&[u8]>; 7] = [
+                Some(b"password"),
+                Some(b"Password"),
+                Some(b"PASSWORD"),
+                Some(b""),
+                Some(b"title"),
+                Some(b"password "),
+                None,
+            ];
+            assert_eq!(
+                call(3, &texts(2, b"", &kinds)),
+                Some(vec![7, 1, 1, 2, 1, 2, 1])
+            );
+            assert_eq!(
+                call(3, &texts(1, b"", &kinds)),
+                Some(vec![7, 1, 1, 2, 1, 2, 0])
+            );
+            assert_eq!(call(3, &texts(i64::MIN, b"", &[])), Some(vec![0; 7]));
+            assert_eq!(call(3, &pack(&[2, 1, 8], &[b"passwor"])), None);
+        }
+
+        #[test]
+        fn w42_2_part_offsets() {
+            assert_eq!(
+                call(
+                    4,
+                    &pack(
+                        &[
+                            10, 1, 1, 4, 1, 3, 5, 1, 5, 6, 1, 8, 9, 0, 0, 0, 1, 7, 11, 1, 7, 10, 1,
+                            0, 0
+                        ],
+                        &[]
+                    )
+                ),
+                Some(vec![8, 1, 3, 1, 1, 2, 10, 0])
+            );
+            assert_eq!(
+                call(
+                    4,
+                    &pack(&[i64::MAX, 1, 1, i64::MAX, 1, i64::MAX, i64::MAX], &[])
+                ),
+                Some(vec![2, 0, 1, 0, 1, 0, i64::MAX, 0])
+            );
+            assert_eq!(
+                call(4, &pack(&[-5, 1, 1, 1], &[])),
+                Some(vec![1, 0, 0, 0, 0, 1, 0, 0])
+            );
+            assert_eq!(
+                call(4, &pack(&[7], &[])),
+                Some(vec![0, 0, 0, 0, 0, 0, 0, 7])
+            );
+            assert_eq!(call(4, &pack(&[7, 2, 1, 1], &[])), None);
+            assert_eq!(call(4, &pack(&[7, 1, 1], &[])), None);
+            assert_eq!(call(4, &pack(&[7], &[b"x"])), None);
+            assert_eq!(call(4, &[]), None);
+        }
+
+        #[test]
+        fn w42_2_abi_sentinels() {
+            assert_eq!(call(5, &pack(&[0], &[])), None);
+            assert_eq!(call(u32::MAX, &pack(&[0], &[])), None);
+            let input = pack(&[10, 1, 1, 10], &[]);
+            let mut out = [0x5au8; 128];
+            let run = |p: *const u8, len: usize, o: *mut u8, cap: usize| unsafe {
+                evaluate(4, 0, p, len, o, cap)
+            };
+            assert_eq!(run(std::ptr::null(), 0, out.as_mut_ptr(), out.len()), -1);
+            assert_eq!(
+                run(input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), MAX_INPUT + 1, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), usize::MAX, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), input.len(), out.as_mut_ptr(), usize::MAX),
+                -1
+            );
+            for cap in [0, 1, 63] {
+                assert_eq!(run(input.as_ptr(), input.len(), out.as_mut_ptr(), cap), -64);
+            }
+            assert!(out.iter().all(|b| *b == 0x5a));
+            assert_eq!(run(input.as_ptr(), input.len(), out.as_mut_ptr(), 64), 64);
+            assert_eq!(word(&out[16..24].try_into().unwrap()), 1);
+            assert!(out[64..].iter().all(|b| *b == 0x5a));
+            let mut shared = [0u8; 160];
+            shared[..input.len()].copy_from_slice(&input);
+            let p = shared.as_mut_ptr();
+            assert_eq!(run(p, input.len(), unsafe { p.add(8) }, 64), -1);
+            let export = |op: u32, flags: u32, out: &mut [u8]| unsafe {
+                super::super::nntmux_w422_nzb_source_guard_install_staging_xml_par2(
+                    op,
+                    flags,
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert_eq!(export(4, 0, &mut out), 64);
+            assert_eq!(export(4, 1, &mut out), -1);
+            assert_eq!(export(0, 0, &mut out), -1);
+        }
+    }
+}
+
+/// Evaluate one Wave 42.2 helper over packed native-endian `i64` slots followed by any
+/// string bytes: op 0 classifies NZB source basenames (staged generations and canonical
+/// sources), op 1 summarizes installation source/destination path pairs, op 2 classifies
+/// upload filenames against an expected extension, op 3 tallies NZB metadata types and
+/// op 4 walks yEnc part offsets. `flags` must be zero. Returns the byte count written, the
+/// negated required capacity when `out_cap` is too small (nothing written), or -1 when the
+/// input is malformed.
+///
+/// # Safety
+/// Both ranges must be live, disjoint readable/writable allocations. Pointers must
+/// be non-null even for zero lengths; arithmetic checks cannot prove provenance.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w422_nzb_source_guard_install_staging_xml_par2(
+    operation: u32,
+    flags: u32,
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        wave42_nzb_source_guard_install_staging_xml_par2::evaluate(
+            operation, flags, input, input_len, out_buf, out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}

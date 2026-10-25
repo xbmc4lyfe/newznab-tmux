@@ -920,4 +920,185 @@ final class NzbSourceGuard
             throw $exception;
         }
     }
+
+    /** The Wave 42.2 export shared by the staged name, path pair, upload filename, metadata type and part offset helpers. */
+    public const string W422_FFI_CDEF = <<<'C'
+        int32_t nntmux_w422_nzb_source_guard_install_staging_xml_par2(
+            uint32_t operation,
+            uint32_t flags,
+            const char *input,
+            size_t input_len,
+            char *out_buf,
+            size_t out_cap
+        );
+        C;
+
+    public const string W422_FFI_DOMAIN = 'nfo_w422';
+
+    /**
+     * Default for the Wave 42.2 toggle only; it stays false because the paired benchmark in
+     * tests/Unit/RustNzbSourceGuardInstallStagingXmlPar2W42ParityTest.php is below 1.5x.
+     */
+    public const bool W422_RUST_FFI_DEFAULT = false;
+
+    public const int W422_MAX_INPUT = 16777216;
+
+    /** The canonical basename of a retained source, as validateAnchorPhp() requires it. */
+    public const string W422_CANONICAL_NAME = '/^[a-zA-Z0-9_-]{1,40}\.nzb(\.gz)?$/D';
+
+    private static ?bool $useW422RustFfi = null;
+
+    public static function useW422RustFfi(bool $enable = true): void
+    {
+        self::$useW422RustFfi = $enable;
+    }
+
+    public static function usesW422RustFfi(): bool
+    {
+        return self::$useW422RustFfi ?? self::W422_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW422RustFfi(): void
+    {
+        self::$useW422RustFfi = null;
+    }
+
+    /**
+     * Run one Wave 42.2 operation; null whenever the library, input or answer is unusable, so callers fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    public static function evaluateW422Native(int $operation, string $input, int $slots): ?array
+    {
+        try {
+            if ($operation < 0 || $operation > 0xFFFFFFFF || $slots < 1 || $input === '' || \strlen($input) > self::W422_MAX_INPUT) {
+                return null;
+            }
+            $ffi = RustPipelineLibrary::resolveDomain(self::W422_FFI_DOMAIN, self::W422_FFI_CDEF, getenv('NNTMUX_PIPELINE_FFI_LIB') ?: null);
+            if (! $ffi instanceof FFI) {
+                return null;
+            }
+            $needed = $slots * 8;
+            for ($attempt = 0; $attempt < 2; $attempt++) {
+                $capacity = 0;
+                $output = RustPipelineLibrary::obtainScratch($ffi, $needed, $capacity);
+                if ($output === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w422_nzb_source_guard_install_staging_xml_par2($operation, 0, $input, \strlen($input), $output, $capacity);
+                if (! \is_int($written) || $written === -1 || $written > $capacity) {
+                    return null;
+                }
+                if ($written < 0) {
+                    // Too small: retry once with the reported capacity.
+                    $needed = -$written;
+
+                    continue;
+                }
+                if ($written !== $slots * 8) {
+                    return null;
+                }
+                $values = array_values(unpack('q'.$slots, FFI::string($output, $written)) ?: []);
+
+                return \count($values) === $slots ? $values : null;
+            }
+        } catch (Throwable) {
+        }
+
+        return null;
+    }
+
+    /**
+     * Pack `[$lead, rows]`, one length slot per text (-1 for a non-string), `$width` texts per row, then the texts after
+     * `$prefix`; null when the packed input would exceed W422_MAX_INPUT.
+     *
+     * @param  list<string|null>  $texts
+     */
+    public static function packW422Texts(int $lead, array $texts, string $prefix = '', int $width = 1): ?string
+    {
+        $size = 16 + \count($texts) * 8 + \strlen($prefix);
+        if ($width < 1 || \count($texts) % $width !== 0 || $size > self::W422_MAX_INPUT) {
+            return null;
+        }
+        $words = [$lead, intdiv(\count($texts), $width)];
+        $tail = [$prefix];
+        foreach ($texts as $text) {
+            if ($text === null) {
+                $words[] = -1;
+
+                continue;
+            }
+            $words[] = \strlen($text);
+            $tail[] = $text;
+            $size += \strlen($text);
+            if ($size > self::W422_MAX_INPUT) {
+                return null;
+            }
+        }
+
+        return pack('q*', ...$words).implode('', $tail);
+    }
+
+    /**
+     * Classify NZB source basenames: invalid (not a string), staged (stagedGuidPhp() names a GUID, whose byte lengths are
+     * summed and maximized), canonical (`<guid>.nzb` or `<guid>.nzb.gz` with a 1-40 character `[a-zA-Z0-9_-]` GUID) or other.
+     *
+     * @param  array<array-key, mixed>  $basenames
+     * @return array{names: int, invalid: int, staged: int, canonical: int, other: int, guid_bytes: int, max_guid_bytes: int}
+     */
+    public static function summarizeStagedNameBatch(array $basenames): array
+    {
+        return (self::usesW422RustFfi() ? self::summarizeStagedNameBatchNative($basenames) : null)
+            ?? self::summarizeStagedNameBatchPhp($basenames);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $basenames
+     * @return array{names: int, invalid: int, staged: int, canonical: int, other: int, guid_bytes: int, max_guid_bytes: int}
+     */
+    public static function summarizeStagedNameBatchPhp(array $basenames): array
+    {
+        $invalid = $staged = $canonical = $other = $bytes = $max = 0;
+        foreach ($basenames as $name) {
+            if (! \is_string($name)) {
+                $invalid++;
+            } elseif (($guid = self::stagedGuidPhp($name)) !== null) {
+                $staged++;
+                $bytes += \strlen($guid);
+                $max = max($max, \strlen($guid));
+            } elseif (preg_match(self::W422_CANONICAL_NAME, $name) === 1) {
+                $canonical++;
+            } else {
+                $other++;
+            }
+        }
+
+        return ['names' => \count($basenames), 'invalid' => $invalid, 'staged' => $staged, 'canonical' => $canonical, 'other' => $other,
+            'guid_bytes' => $bytes, 'max_guid_bytes' => $max];
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $basenames
+     * @return array{names: int, invalid: int, staged: int, canonical: int, other: int, guid_bytes: int, max_guid_bytes: int}|null
+     */
+    public static function summarizeStagedNameBatchNative(array $basenames): ?array
+    {
+        $texts = [];
+        foreach ($basenames as $name) {
+            $texts[] = \is_string($name) ? $name : null;
+        }
+        $input = self::packW422Texts(0, $texts);
+        $slots = $input === null ? null : self::evaluateW422Native(0, $input, 7);
+        if ($slots === null) {
+            return null;
+        }
+        [$count, $invalid, $staged, $canonical, $other, $bytes, $max] = $slots;
+        if ($count !== \count($basenames) || min($slots) < 0 || $invalid + $staged + $canonical + $other !== $count || $max > $bytes) {
+            return null;
+        }
+
+        return ['names' => $count, 'invalid' => $invalid, 'staged' => $staged, 'canonical' => $canonical, 'other' => $other,
+            'guid_bytes' => $bytes, 'max_guid_bytes' => $max];
+    }
 }

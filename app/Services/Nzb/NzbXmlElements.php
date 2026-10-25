@@ -216,4 +216,94 @@ final class NzbXmlElements
 
         return isset($containers[0]) ? $containers[0]->children($this->namespace)->{$element} : [];
     }
+
+    /**
+     * Default for the Wave 42.2 toggle only; it stays false because the paired benchmark in
+     * tests/Unit/RustNzbSourceGuardInstallStagingXmlPar2W42ParityTest.php is below 1.5x.
+     */
+    public const bool W422_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useW422RustFfi = null;
+
+    public static function useW422RustFfi(bool $enable = true): void
+    {
+        self::$useW422RustFfi = $enable;
+    }
+
+    public static function usesW422RustFfi(): bool
+    {
+        return self::$useW422RustFfi ?? self::W422_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW422RustFfi(): void
+    {
+        self::$useW422RustFfi = null;
+    }
+
+    /**
+     * Tally NZB metadata types: invalid (not a string), password (isPasswordMetadataPhp()), password_like (`password` in
+     * another case), empty or other. `rejected` counts the types validPasswordStructurePhp() refuses under $headCount heads.
+     *
+     * @param  array<array-key, mixed>  $types
+     * @return array{types: int, invalid: int, password: int, password_like: int, empty: int, other: int, rejected: int}
+     */
+    public static function summarizeMetadataTypes(array $types, int $headCount = 1): array
+    {
+        return (self::usesW422RustFfi() ? self::summarizeMetadataTypesNative($types, $headCount) : null)
+            ?? self::summarizeMetadataTypesPhp($types, $headCount);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $types
+     * @return array{types: int, invalid: int, password: int, password_like: int, empty: int, other: int, rejected: int}
+     */
+    public static function summarizeMetadataTypesPhp(array $types, int $headCount = 1): array
+    {
+        $invalid = $password = $like = $empty = $other = $rejected = 0;
+        foreach ($types as $type) {
+            if (! is_string($type)) {
+                $invalid++;
+
+                continue;
+            }
+            $isPassword = self::isPasswordMetadataPhp($type);
+            if ($isPassword) {
+                $password++;
+            } elseif (strtolower($type) === 'password') {
+                $like++;
+            } elseif ($type === '') {
+                $empty++;
+            } else {
+                $other++;
+            }
+            $rejected += self::validPasswordStructurePhp($headCount, $isPassword, false) ? 0 : 1;
+        }
+
+        return ['types' => count($types), 'invalid' => $invalid, 'password' => $password, 'password_like' => $like, 'empty' => $empty,
+            'other' => $other, 'rejected' => $rejected];
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $types
+     * @return array{types: int, invalid: int, password: int, password_like: int, empty: int, other: int, rejected: int}|null
+     */
+    public static function summarizeMetadataTypesNative(array $types, int $headCount = 1): ?array
+    {
+        $texts = [];
+        foreach ($types as $type) {
+            $texts[] = is_string($type) ? $type : null;
+        }
+        $input = NzbSourceGuard::packW422Texts($headCount, $texts);
+        $slots = $input === null ? null : NzbSourceGuard::evaluateW422Native(3, $input, 7);
+        if ($slots === null) {
+            return null;
+        }
+        [$count, $invalid, $password, $like, $empty, $other, $rejected] = $slots;
+        if ($count !== count($types) || min($slots) < 0 || $invalid + $password + $like + $empty + $other !== $count || $rejected > $password) {
+            return null;
+        }
+
+        return ['types' => $count, 'invalid' => $invalid, 'password' => $password, 'password_like' => $like, 'empty' => $empty,
+            'other' => $other, 'rejected' => $rejected];
+    }
 }

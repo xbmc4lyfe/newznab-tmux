@@ -214,4 +214,108 @@ final class NzbSourceInstallation
             unset(self::$pendingStaged[$this->staged]);
         }
     }
+
+    /**
+     * Default for the Wave 42.2 toggle only; it stays false because the paired benchmark in
+     * tests/Unit/RustNzbSourceGuardInstallStagingXmlPar2W42ParityTest.php is below 1.5x.
+     */
+    public const bool W422_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useW422RustFfi = null;
+
+    public static function useW422RustFfi(bool $enable = true): void
+    {
+        self::$useW422RustFfi = $enable;
+    }
+
+    public static function usesW422RustFfi(): bool
+    {
+        return self::$useW422RustFfi ?? self::W422_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW422RustFfi(): void
+    {
+        self::$useW422RustFfi = null;
+    }
+
+    /**
+     * Summarize installation path pairs (`source`, `destination`) the way normalizeSourcePathPairPhp() classifies one:
+     * invalid unless both are strings, otherwise unchanged (not staged), in_place (staged sibling) or relocated (staged
+     * elsewhere). `sibling` counts every sibling pair, `empty_paths` every pair with an empty path.
+     *
+     * @param  array<array-key, mixed>  $pairs
+     * @return array{pairs: int, invalid: int, unchanged: int, in_place: int, relocated: int, sibling: int, empty_paths: int}
+     */
+    public static function summarizeSourcePathPairs(array $pairs): array
+    {
+        return (self::usesW422RustFfi() ? self::summarizeSourcePathPairsNative($pairs) : null)
+            ?? self::summarizeSourcePathPairsPhp($pairs);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $pairs
+     * @return array{pairs: int, invalid: int, unchanged: int, in_place: int, relocated: int, sibling: int, empty_paths: int}
+     */
+    public static function summarizeSourcePathPairsPhp(array $pairs): array
+    {
+        $invalid = $unchanged = $inPlace = $relocated = $sibling = $empty = 0;
+        foreach ($pairs as $pair) {
+            [$source, $destination] = self::pathPairFields($pair);
+            if ($source === null || $destination === null) {
+                $invalid++;
+
+                continue;
+            }
+            $normalized = self::normalizeSourcePathPairPhp($source, $destination);
+            if (! $normalized['staged']) {
+                $unchanged++;
+            } elseif ($normalized['sibling']) {
+                $inPlace++;
+            } else {
+                $relocated++;
+            }
+            $sibling += $normalized['sibling'] ? 1 : 0;
+            $empty += $source === '' || $destination === '' ? 1 : 0;
+        }
+
+        return ['pairs' => \count($pairs), 'invalid' => $invalid, 'unchanged' => $unchanged, 'in_place' => $inPlace, 'relocated' => $relocated,
+            'sibling' => $sibling, 'empty_paths' => $empty];
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $pairs
+     * @return array{pairs: int, invalid: int, unchanged: int, in_place: int, relocated: int, sibling: int, empty_paths: int}|null
+     */
+    public static function summarizeSourcePathPairsNative(array $pairs): ?array
+    {
+        $texts = [];
+        foreach ($pairs as $pair) {
+            array_push($texts, ...self::pathPairFields($pair));
+        }
+        $input = NzbSourceGuard::packW422Texts(0, $texts, '', 2);
+        $slots = $input === null ? null : NzbSourceGuard::evaluateW422Native(1, $input, 7);
+        if ($slots === null) {
+            return null;
+        }
+        [$count, $invalid, $unchanged, $inPlace, $relocated, $sibling, $empty] = $slots;
+        if ($count !== \count($pairs) || min($slots) < 0 || $invalid + $unchanged + $inPlace + $relocated !== $count || $sibling > $count - $invalid
+            || $empty > $count - $invalid) {
+            return null;
+        }
+
+        return ['pairs' => $count, 'invalid' => $invalid, 'unchanged' => $unchanged, 'in_place' => $inPlace, 'relocated' => $relocated,
+            'sibling' => $sibling, 'empty_paths' => $empty];
+    }
+
+    /** @return array{string|null, string|null} both paths, each null unless it is a string */
+    private static function pathPairFields(mixed $pair): array
+    {
+        if (! \is_array($pair)) {
+            return [null, null];
+        }
+        $source = $pair['source'] ?? null;
+        $destination = $pair['destination'] ?? null;
+
+        return [\is_string($source) ? $source : null, \is_string($destination) ? $destination : null];
+    }
 }
