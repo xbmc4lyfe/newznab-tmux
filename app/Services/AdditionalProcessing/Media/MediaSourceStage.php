@@ -15,6 +15,7 @@ use App\Services\AdditionalProcessing\State\MediaByteBudget;
 use App\Services\AdditionalProcessing\State\ReleaseProcessingContext;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\File;
 use Throwable;
 
@@ -470,5 +471,163 @@ class MediaSourceStage
     private function expired(float $deadline): bool
     {
         return hrtime(true) / 1e9 >= $deadline;
+    }
+
+    // Rust is the default only while the paired W52.6 benchmark clears 1.5x on all four metrics.
+    private const bool W52_RUST_FFI_DEFAULT = true;
+
+    public const string W52_FFI_CDEF = <<<'C'
+        int32_t nntmux_w526_source_middle_volume_batch(const char *titles, size_t titles_len, const char *title_twin, size_t title_twin_len, const char *indexes, size_t indexes_len, size_t count, int64_t head, int32_t ascii_only, int64_t *out, size_t out_count);
+        C;
+
+    public const int W52_MIDDLE_HEADER = 4;
+
+    private const int W52_MAX_ITEMS = 1_048_576;
+
+    private static ?bool $w52RustFfi = null;
+
+    private static FFI|false|null $w52Ffi = null;
+
+    private static ?CData $w52Out = null;
+
+    private static int $w52Capacity = 0;
+
+    /**
+     * `middleVolume()` over archive candidates' titles and source indexes, with the full order.
+     *
+     * Candidates of `$headSourceIndex` are dropped (a missing source index is -1) and the rest
+     * sorted with a stable `strnatcasecmp()`. Layout: `[0]` count, `[1]` kept, `[2]` position of
+     * the middle kept title (-1 when none is kept), `[3]` FNV-1a digest; then per candidate its
+     * 1-based sorted position (0 when dropped).
+     *
+     * @param  array<array-key, string>  $titles
+     * @param  array<array-key, int>  $sourceIndexes
+     * @return list<int>
+     */
+    public static function middleVolumeBatch(array $titles, array $sourceIndexes, int $headSourceIndex): array
+    {
+        return (self::usesW52RustFfi() ? self::middleVolumeBatchNative($titles, $sourceIndexes, $headSourceIndex) : null)
+            ?? self::middleVolumeBatchPhp($titles, $sourceIndexes, $headSourceIndex);
+    }
+
+    /**
+     * @param  array<array-key, string>  $titles
+     * @param  array<array-key, int>  $sourceIndexes
+     * @return list<int>
+     */
+    public static function middleVolumeBatchPhp(array $titles, array $sourceIndexes, int $headSourceIndex): array
+    {
+        $titles = array_values($titles);
+        $sourceIndexes = array_values($sourceIndexes);
+        $count = \count($titles);
+        $order = [];
+        for ($index = 0; $index < $count; $index++) {
+            if (($sourceIndexes[$index] ?? -1) !== $headSourceIndex) {
+                $order[] = $index;
+            }
+        }
+        usort($order, static fn (int $a, int $b): int => strnatcasecmp($titles[$a], $titles[$b]));
+        $rows = $count > 0 ? array_fill(0, $count, 0) : [];
+        foreach ($order as $position => $index) {
+            $rows[$index] = $position + 1;
+        }
+        $digest = 2_166_136_261;
+        foreach ($rows as $row) {
+            $digest = (($digest ^ (($row ^ ($row >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+        }
+        $kept = \count($order);
+
+        return [$count, $kept, $kept > 0 ? $order[intdiv($kept, 2)] : -1, $digest, ...$rows];
+    }
+
+    /**
+     * Rust order, or null when PHP must compute it (unavailable library, a locale whose
+     * `strnatcasecmp()` is not byte-exact for these titles, or invalid input).
+     *
+     * @param  array<array-key, string>  $titles
+     * @param  array<array-key, int>  $sourceIndexes
+     * @return list<int>|null
+     */
+    public static function middleVolumeBatchNative(array $titles, array $sourceIndexes, int $headSourceIndex): ?array
+    {
+        // strnatcasecmp() follows LC_CTYPE: the C locale is byte-exact, C.UTF-8 only for ASCII.
+        $locale = setlocale(LC_CTYPE, '0');
+        $asciiOnly = $locale === 'C.UTF-8' || $locale === 'C.utf8';
+        if (! $asciiOnly && $locale !== 'C' && $locale !== 'POSIX') {
+            return null;
+        }
+        $count = \count($titles);
+        $fields = self::W52_MIDDLE_HEADER + $count;
+        $binding = $count <= self::W52_MAX_ITEMS ? self::w52Binding($fields) : null;
+        if ($binding === null) {
+            return null;
+        }
+        [$ffi, $out] = $binding;
+        $sourceIndexes = \count($sourceIndexes) === $count ? array_values($sourceIndexes) : array_pad(\array_slice(array_values($sourceIndexes), 0, $count), $count, -1);
+        $joined = implode("\0", $titles);
+        $twin = $count > 0 && substr_count($joined, "\0") !== $count - 1 ? implode("\x01", $titles) : '';
+        $indexes = pack('q*', ...$sourceIndexes);
+        try {
+            // @phpstan-ignore method.notFound
+            $status = $ffi->nntmux_w526_source_middle_volume_batch(
+                $joined, \strlen($joined), $twin, \strlen($twin), $indexes, \strlen($indexes), $count,
+                $headSourceIndex, $asciiOnly ? 1 : 0, $out, $fields,
+            );
+            if ($status !== 1) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $fields * 8));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Run `$callback` with the Wave 52.6 Rust batch path forced on or off, then restore the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW52RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$w52RustFfi;
+        self::$w52RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$w52RustFfi = $previous;
+        }
+    }
+
+    public static function usesW52RustFfi(): bool
+    {
+        return self::$w52RustFfi ?? self::W52_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * The cached Wave 52.6 binding and an output buffer of at least `$fields` values, or null.
+     *
+     * @return array{0: FFI, 1: CData}|null
+     */
+    private static function w52Binding(int $fields): ?array
+    {
+        try {
+            self::$w52Ffi ??= RustPipelineLibrary::resolveDomain('additional_w52', self::W52_FFI_CDEF) ?? false;
+            if (self::$w52Ffi === false) {
+                return null;
+            }
+            if (self::$w52Out === null || self::$w52Capacity < $fields) {
+                self::$w52Capacity = max(256, $fields);
+                self::$w52Out = self::$w52Ffi->new('int64_t['.self::$w52Capacity.']');
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        return [self::$w52Ffi, self::$w52Out];
     }
 }
