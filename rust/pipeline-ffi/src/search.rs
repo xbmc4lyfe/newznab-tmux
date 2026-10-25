@@ -23178,3 +23178,508 @@ mod wave32_5_passkey_reindex_proxy_mcp {
         }
     }
 }
+/// Wave 33.5: passkey credential lookup ids, alternate NNTP configuration
+/// classification, AJAX profile responses, API inform request parameters
+/// and MCP server capability summaries. Every mode mirrors a PHP `*Php`
+/// helper byte for byte; anything outside the exact subset handled here
+/// declines so PHP falls back.
+mod wave33_5_passkey_auth_admin_inform_mcp {
+    const DECLINE: isize = -1;
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+    const MAX_PARTS: usize = 100_000;
+    /// Bytes stripped by PHP's default `trim()`.
+    const PHP_TRIM: &[u8] = b" \t\n\r\0\x0B";
+    const BASE64URL: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const LOCAL_HOSTS: [&[u8]; 4] = [b"localhost", b"127.0.0.1", b"::1", b"[::1]"];
+    const COMPRESSION_ON: [&[u8]; 4] = [b"1", b"true", b"yes", b"on"];
+
+    fn unpack(input: &[u8]) -> Option<Vec<&[u8]>> {
+        let count = u32::from_le_bytes(input.get(..4)?.try_into().ok()?) as usize;
+        if count > MAX_PARTS || count > (input.len() - 4) / 4 {
+            return None;
+        }
+        let mut cursor = 4usize;
+        let mut parts = Vec::with_capacity(count);
+        for _ in 0..count {
+            let length_end = cursor.checked_add(4)?;
+            let length =
+                u32::from_le_bytes(input.get(cursor..length_end)?.try_into().ok()?) as usize;
+            let end = length_end.checked_add(length)?;
+            parts.push(input.get(length_end..end)?);
+            cursor = end;
+        }
+        (cursor == input.len()).then_some(parts)
+    }
+
+    fn pack(parts: &[Vec<u8>]) -> Option<Vec<u8>> {
+        let count = u32::try_from(parts.len()).ok()?;
+        let size = parts.iter().try_fold(4usize, |size, part| {
+            u32::try_from(part.len()).ok()?;
+            size.checked_add(4)?.checked_add(part.len())
+        })?;
+        if size > isize::MAX as usize {
+            return None;
+        }
+        let mut out = Vec::with_capacity(size);
+        out.extend_from_slice(&count.to_le_bytes());
+        for part in parts {
+            out.extend_from_slice(&(part.len() as u32).to_le_bytes());
+            out.extend_from_slice(part);
+        }
+        Some(out)
+    }
+
+    /// Canonical decimal produced by PHP `(string) $int`.
+    fn integer(bytes: &[u8]) -> Option<i64> {
+        let value: i64 = std::str::from_utf8(bytes).ok()?.parse().ok()?;
+        (value.to_string().as_bytes() == bytes).then_some(value)
+    }
+
+    fn flag(bytes: &[u8]) -> Option<bool> {
+        match bytes {
+            b"0" => Some(false),
+            b"1" => Some(true),
+            _ => None,
+        }
+    }
+
+    fn bool_bytes(value: bool) -> Vec<u8> {
+        if value { b"1" } else { b"0" }.to_vec()
+    }
+
+    fn php_trim(bytes: &[u8]) -> &[u8] {
+        let start = bytes
+            .iter()
+            .position(|b| !PHP_TRIM.contains(b))
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|b| !PHP_TRIM.contains(b))
+            .map_or(start, |i| i + 1);
+        &bytes[start..end]
+    }
+
+    /// PHP `rtrim(strtr(base64_encode($raw), '+/', '-_'), '=')`.
+    fn base64url(raw: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(raw.len().div_ceil(3) * 4);
+        for chunk in raw.chunks(3) {
+            let b = [
+                chunk[0],
+                chunk.get(1).copied().unwrap_or(0),
+                chunk.get(2).copied().unwrap_or(0),
+            ];
+            let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+            let symbols = chunk.len() + 1;
+            for i in 0..symbols {
+                out.push(BASE64URL[((n >> (18 - 6 * i)) & 0x3f) as usize]);
+            }
+        }
+        out
+    }
+
+    /// PHP `$a > PHP_INT_MAX - $b ? PHP_INT_MAX : $a + $b` for non-negatives.
+    fn saturating_sum(values: &[i64]) -> i64 {
+        values
+            .iter()
+            .fold(0i64, |total, value| total.saturating_add(*value))
+    }
+
+    fn plural(count: i64, noun: &str) -> String {
+        if count == 1 {
+            format!("{count} {noun}")
+        } else {
+            format!("{count} {noun}s")
+        }
+    }
+
+    fn transform(mode: u32, parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        Some(match mode {
+            // [raw_credential_id] -> [credential_id, byte_length, valid].
+            1 => {
+                let [raw] = parts else {
+                    return None;
+                };
+                vec![
+                    base64url(raw),
+                    raw.len().to_string().into_bytes(),
+                    bool_bytes((16..=1023).contains(&raw.len())),
+                ]
+            }
+            // [host, compression, use_ssl] ->
+            // [configured, host, transport, default_port, compression, classification].
+            2 => {
+                let [host, compression, use_ssl] = parts else {
+                    return None;
+                };
+                let use_ssl = flag(use_ssl)?;
+                let host = php_trim(host).to_ascii_lowercase();
+                let compression = php_trim(compression).to_ascii_lowercase();
+                let configured = !host.is_empty();
+                let classification: &[u8] = if !configured {
+                    b"disabled"
+                } else if LOCAL_HOSTS.contains(&host.as_slice()) {
+                    b"local"
+                } else if use_ssl {
+                    b"secure"
+                } else {
+                    b"plaintext"
+                };
+                vec![
+                    bool_bytes(configured),
+                    host,
+                    if use_ssl { &b"ssl"[..] } else { b"plain" }.to_vec(),
+                    if use_ssl { &b"563"[..] } else { b"119" }.to_vec(),
+                    bool_bytes(COMPRESSION_ON.contains(&compression.as_slice())),
+                    classification.to_vec(),
+                ]
+            }
+            // [succeeded, success_message, error_message] -> [success, status, message].
+            3 => {
+                let [succeeded, success, error] = parts else {
+                    return None;
+                };
+                let succeeded = flag(succeeded)?;
+                let message = if succeeded { success } else { error };
+                let message = if php_trim(message).is_empty() {
+                    if succeeded {
+                        &b"Request completed."[..]
+                    } else {
+                        b"Request failed."
+                    }
+                } else {
+                    message
+                };
+                vec![
+                    bool_bytes(succeeded),
+                    if succeeded { &b"success"[..] } else { b"error" }.to_vec(),
+                    message.to_vec(),
+                ]
+            }
+            // [relo, relp, api_token] -> [relo, relp, api_token, complete]
+            // where PHP `empty()` strings ("" and "0") become "".
+            4 => {
+                let [relo, relp, token] = parts else {
+                    return None;
+                };
+                let keep = |value: &[u8]| -> Vec<u8> {
+                    if value.is_empty() || value == b"0" {
+                        Vec::new()
+                    } else {
+                        value.to_vec()
+                    }
+                };
+                let (relo, relp, token) = (keep(relo), keep(relp), keep(token));
+                let complete = !relo.is_empty() && !relp.is_empty() && !token.is_empty();
+                vec![relo, relp, token, bool_bytes(complete)]
+            }
+            // [tools, resources, prompts] ->
+            // [tools, resources, prompts, total, empty, summary].
+            5 => {
+                let [tools, resources, prompts] = parts else {
+                    return None;
+                };
+                let tools = integer(tools)?.max(0);
+                let resources = integer(resources)?.max(0);
+                let prompts = integer(prompts)?.max(0);
+                let total = saturating_sum(&[tools, resources, prompts]);
+                let summary = format!(
+                    "{}, {}, {}",
+                    plural(tools, "tool"),
+                    plural(resources, "resource"),
+                    plural(prompts, "prompt")
+                );
+                vec![
+                    tools.to_string().into_bytes(),
+                    resources.to_string().into_bytes(),
+                    prompts.to_string().into_bytes(),
+                    total.to_string().into_bytes(),
+                    bool_bytes(total == 0),
+                    summary.into_bytes(),
+                ]
+            }
+            _ => return None,
+        })
+    }
+
+    /// Dispatch count-prefixed, length-prefixed byte strings (little-endian
+    /// u32). Returns written bytes, `-needed` when `cap` is too small, or `-1`
+    /// for invalid input. Failure never writes to the output buffer. Results
+    /// are at least four bytes, so `-1` never means "one byte needed".
+    ///
+    /// # Safety
+    /// Non-null pointers must refer to readable/writable allocations of the
+    /// declared lengths. Null pointers require zero length/capacity. Input and
+    /// output may overlap; the result is fully owned before any output write.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w33_passkey_auth_admin_inform_mcp(
+        mode: u32,
+        input: *const u8,
+        input_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        std::panic::catch_unwind(|| {
+            if input_len > MAX_INPUT
+                || cap > isize::MAX as usize
+                || (input.is_null() && input_len != 0)
+                || (out.is_null() && cap != 0)
+            {
+                return DECLINE;
+            }
+            let input = if input_len == 0 {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(input, input_len) }
+            };
+            let Some(parts) = unpack(input) else {
+                return DECLINE;
+            };
+            let Some(result) = transform(mode, &parts).and_then(|parts| pack(&parts)) else {
+                return DECLINE;
+            };
+            if cap < result.len() || out.is_null() {
+                return -(result.len() as isize);
+            }
+            unsafe { std::ptr::copy(result.as_ptr(), out, result.len()) };
+            result.len() as isize
+        })
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn packet(parts: &[&[u8]]) -> Vec<u8> {
+            pack(&parts.iter().map(|part| part.to_vec()).collect::<Vec<_>>()).unwrap()
+        }
+
+        fn call(mode: u32, parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+            let input = packet(parts);
+            let mut out = vec![0u8; input.len() * 2 + 512];
+            let written = unsafe {
+                nntmux_w33_passkey_auth_admin_inform_mcp(
+                    mode,
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            if written < 0 {
+                return None;
+            }
+            out.truncate(written as usize);
+            Some(unpack(&out)?.into_iter().map(<[u8]>::to_vec).collect())
+        }
+
+        fn strings(items: &[&str]) -> Vec<Vec<u8>> {
+            items.iter().map(|item| item.as_bytes().to_vec()).collect()
+        }
+
+        #[test]
+        fn credential_id_base64url_and_validity() {
+            assert_eq!(call(1, &[b""]).unwrap(), strings(&["", "0", "0"]));
+            assert_eq!(call(1, &[b"f"]).unwrap(), strings(&["Zg", "1", "0"]));
+            assert_eq!(call(1, &[b"fo"]).unwrap(), strings(&["Zm8", "2", "0"]));
+            assert_eq!(call(1, &[b"foo"]).unwrap(), strings(&["Zm9v", "3", "0"]));
+            assert_eq!(
+                call(1, &[b"\xfb\xff\xfe\x00\x3e\x3f"]).unwrap(),
+                strings(&["-__-AD4_", "6", "0"])
+            );
+            let sixteen = [0xabu8; 16];
+            assert_eq!(
+                call(1, &[&sixteen]).unwrap()[1..],
+                strings(&["16", "1"])[..]
+            );
+            let max = vec![7u8; 1023];
+            assert_eq!(call(1, &[&max]).unwrap()[2], b"1".to_vec());
+            let over = vec![7u8; 1024];
+            assert_eq!(call(1, &[&over]).unwrap()[1..], strings(&["1024", "0"])[..]);
+            assert_eq!(call(1, &[]), None);
+            assert_eq!(call(1, &[b"a", b"b"]), None);
+        }
+
+        #[test]
+        fn nntp_classification() {
+            assert_eq!(
+                call(2, &[b"  News.Example.COM \n", b" YES ", b"1"]).unwrap(),
+                strings(&["1", "news.example.com", "ssl", "563", "1", "secure"])
+            );
+            assert_eq!(
+                call(2, &[b"news.example.com", b"0", b"0"]).unwrap(),
+                strings(&["1", "news.example.com", "plain", "119", "0", "plaintext"])
+            );
+            assert_eq!(
+                call(2, &[b"\t\0", b"on", b"0"]).unwrap(),
+                strings(&["0", "", "plain", "119", "1", "disabled"])
+            );
+            for host in [&b"LocalHost"[..], b"127.0.0.1", b"::1", b"[::1]"] {
+                assert_eq!(call(2, &[host, b"", b"1"]).unwrap()[5], b"local".to_vec());
+            }
+            assert_eq!(
+                call(2, &[b"h", b"enabled", b"1"]).unwrap()[4],
+                b"0".to_vec()
+            );
+            assert_eq!(
+                call(2, &[b"\xc3\x89H", b"", b"1"]).unwrap()[1],
+                b"\xc3\x89h".to_vec()
+            );
+            assert_eq!(call(2, &[b"h", b"", b"2"]), None);
+            assert_eq!(call(2, &[b"h", b""]), None);
+        }
+
+        #[test]
+        fn profile_response_defaults() {
+            assert_eq!(
+                call(3, &[b"1", b"Invite sent.", b""]).unwrap(),
+                strings(&["1", "success", "Invite sent."])
+            );
+            assert_eq!(
+                call(3, &[b"0", b"ignored", b"Invite not sent."]).unwrap(),
+                strings(&["0", "error", "Invite not sent."])
+            );
+            assert_eq!(
+                call(3, &[b"0", b"x", b" \n"]).unwrap(),
+                strings(&["0", "error", "Request failed."])
+            );
+            assert_eq!(
+                call(3, &[b"1", b"", b"x"]).unwrap(),
+                strings(&["1", "success", "Request completed."])
+            );
+            assert_eq!(
+                call(3, &[b"1", b" keep \n", b""]).unwrap()[2],
+                b" keep \n".to_vec()
+            );
+            assert_eq!(call(3, &[b"true", b"", b""]), None);
+            assert_eq!(call(3, &[b"1", b""]), None);
+        }
+
+        #[test]
+        fn inform_params_empty_semantics() {
+            assert_eq!(
+                call(4, &[b"Old.Name", b"New.Name", b"tok"]).unwrap(),
+                strings(&["Old.Name", "New.Name", "tok", "1"])
+            );
+            assert_eq!(
+                call(4, &[b"0", b"New", b"tok"]).unwrap(),
+                strings(&["", "New", "tok", "0"])
+            );
+            assert_eq!(
+                call(4, &[b" ", b"00", b""]).unwrap(),
+                strings(&[" ", "00", "", "0"])
+            );
+            assert_eq!(call(4, &[b"a", b"b"]), None);
+        }
+
+        #[test]
+        fn capability_summary_counts() {
+            assert_eq!(
+                call(5, &[b"5", b"2", b"2"]).unwrap(),
+                strings(&["5", "2", "2", "9", "0", "5 tools, 2 resources, 2 prompts"])
+            );
+            assert_eq!(
+                call(5, &[b"1", b"1", b"0"]).unwrap()[5],
+                b"1 tool, 1 resource, 0 prompts".to_vec()
+            );
+            assert_eq!(
+                call(5, &[b"-3", b"0", b"-9223372036854775808"]).unwrap()[3..5],
+                strings(&["0", "1"])[..]
+            );
+            assert_eq!(
+                call(5, &[b"9223372036854775807", b"9223372036854775807", b"1"]).unwrap()[3],
+                b"9223372036854775807".to_vec()
+            );
+            assert_eq!(call(5, &[b"+1", b"0", b"0"]), None);
+            assert_eq!(call(5, &[b"01", b"0", b"0"]), None);
+            assert_eq!(call(5, &[b"1", b"0"]), None);
+        }
+
+        #[test]
+        fn malformed_null_and_capacity() {
+            let input = packet(&[b"1", b"2", b"3"]);
+            let mut out = [0x5a_u8; 128];
+            for (ptr, len, dst, cap) in [
+                (std::ptr::null(), 1, out.as_mut_ptr(), out.len()),
+                (input.as_ptr(), input.len(), std::ptr::null_mut(), 8),
+                (input.as_ptr(), MAX_INPUT + 1, out.as_mut_ptr(), out.len()),
+                (input.as_ptr(), input.len(), out.as_mut_ptr(), usize::MAX),
+            ] {
+                assert_eq!(
+                    unsafe { nntmux_w33_passkey_auth_admin_inform_mcp(5, ptr, len, dst, cap) },
+                    DECLINE
+                );
+            }
+            for bad in [
+                vec![],
+                vec![1, 0, 0],
+                vec![1, 0, 0, 0, 9, 0, 0, 0],
+                vec![0, 0, 0, 0, 0],
+            ] {
+                assert_eq!(
+                    unsafe {
+                        nntmux_w33_passkey_auth_admin_inform_mcp(
+                            5,
+                            bad.as_ptr(),
+                            bad.len(),
+                            out.as_mut_ptr(),
+                            out.len(),
+                        )
+                    },
+                    DECLINE
+                );
+            }
+            for mode in [0u32, 6, 99] {
+                assert_eq!(
+                    unsafe {
+                        nntmux_w33_passkey_auth_admin_inform_mcp(
+                            mode,
+                            input.as_ptr(),
+                            input.len(),
+                            out.as_mut_ptr(),
+                            out.len(),
+                        )
+                    },
+                    DECLINE
+                );
+            }
+            assert_eq!(out, [0x5a; 128]);
+            let full = call(5, &[b"1", b"2", b"3"])
+                .map(|parts| pack(&parts).unwrap().len())
+                .unwrap();
+            for cap in [0usize, 1, full - 1] {
+                let dst = if cap == 0 {
+                    std::ptr::null_mut()
+                } else {
+                    out.as_mut_ptr()
+                };
+                assert_eq!(
+                    unsafe {
+                        nntmux_w33_passkey_auth_admin_inform_mcp(
+                            5,
+                            input.as_ptr(),
+                            input.len(),
+                            dst,
+                            cap,
+                        )
+                    },
+                    -(full as isize)
+                );
+            }
+            assert_eq!(out, [0x5a; 128]);
+            let mut alias = input.clone();
+            alias.resize(full.max(input.len()), 0);
+            let written = unsafe {
+                nntmux_w33_passkey_auth_admin_inform_mcp(
+                    5,
+                    alias.as_ptr(),
+                    input.len(),
+                    alias.as_mut_ptr(),
+                    alias.len(),
+                )
+            };
+            assert_eq!(written, full as isize);
+        }
+    }
+}
