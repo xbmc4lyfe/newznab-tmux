@@ -43591,3 +43591,789 @@ mod w444_tests {
         }
     }
 }
+
+pub mod w454_metadata {
+    use super::{PhpKey, PhpNode, PhpSerParser, PhpSerWriter};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+
+    unsafe fn dispatch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+        summarize: fn(&[u8]) -> Option<Vec<u8>>,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if input.is_null()
+                || out.is_null()
+                || len > MAX_INPUT
+                || len > isize::MAX as usize
+                || cap > isize::MAX as usize
+            {
+                return -1;
+            }
+            let Some(input_end) = (input as usize).checked_add(len) else {
+                return -1;
+            };
+            let Some(out_end) = (out as usize).checked_add(cap) else {
+                return -1;
+            };
+            if len != 0 && cap != 0 && (input as usize) < out_end && (out as usize) < input_end {
+                return -1;
+            }
+            // Both spans and their overlap are checked before borrowing caller memory.
+            let input = unsafe { std::slice::from_raw_parts(input, len) };
+            let Some(result) = summarize(input) else {
+                return -1;
+            };
+            let Ok(needed) = isize::try_from(result.len()) else {
+                return -1;
+            };
+            if result.len() > cap {
+                return -needed;
+            }
+            unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), out, result.len()) };
+            needed
+        }))
+        .unwrap_or(-1)
+    }
+
+    fn is_list(node: &PhpNode<'_>) -> bool {
+        node.is_arr()
+            && node
+                .items()
+                .iter()
+                .enumerate()
+                .all(|(i, (key, _))| *key == PhpKey::Int(i as i64))
+    }
+
+    /// Decodes `[list<string>]` and writes `keys => counts`; entries reach
+    /// `classify` untrimmed so it can tell padded titles apart.
+    fn summarize<const COUNTS: usize>(
+        input: &[u8],
+        keys: [&[u8]; COUNTS],
+        mut classify: impl FnMut(&[u8]) -> [bool; COUNTS],
+    ) -> Option<Vec<u8>> {
+        let doc = PhpSerParser::parse_document(input)?;
+        if !is_list(&doc) || doc.items().len() != 1 {
+            return None;
+        }
+        let rows = &doc.items()[0].1;
+        if !is_list(rows) {
+            return None;
+        }
+        let mut counts = [0i64; COUNTS];
+        for (_, row) in rows.items() {
+            for (count, matched) in counts.iter_mut().zip(classify(row.as_str()?)) {
+                *count += i64::from(matched);
+            }
+        }
+        let mut w = PhpSerWriter::new();
+        w.arr_open(COUNTS);
+        for (key, count) in keys.into_iter().zip(counts) {
+            w.key(key);
+            w.int(count);
+        }
+        w.arr_close();
+        Some(w.buf)
+    }
+
+    /// PHP trim(): space, tab, LF, CR, NUL and vertical tab (not form feed).
+    fn trim(value: &[u8]) -> &[u8] {
+        let is_trim = |b: &u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b);
+        let start = value
+            .iter()
+            .position(|b| !is_trim(b))
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|b| !is_trim(b))
+            .map_or(start, |i| i + 1);
+        &value[start..end]
+    }
+
+    const WORD: u8 = 1;
+    const SPACE: u8 = 2;
+
+    /// PCRE `\w` and `\s` byte classes without UTF mode.
+    const BYTE_CLASS: [u8; 256] = {
+        let mut table = [0u8; 256];
+        let mut b = 0;
+        while b < 256 {
+            let c = b as u8;
+            if c.is_ascii_alphanumeric() || c == b'_' {
+                table[b] = WORD;
+            } else if matches!(c, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') {
+                table[b] = SPACE;
+            }
+            b += 1;
+        }
+        table
+    };
+
+    #[inline(always)]
+    fn is_space(b: u8) -> bool {
+        BYTE_CLASS[b as usize] == SPACE
+    }
+
+    #[inline(always)]
+    fn is_word(b: u8) -> bool {
+        BYTE_CLASS[b as usize] == WORD
+    }
+
+    fn wb_before(value: &[u8], at: usize) -> bool {
+        at == 0 || !is_word(value[at - 1])
+    }
+
+    fn wb_after(value: &[u8], at: usize) -> bool {
+        value.get(at).is_none_or(|b| !is_word(*b))
+    }
+
+    /// `hay[at..]` starts with `prefix`, ASCII case-insensitively.
+    fn starts_ci(hay: &[u8], at: usize, prefix: &[u8]) -> bool {
+        hay.get(at..at + prefix.len())
+            .is_some_and(|s| s.eq_ignore_ascii_case(prefix))
+    }
+
+    fn digit_run(value: &[u8], at: usize) -> usize {
+        value
+            .get(at..)
+            .map_or(0, |s| s.iter().take_while(|b| b.is_ascii_digit()).count())
+    }
+
+    fn trailing_digits(value: &[u8]) -> usize {
+        value
+            .iter()
+            .rev()
+            .take_while(|b| b.is_ascii_digit())
+            .count()
+    }
+
+    /// Calls `visit(start, run, key)` for each maximal `\w` run, where `key` is
+    /// the packed uppercase run, or 0 when the run exceeds 16 bytes.
+    #[inline(always)]
+    fn for_each_word(value: &[u8], mut visit: impl FnMut(usize, &[u8], u128)) {
+        let mut i = 0;
+        while i < value.len() {
+            if !is_word(value[i]) {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            let mut key = 0u128;
+            while i < value.len() && is_word(value[i]) {
+                key = (key << 8) | u128::from(value[i].to_ascii_uppercase());
+                i += 1;
+            }
+            let key = if i - start > 16 { 0 } else { key };
+            visit(start, &value[start..i], key);
+        }
+    }
+
+    /// ASCII-uppercased big-endian packing of a `\w` token; `\w` bytes are never
+    /// zero, so tokens of up to 16 bytes map to distinct keys.
+    const fn pack(token: &[u8]) -> u128 {
+        let mut key = 0u128;
+        let mut i = 0;
+        while i < token.len() {
+            key = (key << 8) | token[i].to_ascii_uppercase() as u128;
+            i += 1;
+        }
+        key
+    }
+
+    /// Keyword table sorted by packed key at compile time for binary search.
+    const fn keyword_table<const N: usize>(words: [(&[u8], u8); N]) -> [(u128, u8); N] {
+        let mut table = [(0u128, 0u8); N];
+        let mut i = 0;
+        while i < N {
+            table[i] = (pack(words[i].0), words[i].1);
+            let mut j = i;
+            while j > 0 && table[j - 1].0 > table[j].0 {
+                let swap = table[j - 1];
+                table[j - 1] = table[j];
+                table[j] = swap;
+                j -= 1;
+            }
+            i += 1;
+        }
+        table
+    }
+
+    /// Duplicate keywords would make the binary search ambiguous.
+    const fn strictly_sorted(table: &[(u128, u8)]) -> bool {
+        let mut i = 1;
+        while i < table.len() {
+            if table[i - 1].0 >= table[i].0 {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+
+    /// Class bits of a packed `\w` run, or 0.
+    #[inline(always)]
+    fn keyword_class(table: &[(u128, u8)], key: u128) -> u8 {
+        table
+            .binary_search_by_key(&key, |entry| entry.0)
+            .map_or(0, |i| table[i].1)
+    }
+
+    // predb.club/.net/.org/.ovh: release titles as parseRows() keeps them.
+
+    const RESOLUTION: u8 = 1;
+    const SCENE_TAG: u8 = 2;
+
+    /// `\b(?:480|576|720|1080|2160)[pi]\b` and `\b(?:PROPER|...|REAL)\b` words.
+    const PREDB_KEYWORDS: [(u128, u8); 19] = keyword_table([
+        (b"480P", RESOLUTION),
+        (b"480I", RESOLUTION),
+        (b"576P", RESOLUTION),
+        (b"576I", RESOLUTION),
+        (b"720P", RESOLUTION),
+        (b"720I", RESOLUTION),
+        (b"1080P", RESOLUTION),
+        (b"1080I", RESOLUTION),
+        (b"2160P", RESOLUTION),
+        (b"2160I", RESOLUTION),
+        (b"PROPER", SCENE_TAG),
+        (b"REPACK", SCENE_TAG),
+        (b"INTERNAL", SCENE_TAG),
+        (b"READNFO", SCENE_TAG),
+        (b"DIRFIX", SCENE_TAG),
+        (b"NFOFIX", SCENE_TAG),
+        (b"SUBFIX", SCENE_TAG),
+        (b"RERIP", SCENE_TAG),
+        (b"REAL", SCENE_TAG),
+    ]);
+
+    const _: () = assert!(strictly_sorted(&PREDB_KEYWORDS));
+
+    /// `\bS\d{1,3}E\d{1,4}\b`, case-insensitive.
+    fn predb_episode_at(t: &[u8], i: usize) -> bool {
+        if !matches!(t[i], b's' | b'S') || !wb_before(t, i) {
+            return false;
+        }
+        let n = digit_run(t, i + 1);
+        if !(1..=3).contains(&n) || !t.get(i + 1 + n).is_some_and(|b| matches!(b, b'e' | b'E')) {
+            return false;
+        }
+        let at = i + 2 + n;
+        let m = digit_run(t, at);
+        (1..=4).contains(&m) && wb_after(t, at + m)
+    }
+
+    fn predb_feed_titles(input: &[u8]) -> Option<Vec<u8>> {
+        summarize(
+            input,
+            [
+                b"total_titles",
+                b"empty_title_count",
+                b"padded_title_count",
+                b"group_suffix_count",
+                b"dotted_count",
+                b"episode_count",
+                b"resolution_count",
+                b"scene_tag_count",
+                b"non_ascii_count",
+                b"control_char_count",
+                b"overlong_count",
+            ],
+            |raw| {
+                let mut flags = [false; 11];
+                flags[0] = true;
+                let t = trim(raw);
+                if t.is_empty() {
+                    flags[1] = true;
+                    return flags;
+                }
+                flags[2] = t.len() != raw.len();
+                // `-\w+\z`: the trailing word run follows a dash.
+                let tail = t.iter().rev().take_while(|b| is_word(**b)).count();
+                flags[3] = tail > 0 && tail < t.len() && t[t.len() - tail - 1] == b'-';
+                flags[4] = !t.iter().any(|b| is_space(*b)) && t.contains(&b'.');
+                for_each_word(t, |start, _, key| {
+                    let class = keyword_class(&PREDB_KEYWORDS, key);
+                    flags[6] |= class & RESOLUTION != 0;
+                    flags[7] |= class & SCENE_TAG != 0;
+                    // An `S` inside a run never follows a boundary, so run starts suffice.
+                    flags[5] = flags[5] || predb_episode_at(t, start);
+                });
+                flags[8] = !t.is_ascii();
+                flags[9] = t.iter().any(|b| *b <= 0x1f || *b == 0x7f);
+                flags[10] = t.len() > 255;
+                flags
+            },
+        )
+    }
+
+    // AnidbService: cleanTitlePhp() tag families on raw (pre-fixEncoding) titles.
+
+    const LANGUAGE: u8 = 1;
+    const ADULT: u8 = 2;
+    const QUALITY: u8 = 4;
+    const RELEASE: u8 = 8;
+    /// First word of `Blu-Ray`, which needs its dash and second word checked.
+    const BLU: u8 = 16;
+
+    /// cleanTitlePhp() keyword families; `Mosaic-less` always matches as `Mosaic` first.
+    const ANIDB_KEYWORDS: [(u128, u8); 54] = keyword_table([
+        (b"ENG", LANGUAGE),
+        (b"JAP", LANGUAGE),
+        (b"JPN", LANGUAGE),
+        (b"SUB", LANGUAGE),
+        (b"DUB", LANGUAGE),
+        (b"MULTI", LANGUAGE),
+        (b"RAW", LANGUAGE),
+        (b"HARDSUB", LANGUAGE),
+        (b"SOFTSUB", LANGUAGE),
+        (b"HARDDUB", LANGUAGE),
+        (b"SOFTDUB", LANGUAGE),
+        (b"ITA", LANGUAGE),
+        (b"SPA", LANGUAGE),
+        (b"FRE", LANGUAGE),
+        (b"GER", LANGUAGE),
+        (b"RUS", LANGUAGE),
+        (b"CHI", LANGUAGE),
+        (b"KOR", LANGUAGE),
+        (b"JAV", ADULT),
+        (b"UNCENSORED", ADULT),
+        (b"CENSORED", ADULT),
+        (b"MOSAIC", ADULT),
+        (b"HD", ADULT),
+        (b"SD", ADULT),
+        (b"FHD", ADULT),
+        (b"UHD", ADULT),
+        (b"480P", QUALITY),
+        (b"720P", QUALITY),
+        (b"1080P", QUALITY),
+        (b"2160P", QUALITY),
+        (b"4K", QUALITY),
+        (b"BD", QUALITY),
+        (b"BDRIP", QUALITY),
+        (b"BLURAY", QUALITY),
+        (b"HEVC", QUALITY),
+        (b"X264", QUALITY),
+        (b"X265", QUALITY),
+        (b"H264", QUALITY),
+        (b"H265", QUALITY),
+        (b"WEB", QUALITY),
+        (b"WEBRIP", QUALITY),
+        (b"DVDRIP", QUALITY),
+        (b"TVRIP", QUALITY),
+        (b"BLU", BLU),
+        (b"PROPER", RELEASE),
+        (b"REPACK", RELEASE),
+        (b"RIP", RELEASE),
+        (b"ISO", RELEASE),
+        (b"CRACK", RELEASE),
+        (b"BETA", RELEASE),
+        (b"ALPHA", RELEASE),
+        (b"FINAL", RELEASE),
+        (b"COMPLETE", RELEASE),
+        (b"FULL", RELEASE),
+    ]);
+
+    const _: () = assert!(strictly_sorted(&ANIDB_KEYWORDS));
+
+    /// `\[[^\]]+\]` (or the parenthesised form): some opener has a non-empty span before its closer.
+    fn enclosed_tag(t: &[u8], open: u8, close: u8) -> bool {
+        let mut i = 0;
+        while let Some(at) = t[i..].iter().position(|b| *b == open) {
+            let start = i + at + 1;
+            match t[start..].iter().position(|b| *b == close) {
+                Some(0) => i = start,
+                Some(_) => return true,
+                None => return false,
+            }
+        }
+        false
+    }
+
+    /// `\sE(?:p(?:isode)?)?\s*0*\d{1,4}\z`, case-insensitive.
+    fn anidb_episode_suffix(t: &[u8]) -> bool {
+        let n = trailing_digits(t);
+        let p = t.len() - n;
+        // 0* absorbs leading zeros, leaving one to four digits before the end.
+        let zeros = t[p..].iter().take_while(|b| **b == b'0').count();
+        if n == 0 || n - zeros.min(n - 1) > 4 {
+            return false;
+        }
+        let mut q = p;
+        while q > 0 && is_space(t[q - 1]) {
+            q -= 1;
+        }
+        [&b"e"[..], b"ep", b"episode"].iter().any(|word| {
+            q > word.len() && starts_ci(t, q - word.len(), word) && is_space(t[q - word.len() - 1])
+        })
+    }
+
+    /// `\s(?:Vol|Ch)\.?\s*\d*\z`, case-insensitive.
+    fn anidb_volume_suffix(t: &[u8]) -> bool {
+        let mut q = t.len() - trailing_digits(t);
+        while q > 0 && is_space(t[q - 1]) {
+            q -= 1;
+        }
+        if q > 0 && t[q - 1] == b'.' {
+            q -= 1;
+        }
+        [&b"vol"[..], b"ch"].iter().any(|word| {
+            q > word.len() && starts_ci(t, q - word.len(), word) && is_space(t[q - word.len() - 1])
+        })
+    }
+
+    fn anidb_titles(input: &[u8]) -> Option<Vec<u8>> {
+        summarize(
+            input,
+            [
+                b"total_titles",
+                b"empty_title_count",
+                b"bracket_tag_count",
+                b"paren_tag_count",
+                b"language_tag_count",
+                b"adult_tag_count",
+                b"date_code_count",
+                b"quality_tag_count",
+                b"release_tag_count",
+                b"sxxexx_count",
+                b"trailing_number_count",
+                b"episode_suffix_count",
+                b"volume_suffix_count",
+                b"mojibake_count",
+            ],
+            |raw| {
+                let mut flags = [false; 14];
+                flags[0] = true;
+                let t = trim(raw);
+                if t.is_empty() {
+                    flags[1] = true;
+                    return flags;
+                }
+                flags[2] = enclosed_tag(t, b'[', b']');
+                flags[3] = enclosed_tag(t, b'(', b')');
+                for_each_word(t, |start, run, key| {
+                    let class = keyword_class(&ANIDB_KEYWORDS, key);
+                    flags[4] |= class & LANGUAGE != 0;
+                    flags[5] |= class & ADULT != 0;
+                    flags[7] |= class & QUALITY != 0
+                        || (class & BLU != 0
+                            && starts_ci(t, start, b"blu-ray")
+                            && wb_after(t, start + 7));
+                    flags[8] |= class & RELEASE != 0;
+                    flags[6] |= run.len() == 6 && run.iter().all(u8::is_ascii_digit);
+                });
+                // `\sS\d+E\d+`, case-insensitive.
+                flags[9] = (1..t.len()).any(|i| {
+                    is_space(t[i - 1]) && matches!(t[i], b's' | b'S') && {
+                        let n = digit_run(t, i + 1);
+                        n > 0
+                            && t.get(i + 1 + n).is_some_and(|b| matches!(b, b'e' | b'E'))
+                            && digit_run(t, i + 2 + n) > 0
+                    }
+                });
+                // `(?:[-_]|\s)\s*\d{1,4}\z`
+                let n = trailing_digits(t);
+                flags[10] = (1..=4).contains(&n)
+                    && n < t.len()
+                    && (matches!(t[t.len() - n - 1], b'-' | b'_') || is_space(t[t.len() - n - 1]));
+                flags[11] = anidb_episode_suffix(t);
+                flags[12] = anidb_volume_suffix(t);
+                flags[13] = t.windows(2).any(|w| w == b"\xc3\x83" || w == b"\xc3\x82");
+                flags
+            },
+        )
+    }
+
+    /// # Safety
+    /// The input and output must be live buffers covering their declared lengths.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w454_predb_feed_title_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, predb_feed_titles) }
+    }
+
+    /// # Safety
+    /// The input and output must be live buffers covering their declared lengths.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w454_anidb_title_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, anidb_titles) }
+    }
+}
+
+#[cfg(test)]
+mod w454_tests {
+    use super::w454_metadata::*;
+    use super::{PhpKey, PhpSerParser, PhpSerWriter};
+
+    type Export = unsafe extern "C" fn(*const u8, usize, *mut u8, usize) -> isize;
+    const EXPORTS: [Export; 2] = [
+        nntmux_w454_predb_feed_title_batch,
+        nntmux_w454_anidb_title_batch,
+    ];
+
+    fn frame(entries: &[&[u8]]) -> Vec<u8> {
+        let mut w = PhpSerWriter::new();
+        w.arr_open(1);
+        w.int(0);
+        w.arr_open(entries.len());
+        for (i, entry) in entries.iter().enumerate() {
+            w.int(i as i64);
+            w.str(entry);
+        }
+        w.arr_close();
+        w.arr_close();
+        w.buf
+    }
+
+    fn output(export: Export, input: &[u8]) -> Vec<u8> {
+        let mut out = vec![b'Z'; 1024];
+        let written = unsafe { export(input.as_ptr(), input.len(), out.as_mut_ptr(), out.len()) };
+        assert!(written > 0, "export declined: {written}");
+        out.truncate(written as usize);
+        out
+    }
+
+    fn summary(export: Export, entries: &[&[u8]], fields: &[(&[u8], i64)]) {
+        let result = output(export, &frame(entries));
+        let doc = PhpSerParser::parse_document(&result).unwrap();
+        assert_eq!(doc.items().len(), fields.len());
+        for ((key, value), (expected_key, expected_value)) in doc.items().iter().zip(fields) {
+            assert!(
+                matches!(key, PhpKey::Str(k) if k == expected_key),
+                "key mismatch for {}",
+                String::from_utf8_lossy(expected_key)
+            );
+            assert_eq!(
+                value.as_int(),
+                Some(*expected_value),
+                "{}",
+                String::from_utf8_lossy(expected_key)
+            );
+        }
+    }
+
+    #[test]
+    fn w454_predb_feed_titles_count_parse_rows_shapes() {
+        let long = [b'A'; 256];
+        summary(
+            nntmux_w454_predb_feed_title_batch,
+            &[
+                b"Show.Name.S01E02.1080p.WEB.H264-GRP",
+                b"  Movie.2024.PROPER.720p.BluRay.x264-GROUP ",
+                b"Artist-Album-WEB-2024-iNT",
+                b"Some Release Name",
+                b"Show.S1234E01-GRP",
+                b"Show.S01E12345.2160i",
+                b"Rel.REAL.RERIP-x",
+                b"Caf\xc3\xa9.2024-GRP",
+                b"Tab\x01Inside",
+                &long,
+                b"",
+                b" \t\n",
+                b"Title-",
+                b"Title.Internal.READNFO",
+                b"No-Group!",
+                b"Form\x0c.Feed",
+                b"Row.Title-GRP",
+                b"",
+                b"",
+                b"2024",
+            ],
+            &[
+                (b"total_titles", 20),
+                (b"empty_title_count", 4),
+                (b"padded_title_count", 1),
+                (b"group_suffix_count", 7),
+                (b"dotted_count", 8),
+                (b"episode_count", 1),
+                (b"resolution_count", 3),
+                (b"scene_tag_count", 3),
+                (b"non_ascii_count", 1),
+                (b"control_char_count", 2),
+                (b"overlong_count", 1),
+            ],
+        );
+    }
+
+    #[test]
+    fn w454_anidb_titles_count_clean_title_tag_families() {
+        summary(
+            nntmux_w454_anidb_title_batch,
+            &[
+                b"[SubsPlease] Frieren - 12 (1080p) [ENG].mkv",
+                b"Show S01E02 BDRip",
+                b"Show_-_007",
+                b"Show 12345",
+                b"Show Ep 007",
+                b"Show Episode0012",
+                b"Show E00000",
+                b"Show Vol. 3",
+                b"Show Ch",
+                b"Show Ch.12x",
+                b"JAV 240101 Uncensored",
+                b"Mosaic-less HD",
+                b"Blu-Ray Box",
+                b"Blu-Rays",
+                b"[] () Title",
+                b"Show (TV)",
+                b"\xc3\x83\xc2\xa9 Title",
+                b"Show FINAL Complete",
+                b"",
+                b"Kimi no Na wa Movie [BD]",
+                b"Show 4K x265",
+                b"Show 1x05",
+                b"",
+                b"12",
+            ],
+            &[
+                (b"total_titles", 24),
+                (b"empty_title_count", 2),
+                (b"bracket_tag_count", 2),
+                (b"paren_tag_count", 2),
+                (b"language_tag_count", 1),
+                (b"adult_tag_count", 2),
+                (b"date_code_count", 1),
+                (b"quality_tag_count", 5),
+                (b"release_tag_count", 1),
+                (b"sxxexx_count", 1),
+                (b"trailing_number_count", 3),
+                (b"episode_suffix_count", 3),
+                (b"volume_suffix_count", 2),
+                (b"mojibake_count", 1),
+            ],
+        );
+    }
+
+    #[test]
+    fn w454_all_exports_check_spans_and_preserve_output_on_failure() {
+        for export in EXPORTS {
+            let input = frame(&[b"x"]);
+            let expected = output(export, &input);
+            let needed = expected.len();
+            let mut out = [b'Z'; 1024];
+            unsafe {
+                for cap in [0, 1, needed - 1] {
+                    assert_eq!(
+                        export(input.as_ptr(), input.len(), out.as_mut_ptr(), cap),
+                        -(needed as isize)
+                    );
+                    assert_eq!(out, [b'Z'; 1024]);
+                }
+                assert_eq!(
+                    export(input.as_ptr(), input.len(), out.as_mut_ptr(), needed),
+                    needed as isize
+                );
+                assert_eq!(&out[..needed], expected);
+                assert!(out[needed..].iter().all(|b| *b == b'Z'));
+                for (ptr, len) in [
+                    (std::ptr::null(), 0),
+                    (std::ptr::null(), input.len()),
+                    (input.as_ptr(), 16 * 1024 * 1024 + 1),
+                    (input.as_ptr(), isize::MAX as usize + 1),
+                    ((usize::MAX - 1) as *const u8, 8),
+                ] {
+                    out.fill(b'Z');
+                    assert_eq!(export(ptr, len, out.as_mut_ptr(), out.len()), -1);
+                    assert_eq!(out, [b'Z'; 1024]);
+                }
+                assert_eq!(
+                    export(input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                    -1
+                );
+                for (ptr, cap) in [
+                    (out.as_mut_ptr(), usize::MAX),
+                    ((usize::MAX - 1) as *mut u8, 8),
+                ] {
+                    assert_eq!(export(input.as_ptr(), input.len(), ptr, cap), -1);
+                    assert_eq!(out, [b'Z'; 1024]);
+                }
+                let mut overlap = vec![b'Z'; input.len() + 2048];
+                overlap[32..32 + input.len()].copy_from_slice(&input);
+                let original = overlap.clone();
+                for offset in [0, 32, 33, 32 + input.len() - 1] {
+                    assert_eq!(
+                        export(
+                            overlap.as_ptr().add(32),
+                            input.len(),
+                            overlap.as_mut_ptr().add(offset),
+                            1024
+                        ),
+                        -1
+                    );
+                    assert_eq!(overlap, original);
+                }
+                // Adjacent input/output spans are legal.
+                assert_eq!(
+                    export(
+                        overlap.as_ptr().add(32),
+                        input.len(),
+                        overlap.as_mut_ptr().add(32 + input.len()),
+                        1024
+                    ),
+                    needed as isize
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn w454_rejects_malformed_frames_and_non_string_entries() {
+        let mut deep = b"a:1:{i:0;".to_vec();
+        for _ in 0..130 {
+            deep.extend_from_slice(b"a:1:{i:0;");
+        }
+        deep.extend_from_slice(b"s:0:\"\";");
+        deep.extend(std::iter::repeat_n(b'}', 131));
+        for export in EXPORTS {
+            let mut out = [b'Z'; 1024];
+            for malformed in [
+                b"".as_slice(),
+                b"N;",
+                b"a:1:{i:0;",
+                b"a:999999999999999999999:{}",
+                b"a:1:{i:0;a:0:{}}trailing",
+                b"a:0:{}",
+                b"a:1:{i:1;a:0:{}}",
+                b"a:2:{i:0;a:0:{}i:1;a:0:{}}",
+                b"a:1:{i:0;N;}",
+                b"a:1:{i:0;a:1:{i:2;s:0:\"\";}}",
+                b"a:1:{i:0;a:1:{s:1:\"x\";s:0:\"\";}}",
+                b"a:1:{i:0;a:1:{i:0;N;}}",
+                b"a:1:{i:0;a:1:{i:0;i:5;}}",
+                b"a:1:{i:0;a:1:{i:0;a:0:{}}}",
+                b"a:1:{i:0;a:1:{i:0;s:5:\"x\";}}",
+                deep.as_slice(),
+            ] {
+                assert_eq!(
+                    unsafe {
+                        export(
+                            malformed.as_ptr(),
+                            malformed.len(),
+                            out.as_mut_ptr(),
+                            out.len(),
+                        )
+                    },
+                    -1,
+                    "{}",
+                    String::from_utf8_lossy(malformed)
+                );
+                assert_eq!(out, [b'Z'; 1024]);
+            }
+            let empty = output(export, &frame(&[]));
+            let doc = PhpSerParser::parse_document(&empty).unwrap();
+            assert!(doc.items().iter().all(|(_, v)| v.as_int() == Some(0)));
+        }
+    }
+}
