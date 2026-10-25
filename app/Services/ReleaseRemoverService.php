@@ -1412,4 +1412,105 @@ class ReleaseRemoverService
 
         return false;
     }
+
+    /**
+     * PHP stays the default for summarizeRemovalCandidateBatch(): the paired benchmark in
+     * tests/Unit/RustCollectionCleaningRemoverBlacklistHandlerW40ParityTest.php does not clear 1.5x.
+     */
+    public const bool W401_RUST_FFI_DEFAULT = false;
+
+    private const string W401_ALNUM = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+
+    private const array W401_CANDIDATE_KEYS = ['candidates', 'invalid_rows', 'undersized', 'gibberish', 'passworded', 'eligible'];
+
+    private static ?bool $w401UseRustFfi = null;
+
+    private static FFI|false|null $w401Ffi = null;
+
+    /**
+     * Summarizes removal candidate rows (`size`, `searchname`, `passwordstatus`): an integer size below `$minSizeBytes` is
+     * undersized, a searchname matching the gibberish (15+ alphanumerics only) or hashed (a 25-alphanumeric run) removal
+     * patterns is gibberish, and a password status of 1 or more is passworded. Rows with any flag are eligible for deletion;
+     * non-array rows are invalid.
+     *
+     * @param  array<array-key, mixed>  $candidates
+     * @return array<string, int>
+     */
+    public static function summarizeRemovalCandidateBatch(array $candidates, int $minSizeBytes = 1048576): array
+    {
+        return (self::usesW401RustFfi() ? self::summarizeRemovalCandidateBatchNative($candidates, $minSizeBytes) : null)
+            ?? self::summarizeRemovalCandidateBatchPhp($candidates, $minSizeBytes);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $candidates
+     * @return array<string, int>
+     */
+    private static function summarizeRemovalCandidateBatchPhp(array $candidates, int $minSizeBytes): array
+    {
+        $summary = array_fill_keys(self::W401_CANDIDATE_KEYS, 0);
+        $summary['candidates'] = count($candidates);
+        foreach ($candidates as $candidate) {
+            if (! is_array($candidate)) {
+                $summary['invalid_rows']++;
+
+                continue;
+            }
+            $size = CollectionCleanupService::w401Int($candidate['size'] ?? null);
+            $name = $candidate['searchname'] ?? null;
+            $small = $size !== null && $size < $minSizeBytes;
+            $hashed = is_string($name) && self::w401Gibberish($name);
+            $locked = (CollectionCleanupService::w401Int($candidate['passwordstatus'] ?? null) ?? 0) >= 1;
+            $summary['undersized'] += (int) $small;
+            $summary['gibberish'] += (int) $hashed;
+            $summary['passworded'] += (int) $locked;
+            $summary['eligible'] += (int) ($small || $hashed || $locked);
+        }
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $candidates
+     * @return array<string, int>|null
+     */
+    private static function summarizeRemovalCandidateBatchNative(array $candidates, int $minSizeBytes): ?array
+    {
+        $words = [$minSizeBytes, count($candidates)];
+        $blob = [];
+        foreach ($candidates as $candidate) {
+            if (is_array($candidate)) {
+                CollectionCleanupService::w401PackRow($words, $blob, [$candidate['size'] ?? null, $candidate['searchname'] ?? null, $candidate['passwordstatus'] ?? null]);
+            } else {
+                $words[] = 0;
+            }
+        }
+        $values = CollectionCleanupService::w401Invoke(self::$w401Ffi, 3, $words, $blob);
+
+        return $values !== null && count($values) === count(self::W401_CANDIDATE_KEYS) ? array_combine(self::W401_CANDIDATE_KEYS, $values) : null;
+    }
+
+    /** removeGibberish()'s `^[a-zA-Z0-9]{15,}$` or removeHashed()'s `[a-zA-Z0-9]{25,}` searchname pattern. */
+    private static function w401Gibberish(string $name): bool
+    {
+        $length = strlen($name);
+
+        return ($length >= 15 && strspn($name, self::W401_ALNUM) === $length) || ($length >= 25 && preg_match('/[a-zA-Z0-9]{25}/', $name) === 1);
+    }
+
+    public static function useW401RustFfi(?bool $enabled): void
+    {
+        self::$w401UseRustFfi = $enabled;
+    }
+
+    public static function usesW401RustFfi(): bool
+    {
+        return self::$w401UseRustFfi ?? self::W401_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW401RustFfi(): void
+    {
+        self::$w401UseRustFfi = null;
+        self::$w401Ffi = null;
+    }
 }

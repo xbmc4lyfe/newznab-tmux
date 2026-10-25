@@ -284,4 +284,102 @@ class BlacklistService
         }
         $this->listsFound[$groupName] = ($this->blackList[$groupName] || $this->whiteList[$groupName]);
     }
+
+    /**
+     * PHP stays the default for summarizeBlacklistEvaluationWindow(): the paired benchmark in
+     * tests/Unit/RustCollectionCleaningRemoverBlacklistHandlerW40ParityTest.php does not clear 1.5x.
+     */
+    public const bool W401_RUST_FFI_DEFAULT = false;
+
+    private const array W401_OUTCOME_KEYS = ['checked', 'invalid_rows', 'whitelisted', 'blacklisted', 'skipped_disabled', 'unmatched', 'distinct_rules'];
+
+    private static ?bool $w401UseRustFfi = null;
+
+    private static FFI|false|null $w401Ffi = null;
+
+    /**
+     * Summarizes blacklist evaluation outcomes (`status`, `optype`, `rule_id`): outcomes whose rule status is not enabled are
+     * skipped, enabled ones count by blacklist/whitelist operation type (any other type is unmatched), and matched outcomes
+     * whose rule id lies in 1..`$maxRuleId` count toward the distinct matched rules. Non-array outcomes are invalid.
+     *
+     * @param  array<array-key, mixed>  $matchOutcomes
+     * @return array<string, int>
+     */
+    public static function summarizeBlacklistEvaluationWindow(array $matchOutcomes, int $maxRuleId = 1000000): array
+    {
+        return (self::usesW401RustFfi() ? self::summarizeBlacklistEvaluationWindowNative($matchOutcomes, $maxRuleId) : null)
+            ?? self::summarizeBlacklistEvaluationWindowPhp($matchOutcomes, $maxRuleId);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $outcomes
+     * @return array<string, int>
+     */
+    private static function summarizeBlacklistEvaluationWindowPhp(array $outcomes, int $maxRuleId): array
+    {
+        $summary = array_fill_keys(self::W401_OUTCOME_KEYS, 0);
+        $summary['checked'] = count($outcomes);
+        $rules = [];
+        foreach ($outcomes as $outcome) {
+            if (! is_array($outcome)) {
+                $summary['invalid_rows']++;
+
+                continue;
+            }
+            if (CollectionCleanupService::w401Int($outcome['status'] ?? null) !== BlacklistConstants::BLACKLIST_ENABLED) {
+                $summary['skipped_disabled']++;
+
+                continue;
+            }
+            $type = match (CollectionCleanupService::w401Int($outcome['optype'] ?? null)) {
+                BlacklistConstants::OPTYPE_BLACKLIST => 'blacklisted',
+                BlacklistConstants::OPTYPE_WHITELIST => 'whitelisted',
+                default => 'unmatched',
+            };
+            $summary[$type]++;
+            $id = $type === 'unmatched' ? null : CollectionCleanupService::w401Int($outcome['rule_id'] ?? null);
+            if ($id !== null && $id >= 1 && $id <= $maxRuleId) {
+                $rules[$id] = true;
+            }
+        }
+        $summary['distinct_rules'] = count($rules);
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $outcomes
+     * @return array<string, int>|null
+     */
+    private static function summarizeBlacklistEvaluationWindowNative(array $outcomes, int $maxRuleId): ?array
+    {
+        $words = [$maxRuleId, count($outcomes)];
+        $blob = [];
+        foreach ($outcomes as $outcome) {
+            if (is_array($outcome)) {
+                CollectionCleanupService::w401PackRow($words, $blob, [$outcome['status'] ?? null, $outcome['optype'] ?? null, $outcome['rule_id'] ?? null]);
+            } else {
+                $words[] = 0;
+            }
+        }
+        $values = CollectionCleanupService::w401Invoke(self::$w401Ffi, 4, $words, $blob);
+
+        return $values !== null && count($values) === count(self::W401_OUTCOME_KEYS) ? array_combine(self::W401_OUTCOME_KEYS, $values) : null;
+    }
+
+    public static function useW401RustFfi(?bool $enabled): void
+    {
+        self::$w401UseRustFfi = $enabled;
+    }
+
+    public static function usesW401RustFfi(): bool
+    {
+        return self::$w401UseRustFfi ?? self::W401_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW401RustFfi(): void
+    {
+        self::$w401UseRustFfi = null;
+        self::$w401Ffi = null;
+    }
 }

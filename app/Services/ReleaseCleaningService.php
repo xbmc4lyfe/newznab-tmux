@@ -652,4 +652,92 @@ class ReleaseCleaningService
         // Remove invalid characters
         return trim(mb_convert_encoding((string) preg_replace('/[^(\x20-\x7F)]*/', '', $cleanerName), 'UTF-8', mb_list_encodings()));
     }
+
+    /**
+     * PHP stays the default for summarizeCleanerPassTelemetry(): the paired benchmark in
+     * tests/Unit/RustCollectionCleaningRemoverBlacklistHandlerW40ParityTest.php does not clear 1.5x.
+     */
+    public const bool W401_RUST_FFI_DEFAULT = false;
+
+    private const array W401_TELEMETRY_KEYS = ['pairs', 'invalid_pairs', 'changed', 'unchanged', 'empty_output', 'bytes_stripped'];
+
+    private static ?bool $w401UseRustFfi = null;
+
+    private static \FFI|false|null $w401Ffi = null;
+
+    /**
+     * Summarizes a subject-cleaning pass from `['before' => subject, 'after' => cleaned]` pairs: byte-identical results are
+     * unchanged, others changed; a result that trim()s to '' is empty output, and every pair adds the bytes the cleaner
+     * removed (never negative). Pairs that are not arrays or lack a string `before`/`after` are invalid.
+     *
+     * @param  array<array-key, mixed>  $beforeAfterPairs
+     * @return array<string, int>
+     */
+    public static function summarizeCleanerPassTelemetry(array $beforeAfterPairs): array
+    {
+        return (self::usesW401RustFfi() ? self::summarizeCleanerPassTelemetryNative($beforeAfterPairs) : null)
+            ?? self::summarizeCleanerPassTelemetryPhp($beforeAfterPairs);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $pairs
+     * @return array<string, int>
+     */
+    private static function summarizeCleanerPassTelemetryPhp(array $pairs): array
+    {
+        $summary = array_fill_keys(self::W401_TELEMETRY_KEYS, 0);
+        $summary['pairs'] = count($pairs);
+        foreach ($pairs as $pair) {
+            $before = is_array($pair) ? ($pair['before'] ?? null) : null;
+            $after = is_array($pair) ? ($pair['after'] ?? null) : null;
+            if (! is_string($before) || ! is_string($after)) {
+                $summary['invalid_pairs']++;
+
+                continue;
+            }
+            $summary[$before === $after ? 'unchanged' : 'changed']++;
+            if (trim($after) === '') {
+                $summary['empty_output']++;
+            }
+            $summary['bytes_stripped'] += max(0, strlen($before) - strlen($after));
+        }
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $pairs
+     * @return array<string, int>|null
+     */
+    private static function summarizeCleanerPassTelemetryNative(array $pairs): ?array
+    {
+        $words = [count($pairs)];
+        $blob = [];
+        foreach ($pairs as $pair) {
+            if (is_array($pair)) {
+                CollectionCleanupService::w401PackRow($words, $blob, [$pair['before'] ?? null, $pair['after'] ?? null]);
+            } else {
+                $words[] = 0;
+            }
+        }
+        $values = CollectionCleanupService::w401Invoke(self::$w401Ffi, 2, $words, $blob);
+
+        return $values !== null && count($values) === count(self::W401_TELEMETRY_KEYS) ? array_combine(self::W401_TELEMETRY_KEYS, $values) : null;
+    }
+
+    public static function useW401RustFfi(?bool $enabled): void
+    {
+        self::$w401UseRustFfi = $enabled;
+    }
+
+    public static function usesW401RustFfi(): bool
+    {
+        return self::$w401UseRustFfi ?? self::W401_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW401RustFfi(): void
+    {
+        self::$w401UseRustFfi = null;
+        self::$w401Ffi = null;
+    }
 }
