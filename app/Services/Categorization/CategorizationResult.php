@@ -8,6 +8,7 @@ use App\Models\Category;
 use App\Services\ReleaseImageService;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 /**
@@ -408,5 +409,205 @@ class CategorizationResult
         }
 
         return self::$w413RustFfiHandle === false ? null : self::$w413RustFfiHandle;
+    }
+
+    /**
+     * Enabled: the paired benchmark in the W53 parity test measures 1.97x common mean, 2.25x common
+     * p99, 2.29x uncommon mean and 2.11x uncommon p99 (per-metric minimum of three runs), above the
+     * 1.5x rule.
+     */
+    private const bool W53_RUST_FFI_DEFAULT = true;
+
+    private const string W53_FFI_CDEF = 'ssize_t nntmux_w531_categorization_result_fold_batch(const char *category_ids, size_t category_ids_len, const char *confidences, size_t confidences_len, const char *matched_by, size_t matched_by_len, size_t count, int64_t misc_id, int64_t hashed_id, int64_t *out, size_t out_cap);';
+
+    public static function usesW53RustFfi(): bool
+    {
+        $enabled = self::w53RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W53_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 53 batch routed to Rust or PHP, then restores the routing. */
+    public static function withW53RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w53RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w53RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Folds a batch of results given as columns: how many {@see isSuccessfulPhp()}, how many
+     * {@see isProtectedMiscResultPhp()}, and the index of the best one when each result replaces
+     * the best so far only if it {@see shouldOverridePhp()} it (-1 for an empty batch).
+     *
+     * @param  array<array-key, int>  $categoryIds
+     * @param  array<array-key, float>  $confidences
+     * @param  array<array-key, string>  $matchedBy
+     * @return array{successful: int, protected: int, best_index: int}
+     *
+     * @throws \InvalidArgumentException when the columns differ in length
+     */
+    public static function foldResults(array $categoryIds, array $confidences, array $matchedBy): array
+    {
+        return self::usesW53RustFfi() ? self::foldResultsNative($categoryIds, $confidences, $matchedBy) : self::foldResultsPhp($categoryIds, $confidences, $matchedBy);
+    }
+
+    /**
+     * @param  array<array-key, int>  $categoryIds
+     * @param  array<array-key, float>  $confidences
+     * @param  array<array-key, string>  $matchedBy
+     * @return array{successful: int, protected: int, best_index: int}
+     */
+    public static function foldResultsPhp(array $categoryIds, array $confidences, array $matchedBy): array
+    {
+        self::w53Count($categoryIds, $confidences, $matchedBy);
+        $confidences = array_values($confidences);
+        $matchedBy = array_values($matchedBy);
+        $successful = $protected = $bestId = 0;
+        $best = -1;
+        $bestConfidence = 0.0;
+        $bestProtected = false;
+        foreach (array_values($categoryIds) as $i => $id) {
+            $confidence = (float) $confidences[$i];
+            $matched = $matchedBy[$i];
+            $isProtected = $id === Category::OTHER_HASHED || ($id === Category::OTHER_MISC
+                && (str_starts_with($matched, 'hash_') || str_starts_with($matched, 'obfuscated_') || str_starts_with($matched, 'gibberish_') || $matched === 'group_only_low_signal'));
+            if (! ($confidence <= 0) && ! ($id === Category::OTHER_MISC && $matched === 'no_match')) {
+                $successful++;
+            }
+            if ($isProtected) {
+                $protected++;
+            }
+            if ($best < 0) {
+                $wins = true;
+            } elseif ($id !== Category::OTHER_MISC && $id !== Category::OTHER_HASHED && $bestProtected && $confidence < 0.6) {
+                $wins = false;
+            } elseif ($confidence > $bestConfidence) {
+                $wins = true;
+            } elseif ($confidence === $bestConfidence) {
+                $wins = $id !== Category::OTHER_MISC && $bestId === Category::OTHER_MISC;
+            } else {
+                $wins = false;
+            }
+            if ($wins) {
+                $best = $i;
+                $bestId = $id;
+                $bestConfidence = $confidence;
+                $bestProtected = $isProtected;
+            }
+        }
+
+        return ['successful' => $successful, 'protected' => $protected, 'best_index' => $best];
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or declines the batch (a
+     * `matchedBy` holding a NUL byte).
+     *
+     * @param  array<array-key, int>  $categoryIds
+     * @param  array<array-key, float>  $confidences
+     * @param  array<array-key, string>  $matchedBy
+     * @return array{successful: int, protected: int, best_index: int}
+     */
+    public static function foldResultsNative(array $categoryIds, array $confidences, array $matchedBy): array
+    {
+        $count = self::w53Count($categoryIds, $confidences, $matchedBy);
+        $buffer = $count === 0 ? null : self::w53Buffer(3);
+        if ($buffer === null) {
+            return self::foldResultsPhp($categoryIds, $confidences, $matchedBy);
+        }
+        [$ffi, $out, $cap] = $buffer;
+        $ids = pack('P*', ...array_values($categoryIds));
+        $packed = pack('e*', ...array_values($confidences));
+        $joined = implode("\0", $matchedBy);
+        try {
+            // @phpstan-ignore method.notFound
+            $words = self::w53Decode($out, $ffi->nntmux_w531_categorization_result_fold_batch($ids, \strlen($ids), $packed, \strlen($packed), $joined, \strlen($joined), $count, Category::OTHER_MISC, Category::OTHER_HASHED, $out, $cap), 3);
+        } catch (Throwable) {
+            $words = null;
+        }
+        if ($words === null || \count($words) !== 3) {
+            return self::foldResultsPhp($categoryIds, $confidences, $matchedBy);
+        }
+
+        return ['successful' => $words[0], 'protected' => $words[1], 'best_index' => $words[2]];
+    }
+
+    /**
+     * @param  array<mixed>  ...$columns
+     */
+    private static function w53Count(array ...$columns): int
+    {
+        $count = \count($columns[0]);
+        foreach ($columns as $column) {
+            if (\count($column) !== $count) {
+                throw new \InvalidArgumentException('Categorization result columns must have the same length.');
+            }
+        }
+
+        return $count;
+    }
+
+    /**
+     * Lazily resolved binding plus the reusable output buffer sized for `$words` words.
+     *
+     * @return array{0: FFI, 1: CData, 2: int}|null
+     */
+    private static function w53Buffer(int $words): ?array
+    {
+        $buffer = self::w53RustFfiState('out', $words);
+
+        return \is_array($buffer) ? $buffer : null;
+    }
+
+    /** @return list<int>|null The `$written` words the export reported, or null when it declined. */
+    private static function w53Decode(CData $out, mixed $written, int $maxWords): ?array
+    {
+        if (! \is_int($written) || $written < 0 || $written > $maxWords) {
+            return null;
+        }
+        if ($written === 0) {
+            return [];
+        }
+        $decoded = unpack('P*', FFI::string($out, $written * 8));
+
+        /** @var list<int>|null */
+        return \is_array($decoded) ? array_values($decoded) : null;
+    }
+
+    /**
+     * Wave 53 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
+     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
+     */
+    private static function w53RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'out':
+                $ffi ??= RustPipelineLibrary::resolveDomain('obfuscation_blacklist_cat_w53', self::W53_FFI_CDEF) ?? false;
+                if (! $ffi instanceof FFI || ! \is_int($val) || $val < 1) {
+                    return null;
+                }
+                if (! $out instanceof CData || $outCap < $val) {
+                    $outCap = max(512, $val * 2);
+                    $out = $ffi->new("int64_t[{$outCap}]");
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled;
+        }
     }
 }
