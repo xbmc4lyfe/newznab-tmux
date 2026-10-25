@@ -14,6 +14,7 @@ use App\Services\Configuration\DomainConfigurationRepository;
 use App\Support\RustPipelineLibrary;
 use Carbon\CarbonInterface;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
 use InvalidArgumentException;
@@ -635,5 +636,171 @@ class RegistrationStatusService
         }
 
         return self::$ffi === false ? null : self::$ffi;
+    }
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W51 parity test). */
+    private const bool W51_RUST_FFI_DEFAULT = true;
+
+    private const string W51_FFI_CDEF = 'ssize_t nntmux_w511_registration_status_decide_batch(const char *statuses, size_t statuses_len, const char *active, size_t active_len, size_t count, int64_t *out, size_t out_cap);';
+
+    public static function usesW51RustFfi(): bool
+    {
+        $enabled = self::w51RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W51_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 51 batch routed to Rust or PHP, then restores the routing. */
+    public static function withW51RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w51RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w51RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Batch of {@see resolve()} decisions: `decide(normalizeManualStatus($manual), $active)` per
+     * row as `effective_status | scheduled_override_active << 2 | available << 3 | is_open << 4
+     * | is_invite_only << 5 | is_closed << 6 | reason << 8` (reason = {@see REASONS} index).
+     *
+     * @param  list<int>  $manualStatuses
+     * @param  list<bool>  $hasActivePeriods
+     * @return list<int>
+     */
+    public static function decideBatch(array $manualStatuses, array $hasActivePeriods): array
+    {
+        return self::usesW51RustFfi()
+            ? self::decideBatchNative($manualStatuses, $hasActivePeriods)
+            : self::decideBatchPhp($manualStatuses, $hasActivePeriods);
+    }
+
+    /**
+     * @param  list<int>  $manualStatuses
+     * @param  list<bool>  $hasActivePeriods
+     * @return list<int>
+     */
+    public static function decideBatchPhp(array $manualStatuses, array $hasActivePeriods): array
+    {
+        self::w51Count($manualStatuses, $hasActivePeriods);
+        $reasons = array_flip(self::REASONS);
+        $words = [];
+        foreach ($manualStatuses as $i => $status) {
+            $decision = self::decidePhp(self::normalizeManualStatusPhp($status), $hasActivePeriods[$i]);
+            $words[] = $decision['effective_status']
+                | (int) $decision['scheduled_override_active'] << 2
+                | (int) $decision['available'] << 3
+                | (int) $decision['is_open'] << 4
+                | (int) $decision['is_invite_only'] << 5
+                | (int) $decision['is_closed'] << 6
+                | $reasons[$decision['reason']] << 8;
+        }
+
+        return $words;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or declines the batch.
+     *
+     * @param  list<int>  $manualStatuses
+     * @param  list<bool>  $hasActivePeriods
+     * @return list<int>
+     */
+    public static function decideBatchNative(array $manualStatuses, array $hasActivePeriods): array
+    {
+        $count = self::w51Count($manualStatuses, $hasActivePeriods);
+        $maxWords = $count;
+        $buffer = $count === 0 ? null : self::w51Buffer($maxWords);
+        if ($buffer === null) {
+            return self::decideBatchPhp($manualStatuses, $hasActivePeriods);
+        }
+        [$ffi, $out, $cap] = $buffer;
+        $statuses = pack('P*', ...$manualStatuses);
+        $active = pack('C*', ...$hasActivePeriods);
+        try {
+            // @phpstan-ignore method.notFound
+            $words = self::w51Decode($out, $ffi->nntmux_w511_registration_status_decide_batch($statuses, \strlen($statuses), $active, \strlen($active), $count, $out, $cap), $maxWords);
+        } catch (Throwable) {
+            $words = null;
+        }
+
+        return $words !== null && \count($words) === $count ? $words : self::decideBatchPhp($manualStatuses, $hasActivePeriods);
+    }
+
+    /**
+     * @param  array<mixed>  ...$columns
+     */
+    private static function w51Count(array ...$columns): int
+    {
+        $count = \count($columns[0]);
+        foreach ($columns as $column) {
+            if (\count($column) !== $count) {
+                throw new InvalidArgumentException('Registration decision batch columns must have the same length.');
+            }
+        }
+
+        return $count;
+    }
+
+    /**
+     * Lazily resolved binding plus the reusable output buffer sized for `$words` words.
+     *
+     * @return array{0: FFI, 1: CData, 2: int}|null
+     */
+    private static function w51Buffer(int $words): ?array
+    {
+        $buffer = self::w51RustFfiState('out', $words);
+
+        return \is_array($buffer) ? $buffer : null;
+    }
+
+    /** @return list<int>|null The `$written` words the export reported, or null when it declined. */
+    private static function w51Decode(CData $out, mixed $written, int $maxWords): ?array
+    {
+        if (! \is_int($written) || $written < 0 || $written > $maxWords) {
+            return null;
+        }
+        if ($written === 0) {
+            return [];
+        }
+        $decoded = unpack('P*', FFI::string($out, $written * 8));
+
+        /** @var list<int>|null */
+        return \is_array($decoded) ? array_values($decoded) : null;
+    }
+
+    /**
+     * Wave 51 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
+     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
+     */
+    private static function w51RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'out':
+                $ffi ??= RustPipelineLibrary::resolveDomain('admin_status_w51', self::W51_FFI_CDEF) ?? false;
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if (! $out instanceof CData || $outCap < $val) {
+                    $outCap = max(512, $val * 2);
+                    $out = $ffi->new("int64_t[{$outCap}]");
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled;
+        }
     }
 }

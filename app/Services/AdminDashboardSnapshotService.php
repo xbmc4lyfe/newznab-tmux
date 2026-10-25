@@ -12,6 +12,7 @@ use App\Models\UsenetGroup;
 use App\Models\User;
 use App\Models\UserActivity;
 use App\Support\RustPipelineLibrary;
+use FFI\CData;
 use Illuminate\Support\Facades\Cache;
 
 /**
@@ -584,5 +585,172 @@ CDEF;
         self::$ffi = $ffi ?? false;
 
         return $ffi;
+    }
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W51 parity test). */
+    private const bool W51_RUST_FFI_DEFAULT = true;
+
+    private const string W51_FFI_CDEF = 'ssize_t nntmux_w511_admin_dashboard_activity_buckets_batch(const char *timestamps, size_t timestamps_len, size_t count, int64_t now, int64_t bucket_seconds, size_t bucket_count, int64_t *out, size_t out_cap);';
+
+    public static function usesW51RustFfi(): bool
+    {
+        $enabled = self::w51RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W51_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 51 batch routed to Rust or PHP, then restores the routing. */
+    public static function withW51RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w51RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w51RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Sparse activity histogram over `$bucketCount` newest-first buckets of `$bucketSeconds`
+     * ending at `$now` (bucket `intdiv($now - $ts, $bucketSeconds)` for timestamps in
+     * `($now - $bucketSeconds * $bucketCount, $now]`): `[outside, bucket, count, ...]` listing
+     * only non-empty buckets in ascending order after the count of timestamps outside the window.
+     *
+     * @param  list<int>  $timestamps
+     * @return list<int>
+     */
+    public static function bucketActivityTimestamps(array $timestamps, int $now, int $bucketSeconds, int $bucketCount): array
+    {
+        return self::usesW51RustFfi()
+            ? self::bucketActivityTimestampsNative($timestamps, $now, $bucketSeconds, $bucketCount)
+            : self::bucketActivityTimestampsPhp($timestamps, $now, $bucketSeconds, $bucketCount);
+    }
+
+    /**
+     * @param  list<int>  $timestamps
+     * @return list<int>
+     */
+    public static function bucketActivityTimestampsPhp(array $timestamps, int $now, int $bucketSeconds, int $bucketCount): array
+    {
+        $windowStart = self::w51ActivityWindowStart($now, $bucketSeconds, $bucketCount);
+        $counts = [];
+        $outside = 0;
+        foreach ($timestamps as $timestamp) {
+            if ($timestamp <= $now && $timestamp > $windowStart) {
+                $bucket = intdiv($now - $timestamp, $bucketSeconds);
+                $counts[$bucket] = ($counts[$bucket] ?? 0) + 1;
+            } else {
+                $outside++;
+            }
+        }
+        ksort($counts);
+        $words = [$outside];
+        foreach ($counts as $bucket => $count) {
+            $words[] = $bucket;
+            $words[] = $count;
+        }
+
+        return $words;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or declines the batch.
+     *
+     * @param  list<int>  $timestamps
+     * @return list<int>
+     */
+    public static function bucketActivityTimestampsNative(array $timestamps, int $now, int $bucketSeconds, int $bucketCount): array
+    {
+        self::w51ActivityWindowStart($now, $bucketSeconds, $bucketCount);
+        $count = \count($timestamps);
+        $maxWords = 2 * min($count, $bucketCount) + 1;
+        $buffer = $count === 0 ? null : self::w51Buffer($maxWords);
+        if ($buffer === null) {
+            return self::bucketActivityTimestampsPhp($timestamps, $now, $bucketSeconds, $bucketCount);
+        }
+        [$ffi, $out, $cap] = $buffer;
+        $packed = pack('P*', ...$timestamps);
+        try {
+            // @phpstan-ignore method.notFound
+            $words = self::w51Decode($out, $ffi->nntmux_w511_admin_dashboard_activity_buckets_batch($packed, \strlen($packed), $count, $now, $bucketSeconds, $bucketCount, $out, $cap), $maxWords);
+        } catch (\Throwable) {
+            $words = null;
+        }
+
+        return $words !== null && \count($words) % 2 === 1
+            ? $words
+            : self::bucketActivityTimestampsPhp($timestamps, $now, $bucketSeconds, $bucketCount);
+    }
+
+    private static function w51ActivityWindowStart(int $now, int $bucketSeconds, int $bucketCount): int
+    {
+        if ($bucketSeconds < 1 || $bucketCount < 1 || $bucketCount > 4096) {
+            throw new \InvalidArgumentException('Activity buckets need a positive width and 1-4096 buckets.');
+        }
+        if ($bucketSeconds > intdiv(PHP_INT_MAX, $bucketCount) || $now < PHP_INT_MIN + $bucketSeconds * $bucketCount) {
+            throw new \InvalidArgumentException('Activity bucket window overflows an integer.');
+        }
+
+        return $now - $bucketSeconds * $bucketCount;
+    }
+
+    /**
+     * Lazily resolved binding plus the reusable output buffer sized for `$words` words.
+     *
+     * @return array{0: \FFI, 1: CData, 2: int}|null
+     */
+    private static function w51Buffer(int $words): ?array
+    {
+        $buffer = self::w51RustFfiState('out', $words);
+
+        return \is_array($buffer) ? $buffer : null;
+    }
+
+    /** @return list<int>|null The `$written` words the export reported, or null when it declined. */
+    private static function w51Decode(CData $out, mixed $written, int $maxWords): ?array
+    {
+        if (! \is_int($written) || $written < 0 || $written > $maxWords) {
+            return null;
+        }
+        if ($written === 0) {
+            return [];
+        }
+        $decoded = unpack('P*', \FFI::string($out, $written * 8));
+
+        /** @var list<int>|null */
+        return \is_array($decoded) ? array_values($decoded) : null;
+    }
+
+    /**
+     * Wave 51 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
+     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
+     */
+    private static function w51RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'out':
+                $ffi ??= RustPipelineLibrary::resolveDomain('admin_status_w51', self::W51_FFI_CDEF) ?? false;
+                if (! $ffi instanceof \FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if (! $out instanceof CData || $outCap < $val) {
+                    $outCap = max(512, $val * 2);
+                    $out = $ffi->new("int64_t[{$outCap}]");
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled;
+        }
     }
 }
