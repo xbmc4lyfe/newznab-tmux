@@ -29408,3 +29408,728 @@ mod wave42_1_binaries_transaction_missed_part_backfill_tests {
         assert_eq!(&out[72..], &[0x5a; 8]);
     }
 }
+
+/// Wave 43.1 pure CPU batch summaries for the release creation, extra, image,
+/// processing and collections cleaning services.
+///
+/// Each export reads a frame of `u32le count`, `count` × `u32le length`, then the
+/// concatenated entry bytes (the frame must be consumed exactly), or `u32le count`,
+/// `u32le 0xFFFFFFFF`, then the entries joined by NUL (exactly `count - 1` NULs, and
+/// no bytes for an empty batch). It writes one `i64le` count per summary key. Malformed frames, null or overlapping buffers
+/// and oversized inputs return -1 without writing; a short output buffer returns
+/// `-required` without writing.
+pub mod w431_release_cleaning {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    pub const MAX_INPUT: usize = 16 * 1024 * 1024;
+
+    pub const CREATION_KEYS: usize = 6;
+    pub const CODEC_KEYS: usize = 11;
+    pub const IMAGE_KEYS: usize = 7;
+    pub const BINARY_KEYS: usize = 7;
+    pub const SUBJECT_KEYS: usize = 8;
+
+    unsafe fn dispatch<const K: usize>(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+        summarize: fn(&[u8]) -> Option<[i64; K]>,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if input.is_null()
+                || out.is_null()
+                || len > MAX_INPUT
+                || len > isize::MAX as usize
+                || cap > isize::MAX as usize
+            {
+                return -1;
+            }
+            let Some(input_end) = (input as usize).checked_add(len) else {
+                return -1;
+            };
+            let Some(out_end) = (out as usize).checked_add(cap) else {
+                return -1;
+            };
+            if len != 0 && cap != 0 && (input as usize) < out_end && (out as usize) < input_end {
+                return -1;
+            }
+            // Both spans and their overlap are checked before borrowing caller memory.
+            let input = unsafe { std::slice::from_raw_parts(input, len) };
+            let Some(counts) = summarize(input) else {
+                return -1;
+            };
+            let needed = K * 8;
+            if needed > cap {
+                return -(needed as isize);
+            }
+            const { assert!(K <= 16) };
+            let mut bytes = [0u8; 128];
+            for (slot, count) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(counts) {
+                *slot = count.to_le_bytes();
+            }
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, needed) };
+            needed as isize
+        }))
+        .unwrap_or(-1)
+    }
+
+    fn read_u32(input: &[u8], at: usize) -> Option<u32> {
+        let bytes = input.get(at..at.checked_add(4)?)?;
+        Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    /// Marks a NUL-separated frame in place of the first length.
+    pub const NUL_FRAME: u32 = u32::MAX;
+
+    /// Calls `visit` for each framed entry; `None` when the frame is malformed.
+    pub fn for_each_entry(input: &[u8], mut visit: impl FnMut(&[u8])) -> Option<usize> {
+        let count = read_u32(input, 0)? as usize;
+        if count > 0 && read_u32(input, 4) == Some(NUL_FRAME) {
+            let blob = &input[8..];
+            let (mut start, mut parts) = (0, 0);
+            scan(
+                blob,
+                |b| u8::from(b == 0),
+                |i| {
+                    if parts + 1 < count {
+                        visit(&blob[start..i]);
+                    }
+                    parts += 1;
+                    start = i + 1;
+                },
+            );
+            if parts + 1 != count {
+                return None;
+            }
+            visit(&blob[start..]);
+            return Some(count);
+        }
+        let header = count.checked_mul(4)?.checked_add(4)?;
+        if header > input.len() {
+            return None;
+        }
+        let mut offset = header;
+        for i in 0..count {
+            let n = read_u32(input, 4 + i * 4)? as usize;
+            let end = offset.checked_add(n)?;
+            visit(input.get(offset..end)?);
+            offset = end;
+        }
+        (offset == input.len()).then_some(count)
+    }
+
+    /// PHP `trim()` default characters: space, tab, LF, CR, NUL and vertical tab.
+    pub fn trim(value: &[u8]) -> &[u8] {
+        let is_trim = |b: &u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b);
+        let start = value
+            .iter()
+            .position(|b| !is_trim(b))
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|b| !is_trim(b))
+            .map_or(start, |i| i + 1);
+        &value[start..end]
+    }
+
+    /// Calls `visit` with every index whose byte satisfies `hit`, skipping 32-byte
+    /// chunks without one. A max reduction over non-short-circuiting byte flags
+    /// vectorizes; boolean folds stay scalar.
+    #[inline(always)]
+    fn scan(value: &[u8], hit: impl Fn(u8) -> u8, mut visit: impl FnMut(usize)) {
+        const CHUNK: usize = 32;
+        for (n, chunk) in value.chunks(CHUNK).enumerate() {
+            if chunk.iter().fold(0u8, |m, &b| m.max(hit(b))) == 0 {
+                continue;
+            }
+            for (j, &b) in chunk.iter().enumerate() {
+                if hit(b) != 0 {
+                    visit(n * CHUNK + j);
+                }
+            }
+        }
+    }
+
+    fn starts_ci(hay: &[u8], at: usize, needle: &[u8]) -> bool {
+        hay.get(at..at + needle.len())
+            .is_some_and(|s| s.eq_ignore_ascii_case(needle))
+    }
+
+    fn digit_at(hay: &[u8], at: usize) -> bool {
+        hay.get(at).is_some_and(u8::is_ascii_digit)
+    }
+
+    fn digits_from(hay: &[u8], at: usize) -> usize {
+        hay.get(at..).map_or(0, |rest| {
+            rest.iter().take_while(|b| b.is_ascii_digit()).count()
+        })
+    }
+
+    /// PCRE `\s` outside UTF mode: space, tab, LF, VT, FF and CR.
+    fn pcre_space(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+    }
+
+    /// PCRE `^(?:alt)$` without `D`: the whole subject, or the subject minus one trailing LF.
+    fn anchored_ci(value: &[u8], alts: &[&[u8]]) -> bool {
+        let body = value.strip_suffix(b"\n").unwrap_or(value);
+        alts.iter()
+            .any(|a| value.eq_ignore_ascii_case(a) || body.eq_ignore_ascii_case(a))
+    }
+
+    /// `\d+\/\d+` then a byte from `close`, starting just after an opening bracket at `open`.
+    fn counter_at(value: &[u8], open: usize, close: &[u8]) -> bool {
+        let a = digits_from(value, open + 1);
+        if a == 0 || value.get(open + 1 + a) != Some(&b'/') {
+            return false;
+        }
+        let at = open + 2 + a;
+        let b = digits_from(value, at);
+        b > 0 && value.get(at + b).is_some_and(|c| close.contains(c))
+    }
+
+    fn summarize<const K: usize>(
+        input: &[u8],
+        trim_entries: bool,
+        classify: fn(&[u8], &mut [i64; K]),
+    ) -> Option<[i64; K]> {
+        let mut counts = [0i64; K];
+        for_each_entry(input, |entry| {
+            counts[0] += 1;
+            let entry = if trim_entries { trim(entry) } else { entry };
+            if entry.is_empty() {
+                counts[1] += 1;
+            } else {
+                classify(entry, &mut counts);
+            }
+        })?;
+        Some(counts)
+    }
+
+    /// Stripped collection subject characters `#@$%^`, `§`, `¨`, `©`, `Ö` (UTF-8 bytes), and
+    /// `/"[^"]+"/`: two consecutive quotes with at least one byte between them.
+    fn creation_flags(s: &[u8]) -> (bool, bool) {
+        let (mut stripped, mut quoted, mut last_quote) = (false, false, None::<usize>);
+        scan(
+            s,
+            |b| {
+                u8::from(b == b'#')
+                    | u8::from(b == b'@')
+                    | u8::from(b == b'$')
+                    | u8::from(b == b'%')
+                    | u8::from(b == b'^')
+                    | u8::from(b == b'"')
+                    | u8::from(b == 0xc2)
+                    | u8::from(b == 0xc3)
+            },
+            |i| match s[i] {
+                b'"' => {
+                    quoted |= last_quote.is_some_and(|l| i > l + 1);
+                    last_quote = Some(i);
+                }
+                0xc2 => stripped |= matches!(s.get(i + 1), Some(0xa7..=0xa9)),
+                0xc3 => stripped |= s.get(i + 1) == Some(&0x96),
+                _ => stripped = true,
+            },
+        );
+        (stripped, quoted)
+    }
+
+    fn creation(input: &[u8]) -> Option<[i64; CREATION_KEYS]> {
+        summarize(input, true, |s, c| {
+            let (stripped, quoted) = creation_flags(s);
+            c[2] += i64::from(stripped);
+            c[3] += i64::from(quoted);
+            c[4] += i64::from(!s.is_ascii());
+            c[5] += i64::from(s.len() > 255);
+        })
+    }
+
+    const HEVC: u8 = 1;
+    const AVC: u8 = 2;
+    const ASP: u8 = 4;
+    const DIVX: u8 = 8;
+    const XVID: u8 = 16;
+    const WMV: u8 = 32;
+
+    /// Mirrors ReleaseExtraService::makeCodecPrettyPhp(); the slot is 2 + label order.
+    pub fn codec_slot(codec: &[u8]) -> usize {
+        let mut found = 0u8;
+        scan(
+            codec,
+            |b| {
+                let l = b | 0x20;
+                u8::from(l == b'h')
+                    | u8::from(l == b'a')
+                    | u8::from(l == b'd')
+                    | u8::from(l == b'x')
+                    | u8::from(l == b'w')
+            },
+            |i| {
+                let at = |needle: &[u8]| starts_ci(codec, i, needle);
+                found |= match codec[i] | 0x20 {
+                    b'h' if at(b"hevc") => HEVC,
+                    b'a' if at(b"avc") => AVC,
+                    b'a' if at(b"asp") => ASP,
+                    b'd' if at(b"dx50") || at(b"divx") || at(b"div3") => DIVX,
+                    b'x' if at(b"xvid") => XVID,
+                    b'w' if at(b"wmv") || at(b"wvc1") => WMV,
+                    _ => 0,
+                };
+            },
+        );
+        if found & HEVC != 0 || anchored_ci(codec, &[b"36"]) {
+            2
+        } else if found & AVC != 0 || anchored_ci(codec, &[b"7", b"27", b"H264"]) {
+            3
+        } else if found & ASP != 0
+            || anchored_ci(codec, &[b"20", b"FMP4", b"MP42", b"MP43", b"MPG4"])
+        {
+            4
+        } else if anchored_ci(codec, &[b"2"]) {
+            5
+        } else if codec == b"MPEG" {
+            6
+        } else if found & DIVX != 0 {
+            7
+        } else if found & XVID != 0 {
+            8
+        } else if found & WMV != 0 {
+            9
+        } else {
+            10
+        }
+    }
+
+    fn codec(input: &[u8]) -> Option<[i64; CODEC_KEYS]> {
+        summarize(input, false, |s, c| c[codec_slot(s)] += 1)
+    }
+
+    fn image(input: &[u8]) -> Option<[i64; IMAGE_KEYS]> {
+        const EXTS: [&[u8]; 6] = [b"jpg", b"jpeg", b"png", b"gif", b"webp", b"bmp"];
+        summarize(input, true, |s, c| {
+            let bad = s.iter().fold(0u8, |m, &b| {
+                m | u8::from(!(b.is_ascii_alphanumeric() | (b == b'_') | (b == b'-')))
+            });
+            c[2] += i64::from(s[0].is_ascii_alphanumeric() && bad == 0);
+            let scheme = if starts_ci(s, 0, b"http://") {
+                Some(7)
+            } else if starts_ci(s, 0, b"https://") {
+                Some(8)
+            } else {
+                None
+            };
+            if let Some(start) = scheme {
+                c[3] += 1;
+                let rest = &s[start..];
+                let authority = rest
+                    .iter()
+                    .position(|b| matches!(b, b'/' | b'?' | b'#'))
+                    .map_or(rest, |end| &rest[..end]);
+                c[4] += i64::from(authority.contains(&b'@'));
+                c[6] += i64::from(s.contains(&b'?'));
+            }
+            // `/\.(?:jpe?g|png|gif|webp|bmp)(?:[?#]|\z)/i`.
+            let mut ext = false;
+            scan(
+                s,
+                |b| u8::from(b == b'.'),
+                |i| {
+                    // Only a byte that can start an extension runs the comparisons.
+                    if s.get(i + 1)
+                        .is_some_and(|b| matches!(b | 0x20, b'j' | b'p' | b'g' | b'w' | b'b'))
+                    {
+                        ext |= EXTS.iter().any(|e| {
+                            starts_ci(s, i + 1, e)
+                                && s.get(i + 1 + e.len())
+                                    .is_none_or(|n| *n == b'?' || *n == b'#')
+                        });
+                    }
+                },
+            );
+            c[5] += i64::from(ext);
+        })
+    }
+
+    /// `\.vol\d+\+\d+\.par2` (case-insensitive) starting at the dot `i`.
+    fn par2_volume_at(s: &[u8], i: usize) -> bool {
+        if !starts_ci(s, i + 1, b"vol") {
+            return false;
+        }
+        let a = digits_from(s, i + 4);
+        if a == 0 || s.get(i + 4 + a) != Some(&b'+') {
+            return false;
+        }
+        let at = i + 5 + a;
+        let b = digits_from(s, at);
+        b > 0 && starts_ci(s, at + b, b".par2")
+    }
+
+    /// `\.(?:rar|zip|7z|r\d{2}|\d{3})(?=["\s]|\z)` (case-insensitive) starting at the dot `i`.
+    fn archive_at(s: &[u8], i: usize) -> bool {
+        let follows = |at: usize| s.get(at).is_none_or(|b| *b == b'"' || pcre_space(*b));
+        let p = i + 1;
+        [b"rar".as_slice(), b"zip", b"7z"]
+            .iter()
+            .any(|e| starts_ci(s, p, e) && follows(p + e.len()))
+            || (s.get(p).is_some_and(|c| c.eq_ignore_ascii_case(&b'r'))
+                && digit_at(s, p + 1)
+                && digit_at(s, p + 2)
+                && follows(p + 3))
+            || (digit_at(s, p) && digit_at(s, p + 1) && digit_at(s, p + 2) && follows(p + 3))
+    }
+
+    fn binaries(input: &[u8]) -> Option<[i64; BINARY_KEYS]> {
+        let mut counts = summarize::<BINARY_KEYS>(input, true, |s, c| {
+            let (mut par2, mut volume, mut archive, mut counter) = (false, false, false, false);
+            scan(
+                s,
+                |b| u8::from(b == b'.') | u8::from(b == b'('),
+                |i| {
+                    if s[i] == b'(' {
+                        counter |= counter_at(s, i, b")");
+                    } else {
+                        // Dispatch on the byte after the dot; most dots start no pattern.
+                        match s.get(i + 1).map(|b| b | 0x20) {
+                            Some(b'p') => par2 |= starts_ci(s, i + 1, b"par2"),
+                            Some(b'v') => volume |= par2_volume_at(s, i),
+                            Some(b'r' | b'z' | b'7' | b'0'..=b'9') => archive |= archive_at(s, i),
+                            _ => {}
+                        }
+                    }
+                },
+            );
+            c[2] += i64::from(par2);
+            c[3] += i64::from(volume);
+            c[4] += i64::from(archive);
+            c[5] += i64::from(counter);
+        })?;
+        counts[6] = i64::from(counts[0] > counts[1] && counts[2] == counts[0] - counts[1]);
+        Some(counts)
+    }
+
+    fn subjects(input: &[u8]) -> Option<[i64; SUBJECT_KEYS]> {
+        const MUSIC: [&[u8]; 5] = [b"flac", b"lossless", b"mp3", b"music", b"sounds"];
+        summarize(input, true, |s, c| {
+            let utf8 = std::str::from_utf8(s).is_ok();
+            let (mut size, mut ext, mut counter, mut music) = (false, false, false, false);
+            scan(
+                s,
+                |b| {
+                    u8::from(b == b' ')
+                        | u8::from(b == b'"')
+                        | u8::from(b == b'(')
+                        | u8::from(b == b'[')
+                        | u8::from(b == b'.')
+                },
+                |i| match s[i] {
+                    // `\d [kKmMgG][bB]`, the required core of REGEX_SUBJECT_SIZE.
+                    b' ' => {
+                        size |= i > 0
+                            && s[i - 1].is_ascii_digit()
+                            && s.get(i + 1)
+                                .is_some_and(|b| matches!(b | 0x20, b'k' | b'm' | b'g'))
+                            && s.get(i + 2).is_some_and(|b| b | 0x20 == b'b');
+                    }
+                    // `\.[A-Za-z0-9]{2,4}"`.
+                    b'"' => {
+                        ext |= (2..=4).any(|k| {
+                            i > k
+                                && s[i - k - 1] == b'.'
+                                && s[i - k..i].iter().all(u8::is_ascii_alphanumeric)
+                        });
+                    }
+                    // `\.(flac|lossless|mp3|music|sounds)`, case-sensitive.
+                    b'.' => {
+                        if s.get(i + 1)
+                            .is_some_and(|b| matches!(b, b'f' | b'l' | b'm' | b's'))
+                        {
+                            music |= MUSIC.iter().any(|m| s[i + 1..].starts_with(m));
+                        }
+                    }
+                    _ => counter |= counter_at(s, i, b")]"),
+                },
+            );
+            // `/[\-_\s]{0,3}yEnc$/ui`: the optional prefix never decides a match, and
+            // trimmed entries carry no trailing LF; invalid UTF-8 never matches.
+            c[2] +=
+                i64::from(utf8 && s.len() >= 4 && s[s.len() - 4..].eq_ignore_ascii_case(b"yenc"));
+            c[3] += i64::from(size);
+            c[4] += i64::from(ext);
+            c[5] += i64::from(counter);
+            c[6] += i64::from(music);
+            c[7] += i64::from(!utf8);
+        })
+    }
+
+    /// # Safety
+    /// `input` must be readable for `len` bytes and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w431_release_creation_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, creation) }
+    }
+
+    /// # Safety
+    /// `input` must be readable for `len` bytes and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w431_release_extra_codec_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, codec) }
+    }
+
+    /// # Safety
+    /// `input` must be readable for `len` bytes and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w431_release_image_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, image) }
+    }
+
+    /// # Safety
+    /// `input` must be readable for `len` bytes and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w431_release_processing_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, binaries) }
+    }
+
+    /// # Safety
+    /// `input` must be readable for `len` bytes and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w431_collections_subject_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, subjects) }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        type Export = unsafe extern "C" fn(*const u8, usize, *mut u8, usize) -> isize;
+
+        fn frame(entries: &[&[u8]]) -> Vec<u8> {
+            let mut wire = (entries.len() as u32).to_le_bytes().to_vec();
+            for e in entries {
+                wire.extend_from_slice(&(e.len() as u32).to_le_bytes());
+            }
+            for e in entries {
+                wire.extend_from_slice(e);
+            }
+            wire
+        }
+
+        fn nul_frame(entries: &[&[u8]]) -> Vec<u8> {
+            let mut wire = (entries.len() as u32).to_le_bytes().to_vec();
+            wire.extend_from_slice(&NUL_FRAME.to_le_bytes());
+            wire.extend_from_slice(&entries.join(&0u8));
+            wire
+        }
+
+        fn run(export: Export, entries: &[&[u8]]) -> Vec<i64> {
+            let counts = run_wire(export, &frame(entries));
+            if entries.iter().all(|e| !e.contains(&0)) && !entries.is_empty() {
+                assert_eq!(run_wire(export, &nul_frame(entries)), counts, "NUL frame");
+            }
+            counts
+        }
+
+        fn run_wire(export: Export, wire: &[u8]) -> Vec<i64> {
+            let mut out = [0u8; 128];
+            let written = unsafe { export(wire.as_ptr(), wire.len(), out.as_mut_ptr(), out.len()) };
+            assert!(written > 0 && written % 8 == 0, "written {written}");
+            out[..written as usize]
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| i64::from_le_bytes(*c))
+                .collect()
+        }
+
+        #[test]
+        fn cleaning_w431_creation_counts() {
+            let got = run(
+                nntmux_w431_release_creation_batch,
+                &[
+                    b"[01/10] - \"file.rar\" yEnc",
+                    b"  \t\0",
+                    "Caf\u{e9} \u{a9} #1".as_bytes(),
+                    b"\"\"",
+                    &[b'x'; 256],
+                    "\u{d6}".as_bytes(),
+                ],
+            );
+            assert_eq!(got, vec![6, 1, 2, 1, 2, 1]);
+        }
+
+        #[test]
+        fn cleaning_w431_codec_slots_follow_php_order() {
+            let cases: [(&[u8], usize); 16] = [
+                (b"36", 2),
+                (b"36\n", 2),
+                (b"x36", 10),
+                (b"hevc", 2),
+                (b"h264", 3),
+                (b"27\n", 3),
+                (b"AVC1", 3),
+                (b"mpg4", 4),
+                (b"MPEG-4 ASP", 4),
+                (b"2", 5),
+                (b"2\n\n", 10),
+                (b"MPEG", 6),
+                (b"mpeg", 10),
+                (b"DIV3", 7),
+                (b"xvid", 8),
+                (b"WVC1", 9),
+            ];
+            for (codec, slot) in cases {
+                assert_eq!(codec_slot(codec), slot, "{codec:?}");
+            }
+            let got = run(
+                nntmux_w431_release_extra_codec_batch,
+                &[b"", b"hevc", b" ", b"wmv3"],
+            );
+            assert_eq!(got, vec![4, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1]);
+        }
+
+        #[test]
+        fn cleaning_w431_image_counts() {
+            let got = run(
+                nntmux_w431_release_image_batch,
+                &[
+                    b"abc-123_x",
+                    b"_abc",
+                    b"HTTPS://user:pw@host/a.JPG?x=1",
+                    b"http://host/p@x/img.webp",
+                    b"cover.png",
+                    b"",
+                ],
+            );
+            assert_eq!(got, vec![6, 1, 1, 2, 1, 3, 1]);
+        }
+
+        #[test]
+        fn cleaning_w431_binary_counts_and_par2_only() {
+            let got = run(
+                nntmux_w431_release_processing_batch,
+                &[b"a.vol07+08.PAR2", b"b.par2", b" "],
+            );
+            assert_eq!(got, vec![3, 1, 2, 1, 0, 0, 1]);
+            let got = run(
+                nntmux_w431_release_processing_batch,
+                &[
+                    b"x.part01.rar \"",
+                    b"x.r07",
+                    b"x.001\"",
+                    b"x.7zz",
+                    b"(1/2)",
+                    b"x.par2",
+                ],
+            );
+            assert_eq!(got, vec![6, 0, 1, 0, 3, 1, 0]);
+            assert_eq!(run(nntmux_w431_release_processing_batch, &[]), vec![0; 7]);
+        }
+
+        #[test]
+        fn cleaning_w431_subject_counts() {
+            let got = run(
+                nntmux_w431_collections_subject_batch,
+                &[
+                    b"alt.binaries.sounds.flac",
+                    b"[1/5] - \"song.flac\" - 12.5 MB yEnc",
+                    b"bad \xff yEnc",
+                    b"x.mp3",
+                ],
+            );
+            assert_eq!(got, vec![4, 0, 1, 1, 1, 1, 3, 1]);
+        }
+
+        #[test]
+        fn cleaning_w431_rejects_malformed_frames_without_writing() {
+            let exports: [Export; 5] = [
+                nntmux_w431_release_creation_batch,
+                nntmux_w431_release_extra_codec_batch,
+                nntmux_w431_release_image_batch,
+                nntmux_w431_release_processing_batch,
+                nntmux_w431_collections_subject_batch,
+            ];
+            let good = frame(&[b"entry"]);
+            let mut trailing = good.clone();
+            trailing.push(b'x');
+            let mut nul_short = nul_frame(&[b"a", b"b", b"c"]);
+            nul_short.truncate(nul_short.len() - 2);
+            let mut nul_long = nul_frame(&[b"a", b"b"]);
+            nul_long.extend_from_slice(b"\0c");
+            let bad: [&[u8]; 8] = [
+                &nul_short,
+                &nul_long,
+                b"\x00\0\0\0\xff\xff\xff\xff",
+                b"",
+                b"\x01\0\0",
+                b"\x01\0\0\0",
+                b"\x01\0\0\0\x09\0\0\0abc",
+                &trailing,
+            ];
+            for export in exports {
+                let mut out = [0x5au8; 128];
+                for wire in bad {
+                    let r =
+                        unsafe { export(wire.as_ptr(), wire.len(), out.as_mut_ptr(), out.len()) };
+                    assert_eq!(r, -1);
+                }
+                let r = unsafe { export(std::ptr::null(), 0, out.as_mut_ptr(), out.len()) };
+                assert_eq!(r, -1);
+                let r = unsafe { export(good.as_ptr(), good.len(), std::ptr::null_mut(), 8) };
+                assert_eq!(r, -1);
+                let r =
+                    unsafe { export(good.as_ptr(), MAX_INPUT + 1, out.as_mut_ptr(), out.len()) };
+                assert_eq!(r, -1);
+                let required = unsafe { export(good.as_ptr(), good.len(), out.as_mut_ptr(), 8) };
+                assert!(required < -8);
+                assert_eq!(out, [0x5a; 128]);
+                let mut overlap = good.clone();
+                overlap.resize(256, 0);
+                let p = overlap.as_mut_ptr();
+                let r = unsafe { export(p, good.len(), p.wrapping_add(4), 128) };
+                assert_eq!(r, -1);
+                let r = unsafe {
+                    export(
+                        good.as_ptr(),
+                        good.len(),
+                        out.as_mut_ptr(),
+                        (-required) as usize,
+                    )
+                };
+                assert_eq!(r, -required, "the reported size is sufficient");
+            }
+        }
+
+        #[test]
+        fn cleaning_w431_trim_matches_php() {
+            assert_eq!(trim(b"\0\x0b x \t\n\r"), b"x");
+            assert_eq!(trim(b"\x0cx\x0c"), b"\x0cx\x0c");
+            assert_eq!(trim(b" \n "), b"");
+        }
+    }
+}

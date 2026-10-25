@@ -2299,4 +2299,88 @@ final class ReleaseProcessingService
     {
         return ['  Releases added: '.number_format($releases), '  NZBs created: '.number_format($nzbs), $dupes > 0 ? '  Duplicates skipped: '.number_format($dupes) : '', '  Processing cycles: '.number_format($iterations)];
     }
+
+    /** Enabled: paired common/uncommon mean and p99 gains reach 1.5x in all eight runs (min 1.53x; see the W43 parity test). */
+    public const bool W431_RUST_FFI_DEFAULT = true;
+
+    public const string W431_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w431_release_processing_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private const array W431_SUMMARY_KEYS = ['total_names', 'empty_name_count', 'par2_count', 'par2_volume_count', 'archive_count', 'counter_count', 'par2_only'];
+
+    private static ?bool $w431UseRustFfi = null;
+
+    private static FFI|false|null $w431Ffi = null;
+
+    public static function useW431RustFfi(bool $enable = true): void
+    {
+        self::$w431UseRustFfi = $enable;
+    }
+
+    public static function usesW431RustFfi(): bool
+    {
+        return self::$w431UseRustFfi ?? self::W431_RUST_FFI_DEFAULT;
+    }
+
+    /** Restores the benchmark default and drops the cached library handle; earlier toggles are untouched. */
+    public static function resetW431RustFfi(): void
+    {
+        self::$w431UseRustFfi = null;
+        self::$w431Ffi = null;
+    }
+
+    /**
+     * Summarizes trimmed binary names the way deleteUnwantedCollections() screens collections: PAR2 names
+     * (`.par2`), PAR2 volumes, archive extensions before a quote, whitespace or the end, and `(n/m)` counters.
+     * `par2_only` is 1 when the batch has non-empty names and every one is a PAR2 name.
+     * Entries come from strings, integers, or the first non-null name, filename array field; other values
+     * (including objects) count as empty entries.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeBinaryNameBatch(array $rows): array
+    {
+        return self::usesW431RustFfi() ? self::summarizeBinaryNameBatchNative($rows) : self::summarizeBinaryNameBatchPhp($rows);
+    }
+
+    /**
+     * Rust summary; falls back to PHP when the library or input frame is unusable.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeBinaryNameBatchNative(array $rows): array
+    {
+        $values = CollectionsCleaningService::w431Invoke(self::$w431Ffi, self::W431_FFI_CDEF, 'nntmux_w431_release_processing_batch', $rows, ['name', 'filename'], \count(self::W431_SUMMARY_KEYS));
+
+        return $values === null ? self::summarizeBinaryNameBatchPhp($rows) : array_combine(self::W431_SUMMARY_KEYS, $values);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeBinaryNameBatchPhp(array $rows): array
+    {
+        $summary = array_fill_keys(self::W431_SUMMARY_KEYS, 0);
+        foreach (CollectionsCleaningService::w431Entries($rows, ['name', 'filename']) as $entry) {
+            $summary['total_names']++;
+            $entry = trim($entry);
+            if ($entry === '') {
+                $summary['empty_name_count']++;
+
+                continue;
+            }
+            $summary['par2_count'] += (int) (stripos($entry, '.par2') !== false);
+            $summary['par2_volume_count'] += (int) (preg_match('/\.vol\d+\+\d+\.par2/i', $entry) === 1);
+            $summary['archive_count'] += (int) (preg_match('/\.(?:rar|zip|7z|r\d{2}|\d{3})(?=["\s]|\z)/i', $entry) === 1);
+            $summary['counter_count'] += (int) (preg_match('/\(\d+\/\d+\)/', $entry) === 1);
+        }
+        $named = $summary['total_names'] - $summary['empty_name_count'];
+        $summary['par2_only'] = (int) ($named > 0 && $summary['par2_count'] === $named);
+
+        return $summary;
+    }
 }
