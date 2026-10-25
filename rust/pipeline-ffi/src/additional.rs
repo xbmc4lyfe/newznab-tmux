@@ -36074,3 +36074,907 @@ mod w506_additional_batch_tests {
         assert_eq!((status, out[0]), (1, 0));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 51.6: AdditionalProcessing batch helpers (`nntmux_w516_*`) for
+// FrameQualityScorer, ImageCandidateRanker, AdditionalCandidateQuery,
+// AdditionalProcessingDiagnostics and AdditionalProcessingOrchestrator. Same
+// conventions as Wave 50.6: one crossing per batch, NUL-joined strings (plus,
+// when a value holds a NUL, the same list joined with 0x01) or `pack('V*')`
+// lengths over a concatenation, machine-order `int64_t` columns in, fixed-width
+// `int64_t` rows out (read with `unpack('P*')`). Every export returns 1, -1 for
+// invalid input (PHP then computes the batch) or -2 when `out` is null,
+// misaligned or too small, and leaves `out` untouched unless it returns 1.
+// ---------------------------------------------------------------------------
+
+/// GUID bucket of PHP `strtolower(substr($guid, 0, 1))`: 0..=15 for a hex
+/// digit, 16 for anything else (including an empty GUID).
+#[inline]
+fn w516_bucket(guid: &[u8]) -> usize {
+    match guid.first() {
+        Some(&byte @ b'0'..=b'9') => usize::from(byte - b'0'),
+        Some(&byte @ (b'a'..=b'f' | b'A'..=b'F')) => usize::from((byte | 0x20) - b'a' + 10),
+        _ => 16,
+    }
+}
+
+/// PHP `strlen($guid) === 40 && ctype_xdigit($guid)`, branch-free over the
+/// fixed width so it vectorizes.
+#[inline]
+fn w516_sha1_hex(guid: &[u8]) -> bool {
+    let Ok(bytes) = <&[u8; 40]>::try_from(guid) else {
+        return false;
+    };
+    let mut bad = 0u8;
+    for &byte in bytes {
+        let digit = byte.wrapping_sub(b'0') < 10;
+        let alpha = (byte | 0x20).wrapping_sub(b'a') < 6;
+        bad |= u8::from(!(digit | alpha));
+    }
+    bad == 0
+}
+
+/// A non-negative row folded to 32 bits for the FNV-1a digest.
+#[inline]
+fn w516_fold(row: i64) -> u32 {
+    (row ^ (row >> 32)) as u32
+}
+
+// --- FrameQualityScorer::scoreFrameBatch -------------------------------------
+
+pub(crate) const W516_FRAME_HEADER: usize = 9;
+
+/// `measureRgbPhp()` over every sample plus `best()`'s choice. `[0]` count,
+/// `[1]` valid, `[2]` blank (valid, stddev below the minimum), `[3]` non-blank
+/// frames of normal brightness, `[4]` best index (-1 when none), `[5]` and
+/// `[6]` its floor(mean * 1000) and floor(stddev * 1000), `[7]` invalid, `[8]`
+/// FNV-1a digest; then per sample `valid | blank << 1 | normal << 2 |
+/// mean_milli << 4 | stddev_milli << 24` (0 for an invalid sample). The luma
+/// arithmetic keeps PHP's evaluation order, so the doubles are bit-identical.
+pub(crate) fn w516_frame_batch(
+    samples: &[&[u8]],
+    min_stddev: f64,
+    min_luma: f64,
+    max_luma: f64,
+) -> Vec<i64> {
+    let count = samples.len();
+    let mut out = vec![0i64; W516_FRAME_HEADER + count];
+    out[0] = count as i64;
+    out[4] = -1;
+    let mut best: Option<(bool, f64)> = None;
+    let mut digest = W47_FNV_OFFSET;
+    for (index, sample) in samples.iter().enumerate() {
+        let mut row = 0i64;
+        if sample.is_empty() || !sample.len().is_multiple_of(3) {
+            out[7] += 1;
+        } else {
+            let (mut sum, mut squares) = (0.0f64, 0.0f64);
+            for pixel in sample.as_chunks::<3>().0 {
+                let luma = 0.299 * f64::from(pixel[0])
+                    + 0.587 * f64::from(pixel[1])
+                    + 0.114 * f64::from(pixel[2]);
+                sum += luma;
+                squares += luma * luma;
+            }
+            let pixels = (sample.len() / 3) as f64;
+            let mean = sum / pixels;
+            let variance = squares / pixels - mean * mean;
+            let stddev = if variance > 0.0 { variance.sqrt() } else { 0.0 };
+            let blank = stddev < min_stddev;
+            let normal = mean >= min_luma && mean <= max_luma;
+            let mean_milli = (mean * 1000.0).floor() as i64;
+            let stddev_milli = (stddev * 1000.0).floor() as i64;
+            out[1] += 1;
+            if blank {
+                out[2] += 1;
+            } else {
+                out[3] += i64::from(normal);
+                let better = match best {
+                    None => true,
+                    Some((best_normal, best_stddev)) => {
+                        normal & !best_normal || (normal == best_normal && stddev > best_stddev)
+                    }
+                };
+                if better {
+                    best = Some((normal, stddev));
+                    out[4] = index as i64;
+                    out[5] = mean_milli;
+                    out[6] = stddev_milli;
+                }
+            }
+            row = 1
+                | i64::from(blank) << 1
+                | i64::from(normal) << 2
+                | mean_milli << 4
+                | stddev_milli << 24;
+        }
+        digest = w47_fnv(digest, w516_fold(row));
+        out[W516_FRAME_HEADER + index] = row;
+    }
+    out[8] = i64::from(digest);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_count` values.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_w516_frame_luma_batch(
+    samples: *const u8,
+    samples_len: usize,
+    sample_lens: *const u8,
+    sample_lens_len: usize,
+    count: usize,
+    min_stddev: f64,
+    min_luma: f64,
+    max_luma: f64,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w49_run(out, out_count, || {
+            let samples = w47_items(
+                w15_input(samples, samples_len)?,
+                w15_input(sample_lens, sample_lens_len)?,
+                count,
+            )?;
+            Some(w516_frame_batch(&samples, min_stddev, min_luma, max_luma))
+        })
+    }
+}
+
+// --- ImageCandidateRanker::rankCandidateBatch --------------------------------
+
+pub(crate) const W516_RANK_HEADER: usize = 7;
+
+/// `rankPhp()` and `sort()` order for every name. `[0]` count, `[1..=4]` per
+/// rank, `[5]` index of the best image (-1 when empty), `[6]` FNV-1a digest; then
+/// per name `rank | size << 4` and the sorted indexes (rank, then larger size,
+/// then input order). Sizes are clamped to 0..2^40-1. None when PHP's file-name
+/// semantics require the PHP path (non-ASCII, trailing separators, `""`).
+pub(crate) fn w516_rank_batch(names: &[&[u8]], sizes: &[i64]) -> Option<Vec<i64>> {
+    let count = names.len();
+    let mut out = vec![0i64; W516_RANK_HEADER + 2 * count];
+    out[0] = count as i64;
+    out[5] = -1;
+    let mut keys = Vec::with_capacity(count);
+    let mut digest = W47_FNV_OFFSET;
+    for (index, name) in names.iter().enumerate() {
+        if let Some(first) = name.iter().position(|&byte| byte == b'"')
+            && name.get(first + 1) == Some(&b'"')
+        {
+            return None;
+        }
+        let rank = i64::from(image_candidate_rank(name)?);
+        let size = w47_clamp(sizes[index]);
+        out[1 + rank as usize] += 1;
+        let row = rank | size << 4;
+        digest = w47_fnv(digest, w516_fold(row));
+        out[W516_RANK_HEADER + index] = row;
+        keys.push((rank, -size, index));
+    }
+    keys.sort_unstable();
+    for (position, &(_, _, index)) in keys.iter().enumerate() {
+        digest = w47_fnv(digest, index as u32);
+        out[W516_RANK_HEADER + count + position] = index as i64;
+    }
+    if let Some(&(_, _, index)) = keys.first() {
+        out[5] = index as i64;
+    }
+    out[6] = i64::from(digest);
+    Some(out)
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_count` values.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_w516_image_rank_batch(
+    names: *const u8,
+    names_len: usize,
+    name_twin: *const u8,
+    name_twin_len: usize,
+    sizes: *const u8,
+    sizes_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w49_run(out, out_count, || {
+            let names = w49_items(
+                w15_input(names, names_len)?,
+                w15_input(name_twin, name_twin_len)?,
+                count,
+            )?;
+            let sizes = w47_ints(w15_input(sizes, sizes_len)?, 1, count)?;
+            w516_rank_batch(&names, &sizes)
+        })
+    }
+}
+
+// --- AdditionalCandidateQuery::planClaimBatch --------------------------------
+
+pub(crate) const W516_CLAIM_HEADER: usize = 46;
+pub(crate) const W516_CLAIM_COLUMNS: usize = 8;
+
+/// The candidate predicates and claim order over in-memory rows. `ints` holds
+/// eight columns of `guids.len()` values: id, postdate, size, passwordstatus,
+/// haspreview, nzbstatus, claimed-at and archive-retry-at (Unix seconds, 0 for
+/// NULL); `params` is min size, max size (0 disables either), now, stale-before,
+/// password checks (non-zero enables) and the claim limit (at least 1).
+///
+/// Reasons, first failing predicate wins: 0 eligible, 1 password status, 2
+/// preview, 3 NZB status, 4 archive retry pending, 5 too small, 6 too large, 7
+/// actively claimed. `[0]` count, `[1..=8]` per reason, `[9..=25]` bucket
+/// totals (eligible or claimed), `[26..=42]` bucket available (eligible), `[43]`
+/// selected, `[44]` GUIDs that are not 40 hex digits, `[45]` FNV-1a digest; then
+/// per row `reason | bucket << 3 | selected << 8 | well_formed << 9 | order <<
+/// 10`, where `order` is the 1-based claim position of an eligible row
+/// (postdate descending, id, input order) and 0 otherwise.
+pub(crate) fn w516_claim_batch(guids: &[&[u8]], ints: &[i64], params: &[i64]) -> Vec<i64> {
+    let count = guids.len();
+    let column = |column: usize| &ints[column * count..(column + 1) * count];
+    let (ids, postdates, sizes) = (column(0), column(1), column(2));
+    let (passwords, previews, nzbs) = (column(3), column(4), column(5));
+    let (claims, retries) = (column(6), column(7));
+    let (min, max, now, stale, checks) = (params[0], params[1], params[2], params[3], params[4]);
+    let mut out = vec![0i64; W516_CLAIM_HEADER + count];
+    out[0] = count as i64;
+    let mut eligible = Vec::with_capacity(count);
+    for (index, guid) in guids.iter().enumerate() {
+        let password = passwords[index];
+        let size = sizes[index];
+        let reason: usize = if !(password == -1 || (checks == 0 && password == 0)) {
+            1
+        } else if previews[index] != -1 {
+            2
+        } else if nzbs[index] != 1 {
+            3
+        } else if retries[index] != 0 && retries[index] > now {
+            4
+        } else if min > 0 && size <= min {
+            5
+        } else if max > 0 && size >= max {
+            6
+        } else if claims[index] != 0 && claims[index] >= stale {
+            7
+        } else {
+            0
+        };
+        let bucket = w516_bucket(guid);
+        let well_formed = w516_sha1_hex(guid);
+        out[1 + reason] += 1;
+        out[44] += i64::from(!well_formed);
+        if reason == 0 || reason == 7 {
+            out[9 + bucket] += 1;
+        }
+        if reason == 0 {
+            out[26 + bucket] += 1;
+            eligible.push((std::cmp::Reverse(postdates[index]), ids[index], index));
+        }
+        out[W516_CLAIM_HEADER + index] = (reason | bucket << 3 | usize::from(well_formed) << 9) as i64;
+    }
+    eligible.sort_unstable();
+    let selected = eligible.len().min(params[5].max(1) as usize);
+    out[43] = selected as i64;
+    for (position, &(_, _, index)) in eligible.iter().enumerate() {
+        out[W516_CLAIM_HEADER + index] |= ((position + 1) << 10 | usize::from(position < selected) << 8) as i64;
+    }
+    let mut digest = W47_FNV_OFFSET;
+    for &row in &out[W516_CLAIM_HEADER..] {
+        digest = w47_fnv(digest, w516_fold(row));
+    }
+    out[45] = i64::from(digest);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_count` values.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_w516_candidate_claim_batch(
+    guids: *const u8,
+    guids_len: usize,
+    guid_twin: *const u8,
+    guid_twin_len: usize,
+    ints: *const u8,
+    ints_len: usize,
+    params: *const u8,
+    params_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w49_run(out, out_count, || {
+            let guids = w49_items(
+                w15_input(guids, guids_len)?,
+                w15_input(guid_twin, guid_twin_len)?,
+                count,
+            )?;
+            let ints = w47_ints(w15_input(ints, ints_len)?, W516_CLAIM_COLUMNS, count)?;
+            let params = w47_ints(w15_input(params, params_len)?, 1, 6)?;
+            Some(w516_claim_batch(&guids, &ints, &params))
+        })
+    }
+}
+
+// --- AdditionalProcessingDiagnostics::matchClaimIndexBatch -------------------
+
+pub(crate) const W516_INDEX_HEADER: usize = 8;
+
+/// `AdditionalProcessingDiagnostics::REQUIRED_CLAIM_INDEX_COLUMNS`.
+const W516_CLAIM_INDEX_COLUMNS: [&[u8]; 7] = [
+    b"passwordstatus",
+    b"haspreview",
+    b"nzbstatus",
+    b"leftguid",
+    b"postdate",
+    b"id",
+    b"additional_pp_claimed_at",
+];
+
+/// Claim-queue index checks over schema indexes; `columns` concatenates every
+/// index's columns, `counts` holds each index's column count. Columns compare
+/// after ASCII `strtolower()`. `[0]` count, `[1]` exact matches, `[2]` last
+/// exact index (-1), `[3]` longest required-column prefix, `[4]` first index
+/// with it (-1 when 0), `[5]` indexes holding every required column, `[6]`
+/// columns, `[7]` FNV-1a digest; then per index `exact | prefix << 1 | present
+/// << 4 | named << 7 | columns << 8` (columns clamped to 2^20-1).
+pub(crate) fn w516_index_batch(names: &[&[u8]], columns: &[&[u8]], counts: &[usize]) -> Vec<i64> {
+    let count = names.len();
+    let mut out = vec![0i64; W516_INDEX_HEADER + count];
+    out[0] = count as i64;
+    out[2] = -1;
+    out[4] = -1;
+    let mut digest = W47_FNV_OFFSET;
+    let mut at = 0;
+    for (index, name) in names.iter().enumerate() {
+        let list = &columns[at..at + counts[index]];
+        at += counts[index];
+        let mut mask = 0u32;
+        let mut prefix = 0usize;
+        let mut leading = true;
+        for (position, column) in list.iter().enumerate() {
+            let mut hit = None;
+            for (slot, required) in W516_CLAIM_INDEX_COLUMNS.iter().enumerate() {
+                if column.len() == required.len() && column.eq_ignore_ascii_case(required) {
+                    mask |= 1 << slot;
+                    hit = Some(slot);
+                    break;
+                }
+            }
+            if leading && hit == Some(position) {
+                prefix += 1;
+            } else {
+                leading = false;
+            }
+        }
+        let exact = list.len() == W516_CLAIM_INDEX_COLUMNS.len() && prefix == list.len();
+        let present = mask.count_ones() as i64;
+        if exact {
+            out[1] += 1;
+            out[2] = index as i64;
+        }
+        if prefix as i64 > out[3] {
+            out[3] = prefix as i64;
+            out[4] = index as i64;
+        }
+        out[5] += i64::from(mask == 0x7F);
+        out[6] += list.len() as i64;
+        let row = i64::from(exact)
+            | (prefix as i64) << 1
+            | present << 4
+            | i64::from(!name.is_empty()) << 7
+            | (list.len().min(0xF_FFFF) as i64) << 8;
+        digest = w47_fnv(digest, row as u32);
+        out[W516_INDEX_HEADER + index] = row;
+    }
+    out[7] = i64::from(digest);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_count` values.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_w516_claim_index_batch(
+    names: *const u8,
+    names_len: usize,
+    name_twin: *const u8,
+    name_twin_len: usize,
+    columns: *const u8,
+    columns_len: usize,
+    column_twin: *const u8,
+    column_twin_len: usize,
+    counts: *const u8,
+    counts_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w49_run(out, out_count, || {
+            let names = w49_items(
+                w15_input(names, names_len)?,
+                w15_input(name_twin, name_twin_len)?,
+                count,
+            )?;
+            let mut lens = Vec::with_capacity(count);
+            let mut total = 0usize;
+            for value in w47_ints(w15_input(counts, counts_len)?, 1, count)? {
+                let value = usize::try_from(value).ok()?;
+                total = total.checked_add(value)?;
+                lens.push(value);
+            }
+            let columns = w49_items(
+                w15_input(columns, columns_len)?,
+                w15_input(column_twin, column_twin_len)?,
+                total,
+            )?;
+            Some(w516_index_batch(&names, &columns, &lens))
+        })
+    }
+}
+
+// --- AdditionalProcessingOrchestrator::summarizeReleaseRunBatch --------------
+
+pub(crate) const W516_RUN_HEADER: usize = 28;
+
+/// Per-release run accounting. `ints` holds three columns of `guids.len()`
+/// values: release id, start and end `hrtime()` nanoseconds (each clamped to
+/// 0..2^62). `[0]` count, `[1]` `batchDispositionPhp(true, count)`, `[2]` claims
+/// to clear, `[3]` duplicate ids, `[4]` unique ids, `[5]` malformed GUIDs (not
+/// 40 hex digits), `[6]` slow releases (elapsed at least `slow`, when `slow` is
+/// positive), `[7]` total elapsed (saturating at 2^62), `[8]` longest elapsed,
+/// `[9]` its first index (-1 when empty), `[10..=26]` GUID buckets, `[27]` FNV-1a
+/// digest; then per release `clear | duplicate << 1 | well_formed << 2 | slow <<
+/// 3 | bucket << 4 | elapsed_micros << 9`.
+pub(crate) fn w516_run_batch(guids: &[&[u8]], ints: &[i64], token: bool, slow: i64) -> Vec<i64> {
+    let count = guids.len();
+    let (ids, starts, ends) = (&ints[..count], &ints[count..2 * count], &ints[2 * count..]);
+    let mut out = vec![0i64; W516_RUN_HEADER + count];
+    out[0] = count as i64;
+    out[1] = if count > 0 { 2 } else { 1 };
+    out[9] = -1;
+    let mut sorted: Vec<(i64, usize)> = ids.iter().copied().zip(0..count).collect();
+    sorted.sort_unstable();
+    let mut duplicate = vec![false; count];
+    for pair in sorted.windows(2) {
+        if pair[0].0 == pair[1].0 {
+            duplicate[pair[1].1] = true;
+        }
+    }
+    let mut digest = W47_FNV_OFFSET;
+    for (index, guid) in guids.iter().enumerate() {
+        let elapsed =
+            (ends[index].clamp(0, W47_TOTAL_CAP) - starts[index].clamp(0, W47_TOTAL_CAP)).max(0);
+        let clear = token && ids[index] > 0;
+        let well_formed = w516_sha1_hex(guid);
+        let is_slow = slow > 0 && elapsed >= slow;
+        let bucket = w516_bucket(guid);
+        out[2] += i64::from(clear);
+        out[3] += i64::from(duplicate[index]);
+        out[5] += i64::from(!well_formed);
+        out[6] += i64::from(is_slow);
+        out[7] = w49_add(out[7], elapsed);
+        if index == 0 || elapsed > out[8] {
+            out[8] = elapsed;
+            out[9] = index as i64;
+        }
+        out[10 + bucket] += 1;
+        let row = i64::from(clear)
+            | i64::from(duplicate[index]) << 1
+            | i64::from(well_formed) << 2
+            | i64::from(is_slow) << 3
+            | (bucket as i64) << 4
+            | (elapsed / 1000) << 9;
+        digest = w47_fnv(digest, w516_fold(row));
+        out[W516_RUN_HEADER + index] = row;
+    }
+    out[4] = out[0] - out[3];
+    out[27] = i64::from(digest);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_count` values.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_w516_release_run_batch(
+    guids: *const u8,
+    guids_len: usize,
+    guid_twin: *const u8,
+    guid_twin_len: usize,
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    token_len: usize,
+    slow_ns: i64,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    // SAFETY: forwarded input and output contracts.
+    unsafe {
+        w49_run(out, out_count, || {
+            let guids = w49_items(
+                w15_input(guids, guids_len)?,
+                w15_input(guid_twin, guid_twin_len)?,
+                count,
+            )?;
+            let ints = w47_ints(w15_input(ints, ints_len)?, 3, count)?;
+            Some(w516_run_batch(&guids, &ints, token_len > 0, slow_ns))
+        })
+    }
+}
+
+#[cfg(test)]
+mod w516_additional_batch_tests {
+    use super::*;
+    use std::ptr::{null, null_mut};
+
+    fn packed(values: &[i64]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect()
+    }
+
+    fn lens(items: &[&[u8]]) -> Vec<u8> {
+        items
+            .iter()
+            .flat_map(|item| (item.len() as u32).to_le_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn w516_bucket_matches_php_first_character() {
+        for (guid, bucket) in [
+            (&b""[..], 16),
+            (b"0abc", 0),
+            (b"9", 9),
+            (b"a1", 10),
+            (b"F", 15),
+            (b"g", 16),
+            (b"\xff", 16),
+        ] {
+            assert_eq!(w516_bucket(guid), bucket, "{guid:?}");
+        }
+    }
+
+    #[test]
+    fn w516_sha1_hex_matches_ctype_xdigit() {
+        let sha = *b"0123456789abcdefABCDEF0123456789abcdef01";
+        assert!(w516_sha1_hex(&sha));
+        assert!(!w516_sha1_hex(&sha[..39]));
+        assert!(!w516_sha1_hex(b""));
+        for bad in [b'g', b'G', b'/', b':', b'@', b'`', 0, 0xC1, 0xE1, b' '] {
+            let mut guid = sha;
+            guid[17] = bad;
+            assert!(!w516_sha1_hex(&guid), "{bad}");
+        }
+    }
+
+    #[test]
+    fn w516_frame_batch_scores_and_picks_best() {
+        let flat = [128u8; 12];
+        let busy: Vec<u8> = (0..48u8).map(|v| v.wrapping_mul(37)).collect();
+        let dark: Vec<u8> = (0..48u8).map(|v| v % 9).collect();
+        let samples: Vec<&[u8]> = vec![&flat, &[1, 2], &dark, &busy, b""];
+        let out = w516_frame_batch(&samples, 2.0, 20.0, 235.0);
+        assert_eq!(out[0], 5);
+        assert_eq!((out[1], out[2], out[7]), (3, 1, 2));
+        assert_eq!(out[4], 3, "normal brightness wins over the darker frame");
+        assert_eq!(
+            out[W516_FRAME_HEADER] & 7,
+            0b111,
+            "a flat grey frame is blank yet normal"
+        );
+        assert!((127_999..=128_000).contains(&(out[W516_FRAME_HEADER] >> 4 & 0xF_FFFF)));
+        assert_eq!(out[W516_FRAME_HEADER] >> 24, 0);
+        assert_eq!(out[W516_FRAME_HEADER + 1], 0);
+        assert_eq!(out[W516_FRAME_HEADER + 3] & 7, 0b101);
+    }
+
+    #[test]
+    fn w516_rank_batch_orders_and_declines() {
+        let names: Vec<&[u8]> = vec![
+            b"cover.jpg",
+            b"Movie.screens.jpg",
+            b"cd1.jpg",
+            b"x.jpg",
+            b"front.png",
+        ];
+        let out = w516_rank_batch(&names, &[10, 5, 99, 7, 50]).unwrap();
+        assert_eq!(&out[..6], &[5, 1, 2, 1, 1, 1]);
+        assert_eq!(&out[W516_RANK_HEADER + 5..], &[1, 4, 0, 3, 2]);
+        assert_eq!(out[W516_RANK_HEADER + 4], 1 | 50 << 4);
+        assert!(w516_rank_batch(&[b"caf\xc3\xa9.jpg"], &[0]).is_none());
+        assert!(w516_rank_batch(&[b"\"\"x\"y.jpg\""], &[0]).is_none());
+        assert!(w516_rank_batch(&[b"dir/"], &[0]).is_none());
+    }
+
+    #[test]
+    fn w516_claim_batch_applies_predicates_in_order() {
+        let sha = b"a123456789abcdef0123456789abcdef01234567";
+        let guids: Vec<&[u8]> = vec![sha, b"b2", b"03", b"z", b"a9", b"c0", b"d0", b"e0"];
+        let columns: Vec<i64> = [
+            [1, 2, 3, 4, 5, 6, 7, 8],             // id
+            [100, 300, 200, 300, 50, 10, 10, 10], // postdate
+            [10, 10, 10, 10, 10, 1, 10, 99],      // size
+            [-1, 0, -1, -1, 1, -1, -1, -1],       // passwordstatus
+            [-1, -1, -1, -1, -1, -1, -1, -1],     // haspreview
+            [1, 1, 1, 1, 1, 1, 1, 1],             // nzbstatus
+            [0, 0, 500, 0, 0, 0, 0, 0],           // claimed at
+            [0, 0, 0, 0, 0, 0, 2000, 0],          // retry at
+        ]
+        .concat();
+        let out = w516_claim_batch(&guids, &columns, &[5, 50, 1000, 400, 0, 2]);
+        assert_eq!(&out[1..9], &[3, 1, 0, 0, 1, 1, 1, 1]);
+        assert_eq!(out[9 + 10], 1);
+        assert_eq!(out[9], 1, "claimed rows count toward bucket totals");
+        assert_eq!(out[26], 0);
+        assert_eq!(out[9 + 16], 1);
+        assert_eq!((out[43], out[44]), (2, 7));
+        let rows = &out[W516_CLAIM_HEADER..];
+        assert_eq!(rows[0], 10 << 3 | 1 << 9 | 3 << 10);
+        assert_eq!(rows[1], 11 << 3 | 1 << 8 | 1 << 10);
+        assert_eq!(rows[3], 16 << 3 | 1 << 8 | 2 << 10);
+        assert_eq!(rows[2], 7);
+        let checks = w516_claim_batch(&guids, &columns, &[5, 50, 1000, 400, 1, 2]);
+        assert_eq!(checks[W516_CLAIM_HEADER + 1] & 7, 1);
+    }
+
+    #[test]
+    fn w516_index_batch_matches_required_columns() {
+        let names: Vec<&[u8]> = vec![b"ix_claim", b"", b"partial"];
+        let mut columns: Vec<&[u8]> = W516_CLAIM_INDEX_COLUMNS.to_vec();
+        columns.extend_from_slice(&[b"ID"]);
+        columns.extend_from_slice(&[b"PasswordStatus", b"HASPREVIEW", b"leftguid"]);
+        let out = w516_index_batch(&names, &columns, &[7, 1, 3]);
+        assert_eq!(&out[..7], &[3, 1, 0, 7, 0, 1, 11]);
+        assert_eq!(
+            out[W516_INDEX_HEADER],
+            1 | 7 << 1 | 7 << 4 | 1 << 7 | 7 << 8
+        );
+        assert_eq!(out[W516_INDEX_HEADER + 1], 1 << 4 | 1 << 8);
+        assert_eq!(
+            out[W516_INDEX_HEADER + 2],
+            2 << 1 | 3 << 4 | 1 << 7 | 3 << 8
+        );
+    }
+
+    #[test]
+    fn w516_run_batch_accounts_releases() {
+        let sha = b"0123456789abcdef0123456789abcdef01234567";
+        let guids: Vec<&[u8]> = vec![sha, b"zz", sha, b""];
+        let ints = [
+            [5, 0, 5, 9],
+            [0, 100, 0, i64::MIN],
+            [4_000, 50, 9_000, i64::MAX],
+        ]
+        .concat();
+        let out = w516_run_batch(&guids, &ints, true, 5_000);
+        assert_eq!(
+            &out[..10],
+            &[4, 2, 3, 1, 3, 2, 2, W47_TOTAL_CAP, W47_TOTAL_CAP, 3]
+        );
+        assert_eq!(out[W516_RUN_HEADER], 1 | 1 << 2 | 4 << 9);
+        assert_eq!(out[W516_RUN_HEADER + 1], 16 << 4);
+        assert_eq!(
+            out[W516_RUN_HEADER + 2],
+            1 | 1 << 1 | 1 << 2 | 1 << 3 | 9 << 9
+        );
+        let empty = w516_run_batch(&[], &[], false, 0);
+        assert_eq!(&empty[..2], &[0, 1]);
+    }
+
+    #[test]
+    fn w516_exports_guard_inputs_and_outputs() {
+        let mut out = vec![0i64; 64];
+        let samples: Vec<&[u8]> = vec![&[10, 20, 30, 40, 50, 60]];
+        let joined = samples.concat();
+        let sizes = lens(&samples);
+        let status = unsafe {
+            nntmux_w516_frame_luma_batch(
+                joined.as_ptr(),
+                joined.len(),
+                sizes.as_ptr(),
+                sizes.len(),
+                1,
+                0.0,
+                0.0,
+                255.0,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!((status, out[0], out[1]), (1, 1, 1));
+        let status = unsafe {
+            nntmux_w516_frame_luma_batch(
+                null(),
+                4,
+                null(),
+                0,
+                1,
+                0.0,
+                0.0,
+                0.0,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!(status, -1);
+        let status = unsafe {
+            nntmux_w516_frame_luma_batch(null(), 0, null(), 0, 0, 0.0, 0.0, 0.0, null_mut(), 64)
+        };
+        assert_eq!(status, -2);
+        let status = unsafe {
+            nntmux_w516_frame_luma_batch(
+                joined.as_ptr(),
+                joined.len(),
+                sizes.as_ptr(),
+                sizes.len(),
+                1,
+                0.0,
+                0.0,
+                0.0,
+                out.as_mut_ptr(),
+                5,
+            )
+        };
+        assert_eq!(status, -2);
+
+        let names = b"a.jpg\0b.jpg";
+        let ints = packed(&[1, 2]);
+        let status = unsafe {
+            nntmux_w516_image_rank_batch(
+                names.as_ptr(),
+                names.len(),
+                null(),
+                0,
+                ints.as_ptr(),
+                ints.len(),
+                2,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!((status, out[0], out[3]), (1, 2, 2));
+        let status = unsafe {
+            nntmux_w516_image_rank_batch(
+                names.as_ptr(),
+                names.len(),
+                null(),
+                0,
+                ints.as_ptr(),
+                8,
+                2,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!(status, -1);
+
+        let guid = b"abc";
+        let columns = packed(&[1, 1, 10, -1, -1, 1, 0, 0]);
+        let params = packed(&[0, 0, 0, 0, 0, 1]);
+        let status = unsafe {
+            nntmux_w516_candidate_claim_batch(
+                guid.as_ptr(),
+                3,
+                null(),
+                0,
+                columns.as_ptr(),
+                columns.len(),
+                params.as_ptr(),
+                params.len(),
+                1,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!((status, out[1], out[43], out[44]), (1, 1, 1, 1));
+        let status = unsafe {
+            nntmux_w516_candidate_claim_batch(
+                guid.as_ptr(),
+                3,
+                null(),
+                0,
+                columns.as_ptr(),
+                columns.len(),
+                params.as_ptr(),
+                8,
+                1,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!(status, -1);
+
+        let names = b"ix";
+        let cols = b"ID\0LEFTGUID";
+        let counts = packed(&[2]);
+        let status = unsafe {
+            nntmux_w516_claim_index_batch(
+                names.as_ptr(),
+                2,
+                null(),
+                0,
+                cols.as_ptr(),
+                cols.len(),
+                null(),
+                0,
+                counts.as_ptr(),
+                8,
+                1,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!((status, out[0], out[6]), (1, 1, 2));
+        let negative = packed(&[-1]);
+        let status = unsafe {
+            nntmux_w516_claim_index_batch(
+                names.as_ptr(),
+                2,
+                null(),
+                0,
+                cols.as_ptr(),
+                cols.len(),
+                null(),
+                0,
+                negative.as_ptr(),
+                8,
+                1,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!(status, -1);
+
+        let runs = packed(&[1, 0, 10]);
+        let status = unsafe {
+            nntmux_w516_release_run_batch(
+                guid.as_ptr(),
+                3,
+                null(),
+                0,
+                runs.as_ptr(),
+                runs.len(),
+                1,
+                1,
+                0,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!((status, out[0], out[2]), (1, 1, 1));
+        let status = unsafe {
+            nntmux_w516_release_run_batch(
+                null(),
+                0,
+                null(),
+                0,
+                null(),
+                0,
+                0,
+                0,
+                0,
+                out.as_mut_ptr(),
+                64,
+            )
+        };
+        assert_eq!((status, out[0], out[1]), (1, 0, 1));
+    }
+}

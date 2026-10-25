@@ -9,6 +9,7 @@ use App\Services\Configuration\ConfigurationProvider;
 use App\Services\Runners\PostProcessRunner;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection as EloquentCollection;
 use Illuminate\Database\Query\Builder as QueryBuilder;
@@ -760,5 +761,237 @@ final class AdditionalCandidateQuery
             'blocked' => $slots[4],
             'invalid' => $slots[5],
         ];
+    }
+
+    // Rust is the default only while the paired W51.6 benchmark clears 1.5x on all four metrics.
+    private const bool W51_RUST_FFI_DEFAULT = true;
+
+    public const string W51_FFI_CDEF = <<<'C'
+        int32_t nntmux_w516_candidate_claim_batch(const char *guids, size_t guids_len, const char *guid_twin, size_t guid_twin_len, const char *ints, size_t ints_len, const char *params, size_t params_len, size_t count, int64_t *out, size_t out_count);
+        C;
+
+    public const int W51_CLAIM_HEADER = 46;
+
+    /** Integer columns of {@see self::planClaimBatch()}, in their packed order. */
+    private const array W51_CLAIM_COLUMNS = ['id', 'postdate', 'size', 'passwordstatus', 'haspreview', 'nzbstatus', 'claimed_at', 'retry_at'];
+
+    private const array W51_HEX_BUCKETS = [
+        '0' => 0, '1' => 1, '2' => 2, '3' => 3, '4' => 4, '5' => 5, '6' => 6, '7' => 7,
+        '8' => 8, '9' => 9, 'a' => 10, 'b' => 11, 'c' => 12, 'd' => 13, 'e' => 14, 'f' => 15,
+    ];
+
+    private const int W51_MAX_ITEMS = 1_048_576;
+
+    private static ?bool $w51RustFfi = null;
+
+    private static FFI|false|null $w51Ffi = null;
+
+    private static ?CData $w51Out = null;
+
+    private static int $w51Capacity = 0;
+
+    /**
+     * Apply the candidate predicates and the claim order to in-memory release rows.
+     *
+     * `$columns` holds a `guid` list and integer lists `id`, `postdate`, `size`,
+     * `passwordstatus`, `haspreview`, `nzbstatus`, `claimed_at` and `retry_at` (Unix seconds,
+     * 0 for NULL); a missing value is 0 and the GUID list sets the row count. Size bounds of 0
+     * are disabled and the limit is at least 1, as in {@see self::claimBatch()}.
+     *
+     * Reasons (first failing predicate wins): 0 eligible, 1 password status, 2 preview, 3 NZB
+     * status, 4 archive retry pending, 5 too small, 6 too large, 7 actively claimed. Layout:
+     * `[0]` count, `[1..8]` per reason, `[9..25]` per GUID bucket (0-f, then other) eligible or
+     * claimed rows, `[26..42]` eligible rows per bucket, `[43]` selected rows, `[44]` GUIDs that
+     * are not 40 hex digits, `[45]` FNV-1a digest; then per row `reason | bucket << 3 |
+     * selected << 8 | well_formed << 9 | order << 10`, where `order` is the 1-based claim
+     * position of an eligible row (postdate descending, id, input order) and 0 otherwise.
+     *
+     * @param  array<string, list<int>|list<string>>  $columns
+     * @return list<int>
+     */
+    public static function planClaimBatch(array $columns, int $minSizeBytes, int $maxSizeBytes, int $now, int $staleBefore, bool $passwordChecks, int $limit): array
+    {
+        return (self::usesW51RustFfi() ? self::planClaimBatchNative($columns, $minSizeBytes, $maxSizeBytes, $now, $staleBefore, $passwordChecks, $limit) : null)
+            ?? self::planClaimBatchPhp($columns, $minSizeBytes, $maxSizeBytes, $now, $staleBefore, $passwordChecks, $limit);
+    }
+
+    /**
+     * @param  array<string, list<int>|list<string>>  $columns
+     * @return list<int>
+     */
+    public static function planClaimBatchPhp(array $columns, int $minSizeBytes, int $maxSizeBytes, int $now, int $staleBefore, bool $passwordChecks, int $limit): array
+    {
+        /** @var list<string> $guids */
+        $guids = array_values($columns['guid'] ?? []);
+        $count = \count($guids);
+        $ints = [];
+        foreach (self::W51_CLAIM_COLUMNS as $name) {
+            /** @var list<int> $values */
+            $values = array_values($columns[$name] ?? []);
+            $ints[] = $values;
+        }
+        [$ids, $postdates, $sizes, $passwords, $previews, $nzbs, $claims, $retries] = $ints;
+        $out = array_fill(0, self::W51_CLAIM_HEADER, 0);
+        $out[0] = $count;
+        $rows = $eligiblePostdates = $eligibleIds = $eligible = [];
+        foreach ($guids as $index => $guid) {
+            $password = $passwords[$index] ?? 0;
+            $size = $sizes[$index] ?? 0;
+            $retry = $retries[$index] ?? 0;
+            $claim = $claims[$index] ?? 0;
+            $reason = match (true) {
+                ! ($password === -1 || (! $passwordChecks && $password === 0)) => 1,
+                ($previews[$index] ?? 0) !== -1 => 2,
+                ($nzbs[$index] ?? 0) !== 1 => 3,
+                $retry !== 0 && $retry > $now => 4,
+                $minSizeBytes > 0 && $size <= $minSizeBytes => 5,
+                $maxSizeBytes > 0 && $size >= $maxSizeBytes => 6,
+                $claim !== 0 && $claim >= $staleBefore => 7,
+                default => 0,
+            };
+            $bucket = self::W51_HEX_BUCKETS[strtolower(substr($guid, 0, 1))] ?? 16;
+            $wellFormed = \strlen($guid) === 40 && ctype_xdigit($guid);
+            $out[1 + $reason]++;
+            $out[44] += (int) ! $wellFormed;
+            if ($reason === 0 || $reason === 7) {
+                $out[9 + $bucket]++;
+            }
+            if ($reason === 0) {
+                $out[26 + $bucket]++;
+                $eligiblePostdates[] = $postdates[$index] ?? 0;
+                $eligibleIds[] = $ids[$index] ?? 0;
+                $eligible[] = $index;
+            }
+            $rows[] = $reason | $bucket << 3 | (int) $wellFormed << 9;
+        }
+        if ($eligible !== []) {
+            array_multisort($eligiblePostdates, SORT_DESC, SORT_NUMERIC, $eligibleIds, SORT_ASC, SORT_NUMERIC, $eligible, SORT_ASC, SORT_NUMERIC);
+        }
+        $selected = min(\count($eligible), max(1, $limit));
+        $out[43] = $selected;
+        foreach ($eligible as $position => $index) {
+            $rows[$index] |= ($position + 1) << 10 | ($position < $selected ? 1 << 8 : 0);
+        }
+        $digest = 2_166_136_261;
+        foreach ($rows as $row) {
+            $digest = (($digest ^ (($row ^ ($row >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+        }
+        $out[45] = $digest;
+
+        return [...$out, ...$rows];
+    }
+
+    /**
+     * Rust planning, or null when PHP must compute it (unavailable library, missing values or
+     * rejected input).
+     *
+     * @param  array<string, list<int>|list<string>>  $columns
+     * @return list<int>|null
+     */
+    public static function planClaimBatchNative(array $columns, int $minSizeBytes, int $maxSizeBytes, int $now, int $staleBefore, bool $passwordChecks, int $limit): ?array
+    {
+        $guids = $columns['guid'] ?? [];
+        $count = \count($guids);
+        $fields = self::W51_CLAIM_HEADER + $count;
+        $binding = $count <= self::W51_MAX_ITEMS ? self::w51Binding($fields) : null;
+        if ($binding === null) {
+            return null;
+        }
+        [$ffi, $out] = $binding;
+        foreach (self::W51_CLAIM_COLUMNS as $name) {
+            if (\count($columns[$name] ?? []) !== $count) {
+                return null;
+            }
+        }
+        /** @var array<array-key, string> $guids */
+        [$joined, $twin] = self::w51Strings($guids);
+        try {
+            $packed = pack('q*', ...($columns['id'] ?? []), ...($columns['postdate'] ?? []), ...($columns['size'] ?? []), ...($columns['passwordstatus'] ?? []),
+                ...($columns['haspreview'] ?? []), ...($columns['nzbstatus'] ?? []), ...($columns['claimed_at'] ?? []), ...($columns['retry_at'] ?? []));
+            $params = pack('q6', $minSizeBytes, $maxSizeBytes, $now, $staleBefore, $passwordChecks ? 1 : 0, $limit);
+            // @phpstan-ignore method.notFound
+            $status = $ffi->nntmux_w516_candidate_claim_batch($joined, \strlen($joined), $twin, \strlen($twin), $packed, \strlen($packed), $params, \strlen($params), $count, $out, $fields);
+
+            return self::w51Decode(\is_int($status) ? $status : -1, $out, $fields);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Run `$callback` with the Wave 51.6 Rust batch path forced on or off, then restore the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW51RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$w51RustFfi;
+        self::$w51RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$w51RustFfi = $previous;
+        }
+    }
+
+    public static function usesW51RustFfi(): bool
+    {
+        return self::$w51RustFfi ?? self::W51_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * The cached Wave 51.6 binding and an output buffer of at least `$fields` values, or null.
+     *
+     * @return array{0: FFI, 1: CData}|null
+     */
+    private static function w51Binding(int $fields): ?array
+    {
+        try {
+            self::$w51Ffi ??= RustPipelineLibrary::resolveDomain('additional_w51', self::W51_FFI_CDEF) ?? false;
+            if (self::$w51Ffi === false) {
+                return null;
+            }
+            $out = self::$w51Out;
+            if ($out === null || self::$w51Capacity < $fields) {
+                self::$w51Capacity = max(256, $fields);
+                $out = self::$w51Out = self::$w51Ffi->new('int64_t['.self::$w51Capacity.']');
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        return [self::$w51Ffi, $out];
+    }
+
+    /**
+     * Decode `$fields` output values after a successful Wave 51.6 call.
+     *
+     * @return list<int>|null
+     */
+    private static function w51Decode(int $status, CData $out, int $fields): ?array
+    {
+        if ($status !== 1) {
+            return null;
+        }
+        $values = unpack('P*', FFI::string($out, $fields * 8));
+
+        return $values === false ? null : array_values($values);
+    }
+
+    /**
+     * NUL-joined values and, when one holds a NUL, the same list joined with 0x01 so Rust
+     * finds the separators where the two differ.
+     *
+     * @param  array<array-key, string>  $items
+     * @return array{0: string, 1: string}
+     */
+    private static function w51Strings(array $items): array
+    {
+        $joined = implode("\0", $items);
+
+        return $items !== [] && substr_count($joined, "\0") !== \count($items) - 1 ? [$joined, implode("\x01", $items)] : [$joined, ''];
     }
 }
