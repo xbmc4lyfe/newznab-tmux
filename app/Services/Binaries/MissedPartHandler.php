@@ -7,6 +7,7 @@ namespace App\Services\Binaries;
 use App\Models\MissedPart;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
@@ -94,7 +95,7 @@ final class MissedPartHandler
             return null;
         }
 
-        return self::packedInts(fn (FFI $ffi, FFI\CData $out, int $cap): int => $ffi->nntmux_missed_range_expand($first, $last, self::NATIVE_MAX_RANGE_ITEMS, $out, $cap), ($span + 1) * 8); // @phpstan-ignore method.notFound
+        return self::packedInts(fn (FFI $ffi, CData $out, int $cap): int => $ffi->nntmux_missed_range_expand($first, $last, self::NATIVE_MAX_RANGE_ITEMS, $out, $cap), ($span + 1) * 8); // @phpstan-ignore method.notFound
     }
 
     /**
@@ -146,7 +147,7 @@ final class MissedPartHandler
             return null;
         }
         $count = intdiv($span, $chunkSize) + 1;
-        $flat = self::packedInts(fn (FFI $ffi, FFI\CData $out, int $cap): int => $ffi->nntmux_missed_range_chunks($first, $last, $chunkSize, self::NATIVE_MAX_RANGE_ITEMS, $out, $cap), $count * 16); // @phpstan-ignore method.notFound
+        $flat = self::packedInts(fn (FFI $ffi, CData $out, int $cap): int => $ffi->nntmux_missed_range_chunks($first, $last, $chunkSize, self::NATIVE_MAX_RANGE_ITEMS, $out, $cap), $count * 16); // @phpstan-ignore method.notFound
         if ($flat === null || \count($flat) % 2 !== 0) {
             return null;
         }
@@ -162,7 +163,7 @@ final class MissedPartHandler
     }
 
     /**
-     * @param  \Closure(FFI, FFI\CData, int): int  $call
+     * @param  \Closure(FFI, CData, int): int  $call
      * @return list<int>|null
      */
     private static function packedInts(\Closure $call, int $bytes): ?array
@@ -509,5 +510,202 @@ final class MissedPartHandler
     {
         self::$w421UseRustFfi = null;
         self::$w421Ffi = null;
+    }
+
+    /** Wave 52.2 paired benchmarks decide this default; see RustBinariesCollectionHeaderMissedPartHandlerW52ParityTest. */
+    private const bool W52_RUST_FFI_DEFAULT = true;
+
+    public const string W52_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w522_missed_part_plan_batch(const char *ints, size_t ints_len, size_t count, const char *received, size_t received_len, size_t received_count, int64_t max_tries, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * Wave 52 routing, binding and output buffer, kept in function-local statics. Operations:
+     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
+     * resolves the binding and 'out' returns `[binding, buffer, capacity]` with room for at
+     * least $val words (null without the library).
+     */
+    private static function w52RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w52', self::W52_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w52RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW52RustFfi(): bool
+    {
+        $enabled = self::w52RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W52_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with planRepairBatch() routed to Rust ($enabled) or PHP, then restores the
+     * previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW52RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w52RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w52RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Batch part repair plan over queued rows (getMissingParts() order) and the article numbers a
+     * repair pass received. One flag byte per row, eight rows per word (row `i` in bits `8 * (i %
+     * 8)`). A number <= 0 is invalid (16), a repeated number a duplicate (8); otherwise a received
+     * number is repaired (1), a part whose next attempt reaches max(1, $maxTries) exhausted (4) and
+     * the rest retryable (2), with 32 marking a retryable part that starts a run of consecutive
+     * numbers. Repaired, retryable, exhausted,
+     * duplicate, invalid and run counts, the smallest and largest retryable numbers (0 for none)
+     * and the XXH64 digest of all earlier words follow.
+     *
+     * @param  list<int>  $numbers
+     * @param  list<int>  $attempts
+     * @param  list<int>  $received
+     * @return list<int>
+     */
+    public static function planRepairBatch(array $numbers, array $attempts, array $received, int $maxTries = 3): array
+    {
+        return self::usesW52RustFfi()
+            ? self::planRepairBatchNative($numbers, $attempts, $received, $maxTries)
+            : self::planRepairBatchPhp($numbers, $attempts, $received, $maxTries);
+    }
+
+    /**
+     * @param  list<int>  $numbers
+     * @param  list<int>  $attempts
+     * @param  list<int>  $received
+     * @return list<int>
+     */
+    public static function planRepairBatchPhp(array $numbers, array $attempts, array $received, int $maxTries = 3): array
+    {
+        $out = $seen = [];
+        $got = array_flip($received);
+        $limit = max(1, $maxTries) - 1;
+        $repaired = $retryable = $exhausted = $duplicates = $invalid = $runs = $min = $max = 0;
+        $prev = null;
+        $packed = $shift = 0;
+        foreach ($numbers as $i => $number) {
+            if ($number <= 0) {
+                $invalid++;
+                $flags = 16;
+            } elseif (isset($seen[$number])) {
+                $duplicates++;
+                $flags = 8;
+            } else {
+                $seen[$number] = true;
+                if (isset($got[$number])) {
+                    $repaired++;
+                    $flags = 1;
+                } elseif (($attempts[$i] ?? 0) >= $limit) {
+                    $exhausted++;
+                    $flags = 4;
+                } else {
+                    $retryable++;
+                    $flags = 2;
+                    if ($prev === null || $prev === PHP_INT_MAX || $prev + 1 !== $number) {
+                        $flags |= 32;
+                        $runs++;
+                    }
+                    $prev = $number;
+                    if ($min === 0 || $number < $min) {
+                        $min = $number;
+                    }
+                    $max = max($max, $number);
+                }
+            }
+            $packed |= $flags << $shift;
+            $shift += 8;
+            if ($shift === 64) {
+                $out[] = $packed;
+                $packed = $shift = 0;
+            }
+        }
+        if ($shift > 0) {
+            $out[] = $packed;
+        }
+        $out[] = $repaired;
+        $out[] = $retryable;
+        $out[] = $exhausted;
+        $out[] = $duplicates;
+        $out[] = $invalid;
+        $out[] = $runs;
+        $out[] = $min;
+        $out[] = $max;
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+        $out[] = $digest[1];
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or the columns differ in length
+     * or are not lists.
+     *
+     * @param  list<int>  $numbers
+     * @param  list<int>  $attempts
+     * @param  list<int>  $received
+     * @return list<int>
+     */
+    public static function planRepairBatchNative(array $numbers, array $attempts, array $received, int $maxTries = 3): array
+    {
+        $count = \count($numbers);
+        $words = intdiv($count + 7, 8) + 9;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w52RustFfiState('out', $words);
+        if ($state === null || \count($attempts) !== $count || ! array_is_list($numbers) || ! array_is_list($attempts) || ! array_is_list($received)) {
+            return self::planRepairBatchPhp($numbers, $attempts, $received, $maxTries);
+        }
+        [$ffi, $out, $cap] = $state;
+        $ints = pack('P*', ...$numbers, ...$attempts);
+        $got = pack('P*', ...$received);
+        $receivedCount = \count($received);
+        try {
+            // @phpstan-ignore method.notFound (Declared by W52_FFI_CDEF.)
+            $written = $ffi->nntmux_w522_missed_part_plan_batch($ints, \strlen($ints), $count, $got, \strlen($got), $receivedCount, $maxTries, $out, $cap);
+        } catch (\Throwable) {
+            $written = -1;
+        }
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : self::planRepairBatchPhp($numbers, $attempts, $received, $maxTries);
     }
 }

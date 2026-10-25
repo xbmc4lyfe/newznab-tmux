@@ -7,6 +7,7 @@ namespace App\Services\Binaries;
 use App\Support\RustPipelineLibrary;
 use App\Support\SqlError;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\DB;
 use Throwable;
 
@@ -741,5 +742,199 @@ final class PartHandler
     {
         self::$w421UseRustFfi = null;
         self::$w421Ffi = null;
+    }
+
+    /** Wave 52.2 paired benchmarks decide this default; see RustBinariesCollectionHeaderMissedPartHandlerW52ParityTest. */
+    private const bool W52_RUST_FFI_DEFAULT = true;
+
+    public const string W52_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w522_part_admission_plan_batch(const char *ids, size_t ids_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * Wave 52 routing, binding and output buffer, kept in function-local statics. Operations:
+     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
+     * resolves the binding and 'out' returns `[binding, buffer, capacity]` with room for at
+     * least $val words (null without the library).
+     */
+    private static function w52RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w52', self::W52_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w52RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW52RustFfi(): bool
+    {
+        $enabled = self::w52RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W52_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with planPartAdmission() routed to Rust ($enabled) or PHP, then restores the
+     * previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW52RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w52RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w52RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Batch admission plan, as addPart() validates and deduplicateParts() keeps one row per
+     * (binary id, part number). One word per part: `flags | winner << 8 | crc32(trim(message id))
+     * << 32`. Flags: 1 part number <= 0, 2 invalid message id (checked only for a valid part
+     * number), 4 the row survives deduplication, 8 the key repeats an earlier valid row. A valid
+     * row's winner is its key's survivor under shouldPreferPhp() (larger size, then smaller article
+     * number); an invalid row's winner is itself. Valid, bad part number, bad message id, surviving
+     * and replaced-or-dropped counts and the XXH64 digest of all earlier words follow.
+     *
+     * @param  list<string>  $messageIds
+     * @param  list<int>  $binaryIds
+     * @param  list<int>  $partNumbers
+     * @param  list<int>  $sizes
+     * @param  list<int>  $numbers
+     * @return list<int>
+     */
+    public static function planPartAdmission(array $messageIds, array $binaryIds, array $partNumbers, array $sizes, array $numbers): array
+    {
+        return self::usesW52RustFfi()
+            ? self::planPartAdmissionNative($messageIds, $binaryIds, $partNumbers, $sizes, $numbers)
+            : self::planPartAdmissionPhp($messageIds, $binaryIds, $partNumbers, $sizes, $numbers);
+    }
+
+    /**
+     * @param  list<string>  $messageIds
+     * @param  list<int>  $binaryIds
+     * @param  list<int>  $partNumbers
+     * @param  list<int>  $sizes
+     * @param  list<int>  $numbers
+     * @return list<int>
+     */
+    public static function planPartAdmissionPhp(array $messageIds, array $binaryIds, array $partNumbers, array $sizes, array $numbers): array
+    {
+        $out = $keys = $winners = [];
+        $valid = $badPart = $badId = 0;
+        foreach ($messageIds as $i => $raw) {
+            $id = trim($raw);
+            $part = $partNumbers[$i] ?? 0;
+            $row = \count($out);
+            $tag = crc32($id) << 32;
+            if ($part <= 0) {
+                $badPart++;
+                $out[] = 1 | $row << 8 | $tag;
+
+                continue;
+            }
+            if ($id === '' || \strlen($id) > 255 || preg_match('/^[\x20-\x7E]+$/D', $id) !== 1) {
+                $badId++;
+                $out[] = 2 | $row << 8 | $tag;
+
+                continue;
+            }
+            $valid++;
+            $key = ($binaryIds[$i] ?? 0).':'.$part;
+            if (isset($winners[$key])) {
+                [$w, $wSize, $wNumber] = $winners[$key];
+                $size = $sizes[$i] ?? 0;
+                $number = $numbers[$i] ?? 0;
+                if ($size > $wSize || ($size === $wSize && $number < $wNumber)) {
+                    $winners[$key] = [$row, $size, $number];
+                }
+                $out[] = 8 | $tag;
+            } else {
+                $winners[$key] = [$row, $sizes[$i] ?? 0, $numbers[$i] ?? 0];
+                $out[] = $tag;
+            }
+            $keys[$row] = $key;
+        }
+        foreach ($keys as $row => $key) {
+            $w = $winners[$key][0];
+            $out[$row] |= $w << 8 | ($w === $row ? 4 : 0);
+        }
+        $survivors = \count($winners);
+        $out[] = $valid;
+        $out[] = $badPart;
+        $out[] = $badId;
+        $out[] = $survivors;
+        $out[] = $valid - $survivors;
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+        $out[] = $digest[1];
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, the columns differ in length or
+     * are not lists, or a message id holds a NUL byte.
+     *
+     * @param  list<string>  $messageIds
+     * @param  list<int>  $binaryIds
+     * @param  list<int>  $partNumbers
+     * @param  list<int>  $sizes
+     * @param  list<int>  $numbers
+     * @return list<int>
+     */
+    public static function planPartAdmissionNative(array $messageIds, array $binaryIds, array $partNumbers, array $sizes, array $numbers): array
+    {
+        $count = \count($messageIds);
+        $words = $count + 6;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w52RustFfiState('out', $words);
+        if ($state === null || \count($binaryIds) !== $count || \count($partNumbers) !== $count || \count($sizes) !== $count || \count($numbers) !== $count
+            || ! array_is_list($messageIds) || ! array_is_list($binaryIds) || ! array_is_list($partNumbers) || ! array_is_list($sizes) || ! array_is_list($numbers)) {
+            return self::planPartAdmissionPhp($messageIds, $binaryIds, $partNumbers, $sizes, $numbers);
+        }
+        [$ffi, $out, $cap] = $state;
+        $joined = implode("\0", $messageIds);
+        $ints = pack('P*', ...$binaryIds, ...$partNumbers, ...$sizes, ...$numbers);
+        try {
+            // @phpstan-ignore method.notFound (Declared by W52_FFI_CDEF.)
+            $written = $ffi->nntmux_w522_part_admission_plan_batch($joined, \strlen($joined), $ints, \strlen($ints), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : self::planPartAdmissionPhp($messageIds, $binaryIds, $partNumbers, $sizes, $numbers);
     }
 }

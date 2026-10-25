@@ -13,6 +13,7 @@ use App\Support\RustPipelineLibrary;
 use App\Support\SqlError;
 use App\Support\Utf8;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\DB;
 use Throwable;
 
@@ -818,7 +819,7 @@ final class CollectionHandler
             return null;
         }
         $packed = pack('q*', ...array_map('intval', array_values($this->collectionIds)));
-        $packed = self::callPacked($ffi, $packed, static fn (FFI $ffi, string $in, FFI\CData $out, int $cap): int => $ffi->nntmux_collection_unique_ids($in, \strlen($in), $out, $cap)); // @phpstan-ignore method.notFound
+        $packed = self::callPacked($ffi, $packed, static fn (FFI $ffi, string $in, CData $out, int $cap): int => $ffi->nntmux_collection_unique_ids($in, \strlen($in), $out, $cap)); // @phpstan-ignore method.notFound
         if ($packed === null) {
             return null;
         }
@@ -862,7 +863,7 @@ final class CollectionHandler
         if ($ffi === null) {
             return null;
         }
-        $packed = self::callPacked($ffi, implode('', $keys), static fn (FFI $ffi, string $in, FFI\CData $out, int $cap): int => $ffi->nntmux_collection_unique_hashes($in, \strlen($in), self::HASH_WIDTH, $out, $cap)); // @phpstan-ignore method.notFound
+        $packed = self::callPacked($ffi, implode('', $keys), static fn (FFI $ffi, string $in, CData $out, int $cap): int => $ffi->nntmux_collection_unique_hashes($in, \strlen($in), self::HASH_WIDTH, $out, $cap)); // @phpstan-ignore method.notFound
 
         return $packed === null ? null : str_split($packed, self::HASH_WIDTH);
     }
@@ -870,7 +871,7 @@ final class CollectionHandler
     /**
      * Run a packed-input export whose output never exceeds its input length.
      *
-     * @param  \Closure(FFI, string, FFI\CData, int): int  $call
+     * @param  \Closure(FFI, string, CData, int): int  $call
      */
     private static function callPacked(FFI $ffi, string $input, \Closure $call): ?string
     {
@@ -982,5 +983,168 @@ final class CollectionHandler
     {
         self::$w401UseRustFfi = null;
         self::$w401Ffi = null;
+    }
+
+    /** Wave 52.2 paired benchmarks decide this default; see RustBinariesCollectionHeaderMissedPartHandlerW52ParityTest. */
+    private const bool W52_RUST_FFI_DEFAULT = true;
+
+    public const string W52_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w522_collection_key_plan_batch(const char *names, size_t names_len, const char *totals, size_t totals_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * Wave 52 routing, binding and output buffer, kept in function-local statics. Operations:
+     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
+     * resolves the binding and 'out' returns `[binding, buffer, capacity]` with room for at
+     * least $val words (null without the library).
+     */
+    private static function w52RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w52', self::W52_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w52RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW52RustFfi(): bool
+    {
+        $enabled = self::w52RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W52_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with planCollectionKeys() routed to Rust ($enabled) or PHP, then restores the
+     * previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW52RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w52RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w52RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Batch collection-key plan, as getOrCreateCollections() derives `name . totalFiles` keys and
+     * their sha1 collectionhash. Two words per header: `flags | first << 8 | crc32(key) << 32`, then
+     * the first eight bytes of sha1(key, true) as a big-endian signed word. Flags: 1 first
+     * occurrence, 2 repeated key (`first` is the key's first row), 4 empty name, 8 total <= 0,
+     * 16 name longer than 255 bytes. Unique keys, repeats, empty names, non-positive totals and the
+     * XXH64 digest of all earlier words follow.
+     *
+     * @param  list<string>  $names  Cleaned collection names (collectionsCleaner()['name'])
+     * @param  list<int>  $totalFiles
+     * @return list<int>
+     */
+    public static function planCollectionKeys(array $names, array $totalFiles): array
+    {
+        return self::usesW52RustFfi()
+            ? self::planCollectionKeysNative($names, $totalFiles)
+            : self::planCollectionKeysPhp($names, $totalFiles);
+    }
+
+    /**
+     * @param  list<string>  $names
+     * @param  list<int>  $totalFiles
+     * @return list<int>
+     */
+    public static function planCollectionKeysPhp(array $names, array $totalFiles): array
+    {
+        $out = $seen = [];
+        $repeats = $empty = $nonPositive = 0;
+        foreach ($names as $i => $name) {
+            $total = $totalFiles[$i] ?? 0;
+            $key = $name.$total;
+            $flags = ($name === '' ? 4 : 0) | ($total <= 0 ? 8 : 0) | (\strlen($name) > 255 ? 16 : 0);
+            $empty += (int) ($name === '');
+            $nonPositive += (int) ($total <= 0);
+            if (isset($seen[$key])) {
+                $flags |= 2;
+                $repeats++;
+                [$first, $tag, $prefix] = $seen[$key];
+            } else {
+                $flags |= 1;
+                /** @var array{1: int} $head */
+                $head = unpack('J', sha1($key, true));
+                [$first, $tag, $prefix] = $seen[$key] = [$i, crc32($key) << 32, $head[1]];
+            }
+            $out[] = $flags | $first << 8 | $tag;
+            $out[] = $prefix;
+        }
+        $out[] = \count($seen);
+        $out[] = $repeats;
+        $out[] = $empty;
+        $out[] = $nonPositive;
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+        $out[] = $digest[1];
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, the lists differ in length or
+     * are not lists, or a name holds a NUL byte.
+     *
+     * @param  list<string>  $names
+     * @param  list<int>  $totalFiles
+     * @return list<int>
+     */
+    public static function planCollectionKeysNative(array $names, array $totalFiles): array
+    {
+        $count = \count($names);
+        $words = 2 * $count + 5;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w52RustFfiState('out', $words);
+        if ($state === null || \count($totalFiles) !== $count || ! array_is_list($names) || ! array_is_list($totalFiles)) {
+            return self::planCollectionKeysPhp($names, $totalFiles);
+        }
+        [$ffi, $out, $cap] = $state;
+        $joined = implode("\0", $names);
+        $totals = pack('P*', ...$totalFiles);
+        try {
+            // @phpstan-ignore method.notFound (Declared by W52_FFI_CDEF.)
+            $written = $ffi->nntmux_w522_collection_key_plan_batch($joined, \strlen($joined), $totals, \strlen($totals), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : self::planCollectionKeysPhp($names, $totalFiles);
     }
 }
