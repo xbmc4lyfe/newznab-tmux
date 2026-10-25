@@ -17,6 +17,118 @@ use Throwable;
  */
 class AnidbService
 {
+    /** Disabled until correctness and the common-path and p99 benchmark gates qualify. */
+    public const bool W394_RUST_FFI_DEFAULT = false;
+
+    public const string W394_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w394_anidb_rate_limit_window(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private static ?bool $w394UseRustFfi = null;
+
+    private static FFI|false|null $w394Ffi = null;
+
+    public static function useW394RustFfi(?bool $use = true): void
+    {
+        self::$w394UseRustFfi = $use;
+        if ($use === null) {
+            self::$w394Ffi = null;
+        }
+    }
+
+    public static function usesW394RustFfi(): bool
+    {
+        return self::$w394UseRustFfi ?? self::W394_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW394RustFfi(): void
+    {
+        self::$w394UseRustFfi = null;
+        self::$w394Ffi = null;
+    }
+
+    /**
+     * Arguments contain only projected scalar fields, never caller-owned objects.
+     *
+     * @param  list<mixed>  $arguments
+     * @return array<string, int|string|bool>|null
+     */
+    private static function w394Call(array $arguments): ?array
+    {
+        try {
+            $input = serialize($arguments);
+            if (strlen($input) > 16777216) {
+                return null;
+            }
+            if (self::$w394Ffi === null) {
+                self::$w394Ffi = RustPipelineLibrary::resolveDomain('metadata_w394', self::W394_FFI_CDEF) ?? false;
+            }
+            $ffi = self::$w394Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            $capacity = 0;
+            $out = RustPipelineLibrary::obtainScratch($ffi, 2048, $capacity);
+            if ($out === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound (Declared by W394_FFI_CDEF.)
+            $written = $ffi->nntmux_w394_anidb_rate_limit_window($input, strlen($input), $out, $capacity);
+            if (is_int($written) && $written < -1 && $written >= -16777216) {
+                $out = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($out === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound (Declared by W394_FFI_CDEF.)
+                $written = $ffi->nntmux_w394_anidb_rate_limit_window($input, strlen($input), $out, $capacity);
+            }
+            if (! is_int($written) || $written <= 0 || $written > $capacity || $written > 16777216) {
+                return null;
+            }
+            $result = @unserialize(FFI::string($out, $written), ['allowed_classes' => false]);
+            $types = ['elapsed_seconds' => 'int', 'required_wait_seconds' => 'int', 'remaining_sleep_seconds' => 'int', 'backoff_multiplier' => 'int', 'ready_to_request' => 'bool'];
+            if (! is_array($result) || array_keys($result) !== array_keys($types)) {
+                return null;
+            }
+            foreach ($types as $key => $type) {
+                if (get_debug_type($result[$key]) !== $type) {
+                    return null;
+                }
+            }
+
+            return $result;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** @return array<string, int|string|bool> */
+    public static function planAnidbRateLimitWindow(int $lastRequestUnix, int $nowUnix, int $consecutiveFailures, int $baseCooldownSeconds = 2): array
+    {
+        if (self::usesW394RustFfi()) {
+            $native = self::w394Call([$lastRequestUnix, $nowUnix, $consecutiveFailures, $baseCooldownSeconds]);
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
+        return self::planAnidbRateLimitWindowPhp($lastRequestUnix, $nowUnix, $consecutiveFailures, $baseCooldownSeconds);
+    }
+
+    /** @return array<string, int|bool> */
+    public static function planAnidbRateLimitWindowPhp(int $lastRequestUnix, int $nowUnix, int $consecutiveFailures, int $baseCooldownSeconds = 2): array
+    {
+        $lastRequestUnix = max(0, $lastRequestUnix);
+        $nowUnix = max(0, $nowUnix);
+        $baseCooldownSeconds = max(0, $baseCooldownSeconds);
+        $elapsed = max(0, $nowUnix - $lastRequestUnix);
+        $multiplier = 1 << min(30, max(0, $consecutiveFailures));
+        $required = $baseCooldownSeconds > intdiv(PHP_INT_MAX, $multiplier) ? PHP_INT_MAX : $baseCooldownSeconds * $multiplier;
+        $remaining = max(0, $required - $elapsed);
+
+        return ['elapsed_seconds' => $elapsed, 'required_wait_seconds' => $required, 'remaining_sleep_seconds' => $remaining, 'backoff_multiplier' => $multiplier, 'ready_to_request' => $remaining === 0];
+    }
+
     public const string FFI_CDEF = <<<'C'
         ssize_t nntmux_anidb_clean_title(const char *ptr, size_t len, char *out, size_t cap);
         ssize_t nntmux_anidb_extract_base_title(const char *ptr, size_t len, char *out, size_t cap);

@@ -7,16 +7,178 @@ namespace App\Services;
 use App\Exceptions\BookProviderException;
 use App\Support\BookIsbn;
 use App\Support\BookMatchScorer;
+use App\Support\RustPipelineLibrary;
 use Carbon\Carbon;
+use FFI;
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\GuzzleException;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
 use JsonException;
 use Psr\Http\Message\ResponseInterface;
+use Throwable;
 
 class IsbnDbService
 {
+    /** Disabled until correctness and the common-path and p99 benchmark gates qualify. */
+    public const bool W394_RUST_FFI_DEFAULT = false;
+
+    public const string W394_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w394_isbn_batch_candidates(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private static ?bool $w394UseRustFfi = null;
+
+    private static FFI|false|null $w394Ffi = null;
+
+    public static function useW394RustFfi(?bool $use = true): void
+    {
+        self::$w394UseRustFfi = $use;
+        if ($use === null) {
+            self::$w394Ffi = null;
+        }
+    }
+
+    public static function usesW394RustFfi(): bool
+    {
+        return self::$w394UseRustFfi ?? self::W394_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW394RustFfi(): void
+    {
+        self::$w394UseRustFfi = null;
+        self::$w394Ffi = null;
+    }
+
+    /**
+     * Arguments contain only projected scalar fields, never caller-owned objects.
+     *
+     * @param  list<mixed>  $arguments
+     * @return array<string, int|string|bool>|null
+     */
+    private static function w394Call(array $arguments): ?array
+    {
+        try {
+            $input = serialize($arguments);
+            if (strlen($input) > 16777216) {
+                return null;
+            }
+            if (self::$w394Ffi === null) {
+                self::$w394Ffi = RustPipelineLibrary::resolveDomain('metadata_w394', self::W394_FFI_CDEF) ?? false;
+            }
+            $ffi = self::$w394Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            $capacity = 0;
+            $out = RustPipelineLibrary::obtainScratch($ffi, 2048, $capacity);
+            if ($out === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound (Declared by W394_FFI_CDEF.)
+            $written = $ffi->nntmux_w394_isbn_batch_candidates($input, strlen($input), $out, $capacity);
+            if (is_int($written) && $written < -1 && $written >= -16777216) {
+                $out = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($out === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound (Declared by W394_FFI_CDEF.)
+                $written = $ffi->nntmux_w394_isbn_batch_candidates($input, strlen($input), $out, $capacity);
+            }
+            if (! is_int($written) || $written <= 0 || $written > $capacity || $written > 16777216) {
+                return null;
+            }
+            $result = @unserialize(FFI::string($out, $written), ['allowed_classes' => false]);
+            $types = ['valid_isbn13_count' => 'int', 'valid_isbn10_count' => 'int', 'invalid_count' => 'int', 'deduplicated_count' => 'int', 'first_canonical_isbn13' => 'string'];
+            if (! is_array($result) || array_keys($result) !== array_keys($types)) {
+                return null;
+            }
+            foreach ($types as $key => $type) {
+                if (get_debug_type($result[$key]) !== $type) {
+                    return null;
+                }
+            }
+
+            return $result;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** @param array<array-key, mixed> $rawTokens
+     * @return array<string, int|string|bool>
+     */
+    public static function normalizeIsbnBatchCandidates(array $rawTokens): array
+    {
+        if (self::usesW394RustFfi()) {
+            $safe = [];
+            foreach ($rawTokens as $token) {
+                $safe[] = is_string($token) ? $token : null;
+            }
+            $native = self::w394Call([$safe]);
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
+        return self::normalizeIsbnBatchCandidatesPhp($rawTokens);
+    }
+
+    /** @param array<array-key, mixed> $rawTokens
+     * @return array<string, int|string>
+     */
+    public static function normalizeIsbnBatchCandidatesPhp(array $rawTokens): array
+    {
+        $valid13 = $valid10 = $invalid = 0;
+        $canonical = [];
+        $first = '';
+        foreach ($rawTokens as $token) {
+            if (! is_string($token)) {
+                $invalid++;
+
+                continue;
+            }
+            $token = str_replace([' ', "\t", "\r", "\n", "\v", "\f", '-'], '', $token);
+            $token = str_replace('x', 'X', $token);
+            $isbn13 = '';
+            if (preg_match('/\A97[89][0-9]{10}\z/D', $token) === 1) {
+                $sum = 0;
+                for ($i = 0; $i < 13; $i++) {
+                    $sum += (ord($token[$i]) - 48) * ($i % 2 === 0 ? 1 : 3);
+                }
+                if ($sum % 10 === 0) {
+                    $valid13++;
+                    $isbn13 = $token;
+                }
+            } elseif (preg_match('/\A[0-9]{9}[0-9X]\z/D', $token) === 1) {
+                $sum = 0;
+                for ($i = 0; $i < 10; $i++) {
+                    $sum += ($token[$i] === 'X' ? 10 : ord($token[$i]) - 48) * (10 - $i);
+                }
+                if ($sum % 11 === 0) {
+                    $valid10++;
+                    $prefix = '978'.substr($token, 0, 9);
+                    $sum13 = 0;
+                    for ($i = 0; $i < 12; $i++) {
+                        $sum13 += (ord($prefix[$i]) - 48) * ($i % 2 === 0 ? 1 : 3);
+                    }
+                    $isbn13 = $prefix.(string) ((10 - $sum13 % 10) % 10);
+                }
+            }
+            if ($isbn13 === '') {
+                $invalid++;
+
+                continue;
+            }
+            $canonical[$isbn13] = true;
+            if ($first === '') {
+                $first = $isbn13;
+            }
+        }
+
+        return ['valid_isbn13_count' => $valid13, 'valid_isbn10_count' => $valid10, 'invalid_count' => $invalid, 'deduplicated_count' => count($canonical), 'first_canonical_isbn13' => $first];
+    }
+
     /** Null selects the benchmark-qualified production default. */
     public ?bool $useRustFfi = null;
 

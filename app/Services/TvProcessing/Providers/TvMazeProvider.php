@@ -5,8 +5,11 @@ declare(strict_types=1);
 namespace App\Services\TvProcessing\Providers;
 
 use App\Services\TvMazeClient;
+use App\Support\RustPipelineLibrary;
 use DariusIII\TVMaze\Episode;
 use DariusIII\TVMaze\TVShow;
+use FFI;
+use Throwable;
 
 /**
  * Class TvMazeProvider.
@@ -15,6 +18,139 @@ use DariusIII\TVMaze\TVShow;
  */
 class TvMazeProvider extends AbstractTvProvider
 {
+    /** Disabled until correctness and the common-path and p99 benchmark gates qualify. */
+    public const bool W394_RUST_FFI_DEFAULT = false;
+
+    public const string W394_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w394_tvmaze_episode_catalog(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private static ?bool $w394UseRustFfi = null;
+
+    private static FFI|false|null $w394Ffi = null;
+
+    public static function useW394RustFfi(?bool $use = true): void
+    {
+        self::$w394UseRustFfi = $use;
+        if ($use === null) {
+            self::$w394Ffi = null;
+        }
+    }
+
+    public static function usesW394RustFfi(): bool
+    {
+        return self::$w394UseRustFfi ?? self::W394_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW394RustFfi(): void
+    {
+        self::$w394UseRustFfi = null;
+        self::$w394Ffi = null;
+    }
+
+    /**
+     * Arguments contain only projected scalar fields, never caller-owned objects.
+     *
+     * @param  list<mixed>  $arguments
+     * @return array<string, int|string|bool>|null
+     */
+    private static function w394Call(array $arguments): ?array
+    {
+        try {
+            $input = serialize($arguments);
+            if (strlen($input) > 16777216) {
+                return null;
+            }
+            if (self::$w394Ffi === null) {
+                self::$w394Ffi = RustPipelineLibrary::resolveDomain('metadata_w394', self::W394_FFI_CDEF) ?? false;
+            }
+            $ffi = self::$w394Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            $capacity = 0;
+            $out = RustPipelineLibrary::obtainScratch($ffi, 2048, $capacity);
+            if ($out === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound (Declared by W394_FFI_CDEF.)
+            $written = $ffi->nntmux_w394_tvmaze_episode_catalog($input, strlen($input), $out, $capacity);
+            if (is_int($written) && $written < -1 && $written >= -16777216) {
+                $out = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($out === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound (Declared by W394_FFI_CDEF.)
+                $written = $ffi->nntmux_w394_tvmaze_episode_catalog($input, strlen($input), $out, $capacity);
+            }
+            if (! is_int($written) || $written <= 0 || $written > $capacity || $written > 16777216) {
+                return null;
+            }
+            $result = @unserialize(FFI::string($out, $written), ['allowed_classes' => false]);
+            $types = ['total_episodes' => 'int', 'matching_season_count' => 'int', 'special_count' => 'int', 'missing_airdate_count' => 'int', 'max_episode_number' => 'int'];
+            if (! is_array($result) || array_keys($result) !== array_keys($types)) {
+                return null;
+            }
+            foreach ($types as $key => $type) {
+                if (get_debug_type($result[$key]) !== $type) {
+                    return null;
+                }
+            }
+
+            return $result;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** @param array<array-key, mixed> $episodes
+     * @return array<string, int|string|bool>
+     */
+    public static function summarizeTvMazeEpisodeCatalog(array $episodes, int $targetSeason = 0): array
+    {
+        if (self::usesW394RustFfi()) {
+            $safe = [];
+            foreach ($episodes as $row) {
+                $row = is_array($row) ? $row : [];
+                $safe[] = [
+                    'season' => is_int($row['season'] ?? null) ? $row['season'] : null,
+                    'number' => is_int($row['number'] ?? null) ? $row['number'] : null,
+                    'airdate' => is_string($row['airdate'] ?? null) ? $row['airdate'] : null,
+                ];
+            }
+            $native = self::w394Call([$safe, $targetSeason]);
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
+        return self::summarizeTvMazeEpisodeCatalogPhp($episodes, $targetSeason);
+    }
+
+    /** @param array<array-key, mixed> $episodes
+     * @return array<string, int>
+     */
+    public static function summarizeTvMazeEpisodeCatalogPhp(array $episodes, int $targetSeason = 0): array
+    {
+        $matching = $special = $missing = $maximum = 0;
+        foreach ($episodes as $row) {
+            $row = is_array($row) ? $row : [];
+            $season = $row['season'] ?? null;
+            if (is_int($season)) {
+                $matching += (int) ($season === $targetSeason);
+                $special += (int) ($season === 0);
+            }
+            $number = $row['number'] ?? null;
+            if (is_int($number) && $number > $maximum) {
+                $maximum = $number;
+            }
+            $airdate = $row['airdate'] ?? null;
+            $missing += (int) (! is_string($airdate) || trim($airdate) === '');
+        }
+
+        return ['total_episodes' => count($episodes), 'matching_season_count' => $matching, 'special_count' => $special, 'missing_airdate_count' => $missing, 'max_episode_number' => $maximum];
+    }
+
     public TvMazeClient $client;
 
     /**
