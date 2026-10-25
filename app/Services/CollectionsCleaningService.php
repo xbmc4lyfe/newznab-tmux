@@ -564,4 +564,180 @@ class CollectionsCleaningService
             && ini_get('pcre.recursion_limit') === '100000'
             && \in_array(setlocale(LC_CTYPE, '0'), ['C', 'POSIX', 'C.UTF-8'], true);
     }
+
+    /** Enabled: paired common/uncommon mean and p99 gains reach 1.5x in all eight runs (min 2.06x; see the W43 parity test). */
+    public const bool W431_RUST_FFI_DEFAULT = true;
+
+    public const string W431_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w431_collections_subject_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private const array W431_SUMMARY_KEYS = ['total_subjects', 'empty_subject_count', 'yenc_suffix_count', 'size_tagged_count', 'file_extension_count', 'part_counter_count', 'music_group_count', 'invalid_utf8_count'];
+
+    /** Largest Wave 43.1 input frame passed to Rust. */
+    private const int W431_MAX_INPUT = 16777216;
+
+    /**
+     * Wave 43.1 entries: strings and integers as-is, the first non-null `$fields` value of an array row,
+     * otherwise ''. Objects are never cast or serialized.
+     *
+     * @param  array<array-key, mixed>  $input
+     * @param  list<string>  $fields
+     * @return list<string>
+     */
+    public static function w431Entries(array $input, array $fields): array
+    {
+        $entries = [];
+        foreach ($input as $item) {
+            if (\is_array($item)) {
+                $value = null;
+                foreach ($fields as $field) {
+                    if (isset($item[$field])) {
+                        $value = $item[$field];
+                        break;
+                    }
+                }
+                $item = $value;
+            }
+            $entries[] = \is_string($item) || \is_int($item) ? (string) $item : '';
+        }
+
+        return $entries;
+    }
+
+    /**
+     * Calls a Wave 43.1 export with the w431Entries() of `$rows` and decodes its `i64le` counts. Entries
+     * are framed as `u32le count, u32le 0xFFFFFFFF, NUL-joined bytes`, or as `u32le count, u32le lengths,
+     * bytes` when an entry contains NUL. `$ffi` is the caller's cached handle. Returns null (fall back
+     * to PHP) when the frame is too large, the library or symbol is unavailable, or the output fails
+     * validation.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @param  list<string>  $fields
+     * @return array<int, int>|null
+     */
+    public static function w431Invoke(FFI|false|null &$ffi, string $cdef, string $symbol, array $rows, array $fields, int $keys): ?array
+    {
+        // Same extraction as w431Entries(), inlined to keep marshaling to one pass.
+        $entries = [];
+        foreach ($rows as $item) {
+            if (\is_array($item)) {
+                $value = null;
+                foreach ($fields as $field) {
+                    if (isset($item[$field])) {
+                        $value = $item[$field];
+                        break;
+                    }
+                }
+                $item = $value;
+            }
+            $entries[] = \is_string($item) || \is_int($item) ? (string) $item : '';
+        }
+        $count = \count($entries);
+        $blob = implode("\0", $entries);
+        $input = $count > 0 && substr_count($blob, "\0") === $count - 1
+            ? pack('VV', $count, 0xFFFFFFFF).$blob
+            : pack('V*', $count, ...array_map(strlen(...), $entries)).implode('', $entries);
+        if (\strlen($input) > self::W431_MAX_INPUT) {
+            return null;
+        }
+        try {
+            $ffi ??= RustPipelineLibrary::resolveDomain('cleaning_w431', $cdef) ?? false;
+            if ($ffi === false) {
+                return null;
+            }
+            $capacity = 0;
+            $out = RustPipelineLibrary::obtainScratch($ffi, $keys * 8, $capacity);
+            if ($out === null) {
+                return null;
+            }
+            $written = $ffi->{$symbol}($input, \strlen($input), $out, $capacity);
+            if ($written !== $keys * 8) {
+                return null;
+            }
+            $values = unpack('q*', FFI::string($out, $written));
+            if (! \is_array($values) || $values[1] !== $count || min($values) < 0 || max($values) > $count) {
+                return null;
+            }
+
+            return $values;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private static ?bool $w431UseRustFfi = null;
+
+    private static FFI|false|null $w431Ffi = null;
+
+    public static function useW431RustFfi(bool $enable = true): void
+    {
+        self::$w431UseRustFfi = $enable;
+    }
+
+    public static function usesW431RustFfi(): bool
+    {
+        return self::$w431UseRustFfi ?? self::W431_RUST_FFI_DEFAULT;
+    }
+
+    /** Restores the benchmark default and drops the cached library handle; earlier toggles are untouched. */
+    public static function resetW431RustFfi(): void
+    {
+        self::$w431UseRustFfi = null;
+        self::$w431Ffi = null;
+    }
+
+    /**
+     * Summarizes trimmed article subjects with the cleaner's patterns: a REGEX_END yEnc suffix, a
+     * REGEX_SUBJECT_SIZE size, a quoted `.ext"` ending, a `[n/m]` or `(n/m)` counter, a music group token
+     * (isMusicGroupPhp()) and invalid UTF-8.
+     * Entries come from strings, integers, or the first non-null subject, name array field; other values
+     * (including objects) count as empty entries.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeSubjectBatch(array $rows): array
+    {
+        return self::usesW431RustFfi() ? self::summarizeSubjectBatchNative($rows) : self::summarizeSubjectBatchPhp($rows);
+    }
+
+    /**
+     * Rust summary; falls back to PHP when the library or input frame is unusable.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeSubjectBatchNative(array $rows): array
+    {
+        $values = self::w431Invoke(self::$w431Ffi, self::W431_FFI_CDEF, 'nntmux_w431_collections_subject_batch', $rows, ['subject', 'name'], \count(self::W431_SUMMARY_KEYS));
+
+        return $values === null ? self::summarizeSubjectBatchPhp($rows) : array_combine(self::W431_SUMMARY_KEYS, $values);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeSubjectBatchPhp(array $rows): array
+    {
+        $summary = array_fill_keys(self::W431_SUMMARY_KEYS, 0);
+        foreach (self::w431Entries($rows, ['subject', 'name']) as $entry) {
+            $summary['total_subjects']++;
+            $entry = trim($entry);
+            if ($entry === '') {
+                $summary['empty_subject_count']++;
+
+                continue;
+            }
+            $summary['yenc_suffix_count'] += (int) (preg_match('/'.self::REGEX_END, $entry) === 1);
+            $summary['size_tagged_count'] += (int) (preg_match('/'.self::REGEX_SUBJECT_SIZE.'/', $entry) === 1);
+            $summary['file_extension_count'] += (int) (preg_match('/\.[A-Za-z0-9]{2,4}"/', $entry) === 1);
+            $summary['part_counter_count'] += (int) (preg_match('/[\(\[]\d+\/\d+[\)\]]/', $entry) === 1);
+            $summary['music_group_count'] += (int) (preg_match('/\.(flac|lossless|mp3|music|sounds)/', $entry) === 1);
+            $summary['invalid_utf8_count'] += (int) (preg_match('//u', $entry) !== 1);
+        }
+
+        return $summary;
+    }
 }

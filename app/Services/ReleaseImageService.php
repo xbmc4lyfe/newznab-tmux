@@ -694,4 +694,89 @@ class ReleaseImageService
 
         return self::$ffi === false ? null : self::$ffi;
     }
+
+    /** Disabled: common p99 missed 1.5x in three of eight paired runs (1.41x, 1.49x, 1.49x; others 2.04x-2.88x; see the W43 parity test). */
+    public const bool W431_RUST_FFI_DEFAULT = false;
+
+    public const string W431_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w431_release_image_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private const array W431_SUMMARY_KEYS = ['total_refs', 'empty_ref_count', 'valid_basename_count', 'http_url_count', 'credential_url_count', 'image_extension_count', 'query_url_count'];
+
+    private static ?bool $w431UseRustFfi = null;
+
+    private static FFI|false|null $w431Ffi = null;
+
+    public static function useW431RustFfi(bool $enable = true): void
+    {
+        self::$w431UseRustFfi = $enable;
+    }
+
+    public static function usesW431RustFfi(): bool
+    {
+        return self::$w431UseRustFfi ?? self::W431_RUST_FFI_DEFAULT;
+    }
+
+    /** Restores the benchmark default and drops the cached library handle; earlier toggles are untouched. */
+    public static function resetW431RustFfi(): void
+    {
+        self::$w431UseRustFfi = null;
+        self::$w431Ffi = null;
+    }
+
+    /**
+     * Summarizes trimmed image references: basenames isValidBasenamePhp() accepts, http(s) URLs, URLs with
+     * an `@` in the authority, URLs with a query, and image extensions before a query, fragment or the end.
+     * Entries come from strings, integers, or the first non-null url, basename, name array field; other values
+     * (including objects) count as empty entries.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeImageReferenceBatch(array $rows): array
+    {
+        return self::usesW431RustFfi() ? self::summarizeImageReferenceBatchNative($rows) : self::summarizeImageReferenceBatchPhp($rows);
+    }
+
+    /**
+     * Rust summary; falls back to PHP when the library or input frame is unusable.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeImageReferenceBatchNative(array $rows): array
+    {
+        $values = CollectionsCleaningService::w431Invoke(self::$w431Ffi, self::W431_FFI_CDEF, 'nntmux_w431_release_image_batch', $rows, ['url', 'basename', 'name'], \count(self::W431_SUMMARY_KEYS));
+
+        return $values === null ? self::summarizeImageReferenceBatchPhp($rows) : array_combine(self::W431_SUMMARY_KEYS, $values);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeImageReferenceBatchPhp(array $rows): array
+    {
+        $summary = array_fill_keys(self::W431_SUMMARY_KEYS, 0);
+        foreach (CollectionsCleaningService::w431Entries($rows, ['url', 'basename', 'name']) as $entry) {
+            $summary['total_refs']++;
+            $entry = trim($entry);
+            if ($entry === '') {
+                $summary['empty_ref_count']++;
+
+                continue;
+            }
+            // Same pattern as isValidBasenamePhp().
+            $summary['valid_basename_count'] += (int) (preg_match('/\A[A-Za-z0-9][A-Za-z0-9_-]*\z/D', $entry) === 1);
+            if (preg_match('#\Ahttps?://([^/?\#]*)#i', $entry, $match) === 1) {
+                $summary['http_url_count']++;
+                $summary['credential_url_count'] += (int) str_contains($match[1], '@');
+                $summary['query_url_count'] += (int) str_contains($entry, '?');
+            }
+            $summary['image_extension_count'] += (int) (preg_match('/\.(?:jpe?g|png|gif|webp|bmp)(?:[?#]|\z)/i', $entry) === 1);
+        }
+
+        return $summary;
+    }
 }

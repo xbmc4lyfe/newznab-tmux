@@ -428,4 +428,85 @@ class ReleaseCreationService
 
         return $resolved;
     }
+
+    /** Enabled: paired common/uncommon mean and p99 gains reach 1.5x in all eight runs (min 1.65x; see the W43 parity test). */
+    public const bool W431_RUST_FFI_DEFAULT = true;
+
+    public const string W431_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w431_release_creation_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private const array W431_SUMMARY_KEYS = ['total_subjects', 'empty_subject_count', 'stripped_char_count', 'quoted_filename_count', 'non_ascii_count', 'oversized_subject_count'];
+
+    private static ?bool $w431UseRustFfi = null;
+
+    private static FFI|false|null $w431Ffi = null;
+
+    public static function useW431RustFfi(bool $enable = true): void
+    {
+        self::$w431UseRustFfi = $enable;
+    }
+
+    public static function usesW431RustFfi(): bool
+    {
+        return self::$w431UseRustFfi ?? self::W431_RUST_FFI_DEFAULT;
+    }
+
+    /** Restores the benchmark default and drops the cached library handle; earlier toggles are untouched. */
+    public static function resetW431RustFfi(): void
+    {
+        self::$w431UseRustFfi = null;
+        self::$w431Ffi = null;
+    }
+
+    /**
+     * Summarizes trimmed collection subjects: subjects holding a character sanitizeCollectionNamesPhp() strips,
+     * a quoted filename (`"[^"]+"`), a non-ASCII byte, or more than 255 bytes.
+     * Entries come from strings, integers, or the first non-null subject, name array field; other values
+     * (including objects) count as empty entries.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeCollectionSubjectBatch(array $rows): array
+    {
+        return self::usesW431RustFfi() ? self::summarizeCollectionSubjectBatchNative($rows) : self::summarizeCollectionSubjectBatchPhp($rows);
+    }
+
+    /**
+     * Rust summary; falls back to PHP when the library or input frame is unusable.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeCollectionSubjectBatchNative(array $rows): array
+    {
+        $values = CollectionsCleaningService::w431Invoke(self::$w431Ffi, self::W431_FFI_CDEF, 'nntmux_w431_release_creation_batch', $rows, ['subject', 'name'], \count(self::W431_SUMMARY_KEYS));
+
+        return $values === null ? self::summarizeCollectionSubjectBatchPhp($rows) : array_combine(self::W431_SUMMARY_KEYS, $values);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeCollectionSubjectBatchPhp(array $rows): array
+    {
+        $summary = array_fill_keys(self::W431_SUMMARY_KEYS, 0);
+        foreach (CollectionsCleaningService::w431Entries($rows, ['subject', 'name']) as $entry) {
+            $summary['total_subjects']++;
+            $entry = trim($entry);
+            if ($entry === '') {
+                $summary['empty_subject_count']++;
+
+                continue;
+            }
+            $summary['stripped_char_count'] += (int) (preg_match('/[#@$%^]|§|¨|©|Ö/', $entry) === 1);
+            $summary['quoted_filename_count'] += (int) (preg_match('/"[^"]+"/', $entry) === 1);
+            $summary['non_ascii_count'] += (int) (preg_match('/[\x80-\xff]/', $entry) === 1);
+            $summary['oversized_subject_count'] += (int) (\strlen($entry) > 255);
+        }
+
+        return $summary;
+    }
 }
