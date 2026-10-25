@@ -1391,4 +1391,149 @@ class ImdbScraper
 
         return array_values($unique);
     }
+
+    /** Enabled: seven paired runs cleared 1.5x on every gate (min common mean 3.92x, p99 3.14x; uncommon mean 4.43x, p99 4.07x; see the W46 parity test). */
+    public const bool W464_RUST_FFI_DEFAULT = true;
+
+    public const string W464_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w464_imdb_search_text_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private const array W464_SUMMARY_KEYS = ['total_entries', 'empty_count', 'year_count', 'imdb_id_count', 'slug_empty_count', 'multi_word_slug_count', 'stripped_char_count', 'v1_image_count', 'waf_marker_count', 'tv_type_count', 'overlong_count'];
+
+    /** unpack() format for the eleven little-endian int64 counters, in W464_SUMMARY_KEYS order. */
+    private const string W464_UNPACK = 'Ptotal_entries/Pempty_count/Pyear_count/Pimdb_id_count/Pslug_empty_count/Pmulti_word_slug_count/Pstripped_char_count/Pv1_image_count/Pwaf_marker_count/Ptv_type_count/Poverlong_count';
+
+    private static ?bool $w464UseRustFfi = null;
+
+    private static FFI|false|null $w464Ffi = null;
+
+    /** Null restores the benchmark-qualified default. */
+    public static function useW464RustFfi(?bool $enable = true): void
+    {
+        self::$w464UseRustFfi = $enable;
+    }
+
+    public static function usesW464RustFfi(): bool
+    {
+        return self::$w464UseRustFfi ?? self::W464_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW464RustFfi(): void
+    {
+        self::$w464UseRustFfi = null;
+        self::$w464Ffi = null;
+    }
+
+    /**
+     * Summarize search queries, suggestion titles and api.imdbapi.dev type
+     * strings as search() and its helpers read them (all trimmed): years
+     * extractYearFromText() finds, tt ids, normalizeSearchSlug() outcomes,
+     * ._V1_ image markers, isWafResponse() markers (ASCII case-insensitive),
+     * normalizeApiDevType() TV types and overlong text. Entries come from
+     * strings, integers, or the title, l, name or query field; other values
+     * count as empty. Byte classes are ASCII-only.
+     *
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeImdbSearchTextBatch(array $entries): array
+    {
+        return self::usesW464RustFfi()
+            ? self::summarizeImdbSearchTextBatchNative($entries)
+            : self::summarizeImdbSearchTextBatchPhp($entries);
+    }
+
+    /**
+     * Rust summary; falls back to PHP when the library or input frame is unusable.
+     *
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeImdbSearchTextBatchNative(array $entries): array
+    {
+        return self::w464Call(self::w464Entries($entries)) ?? self::summarizeImdbSearchTextBatchPhp($entries);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeImdbSearchTextBatchPhp(array $entries): array
+    {
+        $summary = array_fill_keys(self::W464_SUMMARY_KEYS, 0);
+        foreach (self::w464Entries($entries) as $entry) {
+            $summary['total_entries']++;
+            $text = trim($entry);
+            if ($text === '') {
+                $summary['empty_count']++;
+
+                continue;
+            }
+            $slug = preg_replace('/\s+/', '_', trim(strtolower(preg_replace('/[^A-Za-z0-9 ]/', '', $text) ?? ''))) ?? '';
+            $summary['year_count'] += (int) (preg_match('/(?:19|20)[0-9]{2}/', $text) === 1);
+            $summary['imdb_id_count'] += (int) (preg_match('/tt[0-9]{5}/', $text) === 1);
+            $summary['slug_empty_count'] += (int) ($slug === '');
+            $summary['multi_word_slug_count'] += (int) str_contains($slug, '_');
+            $summary['stripped_char_count'] += (int) (preg_match('/[^A-Za-z0-9 ]/', $text) === 1);
+            $summary['v1_image_count'] += (int) str_contains($text, '._V1_');
+            $summary['waf_marker_count'] += (int) (stripos($text, 'captcha') !== false || stripos($text, 'challenge.js') !== false || stripos($text, 'awswaf') !== false || stripos($text, 'window.gokuprops') !== false);
+            $summary['tv_type_count'] += (int) in_array(strtolower($text), ['tvseries', 'tv_series', 'tv mini series', 'tv_mini_series', 'tvminiseries', 'tvspecial', 'tv_special', 'tvmovie', 'tv_movie', 'tvepisode', 'tv_episode'], true);
+            $summary['overlong_count'] += (int) (strlen($text) > 255);
+        }
+
+        return $summary;
+    }
+
+    /** Only integer and string entries participate; objects are never cast or serialized.
+     *
+     * @param  array<array-key, mixed>  $input
+     * @return list<string>
+     */
+    private static function w464Entries(array $input): array
+    {
+        $entries = [];
+        foreach ($input as $item) {
+            if (is_array($item)) {
+                $item = $item['title'] ?? $item['l'] ?? $item['name'] ?? $item['query'] ?? null;
+            }
+            $entries[] = is_string($item) || is_int($item) ? (string) $item : '';
+        }
+
+        return $entries;
+    }
+
+    /** @param list<string> $entries
+     * @return array<string, int>|null
+     */
+    private static function w464Call(array $entries): ?array
+    {
+        try {
+            $input = serialize($entries);
+            if (strlen($input) > 16777216) {
+                return null;
+            }
+            self::$w464Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w464', self::W464_FFI_CDEF) ?? false;
+            $ffi = self::$w464Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            // obtainScratch() returns at least the 88 bytes requested.
+            $out = RustPipelineLibrary::obtainScratch($ffi, 88);
+            // @phpstan-ignore method.notFound (Declared by W464_FFI_CDEF.)
+            if ($out === null || $ffi->nntmux_w464_imdb_search_text_batch($input, strlen($input), $out, 88) !== 88) {
+                return null;
+            }
+            /** @var array<string, int>|false $summary */
+            $summary = unpack(self::W464_UNPACK, FFI::string($out, 88));
+            $total = count($entries);
+            if ($summary === false || $summary['total_entries'] !== $total || min($summary) < 0 || max($summary) > $total) {
+                return null;
+            }
+
+            return $summary;
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }

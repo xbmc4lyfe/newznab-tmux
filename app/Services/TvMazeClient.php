@@ -342,4 +342,146 @@ class TvMazeClient
         }
         self::$lastRequestAt = microtime(true);
     }
+
+    /** Disabled: one of seven paired runs missed the common p99 gate (min common mean 1.97x, p99 1.31x; uncommon mean 3.51x, p99 3.17x; see the W46 parity test). useW464RustFfi(true) opts in. */
+    public const bool W464_RUST_FFI_DEFAULT = false;
+
+    public const string W464_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w464_tvmaze_aka_name_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private const array W464_SUMMARY_KEYS = ['total_entries', 'empty_count', 'blank_count', 'padded_count', 'article_prefix_count', 'year_suffix_count', 'country_suffix_count', 'punctuation_count', 'digit_count', 'non_ascii_count', 'multi_space_count'];
+
+    /** unpack() format for the eleven little-endian int64 counters, in W464_SUMMARY_KEYS order. */
+    private const string W464_UNPACK = 'Ptotal_entries/Pempty_count/Pblank_count/Ppadded_count/Particle_prefix_count/Pyear_suffix_count/Pcountry_suffix_count/Ppunctuation_count/Pdigit_count/Pnon_ascii_count/Pmulti_space_count';
+
+    private static ?bool $w464UseRustFfi = null;
+
+    private static FFI|false|null $w464Ffi = null;
+
+    /** Null restores the benchmark-qualified default. */
+    public static function useW464RustFfi(?bool $enable = true): void
+    {
+        self::$w464UseRustFfi = $enable;
+    }
+
+    public static function usesW464RustFfi(): bool
+    {
+        return self::$w464UseRustFfi ?? self::W464_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW464RustFfi(): void
+    {
+        self::$w464UseRustFfi = null;
+        self::$w464Ffi = null;
+    }
+
+    /**
+     * Summarize AKA names: empty names extractAkaNames() drops, then on the
+     * trimmed name blank and padded names, leading articles, (YYYY) and
+     * (country) suffixes, :!?& punctuation, digits, non-ASCII bytes and
+     * whitespace runs. Entries come from strings, integers, or the name
+     * field; other values count as empty. Byte classes are ASCII-only.
+     *
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeTvMazeAkaNameBatch(array $entries): array
+    {
+        return self::usesW464RustFfi()
+            ? self::summarizeTvMazeAkaNameBatchNative($entries)
+            : self::summarizeTvMazeAkaNameBatchPhp($entries);
+    }
+
+    /**
+     * Rust summary; falls back to PHP when the library or input frame is unusable.
+     *
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeTvMazeAkaNameBatchNative(array $entries): array
+    {
+        return self::w464Call(self::w464Entries($entries)) ?? self::summarizeTvMazeAkaNameBatchPhp($entries);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeTvMazeAkaNameBatchPhp(array $entries): array
+    {
+        $summary = array_fill_keys(self::W464_SUMMARY_KEYS, 0);
+        foreach (self::w464Entries($entries) as $entry) {
+            $summary['total_entries']++;
+            if ($entry === '') {
+                $summary['empty_count']++;
+
+                continue;
+            }
+            $name = trim($entry);
+            $summary['blank_count'] += (int) ($name === '');
+            $summary['padded_count'] += (int) ($name !== $entry);
+            $summary['article_prefix_count'] += (int) (preg_match('/\A(?:[Tt][Hh][Ee]|[Aa][Nn]?)[ \t\n\r\x0b\f]/', $name) === 1);
+            $summary['year_suffix_count'] += (int) (preg_match('/\([0-9]{4}\)\z/', $name) === 1);
+            $summary['country_suffix_count'] += (int) (preg_match('/\((?:US|UK|AU|CA|NZ|JP|KR)\)\z/', $name) === 1);
+            $summary['punctuation_count'] += (int) (preg_match('/[:!?&]/', $name) === 1);
+            $summary['digit_count'] += (int) (preg_match('/[0-9]/', $name) === 1);
+            $summary['non_ascii_count'] += (int) (preg_match('/[\x80-\xff]/', $name) === 1);
+            $summary['multi_space_count'] += (int) (preg_match('/[ \t\n\r\x0b\f]{2}/', $name) === 1);
+        }
+
+        return $summary;
+    }
+
+    /** Only integer and string entries participate; objects are never cast or serialized.
+     *
+     * @param  array<array-key, mixed>  $input
+     * @return list<string>
+     */
+    private static function w464Entries(array $input): array
+    {
+        $entries = [];
+        foreach ($input as $item) {
+            if (is_array($item)) {
+                $item = $item['name'] ?? null;
+            }
+            $entries[] = is_string($item) || is_int($item) ? (string) $item : '';
+        }
+
+        return $entries;
+    }
+
+    /** @param list<string> $entries
+     * @return array<string, int>|null
+     */
+    private static function w464Call(array $entries): ?array
+    {
+        try {
+            $input = serialize($entries);
+            if (strlen($input) > 16777216) {
+                return null;
+            }
+            self::$w464Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w464', self::W464_FFI_CDEF) ?? false;
+            $ffi = self::$w464Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            // obtainScratch() returns at least the 88 bytes requested.
+            $out = RustPipelineLibrary::obtainScratch($ffi, 88);
+            // @phpstan-ignore method.notFound (Declared by W464_FFI_CDEF.)
+            if ($out === null || $ffi->nntmux_w464_tvmaze_aka_name_batch($input, strlen($input), $out, 88) !== 88) {
+                return null;
+            }
+            /** @var array<string, int>|false $summary */
+            $summary = unpack(self::W464_UNPACK, FFI::string($out, 88));
+            $total = count($entries);
+            if ($summary === false || $summary['total_entries'] !== $total || min($summary) < 0 || max($summary) > $total) {
+                return null;
+            }
+
+            return $summary;
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }
