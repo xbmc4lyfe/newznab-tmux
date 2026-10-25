@@ -4,8 +4,11 @@ declare(strict_types=1);
 
 namespace App\Services\Search\DTO;
 
+use App\Services\Search\SearchCursorCodec;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
+use JsonException;
 use Throwable;
 
 /**
@@ -425,5 +428,181 @@ final class SearchCursor
         }
 
         return self::$ffi instanceof FFI ? self::$ffi : null;
+    }
+
+    public const string W51_FFI_CDEF = 'int64_t nntmux_w515_search_cursor_resume_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W51.5 parity test's QUALIFICATION). */
+    private const bool W51_RUST_FFI_DEFAULT = true;
+
+    private static ?bool $w51RustFfi = null;
+
+    private static FFI|false|null $w51Ffi = null;
+
+    private static ?CData $w51Out = null;
+
+    private static int $w51OutCap = 0;
+
+    public static function usesW51RustFfi(): bool
+    {
+        return self::$w51RustFfi ?? self::W51_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with resumePlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW51RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$w51RustFfi;
+        self::$w51RustFfi = $enabled;
+
+        try {
+            return $callback();
+        } finally {
+            self::$w51RustFfi = $previous;
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 51.5 Rust helper, or null to fall back to PHP. The helper
+     * leads with the number of rows PHP must compute, returned in $patches.
+     *
+     * @return list<int>|null
+     */
+    private static function w51Words(int $count, string $data, string $ints, int $words, ?int &$patches = null): ?array
+    {
+        if (self::$w51Ffi === null) {
+            $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+            self::$w51Ffi = RustPipelineLibrary::resolveDomain('search_w51', self::W51_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+            self::$w51Out = null;
+            self::$w51OutCap = 0;
+        }
+        $ffi = self::$w51Ffi;
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+
+        try {
+            if (self::$w51Out === null || $words >= self::$w51OutCap) {
+                $cap = max(1024, $words + 1);
+                self::$w51Out = $ffi->new('int64_t['.$cap.']');
+                self::$w51OutCap = $cap;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w515_search_cursor_resume_plan($count, 0, $data, \strlen($data), $ints, \strlen($ints), self::$w51Out, self::$w51OutCap);
+            if ($written !== $words + 1) {
+                return null;
+            }
+            $patches = self::$w51Out[0];
+            /** @var array<int, int>|false $values */
+            $values = unpack('P*', FFI::string(self::$w51Out, $written * 8), 8);
+
+            return \is_array($values) ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** PHP `hash('xxh64')` of $value read as a signed big-endian word, as the Rust helper reports it. */
+    private static function w51Digest(string $value): int
+    {
+        /** @var array{1: int} $unpacked */
+        $unpacked = unpack('J', hash('xxh64', $value, true));
+
+        return $unpacked[1];
+    }
+
+    /** MATCH_STATES codes reported by resumePlanBatch(). */
+    private const array W51_STATE_CODES = ['valid' => 0, 'expired' => 1, 'query_mismatch' => 2, 'driver_mismatch' => 3, 'generation_mismatch' => 4];
+
+    /**
+     * Batch resume plan for cursors against one query, driver and index generation at $now. Six words per
+     * cursor: `[classifyCursorMatchPhp() state (MATCH_STATES index) | sort width << 3,
+     * resumeOffsetFromSortValuesPhp(), payload length, xxh64(payload), renewed payload length,
+     * xxh64(renewed payload)]`. The payload is SearchCursorCodec::encodePayloadPhp() of the cursor and the
+     * renewed payload that of the cursor rebound to the given query, driver and generation and expiring at
+     * `$now + $ttlSeconds` (the next-page cursor); a payload that cannot be encoded has length -1 and
+     * digest 0.
+     *
+     * @param  list<self>  $cursors
+     * @return list<int>
+     */
+    public static function resumePlanBatch(array $cursors, string $queryHash, string $driver, string $indexGeneration, int $now, int $ttlSeconds = 900): array
+    {
+        return self::usesW51RustFfi()
+            ? self::resumePlanBatchNative($cursors, $queryHash, $driver, $indexGeneration, $now, $ttlSeconds)
+            : self::resumePlanBatchPhp($cursors, $queryHash, $driver, $indexGeneration, $now, $ttlSeconds);
+    }
+
+    /**
+     * @param  list<self>  $cursors
+     * @return list<int>
+     */
+    public static function resumePlanBatchPhp(array $cursors, string $queryHash, string $driver, string $indexGeneration, int $now, int $ttlSeconds = 900): array
+    {
+        $out = [];
+        foreach ($cursors as $cursor) {
+            $state = self::W51_STATE_CODES[self::classifyCursorMatchPhp($cursor->queryHash, $cursor->driver, $cursor->indexGeneration, $cursor->expiresAt, $queryHash, $driver, $indexGeneration, $now)];
+            array_push($out, $state | \count($cursor->sortValues) << 3, self::resumeOffsetFromSortValuesPhp($cursor->sortValues));
+            foreach ([$cursor, new self($cursor->sortValues, $cursor->total, $queryHash, $driver, $indexGeneration, $now + $ttlSeconds)] as $encoded) {
+                try {
+                    $payload = SearchCursorCodec::encodePayloadPhp($encoded);
+                    array_push($out, \strlen($payload), self::w51Digest($payload));
+                } catch (JsonException) {
+                    array_push($out, -1, 0);
+                }
+            }
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch: one `json_encode()` of every cursor's sort values plus NUL-delimited strings. Falls back to
+     * PHP when the library is missing, a string holds a NUL byte, a sort value cannot be encoded or the
+     * renewed expiry overflows, and computes cursors with float, nested or non-list sort values (or a single
+     * string sort value PHP must cast) with PHP.
+     *
+     * @param  list<self>  $cursors
+     * @return list<int>
+     */
+    public static function resumePlanBatchNative(array $cursors, string $queryHash, string $driver, string $indexGeneration, int $now, int $ttlSeconds = 900): array
+    {
+        $count = \count($cursors);
+        $overflows = $ttlSeconds > 0 ? $now > PHP_INT_MAX - $ttlSeconds : $now < PHP_INT_MIN - $ttlSeconds;
+        $sorts = $count === 0 || $overflows || ! array_is_list($cursors) ? false : json_encode(array_column($cursors, 'sortValues'));
+        if ($sorts === false) {
+            return self::resumePlanBatchPhp($cursors, $queryHash, $driver, $indexGeneration, $now, $ttlSeconds);
+        }
+        $data = $sorts."\0".$queryHash."\0".$driver."\0".$indexGeneration
+            ."\0".implode("\0", array_column($cursors, 'queryHash'))
+            ."\0".implode("\0", array_column($cursors, 'driver'))
+            ."\0".implode("\0", array_column($cursors, 'indexGeneration'));
+        $words = self::w51Words($count, $data, pack('P*', $now, $now + $ttlSeconds, ...array_column($cursors, 'expiresAt'), ...array_column($cursors, 'total')), 6 * $count, $patches);
+        if ($words === null) {
+            return self::resumePlanBatchPhp($cursors, $queryHash, $driver, $indexGeneration, $now, $ttlSeconds);
+        }
+        if ($patches > 0) {
+            $keys = $patchCursors = [];
+            foreach (array_keys($words, -1, true) as $key) {
+                if ($key % 6 === 0) {
+                    $keys[] = $key;
+                    $patchCursors[] = $cursors[intdiv($key, 6)];
+                }
+            }
+            $fixed = self::resumePlanBatchPhp($patchCursors, $queryHash, $driver, $indexGeneration, $now, $ttlSeconds);
+            foreach ($keys as $n => $key) {
+                for ($word = 0; $word < 6; $word++) {
+                    $words[$key + $word] = $fixed[6 * $n + $word];
+                }
+            }
+        }
+
+        return $words;
     }
 }

@@ -431,4 +431,162 @@ final class ReleaseSearchQuery
             return null;
         }
     }
+
+    public const string W51_FFI_CDEF = 'int64_t nntmux_w515_release_query_normalize(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W51.5 parity test's QUALIFICATION). */
+    private const bool W51_RUST_FFI_DEFAULT = true;
+
+    private static ?bool $w51RustFfi = null;
+
+    private static FFI|false|null $w51Ffi = null;
+
+    private static ?CData $w51Out = null;
+
+    private static int $w51OutCap = 0;
+
+    public static function usesW51RustFfi(): bool
+    {
+        return self::$w51RustFfi ?? self::W51_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with normalizeRequestBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW51RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$w51RustFfi;
+        self::$w51RustFfi = $enabled;
+
+        try {
+            return $callback();
+        } finally {
+            self::$w51RustFfi = $previous;
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 51.5 Rust helper, or null to fall back to PHP. The helper
+     * leads with the number of rows PHP must compute, returned in $patches.
+     *
+     * @return list<int>|null
+     */
+    private static function w51Words(int $count, string $data, string $ints, int $words, ?int &$patches = null): ?array
+    {
+        if (self::$w51Ffi === null) {
+            $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+            self::$w51Ffi = RustPipelineLibrary::resolveDomain('search_w51', self::W51_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+            self::$w51Out = null;
+            self::$w51OutCap = 0;
+        }
+        $ffi = self::$w51Ffi;
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+
+        try {
+            if (self::$w51Out === null || $words >= self::$w51OutCap) {
+                $cap = max(1024, $words + 1);
+                self::$w51Out = $ffi->new('int64_t['.$cap.']');
+                self::$w51OutCap = $cap;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w515_release_query_normalize($count, 0, $data, \strlen($data), $ints, \strlen($ints), self::$w51Out, self::$w51OutCap);
+            if ($written !== $words + 1) {
+                return null;
+            }
+            $patches = self::$w51Out[0];
+            /** @var array<int, int>|false $values */
+            $values = unpack('P*', FFI::string(self::$w51Out, $written * 8), 8);
+
+            return \is_array($values) ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** PHP `hash('xxh64')` of $value read as a signed big-endian word, as the Rust helper reports it. */
+    private static function w51Digest(string $value): int
+    {
+        /** @var array{1: int} $unpacked */
+        $unpacked = unpack('J', hash('xxh64', $value, true));
+
+        return $unpacked[1];
+    }
+
+    /**
+     * Batch normalization of request strings with the rules of normalizedSortField(),
+     * normalizedSortDirection(), normalizeMediaUniqueId() and normalizeRangeBound(). Five words per request:
+     * `[W415_SORT_FIELDS index (0 fallback) | known field << 3 | ascending << 4, min ID (-1 null), max ID
+     * (-1 null), media unique ID length (-1 null), xxh64(media unique ID) (0 null)]`.
+     *
+     * @param  list<string>  $mediaIds
+     * @param  list<string>  $sortFields
+     * @param  list<string>  $sortDirs
+     * @param  list<string>  $minIds
+     * @param  list<string>  $maxIds
+     * @return list<int>
+     */
+    public static function normalizeRequestBatch(array $mediaIds, array $sortFields, array $sortDirs, array $minIds, array $maxIds): array
+    {
+        return self::usesW51RustFfi()
+            ? self::normalizeRequestBatchNative($mediaIds, $sortFields, $sortDirs, $minIds, $maxIds)
+            : self::normalizeRequestBatchPhp($mediaIds, $sortFields, $sortDirs, $minIds, $maxIds);
+    }
+
+    /**
+     * @param  list<string>  $mediaIds
+     * @param  list<string>  $sortFields
+     * @param  list<string>  $sortDirs
+     * @param  list<string>  $minIds
+     * @param  list<string>  $maxIds
+     * @return list<int>
+     */
+    public static function normalizeRequestBatchPhp(array $mediaIds, array $sortFields, array $sortDirs, array $minIds, array $maxIds): array
+    {
+        $out = [];
+        foreach ($sortFields as $i => $field) {
+            $index = array_search($field, self::W415_SORT_FIELDS, true);
+            $flags = ($index === false ? 0 : $index | 8) | (strtolower($sortDirs[$i]) === 'asc' ? 16 : 0);
+            $media = self::normalizeMediaUniqueId($mediaIds[$i]);
+            array_push(
+                $out,
+                $flags,
+                self::normalizeRangeBound($minIds[$i]) ?? -1,
+                self::normalizeRangeBound($maxIds[$i]) ?? -1,
+                $media === null ? -1 : \strlen($media),
+                $media === null ? 0 : self::w51Digest($media),
+            );
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, the columns differ in length or a value
+     * holds a NUL byte.
+     *
+     * @param  list<string>  $mediaIds
+     * @param  list<string>  $sortFields
+     * @param  list<string>  $sortDirs
+     * @param  list<string>  $minIds
+     * @param  list<string>  $maxIds
+     * @return list<int>
+     */
+    public static function normalizeRequestBatchNative(array $mediaIds, array $sortFields, array $sortDirs, array $minIds, array $maxIds): array
+    {
+        $count = \count($sortFields);
+        if ($count === 0 || \count($mediaIds) !== $count || \count($sortDirs) !== $count || \count($minIds) !== $count || \count($maxIds) !== $count
+            || ! array_is_list($mediaIds) || ! array_is_list($sortFields) || ! array_is_list($sortDirs) || ! array_is_list($minIds) || ! array_is_list($maxIds)) {
+            return self::normalizeRequestBatchPhp($mediaIds, $sortFields, $sortDirs, $minIds, $maxIds);
+        }
+        $data = implode("\0", $mediaIds)."\0".implode("\0", $sortFields)."\0".implode("\0", $sortDirs)."\0".implode("\0", $minIds)."\0".implode("\0", $maxIds);
+
+        return self::w51Words($count, $data, '', 5 * $count) ?? self::normalizeRequestBatchPhp($mediaIds, $sortFields, $sortDirs, $minIds, $maxIds);
+    }
 }
