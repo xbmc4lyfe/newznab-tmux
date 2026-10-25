@@ -24146,3 +24146,546 @@ mod wave34_5_search_cursor_config_stats {
         }
     }
 }
+
+/// Wave 35.5: search driver alias map, Elasticsearch index operation params,
+/// release search document fields, site stat entries and admin log facet filters.
+mod wave35_5_search_provider_facade_facets {
+    const DECLINE: isize = -1;
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+    const MAX_PARTS: usize = 64;
+    /// Bytes stripped by PHP's default `trim()`.
+    const PHP_TRIM: &[u8] = b" \t\n\r\0\x0B";
+    const SUPPORTED_DRIVERS: [&[u8]; 2] = [b"manticore", b"elasticsearch"];
+    const FALLBACK_DRIVER: &[u8] = b"manticore";
+    const INVALID_INDEX_BYTES: &[u8] = b"\\/*?\"<>| ,#:";
+    const INDEX_MAX_BYTES: usize = 255;
+    const STAT_KEY_MAX_BYTES: usize = 64;
+    const CHANNEL_MAX_BYTES: usize = 64;
+    const LOG_LEVELS: [&[u8]; 8] = [
+        b"debug",
+        b"info",
+        b"notice",
+        b"warning",
+        b"error",
+        b"critical",
+        b"alert",
+        b"emergency",
+    ];
+
+    fn unpack(input: &[u8]) -> Option<Vec<&[u8]>> {
+        let count = u32::from_le_bytes(input.get(..4)?.try_into().ok()?) as usize;
+        if count > MAX_PARTS || count > (input.len() - 4) / 4 {
+            return None;
+        }
+        let mut cursor = 4usize;
+        let mut parts = Vec::with_capacity(count);
+        for _ in 0..count {
+            let length_end = cursor.checked_add(4)?;
+            let length =
+                u32::from_le_bytes(input.get(cursor..length_end)?.try_into().ok()?) as usize;
+            let end = length_end.checked_add(length)?;
+            parts.push(input.get(length_end..end)?);
+            cursor = end;
+        }
+        (cursor == input.len()).then_some(parts)
+    }
+
+    fn pack(parts: &[Vec<u8>]) -> Option<Vec<u8>> {
+        let count = u32::try_from(parts.len()).ok()?;
+        let size = parts.iter().try_fold(4usize, |size, part| {
+            u32::try_from(part.len()).ok()?;
+            size.checked_add(4)?.checked_add(part.len())
+        })?;
+        if size > isize::MAX as usize {
+            return None;
+        }
+        let mut out = Vec::with_capacity(size);
+        out.extend_from_slice(&count.to_le_bytes());
+        for part in parts {
+            out.extend_from_slice(&(part.len() as u32).to_le_bytes());
+            out.extend_from_slice(part);
+        }
+        Some(out)
+    }
+
+    /// Canonical decimal produced by PHP `(string) $int`.
+    fn integer(bytes: &[u8]) -> Option<i64> {
+        let value: i64 = std::str::from_utf8(bytes).ok()?.parse().ok()?;
+        (value.to_string().as_bytes() == bytes).then_some(value)
+    }
+
+    fn trim_set<'a>(bytes: &'a [u8], set: &[u8]) -> &'a [u8] {
+        let start = bytes
+            .iter()
+            .position(|b| !set.contains(b))
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|b| !set.contains(b))
+            .map_or(start, |i| i + 1);
+        &bytes[start..end]
+    }
+
+    fn php_trim(bytes: &[u8]) -> &[u8] {
+        trim_set(bytes, PHP_TRIM)
+    }
+
+    fn flag(bytes: &[u8]) -> Option<bool> {
+        match bytes {
+            b"0" => Some(false),
+            b"1" => Some(true),
+            _ => None,
+        }
+    }
+
+    fn flag_bytes(value: bool) -> Vec<u8> {
+        if value { b"1".to_vec() } else { b"0".to_vec() }
+    }
+
+    fn text(value: i64) -> Vec<u8> {
+        value.to_string().into_bytes()
+    }
+
+    /// PHP passes a nullable string as a `0`/`1` flag plus its bytes; null carries no bytes.
+    fn nullable<'a>(present: &[u8], value: &'a [u8]) -> Option<Option<&'a [u8]>> {
+        match flag(present)? {
+            true => Some(Some(value)),
+            false if value.is_empty() => Some(None),
+            false => None,
+        }
+    }
+
+    fn push_nullable(out: &mut Vec<Vec<u8>>, value: Option<Vec<u8>>) {
+        out.push(flag_bytes(value.is_some()));
+        out.push(value.unwrap_or_default());
+    }
+
+    fn transform(mode: u32, parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        Some(match (mode, parts) {
+            // SearchServiceProvider::normalizeDriverAliasMap: unknown drivers fall back to manticore.
+            (1, [driver]) => {
+                let lowered = php_trim(driver).to_ascii_lowercase();
+                let driver = if SUPPORTED_DRIVERS.contains(&lowered.as_slice()) {
+                    lowered
+                } else {
+                    FALLBACK_DRIVER.to_vec()
+                };
+                vec![
+                    b"default".to_vec(),
+                    driver.clone(),
+                    b"search".to_vec(),
+                    driver,
+                    b"search.manticore".to_vec(),
+                    b"manticore".to_vec(),
+                    b"search.elasticsearch".to_vec(),
+                    b"elasticsearch".to_vec(),
+                ]
+            }
+            // Elasticsearch::normalizeIndexOperationParams: index naming rules and bulk pairs.
+            (2, [index, body_count]) => {
+                let body_count = integer(body_count)?;
+                let index = php_trim(index).to_ascii_lowercase();
+                let valid = !index.is_empty()
+                    && index.len() <= INDEX_MAX_BYTES
+                    && index != b"."
+                    && index != b".."
+                    && !matches!(index[0], b'-' | b'_' | b'+')
+                    && !index.iter().any(|b| INVALID_INDEX_BYTES.contains(b));
+                vec![
+                    index,
+                    flag_bytes(valid),
+                    text(if body_count > 0 { body_count / 2 } else { 0 }),
+                    flag_bytes(body_count >= 0 && body_count % 2 == 0),
+                ]
+            }
+            // ReleaseSearchData::normalizeSearchDocumentFields.
+            (3, [id, name, search_name, from_name, categories_id]) => {
+                let id = integer(id)?.max(0);
+                let categories_id = integer(categories_id)?.max(0);
+                let search_name = php_trim(search_name).to_vec();
+                let plain = search_name
+                    .iter()
+                    .map(|&b| if b == b'.' || b == b'-' { b' ' } else { b })
+                    .collect();
+                let indexable = id > 0 && !search_name.is_empty();
+                vec![
+                    text(id),
+                    php_trim(name).to_vec(),
+                    search_name,
+                    plain,
+                    php_trim(from_name).to_vec(),
+                    text(categories_id),
+                    flag_bytes(indexable),
+                ]
+            }
+            // SiteStat::normalizeStatEntry: byte-wise `/[^a-z0-9_]+/` -> `_`, then cut and trim `_`.
+            (4, [key, tag, value]) => {
+                let mut normalized = Vec::with_capacity(key.len());
+                let mut in_run = false;
+                for &b in php_trim(key) {
+                    let b = b.to_ascii_lowercase();
+                    if b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' {
+                        normalized.push(b);
+                        in_run = false;
+                    } else if !in_run {
+                        normalized.push(b'_');
+                        in_run = true;
+                    }
+                }
+                normalized.truncate(STAT_KEY_MAX_BYTES);
+                let normalized = trim_set(&normalized, b"_").to_vec();
+                let value = match *tag {
+                    b"i" => text(integer(value)?),
+                    b"f" => {
+                        let float = f64::from_le_bytes((*value).try_into().ok()?);
+                        let float = if float.is_finite() { float + 0.0 } else { 0.0 };
+                        float.to_le_bytes().to_vec()
+                    }
+                    _ => return None,
+                };
+                let valid = !normalized.is_empty();
+                vec![normalized, flag_bytes(valid), tag.to_vec(), value]
+            }
+            // AdminLogFacetsRequest::normalizeFacetFilterInput.
+            (5, [term_set, term, level_set, level, channel_set, channel]) => {
+                let term = nullable(term_set, term)?
+                    .map(php_trim)
+                    .filter(|term| !term.is_empty());
+                let term_valid =
+                    term.is_none_or(|term| !term.iter().any(|&b| b < 0x20 || b == 0x7F));
+                let level = nullable(level_set, level)?
+                    .map(|level| php_trim(level).to_ascii_lowercase())
+                    .filter(|level| LOG_LEVELS.contains(&level.as_slice()));
+                let channel = nullable(channel_set, channel)?
+                    .map(php_trim)
+                    .filter(|channel| {
+                        !channel.is_empty()
+                            && channel.len() <= CHANNEL_MAX_BYTES
+                            && channel.iter().all(|&b| {
+                                b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-')
+                            })
+                    });
+                let mut out = Vec::with_capacity(7);
+                push_nullable(&mut out, term.map(<[u8]>::to_vec));
+                out.push(flag_bytes(term_valid));
+                push_nullable(&mut out, level);
+                push_nullable(&mut out, channel.map(<[u8]>::to_vec));
+                out
+            }
+            _ => return None,
+        })
+    }
+
+    /// Dispatch count-prefixed, length-prefixed byte strings (little-endian
+    /// u32). Returns written bytes, `-needed` when `cap` is too small, or `-1`
+    /// for invalid input. Failure never writes to the output buffer. Results
+    /// are at least four bytes, so `-1` never means "one byte needed".
+    ///
+    /// # Safety
+    /// Non-null pointers must refer to readable/writable allocations of the
+    /// declared lengths. Null pointers require zero length/capacity. Input and
+    /// output may overlap; the result is fully owned before any output write.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w35_search_provider_facade_facets(
+        mode: u32,
+        input: *const u8,
+        input_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        std::panic::catch_unwind(|| {
+            if input_len > MAX_INPUT
+                || cap > isize::MAX as usize
+                || (input.is_null() && input_len != 0)
+                || (out.is_null() && cap != 0)
+            {
+                return DECLINE;
+            }
+            let input = if input_len == 0 {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(input, input_len) }
+            };
+            let Some(parts) = unpack(input) else {
+                return DECLINE;
+            };
+            let Some(result) = transform(mode, &parts).and_then(|parts| pack(&parts)) else {
+                return DECLINE;
+            };
+            if cap < result.len() || out.is_null() {
+                return -(result.len() as isize);
+            }
+            unsafe { std::ptr::copy(result.as_ptr(), out, result.len()) };
+            result.len() as isize
+        })
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn packet(parts: &[&[u8]]) -> Vec<u8> {
+            pack(&parts.iter().map(|part| part.to_vec()).collect::<Vec<_>>()).unwrap()
+        }
+
+        fn call(mode: u32, parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+            let input = packet(parts);
+            let mut out = vec![0u8; input.len() * 2 + 512];
+            let written = unsafe {
+                nntmux_w35_search_provider_facade_facets(
+                    mode,
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            if written < 0 {
+                return None;
+            }
+            out.truncate(written as usize);
+            Some(unpack(&out)?.into_iter().map(<[u8]>::to_vec).collect())
+        }
+
+        fn strings(items: &[&str]) -> Vec<Vec<u8>> {
+            items.iter().map(|item| item.as_bytes().to_vec()).collect()
+        }
+
+        #[test]
+        fn driver_alias_map() {
+            let map = |driver: &str| {
+                strings(&[
+                    "default",
+                    driver,
+                    "search",
+                    driver,
+                    "search.manticore",
+                    "manticore",
+                    "search.elasticsearch",
+                    "elasticsearch",
+                ])
+            };
+            assert_eq!(
+                call(1, &[b" ElasticSearch\n"]).unwrap(),
+                map("elasticsearch")
+            );
+            assert_eq!(call(1, &[b"manticore"]).unwrap(), map("manticore"));
+            assert_eq!(call(1, &[b"es"]).unwrap(), map("manticore"));
+            assert_eq!(call(1, &[b""]).unwrap(), map("manticore"));
+            assert_eq!(call(1, &[b"\xc3\x89"]).unwrap(), map("manticore"));
+            assert_eq!(call(1, &[]), None);
+            assert_eq!(call(1, &[b"a", b"b"]), None);
+        }
+
+        #[test]
+        fn index_operation_params() {
+            assert_eq!(
+                call(2, &[b" Releases_RT ", b"10"]).unwrap(),
+                strings(&["releases_rt", "1", "5", "1"])
+            );
+            assert_eq!(
+                call(2, &[b"rel", b"7"]).unwrap(),
+                strings(&["rel", "1", "3", "0"])
+            );
+            assert_eq!(
+                call(2, &[b"_rel", b"-4"]).unwrap(),
+                strings(&["_rel", "0", "0", "0"])
+            );
+            assert_eq!(call(2, &[b"..", b"0"]).unwrap()[1], b"0".to_vec());
+            assert_eq!(call(2, &[b"a b", b"0"]).unwrap()[1], b"0".to_vec());
+            assert_eq!(call(2, &[b"a:b", b"0"]).unwrap()[1], b"0".to_vec());
+            assert_eq!(call(2, &[&[b'a'; 256], b"0"]).unwrap()[1], b"0".to_vec());
+            assert_eq!(call(2, &[&[b'a'; 255], b"0"]).unwrap()[1], b"1".to_vec());
+            assert_eq!(
+                call(2, &[b"x", b"-9223372036854775808"]).unwrap(),
+                strings(&["x", "1", "0", "0"])
+            );
+            assert_eq!(call(2, &[b"x", b"+1"]), None);
+            assert_eq!(call(2, &[b"x", b"01"]), None);
+        }
+
+        #[test]
+        fn search_document_fields() {
+            assert_eq!(
+                call(
+                    3,
+                    &[b"42", b" n ", b" Some.Movie-2024 ", b"\tposter\n", b"2040"]
+                )
+                .unwrap(),
+                strings(&[
+                    "42",
+                    "n",
+                    "Some.Movie-2024",
+                    "Some Movie 2024",
+                    "poster",
+                    "2040",
+                    "1"
+                ])
+            );
+            assert_eq!(
+                call(3, &[b"-1", b"", b"", b"", b"-5"]).unwrap(),
+                strings(&["0", "", "", "", "", "0", "0"])
+            );
+            assert_eq!(call(3, &[b"1", b"", b"", b""]), None);
+            assert_eq!(call(3, &[b"1.0", b"", b"", b"", b"0"]), None);
+        }
+
+        #[test]
+        fn stat_entries() {
+            let entry = call(4, &[b"  Releases Added (24h) ", b"i", b"12"]).unwrap();
+            assert_eq!(entry, strings(&["releases_added_24h", "1", "i", "12"]));
+            assert_eq!(
+                call(4, &[b"__a\xc3\x89b__", b"i", b"-3"]).unwrap(),
+                strings(&["a_b", "1", "i", "-3"])
+            );
+            assert_eq!(
+                call(4, &[b"a__!b", b"i", b"0"]).unwrap()[0],
+                b"a___b".to_vec()
+            );
+            assert_eq!(
+                call(4, &[b"!!!", b"i", b"0"]).unwrap()[..2],
+                strings(&["", "0"])[..]
+            );
+            let long = [b'a'; 70];
+            assert_eq!(call(4, &[&long, b"i", b"0"]).unwrap()[0], vec![b'a'; 64]);
+            let f = |value: f64| value.to_le_bytes();
+            assert_eq!(call(4, &[b"x", b"f", &f(1.5)]).unwrap()[3], f(1.5).to_vec());
+            assert_eq!(
+                call(4, &[b"x", b"f", &f(-0.0)]).unwrap()[3],
+                f(0.0).to_vec()
+            );
+            assert_eq!(
+                call(4, &[b"x", b"f", &f(f64::NAN)]).unwrap()[3],
+                f(0.0).to_vec()
+            );
+            assert_eq!(
+                call(4, &[b"x", b"f", &f(f64::NEG_INFINITY)]).unwrap()[3],
+                f(0.0).to_vec()
+            );
+            assert_eq!(call(4, &[b"x", b"f", b"1234567"]), None);
+            assert_eq!(call(4, &[b"x", b"s", b"1"]), None);
+            assert_eq!(call(4, &[b"x", b"i", b"1e3"]), None);
+        }
+
+        #[test]
+        fn facet_filter_input() {
+            assert_eq!(
+                call(
+                    5,
+                    &[
+                        b"1",
+                        b"  timeout ",
+                        b"1",
+                        b" ERROR ",
+                        b"1",
+                        b" queue.default "
+                    ]
+                )
+                .unwrap(),
+                strings(&["1", "timeout", "1", "1", "error", "1", "queue.default"])
+            );
+            assert_eq!(
+                call(5, &[b"0", b"", b"0", b"", b"0", b""]).unwrap(),
+                strings(&["0", "", "1", "0", "", "0", ""])
+            );
+            assert_eq!(
+                call(5, &[b"1", b" \t", b"1", b"fatal", b"1", b"bad channel"]).unwrap(),
+                strings(&["0", "", "1", "0", "", "0", ""])
+            );
+            assert_eq!(
+                call(5, &[b"1", b"a\x01b", b"1", b"", b"1", &[b'c'; 65]]).unwrap(),
+                strings(&["1", "a\x01b", "0", "0", "", "0", ""])
+            );
+            assert_eq!(call(5, &[b"0", b"x", b"0", b"", b"0", b""]), None);
+            assert_eq!(call(5, &[b"2", b"", b"0", b"", b"0", b""]), None);
+            assert_eq!(call(5, &[b"0", b"", b"0", b""]), None);
+        }
+
+        #[test]
+        fn malformed_null_and_capacity() {
+            let input = packet(&[b"manticore"]);
+            let mut out = [0x5a_u8; 128];
+            for (ptr, len, dst, cap) in [
+                (std::ptr::null(), 1, out.as_mut_ptr(), out.len()),
+                (input.as_ptr(), input.len(), std::ptr::null_mut(), 8),
+                (input.as_ptr(), MAX_INPUT + 1, out.as_mut_ptr(), out.len()),
+                (input.as_ptr(), input.len(), out.as_mut_ptr(), usize::MAX),
+            ] {
+                assert_eq!(
+                    unsafe { nntmux_w35_search_provider_facade_facets(1, ptr, len, dst, cap) },
+                    DECLINE
+                );
+            }
+            for bad in [
+                vec![],
+                vec![1, 0, 0],
+                vec![1, 0, 0, 0, 9, 0, 0, 0],
+                vec![65, 0, 0, 0],
+            ] {
+                assert_eq!(
+                    unsafe {
+                        nntmux_w35_search_provider_facade_facets(
+                            1,
+                            bad.as_ptr(),
+                            bad.len(),
+                            out.as_mut_ptr(),
+                            out.len(),
+                        )
+                    },
+                    DECLINE
+                );
+            }
+            for mode in [0u32, 6, 99] {
+                assert_eq!(
+                    unsafe {
+                        nntmux_w35_search_provider_facade_facets(
+                            mode,
+                            input.as_ptr(),
+                            input.len(),
+                            out.as_mut_ptr(),
+                            out.len(),
+                        )
+                    },
+                    DECLINE
+                );
+            }
+            assert_eq!(out, [0x5a; 128]);
+            let full = call(1, &[b"manticore"])
+                .map(|parts| pack(&parts).unwrap().len())
+                .unwrap();
+            for cap in [0usize, 1, full - 1] {
+                let dst = if cap == 0 {
+                    std::ptr::null_mut()
+                } else {
+                    out.as_mut_ptr()
+                };
+                assert_eq!(
+                    unsafe {
+                        nntmux_w35_search_provider_facade_facets(
+                            1,
+                            input.as_ptr(),
+                            input.len(),
+                            dst,
+                            cap,
+                        )
+                    },
+                    -(full as isize)
+                );
+            }
+            assert_eq!(out, [0x5a; 128]);
+            let mut alias = input.clone();
+            alias.resize(full.max(input.len()), 0);
+            let written = unsafe {
+                nntmux_w35_search_provider_facade_facets(
+                    1,
+                    alias.as_ptr(),
+                    input.len(),
+                    alias.as_mut_ptr(),
+                    alias.len(),
+                )
+            };
+            assert_eq!(written, full as isize);
+        }
+    }
+}
