@@ -734,4 +734,175 @@ class NzbContentParser
             'exceeds_segment_limit' => $slots[5] === 1,
         ];
     }
+
+    public const string W52_FFI_CDEF = 'int64_t nntmux_w525_nzb_subject_names(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W52.5 parity test's QUALIFICATION). */
+    private const bool W52_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 52.5 routing and FFI cache, kept in function-local statics so readonly classes can use them too.
+     * Without $op it reports the routing; 'set' swaps the override for $val and returns the previous one;
+     * 'reset' replaces the cached handle with $val (null re-resolves, false disables); 'buffer' returns
+     * `[FFI, int64_t[], capacity]` with room for at least $val words, or null without the library.
+     */
+    private static function w52RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w52_5', self::W52_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W52_RUST_FFI_DEFAULT;
+        }
+    }
+
+    public static function usesW52RustFfi(): bool
+    {
+        return self::w52RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with subjectNameBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW52RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w52RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w52RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 52.5 Rust helper, or null to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w52Words(int $count, string $data, string $ints, int $words): ?array
+    {
+        try {
+            $handle = self::w52RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w525_nzb_subject_names($count, 0, $data, \strlen($data), $ints, \strlen($ints), $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('P*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Batch subject parse for sourceFileInventoryPhp(). Four words per subject: `[status, name offset, name
+     * length, declared part total]`. Status 0 means neither subject pattern matched (the other words are
+     * 0, 0, -1); 1 a matched name the inventory rejects; 2 an accepted name. The name is the trimmed first
+     * capture, as a byte span of the subject; the declared total is `(int)` of the `(n/total)` capture, or -1.
+     *
+     * @param  list<string>  $subjects
+     * @return list<int>
+     */
+    public static function subjectNameBatch(array $subjects): array
+    {
+        return self::usesW52RustFfi() ? self::subjectNameBatchNative($subjects) : self::subjectNameBatchPhp($subjects);
+    }
+
+    /**
+     * @param  list<string>  $subjects
+     * @return list<int>
+     */
+    public static function subjectNameBatchPhp(array $subjects): array
+    {
+        $out = [];
+        foreach ($subjects as $subject) {
+            array_push($out, ...self::w52SubjectName($subject));
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch over NUL-delimited subjects. Falls back to PHP when the library is missing or a subject
+     * holds a NUL byte, and computes declared totals of more than 18 significant digits with PHP.
+     *
+     * @param  list<string>  $subjects
+     * @return list<int>
+     */
+    public static function subjectNameBatchNative(array $subjects): array
+    {
+        $count = \count($subjects);
+        if ($count === 0) {
+            return [];
+        }
+        $data = implode("\0", $subjects);
+        $words = substr_count($data, "\0") === $count - 1 ? self::w52Words($count, $data, '', 4 * $count) : null;
+        if ($words === null) {
+            return self::subjectNameBatchPhp($subjects);
+        }
+        if (\in_array(-2, $words, true)) {
+            $list = array_values($subjects);
+            foreach (array_keys($words, -2, true) as $key) {
+                $words[$key] = self::w52SubjectName($list[intdiv($key, 4)])[3];
+            }
+        }
+
+        return $words;
+    }
+
+    /** @return array{int, int, int, int} */
+    private static function w52SubjectName(string $subject): array
+    {
+        if (preg_match('/^[^"\r\n]*"([^"\r\n]+)"(?:\s+yEnc)?(?:\s+\(\d+\/(\d+)\))?\s*$/iD', $subject, $match, PREG_OFFSET_CAPTURE) !== 1
+            && preg_match('/^([^"\r\n]+?)(?:\s+yEnc)?(?:\s+\(\d+\/(\d+)\))?\s*$/iD', $subject, $match, PREG_OFFSET_CAPTURE) !== 1) {
+            return [0, 0, 0, -1];
+        }
+        [$raw, $offset] = $match[1];
+        $name = trim($raw);
+        $valid = $name !== '' && \strlen($name) <= 4096 && mb_check_encoding($name, 'UTF-8')
+            && preg_match('/[\x00-\x1f\x7f]/', $name) !== 1 && ! \in_array($name[0], ['.', '-'], true)
+            && basename($name) === $name && ! str_contains($name, '\\');
+
+        return [$valid ? 2 : 1, $offset + strspn($raw, " \t\n\r\0\x0B"), \strlen($name), isset($match[2]) ? (int) $match[2][0] : -1];
+    }
 }
