@@ -23,6 +23,14 @@ final class ElasticsearchClientFactory
     private const array HOST_FIELDS = ['host', 'scheme', 'port', 'user', 'pass'];
 
     /**
+     * Rust stays opt-in for the Wave 42.5 summary: the FFI round trip misses the 1.5x gate; see
+     * tests/Unit/RustSearchOutboxElasticManticoreSupportW42ParityTest.php.
+     */
+    public const bool W425_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useW425RustFfi = null;
+
+    /**
      * @param  array<string, mixed>  $config
      */
     public static function make(array $config): Client
@@ -251,5 +259,147 @@ final class ElasticsearchClientFactory
         }
 
         return $options;
+    }
+
+    public static function useW425RustFfi(bool $enable = true): void
+    {
+        self::$useW425RustFfi = $enable;
+    }
+
+    public static function usesW425RustFfi(): bool
+    {
+        return self::$useW425RustFfi ?? self::W425_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW425RustFfi(): void
+    {
+        self::$useW425RustFfi = null;
+    }
+
+    /**
+     * Summarizes configured hosts with the acceptance rules of `buildHostsPhp()`: non-blank strings and
+     * arrays with a non-blank `host` are accepted, everything else (including arrays whose `host` or
+     * `scheme` is neither scalar nor null) is skipped. `https` counts `https://` strings and arrays
+     * whose trimmed scheme is `https` (ASCII case-insensitive); `distinct_hostnames` covers trimmed
+     * array hostnames.
+     *
+     * @param  array<array-key, mixed>  $configHosts
+     * @return array{entries: int, string_hosts: int, structured_hosts: int, skipped: int, https: int, with_port: int, with_credentials: int, distinct_hostnames: int}
+     */
+    public static function summarizeHostConfigBatch(array $configHosts): array
+    {
+        return self::usesW425RustFfi() ? self::summarizeHostConfigBatchNative($configHosts) : self::summarizeHostConfigBatchPhp($configHosts);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $configHosts
+     * @return array{entries: int, string_hosts: int, structured_hosts: int, skipped: int, https: int, with_port: int, with_credentials: int, distinct_hostnames: int}
+     */
+    public static function summarizeHostConfigBatchPhp(array $configHosts): array
+    {
+        $strings = 0;
+        $structured = 0;
+        $skipped = 0;
+        $https = 0;
+        $ports = 0;
+        $credentials = 0;
+        $hostnames = [];
+        foreach ($configHosts as $host) {
+            if (is_string($host)) {
+                $trimmed = trim($host);
+                if ($trimmed === '') {
+                    $skipped++;
+
+                    continue;
+                }
+                $strings++;
+                $https += (int) (strncasecmp($trimmed, 'https://', 8) === 0);
+
+                continue;
+            }
+            $fields = self::w425HostFields($host);
+            $hostname = $fields === null ? '' : trim($fields[0]);
+            if ($fields === null || $hostname === '') {
+                $skipped++;
+
+                continue;
+            }
+            $structured++;
+            $scheme = trim($fields[1]) ?: 'http';
+            $https += (int) (strcasecmp($scheme, 'https') === 0);
+            $ports += (int) $fields[2];
+            $credentials += (int) $fields[3];
+            $hostnames[$hostname] = true;
+        }
+
+        return [
+            'entries' => count($configHosts),
+            'string_hosts' => $strings,
+            'structured_hosts' => $structured,
+            'skipped' => $skipped,
+            'https' => $https,
+            'with_port' => $ports,
+            'with_credentials' => $credentials,
+            'distinct_hostnames' => count($hostnames),
+        ];
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $configHosts
+     * @return array{entries: int, string_hosts: int, structured_hosts: int, skipped: int, https: int, with_port: int, with_credentials: int, distinct_hostnames: int}
+     */
+    public static function summarizeHostConfigBatchNative(array $configHosts): array
+    {
+        $parts = [];
+        foreach ($configHosts as $host) {
+            if (is_string($host)) {
+                array_push($parts, '1', $host, '', '0', '0');
+
+                continue;
+            }
+            $fields = self::w425HostFields($host);
+            if ($fields === null) {
+                array_push($parts, '0', '', '', '0', '0');
+
+                continue;
+            }
+            array_push($parts, '2', $fields[0], $fields[1], $fields[2] ? '1' : '0', $fields[3] ? '1' : '0');
+        }
+        $fields = ElasticsearchResponseHelper::evaluateW425Native(2, $parts);
+        if ($fields === null || count($fields) !== 8) {
+            return self::summarizeHostConfigBatchPhp($configHosts);
+        }
+
+        return [
+            'entries' => (int) $fields[0],
+            'string_hosts' => (int) $fields[1],
+            'structured_hosts' => (int) $fields[2],
+            'skipped' => (int) $fields[3],
+            'https' => (int) $fields[4],
+            'with_port' => (int) $fields[5],
+            'with_credentials' => (int) $fields[6],
+            'distinct_hostnames' => (int) $fields[7],
+        ];
+    }
+
+    /**
+     * Raw host, raw scheme (`http` when missing), port flag and credentials flag of an array host, or
+     * null for anything `summarizeHostConfigBatch()` skips by type.
+     *
+     * @return array{string, string, bool, bool}|null
+     */
+    private static function w425HostFields(mixed $host): ?array
+    {
+        if (! is_array($host)) {
+            return null;
+        }
+        $hostname = $host['host'] ?? '';
+        $scheme = $host['scheme'] ?? 'http';
+        if (! is_scalar($hostname) || ! is_scalar($scheme)) {
+            return null;
+        }
+        $port = $host['port'] ?? null;
+
+        return [(string) $hostname, (string) $scheme, $port !== null && $port !== '', ! empty($host['user']) && ! empty($host['pass'])];
     }
 }
