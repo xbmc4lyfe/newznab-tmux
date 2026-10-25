@@ -10,7 +10,9 @@ use App\Services\Releases\ReleaseBrowseService;
 use App\Support\RustPipelineLibrary;
 use Carbon\CarbonInterface;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\DB;
+use InvalidArgumentException;
 use Throwable;
 
 /**
@@ -377,5 +379,214 @@ class TvLookupOutcomeWriter
             'tv_lookup_attempts' => $attempts,
             'tv_lookup_retry_at' => $retryAt,
         ];
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 49.4 batch helper
+    // ---------------------------------------------------------------------
+
+    /** Enabled: minimum of three paired runs cleared every 1.5x gate (common mean 2.21x, p99 2.05x; uncommon mean 2.66x, p99 2.22x); see RustTvProvidersLocalDbTraktOutcomePosterAdderW49ParityTest. */
+    private const bool W49_RUST_FFI_DEFAULT = true;
+
+    public const string W49_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w49_tv_outcome_resolve_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    private static ?bool $useW49RustFfi = null;
+
+    private static FFI|false|null $w49Ffi = null;
+
+    private static ?CData $w49Out = null;
+
+    private static int $w49OutCap = 0;
+
+    public static function usesW49RustFfi(): bool
+    {
+        return self::$useW49RustFfi ?? self::W49_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W49 batch dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW49RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$useW49RustFfi;
+        self::$useW49RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$useW49RustFfi = $previous;
+        }
+    }
+
+    /**
+     * resolveOutcomePhp() plus shouldBumpCacheVersionPhp() for a batch. Each outcome supplies
+     * seven ints in $scalars ([previous video id, previous status, previous attempts, video id,
+     * episode id, transient 0/1, retry after]) and its status string, and yields four ints:
+     * [tv_episodes_id, tv_lookup_attempts, retry delay seconds or -1, flags]. Flags: 1 link
+     * changed, 2 bump the browse cache, 4 videos_id is the input video id (otherwise 0).
+     * Attempt counters saturate at PHP_INT_MAX instead of overflowing to float.
+     *
+     * @param  list<int>  $scalars
+     * @param  list<string>  $statuses
+     * @return list<int>
+     */
+    public static function resolveOutcomeBatch(array $scalars, array $statuses): array
+    {
+        return self::usesW49RustFfi()
+            ? self::resolveOutcomeBatchNative($scalars, $statuses)
+            : self::resolveOutcomeBatchPhp($scalars, $statuses);
+    }
+
+    /**
+     * @param  list<int>  $scalars
+     * @param  list<string>  $statuses
+     * @return list<int>
+     */
+    public static function resolveOutcomeBatchNative(array $scalars, array $statuses): array
+    {
+        self::w49AssertOutcomeShape($scalars, $statuses);
+        if ($statuses === []) {
+            return [];
+        }
+
+        return self::w49Call(implode("\0", $statuses), pack('P*', ...$scalars), \count($statuses))
+            ?? self::resolveOutcomeBatchPhp($scalars, $statuses);
+    }
+
+    /**
+     * @param  list<int>  $scalars
+     * @param  list<string>  $statuses
+     * @return list<int>
+     */
+    public static function resolveOutcomeBatchPhp(array $scalars, array $statuses): array
+    {
+        self::w49AssertOutcomeShape($scalars, $statuses);
+        $out = [];
+        $at = 0;
+        foreach ($statuses as $status) {
+            $previousVideoId = $scalars[$at];
+            $previousStatus = $scalars[$at + 1];
+            $previousAttempts = $scalars[$at + 2];
+            $retryAfter = $scalars[$at + 6];
+            $next = $previousAttempts < PHP_INT_MAX ? $previousAttempts + 1 : PHP_INT_MAX;
+            $retryDelay = -1;
+            $attempts = 0;
+            $keepsVideo = 4;
+            $videoId = $scalars[$at + 3];
+            switch ($status) {
+                case TvProcessingResult::STATUS_MATCHED:
+                    $episodeStatus = $scalars[$at + 4];
+                    break;
+
+                case TvProcessingResult::STATUS_SEASON_PACK:
+                    $episodeStatus = TvLookupStatus::SeasonPack->value;
+                    break;
+
+                case TvProcessingResult::STATUS_EPISODE_MISSING:
+                    $episodeStatus = TvLookupStatus::EpisodeMissing->value;
+                    $attempts = $previousStatus === TvLookupStatus::EpisodeMissing->value ? $next : 1;
+                    if ($scalars[$at + 5] !== 0) {
+                        $retryDelay = max($retryAfter, TvProcessingCandidateQuery::KNOWN_SHOW_TRANSIENT_DELAY);
+                    } elseif ($attempts < TvProcessingCandidateQuery::MAX_EPISODE_ATTEMPTS) {
+                        $retryDelay = TvProcessingCandidateQuery::episodeDelayPhp($attempts);
+                    }
+                    break;
+
+                case TvProcessingResult::STATUS_TRANSIENT:
+                    $videoId = 0;
+                    $keepsVideo = 0;
+                    $attempts = $previousStatus === TvLookupStatus::Pending->value ? $next : 1;
+                    if ($attempts >= TvProcessingCandidateQuery::MAX_TRANSIENT_ATTEMPTS) {
+                        $episodeStatus = TvLookupStatus::ShowNotFound->value;
+                        $attempts = 0;
+                    } else {
+                        $episodeStatus = TvLookupStatus::Pending->value;
+                        $retryDelay = TvProcessingCandidateQuery::transientDelayPhp($attempts, $retryAfter);
+                    }
+                    break;
+
+                case TvProcessingResult::STATUS_PARSE_FAILED:
+                    $videoId = 0;
+                    $keepsVideo = 0;
+                    $episodeStatus = TvLookupStatus::ParseFailed->value;
+                    break;
+
+                default:
+                    $videoId = 0;
+                    $keepsVideo = 0;
+                    $episodeStatus = TvLookupStatus::ShowNotFound->value;
+                    break;
+            }
+            $linked = self::hasLinkChangedPhp($previousVideoId, $previousStatus, $videoId, $episodeStatus);
+            $flags = ($linked ? 1 : 0) | (self::shouldBumpCacheVersionPhp($linked, $status) ? 2 : 0) | $keepsVideo;
+            array_push($out, $episodeStatus, $attempts, $retryDelay, $flags);
+            $at += 7;
+        }
+
+        return $out;
+    }
+
+    /**
+     * @param  list<int>  $scalars
+     * @param  list<string>  $statuses
+     */
+    private static function w49AssertOutcomeShape(array $scalars, array $statuses): void
+    {
+        self::w49AssertColumns($statuses);
+        if (\count($scalars) !== 7 * \count($statuses) || ! array_is_list($scalars)) {
+            throw new InvalidArgumentException('W49 outcome batches need seven scalars per status.');
+        }
+    }
+
+    /**
+     * One FFI crossing for the batch: NUL-joined text columns, little-endian int64 scalars,
+     * 4 int64 words back per record. Null when the library is missing or declines.
+     *
+     * @return list<int>|null
+     */
+    private static function w49Call(string $text, string $ints, int $count): ?array
+    {
+        try {
+            self::$w49Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w49', self::W49_FFI_CDEF) ?? false;
+            $ffi = self::$w49Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            $need = $count * 4;
+            $out = self::$w49Out;
+            if ($out === null || self::$w49OutCap < $need) {
+                self::$w49OutCap = max(1024, $need);
+                $out = self::$w49Out = $ffi->new('int64_t['.self::$w49OutCap.']');
+            }
+            // @phpstan-ignore method.notFound (Declared by W49_FFI_CDEF.)
+            $written = $ffi->nntmux_w49_tv_outcome_resolve_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, self::$w49OutCap);
+            if ($written !== $need) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $need * 8));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * @param  array<array-key, mixed>  ...$columns
+     */
+    private static function w49AssertColumns(array ...$columns): void
+    {
+        $count = \count($columns[0]);
+        foreach ($columns as $column) {
+            if (\count($column) !== $count || ! array_is_list($column)) {
+                throw new InvalidArgumentException('W49 batch columns must be lists of equal length.');
+            }
+        }
     }
 }
