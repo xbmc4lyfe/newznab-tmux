@@ -23,10 +23,47 @@ use App\Services\MusicService;
 use App\Services\PopulateAniListService;
 use App\Services\ReleaseExtraService;
 use App\Services\Releases\ReleaseSearchService;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Http\Request;
+use Throwable;
 
 class DetailsController extends BasePageController
 {
+    /**
+     * Production default stays false: the paired benchmark in
+     * tests/Unit/RustReleaseModelDetailsFeedSourceParityTest.php is below 1.5x.
+     */
+    public const bool RUST_FFI_DEFAULT = false;
+
+    private const string DETAILS_PLAN_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w374_details_lookup_plan(
+            int64_t videos_id,
+            int64_t gamesinfo_id,
+            int64_t musicinfo_id,
+            int64_t bookinfo_id,
+            int64_t consoleinfo_id,
+            int64_t anidb_id,
+            uint32_t flags,
+            const char *imdb,
+            size_t imdb_len,
+            const char *searchname,
+            size_t searchname_len,
+            char *out_buf,
+            size_t out_cap
+        );
+        C;
+
+    /** Lookup names in show() order; bit i of the native mask selects entry i. */
+    private const array DETAILS_LOOKUPS = ['video', 'movie', 'game', 'music', 'book', 'console', 'anidb'];
+
+    private const string DETAILS_FIELD_SEPARATOR = "\x1F";
+
+    /** Kept apart from BasePageController's toggle so page helpers are unaffected. */
+    private static ?bool $detailsUseRustFfi = null;
+
+    private static FFI|false|null $detailsFfi = null;
+
     private ReleaseSearchService $releaseSearchService;
 
     private MovieService $movieService;
@@ -209,5 +246,120 @@ class DetailsController extends BasePageController
         ]);
 
         return view('details.index', $this->viewData);
+    }
+
+    public static function useRustFfi(?bool $enabled = true): void
+    {
+        self::$detailsUseRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$detailsUseRustFfi ?? self::RUST_FFI_DEFAULT;
+    }
+
+    public static function resetRustFfi(): void
+    {
+        self::$detailsUseRustFfi = null;
+        self::$detailsFfi = null;
+    }
+
+    /**
+     * Plans the metadata lookups show() performs for a release (positive ids and a valid IMDb id)
+     * and its meta description.
+     *
+     * @return array{lookups: list<string>, lookup_count: int, meta_description: string}
+     */
+    public static function planDetailsLookups(int $videosId, int|string|null $imdbId, int $gamesinfoId, int $musicinfoId, int $bookinfoId, int $consoleinfoId, int $anidbId, string $searchname): array
+    {
+        return self::usesRustFfi()
+            ? self::planDetailsLookupsNative($videosId, $imdbId, $gamesinfoId, $musicinfoId, $bookinfoId, $consoleinfoId, $anidbId, $searchname)
+            : self::planDetailsLookupsPhp($videosId, $imdbId, $gamesinfoId, $musicinfoId, $bookinfoId, $consoleinfoId, $anidbId, $searchname);
+    }
+
+    /**
+     * @return array{lookups: list<string>, lookup_count: int, meta_description: string}
+     */
+    private static function planDetailsLookupsNative(int $videosId, int|string|null $imdbId, int $gamesinfoId, int $musicinfoId, int $bookinfoId, int $consoleinfoId, int $anidbId, string $searchname): array
+    {
+        $fields = self::callDetailsNative([$videosId, $gamesinfoId, $musicinfoId, $bookinfoId, $consoleinfoId, $anidbId], $imdbId === null ? null : (string) $imdbId, $searchname);
+        if ($fields === null) {
+            return self::planDetailsLookupsPhp($videosId, $imdbId, $gamesinfoId, $musicinfoId, $bookinfoId, $consoleinfoId, $anidbId, $searchname);
+        }
+
+        $mask = (int) $fields[1];
+        $lookups = [];
+        foreach (self::DETAILS_LOOKUPS as $bit => $lookup) {
+            if (($mask & (1 << $bit)) !== 0) {
+                $lookups[] = $lookup;
+            }
+        }
+
+        return ['lookups' => $lookups, 'lookup_count' => (int) $fields[0], 'meta_description' => $fields[2]];
+    }
+
+    /**
+     * @return array{lookups: list<string>, lookup_count: int, meta_description: string}
+     */
+    private static function planDetailsLookupsPhp(int $videosId, int|string|null $imdbId, int $gamesinfoId, int $musicinfoId, int $bookinfoId, int $consoleinfoId, int $anidbId, string $searchname): array
+    {
+        $wanted = [
+            $videosId > 0,
+            imdb_id_is_valid($imdbId),
+            $gamesinfoId > 0,
+            $musicinfoId > 0,
+            $bookinfoId > 0,
+            $consoleinfoId > 0,
+            $anidbId > 0,
+        ];
+        $lookups = [];
+        foreach (self::DETAILS_LOOKUPS as $index => $lookup) {
+            if ($wanted[$index]) {
+                $lookups[] = $lookup;
+            }
+        }
+
+        return ['lookups' => $lookups, 'lookup_count' => count($lookups), 'meta_description' => 'View NZB for '.$searchname];
+    }
+
+    /**
+     * @param  list<int>  $ids
+     * @return array{0: string, 1: string, 2: string}|null
+     */
+    private static function callDetailsNative(array $ids, ?string $imdb, string $searchname): ?array
+    {
+        self::$detailsFfi ??= RustPipelineLibrary::resolveDomain('metadata_w374', self::DETAILS_PLAN_FFI_CDEF) ?? false;
+        if (self::$detailsFfi === false) {
+            return null;
+        }
+        $ffi = self::$detailsFfi;
+        $args = [...$ids, $imdb === null ? 0 : 1, $imdb ?? '', strlen($imdb ?? ''), $searchname, strlen($searchname)];
+
+        try {
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, strlen($searchname) + 64, $capacity);
+            if ($buffer === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w374_details_lookup_plan(...[...$args, $buffer, $capacity]);
+            if (is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w374_details_lookup_plan(...[...$args, $buffer, $capacity]);
+            }
+            if (! is_int($written) || $written < 0 || $written > $capacity) {
+                return null;
+            }
+            // The meta description is the last field and may itself contain the separator.
+            $fields = explode(self::DETAILS_FIELD_SEPARATOR, FFI::string($buffer, $written), 3);
+
+            return count($fields) === 3 ? [$fields[0], $fields[1], $fields[2]] : null;
+        } catch (Throwable) {
+            return null;
+        }
     }
 }
