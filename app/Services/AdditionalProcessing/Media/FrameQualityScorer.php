@@ -16,19 +16,32 @@ use Throwable;
  * A blank frame (black, white or one flat colour) is never chosen. Among the
  * rest, frames of normal brightness come first, then the most detailed one.
  *
- * measureSample() and measureRgb() route through the Rust pipeline library
- * (nntmux_frame_luma_stats_bmp / nntmux_frame_luma_stats_rgb), clearing >= 3.0x
- * mean and p99 speedup. End-to-end measure() on full JPEG files is dominated by
- * libgd decode + downscale and stays on native PHP below the 1.5x threshold
- * (see tests/Unit/RustImageInspectorFrameScorerParityTest.php).
+ * The Wave 43 toggle covers full-file scoring, including decoding and scaling.
+ * Previously qualified measureSample()/measureRgb() kernels retain their native
+ * default and explicit Php/Native helpers; their earlier adoption is unchanged.
  */
 final class FrameQualityScorer
 {
+    // Production adoption requires >= 1.5x mean and p99 on both W43 workloads.
+    public const bool W43_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $w43RustFfi = null;
+
+    public static function useRustFfi(?bool $enabled = true): void
+    {
+        self::$w43RustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$w43RustFfi ?? self::W43_RUST_FFI_DEFAULT;
+    }
+
     private const int SAMPLE_WIDTH = 64;
 
     private const string FFI_CDEF = <<<'C'
-        int32_t nntmux_frame_luma_stats_rgb(const char *rgb_bytes_ptr, size_t pixel_count, double *out_mean, double *out_stddev);
-        int32_t nntmux_frame_luma_stats_bmp(const char *bmp_ptr, size_t bmp_len, double *out_mean, double *out_stddev);
+        int32_t nntmux_w436_frame_luma_stats_rgb(const char *rgb_bytes_ptr, size_t pixel_count, double *out_mean, double *out_stddev);
+        int32_t nntmux_w436_frame_luma_stats_bmp(const char *bmp_ptr, size_t bmp_len, double *out_mean, double *out_stddev);
         C;
 
     private static ?FFI $ffi = null;
@@ -112,7 +125,7 @@ final class FrameQualityScorer
      */
     public function measure(string $imagePath): ?array
     {
-        return $this->measurePhp($imagePath);
+        return self::usesRustFfi() ? $this->measureNative($imagePath) : $this->measurePhp($imagePath);
     }
 
     /**
@@ -179,7 +192,7 @@ final class FrameQualityScorer
 
         try {
             // @phpstan-ignore method.notFound
-            $status = $ffi->nntmux_frame_luma_stats_bmp($bmp, strlen($bmp), self::$meanOut, self::$stddevOut);
+            $status = $ffi->nntmux_w436_frame_luma_stats_bmp($bmp, strlen($bmp), self::$meanOut, self::$stddevOut);
         } catch (Throwable) {
             return self::measureSamplePhp($sample);
         }
@@ -246,7 +259,7 @@ final class FrameQualityScorer
 
         try {
             // @phpstan-ignore method.notFound
-            $status = $ffi->nntmux_frame_luma_stats_rgb($rgbBytes, intdiv($len, 3), self::$meanOut, self::$stddevOut);
+            $status = $ffi->nntmux_w436_frame_luma_stats_rgb($rgbBytes, intdiv($len, 3), self::$meanOut, self::$stddevOut);
         } catch (Throwable) {
             return self::measureRgbPhp($rgbBytes);
         }

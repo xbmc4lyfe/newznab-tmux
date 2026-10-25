@@ -22,8 +22,23 @@ use Throwable;
  */
 class ArchivedMediaSlicer
 {
+    // Production adoption requires >= 1.5x mean and p99 on both W43 workloads.
+    public const bool W43_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $w43RustFfi = null;
+
+    public static function useRustFfi(?bool $enabled = true): void
+    {
+        self::$w43RustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$w43RustFfi ?? self::W43_RUST_FFI_DEFAULT;
+    }
+
     public const string FFI_CDEF = <<<'C'
-        int32_t nntmux_archived_media_range(const char *range_ptr, size_t range_len, const char *name_ptr, size_t name_len, int64_t file_size, int64_t next_offset, uint32_t has_next_offset, int64_t data_len, int64_t max_sample_bytes, int64_t min_main_video_bytes, int64_t *out_bounds);
+        int32_t nntmux_w436_archived_media_range(const char *range_ptr, size_t range_len, const char *name_ptr, size_t name_len, int64_t file_size, int64_t next_offset, uint32_t has_next_offset, int64_t data_len, int64_t max_sample_bytes, int64_t min_main_video_bytes, int64_t *out_bounds);
         C;
 
     private static ?FFI $ffi = null;
@@ -87,7 +102,9 @@ class ArchivedMediaSlicer
      */
     public function entryFor(string $data, array $file, int $sourceIndex, int $segmentsDownloaded): ?ArchivedMediaEntry
     {
-        return $this->entryForPhp($data, $file, $sourceIndex, $segmentsDownloaded);
+        return self::usesRustFfi()
+            ? $this->entryForNative($data, $file, $sourceIndex, $segmentsDownloaded)
+            : $this->entryForPhp($data, $file, $sourceIndex, $segmentsDownloaded);
     }
 
     /**
@@ -119,7 +136,7 @@ class ArchivedMediaSlicer
             volumeSegmentsDownloaded: $segmentsDownloaded,
             isSample: preg_match('/(?:^|[\\\\\/._ -])sample(?:[\\\\\/._ -]|$)/i', $name) === 1
                 || $size < $this->config->mediaMainVideoMinBytes,
-            container: VideoContainer::detect($head) ?? VideoContainer::fromFileName($name),
+            container: VideoContainer::detectPhp($head) ?? VideoContainer::fromFileName($name),
         );
     }
 
@@ -142,7 +159,7 @@ class ArchivedMediaSlicer
 
         try {
             // @phpstan-ignore method.notFound
-            $status = $ffi->nntmux_archived_media_range(
+            $status = $ffi->nntmux_w436_archived_media_range(
                 $range,
                 strlen($range),
                 $name,
@@ -184,7 +201,7 @@ class ArchivedMediaSlicer
             volumeBytesDownloaded: $dataLen,
             volumeSegmentsDownloaded: $segmentsDownloaded,
             isSample: $isSample,
-            container: VideoContainer::detect($head) ?? VideoContainer::fromFileName($name),
+            container: VideoContainer::detectPhp($head) ?? VideoContainer::fromFileName($name),
         );
     }
 
@@ -267,7 +284,7 @@ class ArchivedMediaSlicer
      */
     public function range(array $file): array
     {
-        return $this->rangePhp($file);
+        return self::usesRustFfi() ? $this->rangeNative($file) : $this->rangePhp($file);
     }
 
     /**
@@ -296,7 +313,7 @@ class ArchivedMediaSlicer
         $range = (string) $file['range'];
         try {
             // @phpstan-ignore method.notFound
-            $status = $ffi->nntmux_archived_media_range(
+            $status = $ffi->nntmux_w436_archived_media_range(
                 $range,
                 strlen($range),
                 '',
