@@ -24,7 +24,27 @@ final class NzbFingerprintAnalyzer
         ssize_t nntmux_nzb_select_article_samples(const char *input, size_t input_len, size_t file_count, size_t max_samples, char *out_buf, size_t out_cap);
         C;
 
+    /**
+     * Wave 47.2 production default for summarizeSegmentBatch() is Rust: the paired benchmark in
+     * tests/Unit/RustFingerprintDispatchBreakerParserAnalyzerCollectorW47ParityTest.php measures 3.29-3.42x mean and
+     * 2.95-3.38x p99 on common batches and 3.25-3.47x mean and 2.61-3.15x p99 on uncommon batches. PHP stays the
+     * fallback when the library is unavailable or a message id holds a NUL byte.
+     */
+    public const bool W47_ANALYZER_RUST_FFI_DEFAULT = true;
+
+    public const string W47_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w47_nzb_segment_batch(const char *blob, size_t blob_len, const char *aux, size_t aux_len, int64_t strings, int64_t skipped, char *out_buf, size_t out_cap);
+        C;
+
+    private const array W47_ANALYZER_KEYS = ['total', 'invalid', 'malformed', 'valid', 'duplicate', 'no_domain', 'distinct_domains', 'max_id_bytes',
+        'id_bytes', 'local_diversity_permille', 'low_entropy', 'segments', 'invalid_bytes', 'advertised_bytes', 'advertised_bytes_overflow',
+        'min_bytes', 'max_bytes', 'dominant_bytes', 'dominant_count', 'outliers'];
+
     private static bool $useRustFfi = true;
+
+    private static ?bool $w47AnalyzerRustFfiOverride = null;
+
+    private static FFI|false|null $w47AnalyzerRustFfiHandle = null;
 
     public function __construct(private readonly YencService $yenc) {}
 
@@ -1446,5 +1466,160 @@ final class NzbFingerprintAnalyzer
             'control_lines' => $controlLines,
             'decoded_bytes' => $decodedBytes,
         ];
+    }
+
+    /** Force the Wave 47.2 segment summary onto Rust (true) or PHP (false); null restores W47_ANALYZER_RUST_FFI_DEFAULT. */
+    public static function useW47AnalyzerRustFfi(?bool $enable = true): void
+    {
+        self::$w47AnalyzerRustFfiOverride = $enable;
+    }
+
+    public static function usesW47AnalyzerRustFfi(): bool
+    {
+        return self::$w47AnalyzerRustFfiOverride ?? self::W47_ANALYZER_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW47AnalyzerRustFfi(): void
+    {
+        self::$w47AnalyzerRustFfiOverride = null;
+        self::$w47AnalyzerRustFfiHandle = null;
+    }
+
+    /**
+     * Summarize NZB segment message ids as analyzeManifest() validates them (non-strings are invalid; trimmed ids
+     * that fail its pattern are malformed; repeats of a stored id are duplicates) with their lowercased domains,
+     * the Gini-Simpson byte diversity (per mille) of every unique id's local part and the local parts with fewer
+     * than six distinct bytes, plus the distribution of the advertised segment sizes: negative sizes are invalid,
+     * the rest are summed (PHP_INT_MAX once it overflows), bounded and grouped around the most frequent (smallest
+     * on a tie) size.
+     *
+     * @param  array<array-key, mixed>  $messageIds
+     * @param  list<int>  $segmentBytes
+     * @return array{total: int, invalid: int, malformed: int, valid: int, duplicate: int, no_domain: int, distinct_domains: int, max_id_bytes: int, id_bytes: int, local_diversity_permille: int, low_entropy: int, segments: int, invalid_bytes: int, advertised_bytes: int, advertised_bytes_overflow: int, min_bytes: int, max_bytes: int, dominant_bytes: int, dominant_count: int, outliers: int}
+     */
+    public static function summarizeSegmentBatch(array $messageIds, array $segmentBytes = []): array
+    {
+        return (self::usesW47AnalyzerRustFfi() ? self::summarizeSegmentBatchNative($messageIds, $segmentBytes) : null)
+            ?? self::summarizeSegmentBatchPhp($messageIds, $segmentBytes);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $messageIds
+     * @param  list<int>  $segmentBytes
+     * @return array{total: int, invalid: int, malformed: int, valid: int, duplicate: int, no_domain: int, distinct_domains: int, max_id_bytes: int, id_bytes: int, local_diversity_permille: int, low_entropy: int, segments: int, invalid_bytes: int, advertised_bytes: int, advertised_bytes_overflow: int, min_bytes: int, max_bytes: int, dominant_bytes: int, dominant_count: int, outliers: int}
+     */
+    public static function summarizeSegmentBatchPhp(array $messageIds, array $segmentBytes = []): array
+    {
+        $invalid = $malformed = $duplicate = $noDomain = $maxLength = $idBytes = $lowEntropy = 0;
+        $seen = $domains = [];
+        $locals = '';
+        foreach ($messageIds as $messageId) {
+            if (! \is_string($messageId)) {
+                $invalid++;
+
+                continue;
+            }
+            $trimmed = trim($messageId);
+            $inner = trim($trimmed, '<>');
+            if ($trimmed === '' || preg_match('/\A[^\s<>\x00-\x1f\x7f]+\z/D', $inner) !== 1) {
+                $malformed++;
+
+                continue;
+            }
+            if (isset($seen[$inner])) {
+                $duplicate++;
+
+                continue;
+            }
+            $seen[$inner] = true;
+            $maxLength = max($maxLength, \strlen($inner));
+            $idBytes += \strlen($inner);
+            $at = strrpos($inner, '@');
+            if ($at === false) {
+                $noDomain++;
+                $local = $inner;
+            } else {
+                $domains[strtolower(substr($inner, $at + 1))] = true;
+                $local = substr($inner, 0, $at);
+            }
+            $locals .= $local;
+            if (\strlen(count_chars($local, 3)) < 6) {
+                $lowEntropy++;
+            }
+        }
+        $bytes = \strlen($locals);
+        $squares = 0;
+        foreach (count_chars($locals, 1) as $n) {
+            $squares += $n * $n;
+        }
+        $invalidBytes = $sum = $max = 0;
+        $min = PHP_INT_MAX;
+        $overflow = false;
+        $sizes = [];
+        foreach ($segmentBytes as $size) {
+            if ($size < 0) {
+                $invalidBytes++;
+
+                continue;
+            }
+            if (! $overflow) {
+                if ($size > PHP_INT_MAX - $sum) {
+                    $overflow = true;
+                } else {
+                    $sum += $size;
+                }
+            }
+            $min = min($min, $size);
+            $max = max($max, $size);
+            $sizes[$size] = ($sizes[$size] ?? 0) + 1;
+        }
+        $dominant = $dominantCount = 0;
+        foreach ($sizes as $size => $n) {
+            if ($n > $dominantCount || ($n === $dominantCount && $size < $dominant)) {
+                [$dominant, $dominantCount] = [$size, $n];
+            }
+        }
+        $segments = \count($segmentBytes) - $invalidBytes;
+
+        return array_combine(self::W47_ANALYZER_KEYS, [\count($messageIds), $invalid, $malformed, \count($seen), $duplicate, $noDomain, \count($domains),
+            $maxLength, $idBytes, $bytes === 0 ? 0 : intdiv(($bytes * $bytes - $squares) * 1000, $bytes * $bytes), $lowEntropy, $segments, $invalidBytes,
+            $overflow ? PHP_INT_MAX : $sum, $overflow ? 1 : 0, $segments === 0 ? 0 : $min, $max, $dominant, $dominantCount, $segments - $dominantCount]);
+    }
+
+    /**
+     * Null when the library is missing, a message id holds a NUL byte or the batch exceeds the native limits.
+     *
+     * @param  array<array-key, mixed>  $messageIds
+     * @param  list<int>  $segmentBytes
+     * @return array{total: int, invalid: int, malformed: int, valid: int, duplicate: int, no_domain: int, distinct_domains: int, max_id_bytes: int, id_bytes: int, local_diversity_permille: int, low_entropy: int, segments: int, invalid_bytes: int, advertised_bytes: int, advertised_bytes_overflow: int, min_bytes: int, max_bytes: int, dominant_bytes: int, dominant_count: int, outliers: int}|null
+     */
+    public static function summarizeSegmentBatchNative(array $messageIds, array $segmentBytes = []): ?array
+    {
+        $ffi = self::w47AnalyzerRustFfi();
+        if ($ffi === null || \count($messageIds) > FingerprintDispatch::W47_MAX_ITEMS || \count($segmentBytes) > FingerprintDispatch::W47_MAX_ITEMS) {
+            return null;
+        }
+        $skipped = 0;
+        foreach ($messageIds as $messageId) {
+            if (! \is_string($messageId)) {
+                $skipped++;
+            }
+        }
+        $blob = implode("\0", $skipped === 0 ? $messageIds : array_filter($messageIds, \is_string(...)));
+        $values = FingerprintDispatch::callW47Native($ffi, 'nntmux_w47_nzb_segment_batch', $blob, pack('q*', ...array_values($segmentBytes)),
+            \count($messageIds) - $skipped, $skipped, \count(self::W47_ANALYZER_KEYS));
+        if ($values === null || $values[0] !== \count($messageIds) || \count($segmentBytes) !== $values[11] + $values[12] || min($values) < 0
+            || $values[0] !== $values[2] + $values[3] + $values[4] + $values[1]) {
+            return null;
+        }
+
+        return array_combine(self::W47_ANALYZER_KEYS, $values);
+    }
+
+    private static function w47AnalyzerRustFfi(): ?FFI
+    {
+        self::$w47AnalyzerRustFfiHandle ??= RustPipelineLibrary::resolveDomain(FingerprintDispatch::W47_FFI_DOMAIN, self::W47_FFI_CDEF) ?? false;
+
+        return self::$w47AnalyzerRustFfiHandle === false ? null : self::$w47AnalyzerRustFfiHandle;
     }
 }
