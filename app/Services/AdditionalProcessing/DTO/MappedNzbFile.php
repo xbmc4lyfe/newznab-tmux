@@ -7,6 +7,7 @@ namespace App\Services\AdditionalProcessing\DTO;
 use App\Services\AdditionalProcessing\Enums\MappingConfidence;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 /**
@@ -112,5 +113,327 @@ final class MappedNzbFile
         }
 
         return ['sourceIndex' => $header['sourceIndex'], 'filename' => substr($bytes, 28, $header['filenameLength']), 'fileSize' => $header['fileSize'], 'confidence' => substr($bytes, $offset + 4), 'confidenceRank' => $header['confidenceRank']];
+    }
+
+    // Rust is the default: the paired W48.6 benchmark cleared 1.5x on all four metrics (3.22x/2.44x common, 2.53x/1.95x uncommon mean/p99).
+    public const bool W48_FILE_MAP_RUST_FFI_DEFAULT = true;
+
+    public const string W48_FFI_CDEF = <<<'C'
+        int32_t nntmux_w48_nzb_file_map(const char *subjects, size_t subjects_len, const char *subject_lens, size_t subject_lens_len, const char *ints, size_t ints_len, size_t count, const char *names, size_t names_len, const char *name_lens, size_t name_lens_len, const char *par2_sizes, size_t par2_sizes_len, size_t par2_count, int64_t *out, size_t out_count);
+        C;
+
+    public const int W48_MAP_HEADER = 12;
+
+    public const int W48_MAP_WIDTH = 6;
+
+    private const int W48_VALUE_CAP = 1_099_511_627_775;
+
+    private const int W48_TOTAL_CAP = 4_611_686_018_427_387_904;
+
+    private const int W48_MAX_ITEMS = 1_048_576;
+
+    public static function useW48FileMapRustFfi(?bool $enabled): void
+    {
+        self::w48Toggle(true, $enabled);
+    }
+
+    public static function usesW48FileMapRustFfi(): bool
+    {
+        return self::w48Toggle() ?? self::W48_FILE_MAP_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW48FileMapRustFfi(): void
+    {
+        self::w48Toggle(true);
+        self::w48Binding(0, true);
+    }
+
+    /**
+     * Map a batch of NZB files to PAR2 entries and order them for byte offsets. A subject's file
+     * name is its first quoted text (else the trimmed subject), its file counter the first
+     * `[n/m]` and its segment total the last `(x/y)` unless `$segmentsTotal` gives one. Kinds:
+     * 3 exact name, 2 case-insensitive name, 1 unique size (one NZB file and one PAR2 entry of
+     * that size), 0 none; each PAR2 entry maps once, names first in input order. Files are
+     * ordered by file counter (none last), name bytes, then index; offsets accumulate the mapped
+     * PAR2 size or else the NZB size. Sizes and counts are clamped to [0, 2^40).
+     *
+     * Layout: `[0]` count, `[1..3]` exact/case-insensitive/unique-size matches, `[4]` unmapped,
+     * `[5..7]` complete/incomplete/unknown segment totals, `[8]` NZB bytes, `[9]` mapped PAR2
+     * bytes, `[10]` ordered bytes, `[11]` FNV-1a digest; then per file the PAR2 index or -1,
+     * `kind | confidence rank << 4`, `file << 32 | files`, segment ppm, byte offset and NZB minus
+     * PAR2 size; then the file order.
+     *
+     * @param  array<array-key, string>  $subjects
+     * @param  array<array-key, int>  $sizes
+     * @param  array<array-key, int>  $segmentsPresent
+     * @param  array<array-key, int>  $segmentsTotal
+     * @param  array<array-key, string>  $par2Names
+     * @param  array<array-key, int>  $par2Sizes
+     * @return list<int>
+     */
+    public static function mapFileBatch(array $subjects, array $sizes, array $segmentsPresent, array $segmentsTotal, array $par2Names, array $par2Sizes): array
+    {
+        return (self::usesW48FileMapRustFfi() ? self::mapFileBatchNative($subjects, $sizes, $segmentsPresent, $segmentsTotal, $par2Names, $par2Sizes) : null)
+            ?? self::mapFileBatchPhp($subjects, $sizes, $segmentsPresent, $segmentsTotal, $par2Names, $par2Sizes);
+    }
+
+    /**
+     * @param  array<array-key, string>  $subjects
+     * @param  array<array-key, int>  $sizes
+     * @param  array<array-key, int>  $segmentsPresent
+     * @param  array<array-key, int>  $segmentsTotal
+     * @param  array<array-key, string>  $par2Names
+     * @param  array<array-key, int>  $par2Sizes
+     * @return list<int>
+     */
+    public static function mapFileBatchPhp(array $subjects, array $sizes, array $segmentsPresent, array $segmentsTotal, array $par2Names, array $par2Sizes): array
+    {
+        $subjects = array_values($subjects);
+        $sizes = array_values($sizes);
+        $segmentsPresent = array_values($segmentsPresent);
+        $segmentsTotal = array_values($segmentsTotal);
+        $par2Names = array_values($par2Names);
+        $par2Sizes = array_values($par2Sizes);
+        $count = \count($subjects);
+        $exact = $folded = $bySize = $real = [];
+        foreach ($par2Names as $entry => $name) {
+            $exact[$name] ??= $entry;
+            $folded[strtolower($name)] ??= $entry;
+            $size = min(max($par2Sizes[$entry] ?? 0, 0), self::W48_VALUE_CAP);
+            $real[] = $size;
+            if (isset($bySize[$size])) {
+                $bySize[$size][0]++;
+            } else {
+                $bySize[$size] = [1, $entry];
+            }
+        }
+        $nzb = $nzbBySize = $names = [];
+        for ($i = 0; $i < $count; $i++) {
+            $size = min(max($sizes[$i] ?? 0, 0), self::W48_VALUE_CAP);
+            $nzb[] = $size;
+            $nzbBySize[$size] = ($nzbBySize[$size] ?? 0) + 1;
+            $names[] = self::w48SubjectName($subjects[$i]);
+        }
+        $claimed = [];
+        $entries = array_fill(0, $count, -1);
+        $kinds = array_fill(0, $count, 0);
+        for ($i = 0; $i < $count; $i++) {
+            $entry = $exact[$names[$i]] ?? null;
+            $kind = 3;
+            if ($entry === null || isset($claimed[$entry])) {
+                $entry = $folded[strtolower($names[$i])] ?? null;
+                $kind = 2;
+            }
+            if ($entry !== null && ! isset($claimed[$entry])) {
+                $claimed[$entry] = true;
+                $entries[$i] = $entry;
+                $kinds[$i] = $kind;
+            }
+        }
+        for ($i = 0; $i < $count; $i++) {
+            $size = $nzb[$i];
+            if ($kinds[$i] !== 0 || $size <= 0 || $nzbBySize[$size] !== 1) {
+                continue;
+            }
+            $bucket = $bySize[$size] ?? null;
+            if ($bucket !== null && $bucket[0] === 1 && ! isset($claimed[$bucket[1]])) {
+                $claimed[$bucket[1]] = true;
+                $entries[$i] = $bucket[1];
+                $kinds[$i] = 1;
+            }
+        }
+        $out = array_fill(0, self::W48_MAP_HEADER, 0);
+        $out[0] = $count;
+        $keys = [];
+        $digest = 2_166_136_261;
+        $nzbTotal = $mappedTotal = 0;
+        for ($i = 0; $i < $count; $i++) {
+            $subject = $subjects[$i];
+            [$file, $files] = self::w48CounterPair($subject, strpos($subject, '['), ']');
+            [, $subjectTotal] = self::w48CounterPair($subject, strrpos($subject, '('), ')');
+            $total = ($segmentsTotal[$i] ?? 0) > 0 ? min($segmentsTotal[$i], self::W48_VALUE_CAP) : $subjectTotal;
+            $have = min(max($segmentsPresent[$i] ?? 0, 0), $total);
+            $out[$total === 0 ? 7 : ($have === $total ? 5 : 6)]++;
+            $kind = $kinds[$i];
+            $out[match ($kind) {
+                3 => 1,
+                2 => 2,
+                1 => 3,
+                default => 4,
+            }]++;
+            $nzbTotal = min($nzbTotal + $nzb[$i], self::W48_TOTAL_CAP);
+            $entry = $entries[$i];
+            if ($entry >= 0) {
+                $mappedTotal = min($mappedTotal + $real[$entry], self::W48_TOTAL_CAP);
+            }
+            $out[] = $entry;
+            $out[] = $kind | min($kind, 2) << 4;
+            $out[] = $file << 32 | $files;
+            $out[] = $total > 0 ? intdiv($have * 1_000_000, $total) : 0;
+            $out[] = 0;
+            $out[] = $entry >= 0 ? $nzb[$i] - $real[$entry] : 0;
+            $digest = (($digest ^ ($kind | min($file, 65_535) << 4)) * 16_777_619) & 0xFFFFFFFF;
+            $keys[] = $file > 0 ? $file : 1_000_000;
+        }
+        $order = $count > 0 ? range(0, $count - 1) : [];
+        $sortNames = $names;
+        array_multisort($keys, SORT_ASC, SORT_NUMERIC, $sortNames, SORT_ASC, SORT_STRING, $order, SORT_ASC, SORT_NUMERIC);
+        $offset = 0;
+        foreach ($order as $index) {
+            $out[self::W48_MAP_HEADER + self::W48_MAP_WIDTH * $index + 4] = $offset;
+            $offset = min($offset + ($entries[$index] >= 0 ? $real[$entries[$index]] : $nzb[$index]), self::W48_TOTAL_CAP);
+        }
+        $out[8] = $nzbTotal;
+        $out[9] = $mappedTotal;
+        $out[10] = $offset;
+        $out[11] = $digest;
+
+        return [...$out, ...$order];
+    }
+
+    /**
+     * Rust mapping, or null when PHP must compute it (unavailable library or rejected input).
+     *
+     * @param  array<array-key, string>  $subjects
+     * @param  array<array-key, int>  $sizes
+     * @param  array<array-key, int>  $segmentsPresent
+     * @param  array<array-key, int>  $segmentsTotal
+     * @param  array<array-key, string>  $par2Names
+     * @param  array<array-key, int>  $par2Sizes
+     * @return list<int>|null
+     */
+    public static function mapFileBatchNative(array $subjects, array $sizes, array $segmentsPresent, array $segmentsTotal, array $par2Names, array $par2Sizes): ?array
+    {
+        $subjects = array_values($subjects);
+        $par2Names = array_values($par2Names);
+        $count = \count($subjects);
+        $par2Count = \count($par2Names);
+        $fields = self::W48_MAP_HEADER + (self::W48_MAP_WIDTH + 1) * $count;
+        $binding = $count <= self::W48_MAX_ITEMS && $par2Count <= self::W48_MAX_ITEMS ? self::w48Binding($fields) : null;
+        if ($binding === null) {
+            return null;
+        }
+        [$ffi, $out] = $binding;
+        [$joined, $lens] = self::w48Join($subjects);
+        [$names, $nameLens] = self::w48Join($par2Names);
+        $ints = pack('q*', ...self::w48Fit($sizes, $count), ...self::w48Fit($segmentsPresent, $count), ...self::w48Fit($segmentsTotal, $count));
+        $real = pack('q*', ...self::w48Fit($par2Sizes, $par2Count));
+        try {
+            // @phpstan-ignore method.notFound
+            $status = $ffi->nntmux_w48_nzb_file_map($joined, \strlen($joined), $lens, \strlen($lens), $ints, \strlen($ints), $count, $names, \strlen($names), $nameLens, \strlen($nameLens), $real, \strlen($real), $par2Count, $out, $fields);
+            if ($status !== 1) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $fields * 8));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $values === false ? null : array_values($values);
+    }
+
+    /** The quoted yEnc file name, else the trimmed subject. */
+    private static function w48SubjectName(string $subject): string
+    {
+        $first = strpos($subject, '"');
+        if ($first !== false) {
+            $second = strpos($subject, '"', $first + 1);
+            if ($second !== false && $second > $first + 1) {
+                return substr($subject, $first + 1, $second - $first - 1);
+            }
+        }
+
+        return trim($subject);
+    }
+
+    /**
+     * 1-6 digit `a/b` between `$open` and the first `$close` after it, else zeros.
+     *
+     * @return array{0: int, 1: int}
+     */
+    private static function w48CounterPair(string $subject, int|false $open, string $close): array
+    {
+        if ($open === false) {
+            return [0, 0];
+        }
+        $slash = strpos($subject, '/', $open);
+        $end = strpos($subject, $close, $open);
+        if ($slash === false || $end === false || $slash > $end) {
+            return [0, 0];
+        }
+        $part = substr($subject, $open + 1, $slash - $open - 1);
+        $total = substr($subject, $slash + 1, $end - $slash - 1);
+
+        return ctype_digit($part) && ctype_digit($total) && \strlen($part) <= 6 && \strlen($total) <= 6 ? [(int) $part, (int) $total] : [0, 0];
+    }
+
+    /**
+     * NUL-joined strings, or concatenated strings with `pack('V*')` lengths when one holds a NUL.
+     *
+     * @param  list<string>  $values
+     * @return array{0: string, 1: string}
+     */
+    private static function w48Join(array $values): array
+    {
+        $joined = implode("\0", $values);
+        if ($values === [] || substr_count($joined, "\0") === \count($values) - 1) {
+            return [$joined, ''];
+        }
+
+        return [implode('', $values), pack('V*', ...array_map(strlen(...), $values))];
+    }
+
+    /**
+     * @param  array<array-key, int>  $values
+     * @return list<int>
+     */
+    private static function w48Fit(array $values, int $count): array
+    {
+        return \count($values) === $count && array_is_list($values) ? $values : array_pad(\array_slice(array_values($values), 0, $count), $count, 0);
+    }
+
+    private static function w48Toggle(bool $set = false, ?bool $enabled = null): ?bool
+    {
+        /** @var bool|null $state */
+        static $state = null;
+        if ($set) {
+            $state = $enabled;
+        }
+
+        return $state;
+    }
+
+    /**
+     * Cached `additional_w48` binding and an output buffer of at least `$fields` values; `$reset` drops both.
+     *
+     * @return array{0: FFI, 1: CData}|null
+     */
+    private static function w48Binding(int $fields, bool $reset = false): ?array
+    {
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $buffer */
+        static $buffer = null;
+        static $capacity = 0;
+        if ($reset) {
+            $ffi = $buffer = null;
+            $capacity = 0;
+
+            return null;
+        }
+        try {
+            $ffi ??= RustPipelineLibrary::resolveDomain('additional_w48', self::W48_FFI_CDEF) ?? false;
+            if ($ffi === false) {
+                return null;
+            }
+            if ($buffer === null || $capacity < $fields) {
+                $capacity = max(256, $fields);
+                $buffer = $ffi->new('int64_t['.$capacity.']');
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $buffer === null ? null : [$ffi, $buffer];
     }
 }
