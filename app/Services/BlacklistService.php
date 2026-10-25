@@ -8,6 +8,7 @@ use App\Enums\BlacklistConstants;
 use App\Models\BinaryBlacklist;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\DB;
 
 class BlacklistService
@@ -381,5 +382,205 @@ class BlacklistService
     {
         self::$w401UseRustFfi = null;
         self::$w401Ffi = null;
+    }
+
+    /**
+     * Enabled: the paired benchmark in the W53 parity test measures 3.03x common mean, 2.74x common
+     * p99, 3.56x uncommon mean and 3.46x uncommon p99 (per-metric minimum of three runs), above the
+     * 1.5x rule.
+     */
+    private const bool W53_RUST_FFI_DEFAULT = true;
+
+    private const string W53_FFI_CDEF = 'ssize_t nntmux_w531_blacklist_literal_first_match_batch(const char *literals, size_t literals_len, const char *columns, size_t columns_len, size_t rule_count, const char *subjects, size_t subjects_len, const char *posters, size_t posters_len, const char *message_ids, size_t message_ids_len, size_t count, int64_t *out, size_t out_cap);';
+
+    public static function usesW53RustFfi(): bool
+    {
+        $enabled = self::w53RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W53_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 53 batch routed to Rust or PHP, then restores the routing. */
+    public static function withW53RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w53RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w53RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * For each article the index of the first `[column, literal]` rule whose literal occurs
+     * case-insensitively (PHP `stripos()`) in that column, or -1. Columns follow
+     * {@see BlacklistConstants}: 1 subject, 2 poster (`From`), 3 Message-ID.
+     *
+     * @param  array<array-key, array{0: int, 1: string}>  $rules
+     * @param  array<array-key, string>  $subjects
+     * @param  array<array-key, string>  $posters
+     * @param  array<array-key, string>  $messageIds
+     * @return list<int>
+     *
+     * @throws \InvalidArgumentException when the article columns differ in length or a rule column is not 1-3
+     */
+    public static function firstLiteralRuleMatches(array $rules, array $subjects, array $posters, array $messageIds): array
+    {
+        return self::usesW53RustFfi() ? self::firstLiteralRuleMatchesNative($rules, $subjects, $posters, $messageIds) : self::firstLiteralRuleMatchesPhp($rules, $subjects, $posters, $messageIds);
+    }
+
+    /**
+     * @param  array<array-key, array{0: int, 1: string}>  $rules
+     * @param  array<array-key, string>  $subjects
+     * @param  array<array-key, string>  $posters
+     * @param  array<array-key, string>  $messageIds
+     * @return list<int>
+     */
+    public static function firstLiteralRuleMatchesPhp(array $rules, array $subjects, array $posters, array $messageIds): array
+    {
+        self::w53Count($subjects, $posters, $messageIds);
+        $rules = self::w53Rules($rules);
+        $posters = array_values($posters);
+        $messageIds = array_values($messageIds);
+        $hits = [];
+        foreach (array_values($subjects) as $i => $subject) {
+            $hit = -1;
+            foreach ($rules as $r => [$column, $literal]) {
+                if (stripos($column === 1 ? $subject : ($column === 2 ? $posters[$i] : $messageIds[$i]), $literal) !== false) {
+                    $hit = $r;
+                    break;
+                }
+            }
+            $hits[] = $hit;
+        }
+
+        return $hits;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or declines the batch (a rule or
+     * article field holding a NUL byte, or more than 4096 rules).
+     *
+     * @param  array<array-key, array{0: int, 1: string}>  $rules
+     * @param  array<array-key, string>  $subjects
+     * @param  array<array-key, string>  $posters
+     * @param  array<array-key, string>  $messageIds
+     * @return list<int>
+     */
+    public static function firstLiteralRuleMatchesNative(array $rules, array $subjects, array $posters, array $messageIds): array
+    {
+        $count = self::w53Count($subjects, $posters, $messageIds);
+        $rules = self::w53Rules($rules);
+        if ($rules === []) {
+            return array_fill(0, $count, -1);
+        }
+        $buffer = $count === 0 ? null : self::w53Buffer($count);
+        if ($buffer === null) {
+            return self::firstLiteralRuleMatchesPhp($rules, $subjects, $posters, $messageIds);
+        }
+        [$ffi, $out, $cap] = $buffer;
+        $literals = implode("\0", array_column($rules, 1));
+        $columns = pack('P*', ...array_column($rules, 0));
+        $joinedSubjects = implode("\0", $subjects);
+        $joinedPosters = implode("\0", $posters);
+        $joinedIds = implode("\0", $messageIds);
+        try {
+            // @phpstan-ignore method.notFound
+            $words = self::w53Decode($out, $ffi->nntmux_w531_blacklist_literal_first_match_batch($literals, \strlen($literals), $columns, \strlen($columns), \count($rules), $joinedSubjects, \strlen($joinedSubjects), $joinedPosters, \strlen($joinedPosters), $joinedIds, \strlen($joinedIds), $count, $out, $cap), $count);
+        } catch (\Throwable) {
+            $words = null;
+        }
+
+        return $words !== null && \count($words) === $count ? $words : self::firstLiteralRuleMatchesPhp($rules, $subjects, $posters, $messageIds);
+    }
+
+    /**
+     * @param  array<array-key, array{0: int, 1: string}>  $rules
+     * @return list<array{0: int, 1: string}>
+     */
+    private static function w53Rules(array $rules): array
+    {
+        foreach ($rules as $rule) {
+            if (! \in_array($rule[0], [1, 2, 3], true)) {
+                throw new \InvalidArgumentException('Literal rule column must be 1, 2 or 3.');
+            }
+        }
+
+        return array_values($rules);
+    }
+
+    /**
+     * @param  array<mixed>  ...$columns
+     */
+    private static function w53Count(array ...$columns): int
+    {
+        $count = \count($columns[0]);
+        foreach ($columns as $column) {
+            if (\count($column) !== $count) {
+                throw new \InvalidArgumentException('Blacklist article columns must have the same length.');
+            }
+        }
+
+        return $count;
+    }
+
+    /**
+     * Lazily resolved binding plus the reusable output buffer sized for `$words` words.
+     *
+     * @return array{0: FFI, 1: CData, 2: int}|null
+     */
+    private static function w53Buffer(int $words): ?array
+    {
+        $buffer = self::w53RustFfiState('out', $words);
+
+        return \is_array($buffer) ? $buffer : null;
+    }
+
+    /** @return list<int>|null The `$written` words the export reported, or null when it declined. */
+    private static function w53Decode(CData $out, mixed $written, int $maxWords): ?array
+    {
+        if (! \is_int($written) || $written < 0 || $written > $maxWords) {
+            return null;
+        }
+        if ($written === 0) {
+            return [];
+        }
+        $decoded = unpack('P*', FFI::string($out, $written * 8));
+
+        /** @var list<int>|null */
+        return \is_array($decoded) ? array_values($decoded) : null;
+    }
+
+    /**
+     * Wave 53 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
+     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
+     */
+    private static function w53RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'out':
+                $ffi ??= RustPipelineLibrary::resolveDomain('obfuscation_blacklist_cat_w53', self::W53_FFI_CDEF) ?? false;
+                if (! $ffi instanceof FFI || ! \is_int($val) || $val < 1) {
+                    return null;
+                }
+                if (! $out instanceof CData || $outCap < $val) {
+                    $outCap = max(512, $val * 2);
+                    $out = $ffi->new("int64_t[{$outCap}]");
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled;
+        }
     }
 }

@@ -7,6 +7,7 @@ namespace App\Services\Binaries;
 use App\Support\IrcChannelList;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Random\Engine\Xoshiro256StarStar;
 use Random\Randomizer;
 use Throwable;
@@ -290,5 +291,174 @@ final class PerArticleObfuscationGate
         }
 
         return $summary;
+    }
+
+    /**
+     * Enabled: the paired benchmark in the W53 parity test measures 4.68x common mean, 3.90x common
+     * p99, 3.91x uncommon mean and 2.51x uncommon p99 (per-metric minimum of three runs), above the
+     * 1.5x rule.
+     */
+    private const bool W53_RUST_FFI_DEFAULT = true;
+
+    private const string W53_FFI_CDEF = 'ssize_t nntmux_w531_obfuscation_part_count_summary_batch(const char *subjects, size_t subjects_len, size_t count, int64_t *out, size_t out_cap);';
+
+    public static function usesW53RustFfi(): bool
+    {
+        $enabled = self::w53RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W53_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 53 batch routed to Rust or PHP, then restores the routing. */
+    public static function withW53RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w53RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w53RustFfiState('set', $previous);
+        }
+    }
+
+    /** {@see summarizePartCounts()} keys after `subjects`, in the order the Rust export writes them. */
+    private const array W53_PART_SUMMARY_KEYS = ['part_markers', 'part_counts', 'first_parts', 'final_parts', 'invalid_parts', 'max_total'];
+
+    /**
+     * Summarizes the yEnc part counts of a subject batch: subjects holding ` (` (the
+     * {@see mayCarryPartCounts()} marker), subjects with a `(part/total)` count (the rightmost one,
+     * 1-9 digits each), first parts, final parts (`part === total`), invalid counts (`part` 0 or
+     * above `total`, excluded from the rest) and the largest valid total.
+     *
+     * @param  array<array-key, string>  $subjects
+     * @return array{subjects: int, part_markers: int, part_counts: int, first_parts: int, final_parts: int, invalid_parts: int, max_total: int}
+     */
+    public static function summarizePartCounts(array $subjects): array
+    {
+        return self::usesW53RustFfi() ? self::summarizePartCountsNative($subjects) : self::summarizePartCountsPhp($subjects);
+    }
+
+    /**
+     * @param  array<array-key, string>  $subjects
+     * @return array{subjects: int, part_markers: int, part_counts: int, first_parts: int, final_parts: int, invalid_parts: int, max_total: int}
+     */
+    public static function summarizePartCountsPhp(array $subjects): array
+    {
+        $markers = $counts = $first = $final = $invalid = $max = 0;
+        foreach ($subjects as $subject) {
+            if (str_contains($subject, ' (')) {
+                $markers++;
+            }
+            if (preg_match('/.*\((\d{1,9})\/(\d{1,9})\)/s', $subject, $match) !== 1) {
+                continue;
+            }
+            $counts++;
+            $part = (int) $match[1];
+            $total = (int) $match[2];
+            if ($part === 0 || $part > $total) {
+                $invalid++;
+
+                continue;
+            }
+            if ($part === 1) {
+                $first++;
+            }
+            if ($part === $total) {
+                $final++;
+            }
+            if ($total > $max) {
+                $max = $total;
+            }
+        }
+
+        return ['subjects' => \count($subjects), 'part_markers' => $markers, 'part_counts' => $counts, 'first_parts' => $first, 'final_parts' => $final, 'invalid_parts' => $invalid, 'max_total' => $max];
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or declines the batch (a subject
+     * holding a NUL byte).
+     *
+     * @param  array<array-key, string>  $subjects
+     * @return array{subjects: int, part_markers: int, part_counts: int, first_parts: int, final_parts: int, invalid_parts: int, max_total: int}
+     */
+    public static function summarizePartCountsNative(array $subjects): array
+    {
+        $count = \count($subjects);
+        $buffer = $count === 0 ? null : self::w53Buffer(6);
+        if ($buffer === null) {
+            return self::summarizePartCountsPhp($subjects);
+        }
+        [$ffi, $out, $cap] = $buffer;
+        $joined = implode("\0", $subjects);
+        try {
+            // @phpstan-ignore method.notFound
+            $words = self::w53Decode($out, $ffi->nntmux_w531_obfuscation_part_count_summary_batch($joined, \strlen($joined), $count, $out, $cap), 6);
+        } catch (Throwable) {
+            $words = null;
+        }
+        if ($words === null || \count($words) !== 6) {
+            return self::summarizePartCountsPhp($subjects);
+        }
+
+        return ['subjects' => $count] + array_combine(self::W53_PART_SUMMARY_KEYS, $words);
+    }
+
+    /**
+     * Lazily resolved binding plus the reusable output buffer sized for `$words` words.
+     *
+     * @return array{0: FFI, 1: CData, 2: int}|null
+     */
+    private static function w53Buffer(int $words): ?array
+    {
+        $buffer = self::w53RustFfiState('out', $words);
+
+        return \is_array($buffer) ? $buffer : null;
+    }
+
+    /** @return list<int>|null The `$written` words the export reported, or null when it declined. */
+    private static function w53Decode(CData $out, mixed $written, int $maxWords): ?array
+    {
+        if (! \is_int($written) || $written < 0 || $written > $maxWords) {
+            return null;
+        }
+        if ($written === 0) {
+            return [];
+        }
+        $decoded = unpack('P*', FFI::string($out, $written * 8));
+
+        /** @var list<int>|null */
+        return \is_array($decoded) ? array_values($decoded) : null;
+    }
+
+    /**
+     * Wave 53 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
+     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
+     */
+    private static function w53RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'out':
+                $ffi ??= RustPipelineLibrary::resolveDomain('obfuscation_blacklist_cat_w53', self::W53_FFI_CDEF) ?? false;
+                if (! $ffi instanceof FFI || ! \is_int($val) || $val < 1) {
+                    return null;
+                }
+                if (! $out instanceof CData || $outCap < $val) {
+                    $outCap = max(512, $val * 2);
+                    $out = $ffi->new("int64_t[{$outCap}]");
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled;
+        }
     }
 }

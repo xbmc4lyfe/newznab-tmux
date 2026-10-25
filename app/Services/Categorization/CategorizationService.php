@@ -9,6 +9,7 @@ use App\Services\Categorization\Pipes\AbstractCategorizationPipe;
 use App\Support\RustPipelineLibrary;
 use Blacklight\Categorize;
 use FFI;
+use FFI\CData;
 
 /**
  * Categorization service using Laravel Pipeline.
@@ -581,5 +582,186 @@ class CategorizationService
         }
 
         return self::$w403RustFfiHandle === false ? null : self::$w403RustFfiHandle;
+    }
+
+    /**
+     * Enabled: the paired benchmark in the W53 parity test measures 2.75x common mean, 3.08x common
+     * p99, 2.14x uncommon mean and 2.33x uncommon p99 (per-metric minimum of three runs), above the
+     * 1.5x rule.
+     */
+    private const bool W53_RUST_FFI_DEFAULT = true;
+
+    private const string W53_FFI_CDEF = 'ssize_t nntmux_w531_category_comparison_matrix_batch(const char *pairs, size_t pairs_len, size_t count, int64_t *out, size_t out_cap);';
+
+    public static function usesW53RustFfi(): bool
+    {
+        $enabled = self::w53RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W53_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 53 batch routed to Rust or PHP, then restores the routing. */
+    public static function withW53RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w53RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w53RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Compares pipeline and legacy category IDs pairwise, like {@see buildComparisonResultPhp()}
+     * does one pair: exact matches, mismatches, mismatches within one root (the thousands), pairs
+     * with an ID outside 0-W403_MAX_CATEGORY_ID, and the pipeline-root by legacy-root counts of the
+     * valid pairs, row-major (`root_matrix[pipelineRoot * 9 + legacyRoot]`).
+     *
+     * @param  array<array-key, int>  $pipelineIds
+     * @param  array<array-key, int>  $legacyIds
+     * @return array{matches: int, mismatches: int, same_root_mismatches: int, invalid_pairs: int, root_matrix: list<int>}
+     *
+     * @throws \InvalidArgumentException when the columns differ in length
+     */
+    public static function compareCategoryBatch(array $pipelineIds, array $legacyIds): array
+    {
+        return self::usesW53RustFfi() ? self::compareCategoryBatchNative($pipelineIds, $legacyIds) : self::compareCategoryBatchPhp($pipelineIds, $legacyIds);
+    }
+
+    /**
+     * @param  array<array-key, int>  $pipelineIds
+     * @param  array<array-key, int>  $legacyIds
+     * @return array{matches: int, mismatches: int, same_root_mismatches: int, invalid_pairs: int, root_matrix: list<int>}
+     */
+    public static function compareCategoryBatchPhp(array $pipelineIds, array $legacyIds): array
+    {
+        $count = self::w53Count($pipelineIds, $legacyIds);
+        $legacyIds = array_values($legacyIds);
+        $matrix = array_fill(0, 81, 0);
+        $matches = $sameRoot = $invalid = 0;
+        foreach (array_values($pipelineIds) as $i => $pipeline) {
+            $legacy = $legacyIds[$i];
+            if ($pipeline === $legacy) {
+                $matches++;
+            }
+            if ($pipeline < 0 || $pipeline > self::W403_MAX_CATEGORY_ID || $legacy < 0 || $legacy > self::W403_MAX_CATEGORY_ID) {
+                $invalid++;
+
+                continue;
+            }
+            $pipelineRoot = intdiv($pipeline, 1000);
+            $legacyRoot = intdiv($legacy, 1000);
+            if ($pipeline !== $legacy && $pipelineRoot === $legacyRoot) {
+                $sameRoot++;
+            }
+            $matrix[$pipelineRoot * 9 + $legacyRoot]++;
+        }
+
+        return ['matches' => $matches, 'mismatches' => $count - $matches, 'same_root_mismatches' => $sameRoot, 'invalid_pairs' => $invalid, 'root_matrix' => $matrix];
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or declines the batch.
+     *
+     * @param  array<array-key, int>  $pipelineIds
+     * @param  array<array-key, int>  $legacyIds
+     * @return array{matches: int, mismatches: int, same_root_mismatches: int, invalid_pairs: int, root_matrix: list<int>}
+     */
+    public static function compareCategoryBatchNative(array $pipelineIds, array $legacyIds): array
+    {
+        $count = self::w53Count($pipelineIds, $legacyIds);
+        $buffer = $count === 0 ? null : self::w53Buffer(85);
+        if ($buffer === null) {
+            return self::compareCategoryBatchPhp($pipelineIds, $legacyIds);
+        }
+        [$ffi, $out, $cap] = $buffer;
+        // One table: the pipeline IDs, then the legacy IDs.
+        $pairs = pack('P*', ...array_values($pipelineIds), ...array_values($legacyIds));
+        try {
+            // @phpstan-ignore method.notFound
+            $words = self::w53Decode($out, $ffi->nntmux_w531_category_comparison_matrix_batch($pairs, \strlen($pairs), $count, $out, $cap), 85);
+        } catch (\Throwable) {
+            $words = null;
+        }
+        if ($words === null || \count($words) !== 85) {
+            return self::compareCategoryBatchPhp($pipelineIds, $legacyIds);
+        }
+
+        return ['matches' => $words[0], 'mismatches' => $words[1], 'same_root_mismatches' => $words[2], 'invalid_pairs' => $words[3], 'root_matrix' => \array_slice($words, 4)];
+    }
+
+    /**
+     * @param  array<mixed>  ...$columns
+     */
+    private static function w53Count(array ...$columns): int
+    {
+        $count = \count($columns[0]);
+        foreach ($columns as $column) {
+            if (\count($column) !== $count) {
+                throw new \InvalidArgumentException('Category comparison columns must have the same length.');
+            }
+        }
+
+        return $count;
+    }
+
+    /**
+     * Lazily resolved binding plus the reusable output buffer sized for `$words` words.
+     *
+     * @return array{0: FFI, 1: CData, 2: int}|null
+     */
+    private static function w53Buffer(int $words): ?array
+    {
+        $buffer = self::w53RustFfiState('out', $words);
+
+        return \is_array($buffer) ? $buffer : null;
+    }
+
+    /** @return list<int>|null The `$written` words the export reported, or null when it declined. */
+    private static function w53Decode(CData $out, mixed $written, int $maxWords): ?array
+    {
+        if (! \is_int($written) || $written < 0 || $written > $maxWords) {
+            return null;
+        }
+        if ($written === 0) {
+            return [];
+        }
+        $decoded = unpack('P*', FFI::string($out, $written * 8));
+
+        /** @var list<int>|null */
+        return \is_array($decoded) ? array_values($decoded) : null;
+    }
+
+    /**
+     * Wave 53 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
+     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
+     */
+    private static function w53RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'out':
+                $ffi ??= RustPipelineLibrary::resolveDomain('obfuscation_blacklist_cat_w53', self::W53_FFI_CDEF) ?? false;
+                if (! $ffi instanceof FFI || ! \is_int($val) || $val < 1) {
+                    return null;
+                }
+                if (! $out instanceof CData || $outCap < $val) {
+                    $outCap = max(512, $val * 2);
+                    $out = $ffi->new("int64_t[{$outCap}]");
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled;
+        }
     }
 }
