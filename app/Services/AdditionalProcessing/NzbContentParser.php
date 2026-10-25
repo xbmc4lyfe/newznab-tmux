@@ -606,4 +606,132 @@ class NzbContentParser
     {
         return $this->nzb->nzbPath($guid);
     }
+
+    public const bool W416_RUST_FFI_DEFAULT = false;
+
+    private const string W416_FFI_CDEF = 'int32_t nntmux_w416_additional_candidate_diag_orch_console_nzb(uint8_t operation, const char *input, size_t input_len, char *out_buf, size_t out_cap);';
+
+    private static ?bool $w416UseRustFfi = null;
+
+    private static FFI|false|null $w416Ffi = null;
+
+    public static function useW416RustFfi(bool $enable = true): void
+    {
+        self::$w416UseRustFfi = $enable;
+    }
+
+    public static function usesW416RustFfi(): bool
+    {
+        return self::$w416UseRustFfi ?? self::W416_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW416RustFfi(): void
+    {
+        self::$w416UseRustFfi = null;
+        self::$w416Ffi = null;
+    }
+
+    /** @return list<int>|null */
+    private static function w416Slots(int $operation, string $input, int $count): ?array
+    {
+        if (\strlen($input) > 16_777_216) {
+            return null;
+        }
+        try {
+            self::$w416Ffi ??= RustPipelineLibrary::resolveDomain('additional', self::W416_FFI_CDEF) ?? false;
+            if (self::$w416Ffi === false) {
+                return null;
+            }
+            $bytes = $count * 8;
+            $buffer = self::$w416Ffi->new('char['.$bytes.']');
+            // @phpstan-ignore method.notFound
+            $written = self::$w416Ffi->nntmux_w416_additional_candidate_diag_orch_console_nzb($operation, $input, \strlen($input), $buffer, $bytes);
+            if ($written !== $bytes) {
+                return null;
+            }
+            $values = unpack('q*', FFI::string($buffer, $bytes));
+            if ($values === false || \count($values) !== $count) {
+                return null;
+            }
+            foreach ($values as $value) {
+                if (! \is_int($value) || $value < 0) {
+                    return null;
+                }
+            }
+
+            return array_values($values);
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    private static function w416Add(int $left, int $right): int
+    {
+        return $left > PHP_INT_MAX - $right ? PHP_INT_MAX : $left + $right;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $files
+     * @return array{total_files: int, empty_files: int, total_segments: int, total_bytes: int, invalid_files: int, exceeds_segment_limit: bool}
+     */
+    public static function summarizeNzbSegmentBatch(array $files, int $maxSegments = 100000): array
+    {
+        return self::usesW416RustFfi()
+            ? self::summarizeNzbSegmentBatchNative($files, $maxSegments)
+            : self::summarizeNzbSegmentBatchPhp($files, $maxSegments);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $files
+     * @return array{total_files: int, empty_files: int, total_segments: int, total_bytes: int, invalid_files: int, exceeds_segment_limit: bool}
+     */
+    public static function summarizeNzbSegmentBatchPhp(array $files, int $maxSegments = 100000): array
+    {
+        $result = ['total_files' => \count($files), 'empty_files' => 0, 'total_segments' => 0, 'total_bytes' => 0, 'invalid_files' => 0, 'exceeds_segment_limit' => false];
+        foreach ($files as $row) {
+            if (! \is_array($row) || ! \is_int($row['segments'] ?? null) || ! \is_int($row['bytes'] ?? null) || $row['segments'] < 0 || $row['bytes'] < 0) {
+                $result['invalid_files']++;
+
+                continue;
+            }
+            $result['empty_files'] += (int) ($row['segments'] === 0);
+            $result['total_segments'] = self::w416Add($result['total_segments'], $row['segments']);
+            $result['total_bytes'] = self::w416Add($result['total_bytes'], $row['bytes']);
+        }
+        $result['exceeds_segment_limit'] = $result['total_segments'] > max(0, $maxSegments);
+
+        return $result;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $files
+     * @return array{total_files: int, empty_files: int, total_segments: int, total_bytes: int, invalid_files: int, exceeds_segment_limit: bool}
+     */
+    public static function summarizeNzbSegmentBatchNative(array $files, int $maxSegments = 100000): array
+    {
+        $total = \count($files);
+        if ($total > 100_000) {
+            return self::summarizeNzbSegmentBatchPhp($files, $maxSegments);
+        }
+        $frame = pack('qqV', $maxSegments, 0, $total);
+        foreach ($files as $row) {
+            if (! \is_array($row) || ! \is_int($row['segments'] ?? null) || ! \is_int($row['bytes'] ?? null) || $row['segments'] < 0 || $row['bytes'] < 0) {
+                return self::summarizeNzbSegmentBatchPhp($files, $maxSegments);
+            }
+            $frame .= pack('qq', $row['segments'], $row['bytes']);
+        }
+        $slots = self::w416Slots(5, $frame, 6);
+        if ($slots === null || $slots[0] !== $total || $slots[4] !== 0 || $slots[5] > 1 || $slots[5] !== (int) ($slots[2] > max(0, $maxSegments)) || $slots[1] > $total) {
+            return self::summarizeNzbSegmentBatchPhp($files, $maxSegments);
+        }
+
+        return [
+            'total_files' => $slots[0],
+            'empty_files' => $slots[1],
+            'total_segments' => $slots[2],
+            'total_bytes' => $slots[3],
+            'invalid_files' => $slots[4],
+            'exceeds_segment_limit' => $slots[5] === 1,
+        ];
+    }
 }
