@@ -79,6 +79,25 @@ final class ReleaseFingerprintCollector
 
     private static bool $useRustFfi = true;
 
+    /**
+     * Wave 47.2 production default for aggregateCandidateBatch() is Rust: the paired benchmark in
+     * tests/Unit/RustFingerprintDispatchBreakerParserAnalyzerCollectorW47ParityTest.php measures 2.18-2.29x mean and
+     * 1.94-2.17x p99 on common batches and 1.77-2.06x mean and 1.72-2.03x p99 on uncommon batches. PHP stays the
+     * fallback when the library is unavailable or a candidate holds a NUL byte.
+     */
+    public const bool W47_COLLECTOR_RUST_FFI_DEFAULT = true;
+
+    public const string W47_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w47_fingerprint_candidate_batch(const char *blob, size_t blob_len, const char *aux, size_t aux_len, int64_t strings, int64_t skipped, char *out_buf, size_t out_cap);
+        C;
+
+    private const array W47_COLLECTOR_KEYS = ['total', 'invalid', 'empty', 'accepted', 'distinct_variants', 'duplicate', 'versioned',
+        'distinct_products', 'medium_confidence', 'low_confidence', 'top_count', 'top_rank', 'digest'];
+
+    private static ?bool $w47CollectorRustFfiOverride = null;
+
+    private static FFI|false|null $w47CollectorRustFfiHandle = null;
+
     private readonly FingerprintProviderBreaker $breaker;
 
     public function __construct(private readonly NzbService $nzb, private readonly NzbFingerprintAnalyzer $analyzer,
@@ -3282,5 +3301,119 @@ final class ReleaseFingerprintCollector
         }
 
         return self::$ffi === false ? null : self::$ffi;
+    }
+
+    /** Force the Wave 47.2 candidate aggregation onto Rust (true) or PHP (false); null restores W47_COLLECTOR_RUST_FFI_DEFAULT. */
+    public static function useW47CollectorRustFfi(?bool $enable = true): void
+    {
+        self::$w47CollectorRustFfiOverride = $enable;
+    }
+
+    public static function usesW47CollectorRustFfi(): bool
+    {
+        return self::$w47CollectorRustFfiOverride ?? self::W47_COLLECTOR_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW47CollectorRustFfi(): void
+    {
+        self::$w47CollectorRustFfiOverride = null;
+        self::$w47CollectorRustFfiHandle = null;
+    }
+
+    /**
+     * Aggregate uploader software candidate names the way softwareCandidates() groups evidence: each string is
+     * lowercased, its whitespace runs collapsed and trimmed; empty names are dropped, repeated normalized names are
+     * duplicates, and the text before the first space or slash names the product (any text after it is a version).
+     * Products seen more than once are medium confidence, the rest low; top_rank is the first-seen rank of the first
+     * product with the most evidence (-1 without one) and digest an FNV-1a hash of the products in first-seen order.
+     *
+     * @param  array<array-key, mixed>  $candidates
+     * @return array{total: int, invalid: int, empty: int, accepted: int, distinct_variants: int, duplicate: int, versioned: int, distinct_products: int, medium_confidence: int, low_confidence: int, top_count: int, top_rank: int, digest: int}
+     */
+    public static function aggregateCandidateBatch(array $candidates): array
+    {
+        return (self::usesW47CollectorRustFfi() ? self::aggregateCandidateBatchNative($candidates) : null)
+            ?? self::aggregateCandidateBatchPhp($candidates);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $candidates
+     * @return array{total: int, invalid: int, empty: int, accepted: int, distinct_variants: int, duplicate: int, versioned: int, distinct_products: int, medium_confidence: int, low_confidence: int, top_count: int, top_rank: int, digest: int}
+     */
+    public static function aggregateCandidateBatchPhp(array $candidates): array
+    {
+        $invalid = $empty = $versioned = 0;
+        $variants = $products = [];
+        foreach ($candidates as $candidate) {
+            if (! \is_string($candidate)) {
+                $invalid++;
+
+                continue;
+            }
+            $normalized = trim((string) preg_replace('/\s+/', ' ', strtolower($candidate)));
+            if ($normalized === '') {
+                $empty++;
+
+                continue;
+            }
+            $split = strcspn($normalized, ' /');
+            if ($split + 1 < \strlen($normalized)) {
+                $versioned++;
+            }
+            $product = substr($normalized, 0, $split);
+            $products[$product] = ($products[$product] ?? 0) + 1;
+            $variants[$normalized] = true;
+        }
+        $accepted = \count($candidates) - $invalid - $empty;
+        $medium = $top = 0;
+        $rank = -1;
+        foreach (array_values($products) as $at => $n) {
+            if ($n > 1) {
+                $medium++;
+            }
+            if ($n > $top) {
+                [$top, $rank] = [$n, $at];
+            }
+        }
+
+        return array_combine(self::W47_COLLECTOR_KEYS, [\count($candidates), $invalid, $empty, $accepted, \count($variants), $accepted - \count($variants),
+            $versioned, \count($products), $medium, \count($products) - $medium, $top, $rank,
+            FingerprintDispatch::w47Fnv($products === [] ? '' : implode("\n", array_keys($products))."\n")]);
+    }
+
+    /**
+     * Null when the library is missing, a candidate holds a NUL byte or the batch exceeds the native limits.
+     *
+     * @param  array<array-key, mixed>  $candidates
+     * @return array{total: int, invalid: int, empty: int, accepted: int, distinct_variants: int, duplicate: int, versioned: int, distinct_products: int, medium_confidence: int, low_confidence: int, top_count: int, top_rank: int, digest: int}|null
+     */
+    public static function aggregateCandidateBatchNative(array $candidates): ?array
+    {
+        $ffi = self::w47CollectorRustFfi();
+        if ($ffi === null || \count($candidates) > FingerprintDispatch::W47_MAX_ITEMS) {
+            return null;
+        }
+        $skipped = 0;
+        foreach ($candidates as $candidate) {
+            if (! \is_string($candidate)) {
+                $skipped++;
+            }
+        }
+        $blob = implode("\0", $skipped === 0 ? $candidates : array_filter($candidates, \is_string(...)));
+        $values = FingerprintDispatch::callW47Native($ffi, 'nntmux_w47_fingerprint_candidate_batch', $blob, '', \count($candidates) - $skipped, $skipped,
+            \count(self::W47_COLLECTOR_KEYS));
+        if ($values === null || $values[0] !== \count($candidates) || min(\array_slice($values, 0, 11)) < 0
+            || $values[0] !== $values[1] + $values[2] + $values[3] || $values[7] !== $values[8] + $values[9]) {
+            return null;
+        }
+
+        return array_combine(self::W47_COLLECTOR_KEYS, $values);
+    }
+
+    private static function w47CollectorRustFfi(): ?FFI
+    {
+        self::$w47CollectorRustFfiHandle ??= RustPipelineLibrary::resolveDomain(FingerprintDispatch::W47_FFI_DOMAIN, self::W47_FFI_CDEF) ?? false;
+
+        return self::$w47CollectorRustFfiHandle === false ? null : self::$w47CollectorRustFfiHandle;
     }
 }

@@ -8,6 +8,7 @@ use App\Jobs\CollectReleaseFingerprintMetadata;
 use App\Support\RustPipelineLibrary;
 use FFI;
 use Illuminate\Support\Facades\Cache;
+use InvalidArgumentException;
 use Throwable;
 
 /**
@@ -20,7 +21,40 @@ final class FingerprintProviderBreaker
         int64_t nntmux_fingerprint_breaker_suspect_seconds(int64_t window_seconds, int64_t cooldown_seconds);
         C;
 
+    /**
+     * Wave 47.2 production default for simulateBatch() is Rust: the paired benchmark in
+     * tests/Unit/RustFingerprintDispatchBreakerParserAnalyzerCollectorW47ParityTest.php measures 2.68-2.85x mean and
+     * 2.20-2.58x p99 on common batches and 1.99-2.19x mean and 1.68-1.92x p99 on uncommon batches. PHP stays the
+     * fallback when the library is unavailable or a time or span is beyond the native limits.
+     */
+    public const bool W47_BREAKER_RUST_FFI_DEFAULT = true;
+
+    public const string W47_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w47_fingerprint_breaker_batch(const char *blob, size_t blob_len, const char *aux, size_t aux_len, int64_t window_seconds, int64_t cooldown_seconds, char *out_buf, size_t out_cap);
+        C;
+
+    /** Simulated events: skipReason(), recordUnavailable(), recordReachable() and releaseProbe(). */
+    public const int W47_CHECK = 0;
+
+    public const int W47_FAILURE = 1;
+
+    public const int W47_SUCCESS = 2;
+
+    public const int W47_RELEASE = 3;
+
+    /** The native simulation declines times beyond +/-2^52 and spans beyond +/-2^40 so every deadline stays an int. */
+    public const int W47_MAX_TIME = 4503599627370496;
+
+    public const int W47_MAX_SPAN = 1099511627776;
+
+    private const array W47_BREAKER_KEYS = ['total', 'invalid', 'out_of_order', 'providers', 'allowed', 'skipped_recent', 'skipped_probe', 'claims',
+        'failures', 'recoveries', 'released', 'ignored', 'open', 'suspect', 'max_window_failures', 'failure_rate_permille', 'final_time'];
+
     private static bool $useRustFfi = false;
+
+    private static ?bool $w47BreakerRustFfiOverride = null;
+
+    private static FFI|false|null $w47BreakerRustFfiHandle = null;
 
     private static FFI|false|null $ffi = null;
 
@@ -243,5 +277,202 @@ final class FingerprintProviderBreaker
         } catch (Throwable) {
             return null;
         }
+    }
+
+    /** Force the Wave 47.2 simulation onto Rust (true) or PHP (false); null restores W47_BREAKER_RUST_FFI_DEFAULT. */
+    public static function useW47BreakerRustFfi(?bool $enable = true): void
+    {
+        self::$w47BreakerRustFfiOverride = $enable;
+    }
+
+    public static function usesW47BreakerRustFfi(): bool
+    {
+        return self::$w47BreakerRustFfiOverride ?? self::W47_BREAKER_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW47BreakerRustFfi(): void
+    {
+        self::$w47BreakerRustFfiOverride = null;
+        self::$w47BreakerRustFfiHandle = null;
+    }
+
+    /**
+     * Replay a batch of breaker events (event $i is $events[$i] for provider $providers[$i] at $times[$i]) against
+     * one in-memory model of the cache keys above, as if every event came from the same job. A check before a
+     * provider's first failure, after its generation expires (suspectSecondsPhp()) or once it recovered is allowed;
+     * within the failure window it is skipped as recent, while another claim lasts ($probeSeconds) as in progress,
+     * and otherwise it claims the re-probe. A success or release only applies to the claim of the latest check.
+     * Unknown events are invalid; a time earlier than the previous event's counts as out of order and replays at the
+     * previous time. A window of zero or less disables the breaker. Also reports, at the final time, providers still
+     * open or suspect (awaiting a re-probe), the most failures within any window, and the failure rate per mille.
+     *
+     * @param  list<int>  $providers
+     * @param  list<int>  $times
+     * @param  list<int>  $events
+     * @return array{total: int, invalid: int, out_of_order: int, providers: int, allowed: int, skipped_recent: int, skipped_probe: int, claims: int, failures: int, recoveries: int, released: int, ignored: int, open: int, suspect: int, max_window_failures: int, failure_rate_permille: int, final_time: int}
+     *
+     * @throws InvalidArgumentException when the three lists differ in length
+     */
+    public static function simulateBatch(array $providers, array $times, array $events, int $windowSeconds, int $cooldownSeconds = 0,
+        int $probeSeconds = CollectReleaseFingerprintMetadata::TIMEOUT_SECONDS): array
+    {
+        return (self::usesW47BreakerRustFfi() ? self::simulateBatchNative($providers, $times, $events, $windowSeconds, $cooldownSeconds, $probeSeconds) : null)
+            ?? self::simulateBatchPhp($providers, $times, $events, $windowSeconds, $cooldownSeconds, $probeSeconds);
+    }
+
+    /**
+     * @param  list<int>  $providers
+     * @param  list<int>  $times
+     * @param  list<int>  $events
+     * @return array{total: int, invalid: int, out_of_order: int, providers: int, allowed: int, skipped_recent: int, skipped_probe: int, claims: int, failures: int, recoveries: int, released: int, ignored: int, open: int, suspect: int, max_window_failures: int, failure_rate_permille: int, final_time: int}
+     */
+    public static function simulateBatchPhp(array $providers, array $times, array $events, int $windowSeconds, int $cooldownSeconds = 0,
+        int $probeSeconds = CollectReleaseFingerprintMetadata::TIMEOUT_SECONDS): array
+    {
+        $count = \count($providers);
+        self::w47AssertSameLength($count, $times, $events);
+        $window = $windowSeconds;
+        $suspect = self::suspectSecondsPhp($window, $cooldownSeconds);
+        $times = array_values($times);
+        $events = array_values($events);
+        // invalid, out_of_order, allowed, skipped_recent, skipped_probe, claims, failures, recoveries, released, ignored
+        $c = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        $maxWindow = 0;
+        $last = null;
+        // Per provider: failure generation, the open/suspect/probe/recovered deadlines, the latest check's claim and
+        // the failure times still inside the window (from $head on).
+        $generation = $open = $suspectUntil = $probe = $recovered = $claimed = $failures = $head = [];
+        foreach (array_values($providers) as $i => $provider) {
+            $kind = $events[$i];
+            if ($kind < self::W47_CHECK || $kind > self::W47_RELEASE) {
+                $c[0]++;
+
+                continue;
+            }
+            $t = $times[$i];
+            if ($last !== null && $t < $last) {
+                $c[1]++;
+                $t = $last;
+            }
+            $last = $t;
+            if (! isset($generation[$provider])) {
+                $generation[$provider] = $head[$provider] = 0;
+                $open[$provider] = $suspectUntil[$provider] = $probe[$provider] = $recovered[$provider] = PHP_INT_MIN;
+                $claimed[$provider] = false;
+                $failures[$provider] = [];
+            }
+            if ($kind === self::W47_CHECK) {
+                $claimed[$provider] = false;
+                if ($window <= 0 || $generation[$provider] === 0 || $t >= $suspectUntil[$provider] || $t < $recovered[$provider]) {
+                    $c[2]++;
+                } elseif ($t < $open[$provider]) {
+                    $c[3]++;
+                } elseif ($t < $probe[$provider]) {
+                    $c[4]++;
+                } else {
+                    $probe[$provider] = $t + $probeSeconds;
+                    $claimed[$provider] = true;
+                    $c[5]++;
+                    $c[2]++;
+                }
+            } elseif ($kind === self::W47_FAILURE) {
+                $c[6]++;
+                $claimed[$provider] = false;
+                if ($window > 0) {
+                    $generation[$provider]++;
+                    $open[$provider] = $t + $window;
+                    $suspectUntil[$provider] = $t + $suspect;
+                    $recovered[$provider] = $probe[$provider] = PHP_INT_MIN;
+                    $failures[$provider][] = $t;
+                    while ($failures[$provider][$head[$provider]] <= $t - $window) {
+                        $head[$provider]++;
+                    }
+                    $maxWindow = max($maxWindow, \count($failures[$provider]) - $head[$provider]);
+                }
+            } elseif (! $claimed[$provider]) {
+                $c[9]++;
+            } elseif ($kind === self::W47_SUCCESS) {
+                $recovered[$provider] = $t + $suspect;
+                $claimed[$provider] = false;
+                $c[7]++;
+            } else {
+                $probe[$provider] = PHP_INT_MIN;
+                $claimed[$provider] = false;
+                $c[8]++;
+            }
+        }
+        $now = $last ?? 0;
+        $openAtEnd = $suspectAtEnd = 0;
+        foreach ($generation as $provider => $failed) {
+            if ($failed === 0 || $now >= $suspectUntil[$provider] || $now < $recovered[$provider]) {
+                continue;
+            }
+            if ($now < $open[$provider]) {
+                $openAtEnd++;
+            } else {
+                $suspectAtEnd++;
+            }
+        }
+        $valid = $count - $c[0];
+
+        return self::w47BreakerSummary([$count, $c[0], $c[1], \count($generation), ...\array_slice($c, 2), $openAtEnd, $suspectAtEnd, $maxWindow,
+            $valid > 0 ? intdiv($c[6] * 1000, $valid) : 0, $now]);
+    }
+
+    /**
+     * Null when the library is missing, a time or span is beyond the native limits or the batch is too large.
+     *
+     * @param  list<int>  $providers
+     * @param  list<int>  $times
+     * @param  list<int>  $events
+     * @return array{total: int, invalid: int, out_of_order: int, providers: int, allowed: int, skipped_recent: int, skipped_probe: int, claims: int, failures: int, recoveries: int, released: int, ignored: int, open: int, suspect: int, max_window_failures: int, failure_rate_permille: int, final_time: int}|null
+     */
+    public static function simulateBatchNative(array $providers, array $times, array $events, int $windowSeconds, int $cooldownSeconds = 0,
+        int $probeSeconds = CollectReleaseFingerprintMetadata::TIMEOUT_SECONDS): ?array
+    {
+        $count = \count($providers);
+        self::w47AssertSameLength($count, $times, $events);
+        $ffi = self::w47BreakerRustFfi();
+        if ($ffi === null || $count > FingerprintDispatch::W47_MAX_ITEMS) {
+            return null;
+        }
+        $blob = pack('q*', ...array_values($providers), ...array_values($times), ...array_values($events));
+        $values = FingerprintDispatch::callW47Native($ffi, 'nntmux_w47_fingerprint_breaker_batch', $blob, pack('q', $probeSeconds), $windowSeconds,
+            $cooldownSeconds, \count(self::W47_BREAKER_KEYS));
+        if ($values === null || $values[0] !== $count || min(\array_slice($values, 0, 16)) < 0) {
+            return null;
+        }
+
+        return self::w47BreakerSummary($values);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  ...$lists
+     *
+     * @throws InvalidArgumentException
+     */
+    private static function w47AssertSameLength(int $count, array ...$lists): void
+    {
+        foreach ($lists as $list) {
+            if (\count($list) !== $count) {
+                throw new InvalidArgumentException('Wave 47.2 batch lists must have the same length.');
+            }
+        }
+    }
+
+    /**
+     * @param  list<int>  $values
+     * @return array{total: int, invalid: int, out_of_order: int, providers: int, allowed: int, skipped_recent: int, skipped_probe: int, claims: int, failures: int, recoveries: int, released: int, ignored: int, open: int, suspect: int, max_window_failures: int, failure_rate_permille: int, final_time: int}
+     */
+    private static function w47BreakerSummary(array $values): array
+    {
+        return array_combine(self::W47_BREAKER_KEYS, $values);
+    }
+
+    private static function w47BreakerRustFfi(): ?FFI
+    {
+        self::$w47BreakerRustFfiHandle ??= RustPipelineLibrary::resolveDomain(FingerprintDispatch::W47_FFI_DOMAIN, self::W47_FFI_CDEF) ?? false;
+
+        return self::$w47BreakerRustFfiHandle === false ? null : self::$w47BreakerRustFfiHandle;
     }
 }

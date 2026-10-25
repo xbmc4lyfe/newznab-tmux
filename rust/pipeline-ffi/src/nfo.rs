@@ -32625,3 +32625,1356 @@ pub unsafe extern "C" fn nntmux_w462_predb_feed_batch(
     }))
     .unwrap_or(-1)
 }
+
+// ============================================================================
+// Wave 47.2: fingerprint dispatch, provider breaker, metadata frames, NZB segments, candidates
+// ============================================================================
+
+mod wave47_fingerprint_dispatch_breaker_parser_analyzer_collector {
+    use super::{crc32_ieee, memchr, nfo_abi_range, php_trim, yenc_ranges_overlap};
+    use std::collections::hash_map::{Entry, RandomState};
+    use std::collections::{HashMap, HashSet, VecDeque};
+    use std::hash::{BuildHasher, Hasher};
+    use std::slice;
+    use std::sync::OnceLock;
+
+    pub(super) const MAX_INPUT: usize = 16 * 1024 * 1024;
+    pub(super) const MAX_ITEMS: usize = 65_536;
+    /// Length-table sentinel for a non-string item.
+    pub(super) const NULL: u32 = u32::MAX;
+    /// Largest |time| the breaker simulation accepts, so every deadline stays exact in PHP.
+    pub(super) const MAX_TIME: i64 = 1 << 52;
+    /// Largest |window|, |cooldown| or |probe| the breaker simulation accepts.
+    pub(super) const MAX_SPAN: i64 = 1 << 40;
+    const NONE: i64 = i64::MIN;
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    const MIX: u64 = 0x9e37_79b9_7f4a_7c15;
+
+    /// Multiply-fold hasher seeded once per process: far cheaper than SipHash on these short keys,
+    /// while the random seed keeps bucket collisions unpredictable to whoever wrote the inputs.
+    #[derive(Clone, Copy)]
+    struct Seeded(u64);
+
+    impl Default for Seeded {
+        fn default() -> Self {
+            static SEED: OnceLock<u64> = OnceLock::new();
+            Seeded(*SEED.get_or_init(|| RandomState::new().hash_one(0x5eed_u64)))
+        }
+    }
+
+    impl BuildHasher for Seeded {
+        type Hasher = Mix;
+
+        fn build_hasher(&self) -> Mix {
+            Mix(self.0)
+        }
+    }
+
+    struct Mix(u64);
+
+    #[inline]
+    fn fold(a: u64, b: u64) -> u64 {
+        let product = u128::from(a) * u128::from(b);
+        product as u64 ^ (product >> 64) as u64
+    }
+
+    impl Hasher for Mix {
+        #[inline]
+        fn write(&mut self, bytes: &[u8]) {
+            let (chunks, tail) = bytes.as_chunks::<8>();
+            let mut hash = self.0;
+            for chunk in chunks {
+                hash = fold(hash ^ u64::from_le_bytes(*chunk), MIX);
+            }
+            if !tail.is_empty() {
+                let mut word = [0u8; 8];
+                word[..tail.len()].copy_from_slice(tail);
+                hash = fold(hash ^ u64::from_le_bytes(word), MIX);
+            }
+            self.0 = hash;
+        }
+
+        #[inline]
+        fn write_u64(&mut self, value: u64) {
+            self.0 = fold(self.0 ^ value, MIX);
+        }
+
+        #[inline]
+        fn write_i64(&mut self, value: i64) {
+            self.write_u64(value as u64);
+        }
+
+        #[inline]
+        fn write_usize(&mut self, value: usize) {
+            self.write_u64(value as u64);
+        }
+
+        #[inline]
+        fn finish(&self) -> u64 {
+            fold(self.0, MIX ^ 0x2d35_8dcc_aa6c_78a5)
+        }
+    }
+
+    type Set<T> = HashSet<T, Seeded>;
+    type Map<K, V> = HashMap<K, V, Seeded>;
+
+    fn set<T>(capacity: usize) -> Set<T> {
+        HashSet::with_capacity_and_hasher(capacity, Seeded::default())
+    }
+
+    fn map<K, V>(capacity: usize) -> Map<K, V> {
+        HashMap::with_capacity_and_hasher(capacity, Seeded::default())
+    }
+
+    /// PHP's crc32(): the ARMv8 CRC32 instructions when present, else the slice-by-8 table.
+    fn crc32(data: &[u8]) -> u32 {
+        #[cfg(target_arch = "aarch64")]
+        {
+            if std::arch::is_aarch64_feature_detected!("crc") {
+                return unsafe { crc32_aarch64(data) };
+            }
+        }
+        crc32_ieee(data)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "crc")]
+    unsafe fn crc32_aarch64(data: &[u8]) -> u32 {
+        use std::arch::aarch64::{__crc32b, __crc32d};
+        let mut crc = 0xFFFF_FFFFu32;
+        let (chunks, tail) = data.as_chunks::<8>();
+        for chunk in chunks {
+            crc = __crc32d(crc, u64::from_le_bytes(*chunk));
+        }
+        for &b in tail {
+            crc = __crc32b(crc, b);
+        }
+        !crc
+    }
+
+    #[inline]
+    fn fnv(mut hash: u64, bytes: &[u8]) -> u64 {
+        for &b in bytes {
+            hash = (hash ^ u64::from(b)).wrapping_mul(FNV_PRIME);
+        }
+        hash
+    }
+
+    #[inline]
+    fn read_u32(bytes: &[u8], at: usize) -> Option<u32> {
+        let end = at.checked_add(4)?;
+        Some(u32::from_le_bytes(bytes.get(at..end)?.try_into().ok()?))
+    }
+
+    fn read_i64s(bytes: &[u8]) -> impl Iterator<Item = i64> + '_ {
+        bytes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| i64::from_le_bytes(*c))
+    }
+
+    /// Split a NUL-joined blob into exactly `count` items; an empty batch is an empty blob.
+    fn split_nul(blob: &[u8], count: usize) -> Option<Vec<&[u8]>> {
+        if count == 0 {
+            return blob.is_empty().then(Vec::new);
+        }
+        let mut items = Vec::with_capacity(count);
+        let mut rest = blob;
+        while items.len() + 1 < count {
+            // SAFETY: `rest` is a live slice and memchr reads at most `rest.len()` bytes of it.
+            let found = unsafe { memchr(rest.as_ptr(), 0, rest.len()) };
+            if found.is_null() {
+                return None;
+            }
+            let at = found as usize - rest.as_ptr() as usize;
+            items.push(&rest[..at]);
+            rest = &rest[at + 1..];
+        }
+        // SAFETY: as above.
+        if !unsafe { memchr(rest.as_ptr(), 0, rest.len()) }.is_null() {
+            return None;
+        }
+        items.push(rest);
+        Some(items)
+    }
+
+    /// Items from a blob and a u32 length table (`NULL` marks a non-string).
+    fn split_lengths<'a>(blob: &'a [u8], lens: &[u8]) -> Option<Vec<Option<&'a [u8]>>> {
+        let (chunks, rest) = lens.as_chunks::<4>();
+        if !rest.is_empty() || chunks.len() > MAX_ITEMS {
+            return None;
+        }
+        let mut items = Vec::with_capacity(chunks.len());
+        let mut pos = 0usize;
+        for chunk in chunks {
+            let len = u32::from_le_bytes(*chunk);
+            if len == NULL {
+                items.push(None);
+                continue;
+            }
+            let end = pos.checked_add(len as usize).filter(|&e| e <= blob.len())?;
+            items.push(Some(&blob[pos..end]));
+            pos = end;
+        }
+        (pos == blob.len()).then_some(items)
+    }
+
+    /// FingerprintDispatch::planEnqueueBatch(): `aux` holds one i64 release id per request followed by
+    /// one force byte per request, `blob` the NUL-joined generations; `database` is 1 when the worker
+    /// routes to the database queue and `shards` the partition count (1..=1024).
+    fn dispatch(blob: &[u8], aux: &[u8], database: i64, shards: i64) -> Option<Vec<i64>> {
+        if !(0..=1).contains(&database)
+            || !(1..=1024).contains(&shards)
+            || !aux.len().is_multiple_of(9)
+        {
+            return None;
+        }
+        let count = aux.len() / 9;
+        if count > MAX_ITEMS {
+            return None;
+        }
+        let (ids, forces) = aux.split_at(count * 8);
+        if forces.iter().any(|&f| f > 1) {
+            return None;
+        }
+        let generations = split_nul(blob, count)?;
+        // queued, forced, generation, no_generation, invalid_release_id
+        let mut reasons = [0i64; 5];
+        let mut duplicate = 0i64;
+        let mut max_id = 0i64;
+        let mut generation_bytes = 0i64;
+        let mut loads = vec![0i64; shards as usize];
+        let mut ids_seen: Set<i64> = set(count);
+        let mut generations_seen: Set<&[u8]> = set(count);
+        let mut digest = FNV_OFFSET;
+        for ((id, &force), generation) in read_i64s(ids).zip(forces).zip(generations) {
+            let trimmed = php_trim(generation);
+            let reason = if id < 1 {
+                4u8
+            } else if database == 1 {
+                force
+            } else if trimmed.is_empty() {
+                3
+            } else {
+                2
+            };
+            reasons[reason as usize] += 1;
+            let applied: &[u8] = if reason == 2 { trimmed } else { b"" };
+            if reason != 4 {
+                duplicate += i64::from(!ids_seen.insert(id));
+                max_id = max_id.max(id);
+                loads[(id % shards) as usize] += 1;
+            }
+            if reason == 2 {
+                generations_seen.insert(trimmed);
+                generation_bytes += trimmed.len() as i64;
+            }
+            let mut record = [reason; 13];
+            record[1..9].copy_from_slice(&id.to_le_bytes());
+            record[9..].copy_from_slice(&crc32(applied).to_le_bytes());
+            digest = fnv(digest, &record);
+        }
+        let (mut busiest, mut load) = (0usize, 0i64);
+        for (shard, &value) in loads.iter().enumerate() {
+            if value > load {
+                (busiest, load) = (shard, value);
+            }
+        }
+        let mut out = Vec::with_capacity(13);
+        out.push(count as i64);
+        out.extend_from_slice(&reasons);
+        out.extend_from_slice(&[
+            duplicate,
+            generations_seen.len() as i64,
+            max_id,
+            generation_bytes,
+            busiest as i64,
+            load,
+            digest as i64,
+        ]);
+        Some(out)
+    }
+
+    #[derive(Default)]
+    struct Provider {
+        generation: i64,
+        open_until: i64,
+        suspect_until: i64,
+        probe_until: i64,
+        recovered_until: i64,
+        claimed: bool,
+        failures: VecDeque<i64>,
+    }
+
+    /// FingerprintProviderBreaker::simulateBatch(): `blob` holds the provider ids, then the event
+    /// times, then the event kinds (0 check, 1 failure, 2 success, 3 release), one i64 per event in
+    /// each column; `aux` is the i64 probe claim seconds.
+    fn breaker(blob: &[u8], aux: &[u8], window: i64, cooldown: i64) -> Option<Vec<i64>> {
+        let probe = i64::from_le_bytes(aux.try_into().ok()?);
+        if !blob.len().is_multiple_of(24)
+            || [window, cooldown, probe]
+                .iter()
+                .any(|v| !(-MAX_SPAN..=MAX_SPAN).contains(v))
+        {
+            return None;
+        }
+        let count = blob.len() / 24;
+        if count > MAX_ITEMS {
+            return None;
+        }
+        let (providers, rest) = blob.split_at(count * 8);
+        let (times, kinds) = rest.split_at(count * 8);
+        if read_i64s(times).any(|t| !(-MAX_TIME..=MAX_TIME).contains(&t)) {
+            return None;
+        }
+        let suspect = if cooldown > 0 {
+            cooldown.min(window.max(30))
+        } else {
+            (window * 4).max(3600)
+        };
+        // invalid, out_of_order, allowed, skipped_recent, skipped_probe, claims, failures,
+        // recoveries, released, ignored
+        let mut c = [0i64; 10];
+        let mut max_window = 0i64;
+        let mut last = NONE;
+        let mut states: Map<i64, Provider> = map(8);
+        for ((provider, mut t), kind) in read_i64s(providers)
+            .zip(read_i64s(times))
+            .zip(read_i64s(kinds))
+        {
+            if !(0..=3).contains(&kind) {
+                c[0] += 1;
+                continue;
+            }
+            if last != NONE && t < last {
+                c[1] += 1;
+                t = last;
+            }
+            last = t;
+            let state = match states.entry(provider) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => entry.insert(Provider {
+                    open_until: NONE,
+                    suspect_until: NONE,
+                    probe_until: NONE,
+                    recovered_until: NONE,
+                    ..Provider::default()
+                }),
+            };
+            match kind {
+                0 => {
+                    state.claimed = false;
+                    if window <= 0
+                        || state.generation == 0
+                        || t >= state.suspect_until
+                        || t < state.recovered_until
+                    {
+                        c[2] += 1;
+                    } else if t < state.open_until {
+                        c[3] += 1;
+                    } else if t < state.probe_until {
+                        c[4] += 1;
+                    } else {
+                        state.probe_until = t + probe;
+                        state.claimed = true;
+                        c[5] += 1;
+                        c[2] += 1;
+                    }
+                }
+                1 => {
+                    c[6] += 1;
+                    state.claimed = false;
+                    if window > 0 {
+                        state.generation += 1;
+                        state.open_until = t + window;
+                        state.suspect_until = t + suspect;
+                        state.recovered_until = NONE;
+                        state.probe_until = NONE;
+                        state.failures.push_back(t);
+                        while state.failures.front().is_some_and(|&f| f <= t - window) {
+                            state.failures.pop_front();
+                        }
+                        max_window = max_window.max(state.failures.len() as i64);
+                    }
+                }
+                _ if !state.claimed => c[9] += 1,
+                2 => {
+                    state.recovered_until = t + suspect;
+                    state.claimed = false;
+                    c[7] += 1;
+                }
+                _ => {
+                    state.probe_until = NONE;
+                    state.claimed = false;
+                    c[8] += 1;
+                }
+            }
+        }
+        let now = if last == NONE { 0 } else { last };
+        let (mut open, mut suspect_open) = (0i64, 0i64);
+        for state in states.values() {
+            if state.generation == 0 || now >= state.suspect_until || now < state.recovered_until {
+                continue;
+            }
+            if now < state.open_until {
+                open += 1;
+            } else {
+                suspect_open += 1;
+            }
+        }
+        let valid = count as i64 - c[0];
+        let mut out = Vec::with_capacity(17);
+        out.extend_from_slice(&[count as i64, c[0], c[1], states.len() as i64]);
+        out.extend_from_slice(&c[2..]);
+        out.extend_from_slice(&[
+            open,
+            suspect_open,
+            max_window,
+            if valid > 0 { c[6] * 1000 / valid } else { 0 },
+            now,
+        ]);
+        Some(out)
+    }
+
+    /// One NativeMetadataParser line list: a u32 count and that many non-null length-prefixed lines.
+    fn frame_lines(field: &[u8]) -> Option<i64> {
+        let count = read_u32(field, 0)? as usize;
+        if count > (field.len() - 4) / 4 {
+            return None;
+        }
+        let mut pos = 4usize;
+        for _ in 0..count {
+            let len = read_u32(field, pos)?;
+            pos += 4;
+            if len == NULL || len as usize > field.len() - pos {
+                return None;
+            }
+            pos += len as usize;
+        }
+        (pos == field.len()).then_some(count as i64)
+    }
+
+    /// NativeMetadataParser::summarizeFrameBatch(): AI02 identity and XR01 xref frames as
+    /// packMetadataField() writes them, from a blob and u32 length table.
+    fn frames(blob: &[u8], lens: &[u8]) -> Option<Vec<i64>> {
+        let items = split_lengths(blob, lens)?;
+        // invalid, ai, xref, unknown, truncated, malformed, trailing, fields, null_fields,
+        // payload_bytes, max_field, header_lines, xref_lines, bracketed_ids, crc_sum
+        let mut c = [0i64; 15];
+        let mut digest = FNV_OFFSET;
+        for item in items.iter() {
+            let Some(frame) = item else {
+                c[0] += 1;
+                continue;
+            };
+            c[14] += i64::from(crc32(frame));
+            let ai = match frame.get(..4) {
+                None => {
+                    c[4] += 1;
+                    continue;
+                }
+                Some(b"AI02") => true,
+                Some(b"XR01") => false,
+                Some(_) => {
+                    c[3] += 1;
+                    continue;
+                }
+            };
+            let expected = if ai { 5 } else { 3 };
+            let mut fields: [Option<&[u8]>; 5] = [None; 5];
+            let mut pos = 4usize;
+            let mut outcome = 0u8; // 0 ok, 1 truncated, 2 malformed
+            for (index, slot) in fields.iter_mut().take(expected).enumerate() {
+                let Some(len) = read_u32(frame, pos) else {
+                    outcome = 1;
+                    break;
+                };
+                pos += 4;
+                if len == NULL {
+                    if !ai || index < 2 {
+                        outcome = 2;
+                        break;
+                    }
+                    continue;
+                }
+                if len as usize > frame.len() - pos {
+                    outcome = 1;
+                    break;
+                }
+                *slot = Some(&frame[pos..pos + len as usize]);
+                pos += len as usize;
+            }
+            let mut lines = 0i64;
+            if outcome == 0 && !ai {
+                match (frame_lines(fields[1]?), frame_lines(fields[2]?)) {
+                    (Some(a), Some(b)) => lines = a + b,
+                    _ => outcome = 2,
+                }
+            }
+            if outcome == 1 {
+                c[4] += 1;
+                continue;
+            }
+            if outcome == 2 {
+                c[5] += 1;
+                continue;
+            }
+            if pos != frame.len() {
+                c[6] += 1;
+                continue;
+            }
+            c[if ai { 1 } else { 2 }] += 1;
+            c[7] += expected as i64;
+            for field in fields.iter().take(expected) {
+                match field {
+                    Some(bytes) => {
+                        c[9] += bytes.len() as i64;
+                        c[10] = c[10].max(bytes.len() as i64);
+                    }
+                    None => c[8] += 1,
+                }
+            }
+            let headers = fields[if ai { 1 } else { 0 }]?;
+            c[11] += headers.iter().filter(|&&b| b == b'\n').count() as i64;
+            c[12] += lines;
+            if ai {
+                let id = fields[0]?;
+                c[13] += i64::from(id.len() > 2 && id[0] == b'<' && id[id.len() - 1] == b'>');
+            }
+            digest = fnv(digest, frame);
+        }
+        let mut out = Vec::with_capacity(17);
+        out.push(items.len() as i64);
+        out.extend_from_slice(&c);
+        out.push(digest as i64);
+        Some(out)
+    }
+
+    /// NzbFingerprintAnalyzer::summarizeSegmentBatch(): `blob` holds the NUL-joined string message
+    /// ids (`strings` of them; PHP counted `skipped` non-strings), `aux` one i64 per segment size.
+    fn segments(blob: &[u8], aux: &[u8], strings: i64, skipped: i64) -> Option<Vec<i64>> {
+        if !(0..=MAX_ITEMS as i64).contains(&strings)
+            || !(0..=MAX_ITEMS as i64).contains(&skipped)
+            || !aux.len().is_multiple_of(8)
+            || aux.len() / 8 > MAX_ITEMS
+        {
+            return None;
+        }
+        let ids = split_nul(blob, strings as usize)?;
+        // malformed, duplicate, no_domain, max_len, sum_len, low_entropy
+        let mut c = [0i64; 6];
+        let mut histogram = [0i64; 256];
+        let mut seen: Set<&[u8]> = set(ids.len());
+        let mut domains: Set<Vec<u8>> = set(8);
+        let mut domain = Vec::new();
+        for id in ids.iter() {
+            let trimmed = php_trim(id);
+            let mut inner = trimmed;
+            while let [b'<' | b'>', rest @ ..] = inner {
+                inner = rest;
+            }
+            while let [rest @ .., b'<' | b'>'] = inner {
+                inner = rest;
+            }
+            if trimmed.is_empty()
+                || inner.is_empty()
+                || inner
+                    .iter()
+                    .any(|&b| b <= 0x20 || b == 0x7f || b == b'<' || b == b'>')
+            {
+                c[0] += 1;
+                continue;
+            }
+            if !seen.insert(inner) {
+                c[1] += 1;
+                continue;
+            }
+            c[3] = c[3].max(inner.len() as i64);
+            c[4] += inner.len() as i64;
+            let local = match inner.iter().rposition(|&b| b == b'@') {
+                Some(at) => {
+                    domain.clear();
+                    domain.extend(inner[at + 1..].iter().map(u8::to_ascii_lowercase));
+                    if !domains.contains(domain.as_slice()) {
+                        domains.insert(domain.clone());
+                    }
+                    &inner[..at]
+                }
+                None => {
+                    c[2] += 1;
+                    inner
+                }
+            };
+            let mut present = [0u64; 4];
+            for &b in local {
+                histogram[b as usize] += 1;
+                present[(b >> 6) as usize] |= 1 << (b & 63);
+            }
+            c[5] += i64::from(present.iter().map(|w| w.count_ones()).sum::<u32>() < 6);
+        }
+        let bytes: i64 = histogram.iter().sum();
+        let squares: i64 = histogram.iter().map(|&n| n * n).sum();
+        let diversity = if bytes == 0 {
+            0
+        } else {
+            ((bytes as i128 * bytes as i128 - squares as i128) * 1000
+                / (bytes as i128 * bytes as i128)) as i64
+        };
+        let (mut invalid_bytes, mut sum, mut overflow) = (0i64, 0i64, false);
+        let (mut min, mut max) = (i64::MAX, 0i64);
+        let mut sizes: Map<i64, i64> = map(8);
+        for size in read_i64s(aux) {
+            if size < 0 {
+                invalid_bytes += 1;
+                continue;
+            }
+            match sum.checked_add(size) {
+                Some(next) if !overflow => sum = next,
+                _ => overflow = true,
+            }
+            min = min.min(size);
+            max = max.max(size);
+            *sizes.entry(size).or_insert(0) += 1;
+        }
+        let segments = aux.len() as i64 / 8 - invalid_bytes;
+        let (mut dominant, mut dominant_count) = (0i64, 0i64);
+        for (&size, &n) in &sizes {
+            if n > dominant_count || (n == dominant_count && size < dominant) {
+                (dominant, dominant_count) = (size, n);
+            }
+        }
+        let valid = ids.len() as i64 - c[0] - c[1];
+        Some(vec![
+            strings + skipped,
+            skipped,
+            c[0],
+            valid,
+            c[1],
+            c[2],
+            domains.len() as i64,
+            c[3],
+            c[4],
+            diversity,
+            c[5],
+            segments,
+            invalid_bytes,
+            if overflow { i64::MAX } else { sum },
+            i64::from(overflow),
+            if segments == 0 { 0 } else { min },
+            max,
+            dominant,
+            dominant_count,
+            segments - dominant_count,
+        ])
+    }
+
+    /// ReleaseFingerprintCollector::aggregateCandidateBatch(): `blob` holds the NUL-joined string
+    /// candidates (`strings` of them; PHP counted `skipped` non-strings).
+    fn candidates(blob: &[u8], strings: i64, skipped: i64) -> Option<Vec<i64>> {
+        if !(0..=MAX_ITEMS as i64).contains(&strings) || !(0..=MAX_ITEMS as i64).contains(&skipped)
+        {
+            return None;
+        }
+        let names = split_nul(blob, strings as usize)?;
+        // Normalize every name into one arena first, so the sets below borrow from it.
+        let mut arena = Vec::with_capacity(blob.len());
+        let mut spans = Vec::with_capacity(names.len());
+        let mut empty = 0i64;
+        for name in names.iter() {
+            let start = arena.len();
+            let mut space = false;
+            for &b in name.iter() {
+                if matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') {
+                    if !space {
+                        arena.push(b' ');
+                    }
+                    space = true;
+                } else {
+                    arena.push(b.to_ascii_lowercase());
+                    space = false;
+                }
+            }
+            let normalized = php_trim(&arena[start..]);
+            if normalized.is_empty() {
+                empty += 1;
+                arena.truncate(start);
+                continue;
+            }
+            let lead = normalized.as_ptr() as usize - arena[start..].as_ptr() as usize;
+            spans.push(start + lead..start + lead + normalized.len());
+        }
+        let mut versioned = 0i64;
+        let mut variants: Set<&[u8]> = set(spans.len());
+        let mut order: Vec<&[u8]> = Vec::new();
+        let mut counts: Vec<i64> = Vec::new();
+        let mut index: Map<&[u8], usize> = map(16);
+        for span in spans {
+            let normalized = &arena[span];
+            let split = normalized
+                .iter()
+                .position(|&b| b == b' ' || b == b'/')
+                .unwrap_or(normalized.len());
+            versioned += i64::from(split + 1 < normalized.len());
+            let product = &normalized[..split];
+            match index.entry(product) {
+                Entry::Occupied(entry) => counts[*entry.get()] += 1,
+                Entry::Vacant(entry) => {
+                    entry.insert(order.len());
+                    order.push(product);
+                    counts.push(1);
+                }
+            }
+            variants.insert(normalized);
+        }
+        let accepted = names.len() as i64 - empty;
+        let (mut top, mut rank) = (0i64, -1i64);
+        for (at, &n) in counts.iter().enumerate() {
+            if n > top {
+                (top, rank) = (n, at as i64);
+            }
+        }
+        let mut digest = FNV_OFFSET;
+        for product in &order {
+            digest = fnv(fnv(digest, product), b"\n");
+        }
+        Some(vec![
+            strings + skipped,
+            skipped,
+            empty,
+            accepted,
+            variants.len() as i64,
+            accepted - variants.len() as i64,
+            versioned,
+            order.len() as i64,
+            counts.iter().filter(|&&n| n > 1).count() as i64,
+            counts.iter().filter(|&&n| n == 1).count() as i64,
+            top,
+            rank,
+            digest as i64,
+        ])
+    }
+
+    pub(super) fn compute(
+        operation: u8,
+        blob: &[u8],
+        aux: &[u8],
+        param_a: i64,
+        param_b: i64,
+    ) -> Option<Vec<i64>> {
+        match operation {
+            0 => dispatch(blob, aux, param_a, param_b),
+            1 => breaker(blob, aux, param_a, param_b),
+            2 if param_a == 0 && param_b == 0 => frames(blob, aux),
+            3 => segments(blob, aux, param_a, param_b),
+            4 if aux.is_empty() => candidates(blob, param_a, param_b),
+            _ => None,
+        }
+    }
+
+    /// # Safety
+    /// See [`super::nntmux_w47_fingerprint_dispatch_batch`].
+    #[allow(clippy::too_many_arguments)]
+    pub(super) unsafe fn evaluate(
+        operation: u8,
+        blob: *const u8,
+        blob_len: usize,
+        aux: *const u8,
+        aux_len: usize,
+        param_a: i64,
+        param_b: i64,
+        output: *mut u8,
+        capacity: usize,
+    ) -> isize {
+        if !nfo_abi_range(blob, blob_len, false)
+            || !nfo_abi_range(aux, aux_len, false)
+            || !nfo_abi_range(output, capacity, false)
+            || blob_len > MAX_INPUT
+            || aux_len > MAX_INPUT
+            || yenc_ranges_overlap(blob as usize, blob_len, output as usize, capacity)
+            || yenc_ranges_overlap(aux as usize, aux_len, output as usize, capacity)
+        {
+            return -1;
+        }
+        let blob = unsafe { slice::from_raw_parts(blob, blob_len) };
+        let aux = unsafe { slice::from_raw_parts(aux, aux_len) };
+        let Some(result) = compute(operation, blob, aux, param_a, param_b) else {
+            return -1;
+        };
+        let needed = result.len() * 8;
+        if needed > capacity {
+            return -(needed as isize);
+        }
+        let out = unsafe { slice::from_raw_parts_mut(output, needed) };
+        for (chunk, value) in out.as_chunks_mut::<8>().0.iter_mut().zip(&result) {
+            chunk.copy_from_slice(&value.to_le_bytes());
+        }
+        needed as isize
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn run(op: u8, blob: &[u8], aux: &[u8], a: i64, b: i64) -> Option<Vec<i64>> {
+            let mut out = vec![0xa5u8; 256];
+            let written = unsafe {
+                evaluate(
+                    op,
+                    blob.as_ptr(),
+                    blob.len(),
+                    aux.as_ptr(),
+                    aux.len(),
+                    a,
+                    b,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            if written < 0 {
+                assert_eq!(written, -1);
+                return None;
+            }
+            Some(read_i64s(&out[..written as usize]).collect())
+        }
+
+        fn ints(values: &[i64]) -> Vec<u8> {
+            values.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+
+        fn fnv_of(parts: &[&[u8]]) -> i64 {
+            parts.iter().fold(FNV_OFFSET, |h, p| fnv(h, p)) as i64
+        }
+
+        #[test]
+        fn w47_2_fnv_matches_reference_vectors() {
+            assert_eq!(fnv(FNV_OFFSET, b""), 0xcbf2_9ce4_8422_2325);
+            assert_eq!(fnv(FNV_OFFSET, b"a"), 0xaf63_dc4c_8601_ec8c);
+            assert_eq!(fnv(FNV_OFFSET, b"foobar"), 0x8594_4171_f739_67e8);
+            assert_eq!(split_nul(b"", 0), Some(vec![]));
+            assert_eq!(split_nul(b"", 1), Some(vec![&b""[..]]));
+            assert_eq!(split_nul(b"a\0b", 2), Some(vec![&b"a"[..], b"b"]));
+            assert_eq!(split_nul(b"a\0b", 1), None);
+            assert_eq!(split_nul(b"a", 2), None);
+            assert_eq!(split_nul(b"a", 0), None);
+            assert_eq!(split_nul(b"\0", 2), Some(vec![&b""[..], b""]));
+            assert_eq!(split_nul(b"\0\0", 2), None);
+            assert_eq!(split_nul(b"a\0\0b", 3), Some(vec![&b"a"[..], b"", b"b"]));
+        }
+
+        #[test]
+        fn w47_2_crc32_and_hasher() {
+            let data: Vec<u8> = (0..4099u32).map(|i| (i * 31 + i / 7) as u8).collect();
+            for len in 0..80 {
+                assert_eq!(crc32(&data[..len]), crc32_ieee(&data[..len]), "{len}");
+            }
+            assert_eq!(crc32(&data), crc32_ieee(&data));
+            assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
+            let mut names: Set<Vec<u8>> = set(0);
+            for i in 0..5000 {
+                assert!(names.insert(format!("Mirror.Release.Part{i}-GRP").into_bytes()));
+            }
+            assert!(!names.insert(b"Mirror.Release.Part7-GRP".to_vec()));
+            let mut ids: Set<i64> = set(0);
+            assert!((0..5000i64).all(|i| ids.insert(i * 1024)));
+            assert!(
+                names.contains(&b"Mirror.Release.Part4999-GRP"[..]) && !names.contains(&b""[..])
+            );
+        }
+
+        #[test]
+        fn w47_2_dispatch_routes_and_digests() {
+            let mut aux = ints(&[5, 5, 0, 17, -3]);
+            aux.extend_from_slice(&[0, 1, 1, 0, 0]);
+            let blob = b" gen-a \0gen-a\0\0\t\0x";
+            let db = run(0, blob, &aux, 1, 4).unwrap();
+            // total, queued, forced, generation, no_generation, invalid, duplicate, distinct, max,
+            // generation_bytes, busiest, load, digest
+            assert_eq!(&db[..12], &[5, 2, 1, 0, 0, 2, 1, 0, 17, 0, 1, 3]);
+            let job = run(0, blob, &aux, 0, 4).unwrap();
+            assert_eq!(&job[..12], &[5, 0, 0, 2, 1, 2, 1, 1, 17, 10, 1, 3]);
+            let mut parts: Vec<Vec<u8>> = vec![];
+            for (reason, id, generation) in [
+                (2u8, 5i64, &b"gen-a"[..]),
+                (2, 5, b"gen-a"),
+                (4, 0, b""),
+                (3, 17, b""),
+                (4, -3, b""),
+            ] {
+                parts.push(vec![reason]);
+                parts.push(id.to_le_bytes().to_vec());
+                parts.push(crc32_ieee(generation).to_le_bytes().to_vec());
+            }
+            let refs: Vec<&[u8]> = parts.iter().map(|p| p.as_slice()).collect();
+            assert_eq!(job[12], fnv_of(&refs));
+            assert_eq!(run(0, b"", b"", 1, 16).unwrap()[..12], [0; 12]);
+            assert_eq!(run(0, b"", b"", 2, 16), None);
+            assert_eq!(run(0, b"", b"", 1, 0), None);
+            assert_eq!(run(0, b"", b"", 1, 1025), None);
+            assert_eq!(run(0, b"a\0b", &aux, 1, 4), None);
+            let mut bad = ints(&[1]);
+            bad.push(2);
+            assert_eq!(run(0, b"", &bad, 1, 4), None);
+            assert_eq!(run(0, b"", &bad[..8], 1, 4), None);
+        }
+
+        #[test]
+        fn w47_2_breaker_state_machine() {
+            let providers = [1, 1, 1, 1, 1, 1, 1, 2, 1, 1];
+            let times = [0, 10, 20, 950, 960, 970, 965, 980, 990, 5000];
+            let kinds = [0, 1, 0, 0, 0, 2, 0, 9, 1, 0];
+            let blob = [ints(&providers), ints(&times), ints(&kinds)].concat();
+            let out = run(1, &blob, &ints(&[1800]), 900, 0).unwrap();
+            // total, invalid, out_of_order, providers, allowed, skipped_recent, skipped_probe,
+            // claims, failures, recoveries, released, ignored, open, suspect, max_window, rate, now
+            assert_eq!(
+                out,
+                vec![10, 1, 1, 1, 3, 1, 2, 1, 2, 0, 0, 1, 0, 0, 1, 222, 5000]
+            );
+            // Disabled window: every check probes and no failure opens the breaker.
+            assert_eq!(
+                run(1, &blob, &ints(&[1800]), 0, 0).unwrap()[4..9],
+                [6, 0, 0, 0, 2]
+            );
+            assert_eq!(run(1, b"", &ints(&[0]), 900, 0).unwrap(), [0; 17]);
+            assert_eq!(run(1, b"", b"", 900, 0), None);
+            assert_eq!(run(1, b"", &ints(&[0]), MAX_SPAN + 1, 0), None);
+            let far = [ints(&[1]), ints(&[MAX_TIME + 1]), ints(&[0])].concat();
+            assert_eq!(run(1, &far, &ints(&[0]), 900, 0), None);
+            assert_eq!(run(1, &far[..23], &ints(&[0]), 900, 0), None);
+        }
+
+        #[test]
+        fn w47_2_breaker_probe_claims_and_recovery() {
+            // fail; a check after the window claims and its success recovers the generation; a
+            // second failure opens again; after that window a claim is released and re-claimed.
+            let times = [0, 100, 101, 102, 103, 104, 170, 171, 172];
+            let kinds = [1, 0, 2, 0, 1, 0, 0, 3, 0];
+            let blob = [ints(&[7; 9]), ints(&times), ints(&kinds)].concat();
+            let out = run(1, &blob, &ints(&[50]), 60, 0).unwrap();
+            assert_eq!(
+                out,
+                vec![9, 0, 0, 1, 4, 1, 0, 3, 2, 1, 1, 0, 0, 1, 1, 222, 172]
+            );
+            // Cooldown 40 (min(40, max(30, 60))) expires each generation before its re-probe.
+            let out = run(1, &blob, &ints(&[50]), 60, 40).unwrap();
+            assert_eq!(&out[4..12], &[4, 1, 0, 0, 2, 0, 0, 2]);
+        }
+
+        fn field(bytes: Option<&[u8]>) -> Vec<u8> {
+            match bytes {
+                Some(b) => [&(b.len() as u32).to_le_bytes()[..], b].concat(),
+                None => NULL.to_le_bytes().to_vec(),
+            }
+        }
+
+        fn lines(items: &[&[u8]]) -> Vec<u8> {
+            let mut out = (items.len() as u32).to_le_bytes().to_vec();
+            for item in items {
+                out.extend(field(Some(item)));
+            }
+            out
+        }
+
+        fn table(items: &[Option<&[u8]>]) -> (Vec<u8>, Vec<u8>) {
+            let mut blob = vec![];
+            let mut lens = vec![];
+            for item in items {
+                match item {
+                    Some(b) => {
+                        blob.extend_from_slice(b);
+                        lens.extend((b.len() as u32).to_le_bytes());
+                    }
+                    None => lens.extend(NULL.to_le_bytes()),
+                }
+            }
+            (blob, lens)
+        }
+
+        #[test]
+        fn w47_2_metadata_frames() {
+            let ai = [
+                &b"AI02"[..],
+                &field(Some(b"<a@b>")),
+                &field(Some(b"Subject: x\r\nFrom: y\r\n")),
+                &field(None),
+                &field(Some(b"221 ok")),
+                &field(None),
+            ]
+            .concat();
+            let xr = [
+                &b"XR01"[..],
+                &field(Some(b"Xref: a\n")),
+                &field(Some(&lines(&[b"row1", b"row2"]))),
+                &field(Some(&lines(&[b"Subject:"]))),
+            ]
+            .concat();
+            let bad_lines = [
+                &b"XR01"[..],
+                &field(Some(b"")),
+                &field(Some(&lines(&[b"r"])[..7])),
+                &field(Some(&lines(&[]))),
+            ]
+            .concat();
+            let trailing = [&ai[..], b"!"].concat();
+            let null_id = [&b"AI02"[..], &field(None)].concat();
+            let items: [Option<&[u8]>; 9] = [
+                Some(&ai),
+                Some(&xr),
+                Some(&bad_lines),
+                Some(&trailing),
+                Some(&ai[..30]),
+                Some(b"AI0"),
+                Some(b"ZZ99data"),
+                None,
+                Some(&null_id),
+            ];
+            let (blob, lens) = table(&items);
+            let out = run(2, &blob, &lens, 0, 0).unwrap();
+            let crc: i64 = items
+                .iter()
+                .flatten()
+                .map(|f| i64::from(crc32_ieee(f)))
+                .sum();
+            assert_eq!(
+                out,
+                vec![
+                    9,
+                    1,
+                    1,
+                    1,
+                    1,
+                    2,
+                    2,
+                    1,
+                    8,
+                    2,
+                    5 + 21 + 6 + 8 + 20 + 16,
+                    21,
+                    3,
+                    3,
+                    1,
+                    crc,
+                    fnv_of(&[&ai, &xr]),
+                ]
+            );
+            assert_eq!(run(2, b"", b"", 0, 0).unwrap()[..16], [0; 16]);
+            assert_eq!(run(2, b"", b"", 1, 0), None);
+            assert_eq!(run(2, b"ab", &1u32.to_le_bytes(), 0, 0), None);
+            assert_eq!(run(2, b"a", &2u32.to_le_bytes(), 0, 0), None);
+            assert_eq!(run(2, b"a", &[1, 0, 0], 0, 0), None);
+            assert_eq!(frame_lines(&[255, 255, 255, 255]), None);
+            assert_eq!(frame_lines(&0u32.to_le_bytes()), Some(0));
+        }
+
+        #[test]
+        fn w47_2_segment_distribution_and_entropy() {
+            let ids =
+                b"<abcdefgh@news.example>\0abcdefgh@NEWS.example\0aaaa@x\0<bad id@x>\0<>\0 \0\
+                        noat\0<abcdefgh@news.example>";
+            let sizes = ints(&[700, 700, 700, 120, -1, 700]);
+            let out = run(3, ids, &sizes, 8, 2).unwrap();
+            // local bytes: abcdefgh twice, aaaa, noat -> a:7 b..h:2 n,o,t:1 => 24 bytes
+            let diversity = (24 * 24 - (49 + 7 * 4 + 3)) * 1000 / (24 * 24);
+            assert_eq!(
+                out,
+                vec![
+                    10,
+                    2,
+                    3,
+                    4,
+                    1,
+                    1,
+                    2,
+                    21,
+                    21 + 21 + 6 + 4,
+                    diversity,
+                    2,
+                    5,
+                    1,
+                    2920,
+                    0,
+                    120,
+                    700,
+                    700,
+                    4,
+                    1
+                ]
+            );
+            let huge = ints(&[i64::MAX, 1, 5]);
+            let out = run(3, b"", &huge, 0, 0).unwrap();
+            assert_eq!(&out[11..], &[3, 0, i64::MAX, 1, 1, i64::MAX, 1, 1, 2]);
+            assert_eq!(run(3, b"", b"", 0, 0).unwrap(), [0; 20]);
+            assert_eq!(run(3, b"a\0b", b"", 1, 0), None);
+            assert_eq!(run(3, b"", b"1234567", 0, 0), None);
+            assert_eq!(run(3, b"", b"", -1, 0), None);
+        }
+
+        #[test]
+        fn w47_2_candidate_aggregation() {
+            let names =
+                b"ngPost 4.16\0 NGPOST\t\t4.16 \0Nyuu/0.4.1\0ngpost\0\x0c\0newsmangler\0nyuu";
+            let out = run(4, names, b"", 7, 1).unwrap();
+            assert_eq!(
+                out,
+                vec![
+                    8,
+                    1,
+                    1,
+                    6,
+                    5,
+                    1,
+                    3,
+                    3,
+                    2,
+                    1,
+                    3,
+                    0,
+                    fnv_of(&[b"ngpost\n", b"nyuu\n", b"newsmangler\n"])
+                ]
+            );
+            assert_eq!(
+                run(4, b"", b"", 0, 0).unwrap(),
+                vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, -1, FNV_OFFSET as i64]
+            );
+            assert_eq!(run(4, b"", b"x", 0, 0), None);
+            assert_eq!(run(4, b"a\0b", b"", 1, 0), None);
+        }
+
+        #[test]
+        fn w47_2_abi_validation() {
+            let mut out = [0x5au8; 256];
+            let blob = b"x";
+            let call = |op: u8, o: *mut u8, cap: usize| unsafe {
+                evaluate(op, blob.as_ptr(), 1, blob.as_ptr(), 0, 1, 0, o, cap)
+            };
+            assert_eq!(call(4, out.as_mut_ptr(), 8), -104);
+            assert!(out.iter().all(|&b| b == 0x5a));
+            assert_eq!(call(4, out.as_mut_ptr(), 104), 104);
+            assert_eq!(call(4, std::ptr::null_mut(), 104), -1);
+            assert_eq!(call(5, out.as_mut_ptr(), 256), -1);
+            assert_eq!(
+                unsafe {
+                    evaluate(
+                        4,
+                        std::ptr::null(),
+                        0,
+                        blob.as_ptr(),
+                        0,
+                        0,
+                        0,
+                        out.as_mut_ptr(),
+                        256,
+                    )
+                },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    evaluate(
+                        4,
+                        blob.as_ptr(),
+                        MAX_INPUT + 1,
+                        blob.as_ptr(),
+                        0,
+                        1,
+                        0,
+                        out.as_mut_ptr(),
+                        256,
+                    )
+                },
+                -1
+            );
+            let mut shared = [0u8; 256];
+            shared[0] = b'x';
+            let p = shared.as_mut_ptr();
+            assert_eq!(unsafe { evaluate(4, p, 1, p, 0, 1, 0, p, 104) }, -1);
+            assert_eq!(unsafe { evaluate(4, p, 1, p, 0, 1, 0, p.add(8), 104) }, 104);
+            let exports: [unsafe extern "C" fn(
+                *const u8,
+                usize,
+                *const u8,
+                usize,
+                i64,
+                i64,
+                *mut u8,
+                usize,
+            ) -> isize; 5] = [
+                super::super::nntmux_w47_fingerprint_dispatch_batch,
+                super::super::nntmux_w47_fingerprint_breaker_batch,
+                super::super::nntmux_w47_metadata_frame_batch,
+                super::super::nntmux_w47_nzb_segment_batch,
+                super::super::nntmux_w47_fingerprint_candidate_batch,
+            ];
+            let probe = 0i64.to_le_bytes();
+            let expected = [104, 136, 136, 160, 104];
+            for (export, want) in exports.iter().zip(expected) {
+                let aux: &[u8] = if std::ptr::fn_addr_eq(*export, exports[1]) {
+                    &probe
+                } else {
+                    b""
+                };
+                let written = unsafe {
+                    export(
+                        b"".as_ptr(),
+                        0,
+                        aux.as_ptr(),
+                        aux.len(),
+                        0,
+                        0,
+                        out.as_mut_ptr(),
+                        256,
+                    )
+                };
+                let empty_dispatch = std::ptr::fn_addr_eq(*export, exports[0]);
+                assert_eq!(written, if empty_dispatch { -1 } else { want });
+            }
+        }
+    }
+}
+
+/// Wave 47.2 FingerprintDispatch::planEnqueueBatch(): `aux` holds one little-endian i64 release id per
+/// request followed by one force byte (0/1) per request, `blob` the NUL-joined generations;
+/// `database` is 1 when the worker routes to the database queue and `shards` the queue partition
+/// count (1..=1024). Writes 13 little-endian `i64` counters and returns the byte count, the negated
+/// required capacity when `out_cap` is too small (nothing written), or -1 for malformed input.
+///
+/// # Safety
+/// Both input ranges and the output must be live allocations of the given lengths, the output must not
+/// overlap either input, and pointers must be non-null even for zero lengths.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_w47_fingerprint_dispatch_batch(
+    blob: *const u8,
+    blob_len: usize,
+    aux: *const u8,
+    aux_len: usize,
+    database: i64,
+    shards: i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| unsafe {
+        wave47_fingerprint_dispatch_breaker_parser_analyzer_collector::evaluate(
+            0, blob, blob_len, aux, aux_len, database, shards, out_buf, out_cap,
+        )
+    })
+    .unwrap_or(-1)
+}
+
+/// Wave 47.2 FingerprintProviderBreaker::simulateBatch(): `blob` holds the provider ids, then the event
+/// times, then the event kinds (0 check, 1 failure, 2 success, 3 release) as little-endian i64
+/// columns, and `aux` the i64 probe claim seconds. Writes 17 `i64` counters; see
+/// [`nntmux_w47_fingerprint_dispatch_batch`] for the return and safety contract.
+///
+/// # Safety
+/// As for [`nntmux_w47_fingerprint_dispatch_batch`].
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_w47_fingerprint_breaker_batch(
+    blob: *const u8,
+    blob_len: usize,
+    aux: *const u8,
+    aux_len: usize,
+    window_seconds: i64,
+    cooldown_seconds: i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| unsafe {
+        wave47_fingerprint_dispatch_breaker_parser_analyzer_collector::evaluate(
+            1,
+            blob,
+            blob_len,
+            aux,
+            aux_len,
+            window_seconds,
+            cooldown_seconds,
+            out_buf,
+            out_cap,
+        )
+    })
+    .unwrap_or(-1)
+}
+
+/// Wave 47.2 NativeMetadataParser::summarizeFrameBatch(): `blob` holds the concatenated AI02/XR01
+/// frames and `aux` one little-endian u32 length per frame (`u32::MAX` for a non-string); both
+/// integer parameters must be zero. Writes 17 `i64` counters; see
+/// [`nntmux_w47_fingerprint_dispatch_batch`] for the return and safety contract.
+///
+/// # Safety
+/// As for [`nntmux_w47_fingerprint_dispatch_batch`].
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_w47_metadata_frame_batch(
+    blob: *const u8,
+    blob_len: usize,
+    aux: *const u8,
+    aux_len: usize,
+    reserved_a: i64,
+    reserved_b: i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| unsafe {
+        wave47_fingerprint_dispatch_breaker_parser_analyzer_collector::evaluate(
+            2, blob, blob_len, aux, aux_len, reserved_a, reserved_b, out_buf, out_cap,
+        )
+    })
+    .unwrap_or(-1)
+}
+
+/// Wave 47.2 NzbFingerprintAnalyzer::summarizeSegmentBatch(): `blob` holds `strings` NUL-joined
+/// message ids (the caller skipped `skipped` non-strings) and `aux` one little-endian i64 per segment
+/// size. Writes 20 `i64` counters; see [`nntmux_w47_fingerprint_dispatch_batch`] for the return and
+/// safety contract.
+///
+/// # Safety
+/// As for [`nntmux_w47_fingerprint_dispatch_batch`].
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_w47_nzb_segment_batch(
+    blob: *const u8,
+    blob_len: usize,
+    aux: *const u8,
+    aux_len: usize,
+    strings: i64,
+    skipped: i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| unsafe {
+        wave47_fingerprint_dispatch_breaker_parser_analyzer_collector::evaluate(
+            3, blob, blob_len, aux, aux_len, strings, skipped, out_buf, out_cap,
+        )
+    })
+    .unwrap_or(-1)
+}
+
+/// Wave 47.2 ReleaseFingerprintCollector::aggregateCandidateBatch(): `blob` holds `strings` NUL-joined
+/// software candidates (the caller skipped `skipped` non-strings) and `aux` must be empty. Writes 13
+/// `i64` counters; see [`nntmux_w47_fingerprint_dispatch_batch`] for the return and safety contract.
+///
+/// # Safety
+/// As for [`nntmux_w47_fingerprint_dispatch_batch`].
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_w47_fingerprint_candidate_batch(
+    blob: *const u8,
+    blob_len: usize,
+    aux: *const u8,
+    aux_len: usize,
+    strings: i64,
+    skipped: i64,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| unsafe {
+        wave47_fingerprint_dispatch_breaker_parser_analyzer_collector::evaluate(
+            4, blob, blob_len, aux, aux_len, strings, skipped, out_buf, out_cap,
+        )
+    })
+    .unwrap_or(-1)
+}
