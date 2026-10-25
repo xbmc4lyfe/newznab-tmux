@@ -29429,7 +29429,7 @@ pub mod w431_release_cleaning {
     pub const BINARY_KEYS: usize = 7;
     pub const SUBJECT_KEYS: usize = 8;
 
-    unsafe fn dispatch<const K: usize>(
+    pub(super) unsafe fn dispatch<const K: usize>(
         input: *const u8,
         len: usize,
         out: *mut u8,
@@ -30130,6 +30130,576 @@ pub mod w431_release_cleaning {
             assert_eq!(trim(b"\0\x0b x \t\n\r"), b"x");
             assert_eq!(trim(b"\x0cx\x0c"), b"\x0cx\x0c");
             assert_eq!(trim(b" \n "), b"");
+        }
+    }
+}
+
+/// Wave 44.1 pure CPU batch summaries for the IRC client and scraper, Xref service, yEnc article
+/// frame and yEnc service. Frames, error codes and output follow `w431_release_cleaning`: each
+/// export writes one `i64le` count per summary key; malformed frames, null or overlapping buffers,
+/// oversized inputs and entries that the existing parsers decline (NUL bytes, exhausted backtracking
+/// budgets) return -1 without writing so PHP keeps its own result.
+///
+/// The IRC, bot message, Xref and frame grammars reuse the production parsers (`irc`, crate root
+/// and `nfo`) rather than duplicating them, so the summaries cannot drift from the parsed records.
+pub mod w441_irc_xref_yenc {
+    use super::w431_release_cleaning::{dispatch, for_each_entry};
+
+    pub const IRC_LINE_KEYS: usize = 6;
+    pub const BOT_KEYS: usize = 8;
+    pub const XREF_KEYS: usize = 6;
+    pub const FRAME_KEYS: usize = 7;
+    pub const YENC_KEYS: usize = 9;
+
+    /// IRCClient::_readFrameTooLong() payload allowance, excluding the terminating CRLF.
+    pub const MAX_IRC_PAYLOAD: usize = 8701;
+
+    /// Counts entries in slot 0 and `empty` entries in slot 1; `classify` sees the others and
+    /// returns `None` to decline the whole batch.
+    fn summarize<const K: usize>(
+        input: &[u8],
+        empty: fn(&[u8]) -> bool,
+        mut classify: impl FnMut(&[u8], &mut [i64; K]) -> Option<()>,
+    ) -> Option<[i64; K]> {
+        let mut counts = [0i64; K];
+        let mut declined = false;
+        for_each_entry(input, |entry| {
+            if declined {
+                return;
+            }
+            counts[0] += 1;
+            if empty(entry) {
+                counts[1] += 1;
+            } else {
+                declined = classify(entry, &mut counts).is_none();
+            }
+        })?;
+        (!declined).then_some(counts)
+    }
+
+    fn grow(scratch: &mut Vec<u8>, needed: usize) {
+        if scratch.len() < needed {
+            scratch.resize(needed, 0);
+        }
+    }
+
+    /// `strpbrk($line, "\x02\x03\x04\x0f\x11\x16\x1d\x1e\x1f")`: every pattern of
+    /// `_stripControlCharactersPhp()` removes at least its control byte.
+    fn has_irc_control(s: &[u8]) -> bool {
+        s.chunks(32).any(|chunk| {
+            chunk.iter().fold(0u8, |m, &b| {
+                m | u8::from(matches!(b, 2 | 3 | 4 | 15 | 17 | 22 | 29 | 30 | 31))
+            }) != 0
+        })
+    }
+
+    fn irc_lines(input: &[u8]) -> Option<[i64; IRC_LINE_KEYS]> {
+        let mut scratch = Vec::new();
+        summarize(input, <[u8]>::is_empty, |s, c| {
+            grow(&mut scratch, s.len() + 4);
+            // SAFETY: both spans are live, disjoint and sized; the scratch holds `len + 4` bytes.
+            let written = unsafe {
+                crate::irc::nntmux_irc_parse_inbound_line(
+                    s.as_ptr(),
+                    s.len(),
+                    scratch.as_mut_ptr(),
+                    scratch.len(),
+                )
+            };
+            match written {
+                0 => {}
+                1.. if scratch[0] == b'P' => c[2] += 1,
+                1.. => c[3] += 1,
+                _ => return None,
+            }
+            c[4] += i64::from(has_irc_control(s));
+            c[5] += i64::from(s.len() > MAX_IRC_PAYLOAD);
+            Some(())
+        })
+    }
+
+    fn bot_messages(input: &[u8]) -> Option<[i64; BOT_KEYS]> {
+        let mut scratch = Vec::new();
+        summarize(input, <[u8]>::is_empty, |s, c| {
+            // Captures hold the request twice (whole, then id and group) plus 12 separators.
+            grow(&mut scratch, s.len() * 2 + 32);
+            let call = |scratch: &mut Vec<u8>| unsafe {
+                // SAFETY: both spans are live, disjoint and sized.
+                crate::irc::nntmux_irc_parse_bot_message(
+                    s.as_ptr(),
+                    s.len(),
+                    scratch.as_mut_ptr(),
+                    scratch.len(),
+                )
+            };
+            let mut written = call(&mut scratch);
+            if written < -1 {
+                grow(&mut scratch, written.unsigned_abs());
+                written = call(&mut scratch);
+            }
+            if written == 0 {
+                return Some(());
+            }
+            if written < 0 {
+                return None;
+            }
+            let mut values = [&[][..]; 13];
+            for (slot, value) in values
+                .iter_mut()
+                .zip(scratch[..written as usize].split(|&b| b == 0))
+            {
+                *slot = value;
+            }
+            c[2] += 1;
+            c[3] += i64::from(!values[7].is_empty());
+            c[4] += i64::from(!values[9].is_empty());
+            c[5] += i64::from(!values[10].is_empty());
+            c[6] += i64::from(!values[12].is_empty());
+            c[7] += i64::from(s[..3].eq_ignore_ascii_case(b"UPD"));
+            Some(())
+        })
+    }
+
+    fn xrefs(input: &[u8]) -> Option<[i64; XREF_KEYS]> {
+        // PHP `empty()` treats "0" like "".
+        summarize(
+            input,
+            |s| s.is_empty() || s == b"0",
+            |s, c| {
+                let (mut tokens, mut numbered, mut multi, mut rejected) =
+                    (false, false, false, false);
+                let mut first: Option<&[u8]> = None;
+                for raw in s.split(|&b| b == b' ') {
+                    let Some(token) = crate::match_xref_token(raw) else {
+                        rejected |= !raw.is_empty();
+                        continue;
+                    };
+                    tokens = true;
+                    let group = crate::strip_xref_number(token);
+                    numbered |= group.len() != token.len();
+                    match first {
+                        None => first = Some(group),
+                        Some(seen) => multi |= seen != group,
+                    }
+                }
+                c[2] += i64::from(tokens);
+                c[3] += i64::from(numbered);
+                c[4] += i64::from(multi);
+                c[5] += i64::from(rejected);
+                Some(())
+            },
+        )
+    }
+
+    /// ArticleFrame spans: begin, header LF, part LF (`usize::MAX` when absent), payload start,
+    /// trailer control and trailer LF or EOF. `None` declines the batch.
+    fn frame_spans(s: &[u8]) -> Option<Option<[usize; 6]>> {
+        let mut spans = [0usize; 6];
+        // SAFETY: `s` is a live non-empty slice; `spans` is a disjoint, aligned local array.
+        match unsafe {
+            crate::nfo::nntmux_yenc_frame_spans(s.as_ptr(), s.len(), spans.as_mut_ptr())
+        } {
+            1 => Some(Some(spans)),
+            0 => Some(None),
+            _ => None,
+        }
+    }
+
+    /// Last value of `key` in ArticleFrame::fields(): trailing CRs trimmed, keys
+    /// `(?:^|[ \t])[a-z][a-z0-9_-]*=` matched case-insensitively, values up to a space or tab,
+    /// and with `with_name` a `name=` value taking the remainder and ending the scan.
+    pub fn frame_field<'a>(mut line: &'a [u8], with_name: bool, key: &[u8]) -> Option<&'a [u8]> {
+        while let Some(rest) = line.strip_suffix(b"\r") {
+            line = rest;
+        }
+        let mut found = None;
+        let mut pos = 0;
+        while pos < line.len() {
+            let start = if pos == 0 && line[0].is_ascii_alphabetic() {
+                0
+            } else if matches!(line[pos], b' ' | b'\t')
+                && line.get(pos + 1).is_some_and(u8::is_ascii_alphabetic)
+            {
+                pos + 1
+            } else {
+                pos += 1;
+                continue;
+            };
+            let mut end = start + 1;
+            while end < line.len()
+                && (line[end].is_ascii_alphanumeric() || matches!(line[end], b'_' | b'-'))
+            {
+                end += 1;
+            }
+            if line.get(end) != Some(&b'=') {
+                pos = end;
+                continue;
+            }
+            let name = &line[start..end];
+            let value_start = end + 1;
+            if with_name && name.eq_ignore_ascii_case(b"name") {
+                if key.eq_ignore_ascii_case(b"name") {
+                    found = Some(&line[value_start..]);
+                }
+                break;
+            }
+            let mut value_end = value_start;
+            while value_end < line.len() && !matches!(line[value_end], b' ' | b'\t') {
+                value_end += 1;
+            }
+            if name.eq_ignore_ascii_case(key) {
+                found = Some(&line[value_start..value_end]);
+            }
+            pos = value_end;
+        }
+        found
+    }
+
+    struct Frame<'a> {
+        header: &'a [u8],
+        part: Option<&'a [u8]>,
+        trailer: &'a [u8],
+        payload: &'a [u8],
+    }
+
+    fn frame(s: &[u8]) -> Option<Option<Frame<'_>>> {
+        Some(
+            frame_spans(s)?.map(
+                |[begin, header_end, part_end, payload, end, trailer_end]| Frame {
+                    header: &s[begin + 7..header_end],
+                    part: (part_end != usize::MAX).then(|| &s[header_end + 7..part_end]),
+                    trailer: &s[end + 5..trailer_end],
+                    payload: &s[payload..end],
+                },
+            ),
+        )
+    }
+
+    fn frames(input: &[u8]) -> Option<[i64; FRAME_KEYS]> {
+        summarize(input, <[u8]>::is_empty, |s, c| {
+            let Some(f) = frame(s)? else {
+                return Some(());
+            };
+            c[2] += 1;
+            c[3] += i64::from(f.part.is_some());
+            c[4] += i64::from(frame_field(f.header, true, b"part").is_some());
+            c[5] += i64::from(frame_field(f.trailer, false, b"crc32").is_some());
+            c[6] += i64::from(frame_field(f.trailer, false, b"pcrc32").is_some());
+            Some(())
+        })
+    }
+
+    /// YencService::metadataNumber() accepts the value: ASCII digits only, at most PHP_INT_MAX.
+    pub fn metadata_number(value: &[u8]) -> bool {
+        if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+            return false;
+        }
+        let digits = &value[value.iter().position(|&b| b != b'0').unwrap_or(value.len())..];
+        digits.len() < 19 || (digits.len() == 19 && digits <= b"9223372036854775807".as_slice())
+    }
+
+    /// YencService::hasDanglingEscape(): an odd number of `=` in the trailing `[=\r\n]*` run.
+    pub fn dangling_escape(payload: &[u8]) -> bool {
+        let mut escapes = 0usize;
+        for &b in payload.iter().rev() {
+            match b {
+                b'=' => escapes += 1,
+                b'\r' | b'\n' => {}
+                _ => break,
+            }
+        }
+        escapes & 1 == 1
+    }
+
+    /// `/(?<==)[\r\n]/` over the payload slice, folded per chunk so the pair test vectorizes.
+    pub fn split_escape(payload: &[u8]) -> bool {
+        let Some(last) = payload.len().checked_sub(1) else {
+            return false;
+        };
+        payload[..last]
+            .chunks(64)
+            .zip(payload[1..].chunks(64))
+            .any(|(left, right)| {
+                left.iter().zip(right).fold(0u8, |m, (&l, &r)| {
+                    m | (u8::from(l == b'=') & (u8::from(r == b'\r') | u8::from(r == b'\n')))
+                }) != 0
+            })
+    }
+
+    fn yenc_metadata(input: &[u8]) -> Option<[i64; YENC_KEYS]> {
+        summarize(input, <[u8]>::is_empty, |s, c| {
+            let Some(f) = frame(s)? else {
+                return Some(());
+            };
+            let multipart = f.part.is_some()
+                || frame_field(f.header, true, b"part").is_some()
+                || frame_field(f.trailer, false, b"part").is_some();
+            let checksum = frame_field(
+                f.trailer,
+                false,
+                if multipart { b"pcrc32" } else { b"crc32" },
+            );
+            c[2] += 1;
+            c[3] += i64::from(frame_field(f.header, true, b"size").is_some_and(metadata_number));
+            c[4] += i64::from(frame_field(f.header, true, b"line").is_some_and(metadata_number));
+            c[5] += i64::from(multipart);
+            c[6] += i64::from(checksum.is_some_and(|v| {
+                (1..=8).contains(&v.len()) && v.iter().all(u8::is_ascii_hexdigit)
+            }));
+            c[7] += i64::from(dangling_escape(f.payload));
+            c[8] += i64::from(split_escape(f.payload));
+            Some(())
+        })
+    }
+
+    /// # Safety
+    /// `input` must be readable for `len` bytes and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w441_irc_client_line_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, irc_lines) }
+    }
+
+    /// # Safety
+    /// `input` must be readable for `len` bytes and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w441_irc_scraper_bot_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, bot_messages) }
+    }
+
+    /// # Safety
+    /// `input` must be readable for `len` bytes and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w441_xref_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, xrefs) }
+    }
+
+    /// # Safety
+    /// `input` must be readable for `len` bytes and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w441_yenc_article_frame_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, frames) }
+    }
+
+    /// # Safety
+    /// `input` must be readable for `len` bytes and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w441_yenc_metadata_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, yenc_metadata) }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::w431_release_cleaning::{MAX_INPUT, NUL_FRAME};
+        use super::*;
+
+        type Export = unsafe extern "C" fn(*const u8, usize, *mut u8, usize) -> isize;
+
+        fn frame_wire(entries: &[&[u8]]) -> Vec<u8> {
+            let mut wire = (entries.len() as u32).to_le_bytes().to_vec();
+            for e in entries {
+                wire.extend_from_slice(&(e.len() as u32).to_le_bytes());
+            }
+            for e in entries {
+                wire.extend_from_slice(e);
+            }
+            wire
+        }
+
+        fn nul_wire(entries: &[&[u8]]) -> Vec<u8> {
+            let mut wire = (entries.len() as u32).to_le_bytes().to_vec();
+            wire.extend_from_slice(&NUL_FRAME.to_le_bytes());
+            wire.extend_from_slice(&entries.join(&0u8));
+            wire
+        }
+
+        fn run_wire(export: Export, wire: &[u8]) -> isize {
+            let mut out = [0u8; 128];
+            unsafe { export(wire.as_ptr(), wire.len(), out.as_mut_ptr(), out.len()) }
+        }
+
+        fn run(export: Export, entries: &[&[u8]]) -> Vec<i64> {
+            let wire = frame_wire(entries);
+            let mut out = [0u8; 128];
+            let written = unsafe { export(wire.as_ptr(), wire.len(), out.as_mut_ptr(), out.len()) };
+            assert!(written > 0 && written % 8 == 0, "written {written}");
+            let counts: Vec<i64> = out[..written as usize]
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| i64::from_le_bytes(*c))
+                .collect();
+            if !entries.is_empty() && entries.iter().all(|e| !e.contains(&0)) {
+                let nul = nul_wire(entries);
+                let mut again = [0u8; 128];
+                let w = unsafe { export(nul.as_ptr(), nul.len(), again.as_mut_ptr(), again.len()) };
+                assert_eq!(w, written);
+                assert_eq!(out, again, "NUL frame");
+            }
+            counts
+        }
+
+        #[test]
+        fn cleaning_w441_irc_line_counts() {
+            let long = vec![b'x'; MAX_IRC_PAYLOAD + 1];
+            let got = run(
+                nntmux_w441_irc_client_line_batch,
+                &[
+                    b"PING :irc.example.net",
+                    b"PING\t :x\n",
+                    b"PING :",
+                    b":nick!user@host PRIVMSG #pre :\x0304NEW: [DT: x]\x0f",
+                    b":nick!user@host NOTICE #pre :hi",
+                    b"",
+                    &long,
+                ],
+            );
+            assert_eq!(got, vec![7, 1, 2, 1, 1, 1]);
+            assert_eq!(
+                run_wire(
+                    nntmux_w441_irc_client_line_batch,
+                    &frame_wire(&[b"PING :a\0b"])
+                ),
+                -1
+            );
+        }
+
+        #[test]
+        fn cleaning_w441_bot_message_counts() {
+            let got = run(
+                nntmux_w441_irc_scraper_bot_batch,
+                &[
+                    b"NEW: [DT: 2024-01-01 00:00:00] [TT: Some.Title-GRP] [SC: src] [CT: TV] [RQ: 123:alt.binaries.x] [SZ: 1GB] [FL: 10]",
+                    b"upd: [DT: t] [TT: T] [SC: s] [CT: c] [RQ: N/A] [SZ: 1] [FL: 2] [FN: a.nfo]",
+                    b"NUK: [DT: t] [TT: T] [SC: s] [CT: c] [RQ: N/A] [SZ: 1] [FL: 2] [NUKED: bad]",
+                    b"NUK: [DT: t] [TT: T] [SC: s] [CT: c] [RQ: N/A] [SZ: 1] [FL: 2] [nuke: odd]",
+                    b"NEW: nothing",
+                    b"",
+                ],
+            );
+            assert_eq!(got, vec![6, 1, 4, 1, 1, 2, 1, 1]);
+        }
+
+        #[test]
+        fn cleaning_w441_xref_counts() {
+            let got = run(
+                nntmux_w441_xref_batch,
+                &[
+                    b"news.example.com alt.binaries.teevee:123 alt.binaries.hdtv:5",
+                    b"alt.binaries.teevee alt.binaries.teevee:9",
+                    b"0",
+                    b"",
+                    b"junk",
+                    b"alt.binaer.x",
+                ],
+            );
+            assert_eq!(got, vec![6, 2, 3, 2, 1, 2]);
+        }
+
+        #[test]
+        fn cleaning_w441_frame_and_metadata_counts() {
+            let single: &[u8] =
+                b"=ybegin line=128 size=3 name=a b.bin\r\nabc\r\n=yend size=3 crc32=352441C2\r\n";
+            let multi: &[u8] = b"=ybegin part=1 total=2 line=128 size=9 name=x\r\n=ypart begin=1 end=3\r\nab=\r\n=yend size=3 part=1 pcrc32=zz\r\n";
+            let header_only: &[u8] =
+                b"=ybegin line=1 size=99999999999999999999 name=n part=4\nx\n=yend\n";
+            let got = run(
+                nntmux_w441_yenc_article_frame_batch,
+                &[single, multi, header_only, b"not yenc", b""],
+            );
+            assert_eq!(got, vec![5, 1, 3, 1, 1, 1, 1]);
+            let got = run(
+                nntmux_w441_yenc_metadata_batch,
+                &[single, multi, header_only, b"not yenc", b""],
+            );
+            assert_eq!(got, vec![5, 1, 3, 2, 3, 1, 1, 1, 1]);
+        }
+
+        #[test]
+        fn cleaning_w441_field_and_number_helpers_match_php() {
+            assert_eq!(frame_field(b" a=1 A=2\r\r", false, b"a"), Some(&b"2"[..]));
+            assert_eq!(frame_field(b"name=x part=1", true, b"part"), None);
+            assert_eq!(frame_field(b" NAME=x y", true, b"name"), Some(&b"x y"[..]));
+            assert_eq!(frame_field(b"1a=2 b-c=3", false, b"b-c"), Some(&b"3"[..]));
+            assert_eq!(frame_field(b"ab c=1", false, b"ab"), None);
+            assert!(metadata_number(b"0009223372036854775807"));
+            assert!(!metadata_number(b"9223372036854775808"));
+            assert!(metadata_number(b"000"));
+            assert!(!metadata_number(b"") || !metadata_number(b"1 "));
+            assert!(dangling_escape(b"ab=\r\n"));
+            assert!(!dangling_escape(b"a==\n"));
+            assert!(split_escape(b"a=\nb"));
+            assert!(!split_escape(b"=a\n="));
+        }
+
+        #[test]
+        fn cleaning_w441_rejects_malformed_frames_without_writing() {
+            let exports: [Export; 5] = [
+                nntmux_w441_irc_client_line_batch,
+                nntmux_w441_irc_scraper_bot_batch,
+                nntmux_w441_xref_batch,
+                nntmux_w441_yenc_article_frame_batch,
+                nntmux_w441_yenc_metadata_batch,
+            ];
+            let good = frame_wire(&[b"entry"]);
+            let mut trailing = good.clone();
+            trailing.push(b'x');
+            let bad: [&[u8]; 5] = [
+                b"",
+                b"\x01\0\0",
+                b"\x01\0\0\0\x09\0\0\0abc",
+                &trailing,
+                b"\x00\0\0\0\xff\xff\xff\xff",
+            ];
+            for export in exports {
+                let mut out = [0x5au8; 128];
+                for wire in bad {
+                    let r =
+                        unsafe { export(wire.as_ptr(), wire.len(), out.as_mut_ptr(), out.len()) };
+                    assert_eq!(r, -1);
+                }
+                let r = unsafe { export(std::ptr::null(), 0, out.as_mut_ptr(), out.len()) };
+                assert_eq!(r, -1);
+                let r =
+                    unsafe { export(good.as_ptr(), MAX_INPUT + 1, out.as_mut_ptr(), out.len()) };
+                assert_eq!(r, -1);
+                let required = unsafe { export(good.as_ptr(), good.len(), out.as_mut_ptr(), 8) };
+                assert!(required < -8);
+                assert_eq!(out, [0x5a; 128]);
+                let r = unsafe {
+                    export(
+                        good.as_ptr(),
+                        good.len(),
+                        out.as_mut_ptr(),
+                        (-required) as usize,
+                    )
+                };
+                assert_eq!(r, -required);
+            }
         }
     }
 }

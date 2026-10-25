@@ -92,10 +92,10 @@ class YencService
 
         $part = new YencPart(
             name: trim($frame->header['name']),
-            size: $this->metadataNumber($frame->header['size']) ?? 0,
-            part: isset($frame->header['part']) ? $this->metadataNumber($frame->header['part']) : null,
-            begin: isset($frame->part['begin']) ? $this->metadataNumber($frame->part['begin']) : null,
-            end: isset($frame->part['end']) ? $this->metadataNumber($frame->part['end']) : null,
+            size: self::metadataNumber($frame->header['size']) ?? 0,
+            part: isset($frame->header['part']) ? self::metadataNumber($frame->header['part']) : null,
+            begin: isset($frame->part['begin']) ? self::metadataNumber($frame->part['begin']) : null,
+            end: isset($frame->part['end']) ? self::metadataNumber($frame->part['end']) : null,
         );
 
         return [$decoded, $part];
@@ -213,8 +213,8 @@ class YencService
 
         return [
             'name' => $frame->header['name'],
-            'size' => $this->metadataNumber($frame->header['size']),
-            'line' => $this->metadataNumber($frame->header['line']),
+            'size' => self::metadataNumber($frame->header['size']),
+            'line' => self::metadataNumber($frame->header['line']),
             'crc32' => isset($frame->trailer['crc32']) ? strtoupper($frame->trailer['crc32']) : null,
         ];
     }
@@ -227,7 +227,7 @@ class YencService
     /** @return array{decoded: string, crc32: string|null} */
     private function decodeFramePayload(string $text, ArticleFrame $frame, bool $strict = false, bool $withCrc = false): array
     {
-        if ($this->hasDanglingEscape($text, $frame->payloadOffset, $frame->payloadLength)) {
+        if (self::hasDanglingEscape($text, $frame->payloadOffset, $frame->payloadLength)) {
             if ($strict) {
                 throw new RuntimeException('Unmatched yEnc escape marker. The file is probably corrupt.');
             }
@@ -283,7 +283,7 @@ class YencService
         return hash('crc32b', $decoded);
     }
 
-    private function hasDanglingEscape(string $source, int $payloadOffset, int $payloadLength): bool
+    private static function hasDanglingEscape(string $source, int $payloadOffset, int $payloadLength): bool
     {
         $count = 0;
         for ($offset = $payloadOffset + $payloadLength - 1; $offset >= $payloadOffset; $offset--) {
@@ -300,7 +300,7 @@ class YencService
     /** @param array<string, string> $fields */
     private function number(array $fields, string $key): int
     {
-        $number = $this->metadataNumber($fields[$key] ?? '');
+        $number = self::metadataNumber($fields[$key] ?? '');
         if ($number === null) {
             throw new RuntimeException("Invalid or missing yEnc {$key}.");
         }
@@ -308,7 +308,7 @@ class YencService
         return $number;
     }
 
-    private function metadataNumber(string $value): ?int
+    private static function metadataNumber(string $value): ?int
     {
         if ($value === '' || ! ctype_digit($value)) {
             return null;
@@ -320,5 +320,97 @@ class YencService
         }
 
         return (int) $value;
+    }
+
+    /** Enabled: paired common/uncommon mean and p99 gains reach 1.5x in all nine runs (min 3.53x; see the W44 parity test). */
+    public const bool W441_RUST_FFI_DEFAULT = true;
+
+    public const string W441_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w441_yenc_metadata_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private const array W441_SUMMARY_KEYS = ['total_articles', 'empty_article_count', 'frame_count', 'valid_size_count', 'valid_line_count', 'multipart_count', 'valid_checksum_count', 'dangling_escape_count', 'split_escape_count'];
+
+    private static ?bool $w441UseRustFfi = null;
+
+    private static FFI|false|null $w441Ffi = null;
+
+    /** Null restores the benchmark default. */
+    public static function useW441RustFfi(?bool $enable = true): void
+    {
+        self::$w441UseRustFfi = $enable;
+    }
+
+    public static function usesW441RustFfi(): bool
+    {
+        return self::$w441UseRustFfi ?? self::W441_RUST_FFI_DEFAULT;
+    }
+
+    /** Restores the benchmark default and drops the cached library handle; earlier toggles are untouched. */
+    public static function resetW441RustFfi(): void
+    {
+        self::$w441UseRustFfi = null;
+        self::$w441Ffi = null;
+    }
+
+    /**
+     * Summarizes the decode() pre-checks of article texts framed by ArticleFrame::parsePhp(): frames, a
+     * metadataNumber() header size and line, multipart frames, a well-formed checksum of the kind decode()
+     * selects (pcrc32 for multipart, crc32 otherwise), and payloads with a dangling escape or a line
+     * ending split from its escape marker.
+     * Entries come from strings, integers, or the first non-null body, text array field; other values
+     * (including objects) count as empty entries.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeArticleMetadataBatch(array $rows): array
+    {
+        return self::usesW441RustFfi() ? self::summarizeArticleMetadataBatchNative($rows) : self::summarizeArticleMetadataBatchPhp($rows);
+    }
+
+    /**
+     * Rust summary; falls back to PHP when the library or input frame is unusable.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeArticleMetadataBatchNative(array $rows): array
+    {
+        $values = XrefService::w441Invoke(self::$w441Ffi, self::W441_FFI_CDEF, 'nntmux_w441_yenc_metadata_batch', $rows, ['body', 'text'], \count(self::W441_SUMMARY_KEYS));
+
+        return $values === null ? self::summarizeArticleMetadataBatchPhp($rows) : array_combine(self::W441_SUMMARY_KEYS, $values);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeArticleMetadataBatchPhp(array $rows): array
+    {
+        $summary = array_fill_keys(self::W441_SUMMARY_KEYS, 0);
+        foreach (XrefService::w441Entries($rows, ['body', 'text']) as $entry) {
+            $summary['total_articles']++;
+            if ($entry === '') {
+                $summary['empty_article_count']++;
+
+                continue;
+            }
+            $frame = ArticleFrame::parsePhp($entry);
+            if ($frame === null) {
+                continue;
+            }
+            $multipart = isset($frame->header['part']) || isset($frame->trailer['part']) || $frame->part !== null;
+            $checksum = $frame->trailer[$multipart ? 'pcrc32' : 'crc32'] ?? null;
+            $summary['frame_count']++;
+            $summary['valid_size_count'] += (int) (self::metadataNumber($frame->header['size']) !== null);
+            $summary['valid_line_count'] += (int) (self::metadataNumber($frame->header['line']) !== null);
+            $summary['multipart_count'] += (int) $multipart;
+            $summary['valid_checksum_count'] += (int) ($checksum !== null && preg_match('/\A[0-9a-f]{1,8}\z/i', $checksum) === 1);
+            $summary['dangling_escape_count'] += (int) self::hasDanglingEscape($entry, $frame->payloadOffset, $frame->payloadLength);
+            $summary['split_escape_count'] += (int) (preg_match('/(?<==)[\r\n]/', substr($entry, $frame->payloadOffset, $frame->payloadLength)) === 1);
+        }
+
+        return $summary;
     }
 }
