@@ -40151,3 +40151,560 @@ pub mod system_temp_user_inactivity_stats_series_w513 {
         }
     }
 }
+
+/// Wave 52.3: whole-batch helpers for `ReleaseFileManager`, `ReleaseFilesArchiveFallback`,
+/// `ReleaseProcessor`, `ReleaseSearchSyncCoordinator` and `UsenetDownloadService`. Each export
+/// takes NUL-joined strings plus packed little-endian `i64`s and writes fixed-width `i64` words,
+/// so PHP crosses FFI once per batch. The per-item rules reuse the matchers in
+/// [`crate::additional`] that the per-string `*Native` helpers already exercise.
+pub mod release_file_archive_processor_sync_usenet_w523 {
+    use crate::additional::{
+        nntmux_release_contains_video_pattern, nntmux_release_has_usable_sample_filename,
+        nntmux_release_is_auxiliary_nzb_subject, nntmux_release_subject_matches_release,
+        nntmux_rfaf_extracted_file_suffix, nntmux_rfm_normalize_file_size,
+        rfaf_is_archive_image_name, rfm_is_mapped_archive_name, rfm_is_mapped_video_name,
+        rfm_is_nfo_filename,
+    };
+    use std::ptr;
+
+    /// Declines the batch to PHP.
+    pub const DECLINE: isize = -1;
+
+    /// Upper bound on `count`, so a corrupt count never drives a huge allocation.
+    const MAX_COUNT: usize = 1 << 24;
+
+    type Batch = fn(&[u8], &[i64], usize) -> Option<Vec<i64>>;
+
+    /// Splits `blob` on NUL into exactly `count` pieces (an empty blob holds no pieces).
+    fn split_exact(blob: &[u8], count: usize) -> Option<Vec<&[u8]>> {
+        if count == 0 {
+            return blob.is_empty().then(Vec::new);
+        }
+        let mut parts = Vec::with_capacity(count);
+        for part in blob.split(|&b| b == 0) {
+            if parts.len() == count {
+                return None;
+            }
+            parts.push(part);
+        }
+        (parts.len() == count).then_some(parts)
+    }
+
+    /// Reads the whole buffer as little-endian `i64`s.
+    fn read_ints(bytes: &[u8]) -> Option<Vec<i64>> {
+        let (chunks, rest) = bytes.as_chunks::<8>();
+        rest.is_empty()
+            .then(|| chunks.iter().map(|c| i64::from_le_bytes(*c)).collect())
+    }
+
+    /// `ReleaseFileManager::w52FileNameSizeBatch()`: `count` names then `count` sizes. Per row
+    /// `[flags, size]` (flags 1 NFO name, 2 valid size; size `-1` when invalid), then the two
+    /// flag counts.
+    fn file_name_sizes(blob: &[u8], ints: &[i64], count: usize) -> Option<Vec<i64>> {
+        if !ints.is_empty() {
+            return None;
+        }
+        let parts = split_exact(blob, count.checked_mul(2)?)?;
+        let (names, sizes) = parts.split_at(count);
+        let mut out = Vec::with_capacity(count * 2 + 2);
+        let (mut nfo, mut valid) = (0i64, 0i64);
+        for (name, size) in names.iter().zip(sizes) {
+            let is_nfo = rfm_is_nfo_filename(name);
+            let mut value = 0i64;
+            let status =
+                unsafe { nntmux_rfm_normalize_file_size(size.as_ptr(), size.len(), &mut value) };
+            if status < 0 {
+                return None;
+            }
+            let has_size = status == 1;
+            nfo += i64::from(is_nfo);
+            valid += i64::from(has_size);
+            out.push(i64::from(is_nfo) | (i64::from(has_size) << 1));
+            out.push(if has_size { value } else { -1 });
+        }
+        out.extend([nfo, valid]);
+        Some(out)
+    }
+
+    /// `ReleaseFilesArchiveFallback::w52ArchiveEntryBatch()`: per name `image | suffix_len << 1`,
+    /// where `suffix_len` is the byte length of `extractedFileSuffix()`, then the image count and
+    /// the count of names with a suffix.
+    fn archive_entries(blob: &[u8], ints: &[i64], count: usize) -> Option<Vec<i64>> {
+        if !ints.is_empty() {
+            return None;
+        }
+        let names = split_exact(blob, count)?;
+        let mut out = Vec::with_capacity(count + 2);
+        let (mut images, mut suffixed) = (0i64, 0i64);
+        for name in names {
+            let image = rfaf_is_archive_image_name(name);
+            // A null output tracks the suffix length without writing; it is never `.` alone.
+            let written = unsafe {
+                nntmux_rfaf_extracted_file_suffix(name.as_ptr(), name.len(), ptr::null_mut(), 0)
+            };
+            if written == DECLINE {
+                return None;
+            }
+            let suffix = written.unsigned_abs() as i64;
+            images += i64::from(image);
+            suffixed += i64::from(suffix > 0);
+            out.push(i64::from(image) | (suffix << 1));
+        }
+        out.extend([images, suffixed]);
+        Some(out)
+    }
+
+    /// `ReleaseProcessor::w52SubjectClassBatch()`: the release name then `count` subjects. Per
+    /// subject 1 video pattern, 2 usable sample, 4 auxiliary support file and 8 release-name
+    /// match (default regexes), then the four flag counts.
+    fn subject_classes(blob: &[u8], ints: &[i64], count: usize) -> Option<Vec<i64>> {
+        if !ints.is_empty() {
+            return None;
+        }
+        let parts = split_exact(blob, count.checked_add(1)?)?;
+        let (release, subjects) = (parts[0], &parts[1..]);
+        let mut out = Vec::with_capacity(count + 4);
+        let mut totals = [0i64; 4];
+        for subject in subjects {
+            let (p, n) = (subject.as_ptr(), subject.len());
+            let statuses = unsafe {
+                [
+                    nntmux_release_contains_video_pattern(p, n, ptr::null(), 0),
+                    nntmux_release_has_usable_sample_filename(p, n),
+                    nntmux_release_is_auxiliary_nzb_subject(p, n, ptr::null(), 0),
+                    nntmux_release_subject_matches_release(p, n, release.as_ptr(), release.len()),
+                ]
+            };
+            let mut flags = 0i64;
+            for (bit, status) in statuses.into_iter().enumerate() {
+                if !matches!(status, 0 | 1) {
+                    return None;
+                }
+                totals[bit] += i64::from(status);
+                flags |= i64::from(status) << bit;
+            }
+            out.push(flags);
+        }
+        out.extend(totals);
+        Some(out)
+    }
+
+    /// `ReleaseSearchSyncCoordinator::w52DecideSequenceBatch()`: ints are
+    /// `[coalesce, has_scope, scope, pending, ops.., release_ids..]`. Folds `decidePhp()` over
+    /// the events; per event `[flags, sync]` (flags 1 pending, 2 scope set, 4 sync emitted; sync
+    /// 0 when none), then the final `[has_scope, scope, pending]`. Unknown operations decline.
+    fn decide_sequence(blob: &[u8], ints: &[i64], count: usize) -> Option<Vec<i64>> {
+        if !blob.is_empty() || ints.len() != count.checked_mul(2)?.checked_add(4)? {
+            return None;
+        }
+        let coalesce = ints[0] != 0;
+        let mut scope = (ints[1] != 0).then_some(ints[2]);
+        let mut pending = ints[3] != 0;
+        let (ops, ids) = ints[4..].split_at(count);
+        let mut out = Vec::with_capacity(count * 2 + 3);
+        for (&op, &id) in ops.iter().zip(ids) {
+            let owned = coalesce && scope == Some(id);
+            let sync = match op {
+                0 => {
+                    if coalesce {
+                        scope = Some(id);
+                        pending = false;
+                    }
+                    None
+                }
+                1 if owned => {
+                    pending = true;
+                    None
+                }
+                1 => Some(id),
+                2 => {
+                    if owned {
+                        pending = false;
+                    }
+                    None
+                }
+                3 if coalesce => {
+                    let sync = if pending { scope } else { None };
+                    scope = None;
+                    pending = false;
+                    sync
+                }
+                3 => None,
+                _ => return None,
+            };
+            out.push(
+                i64::from(pending)
+                    | (i64::from(scope.is_some()) << 1)
+                    | (i64::from(sync.is_some()) << 2),
+            );
+            out.push(sync.unwrap_or(0));
+        }
+        out.extend([
+            i64::from(scope.is_some()),
+            scope.unwrap_or(0),
+            i64::from(pending),
+        ]);
+        Some(out)
+    }
+
+    /// `UsenetDownloadService::w52MappedArticleKindBatch()`: per name 1 mapped archive and 2
+    /// default-regex main video, then the archive and video counts.
+    fn mapped_article_kinds(blob: &[u8], ints: &[i64], count: usize) -> Option<Vec<i64>> {
+        if !ints.is_empty() {
+            return None;
+        }
+        let names = split_exact(blob, count)?;
+        let mut out = Vec::with_capacity(count + 2);
+        let (mut archives, mut videos) = (0i64, 0i64);
+        for name in names {
+            let archive = rfm_is_mapped_archive_name(name);
+            let video = rfm_is_mapped_video_name(name);
+            archives += i64::from(archive);
+            videos += i64::from(video);
+            out.push(i64::from(archive) | (i64::from(video) << 1));
+        }
+        out.extend([archives, videos]);
+        Some(out)
+    }
+
+    /// Validates the buffers, runs `body` without unwinding into PHP and copies its words.
+    /// Returns the word count, `-needed` when `out_cap` is too small, or [`DECLINE`].
+    ///
+    /// # Safety
+    /// Non-null pointers must be valid for their lengths (`out` for `out_cap` `i64`s).
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run(
+        blob: *const u8,
+        blob_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+        body: Batch,
+    ) -> isize {
+        if out.is_null()
+            || (blob.is_null() && blob_len != 0)
+            || (ints.is_null() && ints_len != 0)
+            || blob_len > isize::MAX as usize
+            || ints_len > isize::MAX as usize
+            || out_cap > isize::MAX as usize / 8
+            || count > MAX_COUNT
+        {
+            return DECLINE;
+        }
+        let blob: &[u8] = if blob.is_null() {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(blob, blob_len) }
+        };
+        let ints: &[u8] = if ints.is_null() {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(ints, ints_len) }
+        };
+        let result = std::panic::catch_unwind(|| body(blob, &read_ints(ints)?, count));
+        let Ok(Some(values)) = result else {
+            return DECLINE;
+        };
+        if values.len() > out_cap {
+            return -(values.len() as isize);
+        }
+        unsafe {
+            ptr::copy_nonoverlapping(values.as_ptr(), out, values.len());
+        }
+        values.len() as isize
+    }
+
+    macro_rules! w523_export {
+        ($(#[$doc:meta])* $name:ident => $body:ident) => {
+            $(#[$doc])*
+            ///
+            /// # Safety
+            /// As for [`run`].
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                blob: *const u8,
+                blob_len: usize,
+                ints: *const u8,
+                ints_len: usize,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                unsafe { run(blob, blob_len, ints, ints_len, count, out, out_cap, $body) }
+            }
+        };
+    }
+
+    w523_export!(
+        /// `ReleaseFileManager::w52FileNameSizeBatch()`.
+        nntmux_w523_release_file_name_size_batch => file_name_sizes
+    );
+    w523_export!(
+        /// `ReleaseFilesArchiveFallback::w52ArchiveEntryBatch()`.
+        nntmux_w523_archive_entry_batch => archive_entries
+    );
+    w523_export!(
+        /// `ReleaseProcessor::w52SubjectClassBatch()`.
+        nntmux_w523_release_subject_class_batch => subject_classes
+    );
+    w523_export!(
+        /// `ReleaseSearchSyncCoordinator::w52DecideSequenceBatch()`.
+        nntmux_w523_search_sync_decide_batch => decide_sequence
+    );
+    w523_export!(
+        /// `UsenetDownloadService::w52MappedArticleKindBatch()`.
+        nntmux_w523_mapped_article_kind_batch => mapped_article_kinds
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn packed(values: &[i64]) -> Vec<u8> {
+            values.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+
+        type Export = unsafe extern "C" fn(
+            *const u8,
+            usize,
+            *const u8,
+            usize,
+            usize,
+            *mut i64,
+            usize,
+        ) -> isize;
+
+        fn call(f: Export, blob: &[u8], ints: &[i64], count: usize) -> Result<Vec<i64>, isize> {
+            let ints = packed(ints);
+            let mut out = vec![0i64; 4096];
+            let written = unsafe {
+                f(
+                    blob.as_ptr(),
+                    blob.len(),
+                    ints.as_ptr(),
+                    ints.len(),
+                    count,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            if written < 0 {
+                return Err(written);
+            }
+            out.truncate(written as usize);
+            Ok(out)
+        }
+
+        #[test]
+        fn w523_split_exact_counts_pieces() {
+            assert_eq!(split_exact(b"", 0), Some(vec![]));
+            assert_eq!(split_exact(b"x", 0), None);
+            assert_eq!(split_exact(b"", 1), Some(vec![&b""[..]]));
+            assert_eq!(split_exact(b"a\0b", 2), Some(vec![&b"a"[..], &b"b"[..]]));
+            assert_eq!(split_exact(b"a\0b\0c", 2), None);
+            assert_eq!(split_exact(b"a", 2), None);
+        }
+
+        #[test]
+        fn w523_file_name_sizes_flag_nfo_and_sizes() {
+            let out = call(
+                nntmux_w523_release_file_name_size_batch,
+                b"a.nfo\0movie.mkv\0README.txt\0x\x0012\0abc\x00007\0",
+                &[],
+                4,
+            )
+            .unwrap();
+            assert_eq!(out, [3, 12, 0, -1, 3, 7, 0, -1, 2, 2]);
+            assert_eq!(
+                call(nntmux_w523_release_file_name_size_batch, b"", &[], 0).unwrap(),
+                [0, 0]
+            );
+            assert_eq!(
+                call(
+                    nntmux_w523_release_file_name_size_batch,
+                    b"a\x009223372036854775808",
+                    &[],
+                    1
+                )
+                .unwrap(),
+                [0, -1, 0, 0]
+            );
+            assert_eq!(
+                call(nntmux_w523_release_file_name_size_batch, b"a\0b\0c", &[], 1),
+                Err(DECLINE)
+            );
+        }
+
+        #[test]
+        fn w523_archive_entries_report_image_and_suffix() {
+            let out = call(
+                nntmux_w523_archive_entry_batch,
+                b"cover.JPG\0dir/x.tar.gz\0noext\0trail.\0a.webp\n",
+                &[],
+                5,
+            )
+            .unwrap();
+            assert_eq!(out, [1 | 4 << 1, 3 << 1, 0, 0, 1 | 6 << 1, 2, 3]);
+        }
+
+        #[test]
+        fn w523_subject_classes_use_default_patterns() {
+            let out = call(
+                nntmux_w523_release_subject_class_batch,
+                b"Show.S01E01-GRP\0\"Show.S01E01-GRP.mkv\" yEnc (1/50)\0\"sample.mkv\" yEnc\0\"x.par2\"\0\"x.rar\"",
+                &[],
+                4,
+            )
+            .unwrap();
+            assert_eq!(out.len(), 8);
+            assert_eq!(out[0] & 1, 1);
+            assert_eq!(out[0] & 8, 8);
+            assert_eq!(out[1] & 2, 2);
+            assert_eq!(out[2] & 4, 4);
+            assert_eq!(out[3] & 3, 0);
+        }
+
+        #[test]
+        fn w523_decide_sequence_folds_the_state_machine() {
+            // Coalescing: begin 7, request 7 (pending), request 9 (sync 9), discard 7, request 7, finish (sync 7).
+            let out = call(
+                nntmux_w523_search_sync_decide_batch,
+                b"",
+                &[1, 0, 0, 0, 0, 1, 1, 2, 1, 3, 7, 7, 9, 7, 7, 0],
+                6,
+            )
+            .unwrap();
+            assert_eq!(out, [2, 0, 3, 0, 7, 9, 2, 0, 3, 0, 4, 7, 0, 0, 0]);
+            // Without coalescing every request syncs and the scope is carried untouched.
+            let out = call(
+                nntmux_w523_search_sync_decide_batch,
+                b"",
+                &[0, 1, 5, 1, 0, 1, 3, 4, 4, 4],
+                3,
+            )
+            .unwrap();
+            assert_eq!(out, [3, 0, 7, 4, 3, 0, 1, 5, 1]);
+            assert_eq!(
+                call(
+                    nntmux_w523_search_sync_decide_batch,
+                    b"",
+                    &[1, 0, 0, 0, 4, 1],
+                    1
+                ),
+                Err(DECLINE)
+            );
+            assert_eq!(
+                call(
+                    nntmux_w523_search_sync_decide_batch,
+                    b"",
+                    &[1, 0, 0, 0, 0],
+                    1
+                ),
+                Err(DECLINE)
+            );
+        }
+
+        #[test]
+        fn w523_mapped_article_kinds_match_the_names() {
+            let out = call(
+                nntmux_w523_mapped_article_kind_batch,
+                b"a.rar\0a.7z.001\0movie.MKV\0movie.sample.mkv\0a.txt",
+                &[],
+                5,
+            )
+            .unwrap();
+            assert_eq!(out, [1, 1, 2, 0, 0, 2, 1]);
+        }
+
+        #[test]
+        fn w523_exports_guard_pointers_and_capacity() {
+            let mut out = [0i64; 16];
+            let o = out.as_mut_ptr();
+            let exports: [Export; 5] = [
+                nntmux_w523_release_file_name_size_batch,
+                nntmux_w523_archive_entry_batch,
+                nntmux_w523_release_subject_class_batch,
+                nntmux_w523_search_sync_decide_batch,
+                nntmux_w523_mapped_article_kind_batch,
+            ];
+            for f in exports {
+                unsafe {
+                    assert_eq!(
+                        f(b"x".as_ptr(), 1, ptr::null(), 0, 1, ptr::null_mut(), 16),
+                        DECLINE
+                    );
+                    assert_eq!(f(ptr::null(), 1, ptr::null(), 0, 1, o, 16), DECLINE);
+                    assert_eq!(f(b"x".as_ptr(), 1, ptr::null(), 8, 1, o, 16), DECLINE);
+                    assert_eq!(
+                        f(ptr::null(), 0, ptr::null(), 0, MAX_COUNT + 1, o, 16),
+                        DECLINE
+                    );
+                    assert_eq!(
+                        f(b"x".as_ptr(), 1, b"1234567".as_ptr(), 7, 1, o, 16),
+                        DECLINE
+                    );
+                    assert_eq!(
+                        f(b"x".as_ptr(), 1, ptr::null(), 0, 1, o, usize::MAX),
+                        DECLINE
+                    );
+                }
+            }
+            unsafe {
+                assert_eq!(
+                    nntmux_w523_mapped_article_kind_batch(ptr::null(), 0, ptr::null(), 0, 0, o, 16),
+                    2
+                );
+                assert_eq!(
+                    nntmux_w523_mapped_article_kind_batch(
+                        b"a".as_ptr(),
+                        1,
+                        ptr::null(),
+                        0,
+                        1,
+                        o,
+                        2
+                    ),
+                    -3
+                );
+                assert_eq!(
+                    nntmux_w523_archive_entry_batch(
+                        b"a".as_ptr(),
+                        1,
+                        packed(&[1]).as_ptr(),
+                        8,
+                        1,
+                        o,
+                        16
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w523_search_sync_decide_batch(
+                        b"x".as_ptr(),
+                        1,
+                        ptr::null(),
+                        0,
+                        0,
+                        o,
+                        16
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w523_release_subject_class_batch(
+                        ptr::null(),
+                        0,
+                        ptr::null(),
+                        0,
+                        0,
+                        o,
+                        16
+                    ),
+                    4
+                );
+            }
+        }
+    }
+}

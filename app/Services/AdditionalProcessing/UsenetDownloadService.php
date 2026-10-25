@@ -13,6 +13,7 @@ use App\Services\Yenc\YencPart;
 use App\Support\RustPipelineLibrary;
 use Exception;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\Log;
 
 /**
@@ -835,5 +836,121 @@ class UsenetDownloadService
         $size = $outcome['bytes'] ?? null;
 
         return [\is_string($status) ? $status : null, \is_int($size) ? $size : 0];
+    }
+
+    /** Enabled: three paired runs cleared every 1.5x gate (common mean 4.22-4.42x, p99 3.69-3.95x; uncommon mean 3.78-3.92x, p99 3.08-3.87x); see RustReleaseFileArchiveProcessorSyncUsenetW52ParityTest. */
+    private const bool W52_RUST_FFI_DEFAULT = true;
+
+    public const string W52_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w523_mapped_article_kind_batch(const char *blob, size_t blob_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    private static ?bool $useW52RustFfi = null;
+
+    private static FFI|false|null $w52Ffi = null;
+
+    private static ?CData $w52Out = null;
+
+    private static int $w52OutCap = 0;
+
+    public static function usesW52RustFfi(): bool
+    {
+        return self::$useW52RustFfi ?? self::W52_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 52 Rust path forced on or off, then restores the previous setting. */
+    public static function withW52RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$useW52RustFfi;
+        self::$useW52RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$useW52RustFfi = $previous;
+        }
+    }
+
+    /**
+     * Classifies PAR2-mapped article names: one word per name with 1 isMappedArchiveNamePhp() and
+     * 2 isMappedVideoNamePhp($name, $videoFileRegex), then the archive and video counts. Rust
+     * handles the default video regex; any other regex stays on PHP.
+     *
+     * @param  array<int, string>  $names
+     * @return list<int>
+     */
+    public static function w52MappedArticleKindBatch(array $names, string $videoFileRegex = self::DEFAULT_VIDEO_FILE_REGEX): array
+    {
+        return self::usesW52RustFfi() ? self::w52MappedArticleKindBatchNative($names, $videoFileRegex) : self::w52MappedArticleKindBatchPhp($names, $videoFileRegex);
+    }
+
+    /**
+     * @param  array<int, string>  $names
+     * @return list<int>
+     */
+    public static function w52MappedArticleKindBatchNative(array $names, string $videoFileRegex = self::DEFAULT_VIDEO_FILE_REGEX): array
+    {
+        if ($videoFileRegex !== self::DEFAULT_VIDEO_FILE_REGEX) {
+            return self::w52MappedArticleKindBatchPhp($names, $videoFileRegex);
+        }
+        $count = \count($names);
+
+        return self::w52Invoke(implode("\0", $names), '', $count, $count + 2)
+            ?? self::w52MappedArticleKindBatchPhp($names, $videoFileRegex);
+    }
+
+    /**
+     * @param  array<int, string>  $names
+     * @return list<int>
+     */
+    public static function w52MappedArticleKindBatchPhp(array $names, string $videoFileRegex = self::DEFAULT_VIDEO_FILE_REGEX): array
+    {
+        $out = [];
+        $archives = 0;
+        $videos = 0;
+        foreach ($names as $name) {
+            $name = (string) $name;
+            $archive = self::isMappedArchiveNamePhp($name);
+            $video = self::isMappedVideoNamePhp($name, $videoFileRegex);
+            $archives += (int) $archive;
+            $videos += (int) $video;
+            $out[] = (int) $archive | ($video ? 2 : 0);
+        }
+        $out[] = $archives;
+        $out[] = $videos;
+
+        return $out;
+    }
+
+    /**
+     * Calls the Wave 52 export with NUL-joined strings and packed `i64` integers. Null when the
+     * library is missing, the call declines (for example a string holding a NUL byte) or it writes
+     * more than $cap words, so the caller falls back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w52Invoke(string $blob, string $ints, int $count, int $cap): ?array
+    {
+        self::$w52Ffi ??= RustPipelineLibrary::resolveDomain('categorize_w52', self::W52_FFI_CDEF) ?? false;
+        $ffi = self::$w52Ffi;
+        if ($ffi === false) {
+            return null;
+        }
+        try {
+            if (self::$w52Out === null || self::$w52OutCap < $cap) {
+                self::$w52OutCap = max(1024, $cap * 2);
+                self::$w52Out = $ffi->new('int64_t['.self::$w52OutCap.']');
+            }
+            // @phpstan-ignore method.notFound (Declared by W52_FFI_CDEF.)
+            $written = $ffi->nntmux_w523_mapped_article_kind_batch($blob, \strlen($blob), $ints, \strlen($ints), $count, self::$w52Out, self::$w52OutCap);
+            if (! \is_int($written) || $written <= 0 || $written > $cap) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string(self::$w52Out, $written * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (\Throwable) {
+            return null;
+        }
     }
 }
