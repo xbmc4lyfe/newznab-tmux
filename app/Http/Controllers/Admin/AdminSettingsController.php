@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Http\Controllers\Admin;
 
+use App\Console\Commands\NntmuxSearchReconcile;
 use App\Enums\ConfigurationDomain;
 use App\Http\Controllers\BasePageController;
 use App\Http\Requests\Admin\UpdateDomainConfigurationRequest;
@@ -23,6 +24,14 @@ final class AdminSettingsController extends BasePageController
 {
     // Keep PHP as the production default until the Rust performance gate passes.
     private static bool $useRustFfi = false;
+
+    /**
+     * Rust stays opt-in for the Wave 39.5 summary: the FFI round trip misses the 1.5x gate; see
+     * tests/Unit/RustAdminSettingsMonitoringLogsReconcileW39ParityTest.php.
+     */
+    public const bool W395_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useW395RustFfi = null;
 
     public static function setUseRustFfi(?bool $useRustFfi): void
     {
@@ -143,6 +152,103 @@ final class AdminSettingsController extends BasePageController
         return is_array($result) && isset($result['attributes'], $result['movie'], $result['tmux'])
             && is_array($result['attributes']) && is_array($result['movie']) && is_array($result['tmux'])
             ? $result : self::partitionAttributesPhp($attributes, $postProcessing);
+    }
+
+    public static function useW395RustFfi(?bool $use = true): void
+    {
+        self::$useW395RustFfi = $use;
+    }
+
+    public static function usesW395RustFfi(): bool
+    {
+        return self::$useW395RustFfi ?? self::W395_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW395RustFfi(): void
+    {
+        self::$useW395RustFfi = null;
+    }
+
+    /**
+     * Compares submitted settings with the stored ones. Values compare as PHP strings (null and false
+     * become '', arrays and objects their JSON). Submitted keys missing from the current settings
+     * count as unknown; submitted values that are blank after trim() count as empty.
+     *
+     * @param  array<array-key, mixed>  $currentSettings
+     * @param  array<array-key, mixed>  $submittedSettings
+     * @return array{total: int, changed: int, unchanged: int, unknown: int, empty: int}
+     */
+    public static function summarizeSettingsDiff(array $currentSettings, array $submittedSettings): array
+    {
+        return self::usesW395RustFfi()
+            ? self::summarizeSettingsDiffNative($currentSettings, $submittedSettings)
+            : self::summarizeSettingsDiffPhp($currentSettings, $submittedSettings);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $current
+     * @param  array<array-key, mixed>  $submitted
+     * @return array{total: int, changed: int, unchanged: int, unknown: int, empty: int}
+     */
+    private static function summarizeSettingsDiffNative(array $current, array $submitted): array
+    {
+        $parts = [(string) \count($current)];
+        foreach ([$current, $submitted] as $settings) {
+            foreach ($settings as $key => $value) {
+                $parts[] = (string) $key;
+                $parts[] = self::settingString($value);
+            }
+        }
+        $fields = NntmuxSearchReconcile::evaluateW395Native(1, $parts);
+        if ($fields === null || \count($fields) !== 5) {
+            return self::summarizeSettingsDiffPhp($current, $submitted);
+        }
+
+        return [
+            'total' => (int) $fields[0],
+            'changed' => (int) $fields[1],
+            'unchanged' => (int) $fields[2],
+            'unknown' => (int) $fields[3],
+            'empty' => (int) $fields[4],
+        ];
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $current
+     * @param  array<array-key, mixed>  $submitted
+     * @return array{total: int, changed: int, unchanged: int, unknown: int, empty: int}
+     */
+    private static function summarizeSettingsDiffPhp(array $current, array $submitted): array
+    {
+        $changed = $unchanged = $unknown = $empty = 0;
+        foreach ($submitted as $key => $value) {
+            $value = self::settingString($value);
+            if (! \array_key_exists($key, $current)) {
+                $unknown++;
+            } elseif (self::settingString($current[$key]) === $value) {
+                $unchanged++;
+            } else {
+                $changed++;
+            }
+            if (trim($value) === '') {
+                $empty++;
+            }
+        }
+
+        return [
+            'total' => \count($submitted),
+            'changed' => $changed,
+            'unchanged' => $unchanged,
+            'unknown' => $unknown,
+            'empty' => $empty,
+        ];
+    }
+
+    private static function settingString(mixed $value): string
+    {
+        return \is_scalar($value) || $value === null
+            ? (string) $value
+            : (string) json_encode($value, JSON_PARTIAL_OUTPUT_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE);
     }
 
     public function __construct(
