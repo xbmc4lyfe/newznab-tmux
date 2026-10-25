@@ -9,6 +9,7 @@ use App\Services\Tmux\CollectionDowntimeCompensator;
 use App\Support\RustPipelineLibrary;
 use App\Support\SqlError;
 use FFI;
+use FFI\CData;
 use Illuminate\Database\QueryException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -782,5 +783,186 @@ final class HeaderStorageService
     {
         self::$w411UseRustFfi = null;
         self::$w411Ffi = null;
+    }
+
+    /**
+     * Disabled: the paired common gains clear 1.5x but the uncommon mean and p99 stay near 1.1x
+     * (see the W52 parity test): PHP short-circuits invalid rows while packing, the call and the
+     * decode cost about as much.
+     */
+    private const bool W52_RUST_FFI_DEFAULT = false;
+
+    private const string W52_FFI_CDEF = 'ssize_t nntmux_w521_header_storage_validation_batch(const char *parts, size_t parts_len, const char *message_ids, size_t message_ids_len, size_t count, int64_t *out, size_t out_cap);';
+
+    public static function usesW52RustFfi(): bool
+    {
+        $enabled = self::w52RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W52_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 52 batch routed to Rust or PHP, then restores the routing. */
+    public static function withW52RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w52RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w52RustFfiState('set', $previous);
+        }
+    }
+
+    /** {@see headerValidationCodes()} results: valid, invalid part number, invalid message ID. */
+    public const array W52_VALIDATION_ERRORS = [0 => null, 1 => 'Invalid part number', 2 => 'Invalid message ID'];
+
+    /**
+     * PartHandler::validationErrorPhp() for each (part number, Message-ID) row as a code keyed
+     * into {@see W52_VALIDATION_ERRORS}, as {@see store()} applies it to every header.
+     *
+     * @param  list<int>  $partNumbers
+     * @param  list<string>  $messageIds
+     * @return list<int>
+     *
+     * @throws \InvalidArgumentException when the columns differ in length
+     */
+    public static function headerValidationCodes(array $partNumbers, array $messageIds): array
+    {
+        return self::usesW52RustFfi() ? self::headerValidationCodesNative($partNumbers, $messageIds) : self::headerValidationCodesPhp($partNumbers, $messageIds);
+    }
+
+    /**
+     * @param  list<int>  $partNumbers
+     * @param  list<string>  $messageIds
+     * @return list<int>
+     */
+    public static function headerValidationCodesPhp(array $partNumbers, array $messageIds): array
+    {
+        self::w52Count($partNumbers, $messageIds);
+        $messageIds = array_values($messageIds);
+        $codes = [];
+        foreach (array_values($partNumbers) as $i => $part) {
+            if ($part <= 0) {
+                $codes[] = 1;
+
+                continue;
+            }
+            $messageId = trim($messageIds[$i]);
+            $codes[] = $messageId === '' || \strlen($messageId) > 255 || preg_match('/^[\x20-\x7E]+$/D', $messageId) !== 1 ? 2 : 0;
+        }
+
+        return $codes;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or declines the batch (a
+     * Message-ID holding a NUL byte).
+     *
+     * @param  list<int>  $partNumbers
+     * @param  list<string>  $messageIds
+     * @return list<int>
+     */
+    public static function headerValidationCodesNative(array $partNumbers, array $messageIds): array
+    {
+        $count = self::w52Count($partNumbers, $messageIds);
+        $buffer = $count === 0 ? null : self::w52Buffer($count + 1);
+        if ($buffer === null) {
+            return self::headerValidationCodesPhp($partNumbers, $messageIds);
+        }
+        [$ffi, $out, $cap] = $buffer;
+        // An empty table tells the kernel every part number is positive (the common batch).
+        $parts = min($partNumbers) > 0 ? '' : pack('P*', ...array_values($partNumbers));
+        $joined = implode("\0", $messageIds);
+        try {
+            // @phpstan-ignore method.notFound
+            $words = self::w52Decode($out, $ffi->nntmux_w521_header_storage_validation_batch($parts, \strlen($parts), $joined, \strlen($joined), $count, $out, $cap), $count + 1);
+        } catch (Throwable) {
+            $words = null;
+        }
+        $ones = $words[0] ?? -1;
+        if ($words === null || $ones < 0 || $ones >= \count($words)) {
+            return self::headerValidationCodesPhp($partNumbers, $messageIds);
+        }
+        $codes = array_fill(0, $count, 0);
+        if (\count($words) === 1) {
+            return $codes;
+        }
+
+        // Words: [ones, code-1 indices..., code-2 indices...].
+        return array_replace($codes, array_fill_keys(\array_slice($words, 1, $ones), 1), array_fill_keys(\array_slice($words, 1 + $ones), 2));
+    }
+
+    /**
+     * @param  array<mixed>  ...$columns
+     */
+    private static function w52Count(array ...$columns): int
+    {
+        $count = \count($columns[0]);
+        foreach ($columns as $column) {
+            if (\count($column) !== $count) {
+                throw new \InvalidArgumentException('Header validation columns must have the same length.');
+            }
+        }
+
+        return $count;
+    }
+
+    /**
+     * Lazily resolved binding plus the reusable output buffer sized for `$words` words.
+     *
+     * @return array{0: FFI, 1: CData, 2: int}|null
+     */
+    private static function w52Buffer(int $words): ?array
+    {
+        $buffer = self::w52RustFfiState('out', $words);
+
+        return \is_array($buffer) ? $buffer : null;
+    }
+
+    /** @return list<int>|null The `$written` words the export reported, or null when it declined. */
+    private static function w52Decode(CData $out, mixed $written, int $maxWords): ?array
+    {
+        if (! \is_int($written) || $written < 0 || $written > $maxWords) {
+            return null;
+        }
+        if ($written === 0) {
+            return [];
+        }
+        $decoded = unpack('P*', FFI::string($out, $written * 8));
+
+        /** @var list<int>|null */
+        return \is_array($decoded) ? array_values($decoded) : null;
+    }
+
+    /**
+     * Wave 52 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
+     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
+     */
+    private static function w52RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'out':
+                $ffi ??= RustPipelineLibrary::resolveDomain('backfill_binaries_w52', self::W52_FFI_CDEF) ?? false;
+                if (! $ffi instanceof FFI || ! \is_int($val) || $val < 1) {
+                    return null;
+                }
+                if (! $out instanceof CData || $outCap < $val) {
+                    $outCap = max(512, $val * 2);
+                    $out = $ffi->new("int64_t[{$outCap}]");
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled;
+        }
     }
 }

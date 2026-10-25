@@ -12,6 +12,7 @@ use App\Services\NNTP\NNTPService;
 use App\Services\Releases\Verification\CandidateRepository;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Throwable;
@@ -613,5 +614,149 @@ final class BackfillService
     {
         self::$w421UseRustFfi = null;
         self::$w421Ffi = null;
+    }
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W52 parity test). */
+    private const bool W52_RUST_FFI_DEFAULT = true;
+
+    private const string W52_FFI_CDEF = 'ssize_t nntmux_w521_backfill_article_date_batch(const char *dates, size_t dates_len, size_t count, int64_t *out, size_t out_cap);';
+
+    public static function usesW52RustFfi(): bool
+    {
+        $enabled = self::w52RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W52_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 52 batch routed to Rust or PHP, then restores the routing. */
+    public static function withW52RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w52RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w52RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * strtotime() of each article `Date` header ({@see updateGroupRecord()} resolves the first
+     * article date this way).
+     *
+     * @param  list<string>  $dates
+     * @return list<int|false>
+     */
+    public static function articleDateTimestamps(array $dates): array
+    {
+        return self::usesW52RustFfi() ? self::articleDateTimestampsNative($dates) : self::articleDateTimestampsPhp($dates);
+    }
+
+    /**
+     * @param  list<string>  $dates
+     * @return list<int|false>
+     */
+    public static function articleDateTimestampsPhp(array $dates): array
+    {
+        $stamps = [];
+        foreach ($dates as $date) {
+            $stamps[] = strtotime($date);
+        }
+
+        return $stamps;
+    }
+
+    /**
+     * Rust parses the RFC 5322 shape NNTP servers send (`[Www, ]D Mon YYYY HH:MM:SS ZONE`) and
+     * reports every other row, which PHP resolves with strtotime(); falls back to PHP when the
+     * library is missing or declines the batch (a date holding a NUL byte).
+     *
+     * @param  list<string>  $dates
+     * @return list<int|false>
+     */
+    public static function articleDateTimestampsNative(array $dates): array
+    {
+        $count = \count($dates);
+        $buffer = $count === 0 ? null : self::w52Buffer(2 * $count);
+        if ($buffer === null) {
+            return self::articleDateTimestampsPhp($dates);
+        }
+        [$ffi, $out, $cap] = $buffer;
+        $dates = array_values($dates);
+        $joined = implode("\0", $dates);
+        try {
+            // @phpstan-ignore method.notFound
+            $words = self::w52Decode($out, $ffi->nntmux_w521_backfill_article_date_batch($joined, \strlen($joined), $count, $out, $cap), 2 * $count);
+        } catch (Throwable) {
+            $words = null;
+        }
+        if ($words === null || \count($words) < $count) {
+            return self::articleDateTimestampsPhp($dates);
+        }
+        $stamps = \array_slice($words, 0, $count);
+        foreach (\array_slice($words, $count) as $index) {
+            $stamps[$index] = strtotime($dates[$index]);
+        }
+
+        return $stamps;
+    }
+
+    /**
+     * Lazily resolved binding plus the reusable output buffer sized for `$words` words.
+     *
+     * @return array{0: FFI, 1: CData, 2: int}|null
+     */
+    private static function w52Buffer(int $words): ?array
+    {
+        $buffer = self::w52RustFfiState('out', $words);
+
+        return \is_array($buffer) ? $buffer : null;
+    }
+
+    /** @return list<int>|null The `$written` words the export reported, or null when it declined. */
+    private static function w52Decode(CData $out, mixed $written, int $maxWords): ?array
+    {
+        if (! \is_int($written) || $written < 0 || $written > $maxWords) {
+            return null;
+        }
+        if ($written === 0) {
+            return [];
+        }
+        $decoded = unpack('P*', FFI::string($out, $written * 8));
+
+        /** @var list<int>|null */
+        return \is_array($decoded) ? array_values($decoded) : null;
+    }
+
+    /**
+     * Wave 52 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
+     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
+     */
+    private static function w52RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'out':
+                $ffi ??= RustPipelineLibrary::resolveDomain('backfill_binaries_w52', self::W52_FFI_CDEF) ?? false;
+                if (! $ffi instanceof FFI || ! \is_int($val) || $val < 1) {
+                    return null;
+                }
+                if (! $out instanceof CData || $outCap < $val) {
+                    $outCap = max(512, $val * 2);
+                    $out = $ffi->new("int64_t[{$outCap}]");
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled;
+        }
     }
 }

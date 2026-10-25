@@ -13,6 +13,7 @@ use App\Support\RustPipelineLibrary;
 use DariusIII\NetNntp\Error as NntpError;
 use DariusIII\NetNntp\Protocol\ResponseCode;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -1594,6 +1595,157 @@ class BinariesService
             return $values === false ? null : array_values($values);
         } catch (Throwable) {
             return null;
+        }
+    }
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W52 parity test). */
+    private const bool W52_RUST_FFI_DEFAULT = true;
+
+    private const string W52_FFI_CDEF = 'ssize_t nntmux_w521_binaries_overview_nearest_batch(const char *numbers, size_t numbers_len, size_t count, int64_t low, int64_t high, uint32_t upward, int64_t *out, size_t out_cap);';
+
+    public static function usesW52RustFfi(): bool
+    {
+        $enabled = self::w52RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W52_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 52 batch routed to Rust or PHP, then restores the routing. */
+    public static function withW52RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w52RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w52RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * The overview row {@see nearestOverviewRow()} picks from an XOVER range's `Number` values:
+     * the index of the lowest (`$upward`) or highest number, the first on ties; null for no
+     * rows, false when a number fails filter_var(.., FILTER_VALIDATE_INT) or leaves
+     * `[$low, $high]` (nearestOverviewRow() then defers).
+     *
+     * @param  list<int|string>  $numbers
+     */
+    public static function nearestOverviewIndex(array $numbers, int $low, int $high, bool $upward): int|false|null
+    {
+        return self::usesW52RustFfi()
+            ? self::nearestOverviewIndexNative($numbers, $low, $high, $upward)
+            : self::nearestOverviewIndexPhp($numbers, $low, $high, $upward);
+    }
+
+    /**
+     * @param  list<int|string>  $numbers
+     */
+    public static function nearestOverviewIndexPhp(array $numbers, int $low, int $high, bool $upward): int|false|null
+    {
+        $nearest = $best = null;
+        foreach (array_values($numbers) as $index => $raw) {
+            $number = filter_var($raw, FILTER_VALIDATE_INT);
+            if ($number === false || $number < $low || $number > $high) {
+                return false;
+            }
+            if ($best === null || ($upward ? $number < $best : $number > $best)) {
+                $nearest = $index;
+                $best = $number;
+            }
+        }
+
+        return $nearest;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or declines the batch (a number
+     * holding a NUL byte).
+     *
+     * @param  list<int|string>  $numbers
+     */
+    public static function nearestOverviewIndexNative(array $numbers, int $low, int $high, bool $upward): int|false|null
+    {
+        $count = \count($numbers);
+        $buffer = $count === 0 ? null : self::w52Buffer(1);
+        if ($buffer === null) {
+            return self::nearestOverviewIndexPhp($numbers, $low, $high, $upward);
+        }
+        [$ffi, $out, $cap] = $buffer;
+        $joined = implode("\0", $numbers);
+        try {
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w521_binaries_overview_nearest_batch($joined, \strlen($joined), $count, $low, $high, (int) $upward, $out, $cap);
+            $index = $written === 1 ? $out[0] : null;
+        } catch (Throwable) {
+            $index = null;
+        }
+        if (! \is_int($index) || $index < -2 || $index >= $count) {
+            return self::nearestOverviewIndexPhp($numbers, $low, $high, $upward);
+        }
+
+        return match ($index) {
+            -2 => false,
+            -1 => null,
+            default => $index,
+        };
+    }
+
+    /**
+     * Lazily resolved binding plus the reusable output buffer sized for `$words` words.
+     *
+     * @return array{0: FFI, 1: CData, 2: int}|null
+     */
+    private static function w52Buffer(int $words): ?array
+    {
+        $buffer = self::w52RustFfiState('out', $words);
+
+        return \is_array($buffer) ? $buffer : null;
+    }
+
+    /** @return list<int>|null The `$written` words the export reported, or null when it declined. */
+    private static function w52Decode(CData $out, mixed $written, int $maxWords): ?array
+    {
+        if (! \is_int($written) || $written < 0 || $written > $maxWords) {
+            return null;
+        }
+        if ($written === 0) {
+            return [];
+        }
+        $decoded = unpack('P*', FFI::string($out, $written * 8));
+
+        /** @var list<int>|null */
+        return \is_array($decoded) ? array_values($decoded) : null;
+    }
+
+    /**
+     * Wave 52 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
+     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
+     */
+    private static function w52RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'out':
+                $ffi ??= RustPipelineLibrary::resolveDomain('backfill_binaries_w52', self::W52_FFI_CDEF) ?? false;
+                if (! $ffi instanceof FFI || ! \is_int($val) || $val < 1) {
+                    return null;
+                }
+                if (! $out instanceof CData || $outCap < $val) {
+                    $outCap = max(512, $val * 2);
+                    $out = $ffi->new("int64_t[{$outCap}]");
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled;
         }
     }
 }
