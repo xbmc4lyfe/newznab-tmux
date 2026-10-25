@@ -38310,3 +38310,648 @@ pub mod predb_sources_rate_movie_helpers {
         }
     }
 }
+
+/// Wave 39.4 pure metadata summaries. The wire format is PHP `serialize()` of
+/// the positional argument list and an associative result. Callers must provide
+/// live allocations for their declared spans; invalid sizes and overlapping
+/// input/output spans decline before a slice is constructed or output is written.
+pub mod w394_metadata {
+    use super::{PhpKey, PhpNode, PhpSerParser, PhpSerWriter};
+    use std::collections::HashSet;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+
+    unsafe fn dispatch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+        summarize: fn(&[u8]) -> Option<Vec<u8>>,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if input.is_null()
+                || out.is_null()
+                || len > MAX_INPUT
+                || len > isize::MAX as usize
+                || cap > isize::MAX as usize
+            {
+                return -1;
+            }
+            let Some(input_end) = (input as usize).checked_add(len) else {
+                return -1;
+            };
+            let Some(out_end) = (out as usize).checked_add(cap) else {
+                return -1;
+            };
+            if len != 0 && cap != 0 && (input as usize) < out_end && (out as usize) < input_end {
+                return -1;
+            }
+            // All address arithmetic is checked before borrowing caller memory.
+            let input = unsafe { std::slice::from_raw_parts(input, len) };
+            let Some(result) = summarize(input) else {
+                return -1;
+            };
+            let Ok(needed) = isize::try_from(result.len()) else {
+                return -1;
+            };
+            if result.len() > cap {
+                return -needed;
+            }
+            unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), out, result.len()) };
+            needed
+        }))
+        .unwrap_or(-1)
+    }
+
+    fn args(input: &[u8], count: usize) -> Option<PhpNode<'_>> {
+        let doc = PhpSerParser::parse_document(input)?;
+        if !doc.is_arr()
+            || doc.items().len() != count
+            || !doc
+                .items()
+                .iter()
+                .enumerate()
+                .all(|(i, (key, _))| *key == PhpKey::Int(i as i64))
+        {
+            return None;
+        }
+        Some(doc)
+    }
+
+    fn rows<'a>(doc: &'a PhpNode<'a>) -> Option<&'a PhpNode<'a>> {
+        doc.get_int_key(0).filter(|node| node.is_arr())
+    }
+
+    fn trim(value: &[u8]) -> &[u8] {
+        // PHP trim also includes NUL and excludes form-feed.
+        let is_trim = |b: &u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b);
+        let start = value
+            .iter()
+            .position(|b| !is_trim(b))
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|b| !is_trim(b))
+            .map_or(start, |i| i + 1);
+        &value[start..end]
+    }
+
+    fn text<'a>(row: &'a PhpNode<'a>, key: &[u8]) -> &'a [u8] {
+        row.get(key).and_then(PhpNode::as_str).unwrap_or_default()
+    }
+
+    fn int_summary(fields: &[(&[u8], i64)]) -> Vec<u8> {
+        let mut w = PhpSerWriter::new();
+        w.arr_open(fields.len());
+        for (key, value) in fields {
+            w.key(key);
+            w.int(*value);
+        }
+        w.arr_close();
+        w.buf
+    }
+
+    fn tvmaze(input: &[u8]) -> Option<Vec<u8>> {
+        let doc = args(input, 2)?;
+        let episodes = rows(&doc)?;
+        let target = doc.get_int_key(1)?.as_int()?;
+        let (mut matching, mut specials, mut missing, mut max_number) = (0, 0, 0, 0);
+        for (_, row) in episodes.items() {
+            let season = row.get(b"season").and_then(PhpNode::as_int);
+            matching += i64::from(season == Some(target));
+            specials += i64::from(season == Some(0));
+            missing += i64::from(trim(text(row, b"airdate")).is_empty());
+            max_number = max_number.max(row.get(b"number").and_then(PhpNode::as_int).unwrap_or(0));
+        }
+        Some(int_summary(&[
+            (b"total_episodes", episodes.items().len() as i64),
+            (b"matching_season_count", matching),
+            (b"special_count", specials),
+            (b"missing_airdate_count", missing),
+            (b"max_episode_number", max_number),
+        ]))
+    }
+
+    fn tvdb(input: &[u8]) -> Option<Vec<u8>> {
+        let doc = args(input, 2)?;
+        let translations = rows(&doc)?;
+        let preferred = trim(doc.get_int_key(1)?.as_str()?);
+        let (mut preferred_index, mut english_index, mut overviews, mut aliases) = (-1, -1, 0, 0);
+        for (i, (_, row)) in translations.items().iter().enumerate() {
+            let language = trim(text(row, b"language"));
+            if preferred_index < 0 && language.eq_ignore_ascii_case(preferred) {
+                preferred_index = i as i64;
+            }
+            if english_index < 0 && language.eq_ignore_ascii_case(b"eng") {
+                english_index = i as i64;
+            }
+            overviews += i64::from(!trim(text(row, b"overview")).is_empty());
+            if let Some(values) = row.get(b"aliases") {
+                aliases += values
+                    .items()
+                    .iter()
+                    .filter(|(_, node)| node.as_str().is_some_and(|s| !trim(s).is_empty()))
+                    .count() as i64;
+            }
+        }
+        Some(int_summary(&[
+            (b"total_entries", translations.items().len() as i64),
+            (b"preferred_language_index", preferred_index),
+            (b"english_language_index", english_index),
+            (b"non_empty_overview_count", overviews),
+            (b"alias_count", aliases),
+        ]))
+    }
+
+    fn canonical_isbn(value: &[u8]) -> Option<(bool, Vec<u8>)> {
+        let token: Vec<u8> = value
+            .iter()
+            .copied()
+            .filter(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n' | 0x0b | 0x0c | b'-'))
+            .map(|b| b.to_ascii_uppercase())
+            .collect();
+        match token.len() {
+            13 => {
+                if !token.iter().all(u8::is_ascii_digit)
+                    || !(token.starts_with(b"978") || token.starts_with(b"979"))
+                {
+                    return None;
+                }
+                let sum: u32 = token
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| u32::from(b - b'0') * if i % 2 == 0 { 1 } else { 3 })
+                    .sum();
+                (sum % 10 == 0).then_some((true, token))
+            }
+            10 => {
+                if !token[..9].iter().all(u8::is_ascii_digit)
+                    || !(token[9].is_ascii_digit() || token[9] == b'X')
+                {
+                    return None;
+                }
+                let sum: u32 = token
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| {
+                        (if *b == b'X' { 10 } else { u32::from(b - b'0') }) * (10 - i as u32)
+                    })
+                    .sum();
+                if sum % 11 != 0 {
+                    return None;
+                }
+                let mut canonical = b"978".to_vec();
+                canonical.extend_from_slice(&token[..9]);
+                let sum: u32 = canonical
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| u32::from(b - b'0') * if i % 2 == 0 { 1 } else { 3 })
+                    .sum();
+                canonical.push(b'0' + ((10 - sum % 10) % 10) as u8);
+                Some((false, canonical))
+            }
+            _ => None,
+        }
+    }
+
+    fn isbn(input: &[u8]) -> Option<Vec<u8>> {
+        let doc = args(input, 1)?;
+        let tokens = rows(&doc)?;
+        let (mut valid13, mut valid10, mut invalid) = (0, 0, 0);
+        let mut seen = HashSet::new();
+        let mut first = Vec::new();
+        for (_, token) in tokens.items() {
+            match token.as_str().and_then(canonical_isbn) {
+                Some((is13, canonical)) => {
+                    if is13 {
+                        valid13 += 1;
+                    } else {
+                        valid10 += 1;
+                    }
+                    if first.is_empty() {
+                        first = canonical.clone();
+                    }
+                    seen.insert(canonical);
+                }
+                None => invalid += 1,
+            }
+        }
+        let mut w = PhpSerWriter::new();
+        w.arr_open(5);
+        for (key, value) in [
+            (b"valid_isbn13_count".as_slice(), valid13),
+            (b"valid_isbn10_count", valid10),
+            (b"invalid_count", invalid),
+            (b"deduplicated_count", seen.len() as i64),
+        ] {
+            w.key(key);
+            w.int(value);
+        }
+        w.key(b"first_canonical_isbn13");
+        w.str(&first);
+        w.arr_close();
+        Some(w.buf)
+    }
+
+    fn publication_year(value: &[u8]) -> i64 {
+        let mut pos = 0;
+        while pos < value.len() {
+            if !value[pos].is_ascii_digit() {
+                pos += 1;
+                continue;
+            }
+            let start = pos;
+            while pos < value.len() && value[pos].is_ascii_digit() {
+                pos += 1;
+            }
+            if pos - start == 4 {
+                return value[start..pos]
+                    .iter()
+                    .fold(0, |acc, b| acc * 10 + i64::from(b - b'0'));
+            }
+        }
+        0
+    }
+
+    fn openlibrary(input: &[u8]) -> Option<Vec<u8>> {
+        let doc = args(input, 2)?;
+        let editions = rows(&doc)?;
+        let preferred = doc.get_int_key(1)?.as_int()?;
+        let (mut isbns, mut covers, mut exact, mut earliest) = (0, 0, 0, 0);
+        for (_, row) in editions.items() {
+            isbns += i64::from(row.get(b"isbn_13").is_some_and(|node| {
+                node.items()
+                    .iter()
+                    .any(|(_, s)| s.as_str().is_some_and(|s| !trim(s).is_empty()))
+            }));
+            covers += i64::from(row.get(b"covers").is_some_and(|node| {
+                node.items()
+                    .iter()
+                    .any(|(_, n)| n.as_int().is_some_and(|n| n > 0))
+            }));
+            let year = publication_year(text(row, b"publish_date"));
+            exact += i64::from(preferred > 0 && year == preferred);
+            if year > 0 && (earliest == 0 || year < earliest) {
+                earliest = year;
+            }
+        }
+        Some(int_summary(&[
+            (b"total_editions", editions.items().len() as i64),
+            (b"with_isbn13_count", isbns),
+            (b"with_cover_count", covers),
+            (b"exact_year_match_count", exact),
+            (b"earliest_publication_year", earliest),
+        ]))
+    }
+
+    fn anidb(input: &[u8]) -> Option<Vec<u8>> {
+        let doc = args(input, 4)?;
+        let last = doc.get_int_key(0)?.as_int()?.max(0);
+        let now = doc.get_int_key(1)?.as_int()?.max(0);
+        let failures = doc.get_int_key(2)?.as_int()?.clamp(0, 30);
+        let base = doc.get_int_key(3)?.as_int()?.max(0);
+        let elapsed = now.saturating_sub(last).max(0);
+        let multiplier = 1i64 << failures;
+        let required = base.saturating_mul(multiplier);
+        let remaining = required.saturating_sub(elapsed).max(0);
+        let mut w = PhpSerWriter::new();
+        w.arr_open(5);
+        for (key, value) in [
+            (b"elapsed_seconds".as_slice(), elapsed),
+            (b"required_wait_seconds", required),
+            (b"remaining_sleep_seconds", remaining),
+            (b"backoff_multiplier", multiplier),
+        ] {
+            w.key(key);
+            w.int(value);
+        }
+        w.key(b"ready_to_request");
+        w.bool(remaining == 0);
+        w.arr_close();
+        Some(w.buf)
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w394_tvmaze_episode_catalog(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, tvmaze) }
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w394_tvdb_series_translations(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, tvdb) }
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w394_isbn_batch_candidates(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, isbn) }
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w394_openlibrary_work_editions(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, openlibrary) }
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w394_anidb_rate_limit_window(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, anidb) }
+    }
+}
+
+#[cfg(test)]
+mod w394_tests {
+    use super::w394_metadata::*;
+    use super::{PhpNode, PhpSerParser};
+
+    type Export = unsafe extern "C" fn(*const u8, usize, *mut u8, usize) -> isize;
+
+    fn output(export: Export, input: &[u8]) -> Vec<u8> {
+        let mut out = vec![0; 1024];
+        let written = unsafe { export(input.as_ptr(), input.len(), out.as_mut_ptr(), out.len()) };
+        assert!(written > 0, "export declined: {written}");
+        out.truncate(written as usize);
+        out
+    }
+
+    fn ints(doc: &PhpNode<'_>, fields: &[(&[u8], i64)]) {
+        for (key, expected) in fields {
+            assert_eq!(doc.get(key).and_then(PhpNode::as_int), Some(*expected));
+        }
+    }
+
+    #[test]
+    fn w394_summaries_have_literal_expected_results() {
+        let result = output(nntmux_w394_tvmaze_episode_catalog, br#"a:2:{i:0;a:3:{i:0;a:3:{s:6:"season";i:1;s:6:"number";i:7;s:7:"airdate";s:10:"2024-01-01";}i:1;a:2:{s:6:"season";i:0;s:6:"number";i:2;}i:2;N;}i:1;i:1;}"#);
+        let doc = PhpSerParser::parse_document(&result).unwrap();
+        ints(
+            &doc,
+            &[
+                (b"total_episodes", 3),
+                (b"matching_season_count", 1),
+                (b"special_count", 1),
+                (b"missing_airdate_count", 2),
+                (b"max_episode_number", 7),
+            ],
+        );
+
+        let result = output(nntmux_w394_tvdb_series_translations, br#"a:2:{i:0;a:2:{i:0;a:3:{s:8:"language";s:3:"ENG";s:8:"overview";s:1:"x";s:7:"aliases";a:3:{i:0;s:1:"a";i:1;s:1:" ";i:2;s:1:"a";}}i:1;a:1:{s:8:"language";s:3:"fra";}}i:1;s:3:"fra";}"#);
+        let doc = PhpSerParser::parse_document(&result).unwrap();
+        ints(
+            &doc,
+            &[
+                (b"total_entries", 2),
+                (b"preferred_language_index", 1),
+                (b"english_language_index", 0),
+                (b"non_empty_overview_count", 1),
+                (b"alias_count", 2),
+            ],
+        );
+
+        let result = output(nntmux_w394_isbn_batch_candidates, br#"a:1:{i:0;a:4:{i:0;s:10:"0306406152";i:1;s:13:"9780306406157";i:2;s:10:"080442957X";i:3;s:10:"0306406153";}}"#);
+        let doc = PhpSerParser::parse_document(&result).unwrap();
+        ints(
+            &doc,
+            &[
+                (b"valid_isbn13_count", 1),
+                (b"valid_isbn10_count", 2),
+                (b"invalid_count", 1),
+                (b"deduplicated_count", 2),
+            ],
+        );
+        assert_eq!(
+            doc.get(b"first_canonical_isbn13").and_then(PhpNode::as_str),
+            Some(b"9780306406157".as_slice())
+        );
+
+        let result = output(nntmux_w394_openlibrary_work_editions, br#"a:2:{i:0;a:2:{i:0;a:3:{s:7:"isbn_13";a:1:{i:0;s:13:"9780306406157";}s:6:"covers";a:1:{i:0;i:42;}s:12:"publish_date";s:13:"June 12, 1980";}i:1;a:1:{s:12:"publish_date";s:4:"1979";}}i:1;i:1980;}"#);
+        let doc = PhpSerParser::parse_document(&result).unwrap();
+        ints(
+            &doc,
+            &[
+                (b"total_editions", 2),
+                (b"with_isbn13_count", 1),
+                (b"with_cover_count", 1),
+                (b"exact_year_match_count", 1),
+                (b"earliest_publication_year", 1979),
+            ],
+        );
+
+        let result = output(
+            nntmux_w394_anidb_rate_limit_window,
+            b"a:4:{i:0;i:100;i:1;i:103;i:2;i:2;i:3;i:2;}",
+        );
+        let doc = PhpSerParser::parse_document(&result).unwrap();
+        ints(
+            &doc,
+            &[
+                (b"elapsed_seconds", 3),
+                (b"required_wait_seconds", 8),
+                (b"remaining_sleep_seconds", 5),
+                (b"backoff_multiplier", 4),
+            ],
+        );
+        assert!(doc.get(b"ready_to_request").unwrap().is_false());
+    }
+
+    #[test]
+    fn w394_all_exports_enforce_buffer_and_input_contracts() {
+        let cases: [(Export, &[u8]); 5] = [
+            (
+                nntmux_w394_tvmaze_episode_catalog,
+                b"a:2:{i:0;a:0:{}i:1;i:0;}",
+            ),
+            (
+                nntmux_w394_tvdb_series_translations,
+                br#"a:2:{i:0;a:0:{}i:1;s:3:"eng";}"#,
+            ),
+            (nntmux_w394_isbn_batch_candidates, b"a:1:{i:0;a:0:{}}"),
+            (
+                nntmux_w394_openlibrary_work_editions,
+                b"a:2:{i:0;a:0:{}i:1;i:0;}",
+            ),
+            (
+                nntmux_w394_anidb_rate_limit_window,
+                b"a:4:{i:0;i:0;i:1;i:0;i:2;i:0;i:3;i:2;}",
+            ),
+        ];
+        for (export, input) in cases {
+            let expected = output(export, input);
+            let mut sentinel = [b'Z'; 1024];
+            unsafe {
+                for cap in [0, 1, expected.len() - 1] {
+                    assert_eq!(
+                        export(input.as_ptr(), input.len(), sentinel.as_mut_ptr(), cap),
+                        -(expected.len() as isize)
+                    );
+                    assert_eq!(sentinel, [b'Z'; 1024]);
+                }
+                assert_eq!(
+                    export(
+                        input.as_ptr(),
+                        input.len(),
+                        sentinel.as_mut_ptr(),
+                        expected.len()
+                    ),
+                    expected.len() as isize
+                );
+                assert_eq!(&sentinel[..expected.len()], expected);
+                assert_eq!(
+                    &sentinel[expected.len()..],
+                    vec![b'Z'; 1024 - expected.len()]
+                );
+                for (ptr, len) in [
+                    (std::ptr::null(), 0),
+                    (input.as_ptr(), 16 * 1024 * 1024 + 1),
+                    (input.as_ptr(), usize::MAX),
+                    ((usize::MAX - 1) as *const u8, 8),
+                ] {
+                    sentinel.fill(b'Z');
+                    assert_eq!(export(ptr, len, sentinel.as_mut_ptr(), sentinel.len()), -1);
+                    assert_eq!(sentinel, [b'Z'; 1024]);
+                }
+                assert_eq!(
+                    export(input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                    -1
+                );
+                assert_eq!(
+                    export(
+                        input.as_ptr(),
+                        input.len(),
+                        sentinel.as_mut_ptr(),
+                        usize::MAX
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    export(input.as_ptr(), input.len(), (usize::MAX - 1) as *mut u8, 8),
+                    -1
+                );
+                for malformed in [
+                    b"".as_slice(),
+                    b"N;",
+                    b"a:1:{i:0;",
+                    b"a:999999999999999999999:{}",
+                    b"a:0:{}trailing",
+                ] {
+                    assert_eq!(
+                        export(
+                            malformed.as_ptr(),
+                            malformed.len(),
+                            sentinel.as_mut_ptr(),
+                            sentinel.len()
+                        ),
+                        -1
+                    );
+                }
+                let mut overlap = vec![b'Z'; 2048];
+                overlap[32..32 + input.len()].copy_from_slice(input);
+                let original = overlap.clone();
+                for offset in [0, 32, 33] {
+                    assert_eq!(
+                        export(
+                            overlap.as_ptr().add(32),
+                            input.len(),
+                            overlap.as_mut_ptr().add(offset),
+                            1024
+                        ),
+                        -1
+                    );
+                    assert_eq!(overlap, original);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn w394_anidb_saturates_and_clamps_extremes() {
+        let result = output(nntmux_w394_anidb_rate_limit_window, b"a:4:{i:0;i:-9223372036854775808;i:1;i:9223372036854775807;i:2;i:9223372036854775807;i:3;i:9223372036854775807;}");
+        let doc = PhpSerParser::parse_document(&result).unwrap();
+        ints(
+            &doc,
+            &[
+                (b"elapsed_seconds", i64::MAX),
+                (b"required_wait_seconds", i64::MAX),
+                (b"remaining_sleep_seconds", 0),
+                (b"backoff_multiplier", 1 << 30),
+            ],
+        );
+        assert!(doc.get(b"ready_to_request").unwrap().is_true());
+    }
+
+    #[test]
+    fn w394_accepts_exact_input_limit_and_declines_deep_or_wrong_argument_frames() {
+        // The string length has eight digits throughout, keeping framing fixed.
+        let limit = 16 * 1024 * 1024;
+        let suffix = b"\";}}i:1;i:0;}";
+        let framing =
+            format!("a:2:{{i:0;a:1:{{i:0;a:1:{{s:7:\"airdate\";s:{limit}:\"").len() + suffix.len();
+        let string_len = limit - framing;
+        let header = format!("a:2:{{i:0;a:1:{{i:0;a:1:{{s:7:\"airdate\";s:{string_len}:\"");
+        let mut input = header.into_bytes();
+        input.resize(input.len() + string_len, b'x');
+        input.extend_from_slice(suffix);
+        assert_eq!(input.len(), 16 * 1024 * 1024);
+        let result = output(nntmux_w394_tvmaze_episode_catalog, &input);
+        let doc = PhpSerParser::parse_document(&result).unwrap();
+        ints(
+            &doc,
+            &[
+                (b"total_episodes", 1),
+                (b"special_count", 0),
+                (b"missing_airdate_count", 0),
+            ],
+        );
+
+        let mut deep = b"a:2:{i:0;".to_vec();
+        for _ in 0..130 {
+            deep.extend_from_slice(b"a:1:{i:0;");
+        }
+        deep.extend_from_slice(b"N;");
+        deep.extend(std::iter::repeat_n(b'}', 130));
+        deep.extend_from_slice(b"i:1;i:0;}");
+        let mut out = [b'Z'; 1024];
+        for invalid in [
+            deep.as_slice(),
+            b"a:2:{i:0;a:0:{}i:1;s:1:\"0\";}",
+            b"a:2:{i:0;a:0:{}i:0;i:0;}",
+        ] {
+            assert_eq!(
+                unsafe {
+                    nntmux_w394_tvmaze_episode_catalog(
+                        invalid.as_ptr(),
+                        invalid.len(),
+                        out.as_mut_ptr(),
+                        out.len(),
+                    )
+                },
+                -1
+            );
+            assert_eq!(out, [b'Z'; 1024]);
+        }
+    }
+}

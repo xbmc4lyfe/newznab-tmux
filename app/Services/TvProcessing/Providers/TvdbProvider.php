@@ -6,19 +6,164 @@ namespace App\Services\TvProcessing\Providers;
 
 use App\Exceptions\TvProviderException;
 use App\Support\MetadataSources;
+use App\Support\RustPipelineLibrary;
 use CanIHaveSomeCoffee\TheTVDbAPI\Exception\ResourceNotFoundException;
 use CanIHaveSomeCoffee\TheTVDbAPI\Exception\UnauthorizedException;
 use CanIHaveSomeCoffee\TheTVDbAPI\Model\SeriesExtendedRecord;
 use CanIHaveSomeCoffee\TheTVDbAPI\TheTVDbAPI;
+use FFI;
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\GuzzleException;
 use Illuminate\Support\Facades\Log;
+use Throwable;
 
 /**
  * Class TvdbProvider -- functions used to post process releases against TVDB (API v4).
  */
 class TvdbProvider extends AbstractTvProvider
 {
+    /** Disabled until correctness and the common-path and p99 benchmark gates qualify. */
+    public const bool W394_RUST_FFI_DEFAULT = false;
+
+    public const string W394_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w394_tvdb_series_translations(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private static ?bool $w394UseRustFfi = null;
+
+    private static FFI|false|null $w394Ffi = null;
+
+    public static function useW394RustFfi(?bool $use = true): void
+    {
+        self::$w394UseRustFfi = $use;
+        if ($use === null) {
+            self::$w394Ffi = null;
+        }
+    }
+
+    public static function usesW394RustFfi(): bool
+    {
+        return self::$w394UseRustFfi ?? self::W394_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW394RustFfi(): void
+    {
+        self::$w394UseRustFfi = null;
+        self::$w394Ffi = null;
+    }
+
+    /**
+     * Arguments contain only projected scalar fields, never caller-owned objects.
+     *
+     * @param  list<mixed>  $arguments
+     * @return array<string, int|string|bool>|null
+     */
+    private static function w394Call(array $arguments): ?array
+    {
+        try {
+            $input = serialize($arguments);
+            if (strlen($input) > 16777216) {
+                return null;
+            }
+            if (self::$w394Ffi === null) {
+                self::$w394Ffi = RustPipelineLibrary::resolveDomain('metadata_w394', self::W394_FFI_CDEF) ?? false;
+            }
+            $ffi = self::$w394Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            $capacity = 0;
+            $out = RustPipelineLibrary::obtainScratch($ffi, 2048, $capacity);
+            if ($out === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound (Declared by W394_FFI_CDEF.)
+            $written = $ffi->nntmux_w394_tvdb_series_translations($input, strlen($input), $out, $capacity);
+            if (is_int($written) && $written < -1 && $written >= -16777216) {
+                $out = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($out === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound (Declared by W394_FFI_CDEF.)
+                $written = $ffi->nntmux_w394_tvdb_series_translations($input, strlen($input), $out, $capacity);
+            }
+            if (! is_int($written) || $written <= 0 || $written > $capacity || $written > 16777216) {
+                return null;
+            }
+            $result = @unserialize(FFI::string($out, $written), ['allowed_classes' => false]);
+            $types = ['total_entries' => 'int', 'preferred_language_index' => 'int', 'english_language_index' => 'int', 'non_empty_overview_count' => 'int', 'alias_count' => 'int'];
+            if (! is_array($result) || array_keys($result) !== array_keys($types)) {
+                return null;
+            }
+            foreach ($types as $key => $type) {
+                if (get_debug_type($result[$key]) !== $type) {
+                    return null;
+                }
+            }
+
+            return $result;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** @param array<array-key, mixed> $translations
+     * @return array<string, int|string|bool>
+     */
+    public static function summarizeTvdbSeriesTranslations(array $translations, string $preferredLang = 'eng'): array
+    {
+        if (self::usesW394RustFfi()) {
+            $safe = [];
+            foreach ($translations as $row) {
+                $row = is_array($row) ? $row : [];
+                $aliases = [];
+                foreach (is_array($row['aliases'] ?? null) ? $row['aliases'] : [] as $alias) {
+                    if (is_string($alias)) {
+                        $aliases[] = $alias;
+                    }
+                }
+                $safe[] = [
+                    'language' => is_string($row['language'] ?? null) ? $row['language'] : null,
+                    'overview' => is_string($row['overview'] ?? null) ? $row['overview'] : null,
+                    'aliases' => $aliases,
+                ];
+            }
+            $native = self::w394Call([$safe, $preferredLang]);
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
+        return self::summarizeTvdbSeriesTranslationsPhp($translations, $preferredLang);
+    }
+
+    /** @param array<array-key, mixed> $translations
+     * @return array<string, int>
+     */
+    public static function summarizeTvdbSeriesTranslationsPhp(array $translations, string $preferredLang = 'eng'): array
+    {
+        $preferredLang = strtolower(trim($preferredLang));
+        $preferred = $english = -1;
+        $overviewCount = $aliasCount = $position = 0;
+        foreach ($translations as $row) {
+            $row = is_array($row) ? $row : [];
+            $language = is_string($row['language'] ?? null) ? strtolower(trim($row['language'])) : '';
+            if ($preferred === -1 && $language === $preferredLang) {
+                $preferred = $position;
+            }
+            if ($english === -1 && $language === 'eng') {
+                $english = $position;
+            }
+            $overviewCount += (int) (is_string($row['overview'] ?? null) && trim($row['overview']) !== '');
+            foreach (is_array($row['aliases'] ?? null) ? $row['aliases'] : [] as $alias) {
+                $aliasCount += (int) (is_string($alias) && trim($alias) !== '');
+            }
+            $position++;
+        }
+
+        return ['total_entries' => count($translations), 'preferred_language_index' => $preferred, 'english_language_index' => $english, 'non_empty_overview_count' => $overviewCount, 'alias_count' => $aliasCount];
+    }
+
     public TheTVDbAPI $client;
 
     /**

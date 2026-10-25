@@ -6,14 +6,166 @@ namespace App\Services;
 
 use App\Exceptions\BookProviderException;
 use App\Support\BookIsbn;
+use App\Support\RustPipelineLibrary;
 use Carbon\Carbon;
+use FFI;
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\GuzzleException;
 use Illuminate\Support\Facades\Cache;
 use JsonException;
+use Throwable;
 
 class OpenLibraryService
 {
+    /** Disabled until correctness and the common-path and p99 benchmark gates qualify. */
+    public const bool W394_RUST_FFI_DEFAULT = false;
+
+    public const string W394_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w394_openlibrary_work_editions(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private static ?bool $w394UseRustFfi = null;
+
+    private static FFI|false|null $w394Ffi = null;
+
+    public static function useW394RustFfi(?bool $use = true): void
+    {
+        self::$w394UseRustFfi = $use;
+        if ($use === null) {
+            self::$w394Ffi = null;
+        }
+    }
+
+    public static function usesW394RustFfi(): bool
+    {
+        return self::$w394UseRustFfi ?? self::W394_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW394RustFfi(): void
+    {
+        self::$w394UseRustFfi = null;
+        self::$w394Ffi = null;
+    }
+
+    /**
+     * Arguments contain only projected scalar fields, never caller-owned objects.
+     *
+     * @param  list<mixed>  $arguments
+     * @return array<string, int|string|bool>|null
+     */
+    private static function w394Call(array $arguments): ?array
+    {
+        try {
+            $input = serialize($arguments);
+            if (strlen($input) > 16777216) {
+                return null;
+            }
+            if (self::$w394Ffi === null) {
+                self::$w394Ffi = RustPipelineLibrary::resolveDomain('metadata_w394', self::W394_FFI_CDEF) ?? false;
+            }
+            $ffi = self::$w394Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            $capacity = 0;
+            $out = RustPipelineLibrary::obtainScratch($ffi, 2048, $capacity);
+            if ($out === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound (Declared by W394_FFI_CDEF.)
+            $written = $ffi->nntmux_w394_openlibrary_work_editions($input, strlen($input), $out, $capacity);
+            if (is_int($written) && $written < -1 && $written >= -16777216) {
+                $out = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($out === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound (Declared by W394_FFI_CDEF.)
+                $written = $ffi->nntmux_w394_openlibrary_work_editions($input, strlen($input), $out, $capacity);
+            }
+            if (! is_int($written) || $written <= 0 || $written > $capacity || $written > 16777216) {
+                return null;
+            }
+            $result = @unserialize(FFI::string($out, $written), ['allowed_classes' => false]);
+            $types = ['total_editions' => 'int', 'with_isbn13_count' => 'int', 'with_cover_count' => 'int', 'exact_year_match_count' => 'int', 'earliest_publication_year' => 'int'];
+            if (! is_array($result) || array_keys($result) !== array_keys($types)) {
+                return null;
+            }
+            foreach ($types as $key => $type) {
+                if (get_debug_type($result[$key]) !== $type) {
+                    return null;
+                }
+            }
+
+            return $result;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** @param array<array-key, mixed> $editions
+     * @return array<string, int|string|bool>
+     */
+    public static function summarizeOpenLibraryWorkEditions(array $editions, int $preferredYear = 0): array
+    {
+        if (self::usesW394RustFfi()) {
+            $safe = [];
+            foreach ($editions as $row) {
+                $row = is_array($row) ? $row : [];
+                $isbns = $covers = [];
+                foreach (is_array($row['isbn_13'] ?? null) ? $row['isbn_13'] : [] as $isbn) {
+                    if (is_string($isbn)) {
+                        $isbns[] = $isbn;
+                    }
+                }
+                foreach (is_array($row['covers'] ?? null) ? $row['covers'] : [] as $cover) {
+                    if (is_int($cover)) {
+                        $covers[] = $cover;
+                    }
+                }
+                $safe[] = ['isbn_13' => $isbns, 'covers' => $covers, 'publish_date' => is_string($row['publish_date'] ?? null) ? $row['publish_date'] : null];
+            }
+            $native = self::w394Call([$safe, $preferredYear]);
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
+        return self::summarizeOpenLibraryWorkEditionsPhp($editions, $preferredYear);
+    }
+
+    /** @param array<array-key, mixed> $editions
+     * @return array<string, int>
+     */
+    public static function summarizeOpenLibraryWorkEditionsPhp(array $editions, int $preferredYear = 0): array
+    {
+        $withIsbn = $withCover = $exact = $earliest = 0;
+        foreach ($editions as $row) {
+            $row = is_array($row) ? $row : [];
+            foreach (is_array($row['isbn_13'] ?? null) ? $row['isbn_13'] : [] as $isbn) {
+                if (is_string($isbn) && trim($isbn) !== '') {
+                    $withIsbn++;
+                    break;
+                }
+            }
+            foreach (is_array($row['covers'] ?? null) ? $row['covers'] : [] as $cover) {
+                if (is_int($cover) && $cover > 0) {
+                    $withCover++;
+                    break;
+                }
+            }
+            $year = 0;
+            if (is_string($row['publish_date'] ?? null) && preg_match('/(?<![0-9])[0-9]{4}(?![0-9])/', $row['publish_date'], $match) === 1) {
+                $year = (int) $match[0];
+            }
+            $exact += (int) ($preferredYear > 0 && $year === $preferredYear);
+            if ($year > 0 && ($earliest === 0 || $year < $earliest)) {
+                $earliest = $year;
+            }
+        }
+
+        return ['total_editions' => count($editions), 'with_isbn13_count' => $withIsbn, 'with_cover_count' => $withCover, 'exact_year_match_count' => $exact, 'earliest_publication_year' => $earliest];
+    }
+
     protected const SEARCH_URL = 'https://openlibrary.org/search.json';
 
     protected const ISBN_URL = 'https://openlibrary.org/isbn/';
