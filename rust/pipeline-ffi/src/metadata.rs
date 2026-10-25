@@ -45130,3 +45130,1326 @@ mod w464_tests {
         }
     }
 }
+/// Wave 47.4: IGDB client request, DataNode field path, Apicalypse query clause,
+/// IGDB candidate score and AniList media batch summaries.
+///
+/// Every export reads one PHP `serialize(list<string|int>)` frame holding a fixed number
+/// of fields per row and writes twelve little-endian `int64_t` values.
+pub mod w47_metadata {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+
+    pub const COUNTS: usize = 12;
+
+    pub const OUTPUT_BYTES: usize = COUNTS * 8;
+
+    type Counts = [i64; COUNTS];
+
+    unsafe fn dispatch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+        summarize: fn(&[u8]) -> Option<Counts>,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if input.is_null()
+                || out.is_null()
+                || len > MAX_INPUT
+                || len > isize::MAX as usize
+                || cap > isize::MAX as usize
+            {
+                return -1;
+            }
+            let Some(input_end) = (input as usize).checked_add(len) else {
+                return -1;
+            };
+            let Some(out_end) = (out as usize).checked_add(cap) else {
+                return -1;
+            };
+            if len != 0 && cap != 0 && (input as usize) < out_end && (out as usize) < input_end {
+                return -1;
+            }
+            // Both spans and their overlap are checked before borrowing caller memory.
+            let input = unsafe { std::slice::from_raw_parts(input, len) };
+            let Some(counts) = summarize(input) else {
+                return -1;
+            };
+            if cap < OUTPUT_BYTES {
+                return -(OUTPUT_BYTES as isize);
+            }
+            let mut bytes = [0u8; OUTPUT_BYTES];
+            for (chunk, count) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(counts) {
+                chunk.copy_from_slice(&count.to_le_bytes());
+            }
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, OUTPUT_BYTES) };
+            OUTPUT_BYTES as isize
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Canonical decimal (`0` or no leading zero) of at most 18 digits, then `term`.
+    fn number(input: &[u8], at: &mut usize, term: u8) -> Option<usize> {
+        let digits = input
+            .get(*at..)?
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        if digits == 0 || digits > 18 || (digits > 1 && input[*at] == b'0') {
+            return None;
+        }
+        let value = input[*at..*at + digits]
+            .iter()
+            .fold(0usize, |n, b| n * 10 + usize::from(b - b'0'));
+        *at += digits;
+        (input.get(*at) == Some(&term)).then(|| *at += 1)?;
+        Some(value)
+    }
+
+    fn literal(input: &[u8], at: &mut usize, lit: &[u8]) -> Option<()> {
+        (input.get(*at..*at + lit.len())? == lit).then(|| *at += lit.len())
+    }
+
+    /// Canonical PHP integer text (`0`, or an optional `-` and up to 19 digits without a
+    /// leading zero) ending at `;`; returns the text, which is what `(string)` yields.
+    fn integer<'a>(input: &'a [u8], at: &mut usize) -> Option<&'a [u8]> {
+        let start = *at;
+        let sign = usize::from(input.get(start) == Some(&b'-'));
+        let digits = input
+            .get(start + sign..)?
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        let first = *input.get(start + sign)?;
+        if digits == 0 || digits > 19 || (first == b'0' && (digits > 1 || sign == 1)) {
+            return None;
+        }
+        let end = start + sign + digits;
+        (input.get(end) == Some(&b';')).then(|| *at = end + 1)?;
+        Some(&input[start..end])
+    }
+
+    /// Streams PHP `serialize(list<string|int>)` and hands every `STRIDE` consecutive
+    /// entries to `row` with the zero-based row index; slot 0 counts rows. Integer
+    /// entries arrive as their decimal text, so PHP need not cast them first.
+    fn summarize<'a, const STRIDE: usize>(
+        input: &'a [u8],
+        init: Counts,
+        mut row: impl FnMut(&[&'a [u8]; STRIDE], i64, &mut Counts),
+    ) -> Option<Counts> {
+        let mut at = 0;
+        literal(input, &mut at, b"a:")?;
+        let entries = number(input, &mut at, b':')?;
+        literal(input, &mut at, b"{")?;
+        // Every entry needs at least `i:K;i:0;` (8 bytes).
+        if entries > input.len() / 8 || entries % STRIDE != 0 {
+            return None;
+        }
+        let mut counts = init;
+        let mut fields: [&'a [u8]; STRIDE] = [b""; STRIDE];
+        for index in 0..entries {
+            literal(input, &mut at, b"i:")?;
+            if number(input, &mut at, b';')? != index {
+                return None;
+            }
+            let entry = if input.get(at..at + 2) == Some(b"i:") {
+                at += 2;
+                integer(input, &mut at)?
+            } else {
+                literal(input, &mut at, b"s:")?;
+                let len = number(input, &mut at, b':')?;
+                literal(input, &mut at, b"\"")?;
+                let entry = input.get(at..at.checked_add(len)?)?;
+                at += len;
+                literal(input, &mut at, b"\";")?;
+                entry
+            };
+            fields[index % STRIDE] = entry;
+            if index % STRIDE == STRIDE - 1 {
+                row(&fields, counts[0], &mut counts);
+                counts[0] += 1;
+            }
+        }
+        literal(input, &mut at, b"}")?;
+        (at == input.len()).then_some(counts)
+    }
+
+    /// PHP trim() default set: space, tab, LF, CR, NUL and vertical tab.
+    #[inline(always)]
+    fn is_trim(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b)
+    }
+
+    fn trim(value: &[u8]) -> &[u8] {
+        trim_by(value, is_trim)
+    }
+
+    fn trim_by(value: &[u8], strip: fn(u8) -> bool) -> &[u8] {
+        let start = value.iter().position(|b| !strip(*b)).unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|b| !strip(*b))
+            .map_or(start, |i| i + 1);
+        &value[start..end]
+    }
+
+    #[inline(always)]
+    fn mark(counts: &mut Counts, slot: usize, matched: bool) {
+        counts[slot] += i64::from(matched);
+    }
+
+    /// `strlen in 1..=max_digits && ctype_digit()`, as an integer.
+    fn digits(value: &[u8], max_digits: usize) -> Option<i64> {
+        if value.is_empty() || value.len() > max_digits || !value.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        Some(value.iter().fold(0i64, |n, b| n * 10 + i64::from(b - b'0')))
+    }
+
+    // IGDB Client: [endpoint, expires_in, status] request descriptors.
+
+    const IGDB_ENDPOINTS: [&[u8]; 21] = [
+        b"age_ratings",
+        b"alternative_names",
+        b"artworks",
+        b"collections",
+        b"companies",
+        b"covers",
+        b"external_games",
+        b"franchises",
+        b"game_modes",
+        b"game_videos",
+        b"games",
+        b"genres",
+        b"involved_companies",
+        b"multiquery",
+        b"platform_logos",
+        b"platforms",
+        b"release_dates",
+        b"screenshots",
+        b"search",
+        b"themes",
+        b"websites",
+    ];
+
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
+        for b in bytes {
+            hash ^= u64::from(*b);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash
+    }
+
+    fn igdb_request(f: &[&[u8]; 3], _row: i64, c: &mut Counts) {
+        let endpoint = trim_by(f[0], |b| is_trim(b) || b == b'/');
+        if endpoint.is_empty() {
+            c[1] += 1;
+        } else {
+            mark(c, 2, IGDB_ENDPOINTS.contains(&endpoint));
+            mark(c, 3, endpoint.contains(&b'/'));
+            let invalid = endpoint.iter().any(|b| {
+                !(b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_' || *b == b'/')
+            });
+            mark(c, 4, invalid);
+            // Only well-formed endpoints reach the cache key digest.
+            if !invalid {
+                c[11] = fnv1a(fnv1a(c[11] as u64, endpoint), b"\n") as i64;
+            }
+        }
+        // computeTokenTtl() on a strict 1-9 digit expires_in, else Twitch's 3600 default.
+        let ttl = (digits(f[1], 9).unwrap_or(3600) - 60).max(60);
+        c[5] += ttl;
+        mark(c, 6, ttl == 60);
+        if f[2].len() == 3 && f[2].iter().all(u8::is_ascii_digit) {
+            match f[2][0] {
+                _ if f[2] == b"429" => c[7] += 1,
+                b'5' => c[8] += 1,
+                b'4' => c[9] += 1,
+                b'2' => c[10] += 1,
+                _ => {}
+            }
+        }
+    }
+
+    fn igdb_request_batch(input: &[u8]) -> Option<Counts> {
+        let mut init = [0; COUNTS];
+        init[11] = FNV_OFFSET as i64;
+        summarize::<3>(input, init, igdb_request)
+    }
+
+    // IGDB DataNode: [dotted field path, value type tag] pairs.
+
+    const TAG_INT: u8 = 1;
+    const TAG_FLOAT: u8 = 2;
+    const TAG_STRING: u8 = 4;
+    const TAG_LIST: u8 = 32;
+    const TAG_MAP: u8 = 64;
+
+    fn tag_bit(tag: &[u8]) -> Option<u8> {
+        Some(match tag {
+            b"i" => TAG_INT,
+            b"f" => TAG_FLOAT,
+            b"s" => TAG_STRING,
+            b"b" => 8,
+            b"n" => 16,
+            b"l" => TAG_LIST,
+            b"m" => TAG_MAP,
+            b"o" => 128,
+            _ => return None,
+        })
+    }
+
+    /// Leaf name, accepted type tags and whether DataNode treats it as a date field.
+    const IGDB_SCHEMA: [(&[u8], u8, bool); 40] = [
+        (b"abbreviation", TAG_STRING, false),
+        (b"age_ratings", TAG_LIST, false),
+        (b"aggregated_rating", TAG_INT | TAG_FLOAT, false),
+        (b"aggregated_rating_count", TAG_INT, false),
+        (b"alternative_names", TAG_LIST, false),
+        (b"artworks", TAG_LIST, false),
+        (b"category", TAG_INT, false),
+        (b"checksum", TAG_STRING, false),
+        (b"company", TAG_INT | TAG_MAP, false),
+        (b"cover", TAG_INT | TAG_MAP, false),
+        (b"created_at", TAG_INT, true),
+        (b"date", TAG_INT, true),
+        (b"first_release_date", TAG_INT, true),
+        (b"franchises", TAG_LIST, false),
+        (b"game", TAG_INT | TAG_MAP, false),
+        (b"game_modes", TAG_LIST, false),
+        (b"genres", TAG_LIST, false),
+        (b"human", TAG_STRING, false),
+        (b"id", TAG_INT, false),
+        (b"image_id", TAG_STRING, false),
+        (b"involved_companies", TAG_LIST, false),
+        (b"name", TAG_STRING, false),
+        (b"platform", TAG_INT | TAG_MAP, false),
+        (b"platforms", TAG_LIST, false),
+        (b"popularity", TAG_INT | TAG_FLOAT, false),
+        (b"rating", TAG_INT | TAG_FLOAT, false),
+        (b"rating_count", TAG_INT, false),
+        (b"release_dates", TAG_LIST, false),
+        (b"screenshots", TAG_LIST, false),
+        (b"similar_games", TAG_LIST, false),
+        (b"slug", TAG_STRING, false),
+        (b"start_date", TAG_INT, true),
+        (b"status", TAG_INT, false),
+        (b"storyline", TAG_STRING, false),
+        (b"summary", TAG_STRING, false),
+        (b"themes", TAG_LIST, false),
+        (b"total_rating", TAG_INT | TAG_FLOAT, false),
+        (b"updated_at", TAG_INT, true),
+        (b"url", TAG_STRING, false),
+        (b"websites", TAG_LIST, false),
+    ];
+
+    fn igdb_field_path(f: &[&[u8]; 2], _row: i64, c: &mut Counts) {
+        let path = f[0];
+        if path.is_empty() {
+            c[1] += 1;
+            return;
+        }
+        let bad = path.iter().any(|b| {
+            !(b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'.' | b'*'))
+        });
+        mark(c, 9, bad);
+        let mut valid = !bad;
+        let mut depth = 0i64;
+        let mut leaf: &[u8] = b"";
+        let mut wildcard = false;
+        for segment in path.split(|b| *b == b'.') {
+            depth += 1;
+            // A `*` segment is only legal last; any later segment invalidates it.
+            valid &= !segment.is_empty() && !wildcard;
+            if segment.contains(&b'*') {
+                valid &= segment == b"*";
+                wildcard = true;
+            }
+            leaf = segment;
+        }
+        if !valid {
+            c[1] += 1;
+            return;
+        }
+        mark(c, 2, depth >= 2);
+        mark(c, 3, depth >= 3);
+        mark(c, 4, wildcard);
+        c[10] += depth;
+        let Some(&(_, accepted, date)) = IGDB_SCHEMA.iter().find(|(name, _, _)| *name == leaf)
+        else {
+            return;
+        };
+        mark(c, 5, date);
+        c[6] += 1;
+        if let Some(bit) = tag_bit(f[1]) {
+            mark(c, 7, accepted & bit != 0);
+            mark(c, 8, accepted & bit == 0);
+        }
+        mark(c, 11, date && f[1] == b"i");
+    }
+
+    fn igdb_field_path_batch(input: &[u8]) -> Option<Counts> {
+        summarize::<2>(input, [0; COUNTS], igdb_field_path)
+    }
+
+    // IGDB QueryBuilder: raw Apicalypse query bodies.
+
+    const QUERY_KEYWORDS: [&[u8]; 7] = [
+        b"fields", b"exclude", b"search", b"where", b"sort", b"limit", b"offset",
+    ];
+
+    #[derive(Default)]
+    struct Query {
+        clauses: i64,
+        seen: u8,
+        duplicate: bool,
+        unknown: bool,
+        sort_valid: bool,
+        limit_valid: bool,
+        conditions: i64,
+    }
+
+    impl Query {
+        fn clause(&mut self, raw: &[u8], separators: i64) {
+            let clause = trim(raw);
+            if clause.is_empty() {
+                return;
+            }
+            self.clauses += 1;
+            let kw_len = clause
+                .iter()
+                .take_while(|b| b.is_ascii_alphabetic())
+                .count();
+            let rest = &clause[kw_len..];
+            let keyword = QUERY_KEYWORDS
+                .iter()
+                .position(|kw| kw.len() == kw_len && clause[..kw_len].eq_ignore_ascii_case(kw));
+            let Some(keyword) = keyword.filter(|_| rest.first().is_none_or(|b| is_trim(*b))) else {
+                self.unknown = true;
+                return;
+            };
+            let bit = 1u8 << keyword;
+            self.duplicate |= self.seen & bit != 0;
+            self.seen |= bit;
+            let rest = trim(rest);
+            match keyword {
+                3 => self.conditions += separators + 1,
+                4 => {
+                    let mut words = rest.split(|b| is_trim(*b)).filter(|w| !w.is_empty());
+                    let (field, direction) = (words.next(), words.next());
+                    self.sort_valid |= field.is_some()
+                        && words.next().is_none()
+                        && direction.is_some_and(|d| {
+                            d.eq_ignore_ascii_case(b"asc") || d.eq_ignore_ascii_case(b"desc")
+                        });
+                }
+                5 => self.limit_valid |= digits(rest, 3).is_some_and(|n| (1..=500).contains(&n)),
+                _ => {}
+            }
+        }
+    }
+
+    fn igdb_query(f: &[&[u8]; 1], _row: i64, c: &mut Counts) {
+        let q = f[0];
+        if trim(q).is_empty() {
+            c[1] += 1;
+            return;
+        }
+        let mut query = Query::default();
+        let (mut in_quote, mut depth, mut unbalanced) = (false, 0i64, false);
+        let (mut start, mut separators, mut i) = (0, 0, 0);
+        while i < q.len() {
+            let b = q[i];
+            i += 1;
+            if in_quote {
+                match b {
+                    b'\\' => i += 1,
+                    b'"' => in_quote = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match b {
+                b'"' => in_quote = true,
+                b'(' => depth += 1,
+                b')' if depth == 0 => unbalanced = true,
+                b')' => depth -= 1,
+                b'&' | b'|' => separators += 1,
+                b';' => {
+                    query.clause(&q[start..i - 1], separators);
+                    unbalanced |= depth != 0;
+                    (start, separators, depth) = (i, 0, 0);
+                }
+                _ => {}
+            }
+        }
+        unbalanced |= in_quote || depth != 0;
+        let tail = q.get(start..).unwrap_or_default();
+        let unterminated = !trim(tail).is_empty();
+        query.clause(tail, separators);
+        mark(c, 2, {
+            !unbalanced
+                && !unterminated
+                && !query.unknown
+                && !query.duplicate
+                && query.seen & 1 != 0
+        });
+        mark(c, 3, query.seen & 1 != 0);
+        mark(c, 4, query.seen & 4 != 0);
+        mark(c, 5, query.seen & 8 != 0);
+        mark(c, 6, query.sort_valid);
+        mark(c, 7, query.limit_valid);
+        mark(c, 8, unbalanced);
+        mark(c, 9, query.unknown);
+        c[10] += query.clauses;
+        c[11] += query.conditions;
+    }
+
+    fn igdb_query_batch(input: &[u8]) -> Option<Counts> {
+        summarize::<1>(input, [0; COUNTS], igdb_query)
+    }
+
+    // IGDBService: [query, candidate name, platform hint, candidate platforms, genres].
+
+    const PLATFORM_ALIASES: [(&[u8], &[u8]); 26] = [
+        (b"x360", b"xbox 360"),
+        (b"xbox360", b"xbox 360"),
+        (b"xbla", b"xbox 360"),
+        (b"xbox one", b"xbox one"),
+        (b"xboxone", b"xbox one"),
+        (b"x-box", b"xbox"),
+        (b"xbox", b"xbox"),
+        (b"dsi", b"nintendo ds"),
+        (b"nds", b"nintendo ds"),
+        (b"3ds", b"nintendo 3ds"),
+        (b"ps2", b"playstation2"),
+        (b"ps3", b"playstation 3"),
+        (b"ps4", b"playstation 4"),
+        (b"psp", b"sony psp"),
+        (b"psvita", b"playstation vita"),
+        (b"psx", b"playstation"),
+        (b"psx2psp", b"playstation"),
+        (b"wiiu", b"nintendo wii u"),
+        (b"wii", b"nintendo wii"),
+        (b"ngc", b"gamecube"),
+        (b"gc", b"gamecube"),
+        (b"n64", b"nintendo 64"),
+        (b"nes", b"nintendo nes"),
+        (b"super nintendo", b"snes"),
+        (b"nintendo super nes", b"snes"),
+        (b"snes", b"snes"),
+    ];
+
+    const KNOWN_GENRES: [&[u8]; 47] = [
+        b"Action",
+        b"Adventure",
+        b"Arcade",
+        b"Board Games",
+        b"Cards",
+        b"Casino",
+        b"Flying",
+        b"Puzzle",
+        b"Racing",
+        b"Rhythm",
+        b"Role-Playing",
+        b"RPG",
+        b"Simulation",
+        b"Sports",
+        b"Strategy",
+        b"Trivia",
+        b"Shooter",
+        b"FPS",
+        b"Horror",
+        b"Survival",
+        b"Sandbox",
+        b"Open World",
+        b"Platformer",
+        b"Fighting",
+        b"Stealth",
+        b"MMO",
+        b"MMORPG",
+        b"Battle Royale",
+        b"Roguelike",
+        b"Roguelite",
+        b"Metroidvania",
+        b"Visual Novel",
+        b"Point & Click",
+        b"Management",
+        b"City Builder",
+        b"Tower Defense",
+        b"Turn-Based",
+        b"Real-Time",
+        b"Educational",
+        b"Music",
+        b"Party",
+        b"Indie",
+        b"Hack and Slash",
+        b"Souls-like",
+        b"JRPG",
+        b"ARPG",
+        b"Tactical",
+    ];
+
+    /// The TITLE_STOPWORDS list as a length-dispatched match.
+    #[inline(always)]
+    fn is_stopword(token: &[u8]) -> bool {
+        matches!(
+            token,
+            b"a" | b"an"
+                | b"and"
+                | b"complete"
+                | b"definitive"
+                | b"deluxe"
+                | b"edition"
+                | b"goty"
+                | b"hd"
+                | b"of"
+                | b"remastered"
+                | b"the"
+                | b"ultimate"
+        )
+    }
+
+    /// One `strtolower()` title and its `[^a-z0-9]+`-split tokens (minus stopwords) as
+    /// ranges into the reused lower-case buffer, plus an open-addressing set of the
+    /// distinct tokens (slot value = token index + 1).
+    #[derive(Default)]
+    struct Title {
+        lower: Vec<u8>,
+        tokens: Vec<(usize, usize)>,
+        set: Vec<u32>,
+    }
+
+    fn token_hash(token: &[u8]) -> usize {
+        let mut hash = FNV_OFFSET;
+        for b in token {
+            hash = (hash ^ u64::from(*b)).wrapping_mul(FNV_PRIME);
+        }
+        (hash ^ (hash >> 29)) as usize
+    }
+
+    impl Title {
+        fn load(&mut self, title: &[u8]) {
+            self.lower.clear();
+            self.lower.extend(title.iter().map(u8::to_ascii_lowercase));
+            self.tokens.clear();
+            let mut start = 0;
+            for end in 0..=self.lower.len() {
+                if end < self.lower.len() && self.lower[end].is_ascii_alphanumeric() {
+                    continue;
+                }
+                if end > start && !is_stopword(&self.lower[start..end]) {
+                    self.tokens.push((start, end));
+                }
+                start = end + 1;
+            }
+        }
+
+        #[inline(always)]
+        fn token(&self, (start, end): (usize, usize)) -> &[u8] {
+            &self.lower[start..end]
+        }
+
+        /// Slot holding `token`, or the empty slot where it belongs.
+        fn slot(&self, token: &[u8], hash: usize) -> usize {
+            let mask = self.set.len() - 1;
+            let mut at = hash & mask;
+            loop {
+                match self.set[at] {
+                    0 => return at,
+                    held if self.token(self.tokens[held as usize - 1]) == token => return at,
+                    _ => at = (at + 1) & mask,
+                }
+            }
+        }
+
+        /// Fills the distinct-token set and calls `fresh` with each first occurrence.
+        fn index(&mut self, mut fresh: impl FnMut(&[u8], usize)) -> i64 {
+            self.set.clear();
+            self.set
+                .resize((self.tokens.len() * 2).next_power_of_two().max(16), 0);
+            let mut unique = 0;
+            for i in 0..self.tokens.len() {
+                let token = self.token(self.tokens[i]);
+                let hash = token_hash(token);
+                let at = self.slot(token, hash);
+                if self.set[at] == 0 {
+                    self.set[at] = i as u32 + 1;
+                    unique += 1;
+                    fresh(self.token(self.tokens[i]), hash);
+                }
+            }
+            unique
+        }
+
+        fn contains(&self, token: &[u8], hash: usize) -> bool {
+            self.set[self.slot(token, hash)] != 0
+        }
+
+        /// Whether `self`'s first `n` tokens equal `other`'s first `n` tokens.
+        fn same_prefix(&self, other: &Title, n: usize) -> bool {
+            self.tokens[..n]
+                .iter()
+                .zip(&other.tokens[..n])
+                .all(|(a, b)| self.token(*a) == other.token(*b))
+        }
+    }
+
+    /// 100 for identical token lists, else `100 * shared / union` distinct tokens plus 10
+    /// (capped at 100) when one list is a proper prefix of the other.
+    fn title_score(query: &mut Title, candidate: &mut Title) -> i64 {
+        let (nq, nc) = (query.tokens.len(), candidate.tokens.len());
+        if nq == nc && query.same_prefix(candidate, nq) {
+            return 100;
+        }
+        let unique_query = query.index(|_, _| {});
+        let mut shared = 0i64;
+        let query = &*query;
+        let unique_candidate =
+            candidate.index(|token, hash| shared += i64::from(query.contains(token, hash)));
+        let mut score = 100 * shared / (unique_query + unique_candidate - shared);
+        if nq != nc && query.same_prefix(candidate, nq.min(nc)) {
+            score = (score + 10).min(100);
+        }
+        score
+    }
+
+    /// normalizePlatformHint() with ASCII `strtolower()`: the canonical alias (already
+    /// lower case) or the trimmed input, compared ASCII case-insensitively.
+    fn platform(raw: &[u8]) -> &[u8] {
+        let trimmed = trim(raw);
+        PLATFORM_ALIASES
+            .iter()
+            .find(|(alias, _)| alias.eq_ignore_ascii_case(trimmed))
+            .map_or(trimmed, |(_, canonical)| canonical)
+    }
+
+    /// matchGenre(): any `ucwords(trim())` comma part of `str_replace('-', ' ', ...)` is known.
+    fn genre_known(genres: &[u8]) -> bool {
+        genres.split(|b| *b == b',').any(|part| {
+            // str_replace() turns `-` into a space before trim() runs.
+            let part = trim_by(part, |b| is_trim(b) || b == b'-');
+            KNOWN_GENRES.iter().any(|genre| {
+                genre.len() == part.len()
+                    && part.iter().enumerate().all(|(i, b)| {
+                        let b = if *b == b'-' { b' ' } else { *b };
+                        let word_start = i == 0
+                            || matches!(
+                                part[i - 1],
+                                b'-' | b' ' | b'\t' | b'\r' | b'\n' | 0x0b | 0x0c
+                            );
+                        let b = if word_start {
+                            b.to_ascii_uppercase()
+                        } else {
+                            b
+                        };
+                        b == genre[i]
+                    })
+            })
+        })
+    }
+
+    fn igdb_candidate(f: &[&[u8]; 5], row: i64, c: &mut Counts, titles: &mut [Title; 2]) {
+        let [query, candidate] = titles;
+        query.load(f[0]);
+        candidate.load(f[1]);
+        let title = if query.tokens.is_empty() || candidate.tokens.is_empty() {
+            c[1] += 1;
+            0
+        } else {
+            title_score(query, candidate)
+        };
+        mark(c, 2, title == 100);
+        let hint = platform(f[2]);
+        let mut adjust = 0;
+        if !hint.is_empty() {
+            let matched = f[3].split(|b| *b == b',').any(|p| {
+                let p = platform(p);
+                !p.is_empty() && p.eq_ignore_ascii_case(hint)
+            });
+            mark(c, 4, matched);
+            mark(c, 5, !matched);
+            adjust = if matched { 15 } else { -10 };
+        }
+        mark(c, 6, genre_known(f[4]));
+        let score = (title + adjust).max(0);
+        mark(c, 3, score >= 85);
+        c[7] += score;
+        if score > c[8] {
+            c[8] = score;
+            c[9] = row;
+        }
+        mark(c, 10, score >= 50);
+        c[11] += title;
+    }
+
+    fn igdb_candidate_batch(input: &[u8]) -> Option<Counts> {
+        let mut init = [0; COUNTS];
+        init[8] = -1;
+        init[9] = -1;
+        let mut titles: [Title; 2] = Default::default();
+        summarize::<5>(input, init, |f, row, c| {
+            igdb_candidate(f, row, c, &mut titles)
+        })
+    }
+
+    // PopulateAniListService: [romaji, english, native, synonyms (0x1e-joined),
+    // description, averageScore, episodes] media rows.
+
+    /// `trim(preg_replace('/[\x00-\x20\x7f]+/', ' ', $t), ' ')`.
+    fn sanitize_into(title: &[u8], buf: &mut Vec<u8>) {
+        buf.clear();
+        let mut gap = false;
+        for b in title {
+            if *b <= 0x20 || *b == 0x7f {
+                gap = true;
+            } else {
+                if gap && !buf.is_empty() {
+                    buf.push(b' ');
+                }
+                gap = false;
+                buf.push(*b);
+            }
+        }
+    }
+
+    /// `/<[A-Za-z\/!]/`.
+    fn has_html(text: &[u8]) -> bool {
+        text.windows(2)
+            .any(|w| w[0] == b'<' && (w[1].is_ascii_alphabetic() || matches!(w[1], b'/' | b'!')))
+    }
+
+    /// `/&(?:[A-Za-z]+|#[0-9]+|#[xX][0-9A-Fa-f]+);/`; each run is greedy and must end at `;`.
+    fn has_entity(text: &[u8]) -> bool {
+        let run = |rest: &[u8], class: fn(&u8) -> bool| {
+            let n = rest.iter().take_while(|b| class(b)).count();
+            n > 0 && rest.get(n) == Some(&b';')
+        };
+        let mut from = 0;
+        std::iter::from_fn(|| {
+            let at = from + text[from..].iter().position(|b| *b == b'&')?;
+            from = at + 1;
+            Some(&text[from..])
+        })
+        .any(|rest| match rest {
+            [b'#', b'x' | b'X', hex @ ..] => run(hex, u8::is_ascii_hexdigit),
+            [b'#', digits @ ..] => run(digits, u8::is_ascii_digit),
+            _ => run(rest, u8::is_ascii_alphabetic),
+        })
+    }
+
+    #[derive(Default)]
+    struct MediaScratch {
+        romaji: Vec<u8>,
+        english: Vec<u8>,
+        native: Vec<u8>,
+        synonym: Vec<u8>,
+    }
+
+    fn anilist_media(f: &[&[u8]; 7], c: &mut Counts, scratch: &mut MediaScratch) {
+        let MediaScratch {
+            romaji,
+            english,
+            native,
+            synonym,
+        } = scratch;
+        sanitize_into(f[0], romaji);
+        sanitize_into(f[1], english);
+        sanitize_into(f[2], native);
+        mark(
+            c,
+            1,
+            romaji.is_empty() && english.is_empty() && native.is_empty(),
+        );
+        mark(c, 2, !english.is_empty());
+        mark(c, 3, native.iter().any(|b| *b >= 0x80));
+        let mut synonyms = 0i64;
+        for raw in f[3].split(|b| *b == 0x1e) {
+            sanitize_into(raw, synonym);
+            synonyms += i64::from(
+                !synonym.is_empty()
+                    && !synonym.eq_ignore_ascii_case(romaji)
+                    && !synonym.eq_ignore_ascii_case(english),
+            );
+        }
+        c[4] += synonyms;
+        mark(c, 5, has_html(f[4]));
+        mark(c, 6, has_entity(f[4]));
+        let score = digits(f[5], 3).filter(|n| *n <= 100);
+        mark(c, 7, score.is_some());
+        let episodes = digits(f[6], 4).unwrap_or(0).min(100);
+        let rank = score.unwrap_or(0) * 4
+            + episodes
+            + if english.is_empty() { 0 } else { 10 }
+            + synonyms.min(5) * 2;
+        c[8] += rank;
+        mark(
+            c,
+            9,
+            romaji.len() > 100 || english.len() > 100 || native.len() > 100,
+        );
+        mark(c, 10, romaji.as_slice() != f[0]);
+        c[11] = c[11].max(rank);
+    }
+
+    fn anilist_media_batch(input: &[u8]) -> Option<Counts> {
+        let mut scratch = MediaScratch::default();
+        summarize::<7>(input, [0; COUNTS], |f, _, c| {
+            anilist_media(f, c, &mut scratch)
+        })
+    }
+
+    macro_rules! export {
+        ($name:ident, $summarize:ident) => {
+            /// # Safety
+            /// The input and output must be live buffers covering their declared lengths.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                input: *const u8,
+                len: usize,
+                out: *mut u8,
+                cap: usize,
+            ) -> isize {
+                unsafe { dispatch(input, len, out, cap, $summarize) }
+            }
+        };
+    }
+
+    export!(nntmux_w47_igdb_client_request_batch, igdb_request_batch);
+    export!(
+        nntmux_w47_igdb_datanode_field_path_batch,
+        igdb_field_path_batch
+    );
+    export!(nntmux_w47_igdb_query_clause_batch, igdb_query_batch);
+    export!(nntmux_w47_igdb_candidate_score_batch, igdb_candidate_batch);
+    export!(nntmux_w47_anilist_media_batch, anilist_media_batch);
+}
+
+#[cfg(test)]
+mod w47_tests {
+    use super::w47_metadata::*;
+
+    type Export = unsafe extern "C" fn(*const u8, usize, *mut u8, usize) -> isize;
+    const EXPORTS: [(Export, usize); 5] = [
+        (nntmux_w47_igdb_client_request_batch, 3),
+        (nntmux_w47_igdb_datanode_field_path_batch, 2),
+        (nntmux_w47_igdb_query_clause_batch, 1),
+        (nntmux_w47_igdb_candidate_score_batch, 5),
+        (nntmux_w47_anilist_media_batch, 7),
+    ];
+
+    enum Entry<'a> {
+        S(&'a [u8]),
+        I(i64),
+    }
+    use Entry::{I, S};
+
+    /// PHP `serialize(list<string|int>)`.
+    fn frame(entries: &[Entry]) -> Vec<u8> {
+        let mut wire = format!("a:{}:{{", entries.len()).into_bytes();
+        for (i, entry) in entries.iter().enumerate() {
+            match entry {
+                S(s) => {
+                    wire.extend_from_slice(format!("i:{i};s:{}:\"", s.len()).as_bytes());
+                    wire.extend_from_slice(s);
+                    wire.extend_from_slice(b"\";");
+                }
+                I(n) => wire.extend_from_slice(format!("i:{i};i:{n};").as_bytes()),
+            }
+        }
+        wire.push(b'}');
+        wire
+    }
+
+    fn counts(export: Export, entries: &[Entry]) -> [i64; COUNTS] {
+        let input = frame(entries);
+        let mut out = [b'Z'; 256];
+        let written = unsafe { export(input.as_ptr(), input.len(), out.as_mut_ptr(), out.len()) };
+        assert_eq!(written, OUTPUT_BYTES as isize);
+        assert!(out[OUTPUT_BYTES..].iter().all(|b| *b == b'Z'));
+        let mut result = [0i64; COUNTS];
+        for (value, chunk) in result.iter_mut().zip(out.as_chunks::<8>().0) {
+            *value = i64::from_le_bytes(*chunk);
+        }
+        result
+    }
+
+    fn fnv1a(bytes: &[u8]) -> i64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in bytes {
+            hash = (hash ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash as i64
+    }
+
+    #[test]
+    fn w47_client_request_counts() {
+        assert_eq!(
+            counts(
+                nntmux_w47_igdb_client_request_batch,
+                &[
+                    S(b"/games"),
+                    I(5_000_000),
+                    I(200),
+                    S(b"covers/ "),
+                    S(b"100"),
+                    S(b"429"),
+                    S(b"Games/x"),
+                    S(b"1e3"),
+                    I(503),
+                    S(b"//"),
+                    S(b"0"),
+                    S(b"404"),
+                    S(b""),
+                    S(b""),
+                    S(b""),
+                    S(b""),
+                    I(-5),
+                    S(b"2000"),
+                    S(b"v4/games"),
+                    I(1_000_000_000),
+                    S(b"042"),
+                ]
+            ),
+            [
+                7,
+                3,
+                2,
+                2,
+                1,
+                4_999_940 + 60 + 3540 + 60 + 3540 * 3,
+                2,
+                1,
+                1,
+                1,
+                1,
+                fnv1a(b"games\ncovers\nv4/games\n"),
+            ]
+        );
+        assert_eq!(
+            counts(nntmux_w47_igdb_client_request_batch, &[])[11],
+            fnv1a(b"")
+        );
+    }
+
+    #[test]
+    fn w47_datanode_field_path_counts() {
+        assert_eq!(
+            counts(
+                nntmux_w47_igdb_datanode_field_path_batch,
+                &[
+                    S(b"first_release_date"),
+                    S(b"i"),
+                    S(b"cover.image_id"),
+                    S(b"s"),
+                    S(b"platforms.*"),
+                    S(b"l"),
+                    S(b"involved_companies.company.name"),
+                    S(b"i"),
+                    S(b"rating"),
+                    S(b"f"),
+                    S(b"a..b"),
+                    S(b"i"),
+                    S(b"*.name"),
+                    S(b""),
+                    S(b"Name"),
+                    S(b"s"),
+                    S(b"cover"),
+                    S(b""),
+                    S(b""),
+                    S(b""),
+                    S(b"created_at"),
+                    S(b"s"),
+                    S(b"genres"),
+                    S(b"m"),
+                    S(b"cover"),
+                    S(b"x"),
+                ]
+            ),
+            [13, 4, 3, 1, 1, 2, 8, 3, 3, 1, 13, 1]
+        );
+    }
+
+    #[test]
+    fn w47_query_clause_counts() {
+        assert_eq!(
+            counts(
+                nntmux_w47_igdb_query_clause_batch,
+                &[
+                    S(b"fields name,cover.image_id; search \"Halo; \\\"CE\\\"\"; where platforms = (6,48) & rating > 70 | id = 1; sort rating DESC; limit 10;"),
+                    S(b"fields *; where (a = 1;"),
+                    S(b"FIELDS id; fields name;"),
+                    S(b"fields id; bogus 1;"),
+                    S(b"fields id; limit 501; sort a"),
+                    S(b"   "),
+                    S(b"fields id;;  ; offset 5;"),
+                    S(b"fields id; search \"open"),
+                    S(b"sort x asc;"),
+                    S(b"fields*;"),
+                    I(7),
+                ]
+            ),
+            [11, 1, 2, 7, 2, 2, 2, 1, 2, 3, 21, 4]
+        );
+    }
+
+    #[test]
+    fn w47_candidate_score_counts() {
+        assert_eq!(
+            counts(
+                nntmux_w47_igdb_candidate_score_batch,
+                &[
+                    S(b"Halo: Reach"),
+                    S(b"Halo Reach"),
+                    S(b"x360"),
+                    S(b"Xbox 360,PC"),
+                    S(b"Shooter"),
+                    S(b"The Witcher 3 GOTY"),
+                    S(b"Witcher 3: Wild Hunt"),
+                    S(b"PC"),
+                    S(b"pc,ps4"),
+                    S(b"role-playing, adventure"),
+                    S(b"Halo"),
+                    S(b"Halo 2"),
+                    S(b"ps3"),
+                    S(b"Xbox"),
+                    S(b"shooter"),
+                    S(b"!!!"),
+                    S(b"Doom"),
+                    S(b""),
+                    S(b""),
+                    S(b" -action"),
+                    S(b"Doom"),
+                    S(b""),
+                    S(b""),
+                    S(b""),
+                    S(b""),
+                    S(b"Doom"),
+                    S(b"Doom"),
+                    S(b""),
+                    S(b""),
+                    I(5),
+                ]
+            ),
+            [6, 2, 2, 2, 2, 1, 4, 340, 115, 0, 4, 320]
+        );
+        // Ties keep the first best row; an empty batch reports -1.
+        let tie = counts(
+            nntmux_w47_igdb_candidate_score_batch,
+            &[
+                S(b"a b"),
+                S(b"x"),
+                S(b""),
+                S(b""),
+                S(b""),
+                S(b"Doom"),
+                S(b"DOOM"),
+                S(b""),
+                S(b""),
+                S(b""),
+                S(b"doom"),
+                S(b"doom"),
+                S(b""),
+                S(b""),
+                S(b""),
+            ],
+        );
+        assert_eq!((tie[8], tie[9]), (100, 1));
+        let empty = counts(nntmux_w47_igdb_candidate_score_batch, &[]);
+        assert_eq!((empty[8], empty[9]), (-1, -1));
+    }
+
+    #[test]
+    fn w47_anilist_media_counts() {
+        assert_eq!(
+            counts(
+                nntmux_w47_anilist_media_batch,
+                &[
+                    S(b"Shingeki  no\tKyojin"),
+                    S(b"Attack on Titan"),
+                    S("進撃".as_bytes()),
+                    S(b"AoT\x1eattack on titan\x1e "),
+                    S(b"Humans <br>fight &amp; die."),
+                    I(85),
+                    I(25),
+                    S(b" "),
+                    S(b""),
+                    S(b""),
+                    S(b"One\x1eTwo"),
+                    S(b"&#x27; &#12;"),
+                    S(b"101"),
+                    S(b"99999"),
+                    S(b""),
+                    S(b""),
+                    S(b""),
+                    S(b""),
+                    S(b"a < b & c;"),
+                    I(0),
+                    I(120),
+                    S(b"Bare Title"),
+                    S(b""),
+                    S(b""),
+                    S(b""),
+                    S(b""),
+                    S(b""),
+                    S(b""),
+                    S(b""),
+                    S(b""),
+                    S(b""),
+                    S(b""),
+                    S(b"&#x;&;"),
+                    I(-1),
+                    I(10_000),
+                ]
+            ),
+            [5, 3, 1, 1, 3, 1, 2, 2, 377 + 4 + 100, 0, 2, 377]
+        );
+    }
+
+    #[test]
+    fn w47_integer_entries_read_as_their_decimal_text() {
+        for (export, stride) in EXPORTS {
+            for n in [0, 5, -5, 100, 429, 5_184_000, i64::MAX, i64::MIN] {
+                let text = n.to_string();
+                let as_text: Vec<Entry> = (0..stride).map(|_| S(text.as_bytes())).collect();
+                let as_int: Vec<Entry> = (0..stride).map(|_| I(n)).collect();
+                assert_eq!(counts(export, &as_text), counts(export, &as_int), "{n}");
+            }
+        }
+    }
+
+    #[test]
+    fn w47_all_exports_check_spans_and_preserve_output_on_failure() {
+        for (export, stride) in EXPORTS {
+            let entries: Vec<Entry> = (0..stride).map(|_| S(b"x")).collect();
+            let input = frame(&entries);
+            let mut out = [b'Z'; 256];
+            unsafe {
+                for cap in [0, 1, OUTPUT_BYTES - 1] {
+                    assert_eq!(
+                        export(input.as_ptr(), input.len(), out.as_mut_ptr(), cap),
+                        -(OUTPUT_BYTES as isize)
+                    );
+                    assert_eq!(out, [b'Z'; 256]);
+                }
+                assert_eq!(
+                    export(input.as_ptr(), input.len(), out.as_mut_ptr(), OUTPUT_BYTES),
+                    OUTPUT_BYTES as isize
+                );
+                assert!(out[OUTPUT_BYTES..].iter().all(|b| *b == b'Z'));
+                for (ptr, len) in [
+                    (std::ptr::null(), 0),
+                    (std::ptr::null(), input.len()),
+                    (input.as_ptr(), 16 * 1024 * 1024 + 1),
+                    (input.as_ptr(), isize::MAX as usize + 1),
+                    ((usize::MAX - 1) as *const u8, 8),
+                ] {
+                    out.fill(b'Z');
+                    assert_eq!(export(ptr, len, out.as_mut_ptr(), out.len()), -1);
+                    assert_eq!(out, [b'Z'; 256]);
+                }
+                assert_eq!(
+                    export(input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                    -1
+                );
+                for (ptr, cap) in [
+                    (out.as_mut_ptr(), usize::MAX),
+                    ((usize::MAX - 1) as *mut u8, 8),
+                ] {
+                    assert_eq!(export(input.as_ptr(), input.len(), ptr, cap), -1);
+                    assert_eq!(out, [b'Z'; 256]);
+                }
+                let mut overlap = vec![b'Z'; input.len() + 512];
+                overlap[32..32 + input.len()].copy_from_slice(&input);
+                let original = overlap.clone();
+                for offset in [0, 32, 33, 32 + input.len() - 1] {
+                    assert_eq!(
+                        export(
+                            overlap.as_ptr().add(32),
+                            input.len(),
+                            overlap.as_mut_ptr().add(offset),
+                            256
+                        ),
+                        -1
+                    );
+                    assert_eq!(overlap, original);
+                }
+                // Adjacent input/output spans are legal.
+                assert_eq!(
+                    export(
+                        overlap.as_ptr().add(32),
+                        input.len(),
+                        overlap.as_mut_ptr().add(32 + input.len()),
+                        256
+                    ),
+                    OUTPUT_BYTES as isize
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn w47_rejects_malformed_frames() {
+        for (export, stride) in EXPORTS {
+            let mut out = [b'Z'; 256];
+            // Entry counts must be a multiple of the row width.
+            let short: Vec<Entry> = (0..stride + 1).map(|_| S(b"x")).collect();
+            let partial = if stride > 1 {
+                frame(&short)
+            } else {
+                b"N;".to_vec()
+            };
+            for malformed in [
+                b"".as_slice(),
+                b"N;",
+                b"a:1:{i:0;",
+                b"a:01:{i:0;s:0:\"\";}",
+                b"a:999999999999999999999:{}",
+                b"a:1:{i:0;s:0:\"\";}trailing",
+                b"a:1:{i:1;s:0:\"\";}",
+                b"a:1:{i:00;s:0:\"\";}",
+                b"a:1:{i:0;N;}",
+                b"a:1:{i:0;i:05;}",
+                b"a:1:{i:0;i:-0;}",
+                b"a:1:{i:0;i:-;}",
+                b"a:1:{i:0;i:;}",
+                b"a:1:{i:0;i:5}",
+                b"a:1:{i:0;i:12345678901234567890;}",
+                b"a:1:{i:0;d:5;}",
+                b"a:1:{s:1:\"x\";s:0:\"\";}",
+                b"a:1:{i:0;a:0:{}}",
+                b"a:1:{i:0;s:5:\"x\";}",
+                b"a:1:{i:0;s:1:\"xy\";}",
+                b"a:1:{i:0;s:-1:\"\";}",
+                b"a:2:{i:0;s:0:\"\";}",
+                b"a:0:{i:0;s:0:\"\";}",
+                b"a:1:{i:0;s:0:\"\";",
+                b"a:1:{a:1:{i:0;s:0:\"\";}}",
+                &partial,
+            ] {
+                assert_eq!(
+                    unsafe {
+                        export(
+                            malformed.as_ptr(),
+                            malformed.len(),
+                            out.as_mut_ptr(),
+                            out.len(),
+                        )
+                    },
+                    -1,
+                    "{}",
+                    String::from_utf8_lossy(malformed)
+                );
+                assert_eq!(out, [b'Z'; 256]);
+            }
+            assert_eq!(counts(export, &[])[0], 0);
+            // Entries may embed quotes, NULs and frame syntax.
+            let tricky: Vec<Entry> = (0..stride).map(|_| S(b"\";}i:1;s:0:\"\0")).collect();
+            assert_eq!(counts(export, &tricky)[0], 1);
+        }
+    }
+}

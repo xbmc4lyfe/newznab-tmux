@@ -889,4 +889,209 @@ class PopulateAniListService
             $this->insertAniListInfo($anidbid, $anilistData);
         }
     }
+
+    /** Enabled: seven paired runs cleared 1.5x on every gate (min common mean 2.16x, p99 1.82x; uncommon mean 2.40x, p99 2.21x; see the W47 parity test). */
+    public const bool W47_MEDIA_RUST_FFI_DEFAULT = true;
+
+    public const string W47_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w47_anilist_media_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private const array W47_MEDIA_KEYS = ['total_media', 'untitled_count', 'english_title_count', 'native_non_ascii_count', 'synonym_count', 'html_description_count', 'entity_description_count', 'scored_count', 'rank_score_sum', 'long_title_count', 'sanitized_title_count', 'max_rank_score'];
+
+    private static ?bool $w47UseRustFfi = null;
+
+    private static FFI|false|null $w47Ffi = null;
+
+    /** Null restores the benchmark-qualified default. */
+    public static function useW47MediaRustFfi(?bool $enable = true): void
+    {
+        self::$w47UseRustFfi = $enable;
+    }
+
+    public static function usesW47MediaRustFfi(): bool
+    {
+        return self::$w47UseRustFfi ?? self::W47_MEDIA_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW47MediaRustFfi(): void
+    {
+        self::$w47UseRustFfi = null;
+        self::$w47Ffi = null;
+    }
+
+    /**
+     * Summarize AniList GraphQL media payloads. Titles and synonyms are
+     * sanitized by collapsing runs of bytes 0x00-0x20 and 0x7f into one
+     * space and trimming spaces. Counts untitled rows, English titles,
+     * non-ASCII native titles, synonyms that are non-empty and differ
+     * (ASCII case-insensitively) from the romaji and English titles,
+     * descriptions with HTML tags or entities, valid 0-100 averageScore
+     * values, titles over 100 bytes and romaji titles sanitizing changed.
+     * Each row's rank is 4 * averageScore + min(episodes, 100) + 10 for an
+     * English title + 2 * min(synonyms, 5); the sum and maximum are kept.
+     *
+     * @param  array<array-key, mixed>  $media
+     * @return array<string, int>
+     */
+    public static function summarizeMediaBatch(array $media): array
+    {
+        return self::usesW47MediaRustFfi()
+            ? self::summarizeMediaBatchNative($media)
+            : self::summarizeMediaBatchPhp($media);
+    }
+
+    /**
+     * Rust summary; falls back to PHP when the library or input frame is unusable.
+     *
+     * @param  array<array-key, mixed>  $media
+     * @return array<string, int>
+     */
+    public static function summarizeMediaBatchNative(array $media): array
+    {
+        $fields = self::w47Fields($media);
+
+        return self::w47Call($fields) ?? self::w47Summary($fields);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $media
+     * @return array<string, int>
+     */
+    public static function summarizeMediaBatchPhp(array $media): array
+    {
+        return self::w47Summary(self::w47Fields($media));
+    }
+
+    /**
+     * Only string and integer values participate; objects are never cast or serialized.
+     *
+     * @param  array<array-key, mixed>  $media
+     * @return list<int|string>
+     */
+    private static function w47Fields(array $media): array
+    {
+        $fields = [];
+        foreach ($media as $row) {
+            if (! is_array($row)) {
+                $fields[] = is_string($row) ? $row : (is_int($row) ? (string) $row : '');
+                array_push($fields, '', '', '', '', '', '');
+
+                continue;
+            }
+            $title = $row['title'] ?? null;
+            if (is_array($title)) {
+                $v = $title['romaji'] ?? null;
+                $fields[] = is_string($v) ? $v : (is_int($v) ? (string) $v : '');
+                $v = $title['english'] ?? null;
+                $fields[] = is_string($v) ? $v : (is_int($v) ? (string) $v : '');
+                $v = $title['native'] ?? null;
+                $fields[] = is_string($v) ? $v : (is_int($v) ? (string) $v : '');
+            } else {
+                array_push($fields, '', '', '');
+            }
+            $v = $row['synonyms'] ?? null;
+            if (is_array($v)) {
+                $v = implode("\x1e", array_filter($v, is_string(...)));
+            }
+            $fields[] = is_string($v) ? $v : (is_int($v) ? (string) $v : '');
+            $v = $row['description'] ?? null;
+            $fields[] = is_string($v) ? $v : (is_int($v) ? (string) $v : '');
+            // Integers stay integers: serialize() writes their decimal text, which Rust reads as the string.
+            $v = $row['averageScore'] ?? null;
+            $fields[] = is_string($v) || is_int($v) ? $v : '';
+            $v = $row['episodes'] ?? null;
+            $fields[] = is_string($v) || is_int($v) ? $v : '';
+        }
+
+        return $fields;
+    }
+
+    private static function w47Sanitize(string $title): string
+    {
+        return trim((string) preg_replace('/[\x00-\x20\x7f]+/', ' ', $title), ' ');
+    }
+
+    /**
+     * @param  list<int|string>  $fields
+     * @return array<string, int>
+     */
+    private static function w47Summary(array $fields): array
+    {
+        $summary = array_fill_keys(self::W47_MEDIA_KEYS, 0);
+        for ($i = 0, $n = count($fields); $i < $n; $i += 7) {
+            $summary['total_media']++;
+            $romaji = self::w47Sanitize((string) $fields[$i]);
+            $english = self::w47Sanitize((string) $fields[$i + 1]);
+            $native = self::w47Sanitize((string) $fields[$i + 2]);
+            $summary['untitled_count'] += (int) ($romaji === '' && $english === '' && $native === '');
+            $summary['english_title_count'] += (int) ($english !== '');
+            $summary['native_non_ascii_count'] += (int) (preg_match('/[\x80-\xff]/', $native) === 1);
+            $lowerRomaji = strtolower($romaji);
+            $lowerEnglish = strtolower($english);
+            $synonyms = 0;
+            foreach (explode("\x1e", (string) $fields[$i + 3]) as $synonym) {
+                $synonym = strtolower(self::w47Sanitize($synonym));
+                $synonyms += (int) ($synonym !== '' && $synonym !== $lowerRomaji && $synonym !== $lowerEnglish);
+            }
+            $summary['synonym_count'] += $synonyms;
+            $description = (string) $fields[$i + 4];
+            $summary['html_description_count'] += (int) (preg_match('#<[A-Za-z/!]#', $description) === 1);
+            $summary['entity_description_count'] += (int) (preg_match('/&(?:[A-Za-z]+|#[0-9]+|#[xX][0-9A-Fa-f]+);/', $description) === 1);
+            // Integers behave as their decimal text: 1-3 digits is 0..999, 1-4 digits 0..9999.
+            $score = $fields[$i + 5];
+            $score = is_int($score)
+                ? ($score >= 0 && $score <= 100 ? $score : -1)
+                : (strlen($score) <= 3 && ctype_digit($score) && (int) $score <= 100 ? (int) $score : -1);
+            $summary['scored_count'] += (int) ($score >= 0);
+            $episodes = $fields[$i + 6];
+            $episodes = is_int($episodes)
+                ? ($episodes >= 0 && $episodes <= 9999 ? $episodes : 0)
+                : (strlen($episodes) <= 4 && ctype_digit($episodes) ? (int) $episodes : 0);
+            $rank = 4 * max(0, $score)
+                + min(100, $episodes)
+                + ($english !== '' ? 10 : 0)
+                + 2 * min(5, $synonyms);
+            $summary['rank_score_sum'] += $rank;
+            $summary['long_title_count'] += (int) (strlen($romaji) > 100 || strlen($english) > 100 || strlen($native) > 100);
+            $summary['sanitized_title_count'] += (int) ($romaji !== $fields[$i]);
+            $summary['max_rank_score'] = max($summary['max_rank_score'], $rank);
+        }
+
+        return $summary;
+    }
+
+    /**
+     * @param  list<int|string>  $fields
+     * @return array<string, int>|null
+     */
+    private static function w47Call(array $fields): ?array
+    {
+        try {
+            $input = serialize($fields);
+            if (strlen($input) > 16777216) {
+                return null;
+            }
+            self::$w47Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w47', self::W47_FFI_CDEF) ?? false;
+            $ffi = self::$w47Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            // obtainScratch() returns at least the 96 bytes requested.
+            $out = RustPipelineLibrary::obtainScratch($ffi, 96);
+            // @phpstan-ignore method.notFound (Declared by W47_FFI_CDEF.)
+            if ($out === null || $ffi->nntmux_w47_anilist_media_batch($input, strlen($input), $out, 96) !== 96) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('P*', FFI::string($out, 96));
+            if ($values === false || count($values) !== 12 || count($fields) !== $values[1] * 7) {
+                return null;
+            }
+
+            return array_combine(self::W47_MEDIA_KEYS, $values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }
