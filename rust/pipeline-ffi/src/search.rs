@@ -33149,3 +33149,932 @@ mod wave46_5_api_v1_v2_presenter_payload_rows_xml_context {
         }
     }
 }
+// ---------------------------------------------------------------------------
+// Wave 47.5: LogIndex, LogIndexer, LogSearchCoordinator, ManticoreLogSearcher
+// and LogSearcher batch helpers.
+// ---------------------------------------------------------------------------
+mod wave47_5_logviewer_index_indexer_coordinator_manticore_searcher {
+    use std::collections::HashMap;
+    use std::hash::{BuildHasherDefault, Hasher};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const DECLINE: i64 = -1;
+    const MAX_INPUT: usize = 64 * 1024 * 1024;
+    /// `SearchQuery::MAX_HIGHLIGHTS`: occurrences counted per string.
+    const MAX_HIGHLIGHTS: i64 = 200;
+    /// `LogIndex::OFFSET_BITS`.
+    const OFFSET_BITS: u32 = 40;
+    /// File ids below this keep `(file_id << 40) | offset` positive.
+    const MAX_FILE_ID: i64 = 1 << (63 - OFFSET_BITS);
+
+    /// Little-endian reader over one packed batch.
+    struct Reader<'a> {
+        input: &'a [u8],
+        pos: usize,
+    }
+
+    impl<'a> Reader<'a> {
+        fn new(input: &'a [u8]) -> Self {
+            Self { input, pos: 0 }
+        }
+
+        fn remaining(&self) -> usize {
+            self.input.len() - self.pos
+        }
+
+        fn take(&mut self, len: usize) -> Option<&'a [u8]> {
+            let end = self.pos.checked_add(len)?;
+            let bytes = self.input.get(self.pos..end)?;
+            self.pos = end;
+            Some(bytes)
+        }
+
+        fn i64(&mut self) -> Option<i64> {
+            Some(i64::from_le_bytes(self.take(8)?.try_into().ok()?))
+        }
+
+        fn count(&mut self) -> Option<usize> {
+            usize::try_from(self.i64()?).ok()
+        }
+
+        fn flag(&mut self) -> Option<bool> {
+            match self.i64()? {
+                0 => Some(false),
+                1 => Some(true),
+                _ => None,
+            }
+        }
+
+        /// `count` i64 values; declines when fewer bytes remain.
+        fn i64s(&mut self, count: usize) -> Option<Vec<i64>> {
+            let bytes = self.take(count.checked_mul(8)?)?;
+            Some(
+                bytes
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|chunk| i64::from_le_bytes(*chunk))
+                    .collect(),
+            )
+        }
+
+        /// `count` NUL-joined strings that consume the rest of the input. A
+        /// string holding a NUL makes the counts disagree and declines the
+        /// batch; a zero count needs an empty body.
+        fn strings(&mut self, count: usize) -> Option<Vec<&'a [u8]>> {
+            let body = &self.input[self.pos..];
+            self.pos = self.input.len();
+            if count == 0 {
+                return body.is_empty().then(Vec::new);
+            }
+            let mut parts = Vec::with_capacity(count);
+            let mut start = 0;
+            while let Some(found) = memchr(0, &body[start..]) {
+                if parts.len() + 1 == count {
+                    return None;
+                }
+                parts.push(&body[start..start + found]);
+                start += found + 1;
+            }
+            parts.push(&body[start..]);
+            (parts.len() == count).then_some(parts)
+        }
+    }
+
+    /// Native output: little-endian i64 fields, read by PHP's `unpack('P*')`.
+    struct Fields(Vec<u8>);
+
+    impl Fields {
+        fn with_fields(fields: usize) -> Option<Self> {
+            Some(Self(Vec::with_capacity(fields.checked_mul(8)?)))
+        }
+
+        fn push(&mut self, value: i64) {
+            self.0.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    /// Word-at-a-time FNV-style hash over path bytes; one map lives for one
+    /// call.
+    #[derive(Default)]
+    struct PathHasher(u64);
+
+    impl Hasher for PathHasher {
+        fn write(&mut self, bytes: &[u8]) {
+            const PRIME: u64 = 0x0000_0100_0000_01B3;
+            let (words, tail) = bytes.as_chunks::<8>();
+            let mut hash = self.0 ^ 0xCBF2_9CE4_8422_2325;
+            for word in words {
+                hash = (hash ^ u64::from_le_bytes(*word)).wrapping_mul(PRIME);
+            }
+            let mut last = [0u8; 8];
+            last[..tail.len()].copy_from_slice(tail);
+            hash = (hash ^ u64::from_le_bytes(last)).wrapping_mul(PRIME);
+            self.0 = (hash ^ (hash >> 29)).wrapping_mul(PRIME) ^ (bytes.len() as u64);
+        }
+
+        fn finish(&self) -> u64 {
+            self.0
+        }
+    }
+
+    const LOW_BITS: u64 = 0x0101_0101_0101_0101;
+    const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+
+    /// High bit set in each byte of `word` equal to the splatted byte; the
+    /// lowest set bit is always exact (borrows only reach higher bytes).
+    #[inline(always)]
+    fn eq_mask(word: u64, splat: u64) -> u64 {
+        let x = word ^ splat;
+        x.wrapping_sub(LOW_BITS) & !x & HIGH_BITS
+    }
+
+    #[inline(always)]
+    fn word_at(bytes: &[u8], at: usize) -> u64 {
+        u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
+    }
+
+    /// First position of `a` or `b` in `haystack`, eight bytes at a time.
+    #[inline]
+    fn memchr2(a: u8, b: u8, haystack: &[u8]) -> Option<usize> {
+        let (splat_a, splat_b) = (LOW_BITS * u64::from(a), LOW_BITS * u64::from(b));
+        let mut index = 0;
+        while index + 16 <= haystack.len() {
+            let (first, second) = (word_at(haystack, index), word_at(haystack, index + 8));
+            let low = eq_mask(first, splat_a) | eq_mask(first, splat_b);
+            let high = eq_mask(second, splat_a) | eq_mask(second, splat_b);
+            if low != 0 {
+                return Some(index + (low.trailing_zeros() / 8) as usize);
+            }
+            if high != 0 {
+                return Some(index + 8 + (high.trailing_zeros() / 8) as usize);
+            }
+            index += 16;
+        }
+        haystack[index..]
+            .iter()
+            .position(|&byte| byte == a || byte == b)
+            .map(|found| index + found)
+    }
+
+    /// First position of `needle` in `haystack`, eight bytes at a time.
+    #[inline]
+    fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
+        let splat = LOW_BITS * u64::from(needle);
+        let mut index = 0;
+        while index + 16 <= haystack.len() {
+            let low = eq_mask(word_at(haystack, index), splat);
+            let high = eq_mask(word_at(haystack, index + 8), splat);
+            if low != 0 {
+                return Some(index + (low.trailing_zeros() / 8) as usize);
+            }
+            if high != 0 {
+                return Some(index + 8 + (high.trailing_zeros() / 8) as usize);
+            }
+            index += 16;
+        }
+        haystack[index..]
+            .iter()
+            .position(|&byte| byte == needle)
+            .map(|found| index + found)
+    }
+
+    /// Finds `folded` (non-empty) in `haystack[from..]` like PHP's `strpos`
+    /// / `stripos` (ASCII-only folding since PHP 8.2). `folded` is the needle
+    /// already lowercased when `case_sensitive` is false.
+    fn find(haystack: &[u8], folded: &[u8], from: usize, case_sensitive: bool) -> Option<usize> {
+        let len = folded.len();
+        if len == 0 || haystack.len() < len || from > haystack.len() - len {
+            return None;
+        }
+        let first = folded[0];
+        let other = if case_sensitive {
+            first
+        } else {
+            first.to_ascii_uppercase()
+        };
+        let last_start = haystack.len() - len;
+        let mut index = from;
+        while index <= last_start {
+            let window = &haystack[index..=last_start];
+            index += if first == other {
+                memchr(first, window)?
+            } else {
+                memchr2(first, other, window)?
+            };
+            let candidate = &haystack[index + 1..index + len];
+            let rest = &folded[1..];
+            let matched = if case_sensitive {
+                candidate == rest
+            } else {
+                candidate
+                    .iter()
+                    .zip(rest)
+                    .all(|(h, n)| h.to_ascii_lowercase() == *n)
+            };
+            if matched {
+                return Some(index);
+            }
+            index += 1;
+        }
+        None
+    }
+
+    /// Non-overlapping occurrences (capped at `MAX_HIGHLIGHTS`), the first
+    /// start and the last end, or -1 for both when there is none.
+    fn occurrences(haystack: &[u8], folded: &[u8], case_sensitive: bool) -> (i64, i64, i64) {
+        let mut hits = 0;
+        let mut first = -1;
+        let mut last = -1;
+        let mut offset = 0;
+        while hits < MAX_HIGHLIGHTS {
+            let Some(position) = find(haystack, folded, offset, case_sensitive) else {
+                break;
+            };
+            hits += 1;
+            if first < 0 {
+                first = position as i64;
+            }
+            offset = position + folded.len();
+            last = offset as i64;
+        }
+        (hits, first, last)
+    }
+
+    fn fold_term(term: &[u8], case_sensitive: bool) -> Vec<u8> {
+        if case_sensitive {
+            term.to_vec()
+        } else {
+            term.to_ascii_lowercase()
+        }
+    }
+
+    /// Mode 1, `LogIndex::indexEntryRangeBatch`:
+    /// `[n][m][n x (file_id, offset, end, logged_at)][m cursors]`. Per entry:
+    /// document id and validity flags; per cursor: lower bound over entry
+    /// offsets, valid entries below it and their newest `logged_at`.
+    fn index_entry_ranges(input: &[u8]) -> Option<Vec<u8>> {
+        let mut reader = Reader::new(input);
+        let entries = reader.count()?;
+        let cursors = reader.count()?;
+        if reader.remaining()
+            != entries
+                .checked_mul(32)?
+                .checked_add(cursors.checked_mul(8)?)?
+        {
+            return None;
+        }
+        let mut out = Fields::with_fields(
+            entries
+                .checked_mul(2)?
+                .checked_add(cursors.checked_mul(3)?)?,
+        )?;
+        let mut offsets = Vec::with_capacity(entries);
+        let mut valid_below = Vec::with_capacity(entries + 1);
+        let mut newest_below = Vec::with_capacity(entries + 1);
+        valid_below.push(0i64);
+        newest_below.push(0i64);
+        let mut previous_end: Option<i64> = None;
+        for _ in 0..entries {
+            let file_id = reader.i64()?;
+            let offset = reader.i64()?;
+            let end = reader.i64()?;
+            let logged_at = reader.i64()?;
+            let mut flags = 0i64;
+            if (0..1i64 << OFFSET_BITS).contains(&offset) {
+                flags |= 1;
+            }
+            if end >= offset {
+                flags |= 2;
+            }
+            if (0..MAX_FILE_ID).contains(&file_id) {
+                flags |= 4;
+            }
+            if previous_end.is_none_or(|previous| offset >= previous) {
+                flags |= 8;
+            }
+            if logged_at > 0 {
+                flags |= 16;
+            }
+            previous_end = Some(end);
+            let valid = flags & 15 == 15;
+            let count = valid_below[valid_below.len() - 1] + i64::from(valid);
+            let newest = newest_below[newest_below.len() - 1];
+            valid_below.push(count);
+            newest_below.push(if valid { newest.max(logged_at) } else { newest });
+            offsets.push(offset);
+            out.push((((file_id as u64) << OFFSET_BITS) as i64) | offset);
+            out.push(flags);
+        }
+        for _ in 0..cursors {
+            let cursor = reader.i64()?;
+            let (mut low, mut high) = (0usize, entries);
+            while low < high {
+                let middle = (low + high) >> 1;
+                if offsets[middle] < cursor {
+                    low = middle + 1;
+                } else {
+                    high = middle;
+                }
+            }
+            out.push(low as i64);
+            out.push(valid_below[low]);
+            out.push(newest_below[low]);
+        }
+        Some(out.0)
+    }
+
+    const DIGIT: u8 = 1;
+    const CHANNEL: u8 = 2;
+    const UPPER: u8 = 4;
+    /// Byte classes of the header pattern: `[0-9]`, `[A-Za-z0-9_.\-]`, `[A-Z]`.
+    static CLASSES: [u8; 256] = {
+        let mut table = [0u8; 256];
+        let mut byte = 0;
+        while byte < 256 {
+            let b = byte as u8;
+            if b.is_ascii_digit() {
+                table[byte] |= DIGIT;
+            }
+            if b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-' {
+                table[byte] |= CHANNEL;
+            }
+            if b.is_ascii_uppercase() {
+                table[byte] |= UPPER;
+            }
+            byte += 1;
+        }
+        table
+    };
+    /// `[0000-00-00T00:00:00`: `0` marks a digit, other bytes must match
+    /// (`T` also accepts a space).
+    const STAMP: &[u8; 20] = b"[0000-00-00T00:00:00";
+
+    /// `/^\[[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}[^\]]*\] [A-Za-z0-9_.\-]+\.[A-Z]+:/`.
+    fn is_entry_header(line: &[u8]) -> bool {
+        if line.len() < 21 {
+            return false;
+        }
+        for (index, &expected) in STAMP.iter().enumerate() {
+            let byte = line[index];
+            let ok = match expected {
+                b'0' => CLASSES[byte as usize] & DIGIT != 0,
+                b'T' => byte == b'T' || byte == b' ',
+                _ => byte == expected,
+            };
+            if !ok {
+                return false;
+            }
+        }
+        let Some(close) = memchr(b']', &line[20..]) else {
+            return false;
+        };
+        let start = 20 + close + 2;
+        if line.get(start - 1) != Some(&b' ') {
+            return false;
+        }
+        let run = line[start..]
+            .iter()
+            .take_while(|&&b| CLASSES[b as usize] & CHANNEL != 0)
+            .count();
+        let colon = start + run;
+        if line.get(colon) != Some(&b':') {
+            return false;
+        }
+        let upper = line[start..colon]
+            .iter()
+            .rev()
+            .take_while(|&&b| CLASSES[b as usize] & UPPER != 0)
+            .count();
+        upper > 0 && colon - upper - 1 > start && line[colon - upper - 1] == b'.'
+    }
+
+    fn is_continuation(line: &[u8]) -> bool {
+        match line.first() {
+            Some(b' ' | b'\t') => true,
+            Some(b'#') => line.get(1).is_some_and(u8::is_ascii_digit),
+            _ => line.starts_with(b"Stack trace:") || line.starts_with(b"[stacktrace]"),
+        }
+    }
+
+    /// Mode 2, `LogIndexer::scanChunkBatch`: `[count][strings]`. Per chunk:
+    /// complete lines, entry headers, stack-trace continuations, first and
+    /// last header offsets, resume offset, longest entry span and CRLF lines.
+    fn scan_chunks(input: &[u8]) -> Option<Vec<u8>> {
+        let mut reader = Reader::new(input);
+        let count = reader.count()?;
+        let chunks = reader.strings(count)?;
+        let mut out = Fields::with_fields(count.checked_mul(8)?)?;
+        for chunk in chunks {
+            let (mut lines, mut headers, mut continuations, mut crlf) = (0i64, 0i64, 0i64, 0i64);
+            let (mut first_header, mut last_header, mut longest) = (-1i64, -1i64, 0i64);
+            let mut offset = 0usize;
+            while let Some(found) = memchr(b'\n', &chunk[offset..]) {
+                let line = &chunk[offset..offset + found];
+                lines += 1;
+                if line.last() == Some(&b'\r') {
+                    crlf += 1;
+                }
+                if line.first() == Some(&b'[') && is_entry_header(line) {
+                    headers += 1;
+                    let at = offset as i64;
+                    if first_header < 0 {
+                        first_header = at;
+                    }
+                    if last_header >= 0 {
+                        longest = longest.max(at - last_header);
+                    }
+                    last_header = at;
+                } else if is_continuation(line) {
+                    continuations += 1;
+                }
+                offset += found + 1;
+            }
+            let resume = offset as i64;
+            if last_header >= 0 {
+                longest = longest.max(resume - last_header);
+            }
+            for value in [
+                lines,
+                headers,
+                continuations,
+                first_header,
+                last_header,
+                resume,
+                longest,
+                crlf,
+            ] {
+                out.push(value);
+            }
+        }
+        Some(out.0)
+    }
+
+    /// Mode 3, `LogSearchCoordinator::routeFileBatch`:
+    /// `[count][usable][lag][has_before][before][sizes][offsets][indexed_at][paths]`.
+    /// Per file: route, index state, indexed bytes, indexed cursor and the
+    /// index of the first file with the same path.
+    fn route_files(input: &[u8]) -> Option<Vec<u8>> {
+        let mut reader = Reader::new(input);
+        let count = reader.count()?;
+        let usable = reader.flag()?;
+        let lag = i128::from(reader.i64()?);
+        let has_before = reader.flag()?;
+        let before = reader.i64()?;
+        let sizes = reader.i64s(count)?;
+        let offsets = reader.i64s(count)?;
+        let indexed_at = reader.i64s(count)?;
+        let paths = reader.strings(count)?;
+        let mut out = Fields::with_fields(count.checked_mul(5)?)?;
+        let mut first: HashMap<&[u8], i64, BuildHasherDefault<PathHasher>> =
+            HashMap::with_capacity_and_hasher(count, Default::default());
+        for (index, path) in paths.into_iter().enumerate() {
+            let (size, offset) = (sizes[index], offsets[index]);
+            let has_row = offset >= 0;
+            let state = if !has_row || indexed_at[index] <= 0 {
+                0
+            } else if i128::from(size) - i128::from(offset) <= lag && size >= offset {
+                2
+            } else {
+                1
+            };
+            let route = usable && state == 2;
+            out.push(i64::from(route));
+            out.push(state);
+            out.push(if has_row { offset.min(size) } else { 0 });
+            out.push(match (route, has_before) {
+                (false, _) => -1,
+                (true, false) => offset,
+                (true, true) => before.min(offset),
+            });
+            out.push(*first.entry(path).or_insert(index as i64));
+        }
+        Some(out.0)
+    }
+
+    /// Mode 4, `ManticoreLogSearcher::scoreHitBatch`:
+    /// `[count][case][levels][channels][offsets][ends][lines]` then strings
+    /// `term, levels, channels, hit levels, hit channels, first lines, bodies`.
+    /// Per hit: offset, end, positive line or 0, filter verdict, text match
+    /// and score (4 per first-line occurrence plus 1 per body occurrence).
+    fn score_hits(input: &[u8]) -> Option<Vec<u8>> {
+        let mut reader = Reader::new(input);
+        let count = reader.count()?;
+        let case_sensitive = reader.flag()?;
+        let level_count = reader.count()?;
+        let channel_count = reader.count()?;
+        let offsets = reader.i64s(count)?;
+        let ends = reader.i64s(count)?;
+        let lines = reader.i64s(count)?;
+        let total = count
+            .checked_mul(4)?
+            .checked_add(level_count)?
+            .checked_add(channel_count)?
+            .checked_add(1)?;
+        let strings = reader.strings(total)?;
+        let term = strings[0];
+        let levels = &strings[1..1 + level_count];
+        let channels = &strings[1 + level_count..1 + level_count + channel_count];
+        let columns = &strings[1 + level_count + channel_count..];
+        let (hit_levels, rest) = columns.split_at(count);
+        let (hit_channels, rest) = rest.split_at(count);
+        let (first_lines, bodies) = rest.split_at(count);
+        let folded = fold_term(term, case_sensitive);
+        let mut out = Fields::with_fields(count.checked_mul(6)?)?;
+        let spans_newline = memchr(b'\n', term).is_some();
+        let mut text = Vec::new();
+        for index in 0..count {
+            let accepted = (levels.is_empty() || levels.contains(&hit_levels[index]))
+                && (channels.is_empty() || channels.contains(&hit_channels[index]));
+            let (matched, score) = if term.is_empty() {
+                (1, 0)
+            } else {
+                let (first_line, body) = (first_lines[index], bodies[index]);
+                let in_first = occurrences(first_line, &folded, case_sensitive).0;
+                let in_body = occurrences(body, &folded, case_sensitive).0;
+                // A match in `first_line\nbody` outside both parts spans the
+                // joining newline, so only terms holding one need the text.
+                let matched = in_first > 0
+                    || in_body > 0
+                    || (spans_newline && !body.is_empty() && {
+                        text.clear();
+                        text.extend_from_slice(first_line);
+                        text.push(b'\n');
+                        text.extend_from_slice(body);
+                        find(&text, &folded, 0, case_sensitive).is_some()
+                    });
+                (i64::from(matched), 4 * in_first + in_body)
+            };
+            out.push(offsets[index]);
+            out.push(ends[index]);
+            out.push(lines[index].max(0));
+            out.push(i64::from(accepted));
+            out.push(matched);
+            out.push(score);
+        }
+        Some(out.0)
+    }
+
+    /// Mode 5, `LogSearcher::filterLineWindowBatch`: `[count][case][context]`
+    /// then strings `term, lines`. Per line: matched, highlights, first
+    /// highlight start, last highlight end and merged context window id.
+    fn filter_line_windows(input: &[u8]) -> Option<Vec<u8>> {
+        let mut reader = Reader::new(input);
+        let count = reader.count()?;
+        let case_sensitive = reader.flag()?;
+        let context = reader.i64()?.clamp(0, count as i64) as usize;
+        let strings = reader.strings(count.checked_add(1)?)?;
+        let term = strings[0];
+        let folded = fold_term(term, case_sensitive);
+        let mut rows = Vec::with_capacity(count);
+        let mut windows: Vec<(usize, usize)> = Vec::new();
+        for (index, line) in strings[1..].iter().enumerate() {
+            let (hits, first, last) = if term.is_empty() {
+                (0, -1, -1)
+            } else {
+                occurrences(line, &folded, case_sensitive)
+            };
+            let matched = term.is_empty() || hits > 0;
+            if matched {
+                let start = index.saturating_sub(context);
+                let end = (index + context).min(count - 1);
+                match windows.last_mut() {
+                    Some(window) if start <= window.1 + 1 => window.1 = window.1.max(end),
+                    _ => windows.push((start, end)),
+                }
+            }
+            rows.push([i64::from(matched), hits, first, last, -1]);
+        }
+        for (id, &(start, end)) in windows.iter().enumerate() {
+            for row in &mut rows[start..=end] {
+                row[4] = id as i64;
+            }
+        }
+        let mut out = Fields::with_fields(count.checked_mul(5)?)?;
+        for row in rows {
+            for value in row {
+                out.push(value);
+            }
+        }
+        Some(out.0)
+    }
+
+    fn transform(mode: u32, input: &[u8]) -> Option<Vec<u8>> {
+        match mode {
+            1 => index_entry_ranges(input),
+            2 => scan_chunks(input),
+            3 => route_files(input),
+            4 => score_hits(input),
+            5 => filter_line_windows(input),
+            _ => None,
+        }
+    }
+
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> Option<bool> {
+        if a_len == 0 || b_len == 0 {
+            return Some(false);
+        }
+        let a_end = a.checked_add(a_len)?;
+        let b_end = b.checked_add(b_len)?;
+        Some(a < b_end && b < a_end)
+    }
+
+    /// Runs one Wave 47.5 batch mode: 1 log index entry ranges, 2 log chunk
+    /// scan, 3 search routing, 4 index hit scoring, 5 line filter windows.
+    /// Every mode writes little-endian i64 fields. Returns the bytes written,
+    /// `-needed` when `cap` is too small (never -1: outputs are multiples of
+    /// 8 bytes), or `-1` for invalid input, mode or overlapping buffers.
+    /// Failure never writes to `out`.
+    ///
+    /// # Safety
+    /// Non-null pointers must refer to a readable allocation of `input_len`
+    /// bytes and a writable allocation of `cap` bytes. Null pointers require
+    /// zero length/capacity. Input and output must not overlap.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w47_logviewer_index_indexer_coordinator_manticore_searcher(
+        mode: u32,
+        input: *const u8,
+        input_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> i64 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if input_len > MAX_INPUT
+                || cap > isize::MAX as usize
+                || (input.is_null() && input_len != 0)
+                || (out.is_null() && cap != 0)
+            {
+                return DECLINE;
+            }
+            match overlaps(input as usize, input_len, out as usize, cap) {
+                Some(false) => {}
+                _ => return DECLINE,
+            }
+            let input = if input_len == 0 {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(input, input_len) }
+            };
+            let Some(result) = transform(mode, input) else {
+                return DECLINE;
+            };
+            let Ok(needed) = i64::try_from(result.len()) else {
+                return DECLINE;
+            };
+            if cap < result.len() {
+                return -needed;
+            }
+            if !result.is_empty() {
+                unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), out, result.len()) };
+            }
+            needed
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn ints(values: &[i64]) -> Vec<u8> {
+            values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect()
+        }
+
+        fn strings(parts: &[&[u8]]) -> Vec<u8> {
+            parts.join(&0u8)
+        }
+
+        fn raw(mode: u32, input: &[u8], out: &mut [u8]) -> i64 {
+            unsafe {
+                nntmux_w47_logviewer_index_indexer_coordinator_manticore_searcher(
+                    mode,
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            }
+        }
+
+        fn fields(mode: u32, input: &[u8]) -> Option<Vec<i64>> {
+            let mut out = vec![0u8; 1 << 16];
+            let written = raw(mode, input, &mut out);
+            if written < 0 {
+                return None;
+            }
+            out.truncate(written as usize);
+            Some(
+                out.as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|chunk| i64::from_le_bytes(*chunk))
+                    .collect(),
+            )
+        }
+
+        #[test]
+        fn w47_index_entries_flag_ids_and_bound_cursors() {
+            let input = ints(&[
+                3, 3, // entries, cursors
+                1, 0, 10, 100, //
+                1, 10, 25, 300, //
+                -1, 20, 5, 0, // overlaps, bad file id, end < offset, no time
+                15, 0, 25,
+            ]);
+            assert_eq!(
+                fields(1, &input).unwrap(),
+                vec![
+                    1 << 40,
+                    31, //
+                    (1 << 40) | 10,
+                    31, //
+                    -(1 << 40) | 20,
+                    1, //
+                    2,
+                    2,
+                    300, //
+                    0,
+                    0,
+                    0, //
+                    3,
+                    2,
+                    300,
+                ]
+            );
+            assert_eq!(fields(1, &ints(&[0, 1, 7])).unwrap(), vec![0, 0, 0]);
+            assert_eq!(fields(1, &ints(&[0, 0])).unwrap(), Vec::<i64>::new());
+            assert_eq!(fields(1, &ints(&[1, 0, 1, 2, 3])), None);
+            assert_eq!(fields(1, &ints(&[-1, 0])), None);
+        }
+
+        #[test]
+        fn w47_chunk_scan_finds_headers_and_stack_frames() {
+            let chunk: &[u8] = b"[2026-10-25 12:00:00] local.ERROR: boom\r\n[stacktrace]\n#0 /app/x.php(1)\n  at y\n[2026-10-25T12:00:01.5+00:00] prod.app.INFO: ok\npartial";
+            let mut input = ints(&[3]);
+            input.extend(strings(&[chunk, b"", b"[2026-10-25 12:00:00] .ERROR: x\n[2026-10-25 12:00:00] a.error: x\n[2026-10-25 12:00:00]  a.B: x\n"]));
+            assert_eq!(
+                fields(2, &input).unwrap(),
+                vec![
+                    5, 2, 3, 0, 78, 126, 78, 1, 0, 0, 0, -1, -1, 0, 0, 0, 3, 0, 0, -1, -1, 95, 0, 0
+                ]
+            );
+            assert!(is_entry_header(b"[2026-10-25 12:00:00 x] a.b.C: "));
+            assert!(!is_entry_header(b"[2026-10-25 12:00:00] a.b.C "));
+            assert!(!is_entry_header(b"[2026-10-25 12:00:00] a.C9: "));
+            assert!(!is_entry_header(b"[2026-10-25 12:00:00]"));
+            assert!(!is_entry_header(b"[2026-10-25 12:00:00] "));
+        }
+
+        #[test]
+        fn w47_route_files_matches_coordinator_rules() {
+            let mut input = ints(&[
+                4, 1, 10, 1, 50, 100, 100, 100, 5, 95, 80, 95, -1, 1, 1, 0, 0,
+            ]);
+            input.extend(strings(&[b"a.log", b"b.log", b"a.log", b"c.log"]));
+            assert_eq!(
+                fields(3, &input).unwrap(),
+                vec![
+                    1, 2, 95, 50, 0, 0, 1, 80, -1, 1, 0, 0, 95, -1, 0, 0, 0, 0, -1, 3
+                ]
+            );
+            let mut input = ints(&[1, 1, 0, 2, 0, 1, 1, 1]);
+            input.extend(strings(&[b"x"]));
+            assert_eq!(fields(3, &input), None);
+        }
+
+        #[test]
+        fn w47_score_hits_filters_and_scores() {
+            let mut input = ints(&[2, 0, 1, 0, 10, 20, 15, 30, 3, -4]);
+            input.extend(strings(&[
+                b"Err",
+                b"error",
+                b"error",
+                b"info",
+                b"app",
+                b"app",
+                b"ERR err",
+                b"err\nerr",
+                b"x",
+                b"",
+            ]));
+            assert_eq!(
+                fields(4, &input).unwrap(),
+                vec![10, 15, 3, 1, 1, 8, 20, 30, 0, 0, 1, 8]
+            );
+            let mut input = ints(&[1, 1, 0, 0, 1, 2, 3]);
+            input.extend(strings(&[b"a\nb", b"", b"", b"a", b"b"]));
+            assert_eq!(fields(4, &input).unwrap(), vec![1, 2, 3, 1, 1, 0]);
+        }
+
+        #[test]
+        fn w47_line_windows_merge_context() {
+            let mut input = ints(&[6, 0, 1]);
+            input.extend(strings(&[
+                b"ab", b"xx", b"AB ab", b"xx", b"xx", b"xx", b"zab",
+            ]));
+            assert_eq!(
+                fields(5, &input).unwrap(),
+                vec![
+                    0, 0, -1, -1, 0, 1, 2, 0, 5, 0, 0, 0, -1, -1, 0, 0, 0, -1, -1, -1, 0, 0, -1,
+                    -1, 1, 1, 1, 1, 3, 1
+                ]
+            );
+            let mut input = ints(&[2, 1, -5]);
+            input.extend(strings(&[b"", b"a", b""]));
+            assert_eq!(
+                fields(5, &input).unwrap(),
+                vec![1, 0, -1, -1, 0, 1, 0, -1, -1, 0]
+            );
+            let input: Vec<u8> = (0..250).flat_map(|_| *b"a").collect();
+            let mut packet = ints(&[1, 1, 0]);
+            packet.extend(strings(&[b"a", &input]));
+            assert_eq!(fields(5, &packet).unwrap(), vec![1, 200, 0, 200, 0]);
+        }
+
+        #[test]
+        fn w47_find_matches_naive_search() {
+            let alphabet = b"aAbB\n\0\xffzZ";
+            let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+            let mut next = |limit: usize| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed % limit as u64) as usize
+            };
+            for _ in 0..5000 {
+                let haystack: Vec<u8> = (0..next(70))
+                    .map(|_| alphabet[next(alphabet.len())])
+                    .collect();
+                let needle: Vec<u8> = (0..1 + next(3))
+                    .map(|_| alphabet[next(alphabet.len())])
+                    .collect();
+                let from = next(haystack.len() + 1);
+                for case_sensitive in [true, false] {
+                    let folded = fold_term(&needle, case_sensitive);
+                    let naive = (from..=haystack.len().saturating_sub(needle.len()))
+                        .filter(|&at| at + needle.len() <= haystack.len())
+                        .find(|&at| {
+                            haystack[at..at + needle.len()]
+                                .iter()
+                                .zip(&folded)
+                                .all(|(h, n)| {
+                                    if case_sensitive {
+                                        h == n
+                                    } else {
+                                        h.to_ascii_lowercase() == *n
+                                    }
+                                })
+                        });
+                    assert_eq!(find(&haystack, &folded, from, case_sensitive), naive);
+                }
+                let byte = alphabet[next(alphabet.len())];
+                assert_eq!(
+                    memchr(byte, &haystack),
+                    haystack.iter().position(|&b| b == byte)
+                );
+            }
+        }
+
+        #[test]
+        fn w47_abi_declines_and_reports_capacity() {
+            let input = ints(&[0, 1, 9]);
+            let mut small = [0u8; 8];
+            assert_eq!(raw(1, &input, &mut small), -24);
+            assert_eq!(small, [0u8; 8]);
+            for mode in [0, 6, 99] {
+                assert_eq!(raw(mode, &input, &mut [0u8; 64]), DECLINE);
+            }
+            assert_eq!(raw(2, b"", &mut [0u8; 64]), DECLINE);
+            let mut packet = ints(&[1]);
+            packet.extend(strings(&[b"a", b"b"]));
+            assert_eq!(raw(2, &packet, &mut [0u8; 64]), DECLINE);
+            assert_eq!(
+                unsafe {
+                    nntmux_w47_logviewer_index_indexer_coordinator_manticore_searcher(
+                        1,
+                        std::ptr::null(),
+                        4,
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                },
+                DECLINE
+            );
+            let mut shared = ints(&[0, 0]);
+            shared.resize(64, 0);
+            let pointer = shared.as_mut_ptr();
+            assert_eq!(
+                unsafe {
+                    nntmux_w47_logviewer_index_indexer_coordinator_manticore_searcher(
+                        1, pointer, 16, pointer, 64,
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(overlaps(usize::MAX - 1, 4, 0, 1), None);
+        }
+    }
+}
