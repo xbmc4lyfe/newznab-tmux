@@ -26828,3 +26828,982 @@ pub mod verification_budget_integrity_exceptions {
         }
     }
 }
+/// Wave 37.3: pure argument/plan helpers for `PredbCheck`, `PredbIdentityRebuildCommand`,
+/// `ReleaseIdentitySuggestions`, `AdminPredbController` and `PredbImport`.
+///
+/// Outputs are `0x1F`-separated fields. Caller strings are emitted last (length-prefixed when
+/// followed by another string) so they may contain any byte. Unknown ops or flag bits, null
+/// pointers, oversized inputs and text for an absent string decline with `-1` so PHP keeps its own
+/// implementation. A result that does not fit returns `-required` without touching `out_buf`.
+pub mod predb_check_rebuild_suggestions_import {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    pub const DECLINE: isize = -1;
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+    const FIELD_SEP: u8 = 0x1F;
+    const TRIM_SET: &[u8] = b" \t\n\r\0\x0B\x0C";
+    const COLLAPSE_SET: &[u8] = b" \t\n\r\x0B\x0C";
+    const MAX_CHECK_LIMIT: i64 = 1_000_000;
+    const MAX_QUERY_BYTES: usize = 512;
+    const MAX_CANDIDATES: usize = 50;
+    const MAX_CHUNK: u32 = 256;
+
+    /// `PredbIdentityRebuildCommand` failure messages that may be shown verbatim.
+    const SAFE_FAILURES: [&[u8]; 10] = [
+        b"Unsupported PreDB rebuild page.",
+        b"Unsupported PreDB rebuild generation.",
+        b"PreDB rebuild generation, epoch or loaded policy changed.",
+        b"PreDB rebuild inventory is incomplete.",
+        b"PreDB rebuild inventory changed.",
+        b"PreDB rebuild state is unavailable.",
+        b"Unsupported PreDB schema attestation driver.",
+        b"Unsupported PreDB rebuild traversal metadata driver.",
+        b"PreDB rebuild requires its own supported transaction.",
+        b"PreDB loaded identity policy is unavailable.",
+    ];
+
+    const HAS_LIMIT: u32 = 1;
+    const HAS_ACTION: u32 = 1;
+    const HAS_GENERATION: u32 = 2;
+    const GENERATION_OPTION: u32 = 4;
+    const HAS_CHUNK: u32 = 8;
+    const HAS_QUERY: u32 = 1;
+    const HAS_RELEASE_ID: u32 = 2;
+    const HAS_TEXT: u32 = 1;
+    const OP_NUKE: u32 = 0;
+    const OP_TITLE: u32 = 1;
+
+    unsafe fn valid_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null()
+            || len > MAX_INPUT
+            || len > isize::MAX as usize
+            || (ptr as usize).checked_add(len).is_none()
+        {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    /// An optional caller string: absent strings must have zero length (the pointer may be null).
+    unsafe fn optional_slice<'a>(
+        present: bool,
+        ptr: *const u8,
+        len: usize,
+    ) -> Option<Option<&'a [u8]>> {
+        if present {
+            unsafe { valid_slice(ptr, len) }.map(Some)
+        } else if len == 0 {
+            Some(None)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn valid_out_buf(out_buf: *mut u8, out_cap: usize) -> bool {
+        !out_buf.is_null()
+            && out_cap <= isize::MAX as usize
+            && (out_buf as usize).checked_add(out_cap).is_some()
+    }
+
+    /// Copies `bytes` into `out_buf`, returning the length or `-required` when it does not fit.
+    unsafe fn write_bytes(bytes: &[u8], out_buf: *mut u8, out_cap: usize) -> isize {
+        if bytes.len() > isize::MAX as usize {
+            return DECLINE;
+        }
+        if bytes.len() > out_cap {
+            return -(bytes.len() as isize);
+        }
+        if !bytes.is_empty() {
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len()) };
+        }
+        bytes.len() as isize
+    }
+
+    /// Field writer; every encoding has at least two fields, so a one-byte result (which would
+    /// collide with DECLINE as "needs one byte") is impossible.
+    struct Fields(Vec<u8>);
+
+    impl Fields {
+        fn new(capacity: usize) -> Self {
+            Fields(Vec::with_capacity(capacity))
+        }
+
+        fn raw(&mut self, value: &[u8]) -> &mut Self {
+            if !self.0.is_empty() {
+                self.0.push(FIELD_SEP);
+            }
+            self.0.extend_from_slice(value);
+            self
+        }
+
+        fn int(&mut self, value: i64) -> &mut Self {
+            self.raw(value.to_string().as_bytes())
+        }
+
+        fn flag(&mut self, value: bool) -> &mut Self {
+            self.raw(if value { b"1" } else { b"0" })
+        }
+    }
+
+    /// PHP `trim($value, " \t\n\r\0\x0B\x0C")` on bytes.
+    fn trim_ws(value: &[u8]) -> &[u8] {
+        let start = value
+            .iter()
+            .position(|b| !TRIM_SET.contains(b))
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|b| !TRIM_SET.contains(b))
+            .map_or(start, |i| i + 1);
+        &value[start..end]
+    }
+
+    /// PHP `ctype_digit()` on a string: non-empty and ASCII digits only.
+    fn is_digits(value: &[u8]) -> bool {
+        !value.is_empty() && value.iter().all(u8::is_ascii_digit)
+    }
+
+    fn strip_zeros(value: &[u8]) -> &[u8] {
+        let start = value.iter().position(|&b| b != b'0').unwrap_or(value.len());
+        &value[start..]
+    }
+
+    /// Decimal value of at most 18 ASCII digits.
+    fn small_decimal(digits: &[u8]) -> i64 {
+        digits
+            .iter()
+            .fold(0i64, |acc, &b| acc * 10 + i64::from(b - b'0'))
+    }
+
+    /// `PredbCheck::planCheckLimitPhp()`.
+    pub fn check_limit(limit: Option<&[u8]>) -> Vec<u8> {
+        let mut out = Fields::new(48);
+        let Some(raw) = limit else {
+            out.flag(false)
+                .flag(false)
+                .flag(true)
+                .int(0)
+                .flag(false)
+                .raw(b"all")
+                .raw(b"absent");
+            return out.0;
+        };
+        let t = trim_ws(raw);
+        let (plus, body) = match t.first() {
+            Some(b'+') => (true, &t[1..]),
+            _ => (false, t),
+        };
+        if !is_digits(body) {
+            let reason: &[u8] = if t.is_empty() {
+                b"empty"
+            } else if t[0] == b'-' && is_digits(&t[1..]) {
+                b"negative"
+            } else {
+                b"not_integer"
+            };
+            out.flag(true)
+                .flag(false)
+                .flag(false)
+                .int(0)
+                .flag(false)
+                .raw(b"invalid")
+                .raw(reason);
+            return out.0;
+        }
+        let significant = strip_zeros(body);
+        let (value, clamped) = if significant.len() > 7 {
+            (MAX_CHECK_LIMIT, true)
+        } else {
+            let value = small_decimal(significant);
+            if value > MAX_CHECK_LIMIT {
+                (MAX_CHECK_LIMIT, true)
+            } else {
+                (value, false)
+            }
+        };
+        let canonical = t.len() == raw.len() && !plus && (body.len() == 1 || body[0] != b'0');
+        let (mode, reason): (&[u8], &[u8]) = if value == 0 {
+            (b"all", b"zero")
+        } else if clamped {
+            (b"bounded", b"clamped")
+        } else {
+            (b"bounded", b"ok")
+        };
+        out.flag(true)
+            .flag(canonical)
+            .flag(true)
+            .int(value)
+            .flag(clamped)
+            .raw(mode)
+            .raw(reason);
+        out.0
+    }
+
+    fn is_generation(value: &[u8]) -> bool {
+        value.len() == 32
+            && value
+                .iter()
+                .all(|&b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }
+
+    /// `\A[1-9][0-9]{0,2}\z` and at most 256.
+    fn chunk_value(value: &[u8]) -> Option<u32> {
+        if value.is_empty() || value.len() > 3 || value[0] == b'0' || !is_digits(value) {
+            return None;
+        }
+        let parsed = value
+            .iter()
+            .fold(0u32, |acc, &b| acc * 10 + u32::from(b - b'0'));
+        (parsed <= MAX_CHUNK).then_some(parsed)
+    }
+
+    /// `PredbIdentityRebuildCommand::validateRebuildArgumentsPhp()`.
+    pub fn rebuild_validate(
+        action: Option<&[u8]>,
+        generation: Option<&[u8]>,
+        option_present: bool,
+        chunk: Option<&[u8]>,
+    ) -> Vec<u8> {
+        let index: i64 = match action {
+            Some(b"start") => 0,
+            Some(b"chunk") => 1,
+            Some(b"certify") => 2,
+            _ => -1,
+        };
+        let chunk_parsed = chunk.and_then(chunk_value);
+        let code: i64 = if index < 0 {
+            1
+        } else if index == 0 && (generation.is_some() || option_present) {
+            2
+        } else if index != 0 && !generation.is_some_and(is_generation) {
+            3
+        } else if chunk_parsed.is_none() {
+            4
+        } else if index != 1 && chunk != Some(b"128") {
+            5
+        } else {
+            0
+        };
+        let mut out = Fields::new(24);
+        out.flag(code == 0)
+            .int(code)
+            .int(index)
+            .int(if code == 0 {
+                i64::from(chunk_parsed.unwrap_or(0))
+            } else {
+                0
+            })
+            .flag(index == 1 || index == 2)
+            .flag(index == 2);
+        out.0
+    }
+
+    /// `PredbIdentityRebuildCommand::classifyRebuildFailurePhp()`.
+    pub fn rebuild_failure(message: &[u8]) -> Vec<u8> {
+        let index = SAFE_FAILURES
+            .iter()
+            .position(|safe| *safe == message)
+            .map_or(-1, |i| i as i64);
+        let mut out = Fields::new(8);
+        out.flag(index >= 0).int(index);
+        out.0
+    }
+
+    /// `ReleaseIdentitySuggestions::planSuggestionRequestPhp()`; `ids` is `None` when a candidate
+    /// contained the wire separator (and is therefore not a digit string).
+    pub fn suggestion_plan(
+        query: &[u8],
+        release_id: &[u8],
+        count: usize,
+        ids: Option<&[&[u8]]>,
+    ) -> Vec<u8> {
+        let source: i64 = if !query.is_empty() {
+            0
+        } else if is_digits(release_id) {
+            1
+        } else {
+            2
+        };
+        let query_valid =
+            source == 0 && query.len() <= MAX_QUERY_BYTES && std::str::from_utf8(query).is_ok();
+        let status: i64 = if source == 2 || (source == 0 && !query_valid) {
+            2
+        } else if count > MAX_CANDIDATES {
+            3
+        } else if !ids.is_some_and(|ids| {
+            ids.iter()
+                .all(|id| is_digits(id) && !strip_zeros(id).is_empty())
+        }) {
+            4
+        } else if source == 1 {
+            1
+        } else {
+            0
+        };
+        let mut unique: Vec<&[u8]> = Vec::new();
+        if status <= 1 {
+            for id in ids.unwrap_or_default() {
+                let id = strip_zeros(id);
+                if !unique.contains(&id) {
+                    unique.push(id);
+                }
+            }
+        }
+        let mut out = Fields::new(32 + unique.len() * 8);
+        out.int(source)
+            .int(query.len() as i64)
+            .flag(query_valid)
+            .int(count as i64)
+            .flag(count > 0)
+            .int(status)
+            .int(unique.len() as i64);
+        for id in unique {
+            out.raw(id);
+        }
+        out.0
+    }
+
+    /// `AdminPredbController::planPredbBrowsePhp()`; the effective search is the last field.
+    pub fn predb_browse(search: &[u8]) -> Vec<u8> {
+        let filtered = !(search.is_empty() || search == b"0");
+        let trimmed = trim_ws(search);
+        let terms = search
+            .split(|b| TRIM_SET.contains(b))
+            .filter(|t| !t.is_empty())
+            .count();
+        let mut out = Fields::new(32 + search.len());
+        out.flag(filtered)
+            .int(search.len() as i64)
+            .int(trimmed.len() as i64)
+            .flag(filtered && trimmed.is_empty())
+            .flag(std::str::from_utf8(search).is_ok())
+            .int(terms as i64)
+            .raw(if filtered { search } else { b"" });
+        out.0
+    }
+
+    /// `PredbImport::summarizeNukeStatusPhp()`; the trimmed reason is the last field.
+    pub fn import_nuke(nuked: i64, reason: Option<&[u8]>) -> Vec<u8> {
+        let label: &[u8] = match nuked {
+            0 => b"none",
+            1 => b"unnuked",
+            2 => b"nuked",
+            3 => b"modnuked",
+            _ => b"unknown",
+        };
+        let reason = reason.map(trim_ws).unwrap_or_default();
+        let has_reason = !reason.is_empty();
+        let mut out = Fields::new(48 + reason.len());
+        out.int(nuked)
+            .raw(label)
+            .flag(nuked == 2 || nuked == 3)
+            .flag((1..=3).contains(&nuked))
+            .flag(has_reason)
+            .flag((0..=3).contains(&nuked) && !(nuked == 0 && has_reason))
+            .raw(reason);
+        out.0
+    }
+
+    /// `PredbImport::normalizeImportTitlePhp()`; ends with the title length, title and group.
+    pub fn import_title(title: &[u8], max_bytes: i64) -> Vec<u8> {
+        let trimmed = trim_ws(title);
+        let mut collapsed = Vec::with_capacity(trimmed.len());
+        let mut in_run = false;
+        for &b in trimmed {
+            if COLLAPSE_SET.contains(&b) {
+                if !in_run {
+                    collapsed.push(b' ');
+                }
+                in_run = true;
+            } else {
+                collapsed.push(b);
+                in_run = false;
+            }
+        }
+        let truncated = max_bytes > 0 && collapsed.len() as u64 > max_bytes as u64;
+        if truncated {
+            collapsed.truncate(max_bytes as usize);
+        }
+        let group: Option<&[u8]> = if collapsed.contains(&b' ') {
+            None
+        } else {
+            collapsed
+                .iter()
+                .rposition(|&b| b == b'-')
+                .filter(|&i| i > 0 && i + 1 < collapsed.len())
+                .map(|i| &collapsed[i + 1..])
+        };
+        let mut out = Fields::new(32 + collapsed.len() * 2);
+        out.int(collapsed.len() as i64)
+            .flag(std::str::from_utf8(&collapsed).is_ok())
+            .flag(collapsed.iter().any(|&b| b < 0x20 || b == 0x7F))
+            .flag(truncated)
+            .flag(group.is_some())
+            .int(collapsed.len() as i64)
+            .raw(&collapsed)
+            .raw(group.unwrap_or_default());
+        out.0
+    }
+
+    /// # Safety
+    /// `limit_ptr` must be valid for `limit_len` readable bytes when `HAS_LIMIT` is set, and
+    /// `out_buf` must be valid for `out_cap` writable bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w373_predb_check_limit_plan(
+        flags: u32,
+        limit_ptr: *const u8,
+        limit_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if flags & !HAS_LIMIT != 0 || !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(limit) =
+                (unsafe { optional_slice(flags & HAS_LIMIT != 0, limit_ptr, limit_len) })
+            else {
+                return DECLINE;
+            };
+            unsafe { write_bytes(&check_limit(limit), out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// # Safety
+    /// Each string pointer must be valid for its length when its flag is set, and `out_buf` must
+    /// be valid for `out_cap` writable bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w373_predb_rebuild_validate(
+        flags: u32,
+        action_ptr: *const u8,
+        action_len: usize,
+        generation_ptr: *const u8,
+        generation_len: usize,
+        chunk_ptr: *const u8,
+        chunk_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if flags & !(HAS_ACTION | HAS_GENERATION | GENERATION_OPTION | HAS_CHUNK) != 0
+                || !valid_out_buf(out_buf, out_cap)
+            {
+                return DECLINE;
+            }
+            let Some(action) =
+                (unsafe { optional_slice(flags & HAS_ACTION != 0, action_ptr, action_len) })
+            else {
+                return DECLINE;
+            };
+            let Some(generation) = (unsafe {
+                optional_slice(flags & HAS_GENERATION != 0, generation_ptr, generation_len)
+            }) else {
+                return DECLINE;
+            };
+            let Some(chunk) =
+                (unsafe { optional_slice(flags & HAS_CHUNK != 0, chunk_ptr, chunk_len) })
+            else {
+                return DECLINE;
+            };
+            let bytes = rebuild_validate(action, generation, flags & GENERATION_OPTION != 0, chunk);
+            unsafe { write_bytes(&bytes, out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// # Safety
+    /// `message_ptr` must be valid for `message_len` readable bytes and `out_buf` for `out_cap`
+    /// writable bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w373_predb_rebuild_failure(
+        message_ptr: *const u8,
+        message_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(message) = (unsafe { valid_slice(message_ptr, message_len) }) else {
+                return DECLINE;
+            };
+            unsafe { write_bytes(&rebuild_failure(message), out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// # Safety
+    /// The query and release id pointers must be valid for their lengths when their flags are set,
+    /// `ids_ptr` (candidate ids joined by `0x1F`) must be valid for `ids_len` readable bytes, and
+    /// `out_buf` must be valid for `out_cap` writable bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w373_release_identity_plan(
+        flags: u32,
+        query_ptr: *const u8,
+        query_len: usize,
+        release_ptr: *const u8,
+        release_len: usize,
+        ids_ptr: *const u8,
+        ids_len: usize,
+        id_count: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if flags & !(HAS_QUERY | HAS_RELEASE_ID) != 0
+                || id_count > MAX_INPUT
+                || !valid_out_buf(out_buf, out_cap)
+            {
+                return DECLINE;
+            }
+            let Some(query) =
+                (unsafe { optional_slice(flags & HAS_QUERY != 0, query_ptr, query_len) })
+            else {
+                return DECLINE;
+            };
+            let Some(release) =
+                (unsafe { optional_slice(flags & HAS_RELEASE_ID != 0, release_ptr, release_len) })
+            else {
+                return DECLINE;
+            };
+            let Some(joined) = (unsafe { valid_slice(ids_ptr, ids_len) }) else {
+                return DECLINE;
+            };
+            let pieces: Vec<&[u8]> = if id_count == 0 {
+                if !joined.is_empty() {
+                    return DECLINE;
+                }
+                Vec::new()
+            } else if id_count <= MAX_CANDIDATES {
+                joined.split(|&b| b == FIELD_SEP).collect()
+            } else {
+                Vec::new()
+            };
+            if id_count <= MAX_CANDIDATES && pieces.len() < id_count {
+                return DECLINE;
+            }
+            let ids = (pieces.len() == id_count || id_count > MAX_CANDIDATES)
+                .then_some(pieces.as_slice());
+            let bytes = suggestion_plan(
+                query.unwrap_or_default(),
+                release.unwrap_or_default(),
+                id_count,
+                ids,
+            );
+            unsafe { write_bytes(&bytes, out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// # Safety
+    /// `search_ptr` must be valid for `search_len` readable bytes and `out_buf` for `out_cap`
+    /// writable bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w373_admin_predb_browse(
+        search_ptr: *const u8,
+        search_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(search) = (unsafe { valid_slice(search_ptr, search_len) }) else {
+                return DECLINE;
+            };
+            unsafe { write_bytes(&predb_browse(search), out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `op` 0 summarizes nuke status (`value` = nuked, optional reason text); `op` 1 normalizes a
+    /// title (`value` = maximum bytes, title text required).
+    ///
+    /// # Safety
+    /// `text_ptr` must be valid for `text_len` readable bytes when `HAS_TEXT` is set, and `out_buf`
+    /// must be valid for `out_cap` writable bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w373_predb_import_summarize(
+        op: u32,
+        flags: u32,
+        text_ptr: *const u8,
+        text_len: usize,
+        value: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if flags & !HAS_TEXT != 0 || !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(text) = (unsafe { optional_slice(flags & HAS_TEXT != 0, text_ptr, text_len) })
+            else {
+                return DECLINE;
+            };
+            let bytes = match (op, text) {
+                (OP_NUKE, text) => import_nuke(value, text),
+                (OP_TITLE, Some(title)) => import_title(title, value),
+                _ => return DECLINE,
+            };
+            unsafe { write_bytes(&bytes, out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::ptr;
+
+        fn call(f: impl Fn(*mut u8, usize) -> isize) -> Result<String, isize> {
+            let mut buf = vec![0u8; 1024];
+            let rc = f(buf.as_mut_ptr(), buf.len());
+            if rc < 0 {
+                return Err(rc);
+            }
+            buf.truncate(rc as usize);
+            Ok(String::from_utf8_lossy(&buf).replace('\x1F', "|"))
+        }
+
+        fn limit(text: Option<&[u8]>) -> Result<String, isize> {
+            let (flags, p, l) = text.map_or((0, ptr::null(), 0), |t| (1, t.as_ptr(), t.len()));
+            call(|b, c| unsafe { nntmux_w373_predb_check_limit_plan(flags, p, l, b, c) })
+        }
+
+        #[test]
+        fn w373_check_limit_classifies_arguments() {
+            assert_eq!(limit(None), Ok("0|0|1|0|0|all|absent".into()));
+            assert_eq!(limit(Some(b"25")), Ok("1|1|1|25|0|bounded|ok".into()));
+            assert_eq!(limit(Some(b" +025 ")), Ok("1|0|1|25|0|bounded|ok".into()));
+            assert_eq!(limit(Some(b"0")), Ok("1|1|1|0|0|all|zero".into()));
+            assert_eq!(
+                limit(Some(b"99999999999999999999999")),
+                Ok("1|1|1|1000000|1|bounded|clamped".into())
+            );
+            assert_eq!(
+                limit(Some(b"1000001")),
+                Ok("1|1|1|1000000|1|bounded|clamped".into())
+            );
+            assert_eq!(limit(Some(b" ")), Ok("1|0|0|0|0|invalid|empty".into()));
+            assert_eq!(limit(Some(b"-5")), Ok("1|0|0|0|0|invalid|negative".into()));
+            assert_eq!(
+                limit(Some(b"1e3")),
+                Ok("1|0|0|0|0|invalid|not_integer".into())
+            );
+            assert_eq!(
+                limit(Some(b"+")),
+                Ok("1|0|0|0|0|invalid|not_integer".into())
+            );
+        }
+
+        fn rebuild(
+            action: Option<&[u8]>,
+            generation: Option<&[u8]>,
+            option: bool,
+            chunk: Option<&[u8]>,
+        ) -> Result<String, isize> {
+            let parts = |s: Option<&[u8]>| s.map_or((ptr::null(), 0), |t| (t.as_ptr(), t.len()));
+            let ((ap, al), (gp, gl), (cp, cl)) = (parts(action), parts(generation), parts(chunk));
+            let flags = u32::from(action.is_some())
+                | (u32::from(generation.is_some()) << 1)
+                | (u32::from(option) << 2)
+                | (u32::from(chunk.is_some()) << 3);
+            call(|b, c| unsafe {
+                nntmux_w373_predb_rebuild_validate(flags, ap, al, gp, gl, cp, cl, b, c)
+            })
+        }
+
+        #[test]
+        fn w373_rebuild_validate_mirrors_command_order() {
+            let generation = b"0123456789abcdef0123456789abcdef";
+            assert_eq!(
+                rebuild(Some(b"start"), None, false, Some(b"128")),
+                Ok("1|0|0|128|0|0".into())
+            );
+            assert_eq!(
+                rebuild(Some(b"chunk"), Some(generation), true, Some(b"256")),
+                Ok("1|0|1|256|1|0".into())
+            );
+            assert_eq!(
+                rebuild(Some(b"certify"), Some(generation), true, Some(b"128")),
+                Ok("1|0|2|128|1|1".into())
+            );
+            assert_eq!(
+                rebuild(Some(b"stop"), None, false, Some(b"128")),
+                Ok("0|1|-1|0|0|0".into())
+            );
+            assert_eq!(
+                rebuild(Some(b"start"), None, true, Some(b"128")),
+                Ok("0|2|0|0|0|0".into())
+            );
+            assert_eq!(
+                rebuild(
+                    Some(b"chunk"),
+                    Some(b"0123456789ABCDEF0123456789ABCDEF"),
+                    true,
+                    Some(b"1")
+                ),
+                Ok("0|3|1|0|1|0".into())
+            );
+            assert_eq!(
+                rebuild(Some(b"chunk"), Some(generation), true, Some(b"257")),
+                Ok("0|4|1|0|1|0".into())
+            );
+            assert_eq!(
+                rebuild(Some(b"chunk"), Some(generation), true, Some(b"064")),
+                Ok("0|4|1|0|1|0".into())
+            );
+            assert_eq!(
+                rebuild(Some(b"certify"), Some(generation), true, Some(b"64")),
+                Ok("0|5|2|0|1|1".into())
+            );
+            assert_eq!(rebuild(None, None, false, None), Ok("0|1|-1|0|0|0".into()));
+        }
+
+        #[test]
+        fn w373_rebuild_failure_matches_safe_list() {
+            let safe = b"PreDB rebuild inventory changed.";
+            assert_eq!(
+                call(|b, c| unsafe {
+                    nntmux_w373_predb_rebuild_failure(safe.as_ptr(), safe.len(), b, c)
+                }),
+                Ok("1|4".into())
+            );
+            assert_eq!(
+                call(|b, c| unsafe { nntmux_w373_predb_rebuild_failure(b"x".as_ptr(), 0, b, c) }),
+                Ok("0|-1".into())
+            );
+        }
+
+        #[test]
+        fn w373_suggestion_plan_validates_request() {
+            let run = |query: &[u8], release: Option<&[u8]>, ids: &[u8], count: usize| {
+                let (rf, rp, rl) =
+                    release.map_or((0, ptr::null(), 0), |r| (2, r.as_ptr(), r.len()));
+                call(|b, c| unsafe {
+                    nntmux_w373_release_identity_plan(
+                        1 | rf,
+                        query.as_ptr(),
+                        query.len(),
+                        rp,
+                        rl,
+                        ids.as_ptr(),
+                        ids.len(),
+                        count,
+                        b,
+                        c,
+                    )
+                })
+            };
+            assert_eq!(
+                run(b"Some.Release-GRP", None, b"007\x1F7\x1F12", 3),
+                Ok("0|16|1|3|1|0|2|7|12".into())
+            );
+            assert_eq!(run(b"", Some(b"42"), b"", 0), Ok("1|0|0|0|0|1|0".into()));
+            assert_eq!(run(b"", Some(b"4a"), b"", 0), Ok("2|0|0|0|0|2|0".into()));
+            assert_eq!(run(b"\xff", None, b"", 0), Ok("0|1|0|0|0|2|0".into()));
+            assert_eq!(run(b"q", None, b"000", 1), Ok("0|1|1|1|1|4|0".into()));
+            assert_eq!(run(b"q", None, b"1\x1F2", 1), Ok("0|1|1|1|1|4|0".into()));
+            assert_eq!(run(b"q", None, b"", 51), Ok("0|1|1|51|1|3|0".into()));
+            assert_eq!(run(b"q", None, b"1", 2), Err(DECLINE));
+            assert_eq!(run(b"q", None, b"1", 0), Err(DECLINE));
+            let long = vec![b'a'; 513];
+            assert_eq!(run(&long, None, b"", 0), Ok("0|513|0|0|0|2|0".into()));
+        }
+
+        #[test]
+        fn w373_browse_and_import_summaries() {
+            let browse = |s: &[u8]| {
+                call(|b, c| unsafe { nntmux_w373_admin_predb_browse(s.as_ptr(), s.len(), b, c) })
+            };
+            assert_eq!(browse(b"0"), Ok("0|1|1|0|1|1|".into()));
+            assert_eq!(browse(b""), Ok("0|0|0|0|1|0|".into()));
+            assert_eq!(
+                browse(b" foo  bar\t"),
+                Ok("1|10|8|0|1|2| foo  bar\t".into())
+            );
+            assert_eq!(browse(b" \0 "), Ok("1|3|0|1|1|0| \0 ".into()));
+
+            let import = |op: u32, text: Option<&[u8]>, value: i64| {
+                let (f, p, l) = text.map_or((0, ptr::null(), 0), |t| (1, t.as_ptr(), t.len()));
+                call(|b, c| unsafe { nntmux_w373_predb_import_summarize(op, f, p, l, value, b, c) })
+            };
+            assert_eq!(
+                import(0, Some(b" bad.rip "), 2),
+                Ok("2|nuked|1|1|1|1|bad.rip".into())
+            );
+            assert_eq!(import(0, None, 0), Ok("0|none|0|0|0|1|".into()));
+            assert_eq!(import(0, Some(b"x"), 0), Ok("0|none|0|0|1|0|x".into()));
+            assert_eq!(import(0, None, 9), Ok("9|unknown|0|0|0|0|".into()));
+            assert_eq!(
+                import(1, Some(b"  Some.Show.S01E01.720p-GRP \n"), 0),
+                Ok("25|1|0|0|1|25|Some.Show.S01E01.720p-GRP|GRP".into())
+            );
+            assert_eq!(
+                import(1, Some(b"a \t\n b-c"), 3),
+                Ok("3|1|0|1|0|3|a b|".into())
+            );
+            assert_eq!(import(1, None, 0), Err(DECLINE));
+            assert_eq!(import(2, Some(b"x"), 0), Err(DECLINE));
+        }
+
+        #[test]
+        fn w373_exports_validate_pointers_flags_and_capacity() {
+            let mut small = [b'Z'; 4];
+            let rc = unsafe {
+                nntmux_w373_predb_check_limit_plan(0, ptr::null(), 0, small.as_mut_ptr(), 4)
+            };
+            assert!(rc < DECLINE);
+            assert_eq!(small, [b'Z'; 4]);
+            let mut big = vec![0u8; (-rc) as usize];
+            let rc2 = unsafe {
+                nntmux_w373_predb_check_limit_plan(0, ptr::null(), 0, big.as_mut_ptr(), big.len())
+            };
+            assert_eq!(rc2, -rc);
+            let rc = unsafe {
+                nntmux_w373_predb_rebuild_failure(b"x".as_ptr(), 1, small.as_mut_ptr(), 0)
+            };
+            assert_eq!(rc, -4);
+            assert_eq!(small, [b'Z'; 4]);
+
+            let mut out = vec![0u8; 256];
+            let (b, c) = (out.as_mut_ptr(), out.len());
+            let x = b"x".as_ptr();
+            unsafe {
+                assert_eq!(
+                    nntmux_w373_predb_check_limit_plan(2, ptr::null(), 0, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w373_predb_check_limit_plan(1, ptr::null(), 0, b, c),
+                    DECLINE
+                );
+                assert_eq!(nntmux_w373_predb_check_limit_plan(0, x, 1, b, c), DECLINE);
+                assert_eq!(
+                    nntmux_w373_predb_check_limit_plan(1, x, MAX_INPUT + 1, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w373_predb_check_limit_plan(0, ptr::null(), 0, ptr::null_mut(), 64),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w373_predb_check_limit_plan(
+                        0,
+                        ptr::null(),
+                        0,
+                        b,
+                        isize::MAX as usize + 1
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w373_predb_rebuild_validate(
+                        16,
+                        ptr::null(),
+                        0,
+                        ptr::null(),
+                        0,
+                        ptr::null(),
+                        0,
+                        b,
+                        c
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w373_predb_rebuild_validate(
+                        2,
+                        ptr::null(),
+                        0,
+                        ptr::null(),
+                        0,
+                        ptr::null(),
+                        0,
+                        b,
+                        c
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w373_predb_rebuild_failure(ptr::null(), 0, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w373_admin_predb_browse(ptr::null(), 0, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w373_admin_predb_browse(x, 1, ptr::null_mut(), 8),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w373_release_identity_plan(
+                        4,
+                        ptr::null(),
+                        0,
+                        ptr::null(),
+                        0,
+                        x,
+                        0,
+                        0,
+                        b,
+                        c
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w373_release_identity_plan(
+                        0,
+                        ptr::null(),
+                        0,
+                        ptr::null(),
+                        0,
+                        ptr::null(),
+                        0,
+                        0,
+                        b,
+                        c
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w373_release_identity_plan(
+                        0,
+                        ptr::null(),
+                        0,
+                        ptr::null(),
+                        0,
+                        x,
+                        0,
+                        MAX_INPUT + 1,
+                        b,
+                        c
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w373_predb_import_summarize(0, 2, ptr::null(), 0, 0, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w373_predb_import_summarize(7, 0, ptr::null(), 0, 0, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w373_predb_import_summarize(0, 1, ptr::null(), 0, 0, b, c),
+                    DECLINE
+                );
+                assert!(nntmux_w373_predb_import_summarize(0, 0, ptr::null(), 0, 0, b, c) > 0);
+            }
+        }
+    }
+}
