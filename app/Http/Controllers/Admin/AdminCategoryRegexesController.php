@@ -7,9 +7,12 @@ namespace App\Http\Controllers\Admin;
 use App\Http\Controllers\BasePageController;
 use App\Models\Category;
 use App\Services\RegexService;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\View\View;
+use Throwable;
 
 class AdminCategoryRegexesController extends BasePageController
 {
@@ -202,5 +205,137 @@ class AdminCategoryRegexesController extends BasePageController
     public static function categoryLabelsNative(array $categories): array
     {
         return AdminBlacklistController::wave28Native(3, ['categories' => $categories]) ?? self::categoryLabelsPhp($categories);
+    }
+
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_w383_regex_list_filter(
+            const char *group_ptr,
+            size_t group_len,
+            char *out_buf,
+            size_t out_cap
+        );
+        C;
+
+    /**
+     * Production default for the Wave 38.3 helpers below; it stays false because the paired
+     * benchmark in tests/Unit/RustPredbMatchExceptionIdentityTransactionsParityTest.php is below
+     * 1.5x. The existing usesRustFfi() toggle keeps controlling the form helpers.
+     */
+    public const bool RUST_FFI_DEFAULT = false;
+
+    private static ?bool $regexListRustFfiOverride = null;
+
+    private static FFI|false|null $regexListRustFfiHandle = null;
+
+    public static function useRegexListRustFfi(?bool $enabled): void
+    {
+        self::$regexListRustFfiOverride = $enabled;
+    }
+
+    public static function usesRegexListRustFfi(): bool
+    {
+        return self::$regexListRustFfiOverride ?? self::RUST_FFI_DEFAULT;
+    }
+
+    public static function resetRegexListRustFfi(): void
+    {
+        self::$regexListRustFfiOverride = null;
+        self::$regexListRustFfiHandle = null;
+    }
+
+    /**
+     * Describes the RegexService::getRegex() group filter: a non-empty group becomes the
+     * `%group%` LIKE pattern used today; `escaped_pattern` is the same pattern with `\`, `%` and
+     * `_` backslash-escaped for a literal match, and `has_wildcards` flags `%` or `_` in the group.
+     *
+     * @return array{filtered: bool, has_wildcards: bool, length: int, pattern: string, escaped_pattern: string}
+     */
+    public static function planRegexListFilter(string $group): array
+    {
+        return (self::usesRegexListRustFfi() ? self::planRegexListFilterNative($group) : null) ?? self::planRegexListFilterPhp($group);
+    }
+
+    /**
+     * @return array{filtered: bool, has_wildcards: bool, length: int, pattern: string, escaped_pattern: string}|null
+     */
+    private static function planRegexListFilterNative(string $group): ?array
+    {
+        $fields = self::callRegexListNative('nntmux_w383_regex_list_filter', [$group, strlen($group)], strlen($group) * 3 + 40, 5);
+        if ($fields === null || count($fields) !== 5 || ! ctype_digit($fields[2]) || ! ctype_digit($fields[3])) {
+            return null;
+        }
+        $patternLength = (int) $fields[3];
+        $rest = $fields[4];
+        if (strlen($rest) <= $patternLength || $rest[$patternLength] !== "\x1F") {
+            return null;
+        }
+
+        return [
+            'filtered' => $fields[0] === '1',
+            'has_wildcards' => $fields[1] === '1',
+            'length' => (int) $fields[2],
+            'pattern' => substr($rest, 0, $patternLength),
+            'escaped_pattern' => substr($rest, $patternLength + 1),
+        ];
+    }
+
+    /**
+     * @return array{filtered: bool, has_wildcards: bool, length: int, pattern: string, escaped_pattern: string}
+     */
+    private static function planRegexListFilterPhp(string $group): array
+    {
+        $filtered = $group !== '';
+
+        return [
+            'filtered' => $filtered,
+            'has_wildcards' => strpbrk($group, '%_') !== false,
+            'length' => strlen($group),
+            'pattern' => $filtered ? '%'.$group.'%' : '',
+            'escaped_pattern' => $filtered ? '%'.strtr($group, ['\\' => '\\\\', '%' => '\\%', '_' => '\\_']).'%' : '',
+        ];
+    }
+
+    /**
+     * @param  list<int|string>  $args  arguments preceding the caller-owned output buffer
+     * @return list<string>|null
+     */
+    private static function callRegexListNative(string $symbol, array $args, int $minBytes, int $limit): ?array
+    {
+        $ffi = self::regexListRustFfi();
+        if ($ffi === null) {
+            return null;
+        }
+
+        try {
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, $minBytes, $capacity);
+            if ($buffer === null) {
+                return null;
+            }
+            $written = $ffi->$symbol(...[...$args, $buffer, $capacity]);
+            if (is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return null;
+                }
+                $written = $ffi->$symbol(...[...$args, $buffer, $capacity]);
+            }
+            if (! is_int($written) || $written < 0 || $written > $capacity) {
+                return null;
+            }
+
+            return explode("\x1F", FFI::string($buffer, $written), $limit);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private static function regexListRustFfi(): ?FFI
+    {
+        if (self::$regexListRustFfiHandle === null) {
+            self::$regexListRustFfiHandle = RustPipelineLibrary::resolveDomain('categorize_w383', self::FFI_CDEF) ?? false;
+        }
+
+        return self::$regexListRustFfiHandle === false ? null : self::$regexListRustFfiHandle;
     }
 }
