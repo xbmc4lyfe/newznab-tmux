@@ -40936,3 +40936,830 @@ mod wave52_5_nzb_sevenzip_image_inspector_par2_mapper_entry {
         }
     }
 }
+
+/// Wave 53.5 batch helpers for `ApiCapabilitiesService`, `ApiReleaseRowCache`, `ApiUsageService`,
+/// `XmlResponseContext` and `FailedJobsCollector`. Each entry shares the Wave 52.5 ABI: `count`
+/// records, `flags` (must be 0), NUL-delimited `data`, a little-endian i64 `ints` table and
+/// fixed-width i64 output words. -1 declines (PHP recomputes); -n reports the words needed.
+mod wave53_5_api_capabilities_row_cache_usage_xml_failed_jobs {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const DECLINE: i64 = -1;
+    const MAX_INPUT: usize = 64 * 1024 * 1024;
+    const MAX_RECORDS: usize = 1 << 20;
+
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> Option<bool> {
+        if a_len == 0 || b_len == 0 {
+            return Some(false);
+        }
+        let a_end = a.checked_add(a_len)?;
+        let b_end = b.checked_add(b_len)?;
+        Some(a < b_end && b < a_end)
+    }
+
+    const LOW_BITS: u64 = 0x0101_0101_0101_0101;
+    const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+
+    /// Word-at-a-time search for one byte; the lowest flagged byte is exact
+    /// because borrows only propagate upwards.
+    fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
+        let splat = LOW_BITS.wrapping_mul(u64::from(needle));
+        let (words, _) = haystack.as_chunks::<8>();
+        for (index, word) in words.iter().enumerate() {
+            let x = u64::from_le_bytes(*word) ^ splat;
+            let found = x.wrapping_sub(LOW_BITS) & !x & HIGH_BITS;
+            if found != 0 {
+                return Some(index * 8 + (found.trailing_zeros() / 8) as usize);
+            }
+        }
+        let tail = words.len() * 8;
+        haystack[tail..]
+            .iter()
+            .position(|&b| b == needle)
+            .map(|at| tail + at)
+    }
+
+    /// Splits `data` on NUL into exactly `expected` fields.
+    fn split_fields(data: &[u8], expected: usize) -> Option<Vec<&[u8]>> {
+        if expected == 0 {
+            return data.is_empty().then(Vec::new);
+        }
+        let mut fields = Vec::with_capacity(expected);
+        let mut rest = data;
+        while let Some(at) = memchr(0, rest) {
+            if fields.len() + 1 == expected {
+                return None;
+            }
+            fields.push(&rest[..at]);
+            rest = &rest[at + 1..];
+        }
+        fields.push(rest);
+        (fields.len() == expected).then_some(fields)
+    }
+
+    /// Bytes `rawurlencode()` keeps: ASCII letters, digits and `-_.~`.
+    const UNRESERVED: [bool; 256] = {
+        let mut table = [false; 256];
+        let mut b = 0;
+        while b < 256 {
+            let byte = b as u8;
+            table[b] = byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~');
+            b += 1;
+        }
+        table
+    };
+
+    /// Class-name bytes of a failed job's exception header: ASCII letters, digits, `_` and `\`.
+    const CLASS_BYTES: [bool; 256] = {
+        let mut table = [false; 256];
+        let mut b = 0;
+        while b < 256 {
+            let byte = b as u8;
+            table[b] = byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'\\';
+            b += 1;
+        }
+        table
+    };
+
+    fn read_ints(bytes: &[u8]) -> Option<Vec<i64>> {
+        let (chunks, tail) = bytes.as_chunks::<8>();
+        tail.is_empty().then(|| {
+            chunks
+                .iter()
+                .map(|chunk| i64::from_le_bytes(*chunk))
+                .collect()
+        })
+    }
+
+    /// Validates the shared ABI, runs `body` and copies its words to `out`.
+    ///
+    /// # Safety
+    /// See the entry points.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run(
+        count: usize,
+        flags: i64,
+        data: *const u8,
+        data_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        out: *mut i64,
+        out_cap: usize,
+        width: usize,
+        body: impl FnOnce(&[u8], &[i64], &mut Vec<i64>) -> Option<()>,
+    ) -> i64 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if flags != 0
+                || count > MAX_RECORDS
+                || data_len > MAX_INPUT
+                || ints_len > MAX_INPUT
+                || out_cap > MAX_INPUT
+                || (data.is_null() && data_len != 0)
+                || (ints.is_null() && ints_len != 0)
+                || (out.is_null() && out_cap != 0)
+                || (!out.is_null() && !out.is_aligned())
+            {
+                return DECLINE;
+            }
+            let Some(out_bytes) = out_cap.checked_mul(8) else {
+                return DECLINE;
+            };
+            for (pointer, len) in [(data as usize, data_len), (ints as usize, ints_len)] {
+                if overlaps(pointer, len, out as usize, out_bytes) != Some(false) {
+                    return DECLINE;
+                }
+            }
+            let data = if data_len == 0 || data.is_null() {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(data, data_len) }
+            };
+            let ints = if ints_len == 0 || ints.is_null() {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(ints, ints_len) }
+            };
+            let Some(table) = read_ints(ints) else {
+                return DECLINE;
+            };
+            let needed = count * width;
+            let mut words = Vec::with_capacity(needed);
+            if body(data, &table, &mut words).is_none() || words.len() != needed {
+                return DECLINE;
+            }
+            if out_cap < needed {
+                return -(needed as i64);
+            }
+            if needed > 0 {
+                unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), out, needed) };
+            }
+            needed as i64
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// PHP `trim()` default characters.
+    fn is_trim(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b)
+    }
+
+    fn trim(bytes: &[u8]) -> &[u8] {
+        let start = bytes
+            .iter()
+            .position(|&b| !is_trim(b))
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|&b| !is_trim(b))
+            .map_or(start, |at| at + 1);
+        &bytes[start..end]
+    }
+
+    /// `ApiCapabilitiesService::SEARCHING_V1` / `SEARCHING_V2`, in advertised order.
+    const SEARCHING_V1: [(&[u8], &str); 6] = [
+        (
+            b"search",
+            "q,group,minsize,maxsize,maxage,cat,limit,offset,attrs,extended,del,sort",
+        ),
+        (
+            b"tv-search",
+            "q,vid,tvdbid,traktid,rid,tvmazeid,imdbid,tmdbid,season,ep,cat,minsize,maxsize,maxage,limit,offset,attrs,extended,del,sort",
+        ),
+        (
+            b"movie-search",
+            "q,imdbid,tmdbid,traktid,genre,cat,minsize,maxsize,maxage,limit,offset,attrs,extended,del,sort",
+        ),
+        (
+            b"audio-search",
+            "q,cat,minsize,maxsize,maxage,group,limit,offset,attrs,extended,del,sort",
+        ),
+        (
+            b"book-search",
+            "q,title,author,cat,minsize,maxsize,maxage,group,limit,offset,attrs,extended,del,sort",
+        ),
+        (
+            b"anime-search",
+            "q,anidbid,anilistid,cat,minsize,maxsize,maxage,limit,offset,attrs,extended,del,sort",
+        ),
+    ];
+
+    const SEARCHING_V2: [(&[u8], &str); 6] = [
+        (
+            b"search",
+            "id,group,minsize,maxage,cat,limit,offset,cursor,sort",
+        ),
+        (
+            b"tv-search",
+            "id,vid,tvdbid,traktid,rid,tvmazeid,imdbid,tmdbid,season,ep,cat,minsize,maxage,limit,offset,cursor,sort",
+        ),
+        (
+            b"movie-search",
+            "id,imdbid,tmdbid,traktid,cat,minsize,maxage,limit,offset,cursor,sort",
+        ),
+        (
+            b"audio-search",
+            "id,cat,minsize,maxage,group,limit,offset,cursor,sort",
+        ),
+        (
+            b"book-search",
+            "id,cat,minsize,maxage,group,limit,offset,cursor,sort",
+        ),
+        (
+            b"anime-search",
+            "id,anidbid,anilistid,cat,minsize,maxage,limit,offset,cursor,sort",
+        ),
+    ];
+
+    /// Longest advertised parameter name; longer names are never supported.
+    const MAX_PARAM: usize = 16;
+
+    /// Bit of every parameter name either API version advertises.
+    fn param_bit(name: &[u8]) -> Option<u32> {
+        Some(match name {
+            b"q" => 0,
+            b"group" => 1,
+            b"minsize" => 2,
+            b"maxsize" => 3,
+            b"maxage" => 4,
+            b"cat" => 5,
+            b"limit" => 6,
+            b"offset" => 7,
+            b"attrs" => 8,
+            b"extended" => 9,
+            b"del" => 10,
+            b"sort" => 11,
+            b"vid" => 12,
+            b"tvdbid" => 13,
+            b"traktid" => 14,
+            b"rid" => 15,
+            b"tvmazeid" => 16,
+            b"imdbid" => 17,
+            b"tmdbid" => 18,
+            b"season" => 19,
+            b"ep" => 20,
+            b"genre" => 21,
+            b"title" => 22,
+            b"author" => 23,
+            b"anidbid" => 24,
+            b"anilistid" => 25,
+            b"id" => 26,
+            b"cursor" => 27,
+            _ => return None,
+        })
+    }
+
+    /// `ApiCapabilitiesService::supportedParamPlanBatch()`: `[function ordinal or 0, names,
+    /// supported names, first unsupported name index or -1]`.
+    ///
+    /// `ints` holds the API version; `data` holds every function, then every parameter list.
+    fn param_plans(count: usize, data: &[u8], table: &[i64], words: &mut Vec<i64>) -> Option<()> {
+        let [version] = table else {
+            return None;
+        };
+        let functions: &[(&[u8], &str)] = match version {
+            1 => &SEARCHING_V1,
+            2 => &SEARCHING_V2,
+            _ => &[],
+        };
+        let mut masks = [0u32; 6];
+        for (mask, (_, params)) in masks.iter_mut().zip(functions) {
+            for param in params.split(',') {
+                *mask |= 1 << param_bit(param.as_bytes())?;
+            }
+        }
+        let fields = split_fields(data, count.checked_mul(2)?)?;
+        let (names, lists) = fields.split_at(count);
+        let mut lower = [0u8; MAX_PARAM];
+        for (name, list) in names.iter().zip(lists) {
+            let ordinal = functions.iter().position(|(function, _)| function == name);
+            let allowed = ordinal.map_or(0, |index| masks[index]);
+            let (mut total, mut supported, mut first) = (0i64, 0i64, -1i64);
+            if !list.is_empty() {
+                for raw in list.split(|&b| b == b',') {
+                    let param = trim(raw);
+                    if param.is_empty() {
+                        continue;
+                    }
+                    let known = allowed != 0 && param.len() <= MAX_PARAM && {
+                        let lowered = &mut lower[..param.len()];
+                        for (slot, &b) in lowered.iter_mut().zip(param) {
+                            *slot = b.to_ascii_lowercase();
+                        }
+                        param_bit(lowered).is_some_and(|bit| allowed & 1 << bit != 0)
+                    };
+                    if known {
+                        supported += 1;
+                    } else if first < 0 {
+                        first = total;
+                    }
+                    total += 1;
+                }
+            }
+            words.extend_from_slice(&[
+                ordinal.map_or(0, |index| index as i64 + 1),
+                total,
+                supported,
+                first,
+            ]);
+        }
+        Some(())
+    }
+
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0100_0000_01b3;
+
+    /// `ApiReleaseRowCache::leafFingerprintBatch()`: `[trimmed length, blank | changed << 1,
+    /// FNV-1a 64 of the trimmed value]`.
+    fn leaf_fingerprints(
+        count: usize,
+        data: &[u8],
+        table: &[i64],
+        words: &mut Vec<i64>,
+    ) -> Option<()> {
+        if !table.is_empty() {
+            return None;
+        }
+        for value in split_fields(data, count)? {
+            let trimmed = trim(value);
+            let hash = trimmed.iter().fold(FNV_OFFSET, |hash, &b| {
+                (hash ^ u64::from(b)).wrapping_mul(FNV_PRIME)
+            });
+            let flags =
+                i64::from(trimmed.is_empty()) | i64::from(trimmed.len() != value.len()) << 1;
+            words.extend_from_slice(&[trimmed.len() as i64, flags, hash as i64]);
+        }
+        Some(())
+    }
+
+    /// `ApiUsageService::AUDIT_VALUE_MAX_LENGTH`.
+    const AUDIT_VALUE_CHARS: usize = 64;
+
+    /// `ApiUsageService::auditValuePlanBatch()`: `[code points, bytes of the first 64 code points,
+    /// RFC 3986 encoded length of those bytes]`; declines on invalid UTF-8.
+    fn audit_values(count: usize, data: &[u8], table: &[i64], words: &mut Vec<i64>) -> Option<()> {
+        if !table.is_empty() {
+            return None;
+        }
+        for value in split_fields(data, count)? {
+            let (chars, kept) = if value.is_ascii() {
+                (value.len(), value.len().min(AUDIT_VALUE_CHARS))
+            } else {
+                let text = std::str::from_utf8(value).ok()?;
+                // Code points are the bytes that are not UTF-8 continuation bytes.
+                let chars = value.iter().filter(|&&b| b & 0xc0 != 0x80).count();
+                let kept = text
+                    .char_indices()
+                    .nth(AUDIT_VALUE_CHARS)
+                    .map_or(value.len(), |(at, _)| at);
+                (chars, kept)
+            };
+            let encoded: usize = value[..kept]
+                .iter()
+                .map(|&b| if UNRESERVED[usize::from(b)] { 1 } else { 3 })
+                .sum();
+            words.extend_from_slice(&[chars as i64, kept as i64, encoded as i64]);
+        }
+        Some(())
+    }
+
+    /// `XmlResponseContext::xmlEscapePlanBatch()`: `[ENT_XML1 | ENT_QUOTES escaped length, escaped
+    /// characters, XML 1.0 disallowed control bytes]`; declines on invalid UTF-8.
+    fn xml_escapes(count: usize, data: &[u8], table: &[i64], words: &mut Vec<i64>) -> Option<()> {
+        if !table.is_empty() {
+            return None;
+        }
+        for value in split_fields(data, count)? {
+            std::str::from_utf8(value).ok()?;
+            let (mut length, mut entities, mut controls) = (0i64, 0i64, 0i64);
+            for &b in value {
+                let extra = match b {
+                    b'&' => 4,
+                    b'<' | b'>' => 3,
+                    b'"' | b'\'' => 5,
+                    _ => 0,
+                };
+                length += 1 + extra;
+                entities += i64::from(extra != 0);
+                controls += i64::from(b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r'));
+            }
+            words.extend_from_slice(&[length, entities, controls]);
+        }
+        Some(())
+    }
+
+    /// PHP `str_contains()` for a non-empty needle.
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        let mut from = 0;
+        while haystack.len() - from >= needle.len() {
+            let window = &haystack[from..=haystack.len() - needle.len()];
+            let Some(at) = memchr(needle[0], window) else {
+                return false;
+            };
+            if haystack[from + at..].starts_with(needle) {
+                return true;
+            }
+            from += at + 1;
+        }
+        false
+    }
+
+    /// `FailedJobsCollector::exceptionPlanBatch()`: `[category, class length, first line length]`.
+    ///
+    /// `data` holds the exceptions back to back; `ints` holds their byte lengths.
+    /// Categories: 0 unparseable, 1 timeout, 2 too many attempts, 3 model not found, 4 other.
+    fn exception_plans(
+        count: usize,
+        data: &[u8],
+        table: &[i64],
+        words: &mut Vec<i64>,
+    ) -> Option<()> {
+        if table.len() != count {
+            return None;
+        }
+        let mut at = 0usize;
+        for &length in table {
+            let length = usize::try_from(length).ok()?;
+            let exception = data.get(at..at.checked_add(length)?)?;
+            at += length;
+            let line = &exception[..memchr(b'\n', exception).unwrap_or(exception.len())];
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            let class = &line[..memchr(b':', line).unwrap_or(line.len())];
+            let valid = class.first().is_some_and(|b| !b.is_ascii_digit())
+                && class
+                    .iter()
+                    .fold(true, |valid, &b| valid & CLASS_BYTES[usize::from(b)]);
+            let category = if !valid {
+                0
+            } else if class.ends_with(b"TimeoutExceededException")
+                || contains(line, b"has timed out")
+            {
+                1
+            } else if class.ends_with(b"MaxAttemptsExceededException")
+                || contains(line, b"attempted too many times")
+            {
+                2
+            } else if class.ends_with(b"ModelNotFoundException") {
+                3
+            } else {
+                4
+            };
+            words.extend_from_slice(&[
+                category,
+                if valid { class.len() as i64 } else { 0 },
+                line.len() as i64,
+            ]);
+        }
+        (at == data.len()).then_some(())
+    }
+
+    macro_rules! entry {
+        ($(#[$doc:meta])* $name:ident, $width:expr, $body:ident) => {
+            $(#[$doc])*
+            ///
+            /// # Safety
+            /// Non-null pointers must refer to readable allocations of
+            /// `data_len` and `ints_len` bytes and a writable, aligned
+            /// allocation of `out_cap` i64 words. Null pointers require zero
+            /// length/capacity. Inputs and output must not overlap.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                count: usize,
+                flags: i64,
+                data: *const u8,
+                data_len: usize,
+                ints: *const u8,
+                ints_len: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> i64 {
+                unsafe {
+                    run(count, flags, data, data_len, ints, ints_len, out, out_cap, $width, |data, table, words| {
+                        $body(count, data, table, words)
+                    })
+                }
+            }
+        };
+    }
+
+    entry!(
+        /// `ApiCapabilitiesService::supportedParamPlanBatch()` (see [`param_plans`]).
+        nntmux_w535_api_capabilities_param_plan, 4, param_plans
+    );
+    entry!(
+        /// `ApiReleaseRowCache::leafFingerprintBatch()` (see [`leaf_fingerprints`]).
+        nntmux_w535_api_row_cache_leaf_fingerprint, 3, leaf_fingerprints
+    );
+    entry!(
+        /// `ApiUsageService::auditValuePlanBatch()` (see [`audit_values`]).
+        nntmux_w535_api_usage_audit_value_plan, 3, audit_values
+    );
+    entry!(
+        /// `XmlResponseContext::xmlEscapePlanBatch()` (see [`xml_escapes`]).
+        nntmux_w535_xml_escape_plan, 3, xml_escapes
+    );
+    entry!(
+        /// `FailedJobsCollector::exceptionPlanBatch()` (see [`exception_plans`]).
+        nntmux_w535_failed_job_exception_plan, 3, exception_plans
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        type Entry = unsafe extern "C" fn(
+            usize,
+            i64,
+            *const u8,
+            usize,
+            *const u8,
+            usize,
+            *mut i64,
+            usize,
+        ) -> i64;
+
+        fn pack(values: &[i64]) -> Vec<u8> {
+            values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect()
+        }
+
+        fn call(entry: Entry, count: usize, data: &[u8], table: &[i64]) -> Result<Vec<i64>, i64> {
+            let table = pack(table);
+            let mut out = vec![0i64; 4096];
+            let written = unsafe {
+                entry(
+                    count,
+                    0,
+                    data.as_ptr(),
+                    data.len(),
+                    table.as_ptr(),
+                    table.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            if written < 0 {
+                return Err(written);
+            }
+            out.truncate(written as usize);
+            Ok(out)
+        }
+
+        #[test]
+        fn w535_param_plans_follow_advertised_functions() {
+            let data = b"search\0tv-search\0nope\0movie-search\0q, CAT ,limit,,bogus\0\0q,cat\0id";
+            let words = call(nntmux_w535_api_capabilities_param_plan, 4, data, &[1]).unwrap();
+            assert_eq!(words, [1, 4, 3, 3, 2, 0, 0, -1, 0, 2, 0, 0, 3, 1, 0, 0]);
+            let v2 = call(
+                nntmux_w535_api_capabilities_param_plan,
+                1,
+                b"search\0id,cursor,q",
+                &[2],
+            )
+            .unwrap();
+            assert_eq!(v2, [1, 3, 2, 2]);
+            let unknown = call(
+                nntmux_w535_api_capabilities_param_plan,
+                1,
+                b"search\0q",
+                &[3],
+            )
+            .unwrap();
+            assert_eq!(unknown, [0, 1, 0, 0]);
+            assert_eq!(
+                call(
+                    nntmux_w535_api_capabilities_param_plan,
+                    1,
+                    b"search\0q",
+                    &[]
+                ),
+                Err(DECLINE)
+            );
+            assert_eq!(
+                call(nntmux_w535_api_capabilities_param_plan, 1, b"search", &[1]),
+                Err(DECLINE)
+            );
+        }
+
+        #[test]
+        fn w535_leaf_fingerprints_hash_trimmed_values() {
+            let words = call(
+                nntmux_w535_api_row_cache_leaf_fingerprint,
+                3,
+                b"abc\0 \t\0 abc\n",
+                &[],
+            )
+            .unwrap();
+            let abc = 0xe71f_a219_0541_574b_u64 as i64;
+            assert_eq!(words, [3, 0, abc, 0, 3, FNV_OFFSET as i64, 3, 2, abc]);
+        }
+
+        #[test]
+        fn w535_audit_values_count_code_points() {
+            let long = "\u{e9}".repeat(70);
+            let data = [b"a b~".as_slice(), b"\0", long.as_bytes()].concat();
+            let words = call(nntmux_w535_api_usage_audit_value_plan, 2, &data, &[]).unwrap();
+            assert_eq!(words, [4, 4, 6, 70, 128, 384]);
+            assert_eq!(
+                call(nntmux_w535_api_usage_audit_value_plan, 1, b"\xff", &[]),
+                Err(DECLINE)
+            );
+            assert_eq!(
+                call(nntmux_w535_api_usage_audit_value_plan, 1, b"", &[]).unwrap(),
+                [0, 0, 0]
+            );
+        }
+
+        #[test]
+        fn w535_xml_escapes_size_entities() {
+            let words = call(
+                nntmux_w535_xml_escape_plan,
+                2,
+                b"a'b\"<>&\0x\x01\t\x1f",
+                &[],
+            )
+            .unwrap();
+            assert_eq!(words, [27, 5, 0, 4, 0, 2]);
+            assert_eq!(
+                call(nntmux_w535_xml_escape_plan, 1, b"\xc3", &[]),
+                Err(DECLINE)
+            );
+        }
+
+        #[test]
+        fn w535_exception_plans_classify_first_lines() {
+            let parts: [&[u8]; 6] = [
+                b"Illuminate\\Queue\\TimeoutExceededException: Job has timed out.\nStack",
+                b"App\\Jobs\\X has been attempted too many times.\r\n#0\0",
+                b"Illuminate\\Database\\Eloquent\\ModelNotFoundException: No query results",
+                b"RuntimeException",
+                b": oops",
+                b"9Bad: x",
+            ];
+            let lengths: Vec<i64> = parts.iter().map(|part| part.len() as i64).collect();
+            let data = parts.concat();
+            let words = call(nntmux_w535_failed_job_exception_plan, 6, &data, &lengths).unwrap();
+            assert_eq!(
+                words,
+                [1, 41, 61, 0, 0, 45, 3, 51, 69, 4, 16, 16, 0, 0, 6, 0, 0, 7]
+            );
+            let entry: Entry = nntmux_w535_failed_job_exception_plan;
+            assert_eq!(call(entry, 1, b"ab", &[3]), Err(DECLINE));
+            assert_eq!(call(entry, 1, b"ab", &[1]), Err(DECLINE));
+            assert_eq!(call(entry, 1, b"ab", &[-1]), Err(DECLINE));
+            assert_eq!(call(entry, 2, b"ab", &[2]), Err(DECLINE));
+            assert_eq!(call(entry, 1, b"", &[0]).unwrap(), [0, 0, 0]);
+        }
+
+        #[test]
+        fn w535_byte_search_matches_naive() {
+            let hay = b"0123456789abcdef\n has timed out, has timed\0";
+            for needle in [b'\n', b':', 0, b'0', b'f', b'd'] {
+                assert_eq!(memchr(needle, hay), hay.iter().position(|&b| b == needle));
+            }
+            assert!(contains(hay, b"has timed out"));
+            assert!(contains(b"has timed out", b"has timed out"));
+            assert!(!contains(b"has timed", b"has timed out"));
+            assert!(!contains(b"", b"x"));
+            assert_eq!(split_fields(b"a\0\0b", 3), Some(vec![&b"a"[..], b"", b"b"]));
+            assert_eq!(split_fields(b"a\0b", 1), None);
+            assert_eq!(split_fields(b"", 1), Some(vec![&b""[..]]));
+        }
+
+        #[test]
+        fn w535_abi_declines_and_reports_capacity() {
+            let data = b"abc";
+            let mut out = [7i64; 3];
+            let entry: Entry = nntmux_w535_api_row_cache_leaf_fingerprint;
+            let small = unsafe {
+                entry(
+                    1,
+                    0,
+                    data.as_ptr(),
+                    data.len(),
+                    std::ptr::null(),
+                    0,
+                    out.as_mut_ptr(),
+                    2,
+                )
+            };
+            assert_eq!(small, -3);
+            assert_eq!(out, [7; 3]);
+            let null_out = unsafe {
+                entry(
+                    1,
+                    0,
+                    data.as_ptr(),
+                    data.len(),
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!(null_out, -3);
+            let bad_null = unsafe {
+                entry(
+                    1,
+                    0,
+                    std::ptr::null(),
+                    3,
+                    std::ptr::null(),
+                    0,
+                    out.as_mut_ptr(),
+                    3,
+                )
+            };
+            assert_eq!(bad_null, DECLINE);
+            let bad_out = unsafe {
+                entry(
+                    1,
+                    0,
+                    data.as_ptr(),
+                    data.len(),
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut(),
+                    3,
+                )
+            };
+            assert_eq!(bad_out, DECLINE);
+            let flagged = unsafe {
+                entry(
+                    1,
+                    1,
+                    data.as_ptr(),
+                    data.len(),
+                    std::ptr::null(),
+                    0,
+                    out.as_mut_ptr(),
+                    3,
+                )
+            };
+            assert_eq!(flagged, DECLINE);
+            let ragged = unsafe {
+                entry(
+                    1,
+                    0,
+                    data.as_ptr(),
+                    data.len(),
+                    [0u8; 3].as_ptr(),
+                    3,
+                    out.as_mut_ptr(),
+                    3,
+                )
+            };
+            assert_eq!(ragged, DECLINE);
+            assert_eq!(call(entry, 2, data, &[]), Err(DECLINE));
+            let empty = unsafe {
+                entry(
+                    0,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!(empty, 0);
+            let shared = out.as_mut_ptr();
+            let overlap =
+                unsafe { entry(1, 0, shared.cast::<u8>(), 8, std::ptr::null(), 0, shared, 3) };
+            assert_eq!(overlap, DECLINE);
+        }
+
+        #[test]
+        fn w535_random_inputs_never_panic() {
+            let mut seed = 0x535_u64;
+            let mut next = move || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed
+            };
+            let entries: [Entry; 5] = [
+                nntmux_w535_api_capabilities_param_plan,
+                nntmux_w535_api_row_cache_leaf_fingerprint,
+                nntmux_w535_api_usage_audit_value_plan,
+                nntmux_w535_xml_escape_plan,
+                nntmux_w535_failed_job_exception_plan,
+            ];
+            let alphabet = [
+                0u8, b',', b' ', b':', b'\\', b'&', b'<', b'\'', b'\n', b'\r', 0xff, 0xc3, 0xa9,
+                b'q', b'A', b'1',
+            ];
+            for round in 0..20_000 {
+                let data: Vec<u8> = (0..next() % 40)
+                    .map(|_| alphabet[(next() % 16) as usize])
+                    .collect();
+                let table: Vec<i64> = (0..next() % 3)
+                    .map(|_| [0, 1, 2, -1, i64::MAX, i64::MIN][(next() % 6) as usize])
+                    .collect();
+                let _ = call(entries[round % 5], (next() % 5) as usize, &data, &table);
+            }
+        }
+    }
+}
