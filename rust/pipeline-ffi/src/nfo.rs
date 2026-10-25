@@ -25028,3 +25028,593 @@ pub unsafe extern "C" fn nntmux_w35_nzb_nfo_par2_exceptions_recovery(
     }))
     .unwrap_or(-1)
 }
+
+mod wave36_nntp_fingerprint_exceptions_yenc {
+    use super::{nfo_abi_range, yenc_ranges_overlap};
+    use std::slice;
+
+    pub(super) const MAX_BYTES: usize = 16 * 1024 * 1024;
+
+    /// Attempts after which a confirmed-missing article stops being retried.
+    const MISSING_MAX_ATTEMPTS: i64 = 3;
+
+    /// Consecutive provider failures that open the circuit.
+    const PROVIDER_CIRCUIT_FAILURES: i64 = 3;
+
+    const PROVIDER_MAX_BACKOFF_SECONDS: i64 = 300;
+
+    const RETRY_MAX_BASE_MS: i64 = 60_000;
+
+    const RETRY_MAX_BACKOFF_MS: i64 = 300_000;
+
+    /// The default and hard ceilings for one yEnc codec call.
+    const CODEC_DEFAULT_MAX: i64 = 16_777_216;
+    const CODEC_HARD_MAX: i64 = 1 << 40;
+
+    /// PHP `trim()`'s default character list.
+    fn php_space(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x00)
+    }
+
+    /// The `[start, end)` range `trim()` keeps.
+    fn trim_range(value: &[u8]) -> (usize, usize) {
+        let start = value
+            .iter()
+            .position(|b| !php_space(*b))
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|b| !php_space(*b))
+            .map_or(start, |i| i + 1);
+        (start, end)
+    }
+
+    /// `str_contains(strtolower($haystack), $needle)` for a lowercase ASCII needle.
+    fn contains_ascii_ci(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.len() >= needle.len()
+            && haystack
+                .windows(needle.len())
+                .any(|w| w.eq_ignore_ascii_case(needle))
+    }
+
+    /// `[present, start, len]` for a range that is absent when empty.
+    fn range(value: Option<(usize, usize)>) -> [i64; 3] {
+        value.map_or([0, 0, 0], |(start, end)| {
+            [1, start as i64, (end - start) as i64]
+        })
+    }
+
+    /// The trimmed message-id without one pair of enclosing angle brackets.
+    fn message_id(value: &[u8]) -> Option<(usize, usize)> {
+        let (mut start, mut end) = trim_range(value);
+        if end - start >= 2 && value[start] == b'<' && value[end - 1] == b'>' {
+            start += 1;
+            end -= 1;
+        }
+        (end > start).then_some((start, end))
+    }
+
+    fn trimmed(value: &[u8]) -> Option<(usize, usize)> {
+        let (start, end) = trim_range(value);
+        (end > start).then_some((start, end))
+    }
+
+    /// `[has_id, id_start, id_len, reason, confirmed, attempts, retryable]`;
+    /// reason 0 no such article (430), 1 no such article number (423), 2 unknown.
+    pub(super) fn classify_missing(id: Option<&[u8]>, status: i64, attempts: i64) -> [i64; 7] {
+        let [has, start, len] = range(id.and_then(message_id));
+        let reason = match status {
+            430 => 0,
+            423 => 1,
+            _ => 2,
+        };
+        let attempts = attempts.max(0);
+        [
+            has,
+            start,
+            len,
+            reason,
+            i64::from(reason < 2),
+            attempts,
+            i64::from(attempts < MISSING_MAX_ATTEMPTS),
+        ]
+    }
+
+    /// `[has_host, host_start, host_len, kind, default_port, consecutive,
+    /// circuit_open, retryable, backoff_seconds]`; kind 0 connect, 1 auth,
+    /// 2 denied, 3 unavailable, 4 protocol.
+    pub(super) fn classify_provider(
+        host: Option<&[u8]>,
+        status: i64,
+        tls: bool,
+        consecutive: i64,
+    ) -> [i64; 9] {
+        let host = host.and_then(|value| {
+            let (start, mut end) = trim_range(value);
+            while end > start && value[end - 1] == b'.' {
+                end -= 1;
+            }
+            (end > start).then_some((start, end))
+        });
+        let [has, start, len] = range(host);
+        let kind = match status {
+            i64::MIN..=0 => 0,
+            480..=482 => 1,
+            502 => 2,
+            400 | 503 => 3,
+            _ => 4,
+        };
+        let consecutive = consecutive.max(0);
+        let retryable = kind != 1 && kind != 2;
+        [
+            has,
+            start,
+            len,
+            kind,
+            if tls { 563 } else { 119 },
+            consecutive,
+            i64::from(!retryable || consecutive >= PROVIDER_CIRCUIT_FAILURES),
+            i64::from(retryable),
+            if retryable {
+                (5i64 << consecutive.min(6)).min(PROVIDER_MAX_BACKOFF_SECONDS)
+            } else {
+                0
+            },
+        ]
+    }
+
+    /// `[attempt, max_attempts, base_ms, remaining, exhausted, backoff_ms,
+    /// has_reason, reason_start, reason_len, reason_kind]`; reason kind
+    /// 0 unavailable, 1 closed, 2 interrupted, 3 ended, 4 unknown.
+    pub(super) fn summarize_retry(
+        attempt: i64,
+        max_attempts: i64,
+        base_ms: i64,
+        reason: Option<&[u8]>,
+    ) -> [i64; 10] {
+        let attempt = attempt.max(0);
+        let max_attempts = max_attempts.max(1);
+        let base = base_ms.clamp(0, RETRY_MAX_BASE_MS);
+        let exhausted = attempt >= max_attempts;
+        let backoff = if exhausted {
+            0
+        } else {
+            (base << attempt.min(20)).min(RETRY_MAX_BACKOFF_MS)
+        };
+        let [has, start, len] = range(reason.and_then(trimmed));
+        let kind = match reason {
+            Some(r) if contains_ascii_ci(r, b"unavailable") => 0,
+            Some(r) if contains_ascii_ci(r, b"closed") => 1,
+            Some(r) if contains_ascii_ci(r, b"interrupted") => 2,
+            Some(r) if contains_ascii_ci(r, b"ended") => 3,
+            _ => 4,
+        };
+        [
+            attempt,
+            max_attempts,
+            base,
+            (max_attempts - attempt).max(0),
+            i64::from(exhausted),
+            backoff,
+            has,
+            start,
+            len,
+            kind,
+        ]
+    }
+
+    /// `[has_id, id_start, id_len, has_reason, reason_start, reason_len, kind,
+    /// bytes_read, partial, retryable]`; kind 0 worker stopped, 1 incomplete,
+    /// 2 invalid, 3 request, 4 timeout, 5 io.
+    pub(super) fn classify_transport(
+        id: Option<&[u8]>,
+        reason: Option<&[u8]>,
+        bytes_read: i64,
+    ) -> [i64; 10] {
+        let [has_id, id_start, id_len] = range(id.and_then(message_id));
+        let [has_reason, reason_start, reason_len] = range(reason.and_then(trimmed));
+        let kind = match reason {
+            Some(r) if contains_ascii_ci(r, b"stopped") => 0,
+            Some(r) if contains_ascii_ci(r, b"incomplete") => 1,
+            Some(r) if contains_ascii_ci(r, b"invalid") => 2,
+            Some(r) if contains_ascii_ci(r, b"request failed") => 3,
+            Some(r) if contains_ascii_ci(r, b"timed out") || contains_ascii_ci(r, b"timeout") => 4,
+            _ => 5,
+        };
+        let bytes = bytes_read.max(0);
+        [
+            has_id,
+            id_start,
+            id_len,
+            has_reason,
+            reason_start,
+            reason_len,
+            kind,
+            bytes,
+            i64::from(bytes > 0),
+            i64::from(kind != 2),
+        ]
+    }
+
+    /// `[driver, known, max_bytes, payload_bytes, action, encoded_estimate]`;
+    /// driver 0 PHP, 1 RapidYenc; action 0 skip, 1 decode, 2 reject.
+    pub(super) fn normalize_codec(driver: Option<&[u8]>, payload: i64, max_bytes: i64) -> [i64; 6] {
+        let name = driver.map(|value| {
+            let (start, end) = trim_range(value);
+            &value[start..end]
+        });
+        let (code, known) = match name {
+            Some(n)
+                if n.eq_ignore_ascii_case(b"rapidyenc")
+                    || n.eq_ignore_ascii_case(b"rapid_yenc")
+                    || n.eq_ignore_ascii_case(b"native") =>
+            {
+                (1, 1)
+            }
+            Some(n) if n.eq_ignore_ascii_case(b"php") => (0, 1),
+            _ => (0, 0),
+        };
+        let max = if max_bytes >= 1 {
+            max_bytes.min(CODEC_HARD_MAX)
+        } else {
+            CODEC_DEFAULT_MAX
+        };
+        let payload = payload.max(0);
+        let action = if payload == 0 {
+            0
+        } else if payload > max {
+            2
+        } else {
+            1
+        };
+        let estimate = if action == 1 {
+            let lines = payload / 128 + i64::from(payload % 128 != 0);
+            payload + payload / 50 + lines * 2
+        } else {
+            0
+        };
+        [code, known, max, payload, action, estimate]
+    }
+
+    fn int(bytes: &[u8], index: usize) -> i64 {
+        let mut slot = [0u8; 8];
+        slot.copy_from_slice(&bytes[index * 8..index * 8 + 8]);
+        i64::from_ne_bytes(slot)
+    }
+
+    fn flag(bytes: &[u8], index: usize) -> Option<bool> {
+        match int(bytes, index) {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+
+    /// An optional string's length from its presence flag and length slots; an
+    /// absent string must declare zero bytes.
+    fn optional(bytes: &[u8], present: usize, length: usize) -> Option<(bool, i64)> {
+        let has = flag(bytes, present)?;
+        let len = int(bytes, length);
+        (has || len == 0).then_some((has, len))
+    }
+
+    /// Split the bytes after `head` into strings of the given lengths, which must
+    /// cover the tail exactly.
+    fn strings<'a>(bytes: &'a [u8], head: usize, lengths: &[i64]) -> Option<Vec<&'a [u8]>> {
+        let mut cursor = head;
+        let mut parts = Vec::with_capacity(lengths.len());
+        for &length in lengths {
+            let end = cursor.checked_add(usize::try_from(length).ok()?)?;
+            parts.push(bytes.get(cursor..end)?);
+            cursor = end;
+        }
+        (cursor == bytes.len()).then_some(parts)
+    }
+
+    fn pack_ints(values: &[i64]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_ne_bytes()).collect()
+    }
+
+    fn compute(operation: u32, bytes: &[u8]) -> Option<Vec<u8>> {
+        let fixed = match operation {
+            0 | 4 => 4,
+            1..=3 => 5,
+            _ => return None,
+        };
+        if bytes.len() < fixed * 8 {
+            return None;
+        }
+        let head = fixed * 8;
+        match operation {
+            0 => {
+                let (has, len) = optional(bytes, 0, 1)?;
+                let parts = strings(bytes, head, &[len])?;
+                Some(pack_ints(&classify_missing(
+                    has.then_some(parts[0]),
+                    int(bytes, 2),
+                    int(bytes, 3),
+                )))
+            }
+            1 => {
+                let (has, len) = optional(bytes, 0, 1)?;
+                let tls = flag(bytes, 3)?;
+                let parts = strings(bytes, head, &[len])?;
+                Some(pack_ints(&classify_provider(
+                    has.then_some(parts[0]),
+                    int(bytes, 2),
+                    tls,
+                    int(bytes, 4),
+                )))
+            }
+            2 => {
+                let (has, len) = optional(bytes, 3, 4)?;
+                let parts = strings(bytes, head, &[len])?;
+                Some(pack_ints(&summarize_retry(
+                    int(bytes, 0),
+                    int(bytes, 1),
+                    int(bytes, 2),
+                    has.then_some(parts[0]),
+                )))
+            }
+            3 => {
+                let (has_id, id_len) = optional(bytes, 0, 1)?;
+                let (has_reason, reason_len) = optional(bytes, 2, 3)?;
+                let parts = strings(bytes, head, &[id_len, reason_len])?;
+                Some(pack_ints(&classify_transport(
+                    has_id.then_some(parts[0]),
+                    has_reason.then_some(parts[1]),
+                    int(bytes, 4),
+                )))
+            }
+            4 => {
+                let (has, len) = optional(bytes, 0, 1)?;
+                let parts = strings(bytes, head, &[len])?;
+                Some(pack_ints(&normalize_codec(
+                    has.then_some(parts[0]),
+                    int(bytes, 2),
+                    int(bytes, 3),
+                )))
+            }
+            _ => None,
+        }
+    }
+
+    /// # Safety
+    /// See [`super::nntmux_w36_nntp_fingerprint_exceptions_yenc`].
+    pub(super) unsafe fn evaluate(
+        operation: u32,
+        input: *const u8,
+        length: usize,
+        output: *mut u8,
+        capacity: usize,
+    ) -> i64 {
+        if !nfo_abi_range(input, length, false)
+            || !nfo_abi_range(output, capacity, false)
+            || length > MAX_BYTES
+            || capacity > MAX_BYTES
+            || yenc_ranges_overlap(input as usize, length, output as usize, capacity)
+        {
+            return -1;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, length) };
+        let Some(result) = compute(operation, bytes) else {
+            return -1;
+        };
+        let needed = result.len() as i64;
+        if result.len() > capacity {
+            return -needed;
+        }
+        unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), output, result.len()) };
+        needed
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn call(operation: u32, input: &[u8]) -> Option<Vec<i64>> {
+            let mut out = vec![0xa5u8; 4096];
+            let probe = [0u8; 1];
+            let pointer = if input.is_empty() {
+                probe.as_ptr()
+            } else {
+                input.as_ptr()
+            };
+            let written =
+                unsafe { evaluate(operation, pointer, input.len(), out.as_mut_ptr(), out.len()) };
+            if written < 0 {
+                assert_eq!(written, -1);
+                return None;
+            }
+            Some(
+                out[..written as usize]
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|c| i64::from_ne_bytes(*c))
+                    .collect(),
+            )
+        }
+
+        fn with_strings(slots: &[i64], strings: &[&[u8]]) -> Vec<u8> {
+            let mut v = pack_ints(slots);
+            for s in strings {
+                v.extend_from_slice(s);
+            }
+            v
+        }
+
+        fn opt(value: Option<&str>) -> (i64, i64, &[u8]) {
+            value.map_or((0, 0, &b""[..]), |s| (1, s.len() as i64, s.as_bytes()))
+        }
+
+        #[test]
+        fn w36_2_missing_article_and_provider_failure() {
+            let missing = |id: Option<&str>, status: i64, attempts: i64| {
+                let (has, len, bytes) = opt(id);
+                call(0, &with_strings(&[has, len, status, attempts], &[bytes]))
+            };
+            assert_eq!(
+                missing(Some(" <abc@x> "), 430, 0),
+                Some(vec![1, 2, 5, 0, 1, 0, 1])
+            );
+            assert_eq!(missing(Some("<>"), 423, 2), Some(vec![0, 0, 0, 1, 1, 2, 1]));
+            assert_eq!(missing(Some("<"), 500, 3), Some(vec![1, 0, 1, 2, 0, 3, 0]));
+            assert_eq!(
+                missing(None, 430, i64::MIN),
+                Some(vec![0, 0, 0, 0, 1, 0, 1])
+            );
+            assert_eq!(call(0, &with_strings(&[0, 1, 430, 0], &[b"x"])), None);
+            assert_eq!(call(0, &with_strings(&[2, 0, 430, 0], &[])), None);
+            assert_eq!(call(0, &with_strings(&[1, 2, 430, 0], &[b"x"])), None);
+
+            let provider = |host: Option<&str>, status: i64, tls: i64, n: i64| {
+                let (has, len, bytes) = opt(host);
+                call(1, &with_strings(&[has, len, status, tls, n], &[bytes]))
+            };
+            assert_eq!(
+                provider(Some(" News.Example.com.. "), 0, 1, 0),
+                Some(vec![1, 1, 16, 0, 563, 0, 0, 1, 5])
+            );
+            assert_eq!(
+                provider(Some("..."), 481, 0, 1),
+                Some(vec![0, 0, 0, 1, 119, 1, 1, 0, 0])
+            );
+            assert_eq!(
+                provider(None, 503, 0, 9),
+                Some(vec![0, 0, 0, 3, 119, 9, 1, 1, 300])
+            );
+            assert_eq!(
+                provider(Some("h"), 200, 0, i64::MIN),
+                Some(vec![1, 0, 1, 4, 119, 0, 0, 1, 5])
+            );
+            assert_eq!(provider(Some("h"), 502, 0, 0).unwrap()[3], 2);
+            assert_eq!(call(1, &with_strings(&[0, 0, 0, 2, 0], &[])), None);
+        }
+
+        #[test]
+        fn w36_2_retry_transport_and_codec() {
+            let retry = |a: i64, m: i64, b: i64, reason: Option<&str>| {
+                let (has, len, bytes) = opt(reason);
+                call(2, &with_strings(&[a, m, b, has, len], &[bytes]))
+            };
+            assert_eq!(
+                retry(1, 3, 250, Some(" Pipeline CLOSED ")),
+                Some(vec![1, 3, 250, 2, 0, 500, 1, 1, 15, 1])
+            );
+            assert_eq!(
+                retry(5, 0, -4, None),
+                Some(vec![5, 1, 0, 0, 1, 0, 0, 0, 0, 4])
+            );
+            assert_eq!(
+                retry(i64::MAX, i64::MAX, i64::MAX, Some("\t")),
+                Some(vec![i64::MAX, i64::MAX, 60_000, 0, 1, 0, 0, 0, 0, 4])
+            );
+            assert_eq!(
+                retry(i64::MIN, i64::MAX, 60_000, Some("x")).unwrap()[5],
+                60_000
+            );
+            assert_eq!(retry(30, 99, 1, None).unwrap()[5], 300_000);
+
+            let transport = |id: Option<&str>, reason: Option<&str>, bytes: i64| {
+                let (hi, li, bi) = opt(id);
+                let (hr, lr, br) = opt(reason);
+                call(3, &with_strings(&[hi, li, hr, lr, bytes], &[bi, br]))
+            };
+            assert_eq!(
+                transport(Some("<a@b>"), Some(" Worker STOPPED "), 10),
+                Some(vec![1, 1, 3, 1, 1, 14, 0, 10, 1, 1])
+            );
+            assert_eq!(
+                transport(None, Some("incomplete or invalid"), -1),
+                Some(vec![0, 0, 0, 1, 0, 21, 1, 0, 0, 1])
+            );
+            assert_eq!(
+                transport(None, Some("Invalid digest"), 0).unwrap()[6..],
+                [2, 0, 0, 0]
+            );
+            assert_eq!(transport(None, None, 0).unwrap()[6], 5);
+            assert_eq!(transport(None, Some("read TIMEOUT"), 0).unwrap()[6], 4);
+            assert_eq!(call(3, &with_strings(&[0, 0, 0, 1, 0], &[b"x"])), None);
+
+            let codec = |driver: Option<&str>, payload: i64, max: i64| {
+                let (has, len, bytes) = opt(driver);
+                call(4, &with_strings(&[has, len, payload, max], &[bytes]))
+            };
+            assert_eq!(
+                codec(Some(" rapidYenc "), 1000, 16_777_216),
+                Some(vec![1, 1, 16_777_216, 1000, 1, 1036])
+            );
+            assert_eq!(
+                codec(Some("php"), 0, 0),
+                Some(vec![0, 1, 16_777_216, 0, 0, 0])
+            );
+            assert_eq!(codec(None, 11, 10), Some(vec![0, 0, 10, 11, 2, 0]));
+            assert_eq!(
+                codec(Some("x"), i64::MAX, i64::MAX),
+                Some(vec![0, 0, 1 << 40, i64::MAX, 2, 0])
+            );
+            assert_eq!(
+                codec(Some("x"), 1 << 40, i64::MAX).unwrap()[5],
+                (1i64 << 40) + (1i64 << 40) / 50 + (1i64 << 34)
+            );
+            assert_eq!(call(4, &pack_ints(&[1, 0, 0])), None);
+        }
+
+        #[test]
+        fn w36_2_abi_sentinels() {
+            assert_eq!(call(5, &pack_ints(&[0, 0, 0, 0, 0])), None);
+            let input = with_strings(&[0, 0, 430, 1], &[]);
+            let mut out = [0x5au8; 64];
+            let run = |p: *const u8, len: usize, o: *mut u8, cap: usize| unsafe {
+                evaluate(0, p, len, o, cap)
+            };
+            assert_eq!(run(std::ptr::null(), 0, out.as_mut_ptr(), out.len()), -1);
+            assert_eq!(
+                run(input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), MAX_BYTES + 1, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), input.len(), out.as_mut_ptr(), MAX_BYTES + 1),
+                -1
+            );
+            assert_eq!(run(input.as_ptr(), input.len(), out.as_mut_ptr(), 55), -56);
+            assert!(out.iter().all(|b| *b == 0x5a));
+            assert_eq!(run(input.as_ptr(), input.len(), out.as_mut_ptr(), 56), 56);
+            assert_eq!(i64::from_ne_bytes(out[40..48].try_into().unwrap()), 1);
+            let mut shared = [0u8; 96];
+            shared[..input.len()].copy_from_slice(&input);
+            let p = shared.as_mut_ptr();
+            assert_eq!(run(p, input.len(), unsafe { p.add(8) }, 56), -1);
+        }
+    }
+}
+
+/// Evaluate one Wave 36.2 NNTP/fingerprint exception or yEnc codec policy helper
+/// over packed native-endian `i64` slots followed by any variable-length string
+/// bytes. Returns the byte count written, the negated required capacity when
+/// `output` is too small (nothing written), or -1 when the input is malformed or
+/// outside the contract.
+///
+/// # Safety
+/// Both ranges must be live, disjoint readable/writable allocations. Pointers must
+/// be non-null even for zero lengths; arithmetic checks cannot prove provenance.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w36_nntp_fingerprint_exceptions_yenc(
+    operation: u32,
+    input: *const u8,
+    length: usize,
+    output: *mut u8,
+    capacity: usize,
+) -> i64 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        wave36_nntp_fingerprint_exceptions_yenc::evaluate(
+            operation, input, length, output, capacity,
+        )
+    }))
+    .unwrap_or(-1)
+}
