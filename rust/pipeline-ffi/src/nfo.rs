@@ -35597,7 +35597,7 @@ pub mod wave49_verification_admission_inventory_prep_repo_sample {
         b"Upload stopped growing before it was complete; queued for partial publication.";
 
     /// Borrows a caller span; an empty span may be null and is never sliced.
-    unsafe fn span<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+    pub(crate) unsafe fn span<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
         if len == 0 {
             return Some(&[]);
         }
@@ -35874,7 +35874,7 @@ pub mod wave49_verification_admission_inventory_prep_repo_sample {
 
     /// Runs `body`, appends the digest and copies the words to `out` (byte-wise, so `out` needs
     /// no particular alignment).
-    unsafe fn emit(
+    pub(crate) unsafe fn emit(
         out: *mut i64,
         out_cap: usize,
         count: usize,
@@ -36843,6 +36843,1021 @@ pub mod wave49_verification_admission_inventory_prep_repo_sample {
                         1,
                         1,
                         overlap,
+                        8
+                    ),
+                    -1
+                );
+            }
+        }
+    }
+}
+
+pub mod wave50_2_verification_db_lock_dirty_fetched_file_lock_heartbeat {
+    //! Wave 50.2 batch kernels for DatabaseVerificationLockStore, DirtyCandidateSettler,
+    //! FetchedArticle, FileVerificationLockStore and LeaseHeartbeat. They share the Wave 49.2
+    //! framing: NUL-joined string columns (exactly `count` entries), little-endian `i64`/`f64`
+    //! tables, fixed `i64` words per item, a few summary words and one XXH64 digest of the
+    //! preceding words. Each export returns the word count, `-needed` when `out_cap` (in words)
+    //! is short, or -1 for a null output, a malformed batch or a panic.
+
+    use super::wave49_verification_admission_inventory_prep_repo_sample::{
+        FoldState, column, crc32, emit, ints, span,
+    };
+    use std::cmp::Ordering;
+    use std::collections::HashSet;
+
+    type Set<T> = HashSet<T, FoldState>;
+
+    fn set<T>(n: usize) -> Set<T> {
+        HashSet::with_capacity_and_hasher(n, FoldState::default())
+    }
+
+    /// Exactly `count` little-endian `f64` values (PHP `pack('e*')`).
+    pub fn floats(bytes: &[u8], count: usize) -> Option<Vec<f64>> {
+        if bytes.len() != count.checked_mul(8)? {
+            return None;
+        }
+        Some(
+            bytes
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| f64::from_le_bytes(*c))
+                .collect(),
+        )
+    }
+
+    // ---- DatabaseVerificationLockStore -------------------------------------------------------
+
+    /// MariaDB user-level lock names are limited to 64 bytes.
+    pub const KEY_MAX: usize = 64;
+
+    /// DatabaseVerificationLockStore::MEMBERS.
+    fn group_members(group: &[u8]) -> i64 {
+        match group {
+            b"worker" => 512,
+            b"reset" => 64,
+            _ => 0,
+        }
+    }
+
+    /// A canonical decimal stripe number of at most four digits.
+    fn stripe(digits: &[u8]) -> Option<i64> {
+        if digits.is_empty()
+            || digits.len() > 4
+            || !digits.iter().all(u8::is_ascii_digit)
+            || (digits.len() > 1 && digits[0] == b'0')
+        {
+            return None;
+        }
+        Some(
+            digits
+                .iter()
+                .fold(0i64, |n, &d| n * 10 + i64::from(d - b'0')),
+        )
+    }
+
+    /// Two words per name (`flags | keyLength << 8 | extra << 24`, then `crc32(key)`), then
+    /// fitting, duplicate and stripe-member counts. Flags: 1 key fits 64 bytes, 2 known group
+    /// (extra = its member count), 4 in-range stripe `group.N` (extra = N), 8 repeated name,
+    /// 16 empty name; the key length is clamped to 65535.
+    pub fn lock_keys(prefix: &[u8], names: &[&[u8]]) -> Vec<i64> {
+        let n = names.len();
+        let mut out = Vec::with_capacity(n * 2 + 4);
+        let mut seen: Set<&[u8]> = set(n);
+        let (mut fits, mut duplicates, mut members) = (0i64, 0i64, 0i64);
+        let mut key = Vec::with_capacity(prefix.len() + KEY_MAX);
+        key.extend_from_slice(prefix);
+        for &name in names {
+            key.truncate(prefix.len());
+            key.extend_from_slice(name);
+            let len = key.len();
+            let (mut flags, mut extra) = (0i64, 0i64);
+            if len <= KEY_MAX {
+                flags |= 1;
+                fits += 1;
+            }
+            let group = group_members(name);
+            if group > 0 {
+                flags |= 2;
+                extra = group;
+            } else if let Some(dot) = name.iter().rposition(|&b| b == b'.') {
+                let count = group_members(&name[..dot]);
+                if count > 0
+                    && let Some(index) = stripe(&name[dot + 1..])
+                    && index < count
+                {
+                    flags |= 4;
+                    extra = index;
+                    members += 1;
+                }
+            }
+            if !seen.insert(name) {
+                flags |= 8;
+                duplicates += 1;
+            }
+            if name.is_empty() {
+                flags |= 16;
+            }
+            out.push(flags | (len.min(0xFFFF) as i64) << 8 | extra << 24);
+            out.push(i64::from(crc32(&key)));
+        }
+        out.push(fits);
+        out.push(duplicates);
+        out.push(members);
+        out
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w502_verification_lock_keys_batch(
+        prefix: *const u8,
+        prefix_len: usize,
+        names: *const u8,
+        names_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(prefix, prefix_len), (names, names_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let prefix = span(prefix, prefix_len)?;
+                let names = column(span(names, names_len)?, count)?;
+                Some(lock_keys(prefix, &names))
+            })
+        }
+    }
+
+    // ---- DirtyCandidateSettler ---------------------------------------------------------------
+
+    fn nibble(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    /// DirtyCandidateSettler::sourceHashPhp(): 40 hex digits of either case, decoded.
+    pub fn source_hash(identity: &[u8]) -> Option<[u8; 20]> {
+        if identity.len() != 40 {
+            return None;
+        }
+        let mut hash = [0u8; 20];
+        for (byte, pair) in hash.iter_mut().zip(identity.as_chunks::<2>().0) {
+            *byte = nibble(pair[0])? << 4 | nibble(pair[1])?;
+        }
+        Some(hash)
+    }
+
+    /// Two words per dirty row (`flags | crc32(identity) << 32`, then the decoded hash's first
+    /// eight bytes as a little-endian word or 0), then in-window, settleable and duplicate
+    /// counts and the last in-window index (-1 for none). Flags: 1 valid source hash, 2 after
+    /// the resume cursor (always without one), 4 at or before the sweep's upper bound, 8 both,
+    /// 16 repeated hash, 32 repeated id, 64 settleable (in window, valid, not repeated). Times
+    /// compare as bytes (strcmp), ties by id.
+    pub fn dirty_rows(
+        ids: &[i64],
+        identities: &[&[u8]],
+        ats: &[&[u8]],
+        after: Option<(&[u8], i64)>,
+        upper: (&[u8], i64),
+    ) -> Vec<i64> {
+        let n = ids.len();
+        let mut out = Vec::with_capacity(n * 2 + 5);
+        let mut hashes: Set<[u8; 20]> = set(n);
+        let mut seen_ids: Set<i64> = set(n);
+        let (mut window, mut settle, mut duplicates, mut last) = (0i64, 0i64, 0i64, -1i64);
+        for i in 0..n {
+            let (id, at, identity) = (ids[i], ats[i], identities[i]);
+            let hash = source_hash(identity);
+            let mut flags = i64::from(hash.is_some());
+            let past = after.is_none_or(|(after_at, after_id)| match at.cmp(after_at) {
+                Ordering::Greater => true,
+                Ordering::Equal => id > after_id,
+                Ordering::Less => false,
+            });
+            let before = match at.cmp(upper.0) {
+                Ordering::Less => true,
+                Ordering::Equal => id <= upper.1,
+                Ordering::Greater => false,
+            };
+            flags |= i64::from(past) << 1 | i64::from(before) << 2;
+            if past && before {
+                flags |= 8;
+            }
+            if let Some(h) = hash
+                && !hashes.insert(h)
+            {
+                flags |= 16;
+            }
+            if !seen_ids.insert(id) {
+                flags |= 32;
+            }
+            if flags & 0x30 != 0 {
+                duplicates += 1;
+            }
+            if flags & 8 != 0 {
+                window += 1;
+                last = i as i64;
+                if flags & 0x31 == 1 {
+                    flags |= 64;
+                    settle += 1;
+                }
+            }
+            out.push(flags | i64::from(crc32(identity)) << 32);
+            out.push(hash.map_or(0, |h| {
+                i64::from_le_bytes([h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]])
+            }));
+        }
+        out.extend([window, settle, duplicates, last]);
+        out
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_w502_dirty_candidate_settle_batch(
+        ids_ptr: *const u8,
+        ids_len: usize,
+        identities: *const u8,
+        identities_len: usize,
+        ats: *const u8,
+        ats_len: usize,
+        count: usize,
+        after_at: *const u8,
+        after_at_len: usize,
+        after_id: i64,
+        has_after: i64,
+        upper_at: *const u8,
+        upper_at_len: usize,
+        upper_id: i64,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [
+            (ids_ptr, ids_len),
+            (identities, identities_len),
+            (ats, ats_len),
+            (after_at, after_at_len),
+            (upper_at, upper_at_len),
+        ];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let ids = ints(span(ids_ptr, ids_len)?, count)?;
+                let identities = column(span(identities, identities_len)?, count)?;
+                let ats = column(span(ats, ats_len)?, count)?;
+                let after = match has_after {
+                    0 => None,
+                    1 => Some((span(after_at, after_at_len)?, after_id)),
+                    _ => return None,
+                };
+                let upper = (span(upper_at, upper_at_len)?, upper_id);
+                Some(dirty_rows(&ids, &identities, &ats, after, upper))
+            })
+        }
+    }
+
+    // ---- FetchedArticle ----------------------------------------------------------------------
+
+    /// Articles of one yEnc file, which all declare its size and part total (`None` when
+    /// unknown). One word per article (its end offset, or -1 when unknown), then one flag byte
+    /// per article packed eight to a word (article `i` at bits `8 * (i % 8)` of word `i / 8`),
+    /// then saturated raw and decoded totals and the within-file and final-part counts. Flags:
+    /// 1 end offset known, 2 end within the declared size, 4 part total known, 8 final part,
+    /// 16 negative raw size read as zero, 32 negative decoded size read as zero.
+    pub fn transfers(
+        size: i64,
+        total: Option<i64>,
+        raw: &[i64],
+        offset: &[i64],
+        decoded: &[i64],
+        part: &[i64],
+    ) -> Vec<i64> {
+        let n = raw.len();
+        let mut out = Vec::with_capacity(n + n.div_ceil(8) + 5);
+        let mut masks = vec![0i64; n.div_ceil(8)];
+        let (mut raw_total, mut decoded_total, mut within, mut finals) = (0i64, 0i64, 0i64, 0i64);
+        for i in 0..n {
+            let (r, d) = (raw[i].max(0), decoded[i].max(0));
+            let mut flags = i64::from(raw[i] < 0) << 4 | i64::from(decoded[i] < 0) << 5;
+            let end = if offset[i] >= 0 && offset[i] <= i64::MAX - d {
+                flags |= 1;
+                offset[i] + d
+            } else {
+                -1
+            };
+            if flags & 1 != 0 && end <= size {
+                flags |= 2;
+                within += 1;
+            }
+            if let Some(total) = total {
+                flags |= 4;
+                if part[i] == total {
+                    flags |= 8;
+                    finals += 1;
+                }
+            }
+            raw_total = raw_total.saturating_add(r);
+            decoded_total = decoded_total.saturating_add(d);
+            out.push(end);
+            masks[i / 8] |= flags << (8 * (i % 8));
+        }
+        out.extend(masks);
+        out.extend([raw_total, decoded_total, within, finals]);
+        out
+    }
+
+    /// # Safety
+    /// `ints_ptr` must be readable for `ints_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_w502_fetched_article_transfer_batch(
+        ints_ptr: *const u8,
+        ints_len: usize,
+        count: usize,
+        size: i64,
+        total_parts: i64,
+        has_total: i64,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(ints_ptr, ints_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let table = ints(span(ints_ptr, ints_len)?, count.checked_mul(4)?)?;
+                let total = match has_total {
+                    0 => None,
+                    1 => Some(total_parts),
+                    _ => return None,
+                };
+                let column = |k: usize| &table[k * count..(k + 1) * count];
+                Some(transfers(
+                    size,
+                    total,
+                    column(0),
+                    column(1),
+                    column(2),
+                    column(3),
+                ))
+            })
+        }
+    }
+
+    // ---- FileVerificationLockStore -----------------------------------------------------------
+
+    /// One path component that cannot leave the lock directory or carry control bytes.
+    fn safe_name(name: &[u8]) -> bool {
+        !name.is_empty()
+            && name != b"."
+            && name != b".."
+            && name
+                .iter()
+                .fold(true, |ok, &b| ok & (b >= 0x20) & (b != 0x7f) & (b != b'/'))
+    }
+
+    /// FileVerificationLockStore::computePollDeadlineNsPhp(), saturated at i64::MAX.
+    pub fn deadline(now_ns: i64, seconds: i64) -> i64 {
+        now_ns.saturating_add(seconds.max(0).saturating_mul(1_000_000_000))
+    }
+
+    /// Two words per lock (`flags | pathLength << 8 | crc32(path) << 32`, then the saturated
+    /// poll deadline), then usable and duplicate counts and the earliest usable deadline
+    /// (i64::MAX for none). The path is `directory/name.lock`. Flags: 1 safe name, 2 name fits
+    /// NAME_MAX with its suffix, 4 path within 1024 bytes, 8 repeated name, 16 hidden name,
+    /// 32 usable (1|2|4 without 8); the path length is clamped to 65535.
+    pub fn lock_files(
+        directory: &[u8],
+        names: &[&[u8]],
+        timeouts: &[i64],
+        now_ns: i64,
+    ) -> Vec<i64> {
+        let n = names.len();
+        let mut out = Vec::with_capacity(n * 2 + 4);
+        let mut seen: Set<&[u8]> = set(n);
+        let (mut usable, mut duplicates, mut earliest) = (0i64, 0i64, i64::MAX);
+        let mut path = Vec::with_capacity(directory.len() + 80);
+        path.extend_from_slice(directory);
+        path.push(b'/');
+        let base = path.len();
+        for (i, &name) in names.iter().enumerate() {
+            path.truncate(base);
+            path.extend_from_slice(name);
+            path.extend_from_slice(b".lock");
+            let mut flags = i64::from(safe_name(name))
+                | i64::from(name.len() + 5 <= 255) << 1
+                | i64::from(path.len() <= 1024) << 2;
+            if !seen.insert(name) {
+                flags |= 8;
+                duplicates += 1;
+            }
+            if name.first() == Some(&b'.') {
+                flags |= 16;
+            }
+            let due = deadline(now_ns, timeouts[i]);
+            if flags & 0xF == 7 {
+                flags |= 32;
+                usable += 1;
+                earliest = earliest.min(due);
+            }
+            out.push(flags | (path.len().min(0xFFFF) as i64) << 8 | i64::from(crc32(&path)) << 32);
+            out.push(due);
+        }
+        out.extend([usable, duplicates, earliest]);
+        out
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_w502_file_lock_plan_batch(
+        directory: *const u8,
+        directory_len: usize,
+        names: *const u8,
+        names_len: usize,
+        timeouts: *const u8,
+        timeouts_len: usize,
+        count: usize,
+        now_ns: i64,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [
+            (directory, directory_len),
+            (names, names_len),
+            (timeouts, timeouts_len),
+        ];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let directory = span(directory, directory_len)?;
+                let names = column(span(names, names_len)?, count)?;
+                let timeouts = ints(span(timeouts, timeouts_len)?, count)?;
+                Some(lock_files(directory, &names, &timeouts, now_ns))
+            })
+        }
+    }
+
+    // ---- LeaseHeartbeat ----------------------------------------------------------------------
+
+    /// Replays LeaseHeartbeat::__invoke() over clock ticks: one flag nibble per tick packed
+    /// sixteen to a word (tick `i` at bits `4 * (i % 16)` of word `i / 16`; flags: 1 renewal
+    /// due and taken, 2 clock moved backwards, 4 non-finite tick, 8 stall: a whole interval
+    /// passed since the previous tick), then the renewal and stall counts, whether a last
+    /// renewal exists and its IEEE bits (0 for none).
+    pub fn renewals(last: Option<f64>, ticks: &[f64], interval: f64) -> Vec<i64> {
+        let mut out = vec![0i64; ticks.len().div_ceil(16)];
+        out.reserve(5);
+        let mut last = last;
+        let mut previous: Option<f64> = None;
+        let (mut count, mut stalls) = (0i64, 0i64);
+        for (i, &now) in ticks.iter().enumerate() {
+            let mut flags = 0i64;
+            if last.is_none_or(|l| now - l >= interval) {
+                flags = 1;
+                last = Some(now);
+                count += 1;
+            }
+            if let Some(p) = previous {
+                if now < p {
+                    flags |= 2;
+                }
+                if now - p >= interval {
+                    flags |= 8;
+                    stalls += 1;
+                }
+            }
+            if !now.is_finite() {
+                flags |= 4;
+            }
+            previous = Some(now);
+            out[i / 16] |= flags << (4 * (i % 16));
+        }
+        out.extend([
+            count,
+            stalls,
+            i64::from(last.is_some()),
+            last.map_or(0, |l| l.to_bits() as i64),
+        ]);
+        out
+    }
+
+    /// # Safety
+    /// `ticks` must be readable for `ticks_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_w502_lease_heartbeat_batch(
+        ticks: *const u8,
+        ticks_len: usize,
+        count: usize,
+        has_last: i64,
+        last: f64,
+        interval: f64,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(ticks, ticks_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let ticks = floats(span(ticks, ticks_len)?, count)?;
+                let last = match has_last {
+                    0 => None,
+                    1 => Some(last),
+                    _ => return None,
+                };
+                Some(renewals(last, &ticks, interval))
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::wave49_verification_admission_inventory_prep_repo_sample::digest;
+        use super::*;
+
+        fn run(f: impl Fn(*mut i64, usize) -> isize) -> Vec<i64> {
+            let mut out = vec![0i64; 4096];
+            let n = f(out.as_mut_ptr(), out.len());
+            assert!(n > 0, "export returned {n}");
+            out.truncate(n as usize);
+            let check = out.pop().unwrap();
+            assert_eq!(digest(&out), check);
+            out
+        }
+
+        fn q(values: &[i64]) -> Vec<u8> {
+            values.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+
+        fn e(values: &[f64]) -> Vec<u8> {
+            values.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+
+        #[test]
+        fn helpers_match_php() {
+            assert_eq!(floats(&e(&[1.5, -0.0]), 2).unwrap()[0], 1.5);
+            assert!(floats(&[0; 7], 1).is_none());
+            assert_eq!(stripe(b"0"), Some(0));
+            assert_eq!(stripe(b"511"), Some(511));
+            assert_eq!(stripe(b"05"), None);
+            assert_eq!(stripe(b""), None);
+            assert_eq!(stripe(b"12345"), None);
+            assert_eq!(stripe(b"1a"), None);
+            let hex = b"00112233445566778899AABBCCDDEEFF0a0b0c0d";
+            assert_eq!(source_hash(hex).unwrap()[..4], [0x00, 0x11, 0x22, 0x33]);
+            assert_eq!(source_hash(hex).unwrap()[19], 0x0d);
+            assert!(source_hash(&hex[..39]).is_none());
+            assert!(source_hash(b"g0112233445566778899aabbccddeeff0a0b0c0d").is_none());
+            assert!(safe_name(b"release-verification"));
+            assert!(safe_name(b".hidden"));
+            assert!(!safe_name(b""));
+            assert!(!safe_name(b".."));
+            assert!(!safe_name(b"a/b"));
+            assert!(!safe_name(b"a\x7f"));
+            assert!(!safe_name(b"a\tb"));
+            assert_eq!(deadline(5, -3), 5);
+            assert_eq!(deadline(5, 2), 2_000_000_005);
+            assert_eq!(deadline(i64::MAX - 1, 1), i64::MAX);
+            assert_eq!(deadline(0, i64::MAX), i64::MAX);
+            assert_eq!(deadline(i64::MIN, 1), i64::MIN + 1_000_000_000);
+        }
+
+        #[test]
+        fn lock_keys_classify_groups_stripes_and_lengths() {
+            let prefix = b"nnv:0123456789ab:";
+            let long = [b'x'; 48];
+            let names: Vec<&[u8]> = vec![
+                b"worker",
+                b"worker.511",
+                b"worker.512",
+                b"reset.07",
+                b"reset.63",
+                b"",
+                &long,
+                b"worker",
+                b"other.1",
+            ];
+            let w = lock_keys(prefix, &names);
+            assert_eq!(w.len(), names.len() * 2 + 3);
+            let flags: Vec<i64> = w
+                .iter()
+                .step_by(2)
+                .take(names.len())
+                .map(|x| x & 0xFF)
+                .collect();
+            assert_eq!(flags, [3, 5, 1, 1, 5, 17, 0, 11, 1]);
+            assert_eq!(w[0] >> 24, 512);
+            assert_eq!(w[2] >> 24, 511);
+            assert_eq!(w[8] >> 24, 63);
+            assert_eq!((w[0] >> 8) & 0xFFFF, (prefix.len() + 6) as i64);
+            assert_eq!(w[1], i64::from(crc32(b"nnv:0123456789ab:worker")));
+            assert_eq!(&w[w.len() - 3..], [8, 1, 2]);
+        }
+
+        #[test]
+        fn dirty_rows_follow_cursor_window() {
+            let a = b"00112233445566778899aabbccddeeff00112233";
+            let upper_case = b"00112233445566778899AABBCCDDEEFF00112233";
+            let ids = [5, 6, 7, 8, 9, 6];
+            let identities: Vec<&[u8]> = vec![a, b"short", upper_case, a, b"", b"x"];
+            let ats: Vec<&[u8]> = vec![
+                b"2026-01-01 00:00:00",
+                b"2026-01-01 00:00:01",
+                b"2026-01-02 00:00:00",
+                b"2026-01-03 00:00:00",
+                b"2025-12-31 23:59:59",
+                b"2026-01-01 00:00:00",
+            ];
+            let w = dirty_rows(
+                &ids,
+                &identities,
+                &ats,
+                Some((b"2026-01-01 00:00:00", 5)),
+                (b"2026-01-02 00:00:00", 7),
+            );
+            let flags: Vec<i64> = (0..6).map(|i| w[i * 2] & 0xFFFF_FFFF).collect();
+            assert_eq!(flags, [5, 14, 31, 3 | 16, 4, 6 | 8 | 32]);
+            assert_eq!(w[0] >> 32 & 0xFFFF_FFFF, i64::from(crc32(a)));
+            assert_eq!(
+                w[1],
+                i64::from_le_bytes([0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77])
+            );
+            assert_eq!(w[3], 0);
+            assert_eq!(&w[12..], [3, 0, 3, 5]);
+            let open = dirty_rows(&[1], &[a], &[b"z"], None, (b"z", 1));
+            assert_eq!(open[0] & 0xFF, 1 | 2 | 4 | 8 | 64);
+            assert_eq!(&open[2..], [1, 1, 0, 0]);
+        }
+
+        #[test]
+        fn transfers_match_summary_semantics() {
+            let w = transfers(
+                200,
+                Some(3),
+                &[120, -5, 10, i64::MAX],
+                &[0, 0, -1, i64::MAX],
+                &[100, -1, 4, 1],
+                &[3, 1, 2, 3],
+            );
+            assert_eq!(&w[0..4], [100, 0, -1, -1]);
+            assert_eq!(w[4], 15 | (1 | 2 | 4 | 16 | 32) << 8 | 4 << 16 | 12 << 24);
+            assert_eq!(&w[5..], [i64::MAX, 105, 2, 2]);
+            let unknown = transfers(5, None, &[1, 1], &[4, 5], &[1, 1], &[1, 1]);
+            assert_eq!(&unknown[..3], [5, 6, 3 | 1 << 8]);
+            assert_eq!(&unknown[3..], [2, 2, 1, 0]);
+            let nine = transfers(9, Some(1), &[1; 9], &[0; 9], &[1; 9], &[1; 9]);
+            assert_eq!(&nine[9..11], [0x0F0F_0F0F_0F0F_0F0F, 0x0F]);
+            assert_eq!(&nine[11..], [9, 9, 9, 9]);
+        }
+
+        #[test]
+        fn lock_files_plan_paths_and_deadlines() {
+            let long = vec![b'n'; 251];
+            let names: Vec<&[u8]> = vec![b"release", b"..", b"a/b", b".hidden", &long, b"release"];
+            let w = lock_files(b"/tmp/v", &names, &[5, 0, -1, 2, 1, 3], 1000);
+            let flags: Vec<i64> = (0..6).map(|i| w[i * 2] & 0xFF).collect();
+            assert_eq!(flags, [39, 22, 6, 55, 5, 15]);
+            assert_eq!((w[0] >> 8) & 0xFFFF, 19);
+            assert_eq!(
+                w[0] >> 32 & 0xFFFF_FFFF,
+                i64::from(crc32(b"/tmp/v/release.lock"))
+            );
+            assert_eq!(w[1], 5_000_001_000);
+            assert_eq!(w[5], 1000);
+            assert_eq!(&w[12..], [2, 1, 2_000_001_000]);
+            assert_eq!(lock_files(b"", &[b".."], &[1], 0)[2..], [0, 0, i64::MAX]);
+        }
+
+        #[test]
+        fn renewals_replay_the_heartbeat() {
+            let w = renewals(
+                None,
+                &[10.0, 10.5, 11.0, 9.0, f64::NAN, 12.5, f64::INFINITY],
+                1.0,
+            );
+            assert_eq!(w[0], 0xD142_101);
+            assert_eq!(&w[1..], [4, 1, 1, f64::INFINITY.to_bits() as i64]);
+            let none = renewals(Some(5.0), &[5.5], f64::NAN);
+            assert_eq!(none, [0, 0, 0, 1, 5.0f64.to_bits() as i64]);
+            assert_eq!(renewals(None, &[], 1.0), [0, 0, 0, 0]);
+            let ticks: Vec<f64> = (0..17).map(f64::from).collect();
+            let all = renewals(None, &ticks, 1.0);
+            assert_eq!(&all[..2], [0x9999_9999_9999_9991u64 as i64, 9]);
+            assert_eq!(&all[2..4], [17, 16]);
+        }
+
+        #[test]
+        fn exports_round_trip_and_guard_inputs() {
+            let names = b"worker\0reset.3";
+            let prefix = b"nnv:0123456789ab:";
+            let w = run(|o, c| unsafe {
+                nntmux_w502_verification_lock_keys_batch(
+                    prefix.as_ptr(),
+                    prefix.len(),
+                    names.as_ptr(),
+                    names.len(),
+                    2,
+                    o,
+                    c,
+                )
+            });
+            assert_eq!(w, lock_keys(prefix, &[b"worker", b"reset.3"]));
+            let mut out = [0i64; 4];
+            unsafe {
+                assert_eq!(
+                    nntmux_w502_verification_lock_keys_batch(
+                        prefix.as_ptr(),
+                        prefix.len(),
+                        names.as_ptr(),
+                        names.len(),
+                        2,
+                        std::ptr::null_mut(),
+                        4
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w502_verification_lock_keys_batch(
+                        prefix.as_ptr(),
+                        prefix.len(),
+                        names.as_ptr(),
+                        names.len(),
+                        2,
+                        out.as_mut_ptr(),
+                        4
+                    ),
+                    -8
+                );
+                assert_eq!(
+                    nntmux_w502_verification_lock_keys_batch(
+                        prefix.as_ptr(),
+                        prefix.len(),
+                        names.as_ptr(),
+                        names.len(),
+                        3,
+                        out.as_mut_ptr(),
+                        4
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w502_verification_lock_keys_batch(
+                        std::ptr::null(),
+                        4,
+                        names.as_ptr(),
+                        names.len(),
+                        2,
+                        out.as_mut_ptr(),
+                        4
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w502_verification_lock_keys_batch(
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                        0,
+                        out.as_mut_ptr(),
+                        4
+                    ),
+                    4
+                );
+            }
+
+            let ids = q(&[1, 2]);
+            let identities = b"00112233445566778899aabbccddeeff00112233\0bad";
+            let ats = b"a\0b";
+            let w = run(|o, c| unsafe {
+                nntmux_w502_dirty_candidate_settle_batch(
+                    ids.as_ptr(),
+                    ids.len(),
+                    identities.as_ptr(),
+                    identities.len(),
+                    ats.as_ptr(),
+                    ats.len(),
+                    2,
+                    std::ptr::null(),
+                    0,
+                    0,
+                    0,
+                    b"b".as_ptr(),
+                    1,
+                    9,
+                    o,
+                    c,
+                )
+            });
+            assert_eq!(
+                w,
+                dirty_rows(
+                    &[1, 2],
+                    &[&identities[..40], b"bad"],
+                    &[b"a", b"b"],
+                    None,
+                    (b"b", 9)
+                )
+            );
+            unsafe {
+                assert_eq!(
+                    nntmux_w502_dirty_candidate_settle_batch(
+                        ids.as_ptr(),
+                        ids.len(),
+                        identities.as_ptr(),
+                        identities.len(),
+                        ats.as_ptr(),
+                        ats.len(),
+                        2,
+                        std::ptr::null(),
+                        0,
+                        0,
+                        2,
+                        b"b".as_ptr(),
+                        1,
+                        9,
+                        out.as_mut_ptr(),
+                        4
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w502_dirty_candidate_settle_batch(
+                        ids.as_ptr(),
+                        8,
+                        identities.as_ptr(),
+                        identities.len(),
+                        ats.as_ptr(),
+                        ats.len(),
+                        2,
+                        std::ptr::null(),
+                        0,
+                        0,
+                        0,
+                        b"b".as_ptr(),
+                        1,
+                        9,
+                        out.as_mut_ptr(),
+                        4
+                    ),
+                    -1
+                );
+            }
+
+            let table = q(&[10, 20, 0, 5, 10, 20, 0, 5]);
+            let w = run(|o, c| unsafe {
+                nntmux_w502_fetched_article_transfer_batch(
+                    table.as_ptr(),
+                    table.len(),
+                    2,
+                    15,
+                    5,
+                    1,
+                    o,
+                    c,
+                )
+            });
+            assert_eq!(
+                w,
+                transfers(15, Some(5), &[10, 20], &[0, 5], &[10, 20], &[0, 5])
+            );
+            unsafe {
+                assert_eq!(
+                    nntmux_w502_fetched_article_transfer_batch(
+                        table.as_ptr(),
+                        table.len(),
+                        2,
+                        15,
+                        5,
+                        2,
+                        out.as_mut_ptr(),
+                        4
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w502_fetched_article_transfer_batch(
+                        table.as_ptr(),
+                        8,
+                        2,
+                        15,
+                        5,
+                        1,
+                        out.as_mut_ptr(),
+                        4
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w502_fetched_article_transfer_batch(
+                        std::ptr::null(),
+                        64,
+                        2,
+                        15,
+                        5,
+                        1,
+                        out.as_mut_ptr(),
+                        4
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w502_fetched_article_transfer_batch(
+                        table.as_ptr(),
+                        table.len(),
+                        2,
+                        15,
+                        5,
+                        1,
+                        out.as_mut_ptr(),
+                        4
+                    ),
+                    -8
+                );
+            }
+
+            let timeouts = q(&[1, 2]);
+            let files = b"a\0b";
+            let w = run(|o, c| unsafe {
+                nntmux_w502_file_lock_plan_batch(
+                    b"/d".as_ptr(),
+                    2,
+                    files.as_ptr(),
+                    files.len(),
+                    timeouts.as_ptr(),
+                    timeouts.len(),
+                    2,
+                    7,
+                    o,
+                    c,
+                )
+            });
+            assert_eq!(w, lock_files(b"/d", &[b"a", b"b"], &[1, 2], 7));
+            unsafe {
+                assert_eq!(
+                    nntmux_w502_file_lock_plan_batch(
+                        b"/d".as_ptr(),
+                        2,
+                        files.as_ptr(),
+                        files.len(),
+                        timeouts.as_ptr(),
+                        8,
+                        2,
+                        7,
+                        out.as_mut_ptr(),
+                        4
+                    ),
+                    -1
+                );
+            }
+
+            let ticks = e(&[1.0, 2.5]);
+            let w = run(|o, c| unsafe {
+                nntmux_w502_lease_heartbeat_batch(ticks.as_ptr(), ticks.len(), 2, 1, 0.5, 1.0, o, c)
+            });
+            assert_eq!(w, renewals(Some(0.5), &[1.0, 2.5], 1.0));
+            unsafe {
+                assert_eq!(
+                    nntmux_w502_lease_heartbeat_batch(
+                        ticks.as_ptr(),
+                        ticks.len(),
+                        2,
+                        3,
+                        0.5,
+                        1.0,
+                        out.as_mut_ptr(),
+                        4
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w502_lease_heartbeat_batch(
+                        ticks.as_ptr(),
+                        ticks.len(),
+                        2,
+                        0,
+                        0.5,
+                        1.0,
+                        out.as_mut_ptr(),
+                        2
+                    ),
+                    -6
+                );
+                // An output overlapping an input is refused.
+                let mut shared = e(&[1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+                assert_eq!(
+                    nntmux_w502_lease_heartbeat_batch(
+                        shared.as_ptr(),
+                        16,
+                        2,
+                        0,
+                        0.0,
+                        1.0,
+                        shared.as_mut_ptr() as *mut i64,
                         8
                     ),
                     -1
