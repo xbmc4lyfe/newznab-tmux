@@ -87,4 +87,160 @@ final class Utf8
 
         return self::$ffi;
     }
+
+    /** Disabled: seven paired runs missed the 1.5x common gates (min common mean 1.48x, p99 1.14x; uncommon mean 1.70x, p99 1.63x; see the W44 parity test). */
+    public const bool W444_RUST_FFI_DEFAULT = false;
+
+    public const string W444_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w444_utf8_value_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private const array W444_SUMMARY_KEYS = ['total_values', 'empty_value_count', 'ascii_count', 'valid_multibyte_count', 'invalid_utf8_count', 'control_char_count', 'bom_count', 'mojibake_count'];
+
+    private static ?bool $w444UseRustFfi = null;
+
+    private static FFI|false|null $w444Ffi = null;
+
+    /** Null restores the benchmark-qualified default. */
+    public static function useW444RustFfi(?bool $enable = true): void
+    {
+        self::$w444UseRustFfi = $enable;
+    }
+
+    public static function usesW444RustFfi(): bool
+    {
+        return self::$w444UseRustFfi ?? self::W444_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW444RustFfi(): void
+    {
+        self::$w444UseRustFfi = null;
+        self::$w444Ffi = null;
+    }
+
+    /**
+     * Summarize trimmed values as clean() sees them: pure ASCII, valid
+     * multibyte UTF-8 (mb_check_encoding()), invalid UTF-8, C0/DEL control
+     * bytes other than tab/LF/CR, a UTF-8 BOM and the C3 82/C3 83 mojibake
+     * pairs fixEncoding() targets. Entries come from strings, integers, or
+     * the text or value field; other values count as empty.
+     *
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeUtf8Batch(array $entries): array
+    {
+        return self::usesW444RustFfi()
+            ? self::summarizeUtf8BatchNative($entries)
+            : self::summarizeUtf8BatchPhp($entries);
+    }
+
+    /**
+     * Rust summary; falls back to PHP when the library or input frame is unusable.
+     *
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeUtf8BatchNative(array $entries): array
+    {
+        return self::w444Call(self::w444Entries($entries)) ?? self::summarizeUtf8BatchPhp($entries);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeUtf8BatchPhp(array $entries): array
+    {
+        $summary = array_fill_keys(self::W444_SUMMARY_KEYS, 0);
+        foreach (self::w444Entries($entries) as $value) {
+            $summary['total_values']++;
+            $value = trim($value);
+            if ($value === '') {
+                $summary['empty_value_count']++;
+
+                continue;
+            }
+            $ascii = preg_match('/[\x80-\xFF]/', $value) !== 1;
+            $valid = $ascii || mb_check_encoding($value, 'UTF-8');
+            $summary['ascii_count'] += (int) $ascii;
+            $summary['valid_multibyte_count'] += (int) (! $ascii && $valid);
+            $summary['invalid_utf8_count'] += (int) ! $valid;
+            $summary['control_char_count'] += (int) (preg_match('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/', $value) === 1);
+            $summary['bom_count'] += (int) str_starts_with($value, "\xEF\xBB\xBF");
+            $summary['mojibake_count'] += (int) (str_contains($value, "\xC3\x83") || str_contains($value, "\xC3\x82"));
+        }
+
+        return $summary;
+    }
+
+    /** Only integer and string entries participate; objects are never cast or serialized.
+     *
+     * @param  array<array-key, mixed>  $input
+     * @return list<string>
+     */
+    private static function w444Entries(array $input): array
+    {
+        $entries = [];
+        foreach ($input as $item) {
+            if (is_array($item)) {
+                $item = $item['text'] ?? $item['value'] ?? null;
+            }
+            $entries[] = is_string($item) || is_int($item) ? (string) $item : '';
+        }
+
+        return $entries;
+    }
+
+    /** @param list<string> $entries
+     * @return array<string, int>|null
+     */
+    private static function w444Call(array $entries): ?array
+    {
+        try {
+            $input = serialize([$entries]);
+            if (strlen($input) > 16777216) {
+                return null;
+            }
+            self::$w444Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w444', self::W444_FFI_CDEF) ?? false;
+            $ffi = self::$w444Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            $capacity = 0;
+            $out = RustPipelineLibrary::obtainScratch($ffi, 2048, $capacity);
+            if ($out === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound (Declared by W444_FFI_CDEF.)
+            $written = $ffi->nntmux_w444_utf8_value_batch($input, strlen($input), $out, $capacity);
+            if (is_int($written) && $written < -1 && $written >= -16777216) {
+                $out = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($out === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound (Declared by W444_FFI_CDEF.)
+                $written = $ffi->nntmux_w444_utf8_value_batch($input, strlen($input), $out, $capacity);
+            }
+            if (! is_int($written) || $written <= 0 || $written > $capacity || $written > 16777216) {
+                return null;
+            }
+            $result = @unserialize(FFI::string($out, $written), ['allowed_classes' => false]);
+            if (! is_array($result) || array_keys($result) !== self::W444_SUMMARY_KEYS || $result['total_values'] !== count($entries)) {
+                return null;
+            }
+            $summary = [];
+            foreach (self::W444_SUMMARY_KEYS as $key) {
+                $value = $result[$key];
+                if (! is_int($value) || $value < 0 || $value > count($entries)) {
+                    return null;
+                }
+                $summary[$key] = $value;
+            }
+
+            return $summary;
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }

@@ -351,4 +351,175 @@ final class BookIsbn
 
         return $sum % 10 === 0;
     }
+
+    /** Enabled: seven paired runs cleared 1.5x on every gate (min common mean 4.36x, p99 2.83x; uncommon mean 11.99x, p99 7.59x; see the W44 parity test). */
+    public const bool W444_RUST_FFI_DEFAULT = true;
+
+    public const string W444_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w444_isbn_value_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private const array W444_SUMMARY_KEYS = ['total_values', 'empty_value_count', 'isbn10_count', 'isbn13_count', 'invalid_count', 'duplicate_count', 'isbn10_convertible_count', 'x_check_digit_count'];
+
+    private static ?bool $w444UseRustFfi = null;
+
+    private static FFI|false|null $w444Ffi = null;
+
+    /** Null restores the benchmark-qualified default. */
+    public static function useW444RustFfi(?bool $enable = true): void
+    {
+        self::$w444UseRustFfi = $enable;
+    }
+
+    public static function usesW444RustFfi(): bool
+    {
+        return self::$w444UseRustFfi ?? self::W444_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW444RustFfi(): void
+    {
+        self::$w444UseRustFfi = null;
+        self::$w444Ffi = null;
+    }
+
+    /**
+     * Summarize values through normalizePhp(): valid ISBN-10 and ISBN-13
+     * counts, non-empty values without a valid ISBN, repeats of an earlier
+     * value's canonical ISBN-13 (toIsbn13Php() for ISBN-10), values
+     * toIsbn10Php() can convert, and ISBN-10 X check digits. Entries come
+     * from strings, integers, or the isbn or identifier field; other values
+     * count as empty.
+     *
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeIsbnBatch(array $entries): array
+    {
+        return self::usesW444RustFfi()
+            ? self::summarizeIsbnBatchNative($entries)
+            : self::summarizeIsbnBatchPhp($entries);
+    }
+
+    /**
+     * Rust summary; falls back to PHP when the library or input frame is unusable.
+     *
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeIsbnBatchNative(array $entries): array
+    {
+        return self::w444Call(self::w444Entries($entries)) ?? self::summarizeIsbnBatchPhp($entries);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeIsbnBatchPhp(array $entries): array
+    {
+        $summary = array_fill_keys(self::W444_SUMMARY_KEYS, 0);
+        $seen = [];
+        foreach (self::w444Entries($entries) as $value) {
+            $summary['total_values']++;
+            $value = trim($value);
+            if ($value === '') {
+                $summary['empty_value_count']++;
+
+                continue;
+            }
+            $isbn = self::normalizePhp($value);
+            if ($isbn === null) {
+                $summary['invalid_count']++;
+
+                continue;
+            }
+            if (strlen($isbn) === 10) {
+                $summary['isbn10_count']++;
+                $summary['isbn10_convertible_count']++;
+                $summary['x_check_digit_count'] += (int) ($isbn[9] === 'X');
+                $canonical = (string) self::toIsbn13Php($isbn);
+            } else {
+                $summary['isbn13_count']++;
+                $summary['isbn10_convertible_count'] += (int) str_starts_with($isbn, '978');
+                $canonical = $isbn;
+            }
+            if (isset($seen[$canonical])) {
+                $summary['duplicate_count']++;
+            } else {
+                $seen[$canonical] = true;
+            }
+        }
+
+        return $summary;
+    }
+
+    /** Only integer and string entries participate; objects are never cast or serialized.
+     *
+     * @param  array<array-key, mixed>  $input
+     * @return list<string>
+     */
+    private static function w444Entries(array $input): array
+    {
+        $entries = [];
+        foreach ($input as $item) {
+            if (is_array($item)) {
+                $item = $item['isbn'] ?? $item['identifier'] ?? null;
+            }
+            $entries[] = is_string($item) || is_int($item) ? (string) $item : '';
+        }
+
+        return $entries;
+    }
+
+    /** @param list<string> $entries
+     * @return array<string, int>|null
+     */
+    private static function w444Call(array $entries): ?array
+    {
+        try {
+            $input = serialize([$entries]);
+            if (strlen($input) > 16777216) {
+                return null;
+            }
+            self::$w444Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w444', self::W444_FFI_CDEF) ?? false;
+            $ffi = self::$w444Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            $capacity = 0;
+            $out = RustPipelineLibrary::obtainScratch($ffi, 2048, $capacity);
+            if ($out === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound (Declared by W444_FFI_CDEF.)
+            $written = $ffi->nntmux_w444_isbn_value_batch($input, strlen($input), $out, $capacity);
+            if (is_int($written) && $written < -1 && $written >= -16777216) {
+                $out = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($out === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound (Declared by W444_FFI_CDEF.)
+                $written = $ffi->nntmux_w444_isbn_value_batch($input, strlen($input), $out, $capacity);
+            }
+            if (! is_int($written) || $written <= 0 || $written > $capacity || $written > 16777216) {
+                return null;
+            }
+            $result = @unserialize(FFI::string($out, $written), ['allowed_classes' => false]);
+            if (! is_array($result) || array_keys($result) !== self::W444_SUMMARY_KEYS || $result['total_values'] !== count($entries)) {
+                return null;
+            }
+            $summary = [];
+            foreach (self::W444_SUMMARY_KEYS as $key) {
+                $value = $result[$key];
+                if (! is_int($value) || $value < 0 || $value > count($entries)) {
+                    return null;
+                }
+                $summary[$key] = $value;
+            }
+
+            return $summary;
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }
