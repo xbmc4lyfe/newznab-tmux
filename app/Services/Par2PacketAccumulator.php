@@ -7,8 +7,10 @@ namespace App\Services;
 use App\Support\Par2FileHashEvidence;
 use App\Support\RustPipelineLibrary;
 use dariusiii\rarinfo\Par2Info;
+use FFI;
 use InvalidArgumentException;
 use LengthException;
+use Throwable;
 
 /**
  * A restartable PAR2 metadata stream. Recovery payloads never enter the inventory.
@@ -22,6 +24,40 @@ final class Par2PacketAccumulator
     private string $tail = '';
 
     private int $skipRemaining = 0;
+
+    /** The Wave 44.2 export shared by the accumulator, metadata parser, proof identity, payload identity and sanitizer helpers. */
+    public const string W442_FFI_CDEF = <<<'C'
+        int32_t nntmux_w442_par2_packet_metadata_proof_payload_sanitizer(
+            uint32_t operation,
+            uint32_t flags,
+            const char *input,
+            size_t input_len,
+            char *out_buf,
+            size_t out_cap
+        );
+        C;
+
+    public const string W442_FFI_DOMAIN = 'nfo_w442';
+
+    /**
+     * Default for the Wave 44.2 toggle only (summarizePacketBatch); false because common p99 in the paired benchmark in
+     * tests/Unit/RustPar2PacketMetadataProofPayloadSanitizerW44ParityTest.php fell to 1.31-1.42x in three of six runs.
+     */
+    public const bool W442_RUST_FFI_DEFAULT = false;
+
+    public const int W442_MAX_INPUT = 16777216;
+
+    /** Recovery-slice packet types whose payloads the accumulator skips. */
+    private const array W442_RECOVERY_TYPES = [Par2Info::PACKET_RECOVERY, Par2Info::PACKET_INPUT_BLOCK, Par2Info::PACKET_PACKED_RECOVERY];
+
+    /** Recognized packet types the accumulator retains without a body check. */
+    private const array W442_AUXILIARY_TYPES = [Par2Info::PACKET_CREATOR, Par2Info::PACKET_FILENAME_UC, Par2Info::PACKET_COMMENT_ASCII,
+        Par2Info::PACKET_COMMENT_UC, Par2Info::PACKET_RECOVERY_VER, Par2Info::PACKET_PACKED_MAIN];
+
+    private static ?bool $useW442RustFfi = null;
+
+    /** @var array<string, FFI|false> resolved Wave 44.2 handles per explicit library path ('' for the default search) */
+    private static array $w442Ffi = [];
 
     public function __construct(private readonly int $maxStateBytes = 262144)
     {
@@ -533,5 +569,181 @@ final class Par2PacketAccumulator
         }
 
         return $decoded;
+    }
+
+    /** Force the Wave 44.2 helper onto Rust (true) or PHP (false); null restores W442_RUST_FFI_DEFAULT. */
+    public static function useW442RustFfi(?bool $enable = true): void
+    {
+        self::$useW442RustFfi = $enable;
+    }
+
+    public static function usesW442RustFfi(): bool
+    {
+        return self::$useW442RustFfi ?? self::W442_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW442RustFfi(): void
+    {
+        self::$useW442RustFfi = null;
+    }
+
+    /**
+     * Run one Wave 44.2 operation over `[0, $rows]`, the row slots and the byte tail; null whenever the library, input
+     * or answer is unusable, so callers fall back to PHP.
+     *
+     * @param  list<int>  $slots
+     * @return list<int>|null
+     */
+    public static function evaluateW442Native(int $operation, int $rows, array $slots, string $tail, int $outSlots): ?array
+    {
+        try {
+            if ($operation < 0 || $operation > 0xFFFFFFFF || $outSlots < 1 || $rows < 0
+                || 16 + \count($slots) * 8 + \strlen($tail) > self::W442_MAX_INPUT) {
+                return null;
+            }
+            $path = getenv('NNTMUX_PIPELINE_FFI_LIB') ?: '';
+            $ffi = self::$w442Ffi[$path] ??= RustPipelineLibrary::resolveDomain(self::W442_FFI_DOMAIN, self::W442_FFI_CDEF, $path === '' ? null : $path) ?? false;
+            if ($ffi === false) {
+                return null;
+            }
+            $input = pack('q*', 0, $rows, ...$slots).$tail;
+            $needed = $outSlots * 8;
+            for ($attempt = 0; $attempt < 2; $attempt++) {
+                $capacity = 0;
+                $output = RustPipelineLibrary::obtainScratch($ffi, $needed, $capacity);
+                if ($output === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w442_par2_packet_metadata_proof_payload_sanitizer($operation, 0, $input, \strlen($input), $output, $capacity);
+                if (! \is_int($written) || $written === -1 || $written > $capacity) {
+                    return null;
+                }
+                if ($written < 0) {
+                    // Too small: retry once with the reported capacity.
+                    $needed = -$written;
+
+                    continue;
+                }
+                if ($written !== $outSlots * 8) {
+                    return null;
+                }
+                $values = array_values(unpack('q'.$outSlots, FFI::string($output, $written)) ?: []);
+
+                return \count($values) === $outSlots ? $values : null;
+            }
+        } catch (Throwable) {
+        }
+
+        return null;
+    }
+
+    /**
+     * Inspect raw PAR2 packets as the accumulator's header and body checks see them: non-strings are invalid; strings
+     * shorter than a header are truncated; then a wrong marker, a declared length that is unsupported, not a multiple
+     * of four or not the string length; then Main, FileDesc and IFSC packets (malformed when their bodies fail
+     * retain()'s shape checks), recovery slices, other recognized (auxiliary) and unknown types. Bytes sum every
+     * string; sets counts the distinct recovery-set IDs of accepted packets.
+     *
+     * @param  array<array-key, mixed>  $packets
+     * @return array{packets: int, invalid: int, truncated: int, bad_marker: int, bad_length: int, main: int, filedesc: int, filever: int, recovery: int, auxiliary: int, unknown: int, malformed: int, bytes: int, sets: int}
+     */
+    public static function summarizePacketBatch(array $packets): array
+    {
+        return (self::usesW442RustFfi() ? self::summarizePacketBatchNative($packets) : null)
+            ?? self::summarizePacketBatchPhp($packets);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $packets
+     * @return array{packets: int, invalid: int, truncated: int, bad_marker: int, bad_length: int, main: int, filedesc: int, filever: int, recovery: int, auxiliary: int, unknown: int, malformed: int, bytes: int, sets: int}
+     */
+    public static function summarizePacketBatchPhp(array $packets): array
+    {
+        $summary = ['packets' => \count($packets), 'invalid' => 0, 'truncated' => 0, 'bad_marker' => 0, 'bad_length' => 0, 'main' => 0,
+            'filedesc' => 0, 'filever' => 0, 'recovery' => 0, 'auxiliary' => 0, 'unknown' => 0, 'malformed' => 0, 'bytes' => 0, 'sets' => 0];
+        $sets = [];
+        foreach ($packets as $packet) {
+            if (! \is_string($packet)) {
+                $summary['invalid']++;
+
+                continue;
+            }
+            $length = \strlen($packet);
+            $summary['bytes'] += $length;
+            if ($length < 64) {
+                $summary['truncated']++;
+
+                continue;
+            }
+            if (substr($packet, 0, 8) !== Par2Info::PACKET_MARKER) {
+                $summary['bad_marker']++;
+
+                continue;
+            }
+            /** @var array{low: int, high: int} $parts */
+            $parts = unpack('Vlow/Vhigh', $packet, 8);
+            if ($parts['high'] > 0x7FFFFFFF || $parts['low'] % 4 !== 0 || $length !== $parts['high'] * 0x100000000 + $parts['low']) {
+                $summary['bad_length']++;
+
+                continue;
+            }
+            $type = substr($packet, 48, 16);
+            $body = $length - 64;
+            if ($type === Par2Info::PACKET_MAIN) {
+                $key = $body < 12 || ($body - 12) % 16 !== 0 || unpack('V', $packet, 72)[1] > intdiv($body - 12, 16) ? 'malformed' : 'main';
+            } elseif ($type === Par2Info::PACKET_FILEDESC) {
+                $key = $body < 56 ? 'malformed' : 'filedesc';
+            } elseif ($type === Par2Info::PACKET_FILEVER) {
+                $key = $body < 16 || ($body - 16) % 20 !== 0 ? 'malformed' : 'filever';
+            } elseif (\in_array($type, self::W442_RECOVERY_TYPES, true)) {
+                $key = 'recovery';
+            } elseif (\in_array($type, self::W442_AUXILIARY_TYPES, true)) {
+                $key = 'auxiliary';
+            } else {
+                $key = 'unknown';
+            }
+            $summary[$key]++;
+            if ($key !== 'malformed' && $key !== 'unknown') {
+                $sets[substr($packet, 32, 16)] = true;
+            }
+        }
+        $summary['sets'] = \count($sets);
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $packets
+     * @return array{packets: int, invalid: int, truncated: int, bad_marker: int, bad_length: int, main: int, filedesc: int, filever: int, recovery: int, auxiliary: int, unknown: int, malformed: int, bytes: int, sets: int}|null
+     */
+    public static function summarizePacketBatchNative(array $packets): ?array
+    {
+        $slots = [];
+        $tail = [];
+        foreach ($packets as $packet) {
+            if (\is_string($packet)) {
+                // Only the header and Main count are inspected; payloads stay in PHP.
+                $length = \strlen($packet);
+                $slots[] = $length;
+                $tail[] = $length > 76 ? substr($packet, 0, 76) : $packet;
+            } else {
+                $slots[] = -1;
+            }
+        }
+        $values = self::evaluateW442Native(0, \count($packets), $slots, implode('', $tail), 14);
+        if ($values === null) {
+            return null;
+        }
+        [$count, $invalid, $truncated, $badMarker, $badLength, $main, $filedesc, $filever, $recovery, $auxiliary, $unknown, $malformed, $bytes, $sets] = $values;
+        if ($count !== \count($packets) || min($values) < 0
+            || $invalid + $truncated + $badMarker + $badLength + $main + $filedesc + $filever + $recovery + $auxiliary + $unknown + $malformed !== $count
+            || $sets > $main + $filedesc + $filever + $recovery + $auxiliary) {
+            return null;
+        }
+
+        return ['packets' => $count, 'invalid' => $invalid, 'truncated' => $truncated, 'bad_marker' => $badMarker, 'bad_length' => $badLength,
+            'main' => $main, 'filedesc' => $filedesc, 'filever' => $filever, 'recovery' => $recovery, 'auxiliary' => $auxiliary,
+            'unknown' => $unknown, 'malformed' => $malformed, 'bytes' => $bytes, 'sets' => $sets];
     }
 }
