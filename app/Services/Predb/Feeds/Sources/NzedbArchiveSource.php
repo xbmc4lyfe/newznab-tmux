@@ -41,6 +41,18 @@ final class NzedbArchiveSource extends BoundedHttpFeedSource implements Complete
         '4' => 'control_title',
     ];
 
+    /**
+     * Wave 45.2 production default for summarizeTitleBatch() is Rust: the paired benchmark in
+     * tests/Unit/RustPredbFeedsNzedbPredatabaseRssSceneArchiveSasW45ParityTest.php measures 3.85-4.27x mean and
+     * 3.24-4.36x p99 on common pages and 6.45-7.45x mean and 4.97-7.12x p99 on uncommon exports. PHP stays the
+     * fallback when the library is unavailable or an accepted title is not ASCII.
+     */
+    public const bool W452_RUST_FFI_DEFAULT = true;
+
+    private static ?bool $w452RustFfiOverride = null;
+
+    private static FFI|false|null $w452RustFfiHandle = null;
+
     private static FFI|false|null $native = null;
 
     /** @var list<PredbFeedEntry>|null */
@@ -171,7 +183,7 @@ final class NzedbArchiveSource extends BoundedHttpFeedSource implements Complete
                 $offset += 2;
             }
             $title = $fields[0];
-            $reason = $this->titleRejection($title);
+            $reason = self::titleRejection($title);
             if ($reason !== null) {
                 $rejections[$reason] = ($rejections[$reason] ?? 0) + 1;
 
@@ -315,7 +327,7 @@ final class NzedbArchiveSource extends BoundedHttpFeedSource implements Complete
         throw new RuntimeException('NZEDB_ARCHIVE returned an unterminated CSV field.');
     }
 
-    private function titleRejection(?string $title): ?string
+    private static function titleRejection(?string $title): ?string
     {
         if ($title === null || trim($title) === '') {
             return 'empty_title';
@@ -338,5 +350,98 @@ final class NzedbArchiveSource extends BoundedHttpFeedSource implements Complete
         $this->entries = null;
         $this->acceptedCount = 0;
         $this->rejections = [];
+    }
+
+    /** Force the Wave 45.2 helper onto Rust (true) or PHP (false); null restores W452_RUST_FFI_DEFAULT. */
+    public static function useW452RustFfi(?bool $enable = true): void
+    {
+        self::$w452RustFfiOverride = $enable;
+    }
+
+    public static function usesW452RustFfi(): bool
+    {
+        return self::$w452RustFfiOverride ?? self::W452_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW452RustFfi(): void
+    {
+        self::$w452RustFfiOverride = null;
+        self::$w452RustFfiHandle = null;
+    }
+
+    /**
+     * Summarize literal titles as parseCsv() admits them: non-strings count as empty (a null field), invalid UTF-8 as
+     * invalid_utf8, then titleRejection() and PredbSearchDocument::exactValue() duplicates; the rest are accepted.
+     *
+     * @param  array<array-key, mixed>  $titles
+     * @return array{total: int, accepted: int, empty_title: int, invalid_utf8: int, outer_title_whitespace: int, overlength_title: int, control_title: int, duplicate_title: int}
+     */
+    public static function summarizeTitleBatch(array $titles): array
+    {
+        return (self::usesW452RustFfi() ? self::summarizeTitleBatchNative($titles) : null)
+            ?? self::summarizeTitleBatchPhp($titles);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $titles
+     * @return array{total: int, accepted: int, empty_title: int, invalid_utf8: int, outer_title_whitespace: int, overlength_title: int, control_title: int, duplicate_title: int}
+     */
+    public static function summarizeTitleBatchPhp(array $titles): array
+    {
+        $summary = ['total' => \count($titles), 'accepted' => 0, 'empty_title' => 0, 'invalid_utf8' => 0, 'outer_title_whitespace' => 0,
+            'overlength_title' => 0, 'control_title' => 0, 'duplicate_title' => 0];
+        $identities = [];
+        foreach ($titles as $title) {
+            if (! \is_string($title)) {
+                $reason = 'empty_title';
+            } elseif (! mb_check_encoding($title, 'UTF-8')) {
+                $reason = 'invalid_utf8';
+            } else {
+                $reason = self::titleRejection($title);
+                if ($reason === null) {
+                    $identity = PredbSearchDocument::exactValue($title);
+                    if (! isset($identities[$identity])) {
+                        $identities[$identity] = true;
+                        $summary['accepted']++;
+
+                        continue;
+                    }
+                    $reason = 'duplicate_title';
+                }
+            }
+            $summary[$reason]++;
+        }
+
+        return $summary;
+    }
+
+    /**
+     * Null when the library is missing or an accepted title is not ASCII (Unicode case folding stays in PHP).
+     *
+     * @param  array<array-key, mixed>  $titles
+     * @return array{total: int, accepted: int, empty_title: int, invalid_utf8: int, outer_title_whitespace: int, overlength_title: int, control_title: int, duplicate_title: int}|null
+     */
+    public static function summarizeTitleBatchNative(array $titles): ?array
+    {
+        $packed = PredatabaseSource::packW452Items($titles);
+        $values = $packed === null ? null : PredatabaseSource::callW452Native(self::w452RustFfi(), 0 | $packed[2], 0, $packed[0], $packed[1], 8);
+        if ($values === null) {
+            return null;
+        }
+        [$total, $accepted, $empty, $invalid, $outer, $overlength, $control, $duplicate] = $values;
+        if ($total !== \count($titles) || min($values) < 0
+            || $accepted + $empty + $invalid + $outer + $overlength + $control + $duplicate !== $total || ($duplicate > 0 && $accepted === 0)) {
+            return null;
+        }
+
+        return ['total' => $total, 'accepted' => $accepted, 'empty_title' => $empty, 'invalid_utf8' => $invalid, 'outer_title_whitespace' => $outer,
+            'overlength_title' => $overlength, 'control_title' => $control, 'duplicate_title' => $duplicate];
+    }
+
+    private static function w452RustFfi(): ?FFI
+    {
+        self::$w452RustFfiHandle ??= RustPipelineLibrary::resolveDomain(PredatabaseSource::W452_FFI_DOMAIN, PredatabaseSource::W452_FFI_CDEF) ?? false;
+
+        return self::$w452RustFfiHandle === false ? null : self::$w452RustFfiHandle;
     }
 }
