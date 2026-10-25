@@ -30703,3 +30703,561 @@ pub mod w441_irc_xref_yenc {
         }
     }
 }
+
+pub mod w451_pre_announce_ws_irc_obfuscation {
+    use super::w431_release_cleaning::{dispatch, for_each_entry, trim};
+    use super::wave38_1_obfuscation_gate_router_admin_names::classify_sample;
+
+    pub const ANNOUNCE_KEYS: usize = 8;
+    pub const FRAME_KEYS: usize = 10;
+    pub const CHANNEL_KEYS: usize = 7;
+    pub const GATE_KEYS: usize = 3;
+    pub const ROUTER_KEYS: usize = 6;
+
+    /// Index of `opentrackers`, the last of PreAnnounceParser::FORMATS.
+    pub const MAX_FORMAT: u32 = 5;
+
+    /// WebSocketClient::MAX_FRAME_BYTES.
+    pub const MAX_FRAME_BYTES: u64 = 4 * 1024 * 1024;
+
+    /// PerArticleObfuscationRouter::MAX_SUBJECT_LENGTH.
+    pub const MAX_SUBJECT_LENGTH: usize = 512;
+
+    /// Counts entries in slot 0 and `empty` entries in slot 1; `classify` sees the others and
+    /// returns `None` to decline the whole batch.
+    fn summarize<const K: usize>(
+        input: &[u8],
+        mut classify: impl FnMut(&[u8], &mut [i64; K]) -> Option<()>,
+    ) -> Option<[i64; K]> {
+        let mut counts = [0i64; K];
+        let mut declined = false;
+        for_each_entry(input, |entry| {
+            if declined {
+                return;
+            }
+            counts[0] += 1;
+            if entry.is_empty() {
+                counts[1] += 1;
+            } else {
+                declined = classify(entry, &mut counts).is_none();
+            }
+        })?;
+        (!declined).then_some(counts)
+    }
+
+    fn grow(scratch: &mut Vec<u8>, needed: usize) {
+        if scratch.len() < needed {
+            scratch.resize(needed, 0);
+        }
+    }
+
+    /// `u32le format` then the entry frame; PreAnnounceParser::parsePhp() through the production
+    /// announce grammar, which declines NUL bytes and non-ASCII titles.
+    fn announces(input: &[u8]) -> Option<[i64; ANNOUNCE_KEYS]> {
+        let format = u32::from_le_bytes(input.get(..4)?.try_into().ok()?);
+        if format > MAX_FORMAT {
+            return None;
+        }
+        let mut scratch = Vec::new();
+        summarize(&input[4..], |s, c| {
+            // Fields are slices of the message joined by five NULs.
+            grow(&mut scratch, s.len() + 32);
+            let call = |scratch: &mut Vec<u8>| unsafe {
+                // SAFETY: both spans are live, disjoint and sized.
+                crate::predb_feeds::nntmux_predb_parse_irc_announce(
+                    s.as_ptr(),
+                    s.len(),
+                    format as i32,
+                    scratch.as_mut_ptr(),
+                    scratch.len(),
+                )
+            };
+            let mut written = call(&mut scratch);
+            if written < -1 {
+                grow(&mut scratch, written.unsigned_abs());
+                written = call(&mut scratch);
+            }
+            if written == 0 {
+                return Some(());
+            }
+            if written < 0 {
+                return None;
+            }
+            let mut fields = scratch[..written as usize].split(|&b| b == 0);
+            let ty = fields.next()?;
+            let (_title, section, reason) = (fields.next()?, fields.next()?, fields.next()?);
+            let pre = ty == b"PRE" || ty == b"P2P";
+            let info = ty == b"INFO";
+            let nuke = !pre && !info;
+            c[2] += 1;
+            c[3] += i64::from(pre);
+            c[4] += i64::from(info);
+            c[5] += i64::from(nuke);
+            c[6] += i64::from(!section.is_empty());
+            c[7] += i64::from(nuke && !reason.is_empty());
+            Some(())
+        })
+    }
+
+    pub enum Frame {
+        Incomplete,
+        /// decodeFramePhp() throws: a reserved 64-bit length bit or a length over the limit.
+        Rejected,
+        Complete {
+            fin: bool,
+            opcode: u8,
+            masked: bool,
+        },
+    }
+
+    /// WebSocketClient::decodeFramePhp() without copying or unmasking the payload.
+    pub fn frame_header(s: &[u8]) -> Frame {
+        if s.len() < 2 {
+            return Frame::Incomplete;
+        }
+        let (mut offset, length) = match s[1] & 0x7f {
+            126 if s.len() < 4 => return Frame::Incomplete,
+            126 => (4, u64::from(u16::from_be_bytes([s[2], s[3]]))),
+            127 if s.len() < 10 => return Frame::Incomplete,
+            127 => (10, u64::from_be_bytes(s[2..10].try_into().unwrap())),
+            n => (2, u64::from(n)),
+        };
+        if length >> 63 != 0 || length > MAX_FRAME_BYTES {
+            return Frame::Rejected;
+        }
+        let masked = s[1] & 0x80 != 0;
+        if masked {
+            offset += 4;
+        }
+        if (s.len() as u64) < offset + length {
+            return Frame::Incomplete;
+        }
+        Frame::Complete {
+            fin: s[0] & 0x80 != 0,
+            opcode: s[0] & 0x0f,
+            masked,
+        }
+    }
+
+    fn frames(input: &[u8]) -> Option<[i64; FRAME_KEYS]> {
+        summarize(input, |s, c| {
+            match frame_header(s) {
+                Frame::Incomplete => c[2] += 1,
+                Frame::Rejected => c[9] += 1,
+                Frame::Complete {
+                    fin,
+                    opcode,
+                    masked,
+                } => {
+                    c[3] += 1;
+                    c[4] += i64::from(fin);
+                    c[5] += i64::from(masked);
+                    c[match opcode {
+                        0..=2 => 6,
+                        8..=10 => 7,
+                        _ => 8,
+                    }] += 1;
+                }
+            }
+            Some(())
+        })
+    }
+
+    /// IrcChannelList::parsePhp() over one value: `[no channels, a final password, an item without
+    /// '#', an overwritten channel, two or more channels]`.
+    pub fn channel_list(s: &[u8], keys: &mut Vec<(usize, usize, bool)>) -> [bool; 5] {
+        keys.clear();
+        let mut unprefixed = false;
+        for raw in s.split(|&b| b == b',') {
+            let item = trim(raw);
+            if item.is_empty() {
+                continue;
+            }
+            let (name, password) = match item.iter().position(|&b| b == b':') {
+                Some(colon) => (trim(&item[..colon]), Some(&item[colon + 1..])),
+                None => (trim(item), None),
+            };
+            if name.is_empty() || name == b"#" {
+                continue;
+            }
+            // `#` + the bare name is the key, so bare names compare like keys.
+            let bare = name.strip_prefix(b"#").unwrap_or(name);
+            unprefixed |= bare.len() == name.len();
+            let start = bare.as_ptr() as usize - s.as_ptr() as usize;
+            keys.push((
+                start,
+                bare.len(),
+                password.is_some_and(|p| !trim(p).is_empty()),
+            ));
+        }
+        if keys.is_empty() {
+            return [true, false, false, false, false];
+        }
+        let key = |&(start, len, _): &(usize, usize, bool)| &s[start..start + len];
+        // Stable, so the last item of each run of equal keys holds the stored password.
+        keys.sort_by(|a, b| key(a).cmp(key(b)));
+        let (mut distinct, mut password) = (0, false);
+        for (i, entry) in keys.iter().enumerate() {
+            if keys.get(i + 1).is_none_or(|next| key(next) != key(entry)) {
+                distinct += 1;
+                password |= entry.2;
+            }
+        }
+        [
+            false,
+            password,
+            unprefixed,
+            distinct < keys.len(),
+            distinct > 1,
+        ]
+    }
+
+    fn channel_lists(input: &[u8]) -> Option<[i64; CHANNEL_KEYS]> {
+        let mut keys = Vec::new();
+        summarize(input, |s, c| {
+            for (slot, hit) in c[2..].iter_mut().zip(channel_list(s, &mut keys)) {
+                *slot += i64::from(hit);
+            }
+            Some(())
+        })
+    }
+
+    /// `str_contains($subject, ' (')`, folded per chunk so the pair test vectorizes.
+    pub fn part_marker(s: &[u8]) -> bool {
+        let Some(last) = s.len().checked_sub(1) else {
+            return false;
+        };
+        s[..last]
+            .chunks(64)
+            .zip(s[1..].chunks(64))
+            .any(|(left, right)| {
+                left.iter().zip(right).fold(0u8, |m, (&l, &r)| {
+                    m | (u8::from(l == b' ') & u8::from(r == b'('))
+                }) != 0
+            })
+    }
+
+    fn gate_subjects(input: &[u8]) -> Option<[i64; GATE_KEYS]> {
+        summarize(input, |s, c| {
+            c[2] += i64::from(part_marker(s));
+            Some(())
+        })
+    }
+
+    fn router_subjects(input: &[u8]) -> Option<[i64; ROUTER_KEYS]> {
+        summarize(input, |s, c| {
+            c[2 + classify_sample(Some(s))] += 1;
+            c[5] += i64::from(s.len() > MAX_SUBJECT_LENGTH);
+            Some(())
+        })
+    }
+
+    /// # Safety
+    /// `input` must be readable for `len` bytes and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w451_pre_announce_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, announces) }
+    }
+
+    /// # Safety
+    /// `input` must be readable for `len` bytes and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w451_websocket_frame_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, frames) }
+    }
+
+    /// # Safety
+    /// `input` must be readable for `len` bytes and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w451_irc_channel_list_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, channel_lists) }
+    }
+
+    /// # Safety
+    /// `input` must be readable for `len` bytes and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w451_obfuscation_gate_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, gate_subjects) }
+    }
+
+    /// # Safety
+    /// `input` must be readable for `len` bytes and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w451_obfuscation_router_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, router_subjects) }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::w431_release_cleaning::{MAX_INPUT, NUL_FRAME};
+        use super::*;
+
+        type Export = unsafe extern "C" fn(*const u8, usize, *mut u8, usize) -> isize;
+
+        fn frame_wire(prefix: &[u8], entries: &[&[u8]]) -> Vec<u8> {
+            let mut wire = prefix.to_vec();
+            wire.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+            for e in entries {
+                wire.extend_from_slice(&(e.len() as u32).to_le_bytes());
+            }
+            for e in entries {
+                wire.extend_from_slice(e);
+            }
+            wire
+        }
+
+        fn nul_wire(prefix: &[u8], entries: &[&[u8]]) -> Vec<u8> {
+            let mut wire = prefix.to_vec();
+            wire.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+            wire.extend_from_slice(&NUL_FRAME.to_le_bytes());
+            wire.extend_from_slice(&entries.join(&0u8));
+            wire
+        }
+
+        fn call(export: Export, wire: &[u8]) -> (isize, [u8; 128]) {
+            let mut out = [0u8; 128];
+            let written = unsafe { export(wire.as_ptr(), wire.len(), out.as_mut_ptr(), out.len()) };
+            (written, out)
+        }
+
+        fn run_with(export: Export, prefix: &[u8], entries: &[&[u8]]) -> Vec<i64> {
+            let (written, out) = call(export, &frame_wire(prefix, entries));
+            assert!(written > 0 && written % 8 == 0, "written {written}");
+            if !entries.is_empty() && entries.iter().all(|e| !e.contains(&0)) {
+                assert_eq!(
+                    call(export, &nul_wire(prefix, entries)),
+                    (written, out),
+                    "NUL frame"
+                );
+            }
+            out[..written as usize]
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| i64::from_le_bytes(*c))
+                .collect()
+        }
+
+        fn run(export: Export, entries: &[&[u8]]) -> Vec<i64> {
+            run_with(export, b"", entries)
+        }
+
+        fn announce(format: u32, entries: &[&[u8]]) -> Vec<i64> {
+            run_with(
+                nntmux_w451_pre_announce_batch,
+                &format.to_le_bytes(),
+                entries,
+            )
+        }
+
+        #[test]
+        fn cleaning_w451_pre_announce_counts() {
+            let corruptnet: [&[u8]; 7] = [
+                b"PRE: [FLAC] Some.Album-GRP",
+                b"  INFO: Some.Album-GRP [14F 67.5MB]  ",
+                b"NUKE: Bad.Release-GRP [dupe]",
+                b"UNNUKE: Bad.Release-GRP []",
+                b"PRE: [FLAC] no_group",
+                b"PRE: [FLAC] Some.Album-GRP\n",
+                b"",
+            ];
+            assert_eq!(announce(0, &corruptnet), vec![7, 1, 4, 1, 1, 2, 1, 1]);
+            let zenet: [&[u8]; 3] = [
+                b"(pre) (MP3-WEB) (Name-GRP)",
+                b"(INFO) (Name-GRP) (2 Files) (38 MB)",
+                b"(MODNUKE) (Name-GRP) (  bad  )",
+            ];
+            assert_eq!(announce(1, &zenet), vec![3, 0, 3, 1, 1, 1, 1, 1]);
+            let predatabase: [&[u8]; 3] = [
+                b"pre | MP3-WEB | Name-GRP",
+                b"info | Name-GRP - 14 F & 67 MB",
+                b"p2p | #1 | BTN | Name-GRP, WIN!",
+            ];
+            assert_eq!(announce(2, &predatabase), vec![3, 0, 3, 2, 1, 0, 1, 0]);
+            assert_eq!(
+                announce(
+                    3,
+                    &[
+                        b".::: PRE ::: TV-X264-HD ::: Name-GRP :::.",
+                        b"[INFO] FOR Name-GRP with 5F 158.3MB added."
+                    ]
+                ),
+                vec![2, 0, 2, 1, 1, 0, 1, 0]
+            );
+            assert_eq!(
+                announce(
+                    4,
+                    &[
+                        b"[PRE]  [TV-HD]  Name-GRP",
+                        b"[NUKE] Name-GRP [bad.reason] [NUKENET]"
+                    ]
+                ),
+                vec![2, 0, 2, 1, 0, 1, 1, 1]
+            );
+            assert_eq!(
+                announce(
+                    5,
+                    &[
+                        b"PRE: [FLAC] Some.Album-GRP",
+                        b"(INFO) (N-G) (1 File) (2 MB)"
+                    ]
+                ),
+                vec![2, 0, 2, 1, 1, 0, 1, 0]
+            );
+            let wire = frame_wire(&5u32.to_le_bytes(), &[b"PRE: [X] T\xc3\xa9-GRP"]);
+            assert_eq!(call(nntmux_w451_pre_announce_batch, &wire).0, -1);
+            let wire = frame_wire(&0u32.to_le_bytes(), &[b"PRE: [X] A-G\0"]);
+            assert_eq!(call(nntmux_w451_pre_announce_batch, &wire).0, -1);
+            let wire = frame_wire(&6u32.to_le_bytes(), &[b"x"]);
+            assert_eq!(call(nntmux_w451_pre_announce_batch, &wire).0, -1);
+            assert_eq!(call(nntmux_w451_pre_announce_batch, b"\0\0\0").0, -1);
+        }
+
+        #[test]
+        fn cleaning_w451_websocket_frame_counts() {
+            let mut big = vec![0x82, 127];
+            big.extend_from_slice(&(MAX_FRAME_BYTES + 1).to_be_bytes());
+            let mut reserved = vec![0x81, 127];
+            reserved.extend_from_slice(&(1u64 << 63).to_be_bytes());
+            let got = run(
+                nntmux_w451_websocket_frame_batch,
+                &[
+                    b"\x81\x05hello",
+                    b"\x01\x83abcdxyz",
+                    b"\x89\x00",
+                    b"\x88\x02\x03\xe8",
+                    b"\x83\x00",
+                    b"\x81\x7e\x00\x02hi",
+                    b"\x81\x05hel",
+                    b"\x81\x7e\x00",
+                    b"\x81",
+                    &big,
+                    &reserved,
+                    b"",
+                ],
+            );
+            assert_eq!(got, vec![12, 1, 3, 6, 5, 1, 3, 2, 1, 2]);
+        }
+
+        #[test]
+        fn cleaning_w451_channel_list_counts() {
+            let got = run(
+                nntmux_w451_irc_channel_list_batch,
+                &[
+                    b"#a,#b:secret",
+                    b" a , #a: , ",
+                    b"#,  ,:x",
+                    b"#x:pw,#x",
+                    b"#x,#x:pw",
+                    b"chan",
+                    b"##a,#a",
+                    b"",
+                ],
+            );
+            assert_eq!(got, vec![8, 1, 1, 2, 2, 3, 2]);
+            let mut keys = Vec::new();
+            assert_eq!(
+                channel_list(b"\x0b#a\0:\0", &mut keys),
+                [false, false, false, false, false]
+            );
+        }
+
+        #[test]
+        fn cleaning_w451_gate_and_router_counts() {
+            let subjects: [&[u8]; 6] = [
+                b"[1/9] - \"file.rar\" yEnc (1/50)",
+                b"abcdefghijklmnop1234 (1/2)",
+                b"Usenet Index Post abcdefghijklmnopq (1/2)",
+                b"(1/2) start",
+                b"plain subject",
+                b"",
+            ];
+            assert_eq!(
+                run(nntmux_w451_obfuscation_gate_batch, &subjects),
+                vec![6, 1, 3]
+            );
+            let long = [b'a'; MAX_SUBJECT_LENGTH + 1];
+            let mut with_long = subjects.to_vec();
+            with_long.push(&long);
+            assert_eq!(
+                run(nntmux_w451_obfuscation_router_batch, &with_long),
+                vec![7, 1, 4, 1, 1, 1]
+            );
+            assert!(part_marker(b" ("));
+            assert!(!part_marker(b"( "));
+            assert!(!part_marker(b" "));
+        }
+
+        #[test]
+        fn cleaning_w451_rejects_malformed_frames_without_writing() {
+            let exports: [(Export, &[u8]); 5] = [
+                (nntmux_w451_pre_announce_batch, &[0, 0, 0, 0]),
+                (nntmux_w451_websocket_frame_batch, b""),
+                (nntmux_w451_irc_channel_list_batch, b""),
+                (nntmux_w451_obfuscation_gate_batch, b""),
+                (nntmux_w451_obfuscation_router_batch, b""),
+            ];
+            for (export, prefix) in exports {
+                let good = frame_wire(prefix, &[b"entry"]);
+                let mut trailing = good.clone();
+                trailing.push(b'x');
+                let bad: [&[u8]; 5] = [
+                    b"\x01\0\0",
+                    b"\x01\0\0\0\x09\0\0\0abc",
+                    &trailing,
+                    b"\x00\0\0\0\xff\xff\xff\xff",
+                    b"\x03\0\0\0\xff\xff\xff\xffa",
+                ];
+                let mut out = [0x5au8; 128];
+                for wire in bad {
+                    let wire = [prefix, wire].concat();
+                    let r =
+                        unsafe { export(wire.as_ptr(), wire.len(), out.as_mut_ptr(), out.len()) };
+                    assert_eq!(r, -1);
+                }
+                let r = unsafe { export(std::ptr::null(), 0, out.as_mut_ptr(), out.len()) };
+                assert_eq!(r, -1);
+                let r =
+                    unsafe { export(good.as_ptr(), MAX_INPUT + 1, out.as_mut_ptr(), out.len()) };
+                assert_eq!(r, -1);
+                let required = unsafe { export(good.as_ptr(), good.len(), out.as_mut_ptr(), 8) };
+                assert!(required < -8);
+                assert_eq!(out, [0x5a; 128]);
+                let r = unsafe {
+                    export(
+                        good.as_ptr(),
+                        good.len(),
+                        out.as_mut_ptr(),
+                        (-required) as usize,
+                    )
+                };
+                assert_eq!(r, -required);
+            }
+        }
+    }
+}
