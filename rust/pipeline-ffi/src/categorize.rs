@@ -31544,7 +31544,7 @@ pub mod categorizers_book_console_group_misc_movie_w423 {
     const HASH_LENGTHS: [usize; 3] = [32, 40, 64];
 
     /// Substring needles tagged with their class, searched in one pass per name.
-    struct NeedleSet<const N: usize> {
+    pub(crate) struct NeedleSet<const N: usize> {
         needles: [(&'static [u8], usize); N],
         by_first_byte: [u32; 256],
         by_second_byte: [u32; 256],
@@ -31553,7 +31553,7 @@ pub mod categorizers_book_console_group_misc_movie_w423 {
     impl<const N: usize> NeedleSet<N> {
         /// Every needle must be lowercase and at least two bytes long; at most 32 needles fit the
         /// masks. The byte tables index both cases so names are matched without lowercasing them.
-        const fn new(needles: [(&'static [u8], usize); N]) -> Self {
+        pub(crate) const fn new(needles: [(&'static [u8], usize); N]) -> Self {
             assert!(N <= 32);
             let mut by_first_byte = [0u32; 256];
             let mut by_second_byte = [0u32; 256];
@@ -31581,7 +31581,7 @@ pub mod categorizers_book_console_group_misc_movie_w423 {
         }
 
         /// Bitmask of the needles belonging to `class`.
-        const fn class_mask(&self, class: usize) -> u32 {
+        pub(crate) const fn class_mask(&self, class: usize) -> u32 {
             let mut mask = 0u32;
             let mut k = 0;
             while k < N {
@@ -31595,7 +31595,7 @@ pub mod categorizers_book_console_group_misc_movie_w423 {
 
         /// Bitmask of the needles that occur anywhere in `name`, ignoring ASCII case like a
         /// `str_contains()` over PHP 8.2+ `strtolower($name)`.
-        fn matches(&self, name: &[u8]) -> u32 {
+        pub(crate) fn matches(&self, name: &[u8]) -> u32 {
             let Some((&first, rest)) = name.split_first() else {
                 return 0;
             };
@@ -31623,7 +31623,7 @@ pub mod categorizers_book_console_group_misc_movie_w423 {
 
     /// Index of the first class in `masks` that `matched` hits, else `masks.len()`.
     #[inline]
-    fn first_class(matched: u32, masks: &[u32]) -> usize {
+    pub(crate) fn first_class(matched: u32, masks: &[u32]) -> usize {
         masks
             .iter()
             .position(|&mask| matched & mask != 0)
@@ -31837,7 +31837,7 @@ pub mod categorizers_book_console_group_misc_movie_w423 {
     }
 
     /// Renders `values` as `0x1F`-separated decimals.
-    fn fields(values: &[u64]) -> Vec<u8> {
+    pub(crate) fn fields(values: &[u64]) -> Vec<u8> {
         let mut out = Vec::with_capacity(values.len() * 4);
         for (i, &value) in values.iter().enumerate() {
             if i > 0 {
@@ -31998,7 +31998,7 @@ pub mod categorizers_book_console_group_misc_movie_w423 {
     }
 
     /// Validates a packed string list and the output buffer, then writes `render(items)`.
-    unsafe fn with_strings(
+    pub(crate) unsafe fn with_strings(
         blob_ptr: *const u8,
         blob_len: usize,
         lens_ptr: *const u8,
@@ -32401,6 +32401,621 @@ pub mod categorizers_book_console_group_misc_movie_w423 {
             assert_eq!(text(&fields(&[0, 7, u64::MAX])), "0|7|18446744073709551615");
             assert_eq!(first_class(0, &[1, 2]), 2);
             assert_eq!(first_class(6, &[1, 2, 4]), 1);
+        }
+    }
+}
+
+/// Wave 43.3 batch summaries for the Music, PC, TV and XXX categorizers and the XXX pipe.
+///
+/// Reuses the Wave 42.3 packed string list contract: every export takes `blob` plus little-endian
+/// `u32` lengths and writes `0x1F`-separated decimals (total, one count per class, unknown, flag),
+/// returning the byte count, `-required` (without writing) when the output does not fit, or `-1`
+/// for invalid input.
+pub mod categorizers_music_pc_tv_xxx_pipe_w433 {
+    use super::categorizers_book_console_group_misc_movie_w423::{
+        NeedleSet, fields, first_class, with_strings,
+    };
+
+    /// `MusicCategorizer::W433_MUSIC_CONTENT_MARKERS` (audiobook, podcast, video, lossless, mp3),
+    /// then the vinyl marker.
+    const MUSIC_NEEDLES: NeedleSet<20> = NeedleSet::new([
+        (b"audiobook", 0),
+        (b"audible", 0),
+        (b".m4b", 0),
+        (b"hoerbuch", 0),
+        (b"podcast", 1),
+        (b"radio.show", 1),
+        (b"mvid", 2),
+        (b"musicvideo", 2),
+        (b"music.video", 2),
+        (b"concert", 2),
+        (b"flac", 3),
+        (b"alac", 3),
+        (b"lossless", 3),
+        (b"24bit", 3),
+        (b"hi-res", 3),
+        (b"mp3", 4),
+        (b"320kbps", 4),
+        (b"256kbps", 4),
+        (b"vbr", 4),
+        (b"vinyl", 5),
+    ]);
+    static MUSIC_NEEDLE_SET: NeedleSet<20> = MUSIC_NEEDLES;
+    const MUSIC_CLASS_MASKS: [u32; 5] = [
+        MUSIC_NEEDLES.class_mask(0),
+        MUSIC_NEEDLES.class_mask(1),
+        MUSIC_NEEDLES.class_mask(2),
+        MUSIC_NEEDLES.class_mask(3),
+        MUSIC_NEEDLES.class_mask(4),
+    ];
+    const VINYL_MASK: u32 = MUSIC_NEEDLES.class_mask(5);
+
+    /// `PcCategorizer::W433_PC_PLATFORM_MARKERS` (phone, mac, game, iso, zeroday), then the
+    /// multi-language marker.
+    const PC_NEEDLES: NeedleSet<27> = NeedleSet::new([
+        (b"iphone", 0),
+        (b"ipad", 0),
+        (b"android", 0),
+        (b".apk", 0),
+        (b".ipa", 0),
+        (b"macos", 1),
+        (b"mac.os", 1),
+        (b"osx", 1),
+        (b".dmg", 1),
+        (b"pc.game", 2),
+        (b"pcgame", 2),
+        (b"steamrip", 2),
+        (b"codex", 2),
+        (b"plaza", 2),
+        (b"fitgirl", 2),
+        (b"gog", 2),
+        (b".iso", 3),
+        (b".img", 3),
+        (b"dvd9", 3),
+        (b"keygen", 4),
+        (b"win64", 4),
+        (b"win32", 4),
+        (b"x64", 4),
+        (b"x86", 4),
+        (b"portable", 4),
+        (b"incl.crack", 4),
+        (b"multi", 5),
+    ]);
+    static PC_NEEDLE_SET: NeedleSet<27> = PC_NEEDLES;
+    const PC_CLASS_MASKS: [u32; 5] = [
+        PC_NEEDLES.class_mask(0),
+        PC_NEEDLES.class_mask(1),
+        PC_NEEDLES.class_mask(2),
+        PC_NEEDLES.class_mask(3),
+        PC_NEEDLES.class_mask(4),
+    ];
+    const MULTI_MASK: u32 = PC_NEEDLES.class_mask(5);
+
+    /// `TvCategorizer::W433_TV_CONTENT_MARKERS` (anime, sport, documentary, uhd, hd, sd), then
+    /// `W433_WEB_MARKERS`.
+    const TV_NEEDLES: NeedleSet<29> = NeedleSet::new([
+        (b"anime", 0),
+        (b"subsplease", 0),
+        (b"erai-raws", 0),
+        (b"horriblesubs", 0),
+        (b"nfl", 1),
+        (b"nba", 1),
+        (b"nhl", 1),
+        (b"ufc", 1),
+        (b"wwe", 1),
+        (b"formula1", 1),
+        (b"nascar", 1),
+        (b"documentary", 2),
+        (b"docu", 2),
+        (b"nat.geo", 2),
+        (b"bbc.earth", 2),
+        (b"2160p", 3),
+        (b"uhd", 3),
+        (b"4k", 3),
+        (b"1080p", 4),
+        (b"1080i", 4),
+        (b"720p", 4),
+        (b"480p", 5),
+        (b"sdtv", 5),
+        (b"pdtv", 5),
+        (b"dvdrip", 5),
+        (b"xvid", 5),
+        (b"web-dl", 6),
+        (b"webrip", 6),
+        (b"web.dl", 6),
+    ]);
+    static TV_NEEDLE_SET: NeedleSet<29> = TV_NEEDLES;
+    const TV_CLASS_MASKS: [u32; 6] = [
+        TV_NEEDLES.class_mask(0),
+        TV_NEEDLES.class_mask(1),
+        TV_NEEDLES.class_mask(2),
+        TV_NEEDLES.class_mask(3),
+        TV_NEEDLES.class_mask(4),
+        TV_NEEDLES.class_mask(5),
+    ];
+    const WEB_MASK: u32 = TV_NEEDLES.class_mask(6);
+
+    /// `XxxCategorizer::W433_XXX_FORMAT_MARKERS` (onlyfans, vr, uhd, hd, imageset, dvd, sd), then
+    /// `W433_PACK_MARKERS`.
+    const XXX_NEEDLES: NeedleSet<28> = NeedleSet::new([
+        (b"onlyfans", 0),
+        (b"fansly", 0),
+        (b"manyvids", 0),
+        (b"vr180", 1),
+        (b"vr360", 1),
+        (b"oculus", 1),
+        (b"gearvr", 1),
+        (b"psvr", 1),
+        (b"sidebyside", 1),
+        (b"2160p", 2),
+        (b"4k", 2),
+        (b"uhd", 2),
+        (b"1080p", 3),
+        (b"720p", 3),
+        (b"imageset", 4),
+        (b"image.set", 4),
+        (b"pics", 4),
+        (b"photos", 4),
+        (b"dvdrip", 5),
+        (b"dvd5", 5),
+        (b"dvd9", 5),
+        (b"dvdr", 5),
+        (b"480p", 6),
+        (b"xvid", 6),
+        (b".wmv", 6),
+        (b"mp4", 6),
+        (b"pack", 7),
+        (b"siterip", 7),
+    ]);
+    static XXX_NEEDLE_SET: NeedleSet<28> = XXX_NEEDLES;
+    const XXX_CLASS_MASKS: [u32; 7] = [
+        XXX_NEEDLES.class_mask(0),
+        XXX_NEEDLES.class_mask(1),
+        XXX_NEEDLES.class_mask(2),
+        XXX_NEEDLES.class_mask(3),
+        XXX_NEEDLES.class_mask(4),
+        XXX_NEEDLES.class_mask(5),
+        XXX_NEEDLES.class_mask(6),
+    ];
+    const PACK_MASK: u32 = XXX_NEEDLES.class_mask(7);
+
+    /// `XxxPipe::W433_ADULT_SIGNAL_MARKERS` (studio, jav, keyword), then the `xxx` tag marker.
+    const ADULT_NEEDLES: NeedleSet<24> = NeedleSet::new([
+        (b"brazzers", 0),
+        (b"realitykings", 0),
+        (b"naughtyamerica", 0),
+        (b"bangbros", 0),
+        (b"vixen", 0),
+        (b"blacked", 0),
+        (b"tushy", 0),
+        (b"evilangel", 0),
+        (b"teamskeet", 0),
+        (b"mofos", 0),
+        (b"1pondo", 1),
+        (b"caribbeancom", 1),
+        (b"heyzo", 1),
+        (b"tokyohot", 1),
+        (b"10musume", 1),
+        (b"fc2-ppv", 1),
+        (b"porn", 2),
+        (b"milf", 2),
+        (b"hardcore", 2),
+        (b"lesbian", 2),
+        (b"creampie", 2),
+        (b"blowjob", 2),
+        (b"threesome", 2),
+        (b"xxx", 3),
+    ]);
+    static ADULT_NEEDLE_SET: NeedleSet<24> = ADULT_NEEDLES;
+    const ADULT_CLASS_MASKS: [u32; 3] = [
+        ADULT_NEEDLES.class_mask(0),
+        ADULT_NEEDLES.class_mask(1),
+        ADULT_NEEDLES.class_mask(2),
+    ];
+    const XXX_TAG_MASK: u32 = ADULT_NEEDLES.class_mask(3);
+
+    /// Total, one count per class (first matching class wins), unknown, then the names that hit
+    /// `flag_mask`.
+    fn class_summary<const N: usize, const C: usize>(
+        names: &[&[u8]],
+        set: &NeedleSet<N>,
+        masks: &[u32; C],
+        flag_mask: u32,
+    ) -> Vec<u8> {
+        // C classes plus unknown; at most 7 classes are used.
+        let mut counts = [0u64; 8];
+        let mut flagged = 0u64;
+        for name in names {
+            let matched = set.matches(name);
+            counts[first_class(matched, masks)] += 1;
+            flagged += u64::from(matched & flag_mask != 0);
+        }
+        let mut values = [0u64; 10];
+        values[0] = names.len() as u64;
+        values[1..=C + 1].copy_from_slice(&counts[..=C]);
+        values[C + 2] = flagged;
+        fields(&values[..C + 3])
+    }
+
+    /// `MusicCategorizer::summarizeMusicContentBatch()`: total, audiobook, podcast, video,
+    /// lossless, mp3, unknown, vinyl.
+    pub fn music_content_batch(names: &[&[u8]]) -> Vec<u8> {
+        class_summary(names, &MUSIC_NEEDLE_SET, &MUSIC_CLASS_MASKS, VINYL_MASK)
+    }
+
+    /// `PcCategorizer::summarizePcPlatformBatch()`: total, phone, mac, game, iso, zeroday,
+    /// unknown, multi.
+    pub fn pc_platform_batch(names: &[&[u8]]) -> Vec<u8> {
+        class_summary(names, &PC_NEEDLE_SET, &PC_CLASS_MASKS, MULTI_MASK)
+    }
+
+    /// `TvCategorizer::summarizeTvContentBatch()`: total, anime, sport, documentary, uhd, hd, sd,
+    /// unknown, web.
+    pub fn tv_content_batch(names: &[&[u8]]) -> Vec<u8> {
+        class_summary(names, &TV_NEEDLE_SET, &TV_CLASS_MASKS, WEB_MASK)
+    }
+
+    /// `XxxCategorizer::summarizeXxxFormatBatch()`: total, onlyfans, vr, uhd, hd, imageset, dvd,
+    /// sd, unknown, pack.
+    pub fn xxx_format_batch(names: &[&[u8]]) -> Vec<u8> {
+        class_summary(names, &XXX_NEEDLE_SET, &XXX_CLASS_MASKS, PACK_MASK)
+    }
+
+    /// `XxxPipe::summarizeAdultSignalBatch()`: total, studio, jav, keyword, unknown, xxx.
+    pub fn adult_signal_batch(names: &[&[u8]]) -> Vec<u8> {
+        class_summary(names, &ADULT_NEEDLE_SET, &ADULT_CLASS_MASKS, XXX_TAG_MASK)
+    }
+
+    /// # Safety
+    /// `blob_ptr`/`lens_ptr` must be valid for their lengths in readable bytes, and `out_buf` must be
+    /// valid for `out_cap` writable bytes, not overlapping either input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w433_music_content_batch(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_strings(
+                blob_ptr,
+                blob_len,
+                lens_ptr,
+                lens_len,
+                out_buf,
+                out_cap,
+                music_content_batch,
+            )
+        }
+    }
+
+    /// # Safety
+    /// `blob_ptr`/`lens_ptr` must be valid for their lengths in readable bytes, and `out_buf` must be
+    /// valid for `out_cap` writable bytes, not overlapping either input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w433_pc_platform_batch(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_strings(
+                blob_ptr,
+                blob_len,
+                lens_ptr,
+                lens_len,
+                out_buf,
+                out_cap,
+                pc_platform_batch,
+            )
+        }
+    }
+
+    /// # Safety
+    /// `blob_ptr`/`lens_ptr` must be valid for their lengths in readable bytes, and `out_buf` must be
+    /// valid for `out_cap` writable bytes, not overlapping either input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w433_tv_content_batch(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_strings(
+                blob_ptr,
+                blob_len,
+                lens_ptr,
+                lens_len,
+                out_buf,
+                out_cap,
+                tv_content_batch,
+            )
+        }
+    }
+
+    /// # Safety
+    /// `blob_ptr`/`lens_ptr` must be valid for their lengths in readable bytes, and `out_buf` must be
+    /// valid for `out_cap` writable bytes, not overlapping either input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w433_xxx_format_batch(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_strings(
+                blob_ptr,
+                blob_len,
+                lens_ptr,
+                lens_len,
+                out_buf,
+                out_cap,
+                xxx_format_batch,
+            )
+        }
+    }
+
+    /// # Safety
+    /// `blob_ptr`/`lens_ptr` must be valid for their lengths in readable bytes, and `out_buf` must be
+    /// valid for `out_cap` writable bytes, not overlapping either input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w433_xxx_pipe_adult_signal_batch(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_strings(
+                blob_ptr,
+                blob_len,
+                lens_ptr,
+                lens_len,
+                out_buf,
+                out_cap,
+                adult_signal_batch,
+            )
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::ptr;
+
+        const DECLINE: isize = -1;
+        const MAX_INPUT: usize = 16 * 1024 * 1024;
+
+        type Export =
+            unsafe extern "C" fn(*const u8, usize, *const u8, usize, *mut u8, usize) -> isize;
+
+        const EXPORTS: [Export; 5] = [
+            nntmux_w433_music_content_batch,
+            nntmux_w433_pc_platform_batch,
+            nntmux_w433_tv_content_batch,
+            nntmux_w433_xxx_format_batch,
+            nntmux_w433_xxx_pipe_adult_signal_batch,
+        ];
+
+        fn text(bytes: &[u8]) -> String {
+            String::from_utf8_lossy(bytes).replace('\x1F', "|")
+        }
+
+        fn call(export: Export, items: &[&[u8]]) -> String {
+            let blob = items.concat();
+            let lens: Vec<u8> = items
+                .iter()
+                .flat_map(|i| (i.len() as u32).to_le_bytes())
+                .collect();
+            let mut buf = vec![0u8; 256];
+            let n = unsafe {
+                export(
+                    blob.as_ptr(),
+                    blob.len(),
+                    lens.as_ptr(),
+                    lens.len(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            assert!(n > 0, "call declined: {n}");
+            text(&buf[..n as usize])
+        }
+
+        #[test]
+        fn w433_music_content_counts() {
+            let names: [&[u8]; 9] = [
+                b"Author - Title (Unabridged) AUDIOBOOK.M4B",
+                b"Some.Podcast.Episode.12.MP3",
+                b"Artist-Live_Concert-1080p-MVID",
+                b"Artist-Album-2024-24BIT-FLAC",
+                b"Artist-Album-VINYL-FLAC",
+                b"Artist-Album-WEB-320kbps",
+                b"Artist-Album-Vinyl-Rip",
+                b"Plain.Name",
+                b"",
+            ];
+            assert_eq!(text(&music_content_batch(&names)), "9|1|1|1|2|1|3|2");
+            assert_eq!(text(&music_content_batch(&[])), "0|0|0|0|0|0|0|0");
+            assert_eq!(
+                call(nntmux_w433_music_content_batch, &names),
+                "9|1|1|1|2|1|3|2"
+            );
+        }
+
+        #[test]
+        fn w433_pc_platform_counts() {
+            let names: [&[u8]; 9] = [
+                b"App.v1.2.iPhone.iPad",
+                b"App.v3.Android.APK",
+                b"App.2024.macOS.DMG",
+                b"Game.Title.MULTi5-CODEX",
+                b"Office.2024.x64.ISO",
+                b"Tool.v2.Win64.Incl.Keygen",
+                b"Some.Title.MULTILINGUAL",
+                b"Plain.Name",
+                b"",
+            ];
+            assert_eq!(text(&pc_platform_batch(&names)), "9|2|1|1|1|1|3|2");
+            assert_eq!(
+                call(nntmux_w433_pc_platform_batch, &names),
+                "9|2|1|1|1|1|3|2"
+            );
+            // Class order decides: ".iso" precedes the zero-day markers.
+            assert_eq!(text(&pc_platform_batch(&[b"Disc.ISO"])), "1|0|0|0|1|0|0|0");
+        }
+
+        #[test]
+        fn w433_tv_content_counts() {
+            let names: [&[u8]; 10] = [
+                b"[SubsPlease] Show - 01 (1080p)",
+                b"NFL.2024.Week.1.Team.vs.Team.720p.WEB-DL",
+                b"Nat.Geo.Documentary.2024.1080p",
+                b"Show.S01E01.2160p.WEBRip.x265",
+                b"Show.S01E01.1080p.WEB.DL.H264",
+                b"Show.S01E01.PDTV.XviD",
+                b"Show.S01E01.WEB-DL",
+                b"Plain.Name",
+                b"Show.S01E01.4k",
+                b"",
+            ];
+            assert_eq!(text(&tv_content_batch(&names)), "10|1|1|1|2|1|1|3|4");
+            assert_eq!(
+                call(nntmux_w433_tv_content_batch, &names),
+                "10|1|1|1|2|1|1|3|4"
+            );
+        }
+
+        #[test]
+        fn w433_xxx_format_counts() {
+            let names: [&[u8]; 10] = [
+                b"OnlyFans.Model.Name.2024.1080p",
+                b"Site.24.01.01.Model.VR180.Oculus",
+                b"Site.24.01.01.Model.2160p.MP4",
+                b"Site.24.01.01.Model.720p",
+                b"Site.24.01.01.Model.IMAGESET",
+                b"Studio.Title.DVDRip",
+                b"Site.24.01.01.Model.480p.XviD",
+                b"Site.SITERIP.Pack",
+                b"Plain.Name",
+                b"",
+            ];
+            assert_eq!(text(&xxx_format_batch(&names)), "10|1|1|1|1|1|1|1|3|1");
+            assert_eq!(
+                call(nntmux_w433_xxx_format_batch, &names),
+                "10|1|1|1|1|1|1|1|3|1"
+            );
+        }
+
+        #[test]
+        fn w433_adult_signal_counts() {
+            let names: [&[u8]; 7] = [
+                b"Brazzers.24.01.01.Model.XXX.1080p",
+                b"1Pondo.012424_001.XXX",
+                b"Some.MILF.Hardcore.Scene",
+                b"Studio.XXX.Title",
+                b"VIXEN.Lesbian",
+                b"Plain.Name",
+                b"",
+            ];
+            assert_eq!(text(&adult_signal_batch(&names)), "7|2|1|1|3|3");
+            assert_eq!(
+                call(nntmux_w433_xxx_pipe_adult_signal_batch, &names),
+                "7|2|1|1|3|3"
+            );
+        }
+
+        #[test]
+        fn w433_empty_lists_and_case_insensitive_positions() {
+            assert_eq!(text(&pc_platform_batch(&[])), "0|0|0|0|0|0|0|0");
+            assert_eq!(text(&tv_content_batch(&[])), "0|0|0|0|0|0|0|0|0");
+            assert_eq!(text(&xxx_format_batch(&[])), "0|0|0|0|0|0|0|0|0|0");
+            assert_eq!(text(&adult_signal_batch(&[])), "0|0|0|0|0|0");
+            for pad in 0..40 {
+                let filler = "z".repeat(pad);
+                let name = format!("{filler}.FlAc.{filler}");
+                assert_eq!(
+                    text(&music_content_batch(&[name.as_bytes()])),
+                    "1|0|0|0|1|0|0|0"
+                );
+                let name = format!("{filler}WEB.DL{filler}");
+                assert_eq!(
+                    text(&tv_content_batch(&[name.as_bytes()])),
+                    "1|0|0|0|0|0|0|1|1"
+                );
+                let name = format!("{filler}SideBySide");
+                assert_eq!(
+                    text(&xxx_format_batch(&[name.as_bytes()])),
+                    "1|0|1|0|0|0|0|0|0|0"
+                );
+            }
+            // Truncated needles at the end of a name do not match.
+            assert_eq!(text(&tv_content_batch(&[b"x.2160"])), "1|0|0|0|0|0|0|1|0");
+            assert_eq!(text(&adult_signal_batch(&[b"a.xx"])), "1|0|0|0|1|0");
+            // Non-ASCII bytes are never folded.
+            assert_eq!(text(&music_content_batch(&[b"FL\xc3\x81C"])), "1|0|0|0|0|0|1|0");
+        }
+
+        #[test]
+        fn w433_exports_validate_inputs_and_capacity() {
+            let x = b"x".as_ptr();
+            let lens1 = 1u32.to_le_bytes();
+            unsafe {
+                for export in EXPORTS {
+                    let mut small = [b'Z'; 4];
+                    let needed = export(x, 1, lens1.as_ptr(), 4, small.as_mut_ptr(), 2);
+                    assert!(needed < -2, "needed {needed}");
+                    assert_eq!(small, [b'Z'; 4]);
+                    let mut exact = vec![0u8; (-needed) as usize];
+                    assert_eq!(
+                        export(x, 1, lens1.as_ptr(), 4, exact.as_mut_ptr(), exact.len()),
+                        -needed
+                    );
+                    let mut short = vec![b'Z'; (-needed - 1) as usize];
+                    assert_eq!(
+                        export(x, 1, lens1.as_ptr(), 4, short.as_mut_ptr(), short.len()),
+                        needed
+                    );
+                    assert!(short.iter().all(|&b| b == b'Z'));
+
+                    let mut out = [0u8; 128];
+                    let (b, c) = (out.as_mut_ptr(), out.len());
+                    assert_eq!(export(x, 1, lens1.as_ptr(), 4, ptr::null_mut(), 8), DECLINE);
+                    assert_eq!(export(ptr::null(), 0, x, 0, b, c), DECLINE);
+                    assert_eq!(export(x, 0, ptr::null(), 0, b, c), DECLINE);
+                    assert_eq!(export(x, 1, lens1.as_ptr(), 3, b, c), DECLINE);
+                    assert_eq!(export(x, 0, lens1.as_ptr(), 4, b, c), DECLINE);
+                    let two = 2u32.to_le_bytes();
+                    assert_eq!(export(x, 1, two.as_ptr(), 4, b, c), DECLINE);
+                    let huge = u32::MAX.to_le_bytes();
+                    assert_eq!(export(x, 1, huge.as_ptr(), 4, b, c), DECLINE);
+                    assert_eq!(export(x, MAX_INPUT + 1, x, 0, b, c), DECLINE);
+                    assert_eq!(export(x, usize::MAX, x, 0, b, c), DECLINE);
+                    assert_eq!(export(x, 0, x, 0, usize::MAX as *mut u8, 8), DECLINE);
+                    assert_eq!(export(x, 0, x, 0, b, isize::MAX as usize + 1), DECLINE);
+                    let mut shared =
+                        *b"sample\x06\0\0\0..............................................";
+                    let p = shared.as_mut_ptr();
+                    assert_eq!(export(p, 6, p.add(6), 4, p.add(3), 40), DECLINE);
+                    assert_eq!(export(p, 6, p.add(6), 4, p.add(9), 40), DECLINE);
+                    assert_eq!(&shared[..10], b"sample\x06\0\0\0");
+                    assert!(export(p, 6, p.add(6), 4, p.add(10), 40) > 0);
+                    assert!(export(x, 0, x, 0, b, c) > 0);
+                }
+            }
         }
     }
 }
