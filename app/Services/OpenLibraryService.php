@@ -9,9 +9,11 @@ use App\Support\BookIsbn;
 use App\Support\RustPipelineLibrary;
 use Carbon\Carbon;
 use FFI;
+use FFI\CData;
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\GuzzleException;
 use Illuminate\Support\Facades\Cache;
+use InvalidArgumentException;
 use JsonException;
 use Throwable;
 
@@ -458,6 +460,175 @@ class OpenLibraryService
             return Carbon::parse($date)->format('Y-m-d');
         } catch (\Exception) {
             return null;
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 51.4 batch helper
+    // ---------------------------------------------------------------------
+
+    /** Enabled: minimum of three paired runs cleared every 1.5x gate (common mean 2.10x, p99 1.94x; uncommon mean 2.29x, p99 1.87x); see RustIsbnOpenLibPar2ListProcessorNfoW51ParityTest. */
+    private const bool W51_RUST_FFI_DEFAULT = true;
+
+    public const string W51_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w514_openlibrary_edition_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Edition flags returned by editionBatch(). */
+    public const int W51_ISBN13 = 1;
+
+    public const int W51_COVER = 2;
+
+    public const int W51_EXACT_YEAR = 4;
+
+    public const int W51_EARLIEST = 8;
+
+    private static ?bool $useW51RustFfi = null;
+
+    private static FFI|false|null $w51Ffi = null;
+
+    private static ?CData $w51Out = null;
+
+    private static int $w51OutCap = 0;
+
+    public static function usesW51RustFfi(): bool
+    {
+        return self::$useW51RustFfi ?? self::W51_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W51 batch dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW51RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$useW51RustFfi;
+        self::$useW51RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$useW51RustFfi = $previous;
+        }
+    }
+
+    /**
+     * Classify Open Library editions, two ints each: [publication year or 0, flags]. The year
+     * is the first standalone four-digit run in the publish date (0000 counts as none). Flags:
+     * 1 trimmed first ISBN-13 is non-empty, 2 first cover id is positive, 4 year equals a
+     * positive $preferredYear, 8 the first edition with the earliest positive year. These are
+     * the per-edition terms summarizeOpenLibraryWorkEditionsPhp() counts.
+     *
+     * @param  list<int>  $covers
+     * @param  list<string>  $publishDates
+     * @param  list<string>  $isbn13s
+     * @return list<int>
+     */
+    public static function editionBatch(int $preferredYear, array $covers, array $publishDates, array $isbn13s): array
+    {
+        return self::usesW51RustFfi()
+            ? self::editionBatchNative($preferredYear, $covers, $publishDates, $isbn13s)
+            : self::editionBatchPhp($preferredYear, $covers, $publishDates, $isbn13s);
+    }
+
+    /**
+     * @param  list<int>  $covers
+     * @param  list<string>  $publishDates
+     * @param  list<string>  $isbn13s
+     * @return list<int>
+     */
+    public static function editionBatchNative(int $preferredYear, array $covers, array $publishDates, array $isbn13s): array
+    {
+        self::w51AssertColumns($covers, $publishDates, $isbn13s);
+        if ($covers === []) {
+            return [];
+        }
+
+        return self::w51Call(implode("\0", $publishDates)."\0".implode("\0", $isbn13s), pack('P*', $preferredYear, ...$covers), \count($covers))
+            ?? self::editionBatchPhp($preferredYear, $covers, $publishDates, $isbn13s);
+    }
+
+    /**
+     * @param  list<int>  $covers
+     * @param  list<string>  $publishDates
+     * @param  list<string>  $isbn13s
+     * @return list<int>
+     */
+    public static function editionBatchPhp(int $preferredYear, array $covers, array $publishDates, array $isbn13s): array
+    {
+        self::w51AssertColumns($covers, $publishDates, $isbn13s);
+        $out = [];
+        $earliest = 0;
+        $earliestAt = -1;
+        foreach ($covers as $i => $cover) {
+            $year = preg_match('/(?<![0-9])[0-9]{4}(?![0-9])/', $publishDates[$i], $match) === 1 ? (int) $match[0] : 0;
+            $flags = trim($isbn13s[$i]) !== '' ? self::W51_ISBN13 : 0;
+            if ($cover > 0) {
+                $flags |= self::W51_COVER;
+            }
+            if ($preferredYear > 0 && $year === $preferredYear) {
+                $flags |= self::W51_EXACT_YEAR;
+            }
+            if ($year > 0 && ($earliest === 0 || $year < $earliest)) {
+                $earliest = $year;
+                $earliestAt = $i;
+            }
+            $out[] = $year;
+            $out[] = $flags;
+        }
+        if ($earliestAt >= 0) {
+            $out[$earliestAt * 2 + 1] |= self::W51_EARLIEST;
+        }
+
+        return $out;
+    }
+
+    /**
+     * One FFI crossing for the batch: NUL-joined publish dates then ISBN-13s, little-endian int64 preferred year and cover ids, two int64 words back per record. Null when
+     * the library is missing or declines.
+     *
+     * @return list<int>|null
+     */
+    private static function w51Call(string $text, string $ints, int $count): ?array
+    {
+        try {
+            self::$w51Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w51', self::W51_FFI_CDEF) ?? false;
+            $ffi = self::$w51Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            $need = $count * 2;
+            $out = self::$w51Out;
+            if ($out === null || self::$w51OutCap < $need) {
+                self::$w51OutCap = max(1024, $need);
+                $out = self::$w51Out = $ffi->new('int64_t['.self::$w51OutCap.']');
+            }
+            // @phpstan-ignore method.notFound (Declared by W51_FFI_CDEF.)
+            $written = $ffi->nntmux_w514_openlibrary_edition_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, self::$w51OutCap);
+            if ($written !== $need) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $need * 8));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * @param  array<array-key, mixed>  ...$columns
+     */
+    private static function w51AssertColumns(array ...$columns): void
+    {
+        $count = \count($columns[0]);
+        foreach ($columns as $column) {
+            if (\count($column) !== $count || ! array_is_list($column)) {
+                throw new InvalidArgumentException('W51 batch columns must be lists of equal length.');
+            }
         }
     }
 }

@@ -10,10 +10,12 @@ use App\Support\BookMatchScorer;
 use App\Support\RustPipelineLibrary;
 use Carbon\Carbon;
 use FFI;
+use FFI\CData;
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\GuzzleException;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
+use InvalidArgumentException;
 use JsonException;
 use Psr\Http\Message\ResponseInterface;
 use Throwable;
@@ -551,5 +553,169 @@ class IsbnDbService
         $retryAt = strtotime($retryAfter);
 
         return $retryAt === false ? null : max(1, $retryAt - time());
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 51.4 batch helper
+    // ---------------------------------------------------------------------
+
+    /** Enabled: minimum of three paired runs cleared every 1.5x gate (common mean 10.57x, p99 9.73x; uncommon mean 8.08x, p99 6.30x); see RustIsbnOpenLibPar2ListProcessorNfoW51ParityTest. */
+    private const bool W51_RUST_FFI_DEFAULT = true;
+
+    public const string W51_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w514_isbn_token_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    private static ?bool $useW51RustFfi = null;
+
+    private static FFI|false|null $w51Ffi = null;
+
+    private static ?CData $w51Out = null;
+
+    private static int $w51OutCap = 0;
+
+    public static function usesW51RustFfi(): bool
+    {
+        return self::$useW51RustFfi ?? self::W51_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W51 batch dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW51RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$useW51RustFfi;
+        self::$useW51RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$useW51RustFfi = $previous;
+        }
+    }
+
+    /**
+     * Classify raw ISBN tokens, three ints each: [13 or 10 for a valid ISBN-13 or ISBN-10, 0
+     * when invalid; canonical ISBN-13 as an integer or 0; index of the first earlier token with
+     * the same canonical ISBN-13 or -1]. Tokens are normalized as in
+     * normalizeIsbnBatchCandidatesPhp(): ASCII whitespace and hyphens removed, x uppercased.
+     *
+     * @param  list<string>  $tokens
+     * @return list<int>
+     */
+    public static function isbnTokenBatch(array $tokens): array
+    {
+        return self::usesW51RustFfi()
+            ? self::isbnTokenBatchNative($tokens)
+            : self::isbnTokenBatchPhp($tokens);
+    }
+
+    /**
+     * @param  list<string>  $tokens
+     * @return list<int>
+     */
+    public static function isbnTokenBatchNative(array $tokens): array
+    {
+        self::w51AssertList($tokens);
+        if ($tokens === []) {
+            return [];
+        }
+
+        return self::w51Call(implode("\0", $tokens), '', \count($tokens))
+            ?? self::isbnTokenBatchPhp($tokens);
+    }
+
+    /**
+     * @param  list<string>  $tokens
+     * @return list<int>
+     */
+    public static function isbnTokenBatchPhp(array $tokens): array
+    {
+        self::w51AssertList($tokens);
+        $out = [];
+        $seen = [];
+        foreach ($tokens as $i => $raw) {
+            $token = str_replace('x', 'X', str_replace([' ', "\t", "\r", "\n", "\v", "\f", '-'], '', $raw));
+            $kind = 0;
+            $isbn13 = '';
+            if (preg_match('/\A97[89][0-9]{10}\z/D', $token) === 1) {
+                $sum = 0;
+                for ($k = 0; $k < 13; $k++) {
+                    $sum += (ord($token[$k]) - 48) * ($k % 2 === 0 ? 1 : 3);
+                }
+                if ($sum % 10 === 0) {
+                    $kind = 13;
+                    $isbn13 = $token;
+                }
+            } elseif (preg_match('/\A[0-9]{9}[0-9X]\z/D', $token) === 1) {
+                $sum = 0;
+                for ($k = 0; $k < 10; $k++) {
+                    $sum += ($token[$k] === 'X' ? 10 : ord($token[$k]) - 48) * (10 - $k);
+                }
+                if ($sum % 11 === 0) {
+                    $kind = 10;
+                    $prefix = '978'.substr($token, 0, 9);
+                    $sum13 = 0;
+                    for ($k = 0; $k < 12; $k++) {
+                        $sum13 += (ord($prefix[$k]) - 48) * ($k % 2 === 0 ? 1 : 3);
+                    }
+                    $isbn13 = $prefix.(string) ((10 - $sum13 % 10) % 10);
+                }
+            }
+            if ($isbn13 === '') {
+                array_push($out, 0, 0, -1);
+
+                continue;
+            }
+            $first = $seen[$isbn13] ??= $i;
+            array_push($out, $kind, (int) $isbn13, $first === $i ? -1 : $first);
+        }
+
+        return $out;
+    }
+
+    /**
+     * One FFI crossing for the batch: NUL-joined tokens, three int64 words back per record. Null when
+     * the library is missing or declines.
+     *
+     * @return list<int>|null
+     */
+    private static function w51Call(string $text, string $ints, int $count): ?array
+    {
+        try {
+            self::$w51Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w51', self::W51_FFI_CDEF) ?? false;
+            $ffi = self::$w51Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            $need = $count * 3;
+            $out = self::$w51Out;
+            if ($out === null || self::$w51OutCap < $need) {
+                self::$w51OutCap = max(1024, $need);
+                $out = self::$w51Out = $ffi->new('int64_t['.self::$w51OutCap.']');
+            }
+            // @phpstan-ignore method.notFound (Declared by W51_FFI_CDEF.)
+            $written = $ffi->nntmux_w514_isbn_token_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, self::$w51OutCap);
+            if ($written !== $need) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $need * 8));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** @param array<array-key, mixed> $values */
+    private static function w51AssertList(array $values): void
+    {
+        if (! array_is_list($values)) {
+            throw new InvalidArgumentException('W51 batch input must be a list.');
+        }
     }
 }

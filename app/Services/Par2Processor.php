@@ -16,8 +16,10 @@ use App\Support\Par2FileHashEvidence;
 use App\Support\RustPipelineLibrary;
 use dariusiii\rarinfo\Par2Info;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
+use InvalidArgumentException;
 use RuntimeException;
 use Throwable;
 
@@ -774,6 +776,181 @@ class Par2Processor
             return $summary;
         } catch (Throwable) {
             return null;
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 51.4 batch helper
+    // ---------------------------------------------------------------------
+
+    /** Enabled: minimum of three paired runs cleared every 1.5x gate (common mean 3.61x, p99 2.95x; uncommon mean 3.44x, p99 3.09x); see RustIsbnOpenLibPar2ListProcessorNfoW51ParityTest. */
+    private const bool W51_RUST_FFI_DEFAULT = true;
+
+    public const string W51_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w514_par2_rename_candidate_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Rename candidate flags returned by renameCandidateBatch(). */
+    public const int W51_EMPTY_NAME = 1;
+
+    public const int W51_HEX_HASH = 2;
+
+    public const int W51_OBFUSCATED = 4;
+
+    public const int W51_RELEASE_LIKE = 8;
+
+    public const int W51_PAR2_VOLUME = 16;
+
+    public const int W51_EXECUTABLE = 32;
+
+    private static ?bool $useW51RustFfi = null;
+
+    private static FFI|false|null $w51Ffi = null;
+
+    private static ?CData $w51Out = null;
+
+    private static int $w51OutCap = 0;
+
+    public static function usesW51RustFfi(): bool
+    {
+        return self::$useW51RustFfi ?? self::W51_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W51 batch dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW51RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$useW51RustFfi;
+        self::$useW51RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$useW51RustFfi = $previous;
+        }
+    }
+
+    /**
+     * Classify PAR2 rename candidates, two ints each: [flags, offset << 32 | length of the
+     * stem in the raw name]. The stem is the trimmed name after its last slash or backslash,
+     * up to the last dot. Flags follow summarizePar2RenameCandidateBatchPhp(): 1 empty, 2
+     * 32/40 hex stem, 4 16+ alphanumeric stem, 8 dotted release stem with a dash, 16
+     * .volN+M.par2 volume, 32 executable extension.
+     *
+     * @param  list<string>  $names
+     * @return list<int>
+     */
+    public static function renameCandidateBatch(array $names): array
+    {
+        return self::usesW51RustFfi()
+            ? self::renameCandidateBatchNative($names)
+            : self::renameCandidateBatchPhp($names);
+    }
+
+    /**
+     * @param  list<string>  $names
+     * @return list<int>
+     */
+    public static function renameCandidateBatchNative(array $names): array
+    {
+        self::w51AssertList($names);
+        if ($names === []) {
+            return [];
+        }
+
+        return self::w51Call(implode("\0", $names), '', \count($names))
+            ?? self::renameCandidateBatchPhp($names);
+    }
+
+    /**
+     * @param  list<string>  $names
+     * @return list<int>
+     */
+    public static function renameCandidateBatchPhp(array $names): array
+    {
+        self::w51AssertList($names);
+        $out = [];
+        foreach ($names as $raw) {
+            $entry = trim($raw);
+            $offset = strspn($raw, " \t\n\r\0\x0B");
+            if ($entry === '') {
+                array_push($out, self::W51_EMPTY_NAME, $offset << 32);
+
+                continue;
+            }
+            $slash = strrpos($entry, '/');
+            $backslash = strrpos($entry, '\\');
+            $baseAt = max($slash === false ? -1 : $slash, $backslash === false ? -1 : $backslash) + 1;
+            $base = substr($entry, $baseAt);
+            $dot = strrpos($base, '.');
+            $stem = $dot === false ? $base : substr($base, 0, $dot);
+            $extension = $dot === false ? '' : strtolower(substr($base, $dot + 1));
+            $flags = 0;
+            if (preg_match('/^(?:[0-9A-Fa-f]{32}|[0-9A-Fa-f]{40})\z/', $stem) === 1) {
+                $flags |= self::W51_HEX_HASH;
+            }
+            if (preg_match('/^[A-Za-z0-9]{16,}\z/', $stem) === 1) {
+                $flags |= self::W51_OBFUSCATED;
+            }
+            if (substr_count($stem, '.') >= 2 && str_contains($stem, '-')) {
+                $flags |= self::W51_RELEASE_LIKE;
+            }
+            if (preg_match('/\.vol\d+\+\d+\.par2\z/i', $entry) === 1) {
+                $flags |= self::W51_PAR2_VOLUME;
+            }
+            if (isset(self::W424_EXECUTABLE_EXTENSIONS[$extension])) {
+                $flags |= self::W51_EXECUTABLE;
+            }
+            $out[] = $flags;
+            $out[] = (($offset + $baseAt) << 32) | \strlen($stem);
+        }
+
+        return $out;
+    }
+
+    /**
+     * One FFI crossing for the batch: NUL-joined names, two int64 words back per record. Null when
+     * the library is missing or declines.
+     *
+     * @return list<int>|null
+     */
+    private static function w51Call(string $text, string $ints, int $count): ?array
+    {
+        try {
+            self::$w51Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w51', self::W51_FFI_CDEF) ?? false;
+            $ffi = self::$w51Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            $need = $count * 2;
+            $out = self::$w51Out;
+            if ($out === null || self::$w51OutCap < $need) {
+                self::$w51OutCap = max(1024, $need);
+                $out = self::$w51Out = $ffi->new('int64_t['.self::$w51OutCap.']');
+            }
+            // @phpstan-ignore method.notFound (Declared by W51_FFI_CDEF.)
+            $written = $ffi->nntmux_w514_par2_rename_candidate_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, self::$w51OutCap);
+            if ($written !== $need) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $need * 8));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** @param array<array-key, mixed> $values */
+    private static function w51AssertList(array $values): void
+    {
+        if (! array_is_list($values)) {
+            throw new InvalidArgumentException('W51 batch input must be a list.');
         }
     }
 }
