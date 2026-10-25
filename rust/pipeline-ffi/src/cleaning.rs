@@ -23042,3 +23042,904 @@ mod wave33_binary_part_collection_models_tests {
         }
     }
 }
+
+/// Wave 34.1: normalization, validation and rule-shape helpers for the `CollectionRegex`,
+/// `ReleaseNamingRegex`, `CategoryRegex`, `ReleaseRegex` and `IngestionConfiguration` models.
+///
+/// Regex rule inputs arrive as one buffer of `0x1F`-separated `group_regex`, `regex` and
+/// `description` fields. Outputs are `0x1F`-separated decimal integers and strings; name lists
+/// are comma-joined. Inputs that are not UTF-8, embed either marker byte, carry a non-boolean
+/// flag or a non-empty description flagged as `null` decline with `-1` so PHP keeps its own
+/// implementation.
+pub mod wave34_regex_ingestion_config_models {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+    use std::str;
+
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+    const DECLINE: isize = -1;
+    const FIELD_SEP: u8 = 0x1F;
+    const NULL_MARK: u8 = 0x1E;
+    const TRIM_SET: &[u8] = b" \t\n\r\0\x0B\x0C";
+    const MODIFIERS: &[u8] = b"imsxuADSUXJn";
+    const GROUP_REGEX_MAX: usize = 255;
+    const DESCRIPTION_MAX: usize = 1000;
+    const INT32_MAX: i64 = 2_147_483_647;
+    const U32_MAX: i64 = 4_294_967_295;
+    const HOURS_MAX: i64 = 876_000;
+    const SCAN_DAYS_MAX: i64 = 36_500;
+
+    unsafe fn valid_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null()
+            || len > MAX_INPUT
+            || len > isize::MAX as usize
+            || (ptr as usize).checked_add(len).is_none()
+        {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn valid_out_buf(out_buf: *mut u8, out_cap: usize) -> bool {
+        !out_buf.is_null()
+            && out_cap <= isize::MAX as usize
+            && (out_buf as usize).checked_add(out_cap).is_some()
+    }
+
+    #[inline]
+    fn flag(value: u32) -> Option<bool> {
+        match value {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+
+    /// Copies `bytes` into `out_buf`, returning the length or `-required` when it does not fit.
+    unsafe fn write_bytes(bytes: &[u8], out_buf: *mut u8, out_cap: usize) -> isize {
+        if bytes.len() > isize::MAX as usize {
+            return DECLINE;
+        }
+        if bytes.len() > out_cap {
+            return -(bytes.len() as isize);
+        }
+        if !bytes.is_empty() {
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len()) };
+        }
+        bytes.len() as isize
+    }
+
+    fn finish(encoded: Option<Vec<u8>>, out_buf: *mut u8, out_cap: usize) -> isize {
+        match encoded {
+            Some(bytes) => unsafe { write_bytes(&bytes, out_buf, out_cap) },
+            None => DECLINE,
+        }
+    }
+
+    /// Splits the wire buffer into exactly `expected` UTF-8 fields.
+    fn split_fields(input: &[u8], expected: usize) -> Option<Vec<&str>> {
+        if input.contains(&NULL_MARK) {
+            return None;
+        }
+        let mut fields = Vec::with_capacity(expected);
+        for part in input.split(|&b| b == FIELD_SEP) {
+            if fields.len() == expected {
+                return None;
+            }
+            fields.push(str::from_utf8(part).ok()?);
+        }
+        (fields.len() == expected).then_some(fields)
+    }
+
+    /// PHP `trim($value, " \t\n\r\0\x0B\x0C")`.
+    fn trim_ws(value: &str) -> &str {
+        value.trim_matches(|c: char| c.is_ascii() && TRIM_SET.contains(&(c as u8)))
+    }
+
+    /// PHP `preg_replace('/[ \t\n\r\x0B\x0C]+/', ' ', $value)`.
+    fn collapse_ws(value: &str) -> String {
+        let mut out = String::with_capacity(value.len());
+        let mut in_run = false;
+        for c in value.chars() {
+            if matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0B' | '\x0C') {
+                if !in_run {
+                    out.push(' ');
+                    in_run = true;
+                }
+            } else {
+                out.push(c);
+                in_run = false;
+            }
+        }
+        out
+    }
+
+    /// PHP `mb_substr($value, 0, $max, 'UTF-8')` for valid UTF-8.
+    fn char_prefix(value: &str, max: usize) -> &str {
+        match value.char_indices().nth(max) {
+            Some((index, _)) => &value[..index],
+            None => value,
+        }
+    }
+
+    fn bool_field(value: bool) -> &'static [u8] {
+        if value { b"1" } else { b"0" }
+    }
+
+    fn encode(fields: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(fields.iter().map(|f| f.len() + 1).sum());
+        for (i, field) in fields.iter().enumerate() {
+            if i > 0 {
+                out.push(FIELD_SEP);
+            }
+            out.extend_from_slice(field);
+        }
+        out
+    }
+
+    #[inline]
+    fn is_word_byte(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || byte == b'_'
+    }
+
+    /// `CollectionRegex::regexDelimiterPhp()`: whether `regex` is a delimited PCRE pattern with
+    /// only supported trailing modifiers, and those modifiers.
+    pub fn regex_delimiter(regex: &str) -> (bool, &str) {
+        let bytes = regex.as_bytes();
+        if bytes.len() < 2 {
+            return (false, "");
+        }
+        let open = bytes[0];
+        if !(0x21..=0x7E).contains(&open) || open.is_ascii_alphanumeric() || open == b'\\' {
+            return (false, "");
+        }
+        let close = match open {
+            b'(' => b')',
+            b'[' => b']',
+            b'{' => b'}',
+            b'<' => b'>',
+            other => other,
+        };
+        match bytes.iter().rposition(|&b| b == close) {
+            Some(pos) if pos >= 1 => {
+                let modifiers = &regex[pos + 1..];
+                if modifiers.bytes().all(|b| MODIFIERS.contains(&b)) {
+                    (true, modifiers)
+                } else {
+                    (false, "")
+                }
+            }
+            _ => (false, ""),
+        }
+    }
+
+    /// `CollectionRegex::namedCaptureGroupsPhp()`: `(?P<name>`, `(?<name>` and `(?'name'` group
+    /// names in pattern order, skipping backslash-escaped bytes.
+    pub fn named_capture_groups(regex: &str) -> Vec<&str> {
+        let bytes = regex.as_bytes();
+        let len = bytes.len();
+        let mut names = Vec::new();
+        let mut i = 0;
+        while i < len {
+            let byte = bytes[i];
+            if byte == b'\\' {
+                i += 2;
+                continue;
+            }
+            if byte != b'(' || bytes.get(i + 1) != Some(&b'?') {
+                i += 1;
+                continue;
+            }
+            let mut j = i + 2;
+            let mut open = bytes.get(j).copied();
+            if open == Some(b'P') {
+                j += 1;
+                open = bytes.get(j).copied();
+                if open != Some(b'<') {
+                    i += 1;
+                    continue;
+                }
+            }
+            let close = match open {
+                Some(b'<') => b'>',
+                Some(b'\'') => b'\'',
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            };
+            j += 1;
+            let start = j;
+            while j < len && is_word_byte(bytes[j]) {
+                j += 1;
+            }
+            if j > start && j < len && bytes[j] == close && !bytes[start].is_ascii_digit() {
+                names.push(&regex[start..j]);
+                i = j + 1;
+            } else {
+                i += 1;
+            }
+        }
+        names
+    }
+
+    /// Named groups whose values `RegexService::_matchRegex()` concatenates.
+    fn is_usable_name(name: &str) -> bool {
+        let lower = name.to_ascii_lowercase();
+        !lower.contains("reqid") && !lower.contains("parts")
+    }
+
+    /// Shared `CollectionRegex::normalizeRegexRuleBasePhp()` result.
+    pub struct RegexRule<'a> {
+        pub group_regex: &'a str,
+        pub regex: &'a str,
+        pub status: i64,
+        pub description: String,
+        pub ordinal: i64,
+        pub is_active: bool,
+        pub delimiter_valid: bool,
+        pub modifiers: &'a str,
+        pub sort_key: String,
+    }
+
+    pub fn regex_rule<'a>(
+        group_regex: &'a str,
+        regex: &'a str,
+        status: i64,
+        description: &str,
+        ordinal: i64,
+    ) -> RegexRule<'a> {
+        let group_regex = char_prefix(trim_ws(group_regex), GROUP_REGEX_MAX);
+        let regex = trim_ws(regex);
+        let status = i64::from(status == 1);
+        let description =
+            char_prefix(trim_ws(&collapse_ws(description)), DESCRIPTION_MAX).to_owned();
+        let ordinal = ordinal.clamp(0, INT32_MAX);
+        let (delimiter_valid, modifiers) = regex_delimiter(regex);
+        let sort_key = format!("{ordinal:010}|{}", group_regex.to_ascii_lowercase());
+        RegexRule {
+            group_regex,
+            regex,
+            status,
+            description,
+            ordinal,
+            is_active: status == 1 && !regex.is_empty() && !group_regex.is_empty(),
+            delimiter_valid,
+            modifiers,
+            sort_key,
+        }
+    }
+
+    fn rule_fields<'a>(rule: &'a RegexRule<'_>, ints: &'a [String; 2]) -> [&'a [u8]; 9] {
+        [
+            rule.group_regex.as_bytes(),
+            rule.regex.as_bytes(),
+            ints[0].as_bytes(),
+            rule.description.as_bytes(),
+            ints[1].as_bytes(),
+            bool_field(rule.is_active),
+            bool_field(rule.delimiter_valid),
+            rule.modifiers.as_bytes(),
+            rule.sort_key.as_bytes(),
+        ]
+    }
+
+    fn parse_rule(input: &[u8], description_is_null: bool) -> Option<[&str; 3]> {
+        let fields = split_fields(input, 3)?;
+        if description_is_null && !fields[2].is_empty() {
+            return None;
+        }
+        Some([fields[0], fields[1], fields[2]])
+    }
+
+    /// `CollectionRegex::normalizeCollectionRegexRulePhp()`.
+    pub fn collection_regex_encode(
+        input: &[u8],
+        status: i64,
+        ordinal: i64,
+        description_is_null: bool,
+    ) -> Option<Vec<u8>> {
+        let [group, regex, description] = parse_rule(input, description_is_null)?;
+        let rule = regex_rule(group, regex, status, description, ordinal);
+        let names = named_capture_groups(rule.regex);
+        let usable = names.iter().filter(|name| is_usable_name(name)).count();
+        let ints = [rule.status.to_string(), rule.ordinal.to_string()];
+        let joined = names.join(",");
+        let usable_text = usable.to_string();
+        let mut fields = rule_fields(&rule, &ints).to_vec();
+        fields.push(joined.as_bytes());
+        fields.push(usable_text.as_bytes());
+        fields.push(bool_field(
+            rule.is_active && rule.delimiter_valid && usable > 0,
+        ));
+        Some(encode(&fields))
+    }
+
+    /// `ReleaseNamingRegex::normalizeReleaseNamingRegexRulePhp()`.
+    pub fn release_naming_regex_encode(
+        input: &[u8],
+        status: i64,
+        ordinal: i64,
+        description_is_null: bool,
+    ) -> Option<Vec<u8>> {
+        let [group, regex, description] = parse_rule(input, description_is_null)?;
+        let rule = regex_rule(group, regex, status, description, ordinal);
+        let names = named_capture_groups(rule.regex);
+        let mut order: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|n| is_usable_name(n))
+            .collect();
+        order.sort_unstable();
+        order.dedup();
+        let ints = [rule.status.to_string(), rule.ordinal.to_string()];
+        let joined = names.join(",");
+        let order_text = order.join(",");
+        let mut fields = rule_fields(&rule, &ints).to_vec();
+        fields.push(joined.as_bytes());
+        fields.push(order_text.as_bytes());
+        fields.push(bool_field(
+            rule.is_active && rule.delimiter_valid && !order.is_empty(),
+        ));
+        Some(encode(&fields))
+    }
+
+    /// `CategoryRegex::normalizeCategoryRegexRulePhp()`.
+    pub fn category_regex_encode(
+        input: &[u8],
+        status: i64,
+        ordinal: i64,
+        categories_id: i64,
+        description_is_null: bool,
+    ) -> Option<Vec<u8>> {
+        let [group, regex, description] = parse_rule(input, description_is_null)?;
+        let rule = regex_rule(group, regex, status, description, ordinal);
+        let categories_id = categories_id.clamp(0, INT32_MAX);
+        let ints = [rule.status.to_string(), rule.ordinal.to_string()];
+        let category_text = categories_id.to_string();
+        let mut fields = rule_fields(&rule, &ints).to_vec();
+        fields.push(category_text.as_bytes());
+        fields.push(bool_field(
+            rule.is_active && rule.delimiter_valid && categories_id > 0,
+        ));
+        Some(encode(&fields))
+    }
+
+    /// `ReleaseRegex::normalizeReleaseRegexLinkPhp()`:
+    /// `(releases_id, collection_regex_id, naming_regex_id, has_collection, has_naming, valid, key)`.
+    pub fn release_regex_link(
+        releases_id: i64,
+        collection_regex_id: i64,
+        naming_regex_id: i64,
+    ) -> ([i64; 3], [bool; 3], String) {
+        let ids = [
+            releases_id.max(0),
+            collection_regex_id.max(0),
+            naming_regex_id.max(0),
+        ];
+        let key = format!("{}:{}:{}", ids[0], ids[1], ids[2]);
+        (ids, [ids[1] > 0, ids[2] > 0, ids[0] > 0], key)
+    }
+
+    /// `IngestionConfiguration::normalizeReleaseFormationRulesPhp()`; returns the eleven integer
+    /// fields (booleans as `0`/`1`) and the scan unit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ingestion_release_rules(
+        completion_percent: i64,
+        min_files: i64,
+        min_size: i64,
+        max_size: i64,
+        collection_delay_hours: i64,
+        collection_timeout_hours: i64,
+        cross_post_hours: i64,
+        new_group_scan_method: i64,
+        new_group_days_to_scan: i64,
+        new_group_messages_to_scan: i64,
+    ) -> ([i64; 11], &'static str) {
+        let min_size = min_size.max(0);
+        let max_size = max_size.max(0);
+        let delay = collection_delay_hours.clamp(0, HOURS_MAX);
+        let timeout = collection_timeout_hours.clamp(0, HOURS_MAX);
+        let cross = cross_post_hours.clamp(0, HOURS_MAX);
+        let by_days = new_group_scan_method == 1;
+        let target = if by_days {
+            new_group_days_to_scan.clamp(1, SCAN_DAYS_MAX)
+        } else {
+            new_group_messages_to_scan.clamp(0, U32_MAX)
+        };
+        (
+            [
+                completion_percent.clamp(0, 100),
+                min_files.clamp(0, U32_MAX),
+                min_size,
+                max_size,
+                i64::from(max_size == 0 || max_size >= min_size),
+                delay * 3600,
+                timeout * 3600,
+                cross * 3600,
+                i64::from(timeout >= delay),
+                i64::from(by_days),
+                target,
+            ],
+            if by_days { "days" } else { "posts" },
+        )
+    }
+
+    /// `CollectionRegex::normalizeCollectionRegexRule()`; input is `group_regex`, `regex`,
+    /// `description`.
+    ///
+    /// # Safety
+    /// `input_ptr` must be valid for reads of `input_len` bytes and `out_buf` for writes of
+    /// `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w34_collection_regex_normalize_rule(
+        status: i64,
+        ordinal: i64,
+        description_is_null: u32,
+        input_ptr: *const u8,
+        input_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(input) = (unsafe { valid_slice(input_ptr, input_len) }) else {
+                return DECLINE;
+            };
+            let encoded = flag(description_is_null)
+                .and_then(|is_null| collection_regex_encode(input, status, ordinal, is_null));
+            finish(encoded, out_buf, out_cap)
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `ReleaseNamingRegex::normalizeReleaseNamingRegexRule()`; input is `group_regex`, `regex`,
+    /// `description`.
+    ///
+    /// # Safety
+    /// `input_ptr` must be valid for reads of `input_len` bytes and `out_buf` for writes of
+    /// `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w34_release_naming_regex_normalize_rule(
+        status: i64,
+        ordinal: i64,
+        description_is_null: u32,
+        input_ptr: *const u8,
+        input_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(input) = (unsafe { valid_slice(input_ptr, input_len) }) else {
+                return DECLINE;
+            };
+            let encoded = flag(description_is_null)
+                .and_then(|is_null| release_naming_regex_encode(input, status, ordinal, is_null));
+            finish(encoded, out_buf, out_cap)
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `CategoryRegex::normalizeCategoryRegexRule()`; input is `group_regex`, `regex`,
+    /// `description`.
+    ///
+    /// # Safety
+    /// `input_ptr` must be valid for reads of `input_len` bytes and `out_buf` for writes of
+    /// `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w34_category_regex_normalize_rule(
+        status: i64,
+        ordinal: i64,
+        categories_id: i64,
+        description_is_null: u32,
+        input_ptr: *const u8,
+        input_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(input) = (unsafe { valid_slice(input_ptr, input_len) }) else {
+                return DECLINE;
+            };
+            let encoded = flag(description_is_null).and_then(|is_null| {
+                category_regex_encode(input, status, ordinal, categories_id, is_null)
+            });
+            finish(encoded, out_buf, out_cap)
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `ReleaseRegex::normalizeReleaseRegexLink()`.
+    ///
+    /// # Safety
+    /// `out_buf` must be valid for writes of `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w34_release_regex_normalize_link(
+        releases_id: i64,
+        collection_regex_id: i64,
+        naming_regex_id: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let (ids, flags, key) =
+                release_regex_link(releases_id, collection_regex_id, naming_regex_id);
+            let texts = ids.map(|id| id.to_string());
+            let encoded = encode(&[
+                texts[0].as_bytes(),
+                texts[1].as_bytes(),
+                texts[2].as_bytes(),
+                bool_field(flags[0]),
+                bool_field(flags[1]),
+                bool_field(flags[2]),
+                key.as_bytes(),
+            ]);
+            unsafe { write_bytes(&encoded, out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `IngestionConfiguration::normalizeReleaseFormationRules()`.
+    ///
+    /// # Safety
+    /// `out_buf` must be valid for writes of `out_cap` bytes.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_w34_ingestion_configuration_normalize_release_rules(
+        completion_percent: i64,
+        min_files: i64,
+        min_size: i64,
+        max_size: i64,
+        collection_delay_hours: i64,
+        collection_timeout_hours: i64,
+        cross_post_hours: i64,
+        new_group_scan_method: i64,
+        new_group_days_to_scan: i64,
+        new_group_messages_to_scan: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let (values, unit) = ingestion_release_rules(
+                completion_percent,
+                min_files,
+                min_size,
+                max_size,
+                collection_delay_hours,
+                collection_timeout_hours,
+                cross_post_hours,
+                new_group_scan_method,
+                new_group_days_to_scan,
+                new_group_messages_to_scan,
+            );
+            let texts = values.map(|value| value.to_string());
+            let mut fields: Vec<&[u8]> = texts.iter().map(|text| text.as_bytes()).collect();
+            fields.insert(10, unit.as_bytes());
+            unsafe { write_bytes(&encode(&fields), out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+}
+
+#[cfg(test)]
+mod wave34_regex_ingestion_config_models_tests {
+    use super::wave34_regex_ingestion_config_models::*;
+
+    fn call(f: impl Fn(*mut u8, usize) -> isize) -> Vec<u8> {
+        let needed = f(std::ptr::NonNull::<u8>::dangling().as_ptr(), 0);
+        assert!(needed < -1 || needed == 0, "unexpected {needed}");
+        let mut out = vec![0_u8; (-needed) as usize];
+        let written = f(out.as_mut_ptr(), out.len());
+        assert_eq!(written, out.len() as isize);
+        out
+    }
+
+    #[test]
+    fn delimiter_validation_matches_pcre_shape() {
+        assert_eq!(regex_delimiter("/abc/i"), (true, "i"));
+        assert_eq!(regex_delimiter("#^x$#iu"), (true, "iu"));
+        assert_eq!(regex_delimiter("//"), (true, ""));
+        assert_eq!(regex_delimiter("(abc)"), (true, ""));
+        assert_eq!(regex_delimiter("{a{1}}x"), (true, "x"));
+        assert_eq!(regex_delimiter("/abc/q"), (false, ""));
+        assert_eq!(regex_delimiter("/abc"), (false, ""));
+        assert_eq!(regex_delimiter("abc"), (false, ""));
+        assert_eq!(regex_delimiter("\\a\\"), (false, ""));
+        assert_eq!(regex_delimiter("/"), (false, ""));
+        assert_eq!(regex_delimiter("ééé"), (false, ""));
+    }
+
+    #[test]
+    fn named_groups_skip_escapes_and_lookbehinds() {
+        assert_eq!(
+            named_capture_groups("/(?P<match0>a)(?<match1>b)(?'reqid'c)(?<=x)(?<!y)\\(?<esc>z)/"),
+            vec!["match0", "match1", "reqid"]
+        );
+        assert!(named_capture_groups("/(?<1bad>x)(?P'no'y)(?<>z)(?<open/").is_empty());
+        assert_eq!(named_capture_groups("(?<a>"), vec!["a"]);
+    }
+
+    #[test]
+    fn regex_rule_normalizes_fields() {
+        let rule = regex_rule(
+            "  ^alt\\.binaries\\.TEEVEE$ ",
+            " /(?P<match0>.+)/i \n",
+            1,
+            "  Some \t desc  ",
+            -4,
+        );
+        assert_eq!(rule.group_regex, "^alt\\.binaries\\.TEEVEE$");
+        assert_eq!(rule.regex, "/(?P<match0>.+)/i");
+        assert_eq!((rule.status, rule.ordinal), (1, 0));
+        assert_eq!(rule.description, "Some desc");
+        assert!(rule.is_active && rule.delimiter_valid);
+        assert_eq!(rule.modifiers, "i");
+        assert_eq!(rule.sort_key, "0000000000|^alt\\.binaries\\.teevee$");
+        let (group, description) = ("é".repeat(300), "x".repeat(1200));
+        let rule = regex_rule(&group, "", 7, &description, i64::MAX);
+        assert_eq!(rule.group_regex.chars().count(), 255);
+        assert_eq!(rule.description.len(), 1000);
+        assert_eq!(
+            (rule.status, rule.ordinal, rule.is_active),
+            (0, 2_147_483_647, false)
+        );
+    }
+
+    #[test]
+    fn regex_exports_encode_model_fields() {
+        let input = b" grp \x1f/(?P<match0>a)(?P<parts>b)(?P<match0>c)/\x1f";
+        let out = call(|buf, cap| unsafe {
+            nntmux_w34_collection_regex_normalize_rule(
+                1,
+                3,
+                1,
+                input.as_ptr(),
+                input.len(),
+                buf,
+                cap,
+            )
+        });
+        assert_eq!(
+            out,
+            b"grp\x1f/(?P<match0>a)(?P<parts>b)(?P<match0>c)/\x1f1\x1f\x1f3\x1f1\x1f1\x1f\x1f0000000003|grp\x1fmatch0,parts,match0\x1f2\x1f1"
+        );
+        let out = call(|buf, cap| unsafe {
+            nntmux_w34_release_naming_regex_normalize_rule(
+                1,
+                3,
+                1,
+                input.as_ptr(),
+                input.len(),
+                buf,
+                cap,
+            )
+        });
+        assert!(out.ends_with(b"\x1fmatch0,parts,match0\x1fmatch0\x1f1"));
+        let out = call(|buf, cap| unsafe {
+            nntmux_w34_category_regex_normalize_rule(
+                1,
+                3,
+                -5,
+                1,
+                input.as_ptr(),
+                input.len(),
+                buf,
+                cap,
+            )
+        });
+        assert!(out.ends_with(b"\x1f0\x1f0"));
+        let mut target = [0_u8; 64];
+        for bad in [
+            &b"a\x1fb"[..],
+            b"a\x1fb\x1fc\x1fd",
+            b"a\x1e\x1fb\x1fc",
+            b"\xff\x1fb\x1fc",
+        ] {
+            assert_eq!(
+                unsafe {
+                    nntmux_w34_collection_regex_normalize_rule(
+                        1,
+                        1,
+                        0,
+                        bad.as_ptr(),
+                        bad.len(),
+                        target.as_mut_ptr(),
+                        64,
+                    )
+                },
+                -1
+            );
+        }
+        let flagged = b"a\x1fb\x1fdesc";
+        assert_eq!(
+            unsafe {
+                nntmux_w34_release_naming_regex_normalize_rule(
+                    1,
+                    1,
+                    1,
+                    flagged.as_ptr(),
+                    flagged.len(),
+                    target.as_mut_ptr(),
+                    64,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_w34_category_regex_normalize_rule(
+                    1,
+                    1,
+                    1,
+                    2,
+                    flagged.as_ptr(),
+                    flagged.len(),
+                    target.as_mut_ptr(),
+                    64,
+                )
+            },
+            -1
+        );
+    }
+
+    #[test]
+    fn release_regex_link_and_ingestion_rules() {
+        assert_eq!(
+            release_regex_link(10, 0, -3),
+            ([10, 0, 0], [false, false, true], "10:0:0".to_owned())
+        );
+        let out =
+            call(|buf, cap| unsafe { nntmux_w34_release_regex_normalize_link(5, 6, 7, buf, cap) });
+        assert_eq!(out, b"5\x1f6\x1f7\x1f1\x1f1\x1f1\x1f5:6:7");
+        assert_eq!(
+            ingestion_release_rules(95, 1, 0, 0, 2, 48, 2, 0, 1, 100_000),
+            (
+                [95, 1, 0, 0, 1, 7200, 172_800, 7200, 1, 0, 100_000],
+                "posts"
+            )
+        );
+        assert_eq!(
+            ingestion_release_rules(i64::MAX, i64::MIN, 10, 5, i64::MAX, -1, 3, 1, 0, 9),
+            (
+                [100, 0, 10, 5, 0, 3_153_600_000, 0, 10_800, 0, 1, 1],
+                "days"
+            )
+        );
+        let out = call(|buf, cap| unsafe {
+            nntmux_w34_ingestion_configuration_normalize_release_rules(
+                95, 1, 0, 0, 2, 48, 2, 1, 40_000, 7, buf, cap,
+            )
+        });
+        assert_eq!(
+            out,
+            b"95\x1f1\x1f0\x1f0\x1f1\x1f7200\x1f172800\x1f7200\x1f1\x1f1\x1fdays\x1f36500"
+        );
+    }
+
+    #[test]
+    fn exports_reject_bad_regions_and_leave_short_output_untouched() {
+        let input = b"grp\x1f/x/\x1fdesc";
+        let mut target = vec![0xab_u8; 64];
+        unsafe {
+            let needed = nntmux_w34_collection_regex_normalize_rule(
+                1,
+                1,
+                0,
+                input.as_ptr(),
+                input.len(),
+                target.as_mut_ptr(),
+                0,
+            );
+            assert!(needed < -1);
+            for capacity in [1, (-needed) as usize - 1] {
+                assert_eq!(
+                    nntmux_w34_collection_regex_normalize_rule(
+                        1,
+                        1,
+                        0,
+                        input.as_ptr(),
+                        input.len(),
+                        target.as_mut_ptr(),
+                        capacity,
+                    ),
+                    needed
+                );
+                assert!(target.iter().all(|byte| *byte == 0xab));
+            }
+            assert_eq!(
+                nntmux_w34_collection_regex_normalize_rule(
+                    1,
+                    1,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    target.as_mut_ptr(),
+                    64
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_w34_release_naming_regex_normalize_rule(
+                    1,
+                    1,
+                    0,
+                    input.as_ptr(),
+                    usize::MAX,
+                    target.as_mut_ptr(),
+                    64
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_w34_category_regex_normalize_rule(
+                    1,
+                    1,
+                    1,
+                    2,
+                    input.as_ptr(),
+                    input.len(),
+                    target.as_mut_ptr(),
+                    64
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_w34_category_regex_normalize_rule(
+                    1,
+                    1,
+                    1,
+                    0,
+                    input.as_ptr(),
+                    input.len(),
+                    std::ptr::null_mut(),
+                    64
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_w34_release_regex_normalize_link(1, 1, 1, std::ptr::null_mut(), 64),
+                -1
+            );
+            assert_eq!(
+                nntmux_w34_ingestion_configuration_normalize_release_rules(
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    std::ptr::null_mut(),
+                    64
+                ),
+                -1
+            );
+            assert_eq!(
+                nntmux_w34_release_regex_normalize_link(1, 1, 1, target.as_mut_ptr(), 3),
+                -17
+            );
+            assert!(target.iter().all(|byte| *byte == 0xab));
+        }
+    }
+}
