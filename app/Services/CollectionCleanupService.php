@@ -964,4 +964,236 @@ class CollectionCleanupService
     {
         return array_sum($counts);
     }
+
+    public const string W401_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w401_collection_cleaning_remover_blacklist(uint32_t operation, uint32_t flags, const char *input, size_t input_len, char *out_buf, size_t out_cap);
+        C;
+
+    /**
+     * Rust is the default for summarizeCleanupRetentionBatch(): the paired benchmark in
+     * tests/Unit/RustCollectionCleaningRemoverBlacklistHandlerW40ParityTest.php clears 1.5x on every workload.
+     */
+    public const bool W401_RUST_FFI_DEFAULT = true;
+
+    private const int W401_RUST_MAX_INPUT = 16_777_216;
+
+    /** Filecheck statuses deleteRetentionBandExceptReady() keeps: the in-progress statuses, sized rows and 10. */
+    private const array W401_READY_STATUSES = [CollectionFileCheckStatus::Default->value, CollectionFileCheckStatus::CompleteCollection->value,
+        CollectionFileCheckStatus::CompleteParts->value, CollectionFileCheckStatus::TempComplete->value, CollectionFileCheckStatus::ZeroPart->value,
+        CollectionFileCheckStatus::Sized->value, 10];
+
+    private const array W401_RETENTION_KEYS = ['rows', 'invalid_rows', 'expired', 'ready_protected', 'active_window', 'invalid_timestamp'];
+
+    private static ?bool $w401UseRustFfi = null;
+
+    private static FFI|false|null $w401Ffi = null;
+
+    /**
+     * Buckets collection cleanup rows (`dateadded`, `filecheck`) against `$nowUnix` (negative values read as 0): rows added
+     * less than `$retentionHours` ago are in the active window; older rows are ready-protected when the retention band keeps
+     * their filecheck status and expired otherwise. A `dateadded` that is not a non-negative Unix time or a
+     * `YYYY-MM-DD[ HH:MM:SS]` UTC string counts as an invalid timestamp; non-array rows are invalid rows.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeCleanupRetentionBatch(array $rows, int $nowUnix, int $retentionHours = 48): array
+    {
+        return (self::usesW401RustFfi() ? self::summarizeCleanupRetentionBatchNative($rows, $nowUnix, $retentionHours) : null)
+            ?? self::summarizeCleanupRetentionBatchPhp($rows, $nowUnix, $retentionHours);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    private static function summarizeCleanupRetentionBatchPhp(array $rows, int $nowUnix, int $retentionHours): array
+    {
+        $now = max(0, $nowUnix);
+        $threshold = $retentionHours <= 0 ? 0 : ($retentionHours > intdiv(PHP_INT_MAX, 3_600) ? PHP_INT_MAX : $retentionHours * 3_600);
+        $summary = array_fill_keys(self::W401_RETENTION_KEYS, 0);
+        $summary['rows'] = count($rows);
+        foreach ($rows as $row) {
+            if (! is_array($row)) {
+                $summary['invalid_rows']++;
+
+                continue;
+            }
+            $added = self::w401Timestamp($row['dateadded'] ?? null);
+            if ($added === null) {
+                $summary['invalid_timestamp']++;
+            } elseif ($now - $added < $threshold) {
+                $summary['active_window']++;
+            } elseif (in_array(self::w401Int($row['filecheck'] ?? null), self::W401_READY_STATUSES, true)) {
+                $summary['ready_protected']++;
+            } else {
+                $summary['expired']++;
+            }
+        }
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>|null
+     */
+    private static function summarizeCleanupRetentionBatchNative(array $rows, int $nowUnix, int $retentionHours): ?array
+    {
+        $words = [$nowUnix, $retentionHours, count($rows)];
+        $blob = [];
+        foreach ($rows as $row) {
+            if (is_array($row)) {
+                self::w401PackRow($words, $blob, [$row['dateadded'] ?? null, $row['filecheck'] ?? null]);
+            } else {
+                $words[] = 0;
+            }
+        }
+        $values = self::w401Invoke(self::$w401Ffi, 1, $words, $blob);
+
+        return $values !== null && count($values) === count(self::W401_RETENTION_KEYS) ? array_combine(self::W401_RETENTION_KEYS, $values) : null;
+    }
+
+    public static function useW401RustFfi(?bool $enabled): void
+    {
+        self::$w401UseRustFfi = $enabled;
+    }
+
+    public static function usesW401RustFfi(): bool
+    {
+        return self::$w401UseRustFfi ?? self::W401_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW401RustFfi(): void
+    {
+        self::$w401UseRustFfi = null;
+        self::$w401Ffi = null;
+    }
+
+    /**
+     * Wave 40.1 integer reading shared by the second-pass summaries: an int, or a string of an optional `-` and
+     * 1-18 ASCII digits; anything else (floats, bools, other strings) is null.
+     */
+    public static function w401Int(mixed $value): ?int
+    {
+        if (is_int($value)) {
+            return $value;
+        }
+        if (! is_string($value)) {
+            return null;
+        }
+        $digits = $value !== '' && $value[0] === '-' ? substr($value, 1) : $value;
+        $length = strlen($digits);
+
+        return $length >= 1 && $length <= 18 && strspn($digits, '0123456789') === $length ? (int) $value : null;
+    }
+
+    /**
+     * A non-negative int, or a `YYYY-MM-DD[ HH:MM:SS]` string read as UTC (year 1970+, month 1-12, day 1-31,
+     * time fields in range; days past a month's end roll over arithmetically).
+     */
+    public static function w401Timestamp(mixed $value): ?int
+    {
+        if (is_int($value)) {
+            return $value >= 0 ? $value : null;
+        }
+        $length = is_string($value) ? strlen($value) : 0;
+        if (! is_string($value) || ($length !== 10 && $length !== 19)) {
+            return null;
+        }
+        $long = $length === 19;
+        if ($value[4] !== '-' || $value[7] !== '-' || ($long && ($value[10] !== ' ' || $value[13] !== ':' || $value[16] !== ':'))) {
+            return null;
+        }
+        $digits = substr($value, 0, 4).substr($value, 5, 2).substr($value, 8, 2).($long ? substr($value, 11, 2).substr($value, 14, 2).substr($value, 17, 2) : '000000');
+        if (strspn($digits, '0123456789') !== 14) {
+            return null;
+        }
+        [$year, $month, $day, $hour, $minute, $second] = [(int) substr($digits, 0, 4), (int) substr($digits, 4, 2), (int) substr($digits, 6, 2),
+            (int) substr($digits, 8, 2), (int) substr($digits, 10, 2), (int) substr($digits, 12, 2)];
+        if ($year < 1970 || $month < 1 || $month > 12 || $day < 1 || $day > 31 || $hour > 23 || $minute > 59 || $second > 59) {
+            return null;
+        }
+        $y = $year - ($month <= 2 ? 1 : 0);
+        $era = intdiv($y, 400);
+        $yearOfEra = $y - $era * 400;
+        $dayOfEra = $yearOfEra * 365 + intdiv($yearOfEra, 4) - intdiv($yearOfEra, 100) + intdiv(153 * (($month + 9) % 12) + 2, 5) + $day - 1;
+
+        return ($era * 146_097 + $dayOfEra - 719_468) * 86_400 + $hour * 3_600 + $minute * 60 + $second;
+    }
+
+    /**
+     * Appends an array row to a Wave 40.1 frame: marker 1, then per value its string length (bytes to the blob),
+     * -2 and the int, -3 and a float's 8 bytes, or -1.
+     *
+     * @param  list<int>  $words
+     * @param  list<string>  $blob
+     * @param  list<mixed>  $values
+     */
+    public static function w401PackRow(array &$words, array &$blob, array $values): void
+    {
+        $words[] = 1;
+        foreach ($values as $value) {
+            if (is_string($value)) {
+                $words[] = strlen($value);
+                $blob[] = $value;
+            } elseif (is_int($value)) {
+                $words[] = -2;
+                $words[] = $value;
+            } elseif (is_float($value)) {
+                $words[] = -3;
+                $blob[] = pack('d', $value);
+            } else {
+                $words[] = -1;
+            }
+        }
+    }
+
+    /**
+     * Calls the Wave 40.1 export with a frame, retrying once with a larger scratch buffer when it reports
+     * `-required`; `$ffi` is the caller's cached library handle. Returns the decoded ints or null to fall back.
+     *
+     * @param  list<int>  $words
+     * @param  list<string>  $blob
+     * @return list<int>|null
+     */
+    public static function w401Invoke(FFI|false|null &$ffi, int $operation, array $words, array $blob): ?array
+    {
+        $input = pack('q', count($words)).pack('q*', ...$words).implode('', $blob);
+        if (strlen($input) > self::W401_RUST_MAX_INPUT) {
+            return null;
+        }
+        try {
+            $ffi ??= RustPipelineLibrary::resolveDomain('cleaning_w401', self::W401_FFI_CDEF) ?? false;
+            if ($ffi === false) {
+                return null;
+            }
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, 1024, $capacity);
+            if ($buffer === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w401_collection_cleaning_remover_blacklist($operation, 0, $input, strlen($input), $buffer, $capacity);
+            if (is_int($written) && $written < -1) {
+                if (-$written <= $capacity || -$written > self::W401_RUST_MAX_INPUT) {
+                    return null;
+                }
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w401_collection_cleaning_remover_blacklist($operation, 0, $input, strlen($input), $buffer, $capacity);
+            }
+            if (! is_int($written) || $written <= 0 || $written > $capacity || $written % 8 !== 0) {
+                return null;
+            }
+            $values = unpack('q*', FFI::string($buffer, $written));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }

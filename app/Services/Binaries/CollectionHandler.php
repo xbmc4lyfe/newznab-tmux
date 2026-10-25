@@ -6,6 +6,7 @@ namespace App\Services\Binaries;
 
 use App\Enums\CollectionFileCheckStatus;
 use App\Models\Collection;
+use App\Services\CollectionCleanupService;
 use App\Services\CollectionsCleaningService;
 use App\Services\XrefService;
 use App\Support\RustPipelineLibrary;
@@ -888,5 +889,98 @@ final class CollectionHandler
         } catch (Throwable) {
             return null;
         }
+    }
+
+    /**
+     * PHP stays the default for summarizeCollectionUpsertBatch(): the paired benchmark in
+     * tests/Unit/RustCollectionCleaningRemoverBlacklistHandlerW40ParityTest.php does not clear 1.5x.
+     */
+    public const bool W401_RUST_FFI_DEFAULT = false;
+
+    private const array W401_UPSERT_KEYS = ['collections', 'invalid_rows', 'valid', 'oversized_parts', 'missing_subject', 'total_expected_parts'];
+
+    private static ?bool $w401UseRustFfi = null;
+
+    private static FFI|false|null $w401Ffi = null;
+
+    /**
+     * Summarizes collection upsert payloads (`subject`, `totalfiles`): a subject that is not a string or trim()s to '' is
+     * missing, a positive part count above `$maxPartsPerCollection` is oversized, and payloads with a subject and 1 to
+     * `$maxPartsPerCollection` parts are valid. Positive part counts add to the expected total (saturating at PHP_INT_MAX);
+     * non-array payloads are invalid.
+     *
+     * @param  array<array-key, mixed>  $collections
+     * @return array<string, int>
+     */
+    public static function summarizeCollectionUpsertBatch(array $collections, int $maxPartsPerCollection = 50000): array
+    {
+        return (self::usesW401RustFfi() ? self::summarizeCollectionUpsertBatchNative($collections, $maxPartsPerCollection) : null)
+            ?? self::summarizeCollectionUpsertBatchPhp($collections, $maxPartsPerCollection);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $collections
+     * @return array<string, int>
+     */
+    private static function summarizeCollectionUpsertBatchPhp(array $collections, int $maxParts): array
+    {
+        $summary = array_fill_keys(self::W401_UPSERT_KEYS, 0);
+        $summary['collections'] = \count($collections);
+        foreach ($collections as $collection) {
+            if (! \is_array($collection)) {
+                $summary['invalid_rows']++;
+
+                continue;
+            }
+            $subject = $collection['subject'] ?? null;
+            $missing = ! \is_string($subject) || trim($subject) === '';
+            $parts = CollectionCleanupService::w401Int($collection['totalfiles'] ?? null) ?? 0;
+            $oversized = $parts > 0 && $parts > $maxParts;
+            if ($parts > 0) {
+                $total = $summary['total_expected_parts'];
+                $summary['total_expected_parts'] = $parts > PHP_INT_MAX - $total ? PHP_INT_MAX : $total + $parts;
+            }
+            $summary['missing_subject'] += (int) $missing;
+            $summary['oversized_parts'] += (int) $oversized;
+            $summary['valid'] += (int) (! $missing && $parts > 0 && ! $oversized);
+        }
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $collections
+     * @return array<string, int>|null
+     */
+    private static function summarizeCollectionUpsertBatchNative(array $collections, int $maxParts): ?array
+    {
+        $words = [$maxParts, \count($collections)];
+        $blob = [];
+        foreach ($collections as $collection) {
+            if (\is_array($collection)) {
+                CollectionCleanupService::w401PackRow($words, $blob, [$collection['subject'] ?? null, $collection['totalfiles'] ?? null]);
+            } else {
+                $words[] = 0;
+            }
+        }
+        $values = CollectionCleanupService::w401Invoke(self::$w401Ffi, 5, $words, $blob);
+
+        return $values !== null && \count($values) === \count(self::W401_UPSERT_KEYS) ? array_combine(self::W401_UPSERT_KEYS, $values) : null;
+    }
+
+    public static function useW401RustFfi(?bool $enabled): void
+    {
+        self::$w401UseRustFfi = $enabled;
+    }
+
+    public static function usesW401RustFfi(): bool
+    {
+        return self::$w401UseRustFfi ?? self::W401_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW401RustFfi(): void
+    {
+        self::$w401UseRustFfi = null;
+        self::$w401Ffi = null;
     }
 }

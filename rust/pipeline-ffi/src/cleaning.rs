@@ -26670,7 +26670,7 @@ pub mod wave39_1_admin_regex_category_release_blacklist {
             }
         }
 
-        fn str(self) -> Option<&'a [u8]> {
+        pub(crate) fn str(self) -> Option<&'a [u8]> {
             match self {
                 Value::Str(s) => Some(s),
                 _ => None,
@@ -26678,7 +26678,7 @@ pub mod wave39_1_admin_regex_category_release_blacklist {
         }
     }
 
-    struct Frame<'a> {
+    pub(crate) struct Frame<'a> {
         words: &'a [u8],
         word: usize,
         blob: &'a [u8],
@@ -26686,7 +26686,7 @@ pub mod wave39_1_admin_regex_category_release_blacklist {
     }
 
     impl<'a> Frame<'a> {
-        fn new(bytes: &'a [u8]) -> Option<Self> {
+        pub(crate) fn new(bytes: &'a [u8]) -> Option<Self> {
             let count =
                 usize::try_from(i64::from_ne_bytes(bytes.get(..8)?.try_into().ok()?)).ok()?;
             let end = count.checked_mul(8)?.checked_add(8)?;
@@ -26698,7 +26698,7 @@ pub mod wave39_1_admin_regex_category_release_blacklist {
             })
         }
 
-        fn int(&mut self) -> Option<i64> {
+        pub(crate) fn int(&mut self) -> Option<i64> {
             let start = self.word.checked_mul(8)?;
             let chunk = self.words.get(start..start.checked_add(8)?)?;
             self.word += 1;
@@ -26712,7 +26712,7 @@ pub mod wave39_1_admin_regex_category_release_blacklist {
             Some(value)
         }
 
-        fn value(&mut self) -> Option<Value<'a>> {
+        pub(crate) fn value(&mut self) -> Option<Value<'a>> {
             Some(match self.int()? {
                 -1 => Value::Other,
                 -2 => Value::Int(self.int()?),
@@ -26723,7 +26723,7 @@ pub mod wave39_1_admin_regex_category_release_blacklist {
         }
 
         /// A row marker: whether the row is an array.
-        fn row(&mut self) -> Option<bool> {
+        pub(crate) fn row(&mut self) -> Option<bool> {
             match self.int()? {
                 0 => Some(false),
                 1 => Some(true),
@@ -26732,12 +26732,12 @@ pub mod wave39_1_admin_regex_category_release_blacklist {
         }
 
         /// A row count; every row needs at least its marker word.
-        fn count(&mut self) -> Option<usize> {
+        pub(crate) fn count(&mut self) -> Option<usize> {
             let count = usize::try_from(self.int()?).ok()?;
             (count <= self.words.len() / 8 - self.word).then_some(count)
         }
 
-        fn done(&self) -> bool {
+        pub(crate) fn done(&self) -> bool {
             self.word * 8 == self.words.len() && self.at == self.blob.len()
         }
     }
@@ -27720,5 +27720,540 @@ mod wave39_1_admin_regex_category_release_blacklist_tests {
                 .concat()[..]
         );
         assert_eq!(&out[80..], &[0x5a; 16]);
+    }
+}
+
+// Wave 40.1: second-pass summaries for collection retention cleanup rows, release-cleaner pass
+// telemetry, release-remover candidate batches, blacklist evaluation outcomes and collection
+// upsert payloads. Frames use the Wave 39.1 encoding: an i64 word count, that many native-endian
+// i64 words and a byte blob, with one array/other marker per row followed by its values.
+pub mod wave40_1_collection_cleaning_remover_blacklist {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    use super::php_trim_ascii;
+    use super::wave39_1_admin_regex_category_release_blacklist::{Frame, timestamp};
+
+    pub const DECLINE: isize = -1;
+    pub const MAX_INPUT: usize = 16 * 1024 * 1024;
+
+    pub const OP_CLEANUP_RETENTION: u32 = 1;
+    pub const OP_CLEANER_TELEMETRY: u32 = 2;
+    pub const OP_REMOVAL_CANDIDATES: u32 = 3;
+    pub const OP_BLACKLIST_EVALUATION: u32 = 4;
+    pub const OP_COLLECTION_UPSERT: u32 = 5;
+
+    /// Filecheck statuses the retention band keeps: in progress (0, 1, 2, 15, 16), sized (3) and 10.
+    const READY_STATUSES: [i64; 7] = [0, 1, 2, 15, 16, 3, 10];
+
+    fn with_total(count: usize, counts: &[i64]) -> Vec<i64> {
+        let mut out = Vec::with_capacity(counts.len() + 1);
+        out.push(count as i64);
+        out.extend_from_slice(counts);
+        out
+    }
+
+    /// `CollectionCleanupService::summarizeCleanupRetentionBatchPhp()`.
+    fn cleanup_retention(frame: &mut Frame) -> Option<Vec<i64>> {
+        let now = frame.int()?.max(0);
+        let hours = frame.int()?;
+        let count = frame.count()?;
+        let threshold = if hours <= 0 {
+            0
+        } else {
+            hours.checked_mul(3_600).unwrap_or(i64::MAX)
+        };
+        let mut counts = [0_i64; 5];
+        let [invalid, expired, protected, active, bad_time] = &mut counts;
+        for _ in 0..count {
+            if !frame.row()? {
+                *invalid += 1;
+                continue;
+            }
+            let (added, filecheck) = (frame.value()?, frame.value()?);
+            let Some(added) = timestamp(added) else {
+                *bad_time += 1;
+                continue;
+            };
+            if now - added < threshold {
+                *active += 1;
+            } else if filecheck
+                .int()
+                .is_some_and(|status| READY_STATUSES.contains(&status))
+            {
+                *protected += 1;
+            } else {
+                *expired += 1;
+            }
+        }
+        Some(with_total(count, &counts))
+    }
+
+    /// `ReleaseCleaningService::summarizeCleanerPassTelemetryPhp()`.
+    fn cleaner_telemetry(frame: &mut Frame) -> Option<Vec<i64>> {
+        let count = frame.count()?;
+        let mut counts = [0_i64; 5];
+        let [invalid, changed, unchanged, empty, stripped] = &mut counts;
+        for _ in 0..count {
+            if !frame.row()? {
+                *invalid += 1;
+                continue;
+            }
+            let (before, after) = (frame.value()?, frame.value()?);
+            let (Some(before), Some(after)) = (before.str(), after.str()) else {
+                *invalid += 1;
+                continue;
+            };
+            if before == after {
+                *unchanged += 1;
+            } else {
+                *changed += 1;
+            }
+            *empty += i64::from(php_trim_ascii(after).is_empty());
+            *stripped += before.len().saturating_sub(after.len()) as i64;
+        }
+        Some(with_total(count, &counts))
+    }
+
+    /// `w401Gibberish()`: 15+ bytes that are all ASCII alphanumerics, or any run of 25 of them —
+    /// the release remover's gibberish and hashed searchname patterns.
+    pub fn gibberish(name: &[u8]) -> bool {
+        if name.len() >= 15 && name.iter().all(u8::is_ascii_alphanumeric) {
+            return true;
+        }
+        let mut run = 0_usize;
+        for byte in name {
+            run = if byte.is_ascii_alphanumeric() {
+                run + 1
+            } else {
+                0
+            };
+            if run >= 25 {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// `ReleaseRemoverService::summarizeRemovalCandidateBatchPhp()`.
+    fn removal_candidates(frame: &mut Frame) -> Option<Vec<i64>> {
+        let min_size = frame.int()?;
+        let count = frame.count()?;
+        let mut counts = [0_i64; 5];
+        let [invalid, undersized, junk, passworded, eligible] = &mut counts;
+        for _ in 0..count {
+            if !frame.row()? {
+                *invalid += 1;
+                continue;
+            }
+            let (size, name, password) = (frame.value()?, frame.value()?, frame.value()?);
+            let small = size.int().is_some_and(|size| size < min_size);
+            let hashed = name.str().is_some_and(gibberish);
+            let locked = password.int().is_some_and(|status| status >= 1);
+            *undersized += i64::from(small);
+            *junk += i64::from(hashed);
+            *passworded += i64::from(locked);
+            *eligible += i64::from(small || hashed || locked);
+        }
+        Some(with_total(count, &counts))
+    }
+
+    /// `BlacklistService::summarizeBlacklistEvaluationWindowPhp()`.
+    fn blacklist_evaluation(frame: &mut Frame) -> Option<Vec<i64>> {
+        let max_rule = frame.int()?;
+        let count = frame.count()?;
+        let mut counts = [0_i64; 6];
+        let mut rules = Vec::new();
+        {
+            let [invalid, white, black, skipped, unmatched, _] = &mut counts;
+            for _ in 0..count {
+                if !frame.row()? {
+                    *invalid += 1;
+                    continue;
+                }
+                let (status, optype, rule) = (frame.value()?, frame.value()?, frame.value()?);
+                if status.int() != Some(1) {
+                    *skipped += 1;
+                    continue;
+                }
+                match optype.int() {
+                    Some(1) => *black += 1,
+                    Some(2) => *white += 1,
+                    _ => {
+                        *unmatched += 1;
+                        continue;
+                    }
+                }
+                if let Some(id) = rule.int().filter(|id| (1..=max_rule).contains(id)) {
+                    rules.push(id);
+                }
+            }
+        }
+        rules.sort_unstable();
+        rules.dedup();
+        counts[5] = rules.len() as i64;
+        Some(with_total(count, &counts))
+    }
+
+    /// `CollectionHandler::summarizeCollectionUpsertBatchPhp()`.
+    fn collection_upsert(frame: &mut Frame) -> Option<Vec<i64>> {
+        let max_parts = frame.int()?;
+        let count = frame.count()?;
+        let mut counts = [0_i64; 5];
+        let [invalid, valid, oversized, missing, total] = &mut counts;
+        for _ in 0..count {
+            if !frame.row()? {
+                *invalid += 1;
+                continue;
+            }
+            let (subject, parts) = (frame.value()?, frame.value()?);
+            let no_subject = subject
+                .str()
+                .is_none_or(|subject| php_trim_ascii(subject).is_empty());
+            let parts = parts.int().unwrap_or(0);
+            let too_many = parts > 0 && parts > max_parts;
+            if parts > 0 {
+                *total = total.saturating_add(parts);
+            }
+            *missing += i64::from(no_subject);
+            *oversized += i64::from(too_many);
+            *valid += i64::from(!no_subject && parts > 0 && !too_many);
+        }
+        Some(with_total(count, &counts))
+    }
+
+    pub fn compute(operation: u32, flags: u32, bytes: &[u8]) -> Option<Vec<u8>> {
+        if flags != 0 {
+            return None;
+        }
+        let mut frame = Frame::new(bytes)?;
+        let values = match operation {
+            OP_CLEANUP_RETENTION => cleanup_retention(&mut frame)?,
+            OP_CLEANER_TELEMETRY => cleaner_telemetry(&mut frame)?,
+            OP_REMOVAL_CANDIDATES => removal_candidates(&mut frame)?,
+            OP_BLACKLIST_EVALUATION => blacklist_evaluation(&mut frame)?,
+            OP_COLLECTION_UPSERT => collection_upsert(&mut frame)?,
+            _ => return None,
+        };
+        if !frame.done() || values.len().checked_mul(8)? > MAX_INPUT {
+            return None;
+        }
+        Some(values.iter().flat_map(|v| v.to_ne_bytes()).collect())
+    }
+
+    /// Returns bytes written, `-required` when `out_cap` is too small, or -1 for an unknown
+    /// operation, a nonzero flag word, a malformed frame, invalid/overlapping pointer ranges or a
+    /// caught panic. Negative returns never modify `out_buf`; the caller owns both buffers.
+    ///
+    /// # Safety
+    /// `input` must be readable for `input_len` bytes and `out_buf` writable for `out_cap`
+    /// bytes. Both pointers must be nonnull and the ranges must not overlap.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w401_collection_cleaning_remover_blacklist(
+        operation: u32,
+        flags: u32,
+        input: *const u8,
+        input_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !(OP_CLEANUP_RETENTION..=OP_COLLECTION_UPSERT).contains(&operation)
+                || flags != 0
+                || input.is_null()
+                || out_buf.is_null()
+                || input_len > MAX_INPUT
+                || out_cap > isize::MAX as usize
+            {
+                return DECLINE;
+            }
+            let Some(input_end) = (input as usize).checked_add(input_len) else {
+                return DECLINE;
+            };
+            let Some(out_end) = (out_buf as usize).checked_add(out_cap) else {
+                return DECLINE;
+            };
+            if input_len != 0
+                && out_cap != 0
+                && (input as usize) < out_end
+                && (out_buf as usize) < input_end
+            {
+                return DECLINE;
+            }
+            let bytes = if input_len == 0 {
+                &[][..]
+            } else {
+                unsafe { slice::from_raw_parts(input, input_len) }
+            };
+            let Some(result) = compute(operation, flags, bytes) else {
+                return DECLINE;
+            };
+            if result.len() > out_cap {
+                return -(result.len() as isize);
+            }
+            unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), out_buf, result.len()) };
+            result.len() as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+}
+
+#[cfg(test)]
+mod wave40_1_collection_cleaning_remover_blacklist_tests {
+    use super::wave39_1_admin_regex_category_release_blacklist::Value;
+    use super::wave40_1_collection_cleaning_remover_blacklist::*;
+
+    #[derive(Default)]
+    struct Builder {
+        words: Vec<i64>,
+        blob: Vec<u8>,
+    }
+
+    impl Builder {
+        fn int(mut self, value: i64) -> Self {
+            self.words.push(value);
+            self
+        }
+
+        fn value(mut self, value: Value) -> Self {
+            match value {
+                Value::Other => self.words.push(-1),
+                Value::Int(v) => self.words.extend([-2, v]),
+                Value::Float(v) => {
+                    self.words.push(-3);
+                    self.blob.extend(v.to_ne_bytes());
+                }
+                Value::Str(s) => {
+                    self.words.push(s.len() as i64);
+                    self.blob.extend_from_slice(s);
+                }
+            }
+            self
+        }
+
+        fn row(self, fields: &[Value]) -> Self {
+            fields.iter().fold(self.int(1), |b, v| b.value(*v))
+        }
+
+        fn build(&self) -> Vec<u8> {
+            let mut out = (self.words.len() as i64).to_ne_bytes().to_vec();
+            out.extend(self.words.iter().flat_map(|w| w.to_ne_bytes()));
+            out.extend_from_slice(&self.blob);
+            out
+        }
+    }
+
+    fn run(operation: u32, builder: &Builder) -> Vec<i64> {
+        compute(operation, 0, &builder.build())
+            .expect("frame accepted")
+            .chunks(8)
+            .map(|c| i64::from_ne_bytes(c.try_into().unwrap()))
+            .collect()
+    }
+
+    use Value::{Float, Int, Other, Str};
+
+    const NOW: i64 = 1_792_931_696;
+
+    #[test]
+    fn w401_cleanup_retention_buckets_rows() {
+        let frame = Builder::default()
+            .int(NOW)
+            .int(48)
+            .int(7)
+            .row(&[Int(NOW - 3_600), Int(5)])
+            .row(&[Int(NOW - 48 * 3_600), Int(5)])
+            .row(&[Str(b"2020-01-01 00:00:00"), Str(b"3")])
+            .row(&[Str(b"2020-01-01"), Int(10)])
+            .row(&[Str(b"bogus"), Int(5)])
+            .int(0)
+            .row(&[Int(-1), Other]);
+        assert_eq!(run(OP_CLEANUP_RETENTION, &frame), [7, 1, 1, 2, 1, 2]);
+        let zero = Builder::default()
+            .int(-5)
+            .int(0)
+            .int(1)
+            .row(&[Int(0), Float(3.0)]);
+        assert_eq!(run(OP_CLEANUP_RETENTION, &zero), [1, 0, 1, 0, 0, 0]);
+        let huge = Builder::default()
+            .int(NOW)
+            .int(i64::MAX)
+            .int(1)
+            .row(&[Int(0), Other]);
+        assert_eq!(run(OP_CLEANUP_RETENTION, &huge), [1, 0, 0, 0, 1, 0]);
+    }
+
+    #[test]
+    fn w401_cleaner_telemetry_counts_pairs() {
+        let frame = Builder::default()
+            .int(6)
+            .row(&[Str(b"[1/2] - \"A.rar\" yEnc"), Str(b"A")])
+            .row(&[Str(b"Same"), Str(b"Same")])
+            .row(&[Str(b"x"), Str(b" \t\0")])
+            .row(&[Str(b""), Str(b"grow")])
+            .row(&[Str(b"x"), Other])
+            .int(0);
+        assert_eq!(run(OP_CLEANER_TELEMETRY, &frame), [6, 2, 3, 1, 1, 19]);
+        let ints = Builder::default().int(1).row(&[Int(1), Str(b"1")]);
+        assert_eq!(run(OP_CLEANER_TELEMETRY, &ints), [1, 1, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn w401_gibberish_matches_remover_patterns() {
+        assert!(gibberish(b"abcdefghij12345"));
+        assert!(!gibberish(b"abcdefghij1234"));
+        assert!(!gibberish(b"abcdefghij12345 "));
+        assert!(gibberish(b"x.abcdefghijklmnopqrstuvwxy.z"));
+        assert!(!gibberish(b"x.abcdefghijklmnopqrstuvwx.z"));
+        assert!(!gibberish(b""));
+        assert!(!gibberish("ÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄ".as_bytes()));
+    }
+
+    #[test]
+    fn w401_removal_candidates_flag_rows() {
+        let frame = Builder::default()
+            .int(1_048_576)
+            .int(5)
+            .row(&[Int(10), Str(b"Release.Name"), Int(0)])
+            .row(&[
+                Str(b"2000000"),
+                Str(b"abcdefghijklmnopqrstuvwxyz"),
+                Str(b"1"),
+            ])
+            .row(&[Float(1.0), Other, Int(2)])
+            .row(&[Int(2_000_000), Str(b"Fine.Name-GRP"), Int(-1)])
+            .int(0);
+        assert_eq!(run(OP_REMOVAL_CANDIDATES, &frame), [5, 1, 1, 1, 2, 3]);
+    }
+
+    #[test]
+    fn w401_blacklist_evaluation_counts_distinct_rules() {
+        let frame = Builder::default()
+            .int(100)
+            .int(8)
+            .row(&[Int(1), Int(1), Int(7)])
+            .row(&[Str(b"1"), Str(b"1"), Str(b"7")])
+            .row(&[Int(1), Int(2), Int(9)])
+            .row(&[Int(1), Int(2), Int(101)])
+            .row(&[Int(0), Int(1), Int(3)])
+            .row(&[Int(1), Int(3), Int(4)])
+            .row(&[Int(1), Int(1), Int(0)])
+            .int(0);
+        assert_eq!(run(OP_BLACKLIST_EVALUATION, &frame), [8, 1, 2, 3, 1, 1, 2]);
+    }
+
+    #[test]
+    fn w401_collection_upsert_validates_payloads() {
+        let frame = Builder::default()
+            .int(100)
+            .int(6)
+            .row(&[Str(b"Subject"), Int(10)])
+            .row(&[Str(b" \n"), Int(5)])
+            .row(&[Str(b"Big"), Str(b"101")])
+            .row(&[Other, Int(0)])
+            .row(&[Str(b"Zero"), Str(b"x")])
+            .int(0);
+        assert_eq!(run(OP_COLLECTION_UPSERT, &frame), [6, 1, 1, 1, 2, 116]);
+        let saturate = Builder::default()
+            .int(i64::MAX)
+            .int(2)
+            .row(&[Str(b"a"), Int(i64::MAX)])
+            .row(&[Str(b"b"), Int(1)]);
+        assert_eq!(
+            run(OP_COLLECTION_UPSERT, &saturate),
+            [2, 0, 2, 0, 0, i64::MAX]
+        );
+    }
+
+    #[test]
+    fn w401_malformed_frames_decline() {
+        let empty = Builder::default().int(0).build();
+        for operation in [0, 6, u32::MAX] {
+            assert!(compute(operation, 0, &empty).is_none());
+        }
+        assert!(compute(OP_CLEANER_TELEMETRY, 1, &empty).is_none());
+        assert!(compute(OP_CLEANER_TELEMETRY, 0, &[]).is_none());
+        assert!(compute(OP_CLEANER_TELEMETRY, 0, &i64::MAX.to_ne_bytes()).is_none());
+        assert!(compute(OP_CLEANER_TELEMETRY, 0, &Builder::default().int(-1).build()).is_none());
+        assert!(
+            compute(
+                OP_CLEANER_TELEMETRY,
+                0,
+                &Builder::default().int(2).int(0).build()
+            )
+            .is_none()
+        );
+        assert!(
+            compute(
+                OP_CLEANER_TELEMETRY,
+                0,
+                &Builder::default().int(1).int(2).build()
+            )
+            .is_none()
+        );
+        let mut trailing = empty.clone();
+        trailing.push(0);
+        assert!(compute(OP_CLEANER_TELEMETRY, 0, &trailing).is_none());
+        let short = Builder::default().int(1).int(1).int(5).int(-1).build();
+        assert!(compute(OP_CLEANER_TELEMETRY, 0, &short).is_none());
+        let bad_tag = Builder::default().int(1).int(1).int(-9).int(-1).build();
+        assert!(compute(OP_CLEANER_TELEMETRY, 0, &bad_tag).is_none());
+        let missing_header = Builder::default().int(0).build();
+        assert!(compute(OP_CLEANUP_RETENTION, 0, &missing_header).is_none());
+        assert!(compute(OP_CLEANER_TELEMETRY, 0, &empty).is_some());
+    }
+
+    #[test]
+    fn w401_export_validates_pointers_and_capacity_without_partial_writes() {
+        let input = Builder::default().int(1).int(0).build();
+        let call = |op, flags, ptr, len, out, cap| unsafe {
+            nntmux_w401_collection_cleaning_remover_blacklist(op, flags, ptr, len, out, cap)
+        };
+        let mut out = [0x5a_u8; 64];
+        let (ptr, len) = (input.as_ptr(), input.len());
+        assert_eq!(call(2, 0, ptr, len, out.as_mut_ptr(), 47), -48);
+        assert_eq!(call(2, 0, ptr, len, out.as_mut_ptr(), 0), -48);
+        assert_eq!(call(0, 0, ptr, len, out.as_mut_ptr(), 64), DECLINE);
+        assert_eq!(call(6, 0, ptr, len, out.as_mut_ptr(), 64), DECLINE);
+        assert_eq!(call(2, 1, ptr, len, out.as_mut_ptr(), 64), DECLINE);
+        assert_eq!(
+            call(2, 0, std::ptr::null(), len, out.as_mut_ptr(), 64),
+            DECLINE
+        );
+        assert_eq!(call(2, 0, ptr, len, std::ptr::null_mut(), 64), DECLINE);
+        assert_eq!(
+            call(2, 0, ptr, MAX_INPUT + 1, out.as_mut_ptr(), 64),
+            DECLINE
+        );
+        assert_eq!(call(2, 0, ptr, len, out.as_mut_ptr(), usize::MAX), DECLINE);
+        assert_eq!(
+            call(2, 0, usize::MAX as *const u8, 16, out.as_mut_ptr(), 64),
+            DECLINE
+        );
+        assert_eq!(call(2, 0, ptr, len, usize::MAX as *mut u8, 64), DECLINE);
+        assert_eq!(call(2, 0, ptr, len - 1, out.as_mut_ptr(), 64), DECLINE);
+        assert_eq!(out, [0x5a; 64]);
+        let mut overlapping = input.clone();
+        assert_eq!(
+            call(
+                2,
+                0,
+                overlapping.as_ptr(),
+                len,
+                overlapping.as_mut_ptr(),
+                len
+            ),
+            DECLINE
+        );
+        assert_eq!(overlapping, input);
+
+        assert_eq!(call(2, 0, ptr, len, out.as_mut_ptr(), 64), 48);
+        assert_eq!(
+            &out[..48],
+            &[[1_i64, 1, 0, 0, 0, 0].map(i64::to_ne_bytes)]
+                .concat()
+                .concat()[..]
+        );
+        assert_eq!(&out[48..], &[0x5a; 16]);
     }
 }
