@@ -40004,3 +40004,935 @@ mod wave51_5_search_media_outbox_service_query_cursor {
         }
     }
 }
+
+/// Wave 52.5: batch accelerators for `NzbContentParser`, `SevenZipListingParser`,
+/// `ImageInspector`, `Par2FileMapper` and `Par2FileEntry`.
+///
+/// Every entry point takes `count` records, a byte buffer (`data`) and a
+/// little-endian i64 column (`ints`), and writes exactly `count * width` i64
+/// words to `out`. It returns the number of words written, `-needed` when
+/// `out_cap` is too small (nothing is written), or `-1` to make PHP fall back.
+mod wave52_5_nzb_sevenzip_image_inspector_par2_mapper_entry {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const DECLINE: i64 = -1;
+    /// Word PHP must recompute itself (a value the helper does not model).
+    const PATCH: i64 = -2;
+    const MAX_INPUT: usize = 64 * 1024 * 1024;
+    const MAX_RECORDS: usize = 1 << 20;
+    /// Largest integer every f64 division in `Par2FileMapper` handles exactly.
+    const MAX_EXACT: i64 = 1 << 53;
+
+    const IMAGETYPE_JPEG: i64 = 2;
+    const IMAGETYPE_PNG: i64 = 3;
+    const IMAGETYPE_WEBP: i64 = 18;
+
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> Option<bool> {
+        if a_len == 0 || b_len == 0 {
+            return Some(false);
+        }
+        let a_end = a.checked_add(a_len)?;
+        let b_end = b.checked_add(b_len)?;
+        Some(a < b_end && b < a_end)
+    }
+
+    /// Splits `data` on NUL into exactly `expected` fields.
+    fn split_fields(data: &[u8], expected: usize) -> Option<Vec<&[u8]>> {
+        if expected == 0 {
+            return data.is_empty().then(Vec::new);
+        }
+        let fields: Vec<&[u8]> = data.split(|&byte| byte == 0).collect();
+        (fields.len() == expected).then_some(fields)
+    }
+
+    fn read_ints(bytes: &[u8]) -> Option<Vec<i64>> {
+        let (chunks, tail) = bytes.as_chunks::<8>();
+        tail.is_empty().then(|| {
+            chunks
+                .iter()
+                .map(|chunk| i64::from_le_bytes(*chunk))
+                .collect()
+        })
+    }
+
+    /// Validates the shared ABI, runs `body` and copies its words to `out`.
+    ///
+    /// # Safety
+    /// See the entry points.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run(
+        count: usize,
+        flags: i64,
+        data: *const u8,
+        data_len: usize,
+        ints: *const u8,
+        ints_len: usize,
+        out: *mut i64,
+        out_cap: usize,
+        width: usize,
+        body: impl FnOnce(&[u8], &[i64], &mut Vec<i64>) -> Option<()>,
+    ) -> i64 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if flags != 0
+                || count > MAX_RECORDS
+                || data_len > MAX_INPUT
+                || ints_len > MAX_INPUT
+                || out_cap > MAX_INPUT
+                || (data.is_null() && data_len != 0)
+                || (ints.is_null() && ints_len != 0)
+                || (out.is_null() && out_cap != 0)
+                || (!out.is_null() && !out.is_aligned())
+            {
+                return DECLINE;
+            }
+            let Some(out_bytes) = out_cap.checked_mul(8) else {
+                return DECLINE;
+            };
+            for (pointer, len) in [(data as usize, data_len), (ints as usize, ints_len)] {
+                if overlaps(pointer, len, out as usize, out_bytes) != Some(false) {
+                    return DECLINE;
+                }
+            }
+            let data = if data_len == 0 || data.is_null() {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(data, data_len) }
+            };
+            let ints = if ints_len == 0 || ints.is_null() {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(ints, ints_len) }
+            };
+            let Some(table) = read_ints(ints) else {
+                return DECLINE;
+            };
+            let needed = count * width;
+            let mut words = Vec::with_capacity(needed);
+            if body(data, &table, &mut words).is_none() || words.len() != needed {
+                return DECLINE;
+            }
+            if out_cap < needed {
+                return -(needed as i64);
+            }
+            if needed > 0 {
+                unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), out, needed) };
+            }
+            needed as i64
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// PCRE `\s` without UTF/UCP: space, `\t`, `\n`, `\v`, `\f`, `\r`.
+    fn is_pcre_space(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+    }
+
+    /// PHP `trim()` default characters.
+    fn is_trim(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b)
+    }
+
+    /// Matches `(?:\s+yEnc)?(?:\s+\(\d+\/(\d+)\))?\s*$` (case-insensitive, `D`) against the
+    /// whole of `rest`; returns the second number's digits when that group took part.
+    fn subject_suffix(rest: &[u8]) -> Option<Option<&[u8]>> {
+        let spaces = |at: usize| rest[at..].iter().take_while(|&&b| is_pcre_space(b)).count();
+        let mut at = 0;
+        let lead = spaces(at);
+        if lead > 0 && rest.len() >= lead + 4 && rest[lead..lead + 4].eq_ignore_ascii_case(b"yenc")
+        {
+            let after = lead + 4;
+            // The optional groups only fail together with the trailing `\s*$`, so a yEnc
+            // that leaves no valid tail is retried as part of nothing else.
+            if let Some(found) = subject_count(rest, after) {
+                return Some(found);
+            }
+            at = 0;
+        }
+        subject_count(rest, at)
+    }
+
+    /// Matches `(?:\s+\(\d+\/(\d+)\))?\s*$` from `at` to the end of `rest`.
+    fn subject_count(rest: &[u8], at: usize) -> Option<Option<&[u8]>> {
+        let tail = &rest[at..];
+        if tail.iter().all(|&b| is_pcre_space(b)) {
+            return Some(None);
+        }
+        let lead = tail.iter().take_while(|&&b| is_pcre_space(b)).count();
+        if lead == 0 || tail.get(lead) != Some(&b'(') {
+            return None;
+        }
+        let mut pos = lead + 1;
+        let first = tail[pos..]
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        if first == 0 || tail.get(pos + first) != Some(&b'/') {
+            return None;
+        }
+        pos += first + 1;
+        let second = tail[pos..]
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        if second == 0 || tail.get(pos + second) != Some(&b')') {
+            return None;
+        }
+        let digits = &tail[pos..pos + second];
+        tail[pos + second + 1..]
+            .iter()
+            .all(|&b| is_pcre_space(b))
+            .then_some(Some(digits))
+    }
+
+    /// `(int)` of an ASCII digit run, or [`PATCH`] when it may not fit.
+    fn digits_value(digits: &[u8]) -> i64 {
+        let significant = &digits[digits.iter().take_while(|&&b| b == b'0').count()..];
+        if significant.len() > 18 {
+            return PATCH;
+        }
+        significant
+            .iter()
+            .fold(0i64, |value, &b| value * 10 + i64::from(b - b'0'))
+    }
+
+    /// `NzbContentParser::subjectNameBatch()`: `[status, name offset, name length, declared total]`.
+    fn subject_names(count: usize, data: &[u8], table: &[i64], words: &mut Vec<i64>) -> Option<()> {
+        if !table.is_empty() {
+            return None;
+        }
+        for subject in split_fields(data, count)? {
+            match subject_name(subject) {
+                Some((start, end, declared, valid)) => words.extend_from_slice(&[
+                    if valid { 2 } else { 1 },
+                    start as i64,
+                    (end - start) as i64,
+                    declared,
+                ]),
+                None => words.extend_from_slice(&[0, 0, 0, -1]),
+            }
+        }
+        Some(())
+    }
+
+    /// Returns the trimmed name span, the declared part total (or -1) and whether the
+    /// name passes `sourceFileInventoryPhp()`'s checks; None when neither pattern matches.
+    fn subject_name(subject: &[u8]) -> Option<(usize, usize, i64, bool)> {
+        let barrier = |b: u8| matches!(b, b'"' | b'\r' | b'\n');
+        let (start, end, digits) = if let Some(open) = subject.iter().position(|&b| b == b'"') {
+            // `^[^"\r\n]*"([^"\r\n]+)"` + suffix.
+            if subject[..open].iter().any(|&b| barrier(b)) {
+                return None;
+            }
+            let inner = subject[open + 1..]
+                .iter()
+                .take_while(|&&b| !barrier(b))
+                .count();
+            let close = open + 1 + inner;
+            if inner == 0 || subject.get(close) != Some(&b'"') {
+                return None;
+            }
+            (open + 1, close, subject_suffix(&subject[close + 1..])?)
+        } else {
+            // `^([^"\r\n]+?)` + suffix: the shortest prefix whose rest matches.
+            let limit = subject
+                .iter()
+                .position(|&b| barrier(b))
+                .unwrap_or(subject.len());
+            let mut found = None;
+            for split in 1..=subject.len() {
+                if split > limit {
+                    break;
+                }
+                if split < subject.len() && !is_pcre_space(subject[split]) {
+                    continue;
+                }
+                if let Some(digits) = subject_suffix(&subject[split..]) {
+                    found = Some((0, split, digits));
+                    break;
+                }
+            }
+            found?
+        };
+        let declared = digits.map_or(-1, digits_value);
+        let mut start = start;
+        let mut end = end;
+        while start < end && is_trim(subject[start]) {
+            start += 1;
+        }
+        while end > start && is_trim(subject[end - 1]) {
+            end -= 1;
+        }
+        let name = &subject[start..end];
+        let valid = !name.is_empty()
+            && name.len() <= 4096
+            && std::str::from_utf8(name).is_ok()
+            && !name
+                .iter()
+                .any(|&b| b < 0x20 || b == 0x7f || b == b'/' || b == b'\\')
+            && name[0] != b'.'
+            && name[0] != b'-';
+        Some((start, end, declared, valid))
+    }
+
+    /// `SevenZipListingParser` property names reported by ordinal.
+    const SEVENZIP_KEYS: [&[u8]; 8] = [
+        b"Path",
+        b"Size",
+        b"Modified",
+        b"Attributes",
+        b"CRC",
+        b"Encrypted",
+        b"Method",
+        b"Folder",
+    ];
+
+    /// `SevenZipListingParser::linePlanBatch()`: `[kind | key ordinal << 2, key length,
+    /// value offset, value length]`.
+    fn sevenzip_lines(
+        count: usize,
+        data: &[u8],
+        table: &[i64],
+        words: &mut Vec<i64>,
+    ) -> Option<()> {
+        if !table.is_empty() {
+            return None;
+        }
+        for raw in split_fields(data, count)? {
+            let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+            if line.iter().all(|&b| b == b' ' || b == b'\t') {
+                words.extend_from_slice(&[0, 0, 0, 0]);
+                continue;
+            }
+            let (key_len, value_at, value_len) =
+                if let Some(at) = line.windows(3).position(|w| w == b" = ") {
+                    (at, at + 3, line.len() - at - 3)
+                } else if line.ends_with(b" =") {
+                    (line.len() - 2, line.len(), 0)
+                } else {
+                    words.extend_from_slice(&[1, 0, 0, 0]);
+                    continue;
+                };
+            let key = &line[..key_len];
+            // `/^[A-Za-z][A-Za-z0-9 ()._-]*$/`: `$` also matches before a final "\n".
+            let body = key.strip_suffix(b"\n").unwrap_or(key);
+            let valid = body.first().is_some_and(u8::is_ascii_alphabetic)
+                && body.iter().all(|&b| {
+                    b.is_ascii_alphanumeric()
+                        || matches!(b, b' ' | b'(' | b')' | b'.' | b'_' | b'-')
+                });
+            let kind = if valid {
+                let ordinal = SEVENZIP_KEYS
+                    .iter()
+                    .position(|&name| name == key)
+                    .map_or(0, |index| index as i64 + 1);
+                3 | ordinal << 2
+            } else {
+                2
+            };
+            words.extend_from_slice(&[kind, key_len as i64, value_at as i64, value_len as i64]);
+        }
+        Some(())
+    }
+
+    fn be16(bytes: &[u8], at: usize) -> i64 {
+        i64::from(u16::from_be_bytes([bytes[at], bytes[at + 1]]))
+    }
+
+    fn le16(bytes: &[u8], at: usize) -> i64 {
+        i64::from(u16::from_le_bytes([bytes[at], bytes[at + 1]]))
+    }
+
+    fn le24(bytes: &[u8], at: usize) -> i64 {
+        i64::from(bytes[at]) | i64::from(bytes[at + 1]) << 8 | i64::from(bytes[at + 2]) << 16
+    }
+
+    /// `ImageInspector::headerProbeBatch()`: `[IMAGETYPE_* or 0, width, height]`.
+    fn probe_header(head: &[u8]) -> [i64; 3] {
+        let len = head.len();
+        if len >= 24 && head.starts_with(b"\x89PNG\r\n\x1a\n") && &head[12..16] == b"IHDR" {
+            let width = u32::from_be_bytes([head[16], head[17], head[18], head[19]]);
+            let height = u32::from_be_bytes([head[20], head[21], head[22], head[23]]);
+            return [IMAGETYPE_PNG, i64::from(width), i64::from(height)];
+        }
+        if len >= 30 && head.starts_with(b"RIFF") && &head[8..12] == b"WEBP" {
+            let chunk = &head[12..16];
+            if chunk == b"VP8 " && &head[23..26] == b"\x9d\x01\x2a" {
+                return [
+                    IMAGETYPE_WEBP,
+                    le16(head, 26) & 0x3fff,
+                    le16(head, 28) & 0x3fff,
+                ];
+            }
+            if chunk == b"VP8L" && head[20] == 0x2f {
+                let bits = i64::from(u32::from_le_bytes([head[21], head[22], head[23], head[24]]));
+                return [
+                    IMAGETYPE_WEBP,
+                    (bits & 0x3fff) + 1,
+                    ((bits >> 14) & 0x3fff) + 1,
+                ];
+            }
+            if chunk == b"VP8X" {
+                return [IMAGETYPE_WEBP, le24(head, 24) + 1, le24(head, 27) + 1];
+            }
+            return [IMAGETYPE_WEBP, 0, 0];
+        }
+        if len >= 3 && head.starts_with(b"\xff\xd8\xff") {
+            let mut at = 2usize;
+            while at + 4 <= len {
+                if head[at] != 0xff {
+                    break;
+                }
+                let marker = head[at + 1];
+                if marker == 0xff {
+                    at += 1;
+                    continue;
+                }
+                if marker == 0xd8 || marker == 0x01 || (0xd0..=0xd7).contains(&marker) {
+                    at += 2;
+                    continue;
+                }
+                if marker == 0xd9 || marker == 0xda {
+                    break;
+                }
+                let segment = be16(head, at + 2) as usize;
+                if segment < 2 {
+                    break;
+                }
+                if (0xc0..=0xcf).contains(&marker) && !matches!(marker, 0xc4 | 0xc8 | 0xcc) {
+                    if at + 9 <= len {
+                        return [IMAGETYPE_JPEG, be16(head, at + 7), be16(head, at + 5)];
+                    }
+                    break;
+                }
+                at += 2 + segment;
+            }
+            return [IMAGETYPE_JPEG, 0, 0];
+        }
+        [0, 0, 0]
+    }
+
+    fn image_headers(count: usize, data: &[u8], table: &[i64], words: &mut Vec<i64>) -> Option<()> {
+        if table.len() != count {
+            return None;
+        }
+        let mut at = 0usize;
+        for &length in table {
+            let length = usize::try_from(length).ok()?;
+            let end = at.checked_add(length)?;
+            words.extend_from_slice(&probe_header(data.get(at..end)?));
+            at = end;
+        }
+        (at == data.len()).then_some(())
+    }
+
+    /// PHP `$a / $b` (both positive, at most 2^53) compared as a double.
+    fn ratio(a: i64, b: i64) -> f64 {
+        a as f64 / b as f64
+    }
+
+    /// PHP `(int) ceil($a / $b)` for `0 < $b` and `|$a| <= 2^53`.
+    fn ceil_div(a: i64, b: i64) -> i64 {
+        if a % b == 0 {
+            a / b
+        } else {
+            (a as f64 / b as f64).ceil() as i64
+        }
+    }
+
+    /// `Par2FileMapper::candidatePlanBatch()`: `[candidate count, first, last source index]`.
+    ///
+    /// `table` is `[article part size, source count, (index, posted size, segments)…,
+    /// file size…]` with one file size per record.
+    fn par2_candidates(
+        count: usize,
+        data: &[u8],
+        table: &[i64],
+        words: &mut Vec<i64>,
+    ) -> Option<()> {
+        if !data.is_empty() || table.len() < 2 {
+            return None;
+        }
+        let part = table[0];
+        let sources = usize::try_from(table[1]).ok()?;
+        let source_words = sources.checked_mul(3)?;
+        if table.len() != 2usize.checked_add(source_words)?.checked_add(count)? {
+            return None;
+        }
+        let packed = &table[2..2 + source_words];
+        let files = &table[2 + source_words..];
+        if part > MAX_EXACT
+            || packed
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .any(|s| s[1] <= 0 || s[1] > MAX_EXACT || s[2] <= 0)
+        {
+            return None;
+        }
+        let check = part > 0;
+        for &size in files {
+            if !(-MAX_EXACT..=MAX_EXACT).contains(&size) {
+                return None;
+            }
+            let expected = if check { ceil_div(size, part) } else { 0 };
+            let (mut found, mut first, mut last) = (0i64, -1i64, -1i64);
+            for source in packed.as_chunks::<3>().0 {
+                let value = ratio(size, source[1]);
+                if value < 0.90 || value > 1.001 || (check && expected != source[2]) {
+                    continue;
+                }
+                found += 1;
+                if first < 0 {
+                    first = source[0];
+                }
+                last = source[0];
+            }
+            words.extend_from_slice(&[found, first, last]);
+        }
+        Some(())
+    }
+
+    fn ends_ci(name: &[u8], suffix: &[u8]) -> bool {
+        name.len() >= suffix.len() && name[name.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+    }
+
+    /// Length of the ASCII digit run ending at `end`.
+    fn digits_before(name: &[u8], end: usize) -> usize {
+        name[..end]
+            .iter()
+            .rev()
+            .take_while(|b| b.is_ascii_digit())
+            .count()
+    }
+
+    fn small_number(digits: &[u8]) -> i64 {
+        digits
+            .iter()
+            .fold(0i64, |value, &b| value * 10 + i64::from(b - b'0'))
+    }
+
+    /// `Par2FileEntry::volumePlanBatch()` kind, number and extra for one name.
+    fn volume_kind(name: &[u8]) -> (i64, i64, i64) {
+        let len = name.len();
+        if ends_ci(name, b".par2") {
+            // `/\.vol(\d{1,5})\+(\d{1,5})\.par2$/iD`
+            let end = len - 5;
+            let extra = digits_before(name, end);
+            if (1..=5).contains(&extra) && end > extra && name[end - extra - 1] == b'+' {
+                let plus = end - extra - 1;
+                let number = digits_before(name, plus);
+                if (1..=5).contains(&number)
+                    && plus >= number + 4
+                    && name[plus - number - 4..plus - number].eq_ignore_ascii_case(b".vol")
+                {
+                    return (
+                        6,
+                        small_number(&name[plus - number..plus]),
+                        small_number(&name[end - extra..end]),
+                    );
+                }
+            }
+            return (5, -1, -1);
+        }
+        if ends_ci(name, b".rar") {
+            // `/\.part(\d{1,4})\.rar$/iD`
+            let end = len - 4;
+            let digits = digits_before(name, end);
+            if (1..=4).contains(&digits)
+                && end >= digits + 5
+                && name[end - digits - 5..end - digits].eq_ignore_ascii_case(b".part")
+            {
+                return (1, small_number(&name[end - digits..end]), -1);
+            }
+            return (2, -1, -1);
+        }
+        let digits = digits_before(name, len);
+        // `/\.r(\d{2,3})$/iD`
+        if (2..=3).contains(&digits)
+            && len >= digits + 2
+            && name[len - digits - 2..len - digits].eq_ignore_ascii_case(b".r")
+        {
+            return (3, small_number(&name[len - digits..]), -1);
+        }
+        // `/\.(\d{3})$/D`
+        if digits == 3 && len >= 4 && name[len - 4] == b'.' {
+            return (4, small_number(&name[len - 3..]), -1);
+        }
+        if ends_ci(name, b".7z") {
+            return (7, -1, -1);
+        }
+        if ends_ci(name, b".zip") {
+            return (8, -1, -1);
+        }
+        (0, -1, -1)
+    }
+
+    /// `Par2FileEntry::volumePlanBatch()`: `[kind | hash valid << 8, number, extra]`.
+    ///
+    /// `data` holds every name, then every hash, NUL-delimited.
+    fn par2_volumes(count: usize, data: &[u8], table: &[i64], words: &mut Vec<i64>) -> Option<()> {
+        if !table.is_empty() {
+            return None;
+        }
+        let fields = split_fields(data, count.checked_mul(2)?)?;
+        let (names, hashes) = fields.split_at(count);
+        for (name, hash) in names.iter().zip(hashes) {
+            let (kind, number, extra) = volume_kind(name);
+            let valid = hash.len() == 32
+                && hash
+                    .iter()
+                    .all(|&b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+            words.extend_from_slice(&[kind | i64::from(valid) << 8, number, extra]);
+        }
+        Some(())
+    }
+
+    macro_rules! entry {
+        ($(#[$doc:meta])* $name:ident, $width:expr, $body:ident) => {
+            $(#[$doc])*
+            ///
+            /// # Safety
+            /// Non-null pointers must refer to readable allocations of
+            /// `data_len` and `ints_len` bytes and a writable, aligned
+            /// allocation of `out_cap` i64 words. Null pointers require zero
+            /// length/capacity. Inputs and output must not overlap.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                count: usize,
+                flags: i64,
+                data: *const u8,
+                data_len: usize,
+                ints: *const u8,
+                ints_len: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> i64 {
+                unsafe {
+                    run(count, flags, data, data_len, ints, ints_len, out, out_cap, $width, |data, table, words| {
+                        $body(count, data, table, words)
+                    })
+                }
+            }
+        };
+    }
+
+    entry!(
+        /// `NzbContentParser::subjectNameBatch()` (see [`subject_names`]).
+        nntmux_w525_nzb_subject_names, 4, subject_names
+    );
+    entry!(
+        /// `SevenZipListingParser::linePlanBatch()` (see [`sevenzip_lines`]).
+        nntmux_w525_sevenzip_line_plan, 4, sevenzip_lines
+    );
+    entry!(
+        /// `ImageInspector::headerProbeBatch()` (see [`image_headers`]).
+        nntmux_w525_image_header_probe, 3, image_headers
+    );
+    entry!(
+        /// `Par2FileMapper::candidatePlanBatch()` (see [`par2_candidates`]).
+        nntmux_w525_par2_candidate_plan, 3, par2_candidates
+    );
+    entry!(
+        /// `Par2FileEntry::volumePlanBatch()` (see [`par2_volumes`]).
+        nntmux_w525_par2_entry_volume_plan, 3, par2_volumes
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        type Entry = unsafe extern "C" fn(
+            usize,
+            i64,
+            *const u8,
+            usize,
+            *const u8,
+            usize,
+            *mut i64,
+            usize,
+        ) -> i64;
+
+        fn pack(values: &[i64]) -> Vec<u8> {
+            values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect()
+        }
+
+        fn call(entry: Entry, count: usize, data: &[u8], table: &[i64]) -> Result<Vec<i64>, i64> {
+            let table = pack(table);
+            let mut out = vec![0i64; 4096];
+            let written = unsafe {
+                entry(
+                    count,
+                    0,
+                    data.as_ptr(),
+                    data.len(),
+                    table.as_ptr(),
+                    table.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            if written < 0 {
+                return Err(written);
+            }
+            out.truncate(written as usize);
+            Ok(out)
+        }
+
+        #[test]
+        fn w525_subject_names_follow_both_patterns() {
+            let data = b"[1/3] - \"movie.part01.rar\" yEnc (1/50)\0plain.mkv yEnc (1/99999999999999999999)\0\"x\"oops\0\".hidden\"\0name with space  \0\"a/b\" (2/3)\0";
+            let words = call(nntmux_w525_nzb_subject_names, 7, data, &[]).unwrap();
+            assert_eq!(&words[..4], &[2, 9, 16, 50]);
+            assert_eq!(&words[4..8], &[2, 0, 9, PATCH]);
+            assert_eq!(&words[8..12], &[0, 0, 0, -1]);
+            assert_eq!(&words[12..16], &[1, 1, 7, -1]);
+            assert_eq!(&words[16..20], &[2, 0, 15, -1]);
+            assert_eq!(&words[20..24], &[1, 1, 3, 3]);
+            assert_eq!(&words[24..28], &[0, 0, 0, -1]);
+        }
+
+        #[test]
+        fn w525_subject_suffix_tries_yenc_then_count() {
+            assert_eq!(subject_suffix(b""), Some(None));
+            assert_eq!(subject_suffix(b" YENC "), Some(None));
+            assert_eq!(subject_suffix(b" yEnc (1/2)"), Some(Some(&b"2"[..])));
+            assert_eq!(subject_suffix(b"\t(3/4)\n"), Some(Some(&b"4"[..])));
+            assert_eq!(subject_suffix(b"yEnc"), None);
+            assert_eq!(subject_suffix(b" yEnc(1/2)"), None);
+            assert_eq!(subject_suffix(b" (1/)"), None);
+        }
+
+        #[test]
+        fn w525_sevenzip_lines_classify_properties() {
+            let data = b"Path = a.rar\r\0 \t\0Size =\0garbage\09bad = x\0Custom Key = v = w";
+            let words = call(nntmux_w525_sevenzip_line_plan, 6, data, &[]).unwrap();
+            assert_eq!(&words[..4], &[3 | 1 << 2, 4, 7, 5]);
+            assert_eq!(&words[4..8], &[0, 0, 0, 0]);
+            assert_eq!(&words[8..12], &[3 | 2 << 2, 4, 6, 0]);
+            assert_eq!(&words[12..16], &[1, 0, 0, 0]);
+            assert_eq!(&words[16..20], &[2, 4, 7, 1]);
+            assert_eq!(&words[20..24], &[3, 10, 13, 5]);
+        }
+
+        #[test]
+        fn w525_image_headers_parse_dimensions() {
+            let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+            png.extend_from_slice(&[0, 0, 2, 0, 0, 0, 1, 0x2c]);
+            let mut jpeg = vec![0xff, 0xd8, 0xff, 0xe0, 0, 4, 0, 0, 0xff, 0xc0, 0, 17, 8];
+            jpeg.extend_from_slice(&[0x01, 0xe0, 0x02, 0x80]);
+            let mut vp8x = b"RIFF\0\0\0\0WEBPVP8X".to_vec();
+            vp8x.extend_from_slice(&[10, 0, 0, 0, 0, 0, 0, 0, 0x7f, 0x02, 0, 0xdf, 0x01, 0]);
+            let lengths = [png.len() as i64, jpeg.len() as i64, vp8x.len() as i64, 2];
+            let data = [png, jpeg, vp8x, b"GI".to_vec()].concat();
+            let words = call(nntmux_w525_image_header_probe, 4, &data, &lengths).unwrap();
+            assert_eq!(words, vec![3, 512, 300, 2, 640, 480, 18, 640, 480, 0, 0, 0]);
+            assert_eq!(
+                call(nntmux_w525_image_header_probe, 1, b"ab", &[3]),
+                Err(DECLINE)
+            );
+        }
+
+        #[test]
+        fn w525_par2_candidates_count_fitting_sources() {
+            let table = [0, 3, 0, 1000, 2, 1, 1000, 2, 4, 2000, 3, 990, 1950, 10];
+            let words = call(nntmux_w525_par2_candidate_plan, 3, &[], &table).unwrap();
+            assert_eq!(words, vec![2, 0, 1, 1, 4, 4, 0, -1, -1]);
+            let segmented = [500, 3, 0, 1000, 2, 1, 1000, 3, 4, 2000, 3, 990];
+            assert_eq!(
+                call(nntmux_w525_par2_candidate_plan, 1, &[], &segmented).unwrap(),
+                vec![1, 0, 0]
+            );
+            assert_eq!(
+                call(
+                    nntmux_w525_par2_candidate_plan,
+                    1,
+                    &[],
+                    &[0, 1, 0, 1 << 54, 1, 5]
+                ),
+                Err(DECLINE)
+            );
+        }
+
+        #[test]
+        fn w525_par2_volumes_classify_names() {
+            let names: [&[u8]; 10] = [
+                b"a.part01.rar",
+                b"a.rar",
+                b"a.r00",
+                b"a.001",
+                b"a.vol03+04.PAR2",
+                b"a.par2",
+                b"a.7z",
+                b"a.ZIP",
+                b"a.part12345.rar",
+                b"a.mkv",
+            ];
+            let mut hashes: Vec<&[u8]> = vec![b""; 10];
+            hashes[0] = b"d41d8cd98f00b204e9800998ecf8427e";
+            hashes[1] = b"D41D8CD98F00B204E9800998ECF8427E";
+            hashes[2] = b"x";
+            let data = [&names[..], &hashes[..]].concat().join(&0u8);
+            let words = call(nntmux_w525_par2_entry_volume_plan, 10, &data, &[]).unwrap();
+            assert_eq!(
+                words,
+                vec![
+                    1 | 256,
+                    1,
+                    -1,
+                    2,
+                    -1,
+                    -1,
+                    3,
+                    0,
+                    -1,
+                    4,
+                    1,
+                    -1,
+                    6,
+                    3,
+                    4,
+                    5,
+                    -1,
+                    -1,
+                    7,
+                    -1,
+                    -1,
+                    8,
+                    -1,
+                    -1,
+                    2,
+                    -1,
+                    -1,
+                    0,
+                    -1,
+                    -1
+                ]
+            );
+        }
+
+        #[test]
+        fn w525_abi_declines_and_reports_capacity() {
+            let data = b"Path = x";
+            let mut out = [7i64; 4];
+            let entry: Entry = nntmux_w525_sevenzip_line_plan;
+            let small = unsafe {
+                entry(
+                    1,
+                    0,
+                    data.as_ptr(),
+                    data.len(),
+                    std::ptr::null(),
+                    0,
+                    out.as_mut_ptr(),
+                    3,
+                )
+            };
+            assert_eq!(small, -4);
+            assert_eq!(out, [7; 4]);
+            let null_out = unsafe {
+                entry(
+                    1,
+                    0,
+                    data.as_ptr(),
+                    data.len(),
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!(null_out, -4);
+            let bad_null = unsafe {
+                entry(
+                    1,
+                    0,
+                    std::ptr::null(),
+                    3,
+                    std::ptr::null(),
+                    0,
+                    out.as_mut_ptr(),
+                    4,
+                )
+            };
+            assert_eq!(bad_null, DECLINE);
+            let flagged = unsafe {
+                entry(
+                    1,
+                    1,
+                    data.as_ptr(),
+                    data.len(),
+                    std::ptr::null(),
+                    0,
+                    out.as_mut_ptr(),
+                    4,
+                )
+            };
+            assert_eq!(flagged, DECLINE);
+            let ragged = unsafe {
+                entry(
+                    1,
+                    0,
+                    data.as_ptr(),
+                    data.len(),
+                    [0u8; 3].as_ptr(),
+                    3,
+                    out.as_mut_ptr(),
+                    4,
+                )
+            };
+            assert_eq!(ragged, DECLINE);
+            assert_eq!(call(entry, 2, data, &[]), Err(DECLINE));
+            let empty = unsafe {
+                entry(
+                    0,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!(empty, 0);
+            let shared = out.as_mut_ptr();
+            let overlap =
+                unsafe { entry(1, 0, shared.cast::<u8>(), 8, std::ptr::null(), 0, shared, 4) };
+            assert_eq!(overlap, DECLINE);
+        }
+
+        #[test]
+        fn w525_random_inputs_never_panic() {
+            let mut seed = 0x525_u64;
+            let mut next = move || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed
+            };
+            let entries: [Entry; 5] = [
+                nntmux_w525_nzb_subject_names,
+                nntmux_w525_sevenzip_line_plan,
+                nntmux_w525_image_header_probe,
+                nntmux_w525_par2_candidate_plan,
+                nntmux_w525_par2_entry_volume_plan,
+            ];
+            let alphabet = [
+                0u8, b'"', b' ', b'=', b'.', b'(', b'/', b'1', b'\n', b'\r', 0xff, 0xd8, b'r',
+                b'a', b'+', b'P',
+            ];
+            for round in 0..20_000 {
+                let data: Vec<u8> = (0..next() % 40)
+                    .map(|_| alphabet[(next() % 16) as usize])
+                    .collect();
+                let table: Vec<i64> = (0..next() % 16)
+                    .map(|_| [0, 1, 2, 3, 40, -1, i64::MAX, i64::MIN][(next() % 8) as usize])
+                    .collect();
+                let _ = call(entries[round % 5], (next() % 5) as usize, &data, &table);
+            }
+        }
+    }
+}

@@ -246,4 +246,220 @@ final class ImageInspector
 
         return self::$ffi;
     }
+
+    public const string W52_FFI_CDEF = 'int64_t nntmux_w525_image_header_probe(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W52.5 parity test's QUALIFICATION). */
+    private const bool W52_RUST_FFI_DEFAULT = true;
+
+    /**
+     * Wave 52.5 routing and FFI cache, kept in function-local statics so readonly classes can use them too.
+     * Without $op it reports the routing; 'set' swaps the override for $val and returns the previous one;
+     * 'reset' replaces the cached handle with $val (null re-resolves, false disables); 'buffer' returns
+     * `[FFI, int64_t[], capacity]` with room for at least $val words, or null without the library.
+     */
+    private static function w52RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w52_5', self::W52_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W52_RUST_FFI_DEFAULT;
+        }
+    }
+
+    public static function usesW52RustFfi(): bool
+    {
+        return self::w52RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with headerProbeBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW52RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w52RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w52RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 52.5 Rust helper, or null to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w52Words(int $count, string $data, string $ints, int $words): ?array
+    {
+        try {
+            $handle = self::w52RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w525_image_header_probe($count, 0, $data, \strlen($data), $ints, \strlen($ints), $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('P*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Batch header probe over each file's first bytes. Three words per header: `[IMAGETYPE_JPEG/PNG/WEBP or
+     * 0, width, height]`; width and height are 0 when the header is too short to hold them. PNG reads IHDR,
+     * WebP its VP8, VP8L or VP8X chunk and JPEG the first SOF marker before the scan data.
+     *
+     * @param  list<string>  $heads
+     * @return list<int>
+     */
+    public static function headerProbeBatch(array $heads): array
+    {
+        return self::usesW52RustFfi() ? self::headerProbeBatchNative($heads) : self::headerProbeBatchPhp($heads);
+    }
+
+    /**
+     * @param  list<string>  $heads
+     * @return list<int>
+     */
+    public static function headerProbeBatchPhp(array $heads): array
+    {
+        $out = [];
+        foreach ($heads as $head) {
+            array_push($out, ...self::w52ProbeHeader($head));
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch over concatenated headers and their lengths; falls back to PHP without the library.
+     *
+     * @param  list<string>  $heads
+     * @return list<int>
+     */
+    public static function headerProbeBatchNative(array $heads): array
+    {
+        $count = \count($heads);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w52Words($count, implode('', $heads), pack('P*', ...array_map(strlen(...), $heads)), 3 * $count)
+            ?? self::headerProbeBatchPhp($heads);
+    }
+
+    /** @return array{int, int, int} */
+    private static function w52ProbeHeader(string $head): array
+    {
+        $length = \strlen($head);
+        if ($length >= 24 && str_starts_with($head, "\x89PNG\r\n\x1a\n") && substr($head, 12, 4) === 'IHDR') {
+            /** @var array{1: int, 2: int} $size */
+            $size = unpack('N2', $head, 16);
+
+            return [IMAGETYPE_PNG, $size[1], $size[2]];
+        }
+        if ($length >= 30 && str_starts_with($head, 'RIFF') && substr($head, 8, 4) === 'WEBP') {
+            $chunk = substr($head, 12, 4);
+            if ($chunk === 'VP8 ' && substr($head, 23, 3) === "\x9d\x01\x2a") {
+                /** @var array{1: int, 2: int} $size */
+                $size = unpack('v2', $head, 26);
+
+                return [IMAGETYPE_WEBP, $size[1] & 0x3FFF, $size[2] & 0x3FFF];
+            }
+            if ($chunk === 'VP8L' && $head[20] === "\x2f") {
+                /** @var array{1: int} $bits */
+                $bits = unpack('V', $head, 21);
+
+                return [IMAGETYPE_WEBP, ($bits[1] & 0x3FFF) + 1, ($bits[1] >> 14 & 0x3FFF) + 1];
+            }
+            if ($chunk === 'VP8X') {
+                /** @var array{1: int, 2: int} $size */
+                $size = unpack('V2', substr($head, 24, 3)."\0".substr($head, 27, 3)."\0");
+
+                return [IMAGETYPE_WEBP, $size[1] + 1, $size[2] + 1];
+            }
+
+            return [IMAGETYPE_WEBP, 0, 0];
+        }
+        if ($length >= 3 && str_starts_with($head, "\xFF\xD8\xFF")) {
+            $offset = 2;
+            while ($offset + 4 <= $length && $head[$offset] === "\xFF") {
+                $marker = \ord($head[$offset + 1]);
+                if ($marker === 0xFF) {
+                    $offset++;
+
+                    continue;
+                }
+                if ($marker === 0xD8 || $marker === 0x01 || ($marker >= 0xD0 && $marker <= 0xD7)) {
+                    $offset += 2;
+
+                    continue;
+                }
+                if ($marker === 0xD9 || $marker === 0xDA) {
+                    break;
+                }
+                /** @var array{1: int} $segment */
+                $segment = unpack('n', $head, $offset + 2);
+                if ($segment[1] < 2) {
+                    break;
+                }
+                if ($marker >= 0xC0 && $marker <= 0xCF && $marker !== 0xC4 && $marker !== 0xC8 && $marker !== 0xCC) {
+                    if ($offset + 9 > $length) {
+                        break;
+                    }
+                    /** @var array{height: int, width: int} $size */
+                    $size = unpack('nheight/nwidth', $head, $offset + 5);
+
+                    return [IMAGETYPE_JPEG, $size['width'], $size['height']];
+                }
+                $offset += 2 + $segment[1];
+            }
+
+            return [IMAGETYPE_JPEG, 0, 0];
+        }
+
+        return [0, 0, 0];
+    }
 }
