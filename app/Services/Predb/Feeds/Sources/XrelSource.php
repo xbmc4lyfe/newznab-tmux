@@ -6,6 +6,7 @@ namespace App\Services\Predb\Feeds\Sources;
 
 use App\Models\Predb;
 use App\Services\Predb\Feeds\PredbFeedEntry;
+use App\Services\Predb\Feeds\PredbFeedImporter;
 use App\Support\RustPipelineLibrary;
 use Carbon\CarbonImmutable;
 use FFI;
@@ -32,6 +33,14 @@ final class XrelSource extends HttpFeedSource
      */
     public const bool RUST_FFI_DEFAULT = false;
 
+    /**
+     * Wave 46.2 production default for summarizeDirnameBatch() is Rust: the paired benchmark in
+     * tests/Unit/RustPredbFeedsSrrdb3dsdbXrelNswdbImporterW46ParityTest.php measures 2.73-2.85x mean and 2.36-2.86x
+     * p99 on common pages and 2.95-3.07x mean and 2.27-2.42x p99 on uncommon batches. PHP stays the fallback when the
+     * library is unavailable.
+     */
+    public const bool W462_RUST_FFI_DEFAULT = true;
+
     private const string XREL_PAGE_FFI_CDEF = <<<'C'
         ssize_t nntmux_w374_xrel_page_plan(
             int64_t page_size,
@@ -48,6 +57,10 @@ final class XrelSource extends HttpFeedSource
     private static ?bool $xrelUseRustFfi = null;
 
     private static FFI|false|null $xrelFfi = null;
+
+    private static ?bool $w462RustFfiOverride = null;
+
+    private static FFI|false|null $w462RustFfiHandle = null;
 
     public function __construct(
         string $endpoint,
@@ -263,5 +276,101 @@ final class XrelSource extends HttpFeedSource
         } catch (Throwable) {
             return null;
         }
+    }
+
+    /** Force the Wave 46.2 helper onto Rust (true) or PHP (false); null restores W462_RUST_FFI_DEFAULT. */
+    public static function useW462RustFfi(?bool $enable = true): void
+    {
+        self::$w462RustFfiOverride = $enable;
+    }
+
+    public static function usesW462RustFfi(): bool
+    {
+        return self::$w462RustFfiOverride ?? self::W462_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW462RustFfi(): void
+    {
+        self::$w462RustFfiOverride = null;
+        self::$w462RustFfiHandle = null;
+    }
+
+    /**
+     * Summarize dirnames as parseRows() admits them: non-strings are invalid and dirnames that trim() to '' are
+     * empty; accepted dirnames count those trim() changed, those ending in a -GROUP suffix, those holding a space
+     * and the distinct strtolower() dirnames.
+     *
+     * @param  array<array-key, mixed>  $dirnames
+     * @return array{total: int, invalid: int, empty: int, accepted: int, padded: int, grouped: int, spaced: int, distinct: int}
+     */
+    public static function summarizeDirnameBatch(array $dirnames): array
+    {
+        return (self::usesW462RustFfi() ? self::summarizeDirnameBatchNative($dirnames) : null)
+            ?? self::summarizeDirnameBatchPhp($dirnames);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $dirnames
+     * @return array{total: int, invalid: int, empty: int, accepted: int, padded: int, grouped: int, spaced: int, distinct: int}
+     */
+    public static function summarizeDirnameBatchPhp(array $dirnames): array
+    {
+        $summary = ['total' => \count($dirnames), 'invalid' => 0, 'empty' => 0, 'accepted' => 0, 'padded' => 0, 'grouped' => 0, 'spaced' => 0,
+            'distinct' => 0];
+        $seen = [];
+        foreach ($dirnames as $dirname) {
+            if (! \is_string($dirname)) {
+                $summary['invalid']++;
+
+                continue;
+            }
+            $title = trim($dirname);
+            if ($title === '') {
+                $summary['empty']++;
+
+                continue;
+            }
+            $summary['accepted']++;
+            if ($title !== $dirname) {
+                $summary['padded']++;
+            }
+            if (preg_match('/-[A-Za-z0-9_]+$/D', $title) === 1) {
+                $summary['grouped']++;
+            }
+            if (str_contains($title, ' ')) {
+                $summary['spaced']++;
+            }
+            $seen[strtolower($title)] = true;
+        }
+        $summary['distinct'] = \count($seen);
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $dirnames
+     * @return array{total: int, invalid: int, empty: int, accepted: int, padded: int, grouped: int, spaced: int, distinct: int}|null
+     */
+    public static function summarizeDirnameBatchNative(array $dirnames): ?array
+    {
+        $values = PredbFeedImporter::w462Summary(self::w462RustFfi(), 2, $dirnames, 8);
+        if ($values === null) {
+            return null;
+        }
+        [$total, $invalid, $empty, $accepted, $padded, $grouped, $spaced, $distinct] = $values;
+        if ($total !== \count($dirnames) || min($values) < 0 || $invalid + $empty + $accepted !== $total
+            || max($padded, $grouped, $spaced, $distinct) > $accepted || ($distinct > 0) !== ($accepted > 0)) {
+            return null;
+        }
+
+        return ['total' => $total, 'invalid' => $invalid, 'empty' => $empty, 'accepted' => $accepted, 'padded' => $padded, 'grouped' => $grouped,
+            'spaced' => $spaced, 'distinct' => $distinct];
+    }
+
+    private static function w462RustFfi(): ?FFI
+    {
+        self::$w462RustFfiHandle ??= RustPipelineLibrary::resolveDomain(PredbFeedImporter::W462_FFI_DOMAIN, PredbFeedImporter::W462_FFI_CDEF) ?? false;
+
+        return self::$w462RustFfiHandle === false ? null : self::$w462RustFfiHandle;
     }
 }

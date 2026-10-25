@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Services\Predb\Feeds\Sources;
 
 use App\Services\Predb\Feeds\PredbFeedEntry;
+use App\Services\Predb\Feeds\PredbFeedImporter;
 use App\Support\RustPipelineLibrary;
 use Carbon\CarbonImmutable;
 use DateTimeImmutable;
@@ -29,6 +30,14 @@ final class SrrdbSource extends HttpFeedSource
      */
     public const bool RUST_FFI_DEFAULT = false;
 
+    /**
+     * Wave 46.2 production default for summarizeDateBatch() is Rust: the paired benchmark in
+     * tests/Unit/RustPredbFeedsSrrdb3dsdbXrelNswdbImporterW46ParityTest.php measures 5.23-5.63x mean and 3.78-5.13x
+     * p99 on common pages and 5.57-5.78x mean and 4.14-5.45x p99 on uncommon batches. PHP stays the fallback when the
+     * library is unavailable.
+     */
+    public const bool W462_RUST_FFI_DEFAULT = true;
+
     private const string SRRDB_PAGE_FFI_CDEF = <<<'C'
         ssize_t nntmux_w374_srrdb_page_plan(
             int64_t page,
@@ -47,6 +56,10 @@ final class SrrdbSource extends HttpFeedSource
     private static ?bool $srrdbUseRustFfi = null;
 
     private static FFI|false|null $srrdbFfi = null;
+
+    private static ?bool $w462RustFfiOverride = null;
+
+    private static FFI|false|null $w462RustFfiHandle = null;
 
     /** @var array<string, DateTimeZone|false> Zones whose local dates may skip Carbon's parser. */
     private static array $zones = [];
@@ -252,5 +265,95 @@ final class SrrdbSource extends HttpFeedSource
         } catch (Throwable) {
             return null;
         }
+    }
+
+    /** Force the Wave 46.2 helper onto Rust (true) or PHP (false); null restores W462_RUST_FFI_DEFAULT. */
+    public static function useW462RustFfi(?bool $enable = true): void
+    {
+        self::$w462RustFfiOverride = $enable;
+    }
+
+    public static function usesW462RustFfi(): bool
+    {
+        return self::$w462RustFfiOverride ?? self::W462_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW462RustFfi(): void
+    {
+        self::$w462RustFfiOverride = null;
+        self::$w462RustFfiHandle = null;
+    }
+
+    /**
+     * Summarize row dates as parseDate() reads them: non-strings and dates that trim() to '' are undated; the rest
+     * are canonical (a real "Y-m-d H:i:s" calendar date and time) or malformed, counting those trim() changed and
+     * the distinct canonical days.
+     *
+     * @param  array<array-key, mixed>  $dates
+     * @return array{total: int, undated: int, canonical: int, malformed: int, padded: int, distinct_days: int}
+     */
+    public static function summarizeDateBatch(array $dates): array
+    {
+        return (self::usesW462RustFfi() ? self::summarizeDateBatchNative($dates) : null)
+            ?? self::summarizeDateBatchPhp($dates);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $dates
+     * @return array{total: int, undated: int, canonical: int, malformed: int, padded: int, distinct_days: int}
+     */
+    public static function summarizeDateBatchPhp(array $dates): array
+    {
+        $summary = ['total' => \count($dates), 'undated' => 0, 'canonical' => 0, 'malformed' => 0, 'padded' => 0, 'distinct_days' => 0];
+        $days = [];
+        foreach ($dates as $date) {
+            $value = \is_string($date) ? trim($date) : '';
+            if ($value === '') {
+                $summary['undated']++;
+
+                continue;
+            }
+            if ($value !== $date) {
+                $summary['padded']++;
+            }
+            if (preg_match('/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/D', $value, $parts) === 1
+                && checkdate((int) $parts[2], (int) $parts[3], (int) $parts[1])
+                && (int) $parts[4] < 24 && (int) $parts[5] < 60 && (int) $parts[6] < 60) {
+                $summary['canonical']++;
+                $days[substr($value, 0, 10)] = true;
+            } else {
+                $summary['malformed']++;
+            }
+        }
+        $summary['distinct_days'] = \count($days);
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $dates
+     * @return array{total: int, undated: int, canonical: int, malformed: int, padded: int, distinct_days: int}|null
+     */
+    public static function summarizeDateBatchNative(array $dates): ?array
+    {
+        $values = PredbFeedImporter::w462Summary(self::w462RustFfi(), 0, $dates, 6);
+        if ($values === null) {
+            return null;
+        }
+        [$total, $undated, $canonical, $malformed, $padded, $days] = $values;
+        if ($total !== \count($dates) || min($values) < 0 || $undated + $canonical + $malformed !== $total
+            || $padded > $canonical + $malformed || $days > $canonical || ($days > 0) !== ($canonical > 0)) {
+            return null;
+        }
+
+        return ['total' => $total, 'undated' => $undated, 'canonical' => $canonical, 'malformed' => $malformed, 'padded' => $padded,
+            'distinct_days' => $days];
+    }
+
+    private static function w462RustFfi(): ?FFI
+    {
+        self::$w462RustFfiHandle ??= RustPipelineLibrary::resolveDomain(PredbFeedImporter::W462_FFI_DOMAIN, PredbFeedImporter::W462_FFI_CDEF) ?? false;
+
+        return self::$w462RustFfiHandle === false ? null : self::$w462RustFfiHandle;
     }
 }

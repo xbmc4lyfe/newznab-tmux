@@ -30686,7 +30686,7 @@ mod wave45_predb_feed_source_batch {
     const MAX_SLOTS: usize = 9;
 
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    enum Item<'a> {
+    pub(super) enum Item<'a> {
         Text(&'a [u8]),
         Null,
         Invalid,
@@ -30695,7 +30695,7 @@ mod wave45_predb_feed_source_batch {
     /// Folded-multiply hasher over 16-byte blocks. The sets only hold one bounded batch, so
     /// SipHash's flooding resistance buys nothing here; equal hashes still compare in full.
     #[derive(Default)]
-    struct Fold(u64);
+    pub(super) struct Fold(u64);
 
     const SEEDS: [u64; 4] = [
         0x243f_6a88_85a3_08d3,
@@ -30753,9 +30753,9 @@ mod wave45_predb_feed_source_batch {
         }
     }
 
-    type FoldSet<'a> = HashSet<&'a [u8], BuildHasherDefault<Fold>>;
+    pub(super) type FoldSet<'a> = HashSet<&'a [u8], BuildHasherDefault<Fold>>;
 
-    fn set_with<'a>(capacity: usize) -> FoldSet<'a> {
+    pub(super) fn set_with<'a>(capacity: usize) -> FoldSet<'a> {
         HashSet::with_capacity_and_hasher(capacity, BuildHasherDefault::default())
     }
 
@@ -30801,7 +30801,7 @@ mod wave45_predb_feed_source_batch {
     }
 
     /// PHP `trim()` with its default character list.
-    fn php_trim(text: &[u8]) -> &[u8] {
+    pub(super) fn php_trim(text: &[u8]) -> &[u8] {
         let keep = |b: &u8| !matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b);
         let start = text.iter().position(keep).unwrap_or(text.len());
         let end = text.iter().rposition(keep).map_or(start, |end| end + 1);
@@ -30816,7 +30816,7 @@ mod wave45_predb_feed_source_batch {
 
     /// `[A-Za-z0-9_]`, branch-free so the folds below vectorize.
     #[inline]
-    fn word_byte(b: u8) -> bool {
+    pub(super) fn word_byte(b: u8) -> bool {
         ((b | 0x20).wrapping_sub(b'a') < 26) | (b.wrapping_sub(b'0') < 10) | (b == b'_')
     }
 
@@ -31686,6 +31686,940 @@ pub unsafe extern "C" fn nntmux_w452_predb_feed_source_batch(
 ) -> isize {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         wave45_predb_feed_source_batch::evaluate(
+            operation, flags, blob, blob_len, lens, lens_len, out_buf, out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
+
+/// Wave 46.2 batch summaries for the srrDB, 3dsdb, xREL and nswdb sources and the feed importer,
+/// over the Wave 45.2 blob layout (a NUL-delimited blob or a `u32` length table).
+mod wave46_predb_feed_import_batch {
+    use super::wave45_predb_feed_source_batch::{
+        DELIMITED, Item, MAX_INPUT, php_trim, set_with, word_byte,
+    };
+    use super::{memchr, nfo_abi_range, yenc_ranges_overlap};
+    use std::collections::HashSet;
+    use std::hash::{BuildHasherDefault, Hash, Hasher};
+    use std::slice;
+
+    /// Most counters any op answers.
+    const MAX_SLOTS: usize = 8;
+
+    /// Length sentinels of the length layout: a null or non-string item, and an invalid one.
+    const NULL: u32 = u32::MAX;
+    const INVALID: u32 = u32::MAX - 1;
+
+    /// The batch items, streamed from either layout. A NUL-delimited blob pairs with the strictly
+    /// ascending `u32` indexes of its null items (each an empty slot); a concatenated blob pairs
+    /// with one `u32` length per item. A layout violation yields `Item::Invalid` or leaves the
+    /// rows incomplete.
+    struct Rows<'a> {
+        delimited: bool,
+        rest: Option<&'a [u8]>,
+        words: &'a [[u8; 4]],
+        index: u32,
+        /// Items in the batch: NUL separators plus one, or one per length.
+        total: usize,
+    }
+
+    impl<'a> Rows<'a> {
+        fn new(delimited: bool, blob: &'a [u8], lens: &'a [u8]) -> Option<Self> {
+            let (words, rest) = lens.as_chunks::<4>();
+            if !rest.is_empty() {
+                return None;
+            }
+            let total = if delimited {
+                count_nul(blob) + 1
+            } else {
+                words.len()
+            };
+            Some(Self {
+                delimited,
+                rest: Some(blob),
+                words,
+                index: 0,
+                total,
+            })
+        }
+
+        /// Set capacity to reserve up front; larger batches grow their sets as they fill.
+        fn capacity(&self) -> usize {
+            self.total.min(1 << 16)
+        }
+
+        /// Whether every item and index was consumed exactly.
+        fn complete(&self) -> bool {
+            self.words.is_empty()
+                && if self.delimited {
+                    self.rest.is_none()
+                } else {
+                    self.rest.is_some_and(<[u8]>::is_empty)
+                }
+        }
+
+        fn next_delimited(&mut self) -> Option<Item<'a>> {
+            let rest = self.rest?;
+            // SAFETY: `rest` is a live slice; memchr reads at most `rest.len()` bytes.
+            let found = unsafe { memchr(rest.as_ptr(), 0, rest.len()) };
+            let text = if found.is_null() {
+                self.rest = None;
+                rest
+            } else {
+                let at = found as usize - rest.as_ptr() as usize;
+                self.rest = Some(&rest[at + 1..]);
+                &rest[..at]
+            };
+            let index = self.index;
+            self.index += 1;
+            if let Some((word, words)) = self.words.split_first()
+                && u32::from_le_bytes(*word) == index
+            {
+                self.words = words;
+                return Some(if text.is_empty() {
+                    Item::Null
+                } else {
+                    Item::Invalid
+                });
+            }
+            Some(Item::Text(text))
+        }
+
+        fn next_length(&mut self) -> Option<Item<'a>> {
+            let (word, words) = self.words.split_first()?;
+            self.words = words;
+            Some(match u32::from_le_bytes(*word) {
+                NULL => Item::Null,
+                INVALID => Item::Invalid,
+                length => {
+                    let rest = self.rest.unwrap_or_default();
+                    match rest.split_at_checked(length as usize) {
+                        Some((text, after)) => {
+                            self.rest = Some(after);
+                            Item::Text(text)
+                        }
+                        None => Item::Invalid,
+                    }
+                }
+            })
+        }
+    }
+
+    /// NUL bytes in the blob. Each 255-byte chunk folds into a `u8` counter, so the scan
+    /// vectorizes without widening.
+    fn count_nul(blob: &[u8]) -> usize {
+        blob.chunks(255)
+            .map(|chunk| {
+                usize::from(
+                    chunk
+                        .iter()
+                        .fold(0u8, |count, &b| count.wrapping_add(u8::from(b == 0))),
+                )
+            })
+            .sum()
+    }
+
+    /// Whether the text holds the byte (libc memchr).
+    #[inline]
+    fn has_byte(text: &[u8], byte: u8) -> bool {
+        // SAFETY: `text` is a live slice; memchr reads at most `text.len()` bytes.
+        !unsafe { memchr(text.as_ptr(), i32::from(byte), text.len()) }.is_null()
+    }
+
+    impl<'a> Iterator for Rows<'a> {
+        type Item = Item<'a>;
+
+        fn next(&mut self) -> Option<Item<'a>> {
+            if self.delimited {
+                self.next_delimited()
+            } else {
+                self.next_length()
+            }
+        }
+    }
+
+    #[inline]
+    fn fold_mul(a: u64, b: u64) -> u64 {
+        let product = u128::from(a) * u128::from(b);
+        (product as u64) ^ ((product >> 64) as u64)
+    }
+
+    /// ASCII-lowercases the eight bytes of a word: bytes `A`-`Z` gain 0x20, all others stay.
+    #[inline]
+    fn lower_word(word: u64) -> u64 {
+        const HIGH: u64 = 0x8080_8080_8080_8080;
+        const ONES: u64 = 0x0101_0101_0101_0101;
+        let low = word & !HIGH;
+        let from_a = low + ONES * u64::from(0x80 - b'A');
+        let past_z = low + ONES * u64::from(0x80 - b'Z' - 1);
+        word | ((from_a & !past_z & !word & HIGH) >> 2)
+    }
+
+    /// Folded-multiply hash of the ASCII-lowercased text, read in place a word at a time.
+    fn caseless_hash(text: &[u8]) -> u64 {
+        const SEEDS: [u64; 4] = [
+            0x243f_6a88_85a3_08d3,
+            0x1319_8a2e_0370_7344,
+            0xa409_3822_299f_31d0,
+            0x082e_fa98_ec4e_6c89,
+        ];
+        let len = text.len();
+        let lower = |bytes: &[u8; 8]| lower_word(u64::from_le_bytes(*bytes));
+        let word = |at: usize| {
+            let mut chunk = [0u8; 8];
+            chunk.copy_from_slice(&text[at..at + 8]);
+            lower(&chunk)
+        };
+        let mut acc = (len as u64).wrapping_mul(SEEDS[0]);
+        if len >= 16 {
+            for block in text.as_chunks::<16>().0 {
+                let (a, b) = block.split_at(8);
+                let (a, b) = (
+                    lower(a.try_into().unwrap_or(&[0; 8])),
+                    lower(b.try_into().unwrap_or(&[0; 8])),
+                );
+                acc = acc
+                    .rotate_left(29)
+                    .wrapping_add(fold_mul(a ^ SEEDS[1], b ^ SEEDS[2]));
+            }
+            acc = acc.rotate_left(29).wrapping_add(fold_mul(
+                word(len - 16) ^ SEEDS[2],
+                word(len - 8) ^ SEEDS[3],
+            ));
+        } else if len >= 8 {
+            acc = fold_mul(acc ^ word(0) ^ SEEDS[1], word(len - 8) ^ SEEDS[2]);
+        } else if len > 0 {
+            let mut tail = [0u8; 8];
+            tail[..len].copy_from_slice(text);
+            acc = fold_mul(
+                acc ^ lower_word(u64::from_le_bytes(tail)) ^ SEEDS[1],
+                SEEDS[2],
+            );
+        }
+        fold_mul(acc ^ SEEDS[3], SEEDS[0])
+    }
+
+    /// A text compared and hashed under ASCII case folding (`strtolower()`), so the set needs no
+    /// lowercased copy of the batch.
+    #[derive(Clone, Copy)]
+    struct Caseless<'a>(&'a [u8]);
+
+    impl PartialEq for Caseless<'_> {
+        fn eq(&self, other: &Self) -> bool {
+            self.0.eq_ignore_ascii_case(other.0)
+        }
+    }
+
+    impl Eq for Caseless<'_> {}
+
+    impl Hash for Caseless<'_> {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            state.write_u64(caseless_hash(self.0));
+        }
+    }
+
+    /// Passes the precomputed `Caseless` hash through.
+    #[derive(Default)]
+    struct Passthrough(u64);
+
+    impl Hasher for Passthrough {
+        fn write(&mut self, bytes: &[u8]) {
+            for &b in bytes {
+                self.0 = self.0.rotate_left(8) ^ u64::from(b);
+            }
+        }
+
+        fn write_u64(&mut self, value: u64) {
+            self.0 = value;
+        }
+
+        fn finish(&self) -> u64 {
+            self.0
+        }
+    }
+
+    fn caseless_set<'a>(capacity: usize) -> HashSet<Caseless<'a>, BuildHasherDefault<Passthrough>> {
+        HashSet::with_capacity_and_hasher(capacity, BuildHasherDefault::default())
+    }
+
+    /// Open-addressing set of positive integers (0 marks a free slot), at most half full.
+    struct IdSet {
+        slots: Vec<u64>,
+        shift: u32,
+        len: usize,
+    }
+
+    impl IdSet {
+        fn new(items: usize) -> Self {
+            let size = (items.max(8) * 2).next_power_of_two();
+            Self {
+                slots: vec![0; size],
+                shift: 64 - size.trailing_zeros(),
+                len: 0,
+            }
+        }
+
+        /// Whether the value was new; `value` must be positive.
+        fn insert(&mut self, value: u64) -> bool {
+            if (self.len + 1) * 2 > self.slots.len() {
+                let mut grown = Self::new(self.slots.len());
+                for &slot in self.slots.iter().filter(|&&slot| slot != 0) {
+                    grown.insert(slot);
+                }
+                *self = grown;
+            }
+            let mask = self.slots.len() - 1;
+            let mut at = (value.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> self.shift) as usize;
+            loop {
+                match self.slots[at] {
+                    0 => {
+                        self.slots[at] = value;
+                        self.len += 1;
+                        return true;
+                    }
+                    slot if slot == value => return false,
+                    _ => at = (at + 1) & mask,
+                }
+            }
+        }
+    }
+
+    /// The calendar day of `^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$` when `checkdate()` accepts it and
+    /// the time is within 23:59:59.
+    pub(super) fn canonical_day(value: &[u8]) -> Option<&[u8]> {
+        let v: &[u8; 19] = value.try_into().ok()?;
+        let shape = v.iter().enumerate().all(|(i, &b)| match i {
+            4 | 7 => b == b'-',
+            10 => b == b' ',
+            13 | 16 => b == b':',
+            _ => b.is_ascii_digit(),
+        });
+        if !shape {
+            return None;
+        }
+        let num = |at: usize, len: usize| {
+            v[at..at + len]
+                .iter()
+                .fold(0u32, |acc, &b| acc * 10 + u32::from(b - b'0'))
+        };
+        let (year, month, day) = (num(0, 4), num(5, 2), num(8, 2));
+        let leap =
+            year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+        let days = match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if leap => 29,
+            2 => 28,
+            _ => return None,
+        };
+        (year >= 1
+            && (1..=days).contains(&day)
+            && num(11, 2) < 24
+            && num(14, 2) < 60
+            && num(17, 2) < 60)
+            .then(|| &value[..10])
+    }
+
+    /// Op 0: `SrrdbSource::summarizeDateBatch`: non-strings and dates that trim to nothing are
+    /// undated; the rest are canonical (`canonical_day()`) or malformed, counting those trim()
+    /// changed and the distinct canonical days.
+    fn srrdb_dates(rows: &mut Rows<'_>) -> Option<Vec<i64>> {
+        // undated, canonical, malformed, padded
+        let mut counts = [0i64; 4];
+        let mut days = set_with(rows.capacity());
+        for row in rows.by_ref() {
+            let date = match row {
+                Item::Text(date) => date,
+                Item::Null => {
+                    counts[0] += 1;
+                    continue;
+                }
+                Item::Invalid => return None,
+            };
+            let value = php_trim(date);
+            if value.is_empty() {
+                counts[0] += 1;
+                continue;
+            }
+            if value.len() != date.len() {
+                counts[3] += 1;
+            }
+            match canonical_day(value) {
+                Some(day) => {
+                    counts[1] += 1;
+                    days.insert(day);
+                }
+                None => counts[2] += 1,
+            }
+        }
+        let mut out = Vec::with_capacity(6);
+        out.push(rows.total as i64);
+        out.extend_from_slice(&counts);
+        out.push(days.len() as i64);
+        Some(out)
+    }
+
+    /// Ops 1 and 3: `ThreeDsDbSource::summarizeThreeDsDbIdBatch` and
+    /// `NswdbSource::summarizeNswdbIdBatch`: non-strings are invalid, IDs outside
+    /// `^[1-9][0-9]*$` malformed, IDs above `PHP_INT_MAX` overflow, repeated IDs duplicates and the
+    /// rest accepted, with the largest accepted ID (0 without one).
+    fn catalogue_ids(rows: &mut Rows<'_>) -> Option<Vec<i64>> {
+        // invalid, malformed, overflow, duplicate
+        let mut counts = [0i64; 4];
+        let mut seen = IdSet::new(rows.capacity());
+        let mut max = 0i64;
+        for row in rows.by_ref() {
+            let id = match row {
+                Item::Text(id) => id,
+                Item::Null => {
+                    counts[0] += 1;
+                    continue;
+                }
+                Item::Invalid => return None,
+            };
+            if id.first().is_none_or(|&b| b == b'0') || !id.iter().all(u8::is_ascii_digit) {
+                counts[1] += 1;
+                continue;
+            }
+            let value = (id.len() <= 19)
+                .then(|| {
+                    id.iter()
+                        .fold(0u64, |acc, &b| acc * 10 + u64::from(b - b'0'))
+                })
+                .and_then(|value| i64::try_from(value).ok());
+            let Some(value) = value else {
+                counts[2] += 1;
+                continue;
+            };
+            if !seen.insert(value as u64) {
+                counts[3] += 1;
+                continue;
+            }
+            max = max.max(value);
+        }
+        let mut out = Vec::with_capacity(7);
+        out.push(rows.total as i64);
+        out.extend_from_slice(&counts);
+        out.extend_from_slice(&[seen.len as i64, max]);
+        Some(out)
+    }
+
+    /// `-[A-Za-z0-9_]+$`: the trailing run of word bytes is non-empty and follows a dash.
+    fn group_suffix(title: &[u8]) -> bool {
+        let run = title.iter().rev().take_while(|&&b| word_byte(b)).count();
+        run > 0 && run < title.len() && title[title.len() - run - 1] == b'-'
+    }
+
+    /// Op 2: `XrelSource::summarizeDirnameBatch`: non-strings are invalid and dirnames that trim
+    /// to nothing empty; accepted dirnames count those trim() changed, group-suffixed and spaced
+    /// ones and the distinct `strtolower()` dirnames.
+    fn xrel_dirnames(rows: &mut Rows<'_>) -> Option<Vec<i64>> {
+        // invalid, empty, accepted, padded, grouped, spaced
+        let mut counts = [0i64; 6];
+        let mut seen = caseless_set(rows.capacity());
+        for row in rows.by_ref() {
+            let text = match row {
+                Item::Text(text) => text,
+                Item::Null => {
+                    counts[0] += 1;
+                    continue;
+                }
+                Item::Invalid => return None,
+            };
+            let title = php_trim(text);
+            if title.is_empty() {
+                counts[1] += 1;
+                continue;
+            }
+            counts[2] += 1;
+            counts[3] += i64::from(title.len() != text.len());
+            counts[4] += i64::from(group_suffix(title));
+            counts[5] += i64::from(has_byte(title, b' '));
+            seen.insert(Caseless(title));
+        }
+        let mut out = Vec::with_capacity(8);
+        out.push(rows.total as i64);
+        out.extend_from_slice(&counts);
+        out.push(seen.len() as i64);
+        Some(out)
+    }
+
+    /// Op 4: `PredbFeedImporter::summarizeTitleBatch`: non-strings are invalid; trimmed titles are
+    /// then empty, over 255 characters, or candidates, counting those trim() changed and the
+    /// `mb_strtolower()` duplicates. Declines (None) for a non-ASCII title within the limit (full
+    /// Unicode case folding stays in PHP) and for invalid UTF-8 that must be measured.
+    fn importer_titles(rows: &mut Rows<'_>) -> Option<Vec<i64>> {
+        // invalid, empty, overlength, padded
+        let mut counts = [0i64; 4];
+        let mut candidates = 0i64;
+        let mut seen = caseless_set(rows.capacity());
+        for row in rows.by_ref() {
+            let text = match row {
+                Item::Text(text) => text,
+                Item::Null => {
+                    counts[0] += 1;
+                    continue;
+                }
+                Item::Invalid => return None,
+            };
+            let title = php_trim(text);
+            if title.is_empty() {
+                counts[1] += 1;
+                continue;
+            }
+            let ascii = title.is_ascii();
+            let characters = if ascii {
+                title.len()
+            } else {
+                std::str::from_utf8(title).ok()?;
+                title.iter().filter(|&&b| b & 0xc0 != 0x80).count()
+            };
+            if characters > 255 {
+                counts[2] += 1;
+                continue;
+            }
+            if !ascii {
+                return None;
+            }
+            counts[3] += i64::from(title.len() != text.len());
+            candidates += 1;
+            seen.insert(Caseless(title));
+        }
+        let distinct = seen.len() as i64;
+        let mut out = Vec::with_capacity(7);
+        out.push(rows.total as i64);
+        out.extend_from_slice(&counts);
+        out.extend_from_slice(&[candidates - distinct, distinct]);
+        Some(out)
+    }
+
+    fn compute(operation: u32, flags: u32, blob: &[u8], lens: &[u8]) -> Option<Vec<i64>> {
+        if flags != 0 {
+            return None;
+        }
+        let rows = &mut Rows::new(operation & DELIMITED != 0, blob, lens)?;
+        let result = match operation & !DELIMITED {
+            0 => srrdb_dates(rows),
+            1 | 3 => catalogue_ids(rows),
+            2 => xrel_dirnames(rows),
+            4 => importer_titles(rows),
+            _ => None,
+        }?;
+        rows.complete().then_some(result)
+    }
+
+    /// # Safety
+    /// See [`super::nntmux_w462_predb_feed_batch`].
+    #[allow(clippy::too_many_arguments)]
+    pub(super) unsafe fn evaluate(
+        operation: u32,
+        flags: u32,
+        blob: *const u8,
+        blob_len: usize,
+        lens: *const u8,
+        lens_len: usize,
+        output: *mut u8,
+        capacity: usize,
+    ) -> isize {
+        if !nfo_abi_range(blob, blob_len, false)
+            || !nfo_abi_range(lens, lens_len, false)
+            || !nfo_abi_range(output, capacity, false)
+            || blob_len > MAX_INPUT
+            || lens_len > MAX_INPUT
+            || yenc_ranges_overlap(blob as usize, blob_len, output as usize, capacity)
+            || yenc_ranges_overlap(lens as usize, lens_len, output as usize, capacity)
+        {
+            return -1;
+        }
+        let blob = unsafe { slice::from_raw_parts(blob, blob_len) };
+        let lens = unsafe { slice::from_raw_parts(lens, lens_len) };
+        let Some(result) = compute(operation, flags, blob, lens) else {
+            return -1;
+        };
+        debug_assert!(result.len() <= MAX_SLOTS);
+        let needed = result.len() * 8;
+        if needed > capacity {
+            return -(needed as isize);
+        }
+        let out = unsafe { slice::from_raw_parts_mut(output, needed) };
+        for (chunk, value) in out.as_chunks_mut::<8>().0.iter_mut().zip(&result) {
+            chunk.copy_from_slice(&value.to_ne_bytes());
+        }
+        needed as isize
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn pack(items: &[Option<&[u8]>]) -> (Vec<u8>, Vec<u8>) {
+            let mut blob = vec![];
+            let mut lens = vec![];
+            for item in items {
+                let length = match item {
+                    Some(text) => {
+                        blob.extend_from_slice(text);
+                        text.len() as u32
+                    }
+                    None => NULL,
+                };
+                lens.extend_from_slice(&length.to_le_bytes());
+            }
+            (blob, lens)
+        }
+
+        fn call_raw(operation: u32, flags: u32, blob: &[u8], lens: &[u8]) -> Option<Vec<i64>> {
+            let mut out = vec![0xa5u8; 128];
+            let written = unsafe {
+                evaluate(
+                    operation,
+                    flags,
+                    blob.as_ptr(),
+                    blob.len(),
+                    lens.as_ptr(),
+                    lens.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            if written < 0 {
+                assert_eq!(written, -1);
+                return None;
+            }
+            Some(
+                out[..written as usize]
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|c| i64::from_ne_bytes(*c))
+                    .collect(),
+            )
+        }
+
+        fn call(operation: u32, items: &[Option<&[u8]>]) -> Option<Vec<i64>> {
+            let (blob, lens) = pack(items);
+            call_raw(operation, 0, &blob, &lens)
+        }
+
+        #[test]
+        fn w46_2_canonical_day() {
+            assert_eq!(
+                canonical_day(b"2024-02-29 23:59:59"),
+                Some(&b"2024-02-29"[..])
+            );
+            assert_eq!(
+                canonical_day(b"2000-02-29 00:00:00"),
+                Some(&b"2000-02-29"[..])
+            );
+            for bad in [
+                &b"2023-02-29 00:00:00"[..],
+                b"1900-02-29 00:00:00",
+                b"2024-04-31 00:00:00",
+                b"2024-13-01 00:00:00",
+                b"2024-00-01 00:00:00",
+                b"2024-01-00 00:00:00",
+                b"0000-01-01 00:00:00",
+                b"2024-01-01 24:00:00",
+                b"2024-01-01 00:60:00",
+                b"2024-01-01 00:00:60",
+                b"2024-01-01T00:00:00",
+                b"2024-01-01 00:00:0",
+                b"2024-01-01 00:00:000",
+                b"2024/01/01 00:00:00",
+                b"2024-01-01 0a:00:00",
+                b"",
+            ] {
+                assert_eq!(canonical_day(bad), None, "{bad:?}");
+            }
+        }
+
+        #[test]
+        fn w46_2_srrdb_dates() {
+            let items: [Option<&[u8]>; 9] = [
+                Some(b"2024-01-02 03:04:05"),
+                Some(b" 2024-01-02 23:00:00\n"),
+                Some(b"2024-01-03 00:00:00"),
+                Some(b"2024-02-30 00:00:00"),
+                Some(b"yesterday"),
+                Some(b" \0\x0b"),
+                Some(b""),
+                None,
+                Some(b"\x0c2024-01-02 03:04:05"),
+            ];
+            // total, undated, canonical, malformed, padded, distinct_days
+            assert_eq!(call(0, &items), Some(vec![9, 3, 3, 3, 1, 2]));
+            assert_eq!(call(0, &[]), Some(vec![0; 6]));
+        }
+
+        #[test]
+        fn w46_2_catalogue_ids() {
+            let items: [Option<&[u8]>; 11] = [
+                Some(b"1"),
+                Some(b"42"),
+                Some(b"42"),
+                Some(b"042"),
+                Some(b"0"),
+                Some(b""),
+                Some(b" 7"),
+                Some(b"9223372036854775807"),
+                Some(b"9223372036854775808"),
+                Some(b"99999999999999999999"),
+                None,
+            ];
+            // total, invalid, malformed, overflow, duplicate, accepted, max_id
+            let expected = vec![11, 1, 4, 2, 1, 3, i64::MAX];
+            assert_eq!(call(1, &items), Some(expected.clone()));
+            assert_eq!(call(3, &items), Some(expected));
+            assert_eq!(call(1, &[]), Some(vec![0; 7]));
+            assert_eq!(
+                call(3, &[Some(b"5"), Some(b"3")]),
+                Some(vec![2, 0, 0, 0, 0, 2, 5])
+            );
+        }
+
+        #[test]
+        fn w46_2_xrel_dirnames() {
+            assert!(group_suffix(b"Movie-GRP") && group_suffix(b"a-b-c_1") && group_suffix(b"-a"));
+            for text in [
+                &b"Movie-"[..],
+                b"Movie",
+                b"a-b.c",
+                b"GRP",
+                b"",
+                b"-",
+                b"a- b",
+                b"a.b",
+            ] {
+                assert!(!group_suffix(text), "{text:?}");
+            }
+            assert_eq!(count_nul(&[0u8; 20000]), 20000);
+            assert_eq!(count_nul(&[1u8; 20000]), 0);
+            assert_eq!(count_nul(b"\0a\0"), 2);
+            assert!(has_byte(b"a b", b' ') && !has_byte(b"ab", b' ') && !has_byte(b"", b' '));
+            let items: [Option<&[u8]>; 8] = [
+                Some(b"Movie.2024.1080p-GRP"),
+                Some(b" movie.2024.1080P-grp\t"),
+                Some(b"Spaced Title-GRP"),
+                Some(b"No.Group"),
+                Some(b"Trail-"),
+                Some(b" \0"),
+                None,
+                Some(b"\xc3\x89t\xc3\xa9-GRP"),
+            ];
+            // total, invalid, empty, accepted, padded, grouped, spaced, distinct
+            assert_eq!(call(2, &items), Some(vec![8, 1, 1, 6, 1, 4, 1, 5]));
+            assert_eq!(call(2, &[]), Some(vec![0; 8]));
+        }
+
+        #[test]
+        fn w46_2_importer_titles() {
+            let long = [b'a'; 256];
+            let max = [b'a'; 255];
+            let wide = "\u{e9}".repeat(256);
+            let items: [Option<&[u8]>; 8] = [
+                Some(b"Movie.2024-GRP"),
+                Some(b" MOVIE.2024-grp "),
+                Some(b"Other-GRP"),
+                Some(&long),
+                Some(&max),
+                Some(wide.as_bytes()),
+                Some(b"\t\n"),
+                None,
+            ];
+            // total, invalid, empty, overlength, padded, duplicate, accepted
+            assert_eq!(call(4, &items), Some(vec![8, 1, 1, 2, 1, 1, 3]));
+            assert_eq!(call(4, &[Some("Caf\u{e9}-GRP".as_bytes())]), None);
+            // mb_strtolower() substitutes invalid bytes, so invalid UTF-8 stays in PHP.
+            assert_eq!(call(4, &[Some(b"bad\xff")]), None);
+            let invalid_long = [&[0xffu8][..], &long].concat();
+            assert_eq!(call(4, &[Some(&invalid_long)]), None);
+            assert_eq!(call(4, &[]), Some(vec![0; 7]));
+        }
+
+        #[test]
+        fn w46_2_caseless_hash() {
+            for b in 0..=255u8 {
+                let word = u64::from_le_bytes([b, b'A', b'z', 0x80 | b, b'Z', b'@', b'[', 0xc1]);
+                let expected = word.to_le_bytes().map(|x| x.to_ascii_lowercase());
+                assert_eq!(lower_word(word).to_le_bytes(), expected, "{b}");
+            }
+            let mut texts: Vec<Vec<u8>> = vec![vec![], vec![0], b"A".to_vec()];
+            for len in 1..80 {
+                let text: Vec<u8> = (0..len).map(|i| b"aZ.-9_\xc3\x89 "[i % 9]).collect();
+                texts.push(text.to_ascii_uppercase());
+                texts.push(text);
+            }
+            for a in &texts {
+                for b in &texts {
+                    if a.eq_ignore_ascii_case(b) {
+                        assert_eq!(caseless_hash(a), caseless_hash(b), "{a:?} {b:?}");
+                    }
+                }
+            }
+            let distinct: HashSet<u64> = (0..5000)
+                .map(|i| caseless_hash(format!("Mirror.Release.Part{i}-GRP").as_bytes()))
+                .collect();
+            assert_eq!(distinct.len(), 5000);
+            assert_ne!(caseless_hash(b""), caseless_hash(b"\0"));
+            assert_ne!(caseless_hash(b"abcdefghij"), caseless_hash(b"abcdefghik"));
+            let mut ids = IdSet::new(0);
+            assert!((1..=64u64).all(|v| ids.insert(v * 1_000_003)));
+            assert!(!ids.insert(1_000_003) && ids.len == 64);
+        }
+
+        #[test]
+        fn w46_2_layouts_and_sentinels() {
+            let names: [&[u8]; 4] = [b"Movie-GRP", b" 12 ", b"", b"2024-01-02 03:04:05"];
+            let joined = names.join(&0u8);
+            let listed: Vec<Option<&[u8]>> = names.iter().map(|n| Some(*n)).collect();
+            let (blob, lens) = pack(&listed);
+            for op in 0..5u32 {
+                assert_eq!(
+                    call_raw(op | DELIMITED, 0, &joined, b""),
+                    call_raw(op, 0, &blob, &lens),
+                    "op {op}"
+                );
+                assert_eq!(call_raw(op, 1, &blob, &lens), None, "op {op}");
+                assert_eq!(
+                    call_raw(op, 0, b"", &INVALID.to_le_bytes()),
+                    None,
+                    "op {op}"
+                );
+            }
+            for op in [5, 0x200, u32::MAX] {
+                assert_eq!(call_raw(op, 0, &blob, &lens), None);
+            }
+            assert_eq!(call_raw(DELIMITED, 0, b"a", &1u32.to_le_bytes()), None);
+            // Null indexes must ascend strictly and name empty slots.
+            let with_nulls: Vec<Option<&[u8]>> = vec![Some(b"42"), None, Some(b"7"), None];
+            let (blob, lens) = pack(&with_nulls);
+            let indexes = [1u32, 3].map(u32::to_le_bytes).concat();
+            for op in 0..5u32 {
+                assert_eq!(
+                    call_raw(op | DELIMITED, 0, b"42\0\x007\0", &indexes),
+                    call_raw(op, 0, &blob, &lens),
+                    "op {op}"
+                );
+            }
+            let back = [3u32, 1].map(u32::to_le_bytes).concat();
+            let twice = [1u32, 1].map(u32::to_le_bytes).concat();
+            for bad in [
+                &back[..],
+                &twice,
+                &indexes[..3],
+                &0u32.to_le_bytes(),
+                &4u32.to_le_bytes(),
+            ] {
+                assert_eq!(call_raw(2 | DELIMITED, 0, b"42\0\x007\0", bad), None);
+            }
+            assert_eq!(call_raw(2, 0, &blob, &lens[..3]), None);
+            assert_eq!(call_raw(2, 0, &blob[1..], &lens), None);
+
+            let (blob, lens) = pack(&[Some(b"Movie-GRP")]);
+            let mut out = [0x5au8; 128];
+            let run = |o: *mut u8, cap: usize| unsafe {
+                evaluate(
+                    2,
+                    0,
+                    blob.as_ptr(),
+                    blob.len(),
+                    lens.as_ptr(),
+                    lens.len(),
+                    o,
+                    cap,
+                )
+            };
+            for cap in [0, 1, 63] {
+                assert_eq!(run(out.as_mut_ptr(), cap), -64);
+            }
+            assert!(out.iter().all(|b| *b == 0x5a));
+            assert_eq!(run(std::ptr::null_mut(), 64), -1);
+            assert_eq!(run(out.as_mut_ptr(), usize::MAX), -1);
+            assert_eq!(run(out.as_mut_ptr(), 64), 64);
+            assert!(out[64..].iter().all(|b| *b == 0x5a));
+            assert_eq!(
+                unsafe {
+                    evaluate(
+                        2,
+                        0,
+                        std::ptr::null(),
+                        0,
+                        lens.as_ptr(),
+                        4,
+                        out.as_mut_ptr(),
+                        64,
+                    )
+                },
+                -1
+            );
+            assert_eq!(
+                unsafe {
+                    evaluate(
+                        2,
+                        0,
+                        blob.as_ptr(),
+                        MAX_INPUT + 1,
+                        lens.as_ptr(),
+                        4,
+                        out.as_mut_ptr(),
+                        64,
+                    )
+                },
+                -1
+            );
+            let mut shared = [0u8; 128];
+            shared[..9].copy_from_slice(&blob);
+            shared[9..13].copy_from_slice(&lens);
+            let p = shared.as_mut_ptr();
+            let overlap = |at: usize| unsafe { evaluate(2, 0, p, 9, p.add(9), 4, p.add(at), 64) };
+            assert_eq!(overlap(4), -1);
+            assert_eq!(overlap(12), -1);
+            assert_eq!(overlap(16), 64);
+            let export = |op: u32, flags: u32, out: &mut [u8]| unsafe {
+                super::super::nntmux_w462_predb_feed_batch(
+                    op,
+                    flags,
+                    blob.as_ptr(),
+                    blob.len(),
+                    lens.as_ptr(),
+                    lens.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert_eq!(export(0, 0, &mut out), 48);
+            assert_eq!(export(1, 0, &mut out), 56);
+            assert_eq!(export(4, 0, &mut out), 56);
+            assert_eq!(export(4, 1, &mut out), -1);
+        }
+    }
+}
+
+/// Evaluate one Wave 46.2 PreDB feed summary over `blob`, the concatenated item bytes, and `lens`,
+/// one little-endian `u32` length per item (`u32::MAX` marks a null or non-string item); with
+/// operation bit `0x100` the blob instead holds the items separated by NUL bytes and `lens` is
+/// empty. Op 0 summarizes srrDB dates, ops 1 and 3 3dsdb and nswdb catalogue IDs, op 2 xREL
+/// dirnames and op 4 feed importer titles; `flags` must be zero. Writes native-endian `i64`
+/// counters and returns the byte count, the negated required capacity when `out_cap` is too small
+/// (nothing written), or -1 for malformed input or a batch the op leaves to PHP.
+///
+/// # Safety
+/// All three ranges must be live allocations of the given lengths, and the output must not overlap
+/// either input. Pointers must be non-null even for zero lengths.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_w462_predb_feed_batch(
+    operation: u32,
+    flags: u32,
+    blob: *const u8,
+    blob_len: usize,
+    lens: *const u8,
+    lens_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        wave46_predb_feed_import_batch::evaluate(
             operation, flags, blob, blob_len, lens, lens_len, out_buf, out_cap,
         )
     }))
