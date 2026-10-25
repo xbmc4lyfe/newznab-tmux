@@ -31647,3 +31647,1291 @@ mod w466_additional_archive_tv_metrics_witness_tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 47.6: AdditionalProcessing DTO batch helpers (`nntmux_w47_*`). Each export
+// folds a 64-128 item batch in one crossing and writes fixed-width `int64_t`
+// rows that PHP reads back with `unpack('P*')`. Strings arrive NUL-joined, or
+// concatenated with `pack('V*')` lengths when an item itself contains a NUL.
+// Every export returns 1, -1 for invalid input or -2 when `out` is too small or
+// misaligned, and leaves `out` untouched unless it returns 1.
+// ---------------------------------------------------------------------------
+
+const W47_FNV_OFFSET: u32 = 2_166_136_261;
+const W47_FNV_PRIME: u32 = 16_777_619;
+/// Per-item byte, latency and duration clamp (2^40 - 1).
+const W47_VALUE_CAP: i64 = (1 << 40) - 1;
+/// Running-total cap; a capped total plus one clamped value stays below 2^63.
+const W47_TOTAL_CAP: i64 = 1 << 62;
+const W47_MAX_ITEMS: usize = 1 << 20;
+
+#[inline]
+fn w47_fnv(hash: u32, value: u32) -> u32 {
+    (hash ^ value).wrapping_mul(W47_FNV_PRIME)
+}
+
+#[inline]
+fn w47_clamp(value: i64) -> i64 {
+    value.clamp(0, W47_VALUE_CAP)
+}
+
+#[inline]
+fn w47_add(total: i64, value: i64) -> i64 {
+    (total + value).min(W47_TOTAL_CAP)
+}
+
+/// `count` items from NUL-joined bytes (`lens` empty) or from `pack('V*')`
+/// lengths over the concatenation.
+fn w47_items<'a>(joined: &'a [u8], lens: &[u8], count: usize) -> Option<Vec<&'a [u8]>> {
+    if count > W47_MAX_ITEMS {
+        return None;
+    }
+    if lens.is_empty() {
+        return w466_split(joined, count);
+    }
+    if lens.len() != count.checked_mul(4)? {
+        return None;
+    }
+    let mut parts = Vec::with_capacity(count);
+    let mut at = 0usize;
+    for chunk in lens.as_chunks::<4>().0 {
+        let end = at.checked_add(u32::from_le_bytes(*chunk) as usize)?;
+        parts.push(joined.get(at..end)?);
+        at = end;
+    }
+    (at == joined.len()).then_some(parts)
+}
+
+/// `rows` columns of `count` machine-order `int64_t` values (PHP `pack('q*')`).
+fn w47_ints(packed: &[u8], rows: usize, count: usize) -> Option<Vec<i64>> {
+    if count > W47_MAX_ITEMS || packed.len() != rows.checked_mul(count)?.checked_mul(8)? {
+        return None;
+    }
+    Some(w466_i64s(packed)?.collect())
+}
+
+/// PHP `str_contains()` on bytes.
+fn w47_contains(haystack: &[u8], needle: &[u8]) -> bool {
+    let Some((&first, rest)) = needle.split_first() else {
+        return true;
+    };
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    let last = haystack.len() - needle.len();
+    let mut at = 0;
+    while let Some(offset) = haystack[at..=last].iter().position(|&byte| byte == first) {
+        let start = at + offset;
+        if &haystack[start + 1..start + needle.len()] == rest {
+            return true;
+        }
+        at = start + 1;
+        if at > last {
+            break;
+        }
+    }
+    false
+}
+
+fn w47_contains_any(haystack: &[u8], needles: &[&[u8]]) -> bool {
+    needles.iter().any(|needle| w47_contains(haystack, needle))
+}
+
+/// PHP `strrpos()` on bytes.
+fn w47_rfind(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    (0..=haystack.len() - needle.len())
+        .rev()
+        .find(|&at| &haystack[at..at + needle.len()] == needle)
+}
+
+/// `ctype_digit()`.
+fn w47_digits(value: &[u8]) -> bool {
+    !value.is_empty() && value.iter().all(u8::is_ascii_digit)
+}
+
+/// `(int)` of a short (at most 6 digit) ASCII digit string.
+fn w47_parse(digits: &[u8]) -> i64 {
+    digits
+        .iter()
+        .fold(0i64, |value, &digit| value * 10 + i64::from(digit - b'0'))
+}
+
+/// Text after the last dot (empty without one) and the dot position.
+fn w47_extension(lower: &[u8]) -> (&[u8], Option<usize>) {
+    match lower.iter().rposition(|&byte| byte == b'.') {
+        Some(dot) => (&lower[dot + 1..], Some(dot)),
+        None => (&[], None),
+    }
+}
+
+fn w47_lower_into(source: &[u8], buffer: &mut Vec<u8>) {
+    buffer.clear();
+    buffer.extend(source.iter().map(u8::to_ascii_lowercase));
+}
+
+unsafe fn w47_finish(out: *mut i64, out_count: usize, values: Option<Vec<i64>>) -> i32 {
+    match values {
+        None => -1,
+        // SAFETY: forwarded output contract.
+        Some(values) => {
+            if unsafe { w466_write_i64s(out, out_count, &values) } {
+                1
+            } else {
+                -2
+            }
+        }
+    }
+}
+
+// --- AdditionalBatchResult::summarizeOutcomeTelemetry ------------------------
+
+pub(crate) const W47_OUTCOME_FIELDS: usize = 33;
+
+/// `ProcessingOutcome` case index, 12 for an unknown value.
+pub(crate) fn w47_outcome_index(value: &[u8]) -> usize {
+    match value {
+        b"completed" => 0,
+        b"no-useful-artifacts" => 1,
+        b"passworded" => 2,
+        b"group-unavailable" => 3,
+        b"temporary-workspace-unavailable" => 4,
+        b"timed-out" => 5,
+        b"deleted-after-timeout" => 6,
+        b"deleted-broken-nzb" => 7,
+        b"deleted-par2-only" => 8,
+        b"not-found" => 9,
+        b"awaiting-late-articles" => 10,
+        b"failed" => 11,
+        _ => 12,
+    }
+}
+
+/// Retry class of a lowercased error message: 0 none, 1 transient network,
+/// 2 missing articles, 3 corrupt data, 4 permanent, 5 unknown. The highest
+/// matching class wins, as PHP's ordered `str_contains()` checks do; one pass
+/// dispatches each byte to the needles starting with it.
+pub(crate) fn w47_retry_class(lower: &[u8]) -> usize {
+    if lower.is_empty() {
+        return 0;
+    }
+    let mut best = 0usize;
+    for at in 0..lower.len() {
+        let rest = &lower[at..];
+        let class = match rest[0] {
+            b'p' if rest.starts_with(b"password") => 4,
+            b'e' if rest.starts_with(b"encrypted") => 4,
+            b'u' if rest.starts_with(b"unsupported") => 4,
+            b'c' if rest.starts_with(b"crc")
+                || rest.starts_with(b"corrupt")
+                || rest.starts_with(b"checksum") =>
+            {
+                3
+            }
+            b'c' if rest.starts_with(b"connection") => 1,
+            b'b' if rest.starts_with(b"bad data") => 3,
+            b'4' if rest.starts_with(b"430") => 2,
+            b'n' if rest.starts_with(b"no such article") => 2,
+            b'm' if rest.starts_with(b"missing") => 2,
+            b'i' if rest.starts_with(b"incomplete") => 2,
+            b't' if rest.starts_with(b"timeout")
+                || rest.starts_with(b"timed out")
+                || rest.starts_with(b"temporar") =>
+            {
+                1
+            }
+            b'r' if rest.starts_with(b"reset by peer") || rest.starts_with(b"refused") => 1,
+            _ => continue,
+        };
+        if class == 4 {
+            return 4;
+        }
+        best = best.max(class);
+    }
+    if best == 0 { 5 } else { best }
+}
+
+/// Layout: `[0]` count, `[1..=13]` outcome counts (12 cases, unknown), `[14]`
+/// successful, `[15]` deleted, `[16..=21]` retry classes, `[22]` retryable,
+/// `[23]` retry-exhausted (3+ attempts), `[24]` elapsed total, `[25]` elapsed
+/// max, `[26..=30]` <100ms/<1s/<10s/<60s/longer, `[31]` first slowest index or
+/// -1, `[32]` FNV-1a digest of `case | class << 4 | min(attempts, 15) << 8`.
+pub(crate) fn w47_outcome_telemetry(
+    outcomes: &[&[u8]],
+    errors: &[&[u8]],
+    ints: &[i64],
+) -> Vec<i64> {
+    let count = outcomes.len();
+    let (elapsed, attempts) = ints.split_at(count);
+    let mut out = vec![0i64; W47_OUTCOME_FIELDS];
+    out[0] = count as i64;
+    out[31] = -1;
+    let (mut digest, mut total, mut max) = (W47_FNV_OFFSET, 0i64, -1i64);
+    let mut lower = Vec::new();
+    for index in 0..count {
+        let case = w47_outcome_index(outcomes[index]);
+        out[1 + case] += 1;
+        w47_lower_into(errors[index], &mut lower);
+        let class = w47_retry_class(&lower);
+        out[16 + class] += 1;
+        let tries = attempts[index].max(0);
+        let successful = case <= 2;
+        let deleted = (6..=8).contains(&case);
+        out[14] += i64::from(successful);
+        out[15] += i64::from(deleted);
+        if !successful && !deleted && (class == 1 || class == 2 || matches!(case, 3 | 4 | 5 | 10)) {
+            out[if tries < 3 { 22 } else { 23 }] += 1;
+        }
+        let micros = w47_clamp(elapsed[index]);
+        total = w47_add(total, micros);
+        if micros > max {
+            max = micros;
+            out[31] = index as i64;
+        }
+        let bucket = [100_000, 1_000_000, 10_000_000, 60_000_000]
+            .iter()
+            .take_while(|&&limit| micros >= limit)
+            .count();
+        out[26 + bucket] += 1;
+        digest = w47_fnv(
+            digest,
+            case as u32 | (class as u32) << 4 | (tries.min(15) as u32) << 8,
+        );
+    }
+    out[24] = total;
+    out[25] = max.max(0);
+    out[32] = i64::from(digest);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_count` values.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_w47_batch_outcome_telemetry(
+    outcomes: *const u8,
+    outcomes_len: usize,
+    outcome_lens: *const u8,
+    outcome_lens_len: usize,
+    errors: *const u8,
+    errors_len: usize,
+    error_lens: *const u8,
+    error_lens_len: usize,
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        let values = (|| {
+            let outcomes = w47_items(
+                w15_input(outcomes, outcomes_len)?,
+                w15_input(outcome_lens, outcome_lens_len)?,
+                count,
+            )?;
+            let errors = w47_items(
+                w15_input(errors, errors_len)?,
+                w15_input(error_lens, error_lens_len)?,
+                count,
+            )?;
+            let ints = w47_ints(w15_input(ints, ints_len)?, 2, count)?;
+            Some(w47_outcome_telemetry(&outcomes, &errors, &ints))
+        })();
+        // SAFETY: forwarded output contract.
+        unsafe { w47_finish(out, out_count, values) }
+    })
+    .unwrap_or(-1)
+}
+
+// --- AdditionalWorkPlan::scheduleTaskBatch -----------------------------------
+
+pub(crate) const W47_TASK_HEADER: usize = 12;
+const W47_TASK_BASE: [i64; 9] = [900, 300, 500, 600, 700, 800, 100, 400, 0];
+const W47_KIB_CAP: i64 = 1_048_575;
+
+/// Task kind of a lowercased NZB file name: 0 first archive volume, 1 later
+/// archive volume, 2 media, 3 sample, 4 NFO, 5 PAR2 index, 6 PAR2 volume,
+/// 7 image, 8 other.
+pub(crate) fn w47_task_kind(lower: &[u8]) -> usize {
+    let (extension, dot) = w47_extension(lower);
+    match extension {
+        b"par2" => {
+            if w47_contains(lower, b".vol") {
+                6
+            } else {
+                5
+            }
+        }
+        b"nfo" => 4,
+        b"jpg" | b"jpeg" | b"png" | b"webp" | b"gif" => 7,
+        b"mkv" | b"mp4" | b"avi" | b"m4v" | b"ts" | b"m2ts" | b"wmv" | b"mov" | b"mpg"
+        | b"mpeg" | b"webm" | b"mp3" | b"flac" | b"m4a" => {
+            if w47_contains(lower, b"sample") {
+                3
+            } else {
+                2
+            }
+        }
+        b"zip" | b"7z" => 0,
+        b"rar" => {
+            let dot = dot.unwrap_or(0);
+            match w47_rfind(&lower[..dot], b".part") {
+                Some(part) if w47_digits(&lower[part + 5..dot]) => {
+                    let digits = &lower[part + 5..dot];
+                    let first = digits.iter().position(|&digit| digit != b'0');
+                    usize::from(first.map(|at| &digits[at..]) != Some(b"1"))
+                }
+                _ => 0,
+            }
+        }
+        _ if (3..=4).contains(&extension.len())
+            && extension[0] == b'r'
+            && w47_digits(&extension[1..]) =>
+        {
+            1
+        }
+        _ if extension.len() == 3 && w47_digits(extension) => usize::from(extension != b"001"),
+        _ => 8,
+    }
+}
+
+/// Layout: `[0]` count, `[1..=9]` kind counts, `[10]` selected, `[11]` selected
+/// bytes, then per priority position `index | selected << 32 | kind << 33` and
+/// the score `base << 20 | KiB component` (smaller first for samples, NFOs,
+/// PAR2 indexes and images). Selection is greedy in priority order: a task is
+/// taken when its size still fits the remaining budget.
+pub(crate) fn w47_schedule_tasks(names: &[&[u8]], sizes: &[i64], budget: i64) -> Vec<i64> {
+    let count = names.len();
+    let mut out = vec![0i64; W47_TASK_HEADER + 2 * count];
+    out[0] = count as i64;
+    let mut kinds = Vec::with_capacity(count);
+    let mut scores = Vec::with_capacity(count);
+    let mut lower = Vec::new();
+    for (name, &size) in names.iter().zip(sizes) {
+        w47_lower_into(name, &mut lower);
+        let kind = w47_task_kind(&lower);
+        out[1 + kind] += 1;
+        let kib = (size.max(0) >> 10).min(W47_KIB_CAP);
+        let component = if matches!(kind, 3 | 4 | 5 | 7) {
+            W47_KIB_CAP - kib
+        } else {
+            kib
+        };
+        kinds.push(kind);
+        scores.push(W47_TASK_BASE[kind] << 20 | component);
+    }
+    let mut order: Vec<usize> = (0..count).collect();
+    order.sort_by(|&a, &b| scores[b].cmp(&scores[a]));
+    let budget = budget.max(0);
+    let mut remaining = budget;
+    for (position, &index) in order.iter().enumerate() {
+        let size = sizes[index].max(0);
+        let selected = size <= remaining;
+        if selected {
+            remaining -= size;
+            out[10] += 1;
+        }
+        out[W47_TASK_HEADER + 2 * position] =
+            index as i64 | i64::from(selected) << 32 | (kinds[index] as i64) << 33;
+        out[W47_TASK_HEADER + 2 * position + 1] = scores[index];
+    }
+    out[11] = budget - remaining;
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_count` values.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_w47_workplan_schedule(
+    names: *const u8,
+    names_len: usize,
+    name_lens: *const u8,
+    name_lens_len: usize,
+    sizes: *const u8,
+    sizes_len: usize,
+    count: usize,
+    budget: i64,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        let values = (|| {
+            let names = w47_items(
+                w15_input(names, names_len)?,
+                w15_input(name_lens, name_lens_len)?,
+                count,
+            )?;
+            let sizes = w47_ints(w15_input(sizes, sizes_len)?, 1, count)?;
+            Some(w47_schedule_tasks(&names, &sizes, budget))
+        })();
+        // SAFETY: forwarded output contract.
+        unsafe { w47_finish(out, out_count, values) }
+    })
+    .unwrap_or(-1)
+}
+
+// --- ArchivedMediaEntry::rankEntryBatch --------------------------------------
+
+pub(crate) const W47_ENTRY_HEADER: usize = 5;
+pub(crate) const W47_ENTRY_WIDTH: usize = 5;
+
+/// 1 mkv, 2 mp4, 3 avi, 4 transport stream, 5 wmv, 6 mov, 7 MPEG program
+/// stream, 8 webm, 9 audio, 10 image, 11 subtitle, 0 other.
+pub(crate) fn w47_media_class(extension: &[u8]) -> i64 {
+    match extension {
+        b"mkv" => 1,
+        b"mp4" | b"m4v" => 2,
+        b"avi" => 3,
+        b"ts" | b"m2ts" | b"mts" => 4,
+        b"wmv" => 5,
+        b"mov" => 6,
+        b"mpg" | b"mpeg" | b"vob" => 7,
+        b"webm" => 8,
+        b"mp3" | b"flac" | b"m4a" | b"ogg" | b"wav" => 9,
+        b"jpg" | b"jpeg" | b"png" | b"webp" => 10,
+        b"srt" | b"sub" | b"idx" | b"ass" => 11,
+        _ => 0,
+    }
+}
+
+/// 2 HEVC, 1 AVC, 3 AV1, 4 MPEG-4 ASP, 0 unknown.
+pub(crate) fn w47_codec_hint(lower: &[u8]) -> i64 {
+    if w47_contains_any(lower, &[b"x265", b"h265", b"hevc"]) {
+        2
+    } else if w47_contains_any(lower, &[b"x264", b"h264", b"avc"]) {
+        1
+    } else if w47_contains(lower, b"av1") {
+        3
+    } else if w47_contains_any(lower, &[b"xvid", b"divx"]) {
+        4
+    } else {
+        0
+    }
+}
+
+/// Layout: `[0]` count, `[1]` playable video entries, `[2]` samples, `[3]`
+/// unsafe paths, `[4]` best entry or -1, then per entry: flags (1 `..`, 2
+/// absolute or drive path, 4 control bytes, 8 sample, 16 hidden, 32 empty),
+/// `class | codec << 8`, sanitized length, CRC32 of the sanitized path and
+/// rank. Ranking orders safe non-sample video, safe samples, other safe
+/// entries and unsafe entries, larger first, then by input position.
+pub(crate) fn w47_rank_entries(paths: &[&[u8]], sizes: &[i64]) -> Vec<i64> {
+    let count = paths.len();
+    let mut out = vec![0i64; W47_ENTRY_HEADER + W47_ENTRY_WIDTH * count];
+    out[0] = count as i64;
+    out[4] = -1;
+    let mut tiers = Vec::with_capacity(count);
+    let (mut stripped, mut clean, mut lower) = (Vec::new(), Vec::new(), Vec::new());
+    for (index, path) in paths.iter().enumerate() {
+        let mut flags = 0i64;
+        stripped.clear();
+        for &byte in *path {
+            if byte < 0x20 || byte == 0x7f {
+                flags |= 4;
+            } else {
+                stripped.push(if byte == b'\\' { b'/' } else { byte });
+            }
+        }
+        let mut rest = stripped.as_slice();
+        if rest.first() == Some(&b'/') {
+            flags |= 2;
+        } else if rest.len() >= 2 && rest[1] == b':' && (rest[0] | 0x20).is_ascii_lowercase() {
+            flags |= 2;
+            rest = &rest[2..];
+        }
+        clean.clear();
+        let mut base_start = 0;
+        for segment in rest.split(|&byte| byte == b'/') {
+            if segment.is_empty() || segment == b"." {
+                continue;
+            }
+            if segment == b".." {
+                flags |= 1;
+                continue;
+            }
+            if !clean.is_empty() {
+                clean.push(b'/');
+            }
+            base_start = clean.len();
+            clean.extend_from_slice(segment);
+        }
+        let base = &clean[base_start..];
+        if clean.is_empty() {
+            flags |= 32;
+        }
+        if base.first() == Some(&b'.') {
+            flags |= 16;
+        }
+        w47_lower_into(base, &mut lower);
+        if w47_contains(&lower, b"sample") {
+            flags |= 8;
+        }
+        let class = w47_media_class(w47_extension(&lower).0);
+        let unsafe_path = flags & 39 != 0;
+        let tier = if unsafe_path {
+            3
+        } else if (1..=8).contains(&class) {
+            i64::from(flags & 8 != 0)
+        } else {
+            2
+        };
+        out[1] += i64::from(tier <= 1);
+        out[2] += i64::from(flags & 8 != 0);
+        out[3] += i64::from(unsafe_path);
+        let at = W47_ENTRY_HEADER + W47_ENTRY_WIDTH * index;
+        out[at] = flags;
+        out[at + 1] = class | w47_codec_hint(&lower) << 8;
+        out[at + 2] = clean.len() as i64;
+        out[at + 3] = i64::from(crc32_fast(&clean));
+        tiers.push(tier);
+    }
+    let mut order: Vec<usize> = (0..count).collect();
+    order.sort_by(|&a, &b| {
+        tiers[a]
+            .cmp(&tiers[b])
+            .then_with(|| sizes[b].max(0).cmp(&sizes[a].max(0)))
+    });
+    for (rank, &index) in order.iter().enumerate() {
+        out[W47_ENTRY_HEADER + W47_ENTRY_WIDTH * index + 4] = rank as i64;
+    }
+    if let Some(&best) = order.first()
+        && tiers[best] <= 1
+    {
+        out[4] = best as i64;
+    }
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_count` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w47_media_entry_rank(
+    paths: *const u8,
+    paths_len: usize,
+    path_lens: *const u8,
+    path_lens_len: usize,
+    sizes: *const u8,
+    sizes_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        let values = (|| {
+            let paths = w47_items(
+                w15_input(paths, paths_len)?,
+                w15_input(path_lens, path_lens_len)?,
+                count,
+            )?;
+            let sizes = w47_ints(w15_input(sizes, sizes_len)?, 1, count)?;
+            Some(w47_rank_entries(&paths, &sizes))
+        })();
+        // SAFETY: forwarded output contract.
+        unsafe { w47_finish(out, out_count, values) }
+    })
+    .unwrap_or(-1)
+}
+
+// --- DownloadMetrics::articleStatsBatch ---------------------------------------
+
+pub(crate) const W47_ARTICLE_FIELDS: usize = 20;
+/// Largest byte total whose `* 1_000_000` fits an `int64_t`.
+const W47_THROUGHPUT_BYTES_CAP: i64 = 8_796_093_022_207;
+/// Largest throughput whose `* 1_000_000` fits an `int64_t`.
+const W47_UTILIZATION_CAP: i64 = 9_223_372_036_854;
+
+/// Layout: `[0]` count, `[1..=5]` ok/missing/CRC/timeout/other statuses, `[6]`
+/// ok bytes, `[7]` ok latency sum, `[8]` min, `[9]` max, `[10]` mean, `[11..=13]`
+/// nearest-rank p50/p95/p99, `[14]` mean consecutive latency delta, `[15]`
+/// bytes per second over the window, `[16]` missing ppm, `[17]` failure ppm,
+/// `[18]` link utilization ppm, `[19]` longest failure streak.
+pub(crate) fn w47_article_stats(
+    ints: &[i64],
+    window_micros: i64,
+    link_bytes_per_second: i64,
+) -> Vec<i64> {
+    let count = ints.len() / 3;
+    let (latencies, rest) = ints.split_at(count);
+    let (bytes, statuses) = rest.split_at(count);
+    let mut out = vec![0i64; W47_ARTICLE_FIELDS];
+    out[0] = count as i64;
+    let mut ok: Vec<i64> = Vec::with_capacity(count);
+    let (mut total, mut sum, mut jitter, mut streak) = (0i64, 0i64, 0i64, 0i64);
+    for index in 0..count {
+        let status = statuses[index];
+        out[1 + if (0..=3).contains(&status) {
+            status as usize
+        } else {
+            4
+        }] += 1;
+        if status != 0 {
+            streak += 1;
+            out[19] = out[19].max(streak);
+            continue;
+        }
+        streak = 0;
+        let latency = w47_clamp(latencies[index]);
+        total = w47_add(total, w47_clamp(bytes[index]));
+        sum = w47_add(sum, latency);
+        if let Some(&previous) = ok.last() {
+            jitter = w47_add(jitter, (latency - previous).abs());
+        }
+        ok.push(latency);
+    }
+    let okays = ok.len() as i64;
+    out[6] = total;
+    out[7] = sum;
+    if okays > 0 {
+        out[10] = sum / okays;
+        out[14] = if okays > 1 { jitter / (okays - 1) } else { 0 };
+        ok.sort_unstable();
+        out[8] = ok[0];
+        out[9] = ok[ok.len() - 1];
+        for (slot, percentile) in [(11, 50), (12, 95), (13, 99)] {
+            out[slot] = ok[((percentile * okays + 99) / 100 - 1) as usize];
+        }
+    }
+    if window_micros > 0 {
+        out[15] = total.min(W47_THROUGHPUT_BYTES_CAP) * 1_000_000 / window_micros;
+    }
+    if count > 0 {
+        out[16] = out[2] * 1_000_000 / count as i64;
+        out[17] = (count as i64 - okays) * 1_000_000 / count as i64;
+    }
+    if link_bytes_per_second > 0 {
+        out[18] = out[15].min(W47_UTILIZATION_CAP) * 1_000_000 / link_bytes_per_second;
+    }
+    out
+}
+
+/// # Safety
+/// A non-null `ints` must be readable for `ints_len` bytes; `out` must be aligned
+/// and writable for `out_count` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w47_article_metrics(
+    ints: *const u8,
+    ints_len: usize,
+    count: usize,
+    window_micros: i64,
+    link_bytes_per_second: i64,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        let values = w15_input(ints, ints_len)
+            .and_then(|ints| w47_ints(ints, 3, count))
+            .map(|ints| w47_article_stats(&ints, window_micros, link_bytes_per_second));
+        // SAFETY: forwarded output contract.
+        unsafe { w47_finish(out, out_count, values) }
+    })
+    .unwrap_or(-1)
+}
+
+// --- DownloadedArchive::verifyVolumeBatch -------------------------------------
+
+pub(crate) const W47_VOLUME_HEADER: usize = 9;
+pub(crate) const W47_VOLUME_WIDTH: usize = 4;
+const W47_HEAD_BYTES: usize = 64;
+
+/// 2 RAR5, 1 RAR4, 3 ZIP, 4 7z, 5 gzip, 6 PAR2, 0 unknown.
+pub(crate) fn w47_signature(head: &[u8]) -> i64 {
+    if head.starts_with(b"Rar!\x1a\x07\x01\x00") {
+        2
+    } else if head.starts_with(b"Rar!\x1a\x07\x00") {
+        1
+    } else if head.starts_with(b"PK\x03\x04") || head.starts_with(b"PK\x07\x08") {
+        3
+    } else if head.starts_with(&SEVENZIP_SIGNATURE) {
+        4
+    } else if head.starts_with(b"\x1f\x8b") {
+        5
+    } else if head.starts_with(b"PAR2\0PKT") {
+        6
+    } else {
+        0
+    }
+}
+
+/// Expected container (-1 unknown extension, 0 generic split, 1 RAR, 3 ZIP,
+/// 4 7z, 5 gzip, 6 PAR2), volume ordinal and set stem of a lowercased name.
+pub(crate) fn w47_volume(lower: &[u8]) -> (i64, i64, &[u8]) {
+    let (extension, dot) = w47_extension(lower);
+    let Some(dot) = dot else {
+        return (-1, -1, lower);
+    };
+    let stem = &lower[..dot];
+    match extension {
+        b"rar" => match w47_rfind(stem, b".part") {
+            Some(part) if stem.len() - part - 5 <= 6 && w47_digits(&stem[part + 5..]) => {
+                (1, (w47_parse(&stem[part + 5..]) - 1).max(0), &stem[..part])
+            }
+            _ => (1, 0, stem),
+        },
+        b"zip" => (3, 0, stem),
+        b"7z" => (4, 0, stem),
+        b"gz" => (5, 0, stem),
+        b"par2" => match w47_rfind(stem, b".vol") {
+            Some(volume) => (6, 1, &stem[..volume]),
+            None => (6, 0, stem),
+        },
+        _ if extension.len() == 3 && extension[0] == b'r' && w47_digits(&extension[1..]) => {
+            (1, w47_parse(&extension[1..]) + 1, stem)
+        }
+        _ if extension.len() == 3 && extension[0] == b'z' && w47_digits(&extension[1..]) => {
+            (3, w47_parse(&extension[1..]), stem)
+        }
+        _ if extension.len() == 3 && w47_digits(extension) => {
+            let ordinal = (w47_parse(extension) - 1).max(0);
+            match w47_extension(stem) {
+                (b"7z", Some(inner)) => (4, ordinal, &stem[..inner]),
+                _ => (0, ordinal, stem),
+            }
+        }
+        _ => (-1, -1, lower),
+    }
+}
+
+/// Layout: `[0]` count, `[1]` sets, `[2..=5]` matched/mismatched/continuation/
+/// unknown statuses, `[6]` missing volumes, `[7]` duplicate volumes, `[8]`
+/// FNV-1a digest of each head's CRC32 (first 64 bytes) and ordinal in volume
+/// order, then per item `status | signature << 4 | (expected + 1) << 8`,
+/// ordinal, set id (first index of the set) and volume-order position.
+pub(crate) fn w47_verify_volumes(lower_names: &[&[u8]], heads: &[&[u8]]) -> Vec<i64> {
+    let count = lower_names.len();
+    let mut out = vec![0i64; W47_VOLUME_HEADER + W47_VOLUME_WIDTH * count];
+    out[0] = count as i64;
+    let mut sets: std::collections::HashMap<(i64, &[u8]), i64> =
+        std::collections::HashMap::with_capacity(count);
+    let mut rows = Vec::with_capacity(count);
+    for (index, (name, head)) in lower_names.iter().zip(heads).enumerate() {
+        let (expected, ordinal, stem) = w47_volume(name);
+        let signature = w47_signature(head);
+        let status = if expected < 0 {
+            3
+        } else if expected == 0 || (matches!(expected, 3 | 4) && ordinal > 0) {
+            2
+        } else if expected == 1 {
+            i64::from(!matches!(signature, 1 | 2))
+        } else {
+            i64::from(signature != expected)
+        };
+        out[2 + status as usize] += 1;
+        let set = *sets.entry((expected, stem)).or_insert(index as i64);
+        let at = W47_VOLUME_HEADER + W47_VOLUME_WIDTH * index;
+        out[at] = status | signature << 4 | (expected + 1) << 8;
+        out[at + 1] = ordinal;
+        out[at + 2] = set;
+        rows.push((set, ordinal, expected));
+    }
+    out[1] = sets.len() as i64;
+    let mut order: Vec<usize> = (0..count).collect();
+    order.sort_by(|&a, &b| (rows[a].0, rows[a].1).cmp(&(rows[b].0, rows[b].1)));
+    let (mut digest, mut previous_set, mut previous) = (W47_FNV_OFFSET, -1i64, 0i64);
+    for (position, &index) in order.iter().enumerate() {
+        out[W47_VOLUME_HEADER + W47_VOLUME_WIDTH * index + 3] = position as i64;
+        let head = heads[index];
+        let (set, ordinal, expected) = rows[index];
+        digest = w47_fnv(digest, crc32_fast(&head[..head.len().min(W47_HEAD_BYTES)]));
+        digest = w47_fnv(digest, ordinal as u32);
+        if expected < 0 || expected == 6 {
+            continue;
+        }
+        if set != previous_set {
+            out[6] += ordinal;
+            previous_set = set;
+        } else if ordinal == previous {
+            out[7] += 1;
+        } else if ordinal > previous + 1 {
+            out[6] += ordinal - previous - 1;
+        }
+        previous = ordinal;
+    }
+    out[8] = i64::from(digest);
+    out
+}
+
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_count` values.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_w47_archive_volume_verify(
+    names: *const u8,
+    names_len: usize,
+    name_lens: *const u8,
+    name_lens_len: usize,
+    heads: *const u8,
+    heads_len: usize,
+    head_lens: *const u8,
+    head_lens_len: usize,
+    count: usize,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        let values = (|| {
+            let lower = w15_input(names, names_len)?.to_ascii_lowercase();
+            let names = w47_items(&lower, w15_input(name_lens, name_lens_len)?, count)?;
+            let heads = w47_items(
+                w15_input(heads, heads_len)?,
+                w15_input(head_lens, head_lens_len)?,
+                count,
+            )?;
+            Some(w47_verify_volumes(&names, &heads))
+        })();
+        // SAFETY: forwarded output contract.
+        unsafe { w47_finish(out, out_count, values) }
+    })
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod w476_additional_dto_batch_tests {
+    use super::*;
+    use std::ptr::{null, null_mut};
+
+    fn joined(items: &[&[u8]]) -> Vec<u8> {
+        items.join(&0u8)
+    }
+
+    fn packed(values: &[i64]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn additional_w47_items_split_nul_and_length_layouts() {
+        assert_eq!(w47_items(b"", b"", 0), Some(vec![]));
+        assert_eq!(w47_items(b"", b"", 1), Some(vec![&b""[..]]));
+        assert_eq!(w47_items(b"a\0b", b"", 2), Some(vec![&b"a"[..], b"b"]));
+        assert_eq!(w47_items(b"a\0b", b"", 1), None);
+        let lens: Vec<u8> = [3u32, 0, 1]
+            .iter()
+            .flat_map(|len| len.to_le_bytes())
+            .collect();
+        assert_eq!(
+            w47_items(b"a\0bc", &lens, 3),
+            Some(vec![&b"a\0b"[..], b"", b"c"])
+        );
+        assert_eq!(w47_items(b"a\0bcd", &lens, 3), None);
+        assert_eq!(w47_items(b"a\0b", &lens, 3), None);
+        assert_eq!(w47_items(b"abc", &lens[..8], 3), None);
+        assert_eq!(w47_ints(&packed(&[1, 2]), 2, 1), Some(vec![1, 2]));
+        assert_eq!(w47_ints(&packed(&[1, 2]), 3, 1), None);
+        assert!(
+            w47_contains(b"abcabd", b"abd")
+                && w47_contains(b"x", b"")
+                && !w47_contains(b"ab", b"abc")
+        );
+        assert_eq!(w47_rfind(b"a.part1.part2", b".part"), Some(7));
+        assert_eq!(w47_rfind(b"abc", b""), None);
+    }
+
+    #[test]
+    fn additional_w47_outcome_telemetry_layout() {
+        let outcomes: [&[u8]; 5] = [
+            b"completed",
+            b"timed-out",
+            b"failed",
+            b"deleted-broken-nzb",
+            b"bogus",
+        ];
+        let errors: [&[u8]; 5] = [
+            b"",
+            b"Read TIMEOUT",
+            b"430 No Such Article",
+            b"CRC mismatch",
+            b"weird",
+        ];
+        let mut ints = vec![50_000, 2_000_000, 70_000_000, -5, i64::MAX];
+        ints.extend([0, 1, 5, 0, -2]);
+        let out = w47_outcome_telemetry(&outcomes, &errors, &ints);
+        assert_eq!(out.len(), W47_OUTCOME_FIELDS);
+        assert_eq!(out[0], 5);
+        assert_eq!(&out[1..14], &[1, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 1]);
+        assert_eq!((out[14], out[15]), (1, 1));
+        assert_eq!(&out[16..22], &[1, 1, 1, 1, 0, 1]);
+        // timed-out (1 try) is retryable; failed + missing article with 5 tries is exhausted.
+        assert_eq!((out[22], out[23]), (1, 1));
+        assert_eq!(out[24], 50_000 + 2_000_000 + 70_000_000 + W47_VALUE_CAP);
+        assert_eq!((out[25], out[31]), (W47_VALUE_CAP, 4));
+        assert_eq!(&out[26..31], &[2, 0, 1, 0, 2]);
+        let mut digest = W47_FNV_OFFSET;
+        for value in [
+            0u32,
+            5 | 1 << 4 | 1 << 8,
+            11 | 2 << 4 | 5 << 8,
+            7 | 3 << 4,
+            12 | 5 << 4,
+        ] {
+            digest = w47_fnv(digest, value);
+        }
+        assert_eq!(out[32], i64::from(digest));
+        let empty = w47_outcome_telemetry(&[], &[], &[]);
+        assert_eq!(
+            (empty[0], empty[25], empty[31], empty[32]),
+            (0, 0, -1, i64::from(W47_FNV_OFFSET))
+        );
+        assert_eq!(w47_retry_class(b"bad password"), 4);
+        assert_eq!(w47_retry_class(b"connection refused"), 1);
+    }
+
+    #[test]
+    fn additional_w47_retry_class_matches_ordered_contains() {
+        let reference = |lower: &[u8]| -> usize {
+            let groups: [(usize, &[&[u8]]); 4] = [
+                (4, &[b"password", b"encrypted", b"unsupported"]),
+                (3, &[b"crc", b"corrupt", b"checksum", b"bad data"]),
+                (2, &[b"430", b"no such article", b"missing", b"incomplete"]),
+                (
+                    1,
+                    &[
+                        b"timeout",
+                        b"timed out",
+                        b"connection",
+                        b"reset by peer",
+                        b"refused",
+                        b"temporar",
+                    ],
+                ),
+            ];
+            if lower.is_empty() {
+                return 0;
+            }
+            groups
+                .iter()
+                .find(|(_, needles)| w47_contains_any(lower, needles))
+                .map_or(5, |&(class, _)| class)
+        };
+        let words: [&[u8]; 16] = [
+            b"password",
+            b"encrypte",
+            b"crc",
+            b"corrup",
+            b"checksum",
+            b"bad data",
+            b"430",
+            b"43",
+            b"no such article",
+            b"missing",
+            b"incomplete",
+            b"timeout",
+            b"timed out",
+            b"connection",
+            b"refused",
+            b"temporar",
+        ];
+        let mut state = 476u64;
+        for _ in 0..20_000 {
+            let mut message = Vec::new();
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            for shift in 0..(state >> 61) {
+                let word = words[(state >> (4 * shift + 8)) as usize & 15];
+                message.extend_from_slice(word);
+                message.push(b" xyz"[(state >> (shift + 40)) as usize & 3]);
+            }
+            assert_eq!(
+                w47_retry_class(&message),
+                reference(&message),
+                "{}",
+                String::from_utf8_lossy(&message)
+            );
+        }
+    }
+
+    #[test]
+    fn additional_w47_task_kinds_and_schedule() {
+        let cases: [(&[u8], usize); 18] = [
+            (b"x.part01.rar", 0),
+            (b"x.part1.rar", 0),
+            (b"x.part02.rar", 1),
+            (b"x.part.rar", 0),
+            (b"x.rar", 0),
+            (b"x.r00", 1),
+            (b"x.r000", 1),
+            (b"x.001", 0),
+            (b"x.002", 1),
+            (b"x.zip", 0),
+            (b"x.vol01+02.par2", 6),
+            (b"x.par2", 5),
+            (b"x.nfo", 4),
+            (b"x-sample.mkv", 3),
+            (b"x.mkv", 2),
+            (b"x.jpg", 7),
+            (b"noext", 8),
+            (b"x.part00001.rar", 0),
+        ];
+        for (name, kind) in cases {
+            assert_eq!(
+                w47_task_kind(name),
+                kind,
+                "{}",
+                String::from_utf8_lossy(name)
+            );
+        }
+        let names: [&[u8]; 4] = [
+            b"Movie.MKV",
+            b"movie.nfo",
+            b"movie.part01.rar",
+            b"movie.part02.rar",
+        ];
+        let out = w47_schedule_tasks(&names, &[4096, 2048, 1024, -1], 3000);
+        assert_eq!(out[0], 4);
+        assert_eq!(&out[1..10], &[1, 1, 1, 0, 1, 0, 0, 0, 0]);
+        // Priority: first volume (900), NFO (700), media (500), later volume (300).
+        let order: Vec<i64> = (0..4)
+            .map(|at| out[W47_TASK_HEADER + 2 * at] & 0xFFFF_FFFF)
+            .collect();
+        assert_eq!(order, [2, 1, 0, 3]);
+        let selected: Vec<i64> = (0..4)
+            .map(|at| out[W47_TASK_HEADER + 2 * at] >> 32 & 1)
+            .collect();
+        assert_eq!(selected, [1, 0, 0, 1]);
+        assert_eq!((out[10], out[11]), (2, 1024));
+        assert_eq!(out[W47_TASK_HEADER + 1], 900 << 20 | 1);
+        assert_eq!(out[W47_TASK_HEADER + 3], 700 << 20 | (W47_KIB_CAP - 2));
+        assert_eq!(w47_schedule_tasks(&[], &[], -5), vec![0; W47_TASK_HEADER]);
+    }
+
+    #[test]
+    fn additional_w47_entry_rank_sanitizes_and_orders() {
+        let paths: [&[u8]; 5] = [
+            b"Movie/Sample/movie-sample.mkv",
+            b"C:\\Movie\\..\\Movie.x265.MKV",
+            b"Movie//./Movie.1080p.x264.mkv",
+            b"Movie/cover.jpg",
+            b"\x01../",
+        ];
+        let out = w47_rank_entries(&paths, &[100, 900, 800, 50, 1]);
+        assert_eq!(&out[..W47_ENTRY_HEADER], &[5, 2, 1, 2, 2]);
+        let row =
+            |index: usize| &out[W47_ENTRY_HEADER + W47_ENTRY_WIDTH * index..][..W47_ENTRY_WIDTH];
+        assert_eq!(row(0)[0], 8);
+        assert_eq!(
+            row(1)[..3],
+            [3, 1 | 2 << 8, b"Movie/Movie.x265.MKV".len() as i64]
+        );
+        assert_eq!(
+            row(2)[..3],
+            [0, 1 | 1 << 8, b"Movie/Movie.1080p.x264.mkv".len() as i64]
+        );
+        assert_eq!(
+            row(2)[3],
+            i64::from(crc32_fast(b"Movie/Movie.1080p.x264.mkv"))
+        );
+        assert_eq!(row(4)[..3], [1 | 4 | 32, 0, 0]);
+        let ranks: Vec<i64> = (0..5).map(|index| row(index)[4]).collect();
+        assert_eq!(ranks, [1, 3, 0, 2, 4]);
+        assert_eq!(w47_rank_entries(&[], &[]), vec![0, 0, 0, 0, -1]);
+    }
+
+    #[test]
+    fn additional_w47_article_stats_layout() {
+        let mut ints = vec![100, 300, 200, 999, 400, -7];
+        ints.extend([1000, 2000, 3000, 9, 4000, 5000]);
+        ints.extend([0, 0, 1, 2, 0, 9]);
+        let out = w47_article_stats(&ints, 1_000_000, 20_000);
+        assert_eq!(&out[..6], &[6, 3, 1, 1, 0, 1]);
+        assert_eq!(
+            (out[6], out[7], out[8], out[9], out[10]),
+            (7000, 800, 100, 400, 266)
+        );
+        assert_eq!(&out[11..14], &[300, 400, 400]);
+        assert_eq!(out[14], (200 + 100) / 2);
+        assert_eq!(
+            (out[15], out[16], out[17], out[18], out[19]),
+            (7000, 166_666, 500_000, 350_000, 2)
+        );
+        let empty = w47_article_stats(&[], 0, 0);
+        assert_eq!(empty, vec![0; W47_ARTICLE_FIELDS]);
+        let huge = w47_article_stats(&[i64::MAX, i64::MAX, 0], 1, 1);
+        assert_eq!(
+            (huge[6], huge[15], huge[18]),
+            (
+                W47_VALUE_CAP,
+                W47_VALUE_CAP * 1_000_000,
+                W47_UTILIZATION_CAP * 1_000_000
+            )
+        );
+    }
+
+    #[test]
+    fn additional_w47_volume_verification() {
+        let names: [&[u8]; 7] = [
+            b"show.part02.rar",
+            b"show.part01.rar",
+            b"show.part04.rar",
+            b"show.par2",
+            b"show.vol00+01.par2",
+            b"archive.7z.002",
+            b"readme",
+        ];
+        let rar: &[u8] = b"Rar!\x1a\x07\x01\x00rest";
+        let heads: [&[u8]; 7] = [rar, rar, b"junk", b"PAR2\0PKTx", b"PAR2\0PKTy", b"", b"x"];
+        let out = w47_verify_volumes(&names, &heads);
+        // The 7z set misses its leading volume and the RAR set misses part03.
+        assert_eq!(&out[..8], &[7, 4, 4, 1, 1, 1, 2, 0]);
+        let row =
+            |index: usize| &out[W47_VOLUME_HEADER + W47_VOLUME_WIDTH * index..][..W47_VOLUME_WIDTH];
+        assert_eq!(row(0), [2 << 4 | 2 << 8, 1, 0, 1]);
+        assert_eq!(row(1), [2 << 4 | 2 << 8, 0, 0, 0]);
+        assert_eq!(row(2), [1 | 2 << 8, 3, 0, 2]);
+        assert_eq!(row(4)[..3], [6 << 4 | 7 << 8, 1, 3]);
+        assert_eq!(row(5)[..3], [2 | 5 << 8, 1, 5]);
+        assert_eq!(row(6)[..3], [3, -1, 6]);
+        assert_eq!(w47_volume(b"a.r07"), (1, 8, &b"a"[..]));
+        assert_eq!(w47_volume(b"a.z01"), (3, 1, &b"a"[..]));
+        assert_eq!(w47_volume(b"a.mkv.001"), (0, 0, &b"a.mkv"[..]));
+        assert_eq!(
+            w47_volume(b"a.part1234567.rar"),
+            (1, 0, &b"a.part1234567"[..])
+        );
+        assert_eq!(w47_signature(b"Rar!\x1a\x07\x00"), 1);
+        assert_eq!(w47_signature(b"7z\xbc\xaf\x27\x1c"), 4);
+        assert_eq!(
+            w47_verify_volumes(&[], &[]),
+            vec![0, 0, 0, 0, 0, 0, 0, 0, i64::from(W47_FNV_OFFSET)]
+        );
+    }
+
+    #[test]
+    fn additional_w47_exports_validate_inputs_and_outputs() {
+        let mut out = [0i64; 64];
+        let names = joined(&[b"a.rar", b"b.nfo"]);
+        let sizes = packed(&[1, 2]);
+        let call = |out: *mut i64, cap: usize, count: usize| unsafe {
+            nntmux_w47_workplan_schedule(
+                names.as_ptr(),
+                names.len(),
+                null(),
+                0,
+                sizes.as_ptr(),
+                sizes.len(),
+                count,
+                10,
+                out,
+                cap,
+            )
+        };
+        assert_eq!(call(out.as_mut_ptr(), out.len(), 2), 1);
+        assert_eq!(out[0], 2);
+        assert_eq!(call(out.as_mut_ptr(), out.len(), 3), -1);
+        assert_eq!(call(out.as_mut_ptr(), W47_TASK_HEADER + 3, 2), -2);
+        assert_eq!(call(null_mut(), 0, 2), -2);
+        assert_eq!(
+            unsafe {
+                nntmux_w47_workplan_schedule(
+                    null(),
+                    1,
+                    null(),
+                    0,
+                    null(),
+                    0,
+                    0,
+                    0,
+                    out.as_mut_ptr(),
+                    64,
+                )
+            },
+            -1
+        );
+
+        let ints = packed(&[5, 6, 0]);
+        assert_eq!(
+            unsafe {
+                nntmux_w47_article_metrics(ints.as_ptr(), ints.len(), 1, 1, 1, out.as_mut_ptr(), 64)
+            },
+            1
+        );
+        assert_eq!((out[0], out[6]), (1, 6));
+        assert_eq!(
+            unsafe {
+                nntmux_w47_article_metrics(ints.as_ptr(), ints.len(), 2, 1, 1, out.as_mut_ptr(), 64)
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe { nntmux_w47_article_metrics(null(), 0, 0, 0, 0, out.as_mut_ptr(), 64) },
+            1
+        );
+
+        let outcomes = joined(&[b"completed"]);
+        let lens: Vec<u8> = 3u32.to_le_bytes().to_vec();
+        let ints = packed(&[1, 0]);
+        assert_eq!(
+            unsafe {
+                nntmux_w47_batch_outcome_telemetry(
+                    outcomes.as_ptr(),
+                    outcomes.len(),
+                    null(),
+                    0,
+                    b"a\0b".as_ptr(),
+                    3,
+                    lens.as_ptr(),
+                    4,
+                    ints.as_ptr(),
+                    ints.len(),
+                    1,
+                    out.as_mut_ptr(),
+                    64,
+                )
+            },
+            1
+        );
+        assert_eq!((out[1], out[21]), (1, 1));
+
+        let paths = joined(&[b"a.mkv"]);
+        let sizes = packed(&[1]);
+        assert_eq!(
+            unsafe {
+                nntmux_w47_media_entry_rank(
+                    paths.as_ptr(),
+                    paths.len(),
+                    null(),
+                    0,
+                    sizes.as_ptr(),
+                    8,
+                    1,
+                    out.as_mut_ptr(),
+                    64,
+                )
+            },
+            1
+        );
+        assert_eq!(out[4], 0);
+
+        let names = b"A.RAR".to_vec();
+        let heads = b"Rar!\x1a\x07\x00";
+        let head_lens = 7u32.to_le_bytes();
+        assert_eq!(
+            unsafe {
+                nntmux_w47_archive_volume_verify(
+                    names.as_ptr(),
+                    names.len(),
+                    null(),
+                    0,
+                    heads.as_ptr(),
+                    heads.len(),
+                    head_lens.as_ptr(),
+                    4,
+                    1,
+                    out.as_mut_ptr(),
+                    64,
+                )
+            },
+            1
+        );
+        assert_eq!((out[2], out[W47_VOLUME_HEADER]), (1, 1 << 4 | 2 << 8));
+    }
+}
