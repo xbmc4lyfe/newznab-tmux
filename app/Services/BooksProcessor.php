@@ -7,6 +7,7 @@ namespace App\Services;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 class BooksProcessor
@@ -345,6 +346,180 @@ class BooksProcessor
             }
 
             return $summary;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** Enabled: three paired runs cleared every 1.5x gate (common mean 5.18-5.80x, p99 4.76-5.14x; uncommon mean 4.46-4.65x, p99 3.34-3.81x); see RustTvPipeBookServiceBooksConsolesGamesProcessorW53ParityTest. */
+    private const bool W53_RUST_FFI_DEFAULT = true;
+
+    public const string W53_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w533_book_title_flag_batch(const char *blob, size_t blob_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    public static function usesW53RustFfi(): bool
+    {
+        $override = self::w53RustFfiState();
+
+        return \is_bool($override) ? $override : self::W53_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 53 Rust path forced on or off, then restores the previous setting. */
+    public static function withW53RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w53RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w53RustFfiState('set', $previous);
+        }
+    }
+
+    /** Per uppercased token: 2 ebook, 4 audiobook, 8 comic, 16 magazine and 32 RETAIL (the W414 token sets). */
+    private const array W53_BOOK_TOKEN_FLAGS = [
+        'EPUB' => 2, 'MOBI' => 2, 'AZW' => 2, 'AZW3' => 2, 'PDF' => 2, 'KF8' => 2, 'LIT' => 2, 'FB2' => 2, 'DJVU' => 2,
+        'AUDIOBOOK' => 4, 'AUDIOBOOKS' => 4, 'M4B' => 4, 'UNABRIDGED' => 4, 'ABRIDGED' => 4, 'MP3' => 4,
+        'CBR' => 8, 'CBZ' => 8, 'CB7' => 8, 'COMIC' => 8, 'COMICS' => 8,
+        'MAGAZINE' => 16, 'MAGAZINES' => 16, 'ISSUE' => 16, 'WEEKLY' => 16, 'MONTHLY' => 16,
+        'RETAIL' => 32,
+    ];
+
+    /**
+     * Classifies book release titles: one word per trimmed title with `flags | year << 8`, flags 1
+     * empty, 2 ebook, 4 audiobook, 8 comic, 16 magazine and 32 RETAIL tokens, and `year` the first
+     * 19xx/20xx token (0 without one); then the six flag counts and the year-tagged count. Tokens are
+     * maximal ASCII alphanumeric runs compared case-insensitively.
+     *
+     * @param  array<array-key, string>  $titles
+     * @return list<int>
+     */
+    public static function w53BookTitleFlagBatch(array $titles): array
+    {
+        return self::usesW53RustFfi() ? self::w53BookTitleFlagBatchNative($titles) : self::w53BookTitleFlagBatchPhp($titles);
+    }
+
+    /**
+     * @param  array<array-key, string>  $titles
+     * @return list<int>
+     */
+    public static function w53BookTitleFlagBatchNative(array $titles): array
+    {
+        return self::w533Invoke($titles, \count($titles) + 7) ?? self::w53BookTitleFlagBatchPhp($titles);
+    }
+
+    /**
+     * @param  array<array-key, string>  $titles
+     * @return list<int>
+     */
+    public static function w53BookTitleFlagBatchPhp(array $titles): array
+    {
+        $out = [];
+        $totals = [0, 0, 0, 0, 0, 0];
+        $years = 0;
+        foreach ($titles as $title) {
+            $title = trim((string) $title);
+            if ($title === '') {
+                $word = 1;
+            } else {
+                $flags = 0;
+                $year = 0;
+                foreach (preg_split('/[^A-Za-z0-9]+/', strtoupper($title), -1, PREG_SPLIT_NO_EMPTY) ?: [] as $token) {
+                    $flags |= self::W53_BOOK_TOKEN_FLAGS[$token] ?? 0;
+                    if ($year === 0 && \strlen($token) === 4 && ctype_digit($token) && (str_starts_with($token, '19') || str_starts_with($token, '20'))) {
+                        $year = (int) $token;
+                    }
+                }
+                $years += (int) ($year !== 0);
+                $word = $flags | ($year << 8);
+            }
+            $totals[0] += $word & 1;
+            $totals[1] += ($word >> 1) & 1;
+            $totals[2] += ($word >> 2) & 1;
+            $totals[3] += ($word >> 3) & 1;
+            $totals[4] += ($word >> 4) & 1;
+            $totals[5] += ($word >> 5) & 1;
+            $out[] = $word;
+        }
+        array_push($out, ...$totals);
+        $out[] = $years;
+
+        return $out;
+    }
+
+    /**
+     * Wave 53 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out'
+     * returns an `int64_t` output buffer of at least $val words.
+     */
+    private static function w53RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('categorize_w53', self::W53_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w53RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 53.3 export with the NUL-joined $items. Null when the library is missing, the
+     * call declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>|null
+     */
+    private static function w533Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w53RustFfiState('ffi');
+            $out = self::w53RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $blob = implode("\0", $items);
+            if (substr_count($blob, "\0") !== max(0, \count($items) - 1)) {
+                // An item holds a NUL byte: substitute a space, which classifies identically (trim() strips both bytes and both split tokens).
+                $blob = implode("\0", str_replace("\0", ' ', $items));
+            }
+            // @phpstan-ignore method.notFound (Declared by W53_FFI_CDEF.)
+            $written = $ffi->nntmux_w533_book_title_flag_batch($blob, \strlen($blob), \count($items), $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
         } catch (Throwable) {
             return null;
         }
