@@ -47780,7 +47780,7 @@ pub mod w494_tv {
         3,
         local_db_show_key
     );
-    export!(nntmux_w49_tv_trakt_ids_batch, 2, 0, 2, trakt_ids);
+    export!(nntmux_w49_tv_trakt_provider_ids_batch, 2, 0, 2, trakt_ids);
     export!(
         nntmux_w49_tv_outcome_resolve_batch,
         1,
@@ -47900,7 +47900,7 @@ mod w494_tests {
             b"http",
             b"///x",
         ];
-        let out = words(nntmux_w49_tv_trakt_ids_batch, &[&imdb, &images], &[], 6, 2);
+        let out = words(nntmux_w49_tv_trakt_provider_ids_batch, &[&imdb, &images], &[], 6, 2);
         assert_eq!(
             out,
             [
@@ -48063,7 +48063,7 @@ mod w494_tests {
 
     const EXPORTS: [(Export, usize, usize, usize); 5] = [
         (nntmux_w49_tv_local_db_show_key_batch, 2, 1, 3),
-        (nntmux_w49_tv_trakt_ids_batch, 2, 0, 2),
+        (nntmux_w49_tv_trakt_provider_ids_batch, 2, 0, 2),
         (nntmux_w49_tv_outcome_resolve_batch, 1, 7, 4),
         (nntmux_w49_tv_poster_pick_batch, 3, 0, 3),
         (nntmux_w49_tv_show_adder_request_batch, 2, 0, 2),
@@ -48192,12 +48192,12 @@ mod w494_tests {
                 let mut out = vec![0i64; fields.len() * 2];
                 let count = fields.len();
                 assert_eq!(
-                    call(nntmux_w49_tv_trakt_ids_batch, &text, &[], count, &mut out),
+                    call(nntmux_w49_tv_trakt_provider_ids_batch, &text, &[], count, &mut out),
                     (count * 2) as isize
                 );
                 let short = &text[..text.len() - 2];
                 assert_eq!(
-                    call(nntmux_w49_tv_trakt_ids_batch, short, &[], count, &mut out),
+                    call(nntmux_w49_tv_trakt_provider_ids_batch, short, &[], count, &mut out),
                     -1
                 );
             }
@@ -48209,7 +48209,7 @@ mod w494_tests {
         let mut buffer = [0i64; 8];
         let ptr = buffer.as_mut_ptr();
         let rc = unsafe {
-            nntmux_w49_tv_trakt_ids_batch(ptr.cast::<u8>(), 3, std::ptr::null(), 0, 1, ptr, 8)
+            nntmux_w49_tv_trakt_provider_ids_batch(ptr.cast::<u8>(), 3, std::ptr::null(), 0, 1, ptr, 8)
         };
         assert_eq!(rc, -1);
     }
