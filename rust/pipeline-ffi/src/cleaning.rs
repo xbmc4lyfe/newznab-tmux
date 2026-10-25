@@ -25107,3 +25107,799 @@ mod wave36_1_user_gdpr_auth_events_provider_tests {
         assert_eq!(&out[56..], &[0x5a; 8]);
     }
 }
+
+// Wave 37.1: release name fixing, multiprocessing, database reset and existing-release audit
+// command plans. Integers are native-endian i64 (PHP pack `q`); a string is an i64 byte
+// length (-1 = PHP null) followed by its raw bytes. Booleans travel in the `flags` word.
+pub mod wave37_1_fix_names_reset_verify {
+    use std::collections::HashSet;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    pub const DECLINE: isize = -1;
+    pub const MAX_INPUT: usize = 16 * 1024 * 1024;
+    /// PHP's default `trim()` set: " \t\n\r\0\x0B".
+    const TRIM_SET: &[u8] = b" \t\n\r\0\x0B";
+    const MAX_TABLE_NAME: usize = 64;
+
+    pub const OP_FIX_NAMES_PLAN: u32 = 1;
+    pub const OP_GROUP_RUN_PLAN: u32 = 2;
+    pub const OP_PREDB_SEARCHED: u32 = 3;
+    pub const OP_FORK_TYPE: u32 = 4;
+    pub const OP_RESET_PLAN: u32 = 5;
+    pub const OP_AUDIT_RUN_PLAN: u32 = 6;
+
+    /// Flag bits accepted by each operation; any other bit declines.
+    pub fn allowed_flags(operation: u32) -> Option<u32> {
+        match operation {
+            OP_FIX_NAMES_PLAN => Some(0b1111),
+            OP_GROUP_RUN_PLAN | OP_PREDB_SEARCHED | OP_FORK_TYPE | OP_RESET_PLAN => Some(0b1),
+            OP_AUDIT_RUN_PLAN => Some(0b1111),
+            _ => None,
+        }
+    }
+
+    struct Reader<'a> {
+        bytes: &'a [u8],
+        offset: usize,
+    }
+
+    impl<'a> Reader<'a> {
+        fn take(&mut self, count: usize) -> Option<&'a [u8]> {
+            let end = self.offset.checked_add(count)?;
+            let value = self.bytes.get(self.offset..end)?;
+            self.offset = end;
+            Some(value)
+        }
+
+        fn integer(&mut self) -> Option<i64> {
+            Some(i64::from_ne_bytes(self.take(8)?.try_into().ok()?))
+        }
+
+        fn string(&mut self) -> Option<Option<&'a [u8]>> {
+            match self.integer()? {
+                -1 => Some(None),
+                len if len < 0 => None,
+                len => Some(Some(self.take(usize::try_from(len).ok()?)?)),
+            }
+        }
+
+        fn required_string(&mut self) -> Option<&'a [u8]> {
+            self.string()?
+        }
+
+        fn remaining(&self) -> usize {
+            self.bytes.len() - self.offset
+        }
+    }
+
+    fn put_int(out: &mut Vec<u8>, value: i64) {
+        out.extend_from_slice(&value.to_ne_bytes());
+    }
+
+    fn put_string(out: &mut Vec<u8>, value: &[u8]) {
+        put_int(out, value.len() as i64);
+        out.extend_from_slice(value);
+    }
+
+    fn trim(mut s: &[u8]) -> &[u8] {
+        while let Some((first, rest)) = s.split_first() {
+            if !TRIM_SET.contains(first) {
+                break;
+            }
+            s = rest;
+        }
+        while let Some((last, rest)) = s.split_last() {
+            if !TRIM_SET.contains(last) {
+                break;
+            }
+            s = rest;
+        }
+        s
+    }
+
+    /// `FixReleaseNames::normalizeFixNamesPlanPhp()`:
+    /// `[method, valid, source, pass, requires_nntp, other, limit_present, limit]` where source
+    /// is 0 none, 1 nfo, 2 files, 3 par2, 4 media, 5 xxx_files, 6 srr, 7 par_hash,
+    /// 8 media_movie_name, 9 crc and pass is 0 invalid, 1 recent (past 6 hours), 2 full.
+    pub fn fix_names_plan(method: &[u8], category: Option<&[u8]>, limit: Option<i64>) -> [i64; 8] {
+        let number = match method {
+            [d] if d.is_ascii_digit() => i64::from(d - b'0'),
+            [a, b] if *a != b'0' && a.is_ascii_digit() && b.is_ascii_digit() => {
+                i64::from(a - b'0') * 10 + i64::from(b - b'0')
+            }
+            _ => -1,
+        };
+        let valid = (3..=20).contains(&number);
+        let (method, source, pass) = if valid {
+            (
+                number,
+                (number - 1) / 2,
+                if number % 2 == 1 { 1 } else { 2 },
+            )
+        } else {
+            (0, 0, 0)
+        };
+        let other = match category {
+            Some(b"all") => 2,
+            Some(b"predb_id") => 3,
+            _ => 1,
+        };
+        [
+            method,
+            i64::from(valid),
+            source,
+            pass,
+            i64::from(method == 7 || method == 8),
+            other,
+            i64::from(limit.is_some()),
+            limit.map_or(0, |value| value.max(1)),
+        ]
+    }
+
+    /// `ReleasesFixNamesGroup::normalizeGroupRunPlanPhp()`:
+    /// `[type, valid, error, guid_valid, limit, limit_positive, thread, workers, thread_in_range]`
+    /// where type is 0 invalid, 1 standard, 2 predbft and error is 0 none, 1 invalid_type,
+    /// 2 missing_guid_char.
+    pub fn group_run_plan(
+        kind: &[u8],
+        guid_char: Option<&[u8]>,
+        limit: i64,
+        thread: i64,
+        workers: i64,
+    ) -> [i64; 9] {
+        let (kind, error) = match kind {
+            b"standard" => (1, if guid_char.is_none() { 2 } else { 0 }),
+            b"predbft" => (2, 0),
+            _ => (0, 1),
+        };
+        let guid_valid = matches!(guid_char, Some([c]) if c.is_ascii_hexdigit());
+        [
+            kind,
+            i64::from(error == 0),
+            error,
+            i64::from(guid_valid),
+            limit,
+            i64::from(limit > 0),
+            thread,
+            workers,
+            i64::from(thread >= 1 && thread <= workers),
+        ]
+    }
+
+    /// `ReleasesFixNamesGroup::planPredbSearchedUpdatePhp()`:
+    /// `[searched, outcome, requires_unsearched]` where outcome is 1 matched, 2 exhausted,
+    /// 3 decrement.
+    pub fn predb_searched(matched: bool, ftmatched: i64, searched: i64) -> [i64; 3] {
+        let (searched, outcome) = if matched {
+            (1, 1)
+        } else if ftmatched < 0 {
+            (-6, 2)
+        } else {
+            (searched.saturating_sub(1), 3)
+        };
+        [searched, outcome, i64::from(searched != 1)]
+    }
+
+    /// `ProcessFixRelNames::normalizeForkTypePhp()`: `[type, exact]` where type is 0 invalid,
+    /// 1 standard, 2 predbft.
+    pub fn fork_type(raw: Option<&[u8]>) -> [i64; 2] {
+        let raw_bytes = raw.unwrap_or_default();
+        let normalized = trim(raw_bytes).to_ascii_lowercase();
+        let kind = match normalized.as_slice() {
+            b"standard" => 1,
+            b"predbft" => 2,
+            _ => 0,
+        };
+        let exact = kind != 0 && raw.is_some() && raw_bytes == normalized.as_slice();
+        [kind, i64::from(exact)]
+    }
+
+    fn is_table_name(name: &[u8]) -> bool {
+        name.len() <= MAX_TABLE_NAME
+            && name
+                .first()
+                .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
+            && name.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+    }
+
+    /// `NntmuxResetDb::normalizeResetPlanPhp()`:
+    /// `(action, search_backend, tables, invalid, duplicates)` where action is 1 refuse_environment,
+    /// 2 abort, 3 reset and search backend is 1 elasticsearch, 2 manticore. `None` table entries
+    /// are PHP non-strings.
+    pub fn reset_plan<'a>(
+        environment: &[u8],
+        confirmed: bool,
+        search_driver: &[u8],
+        tables: &[Option<&'a [u8]>],
+    ) -> (i64, i64, Vec<&'a [u8]>, i64, i64) {
+        let action = if environment != b"local" {
+            1
+        } else if !confirmed {
+            2
+        } else {
+            3
+        };
+        let search = if search_driver == b"elasticsearch" {
+            1
+        } else {
+            2
+        };
+        let mut seen = HashSet::with_capacity(tables.len());
+        let mut kept = Vec::with_capacity(tables.len());
+        let (mut invalid, mut duplicates) = (0, 0);
+        for table in tables {
+            let Some(table) = table else {
+                invalid += 1;
+                continue;
+            };
+            let table = trim(table);
+            if !is_table_name(table) {
+                invalid += 1;
+                continue;
+            }
+            if !seen.insert(table.to_ascii_lowercase()) {
+                duplicates += 1;
+                continue;
+            }
+            kept.push(table);
+        }
+        (action, search, kept, invalid, duplicates)
+    }
+
+    /// Audit run options for `VerifyExistingReleases::normalizeAuditRunPlanPhp()`.
+    #[derive(Clone, Copy, Debug)]
+    pub struct AuditInput {
+        pub dry_run: bool,
+        pub delete: bool,
+        pub resume: bool,
+        pub retry_turn: bool,
+        pub limit: i64,
+        pub since_id: i64,
+        pub state_cursor: i64,
+        pub fresh_count: i64,
+        pub retry_count: i64,
+    }
+
+    /// `[limit, cursor, deletes_enabled, fresh_attempts, retry_attempts, final_retry_turn,
+    /// first_source, last_source]` where sources are 0 none, 1 fresh, 2 retry. The schedule
+    /// assumes every queued release still exists, in the command loop's interleaving order.
+    pub fn audit_run_plan(input: AuditInput) -> [i64; 8] {
+        let limit = input.limit.max(1);
+        let fresh = input.fresh_count.clamp(0, limit);
+        let retry = if input.resume {
+            input.retry_count.clamp(0, limit)
+        } else {
+            0
+        };
+        // The loop alternates starting with retries on a retry turn; once one queue empties the
+        // other drains alone. `first` is the queue the alternation starts with.
+        let (first_is_retry, first, second) = if input.retry_turn {
+            (true, retry, fresh)
+        } else {
+            (false, fresh, retry)
+        };
+        // Both queues are clamped to `0..=limit`, so `limit - second` cannot overflow.
+        let total = if first > limit - second {
+            limit
+        } else {
+            first + second
+        };
+        let pairs = first.min(second);
+        let (first_used, second_used, last_is_first) = if first == 0 {
+            (0, total, false)
+        } else if total <= pairs || total - pairs <= pairs {
+            (total - total / 2, total / 2, total % 2 == 1)
+        } else if first > second {
+            (total - pairs, pairs, true)
+        } else {
+            (pairs, total - pairs, false)
+        };
+        let (retry_used, fresh_used) = if first_is_retry {
+            (first_used, second_used)
+        } else {
+            (second_used, first_used)
+        };
+        let source = |is_first: bool| {
+            if is_first == first_is_retry { 2 } else { 1 }
+        };
+        let (first_source, last_source, final_turn) = if total == 0 {
+            (0, 0, input.retry_turn)
+        } else {
+            let last = source(last_is_first);
+            (source(first != 0), last, last != 2)
+        };
+        [
+            limit,
+            if input.resume {
+                input.state_cursor
+            } else {
+                input.since_id
+            },
+            i64::from(!input.dry_run && input.delete),
+            fresh_used,
+            retry_used,
+            i64::from(final_turn),
+            first_source,
+            last_source,
+        ]
+    }
+
+    pub fn compute(operation: u32, flags: u32, bytes: &[u8]) -> Option<Vec<u8>> {
+        if flags & !allowed_flags(operation)? != 0 {
+            return None;
+        }
+        let flag = |bit: u32| flags & (1 << bit) != 0;
+        let mut reader = Reader { bytes, offset: 0 };
+        let mut out = Vec::new();
+        match operation {
+            OP_FIX_NAMES_PLAN => {
+                let method = reader.required_string()?;
+                let category = reader.string()?;
+                let limit = reader.integer()?;
+                if !flag(3) && limit != 0 {
+                    return None;
+                }
+                for value in fix_names_plan(method, category, flag(3).then_some(limit)) {
+                    put_int(&mut out, value);
+                }
+                for bit in 0..3 {
+                    put_int(&mut out, i64::from(flag(bit)));
+                }
+            }
+            OP_GROUP_RUN_PLAN => {
+                let kind = reader.required_string()?;
+                let guid_char = reader.required_string()?;
+                if !flag(0) && !guid_char.is_empty() {
+                    return None;
+                }
+                let guid_char = flag(0).then_some(guid_char);
+                let (limit, thread, workers) =
+                    (reader.integer()?, reader.integer()?, reader.integer()?);
+                for value in group_run_plan(kind, guid_char, limit, thread, workers) {
+                    put_int(&mut out, value);
+                }
+            }
+            OP_PREDB_SEARCHED => {
+                let (ftmatched, searched) = (reader.integer()?, reader.integer()?);
+                for value in predb_searched(flag(0), ftmatched, searched) {
+                    put_int(&mut out, value);
+                }
+            }
+            OP_FORK_TYPE => {
+                let raw = reader.required_string()?;
+                if !flag(0) && !raw.is_empty() {
+                    return None;
+                }
+                for value in fork_type(flag(0).then_some(raw)) {
+                    put_int(&mut out, value);
+                }
+            }
+            OP_RESET_PLAN => {
+                let environment = reader.required_string()?;
+                let search_driver = reader.required_string()?;
+                let count = usize::try_from(reader.integer()?).ok()?;
+                // Every entry needs at least its 8-byte length prefix.
+                if count > reader.remaining() / 8 {
+                    return None;
+                }
+                let mut tables = Vec::with_capacity(count);
+                for _ in 0..count {
+                    tables.push(reader.string()?);
+                }
+                let (action, search, kept, invalid, duplicates) =
+                    reset_plan(environment, flag(0), search_driver, &tables);
+                for value in [action, search, invalid, duplicates, kept.len() as i64] {
+                    put_int(&mut out, value);
+                }
+                for table in kept {
+                    put_string(&mut out, table);
+                }
+            }
+            OP_AUDIT_RUN_PLAN => {
+                let values = [
+                    reader.integer()?,
+                    reader.integer()?,
+                    reader.integer()?,
+                    reader.integer()?,
+                    reader.integer()?,
+                ];
+                let plan = audit_run_plan(AuditInput {
+                    dry_run: flag(0),
+                    delete: flag(1),
+                    resume: flag(2),
+                    retry_turn: flag(3),
+                    limit: values[0],
+                    since_id: values[1],
+                    state_cursor: values[2],
+                    fresh_count: values[3],
+                    retry_count: values[4],
+                });
+                for value in plan {
+                    put_int(&mut out, value);
+                }
+            }
+            _ => return None,
+        }
+        if reader.offset != bytes.len() || out.len() > MAX_INPUT {
+            return None;
+        }
+        Some(out)
+    }
+
+    /// Returns bytes written, `-required` when `out_cap` is too small, or -1 for an unknown
+    /// operation or flag bit, a malformed frame, invalid/overlapping pointer ranges or a caught
+    /// panic. Negative returns never modify `out_buf`; the caller owns both buffers.
+    ///
+    /// # Safety
+    /// `input` must be readable for `input_len` bytes and `out_buf` writable for `out_cap`
+    /// bytes. Both pointers must be nonnull and the ranges must not overlap.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w371_fix_names_reset_verify(
+        operation: u32,
+        flags: u32,
+        input: *const u8,
+        input_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if allowed_flags(operation).is_none_or(|allowed| flags & !allowed != 0)
+                || input.is_null()
+                || out_buf.is_null()
+                || input_len > MAX_INPUT
+                || out_cap > isize::MAX as usize
+            {
+                return DECLINE;
+            }
+            let Some(input_end) = (input as usize).checked_add(input_len) else {
+                return DECLINE;
+            };
+            let Some(out_end) = (out_buf as usize).checked_add(out_cap) else {
+                return DECLINE;
+            };
+            if input_len != 0
+                && out_cap != 0
+                && (input as usize) < out_end
+                && (out_buf as usize) < input_end
+            {
+                return DECLINE;
+            }
+            let bytes = if input_len == 0 {
+                &[][..]
+            } else {
+                unsafe { slice::from_raw_parts(input, input_len) }
+            };
+            let Some(result) = compute(operation, flags, bytes) else {
+                return DECLINE;
+            };
+            if result.len() > out_cap {
+                return -(result.len() as isize);
+            }
+            unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), out_buf, result.len()) };
+            result.len() as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+}
+
+#[cfg(test)]
+mod wave37_1_fix_names_reset_verify_tests {
+    use super::wave37_1_fix_names_reset_verify::*;
+
+    fn frame(strings: &[Option<&[u8]>], ints: &[i64]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for value in strings {
+            match value {
+                Some(bytes) => {
+                    out.extend_from_slice(&(bytes.len() as i64).to_ne_bytes());
+                    out.extend_from_slice(bytes);
+                }
+                None => out.extend_from_slice(&(-1_i64).to_ne_bytes()),
+            }
+        }
+        out.extend(ints.iter().flat_map(|v| v.to_ne_bytes()));
+        out
+    }
+
+    fn ints(values: &[i64]) -> Vec<u8> {
+        frame(&[], values)
+    }
+
+    #[test]
+    fn w371_fix_names_plan_matches_php() {
+        assert_eq!(fix_names_plan(b"3", None, None), [3, 1, 1, 1, 0, 1, 0, 0]);
+        assert_eq!(
+            fix_names_plan(b"8", Some(b"all"), Some(-5)),
+            [8, 1, 3, 2, 1, 2, 1, 1]
+        );
+        assert_eq!(
+            fix_names_plan(b"20", Some(b"predb_id"), Some(250)),
+            [20, 1, 9, 2, 0, 3, 1, 250]
+        );
+        assert_eq!(
+            fix_names_plan(b"17", Some(b"ALL"), None)[2..6],
+            [8, 1, 0, 1]
+        );
+        for bad in [
+            &b""[..],
+            b"2",
+            b"21",
+            b"03",
+            b"07",
+            b" 7",
+            b"7 ",
+            b"1e1",
+            b"-3",
+            b"100",
+        ] {
+            assert_eq!(
+                fix_names_plan(bad, None, None)[..5],
+                [0, 0, 0, 0, 0],
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            compute(OP_FIX_NAMES_PLAN, 0b0101, &frame(&[Some(b"7"), None], &[0])),
+            Some(ints(&[7, 1, 3, 1, 1, 1, 0, 0, 1, 0, 1]))
+        );
+    }
+
+    #[test]
+    fn w371_group_plans_match_php() {
+        assert_eq!(
+            group_run_plan(b"standard", Some(b"a"), 1000, 1, 1),
+            [1, 1, 0, 1, 1000, 1, 1, 1, 1]
+        );
+        assert_eq!(
+            group_run_plan(b"standard", None, 0, 0, 0),
+            [1, 0, 2, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(group_run_plan(b"standard", Some(b"G"), 5, 1, 1)[3], 0);
+        assert_eq!(group_run_plan(b"standard", Some(b"ab"), 5, 1, 1)[3], 0);
+        assert_eq!(
+            group_run_plan(b"predbft", None, -1, 3, 2),
+            [2, 1, 0, 0, -1, 0, 3, 2, 0]
+        );
+        assert_eq!(group_run_plan(b"Standard", None, 1, 1, 1)[..3], [0, 0, 1]);
+
+        assert_eq!(predb_searched(true, -9, 7), [1, 1, 0]);
+        assert_eq!(predb_searched(false, -1, 7), [-6, 2, 1]);
+        assert_eq!(predb_searched(false, 0, 2), [1, 3, 0]);
+        assert_eq!(predb_searched(false, 3, 0), [-1, 3, 1]);
+        assert_eq!(predb_searched(false, 0, i64::MIN), [i64::MIN, 3, 1]);
+    }
+
+    #[test]
+    fn w371_fork_type_and_reset_plan_match_php() {
+        assert_eq!(fork_type(Some(b"standard")), [1, 1]);
+        assert_eq!(fork_type(Some(b" PredbFT\n")), [2, 0]);
+        assert_eq!(fork_type(Some(b"\x0bpredbft\0")), [2, 0]);
+        assert_eq!(fork_type(Some(b"\x0cpredbft")), [0, 0]);
+        assert_eq!(fork_type(None), [0, 0]);
+        assert_eq!(fork_type(Some(b"")), [0, 0]);
+
+        let tables: [Option<&[u8]>; 8] = [
+            Some(b" releases "),
+            Some(b"RELEASES"),
+            None,
+            Some(b"1bad"),
+            Some(b"bad-name"),
+            Some(b"_ok9"),
+            Some(b""),
+            Some(&[b'a'; 65]),
+        ];
+        let (action, search, kept, invalid, duplicates) =
+            reset_plan(b"local", true, b"elasticsearch", &tables);
+        assert_eq!((action, search), (3, 1));
+        assert_eq!(kept, vec![b"releases".as_slice(), b"_ok9"]);
+        assert_eq!((invalid, duplicates), (5, 1));
+        assert_eq!(reset_plan(b"Local", true, b"manticore", &[]).0, 1);
+        assert_eq!(reset_plan(b"local", false, b"", &[]).0..=2, 2..=2);
+        assert_eq!(reset_plan(b"local", false, b"Elasticsearch", &[]).1, 2);
+    }
+
+    fn simulate(input: AuditInput) -> [i64; 8] {
+        let limit = input.limit.max(1);
+        let mut fresh = input.fresh_count.clamp(0, limit);
+        let mut retry = if input.resume {
+            input.retry_count.clamp(0, limit)
+        } else {
+            0
+        };
+        let (mut turn, mut attempted) = (input.retry_turn, 0);
+        let (mut fresh_used, mut retry_used, mut first, mut last) = (0, 0, 0, 0);
+        while attempted < limit && (fresh > 0 || retry > 0) {
+            let is_retry = retry > 0 && (turn || fresh == 0);
+            if is_retry {
+                retry -= 1;
+                retry_used += 1;
+            } else {
+                fresh -= 1;
+                fresh_used += 1;
+            }
+            last = if is_retry { 2 } else { 1 };
+            if first == 0 {
+                first = last;
+            }
+            attempted += 1;
+            turn = !is_retry;
+        }
+        [
+            limit,
+            if input.resume {
+                input.state_cursor
+            } else {
+                input.since_id
+            },
+            i64::from(!input.dry_run && input.delete),
+            fresh_used,
+            retry_used,
+            i64::from(turn),
+            first,
+            last,
+        ]
+    }
+
+    #[test]
+    fn w371_audit_plan_closed_form_matches_loop() {
+        for bits in 0..16_u32 {
+            for limit in -1..9 {
+                for fresh in -1..10 {
+                    for retry in -1..10 {
+                        let input = AuditInput {
+                            dry_run: bits & 1 != 0,
+                            delete: bits & 2 != 0,
+                            resume: bits & 4 != 0,
+                            retry_turn: bits & 8 != 0,
+                            limit,
+                            since_id: 11,
+                            state_cursor: 22,
+                            fresh_count: fresh,
+                            retry_count: retry,
+                        };
+                        assert_eq!(audit_run_plan(input), simulate(input), "{input:?}");
+                    }
+                }
+            }
+        }
+        let huge = AuditInput {
+            dry_run: false,
+            delete: true,
+            resume: true,
+            retry_turn: true,
+            limit: i64::MAX,
+            since_id: i64::MIN,
+            state_cursor: i64::MAX,
+            fresh_count: i64::MAX,
+            retry_count: i64::MAX / 2,
+        };
+        assert_eq!(
+            audit_run_plan(huge),
+            [
+                i64::MAX,
+                i64::MAX,
+                1,
+                i64::MAX / 2 + 1,
+                i64::MAX / 2,
+                1,
+                2,
+                1
+            ]
+        );
+    }
+
+    #[test]
+    fn w371_malformed_frames_and_flags_decline() {
+        for operation in [0, 7, u32::MAX] {
+            assert!(compute(operation, 0, &[]).is_none());
+        }
+        assert!(
+            compute(
+                OP_FIX_NAMES_PLAN,
+                0b1_0000,
+                &frame(&[Some(b"3"), None], &[0])
+            )
+            .is_none()
+        );
+        assert!(compute(OP_FIX_NAMES_PLAN, 0, &frame(&[Some(b"3"), None], &[5])).is_none());
+        assert!(compute(OP_FIX_NAMES_PLAN, 0, &frame(&[None, None], &[0])).is_none());
+        assert!(compute(OP_FIX_NAMES_PLAN, 0, &frame(&[Some(b"3"), None], &[0, 0])).is_none());
+        assert!(
+            compute(
+                OP_GROUP_RUN_PLAN,
+                0b10,
+                &frame(&[Some(b"x"), Some(b"")], &[1, 1, 1])
+            )
+            .is_none()
+        );
+        assert!(
+            compute(
+                OP_GROUP_RUN_PLAN,
+                0,
+                &frame(&[Some(b"x"), Some(b"a")], &[1, 1, 1])
+            )
+            .is_none()
+        );
+        assert!(compute(OP_PREDB_SEARCHED, 0, &ints(&[1])).is_none());
+        assert!(compute(OP_FORK_TYPE, 0, &frame(&[Some(b"x")], &[])).is_none());
+        assert!(compute(OP_FORK_TYPE, 1, &frame(&[None], &[])).is_none());
+        assert!(
+            compute(
+                OP_RESET_PLAN,
+                0,
+                &frame(&[Some(b"l"), Some(b"e")], &[i64::MAX])
+            )
+            .is_none()
+        );
+        assert!(compute(OP_RESET_PLAN, 0, &frame(&[Some(b"l"), Some(b"e")], &[-1])).is_none());
+        assert!(
+            compute(
+                OP_RESET_PLAN,
+                0,
+                &frame(&[Some(b"l"), Some(b"e")], &[2, -1])
+            )
+            .is_none()
+        );
+        assert!(
+            compute(
+                OP_RESET_PLAN,
+                0,
+                &frame(&[Some(b"l"), Some(b"e")], &[1, -2])
+            )
+            .is_none()
+        );
+        assert!(compute(OP_AUDIT_RUN_PLAN, 0b1_0000, &ints(&[1, 2, 3, 4, 5])).is_none());
+        assert!(compute(OP_AUDIT_RUN_PLAN, 0, &ints(&[1, 2, 3, 4])).is_none());
+        assert_eq!(
+            compute(
+                OP_RESET_PLAN,
+                1,
+                &frame(&[Some(b"local"), Some(b"manticore")], &[1, -1])
+            ),
+            Some(ints(&[3, 2, 1, 0, 0]))
+        );
+    }
+
+    #[test]
+    fn w371_export_validates_pointers_and_capacity_without_partial_writes() {
+        let input = ints(&[0, 5]);
+        let call = |op, flags, ptr, len, out, cap| unsafe {
+            nntmux_w371_fix_names_reset_verify(op, flags, ptr, len, out, cap)
+        };
+        let mut out = [0x5a_u8; 40];
+        let (ptr, len) = (input.as_ptr(), input.len());
+        assert_eq!(call(3, 0, ptr, len, out.as_mut_ptr(), 23), -24);
+        assert_eq!(call(3, 0, ptr, len, out.as_mut_ptr(), 0), -24);
+        assert_eq!(call(0, 0, ptr, len, out.as_mut_ptr(), 40), DECLINE);
+        assert_eq!(call(7, 0, ptr, len, out.as_mut_ptr(), 40), DECLINE);
+        assert_eq!(call(3, 2, ptr, len, out.as_mut_ptr(), 40), DECLINE);
+        assert_eq!(
+            call(3, 0, std::ptr::null(), len, out.as_mut_ptr(), 40),
+            DECLINE
+        );
+        assert_eq!(call(3, 0, ptr, len, std::ptr::null_mut(), 40), DECLINE);
+        assert_eq!(
+            call(3, 0, ptr, MAX_INPUT + 1, out.as_mut_ptr(), 40),
+            DECLINE
+        );
+        assert_eq!(call(3, 0, ptr, len, out.as_mut_ptr(), usize::MAX), DECLINE);
+        assert_eq!(
+            call(3, 0, usize::MAX as *const u8, 16, out.as_mut_ptr(), 40),
+            DECLINE
+        );
+        assert_eq!(call(3, 0, ptr, len, usize::MAX as *mut u8, 40), DECLINE);
+        assert_eq!(call(3, 0, ptr, len - 1, out.as_mut_ptr(), 40), DECLINE);
+        assert_eq!(out, [0x5a; 40]);
+        let mut overlapping = input.clone();
+        assert_eq!(
+            call(3, 0, overlapping.as_ptr(), 16, overlapping.as_mut_ptr(), 16),
+            DECLINE
+        );
+        assert_eq!(overlapping, input);
+
+        assert_eq!(call(3, 0, ptr, len, out.as_mut_ptr(), 40), 24);
+        assert_eq!(&out[..24], ints(&[4, 3, 1]).as_slice());
+        assert_eq!(&out[24..], &[0x5a; 16]);
+    }
+}
