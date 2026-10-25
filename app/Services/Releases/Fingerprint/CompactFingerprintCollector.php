@@ -10,6 +10,7 @@ use App\Services\NNTP\NntpProviderUnavailableException;
 use App\Services\NNTP\NNTPService;
 use App\Services\Nzb\NzbService;
 use App\Services\Nzb\NzbSourceGuard;
+use App\Services\Nzb\Par2CandidateRecoveryResult;
 use App\Support\RustPipelineLibrary;
 use FFI;
 use Throwable;
@@ -1360,5 +1361,105 @@ final class CompactFingerprintCollector
 
         /** @var array{samples: list<array{file_index: int, kind: string, segment_number: int, messageid: string, role: string}>, omitted: int, segment_counts: array<int, int>, manifest_invalid_files: int, nzb: array<string, mixed>, files: list<array<string, mixed>>, posting: array{first_utc: string, last_utc: string, span_s: int}|null, group_count: int, file_count: int, nzb_names: array<string, true>} */
         return $decoded;
+    }
+
+    /**
+     * Default for the Wave 43.2 toggle only; it stays false because the paired benchmark in
+     * tests/Unit/RustNzbPar2ResultFingerprintStoreWorkerQueueW43ParityTest.php is below 1.5x.
+     */
+    public const bool W432_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useW432RustFfi = null;
+
+    /** Force the Wave 43.2 helper onto Rust (true) or PHP (false); null restores W432_RUST_FFI_DEFAULT. */
+    public static function useW432RustFfi(?bool $enable = true): void
+    {
+        self::$useW432RustFfi = $enable;
+    }
+
+    public static function usesW432RustFfi(): bool
+    {
+        return self::$useW432RustFfi ?? self::W432_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW432RustFfi(): void
+    {
+        self::$useW432RustFfi = null;
+    }
+
+    /**
+     * Judge fetched copies with identityStatus(): each row is an array with a string `requested` Message-ID and the
+     * fetched `header` Message-ID and ARTICLE `response_text` (missing keys are null); other rows are invalid. A mismatch
+     * is counted against the header when the trimmed header differs, otherwise against the status line.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array{rows: int, invalid: int, confirmed: int, unconfirmed: int, header_mismatch: int, status_mismatch: int}
+     */
+    public static function summarizeIdentityStatuses(array $rows): array
+    {
+        return (self::usesW432RustFfi() ? self::summarizeIdentityStatusesNative($rows) : null)
+            ?? self::summarizeIdentityStatusesPhp($rows);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rows
+     * @return array{rows: int, invalid: int, confirmed: int, unconfirmed: int, header_mismatch: int, status_mismatch: int}
+     */
+    public static function summarizeIdentityStatusesPhp(array $rows): array
+    {
+        $summary = ['rows' => \count($rows), 'invalid' => 0, 'confirmed' => 0, 'unconfirmed' => 0, 'header_mismatch' => 0, 'status_mismatch' => 0];
+        foreach ($rows as $row) {
+            if (! \is_array($row) || ! \is_string($row['requested'] ?? null)) {
+                $summary['invalid']++;
+
+                continue;
+            }
+            $header = $row['header'] ?? null;
+            $status = self::identityStatus($row['requested'], $header, ['article_response' => ['response_text' => $row['response_text'] ?? null]]);
+            $key = match ($status) {
+                null => 'confirmed',
+                'ArticleIdentityUnconfirmed' => 'unconfirmed',
+                default => \is_string($header) && trim($header) === '<'.trim($row['requested'], '<>').'>' ? 'status_mismatch' : 'header_mismatch',
+            };
+            $summary[$key]++;
+        }
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rows
+     * @return array{rows: int, invalid: int, confirmed: int, unconfirmed: int, header_mismatch: int, status_mismatch: int}|null
+     */
+    public static function summarizeIdentityStatusesNative(array $rows): ?array
+    {
+        $slots = [];
+        $tail = [];
+        foreach ($rows as $row) {
+            if (! \is_array($row) || ! \is_string($row['requested'] ?? null)) {
+                array_push($slots, -1, -1, -1);
+
+                continue;
+            }
+            foreach ([$row['requested'], $row['header'] ?? null, $row['response_text'] ?? null] as $text) {
+                if (\is_string($text)) {
+                    $slots[] = \strlen($text);
+                    $tail[] = $text;
+                } else {
+                    $slots[] = -1;
+                }
+            }
+        }
+        $values = Par2CandidateRecoveryResult::evaluateW432Native(3, \count($rows), $slots, implode('', $tail), 6);
+        if ($values === null) {
+            return null;
+        }
+        [$count, $invalid, $confirmed, $unconfirmed, $headerMismatch, $statusMismatch] = $values;
+        if ($count !== \count($rows) || min($values) < 0 || $invalid + $confirmed + $unconfirmed + $headerMismatch + $statusMismatch !== $count) {
+            return null;
+        }
+
+        return ['rows' => $count, 'invalid' => $invalid, 'confirmed' => $confirmed, 'unconfirmed' => $unconfirmed,
+            'header_mismatch' => $headerMismatch, 'status_mismatch' => $statusMismatch];
     }
 }
