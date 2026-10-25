@@ -55,6 +55,154 @@ class LocalDbPipe extends AbstractTvProviderPipe
         return self::$ffi === false ? null : self::$ffi;
     }
 
+    /**
+     * Wave 48.3 batch local video/episode title, season/episode/airdate and external-id candidate matching.
+     * Enabled: seven paired runs cleared 1.5x on every gate (min common mean 2.60x, p99 2.17x; uncommon mean 1.89x, p99 1.72x; see the W48 parity test).
+     */
+    public const bool W48_LOCAL_DB_RUST_FFI_DEFAULT = true;
+
+    public const string W48_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w48_tv_local_db_candidate_batch(const char *blob, size_t blob_len, const char *ints, size_t ints_len, size_t count, char *out, size_t out_cap);
+        C;
+
+    /** Totals at or above these thresholds are a match (2) or a probable match (1). */
+    public const int W48_MATCH_TOTAL = 150;
+
+    public const int W48_PROBABLE_TOTAL = 90;
+
+    private static ?bool $w48RustFfiOverride = null;
+
+    private static FFI|false|null $w48RustFfiHandle = null;
+
+    /** Null restores W48_LOCAL_DB_RUST_FFI_DEFAULT. */
+    public static function useW48LocalDbRustFfi(?bool $enable = true): void
+    {
+        self::$w48RustFfiOverride = $enable;
+        if ($enable === null) {
+            self::$w48RustFfiHandle = null;
+        }
+    }
+
+    public static function usesW48LocalDbRustFfi(): bool
+    {
+        return self::$w48RustFfiOverride ?? self::W48_LOCAL_DB_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Five values per release/candidate pair: the title score (100 for equal non-empty
+     * normalized titles, else the token Jaccard percent), the episode code (2 when season and
+     * episode are both >= 0 and equal the candidate's, else 1 for an equal non-empty airdate,
+     * else 0), the total (title score + 50/40 for episode code 2/1 + 30 per equal positive
+     * external id - 60 per differing positive pair over tvdb and tmdb), the decision (0 on any
+     * id conflict, else 2 from W48_MATCH_TOTAL, 1 from W48_PROBABLE_TOTAL, else 0) and the
+     * FNV-1a 32 digest of the normalized candidate title. Then the three decision counts, the
+     * index of the best total (first on ties; -1 for an empty batch) and that total (0 when
+     * empty). Unknown seasons and episodes are -1; missing keys read as '' or 0.
+     *
+     * @param  list<array<string, mixed>>  $items  title, candidate_title, airdate, candidate_airdate, season, episode, candidate_season, candidate_episode, tvdb, candidate_tvdb, tmdb, candidate_tmdb
+     * @return list<int>
+     */
+    public static function w48CandidateBatch(array $items): array
+    {
+        return self::usesW48LocalDbRustFfi()
+            ? self::w48CandidateBatchNative($items)
+            : self::w48CandidateBatchPhp($items);
+    }
+
+    /**
+     * @param  list<array<string, mixed>>  $items
+     * @return list<int>
+     */
+    public static function w48CandidateBatchNative(array $items): array
+    {
+        $count = \count($items);
+        $c = self::w48Columns($items, [
+            'title' => '', 'candidate_title' => '', 'airdate' => '', 'candidate_airdate' => '',
+            'season' => 0, 'episode' => 0, 'candidate_season' => 0, 'candidate_episode' => 0,
+            'tvdb' => 0, 'candidate_tvdb' => 0, 'tmdb' => 0, 'candidate_tmdb' => 0,
+        ]);
+
+        return self::w48Invoke(
+            self::w48RustFfi(),
+            'nntmux_w48_tv_local_db_candidate_batch',
+            [$c['title'], $c['candidate_title'], $c['airdate'], $c['candidate_airdate']],
+            [$c['season'], $c['episode'], $c['candidate_season'], $c['candidate_episode'], $c['tvdb'], $c['candidate_tvdb'], $c['tmdb'], $c['candidate_tmdb']],
+            $count,
+            $count * 5 + 5,
+        ) ?? self::w48CandidateBatchPhp($items);
+    }
+
+    /**
+     * @param  list<array<string, mixed>>  $items
+     * @return list<int>
+     */
+    public static function w48CandidateBatchPhp(array $items): array
+    {
+        $out = [];
+        $decisions = [0, 0, 0];
+        $best = -1;
+        $bestTotal = 0;
+        $index = 0;
+        foreach ($items as $item) {
+            $title = self::w48Normalize((string) ($item['title'] ?? ''));
+            $candidate = self::w48Normalize((string) ($item['candidate_title'] ?? ''));
+            if ($title !== '' && $title === $candidate) {
+                $titleScore = 100;
+            } else {
+                $a = $title === '' ? [] : array_flip(explode(' ', $title));
+                $b = $candidate === '' ? [] : array_flip(explode(' ', $candidate));
+                $shared = \count(array_intersect_key($a, $b));
+                $union = \count($a) + \count($b) - $shared;
+                $titleScore = $union === 0 ? 0 : intdiv(100 * $shared, $union);
+            }
+            $season = (int) ($item['season'] ?? 0);
+            $episode = (int) ($item['episode'] ?? 0);
+            $airdate = (string) ($item['airdate'] ?? '');
+            $episodeCode = match (true) {
+                $season >= 0 && $episode >= 0 && $season === (int) ($item['candidate_season'] ?? 0)
+                    && $episode === (int) ($item['candidate_episode'] ?? 0) => 2,
+                $airdate !== '' && $airdate === (string) ($item['candidate_airdate'] ?? '') => 1,
+                default => 0,
+            };
+            $matches = 0;
+            $conflicts = 0;
+            foreach ([['tvdb', 'candidate_tvdb'], ['tmdb', 'candidate_tmdb']] as [$key, $candidateKey]) {
+                $id = (int) ($item[$key] ?? 0);
+                $candidateId = (int) ($item[$candidateKey] ?? 0);
+                if ($id > 0 && $candidateId > 0) {
+                    $id === $candidateId ? $matches++ : $conflicts++;
+                }
+            }
+            $total = $titleScore + [0, 40, 50][$episodeCode] + 30 * $matches - 60 * $conflicts;
+            $decision = match (true) {
+                $conflicts > 0 => 0,
+                $total >= self::W48_MATCH_TOTAL => 2,
+                $total >= self::W48_PROBABLE_TOTAL => 1,
+                default => 0,
+            };
+            $decisions[$decision]++;
+            if ($best < 0 || $total > $bestTotal) {
+                $best = $index;
+                $bestTotal = $total;
+            }
+            array_push($out, $titleScore, $episodeCode, $total, $decision, self::w48Fnv($candidate));
+            $index++;
+        }
+        array_push($out, ...$decisions);
+        array_push($out, $best, $bestTotal);
+
+        return $out;
+    }
+
+    private static function w48RustFfi(): ?FFI
+    {
+        if (self::$w48RustFfiHandle === null) {
+            self::$w48RustFfiHandle = RustPipelineLibrary::resolveDomain('categorize_w48', self::W48_FFI_CDEF) ?? false;
+        }
+
+        return self::$w48RustFfiHandle === false ? null : self::$w48RustFfiHandle;
+    }
+
     protected int $priority = 10;
 
     public function __construct(private ?LocalDbProvider $localDb = null) {}
