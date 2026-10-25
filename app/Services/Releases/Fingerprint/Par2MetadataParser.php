@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Fingerprint;
 
+use App\Services\Par2PacketAccumulator;
+
 /**
  * `findCrossVolumeRecoveryConflicts`, `validateCrossVolumeIfscRelationships` and
  * `relateNzbFilePrefixesToSources` retain PHP under the < 1.5x FFI bailout rule: the Rust
@@ -17,6 +19,14 @@ final class Par2MetadataParser
     private const MAX_MAIN_FILE_IDS = 32_768;
 
     public const MAX_SOURCE_BLOCKS = 32_768;
+
+    /**
+     * Default for the Wave 44.2 toggle only (summarizeConflictKeyBatch); false because the paired benchmark in
+     * tests/Unit/RustPar2PacketMetadataProofPayloadSanitizerW44ParityTest.php is below 1.5x (common mean 0.65-0.77x).
+     */
+    public const bool W442_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useW442RustFfi = null;
 
     /**
      * @param  list<array<string, mixed>>  $volumes
@@ -1458,5 +1468,110 @@ final class Par2MetadataParser
         }
 
         return $regions;
+    }
+
+    /** Force the Wave 44.2 helper onto Rust (true) or PHP (false); null restores W442_RUST_FFI_DEFAULT. */
+    public static function useW442RustFfi(?bool $enable = true): void
+    {
+        self::$useW442RustFfi = $enable;
+    }
+
+    public static function usesW442RustFfi(): bool
+    {
+        return self::$useW442RustFfi ?? self::W442_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW442RustFfi(): void
+    {
+        self::$useW442RustFfi = null;
+    }
+
+    /**
+     * Summarize source definition conflicts as sourceDefinitionConflictKeys() filters them: non-array rows are invalid,
+     * then a recovery-set ID that is not 32 hex digits, then a non-null file ID that is not; accepted rows are wildcard
+     * (null file ID) or file keys, with the distinct case-folded key count.
+     *
+     * @param  array<array-key, mixed>  $conflicts
+     * @return array{rows: int, invalid: int, bad_set: int, bad_file: int, wildcard: int, file: int, distinct: int}
+     */
+    public static function summarizeConflictKeyBatch(array $conflicts): array
+    {
+        return (self::usesW442RustFfi() ? self::summarizeConflictKeyBatchNative($conflicts) : null)
+            ?? self::summarizeConflictKeyBatchPhp($conflicts);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $conflicts
+     * @return array{rows: int, invalid: int, bad_set: int, bad_file: int, wildcard: int, file: int, distinct: int}
+     */
+    public static function summarizeConflictKeyBatchPhp(array $conflicts): array
+    {
+        $summary = ['rows' => \count($conflicts), 'invalid' => 0, 'bad_set' => 0, 'bad_file' => 0, 'wildcard' => 0, 'file' => 0, 'distinct' => 0];
+        $keys = [];
+        foreach ($conflicts as $conflict) {
+            if (! is_array($conflict)) {
+                $summary['invalid']++;
+
+                continue;
+            }
+            $setId = $conflict['recovery_set_id'] ?? null;
+            $fileId = $conflict['file_id'] ?? null;
+            if (! is_string($setId) || preg_match('/\A[0-9a-f]{32}\z/i', $setId) !== 1) {
+                $summary['bad_set']++;
+
+                continue;
+            }
+            if ($fileId !== null && (! is_string($fileId) || preg_match('/\A[0-9a-f]{32}\z/i', $fileId) !== 1)) {
+                $summary['bad_file']++;
+
+                continue;
+            }
+            $summary[$fileId === null ? 'wildcard' : 'file']++;
+            $keys[strtolower($setId.':'.($fileId ?? '*'))] = true;
+        }
+        $summary['distinct'] = \count($keys);
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $conflicts
+     * @return array{rows: int, invalid: int, bad_set: int, bad_file: int, wildcard: int, file: int, distinct: int}|null
+     */
+    public static function summarizeConflictKeyBatchNative(array $conflicts): ?array
+    {
+        $slots = [];
+        $tail = '';
+        foreach ($conflicts as $conflict) {
+            if (! is_array($conflict)) {
+                array_push($slots, -1, -1, 1);
+
+                continue;
+            }
+            $setId = $conflict['recovery_set_id'] ?? null;
+            $fileId = $conflict['file_id'] ?? null;
+            $setLength = -1;
+            if (is_string($setId)) {
+                $setLength = \strlen($setId);
+                $tail .= $setId;
+            }
+            if (is_string($fileId)) {
+                array_push($slots, $setLength, \strlen($fileId), 0);
+                $tail .= $fileId;
+            } else {
+                array_push($slots, $setLength, -1, $fileId === null ? 0 : 2);
+            }
+        }
+        $values = Par2PacketAccumulator::evaluateW442Native(1, \count($conflicts), $slots, $tail, 7);
+        if ($values === null) {
+            return null;
+        }
+        [$count, $invalid, $badSet, $badFile, $wildcard, $file, $distinct] = $values;
+        if ($count !== \count($conflicts) || min($values) < 0 || $invalid + $badSet + $badFile + $wildcard + $file !== $count
+            || $distinct > $wildcard + $file || ($distinct > 0) !== ($wildcard + $file > 0)) {
+            return null;
+        }
+
+        return ['rows' => $count, 'invalid' => $invalid, 'bad_set' => $badSet, 'bad_file' => $badFile, 'wildcard' => $wildcard, 'file' => $file, 'distinct' => $distinct];
     }
 }

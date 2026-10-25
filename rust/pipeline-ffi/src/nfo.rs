@@ -29883,3 +29883,783 @@ pub unsafe extern "C" fn nntmux_w432_nzb_par2_result_fingerprint_store_worker_qu
     }))
     .unwrap_or(-1)
 }
+
+mod wave44_par2_packet_metadata_proof_payload_sanitizer {
+    use super::{nfo_abi_range, yenc_ranges_overlap};
+    use std::collections::{HashMap, HashSet};
+    use std::slice;
+
+    pub(super) const MAX_INPUT: usize = 16 * 1024 * 1024;
+
+    const MARKER: &[u8; 8] = b"PAR2\0PKT";
+    const MAIN: &[u8; 16] = b"PAR 2.0\0Main\0\0\0\0";
+    const FILEDESC: &[u8; 16] = b"PAR 2.0\0FileDesc";
+    const FILEVER: &[u8; 16] = b"PAR 2.0\0IFSC\0\0\0\0";
+    /// Recovery, input-file and packed recovery slices: the accumulator skips their payloads.
+    const RECOVERY: [&[u8; 16]; 3] = [
+        b"PAR 2.0\0RecvSlic",
+        b"PAR 2.0\0FileSlic",
+        b"PAR 2.0\0PkdRecvS",
+    ];
+    /// Creator, Unicode filename, comments, recovery verification and packed Main.
+    const AUXILIARY: [&[u8; 16]; 6] = [
+        b"PAR 2.0\0Creator\0",
+        b"PAR 2.0\0UniFileN",
+        b"PAR 2.0\0CommASCI",
+        b"PAR 2.0\0CommUni\0",
+        b"PAR 2.0\0RFSC\0\0\0\0",
+        b"PAR 2.0\0PkdMain\0",
+    ];
+
+    /// `PayloadIdentityResolver::resolvePhp()` noise words, longest alternatives included.
+    const NOISE: [&[u8]; 7] = [
+        b"sample",
+        b"proof",
+        b"thumbs",
+        b"thumb",
+        b"subs",
+        b"sub",
+        b"subtitles",
+    ];
+
+    /// `FilenameSanitizer` output ceiling (`MAX_FILENAME_LENGTH`).
+    const MAX_FILENAME: usize = 200;
+
+    type Slot = [u8; 8];
+
+    fn word(chunk: &Slot) -> i64 {
+        i64::from_ne_bytes(*chunk)
+    }
+
+    fn le32(bytes: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+    }
+
+    type TextRow<'a, const TEXTS: usize> = [Option<&'a [u8]>; TEXTS];
+
+    /// `[lead, count]`, `count` rows of `WIDTH` slots whose first `TEXTS` slots are text lengths
+    /// (-1 marks a non-string), then the texts in row order. Declared lengths must cover the tail
+    /// exactly.
+    #[allow(clippy::type_complexity)]
+    fn text_table<const WIDTH: usize, const TEXTS: usize>(
+        bytes: &[u8],
+    ) -> Option<Vec<(TextRow<'_, TEXTS>, [i64; WIDTH])>> {
+        let (head, _) = bytes.get(..16)?.as_chunks::<8>();
+        if word(&head[0]) != 0 {
+            return None;
+        }
+        let count = usize::try_from(word(&head[1])).ok()?;
+        let table_end = count.checked_mul(WIDTH)?.checked_mul(8)?.checked_add(16)?;
+        let table = bytes.get(16..table_end)?;
+        let tail = &bytes[table_end..];
+        let mut offset = 0usize;
+        let mut out = Vec::with_capacity(count);
+        for row in table.as_chunks::<8>().0.as_chunks::<WIDTH>().0 {
+            let mut values = [0i64; WIDTH];
+            for (value, chunk) in values.iter_mut().zip(row) {
+                *value = word(chunk);
+            }
+            let mut texts = [None; TEXTS];
+            for (text, &length) in texts.iter_mut().zip(&values) {
+                if length != -1 {
+                    let end = offset.checked_add(usize::try_from(length).ok()?)?;
+                    *text = Some(tail.get(offset..end)?);
+                    offset = end;
+                }
+            }
+            out.push((texts, values));
+        }
+        (offset == tail.len()).then_some(out)
+    }
+
+    /// Bytes of each packet the checks read: the header plus the Main recovery-file count.
+    const PACKET_PREFIX: usize = 76;
+
+    /// `[lead, count]`, `count` packet lengths (-1 marks a non-string), then each packet's first
+    /// `min(length, PACKET_PREFIX)` bytes in row order, covering the tail exactly.
+    fn packet_prefixes(bytes: &[u8]) -> Option<Vec<Option<(&[u8], usize)>>> {
+        let (head, _) = bytes.get(..16)?.as_chunks::<8>();
+        if word(&head[0]) != 0 {
+            return None;
+        }
+        let count = usize::try_from(word(&head[1])).ok()?;
+        let table_end = count.checked_mul(8)?.checked_add(16)?;
+        let table = bytes.get(16..table_end)?;
+        let tail = &bytes[table_end..];
+        let mut offset = 0usize;
+        let mut out = Vec::with_capacity(count);
+        for chunk in table.as_chunks::<8>().0 {
+            let full = match word(chunk) {
+                -1 => {
+                    out.push(None);
+                    continue;
+                }
+                full => usize::try_from(full).ok()?,
+            };
+            let end = offset.checked_add(full.min(PACKET_PREFIX))?;
+            out.push(Some((tail.get(offset..end)?, full)));
+            offset = end;
+        }
+        (offset == tail.len()).then_some(out)
+    }
+
+    /// Op 0: `Par2PacketAccumulator::summarizePacketBatch` over packet lengths and prefixes (see
+    /// [`packet_prefixes`]), applying the accumulator's header and body checks without copying
+    /// packet payloads.
+    fn packet_batch(bytes: &[u8]) -> Option<Vec<i64>> {
+        let rows = packet_prefixes(bytes)?;
+        // invalid, truncated, bad_marker, bad_length, main, filedesc, filever, recovery,
+        // auxiliary, unknown, malformed
+        let mut counts = [0i64; 11];
+        let mut payload_bytes = 0i64;
+        let mut sets: HashSet<&[u8]> = HashSet::new();
+        for row in &rows {
+            let Some((packet, full)) = *row else {
+                counts[0] += 1;
+                continue;
+            };
+            payload_bytes = payload_bytes.checked_add(full as i64)?;
+            if full < 64 {
+                counts[1] += 1;
+                continue;
+            }
+            if &packet[..8] != MARKER {
+                counts[2] += 1;
+                continue;
+            }
+            let (low, high) = (le32(packet, 8), le32(packet, 12));
+            let length = (u64::from(high) << 32) | u64::from(low);
+            if high > 0x7FFF_FFFF || length % 4 != 0 || length != full as u64 {
+                counts[3] += 1;
+                continue;
+            }
+            let kind: &[u8] = &packet[48..64];
+            let body = full - 64;
+            let slot = if kind == MAIN {
+                if body < 12
+                    || (body - 12) % 16 != 0
+                    || le32(packet, 72) as usize > (body - 12) / 16
+                {
+                    10
+                } else {
+                    4
+                }
+            } else if kind == FILEDESC {
+                if body < 56 { 10 } else { 5 }
+            } else if kind == FILEVER {
+                if body < 16 || (body - 16) % 20 != 0 {
+                    10
+                } else {
+                    6
+                }
+            } else if RECOVERY.iter().any(|t| kind == *t) {
+                7
+            } else if AUXILIARY.iter().any(|t| kind == *t) {
+                8
+            } else {
+                9
+            };
+            counts[slot] += 1;
+            if slot <= 8 {
+                sets.insert(&packet[32..48]);
+            }
+        }
+        let mut out = Vec::with_capacity(14);
+        out.push(rows.len() as i64);
+        out.extend_from_slice(&counts);
+        out.extend_from_slice(&[payload_bytes, sets.len() as i64]);
+        Some(out)
+    }
+
+    /// `/\A[0-9a-f]{32}\z/i` as a case-folded value.
+    fn hex128(text: &[u8]) -> Option<u128> {
+        if text.len() != 32 {
+            return None;
+        }
+        let mut value = 0u128;
+        for &b in text {
+            value = (value << 4) | u128::from((b as char).to_digit(16)?);
+        }
+        Some(value)
+    }
+
+    /// Op 1: `Par2MetadataParser::summarizeConflictKeyBatch` over rows of
+    /// `[set_len, file_len, kind]` (kind 0 an array row with a string or null file ID, 2 an array
+    /// row whose file ID is another type, 1 a non-array row with no texts) and those texts, as
+    /// `sourceDefinitionConflictKeys()` filters and deduplicates them.
+    fn conflict_keys(bytes: &[u8]) -> Option<Vec<i64>> {
+        let rows = text_table::<3, 2>(bytes)?;
+        // invalid, bad_set, bad_file, wildcard, file
+        let mut counts = [0i64; 5];
+        let mut distinct: HashSet<(u128, Option<u128>)> = HashSet::with_capacity(rows.len());
+        for ([set, file], [_, _, kind]) in &rows {
+            match (*kind, file) {
+                (1, None) if set.is_none() => {
+                    counts[0] += 1;
+                    continue;
+                }
+                (0, _) | (2, None) => {}
+                _ => return None,
+            }
+            let Some(set) = set.and_then(hex128) else {
+                counts[1] += 1;
+                continue;
+            };
+            let file = match (*kind, file) {
+                (0, None) => None,
+                (0, Some(file)) => match hex128(file) {
+                    Some(file) => Some(file),
+                    None => {
+                        counts[2] += 1;
+                        continue;
+                    }
+                },
+                _ => {
+                    counts[2] += 1;
+                    continue;
+                }
+            };
+            counts[if file.is_none() { 3 } else { 4 }] += 1;
+            distinct.insert((set, file));
+        }
+        let mut out = Vec::with_capacity(7);
+        out.push(rows.len() as i64);
+        out.extend_from_slice(&counts);
+        out.push(distinct.len() as i64);
+        Some(out)
+    }
+
+    /// Op 2: `Par2ProofIdentity::summarizeProofIdentities` over rows of `[length, kind]` (kind 0
+    /// string, 1 null, 2 any other type) and the strings: lowercase SHA-256 hex identities are
+    /// proofs, grouped to find the largest set sharing one source proof.
+    fn proof_identities(bytes: &[u8]) -> Option<Vec<i64>> {
+        let rows = text_table::<2, 1>(bytes)?;
+        let (mut absent, mut invalid, mut proofs, mut largest) = (0i64, 0i64, 0i64, 0i64);
+        let mut groups: HashMap<&[u8], i64> = HashMap::with_capacity(rows.len());
+        for ([text], [_, kind]) in &rows {
+            let identity = match (kind, text) {
+                (0, Some(identity)) => *identity,
+                (1, None) => {
+                    absent += 1;
+                    continue;
+                }
+                (2, None) => {
+                    invalid += 1;
+                    continue;
+                }
+                _ => return None,
+            };
+            if identity.len() != 64
+                || !identity
+                    .iter()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+            {
+                invalid += 1;
+                continue;
+            }
+            proofs += 1;
+            let group = groups.entry(identity).or_insert(0);
+            *group += 1;
+            largest = largest.max(*group);
+        }
+        Some(vec![
+            rows.len() as i64,
+            absent,
+            invalid,
+            proofs,
+            groups.len() as i64,
+            largest,
+        ])
+    }
+
+    /// PCRE `\s` without UTF/UCP plus the `.`, `_` and `-` separators.
+    fn separator(b: u8) -> bool {
+        matches!(
+            b,
+            b'.' | b'_' | b'-' | b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r'
+        )
+    }
+
+    /// `/(?:^|[._\-\s])(?:sample|proof|thumbs?|subs?|subtitles)(?:[._\-\s]|$)/i` (bytes).
+    fn noise(name: &[u8]) -> bool {
+        (0..name.len()).any(|start| {
+            (start == 0 || separator(name[start - 1]))
+                && NOISE.iter().any(|w| {
+                    let end = start + w.len();
+                    end <= name.len()
+                        && name[start..end].eq_ignore_ascii_case(w)
+                        && (end == name.len() || separator(name[end]))
+                })
+        })
+    }
+
+    /// Op 3: `PayloadIdentityResolver::summarizeIdentityHints` over rows of `[name_len, code]`:
+    /// code 10 opens a manifest with an iterable hint list, 11 is a non-array manifest and 12 a
+    /// manifest whose hints are not an array or exceed 4096 (all with no text); code 0 is an
+    /// ineligible hint (no text) and 1/2 a yEnc/PAR2 hint with its filename.
+    fn identity_hints(bytes: &[u8]) -> Option<Vec<i64>> {
+        let rows = text_table::<2, 1>(bytes)?;
+        // manifests, invalid, oversized, named, unnamed, hints, invalid_hints, yenc, par2,
+        // noise, candidates, candidate_bytes
+        let mut out = vec![0i64; 12];
+        let mut open: Option<bool> = None;
+        for ([name], [_, code]) in &rows {
+            match (*code, name) {
+                (10..=12, None) => {
+                    if let Some(named) = open.take() {
+                        out[if named { 3 } else { 4 }] += 1;
+                    }
+                    out[0] += 1;
+                    match code {
+                        10 => open = Some(false),
+                        11 => out[1] += 1,
+                        _ => out[2] += 1,
+                    }
+                }
+                (0, None) => {
+                    open?;
+                    out[5] += 1;
+                    out[6] += 1;
+                }
+                (1 | 2, Some(name)) => {
+                    open = Some(open.is_some().then_some(true)?);
+                    out[5] += 1;
+                    out[if *code == 1 { 7 } else { 8 }] += 1;
+                    if noise(name) {
+                        out[9] += 1;
+                    } else {
+                        out[10] += 1;
+                        out[11] += name.len() as i64;
+                    }
+                }
+                _ => return None,
+            }
+        }
+        if let Some(named) = open {
+            out[if named { 3 } else { 4 }] += 1;
+        }
+        Some(out)
+    }
+
+    /// PHP `trim()` with its default character list, plus any extra bytes.
+    fn php_trim<'a>(text: &'a [u8], extra: &[u8]) -> &'a [u8] {
+        let keep =
+            |b: &u8| !matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b) && !extra.contains(b);
+        let start = text.iter().position(keep).unwrap_or(text.len());
+        let end = text.iter().rposition(keep).map_or(start, |end| end + 1);
+        &text[start..end]
+    }
+
+    /// `FilenameSanitizer::trimFilename()`.
+    fn trim_filename(text: &[u8]) -> &[u8] {
+        let text = php_trim(text, b"._-");
+        let dots = text.iter().take_while(|&&b| b == b'.').count();
+        &text[dots..]
+    }
+
+    /// Op 4: `FilenameSanitizer::summarizeFilenames` over rows of `[length, kind]` (kind 0 string,
+    /// 1 null, 2 any other type) and the strings. ASCII names replay `sanitizePhp()`; any byte
+    /// above 0x7F is only counted as non-ASCII.
+    fn filenames(bytes: &[u8]) -> Option<Vec<i64>> {
+        let rows = text_table::<2, 1>(bytes)?;
+        // invalid, empty, non_ascii, fallback, truncated, clean, changed
+        let mut counts = [0i64; 7];
+        let mut payload_bytes = 0i64;
+        let mut normalized = Vec::with_capacity(256);
+        for ([text], [_, kind]) in &rows {
+            let name = match (kind, text) {
+                (0, Some(name)) => *name,
+                (1, None) => {
+                    counts[1] += 1;
+                    continue;
+                }
+                (2, None) => {
+                    counts[0] += 1;
+                    continue;
+                }
+                _ => return None,
+            };
+            payload_bytes += name.len() as i64;
+            let trimmed = php_trim(name, b"");
+            if trimmed.is_empty() {
+                counts[1] += 1;
+                continue;
+            }
+            if !name.is_ascii() {
+                counts[2] += 1;
+                continue;
+            }
+            normalized.clear();
+            for &b in trimmed {
+                let b = match b {
+                    0..=0x1f | 0x7f => continue,
+                    b'/' | b'\\' | b':' | b'*' | b'?' | b'"' | b'<' | b'>' | b'|' | b' '
+                    | b',' => b'_',
+                    b => b,
+                };
+                if b != b'_' || normalized.last() != Some(&b'_') {
+                    normalized.push(b);
+                }
+            }
+            let normal = trim_filename(&normalized);
+            let finished = trim_filename(&normal[..normal.len().min(MAX_FILENAME)]);
+            let slot = if normal.is_empty() || matches!(finished, b"" | b"." | b"..") {
+                3
+            } else if normal.len() > MAX_FILENAME {
+                4
+            } else if finished == name {
+                5
+            } else {
+                6
+            };
+            counts[slot] += 1;
+        }
+        let mut out = Vec::with_capacity(9);
+        out.push(rows.len() as i64);
+        out.extend_from_slice(&counts);
+        out.push(payload_bytes);
+        Some(out)
+    }
+
+    fn compute(operation: u32, flags: u32, bytes: &[u8]) -> Option<Vec<i64>> {
+        if flags != 0 {
+            return None;
+        }
+        match operation {
+            0 => packet_batch(bytes),
+            1 => conflict_keys(bytes),
+            2 => proof_identities(bytes),
+            3 => identity_hints(bytes),
+            4 => filenames(bytes),
+            _ => None,
+        }
+    }
+
+    /// # Safety
+    /// See [`super::nntmux_w442_par2_packet_metadata_proof_payload_sanitizer`].
+    pub(super) unsafe fn evaluate(
+        operation: u32,
+        flags: u32,
+        input: *const u8,
+        length: usize,
+        output: *mut u8,
+        capacity: usize,
+    ) -> i32 {
+        if !nfo_abi_range(input, length, false)
+            || !nfo_abi_range(output, capacity, false)
+            || length > MAX_INPUT
+            || capacity > isize::MAX as usize
+            || yenc_ranges_overlap(input as usize, length, output as usize, capacity)
+        {
+            return -1;
+        }
+        let bytes = unsafe { slice::from_raw_parts(input, length) };
+        let Some(result) = compute(operation, flags, bytes) else {
+            return -1;
+        };
+        // Every answer has at most 14 slots, so the byte count always fits an i32.
+        let needed = result.len() * 8;
+        if needed > capacity {
+            return -(needed as i32);
+        }
+        let out = unsafe { slice::from_raw_parts_mut(output, needed) };
+        for (chunk, value) in out.as_chunks_mut::<8>().0.iter_mut().zip(&result) {
+            chunk.copy_from_slice(&value.to_ne_bytes());
+        }
+        needed as i32
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// `[0, rows]`, the row slots, then the texts.
+        fn table(rows: usize, slots: &[i64], tail: &[&[u8]]) -> Vec<u8> {
+            let mut v: Vec<u8> = [0, rows as i64]
+                .iter()
+                .chain(slots)
+                .flat_map(|s| s.to_ne_bytes())
+                .collect();
+            for t in tail {
+                v.extend_from_slice(t);
+            }
+            v
+        }
+
+        fn call(operation: u32, input: &[u8]) -> Option<Vec<i64>> {
+            let mut out = vec![0xa5u8; 256];
+            let written = unsafe {
+                evaluate(
+                    operation,
+                    0,
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            if written < 0 {
+                assert_eq!(written, -1);
+                return None;
+            }
+            Some(
+                out[..written as usize]
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(word)
+                    .collect(),
+            )
+        }
+
+        fn packet(kind: &[u8; 16], set: u8, body: usize) -> Vec<u8> {
+            let length = 64 + body;
+            let mut p = MARKER.to_vec();
+            p.extend_from_slice(&(length as u64).to_le_bytes());
+            p.extend_from_slice(&[0x11; 16]);
+            p.extend_from_slice(&[set; 16]);
+            p.extend_from_slice(kind);
+            p.resize(length, 0);
+            p
+        }
+
+        #[test]
+        fn w44_2_packet_batch() {
+            let mut main = packet(MAIN, 1, 28);
+            main[72] = 1;
+            let mut overcount = packet(MAIN, 1, 28);
+            overcount[72] = 2;
+            let mut bad_marker = packet(FILEDESC, 1, 56);
+            bad_marker[3] = b'3';
+            let mut odd_length = packet(FILEVER, 1, 36);
+            odd_length[8] = 99;
+            let mut high = packet(FILEVER, 1, 36);
+            high[15] = 0x80;
+            let packets: Vec<Vec<u8>> = vec![
+                main,
+                overcount,
+                packet(FILEDESC, 2, 56),
+                packet(FILEDESC, 2, 52),
+                packet(FILEVER, 2, 36),
+                packet(FILEVER, 2, 32),
+                packet(RECOVERY[0], 3, 4),
+                packet(RECOVERY[2], 3, 0),
+                packet(AUXILIARY[0], 4, 8),
+                packet(b"PAR 2.0\0Unknown!", 5, 0),
+                bad_marker,
+                odd_length,
+                high,
+                vec![0u8; 63],
+            ];
+            let mut slots = vec![];
+            let mut tail: Vec<&[u8]> = vec![];
+            for p in &packets {
+                slots.push(p.len() as i64);
+                tail.push(&p[..p.len().min(PACKET_PREFIX)]);
+            }
+            slots.push(-1);
+            let total: i64 = packets.iter().map(|p| p.len() as i64).sum();
+            assert_eq!(
+                call(0, &table(packets.len() + 1, &slots, &tail)),
+                Some(vec![15, 1, 1, 1, 2, 1, 1, 1, 2, 1, 1, 3, total, 4])
+            );
+            assert_eq!(call(0, &table(0, &[], &[])), Some(vec![0; 14]));
+            assert_eq!(call(0, &table(1, &[3], &[b"ab"])), None);
+            assert_eq!(call(0, &table(1, &[-2], &[])), None);
+            assert_eq!(call(0, &table(1, &[-1], &[b"a"])), None);
+            assert_eq!(call(0, &table(1, &[100], &[&[0u8; 77]])), None);
+            assert_eq!(
+                call(0, &table(1, &[2], &[b"ab"])),
+                Some(vec![1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0])
+            );
+            // Payloads past the prefix are never sent; the declared length is still checked.
+            let mut big = packet(RECOVERY[0], 9, 65536);
+            big.truncate(PACKET_PREFIX);
+            assert_eq!(
+                call(0, &table(1, &[65600], &[&big])),
+                Some(vec![1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 65600, 1])
+            );
+            assert_eq!(call(0, &table(1, &[65604], &[&big])).unwrap()[4], 1);
+        }
+
+        #[test]
+        fn w44_2_conflict_keys() {
+            let set = b"0123456789abcdef0123456789ABCDEF";
+            let lower = b"0123456789abcdef0123456789abcdef";
+            let input = table(
+                8,
+                &[
+                    32, 32, 0, // file key
+                    32, 32, 0, // same key after case folding
+                    32, -1, 0, // wildcard
+                    32, 3, 0, // bad file
+                    32, -1, 2, // non-string file
+                    31, -1, 0, // bad set
+                    -1, -1, 0, // missing set
+                    -1, -1, 1, // non-array
+                ],
+                &[set, lower, lower, set, set, lower, b"abc", set, &set[..31]],
+            );
+            assert_eq!(call(1, &input), Some(vec![8, 1, 2, 2, 1, 2, 2]));
+            assert_eq!(hex128(b"0123456789abcdef0123456789abcdeg"), None);
+            assert_eq!(call(1, &table(0, &[], &[])), Some(vec![0; 7]));
+            assert_eq!(call(1, &table(1, &[1, -1, 1], &[b"a"])), None);
+            assert_eq!(call(1, &table(1, &[-1, 1, 2], &[b"a"])), None);
+            assert_eq!(call(1, &table(1, &[-1, -1, 3], &[])), None);
+        }
+
+        #[test]
+        fn w44_2_proof_identities() {
+            let a = [b'a'; 64];
+            let b = [b'0'; 64];
+            let upper = [b'A'; 64];
+            let input = table(
+                7,
+                &[64, 0, 64, 0, 64, 0, 64, 0, -1, 1, -1, 2, 3, 0],
+                &[&a, &b, &a, &upper, b"abc"],
+            );
+            assert_eq!(call(2, &input), Some(vec![7, 1, 3, 3, 2, 2]));
+            assert_eq!(call(2, &table(0, &[], &[])), Some(vec![0; 6]));
+            assert_eq!(call(2, &table(1, &[1, 1], &[b"a"])), None);
+            assert_eq!(call(2, &table(1, &[-1, 0], &[])), None);
+        }
+
+        #[test]
+        fn w44_2_identity_hints() {
+            assert!(noise(b"Movie.2020.sample.mkv"));
+            assert!(noise(b"sample.mkv"));
+            assert!(noise(b"Show-SUBS"));
+            assert!(noise(b"a thumbs\n"));
+            assert!(noise(b"x_Subtitles_y"));
+            assert!(!noise(b"subsample.mkv"));
+            assert!(!noise(b"Movie.2020.samples.mkv"));
+            assert!(!noise(b"proofs"));
+            assert!(!noise(b"x\x85sample"));
+            let input = table(
+                10,
+                &[
+                    -1, 10, 10, 1, 9, 2, -1, 0, // named manifest: candidate, noise, invalid
+                    -1, 10, -1, 0, // unnamed manifest
+                    -1, 11, -1, 12, // invalid and oversized
+                    -1, 10, 0, 1, // named by an empty yEnc filename
+                ],
+                &[b"Movie.2020", b"a.sample."],
+            );
+            assert_eq!(
+                call(3, &input),
+                Some(vec![5, 1, 1, 2, 1, 5, 2, 2, 1, 1, 2, 10])
+            );
+            assert_eq!(call(3, &table(0, &[], &[])), Some(vec![0; 12]));
+            assert_eq!(call(3, &table(1, &[1, 1], &[b"a"])), None);
+            assert_eq!(call(3, &table(2, &[-1, 11, 1, 1], &[b"a"])), None);
+            assert_eq!(call(3, &table(1, &[-1, 0], &[])), None);
+            assert_eq!(call(3, &table(1, &[1, 10], &[b"a"])), None);
+        }
+
+        #[test]
+        fn w44_2_filenames() {
+            let long = [b'x'; 201];
+            let names: [&[u8]; 9] = [
+                b"Movie.2020.mkv",
+                b" a/b:c  d.mkv ",
+                b"...",
+                b" \t",
+                b"caf\xc3\xa9",
+                &long,
+                b"\x01\x02",
+                b"a__b",
+                b"_a",
+            ];
+            let mut slots = vec![];
+            for n in &names {
+                slots.extend([n.len() as i64, 0]);
+            }
+            slots.extend([-1, 1, -1, 2]);
+            let total: i64 = names.iter().map(|n| n.len() as i64).sum();
+            assert_eq!(
+                call(4, &table(names.len() + 2, &slots, &names)),
+                Some(vec![11, 1, 2, 1, 2, 1, 1, 3, total])
+            );
+            assert_eq!(trim_filename(b"-._.a.b_-"), b"a.b");
+            assert_eq!(call(4, &table(0, &[], &[])), Some(vec![0; 9]));
+            assert_eq!(call(4, &table(1, &[1, 1], &[b"a"])), None);
+            assert_eq!(call(4, &table(1, &[-1, 0], &[])), None);
+        }
+
+        #[test]
+        fn w44_2_abi_sentinels() {
+            assert_eq!(call(5, &table(0, &[], &[])), None);
+            assert_eq!(call(u32::MAX, &table(0, &[], &[])), None);
+            assert_eq!(call(0, &[0u8; 8]), None);
+            let input = table(1, &[-1, 1], &[]);
+            let mut out = [0x5au8; 128];
+            let run = |p: *const u8, len: usize, o: *mut u8, cap: usize| unsafe {
+                evaluate(2, 0, p, len, o, cap)
+            };
+            assert_eq!(run(std::ptr::null(), 0, out.as_mut_ptr(), out.len()), -1);
+            assert_eq!(
+                run(input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), MAX_INPUT + 1, out.as_mut_ptr(), out.len()),
+                -1
+            );
+            assert_eq!(
+                run(input.as_ptr(), input.len(), out.as_mut_ptr(), usize::MAX),
+                -1
+            );
+            for cap in [0, 1, 47] {
+                assert_eq!(run(input.as_ptr(), input.len(), out.as_mut_ptr(), cap), -48);
+            }
+            assert!(out.iter().all(|b| *b == 0x5a));
+            assert_eq!(run(input.as_ptr(), input.len(), out.as_mut_ptr(), 48), 48);
+            assert_eq!(word(&out[8..16].try_into().unwrap()), 1);
+            assert!(out[48..].iter().all(|b| *b == 0x5a));
+            let mut shared = [0u8; 160];
+            shared[..input.len()].copy_from_slice(&input);
+            let p = shared.as_mut_ptr();
+            assert_eq!(run(p, input.len(), unsafe { p.add(8) }, 48), -1);
+            let export = |op: u32, flags: u32, out: &mut [u8]| unsafe {
+                super::super::nntmux_w442_par2_packet_metadata_proof_payload_sanitizer(
+                    op,
+                    flags,
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert_eq!(export(2, 0, &mut out), 48);
+            assert_eq!(export(2, 1, &mut out), -1);
+            assert_eq!(export(1, 0, &mut out), -1);
+        }
+    }
+}
+
+/// Evaluate one Wave 44.2 helper over packed native-endian `i64` slots `[0, rows]`, the row
+/// slots and any string bytes: op 0 inspects raw PAR2 packets, op 1 filters PAR2 source
+/// definition conflict keys, op 2 groups PAR2 source-proof identities, op 3 tallies payload
+/// identity hints and op 4 classifies filenames for sanitization. `flags` must be zero. Returns
+/// the byte count written, the negated required capacity when `out_cap` is too small (nothing
+/// written), or -1 when the input is malformed.
+///
+/// # Safety
+/// Both ranges must be live, disjoint readable/writable allocations. Pointers must
+/// be non-null even for zero lengths; arithmetic checks cannot prove provenance.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w442_par2_packet_metadata_proof_payload_sanitizer(
+    operation: u32,
+    flags: u32,
+    input: *const u8,
+    input_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        wave44_par2_packet_metadata_proof_payload_sanitizer::evaluate(
+            operation, flags, input, input_len, out_buf, out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
