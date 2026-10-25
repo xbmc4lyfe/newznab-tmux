@@ -395,4 +395,265 @@ final readonly class DownloadedArchive
 
         return $ffi === false ? null : $ffi;
     }
+
+    // Rust is the default only while the paired W54.6 benchmark clears 1.5x on all four metrics.
+    private const bool W54_RUST_FFI_DEFAULT = true;
+
+    public const string W54_FFI_CDEF = <<<'C'
+        int32_t nntmux_w546_listing_summary_batch(const char *names, size_t names_len, const char *name_lens, size_t name_lens_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    public const int W54_LISTING_HEADER = 17;
+
+    private const int W54_MAX_ITEMS = 1_048_576;
+
+    private const int W54_VALUE_CAP = 1_099_511_627_775;
+
+    private const int W54_TOTAL_CAP = 4_611_686_018_427_387_904;
+
+    /** Lower-cased extension => listing class (0 video, 1 audio, 2 image, 3 NFO, 4 other text, 5 PAR2, 6 archive). */
+    private const array W54_LISTING_CLASSES = [
+        'mkv' => 0, 'mp4' => 0, 'avi' => 0, 'm4v' => 0, 'mov' => 0, 'wmv' => 0, 'ts' => 0, 'm2ts' => 0, 'mpg' => 0, 'mpeg' => 0, 'vob' => 0, 'webm' => 0,
+        'mp3' => 1, 'flac' => 1, 'm4a' => 1, 'aac' => 1, 'ogg' => 1, 'wav' => 1, 'wma' => 1, 'ape' => 1,
+        'jpg' => 2, 'jpeg' => 2, 'png' => 2, 'gif' => 2, 'webp' => 2, 'bmp' => 2,
+        'nfo' => 3, 'txt' => 4, 'diz' => 4, 'sfv' => 4, 'par2' => 5, 'rar' => 6, 'zip' => 6, '7z' => 6,
+    ];
+
+    /**
+     * `fileSummaryPhp()` plus name classes over one listing, from per-entry names, sizes and flags.
+     *
+     * Sizes clamp to [0, 2^40); missing sizes and flags are 0. Flag bit 0 marks a directory (`is_dir`) and
+     * bit 1 a passworded entry (`pass`); higher bits are ignored. The class is that of the text after the
+     * last dot, ASCII lower-cased (three-digit and `r` plus two-digit extensions are archive volumes; 7 is
+     * any other file and 8 a directory). Layout: `[0]` count, `[1]` files, `[2]` directories, `[3]` file
+     * bytes (capped at 2^62), `[4]` 1 when a file is passworded, `[5..12]` files per class 0..7, `[13]`
+     * first largest file (-1 when none), `[14]` first NFO file (-1 when none), `[15]` deepest path (`/` or
+     * `\` separators, capped at 255), `[16]` FNV-1a digest; then per entry `class | depth << 4 | flags << 12
+     * | size << 14`.
+     *
+     * @param  array<array-key, string>  $names
+     * @param  array<array-key, int>  $sizes
+     * @param  array<array-key, int>  $flags
+     * @return list<int>
+     */
+    public static function summarizeListingBatch(array $names, array $sizes, array $flags): array
+    {
+        return (self::usesW54RustFfi() ? self::summarizeListingBatchNative($names, $sizes, $flags) : null)
+            ?? self::summarizeListingBatchPhp($names, $sizes, $flags);
+    }
+
+    /**
+     * @param  array<array-key, string>  $names
+     * @param  array<array-key, int>  $sizes
+     * @param  array<array-key, int>  $flags
+     * @return list<int>
+     */
+    public static function summarizeListingBatchPhp(array $names, array $sizes, array $flags): array
+    {
+        $names = array_values($names);
+        $sizes = array_values($sizes);
+        $flags = array_values($flags);
+        $count = \count($names);
+        $out = array_fill(0, self::W54_LISTING_HEADER, 0);
+        $out[0] = $count;
+        $out[14] = -1;
+        $largestAt = -1;
+        $largest = 0;
+        $digest = 2_166_136_261;
+        $rows = [];
+        for ($i = 0; $i < $count; $i++) {
+            $name = $names[$i];
+            $size = min(max($sizes[$i] ?? 0, 0), self::W54_VALUE_CAP);
+            $flag = ($flags[$i] ?? 0) & 3;
+            $depth = min(substr_count($name, '/') + substr_count($name, '\\'), 255);
+            if ($depth > $out[15]) {
+                $out[15] = $depth;
+            }
+            if (($flag & 1) !== 0) {
+                $out[2]++;
+                $class = 8;
+            } else {
+                $class = self::w54ListingClass($name);
+                $out[1]++;
+                $out[3] = min($out[3] + $size, self::W54_TOTAL_CAP);
+                $out[4] |= $flag >> 1;
+                $out[5 + $class]++;
+                if ($largestAt < 0 || $size > $largest) {
+                    $largestAt = $i;
+                    $largest = $size;
+                }
+                if ($class === 3 && $out[14] < 0) {
+                    $out[14] = $i;
+                }
+            }
+            $row = $class | $depth << 4 | $flag << 12 | $size << 14;
+            $digest = (($digest ^ (($row ^ ($row >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+            $rows[] = $row;
+        }
+        $out[13] = $largestAt;
+        $out[16] = $digest;
+
+        return [...$out, ...$rows];
+    }
+
+    /**
+     * Rust summary, or null when PHP must compute it (unavailable library or rejected input).
+     *
+     * @param  array<array-key, string>  $names
+     * @param  array<array-key, int>  $sizes
+     * @param  array<array-key, int>  $flags
+     * @return list<int>|null
+     */
+    public static function summarizeListingBatchNative(array $names, array $sizes, array $flags): ?array
+    {
+        $names = array_values($names);
+        $count = \count($names);
+        if ($count > self::W54_MAX_ITEMS) {
+            return null;
+        }
+        [$joined, $lens] = self::w54Strings($names);
+        $ints = pack('q*', ...self::w54Fit($sizes, $count), ...self::w54Fit($flags, $count));
+        $fields = self::W54_LISTING_HEADER + $count;
+
+        // @phpstan-ignore method.notFound
+        return self::w54Call($fields, static fn (FFI $ffi, CData $out): mixed => $ffi->nntmux_w546_listing_summary_batch($joined, \strlen($joined), $lens, \strlen($lens), $ints, \strlen($ints), $count, $out, $fields));
+    }
+
+    /** Listing class of a file name, as `summarizeListingBatch()` documents it. */
+    private static function w54ListingClass(string $name): int
+    {
+        $dot = strrpos($name, '.');
+        if ($dot === false) {
+            return 7;
+        }
+        $ext = strtolower(substr($name, $dot + 1));
+        $length = \strlen($ext);
+        if ($length === 0 || $length > 4) {
+            return 7;
+        }
+        $class = self::W54_LISTING_CLASSES[$ext] ?? null;
+        if ($class !== null) {
+            return $class;
+        }
+
+        return $length === 3 && ctype_digit($ext[0] === 'r' ? substr($ext, 1) : $ext) ? 6 : 7;
+    }
+
+    /**
+     * Run `$callback` with the Wave 54.6 Rust batch path forced on or off, then restore the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW54RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w54RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w54RustFfiState('set', $previous);
+        }
+    }
+
+    public static function usesW54RustFfi(): bool
+    {
+        $forced = self::w54RustFfiState();
+
+        return \is_bool($forced) ? $forced : self::W54_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Wave 54.6 routing and binding, kept in function statics because readonly classes cannot declare
+     * static properties. No `$op` returns the forced routing (null for the default); `'set'` replaces it
+     * with `$val` and returns the previous value; `'binding'` returns the cached `additional_w54` binding
+     * and an output buffer of at least `$val` values, or null.
+     */
+    private static function w54RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $enabled */
+        static $enabled = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $buffer */
+        static $buffer = null;
+        static $capacity = 0;
+        if ($op === 'set') {
+            $previous = $enabled;
+            $enabled = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op !== 'binding') {
+            return $enabled;
+        }
+        $fields = \is_int($val) ? $val : 0;
+        try {
+            $ffi ??= RustPipelineLibrary::resolveDomain('additional_w54', self::W54_FFI_CDEF) ?? false;
+            if ($ffi === false) {
+                return null;
+            }
+            if ($buffer === null || $capacity < $fields) {
+                $capacity = max(256, $fields);
+                $buffer = $ffi->new('int64_t['.$capacity.']');
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $buffer === null ? null : [$ffi, $buffer];
+    }
+
+    /**
+     * The batch's `$fields` output words from one Wave 54.6 call, or null when PHP must compute it.
+     *
+     * @param  callable(FFI, CData): mixed  $call
+     * @return list<int>|null
+     */
+    private static function w54Call(int $fields, callable $call): ?array
+    {
+        /** @var array{0: FFI, 1: CData}|null $binding */
+        $binding = self::w54RustFfiState('binding', $fields);
+        if ($binding === null) {
+            return null;
+        }
+        try {
+            if ($call($binding[0], $binding[1]) !== 1) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($binding[1], $fields * 8));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $values === false ? null : array_values($values);
+    }
+
+    /**
+     * Exactly `$count` values: the list itself when it already fits, otherwise padded with `$default`.
+     *
+     * @param  array<array-key, int>  $values
+     * @return list<int>
+     */
+    private static function w54Fit(array $values, int $count, int $default = 0): array
+    {
+        return \count($values) === $count && array_is_list($values) ? $values : array_pad(\array_slice(array_values($values), 0, $count), $count, $default);
+    }
+
+    /**
+     * NUL-joined items, or their concatenation with `pack('V*')` lengths when an item holds a NUL.
+     *
+     * @param  list<string>  $items
+     * @return array{0: string, 1: string}
+     */
+    private static function w54Strings(array $items): array
+    {
+        $joined = implode("\0", $items);
+        if ($items === [] || substr_count($joined, "\0") === \count($items) - 1) {
+            return [$joined, ''];
+        }
+
+        return [implode('', $items), pack('V*', ...array_map(strlen(...), $items))];
+    }
 }

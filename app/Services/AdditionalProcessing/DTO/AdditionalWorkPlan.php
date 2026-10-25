@@ -510,4 +510,271 @@ final readonly class AdditionalWorkPlan
 
         return $ffi === false ? null : $ffi;
     }
+
+    // Rust is the default only while the paired W54.6 benchmark clears 1.5x on all four metrics.
+    private const bool W54_RUST_FFI_DEFAULT = true;
+
+    public const string W54_FFI_CDEF = <<<'C'
+        int32_t nntmux_w546_plan_summary_batch(const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    public const int W54_PLAN_HEADER = 15;
+
+    private const int W54_MAX_ITEMS = 1_048_576;
+
+    private const int W54_COUNT_CAP = 1_048_575;
+
+    private const int W54_TOTAL_CAP = 4_611_686_018_427_387_904;
+
+    /** Plan flag bits of `summarizePlanBatch()`. */
+    public const int W54_FLAG_MEDIA_INFO = 1;
+
+    public const int W54_FLAG_AUDIO_INFO = 2;
+
+    public const int W54_FLAG_BOOK_FLOOD = 4;
+
+    public const int W54_FLAG_PROBE_ONLY_FILE = 8;
+
+    /**
+     * Stage, tier and work-unit summary of many plans from their candidate counts.
+     *
+     * Counts clamp to [0, 2^20); missing values are 0. Flags use the `W54_FLAG_*` bits. A plan is supported
+     * as `hasSupportedCandidates()` decides. Layout: `[0]` count, `[1]` supported plans, `[2]` unsupported,
+     * `[3..10]` plans per stage (archive, sample, thumbnail, media info, audio, probe, PAR2, book), `[11]`
+     * work units total, `[12]` first heaviest plan (-1 when none), `[13]` book floods, `[14]` FNV-1a
+     * digest; then per plan `stages | tier << 8 | units << 10 | duplicate_ppm << 40`. Tier 3 has archives
+     * and a main video, 2 either one, 1 other supported plans and 0 unsupported ones. Units weigh samples
+     * 2, JPG IDs and images 1, archives 8, probes 4, PAR2 candidates 2, main videos 5, media info 3, audio
+     * info 2 and book files 1 (none in a flood); the duplicate ppm is of samples, JPG IDs and duplicates.
+     *
+     * @param  array<array-key, int>  $samples
+     * @param  array<array-key, int>  $jpgs
+     * @param  array<array-key, int>  $archives
+     * @param  array<array-key, int>  $probes
+     * @param  array<array-key, int>  $par2Indexes
+     * @param  array<array-key, int>  $mainVideos
+     * @param  array<array-key, int>  $images
+     * @param  array<array-key, int>  $bookFiles
+     * @param  array<array-key, int>  $duplicates
+     * @param  array<array-key, int>  $flags
+     * @return list<int>
+     */
+    public static function summarizePlanBatch(array $samples, array $jpgs, array $archives, array $probes, array $par2Indexes, array $mainVideos, array $images, array $bookFiles, array $duplicates, array $flags): array
+    {
+        return (self::usesW54RustFfi() ? self::summarizePlanBatchNative($samples, $jpgs, $archives, $probes, $par2Indexes, $mainVideos, $images, $bookFiles, $duplicates, $flags) : null)
+            ?? self::summarizePlanBatchPhp($samples, $jpgs, $archives, $probes, $par2Indexes, $mainVideos, $images, $bookFiles, $duplicates, $flags);
+    }
+
+    /**
+     * @param  array<array-key, int>  $samples
+     * @param  array<array-key, int>  $jpgs
+     * @param  array<array-key, int>  $archives
+     * @param  array<array-key, int>  $probes
+     * @param  array<array-key, int>  $par2Indexes
+     * @param  array<array-key, int>  $mainVideos
+     * @param  array<array-key, int>  $images
+     * @param  array<array-key, int>  $bookFiles
+     * @param  array<array-key, int>  $duplicates
+     * @param  array<array-key, int>  $flags
+     * @return list<int>
+     */
+    public static function summarizePlanBatchPhp(array $samples, array $jpgs, array $archives, array $probes, array $par2Indexes, array $mainVideos, array $images, array $bookFiles, array $duplicates, array $flags): array
+    {
+        $samples = array_values($samples);
+        $jpgs = array_values($jpgs);
+        $archives = array_values($archives);
+        $probes = array_values($probes);
+        $par2Indexes = array_values($par2Indexes);
+        $mainVideos = array_values($mainVideos);
+        $images = array_values($images);
+        $bookFiles = array_values($bookFiles);
+        $duplicates = array_values($duplicates);
+        $flags = array_values($flags);
+        $count = \count($samples);
+        $cap = self::W54_COUNT_CAP;
+        $out = array_fill(0, self::W54_PLAN_HEADER, 0);
+        $out[0] = $count;
+        $heaviestAt = -1;
+        $heaviest = 0;
+        $digest = 2_166_136_261;
+        $rows = [];
+        for ($i = 0; $i < $count; $i++) {
+            $sample = min(max($samples[$i], 0), $cap);
+            $jpg = min(max($jpgs[$i] ?? 0, 0), $cap);
+            $archive = min(max($archives[$i] ?? 0, 0), $cap);
+            $probe = min(max($probes[$i] ?? 0, 0), $cap);
+            $par2 = min(max($par2Indexes[$i] ?? 0, 0), $cap);
+            $video = min(max($mainVideos[$i] ?? 0, 0), $cap);
+            $image = min(max($images[$i] ?? 0, 0), $cap);
+            $book = min(max($bookFiles[$i] ?? 0, 0), $cap);
+            $duplicate = min(max($duplicates[$i] ?? 0, 0), $cap);
+            $flag = $flags[$i] ?? 0;
+            $media = ($flag & 1) !== 0;
+            $audio = ($flag & 2) !== 0;
+            $flood = ($flag & 4) !== 0;
+            $supported = $archive > 0 || $sample > 0 || $jpg > 0 || $media || $audio || $probe > 0;
+            $stages = ($archive > 0 ? 1 : 0) | ($sample > 0 ? 2 : 0) | ($jpg > 0 || $image > 0 ? 4 : 0) | ($media ? 8 : 0)
+                | ($audio ? 16 : 0) | ($probe > 0 ? 32 : 0) | ($par2 > 0 ? 64 : 0) | ($book > 0 && ! $flood ? 128 : 0);
+            $tier = $archive > 0 && $video > 0 ? 3 : ($archive > 0 || $video > 0 ? 2 : ($supported ? 1 : 0));
+            $units = $sample * 2 + $jpg + $image + $archive * 8 + $probe * 4 + $par2 * 2 + $video * 5
+                + ($media ? 3 : 0) + ($audio ? 2 : 0) + ($flood ? 0 : $book);
+            $listed = $sample + $jpg + $duplicate;
+            $duplicatePpm = $listed > 0 ? intdiv($duplicate * 1_000_000, $listed) : 0;
+            $out[$supported ? 1 : 2]++;
+            for ($stage = 0; $stage < 8; $stage++) {
+                $out[3 + $stage] += ($stages >> $stage) & 1;
+            }
+            $out[11] = min($out[11] + $units, self::W54_TOTAL_CAP);
+            if ($heaviestAt < 0 || $units > $heaviest) {
+                $heaviestAt = $i;
+                $heaviest = $units;
+            }
+            if ($flood) {
+                $out[13]++;
+            }
+            $row = $stages | $tier << 8 | $units << 10 | $duplicatePpm << 40;
+            $digest = (($digest ^ (($row ^ ($row >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+            $rows[] = $row;
+        }
+        $out[12] = $heaviestAt;
+        $out[14] = $digest;
+
+        return [...$out, ...$rows];
+    }
+
+    /**
+     * Rust summary, or null when PHP must compute it (unavailable library or rejected input).
+     *
+     * @param  array<array-key, int>  $samples
+     * @param  array<array-key, int>  $jpgs
+     * @param  array<array-key, int>  $archives
+     * @param  array<array-key, int>  $probes
+     * @param  array<array-key, int>  $par2Indexes
+     * @param  array<array-key, int>  $mainVideos
+     * @param  array<array-key, int>  $images
+     * @param  array<array-key, int>  $bookFiles
+     * @param  array<array-key, int>  $duplicates
+     * @param  array<array-key, int>  $flags
+     * @return list<int>|null
+     */
+    public static function summarizePlanBatchNative(array $samples, array $jpgs, array $archives, array $probes, array $par2Indexes, array $mainVideos, array $images, array $bookFiles, array $duplicates, array $flags): ?array
+    {
+        $count = \count($samples);
+        if ($count > self::W54_MAX_ITEMS) {
+            return null;
+        }
+        $ints = pack(
+            'q*',
+            ...self::w54Fit($samples, $count), ...self::w54Fit($jpgs, $count), ...self::w54Fit($archives, $count),
+            ...self::w54Fit($probes, $count), ...self::w54Fit($par2Indexes, $count), ...self::w54Fit($mainVideos, $count),
+            ...self::w54Fit($images, $count), ...self::w54Fit($bookFiles, $count), ...self::w54Fit($duplicates, $count),
+            ...self::w54Fit($flags, $count),
+        );
+        $fields = self::W54_PLAN_HEADER + $count;
+
+        // @phpstan-ignore method.notFound
+        return self::w54Call($fields, static fn (FFI $ffi, CData $out): mixed => $ffi->nntmux_w546_plan_summary_batch($ints, \strlen($ints), $count, $out, $fields));
+    }
+
+    /**
+     * Run `$callback` with the Wave 54.6 Rust batch path forced on or off, then restore the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW54RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w54RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w54RustFfiState('set', $previous);
+        }
+    }
+
+    public static function usesW54RustFfi(): bool
+    {
+        $forced = self::w54RustFfiState();
+
+        return \is_bool($forced) ? $forced : self::W54_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Wave 54.6 routing and binding, kept in function statics because readonly classes cannot declare
+     * static properties. No `$op` returns the forced routing (null for the default); `'set'` replaces it
+     * with `$val` and returns the previous value; `'binding'` returns the cached `additional_w54` binding
+     * and an output buffer of at least `$val` values, or null.
+     */
+    private static function w54RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $enabled */
+        static $enabled = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $buffer */
+        static $buffer = null;
+        static $capacity = 0;
+        if ($op === 'set') {
+            $previous = $enabled;
+            $enabled = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op !== 'binding') {
+            return $enabled;
+        }
+        $fields = \is_int($val) ? $val : 0;
+        try {
+            $ffi ??= RustPipelineLibrary::resolveDomain('additional_w54', self::W54_FFI_CDEF) ?? false;
+            if ($ffi === false) {
+                return null;
+            }
+            if ($buffer === null || $capacity < $fields) {
+                $capacity = max(256, $fields);
+                $buffer = $ffi->new('int64_t['.$capacity.']');
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $buffer === null ? null : [$ffi, $buffer];
+    }
+
+    /**
+     * The batch's `$fields` output words from one Wave 54.6 call, or null when PHP must compute it.
+     *
+     * @param  callable(FFI, CData): mixed  $call
+     * @return list<int>|null
+     */
+    private static function w54Call(int $fields, callable $call): ?array
+    {
+        /** @var array{0: FFI, 1: CData}|null $binding */
+        $binding = self::w54RustFfiState('binding', $fields);
+        if ($binding === null) {
+            return null;
+        }
+        try {
+            if ($call($binding[0], $binding[1]) !== 1) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($binding[1], $fields * 8));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $values === false ? null : array_values($values);
+    }
+
+    /**
+     * Exactly `$count` values: the list itself when it already fits, otherwise padded with `$default`.
+     *
+     * @param  array<array-key, int>  $values
+     * @return list<int>
+     */
+    private static function w54Fit(array $values, int $count, int $default = 0): array
+    {
+        return \count($values) === $count && array_is_list($values) ? $values : array_pad(\array_slice(array_values($values), 0, $count), $count, $default);
+    }
 }
