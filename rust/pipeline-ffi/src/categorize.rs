@@ -29552,3 +29552,913 @@ pub mod verification_barrier_forward_pub_controllers {
         }
     }
 }
+
+/// Wave 40.3 second-pass planning helpers for `CategorizationService`, `GroupNamePipe`,
+/// `BookPipe`, `ConsolePipe` and `MoviePipe`. Every export writes `0x1F`-separated fields and
+/// returns the byte count, `-required` (without writing) when `out_cap` is too small, or `-1`.
+pub mod categorization_group_name_fixer_w403 {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    pub const DECLINE: isize = -1;
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+    const FIELD_SEP: u8 = 0x1F;
+    /// PHP `trim()` default character set.
+    const TRIM_SET: &[u8] = b" \t\n\r\0\x0B";
+    /// `ConsolePipe::summarizeCleanedFilenameBatchPhp()` stem trim set.
+    const STEM_TRIM_SET: &[u8] = b" \t\n\r\0\x0B.-_";
+    const MAX_CATEGORY_ID: i64 = 8999;
+    const MAX_PERMILLE: i64 = 1000;
+    const MIN_WINNER_MARGIN_PERMILLE: i64 = 50;
+    const MAX_EXTENSION_LENGTH: usize = 4;
+
+    /// `GroupNamePipe::W403_ROUTING_HINTS` flattened in match order as (needle, hint), followed by
+    /// the `boneless` marker as hint `BONELESS_HINT`.
+    const ROUTING_NEEDLES: [(&[u8], usize); 26] = [
+        (b"erotica", 0),
+        (b"xxx", 0),
+        (b"porn", 0),
+        (b"sex", 0),
+        (b"games", 1),
+        (b"console", 1),
+        (b"xbox", 1),
+        (b"nintendo", 1),
+        (b"playstation", 1),
+        (b"wii", 1),
+        (b"music", 2),
+        (b"mp3", 2),
+        (b"sounds", 2),
+        (b"flac", 2),
+        (b"audio", 2),
+        (b"teevee", 3),
+        (b"tv", 3),
+        (b"series", 3),
+        (b"moovee", 4),
+        (b"movies", 4),
+        (b"dvd", 4),
+        (b"bluray", 4),
+        (b"divx", 4),
+        (b"x264", 4),
+        (b"x265", 4),
+        (b"boneless", BONELESS_HINT),
+    ];
+    const HINT_COUNT: usize = 5;
+    const BONELESS_HINT: usize = 5;
+
+    /// Needle bitmask per leading byte, so one pass over a name finds every needle it contains.
+    const NEEDLES_BY_FIRST_BYTE: [u32; 256] = {
+        let mut table = [0u32; 256];
+        let mut k = 0;
+        while k < ROUTING_NEEDLES.len() {
+            table[ROUTING_NEEDLES[k].0[0] as usize] |= 1 << k;
+            k += 1;
+        }
+        table
+    };
+
+    /// Needle bitmask per second byte; every needle is at least two bytes long.
+    const NEEDLES_BY_SECOND_BYTE: [u32; 256] = {
+        let mut table = [0u32; 256];
+        let mut k = 0;
+        while k < ROUTING_NEEDLES.len() {
+            table[ROUTING_NEEDLES[k].0[1] as usize] |= 1 << k;
+            k += 1;
+        }
+        table
+    };
+
+    /// Needle bitmask per hint (the boneless marker last).
+    const NEEDLES_BY_HINT: [u32; HINT_COUNT + 1] = {
+        let mut masks = [0u32; HINT_COUNT + 1];
+        let mut k = 0;
+        while k < ROUTING_NEEDLES.len() {
+            masks[ROUTING_NEEDLES[k].1] |= 1 << k;
+            k += 1;
+        }
+        masks
+    };
+
+    /// `BookPipe::OUTCOME_*` labels, in field order.
+    const FIX_OUTCOMES: [&[u8]; 5] = [b"nfo", b"files", b"par2", b"predb", b"unfixable"];
+
+    /// `ConsolePipe::W403_GENERIC_STEMS`.
+    const GENERIC_STEMS: [&[u8]; 20] = [
+        b"sample",
+        b"proof",
+        b"cover",
+        b"covers",
+        b"thumbs",
+        b"folder",
+        b"index",
+        b"readme",
+        b"screens",
+        b"screenshot",
+        b"subs",
+        b"setup",
+        b"install",
+        b"info",
+        b"nfo",
+        b"sfv",
+        b"par2",
+        b"extras",
+        b"default",
+        b"untitled",
+    ];
+
+    unsafe fn valid_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null()
+            || len > MAX_INPUT
+            || len > isize::MAX as usize
+            || (ptr as usize).checked_add(len).is_none()
+        {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn valid_out_buf(out_buf: *mut u8, out_cap: usize) -> bool {
+        !out_buf.is_null()
+            && out_cap <= isize::MAX as usize
+            && (out_buf as usize).checked_add(out_cap).is_some()
+    }
+
+    /// Whether `[a, a + a_len)` and `[b, b + b_len)` share a byte (empty ranges never do).
+    #[inline]
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> bool {
+        if a_len == 0 || b_len == 0 {
+            return false;
+        }
+        match (a.checked_add(a_len), b.checked_add(b_len)) {
+            (Some(a_end), Some(b_end)) => a < b_end && b < a_end,
+            _ => true,
+        }
+    }
+
+    /// Copies `bytes` into `out_buf`, returning the length or `-required` when it does not fit.
+    unsafe fn write_bytes(bytes: &[u8], out_buf: *mut u8, out_cap: usize) -> isize {
+        if bytes.len() > isize::MAX as usize {
+            return DECLINE;
+        }
+        if bytes.len() > out_cap {
+            return -(bytes.len() as isize);
+        }
+        if !bytes.is_empty() {
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len()) };
+        }
+        bytes.len() as isize
+    }
+
+    struct Fields(Vec<u8>);
+
+    impl Fields {
+        fn new(capacity: usize) -> Self {
+            Fields(Vec::with_capacity(capacity))
+        }
+
+        fn int(&mut self, value: i64) -> &mut Self {
+            if !self.0.is_empty() {
+                self.0.push(FIELD_SEP);
+            }
+            let mut digits = [0u8; 20];
+            self.0.extend_from_slice(decimal(value, &mut digits));
+            self
+        }
+
+        fn flag(&mut self, value: bool) -> &mut Self {
+            self.int(i64::from(value))
+        }
+    }
+
+    /// Allocation-free decimal rendering of `value` into `buf`.
+    fn decimal(value: i64, buf: &mut [u8; 20]) -> &[u8] {
+        let mut n = value.unsigned_abs();
+        let mut i = buf.len();
+        loop {
+            i -= 1;
+            buf[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        if value < 0 {
+            i -= 1;
+            buf[i] = b'-';
+        }
+        &buf[i..]
+    }
+
+    /// Splits `blob` by packed little-endian `u32` lengths; the lengths must cover it exactly.
+    fn split_blob<'a>(blob: &'a [u8], lens: &[u8]) -> Option<Vec<&'a [u8]>> {
+        let (chunks, []) = lens.as_chunks::<4>() else {
+            return None;
+        };
+        let mut items = Vec::with_capacity(chunks.len());
+        let mut offset = 0usize;
+        for chunk in chunks {
+            let len = u32::from_le_bytes(*chunk) as usize;
+            let end = offset.checked_add(len)?;
+            items.push(blob.get(offset..end)?);
+            offset = end;
+        }
+        (offset == blob.len()).then_some(items)
+    }
+
+    /// Decodes packed little-endian `i64` values; the length must be a multiple of eight.
+    fn split_ints(raw: &[u8]) -> Option<Vec<i64>> {
+        let (chunks, []) = raw.as_chunks::<8>() else {
+            return None;
+        };
+        Some(chunks.iter().map(|c| i64::from_le_bytes(*c)).collect())
+    }
+
+    fn trim_set<'a>(bytes: &'a [u8], set: &[u8]) -> &'a [u8] {
+        let start = bytes
+            .iter()
+            .position(|b| !set.contains(b))
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|b| !set.contains(b))
+            .map_or(start, |i| i + 1);
+        &bytes[start..end]
+    }
+
+    /// ASCII lowercase of `bytes` into `out`, like PHP 8.2+ `strtolower()`.
+    fn lower_into(bytes: &[u8], out: &mut Vec<u8>) {
+        out.clear();
+        out.extend(bytes.iter().map(u8::to_ascii_lowercase));
+    }
+
+    /// Bitmask of the `ROUTING_NEEDLES` that occur anywhere in `name`.
+    fn routing_matches(name: &[u8]) -> u32 {
+        let mut matched = 0u32;
+        for (i, pair) in name.windows(2).enumerate() {
+            let mut candidates = NEEDLES_BY_FIRST_BYTE[pair[0] as usize]
+                & NEEDLES_BY_SECOND_BYTE[pair[1] as usize]
+                & !matched;
+            while candidates != 0 {
+                let k = candidates.trailing_zeros() as usize;
+                candidates &= candidates - 1;
+                if name[i..].starts_with(ROUTING_NEEDLES[k].0) {
+                    matched |= 1 << k;
+                }
+            }
+        }
+        matched
+    }
+
+    /// `CategorizationService::summarizeCategoryDistributionPhp()`.
+    pub fn category_distribution(ids: &[i64]) -> Vec<u8> {
+        // Console, Movies, Audio, PC, TV, XXX, Books, Other.
+        let mut buckets = [0i64; 8];
+        let mut invalid = 0i64;
+        for &id in ids {
+            if !(0..=MAX_CATEGORY_ID).contains(&id) {
+                invalid += 1;
+                continue;
+            }
+            let root = (id / 1000) as usize;
+            buckets[if root == 0 || root == 8 { 7 } else { root - 1 }] += 1;
+        }
+        let total = ids.len() as i64;
+        let mut out = Fields::new(64);
+        out.int(total).int(total - invalid);
+        for count in buckets {
+            out.int(count);
+        }
+        out.int(invalid);
+        out.0
+    }
+
+    /// `GroupNamePipe::summarizeGroupNameRoutingPhp()`.
+    pub fn group_name_routing(names: &[&[u8]]) -> Vec<u8> {
+        let (mut binary, mut text_only, mut boneless, mut unknown) = (0i64, 0i64, 0i64, 0i64);
+        let mut hints = [0i64; HINT_COUNT];
+        let mut name = Vec::with_capacity(64);
+        for raw in names {
+            lower_into(trim_set(raw, TRIM_SET), &mut name);
+            if name.starts_with(b"alt.binaries.") || name.starts_with(b"a.b.") {
+                binary += 1;
+            } else if !name.is_empty() {
+                text_only += 1;
+            }
+            let matched = routing_matches(&name);
+            let is_boneless = matched & NEEDLES_BY_HINT[BONELESS_HINT] != 0;
+            if is_boneless {
+                boneless += 1;
+            }
+            match NEEDLES_BY_HINT[..HINT_COUNT]
+                .iter()
+                .position(|&mask| matched & mask != 0)
+            {
+                Some(hint) => hints[hint] += 1,
+                None if !is_boneless => unknown += 1,
+                None => {}
+            }
+        }
+        let mut out = Fields::new(64);
+        out.int(names.len() as i64)
+            .int(binary)
+            .int(text_only)
+            .int(boneless);
+        for count in hints {
+            out.int(count);
+        }
+        out.int(unknown);
+        out.0
+    }
+
+    /// `BookPipe::summarizeNameFixBatchProgressPhp()`.
+    pub fn name_fix_progress(outcomes: &[&[u8]], max_fixes: i64) -> Vec<u8> {
+        let mut counts = [0i64; 5];
+        let mut unknown = 0i64;
+        let mut label = Vec::with_capacity(16);
+        for raw in outcomes {
+            lower_into(trim_set(raw, TRIM_SET), &mut label);
+            match FIX_OUTCOMES.iter().position(|o| *o == label.as_slice()) {
+                Some(i) => counts[i] += 1,
+                None => unknown += 1,
+            }
+        }
+        let max = max_fixes.max(1);
+        let fixed = counts[0] + counts[1] + counts[2] + counts[3];
+        let mut out = Fields::new(64);
+        out.int(outcomes.len() as i64);
+        for count in &counts[..4] {
+            out.int(*count);
+        }
+        out.int(fixed)
+            .int(counts[4])
+            .int(unknown)
+            .flag(fixed >= max)
+            .int((max - fixed).max(0))
+            .int(max);
+        out.0
+    }
+
+    /// `ConsolePipe::summarizeCleanedFilenameBatchPhp()`.
+    pub fn cleaned_filename_batch(filenames: &[&[u8]], min_length: i64) -> Vec<u8> {
+        let (mut plausible, mut too_short, mut junk) = (0i64, 0i64, 0i64);
+        // Lowercased candidates share one arena; sorting their spans counts the distinct ones.
+        let mut arena: Vec<u8> = Vec::with_capacity(filenames.iter().map(|f| f.len()).sum());
+        let mut spans: Vec<(usize, usize)> = Vec::with_capacity(filenames.len());
+        for raw in filenames {
+            let name = trim_set(raw, TRIM_SET);
+            let mut stem = match name.iter().rposition(|&b| b == b'/' || b == b'\\') {
+                Some(cut) => &name[cut + 1..],
+                None => name,
+            };
+            if let Some(dot) = stem.iter().rposition(|&b| b == b'.') {
+                let ext = &stem[dot + 1..];
+                if dot > 0
+                    && !ext.is_empty()
+                    && ext.len() <= MAX_EXTENSION_LENGTH
+                    && ext.iter().all(u8::is_ascii_alphanumeric)
+                {
+                    stem = &stem[..dot];
+                }
+            }
+            let stem = trim_set(stem, STEM_TRIM_SET);
+            if (stem.len() as i64) < min_length {
+                too_short += 1;
+                continue;
+            }
+            let start = arena.len();
+            arena.extend(stem.iter().map(u8::to_ascii_lowercase));
+            let lower = &arena[start..];
+            if lower.iter().all(u8::is_ascii_digit) || GENERIC_STEMS.contains(&lower) {
+                junk += 1;
+                arena.truncate(start);
+                continue;
+            }
+            plausible += 1;
+            spans.push((start, arena.len()));
+        }
+        let mut candidates: Vec<&[u8]> = spans.iter().map(|&(s, e)| &arena[s..e]).collect();
+        candidates.sort_unstable();
+        candidates.dedup();
+        let mut out = Fields::new(48);
+        out.int(filenames.len() as i64)
+            .int(plausible)
+            .int(too_short)
+            .int(junk)
+            .int(candidates.len() as i64);
+        out.0
+    }
+
+    /// `MoviePipe::summarizeCandidateScoreWindowPhp()`.
+    pub fn candidate_score_window(scores: &[i64], threshold_permille: i64) -> Vec<u8> {
+        let threshold = threshold_permille.clamp(0, MAX_PERMILLE);
+        let (mut above, mut best, mut runner_up) = (0i64, 0i64, 0i64);
+        for &raw in scores {
+            let score = raw.clamp(0, MAX_PERMILLE);
+            if score >= threshold {
+                above += 1;
+            }
+            if score > best {
+                runner_up = best;
+                best = score;
+            } else if score > runner_up {
+                runner_up = score;
+            }
+        }
+        let candidates = scores.len() as i64;
+        let margin = best - runner_up;
+        let unambiguous = above >= 1 && (candidates == 1 || margin >= MIN_WINNER_MARGIN_PERMILLE);
+        let mut out = Fields::new(64);
+        out.int(candidates)
+            .int(above)
+            .int(best)
+            .int(runner_up)
+            .int(margin)
+            .flag(unambiguous)
+            .int(threshold);
+        out.0
+    }
+
+    /// Validates a packed string list and the output buffer, then writes `render(items)`.
+    unsafe fn with_strings(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+        render: impl FnOnce(&[&[u8]]) -> Vec<u8>,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap)
+                || overlaps(out_buf as usize, out_cap, blob_ptr as usize, blob_len)
+                || overlaps(out_buf as usize, out_cap, lens_ptr as usize, lens_len)
+            {
+                return DECLINE;
+            }
+            let (Some(blob), Some(lens)) = (unsafe { valid_slice(blob_ptr, blob_len) }, unsafe {
+                valid_slice(lens_ptr, lens_len)
+            }) else {
+                return DECLINE;
+            };
+            let Some(items) = split_blob(blob, lens) else {
+                return DECLINE;
+            };
+            unsafe { write_bytes(&render(&items), out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// Validates a packed `i64` list and the output buffer, then writes `render(values)`.
+    unsafe fn with_ints(
+        raw_ptr: *const u8,
+        raw_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+        render: impl FnOnce(&[i64]) -> Vec<u8>,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap)
+                || overlaps(out_buf as usize, out_cap, raw_ptr as usize, raw_len)
+            {
+                return DECLINE;
+            }
+            let Some(raw) = (unsafe { valid_slice(raw_ptr, raw_len) }) else {
+                return DECLINE;
+            };
+            let Some(values) = split_ints(raw) else {
+                return DECLINE;
+            };
+            unsafe { write_bytes(&render(&values), out_buf, out_cap) }
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// # Safety
+    /// `ids_ptr` must be valid for `ids_len` readable bytes (packed little-endian `i64`s) and
+    /// `out_buf` valid for `out_cap` writable bytes, not overlapping the input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w403_category_distribution(
+        ids_ptr: *const u8,
+        ids_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe { with_ints(ids_ptr, ids_len, out_buf, out_cap, category_distribution) }
+    }
+
+    /// # Safety
+    /// `blob_ptr`/`lens_ptr` must be valid for their lengths in readable bytes, and `out_buf` must be
+    /// valid for `out_cap` writable bytes, not overlapping either input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w403_group_name_routing(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_strings(
+                blob_ptr,
+                blob_len,
+                lens_ptr,
+                lens_len,
+                out_buf,
+                out_cap,
+                group_name_routing,
+            )
+        }
+    }
+
+    /// # Safety
+    /// `blob_ptr`/`lens_ptr` must be valid for their lengths in readable bytes, and `out_buf` must be
+    /// valid for `out_cap` writable bytes, not overlapping either input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w403_name_fix_batch_progress(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        max_fixes: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_strings(
+                blob_ptr,
+                blob_len,
+                lens_ptr,
+                lens_len,
+                out_buf,
+                out_cap,
+                |items| name_fix_progress(items, max_fixes),
+            )
+        }
+    }
+
+    /// # Safety
+    /// `blob_ptr`/`lens_ptr` must be valid for their lengths in readable bytes, and `out_buf` must be
+    /// valid for `out_cap` writable bytes, not overlapping either input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w403_cleaned_filename_batch(
+        blob_ptr: *const u8,
+        blob_len: usize,
+        lens_ptr: *const u8,
+        lens_len: usize,
+        min_plausible_length: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_strings(
+                blob_ptr,
+                blob_len,
+                lens_ptr,
+                lens_len,
+                out_buf,
+                out_cap,
+                |items| cleaned_filename_batch(items, min_plausible_length),
+            )
+        }
+    }
+
+    /// # Safety
+    /// `scores_ptr` must be valid for `scores_len` readable bytes (packed little-endian `i64`s) and
+    /// `out_buf` valid for `out_cap` writable bytes, not overlapping the input.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w403_candidate_score_window(
+        scores_ptr: *const u8,
+        scores_len: usize,
+        threshold_permille: i64,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        unsafe {
+            with_ints(scores_ptr, scores_len, out_buf, out_cap, |scores| {
+                candidate_score_window(scores, threshold_permille)
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::ptr;
+
+        fn text(bytes: &[u8]) -> String {
+            String::from_utf8_lossy(bytes).replace('\x1F', "|")
+        }
+
+        fn call(f: impl Fn(*mut u8, usize) -> isize) -> String {
+            let mut buf = vec![0u8; 256];
+            let n = f(buf.as_mut_ptr(), buf.len());
+            assert!(n > 0, "call declined: {n}");
+            text(&buf[..n as usize])
+        }
+
+        fn packed(items: &[&[u8]]) -> (Vec<u8>, Vec<u8>) {
+            let blob = items.concat();
+            let lens = items
+                .iter()
+                .flat_map(|i| (i.len() as u32).to_le_bytes())
+                .collect();
+            (blob, lens)
+        }
+
+        fn ints(values: &[i64]) -> Vec<u8> {
+            values.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+
+        #[test]
+        fn w403_category_distribution_buckets() {
+            let ids = [
+                1000,
+                1999,
+                2040,
+                3010,
+                4050,
+                5040,
+                5070,
+                6010,
+                7020,
+                0,
+                10,
+                20,
+                8010,
+                8999,
+                9000,
+                -1,
+                i64::MIN,
+                i64::MAX,
+            ];
+            assert_eq!(
+                text(&category_distribution(&ids)),
+                "18|14|2|1|1|1|2|1|1|5|4"
+            );
+            assert_eq!(text(&category_distribution(&[])), "0|0|0|0|0|0|0|0|0|0|0");
+            let raw = ints(&[2000, 5000, -5]);
+            let got = call(|b, c| unsafe {
+                nntmux_w403_category_distribution(raw.as_ptr(), raw.len(), b, c)
+            });
+            assert_eq!(got, "3|2|0|1|0|0|1|0|0|0|1");
+        }
+
+        #[test]
+        fn w403_group_name_routing_hints() {
+            let groups: [&[u8]; 10] = [
+                b" Alt.Binaries.Boneless ",
+                b"a.b.teevee",
+                b"alt.binaries.movies.divx",
+                b"alt.binaries.sounds.mp3",
+                b"alt.binaries.games.xbox360",
+                b"alt.binaries.erotica",
+                b"alt.binaries.misc",
+                b"comp.lang.php",
+                b"",
+                b"alt.binaries.hdtv.x264",
+            ];
+            assert_eq!(text(&group_name_routing(&groups)), "10|8|1|1|1|1|1|2|1|3");
+            let (blob, lens) = packed(&groups);
+            let got = call(|b, c| unsafe {
+                nntmux_w403_group_name_routing(
+                    blob.as_ptr(),
+                    blob.len(),
+                    lens.as_ptr(),
+                    lens.len(),
+                    b,
+                    c,
+                )
+            });
+            assert_eq!(got, "10|8|1|1|1|1|1|2|1|3");
+        }
+
+        #[test]
+        fn w403_name_fix_progress_counts() {
+            let outcomes: [&[u8]; 8] = [
+                b"nfo",
+                b" NFO ",
+                b"files",
+                b"par2",
+                b"predb",
+                b"unfixable",
+                b"bogus",
+                b"",
+            ];
+            assert_eq!(
+                text(&name_fix_progress(&outcomes, 500)),
+                "8|2|1|1|1|5|1|2|0|495|500"
+            );
+            assert_eq!(
+                text(&name_fix_progress(&outcomes, 5)),
+                "8|2|1|1|1|5|1|2|1|0|5"
+            );
+            assert_eq!(
+                text(&name_fix_progress(&outcomes, i64::MIN)),
+                "8|2|1|1|1|5|1|2|1|0|1"
+            );
+            assert_eq!(text(&name_fix_progress(&[], 0)), "0|0|0|0|0|0|0|0|0|1|1");
+            let (blob, lens) = packed(&outcomes);
+            let got = call(|b, c| unsafe {
+                nntmux_w403_name_fix_batch_progress(
+                    blob.as_ptr(),
+                    blob.len(),
+                    lens.as_ptr(),
+                    lens.len(),
+                    3,
+                    b,
+                    c,
+                )
+            });
+            assert_eq!(got, "8|2|1|1|1|5|1|2|1|0|3");
+        }
+
+        #[test]
+        fn w403_cleaned_filename_batch_counts() {
+            let names: [&[u8]; 9] = [
+                b"Movie.Title.2024.1080p.mkv",
+                b"dir/sub\\movie.title.2024.1080p.MKV",
+                b"sample.mkv",
+                b"00001.jpg",
+                b"ab.mkv",
+                b"  _Some.Show.S01E01_  ",
+                b".hidden",
+                b"archive.part01.rar",
+                b"name.toolong",
+            ];
+            assert_eq!(text(&cleaned_filename_batch(&names, 5)), "9|6|1|2|5");
+            assert_eq!(text(&cleaned_filename_batch(&names, i64::MAX)), "9|0|9|0|0");
+            assert_eq!(text(&cleaned_filename_batch(&names, i64::MIN)), "9|7|0|2|6");
+            let (blob, lens) = packed(&names);
+            let got = call(|b, c| unsafe {
+                nntmux_w403_cleaned_filename_batch(
+                    blob.as_ptr(),
+                    blob.len(),
+                    lens.as_ptr(),
+                    lens.len(),
+                    5,
+                    b,
+                    c,
+                )
+            });
+            assert_eq!(got, "9|6|1|2|5");
+        }
+
+        #[test]
+        fn w403_candidate_score_window_states() {
+            assert_eq!(
+                text(&candidate_score_window(&[910, 860, 700], 850)),
+                "3|2|910|860|50|1|850"
+            );
+            assert_eq!(
+                text(&candidate_score_window(&[910, 870], 850)),
+                "2|2|910|870|40|0|850"
+            );
+            assert_eq!(
+                text(&candidate_score_window(&[900], 850)),
+                "1|1|900|0|900|1|850"
+            );
+            assert_eq!(
+                text(&candidate_score_window(&[900, 900], 850)),
+                "2|2|900|900|0|0|850"
+            );
+            assert_eq!(text(&candidate_score_window(&[], 850)), "0|0|0|0|0|0|850");
+            assert_eq!(
+                text(&candidate_score_window(&[i64::MAX, i64::MIN], i64::MIN)),
+                "2|2|1000|0|1000|1|0"
+            );
+            assert_eq!(
+                text(&candidate_score_window(&[0], i64::MAX)),
+                "1|0|0|0|0|0|1000"
+            );
+            let raw = ints(&[800, 990]);
+            let got = call(|b, c| unsafe {
+                nntmux_w403_candidate_score_window(raw.as_ptr(), raw.len(), 850, b, c)
+            });
+            assert_eq!(got, "2|1|990|800|190|1|850");
+        }
+
+        #[test]
+        fn w403_exports_validate_inputs_and_capacity() {
+            let x = b"x".as_ptr();
+            let lens1 = 1u32.to_le_bytes();
+            let raw = ints(&[5000]);
+            unsafe {
+                let mut small = [b'Z'; 4];
+                let needed =
+                    nntmux_w403_category_distribution(raw.as_ptr(), 8, small.as_mut_ptr(), 4);
+                assert_eq!(needed, -("1|1|0|0|0|0|1|0|0|0|0".len() as isize));
+                assert_eq!(small, [b'Z'; 4]);
+                let needed =
+                    nntmux_w403_group_name_routing(x, 1, lens1.as_ptr(), 4, small.as_mut_ptr(), 0);
+                assert!(needed < -1);
+                assert_eq!(small, [b'Z'; 4]);
+
+                let mut out = [0u8; 128];
+                let (b, c) = (out.as_mut_ptr(), out.len());
+                // Null output and inputs decline.
+                assert_eq!(
+                    nntmux_w403_category_distribution(raw.as_ptr(), 8, ptr::null_mut(), 8),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w403_category_distribution(ptr::null(), 0, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w403_candidate_score_window(ptr::null(), 0, 850, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w403_group_name_routing(ptr::null(), 0, x, 0, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w403_group_name_routing(x, 0, ptr::null(), 0, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w403_name_fix_batch_progress(ptr::null(), 0, x, 0, 5, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w403_cleaned_filename_batch(x, 0, ptr::null(), 0, 5, b, c),
+                    DECLINE
+                );
+                // Ragged lengths and inconsistent blobs decline.
+                assert_eq!(nntmux_w403_category_distribution(x, 1, b, c), DECLINE);
+                assert_eq!(nntmux_w403_candidate_score_window(x, 7, 850, b, c), DECLINE);
+                assert_eq!(
+                    nntmux_w403_group_name_routing(x, 1, lens1.as_ptr(), 3, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w403_name_fix_batch_progress(x, 0, lens1.as_ptr(), 4, 5, b, c),
+                    DECLINE
+                );
+                let two = 2u32.to_le_bytes();
+                assert_eq!(
+                    nntmux_w403_cleaned_filename_batch(x, 1, two.as_ptr(), 4, 5, b, c),
+                    DECLINE
+                );
+                let huge = u32::MAX.to_le_bytes();
+                assert_eq!(
+                    nntmux_w403_group_name_routing(x, 1, huge.as_ptr(), 4, b, c),
+                    DECLINE
+                );
+                // Oversized inputs decline.
+                assert_eq!(
+                    nntmux_w403_group_name_routing(x, MAX_INPUT + 1, x, 0, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w403_category_distribution(x, MAX_INPUT + 8, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w403_candidate_score_window(x, usize::MAX - 7, 850, b, c),
+                    DECLINE
+                );
+                // An output buffer overlapping an input declines without writing.
+                let mut shared = *b"sample\x06\0\0\0..............................................";
+                let p = shared.as_mut_ptr();
+                assert_eq!(
+                    nntmux_w403_cleaned_filename_batch(p, 6, p.add(6), 4, 5, p.add(3), 40),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w403_cleaned_filename_batch(p, 6, p.add(6), 4, 5, p.add(9), 40),
+                    DECLINE
+                );
+                assert_eq!(&shared[..6], b"sample");
+                assert!(
+                    nntmux_w403_cleaned_filename_batch(p, 6, p.add(6), 4, 5, p.add(10), 40) > 0
+                );
+                let mut ints_shared = [0u8; 64];
+                let q = ints_shared.as_mut_ptr();
+                assert_eq!(
+                    nntmux_w403_category_distribution(q, 8, q.add(7), 40),
+                    DECLINE
+                );
+                assert!(nntmux_w403_category_distribution(q, 8, q.add(8), 40) > 0);
+                // Empty lists are valid.
+                assert!(nntmux_w403_group_name_routing(x, 0, x, 0, b, c) > 0);
+                assert!(nntmux_w403_name_fix_batch_progress(x, 0, x, 0, 5, b, c) > 0);
+                assert!(nntmux_w403_cleaned_filename_batch(x, 0, x, 0, 5, b, c) > 0);
+                assert!(nntmux_w403_category_distribution(x, 0, b, c) > 0);
+                assert!(nntmux_w403_candidate_score_window(x, 0, 850, b, c) > 0);
+            }
+        }
+
+        #[test]
+        fn w403_overlap_helper() {
+            assert!(!overlaps(10, 0, 10, 5));
+            assert!(overlaps(10, 5, 14, 1));
+            assert!(!overlaps(10, 5, 15, 1));
+            assert!(overlaps(usize::MAX, 2, 0, 1));
+        }
+    }
+}

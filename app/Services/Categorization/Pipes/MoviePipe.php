@@ -17,6 +17,33 @@ use Throwable;
  */
 class MoviePipe extends AbstractCategorizationPipe
 {
+    /**
+     * Wave 40.3 production default is PHP: the paired benchmark in
+     * tests/Unit/RustCategorizationServiceGroupNameFixerW40ParityTest.php measures only
+     * 0.42-0.43x mean / 0.37-0.50x p99 on the common batch, below the 1.5x adoption threshold, so Rust
+     * stays behind useW403RustFfi(true). Named W403 so it stays distinct from other Rust FFI toggles.
+     */
+    public const bool W403_RUST_FFI_DEFAULT = false;
+
+    public const string W403_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w403_candidate_score_window(
+            const char *values_ptr,
+            size_t values_len,
+            int64_t threshold_permille,
+            char *out_buf,
+            size_t out_cap
+        );
+        C;
+
+    public const int W403_MAX_PERMILLE = 1000;
+
+    /** A winner above the threshold is unambiguous alone or this far ahead of the runner-up. */
+    public const int W403_MIN_WINNER_MARGIN_PERMILLE = 50;
+
+    private static ?bool $w403RustFfiOverride = null;
+
+    private static FFI|false|null $w403RustFfiHandle = null;
+
     public const string PIPE_SPEC_FFI_CDEF = <<<'C'
         ssize_t nntmux_categorize_pipes_spec_name(uint8_t kind, char *out_buf, size_t out_cap);
         int64_t nntmux_categorize_pipes_spec_priority(uint8_t kind);
@@ -209,5 +236,166 @@ class MoviePipe extends AbstractCategorizationPipe
         }
 
         return self::$pipeSpecFfi === false ? null : self::$pipeSpecFfi;
+    }
+
+    public static function useW403RustFfi(?bool $enabled): void
+    {
+        self::$w403RustFfiOverride = $enabled;
+    }
+
+    public static function usesW403RustFfi(): bool
+    {
+        return self::$w403RustFfiOverride ?? self::W403_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW403RustFfi(): void
+    {
+        self::$w403RustFfiOverride = null;
+        self::$w403RustFfiHandle = null;
+    }
+
+    /**
+     * Summary of a window of candidate similarity scores in permille. Integer scores and the
+     * threshold are clamped to 0..W403_MAX_PERMILLE; non-integer scores are invalid and skipped. The
+     * best candidate is an unambiguous winner when it reaches the threshold and is either the only
+     * candidate or at least W403_MIN_WINNER_MARGIN_PERMILLE ahead of the runner-up.
+     *
+     * @param  array<array-key, mixed>  $scoresPermille
+     * @return array{candidates: int, invalid: int, above_threshold: int, best: int, runner_up: int, margin: int, unambiguous: bool, threshold: int}
+     */
+    public static function summarizeCandidateScoreWindow(array $scoresPermille, int $thresholdPermille = 850): array
+    {
+        return (self::usesW403RustFfi() ? self::summarizeCandidateScoreWindowNative($scoresPermille, $thresholdPermille) : null)
+            ?? self::summarizeCandidateScoreWindowPhp($scoresPermille, $thresholdPermille);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $scoresPermille
+     * @return array{candidates: int, invalid: int, above_threshold: int, best: int, runner_up: int, margin: int, unambiguous: bool, threshold: int}
+     */
+    public static function summarizeCandidateScoreWindowPhp(array $scoresPermille, int $thresholdPermille = 850): array
+    {
+        $threshold = max(0, min(self::W403_MAX_PERMILLE, $thresholdPermille));
+        $invalid = 0;
+        $above = 0;
+        $best = 0;
+        $runnerUp = 0;
+        foreach ($scoresPermille as $raw) {
+            if (! \is_int($raw)) {
+                $invalid++;
+
+                continue;
+            }
+            $score = max(0, min(self::W403_MAX_PERMILLE, $raw));
+            if ($score >= $threshold) {
+                $above++;
+            }
+            if ($score > $best) {
+                $runnerUp = $best;
+                $best = $score;
+            } elseif ($score > $runnerUp) {
+                $runnerUp = $score;
+            }
+        }
+        $candidates = \count($scoresPermille) - $invalid;
+        $margin = $best - $runnerUp;
+
+        return [
+            'candidates' => $candidates,
+            'invalid' => $invalid,
+            'above_threshold' => $above,
+            'best' => $best,
+            'runner_up' => $runnerUp,
+            'margin' => $margin,
+            'unambiguous' => $above >= 1 && ($candidates === 1 || $margin >= self::W403_MIN_WINNER_MARGIN_PERMILLE),
+            'threshold' => $threshold,
+        ];
+    }
+
+    /**
+     * Declines (null) for non-integer scores so PHP counts them as invalid.
+     *
+     * @param  array<array-key, mixed>  $scoresPermille
+     * @return array{candidates: int, invalid: int, above_threshold: int, best: int, runner_up: int, margin: int, unambiguous: bool, threshold: int}|null
+     */
+    public static function summarizeCandidateScoreWindowNative(array $scoresPermille, int $thresholdPermille = 850): ?array
+    {
+        foreach ($scoresPermille as $item) {
+            if (! \is_int($item)) {
+                return null;
+            }
+        }
+        $packed = pack('P*', ...array_values($scoresPermille));
+        $fields = self::callW403Native('nntmux_w403_candidate_score_window', [$packed, \strlen($packed), $thresholdPermille], 96, 7);
+        if ($fields === null || ($fields[5] !== '0' && $fields[5] !== '1')) {
+            return null;
+        }
+
+        return [
+            'candidates' => (int) $fields[0],
+            'invalid' => 0,
+            'above_threshold' => (int) $fields[1],
+            'best' => (int) $fields[2],
+            'runner_up' => (int) $fields[3],
+            'margin' => (int) $fields[4],
+            'unambiguous' => $fields[5] === '1',
+            'threshold' => (int) $fields[6],
+        ];
+    }
+
+    /**
+     * Calls a Wave 40.3 export with the shared scratch buffer, retrying once at the size it asks for.
+     * Returns its fields only when there are exactly $fieldCount, all of them decimal.
+     *
+     * @param  list<int|string>  $args  arguments preceding the caller-owned output buffer
+     * @return list<string>|null
+     */
+    private static function callW403Native(string $symbol, array $args, int $minBytes, int $fieldCount): ?array
+    {
+        $ffi = self::w403RustFfi();
+        if ($ffi === null) {
+            return null;
+        }
+
+        try {
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, $minBytes, $capacity);
+            if ($buffer === null) {
+                return null;
+            }
+            $written = $ffi->$symbol(...[...$args, $buffer, $capacity]);
+            if (\is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return null;
+                }
+                $written = $ffi->$symbol(...[...$args, $buffer, $capacity]);
+            }
+            if (! \is_int($written) || $written < 0 || $written > $capacity) {
+                return null;
+            }
+            $fields = explode("\x1F", FFI::string($buffer, $written));
+            if (\count($fields) !== $fieldCount) {
+                return null;
+            }
+            foreach ($fields as $field) {
+                if (\strlen($field) > 19 || ! ctype_digit($field)) {
+                    return null;
+                }
+            }
+
+            return $fields;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private static function w403RustFfi(): ?FFI
+    {
+        if (self::$w403RustFfiHandle === null) {
+            self::$w403RustFfiHandle = RustPipelineLibrary::resolveDomain('categorize_w403', self::W403_FFI_CDEF) ?? false;
+        }
+
+        return self::$w403RustFfiHandle === false ? null : self::$w403RustFfiHandle;
     }
 }
