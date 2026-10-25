@@ -31,6 +31,151 @@ use Throwable;
  */
 class MovieService
 {
+    /** Disabled unless paired common and uncommon mean/p99 gains all reach 1.5x. */
+    public const bool W404_RUST_FFI_DEFAULT = false;
+
+    public const string W404_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w404_movie_metadata_completeness(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private static ?bool $w404UseRustFfi = null;
+
+    private static FFI|false|null $w404Ffi = null;
+
+    public static function useW404RustFfi(?bool $use = true): void
+    {
+        self::$w404UseRustFfi = $use;
+        if ($use === null) {
+            self::$w404Ffi = null;
+        }
+    }
+
+    public static function usesW404RustFfi(): bool
+    {
+        return self::$w404UseRustFfi ?? self::W404_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW404RustFfi(): void
+    {
+        self::$w404UseRustFfi = null;
+        self::$w404Ffi = null;
+    }
+
+    /** @param list<list<string>> $rows
+     * @return array<string, int>|null
+     */
+    private static function w404Call(array $rows): ?array
+    {
+        try {
+            $input = serialize([$rows]);
+            if (strlen($input) > 16777216) {
+                return null;
+            }
+            self::$w404Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w404', self::W404_FFI_CDEF) ?? false;
+            $ffi = self::$w404Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            $capacity = 0;
+            $out = RustPipelineLibrary::obtainScratch($ffi, 2048, $capacity);
+            if ($out === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound (Declared by W404_FFI_CDEF.)
+            $written = $ffi->nntmux_w404_movie_metadata_completeness($input, strlen($input), $out, $capacity);
+            if (is_int($written) && $written < -1 && $written >= -16777216) {
+                $out = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($out === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound (Declared by W404_FFI_CDEF.)
+                $written = $ffi->nntmux_w404_movie_metadata_completeness($input, strlen($input), $out, $capacity);
+            }
+            if (! is_int($written) || $written <= 0 || $written > $capacity || $written > 16777216) {
+                return null;
+            }
+            $result = @unserialize(FFI::string($out, $written), ['allowed_classes' => false]);
+            $keys = ['total_rows', 'valid_imdb_id_count', 'has_tmdb_id_count', 'has_cover_count', 'missing_year_count', 'complete_record_count'];
+            if (! is_array($result) || array_keys($result) !== $keys) {
+                return null;
+            }
+            $summary = [];
+            foreach ($keys as $key) {
+                $value = $result[$key];
+                if (! is_int($value) || $value < 0 || $value > count($rows)) {
+                    return null;
+                }
+                $summary[$key] = $value;
+            }
+
+            return $summary;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** Only integer and string fields participate; objects are never cast or serialized. */
+    private static function w404Text(mixed $value): string
+    {
+        return is_string($value) || is_int($value) ? trim((string) $value) : '';
+    }
+
+    /** @param array<array-key, mixed> $input
+     * @return list<list<string>>
+     */
+    private static function w404Rows(array $input): array
+    {
+        $rows = [];
+        foreach ($input as $row) {
+            $row = is_array($row) ? $row : [];
+            $rows[] = [self::w404Text($row['imdbid'] ?? null), self::w404Text($row['tmdbid'] ?? null), self::w404Text($row['cover'] ?? null), self::w404Text($row['year'] ?? null)];
+        }
+
+        return $rows;
+    }
+
+    /**
+     * Summarize imdbid, tmdbid, cover and year fields. IMDb IDs have an optional
+     * lowercase tt prefix and 7-10 nonzero-as-a-whole digits. TMDb/cover are
+     * positive decimals; years are 1000-2999. Complete means all four qualify.
+     *
+     * @param  array<array-key, mixed>  $movies
+     * @return array<string, int>
+     */
+    public static function summarizeMovieMetadataCompleteness(array $movies): array
+    {
+        if (self::usesW404RustFfi()) {
+            $native = self::w404Call(self::w404Rows($movies));
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
+        return self::summarizeMovieMetadataCompletenessPhp($movies);
+    }
+
+    /** @param array<array-key, mixed> $movies
+     * @return array<string, int>
+     */
+    public static function summarizeMovieMetadataCompletenessPhp(array $movies): array
+    {
+        $summary = array_fill_keys(['total_rows', 'valid_imdb_id_count', 'has_tmdb_id_count', 'has_cover_count', 'missing_year_count', 'complete_record_count'], 0);
+        $summary['total_rows'] = count($movies);
+        foreach (self::w404Rows($movies) as [$imdb, $tmdb, $cover, $year]) {
+            $validImdb = preg_match('/\A(?:tt)?[0-9]{7,10}\z/', $imdb) === 1 && strspn($imdb, 't0') !== strlen($imdb);
+            $hasTmdb = preg_match('/\A[0-9]+\z/', $tmdb) === 1 && strspn($tmdb, '0') !== strlen($tmdb);
+            $hasCover = preg_match('/\A[0-9]+\z/', $cover) === 1 && strspn($cover, '0') !== strlen($cover);
+            $hasYear = preg_match('/\A[12][0-9]{3}\z/', $year) === 1;
+            $summary['valid_imdb_id_count'] += (int) $validImdb;
+            $summary['has_tmdb_id_count'] += (int) $hasTmdb;
+            $summary['has_cover_count'] += (int) $hasCover;
+            $summary['missing_year_count'] += (int) ! $hasYear;
+            $summary['complete_record_count'] += (int) ($validImdb && $hasTmdb && $hasCover && $hasYear);
+        }
+
+        return $summary;
+    }
+
     protected const MATCH_PERCENT = 75;
 
     /** Lower threshold when year matches exactly; allows matching by alternate title (e.g. "Girl Cops" vs primary). */

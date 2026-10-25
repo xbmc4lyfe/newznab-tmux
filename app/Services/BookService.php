@@ -32,6 +32,146 @@ use Throwable;
  */
 class BookService
 {
+    /** Disabled unless paired common and uncommon mean/p99 gains all reach 1.5x. */
+    public const bool W404_RUST_FFI_DEFAULT = false;
+
+    public const string W404_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w404_book_lookup_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private static ?bool $w404UseRustFfi = null;
+
+    private static FFI|false|null $w404Ffi = null;
+
+    public static function useW404RustFfi(?bool $use = true): void
+    {
+        self::$w404UseRustFfi = $use;
+        if ($use === null) {
+            self::$w404Ffi = null;
+        }
+    }
+
+    public static function usesW404RustFfi(): bool
+    {
+        return self::$w404UseRustFfi ?? self::W404_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW404RustFfi(): void
+    {
+        self::$w404UseRustFfi = null;
+        self::$w404Ffi = null;
+    }
+
+    /** @param list<list<string>> $rows
+     * @return array<string, int>|null
+     */
+    private static function w404Call(array $rows): ?array
+    {
+        try {
+            $input = serialize([$rows]);
+            if (strlen($input) > 16777216) {
+                return null;
+            }
+            self::$w404Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w404', self::W404_FFI_CDEF) ?? false;
+            $ffi = self::$w404Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            $capacity = 0;
+            $out = RustPipelineLibrary::obtainScratch($ffi, 2048, $capacity);
+            if ($out === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound (Declared by W404_FFI_CDEF.)
+            $written = $ffi->nntmux_w404_book_lookup_batch($input, strlen($input), $out, $capacity);
+            if (is_int($written) && $written < -1 && $written >= -16777216) {
+                $out = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($out === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound (Declared by W404_FFI_CDEF.)
+                $written = $ffi->nntmux_w404_book_lookup_batch($input, strlen($input), $out, $capacity);
+            }
+            if (! is_int($written) || $written <= 0 || $written > $capacity || $written > 16777216) {
+                return null;
+            }
+            $result = @unserialize(FFI::string($out, $written), ['allowed_classes' => false]);
+            $keys = ['total_rows', 'valid_isbn_count', 'has_author_count', 'has_publish_date_count', 'ebook_format_count'];
+            if (! is_array($result) || array_keys($result) !== $keys) {
+                return null;
+            }
+            $summary = [];
+            foreach ($keys as $key) {
+                $value = $result[$key];
+                if (! is_int($value) || $value < 0 || $value > count($rows)) {
+                    return null;
+                }
+                $summary[$key] = $value;
+            }
+
+            return $summary;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** Only integer and string fields participate; objects are never cast or serialized. */
+    private static function w404Text(mixed $value): string
+    {
+        return is_string($value) || is_int($value) ? trim((string) $value) : '';
+    }
+
+    /** @param array<array-key, mixed> $input
+     * @return list<list<string>>
+     */
+    private static function w404Rows(array $input): array
+    {
+        $rows = [];
+        foreach ($input as $row) {
+            $row = is_array($row) ? $row : [];
+            $rows[] = [self::w404Text($row['isbn'] ?? null), self::w404Text($row['author'] ?? null), self::w404Text($row['publishdate'] ?? $row['publish_date'] ?? null), self::w404Text($row['format'] ?? null)];
+        }
+
+        return $rows;
+    }
+
+    /**
+     * Summarize isbn, author, publishdate (or publish_date) and format.
+     * ISBN validity follows BookIsbn's PHP checksums; dates count when nonempty.
+     * Ebook formats are EPUB, MOBI, AZW, AZW3, PDF, CBZ and CBR (case-insensitive).
+     *
+     * @param  array<array-key, mixed>  $books
+     * @return array<string, int>
+     */
+    public static function summarizeBookLookupBatch(array $books): array
+    {
+        if (self::usesW404RustFfi()) {
+            $native = self::w404Call(self::w404Rows($books));
+            if ($native !== null) {
+                return $native;
+            }
+        }
+
+        return self::summarizeBookLookupBatchPhp($books);
+    }
+
+    /** @param array<array-key, mixed> $books
+     * @return array<string, int>
+     */
+    public static function summarizeBookLookupBatchPhp(array $books): array
+    {
+        $summary = array_fill_keys(['total_rows', 'valid_isbn_count', 'has_author_count', 'has_publish_date_count', 'ebook_format_count'], 0);
+        $summary['total_rows'] = count($books);
+        foreach (self::w404Rows($books) as [$isbn, $author, $publishDate, $format]) {
+            $summary['valid_isbn_count'] += (int) (BookIsbn::normalizePhp($isbn) !== null);
+            $summary['has_author_count'] += (int) ($author !== '');
+            $summary['has_publish_date_count'] += (int) ($publishDate !== '');
+            $summary['ebook_format_count'] += (int) in_array(strtoupper($format), ['EPUB', 'MOBI', 'AZW', 'AZW3', 'PDF', 'CBZ', 'CBR'], true);
+        }
+
+        return $summary;
+    }
+
     public const string BOOK_FFI_CDEF = <<<'C'
         ssize_t nntmux_book_parse_release_name(const char *input, size_t input_len, const char *release_type, size_t type_len, char *out, size_t cap);
         ssize_t nntmux_book_extract_isbn(const char *input, size_t input_len, char *out, size_t cap);
