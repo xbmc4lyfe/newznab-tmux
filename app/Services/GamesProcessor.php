@@ -182,4 +182,168 @@ class GamesProcessor
 
         return self::$ffi === false ? null : self::$ffi;
     }
+
+    /** Enabled: paired common and uncommon mean/p99 gains all reach 1.5x (see the W41 parity test). */
+    public const bool W414_RUST_FFI_DEFAULT = true;
+
+    public const string W414_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w414_game_release_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private const array W414_SUMMARY_KEYS = ['total_entries', 'empty_title_count', 'version_tagged_count', 'crack_fix_count', 'multi_language_count', 'repack_count', 'group_suffix_count'];
+
+    private const array W414_CRACK_TOKENS = ['CRACK' => true, 'CRACKFIX' => true, 'CRACKED' => true, 'FIX' => true, 'HOTFIX' => true, 'READNFO' => true];
+
+    private const array W414_REPACK_TOKENS = ['REPACK' => true, 'RIP' => true, 'FITGIRL' => true, 'DODI' => true];
+
+    private static ?bool $w414UseRustFfi = null;
+
+    private static FFI|false|null $w414Ffi = null;
+
+    public static function useW414RustFfi(bool $enable = true): void
+    {
+        self::$w414UseRustFfi = $enable;
+    }
+
+    public static function usesW414RustFfi(): bool
+    {
+        return self::$w414UseRustFfi ?? self::W414_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW414RustFfi(): void
+    {
+        self::$w414UseRustFfi = null;
+        self::$w414Ffi = null;
+    }
+
+    /**
+     * Summarize PC game release titles by V<n>/BUILD version tokens,
+     * crack/fix tokens, MULTI<n> language tokens, repack tokens and a
+     * trailing "-GROUP" suffix of 1-20 word characters.
+     * Titles come from strings, integers, or the searchname, name or title
+     * array field; other values (including objects) count as empty titles.
+     * Tokens are maximal ASCII alphanumeric runs compared case-insensitively.
+     *
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeGameReleaseBatch(array $entries): array
+    {
+        return self::usesW414RustFfi()
+            ? self::summarizeGameReleaseBatchNative($entries)
+            : self::summarizeGameReleaseBatchPhp($entries);
+    }
+
+    /**
+     * Rust summary; falls back to PHP when the library or input frame is unusable.
+     *
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeGameReleaseBatchNative(array $entries): array
+    {
+        return self::w414Call(self::w414Titles($entries)) ?? self::summarizeGameReleaseBatchPhp($entries);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizeGameReleaseBatchPhp(array $entries): array
+    {
+        $summary = array_fill_keys(self::W414_SUMMARY_KEYS, 0);
+        foreach (self::w414Titles($entries) as $title) {
+            $summary['total_entries']++;
+            $title = trim($title);
+            if ($title === '') {
+                $summary['empty_title_count']++;
+
+                continue;
+            }
+            $summary['group_suffix_count'] += (int) (preg_match('/-[A-Za-z0-9_]{1,20}\z/', $title) === 1);
+            $found = [false, false, false, false];
+            foreach (preg_split('/[^A-Za-z0-9]+/', strtoupper($title), -1, PREG_SPLIT_NO_EMPTY) ?: [] as $token) {
+                $found[0] = $found[0] || $token === 'BUILD' || ($token[0] === 'V' && strlen($token) > 1 && strspn($token, '0123456789', 1) === strlen($token) - 1);
+                $found[1] = $found[1] || isset(self::W414_CRACK_TOKENS[$token]);
+                $found[2] = $found[2] || (str_starts_with($token, 'MULTI') && strspn($token, '0123456789', 5) === strlen($token) - 5);
+                $found[3] = $found[3] || isset(self::W414_REPACK_TOKENS[$token]);
+            }
+            $summary['version_tagged_count'] += (int) $found[0];
+            $summary['crack_fix_count'] += (int) $found[1];
+            $summary['multi_language_count'] += (int) $found[2];
+            $summary['repack_count'] += (int) $found[3];
+        }
+
+        return $summary;
+    }
+
+    /** Only integer and string titles participate; objects are never cast or serialized.
+     *
+     * @param  array<array-key, mixed>  $input
+     * @return list<string>
+     */
+    private static function w414Titles(array $input): array
+    {
+        $titles = [];
+        foreach ($input as $item) {
+            if (is_array($item)) {
+                $item = $item['searchname'] ?? $item['name'] ?? $item['title'] ?? null;
+            }
+            $titles[] = is_string($item) || is_int($item) ? (string) $item : '';
+        }
+
+        return $titles;
+    }
+
+    /** @param list<string> $titles
+     * @return array<string, int>|null
+     */
+    private static function w414Call(array $titles): ?array
+    {
+        try {
+            $input = serialize([$titles]);
+            if (strlen($input) > 16777216) {
+                return null;
+            }
+            self::$w414Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w414', self::W414_FFI_CDEF) ?? false;
+            $ffi = self::$w414Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            $capacity = 0;
+            $out = RustPipelineLibrary::obtainScratch($ffi, 2048, $capacity);
+            if ($out === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound (Declared by W414_FFI_CDEF.)
+            $written = $ffi->nntmux_w414_game_release_batch($input, strlen($input), $out, $capacity);
+            if (is_int($written) && $written < -1 && $written >= -16777216) {
+                $out = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($out === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound (Declared by W414_FFI_CDEF.)
+                $written = $ffi->nntmux_w414_game_release_batch($input, strlen($input), $out, $capacity);
+            }
+            if (! is_int($written) || $written <= 0 || $written > $capacity || $written > 16777216) {
+                return null;
+            }
+            $result = @unserialize(FFI::string($out, $written), ['allowed_classes' => false]);
+            if (! is_array($result) || array_keys($result) !== self::W414_SUMMARY_KEYS || $result['total_entries'] !== count($titles)) {
+                return null;
+            }
+            $summary = [];
+            foreach (self::W414_SUMMARY_KEYS as $key) {
+                $value = $result[$key];
+                if (! is_int($value) || $value < 0 || $value > count($titles)) {
+                    return null;
+                }
+                $summary[$key] = $value;
+            }
+
+            return $summary;
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }

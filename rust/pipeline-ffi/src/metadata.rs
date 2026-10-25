@@ -39778,3 +39778,789 @@ mod w404_tests {
         }
     }
 }
+
+pub mod w414_processors {
+    use super::{PhpKey, PhpNode, PhpSerParser, PhpSerWriter};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+
+    unsafe fn dispatch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+        summarize: fn(&[u8]) -> Option<Vec<u8>>,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if input.is_null()
+                || out.is_null()
+                || len > MAX_INPUT
+                || len > isize::MAX as usize
+                || cap > isize::MAX as usize
+            {
+                return -1;
+            }
+            let Some(input_end) = (input as usize).checked_add(len) else {
+                return -1;
+            };
+            let Some(out_end) = (out as usize).checked_add(cap) else {
+                return -1;
+            };
+            if len != 0 && cap != 0 && (input as usize) < out_end && (out as usize) < input_end {
+                return -1;
+            }
+            // Check both address spans and their overlap before borrowing caller memory.
+            let input = unsafe { std::slice::from_raw_parts(input, len) };
+            let Some(result) = summarize(input) else {
+                return -1;
+            };
+            let Ok(needed) = isize::try_from(result.len()) else {
+                return -1;
+            };
+            if result.len() > cap {
+                return -needed;
+            }
+            unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), out, result.len()) };
+            needed
+        }))
+        .unwrap_or(-1)
+    }
+
+    fn is_list(node: &PhpNode<'_>) -> bool {
+        node.is_arr()
+            && node
+                .items()
+                .iter()
+                .enumerate()
+                .all(|(i, (key, _))| *key == PhpKey::Int(i as i64))
+    }
+
+    /// Parses `serialize([list<string>])`, trims each title with PHP trim
+    /// semantics and accumulates one count per classifier slot.
+    fn summarize<const COUNTS: usize>(
+        input: &[u8],
+        keys: [&[u8]; COUNTS],
+        classify: fn(&[u8]) -> [bool; COUNTS],
+    ) -> Option<Vec<u8>> {
+        let doc = PhpSerParser::parse_document(input)?;
+        if !is_list(&doc) || doc.items().len() != 1 {
+            return None;
+        }
+        let rows = &doc.items()[0].1;
+        if !is_list(rows) {
+            return None;
+        }
+        let mut counts = [0i64; COUNTS];
+        for (_, row) in rows.items() {
+            let title = trim(row.as_str()?);
+            for (count, matched) in counts.iter_mut().zip(classify(title)) {
+                *count += i64::from(matched);
+            }
+        }
+        let mut w = PhpSerWriter::new();
+        w.arr_open(COUNTS);
+        for (key, count) in keys.into_iter().zip(counts) {
+            w.key(key);
+            w.int(count);
+        }
+        w.arr_close();
+        Some(w.buf)
+    }
+
+    fn trim(value: &[u8]) -> &[u8] {
+        // PHP trim includes NUL and vertical tab, but excludes form feed.
+        let is_trim = |b: &u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b);
+        let start = value
+            .iter()
+            .position(|b| !is_trim(b))
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|b| !is_trim(b))
+            .map_or(start, |i| i + 1);
+        &value[start..end]
+    }
+
+    fn tokens(value: &[u8]) -> impl Iterator<Item = &[u8]> {
+        value
+            .split(|b| !b.is_ascii_alphanumeric())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// ASCII-uppercases tokens of up to 16 bytes; longer tokens match no keyword.
+    fn upper<'b>(token: &[u8], buf: &'b mut [u8; 16]) -> &'b [u8] {
+        if token.len() > buf.len() {
+            return &[];
+        }
+        for (dst, src) in buf.iter_mut().zip(token) {
+            *dst = src.to_ascii_uppercase();
+        }
+        &buf[..token.len()]
+    }
+
+    fn year(token: &[u8]) -> bool {
+        token.len() == 4
+            && (token.starts_with(b"19") || token.starts_with(b"20"))
+            && token.iter().all(u8::is_ascii_digit)
+    }
+
+    fn digits(value: &[u8]) -> usize {
+        value.iter().take_while(|b| b.is_ascii_digit()).count()
+    }
+
+    /// `^MULTI\d*$` on the uppercased token.
+    fn multi_language(token: &[u8]) -> bool {
+        token.len() >= 5
+            && token[..5].eq_ignore_ascii_case(b"MULTI")
+            && token[5..].iter().all(u8::is_ascii_digit)
+    }
+
+    /// `^(?:S\d{1,2})?EP?\d{1,4}$`, case-insensitive.
+    fn episode_token(token: &[u8]) -> bool {
+        let mut rest = token;
+        if let Some(b's' | b'S') = rest.first() {
+            let n = digits(&rest[1..]);
+            if !(1..=2).contains(&n) {
+                return false;
+            }
+            rest = &rest[1 + n..];
+        }
+        let Some(b'e' | b'E') = rest.first() else {
+            return false;
+        };
+        rest = &rest[1..];
+        if let Some(b'p' | b'P') = rest.first() {
+            rest = &rest[1..];
+        }
+        (1..=4).contains(&rest.len()) && digits(rest) == rest.len()
+    }
+
+    /// ` - \d{1,4}(?!\d)`: some dash separator followed by a 1-4 digit run.
+    fn dash_episode(title: &[u8]) -> bool {
+        title
+            .windows(3)
+            .enumerate()
+            .any(|(i, w)| w == b" - " && (1..=4).contains(&digits(&title[i + 3..])))
+    }
+
+    /// `^\[[^\]]+\]`.
+    fn fansub_group(title: &[u8]) -> bool {
+        title.first() == Some(&b'[')
+            && title[1..]
+                .iter()
+                .position(|b| *b == b']')
+                .is_some_and(|i| i > 0)
+    }
+
+    /// `[\[(][0-9A-Fa-f]{8}[\])]`.
+    fn crc_tag(title: &[u8]) -> bool {
+        title.windows(10).any(|w| {
+            matches!(w[0], b'[' | b'(')
+                && matches!(w[9], b']' | b')')
+                && w[1..9].iter().all(u8::is_ascii_hexdigit)
+        })
+    }
+
+    /// `-[A-Za-z0-9_]{1,20}\z`.
+    fn group_suffix(title: &[u8]) -> bool {
+        let run = title
+            .iter()
+            .rev()
+            .take_while(|b| b.is_ascii_alphanumeric() || **b == b'_')
+            .count();
+        (1..=20).contains(&run) && title.len() > run && title[title.len() - run - 1] == b'-'
+    }
+
+    const BATCH: u8 = 1;
+    const RESOLUTION: u8 = 2;
+
+    fn anime_token(token: &[u8]) -> u8 {
+        match token {
+            b"BATCH" | b"COMPLETE" => BATCH,
+            b"480P" | b"540P" | b"576P" | b"720P" | b"1080P" | b"1440P" | b"2160P" | b"4K" => {
+                RESOLUTION
+            }
+            _ => 0,
+        }
+    }
+
+    fn anime(input: &[u8]) -> Option<Vec<u8>> {
+        summarize(
+            input,
+            [
+                b"total_titles",
+                b"empty_title_count",
+                b"fansub_group_count",
+                b"episode_tagged_count",
+                b"batch_tagged_count",
+                b"resolution_tagged_count",
+                b"crc_tagged_count",
+            ],
+            |title| {
+                let (mut episode, mut flags, mut buf) = (false, 0u8, [0u8; 16]);
+                for token in tokens(title) {
+                    episode |= episode_token(token);
+                    flags |= anime_token(upper(token, &mut buf));
+                }
+                [
+                    true,
+                    title.is_empty(),
+                    fansub_group(title),
+                    episode || dash_episode(title),
+                    flags & BATCH != 0,
+                    flags & RESOLUTION != 0,
+                    crc_tag(title),
+                ]
+            },
+        )
+    }
+
+    fn book_token(token: &[u8]) -> u8 {
+        match token {
+            b"EPUB" | b"MOBI" | b"AZW" | b"AZW3" | b"PDF" | b"KF8" | b"LIT" | b"FB2" | b"DJVU" => 1,
+            b"AUDIOBOOK" | b"AUDIOBOOKS" | b"M4B" | b"UNABRIDGED" | b"ABRIDGED" | b"MP3" => 2,
+            b"CBR" | b"CBZ" | b"CB7" | b"COMIC" | b"COMICS" => 4,
+            b"MAGAZINE" | b"MAGAZINES" | b"ISSUE" | b"WEEKLY" | b"MONTHLY" => 8,
+            b"RETAIL" => 16,
+            _ => 0,
+        }
+    }
+
+    fn books(input: &[u8]) -> Option<Vec<u8>> {
+        summarize(
+            input,
+            [
+                b"total_releases",
+                b"empty_title_count",
+                b"ebook_count",
+                b"audiobook_count",
+                b"comic_count",
+                b"magazine_count",
+                b"retail_count",
+                b"year_tagged_count",
+            ],
+            |title| {
+                let (mut flags, mut buf) = (0u8, [0u8; 16]);
+                for token in tokens(title) {
+                    flags |= book_token(upper(token, &mut buf));
+                    flags |= if year(token) { 32 } else { 0 };
+                }
+                [
+                    true,
+                    title.is_empty(),
+                    flags & 1 != 0,
+                    flags & 2 != 0,
+                    flags & 4 != 0,
+                    flags & 8 != 0,
+                    flags & 16 != 0,
+                    flags & 32 != 0,
+                ]
+            },
+        )
+    }
+
+    fn console_token(token: &[u8]) -> u8 {
+        match token {
+            b"NINTENDO" | b"SWITCH" | b"NSW" | b"WII" | b"WIIU" | b"NDS" | b"3DS" | b"GBA"
+            | b"NES" | b"SNES" | b"N64" | b"NGC" | b"GAMECUBE" | b"PSX" | b"PS1" | b"PS2"
+            | b"PS3" | b"PS4" | b"PS5" | b"PSP" | b"PSV" | b"VITA" | b"XBOX" | b"X360"
+            | b"XBOXONE" | b"XONE" | b"XSX" | b"DREAMCAST" | b"GENESIS" | b"MEGADRIVE"
+            | b"SATURN" => 1,
+            b"USA" | b"EUR" | b"EUROPE" | b"JPN" | b"JAP" | b"JAPAN" | b"PAL" | b"NTSC"
+            | b"NTSCU" | b"NTSCJ" | b"ASIA" | b"KOR" | b"REGIONFREE" => 2,
+            b"ISO" | b"NSP" | b"XCI" | b"CIA" | b"WBFS" | b"RVZ" | b"CSO" | b"CHD" | b"PKG"
+            | b"NSZ" | b"XCZ" => 8,
+            b"UPDATE" | b"DLC" | b"PATCH" => 16,
+            _ => 0,
+        }
+    }
+
+    fn consoles(input: &[u8]) -> Option<Vec<u8>> {
+        summarize(
+            input,
+            [
+                b"total_releases",
+                b"empty_title_count",
+                b"platform_tagged_count",
+                b"region_tagged_count",
+                b"multi_language_count",
+                b"dump_format_count",
+                b"update_dlc_count",
+            ],
+            |title| {
+                let (mut flags, mut buf) = (0u8, [0u8; 16]);
+                for token in tokens(title) {
+                    flags |= console_token(upper(token, &mut buf));
+                    flags |= if multi_language(token) { 4 } else { 0 };
+                }
+                [
+                    true,
+                    title.is_empty(),
+                    flags & 1 != 0,
+                    flags & 2 != 0,
+                    flags & 4 != 0,
+                    flags & 8 != 0,
+                    flags & 16 != 0,
+                ]
+            },
+        )
+    }
+
+    /// `^V\d+$` (case-insensitive) or the BUILD token.
+    fn version_token(token: &[u8]) -> bool {
+        (matches!(token.first(), Some(b'v' | b'V'))
+            && token.len() > 1
+            && token[1..].iter().all(u8::is_ascii_digit))
+            || token.eq_ignore_ascii_case(b"BUILD")
+    }
+
+    fn game_token(token: &[u8]) -> u8 {
+        match token {
+            b"CRACK" | b"CRACKFIX" | b"CRACKED" | b"FIX" | b"HOTFIX" | b"READNFO" => 2,
+            b"REPACK" | b"RIP" | b"FITGIRL" | b"DODI" => 8,
+            _ => 0,
+        }
+    }
+
+    fn games(input: &[u8]) -> Option<Vec<u8>> {
+        summarize(
+            input,
+            [
+                b"total_entries",
+                b"empty_title_count",
+                b"version_tagged_count",
+                b"crack_fix_count",
+                b"multi_language_count",
+                b"repack_count",
+                b"group_suffix_count",
+            ],
+            |title| {
+                let (mut flags, mut buf) = (0u8, [0u8; 16]);
+                for token in tokens(title) {
+                    flags |= game_token(upper(token, &mut buf));
+                    flags |= if version_token(token) { 1 } else { 0 };
+                    flags |= if multi_language(token) { 4 } else { 0 };
+                }
+                [
+                    true,
+                    title.is_empty(),
+                    flags & 1 != 0,
+                    flags & 2 != 0,
+                    flags & 4 != 0,
+                    flags & 8 != 0,
+                    group_suffix(title),
+                ]
+            },
+        )
+    }
+
+    fn movie_token(token: &[u8]) -> u8 {
+        match token {
+            b"480P" | b"576P" | b"720P" | b"1080P" | b"1080I" | b"2160P" | b"4K" | b"UHD" => 1,
+            b"BLURAY" | b"BDRIP" | b"BRRIP" | b"WEBDL" | b"WEBRIP" | b"WEB" | b"HDTV"
+            | b"DVDRIP" | b"DVD" | b"REMUX" | b"HDRIP" => 2,
+            b"X264" | b"X265" | b"H264" | b"H265" | b"HEVC" | b"AVC" | b"XVID" | b"DIVX"
+            | b"AV1" | b"VP9" => 4,
+            b"HDR" | b"HDR10" | b"HDR10PLUS" | b"DV" | b"DOVI" | b"DOLBYVISION" | b"HLG" => 8,
+            _ => 0,
+        }
+    }
+
+    fn movies(input: &[u8]) -> Option<Vec<u8>> {
+        summarize(
+            input,
+            [
+                b"total_releases",
+                b"empty_title_count",
+                b"resolution_tagged_count",
+                b"source_tagged_count",
+                b"codec_tagged_count",
+                b"hdr_tagged_count",
+                b"year_tagged_count",
+                b"complete_tag_count",
+            ],
+            |title| {
+                let (mut flags, mut buf) = (0u8, [0u8; 16]);
+                for token in tokens(title) {
+                    flags |= movie_token(upper(token, &mut buf));
+                    flags |= if year(token) { 16 } else { 0 };
+                }
+                [
+                    true,
+                    title.is_empty(),
+                    flags & 1 != 0,
+                    flags & 2 != 0,
+                    flags & 4 != 0,
+                    flags & 8 != 0,
+                    flags & 16 != 0,
+                    flags & 23 == 23,
+                ]
+            },
+        )
+    }
+
+    /// # Safety
+    /// The input and output must be live buffers covering their declared lengths.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w414_anime_title_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, anime) }
+    }
+
+    /// # Safety
+    /// The input and output must be live buffers covering their declared lengths.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w414_book_release_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, books) }
+    }
+
+    /// # Safety
+    /// The input and output must be live buffers covering their declared lengths.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w414_console_release_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, consoles) }
+    }
+
+    /// # Safety
+    /// The input and output must be live buffers covering their declared lengths.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w414_game_release_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, games) }
+    }
+
+    /// # Safety
+    /// The input and output must be live buffers covering their declared lengths.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w414_movie_release_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, movies) }
+    }
+}
+
+#[cfg(test)]
+mod w414_tests {
+    use super::w414_processors::*;
+    use super::{PhpKey, PhpSerParser, PhpSerWriter};
+
+    type Export = unsafe extern "C" fn(*const u8, usize, *mut u8, usize) -> isize;
+    const EXPORTS: [Export; 5] = [
+        nntmux_w414_anime_title_batch,
+        nntmux_w414_book_release_batch,
+        nntmux_w414_console_release_batch,
+        nntmux_w414_game_release_batch,
+        nntmux_w414_movie_release_batch,
+    ];
+
+    fn frame(titles: &[&[u8]]) -> Vec<u8> {
+        let mut w = PhpSerWriter::new();
+        w.arr_open(1);
+        w.int(0);
+        w.arr_open(titles.len());
+        for (i, title) in titles.iter().enumerate() {
+            w.int(i as i64);
+            w.str(title);
+        }
+        w.arr_close();
+        w.arr_close();
+        w.buf
+    }
+
+    fn output(export: Export, input: &[u8]) -> Vec<u8> {
+        let mut out = vec![b'Z'; 1024];
+        let written = unsafe { export(input.as_ptr(), input.len(), out.as_mut_ptr(), out.len()) };
+        assert!(written > 0, "export declined: {written}");
+        out.truncate(written as usize);
+        out
+    }
+
+    fn summary(export: Export, titles: &[&[u8]], fields: &[(&[u8], i64)]) {
+        let result = output(export, &frame(titles));
+        let doc = PhpSerParser::parse_document(&result).unwrap();
+        assert_eq!(doc.items().len(), fields.len());
+        for ((key, value), (expected_key, expected_value)) in doc.items().iter().zip(fields) {
+            assert!(
+                matches!(key, PhpKey::Str(k) if k == expected_key),
+                "key mismatch for {}",
+                String::from_utf8_lossy(expected_key)
+            );
+            assert_eq!(
+                value.as_int(),
+                Some(*expected_value),
+                "{}",
+                String::from_utf8_lossy(expected_key)
+            );
+        }
+    }
+
+    #[test]
+    fn w414_anime_counts_groups_episodes_and_crc_tags() {
+        summary(
+            nntmux_w414_anime_title_batch,
+            &[
+                b"[SubsPlease] Show - 05 (1080p) [ABCDEF12]",
+                b"[] Show - 12345 [GHIJKL12]",
+                b" \0[Group] Show S01E02 720p(0123abcd)\t",
+                b"Show.EP1234.Batch",
+                b"Show e12345 Complete 4K",
+                b"Show - 1",
+                b"",
+                b"Show S123E01 [ABCDEF1]",
+                b"\x0c[x]",
+            ],
+            &[
+                (b"total_titles", 9),
+                (b"empty_title_count", 1),
+                (b"fansub_group_count", 2),
+                (b"episode_tagged_count", 4),
+                (b"batch_tagged_count", 2),
+                (b"resolution_tagged_count", 3),
+                (b"crc_tagged_count", 2),
+            ],
+        );
+    }
+
+    #[test]
+    fn w414_books_count_format_families_and_years() {
+        summary(
+            nntmux_w414_book_release_batch,
+            &[
+                b"Author - Title (2021) Retail EPUB",
+                b"Author.Title.Unabridged.M4B",
+                b"Comic.Issue.001.CBZ",
+                b"Magazine.Weekly.1899.PDF",
+                b"Title.epubx.20201",
+                b"\xff\0mobi\xffretail",
+                b"",
+            ],
+            &[
+                (b"total_releases", 7),
+                (b"empty_title_count", 1),
+                (b"ebook_count", 3),
+                (b"audiobook_count", 1),
+                (b"comic_count", 1),
+                (b"magazine_count", 2),
+                (b"retail_count", 2),
+                (b"year_tagged_count", 1),
+            ],
+        );
+    }
+
+    #[test]
+    fn w414_consoles_count_platform_region_multi_dump_and_updates() {
+        summary(
+            nntmux_w414_console_release_batch,
+            &[
+                b"Game.NSW.USA.MULTi5.NSP-GROUP",
+                b"Game.PS2.PAL.ISO",
+                b"Game.XBOX360.MULTIX",
+                b"Game.Update.v1.2.DLC",
+                b"Game_multi_NTSC-U",
+                b"",
+            ],
+            &[
+                (b"total_releases", 6),
+                (b"empty_title_count", 1),
+                (b"platform_tagged_count", 2),
+                (b"region_tagged_count", 3),
+                (b"multi_language_count", 2),
+                (b"dump_format_count", 2),
+                (b"update_dlc_count", 1),
+            ],
+        );
+    }
+
+    #[test]
+    fn w414_games_count_versions_cracks_and_group_suffixes() {
+        summary(
+            nntmux_w414_game_release_batch,
+            &[
+                b"Game.v1.2.3-CODEX",
+                b"Game.Build.123.CRACKFIX-I_KnoW",
+                b"Game.MULTi12.REPACK-FitGirl",
+                b"Game.vX-",
+                b"Game-ABCDEFGHIJKLMNOPQRSTU",
+                b"-A",
+                b"",
+            ],
+            &[
+                (b"total_entries", 7),
+                (b"empty_title_count", 1),
+                (b"version_tagged_count", 2),
+                (b"crack_fix_count", 1),
+                (b"multi_language_count", 1),
+                (b"repack_count", 1),
+                (b"group_suffix_count", 4),
+            ],
+        );
+    }
+
+    #[test]
+    fn w414_movies_count_tags_and_complete_releases() {
+        summary(
+            nntmux_w414_movie_release_batch,
+            &[
+                b"Movie.2021.1080p.BluRay.x264-GRP",
+                b"Movie.2160p.WEB-DL.HDR.DV.HEVC",
+                b"Movie 1999 720p WEBRip XviD",
+                b"Movie.3000.UHD",
+                b"\0",
+            ],
+            &[
+                (b"total_releases", 5),
+                (b"empty_title_count", 1),
+                (b"resolution_tagged_count", 4),
+                (b"source_tagged_count", 3),
+                (b"codec_tagged_count", 3),
+                (b"hdr_tagged_count", 1),
+                (b"year_tagged_count", 2),
+                (b"complete_tag_count", 2),
+            ],
+        );
+    }
+
+    #[test]
+    fn w414_all_exports_check_spans_and_preserve_output_on_failure() {
+        for export in EXPORTS {
+            let input = frame(&[b"x"]);
+            let expected = output(export, &input);
+            let needed = expected.len();
+            let mut out = [b'Z'; 1024];
+            unsafe {
+                for cap in [0, 1, needed - 1] {
+                    assert_eq!(
+                        export(input.as_ptr(), input.len(), out.as_mut_ptr(), cap),
+                        -(needed as isize)
+                    );
+                    assert_eq!(out, [b'Z'; 1024]);
+                }
+                assert_eq!(
+                    export(input.as_ptr(), input.len(), out.as_mut_ptr(), needed),
+                    needed as isize
+                );
+                assert_eq!(&out[..needed], expected);
+                assert!(out[needed..].iter().all(|b| *b == b'Z'));
+                for (ptr, len) in [
+                    (std::ptr::null(), 0),
+                    (std::ptr::null(), input.len()),
+                    (input.as_ptr(), 16 * 1024 * 1024 + 1),
+                    (input.as_ptr(), isize::MAX as usize + 1),
+                    ((usize::MAX - 1) as *const u8, 8),
+                ] {
+                    out.fill(b'Z');
+                    assert_eq!(export(ptr, len, out.as_mut_ptr(), out.len()), -1);
+                    assert_eq!(out, [b'Z'; 1024]);
+                }
+                assert_eq!(
+                    export(input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+                    -1
+                );
+                for (ptr, cap) in [
+                    (out.as_mut_ptr(), usize::MAX),
+                    ((usize::MAX - 1) as *mut u8, 8),
+                ] {
+                    assert_eq!(export(input.as_ptr(), input.len(), ptr, cap), -1);
+                    assert_eq!(out, [b'Z'; 1024]);
+                }
+                let mut overlap = vec![b'Z'; input.len() + 2048];
+                overlap[32..32 + input.len()].copy_from_slice(&input);
+                let original = overlap.clone();
+                for offset in [0, 32, 33, 32 + input.len() - 1] {
+                    assert_eq!(
+                        export(
+                            overlap.as_ptr().add(32),
+                            input.len(),
+                            overlap.as_mut_ptr().add(offset),
+                            1024
+                        ),
+                        -1
+                    );
+                    assert_eq!(overlap, original);
+                }
+                // Adjacent input/output spans are legal.
+                assert_eq!(
+                    export(
+                        overlap.as_ptr().add(32),
+                        input.len(),
+                        overlap.as_mut_ptr().add(32 + input.len()),
+                        1024
+                    ),
+                    needed as isize
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn w414_rejects_malformed_frames_and_non_string_titles() {
+        let mut deep = b"a:1:{i:0;".to_vec();
+        for _ in 0..130 {
+            deep.extend_from_slice(b"a:1:{i:0;");
+        }
+        deep.extend_from_slice(b"s:0:\"\";");
+        deep.extend(std::iter::repeat_n(b'}', 131));
+        for export in EXPORTS {
+            let mut out = [b'Z'; 1024];
+            for malformed in [
+                b"".as_slice(),
+                b"N;",
+                b"a:1:{i:0;",
+                b"a:999999999999999999999:{}",
+                b"a:1:{i:0;a:0:{}}trailing",
+                b"a:0:{}",
+                b"a:1:{i:1;a:0:{}}",
+                b"a:2:{i:0;a:0:{}i:1;a:0:{}}",
+                b"a:1:{i:0;N;}",
+                b"a:1:{i:0;a:1:{i:2;s:0:\"\";}}",
+                b"a:1:{i:0;a:1:{s:1:\"x\";s:0:\"\";}}",
+                b"a:1:{i:0;a:1:{i:0;N;}}",
+                b"a:1:{i:0;a:1:{i:0;i:5;}}",
+                b"a:1:{i:0;a:1:{i:0;a:0:{}}}",
+                b"a:1:{i:0;a:1:{i:0;s:5:\"x\";}}",
+                deep.as_slice(),
+            ] {
+                assert_eq!(
+                    unsafe {
+                        export(
+                            malformed.as_ptr(),
+                            malformed.len(),
+                            out.as_mut_ptr(),
+                            out.len(),
+                        )
+                    },
+                    -1,
+                    "{}",
+                    String::from_utf8_lossy(malformed)
+                );
+                assert_eq!(out, [b'Z'; 1024]);
+            }
+            // An empty title list is valid and yields zero counts.
+            let empty = output(export, &frame(&[]));
+            let doc = PhpSerParser::parse_document(&empty).unwrap();
+            assert!(doc.items().iter().all(|(_, v)| v.as_int() == Some(0)));
+        }
+    }
+}
