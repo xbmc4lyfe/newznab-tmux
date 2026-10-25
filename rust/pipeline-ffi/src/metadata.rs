@@ -37039,11 +37039,29 @@ pub mod release_details_feed_source_helpers {
 
     /// `DetailsController::planDetailsLookups()`: emits the lookup count, the lookup bitmask
     /// (video, movie, game, music, book, console, anidb) and the meta description.
-    fn details_plan_encode(ids: [i64; 6], imdb: Option<&[u8]>, searchname: &[u8]) -> Vec<u8> {
+    /// 309+ significant digits may overflow `strtod` to INF, which PHP's `(int)` maps to 0;
+    /// decline (`None`) so PHP handles those inputs directly.
+    fn details_plan_encode(
+        ids: [i64; 6],
+        imdb: Option<&[u8]>,
+        searchname: &[u8],
+    ) -> Option<Vec<u8>> {
         let [videos, games, music, book, console, anidb] = ids;
-        // imdb_id_is_valid(): digits survive `preg_replace('/\D/', '')`; any non-zero digit
-        // makes the remaining digit string non-zero.
-        let movie = imdb.is_some_and(|id| id.iter().any(|b| (b'1'..=b'9').contains(b)));
+        let movie = match imdb {
+            None => false,
+            Some(id) => {
+                let mut significant = 0usize;
+                for &b in id {
+                    if b.is_ascii_digit() && (significant > 0 || b != b'0') {
+                        significant += 1;
+                    }
+                }
+                if significant > 308 {
+                    return None;
+                }
+                significant > 0
+            }
+        };
         let wanted = [
             videos > 0,
             movie,
@@ -37059,7 +37077,7 @@ pub mod release_details_feed_source_helpers {
         );
         let (count, mask) = (mask.count_ones().to_string(), mask.to_string());
         let meta = [b"View NZB for ".as_slice(), searchname].concat();
-        encode(&[count.as_bytes(), mask.as_bytes(), &meta])
+        Some(encode(&[count.as_bytes(), mask.as_bytes(), &meta]))
     }
 
     /// `BoundedHttpFeedSource::planBoundedBodyRead()`: emits supported, gzip, limits valid, next
@@ -37209,7 +37227,7 @@ pub mod release_details_feed_source_helpers {
                 consoleinfo_id,
                 anidb_id,
             ];
-            finish(Some(details_plan_encode(ids, imdb, name)), out_buf, out_cap)
+            finish(details_plan_encode(ids, imdb, name), out_buf, out_cap)
         }))
         .unwrap_or(DECLINE)
     }
@@ -37342,20 +37360,24 @@ pub mod release_details_feed_source_helpers {
         #[test]
         fn w374_details_plan_follows_php() {
             assert_eq!(
-                s(Some(details_plan_encode(
+                s(details_plan_encode(
                     [1, 0, 3, -1, 0, 9],
                     Some(b"tt0111161"),
                     b"Some.Release"
-                ))),
+                )),
                 Some("4\x1F75\x1FView NZB for Some.Release".into())
             );
             assert_eq!(
-                s(Some(details_plan_encode([0; 6], Some(b"tt0000000"), b""))),
+                s(details_plan_encode([0; 6], Some(b"tt0000000"), b"")),
                 Some("0\x1F0\x1FView NZB for ".into())
             );
             assert_eq!(
-                s(Some(details_plan_encode([i64::MAX; 6], None, b"a\x1Fb"))),
+                s(details_plan_encode([i64::MAX; 6], None, b"a\x1Fb")),
                 Some("6\x1F125\x1FView NZB for a\x1Fb".into())
+            );
+            assert_eq!(
+                details_plan_encode([0; 6], Some(&[b'9'; 309]), b"x"),
+                None
             );
         }
 

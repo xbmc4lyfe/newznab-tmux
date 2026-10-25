@@ -192,7 +192,7 @@ final class RustReleaseModelDetailsFeedSourceParityTest extends TestCase
             $this->assertGuidParity([$guid, $guid]);
         }
 
-        foreach ([null, 0, -5, PHP_INT_MIN, ...self::TEXTS] as $imdb) {
+        foreach ([null, 0, -5, PHP_INT_MIN, str_repeat('9', 308), str_repeat('9', 309), ...self::TEXTS] as $imdb) {
             foreach (self::TEXTS as $name) {
                 $this->assertDetailsParity([1, 0, 1, 0, 1, 0], $imdb, $name);
             }
