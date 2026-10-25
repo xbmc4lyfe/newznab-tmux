@@ -31261,3 +31261,590 @@ pub mod w451_pre_announce_ws_irc_obfuscation {
         }
     }
 }
+
+/// Wave 46.1 pure CPU batch summaries for the collection regex file counter (RegexService), the NNTP
+/// verification message-id plan (NNTPService), framer article-id validation (RustVerificationFramer),
+/// yEnc CRC32 normalization (YencPart) and yEnc decoder mode selection (DecoderFactory). Frames, error
+/// codes and output follow `w431_release_cleaning`; the NNTP and decoder exports take a fixed prefix.
+pub mod w461_regex_nntp_framer_yenc_decoder {
+    use super::w431_release_cleaning::{NUL_FRAME, dispatch, for_each_entry};
+
+    pub const FILE_COUNT_KEYS: usize = 8;
+    pub const MESSAGE_ID_KEYS: usize = 9;
+    pub const ARTICLE_ID_KEYS: usize = 8;
+    pub const CRC_KEYS: usize = 8;
+    pub const MODE_KEYS: usize = 8;
+
+    /// RustVerificationFramer::MAX_INIT_BYTES, the longest article ID it accepts.
+    pub const MAX_ARTICLE_ID_BYTES: usize = 131072;
+
+    /// DecoderFactory prefix bits: a library path is set, the SAPI is `cli`, the OS family is `Linux`.
+    pub const MODE_LIBRARY: u32 = 1;
+    pub const MODE_CLI: u32 = 2;
+    pub const MODE_LINUX: u32 = 4;
+
+    /// Counts entries in slot 0 and empty entries in slot 1; `classify` sees the others.
+    fn summarize<const K: usize>(
+        input: &[u8],
+        mut classify: impl FnMut(&[u8], &mut [i64; K]),
+    ) -> Option<[i64; K]> {
+        let mut counts = [0i64; K];
+        for_each_entry(input, |entry| {
+            counts[0] += 1;
+            if entry.is_empty() {
+                counts[1] += 1;
+            } else {
+                classify(entry, &mut counts);
+            }
+        })?;
+        Some(counts)
+    }
+
+    /// PCRE `\s` outside UTF mode: space, tab, LF, VT, FF and CR.
+    fn pcre_space(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+    }
+
+    fn digit_run(s: &[u8], at: usize) -> usize {
+        s.get(at..).map_or(0, |rest| {
+            rest.iter().take_while(|b| b.is_ascii_digit()).count()
+        })
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Separator {
+        Slash,
+        Of,
+        Dash,
+    }
+
+    /// RegexService::collectionFileCountPhp():
+    /// `/[[(\s](\d{1,5})(\/|[\s_]of[\s_]|-)(\d{1,5})[])\s$:]/i`, leftmost match. A digit can neither
+    /// separate nor close, so each group is a whole digit run of one to five bytes.
+    pub fn file_count(s: &[u8]) -> Option<(Separator, &[u8])> {
+        // Candidates are an opener followed by a digit; 32-byte chunks without one are skipped by a
+        // branchless pairwise flag reduction, which vectorizes.
+        const CHUNK: usize = 32;
+        let opener = |b: u8| {
+            u8::from(b == b'[')
+                | u8::from(b == b'(')
+                | u8::from(b == b' ')
+                | u8::from(b.wrapping_sub(b'\t') < 5)
+        };
+        let digit = |b: u8| u8::from(b.wrapping_sub(b'0') < 10);
+        let mut base = 0;
+        while base + 1 < s.len() {
+            let end = (base + CHUNK).min(s.len() - 1);
+            let (open, next) = (&s[base..end], &s[base + 1..end + 1]);
+            if open
+                .iter()
+                .zip(next)
+                .fold(0u8, |m, (&o, &n)| m | (opener(o) & digit(n)))
+                != 0
+            {
+                for i in base..end {
+                    if opener(s[i]) & digit(s[i + 1]) != 0 {
+                        if let Some(found) = file_count_at(s, i) {
+                            return Some(found);
+                        }
+                    }
+                }
+            }
+            base = end;
+        }
+        None
+    }
+
+    /// The file count pattern anchored at the opener `i`, which a digit follows.
+    fn file_count_at(s: &[u8], i: usize) -> Option<(Separator, &[u8])> {
+        let a = digit_run(s, i + 1);
+        if a > 5 {
+            return None;
+        }
+        let p = i + 1 + a;
+        let edge = |b: Option<&u8>| b.is_some_and(|&b| b == b'_' || pcre_space(b));
+        let (separator, q) = match s.get(p) {
+            Some(b'/') => (Separator::Slash, p + 1),
+            Some(b'-') => (Separator::Dash, p + 1),
+            b if edge(b)
+                && s.get(p + 1..p + 3)
+                    .is_some_and(|o| o.eq_ignore_ascii_case(b"of"))
+                && edge(s.get(p + 3)) =>
+            {
+                (Separator::Of, p + 4)
+            }
+            _ => return None,
+        };
+        let b = digit_run(s, q);
+        let closed = s
+            .get(q + b)
+            .is_some_and(|&c| matches!(c, b']' | b')' | b'$' | b':') || pcre_space(c));
+        (b > 0 && b <= 5 && closed).then(|| (separator, &s[q..q + b]))
+    }
+
+    fn file_counts(input: &[u8]) -> Option<[i64; FILE_COUNT_KEYS]> {
+        summarize(input, |s, c| {
+            let Some((separator, total)) = file_count(s) else {
+                return;
+            };
+            let total = total.iter().fold(0u32, |n, d| n * 10 + u32::from(d - b'0'));
+            c[2] += 1;
+            c[3 + separator as usize] += 1;
+            c[6] += i64::from(total == 1);
+            c[7] += i64::from(total == 0);
+        })
+    }
+
+    /// NNTPService::planVerificationMessageIdPhp() per message-id after the `i64le` byte budget.
+    fn message_ids(input: &[u8]) -> Option<[i64; MESSAGE_ID_KEYS]> {
+        let budget = i64::from_le_bytes(input.get(..8)?.try_into().ok()?);
+        summarize(&input[8..], |s, c| {
+            let bracket = |b: &u8| *b == b'<' || *b == b'>';
+            let start = s.iter().position(|b| !bracket(b)).unwrap_or(s.len());
+            let end = s.iter().rposition(|b| !bracket(b)).map_or(start, |i| i + 1);
+            let id = &s[start..end];
+            let invalid = id.iter().fold(0u8, |m, &b| {
+                m | u8::from(b <= 0x20 || b == 0x7f || bracket(&b))
+            });
+            let reason = if budget < 1 {
+                1
+            } else if id.is_empty() {
+                2
+            } else if invalid != 0 {
+                3
+            } else {
+                0
+            };
+            c[2 + reason] += 1;
+            c[6] += i64::from(id.len() < s.len());
+            c[7] += i64::from(reason == 0 && (id.len() as i64) + 2 <= budget);
+            c[8] += i64::from(s[0] != b'<' || s[s.len() - 1] != b'>');
+        })
+    }
+
+    /// `(*UCP)\s` under PCRE2 10.49: tab through CR, space, NEL, NBSP, U+1680, U+180E, U+2000 to
+    /// U+200A, U+2028, U+2029, U+202F, U+205F and U+3000.
+    fn ucp_space(c: char) -> bool {
+        matches!(
+            c,
+            '\t'..='\r'
+                | ' '
+                | '\u{85}'
+                | '\u{a0}'
+                | '\u{1680}'
+                | '\u{180e}'
+                | '\u{2000}'..='\u{200a}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202f}'
+                | '\u{205f}'
+                | '\u{3000}'
+        )
+    }
+
+    /// A length-frame entry length marking an ID over MAX_ARTICLE_ID_BYTES whose bytes PHP leaves out.
+    pub const OVERSIZE_ID: u32 = u32::MAX - 1;
+
+    /// `for_each_entry()`, except that a length frame may give OVERSIZE_ID for an entry with no bytes,
+    /// passed to `visit` as `None`.
+    fn for_each_article_id(input: &[u8], mut visit: impl FnMut(Option<&[u8]>)) -> Option<usize> {
+        let word = |at: usize| -> Option<u32> {
+            Some(u32::from_le_bytes(
+                input.get(at..at.checked_add(4)?)?.try_into().ok()?,
+            ))
+        };
+        let count = word(0)? as usize;
+        if count > 0 && word(4) == Some(NUL_FRAME) {
+            return for_each_entry(input, |entry| visit(Some(entry)));
+        }
+        let header = count.checked_mul(4)?.checked_add(4)?;
+        if header > input.len() {
+            return None;
+        }
+        let mut offset = header;
+        for i in 0..count {
+            let n = word(4 + i * 4)?;
+            if n == OVERSIZE_ID {
+                visit(None);
+                continue;
+            }
+            let end = offset.checked_add(n as usize)?;
+            visit(Some(input.get(offset..end)?));
+            offset = end;
+        }
+        (offset == input.len()).then_some(count)
+    }
+
+    /// RustVerificationFramer::validateConnection() per article ID: over the length limit, invalid
+    /// UTF-8 (where `preg_match()` fails), or holding `(*UCP)\s`, `\p{Cc}` or an angle bracket.
+    fn article_ids(input: &[u8]) -> Option<[i64; ARTICLE_ID_KEYS]> {
+        let mut counts = [0i64; ARTICLE_ID_KEYS];
+        for_each_article_id(input, |entry| {
+            counts[0] += 1;
+            match entry {
+                Some([]) => counts[1] += 1,
+                Some(s) => article_id(s, &mut counts),
+                None => counts[3] += 1,
+            }
+        })?;
+        Some(counts)
+    }
+
+    fn article_id(s: &[u8], c: &mut [i64; ARTICLE_ID_KEYS]) {
+        if s.len() > MAX_ARTICLE_ID_BYTES {
+            c[3] += 1;
+            return;
+        }
+        let Ok(text) = std::str::from_utf8(s) else {
+            c[4] += 1;
+            return;
+        };
+        let (mut space, mut control, mut bracket) = (false, false, false);
+        if text.is_ascii() {
+            let flags = s.iter().fold(0u8, |m, &b| {
+                m | u8::from(pcre_space(b))
+                    | (u8::from(b < 0x20 || b == 0x7f) << 1)
+                    | (u8::from(b == b'<' || b == b'>') << 2)
+            });
+            space = flags & 1 != 0;
+            control = flags & 2 != 0;
+            bracket = flags & 4 != 0;
+        } else {
+            for ch in text.chars() {
+                space |= ucp_space(ch);
+                control |= ch.is_control();
+                bracket |= ch == '<' || ch == '>';
+            }
+        }
+        c[2] += i64::from(!(space || control || bracket));
+        c[5] += i64::from(space);
+        c[6] += i64::from(control);
+        c[7] += i64::from(bracket);
+    }
+
+    /// YencPart::normalizeCrc32Php() per CRC: valid (one to eight hex digits), padded, holding an
+    /// uppercase digit or normalizing to zero, otherwise too long or not hex.
+    fn crcs(input: &[u8]) -> Option<[i64; CRC_KEYS]> {
+        summarize(input, |s, c| {
+            if s.len() > 8 {
+                c[6] += 1;
+            } else if !s.iter().all(u8::is_ascii_hexdigit) {
+                c[7] += 1;
+            } else {
+                c[2] += 1;
+                c[3] += i64::from(s.len() < 8);
+                c[4] += i64::from(s.iter().any(|b| matches!(b, b'A'..=b'F')));
+                c[5] += i64::from(s.iter().all(|&b| b == b'0'));
+            }
+        })
+    }
+
+    /// DecoderFactory::validModePhp() and selectsPhpPhp() per mode after the `u32le` environment bits.
+    fn modes(input: &[u8]) -> Option<[i64; MODE_KEYS]> {
+        let flags = u32::from_le_bytes(input.get(..4)?.try_into().ok()?);
+        if flags > MODE_LIBRARY | MODE_CLI | MODE_LINUX {
+            return None;
+        }
+        let auto_php = flags != MODE_LIBRARY | MODE_CLI | MODE_LINUX;
+        summarize(&input[4..], |s, c| {
+            let (slot, php) = match s {
+                b"auto" => (3, auto_php),
+                b"php" => (4, true),
+                b"native" => (5, false),
+                _ => {
+                    c[7] += 1;
+                    return;
+                }
+            };
+            c[2] += 1;
+            c[slot] += 1;
+            c[6] += i64::from(php);
+        })
+    }
+
+    /// # Safety
+    /// `input` must be readable for `len` bytes and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w461_regex_file_count_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, file_counts) }
+    }
+
+    /// # Safety
+    /// `input` must be readable for `len` bytes and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w461_nntp_message_id_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, message_ids) }
+    }
+
+    /// # Safety
+    /// `input` must be readable for `len` bytes and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w461_framer_article_id_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, article_ids) }
+    }
+
+    /// # Safety
+    /// `input` must be readable for `len` bytes and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w461_yenc_crc_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, crcs) }
+    }
+
+    /// # Safety
+    /// `input` must be readable for `len` bytes and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w461_yenc_decoder_mode_batch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        unsafe { dispatch(input, len, out, cap, modes) }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::w431_release_cleaning::MAX_INPUT;
+        use super::*;
+
+        type Export = unsafe extern "C" fn(*const u8, usize, *mut u8, usize) -> isize;
+
+        fn frame_wire(prefix: &[u8], entries: &[&[u8]]) -> Vec<u8> {
+            let mut wire = prefix.to_vec();
+            wire.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+            for e in entries {
+                wire.extend_from_slice(&(e.len() as u32).to_le_bytes());
+            }
+            for e in entries {
+                wire.extend_from_slice(e);
+            }
+            wire
+        }
+
+        fn nul_wire(prefix: &[u8], entries: &[&[u8]]) -> Vec<u8> {
+            let mut wire = prefix.to_vec();
+            wire.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+            wire.extend_from_slice(&NUL_FRAME.to_le_bytes());
+            wire.extend_from_slice(&entries.join(&0u8));
+            wire
+        }
+
+        fn call(export: Export, wire: &[u8]) -> (isize, [u8; 128]) {
+            let mut out = [0u8; 128];
+            let written = unsafe { export(wire.as_ptr(), wire.len(), out.as_mut_ptr(), out.len()) };
+            (written, out)
+        }
+
+        fn run_with(export: Export, prefix: &[u8], entries: &[&[u8]]) -> Vec<i64> {
+            let (written, out) = call(export, &frame_wire(prefix, entries));
+            assert!(written > 0 && written % 8 == 0, "written {written}");
+            if !entries.is_empty() && entries.iter().all(|e| !e.contains(&0)) {
+                assert_eq!(
+                    call(export, &nul_wire(prefix, entries)),
+                    (written, out),
+                    "NUL frame"
+                );
+            }
+            out[..written as usize]
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| i64::from_le_bytes(*c))
+                .collect()
+        }
+
+        #[test]
+        fn cleaning_w461_file_count_matches_the_collection_regex() {
+            assert_eq!(
+                file_count(b"x (01/20) y"),
+                Some((Separator::Slash, &b"20"[..]))
+            );
+            assert_eq!(file_count(b"x [3 OF 7]"), Some((Separator::Of, &b"7"[..])));
+            assert_eq!(file_count(b"x_[3_of_7:"), Some((Separator::Of, &b"7"[..])));
+            assert_eq!(file_count(b"x 1-2$"), Some((Separator::Dash, &b"2"[..])));
+            assert_eq!(file_count(b"x (123456/7)"), None);
+            assert_eq!(file_count(b"x (1/234567)"), None);
+            assert_eq!(file_count(b"x (1/2"), None);
+            assert_eq!(file_count(b"(1/2)"), Some((Separator::Slash, &b"2"[..])));
+            assert_eq!(
+                file_count(b"x\xa0(1/2)"),
+                Some((Separator::Slash, &b"2"[..]))
+            );
+            assert_eq!(file_count(b"x\xa01/2)"), None);
+            assert_eq!(file_count(b"x (1\xa0of 2)"), None);
+            assert_eq!(
+                file_count(b"(9/9x (1/3)"),
+                Some((Separator::Slash, &b"3"[..]))
+            );
+            let got = run_with(
+                nntmux_w461_regex_file_count_batch,
+                b"",
+                &[b"a (1/1)", b"b [2 of 0]", b"c 3-00 ", b"none", b""],
+            );
+            assert_eq!(got, vec![5, 1, 3, 1, 1, 1, 1, 2]);
+        }
+
+        #[test]
+        fn cleaning_w461_message_id_plans() {
+            let entries: [&[u8]; 7] = [b"<a@b>", b"a@b", b"<<>>", b"<a b>", b"<a", b"\xffok>", b""];
+            let budget = |n: i64| n.to_le_bytes();
+            assert_eq!(
+                run_with(nntmux_w461_nntp_message_id_batch, &budget(5), &entries),
+                vec![7, 1, 4, 0, 1, 1, 5, 4, 3]
+            );
+            assert_eq!(
+                run_with(nntmux_w461_nntp_message_id_batch, &budget(0), &entries),
+                vec![7, 1, 0, 6, 0, 0, 5, 0, 3]
+            );
+            assert_eq!(
+                call(nntmux_w461_nntp_message_id_batch, b"\0\0\0\0\0\0\0").0,
+                -1
+            );
+        }
+
+        #[test]
+        fn cleaning_w461_article_id_validation() {
+            let long = vec![b'a'; MAX_ARTICLE_ID_BYTES + 1];
+            let got = run_with(
+                nntmux_w461_framer_article_id_batch,
+                b"",
+                &[
+                    b"part1@example",
+                    "\u{e9}t\u{e9}@x".as_bytes(),
+                    b"a b",
+                    b"a\tb",
+                    b"a\x1fb",
+                    b"<id>",
+                    "a\u{3000}b".as_bytes(),
+                    "a\u{85}b".as_bytes(),
+                    "a\u{9f}b".as_bytes(),
+                    b"a\xffb",
+                    &long,
+                    b"",
+                ],
+            );
+            assert_eq!(got, vec![12, 1, 2, 1, 1, 4, 4, 1]);
+            let mut wire = 3u32.to_le_bytes().to_vec();
+            for n in [1, OVERSIZE_ID, 0] {
+                wire.extend_from_slice(&n.to_le_bytes());
+            }
+            wire.push(b'a');
+            let (written, out) = call(nntmux_w461_framer_article_id_batch, &wire);
+            assert_eq!(written, 64);
+            let counts: Vec<i64> = out[..64]
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| i64::from_le_bytes(*c))
+                .collect();
+            assert_eq!(counts, vec![3, 1, 1, 1, 0, 0, 0, 0]);
+            wire.push(b'b');
+            assert_eq!(call(nntmux_w461_framer_article_id_batch, &wire).0, -1);
+        }
+
+        #[test]
+        fn cleaning_w461_crc_and_mode_counts() {
+            let got = run_with(
+                nntmux_w461_yenc_crc_batch,
+                b"",
+                &[
+                    b"DEADBEEF",
+                    b"0",
+                    b"abc",
+                    b"123456789",
+                    b"xyz",
+                    b"00000000",
+                    b"",
+                ],
+            );
+            assert_eq!(got, vec![7, 1, 4, 2, 1, 2, 1, 1]);
+            let entries: [&[u8]; 6] = [b"auto", b"php", b"native", b"AUTO", b" auto", b""];
+            let all = MODE_LIBRARY | MODE_CLI | MODE_LINUX;
+            assert_eq!(
+                run_with(
+                    nntmux_w461_yenc_decoder_mode_batch,
+                    &all.to_le_bytes(),
+                    &entries
+                ),
+                vec![6, 1, 3, 1, 1, 1, 1, 2]
+            );
+            assert_eq!(
+                run_with(
+                    nntmux_w461_yenc_decoder_mode_batch,
+                    &MODE_CLI.to_le_bytes(),
+                    &entries
+                ),
+                vec![6, 1, 3, 1, 1, 1, 2, 2]
+            );
+            let wire = frame_wire(&8u32.to_le_bytes(), &[b"auto"]);
+            assert_eq!(call(nntmux_w461_yenc_decoder_mode_batch, &wire).0, -1);
+        }
+
+        #[test]
+        fn cleaning_w461_rejects_malformed_frames_without_writing() {
+            let exports: [(Export, &[u8]); 5] = [
+                (nntmux_w461_regex_file_count_batch, b""),
+                (nntmux_w461_nntp_message_id_batch, &[5, 0, 0, 0, 0, 0, 0, 0]),
+                (nntmux_w461_framer_article_id_batch, b""),
+                (nntmux_w461_yenc_crc_batch, b""),
+                (nntmux_w461_yenc_decoder_mode_batch, &[0, 0, 0, 0]),
+            ];
+            for (export, prefix) in exports {
+                let good = frame_wire(prefix, &[b"entry"]);
+                let mut trailing = good.clone();
+                trailing.push(b'x');
+                let bad: [&[u8]; 5] = [
+                    b"\x01\0\0",
+                    b"\x01\0\0\0\x09\0\0\0abc",
+                    &trailing,
+                    b"\x00\0\0\0\xff\xff\xff\xff",
+                    b"\x03\0\0\0\xff\xff\xff\xffa",
+                ];
+                let mut out = [0x5au8; 128];
+                for wire in bad {
+                    let wire = [prefix, wire].concat();
+                    let r =
+                        unsafe { export(wire.as_ptr(), wire.len(), out.as_mut_ptr(), out.len()) };
+                    assert_eq!(r, -1);
+                }
+                let r = unsafe { export(std::ptr::null(), 0, out.as_mut_ptr(), out.len()) };
+                assert_eq!(r, -1);
+                let r =
+                    unsafe { export(good.as_ptr(), MAX_INPUT + 1, out.as_mut_ptr(), out.len()) };
+                assert_eq!(r, -1);
+                let required = unsafe { export(good.as_ptr(), good.len(), out.as_mut_ptr(), 8) };
+                assert!(required < -8);
+                assert_eq!(out, [0x5a; 128]);
+                let r = unsafe {
+                    export(
+                        good.as_ptr(),
+                        good.len(),
+                        out.as_mut_ptr(),
+                        (-required) as usize,
+                    )
+                };
+                assert_eq!(r, -required);
+            }
+        }
+    }
+}

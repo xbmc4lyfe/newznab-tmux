@@ -4,7 +4,9 @@ declare(strict_types=1);
 
 namespace App\Services\NNTP;
 
+use App\Services\RegexService;
 use Closure;
+use FFI;
 use RuntimeException;
 use Throwable;
 
@@ -22,6 +24,9 @@ final class RustVerificationFramer
     private const int MAX_BUFFER_BYTES = 67108864;
 
     private const int IPC_TIMEOUT_SECONDS = 30;
+
+    /** A Unicode space, control or angle bracket; preg_match() fails on invalid UTF-8. */
+    private const string INVALID_ID_PATTERN = '~(*UCP)[\\s\\p{Cc}<>]~u';
 
     /** @var resource|null */
     private $process = null;
@@ -145,7 +150,7 @@ final class RustVerificationFramer
         }
         foreach ($connection['ids'] as $id) {
             if (! is_string($id) || $id === '' || strlen($id) > self::MAX_INIT_BYTES
-                || preg_match('~(*UCP)[\\s\\p{Cc}<>]~u', $id) !== 0) {
+                || preg_match(self::INVALID_ID_PATTERN, $id) !== 0) {
                 throw new RuntimeException('Invalid Rust verification framer article ID.');
             }
         }
@@ -272,5 +277,106 @@ final class RustVerificationFramer
     public function __destruct()
     {
         $this->close();
+    }
+
+    /**
+     * Disabled: five paired runs measured 2.13-2.20x common mean but only 1.46-1.95x common p99
+     * (2.47-2.56x and 2.31-2.80x uncommon mean and p99; see the W46 parity test), below the 1.5x rule
+     * in one run.
+     */
+    public const bool W461_RUST_FFI_DEFAULT = false;
+
+    public const string W461_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w461_framer_article_id_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private const array W461_SUMMARY_KEYS = ['total_ids', 'empty_id_count', 'valid_count', 'oversize_count', 'invalid_utf8_count', 'space_count', 'control_count', 'bracket_count'];
+
+    private static ?bool $w461UseRustFfi = null;
+
+    private static FFI|false|null $w461Ffi = null;
+
+    /** Null restores the benchmark default. */
+    public static function useW461RustFfi(?bool $enable = true): void
+    {
+        self::$w461UseRustFfi = $enable;
+    }
+
+    public static function usesW461RustFfi(): bool
+    {
+        return self::$w461UseRustFfi ?? self::W461_RUST_FFI_DEFAULT;
+    }
+
+    /** Restores the benchmark default and drops the cached library handle. */
+    public static function resetW461RustFfi(): void
+    {
+        self::$w461UseRustFfi = null;
+        self::$w461Ffi = null;
+    }
+
+    /**
+     * Summarizes article IDs the way validateConnection() checks each one: IDs it accepts, IDs over
+     * MAX_INIT_BYTES, invalid UTF-8, and IDs holding a Unicode space, a control character or an angle bracket.
+     * Entries come from strings, integers, or the first non-null id, message_id array field; other values
+     * (including objects) count as empty entries.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeArticleIdBatch(array $rows): array
+    {
+        return self::usesW461RustFfi() ? self::summarizeArticleIdBatchNative($rows) : self::summarizeArticleIdBatchPhp($rows);
+    }
+
+    /**
+     * Rust summary; falls back to PHP when the library or input frame is unusable.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeArticleIdBatchNative(array $rows): array
+    {
+        // Only the length of an ID over MAX_INIT_BYTES matters, so its bytes are never copied.
+        $values = RegexService::w461Invoke(self::$w461Ffi, self::W461_FFI_CDEF, 'nntmux_w461_framer_article_id_batch', $rows, ['id', 'message_id'], \count(self::W461_SUMMARY_KEYS), '', self::MAX_INIT_BYTES);
+
+        return $values === null ? self::summarizeArticleIdBatchPhp($rows) : array_combine(self::W461_SUMMARY_KEYS, $values);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeArticleIdBatchPhp(array $rows): array
+    {
+        $summary = array_fill_keys(self::W461_SUMMARY_KEYS, 0);
+        foreach (RegexService::w461Entries($rows, ['id', 'message_id']) as $id) {
+            $summary['total_ids']++;
+            if ($id === '') {
+                $summary['empty_id_count']++;
+
+                continue;
+            }
+            if (strlen($id) > self::MAX_INIT_BYTES) {
+                $summary['oversize_count']++;
+
+                continue;
+            }
+            $invalid = preg_match(self::INVALID_ID_PATTERN, $id);
+            if ($invalid === 0) {
+                $summary['valid_count']++;
+
+                continue;
+            }
+            if ($invalid === false) {
+                $summary['invalid_utf8_count']++;
+
+                continue;
+            }
+            $summary['space_count'] += (int) preg_match('~(*UCP)\\s~u', $id);
+            $summary['control_count'] += (int) preg_match('~\\p{Cc}~u', $id);
+            $summary['bracket_count'] += (int) (strpbrk($id, '<>') !== false);
+        }
+
+        return $summary;
     }
 }

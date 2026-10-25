@@ -11,10 +11,13 @@ use App\Models\Release;
 use App\Models\ReleaseNamingRegex;
 use App\Models\UsenetGroup;
 use App\Support\ReleaseNameDisplay;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use Throwable;
 
 /**
  * Service for managing regex patterns for collections, categories, and release naming.
@@ -45,6 +48,9 @@ class RegexService
      * again, so edits still reach long-running workers within about a minute of the shared copy.
      */
     private const int LOCAL_REGEX_CACHE_SECONDS = 60;
+
+    /** The collection file counter: an opening bracket or space, `current`, a separator, `total`, a closer. */
+    private const string FILE_COUNT_PATTERN = '/[[(\s](\d{1,5})(\/|[\s_]of[\s_]|-)(\d{1,5})[])\s$:]/i';
 
     /**
      * Default category ID
@@ -162,7 +168,7 @@ class RegexService
     /**
      * Delete a regex using its id.
      *
-     * @throws \Throwable
+     * @throws Throwable
      */
     public function deleteRegex(int $id): void
     {
@@ -397,7 +403,7 @@ class RegexService
 
     public function collectionFileCountPhp(string $subject): string
     {
-        return preg_match('/[[(\s](\d{1,5})(\/|[\s_]of[\s_]|-)(\d{1,5})[])\s$:]/i', $subject, $count) ? $count[3] : '0';
+        return preg_match(self::FILE_COUNT_PATTERN, $subject, $count) ? $count[3] : '0';
     }
 
     public function collectionHash(string $subject, string $name, string $poster, int $groupId): string
@@ -418,5 +424,203 @@ class RegexService
         }
 
         return ReleaseNameDisplay::transformNative(2, $input) ?? $this->collectionHashPhp($subject, $name, $poster, $groupId);
+    }
+
+    /**
+     * Disabled: the 32-row common path is mostly fixed marshaling cost, so five paired runs measured
+     * 2.19-2.28x common mean but only 1.40-2.38x common p99 (2.21-2.29x and 1.95-2.72x uncommon mean
+     * and p99; see the W46 parity test), below the 1.5x rule in one run.
+     */
+    public const bool W461_RUST_FFI_DEFAULT = false;
+
+    public const string W461_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w461_regex_file_count_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    /** Largest Wave 46.1 input frame passed to Rust. */
+    public const int W461_MAX_INPUT = 16777216;
+
+    /** Frame length standing for an entry over the caller's `$oversize` limit, sent without its bytes. */
+    public const int W461_OVERSIZE_LENGTH = 0xFFFFFFFE;
+
+    private const array W461_SUMMARY_KEYS = ['total_subjects', 'empty_subject_count', 'counted_count', 'slash_count', 'of_count', 'dash_count', 'single_total_count', 'zero_total_count'];
+
+    private static ?bool $w461UseRustFfi = null;
+
+    private static FFI|false|null $w461Ffi = null;
+
+    /** Null restores the benchmark default. */
+    public static function useW461RustFfi(?bool $enable = true): void
+    {
+        self::$w461UseRustFfi = $enable;
+    }
+
+    public static function usesW461RustFfi(): bool
+    {
+        return self::$w461UseRustFfi ?? self::W461_RUST_FFI_DEFAULT;
+    }
+
+    /** Restores the benchmark default and drops the cached library handle; the useRustFfi property is untouched. */
+    public static function resetW461RustFfi(): void
+    {
+        self::$w461UseRustFfi = null;
+        self::$w461Ffi = null;
+    }
+
+    /**
+     * Wave 46.1 entries: strings and integers as-is, the first non-null `$fields` value of an array row,
+     * otherwise ''. Objects are never cast or serialized.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @param  list<string>  $fields
+     * @return list<string>
+     */
+    public static function w461Entries(array $rows, array $fields): array
+    {
+        $entries = [];
+        foreach ($rows as $item) {
+            if (\is_array($item)) {
+                $value = null;
+                foreach ($fields as $field) {
+                    if (isset($item[$field])) {
+                        $value = $item[$field];
+                        break;
+                    }
+                }
+                $item = $value;
+            }
+            $entries[] = \is_string($item) || \is_int($item) ? (string) $item : '';
+        }
+
+        return $entries;
+    }
+
+    /**
+     * Calls a Wave 46.1 export with `$prefix` and the w461Entries() of `$rows`, and decodes its `i64le`
+     * counts. Entries are framed as `u32le count, u32le lengths, bytes`, assembled by one implode() so the
+     * entry bytes are copied once and never scanned in PHP. `$ffi` is the caller's cached handle. Returns
+     * null (fall back to PHP) when the frame is too large, the library or symbol is unavailable, Rust
+     * declines the batch, or the output fails validation. An export that only counts entries longer than
+     * `$oversize` bytes receives W461_OVERSIZE_LENGTH and no bytes for them.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @param  list<string>  $fields
+     * @return array<int, int>|null
+     */
+    public static function w461Invoke(FFI|false|null &$ffi, string $cdef, string $symbol, array $rows, array $fields, int $keys, string $prefix = '', int $oversize = PHP_INT_MAX): ?array
+    {
+        // Same extraction as w461Entries(), inlined to keep marshaling to one pass.
+        $parts = [''];
+        $lengths = [];
+        $total = \strlen($prefix);
+        foreach ($rows as $item) {
+            if (\is_array($item)) {
+                $value = null;
+                foreach ($fields as $field) {
+                    if (isset($item[$field])) {
+                        $value = $item[$field];
+                        break;
+                    }
+                }
+                $item = $value;
+            }
+            $entry = \is_string($item) || \is_int($item) ? (string) $item : '';
+            $length = \strlen($entry);
+            if ($length > $oversize) {
+                $lengths[] = self::W461_OVERSIZE_LENGTH;
+
+                continue;
+            }
+            $parts[] = $entry;
+            $lengths[] = $length;
+            $total += $length;
+        }
+        $count = \count($lengths);
+        if ($total + 4 * $count + 4 > self::W461_MAX_INPUT) {
+            return null;
+        }
+        // A NUL-separated frame would need a PHP scan for embedded NULs, which binary frames carry.
+        $parts[0] = $prefix.pack('V*', $count, ...$lengths);
+        $input = implode('', $parts);
+        try {
+            $ffi ??= RustPipelineLibrary::resolveDomain('cleaning_w461', $cdef) ?? false;
+            if ($ffi === false) {
+                return null;
+            }
+            $capacity = 0;
+            $out = RustPipelineLibrary::obtainScratch($ffi, $keys * 8, $capacity);
+            if ($out === null) {
+                return null;
+            }
+            $written = $ffi->{$symbol}($input, \strlen($input), $out, $capacity);
+            if ($written !== $keys * 8) {
+                return null;
+            }
+            $values = unpack('q*', FFI::string($out, $written));
+            if (! \is_array($values) || $values[1] !== $count || min($values) < 0 || max($values) > $count) {
+                return null;
+            }
+
+            return $values;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Summarizes subjects with the collectionFileCountPhp() pattern: subjects carrying a file count, by
+     * separator (`/`, `of`, `-`), and those whose total is one or zero.
+     * Entries come from strings, integers, or the first non-null name, subject array field; other values
+     * (including objects) count as empty entries.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeFileCountBatch(array $rows): array
+    {
+        return self::usesW461RustFfi() ? self::summarizeFileCountBatchNative($rows) : self::summarizeFileCountBatchPhp($rows);
+    }
+
+    /**
+     * Rust summary; falls back to PHP when the library or input frame is unusable.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeFileCountBatchNative(array $rows): array
+    {
+        $values = self::w461Invoke(self::$w461Ffi, self::W461_FFI_CDEF, 'nntmux_w461_regex_file_count_batch', $rows, ['name', 'subject'], \count(self::W461_SUMMARY_KEYS));
+
+        return $values === null ? self::summarizeFileCountBatchPhp($rows) : array_combine(self::W461_SUMMARY_KEYS, $values);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeFileCountBatchPhp(array $rows): array
+    {
+        $summary = array_fill_keys(self::W461_SUMMARY_KEYS, 0);
+        foreach (self::w461Entries($rows, ['name', 'subject']) as $entry) {
+            $summary['total_subjects']++;
+            if ($entry === '') {
+                $summary['empty_subject_count']++;
+
+                continue;
+            }
+            if (preg_match(self::FILE_COUNT_PATTERN, $entry, $count) !== 1) {
+                continue;
+            }
+            $summary['counted_count']++;
+            $summary[match ($count[2]) {
+                '/' => 'slash_count',
+                '-' => 'dash_count',
+                default => 'of_count',
+            }]++;
+            $summary['single_total_count'] += (int) ((int) $count[3] === 1);
+            $summary['zero_total_count'] += (int) ((int) $count[3] === 0);
+        }
+
+        return $summary;
     }
 }
