@@ -336,4 +336,131 @@ class AdminReleasesController extends BasePageController
 
         return $ffi;
     }
+
+    /**
+     * PHP remains the default: the paired benchmark in
+     * tests/Unit/RustAdminRegexCategoryGroupReleaseW39ParityTest.php is below 1.5x.
+     */
+    public const bool W391_RUST_FFI_DEFAULT = false;
+
+    private const array W391_BATCH_KEYS = ['releases', 'invalid_rows', 'total_bytes', 'passworded', 'low_completion', 'missing_category', 'unprocessed', 'stale_unprocessed'];
+
+    private static ?bool $w391UseRustFfi = null;
+
+    private static FFI|false|null $w391Ffi = null;
+
+    /**
+     * Summarizes admin release list rows (`size`, `passwordstatus`, `completion`, `categories_id`, `adddate`):
+     * positive sizes summed (saturating at PHP_INT_MAX), passworded rows (status > 0), completion below 100,
+     * missing categories (absent or <= 0) and unprocessed rows (password status -1), of which `stale_unprocessed`
+     * were added at least `$staleHours` before `$nowUnix` (<= 0 uses the current time; `adddate` read as UTC).
+     *
+     * @param  array<array-key, mixed>  $releases
+     * @return array<string, int>
+     */
+    public static function summarizeReleaseAdminBatch(array $releases, int $staleHours = 168, int $nowUnix = 0): array
+    {
+        $now = $nowUnix > 0 ? $nowUnix : time();
+
+        return (self::usesW391RustFfi() ? self::summarizeReleaseAdminBatchNative($releases, $staleHours, $now) : null)
+            ?? self::summarizeReleaseAdminBatchPhp($releases, $staleHours, $now);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $releases
+     * @return array<string, int>
+     */
+    private static function summarizeReleaseAdminBatchPhp(array $releases, int $staleHours, int $now): array
+    {
+        $now = max(0, $now);
+        $threshold = $staleHours <= 0 ? 0 : ($staleHours > intdiv(PHP_INT_MAX, 3_600) ? PHP_INT_MAX : $staleHours * 3_600);
+        $summary = array_fill_keys(self::W391_BATCH_KEYS, 0);
+        $summary['releases'] = count($releases);
+        foreach ($releases as $release) {
+            if (! is_array($release)) {
+                $summary['invalid_rows']++;
+
+                continue;
+            }
+            $size = AdminBlacklistController::w391Int($release['size'] ?? null);
+            if ($size !== null && $size > 0) {
+                $summary['total_bytes'] = $size > PHP_INT_MAX - $summary['total_bytes'] ? PHP_INT_MAX : $summary['total_bytes'] + $size;
+            }
+            $password = AdminBlacklistController::w391Int($release['passwordstatus'] ?? null);
+            if ($password !== null && $password > 0) {
+                $summary['passworded']++;
+            }
+            if (self::w391BelowHundred($release['completion'] ?? null)) {
+                $summary['low_completion']++;
+            }
+            $category = AdminBlacklistController::w391Int($release['categories_id'] ?? null);
+            if ($category === null || $category <= 0) {
+                $summary['missing_category']++;
+            }
+            if ($password === -1) {
+                $summary['unprocessed']++;
+                $added = AdminBlacklistController::w391Timestamp($release['adddate'] ?? null);
+                if ($added !== null && $now - $added >= $threshold) {
+                    $summary['stale_unprocessed']++;
+                }
+            }
+        }
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $releases
+     * @return array<string, int>|null
+     */
+    private static function summarizeReleaseAdminBatchNative(array $releases, int $staleHours, int $now): ?array
+    {
+        $words = [$staleHours, $now, count($releases)];
+        $blob = [];
+        foreach ($releases as $release) {
+            if (is_array($release)) {
+                AdminBlacklistController::w391PackRow($words, $blob, [$release['size'] ?? null, $release['passwordstatus'] ?? null, $release['completion'] ?? null,
+                    $release['categories_id'] ?? null, $release['adddate'] ?? null]);
+            } else {
+                $words[] = 0;
+            }
+        }
+        $values = AdminBlacklistController::w391Invoke(self::$w391Ffi, 3, $words, $blob);
+
+        return $values !== null && count($values) === count(self::W391_BATCH_KEYS) ? array_combine(self::W391_BATCH_KEYS, $values) : null;
+    }
+
+    /** An int or float below 100, or a `digits[.digits]` string whose integer part is below 100. */
+    private static function w391BelowHundred(mixed $value): bool
+    {
+        if (is_int($value) || is_float($value)) {
+            return $value < 100;
+        }
+        if (! is_string($value)) {
+            return false;
+        }
+        $dot = strpos($value, '.');
+        $integer = $dot === false ? $value : substr($value, 0, $dot);
+        $fraction = $dot === false ? null : substr($value, $dot + 1);
+
+        return $integer !== '' && strspn($integer, '0123456789') === strlen($integer)
+            && ($fraction === null || ($fraction !== '' && strspn($fraction, '0123456789') === strlen($fraction)))
+            && strlen(ltrim($integer, '0')) <= 2;
+    }
+
+    public static function useW391RustFfi(?bool $enabled): void
+    {
+        self::$w391UseRustFfi = $enabled;
+    }
+
+    public static function usesW391RustFfi(): bool
+    {
+        return self::$w391UseRustFfi ?? self::W391_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW391RustFfi(): void
+    {
+        self::$w391UseRustFfi = null;
+        self::$w391Ffi = null;
+    }
 }

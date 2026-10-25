@@ -26608,3 +26608,1117 @@ mod wave38_1_obfuscation_gate_router_admin_names_tests {
         assert_eq!(&out[32..], &[0x5a; 16]);
     }
 }
+
+// Wave 39.1: second-pass admin audit summaries for release-naming regexes, the category
+// hierarchy, admin release batches, binary blacklist rules and clean-subject dry runs. A frame
+// is an i64 word count, that many native-endian i64 words (PHP pack `q`) and a byte blob. A
+// value word is a string byte length (its bytes are the next blob bytes), -1 for any other PHP
+// value, -2 for an int (the next word) or -3 for a float (the next 8 blob bytes, PHP pack `d`).
+// A row starts with 1 (array) or 0 (any other value; no fields follow).
+pub mod wave39_1_admin_regex_category_release_blacklist {
+    use std::collections::HashSet;
+    use std::hash::{Hash, Hasher};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    use super::php_trim_ascii;
+
+    pub const DECLINE: isize = -1;
+    pub const MAX_INPUT: usize = 16 * 1024 * 1024;
+
+    pub const OP_NAMING_REGEX_AUDIT: u32 = 1;
+    pub const OP_CATEGORY_HIERARCHY: u32 = 2;
+    pub const OP_RELEASE_ADMIN_BATCH: u32 = 3;
+    pub const OP_BLACKLIST_RULE_HEALTH: u32 = 4;
+    pub const OP_CLEAN_SUBJECT_DRY_RUN: u32 = 5;
+
+    /// Group regexes that match every group, after PHP `trim()`.
+    const WILDCARD_GROUPS: [&[u8]; 7] = [b"", b"*", b".*", b".+", b"^.*$", b"^.*", b".*$"];
+    /// Modifier bytes PHP's `preg_*` accept after the closing delimiter.
+    const MODIFIERS: &[u8] = b"imsxADSUXJun \n\r";
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub enum Value<'a> {
+        Other,
+        Str(&'a [u8]),
+        Int(i64),
+        Float(f64),
+    }
+
+    impl<'a> Value<'a> {
+        /// `w391Int()`: an int, or a string of an optional `-` and 1-18 ASCII digits.
+        pub fn int(self) -> Option<i64> {
+            match self {
+                Value::Int(value) => Some(value),
+                Value::Str(s) => {
+                    let (negative, digits) = match s {
+                        [b'-', rest @ ..] => (true, rest),
+                        _ => (false, s),
+                    };
+                    if digits.is_empty()
+                        || digits.len() > 18
+                        || !digits.iter().all(u8::is_ascii_digit)
+                    {
+                        return None;
+                    }
+                    let value = digits
+                        .iter()
+                        .fold(0_i64, |acc, d| acc * 10 + i64::from(d - b'0'));
+                    Some(if negative { -value } else { value })
+                }
+                _ => None,
+            }
+        }
+
+        fn str(self) -> Option<&'a [u8]> {
+            match self {
+                Value::Str(s) => Some(s),
+                _ => None,
+            }
+        }
+    }
+
+    struct Frame<'a> {
+        words: &'a [u8],
+        word: usize,
+        blob: &'a [u8],
+        at: usize,
+    }
+
+    impl<'a> Frame<'a> {
+        fn new(bytes: &'a [u8]) -> Option<Self> {
+            let count =
+                usize::try_from(i64::from_ne_bytes(bytes.get(..8)?.try_into().ok()?)).ok()?;
+            let end = count.checked_mul(8)?.checked_add(8)?;
+            Some(Frame {
+                words: bytes.get(8..end)?,
+                word: 0,
+                blob: bytes.get(end..)?,
+                at: 0,
+            })
+        }
+
+        fn int(&mut self) -> Option<i64> {
+            let start = self.word.checked_mul(8)?;
+            let chunk = self.words.get(start..start.checked_add(8)?)?;
+            self.word += 1;
+            Some(i64::from_ne_bytes(chunk.try_into().ok()?))
+        }
+
+        fn bytes(&mut self, len: usize) -> Option<&'a [u8]> {
+            let end = self.at.checked_add(len)?;
+            let value = self.blob.get(self.at..end)?;
+            self.at = end;
+            Some(value)
+        }
+
+        fn value(&mut self) -> Option<Value<'a>> {
+            Some(match self.int()? {
+                -1 => Value::Other,
+                -2 => Value::Int(self.int()?),
+                -3 => Value::Float(f64::from_ne_bytes(self.bytes(8)?.try_into().ok()?)),
+                len if len >= 0 => Value::Str(self.bytes(usize::try_from(len).ok()?)?),
+                _ => return None,
+            })
+        }
+
+        /// A row marker: whether the row is an array.
+        fn row(&mut self) -> Option<bool> {
+            match self.int()? {
+                0 => Some(false),
+                1 => Some(true),
+                _ => None,
+            }
+        }
+
+        /// A row count; every row needs at least its marker word.
+        fn count(&mut self) -> Option<usize> {
+            let count = usize::try_from(self.int()?).ok()?;
+            (count <= self.words.len() / 8 - self.word).then_some(count)
+        }
+
+        fn done(&self) -> bool {
+            self.word * 8 == self.words.len() && self.at == self.blob.len()
+        }
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.len() >= needle.len() && haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// `w391ValidDelimitedPattern()`: PHP's delimiter scan — a non-alphanumeric, non-backslash,
+    /// non-NUL, non-whitespace opening byte, a matching (bracket-nesting) closing delimiter with
+    /// backslash escapes skipped, then only accepted modifier bytes.
+    pub fn valid_delimited_pattern(pattern: &[u8]) -> bool {
+        let Some(&open) = pattern.first() else {
+            return false;
+        };
+        if pattern.len() < 2
+            || open.is_ascii_alphanumeric()
+            || matches!(open, b'\\' | 0 | b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+        {
+            return false;
+        }
+        let close = match open {
+            b'(' => b')',
+            b'[' => b']',
+            b'{' => b'}',
+            b'<' => b'>',
+            other => other,
+        };
+        let mut depth = 1_usize;
+        let mut i = 1;
+        while i < pattern.len() {
+            let c = pattern[i];
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == close {
+                if close == open {
+                    break;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            } else if close != open && c == open {
+                depth += 1;
+            }
+            i += 1;
+        }
+        i < pattern.len() && pattern[i + 1..].iter().all(|b| MODIFIERS.contains(b))
+    }
+
+    /// The `reqid`, `parts` and `name` capture groups in each PCRE spelling.
+    const NAMED_GROUPS: [[&[u8]; 3]; 3] = [
+        [b"(?P<reqid>", b"(?<reqid>", b"(?'reqid'"],
+        [b"(?P<parts>", b"(?<parts>", b"(?'parts'"],
+        [b"(?P<name>", b"(?<name>", b"(?'name'"],
+    ];
+
+    /// Whether `regex` names each of the `reqid`, `parts` and `name` capture groups.
+    pub fn named_groups(regex: &[u8]) -> [bool; 3] {
+        let mut found = [false; 3];
+        if regex.contains(&b'?') {
+            for (hit, spellings) in found.iter_mut().zip(NAMED_GROUPS) {
+                *hit = spellings.iter().any(|needle| contains(regex, needle));
+            }
+        }
+        found
+    }
+
+    /// `AdminReleaseNamingRegexesController::summarizeNamingRegexAuditPhp()`.
+    fn naming_regex_audit(frame: &mut Frame) -> Option<Vec<i64>> {
+        let max_rows = frame.int()?;
+        let total = frame.int()?;
+        let audited = frame.count()?;
+        if total < 0 || audited as i64 != total.min(max_rows.max(0)) {
+            return None;
+        }
+        let (mut invalid, mut active, mut valid, mut wildcards) = (0, 0, 0, 0);
+        let mut named = [0_i64; 3];
+        let mut ordinals = Vec::with_capacity(audited);
+        for _ in 0..audited {
+            if !frame.row()? {
+                invalid += 1;
+                continue;
+            }
+            let (status, regex, group, ordinal) = (
+                frame.value()?,
+                frame.value()?,
+                frame.value()?,
+                frame.value()?,
+            );
+            if status.int() == Some(1) {
+                active += 1;
+            }
+            if let Some(regex) = regex.str() {
+                valid += i64::from(valid_delimited_pattern(regex));
+                for (count, hit) in named.iter_mut().zip(named_groups(regex)) {
+                    *count += i64::from(hit);
+                }
+            }
+            if group
+                .str()
+                .is_none_or(|g| WILDCARD_GROUPS.contains(&php_trim_ascii(g)))
+            {
+                wildcards += 1;
+            }
+            if let Some(ordinal) = ordinal.int() {
+                ordinals.push(ordinal);
+            }
+        }
+        ordinals.sort_unstable();
+        let (mut duplicates, mut gaps) = (0, 0);
+        let mut previous: Option<i64> = None;
+        for &ordinal in &ordinals {
+            if previous == Some(ordinal) {
+                duplicates += 1;
+                continue;
+            }
+            if let Some(prev) = previous
+                && prev >= 0
+                && ordinal - prev > 1
+            {
+                gaps += 1;
+            }
+            previous = Some(ordinal);
+        }
+        let audited = audited as i64;
+        Some(vec![
+            total,
+            audited,
+            i64::from(total > audited),
+            invalid,
+            active,
+            valid,
+            audited - invalid - valid,
+            named[0],
+            named[1],
+            named[2],
+            duplicates,
+            gaps,
+            wildcards,
+        ])
+    }
+
+    /// A (parent, title) key compared without ASCII case, like PHP 8.2+ `strtolower()`.
+    struct TitleKey<'a>(i64, &'a [u8]);
+
+    impl Hash for TitleKey<'_> {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            state.write_i64(self.0);
+            state.write_usize(self.1.len());
+            for b in self.1 {
+                state.write_u8(b.to_ascii_lowercase());
+            }
+        }
+    }
+
+    impl PartialEq for TitleKey<'_> {
+        fn eq(&self, other: &Self) -> bool {
+            self.0 == other.0 && self.1.eq_ignore_ascii_case(other.1)
+        }
+    }
+
+    impl Eq for TitleKey<'_> {}
+
+    /// `AdminCategoryController::planCategoryHierarchySummaryPhp()`.
+    fn category_hierarchy(frame: &mut Frame) -> Option<Vec<i64>> {
+        let count = frame.count()?;
+        let mut counts = [0_i64; 8];
+        let [
+            invalid,
+            missing_ids,
+            roots,
+            children,
+            active,
+            disabled,
+            anomalies,
+            duplicates,
+        ] = &mut counts;
+        let mut parents = Vec::new();
+        let mut titles = HashSet::new();
+        for _ in 0..count {
+            if !frame.row()? {
+                *invalid += 1;
+                continue;
+            }
+            let (id, title, root, status, min, max) = (
+                frame.value()?,
+                frame.value()?,
+                frame.value()?,
+                frame.value()?,
+                frame.value()?,
+                frame.value()?,
+            );
+            if id.int().is_none_or(|id| id <= 0) {
+                *missing_ids += 1;
+            }
+            let parent = root.int().unwrap_or(0);
+            if parent > 0 {
+                *children += 1;
+                parents.push(parent);
+            } else {
+                *roots += 1;
+            }
+            match status.int() {
+                Some(1) => *active += 1,
+                Some(0 | 2) => *disabled += 1,
+                _ => {}
+            }
+            let (min, max) = (min.int().unwrap_or(0), max.int().unwrap_or(0));
+            if max > 0 && min > max {
+                *anomalies += 1;
+            }
+            if let Some(title) = title.str()
+                && !titles.insert(TitleKey(parent, title))
+            {
+                *duplicates += 1;
+            }
+        }
+        parents.sort_unstable();
+        let mut ids = Vec::new();
+        let mut child_counts = Vec::new();
+        for parent in parents {
+            if ids.last() == Some(&parent) {
+                *child_counts.last_mut()? += 1;
+            } else {
+                ids.push(parent);
+                child_counts.push(1);
+            }
+        }
+        let mut out = Vec::with_capacity(10 + ids.len() * 2);
+        out.push(count as i64);
+        out.extend_from_slice(&counts);
+        out.push(ids.len() as i64);
+        out.extend(ids);
+        out.extend(child_counts);
+        Some(out)
+    }
+
+    /// `w391BelowHundred()`: an int or float below 100, or a `digits[.digits]` string whose
+    /// integer part is below 100.
+    pub fn below_hundred(value: Value) -> bool {
+        match value {
+            Value::Int(v) => v < 100,
+            Value::Float(v) => v < 100.0,
+            Value::Str(s) => {
+                let (int, frac) = match s.iter().position(|b| *b == b'.') {
+                    Some(dot) => (&s[..dot], Some(&s[dot + 1..])),
+                    None => (s, None),
+                };
+                !int.is_empty()
+                    && int.iter().all(u8::is_ascii_digit)
+                    && frac.is_none_or(|f| !f.is_empty() && f.iter().all(u8::is_ascii_digit))
+                    && int.iter().skip_while(|b| **b == b'0').count() <= 2
+            }
+            Value::Other => false,
+        }
+    }
+
+    /// `w391Timestamp()`: a non-negative int, or a `YYYY-MM-DD[ HH:MM:SS]` string read as UTC
+    /// (year 1970+, month 1-12, day 1-31, time fields in range; no per-month day check).
+    pub fn timestamp(value: Value) -> Option<i64> {
+        let s = match value {
+            Value::Int(v) => return (v >= 0).then_some(v),
+            Value::Str(s) if s.len() == 10 || s.len() == 19 => s,
+            _ => return None,
+        };
+        let number = |from: usize, len: usize| -> Option<i64> {
+            let digits = &s[from..from + len];
+            digits.iter().all(u8::is_ascii_digit).then(|| {
+                digits
+                    .iter()
+                    .fold(0, |acc, d| acc * 10 + i64::from(d - b'0'))
+            })
+        };
+        if s[4] != b'-' || s[7] != b'-' {
+            return None;
+        }
+        let (year, month, day) = (number(0, 4)?, number(5, 2)?, number(8, 2)?);
+        let (mut hour, mut minute, mut second) = (0, 0, 0);
+        if s.len() == 19 {
+            if s[10] != b' ' || s[13] != b':' || s[16] != b':' {
+                return None;
+            }
+            (hour, minute, second) = (number(11, 2)?, number(14, 2)?, number(17, 2)?);
+        }
+        if year < 1970
+            || !(1..=12).contains(&month)
+            || !(1..=31).contains(&day)
+            || hour > 23
+            || minute > 59
+            || second > 59
+        {
+            return None;
+        }
+        let y = year - i64::from(month <= 2);
+        let era = y / 400;
+        let yoe = y - era * 400;
+        let doy = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        let days = era * 146_097 + doe - 719_468;
+        Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
+    }
+
+    /// `AdminReleasesController::summarizeReleaseAdminBatchPhp()`.
+    fn release_admin_batch(frame: &mut Frame) -> Option<Vec<i64>> {
+        let stale_hours = frame.int()?;
+        let now = frame.int()?.max(0);
+        let count = frame.count()?;
+        let threshold = if stale_hours <= 0 {
+            0
+        } else {
+            stale_hours.checked_mul(3_600).unwrap_or(i64::MAX)
+        };
+        let mut counts = [0_i64; 7];
+        let [invalid, bytes, passworded, low, missing, unprocessed, stale] = &mut counts;
+        for _ in 0..count {
+            if !frame.row()? {
+                *invalid += 1;
+                continue;
+            }
+            let (size, password, completion, category, added) = (
+                frame.value()?,
+                frame.value()?,
+                frame.value()?,
+                frame.value()?,
+                frame.value()?,
+            );
+            if let Some(size) = size.int()
+                && size > 0
+            {
+                *bytes = bytes.saturating_add(size);
+            }
+            let password = password.int();
+            if password.is_some_and(|p| p > 0) {
+                *passworded += 1;
+            }
+            if below_hundred(completion) {
+                *low += 1;
+            }
+            if category.int().is_none_or(|c| c <= 0) {
+                *missing += 1;
+            }
+            if password == Some(-1) {
+                *unprocessed += 1;
+                if timestamp(added).is_some_and(|t| now - t >= threshold) {
+                    *stale += 1;
+                }
+            }
+        }
+        let mut out = vec![count as i64];
+        out.extend_from_slice(&counts);
+        Some(out)
+    }
+
+    /// `w391BreaksSlashDelimiter()`: an unescaped `/` or a trailing lone backslash would break
+    /// BlacklistService's `'/'.$regex.'/i'` wrapping.
+    pub fn breaks_slash_delimiter(regex: &[u8]) -> bool {
+        let mut i = 0;
+        while i < regex.len() {
+            match regex[i] {
+                b'\\' if i + 1 >= regex.len() => return true,
+                b'\\' => i += 2,
+                b'/' => return true,
+                _ => i += 1,
+            }
+        }
+        false
+    }
+
+    /// `AdminBlacklistController::summarizeBlacklistRuleHealthPhp()`.
+    fn blacklist_rule_health(frame: &mut Frame) -> Option<Vec<i64>> {
+        let now = frame.int()?.max(0);
+        let stale_days = frame.int()?;
+        let count = frame.count()?;
+        let threshold = if stale_days <= 0 {
+            0
+        } else {
+            stale_days.checked_mul(86_400).unwrap_or(i64::MAX)
+        };
+        let mut counts = [0_i64; 10];
+        let [
+            invalid,
+            active,
+            disabled,
+            subject,
+            poster,
+            message_id,
+            unknown,
+            bad_regex,
+            stale,
+            never,
+        ] = &mut counts;
+        for _ in 0..count {
+            if !frame.row()? {
+                *invalid += 1;
+                continue;
+            }
+            let (status, column, regex, last) = (
+                frame.value()?,
+                frame.value()?,
+                frame.value()?,
+                frame.value()?,
+            );
+            if status.int() == Some(1) {
+                *active += 1;
+            } else {
+                *disabled += 1;
+            }
+            match column.int() {
+                Some(1) => *subject += 1,
+                Some(2) => *poster += 1,
+                Some(3) => *message_id += 1,
+                _ => *unknown += 1,
+            }
+            if regex
+                .str()
+                .is_none_or(|r| r.is_empty() || breaks_slash_delimiter(r))
+            {
+                *bad_regex += 1;
+            }
+            match timestamp(last) {
+                Some(t) if now - t >= threshold => *stale += 1,
+                Some(_) => {}
+                None => *never += 1,
+            }
+        }
+        let mut out = vec![count as i64];
+        out.extend_from_slice(&counts);
+        Some(out)
+    }
+
+    /// `w391HashLike()`: 16+ hex digits, or 24+ ASCII alphanumerics mixing digits and letters.
+    pub fn hash_like(name: &[u8]) -> bool {
+        (name.len() >= 16 && name.iter().all(u8::is_ascii_hexdigit))
+            || (name.len() >= 24
+                && name.iter().all(u8::is_ascii_alphanumeric)
+                && name.iter().any(u8::is_ascii_digit)
+                && name.iter().any(u8::is_ascii_alphabetic))
+    }
+
+    /// `ReleasesCleanSubjectNames::planCleanSubjectDryRunSummaryPhp()`.
+    fn clean_subject_dry_run(frame: &mut Frame) -> Option<Vec<i64>> {
+        let limit = frame.int()?.max(0);
+        let count = frame.count()?;
+        let mut counts = [0_i64; 6];
+        let [invalid, unchanged, changed, shortened, hashes, sampled] = &mut counts;
+        let mut ids = Vec::new();
+        for _ in 0..count {
+            if !frame.row()? {
+                *invalid += 1;
+                continue;
+            }
+            let (id, from, to) = (frame.value()?, frame.value()?, frame.value()?);
+            let Some(from) = from.str() else {
+                *invalid += 1;
+                continue;
+            };
+            let Some(to) = to.str().filter(|to| !to.eq_ignore_ascii_case(from)) else {
+                *unchanged += 1;
+                continue;
+            };
+            *changed += 1;
+            *shortened += from.len().saturating_sub(to.len()) as i64;
+            *hashes += i64::from(hash_like(to));
+            if *sampled < limit {
+                *sampled += 1;
+                ids.push(id.int().unwrap_or(0));
+            }
+        }
+        let mut out = Vec::with_capacity(8 + ids.len());
+        out.push(count as i64);
+        out.extend_from_slice(&counts);
+        out.push(ids.len() as i64);
+        out.extend(ids);
+        Some(out)
+    }
+
+    pub fn compute(operation: u32, flags: u32, bytes: &[u8]) -> Option<Vec<u8>> {
+        if flags != 0 {
+            return None;
+        }
+        let mut frame = Frame::new(bytes)?;
+        let values = match operation {
+            OP_NAMING_REGEX_AUDIT => naming_regex_audit(&mut frame)?,
+            OP_CATEGORY_HIERARCHY => category_hierarchy(&mut frame)?,
+            OP_RELEASE_ADMIN_BATCH => release_admin_batch(&mut frame)?,
+            OP_BLACKLIST_RULE_HEALTH => blacklist_rule_health(&mut frame)?,
+            OP_CLEAN_SUBJECT_DRY_RUN => clean_subject_dry_run(&mut frame)?,
+            _ => return None,
+        };
+        if !frame.done() || values.len().checked_mul(8)? > MAX_INPUT {
+            return None;
+        }
+        Some(values.iter().flat_map(|v| v.to_ne_bytes()).collect())
+    }
+
+    /// Returns bytes written, `-required` when `out_cap` is too small, or -1 for an unknown
+    /// operation, a nonzero flag word, a malformed frame, invalid/overlapping pointer ranges or a
+    /// caught panic. Negative returns never modify `out_buf`; the caller owns both buffers.
+    ///
+    /// # Safety
+    /// `input` must be readable for `input_len` bytes and `out_buf` writable for `out_cap`
+    /// bytes. Both pointers must be nonnull and the ranges must not overlap.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w391_admin_regex_category_release_blacklist(
+        operation: u32,
+        flags: u32,
+        input: *const u8,
+        input_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !(OP_NAMING_REGEX_AUDIT..=OP_CLEAN_SUBJECT_DRY_RUN).contains(&operation)
+                || flags != 0
+                || input.is_null()
+                || out_buf.is_null()
+                || input_len > MAX_INPUT
+                || out_cap > isize::MAX as usize
+            {
+                return DECLINE;
+            }
+            let Some(input_end) = (input as usize).checked_add(input_len) else {
+                return DECLINE;
+            };
+            let Some(out_end) = (out_buf as usize).checked_add(out_cap) else {
+                return DECLINE;
+            };
+            if input_len != 0
+                && out_cap != 0
+                && (input as usize) < out_end
+                && (out_buf as usize) < input_end
+            {
+                return DECLINE;
+            }
+            let bytes = if input_len == 0 {
+                &[][..]
+            } else {
+                unsafe { slice::from_raw_parts(input, input_len) }
+            };
+            let Some(result) = compute(operation, flags, bytes) else {
+                return DECLINE;
+            };
+            if result.len() > out_cap {
+                return -(result.len() as isize);
+            }
+            unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), out_buf, result.len()) };
+            result.len() as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+}
+
+#[cfg(test)]
+mod wave39_1_admin_regex_category_release_blacklist_tests {
+    use super::wave39_1_admin_regex_category_release_blacklist::*;
+
+    /// Builds a frame from header words and the blob strings they reference.
+    #[derive(Default)]
+    struct Builder {
+        words: Vec<i64>,
+        blob: Vec<u8>,
+    }
+
+    impl Builder {
+        fn int(mut self, value: i64) -> Self {
+            self.words.push(value);
+            self
+        }
+
+        fn value(mut self, value: Value) -> Self {
+            match value {
+                Value::Other => self.words.push(-1),
+                Value::Int(v) => self.words.extend([-2, v]),
+                Value::Float(v) => {
+                    self.words.push(-3);
+                    self.blob.extend(v.to_ne_bytes());
+                }
+                Value::Str(s) => {
+                    self.words.push(s.len() as i64);
+                    self.blob.extend_from_slice(s);
+                }
+            }
+            self
+        }
+
+        fn row(self, fields: &[Value]) -> Self {
+            fields.iter().fold(self.int(1), |b, v| b.value(*v))
+        }
+
+        fn build(&self) -> Vec<u8> {
+            let mut out = (self.words.len() as i64).to_ne_bytes().to_vec();
+            out.extend(self.words.iter().flat_map(|w| w.to_ne_bytes()));
+            out.extend_from_slice(&self.blob);
+            out
+        }
+    }
+
+    fn decode(bytes: Option<Vec<u8>>) -> Vec<i64> {
+        bytes
+            .expect("frame accepted")
+            .chunks(8)
+            .map(|c| i64::from_ne_bytes(c.try_into().unwrap()))
+            .collect()
+    }
+
+    use Value::{Float, Int, Other, Str};
+
+    #[test]
+    fn w391_value_ints_match_php_normalization() {
+        assert_eq!(Str(b"42").int(), Some(42));
+        assert_eq!(Str(b"-7").int(), Some(-7));
+        assert_eq!(Str(b"-0").int(), Some(0));
+        assert_eq!(Str(b"007").int(), Some(7));
+        assert_eq!(
+            Str(b"999999999999999999").int(),
+            Some(999_999_999_999_999_999)
+        );
+        for s in [
+            &b""[..],
+            b"-",
+            b"1.0",
+            b" 1",
+            b"1 ",
+            b"+1",
+            b"1e3",
+            b"0x1",
+            b"1234567890123456789",
+        ] {
+            assert_eq!(Str(s).int(), None, "{s:?}");
+        }
+        assert_eq!(Int(i64::MIN).int(), Some(i64::MIN));
+        assert_eq!(Float(1.0).int(), None);
+        assert_eq!(Other.int(), None);
+    }
+
+    #[test]
+    fn w391_delimiters_follow_php_scan() {
+        for (pattern, valid) in [
+            (&b"/abc/i"[..], true),
+            (b"//", true),
+            (b"#a\\#b#imsxADSUXJun", true),
+            (b"/a/ i\n\r", true),
+            (b"/a/e", false),
+            (b"/a/g", false),
+            (b"/a", false),
+            (b"/a\\/", false),
+            (b"/a\\", false),
+            (b"a/b/", false),
+            (b"\\a\\", false),
+            (b" /a/", false),
+            (b"\0a\0", false),
+            (b"/", false),
+            (b"", false),
+            (b"(a(b)c)i", true),
+            (b"(a(b)c", false),
+            (b"{a\\}}", true),
+            (b"[a]]", false),
+            (b"<a>", true),
+            (b"\xffa\xff", true),
+            (b"~^(?P<name>.+)~", true),
+        ] {
+            assert_eq!(valid_delimited_pattern(pattern), valid, "{pattern:?}");
+        }
+        assert_eq!(
+            named_groups(b"/(?P<reqid>\\d+)(?<parts>x)(?'name'y)/"),
+            [true, true, true]
+        );
+        assert_eq!(
+            named_groups(b"/(?P<reqids>\\d+)(?<part>x)(?P'name'y)/"),
+            [false, false, false]
+        );
+    }
+
+    #[test]
+    fn w391_naming_regex_audit_counts_rows() {
+        let frame = Builder::default()
+            .int(3)
+            .int(5)
+            .int(3)
+            .row(&[Int(1), Str(b"/(?<reqid>\\d+)/i"), Str(b" .* "), Int(5)])
+            .int(0)
+            .row(&[Str(b"1"), Str(b"bad"), Other, Str(b"7")])
+            .build();
+        assert_eq!(
+            decode(compute(OP_NAMING_REGEX_AUDIT, 0, &frame)),
+            [5, 3, 1, 1, 2, 1, 1, 1, 0, 0, 0, 1, 2]
+        );
+        let ordinals = [5, 5, -1, 0, 1, 3, 3, 9, i64::MAX, i64::MIN];
+        let mut b = Builder::default()
+            .int(500)
+            .int(ordinals.len() as i64)
+            .int(ordinals.len() as i64);
+        for ordinal in ordinals {
+            b = b.row(&[Other, Other, Str(b"alt"), Int(ordinal)]);
+        }
+        let out = decode(compute(OP_NAMING_REGEX_AUDIT, 0, &b.build()));
+        assert_eq!(&out[10..], &[2, 4, 0]);
+        // The audited count must equal min(total, max(0, max_rows)).
+        let mismatch = Builder::default().int(-4).int(1).int(1).int(0).build();
+        assert!(compute(OP_NAMING_REGEX_AUDIT, 0, &mismatch).is_none());
+        let zero = Builder::default().int(-4).int(1).int(0).build();
+        assert_eq!(
+            decode(compute(OP_NAMING_REGEX_AUDIT, 0, &zero))[..3],
+            [1, 0, 1]
+        );
+    }
+
+    #[test]
+    fn w391_category_hierarchy_groups_parents() {
+        let frame = Builder::default()
+            .int(5)
+            .row(&[Int(10), Str(b"Other"), Int(0), Int(1), Int(0), Int(0)])
+            .row(&[
+                Str(b"2010"),
+                Str(b"Foreign"),
+                Str(b"2000"),
+                Int(0),
+                Int(500),
+                Int(100),
+            ])
+            .row(&[
+                Int(2020),
+                Str(b"FOREIGN"),
+                Int(2000),
+                Int(2),
+                Int(500),
+                Int(0),
+            ])
+            .row(&[Other, Str(b"foreign"), Int(1000), Str(b"x"), Int(5), Int(4)])
+            .int(0)
+            .build();
+        assert_eq!(
+            decode(compute(OP_CATEGORY_HIERARCHY, 0, &frame)),
+            [5, 1, 1, 1, 3, 1, 2, 2, 1, 2, 1000, 2000, 1, 2]
+        );
+    }
+
+    #[test]
+    fn w391_completion_and_timestamps_match_php() {
+        for (value, below) in [
+            (Int(99), true),
+            (Int(100), false),
+            (Int(-5), true),
+            (Float(99.999), true),
+            (Float(100.0), false),
+            (Float(f64::NAN), false),
+            (Float(f64::NEG_INFINITY), true),
+            (Str(b"99.5"), true),
+            (Str(b"0099.5"), true),
+            (Str(b"100"), false),
+            (Str(b"0"), true),
+            (Str(b"99."), false),
+            (Str(b".5"), false),
+            (Str(b"-1"), false),
+            (Str(b"1e1"), false),
+            (Other, false),
+        ] {
+            assert_eq!(below_hundred(value), below, "{value:?}");
+        }
+        assert_eq!(timestamp(Str(b"1970-01-01 00:00:00")), Some(0));
+        assert_eq!(timestamp(Str(b"2026-10-25 12:34:56")), Some(1_792_931_696));
+        assert_eq!(timestamp(Str(b"2000-03-01")), Some(951_868_800));
+        assert_eq!(timestamp(Str(b"2024-02-31")), Some(1_709_337_600));
+        assert_eq!(timestamp(Int(5)), Some(5));
+        for bad in [
+            Int(-1),
+            Str(b"1969-12-31"),
+            Str(b"0000-00-00 00:00:00"),
+            Str(b"2026-13-01"),
+            Str(b"2026-10-32"),
+            Str(b"2026-10-25T12:34:56"),
+            Str(b"2026-10-25 24:00:00"),
+            Str(b"2026/10/25"),
+            Str(b"2026-1-251"),
+            Float(1.0),
+        ] {
+            assert_eq!(timestamp(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn w391_release_batch_and_blacklist_health() {
+        let now = 1_793_018_096;
+        let frame = Builder::default()
+            .int(168)
+            .int(now)
+            .int(4)
+            .row(&[
+                Int(i64::MAX),
+                Int(-1),
+                Float(99.0),
+                Int(0),
+                Str(b"2026-10-01 00:00:00"),
+            ])
+            .row(&[Str(b"10"), Str(b"1"), Str(b"100"), Str(b"5000"), Other])
+            .row(&[Int(-5), Int(-1), Other, Other, Int(now - 3_600)])
+            .int(0)
+            .build();
+        assert_eq!(
+            decode(compute(OP_RELEASE_ADMIN_BATCH, 0, &frame)),
+            [4, 1, i64::MAX, 1, 1, 2, 2, 1]
+        );
+        let huge = Builder::default()
+            .int(i64::MAX)
+            .int(-9)
+            .int(1)
+            .row(&[Other, Int(-1), Other, Int(1), Int(0)])
+            .build();
+        assert_eq!(
+            decode(compute(OP_RELEASE_ADMIN_BATCH, 0, &huge))[6..],
+            [1, 0]
+        );
+
+        for (regex, breaks) in [
+            (&b"abc"[..], false),
+            (b"a\\/b", false),
+            (b"a/b", true),
+            (b"a\\", true),
+            (b"a\\\\", false),
+        ] {
+            assert_eq!(breaks_slash_delimiter(regex), breaks, "{regex:?}");
+        }
+        let rules = Builder::default()
+            .int(now)
+            .int(90)
+            .int(4)
+            .row(&[Int(1), Int(1), Str(b"^foo"), Str(b"2026-01-01 00:00:00")])
+            .row(&[Str(b"0"), Str(b"2"), Str(b""), Other])
+            .row(&[Int(2), Int(7), Str(b"a/b"), Int(now)])
+            .int(0)
+            .build();
+        assert_eq!(
+            decode(compute(OP_BLACKLIST_RULE_HEALTH, 0, &rules)),
+            [4, 1, 1, 2, 1, 1, 0, 1, 2, 1, 1]
+        );
+    }
+
+    #[test]
+    fn w391_clean_subject_dry_run_samples_changes() {
+        let frame = Builder::default()
+            .int(2)
+            .int(6)
+            .row(&[Int(1), Str(b"[1/2] - \"A.rar\""), Str(b"A")])
+            .row(&[Int(2), Str(b"Same"), Str(b"sAME")])
+            .row(&[Int(3), Str(b"x"), Other])
+            .row(&[Str(b"4"), Str(b"short"), Str(b"0123456789abcdef0123")])
+            .row(&[Other, Str(b"x"), Str(b"Abcdefghijklmnopqrstuvw1")])
+            .row(&[Int(6), Other, Str(b"a")])
+            .build();
+        assert_eq!(
+            decode(compute(OP_CLEAN_SUBJECT_DRY_RUN, 0, &frame)),
+            [6, 1, 2, 3, 14, 2, 2, 2, 1, 4]
+        );
+        assert!(hash_like(b"0123456789ABCDEF"));
+        assert!(!hash_like(b"0123456789ABCDE"));
+        assert!(!hash_like(b"abcdefghijklmnopqrstuvwx"));
+        assert!(!hash_like(b"0123456789abcdef-"));
+    }
+
+    #[test]
+    fn w391_malformed_frames_decline() {
+        let empty = Builder::default().int(0).build();
+        for operation in [0, 6, u32::MAX] {
+            assert!(compute(operation, 0, &empty).is_none());
+        }
+        assert!(compute(OP_CATEGORY_HIERARCHY, 1, &empty).is_none());
+        assert!(compute(OP_CATEGORY_HIERARCHY, 0, &[]).is_none());
+        assert!(compute(OP_CATEGORY_HIERARCHY, 0, &(-1_i64).to_ne_bytes()).is_none());
+        assert!(compute(OP_CATEGORY_HIERARCHY, 0, &i64::MAX.to_ne_bytes()).is_none());
+        assert!(
+            compute(
+                OP_CATEGORY_HIERARCHY,
+                0,
+                &Builder::default().int(2).int(0).build()
+            )
+            .is_none()
+        );
+        assert!(
+            compute(
+                OP_CATEGORY_HIERARCHY,
+                0,
+                &Builder::default().int(1).int(2).build()
+            )
+            .is_none()
+        );
+        assert!(
+            compute(
+                OP_CATEGORY_HIERARCHY,
+                0,
+                &Builder::default().int(-1).build()
+            )
+            .is_none()
+        );
+        let mut trailing = empty.clone();
+        trailing.push(0);
+        assert!(compute(OP_CATEGORY_HIERARCHY, 0, &trailing).is_none());
+        let bad_tag = Builder::default().int(1).int(1).int(-9).build();
+        assert!(
+            compute(
+                OP_CLEAN_SUBJECT_DRY_RUN,
+                0,
+                &Builder::default().int(0).int(1).int(1).int(-4).build()
+            )
+            .is_none()
+        );
+        assert!(compute(OP_CATEGORY_HIERARCHY, 0, &bad_tag).is_none());
+        let short_string = Builder::default()
+            .int(0)
+            .int(1)
+            .int(1)
+            .int(-1)
+            .int(5)
+            .build();
+        assert!(compute(OP_CLEAN_SUBJECT_DRY_RUN, 0, &short_string).is_none());
+        let short_float = Builder::default()
+            .int(0)
+            .int(0)
+            .int(1)
+            .int(1)
+            .int(-1)
+            .int(-1)
+            .int(-3)
+            .build();
+        assert!(compute(OP_RELEASE_ADMIN_BATCH, 0, &short_float).is_none());
+        assert!(compute(OP_CATEGORY_HIERARCHY, 0, &Builder::default().int(0).build()).is_some());
+    }
+
+    #[test]
+    fn w391_export_validates_pointers_and_capacity_without_partial_writes() {
+        let input = Builder::default().int(1).int(0).build();
+        let call = |op, flags, ptr, len, out, cap| unsafe {
+            nntmux_w391_admin_regex_category_release_blacklist(op, flags, ptr, len, out, cap)
+        };
+        let mut out = [0x5a_u8; 96];
+        let (ptr, len) = (input.as_ptr(), input.len());
+        assert_eq!(call(2, 0, ptr, len, out.as_mut_ptr(), 79), -80);
+        assert_eq!(call(2, 0, ptr, len, out.as_mut_ptr(), 0), -80);
+        assert_eq!(call(0, 0, ptr, len, out.as_mut_ptr(), 96), DECLINE);
+        assert_eq!(call(6, 0, ptr, len, out.as_mut_ptr(), 96), DECLINE);
+        assert_eq!(call(2, 1, ptr, len, out.as_mut_ptr(), 96), DECLINE);
+        assert_eq!(
+            call(2, 0, std::ptr::null(), len, out.as_mut_ptr(), 96),
+            DECLINE
+        );
+        assert_eq!(call(2, 0, ptr, len, std::ptr::null_mut(), 96), DECLINE);
+        assert_eq!(
+            call(2, 0, ptr, MAX_INPUT + 1, out.as_mut_ptr(), 96),
+            DECLINE
+        );
+        assert_eq!(call(2, 0, ptr, len, out.as_mut_ptr(), usize::MAX), DECLINE);
+        assert_eq!(
+            call(2, 0, usize::MAX as *const u8, 16, out.as_mut_ptr(), 96),
+            DECLINE
+        );
+        assert_eq!(call(2, 0, ptr, len, usize::MAX as *mut u8, 96), DECLINE);
+        assert_eq!(call(2, 0, ptr, len - 1, out.as_mut_ptr(), 96), DECLINE);
+        assert_eq!(out, [0x5a; 96]);
+        let mut overlapping = input.clone();
+        assert_eq!(
+            call(
+                2,
+                0,
+                overlapping.as_ptr(),
+                len,
+                overlapping.as_mut_ptr(),
+                len
+            ),
+            DECLINE
+        );
+        assert_eq!(overlapping, input);
+
+        assert_eq!(call(2, 0, ptr, len, out.as_mut_ptr(), 96), 80);
+        assert_eq!(
+            &out[..80],
+            &[[1_i64, 1, 0, 0, 0, 0, 0, 0, 0, 0].map(i64::to_ne_bytes)]
+                .concat()
+                .concat()[..]
+        );
+        assert_eq!(&out[80..], &[0x5a; 16]);
+    }
+}
