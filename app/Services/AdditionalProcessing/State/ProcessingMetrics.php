@@ -18,10 +18,20 @@ final class ProcessingMetrics
         ssize_t nntmux_pmetrics_format_summary(const char *packed, size_t len, char *out, size_t cap);
         C;
 
+    public const bool W466_RUST_FFI_DEFAULT = false;
+
+    public const string W466_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w466_stage_summary(const char *keys, size_t keys_len, size_t count, const char *nanoseconds, size_t nanoseconds_len, char *out, size_t cap);
+        C;
+
     // PHP remains the production default: FFI marshaling stays below the 1.5x gate.
     private static bool $useRustFfi = false;
 
     private static FFI|false|null $ffi = null;
+
+    private static ?bool $w466RustFfi = null;
+
+    private static FFI|false|null $w466Ffi = null;
 
     private readonly int $startedAtNanoseconds;
 
@@ -43,6 +53,22 @@ final class ProcessingMetrics
     public static function usesRustFfi(): bool
     {
         return self::$useRustFfi;
+    }
+
+    public static function useW466RustFfi(?bool $enabled): void
+    {
+        self::$w466RustFfi = $enabled;
+    }
+
+    public static function usesW466RustFfi(): bool
+    {
+        return self::$w466RustFfi ?? self::W466_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW466RustFfi(): void
+    {
+        self::$w466RustFfi = null;
+        self::$w466Ffi = null;
     }
 
     /**
@@ -89,7 +115,73 @@ final class ProcessingMetrics
      */
     public function summaryLine(): string
     {
-        return self::formatStageSummary($this->stageDurations());
+        return self::usesW466RustFfi()
+            ? self::summaryFromNanoseconds($this->stageNanoseconds)
+            : self::formatStageSummary($this->stageDurations());
+    }
+
+    /**
+     * `stage=seconds` summary straight from nanosecond totals in one call.
+     *
+     * @param  array<array-key, int>  $nanoseconds
+     */
+    public static function summaryFromNanoseconds(array $nanoseconds): string
+    {
+        return (self::usesW466RustFfi() ? self::summaryFromNanosecondsNative($nanoseconds) : null)
+            ?? self::summaryFromNanosecondsPhp($nanoseconds);
+    }
+
+    /**
+     * @param  array<array-key, int>  $nanoseconds
+     */
+    public static function summaryFromNanosecondsPhp(array $nanoseconds): string
+    {
+        return self::formatStageSummaryPhp(self::secondsFromNanosecondsPhp($nanoseconds));
+    }
+
+    /**
+     * Rust summary, or null when PHP must format it (non-integer totals, which the
+     * strict int conversion rejects, keys with NUL bytes or an unavailable library).
+     *
+     * @param  array<array-key, mixed>  $nanoseconds
+     */
+    public static function summaryFromNanosecondsNative(array $nanoseconds): ?string
+    {
+        if ($nanoseconds === []) {
+            return '';
+        }
+        $ffi = self::$w466Ffi instanceof FFI ? self::$w466Ffi : self::w466Ffi();
+        $count = \count($nanoseconds);
+        if ($ffi === null || \count(array_filter($nanoseconds, 'is_int')) !== $count) {
+            return null;
+        }
+        $keys = implode("\0", array_keys($nanoseconds));
+        if (substr_count($keys, "\0") !== $count - 1) {
+            return null;
+        }
+        $values = pack('q*', ...array_values($nanoseconds));
+
+        try {
+            $cap = 0;
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, \strlen($keys) + 24 * $count, $cap);
+            if ($scratch === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w466_stage_summary($keys, \strlen($keys), $count, $values, \strlen($values), $scratch, $cap);
+            if ($written < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w466_stage_summary($keys, \strlen($keys), $count, $values, \strlen($values), $scratch, $cap);
+            }
+
+            return $written > 0 && $written <= $cap ? FFI::string($scratch, $written) : null;
+        } catch (Throwable) {
+            return null;
+        }
     }
 
     /**
@@ -268,5 +360,14 @@ final class ProcessingMetrics
         }
 
         return self::$ffi === false ? null : self::$ffi;
+    }
+
+    private static function w466Ffi(): ?FFI
+    {
+        if (self::$w466Ffi === null) {
+            self::$w466Ffi = RustPipelineLibrary::resolveDomain('additional', self::W466_FFI_CDEF) ?? false;
+        }
+
+        return self::$w466Ffi === false ? null : self::$w466Ffi;
     }
 }
