@@ -38913,3 +38913,1148 @@ pub mod w521_backfill_binaries_config_service_header_storage {
         }
     }
 }
+
+pub mod w531_obfuscation_blacklist_cat_pipeline_result_service {
+    //! Wave 53.1 batch kernels for yEnc part count summaries, first-match literal blacklist
+    //! rules, release name signal masks, categorization result folds and pipeline/legacy
+    //! category comparison matrices. Every export reads NUL-joined string columns or
+    //! little-endian `i64`/`f64` tables, writes fixed-width `i64` words into `out` and returns
+    //! the word count, `SHORT_CAPACITY` when `out_cap` (in words) is below the export's worst
+    //! case, or -1 for a malformed batch (a string column whose rows hold NUL bytes splits into
+    //! extra rows and is malformed).
+
+    use super::w48_proxy_verdict_captcha_breach_reglog::rows;
+    use super::w501_status_probes_db_disk_nntp_result_queue::i64s;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    pub const MAX_INPUT: usize = 64 * 1024 * 1024;
+    pub const MAX_ITEMS: usize = 1 << 20;
+    /// Largest literal rule list the blacklist kernel accepts.
+    pub const MAX_RULES: usize = 4096;
+    pub const SHORT_CAPACITY: isize = -2;
+    /// `[part_markers, part_counts, first_parts, final_parts, invalid_parts, max_total]`.
+    pub const PART_SUMMARY_WORDS: usize = 6;
+    /// `[successful, protected, best_index]`.
+    pub const RESULT_FOLD_WORDS: usize = 3;
+    /// Category roots 0-8 (IDs 0 through `MAX_CATEGORY_ID`).
+    pub const ROOTS: usize = 9;
+    /// `[matches, mismatches, same_root_mismatches, invalid_pairs]` then the root matrix.
+    pub const MATRIX_WORDS: usize = 4 + ROOTS * ROOTS;
+    pub const MAX_CATEGORY_ID: i64 = 8999;
+
+    pub const SIGNAL_HASH: i64 = 1;
+    pub const SIGNAL_GROUP_SUFFIX: i64 = 2;
+    pub const SIGNAL_EPISODE: i64 = 4;
+    pub const SIGNAL_RESOLUTION: i64 = 8;
+    pub const SIGNAL_YEAR: i64 = 16;
+    pub const SIGNAL_ONLYFANS: i64 = 32;
+
+    /// Borrows a caller span; an empty span may be null and is never dereferenced.
+    unsafe fn span<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null() || len > MAX_INPUT {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
+    fn overlaps(input: (*const u8, usize), out: *mut i64, words: usize) -> bool {
+        let (a, a_len) = (input.0 as usize, input.1);
+        let (b, b_len) = (out as usize, words.saturating_mul(8));
+        a_len != 0 && b_len != 0 && a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
+    }
+
+    /// Validates the output window for at most `max_words` words, lets `body` push them from
+    /// the borrowed inputs and copies the pushed words to `out`.
+    unsafe fn run(
+        out: *mut i64,
+        out_cap: usize,
+        count: usize,
+        max_words: usize,
+        inputs: &[(*const u8, usize)],
+        body: impl FnOnce(&[&[u8]], &mut Vec<i64>) -> bool,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out.is_null()
+                || !(out as usize).is_multiple_of(std::mem::align_of::<i64>())
+                || count > MAX_ITEMS
+                || out_cap > isize::MAX as usize / 8
+            {
+                return -1;
+            }
+            if max_words > out_cap {
+                return SHORT_CAPACITY;
+            }
+            if inputs.iter().any(|&input| overlaps(input, out, max_words)) {
+                return -1;
+            }
+            let mut spans = Vec::with_capacity(inputs.len());
+            for &(ptr, len) in inputs {
+                match unsafe { span(ptr, len) } {
+                    Some(bytes) => spans.push(bytes),
+                    None => return -1,
+                }
+            }
+            let mut words = Vec::with_capacity(max_words);
+            if !body(&spans, &mut words) || words.len() > max_words {
+                return -1;
+            }
+            // At most `max_words` words, checked against `out_cap` above.
+            unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), out, words.len()) };
+            words.len() as isize
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// A little-endian `f64` table (`pack('e*', ...)`) of exactly `count` values.
+    pub fn f64s(table: &[u8], count: usize) -> Option<Vec<f64>> {
+        if table.len() != count.checked_mul(8)? {
+            return None;
+        }
+        Some(
+            table
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|&c| f64::from_le_bytes(c))
+                .collect(),
+        )
+    }
+
+    /// The value and length of a 1-9 digit run at the start of `bytes`.
+    fn digit_run(bytes: &[u8]) -> Option<(i64, usize)> {
+        let n = bytes
+            .iter()
+            .take(10)
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        if n == 0 || n > 9 {
+            return None;
+        }
+        Some((
+            bytes[..n]
+                .iter()
+                .fold(0i64, |v, &b| v * 10 + i64::from(b - b'0')),
+            n,
+        ))
+    }
+
+    /// `\d{1,9}\/\d{1,9}\)` right after a `(`.
+    fn part_at(tail: &[u8]) -> Option<(i64, i64)> {
+        let (part, n) = digit_run(tail)?;
+        if tail.get(n) != Some(&b'/') {
+            return None;
+        }
+        let rest = &tail[n + 1..];
+        let (total, m) = digit_run(rest)?;
+        (rest.get(m) == Some(&b')')).then_some((part, total))
+    }
+
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    const LOW7: u64 = 0x7F7F_7F7F_7F7F_7F7F;
+
+    /// The high bit of exactly the zero bytes of `v`.
+    fn zero_bytes(v: u64) -> u64 {
+        !(((v & LOW7).wrapping_add(LOW7)) | v | LOW7)
+    }
+
+    /// The high bit of exactly the `byte` bytes of `v`.
+    fn byte_eq(v: u64, byte: u8) -> u64 {
+        zero_bytes(v ^ (u64::from(byte) * LO))
+    }
+
+    /// The high bit of exactly the ASCII digit bytes of `v`.
+    fn digit_bytes(v: u64) -> u64 {
+        // `b | 0x80` minus 0x30 or 0x3A never borrows across bytes.
+        let h = v | HI;
+        h.wrapping_sub(0x30 * LO) & !h.wrapping_sub(0x3A * LO) & !v & HI
+    }
+
+    /// Calls `visit` with each position of `s` whose byte `mask` marks (8 bytes at a time),
+    /// in order, until it returns false.
+    fn scan(s: &[u8], mask: impl Fn(u64) -> u64, mut visit: impl FnMut(usize) -> bool) {
+        let (words, tail) = s.as_chunks::<8>();
+        for (w, chunk) in words.iter().enumerate() {
+            let mut m = mask(u64::from_le_bytes(*chunk));
+            while m != 0 {
+                if !visit(w * 8 + (m.trailing_zeros() / 8) as usize) {
+                    return;
+                }
+                m &= m - 1;
+            }
+        }
+        if tail.is_empty() {
+            return;
+        }
+        let base = words.len() * 8;
+        let mut last = [0u8; 8];
+        last[..tail.len()].copy_from_slice(tail);
+        let mut m = mask(u64::from_le_bytes(last)) & ((1u64 << (tail.len() * 8)) - 1);
+        while m != 0 {
+            if !visit(base + (m.trailing_zeros() / 8) as usize) {
+                return;
+            }
+            m &= m - 1;
+        }
+    }
+
+    /// Whether `subject` holds ` (` and its rightmost `(part/total)`, from one pass over its
+    /// `(` bytes.
+    fn scan_subject(subject: &[u8]) -> (bool, Option<(i64, i64)>) {
+        let (mut marker, mut found) = (false, None);
+        scan(
+            subject,
+            |v| byte_eq(v, b'('),
+            |p| {
+                marker |= p > 0 && subject[p - 1] == b' ';
+                if let Some(count) = part_at(&subject[p + 1..]) {
+                    found = Some(count);
+                }
+                true
+            },
+        );
+        (marker, found)
+    }
+
+    /// PHP `preg_match('/.*\((\d{1,9})\/(\d{1,9})\)/s', ...)`: the rightmost `(part/total)`.
+    pub fn part_count(subject: &[u8]) -> Option<(i64, i64)> {
+        scan_subject(subject).1
+    }
+
+    /// The [`PART_SUMMARY_WORDS`] summary of a batch of subjects.
+    pub fn part_summary<'a>(subjects: impl IntoIterator<Item = &'a [u8]>) -> [i64; 6] {
+        let mut s = [0i64; 6];
+        for subject in subjects {
+            let (marker, count) = scan_subject(subject);
+            s[0] += i64::from(marker);
+            let Some((part, total)) = count else {
+                continue;
+            };
+            s[1] += 1;
+            if part == 0 || part > total {
+                s[4] += 1;
+                continue;
+            }
+            s[2] += i64::from(part == 1);
+            s[3] += i64::from(part == total);
+            s[5] = s[5].max(total);
+        }
+        s
+    }
+
+    /// Whether lowercased `needle` occurs in lowercased `haystack` (an empty needle always
+    /// does, like PHP `stripos()`).
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        let Some((&first, rest)) = needle.split_first() else {
+            return true;
+        };
+        if needle.len() > haystack.len() {
+            return false;
+        }
+        let starts = &haystack[..=haystack.len() - needle.len()];
+        let mut found = false;
+        scan(
+            starts,
+            |v| byte_eq(v, first),
+            |p| {
+                found = &haystack[p + 1..p + needle.len()] == rest;
+                !found
+            },
+        );
+        found
+    }
+
+    /// ASCII lowercase, as PHP `stripos()` folds bytes.
+    fn lower(b: u8) -> u8 {
+        b | (u8::from(b.wrapping_sub(b'A') < 26) << 5)
+    }
+
+    /// A 12-bit bigram slot; distinct bigrams may share one (a false "maybe present").
+    fn bigram(a: u8, b: u8) -> usize {
+        (usize::from(a & 0x3F) << 6) | usize::from(b & 0x3F)
+    }
+
+    /// Fields shorter than this skip the bigram filter and are searched directly.
+    const GRAM_MIN_FIELD: usize = 48;
+
+    /// One article field, lowercased, plus a stamped bigram presence table so a literal
+    /// missing any of its probed bigrams is skipped without a search.
+    struct Field {
+        lowered: Vec<u8>,
+        grams: [u8; 4096],
+        stamp: u8,
+        filtered: bool,
+    }
+
+    impl Field {
+        fn load(&mut self, raw: &[u8]) {
+            self.lowered.clear();
+            self.lowered.extend(raw.iter().map(|&b| lower(b)));
+            self.filtered = self.lowered.len() >= GRAM_MIN_FIELD;
+            if !self.filtered {
+                return;
+            }
+            self.stamp = self.stamp.wrapping_add(1);
+            if self.stamp == 0 {
+                self.grams.fill(0);
+                self.stamp = 1;
+            }
+            for pair in self.lowered.windows(2) {
+                self.grams[bigram(pair[0], pair[1]) & 0xFFF] = self.stamp;
+            }
+        }
+
+        fn holds(&self, needle: &[u8], probes: &[usize; 3]) -> bool {
+            (!self.filtered
+                || needle.len() < 2
+                || probes.iter().all(|&p| self.grams[p & 0xFFF] == self.stamp))
+                && contains(&self.lowered, needle)
+        }
+    }
+
+    /// The index of the first `(column, literal)` rule whose literal occurs, ASCII
+    /// case-insensitively, in that column (1 subject, 2 poster, 3 Message-ID) of each article,
+    /// or -1. Columns outside 1-3 make the batch malformed.
+    pub fn first_literal_matches(
+        literals: &[&[u8]],
+        columns: &[i64],
+        articles: [&[&[u8]]; 3],
+        out: &mut Vec<i64>,
+    ) -> bool {
+        if columns.iter().any(|c| !(1..=3).contains(c)) {
+            return false;
+        }
+        let needles: Vec<(Vec<u8>, usize, [usize; 3])> = literals
+            .iter()
+            .zip(columns)
+            .map(|(literal, &column)| {
+                let bytes: Vec<u8> = literal.iter().map(|&b| lower(b)).collect();
+                let mut probes = [0; 3];
+                if bytes.len() >= 2 {
+                    let last = bytes.len() - 2;
+                    for (slot, at) in probes.iter_mut().zip([0, last / 2, last]) {
+                        *slot = bigram(bytes[at], bytes[at + 1]);
+                    }
+                }
+                (bytes, (column - 1) as usize, probes)
+            })
+            .collect();
+        let mut fields: Vec<Field> = (0..3)
+            .map(|_| Field {
+                lowered: Vec::new(),
+                grams: [0; 4096],
+                stamp: 0,
+                filtered: false,
+            })
+            .collect();
+        for (i, _) in articles[0].iter().enumerate() {
+            let mut ready = [false; 3];
+            let mut hit = -1;
+            for (r, (needle, column, probes)) in needles.iter().enumerate() {
+                if !ready[*column] {
+                    fields[*column].load(articles[*column][i]);
+                    ready[*column] = true;
+                }
+                if fields[*column].holds(needle, probes) {
+                    hit = r as i64;
+                    break;
+                }
+            }
+            out.push(hit);
+        }
+        true
+    }
+
+    fn word(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_'
+    }
+
+    fn digit_at(s: &[u8], i: usize) -> bool {
+        s.get(i).is_some_and(u8::is_ascii_digit)
+    }
+
+    /// `/\A[0-9a-f]{32}(?:[0-9a-f]{8})?\z/i`.
+    fn is_hash(s: &[u8]) -> bool {
+        (s.len() == 32 || s.len() == 40) && s.iter().all(u8::is_ascii_hexdigit)
+    }
+
+    /// `/-[A-Za-z0-9]{2,15}\z/`.
+    fn has_group_suffix(s: &[u8]) -> bool {
+        let run = s
+            .iter()
+            .rev()
+            .take(16)
+            .take_while(|b| b.is_ascii_alphanumeric())
+            .count();
+        (2..=15).contains(&run) && s.len() > run && s[s.len() - run - 1] == b'-'
+    }
+
+    fn ci_at(s: &[u8], at: usize, lower: &[u8]) -> bool {
+        s.get(at..at + lower.len())
+            .is_some_and(|w| w.eq_ignore_ascii_case(lower))
+    }
+
+    /// `Only[-_ ]?Fans\b` (case-insensitive) at `at`.
+    fn onlyfans_at(s: &[u8], at: usize) -> bool {
+        if !ci_at(s, at, b"only") {
+            return false;
+        }
+        let mut j = at + 4;
+        if matches!(s.get(j), Some(b'-' | b'_' | b' ')) {
+            j += 1;
+        }
+        ci_at(s, j, b"fans") && s.get(j + 4).is_none_or(|&b| !word(b))
+    }
+
+    /// Candidate bytes of one word for [`release_name_signals`]: digits whose previous byte in
+    /// the word is not a digit (byte 0 always qualifies) and `o`/`O` bytes followed by `n`/`N`
+    /// (byte 7 always qualifies, its successor lies in the next word).
+    fn signal_candidates(v: u64) -> u64 {
+        let digits = digit_bytes(v);
+        let folded = v | (0x20 * LO);
+        let o = byte_eq(folded, b'o');
+        let n = byte_eq(folded, b'n');
+        (digits & !(digits << 8)) | (o & ((n >> 8) | (1 << 63)))
+    }
+
+    /// The `SIGNAL_*` mask of one release name. Episode, resolution and year patterns all
+    /// anchor on a whole ASCII digit run (`(?<!\d)` with a non-digit after the token), and
+    /// `\bOnly` on an `on` pair, so one pass visits only those candidates.
+    pub fn release_name_signals(s: &[u8]) -> i64 {
+        const SCANNED: i64 = SIGNAL_EPISODE | SIGNAL_RESOLUTION | SIGNAL_YEAR | SIGNAL_ONLYFANS;
+        let mut mask = 0;
+        if is_hash(s) {
+            mask |= SIGNAL_HASH;
+        }
+        if has_group_suffix(s) {
+            mask |= SIGNAL_GROUP_SUFFIX;
+        }
+        if s.starts_with(b"OF.") {
+            mask |= SIGNAL_ONLYFANS;
+        }
+        let mut next = 0;
+        scan(s, signal_candidates, |i| {
+            if i < next {
+                return true;
+            }
+            if s[i].is_ascii_digit() {
+                // Candidates arrive in order and a run's first digit is always one, so a
+                // digit at or past `next` starts its run.
+                let run = s[i..].iter().take_while(|b| b.is_ascii_digit()).count();
+                let digits = &s[i..i + run];
+                let after = s.get(i + run).copied();
+                if run == 4 && (digits.starts_with(b"19") || digits.starts_with(b"20")) {
+                    mask |= SIGNAL_YEAR;
+                }
+                if matches!(digits, b"480" | b"576" | b"720" | b"1080" | b"2160")
+                    && matches!(after, Some(b'p' | b'P' | b'i' | b'I'))
+                {
+                    mask |= SIGNAL_RESOLUTION;
+                }
+                if run <= 3
+                    && i > 0
+                    && matches!(s[i - 1], b'S' | b's')
+                    && matches!(after, Some(b'E' | b'e'))
+                    && digit_at(s, i + run + 1)
+                {
+                    mask |= SIGNAL_EPISODE;
+                }
+                next = i + run;
+            } else if (i == 0 || !word(s[i - 1])) && onlyfans_at(s, i) {
+                mask |= SIGNAL_ONLYFANS;
+            }
+            mask & SCANNED != SCANNED
+        });
+        mask
+    }
+
+    /// CategorizationResult::isProtectedMiscResultPhp().
+    fn protected(id: i64, matched_by: &[u8], misc: i64, hashed: i64) -> bool {
+        id == hashed
+            || (id == misc
+                && (matched_by.starts_with(b"hash_")
+                    || matched_by.starts_with(b"obfuscated_")
+                    || matched_by.starts_with(b"gibberish_")
+                    || matched_by == b"group_only_low_signal"))
+    }
+
+    /// `[successful, protected, best_index]` where the best result is folded with
+    /// CategorizationResult::shouldOverridePhp() from the first one (-1 for an empty batch).
+    pub fn result_fold(
+        ids: &[i64],
+        confidences: &[f64],
+        matched_by: &[&[u8]],
+        misc: i64,
+        hashed: i64,
+    ) -> [i64; 3] {
+        let (mut successful, mut protected_count, mut best) = (0i64, 0i64, -1i64);
+        let mut best_protected = false;
+        for (i, ((&id, &confidence), &matched)) in
+            ids.iter().zip(confidences).zip(matched_by).enumerate()
+        {
+            let is_protected = protected(id, matched, misc, hashed);
+            // `!($confidence <= 0)`: NaN counts as successful, as in PHP.
+            let positive = confidence > 0.0 || confidence.is_nan();
+            successful += i64::from(positive && !(id == misc && matched == b"no_match"));
+            protected_count += i64::from(is_protected);
+            let wins = if best < 0 {
+                true
+            } else {
+                let (best_id, best_confidence) = (ids[best as usize], confidences[best as usize]);
+                if id != misc && id != hashed && best_protected && confidence < 0.6 {
+                    false
+                } else if confidence > best_confidence {
+                    true
+                } else if confidence == best_confidence {
+                    id != misc && best_id == misc
+                } else {
+                    false
+                }
+            };
+            if wins {
+                best = i as i64;
+                best_protected = is_protected;
+            }
+        }
+        [successful, protected_count, best]
+    }
+
+    /// The [`MATRIX_WORDS`] comparison of pipeline and legacy category IDs: exact matches,
+    /// mismatches, mismatches within one root, pairs with an ID outside 0-`MAX_CATEGORY_ID`,
+    /// then the row-major pipeline-root by legacy-root counts of the valid pairs.
+    pub fn comparison_matrix(pipeline: &[i64], legacy: &[i64], out: &mut Vec<i64>) {
+        let mut words = [0i64; MATRIX_WORDS];
+        let valid = |id: i64| (0..=MAX_CATEGORY_ID).contains(&id);
+        for (&p, &l) in pipeline.iter().zip(legacy) {
+            if p == l {
+                words[0] += 1;
+            } else {
+                words[1] += 1;
+            }
+            if !valid(p) || !valid(l) {
+                words[3] += 1;
+                continue;
+            }
+            let (pr, lr) = ((p / 1000) as usize, (l / 1000) as usize);
+            words[2] += i64::from(p != l && pr == lr);
+            words[4 + pr * ROOTS + lr] += 1;
+        }
+        out.extend_from_slice(&words);
+    }
+
+    /// Writes the [`PART_SUMMARY_WORDS`] summary of NUL-joined subjects.
+    ///
+    /// # Safety
+    /// `subjects` must be readable for `subjects_len` bytes and `out` writable for `out_cap`
+    /// words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w531_obfuscation_part_count_summary_batch(
+        subjects: *const u8,
+        subjects_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(subjects, subjects_len)];
+        unsafe {
+            run(out, out_cap, count, PART_SUMMARY_WORDS, &inputs, |s, o| {
+                let Some(subjects) = rows(s[0], count) else {
+                    return false;
+                };
+                o.extend_from_slice(&part_summary(subjects));
+                true
+            })
+        }
+    }
+
+    /// Writes one first-matching rule index (or -1) per article; `out_cap` must hold `count`.
+    /// Rules are NUL-joined literals plus an `i64` column table of `rule_count` entries.
+    ///
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w531_blacklist_literal_first_match_batch(
+        literals: *const u8,
+        literals_len: usize,
+        columns: *const u8,
+        columns_len: usize,
+        rule_count: usize,
+        subjects: *const u8,
+        subjects_len: usize,
+        posters: *const u8,
+        posters_len: usize,
+        message_ids: *const u8,
+        message_ids_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [
+            (literals, literals_len),
+            (columns, columns_len),
+            (subjects, subjects_len),
+            (posters, posters_len),
+            (message_ids, message_ids_len),
+        ];
+        unsafe {
+            run(out, out_cap, count, count, &inputs, |s, o| {
+                if rule_count > MAX_RULES {
+                    return false;
+                }
+                let (Some(literals), Some(columns)) =
+                    (rows(s[0], rule_count), i64s(s[1], rule_count))
+                else {
+                    return false;
+                };
+                let (Some(subjects), Some(posters), Some(ids)) =
+                    (rows(s[2], count), rows(s[3], count), rows(s[4], count))
+                else {
+                    return false;
+                };
+                first_literal_matches(&literals, &columns, [&subjects, &posters, &ids], o)
+            })
+        }
+    }
+
+    /// Writes one `SIGNAL_*` mask per NUL-joined release name; `out_cap` must hold `count`.
+    ///
+    /// # Safety
+    /// `names` must be readable for `names_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w531_release_name_signal_batch(
+        names: *const u8,
+        names_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(names, names_len)];
+        unsafe {
+            run(out, out_cap, count, count, &inputs, |s, o| {
+                let Some(names) = rows(s[0], count) else {
+                    return false;
+                };
+                o.extend(names.into_iter().map(release_name_signals));
+                true
+            })
+        }
+    }
+
+    /// Writes the [`RESULT_FOLD_WORDS`] fold of `count` categorization results given as an
+    /// `i64` category table, an `f64` confidence table and NUL-joined `matchedBy` strings.
+    ///
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w531_categorization_result_fold_batch(
+        category_ids: *const u8,
+        category_ids_len: usize,
+        confidences: *const u8,
+        confidences_len: usize,
+        matched_by: *const u8,
+        matched_by_len: usize,
+        count: usize,
+        misc_id: i64,
+        hashed_id: i64,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [
+            (category_ids, category_ids_len),
+            (confidences, confidences_len),
+            (matched_by, matched_by_len),
+        ];
+        unsafe {
+            run(out, out_cap, count, RESULT_FOLD_WORDS, &inputs, |s, o| {
+                let (Some(ids), Some(confidences), Some(matched)) =
+                    (i64s(s[0], count), f64s(s[1], count), rows(s[2], count))
+                else {
+                    return false;
+                };
+                o.extend_from_slice(&result_fold(
+                    &ids,
+                    &confidences,
+                    &matched,
+                    misc_id,
+                    hashed_id,
+                ));
+                true
+            })
+        }
+    }
+
+    /// Writes the [`MATRIX_WORDS`] comparison of `count` (pipeline, legacy) category ID pairs
+    /// read from one `i64` table of `2 * count` entries: the pipeline IDs, then the legacy IDs.
+    ///
+    /// # Safety
+    /// `pairs` must be readable for `pairs_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w531_category_comparison_matrix_batch(
+        pairs: *const u8,
+        pairs_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(pairs, pairs_len)];
+        unsafe {
+            run(out, out_cap, count, MATRIX_WORDS, &inputs, |s, o| {
+                let Some(ids) = i64s(s[0], count * 2) else {
+                    return false;
+                };
+                let (pipeline, legacy) = ids.split_at(count);
+                comparison_matrix(pipeline, legacy, o);
+                true
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn le(values: &[i64]) -> Vec<u8> {
+            values.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+
+        fn lef(values: &[f64]) -> Vec<u8> {
+            values.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+
+        /// Straightforward per-position ports of the PHP patterns, the oracle for the SWAR scans.
+        fn naive_signals(s: &[u8]) -> i64 {
+            let digit = |i: usize| s.get(i).is_some_and(u8::is_ascii_digit);
+            let free = |i: usize| i == 0 || !s[i - 1].is_ascii_digit();
+            let mut mask = 0;
+            if is_hash(s) {
+                mask |= SIGNAL_HASH;
+            }
+            if has_group_suffix(s) {
+                mask |= SIGNAL_GROUP_SUFFIX;
+            }
+            for i in 0..s.len() {
+                if matches!(s[i], b'S' | b's') {
+                    let run = (1..=4).take_while(|&k| digit(i + k)).count();
+                    if (1..=3).contains(&run)
+                        && matches!(s.get(i + 1 + run), Some(b'E' | b'e'))
+                        && digit(i + 2 + run)
+                    {
+                        mask |= SIGNAL_EPISODE;
+                    }
+                }
+                for t in [&b"480"[..], b"576", b"720", b"1080", b"2160"] {
+                    if free(i)
+                        && s[i..].starts_with(t)
+                        && matches!(s.get(i + t.len()), Some(b'p' | b'P' | b'i' | b'I'))
+                    {
+                        mask |= SIGNAL_RESOLUTION;
+                    }
+                }
+                if free(i)
+                    && (s[i..].starts_with(b"19") || s[i..].starts_with(b"20"))
+                    && digit(i + 2)
+                    && digit(i + 3)
+                    && !digit(i + 4)
+                {
+                    mask |= SIGNAL_YEAR;
+                }
+                if (i == 0 || !word(s[i - 1])) && onlyfans_at(s, i) {
+                    mask |= SIGNAL_ONLYFANS;
+                }
+            }
+            if s.starts_with(b"OF.") {
+                mask |= SIGNAL_ONLYFANS;
+            }
+            mask
+        }
+
+        fn naive_part_count(s: &[u8]) -> Option<(i64, i64)> {
+            (0..s.len())
+                .rev()
+                .filter(|&p| s[p] == b'(')
+                .find_map(|p| part_at(&s[p + 1..]))
+        }
+
+        #[test]
+        fn w531_swar_scans_match_naive_oracles() {
+            const ALPHABET: &[u8] = b"0123456789SsEePpIiOoNnLlYyFfAa-_ ./()\x00\xC3\xA9x";
+            let mut seed = 0x5EED_u64;
+            let mut next = |bound: usize| {
+                seed = seed
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (seed >> 33) as usize % bound
+            };
+            for _ in 0..20_000 {
+                let len = next(70);
+                let s: Vec<u8> = (0..len).map(|_| ALPHABET[next(ALPHABET.len())]).collect();
+                assert_eq!(release_name_signals(&s), naive_signals(&s), "{s:?}");
+                assert_eq!(part_count(&s), naive_part_count(&s), "{s:?}");
+                assert_eq!(
+                    scan_subject(&s).0,
+                    s.windows(2).any(|w| w == b" ("),
+                    "{s:?}"
+                );
+                let lowered: Vec<u8> = s.iter().map(|&b| lower(b)).collect();
+                let start = next(len + 1);
+                let end = (start + next(6)).min(len);
+                let needle = &lowered[start..end];
+                let expected =
+                    lowered.windows(needle.len().max(1)).any(|w| w == needle) || needle.is_empty();
+                assert_eq!(contains(&lowered, needle), expected, "{s:?} {needle:?}");
+                assert!(!contains(&lowered, b"\x01\x02"));
+            }
+            for name in [
+                "Show.Only Fans.S01E02",
+                "ONLY_FANS",
+                "xx onlyfans 1999 720p s1e2",
+                // `o`/`n` pairs and digit runs straddling the 8-byte words.
+                "1234567Only Fans",
+                "abcdefgOnlyFans!",
+                "abcdef.oNLY-FANS",
+                "abcdef19990x",
+                "abcdefg1999.720p",
+                "abcdefgs01e02",
+                "abcdef12345678901999 2160i",
+            ] {
+                assert_eq!(
+                    release_name_signals(name.as_bytes()),
+                    naive_signals(name.as_bytes())
+                );
+            }
+        }
+
+        #[test]
+        fn w531_bigram_filter_matches_unfiltered_search() {
+            let long = "Some.Long.Subject.With.Many.Words.About.Things.And.Stuff - \"file.part01.rar\" yEnc (1/99)";
+            let literals: [&[u8]; 5] = [b"zzz", b"PART01", b"x", b"things.and", b"stuff -"];
+            let subjects: [&[u8]; 2] = [long.as_bytes(), b"short"];
+            let empty: [&[u8]; 2] = [b"", b""];
+            for (rule, expected) in [(0, [-1, -1]), (1, [0, -1]), (2, [-1, -1])] {
+                let mut out = Vec::new();
+                assert!(first_literal_matches(
+                    &literals[rule..=rule],
+                    &[1],
+                    [&subjects, &empty, &empty],
+                    &mut out
+                ));
+                assert_eq!(out, expected, "rule {rule}");
+            }
+            let mut out = Vec::new();
+            assert!(first_literal_matches(
+                &literals,
+                &[1, 2, 3, 1, 1],
+                [&subjects, &empty, &empty],
+                &mut out
+            ));
+            assert_eq!(out, [3, -1]);
+            // Stamps wrap after 255 loads without stale bigrams leaking into later articles.
+            let many: Vec<&[u8]> = (0..600)
+                .map(|i| {
+                    if i % 2 == 0 {
+                        long.as_bytes()
+                    } else {
+                        &b"a different subject that is long enough to filter"[..]
+                    }
+                })
+                .collect();
+            let blank = vec![&b""[..]; 600];
+            let mut out = Vec::new();
+            assert!(first_literal_matches(
+                &literals[3..4],
+                &[1],
+                [&many, &blank, &blank],
+                &mut out
+            ));
+            assert!(
+                out.iter()
+                    .enumerate()
+                    .all(|(i, &hit)| hit == if i % 2 == 0 { 0 } else { -1 })
+            );
+        }
+
+        #[test]
+        fn w531_part_counts_take_the_rightmost_match() {
+            assert_eq!(
+                part_count(b"Movie [01/10] - \"a.rar\" yEnc (1/50)"),
+                Some((1, 50))
+            );
+            assert_eq!(part_count(b"x (3/9) y (12/40) z"), Some((12, 40)));
+            assert_eq!(part_count(b"x (3/9) y (12/40 z"), Some((3, 9)));
+            assert_eq!(part_count(b"(000000001/000000002)"), Some((1, 2)));
+            assert_eq!(part_count(b"(1234567890/2)"), None);
+            assert_eq!(part_count(b"(1/1234567890)"), None);
+            assert_eq!(part_count(b"((1/2)"), Some((1, 2)));
+            assert_eq!(part_count(b"(/2)"), None);
+            assert_eq!(part_count(b""), None);
+            let rows: [&[u8]; 5] = [b"a (1/5)", b"b (5/5)", b"c (0/5)", b"d (7/5)", b"plain"];
+            assert_eq!(part_summary(rows), [4, 4, 1, 1, 2, 5]);
+        }
+
+        #[test]
+        fn w531_literal_rules_match_case_insensitively_in_order() {
+            let literals: [&[u8]; 3] = [b"SPAM", b"poster@", b""];
+            let subjects: [&[u8]; 3] = [b"no spam here", b"clean", b"x"];
+            let posters: [&[u8]; 3] = [b"a", b"Poster@host", b"b"];
+            let ids: [&[u8]; 3] = [b"<1>", b"<2>", b"<3>"];
+            let mut out = Vec::new();
+            assert!(first_literal_matches(
+                &literals[..2],
+                &[1, 2],
+                [&subjects, &posters, &ids],
+                &mut out
+            ));
+            assert_eq!(out, [0, 1, -1]);
+            out.clear();
+            assert!(first_literal_matches(
+                &literals,
+                &[3, 3, 3],
+                [&subjects, &posters, &ids],
+                &mut out
+            ));
+            assert_eq!(out, [2, 2, 2]);
+            assert!(!first_literal_matches(
+                &literals[..1],
+                &[4],
+                [&subjects, &posters, &ids],
+                &mut out
+            ));
+            assert!(contains(b"abc", b""));
+            assert!(!contains(b"", b"a"));
+            assert!(contains(b"aab", b"ab"));
+        }
+
+        #[test]
+        fn w531_release_name_signals_match_php_patterns() {
+            assert_eq!(
+                release_name_signals(b"0123456789abcdefABCDEF0123456789"),
+                SIGNAL_HASH
+            );
+            assert_eq!(release_name_signals(&[b'a'; 40]), SIGNAL_HASH);
+            assert_eq!(release_name_signals(&[b'a'; 36]), 0);
+            assert_eq!(
+                release_name_signals(b"Show.S01E02.1080p.WEB.h264-GRP"),
+                SIGNAL_GROUP_SUFFIX | SIGNAL_EPISODE | SIGNAL_RESOLUTION
+            );
+            assert_eq!(
+                release_name_signals(b"Movie.2019.720p-ABCDEFGHIJKLMNOP"),
+                SIGNAL_YEAR | SIGNAL_RESOLUTION
+            );
+            assert_eq!(release_name_signals(b"S1234E5 11080p 120199"), 0);
+            assert_eq!(release_name_signals(b"OF.name"), SIGNAL_ONLYFANS);
+            assert_eq!(release_name_signals(b"site only-fans x"), SIGNAL_ONLYFANS);
+            assert_eq!(release_name_signals(b"xOnlyFans"), 0);
+            assert_eq!(release_name_signals(b"OnlyFans_"), 0);
+            assert_eq!(release_name_signals(b"-ab"), SIGNAL_GROUP_SUFFIX);
+            assert_eq!(release_name_signals(b"ab"), 0);
+        }
+
+        #[test]
+        fn w531_result_fold_follows_should_override() {
+            let (misc, hashed) = (10, 20);
+            let matched: [&[u8]; 4] = [b"no_match", b"hash_md5", b"tv_title", b"movie"];
+            assert_eq!(
+                result_fold(
+                    &[10, 10, 5030, 2040],
+                    &[0.0, 0.5, 0.55, 0.9],
+                    &matched,
+                    misc,
+                    hashed
+                ),
+                [3, 1, 3]
+            );
+            assert_eq!(result_fold(&[], &[], &[], misc, hashed), [0, 0, -1]);
+            let nan: [&[u8]; 2] = [b"a", b"b"];
+            assert_eq!(
+                result_fold(&[10, 5030], &[f64::NAN, 0.5], &nan, misc, hashed),
+                [2, 0, 0]
+            );
+            let tie: [&[u8]; 2] = [b"a", b"b"];
+            assert_eq!(
+                result_fold(&[10, 5030], &[0.5, 0.5], &tie, misc, hashed),
+                [2, 0, 1]
+            );
+        }
+
+        #[test]
+        fn w531_comparison_matrix_counts_roots() {
+            let mut out = Vec::new();
+            comparison_matrix(
+                &[2040, 2040, 5030, -1, 9000],
+                &[2040, 2050, 1000, 5, 9000],
+                &mut out,
+            );
+            assert_eq!(&out[..4], &[2, 3, 1, 2]);
+            assert_eq!(out[4 + 2 * ROOTS + 2], 2);
+            assert_eq!(out[4 + 5 * ROOTS + 1], 1);
+            assert_eq!(out[4..].iter().sum::<i64>(), 3);
+        }
+
+        #[test]
+        fn w531_exports_guard_pointers_capacity_and_counts() {
+            let mut out = [0i64; 128];
+            let p = out.as_mut_ptr();
+            let null = std::ptr::null();
+            unsafe {
+                let subjects = b"a (1/5)\0b (5/5)";
+                assert_eq!(
+                    nntmux_w531_obfuscation_part_count_summary_batch(
+                        subjects.as_ptr(),
+                        subjects.len(),
+                        2,
+                        p,
+                        8
+                    ),
+                    6
+                );
+                assert_eq!(&out[..6], &[2, 2, 1, 1, 0, 5]);
+                assert_eq!(
+                    nntmux_w531_obfuscation_part_count_summary_batch(
+                        subjects.as_ptr(),
+                        subjects.len(),
+                        2,
+                        p,
+                        5
+                    ),
+                    SHORT_CAPACITY
+                );
+                assert_eq!(
+                    nntmux_w531_obfuscation_part_count_summary_batch(
+                        subjects.as_ptr(),
+                        subjects.len(),
+                        3,
+                        p,
+                        8
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w531_obfuscation_part_count_summary_batch(null, 0, 0, p, 6),
+                    6
+                );
+                assert_eq!(
+                    nntmux_w531_obfuscation_part_count_summary_batch(null, 4, 1, p, 6),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w531_obfuscation_part_count_summary_batch(
+                        subjects.as_ptr(),
+                        subjects.len(),
+                        2,
+                        std::ptr::null_mut(),
+                        8
+                    ),
+                    -1
+                );
+                // Misaligned output.
+                assert_eq!(
+                    nntmux_w531_obfuscation_part_count_summary_batch(
+                        subjects.as_ptr(),
+                        subjects.len(),
+                        2,
+                        p.cast::<u8>().add(1).cast::<i64>(),
+                        8
+                    ),
+                    -1
+                );
+
+                let (literals, columns) = (b"spam", le(&[1]));
+                let (subjects, posters, ids) = (b"SPAM\0ok", b"a\0b", b"<1>\0<2>");
+                let call = |cols: &[u8], count: usize, cap: usize, out: *mut i64| {
+                    nntmux_w531_blacklist_literal_first_match_batch(
+                        literals.as_ptr(),
+                        literals.len(),
+                        cols.as_ptr(),
+                        cols.len(),
+                        1,
+                        subjects.as_ptr(),
+                        subjects.len(),
+                        posters.as_ptr(),
+                        posters.len(),
+                        ids.as_ptr(),
+                        ids.len(),
+                        count,
+                        out,
+                        cap,
+                    )
+                };
+                assert_eq!(call(&columns, 2, 8, p), 2);
+                assert_eq!(&out[..2], &[0, -1]);
+                assert_eq!(call(&columns, 2, 1, p), SHORT_CAPACITY);
+                assert_eq!(call(&columns, 1, 8, p), -1);
+                assert_eq!(call(&le(&[0]), 2, 8, p), -1);
+                assert_eq!(call(&le(&[1, 2]), 2, 8, p), -1);
+                assert_eq!(
+                    nntmux_w531_blacklist_literal_first_match_batch(
+                        null, 0, null, 0, 0, null, 0, null, 0, null, 0, 0, p, 0
+                    ),
+                    0
+                );
+
+                let names = b"Show.S01E02-GRP\0x";
+                assert_eq!(
+                    nntmux_w531_release_name_signal_batch(names.as_ptr(), names.len(), 2, p, 2),
+                    2
+                );
+                assert_eq!(&out[..2], &[SIGNAL_GROUP_SUFFIX | SIGNAL_EPISODE, 0]);
+                assert_eq!(
+                    nntmux_w531_release_name_signal_batch(names.as_ptr(), names.len(), 2, p, 1),
+                    SHORT_CAPACITY
+                );
+                assert_eq!(nntmux_w531_release_name_signal_batch(null, 3, 1, p, 2), -1);
+
+                let (rids, confs, matched) =
+                    (le(&[10, 2040]), lef(&[0.0, 0.9]), b"no_match\0movie");
+                let fold = |count: usize, cap: usize| {
+                    nntmux_w531_categorization_result_fold_batch(
+                        rids.as_ptr(),
+                        rids.len(),
+                        confs.as_ptr(),
+                        confs.len(),
+                        matched.as_ptr(),
+                        matched.len(),
+                        count,
+                        10,
+                        20,
+                        p,
+                        cap,
+                    )
+                };
+                assert_eq!(fold(2, 3), 3);
+                assert_eq!(&out[..3], &[1, 0, 1]);
+                assert_eq!(fold(2, 2), SHORT_CAPACITY);
+                assert_eq!(fold(1, 3), -1);
+
+                let pairs = le(&[2040, 5030, 2040, 5040]);
+                let compare = |len: usize, count: usize, cap: usize| {
+                    nntmux_w531_category_comparison_matrix_batch(pairs.as_ptr(), len, count, p, cap)
+                };
+                assert_eq!(compare(32, 2, MATRIX_WORDS), MATRIX_WORDS as isize);
+                assert_eq!(&out[..4], &[1, 1, 1, 0]);
+                assert_eq!(compare(32, 2, MATRIX_WORDS - 1), SHORT_CAPACITY);
+                assert_eq!(compare(24, 2, MATRIX_WORDS), -1);
+                assert_eq!(compare(32, 1, MATRIX_WORDS), -1);
+                assert_eq!(
+                    nntmux_w531_category_comparison_matrix_batch(null, 8, 1, p, MATRIX_WORDS),
+                    -1
+                );
+                // An output window overlapping an input is refused.
+                let mut shared = le(&[0; 96]);
+                let overlap = shared.as_mut_ptr();
+                assert_eq!(
+                    nntmux_w531_category_comparison_matrix_batch(
+                        overlap,
+                        16,
+                        1,
+                        overlap.cast::<i64>(),
+                        MATRIX_WORDS
+                    ),
+                    -1
+                );
+            }
+        }
+    }
+}
