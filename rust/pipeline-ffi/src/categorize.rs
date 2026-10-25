@@ -25200,3 +25200,927 @@ pub mod gdpr_security_registration_models {
         }
     }
 }
+/// Wave 35.3: pure normalization helpers for `CategorizationServiceProvider`,
+/// `ProcessingServiceProvider`, the `Categorization` facade, the `ReleaseNameFixed` event and the
+/// `ReleaseInform` model.
+///
+/// Multi-field string inputs arrive as one buffer of `0x1F`-separated fields and outputs are
+/// `0x1F`-separated. Inputs that embed a `0x1E` byte, have the wrong field count, carry unknown
+/// flag bits or set text for an absent field decline with `-1` so PHP keeps its own
+/// implementation. A result that does not fit returns `-required` without touching `out_buf`.
+pub mod categorization_providers_events_inform {
+    use std::collections::HashSet;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+    use std::str;
+
+    pub const DECLINE: isize = -1;
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+    const FIELD_SEP: u8 = 0x1F;
+    const NULL_MARK: u8 = 0x1E;
+    const TRIM_SET: &[u8] = b" \t\n\r\0\x0B\x0C";
+    const ALIAS_MAX: usize = 64;
+    const INFORM_NAME_MAX_CHARS: usize = 255;
+    const INFORM_TOKEN_MAX: usize = 255;
+
+    const GROUP_IS_STRING: u32 = 1;
+    const CALL_HAS_POSTER: u32 = 2;
+    const CALL_DEBUG: u32 = 4;
+
+    /// `CategorizationPipeline::class` and its container alias.
+    pub const DEFAULT_CATEGORIZATION_CLASS: &[u8] =
+        b"App\\Services\\Categorization\\CategorizationPipeline";
+    pub const DEFAULT_CATEGORIZATION_ALIAS: &[u8] = b"categorization";
+    /// `[PostProcessService::class, ReleaseProcessingService::class]`.
+    pub const DEFAULT_PROCESSING_SERVICES: [&[u8]; 2] = [
+        b"App\\Services\\PostProcessService",
+        b"App\\Services\\ReleaseProcessingService",
+    ];
+
+    unsafe fn valid_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null()
+            || len > MAX_INPUT
+            || len > isize::MAX as usize
+            || (ptr as usize).checked_add(len).is_none()
+        {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn valid_out_buf(out_buf: *mut u8, out_cap: usize) -> bool {
+        !out_buf.is_null()
+            && out_cap <= isize::MAX as usize
+            && (out_buf as usize).checked_add(out_cap).is_some()
+    }
+
+    /// Copies `bytes` into `out_buf`, returning the length or `-required` when it does not fit.
+    unsafe fn write_bytes(bytes: &[u8], out_buf: *mut u8, out_cap: usize) -> isize {
+        if bytes.len() > isize::MAX as usize {
+            return DECLINE;
+        }
+        if bytes.len() > out_cap {
+            return -(bytes.len() as isize);
+        }
+        if !bytes.is_empty() {
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len()) };
+        }
+        bytes.len() as isize
+    }
+
+    fn finish(encoded: Option<Vec<u8>>, out_buf: *mut u8, out_cap: usize) -> isize {
+        match encoded {
+            // Every encoding here has at least three fields, so a one-byte result (which would
+            // collide with DECLINE as "needs one byte") is impossible.
+            Some(bytes) => unsafe { write_bytes(&bytes, out_buf, out_cap) },
+            None => DECLINE,
+        }
+    }
+
+    /// Splits `input` into exactly `N` fields, declining on a wrong count or any null marker.
+    fn split_fields<const N: usize>(input: &[u8]) -> Option<[&[u8]; N]> {
+        if input.contains(&NULL_MARK) {
+            return None;
+        }
+        let mut out: [&[u8]; N] = [&[]; N];
+        let mut parts = input.split(|&b| b == FIELD_SEP);
+        for slot in &mut out {
+            *slot = parts.next()?;
+        }
+        parts.next().is_none().then_some(out)
+    }
+
+    fn encode(fields: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(fields.iter().map(|f| f.len() + 1).sum());
+        for (i, field) in fields.iter().enumerate() {
+            if i > 0 {
+                out.push(FIELD_SEP);
+            }
+            out.extend_from_slice(field);
+        }
+        out
+    }
+
+    #[inline]
+    fn bool_bytes(value: bool) -> &'static [u8] {
+        if value { b"1" } else { b"0" }
+    }
+
+    /// PHP `trim($value, " \t\n\r\0\x0B\x0C")` on bytes.
+    fn trim_ws(value: &[u8]) -> &[u8] {
+        let start = value
+            .iter()
+            .position(|b| !TRIM_SET.contains(b))
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|b| !TRIM_SET.contains(b))
+            .map_or(start, |i| i + 1);
+        &value[start..end]
+    }
+
+    /// PHP `ltrim(trim($value, TRIM), '\\')`.
+    fn normalize_class(value: &[u8]) -> &[u8] {
+        let value = trim_ws(value);
+        let start = value
+            .iter()
+            .position(|&b| b != b'\\')
+            .unwrap_or(value.len());
+        &value[start..]
+    }
+
+    /// PHP `preg_match('/\A[A-Za-z_][A-Za-z0-9_]*(?:\\\\[A-Za-z_][A-Za-z0-9_]*)*\z/', $class)`.
+    pub fn is_valid_class(class: &[u8]) -> bool {
+        !class.is_empty()
+            && class.split(|&b| b == b'\\').all(|segment| {
+                segment
+                    .first()
+                    .is_some_and(|&b| b.is_ascii_alphabetic() || b == b'_')
+                    && segment
+                        .iter()
+                        .all(|&b| b.is_ascii_alphanumeric() || b == b'_')
+            })
+    }
+
+    /// `(short_name, namespace)` split at the last backslash.
+    fn split_class(class: &[u8]) -> (&[u8], &[u8]) {
+        match class.iter().rposition(|&b| b == b'\\') {
+            Some(pos) => (&class[pos + 1..], &class[..pos]),
+            None => (class, &[]),
+        }
+    }
+
+    /// `CategorizationServiceProvider::normalizeBindingMetadataPhp()`:
+    /// `(service_class, alias, short_name, namespace, class_valid, alias_valid, is_default)`.
+    pub fn binding_metadata(service_class: &[u8], alias: &[u8]) -> BindingMetadata {
+        let class = normalize_class(service_class).to_vec();
+        let alias = trim_ws(alias).to_ascii_lowercase();
+        let class_valid = is_valid_class(&class);
+        let alias_valid = alias.len() <= ALIAS_MAX
+            && alias.first().is_some_and(u8::is_ascii_lowercase)
+            && alias.iter().all(|&b| {
+                b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'.' | b'-')
+            });
+        let is_default =
+            class == DEFAULT_CATEGORIZATION_CLASS && alias == DEFAULT_CATEGORIZATION_ALIAS;
+        BindingMetadata {
+            class,
+            alias,
+            class_valid,
+            alias_valid,
+            is_default,
+        }
+    }
+
+    pub struct BindingMetadata {
+        pub class: Vec<u8>,
+        pub alias: Vec<u8>,
+        pub class_valid: bool,
+        pub alias_valid: bool,
+        pub is_default: bool,
+    }
+
+    /// `ProcessingServiceProvider::normalizeServiceRegistryPhp()` for string entries:
+    /// `(services, duplicates, invalid, is_default)`; duplicates compare case-insensitively like
+    /// PHP class names and keep the first spelling.
+    pub fn service_registry<'a>(entries: &[&'a [u8]]) -> (Vec<&'a [u8]>, usize, usize, bool) {
+        let mut services = Vec::with_capacity(entries.len());
+        let mut seen: HashSet<Vec<u8>> = HashSet::with_capacity(entries.len());
+        let (mut duplicates, mut invalid) = (0usize, 0usize);
+        for entry in entries {
+            let class = normalize_class(entry);
+            if !is_valid_class(class) {
+                invalid += 1;
+            } else if seen.insert(class.to_ascii_lowercase()) {
+                services.push(class);
+            } else {
+                duplicates += 1;
+            }
+        }
+        let is_default = services.as_slice() == DEFAULT_PROCESSING_SERVICES.as_slice();
+        (services, duplicates, invalid, is_default)
+    }
+
+    /// PHP group id normalization shared by the facade and the event: positive ints pass, a
+    /// trimmed all-digit string that fits `PHP_INT_MAX` parses, everything else is `0`.
+    pub fn normalize_group(group_int: i64, group_str: Option<&[u8]>) -> i64 {
+        match group_str {
+            None => group_int.max(0),
+            Some(raw) => {
+                let value = trim_ws(raw);
+                if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+                    return 0;
+                }
+                let start = value.iter().position(|&b| b != b'0').unwrap_or(value.len());
+                let digits = &value[start..];
+                if digits.is_empty() || digits.len() > 19 {
+                    return 0;
+                }
+                // Digits are ASCII, so `from_utf8` cannot fail; overflow past i64::MAX is `0`.
+                str::from_utf8(digits)
+                    .ok()
+                    .and_then(|d| d.parse::<i64>().ok())
+                    .unwrap_or(0)
+            }
+        }
+    }
+
+    /// `Categorization::normalizeCategorizeCallArgsPhp()`:
+    /// `(group_id, release_name, poster, debug, has_group, has_poster, name_length, is_valid)`.
+    pub fn categorize_call_args<'a>(
+        group_id: i64,
+        release_name: &'a [u8],
+        poster: Option<&'a [u8]>,
+    ) -> (&'a [u8], &'a [u8], bool, bool) {
+        let name = trim_ws(release_name);
+        let poster = poster.map_or(&[][..], trim_ws);
+        (name, poster, group_id > 0, !poster.is_empty())
+    }
+
+    /// Byte length of the common prefix (PHP `strspn($a ^ $b, "\0")`).
+    fn common_prefix(a: &[u8], b: &[u8]) -> usize {
+        a.iter().zip(b).take_while(|(x, y)| x == y).count()
+    }
+
+    /// `ReleaseNameFixed::summarizeRenameDeltaPhp()` name analysis:
+    /// `(old_name, new_name, changed, case_only, length_delta, common_prefix_length)`.
+    pub fn rename_delta<'a>(
+        old: &'a [u8],
+        new: &'a [u8],
+    ) -> (&'a [u8], &'a [u8], bool, bool, i64, usize) {
+        let old = trim_ws(old);
+        let new = trim_ws(new);
+        let changed = old != new;
+        let case_only = changed && old.eq_ignore_ascii_case(new);
+        (
+            old,
+            new,
+            changed,
+            case_only,
+            new.len() as i64 - old.len() as i64,
+            common_prefix(old, new),
+        )
+    }
+
+    /// `ReleaseInform::normalizeInformRecordPhp()`:
+    /// `(relOName, relPName, api_token, names_fit, token_valid, is_rename, is_valid)`.
+    pub fn inform_record<'a>(
+        rel_o: &'a [u8],
+        rel_p: &'a [u8],
+        token: &'a [u8],
+    ) -> (&'a [u8], &'a [u8], &'a [u8], bool, bool, bool, bool) {
+        let rel_o = trim_ws(rel_o);
+        let rel_p = trim_ws(rel_p);
+        let token = trim_ws(token);
+        let fits = |name: &[u8]| {
+            !name.is_empty()
+                && str::from_utf8(name).is_ok_and(|s| s.chars().count() <= INFORM_NAME_MAX_CHARS)
+        };
+        let names_fit = fits(rel_o) && fits(rel_p);
+        let token_valid = !token.is_empty()
+            && token.len() <= INFORM_TOKEN_MAX
+            && token.iter().all(u8::is_ascii_alphanumeric);
+        let is_rename = rel_o != rel_p;
+        (
+            rel_o,
+            rel_p,
+            token,
+            names_fit,
+            token_valid,
+            is_rename,
+            names_fit && token_valid && is_rename,
+        )
+    }
+
+    fn binding_encode(input: &[u8]) -> Option<Vec<u8>> {
+        let [class, alias] = split_fields::<2>(input)?;
+        let meta = binding_metadata(class, alias);
+        let (short, namespace) = split_class(&meta.class);
+        Some(encode(&[
+            &meta.class,
+            &meta.alias,
+            short,
+            namespace,
+            bool_bytes(meta.class_valid),
+            bool_bytes(meta.alias_valid),
+            bool_bytes(meta.is_default),
+        ]))
+    }
+
+    fn registry_encode(count: usize, input: &[u8]) -> Option<Vec<u8>> {
+        if input.contains(&NULL_MARK) {
+            return None;
+        }
+        let entries: Vec<&[u8]> = if count == 0 {
+            if !input.is_empty() {
+                return None;
+            }
+            Vec::new()
+        } else {
+            let entries: Vec<&[u8]> = input.split(|&b| b == FIELD_SEP).collect();
+            if entries.len() != count {
+                return None;
+            }
+            entries
+        };
+        let (services, duplicates, invalid, is_default) = service_registry(&entries);
+        let (n, d, i) = (
+            services.len().to_string(),
+            duplicates.to_string(),
+            invalid.to_string(),
+        );
+        let mut fields: Vec<&[u8]> = Vec::with_capacity(4 + services.len() * 2);
+        fields.extend_from_slice(&[
+            n.as_bytes(),
+            d.as_bytes(),
+            i.as_bytes(),
+            bool_bytes(is_default),
+        ]);
+        for service in &services {
+            fields.push(service);
+            fields.push(split_class(service).0);
+        }
+        Some(encode(&fields))
+    }
+
+    fn call_args_encode(flags: u32, group_id: i64, input: &[u8]) -> Option<Vec<u8>> {
+        if flags & !(GROUP_IS_STRING | CALL_HAS_POSTER | CALL_DEBUG) != 0 {
+            return None;
+        }
+        let [group_str, name, poster] = split_fields::<3>(input)?;
+        let group_is_string = flags & GROUP_IS_STRING != 0;
+        let has_poster = flags & CALL_HAS_POSTER != 0;
+        if (!group_is_string && !group_str.is_empty()) || (!has_poster && !poster.is_empty()) {
+            return None;
+        }
+        let group = normalize_group(group_id, group_is_string.then_some(group_str));
+        let (name, poster, has_group, poster_present) =
+            categorize_call_args(group, name, has_poster.then_some(poster));
+        let (group, length) = (group.to_string(), name.len().to_string());
+        Some(encode(&[
+            group.as_bytes(),
+            name,
+            poster,
+            bool_bytes(flags & CALL_DEBUG != 0),
+            bool_bytes(has_group),
+            bool_bytes(poster_present),
+            length.as_bytes(),
+            bool_bytes(!name.is_empty()),
+        ]))
+    }
+
+    fn rename_encode(
+        flags: u32,
+        release_id: i64,
+        old_category_id: i64,
+        group_id: i64,
+        input: &[u8],
+    ) -> Option<Vec<u8>> {
+        if flags & !GROUP_IS_STRING != 0 {
+            return None;
+        }
+        let [group_str, old, new] = split_fields::<3>(input)?;
+        let group_is_string = flags & GROUP_IS_STRING != 0;
+        if !group_is_string && !group_str.is_empty() {
+            return None;
+        }
+        let group = normalize_group(group_id, group_is_string.then_some(group_str));
+        let (old, new, changed, case_only, delta, prefix) = rename_delta(old, new);
+        let valid = release_id > 0 && !new.is_empty() && changed;
+        let (id, category, group, delta, prefix) = (
+            release_id.to_string(),
+            old_category_id.to_string(),
+            group.to_string(),
+            delta.to_string(),
+            prefix.to_string(),
+        );
+        Some(encode(&[
+            id.as_bytes(),
+            old,
+            new,
+            category.as_bytes(),
+            group.as_bytes(),
+            bool_bytes(changed),
+            bool_bytes(case_only),
+            delta.as_bytes(),
+            prefix.as_bytes(),
+            bool_bytes(valid),
+        ]))
+    }
+
+    fn inform_encode(input: &[u8]) -> Option<Vec<u8>> {
+        let [rel_o, rel_p, token] = split_fields::<3>(input)?;
+        let (rel_o, rel_p, token, fits, token_valid, rename, valid) =
+            inform_record(rel_o, rel_p, token);
+        Some(encode(&[
+            rel_o,
+            rel_p,
+            token,
+            bool_bytes(fits),
+            bool_bytes(token_valid),
+            bool_bytes(rename),
+            bool_bytes(valid),
+        ]))
+    }
+
+    /// `CategorizationServiceProvider::normalizeBindingMetadata()`; input is `service_class`,
+    /// `alias`.
+    ///
+    /// # Safety
+    /// Non-null input pointers must be readable for their lengths and `out_buf` writable for
+    /// `out_cap` bytes; null or oversized buffers decline with `-1`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_categorization_service_provider_binding_metadata(
+        input_ptr: *const u8,
+        input_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(input) = (unsafe { valid_slice(input_ptr, input_len) }) else {
+                return DECLINE;
+            };
+            finish(binding_encode(input), out_buf, out_cap)
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `ProcessingServiceProvider::normalizeServiceRegistry()`; input is `count` string entries
+    /// (empty when `count` is `0`). Output is `count`, `duplicates`, `invalid`, `is_default`,
+    /// then a `service`, `short_name` pair per kept entry.
+    ///
+    /// # Safety
+    /// Non-null input pointers must be readable for their lengths and `out_buf` writable for
+    /// `out_cap` bytes; null or oversized buffers decline with `-1`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_processing_service_provider_normalize_registry(
+        count: usize,
+        input_ptr: *const u8,
+        input_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) || count > MAX_INPUT {
+                return DECLINE;
+            }
+            let Some(input) = (unsafe { valid_slice(input_ptr, input_len) }) else {
+                return DECLINE;
+            };
+            finish(registry_encode(count, input), out_buf, out_cap)
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `Categorization::normalizeCategorizeCallArgs()`; input is `group_id` (string form),
+    /// `release_name`, `poster`. `flags` bit 0 marks a string group id (otherwise `group_id` is
+    /// used and the string field must be empty), bit 1 a non-null poster (otherwise empty) and
+    /// bit 2 debug mode.
+    ///
+    /// # Safety
+    /// Non-null input pointers must be readable for their lengths and `out_buf` writable for
+    /// `out_cap` bytes; null or oversized buffers decline with `-1`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_categorization_normalize_call_args(
+        flags: u32,
+        group_id: i64,
+        input_ptr: *const u8,
+        input_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(input) = (unsafe { valid_slice(input_ptr, input_len) }) else {
+                return DECLINE;
+            };
+            finish(call_args_encode(flags, group_id, input), out_buf, out_cap)
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `ReleaseNameFixed::summarizeRenameDelta()`; input is `group_id` (string form), `old_name`,
+    /// `new_name`. `flags` bit 0 marks a string group id.
+    ///
+    /// # Safety
+    /// Non-null input pointers must be readable for their lengths and `out_buf` writable for
+    /// `out_cap` bytes; null or oversized buffers decline with `-1`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_release_name_fixed_summarize_delta(
+        flags: u32,
+        release_id: i64,
+        old_category_id: i64,
+        group_id: i64,
+        input_ptr: *const u8,
+        input_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(input) = (unsafe { valid_slice(input_ptr, input_len) }) else {
+                return DECLINE;
+            };
+            finish(
+                rename_encode(flags, release_id, old_category_id, group_id, input),
+                out_buf,
+                out_cap,
+            )
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `ReleaseInform::normalizeInformRecord()`; input is `relOName`, `relPName`, `api_token`.
+    ///
+    /// # Safety
+    /// Non-null input pointers must be readable for their lengths and `out_buf` writable for
+    /// `out_cap` bytes; null or oversized buffers decline with `-1`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_release_inform_normalize_record(
+        input_ptr: *const u8,
+        input_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(input) = (unsafe { valid_slice(input_ptr, input_len) }) else {
+                return DECLINE;
+            };
+            finish(inform_encode(input), out_buf, out_cap)
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::ptr;
+
+        fn call(f: impl Fn(*mut u8, usize) -> isize) -> Result<Vec<u8>, isize> {
+            let mut buf = vec![0u8; 1024];
+            let rc = f(buf.as_mut_ptr(), buf.len());
+            if rc < 0 {
+                return Err(rc);
+            }
+            buf.truncate(rc as usize);
+            Ok(buf)
+        }
+
+        fn fields(out: &[u8]) -> Vec<String> {
+            out.split(|&b| b == FIELD_SEP)
+                .map(|f| String::from_utf8_lossy(f).into_owned())
+                .collect()
+        }
+
+        #[test]
+        fn binding_rules() {
+            let m = binding_metadata(
+                b" \\App\\Services\\Categorization\\CategorizationPipeline ",
+                b" Categorization ",
+            );
+            assert_eq!(m.class, DEFAULT_CATEGORIZATION_CLASS);
+            assert_eq!(m.alias, b"categorization");
+            assert!(m.class_valid && m.alias_valid && m.is_default);
+            assert_eq!(
+                split_class(&m.class),
+                (
+                    &b"CategorizationPipeline"[..],
+                    &b"App\\Services\\Categorization"[..]
+                )
+            );
+            let m = binding_metadata(b"App\\\\Bad", b"1alias");
+            assert!(!m.class_valid && !m.alias_valid && !m.is_default);
+            assert!(!binding_metadata(b"9Lead", b"a").class_valid);
+            assert!(!binding_metadata(b"Trailing\\", b"a").class_valid);
+            assert!(!binding_metadata(b"", b"").alias_valid);
+            assert!(binding_metadata(b"_X\\Y_1", b"a.b-c_9").alias_valid);
+            assert!(!binding_metadata(b"X", &[b'a'; 65]).alias_valid);
+            assert!(!binding_metadata("Ünï".as_bytes(), b"a").class_valid);
+            assert_eq!(split_class(b"Plain"), (&b"Plain"[..], &b""[..]));
+        }
+
+        #[test]
+        fn registry_rules() {
+            let entries: [&[u8]; 6] = [
+                b"\\App\\Services\\PostProcessService",
+                b"app\\services\\postprocessservice",
+                b" App\\Services\\ReleaseProcessingService ",
+                b"",
+                b"Bad Name",
+                b"App\\Other",
+            ];
+            let (services, dup, invalid, default) = service_registry(&entries);
+            assert_eq!(services.len(), 3);
+            assert_eq!((dup, invalid, default), (1, 2, false));
+            let (_, _, _, default) = service_registry(&entries[..3]);
+            assert!(default);
+            assert_eq!(service_registry(&[]).0.len(), 0);
+        }
+
+        #[test]
+        fn group_and_call_rules() {
+            assert_eq!(normalize_group(5, None), 5);
+            assert_eq!(normalize_group(-5, None), 0);
+            assert_eq!(normalize_group(i64::MIN, None), 0);
+            assert_eq!(normalize_group(0, Some(b" 0042 ")), 42);
+            assert_eq!(normalize_group(0, Some(b"000")), 0);
+            assert_eq!(normalize_group(0, Some(b"9223372036854775807")), i64::MAX);
+            assert_eq!(normalize_group(0, Some(b"9223372036854775808")), 0);
+            assert_eq!(normalize_group(0, Some(b"-1")), 0);
+            assert_eq!(normalize_group(0, Some(b"+1")), 0);
+            assert_eq!(normalize_group(0, Some(b"1e3")), 0);
+            assert_eq!(normalize_group(0, Some(b"")), 0);
+            let mut long = vec![b'0'; 40];
+            long.push(b'7');
+            assert_eq!(normalize_group(0, Some(&long)), 7);
+
+            let (name, poster, has_group, has_poster) =
+                categorize_call_args(3, b"  Some.Release-GRP\n", None);
+            assert_eq!((name, poster), (&b"Some.Release-GRP"[..], &b""[..]));
+            assert!(has_group && !has_poster);
+            assert!(categorize_call_args(0, b"x", Some(b" p ")).3);
+        }
+
+        #[test]
+        fn rename_and_inform_rules() {
+            let (old, new, changed, case_only, delta, prefix) =
+                rename_delta(b" Old.Name ", b"Old.Name.REPACK");
+            assert_eq!((old, new), (&b"Old.Name"[..], &b"Old.Name.REPACK"[..]));
+            assert!(changed && !case_only);
+            assert_eq!((delta, prefix), (7, 8));
+            let r = rename_delta(b"abc", b"ABC");
+            assert!(r.2 && r.3);
+            assert_eq!(r.5, 0);
+            let r = rename_delta(b"same", b" same ");
+            assert!(!r.2 && !r.3);
+
+            let r = inform_record(b" Obf.Name ", b"Proper.Name", b" abc123 ");
+            assert_eq!(
+                (r.0, r.1, r.2),
+                (&b"Obf.Name"[..], &b"Proper.Name"[..], &b"abc123"[..])
+            );
+            assert!(r.3 && r.4 && r.5 && r.6);
+            assert!(!inform_record(b"a", b"a", b"t").6);
+            assert!(!inform_record(b"a", b"b", b"t-1").4);
+            assert!(!inform_record(b"\xff", b"b", b"t").3);
+            let long = "é".repeat(255);
+            assert!(inform_record(long.as_bytes(), b"b", b"t").3);
+            let long = "é".repeat(256);
+            assert!(!inform_record(long.as_bytes(), b"b", b"t").3);
+        }
+
+        #[test]
+        fn exports_encode_fields() {
+            let input =
+                b"\\App\\Services\\Categorization\\CategorizationPipeline\x1Fcategorization";
+            let out = call(|b, c| unsafe {
+                nntmux_categorization_service_provider_binding_metadata(
+                    input.as_ptr(),
+                    input.len(),
+                    b,
+                    c,
+                )
+            })
+            .unwrap();
+            assert_eq!(
+                fields(&out),
+                [
+                    "App\\Services\\Categorization\\CategorizationPipeline",
+                    "categorization",
+                    "CategorizationPipeline",
+                    "App\\Services\\Categorization",
+                    "1",
+                    "1",
+                    "1"
+                ]
+            );
+
+            let input = b"App\\A\x1Fapp\\a\x1F1bad";
+            let out = call(|b, c| unsafe {
+                nntmux_processing_service_provider_normalize_registry(
+                    3,
+                    input.as_ptr(),
+                    input.len(),
+                    b,
+                    c,
+                )
+            })
+            .unwrap();
+            assert_eq!(fields(&out), ["1", "1", "1", "0", "App\\A", "A"]);
+            let empty = b"";
+            let out = call(|b, c| unsafe {
+                nntmux_processing_service_provider_normalize_registry(0, empty.as_ptr(), 0, b, c)
+            })
+            .unwrap();
+            assert_eq!(fields(&out), ["0", "0", "0", "0"]);
+
+            let input = b" 12 \x1F Name \x1Fposter";
+            let out = call(|b, c| unsafe {
+                nntmux_categorization_normalize_call_args(7, 0, input.as_ptr(), input.len(), b, c)
+            })
+            .unwrap();
+            assert_eq!(
+                fields(&out),
+                ["12", "Name", "poster", "1", "1", "1", "4", "1"]
+            );
+
+            let input = b"\x1Fold\x1Fnew";
+            let out = call(|b, c| unsafe {
+                nntmux_release_name_fixed_summarize_delta(
+                    0,
+                    9,
+                    5000,
+                    -3,
+                    input.as_ptr(),
+                    input.len(),
+                    b,
+                    c,
+                )
+            })
+            .unwrap();
+            assert_eq!(
+                fields(&out),
+                ["9", "old", "new", "5000", "0", "1", "0", "0", "0", "1"]
+            );
+
+            let input = b"o\x1Fp\x1Ftok";
+            let out = call(|b, c| unsafe {
+                nntmux_release_inform_normalize_record(input.as_ptr(), input.len(), b, c)
+            })
+            .unwrap();
+            assert_eq!(fields(&out), ["o", "p", "tok", "1", "1", "1", "1"]);
+        }
+
+        #[test]
+        fn exports_reject_malformed_input_and_respect_capacity() {
+            let input = b"o\x1Fp\x1Ftok";
+            let mut small = [b'Z'; 4];
+            let rc = unsafe {
+                nntmux_release_inform_normalize_record(
+                    input.as_ptr(),
+                    input.len(),
+                    small.as_mut_ptr(),
+                    small.len(),
+                )
+            };
+            assert!(rc < DECLINE);
+            assert_eq!(small, [b'Z'; 4]);
+            let mut big = vec![0u8; (-rc) as usize];
+            let rc2 = unsafe {
+                nntmux_release_inform_normalize_record(
+                    input.as_ptr(),
+                    input.len(),
+                    big.as_mut_ptr(),
+                    big.len(),
+                )
+            };
+            assert_eq!(rc2, -rc);
+
+            for bad in [&b"only"[..], b"a\x1Fb\x1Fc", b"a\x1E\x1Fb"] {
+                assert_eq!(
+                    call(|b, c| unsafe {
+                        nntmux_categorization_service_provider_binding_metadata(
+                            bad.as_ptr(),
+                            bad.len(),
+                            b,
+                            c,
+                        )
+                    }),
+                    Err(DECLINE)
+                );
+            }
+            for (count, bad) in [(0usize, &b"x"[..]), (2, b"x"), (1, b"x\x1Fy"), (1, b"\x1E")] {
+                assert_eq!(
+                    call(|b, c| unsafe {
+                        nntmux_processing_service_provider_normalize_registry(
+                            count,
+                            bad.as_ptr(),
+                            bad.len(),
+                            b,
+                            c,
+                        )
+                    }),
+                    Err(DECLINE)
+                );
+            }
+            for (flags, bad) in [
+                (0u32, &b"1\x1Fn\x1F"[..]),
+                (0, b"\x1Fn\x1Fp"),
+                (8, b"\x1Fn\x1F"),
+                (0, b"\x1Fn"),
+                (0, b"\x1Fn\x1E\x1F"),
+            ] {
+                assert_eq!(
+                    call(|b, c| unsafe {
+                        nntmux_categorization_normalize_call_args(
+                            flags,
+                            0,
+                            bad.as_ptr(),
+                            bad.len(),
+                            b,
+                            c,
+                        )
+                    }),
+                    Err(DECLINE)
+                );
+            }
+            for (flags, bad) in [
+                (0u32, &b"1\x1Fa\x1Fb"[..]),
+                (2, b"\x1Fa\x1Fb"),
+                (0, b"\x1Fa"),
+            ] {
+                assert_eq!(
+                    call(|b, c| unsafe {
+                        nntmux_release_name_fixed_summarize_delta(
+                            flags,
+                            1,
+                            1,
+                            1,
+                            bad.as_ptr(),
+                            bad.len(),
+                            b,
+                            c,
+                        )
+                    }),
+                    Err(DECLINE)
+                );
+            }
+            assert_eq!(
+                call(|b, c| unsafe {
+                    nntmux_release_inform_normalize_record(b"a\x1Fb".as_ptr(), 3, b, c)
+                }),
+                Err(DECLINE)
+            );
+
+            unsafe {
+                let (b, c) = (big.as_mut_ptr(), big.len());
+                assert_eq!(
+                    nntmux_categorization_service_provider_binding_metadata(ptr::null(), 0, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_processing_service_provider_normalize_registry(0, ptr::null(), 0, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_categorization_normalize_call_args(0, 0, ptr::null(), 0, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_release_name_fixed_summarize_delta(0, 0, 0, 0, ptr::null(), 0, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_release_inform_normalize_record(ptr::null(), 0, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_release_inform_normalize_record(
+                        input.as_ptr(),
+                        input.len(),
+                        ptr::null_mut(),
+                        64
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_release_inform_normalize_record(input.as_ptr(), MAX_INPUT + 1, b, c),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_release_inform_normalize_record(
+                        input.as_ptr(),
+                        input.len(),
+                        b,
+                        isize::MAX as usize + 1
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_processing_service_provider_normalize_registry(
+                        MAX_INPUT + 1,
+                        input.as_ptr(),
+                        input.len(),
+                        b,
+                        c
+                    ),
+                    DECLINE
+                );
+            }
+        }
+    }
+}
