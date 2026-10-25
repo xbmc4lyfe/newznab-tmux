@@ -360,4 +360,129 @@ class AdminCategoryController extends BasePageController
 
         return $ffi;
     }
+
+    /**
+     * PHP remains the default: the paired benchmark in
+     * tests/Unit/RustAdminRegexCategoryGroupReleaseW39ParityTest.php is below 1.5x.
+     */
+    public const bool W391_RUST_FFI_DEFAULT = false;
+
+    private const array W391_HIERARCHY_KEYS = ['categories', 'invalid_rows', 'missing_ids', 'roots', 'children', 'active', 'disabled', 'size_anomalies', 'duplicate_titles'];
+
+    private static ?bool $w391UseRustFfi = null;
+
+    private static FFI|false|null $w391Ffi = null;
+
+    /**
+     * Summarizes category rows (`id`, `title`, `root_categories_id`, `status`, `minsizetoformrelease`,
+     * `maxsizetoformrelease`): missing ids, root (no positive parent) vs child rows, active vs inactive/disabled
+     * status, `minsize > maxsize && maxsize > 0` anomalies and titles repeated case-insensitively under one parent.
+     * `parent_ids` lists the distinct positive parent ids ascending; `child_counts` aligns with it.
+     *
+     * @param  array<array-key, mixed>  $categories
+     * @return array<string, int|list<int>>
+     */
+    public static function planCategoryHierarchySummary(array $categories): array
+    {
+        return (self::usesW391RustFfi() ? self::planCategoryHierarchySummaryNative($categories) : null) ?? self::planCategoryHierarchySummaryPhp($categories);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $categories
+     * @return array<string, int|list<int>>
+     */
+    private static function planCategoryHierarchySummaryPhp(array $categories): array
+    {
+        $summary = array_fill_keys(self::W391_HIERARCHY_KEYS, 0);
+        $summary['categories'] = count($categories);
+        $parents = [];
+        $titles = [];
+        foreach ($categories as $row) {
+            if (! is_array($row)) {
+                $summary['invalid_rows']++;
+
+                continue;
+            }
+            $id = AdminBlacklistController::w391Int($row['id'] ?? null);
+            if ($id === null || $id <= 0) {
+                $summary['missing_ids']++;
+            }
+            $parent = AdminBlacklistController::w391Int($row['root_categories_id'] ?? null) ?? 0;
+            if ($parent > 0) {
+                $summary['children']++;
+                $parents[$parent] = ($parents[$parent] ?? 0) + 1;
+            } else {
+                $summary['roots']++;
+            }
+            $status = AdminBlacklistController::w391Int($row['status'] ?? null);
+            if ($status === Category::STATUS_ACTIVE) {
+                $summary['active']++;
+            } elseif ($status === Category::STATUS_INACTIVE || $status === Category::STATUS_DISABLED) {
+                $summary['disabled']++;
+            }
+            $min = AdminBlacklistController::w391Int($row['minsizetoformrelease'] ?? null) ?? 0;
+            $max = AdminBlacklistController::w391Int($row['maxsizetoformrelease'] ?? null) ?? 0;
+            if ($max > 0 && $min > $max) {
+                $summary['size_anomalies']++;
+            }
+            $title = $row['title'] ?? null;
+            if (is_string($title)) {
+                $key = $parent.':'.strtolower($title);
+                if (isset($titles[$key])) {
+                    $summary['duplicate_titles']++;
+                } else {
+                    $titles[$key] = true;
+                }
+            }
+        }
+        ksort($parents);
+        $summary['parent_ids'] = array_keys($parents);
+        $summary['child_counts'] = array_values($parents);
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $categories
+     * @return array<string, int|list<int>>|null
+     */
+    private static function planCategoryHierarchySummaryNative(array $categories): ?array
+    {
+        $words = [count($categories)];
+        $blob = [];
+        foreach ($categories as $row) {
+            if (is_array($row)) {
+                AdminBlacklistController::w391PackRow($words, $blob, [$row['id'] ?? null, $row['title'] ?? null, $row['root_categories_id'] ?? null,
+                    $row['status'] ?? null, $row['minsizetoformrelease'] ?? null, $row['maxsizetoformrelease'] ?? null]);
+            } else {
+                $words[] = 0;
+            }
+        }
+        $values = AdminBlacklistController::w391Invoke(self::$w391Ffi, 2, $words, $blob);
+        $fixed = count(self::W391_HIERARCHY_KEYS);
+        if ($values === null || count($values) < $fixed + 1 || $values[$fixed] < 0 || count($values) !== $fixed + 1 + 2 * $values[$fixed]) {
+            return null;
+        }
+        $summary = array_combine(self::W391_HIERARCHY_KEYS, array_slice($values, 0, $fixed));
+        $summary['parent_ids'] = array_slice($values, $fixed + 1, $values[$fixed]);
+        $summary['child_counts'] = array_slice($values, $fixed + 1 + $values[$fixed]);
+
+        return $summary;
+    }
+
+    public static function useW391RustFfi(?bool $enabled): void
+    {
+        self::$w391UseRustFfi = $enabled;
+    }
+
+    public static function usesW391RustFfi(): bool
+    {
+        return self::$w391UseRustFfi ?? self::W391_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW391RustFfi(): void
+    {
+        self::$w391UseRustFfi = null;
+        self::$w391Ffi = null;
+    }
 }

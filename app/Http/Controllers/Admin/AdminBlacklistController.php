@@ -295,4 +295,247 @@ class AdminBlacklistController extends BasePageController
     {
         return self::wave28Native(1, []) ?? self::optionMetadataPhp();
     }
+
+    public const string W391_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w391_admin_regex_category_release_blacklist(uint32_t operation, uint32_t flags, const char *input, size_t input_len, char *out_buf, size_t out_cap);
+        C;
+
+    /**
+     * Rust is the default for summarizeBlacklistRuleHealth(): the paired benchmark in
+     * tests/Unit/RustAdminRegexCategoryGroupReleaseW39ParityTest.php clears 1.5x on every workload.
+     */
+    public const bool W391_RUST_FFI_DEFAULT = true;
+
+    private const int W391_RUST_MAX_INPUT = 16_777_216;
+
+    private const array W391_RULE_KEYS = ['rules', 'invalid_rows', 'active', 'disabled', 'subject', 'poster', 'message_id', 'unknown_column', 'invalid_regex', 'stale',
+        'never_active'];
+
+    private static ?bool $w391UseRustFfi = null;
+
+    private static FFI|false|null $w391Ffi = null;
+
+    /**
+     * Audits binary blacklist rule rows (`status`, `msgcol`, `regex`, `last_activity`): active (status 1) vs other rules,
+     * the subject/poster/message-id target columns, regexes that are empty or would break BlacklistService's
+     * `'/'.$regex.'/i'` wrapping, and last activity at least `$staleDays` old (`never_active` when absent).
+     * `$nowUnix` <= 0 uses the current time.
+     *
+     * @param  array<array-key, mixed>  $rules
+     * @return array<string, int>
+     */
+    public static function summarizeBlacklistRuleHealth(array $rules, int $nowUnix = 0, int $staleDays = 90): array
+    {
+        $now = $nowUnix > 0 ? $nowUnix : time();
+
+        return (self::usesW391RustFfi() ? self::summarizeBlacklistRuleHealthNative($rules, $now, $staleDays) : null)
+            ?? self::summarizeBlacklistRuleHealthPhp($rules, $now, $staleDays);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rules
+     * @return array<string, int>
+     */
+    private static function summarizeBlacklistRuleHealthPhp(array $rules, int $now, int $staleDays): array
+    {
+        $now = max(0, $now);
+        $threshold = $staleDays <= 0 ? 0 : ($staleDays > intdiv(PHP_INT_MAX, 86_400) ? PHP_INT_MAX : $staleDays * 86_400);
+        $summary = array_fill_keys(self::W391_RULE_KEYS, 0);
+        $summary['rules'] = count($rules);
+        foreach ($rules as $rule) {
+            if (! is_array($rule)) {
+                $summary['invalid_rows']++;
+
+                continue;
+            }
+            $summary[self::w391Int($rule['status'] ?? null) === 1 ? 'active' : 'disabled']++;
+            $summary[match (self::w391Int($rule['msgcol'] ?? null)) {
+                BlacklistConstants::BLACKLIST_FIELD_SUBJECT => 'subject',
+                BlacklistConstants::BLACKLIST_FIELD_FROM => 'poster',
+                BlacklistConstants::BLACKLIST_FIELD_MESSAGEID => 'message_id',
+                default => 'unknown_column',
+            }]++;
+            $regex = $rule['regex'] ?? null;
+            if (! is_string($regex) || $regex === '' || self::w391BreaksSlashDelimiter($regex)) {
+                $summary['invalid_regex']++;
+            }
+            $last = self::w391Timestamp($rule['last_activity'] ?? null);
+            if ($last === null) {
+                $summary['never_active']++;
+            } elseif ($now - $last >= $threshold) {
+                $summary['stale']++;
+            }
+        }
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rules
+     * @return array<string, int>|null
+     */
+    private static function summarizeBlacklistRuleHealthNative(array $rules, int $now, int $staleDays): ?array
+    {
+        $words = [$now, $staleDays, count($rules)];
+        $blob = [];
+        foreach ($rules as $rule) {
+            if (is_array($rule)) {
+                self::w391PackRow($words, $blob, [$rule['status'] ?? null, $rule['msgcol'] ?? null, $rule['regex'] ?? null, $rule['last_activity'] ?? null]);
+            } else {
+                $words[] = 0;
+            }
+        }
+        $values = self::w391Invoke(self::$w391Ffi, 4, $words, $blob);
+
+        return $values !== null && count($values) === count(self::W391_RULE_KEYS) ? array_combine(self::W391_RULE_KEYS, $values) : null;
+    }
+
+    /** An unescaped `/` or a trailing lone backslash would end the `'/'.$regex.'/i'` pattern early. */
+    private static function w391BreaksSlashDelimiter(string $regex): bool
+    {
+        return strpbrk($regex, '/\\') !== false && preg_match('~\A(?:[^/\\\\]++|\\\\.)*+\z~s', $regex) !== 1;
+    }
+
+    public static function useW391RustFfi(?bool $enabled): void
+    {
+        self::$w391UseRustFfi = $enabled;
+    }
+
+    public static function usesW391RustFfi(): bool
+    {
+        return self::$w391UseRustFfi ?? self::W391_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW391RustFfi(): void
+    {
+        self::$w391UseRustFfi = null;
+        self::$w391Ffi = null;
+    }
+
+    /**
+     * Wave 39.1 integer reading shared by the admin audit helpers: an int, or a string of an optional `-` and
+     * 1-18 ASCII digits; anything else (floats, bools, other strings) is null.
+     */
+    public static function w391Int(mixed $value): ?int
+    {
+        if (is_int($value)) {
+            return $value;
+        }
+        if (! is_string($value)) {
+            return null;
+        }
+        $digits = $value !== '' && $value[0] === '-' ? substr($value, 1) : $value;
+        $length = strlen($digits);
+
+        return $length >= 1 && $length <= 18 && strspn($digits, '0123456789') === $length ? (int) $value : null;
+    }
+
+    /**
+     * A non-negative int, or a `YYYY-MM-DD[ HH:MM:SS]` string read as UTC (year 1970+, month 1-12, day 1-31,
+     * time fields in range; days past a month's end roll over arithmetically).
+     */
+    public static function w391Timestamp(mixed $value): ?int
+    {
+        if (is_int($value)) {
+            return $value >= 0 ? $value : null;
+        }
+        $length = is_string($value) ? strlen($value) : 0;
+        if (! is_string($value) || ($length !== 10 && $length !== 19)) {
+            return null;
+        }
+        $long = $length === 19;
+        if ($value[4] !== '-' || $value[7] !== '-' || ($long && ($value[10] !== ' ' || $value[13] !== ':' || $value[16] !== ':'))) {
+            return null;
+        }
+        $digits = substr($value, 0, 4).substr($value, 5, 2).substr($value, 8, 2).($long ? substr($value, 11, 2).substr($value, 14, 2).substr($value, 17, 2) : '000000');
+        if (strspn($digits, '0123456789') !== 14) {
+            return null;
+        }
+        [$year, $month, $day, $hour, $minute, $second] = [(int) substr($digits, 0, 4), (int) substr($digits, 4, 2), (int) substr($digits, 6, 2),
+            (int) substr($digits, 8, 2), (int) substr($digits, 10, 2), (int) substr($digits, 12, 2)];
+        if ($year < 1970 || $month < 1 || $month > 12 || $day < 1 || $day > 31 || $hour > 23 || $minute > 59 || $second > 59) {
+            return null;
+        }
+        $y = $year - ($month <= 2 ? 1 : 0);
+        $era = intdiv($y, 400);
+        $yearOfEra = $y - $era * 400;
+        $dayOfEra = $yearOfEra * 365 + intdiv($yearOfEra, 4) - intdiv($yearOfEra, 100) + intdiv(153 * (($month + 9) % 12) + 2, 5) + $day - 1;
+
+        return ($era * 146_097 + $dayOfEra - 719_468) * 86_400 + $hour * 3_600 + $minute * 60 + $second;
+    }
+
+    /**
+     * Appends an array row to a Wave 39.1 frame: marker 1, then per value its string length (bytes to the blob),
+     * -2 and the int, -3 and a float's 8 bytes, or -1.
+     *
+     * @param  list<int>  $words
+     * @param  list<string>  $blob
+     * @param  list<mixed>  $values
+     */
+    public static function w391PackRow(array &$words, array &$blob, array $values): void
+    {
+        $words[] = 1;
+        foreach ($values as $value) {
+            if (is_string($value)) {
+                $words[] = strlen($value);
+                $blob[] = $value;
+            } elseif (is_int($value)) {
+                $words[] = -2;
+                $words[] = $value;
+            } elseif (is_float($value)) {
+                $words[] = -3;
+                $blob[] = pack('d', $value);
+            } else {
+                $words[] = -1;
+            }
+        }
+    }
+
+    /**
+     * Calls the Wave 39.1 export with a frame, retrying once with a larger scratch buffer when it reports
+     * `-required`; `$ffi` is the caller's cached library handle. Returns the decoded ints or null to fall back.
+     *
+     * @param  list<int>  $words
+     * @param  list<string>  $blob
+     * @return list<int>|null
+     */
+    public static function w391Invoke(FFI|false|null &$ffi, int $operation, array $words, array $blob): ?array
+    {
+        $input = pack('q', count($words)).pack('q*', ...$words).implode('', $blob);
+        if (strlen($input) > self::W391_RUST_MAX_INPUT) {
+            return null;
+        }
+        try {
+            $ffi ??= RustPipelineLibrary::resolveDomain('cleaning_w391', self::W391_FFI_CDEF) ?? false;
+            if ($ffi === false) {
+                return null;
+            }
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, 1024, $capacity);
+            if ($buffer === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w391_admin_regex_category_release_blacklist($operation, 0, $input, strlen($input), $buffer, $capacity);
+            if (is_int($written) && $written < -1) {
+                if (-$written <= $capacity || -$written > self::W391_RUST_MAX_INPUT) {
+                    return null;
+                }
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w391_admin_regex_category_release_blacklist($operation, 0, $input, strlen($input), $buffer, $capacity);
+            }
+            if (! is_int($written) || $written <= 0 || $written > $capacity || $written % 8 !== 0) {
+                return null;
+            }
+            $values = unpack('q*', FFI::string($buffer, $written));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }

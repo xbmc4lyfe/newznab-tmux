@@ -7,6 +7,7 @@ namespace App\Http\Controllers\Admin;
 use App\Http\Controllers\BasePageController;
 use App\Models\Category;
 use App\Services\RegexService;
+use FFI;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Request;
 use Illuminate\View\View;
@@ -215,5 +216,190 @@ class AdminReleaseNamingRegexesController extends BasePageController
     public static function normalizeTestParametersNative(array $input): array
     {
         return AdminBlacklistController::wave28Native(8, ['input' => $input]) ?? self::normalizeTestParametersPhp($input);
+    }
+
+    /**
+     * PHP remains the default: the paired benchmark in
+     * tests/Unit/RustAdminRegexCategoryGroupReleaseW39ParityTest.php is below 1.5x.
+     */
+    public const bool W391_RUST_FFI_DEFAULT = false;
+
+    private const array W391_AUDIT_KEYS = ['rows', 'audited', 'truncated', 'invalid_rows', 'active', 'valid_delimiters', 'invalid_delimiters', 'named_reqid', 'named_parts', 'named_name', 'ordinal_duplicates', 'ordinal_gaps', 'wildcard_groups'];
+
+    /** Group regexes that match every group, after `trim()`. */
+    private const array W391_WILDCARD_GROUPS = ['', '*', '.*', '.+', '^.*$', '^.*', '.*$'];
+
+    /** Closing delimiters for PCRE's bracket-style opening delimiters. */
+    private const array W391_BRACKETS = ['(' => ')', '[' => ']', '{' => '}', '<' => '>'];
+
+    private static ?bool $w391UseRustFfi = null;
+
+    private static FFI|false|null $w391Ffi = null;
+
+    /**
+     * Audits up to `$maxRows` release-naming regex rows (`status`, `regex`, `group_regex`, `ordinal`): active rows
+     * (status 1), regexes with a valid PCRE delimiter pair and modifiers, `reqid`/`parts`/`name` named groups,
+     * repeated ordinals, gaps between consecutive distinct non-negative ordinals, and group regexes that are
+     * missing or match every group. `invalid_delimiters` counts audited array rows without a valid pattern.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int|bool>
+     */
+    public static function summarizeNamingRegexAudit(array $rows, int $maxRows = 500): array
+    {
+        return (self::usesW391RustFfi() ? self::summarizeNamingRegexAuditNative($rows, $maxRows) : null) ?? self::summarizeNamingRegexAuditPhp($rows, $maxRows);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int|bool>
+     */
+    private static function summarizeNamingRegexAuditPhp(array $rows, int $maxRows): array
+    {
+        $total = count($rows);
+        $audited = min($total, max(0, $maxRows));
+        $summary = array_fill_keys(self::W391_AUDIT_KEYS, 0);
+        $summary['rows'] = $total;
+        $summary['audited'] = $audited;
+        $summary['truncated'] = $total > $audited;
+        $seen = [];
+        $left = $audited;
+        foreach ($rows as $row) {
+            if ($left-- <= 0) {
+                break;
+            }
+            if (! is_array($row)) {
+                $summary['invalid_rows']++;
+
+                continue;
+            }
+            if (AdminBlacklistController::w391Int($row['status'] ?? null) === 1) {
+                $summary['active']++;
+            }
+            $regex = $row['regex'] ?? null;
+            if (is_string($regex)) {
+                if (self::w391ValidDelimitedPattern($regex)) {
+                    $summary['valid_delimiters']++;
+                }
+                foreach (['reqid', 'parts', 'name'] as $name) {
+                    if (str_contains($regex, "(?P<{$name}>") || str_contains($regex, "(?<{$name}>") || str_contains($regex, "(?'{$name}'")) {
+                        $summary['named_'.$name]++;
+                    }
+                }
+            }
+            $group = $row['group_regex'] ?? null;
+            if (! is_string($group) || in_array(trim($group), self::W391_WILDCARD_GROUPS, true)) {
+                $summary['wildcard_groups']++;
+            }
+            $ordinal = AdminBlacklistController::w391Int($row['ordinal'] ?? null);
+            if ($ordinal !== null) {
+                if (isset($seen[$ordinal])) {
+                    $summary['ordinal_duplicates']++;
+                } else {
+                    $seen[$ordinal] = true;
+                }
+            }
+        }
+        $summary['invalid_delimiters'] = $audited - $summary['invalid_rows'] - $summary['valid_delimiters'];
+        $ordinals = array_keys($seen);
+        sort($ordinals);
+        $previous = null;
+        foreach ($ordinals as $ordinal) {
+            if ($previous !== null && $previous >= 0 && $ordinal - $previous > 1) {
+                $summary['ordinal_gaps']++;
+            }
+            $previous = $ordinal;
+        }
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int|bool>|null
+     */
+    private static function summarizeNamingRegexAuditNative(array $rows, int $maxRows): ?array
+    {
+        $left = min(count($rows), max(0, $maxRows));
+        $words = [$maxRows, count($rows), $left];
+        $blob = [];
+        foreach ($rows as $row) {
+            if ($left-- <= 0) {
+                break;
+            }
+            if (is_array($row)) {
+                AdminBlacklistController::w391PackRow($words, $blob, [$row['status'] ?? null, $row['regex'] ?? null, $row['group_regex'] ?? null, $row['ordinal'] ?? null]);
+            } else {
+                $words[] = 0;
+            }
+        }
+        $values = AdminBlacklistController::w391Invoke(self::$w391Ffi, 1, $words, $blob);
+        if ($values === null || count($values) !== count(self::W391_AUDIT_KEYS) || ($values[2] & ~1) !== 0) {
+            return null;
+        }
+        $summary = array_combine(self::W391_AUDIT_KEYS, $values);
+        $summary['truncated'] = $values[2] === 1;
+
+        return $summary;
+    }
+
+    /**
+     * PHP's `preg_*` delimiter scan: an opening byte that is not alphanumeric, a backslash, NUL or whitespace;
+     * its closing delimiter (nesting for `([{<`) with backslash escapes skipped; then only modifiers PHP accepts.
+     */
+    private static function w391ValidDelimitedPattern(string $pattern): bool
+    {
+        $length = strlen($pattern);
+        if ($length < 2) {
+            return false;
+        }
+        $open = $pattern[0];
+        if ($open === '\\' || strspn($open, "\0 \t\n\x0b\x0c\rabcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") === 1) {
+            return false;
+        }
+        $close = self::W391_BRACKETS[$open] ?? $open;
+        // Jump between backslashes and delimiters instead of stepping through every byte.
+        $stops = '\\'.$close.($close === $open ? '' : $open);
+        $depth = 1;
+        $i = 1;
+        while ($i < $length) {
+            $i += strcspn($pattern, $stops, $i);
+            if ($i >= $length) {
+                break;
+            }
+            $char = $pattern[$i];
+            if ($char === '\\') {
+                $i += 2;
+            } elseif ($char !== $close) {
+                $depth++;
+                $i++;
+            } elseif ($close === $open || --$depth === 0) {
+                break;
+            } else {
+                $i++;
+            }
+        }
+        if ($i >= $length) {
+            return false;
+        }
+        $modifiers = substr($pattern, $i + 1);
+
+        return strspn($modifiers, "imsxADSUXJun \n\r") === strlen($modifiers);
+    }
+
+    public static function useW391RustFfi(?bool $enabled): void
+    {
+        self::$w391UseRustFfi = $enabled;
+    }
+
+    public static function usesW391RustFfi(): bool
+    {
+        return self::$w391UseRustFfi ?? self::W391_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW391RustFfi(): void
+    {
+        self::$w391UseRustFfi = null;
+        self::$w391Ffi = null;
     }
 }
