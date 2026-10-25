@@ -37188,3 +37188,816 @@ pub mod w501_status_probes_db_disk_nntp_result_queue {
         }
     }
 }
+
+pub mod w511_admin_dashboard_redis_reg_logo_status {
+    //! Wave 51.1 batch kernels for the admin dashboard activity histogram, Redis keyspace specs,
+    //! registration status decisions, managed site-logo paths and site-status downtime. Every
+    //! export reads NUL-joined string columns, byte flags and little-endian `i64` tables, writes
+    //! fixed-width `i64` words into `out` and returns the word count, `SHORT_CAPACITY` when
+    //! `out_cap` (in words) is below the export's worst case, or -1 for a malformed batch (a
+    //! string column whose rows hold NUL bytes splits into extra rows and is malformed).
+
+    use super::w48_proxy_verdict_captcha_breach_reglog::rows;
+    use super::w501_status_probes_db_disk_nntp_result_queue::{i64s, null_mask};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    pub const MAX_INPUT: usize = 64 * 1024 * 1024;
+    pub const MAX_ITEMS: usize = 1 << 20;
+    pub const MAX_BUCKETS: usize = 4096;
+    /// Bucket counts up to this size are tallied in a dense table instead of sorted.
+    const DENSE_BUCKETS: usize = 512;
+    pub const SHORT_CAPACITY: isize = -2;
+
+    const LOGO_PREFIX: &[u8] = b"site-logos/";
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    const LOW7: u64 = 0x7F7F_7F7F_7F7F_7F7F;
+    const DOTS: u64 = 0x2E2E_2E2E_2E2E_2E2E;
+
+    /// Borrows a caller span; an empty span may be null and is never dereferenced.
+    unsafe fn span<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null() || len > MAX_INPUT {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
+    fn overlaps(input: (*const u8, usize), out: *mut i64, words: usize) -> bool {
+        let (a, a_len) = (input.0 as usize, input.1);
+        let (b, b_len) = (out as usize, words.saturating_mul(8));
+        a_len != 0 && b_len != 0 && a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
+    }
+
+    /// Validates the output window for at most `max_words` words, lets `body` push them from
+    /// the borrowed inputs and copies the pushed words to `out`.
+    unsafe fn run(
+        out: *mut i64,
+        out_cap: usize,
+        count: usize,
+        max_words: usize,
+        inputs: &[(*const u8, usize)],
+        body: impl FnOnce(&[&[u8]], &mut Vec<i64>) -> bool,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out.is_null()
+                || !(out as usize).is_multiple_of(std::mem::align_of::<i64>())
+                || count > MAX_ITEMS
+                || out_cap > isize::MAX as usize / 8
+            {
+                return -1;
+            }
+            if max_words > out_cap {
+                return SHORT_CAPACITY;
+            }
+            if inputs.iter().any(|&input| overlaps(input, out, max_words)) {
+                return -1;
+            }
+            let mut spans = Vec::with_capacity(inputs.len());
+            for &(ptr, len) in inputs {
+                match unsafe { span(ptr, len) } {
+                    Some(bytes) => spans.push(bytes),
+                    None => return -1,
+                }
+            }
+            let mut words = Vec::with_capacity(max_words);
+            if !body(&spans, &mut words) || words.len() > max_words {
+                return -1;
+            }
+            // At most `max_words` words, checked against `out_cap` above.
+            unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), out, words.len()) };
+            words.len() as isize
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Worst-case histogram size: the outside count plus a pair per non-empty bucket.
+    pub fn activity_words(count: usize, bucket_count: usize) -> usize {
+        count.min(bucket_count).saturating_mul(2).saturating_add(1)
+    }
+
+    /// Sparse activity histogram over `bucket_count` newest-first buckets of `bucket_seconds`
+    /// ending at `now` (bucket `intdiv(now - ts, bucket_seconds)` for `now - span < ts <= now`):
+    /// `[outside, bucket, count, ...]` with only non-empty buckets in ascending order. `None`
+    /// for an invalid window.
+    pub fn activity_buckets(
+        timestamps: &[i64],
+        now: i64,
+        bucket_seconds: i64,
+        bucket_count: usize,
+    ) -> Option<Vec<i64>> {
+        if bucket_seconds < 1 || bucket_count == 0 || bucket_count > MAX_BUCKETS {
+            return None;
+        }
+        let span = bucket_seconds.checked_mul(bucket_count as i64)?;
+        let window_start = now.checked_sub(span)?;
+        let in_window = |ts: i64| ts <= now && ts > window_start;
+        let mut words = Vec::with_capacity(activity_words(timestamps.len(), bucket_count));
+        words.push(0);
+        if bucket_count <= DENSE_BUCKETS || bucket_count <= timestamps.len().saturating_mul(4) {
+            let mut counts = vec![0i64; bucket_count];
+            for &ts in timestamps {
+                if in_window(ts) {
+                    counts[((now - ts) / bucket_seconds) as usize] += 1;
+                } else {
+                    words[0] += 1;
+                }
+            }
+            for (bucket, &n) in counts.iter().enumerate() {
+                if n != 0 {
+                    words.extend([bucket as i64, n]);
+                }
+            }
+        } else {
+            let mut buckets = Vec::with_capacity(timestamps.len());
+            for &ts in timestamps {
+                if in_window(ts) {
+                    buckets.push((now - ts) / bucket_seconds);
+                } else {
+                    words[0] += 1;
+                }
+            }
+            buckets.sort_unstable();
+            for run in buckets.chunk_by(|a, b| a == b) {
+                words.extend([run[0], run.len() as i64]);
+            }
+        }
+        Some(words)
+    }
+
+    /// `preg_match('/keys=(\d+)/', $spec, $m) ? (int) $m[1] : -1`, saturating like PHP's
+    /// numeric-string cast.
+    pub fn keyspace_keys(spec: &[u8]) -> i64 {
+        let mut from = 0;
+        while let Some(pos) = spec[from..].windows(5).position(|w| w == b"keys=") {
+            let digits = from + pos + 5;
+            if spec.get(digits).is_some_and(u8::is_ascii_digit) {
+                return spec[digits..]
+                    .iter()
+                    .take_while(|b| b.is_ascii_digit())
+                    .fold(0i64, |v, &b| {
+                        v.saturating_mul(10).saturating_add(i64::from(b - b'0'))
+                    });
+            }
+            from += pos + 1;
+        }
+        -1
+    }
+
+    /// `decide(normalizeManualStatus($manual), $active)` as `effective | override << 2 |
+    /// available << 3 | open << 4 | invite << 5 | closed << 6 | reason << 8` (reasons in
+    /// `RegistrationStatusService::REASONS` order).
+    pub fn registration(manual: i64, active: bool) -> i64 {
+        let normalized = if (0..=2).contains(&manual) { manual } else { 0 };
+        let effective = if active { 0 } else { normalized };
+        let scheduled = active && normalized != 0;
+        let reason = match (scheduled, effective) {
+            (true, _) => 0,
+            (false, 0) => 1,
+            (false, 1) => 2,
+            _ => 3,
+        };
+        effective
+            | i64::from(scheduled) << 2
+            | i64::from(effective != 2) << 3
+            | i64::from(effective == 0) << 4
+            | i64::from(effective == 1) << 5
+            | i64::from(effective == 2) << 6
+            | reason << 8
+    }
+
+    /// `SiteLogoService::isManagedPath()`: non-empty, no `..`, inside `site-logos/`.
+    pub fn logo_managed(path: &[u8]) -> bool {
+        path.starts_with(LOGO_PREFIX) && !path.windows(2).any(|w| w == b"..")
+    }
+
+    /// High bit of every zero byte of `x`, exactly (no borrow between bytes).
+    fn zero_bytes(x: u64) -> u64 {
+        !(((x & LOW7) + LOW7) | x | LOW7)
+    }
+
+    /// Bits of the bytes `[from, to)` of a word (`to <= 8`).
+    fn byte_range(from: u32, to: u32) -> u64 {
+        let below = |n: u32| {
+            if n >= 8 {
+                u64::MAX
+            } else {
+                (1u64 << (n * 8)) - 1
+            }
+        };
+        below(to) & !below(from)
+    }
+
+    /// Row state for [`unmanaged_logo_indices`].
+    struct LogoRows<'a> {
+        joined: &'a [u8],
+        count: usize,
+        row: usize,
+        start: usize,
+        dotdot: bool,
+        indices: Vec<i64>,
+    }
+
+    impl LogoRows<'_> {
+        /// Closes the row ending at the NUL (or end of input) at `end`; false when the column
+        /// holds more rows than `count`.
+        fn close(&mut self, end: usize) -> bool {
+            if self.dotdot || !self.joined[self.start..end].starts_with(LOGO_PREFIX) {
+                self.indices.push(self.row as i64);
+            }
+            self.row += 1;
+            self.start = end + 1;
+            self.dotdot = false;
+            end == self.joined.len() || self.row < self.count
+        }
+    }
+
+    /// Indices of the NUL-joined `count` paths that are not managed logo paths, in one pass of
+    /// exact SWAR masks for NUL bytes and `..` pairs; `None` when the column holds another
+    /// number of rows.
+    pub fn unmanaged_logo_indices(joined: &[u8], count: usize) -> Option<Vec<i64>> {
+        if count == 0 {
+            return joined.is_empty().then(Vec::new);
+        }
+        let mut rows = LogoRows {
+            joined,
+            count,
+            row: 0,
+            start: 0,
+            dotdot: false,
+            indices: Vec::new(),
+        };
+        let (words, tail) = joined.as_chunks::<8>();
+        let mut prev_dot = false;
+        for (w, chunk) in words.iter().enumerate() {
+            let x = u64::from_le_bytes(*chunk);
+            let quick = (x.wrapping_sub(LO) & !x) | ((x ^ DOTS).wrapping_sub(LO) & !(x ^ DOTS));
+            if quick & HI == 0 {
+                prev_dot = false;
+                continue;
+            }
+            let dots = zero_bytes(x ^ DOTS);
+            let pairs = dots & (dots >> 8);
+            rows.dotdot |= prev_dot && dots & 0x80 != 0;
+            prev_dot = dots >> 63 != 0;
+            let mut nuls = zero_bytes(x);
+            let mut from = 0u32;
+            while nuls != 0 {
+                let at = nuls.trailing_zeros() / 8;
+                rows.dotdot |= pairs & byte_range(from, at) != 0;
+                if !rows.close(w * 8 + at as usize) {
+                    return None;
+                }
+                from = at + 1;
+                nuls &= nuls - 1;
+            }
+            rows.dotdot |= pairs & byte_range(from, 8) != 0;
+        }
+        let base = joined.len() - tail.len();
+        for (k, &b) in tail.iter().enumerate() {
+            if b == 0 {
+                if !rows.close(base + k) {
+                    return None;
+                }
+                prev_dot = false;
+            } else {
+                let dot = b == b'.';
+                rows.dotdot |= dot && prev_dot;
+                prev_dot = dot;
+            }
+        }
+        rows.close(joined.len());
+        (rows.row == count).then_some(rows.indices)
+    }
+
+    /// Clamps each incident to `[window_start, window_end]` (an open incident ends at
+    /// `window_end`), keeps non-empty spans, merges overlapping/adjacent spans in start order
+    /// and returns `[downtimeSeconds, start0, end0, ...]`; `None` when the sum overflows.
+    pub fn downtime(
+        starts: &[i64],
+        ends: &[i64],
+        open: &[bool],
+        window_start: i64,
+        window_end: i64,
+    ) -> Option<Vec<i64>> {
+        let mut spans: Vec<(i64, i64)> = starts
+            .iter()
+            .zip(ends)
+            .zip(open)
+            .filter_map(|((&s, &e), &o)| {
+                let s = s.max(window_start);
+                let e = if o { window_end } else { e.min(window_end) };
+                (s < e).then_some((s, e))
+            })
+            .collect();
+        spans.sort_by_key(|&(s, _)| s);
+        let mut merged: Vec<(i64, i64)> = Vec::with_capacity(spans.len());
+        for (s, e) in spans {
+            match merged.last_mut() {
+                Some(last) if s <= last.1 => last.1 = last.1.max(e),
+                _ => merged.push((s, e)),
+            }
+        }
+        let mut total = 0i64;
+        for &(s, e) in &merged {
+            total = total.checked_add(e.checked_sub(s)?)?;
+        }
+        let mut words = Vec::with_capacity(1 + merged.len() * 2);
+        words.push(total);
+        for (s, e) in merged {
+            words.push(s);
+            words.push(e);
+        }
+        Some(words)
+    }
+
+    /// Writes the sparse histogram; `out_cap` must hold `1 + 2 * min(count, bucket_count)`.
+    ///
+    /// # Safety
+    /// `timestamps` must be readable for `timestamps_len` bytes and `out` writable for
+    /// `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w511_admin_dashboard_activity_buckets_batch(
+        timestamps: *const u8,
+        timestamps_len: usize,
+        count: usize,
+        now: i64,
+        bucket_seconds: i64,
+        bucket_count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(timestamps, timestamps_len)];
+        let max_words = activity_words(count, bucket_count);
+        unsafe {
+            run(out, out_cap, count, max_words, &inputs, |s, o| {
+                let Some(ts) = i64s(s[0], count) else {
+                    return false;
+                };
+                match activity_buckets(&ts, now, bucket_seconds, bucket_count) {
+                    Some(words) => {
+                        o.extend(words);
+                        true
+                    }
+                    None => false,
+                }
+            })
+        }
+    }
+
+    /// One word per keyspace spec: its `keys=` count, or -1 without one.
+    ///
+    /// # Safety
+    /// `specs` must be readable for `specs_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w511_redis_keyspace_keys_batch(
+        specs: *const u8,
+        specs_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(specs, specs_len)];
+        unsafe {
+            run(out, out_cap, count, count, &inputs, |s, o| {
+                let Some(specs) = rows(s[0], count) else {
+                    return false;
+                };
+                o.extend(specs.into_iter().map(keyspace_keys));
+                true
+            })
+        }
+    }
+
+    /// One decision word per (manual status, active-period byte) row.
+    ///
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w511_registration_status_decide_batch(
+        statuses: *const u8,
+        statuses_len: usize,
+        active: *const u8,
+        active_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(statuses, statuses_len), (active, active_len)];
+        unsafe {
+            run(out, out_cap, count, count, &inputs, |s, o| {
+                let Some(statuses) = i64s(s[0], count) else {
+                    return false;
+                };
+                if s[1].len() != count || s[1].iter().any(|&b| b > 1) {
+                    return false;
+                }
+                o.extend(
+                    statuses
+                        .iter()
+                        .zip(s[1])
+                        .map(|(&m, &a)| registration(m, a == 1)),
+                );
+                true
+            })
+        }
+    }
+
+    /// Writes the indices of the unmanaged paths; `out_cap` must hold `count` words.
+    ///
+    /// # Safety
+    /// `paths` must be readable for `paths_len` bytes and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w511_site_logo_unmanaged_batch(
+        paths: *const u8,
+        paths_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(paths, paths_len)];
+        unsafe {
+            run(
+                out,
+                out_cap,
+                count,
+                count,
+                &inputs,
+                |s, o| match unmanaged_logo_indices(s[0], count) {
+                    Some(indices) => {
+                        o.extend(indices);
+                        true
+                    }
+                    None => false,
+                },
+            )
+        }
+    }
+
+    /// Writes `[downtimeSeconds, start0, end0, ...]`; `out_cap` must hold `1 + 2 * count`.
+    ///
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w511_site_status_downtime_batch(
+        starts: *const u8,
+        starts_len: usize,
+        ends: *const u8,
+        ends_len: usize,
+        nulls: *const u8,
+        nulls_len: usize,
+        count: usize,
+        window_start: i64,
+        window_end: i64,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(starts, starts_len), (ends, ends_len), (nulls, nulls_len)];
+        let max_words = count.saturating_mul(2).saturating_add(1);
+        unsafe {
+            run(out, out_cap, count, max_words, &inputs, |s, o| {
+                let (Some(starts), Some(ends), Some(open)) =
+                    (i64s(s[0], count), i64s(s[1], count), null_mask(s[2], count))
+                else {
+                    return false;
+                };
+                match downtime(&starts, &ends, &open, window_start, window_end) {
+                    Some(words) => {
+                        o.extend(words);
+                        true
+                    }
+                    None => false,
+                }
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn le(values: &[i64]) -> Vec<u8> {
+            values.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+
+        #[test]
+        fn w511_activity_buckets_follow_the_window() {
+            assert_eq!(
+                activity_buckets(&[100, 99, 91, 90, 101, 0], 100, 5, 2),
+                Some(vec![3, 0, 2, 1, 1])
+            );
+            assert_eq!(activity_buckets(&[], 0, 1, 1), Some(vec![0]));
+            assert_eq!(activity_buckets(&[1], 0, 0, 1), None);
+            assert_eq!(activity_buckets(&[1], 0, 1, 0), None);
+            assert_eq!(activity_buckets(&[1], 0, 1, MAX_BUCKETS + 1), None);
+            assert_eq!(activity_buckets(&[1], i64::MIN, 1, 1), None);
+            assert_eq!(activity_buckets(&[1], 0, i64::MAX, 2), None);
+            assert_eq!(
+                activity_buckets(&[i64::MIN, i64::MAX, 0], i64::MAX, i64::MAX, 1),
+                Some(vec![2, 0, 1])
+            );
+            assert_eq!(
+                activity_buckets(&[5, 1, 9, 5, 2], 10, 1, 10),
+                Some(vec![0, 1, 1, 5, 2, 8, 1, 9, 1])
+            );
+            let sparse: Vec<i64> = (0..40).map(|i| 4000 - i * 97 % 4000).collect();
+            let sparse_words = activity_buckets(&sparse, 4000, 1, 4096).unwrap_or_default();
+            let mut expected = vec![0i64];
+            let mut seen = std::collections::BTreeMap::new();
+            for &ts in &sparse {
+                *seen.entry(4000 - ts).or_insert(0i64) += 1;
+            }
+            for (bucket, n) in seen {
+                expected.extend([bucket, n]);
+            }
+            assert_eq!(sparse_words, expected);
+            assert_eq!(activity_words(3, 1), 3);
+            assert_eq!(activity_words(usize::MAX, usize::MAX), usize::MAX);
+        }
+
+        #[test]
+        fn w511_keyspace_keys_match_the_php_regex() {
+            assert_eq!(keyspace_keys(b"keys=123,expires=0,avg_ttl=0"), 123);
+            assert_eq!(keyspace_keys(b"keys=,keys=7"), 7);
+            assert_eq!(keyspace_keys(b"subkeys=5"), 5);
+            assert_eq!(keyspace_keys(b"keys=0007x"), 7);
+            assert_eq!(keyspace_keys(b"kkeys=keys=9"), 9);
+            assert_eq!(keyspace_keys(b"keys=99999999999999999999"), i64::MAX);
+            assert_eq!(keyspace_keys(b"keys=9223372036854775808"), i64::MAX);
+            assert_eq!(keyspace_keys(b"keys="), -1);
+            assert_eq!(keyspace_keys(b"KEYS=1"), -1);
+            assert_eq!(keyspace_keys(b""), -1);
+            assert_eq!(keyspace_keys("keys=\u{0663}".as_bytes()), -1);
+        }
+
+        #[test]
+        fn w511_registration_words_match_decide() {
+            assert_eq!(registration(0, false), 0b1_1000 | 1 << 8);
+            assert_eq!(registration(1, false), 1 | 0b10_1000 | 2 << 8);
+            assert_eq!(registration(2, false), 2 | 0b100_0000 | 3 << 8);
+            assert_eq!(registration(2, true), 0b1_1100);
+            assert_eq!(registration(0, true), 0b1_1000 | 1 << 8);
+            assert_eq!(registration(7, false), registration(0, false));
+            assert_eq!(registration(-1, true), registration(0, true));
+        }
+
+        #[test]
+        fn w511_logo_paths_match_the_scalar_rule() {
+            let paths: [&[u8]; 14] = [
+                b"site-logos/a.png",
+                b"site-logos/",
+                b"site-logos/../x",
+                b"site-logos",
+                b"",
+                b"/site-logos/a",
+                b"site-logos/a..png",
+                b"site-logos/.hidden",
+                b"site-logos/abcdefgh.",
+                b"site-logos/abcdefg..",
+                b"site-logos/abcdefghijklmnop.x.y.z",
+                b"..",
+                b".",
+                b"site-logos/\xC3\xA9..",
+            ];
+            let joined = paths.join(&0u8);
+            let expected: Vec<i64> = paths
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| !logo_managed(p))
+                .map(|(i, _)| i as i64)
+                .collect();
+            assert_eq!(expected, vec![2, 3, 4, 5, 6, 9, 11, 12, 13]);
+            assert_eq!(unmanaged_logo_indices(&joined, paths.len()), Some(expected));
+            assert_eq!(unmanaged_logo_indices(&joined, paths.len() + 1), None);
+            assert_eq!(unmanaged_logo_indices(&joined, paths.len() - 1), None);
+            assert_eq!(unmanaged_logo_indices(b"", 0), Some(vec![]));
+            assert_eq!(unmanaged_logo_indices(b"x", 0), None);
+            assert_eq!(unmanaged_logo_indices(b"", 1), Some(vec![0]));
+            assert_eq!(unmanaged_logo_indices(b"\0", 2), Some(vec![0, 1]));
+            let alphabet = [b'.', b'.', b'a', b'/', 0u8, 0x80, b's'];
+            let mut seed = 0x2545_F491_4F6C_DD1Du64;
+            for _ in 0..4000 {
+                let mut paths: Vec<Vec<u8>> = Vec::new();
+                for _ in 0..(seed % 5 + 1) {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    let mut path = if seed % 3 == 0 {
+                        Vec::new()
+                    } else {
+                        LOGO_PREFIX.to_vec()
+                    };
+                    for k in 0..(seed >> 8) % 24 {
+                        let pick = ((seed >> (k % 48)) % alphabet.len() as u64) as usize;
+                        if alphabet[pick] != 0 {
+                            path.push(alphabet[pick]);
+                        }
+                    }
+                    paths.push(path);
+                }
+                let joined = paths.join(&0u8);
+                let expected: Vec<i64> = paths
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| !logo_managed(p))
+                    .map(|(i, _)| i as i64)
+                    .collect();
+                assert_eq!(unmanaged_logo_indices(&joined, paths.len()), Some(expected));
+                assert_eq!(unmanaged_logo_indices(&joined, paths.len() + 1), None);
+            }
+            for len in 0..40 {
+                let mut path = b"site-logos/".to_vec();
+                path.extend(std::iter::repeat_n(b'a', len));
+                for at in 11..path.len() + 1 {
+                    let mut dotted = path.clone();
+                    dotted.insert(at, b'.');
+                    dotted.insert(at, b'.');
+                    let joined = [path.as_slice(), &dotted, &path].join(&0u8);
+                    assert_eq!(unmanaged_logo_indices(&joined, 3), Some(vec![1]));
+                }
+            }
+        }
+
+        #[test]
+        fn w511_downtime_merges_clamped_spans() {
+            assert_eq!(
+                downtime(
+                    &[5, 0, 30, 12, 50],
+                    &[10, 8, 0, 20, 70],
+                    &[false, false, true, false, false],
+                    2,
+                    60
+                ),
+                Some(vec![46, 2, 10, 12, 20, 30, 60])
+            );
+            assert_eq!(downtime(&[], &[], &[], 0, 10), Some(vec![0]));
+            assert_eq!(downtime(&[5], &[5], &[false], 0, 10), Some(vec![0]));
+            assert_eq!(
+                downtime(&[i64::MIN], &[0], &[true], i64::MIN, i64::MAX),
+                None
+            );
+        }
+
+        #[test]
+        fn w511_exports_guard_pointers_capacity_and_counts() {
+            let mut out = [0i64; 8];
+            let p = out.as_mut_ptr();
+            let null = std::ptr::null();
+            let times = le(&[100, 0]);
+            let t = times.as_ptr();
+            let text = b"keys=4\0x";
+            let s = text.as_ptr();
+            let flags = [1u8, 0];
+            let f = flags.as_ptr();
+            let nulls = 0u32.to_le_bytes();
+            let n = nulls.as_ptr();
+            unsafe {
+                assert_eq!(
+                    nntmux_w511_admin_dashboard_activity_buckets_batch(t, 16, 2, 100, 10, 2, p, 8),
+                    3
+                );
+                assert_eq!(&out[..3], &[1, 0, 1]);
+                assert_eq!(
+                    nntmux_w511_admin_dashboard_activity_buckets_batch(null, 0, 0, 0, 1, 1, p, 8),
+                    1
+                );
+                assert_eq!(
+                    nntmux_w511_admin_dashboard_activity_buckets_batch(t, 16, 2, 100, 10, 2, p, 4),
+                    SHORT_CAPACITY
+                );
+                assert_eq!(
+                    nntmux_w511_admin_dashboard_activity_buckets_batch(t, 8, 2, 100, 10, 2, p, 8),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w511_admin_dashboard_activity_buckets_batch(
+                        null, 16, 2, 100, 10, 2, p, 8
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w511_admin_dashboard_activity_buckets_batch(t, 16, 2, 100, 0, 2, p, 8),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w511_admin_dashboard_activity_buckets_batch(t, 16, 2, 100, 1, 0, p, 8),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w511_admin_dashboard_activity_buckets_batch(
+                        t,
+                        16,
+                        2,
+                        100,
+                        10,
+                        2,
+                        std::ptr::null_mut(),
+                        8
+                    ),
+                    -1
+                );
+
+                assert_eq!(nntmux_w511_redis_keyspace_keys_batch(s, 8, 2, p, 8), 2);
+                assert_eq!(&out[..2], &[4, -1]);
+                assert_eq!(nntmux_w511_redis_keyspace_keys_batch(s, 8, 3, p, 8), -1);
+                assert_eq!(nntmux_w511_redis_keyspace_keys_batch(s, 8, 1, p, 8), -1);
+                assert_eq!(
+                    nntmux_w511_redis_keyspace_keys_batch(s, 8, 2, p, 1),
+                    SHORT_CAPACITY
+                );
+                assert_eq!(nntmux_w511_redis_keyspace_keys_batch(null, 0, 0, p, 0), 0);
+
+                assert_eq!(
+                    nntmux_w511_registration_status_decide_batch(t, 16, f, 2, 2, p, 8),
+                    2
+                );
+                assert_eq!(out[0], registration(100, true));
+                assert_eq!(out[1], registration(0, false));
+                assert_eq!(
+                    nntmux_w511_registration_status_decide_batch(t, 16, s, 2, 2, p, 8),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w511_registration_status_decide_batch(t, 16, f, 1, 2, p, 8),
+                    -1
+                );
+
+                let logos = b"site-logos/a\0../b";
+                assert_eq!(
+                    nntmux_w511_site_logo_unmanaged_batch(logos.as_ptr(), logos.len(), 2, p, 8),
+                    1
+                );
+                assert_eq!(out[0], 1);
+                assert_eq!(
+                    nntmux_w511_site_logo_unmanaged_batch(logos.as_ptr(), logos.len(), 2, p, 1),
+                    SHORT_CAPACITY
+                );
+                assert_eq!(
+                    nntmux_w511_site_logo_unmanaged_batch(logos.as_ptr(), logos.len(), 1, p, 8),
+                    -1
+                );
+                assert_eq!(nntmux_w511_site_logo_unmanaged_batch(null, 4, 1, p, 8), -1);
+
+                let starts = le(&[0, 50]);
+                let ends = le(&[10, 0]);
+                assert_eq!(
+                    nntmux_w511_site_status_downtime_batch(
+                        starts.as_ptr(),
+                        16,
+                        ends.as_ptr(),
+                        16,
+                        n,
+                        4,
+                        2,
+                        0,
+                        60,
+                        p,
+                        8
+                    ),
+                    3
+                );
+                assert_eq!(&out[..3], &[60, 0, 60]);
+                assert_eq!(
+                    nntmux_w511_site_status_downtime_batch(
+                        starts.as_ptr(),
+                        16,
+                        ends.as_ptr(),
+                        16,
+                        null,
+                        0,
+                        2,
+                        0,
+                        60,
+                        p,
+                        4
+                    ),
+                    SHORT_CAPACITY
+                );
+                assert_eq!(
+                    nntmux_w511_site_status_downtime_batch(
+                        starts.as_ptr(),
+                        16,
+                        ends.as_ptr(),
+                        16,
+                        null,
+                        0,
+                        2,
+                        0,
+                        60,
+                        p,
+                        8
+                    ),
+                    3
+                );
+                assert_eq!(&out[..3], &[10, 0, 10]);
+                let overlap = out.as_ptr() as *const u8;
+                assert_eq!(
+                    nntmux_w511_site_logo_unmanaged_batch(overlap, 4, 1, p, 8),
+                    -1
+                );
+            }
+        }
+    }
+}

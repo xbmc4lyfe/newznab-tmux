@@ -14,6 +14,7 @@ use App\Services\StatusProbes\ProbeResult;
 use App\Services\StatusProbes\ServiceProbeRegistry;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Cache;
@@ -788,5 +789,196 @@ class SiteStatusService
             4 => ServiceStatusEnum::MajorOutage,
             default => $this->mapIncidentImpactToServiceHealthPhp($impact),
         };
+    }
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W51 parity test). */
+    private const bool W51_RUST_FFI_DEFAULT = true;
+
+    private const string W51_FFI_CDEF = 'ssize_t nntmux_w511_site_status_downtime_batch(const char *starts, size_t starts_len, const char *ends, size_t ends_len, const char *nulls, size_t nulls_len, size_t count, int64_t window_start, int64_t window_end, int64_t *out, size_t out_cap);';
+
+    public static function usesW51RustFfi(): bool
+    {
+        $enabled = self::w51RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W51_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 51 batch routed to Rust or PHP, then restores the routing. */
+    public static function withW51RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w51RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w51RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * {@see recalculateUptime()} downtime for one window: each incident is clamped to
+     * `[$windowStart, $windowEnd]` (a null end is still open), empty spans are dropped and the
+     * rest merged like {@see mergeIntervalsPhp()}. Returns `[downtimeSeconds, start0, end0, ...]`.
+     *
+     * @param  list<int>  $starts
+     * @param  list<int|null>  $ends
+     * @return list<int>
+     */
+    public static function downtimeSummary(int $windowStart, int $windowEnd, array $starts, array $ends): array
+    {
+        return self::usesW51RustFfi()
+            ? self::downtimeSummaryNative($windowStart, $windowEnd, $starts, $ends)
+            : self::downtimeSummaryPhp($windowStart, $windowEnd, $starts, $ends);
+    }
+
+    /**
+     * @param  list<int>  $starts
+     * @param  list<int|null>  $ends
+     * @return list<int>
+     */
+    public static function downtimeSummaryPhp(int $windowStart, int $windowEnd, array $starts, array $ends): array
+    {
+        self::w51Count($starts, $ends);
+        $intervals = [];
+        foreach ($starts as $i => $start) {
+            $end = $ends[$i];
+            $s = max($start, $windowStart);
+            $e = $end === null ? $windowEnd : min($end, $windowEnd);
+            if ($s < $e) {
+                $intervals[] = [$s, $e];
+            }
+        }
+        $merged = [];
+        if ($intervals !== []) {
+            usort($intervals, static fn (array $a, array $b): int => $a[0] <=> $b[0]);
+            $merged = [$intervals[0]];
+            $last = 0;
+            for ($i = 1, $count = \count($intervals); $i < $count; $i++) {
+                if ($intervals[$i][0] <= $merged[$last][1]) {
+                    $merged[$last][1] = max($merged[$last][1], $intervals[$i][1]);
+                } else {
+                    $merged[++$last] = $intervals[$i];
+                }
+            }
+        }
+        $downtime = 0;
+        $words = [0];
+        foreach ($merged as [$s, $e]) {
+            $downtime += $e - $s;
+            $words[] = $s;
+            $words[] = $e;
+        }
+        if (! \is_int($downtime)) {
+            throw new \InvalidArgumentException('Site status downtime overflows an integer.');
+        }
+        $words[0] = $downtime;
+
+        return $words;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or declines the batch (an
+     * overflowing sum, which PHP then rejects).
+     *
+     * @param  list<int>  $starts
+     * @param  list<int|null>  $ends
+     * @return list<int>
+     */
+    public static function downtimeSummaryNative(int $windowStart, int $windowEnd, array $starts, array $ends): array
+    {
+        $count = self::w51Count($starts, $ends);
+        $maxWords = 2 * $count + 1;
+        $buffer = $count === 0 ? null : self::w51Buffer($maxWords);
+        if ($buffer === null) {
+            return self::downtimeSummaryPhp($windowStart, $windowEnd, $starts, $ends);
+        }
+        [$ffi, $out, $cap] = $buffer;
+        $packedStarts = pack('P*', ...$starts);
+        $packedEnds = pack('P*', ...$ends);
+        $nulls = pack('V*', ...array_keys($ends, null, true));
+        try {
+            // @phpstan-ignore method.notFound
+            $words = self::w51Decode($out, $ffi->nntmux_w511_site_status_downtime_batch($packedStarts, \strlen($packedStarts), $packedEnds, \strlen($packedEnds), $nulls, \strlen($nulls), $count, $windowStart, $windowEnd, $out, $cap), $maxWords);
+        } catch (\Throwable) {
+            $words = null;
+        }
+
+        return $words !== null && $words !== [] && \count($words) % 2 === 1
+            ? $words
+            : self::downtimeSummaryPhp($windowStart, $windowEnd, $starts, $ends);
+    }
+
+    /**
+     * @param  array<mixed>  ...$columns
+     */
+    private static function w51Count(array ...$columns): int
+    {
+        $count = \count($columns[0]);
+        foreach ($columns as $column) {
+            if (\count($column) !== $count) {
+                throw new \InvalidArgumentException('Site status downtime columns must have the same length.');
+            }
+        }
+
+        return $count;
+    }
+
+    /**
+     * Lazily resolved binding plus the reusable output buffer sized for `$words` words.
+     *
+     * @return array{0: FFI, 1: CData, 2: int}|null
+     */
+    private static function w51Buffer(int $words): ?array
+    {
+        $buffer = self::w51RustFfiState('out', $words);
+
+        return \is_array($buffer) ? $buffer : null;
+    }
+
+    /** @return list<int>|null The `$written` words the export reported, or null when it declined. */
+    private static function w51Decode(CData $out, mixed $written, int $maxWords): ?array
+    {
+        if (! \is_int($written) || $written < 0 || $written > $maxWords) {
+            return null;
+        }
+        if ($written === 0) {
+            return [];
+        }
+        $decoded = unpack('P*', FFI::string($out, $written * 8));
+
+        /** @var list<int>|null */
+        return \is_array($decoded) ? array_values($decoded) : null;
+    }
+
+    /**
+     * Wave 51 routing override (`set`) plus the lazily resolved binding and reusable `int64_t`
+     * output buffer (`out`, sized for `$val` words), kept in function-local statics.
+     */
+    private static function w51RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'out':
+                $ffi ??= RustPipelineLibrary::resolveDomain('admin_status_w51', self::W51_FFI_CDEF) ?? false;
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if (! $out instanceof CData || $outCap < $val) {
+                    $outCap = max(512, $val * 2);
+                    $out = $ffi->new("int64_t[{$outCap}]");
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled;
+        }
     }
 }
