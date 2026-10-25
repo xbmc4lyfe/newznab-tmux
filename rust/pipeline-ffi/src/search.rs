@@ -31623,3 +31623,763 @@ mod wave44_5_log_index_parser_search_prometheus_doc {
         }
     }
 }
+
+/// Wave 45.5 API helpers: supported search parameter batches
+/// (`ApiCapabilitiesService`), list CSV canonicalization batches
+/// (`ApiInputCanonicalizer`), sort normalization and validation batches
+/// (`ApiQueryParameters`), cache-key string leaf batches
+/// (`ApiReleaseRowCache`) and audit entry batches (`ApiUsageService`). PHP
+/// sends a count, the little-endian u32 length of every part and then the
+/// concatenated parts; results are i64 counters in a fixed order per mode.
+mod wave45_5_api_capabilities_canonicalizer_query_cache_usage {
+    use std::borrow::Cow;
+    use std::collections::HashSet;
+    use std::hash::{BuildHasherDefault, Hasher};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const DECLINE: i64 = -1;
+    const MAX_INPUT: usize = 64 * 1024 * 1024;
+    const MAX_PARTS: usize = 1 << 22;
+    /// Characters stripped by PHP's default `trim()`.
+    const TRIM: &[u8] = b" \t\n\r\0\x0B";
+    /// `ApiUsageService::AUDIT_VALUE_MAX_LENGTH` and `AUDIT_MAX_LENGTH`.
+    const AUDIT_VALUE_CHARS: usize = 64;
+    const AUDIT_ENTRY_CHARS: usize = 255;
+    /// Columns accepted by `ApiQueryParameters::hasValidSortPhp()`, in the
+    /// order their counters are written.
+    const SORT_COLUMNS: [&[u8]; 6] = [b"cat", b"name", b"size", b"files", b"stats", b"posted"];
+
+    /// `ApiCapabilitiesService::SEARCHING_V1`.
+    const SEARCHING_V1: [(&[u8], &[u8]); 6] = [
+        (
+            b"search",
+            b"q,group,minsize,maxsize,maxage,cat,limit,offset,attrs,extended,del,sort",
+        ),
+        (
+            b"tv-search",
+            b"q,vid,tvdbid,traktid,rid,tvmazeid,imdbid,tmdbid,season,ep,cat,minsize,maxsize,maxage,limit,offset,attrs,extended,del,sort",
+        ),
+        (
+            b"movie-search",
+            b"q,imdbid,tmdbid,traktid,genre,cat,minsize,maxsize,maxage,limit,offset,attrs,extended,del,sort",
+        ),
+        (
+            b"audio-search",
+            b"q,cat,minsize,maxsize,maxage,group,limit,offset,attrs,extended,del,sort",
+        ),
+        (
+            b"book-search",
+            b"q,title,author,cat,minsize,maxsize,maxage,group,limit,offset,attrs,extended,del,sort",
+        ),
+        (
+            b"anime-search",
+            b"q,anidbid,anilistid,cat,minsize,maxsize,maxage,limit,offset,attrs,extended,del,sort",
+        ),
+    ];
+
+    /// `ApiCapabilitiesService::SEARCHING_V2`.
+    const SEARCHING_V2: [(&[u8], &[u8]); 6] = [
+        (
+            b"search",
+            b"id,group,minsize,maxage,cat,limit,offset,cursor,sort",
+        ),
+        (
+            b"tv-search",
+            b"id,vid,tvdbid,traktid,rid,tvmazeid,imdbid,tmdbid,season,ep,cat,minsize,maxage,limit,offset,cursor,sort",
+        ),
+        (
+            b"movie-search",
+            b"id,imdbid,tmdbid,traktid,cat,minsize,maxage,limit,offset,cursor,sort",
+        ),
+        (
+            b"audio-search",
+            b"id,cat,minsize,maxage,group,limit,offset,cursor,sort",
+        ),
+        (
+            b"book-search",
+            b"id,cat,minsize,maxage,group,limit,offset,cursor,sort",
+        ),
+        (
+            b"anime-search",
+            b"id,anidbid,anilistid,cat,minsize,maxage,limit,offset,cursor,sort",
+        ),
+    ];
+
+    /// Word-at-a-time FNV-style hasher for the per-call distinct sets; each set
+    /// lives for one call, so SipHash's flooding resistance is not needed.
+    #[derive(Default)]
+    struct WordHasher(u64);
+
+    impl Hasher for WordHasher {
+        fn write(&mut self, bytes: &[u8]) {
+            const PRIME: u64 = 0x0000_0100_0000_01B3;
+            let (words, tail) = bytes.as_chunks::<8>();
+            let mut hash = self.0 ^ 0xCBF2_9CE4_8422_2325;
+            for word in words {
+                hash = (hash ^ u64::from_le_bytes(*word)).wrapping_mul(PRIME);
+            }
+            let mut last = [0u8; 8];
+            last[..tail.len()].copy_from_slice(tail);
+            hash = (hash ^ u64::from_le_bytes(last)).wrapping_mul(PRIME);
+            self.0 = (hash ^ (hash >> 29)).wrapping_mul(PRIME) ^ (bytes.len() as u64);
+        }
+
+        fn write_usize(&mut self, value: usize) {
+            self.0 = (self.0 ^ value as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+
+        fn finish(&self) -> u64 {
+            self.0 ^ (self.0 >> 32)
+        }
+    }
+
+    type Distinct<T> = HashSet<T, BuildHasherDefault<WordHasher>>;
+
+    fn distinct<T>(capacity: usize) -> Distinct<T> {
+        HashSet::with_capacity_and_hasher(capacity.min(4096), Default::default())
+    }
+
+    /// Records `value` once, copying it only when it is not already present.
+    fn remember<'a>(set: &mut Distinct<Cow<'a, [u8]>>, value: &[u8]) {
+        if !set.contains(value) {
+            set.insert(Cow::Owned(value.to_vec()));
+        }
+    }
+
+    /// Splits `[count][len; count][bytes...]` without copying.
+    fn unpack(input: &[u8]) -> Option<Vec<&[u8]>> {
+        let count = u32::from_le_bytes(input.get(..4)?.try_into().ok()?) as usize;
+        if count > MAX_PARTS || count > (input.len() - 4) / 4 {
+            return None;
+        }
+        let lengths = input.get(4..4 + count * 4)?;
+        let mut cursor = 4 + count * 4;
+        let mut parts = Vec::with_capacity(count);
+        for chunk in lengths.as_chunks::<4>().0 {
+            let length = u32::from_le_bytes(*chunk) as usize;
+            let end = cursor.checked_add(length)?;
+            parts.push(input.get(cursor..end)?);
+            cursor = end;
+        }
+        (cursor == input.len()).then_some(parts)
+    }
+
+    /// Canonical decimal produced by PHP `(string) $int`.
+    fn integer(bytes: &[u8]) -> Option<i64> {
+        if bytes.is_empty() || bytes.len() > 20 {
+            return None;
+        }
+        let value: i64 = std::str::from_utf8(bytes).ok()?.parse().ok()?;
+        (value.to_string().as_bytes() == bytes).then_some(value)
+    }
+
+    /// A canonical non-negative in-band count no larger than `limit`.
+    fn length(bytes: &[u8], limit: usize) -> Option<usize> {
+        let value = usize::try_from(integer(bytes)?).ok()?;
+        (value <= limit).then_some(value)
+    }
+
+    fn counts(values: &[usize]) -> Option<Vec<i64>> {
+        values
+            .iter()
+            .map(|value| i64::try_from(*value).ok())
+            .collect()
+    }
+
+    /// PHP `trim()` with the default character list.
+    fn trim(bytes: &[u8]) -> &[u8] {
+        let start = bytes
+            .iter()
+            .position(|byte| !TRIM.contains(byte))
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|byte| !TRIM.contains(byte))
+            .map_or(start, |index| index + 1);
+        &bytes[start..end]
+    }
+
+    // ---- Mode 1: ApiCapabilitiesService::searching() ---------------------
+
+    /// `count` NUL-separated pieces of `joined`, or `None` when a piece held a
+    /// NUL itself and the counts disagree. A zero count needs an empty part.
+    fn pieces(joined: &[u8], count: usize) -> Option<Vec<&[u8]>> {
+        if count == 0 {
+            return joined.is_empty().then(Vec::new);
+        }
+        let pieces: Vec<&[u8]> = joined.split(|byte| *byte == 0).collect();
+        (pieces.len() == count).then_some(pieces)
+    }
+
+    /// One bit per parameter either searching table lists; 0 for others.
+    fn parameter_bit(key: &[u8]) -> u32 {
+        let index = match key {
+            b"q" => 0,
+            b"id" => 1,
+            b"group" => 2,
+            b"minsize" => 3,
+            b"maxsize" => 4,
+            b"maxage" => 5,
+            b"cat" => 6,
+            b"limit" => 7,
+            b"offset" => 8,
+            b"attrs" => 9,
+            b"extended" => 10,
+            b"del" => 11,
+            b"sort" => 12,
+            b"cursor" => 13,
+            b"vid" => 14,
+            b"tvdbid" => 15,
+            b"traktid" => 16,
+            b"rid" => 17,
+            b"tvmazeid" => 18,
+            b"imdbid" => 19,
+            b"tmdbid" => 20,
+            b"season" => 21,
+            b"ep" => 22,
+            b"genre" => 23,
+            b"title" => 24,
+            b"author" => 25,
+            b"anidbid" => 26,
+            b"anilistid" => 27,
+            _ => return 0,
+        };
+        1 << index
+    }
+
+    /// Parts: version, then per request the `t` function, its key count
+    /// (including `t`) and the NUL-joined keys; a key holding a NUL makes the
+    /// counts disagree and declines the batch. Fields: known_functions,
+    /// unknown_functions, parameters, supported_parameters,
+    /// unsupported_parameters, fully_supported, max_parameters,
+    /// distinct_functions.
+    fn supported_parameters(parts: &[&[u8]]) -> Option<Vec<i64>> {
+        let (version, rest) = parts.split_first()?;
+        let table: &[(&[u8], &[u8])] = match integer(version)? {
+            1 => &SEARCHING_V1,
+            2 => &SEARCHING_V2,
+            _ => &[],
+        };
+        let functions: Vec<(&[u8], u32)> = table
+            .iter()
+            .map(|(name, params)| {
+                let mask = params
+                    .split(|byte| *byte == b',')
+                    .fold(0, |mask, param| mask | parameter_bit(param));
+                (*name, mask)
+            })
+            .collect();
+        if !rest.len().is_multiple_of(3) {
+            return None;
+        }
+        let mut totals = [0usize; 7];
+        let mut seen: Distinct<&[u8]> = distinct(rest.len() / 3);
+        for request in rest.as_chunks::<3>().0 {
+            let [function, count, joined] = *request;
+            // `t` is a key of every framed request.
+            let count = length(count, joined.len() + 1)?.checked_sub(1)?;
+            let mask = functions
+                .iter()
+                .find(|(name, _)| *name == function)
+                .map(|(_, mask)| *mask);
+            let (mut keys, mut supported) = (0usize, 0usize);
+            for key in joined.split(|byte| *byte == 0) {
+                keys += 1;
+                supported += usize::from(mask.is_some_and(|mask| mask & parameter_bit(key) != 0));
+            }
+            if keys != count + 1 {
+                return None;
+            }
+            seen.insert(function);
+            totals[2] += count;
+            totals[6] = totals[6].max(count);
+            if mask.is_some() {
+                totals[0] += 1;
+                totals[3] += supported;
+                totals[4] += count - supported;
+                totals[5] += usize::from(supported == count);
+            } else {
+                totals[1] += 1;
+                totals[4] += count;
+            }
+        }
+        let mut out = counts(&totals)?;
+        out.push(i64::try_from(seen.len()).ok()?);
+        Some(out)
+    }
+
+    // ---- Mode 2: ApiInputCanonicalizer::canonicalizeListCsvPhp() --------
+
+    /// Fields: null_results, changed, items, dropped_items, canonical_bytes,
+    /// max_items, distinct_canonical.
+    fn list_csvs(values: &[&[u8]]) -> Option<Vec<i64>> {
+        let mut totals = [0usize; 6];
+        let mut seen: Distinct<Cow<'_, [u8]>> = distinct(values.len());
+        let mut canonical = Vec::new();
+        for value in values {
+            canonical.clear();
+            let (mut kept, mut total) = (0usize, 0usize);
+            for item in value.split(|byte| *byte == b',') {
+                total += 1;
+                let item = trim(item);
+                if item.is_empty() {
+                    continue;
+                }
+                if kept > 0 {
+                    canonical.push(b',');
+                }
+                canonical.extend_from_slice(item);
+                kept += 1;
+            }
+            totals[3] += total - kept;
+            if kept == 0 {
+                totals[0] += 1;
+                continue;
+            }
+            if canonical.as_slice() == *value {
+                if !seen.contains(*value) {
+                    seen.insert(Cow::Borrowed(*value));
+                }
+            } else {
+                totals[1] += 1;
+                remember(&mut seen, &canonical);
+            }
+            totals[2] += kept;
+            totals[4] += canonical.len();
+            totals[5] = totals[5].max(kept);
+        }
+        let mut out = counts(&totals)?;
+        out.push(i64::try_from(seen.len()).ok()?);
+        Some(out)
+    }
+
+    // ---- Mode 3: ApiQueryParameters::sortPhp() / hasValidSortPhp() ------
+
+    /// Fields: changed, empty, valid, asc, desc, one counter per
+    /// [`SORT_COLUMNS`] entry and distinct_sorts. PHP 8 `strtolower()` only
+    /// maps ASCII; trimming removes the final newline PCRE `$` would allow.
+    fn sorts(values: &[&[u8]]) -> Option<Vec<i64>> {
+        let mut totals = [0usize; 11];
+        let mut seen: Distinct<Cow<'_, [u8]>> = distinct(values.len());
+        let mut lower = Vec::new();
+        for value in values {
+            let trimmed = trim(value);
+            lower.clear();
+            lower.extend(trimmed.iter().map(u8::to_ascii_lowercase));
+            let changed = lower.as_slice() != *value;
+            totals[0] += usize::from(changed);
+            totals[1] += usize::from(lower.is_empty());
+            if let Some(split) = lower.iter().position(|byte| *byte == b'_') {
+                let (column, direction) = (&lower[..split], &lower[split + 1..]);
+                let asc = direction == b"asc";
+                if (asc || direction == b"desc")
+                    && let Some(index) = SORT_COLUMNS.iter().position(|name| *name == column)
+                {
+                    totals[2] += 1;
+                    totals[if asc { 3 } else { 4 }] += 1;
+                    totals[5 + index] += 1;
+                }
+            }
+            if changed {
+                remember(&mut seen, &lower);
+            } else if !seen.contains(*value) {
+                seen.insert(Cow::Borrowed(*value));
+            }
+        }
+        let mut out = counts(&totals)?;
+        out.push(i64::try_from(seen.len()).ok()?);
+        Some(out)
+    }
+
+    // ---- Mode 4: ApiReleaseRowCache::normalizePhp() string leaves -------
+
+    /// Fields: strings, trimmed, blank, string_bytes, max_string_bytes,
+    /// distinct_strings.
+    fn string_leaves(values: &[&[u8]]) -> Option<Vec<i64>> {
+        let mut totals = [values.len(), 0, 0, 0, 0];
+        let mut seen: Distinct<&[u8]> = distinct(values.len());
+        for value in values {
+            let trimmed = trim(value);
+            totals[1] += usize::from(trimmed.len() != value.len());
+            totals[2] += usize::from(trimmed.is_empty());
+            totals[3] += trimmed.len();
+            totals[4] = totals[4].max(trimmed.len());
+            seen.insert(trimmed);
+        }
+        let mut out = counts(&totals)?;
+        out.push(i64::try_from(seen.len()).ok()?);
+        Some(out)
+    }
+
+    // ---- Mode 5: ApiUsageService::auditEntryFromPhp() -------------------
+
+    /// PHP `rawurlencode()`.
+    fn rawurlencode(bytes: &[u8], out: &mut Vec<u8>) {
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        for &byte in bytes {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+                out.push(byte);
+            } else {
+                out.extend_from_slice(&[
+                    b'%',
+                    HEX[usize::from(byte >> 4)],
+                    HEX[usize::from(byte & 15)],
+                ]);
+            }
+        }
+    }
+
+    /// `mb_substr($s, 0, $chars)` for UTF-8 already known to be valid, and
+    /// whether it cut anything.
+    fn utf8_prefix(bytes: &[u8], chars: usize) -> (&[u8], bool) {
+        if bytes.len() <= chars {
+            return (bytes, false);
+        }
+        let mut seen = 0usize;
+        for (index, byte) in bytes.iter().enumerate() {
+            if (*byte as i8) >= -0x40 {
+                if seen == chars {
+                    return (&bytes[..index], true);
+                }
+                seen += 1;
+            }
+        }
+        (bytes, false)
+    }
+
+    /// Parts per entry: path, pair count, NUL-joined keys and NUL-joined
+    /// values (null values sent as empty strings). Fields: truncated_values,
+    /// truncated_entries, entry_bytes, max_entry_bytes, distinct_entries.
+    /// Invalid UTF-8 in a path or value declines the batch, as `mb_substr()`
+    /// substitutes there.
+    fn audit_entries(parts: &[&[u8]]) -> Option<Vec<i64>> {
+        if !parts.len().is_multiple_of(4) {
+            return None;
+        }
+        let mut totals = [0usize; 4];
+        let mut seen: Distinct<Cow<'_, [u8]>> = distinct(parts.len() / 4);
+        let mut entry = Vec::new();
+        for frame in parts.as_chunks::<4>().0 {
+            let [path, count, keys, values] = *frame;
+            let count = length(count, keys.len() + 1)?;
+            let (keys, values) = (pieces(keys, count)?, pieces(values, count)?);
+            std::str::from_utf8(path).ok()?;
+            entry.clear();
+            entry.push(b'/');
+            entry.extend_from_slice(&path[path.iter().take_while(|byte| **byte == b'/').count()..]);
+            for (index, (key, value)) in keys.iter().zip(&values).enumerate() {
+                let value = if value.is_ascii() {
+                    value
+                } else {
+                    std::str::from_utf8(value).ok()?.as_bytes()
+                };
+                let (value, cut) = utf8_prefix(value, AUDIT_VALUE_CHARS);
+                totals[0] += usize::from(cut);
+                entry.push(if index == 0 { b'?' } else { b'&' });
+                rawurlencode(key, &mut entry);
+                entry.push(b'=');
+                rawurlencode(value, &mut entry);
+            }
+            // The query is ASCII and the path was validated, so the entry is UTF-8.
+            let (audit, cut) = utf8_prefix(&entry, AUDIT_ENTRY_CHARS);
+            totals[1] += usize::from(cut);
+            totals[2] += audit.len();
+            totals[3] = totals[3].max(audit.len());
+            remember(&mut seen, audit);
+        }
+        let mut out = counts(&totals)?;
+        out.push(i64::try_from(seen.len()).ok()?);
+        Some(out)
+    }
+
+    fn transform(mode: u32, parts: &[&[u8]]) -> Option<Vec<i64>> {
+        match mode {
+            1 => supported_parameters(parts),
+            2 => list_csvs(parts),
+            3 => sorts(parts),
+            4 => string_leaves(parts),
+            5 => audit_entries(parts),
+            _ => None,
+        }
+    }
+
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> Option<bool> {
+        if a_len == 0 || b_len == 0 {
+            return Some(false);
+        }
+        let a_end = a.checked_add(a_len)?;
+        let b_end = b.checked_add(b_len)?;
+        Some(a < b_end && b < a_end)
+    }
+
+    /// Summarize a count-prefixed, length-table framed batch (little-endian
+    /// u32 count, then one u32 length per part, then the parts). Writes the
+    /// mode's i64 counters to `out` and returns how many were written,
+    /// `-needed` when `cap` (in elements) is too small, or `-1` for invalid
+    /// input, mode, overlapping buffers or a declined batch. Failure never
+    /// writes to `out`; every mode writes at least five counters, so `-1`
+    /// never means "one counter needed".
+    ///
+    /// # Safety
+    /// Non-null pointers must refer to a readable allocation of `input_len`
+    /// bytes and a writable allocation of `cap` i64 values. Null pointers
+    /// require zero length/capacity. Input and output must not overlap.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w455_api_capabilities_canonicalizer_query_cache_usage(
+        mode: u32,
+        input: *const u8,
+        input_len: usize,
+        out: *mut i64,
+        cap: usize,
+    ) -> i64 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if input_len > MAX_INPUT
+                || cap > (isize::MAX as usize) / 8
+                || (input.is_null() && input_len != 0)
+                || (out.is_null() && cap != 0)
+                || !(out as usize).is_multiple_of(std::mem::align_of::<i64>())
+            {
+                return DECLINE;
+            }
+            match overlaps(input as usize, input_len, out as usize, cap * 8) {
+                Some(false) => {}
+                _ => return DECLINE,
+            }
+            let input = if input_len == 0 {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(input, input_len) }
+            };
+            let Some(parts) = unpack(input) else {
+                return DECLINE;
+            };
+            let Some(result) = transform(mode, &parts) else {
+                return DECLINE;
+            };
+            // At most 12 counters per mode.
+            let needed = result.len() as i64;
+            if cap < result.len() || out.is_null() {
+                return -needed;
+            }
+            unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), out, result.len()) };
+            needed
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn packet(parts: &[&[u8]]) -> Vec<u8> {
+            let mut out = (parts.len() as u32).to_le_bytes().to_vec();
+            for part in parts {
+                out.extend_from_slice(&(part.len() as u32).to_le_bytes());
+            }
+            for part in parts {
+                out.extend_from_slice(part);
+            }
+            out
+        }
+
+        fn raw(mode: u32, input: &[u8], out: &mut [i64]) -> i64 {
+            unsafe {
+                nntmux_w455_api_capabilities_canonicalizer_query_cache_usage(
+                    mode,
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            }
+        }
+
+        fn call(mode: u32, parts: &[&[u8]]) -> Option<Vec<i64>> {
+            let input = packet(parts);
+            let mut out = vec![0i64; 32];
+            let written = raw(mode, &input, &mut out);
+            if written < 0 {
+                return None;
+            }
+            out.truncate(written as usize);
+            Some(out)
+        }
+
+        #[test]
+        fn w455_supported_parameters_follow_searching_tables() {
+            let parts: [&[u8]; 13] = [
+                b"2",
+                b"search",
+                b"3",
+                b"t\0id\0cat",
+                b"movie-search",
+                b"2",
+                b"q\0t",
+                b"nope",
+                b"1",
+                b"t",
+                b"search",
+                b"2",
+                b"t\x000",
+            ];
+            assert_eq!(call(1, &parts), Some(vec![3, 1, 4, 2, 2, 1, 2, 3]));
+            // A trailing partial request declines the batch.
+            assert_eq!(call(1, &parts[..12]), None);
+            assert_eq!(
+                call(1, &[b"1", b"search", b"2", b"t\0q"]),
+                Some(vec![1, 0, 1, 1, 0, 1, 1, 1])
+            );
+            assert_eq!(
+                call(1, &[b"3", b"search", b"2", b"t\0q"]),
+                Some(vec![0, 1, 1, 0, 1, 0, 1, 1])
+            );
+            assert_eq!(call(1, &[b"2"]), Some(vec![0; 8]));
+            assert_eq!(call(1, &[]), None);
+            assert_eq!(call(1, &[b"02", b"search", b"1", b"t"]), None);
+            assert_eq!(call(1, &[b"2", b"search", b"-1", b"t"]), None);
+            assert_eq!(call(1, &[b"2", b"search", b"0", b""]), None);
+            assert_eq!(call(1, &[b"2", b"search", b"1", b"t\0q"]), None);
+            for (_, params) in SEARCHING_V1.iter().chain(&SEARCHING_V2) {
+                assert!(
+                    params
+                        .split(|byte| *byte == b',')
+                        .all(|param| parameter_bit(param) != 0)
+                );
+            }
+            // A key holding a NUL splits into too many pieces.
+            assert_eq!(call(1, &[b"2", b"search", b"2", b"t\0a\0b"]), None);
+            assert_eq!(pieces(b"", 0), Some(vec![]));
+            assert_eq!(pieces(b"x", 0), None);
+            assert_eq!(pieces(b"", 1), Some(vec![&b""[..]]));
+        }
+
+        #[test]
+        fn w455_list_csvs_mirror_explode_trim_filter() {
+            assert_eq!(
+                call(2, &[b"2000, 5030,,", b"2000,5030", b" , ", b"", b"7"]),
+                Some(vec![2, 1, 5, 5, 19, 2, 2])
+            );
+            assert_eq!(
+                call(2, &[b"\x0b1\0,\x0c2"]),
+                Some(vec![0, 1, 2, 0, 4, 2, 1])
+            );
+            assert_eq!(call(2, &[]), Some(vec![0; 7]));
+        }
+
+        #[test]
+        fn w455_sorts_mirror_strtolower_trim_and_pattern() {
+            assert_eq!(
+                call(
+                    3,
+                    &[
+                        b"posted_desc",
+                        b" NAME_Asc\n",
+                        b"size_up",
+                        b"",
+                        b"posted_desc\n",
+                        b"cat_asc_",
+                        b"\xc3\x89_asc"
+                    ]
+                ),
+                Some(vec![2, 1, 3, 1, 2, 0, 1, 0, 0, 0, 2, 6])
+            );
+            assert_eq!(
+                call(3, &[b"files_desc", b"stats_asc", b"cat_desc"]),
+                Some(vec![0, 0, 3, 1, 2, 1, 0, 0, 1, 1, 0, 3])
+            );
+        }
+
+        #[test]
+        fn w455_string_leaves_count_trim_results() {
+            assert_eq!(
+                call(4, &[b" a ", b"a", b"\t", b"", b"bb"]),
+                Some(vec![5, 2, 2, 4, 2, 3])
+            );
+        }
+
+        #[test]
+        fn w455_audit_entries_truncate_and_encode() {
+            let long = "é".repeat(70);
+            assert_eq!(
+                call(
+                    5,
+                    &[
+                        b"//api/v2/search",
+                        b"3",
+                        b"cat\0id\0q",
+                        b"5030\0a b\0",
+                        b"api",
+                        b"0",
+                        b"",
+                        b"",
+                        b"/api",
+                        b"1",
+                        b"q",
+                        long.as_bytes(),
+                    ]
+                ),
+                Some(vec![1, 1, 294, 255, 3])
+            );
+            let entry = format!("/x?k={}", "%C3%A9".repeat(64));
+            let (cut, truncated) = utf8_prefix(entry.as_bytes(), 255);
+            assert!(truncated);
+            assert_eq!(cut.len(), 255);
+            assert_eq!(
+                call(5, &[b"x", b"1", b"k", long.as_bytes()]),
+                Some(vec![1, 1, 255, 255, 1])
+            );
+            assert_eq!(call(5, &[b"x", b"1", b"k", b"\xff"]), None);
+            assert_eq!(call(5, &[b"\xff", b"0", b"", b""]), None);
+            assert_eq!(call(5, &[b"x", b"1", b"k"]), None);
+            assert_eq!(call(5, &[b"x", b"1", b"k", b"a\0b"]), None);
+            assert_eq!(utf8_prefix("aé".as_bytes(), 1), (&b"a"[..], true));
+            assert_eq!(utf8_prefix("aé".as_bytes(), 2), ("aé".as_bytes(), false));
+        }
+
+        #[test]
+        fn w455_abi_declines_invalid_input_and_reports_capacity() {
+            let input = packet(&[b"a"]);
+            let mut small = [0i64; 4];
+            assert_eq!(raw(2, &input, &mut small), -7);
+            assert_eq!(small, [0; 4]);
+            let mut out = [0i64; 16];
+            for mode in [0, 6, 99] {
+                assert_eq!(raw(mode, &input, &mut out), DECLINE);
+            }
+            assert_eq!(raw(2, b"", &mut out), DECLINE);
+            assert_eq!(raw(2, b"\x01\x00\x00", &mut out), DECLINE);
+            assert_eq!(
+                raw(2, b"\x01\x00\x00\x00\x09\x00\x00\x00", &mut out),
+                DECLINE
+            );
+            let mut trailing = input.clone();
+            trailing.push(0);
+            assert_eq!(raw(2, &trailing, &mut out), DECLINE);
+            assert_eq!(raw(2, b"\xff\xff\xff\xff", &mut out), DECLINE);
+            assert_eq!(raw(2, &packet(&[]), &mut out), 7);
+            let null = unsafe {
+                nntmux_w455_api_capabilities_canonicalizer_query_cache_usage(
+                    2,
+                    input.as_ptr(),
+                    input.len(),
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!(null, -7);
+            let bad = unsafe {
+                nntmux_w455_api_capabilities_canonicalizer_query_cache_usage(
+                    2,
+                    std::ptr::null(),
+                    4,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert_eq!(bad, DECLINE);
+            assert_eq!(overlaps(10, 5, 14, 1), Some(true));
+            assert_eq!(overlaps(10, 5, 15, 1), Some(false));
+            assert_eq!(overlaps(usize::MAX - 1, 4, 0, 1), None);
+        }
+    }
+}

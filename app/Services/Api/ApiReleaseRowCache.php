@@ -20,9 +20,18 @@ class ApiReleaseRowCache
 
     private const NULL_SENTINEL = ['__nntmux_api_release_row_cache_null' => true];
 
+    /**
+     * Rust stays opt-in for the Wave 45.5 string leaf summary: collecting the leaves in PHP is most of
+     * the work (min 1.22/1.16/1.46/1.28x); see
+     * tests/Unit/RustApiCapabilitiesCanonicalizerQueryCacheUsageW45ParityTest.php.
+     */
+    public const bool W455_RUST_FFI_DEFAULT = false;
+
     public static bool $useRustFfi = false;
 
     private static FFI|false|null $ffi = null;
+
+    private static ?bool $useW455RustFfi = null;
 
     /**
      * Cache release rows only. User-specific response fields should be built after this returns.
@@ -266,6 +275,109 @@ class ApiReleaseRowCache
     public static function setUseRustFfi(bool $useRustFfi): void
     {
         self::$useRustFfi = $useRustFfi;
+    }
+
+    /** Pass null to restore {@see W455_RUST_FFI_DEFAULT}. */
+    public static function useW455RustFfi(?bool $enable = true): void
+    {
+        self::$useW455RustFfi = $enable;
+    }
+
+    public static function usesW455RustFfi(): bool
+    {
+        return self::$useW455RustFfi ?? self::W455_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW455RustFfi(): void
+    {
+        self::$useW455RustFfi = null;
+    }
+
+    /**
+     * Summarizes the top-level values {@see normalizePhp()} sees in each parameter set: `keys`, string
+     * values (`trimmed` when trim() changes them, `blank` after trimming, `string_bytes`,
+     * `max_string_bytes` and `distinct_strings` after trimming), `nested` arrays it recurses into or sorts
+     * and `other` values it keeps as-is, plus `max_keys`. Non-array sets are invalid.
+     *
+     * @param  array<array-key, mixed>  $parameterSets
+     * @return array{sets: int, invalid: int, keys: int, strings: int, trimmed: int, blank: int, string_bytes: int, max_string_bytes: int, nested: int, other: int, max_keys: int, distinct_strings: int}
+     */
+    public function summarizeStringLeafBatch(array $parameterSets): array
+    {
+        return self::usesW455RustFfi() ? $this->summarizeStringLeafBatchNative($parameterSets) : $this->summarizeStringLeafBatchPhp($parameterSets);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $parameterSets
+     * @return array{sets: int, invalid: int, keys: int, strings: int, trimmed: int, blank: int, string_bytes: int, max_string_bytes: int, nested: int, other: int, max_keys: int, distinct_strings: int}
+     */
+    public function summarizeStringLeafBatchPhp(array $parameterSets): array
+    {
+        $summary = ['sets' => \count($parameterSets), 'invalid' => 0, 'keys' => 0, 'strings' => 0, 'trimmed' => 0, 'blank' => 0, 'string_bytes' => 0, 'max_string_bytes' => 0, 'nested' => 0, 'other' => 0, 'max_keys' => 0, 'distinct_strings' => 0];
+        $distinct = [];
+        foreach ($parameterSets as $parameters) {
+            if (! \is_array($parameters)) {
+                $summary['invalid']++;
+
+                continue;
+            }
+            $summary['keys'] += \count($parameters);
+            $summary['max_keys'] = max($summary['max_keys'], \count($parameters));
+            foreach ($parameters as $value) {
+                if (\is_string($value)) {
+                    $trimmed = trim($value);
+                    $length = \strlen($trimmed);
+                    $summary['strings']++;
+                    $summary['trimmed'] += (int) ($length !== \strlen($value));
+                    $summary['blank'] += (int) ($trimmed === '');
+                    $summary['string_bytes'] += $length;
+                    $summary['max_string_bytes'] = max($summary['max_string_bytes'], $length);
+                    $distinct[$trimmed] = true;
+                } elseif (\is_array($value)) {
+                    $summary['nested']++;
+                } else {
+                    $summary['other']++;
+                }
+            }
+        }
+        $summary['distinct_strings'] = \count($distinct);
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $parameterSets
+     * @return array{sets: int, invalid: int, keys: int, strings: int, trimmed: int, blank: int, string_bytes: int, max_string_bytes: int, nested: int, other: int, max_keys: int, distinct_strings: int}
+     */
+    public function summarizeStringLeafBatchNative(array $parameterSets): array
+    {
+        $summary = ['sets' => \count($parameterSets), 'invalid' => 0, 'keys' => 0, 'strings' => 0, 'trimmed' => 0, 'blank' => 0, 'string_bytes' => 0, 'max_string_bytes' => 0, 'nested' => 0, 'other' => 0, 'max_keys' => 0, 'distinct_strings' => 0];
+        $strings = [];
+        foreach ($parameterSets as $parameters) {
+            if (! \is_array($parameters)) {
+                $summary['invalid']++;
+
+                continue;
+            }
+            $summary['keys'] += \count($parameters);
+            $summary['max_keys'] = max($summary['max_keys'], \count($parameters));
+            foreach ($parameters as $value) {
+                if (\is_string($value)) {
+                    $strings[] = $value;
+                } elseif (\is_array($value)) {
+                    $summary['nested']++;
+                } else {
+                    $summary['other']++;
+                }
+            }
+        }
+        $fields = ApiInputCanonicalizer::evaluateW455Native(4, $strings, 6);
+        if ($fields === null) {
+            return $this->summarizeStringLeafBatchPhp($parameterSets);
+        }
+        [$summary['strings'], $summary['trimmed'], $summary['blank'], $summary['string_bytes'], $summary['max_string_bytes'], $summary['distinct_strings']] = $fields;
+
+        return $summary;
     }
 
     public static function mediaFfi(): ?FFI
