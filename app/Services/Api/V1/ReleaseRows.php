@@ -6,6 +6,7 @@ namespace App\Services\Api\V1;
 
 use App\Models\Release;
 use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 use Throwable;
@@ -250,5 +251,171 @@ final class ReleaseRows
         }
 
         return null;
+    }
+
+    public const string W54_FFI_CDEF = 'int64_t nntmux_w545_release_rows_search_name_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W54.5 parity test's QUALIFICATION). */
+    private const bool W54_RUST_FFI_DEFAULT = true;
+
+    /** Resolution of a lower-cased search name token. */
+    private const array W54_RESOLUTIONS = ['2160p' => 2160, '4k' => 2160, 'uhd' => 2160, '1080p' => 1080, '1080i' => 1080, '720p' => 720, '576p' => 576, '480p' => 480];
+
+    /**
+     * Wave 54.5 routing and FFI cache, kept in function-local statics. Without $op it reports the routing;
+     * 'set' swaps the override for $val and returns the previous one; 'reset' replaces the cached handle
+     * with $val (null re-resolves, false disables); 'buffer' returns `[FFI, int64_t[], capacity]` with room
+     * for at least $val words, or null without the library.
+     */
+    private static function w54RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $outCap = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = $val;
+
+                return $previous;
+            case 'reset':
+                $ffi = $val;
+                $out = null;
+                $outCap = 0;
+
+                return null;
+            case 'buffer':
+                if ($ffi === null) {
+                    $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+                    $ffi = RustPipelineLibrary::resolveDomain('w54_5', self::W54_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+                }
+                if (! $ffi instanceof FFI || ! \is_int($val)) {
+                    return null;
+                }
+                if ($out === null || $outCap < $val) {
+                    $outCap = max(1024, $val);
+                    $out = $ffi->new('int64_t['.$outCap.']');
+                }
+
+                return [$ffi, $out, $outCap];
+            default:
+                return $enabled ?? self::W54_RUST_FFI_DEFAULT;
+        }
+    }
+
+    public static function usesW54RustFfi(): bool
+    {
+        return self::w54RustFfiState() === true;
+    }
+
+    /**
+     * Runs $callback with searchNamePlanBatch() routed to Rust ($enabled) or PHP, then restores the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW54RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w54RustFfiState('set', $enabled);
+
+        try {
+            return $callback();
+        } finally {
+            self::w54RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 54.5 Rust helper over $count NUL-joined records, or null
+     * to fall back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w54Words(int $count, string $data, int $words): ?array
+    {
+        try {
+            $handle = self::w54RustFfiState('buffer', $words);
+            if (! \is_array($handle)) {
+                return null;
+            }
+            [$ffi, $out, $cap] = $handle;
+            $written = $ffi->nntmux_w545_release_rows_search_name_plan($count, 0, $data, \strlen($data), '', 0, $out, $cap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('P*', FFI::string($out, $written * 8));
+
+            return \is_array($values) && \count($values) === $words ? array_values($values) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Batch shape of release search names split on `[._\- ]+`. Four words per name: `[tokens, the first
+     * 19xx/20xx token (or 0), the first resolution token (2160 for 2160p/4K/UHD, 1080 for 1080p/1080i,
+     * 720, 576, 480, else 0), flags (1 non-ASCII byte, 2 PROPER/REPACK token, 4 `-GROUP` suffix)]`.
+     *
+     * @param  list<string>  $names
+     * @return list<int>
+     */
+    public static function searchNamePlanBatch(array $names): array
+    {
+        return self::usesW54RustFfi() ? self::searchNamePlanBatchNative($names) : self::searchNamePlanBatchPhp($names);
+    }
+
+    /**
+     * @param  list<string>  $names
+     * @return list<int>
+     */
+    public static function searchNamePlanBatchPhp(array $names): array
+    {
+        $out = [];
+        foreach ($names as $name) {
+            $tokens = preg_split('/[._\- ]+/', $name, -1, PREG_SPLIT_NO_EMPTY) ?: [];
+            $year = 0;
+            $resolution = 0;
+            $flags = preg_match('/[\x80-\xff]/', $name) === 1 ? 1 : 0;
+            foreach ($tokens as $token) {
+                $lower = strtolower($token);
+                if ($year === 0 && \strlen($token) === 4 && (str_starts_with($token, '19') || str_starts_with($token, '20')) && ctype_digit($token)) {
+                    $year = (int) $token;
+                }
+                if ($resolution === 0) {
+                    $resolution = self::W54_RESOLUTIONS[$lower] ?? 0;
+                }
+                if ($lower === 'proper' || $lower === 'repack') {
+                    $flags |= 2;
+                }
+            }
+            if (preg_match('/-[A-Za-z0-9]+\z/', $name) === 1) {
+                $flags |= 4;
+            }
+            array_push($out, \count($tokens), $year, $resolution, $flags);
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch over the NUL-joined values; falls back to PHP without the library or when a value holds
+     * a NUL.
+     *
+     * @param  list<string>  $names
+     * @return list<int>
+     */
+    public static function searchNamePlanBatchNative(array $names): array
+    {
+        $count = \count($names);
+        if ($count === 0) {
+            return [];
+        }
+
+        return self::w54Words($count, implode("\0", $names), 4 * $count) ?? self::searchNamePlanBatchPhp($names);
     }
 }
