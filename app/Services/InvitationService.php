@@ -9,9 +9,11 @@ use App\Models\Invitation;
 use App\Models\User;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Facades\Validator;
 use Illuminate\Validation\ValidationException;
+use InvalidArgumentException;
 use Throwable;
 
 class InvitationService
@@ -398,5 +400,198 @@ class InvitationService
             $expiredInvitations,
             $cancelledInvitations,
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 50.4 batch helper
+    // ---------------------------------------------------------------------
+
+    /** Enabled: minimum of three paired runs cleared every 1.5x gate (common mean 3.33x, p99 2.62x; uncommon mean 3.25x, p99 2.63x); see RustBookCandidateFanartForkingGenreInvitationW50ParityTest. */
+    private const bool W50_RUST_FFI_DEFAULT = true;
+
+    public const string W50_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w504_invitation_ledger_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** State flags returned by invitationLedgerBatch(). */
+    public const int W50_VALID = 1;
+
+    public const int W50_EXPIRED = 2;
+
+    public const int W50_USED = 4;
+
+    public const int W50_CANCELLED = 8;
+
+    public const int W50_PLAUSIBLE_EMAIL = 16;
+
+    public const int W50_UNNORMALIZED_EMAIL = 32;
+
+    private const int W50_SCALARS = 3;
+
+    private static ?bool $useW50RustFfi = null;
+
+    private static FFI|false|null $w50Ffi = null;
+
+    private static ?CData $w50Out = null;
+
+    private static int $w50OutCap = 0;
+
+    public static function usesW50RustFfi(): bool
+    {
+        return self::$useW50RustFfi ?? self::W50_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W50 batch dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW50RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$useW50RustFfi;
+        self::$useW50RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$useW50RustFfi = $previous;
+        }
+    }
+
+    /**
+     * Ledger a batch of invitations, three ints each: [state flags, first earlier duplicate,
+     * trimmed email span]. Each invitation supplies three ints in $scalars ([is_active 0/1,
+     * expires_at µs, has used_at 0/1]) and its email; $nowUs is the shared clock in
+     * Invitation::toMicroTimestamp() units.
+     *
+     * States follow Invitation::evaluateInvitationState(): 1 valid, 2 expired, 4 used, plus
+     * 8 cancelled (inactive and unused). 16 marks a plausible normalized email (one '@'
+     * after a non-empty local part, a dotted domain neither starting nor ending in '.', no
+     * space, control or DEL bytes) and 32 an email that Invitation::normalizeEmail() would
+     * change. The duplicate is the first earlier row with the same non-empty normalized email,
+     * otherwise -1; the span is the trimmed email as offset << 32 | length.
+     *
+     * @param  list<int>  $scalars
+     * @param  list<string>  $emails
+     * @return list<int>
+     */
+    public static function invitationLedgerBatch(int $nowUs, array $scalars, array $emails): array
+    {
+        return self::usesW50RustFfi()
+            ? self::invitationLedgerBatchNative($nowUs, $scalars, $emails)
+            : self::invitationLedgerBatchPhp($nowUs, $scalars, $emails);
+    }
+
+    /**
+     * @param  list<int>  $scalars
+     * @param  list<string>  $emails
+     * @return list<int>
+     */
+    public static function invitationLedgerBatchNative(int $nowUs, array $scalars, array $emails): array
+    {
+        self::w50AssertShape($scalars, $emails);
+        if ($emails === []) {
+            return [];
+        }
+
+        return self::w50Call(implode("\0", $emails), pack('P*', $nowUs, ...$scalars), \count($emails))
+            ?? self::invitationLedgerBatchPhp($nowUs, $scalars, $emails);
+    }
+
+    /**
+     * @param  list<int>  $scalars
+     * @param  list<string>  $emails
+     * @return list<int>
+     */
+    public static function invitationLedgerBatchPhp(int $nowUs, array $scalars, array $emails): array
+    {
+        self::w50AssertShape($scalars, $emails);
+        $out = [];
+        $seen = [];
+        $at = 0;
+        foreach ($emails as $i => $raw) {
+            $active = $scalars[$at] !== 0;
+            $expiresAt = $scalars[$at + 1];
+            $used = $scalars[$at + 2] !== 0;
+            $at += self::W50_SCALARS;
+            $state = 0;
+            if ($active && $expiresAt > $nowUs && ! $used) {
+                $state |= self::W50_VALID;
+            }
+            if ($expiresAt < $nowUs) {
+                $state |= self::W50_EXPIRED;
+            }
+            if ($used) {
+                $state |= self::W50_USED;
+            } elseif (! $active) {
+                $state |= self::W50_CANCELLED;
+            }
+            $email = trim($raw);
+            $normalized = strtolower($email);
+            if ($normalized !== $raw) {
+                $state |= self::W50_UNNORMALIZED_EMAIL;
+            }
+            $first = -1;
+            if ($normalized !== '') {
+                $first = $seen[$normalized] ??= $i;
+                $first = $first === $i ? -1 : $first;
+                $sign = strpos($normalized, '@');
+                if ($sign !== false && $sign > 0 && strpos($normalized, '@', $sign + 1) === false
+                    && \strlen($normalized) - $sign > 3 && $normalized[$sign + 1] !== '.' && $normalized[-1] !== '.'
+                    && strpos($normalized, '.', $sign + 2) !== false && preg_match('/[\x00-\x20\x7F]/', $normalized) !== 1) {
+                    $state |= self::W50_PLAUSIBLE_EMAIL;
+                }
+            }
+            array_push($out, $state, $first, (strspn($raw, " \t\n\r\0\x0B") << 32) | \strlen($email));
+        }
+
+        return $out;
+    }
+
+    /**
+     * One FFI crossing for the batch: NUL-joined emails, little-endian int64 clock and
+     * scalars, three int64 words back per invitation. Null when the library is missing or
+     * declines.
+     *
+     * @return list<int>|null
+     */
+    private static function w50Call(string $text, string $ints, int $count): ?array
+    {
+        try {
+            self::$w50Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w50', self::W50_FFI_CDEF) ?? false;
+            $ffi = self::$w50Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            $need = $count * 3;
+            $out = self::$w50Out;
+            if ($out === null || self::$w50OutCap < $need) {
+                self::$w50OutCap = max(1024, $need);
+                $out = self::$w50Out = $ffi->new('int64_t['.self::$w50OutCap.']');
+            }
+            // @phpstan-ignore method.notFound (Declared by W50_FFI_CDEF.)
+            $written = $ffi->nntmux_w504_invitation_ledger_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, self::$w50OutCap);
+            if ($written !== $need) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $need * 8));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $scalars
+     * @param  array<array-key, mixed>  $emails
+     */
+    private static function w50AssertShape(array $scalars, array $emails): void
+    {
+        if (! array_is_list($scalars) || ! array_is_list($emails) || \count($scalars) !== \count($emails) * self::W50_SCALARS) {
+            throw new InvalidArgumentException('W50 invitation batches need list columns and three scalars per invitation.');
+        }
     }
 }

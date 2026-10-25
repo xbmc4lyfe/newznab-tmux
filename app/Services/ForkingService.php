@@ -11,7 +11,9 @@ use App\Services\Runners\PostProcessRunner;
 use App\Services\Runners\ReleasesRunner;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\Log;
+use InvalidArgumentException;
 use Symfony\Component\Process\Process;
 use Throwable;
 
@@ -482,5 +484,161 @@ class ForkingService
         }
 
         return self::$ffi === false ? null : self::$ffi;
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 50.4 batch helper
+    // ---------------------------------------------------------------------
+
+    /** Enabled: minimum of three paired runs cleared every 1.5x gate (common mean 2.82x, p99 2.83x; uncommon mean 2.46x, p99 2.06x); see RustBookCandidateFanartForkingGenreInvitationW50ParityTest. */
+    private const bool W50_RUST_FFI_DEFAULT = true;
+
+    public const string W50_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w504_fork_timing_parse_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Work type index reported by parseTimingHeaderBatch() for a line that is not a timing header. */
+    public const int W50_NOT_A_HEADER = -2;
+
+    private const string W50_PREFIX = 'Multi-processing for ';
+
+    private static ?bool $useW50RustFfi = null;
+
+    private static FFI|false|null $w50Ffi = null;
+
+    private static ?CData $w50Out = null;
+
+    private static int $w50OutCap = 0;
+
+    public static function usesW50RustFfi(): bool
+    {
+        return self::$useW50RustFfi ?? self::W50_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W50 batch dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW50RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$useW50RustFfi;
+        self::$useW50RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$useW50RustFfi = $previous;
+        }
+    }
+
+    /**
+     * Parse timingHeader() console lines, four ints each: [work type index, elapsed seconds,
+     * task length, date offset << 32 | date length]. One trailing "\n" is ignored. A header
+     * is "Multi-processing for {task} finished in {1-18 digits} seconds at {date}." with the
+     * task ending at the first " finished in "; the index is the task's exact position in
+     * WORK_TYPES or -1. Other lines yield [W50_NOT_A_HEADER, 0, 0, 0].
+     *
+     * @param  list<string>  $lines
+     * @return list<int>
+     */
+    public static function parseTimingHeaderBatch(array $lines): array
+    {
+        return self::usesW50RustFfi()
+            ? self::parseTimingHeaderBatchNative($lines)
+            : self::parseTimingHeaderBatchPhp($lines);
+    }
+
+    /**
+     * @param  list<string>  $lines
+     * @return list<int>
+     */
+    public static function parseTimingHeaderBatchNative(array $lines): array
+    {
+        self::w50AssertList($lines);
+        if ($lines === []) {
+            return [];
+        }
+
+        return self::w50Call(implode("\0", $lines), '', \count($lines))
+            ?? self::parseTimingHeaderBatchPhp($lines);
+    }
+
+    /**
+     * @param  list<string>  $lines
+     * @return list<int>
+     */
+    public static function parseTimingHeaderBatchPhp(array $lines): array
+    {
+        self::w50AssertList($lines);
+        static $indexes = null;
+        $indexes ??= array_flip(self::WORK_TYPES);
+        $out = [];
+        foreach ($lines as $line) {
+            if (str_ends_with($line, "\n")) {
+                $line = substr($line, 0, -1);
+            }
+            $finished = str_starts_with($line, self::W50_PREFIX) ? strpos($line, ' finished in ', 21) : false;
+            if ($finished !== false) {
+                $digits = strspn($line, '0123456789', $finished + 13);
+                $dateStart = $finished + 25 + $digits;
+                $length = \strlen($line);
+                if ($digits >= 1 && $digits <= 18 && substr_compare($line, ' seconds at ', $finished + 13 + $digits, 12) === 0
+                    && $length > $dateStart && $line[$length - 1] === '.') {
+                    $task = substr($line, 21, $finished - 21);
+                    array_push($out, $indexes[$task] ?? -1, (int) substr($line, $finished + 13, $digits), $finished - 21, ($dateStart << 32) | ($length - 1 - $dateStart));
+
+                    continue;
+                }
+            }
+            array_push($out, self::W50_NOT_A_HEADER, 0, 0, 0);
+        }
+
+        return $out;
+    }
+
+    /**
+     * One FFI crossing for the batch: NUL-joined lines, four int64 words back per line.
+     * Null when the library is missing or declines.
+     *
+     * @return list<int>|null
+     */
+    private static function w50Call(string $text, string $ints, int $count): ?array
+    {
+        try {
+            self::$w50Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w50', self::W50_FFI_CDEF) ?? false;
+            $ffi = self::$w50Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            $need = $count * 4;
+            $out = self::$w50Out;
+            if ($out === null || self::$w50OutCap < $need) {
+                self::$w50OutCap = max(1024, $need);
+                $out = self::$w50Out = $ffi->new('int64_t['.self::$w50OutCap.']');
+            }
+            // @phpstan-ignore method.notFound (Declared by W50_FFI_CDEF.)
+            $written = $ffi->nntmux_w504_fork_timing_parse_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, self::$w50OutCap);
+            if ($written !== $need) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $need * 8));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $lines
+     */
+    private static function w50AssertList(array $lines): void
+    {
+        if (! array_is_list($lines)) {
+            throw new InvalidArgumentException('W50 batch columns must be lists.');
+        }
     }
 }
