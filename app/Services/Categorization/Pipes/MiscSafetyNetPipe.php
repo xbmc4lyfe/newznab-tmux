@@ -64,6 +64,37 @@ class MiscSafetyNetPipe extends AbstractCategorizationPipe
 
     private static FFI|false|null $predbTransactionRustFfiHandle = null;
 
+    /**
+     * Wave 46.3 production default stays PHP: the paired benchmark in
+     * tests/Unit/RustAbstractCategorizerPipeSafetyNetDisplayNamesW46ParityTest.php measures
+     * 0.84-0.98x mean / 0.77-1.40x p99 on the common 32-label batch and 1.35-1.41x mean /
+     * 1.13-1.32x p99 uncommon (one prefix check per label costs about what packing does), below
+     * the 1.5x gate. useW463RustFfi(true) keeps the Rust helper available for parity and benchmarks.
+     * Named W463 so it stays distinct from the class's existing useRustFfi paths.
+     */
+    public const bool W463_RUST_FFI_DEFAULT = false;
+
+    public const string W463_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w463_safety_net_downgrade_batch(
+            const char *blob_ptr,
+            size_t blob_len,
+            const char *lens_ptr,
+            size_t lens_len,
+            char *out_buf,
+            size_t out_cap
+        );
+        C;
+
+    /** shouldDowngradeToMiscPhp() group-only matched-by prefix. */
+    public const string W463_GROUP_PREFIX = 'group_name_';
+
+    /** Exactly 5 0x1F-separated decimals of 1-19 digits. */
+    private const string W463_FIELDS_PATTERN = '/\A(?:\d{1,19}\x1F){4}\d{1,19}\z/';
+
+    private static ?bool $w463RustFfiOverride = null;
+
+    private static FFI|false|null $w463RustFfiHandle = null;
+
     public static bool $useRustFfi = false;
 
     protected int $priority = 100;
@@ -303,5 +334,167 @@ class MiscSafetyNetPipe extends AbstractCategorizationPipe
         }
 
         return self::$predbTransactionRustFfiHandle === false ? null : self::$predbTransactionRustFfiHandle;
+    }
+
+    /**
+     * Enables (true) or disables (false) the Wave 46.3 Rust helper; null restores
+     * W463_RUST_FFI_DEFAULT.
+     */
+    public static function useW463RustFfi(?bool $enable = true): void
+    {
+        self::$w463RustFfiOverride = $enable;
+    }
+
+    public static function usesW463RustFfi(): bool
+    {
+        return self::$w463RustFfiOverride ?? self::W463_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW463RustFfi(): void
+    {
+        self::$w463RustFfiOverride = null;
+        self::$w463RustFfiHandle = null;
+    }
+
+    /**
+     * Downgrade summary for a batch of best results, applying shouldDowngradeToMiscPhp() per entry:
+     * matched-by labels starting with W463_GROUP_PREFIX, entries whose $lowSignal or $locked value
+     * under the same key is exactly true, and entries the pipe would downgrade (group-matched, low
+     * signal and not locked). Non-string labels count as empty labels.
+     *
+     * @param  array<array-key, mixed>  $matchedBy
+     * @param  array<array-key, mixed>  $lowSignal
+     * @param  array<array-key, mixed>  $locked
+     * @return array{total: int, group_matched: int, low_signal: int, locked: int, downgrade: int}
+     */
+    public static function summarizeDowngradeBatch(array $matchedBy, array $lowSignal = [], array $locked = []): array
+    {
+        return (self::usesW463RustFfi() ? self::summarizeDowngradeBatchNative($matchedBy, $lowSignal, $locked) : null)
+            ?? self::summarizeDowngradeBatchPhp($matchedBy, $lowSignal, $locked);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $matchedBy
+     * @param  array<array-key, mixed>  $lowSignal
+     * @param  array<array-key, mixed>  $locked
+     * @return array{total: int, group_matched: int, low_signal: int, locked: int, downgrade: int}
+     */
+    public static function summarizeDowngradeBatchPhp(array $matchedBy, array $lowSignal = [], array $locked = []): array
+    {
+        $group = $low = $lockedCount = $downgrade = 0;
+        foreach ($matchedBy as $key => $label) {
+            $isGroup = \is_string($label) && str_starts_with($label, self::W463_GROUP_PREFIX);
+            $isLow = ($lowSignal[$key] ?? false) === true;
+            $isLocked = ($locked[$key] ?? false) === true;
+            $group += (int) $isGroup;
+            $low += (int) $isLow;
+            $lockedCount += (int) $isLocked;
+            $downgrade += (int) (! $isLocked && $isLow && $isGroup);
+        }
+
+        return [
+            'total' => \count($matchedBy),
+            'group_matched' => $group,
+            'low_signal' => $low,
+            'locked' => $lockedCount,
+            'downgrade' => $downgrade,
+        ];
+    }
+
+    /**
+     * Sends the labels followed by one flags item (a byte per label: bit 0 low signal, bit 1 locked).
+     * Declines (null) for non-list or non-string labels and when the library is unavailable.
+     *
+     * @param  array<array-key, mixed>  $matchedBy
+     * @param  array<array-key, mixed>  $lowSignal
+     * @param  array<array-key, mixed>  $locked
+     * @return array{total: int, group_matched: int, low_signal: int, locked: int, downgrade: int}|null
+     */
+    public static function summarizeDowngradeBatchNative(array $matchedBy, array $lowSignal = [], array $locked = []): ?array
+    {
+        if (! array_is_list($matchedBy)) {
+            return null;
+        }
+        $lengths = [];
+        foreach ($matchedBy as $label) {
+            if (! \is_string($label)) {
+                return null;
+            }
+            $lengths[] = \strlen($label);
+        }
+        $count = \count($matchedBy);
+        $flags = str_repeat("\0", $count);
+        foreach (array_keys($lowSignal, true, true) as $key) {
+            if (\is_int($key) && $key >= 0 && $key < $count) {
+                $flags[$key] = "\x01";
+            }
+        }
+        foreach (array_keys($locked, true, true) as $key) {
+            if (\is_int($key) && $key >= 0 && $key < $count) {
+                $flags[$key] = $flags[$key] === "\x01" ? "\x03" : "\x02";
+            }
+        }
+        $lengths[] = $count;
+        $fields = self::callW463Native(implode('', $matchedBy).$flags, pack('V*', ...$lengths));
+        if ($fields === null) {
+            return null;
+        }
+
+        return [
+            'total' => (int) $fields[0],
+            'group_matched' => (int) $fields[1],
+            'low_signal' => (int) $fields[2],
+            'locked' => (int) $fields[3],
+            'downgrade' => (int) $fields[4],
+        ];
+    }
+
+    /**
+     * Calls the Wave 46.3 export with the shared scratch buffer, retrying once at the size it asks
+     * for. Returns its fields only when they match W463_FIELDS_PATTERN.
+     *
+     * @return list<string>|null
+     */
+    private static function callW463Native(string $blob, string $lens): ?array
+    {
+        $ffi = self::w463RustFfi();
+        if ($ffi === null) {
+            return null;
+        }
+
+        try {
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, 192, $capacity);
+            if ($buffer === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w463_safety_net_downgrade_batch($blob, \strlen($blob), $lens, \strlen($lens), $buffer, $capacity);
+            if (\is_int($written) && $written < -1) {
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w463_safety_net_downgrade_batch($blob, \strlen($blob), $lens, \strlen($lens), $buffer, $capacity);
+            }
+            if (! \is_int($written) || $written < 0 || $written > $capacity) {
+                return null;
+            }
+            $raw = FFI::string($buffer, $written);
+
+            return preg_match(self::W463_FIELDS_PATTERN, $raw) === 1 ? explode("\x1F", $raw) : null;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private static function w463RustFfi(): ?FFI
+    {
+        if (self::$w463RustFfiHandle === null) {
+            self::$w463RustFfiHandle = RustPipelineLibrary::resolveDomain('categorize_w463', self::W463_FFI_CDEF) ?? false;
+        }
+
+        return self::$w463RustFfiHandle === false ? null : self::$w463RustFfiHandle;
     }
 }
