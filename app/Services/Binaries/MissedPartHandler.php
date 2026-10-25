@@ -397,4 +397,117 @@ final class MissedPartHandler
             ->where('attempts', '>=', $this->partRepairMaxTries)
             ->delete();
     }
+
+    /**
+     * PHP stays the default for summarizeMissedPartBatch(): the paired benchmark in
+     * tests/Unit/RustBinariesTransactionMissedPartBackfillW42ParityTest.php does not clear 1.5x.
+     */
+    public const bool W421_RUST_FFI_DEFAULT = false;
+
+    private const array W421_MISSED_KEYS = ['parts', 'invalid_rows', 'bad_number', 'bad_group', 'bad_attempts', 'exhausted', 'retryable', 'duplicates',
+        'min_number', 'max_number'];
+
+    private static ?bool $w421UseRustFfi = null;
+
+    private static FFI|false|null $w421Ffi = null;
+
+    /**
+     * Summarizes part repair queue rows (`numberid`, `groups_id`, `attempts`): an article number or group id that is not
+     * a positive int (or 1-18 digit string) is bad, attempts that are not a non-negative int are bad, attempts at or
+     * above `$maxTries` are exhausted and the rest retryable. Rows repeating a valid (group, number) pair are
+     * duplicates, and the smallest and largest valid numbers are reported (0 when none). Non-array rows are invalid.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeMissedPartBatch(array $rows, int $maxTries = 3): array
+    {
+        return (self::usesW421RustFfi() ? self::summarizeMissedPartBatchNative($rows, $maxTries) : null)
+            ?? self::summarizeMissedPartBatchPhp($rows, $maxTries);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeMissedPartBatchPhp(array $rows, int $maxTries = 3): array
+    {
+        $summary = array_fill_keys(self::W421_MISSED_KEYS, 0);
+        $summary['parts'] = \count($rows);
+        $seen = [];
+        $any = false;
+        foreach ($rows as $row) {
+            if (! \is_array($row)) {
+                $summary['invalid_rows']++;
+
+                continue;
+            }
+            $number = BinariesService::w411Int($row['numberid'] ?? null);
+            $number = $number !== null && $number > 0 ? $number : null;
+            $group = BinariesService::w411Int($row['groups_id'] ?? null);
+            $group = $group !== null && $group > 0 ? $group : null;
+            $attempts = BinariesService::w411Int($row['attempts'] ?? null);
+            $summary['bad_number'] += (int) ($number === null);
+            $summary['bad_group'] += (int) ($group === null);
+            if ($attempts === null || $attempts < 0) {
+                $summary['bad_attempts']++;
+            } elseif ($attempts >= $maxTries) {
+                $summary['exhausted']++;
+            } else {
+                $summary['retryable']++;
+            }
+            if ($number === null) {
+                continue;
+            }
+            if ($any) {
+                $summary['min_number'] = min($summary['min_number'], $number);
+                $summary['max_number'] = max($summary['max_number'], $number);
+            } else {
+                [$summary['min_number'], $summary['max_number'], $any] = [$number, $number, true];
+            }
+            if ($group !== null) {
+                $key = $group.':'.$number;
+                $summary['duplicates'] += (int) isset($seen[$key]);
+                $seen[$key] = true;
+            }
+        }
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>|null
+     */
+    public static function summarizeMissedPartBatchNative(array $rows, int $maxTries = 3): ?array
+    {
+        $words = [$maxTries, \count($rows)];
+        $blob = [];
+        foreach ($rows as $row) {
+            if (\is_array($row)) {
+                BinariesService::w411PackRow($words, $blob, [$row['numberid'] ?? null, $row['groups_id'] ?? null, $row['attempts'] ?? null]);
+            } else {
+                $words[] = 0;
+            }
+        }
+        $values = HeaderStorageTransaction::w421Invoke(self::$w421Ffi, 2, $words, $blob);
+
+        return $values !== null && \count($values) === \count(self::W421_MISSED_KEYS) ? array_combine(self::W421_MISSED_KEYS, $values) : null;
+    }
+
+    public static function useW421RustFfi(bool $enable = true): void
+    {
+        self::$w421UseRustFfi = $enable;
+    }
+
+    public static function usesW421RustFfi(): bool
+    {
+        return self::$w421UseRustFfi ?? self::W421_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW421RustFfi(): void
+    {
+        self::$w421UseRustFfi = null;
+        self::$w421Ffi = null;
+    }
 }
