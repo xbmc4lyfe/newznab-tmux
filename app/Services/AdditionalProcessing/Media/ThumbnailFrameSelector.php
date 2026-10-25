@@ -20,14 +20,13 @@ use Throwable;
  * way into the part that was downloaded, estimated from the container's
  * duration and the file's real size or the stream's bit rate.
  *
- * looksLikeText() and window() stay on native PHP: on 4 KiB playlist heads ltrim + stripos
- * finishes in ~89 ns (matching a bare FFI call), and window() is three float operations
- * (~100 ns), so the Rust candidates (looksLikeTextNative(), windowNative(), selectNative())
- * measure below the 1.5x adoption threshold across all required workloads
- * (see tests/Unit/RustImageInspectorFrameScorerParityTest.php).
+ * Wave 45 helpers remain opt-in: caller-level mean and p99 benchmarks do not
+ * meet the 1.5x gate on both workloads. See the Wave 45 parity test.
  */
 class ThumbnailFrameSelector
 {
+    public const bool W45_RUST_FFI_DEFAULT = false;
+
     /** Share of the downloaded playing time skipped before taking frames. */
     private const float START_FRACTION = 0.25;
 
@@ -35,9 +34,11 @@ class ThumbnailFrameSelector
     private const float PLAYABLE_MARGIN = 0.85;
 
     private const string FFI_CDEF = <<<'C'
-        int32_t nntmux_thumbnail_looks_like_text(const char *head_ptr, size_t head_len);
-        int32_t nntmux_thumbnail_window(uint32_t position_is_mid, double duration, uint32_t has_duration, int64_t bit_rate, uint32_t has_bit_rate, int64_t available_bytes, int64_t total_bytes, uint32_t has_hints, int32_t attempts, double *out_from, double *out_spacing);
+        int32_t nntmux_w45_thumbnail_looks_like_text(const char *head_ptr, size_t head_len);
+        int32_t nntmux_w45_thumbnail_window(uint32_t position_is_mid, double duration, uint32_t has_duration, int64_t bit_rate, uint32_t has_bit_rate, int64_t available_bytes, int64_t total_bytes, uint32_t has_hints, int32_t attempts, double *out_from, double *out_spacing);
         C;
+
+    private static bool $useRustFfi = self::W45_RUST_FFI_DEFAULT;
 
     private static ?FFI $ffi = null;
 
@@ -48,6 +49,16 @@ class ThumbnailFrameSelector
     private static ?CData $fromOut = null;
 
     private static ?CData $spacingOut = null;
+
+    public static function useW45RustFfi(?bool $enabled): void
+    {
+        self::$useRustFfi = $enabled ?? self::W45_RUST_FFI_DEFAULT;
+    }
+
+    public static function usesW45RustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
 
     public function __construct(
         private readonly ProcessingConfiguration $config,
@@ -122,7 +133,9 @@ class ThumbnailFrameSelector
      */
     public function window(string $videoPath, ?VideoContainer $container, ?MediaSourceHints $hints): array
     {
-        return $this->windowPhp($videoPath, $container, $hints);
+        return self::$useRustFfi
+            ? $this->windowNative($videoPath, $container, $hints)
+            : $this->windowPhp($videoPath, $container, $hints);
     }
 
     /**
@@ -147,14 +160,14 @@ class ThumbnailFrameSelector
     {
         $supported = false;
         $ffi = self::ffi();
-        if ($ffi === null || self::$fromOut === null || self::$spacingOut === null || self::$windowOut === null || $this->config->thumbnailFrameAttempts <= 0) {
+        if ($ffi === null || self::$fromOut === null || self::$spacingOut === null || self::$windowOut === null || $this->config->thumbnailFrameAttempts <= 0 || $this->config->thumbnailFrameAttempts > 2147483647) {
             return $this->windowPhp($videoPath, $container, $hints);
         }
 
         if ($hints?->position === SourcePosition::Mid) {
             try {
                 // @phpstan-ignore method.notFound
-                $status = $ffi->nntmux_thumbnail_window(1, 0.0, 0, 0, 0, 0, 0, 1, $this->config->thumbnailFrameAttempts, self::$fromOut, self::$spacingOut);
+                $status = $ffi->nntmux_w45_thumbnail_window(1, 0.0, 0, 0, 0, 0, 0, 1, $this->config->thumbnailFrameAttempts, self::$fromOut, self::$spacingOut);
             } catch (Throwable) {
                 return $this->windowPhp($videoPath, $container, $hints);
             }
@@ -164,6 +177,10 @@ class ThumbnailFrameSelector
             $supported = true;
 
             return [(float) self::$windowOut[0], (float) self::$windowOut[1]];
+        }
+
+        if ($hints !== null && $hints->position !== SourcePosition::Complete && $hints->availableBytes > 0 && $hints->realSize !== null && $hints->realSize <= 0) {
+            return $this->windowPhp($videoPath, $container, $hints);
         }
 
         ['duration' => $duration, 'bitRate' => $bitRate] = $this->grabber->probe($videoPath, $container);
@@ -179,7 +196,7 @@ class ThumbnailFrameSelector
 
         try {
             // @phpstan-ignore method.notFound
-            $status = $ffi->nntmux_thumbnail_window(
+            $status = $ffi->nntmux_w45_thumbnail_window(
                 0,
                 $duration ?? 0.0,
                 $duration !== null ? 1 : 0,
@@ -205,7 +222,7 @@ class ThumbnailFrameSelector
 
     public static function looksLikeText(string $head): bool
     {
-        return self::looksLikeTextPhp($head);
+        return self::$useRustFfi ? self::looksLikeTextNative($head) : self::looksLikeTextPhp($head);
     }
 
     public static function looksLikeTextNative(string $head, bool &$supported = false): bool
@@ -218,7 +235,7 @@ class ThumbnailFrameSelector
 
         try {
             // @phpstan-ignore method.notFound
-            $status = $ffi->nntmux_thumbnail_looks_like_text($head, strlen($head));
+            $status = $ffi->nntmux_w45_thumbnail_looks_like_text($head, strlen($head));
         } catch (Throwable) {
             return self::looksLikeTextPhp($head);
         }
@@ -255,7 +272,7 @@ class ThumbnailFrameSelector
     {
         if (! self::$ffiResolved) {
             self::$ffiResolved = true;
-            $ffi = RustPipelineLibrary::resolveDomain('thumbnail_frame_selector', self::FFI_CDEF);
+            $ffi = RustPipelineLibrary::resolveDomain('additional', self::FFI_CDEF);
             if ($ffi !== null) {
                 try {
                     $window = $ffi->new('double[2]');
