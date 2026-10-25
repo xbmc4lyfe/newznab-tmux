@@ -16,18 +16,33 @@ use Throwable;
  * Openings are often black or show logos; a frame from the middle shows the content.
  * Only the containers whose stream can be picked up again at a known marker are supported.
  *
- * splice() stays on PHP: the joined copy dominates its cost and Zend's strpos/PCRE scans are
+ * splice() defaults to PHP: the joined copy dominates its cost and Zend's strpos/PCRE scans are
  * already native, so the Rust offset scanner (spliceNative()) measured below the 1.5x adoption
  * threshold (see tests/Unit/RustMediaSlicerSplicerParityTest.php).
  */
 final class ContainerSplicer
 {
+    // Production adoption requires >= 1.5x mean and p99 on both W43 workloads.
+    public const bool W43_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $w43RustFfi = null;
+
+    public static function useRustFfi(?bool $enabled = true): void
+    {
+        self::$w43RustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$w43RustFfi ?? self::W43_RUST_FFI_DEFAULT;
+    }
+
     private const string MATROSKA_CLUSTER = "\x1F\x43\xB6\x75";
 
     private const string MPEG_PACK_START = "\x00\x00\x01\xBA";
 
     private const string FFI_CDEF = <<<'C'
-        int32_t nntmux_container_splice(uint8_t container_code, const char *head, size_t head_len, const char *tail, size_t tail_len, size_t *out_head_end, size_t *out_tail_start);
+        int32_t nntmux_w436_container_splice(uint8_t container_code, const char *head, size_t head_len, const char *tail, size_t tail_len, size_t *out_head_end, size_t *out_tail_start);
         C;
 
     private static ?FFI $ffi = null;
@@ -46,9 +61,14 @@ final class ContainerSplicer
      */
     public function splice(string $head, string $mid, VideoContainer $container): ?string
     {
+        return self::usesRustFfi() ? $this->spliceNative($head, $mid, $container) : $this->splicePhp($head, $mid, $container);
+    }
+
+    public function splicePhp(string $head, string $mid, VideoContainer $container): ?string
+    {
         return match ($container) {
             VideoContainer::Matroska => $this->joinAt($head, self::MATROSKA_CLUSTER, $mid, self::MATROSKA_CLUSTER),
-            VideoContainer::MpegTransport => ($offset = VideoContainer::transportStreamOffset($mid)) === null ? null : substr($mid, $offset),
+            VideoContainer::MpegTransport => ($offset = VideoContainer::transportStreamOffsetPhp($mid)) === null ? null : substr($mid, $offset),
             VideoContainer::MpegProgram => ($offset = strpos($mid, self::MPEG_PACK_START)) === false ? null : substr($mid, $offset),
             VideoContainer::Avi => $this->spliceAvi($head, $mid),
             default => null,
@@ -71,17 +91,17 @@ final class ContainerSplicer
         };
         $ffi = self::ffi();
         if ($ffi === null || self::$headEndOut === null || self::$midStartOut === null || self::$offsets === null) {
-            return $this->splice($head, $mid, $container);
+            return $this->splicePhp($head, $mid, $container);
         }
 
         try {
             // @phpstan-ignore method.notFound
-            $status = $ffi->nntmux_container_splice($code, $head, strlen($head), $mid, strlen($mid), self::$headEndOut, self::$midStartOut);
+            $status = $ffi->nntmux_w436_container_splice($code, $head, strlen($head), $mid, strlen($mid), self::$headEndOut, self::$midStartOut);
         } catch (Throwable) {
-            return $this->splice($head, $mid, $container);
+            return $this->splicePhp($head, $mid, $container);
         }
         if (! is_int($status) || $status < 0) {
-            return $this->splice($head, $mid, $container);
+            return $this->splicePhp($head, $mid, $container);
         }
         $supported = true;
         if ($status !== 1) {
