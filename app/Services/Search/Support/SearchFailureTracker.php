@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Search\Support;
 
+use App\Services\Search\SearchService;
 use App\Support\RustPipelineLibrary;
 use FFI;
 
@@ -132,5 +133,110 @@ final class SearchFailureTracker
         $result = $ffi->nntmux_search_failure_reached($this->failures, $threshold);
 
         return \is_int($result) && $result >= 0 ? $result === 1 : $this->reachedThresholdPhp($threshold);
+    }
+
+    /**
+     * Rust stays opt-in for the Wave 40.5 summary: the FFI round trip misses the 1.5x gate; see
+     * tests/Unit/RustManticoreElasticSearchServiceCircuitW40ParityTest.php.
+     */
+    public const bool W405_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useW405RustFfi = null;
+
+    public static function useW405RustFfi(?bool $use = true): void
+    {
+        self::$useW405RustFfi = $use;
+    }
+
+    public static function usesW405RustFfi(): bool
+    {
+        return self::$useW405RustFfi ?? self::W405_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW405RustFfi(): void
+    {
+        self::$useW405RustFfi = null;
+    }
+
+    /**
+     * Evaluates the circuit state window. Failures and cooldown clamp at 0 and the threshold at 1.
+     * Below the threshold the circuit is `closed`; otherwise it stays `open` until the cooldown
+     * since `$openedAtUnix` has elapsed (a future open time counts as no elapsed time, and elapsed
+     * time saturates at PHP_INT_MAX) and is then `half_open`, allowing one probe. The next failure
+     * trips the circuit when a closed circuit is one failure short of the threshold, or when it is
+     * half-open.
+     *
+     * @return array{state: 'closed'|'open'|'half_open', allow_probe: bool, remaining_cooldown_seconds: int, trip_on_next_failure: bool}
+     */
+    public static function evaluateCircuitStateWindow(int $failureCount, int $failureThreshold, int $openedAtUnix, int $nowUnix, int $cooldownSeconds = 60): array
+    {
+        return self::usesW405RustFfi()
+            ? self::evaluateCircuitStateWindowNative($failureCount, $failureThreshold, $openedAtUnix, $nowUnix, $cooldownSeconds)
+            : self::evaluateCircuitStateWindowPhp($failureCount, $failureThreshold, $openedAtUnix, $nowUnix, $cooldownSeconds);
+    }
+
+    /**
+     * @return array{state: 'closed'|'open'|'half_open', allow_probe: bool, remaining_cooldown_seconds: int, trip_on_next_failure: bool}
+     */
+    private static function evaluateCircuitStateWindowNative(int $failureCount, int $failureThreshold, int $openedAtUnix, int $nowUnix, int $cooldownSeconds): array
+    {
+        $fields = SearchService::evaluateW405Native(4, [
+            (string) $failureCount,
+            (string) $failureThreshold,
+            (string) $openedAtUnix,
+            (string) $nowUnix,
+            (string) $cooldownSeconds,
+        ]);
+        if ($fields === null || \count($fields) !== 4) {
+            return self::evaluateCircuitStateWindowPhp($failureCount, $failureThreshold, $openedAtUnix, $nowUnix, $cooldownSeconds);
+        }
+        $state = match ($fields[0]) {
+            'closed' => 'closed',
+            'open' => 'open',
+            'half_open' => 'half_open',
+            default => null,
+        };
+        if ($state === null) {
+            return self::evaluateCircuitStateWindowPhp($failureCount, $failureThreshold, $openedAtUnix, $nowUnix, $cooldownSeconds);
+        }
+
+        return [
+            'state' => $state,
+            'allow_probe' => $fields[1] === '1',
+            'remaining_cooldown_seconds' => (int) $fields[2],
+            'trip_on_next_failure' => $fields[3] === '1',
+        ];
+    }
+
+    /**
+     * @return array{state: 'closed'|'open'|'half_open', allow_probe: bool, remaining_cooldown_seconds: int, trip_on_next_failure: bool}
+     */
+    private static function evaluateCircuitStateWindowPhp(int $failureCount, int $failureThreshold, int $openedAtUnix, int $nowUnix, int $cooldownSeconds): array
+    {
+        $failures = max(0, $failureCount);
+        $threshold = max(1, $failureThreshold);
+        if ($failures < $threshold) {
+            return [
+                'state' => 'closed',
+                'allow_probe' => false,
+                'remaining_cooldown_seconds' => 0,
+                'trip_on_next_failure' => $failures >= $threshold - 1,
+            ];
+        }
+
+        $elapsed = match (true) {
+            $openedAtUnix > $nowUnix => 0,
+            $openedAtUnix < 0 && $nowUnix > PHP_INT_MAX + $openedAtUnix => PHP_INT_MAX,
+            default => $nowUnix - $openedAtUnix,
+        };
+        $remaining = max(0, max(0, $cooldownSeconds) - $elapsed);
+        $halfOpen = $remaining === 0;
+
+        return [
+            'state' => $halfOpen ? 'half_open' : 'open',
+            'allow_probe' => $halfOpen,
+            'remaining_cooldown_seconds' => $remaining,
+            'trip_on_next_failure' => $halfOpen,
+        ];
     }
 }

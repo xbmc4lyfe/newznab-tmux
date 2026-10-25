@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Search\Support;
 
+use App\Services\Search\SearchService;
 use App\Support\ReleaseSearchIndexDocument;
 use App\Support\RustPipelineLibrary;
 use FFI;
@@ -162,5 +163,146 @@ final class ReleaseIndexProjection
         $row = self::query()->where('r.id', $releaseId)->first();
 
         return $row === null ? null : ReleaseSearchIndexDocument::normalize((array) $row);
+    }
+
+    /**
+     * Rust stays opt-in for the Wave 40.5 summary: the FFI round trip misses the 1.5x gate; see
+     * tests/Unit/RustManticoreElasticSearchServiceCircuitW40ParityTest.php.
+     */
+    public const bool W405_RUST_FFI_DEFAULT = false;
+
+    /** Columns that link a release to external media metadata. */
+    private const array MEDIA_ID_KEYS = ['imdbid', 'tmdbid', 'tvdb', 'videos_id', 'anidbid'];
+
+    private static ?bool $useW405RustFfi = null;
+
+    public static function useW405RustFfi(?bool $use = true): void
+    {
+        self::$useW405RustFfi = $use;
+    }
+
+    public static function usesW405RustFfi(): bool
+    {
+        return self::$useW405RustFfi ?? self::W405_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW405RustFfi(): void
+    {
+        self::$useW405RustFfi = null;
+    }
+
+    /**
+     * Summarizes hydrated release rows. A value is a positive identifier when it is a positive
+     * int, or a string of 1-18 ASCII digits that is not all zeros (database drivers may return
+     * numeric columns as strings; IMDb ids keep leading zeros). Rows that are not arrays or lack a
+     * positive `id` are invalid and excluded from the other counts. `searchname` counts when it is
+     * a string that is non-empty after trim(); `categories_id`, the media id columns and `size`
+     * use the identifier rule, so a missing or non-positive size is a zero size.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array{total_rows: int, with_searchname: int, with_category: int, with_external_media_id: int, zero_size: int, invalid_rows: int}
+     */
+    public static function summarizeHydrationBatchCompleteness(array $rows): array
+    {
+        return self::usesW405RustFfi()
+            ? self::summarizeHydrationBatchCompletenessNative($rows)
+            : self::summarizeHydrationBatchCompletenessPhp($rows);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rows
+     * @return array{total_rows: int, with_searchname: int, with_category: int, with_external_media_id: int, zero_size: int, invalid_rows: int}
+     */
+    private static function summarizeHydrationBatchCompletenessNative(array $rows): array
+    {
+        $parts = [];
+        foreach ($rows as $row) {
+            if (! \is_array($row)) {
+                array_push($parts, '', '', '', '', '', '', '', '', '');
+
+                continue;
+            }
+            $name = $row['searchname'] ?? null;
+            $parts[] = self::identifierPart($row['id'] ?? null);
+            $parts[] = \is_string($name) ? $name : '';
+            $parts[] = self::identifierPart($row['categories_id'] ?? null);
+            foreach (self::MEDIA_ID_KEYS as $key) {
+                $parts[] = self::identifierPart($row[$key] ?? null);
+            }
+            $parts[] = self::identifierPart($row['size'] ?? null);
+        }
+        $fields = SearchService::evaluateW405Native(5, $parts);
+        if ($fields === null || \count($fields) !== 6) {
+            return self::summarizeHydrationBatchCompletenessPhp($rows);
+        }
+
+        return [
+            'total_rows' => (int) $fields[0],
+            'with_searchname' => (int) $fields[1],
+            'with_category' => (int) $fields[2],
+            'with_external_media_id' => (int) $fields[3],
+            'zero_size' => (int) $fields[4],
+            'invalid_rows' => (int) $fields[5],
+        ];
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rows
+     * @return array{total_rows: int, with_searchname: int, with_category: int, with_external_media_id: int, zero_size: int, invalid_rows: int}
+     */
+    private static function summarizeHydrationBatchCompletenessPhp(array $rows): array
+    {
+        $named = $categorized = $media = $zero = $invalid = 0;
+        foreach ($rows as $row) {
+            if (! \is_array($row) || ! self::isIdentifier($row['id'] ?? null)) {
+                $invalid++;
+
+                continue;
+            }
+            $name = $row['searchname'] ?? null;
+            if (\is_string($name) && trim($name) !== '') {
+                $named++;
+            }
+            if (self::isIdentifier($row['categories_id'] ?? null)) {
+                $categorized++;
+            }
+            foreach (self::MEDIA_ID_KEYS as $key) {
+                if (self::isIdentifier($row[$key] ?? null)) {
+                    $media++;
+                    break;
+                }
+            }
+            if (! self::isIdentifier($row['size'] ?? null)) {
+                $zero++;
+            }
+        }
+
+        return [
+            'total_rows' => \count($rows),
+            'with_searchname' => $named,
+            'with_category' => $categorized,
+            'with_external_media_id' => $media,
+            'zero_size' => $zero,
+            'invalid_rows' => $invalid,
+        ];
+    }
+
+    private static function isIdentifier(mixed $value): bool
+    {
+        if (\is_int($value)) {
+            return $value > 0;
+        }
+
+        return \is_string($value) && \strlen($value) <= 18 && preg_match('/^[0-9]*[1-9][0-9]*$/D', $value) === 1;
+    }
+
+    /** Rust applies the string rule, so positive ints travel as `1`. */
+    private static function identifierPart(mixed $value): string
+    {
+        if (\is_int($value)) {
+            return $value > 0 ? '1' : '0';
+        }
+
+        return \is_string($value) ? $value : '';
     }
 }

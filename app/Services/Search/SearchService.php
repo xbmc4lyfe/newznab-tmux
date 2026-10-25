@@ -43,6 +43,22 @@ class SearchService extends Manager implements SearchServiceInterface
 
     private static FFI|false|null $ffi = null;
 
+    public const string W405_FFI_CDEF = 'ptrdiff_t nntmux_w40_manticore_elastic_search_service_circuit(uint32_t mode, const char *input, size_t input_len, char *out, size_t cap);';
+
+    /**
+     * Rust stays opt-in for the Wave 40.5 summary: the FFI round trip misses the 1.5x gate; see
+     * tests/Unit/RustManticoreElasticSearchServiceCircuitW40ParityTest.php.
+     */
+    public const bool W405_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useW405RustFfi = null;
+
+    private const int W405_NATIVE_MAX_PARTS = 1 << 20;
+
+    private const int W405_NATIVE_MAX_BYTES = 16 * 1024 * 1024;
+
+    private static FFI|false|null $w405Ffi = null;
+
     /**
      * search_index_failures.operation for a deferred update that has not been flushed.
      */
@@ -92,6 +108,189 @@ class SearchService extends Manager implements SearchServiceInterface
         }
 
         return self::$ffi === false ? null : self::$ffi;
+    }
+
+    public static function useW405RustFfi(?bool $use = true): void
+    {
+        self::$useW405RustFfi = $use;
+    }
+
+    public static function usesW405RustFfi(): bool
+    {
+        return self::$useW405RustFfi ?? self::W405_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW405RustFfi(): void
+    {
+        self::$useW405RustFfi = null;
+    }
+
+    /**
+     * Summarizes search driver fallback attempts in call order. An attempt succeeds only when
+     * `ok` is `true`; `latency_ms` counts when it is an integer (negative values as 0) and the
+     * total saturates at PHP_INT_MAX. Non-array attempts are failed attempts with no latency. A
+     * fallback is used whenever more than one driver was attempted; the winner is the first
+     * successful attempt (-1 when none).
+     *
+     * @param  array<array-key, mixed>  $driverAttempts
+     * @return array{attempts: int, primary_hit: bool, fallback_used: bool, total_latency_ms: int, budget_exceeded: bool, winning_index: int}
+     */
+    public static function summarizeSearchFallbackTelemetry(array $driverAttempts, int $latencyBudgetMs = 1500): array
+    {
+        return self::usesW405RustFfi()
+            ? self::summarizeSearchFallbackTelemetryNative($driverAttempts, $latencyBudgetMs)
+            : self::summarizeSearchFallbackTelemetryPhp($driverAttempts, $latencyBudgetMs);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $driverAttempts
+     * @return array{attempts: int, primary_hit: bool, fallback_used: bool, total_latency_ms: int, budget_exceeded: bool, winning_index: int}
+     */
+    private static function summarizeSearchFallbackTelemetryNative(array $driverAttempts, int $latencyBudgetMs): array
+    {
+        $parts = [(string) $latencyBudgetMs];
+        foreach ($driverAttempts as $attempt) {
+            if (! \is_array($attempt)) {
+                array_push($parts, '0', '');
+
+                continue;
+            }
+            $latency = $attempt['latency_ms'] ?? null;
+            array_push($parts, ($attempt['ok'] ?? null) === true ? '1' : '0', \is_int($latency) ? (string) $latency : '');
+        }
+        $fields = self::evaluateW405Native(3, $parts);
+        if ($fields === null || \count($fields) !== 6) {
+            return self::summarizeSearchFallbackTelemetryPhp($driverAttempts, $latencyBudgetMs);
+        }
+
+        return [
+            'attempts' => (int) $fields[0],
+            'primary_hit' => $fields[1] === '1',
+            'fallback_used' => $fields[2] === '1',
+            'total_latency_ms' => (int) $fields[3],
+            'budget_exceeded' => $fields[4] === '1',
+            'winning_index' => (int) $fields[5],
+        ];
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $driverAttempts
+     * @return array{attempts: int, primary_hit: bool, fallback_used: bool, total_latency_ms: int, budget_exceeded: bool, winning_index: int}
+     */
+    private static function summarizeSearchFallbackTelemetryPhp(array $driverAttempts, int $latencyBudgetMs): array
+    {
+        $total = 0;
+        $winner = -1;
+        $index = 0;
+        foreach ($driverAttempts as $attempt) {
+            if (\is_array($attempt)) {
+                if ($winner < 0 && ($attempt['ok'] ?? null) === true) {
+                    $winner = $index;
+                }
+                $latency = \is_int($attempt['latency_ms'] ?? null) ? max(0, $attempt['latency_ms']) : 0;
+                $total = $latency > PHP_INT_MAX - $total ? PHP_INT_MAX : $total + $latency;
+            }
+            $index++;
+        }
+
+        return [
+            'attempts' => $index,
+            'primary_hit' => $winner === 0,
+            'fallback_used' => $index > 1,
+            'total_latency_ms' => $total,
+            'budget_exceeded' => $total > $latencyBudgetMs,
+            'winning_index' => $winner,
+        ];
+    }
+
+    /**
+     * Shared Wave 40.5 bridge to `nntmux_w40_manticore_elastic_search_service_circuit`. Returns the
+     * decoded result fields, or null when the library is missing, the input is too large or Rust
+     * declines (callers then use their PHP implementation).
+     *
+     * @param  list<string>  $parts
+     * @return list<string>|null
+     */
+    public static function evaluateW405Native(int $mode, array $parts): ?array
+    {
+        $ffi = self::w405Ffi();
+        if ($ffi === null || $mode < 0 || \count($parts) > self::W405_NATIVE_MAX_PARTS) {
+            return null;
+        }
+
+        try {
+            $input = pack('V', \count($parts));
+            foreach ($parts as $part) {
+                $input .= pack('V', \strlen($part)).$part;
+            }
+            if (\strlen($input) > self::W405_NATIVE_MAX_BYTES) {
+                return null;
+            }
+
+            $minBytes = \strlen($input) * 2 + 256;
+            for ($attempt = 0; $attempt < 2; $attempt++) {
+                $capacity = 0;
+                $out = RustPipelineLibrary::obtainScratch($ffi, $minBytes, $capacity);
+                if ($out === null) {
+                    return null;
+                }
+                $capacity = min($capacity, self::W405_NATIVE_MAX_BYTES);
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w40_manticore_elastic_search_service_circuit($mode, $input, \strlen($input), $out, $capacity);
+                if (! \is_int($written)) {
+                    return null;
+                }
+                if ($written >= 4 && $written <= $capacity) {
+                    return self::unpackW405(FFI::string($out, $written));
+                }
+                if ($written > -4 || -$written <= $capacity || -$written > self::W405_NATIVE_MAX_BYTES) {
+                    return null;
+                }
+                $minBytes = -$written;
+            }
+        } catch (\Throwable) {
+            return null;
+        }
+
+        return null;
+    }
+
+    /** @return list<string>|null */
+    private static function unpackW405(string $packet): ?array
+    {
+        $length = \strlen($packet);
+        $header = unpack('V', $packet);
+        $count = \is_array($header) ? $header[1] : null;
+        if (! \is_int($count) || $count > intdiv($length - 4, 4)) {
+            return null;
+        }
+
+        $offset = 4;
+        $parts = [];
+        for ($i = 0; $i < $count; $i++) {
+            if ($offset + 4 > $length) {
+                return null;
+            }
+            $size = unpack('V', $packet, $offset);
+            $size = \is_array($size) ? $size[1] : null;
+            if (! \is_int($size) || $offset + 4 + $size > $length) {
+                return null;
+            }
+            $parts[] = substr($packet, $offset + 4, $size);
+            $offset += 4 + $size;
+        }
+
+        return $offset === $length ? $parts : null;
+    }
+
+    private static function w405Ffi(): ?FFI
+    {
+        if (self::$w405Ffi === null) {
+            $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+            self::$w405Ffi = RustPipelineLibrary::resolveDomain('search_w405', self::W405_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+        }
+
+        return self::$w405Ffi instanceof FFI ? self::$w405Ffi : null;
     }
 
     /**
