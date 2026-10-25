@@ -1082,4 +1082,124 @@ class NzbImportService
             cli()->notice($message);
         }
     }
+
+    /**
+     * Default for the Wave 41.2 toggle only; it stays false because the paired benchmark in
+     * tests/Unit/RustNzbSyncNfoImportCoverageCandidateW41ParityTest.php is below 1.5x.
+     */
+    public const bool W412_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useW412RustFfi = null;
+
+    public static function useW412RustFfi(bool $enable = true): void
+    {
+        self::$useW412RustFfi = $enable;
+    }
+
+    public static function usesW412RustFfi(): bool
+    {
+        return self::$useW412RustFfi ?? self::W412_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW412RustFfi(): void
+    {
+        self::$useW412RustFfi = null;
+    }
+
+    /** NzbImportStatus values in the Wave 41.2 output order; the Rust export matches these bytes exactly. */
+    public const array W412_IMPORT_STATUSES = ['inserted', 'queued', 'metadata_ignored', 'metadata_deferred', 'duplicate', 'blacklisted', 'nogroup', 'failed'];
+
+    /**
+     * Tally NZB import results (`status`, `bytes`). A status is an NzbImportStatus or its exact string value; anything
+     * else counts as unknown. Bytes count only as integers on inserted results, negatives as zero, saturating at PHP_INT_MAX.
+     *
+     * @param  array<array-key, mixed>  $results
+     * @return array{results: int, inserted: int, queued: int, metadata_ignored: int, metadata_deferred: int, duplicate: int, blacklisted: int, nogroup: int, failed: int, unknown: int, inserted_bytes: int}
+     */
+    public static function summarizeImportStatusBatch(array $results): array
+    {
+        return (self::usesW412RustFfi() ? self::summarizeImportStatusBatchNative($results) : null)
+            ?? self::summarizeImportStatusBatchPhp($results);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $results
+     * @return array{results: int, inserted: int, queued: int, metadata_ignored: int, metadata_deferred: int, duplicate: int, blacklisted: int, nogroup: int, failed: int, unknown: int, inserted_bytes: int}
+     */
+    public static function summarizeImportStatusBatchPhp(array $results): array
+    {
+        $counts = array_fill_keys(self::W412_IMPORT_STATUSES, 0);
+        $unknown = $bytes = 0;
+        foreach ($results as $result) {
+            [$status, $size] = self::importStatusFields($result);
+            if ($status === null || ! isset($counts[$status])) {
+                $unknown++;
+
+                continue;
+            }
+            $counts[$status]++;
+            if ($status === 'inserted') {
+                $size = max(0, $size);
+                $bytes = $bytes > PHP_INT_MAX - $size ? PHP_INT_MAX : $bytes + $size;
+            }
+        }
+
+        return self::importStatusSummary(\count($results), array_values($counts), $unknown, $bytes);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $results
+     * @return array{results: int, inserted: int, queued: int, metadata_ignored: int, metadata_deferred: int, duplicate: int, blacklisted: int, nogroup: int, failed: int, unknown: int, inserted_bytes: int}|null
+     */
+    public static function summarizeImportStatusBatchNative(array $results): ?array
+    {
+        $words = [0, \count($results)];
+        $texts = [];
+        $size = 16 + \count($results) * 16;
+        foreach ($results as $result) {
+            [$status, $bytes] = self::importStatusFields($result);
+            $words[] = $status === null ? -1 : \strlen($status);
+            $words[] = $bytes;
+            if ($status !== null) {
+                $texts[] = $status;
+                $size += \strlen($status);
+            }
+            if ($size > DirectorySyncBridge::W412_MAX_INPUT) {
+                return null;
+            }
+        }
+        $slots = DirectorySyncBridge::evaluateW412Native(4, pack('q*', ...$words).implode('', $texts), 11);
+        if ($slots === null) {
+            return null;
+        }
+        $count = $slots[0];
+        $counts = \array_slice($slots, 1, 8);
+        if ($count !== \count($results) || min($slots) < 0 || array_sum($counts) + $slots[9] !== $count) {
+            return null;
+        }
+
+        return self::importStatusSummary($count, $counts, $slots[9], $slots[10]);
+    }
+
+    /** @return array{string|null, int} the status text (null unless an NzbImportStatus or string) and the bytes (0 unless an integer) */
+    private static function importStatusFields(mixed $result): array
+    {
+        if (! \is_array($result)) {
+            return [null, 0];
+        }
+        $status = $result['status'] ?? null;
+        $bytes = $result['bytes'] ?? 0;
+
+        return [$status instanceof NzbImportStatus ? $status->value : (\is_string($status) ? $status : null), \is_int($bytes) ? $bytes : 0];
+    }
+
+    /**
+     * @param  list<int>  $counts  per W412_IMPORT_STATUSES entry
+     * @return array{results: int, inserted: int, queued: int, metadata_ignored: int, metadata_deferred: int, duplicate: int, blacklisted: int, nogroup: int, failed: int, unknown: int, inserted_bytes: int}
+     */
+    private static function importStatusSummary(int $results, array $counts, int $unknown, int $bytes): array
+    {
+        /** @var array{results: int, inserted: int, queued: int, metadata_ignored: int, metadata_deferred: int, duplicate: int, blacklisted: int, nogroup: int, failed: int, unknown: int, inserted_bytes: int} */
+        return ['results' => $results, ...array_combine(self::W412_IMPORT_STATUSES, $counts), 'unknown' => $unknown, 'inserted_bytes' => $bytes];
+    }
 }

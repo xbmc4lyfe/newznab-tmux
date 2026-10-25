@@ -267,4 +267,114 @@ final class NfoImportService
             return ['status' => 'failed', 'message' => $exception->getMessage()];
         }
     }
+
+    /**
+     * Default for the Wave 41.2 toggle only; it stays false because the paired benchmark in
+     * tests/Unit/RustNzbSyncNfoImportCoverageCandidateW41ParityTest.php is below 1.5x.
+     */
+    public const bool W412_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useW412RustFfi = null;
+
+    public static function useW412RustFfi(bool $enable = true): void
+    {
+        self::$useW412RustFfi = $enable;
+    }
+
+    public static function usesW412RustFfi(): bool
+    {
+        return self::$useW412RustFfi ?? self::W412_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW412RustFfi(): void
+    {
+        self::$useW412RustFfi = null;
+    }
+
+    /**
+     * Summarize NFO import payloads (`guid`, `nfo`). Each entry lands in the first bucket that applies: missing_guid
+     * (validGuidPhp() rejects the guid), empty (no string payload or ''), oversized (longer than max(0, $maxBytes)),
+     * binary (contains a NUL byte) or accepted, whose byte lengths are summed.
+     *
+     * @param  array<array-key, mixed>  $entries
+     * @return array{entries: int, accepted: int, missing_guid: int, empty: int, oversized: int, binary: int, accepted_bytes: int}
+     */
+    public static function summarizeNfoImportPayloads(array $entries, int $maxBytes = 65535): array
+    {
+        return (self::usesW412RustFfi() ? self::summarizeNfoImportPayloadsNative($entries, $maxBytes) : null)
+            ?? self::summarizeNfoImportPayloadsPhp($entries, $maxBytes);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $entries
+     * @return array{entries: int, accepted: int, missing_guid: int, empty: int, oversized: int, binary: int, accepted_bytes: int}
+     */
+    public static function summarizeNfoImportPayloadsPhp(array $entries, int $maxBytes = 65535): array
+    {
+        $limit = max(0, $maxBytes);
+        $accepted = $missing = $empty = $oversized = $binary = $bytes = 0;
+        foreach ($entries as $entry) {
+            [$guid, $nfo] = self::nfoPayloadFields($entry);
+            if (! $guid) {
+                $missing++;
+            } elseif ($nfo === null || $nfo === '') {
+                $empty++;
+            } elseif (\strlen($nfo) > $limit) {
+                $oversized++;
+            } elseif (str_contains($nfo, "\0")) {
+                $binary++;
+            } else {
+                $accepted++;
+                $bytes += \strlen($nfo);
+            }
+        }
+
+        return ['entries' => \count($entries), 'accepted' => $accepted, 'missing_guid' => $missing, 'empty' => $empty, 'oversized' => $oversized,
+            'binary' => $binary, 'accepted_bytes' => $bytes];
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $entries
+     * @return array{entries: int, accepted: int, missing_guid: int, empty: int, oversized: int, binary: int, accepted_bytes: int}|null
+     */
+    public static function summarizeNfoImportPayloadsNative(array $entries, int $maxBytes = 65535): ?array
+    {
+        $words = [$maxBytes, \count($entries)];
+        $texts = [];
+        $size = 16 + \count($entries) * 16;
+        foreach ($entries as $entry) {
+            [$guid, $nfo] = self::nfoPayloadFields($entry);
+            $words[] = $nfo === null ? -1 : \strlen($nfo);
+            $words[] = (int) $guid;
+            if ($nfo !== null) {
+                $texts[] = $nfo;
+                $size += \strlen($nfo);
+            }
+            if ($size > DirectorySyncBridge::W412_MAX_INPUT) {
+                return null;
+            }
+        }
+        $slots = DirectorySyncBridge::evaluateW412Native(1, pack('q*', ...$words).implode('', $texts), 7);
+        if ($slots === null) {
+            return null;
+        }
+        [$count, $accepted, $missing, $empty, $oversized, $binary, $bytes] = $slots;
+        if ($count !== \count($entries) || min($slots) < 0 || $accepted + $missing + $empty + $oversized + $binary !== $count) {
+            return null;
+        }
+
+        return ['entries' => $count, 'accepted' => $accepted, 'missing_guid' => $missing, 'empty' => $empty, 'oversized' => $oversized,
+            'binary' => $binary, 'accepted_bytes' => $bytes];
+    }
+
+    /** @return array{bool, string|null} whether the guid is valid, and the NFO payload when it is a string */
+    private static function nfoPayloadFields(mixed $entry): array
+    {
+        if (! \is_array($entry)) {
+            return [false, null];
+        }
+        $nfo = $entry['nfo'] ?? null;
+
+        return [self::validGuidPhp($entry['guid'] ?? null), \is_string($nfo) ? $nfo : null];
+    }
 }
