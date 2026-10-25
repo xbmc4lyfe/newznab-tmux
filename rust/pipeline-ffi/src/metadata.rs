@@ -52361,3 +52361,935 @@ mod w534_tests {
         assert_eq!(out, vec![1, 199_999, 2, 0]);
     }
 }
+
+/// Wave 54.4 batch helpers for XxxPipe adult signal rows, IGDB Client request rows and the IGDB
+/// Company, Game and Platform record models. Each export reads NUL-joined text columns and packed
+/// little-endian int64 columns through the Wave 50.4 runner and writes fixed-width int64 words
+/// per record, so PHP decodes a whole batch with one unpack('P*').
+pub mod w544_batch {
+    use super::w504_batch::{Batch, Shape, run, span_word};
+
+    /// The IGDB models' whitespace set: " \t\n\r\0\x0B\x0C".
+    #[inline(always)]
+    fn is_ws(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b | 0x0c)
+    }
+
+    /// trim() with the whitespace set as `(strspn offset, trimmed)`.
+    fn ws_trim(value: &[u8]) -> (usize, &[u8]) {
+        let start = value.iter().position(|b| !is_ws(*b)).unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|b| !is_ws(*b))
+            .map_or(start, |i| i + 1);
+        (start, &value[start..end])
+    }
+
+    /// strlen(preg_replace('/[ \t\n\r\0\x0B\x0C]+/', ' ', $trimmed)).
+    fn collapsed_len(trimmed: &[u8]) -> usize {
+        let mut len = 0;
+        let mut prev = false;
+        for c in trimmed {
+            let ws = is_ws(*c);
+            len += usize::from(!(ws && prev));
+            prev = ws;
+        }
+        len
+    }
+
+    /// The `-`-separated segments of trim(preg_replace('/[^a-z0-9]+/', '-', strtolower($s)), '-').
+    fn segments(s: &[u8]) -> impl Iterator<Item = &[u8]> {
+        s.split(|c| !c.is_ascii_alphanumeric())
+            .filter(|seg| !seg.is_empty())
+    }
+
+    fn slug_len(s: &[u8]) -> usize {
+        let (mut bytes, mut count) = (0, 0);
+        for seg in segments(s) {
+            bytes += seg.len();
+            count += 1;
+        }
+        if count == 0 { 0 } else { bytes + count - 1 }
+    }
+
+    /// Decimal digits of a positive integer.
+    fn digits(mut value: i64) -> usize {
+        let mut n = 1;
+        while value >= 10 {
+            value /= 10;
+            n += 1;
+        }
+        n
+    }
+
+    /// unpack('J', hash('fnv1a64', $bytes, true))[1].
+    fn fnv1a64(bytes: &[u8]) -> i64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in bytes {
+            hash ^= u64::from(*b);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash as i64
+    }
+
+    /// Element `i` of int64 column `col` in a column-major packing of two columns.
+    #[inline(always)]
+    fn int2(b: &Batch<'_>, col: usize, i: usize) -> i64 {
+        let flat = col * b.count + i;
+        b.int(flat / 2, flat % 2)
+    }
+
+    /// XxxPipe::W433_ADULT_SIGNAL_MARKERS in class and match order (studio 0-9, jav 10-15,
+    /// keyword 16-22), then the W433_XXX_TAG_MARKERS entry.
+    const MARKERS: [&[u8]; 24] = [
+        b"brazzers",
+        b"realitykings",
+        b"naughtyamerica",
+        b"bangbros",
+        b"vixen",
+        b"blacked",
+        b"tushy",
+        b"evilangel",
+        b"teamskeet",
+        b"mofos",
+        b"1pondo",
+        b"caribbeancom",
+        b"heyzo",
+        b"tokyohot",
+        b"10musume",
+        b"fc2-ppv",
+        b"porn",
+        b"milf",
+        b"hardcore",
+        b"lesbian",
+        b"creampie",
+        b"blowjob",
+        b"threesome",
+        b"xxx",
+    ];
+
+    const XXX: usize = 23;
+
+    const XXX_BIT: u32 = 1 << XXX;
+
+    /// First marker index of each class.
+    const CLASS_START: [usize; 3] = [0, 10, 16];
+
+    /// Markers by first byte, either case.
+    const FIRST_BYTE: [u32; 256] = {
+        let mut table = [0u32; 256];
+        let mut k = 0;
+        while k < MARKERS.len() {
+            let first = MARKERS[k][0];
+            table[first as usize] |= 1 << k;
+            table[first.to_ascii_uppercase() as usize] |= 1 << k;
+            k += 1;
+        }
+        table
+    };
+
+    /// [class | xxx << 2, marker index, marker offset, xxx offset] of the lowercased name.
+    ///
+    /// One left-to-right pass records the first offset of every marker still able to win: a
+    /// match retires every later (lower priority) adult marker, and the pass stops once
+    /// nothing is pending.
+    fn adult_signal_row(b: &Batch<'_>, out: &mut [i64]) {
+        for (i, slot) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let name = b.text(0, i);
+            let mut first_at = [usize::MAX; MARKERS.len()];
+            let mut pending: u32 = (1 << MARKERS.len()) - 1;
+            for at in 0..name.len() {
+                let mut bits = FIRST_BYTE[name[at] as usize] & pending;
+                while bits != 0 {
+                    let k = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    let marker = MARKERS[k];
+                    if name
+                        .get(at..at + marker.len())
+                        .is_some_and(|w| w.eq_ignore_ascii_case(marker))
+                    {
+                        first_at[k] = at;
+                        pending &= !(1 << k);
+                        if k != XXX {
+                            pending &= ((1 << k) - 1) | (pending & XXX_BIT);
+                            bits &= pending;
+                        }
+                    }
+                }
+                if pending == 0 {
+                    break;
+                }
+            }
+            let xxx = first_at[XXX];
+            let hit = first_at[..XXX].iter().position(|at| *at != usize::MAX);
+            let (class, index, offset) = hit.map_or((0, -1, -1), |k| {
+                let class = CLASS_START
+                    .iter()
+                    .rposition(|start| k >= *start)
+                    .unwrap_or(0);
+                (
+                    class as i64 + 1,
+                    (k - CLASS_START[class]) as i64,
+                    first_at[k] as i64,
+                )
+            });
+            *slot = [
+                class | i64::from(xxx != usize::MAX) << 2,
+                index,
+                offset,
+                if xxx == usize::MAX { -1 } else { xxx as i64 },
+            ];
+        }
+    }
+
+    /// Client::W47_ENDPOINTS keys; the code is the position plus one.
+    const ENDPOINTS: [&[u8]; 21] = [
+        b"age_ratings",
+        b"alternative_names",
+        b"artworks",
+        b"collections",
+        b"companies",
+        b"covers",
+        b"external_games",
+        b"franchises",
+        b"game_modes",
+        b"game_videos",
+        b"games",
+        b"genres",
+        b"involved_companies",
+        b"multiquery",
+        b"platform_logos",
+        b"platforms",
+        b"release_dates",
+        b"screenshots",
+        b"search",
+        b"themes",
+        b"websites",
+    ];
+
+    #[inline(always)]
+    fn is_endpoint_trim(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b | b'/')
+    }
+
+    /// [endpoint span, endpoint flags, token TTL, status class | retryable << 4 | code << 8].
+    fn request_row(b: &Batch<'_>, out: &mut [i64]) {
+        for (i, slot) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let endpoint = b.text(0, i);
+            let start = endpoint
+                .iter()
+                .position(|c| !is_endpoint_trim(*c))
+                .unwrap_or(endpoint.len());
+            let end = endpoint
+                .iter()
+                .rposition(|c| !is_endpoint_trim(*c))
+                .map_or(start, |p| p + 1);
+            let trimmed = &endpoint[start..end];
+            let flags = if trimmed.is_empty() {
+                32
+            } else {
+                let code = ENDPOINTS
+                    .iter()
+                    .position(|known| *known == trimmed)
+                    .map_or(0, |p| p as i64 + 1);
+                let valid = trimmed.iter().all(|c| {
+                    c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'_' | b'/')
+                });
+                code | i64::from(trimmed.contains(&b'/')) << 6 | i64::from(!valid) << 7
+            };
+            let expires = b.text(1, i);
+            let seconds = if !expires.is_empty()
+                && expires.len() <= 9
+                && expires.iter().all(u8::is_ascii_digit)
+            {
+                expires
+                    .iter()
+                    .fold(0i64, |v, c| v * 10 + i64::from(c - b'0'))
+            } else {
+                3600
+            };
+            let status = b.int(i, 0);
+            let code = if (100..=999).contains(&status) {
+                status
+            } else {
+                0
+            };
+            let class = code / 100;
+            let category = match (code, class) {
+                (429, _) => 1,
+                (_, 5) => 2,
+                (_, 4) => 3,
+                (_, 2) => 4,
+                _ => 0,
+            };
+            let retryable = code == 0 || code == 408 || code == 429 || class == 5;
+            *slot = [
+                span_word(start, trimmed.len()),
+                flags,
+                (seconds - 60).max(60),
+                category | i64::from(retryable) << 4 | code << 8,
+            ];
+        }
+    }
+
+    /// Company::W48_SUFFIXES.
+    const SUFFIXES: [&[u8]; 16] = [
+        b"ab",
+        b"ag",
+        b"bv",
+        b"co",
+        b"corp",
+        b"corporation",
+        b"gmbh",
+        b"inc",
+        b"kk",
+        b"limited",
+        b"llc",
+        b"ltd",
+        b"oy",
+        b"plc",
+        b"sa",
+        b"srl",
+    ];
+
+    /// Company::W48_KNOWN_PUBLISHERS, in match order.
+    const PUBLISHERS: [&[u8]; 16] = [
+        b"activision",
+        b"bandai-namco",
+        b"bethesda",
+        b"capcom",
+        b"devolver",
+        b"electronic-arts",
+        b"konami",
+        b"microsoft",
+        b"nintendo",
+        b"sega",
+        b"sony",
+        b"square-enix",
+        b"take-two",
+        b"thq",
+        b"ubisoft",
+        b"warner-bros",
+    ];
+
+    /// [name span, slug length | canonical length << 32, canonical FNV-1a, flags].
+    fn company_row(b: &Batch<'_>, out: &mut [i64]) {
+        let mut segs: Vec<&[u8]> = Vec::new();
+        let mut canonical = Vec::new();
+        for (i, slot) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let (lead, trimmed) = ws_trim(b.text(0, i));
+            let name_len = collapsed_len(trimmed);
+            segs.clear();
+            segs.extend(segments(trimmed));
+            let slug = segs
+                .iter()
+                .map(|s| s.len() + 1)
+                .sum::<usize>()
+                .saturating_sub(1);
+            let mut keep = segs.len();
+            while keep > 1
+                && SUFFIXES
+                    .iter()
+                    .any(|suffix| suffix.eq_ignore_ascii_case(segs[keep - 1]))
+            {
+                keep -= 1;
+            }
+            canonical.clear();
+            for (k, seg) in segs[..keep].iter().enumerate() {
+                if k > 0 {
+                    canonical.push(b'-');
+                }
+                canonical.extend(seg.iter().map(u8::to_ascii_lowercase));
+            }
+            let publisher = PUBLISHERS
+                .iter()
+                .position(|p| {
+                    canonical.starts_with(p)
+                        && (canonical.len() == p.len() || canonical[p.len()] == b'-')
+                })
+                .map_or(0, |p| p as i64 + 1);
+            let valid_id = int2(b, 0, i) > 0;
+            let country = int2(b, 1, i);
+            *slot = [
+                span_word(lead, name_len),
+                (slug | canonical.len() << 32) as i64,
+                fnv1a64(&canonical),
+                publisher
+                    | i64::from(keep < segs.len()) << 5
+                    | i64::from((1..=999).contains(&country)) << 6
+                    | i64::from(valid_id) << 7
+                    | i64::from(valid_id && name_len > 0) << 8,
+            ];
+        }
+    }
+
+    /// [search span, escaped length, limit, platform id or -1, query length].
+    fn game_row(b: &Batch<'_>, out: &mut [i64]) {
+        for (i, slot) in out.as_chunks_mut::<5>().0.iter_mut().enumerate() {
+            let (lead, trimmed) = ws_trim(b.text(0, i));
+            let search = collapsed_len(trimmed);
+            let escaped = search + trimmed.iter().filter(|c| matches!(c, b'"' | b'\\')).count();
+            let limit = int2(b, 0, i).clamp(1, 500);
+            let platform = int2(b, 1, i);
+            // 'search "' + escaped + '"; fields *; ' + where + 'limit ' + limit + ';'.
+            let mut query = 8 + escaped + 13 + 6 + digits(limit) + 1;
+            if platform > 0 {
+                // 'where platforms = (' + id + '); '.
+                query += 19 + digits(platform) + 3;
+            }
+            *slot = [
+                span_word(lead, search),
+                escaped as i64,
+                limit,
+                if platform > 0 { platform } else { -1 },
+                query as i64,
+            ];
+        }
+    }
+
+    /// Platform::W48_ALIASES: [family, generation, handheld] by [a-z0-9] key.
+    fn platform_alias(key: &[u8]) -> Option<(i64, i64, bool)> {
+        Some(match key {
+            b"ps1" | b"psx" | b"playstation" => (1, 5, false),
+            b"ps2" | b"playstation2" => (1, 6, false),
+            b"ps3" | b"playstation3" => (1, 7, false),
+            b"ps4" | b"playstation4" => (1, 8, false),
+            b"ps5" | b"playstation5" => (1, 9, false),
+            b"psp" | b"playstationportable" => (1, 7, true),
+            b"vita" | b"psvita" | b"playstationvita" => (1, 8, true),
+            b"xbox" => (2, 6, false),
+            b"x360" | b"xbox360" => (2, 7, false),
+            b"xone" | b"xboxone" | b"xb1" => (2, 8, false),
+            b"xsx" | b"xboxseriesx" | b"xboxseriesxs" => (2, 9, false),
+            b"nes" | b"famicom" | b"nintendoentertainmentsystem" => (3, 3, false),
+            b"snes" | b"supernintendo" | b"supernintendoentertainmentsystem" | b"superfamicom" => {
+                (3, 4, false)
+            }
+            b"n64" | b"nintendo64" => (3, 5, false),
+            b"gc" | b"ngc" | b"gamecube" | b"nintendogamecube" => (3, 6, false),
+            b"wii" => (3, 7, false),
+            b"wiiu" => (3, 8, false),
+            b"switch" | b"nintendoswitch" | b"ns" => (3, 8, true),
+            b"gb" | b"gameboy" => (3, 4, true),
+            b"gba" | b"gameboyadvance" => (3, 6, true),
+            b"ds" | b"nds" | b"nintendods" => (3, 7, true),
+            b"3ds" | b"nintendo3ds" => (3, 8, true),
+            b"sms" | b"mastersystem" | b"segamastersystem" => (4, 3, false),
+            b"md" | b"genesis" | b"megadrive" | b"segagenesis" | b"segamegadrive" => (4, 4, false),
+            b"saturn" | b"segasaturn" => (4, 5, false),
+            b"dc" | b"dreamcast" | b"segadreamcast" => (4, 6, false),
+            b"gg" | b"gamegear" | b"segagamegear" => (4, 4, true),
+            b"pc"
+            | b"win"
+            | b"windows"
+            | b"pcmicrosoftwindows"
+            | b"mac"
+            | b"macos"
+            | b"linux"
+            | b"dos" => (5, 0, false),
+            b"ios" | b"android" | b"iphone" | b"ipad" => (6, 0, true),
+            _ => return None,
+        })
+    }
+
+    /// Longest alias key ("supernintendoentertainmentsystem").
+    const ALIAS_MAX: usize = 32;
+
+    /// The alias of preg_replace('/[^a-z0-9]+/', '', strtolower($value)).
+    fn lookup_alias(value: &[u8]) -> Option<(i64, i64, bool)> {
+        let mut key = [0u8; ALIAS_MAX];
+        let mut len = 0;
+        for c in value {
+            if c.is_ascii_alphanumeric() {
+                if len == ALIAS_MAX {
+                    return None;
+                }
+                key[len] = c.to_ascii_lowercase();
+                len += 1;
+            }
+        }
+        platform_alias(&key[..len])
+    }
+
+    /// [name span, slug length, abbreviation span or -1, family flags].
+    fn platform_row(b: &Batch<'_>, out: &mut [i64]) {
+        for (i, slot) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let name = b.text(0, i);
+            let abbreviation = b.text(1, i);
+            let (lead, trimmed) = ws_trim(name);
+            let name_len = collapsed_len(trimmed);
+            let (abbr_lead, abbr_trimmed) = ws_trim(abbreviation);
+            let abbr_len = collapsed_len(abbr_trimmed);
+            let (alias, source) = match lookup_alias(abbreviation) {
+                Some(alias) => (alias, 1),
+                None => lookup_alias(name).map_or(((0, 0, false), 0), |alias| (alias, 2)),
+            };
+            let valid_id = b.int(i, 0) > 0;
+            *slot = [
+                span_word(lead, name_len),
+                slug_len(trimmed) as i64,
+                if abbr_len == 0 {
+                    -1
+                } else {
+                    span_word(abbr_lead, abbr_len)
+                },
+                alias.0
+                    | alias.1 << 4
+                    | i64::from(alias.2) << 8
+                    | source << 9
+                    | i64::from(valid_id) << 11
+                    | i64::from(valid_id && name_len > 0) << 12,
+            ];
+        }
+    }
+
+    macro_rules! export {
+        ($name:ident, $cols:literal, $per:literal, $words:literal, $body:ident) => {
+            /// # Safety
+            ///
+            /// `text` must point to `text_len` readable bytes, `ints` to `ints_len` readable
+            /// bytes and `out` to `out_cap` writable, aligned int64 words that overlap neither
+            /// input; null pointers are accepted only with zero lengths. The runner rejects a
+            /// null or misaligned output, null inputs with non-zero lengths, overlapping
+            /// buffers and field/int counts that do not match `count` before slicing, reports
+            /// `-needed` for a short output without writing, and maps panics to -1.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                text: *const u8,
+                text_len: usize,
+                ints: *const u8,
+                ints_len: usize,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                let shape = Shape {
+                    cols: $cols,
+                    head: 0,
+                    per: $per,
+                    words: $words,
+                };
+                unsafe {
+                    run(
+                        text, text_len, ints, ints_len, count, out, out_cap, shape, $body,
+                    )
+                }
+            }
+        };
+    }
+
+    export!(
+        nntmux_w544_xxx_adult_signal_row_batch,
+        1,
+        0,
+        4,
+        adult_signal_row
+    );
+    export!(nntmux_w544_igdb_request_row_batch, 2, 1, 4, request_row);
+    export!(nntmux_w544_igdb_company_row_batch, 1, 2, 4, company_row);
+    export!(nntmux_w544_igdb_game_row_batch, 1, 2, 5, game_row);
+    export!(nntmux_w544_igdb_platform_row_batch, 2, 1, 4, platform_row);
+}
+
+#[cfg(test)]
+mod w544_tests {
+    use super::w544_batch::*;
+
+    type Export =
+        unsafe extern "C" fn(*const u8, usize, *const u8, usize, usize, *mut i64, usize) -> isize;
+
+    fn call(export: Export, text: &[u8], ints: &[u8], count: usize, out: &mut [i64]) -> isize {
+        unsafe {
+            export(
+                text.as_ptr(),
+                text.len(),
+                ints.as_ptr(),
+                ints.len(),
+                count,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        }
+    }
+
+    fn pack(values: &[i64]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    /// Column-major text fields and int64 values for `count` records.
+    fn rows(
+        export: Export,
+        fields: &[&[u8]],
+        ints: &[i64],
+        count: usize,
+        words: usize,
+    ) -> Vec<i64> {
+        let text = fields.join(&0u8);
+        let mut out = vec![i64::MIN; count * words];
+        assert_eq!(
+            call(export, &text, &pack(ints), count, &mut out),
+            (count * words) as isize
+        );
+        out
+    }
+
+    fn span(offset: i64, len: i64) -> i64 {
+        (offset << 32) | len
+    }
+
+    #[test]
+    fn w544_adult_signal_hand_cases() {
+        let names: [&[u8]; 8] = [
+            b"Brazzers.XXX.1080p",
+            b"Some.MILF.and.Tushy",
+            b"FC2-PPV-123456",
+            b"Movie.2024.1080p",
+            b"xxXxx porn",
+            b"",
+            b"HEYZO 1pondo",
+            b"\xC3\x89Lesbian",
+        ];
+        let out = rows(nntmux_w544_xxx_adult_signal_row_batch, &names, &[], 8, 4);
+        assert_eq!(
+            out,
+            vec![
+                1 | 4,
+                0,
+                0,
+                9, //
+                1,
+                6,
+                14,
+                -1, //
+                2,
+                5,
+                0,
+                -1, //
+                0,
+                -1,
+                -1,
+                -1, //
+                3 | 4,
+                0,
+                6,
+                0, //
+                0,
+                -1,
+                -1,
+                -1, //
+                2,
+                0,
+                6,
+                -1, //
+                3,
+                3,
+                2,
+                -1,
+            ]
+        );
+    }
+
+    #[test]
+    fn w544_adult_signal_priority_beats_position() {
+        let names: [&[u8]; 5] = [
+            b"tushy.milf.BRAZZERS.tushy",
+            b"porn heyzo mofos",
+            b"blackedblacked xx xXx",
+            b"brazzer razzers",
+            b"vixenxxx",
+        ];
+        let out = rows(nntmux_w544_xxx_adult_signal_row_batch, &names, &[], 5, 4);
+        assert_eq!(
+            out,
+            vec![
+                1, 0, 11, -1, //
+                1, 9, 11, -1, //
+                1 | 4, 5, 0, 18, //
+                0, -1, -1, -1, //
+                1 | 4, 4, 0, 5,
+            ]
+        );
+    }
+
+    #[test]
+    fn w544_request_row_hand_cases() {
+        let endpoints: [&[u8]; 6] = [
+            b"/games/",
+            b" release_dates ",
+            b"",
+            b"/v4/Games",
+            b"x/y",
+            b"//",
+        ];
+        let expires: [&[u8]; 6] = [b"3600", b"30", b"", b"1234567890", b"12a", b"0"];
+        let statuses = [200, 429, 0, 503, 404, 1000];
+        let fields: Vec<&[u8]> = endpoints.iter().chain(expires.iter()).copied().collect();
+        let out = rows(nntmux_w544_igdb_request_row_batch, &fields, &statuses, 6, 4);
+        assert_eq!(
+            out,
+            vec![
+                span(1, 5),
+                11,
+                3540,
+                4 | 200 << 8, //
+                span(1, 13),
+                17,
+                60,
+                1 | 16 | 429 << 8, //
+                span(0, 0),
+                32,
+                3540,
+                16, //
+                span(1, 8),
+                64 | 128,
+                3540,
+                2 | 16 | 503 << 8, //
+                span(0, 3),
+                64,
+                3540,
+                3 | 404 << 8, //
+                span(2, 0),
+                32,
+                60,
+                16,
+            ]
+        );
+    }
+
+    #[test]
+    fn w544_company_row_hand_cases() {
+        let names: [&[u8]; 5] = [
+            b"  Nintendo  Co.,\tLtd. ",
+            b"Square Enix Holdings",
+            b"Inc",
+            b"",
+            b"Ubisoft\xC3\xA9 GmbH Inc",
+        ];
+        let ints = [1, 2, -3, 0, 5, 392, 0, 1000, 840, 1];
+        let out = rows(nntmux_w544_igdb_company_row_batch, &names, &ints, 5, 4);
+        let fnv = |s: &[u8]| {
+            let mut h: u64 = 0xcbf29ce484222325;
+            for b in s {
+                h = (h ^ u64::from(*b)).wrapping_mul(0x100000001b3);
+            }
+            h as i64
+        };
+        assert_eq!(
+            out,
+            vec![
+                span(2, 18),
+                15 | 8 << 32,
+                fnv(b"nintendo"),
+                9 | 32 | 64 | 128 | 256, //
+                span(0, 20),
+                20 | 20 << 32,
+                fnv(b"square-enix-holdings"),
+                12 | 128 | 256, //
+                span(0, 3),
+                3 | 3 << 32,
+                fnv(b"inc"),
+                0, //
+                span(0, 0),
+                0,
+                fnv(b""),
+                64, //
+                span(0, 18),
+                16 | 7 << 32,
+                fnv(b"ubisoft"),
+                15 | 32 | 64 | 128 | 256,
+            ]
+        );
+    }
+
+    #[test]
+    fn w544_game_row_hand_cases() {
+        let titles: [&[u8]; 4] = [b"  Zelda \"BotW\"\t\\ x ", b"", b"Halo", b"\x0C"];
+        let ints = [10, 0, 900, -5, 6, 0, 1234567, i64::MAX];
+        let out = rows(nntmux_w544_igdb_game_row_batch, &titles, &ints, 4, 5);
+        // search "Zelda \"BotW\" \\ x"; fields *; where platforms = (6); limit 10;
+        assert_eq!(
+            out,
+            vec![
+                span(2, 16),
+                19,
+                10,
+                6,
+                8 + 19 + 13 + 23 + 6 + 2 + 1, //
+                span(0, 0),
+                0,
+                1,
+                -1,
+                8 + 13 + 6 + 1 + 1, //
+                span(0, 4),
+                4,
+                500,
+                1234567,
+                8 + 4 + 13 + 29 + 6 + 3 + 1, //
+                span(1, 0),
+                0,
+                1,
+                i64::MAX,
+                8 + 13 + 22 + 19 + 6 + 1 + 1,
+            ]
+        );
+    }
+
+    #[test]
+    fn w544_platform_row_hand_cases() {
+        let names: [&[u8]; 4] = [
+            b" PlayStation  Portable ",
+            b"Nintendo Switch",
+            b"Unknown Box",
+            b"",
+        ];
+        let abbreviations: [&[u8]; 4] =
+            [b"", b" ns ", b"  ", b"Super-Nintendo Entertainment System!"];
+        let fields: Vec<&[u8]> = names.iter().chain(abbreviations.iter()).copied().collect();
+        let out = rows(
+            nntmux_w544_igdb_platform_row_batch,
+            &fields,
+            &[7, 0, 3, 9],
+            4,
+            4,
+        );
+        assert_eq!(
+            out,
+            vec![
+                span(1, 20),
+                20,
+                -1,
+                1 | 7 << 4 | 256 | 2 << 9 | 2048 | 4096, //
+                span(0, 15),
+                15,
+                span(1, 2),
+                3 | 8 << 4 | 256 | 1 << 9, //
+                span(0, 11),
+                11,
+                -1,
+                2048 | 4096, //
+                span(0, 0),
+                0,
+                span(0, 36),
+                3 | 4 << 4 | 1 << 9 | 2048,
+            ]
+        );
+    }
+
+    /// (export, text columns, ints per record, words per record).
+    const EXPORTS: [(Export, usize, usize, usize); 5] = [
+        (nntmux_w544_xxx_adult_signal_row_batch, 1, 0, 4),
+        (nntmux_w544_igdb_request_row_batch, 2, 1, 4),
+        (nntmux_w544_igdb_company_row_batch, 1, 2, 4),
+        (nntmux_w544_igdb_game_row_batch, 1, 2, 5),
+        (nntmux_w544_igdb_platform_row_batch, 2, 1, 4),
+    ];
+
+    #[test]
+    fn w544_raw_export_contract() {
+        for (export, cols, per, words) in EXPORTS {
+            let text = vec![&b"a"[..]; 2 * cols].join(&0u8);
+            let ints = pack(&vec![7i64; 2 * per]);
+            let mut out = vec![i64::MIN; 2 * words];
+            unsafe {
+                assert_eq!(
+                    export(
+                        text.as_ptr(),
+                        text.len(),
+                        ints.as_ptr(),
+                        ints.len(),
+                        2,
+                        std::ptr::null_mut(),
+                        64
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    export(
+                        std::ptr::null(),
+                        text.len(),
+                        ints.as_ptr(),
+                        ints.len(),
+                        2,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    -1
+                );
+                if per > 0 {
+                    assert_eq!(
+                        export(
+                            text.as_ptr(),
+                            text.len(),
+                            std::ptr::null(),
+                            ints.len(),
+                            2,
+                            out.as_mut_ptr(),
+                            out.len()
+                        ),
+                        -1
+                    );
+                }
+                assert_eq!(
+                    export(
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                        0,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    0
+                );
+                let mut shared = vec![0i64; 64];
+                let base = shared.as_mut_ptr();
+                assert_eq!(
+                    export(base.cast(), 8, ints.as_ptr(), ints.len(), 2, base, 64),
+                    -1
+                );
+            }
+            assert!(out.iter().all(|w| *w == i64::MIN));
+            let mut extra = text.clone();
+            extra.extend_from_slice(b"\0b");
+            assert_eq!(call(export, &extra, &ints, 2, &mut out), -1);
+            assert_eq!(
+                call(export, &text[..text.len() - 2], &ints, 2, &mut out),
+                -1
+            );
+            if per > 0 {
+                assert_eq!(call(export, &text, &ints[8..], 2, &mut out), -1);
+            }
+            let mut short = vec![i64::MIN; 2 * words - 1];
+            assert_eq!(
+                call(export, &text, &ints, 2, &mut short),
+                -((2 * words) as isize)
+            );
+            assert!(short.iter().all(|w| *w == i64::MIN));
+            assert_eq!(
+                call(export, &text, &ints, 2, &mut out),
+                (2 * words) as isize
+            );
+            assert!(out.iter().all(|w| *w != i64::MIN));
+        }
+    }
+
+    #[test]
+    fn w544_long_and_binary_inputs_stay_bounded() {
+        let long: Vec<u8> = [b' '; 200_000]
+            .iter()
+            .chain(b"Tushy Inc".iter())
+            .copied()
+            .collect();
+        let binary: Vec<u8> = (1u8..=255).collect();
+        for (export, cols, per, words) in EXPORTS {
+            for value in [&long[..], &binary[..]] {
+                let text = vec![value; cols].join(&0u8);
+                let ints = pack(&vec![i64::MIN; per]);
+                let mut out = vec![i64::MIN; words];
+                assert_eq!(call(export, &text, &ints, 1, &mut out), words as isize);
+            }
+        }
+        let out = rows(nntmux_w544_xxx_adult_signal_row_batch, &[&long], &[], 1, 4);
+        assert_eq!(out, vec![1, 6, 200_000, -1]);
+    }
+}
