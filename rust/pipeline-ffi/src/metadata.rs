@@ -48264,39 +48264,39 @@ pub mod w504_batch {
         tail.iter().position(|c| *c == 0).map(|p| done + p)
     }
 
-    struct Batch<'a> {
-        count: usize,
+    pub(crate) struct Batch<'a> {
+        pub(crate) count: usize,
         fields: Vec<&'a [u8]>,
-        head: Vec<i64>,
+        pub(crate) head: Vec<i64>,
         rows: &'a [[u8; 8]],
         per: usize,
     }
 
     impl<'a> Batch<'a> {
         #[inline(always)]
-        fn text(&self, col: usize, i: usize) -> &'a [u8] {
+        pub(crate) fn text(&self, col: usize, i: usize) -> &'a [u8] {
             self.fields[col * self.count + i]
         }
 
         #[inline(always)]
-        fn int(&self, i: usize, k: usize) -> i64 {
+        pub(crate) fn int(&self, i: usize, k: usize) -> i64 {
             i64::from_le_bytes(self.rows[i * self.per + k])
         }
     }
 
     /// Record layout: text columns, header ints, ints per record and output words.
     #[derive(Clone, Copy)]
-    struct Shape {
-        cols: usize,
-        head: usize,
-        per: usize,
-        words: usize,
+    pub(crate) struct Shape {
+        pub(crate) cols: usize,
+        pub(crate) head: usize,
+        pub(crate) per: usize,
+        pub(crate) words: usize,
     }
 
-    type Body = fn(&Batch<'_>, &mut [i64]);
+    pub(crate) type Body = fn(&Batch<'_>, &mut [i64]);
 
     #[allow(clippy::too_many_arguments)]
-    unsafe fn run(
+    pub(crate) unsafe fn run(
         text: *const u8,
         text_len: usize,
         ints: *const u8,
@@ -48375,12 +48375,12 @@ pub mod w504_batch {
 
     /// PHP trim() default set: space, tab, LF, CR, NUL and vertical tab.
     #[inline(always)]
-    fn is_trim(b: u8) -> bool {
+    pub(crate) fn is_trim(b: u8) -> bool {
         matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b)
     }
 
     /// trim() as `(offset, trimmed)`; an all-blank value reports its full length as offset.
-    fn trim(value: &[u8]) -> (usize, &[u8]) {
+    pub(crate) fn trim(value: &[u8]) -> (usize, &[u8]) {
         let start = value
             .iter()
             .position(|b| !is_trim(*b))
@@ -48393,7 +48393,7 @@ pub mod w504_batch {
     }
 
     #[inline(always)]
-    fn span_word(offset: usize, len: usize) -> i64 {
+    pub(crate) fn span_word(offset: usize, len: usize) -> i64 {
         ((offset as i64) << 32) | len as i64
     }
 
@@ -48482,7 +48482,7 @@ pub mod w504_batch {
     /// Index of the first earlier key equal under ASCII case folding (strtolower()), or -1
     /// for the first occurrence. Empty keys never match. Keys are compared, so hash
     /// collisions cannot merge distinct keys.
-    fn first_seen(keys: &[&[u8]], hashes: &[u64], out: &mut [i64], stride: usize, at: usize) {
+    pub(crate) fn first_seen(keys: &[&[u8]], hashes: &[u64], out: &mut [i64], stride: usize, at: usize) {
         let size = (keys.len() * 2).next_power_of_two().max(4);
         let mask = size - 1;
         let mut slots = vec![u32::MAX; size];
@@ -49451,5 +49451,787 @@ mod w504_tests {
             assert_eq!(out[i * 3], if i < 300 { -1 } else { (i - 300) as i64 });
         }
         assert_eq!(out[600 * 3], 7);
+    }
+}
+
+/// Wave 51.4 batch helpers reuse the Wave 50.4 frame: NUL-joined text columns, little-endian
+/// int64 header and per-record ints, and fixed-width int64 output words per record.
+pub mod w514_batch {
+    use super::w504_batch::{Batch, Shape, first_seen, run, scan, span_word, trim};
+
+    const MIX: u64 = 0x9e37_79b9_7f4a_7c15;
+
+    /// `token` as an alphanumeric-bounded, ASCII case-insensitive word anywhere in `hay`.
+    fn has_token(hay: &[u8], token: &[u8]) -> bool {
+        hay.len() >= token.len()
+            && hay.windows(token.len()).enumerate().any(|(at, w)| {
+                w.eq_ignore_ascii_case(token)
+                    && (at == 0 || !hay[at - 1].is_ascii_alphanumeric())
+                    && hay
+                        .get(at + token.len())
+                        .is_none_or(|c| !c.is_ascii_alphanumeric())
+            })
+    }
+
+    fn all_digits(value: &[u8]) -> bool {
+        value.iter().all(u8::is_ascii_digit)
+    }
+
+    /// Text after the last '.' (strrpos()), when there is one.
+    fn extension(entry: &[u8]) -> Option<(usize, &[u8])> {
+        entry
+            .iter()
+            .rposition(|c| *c == b'.')
+            .map(|dot| (dot + 1, &entry[dot + 1..]))
+    }
+
+    fn strip_suffix_ci<'a>(value: &'a [u8], suffix: &[u8]) -> Option<&'a [u8]> {
+        let split = value.len().checked_sub(suffix.len())?;
+        value[split..]
+            .eq_ignore_ascii_case(suffix)
+            .then_some(&value[..split])
+    }
+
+    // -------------------------------------------------------------------------------------
+    // IsbnDbService
+    // -------------------------------------------------------------------------------------
+
+    /// Alternating 1/3 weighted digit sum of the ISBN-13 checksum.
+    fn isbn13_check(digits: &[u8]) -> u32 {
+        digits
+            .iter()
+            .enumerate()
+            .map(|(i, d)| u32::from(d - b'0') * if i % 2 == 0 { 1 } else { 3 })
+            .sum()
+    }
+
+    fn decimal(digits: &[u8]) -> i64 {
+        digits
+            .iter()
+            .fold(0, |value, d| value * 10 + i64::from(d - b'0'))
+    }
+
+    /// `(13 or 10, canonical ISBN-13)` after normalizeIsbnBatchCandidatesPhp() stripping, or
+    /// `(0, 0)` for an invalid token.
+    fn isbn_canonical(token: &[u8]) -> (i64, i64) {
+        let mut buf = [0u8; 13];
+        let mut len = 0;
+        for &c in token {
+            if matches!(c, b' ' | b'\t' | b'\r' | b'\n' | 0x0b | 0x0c | b'-') {
+                continue;
+            }
+            if len == buf.len() {
+                return (0, 0);
+            }
+            buf[len] = if c == b'x' { b'X' } else { c };
+            len += 1;
+        }
+        match len {
+            13 if buf.starts_with(b"97")
+                && matches!(buf[2], b'8' | b'9')
+                && all_digits(&buf)
+                && isbn13_check(&buf).is_multiple_of(10) =>
+            {
+                (13, decimal(&buf))
+            }
+            10 if all_digits(&buf[..9]) && (buf[9].is_ascii_digit() || buf[9] == b'X') => {
+                let sum: u32 = buf[..10]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| {
+                        let value = if *c == b'X' { 10 } else { u32::from(c - b'0') };
+                        value * (10 - i as u32)
+                    })
+                    .sum();
+                if !sum.is_multiple_of(11) {
+                    return (0, 0);
+                }
+                let mut isbn = [0u8; 13];
+                isbn[..3].copy_from_slice(b"978");
+                isbn[3..12].copy_from_slice(&buf[..9]);
+                isbn[12] = b'0' + ((10 - isbn13_check(&isbn[..12]) % 10) % 10) as u8;
+                (10, decimal(&isbn))
+            }
+            _ => (0, 0),
+        }
+    }
+
+    /// `[13, 10 or 0 invalid, canonical ISBN-13 or 0, first earlier token with the same
+    /// canonical ISBN-13 or -1]` per token.
+    fn isbn_token(b: &Batch<'_>, out: &mut [i64]) {
+        let size = (b.count * 2).next_power_of_two().max(4);
+        let mask = size - 1;
+        // `(canonical ISBN-13, first index)`; valid ISBN-13 values are never 0.
+        let mut slots = vec![(0i64, 0i64); size];
+        for (i, slot) in out.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+            let (kind, isbn) = isbn_canonical(b.text(0, i));
+            let mut first = -1;
+            if kind != 0 {
+                let mut pos = ((isbn as u64).wrapping_mul(MIX) >> 32) as usize & mask;
+                first = loop {
+                    let (held, at) = slots[pos];
+                    if held == 0 {
+                        slots[pos] = (isbn, i as i64);
+                        break -1;
+                    }
+                    if held == isbn {
+                        break at;
+                    }
+                    pos = (pos + 1) & mask;
+                };
+            }
+            *slot = [kind, isbn, first];
+        }
+    }
+
+    // -------------------------------------------------------------------------------------
+    // OpenLibraryService
+    // -------------------------------------------------------------------------------------
+
+    const EDITION_ISBN13: i64 = 1;
+    const EDITION_COVER: i64 = 2;
+    const EDITION_EXACT_YEAR: i64 = 4;
+    const EDITION_EARLIEST: i64 = 8;
+
+    /// The first run of exactly four ASCII digits, `(?<![0-9])[0-9]{4}(?![0-9])`, or 0.
+    fn first_year(date: &[u8]) -> i64 {
+        let mut i = 0;
+        while i < date.len() {
+            if !date[i].is_ascii_digit() {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < date.len() && date[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i - start == 4 {
+                return decimal(&date[start..i]);
+            }
+        }
+        0
+    }
+
+    /// `[publication year or 0, flags]` from (publish date, first ISBN-13), header
+    /// `[preferred year]` and `[first cover id]` per record. The first edition with the
+    /// earliest positive year is flagged earliest.
+    fn openlibrary_edition(b: &Batch<'_>, out: &mut [i64]) {
+        let preferred = b.head[0];
+        let words = out.as_chunks_mut::<2>().0;
+        let mut earliest: Option<(usize, i64)> = None;
+        for (i, slot) in words.iter_mut().enumerate() {
+            let year = first_year(b.text(0, i));
+            let mut flags = 0;
+            if !trim(b.text(1, i)).1.is_empty() {
+                flags |= EDITION_ISBN13;
+            }
+            if b.int(i, 0) > 0 {
+                flags |= EDITION_COVER;
+            }
+            if preferred > 0 && year == preferred {
+                flags |= EDITION_EXACT_YEAR;
+            }
+            if year > 0 && earliest.is_none_or(|(_, best)| year < best) {
+                earliest = Some((i, year));
+            }
+            *slot = [year, flags];
+        }
+        if let Some((at, _)) = earliest {
+            words[at][1] |= EDITION_EARLIEST;
+        }
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Par2FileList
+    // -------------------------------------------------------------------------------------
+
+    const FILE_EMPTY: i64 = 1;
+    const FILE_PAR2: i64 = 2;
+    const FILE_RAR_VOLUME: i64 = 4;
+    const FILE_SPLIT_ARCHIVE: i64 = 8;
+    const FILE_VIDEO: i64 = 16;
+    const FILE_SAMPLE: i64 = 32;
+    const FILE_PATH: i64 = 64;
+
+    const VIDEO_EXTENSIONS: [&[u8]; 9] = [
+        b"mkv", b"mp4", b"avi", b"m2ts", b"ts", b"wmv", b"mov", b"mpg", b"vob",
+    ];
+
+    /// `[flags, extension offset << 32 | length in the raw name, or -1 without a dot]`.
+    fn par2_file_name(b: &Batch<'_>, out: &mut [i64]) {
+        for (i, slot) in out.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+            let (offset, entry) = trim(b.text(0, i));
+            if entry.is_empty() {
+                *slot = [FILE_EMPTY, -1];
+                continue;
+            }
+            let (span, ext) = match extension(entry) {
+                Some((at, ext)) => (span_word(offset + at, ext.len()), ext),
+                None => (-1, &[][..]),
+            };
+            let mut flags = 0;
+            if ext.eq_ignore_ascii_case(b"par2") {
+                flags |= FILE_PAR2;
+            }
+            if ext.eq_ignore_ascii_case(b"rar")
+                || (ext.len() == 3 && ext[0].eq_ignore_ascii_case(&b'r') && all_digits(&ext[1..]))
+            {
+                flags |= FILE_RAR_VOLUME;
+            }
+            if ext.eq_ignore_ascii_case(b"7z")
+                || ext.eq_ignore_ascii_case(b"zip")
+                || (ext.len() == 3 && all_digits(ext))
+            {
+                flags |= FILE_SPLIT_ARCHIVE;
+            }
+            if VIDEO_EXTENSIONS.iter().any(|v| ext.eq_ignore_ascii_case(v)) {
+                flags |= FILE_VIDEO;
+            }
+            if has_token(entry, b"sample") {
+                flags |= FILE_SAMPLE;
+            }
+            if entry.iter().any(|c| matches!(c, b'/' | b'\\')) {
+                flags |= FILE_PATH;
+            }
+            *slot = [flags, span];
+        }
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Par2Processor
+    // -------------------------------------------------------------------------------------
+
+    const RENAME_EMPTY: i64 = 1;
+    const RENAME_HEX_HASH: i64 = 2;
+    const RENAME_OBFUSCATED: i64 = 4;
+    const RENAME_RELEASE_LIKE: i64 = 8;
+    const RENAME_PAR2_VOLUME: i64 = 16;
+    const RENAME_EXECUTABLE: i64 = 32;
+
+    const EXECUTABLE_EXTENSIONS: [&[u8]; 10] = [
+        b"exe", b"bat", b"cmd", b"scr", b"com", b"vbs", b"js", b"ps1", b"msi", b"lnk",
+    ];
+
+    fn trailing_digits(value: &[u8]) -> usize {
+        value
+            .iter()
+            .rev()
+            .take_while(|c| c.is_ascii_digit())
+            .count()
+    }
+
+    /// `\.vol\d+\+\d+\.par2\z`, ASCII case-insensitive.
+    fn par2_volume(entry: &[u8]) -> bool {
+        let Some(rest) = strip_suffix_ci(entry, b".par2") else {
+            return false;
+        };
+        let blocks = trailing_digits(rest);
+        let Some(rest) = rest[..rest.len() - blocks].strip_suffix(b"+") else {
+            return false;
+        };
+        let start = trailing_digits(rest);
+        blocks > 0 && start > 0 && strip_suffix_ci(&rest[..rest.len() - start], b".vol").is_some()
+    }
+
+    /// `[flags, stem offset << 32 | length in the raw name]`; the stem is the base name
+    /// after the last slash or backslash, up to its last dot.
+    fn par2_rename_candidate(b: &Batch<'_>, out: &mut [i64]) {
+        for (i, slot) in out.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+            let (offset, entry) = trim(b.text(0, i));
+            if entry.is_empty() {
+                *slot = [RENAME_EMPTY, span_word(offset, 0)];
+                continue;
+            }
+            let base_at = entry
+                .iter()
+                .rposition(|c| matches!(c, b'/' | b'\\'))
+                .map_or(0, |p| p + 1);
+            let base = &entry[base_at..];
+            let (stem, ext) = match extension(base) {
+                Some((at, ext)) => (&base[..at - 1], ext),
+                None => (base, &[][..]),
+            };
+            let mut flags = 0;
+            if (stem.len() == 32 || stem.len() == 40) && stem.iter().all(u8::is_ascii_hexdigit) {
+                flags |= RENAME_HEX_HASH;
+            }
+            if stem.len() >= 16 && stem.iter().all(u8::is_ascii_alphanumeric) {
+                flags |= RENAME_OBFUSCATED;
+            }
+            if stem.iter().filter(|c| **c == b'.').count() >= 2 && stem.contains(&b'-') {
+                flags |= RENAME_RELEASE_LIKE;
+            }
+            if par2_volume(entry) {
+                flags |= RENAME_PAR2_VOLUME;
+            }
+            if EXECUTABLE_EXTENSIONS
+                .iter()
+                .any(|e| ext.eq_ignore_ascii_case(e))
+            {
+                flags |= RENAME_EXECUTABLE;
+            }
+            *slot = [flags, span_word(offset + base_at, stem.len())];
+        }
+    }
+
+    // -------------------------------------------------------------------------------------
+    // NfoProcessor
+    // -------------------------------------------------------------------------------------
+
+    const NFO_EMPTY: i64 = 1;
+    const NFO_NFO: i64 = 2;
+    const NFO_DIZ: i64 = 4;
+    const NFO_TXT: i64 = 8;
+    const NFO_SAMPLE_PROOF: i64 = 16;
+    const NFO_PATH: i64 = 32;
+
+    /// `[flags, first earlier name equal after trim() and ASCII case folding, or -1]`.
+    fn nfo_candidate(b: &Batch<'_>, out: &mut [i64]) {
+        let mut keys: Vec<&[u8]> = Vec::with_capacity(b.count);
+        let mut hashes: Vec<u64> = Vec::with_capacity(b.count);
+        for i in 0..b.count {
+            let (_, entry) = trim(b.text(0, i));
+            keys.push(entry);
+            hashes.push(scan(entry).hash);
+            let flags = if entry.is_empty() {
+                NFO_EMPTY
+            } else {
+                let ext = extension(entry).map_or(&[][..], |(_, ext)| ext);
+                let mut flags = 0;
+                if ext.eq_ignore_ascii_case(b"nfo") {
+                    flags |= NFO_NFO;
+                } else if ext.eq_ignore_ascii_case(b"diz") {
+                    flags |= NFO_DIZ;
+                } else if ext.eq_ignore_ascii_case(b"txt") {
+                    flags |= NFO_TXT;
+                }
+                if has_token(entry, b"sample") || has_token(entry, b"proof") {
+                    flags |= NFO_SAMPLE_PROOF;
+                }
+                if entry.iter().any(|c| matches!(c, b'/' | b'\\')) {
+                    flags |= NFO_PATH;
+                }
+                flags
+            };
+            out[i * 2] = flags;
+        }
+        first_seen(&keys, &hashes, out, 2, 1);
+    }
+
+    macro_rules! export {
+        ($name:ident, $cols:literal, $head:literal, $per:literal, $words:literal, $body:ident) => {
+            /// # Safety
+            ///
+            /// `text` must point to `text_len` readable bytes, `ints` to `ints_len`
+            /// readable bytes and `out` to `out_cap` writable, aligned int64 words that
+            /// overlap neither input; null pointers are accepted only with zero lengths.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                text: *const u8,
+                text_len: usize,
+                ints: *const u8,
+                ints_len: usize,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                let shape = Shape {
+                    cols: $cols,
+                    head: $head,
+                    per: $per,
+                    words: $words,
+                };
+                unsafe {
+                    run(
+                        text, text_len, ints, ints_len, count, out, out_cap, shape, $body,
+                    )
+                }
+            }
+        };
+    }
+
+    export!(nntmux_w514_isbn_token_batch, 1, 0, 0, 3, isbn_token);
+    export!(
+        nntmux_w514_openlibrary_edition_batch,
+        2,
+        1,
+        1,
+        2,
+        openlibrary_edition
+    );
+    export!(nntmux_w514_par2_file_name_batch, 1, 0, 0, 2, par2_file_name);
+    export!(
+        nntmux_w514_par2_rename_candidate_batch,
+        1,
+        0,
+        0,
+        2,
+        par2_rename_candidate
+    );
+    export!(nntmux_w514_nfo_candidate_batch, 1, 0, 0, 2, nfo_candidate);
+}
+
+#[cfg(test)]
+mod w514_tests {
+    use super::w514_batch::*;
+
+    type Export =
+        unsafe extern "C" fn(*const u8, usize, *const u8, usize, usize, *mut i64, usize) -> isize;
+
+    fn text(columns: &[&[&[u8]]]) -> Vec<u8> {
+        columns
+            .iter()
+            .flat_map(|column| column.iter())
+            .copied()
+            .collect::<Vec<_>>()
+            .join(&0u8)
+    }
+
+    fn ints(values: &[i64]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn call(export: Export, text: &[u8], ints: &[u8], count: usize, out: &mut [i64]) -> isize {
+        unsafe {
+            export(
+                text.as_ptr(),
+                text.len(),
+                ints.as_ptr(),
+                ints.len(),
+                count,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        }
+    }
+
+    fn words(
+        export: Export,
+        columns: &[&[&[u8]]],
+        values: &[i64],
+        count: usize,
+        per: usize,
+    ) -> Vec<i64> {
+        let mut out = vec![i64::MIN; count * per];
+        assert_eq!(
+            call(export, &text(columns), &ints(values), count, &mut out),
+            (count * per) as isize
+        );
+        out
+    }
+
+    fn span(offset: i64, len: i64) -> i64 {
+        (offset << 32) | len
+    }
+
+    #[test]
+    fn w514_isbn_token_hand_cases() {
+        let tokens: [&[u8]; 10] = [
+            b"978-0-306-40615-7",
+            b"0-306-40615-2",
+            b"9780306406157",
+            b"080442957x",
+            b"080442957X",
+            b"9780306406158",
+            b"97803064061570",
+            b"979 10 90636 07 1",
+            b"\x0c9780306406157\x0b",
+            b"",
+        ];
+        let out = words(nntmux_w514_isbn_token_batch, &[&tokens], &[], 10, 3);
+        assert_eq!(
+            out,
+            vec![
+                13,
+                9_780_306_406_157,
+                -1,
+                10,
+                9_780_306_406_157,
+                0,
+                13,
+                9_780_306_406_157,
+                0,
+                10,
+                9_780_804_429_573,
+                -1,
+                10,
+                9_780_804_429_573,
+                3,
+                0,
+                0,
+                -1,
+                0,
+                0,
+                -1,
+                13,
+                9_791_090_636_071,
+                -1,
+                13,
+                9_780_306_406_157,
+                0,
+                0,
+                0,
+                -1,
+            ]
+        );
+    }
+
+    #[test]
+    fn w514_openlibrary_edition_hand_cases() {
+        let dates: [&[u8]; 6] = [
+            b"March 2004",
+            b"12345 1999",
+            b"c1987, 2001",
+            b"",
+            b"1987",
+            b"0000",
+        ];
+        let isbns: [&[u8]; 6] = [b"9780306406157", b" \t", b"", b"x", b"", b"1"];
+        let out = words(
+            nntmux_w514_openlibrary_edition_batch,
+            &[&dates, &isbns],
+            &[1987, 5, 0, -1, i64::MAX, 7, 0],
+            6,
+            2,
+        );
+        assert_eq!(
+            out,
+            vec![
+                2004,
+                1 | 2,
+                1999,
+                0,
+                1987,
+                4 | 8,
+                0,
+                1 | 2,
+                1987,
+                2 | 4,
+                0,
+                1
+            ]
+        );
+    }
+
+    #[test]
+    fn w514_par2_file_name_hand_cases() {
+        let names: [&[u8]; 9] = [
+            b" Show.S01E01.mkv ",
+            b"show.R01",
+            b"archive.7Z",
+            b"movie.sample.mp4",
+            b"dir/file.PAR2",
+            b"x.123",
+            b"\t",
+            b"samples/a.rar",
+            b"noext",
+        ];
+        let out = words(nntmux_w514_par2_file_name_batch, &[&names], &[], 9, 2);
+        assert_eq!(
+            out,
+            vec![
+                16,
+                span(13, 3),
+                4,
+                span(5, 3),
+                8,
+                span(8, 2),
+                16 | 32,
+                span(13, 3),
+                2 | 64,
+                span(9, 4),
+                8,
+                span(2, 3),
+                1,
+                -1,
+                4 | 64,
+                span(10, 3),
+                0,
+                -1,
+            ]
+        );
+    }
+
+    #[test]
+    fn w514_par2_rename_candidate_hand_cases() {
+        let names: [&[u8]; 8] = [
+            b"d41d8cd98f00b204e9800998ecf8427e.mkv",
+            b" dir\\Abcdefgh12345678 ",
+            b"Some.Release.Name-GRP.rar",
+            b"x.vol00+01.PAR2",
+            b"setup.EXE",
+            b"x.vol+01.par2",
+            b"  ",
+            b"a/b/.hidden",
+        ];
+        let out = words(
+            nntmux_w514_par2_rename_candidate_batch,
+            &[&names],
+            &[],
+            8,
+            2,
+        );
+        assert_eq!(
+            out,
+            vec![
+                2 | 4,
+                span(0, 32),
+                4,
+                span(5, 16),
+                8,
+                span(0, 21),
+                16,
+                span(0, 10),
+                32,
+                span(0, 5),
+                0,
+                span(0, 8),
+                1,
+                span(2, 0),
+                0,
+                span(4, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn w514_nfo_candidate_hand_cases() {
+        let names: [&[u8]; 7] = [
+            b" Release.NFO ",
+            b"release.nfo",
+            b"file_id.diz",
+            b"proof/readme.txt",
+            b"",
+            b"Sample-Info.nfo2",
+            b"RELEASE.NFO",
+        ];
+        let out = words(nntmux_w514_nfo_candidate_batch, &[&names], &[], 7, 2);
+        assert_eq!(
+            out,
+            vec![2, -1, 2, 0, 4, -1, 8 | 16 | 32, -1, 1, -1, 16, -1, 2, 0]
+        );
+    }
+
+    const EXPORTS: [(Export, usize, usize, usize, usize); 5] = [
+        (nntmux_w514_isbn_token_batch, 1, 0, 0, 3),
+        (nntmux_w514_openlibrary_edition_batch, 2, 1, 1, 2),
+        (nntmux_w514_par2_file_name_batch, 1, 0, 0, 2),
+        (nntmux_w514_par2_rename_candidate_batch, 1, 0, 0, 2),
+        (nntmux_w514_nfo_candidate_batch, 1, 0, 0, 2),
+    ];
+
+    #[test]
+    fn w514_raw_export_contract() {
+        for (export, cols, head, per, words_per) in EXPORTS {
+            let fields: Vec<&[u8]> = vec![&b"x"[..]; 2];
+            let columns: Vec<&[&[u8]]> = vec![&fields[..]; cols];
+            let good_text = text(&columns);
+            let good_ints = ints(&vec![1; head + 2 * per]);
+            let mut out = vec![i64::MIN; 2 * words_per];
+            assert_eq!(
+                call(export, &good_text, &good_ints, 2, &mut out),
+                (2 * words_per) as isize
+            );
+            assert_eq!(call(export, &[], &ints(&vec![0; head]), 0, &mut out), 0);
+            let mut extra = good_text.clone();
+            extra.extend_from_slice(b"\0y");
+            assert_eq!(call(export, &extra, &good_ints, 2, &mut out), -1);
+            if head + 2 * per > 0 {
+                assert_eq!(
+                    call(
+                        export,
+                        &good_text,
+                        &good_ints[..good_ints.len() - 8],
+                        2,
+                        &mut out
+                    ),
+                    -1
+                );
+            }
+            unsafe {
+                assert_eq!(
+                    export(
+                        std::ptr::null(),
+                        4,
+                        good_ints.as_ptr(),
+                        good_ints.len(),
+                        2,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    export(
+                        good_text.as_ptr(),
+                        good_text.len(),
+                        std::ptr::null(),
+                        8,
+                        2,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    export(
+                        good_text.as_ptr(),
+                        good_text.len(),
+                        good_ints.as_ptr(),
+                        good_ints.len(),
+                        2,
+                        std::ptr::null_mut(),
+                        8
+                    ),
+                    -1
+                );
+                let head_ints = ints(&vec![0; head]);
+                let head_ptr = if head == 0 {
+                    std::ptr::null()
+                } else {
+                    head_ints.as_ptr()
+                };
+                assert_eq!(
+                    export(
+                        std::ptr::null(),
+                        0,
+                        head_ptr,
+                        head_ints.len(),
+                        0,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    0
+                );
+            }
+            let mut short = vec![i64::MIN; 2 * words_per - 1];
+            assert_eq!(
+                call(export, &good_text, &good_ints, 2, &mut short),
+                -((2 * words_per) as isize)
+            );
+            assert!(short.iter().all(|w| *w == i64::MIN));
+        }
+    }
+
+    #[test]
+    fn w514_isbn_duplicates_survive_many_keys() {
+        let owned: Vec<Vec<u8>> = (0..900u64)
+            .map(|i| {
+                let body = format!("978{:09}", i % 300);
+                let digits = body.as_bytes();
+                let sum: u32 = digits
+                    .iter()
+                    .enumerate()
+                    .map(|(k, d)| u32::from(d - b'0') * if k % 2 == 0 { 1 } else { 3 })
+                    .sum();
+                format!("{body}{}", (10 - sum % 10) % 10).into_bytes()
+            })
+            .collect();
+        let tokens: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
+        let out = words(nntmux_w514_isbn_token_batch, &[&tokens], &[], 900, 3);
+        for i in 0..900 {
+            assert_eq!(out[i * 3], 13);
+            assert_eq!(out[i * 3 + 2], if i < 300 { -1 } else { (i % 300) as i64 });
+        }
     }
 }

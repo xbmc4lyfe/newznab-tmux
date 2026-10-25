@@ -7,6 +7,8 @@ namespace App\Services;
 use App\Support\RustPipelineLibrary;
 use dariusiii\rarinfo\Par2Info;
 use FFI;
+use FFI\CData;
+use InvalidArgumentException;
 use Throwable;
 
 final class Par2FileList
@@ -410,6 +412,180 @@ final class Par2FileList
             return $summary;
         } catch (Throwable) {
             return null;
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 51.4 batch helper
+    // ---------------------------------------------------------------------
+
+    /** Enabled: minimum of three paired runs cleared every 1.5x gate (common mean 3.30x, p99 2.99x; uncommon mean 3.60x, p99 3.32x); see RustIsbnOpenLibPar2ListProcessorNfoW51ParityTest. */
+    private const bool W51_RUST_FFI_DEFAULT = true;
+
+    public const string W51_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w514_par2_file_name_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** File name flags returned by fileNameBatch(). */
+    public const int W51_EMPTY_NAME = 1;
+
+    public const int W51_PAR2 = 2;
+
+    public const int W51_RAR_VOLUME = 4;
+
+    public const int W51_SPLIT_ARCHIVE = 8;
+
+    public const int W51_VIDEO = 16;
+
+    public const int W51_SAMPLE = 32;
+
+    public const int W51_PATH = 64;
+
+    private static ?bool $useW51RustFfi = null;
+
+    private static FFI|false|null $w51Ffi = null;
+
+    private static ?CData $w51Out = null;
+
+    private static int $w51OutCap = 0;
+
+    public static function usesW51RustFfi(): bool
+    {
+        return self::$useW51RustFfi ?? self::W51_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W51 batch dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW51RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$useW51RustFfi;
+        self::$useW51RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$useW51RustFfi = $previous;
+        }
+    }
+
+    /**
+     * Classify PAR2 file description names, two ints each: [flags, offset << 32 | length of
+     * the extension after the last dot in the raw name, or -1 without a dot or name]. Flags
+     * follow summarizePar2FileNameBatchPhp() on the trimmed name: 1 empty, 2 par2, 4 rar or
+     * rNN volume, 8 7z/zip/NNN split archive, 16 video container, 32 SAMPLE token, 64 slash
+     * path.
+     *
+     * @param  list<string>  $names
+     * @return list<int>
+     */
+    public static function fileNameBatch(array $names): array
+    {
+        return self::usesW51RustFfi()
+            ? self::fileNameBatchNative($names)
+            : self::fileNameBatchPhp($names);
+    }
+
+    /**
+     * @param  list<string>  $names
+     * @return list<int>
+     */
+    public static function fileNameBatchNative(array $names): array
+    {
+        self::w51AssertList($names);
+        if ($names === []) {
+            return [];
+        }
+
+        return self::w51Call(implode("\0", $names), '', \count($names))
+            ?? self::fileNameBatchPhp($names);
+    }
+
+    /**
+     * @param  list<string>  $names
+     * @return list<int>
+     */
+    public static function fileNameBatchPhp(array $names): array
+    {
+        self::w51AssertList($names);
+        $out = [];
+        foreach ($names as $raw) {
+            $entry = trim($raw);
+            if ($entry === '') {
+                array_push($out, self::W51_EMPTY_NAME, -1);
+
+                continue;
+            }
+            $dot = strrpos($entry, '.');
+            $extension = $dot === false ? '' : strtolower(substr($entry, $dot + 1));
+            $flags = 0;
+            if ($extension === 'par2') {
+                $flags |= self::W51_PAR2;
+            }
+            if ($extension === 'rar' || preg_match('/^r\d{2}\z/', $extension) === 1) {
+                $flags |= self::W51_RAR_VOLUME;
+            }
+            if ($extension === '7z' || $extension === 'zip' || preg_match('/^\d{3}\z/', $extension) === 1) {
+                $flags |= self::W51_SPLIT_ARCHIVE;
+            }
+            if (isset(self::W424_VIDEO_EXTENSIONS[$extension])) {
+                $flags |= self::W51_VIDEO;
+            }
+            if (preg_match('/(?<![A-Za-z0-9])SAMPLE(?![A-Za-z0-9])/i', $entry) === 1) {
+                $flags |= self::W51_SAMPLE;
+            }
+            if (strpbrk($entry, '/\\') !== false) {
+                $flags |= self::W51_PATH;
+            }
+            $out[] = $flags;
+            $out[] = $dot === false ? -1 : ((strspn($raw, " \t\n\r\0\x0B") + $dot + 1) << 32) | (\strlen($entry) - $dot - 1);
+        }
+
+        return $out;
+    }
+
+    /**
+     * One FFI crossing for the batch: NUL-joined names, two int64 words back per record. Null when
+     * the library is missing or declines.
+     *
+     * @return list<int>|null
+     */
+    private static function w51Call(string $text, string $ints, int $count): ?array
+    {
+        try {
+            self::$w51Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w51', self::W51_FFI_CDEF) ?? false;
+            $ffi = self::$w51Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            $need = $count * 2;
+            $out = self::$w51Out;
+            if ($out === null || self::$w51OutCap < $need) {
+                self::$w51OutCap = max(1024, $need);
+                $out = self::$w51Out = $ffi->new('int64_t['.self::$w51OutCap.']');
+            }
+            // @phpstan-ignore method.notFound (Declared by W51_FFI_CDEF.)
+            $written = $ffi->nntmux_w514_par2_file_name_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, self::$w51OutCap);
+            if ($written !== $need) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $need * 8));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** @param array<array-key, mixed> $values */
+    private static function w51AssertList(array $values): void
+    {
+        if (! array_is_list($values)) {
+            throw new InvalidArgumentException('W51 batch input must be a list.');
         }
     }
 }
