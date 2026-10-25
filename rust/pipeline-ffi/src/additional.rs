@@ -25355,3 +25355,262 @@ mod w336_locks_uptime_tests {
         assert_eq!(output, [0x5a; 256]);
     }
 }
+
+// Wave 34.6: pure configuration, runtime flag, service transition and probe summaries.
+// Counts and capacities are in i64 elements, never bytes. No persistence or clock reads.
+fn w346_compute(operation: u8, input: &[i64]) -> Option<([i64; 5], usize)> {
+    let mut result = [0; 5];
+    let size = match (operation, input) {
+        (1, [threads, timeout, retries]) => {
+            result[..3].copy_from_slice(&[(*threads).max(1), (*timeout).max(0), (*retries).max(0)]);
+            3
+        }
+        (2, [sequential, backfill, post, amazon, non]) => {
+            result[0] = if (0..=2).contains(sequential) {
+                *sequential
+            } else {
+                0
+            };
+            result[1] = if matches!(backfill, 0 | 1 | 4) {
+                *backfill
+            } else {
+                0
+            };
+            for (index, mode) in [post, amazon, non].into_iter().enumerate() {
+                result[index + 2] = if (0..=3).contains(mode) { *mode } else { 0 };
+            }
+            5
+        }
+        (3, [running, stop, running_update, stop_update]) => {
+            if !(0..=1).contains(running)
+                || !(0..=1).contains(stop)
+                || !(-1..=1).contains(running_update)
+                || !(-1..=1).contains(stop_update)
+            {
+                return None;
+            }
+            let running = if *running_update == -1 {
+                *running
+            } else {
+                *running_update
+            };
+            let stop = if *stop_update == -1 {
+                *stop
+            } else {
+                *stop_update
+            };
+            result[..3].copy_from_slice(&[running, stop, i64::from(running == 1 && stop == 0)]);
+            3
+        }
+        (4, [current, ok, impact]) => {
+            if !(0..=4).contains(current) || !(0..=1).contains(ok) || !(-1..=3).contains(impact) {
+                return None;
+            }
+            // Status: operational, degraded, partial outage, major outage, maintenance.
+            // Impact: null=-1, none=0, minor=1, major=2, critical=3.
+            let status = if *ok == 1 {
+                0
+            } else {
+                match impact {
+                    0 | 1 => 1,
+                    -1 | 2 => 2,
+                    3 => 3,
+                    _ => return None,
+                }
+            };
+            result[..2].copy_from_slice(&[status, i64::from(status != *current)]);
+            2
+        }
+        (5, [ok, latency, impact]) => {
+            if !(0..=1).contains(ok) || !(-1..=3).contains(impact) {
+                return None;
+            }
+            result[..3].copy_from_slice(&[*ok, (*latency).max(0), *impact]);
+            3
+        }
+        _ => return None,
+    };
+    Some((result, size))
+}
+
+/// Returns elements written, -needed for insufficient output capacity, or -1 for
+/// invalid input. Every negative result leaves the caller's output unchanged.
+///
+/// # Safety
+/// Pointers must reference live readable/writable allocations of the declared
+/// element counts, aligned for i64. Null and overlapping buffers are rejected.
+/// No allocation ownership crosses the ABI; both buffers remain caller-owned.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w346_configuration_status(
+    operation: u8,
+    input: *const i64,
+    input_count: usize,
+    output: *mut i64,
+    output_capacity: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        let expected = match operation {
+            1 | 4 | 5 => 3,
+            2 => 5,
+            3 => 4,
+            _ => return -1,
+        };
+        if input_count != expected
+            || output_capacity > 16
+            || input.is_null()
+            || output.is_null()
+            || (input as usize) % std::mem::align_of::<i64>() != 0
+            || (output as usize) % std::mem::align_of::<i64>() != 0
+        {
+            return -1;
+        }
+        // Bounded counts make multiplication safe; checked addresses also reject wraparound.
+        let Some(input_end) = (input as usize).checked_add(input_count * 8) else {
+            return -1;
+        };
+        let Some(output_end) = (output as usize).checked_add(output_capacity * 8) else {
+            return -1;
+        };
+        if output_capacity != 0 && (input as usize) < output_end && (output as usize) < input_end {
+            return -1;
+        }
+        let values = unsafe { std::slice::from_raw_parts(input, input_count) };
+        let Some((result, count)) = w346_compute(operation, values) else {
+            return -1;
+        };
+        if output_capacity < count {
+            return -(count as isize);
+        }
+        unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), output, count) };
+        count as isize
+    })
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod w346_configuration_status_tests {
+    use super::*;
+
+    #[test]
+    fn pure_computation_boundaries() {
+        assert_eq!(
+            w346_compute(1, &[i64::MIN, -1, i64::MAX]),
+            Some(([1, 0, i64::MAX, 0, 0], 3))
+        );
+        assert_eq!(
+            w346_compute(2, &[3, 2, -1, 3, 2]),
+            Some(([0, 0, 0, 3, 2], 5))
+        );
+        assert_eq!(
+            w346_compute(2, &[2, 4, 1, 2, 3]),
+            Some(([2, 4, 1, 2, 3], 5))
+        );
+        for running in 0..=1 {
+            for stop in 0..=1 {
+                for update in -1..=1 {
+                    let actual = w346_compute(3, &[running, stop, update, -1]).unwrap().0;
+                    let next = if update == -1 { running } else { update };
+                    assert_eq!(
+                        &actual[..3],
+                        &[next, stop, i64::from(next == 1 && stop == 0)]
+                    );
+                }
+            }
+        }
+        for current in 0..=4 {
+            for (impact, status) in [(-1, 2), (0, 1), (1, 1), (2, 2), (3, 3)] {
+                assert_eq!(
+                    w346_compute(4, &[current, 0, impact]).unwrap().0[..2],
+                    [status, i64::from(current != status)]
+                );
+                assert_eq!(
+                    w346_compute(4, &[current, 1, impact]).unwrap().0[..2],
+                    [0, i64::from(current != 0)]
+                );
+            }
+        }
+        assert_eq!(
+            w346_compute(5, &[0, i64::MIN, -1]),
+            Some(([0, 0, -1, 0, 0], 3))
+        );
+        assert_eq!(
+            w346_compute(5, &[1, i64::MAX, 3]),
+            Some(([1, i64::MAX, 3, 0, 0], 3))
+        );
+        for (op, input) in [
+            (3, vec![2, 0, -1, -1]),
+            (3, vec![1, 0, -2, -1]),
+            (4, vec![5, 0, 0]),
+            (4, vec![0, 2, 0]),
+            (4, vec![0, 0, 4]),
+            (5, vec![0, 0, -2]),
+        ] {
+            assert!(w346_compute(op, &input).is_none());
+        }
+    }
+
+    #[test]
+    fn abi_checks_before_dereference_and_never_partially_writes() {
+        let mut input = [1_i64, 0, -1, -1, 3];
+        let mut output = [90_i64; 8];
+        let call = |op, ptr, len, out, cap| unsafe {
+            nntmux_w346_configuration_status(op, ptr, len, out, cap)
+        };
+        for (op, count, needed) in [(1, 3, 3), (2, 5, 5), (3, 4, 3), (4, 3, 2), (5, 3, 3)] {
+            assert_eq!(
+                call(op, input.as_ptr(), count, output.as_mut_ptr(), 0),
+                -needed
+            );
+            assert_eq!(
+                call(
+                    op,
+                    input.as_ptr(),
+                    count,
+                    output.as_mut_ptr(),
+                    needed as usize - 1
+                ),
+                -needed
+            );
+            assert_eq!(
+                call(op, std::ptr::null(), count, output.as_mut_ptr(), 8),
+                -1
+            );
+            assert_eq!(call(op, input.as_ptr(), count, std::ptr::null_mut(), 8), -1);
+            assert_eq!(
+                call(op, input.as_ptr(), count - 1, output.as_mut_ptr(), 8),
+                -1
+            );
+            assert_eq!(
+                call(op, input.as_ptr(), usize::MAX, output.as_mut_ptr(), 8),
+                -1
+            );
+            assert_eq!(
+                call(op, input.as_ptr(), count, output.as_mut_ptr(), usize::MAX),
+                -1
+            );
+            assert_eq!(
+                call(op, input.as_ptr(), count, input.as_mut_ptr(), count),
+                -1
+            );
+            let unaligned = unsafe { input.as_ptr().cast::<u8>().add(1) }.cast::<i64>();
+            assert_eq!(call(op, unaligned, count, output.as_mut_ptr(), 8), -1);
+            assert_eq!(call(op, input.as_ptr(), count, unaligned.cast_mut(), 8), -1);
+            let wraps = (usize::MAX - 7) as *const i64;
+            assert_eq!(call(op, wraps, count, output.as_mut_ptr(), 8), -1);
+            assert_eq!(call(op, input.as_ptr(), count, wraps.cast_mut(), 8), -1);
+            assert_eq!(output, [90; 8]);
+            let expected = w346_compute(op, &input[..count]).unwrap();
+            assert_eq!(
+                call(op, input.as_ptr(), count, output.as_mut_ptr(), 8),
+                needed
+            );
+            assert_eq!(&output[..needed as usize], &expected.0[..needed as usize]);
+            assert_eq!(&output[needed as usize..], &vec![90; 8 - needed as usize]);
+            output.fill(90);
+        }
+        assert_eq!(call(0, input.as_ptr(), 3, output.as_mut_ptr(), 8), -1);
+        input[0] = 2;
+        assert_eq!(call(3, input.as_ptr(), 4, output.as_mut_ptr(), 8), -1);
+        assert_eq!(output, [90; 8]);
+    }
+}

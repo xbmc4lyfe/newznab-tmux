@@ -23683,3 +23683,466 @@ mod wave33_5_passkey_auth_admin_inform_mcp {
         }
     }
 }
+
+/// Wave 34.5: search cursor match/resume offset, metadata/site configuration
+/// normalization and stats/dashboard command formatting helpers.
+mod wave34_5_search_cursor_config_stats {
+    const DECLINE: isize = -1;
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+    const MAX_PARTS: usize = 64;
+    /// Bytes stripped by PHP's default `trim()`.
+    const PHP_TRIM: &[u8] = b" \t\n\r\0\x0B";
+    const TRAILER_DEFAULTS: [i64; 2] = [480, 345];
+    const TRAILER_MAX: i64 = 65_535;
+    const LANGUAGE_MAX_BYTES: usize = 8;
+    /// 2^63: the first float magnitude PHP cannot truncate into an int.
+    const I64_LIMIT: f64 = 9_223_372_036_854_775_808.0;
+
+    fn unpack(input: &[u8]) -> Option<Vec<&[u8]>> {
+        let count = u32::from_le_bytes(input.get(..4)?.try_into().ok()?) as usize;
+        if count > MAX_PARTS || count > (input.len() - 4) / 4 {
+            return None;
+        }
+        let mut cursor = 4usize;
+        let mut parts = Vec::with_capacity(count);
+        for _ in 0..count {
+            let length_end = cursor.checked_add(4)?;
+            let length =
+                u32::from_le_bytes(input.get(cursor..length_end)?.try_into().ok()?) as usize;
+            let end = length_end.checked_add(length)?;
+            parts.push(input.get(length_end..end)?);
+            cursor = end;
+        }
+        (cursor == input.len()).then_some(parts)
+    }
+
+    fn pack(parts: &[Vec<u8>]) -> Option<Vec<u8>> {
+        let count = u32::try_from(parts.len()).ok()?;
+        let size = parts.iter().try_fold(4usize, |size, part| {
+            u32::try_from(part.len()).ok()?;
+            size.checked_add(4)?.checked_add(part.len())
+        })?;
+        if size > isize::MAX as usize {
+            return None;
+        }
+        let mut out = Vec::with_capacity(size);
+        out.extend_from_slice(&count.to_le_bytes());
+        for part in parts {
+            out.extend_from_slice(&(part.len() as u32).to_le_bytes());
+            out.extend_from_slice(part);
+        }
+        Some(out)
+    }
+
+    /// Canonical decimal produced by PHP `(string) $int`.
+    fn integer(bytes: &[u8]) -> Option<i64> {
+        let value: i64 = std::str::from_utf8(bytes).ok()?.parse().ok()?;
+        (value.to_string().as_bytes() == bytes).then_some(value)
+    }
+
+    fn float(bytes: &[u8]) -> Option<f64> {
+        Some(f64::from_le_bytes(bytes.try_into().ok()?))
+    }
+
+    fn php_trim(bytes: &[u8]) -> &[u8] {
+        let start = bytes
+            .iter()
+            .position(|b| !PHP_TRIM.contains(b))
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|b| !PHP_TRIM.contains(b))
+            .map_or(start, |i| i + 1);
+        &bytes[start..end]
+    }
+
+    fn text(value: impl ToString) -> Vec<u8> {
+        value.to_string().into_bytes()
+    }
+
+    fn transform(mode: u32, parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        Some(match (mode, parts) {
+            // SearchCursor::classifyCursorMatch: expiry is checked before the bindings.
+            (
+                1,
+                [
+                    query,
+                    driver,
+                    generation,
+                    expires,
+                    want_query,
+                    want_driver,
+                    want_generation,
+                    now,
+                ],
+            ) => {
+                let (expires, now) = (integer(expires)?, integer(now)?);
+                let state: &[u8] = if expires < now {
+                    b"expired"
+                } else if query != want_query {
+                    b"query_mismatch"
+                } else if driver != want_driver {
+                    b"driver_mismatch"
+                } else if generation != want_generation {
+                    b"generation_mismatch"
+                } else {
+                    b"valid"
+                };
+                vec![state.to_vec()]
+            }
+            // SearchCursor::resumeOffsetFromSortValues: only a single offset sort value resumes.
+            (2, [count, rest @ ..]) => {
+                let count = integer(count)?;
+                let offset = match (count, rest) {
+                    (1, [value]) => integer(value)?.max(0),
+                    (c, []) if c >= 0 && c != 1 => 0,
+                    _ => return None,
+                };
+                vec![text(offset)]
+            }
+            // MetadataConfiguration::summarizeLookupModes.
+            (3, [_, _, _, _, _, _]) => {
+                let mut counts = [0i64; 4];
+                for part in parts {
+                    match integer(part)? {
+                        0 => counts[2] += 1,
+                        1 => counts[0] += 1,
+                        2 => {
+                            counts[0] += 1;
+                            counts[1] += 1;
+                        }
+                        _ => counts[3] += 1,
+                    }
+                }
+                counts.iter().map(text).collect()
+            }
+            // MetadataConfiguration::normalizeMovieLanguage.
+            (4, [language]) => {
+                let lowered = php_trim(language).to_ascii_lowercase();
+                let valid = !lowered.is_empty()
+                    && lowered.len() <= LANGUAGE_MAX_BYTES
+                    && lowered
+                        .iter()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-');
+                vec![if valid { lowered } else { b"en".to_vec() }]
+            }
+            // SiteConfiguration::normalizeTrailerDimensions.
+            (5, [width, height]) => [integer(width)?, integer(height)?]
+                .iter()
+                .zip(TRAILER_DEFAULTS)
+                .map(|(&value, default)| {
+                    text(if value <= 0 {
+                        default
+                    } else {
+                        value.min(TRAILER_MAX)
+                    })
+                })
+                .collect(),
+            // SiteConfiguration::normalizeHomeLink.
+            (6, [link]) => {
+                let trimmed = php_trim(link);
+                vec![if trimmed.is_empty() {
+                    b"/".to_vec()
+                } else {
+                    trimmed.to_vec()
+                }]
+            }
+            // CollectStats::formatStepMessage.
+            (7, [label, elapsed]) => {
+                let elapsed = integer(elapsed)?.max(0);
+                let mut message = label.to_vec();
+                message.extend_from_slice(format!(" collected in {elapsed} ms.").as_bytes());
+                vec![message]
+            }
+            // WarmAdminDashboard::formatWarmSummary: PHP `(int) (($end - $start) * 1000)`.
+            (8, [start, end]) => {
+                let product = (float(end)? - float(start)?) * 1000.0;
+                if !product.is_finite() || product >= I64_LIMIT || product < -I64_LIMIT {
+                    return None;
+                }
+                let elapsed = product.trunc() as i64;
+                vec![
+                    text(elapsed),
+                    format!("Admin dashboard snapshot warmed in {elapsed} ms.").into_bytes(),
+                ]
+            }
+            _ => return None,
+        })
+    }
+
+    /// Dispatch count-prefixed, length-prefixed byte strings (little-endian
+    /// u32). Returns written bytes, `-needed` when `cap` is too small, or `-1`
+    /// for invalid input. Failure never writes to the output buffer. Results
+    /// are at least four bytes, so `-1` never means "one byte needed".
+    ///
+    /// # Safety
+    /// Non-null pointers must refer to readable/writable allocations of the
+    /// declared lengths. Null pointers require zero length/capacity. Input and
+    /// output may overlap; the result is fully owned before any output write.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w34_search_cursor_config_stats(
+        mode: u32,
+        input: *const u8,
+        input_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        std::panic::catch_unwind(|| {
+            if input_len > MAX_INPUT
+                || cap > isize::MAX as usize
+                || (input.is_null() && input_len != 0)
+                || (out.is_null() && cap != 0)
+            {
+                return DECLINE;
+            }
+            let input = if input_len == 0 {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(input, input_len) }
+            };
+            let Some(parts) = unpack(input) else {
+                return DECLINE;
+            };
+            let Some(result) = transform(mode, &parts).and_then(|parts| pack(&parts)) else {
+                return DECLINE;
+            };
+            if cap < result.len() || out.is_null() {
+                return -(result.len() as isize);
+            }
+            unsafe { std::ptr::copy(result.as_ptr(), out, result.len()) };
+            result.len() as isize
+        })
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn packet(parts: &[&[u8]]) -> Vec<u8> {
+            pack(&parts.iter().map(|part| part.to_vec()).collect::<Vec<_>>()).unwrap()
+        }
+
+        fn call(mode: u32, parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+            let input = packet(parts);
+            let mut out = vec![0u8; input.len() * 2 + 512];
+            let written = unsafe {
+                nntmux_w34_search_cursor_config_stats(
+                    mode,
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            if written < 0 {
+                return None;
+            }
+            out.truncate(written as usize);
+            Some(unpack(&out)?.into_iter().map(<[u8]>::to_vec).collect())
+        }
+
+        fn strings(items: &[&str]) -> Vec<Vec<u8>> {
+            items.iter().map(|item| item.as_bytes().to_vec()).collect()
+        }
+
+        fn state(parts: [&[u8]; 8]) -> Vec<u8> {
+            call(1, &parts).unwrap().remove(0)
+        }
+
+        #[test]
+        fn cursor_match_states() {
+            assert_eq!(
+                state([b"q", b"d", b"g", b"10", b"q", b"d", b"g", b"10"]),
+                b"valid"
+            );
+            assert_eq!(
+                state([b"q", b"d", b"g", b"9", b"q", b"d", b"g", b"10"]),
+                b"expired"
+            );
+            assert_eq!(
+                state([b"x", b"x", b"x", b"9", b"q", b"d", b"g", b"10"]),
+                b"expired"
+            );
+            assert_eq!(
+                state([b"x", b"x", b"g", b"11", b"q", b"d", b"g", b"10"]),
+                b"query_mismatch"
+            );
+            assert_eq!(
+                state([b"q", b"x", b"x", b"11", b"q", b"d", b"g", b"10"]),
+                b"driver_mismatch"
+            );
+            assert_eq!(
+                state([b"q", b"d", b"G", b"11", b"q", b"d", b"g", b"10"]),
+                b"generation_mismatch"
+            );
+            assert_eq!(
+                call(1, &[b"q", b"d", b"g", b"+1", b"q", b"d", b"g", b"0"]),
+                None
+            );
+            assert_eq!(call(1, &[b"q", b"d", b"g", b"1", b"q", b"d", b"g"]), None);
+        }
+
+        #[test]
+        fn resume_offsets() {
+            assert_eq!(call(2, &[b"1", b"250"]).unwrap(), strings(&["250"]));
+            assert_eq!(call(2, &[b"1", b"-7"]).unwrap(), strings(&["0"]));
+            assert_eq!(call(2, &[b"0"]).unwrap(), strings(&["0"]));
+            assert_eq!(call(2, &[b"2"]).unwrap(), strings(&["0"]));
+            assert_eq!(
+                call(2, &[b"1", b"9223372036854775807"]).unwrap(),
+                strings(&["9223372036854775807"])
+            );
+            assert_eq!(call(2, &[b"1"]), None);
+            assert_eq!(call(2, &[b"1", b"12abc"]), None);
+            assert_eq!(call(2, &[b"1", b" 1"]), None);
+            assert_eq!(call(2, &[b"2", b"1"]), None);
+            assert_eq!(call(2, &[b"-1"]), None);
+            assert_eq!(call(2, &[]), None);
+        }
+
+        #[test]
+        fn lookup_mode_summary() {
+            assert_eq!(
+                call(3, &[b"0", b"1", b"2", b"2", b"9", b"-1"]).unwrap(),
+                strings(&["3", "2", "1", "2"])
+            );
+            assert_eq!(call(3, &[b"0", b"0", b"0", b"0", b"0"]), None);
+            assert_eq!(call(3, &[b"0", b"0", b"0", b"0", b"0", b"x"]), None);
+        }
+
+        #[test]
+        fn movie_language() {
+            assert_eq!(call(4, &[b" DE \n"]).unwrap(), strings(&["de"]));
+            assert_eq!(call(4, &[b"pt-BR"]).unwrap(), strings(&["pt-br"]));
+            assert_eq!(call(4, &[b""]).unwrap(), strings(&["en"]));
+            assert_eq!(call(4, &[b"toolonglang"]).unwrap(), strings(&["en"]));
+            assert_eq!(call(4, &[b"e n"]).unwrap(), strings(&["en"]));
+            assert_eq!(call(4, &[b"\xc3\x89s"]).unwrap(), strings(&["en"]));
+            assert_eq!(call(4, &[b"a", b"b"]), None);
+        }
+
+        #[test]
+        fn site_normalization() {
+            assert_eq!(call(5, &[b"0", b"-4"]).unwrap(), strings(&["480", "345"]));
+            assert_eq!(
+                call(5, &[b"640", b"70000"]).unwrap(),
+                strings(&["640", "65535"])
+            );
+            assert_eq!(call(5, &[b"640", b"0x1"]), None);
+            assert_eq!(call(6, &[b" \t"]).unwrap(), strings(&["/"]));
+            assert_eq!(call(6, &[b" /home \n"]).unwrap(), strings(&["/home"]));
+            assert_eq!(call(6, &[]), None);
+        }
+
+        #[test]
+        fn command_formatting() {
+            assert_eq!(
+                call(7, &[b"Top grabbers", b"12"]).unwrap(),
+                strings(&["Top grabbers collected in 12 ms."])
+            );
+            assert_eq!(
+                call(7, &[b"x", b"-5"]).unwrap(),
+                strings(&["x collected in 0 ms."])
+            );
+            assert_eq!(call(7, &[b"x", b"1.5"]), None);
+            let f = |value: f64| value.to_le_bytes();
+            assert_eq!(
+                call(8, &[&f(10.0), &f(10.2505)]).unwrap(),
+                strings(&["250", "Admin dashboard snapshot warmed in 250 ms."])
+            );
+            assert_eq!(call(8, &[&f(10.0), &f(9.9995)]).unwrap()[0], b"0".to_vec());
+            assert_eq!(call(8, &[&f(0.0), &f(-0.0015)]).unwrap()[0], b"-1".to_vec());
+            assert_eq!(call(8, &[&f(0.0), &f(f64::NAN)]), None);
+            assert_eq!(call(8, &[&f(0.0), &f(f64::INFINITY)]), None);
+            assert_eq!(call(8, &[&f(0.0), &f(1e300)]), None);
+            assert_eq!(call(8, &[&f(0.0), b"1234567"]), None);
+        }
+
+        #[test]
+        fn malformed_null_and_capacity() {
+            let input = packet(&[b"x", b"7"]);
+            let mut out = [0x5a_u8; 128];
+            for (ptr, len, dst, cap) in [
+                (std::ptr::null(), 1, out.as_mut_ptr(), out.len()),
+                (input.as_ptr(), input.len(), std::ptr::null_mut(), 8),
+                (input.as_ptr(), MAX_INPUT + 1, out.as_mut_ptr(), out.len()),
+                (input.as_ptr(), input.len(), out.as_mut_ptr(), usize::MAX),
+            ] {
+                assert_eq!(
+                    unsafe { nntmux_w34_search_cursor_config_stats(7, ptr, len, dst, cap) },
+                    DECLINE
+                );
+            }
+            for bad in [
+                vec![],
+                vec![1, 0, 0],
+                vec![1, 0, 0, 0, 9, 0, 0, 0],
+                vec![65, 0, 0, 0],
+            ] {
+                assert_eq!(
+                    unsafe {
+                        nntmux_w34_search_cursor_config_stats(
+                            7,
+                            bad.as_ptr(),
+                            bad.len(),
+                            out.as_mut_ptr(),
+                            out.len(),
+                        )
+                    },
+                    DECLINE
+                );
+            }
+            for mode in [0u32, 9, 99] {
+                assert_eq!(
+                    unsafe {
+                        nntmux_w34_search_cursor_config_stats(
+                            mode,
+                            input.as_ptr(),
+                            input.len(),
+                            out.as_mut_ptr(),
+                            out.len(),
+                        )
+                    },
+                    DECLINE
+                );
+            }
+            assert_eq!(out, [0x5a; 128]);
+            let full = call(7, &[b"x", b"7"])
+                .map(|parts| pack(&parts).unwrap().len())
+                .unwrap();
+            for cap in [0usize, 1, full - 1] {
+                let dst = if cap == 0 {
+                    std::ptr::null_mut()
+                } else {
+                    out.as_mut_ptr()
+                };
+                assert_eq!(
+                    unsafe {
+                        nntmux_w34_search_cursor_config_stats(
+                            7,
+                            input.as_ptr(),
+                            input.len(),
+                            dst,
+                            cap,
+                        )
+                    },
+                    -(full as isize)
+                );
+            }
+            assert_eq!(out, [0x5a; 128]);
+            let mut alias = input.clone();
+            alias.resize(full.max(input.len()), 0);
+            let written = unsafe {
+                nntmux_w34_search_cursor_config_stats(
+                    7,
+                    alias.as_ptr(),
+                    input.len(),
+                    alias.as_mut_ptr(),
+                    alias.len(),
+                )
+            };
+            assert_eq!(written, full as isize);
+        }
+    }
+}
