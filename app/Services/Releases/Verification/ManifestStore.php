@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace App\Services\Releases\Verification;
 
+use App\Support\RustPipelineLibrary;
+use FFI;
+use FFI\CData;
 use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Schema;
@@ -594,5 +597,183 @@ final class ManifestStore
         }
 
         return ['items' => $slots[0], 'non_empty' => $slots[1], 'empty' => $slots[2], 'accepted_bytes' => $slots[3], 'exceeded_index' => $slots[4], 'accepted' => $slots[5]];
+    }
+
+    /** Wave 51.2 paired benchmarks decide this default; see RustVerificationManifestNntpReaderDeferralsPayloadW51ParityTest. */
+    private const bool W51_RUST_FFI_DEFAULT = true;
+
+    public const string W51_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w512_manifest_import_plan_batch(const char *names, size_t names_len, const char *sizes, size_t sizes_len, size_t count, int64_t max_total_bytes, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * Wave 51 routing, binding and output buffer, kept in function-local statics. Operations:
+     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
+     * resolves the binding and 'out' returns a buffer of at least $val words (its capacity
+     * through 'cap').
+     */
+    private static function w51RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w51', self::W51_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w51RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return $out;
+            case 'cap':
+                return $capacity;
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW51RustFfi(): bool
+    {
+        $enabled = self::w51RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W51_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with planManifestImport() routed to Rust ($enabled) or PHP, then restores the
+     * previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW51RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w51RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w51RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Batch import plan for manifest references. One word per name: `flags | min(strlen, 0xFFFF)
+     * << 8 | crc32(name) << 32` (flags: 1 valid name, 2 repeated name, 4 non-positive size,
+     * 8 admitted, 16 first refusal). Valid first occurrences with a positive size are admitted in
+     * order against max(0, $maxTotalBytes) until one no longer fits, which closes admission.
+     * Valid, repeated and admitted counts, admitted bytes, the exceeded index (-1 for none) and
+     * the XXH64 digest of all earlier words follow.
+     *
+     * @param  list<string>  $names
+     * @param  list<int>  $byteSizes
+     * @return list<int>
+     */
+    public static function planManifestImport(array $names, array $byteSizes, int $maxTotalBytes = 67108864): array
+    {
+        return self::usesW51RustFfi()
+            ? self::planManifestImportNative($names, $byteSizes, $maxTotalBytes)
+            : self::planManifestImportPhp($names, $byteSizes, $maxTotalBytes);
+    }
+
+    /**
+     * @param  list<string>  $names
+     * @param  list<int>  $byteSizes
+     * @return list<int>
+     */
+    public static function planManifestImportPhp(array $names, array $byteSizes, int $maxTotalBytes = 67108864): array
+    {
+        $out = $seen = [];
+        $budget = max(0, $maxTotalBytes);
+        $valid = $repeated = $admitted = $bytes = 0;
+        $exceeded = -1;
+        foreach ($names as $i => $name) {
+            $size = $byteSizes[$i] ?? 0;
+            $flags = (int) (preg_match('/\A[0-9a-f]{64}\.json\.gz\z/', $name) === 1);
+            $valid += $flags;
+            if (isset($seen[$name])) {
+                $flags |= 2;
+                $repeated++;
+            } else {
+                $seen[$name] = true;
+            }
+            if ($size <= 0) {
+                $flags |= 4;
+            } elseif (($flags & 3) === 1 && $exceeded < 0) {
+                // $bytes never exceeds $budget, so the difference cannot overflow.
+                if ($size <= $budget - $bytes) {
+                    $bytes += $size;
+                    $admitted++;
+                    $flags |= 8;
+                } else {
+                    $exceeded = $i;
+                    $flags |= 16;
+                }
+            }
+            $out[] = $flags | min(\strlen($name), 0xFFFF) << 8 | crc32($name) << 32;
+        }
+        $out[] = $valid;
+        $out[] = $repeated;
+        $out[] = $admitted;
+        $out[] = $bytes;
+        $out[] = $exceeded;
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+        $out[] = $digest[1];
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, the lists differ in length or
+     * are not lists, or a name holds a NUL byte.
+     *
+     * @param  list<string>  $names
+     * @param  list<int>  $byteSizes
+     * @return list<int>
+     */
+    public static function planManifestImportNative(array $names, array $byteSizes, int $maxTotalBytes = 67108864): array
+    {
+        $count = \count($names);
+        $ffi = $count === 0 ? null : self::w51RustFfiState('ffi');
+        if (! $ffi instanceof FFI || \count($byteSizes) !== $count || ! array_is_list($names) || ! array_is_list($byteSizes)) {
+            return self::planManifestImportPhp($names, $byteSizes, $maxTotalBytes);
+        }
+        $joined = implode("\0", $names);
+        $sizes = pack('P*', ...$byteSizes);
+        $words = $count + 6;
+        $values = false;
+        try {
+            $out = self::w51RustFfiState('out', $words);
+            if ($out instanceof CData) {
+                // @phpstan-ignore method.notFound (Declared by W51_FFI_CDEF.)
+                $written = $ffi->nntmux_w512_manifest_import_plan_batch($joined, \strlen($joined), $sizes, \strlen($sizes), $count, $maxTotalBytes, $out, self::w51RustFfiState('cap'));
+                $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+            }
+        } catch (\Throwable) {
+            $values = false;
+        }
+
+        /** @var list<int>|null $result */
+        $result = \is_array($values) ? array_values($values) : null;
+
+        return $result ?? self::planManifestImportPhp($names, $byteSizes, $maxTotalBytes);
     }
 }

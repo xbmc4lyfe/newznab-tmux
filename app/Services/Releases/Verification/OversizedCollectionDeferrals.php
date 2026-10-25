@@ -6,6 +6,8 @@ namespace App\Services\Releases\Verification;
 
 use App\Exceptions\CandidateMetadataBudgetExceeded;
 use App\Support\RustPipelineLibrary;
+use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
@@ -271,5 +273,206 @@ final class OversizedCollectionDeferrals
     private function available(): bool
     {
         return $this->available ??= Schema::hasTable(self::TABLE);
+    }
+
+    /** Wave 51.2 paired benchmarks decide this default; see RustVerificationManifestNntpReaderDeferralsPayloadW51ParityTest. */
+    private const bool W51_RUST_FFI_DEFAULT = true;
+
+    public const string W51_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w512_oversized_deferral_batch(const char *ints, size_t ints_len, const char *strings, size_t strings_len, size_t count, int64_t budget, const char *now, size_t now_len, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * Wave 51 routing, binding and output buffer, kept in function-local statics. Operations:
+     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
+     * resolves the binding and 'out' returns a buffer of at least $val words (its capacity
+     * through 'cap').
+     */
+    private static function w51RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w51', self::W51_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w51RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return $out;
+            case 'cap':
+                return $capacity;
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW51RustFfi(): bool
+    {
+        $enabled = self::w51RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W51_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with classifyDeferrals() routed to Rust ($enabled) or PHP, then restores the
+     * previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW51RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w51RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w51RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Batch classification of deferral records against each collection's current hash ('' when
+     * the collection is gone), the current budget and now. Two words per record: `flags |
+     * crc32(recorded hash) << 32` (flags: 1 current hash matches, 2 recorded budget at least the
+     * current one, 4 retry_after later than now, compared bytewise, 8 still deferred: 1, 2 and 4,
+     * 16 unlocked by a raised budget, 32 stale, 64 repeated id, 128 same hash and budget), then
+     * the backoff seconds a new over-budget failure would record (the attempt count continues
+     * only at the same hash and budget; negative counts read as zero). Deferred, unlocked, stale
+     * and repeated counts and the XXH64 digest of all earlier words follow.
+     *
+     * @param  list<int>  $ids
+     * @param  list<string>  $currentHashes
+     * @param  list<string>  $recordedHashes
+     * @param  list<int>  $budgetBytes
+     * @param  list<int>  $attempts
+     * @param  list<string>  $retryAfters
+     * @return list<int>
+     */
+    public static function classifyDeferrals(array $ids, array $currentHashes, array $recordedHashes, array $budgetBytes,
+        array $attempts, array $retryAfters, int $budget, string $now): array
+    {
+        return self::usesW51RustFfi()
+            ? self::classifyDeferralsNative($ids, $currentHashes, $recordedHashes, $budgetBytes, $attempts, $retryAfters, $budget, $now)
+            : self::classifyDeferralsPhp($ids, $currentHashes, $recordedHashes, $budgetBytes, $attempts, $retryAfters, $budget, $now);
+    }
+
+    /**
+     * @param  list<int>  $ids
+     * @param  list<string>  $currentHashes
+     * @param  list<string>  $recordedHashes
+     * @param  list<int>  $budgetBytes
+     * @param  list<int>  $attempts
+     * @param  list<string>  $retryAfters
+     * @return list<int>
+     */
+    public static function classifyDeferralsPhp(array $ids, array $currentHashes, array $recordedHashes, array $budgetBytes,
+        array $attempts, array $retryAfters, int $budget, string $now): array
+    {
+        $out = $seen = [];
+        $deferred = $unlocked = $stale = $repeated = 0;
+        foreach ($ids as $i => $id) {
+            $recorded = $recordedHashes[$i] ?? '';
+            $current = $currentHashes[$i] ?? '';
+            $recordedBudget = $budgetBytes[$i] ?? 0;
+            $matches = $current !== '' && $current === $recorded;
+            $flags = (int) $matches | (int) ($recordedBudget >= $budget) << 1 | (int) (strcmp($retryAfters[$i] ?? '', $now) > 0) << 2;
+            if (($flags & 7) === 7) {
+                $flags |= 8;
+                $deferred++;
+            }
+            if ($matches && $recordedBudget < $budget) {
+                $flags |= 16;
+                $unlocked++;
+            }
+            if (! $matches) {
+                $flags |= 32;
+                $stale++;
+            }
+            if (isset($seen[$id])) {
+                $flags |= 64;
+                $repeated++;
+            } else {
+                $seen[$id] = true;
+            }
+            $exponent = 0;
+            if ($matches && $recordedBudget === $budget) {
+                $flags |= 128;
+                $exponent = max(0, min(10, $attempts[$i] ?? 0));
+            }
+            $out[] = $flags | crc32($recorded) << 32;
+            $out[] = min(self::MAX_BACKOFF_SECONDS, self::FIRST_BACKOFF_SECONDS << $exponent);
+        }
+        $out[] = $deferred;
+        $out[] = $unlocked;
+        $out[] = $stale;
+        $out[] = $repeated;
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+        $out[] = $digest[1];
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, the lists differ in length or
+     * are not lists, or a hash or time holds a NUL byte.
+     *
+     * @param  list<int>  $ids
+     * @param  list<string>  $currentHashes
+     * @param  list<string>  $recordedHashes
+     * @param  list<int>  $budgetBytes
+     * @param  list<int>  $attempts
+     * @param  list<string>  $retryAfters
+     * @return list<int>
+     */
+    public static function classifyDeferralsNative(array $ids, array $currentHashes, array $recordedHashes, array $budgetBytes,
+        array $attempts, array $retryAfters, int $budget, string $now): array
+    {
+        $count = \count($ids);
+        $ffi = $count === 0 ? null : self::w51RustFfiState('ffi');
+        if (! $ffi instanceof FFI || \count($currentHashes) !== $count || \count($recordedHashes) !== $count || \count($budgetBytes) !== $count
+            || \count($attempts) !== $count || \count($retryAfters) !== $count || ! array_is_list($ids) || ! array_is_list($currentHashes)
+            || ! array_is_list($recordedHashes) || ! array_is_list($budgetBytes) || ! array_is_list($attempts) || ! array_is_list($retryAfters)) {
+            return self::classifyDeferralsPhp($ids, $currentHashes, $recordedHashes, $budgetBytes, $attempts, $retryAfters, $budget, $now);
+        }
+        $table = pack('P*', ...$ids, ...$budgetBytes, ...$attempts);
+        $strings = implode("\0", $currentHashes)."\0".implode("\0", $recordedHashes)."\0".implode("\0", $retryAfters);
+        $words = 2 * $count + 5;
+        $values = false;
+        try {
+            $out = self::w51RustFfiState('out', $words);
+            if ($out instanceof CData) {
+                // @phpstan-ignore method.notFound (Declared by W51_FFI_CDEF.)
+                $written = $ffi->nntmux_w512_oversized_deferral_batch($table, \strlen($table), $strings, \strlen($strings), $count, $budget, $now, \strlen($now), $out, self::w51RustFfiState('cap'));
+                $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+            }
+        } catch (Throwable) {
+            $values = false;
+        }
+
+        /** @var list<int>|null $result */
+        $result = \is_array($values) ? array_values($values) : null;
+
+        return $result ?? self::classifyDeferralsPhp($ids, $currentHashes, $recordedHashes, $budgetBytes, $attempts, $retryAfters, $budget, $now);
     }
 }
