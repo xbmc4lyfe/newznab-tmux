@@ -31848,3 +31848,1465 @@ pub mod w461_regex_nntp_framer_yenc_decoder {
         }
     }
 }
+
+/// Wave 47.1 pure CPU batch helpers for IRC network endpoint routing (IrcNetworks), PreDB SSE and
+/// WebSocket frame classification (PredbStreamListener), Cloudflare CIDR table verification and
+/// address containment (CloudflareIpRangeService), indexer proxy request signal scoring
+/// (IndexerProxyDetector) and X-Forwarded-For chain client-hop resolution (ProxyRequestContext).
+///
+/// Batches are NUL-joined strings with an explicit entry count; output is a fixed number of
+/// little-endian i64 words (PHP `unpack('P*')`). Each export returns the bytes written, the
+/// negated byte count when `cap` is too small, or -1 when the batch is malformed. IP addresses
+/// follow PHP `filter_var(..., FILTER_VALIDATE_IP)` exactly and pack as `inet_pton()` would.
+pub mod w47_irc_stream_cloudflare_proxy {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    pub const MAX_INPUT: usize = 16 * 1024 * 1024;
+    pub const MAX_ITEMS: usize = 1 << 20;
+
+    /// Borrows a caller span; an empty span may be null.
+    unsafe fn span<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null() || len > MAX_INPUT {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
+    fn overlaps(a: *const u8, a_len: usize, b: *const u8, b_len: usize) -> bool {
+        let (a, b) = (a as usize, b as usize);
+        a_len != 0 && b_len != 0 && a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
+    }
+
+    /// A checked window of `words` i64 output slots.
+    pub struct Out {
+        ptr: *mut u8,
+        words: usize,
+    }
+
+    impl Out {
+        fn put(&self, slot: usize, word: i64) {
+            if slot < self.words {
+                // The slot lies inside the capacity checked by `run()`.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        word.to_le_bytes().as_ptr(),
+                        self.ptr.add(slot * 8),
+                        8,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Validates the output window against `cap` and every input span, then lets `body` fill it.
+    unsafe fn run(
+        out: *mut u8,
+        cap: usize,
+        words: usize,
+        inputs: &[(*const u8, usize)],
+        body: impl FnOnce(&Out) -> bool,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if words > MAX_ITEMS * 2 {
+                return -1;
+            }
+            let needed = words * 8;
+            if needed != 0 {
+                if out.is_null() || cap > isize::MAX as usize {
+                    return -1;
+                }
+                if needed > cap {
+                    return -(needed as isize);
+                }
+                if inputs
+                    .iter()
+                    .any(|&(ptr, len)| overlaps(ptr, len, out, needed))
+                {
+                    return -1;
+                }
+            }
+            if body(&Out { ptr: out, words }) {
+                needed as isize
+            } else {
+                -1
+            }
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Offset of the first NUL at or after `from`, eight bytes at a time.
+    fn next_nul(s: &[u8], from: usize) -> Option<usize> {
+        const ONES: u64 = 0x0101_0101_0101_0101;
+        const HIGHS: u64 = 0x8080_8080_8080_8080;
+        let mut i = from;
+        while let Some(chunk) = s.get(i..i + 8) {
+            let x = u64::from_le_bytes(chunk.try_into().ok()?);
+            // The lowest flagged byte is always a real zero byte.
+            let zero = x.wrapping_sub(ONES) & !x & HIGHS;
+            if zero != 0 {
+                return Some(i + (zero.trailing_zeros() / 8) as usize);
+            }
+            i += 8;
+        }
+        s.get(i..)?.iter().position(|&b| b == 0).map(|p| i + p)
+    }
+
+    /// `input.split(|&b| b == 0)` over a SWAR NUL scan.
+    pub struct NulSplit<'a> {
+        input: &'a [u8],
+        at: usize,
+        done: bool,
+    }
+
+    impl<'a> Iterator for NulSplit<'a> {
+        type Item = &'a [u8];
+
+        fn next(&mut self) -> Option<&'a [u8]> {
+            if self.done {
+                return None;
+            }
+            let start = self.at;
+            match next_nul(self.input, start) {
+                Some(nul) => {
+                    self.at = nul + 1;
+                    Some(&self.input[start..nul])
+                }
+                None => {
+                    self.done = true;
+                    Some(&self.input[start..])
+                }
+            }
+        }
+    }
+
+    pub fn split_nul(input: &[u8]) -> NulSplit<'_> {
+        NulSplit {
+            input,
+            at: 0,
+            done: false,
+        }
+    }
+
+    /// Visits exactly `count` NUL-separated entries; false when the batch holds another number.
+    pub fn for_each_nul(input: &[u8], count: usize, mut visit: impl FnMut(usize, &[u8])) -> bool {
+        if count == 0 {
+            return input.is_empty();
+        }
+        let mut seen = 0;
+        for (i, entry) in split_nul(input).enumerate() {
+            if i >= count {
+                return false;
+            }
+            visit(i, entry);
+            seen = i + 1;
+        }
+        seen == count
+    }
+
+    /// PHP `trim()` with its default character list.
+    pub fn php_trim(s: &[u8]) -> &[u8] {
+        let keep = |b: &u8| !matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b);
+        let Some(start) = s.iter().position(keep) else {
+            return &[];
+        };
+        let end = s.iter().rposition(keep).map_or(start, |i| i + 1);
+        &s[start..end]
+    }
+
+    fn trim_blank(s: &[u8]) -> &[u8] {
+        let keep = |b: &u8| *b != b' ' && *b != b'\t';
+        let Some(start) = s.iter().position(keep) else {
+            return &[];
+        };
+        let end = s.iter().rposition(keep).map_or(start, |i| i + 1);
+        &s[start..end]
+    }
+
+    fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        if needle.is_empty() || needle.len() > haystack.len() {
+            return None;
+        }
+        let first = needle[0];
+        let last = haystack.len() - needle.len();
+        let mut at = 0;
+        while at <= last {
+            let next = haystack[at..=last].iter().position(|&b| b == first)?;
+            at += next;
+            if &haystack[at..at + needle.len()] == needle {
+                return Some(at);
+            }
+            at += 1;
+        }
+        None
+    }
+
+    /// `str_contains(strtolower($haystack), $needle)` for a lowercase, non-empty needle.
+    fn contains_ci(haystack: &[u8], needle: &[u8]) -> bool {
+        if needle.is_empty() || needle.len() > haystack.len() {
+            return needle.is_empty();
+        }
+        let first = needle[0];
+        (0..=haystack.len() - needle.len()).any(|i| {
+            haystack[i].to_ascii_lowercase() == first
+                && haystack[i + 1..i + needle.len()]
+                    .iter()
+                    .zip(&needle[1..])
+                    .all(|(a, b)| a.to_ascii_lowercase() == *b)
+        })
+    }
+
+    fn ends_with_ci(s: &[u8], suffix: &[u8]) -> bool {
+        s.len() >= suffix.len() && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+    }
+
+    fn starts_with_ci(s: &[u8], prefix: &[u8]) -> bool {
+        s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix)
+    }
+
+    fn digits(s: &[u8], max: usize) -> Option<u64> {
+        if s.is_empty() || s.len() > max || !s.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        Some(s.iter().fold(0u64, |n, d| n * 10 + u64::from(d - b'0')))
+    }
+
+    const CRC_TABLE: [u32; 256] = {
+        let mut table = [0u32; 256];
+        let mut i = 0;
+        while i < 256 {
+            let mut c = i as u32;
+            let mut k = 0;
+            while k < 8 {
+                c = if c & 1 != 0 {
+                    0xEDB8_8320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
+                k += 1;
+            }
+            table[i] = c;
+            i += 1;
+        }
+        table
+    };
+
+    fn crc_update(crc: u32, bytes: impl IntoIterator<Item = u8>) -> u32 {
+        bytes.into_iter().fold(crc, |c, b| {
+            CRC_TABLE[((c ^ u32::from(b)) & 0xff) as usize] ^ (c >> 8)
+        })
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Ip {
+        V4([u8; 4]),
+        V6([u8; 16]),
+    }
+
+    impl Ip {
+        fn value(self) -> (bool, u128) {
+            match self {
+                Ip::V4(b) => (false, u128::from(u32::from_be_bytes(b))),
+                Ip::V6(b) => (true, u128::from_be_bytes(b)),
+            }
+        }
+
+        fn bits(self) -> u32 {
+            match self {
+                Ip::V4(_) => 32,
+                Ip::V6(_) => 128,
+            }
+        }
+
+        /// Loopback, RFC 1918, link-local and CGNAT IPv4; IPv6 loopback, ULA and link-local.
+        fn private(self) -> bool {
+            match self {
+                Ip::V4([a, b, ..]) => {
+                    a == 10
+                        || a == 127
+                        || (a == 172 && b & 0xf0 == 16)
+                        || (a == 192 && b == 168)
+                        || (a == 169 && b == 254)
+                        || (a == 100 && b & 0xc0 == 64)
+                }
+                Ip::V6(b) => {
+                    u128::from_be_bytes(b) == 1
+                        || b[0] & 0xfe == 0xfc
+                        || (b[0] == 0xfe && b[1] & 0xc0 == 0x80)
+                }
+            }
+        }
+    }
+
+    /// PHP `_php_filter_validate_ipv4()`.
+    pub fn php_ipv4(s: &[u8]) -> Option<[u8; 4]> {
+        let mut ip = [0u8; 4];
+        let (mut n, mut i) = (0, 0);
+        while i < s.len() {
+            if !s[i].is_ascii_digit() {
+                return None;
+            }
+            let leading_zero = s[i] == b'0';
+            let mut m = 1;
+            let mut num = u32::from(s[i] - b'0');
+            i += 1;
+            while i < s.len() && s[i].is_ascii_digit() {
+                num = num * 10 + u32::from(s[i] - b'0');
+                i += 1;
+                m += 1;
+                if num > 255 || m > 3 {
+                    return None;
+                }
+            }
+            if leading_zero && (num != 0 || m > 1) {
+                return None;
+            }
+            ip[n] = num as u8;
+            n += 1;
+            if n == 4 {
+                return (i == s.len()).then_some(ip);
+            }
+            if i >= s.len() || s[i] != b'.' {
+                return None;
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// PHP `_php_filter_validate_ipv6()`, packed as `inet_pton()` packs the accepted forms.
+    pub fn php_ipv6(s: &[u8]) -> Option<[u8; 16]> {
+        if !s.contains(&b':') {
+            return None;
+        }
+        let mut quad = None;
+        let mut len = s.len();
+        if let Some(dot) = s.iter().position(|&b| b == b'.') {
+            let mut start = dot;
+            while start > 0 && s[start - 1] != b':' {
+                start -= 1;
+            }
+            quad = Some(php_ipv4(&s[start..])?);
+            len = start;
+            if len < 2 {
+                return None;
+            }
+            if s[start - 2] != b':' {
+                len -= 1;
+            }
+        }
+        let mut blocks = if quad.is_some() { 2 } else { 0 };
+        let mut compressed: Option<usize> = None;
+        let mut groups = [0u16; 8];
+        let mut parsed = 0usize;
+        let mut i = 0;
+        'parse: while i < len {
+            if s[i] == b':' {
+                i += 1;
+                if i >= len {
+                    return None;
+                }
+                if s[i] == b':' {
+                    if compressed.is_some() {
+                        return None;
+                    }
+                    compressed = Some(parsed);
+                    blocks += 1;
+                    i += 1;
+                    if i == len {
+                        if blocks > 8 {
+                            return None;
+                        }
+                        break 'parse;
+                    }
+                } else if i - 1 == 0 {
+                    return None;
+                }
+            }
+            let (mut num, mut n) = (0u32, 0);
+            while i < len {
+                let d = match s[i] {
+                    b @ b'0'..=b'9' => b - b'0',
+                    b @ b'a'..=b'f' => b - b'a' + 10,
+                    b @ b'A'..=b'F' => b - b'A' + 10,
+                    _ => break,
+                };
+                num = num.wrapping_mul(16).wrapping_add(u32::from(d));
+                n += 1;
+                i += 1;
+            }
+            if !(1..=4).contains(&n) {
+                return None;
+            }
+            if parsed < 8 {
+                groups[parsed] = num as u16;
+            }
+            parsed += 1;
+            blocks += 1;
+            if blocks > 8 {
+                return None;
+            }
+        }
+        if !((compressed.is_some() && blocks <= 8) || blocks == 8) {
+            return None;
+        }
+        let available = if quad.is_some() { 6 } else { 8 };
+        let mut words = [0u16; 8];
+        match compressed {
+            Some(at) => {
+                let tail = parsed - at;
+                words[..at].copy_from_slice(&groups[..at]);
+                words[available - tail..available].copy_from_slice(&groups[at..parsed]);
+            }
+            None => words[..parsed].copy_from_slice(&groups[..parsed]),
+        }
+        let mut out = [0u8; 16];
+        for (slot, word) in out.chunks_exact_mut(2).zip(words) {
+            slot.copy_from_slice(&word.to_be_bytes());
+        }
+        if let Some(q) = quad {
+            out[12..].copy_from_slice(&q);
+        }
+        Some(out)
+    }
+
+    /// PHP `filter_var($s, FILTER_VALIDATE_IP)`: IPv6 when it holds a colon, IPv4 when it holds a dot.
+    pub fn php_ip(s: &[u8]) -> Option<Ip> {
+        if s.contains(&b':') {
+            php_ipv6(s).map(Ip::V6)
+        } else if s.contains(&b'.') {
+            php_ipv4(s).map(Ip::V4)
+        } else {
+            None
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    pub struct Range {
+        v6: bool,
+        net: u128,
+        mask: u128,
+    }
+
+    impl Range {
+        fn new(ip: Ip, prefix: u32) -> (Self, bool) {
+            let (v6, value) = ip.value();
+            let width = ip.bits();
+            let full = if width == 128 {
+                u128::MAX
+            } else {
+                (1u128 << width) - 1
+            };
+            let mask = if prefix == 0 {
+                0
+            } else {
+                (u128::MAX << (width - prefix)) & full
+            };
+            (
+                Range {
+                    v6,
+                    net: value & mask,
+                    mask,
+                },
+                value & !mask & full != 0,
+            )
+        }
+
+        fn contains(&self, ip: Ip) -> bool {
+            let (v6, value) = ip.value();
+            v6 == self.v6 && value & self.mask == self.net
+        }
+    }
+
+    /// `address/prefix` with a one-to-three digit prefix no longer than the address width.
+    pub fn parse_cidr(s: &[u8]) -> Option<(Ip, u32)> {
+        let slash = s.iter().position(|&b| b == b'/')?;
+        let prefix = digits(&s[slash + 1..], 3)? as u32;
+        let ip = php_ip(&s[..slash])?;
+        (prefix <= ip.bits()).then_some((ip, prefix))
+    }
+
+    // ---- IrcNetworks endpoint routing --------------------------------------------------------
+
+    fn hostname_ok(host: &[u8]) -> bool {
+        host.len() <= 253
+            && host.split(|&b| b == b'.').all(|label| {
+                (1..=63).contains(&label.len())
+                    && label
+                        .iter()
+                        .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+                    && label[0] != b'-'
+                    && label[label.len() - 1] != b'-'
+            })
+    }
+
+    /// IrcNetworks::routeEndpointsPhp() for one `[irc[s]://]host[:[+]port][/#chan,...]` spec.
+    pub fn endpoint(spec: &[u8]) -> (i64, i64) {
+        let mut s = php_trim(spec);
+        if s.is_empty() {
+            return (-1, 0);
+        }
+        let mut tls = false;
+        if starts_with_ci(s, b"ircs://") {
+            tls = true;
+            s = &s[7..];
+        } else if starts_with_ci(s, b"irc://") {
+            s = &s[6..];
+        }
+        let (authority, path) = match s.iter().position(|&b| b == b'/') {
+            Some(i) => (&s[..i], &s[i + 1..]),
+            None => (s, &[][..]),
+        };
+        let (host, port_text, kind): (&[u8], Option<&[u8]>, i64);
+        if authority.first() == Some(&b'[') {
+            let Some(close) = authority.iter().position(|&b| b == b']') else {
+                return (-4, 0);
+            };
+            host = &authority[1..close];
+            if php_ipv6(host).is_none() {
+                return (-4, 0);
+            }
+            let rest = &authority[close + 1..];
+            port_text = match rest.first() {
+                None => None,
+                Some(b':') => Some(&rest[1..]),
+                Some(_) => return (-3, 0),
+            };
+            kind = 3;
+        } else {
+            let colon = authority.iter().position(|&b| b == b':');
+            host = colon.map_or(authority, |c| &authority[..c]);
+            port_text = colon.map(|c| &authority[c + 1..]);
+            if host.is_empty() {
+                return (-2, 0);
+            }
+            if host.iter().all(|&b| b.is_ascii_digit() || b == b'.') {
+                if !matches!(php_ip(host), Some(Ip::V4(_))) {
+                    return (-2, 0);
+                }
+                kind = 2;
+            } else {
+                if !hostname_ok(host) {
+                    return (-2, 0);
+                }
+                kind = 1;
+            }
+        }
+        let port = match port_text {
+            None => {
+                if tls {
+                    6697
+                } else {
+                    6667
+                }
+            }
+            Some(text) => {
+                let text = match text.first() {
+                    Some(b'+') => {
+                        tls = true;
+                        &text[1..]
+                    }
+                    _ => text,
+                };
+                match digits(text, 5) {
+                    Some(p @ 1..=65535) => p as i64,
+                    _ => return (-3, 0),
+                }
+            }
+        };
+        let (mut valid, mut invalid) = (0i64, 0i64);
+        if !path.is_empty() {
+            for channel in path.split(|&b| b == b',') {
+                if channel.is_empty() {
+                    continue;
+                }
+                let ok = (channel[0] == b'#' || channel[0] == b'&')
+                    && (2..=50).contains(&channel.len())
+                    && !channel
+                        .iter()
+                        .any(|&b| matches!(b, b' ' | 0x07 | b'\r' | b'\n' | b'\t'));
+                if ok {
+                    valid += 1;
+                } else {
+                    invalid += 1;
+                }
+            }
+        }
+        let mut port_digits = [0u8; 5];
+        let mut at = port_digits.len();
+        let mut rest = port;
+        loop {
+            at -= 1;
+            port_digits[at] = b'0' + (rest % 10) as u8;
+            rest /= 10;
+            if rest == 0 {
+                break;
+            }
+        }
+        let crc = crc_update(
+            0xffff_ffff,
+            host.iter()
+                .map(u8::to_ascii_lowercase)
+                .chain(std::iter::once(b':'))
+                .chain(port_digits[at..].iter().copied()),
+        ) ^ 0xffff_ffff;
+        let word = 1
+            | i64::from(tls) << 1
+            | kind << 2
+            | port << 8
+            | valid.min(255) << 24
+            | invalid.min(255) << 32;
+        (word, i64::from(crc))
+    }
+
+    /// # Safety
+    /// `input` must be readable for `len` bytes and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w47_irc_endpoint_route_batch(
+        input: *const u8,
+        len: usize,
+        count: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let Some(words) = count.checked_mul(2) else {
+            return -1;
+        };
+        unsafe {
+            run(out, cap, words, &[(input, len)], |o| {
+                let Some(input) = span(input, len) else {
+                    return false;
+                };
+                for_each_nul(input, count, |i, spec| {
+                    let (word, digest) = endpoint(spec);
+                    o.put(i * 2, word);
+                    o.put(i * 2 + 1, digest);
+                })
+            })
+        }
+    }
+
+    // ---- PredbStreamListener frame classification -------------------------------------------
+
+    fn json_ws(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r')
+    }
+
+    fn skip_ws(t: &[u8], mut at: usize) -> usize {
+        while at < t.len() && json_ws(t[at]) {
+            at += 1;
+        }
+        at
+    }
+
+    /// Position after `"key"`, whitespace, a colon and whitespace, when the first `"key"` has one.
+    fn value_at(t: &[u8], key: &[u8]) -> Option<usize> {
+        let at = skip_ws(t, find(t, key)? + key.len());
+        (t.get(at) == Some(&b':')).then(|| skip_ws(t, at + 1))
+    }
+
+    /// 1 heartbeat, 2 insert, 3 update, 4 predb.net message, 5 other payload.
+    pub fn classify_payload(payload: &[u8]) -> i64 {
+        let Some(start) = payload.iter().position(|&b| !json_ws(b)) else {
+            return 5;
+        };
+        let t = &payload[start..];
+        if t[0] != b'{' {
+            return 5;
+        }
+        if let Some(at) = value_at(t, b"\"action\"") {
+            if t[at..].starts_with(b"\"insert\"") {
+                return 2;
+            }
+            if t[at..].starts_with(b"\"update\"") {
+                return 3;
+            }
+        }
+        if value_at(t, b"\"message\"").is_some_and(|at| t.get(at) == Some(&b'{')) {
+            return 4;
+        }
+        if find(t, b"\"hb\"").is_some() {
+            return 1;
+        }
+        5
+    }
+
+    /// PredbStreamListener::classifyFramesPhp() for one SSE block or WebSocket JSON message.
+    pub fn frame(f: &[u8], data: &mut Vec<u8>) -> (i64, i64) {
+        if f.iter().find(|&&b| !json_ws(b)) == Some(&b'{') {
+            return (classify_payload(f) | 1 << 8 | 1 << 27, -1);
+        }
+        data.clear();
+        let (mut lines, mut comments, mut ignored) = (0i64, 0i64, 0i64);
+        let (mut has_id, mut retry, mut event) = (false, -1i64, None::<&[u8]>);
+        let mut i = 0;
+        while i <= f.len() {
+            let end = f[i..]
+                .iter()
+                .position(|&b| b == b'\r' || b == b'\n')
+                .map_or(f.len(), |p| i + p);
+            let line = &f[i..end];
+            i = if end >= f.len() {
+                f.len() + 1
+            } else if f[end] == b'\r' && f.get(end + 1) == Some(&b'\n') {
+                end + 2
+            } else {
+                end + 1
+            };
+            if line.is_empty() {
+                continue;
+            }
+            if line[0] == b':' {
+                comments += 1;
+                continue;
+            }
+            let (field, mut value) = match line.iter().position(|&b| b == b':') {
+                Some(c) => (&line[..c], &line[c + 1..]),
+                None => (line, &[][..]),
+            };
+            if value.first() == Some(&b' ') {
+                value = &value[1..];
+            }
+            match field {
+                b"event" => event = Some(value),
+                b"data" => {
+                    if lines > 0 {
+                        data.push(b'\n');
+                    }
+                    data.extend_from_slice(value);
+                    lines += 1;
+                }
+                b"id" => has_id = true,
+                b"retry" => {
+                    if let Some(ms) = digits(value, 18) {
+                        retry = ms as i64;
+                    }
+                }
+                _ => ignored += 1,
+            }
+        }
+        let class = if matches!(event, Some(b"hb" | b"heartbeat" | b"ping")) {
+            1
+        } else if lines == 0 {
+            0
+        } else {
+            classify_payload(data)
+        };
+        let word = class
+            | lines.min(255) << 8
+            | comments.min(255) << 16
+            | i64::from(has_id) << 24
+            | i64::from(retry >= 0) << 25
+            | i64::from(event.is_some()) << 26
+            | ignored.min(255) << 32;
+        (word, retry)
+    }
+
+    /// # Safety
+    /// `input` must be readable for `len` bytes and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w47_predb_stream_frame_batch(
+        input: *const u8,
+        len: usize,
+        count: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let Some(words) = count.checked_mul(2) else {
+            return -1;
+        };
+        unsafe {
+            run(out, cap, words, &[(input, len)], |o| {
+                let Some(input) = span(input, len) else {
+                    return false;
+                };
+                let mut data = Vec::new();
+                for_each_nul(input, count, |i, f| {
+                    let (word, retry) = frame(f, &mut data);
+                    o.put(i * 2, word);
+                    o.put(i * 2 + 1, retry);
+                })
+            })
+        }
+    }
+
+    // ---- CloudflareIpRangeService CIDR table verification and containment --------------------
+
+    /// One word per range (prefix | host bits set << 8 | IPv6 << 9, or -1 when invalid), then one
+    /// per address (index of the first containing valid range, -1 for none, -2 when invalid).
+    pub fn cidr_match(
+        addresses: &[u8],
+        address_count: usize,
+        ranges: &[u8],
+        range_count: usize,
+        o: &Out,
+    ) -> bool {
+        let mut table: Vec<(usize, Range)> = Vec::with_capacity(range_count);
+        let ranges_ok = for_each_nul(ranges, range_count, |i, cidr| {
+            let word = match parse_cidr(cidr) {
+                Some((ip, prefix)) => {
+                    let (range, host_bits) = Range::new(ip, prefix);
+                    table.push((i, range));
+                    i64::from(prefix) | i64::from(host_bits) << 8 | i64::from(range.v6) << 9
+                }
+                None => -1,
+            };
+            o.put(i, word);
+        });
+        ranges_ok
+            && for_each_nul(addresses, address_count, |i, address| {
+                let word = match php_ip(address) {
+                    None => -2,
+                    Some(ip) => table
+                        .iter()
+                        .find(|(_, range)| range.contains(ip))
+                        .map_or(-1, |&(index, _)| index as i64),
+                };
+                o.put(range_count + i, word);
+            })
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w47_cloudflare_cidr_match_batch(
+        addresses: *const u8,
+        addresses_len: usize,
+        address_count: usize,
+        ranges: *const u8,
+        ranges_len: usize,
+        range_count: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let Some(words) = address_count.checked_add(range_count) else {
+            return -1;
+        };
+        unsafe {
+            run(
+                out,
+                cap,
+                words,
+                &[(addresses, addresses_len), (ranges, ranges_len)],
+                |o| {
+                    let (Some(addresses), Some(ranges)) =
+                        (span(addresses, addresses_len), span(ranges, ranges_len))
+                    else {
+                        return false;
+                    };
+                    cidr_match(addresses, address_count, ranges, range_count, o)
+                },
+            )
+        }
+    }
+
+    // ---- IndexerProxyDetector request signal scoring ------------------------------------------
+
+    pub const INDEXER_AGENTS: [&[u8]; 8] = [
+        b"nzbhydra",
+        b"prowlarr",
+        b"jackett",
+        b"sonarr",
+        b"radarr",
+        b"lidarr",
+        b"readarr",
+        b"mylar",
+    ];
+    pub const DOWNLOADER_AGENTS: [&[u8]; 4] = [b"sabnzbd", b"nzbget", b"nzbvortex", b"nzbunity"];
+
+    /// `preg_split('/[\r\n,]+/')`, trimmed, non-empty and lowercased.
+    pub fn referer_patterns(configured: &[u8]) -> Vec<Vec<u8>> {
+        configured
+            .split(|&b| matches!(b, b'\r' | b'\n' | b','))
+            .map(php_trim)
+            .filter(|p| !p.is_empty())
+            .map(<[u8]>::to_ascii_lowercase)
+            .collect()
+    }
+
+    /// Whether an `http(s)://` referer names localhost, a `.local`/`.lan` host or a private IP.
+    fn referer_local(referer: &[u8]) -> bool {
+        let rest = if starts_with_ci(referer, b"http://") {
+            &referer[7..]
+        } else if starts_with_ci(referer, b"https://") {
+            &referer[8..]
+        } else {
+            return false;
+        };
+        let end = rest
+            .iter()
+            .position(|&b| matches!(b, b'/' | b'?' | b'#'))
+            .unwrap_or(rest.len());
+        let mut authority = &rest[..end];
+        if let Some(at) = authority.iter().rposition(|&b| b == b'@') {
+            authority = &authority[at + 1..];
+        }
+        let host = if authority.first() == Some(&b'[') {
+            match authority.iter().position(|&b| b == b']') {
+                Some(close) => &authority[1..close],
+                None => &[][..],
+            }
+        } else {
+            let colon = authority.iter().position(|&b| b == b':');
+            colon.map_or(authority, |c| &authority[..c])
+        };
+        host.eq_ignore_ascii_case(b"localhost")
+            || ends_with_ci(host, b".local")
+            || ends_with_ci(host, b".lan")
+            || php_ip(host).is_some_and(Ip::private)
+    }
+
+    /// Whether the agent holds any INDEXER_AGENTS / DOWNLOADER_AGENTS fragment, case-insensitively,
+    /// in one pass that only compares at bytes starting some fragment.
+    fn agent_kinds(agent: &[u8]) -> (bool, bool) {
+        let (mut indexer, mut downloader) = (false, false);
+        for (i, b) in agent.iter().enumerate() {
+            if !matches!(b | 0x20, b'j' | b'l' | b'm' | b'n' | b'p' | b'r' | b's') {
+                continue;
+            }
+            let rest = &agent[i..];
+            indexer = indexer || INDEXER_AGENTS.iter().any(|t| starts_with_ci(rest, t));
+            downloader = downloader || DOWNLOADER_AGENTS.iter().any(|t| starts_with_ci(rest, t));
+            if indexer && downloader {
+                break;
+            }
+        }
+        (indexer, downloader)
+    }
+
+    /// IndexerProxyDetector::scoreRequestsPhp(): score | reason flags << 8.
+    pub fn score(ip: &[u8], agent: &[u8], referer: &[u8], patterns: &[Vec<u8>]) -> i64 {
+        let (mut score, mut flags) = (0i64, 0i64);
+        if !referer.is_empty() && patterns.iter().any(|p| contains_ci(referer, p)) {
+            score += 30;
+            flags |= 1;
+        }
+        if agent.is_empty() {
+            score += 15;
+            flags |= 8;
+        } else {
+            let (indexer, downloader) = agent_kinds(agent);
+            if indexer {
+                score += 25;
+                flags |= 2;
+            }
+            if downloader {
+                flags |= 4;
+            }
+        }
+        match php_ip(ip) {
+            None => flags |= 32,
+            Some(addr) if addr.private() => {
+                flags |= 16;
+                if flags & 2 != 0 {
+                    score += 20;
+                }
+            }
+            Some(_) => {}
+        }
+        if referer_local(referer) {
+            score += 10;
+            flags |= 64;
+        }
+        if flags & 4 != 0 && flags & 2 == 0 {
+            score -= 20;
+        }
+        score.clamp(0, 100) | flags << 8
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w47_proxy_signal_score_batch(
+        ips: *const u8,
+        ips_len: usize,
+        agents: *const u8,
+        agents_len: usize,
+        referers: *const u8,
+        referers_len: usize,
+        count: usize,
+        patterns: *const u8,
+        patterns_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let inputs = [
+            (ips, ips_len),
+            (agents, agents_len),
+            (referers, referers_len),
+            (patterns, patterns_len),
+        ];
+        unsafe {
+            run(out, cap, count, &inputs, |o| {
+                let (Some(ips), Some(agents), Some(referers), Some(patterns)) = (
+                    span(ips, ips_len),
+                    span(agents, agents_len),
+                    span(referers, referers_len),
+                    span(patterns, patterns_len),
+                ) else {
+                    return false;
+                };
+                if count == 0 {
+                    return ips.is_empty() && agents.is_empty() && referers.is_empty();
+                }
+                let patterns = referer_patterns(patterns);
+                let (mut a, mut b, mut c) =
+                    (split_nul(ips), split_nul(agents), split_nul(referers));
+                for i in 0..count {
+                    let (Some(ip), Some(agent), Some(referer)) = (a.next(), b.next(), c.next())
+                    else {
+                        return false;
+                    };
+                    o.put(i, score(ip, agent, referer, &patterns));
+                }
+                a.next().is_none() && b.next().is_none() && c.next().is_none()
+            })
+        }
+    }
+
+    // ---- ProxyRequestContext X-Forwarded-For chain resolution ---------------------------------
+
+    /// Trusted proxies: CIDRs or exact addresses; anything else is ignored.
+    pub fn trusted_table(trusted: &[u8], count: usize) -> Option<Vec<Range>> {
+        let mut table = Vec::with_capacity(count);
+        for_each_nul(trusted, count, |_, entry| {
+            let parsed = if entry.contains(&b'/') {
+                parse_cidr(entry)
+            } else {
+                php_ip(entry).map(|ip| (ip, ip.bits()))
+            };
+            if let Some((ip, prefix)) = parsed {
+                table.push(Range::new(ip, prefix).0);
+            }
+        })
+        .then_some(table)
+    }
+
+    /// One hop: `[v6]`, `[v6]:port`, `v4:port` (exactly one colon) or a bare address.
+    pub fn hop(raw: &[u8]) -> Option<(Ip, bool)> {
+        let hop = trim_blank(raw);
+        let port_ok = |p: &[u8]| digits(p, 5).is_some();
+        let (address, port) = if hop.first() == Some(&b'[') {
+            let close = hop.iter().position(|&b| b == b']')?;
+            let rest = &hop[close + 1..];
+            if !rest.is_empty() && (rest[0] != b':' || !port_ok(&rest[1..])) {
+                return None;
+            }
+            (&hop[1..close], !rest.is_empty())
+        } else if hop.iter().filter(|&&b| b == b':').count() == 1 {
+            let colon = hop.iter().position(|&b| b == b':')?;
+            if !port_ok(&hop[colon + 1..]) {
+                return None;
+            }
+            (&hop[..colon], true)
+        } else {
+            (hop, false)
+        };
+        php_ip(address).map(|ip| (ip, port))
+    }
+
+    /// ProxyRequestContext::resolveForwardedChainsPhp() for one remote address and header.
+    pub fn chain(remote: &[u8], header: &[u8], table: &[Range], hops: &mut Vec<Ip>) -> (i64, i64) {
+        let trusted = |ip: Ip| table.iter().any(|r| r.contains(ip));
+        let remote_ip = php_ip(remote);
+        let (mut count, mut invalid, mut port, mut v6) = (0i64, 0i64, false, false);
+        hops.clear();
+        let present = !trim_blank(header).is_empty();
+        if present {
+            for raw in header.split(|&b| b == b',') {
+                count += 1;
+                match hop(raw) {
+                    Some((ip, has_port)) => {
+                        port |= has_port;
+                        v6 |= matches!(ip, Ip::V6(_));
+                        hops.push(ip);
+                    }
+                    None => invalid += 1,
+                }
+            }
+        }
+        let mut skipped = 0i64;
+        let client = if !remote_ip.is_some_and(trusted) {
+            -1
+        } else if !present {
+            -3
+        } else if invalid > 0 {
+            -2
+        } else {
+            let mut client = 0;
+            for (j, ip) in hops.iter().enumerate().rev() {
+                if !trusted(*ip) {
+                    client = j as i64;
+                    break;
+                }
+                skipped += 1;
+            }
+            client
+        };
+        let flags = count.min(255)
+            | skipped.min(255) << 8
+            | i64::from(port) << 16
+            | i64::from(v6) << 17
+            | i64::from(remote_ip.is_some()) << 18
+            | invalid.min(255) << 24;
+        (client, flags)
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `cap` bytes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w47_proxy_forwarded_chain_batch(
+        remotes: *const u8,
+        remotes_len: usize,
+        chains: *const u8,
+        chains_len: usize,
+        count: usize,
+        trusted: *const u8,
+        trusted_len: usize,
+        trusted_count: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        let Some(words) = count.checked_mul(2) else {
+            return -1;
+        };
+        let inputs = [
+            (remotes, remotes_len),
+            (chains, chains_len),
+            (trusted, trusted_len),
+        ];
+        unsafe {
+            run(out, cap, words, &inputs, |o| {
+                let (Some(remotes), Some(chains), Some(trusted)) = (
+                    span(remotes, remotes_len),
+                    span(chains, chains_len),
+                    span(trusted, trusted_len),
+                ) else {
+                    return false;
+                };
+                let Some(table) = trusted_table(trusted, trusted_count) else {
+                    return false;
+                };
+                if count == 0 {
+                    return remotes.is_empty() && chains.is_empty();
+                }
+                let (mut r, mut c) = (split_nul(remotes), split_nul(chains));
+                let mut hops = Vec::new();
+                for i in 0..count {
+                    let (Some(remote), Some(header)) = (r.next(), c.next()) else {
+                        return false;
+                    };
+                    let (client, flags) = chain(remote, header, &table, &mut hops);
+                    o.put(i * 2, client);
+                    o.put(i * 2 + 1, flags);
+                }
+                r.next().is_none() && c.next().is_none()
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn words(bytes: &[u8]) -> Vec<i64> {
+            bytes
+                .chunks_exact(8)
+                .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                .collect()
+        }
+
+        fn irc(entries: &[&str]) -> Vec<i64> {
+            let joined = entries.join("\0");
+            let mut out = vec![0u8; entries.len() * 16];
+            let n = unsafe {
+                nntmux_w47_irc_endpoint_route_batch(
+                    joined.as_ptr(),
+                    joined.len(),
+                    entries.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert_eq!(n, out.len() as isize);
+            words(&out)
+        }
+
+        #[test]
+        fn cleaning_w47_php_ip_matches_filter_var_rules() {
+            assert_eq!(php_ip(b"1.2.3.4"), Some(Ip::V4([1, 2, 3, 4])));
+            for bad in [
+                &b"01.2.3.4"[..],
+                b"1.2.3",
+                b"256.1.1.1",
+                b"1.2.3.4.",
+                b"1234",
+                b"",
+                b" 1.2.3.4",
+                b"1.2.3.0004",
+            ] {
+                assert_eq!(php_ip(bad), None, "{:?}", std::str::from_utf8(bad));
+            }
+            assert!(php_ip(b"0.0.0.0").is_some());
+            let mut v = [0u8; 16];
+            v[15] = 1;
+            assert_eq!(php_ip(b"::1"), Some(Ip::V6(v)));
+            assert!(php_ip(b"::").is_some());
+            assert!(php_ip(b"1::").is_some());
+            assert!(php_ip(b"1:2:3:4:5:6:7:8").is_some());
+            assert!(php_ip(b"1:2:3:4:5:6:7::").is_some());
+            assert!(php_ip(b"1::2:3:4:5:6:7").is_some());
+            assert_eq!(php_ip(b"1:2:3:4::5:6:7:8"), None);
+            assert_eq!(php_ip(b":1::"), None);
+            assert_eq!(php_ip(b"1:::2"), None);
+            assert_eq!(php_ip(b"1::2::3"), None);
+            assert_eq!(php_ip(b"12345::"), None);
+            assert_eq!(php_ip(b"1:2.3.4.5"), None);
+            assert_eq!(php_ip(b":1.2.3.4"), None);
+            let mut mapped = [0u8; 16];
+            mapped[10] = 0xff;
+            mapped[11] = 0xff;
+            mapped[12..].copy_from_slice(&[1, 2, 3, 4]);
+            assert_eq!(php_ip(b"::ffff:1.2.3.4"), Some(Ip::V6(mapped)));
+            let mut tail = [0u8; 16];
+            tail[1] = 1;
+            tail[12..].copy_from_slice(&[9, 8, 7, 6]);
+            assert_eq!(php_ip(b"1::9.8.7.6"), Some(Ip::V6(tail)));
+            assert_eq!(php_ip(b"1:2:3:4:5:6:7:1.2.3.4"), None);
+            assert!(php_ip(b"1:2:3:4:5:6:1.2.3.4").is_some());
+        }
+
+        #[test]
+        fn cleaning_w47_irc_endpoints_route_and_digest() {
+            let out = irc(&[
+                "irc.synirc.net",
+                "ircs://Irc.Example.org:+7000/#a,#b,bad,",
+                "",
+                "[::1]:6697",
+                "1.2.3",
+                "host:0",
+                "[zz]",
+                "[::1]x",
+            ]);
+            let crc = |s: &str| i64::from(crc_update(0xffff_ffff, s.bytes()) ^ 0xffff_ffff);
+            assert_eq!(out[0], 1 | 1 << 2 | 6667 << 8);
+            assert_eq!(out[1], crc("irc.synirc.net:6667"));
+            assert_eq!(out[2], 1 | 1 << 1 | 1 << 2 | 7000 << 8 | 2 << 24 | 1 << 32);
+            assert_eq!(out[3], crc("irc.example.org:7000"));
+            assert_eq!(&out[4..6], &[-1, 0]);
+            assert_eq!(out[6], 1 | 3 << 2 | 6697 << 8);
+            assert_eq!(out[7], crc("::1:6697"));
+            assert_eq!(&out[8..], &[-2, 0, -3, 0, -4, 0, -3, 0]);
+            assert_eq!(crc("123456789"), 0xcbf4_3926);
+        }
+
+        #[test]
+        fn cleaning_w47_stream_frames_classify() {
+            let mut data = Vec::new();
+            assert_eq!(
+                frame(b"{\"action\" : \"insert\",\"row\":{}}", &mut data),
+                (2 | 1 << 8 | 1 << 27, -1)
+            );
+            assert_eq!(
+                frame(b"  {\"message\":{\"release\":\"x\"}}", &mut data).0 & 0xff,
+                4
+            );
+            assert_eq!(frame(b"{\"hb\":1}", &mut data).0 & 0xff, 1);
+            let (w, r) = frame(b": hi\r\nevent: update\r\ndata: {\"action\":\r\ndata: \"update\"}\nid: 7\rretry: 1500\nfoo\n\n", &mut data);
+            assert_eq!(
+                w,
+                3 | 2 << 8 | 1 << 16 | 1 << 24 | 1 << 25 | 1 << 26 | 1 << 32
+            );
+            assert_eq!(r, 1500);
+            assert_eq!(frame(b"event: hb", &mut data).0 & 0xff, 1);
+            assert_eq!(frame(b"", &mut data), (0, -1));
+            assert_eq!(frame(b"data:plain", &mut data).0 & 0xff, 5);
+            assert_eq!(frame(b"retry: 12x", &mut data), (0, -1));
+        }
+
+        #[test]
+        fn cleaning_w47_cidr_tables_and_containment() {
+            let ranges = b"173.245.48.0/20\0bad\x002400:cb00::/32\x0010.1.2.3/8\x001.2.3.4/33";
+            let addresses = b"173.245.50.1\x002400:cb00:1::5\x0010.9.9.9\x008.8.8.8\x00nope";
+            let mut out = vec![0u8; 80];
+            let n = unsafe {
+                nntmux_w47_cloudflare_cidr_match_batch(
+                    addresses.as_ptr(),
+                    addresses.len(),
+                    5,
+                    ranges.as_ptr(),
+                    ranges.len(),
+                    5,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert_eq!(n, 80);
+            assert_eq!(
+                words(&out),
+                vec![20, -1, 32 | 1 << 9, 8 | 1 << 8, -1, 0, 2, 3, -1, -2]
+            );
+            let mut small = vec![0u8; 8];
+            let n = unsafe {
+                nntmux_w47_cloudflare_cidr_match_batch(
+                    addresses.as_ptr(),
+                    addresses.len(),
+                    5,
+                    ranges.as_ptr(),
+                    ranges.len(),
+                    5,
+                    small.as_mut_ptr(),
+                    small.len(),
+                )
+            };
+            assert_eq!(n, -80);
+            let n = unsafe {
+                nntmux_w47_cloudflare_cidr_match_batch(
+                    addresses.as_ptr(),
+                    addresses.len(),
+                    4,
+                    ranges.as_ptr(),
+                    ranges.len(),
+                    5,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert_eq!(n, -1);
+        }
+
+        #[test]
+        fn cleaning_w47_proxy_scores() {
+            let patterns = referer_patterns(b" Hydra.Local:5076 ,\r\n\nprowlarr,,");
+            assert_eq!(
+                patterns,
+                vec![b"hydra.local:5076".to_vec(), b"prowlarr".to_vec()]
+            );
+            assert_eq!(
+                score(
+                    b"192.168.1.5",
+                    b"NZBHydra2/5.0",
+                    b"http://hydra.local:5076/x",
+                    &patterns
+                ),
+                85 | (1 | 2 | 16 | 64) << 8
+            );
+            assert_eq!(
+                score(b"8.8.8.8", b"SABnzbd/4.0", b"", &patterns),
+                0 | 4 << 8
+            );
+            assert_eq!(
+                score(b"bad", b"", b"https://user@[fe80::1]:80/", &patterns),
+                25 | (8 | 32 | 64) << 8
+            );
+        }
+
+        #[test]
+        fn cleaning_w47_forwarded_chains() {
+            let table = trusted_table(b"10.0.0.0/8\x00203.0.113.7\x00junk\x00::1", 4).unwrap();
+            let mut hops = Vec::new();
+            assert_eq!(
+                chain(
+                    b"10.0.0.1",
+                    b"198.51.100.2, 203.0.113.7:443",
+                    &table,
+                    &mut hops
+                ),
+                (0, 2 | 1 << 8 | 1 << 16 | 1 << 18)
+            );
+            assert_eq!(
+                chain(
+                    b"10.0.0.1",
+                    b"1.1.1.1,10.2.2.2 , [2001:db8::1]:80",
+                    &table,
+                    &mut hops
+                ),
+                (2, 3 | 1 << 16 | 1 << 17 | 1 << 18)
+            );
+            assert_eq!(
+                chain(b"8.8.8.8", b"1.1.1.1", &table, &mut hops),
+                (-1, 1 | 1 << 18)
+            );
+            assert_eq!(chain(b"::1", b" \t", &table, &mut hops), (-3, 1 << 18));
+            assert_eq!(
+                chain(b"::1", b"1.1.1.1,,x", &table, &mut hops),
+                (-2, 3 | 1 << 18 | 2 << 24)
+            );
+            assert_eq!(
+                chain(b"10.0.0.1", b"10.1.1.1,10.2.2.2", &table, &mut hops),
+                (0, 2 | 2 << 8 | 1 << 18)
+            );
+        }
+
+        #[test]
+        fn cleaning_w47_nul_split_matches_slice_split() {
+            for input in [
+                &b""[..],
+                b"\0",
+                b"abc",
+                b"a\0b\0\0c",
+                b"0123456789abcdef\0",
+                b"\00123456789abcdef0123456789\0\0x",
+            ] {
+                let fast: Vec<&[u8]> = split_nul(input).collect();
+                let slow: Vec<&[u8]> = input.split(|&b| b == 0).collect();
+                assert_eq!(fast, slow);
+            }
+            let mut long = vec![b'x'; 300];
+            for at in [0, 7, 8, 9, 63, 64, 128, 299] {
+                long[at] = 0;
+                let fast: Vec<&[u8]> = split_nul(&long).collect();
+                let slow: Vec<&[u8]> = long.split(|&b| b == 0).collect();
+                assert_eq!(fast, slow);
+            }
+        }
+
+        #[test]
+        fn cleaning_w47_malformed_batches_decline() {
+            let mut out = vec![0u8; 32];
+            let input = b"a\0b";
+            let n = unsafe {
+                nntmux_w47_predb_stream_frame_batch(
+                    input.as_ptr(),
+                    input.len(),
+                    1,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert_eq!(n, -1);
+            let n = unsafe {
+                nntmux_w47_predb_stream_frame_batch(
+                    input.as_ptr(),
+                    input.len(),
+                    2,
+                    out.as_mut_ptr(),
+                    8,
+                )
+            };
+            assert_eq!(n, -32);
+            let n = unsafe {
+                nntmux_w47_irc_endpoint_route_batch(std::ptr::null(), 0, 0, std::ptr::null_mut(), 0)
+            };
+            assert_eq!(n, 0);
+            let n = unsafe {
+                nntmux_w47_proxy_signal_score_batch(
+                    input.as_ptr(),
+                    3,
+                    input.as_ptr(),
+                    3,
+                    input.as_ptr(),
+                    1,
+                    2,
+                    std::ptr::null(),
+                    0,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert_eq!(n, -1);
+        }
+    }
+}
