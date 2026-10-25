@@ -35,6 +35,7 @@ use FFMpeg\Media\Video;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Log;
+use InvalidArgumentException;
 use Mhor\MediaInfo\MediaInfo;
 
 /**
@@ -786,5 +787,194 @@ class MediaExtractionService
         }
 
         return $this->mediaInfo;
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 52.4 batch helper
+    // ---------------------------------------------------------------------
+
+    /** Enabled: minimum of three paired runs cleared every 1.5x gate (common mean 2.53x, p99 1.91x; uncommon mean 2.17x, p99 1.80x); see RustWorkPlannerArchiveConfigConsoleMediaExtractW52ParityTest. */
+    private const bool W52_RUST_FFI_DEFAULT = true;
+
+    public const string W52_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w524_audio_tag_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** audioTagBatch() flags; valid is exclusive. */
+    public const int W52_TAG_VALID = 1;
+
+    public const int W52_TAG_EMPTY = 2;
+
+    public const int W52_TAG_INVALID_UTF8 = 4;
+
+    public const int W52_TAG_CONTROL = 8;
+
+    /**
+     * Validate MediaInfo tag strings, four ints each: [flags, trimmed offset << 32 | length,
+     * UTF-8 characters in the trimmed text or -1 when it is invalid, first `(?:19|20)\d\d`
+     * year in the value (as audioReleaseTitlePhp() reads a date) or -1]. Flags: 1 valid
+     * (audioTagTextPhp() returns the trimmed text), otherwise 2 empty after trim(), 4 invalid
+     * UTF-8 and 8 control byte (0x00-0x1f, 0x7f) in the trimmed text.
+     *
+     * @param  list<string>  $values
+     * @return list<int>
+     */
+    public static function audioTagBatch(array $values): array
+    {
+        return self::usesW52RustFfi()
+            ? self::audioTagBatchNative($values)
+            : self::audioTagBatchPhp($values);
+    }
+
+    /**
+     * @param  list<string>  $values
+     * @return list<int>
+     */
+    public static function audioTagBatchNative(array $values): array
+    {
+        self::w52AssertList($values);
+        if ($values === []) {
+            return [];
+        }
+
+        [$text, $twin] = self::w52Text($values);
+
+        return self::w52Call($text, $twin, \count($values))
+            ?? self::audioTagBatchPhp($values);
+    }
+
+    /**
+     * @param  list<string>  $values
+     * @return list<int>
+     */
+    public static function audioTagBatchPhp(array $values): array
+    {
+        self::w52AssertList($values);
+        $out = [];
+        foreach ($values as $value) {
+            $text = trim($value);
+            $utf8 = mb_check_encoding($text, 'UTF-8');
+            $flags = ($text === '' ? self::W52_TAG_EMPTY : 0)
+                | ($utf8 ? 0 : self::W52_TAG_INVALID_UTF8)
+                | (preg_match('/[\x00-\x1f\x7f]/', $text) === 1 ? self::W52_TAG_CONTROL : 0);
+            $out[] = $flags === 0 ? self::W52_TAG_VALID : $flags;
+            $out[] = (strspn($value, " \t\n\r\0\x0B") << 32) | \strlen($text);
+            $out[] = $utf8 ? mb_strlen($text, 'UTF-8') : -1;
+            $out[] = preg_match('/(?:19|20)\d\d/', $value, $year) === 1 ? (int) $year[0] : -1;
+        }
+
+        return $out;
+    }
+
+    public static function usesW52RustFfi(): bool
+    {
+        $enabled = self::w52RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W52_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W52 batch dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW52RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w52RustFfiState('enabled');
+        self::w52RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w52RustFfiState('enabled', $previous);
+        }
+    }
+
+    /**
+     * One FFI crossing for the batch: encoded text and packed int64 columns in, 4 int64
+     * words back per record. Null when the library is missing or declines.
+     *
+     * @return list<int>|null
+     */
+    private static function w52Call(string $text, string $ints, int $count): ?array
+    {
+        try {
+            $state = self::w52RustFfiState();
+            $ffi = $state['ffi'] ?? null;
+            if ($ffi === null) {
+                $ffi = RustPipelineLibrary::resolveDomain('metadata_w52', self::W52_FFI_CDEF) ?? false;
+                self::w52RustFfiState('ffi', $ffi);
+            }
+            if (! $ffi instanceof FFI) {
+                return null;
+            }
+            $need = $count * 4;
+            $out = $state['out'] ?? null;
+            $cap = $state['cap'] ?? 0;
+            if (! $out instanceof CData || ! \is_int($cap) || $cap < $need) {
+                $cap = max(1024, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w52RustFfiState('out', $out);
+                self::w52RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W52_FFI_CDEF.)
+            $written = $ffi->nntmux_w524_audio_tag_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, $cap);
+            if ($written !== $need) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $need * 8));
+
+            return $values === false ? null : array_values($values);
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Text column encoding: NUL-joined values and, when a value holds a NUL byte, the same
+     * values joined with 0x01 so Rust finds the separators where the two buffers differ.
+     *
+     * @param  list<string>  $values
+     * @return array{0: string, 1: string}
+     */
+    private static function w52Text(array $values): array
+    {
+        $joined = implode("\0", $values);
+
+        return [$joined, substr_count($joined, "\0") === \count($values) - 1 ? '' : implode("\x01", $values)];
+    }
+
+    /** @param array<array-key, mixed> $values */
+    private static function w52AssertList(array $values): void
+    {
+        if (! array_is_list($values)) {
+            throw new InvalidArgumentException('W52 batch input must be a list.');
+        }
+    }
+
+    /**
+     * W52 routing override and cached binding. Readonly classes cannot declare static
+     * properties, so they live in a function static: no arguments returns the state, one
+     * argument reads a key ('reset' clears everything) and two arguments write a key.
+     */
+    private static function w52RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+        }
+
+        return $state[$op] ?? null;
     }
 }

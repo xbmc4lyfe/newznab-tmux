@@ -10,7 +10,11 @@ use App\Services\AdditionalProcessing\DTO\ArchiveCandidate;
 use App\Services\AdditionalProcessing\DTO\ImageCandidate;
 use App\Services\AdditionalProcessing\Media\ImageCandidateRanker;
 use App\Support\RustPipelineLibrary;
+use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\Log;
+use InvalidArgumentException;
+use Throwable;
 
 final readonly class AdditionalWorkPlanner
 {
@@ -1084,5 +1088,214 @@ final readonly class AdditionalWorkPlanner
         }
 
         return $override;
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 52.4 batch helper
+    // ---------------------------------------------------------------------
+
+    /** Enabled: minimum of three paired runs cleared every 1.5x gate (common mean 2.23x, p99 2.04x; uncommon mean 2.13x, p99 2.01x); see RustWorkPlannerArchiveConfigConsoleMediaExtractW52ParityTest. */
+    private const bool W52_RUST_FFI_DEFAULT = true;
+
+    public const string W52_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w524_archive_volume_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** archiveVolumeBatch() flags. */
+    public const int W52_VOLUME_RAR = 1;
+
+    public const int W52_VOLUME_QUOTED = 2;
+
+    public const int W52_VOLUME_EXTENSION = 4;
+
+    /** rarVolume() patterns: [quoted name, bare subject] per volume family, in match order. */
+    private const array W52_RAR_PATTERNS = [
+        ['/^(.+)\.part(\d+)\.rar(?:$|[ ")-])/i', '/([^"\s\/]+)\.part(\d+)\.rar(?:$|[ ")-])/i'],
+        ['/^(.+)\.rar(?:$|[ ")-])/i', '/([^"\s\/]+)\.rar(?:$|[ ")-])/i'],
+        ['/^(.+)\.r(\d{2,3})(?:$|[ ")-])/i', '/([^"\s\/]+)\.r(\d{2,3})(?:$|[ ")-])/i'],
+    ];
+
+    /**
+     * Classify NZB subjects for archive volume planning, four ints each: [flags, rarVolume()
+     * order (.rar 0, .partN.rar N, .rNN NN + 1) or -1, rar set name offset << 32 | length in
+     * the raw subject (rarVolume() lower-cases it) or -1, first `.part0*(\d+)` number or -1].
+     * Flags: 1 rar volume, 2 quoted name without CR/LF, 4 hasFileExtension().
+     *
+     * @param  list<string>  $titles
+     * @return list<int>
+     */
+    public static function archiveVolumeBatch(array $titles): array
+    {
+        return self::usesW52RustFfi()
+            ? self::archiveVolumeBatchNative($titles)
+            : self::archiveVolumeBatchPhp($titles);
+    }
+
+    /**
+     * @param  list<string>  $titles
+     * @return list<int>
+     */
+    public static function archiveVolumeBatchNative(array $titles): array
+    {
+        self::w52AssertList($titles);
+        if ($titles === []) {
+            return [];
+        }
+
+        [$text, $twin] = self::w52Text($titles);
+
+        return self::w52Call($text, $twin, \count($titles))
+            ?? self::archiveVolumeBatchPhp($titles);
+    }
+
+    /**
+     * @param  list<string>  $titles
+     * @return list<int>
+     */
+    public static function archiveVolumeBatchPhp(array $titles): array
+    {
+        self::w52AssertList($titles);
+        $out = [];
+        foreach ($titles as $title) {
+            $quoted = preg_match('/"([^"\r\n]+)"/', $title, $quote, PREG_OFFSET_CAPTURE) === 1;
+            [$name, $base, $variant] = $quoted ? [$quote[1][0], $quote[1][1], 0] : [$title, 0, 1];
+            $flags = $quoted ? self::W52_VOLUME_QUOTED : 0;
+            $order = -1;
+            $span = -1;
+            foreach (self::W52_RAR_PATTERNS as $family => $patterns) {
+                if (preg_match($patterns[$variant], $name, $match, PREG_OFFSET_CAPTURE) === 1) {
+                    $flags |= self::W52_VOLUME_RAR;
+                    $order = match ($family) {
+                        0 => (int) $match[2][0],
+                        1 => 0,
+                        default => (int) $match[2][0] + 1,
+                    };
+                    $span = (($base + $match[1][1]) << 32) | \strlen($match[1][0]);
+                    break;
+                }
+            }
+            $extensionName = preg_match('/"([^"]+)"/', $title, $any) === 1 ? $any[1] : $title;
+            if (preg_match('/\.[a-z0-9]{2,4}$/i', trim($extensionName)) === 1) {
+                $flags |= self::W52_VOLUME_EXTENSION;
+            }
+            $out[] = $flags;
+            $out[] = $order;
+            $out[] = $span;
+            $out[] = preg_match('/\.part0*(\d+)/i', $title, $part) === 1 ? (int) $part[1] : -1;
+        }
+
+        return $out;
+    }
+
+    public static function usesW52RustFfi(): bool
+    {
+        $enabled = self::w52RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W52_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W52 batch dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW52RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w52RustFfiState('enabled');
+        self::w52RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w52RustFfiState('enabled', $previous);
+        }
+    }
+
+    /**
+     * One FFI crossing for the batch: encoded text and packed int64 columns in, 4 int64
+     * words back per record. Null when the library is missing or declines.
+     *
+     * @return list<int>|null
+     */
+    private static function w52Call(string $text, string $ints, int $count): ?array
+    {
+        try {
+            $state = self::w52RustFfiState();
+            $ffi = $state['ffi'] ?? null;
+            if ($ffi === null) {
+                $ffi = RustPipelineLibrary::resolveDomain('metadata_w52', self::W52_FFI_CDEF) ?? false;
+                self::w52RustFfiState('ffi', $ffi);
+            }
+            if (! $ffi instanceof FFI) {
+                return null;
+            }
+            $need = $count * 4;
+            $out = $state['out'] ?? null;
+            $cap = $state['cap'] ?? 0;
+            if (! $out instanceof CData || ! \is_int($cap) || $cap < $need) {
+                $cap = max(1024, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w52RustFfiState('out', $out);
+                self::w52RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W52_FFI_CDEF.)
+            $written = $ffi->nntmux_w524_archive_volume_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, $cap);
+            if ($written !== $need) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $need * 8));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * Text column encoding: NUL-joined values and, when a value holds a NUL byte, the same
+     * values joined with 0x01 so Rust finds the separators where the two buffers differ.
+     *
+     * @param  list<string>  $values
+     * @return array{0: string, 1: string}
+     */
+    private static function w52Text(array $values): array
+    {
+        $joined = implode("\0", $values);
+
+        return [$joined, substr_count($joined, "\0") === \count($values) - 1 ? '' : implode("\x01", $values)];
+    }
+
+    /** @param array<array-key, mixed> $values */
+    private static function w52AssertList(array $values): void
+    {
+        if (! array_is_list($values)) {
+            throw new InvalidArgumentException('W52 batch input must be a list.');
+        }
+    }
+
+    /**
+     * W52 routing override and cached binding. Readonly classes cannot declare static
+     * properties, so they live in a function static: no arguments returns the state, one
+     * argument reads a key ('reset' clears everything) and two arguments write a key.
+     */
+    private static function w52RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+        }
+
+        return $state[$op] ?? null;
     }
 }

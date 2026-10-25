@@ -8,6 +8,7 @@ use App\Services\AdditionalProcessing\AdditionalCandidateQuery;
 use App\Services\Configuration\ConfigurationProvider;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use ReflectionProperty;
 use Throwable;
 
@@ -585,5 +586,175 @@ final readonly class ProcessingConfiguration
     private static function w426ValidRow(mixed $row): bool
     {
         return \is_array($row) && \is_int($row['batch_size'] ?? null) && \is_int($row['threads'] ?? null) && \is_int($row['timeout_seconds'] ?? null) && \is_int($row['max_bytes'] ?? null);
+    }
+
+    // ---------------------------------------------------------------------
+    // Wave 52.4 batch helper
+    // ---------------------------------------------------------------------
+
+    /** Enabled: minimum of three paired runs cleared every 1.5x gate (common mean 2.85x, p99 2.66x; uncommon mean 3.50x, p99 3.83x); see RustWorkPlannerArchiveConfigConsoleMediaExtractW52ParityTest. */
+    private const bool W52_RUST_FFI_DEFAULT = true;
+
+    public const string W52_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w524_limit_snapshot_batch(const char *text, size_t text_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * Normalize many limit snapshots at once. `$raw` holds LIMIT_COUNT integers per snapshot in
+     * normalizeLimits() order; each snapshot yields its LIMIT_COUNT normalized limits followed by
+     * a mask with bit k set when limit k was clamped.
+     *
+     * @param  list<int>  $raw
+     * @return list<int>
+     */
+    public static function normalizeLimitsBatch(array $raw): array
+    {
+        return self::usesW52RustFfi()
+            ? self::normalizeLimitsBatchNative($raw)
+            : self::normalizeLimitsBatchPhp($raw);
+    }
+
+    /**
+     * @param  list<int>  $raw
+     * @return list<int>
+     */
+    public static function normalizeLimitsBatchNative(array $raw): array
+    {
+        self::w52AssertSnapshots($raw);
+        if ($raw === []) {
+            return [];
+        }
+
+        return self::w52Call('', pack('P*', ...$raw), intdiv(\count($raw), self::LIMIT_COUNT))
+            ?? self::normalizeLimitsBatchPhp($raw);
+    }
+
+    /**
+     * @param  list<int>  $raw
+     * @return list<int>
+     */
+    public static function normalizeLimitsBatchPhp(array $raw): array
+    {
+        self::w52AssertSnapshots($raw);
+        $out = [];
+        foreach (array_chunk($raw, self::LIMIT_COUNT) as $snapshot) {
+            $mask = 0;
+            foreach (self::normalizeLimitsPhp($snapshot) as $index => $limit) {
+                $out[] = $limit;
+                if ($limit !== $snapshot[$index]) {
+                    $mask |= 1 << $index;
+                }
+            }
+            $out[] = $mask;
+        }
+
+        return $out;
+    }
+
+    /** @param array<array-key, mixed> $raw */
+    private static function w52AssertSnapshots(array $raw): void
+    {
+        self::w52AssertList($raw);
+        if (\count($raw) % self::LIMIT_COUNT !== 0) {
+            throw new \InvalidArgumentException('Expected a multiple of '.self::LIMIT_COUNT.' configuration limits.');
+        }
+    }
+
+    public static function usesW52RustFfi(): bool
+    {
+        $enabled = self::w52RustFfiState('enabled');
+
+        return \is_bool($enabled) ? $enabled : self::W52_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Run $callback with the W52 batch dispatch forced on or off, then restore the previous choice.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW52RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w52RustFfiState('enabled');
+        self::w52RustFfiState('enabled', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w52RustFfiState('enabled', $previous);
+        }
+    }
+
+    /**
+     * One FFI crossing for the batch: encoded text and packed int64 columns in, 15 int64
+     * words back per record. Null when the library is missing or declines.
+     *
+     * @return list<int>|null
+     */
+    private static function w52Call(string $text, string $ints, int $count): ?array
+    {
+        try {
+            $state = self::w52RustFfiState();
+            $ffi = $state['ffi'] ?? null;
+            if ($ffi === null) {
+                $ffi = RustPipelineLibrary::resolveDomain('metadata_w52', self::W52_FFI_CDEF) ?? false;
+                self::w52RustFfiState('ffi', $ffi);
+            }
+            if (! $ffi instanceof FFI) {
+                return null;
+            }
+            $need = $count * 15;
+            $out = $state['out'] ?? null;
+            $cap = $state['cap'] ?? 0;
+            if (! $out instanceof CData || ! \is_int($cap) || $cap < $need) {
+                $cap = max(1024, $need);
+                $out = $ffi->new('int64_t['.$cap.']');
+                self::w52RustFfiState('out', $out);
+                self::w52RustFfiState('cap', $cap);
+            }
+            // @phpstan-ignore method.notFound (Declared by W52_FFI_CDEF.)
+            $written = $ffi->nntmux_w524_limit_snapshot_batch($text, \strlen($text), $ints, \strlen($ints), $count, $out, $cap);
+            if ($written !== $need) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $need * 8));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    /** @param array<array-key, mixed> $values */
+    private static function w52AssertList(array $values): void
+    {
+        if (! array_is_list($values)) {
+            throw new \InvalidArgumentException('W52 batch input must be a list.');
+        }
+    }
+
+    /**
+     * W52 routing override and cached binding. Readonly classes cannot declare static
+     * properties, so they live in a function static: no arguments returns the state, one
+     * argument reads a key ('reset' clears everything) and two arguments write a key.
+     */
+    private static function w52RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var array{enabled: ?bool, ffi: FFI|false|null, out: ?CData, cap: int} $state */
+        static $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+        if ($op === null) {
+            return $state;
+        }
+        if ($op === 'reset') {
+            $state = ['enabled' => null, 'ffi' => null, 'out' => null, 'cap' => 0];
+
+            return null;
+        }
+        if (\func_num_args() > 1) {
+            $state[$op] = $val;
+        }
+
+        return $state[$op] ?? null;
     }
 }

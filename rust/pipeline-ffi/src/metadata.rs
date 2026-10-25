@@ -50235,3 +50235,1131 @@ mod w514_tests {
         }
     }
 }
+
+// =========================================================================================
+// Wave 52.4 batch helpers: AdditionalWorkPlanner archive volumes, ArchiveExtractionService
+// extracted entries, ProcessingConfiguration limit snapshots, ConsoleOutputService lines and
+// MediaExtractionService audio tags. Each export decodes one NUL-joined text column and/or
+// little-endian int64 columns and writes fixed-width int64 words per record, so PHP pays a
+// single FFI crossing per batch.
+// =========================================================================================
+
+pub mod w524_batch {
+    use super::w504_batch::{Batch, Shape, run, span_word, trim};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const MAX_BYTES: usize = 64 * 1024 * 1024;
+
+    const MAX_RECORDS: usize = 1 << 20;
+
+    /// Decimal digits saturating at i64::MAX, as PHP's (int) cast of a digit string.
+    fn saturating_decimal(digits: &[u8]) -> i64 {
+        let mut value: i64 = 0;
+        for b in digits {
+            match value
+                .checked_mul(10)
+                .and_then(|v| v.checked_add(i64::from(b - b'0')))
+            {
+                Some(v) => value = v,
+                None => return i64::MAX,
+            }
+        }
+        value
+    }
+
+    fn digit_run(value: &[u8], from: usize) -> usize {
+        value.get(from..).map_or(0, |rest| {
+            rest.iter().take_while(|c| c.is_ascii_digit()).count()
+        })
+    }
+
+    fn starts_with_ci(value: &[u8], at: usize, needle: &[u8]) -> bool {
+        value
+            .get(at..at + needle.len())
+            .is_some_and(|w| w.eq_ignore_ascii_case(needle))
+    }
+
+    fn base_name(path: &[u8]) -> (usize, &[u8]) {
+        let at = path
+            .iter()
+            .rposition(|c| matches!(c, b'/' | b'\\'))
+            .map_or(0, |p| p + 1);
+        (at, &path[at..])
+    }
+
+    fn extension(name: &[u8]) -> &[u8] {
+        name.iter()
+            .rposition(|c| *c == b'.')
+            .map_or(&[][..], |dot| &name[dot + 1..])
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Text column runner
+    // -------------------------------------------------------------------------------------
+
+    /// Empty spans never touch the pointer: `from_raw_parts` on null is UB even for len 0.
+    unsafe fn span<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null() || len > MAX_BYTES {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> bool {
+        a_len != 0 && b_len != 0 && a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
+    }
+
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+
+    /// First position at or after `from` with `hay[i] | fold == needle`, eight bytes per step;
+    /// the lowest flagged byte of the zero-byte test is exact.
+    #[inline]
+    fn find_byte(hay: &[u8], from: usize, needle: u8, fold: u8) -> Option<usize> {
+        let rest = hay.get(from..)?;
+        let pattern = LO * u64::from(needle);
+        let mask = LO * u64::from(fold);
+        let (chunks, tail) = rest.as_chunks::<8>();
+        for (i, chunk) in chunks.iter().enumerate() {
+            let word = (u64::from_le_bytes(*chunk) | mask) ^ pattern;
+            let found = word.wrapping_sub(LO) & !word & HI;
+            if found != 0 {
+                return Some(from + i * 8 + (found.trailing_zeros() / 8) as usize);
+            }
+        }
+        let done = from + chunks.len() * 8;
+        tail.iter()
+            .position(|c| (c | fold) == needle)
+            .map(|p| done + p)
+    }
+
+    /// `count` values: NUL-separated, or when `twin` is not empty, separated where `text`
+    /// holds NUL and the equally long `twin` (the same values joined with 0x01) does not, so
+    /// values may hold NUL bytes themselves.
+    fn split_fields<'a>(text: &'a [u8], twin: &[u8], count: usize) -> Option<Vec<&'a [u8]>> {
+        let mut fields = Vec::with_capacity(count);
+        let mut start = 0;
+        if twin.is_empty() {
+            while let Some(end) = find_byte(text, start, 0, 0) {
+                if fields.len() + 1 == count {
+                    return None;
+                }
+                fields.push(&text[start..end]);
+                start = end + 1;
+            }
+        } else {
+            if twin.len() != text.len() {
+                return None;
+            }
+            let (a, a_tail) = text.as_chunks::<8>();
+            let (b, b_tail) = twin.as_chunks::<8>();
+            let words = a
+                .iter()
+                .zip(b)
+                .map(|(x, y)| u64::from_le_bytes(*x) ^ u64::from_le_bytes(*y));
+            let tails = a_tail.iter().zip(b_tail).map(|(x, y)| u64::from(x ^ y));
+            for (k, diff) in words.enumerate() {
+                if diff == 0 {
+                    continue;
+                }
+                for pos in k * 8..k * 8 + 8 {
+                    if text[pos] != twin[pos] {
+                        if text[pos] != 0 || twin[pos] != 1 || fields.len() + 1 == count {
+                            return None;
+                        }
+                        fields.push(&text[start..pos]);
+                        start = pos + 1;
+                    }
+                }
+            }
+            let done = a.len() * 8;
+            for (j, diff) in tails.enumerate() {
+                let pos = done + j;
+                if diff != 0 {
+                    if text[pos] != 0 || twin[pos] != 1 || fields.len() + 1 == count {
+                        return None;
+                    }
+                    fields.push(&text[start..pos]);
+                    start = pos + 1;
+                }
+            }
+        }
+        fields.push(&text[start..]);
+        (fields.len() == count).then_some(fields)
+    }
+
+    /// ASCII case-insensitive substring test for a lower-case letter-led `needle`.
+    fn contains_folded(hay: &[u8], needle: &[u8]) -> bool {
+        let mut from = 0;
+        while let Some(at) = find_byte(hay, from, needle[0], 0x20) {
+            if hay.len() - at < needle.len() {
+                return false;
+            }
+            if hay[at..at + needle.len()].eq_ignore_ascii_case(needle) {
+                return true;
+            }
+            from = at + 1;
+        }
+        false
+    }
+
+    type TextBody = fn(&[&[u8]], &mut [i64]);
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run_text(
+        text: *const u8,
+        text_len: usize,
+        twin: *const u8,
+        twin_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+        words: usize,
+        body: TextBody,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out.is_null()
+                || !out.is_aligned()
+                || count > MAX_RECORDS
+                || out_cap > isize::MAX as usize / 8
+            {
+                return -1;
+            }
+            let out_bytes = out_cap * 8;
+            if overlaps(text as usize, text_len, out as usize, out_bytes)
+                || overlaps(twin as usize, twin_len, out as usize, out_bytes)
+            {
+                return -1;
+            }
+            let (Some(text), Some(twin)) = (unsafe { span(text, text_len) }, unsafe {
+                span(twin, twin_len)
+            }) else {
+                return -1;
+            };
+            if count == 0 {
+                return if text.is_empty() && twin.is_empty() {
+                    0
+                } else {
+                    -1
+                };
+            }
+            let Some(fields) = split_fields(text, twin, count) else {
+                return -1;
+            };
+            let need = count * words;
+            if need > out_cap {
+                return -(need.max(2) as isize);
+            }
+            // Non-null, aligned, within `out_cap` and disjoint from both inputs.
+            let out = unsafe { std::slice::from_raw_parts_mut(out, need) };
+            body(&fields, out);
+            need as isize
+        }))
+        .unwrap_or(-1)
+    }
+
+    // -------------------------------------------------------------------------------------
+    // AdditionalWorkPlanner
+    // -------------------------------------------------------------------------------------
+
+    const VOLUME_RAR: i64 = 1;
+    const VOLUME_QUOTED: i64 = 2;
+    const VOLUME_EXTENSION: i64 = 4;
+
+    /// `"([^"\r\n]+)"`: the first quoted name holding no CR/LF, as `(start, end)`.
+    fn quoted_name(title: &[u8]) -> Option<(usize, usize)> {
+        let mut i = 0;
+        while i < title.len() {
+            if title[i] != b'"' {
+                i += 1;
+                continue;
+            }
+            let start = i + 1;
+            let mut j = start;
+            while j < title.len() && !matches!(title[j], b'"' | b'\r' | b'\n') {
+                j += 1;
+            }
+            if j < title.len() && title[j] == b'"' && j > start {
+                return Some((start, j));
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// `"([^"]+)"`: the first non-empty quoted name, as `(start, end)`.
+    fn quoted_any(title: &[u8]) -> Option<(usize, usize)> {
+        let mut i = title.iter().position(|c| *c == b'"')?;
+        loop {
+            let close = i + 1 + title[i + 1..].iter().position(|c| *c == b'"')?;
+            if close > i + 1 {
+                return Some((i + 1, close));
+            }
+            i = close;
+        }
+    }
+
+    /// `(?:$|[ ")-])` at `at`; `$` also matches before a final newline.
+    fn volume_end(name: &[u8], at: usize) -> bool {
+        at == name.len()
+            || (at + 1 == name.len() && name[at] == b'\n')
+            || matches!(name[at], b' ' | b'"' | b')' | b'-')
+    }
+
+    /// `\.part(\d+)\.rar` + end at `p`, with the (int) part number.
+    fn part_rar(name: &[u8], p: usize) -> Option<i64> {
+        if !starts_with_ci(name, p, b".part") {
+            return None;
+        }
+        let digits = digit_run(name, p + 5);
+        let after = p + 5 + digits;
+        (digits > 0 && starts_with_ci(name, after, b".rar") && volume_end(name, after + 4))
+            .then(|| saturating_decimal(&name[p + 5..after]))
+    }
+
+    /// `\.rar` + end at `p`: the first volume.
+    fn plain_rar(name: &[u8], p: usize) -> Option<i64> {
+        (starts_with_ci(name, p, b".rar") && volume_end(name, p + 4)).then_some(0)
+    }
+
+    /// `\.r(\d{2,3})` + end at `p`: the old-style volume number plus one.
+    fn numbered_rar(name: &[u8], p: usize) -> Option<i64> {
+        if !starts_with_ci(name, p, b".r") {
+            return None;
+        }
+        let digits = digit_run(name, p + 2);
+        ((2..=3).contains(&digits) && volume_end(name, p + 2 + digits))
+            .then(|| saturating_decimal(&name[p + 2..p + 2 + digits]) + 1)
+    }
+
+    type Suffix = fn(&[u8], usize) -> Option<i64>;
+
+    /// `[^"\s\/]` excludes quotes, slashes and PCRE \s (space, \t, \n, \v, \f, \r).
+    fn volume_separator(c: u8) -> bool {
+        matches!(c, b'"' | b'/' | b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')
+    }
+
+    /// The greedy `(prefix)` + suffix match: `^(.+)` in a quoted name, otherwise the first
+    /// separator-free run holding a match, ending at its last suffix position.
+    fn volume_match(name: &[u8], quoted: bool, suffix: Suffix) -> Option<(usize, usize, i64)> {
+        if quoted {
+            return (1..name.len())
+                .rev()
+                .find_map(|p| suffix(name, p).map(|order| (0, p, order)));
+        }
+        let mut start = 0;
+        while start < name.len() {
+            if volume_separator(name[start]) {
+                start += 1;
+                continue;
+            }
+            let mut end = start;
+            while end < name.len() && !volume_separator(name[end]) {
+                end += 1;
+            }
+            if let Some(found) = (start + 1..end)
+                .rev()
+                .find_map(|p| suffix(name, p).map(|order| (start, p, order)))
+            {
+                return Some(found);
+            }
+            start = end;
+        }
+        None
+    }
+
+    /// `\.part0*(\d+)`: the first part number, saturating, or -1.
+    fn part_number(title: &[u8]) -> i64 {
+        (0..title.len())
+            .find(|&i| starts_with_ci(title, i, b".part") && digit_run(title, i + 5) > 0)
+            .map_or(-1, |i| {
+                saturating_decimal(&title[i + 5..i + 5 + digit_run(title, i + 5)])
+            })
+    }
+
+    /// `\.[a-z0-9]{2,4}$` on the trimmed (quoted) name.
+    fn has_extension(title: &[u8]) -> bool {
+        let name = quoted_any(title).map_or(title, |(s, e)| &title[s..e]);
+        let (_, name) = trim(name);
+        let alnum = name
+            .iter()
+            .rev()
+            .take(5)
+            .take_while(|c| c.is_ascii_alphanumeric())
+            .count();
+        (2..=4).contains(&alnum) && name.len() > alnum && name[name.len() - alnum - 1] == b'.'
+    }
+
+    /// `[flags, rar volume order or -1, rar set name offset << 32 | length in the raw title or
+    /// -1, first part number or -1]`.
+    fn archive_volume(fields: &[&[u8]], out: &mut [i64]) {
+        for (i, slot) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let title = fields[i];
+            let quoted = quoted_name(title);
+            let (base, name) = quoted.map_or((0, title), |(s, e)| (s, &title[s..e]));
+            let suffixes: [Suffix; 3] = [part_rar, plain_rar, numbered_rar];
+            let volume = suffixes
+                .iter()
+                .find_map(|suffix| volume_match(name, quoted.is_some(), *suffix));
+            let mut flags = 0;
+            if quoted.is_some() {
+                flags |= VOLUME_QUOTED;
+            }
+            if has_extension(title) {
+                flags |= VOLUME_EXTENSION;
+            }
+            let (order, span) = match volume {
+                Some((start, end, order)) => {
+                    flags |= VOLUME_RAR;
+                    (order, span_word(base + start, end - start))
+                }
+                None => (-1, -1),
+            };
+            *slot = [flags, order, span, part_number(title)];
+        }
+    }
+
+    // -------------------------------------------------------------------------------------
+    // ArchiveExtractionService
+    // -------------------------------------------------------------------------------------
+
+    const ENTRY_EMPTY: i64 = 1;
+    const ENTRY_ABSOLUTE: i64 = 2;
+    const ENTRY_TRAVERSAL: i64 = 4;
+    const ENTRY_NUL: i64 = 8;
+    const ENTRY_EXECUTABLE: i64 = 16;
+    const ENTRY_ARCHIVE: i64 = 32;
+    const ENTRY_NFO: i64 = 64;
+
+    const EXECUTABLE_EXTENSIONS: [&[u8]; 12] = [
+        b"bat", b"cmd", b"com", b"cpl", b"exe", b"jar", b"js", b"msi", b"ps1", b"scr", b"sh",
+        b"vbs",
+    ];
+
+    /// `[flags, base name offset << 32 | length]`.
+    fn extracted_entry(fields: &[&[u8]], out: &mut [i64]) {
+        for (i, slot) in out.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+            let path = fields[i];
+            if path.is_empty() {
+                *slot = [ENTRY_EMPTY, 0];
+                continue;
+            }
+            let mut flags = 0;
+            if matches!(path[0], b'/' | b'\\') {
+                flags |= ENTRY_ABSOLUTE;
+            }
+            if path
+                .split(|c| matches!(c, b'/' | b'\\'))
+                .any(|s| s == b"..")
+            {
+                flags |= ENTRY_TRAVERSAL;
+            }
+            if path.contains(&0) {
+                flags |= ENTRY_NUL;
+            }
+            let (at, base) = base_name(path);
+            let ext = extension(base);
+            if EXECUTABLE_EXTENSIONS
+                .iter()
+                .any(|e| ext.eq_ignore_ascii_case(e))
+            {
+                flags |= ENTRY_EXECUTABLE;
+            }
+            if ext.eq_ignore_ascii_case(b"rar")
+                || ext.eq_ignore_ascii_case(b"zip")
+                || ext.eq_ignore_ascii_case(b"7z")
+                || (ext.len() == 3
+                    && ext[0].eq_ignore_ascii_case(&b'r')
+                    && ext[1..].iter().all(u8::is_ascii_digit))
+                || (ext.len() == 3 && ext.iter().all(u8::is_ascii_digit))
+            {
+                flags |= ENTRY_ARCHIVE;
+            }
+            if [&b"nfo"[..], b"diz", b"inf"]
+                .iter()
+                .any(|e| ext.eq_ignore_ascii_case(e))
+            {
+                flags |= ENTRY_NFO;
+            }
+            *slot = [flags, span_word(at, base.len())];
+        }
+    }
+
+    // -------------------------------------------------------------------------------------
+    // ProcessingConfiguration
+    // -------------------------------------------------------------------------------------
+
+    const LIMITS: usize = 14;
+
+    /// normalizeLimitsPhp() per snapshot, then a mask of the limits it changed.
+    fn limit_snapshot(b: &Batch<'_>, out: &mut [i64]) {
+        for (i, slot) in out.as_chunks_mut::<15>().0.iter_mut().enumerate() {
+            let raw: [i64; LIMITS] = std::array::from_fn(|k| b.int(i, k));
+            let normalized = [
+                raw[0].max(0),
+                raw[1].clamp(1, 50),
+                raw[2].clamp(11, 200),
+                raw[3].max(1),
+                raw[4].max(0),
+                raw[5].max(0),
+                raw[6].max(1_048_576),
+                raw[7].max(262_144),
+                raw[8].max(0),
+                raw[9].max(1_048_576),
+                raw[10].max(0),
+                raw[11].max(1),
+                raw[12].clamp(1, 10),
+                raw[13].max(1),
+            ];
+            let mut mask = 0;
+            for k in 0..LIMITS {
+                slot[k] = normalized[k];
+                if normalized[k] != raw[k] {
+                    mask |= 1 << k;
+                }
+            }
+            slot[LIMITS] = mask;
+        }
+    }
+
+    // -------------------------------------------------------------------------------------
+    // ConsoleOutputService
+    // -------------------------------------------------------------------------------------
+
+    const LINE_BLANK: i64 = 1;
+    const LINE_ANSI: i64 = 2;
+    const LINE_CARRIAGE: i64 = 4;
+    const LINE_NEWLINE_END: i64 = 8;
+    const LINE_ERROR: i64 = 16;
+    const LINE_WARNING: i64 = 32;
+
+    /// Length of the CSI sequence `\x1b\[[0-9;?]*[ -\/]*[@-~]` at `at`, or 0.
+    fn csi_len(line: &[u8], at: usize) -> usize {
+        if line.get(at..at + 2) != Some(b"\x1b[") {
+            return 0;
+        }
+        let mut j = at + 2;
+        while j < line.len() && matches!(line[j], b'0'..=b'9' | b';' | b'?') {
+            j += 1;
+        }
+        while j < line.len() && matches!(line[j], b' '..=b'/') {
+            j += 1;
+        }
+        if j < line.len() && matches!(line[j], b'@'..=b'~') {
+            j + 1 - at
+        } else {
+            0
+        }
+    }
+
+    /// `[flags, visible bytes after stripping CSI sequences, newline count]`.
+    fn console_line(fields: &[&[u8]], out: &mut [i64]) {
+        for (i, slot) in out.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+            let line = fields[i];
+            let mut visible = line.len();
+            let mut escapes = false;
+            let mut at = 0;
+            while let Some(pos) = find_byte(line, at, 0x1b, 0) {
+                let len = csi_len(line, pos);
+                if len == 0 {
+                    at = pos + 1;
+                } else {
+                    escapes = true;
+                    visible -= len;
+                    at = pos + len;
+                }
+            }
+            let mut flags = 0;
+            if trim(line).1.is_empty() {
+                flags |= LINE_BLANK;
+            }
+            if escapes {
+                flags |= LINE_ANSI;
+            }
+            if find_byte(line, 0, b'\r', 0).is_some() {
+                flags |= LINE_CARRIAGE;
+            }
+            if line.last() == Some(&b'\n') {
+                flags |= LINE_NEWLINE_END;
+            }
+            if contains_folded(line, b"error") {
+                flags |= LINE_ERROR;
+            }
+            if contains_folded(line, b"warn") {
+                flags |= LINE_WARNING;
+            }
+            let newlines = line.iter().filter(|c| **c == b'\n').count();
+            *slot = [flags, visible as i64, newlines as i64];
+        }
+    }
+
+    // -------------------------------------------------------------------------------------
+    // MediaExtractionService
+    // -------------------------------------------------------------------------------------
+
+    const TAG_VALID: i64 = 1;
+    const TAG_EMPTY: i64 = 2;
+    const TAG_INVALID_UTF8: i64 = 4;
+    const TAG_CONTROL: i64 = 8;
+
+    /// The first `(?:19|20)\d\d` year, as audioReleaseTitlePhp() reads a date, or -1.
+    fn first_century_year(value: &[u8]) -> i64 {
+        value
+            .windows(4)
+            .find(|w| {
+                matches!(&w[..2], b"19" | b"20") && w[2].is_ascii_digit() && w[3].is_ascii_digit()
+            })
+            .map_or(-1, |w| {
+                w.iter().fold(0, |year, d| year * 10 + i64::from(d - b'0'))
+            })
+    }
+
+    /// `[flags, trimmed offset << 32 | length, UTF-8 characters in the trimmed text or -1 when
+    /// it is invalid, first (?:19|20)\d\d year in the raw value or -1]`, as audioTagTextPhp()
+    /// on a string.
+    fn audio_tag(fields: &[&[u8]], out: &mut [i64]) {
+        for (i, slot) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let (offset, text) = trim(fields[i]);
+            let mut flags = 0;
+            if text.is_empty() {
+                flags |= TAG_EMPTY;
+            }
+            let chars = if std::str::from_utf8(text).is_ok() {
+                text.iter().filter(|c| (**c as i8) >= -0x40).count() as i64
+            } else {
+                flags |= TAG_INVALID_UTF8;
+                -1
+            };
+            if text.iter().any(|c| *c < 0x20 || *c == 0x7f) {
+                flags |= TAG_CONTROL;
+            }
+            if flags == 0 {
+                flags = TAG_VALID;
+            }
+            *slot = [
+                flags,
+                span_word(offset, text.len()),
+                chars,
+                first_century_year(fields[i]),
+            ];
+        }
+    }
+
+    macro_rules! export {
+        ($name:ident, $cols:literal, $head:literal, $per:literal, $words:literal, $body:ident) => {
+            /// # Safety
+            ///
+            /// `text` must point to `text_len` readable bytes, `ints` to `ints_len`
+            /// readable bytes and `out` to `out_cap` writable, aligned int64 words that
+            /// overlap neither input; null pointers are accepted only with zero lengths.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                text: *const u8,
+                text_len: usize,
+                ints: *const u8,
+                ints_len: usize,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                let shape = Shape {
+                    cols: $cols,
+                    head: $head,
+                    per: $per,
+                    words: $words,
+                };
+                unsafe {
+                    run(
+                        text, text_len, ints, ints_len, count, out, out_cap, shape, $body,
+                    )
+                }
+            }
+        };
+    }
+
+    macro_rules! export_text {
+        ($name:ident, $words:literal, $body:ident) => {
+            /// # Safety
+            ///
+            /// `text` must point to `text_len` readable bytes, `twin` to `twin_len` readable
+            /// bytes (empty, or the 0x01-joined twin of `text`) and `out` to `out_cap`
+            /// writable, aligned int64 words that overlap neither input; null pointers are
+            /// accepted only with zero lengths.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                text: *const u8,
+                text_len: usize,
+                twin: *const u8,
+                twin_len: usize,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                unsafe {
+                    run_text(
+                        text, text_len, twin, twin_len, count, out, out_cap, $words, $body,
+                    )
+                }
+            }
+        };
+    }
+
+    export_text!(nntmux_w524_archive_volume_batch, 4, archive_volume);
+    export_text!(nntmux_w524_extracted_entry_batch, 2, extracted_entry);
+    export!(
+        nntmux_w524_limit_snapshot_batch,
+        0,
+        0,
+        14,
+        15,
+        limit_snapshot
+    );
+    export_text!(nntmux_w524_console_line_batch, 3, console_line);
+    export_text!(nntmux_w524_audio_tag_batch, 4, audio_tag);
+}
+
+#[cfg(test)]
+mod w524_tests {
+    use super::w524_batch::*;
+
+    type Export =
+        unsafe extern "C" fn(*const u8, usize, *const u8, usize, usize, *mut i64, usize) -> isize;
+
+    fn ints(values: &[i64]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn call(export: Export, text: &[u8], ints: &[u8], count: usize, out: &mut [i64]) -> isize {
+        unsafe {
+            export(
+                text.as_ptr(),
+                text.len(),
+                ints.as_ptr(),
+                ints.len(),
+                count,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        }
+    }
+
+    fn texts(export: Export, values: &[&[u8]], per: usize) -> Vec<i64> {
+        let text = values.join(&0u8);
+        let mut out = vec![i64::MIN; values.len() * per];
+        assert_eq!(
+            call(export, &text, &[], values.len(), &mut out),
+            (values.len() * per) as isize
+        );
+        out
+    }
+
+    fn span(offset: i64, len: i64) -> i64 {
+        (offset << 32) | len
+    }
+
+    #[test]
+    fn w524_archive_volume_hand_cases() {
+        let titles: [&[u8]; 12] = [
+            b"Show.S01E01.part01.rar yEnc (1/50)",
+            b"[1/9] - \"Show.S01E01.PART02.RAR\" yEnc (1/50)",
+            b"Movie.2024.rar",
+            b"Movie.2024.r00 yEnc",
+            b"Movie.2024.r1234",
+            b"\"name.r17\"",
+            b"a b.part3.rar",
+            b"x/y.rar\n",
+            b"\"\" Movie.mkv",
+            b"Show.part007.mkv",
+            b"\"broken\nname.rar\" z.rar",
+            b"",
+        ];
+        let out = texts(nntmux_w524_archive_volume_batch, &titles, 4);
+        let expected: [[i64; 4]; 12] = [
+            [1, 1, span(0, 11), 1],
+            [1 | 2 | 4, 2, span(9, 11), 2],
+            [1 | 4, 0, span(0, 10), -1],
+            [1, 1, span(0, 10), -1],
+            [0, -1, -1, -1],
+            [1 | 2 | 4, 18, span(1, 4), -1],
+            [1 | 4, 3, span(2, 1), 3],
+            [1 | 4, 0, span(2, 1), -1],
+            [4, -1, -1, -1],
+            [4, -1, -1, 7],
+            [1 | 4, 0, span(8, 4), -1],
+            [0, -1, -1, -1],
+        ];
+        for (i, want) in expected.iter().enumerate() {
+            assert_eq!(&out[i * 4..i * 4 + 4], want, "title {i}");
+        }
+    }
+
+    #[test]
+    fn w524_extracted_entry_hand_cases() {
+        let paths: [&[u8]; 8] = [
+            b"Movie/movie.mkv",
+            b"/etc/passwd",
+            b"a\\..\\b.EXE",
+            b"inner.part01.RAR",
+            b"group.nfo",
+            b"x.r05",
+            b"",
+            b"dir/",
+        ];
+        let out = texts(nntmux_w524_extracted_entry_batch, &paths, 2);
+        assert_eq!(
+            out,
+            vec![
+                0,
+                span(6, 9),
+                2,
+                span(5, 6),
+                4 | 16,
+                span(5, 5),
+                32,
+                span(0, 16),
+                64,
+                span(0, 9),
+                32,
+                span(0, 5),
+                1,
+                0,
+                0,
+                span(4, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn w524_limit_snapshot_hand_cases() {
+        let mut raw = vec![
+            3, 3, 30, 2, 2, 16, 2_000_000, 300_000, 0, 2_000_000, 30, 30, 4, 1,
+        ];
+        raw.extend([-1, 99, 5, 0, -5, -1, 0, 0, -1, 0, -1, 0, 99, i64::MIN]);
+        let mut out = vec![i64::MIN; 30];
+        assert_eq!(
+            call(
+                nntmux_w524_limit_snapshot_batch,
+                &[],
+                &ints(&raw),
+                2,
+                &mut out
+            ),
+            30
+        );
+        assert_eq!(
+            &out[..15],
+            &[
+                raw[0], 3, 30, 2, 2, 16, 2_000_000, 300_000, 0, 2_000_000, 30, 30, 4, 1, 0
+            ]
+        );
+        assert_eq!(
+            &out[15..],
+            &[
+                0, 50, 11, 1, 0, 0, 1_048_576, 262_144, 0, 1_048_576, 0, 1, 10, 1, 0x3fff
+            ]
+        );
+    }
+
+    #[test]
+    fn w524_console_line_hand_cases() {
+        let lines: [&[u8]; 6] = [
+            b"\x1b[1;31mError\x1b[0m: broken\n",
+            b"\x1b[ no final \x1b",
+            b"progress 10%\r",
+            b" \t ",
+            b"Warning\nsecond\n",
+            b"",
+        ];
+        let out = texts(nntmux_w524_console_line_batch, &lines, 3);
+        assert_eq!(
+            out,
+            vec![
+                2 | 8 | 16,
+                14,
+                1,
+                2,
+                9,
+                0,
+                4,
+                13,
+                0,
+                1,
+                3,
+                0,
+                8 | 32,
+                15,
+                2,
+                1,
+                0,
+                0,
+            ]
+        );
+    }
+
+    #[test]
+    fn w524_audio_tag_hand_cases() {
+        let tags: [&[u8]; 6] = [
+            b"  Artist Name \n",
+            b"caf\xc3\xa9",
+            b"bad\xc3",
+            b"tab\tinside",
+            b" \x0b ",
+            b"\xed\xa0\x80",
+        ];
+        let out = texts(nntmux_w524_audio_tag_batch, &tags, 4);
+        assert_eq!(
+            out,
+            vec![
+                1,
+                span(2, 11),
+                11,
+                -1,
+                1,
+                span(0, 5),
+                4,
+                -1,
+                4,
+                span(0, 4),
+                -1,
+                -1,
+                8,
+                span(0, 10),
+                10,
+                -1,
+                2,
+                span(3, 0),
+                0,
+                -1,
+                4,
+                span(0, 3),
+                -1,
+                -1
+            ]
+        );
+        let dates: [&[u8]; 5] = [
+            b"1999-01-01",
+            b"c. 18992021",
+            b"2001",
+            b"\xff20\x0112",
+            b"205x 1987",
+        ];
+        let out = texts(nntmux_w524_audio_tag_batch, &dates, 4);
+        let years: Vec<i64> = out.as_chunks::<4>().0.iter().map(|w| w[3]).collect();
+        assert_eq!(years, vec![1999, 2021, 2001, -1, 1987]);
+    }
+
+    const EXPORTS: [(Export, usize, usize, usize); 5] = [
+        (nntmux_w524_archive_volume_batch, 1, 0, 4),
+        (nntmux_w524_extracted_entry_batch, 1, 0, 2),
+        (nntmux_w524_limit_snapshot_batch, 0, 14, 15),
+        (nntmux_w524_console_line_batch, 1, 0, 3),
+        (nntmux_w524_audio_tag_batch, 1, 0, 4),
+    ];
+
+    #[test]
+    fn w524_raw_export_contract() {
+        for (export, cols, per, words) in EXPORTS {
+            let text: Vec<u8> = if cols == 1 {
+                b"a\0b".to_vec()
+            } else {
+                Vec::new()
+            };
+            let values = ints(&vec![7; per * 2]);
+            let mut out = vec![i64::MIN; 2 * words];
+            // Null output, and null inputs with non-zero lengths, are rejected.
+            unsafe {
+                assert_eq!(
+                    export(
+                        text.as_ptr(),
+                        text.len(),
+                        values.as_ptr(),
+                        values.len(),
+                        2,
+                        std::ptr::null_mut(),
+                        8
+                    ),
+                    -1
+                );
+                if cols == 1 {
+                    assert_eq!(
+                        export(
+                            std::ptr::null(),
+                            3,
+                            values.as_ptr(),
+                            values.len(),
+                            2,
+                            out.as_mut_ptr(),
+                            out.len()
+                        ),
+                        -1
+                    );
+                }
+                if per > 0 {
+                    assert_eq!(
+                        export(
+                            text.as_ptr(),
+                            text.len(),
+                            std::ptr::null(),
+                            values.len(),
+                            2,
+                            out.as_mut_ptr(),
+                            out.len()
+                        ),
+                        -1
+                    );
+                }
+                // Empty batches accept null inputs.
+                assert_eq!(
+                    export(
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                        0,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    0
+                );
+            }
+            assert!(out.iter().all(|w| *w == i64::MIN));
+            // Field and int counts must match the record count.
+            if cols == 1 {
+                assert_eq!(call(export, b"a\0b\0c", &values, 2, &mut out), -1);
+                assert_eq!(call(export, b"a", &values, 2, &mut out), -1);
+            }
+            if per > 0 {
+                assert_eq!(call(export, &text, &values[8..], 2, &mut out), -1);
+            }
+            // Short output reports the needed words without writing.
+            let mut short = vec![i64::MIN; 2 * words - 1];
+            assert_eq!(
+                call(export, &text, &values, 2, &mut short),
+                -((2 * words) as isize)
+            );
+            assert!(short.iter().all(|w| *w == i64::MIN));
+            assert_eq!(
+                call(export, &text, &values, 2, &mut out),
+                (2 * words) as isize
+            );
+        }
+    }
+
+    fn twin(values: &[&[u8]]) -> (Vec<u8>, Vec<u8>) {
+        (values.join(&0u8), values.join(&1u8))
+    }
+
+    #[test]
+    fn w524_twin_encoded_values_carry_nul() {
+        let values: [&[u8]; 4] = [b"a\0b/x.EXE", b"\0", b"\x01", b" ta\0g\x01\0 xxxxxxxxxxxxx"];
+        let (text, pair) = twin(&values);
+        for (export, _, per, words) in EXPORTS {
+            if per > 0 {
+                continue;
+            }
+            let mut out = vec![i64::MIN; 4 * words];
+            assert_eq!(
+                call(export, &text, &pair, 4, &mut out),
+                (4 * words) as isize
+            );
+            // Without NUL bytes both encodings agree.
+            let plain: [&[u8]; 3] = [b"Movie.part01.rar", b"x/y.nfo", b"\x1b[1mBold"];
+            let (joined, joined_twin) = twin(&plain);
+            let mut paired = vec![i64::MIN; 3 * words];
+            assert_eq!(
+                call(export, &joined, &joined_twin, 3, &mut paired),
+                (3 * words) as isize
+            );
+            assert_eq!(paired, texts(export, &plain, words));
+            // The twin must match the text length, differ only at separators and agree
+            // with the record count.
+            let mut wrong = pair.clone();
+            wrong[0] = b'z';
+            assert_eq!(call(export, &text, &wrong, 4, &mut out), -1);
+            let mut flipped = pair.clone();
+            let sep = text.iter().zip(&pair).position(|(x, y)| x != y).unwrap();
+            flipped[sep] = 2;
+            assert_eq!(call(export, &text, &flipped, 4, &mut out), -1);
+            assert_eq!(call(export, &text, &pair[1..], 4, &mut out), -1);
+            assert_eq!(call(export, &text, &pair, 3, &mut out), -1);
+            assert_eq!(call(export, &text, &pair, 5, &mut out), -1);
+            unsafe {
+                assert_eq!(
+                    export(
+                        text.as_ptr(),
+                        text.len(),
+                        std::ptr::null(),
+                        pair.len(),
+                        4,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    -1
+                );
+            }
+        }
+        let mut out = vec![0; 8];
+        assert_eq!(
+            call(nntmux_w524_extracted_entry_batch, &text, &pair, 4, &mut out),
+            8
+        );
+        assert_eq!(out[0], 8 | 16);
+        assert_eq!(out[2], 8);
+        let mut out = vec![0; 16];
+        assert_eq!(
+            call(nntmux_w524_audio_tag_batch, &text, &pair, 4, &mut out),
+            16
+        );
+        assert_eq!(&out[8..], &[8, span(0, 1), 1, -1, 8, span(1, 20), 20, -1]);
+    }
+
+    #[test]
+    fn w524_console_scan_matches_naive_search() {
+        let lines: [&[u8]; 6] = [
+            b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxErRoR",
+            b"errorwarnERRORWARN\x1b[0m\x1b[0m\x1b[0m\x1b[0m\x1b[0m",
+            b"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeerro",
+            b"wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwar\rn",
+            b"E\xc5\xd2\xd2\xcf\xd2 no folded high bytes",
+            b"\x1b[1m\x1b\x1b[2m\r\n\n",
+        ];
+        let out = texts(nntmux_w524_console_line_batch, &lines, 3);
+        assert_eq!(
+            out,
+            vec![
+                16,
+                43,
+                0,
+                16 | 32 | 2,
+                18,
+                0,
+                0,
+                34,
+                0,
+                4,
+                35,
+                0,
+                0,
+                27,
+                0,
+                2 | 4 | 8,
+                4,
+                2
+            ]
+        );
+    }
+
+    #[test]
+    fn w524_long_inputs_stay_linear() {
+        let quotes = vec![b'"'; 200_000];
+        let mut seps = b"a".repeat(100_000);
+        seps.extend_from_slice(b".rar");
+        let titles: [&[u8]; 2] = [&quotes, &seps];
+        let out = texts(nntmux_w524_archive_volume_batch, &titles, 4);
+        assert_eq!(&out[..4], &[0, -1, -1, -1]);
+        assert_eq!(&out[4..], &[1 | 4, 0, span(0, 100_000), -1]);
+    }
+}
