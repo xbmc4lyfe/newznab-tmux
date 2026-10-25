@@ -43,6 +43,16 @@ class NntmuxOffsetWorker extends Command
     private const GROUP_CONCAT_MAX_LEN = 65535;
 
     /**
+     * Rust stays opt-in: the FFI round trip is slower than the PHP helper (< 1.5x); see
+     * tests/Unit/RustSearchIndexOffsetWorkerCommandParityTest.php.
+     */
+    public const bool RUST_FFI_DEFAULT = false;
+
+    private const int DEFAULT_BATCH_SIZE = 10000;
+
+    private static ?bool $useRustFfi = null;
+
+    /**
      * Execute the console command.
      */
     public function handle(): int
@@ -341,5 +351,91 @@ class NntmuxOffsetWorker extends Command
     private function getSelectedIndex(): ?string
     {
         return $this->option('releases') ? 'releases' : ($this->option('predb') ? 'predb' : null);
+    }
+
+    public static function useRustFfi(?bool $use = true): void
+    {
+        self::$useRustFfi = $use;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? self::RUST_FFI_DEFAULT;
+    }
+
+    public static function resetRustFfi(): void
+    {
+        self::$useRustFfi = null;
+    }
+
+    /**
+     * Plans a worker run from its CLI options without touching the database: the engine and index
+     * follow getSelectedEngine()/getSelectedIndex() precedence, negative offset, limit and worker ID
+     * clamp to zero, a non-positive batch size falls back to 10000 and the end offset saturates at
+     * PHP_INT_MAX. Batches use integer ceil division; the last batch is the remainder or a full batch.
+     *
+     * @return array{valid: bool, engine: ?string, index: ?string, offset: int, limit: int, end_offset: int, worker_id: int, batch_size: int, batches: int, last_batch: int, start_message: string}
+     */
+    public static function planWorkerRun(bool $manticore, bool $elastic, bool $releases, bool $predb, int $offset, int $limit, int $workerId = 0, int $batchSize = self::DEFAULT_BATCH_SIZE): array
+    {
+        return self::usesRustFfi()
+            ? self::planWorkerRunNative($manticore, $elastic, $releases, $predb, $offset, $limit, $workerId, $batchSize)
+            : self::planWorkerRunPhp($manticore, $elastic, $releases, $predb, $offset, $limit, $workerId, $batchSize);
+    }
+
+    /**
+     * @return array{valid: bool, engine: ?string, index: ?string, offset: int, limit: int, end_offset: int, worker_id: int, batch_size: int, batches: int, last_batch: int, start_message: string}
+     */
+    private static function planWorkerRunNative(bool $manticore, bool $elastic, bool $releases, bool $predb, int $offset, int $limit, int $workerId, int $batchSize): array
+    {
+        $fields = NntmuxPopulateSearchIndexes::evaluateNative(4, [
+            $manticore ? '1' : '0', $elastic ? '1' : '0', $releases ? '1' : '0', $predb ? '1' : '0',
+            (string) $offset, (string) $limit, (string) $workerId, (string) $batchSize,
+        ]);
+        if ($fields === null || \count($fields) !== 13) {
+            return self::planWorkerRunPhp($manticore, $elastic, $releases, $predb, $offset, $limit, $workerId, $batchSize);
+        }
+
+        return [
+            'valid' => $fields[0] === '1',
+            'engine' => $fields[1] === '1' ? $fields[2] : null,
+            'index' => $fields[3] === '1' ? $fields[4] : null,
+            'offset' => (int) $fields[5],
+            'limit' => (int) $fields[6],
+            'end_offset' => (int) $fields[7],
+            'worker_id' => (int) $fields[8],
+            'batch_size' => (int) $fields[9],
+            'batches' => (int) $fields[10],
+            'last_batch' => (int) $fields[11],
+            'start_message' => $fields[12],
+        ];
+    }
+
+    /**
+     * @return array{valid: bool, engine: ?string, index: ?string, offset: int, limit: int, end_offset: int, worker_id: int, batch_size: int, batches: int, last_batch: int, start_message: string}
+     */
+    private static function planWorkerRunPhp(bool $manticore, bool $elastic, bool $releases, bool $predb, int $offset, int $limit, int $workerId, int $batchSize): array
+    {
+        $engine = $manticore ? 'manticore' : ($elastic ? 'elastic' : null);
+        $index = $releases ? 'releases' : ($predb ? 'predb' : null);
+        $offset = max(0, $offset);
+        $limit = max(0, $limit);
+        $workerId = max(0, $workerId);
+        $batchSize = $batchSize > 0 ? $batchSize : self::DEFAULT_BATCH_SIZE;
+        $remainder = $limit % $batchSize;
+
+        return [
+            'valid' => $engine !== null && $index !== null,
+            'engine' => $engine,
+            'index' => $index,
+            'offset' => $offset,
+            'limit' => $limit,
+            'end_offset' => $limit > PHP_INT_MAX - $offset ? PHP_INT_MAX : $offset + $limit,
+            'worker_id' => $workerId,
+            'batch_size' => $batchSize,
+            'batches' => intdiv($limit, $batchSize) + ($remainder !== 0 ? 1 : 0),
+            'last_batch' => $limit === 0 ? 0 : ($remainder !== 0 ? $remainder : $batchSize),
+            'start_message' => "Worker {$workerId} starting: processing {$limit} records from offset {$offset}",
+        ];
     }
 }
