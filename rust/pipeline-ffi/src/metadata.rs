@@ -34569,3 +34569,556 @@ pub mod tv_subtitle_steam_password_models {
         }
     }
 }
+/// Wave 34.4: lookup dispatch plans for the `BooksProcessor`, `ConsolesProcessor`,
+/// `GamesProcessor`, `MoviesProcessor` and `MusicProcessor` post-processing stages.
+///
+/// The export resolves the lookup mode (an explicit `MoviesProcessor` override follows PHP
+/// `is_numeric()` + `(int)` semantics), the dispatch gate, the echo configuration and a
+/// one-line dispatch summary. Output is `dispatch\x1Fmode\x1Fecho\x1Fsource\x1Fsummary` with
+/// booleans as `1`/`0`. Malformed arguments decline with `-1` so PHP keeps its own
+/// implementation; `-2` asks the caller for the configured default lookup value, and a
+/// too-small buffer returns `-(required)`, which is always below `-2`.
+pub mod media_catalogue_processors {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+    const DECLINE: isize = -1;
+    const NEED_DEFAULT: isize = -2;
+    const FIELD_SEP: u8 = 0x1F;
+
+    pub const PROCESSOR_BOOKS: u32 = 1;
+    pub const PROCESSOR_CONSOLES: u32 = 2;
+    pub const PROCESSOR_GAMES: u32 = 3;
+    pub const PROCESSOR_MOVIES: u32 = 4;
+    pub const PROCESSOR_MUSIC: u32 = 5;
+
+    const OVERRIDE_NONE: u32 = 0;
+    const OVERRIDE_INT: u32 = 1;
+    const OVERRIDE_STRING: u32 = 2;
+
+    /// Explicit lookup mode argument (`MoviesProcessor::process()` `$processMovies`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Override<'a> {
+        None,
+        Int(i64),
+        Text(&'a [u8]),
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Plan {
+        pub dispatch: bool,
+        pub mode: i64,
+        pub echo: bool,
+        pub from_override: bool,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum PlanError {
+        Decline,
+        NeedDefault,
+    }
+
+    fn label(processor: u32) -> Option<&'static str> {
+        match processor {
+            PROCESSOR_BOOKS => Some("Books"),
+            PROCESSOR_CONSOLES => Some("Consoles"),
+            PROCESSOR_GAMES => Some("Games"),
+            PROCESSOR_MOVIES => Some("Movies"),
+            PROCESSOR_MUSIC => Some("Music"),
+            _ => None,
+        }
+    }
+
+    /// PHP numeric-string whitespace: `" \t\n\r\v\f"`.
+    fn is_php_ws(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C)
+    }
+
+    fn count_digits(bytes: &[u8], from: usize) -> usize {
+        bytes[from..]
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count()
+    }
+
+    /// PHP `zend_dval_to_lval_cap()`: non-finite is 0, out-of-range saturates.
+    fn php_double_to_int(value: f64) -> i64 {
+        const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
+        if !value.is_finite() {
+            0
+        } else if value >= TWO_POW_63 {
+            i64::MAX
+        } else if value < -TWO_POW_63 {
+            i64::MIN
+        } else {
+            value as i64
+        }
+    }
+
+    /// PHP 8 `is_numeric($text) ? (int) $text : null` for a string.
+    pub fn php_numeric_int(text: &[u8]) -> Option<i64> {
+        let start = text.iter().position(|&b| !is_php_ws(b))?;
+        let end = text.iter().rposition(|&b| !is_php_ws(b))? + 1;
+        let core = &text[start..end];
+
+        let mut pos = usize::from(matches!(core.first(), Some(b'+' | b'-')));
+        let int_digits = count_digits(core, pos);
+        pos += int_digits;
+        let mut is_integer = true;
+        let mut frac_digits = 0;
+        if core.get(pos) == Some(&b'.') {
+            is_integer = false;
+            frac_digits = count_digits(core, pos + 1);
+            pos += 1 + frac_digits;
+        }
+        if int_digits == 0 && frac_digits == 0 {
+            return None;
+        }
+        if matches!(core.get(pos), Some(b'e' | b'E')) {
+            let mut exp = pos + 1;
+            if matches!(core.get(exp), Some(b'+' | b'-')) {
+                exp += 1;
+            }
+            let exp_digits = count_digits(core, exp);
+            if exp_digits == 0 {
+                return None;
+            }
+            is_integer = false;
+            pos = exp + exp_digits;
+        }
+        if pos != core.len() {
+            return None;
+        }
+
+        // The grammar above only admits ASCII, so the core is valid UTF-8.
+        let core = std::str::from_utf8(core).ok()?;
+        if is_integer && let Ok(value) = core.parse::<i64>() {
+            return Some(value);
+        }
+        core.parse::<f64>().ok().map(php_double_to_int)
+    }
+
+    /// `{Books,Consoles,Games,Movies,Music}Processor::dispatchPlanPhp()`.
+    pub fn plan(
+        processor: u32,
+        override_value: Override<'_>,
+        default_lookup: Option<i64>,
+        echo: bool,
+    ) -> Result<Plan, PlanError> {
+        label(processor).ok_or(PlanError::Decline)?;
+        if processor != PROCESSOR_MOVIES {
+            if override_value != Override::None {
+                return Err(PlanError::Decline);
+            }
+            let mode = default_lookup.ok_or(PlanError::Decline)?;
+            return Ok(Plan {
+                dispatch: mode != 0,
+                mode,
+                echo,
+                from_override: false,
+            });
+        }
+
+        let explicit = match override_value {
+            Override::None => None,
+            Override::Int(value) => Some(value),
+            Override::Text(text) => php_numeric_int(text),
+        };
+        let mode = match explicit {
+            Some(value) => value,
+            None => default_lookup.ok_or(PlanError::NeedDefault)?,
+        };
+        Ok(Plan {
+            dispatch: mode > 0,
+            mode,
+            echo,
+            from_override: explicit.is_some(),
+        })
+    }
+
+    /// One-line dispatch summary, e.g. `Books lookup: mode=1 source=setting dispatch=yes echo=off`.
+    pub fn summary(processor: u32, plan: &Plan) -> Option<String> {
+        Some(format!(
+            "{} lookup: mode={} source={} dispatch={} echo={}",
+            label(processor)?,
+            plan.mode,
+            source(plan),
+            if plan.dispatch { "yes" } else { "no" },
+            if plan.echo { "on" } else { "off" },
+        ))
+    }
+
+    fn source(plan: &Plan) -> &'static str {
+        if plan.from_override {
+            "override"
+        } else {
+            "setting"
+        }
+    }
+
+    fn encode(processor: u32, plan: &Plan) -> Option<Vec<u8>> {
+        let summary = summary(processor, plan)?;
+        let mode = plan.mode.to_string();
+        let fields: [&[u8]; 5] = [
+            if plan.dispatch { b"1" } else { b"0" },
+            mode.as_bytes(),
+            if plan.echo { b"1" } else { b"0" },
+            source(plan).as_bytes(),
+            summary.as_bytes(),
+        ];
+        let mut out = Vec::with_capacity(fields.iter().map(|f| f.len() + 1).sum());
+        for (i, field) in fields.iter().enumerate() {
+            if i > 0 {
+                out.push(FIELD_SEP);
+            }
+            out.extend_from_slice(field);
+        }
+        Some(out)
+    }
+
+    fn flag(value: u32) -> Option<bool> {
+        match value {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+
+    unsafe fn override_arg<'a>(
+        kind: u32,
+        int_value: i64,
+        ptr: *const u8,
+        len: usize,
+    ) -> Option<Override<'a>> {
+        match kind {
+            OVERRIDE_NONE if int_value == 0 && len == 0 => Some(Override::None),
+            OVERRIDE_INT if len == 0 => Some(Override::Int(int_value)),
+            OVERRIDE_STRING
+                if int_value == 0
+                    && !ptr.is_null()
+                    && len <= MAX_INPUT
+                    && (ptr as usize).checked_add(len).is_some() =>
+            {
+                if len == 0 {
+                    Some(Override::Text(&[]))
+                } else {
+                    Some(Override::Text(unsafe { slice::from_raw_parts(ptr, len) }))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Lookup dispatch plan for the processor identified by `processor` (1-5).
+    ///
+    /// `override_kind` is 0 (none/null), 1 (`override_int`) or 2 (`override_ptr`/`override_len`
+    /// string); `has_default` and `echo_output` are 0/1 flags.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_w34_media_catalogue_processor_plan(
+        processor: u32,
+        override_kind: u32,
+        override_int: i64,
+        override_ptr: *const u8,
+        override_len: usize,
+        has_default: u32,
+        default_lookup: i64,
+        echo_output: u32,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out_buf.is_null()
+                || out_cap > isize::MAX as usize
+                || (out_buf as usize).checked_add(out_cap).is_none()
+            {
+                return DECLINE;
+            }
+            let (Some(has_default), Some(echo)) = (flag(has_default), flag(echo_output)) else {
+                return DECLINE;
+            };
+            let Some(override_value) =
+                (unsafe { override_arg(override_kind, override_int, override_ptr, override_len) })
+            else {
+                return DECLINE;
+            };
+            if !has_default && default_lookup != 0 {
+                return DECLINE;
+            }
+            let default = has_default.then_some(default_lookup);
+            let plan = match plan(processor, override_value, default, echo) {
+                Ok(plan) => plan,
+                Err(PlanError::NeedDefault) => return NEED_DEFAULT,
+                Err(PlanError::Decline) => return DECLINE,
+            };
+            let Some(bytes) = encode(processor, &plan) else {
+                return DECLINE;
+            };
+            if bytes.len() > out_cap {
+                return -(bytes.len() as isize);
+            }
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len()) };
+            bytes.len() as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[allow(clippy::too_many_arguments)]
+        fn call(
+            processor: u32,
+            kind: u32,
+            int_value: i64,
+            text: Option<&[u8]>,
+            has_default: u32,
+            default: i64,
+            echo: u32,
+        ) -> Result<String, isize> {
+            let (ptr, len) = text.map_or((std::ptr::null(), 0), |t| (t.as_ptr(), t.len()));
+            let mut buf = vec![0u8; 256];
+            let rc = unsafe {
+                nntmux_w34_media_catalogue_processor_plan(
+                    processor,
+                    kind,
+                    int_value,
+                    ptr,
+                    len,
+                    has_default,
+                    default,
+                    echo,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                )
+            };
+            if rc < 0 {
+                return Err(rc);
+            }
+            Ok(String::from_utf8(buf[..rc as usize].to_vec()).unwrap())
+        }
+
+        #[test]
+        fn numeric_strings_follow_php() {
+            let cases: &[(&str, Option<i64>)] = &[
+                ("1", Some(1)),
+                (" 1", Some(1)),
+                ("1 ", Some(1)),
+                ("\x0B1\x0C\n", Some(1)),
+                ("1e", None),
+                (".5", Some(0)),
+                ("5.", Some(5)),
+                ("+.5e-3", Some(0)),
+                ("\x001", None),
+                ("1_000", None),
+                ("0x1A", None),
+                ("-0", Some(0)),
+                ("  ", None),
+                ("", None),
+                (".", None),
+                ("+", None),
+                ("-", None),
+                ("1e+5", Some(100_000)),
+                ("-1.9", Some(-1)),
+                ("2.5e0", Some(2)),
+                ("9223372036854775807", Some(i64::MAX)),
+                ("9223372036854775808", Some(i64::MAX)),
+                ("-9223372036854775808", Some(i64::MIN)),
+                ("-9223372036854775809", Some(i64::MIN)),
+                ("00000000000000000000001", Some(1)),
+                ("1e1000", Some(0)),
+                ("-1e1000", Some(0)),
+                ("-9.3e18", Some(i64::MIN)),
+                ("9.2233720368547758e18", Some(i64::MAX)),
+                ("  +0012.7e1  ", Some(127)),
+                ("1 2", None),
+                ("abc", None),
+                ("١", None),
+                ("1\u{a0}", None),
+            ];
+            for (text, expected) in cases {
+                assert_eq!(php_numeric_int(text.as_bytes()), *expected, "{text:?}");
+            }
+        }
+
+        #[test]
+        fn plans_gate_lookup_modes() {
+            for processor in [
+                PROCESSOR_BOOKS,
+                PROCESSOR_CONSOLES,
+                PROCESSOR_GAMES,
+                PROCESSOR_MUSIC,
+            ] {
+                assert!(
+                    !plan(processor, Override::None, Some(0), false)
+                        .unwrap()
+                        .dispatch
+                );
+                assert!(
+                    plan(processor, Override::None, Some(2), true)
+                        .unwrap()
+                        .dispatch
+                );
+                assert!(
+                    plan(processor, Override::None, Some(-1), true)
+                        .unwrap()
+                        .dispatch
+                );
+                assert_eq!(
+                    plan(processor, Override::None, None, false),
+                    Err(PlanError::Decline)
+                );
+                assert_eq!(
+                    plan(processor, Override::Int(1), Some(1), false),
+                    Err(PlanError::Decline)
+                );
+            }
+            let movies = |o, d| plan(PROCESSOR_MOVIES, o, d, false);
+            assert_eq!(movies(Override::None, None), Err(PlanError::NeedDefault));
+            assert_eq!(
+                movies(Override::Text(b"abc"), None),
+                Err(PlanError::NeedDefault)
+            );
+            assert!(!movies(Override::Int(-1), None).unwrap().dispatch);
+            assert_eq!(movies(Override::Text(b" 2 "), None).unwrap().mode, 2);
+            assert!(movies(Override::Text(b""), Some(1)).unwrap().dispatch);
+            assert!(!movies(Override::Text(b"0.5"), Some(1)).unwrap().dispatch);
+            assert!(!movies(Override::None, Some(-3)).unwrap().dispatch);
+            assert_eq!(
+                plan(0, Override::None, Some(1), false),
+                Err(PlanError::Decline)
+            );
+            assert_eq!(
+                plan(6, Override::None, Some(1), false),
+                Err(PlanError::Decline)
+            );
+        }
+
+        #[test]
+        fn export_encodes_plans() {
+            assert_eq!(
+                call(PROCESSOR_BOOKS, 0, 0, None, 1, 1, 0),
+                Ok("1\x1F1\x1F0\x1Fsetting\x1FBooks lookup: mode=1 source=setting dispatch=yes echo=off".into())
+            );
+            assert_eq!(
+                call(PROCESSOR_MUSIC, 0, 0, None, 1, 0, 1),
+                Ok("0\x1F0\x1F1\x1Fsetting\x1FMusic lookup: mode=0 source=setting dispatch=no echo=on".into())
+            );
+            assert_eq!(
+                call(PROCESSOR_MOVIES, 2, 0, Some(b"2"), 0, 0, 0),
+                Ok("1\x1F2\x1F0\x1Foverride\x1FMovies lookup: mode=2 source=override dispatch=yes echo=off".into())
+            );
+            assert_eq!(
+                call(PROCESSOR_MOVIES, 1, i64::MIN, None, 0, 0, 1),
+                Ok(format!(
+                    "0\x1F{}\x1F1\x1Foverride\x1FMovies lookup: mode={} source=override dispatch=no echo=on",
+                    i64::MIN,
+                    i64::MIN
+                ))
+            );
+            assert_eq!(
+                call(PROCESSOR_MOVIES, 2, 0, Some(b"x"), 0, 0, 0),
+                Err(NEED_DEFAULT)
+            );
+            assert_eq!(
+                call(PROCESSOR_MOVIES, 0, 0, None, 0, 0, 0),
+                Err(NEED_DEFAULT)
+            );
+            assert!(
+                call(PROCESSOR_MOVIES, 2, 0, Some(b""), 1, 2, 0)
+                    .unwrap()
+                    .contains("source=setting")
+            );
+        }
+
+        #[test]
+        fn export_validates_arguments_and_capacity() {
+            // Unknown processor, override on a non-movie processor, bad flags and kinds.
+            assert_eq!(call(0, 0, 0, None, 1, 1, 0), Err(DECLINE));
+            assert_eq!(call(6, 0, 0, None, 1, 1, 0), Err(DECLINE));
+            assert_eq!(call(PROCESSOR_GAMES, 1, 1, None, 1, 1, 0), Err(DECLINE));
+            assert_eq!(call(PROCESSOR_GAMES, 0, 0, None, 0, 0, 0), Err(DECLINE));
+            assert_eq!(call(PROCESSOR_GAMES, 0, 0, None, 2, 1, 0), Err(DECLINE));
+            assert_eq!(call(PROCESSOR_GAMES, 0, 0, None, 1, 1, 2), Err(DECLINE));
+            assert_eq!(call(PROCESSOR_MOVIES, 3, 0, None, 1, 1, 0), Err(DECLINE));
+            assert_eq!(call(PROCESSOR_MOVIES, 0, 5, None, 1, 1, 0), Err(DECLINE));
+            assert_eq!(call(PROCESSOR_MOVIES, 2, 0, None, 1, 1, 0), Err(DECLINE));
+            assert_eq!(
+                call(PROCESSOR_MOVIES, 2, 7, Some(b"1"), 1, 1, 0),
+                Err(DECLINE)
+            );
+            assert_eq!(
+                call(PROCESSOR_MOVIES, 1, 1, Some(b"1"), 1, 1, 0),
+                Err(DECLINE)
+            );
+            assert_eq!(call(PROCESSOR_MOVIES, 0, 0, None, 0, 4, 0), Err(DECLINE));
+
+            let mut small = [b'Z'; 8];
+            let rc = unsafe {
+                nntmux_w34_media_catalogue_processor_plan(
+                    PROCESSOR_BOOKS,
+                    0,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    1,
+                    1,
+                    0,
+                    small.as_mut_ptr(),
+                    small.len(),
+                )
+            };
+            assert!(rc < NEED_DEFAULT);
+            assert_eq!(small, [b'Z'; 8]);
+            let mut exact = vec![0u8; (-rc) as usize];
+            let written = unsafe {
+                nntmux_w34_media_catalogue_processor_plan(
+                    PROCESSOR_BOOKS,
+                    0,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    1,
+                    1,
+                    0,
+                    exact.as_mut_ptr(),
+                    exact.len(),
+                )
+            };
+            assert_eq!(written, -rc);
+            let null_out = unsafe {
+                nntmux_w34_media_catalogue_processor_plan(
+                    PROCESSOR_BOOKS,
+                    0,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    1,
+                    1,
+                    0,
+                    std::ptr::null_mut(),
+                    64,
+                )
+            };
+            assert_eq!(null_out, DECLINE);
+            let text = b"1";
+            let too_long = unsafe {
+                nntmux_w34_media_catalogue_processor_plan(
+                    PROCESSOR_MOVIES,
+                    2,
+                    0,
+                    text.as_ptr(),
+                    MAX_INPUT + 1,
+                    1,
+                    1,
+                    0,
+                    exact.as_mut_ptr(),
+                    exact.len(),
+                )
+            };
+            assert_eq!(too_long, DECLINE);
+        }
+    }
+}
