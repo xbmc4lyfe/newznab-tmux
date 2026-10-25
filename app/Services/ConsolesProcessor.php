@@ -179,4 +179,172 @@ class ConsolesProcessor
 
         return self::$ffi === false ? null : self::$ffi;
     }
+
+    /** Enabled: paired common and uncommon mean/p99 gains all reach 1.5x (see the W41 parity test). */
+    public const bool W414_RUST_FFI_DEFAULT = true;
+
+    public const string W414_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w414_console_release_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private const array W414_SUMMARY_KEYS = ['total_releases', 'empty_title_count', 'platform_tagged_count', 'region_tagged_count', 'multi_language_count', 'dump_format_count', 'update_dlc_count'];
+
+    private const array W414_PLATFORM_TOKENS = ['NINTENDO' => true, 'SWITCH' => true, 'NSW' => true, 'WII' => true, 'WIIU' => true, 'NDS' => true, '3DS' => true, 'GBA' => true, 'NES' => true, 'SNES' => true, 'N64' => true, 'NGC' => true, 'GAMECUBE' => true, 'PSX' => true, 'PS1' => true, 'PS2' => true, 'PS3' => true, 'PS4' => true, 'PS5' => true, 'PSP' => true, 'PSV' => true, 'VITA' => true, 'XBOX' => true, 'X360' => true, 'XBOXONE' => true, 'XONE' => true, 'XSX' => true, 'DREAMCAST' => true, 'GENESIS' => true, 'MEGADRIVE' => true, 'SATURN' => true];
+
+    private const array W414_REGION_TOKENS = ['USA' => true, 'EUR' => true, 'EUROPE' => true, 'JPN' => true, 'JAP' => true, 'JAPAN' => true, 'PAL' => true, 'NTSC' => true, 'NTSCU' => true, 'NTSCJ' => true, 'ASIA' => true, 'KOR' => true, 'REGIONFREE' => true];
+
+    private const array W414_DUMP_TOKENS = ['ISO' => true, 'NSP' => true, 'XCI' => true, 'CIA' => true, 'WBFS' => true, 'RVZ' => true, 'CSO' => true, 'CHD' => true, 'PKG' => true, 'NSZ' => true, 'XCZ' => true];
+
+    private const array W414_UPDATE_TOKENS = ['UPDATE' => true, 'DLC' => true, 'PATCH' => true];
+
+    private static ?bool $w414UseRustFfi = null;
+
+    private static FFI|false|null $w414Ffi = null;
+
+    public static function useW414RustFfi(bool $enable = true): void
+    {
+        self::$w414UseRustFfi = $enable;
+    }
+
+    public static function usesW414RustFfi(): bool
+    {
+        return self::$w414UseRustFfi ?? self::W414_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW414RustFfi(): void
+    {
+        self::$w414UseRustFfi = null;
+        self::$w414Ffi = null;
+    }
+
+    /**
+     * Summarize console release titles by platform, region, MULTI<n>
+     * language, dump format and update/DLC/patch tokens.
+     * Titles come from strings, integers, or the searchname, name or title
+     * array field; other values (including objects) count as empty titles.
+     * Tokens are maximal ASCII alphanumeric runs compared case-insensitively.
+     *
+     * @param  array<array-key, mixed>  $releases
+     * @return array<string, int>
+     */
+    public static function summarizeConsoleReleaseBatch(array $releases): array
+    {
+        return self::usesW414RustFfi()
+            ? self::summarizeConsoleReleaseBatchNative($releases)
+            : self::summarizeConsoleReleaseBatchPhp($releases);
+    }
+
+    /**
+     * Rust summary; falls back to PHP when the library or input frame is unusable.
+     *
+     * @param  array<array-key, mixed>  $releases
+     * @return array<string, int>
+     */
+    public static function summarizeConsoleReleaseBatchNative(array $releases): array
+    {
+        return self::w414Call(self::w414Titles($releases)) ?? self::summarizeConsoleReleaseBatchPhp($releases);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $releases
+     * @return array<string, int>
+     */
+    public static function summarizeConsoleReleaseBatchPhp(array $releases): array
+    {
+        $summary = array_fill_keys(self::W414_SUMMARY_KEYS, 0);
+        foreach (self::w414Titles($releases) as $title) {
+            $summary['total_releases']++;
+            $title = trim($title);
+            if ($title === '') {
+                $summary['empty_title_count']++;
+
+                continue;
+            }
+            $found = [false, false, false, false, false];
+            foreach (preg_split('/[^A-Za-z0-9]+/', strtoupper($title), -1, PREG_SPLIT_NO_EMPTY) ?: [] as $token) {
+                $found[0] = $found[0] || isset(self::W414_PLATFORM_TOKENS[$token]);
+                $found[1] = $found[1] || isset(self::W414_REGION_TOKENS[$token]);
+                $found[2] = $found[2] || (str_starts_with($token, 'MULTI') && strspn($token, '0123456789', 5) === strlen($token) - 5);
+                $found[3] = $found[3] || isset(self::W414_DUMP_TOKENS[$token]);
+                $found[4] = $found[4] || isset(self::W414_UPDATE_TOKENS[$token]);
+            }
+            $summary['platform_tagged_count'] += (int) $found[0];
+            $summary['region_tagged_count'] += (int) $found[1];
+            $summary['multi_language_count'] += (int) $found[2];
+            $summary['dump_format_count'] += (int) $found[3];
+            $summary['update_dlc_count'] += (int) $found[4];
+        }
+
+        return $summary;
+    }
+
+    /** Only integer and string titles participate; objects are never cast or serialized.
+     *
+     * @param  array<array-key, mixed>  $input
+     * @return list<string>
+     */
+    private static function w414Titles(array $input): array
+    {
+        $titles = [];
+        foreach ($input as $item) {
+            if (is_array($item)) {
+                $item = $item['searchname'] ?? $item['name'] ?? $item['title'] ?? null;
+            }
+            $titles[] = is_string($item) || is_int($item) ? (string) $item : '';
+        }
+
+        return $titles;
+    }
+
+    /** @param list<string> $titles
+     * @return array<string, int>|null
+     */
+    private static function w414Call(array $titles): ?array
+    {
+        try {
+            $input = serialize([$titles]);
+            if (strlen($input) > 16777216) {
+                return null;
+            }
+            self::$w414Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w414', self::W414_FFI_CDEF) ?? false;
+            $ffi = self::$w414Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            $capacity = 0;
+            $out = RustPipelineLibrary::obtainScratch($ffi, 2048, $capacity);
+            if ($out === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound (Declared by W414_FFI_CDEF.)
+            $written = $ffi->nntmux_w414_console_release_batch($input, strlen($input), $out, $capacity);
+            if (is_int($written) && $written < -1 && $written >= -16777216) {
+                $out = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($out === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound (Declared by W414_FFI_CDEF.)
+                $written = $ffi->nntmux_w414_console_release_batch($input, strlen($input), $out, $capacity);
+            }
+            if (! is_int($written) || $written <= 0 || $written > $capacity || $written > 16777216) {
+                return null;
+            }
+            $result = @unserialize(FFI::string($out, $written), ['allowed_classes' => false]);
+            if (! is_array($result) || array_keys($result) !== self::W414_SUMMARY_KEYS || $result['total_releases'] !== count($titles)) {
+                return null;
+            }
+            $summary = [];
+            foreach (self::W414_SUMMARY_KEYS as $key) {
+                $value = $result[$key];
+                if (! is_int($value) || $value < 0 || $value > count($titles)) {
+                    return null;
+                }
+                $summary[$key] = $value;
+            }
+
+            return $summary;
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }
