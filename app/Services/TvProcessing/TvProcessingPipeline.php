@@ -15,6 +15,7 @@ use App\Services\TvProcessing\Pipes\TvdbPipe;
 use App\Services\TvProcessing\Pipes\TvMazePipe;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Pipeline\Pipeline;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Log;
@@ -58,6 +59,181 @@ class TvProcessingPipeline
         }
 
         return self::$ffi === false ? null : self::$ffi;
+    }
+
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean 2.21x, p99 2.06x; uncommon mean 2.08x, p99 1.81x); see RustTvCandidatePipelineTvMazeTvdbHydrationW50ParityTest. */
+    private const W50_RUST_FFI_DEFAULT = true;
+
+    public const string W50_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w503_tv_pipeline_result_tally_batch(const char *blob, size_t blob_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    private static ?bool $useW50RustFfi = null;
+
+    private static FFI|false|null $w50Ffi = null;
+
+    private static ?CData $w50Out = null;
+
+    private static int $w50OutCap = 0;
+
+    public static function usesW50RustFfi(): bool
+    {
+        return self::$useW50RustFfi ?? self::W50_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 50 Rust path forced on or off, then restores the previous setting. */
+    public static function withW50RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$useW50RustFfi;
+        self::$useW50RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$useW50RustFfi = $previous;
+        }
+    }
+
+    /**
+     * Tallies a batch of processRelease() results as updateStats() does. Four values per result:
+     * the bucket (0 matched, 1 episode missing, 2 not found, 3 deferred; see
+     * classifyResultStatusPhp()), the provider slot (first-seen index among matched providers, a
+     * missing or null provider reading as 'unknown'; -1 unless matched), the FNV-1a 32 key of the
+     * normalized title (lowercase alphanumeric runs joined by single spaces) and flags (1 video_id
+     * > 0, 2 episode_id > 0, 4 season pack). Then the processed count, the four bucket counts, the
+     * provider count, the distinct normalized matched-title count and the per-slot match counts.
+     *
+     * @param  list<array<string, mixed>>  $results  status, provider, title, video_id, episode_id
+     * @return list<int>
+     */
+    public static function w50ResultTallyBatch(array $results): array
+    {
+        return self::usesW50RustFfi() ? self::w50ResultTallyBatchNative($results) : self::w50ResultTallyBatchPhp($results);
+    }
+
+    /**
+     * @param  list<array<string, mixed>>  $results
+     * @return list<int>
+     */
+    public static function w50ResultTallyBatchNative(array $results): array
+    {
+        $count = \count($results);
+        $columns = self::w50Columns($results, ['status' => '', 'provider' => null, 'title' => '', 'video_id' => 0, 'episode_id' => 0]);
+        $nullProviders = array_keys($columns['provider'], null, true);
+        $blob = implode("\0", $columns['status'])."\0".implode("\0", $columns['provider'])."\0".implode("\0", $columns['title']);
+        $ints = pack('q*', \count($nullProviders), ...$nullProviders).pack('q*', ...$columns['video_id']).pack('q*', ...$columns['episode_id']);
+
+        return self::w50Invoke($count === 0 ? '' : $blob, $ints, $count)
+            ?? self::w50ResultTallyBatchPhp($results);
+    }
+
+    /**
+     * @param  list<array<string, mixed>>  $results
+     * @return list<int>
+     */
+    public static function w50ResultTallyBatchPhp(array $results): array
+    {
+        $out = [];
+        $buckets = ['matched' => 0, 'episode_missing' => 0, 'not_found' => 0, 'deferred' => 0];
+        $codes = ['matched' => 0, 'episode_missing' => 1, 'not_found' => 2, 'deferred' => 3];
+        $slots = [];
+        $slotCounts = [];
+        $titles = [];
+        foreach ($results as $result) {
+            $status = (string) ($result['status'] ?? '');
+            $bucket = self::classifyResultStatusPhp($status);
+            $buckets[$bucket]++;
+            $title = implode(' ', preg_split('/[^a-z0-9]+/', strtolower((string) ($result['title'] ?? '')), -1, PREG_SPLIT_NO_EMPTY) ?: []);
+            $slot = -1;
+            if ($bucket === 'matched') {
+                $provider = (string) ($result['provider'] ?? 'unknown');
+                if (! isset($slots[$provider])) {
+                    $slots[$provider] = \count($slotCounts);
+                    $slotCounts[] = 0;
+                }
+                $slot = $slots[$provider];
+                $slotCounts[$slot]++;
+                $titles[$title] = true;
+            }
+            array_push(
+                $out,
+                $codes[$bucket],
+                $slot,
+                (int) hexdec(hash('fnv1a32', $title)),
+                ((int) ($result['video_id'] ?? 0) > 0 ? 1 : 0) | ((int) ($result['episode_id'] ?? 0) > 0 ? 2 : 0)
+                    | ($status === TvProcessingResult::STATUS_SEASON_PACK ? 4 : 0),
+            );
+        }
+        array_push($out, \count($results), ...array_values($buckets));
+        array_push($out, \count($slotCounts), \count($titles), ...$slotCounts);
+
+        return $out;
+    }
+
+    /**
+     * One column per key of $defaults. Rows missing a key read its default; present nulls stay
+     * null, which pack() and implode() read as 0 and '' like the defaults they replace.
+     *
+     * @param  list<array<string, mixed>>  $rows
+     * @param  array<string, mixed>  $defaults
+     * @return array<string, list<mixed>>
+     */
+    private static function w50Columns(array $rows, array $defaults): array
+    {
+        $count = \count($rows);
+        $columns = [];
+        foreach ($defaults as $key => $default) {
+            $column = array_column($rows, $key);
+            if (\count($column) !== $count) {
+                $filled = [];
+                foreach ($rows as $row) {
+                    $filled[] = $row + $defaults;
+                }
+                $columns = [];
+                foreach ($defaults as $name => $unused) {
+                    $columns[$name] = array_column($filled, $name);
+                }
+
+                return $columns;
+            }
+            $columns[$key] = $column;
+        }
+
+        return $columns;
+    }
+
+    /**
+     * Calls the Wave 50 export with NUL-joined strings and packed `i64` integers. Null when the
+     * library is missing, the call declines (for example a string holding a NUL byte) or the
+     * output is inconsistent, so the caller falls back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w50Invoke(string $blob, string $ints, int $count): ?array
+    {
+        self::$w50Ffi ??= RustPipelineLibrary::resolveDomain('categorize_w50', self::W50_FFI_CDEF) ?? false;
+        $ffi = self::$w50Ffi;
+        if ($ffi === false) {
+            return null;
+        }
+        $base = $count * 4 + 7;
+        $maxWords = $base + $count;
+        try {
+            if (self::$w50Out === null || self::$w50OutCap < $maxWords) {
+                self::$w50OutCap = max(1024, $maxWords * 2);
+                self::$w50Out = $ffi->new('int64_t['.self::$w50OutCap.']');
+            }
+            // @phpstan-ignore method.notFound (Declared by W50_FFI_CDEF.)
+            $written = $ffi->nntmux_w503_tv_pipeline_result_tally_batch($blob, \strlen($blob), $ints, \strlen($ints), $count, self::$w50Out, self::$w50OutCap);
+            if (! \is_int($written) || $written < $base || $written > $maxWords || $written !== $base + (int) self::$w50Out[$count * 4 + 5]) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string(self::$w50Out, $written * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 
     /**

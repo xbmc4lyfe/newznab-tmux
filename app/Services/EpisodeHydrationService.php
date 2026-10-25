@@ -482,6 +482,169 @@ class EpisodeHydrationService
         return ($this->isMissing($r->series) || $this->isMissing($r->episode)) && ! empty($r->searchname);
     }
 
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean 3.79x, p99 3.59x; uncommon mean 3.96x, p99 3.37x); see RustTvCandidatePipelineTvMazeTvdbHydrationW50ParityTest. */
+    private const W50_RUST_FFI_DEFAULT = true;
+
+    public const string W50_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w503_episode_searchname_hydrate_batch(const char *blob, size_t blob_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    private static ?bool $useW50RustFfi = null;
+
+    private static FFI|false|null $w50Ffi = null;
+
+    private static ?CData $w50Out = null;
+
+    private static int $w50OutCap = 0;
+
+    /** Library-free instance whose hydrateFromSearchname() is the PHP reference. */
+    private static ?self $w50Reference = null;
+
+    public static function usesW50RustFfi(): bool
+    {
+        return self::$useW50RustFfi ?? self::W50_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 50 Rust path forced on or off, then restores the previous setting. */
+    public static function withW50RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$useW50RustFfi;
+        self::$useW50RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$useW50RustFfi = $previous;
+        }
+    }
+
+    /**
+     * Runs the hydrateFromSearchname() cascade over a batch of rows. Three values per row: the
+     * resulting series and episode (`(int)` casts) and flags (-1 skipped because neither number
+     * is missing or the searchname is empty per `empty()`, else 1 series set plus 2 episode set,
+     * 0 when no rule applied). Then the skipped, unresolved and resolved counts. A number is
+     * missing when it casts to 0, as isMissing() decides for scalars.
+     *
+     * @param  list<array<string, mixed>>  $rows  searchname, series, episode
+     * @return list<int>
+     */
+    public static function w50SearchnameHydrateBatch(array $rows): array
+    {
+        return self::usesW50RustFfi() ? self::w50SearchnameHydrateBatchNative($rows) : self::w50SearchnameHydrateBatchPhp($rows);
+    }
+
+    /**
+     * @param  list<array<string, mixed>>  $rows
+     * @return list<int>
+     */
+    public static function w50SearchnameHydrateBatchNative(array $rows): array
+    {
+        $count = \count($rows);
+        $columns = self::w50Columns($rows, ['searchname' => '', 'series' => 0, 'episode' => 0]);
+
+        return self::w50Invoke(
+            implode("\0", $columns['searchname']),
+            pack('q*', ...$columns['series']).pack('q*', ...$columns['episode']),
+            $count,
+            $count * 3 + 3,
+        )
+            ?? self::w50SearchnameHydrateBatchPhp($rows);
+    }
+
+    /**
+     * @param  list<array<string, mixed>>  $rows
+     * @return list<int>
+     */
+    public static function w50SearchnameHydrateBatchPhp(array $rows): array
+    {
+        $reference = self::$w50Reference ??= new self;
+        $out = [];
+        $skipped = $unresolved = $resolved = 0;
+        foreach ($rows as $row) {
+            $searchname = (string) ($row['searchname'] ?? '');
+            $series = (int) ($row['series'] ?? 0);
+            $episode = (int) ($row['episode'] ?? 0);
+            if (($series !== 0 && $episode !== 0) || empty($searchname)) {
+                $skipped++;
+                array_push($out, $series, $episode, -1);
+
+                continue;
+            }
+            $probe = (object) ['searchname' => $searchname, 'series' => $series === 0 ? null : $series, 'episode' => $episode === 0 ? null : $episode];
+            $reference->hydrateFromSearchname($probe);
+            $flags = ($series === 0 && $probe->series !== null ? 1 : 0) | ($episode === 0 && $probe->episode !== null ? 2 : 0);
+            $flags === 0 ? $unresolved++ : $resolved++;
+            array_push($out, (int) $probe->series, (int) $probe->episode, $flags);
+        }
+        array_push($out, $skipped, $unresolved, $resolved);
+
+        return $out;
+    }
+
+    /**
+     * One column per key of $defaults. Rows missing a key read its default; present nulls stay
+     * null, which pack() and implode() read as 0 and '' like the defaults they replace.
+     *
+     * @param  list<array<string, mixed>>  $rows
+     * @param  array<string, mixed>  $defaults
+     * @return array<string, list<mixed>>
+     */
+    private static function w50Columns(array $rows, array $defaults): array
+    {
+        $count = \count($rows);
+        $columns = [];
+        foreach ($defaults as $key => $default) {
+            $column = array_column($rows, $key);
+            if (\count($column) !== $count) {
+                $filled = [];
+                foreach ($rows as $row) {
+                    $filled[] = $row + $defaults;
+                }
+                $columns = [];
+                foreach ($defaults as $name => $unused) {
+                    $columns[$name] = array_column($filled, $name);
+                }
+
+                return $columns;
+            }
+            $columns[$key] = $column;
+        }
+
+        return $columns;
+    }
+
+    /**
+     * Calls the Wave 50 export with NUL-joined strings and packed `i64` integers. Null when the
+     * library is missing or the call declines (for example a string holding a NUL byte), so the
+     * caller falls back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w50Invoke(string $blob, string $ints, int $count, int $words): ?array
+    {
+        self::$w50Ffi ??= RustPipelineLibrary::resolveDomain('categorize_w50', self::W50_FFI_CDEF) ?? false;
+        $ffi = self::$w50Ffi;
+        if ($ffi === false) {
+            return null;
+        }
+        try {
+            if (self::$w50Out === null || self::$w50OutCap < $words) {
+                self::$w50OutCap = max(1024, $words * 2);
+                self::$w50Out = $ffi->new('int64_t['.self::$w50OutCap.']');
+            }
+            // @phpstan-ignore method.notFound (Declared by W50_FFI_CDEF.)
+            $written = $ffi->nntmux_w503_episode_searchname_hydrate_batch($blob, \strlen($blob), $ints, \strlen($ints), $count, self::$w50Out, self::$w50OutCap);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string(self::$w50Out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
     /** Disabled: common mean 1.47-1.52x and p99 1.12-1.70x missed 1.5x in five paired runs; uncommon passed (mean >= 1.82x, p99 >= 1.75x). See the W43 parity test. */
     public const bool W434_RUST_FFI_DEFAULT = false;
 

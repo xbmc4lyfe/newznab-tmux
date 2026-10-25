@@ -12,6 +12,7 @@ use CanIHaveSomeCoffee\TheTVDbAPI\Exception\UnauthorizedException;
 use CanIHaveSomeCoffee\TheTVDbAPI\Model\SeriesExtendedRecord;
 use CanIHaveSomeCoffee\TheTVDbAPI\TheTVDbAPI;
 use FFI;
+use FFI\CData;
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\GuzzleException;
 use Illuminate\Support\Facades\Log;
@@ -162,6 +163,189 @@ class TvdbProvider extends AbstractTvProvider
         }
 
         return ['total_entries' => count($translations), 'preferred_language_index' => $preferred, 'english_language_index' => $english, 'non_empty_overview_count' => $overviewCount, 'alias_count' => $aliasCount];
+    }
+
+    /** Enabled: the minimum of three paired runs cleared every 1.5x gate (common mean 3.77x, p99 3.61x; uncommon mean 2.79x, p99 2.49x); see RustTvCandidatePipelineTvMazeTvdbHydrationW50ParityTest. */
+    private const W50_RUST_FFI_DEFAULT = true;
+
+    public const string W50_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w503_tvdb_episode_match_batch(const char *blob, size_t blob_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    private static ?bool $useW50RustFfi = null;
+
+    private static FFI|false|null $w50Ffi = null;
+
+    private static ?CData $w50Out = null;
+
+    private static int $w50OutCap = 0;
+
+    public static function usesW50RustFfi(): bool
+    {
+        return self::$useW50RustFfi ?? self::W50_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 50 Rust path forced on or off, then restores the previous setting. */
+    public static function withW50RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$useW50RustFfi;
+        self::$useW50RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$useW50RustFfi = $previous;
+        }
+    }
+
+    /**
+     * Formats and matches a batch of TVDB episode records as fetchAllEpisodes()/fetchEpisode()
+     * do. Six values per record: valid (checkRequiredAttr('tvdbE'): seasonNumber and number
+     * neither null nor ''), the series and episode (`(int)` casts), the FNV-1a 32 hash of
+     * se_complete, the untrimmed aired date as `YYYYMMDD` (a valid `YYYY-MM-DD` with a non-zero
+     * year, else 0) and flags (1 a valid record matching $season and $episode, 2 non-blank name).
+     * Then the valid count, the first matching index (-1 when none), the latest aired date and
+     * the undated count among valid records.
+     *
+     * @param  list<array<string, mixed>>  $records  seasonNumber, number, aired, name
+     * @return list<int>
+     */
+    public static function w50EpisodeMatchBatch(array $records, int $season, int $episode): array
+    {
+        return self::usesW50RustFfi()
+            ? self::w50EpisodeMatchBatchNative($records, $season, $episode)
+            : self::w50EpisodeMatchBatchPhp($records, $season, $episode);
+    }
+
+    /**
+     * @param  list<array<string, mixed>>  $records
+     * @return list<int>
+     */
+    public static function w50EpisodeMatchBatchNative(array $records, int $season, int $episode): array
+    {
+        $count = \count($records);
+        $columns = self::w50Columns($records, ['seasonNumber' => null, 'number' => null, 'aired' => '', 'name' => '']);
+        $seasons = $columns['seasonNumber'];
+        $numbers = $columns['number'];
+        $ints = pack('q*', $season, $episode);
+        foreach ([array_keys($seasons, null, true), array_keys($seasons, '', true), array_keys($numbers, null, true), array_keys($numbers, '', true)] as $mask) {
+            $ints .= pack('q*', \count($mask), ...$mask);
+        }
+        $ints .= pack('q*', ...$seasons).pack('q*', ...$numbers);
+        $blob = implode("\0", $columns['aired'])."\0".implode("\0", $columns['name']);
+
+        return self::w50Invoke($count === 0 ? '' : $blob, $ints, $count, $count * 6 + 4)
+            ?? self::w50EpisodeMatchBatchPhp($records, $season, $episode);
+    }
+
+    /**
+     * @param  list<array<string, mixed>>  $records
+     * @return list<int>
+     */
+    public static function w50EpisodeMatchBatchPhp(array $records, int $season, int $episode): array
+    {
+        $out = [];
+        $valid = $latest = $undated = 0;
+        $first = -1;
+        $index = 0;
+        foreach ($records as $record) {
+            $seasonNumber = $record['seasonNumber'] ?? null;
+            $number = $record['number'] ?? null;
+            $isValid = $seasonNumber !== null && $seasonNumber !== '' && $number !== null && $number !== '';
+            $series = (int) $seasonNumber;
+            $episodeNumber = (int) $number;
+            $aired = 0;
+            if (preg_match('/^(\d{4})-(\d{2})-(\d{2})$/D', (string) ($record['aired'] ?? ''), $m) === 1
+                && (int) $m[1] > 0 && checkdate((int) $m[2], (int) $m[3], (int) $m[1])) {
+                $aired = (int) $m[1] * 10000 + (int) $m[2] * 100 + (int) $m[3];
+            }
+            $matched = $isValid && $series === $season && $episodeNumber === $episode;
+            if ($isValid) {
+                $valid++;
+                $latest = max($latest, $aired);
+                $undated += $aired === 0 ? 1 : 0;
+                if ($matched && $first < 0) {
+                    $first = $index;
+                }
+            }
+            array_push(
+                $out,
+                $isValid ? 1 : 0,
+                $series,
+                $episodeNumber,
+                (int) hexdec(hash('fnv1a32', 'S'.sprintf('%02d', $series).'E'.sprintf('%02d', $episodeNumber))),
+                $aired,
+                ($matched ? 1 : 0) | (trim((string) ($record['name'] ?? '')) !== '' ? 2 : 0),
+            );
+            $index++;
+        }
+        array_push($out, $valid, $first, $latest, $undated);
+
+        return $out;
+    }
+
+    /**
+     * One column per key of $defaults. Rows missing a key read its default; present nulls stay
+     * null, which pack() and implode() read as 0 and '' like the defaults they replace.
+     *
+     * @param  list<array<string, mixed>>  $rows
+     * @param  array<string, mixed>  $defaults
+     * @return array<string, list<mixed>>
+     */
+    private static function w50Columns(array $rows, array $defaults): array
+    {
+        $count = \count($rows);
+        $columns = [];
+        foreach ($defaults as $key => $default) {
+            $column = array_column($rows, $key);
+            if (\count($column) !== $count) {
+                $filled = [];
+                foreach ($rows as $row) {
+                    $filled[] = $row + $defaults;
+                }
+                $columns = [];
+                foreach ($defaults as $name => $unused) {
+                    $columns[$name] = array_column($filled, $name);
+                }
+
+                return $columns;
+            }
+            $columns[$key] = $column;
+        }
+
+        return $columns;
+    }
+
+    /**
+     * Calls the Wave 50 export with NUL-joined strings and packed `i64` integers. Null when the
+     * library is missing or the call declines (for example a string holding a NUL byte), so the
+     * caller falls back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w50Invoke(string $blob, string $ints, int $count, int $words): ?array
+    {
+        self::$w50Ffi ??= RustPipelineLibrary::resolveDomain('categorize_w50', self::W50_FFI_CDEF) ?? false;
+        $ffi = self::$w50Ffi;
+        if ($ffi === false) {
+            return null;
+        }
+        try {
+            if (self::$w50Out === null || self::$w50OutCap < $words) {
+                self::$w50OutCap = max(1024, $words * 2);
+                self::$w50Out = $ffi->new('int64_t['.self::$w50OutCap.']');
+            }
+            // @phpstan-ignore method.notFound (Declared by W50_FFI_CDEF.)
+            $written = $ffi->nntmux_w503_tvdb_episode_match_batch($blob, \strlen($blob), $ints, \strlen($ints), $count, self::$w50Out, self::$w50OutCap);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string(self::$w50Out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 
     public TheTVDbAPI $client;
