@@ -35122,3 +35122,777 @@ pub mod media_catalogue_processors {
         }
     }
 }
+/// Wave 35.4: pure normalization/classification helpers for the IGDB `Company`, `Game` and
+/// `Platform` models, `IgdbHttpException` and `BookProviderException`.
+///
+/// Multi-field string inputs arrive as one buffer of `0x1F`-separated fields. Outputs are
+/// `0x1F`-separated with `0x1E` alone for PHP `null`. Inputs that embed either marker byte, carry
+/// unknown flag bits or a non-zero value behind a cleared presence flag decline with `-1` so PHP
+/// keeps its own implementation. A result that does not fit returns `-required` without touching
+/// `out_buf`.
+pub mod igdb_book_provider_metadata {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::slice;
+
+    pub const DECLINE: isize = -1;
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+    const FIELD_SEP: u8 = 0x1F;
+    const NULL_MARK: u8 = 0x1E;
+    const TRIM_SET: &[u8] = b" \t\n\r\0\x0B\x0C";
+    const LIMIT_MIN: i64 = 1;
+    const LIMIT_MAX: i64 = 500;
+    const COUNTRY_MAX: i64 = 999;
+    const BODY_EXCERPT_MAX: usize = 256;
+    const RETRY_AFTER_MAX: i64 = 86_400;
+    const BOOK_HAS_STATUS: u32 = 1;
+    const BOOK_HAS_RETRY_AFTER: u32 = 2;
+
+    unsafe fn valid_slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if ptr.is_null()
+            || len > MAX_INPUT
+            || len > isize::MAX as usize
+            || (ptr as usize).checked_add(len).is_none()
+        {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        Some(unsafe { slice::from_raw_parts(ptr, len) })
+    }
+
+    #[inline]
+    fn valid_out_buf(out_buf: *mut u8, out_cap: usize) -> bool {
+        !out_buf.is_null()
+            && out_cap <= isize::MAX as usize
+            && (out_buf as usize).checked_add(out_cap).is_some()
+    }
+
+    /// Copies `bytes` into `out_buf`, returning the length or `-required` when it does not fit.
+    unsafe fn write_bytes(bytes: &[u8], out_buf: *mut u8, out_cap: usize) -> isize {
+        if bytes.len() > isize::MAX as usize {
+            return DECLINE;
+        }
+        if bytes.len() > out_cap {
+            return -(bytes.len() as isize);
+        }
+        if !bytes.is_empty() {
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len()) };
+        }
+        bytes.len() as isize
+    }
+
+    fn finish(encoded: Option<Vec<u8>>, out_buf: *mut u8, out_cap: usize) -> isize {
+        match encoded {
+            // Every encoding has at least five fields, so `-1` (DECLINE) never doubles as a
+            // "needs one byte" answer.
+            Some(bytes) => unsafe { write_bytes(&bytes, out_buf, out_cap) },
+            None => DECLINE,
+        }
+    }
+
+    /// Splits `input` into exactly `N` fields, declining on a wrong count or any null marker.
+    fn split_fields<const N: usize>(input: &[u8]) -> Option<[&[u8]; N]> {
+        if input.contains(&NULL_MARK) {
+            return None;
+        }
+        let mut out: [&[u8]; N] = [&[]; N];
+        let mut parts = input.split(|&b| b == FIELD_SEP);
+        for slot in &mut out {
+            *slot = parts.next()?;
+        }
+        parts.next().is_none().then_some(out)
+    }
+
+    /// Joins fields with the separator; `None` encodes PHP `null`.
+    fn encode(fields: &[Option<&[u8]>]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(fields.iter().map(|f| f.map_or(1, <[u8]>::len) + 1).sum());
+        for (i, field) in fields.iter().enumerate() {
+            if i > 0 {
+                out.push(FIELD_SEP);
+            }
+            out.extend_from_slice(field.unwrap_or(&[NULL_MARK]));
+        }
+        out
+    }
+
+    #[inline]
+    fn bool_bytes(value: bool) -> &'static [u8] {
+        if value { b"1" } else { b"0" }
+    }
+
+    #[inline]
+    fn flag(value: u32) -> Option<bool> {
+        match value {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+
+    /// PHP `trim($value, " \t\n\r\0\x0B\x0C")` on bytes.
+    fn trim_ws(value: &[u8]) -> &[u8] {
+        let start = value
+            .iter()
+            .position(|b| !TRIM_SET.contains(b))
+            .unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|b| !TRIM_SET.contains(b))
+            .map_or(start, |i| i + 1);
+        &value[start..end]
+    }
+
+    /// PHP `preg_replace('/[ \t\n\r\0\x0B\x0C]+/', ' ', trim($value, WHITESPACE))`.
+    pub fn collapse_ws(value: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(value.len());
+        let mut in_run = false;
+        for &b in trim_ws(value) {
+            if TRIM_SET.contains(&b) {
+                if !in_run {
+                    out.push(b' ');
+                    in_run = true;
+                }
+            } else {
+                out.push(b);
+                in_run = false;
+            }
+        }
+        out
+    }
+
+    /// PHP `trim(preg_replace('/[^a-z0-9]+/', $sep, strtolower($value)), $sep)`.
+    pub fn slug(value: &[u8], sep: u8) -> Vec<u8> {
+        let mut out = Vec::with_capacity(value.len());
+        let mut in_run = false;
+        for &b in value {
+            let b = b.to_ascii_lowercase();
+            if b.is_ascii_lowercase() || b.is_ascii_digit() {
+                out.push(b);
+                in_run = false;
+            } else if !in_run {
+                out.push(sep);
+                in_run = true;
+            }
+        }
+        let start = out.iter().position(|&b| b != sep).unwrap_or(out.len());
+        let end = out.iter().rposition(|&b| b != sep).map_or(start, |i| i + 1);
+        out[start..end].to_vec()
+    }
+
+    /// Shared HTTP status classification of `IgdbHttpException` and `BookProviderException`.
+    pub fn http_category(status: i64) -> &'static str {
+        match status {
+            0 => "transport",
+            401 | 403 => "auth",
+            404 => "not_found",
+            408 => "timeout",
+            429 => "rate_limited",
+            400..=499 => "client",
+            500..=599 => "server",
+            _ => "unknown",
+        }
+    }
+
+    #[inline]
+    fn retryable_category(category: &str) -> bool {
+        matches!(
+            category,
+            "transport" | "timeout" | "rate_limited" | "server"
+        )
+    }
+
+    fn positive(value: i64) -> Option<i64> {
+        (value > 0).then_some(value)
+    }
+
+    /// `Company::normalizeCompanyRecordPhp()`: `(id, name, slug, country, is_valid)`.
+    pub fn company_encode(id: i64, country: Option<i64>, name: &[u8]) -> Option<Vec<u8>> {
+        let [name] = split_fields::<1>(name)?;
+        let id = positive(id).map(|v| v.to_string());
+        let name = collapse_ws(name);
+        let slug = slug(&name, b'-');
+        let country = country
+            .filter(|&c| (1..=COUNTRY_MAX).contains(&c))
+            .map(|c| c.to_string());
+        let is_valid = id.is_some() && !name.is_empty();
+        Some(encode(&[
+            id.as_deref().map(str::as_bytes),
+            Some(&name),
+            Some(&slug),
+            country.as_deref().map(str::as_bytes),
+            Some(bool_bytes(is_valid)),
+        ]))
+    }
+
+    /// `Game::normalizeGameLookupSpecPhp()`: `(search, escaped, limit, platform_id, query, is_valid)`.
+    pub fn game_encode(limit: i64, platform: Option<i64>, title: &[u8]) -> Option<Vec<u8>> {
+        let [title] = split_fields::<1>(title)?;
+        let search = collapse_ws(title);
+        let mut escaped = Vec::with_capacity(search.len() + 8);
+        for &b in &search {
+            if b == b'"' || b == b'\\' {
+                escaped.push(b'\\');
+            }
+            escaped.push(b);
+        }
+        let limit = limit.clamp(LIMIT_MIN, LIMIT_MAX);
+        let platform = platform.and_then(positive);
+        let mut query = Vec::with_capacity(escaped.len() + 64);
+        query.extend_from_slice(b"search \"");
+        query.extend_from_slice(&escaped);
+        query.extend_from_slice(b"\"; fields *; ");
+        if let Some(id) = platform {
+            query.extend_from_slice(format!("where platforms = ({id}); ").as_bytes());
+        }
+        query.extend_from_slice(format!("limit {limit};").as_bytes());
+        let limit = limit.to_string();
+        let platform = platform.map(|v| v.to_string());
+        Some(encode(&[
+            Some(&search),
+            Some(&escaped),
+            Some(limit.as_bytes()),
+            platform.as_deref().map(str::as_bytes),
+            Some(&query),
+            Some(bool_bytes(!search.is_empty())),
+        ]))
+    }
+
+    /// `Platform::normalizePlatformRecordPhp()`: `(id, name, slug, abbreviation, label, is_valid)`.
+    pub fn platform_encode(id: i64, has_abbreviation: bool, input: &[u8]) -> Option<Vec<u8>> {
+        let [name, abbreviation] = split_fields::<2>(input)?;
+        if !has_abbreviation && !abbreviation.is_empty() {
+            return None;
+        }
+        let id = positive(id).map(|v| v.to_string());
+        let name = collapse_ws(name);
+        let slug = slug(&name, b'-');
+        let abbreviation = has_abbreviation
+            .then(|| collapse_ws(abbreviation).to_ascii_uppercase())
+            .filter(|a| !a.is_empty());
+        let label = abbreviation.as_deref().unwrap_or(&name);
+        let is_valid = id.is_some() && !name.is_empty();
+        Some(encode(&[
+            id.as_deref().map(str::as_bytes),
+            Some(&name),
+            Some(&slug),
+            abbreviation.as_deref(),
+            Some(label),
+            Some(bool_bytes(is_valid)),
+        ]))
+    }
+
+    /// `IgdbHttpException::classifyHttpFailurePhp()`:
+    /// `(status_code, category, retryable, message, body_excerpt)`.
+    pub fn http_failure_encode(status: i64, has_body: bool, input: &[u8]) -> Option<Vec<u8>> {
+        let [message, body] = split_fields::<2>(input)?;
+        if !has_body && !body.is_empty() {
+            return None;
+        }
+        let category = http_category(status);
+        let mut message = collapse_ws(message);
+        if message.is_empty() {
+            message = format!("IGDB request failed with HTTP status {status}").into_bytes();
+        }
+        let body = has_body
+            .then(|| trim_ws(body))
+            .filter(|b| !b.is_empty())
+            .map(|b| &b[..b.len().min(BODY_EXCERPT_MAX)]);
+        let status = status.to_string();
+        Some(encode(&[
+            Some(status.as_bytes()),
+            Some(category.as_bytes()),
+            Some(bool_bytes(retryable_category(category))),
+            Some(&message),
+            body,
+        ]))
+    }
+
+    /// `BookProviderException::classifyProviderFailurePhp()`:
+    /// `(provider, status_code, category, retryable, retry_after_seconds, backoff_seconds)`.
+    pub fn provider_failure_encode(
+        flags: u32,
+        status: i64,
+        retry_after: i64,
+        provider: &[u8],
+    ) -> Option<Vec<u8>> {
+        if flags & !(BOOK_HAS_STATUS | BOOK_HAS_RETRY_AFTER) != 0 {
+            return None;
+        }
+        let has_status = flags & BOOK_HAS_STATUS != 0;
+        let has_retry = flags & BOOK_HAS_RETRY_AFTER != 0;
+        if (!has_status && status != 0) || (!has_retry && retry_after != 0) {
+            return None;
+        }
+        let [provider] = split_fields::<1>(provider)?;
+        let mut provider = slug(provider, b'_');
+        if provider.is_empty() {
+            provider = b"unknown".to_vec();
+        }
+        let status = has_status.then_some(status);
+        let category = status.map_or("transport", http_category);
+        let retryable = retryable_category(category);
+        let retry_after = has_retry
+            .then_some(retry_after)
+            .and_then(positive)
+            .map(|v| v.min(RETRY_AFTER_MAX));
+        let backoff = retry_after.unwrap_or(match category {
+            "rate_limited" => 60,
+            _ if retryable => 30,
+            _ => 0,
+        });
+        let status = status.map(|v| v.to_string());
+        let retry_after = retry_after.map(|v| v.to_string());
+        let backoff = backoff.to_string();
+        Some(encode(&[
+            Some(&provider),
+            status.as_deref().map(str::as_bytes),
+            Some(category.as_bytes()),
+            Some(bool_bytes(retryable)),
+            retry_after.as_deref().map(str::as_bytes),
+            Some(backoff.as_bytes()),
+        ]))
+    }
+
+    /// `Company::normalizeCompanyRecord()`; `has_country` is `0` for PHP `null` (then `country`
+    /// must be `0`) or `1`.
+    ///
+    /// # Safety
+    /// Non-null input pointers must be readable for their lengths and `out_buf` writable for
+    /// `out_cap` bytes; null or oversized buffers decline with `-1`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w35_igdb_company_record(
+        id: i64,
+        has_country: u32,
+        country: i64,
+        name_ptr: *const u8,
+        name_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(has_country) = flag(has_country) else {
+                return DECLINE;
+            };
+            if !has_country && country != 0 {
+                return DECLINE;
+            }
+            let Some(name) = (unsafe { valid_slice(name_ptr, name_len) }) else {
+                return DECLINE;
+            };
+            finish(
+                company_encode(id, has_country.then_some(country), name),
+                out_buf,
+                out_cap,
+            )
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `Game::normalizeGameLookupSpec()`; `has_platform` is `0` for PHP `null` (then
+    /// `platform_id` must be `0`) or `1`.
+    ///
+    /// # Safety
+    /// Non-null input pointers must be readable for their lengths and `out_buf` writable for
+    /// `out_cap` bytes; null or oversized buffers decline with `-1`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w35_igdb_game_lookup_spec(
+        limit: i64,
+        has_platform: u32,
+        platform_id: i64,
+        title_ptr: *const u8,
+        title_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(has_platform) = flag(has_platform) else {
+                return DECLINE;
+            };
+            if !has_platform && platform_id != 0 {
+                return DECLINE;
+            }
+            let Some(title) = (unsafe { valid_slice(title_ptr, title_len) }) else {
+                return DECLINE;
+            };
+            finish(
+                game_encode(limit, has_platform.then_some(platform_id), title),
+                out_buf,
+                out_cap,
+            )
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `Platform::normalizePlatformRecord()`; input is `name`, `abbreviation`. `has_abbreviation`
+    /// is `0` for PHP `null` (the abbreviation field must then be empty) or `1`.
+    ///
+    /// # Safety
+    /// Non-null input pointers must be readable for their lengths and `out_buf` writable for
+    /// `out_cap` bytes; null or oversized buffers decline with `-1`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w35_igdb_platform_record(
+        id: i64,
+        has_abbreviation: u32,
+        input_ptr: *const u8,
+        input_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(has_abbreviation) = flag(has_abbreviation) else {
+                return DECLINE;
+            };
+            let Some(input) = (unsafe { valid_slice(input_ptr, input_len) }) else {
+                return DECLINE;
+            };
+            finish(
+                platform_encode(id, has_abbreviation, input),
+                out_buf,
+                out_cap,
+            )
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `IgdbHttpException::classifyHttpFailure()`; input is `message`, `response_body`.
+    /// `has_body` is `0` for PHP `null` (the body field must then be empty) or `1`.
+    ///
+    /// # Safety
+    /// Non-null input pointers must be readable for their lengths and `out_buf` writable for
+    /// `out_cap` bytes; null or oversized buffers decline with `-1`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w35_igdb_http_failure_classify(
+        status_code: i64,
+        has_body: u32,
+        input_ptr: *const u8,
+        input_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(has_body) = flag(has_body) else {
+                return DECLINE;
+            };
+            let Some(input) = (unsafe { valid_slice(input_ptr, input_len) }) else {
+                return DECLINE;
+            };
+            finish(
+                http_failure_encode(status_code, has_body, input),
+                out_buf,
+                out_cap,
+            )
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    /// `BookProviderException::classifyProviderFailure()`; `flags` bit 0/1 mark a non-null status
+    /// code and retry-after value (a cleared bit requires the matching value to be `0`).
+    ///
+    /// # Safety
+    /// Non-null input pointers must be readable for their lengths and `out_buf` writable for
+    /// `out_cap` bytes; null or oversized buffers decline with `-1`.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w35_book_provider_failure_classify(
+        flags: u32,
+        status_code: i64,
+        retry_after_seconds: i64,
+        provider_ptr: *const u8,
+        provider_len: usize,
+        out_buf: *mut u8,
+        out_cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if !valid_out_buf(out_buf, out_cap) {
+                return DECLINE;
+            }
+            let Some(provider) = (unsafe { valid_slice(provider_ptr, provider_len) }) else {
+                return DECLINE;
+            };
+            finish(
+                provider_failure_encode(flags, status_code, retry_after_seconds, provider),
+                out_buf,
+                out_cap,
+            )
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn s(bytes: Option<Vec<u8>>) -> Option<String> {
+            bytes.map(|b| String::from_utf8_lossy(&b).into_owned())
+        }
+
+        #[test]
+        fn text_helpers_follow_php() {
+            assert_eq!(collapse_ws(b" \t Nintendo \n\x0B  EPD \0"), b"Nintendo EPD");
+            assert_eq!(collapse_ws(b"\x0C\r"), b"");
+            assert_eq!(
+                slug(b" Sony  Interactive, Inc. ", b'-'),
+                b"sony-interactive-inc"
+            );
+            assert_eq!(slug("Ünïcödé".as_bytes(), b'-'), b"n-c-d");
+            assert_eq!(slug(b"--", b'-'), b"");
+            assert_eq!(http_category(0), "transport");
+            assert_eq!(http_category(403), "auth");
+            assert_eq!(http_category(418), "client");
+            assert_eq!(http_category(503), "server");
+            assert_eq!(http_category(-1), "unknown");
+            assert_eq!(http_category(i64::MAX), "unknown");
+        }
+
+        #[test]
+        fn records_encode_php_shapes() {
+            assert_eq!(
+                s(company_encode(70, Some(392), b" Nintendo  EPD ")),
+                Some("70\x1FNintendo EPD\x1Fnintendo-epd\x1F392\x1F1".into())
+            );
+            assert_eq!(
+                s(company_encode(0, Some(1000), b"")),
+                Some("\x1E\x1F\x1F\x1F\x1E\x1F0".into())
+            );
+            assert_eq!(
+                s(game_encode(0, Some(48), b" The \"Last\" \\ Of Us ")),
+                Some(
+                    "The \"Last\" \\ Of Us\x1FThe \\\"Last\\\" \\\\ Of Us\x1F1\x1F48\x1Fsearch \"The \\\"Last\\\" \\\\ Of Us\"; fields *; where platforms = (48); limit 1;\x1F1"
+                        .into()
+                )
+            );
+            assert_eq!(
+                s(game_encode(i64::MAX, Some(-4), b"")),
+                Some("\x1F\x1F500\x1F\x1E\x1Fsearch \"\"; fields *; limit 500;\x1F0".into())
+            );
+            assert_eq!(
+                s(platform_encode(48, true, b"PlayStation 4\x1F ps4 ")),
+                Some("48\x1FPlayStation 4\x1Fplaystation-4\x1FPS4\x1FPS4\x1F1".into())
+            );
+            assert_eq!(
+                s(platform_encode(-1, true, b"PC\x1F  ")),
+                Some("\x1E\x1FPC\x1Fpc\x1F\x1E\x1FPC\x1F0".into())
+            );
+            assert_eq!(platform_encode(1, false, b"PC\x1Fx"), None);
+            assert_eq!(platform_encode(1, true, b"PC"), None);
+        }
+
+        #[test]
+        fn failures_encode_php_shapes() {
+            assert_eq!(
+                s(http_failure_encode(
+                    429,
+                    true,
+                    b" Too   many \x1F {\"x\":1} "
+                )),
+                Some("429\x1Frate_limited\x1F1\x1FToo many\x1F{\"x\":1}".into())
+            );
+            assert_eq!(
+                s(http_failure_encode(404, false, b"\x1F")),
+                Some(
+                    "404\x1Fnot_found\x1F0\x1FIGDB request failed with HTTP status 404\x1F\x1E"
+                        .into()
+                )
+            );
+            let long = [b'a'; 300];
+            let mut input = b"m\x1F".to_vec();
+            input.extend_from_slice(&long);
+            let encoded = http_failure_encode(500, true, &input).unwrap();
+            assert!(encoded.ends_with(&[b'a'; BODY_EXCERPT_MAX]));
+            assert_eq!(http_failure_encode(500, false, b"m\x1Fbody"), None);
+            assert_eq!(
+                s(provider_failure_encode(3, 429, 120, b" Google Books ")),
+                Some("google_books\x1F429\x1Frate_limited\x1F1\x1F120\x1F120".into())
+            );
+            assert_eq!(
+                s(provider_failure_encode(0, 0, 0, b"!!")),
+                Some("unknown\x1F\x1E\x1Ftransport\x1F1\x1F\x1E\x1F30".into())
+            );
+            assert_eq!(
+                s(provider_failure_encode(3, 429, i64::MAX, b"x")),
+                Some("x\x1F429\x1Frate_limited\x1F1\x1F86400\x1F86400".into())
+            );
+            assert_eq!(
+                s(provider_failure_encode(3, 404, -5, b"x")),
+                Some("x\x1F404\x1Fnot_found\x1F0\x1F\x1E\x1F0".into())
+            );
+            assert_eq!(
+                s(provider_failure_encode(1, 429, 0, b"x")),
+                Some("x\x1F429\x1Frate_limited\x1F1\x1F\x1E\x1F60".into())
+            );
+            assert_eq!(provider_failure_encode(4, 0, 0, b"x"), None);
+            assert_eq!(provider_failure_encode(0, 1, 0, b"x"), None);
+            assert_eq!(provider_failure_encode(1, 1, 1, b"x"), None);
+            assert_eq!(provider_failure_encode(0, 0, 0, b"a\x1Eb"), None);
+        }
+
+        #[test]
+        fn exports_validate_arguments_and_capacity() {
+            let mut out = [0u8; 256];
+            let name = b"Nintendo";
+            let call = |id, has, country, ptr: *const u8, len, out: &mut [u8]| unsafe {
+                nntmux_w35_igdb_company_record(
+                    id,
+                    has,
+                    country,
+                    ptr,
+                    len,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            let written = call(1, 1, 392, name.as_ptr(), name.len(), &mut out);
+            assert_eq!(
+                &out[..written as usize],
+                b"1\x1FNintendo\x1Fnintendo\x1F392\x1F1"
+            );
+            assert_eq!(call(1, 2, 0, name.as_ptr(), name.len(), &mut out), DECLINE);
+            assert_eq!(call(1, 0, 5, name.as_ptr(), name.len(), &mut out), DECLINE);
+            assert_eq!(call(1, 0, 0, std::ptr::null(), 0, &mut out), DECLINE);
+            assert_eq!(
+                call(1, 0, 0, name.as_ptr(), MAX_INPUT + 1, &mut out),
+                DECLINE
+            );
+            assert_eq!(call(1, 0, 0, b"a\x1Fb".as_ptr(), 3, &mut out), DECLINE);
+
+            let mut small = [b'Z'; 4];
+            let needed = call(1, 0, 0, name.as_ptr(), name.len(), &mut small);
+            assert!(needed < DECLINE);
+            assert_eq!(small, [b'Z'; 4]);
+            let mut exact = vec![0u8; (-needed) as usize];
+            assert_eq!(
+                call(1, 0, 0, name.as_ptr(), name.len(), &mut exact),
+                -needed
+            );
+
+            let null_out = unsafe {
+                nntmux_w35_igdb_company_record(
+                    1,
+                    0,
+                    0,
+                    name.as_ptr(),
+                    name.len(),
+                    std::ptr::null_mut(),
+                    64,
+                )
+            };
+            assert_eq!(null_out, DECLINE);
+            unsafe {
+                assert_eq!(
+                    nntmux_w35_igdb_game_lookup_spec(
+                        10,
+                        0,
+                        3,
+                        name.as_ptr(),
+                        name.len(),
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w35_igdb_game_lookup_spec(
+                        10,
+                        2,
+                        0,
+                        name.as_ptr(),
+                        name.len(),
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    DECLINE
+                );
+                assert!(
+                    nntmux_w35_igdb_game_lookup_spec(
+                        10,
+                        1,
+                        3,
+                        name.as_ptr(),
+                        name.len(),
+                        out.as_mut_ptr(),
+                        out.len()
+                    ) > 0
+                );
+                assert_eq!(
+                    nntmux_w35_igdb_platform_record(
+                        1,
+                        3,
+                        b"a\x1F".as_ptr(),
+                        2,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w35_igdb_platform_record(
+                        1,
+                        0,
+                        std::ptr::null(),
+                        0,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w35_igdb_http_failure_classify(
+                        500,
+                        9,
+                        b"m\x1F".as_ptr(),
+                        2,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    DECLINE
+                );
+                assert!(
+                    nntmux_w35_igdb_http_failure_classify(
+                        500,
+                        0,
+                        b"m\x1F".as_ptr(),
+                        2,
+                        out.as_mut_ptr(),
+                        out.len()
+                    ) > 0
+                );
+                assert_eq!(
+                    nntmux_w35_book_provider_failure_classify(
+                        8,
+                        0,
+                        0,
+                        name.as_ptr(),
+                        name.len(),
+                        out.as_mut_ptr(),
+                        out.len()
+                    ),
+                    DECLINE
+                );
+                assert_eq!(
+                    nntmux_w35_book_provider_failure_classify(
+                        0,
+                        0,
+                        0,
+                        name.as_ptr(),
+                        name.len(),
+                        std::ptr::null_mut(),
+                        0
+                    ),
+                    DECLINE
+                );
+            }
+        }
+    }
+}
