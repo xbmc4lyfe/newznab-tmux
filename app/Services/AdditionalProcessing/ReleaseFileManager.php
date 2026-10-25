@@ -1439,4 +1439,147 @@ class ReleaseFileManager
     {
         return $this->fileNameCleaner->isPlausibleReleaseTitle($title);
     }
+
+    // Wave 42.6 is independent of every earlier FFI toggle.
+    public const bool W426_RUST_FFI_DEFAULT = false;
+
+    private const string W426_FFI_CDEF = 'int32_t nntmux_w426_additional_file_manager_fallback_sync_sevenzip(uint8_t operation, const char *input, size_t input_len, char *output, size_t output_cap);';
+
+    /** @return array{enabled: ?bool, ffi: FFI|false|null} */
+    private static function &w426State(): array
+    {
+        // A static local also supports readonly configuration objects.
+        static $state = ['enabled' => null, 'ffi' => null];
+
+        return $state;
+    }
+
+    public static function useW426RustFfi(bool $enable = true): void
+    {
+        $state = &self::w426State();
+        $state['enabled'] = $enable;
+    }
+
+    public static function usesW426RustFfi(): bool
+    {
+        return self::w426State()['enabled'] ?? self::W426_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW426RustFfi(): void
+    {
+        $state = &self::w426State();
+        $state = ['enabled' => null, 'ffi' => null];
+    }
+
+    /** @return list<int>|null */
+    private static function w426Slots(int $operation, string $input, int $count): ?array
+    {
+        if (PHP_INT_SIZE !== 8 || \strlen($input) > 16_777_216) {
+            return null;
+        }
+        try {
+            $state = &self::w426State();
+            $state['ffi'] ??= RustPipelineLibrary::resolveDomain('additional', self::W426_FFI_CDEF) ?? false;
+            if ($state['ffi'] === false) {
+                return null;
+            }
+            $bytes = $count * 8;
+            $buffer = $state['ffi']->new('char['.$bytes.']');
+            // @phpstan-ignore method.notFound
+            $written = $state['ffi']->nntmux_w426_additional_file_manager_fallback_sync_sevenzip($operation, $input, \strlen($input), $buffer, $bytes);
+            if ($written !== $bytes) {
+                return null;
+            }
+            $values = unpack('q*', FFI::string($buffer, $bytes));
+            if ($values === false || \count($values) !== $count) {
+                return null;
+            }
+            $values = array_values($values);
+            foreach ($values as $index => $value) {
+                if (! \is_int($value) || ($value < 0 && ! ($operation === 3 && $index === 7))) {
+                    return null;
+                }
+            }
+
+            return $values;
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    private static function w426Add(int $a, int $b): int
+    {
+        return $a > PHP_INT_MAX - $b ? PHP_INT_MAX : $a + $b;
+    }
+
+    /**
+     * Report file counts and byte totals without database writes. Empty names and negative sizes are invalid.
+     * Integer sums saturate at PHP_INT_MAX; malformed rows are counted without coercion.
+     *
+     * @param  array<array-key, mixed>  $files
+     * @return array{total: int, files: int, total_bytes: int, empty_files: int, name_bytes: int, exceeds_limit: bool, invalid: int}
+     */
+    public static function summarizeFilePersistenceBatch(array $files, int $limit = 11): array
+    {
+        return self::usesW426RustFfi()
+            ? self::summarizeFilePersistenceBatchNative($files, $limit)
+            : self::summarizeFilePersistenceBatchPhp($files, $limit);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $files
+     * @return array{total: int, files: int, total_bytes: int, empty_files: int, name_bytes: int, exceeds_limit: bool, invalid: int}
+     */
+    public static function summarizeFilePersistenceBatchPhp(array $files, int $limit = 11): array
+    {
+        $result = ['total' => \count($files), 'files' => 0, 'total_bytes' => 0, 'empty_files' => 0, 'name_bytes' => 0, 'exceeds_limit' => false, 'invalid' => 0];
+        foreach ($files as $row) {
+            if (! self::w426ValidRow($row)) {
+                $result['invalid']++;
+
+                continue;
+            }
+            $result['files']++;
+            $result['total_bytes'] = self::w426Add($result['total_bytes'], $row['size']);
+            $result['empty_files'] += (int) ($row['size'] === 0);
+            $result['name_bytes'] = self::w426Add($result['name_bytes'], \strlen($row['name']));
+        }
+        $result['exceeds_limit'] = $result['files'] > max(0, $limit);
+
+        return $result;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $files
+     * @return array{total: int, files: int, total_bytes: int, empty_files: int, name_bytes: int, exceeds_limit: bool, invalid: int}
+     */
+    public static function summarizeFilePersistenceBatchNative(array $files, int $limit = 11): array
+    {
+        $total = \count($files);
+        if (PHP_INT_SIZE !== 8 || $total > 100_000) {
+            return self::summarizeFilePersistenceBatchPhp($files, $limit);
+        }
+        $frame = pack('qV', $limit, $total);
+        foreach ($files as $row) {
+            if (! self::w426ValidRow($row)) {
+                return self::summarizeFilePersistenceBatchPhp($files, $limit);
+            }
+            if (\strlen($row['name']) > 16_777_216 - 12 - \strlen($frame)) {
+                return self::summarizeFilePersistenceBatchPhp($files, $limit);
+            }
+            $frame .= pack('qV', $row['size'], \strlen($row['name'])).$row['name'];
+        }
+        $slots = self::w426Slots(1, $frame, 7);
+        if ($slots === null || $slots[0] !== $total || $slots[1] !== $total || $slots[3] > $total || $slots[5] !== (int) ($total > max(0, $limit)) || $slots[6] !== 0) {
+            return self::summarizeFilePersistenceBatchPhp($files, $limit);
+        }
+
+        return ['total' => $slots[0], 'files' => $slots[1], 'total_bytes' => $slots[2], 'empty_files' => $slots[3], 'name_bytes' => $slots[4], 'exceeds_limit' => $slots[5] === 1, 'invalid' => $slots[6]];
+    }
+
+    /** @phpstan-assert-if-true array{name: string, size: int} $row */
+    private static function w426ValidRow(mixed $row): bool
+    {
+        return \is_array($row) && \is_string($row['name'] ?? null) && $row['name'] !== '' && \is_int($row['size'] ?? null) && $row['size'] >= 0;
+    }
 }

@@ -444,4 +444,146 @@ final readonly class ProcessingConfiguration
 
         return $ffi === false ? null : $ffi;
     }
+
+    // Wave 42.6 is independent of every earlier FFI toggle.
+    public const bool W426_RUST_FFI_DEFAULT = false;
+
+    private const string W426_FFI_CDEF = 'int32_t nntmux_w426_additional_file_manager_fallback_sync_sevenzip(uint8_t operation, const char *input, size_t input_len, char *output, size_t output_cap);';
+
+    /** @return array{enabled: ?bool, ffi: FFI|false|null} */
+    private static function &w426State(): array
+    {
+        // A static local also supports readonly configuration objects.
+        static $state = ['enabled' => null, 'ffi' => null];
+
+        return $state;
+    }
+
+    public static function useW426RustFfi(bool $enable = true): void
+    {
+        $state = &self::w426State();
+        $state['enabled'] = $enable;
+    }
+
+    public static function usesW426RustFfi(): bool
+    {
+        return self::w426State()['enabled'] ?? self::W426_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW426RustFfi(): void
+    {
+        $state = &self::w426State();
+        $state = ['enabled' => null, 'ffi' => null];
+    }
+
+    /** @return list<int>|null */
+    private static function w426Slots(int $operation, string $input, int $count): ?array
+    {
+        if (PHP_INT_SIZE !== 8 || \strlen($input) > 16_777_216) {
+            return null;
+        }
+        try {
+            $state = &self::w426State();
+            $state['ffi'] ??= RustPipelineLibrary::resolveDomain('additional', self::W426_FFI_CDEF) ?? false;
+            if ($state['ffi'] === false) {
+                return null;
+            }
+            $bytes = $count * 8;
+            $buffer = $state['ffi']->new('char['.$bytes.']');
+            // @phpstan-ignore method.notFound
+            $written = $state['ffi']->nntmux_w426_additional_file_manager_fallback_sync_sevenzip($operation, $input, \strlen($input), $buffer, $bytes);
+            if ($written !== $bytes) {
+                return null;
+            }
+            $values = unpack('q*', FFI::string($buffer, $bytes));
+            if ($values === false || \count($values) !== $count) {
+                return null;
+            }
+            $values = array_values($values);
+            foreach ($values as $index => $value) {
+                if (! \is_int($value) || ($value < 0 && ! ($operation === 3 && $index === 7))) {
+                    return null;
+                }
+            }
+
+            return $values;
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
+    private static function w426Add(int $a, int $b): int
+    {
+        return $a > PHP_INT_MAX - $b ? PHP_INT_MAX : $a + $b;
+    }
+
+    /**
+     * Summarize independent configuration snapshots; negative capacities clamp to zero and arithmetic saturates.
+     * Integer sums saturate at PHP_INT_MAX; malformed rows are counted without coercion.
+     *
+     * @param  array<array-key, mixed>  $files
+     * @return array{total: int, disabled: int, max_in_flight: int, max_timeout_seconds: int, total_max_bytes: int, invalid: int}
+     */
+    public static function summarizeLimitConfigurationBatch(array $files): array
+    {
+        return self::usesW426RustFfi()
+            ? self::summarizeLimitConfigurationBatchNative($files)
+            : self::summarizeLimitConfigurationBatchPhp($files);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $files
+     * @return array{total: int, disabled: int, max_in_flight: int, max_timeout_seconds: int, total_max_bytes: int, invalid: int}
+     */
+    public static function summarizeLimitConfigurationBatchPhp(array $files): array
+    {
+        $result = ['total' => \count($files), 'disabled' => 0, 'max_in_flight' => 0, 'max_timeout_seconds' => 0, 'total_max_bytes' => 0, 'invalid' => 0];
+        foreach ($files as $row) {
+            if (! self::w426ValidRow($row)) {
+                $result['invalid']++;
+
+                continue;
+            }
+            $batch = max(0, $row['batch_size']);
+            $threads = max(0, $row['threads']);
+            $capacity = $threads > 0 && $batch > intdiv(PHP_INT_MAX, $threads) ? PHP_INT_MAX : $batch * $threads;
+            $result['disabled'] += (int) ($batch === 0 || $threads === 0);
+            $result['max_in_flight'] = max($result['max_in_flight'], $capacity);
+            $result['max_timeout_seconds'] = max($result['max_timeout_seconds'], $row['timeout_seconds'], 0);
+            $result['total_max_bytes'] = self::w426Add($result['total_max_bytes'], max(0, $row['max_bytes']));
+        }
+
+        return $result;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $files
+     * @return array{total: int, disabled: int, max_in_flight: int, max_timeout_seconds: int, total_max_bytes: int, invalid: int}
+     */
+    public static function summarizeLimitConfigurationBatchNative(array $files): array
+    {
+        $total = \count($files);
+        if (PHP_INT_SIZE !== 8 || $total > 100_000) {
+            return self::summarizeLimitConfigurationBatchPhp($files);
+        }
+        $frame = pack('qV', 0, $total);
+        foreach ($files as $row) {
+            if (! self::w426ValidRow($row)) {
+                return self::summarizeLimitConfigurationBatchPhp($files);
+            }
+            $frame .= pack('qqqq', $row['batch_size'], $row['threads'], $row['timeout_seconds'], $row['max_bytes']);
+        }
+        $slots = self::w426Slots(5, $frame, 6);
+        if ($slots === null || $slots[0] !== $total || $slots[1] > $total || $slots[5] !== 0) {
+            return self::summarizeLimitConfigurationBatchPhp($files);
+        }
+
+        return ['total' => $slots[0], 'disabled' => $slots[1], 'max_in_flight' => $slots[2], 'max_timeout_seconds' => $slots[3], 'total_max_bytes' => $slots[4], 'invalid' => $slots[5]];
+    }
+
+    /** @phpstan-assert-if-true array{batch_size: int, threads: int, timeout_seconds: int, max_bytes: int} $row */
+    private static function w426ValidRow(mixed $row): bool
+    {
+        return \is_array($row) && \is_int($row['batch_size'] ?? null) && \is_int($row['threads'] ?? null) && \is_int($row['timeout_seconds'] ?? null) && \is_int($row['max_bytes'] ?? null);
+    }
 }

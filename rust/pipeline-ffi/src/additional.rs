@@ -28339,3 +28339,687 @@ pub unsafe extern "C" fn nntmux_w416_additional_candidate_diag_orch_console_nzb(
     }))
     .unwrap_or(-1)
 }
+
+#[cfg(test)]
+mod w426_tests {
+    use super::nntmux_w426_additional_file_manager_fallback_sync_sevenzip as call;
+
+    fn header(parameter: i64, count: usize) -> Vec<u8> {
+        let mut bytes = parameter.to_ne_bytes().to_vec();
+        bytes.extend_from_slice(&(count as u32).to_le_bytes());
+        bytes
+    }
+
+    fn named(parameter: i64, rows: &[(i64, &[u8], &[u8])]) -> Vec<u8> {
+        let mut bytes = header(parameter, rows.len());
+        for (size, flags, name) in rows {
+            bytes.extend_from_slice(&size.to_ne_bytes());
+            bytes.extend_from_slice(flags);
+            bytes.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(name);
+        }
+        bytes
+    }
+
+    fn fixed(parameter: i64, rows: &[&[i64]]) -> Vec<u8> {
+        let mut bytes = header(parameter, rows.len());
+        for row in rows {
+            for value in *row {
+                bytes.extend_from_slice(&value.to_ne_bytes());
+            }
+        }
+        bytes
+    }
+
+    fn assert_result(op: u8, input: &[u8], expected: &[i64]) {
+        // Offset both buffers by one: the ABI promises byte alignment only.
+        let mut unaligned = vec![0xaa];
+        unaligned.extend_from_slice(input);
+        let mut output = [0x5a; 82];
+        let required = expected.len() * 8;
+        assert_eq!(
+            unsafe {
+                call(
+                    op,
+                    unaligned.as_ptr().add(1),
+                    input.len(),
+                    output.as_mut_ptr().add(1),
+                    required,
+                )
+            },
+            required as i32
+        );
+        let actual: Vec<i64> = output[1..required + 1]
+            .chunks_exact(8)
+            .map(|bytes| i64::from_ne_bytes(bytes.try_into().unwrap()))
+            .collect();
+        assert_eq!(actual, expected);
+        assert_eq!(output[0], 0x5a);
+        assert!(output[required + 1..].iter().all(|byte| *byte == 0x5a));
+    }
+
+    fn assert_invalid(op: u8, input: &[u8]) {
+        for capacity in [0, 1, 80] {
+            let mut output = [0x5a; 80];
+            assert_eq!(
+                unsafe {
+                    call(
+                        op,
+                        input.as_ptr(),
+                        input.len(),
+                        output.as_mut_ptr(),
+                        capacity,
+                    )
+                },
+                -1,
+                "operation {op}, frame {input:?}, capacity {capacity}"
+            );
+            assert_eq!(output, [0x5a; 80]);
+        }
+    }
+
+    #[test]
+    fn w426_file_manager_counts_names_zero_sizes_and_limit_strictly() {
+        let input = named(3, &[(0, &[], b"a"), (5, &[], b"bc"), (7, &[], b"\xff")]);
+        assert_result(1, &input, &[3, 3, 12, 1, 4, 0, 0]);
+        assert_result(
+            1,
+            &named(2, &[(0, &[], b"a"), (1, &[], b"b"), (2, &[], b"c")]),
+            &[3, 3, 3, 1, 3, 1, 0],
+        );
+        assert_result(
+            1,
+            &named(i64::MIN, &[(1, &[], b"x")]),
+            &[1, 1, 1, 0, 1, 1, 0],
+        );
+        assert_result(
+            1,
+            &named(i64::MAX, &[(i64::MAX, &[], b"a"), (1, &[], b"b")]),
+            &[2, 2, i64::MAX, 0, 2, 0, 0],
+        );
+    }
+
+    #[test]
+    fn w426_fallback_matches_php_image_suffix_and_usable_byte_rules() {
+        let input = named(
+            0,
+            &[
+                (10, &[0, 1], b"a.JPG"),
+                (20, &[1, 1], b"b.jpeg"),
+                (30, &[0, 0], b"c.PNG\n"),
+                (40, &[0, 1], b"d.webp\n\n"),
+                (50, &[0, 1], b"e.jpg\r\n"),
+                (60, &[0, 1], b""),
+                (70, &[0, 0], b".WeBp"),
+                (80, &[0, 1], b"z.jpEg\n"),
+            ],
+        );
+        assert_result(2, &input, &[8, 5, 4, 2, 190, 0]);
+        assert_result(
+            2,
+            &named(
+                0,
+                &[
+                    (i64::MAX, &[0, 0], b"a.png"),
+                    (1, &[0, 0], b"b.jpg"),
+                    (i64::MAX, &[1, 0], b"c.jpg"),
+                ],
+            ),
+            &[3, 3, 2, 0, i64::MAX, 0],
+        );
+    }
+
+    #[test]
+    fn w426_sync_preserves_sequential_scope_pending_and_finish_semantics() {
+        assert_result(
+            3,
+            &fixed(
+                1,
+                &[
+                    &[1, 7],
+                    &[0, 9],
+                    &[1, 9],
+                    &[1, 9],
+                    &[1, 8],
+                    &[2, 8],
+                    &[2, 9],
+                    &[2, 9],
+                    &[1, 9],
+                    &[3, 0],
+                    &[3, 0],
+                ],
+            ),
+            &[11, 5, 3, 3, 1, 0, 0, 0, 0, 0],
+        );
+        assert_result(
+            3,
+            &fixed(1, &[&[0, i64::MIN], &[1, i64::MIN]]),
+            &[2, 1, 0, 1, 0, 1, 1, i64::MIN, 0, 0],
+        );
+        assert_result(
+            3,
+            &fixed(1, &[&[0, 8], &[1, 8], &[0, i64::MAX]]),
+            &[3, 1, 0, 1, 0, 0, 1, i64::MAX, 0, 0],
+        );
+        assert_result(
+            3,
+            &fixed(0, &[&[0, 8], &[1, 8], &[2, 8], &[3, 8]]),
+            &[4, 1, 1, 0, 0, 0, 0, 0, 0, 0],
+        );
+        assert_result(
+            3,
+            &fixed(1, &[&[0, 0], &[1, 0], &[3, i64::MIN]]),
+            &[3, 1, 1, 1, 0, 0, 0, 0, 0, 0],
+        );
+    }
+
+    #[test]
+    fn w426_sevenzip_counts_flags_and_accepts_noncontrol_binary_names() {
+        assert_result(
+            4,
+            &named(
+                0,
+                &[
+                    (0, &[0, 0], b"a"),
+                    (7, &[1, 0], b"b"),
+                    (8, &[0, 1], b"\xc2\xa0"),
+                    (9, &[1, 1], b"\xff\x80"),
+                ],
+            ),
+            &[4, 4, 24, 2, 2, 0],
+        );
+        assert_result(
+            4,
+            &named(0, &[(i64::MAX, &[1, 1], b"a"), (1, &[1, 1], b"b")]),
+            &[2, 2, i64::MAX, 2, 2, 0],
+        );
+    }
+
+    #[test]
+    fn w426_batch_clamps_signed_values_and_saturates_products_and_sums() {
+        assert_result(
+            5,
+            &fixed(
+                0,
+                &[
+                    &[3, 4, 8, 10],
+                    &[0, 5, -1, -2],
+                    &[-1, 3, 9, 20],
+                    &[2, 0, 0, 0],
+                ],
+            ),
+            &[4, 3, 12, 9, 30, 0],
+        );
+        assert_result(
+            5,
+            &fixed(
+                0,
+                &[
+                    &[i64::MAX, i64::MAX, i64::MAX, i64::MAX],
+                    &[1, 1, 0, 1],
+                    &[i64::MIN, i64::MIN, i64::MIN, i64::MIN],
+                ],
+            ),
+            &[3, 1, i64::MAX, i64::MAX, i64::MAX, 0],
+        );
+    }
+
+    #[test]
+    fn w426_empty_frames_have_fixed_width_zero_results() {
+        assert_result(1, &header(i64::MIN, 0), &[0; 7]);
+        assert_result(2, &header(0, 0), &[0; 6]);
+        assert_result(3, &header(1, 0), &[0; 10]);
+        assert_result(4, &header(0, 0), &[0; 6]);
+        assert_result(5, &header(0, 0), &[0; 6]);
+    }
+
+    fn examples() -> Vec<Vec<u8>> {
+        vec![
+            named(0, &[(0, &[], b"a")]),
+            named(0, &[(0, &[0, 0], b"a.jpg")]),
+            fixed(1, &[&[0, 7]]),
+            named(0, &[(0, &[0, 0], b"a")]),
+            fixed(0, &[&[1, 1, 1, 1]]),
+        ]
+    }
+
+    #[test]
+    fn w426_rejects_every_truncation_trailing_bytes_and_wrong_counts() {
+        for (index, input) in examples().iter().enumerate() {
+            let op = index as u8 + 1;
+            for length in 0..input.len() {
+                assert_invalid(op, &input[..length]);
+            }
+            let mut trailing = input.clone();
+            trailing.push(0);
+            assert_invalid(op, &trailing);
+            for count in [0_u32, 2, 100_001, u32::MAX] {
+                let mut wrong = input.clone();
+                wrong[8..12].copy_from_slice(&count.to_le_bytes());
+                assert_invalid(op, &wrong);
+            }
+        }
+        for op in [0, 6, 255] {
+            assert_invalid(op, &header(0, 0));
+        }
+        for op in [2, 4, 5] {
+            for parameter in [i64::MIN, -1, 1, i64::MAX] {
+                assert_invalid(op, &header(parameter, 0));
+            }
+        }
+        for parameter in [i64::MIN, -1, 2, i64::MAX] {
+            assert_invalid(3, &header(parameter, 0));
+        }
+    }
+
+    #[test]
+    fn w426_rejects_bad_sizes_names_flags_operations_and_declared_name_lengths() {
+        for op in [1, 2, 4] {
+            let flags: &[u8] = if op == 1 { &[] } else { &[0, 0] };
+            for size in [-1, i64::MIN] {
+                assert_invalid(op, &named(0, &[(size, flags, b"x")]));
+            }
+            let mut length = named(0, &[(0, flags, b"x")]);
+            let offset = 20 + flags.len();
+            for count in [2_u32, u32::MAX] {
+                length[offset..offset + 4].copy_from_slice(&count.to_le_bytes());
+                assert_invalid(op, &length);
+            }
+            if op != 2 {
+                assert_invalid(op, &named(0, &[(0, flags, b"")]));
+            }
+        }
+        for op in [2, 4] {
+            for flags in [&[2, 0][..], &[0, 2], &[255, 1], &[1, 255]] {
+                assert_invalid(op, &named(0, &[(0, flags, b"x")]));
+            }
+        }
+        for operation in [-1, 4, i64::MIN, i64::MAX] {
+            assert_invalid(3, &fixed(1, &[&[operation, 0]]));
+        }
+        for byte in (0..=0x1f).chain([0x7f]) {
+            assert_invalid(4, &named(0, &[(0, &[0, 0], &[b'a', byte, b'b'])]));
+        }
+        for byte in 0x80..=0x9f {
+            assert_invalid(4, &named(0, &[(0, &[0, 0], &[b'a', 0xc2, byte, b'b'])]));
+        }
+    }
+
+    #[test]
+    fn w426_accepts_maximum_rows_and_rejects_one_more() {
+        let row = [0, 0, 0, 0];
+        assert_result(
+            5,
+            &fixed(0, &vec![row.as_slice(); 100_000]),
+            &[100_000, 100_000, 0, 0, 0, 0],
+        );
+        assert_invalid(5, &fixed(0, &vec![row.as_slice(); 100_001]));
+    }
+
+    #[test]
+    fn w426_accepts_exact_byte_limit_and_rejects_one_more_without_writes() {
+        let limit = 16_777_216;
+        let name = vec![b'x'; limit - 24];
+        let mut input = named(1, &[(1, &[], &name)]);
+        assert_eq!(input.len(), limit);
+        assert_result(1, &input, &[1, 1, 1, 0, 16_777_192, 0, 0]);
+        input.push(b'x');
+        let mut output = [0x5a; 80];
+        assert_eq!(
+            unsafe { call(1, input.as_ptr(), input.len(), output.as_mut_ptr(), 80) },
+            -1
+        );
+        assert_eq!(output, [0x5a; 80]);
+        // The maximum capacity is accepted without writing beyond the result.
+        let small = header(0, 0);
+        let mut large_output = vec![0x5a; limit];
+        assert_eq!(
+            unsafe {
+                call(
+                    1,
+                    small.as_ptr(),
+                    small.len(),
+                    large_output.as_mut_ptr(),
+                    limit,
+                )
+            },
+            56
+        );
+        assert!(large_output[..56].iter().all(|byte| *byte == 0));
+        assert!(large_output[56..].iter().all(|byte| *byte == 0x5a));
+    }
+
+    #[test]
+    fn w426_capacity_queries_and_short_outputs_never_write() {
+        for (index, input) in examples().iter().enumerate() {
+            let op = index as u8 + 1;
+            let required = match op {
+                1 => 56,
+                3 => 80,
+                _ => 48,
+            };
+            for capacity in [0, 1, required - 1] {
+                let mut output = [0x5a; 80];
+                assert_eq!(
+                    unsafe {
+                        call(
+                            op,
+                            input.as_ptr(),
+                            input.len(),
+                            output.as_mut_ptr(),
+                            capacity,
+                        )
+                    },
+                    -(required as i32)
+                );
+                assert_eq!(output, [0x5a; 80]);
+            }
+        }
+    }
+
+    #[test]
+    fn w426_checks_null_lengths_address_wrap_and_whole_or_partial_overlap_first() {
+        let input = header(0, 0);
+        let mut output = [0x5a; 80];
+        let limit = 16_777_216;
+        let invalid = [
+            (std::ptr::null(), input.len(), output.as_mut_ptr(), 80),
+            (std::ptr::null(), 0, output.as_mut_ptr(), 80),
+            (input.as_ptr(), input.len(), std::ptr::null_mut(), 80),
+            (input.as_ptr(), input.len(), std::ptr::null_mut(), 0),
+            (input.as_ptr(), limit + 1, output.as_mut_ptr(), 80),
+            (input.as_ptr(), usize::MAX, output.as_mut_ptr(), 80),
+            (input.as_ptr(), input.len(), output.as_mut_ptr(), limit + 1),
+            (input.as_ptr(), input.len(), output.as_mut_ptr(), usize::MAX),
+            (
+                usize::MAX as *const u8,
+                input.len(),
+                output.as_mut_ptr(),
+                80,
+            ),
+            (input.as_ptr(), input.len(), usize::MAX as *mut u8, 80),
+            (
+                (usize::MAX - 10) as *const u8,
+                input.len(),
+                output.as_mut_ptr(),
+                80,
+            ),
+            (
+                input.as_ptr(),
+                input.len(),
+                (usize::MAX - 79) as *mut u8,
+                80,
+            ),
+        ];
+        for (source, length, destination, capacity) in invalid {
+            assert_eq!(
+                unsafe { call(1, source, length, destination, capacity) },
+                -1
+            );
+            assert_eq!(output, [0x5a; 80]);
+        }
+        let mut shared = [0x5a; 128];
+        shared[32..44].copy_from_slice(&input);
+        let before = shared;
+        for (offset, capacity) in [(32, 80), (33, 1), (0, 33), (43, 1)] {
+            assert_eq!(
+                unsafe {
+                    call(
+                        1,
+                        shared.as_ptr().add(32),
+                        12,
+                        shared.as_mut_ptr().add(offset),
+                        capacity,
+                    )
+                },
+                -1
+            );
+            assert_eq!(shared, before);
+        }
+        // Adjacent ranges do not overlap, even when the output is too short.
+        assert_eq!(
+            unsafe {
+                call(
+                    1,
+                    shared.as_ptr().add(32),
+                    12,
+                    shared.as_mut_ptr().add(44),
+                    1,
+                )
+            },
+            -56
+        );
+        assert_eq!(shared, before);
+    }
+}
+
+const W426_MAX_BYTES: usize = 16_777_216;
+const W426_MAX_ROWS: usize = 100_000;
+
+fn w426_take<'a>(remaining: &mut &'a [u8], length: usize) -> Option<&'a [u8]> {
+    let value = remaining.get(..length)?;
+    *remaining = &remaining[length..];
+    Some(value)
+}
+
+fn w426_i64(remaining: &mut &[u8]) -> Option<i64> {
+    Some(i64::from_ne_bytes(
+        w426_take(remaining, 8)?.try_into().ok()?,
+    ))
+}
+
+fn w426_boolean(remaining: &mut &[u8]) -> Option<bool> {
+    match w426_take(remaining, 1)?[0] {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
+}
+
+fn w426_name<'a>(remaining: &mut &'a [u8]) -> Option<&'a [u8]> {
+    let length = u32::from_le_bytes(w426_take(remaining, 4)?.try_into().ok()?) as usize;
+    w426_take(remaining, length)
+}
+
+fn w426_compute(operation: u8, mut remaining: &[u8]) -> Option<([i64; 10], usize)> {
+    let parameter = w426_i64(&mut remaining)?;
+    let count = u32::from_le_bytes(w426_take(&mut remaining, 4)?.try_into().ok()?) as usize;
+    if count > W426_MAX_ROWS
+        || match operation {
+            1 => false,
+            3 => !matches!(parameter, 0 | 1),
+            2 | 4 | 5 => parameter != 0,
+            _ => true,
+        }
+    {
+        return None;
+    }
+    let mut result = [0_i64; 10];
+    result[0] = count as i64;
+    let mut scope = None;
+    let mut pending = false;
+    for _ in 0..count {
+        match operation {
+            1 => {
+                let size = w426_i64(&mut remaining)?;
+                let name = w426_name(&mut remaining)?;
+                if size < 0 || name.is_empty() {
+                    return None;
+                }
+                result[1] += 1;
+                result[2] = result[2].saturating_add(size);
+                result[3] += i64::from(size == 0);
+                result[4] = result[4].saturating_add(name.len() as i64);
+            }
+            2 | 4 => {
+                let size = w426_i64(&mut remaining)?;
+                let pass = w426_boolean(&mut remaining)?;
+                let flag = w426_boolean(&mut remaining)?;
+                let name = w426_name(&mut remaining)?;
+                if size < 0 {
+                    return None;
+                }
+                if operation == 2 {
+                    // PCRE's $ permits exactly one final LF, including with /i.
+                    let suffix_name = name.strip_suffix(b"\n").unwrap_or(name);
+                    let image = [b".jpg".as_slice(), b".jpeg", b".png", b".webp"]
+                        .iter()
+                        .any(|suffix| {
+                            suffix_name.len() >= suffix.len()
+                                && suffix_name[suffix_name.len() - suffix.len()..]
+                                    .eq_ignore_ascii_case(suffix)
+                        });
+                    result[1] += i64::from(image);
+                    if image && !pass {
+                        result[2] += 1;
+                        result[3] += i64::from(flag);
+                        result[4] = result[4].saturating_add(size);
+                    }
+                } else {
+                    if name.is_empty()
+                        || name.iter().any(|byte| *byte <= 0x1f || *byte == 0x7f)
+                        || name
+                            .windows(2)
+                            .any(|pair| pair[0] == 0xc2 && (0x80..=0x9f).contains(&pair[1]))
+                    {
+                        return None;
+                    }
+                    result[1] += 1;
+                    result[2] = result[2].saturating_add(size);
+                    result[3] += i64::from(pass);
+                    result[4] += i64::from(flag);
+                }
+            }
+            3 => {
+                let action = w426_i64(&mut remaining)?;
+                let release_id = w426_i64(&mut remaining)?;
+                match action {
+                    0 => {
+                        if parameter == 1 {
+                            scope = Some(release_id);
+                            pending = false;
+                        }
+                    }
+                    1 => {
+                        result[1] += 1;
+                        if parameter == 1 && scope == Some(release_id) {
+                            pending = true;
+                            result[3] += 1;
+                        } else {
+                            result[2] += 1;
+                        }
+                    }
+                    2 => {
+                        if parameter == 1 && scope == Some(release_id) {
+                            result[4] += i64::from(pending);
+                            pending = false;
+                        }
+                    }
+                    3 => {
+                        if parameter == 1 {
+                            result[2] += i64::from(scope.is_some() && pending);
+                            scope = None;
+                            pending = false;
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+            5 => {
+                let batch = w426_i64(&mut remaining)?;
+                let threads = w426_i64(&mut remaining)?;
+                let timeout = w426_i64(&mut remaining)?;
+                let max_bytes = w426_i64(&mut remaining)?;
+                result[1] += i64::from(batch <= 0 || threads <= 0);
+                result[2] = result[2].max(batch.max(0).saturating_mul(threads.max(0)));
+                result[3] = result[3].max(timeout.max(0));
+                result[4] = result[4].saturating_add(max_bytes.max(0));
+            }
+            _ => return None,
+        }
+    }
+    if !remaining.is_empty() {
+        return None;
+    }
+    let slots = match operation {
+        1 => {
+            result[5] = i64::from(result[1] > parameter.max(0));
+            7
+        }
+        3 => {
+            result[5] = i64::from(pending);
+            result[6] = i64::from(scope.is_some());
+            result[7] = scope.unwrap_or(0);
+            10
+        }
+        _ => 6,
+    };
+    Some((result, slots))
+}
+
+/// Computes Wave 42.6 file manager, image fallback, search sync, archive or batch summaries.
+///
+/// Frames begin with a native-endian signed i64 parameter and a little-endian u32
+/// row count. Operations 1, 2 and 4 use variable-length names; operations 3 and 5
+/// use respectively two and four native-endian i64 fields per row. Results use
+/// native-endian i64 slots: seven for operation 1, ten for 3, six otherwise.
+/// Returns the positive result byte count, its negative for insufficient capacity,
+/// or -1 for invalid input. Every negative return leaves output untouched.
+///
+/// # Safety
+///
+/// Both pointers must be nonnull. Input must be initialized and readable for
+/// `input_len` bytes and output writable for `out_cap` bytes, each within a single
+/// live allocation for the call. The ranges must not overlap. The caller must
+/// prevent concurrent mutation of input and concurrent access to output being
+/// written. Byte buffers need no extra alignment. This function checks nullness,
+/// lengths, address overflow and overlap before reading, but cannot establish
+/// allocation liveness, bounds, provenance or access permissions. A nonnull output
+/// with zero capacity is allowed for a capacity query.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w426_additional_file_manager_fallback_sync_sevenzip(
+    operation: u8,
+    input: *const u8,
+    input_len: usize,
+    output: *mut u8,
+    output_cap: usize,
+) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !(1..=5).contains(&operation)
+            || input.is_null()
+            || output.is_null()
+            || !(12..=W426_MAX_BYTES).contains(&input_len)
+            || output_cap > W426_MAX_BYTES
+        {
+            return -1;
+        }
+        let input_start = input as usize;
+        let output_start = output as usize;
+        let Some(input_end) = input_start.checked_add(input_len) else {
+            return -1;
+        };
+        let Some(output_end) = output_start.checked_add(output_cap) else {
+            return -1;
+        };
+        if output_cap != 0 && input_start < output_end && output_start < input_end {
+            return -1;
+        }
+        // Every mechanically checkable pointer condition precedes the first read.
+        let bytes = unsafe { std::slice::from_raw_parts(input, input_len) };
+        let Some((result, slots)) = w426_compute(operation, bytes) else {
+            return -1;
+        };
+        let required = slots * 8;
+        if output_cap < required {
+            return -(required as i32);
+        }
+        let mut encoded = [0_u8; 80];
+        for (destination, value) in encoded.chunks_exact_mut(8).zip(result) {
+            destination.copy_from_slice(&value.to_ne_bytes());
+        }
+        // A complete valid frame and sufficient capacity are required before writing.
+        unsafe { std::ptr::copy_nonoverlapping(encoded.as_ptr(), output, required) };
+        required as i32
+    }))
+    .unwrap_or(-1)
+}
