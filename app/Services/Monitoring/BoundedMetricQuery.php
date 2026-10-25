@@ -6,6 +6,7 @@ namespace App\Services\Monitoring;
 
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Database\MySqlConnection;
 use Illuminate\Database\Query\Builder;
 use LogicException;
@@ -18,7 +19,20 @@ class BoundedMetricQuery
         ssize_t nntmux_bounded_metric_rewrite_sql(uint32_t is_maria, const char *sql_ptr, size_t sql_len, char *out_buf, size_t out_cap);
         C;
 
+    public const string W49_FFI_CDEF = 'int64_t nntmux_w49_bounded_metric_query_rewrite_plan(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /** Rust: ~2.4-4.3x mean, >=1.66x p99 in every strict run; see tests/Unit/RustMonitoringBoundedMetricFamilyExporterSnapshotJwtW49ParityTest.php. */
+    private const bool W49_RUST_FFI_DEFAULT = true;
+
     private static bool $useRustFfi = false;
+
+    private static ?bool $w49RustFfi = null;
+
+    private static FFI|false|null $w49Ffi = null;
+
+    private static ?CData $w49Out = null;
+
+    private static int $w49OutCap = 0;
 
     private static FFI|false|null $ffi = null;
 
@@ -53,6 +67,72 @@ class BoundedMetricQuery
         }
 
         return self::$ffi === false ? null : self::$ffi;
+    }
+
+    public static function usesW49RustFfi(): bool
+    {
+        return self::$w49RustFfi ?? self::W49_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 49.5 batch helper routed to Rust or PHP, then restores the routing. */
+    public static function withW49RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$w49RustFfi;
+        self::$w49RustFfi = $enabled;
+
+        try {
+            return $callback();
+        } finally {
+            self::$w49RustFfi = $previous;
+        }
+    }
+
+    /**
+     * Plans {@see rewriteSqlPhp()} for many metric queries. Per SQL: `[rewritten, rewritten_len,
+     * rewritten_xxh64]`, where `rewritten` is 1 when a statement time limit was added.
+     *
+     * @param  list<string>  $sqls
+     * @return list<list<int>>
+     */
+    public static function rewritePlanBatch(array $sqls, bool $isMaria): array
+    {
+        return self::usesW49RustFfi() ? self::rewritePlanBatchNative($sqls, $isMaria) : self::rewritePlanBatchPhp($sqls, $isMaria);
+    }
+
+    /**
+     * @param  list<string>  $sqls
+     * @return list<list<int>>
+     */
+    public static function rewritePlanBatchPhp(array $sqls, bool $isMaria): array
+    {
+        $rows = [];
+
+        foreach ($sqls as $sql) {
+            $rewritten = self::rewriteSqlPhp($sql, $isMaria);
+            /** @var array{1: int} $hash */
+            $hash = unpack('J', hash('xxh64', $rewritten, true));
+            $rows[] = [$rewritten === $sql ? 0 : 1, \strlen($rewritten), $hash[1]];
+        }
+
+        return $rows;
+    }
+
+    /**
+     * @param  list<string>  $sqls
+     * @return list<list<int>>
+     */
+    public static function rewritePlanBatchNative(array $sqls, bool $isMaria): array
+    {
+        $count = \count($sqls);
+        if ($count === 0) {
+            return [];
+        }
+
+        // NUL-delimited fields; Rust declines a value holding NUL (the field count no longer matches).
+        $data = implode("\0", $sqls);
+        $words = self::w49Words($count, $isMaria ? 1 : 0, $data, '', 3 * $count);
+
+        return $words === null ? self::rewritePlanBatchPhp($sqls, $isMaria) : array_chunk($words, 3);
     }
 
     /** @return list<object> */
@@ -115,6 +195,44 @@ class BoundedMetricQuery
             return $written === 0 ? '' : FFI::string($scratch, $written);
         } catch (Throwable) {
             return self::rewriteSqlPhp($sql, $isMaria);
+        }
+    }
+
+    /**
+     * Exactly $words output words from the Wave 49.5 Rust helper, or null to fall back to PHP.
+     *
+     * @return array<int, int>|null
+     */
+    private static function w49Words(int $count, int $flags, string $data, string $ints, int $words): ?array
+    {
+        if (self::$w49Ffi === null) {
+            $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+            self::$w49Ffi = RustPipelineLibrary::resolveDomain('search_w49', self::W49_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+            self::$w49Out = null;
+            self::$w49OutCap = 0;
+        }
+        $ffi = self::$w49Ffi;
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+
+        try {
+            if (self::$w49Out === null || $words > self::$w49OutCap) {
+                $cap = max(1024, $words);
+                self::$w49Out = $ffi->new('int64_t['.$cap.']');
+                self::$w49OutCap = $cap;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w49_bounded_metric_query_rewrite_plan($count, $flags, $data, \strlen($data), $ints, \strlen($ints), self::$w49Out, self::$w49OutCap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('P*', FFI::string(self::$w49Out, $words * 8));
+
+            return \is_array($values) ? $values : null;
+        } catch (Throwable) {
+            return null;
         }
     }
 }

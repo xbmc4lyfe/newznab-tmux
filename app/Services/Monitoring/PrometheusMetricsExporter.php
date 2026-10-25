@@ -26,6 +26,19 @@ class PrometheusMetricsExporter
         ssize_t nntmux_prometheus_exporter_truncate_body(const char *body_ptr, size_t body_len, size_t max_chars, char *out_buf, size_t out_cap);
         C;
 
+    public const string W49_FFI_CDEF = 'int64_t nntmux_w49_prometheus_exporter_push_target(size_t count, int64_t flags, const char *data, size_t data_len, const char *ints, size_t ints_len, int64_t *out, size_t out_cap);';
+
+    /** Rust: ~2.2-3.1x mean, >=1.77x p99 in every strict run; see tests/Unit/RustMonitoringBoundedMetricFamilyExporterSnapshotJwtW49ParityTest.php. */
+    private const bool W49_RUST_FFI_DEFAULT = true;
+
+    private static ?bool $w49RustFfi = null;
+
+    private static FFI|false|null $w49Ffi = null;
+
+    private static ?CData $w49Out = null;
+
+    private static int $w49OutCap = 0;
+
     private static bool $useRustFfi = false;
 
     private static FFI|false|null $ffi = null;
@@ -73,6 +86,76 @@ class PrometheusMetricsExporter
         }
 
         return self::$ffi === false ? null : self::$ffi;
+    }
+
+    public static function usesW49RustFfi(): bool
+    {
+        return self::$w49RustFfi ?? self::W49_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 49.5 batch helper routed to Rust or PHP, then restores the routing. */
+    public static function withW49RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$w49RustFfi;
+        self::$w49RustFfi = $enabled;
+
+        try {
+            return $callback();
+        } finally {
+            self::$w49RustFfi = $previous;
+        }
+    }
+
+    /**
+     * Summarizes many Pushgateway targets and rejected-push bodies. Per `[base_url, job, body, max_chars]`
+     * target: `[url_len, url_xxh64, body_len, body_xxh64]` for {@see formatPushgatewayUrlPhp()} and
+     * {@see truncateErrorBodyPhp()}.
+     *
+     * @param  list<array{string, string, string, int}>  $targets
+     * @return list<list<int>>
+     */
+    public static function pushTargetBatch(array $targets): array
+    {
+        return self::usesW49RustFfi() ? self::pushTargetBatchNative($targets) : self::pushTargetBatchPhp($targets);
+    }
+
+    /**
+     * @param  list<array{string, string, string, int}>  $targets
+     * @return list<list<int>>
+     */
+    public static function pushTargetBatchPhp(array $targets): array
+    {
+        $rows = [];
+
+        foreach ($targets as [$baseUrl, $job, $body, $maxChars]) {
+            $url = self::formatPushgatewayUrlPhp($baseUrl, $job);
+            $kept = self::truncateErrorBodyPhp($body, $maxChars);
+            /** @var array{1: int} $urlHash */
+            $urlHash = unpack('J', hash('xxh64', $url, true));
+            /** @var array{1: int} $bodyHash */
+            $bodyHash = unpack('J', hash('xxh64', $kept, true));
+            $rows[] = [\strlen($url), $urlHash[1], \strlen($kept), $bodyHash[1]];
+        }
+
+        return $rows;
+    }
+
+    /**
+     * @param  list<array{string, string, string, int}>  $targets
+     * @return list<list<int>>
+     */
+    public static function pushTargetBatchNative(array $targets): array
+    {
+        $count = \count($targets);
+        if ($count === 0) {
+            return [];
+        }
+
+        // NUL-delimited columns (base URLs, jobs, bodies); Rust declines a value holding NUL (the field count no longer matches) or a body PHP repairs.
+        $data = implode("\0", array_column($targets, 0))."\0".implode("\0", array_column($targets, 1))."\0".implode("\0", array_column($targets, 2));
+        $words = self::w49Words($count, $data, pack('P*', ...array_column($targets, 3)), 4 * $count);
+
+        return $words === null ? self::pushTargetBatchPhp($targets) : array_chunk($words, 4);
     }
 
     /**
@@ -294,5 +377,43 @@ class PrometheusMetricsExporter
         }
 
         return self::$doubleSlot;
+    }
+
+    /**
+     * Exactly $words output words from the Wave 49.5 Rust helper, or null to fall back to PHP.
+     *
+     * @return array<int, int>|null
+     */
+    private static function w49Words(int $count, string $data, string $ints, int $words): ?array
+    {
+        if (self::$w49Ffi === null) {
+            $path = getenv('NNTMUX_PIPELINE_FFI_LIB');
+            self::$w49Ffi = RustPipelineLibrary::resolveDomain('search_w49', self::W49_FFI_CDEF, \is_string($path) && $path !== '' ? $path : null) ?? false;
+            self::$w49Out = null;
+            self::$w49OutCap = 0;
+        }
+        $ffi = self::$w49Ffi;
+        if (! $ffi instanceof FFI) {
+            return null;
+        }
+
+        try {
+            if (self::$w49Out === null || $words > self::$w49OutCap) {
+                $cap = max(1024, $words);
+                self::$w49Out = $ffi->new('int64_t['.$cap.']');
+                self::$w49OutCap = $cap;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w49_prometheus_exporter_push_target($count, 0, $data, \strlen($data), $ints, \strlen($ints), self::$w49Out, self::$w49OutCap);
+            if ($written !== $words) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('P*', FFI::string(self::$w49Out, $words * 8));
+
+            return \is_array($values) ? $values : null;
+        } catch (Throwable) {
+            return null;
+        }
     }
 }
