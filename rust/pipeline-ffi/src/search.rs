@@ -27462,3 +27462,712 @@ mod wave39_5_admin_settings_monitoring_logs_reconcile {
         }
     }
 }
+
+/// Wave 40.5 second-pass search helpers: Manticore bulk upsert batch sizing
+/// (`ManticoreSearchDriver`), Elasticsearch `_bulk` response statuses
+/// (`ElasticSearchDriver`), search driver fallback telemetry (`SearchService`),
+/// circuit breaker state windows (`SearchFailureTracker`) and release search
+/// document hydration completeness (`ReleaseIndexProjection`). PHP marshals
+/// each call into count-prefixed, length-prefixed byte strings; results use
+/// the same framing.
+mod wave40_5_manticore_elastic_search_service_circuit {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const DECLINE: isize = -1;
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+    const MAX_PARTS: usize = 1 << 20;
+    /// Bytes stripped by PHP's default `trim()`.
+    const PHP_TRIM: &[u8] = b" \t\n\r\0\x0B";
+    /// Braces around one estimated upsert document.
+    const DOC_OVERHEAD: i64 = 2;
+    /// Quotes, colon and comma around one estimated field.
+    const FIELD_OVERHEAD: i64 = 4;
+    /// Parts per hydration row: id, searchname, category, five media ids, size.
+    const HYDRATION_ROW_PARTS: usize = 9;
+
+    fn unpack(input: &[u8]) -> Option<Vec<&[u8]>> {
+        let count = u32::from_le_bytes(input.get(..4)?.try_into().ok()?) as usize;
+        if count > MAX_PARTS || count > (input.len() - 4) / 4 {
+            return None;
+        }
+        let mut cursor = 4usize;
+        let mut parts = Vec::with_capacity(count);
+        for _ in 0..count {
+            let length_end = cursor.checked_add(4)?;
+            let length =
+                u32::from_le_bytes(input.get(cursor..length_end)?.try_into().ok()?) as usize;
+            let end = length_end.checked_add(length)?;
+            parts.push(input.get(length_end..end)?);
+            cursor = end;
+        }
+        (cursor == input.len()).then_some(parts)
+    }
+
+    fn pack(parts: &[Vec<u8>]) -> Option<Vec<u8>> {
+        let count = u32::try_from(parts.len()).ok()?;
+        let size = parts.iter().try_fold(4usize, |size, part| {
+            u32::try_from(part.len()).ok()?;
+            size.checked_add(4)?.checked_add(part.len())
+        })?;
+        if size > isize::MAX as usize {
+            return None;
+        }
+        let mut out = Vec::with_capacity(size);
+        out.extend_from_slice(&count.to_le_bytes());
+        for part in parts {
+            out.extend_from_slice(&(part.len() as u32).to_le_bytes());
+            out.extend_from_slice(part);
+        }
+        Some(out)
+    }
+
+    /// Canonical decimal produced by PHP `(string) $int`.
+    fn integer(bytes: &[u8]) -> Option<i64> {
+        if bytes.is_empty() || bytes.len() > 20 {
+            return None;
+        }
+        let value: i64 = std::str::from_utf8(bytes).ok()?.parse().ok()?;
+        (value.to_string().as_bytes() == bytes).then_some(value)
+    }
+
+    /// Empty means "not an integer" (counts as zero); otherwise canonical.
+    fn optional_integer(bytes: &[u8]) -> Option<i64> {
+        if bytes.is_empty() {
+            Some(0)
+        } else {
+            integer(bytes)
+        }
+    }
+
+    fn text(value: i64) -> Vec<u8> {
+        value.to_string().into_bytes()
+    }
+
+    fn bit(value: bool) -> Vec<u8> {
+        if value { b"1".to_vec() } else { b"0".to_vec() }
+    }
+
+    fn php_trim(bytes: &[u8]) -> &[u8] {
+        let start = bytes
+            .iter()
+            .position(|b| !PHP_TRIM.contains(b))
+            .unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .rposition(|b| !PHP_TRIM.contains(b))
+            .map_or(start, |i| i + 1);
+        &bytes[start..end]
+    }
+
+    fn len_i64(bytes: &[u8]) -> Option<i64> {
+        i64::try_from(bytes.len()).ok()
+    }
+
+    /// Mode 1 (`ManticoreSearchDriver::summarizeManticoreBulkUpsertBatch`):
+    /// `[max_batch_bytes, (id, field_count, (key, value) x
+    /// field_count)...]` -> `[documents, valid_ids, invalid_ids,
+    /// estimated_bytes, exceeds_batch_limit, chunks]`. Only documents with a
+    /// positive id contribute bytes; each is `2 + sum(len(key) + len(value) +
+    /// 4)`. Chunks pack documents greedily without exceeding the limit (an
+    /// oversized document gets its own chunk).
+    fn manticore_bulk_upsert(parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        let (max_bytes, mut rest) = parts.split_first()?;
+        let max_bytes = integer(max_bytes)?;
+        let (mut documents, mut valid, mut invalid) = (0i64, 0i64, 0i64);
+        let (mut total, mut chunks, mut current) = (0i64, 0i64, 0i64);
+        while !rest.is_empty() {
+            let [id, count, tail @ ..] = rest else {
+                return None;
+            };
+            let fields = usize::try_from(integer(count)?).ok()?.checked_mul(2)?;
+            if fields > tail.len() {
+                return None;
+            }
+            let (pairs, next) = tail.split_at(fields);
+            rest = next;
+            documents += 1;
+            if !optional_integer(id)?.is_positive() {
+                invalid += 1;
+                continue;
+            }
+            valid += 1;
+            let mut bytes = DOC_OVERHEAD;
+            for value in pairs {
+                bytes = bytes.checked_add(len_i64(value)?)?;
+            }
+            bytes = bytes.checked_add(FIELD_OVERHEAD.checked_mul((fields / 2) as i64)?)?;
+            total = total.checked_add(bytes)?;
+            if chunks == 0 || current.checked_add(bytes)? > max_bytes {
+                chunks += 1;
+                current = bytes;
+            } else {
+                current += bytes;
+            }
+        }
+        Some(vec![
+            text(documents),
+            text(valid),
+            text(invalid),
+            text(total),
+            bit(total > max_bytes),
+            text(chunks),
+        ])
+    }
+
+    /// Mode 2 (`ElasticSearchDriver::summarizeElasticBulkResponseItems`):
+    /// `[status...]` (empty for malformed items) -> `[items,
+    /// created_201, updated_200, conflict_409, throttled_429,
+    /// server_error_5xx, all_succeeded]`; success means 200..=299.
+    fn elastic_bulk_response(parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        let (mut created, mut updated, mut conflict, mut throttled, mut server) =
+            (0i64, 0i64, 0i64, 0i64, 0i64);
+        let mut all_ok = true;
+        for status in parts {
+            if status.is_empty() {
+                all_ok = false;
+                continue;
+            }
+            let status = integer(status)?;
+            match status {
+                201 => created += 1,
+                200 => updated += 1,
+                409 => conflict += 1,
+                429 => throttled += 1,
+                500..=599 => server += 1,
+                _ => {}
+            }
+            all_ok &= (200..=299).contains(&status);
+        }
+        Some(vec![
+            text(parts.len() as i64),
+            text(created),
+            text(updated),
+            text(conflict),
+            text(throttled),
+            text(server),
+            bit(all_ok),
+        ])
+    }
+
+    /// Mode 3 (`SearchService::summarizeSearchFallbackTelemetry`):
+    /// `[budget_ms, (ok, latency_ms)...]` with `ok` `1`/`0` and the
+    /// latency empty when unknown -> `[attempts, primary_hit, fallback_used,
+    /// total_latency_ms (saturating, negatives as 0), budget_exceeded,
+    /// winning_index (-1 when none)]`.
+    fn search_fallback(parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        let (budget, attempts) = parts.split_first()?;
+        let budget = integer(budget)?;
+        let (attempts, []) = attempts.as_chunks::<2>() else {
+            return None;
+        };
+        let (mut total, mut winner) = (0i64, -1i64);
+        for (index, attempt) in attempts.iter().enumerate() {
+            let ok = match attempt[0] {
+                b"1" => true,
+                b"0" => false,
+                _ => return None,
+            };
+            if ok && winner < 0 {
+                winner = index as i64;
+            }
+            total = total.saturating_add(optional_integer(attempt[1])?.max(0));
+        }
+        let count = attempts.len() as i64;
+        Some(vec![
+            text(count),
+            bit(winner == 0),
+            bit(count > 1),
+            text(total),
+            bit(total > budget),
+            text(winner),
+        ])
+    }
+
+    /// Mode 4 (`SearchFailureTracker::evaluateCircuitStateWindow`):
+    /// `[failures, threshold, opened_at, now, cooldown]` -> `[state,
+    /// allow_probe, remaining_cooldown, trip_on_next_failure]`. Failures and
+    /// cooldown clamp at 0, the threshold at 1; a future `opened_at` counts
+    /// as zero elapsed time.
+    fn circuit_window(parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        let [failures, threshold, opened_at, now, cooldown] = parts else {
+            return None;
+        };
+        let failures = integer(failures)?.max(0);
+        let threshold = integer(threshold)?.max(1);
+        let opened_at = integer(opened_at)?;
+        let now = integer(now)?;
+        let cooldown = integer(cooldown)?.max(0);
+        if failures < threshold {
+            return Some(vec![
+                b"closed".to_vec(),
+                bit(false),
+                text(0),
+                bit(failures >= threshold - 1),
+            ]);
+        }
+        let elapsed = if opened_at > now {
+            0
+        } else {
+            now.saturating_sub(opened_at)
+        };
+        let remaining = (cooldown - elapsed).max(0);
+        let half_open = remaining == 0;
+        Some(vec![
+            if half_open {
+                b"half_open".to_vec()
+            } else {
+                b"open".to_vec()
+            },
+            bit(half_open),
+            text(remaining),
+            bit(half_open),
+        ])
+    }
+
+    /// Positive identifier: 1..=18 ASCII digits with at least one non-zero
+    /// digit (PHP marshals positive ints as `1`).
+    fn identifier(bytes: &[u8]) -> bool {
+        (1..=18).contains(&bytes.len())
+            && bytes.iter().all(u8::is_ascii_digit)
+            && bytes.iter().any(|b| *b != b'0')
+    }
+
+    /// Mode 5 (`ReleaseIndexProjection::summarizeHydrationBatchCompleteness`):
+    /// rows of `[id, searchname, category, imdbid, tmdbid, tvdb,
+    /// videos_id, anidbid, size]` -> `[rows, with_searchname, with_category,
+    /// with_external_media_id, zero_size, invalid]`. Rows without a positive
+    /// id are invalid and excluded from the other counts.
+    fn hydration_completeness(parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        let (rows, []) = parts.as_chunks::<HYDRATION_ROW_PARTS>() else {
+            return None;
+        };
+        let (mut named, mut categorized, mut media, mut zero, mut invalid) =
+            (0i64, 0i64, 0i64, 0i64, 0i64);
+        for row in rows {
+            if !identifier(row[0]) {
+                invalid += 1;
+                continue;
+            }
+            named += i64::from(!php_trim(row[1]).is_empty());
+            categorized += i64::from(identifier(row[2]));
+            media += i64::from(row[3..8].iter().any(|id| identifier(id)));
+            zero += i64::from(!identifier(row[8]));
+        }
+        Some(vec![
+            text(rows.len() as i64),
+            text(named),
+            text(categorized),
+            text(media),
+            text(zero),
+            text(invalid),
+        ])
+    }
+
+    fn transform(mode: u32, parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+        match mode {
+            1 => manticore_bulk_upsert(parts),
+            2 => elastic_bulk_response(parts),
+            3 => search_fallback(parts),
+            4 => circuit_window(parts),
+            5 => hydration_completeness(parts),
+            _ => None,
+        }
+    }
+
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> Option<bool> {
+        if a_len == 0 || b_len == 0 {
+            return Some(false);
+        }
+        let a_end = a.checked_add(a_len)?;
+        let b_end = b.checked_add(b_len)?;
+        Some(a < b_end && b < a_end)
+    }
+
+    /// Dispatch count-prefixed, length-prefixed byte strings (little-endian
+    /// u32). Returns written bytes, `-needed` when `cap` is too small, or `-1`
+    /// for invalid input, mode, overlapping buffers or fields. Failure never
+    /// writes to the output buffer. Results are at least four bytes, so `-1`
+    /// never means "one byte needed".
+    ///
+    /// # Safety
+    /// Non-null pointers must refer to readable/writable allocations of the
+    /// declared lengths. Null pointers require zero length/capacity. Input and
+    /// output must not overlap.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w40_manticore_elastic_search_service_circuit(
+        mode: u32,
+        input: *const u8,
+        input_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if input_len > MAX_INPUT
+                || input_len > isize::MAX as usize
+                || cap > isize::MAX as usize
+                || (input.is_null() && input_len != 0)
+                || (out.is_null() && cap != 0)
+            {
+                return DECLINE;
+            }
+            match overlaps(input as usize, input_len, out as usize, cap) {
+                Some(false) => {}
+                _ => return DECLINE,
+            }
+            let input = if input_len == 0 {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(input, input_len) }
+            };
+            let Some(parts) = unpack(input) else {
+                return DECLINE;
+            };
+            let Some(result) = transform(mode, &parts).and_then(|parts| pack(&parts)) else {
+                return DECLINE;
+            };
+            if cap < result.len() || out.is_null() {
+                return -(result.len() as isize);
+            }
+            unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), out, result.len()) };
+            result.len() as isize
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn packet(parts: &[&[u8]]) -> Vec<u8> {
+            pack(&parts.iter().map(|part| part.to_vec()).collect::<Vec<_>>()).unwrap()
+        }
+
+        fn call(mode: u32, parts: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+            let input = packet(parts);
+            let mut out = vec![0u8; input.len() * 4 + 4096];
+            let written = unsafe {
+                nntmux_w40_manticore_elastic_search_service_circuit(
+                    mode,
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            if written < 0 {
+                return None;
+            }
+            out.truncate(written as usize);
+            Some(unpack(&out)?.into_iter().map(<[u8]>::to_vec).collect())
+        }
+
+        fn strings(items: &[&str]) -> Vec<Vec<u8>> {
+            items.iter().map(|item| item.as_bytes().to_vec()).collect()
+        }
+
+        #[test]
+        fn w40_manticore_bulk_upsert_batch() {
+            // Doc 1: 2 + (2+1+4) + (4+5+4) = 22; doc 2 invalid; doc 3: 2 + (2+2+4) = 10.
+            assert_eq!(
+                call(
+                    1,
+                    &[
+                        b"25", b"1", b"2", b"id", b"1", b"name", b"hello", b"", b"0", b"7", b"1",
+                        b"id", b"07"
+                    ]
+                )
+                .unwrap(),
+                strings(&["3", "2", "1", "32", "1", "2"])
+            );
+            assert_eq!(
+                call(1, &[b"100", b"-4", b"0", b"5", b"0"]).unwrap(),
+                strings(&["2", "1", "1", "2", "0", "1"])
+            );
+            assert_eq!(
+                call(1, &[b"0", b"1", b"0", b"2", b"0"]).unwrap(),
+                strings(&["2", "2", "0", "4", "1", "2"])
+            );
+            assert_eq!(
+                call(1, &[b"8388608"]).unwrap(),
+                strings(&["0", "0", "0", "0", "0", "0"])
+            );
+            assert_eq!(call(1, &[b"10", b"1", b"1", b"id"]), None);
+            assert_eq!(call(1, &[b"10", b"1"]), None);
+            assert_eq!(call(1, &[b"10", b"01", b"0"]), None);
+            assert_eq!(call(1, &[b"10", b"1", b"-1"]), None);
+            assert_eq!(call(1, &[]), None);
+        }
+
+        #[test]
+        fn w40_elastic_bulk_response_items() {
+            assert_eq!(
+                call(
+                    2,
+                    &[
+                        b"201", b"200", b"409", b"429", b"503", b"500", b"404", b"", b"201"
+                    ]
+                )
+                .unwrap(),
+                strings(&["9", "2", "1", "1", "1", "2", "0"])
+            );
+            assert_eq!(
+                call(2, &[b"201", b"204", b"200"]).unwrap(),
+                strings(&["3", "1", "1", "0", "0", "0", "1"])
+            );
+            assert_eq!(
+                call(2, &[]).unwrap(),
+                strings(&["0", "0", "0", "0", "0", "0", "1"])
+            );
+            assert_eq!(call(2, &[b"+201"]), None);
+        }
+
+        #[test]
+        fn w40_search_fallback_telemetry() {
+            assert_eq!(
+                call(3, &[b"1500", b"0", b"1200", b"1", b"400", b"1", b"-9"]).unwrap(),
+                strings(&["3", "0", "1", "1600", "1", "1"])
+            );
+            assert_eq!(
+                call(3, &[b"1500", b"1", b"20"]).unwrap(),
+                strings(&["1", "1", "0", "20", "0", "0"])
+            );
+            let max = i64::MAX.to_string();
+            assert_eq!(
+                call(3, &[b"0", b"0", max.as_bytes(), b"0", b"5", b"0", b""]).unwrap(),
+                strings(&["3", "0", "1", &max, "1", "-1"])
+            );
+            assert_eq!(
+                call(3, &[b"-1"]).unwrap(),
+                strings(&["0", "0", "0", "0", "1", "-1"])
+            );
+            assert_eq!(call(3, &[b"10", b"1"]), None);
+            assert_eq!(call(3, &[b"10", b"yes", b"1"]), None);
+            assert_eq!(call(3, &[]), None);
+        }
+
+        #[test]
+        fn w40_circuit_state_window() {
+            assert_eq!(
+                call(4, &[b"3", b"5", b"0", b"100", b"60"]).unwrap(),
+                strings(&["closed", "0", "0", "0"])
+            );
+            assert_eq!(
+                call(4, &[b"4", b"5", b"0", b"100", b"60"]).unwrap(),
+                strings(&["closed", "0", "0", "1"])
+            );
+            assert_eq!(
+                call(4, &[b"5", b"5", b"100", b"130", b"60"]).unwrap(),
+                strings(&["open", "0", "30", "0"])
+            );
+            assert_eq!(
+                call(4, &[b"9", b"5", b"100", b"160", b"60"]).unwrap(),
+                strings(&["half_open", "1", "0", "1"])
+            );
+            assert_eq!(
+                call(4, &[b"1", b"5", b"200", b"100", b"60"]).unwrap(),
+                strings(&["closed", "0", "0", "0"])
+            );
+            assert_eq!(
+                call(4, &[b"5", b"5", b"200", b"100", b"60"]).unwrap(),
+                strings(&["open", "0", "60", "0"])
+            );
+            let (min, max) = (i64::MIN.to_string(), i64::MAX.to_string());
+            assert_eq!(
+                call(
+                    4,
+                    &[
+                        max.as_bytes(),
+                        b"-3",
+                        min.as_bytes(),
+                        max.as_bytes(),
+                        max.as_bytes()
+                    ]
+                )
+                .unwrap(),
+                strings(&["half_open", "1", "0", "1"])
+            );
+            assert_eq!(
+                call(4, &[b"-5", b"0", b"0", b"0", b"-60"]).unwrap(),
+                strings(&["closed", "0", "0", "1"])
+            );
+            assert_eq!(call(4, &[b"1", b"2", b"3", b"4"]), None);
+            assert_eq!(call(4, &[b"1", b"2", b"3", b"4", b"x"]), None);
+        }
+
+        #[test]
+        fn w40_hydration_batch_completeness() {
+            assert_eq!(
+                call(
+                    5,
+                    &[
+                        b"1", b" Movie ", b"2040", b"0", b"0", b"0", b"0", b"0", b"1", // full
+                        b"1", b" \t", b"0", b"0012345", b"", b"", b"", b"",
+                        b"0", // media, zero
+                        b"", b"x", b"1", b"1", b"1", b"1", b"1", b"1", b"1", // invalid
+                        b"000", b"x", b"1", b"", b"", b"", b"", b"", b"1", // invalid id
+                    ]
+                )
+                .unwrap(),
+                strings(&["4", "1", "1", "1", "1", "2"])
+            );
+            assert_eq!(
+                call(5, &[]).unwrap(),
+                strings(&["0", "0", "0", "0", "0", "0"])
+            );
+            assert_eq!(
+                call(
+                    5,
+                    &[
+                        b"1234567890123456789",
+                        b"",
+                        b"",
+                        b"",
+                        b"",
+                        b"",
+                        b"",
+                        b"",
+                        b""
+                    ]
+                )
+                .unwrap(),
+                strings(&["1", "0", "0", "0", "0", "1"])
+            );
+            assert_eq!(call(5, &[b"1"]), None);
+        }
+
+        #[test]
+        fn w40_malformed_null_overlap_and_capacity() {
+            let input = packet(&[b"1500", b"0", b"10", b"1", b"20"]);
+            let mut out = [0x5a_u8; 16];
+            for (ptr, len, dst, cap) in [
+                (std::ptr::null(), 1, out.as_mut_ptr(), out.len()),
+                (input.as_ptr(), input.len(), std::ptr::null_mut(), 8),
+                (input.as_ptr(), MAX_INPUT + 1, out.as_mut_ptr(), out.len()),
+                (input.as_ptr(), input.len(), out.as_mut_ptr(), usize::MAX),
+                (
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    isize::MAX as usize + 1,
+                ),
+            ] {
+                assert_eq!(
+                    unsafe {
+                        nntmux_w40_manticore_elastic_search_service_circuit(3, ptr, len, dst, cap)
+                    },
+                    DECLINE
+                );
+            }
+            let too_many = [
+                (MAX_PARTS as u32 + 1).to_le_bytes().to_vec(),
+                vec![0; 4 * (MAX_PARTS + 1)],
+            ]
+            .concat();
+            for bad in [
+                vec![],
+                vec![1, 0, 0],
+                vec![1, 0, 0, 0, 9, 0, 0, 0],
+                vec![65, 0, 0, 0],
+                too_many,
+            ] {
+                assert_eq!(
+                    unsafe {
+                        nntmux_w40_manticore_elastic_search_service_circuit(
+                            3,
+                            bad.as_ptr(),
+                            bad.len(),
+                            out.as_mut_ptr(),
+                            out.len(),
+                        )
+                    },
+                    DECLINE
+                );
+            }
+            for mode in [0u32, 6, 99, u32::MAX] {
+                assert_eq!(
+                    unsafe {
+                        nntmux_w40_manticore_elastic_search_service_circuit(
+                            mode,
+                            input.as_ptr(),
+                            input.len(),
+                            out.as_mut_ptr(),
+                            out.len(),
+                        )
+                    },
+                    DECLINE
+                );
+            }
+            assert_eq!(out, [0x5a; 16]);
+            let full = pack(&call(3, &[b"1500", b"0", b"10", b"1", b"20"]).unwrap())
+                .unwrap()
+                .len();
+            assert!(full > out.len());
+            for cap in [0usize, 1, out.len()] {
+                let dst = if cap == 0 {
+                    std::ptr::null_mut()
+                } else {
+                    out.as_mut_ptr()
+                };
+                assert_eq!(
+                    unsafe {
+                        nntmux_w40_manticore_elastic_search_service_circuit(
+                            3,
+                            input.as_ptr(),
+                            input.len(),
+                            dst,
+                            cap,
+                        )
+                    },
+                    -(full as isize)
+                );
+            }
+            assert_eq!(out, [0x5a; 16]);
+            // Overlapping input/output buffers decline without writing.
+            let mut alias = input.clone();
+            alias.resize(full.max(input.len()) + 8, 0x77);
+            let snapshot = alias.clone();
+            for offset in [0usize, 4, input.len() - 1] {
+                let written = unsafe {
+                    nntmux_w40_manticore_elastic_search_service_circuit(
+                        3,
+                        alias.as_ptr(),
+                        input.len(),
+                        alias.as_mut_ptr().add(offset),
+                        alias.len() - offset,
+                    )
+                };
+                assert_eq!(written, DECLINE);
+            }
+            assert_eq!(alias, snapshot);
+            // Adjacent (non-overlapping) buffers are accepted.
+            let mut adjacent = input.clone();
+            adjacent.resize(input.len() + full, 0);
+            let written = unsafe {
+                nntmux_w40_manticore_elastic_search_service_circuit(
+                    3,
+                    adjacent.as_ptr(),
+                    input.len(),
+                    adjacent.as_mut_ptr().add(input.len()),
+                    full,
+                )
+            };
+            assert_eq!(written, full as isize);
+            assert_eq!(unpack(&adjacent[input.len()..]).unwrap()[0], b"2");
+            assert_eq!(overlaps(usize::MAX - 1, 4, 0, 1), None);
+            // Wrapping address ranges decline before borrowing memory.
+            assert_eq!(
+                unsafe {
+                    nntmux_w40_manticore_elastic_search_service_circuit(
+                        3,
+                        (usize::MAX - 1) as *const u8,
+                        8,
+                        out.as_mut_ptr(),
+                        out.len(),
+                    )
+                },
+                DECLINE
+            );
+            assert_eq!(out, [0x5a; 16]);
+        }
+    }
+}

@@ -17,6 +17,7 @@ use App\Services\Search\Contracts\ReleaseCandidatePager;
 use App\Services\Search\Contracts\SearchDriverInterface;
 use App\Services\Search\DTO\ReleaseSearchQuery;
 use App\Services\Search\DTO\SearchPage;
+use App\Services\Search\SearchService;
 use App\Services\Search\Support\ElasticsearchClientFactory;
 use App\Services\Search\Support\ElasticsearchResponseHelper;
 use App\Services\Search\Support\ReleaseIndexProjection;
@@ -3703,5 +3704,118 @@ class ElasticSearchDriver implements PredbFilenameCandidateLookup, ReleaseCandid
         }
 
         return array_keys($seen);
+    }
+
+    /**
+     * Rust stays opt-in for the Wave 40.5 summary: the FFI round trip misses the 1.5x gate; see
+     * tests/Unit/RustManticoreElasticSearchServiceCircuitW40ParityTest.php.
+     */
+    public const bool W405_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useW405RustFfi = null;
+
+    public static function useW405RustFfi(?bool $use = true): void
+    {
+        self::$useW405RustFfi = $use;
+    }
+
+    public static function usesW405RustFfi(): bool
+    {
+        return self::$useW405RustFfi ?? self::W405_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW405RustFfi(): void
+    {
+        self::$useW405RustFfi = null;
+    }
+
+    /**
+     * Summarizes Elasticsearch `_bulk` response items. Each item is keyed by its action
+     * (`index`, `create`, `update`, `delete`); the first entry's integer `status` is used. Items
+     * without one are malformed and count as failures. All items succeeded when every status is
+     * 2xx (vacuously true for an empty response).
+     *
+     * @param  array<array-key, mixed>  $items
+     * @return array{total_items: int, created_count: int, updated_count: int, conflict_count: int, throttled_count: int, server_error_count: int, all_succeeded: bool}
+     */
+    public static function summarizeElasticBulkResponseItems(array $items): array
+    {
+        return self::usesW405RustFfi()
+            ? self::summarizeElasticBulkResponseItemsNative($items)
+            : self::summarizeElasticBulkResponseItemsPhp($items);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $items
+     * @return array{total_items: int, created_count: int, updated_count: int, conflict_count: int, throttled_count: int, server_error_count: int, all_succeeded: bool}
+     */
+    private static function summarizeElasticBulkResponseItemsNative(array $items): array
+    {
+        $parts = [];
+        foreach ($items as $item) {
+            $status = self::itemStatus($item);
+            $parts[] = $status === null ? '' : (string) $status;
+        }
+        $fields = SearchService::evaluateW405Native(2, $parts);
+        if ($fields === null || \count($fields) !== 7) {
+            return self::summarizeElasticBulkResponseItemsPhp($items);
+        }
+
+        return [
+            'total_items' => (int) $fields[0],
+            'created_count' => (int) $fields[1],
+            'updated_count' => (int) $fields[2],
+            'conflict_count' => (int) $fields[3],
+            'throttled_count' => (int) $fields[4],
+            'server_error_count' => (int) $fields[5],
+            'all_succeeded' => $fields[6] === '1',
+        ];
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $items
+     * @return array{total_items: int, created_count: int, updated_count: int, conflict_count: int, throttled_count: int, server_error_count: int, all_succeeded: bool}
+     */
+    private static function summarizeElasticBulkResponseItemsPhp(array $items): array
+    {
+        $created = $updated = $conflict = $throttled = $server = 0;
+        $allOk = true;
+        foreach ($items as $item) {
+            $status = self::itemStatus($item);
+            if ($status === null) {
+                $allOk = false;
+
+                continue;
+            }
+            match (true) {
+                $status === 201 => $created++,
+                $status === 200 => $updated++,
+                $status === 409 => $conflict++,
+                $status === 429 => $throttled++,
+                $status >= 500 && $status <= 599 => $server++,
+                default => null,
+            };
+            $allOk = $allOk && $status >= 200 && $status <= 299;
+        }
+
+        return [
+            'total_items' => \count($items),
+            'created_count' => $created,
+            'updated_count' => $updated,
+            'conflict_count' => $conflict,
+            'throttled_count' => $throttled,
+            'server_error_count' => $server,
+            'all_succeeded' => $allOk,
+        ];
+    }
+
+    private static function itemStatus(mixed $item): ?int
+    {
+        if (! \is_array($item)) {
+            return null;
+        }
+        $result = reset($item);
+
+        return \is_array($result) && \is_int($result['status'] ?? null) ? $result['status'] : null;
     }
 }
