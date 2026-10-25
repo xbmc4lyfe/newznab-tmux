@@ -27,9 +27,35 @@ class ReleaseProcessingContext
     // Caller-level FFI benchmarks must qualify every workload before adoption.
     private static bool $useRustFfi = false;
 
+    public const bool W466_RUST_FFI_DEFAULT = false;
+
+    public const string W466_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w466_admit_witnesses(const char *names, size_t names_len, size_t name_count, const char *witnesses, size_t witnesses_len, size_t witness_count, const char *listed, size_t listed_len, size_t listed_count, size_t witness_bytes, char *out, size_t cap);
+        C;
+
+    private static ?bool $w466RustFfi = null;
+
+    private static FFI|false|null $w466Ffi = null;
+
     public static function setUseRustFfi(bool $enabled): void
     {
         self::$useRustFfi = $enabled;
+    }
+
+    public static function useW466RustFfi(?bool $enabled): void
+    {
+        self::$w466RustFfi = $enabled;
+    }
+
+    public static function usesW466RustFfi(): bool
+    {
+        return self::$w466RustFfi ?? self::W466_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW466RustFfi(): void
+    {
+        self::$w466RustFfi = null;
+        self::$w466Ffi = null;
     }
 
     private const int MAX_RETAINED_ARCHIVES = 2;
@@ -432,6 +458,16 @@ class ReleaseProcessingContext
      */
     public function rememberArchiveFileNames(array $files): void
     {
+        if (! self::usesW466RustFfi() || ! $this->rememberArchiveFileNamesNative($files)) {
+            $this->rememberArchiveFileNamesPhp($files);
+        }
+    }
+
+    /**
+     * @param  array<int, array<string, mixed>>  $files
+     */
+    public function rememberArchiveFileNamesPhp(array $files): void
+    {
         foreach ($files as $file) {
             $name = (string) ($file['name'] ?? '');
             if (! $this->rememberNamingWitness($name)) {
@@ -441,6 +477,82 @@ class ReleaseProcessingContext
                 $this->archiveFileNames[] = $name;
             }
         }
+    }
+
+    /**
+     * Admit and list the names in one Rust call; false (state untouched) when PHP must
+     * handle the batch: entries that are not arrays, names that are not strings or
+     * contain NUL bytes, or an unavailable library.
+     *
+     * @param  array<int, array<string, mixed>>  $files
+     */
+    public function rememberArchiveFileNamesNative(array $files): bool
+    {
+        if ($files === [] || $this->namingWitnessesOmitted) {
+            // PHP stops at the first name once omission is recorded.
+            return true;
+        }
+        $ffi = self::$w466Ffi instanceof FFI ? self::$w466Ffi : self::w466Ffi();
+        $count = \count($files);
+        if ($ffi === null || \count(array_filter($files, 'is_array')) !== $count) {
+            return false;
+        }
+        $names = array_column($files, 'name');
+        if (\count($names) !== $count || \count(array_filter($names, 'is_string')) !== $count) {
+            return false;
+        }
+        $joined = implode("\0", $names);
+        $witnessCount = \count($this->archiveNamingWitnesses);
+        $witnesses = implode("\0", array_keys($this->archiveNamingWitnesses));
+        $listedCount = \count($this->archiveFileNames);
+        $listed = implode("\0", $this->archiveFileNames);
+        if (substr_count($joined, "\0") !== $count - 1
+            || substr_count($witnesses, "\0") !== max(0, $witnessCount - 1)
+            || substr_count($listed, "\0") !== max(0, $listedCount - 1)) {
+            return false;
+        }
+
+        try {
+            $cap = 0;
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, 21 + 2 * \strlen($joined) + 2, $cap);
+            if ($scratch === null) {
+                return false;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w466_admit_witnesses($joined, \strlen($joined), $count, $witnesses, \strlen($witnesses), $witnessCount, $listed, \strlen($listed), $listedCount, $this->namingWitnessBytes, $scratch, $cap);
+            if ($written < -1) {
+                $scratch = RustPipelineLibrary::obtainScratch($ffi, -$written, $cap);
+                if ($scratch === null) {
+                    return false;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w466_admit_witnesses($joined, \strlen($joined), $count, $witnesses, \strlen($witnesses), $witnessCount, $listed, \strlen($listed), $listedCount, $this->namingWitnessBytes, $scratch, $cap);
+            }
+            if ($written < 21 || $written > $cap) {
+                return false;
+            }
+            $result = FFI::string($scratch, $written);
+        } catch (Throwable) {
+            return false;
+        }
+        $header = unpack('Comitted/Pbytes/Vadmitted/Vappended/Vlength', $result);
+        if (! \is_array($header) || 21 + $header['length'] > $written) {
+            return false;
+        }
+        $admitted = $header['admitted'] > 0 ? explode("\0", substr($result, 21, $header['length'])) : [];
+        $appended = $header['appended'] > 0 ? explode("\0", substr($result, 21 + $header['length'])) : [];
+        if (\count($admitted) !== $header['admitted'] || \count($appended) !== $header['appended']) {
+            return false;
+        }
+        $this->archiveNamingWitnesses += array_fill_keys($admitted, true);
+        array_push($this->archiveFileNames, ...$appended);
+        $this->namingWitnessBytes = $header['bytes'];
+        if ($header['omitted'] !== 0) {
+            $this->namingWitnessesOmitted = true;
+            $this->archiveNameEvidenceIncomplete = true;
+        }
+
+        return true;
     }
 
     public function rememberArchiveFilenameNamingAttempt(string $name, bool $proofDeferred): void
@@ -658,6 +770,15 @@ class ReleaseProcessingContext
     public function getElapsedSeconds(): int
     {
         return (int) ((hrtime(true) - $this->startTime) / 1e9);
+    }
+
+    private static function w466Ffi(): ?FFI
+    {
+        if (self::$w466Ffi === null) {
+            self::$w466Ffi = RustPipelineLibrary::resolveDomain('additional', self::W466_FFI_CDEF) ?? false;
+        }
+
+        return self::$w466Ffi === false ? null : self::$w466Ffi;
     }
 
     /** @param array<mixed> $input */

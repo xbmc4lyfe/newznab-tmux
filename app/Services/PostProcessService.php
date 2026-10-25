@@ -32,8 +32,20 @@ final class PostProcessService
         int32_t nntmux_pps_tv_lookup(int32_t kind, int64_t int_value, const char *ptr, size_t len, int64_t default_value, int32_t has_default, int64_t *out_resolved);
         C;
 
+    public const bool W466_RUST_FFI_DEFAULT = false;
+
+    public const string W466_FFI_CDEF = <<<'C'
+        int32_t nntmux_w466_tv_lookup_summary(const char *values, size_t len, size_t count, int64_t default_value, int64_t *out, size_t out_count);
+        C;
+
     // PHP remains the production default until benchmarks qualify Rust.
     private static ?bool $useRustFfi = null;
+
+    private static ?bool $w466RustFfi = null;
+
+    private static FFI|false|null $w466Ffi = null;
+
+    private static ?CData $w466Summary = null;
 
     private static FFI|false|null $ffi = null;
 
@@ -123,6 +135,23 @@ final class PostProcessService
         return self::$useRustFfi ?? false;
     }
 
+    public static function useW466RustFfi(?bool $enabled): void
+    {
+        self::$w466RustFfi = $enabled;
+    }
+
+    public static function usesW466RustFfi(): bool
+    {
+        return self::$w466RustFfi ?? self::W466_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW466RustFfi(): void
+    {
+        self::$w466RustFfi = null;
+        self::$w466Ffi = null;
+        self::$w466Summary = null;
+    }
+
     public static function setFfiForTesting(FFI|false|null $override = null): void
     {
         self::$ffi = $override;
@@ -187,6 +216,38 @@ final class PostProcessService
         $resolved = self::$resolvedBuffer[0];
 
         return ['resolved' => $resolved, 'renamedOnly' => ($flags & 1) !== 0];
+    }
+
+    /**
+     * Resolve each TV lookup value like resolveTvLookupMode() with an integer default and
+     * count the modes: 0 skips, 1 looks up all releases, 2 renamed releases only. The
+     * variadic signature lets PHP enforce `int|string|null` on every value.
+     *
+     * @return array{skip: int, all: int, renamed: int, other: int}
+     */
+    public static function summarizeTvLookupModes(int $defaultLookupValue, int|string|null ...$values): array
+    {
+        return (self::usesW466RustFfi() ? self::tvLookupSummaryNative($defaultLookupValue, $values) : null)
+            ?? self::tvLookupSummaryPhp($defaultLookupValue, $values);
+    }
+
+    /**
+     * @return array{skip: int, all: int, renamed: int, other: int}
+     */
+    public static function summarizeTvLookupModesPhp(int $defaultLookupValue, int|string|null ...$values): array
+    {
+        return self::tvLookupSummaryPhp($defaultLookupValue, $values);
+    }
+
+    /**
+     * Rust counts, or null when PHP must resolve the values (a NUL byte or an
+     * unavailable library).
+     *
+     * @return array{skip: int, all: int, renamed: int, other: int}|null
+     */
+    public static function summarizeTvLookupModesNative(int $defaultLookupValue, int|string|null ...$values): ?array
+    {
+        return self::tvLookupSummaryNative($defaultLookupValue, $values);
     }
 
     /**
@@ -379,6 +440,54 @@ final class PostProcessService
         return $this->par2Processor->applyInventoryForRename($inventory, $relID, $groupID, $show, $canPersist, $allowTerminalMetadata, $expectedSnapshot);
     }
 
+    /**
+     * @param  array<array-key, int|string|null>  $values
+     * @return array{skip: int, all: int, renamed: int, other: int}
+     */
+    private static function tvLookupSummaryPhp(int $defaultLookupValue, array $values): array
+    {
+        $summary = ['skip' => 0, 'all' => 0, 'renamed' => 0, 'other' => 0];
+        foreach ($values as $value) {
+            $resolved = is_numeric($value) ? (int) $value : $defaultLookupValue;
+            $summary[match ($resolved) {
+                0 => 'skip',
+                1 => 'all',
+                2 => 'renamed',
+                default => 'other',
+            }]++;
+        }
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, int|string|null>  $values
+     * @return array{skip: int, all: int, renamed: int, other: int}|null
+     */
+    private static function tvLookupSummaryNative(int $defaultLookupValue, array $values): ?array
+    {
+        $ffi = self::$w466Ffi instanceof FFI ? self::$w466Ffi : self::w466Ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $count = \count($values);
+        // implode() renders int and null exactly as is_numeric()/(int) read them.
+        $joined = implode("\0", $values);
+        if (substr_count($joined, "\0") !== max(0, $count - 1)) {
+            return null;
+        }
+
+        try {
+            $out = self::$w466Summary ??= $ffi->new('int64_t[4]');
+            // @phpstan-ignore method.notFound
+            $status = $ffi->nntmux_w466_tv_lookup_summary($joined, \strlen($joined), $count, $defaultLookupValue, $out, 4);
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $status === 1 ? ['skip' => $out[0], 'all' => $out[1], 'renamed' => $out[2], 'other' => $out[3]] : null;
+    }
+
     /** Flags from `nntmux_pps_tv_lookup`, or null when the call fails. */
     private static function tvLookupNative(FFI $ffi, int $kind, int $intValue, string $text, ?int $default): ?int
     {
@@ -400,5 +509,14 @@ final class PostProcessService
         }
 
         return self::$ffi === false ? null : self::$ffi;
+    }
+
+    private static function w466Ffi(): ?FFI
+    {
+        if (self::$w466Ffi === null) {
+            self::$w466Ffi = RustPipelineLibrary::resolveDomain('additional', self::W466_FFI_CDEF) ?? false;
+        }
+
+        return self::$w466Ffi === false ? null : self::$w466Ffi;
     }
 }

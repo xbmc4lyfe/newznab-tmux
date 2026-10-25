@@ -7,6 +7,7 @@ namespace App\Services;
 use App\Support\RustPipelineLibrary;
 use dariusiii\rarinfo\ArchiveInfo;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 class ArchiveProcessingService
@@ -15,10 +16,32 @@ class ArchiveProcessingService
         int32_t nntmux_aps_analysis_code(int32_t set_data_ok, const char *error, size_t error_len, int32_t encrypted_prop, int32_t summary_flag_present, int64_t summary_flag);
         C;
 
+    public const bool W466_RUST_FFI_DEFAULT = false;
+
+    public const string W466_FFI_CDEF = <<<'C'
+        int32_t nntmux_w466_archive_file_summary(const char *names, size_t names_len, size_t name_count, const char *sizes, size_t sizes_len, int64_t *out, size_t out_count);
+        C;
+
+    /** Lower-case extensions (after the last dot) counted by summarizeFileList(). */
+    private const array W466_EXTENSION_CLASSES = [
+        'mkv' => 'video', 'mp4' => 'video', 'avi' => 'video', 'm4v' => 'video', 'mov' => 'video', 'wmv' => 'video',
+        'ts' => 'video', 'm2ts' => 'video', 'mpg' => 'video', 'mpeg' => 'video', 'vob' => 'video', 'webm' => 'video',
+        'mp3' => 'audio', 'flac' => 'audio', 'm4a' => 'audio', 'aac' => 'audio', 'ogg' => 'audio', 'wav' => 'audio',
+        'wma' => 'audio', 'ape' => 'audio', 'jpg' => 'image', 'jpeg' => 'image', 'png' => 'image', 'gif' => 'image',
+        'webp' => 'image', 'bmp' => 'image', 'nfo' => 'text', 'txt' => 'text', 'diz' => 'text', 'sfv' => 'text',
+        'par2' => 'par2', 'rar' => 'archive', 'zip' => 'archive', '7z' => 'archive',
+    ];
+
     // PHP remains the production default until benchmarks qualify Rust.
     public static bool $useRustFfi = false;
 
     private static FFI|false|null $ffi = null;
+
+    private static ?bool $w466RustFfi = null;
+
+    private static FFI|false|null $w466Ffi = null;
+
+    private static ?CData $w466Summary = null;
 
     public function __construct(private readonly ArchiveInfo $archiveInfo) {}
 
@@ -34,6 +57,32 @@ class ArchiveProcessingService
         }
 
         return self::$ffi === false ? null : self::$ffi;
+    }
+
+    private static function w466Ffi(): ?FFI
+    {
+        if (self::$w466Ffi === null) {
+            self::$w466Ffi = RustPipelineLibrary::resolveDomain('additional', self::W466_FFI_CDEF) ?? false;
+        }
+
+        return self::$w466Ffi === false ? null : self::$w466Ffi;
+    }
+
+    public static function useW466RustFfi(?bool $enabled): void
+    {
+        self::$w466RustFfi = $enabled;
+    }
+
+    public static function usesW466RustFfi(): bool
+    {
+        return self::$w466RustFfi ?? self::W466_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW466RustFfi(): void
+    {
+        self::$w466RustFfi = null;
+        self::$w466Ffi = null;
+        self::$w466Summary = null;
     }
 
     /**
@@ -120,6 +169,117 @@ class ArchiveProcessingService
             3 => ['ok' => false, 'error' => 'Unknown error', 'summary' => null, 'is_encrypted' => false],
             default => self::normalizeAnalysisPhp($setDataOk, $archiveError, $isEncryptedProp, $summary),
         };
+    }
+
+    /**
+     * Counts for an archive listing: entries, encrypted and compressed entries, the
+     * `(int)` size total (a float once it overflows) and entries per name class. The
+     * variadic signature lets PHP enforce that every entry is an array.
+     *
+     * @param  array<array-key, mixed>  ...$files
+     * @return array{files: int, encrypted: int, compressed: int, bytes: int|float, video: int, audio: int, image: int, text: int, par2: int, archive: int, other: int}
+     */
+    public static function summarizeFileList(array ...$files): array
+    {
+        return (self::usesW466RustFfi() ? self::fileListSummaryNative($files) : null) ?? self::fileListSummaryPhp($files);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  ...$files
+     * @return array{files: int, encrypted: int, compressed: int, bytes: int|float, video: int, audio: int, image: int, text: int, par2: int, archive: int, other: int}
+     */
+    public static function summarizeFileListPhp(array ...$files): array
+    {
+        return self::fileListSummaryPhp($files);
+    }
+
+    /**
+     * Rust summary, or null when PHP must summarize (names with NUL bytes, an
+     * overflowing total or an unavailable library).
+     *
+     * @param  array<array-key, mixed>  ...$files
+     * @return array{files: int, encrypted: int, compressed: int, bytes: int, video: int, audio: int, image: int, text: int, par2: int, archive: int, other: int}|null
+     */
+    public static function summarizeFileListNative(array ...$files): ?array
+    {
+        return self::fileListSummaryNative($files);
+    }
+
+    /** Name class used by summarizeFileList(). */
+    public static function fileNameClassPhp(string $name): string
+    {
+        $dot = strrpos($name, '.');
+        if ($dot === false) {
+            return 'other';
+        }
+        $extension = strtolower(substr($name, $dot + 1));
+
+        return self::W466_EXTENSION_CLASSES[$extension] ?? (preg_match('/^(?:r\d{2}|\d{3})\z/', $extension) === 1 ? 'archive' : 'other');
+    }
+
+    /**
+     * @param  array<array-key, array<array-key, mixed>>  $files
+     * @return array{files: int, encrypted: int, compressed: int, bytes: int|float, video: int, audio: int, image: int, text: int, par2: int, archive: int, other: int}
+     */
+    private static function fileListSummaryPhp(array $files): array
+    {
+        $summary = ['files' => 0, 'encrypted' => 0, 'compressed' => 0, 'bytes' => 0, 'video' => 0, 'audio' => 0, 'image' => 0, 'text' => 0, 'par2' => 0, 'archive' => 0, 'other' => 0];
+        foreach ($files as $file) {
+            $summary['files']++;
+            if (! empty($file['pass'])) {
+                $summary['encrypted']++;
+            }
+            if (! empty($file['compressed'])) {
+                $summary['compressed']++;
+            }
+            $summary['bytes'] += (int) ($file['size'] ?? 0);
+            $summary[self::fileNameClassPhp((string) ($file['name'] ?? ''))]++;
+        }
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, array<array-key, mixed>>  $files
+     * @return array{files: int, encrypted: int, compressed: int, bytes: int, video: int, audio: int, image: int, text: int, par2: int, archive: int, other: int}|null
+     */
+    private static function fileListSummaryNative(array $files): ?array
+    {
+        $ffi = self::$w466Ffi instanceof FFI ? self::$w466Ffi : self::w466Ffi();
+        if ($ffi === null) {
+            return null;
+        }
+        $count = \count($files);
+        // array_column() keeps null names and skips missing ones, which PHP reads as ''.
+        $names = array_column($files, 'name');
+        $joined = implode("\0", $names);
+        $nameCount = \count($names);
+        if (substr_count($joined, "\0") !== max(0, $nameCount - 1)) {
+            return null;
+        }
+        // pack() converts sizes exactly like the (int) cast; missing sizes add nothing.
+        $sizes = array_column($files, 'size');
+        $packed = $sizes === [] ? '' : pack('q*', ...$sizes);
+
+        try {
+            $out = self::$w466Summary ??= $ffi->new('int64_t[8]');
+            // @phpstan-ignore method.notFound
+            $status = $ffi->nntmux_w466_archive_file_summary($joined, \strlen($joined), $nameCount, $packed, \strlen($packed), $out, 8);
+        } catch (Throwable) {
+            return null;
+        }
+        if ($status !== 1) {
+            return null;
+        }
+
+        return [
+            'files' => $count,
+            'encrypted' => \count(array_filter(array_column($files, 'pass'))),
+            'compressed' => \count(array_filter(array_column($files, 'compressed'))),
+            'bytes' => $out[0], 'video' => $out[1], 'audio' => $out[2], 'image' => $out[3],
+            'text' => $out[4], 'par2' => $out[5], 'archive' => $out[6],
+            'other' => $out[7] + $count - $nameCount,
+        ];
     }
 
     /**

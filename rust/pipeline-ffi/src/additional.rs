@@ -30558,3 +30558,1092 @@ mod wave45_thumbnail_fetcher_stage_tool_budget_tests {
         assert!(unsafe { nntmux_w45_budget_utilization(10, 4, std::ptr::null_mut()) }.is_nan());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 46.6: archive listings, TV lookup modes, persistence metrics, stage
+// summaries and naming witness admission as single batched calls. Strings use
+// NUL-joined lists (the PHP caller proves the separator count), integers use
+// machine-order `int64_t` packs and every failure returns -1 so PHP falls back.
+// ---------------------------------------------------------------------------
+
+/// Split a NUL-joined list that must contain exactly `count` entries. Scans eight
+/// bytes at a time with an exact per-byte zero test (no cross-byte borrows).
+fn w466_split(joined: &[u8], count: usize) -> Option<Vec<&[u8]>> {
+    const LOW7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    if count == 0 {
+        return joined.is_empty().then(Vec::new);
+    }
+    if count > joined.len().saturating_add(1) {
+        return None;
+    }
+    let mut parts = Vec::with_capacity(count);
+    let mut start = 0;
+    let (words, tail) = joined.as_chunks::<8>();
+    for (index, word) in words.iter().enumerate() {
+        let word = u64::from_le_bytes(*word);
+        let mut zeros = !(((word & LOW7).wrapping_add(LOW7)) | word) & HIGH;
+        while zeros != 0 {
+            let at = index * 8 + (zeros.trailing_zeros() / 8) as usize;
+            if parts.len() + 1 == count {
+                return None;
+            }
+            parts.push(&joined[start..at]);
+            start = at + 1;
+            zeros &= zeros - 1;
+        }
+    }
+    let base = words.len() * 8;
+    for (offset, &byte) in tail.iter().enumerate() {
+        if byte == 0 {
+            if parts.len() + 1 == count {
+                return None;
+            }
+            parts.push(&joined[start..base + offset]);
+            start = base + offset + 1;
+        }
+    }
+    parts.push(&joined[start..]);
+    (parts.len() == count).then_some(parts)
+}
+
+/// Machine-order `int64_t` values (PHP `pack('q*')`).
+fn w466_i64s(packed: &[u8]) -> Option<impl Iterator<Item = i64> + '_> {
+    packed.len().is_multiple_of(8).then(|| {
+        packed
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|chunk| i64::from_ne_bytes(*chunk))
+    })
+}
+
+/// Machine-order doubles (PHP `pack('e*')` on little-endian hosts).
+fn w466_f64s(packed: &[u8]) -> Option<impl Iterator<Item = f64> + '_> {
+    packed.len().is_multiple_of(8).then(|| {
+        packed
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|chunk| f64::from_le_bytes(*chunk))
+    })
+}
+
+unsafe fn w466_write_i64s(out: *mut i64, out_count: usize, values: &[i64]) -> bool {
+    if out_count < values.len() || !w17_aligned(out.cast_const(), out_count) {
+        return false;
+    }
+    // SAFETY: `out` is non-null, aligned and writable for `out_count >= values.len()`.
+    unsafe { std::ptr::copy_nonoverlapping(values.as_ptr(), out, values.len()) };
+    true
+}
+
+/// `ArchiveProcessingService` file-name class: 0 video, 1 audio, 2 image, 3 text,
+/// 4 par2, 5 archive, 6 other. Mirrors PHP's ASCII `strtolower` on the text after
+/// the last dot.
+pub(crate) fn w466_archive_name_class(name: &[u8]) -> usize {
+    let Some(dot) = name.iter().rposition(|&byte| byte == b'.') else {
+        return 6;
+    };
+    let ext = &name[dot + 1..];
+    if ext.len() > 4 || ext.is_empty() {
+        return 6;
+    }
+    // Pack the lower-cased extension into a word so the class is one integer match.
+    let mut lower = [0u8; 4];
+    for (slot, byte) in lower.iter_mut().zip(ext) {
+        *slot = byte.to_ascii_lowercase();
+    }
+    const fn key(ext: &[u8]) -> u32 {
+        let mut raw = [0u8; 4];
+        let mut i = 0;
+        while i < ext.len() {
+            raw[i] = ext[i];
+            i += 1;
+        }
+        u32::from_le_bytes(raw)
+    }
+    const TABLE: [(u32, usize); 34] = [
+        (key(b"mkv"), 0),
+        (key(b"mp4"), 0),
+        (key(b"avi"), 0),
+        (key(b"m4v"), 0),
+        (key(b"mov"), 0),
+        (key(b"wmv"), 0),
+        (key(b"ts"), 0),
+        (key(b"m2ts"), 0),
+        (key(b"mpg"), 0),
+        (key(b"mpeg"), 0),
+        (key(b"vob"), 0),
+        (key(b"webm"), 0),
+        (key(b"mp3"), 1),
+        (key(b"flac"), 1),
+        (key(b"m4a"), 1),
+        (key(b"aac"), 1),
+        (key(b"ogg"), 1),
+        (key(b"wav"), 1),
+        (key(b"wma"), 1),
+        (key(b"ape"), 1),
+        (key(b"jpg"), 2),
+        (key(b"jpeg"), 2),
+        (key(b"png"), 2),
+        (key(b"gif"), 2),
+        (key(b"webp"), 2),
+        (key(b"bmp"), 2),
+        (key(b"nfo"), 3),
+        (key(b"txt"), 3),
+        (key(b"diz"), 3),
+        (key(b"sfv"), 3),
+        (key(b"par2"), 4),
+        (key(b"rar"), 5),
+        (key(b"zip"), 5),
+        (key(b"7z"), 5),
+    ];
+    let word = u32::from_le_bytes(lower);
+    match TABLE.iter().find(|(known, _)| *known == word) {
+        Some(&(_, class)) => class,
+        _ => match lower {
+            [b'r', a, b, 0] if a.is_ascii_digit() && b.is_ascii_digit() => 5,
+            [a, b, c, 0] if a.is_ascii_digit() && b.is_ascii_digit() && c.is_ascii_digit() => 5,
+            _ => 6,
+        },
+    }
+}
+
+/// `[bytes, video, audio, image, text, par2, archive, other]` for a listing, or
+/// `None` when the size total overflows (PHP widens to float).
+pub(crate) fn w466_archive_summary(names: &[&[u8]], sizes: &[u8]) -> Option<[i64; 8]> {
+    let mut out = [0i64; 8];
+    for size in w466_i64s(sizes)? {
+        out[0] = out[0].checked_add(size)?;
+    }
+    for name in names {
+        out[1 + w466_archive_name_class(name)] += 1;
+    }
+    Some(out)
+}
+
+/// `ArchiveProcessingService::summarizeFileList()`: `names` holds `name_count`
+/// NUL-joined names and `sizes` the packed sizes. Writes eight `int64_t` values
+/// (see [`w466_archive_summary`]). Returns 1, 0 when the byte total overflows or
+/// -1 for invalid input, leaving `out` untouched unless it returns 1.
+///
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_count` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w466_archive_file_summary(
+    names: *const u8,
+    names_len: usize,
+    name_count: usize,
+    sizes: *const u8,
+    sizes_len: usize,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        let (Some(names), Some(sizes)) = (w15_input(names, names_len), w15_input(sizes, sizes_len))
+        else {
+            return -1;
+        };
+        let Some(names) = w466_split(names, name_count) else {
+            return -1;
+        };
+        if !sizes.len().is_multiple_of(8) {
+            return -1;
+        }
+        let Some(summary) = w466_archive_summary(&names, sizes) else {
+            return 0;
+        };
+        // SAFETY: forwarded output contract.
+        i32::from(unsafe { w466_write_i64s(out, out_count, &summary) }) * 2 - 1
+    })
+    .unwrap_or(-1)
+}
+
+/// PHP 8 `is_numeric($value) ? (int) $value : null` on 64-bit, including
+/// `zend_dval_to_lval_cap` (non-finite doubles become 0, others saturate).
+pub(crate) fn w466_php_numeric_int(value: &[u8]) -> Option<i64> {
+    let start = value.iter().position(|byte| !w20cd_is_php_space(*byte))?;
+    let end = value.iter().rposition(|byte| !w20cd_is_php_space(*byte))? + 1;
+    let body = &value[start..end];
+    let unsigned = match body.first() {
+        Some(b'+' | b'-') => &body[1..],
+        _ => body,
+    };
+    let int_digits = unsigned.iter().take_while(|b| b.is_ascii_digit()).count();
+    let mut cursor = int_digits;
+    let mut fraction_digits = 0;
+    let mut is_integer = true;
+    if unsigned.get(cursor) == Some(&b'.') {
+        is_integer = false;
+        cursor += 1;
+        fraction_digits = unsigned[cursor..]
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        cursor += fraction_digits;
+    }
+    if int_digits == 0 && fraction_digits == 0 {
+        return None;
+    }
+    if matches!(unsigned.get(cursor), Some(b'e' | b'E')) {
+        let mut exponent = cursor + 1;
+        if matches!(unsigned.get(exponent), Some(b'+' | b'-')) {
+            exponent += 1;
+        }
+        let digits = unsigned[exponent..]
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        if digits == 0 {
+            return None;
+        }
+        is_integer = false;
+        cursor = exponent + digits;
+    }
+    if cursor != unsigned.len() {
+        return None;
+    }
+    // The grammar above is ASCII-only, so the body is valid UTF-8.
+    let text = std::str::from_utf8(body).ok()?;
+    if is_integer && let Ok(parsed) = text.parse::<i64>() {
+        return Some(parsed);
+    }
+    let parsed = text.parse::<f64>().ok()?;
+    Some(if parsed.is_finite() { parsed as i64 } else { 0 })
+}
+
+/// `PostProcessService::summarizeTvLookupModes()` counts
+/// `[skip (0), all (1), renamed only (2), other]` for `count` NUL-joined values,
+/// each resolved like `resolveTvLookupMode()` with an integer default.
+/// Returns 1, or -1 for invalid input without writing `out`.
+///
+/// # Safety
+/// A non-null `values` must be readable for `len` bytes; `out` must be aligned and
+/// writable for `out_count` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w466_tv_lookup_summary(
+    values: *const u8,
+    len: usize,
+    count: usize,
+    default_value: i64,
+    out: *mut i64,
+    out_count: usize,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        let Some(values) = w15_input(values, len).and_then(|joined| w466_split(joined, count))
+        else {
+            return -1;
+        };
+        let mut summary = [0i64; 4];
+        for value in values {
+            let resolved = w466_php_numeric_int(value).unwrap_or(default_value);
+            summary[usize::try_from(resolved).map_or(3, |mode| mode.min(3))] += 1;
+        }
+        // SAFETY: forwarded output contract.
+        if unsafe { w466_write_i64s(out, out_count, &summary) } {
+            1
+        } else {
+            -1
+        }
+    })
+    .unwrap_or(-1)
+}
+
+/// `PersistenceMetricsCollector::applyEvents()`: folds `count` packed events into the
+/// starting counters `statements`, `total_ms`, `requests` and `executions`. `integers`
+/// holds `count` event kinds followed by `count` release IDs (`int64_t`) and
+/// `milliseconds` `count` doubles. Writes `[statements, requests, executions]` and the
+/// milliseconds total and returns 1, or returns -1 (outputs untouched) for an unknown
+/// event, counter overflow or invalid input so PHP can raise or widen exactly.
+///
+/// # Safety
+/// Non-null inputs must be readable for their lengths; `out` must be aligned and
+/// writable for `out_count` values and `out_ms` for one double.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_w466_pmc_apply_batch(
+    integers: *const u8,
+    integers_len: usize,
+    milliseconds: *const u8,
+    milliseconds_len: usize,
+    count: usize,
+    has_scope: i32,
+    scope_id: i64,
+    statements: i64,
+    total_ms: f64,
+    requests: i64,
+    executions: i64,
+    out: *mut i64,
+    out_count: usize,
+    out_ms: *mut f64,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        let (Some(integers), Some(ms)) = (
+            w15_input(integers, integers_len),
+            w15_input(milliseconds, milliseconds_len),
+        ) else {
+            return -1;
+        };
+        let bytes = count.checked_mul(8);
+        if bytes.and_then(|bytes| bytes.checked_mul(2)) != Some(integers.len())
+            || bytes != Some(ms.len())
+            || !w17_aligned(out_ms.cast_const(), 1)
+            || out_count < 3
+            || !w17_aligned(out.cast_const(), out_count)
+        {
+            return -1;
+        }
+        let (events, ids) = integers.split_at(integers.len() / 2);
+        let mut metrics = W17Metrics {
+            statements,
+            milliseconds: total_ms,
+            requests,
+            executions,
+        };
+        let scope = (has_scope != 0).then_some(scope_id);
+        let (Some(events), Some(ids), Some(ms)) =
+            (w466_i64s(events), w466_i64s(ids), w466_f64s(ms))
+        else {
+            return -1;
+        };
+        for ((event, id), ms) in events.zip(ids).zip(ms) {
+            let Ok(event) = i32::try_from(event) else {
+                return -1;
+            };
+            if w17_metrics_apply(event, scope, id, ms, &mut metrics).is_err() {
+                return -1;
+            }
+        }
+        let values = [metrics.statements, metrics.requests, metrics.executions];
+        // SAFETY: both outputs were validated above.
+        unsafe {
+            std::ptr::copy_nonoverlapping(values.as_ptr(), out, 3);
+            out_ms.write(metrics.milliseconds);
+        }
+        1
+    })
+    .unwrap_or(-1)
+}
+
+/// `key=%.6Fs` summary for NUL-joined stage keys and packed nanosecond values,
+/// converting each value like PHP's `$nanoseconds / 1_000_000_000`.
+pub(crate) fn w466_stage_summary(keys: &[&[u8]], nanoseconds: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Write;
+
+    if nanoseconds.len() != keys.len().checked_mul(8)? {
+        return None;
+    }
+    let mut out = Vec::with_capacity(keys.iter().map(|key| key.len() + 16).sum());
+    for (key, value) in keys.iter().zip(w466_i64s(nanoseconds)?) {
+        let seconds = w15_php_int_div(value, 1_000_000_000)?;
+        if !out.is_empty() {
+            out.push(b' ');
+        }
+        out.extend_from_slice(key);
+        out.push(b'=');
+        // Integer division never yields -0.0, so PHP's sign rule needs no special case.
+        write!(out, "{seconds:.6}").ok()?;
+        out.push(b's');
+    }
+    Some(out)
+}
+
+/// `ProcessingMetrics::summaryFromNanoseconds()` for `count` NUL-joined keys and
+/// machine-order `int64_t` totals. Returns bytes written, `-needed` for a short buffer
+/// or -1 for invalid input.
+///
+/// # Safety
+/// Non-null input/output pointers must be valid for their declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w466_stage_summary(
+    keys: *const u8,
+    keys_len: usize,
+    count: usize,
+    nanoseconds: *const u8,
+    nanoseconds_len: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        let (Some(keys), Some(values)) = (
+            w15_input(keys, keys_len).and_then(|keys| w466_split(keys, count)),
+            w15_input(nanoseconds, nanoseconds_len),
+        ) else {
+            return -1;
+        };
+        match w466_stage_summary(&keys, values) {
+            Some(result) => w15_write(out, cap, &result),
+            None => -1,
+        }
+    })
+    .unwrap_or(-1)
+}
+
+/// Fx-style word hasher: the sets only hold caller-supplied names for one call, so a
+/// fast deterministic hash beats SipHash's per-call key setup on small batches.
+#[derive(Default)]
+struct W466Hasher(u64);
+
+impl std::hash::Hasher for W466Hasher {
+    fn write(&mut self, bytes: &[u8]) {
+        const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+        let (words, tail) = bytes.as_chunks::<8>();
+        for word in words {
+            self.0 = (self.0.rotate_left(5) ^ u64::from_le_bytes(*word)).wrapping_mul(SEED);
+        }
+        let mut last = [0u8; 8];
+        last[..tail.len()].copy_from_slice(tail);
+        self.0 = (self.0.rotate_left(5) ^ u64::from_le_bytes(last) ^ (bytes.len() as u64))
+            .wrapping_mul(SEED);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type W466Set<'a> = std::collections::HashSet<&'a [u8], std::hash::BuildHasherDefault<W466Hasher>>;
+
+const W466_MAX_WITNESSES: usize = 256;
+const W466_MAX_WITNESS_BYTES: usize = 32768;
+const W466_MAX_WITNESS_NAME: usize = 4096;
+
+/// Outcome of `ReleaseProcessingContext::rememberArchiveFileNames()`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct W466Admission<'a> {
+    pub omitted: bool,
+    pub bytes: usize,
+    pub admitted: Vec<&'a [u8]>,
+    pub appended: Vec<&'a [u8]>,
+}
+
+/// Admit `names` in order: known witnesses pass, new ones need non-empty valid UTF-8
+/// within the name, count and byte caps; the first rejection marks omission and stops.
+/// Every admitted name absent from `listed` (or appended earlier) is appended.
+pub(crate) fn w466_admit_witnesses<'a>(
+    names: &[&'a [u8]],
+    witnesses: &[&[u8]],
+    listed: &[&[u8]],
+    mut bytes: usize,
+) -> W466Admission<'a> {
+    let mut known =
+        W466Set::with_capacity_and_hasher(witnesses.len() + names.len(), Default::default());
+    known.extend(witnesses.iter().copied());
+    let mut seen =
+        W466Set::with_capacity_and_hasher(listed.len() + names.len(), Default::default());
+    seen.extend(listed.iter().copied());
+    let mut admitted = Vec::new();
+    let mut appended = Vec::new();
+    let mut omitted = false;
+    for &name in names {
+        if !known.contains(name) {
+            let valid = !name.is_empty()
+                && name.len() <= W466_MAX_WITNESS_NAME
+                && std::str::from_utf8(name).is_ok()
+                && known.len() < W466_MAX_WITNESSES
+                && bytes
+                    .checked_add(name.len())
+                    .is_some_and(|total| total <= W466_MAX_WITNESS_BYTES);
+            if !valid {
+                omitted = true;
+                break;
+            }
+            known.insert(name);
+            admitted.push(name);
+            bytes += name.len();
+        }
+        if seen.insert(name) {
+            appended.push(name);
+        }
+    }
+    W466Admission {
+        omitted,
+        bytes,
+        admitted,
+        appended,
+    }
+}
+
+/// `ReleaseProcessingContext::rememberArchiveFileNames()` for NUL-joined `names`,
+/// existing witness keys and listed names. Output: `u8` omitted flag, `u64 LE`
+/// witness bytes, `u32 LE` admitted count, `u32 LE` appended count, `u32 LE`
+/// admitted segment length, then the NUL-joined admitted and appended segments.
+/// Returns bytes written, `-needed` for a short buffer or -1 for invalid input.
+///
+/// # Safety
+/// Non-null input/output pointers must be valid for their declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w466_admit_witnesses(
+    names: *const u8,
+    names_len: usize,
+    name_count: usize,
+    witnesses: *const u8,
+    witnesses_len: usize,
+    witness_count: usize,
+    listed: *const u8,
+    listed_len: usize,
+    listed_count: usize,
+    witness_bytes: usize,
+    out: *mut u8,
+    cap: usize,
+) -> isize {
+    std::panic::catch_unwind(|| {
+        let split =
+            |ptr, len, count| w15_input(ptr, len).and_then(|bytes| w466_split(bytes, count));
+        let (Some(names), Some(witnesses), Some(listed)) = (
+            split(names, names_len, name_count),
+            split(witnesses, witnesses_len, witness_count),
+            split(listed, listed_len, listed_count),
+        ) else {
+            return -1;
+        };
+        let admission = w466_admit_witnesses(&names, &witnesses, &listed, witness_bytes);
+        let admitted = admission.admitted.join(&0u8);
+        let appended = admission.appended.join(&0u8);
+        let (Ok(admitted_count), Ok(appended_count), Ok(admitted_len)) = (
+            u32::try_from(admission.admitted.len()),
+            u32::try_from(admission.appended.len()),
+            u32::try_from(admitted.len()),
+        ) else {
+            return -1;
+        };
+        let mut result = Vec::with_capacity(21 + admitted.len() + appended.len());
+        result.push(u8::from(admission.omitted));
+        result.extend_from_slice(&(admission.bytes as u64).to_le_bytes());
+        result.extend_from_slice(&admitted_count.to_le_bytes());
+        result.extend_from_slice(&appended_count.to_le_bytes());
+        result.extend_from_slice(&admitted_len.to_le_bytes());
+        result.extend_from_slice(&admitted);
+        result.extend_from_slice(&appended);
+        w15_write(out, cap, &result)
+    })
+    .unwrap_or(-1)
+}
+
+#[cfg(test)]
+mod w466_additional_archive_tv_metrics_witness_tests {
+    use super::*;
+
+    fn packed(values: &[i64]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn additional_w466_split_matches_exact_counts_across_word_boundaries() {
+        assert_eq!(w466_split(b"", 0), Some(vec![]));
+        assert_eq!(w466_split(b"", 1), Some(vec![&b""[..]]));
+        assert_eq!(w466_split(b"x", 0), None);
+        assert_eq!(w466_split(b"\0", 2), Some(vec![&b""[..], &b""[..]]));
+        assert_eq!(w466_split(b"a\0b", 1), None);
+        assert_eq!(w466_split(b"a\0b", 3), None);
+        // A 0x01 byte after a NUL must not be mistaken for another separator.
+        let joined = b"abcdefg\0\x01\x01\x01\x01\x01\x01\x01\x01\0tail\x80\xff";
+        assert_eq!(
+            w466_split(joined, 3),
+            Some(vec![
+                &b"abcdefg"[..],
+                &b"\x01\x01\x01\x01\x01\x01\x01\x01"[..],
+                &b"tail\x80\xff"[..]
+            ])
+        );
+        let names: Vec<Vec<u8>> = (0..64).map(|i| vec![b'n'; i]).collect();
+        let joined = names.join(&0u8);
+        let parts = w466_split(&joined, names.len()).unwrap();
+        assert_eq!(parts, names.iter().map(Vec::as_slice).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn additional_w466_archive_summary_classifies_like_php_and_flags_overflow() {
+        for (name, class) in [
+            (&b""[..], 6),
+            (b"noext", 6),
+            (b"a.", 6),
+            (b".MKV", 0),
+            (b"x.M2TS", 0),
+            (b"x.Flac", 1),
+            (b"x.JPEG", 2),
+            (b"x.sfv", 3),
+            (b"x.PAR2", 4),
+            (b"x.7Z", 5),
+            (b"x.R01", 5),
+            (b"x.001", 5),
+            (b"x.r1", 6),
+            (b"x.r001", 6),
+            (b"x.0001", 6),
+            (b"x.r0a", 6),
+            (b"dir.v1/file", 6),
+            (b"x.mkv\n", 6),
+            (b"x.mkvx", 6),
+            (b"\xd1\x84.Mp4", 0),
+        ] {
+            assert_eq!(w466_archive_name_class(name), class, "{name:?}");
+        }
+        let names = b"a.rar\0b.R00\0c.mkv\0d.nfo\0e";
+        let sizes = packed(&[5, -2, i64::MAX - 3]);
+        let mut out = [99i64; 8];
+        assert_eq!(
+            unsafe {
+                nntmux_w466_archive_file_summary(
+                    names.as_ptr(),
+                    names.len(),
+                    5,
+                    sizes.as_ptr(),
+                    sizes.len(),
+                    out.as_mut_ptr(),
+                    8,
+                )
+            },
+            1
+        );
+        assert_eq!(out, [i64::MAX, 1, 0, 0, 1, 0, 2, 1]);
+        let overflow = packed(&[i64::MAX, 1]);
+        let mut untouched = [7i64; 8];
+        assert_eq!(
+            unsafe {
+                nntmux_w466_archive_file_summary(
+                    names.as_ptr(),
+                    names.len(),
+                    5,
+                    overflow.as_ptr(),
+                    overflow.len(),
+                    untouched.as_mut_ptr(),
+                    8,
+                )
+            },
+            0
+        );
+        for (count, sizes_len, out_count) in [(4, 0, 8), (5, 7, 8), (5, 0, 7)] {
+            assert_eq!(
+                unsafe {
+                    nntmux_w466_archive_file_summary(
+                        names.as_ptr(),
+                        names.len(),
+                        count,
+                        sizes.as_ptr(),
+                        sizes_len,
+                        untouched.as_mut_ptr(),
+                        out_count,
+                    )
+                },
+                -1
+            );
+        }
+        assert_eq!(
+            unsafe {
+                nntmux_w466_archive_file_summary(
+                    std::ptr::null(),
+                    1,
+                    1,
+                    std::ptr::null(),
+                    0,
+                    untouched.as_mut_ptr(),
+                    8,
+                )
+            },
+            -1
+        );
+        assert_eq!(untouched, [7; 8]);
+        assert_eq!(
+            unsafe {
+                nntmux_w466_archive_file_summary(
+                    std::ptr::null(),
+                    0,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    out.as_mut_ptr(),
+                    8,
+                )
+            },
+            1
+        );
+        assert_eq!(out, [0; 8]);
+    }
+
+    #[test]
+    fn additional_w466_numeric_strings_follow_php_casts_including_infinity() {
+        for (text, expected) in [
+            (&b"2"[..], Some(2)),
+            (b" 2", Some(2)),
+            (b"2 ", Some(2)),
+            (b"\t\n\x0b\x0c\r2", Some(2)),
+            (b"2.9", Some(2)),
+            (b"-2.9", Some(-2)),
+            (b".2e1", Some(2)),
+            (b"2.", Some(2)),
+            (b"+2", Some(2)),
+            (b"1e0", Some(1)),
+            (b"9223372036854775808", Some(i64::MAX)),
+            (b"-9223372036854775809", Some(i64::MIN)),
+            (b"1e19", Some(i64::MAX)),
+            (b"1e1000", Some(0)),
+            (b"-1e1000", Some(0)),
+            (b"2e-400", Some(0)),
+            (b"", None),
+            (b" ", None),
+            (b".", None),
+            (b"++2", None),
+            (b"2e", None),
+            (b"0x2", None),
+            (b"1_000", None),
+            (b"2\xc2\xa0", None),
+        ] {
+            assert_eq!(w466_php_numeric_int(text), expected, "{text:?}");
+        }
+        let values = b"2\0 1\0abc\0\0" as &[u8];
+        let mut out = [9i64; 4];
+        assert_eq!(
+            unsafe {
+                nntmux_w466_tv_lookup_summary(
+                    values.as_ptr(),
+                    values.len(),
+                    5,
+                    0,
+                    out.as_mut_ptr(),
+                    4,
+                )
+            },
+            1
+        );
+        assert_eq!(out, [3, 1, 1, 0]);
+        let mut out = [9i64; 4];
+        assert_eq!(
+            unsafe {
+                nntmux_w466_tv_lookup_summary(
+                    values.as_ptr(),
+                    values.len(),
+                    5,
+                    -1,
+                    out.as_mut_ptr(),
+                    4,
+                )
+            },
+            1
+        );
+        assert_eq!(out, [0, 1, 1, 3]);
+        let mut untouched = [9i64; 4];
+        assert_eq!(
+            unsafe {
+                nntmux_w466_tv_lookup_summary(
+                    values.as_ptr(),
+                    values.len(),
+                    4,
+                    0,
+                    untouched.as_mut_ptr(),
+                    4,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_w466_tv_lookup_summary(
+                    values.as_ptr(),
+                    values.len(),
+                    5,
+                    0,
+                    untouched.as_mut_ptr(),
+                    3,
+                )
+            },
+            -1
+        );
+        assert_eq!(untouched, [9; 4]);
+    }
+
+    #[test]
+    fn additional_w466_event_batches_fold_in_order_and_reject_without_writes() {
+        let call = |kinds: &[i64],
+                    ids: &[i64],
+                    ms: &[f64],
+                    scope: Option<i64>,
+                    start: [i64; 3],
+                    out: &mut [i64; 3],
+                    total: &mut f64| {
+            let mut integers = packed(kinds);
+            integers.extend(packed(ids));
+            let ms: Vec<u8> = ms.iter().flat_map(|value| value.to_le_bytes()).collect();
+            unsafe {
+                nntmux_w466_pmc_apply_batch(
+                    integers.as_ptr(),
+                    integers.len(),
+                    ms.as_ptr(),
+                    ms.len(),
+                    kinds.len(),
+                    i32::from(scope.is_some()),
+                    scope.unwrap_or(0),
+                    start[0],
+                    0.5,
+                    start[1],
+                    start[2],
+                    out.as_mut_ptr(),
+                    3,
+                    total,
+                )
+            }
+        };
+        let (mut out, mut total) = ([0i64; 3], 0.0);
+        assert_eq!(
+            call(
+                &[0, 1, 1, 2, 0],
+                &[0, 7, 8, 7, 3],
+                &[1.25, 9.0, 9.0, 9.0, 0.25],
+                Some(7),
+                [1, 2, 3],
+                &mut out,
+                &mut total
+            ),
+            1
+        );
+        assert_eq!((out, total), ([3, 3, 4], 2.0));
+        assert_eq!(
+            call(
+                &[0, 1, 2],
+                &[0, 7, 7],
+                &[1.0, 0.0, 0.0],
+                None,
+                [1, 2, 3],
+                &mut out,
+                &mut total
+            ),
+            1
+        );
+        assert_eq!((out, total), ([1, 2, 3], 0.5));
+        let (mut kept, mut kept_total) = ([5i64; 3], 4.0);
+        for (kinds, start) in [
+            (&[0, 3][..], [0, 0, 0]),
+            (&[4_294_967_296][..], [0, 0, 0]),
+            (&[0][..], [i64::MAX, 0, 0]),
+            (&[2][..], [0, 0, i64::MAX]),
+        ] {
+            let ids = vec![7; kinds.len()];
+            let ms = vec![1.0; kinds.len()];
+            assert_eq!(
+                call(kinds, &ids, &ms, Some(7), start, &mut kept, &mut kept_total),
+                -1
+            );
+        }
+        let integers = packed(&[0, 7]);
+        let ms = 1.0f64.to_le_bytes();
+        assert_eq!(
+            unsafe {
+                nntmux_w466_pmc_apply_batch(
+                    integers.as_ptr(),
+                    integers.len(),
+                    ms.as_ptr(),
+                    ms.len(),
+                    2,
+                    1,
+                    7,
+                    0,
+                    0.0,
+                    0,
+                    0,
+                    kept.as_mut_ptr(),
+                    3,
+                    &mut kept_total,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_w466_pmc_apply_batch(
+                    integers.as_ptr(),
+                    integers.len(),
+                    ms.as_ptr(),
+                    ms.len(),
+                    1,
+                    1,
+                    7,
+                    0,
+                    0.0,
+                    0,
+                    0,
+                    kept.as_mut_ptr(),
+                    2,
+                    &mut kept_total,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_w466_pmc_apply_batch(
+                    integers.as_ptr(),
+                    integers.len(),
+                    ms.as_ptr(),
+                    ms.len(),
+                    1,
+                    1,
+                    7,
+                    0,
+                    0.0,
+                    0,
+                    0,
+                    kept.as_mut_ptr(),
+                    3,
+                    std::ptr::null_mut(),
+                )
+            },
+            -1
+        );
+        assert_eq!((kept, kept_total), ([5; 3], 4.0));
+    }
+
+    #[test]
+    fn additional_w466_stage_summary_formats_php_division_and_rejects_bad_layouts() {
+        let keys = b"download\0media\0par2\0\xe4\xb9\x85";
+        let values = packed(&[2_000_000_000, 1_234_567, -1, i64::MAX]);
+        let mut out = [0u8; 256];
+        let written = unsafe {
+            nntmux_w466_stage_summary(
+                keys.as_ptr(),
+                keys.len(),
+                4,
+                values.as_ptr(),
+                values.len(),
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(
+            &out[..written as usize],
+            "download=2.000000s media=0.001235s par2=-0.000000s \u{4e45}=9223372036.854776s"
+                .as_bytes()
+        );
+        let mut short = [0u8; 4];
+        assert!(
+            unsafe {
+                nntmux_w466_stage_summary(
+                    keys.as_ptr(),
+                    keys.len(),
+                    4,
+                    values.as_ptr(),
+                    values.len(),
+                    short.as_mut_ptr(),
+                    short.len(),
+                )
+            } < -1
+        );
+        for (count, values_len) in [
+            (3, values.len()),
+            (4, values.len() - 8),
+            (4, values.len() - 1),
+        ] {
+            assert_eq!(
+                unsafe {
+                    nntmux_w466_stage_summary(
+                        keys.as_ptr(),
+                        keys.len(),
+                        count,
+                        values.as_ptr(),
+                        values_len,
+                        out.as_mut_ptr(),
+                        out.len(),
+                    )
+                },
+                -1
+            );
+        }
+    }
+
+    #[test]
+    fn additional_w466_witness_admission_dedupes_caps_and_stops_at_first_rejection() {
+        let admission = w466_admit_witnesses(
+            &[b"a", b"b", b"a", b"known", b"\xff", b"c"],
+            &[b"known"],
+            &[b"b"],
+            10,
+        );
+        assert_eq!(
+            admission,
+            W466Admission {
+                omitted: true,
+                bytes: 12,
+                admitted: vec![b"a", b"b"],
+                appended: vec![b"a", b"known"]
+            }
+        );
+        let long = vec![b'x'; 4096];
+        let too_long = vec![b'x'; 4097];
+        assert!(!w466_admit_witnesses(&[&long], &[], &[], 0).omitted);
+        assert!(w466_admit_witnesses(&[&too_long], &[], &[], 0).omitted);
+        assert!(w466_admit_witnesses(&[b""], &[], &[], 0).omitted);
+        assert!(w466_admit_witnesses(&[b"ab"], &[], &[], 32767).omitted);
+        assert!(!w466_admit_witnesses(&[b"a"], &[], &[], 32767).omitted);
+        // A known witness still passes once the caps are reached.
+        let full: Vec<Vec<u8>> = (0..256).map(|i| format!("n{i}").into_bytes()).collect();
+        let full: Vec<&[u8]> = full.iter().map(Vec::as_slice).collect();
+        let capped = w466_admit_witnesses(&[b"n5", b"new"], &full, &[], 100);
+        assert_eq!((capped.omitted, capped.appended), (true, vec![&b"n5"[..]]));
+
+        let mut out = [0u8; 128];
+        let written = unsafe {
+            nntmux_w466_admit_witnesses(
+                b"a\0b\0a".as_ptr(),
+                5,
+                3,
+                b"z".as_ptr(),
+                1,
+                1,
+                b"b".as_ptr(),
+                1,
+                1,
+                1,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(written, 25);
+        assert_eq!(out[0], 0);
+        assert_eq!(u64::from_le_bytes(out[1..9].try_into().unwrap()), 3);
+        assert_eq!(u32::from_le_bytes(out[9..13].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(out[13..17].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(out[17..21].try_into().unwrap()), 3);
+        assert_eq!(&out[21..25], b"a\0ba");
+        let mut short = [0u8; 8];
+        assert!(
+            unsafe {
+                nntmux_w466_admit_witnesses(
+                    b"a".as_ptr(),
+                    1,
+                    1,
+                    std::ptr::null(),
+                    0,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    0,
+                    0,
+                    short.as_mut_ptr(),
+                    short.len(),
+                )
+            } < -1
+        );
+        assert_eq!(
+            unsafe {
+                nntmux_w466_admit_witnesses(
+                    b"a\0b".as_ptr(),
+                    3,
+                    1,
+                    std::ptr::null(),
+                    0,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    0,
+                    0,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            },
+            -1
+        );
+    }
+}
