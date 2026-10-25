@@ -10,6 +10,7 @@ use App\Services\Categorization\Categorizers\TvCategorizer;
 use App\Services\Categorization\ReleaseContext;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 /**
@@ -397,5 +398,161 @@ class TvPipe extends AbstractCategorizationPipe
         }
 
         return self::$w413RustFfiHandle === false ? null : self::$w413RustFfiHandle;
+    }
+
+    /** Enabled: three paired runs cleared every 1.5x gate (common mean 2.72-2.86x, p99 2.42-2.70x; uncommon mean 2.63-2.71x, p99 2.23-2.58x); see RustTvPipeBookServiceBooksConsolesGamesProcessorW53ParityTest. */
+    private const bool W53_RUST_FFI_DEFAULT = true;
+
+    public const string W53_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w533_tv_episode_token_batch(const char *blob, size_t blob_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    public static function usesW53RustFfi(): bool
+    {
+        $override = self::w53RustFfiState();
+
+        return \is_bool($override) ? $override : self::W53_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 53 Rust path forced on or off, then restores the previous setting. */
+    public static function withW53RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w53RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w53RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Classifies TV release names by W413_EPISODE_PATTERN, then W413_DAILY_PATTERN, then
+     * W413_SEASON_PACK_PATTERN on the lowercased name: one word per name with
+     * `kind | season << 2 | episode << 16` (kind 0 none, 1 episode, 2 daily, 3 season pack; season and
+     * episode come from the leftmost episode token), then the episode, daily, season-pack and none counts.
+     *
+     * @param  array<array-key, string>  $names
+     * @return list<int>
+     */
+    public static function w53EpisodeTokenBatch(array $names): array
+    {
+        return self::usesW53RustFfi() ? self::w53EpisodeTokenBatchNative($names) : self::w53EpisodeTokenBatchPhp($names);
+    }
+
+    /**
+     * @param  array<array-key, string>  $names
+     * @return list<int>
+     */
+    public static function w53EpisodeTokenBatchNative(array $names): array
+    {
+        return self::w533Invoke($names, \count($names) + 4) ?? self::w53EpisodeTokenBatchPhp($names);
+    }
+
+    /**
+     * @param  array<array-key, string>  $names
+     * @return list<int>
+     */
+    public static function w53EpisodeTokenBatchPhp(array $names): array
+    {
+        $out = [];
+        $totals = [0, 0, 0, 0];
+        foreach ($names as $name) {
+            $name = strtolower((string) $name);
+            if (preg_match(self::W413_EPISODE_PATTERN, $name, $match) === 1) {
+                $word = 1 | ((int) $match[1] << 2) | ((int) $match[2] << 16);
+            } elseif (preg_match(self::W413_DAILY_PATTERN, $name) === 1) {
+                $word = 2;
+            } elseif (preg_match(self::W413_SEASON_PACK_PATTERN, $name) === 1) {
+                $word = 3;
+            } else {
+                $word = 0;
+            }
+            $totals[$word & 3]++;
+            $out[] = $word;
+        }
+        $out[] = $totals[1];
+        $out[] = $totals[2];
+        $out[] = $totals[3];
+        $out[] = $totals[0];
+
+        return $out;
+    }
+
+    /**
+     * Wave 53 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out'
+     * returns an `int64_t` output buffer of at least $val words.
+     */
+    private static function w53RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('categorize_w53', self::W53_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w53RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 53.3 export with the NUL-joined $items. Null when the library is missing, the
+     * call declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>|null
+     */
+    private static function w533Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w53RustFfiState('ffi');
+            $out = self::w53RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $blob = implode("\0", $items);
+            if (substr_count($blob, "\0") !== max(0, \count($items) - 1)) {
+                // An item holds a NUL byte: substitute 0x01, which classifies identically (none of the episode, daily or season-pack patterns match either byte).
+                $blob = implode("\0", str_replace("\0", "\x01", $items));
+            }
+            // @phpstan-ignore method.notFound (Declared by W53_FFI_CDEF.)
+            $written = $ffi->nntmux_w533_tv_episode_token_batch($blob, \strlen($blob), \count($items), $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }
