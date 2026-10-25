@@ -396,4 +396,253 @@ final readonly class MediaSourceHints
 
         return $buffer === null ? null : [$ffi, $buffer];
     }
+
+    // Rust is the default only while the paired W54.6 benchmark clears 1.5x on all four metrics.
+    private const bool W54_RUST_FFI_DEFAULT = true;
+
+    public const string W54_FFI_CDEF = <<<'C'
+        int32_t nntmux_w546_hint_normalize_batch(const char *positions, size_t positions_len, const char *position_lens, size_t position_lens_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    public const int W54_HINT_HEADER = 15;
+
+    private const int W54_MAX_ITEMS = 1_048_576;
+
+    private const int W54_VALUE_CAP = 1_099_511_627_775;
+
+    private const int W54_TOTAL_CAP = 4_611_686_018_427_387_904;
+
+    /** `SourcePosition` backing value => code; anything else is code 3 and treated as a head. */
+    private const array W54_POSITION_CODES = ['complete' => 0, 'head' => 1, 'mid' => 2];
+
+    /**
+     * `headPhp()` normalization and `availableFractionPhp()` over many hints, as integer parts per million.
+     *
+     * Per hint a position value, a real size (null, 0 or less is unknown; capped at 2^40-1) and available
+     * bytes (clamped to [0, 2^40)); missing values are unknown and 0. A head whose real size is covered
+     * becomes complete; a mid hint drops its real size as `mid()` does. Layout: `[0]` count, `[1..4]`
+     * inputs per code, `[5..7]` normalized complete/head/mid, `[8]` promoted heads, `[9]` partial hints
+     * without a real size, `[10]` available and `[11]` missing bytes (capped at 2^62), `[12]` mean fraction
+     * ppm of hints with a fraction, `[13]` first lowest fraction (-1 when none), `[14]` FNV-1a digest; then
+     * per hint `normalized | code << 2 | (ppm + 1) << 4 | flags << 24 | missing_kib << 28`, where `ppm + 1`
+     * is 0 for a null fraction, flag bit 0 is promoted, bit 1 unknown real size, bit 2 nothing available,
+     * bit 3 more available than real, and the missing KiB round up.
+     *
+     * @param  array<array-key, string>  $positions  SourcePosition values
+     * @param  array<array-key, int|null>  $realSizes
+     * @param  array<array-key, int>  $availableBytes
+     * @return list<int>
+     */
+    public static function normalizeHintBatch(array $positions, array $realSizes, array $availableBytes): array
+    {
+        return (self::usesW54RustFfi() ? self::normalizeHintBatchNative($positions, $realSizes, $availableBytes) : null)
+            ?? self::normalizeHintBatchPhp($positions, $realSizes, $availableBytes);
+    }
+
+    /**
+     * @param  array<array-key, string>  $positions
+     * @param  array<array-key, int|null>  $realSizes
+     * @param  array<array-key, int>  $availableBytes
+     * @return list<int>
+     */
+    public static function normalizeHintBatchPhp(array $positions, array $realSizes, array $availableBytes): array
+    {
+        $positions = array_values($positions);
+        $realSizes = array_values($realSizes);
+        $availableBytes = array_values($availableBytes);
+        $count = \count($positions);
+        $out = array_fill(0, self::W54_HINT_HEADER, 0);
+        $out[0] = $count;
+        $lowestAt = -1;
+        $lowest = 0;
+        $ppmSum = $ppmCount = 0;
+        $digest = 2_166_136_261;
+        $rows = [];
+        for ($i = 0; $i < $count; $i++) {
+            $code = self::W54_POSITION_CODES[$positions[$i]] ?? 3;
+            $real = min($realSizes[$i] ?? -1, self::W54_VALUE_CAP);
+            $available = min(max($availableBytes[$i] ?? 0, 0), self::W54_VALUE_CAP);
+            $known = $real > 0;
+            $promoted = $code === 1 && $known && $available >= $real;
+            $normalized = $code === 0 || $promoted ? 0 : ($code === 2 ? 2 : 1);
+            $sized = $known && $normalized !== 2;
+            $ppm = $normalized === 0 ? 1_000_000 : ($sized && $available > 0 ? min(intdiv($available * 1_000_000, $real), 1_000_000) : null);
+            $missing = $normalized !== 0 && $sized ? max($real - $available, 0) : 0;
+            $unsized = $normalized !== 0 && ! $sized;
+            $flags = ($promoted ? 1 : 0) | ($unsized ? 2 : 0) | ($available === 0 ? 4 : 0) | ($known && $available > $real ? 8 : 0);
+            $out[1 + $code]++;
+            $out[5 + $normalized]++;
+            if ($promoted) {
+                $out[8]++;
+            }
+            if ($unsized) {
+                $out[9]++;
+            }
+            $out[10] = min($out[10] + $available, self::W54_TOTAL_CAP);
+            $out[11] = min($out[11] + $missing, self::W54_TOTAL_CAP);
+            if ($ppm !== null) {
+                $ppmSum += $ppm;
+                $ppmCount++;
+                if ($lowestAt < 0 || $ppm < $lowest) {
+                    $lowestAt = $i;
+                    $lowest = $ppm;
+                }
+            }
+            $row = $normalized | $code << 2 | ($ppm === null ? 0 : $ppm + 1) << 4 | $flags << 24 | intdiv($missing + 1023, 1024) << 28;
+            $digest = (($digest ^ (($row ^ ($row >> 32)) & 0xFFFFFFFF)) * 16_777_619) & 0xFFFFFFFF;
+            $rows[] = $row;
+        }
+        if ($ppmCount > 0) {
+            $out[12] = intdiv($ppmSum, $ppmCount);
+        }
+        $out[13] = $lowestAt;
+        $out[14] = $digest;
+
+        return [...$out, ...$rows];
+    }
+
+    /**
+     * Rust normalization, or null when PHP must compute it (unavailable library or rejected input).
+     *
+     * @param  array<array-key, string>  $positions
+     * @param  array<array-key, int|null>  $realSizes
+     * @param  array<array-key, int>  $availableBytes
+     * @return list<int>|null
+     */
+    public static function normalizeHintBatchNative(array $positions, array $realSizes, array $availableBytes): ?array
+    {
+        $positions = array_values($positions);
+        $count = \count($positions);
+        if ($count > self::W54_MAX_ITEMS) {
+            return null;
+        }
+        if (\in_array(null, $realSizes, true)) {
+            $realSizes = array_map(static fn (mixed $size): mixed => $size ?? -1, $realSizes);
+        }
+        /** @var array<array-key, int> $realSizes */
+        [$joined, $lens] = self::w54Strings($positions);
+        $ints = pack('q*', ...self::w54Fit($realSizes, $count, -1), ...self::w54Fit($availableBytes, $count));
+        $fields = self::W54_HINT_HEADER + $count;
+
+        // @phpstan-ignore method.notFound
+        return self::w54Call($fields, static fn (FFI $ffi, CData $out): mixed => $ffi->nntmux_w546_hint_normalize_batch($joined, \strlen($joined), $lens, \strlen($lens), $ints, \strlen($ints), $count, $out, $fields));
+    }
+
+    /**
+     * Run `$callback` with the Wave 54.6 Rust batch path forced on or off, then restore the previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW54RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w54RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w54RustFfiState('set', $previous);
+        }
+    }
+
+    public static function usesW54RustFfi(): bool
+    {
+        $forced = self::w54RustFfiState();
+
+        return \is_bool($forced) ? $forced : self::W54_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Wave 54.6 routing and binding, kept in function statics because readonly classes cannot declare
+     * static properties. No `$op` returns the forced routing (null for the default); `'set'` replaces it
+     * with `$val` and returns the previous value; `'binding'` returns the cached `additional_w54` binding
+     * and an output buffer of at least `$val` values, or null.
+     */
+    private static function w54RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $enabled */
+        static $enabled = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $buffer */
+        static $buffer = null;
+        static $capacity = 0;
+        if ($op === 'set') {
+            $previous = $enabled;
+            $enabled = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op !== 'binding') {
+            return $enabled;
+        }
+        $fields = \is_int($val) ? $val : 0;
+        try {
+            $ffi ??= RustPipelineLibrary::resolveDomain('additional_w54', self::W54_FFI_CDEF) ?? false;
+            if ($ffi === false) {
+                return null;
+            }
+            if ($buffer === null || $capacity < $fields) {
+                $capacity = max(256, $fields);
+                $buffer = $ffi->new('int64_t['.$capacity.']');
+            }
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $buffer === null ? null : [$ffi, $buffer];
+    }
+
+    /**
+     * The batch's `$fields` output words from one Wave 54.6 call, or null when PHP must compute it.
+     *
+     * @param  callable(FFI, CData): mixed  $call
+     * @return list<int>|null
+     */
+    private static function w54Call(int $fields, callable $call): ?array
+    {
+        /** @var array{0: FFI, 1: CData}|null $binding */
+        $binding = self::w54RustFfiState('binding', $fields);
+        if ($binding === null) {
+            return null;
+        }
+        try {
+            if ($call($binding[0], $binding[1]) !== 1) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($binding[1], $fields * 8));
+        } catch (Throwable) {
+            return null;
+        }
+
+        return $values === false ? null : array_values($values);
+    }
+
+    /**
+     * Exactly `$count` values: the list itself when it already fits, otherwise padded with `$default`.
+     *
+     * @param  array<array-key, int>  $values
+     * @return list<int>
+     */
+    private static function w54Fit(array $values, int $count, int $default = 0): array
+    {
+        return \count($values) === $count && array_is_list($values) ? $values : array_pad(\array_slice(array_values($values), 0, $count), $count, $default);
+    }
+
+    /**
+     * NUL-joined items, or their concatenation with `pack('V*')` lengths when an item holds a NUL.
+     *
+     * @param  list<string>  $items
+     * @return array{0: string, 1: string}
+     */
+    private static function w54Strings(array $items): array
+    {
+        $joined = implode("\0", $items);
+        if ($items === [] || substr_count($joined, "\0") === \count($items) - 1) {
+            return [$joined, ''];
+        }
+
+        return [implode('', $items), pack('V*', ...array_map(strlen(...), $items))];
+    }
 }
