@@ -615,4 +615,165 @@ class Par2Processor
             throw $error;
         }
     }
+
+    /** Disabled: common p99 missed 1.5x in one of five paired runs (1.58x, 1.65x, 1.29x, 1.68x, 2.20x; see the W42 parity test). */
+    public const bool W424_RUST_FFI_DEFAULT = false;
+
+    public const string W424_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w424_par2_rename_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private const array W424_SUMMARY_KEYS = ['total_files', 'empty_name_count', 'hex_hash_name_count', 'obfuscated_name_count', 'release_like_count', 'par2_volume_count', 'executable_count'];
+
+    private const array W424_EXECUTABLE_EXTENSIONS = ['exe' => true, 'bat' => true, 'cmd' => true, 'scr' => true, 'com' => true, 'vbs' => true, 'js' => true, 'ps1' => true, 'msi' => true, 'lnk' => true];
+
+    private static ?bool $w424UseRustFfi = null;
+
+    private static FFI|false|null $w424Ffi = null;
+
+    public static function useW424RustFfi(bool $enable = true): void
+    {
+        self::$w424UseRustFfi = $enable;
+    }
+
+    public static function usesW424RustFfi(): bool
+    {
+        return self::$w424UseRustFfi ?? self::W424_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW424RustFfi(): void
+    {
+        self::$w424UseRustFfi = null;
+        self::$w424Ffi = null;
+    }
+
+    /**
+     * Summarize PAR2 rename candidates by base name (after the last slash)
+     * and stem (before its last dot): 32/40 hex stems, 16+ alphanumeric
+     * stems, dotted release stems with a dash, .volN+M.par2 volumes and
+     * executable extensions.
+     * Entries come from strings, integers, or the filename or name array
+     * field; other values (including objects) count as empty entries.
+     *
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizePar2RenameCandidateBatch(array $entries): array
+    {
+        return self::usesW424RustFfi()
+            ? self::summarizePar2RenameCandidateBatchNative($entries)
+            : self::summarizePar2RenameCandidateBatchPhp($entries);
+    }
+
+    /**
+     * Rust summary; falls back to PHP when the library or input frame is unusable.
+     *
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizePar2RenameCandidateBatchNative(array $entries): array
+    {
+        return self::w424Call(self::w424Entries($entries)) ?? self::summarizePar2RenameCandidateBatchPhp($entries);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $entries
+     * @return array<string, int>
+     */
+    public static function summarizePar2RenameCandidateBatchPhp(array $entries): array
+    {
+        $summary = array_fill_keys(self::W424_SUMMARY_KEYS, 0);
+        foreach (self::w424Entries($entries) as $entry) {
+            $summary['total_files']++;
+            $entry = trim($entry);
+            if ($entry === '') {
+                $summary['empty_name_count']++;
+
+                continue;
+            }
+            $slash = strrpos($entry, '/');
+            $backslash = strrpos($entry, '\\');
+            $base = substr($entry, max($slash === false ? -1 : $slash, $backslash === false ? -1 : $backslash) + 1);
+            $dot = strrpos($base, '.');
+            $stem = $dot === false ? $base : substr($base, 0, $dot);
+            $extension = $dot === false ? '' : strtolower(substr($base, $dot + 1));
+            $summary['hex_hash_name_count'] += (int) (preg_match('/^(?:[0-9A-Fa-f]{32}|[0-9A-Fa-f]{40})\z/', $stem) === 1);
+            $summary['obfuscated_name_count'] += (int) (preg_match('/^[A-Za-z0-9]{16,}\z/', $stem) === 1);
+            $summary['release_like_count'] += (int) (substr_count($stem, '.') >= 2 && str_contains($stem, '-'));
+            $summary['par2_volume_count'] += (int) (preg_match('/\.vol\d+\+\d+\.par2\z/i', $entry) === 1);
+            $summary['executable_count'] += (int) isset(self::W424_EXECUTABLE_EXTENSIONS[$extension]);
+        }
+
+        return $summary;
+    }
+
+    /** Only integer and string entries participate; objects are never cast or serialized.
+     *
+     * @param  array<array-key, mixed>  $input
+     * @return list<string>
+     */
+    private static function w424Entries(array $input): array
+    {
+        $entries = [];
+        foreach ($input as $item) {
+            if (is_array($item)) {
+                $item = $item['filename'] ?? $item['name'] ?? null;
+            }
+            $entries[] = is_string($item) || is_int($item) ? (string) $item : '';
+        }
+
+        return $entries;
+    }
+
+    /** @param list<string> $entries
+     * @return array<string, int>|null
+     */
+    private static function w424Call(array $entries): ?array
+    {
+        try {
+            $input = serialize([$entries]);
+            if (strlen($input) > 16777216) {
+                return null;
+            }
+            self::$w424Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w424', self::W424_FFI_CDEF) ?? false;
+            $ffi = self::$w424Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            $capacity = 0;
+            $out = RustPipelineLibrary::obtainScratch($ffi, 2048, $capacity);
+            if ($out === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound (Declared by W424_FFI_CDEF.)
+            $written = $ffi->nntmux_w424_par2_rename_batch($input, strlen($input), $out, $capacity);
+            if (is_int($written) && $written < -1 && $written >= -16777216) {
+                $out = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($out === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound (Declared by W424_FFI_CDEF.)
+                $written = $ffi->nntmux_w424_par2_rename_batch($input, strlen($input), $out, $capacity);
+            }
+            if (! is_int($written) || $written <= 0 || $written > $capacity || $written > 16777216) {
+                return null;
+            }
+            $result = @unserialize(FFI::string($out, $written), ['allowed_classes' => false]);
+            if (! is_array($result) || array_keys($result) !== self::W424_SUMMARY_KEYS || $result['total_files'] !== count($entries)) {
+                return null;
+            }
+            $summary = [];
+            foreach (self::W424_SUMMARY_KEYS as $key) {
+                $value = $result[$key];
+                if (! is_int($value) || $value < 0 || $value > count($entries)) {
+                    return null;
+                }
+                $summary[$key] = $value;
+            }
+
+            return $summary;
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }
