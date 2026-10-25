@@ -113,8 +113,9 @@ final class RustTvProvidersLocalDbTraktOutcomePosterAdderW49ParityTest extends T
     // ---------------------------------------------------------------------
 
     #[DataProvider('helperProvider')]
-    public function test_w49_switch_api_and_default(string $class, string $method): void
+    public function test_w49_switch_api_and_default(string $class, string $method, int $words): void
     {
+        self::assertGreaterThan(0, $words);
         $reflection = new ReflectionClass($class);
         $constant = $reflection->getReflectionConstant('W49_RUST_FFI_DEFAULT');
         self::assertNotFalse($constant);
@@ -150,8 +151,9 @@ final class RustTvProvidersLocalDbTraktOutcomePosterAdderW49ParityTest extends T
     }
 
     #[DataProvider('helperProvider')]
-    public function test_empty_batches_and_shape_errors(string $class, string $method): void
+    public function test_empty_batches_and_shape_errors(string $class, string $method, int $words): void
     {
+        self::assertGreaterThan(0, $words);
         $columns = count(self::realistic($class));
         foreach ([false, true] as $native) {
             self::assertSame([], self::dispatch($class, $method, $native, array_fill(0, $columns, [])));
