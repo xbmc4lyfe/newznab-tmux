@@ -35573,3 +35573,1281 @@ pub unsafe extern "C" fn nntmux_w48_update_lock_batch(
     })
     .unwrap_or(-1)
 }
+
+pub mod wave49_verification_admission_inventory_prep_repo_sample {
+    //! Wave 49.2 batch kernels for CandidateAdmission, CandidateHeaderInventory,
+    //! CandidatePreparationService, CandidateRepository and CandidateSampleBatch. String
+    //! columns arrive NUL-joined (exactly `count` entries), integer columns as little-endian
+    //! `i64` tables. Every export writes fixed `i64` words per item, a few summary words and one
+    //! XXH64 digest of the preceding words, returning the word count, `-needed` when
+    //! `out_cap` (in words) is short, or -1 for a malformed batch.
+
+    use super::crc32_ieee;
+    use std::collections::hash_map::{Entry, RandomState};
+    use std::collections::{HashMap, HashSet};
+    use std::hash::{BuildHasher, Hasher};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::OnceLock;
+
+    pub const MAX_INPUT: usize = 64 * 1024 * 1024;
+    pub const MAX_ITEMS: usize = 1 << 20;
+
+    pub const PARTIAL_DEFERRED: &[u8] = b"Partial publication deferred: ";
+    pub const PARTIAL_QUEUED: &[u8] =
+        b"Upload stopped growing before it was complete; queued for partial publication.";
+
+    /// Borrows a caller span; an empty span may be null and is never sliced.
+    unsafe fn span<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+        if len == 0 {
+            return Some(&[]);
+        }
+        if ptr.is_null() || len > MAX_INPUT {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
+    fn overlaps(a: *const u8, a_len: usize, b: *const u8, b_len: usize) -> bool {
+        let (a, b) = (a as usize, b as usize);
+        a_len != 0 && b_len != 0 && a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
+    }
+
+    const P1: u64 = 0x9E37_79B1_85EB_CA87;
+    const P2: u64 = 0xC2B2_AE3D_27D4_EB4F;
+    const P3: u64 = 0x1656_67B1_9E37_79F9;
+    const P4: u64 = 0x85EB_CA77_C2B2_AE63;
+    const P5: u64 = 0x27D4_EB2F_1656_67C5;
+
+    #[inline]
+    fn xxh_round(acc: u64, input: u64) -> u64 {
+        acc.wrapping_add(input.wrapping_mul(P2))
+            .rotate_left(31)
+            .wrapping_mul(P1)
+    }
+
+    #[inline]
+    fn xxh_merge(acc: u64, value: u64) -> u64 {
+        (acc ^ xxh_round(0, value))
+            .wrapping_mul(P1)
+            .wrapping_add(P4)
+    }
+
+    /// PHP `unpack('J', hash('xxh64', pack('P*', ...$words), true))[1]`: XXH64 (seed 0) over the
+    /// little-endian words, which are whole 8-byte lanes.
+    pub fn digest(words: &[i64]) -> i64 {
+        let len = (words.len() as u64) * 8;
+        let (stripes, rest) = words.as_chunks::<4>();
+        let mut h = if stripes.is_empty() {
+            P5
+        } else {
+            let mut v = [P1.wrapping_add(P2), P2, 0, 0u64.wrapping_sub(P1)];
+            for stripe in stripes {
+                for (lane, &word) in v.iter_mut().zip(stripe) {
+                    *lane = xxh_round(*lane, word as u64);
+                }
+            }
+            let mut h = v[0]
+                .rotate_left(1)
+                .wrapping_add(v[1].rotate_left(7))
+                .wrapping_add(v[2].rotate_left(12))
+                .wrapping_add(v[3].rotate_left(18));
+            for lane in v {
+                h = xxh_merge(h, lane);
+            }
+            h
+        };
+        h = h.wrapping_add(len);
+        for &word in rest {
+            h = (h ^ xxh_round(0, word as u64))
+                .rotate_left(27)
+                .wrapping_mul(P1)
+                .wrapping_add(P4);
+        }
+        h ^= h >> 33;
+        h = h.wrapping_mul(P2);
+        h ^= h >> 29;
+        h = h.wrapping_mul(P3);
+        h ^= h >> 32;
+        h as i64
+    }
+
+    /// Calls `hit` with the index of every NUL byte in order until it returns false; returns
+    /// whether the scan completed. NEON tests 64 bytes per step and maps a hit block's 16-byte
+    /// lanes to nibble masks.
+    #[cfg(target_arch = "aarch64")]
+    fn nul_scan(bytes: &[u8], mut hit: impl FnMut(usize) -> bool) -> bool {
+        use std::arch::aarch64::{
+            uint8x16_t, vceqzq_u8, vget_lane_u64, vld1q_u8, vmaxvq_u8, vorrq_u8,
+            vreinterpret_u64_u8, vreinterpretq_u16_u8, vshrn_n_u16,
+        };
+        let (groups, _) = bytes.as_chunks::<64>();
+        for (g, group) in groups.iter().enumerate() {
+            // NEON is mandatory on aarch64, and every 16-byte load lies inside the 64-byte group.
+            let (any, masks) = unsafe {
+                let p = group.as_ptr();
+                let eq: [uint8x16_t; 4] = [
+                    vceqzq_u8(vld1q_u8(p)),
+                    vceqzq_u8(vld1q_u8(p.add(16))),
+                    vceqzq_u8(vld1q_u8(p.add(32))),
+                    vceqzq_u8(vld1q_u8(p.add(48))),
+                ];
+                let any = vmaxvq_u8(vorrq_u8(vorrq_u8(eq[0], eq[1]), vorrq_u8(eq[2], eq[3]))) != 0;
+                let nibbles = |e: uint8x16_t| {
+                    vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(vreinterpretq_u16_u8(
+                        e,
+                    ))))
+                };
+                (any, if any { eq.map(nibbles) } else { [0; 4] })
+            };
+            if !any {
+                continue;
+            }
+            for (l, &lane) in masks.iter().enumerate() {
+                let mut m = lane;
+                while m != 0 {
+                    let j = (m.trailing_zeros() / 4) as usize;
+                    if !hit(g * 64 + l * 16 + j) {
+                        return false;
+                    }
+                    m &= !(0xF << (j * 4));
+                }
+            }
+        }
+        (groups.len() * 64..bytes.len()).all(|j| bytes[j] != 0 || hit(j))
+    }
+
+    /// Portable SWAR variant: an exact per-byte zero mask for every 8-byte word.
+    #[cfg(not(target_arch = "aarch64"))]
+    fn nul_scan(bytes: &[u8], mut hit: impl FnMut(usize) -> bool) -> bool {
+        const LOW7: u64 = 0x7F7F_7F7F_7F7F_7F7F;
+        let (words, _) = bytes.as_chunks::<8>();
+        for (w, word) in words.iter().enumerate() {
+            let x = u64::from_le_bytes(*word);
+            let mut zero = !(((x & LOW7) + LOW7) | x | LOW7);
+            while zero != 0 {
+                if !hit(w * 8 + (zero.trailing_zeros() / 8) as usize) {
+                    return false;
+                }
+                zero &= zero - 1;
+            }
+        }
+        (words.len() * 8..bytes.len()).all(|j| bytes[j] != 0 || hit(j))
+    }
+
+    /// Exactly `count` NUL-separated entries, or None when the column holds another number.
+    pub fn column(bytes: &[u8], count: usize) -> Option<Vec<&[u8]>> {
+        if count == 0 {
+            return bytes.is_empty().then(Vec::new);
+        }
+        let mut rows: Vec<&[u8]> = Vec::with_capacity(count);
+        let mut start = 0;
+        let complete = nul_scan(bytes, |j| {
+            if rows.len() + 1 >= count {
+                return false;
+            }
+            rows.push(&bytes[start..j]);
+            start = j + 1;
+            true
+        });
+        if !complete {
+            return None;
+        }
+        rows.push(&bytes[start..]);
+        (rows.len() == count).then_some(rows)
+    }
+
+    /// Folded multiply: the high and low halves of the 128-bit product, xored.
+    #[inline]
+    fn fold(a: u64, b: u64) -> u64 {
+        let p = u128::from(a) * u128::from(b);
+        (p as u64) ^ ((p >> 64) as u64)
+    }
+
+    const K1: u64 = 0x9E37_79B9_7F4A_7C15;
+    const K2: u64 = 0xD6E8_FEB8_6659_FD93;
+
+    /// Per-process seeded folded-multiply hasher for batch-local duplicate detection: much
+    /// cheaper than SipHash on short keys, and the secret seed keeps collisions unpredictable.
+    #[derive(Clone, Copy)]
+    pub struct FoldState(u64);
+
+    impl Default for FoldState {
+        fn default() -> Self {
+            static SEED: OnceLock<u64> = OnceLock::new();
+            FoldState(*SEED.get_or_init(|| RandomState::new().hash_one(0x4e4e_544d_7578_u64) | 1))
+        }
+    }
+
+    impl BuildHasher for FoldState {
+        type Hasher = Fold;
+        fn build_hasher(&self) -> Fold {
+            Fold(self.0)
+        }
+    }
+
+    pub struct Fold(u64);
+
+    impl Hasher for Fold {
+        #[inline]
+        fn write(&mut self, bytes: &[u8]) {
+            let mut h = self.0;
+            let (words, rest) = bytes.as_chunks::<8>();
+            for word in words {
+                h = fold(h ^ u64::from_le_bytes(*word), K1);
+            }
+            if !rest.is_empty() {
+                let mut tail = [0u8; 8];
+                tail[..rest.len()].copy_from_slice(rest);
+                h = fold(h ^ u64::from_le_bytes(tail), K2);
+            }
+            self.0 = h;
+        }
+
+        #[inline]
+        fn write_u64(&mut self, n: u64) {
+            self.0 = fold(self.0 ^ n, K1);
+        }
+
+        #[inline]
+        fn write_i64(&mut self, n: i64) {
+            self.write_u64(n as u64);
+        }
+
+        #[inline]
+        fn write_usize(&mut self, n: usize) {
+            self.write_u64(n as u64);
+        }
+
+        #[inline]
+        fn finish(&self) -> u64 {
+            fold(self.0, K2)
+        }
+    }
+
+    type Set<T> = HashSet<T, FoldState>;
+    type Map<K, V> = HashMap<K, V, FoldState>;
+
+    fn set<T>(n: usize) -> Set<T> {
+        HashSet::with_capacity_and_hasher(n, FoldState::default())
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "crc")]
+    unsafe fn crc32_hw(data: &[u8]) -> u32 {
+        use std::arch::aarch64::{__crc32b, __crc32d};
+        let mut crc = !0u32;
+        let (words, rest) = data.as_chunks::<8>();
+        for word in words {
+            crc = __crc32d(crc, u64::from_le_bytes(*word));
+        }
+        for &b in rest {
+            crc = __crc32b(crc, b);
+        }
+        !crc
+    }
+
+    /// PHP `crc32()`: the ARMv8 CRC32 instructions when present, else slice-by-8.
+    #[inline]
+    pub fn crc32(data: &[u8]) -> u32 {
+        #[cfg(target_arch = "aarch64")]
+        if std::arch::is_aarch64_feature_detected!("crc") {
+            // The feature was detected at runtime.
+            return unsafe { crc32_hw(data) };
+        }
+        crc32_ieee(data)
+    }
+
+    /// Exactly `count` little-endian `i64` values.
+    pub fn ints(bytes: &[u8], count: usize) -> Option<Vec<i64>> {
+        if bytes.len() != count.checked_mul(8)? {
+            return None;
+        }
+        Some(
+            bytes
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| i64::from_le_bytes(*c))
+                .collect(),
+        )
+    }
+
+    /// Runs `body`, appends the digest and copies the words to `out` (byte-wise, so `out` needs
+    /// no particular alignment).
+    unsafe fn emit(
+        out: *mut i64,
+        out_cap: usize,
+        count: usize,
+        inputs: &[(*const u8, usize)],
+        body: impl FnOnce() -> Option<Vec<i64>>,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if out.is_null() || count > MAX_ITEMS || out_cap > (isize::MAX as usize) / 8 {
+                return -1;
+            }
+            let Some(mut words) = body() else {
+                return -1;
+            };
+            words.push(digest(&words));
+            let needed = words.len();
+            if needed > out_cap {
+                return -(needed as isize);
+            }
+            if inputs
+                .iter()
+                .any(|&(ptr, len)| overlaps(ptr, len, out as *const u8, needed * 8))
+            {
+                return -1;
+            }
+            for word in &mut words {
+                *word = word.to_le();
+            }
+            // `needed` words were checked against `out_cap` above.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    words.as_ptr() as *const u8,
+                    out as *mut u8,
+                    needed * 8,
+                );
+            }
+            needed as isize
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Whether every byte is `[0-9a-f]` (branch-free, so it vectorizes).
+    fn lower_hex(s: &[u8]) -> bool {
+        s.iter().fold(true, |ok, &b| {
+            ok & ((b.wrapping_sub(b'0') < 10) | (b.wrapping_sub(b'a') < 6))
+        })
+    }
+
+    /// PHP `trim($s, '<>')`.
+    pub fn trim_angle(s: &[u8]) -> &[u8] {
+        let angle = |b: &u8| *b == b'<' || *b == b'>';
+        let start = s.iter().position(|b| !angle(b)).unwrap_or(s.len());
+        let end = s.iter().rposition(|b| !angle(b)).map_or(start, |p| p + 1);
+        &s[start..end]
+    }
+
+    /// PHP `preg_match('/\A[^\s<>\x00-\x1f\x7f]+\z/D', $id) === 1` (non-UTF `\s`).
+    pub fn reference_valid(id: &[u8]) -> bool {
+        !id.is_empty()
+            && id.iter().fold(true, |ok, &b| {
+                ok & (b > 0x20) & (b != 0x7f) & (b != b'<') & (b != b'>')
+            })
+    }
+
+    /// PHP `mb_strcut($s, 0, $max, 'UTF-8')`: a cut never ends before a continuation byte.
+    pub fn strcut(s: &[u8], max: usize) -> &[u8] {
+        if s.len() <= max {
+            return s;
+        }
+        let mut end = max;
+        while end > 0 && s[end] & 0xC0 == 0x80 {
+            end -= 1;
+        }
+        &s[..end]
+    }
+
+    /// Superset of PHP numeric strings (`ws* [+-]? digits [. digits] [e [+-] digits] ws*`, at least
+    /// one mantissa digit): a comparison of two of them may be numeric, not lexical.
+    pub fn maybe_numeric(s: &[u8]) -> bool {
+        const WS: &[u8] = b" \t\n\r\x0b\x0c";
+        let mut i = 0;
+        let digits = |i: &mut usize| {
+            let start = *i;
+            while *i < s.len() && s[*i].is_ascii_digit() {
+                *i += 1;
+            }
+            *i - start
+        };
+        while i < s.len() && WS.contains(&s[i]) {
+            i += 1;
+        }
+        if i < s.len() && (s[i] == b'+' || s[i] == b'-') {
+            i += 1;
+        }
+        let mut mantissa = digits(&mut i);
+        if i < s.len() && s[i] == b'.' {
+            i += 1;
+            mantissa += digits(&mut i);
+        }
+        if mantissa == 0 {
+            return false;
+        }
+        if i < s.len() && (s[i] == b'e' || s[i] == b'E') {
+            i += 1;
+            if i < s.len() && (s[i] == b'+' || s[i] == b'-') {
+                i += 1;
+            }
+            digits(&mut i);
+        }
+        while i < s.len() && WS.contains(&s[i]) {
+            i += 1;
+        }
+        i == s.len()
+    }
+
+    // ---- CandidateAdmission ------------------------------------------------------------------
+
+    /// Two words per receipt, then accepted and duplicate counts.
+    pub fn admission(
+        ids: &[i64],
+        versions: &[i64],
+        identities: &[&[u8]],
+        hashes: &[&[u8]],
+    ) -> Vec<i64> {
+        let n = ids.len();
+        let mut out = Vec::with_capacity(n * 2 + 3);
+        let mut seen_ids: Set<i64> = set(n);
+        let mut seen_identities: Set<&[u8]> = set(n);
+        let (mut accepted, mut duplicates) = (0i64, 0i64);
+        let mut joined = Vec::with_capacity(128);
+        for i in 0..n {
+            let (identity, hash, version) = (identities[i], hashes[i], versions[i]);
+            let len = identity.len();
+            let mut flags = i64::from(ids[i] > 0)
+                | i64::from(version >= 1) << 1
+                | i64::from(hash.len() == 64 && lower_hex(hash)) << 2
+                | i64::from(len > 0) << 3
+                | i64::from(len > 0 && lower_hex(identity)) << 4;
+            if !seen_ids.insert(ids[i]) {
+                flags |= 1 << 5;
+            }
+            if !seen_identities.insert(identity) {
+                flags |= 1 << 6;
+            }
+            if flags & 0x60 != 0 {
+                duplicates += 1;
+            }
+            if flags & 0x6F == 0x0F {
+                flags |= 1 << 7;
+                accepted += 1;
+            }
+            out.push(flags | (len.min(0xFFFF) as i64) << 8);
+            joined.clear();
+            joined.extend_from_slice(identity);
+            joined.push(b':');
+            joined.extend_from_slice(hash);
+            out.push(i64::from(crc32(&joined)) | (version & 0x7FFF_FFFF) << 32);
+        }
+        out.push(accepted);
+        out.push(duplicates);
+        out
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_w49_candidate_admission_batch(
+        ints_ptr: *const u8,
+        ints_len: usize,
+        identities: *const u8,
+        identities_len: usize,
+        hashes: *const u8,
+        hashes_len: usize,
+        count: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [
+            (ints_ptr, ints_len),
+            (identities, identities_len),
+            (hashes, hashes_len),
+        ];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let table = ints(span(ints_ptr, ints_len)?, count.checked_mul(2)?)?;
+                let identities = column(span(identities, identities_len)?, count)?;
+                let hashes = column(span(hashes, hashes_len)?, count)?;
+                Some(admission(
+                    &table[..count],
+                    &table[count..],
+                    &identities,
+                    &hashes,
+                ))
+            })
+        }
+    }
+
+    // ---- CandidateHeaderInventory ------------------------------------------------------------
+
+    /// One word per segment, then the assessment status and the clamped byte total.
+    pub fn inventory(ids: &[&[u8]], numbers: &[i64], bytes: &[i64], total: i64) -> Vec<i64> {
+        let n = ids.len();
+        let mut out = Vec::with_capacity(n + 3);
+        let mut seen_ids: Set<&[u8]> = set(n);
+        // In-range part numbers use a bitmap; anything else (rare) a set.
+        let span = if (1..=1 << 24).contains(&total) {
+            total as usize + 1
+        } else {
+            0
+        };
+        let mut bitmap = vec![0u64; span.div_ceil(64)];
+        let mut other_numbers: Set<i64> = set(0);
+        let mut first_bad: Option<usize> = None;
+        let mut sum = 0i64;
+        for i in 0..n {
+            let id = trim_angle(ids[i]);
+            let mut flags = i64::from(!reference_valid(id));
+            if !seen_ids.insert(id) {
+                flags |= 1 << 1;
+            }
+            if numbers[i] < 1 || numbers[i] > total {
+                flags |= 1 << 2;
+            }
+            let number = numbers[i];
+            let repeated = if number >= 1 && (number as u64) < span as u64 {
+                let (word, bit) = (number as usize / 64, 1u64 << (number as usize % 64));
+                let seen = bitmap[word] & bit != 0;
+                bitmap[word] |= bit;
+                seen
+            } else {
+                !other_numbers.insert(number)
+            };
+            if repeated {
+                flags |= 1 << 3;
+            }
+            if bytes[i] < 1 {
+                flags |= 1 << 4;
+            } else {
+                sum += bytes[i].min(1 << 40);
+            }
+            if flags != 0 && first_bad.is_none() {
+                first_bad = Some(i);
+            }
+            out.push(flags | (id.len().min(0xFF_FFFF) as i64) << 8 | i64::from(crc32(id)) << 32);
+        }
+        let n = n as i64;
+        out.push(if total < 1 || n > total {
+            11
+        } else if let Some(i) = first_bad {
+            14 | (i as i64) << 8
+        } else if n < total {
+            2
+        } else {
+            0
+        });
+        out.push(sum);
+        out
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_w49_candidate_header_inventory_batch(
+        ids: *const u8,
+        ids_len: usize,
+        ints_ptr: *const u8,
+        ints_len: usize,
+        count: usize,
+        total_parts: i64,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(ids, ids_len), (ints_ptr, ints_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let ids = column(span(ids, ids_len)?, count)?;
+                let table = ints(span(ints_ptr, ints_len)?, count.checked_mul(2)?)?;
+                Some(inventory(
+                    &ids,
+                    &table[..count],
+                    &table[count..],
+                    total_parts,
+                ))
+            })
+        }
+    }
+
+    // ---- CandidatePreparationService ---------------------------------------------------------
+
+    fn status_code(status: &[u8]) -> i64 {
+        match status {
+            b"ready" => 0,
+            b"waiting_upload" => 1,
+            b"header_rejected" => 2,
+            b"unknown" => 3,
+            _ => 4,
+        }
+    }
+
+    /// One word per assessed row, then flush, immediate-update and waiting-row counts; None for a
+    /// negative `max_bytes` (mb_strcut() then counts back from the end).
+    pub fn preparation(
+        statuses: &[&[u8]],
+        reasons: &[&[u8]],
+        max_bytes: i64,
+        batch_size: i64,
+    ) -> Option<Vec<i64>> {
+        let max = usize::try_from(max_bytes).ok()?;
+        let batch = batch_size.max(1);
+        let mut out = Vec::with_capacity(statuses.len() + 4);
+        let mut group: &[u8] = b"";
+        let (mut pending, mut flushes, mut immediate, mut waiting) = (0i64, 0i64, 0i64, 0i64);
+        for (status, reason) in statuses.iter().zip(reasons) {
+            let shape = i64::from(*status != b"ready") | i64::from(*status == b"unknown") << 1;
+            let text: &[u8] = if shape & 1 != 0 {
+                strcut(reason, max)
+            } else {
+                b""
+            };
+            let mut flags = 0i64;
+            if *status == b"waiting_upload" {
+                if text != group {
+                    if pending > 0 {
+                        flushes += 1;
+                        pending = 0;
+                        flags |= 1 << 5;
+                    }
+                    group = text;
+                }
+                pending += 1;
+                waiting += 1;
+                if pending == batch {
+                    flushes += 1;
+                    pending = 0;
+                    flags |= 1 << 6;
+                }
+            } else {
+                if pending > 0 {
+                    flushes += 1;
+                    pending = 0;
+                    flags |= 1 << 5;
+                }
+                immediate += 1;
+            }
+            out.push(
+                status_code(status)
+                    | shape << 3
+                    | flags
+                    | (text.len().min(0xFF_FFFF) as i64) << 8
+                    | flushes.min(0x3FFF_FFFF) << 32,
+            );
+        }
+        if pending > 0 {
+            flushes += 1;
+        }
+        out.extend([flushes, immediate, waiting]);
+        Some(out)
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_w49_candidate_preparation_batch(
+        statuses: *const u8,
+        statuses_len: usize,
+        reasons: *const u8,
+        reasons_len: usize,
+        count: usize,
+        max_bytes: i64,
+        batch_size: i64,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(statuses, statuses_len), (reasons, reasons_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let statuses = column(span(statuses, statuses_len)?, count)?;
+                let reasons = column(span(reasons, reasons_len)?, count)?;
+                preparation(&statuses, &reasons, max_bytes, batch_size)
+            })
+        }
+    }
+
+    // ---- CandidateRepository -----------------------------------------------------------------
+
+    /// One word per waiting row, then eligible, deferred, held and owed counts; None when a
+    /// comparison might be numeric (PHP must compare it).
+    pub fn partial(
+        lasts: &[&[u8]],
+        statuses: &[&[u8]],
+        reasons: &[&[u8]],
+        owed: &[u8],
+        hold: &[u8],
+    ) -> Option<Vec<i64>> {
+        let numeric_cutoff = maybe_numeric(owed) || maybe_numeric(hold);
+        let mut out = Vec::with_capacity(lasts.len() + 5);
+        let mut counts = [0i64; 4];
+        for i in 0..lasts.len() {
+            let (last, status, reason) = (lasts[i], statuses[i], reasons[i]);
+            if numeric_cutoff && maybe_numeric(last) {
+                return None;
+            }
+            let deferred = reason.starts_with(PARTIAL_DEFERRED);
+            let queued = reason == PARTIAL_QUEUED;
+            let ge_owed = last >= owed;
+            let lt_hold = last < hold;
+            let action = if deferred || !ge_owed {
+                0
+            } else if lt_hold {
+                1
+            } else {
+                2
+            };
+            let is_waiting = status == b"waiting_upload";
+            let is_ready = status == b"ready";
+            let owes = ge_owed && ((is_waiting && !deferred) || (is_ready && queued));
+            counts[[1, 0, 2][action]] += 1;
+            counts[3] += i64::from(owes);
+            out.push(
+                action as i64
+                    | i64::from(owes) << 2
+                    | i64::from(deferred) << 3
+                    | i64::from(queued) << 4
+                    | i64::from(ge_owed) << 5
+                    | i64::from(lt_hold) << 6
+                    | i64::from(is_waiting) << 7
+                    | i64::from(is_ready) << 8,
+            );
+        }
+        out.extend(counts);
+        Some(out)
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_w49_candidate_repository_partial_batch(
+        lasts: *const u8,
+        lasts_len: usize,
+        statuses: *const u8,
+        statuses_len: usize,
+        reasons: *const u8,
+        reasons_len: usize,
+        count: usize,
+        owed: *const u8,
+        owed_len: usize,
+        hold: *const u8,
+        hold_len: usize,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [
+            (lasts, lasts_len),
+            (statuses, statuses_len),
+            (reasons, reasons_len),
+            (owed, owed_len),
+            (hold, hold_len),
+        ];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let lasts = column(span(lasts, lasts_len)?, count)?;
+                let statuses = column(span(statuses, statuses_len)?, count)?;
+                let reasons = column(span(reasons, reasons_len)?, count)?;
+                partial(
+                    &lasts,
+                    &statuses,
+                    &reasons,
+                    span(owed, owed_len)?,
+                    span(hold, hold_len)?,
+                )
+            })
+        }
+    }
+
+    // ---- CandidateSampleBatch ----------------------------------------------------------------
+
+    /// `claimBudget()` over inputs clamped to 0..=2^31.
+    pub fn claim_budget(maximum: i64, admitted: i64, configured: i64, source: i64) -> i64 {
+        let c = |v: i64| v.clamp(0, 1 << 31);
+        let (maximum, admitted, configured, source) =
+            (c(maximum), c(admitted), c(configured), c(source));
+        (maximum - admitted)
+            .min(configured.clamp(1, 16))
+            .min(source.max(1))
+            .max(0)
+    }
+
+    /// One word per queued claim, then budget, prefetch count, limit reached and has pending.
+    pub fn sample(
+        claims: &[i64],
+        messages: &[&[u8]],
+        maximum: i64,
+        admitted: i64,
+        configured: i64,
+        source: i64,
+    ) -> Vec<i64> {
+        let n = claims.len();
+        let budget = claim_budget(maximum, admitted, configured, source);
+        let mut out = Vec::with_capacity(n + 5);
+        let mut seen_claims: Set<i64> = set(n);
+        let mut first: Map<&[u8], usize> =
+            HashMap::with_capacity_and_hasher(n, FoldState::default());
+        let mut prefetch = 0i64;
+        for i in 0..n {
+            let id = trim_angle(messages[i]);
+            let mut flags = i64::from((i as i64) < budget)
+                | i64::from(!seen_claims.insert(claims[i])) << 1
+                | i64::from(claims[i] < 1) << 2
+                | i64::from(id.is_empty()) << 3;
+            let index = if id.is_empty() {
+                i
+            } else {
+                match first.entry(id) {
+                    Entry::Occupied(e) => {
+                        flags |= 1 << 4;
+                        *e.get()
+                    }
+                    Entry::Vacant(v) => *v.insert(i),
+                }
+            };
+            if flags == 1 {
+                flags |= 1 << 5;
+                prefetch += 1;
+            }
+            out.push(
+                flags
+                    | (id.len().min(0xFF_FFFF) as i64) << 8
+                    | (index.min(0x7FFF_FFFF) as i64) << 32,
+            );
+        }
+        let c = |v: i64| v.clamp(0, 1 << 31);
+        out.extend([
+            budget,
+            prefetch,
+            i64::from(c(admitted) >= c(maximum)),
+            i64::from(n > 0),
+        ]);
+        out
+    }
+
+    /// # Safety
+    /// Each input must be readable for its length and `out` writable for `out_cap` words.
+    #[unsafe(no_mangle)]
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe extern "C" fn nntmux_w49_candidate_sample_batch(
+        claims: *const u8,
+        claims_len: usize,
+        messages: *const u8,
+        messages_len: usize,
+        count: usize,
+        maximum_claims: i64,
+        admitted: i64,
+        configured: i64,
+        source_batch_size: i64,
+        out: *mut i64,
+        out_cap: usize,
+    ) -> isize {
+        let inputs = [(claims, claims_len), (messages, messages_len)];
+        unsafe {
+            emit(out, out_cap, count, &inputs, || {
+                let claims = ints(span(claims, claims_len)?, count)?;
+                let messages = column(span(messages, messages_len)?, count)?;
+                Some(sample(
+                    &claims,
+                    &messages,
+                    maximum_claims,
+                    admitted,
+                    configured,
+                    source_batch_size,
+                ))
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn run(f: impl Fn(*mut i64, usize) -> isize) -> Vec<i64> {
+            let mut out = vec![0i64; 4096];
+            let n = f(out.as_mut_ptr(), out.len());
+            assert!(n > 0, "export returned {n}");
+            out.truncate(n as usize);
+            let digest = out.pop().unwrap();
+            assert_eq!(super::digest(&out), digest);
+            out
+        }
+
+        fn q(values: &[i64]) -> Vec<u8> {
+            values.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+
+        #[test]
+        fn digest_matches_php_xxh64() {
+            assert_eq!(digest(&[]), -1_205_034_819_632_174_695);
+            assert_eq!(digest(&[1]), -6_977_822_845_260_490_347);
+            assert_eq!(digest(&[1, 2, 3]), -8_675_655_460_994_363_910);
+            assert_eq!(digest(&[1, 2, 3, 4]), 8_356_527_653_647_720_045);
+            assert_eq!(
+                digest(&[1, 2, 3, 4, 5, -1, i64::MIN, i64::MAX, 0]),
+                8_101_292_577_011_640_768
+            );
+        }
+
+        #[test]
+        fn helpers_match_php() {
+            assert_eq!(column(b"", 0), Some(vec![]));
+            assert_eq!(column(b"", 1), Some(vec![&b""[..]]));
+            assert_eq!(column(b"a\0", 2), Some(vec![&b"a"[..], &b""[..]]));
+            assert_eq!(column(b"a\0b", 1), None);
+            assert_eq!(column(b"a", 2), None);
+            assert_eq!(column(b"a", 0), None);
+            assert_eq!(ints(&q(&[1, -2]), 2), Some(vec![1, -2]));
+            assert_eq!(ints(&[0; 7], 1), None);
+            assert_eq!(trim_angle(b"<<a@b>>"), b"a@b");
+            assert_eq!(trim_angle(b"<>"), b"");
+            assert_eq!(trim_angle(b"a<b"), b"a<b");
+            assert!(reference_valid(b"part1of9.abc@news.example"));
+            assert!(reference_valid(b"\x80\xff"));
+            assert!(!reference_valid(b""));
+            assert!(!reference_valid(b"a b"));
+            assert!(!reference_valid(b"a\x7fb"));
+            assert!(!reference_valid(b"a<b"));
+            assert_eq!(strcut(b"abc", 5), b"abc");
+            assert_eq!(strcut("aé".as_bytes(), 2), b"a");
+            assert_eq!(strcut("aé".as_bytes(), 3), "aé".as_bytes());
+            assert_eq!(strcut(b"\x80\x80\x80", 2), b"");
+            assert_eq!(strcut(b"abc", 0), b"");
+            for s in [&b""[..], b"a", b"part1of9.abc@news.example", &[0xffu8; 37]] {
+                assert_eq!(crc32(s), crc32_ieee(s));
+            }
+            let long: Vec<u8> = (0..200u8).map(|b| b | 1).collect();
+            assert_eq!(column(&long, 1), Some(vec![&long[..]]));
+            let mut nul = long.clone();
+            nul[17] = 0;
+            nul[150] = 0;
+            assert_eq!(
+                column(&nul, 3),
+                Some(vec![&nul[..17], &nul[18..150], &nul[151..]])
+            );
+            assert_eq!(column(&nul, 2), None);
+            for len in [0usize, 1, 15, 16, 17, 63, 64, 65, 127, 128, 129, 300] {
+                for step in [1usize, 3, 16, 64, 70] {
+                    let mut buf = vec![b'x'; len];
+                    let mut expect = 1;
+                    for k in (0..len).step_by(step) {
+                        buf[k] = 0;
+                        expect += 1;
+                    }
+                    let rows = column(&buf, expect).expect("exact column");
+                    assert_eq!(rows.concat().len() + expect - 1, len);
+                    assert_eq!(
+                        rows.iter().map(|r| r.len()).sum::<usize>() + expect - 1,
+                        len
+                    );
+                    let naive: Vec<&[u8]> = buf.split(|&b| b == 0).collect();
+                    assert_eq!(rows, naive);
+                    assert_eq!(
+                        column(&buf, expect - 1),
+                        if len == 0 { Some(vec![]) } else { None }
+                    );
+                    assert_eq!(column(&buf, expect + 1), None);
+                }
+            }
+            assert!(lower_hex(b"0123456789abcdef0123456789abcdef"));
+            assert!(!lower_hex(b"0123456789abcdef0123456789abcdeg"));
+            assert!(!reference_valid(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa>"));
+            assert!(maybe_numeric(b" 1.5e3 "));
+            assert!(maybe_numeric(b"-7"));
+            assert!(!maybe_numeric(b"2026-01-01 00:00:00"));
+            assert!(!maybe_numeric(b""));
+            assert!(!maybe_numeric(b"e"));
+            assert!(!maybe_numeric(b"2026-01-01"));
+            assert!(!maybe_numeric(b"."));
+            assert!(maybe_numeric(b".5"));
+            assert!(maybe_numeric(b"1."));
+            assert!(maybe_numeric(b"\x0c+1E-9\n"));
+        }
+
+        #[test]
+        fn admission_words() {
+            let hash = "a".repeat(64);
+            let words = run(|out, cap| unsafe {
+                let table = q(&[5, 5, 0, 1, 2, 1]);
+                let identities = format!("abc\0abc\0XYZ");
+                let hashes = format!("{hash}\0{hash}\0short");
+                nntmux_w49_candidate_admission_batch(
+                    table.as_ptr(),
+                    table.len(),
+                    identities.as_ptr(),
+                    identities.len(),
+                    hashes.as_ptr(),
+                    hashes.len(),
+                    3,
+                    out,
+                    cap,
+                )
+            });
+            let crc = |s: &str| i64::from(crc32_ieee(s.as_bytes()));
+            assert_eq!(words.len(), 8);
+            assert_eq!(words[0], 0x0F | 0x10 | 0x80 | 3 << 8);
+            assert_eq!(words[1], crc(&format!("abc:{hash}")) | 1 << 32);
+            assert_eq!(words[2], 0x0F | 0x10 | 0x20 | 0x40 | 3 << 8);
+            assert_eq!(words[4], 0x0A | 3 << 8);
+            assert_eq!(words[5], crc("XYZ:short") | 1 << 32);
+            assert_eq!(&words[6..], &[1, 1]);
+        }
+
+        #[test]
+        fn inventory_words() {
+            let ids = b"<a@b>\0a@b\0bad id";
+            let table = q(&[1, 2, 9, 10, 0, 1 << 41]);
+            let words = run(|out, cap| unsafe {
+                nntmux_w49_candidate_header_inventory_batch(
+                    ids.as_ptr(),
+                    ids.len(),
+                    table.as_ptr(),
+                    table.len(),
+                    3,
+                    4,
+                    out,
+                    cap,
+                )
+            });
+            let crc = |s: &[u8]| i64::from(crc32_ieee(s)) << 32;
+            assert_eq!(words[0], 3 << 8 | crc(b"a@b"));
+            assert_eq!(words[1], 2 | 16 | 3 << 8 | crc(b"a@b"));
+            assert_eq!(words[2], 1 | 4 | 6 << 8 | crc(b"bad id"));
+            assert_eq!(words[3], 14 | 1 << 8);
+            assert_eq!(words[4], 10 + (1 << 40));
+            assert_eq!(inventory(&[], &[], &[], 0), vec![11, 0]);
+            assert_eq!(inventory(&[b"x"], &[1], &[1], 2)[1], 2);
+        }
+
+        #[test]
+        fn preparation_words() {
+            let s: Vec<&[u8]> = vec![
+                b"waiting_upload",
+                b"waiting_upload",
+                b"ready",
+                b"unknown",
+                b"waiting_upload",
+            ];
+            let r: Vec<&[u8]> = vec![b"x", b"x", b"", "é!".as_bytes(), b"y"];
+            let words = preparation(&s, &r, 1, 2).unwrap();
+            assert_eq!(words[0], 1 | 1 << 3 | 1 << 8);
+            assert_eq!(words[1], 1 | 1 << 3 | 1 << 6 | 1 << 8 | 1 << 32);
+            assert_eq!(words[2], 1 << 32);
+            assert_eq!(words[3], 3 | 3 << 3 | 1 << 32);
+            assert_eq!(words[4], 1 | 1 << 3 | 1 << 8 | 1 << 32);
+            assert_eq!(&words[5..], &[2, 2, 3]);
+            assert_eq!(preparation(&s, &r, -1, 25), None);
+        }
+
+        #[test]
+        fn partial_words() {
+            let deferred = [PARTIAL_DEFERRED, b"x"].concat();
+            let lasts: Vec<&[u8]> = vec![
+                b"2026-01-02",
+                b"2026-01-05",
+                b"2025-12-31",
+                b"",
+                b"2026-01-02",
+            ];
+            let statuses: Vec<&[u8]> = vec![
+                b"waiting_upload",
+                b"waiting_upload",
+                b"waiting_upload",
+                b"ready",
+                b"ready",
+            ];
+            let reasons: Vec<&[u8]> = vec![b"", b"", b"", PARTIAL_QUEUED, PARTIAL_QUEUED];
+            let words = partial(&lasts, &statuses, &reasons, b"2026-01-01", b"2026-01-03").unwrap();
+            assert_eq!(words[0], 1 | 4 | 32 | 64 | 128);
+            assert_eq!(words[1], 2 | 4 | 32 | 128);
+            assert_eq!(words[2], 64 | 128);
+            assert_eq!(words[3], 16 | 64 | 256);
+            assert_eq!(words[4], 1 | 4 | 16 | 32 | 64 | 256);
+            assert_eq!(&words[5..], &[2, 2, 1, 3]);
+            let d: Vec<&[u8]> = vec![&deferred];
+            assert_eq!(
+                partial(
+                    &[b"2026-01-02"],
+                    &[b"waiting_upload"],
+                    &d,
+                    b"2026-01-01",
+                    b"2026-01-03"
+                )
+                .unwrap()[0],
+                8 | 32 | 64 | 128
+            );
+            assert_eq!(partial(&[b"5"], &[b"ready"], &[b""], b"4", b"6"), None);
+            assert!(partial(&[b"5"], &[b"ready"], &[b""], b"2026", b"x").is_none());
+            assert!(partial(&[b"5"], &[b"ready"], &[b""], b"x", b"y").is_some());
+        }
+
+        #[test]
+        fn sample_words() {
+            let claims = q(&[7, 7, 0, 9]);
+            let msgs = b"<a@b>\0a@b\0\0<c@d>";
+            let words = run(|out, cap| unsafe {
+                nntmux_w49_candidate_sample_batch(
+                    claims.as_ptr(),
+                    claims.len(),
+                    msgs.as_ptr(),
+                    msgs.len(),
+                    4,
+                    10,
+                    1,
+                    3,
+                    8,
+                    out,
+                    cap,
+                )
+            });
+            assert_eq!(words[0], 1 | 32 | 3 << 8);
+            assert_eq!(words[1], 1 | 2 | 16 | 3 << 8);
+            assert_eq!(words[2], 1 | 4 | 8 | 2 << 32);
+            assert_eq!(words[3], 3 << 8 | 3 << 32);
+            assert_eq!(&words[4..], &[3, 1, 0, 1]);
+            assert_eq!(claim_budget(i64::MAX, i64::MIN, 99, 0), 1);
+            assert_eq!(claim_budget(1, 5, 4, 4), 0);
+        }
+
+        #[test]
+        fn guards_reject_null_short_and_malformed() {
+            let table = q(&[1, 1]);
+            let mut out = [0i64; 8];
+            unsafe {
+                assert_eq!(
+                    nntmux_w49_candidate_sample_batch(
+                        table.as_ptr(),
+                        8,
+                        b"a".as_ptr(),
+                        1,
+                        1,
+                        1,
+                        0,
+                        1,
+                        1,
+                        std::ptr::null_mut(),
+                        8
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w49_candidate_sample_batch(
+                        table.as_ptr(),
+                        8,
+                        b"a".as_ptr(),
+                        1,
+                        1,
+                        1,
+                        0,
+                        1,
+                        1,
+                        out.as_mut_ptr(),
+                        2
+                    ),
+                    -6
+                );
+                assert_eq!(
+                    nntmux_w49_candidate_sample_batch(
+                        std::ptr::null(),
+                        8,
+                        b"a".as_ptr(),
+                        1,
+                        1,
+                        1,
+                        0,
+                        1,
+                        1,
+                        out.as_mut_ptr(),
+                        8
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w49_candidate_sample_batch(
+                        table.as_ptr(),
+                        16,
+                        b"a".as_ptr(),
+                        1,
+                        1,
+                        1,
+                        0,
+                        1,
+                        1,
+                        out.as_mut_ptr(),
+                        8
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w49_candidate_sample_batch(
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                        0,
+                        1,
+                        0,
+                        1,
+                        1,
+                        out.as_mut_ptr(),
+                        8
+                    ),
+                    5
+                );
+                assert_eq!(
+                    nntmux_w49_candidate_admission_batch(
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                        MAX_ITEMS + 1,
+                        out.as_mut_ptr(),
+                        8
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w49_candidate_preparation_batch(
+                        b"a".as_ptr(),
+                        1,
+                        b"b".as_ptr(),
+                        1,
+                        1,
+                        -1,
+                        25,
+                        out.as_mut_ptr(),
+                        8
+                    ),
+                    -1
+                );
+                assert_eq!(
+                    nntmux_w49_candidate_repository_partial_batch(
+                        b"a".as_ptr(),
+                        1,
+                        b"b".as_ptr(),
+                        1,
+                        std::ptr::null(),
+                        0,
+                        1,
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                        out.as_mut_ptr(),
+                        8
+                    ),
+                    6
+                );
+                let overlap = out.as_mut_ptr();
+                assert_eq!(
+                    nntmux_w49_candidate_header_inventory_batch(
+                        overlap as *const u8,
+                        1,
+                        table.as_ptr(),
+                        16,
+                        1,
+                        1,
+                        overlap,
+                        8
+                    ),
+                    -1
+                );
+            }
+        }
+    }
+}

@@ -7,6 +7,7 @@ namespace App\Services\Releases\Verification;
 use App\Support\RustPipelineLibrary;
 use Closure;
 use FFI;
+use FFI\CData;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use RuntimeException;
@@ -356,5 +357,172 @@ final class CandidateSampleBatch
         unset($this->pending[$id]);
 
         return $claim;
+    }
+
+    /** Wave 49.2 paired benchmarks decide this default; see RustVerificationAdmissionInventoryPrepRepoSampleW49ParityTest. */
+    private const W49_RUST_FFI_DEFAULT = true;
+
+    public const string W49_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w49_candidate_sample_batch(const char *claims, size_t claims_len, const char *messages, size_t messages_len, size_t count, int64_t maximum_claims, int64_t admitted, int64_t configured, int64_t source_batch_size, int64_t *out, size_t out_cap);
+        C;
+
+    private static ?bool $w49RustFfi = null;
+
+    private static FFI|false|null $w49Ffi = null;
+
+    private static ?CData $w49Out = null;
+
+    private static int $w49OutCap = 0;
+
+    public static function usesW49RustFfi(): bool
+    {
+        return self::$w49RustFfi ?? self::W49_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with planPrefetchBatch() routed to Rust ($enabled) or PHP, then restores the previous
+     * routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW49RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$w49RustFfi;
+        self::$w49RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$w49RustFfi = $previous;
+        }
+    }
+
+    /**
+     * Batch prefetch plan for queued claims. The budget is claimBudgetPhp() over inputs clamped
+     * to 0..2^31. One word per claim: `flags | trimmedLength << 8 | first index << 32`, where the
+     * message ID is trimmed of `<>`, flags are 1 inside the budget, 2 claim id repeats an earlier
+     * one, 4 claim id < 1, 8 empty message ID, 16 message ID repeats an earlier one, 32 prefetched
+     * (1 alone), and first index is the earliest claim with the same message ID (its own index
+     * when empty; length clamped to 2^24 - 1, index to 2^31 - 1). Then the budget, prefetch count,
+     * whether the claim limit is reached, whether any claim is queued and the XXH64 digest of
+     * all earlier words.
+     *
+     * @param  list<int>  $claimIds
+     * @param  list<string>  $messageIds
+     * @return list<int>
+     */
+    public static function planPrefetchBatch(array $claimIds, array $messageIds, int $maximumClaims, int $admitted, int $configured, int $sourceBatchSize): array
+    {
+        return self::usesW49RustFfi()
+            ? self::planPrefetchBatchNative($claimIds, $messageIds, $maximumClaims, $admitted, $configured, $sourceBatchSize)
+            : self::planPrefetchBatchPhp($claimIds, $messageIds, $maximumClaims, $admitted, $configured, $sourceBatchSize);
+    }
+
+    /**
+     * @param  list<int>  $claimIds
+     * @param  list<string>  $messageIds
+     * @return list<int>
+     */
+    public static function planPrefetchBatchPhp(array $claimIds, array $messageIds, int $maximumClaims, int $admitted, int $configured, int $sourceBatchSize): array
+    {
+        $maximum = max(0, min(1 << 31, $maximumClaims));
+        $taken = max(0, min(1 << 31, $admitted));
+        $budget = self::claimBudgetPhp($maximum, $taken, max(0, min(1 << 31, $configured)), max(0, min(1 << 31, $sourceBatchSize)));
+        $out = $claims = $first = [];
+        $prefetch = 0;
+        foreach ($claimIds as $i => $id) {
+            $key = trim($messageIds[$i] ?? '', '<>');
+            $flags = (int) ($i < $budget) | (int) isset($claims[$id]) << 1 | (int) ($id < 1) << 2 | (int) ($key === '') << 3;
+            $claims[$id] = true;
+            if ($key === '') {
+                $index = $i;
+            } elseif (isset($first[$key])) {
+                $flags |= 16;
+                $index = $first[$key];
+            } else {
+                $first[$key] = $index = $i;
+            }
+            if ($flags === 1) {
+                $flags |= 32;
+                $prefetch++;
+            }
+            $out[] = $flags | min(\strlen($key), 0xFFFFFF) << 8 | min($index, 0x7FFFFFFF) << 32;
+        }
+        $out[] = $budget;
+        $out[] = $prefetch;
+        $out[] = (int) ($taken >= $maximum);
+        $out[] = (int) ($claimIds !== []);
+
+        return self::w49Digest($out);
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, the lists differ in length or a
+     * message ID holds a NUL byte.
+     *
+     * @param  list<int>  $claimIds
+     * @param  list<string>  $messageIds
+     * @return list<int>
+     */
+    public static function planPrefetchBatchNative(array $claimIds, array $messageIds, int $maximumClaims, int $admitted, int $configured, int $sourceBatchSize): array
+    {
+        $count = \count($claimIds);
+        $ffi = $count === 0 ? null : (self::$w49Ffi instanceof FFI ? self::$w49Ffi : self::w49Ffi());
+        if ($ffi === null || \count($messageIds) !== $count) {
+            return self::planPrefetchBatchPhp($claimIds, $messageIds, $maximumClaims, $admitted, $configured, $sourceBatchSize);
+        }
+        $joined = implode("\0", $messageIds);
+        $words = $count + 5;
+        $values = false;
+        // Rust rejects a column whose NUL count differs from $count - 1 (an embedded NUL byte).
+        try {
+            $out = self::w49Out($ffi, $words);
+            $ints = pack('P*', ...$claimIds);
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w49_candidate_sample_batch($ints, \strlen($ints), $joined, \strlen($joined), $count, $maximumClaims, $admitted, $configured, $sourceBatchSize, $out, self::$w49OutCap);
+            $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+        } catch (Throwable) {
+            $values = false;
+        }
+
+        /** @var list<int>|null $result */
+        $result = \is_array($values) ? array_values($values) : null;
+
+        return $result ?? self::planPrefetchBatchPhp($claimIds, $messageIds, $maximumClaims, $admitted, $configured, $sourceBatchSize);
+    }
+
+    private static function w49Ffi(): ?FFI
+    {
+        self::$w49Ffi ??= RustPipelineLibrary::resolveDomain('nfo_w49', self::W49_FFI_CDEF) ?? false;
+
+        return self::$w49Ffi === false ? null : self::$w49Ffi;
+    }
+
+    /** A reusable output buffer of at least $words `int64_t` words; FFI::new() throws on failure. */
+    private static function w49Out(FFI $ffi, int $words): CData
+    {
+        if (self::$w49Out === null || self::$w49OutCap < $words) {
+            self::$w49Out = $ffi->new('int64_t['.max(1024, $words).']');
+            self::$w49OutCap = max(1024, $words);
+        }
+
+        return self::$w49Out;
+    }
+
+    /**
+     * Appends the XXH64 digest of the words.
+     *
+     * @param  list<int>  $words
+     * @return list<int>
+     */
+    private static function w49Digest(array $words): array
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$words), true));
+        $words[] = $digest[1];
+
+        return $words;
     }
 }

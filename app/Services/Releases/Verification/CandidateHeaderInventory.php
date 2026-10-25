@@ -488,4 +488,185 @@ final class CandidateHeaderInventory
 
         return self::$ffi;
     }
+
+    /** Wave 49.2 paired benchmarks decide this default; see RustVerificationAdmissionInventoryPrepRepoSampleW49ParityTest. */
+    private const W49_RUST_FFI_DEFAULT = true;
+
+    public const string W49_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w49_candidate_header_inventory_batch(const char *ids, size_t ids_len, const char *ints, size_t ints_len, size_t count, int64_t total_parts, int64_t *out, size_t out_cap);
+        C;
+
+    private static ?bool $w49RustFfi = null;
+
+    private static FFI|false|null $w49Ffi = null;
+
+    private static ?CData $w49Out = null;
+
+    private static int $w49OutCap = 0;
+
+    public static function usesW49RustFfi(): bool
+    {
+        return self::$w49RustFfi ?? self::W49_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with classifyArticleReferences() routed to Rust ($enabled) or PHP, then restores the previous
+     * routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW49RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$w49RustFfi;
+        self::$w49RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$w49RustFfi = $previous;
+        }
+    }
+
+    /**
+     * Batch article-reference classification for one file's segments. One word per segment:
+     * `flags | trimmedLength << 8 | crc32(trimmed) << 32`, where the message ID is trimmed of
+     * `<>` and flags are 1 invalid reference (assessment()'s pattern), 2 trimmed ID repeats an
+     * earlier one, 4 number outside 1..totalParts, 8 number repeats an earlier one, 16 bytes < 1
+     * (length clamped to 2^24 - 1). Then the status (11 invalid declared count, `14 | first
+     * defective index << 8`, 2 articles still uploading, 0 ready), the byte total of positive
+     * sizes (each clamped to 2^40) and the XXH64 digest of all earlier words.
+     *
+     * @param  list<string>  $messageIds
+     * @param  list<int>  $numbers
+     * @param  list<int>  $bytes
+     * @return list<int>
+     */
+    public static function classifyArticleReferences(array $messageIds, array $numbers, array $bytes, int $totalParts): array
+    {
+        return self::usesW49RustFfi()
+            ? self::classifyArticleReferencesNative($messageIds, $numbers, $bytes, $totalParts)
+            : self::classifyArticleReferencesPhp($messageIds, $numbers, $bytes, $totalParts);
+    }
+
+    /**
+     * @param  list<string>  $messageIds
+     * @param  list<int>  $numbers
+     * @param  list<int>  $bytes
+     * @return list<int>
+     */
+    public static function classifyArticleReferencesPhp(array $messageIds, array $numbers, array $bytes, int $totalParts): array
+    {
+        $out = $ids = $seen = [];
+        $first = -1;
+        $sum = 0;
+        foreach ($messageIds as $i => $messageId) {
+            $id = trim($messageId, '<>');
+            $number = $numbers[$i] ?? 0;
+            $size = $bytes[$i] ?? 0;
+            $flags = (int) (preg_match('/\A[^\s<>\x00-\x1f\x7f]+\z/D', $id) !== 1);
+            if (isset($ids[$id])) {
+                $flags |= 2;
+            } else {
+                $ids[$id] = true;
+            }
+            if ($number < 1 || $number > $totalParts) {
+                $flags |= 4;
+            }
+            if (isset($seen[$number])) {
+                $flags |= 8;
+            } else {
+                $seen[$number] = true;
+            }
+            if ($size < 1) {
+                $flags |= 16;
+            } else {
+                $sum += min($size, 1 << 40);
+            }
+            if ($flags !== 0 && $first === -1) {
+                $first = $i;
+            }
+            $out[] = $flags | min(\strlen($id), 0xFFFFFF) << 8 | crc32($id) << 32;
+        }
+        $count = \count($messageIds);
+        $out[] = match (true) {
+            $totalParts < 1 || $count > $totalParts => 11,
+            $first !== -1 => 14 | $first << 8,
+            $count < $totalParts => 2,
+            default => 0,
+        };
+        $out[] = $sum;
+
+        return self::w49Digest($out);
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, the lists differ in length or a
+     * message ID holds a NUL byte.
+     *
+     * @param  list<string>  $messageIds
+     * @param  list<int>  $numbers
+     * @param  list<int>  $bytes
+     * @return list<int>
+     */
+    public static function classifyArticleReferencesNative(array $messageIds, array $numbers, array $bytes, int $totalParts): array
+    {
+        $count = \count($messageIds);
+        $ffi = $count === 0 ? null : (self::$w49Ffi instanceof FFI ? self::$w49Ffi : self::w49Ffi());
+        if ($ffi === null || \count($numbers) !== $count || \count($bytes) !== $count) {
+            return self::classifyArticleReferencesPhp($messageIds, $numbers, $bytes, $totalParts);
+        }
+        $joined = implode("\0", $messageIds);
+        $words = $count + 3;
+        $values = false;
+        // Rust rejects a column whose NUL count differs from $count - 1 (an embedded NUL byte).
+        try {
+            $out = self::w49Out($ffi, $words);
+            $ints = pack('P*', ...$numbers, ...$bytes);
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w49_candidate_header_inventory_batch($joined, \strlen($joined), $ints, \strlen($ints), $count, $totalParts, $out, self::$w49OutCap);
+            $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+        } catch (Throwable) {
+            $values = false;
+        }
+
+        /** @var list<int>|null $result */
+        $result = \is_array($values) ? array_values($values) : null;
+
+        return $result ?? self::classifyArticleReferencesPhp($messageIds, $numbers, $bytes, $totalParts);
+    }
+
+    private static function w49Ffi(): ?FFI
+    {
+        self::$w49Ffi ??= RustPipelineLibrary::resolveDomain('nfo_w49', self::W49_FFI_CDEF) ?? false;
+
+        return self::$w49Ffi === false ? null : self::$w49Ffi;
+    }
+
+    /** A reusable output buffer of at least $words `int64_t` words; FFI::new() throws on failure. */
+    private static function w49Out(FFI $ffi, int $words): CData
+    {
+        if (self::$w49Out === null || self::$w49OutCap < $words) {
+            self::$w49Out = $ffi->new('int64_t['.max(1024, $words).']');
+            self::$w49OutCap = max(1024, $words);
+        }
+
+        return self::$w49Out;
+    }
+
+    /**
+     * Appends the XXH64 digest of the words.
+     *
+     * @param  list<int>  $words
+     * @return list<int>
+     */
+    private static function w49Digest(array $words): array
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$words), true));
+        $words[] = $digest[1];
+
+        return $words;
+    }
 }
