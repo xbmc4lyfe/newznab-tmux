@@ -11,6 +11,7 @@ use App\Services\Categorization\ReleaseContext;
 use App\Support\RustPipelineLibrary;
 use Closure;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 /**
@@ -496,5 +497,178 @@ class MiscSafetyNetPipe extends AbstractCategorizationPipe
         }
 
         return self::$w463RustFfiHandle === false ? null : self::$w463RustFfiHandle;
+    }
+
+    /** Wave 53.2 paired benchmarks decide this default; see RustCategorizationPipesAbstractBookPassableMiscMovieW53ParityTest. */
+    private const bool W53_RUST_FFI_DEFAULT = true;
+
+    private const string W53_FFI_CDEF = <<<'C'
+        intptr_t nntmux_w532_misc_safety_net_plan_batch(const char *labels, size_t labels_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /**
+     * Wave 53 routing, binding and output buffer, kept in function-local statics. Operations:
+     * null reads the routing override, 'set' replaces it (returning the previous one), 'ffi'
+     * resolves the binding and 'out' returns `[binding, buffer, capacity]` with room for at
+     * least $val words (null without the library).
+     */
+    private static function w53RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        static $enabled = null;
+        static $ffi = null;
+        static $out = null;
+        static $capacity = 0;
+
+        switch ($op) {
+            case 'set':
+                $previous = $enabled;
+                $enabled = \is_bool($val) ? $val : null;
+
+                return $previous;
+            case 'ffi':
+                $ffi ??= RustPipelineLibrary::resolveDomain('nfo_w53', self::W53_FFI_CDEF) ?? false;
+
+                return $ffi === false ? null : $ffi;
+            case 'out':
+                $words = \is_int($val) ? $val : 0;
+                if (! $out instanceof CData || $capacity < $words) {
+                    $resolved = self::w53RustFfiState('ffi');
+                    $buffer = $resolved instanceof FFI ? $resolved->new('int64_t['.max(1024, $words).']') : null;
+                    if (! $buffer instanceof CData) {
+                        return null;
+                    }
+                    [$out, $capacity] = [$buffer, max(1024, $words)];
+                }
+
+                return [$ffi, $out, $capacity];
+            default:
+                return $enabled;
+        }
+    }
+
+    public static function usesW53RustFfi(): bool
+    {
+        $enabled = self::w53RustFfiState();
+
+        return \is_bool($enabled) ? $enabled : self::W53_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with planSafetyNetBatch() routed to Rust ($enabled) or PHP, then restores the
+     * previous routing.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW53RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w53RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w53RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Batch safety-net plan, as handle() applies shouldDowngradeToMiscPhp(): a passable not
+     * locked to misc (state bit 1 clear) whose miscAnalysis lowSignal is true (state bit 2) and
+     * whose matchedBy starts with `group_name_` becomes (OTHER_MISC, `group_only_low_signal`)
+     * and locks. One word per passable: `flags | family << 8 | crc32(final matchedBy) << 32`.
+     * Flags: 1 downgrade, 2 locked before, 4 low signal, 8 protected final result, 16 locked
+     * after, 32 empty matchedBy. Family of the incoming matchedBy: 5 `no_match`, 1
+     * `group_name_`, 2 `hash`, 3 `gibberish_` prefixes, 4 holds `fallback`, else 0. Downgrades,
+     * passables locked afterwards, protected final results, distinct downgraded labels, the six
+     * family counts and the XXH64 digest of all earlier words follow.
+     *
+     * @param  list<int>  $categoryIds
+     * @param  list<string>  $matchedBy
+     * @param  list<int>  $states
+     * @return list<int>
+     */
+    public static function planSafetyNetBatch(array $categoryIds, array $matchedBy, array $states): array
+    {
+        return self::usesW53RustFfi()
+            ? self::planSafetyNetBatchNative($categoryIds, $matchedBy, $states)
+            : self::planSafetyNetBatchPhp($categoryIds, $matchedBy, $states);
+    }
+
+    /**
+     * @param  list<int>  $categoryIds
+     * @param  list<string>  $matchedBy
+     * @param  list<int>  $states
+     * @return list<int>
+     */
+    public static function planSafetyNetBatchPhp(array $categoryIds, array $matchedBy, array $states): array
+    {
+        [$categoryIds, $states] = [array_values($categoryIds), array_values($states)];
+        $out = $seen = [];
+        $downgrades = $lockedAfter = $shielded = 0;
+        $families = [0, 0, 0, 0, 0, 0];
+        foreach (array_values($matchedBy) as $i => $label) {
+            $state = $states[$i] ?? 0;
+            $locked = ($state & 1) !== 0;
+            $low = ($state & 2) !== 0;
+            $family = $label === 'no_match' ? 5 : (str_starts_with($label, 'group_name_') ? 1 : (str_starts_with($label, 'hash') ? 2
+                : (str_starts_with($label, 'gibberish_') ? 3 : (str_contains($label, 'fallback') ? 4 : 0))));
+            $downgrade = ! $locked && $low && $family === 1;
+            if ($downgrade) {
+                $seen[$label] = true;
+                [$category, $final] = [Category::OTHER_MISC, 'group_only_low_signal'];
+            } else {
+                [$category, $final] = [$categoryIds[$i] ?? 0, $label];
+            }
+            $shield = ($category === Category::OTHER_HASHED || ($category === Category::OTHER_MISC && (str_starts_with($final, 'hash_') || str_starts_with($final, 'obfuscated_')
+                || str_starts_with($final, 'gibberish_') || $final === 'group_only_low_signal')));
+            $after = $locked || $downgrade;
+            $downgrades += (int) $downgrade;
+            $lockedAfter += (int) $after;
+            $shielded += (int) $shield;
+            $families[$family]++;
+            $out[] = ($downgrade ? 1 : 0) | ($locked ? 2 : 0) | ($low ? 4 : 0) | ($shield ? 8 : 0) | ($after ? 16 : 0) | ($label === '' ? 32 : 0)
+                | $family << 8 | crc32($final) << 32;
+        }
+        array_push($out, $downgrades, $lockedAfter, $shielded, \count($seen), ...$families);
+        /** @var array{1: int} $digest */
+        $digest = unpack('J', hash('xxh64', pack('P*', ...$out), true));
+        $out[] = $digest[1];
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing, the lists differ in length or
+     * are not lists, or a label holds a NUL byte.
+     *
+     * @param  list<int>  $categoryIds
+     * @param  list<string>  $matchedBy
+     * @param  list<int>  $states
+     * @return list<int>
+     */
+    public static function planSafetyNetBatchNative(array $categoryIds, array $matchedBy, array $states): array
+    {
+        $count = \count($matchedBy);
+        $words = $count + 11;
+        /** @var array{FFI, CData, int}|null $state */
+        $state = $count === 0 ? null : self::w53RustFfiState('out', $words);
+        if ($state === null || \count($categoryIds) !== $count || \count($states) !== $count
+            || ! array_is_list($matchedBy) || ! array_is_list($categoryIds) || ! array_is_list($states)) {
+            return self::planSafetyNetBatchPhp($categoryIds, $matchedBy, $states);
+        }
+        $labels = implode("\0", $matchedBy);
+        $ints = pack('P*', ...$categoryIds, ...$states);
+        [$ffi, $out, $cap] = $state;
+        try {
+            // @phpstan-ignore method.notFound (Declared by W53_FFI_CDEF.)
+            $written = $ffi->nntmux_w532_misc_safety_net_plan_batch($labels, \strlen($labels), $ints, \strlen($ints), $count, $out, $cap);
+        } catch (Throwable) {
+            $written = -1;
+        }
+        /** @var array<int, int>|false $values */
+        $values = $written === $words ? unpack('P*', FFI::string($out, $words * 8)) : false;
+
+        return \is_array($values) ? array_values($values) : self::planSafetyNetBatchPhp($categoryIds, $matchedBy, $states);
     }
 }
