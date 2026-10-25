@@ -5,12 +5,30 @@ declare(strict_types=1);
 namespace App\Services\Releases\Verification;
 
 use App\Services\Configuration\ConfigurationProvider;
+use App\Support\RustPipelineLibrary;
+use FFI;
 use Illuminate\Support\Facades\DB;
 use RuntimeException;
+use Throwable;
 
 final class CollectionReleasePolicy
 {
     private static bool $useRustFfi = true;
+
+    public const string W396_FFI_CDEF = 'ssize_t nntmux_w396_verification_store_prelock_manifest_reset(uint8_t operation, uint8_t flags, const char *input, size_t input_len, char *out_buf, size_t out_cap);';
+
+    /** Wave 39.6 paired benchmarks decide this default; see RustVerificationStorePrelockManifestResetW39ParityTest. */
+    public const bool W396_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $w396UseRustFfi = null;
+
+    private static FFI|false|null $w396Ffi = null;
+
+    private const int W396_RUST_MAX_INPUT = 16_777_216;
+
+    private const array W396_AGE_STATES = ['too_young', 'eligible', 'expired'];
+
+    private const array W396_ACTIONS = ['wait', 'release', 'discard'];
 
     public static function setUseRustFfi(bool $enabled): void
     {
@@ -177,5 +195,143 @@ final class CollectionReleasePolicy
         return ['min_size' => max(0, (int) ($group->minsizetoformrelease ?? 0), $settings->minSizeToFormRelease),
             'max_size' => max(0, $settings->maxSizeToFormRelease),
             'min_files' => max(0, (int) ($group->minfilestoformrelease ?? 0), $settings->minFilesToFormRelease)];
+    }
+
+    public static function useW396RustFfi(?bool $enabled): void
+    {
+        self::$w396UseRustFfi = $enabled;
+    }
+
+    public static function usesW396RustFfi(): bool
+    {
+        return self::$w396UseRustFfi ?? self::W396_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW396RustFfi(): void
+    {
+        self::$w396UseRustFfi = null;
+        self::$w396Ffi = null;
+    }
+
+    /**
+     * Whether a collection may form a release yet. Parts are clamped to 0 <= available <= total; the age window
+     * is too_young below max(0, $minAgeSeconds), expired above a positive $maxAgeSeconds, else eligible. An empty
+     * collection never meets the clamped 0–1000 completion threshold. Too-young or incomplete eligible collections
+     * wait, complete ones release (also when expired), and an expired incomplete collection is discarded.
+     *
+     * @return array{total_parts: int, available_parts: int, completion_permille: int, age_state: string, completion_met: bool, action: string}
+     */
+    public static function summarizeEligibilityWindow(int $totalParts, int $availableParts, int $ageSeconds, int $minAgeSeconds, int $maxAgeSeconds, int $minCompletionPermille = 950): array
+    {
+        return (self::usesW396RustFfi() ? self::summarizeEligibilityWindowNative($totalParts, $availableParts, $ageSeconds, $minAgeSeconds, $maxAgeSeconds, $minCompletionPermille) : null)
+            ?? self::summarizeEligibilityWindowPhp($totalParts, $availableParts, $ageSeconds, $minAgeSeconds, $maxAgeSeconds, $minCompletionPermille);
+    }
+
+    /** @return array{total_parts: int, available_parts: int, completion_permille: int, age_state: string, completion_met: bool, action: string} */
+    public static function summarizeEligibilityWindowPhp(int $totalParts, int $availableParts, int $ageSeconds, int $minAgeSeconds, int $maxAgeSeconds, int $minCompletionPermille = 950): array
+    {
+        $total = max(0, $totalParts);
+        $available = min(max(0, $availableParts), $total);
+        $permille = self::w396Permille($available, $total);
+        $state = $ageSeconds < max(0, $minAgeSeconds) ? 'too_young' : ($maxAgeSeconds > 0 && $ageSeconds > $maxAgeSeconds ? 'expired' : 'eligible');
+        $met = $total > 0 && $permille >= min(max(0, $minCompletionPermille), 1000);
+
+        return [
+            'total_parts' => $total,
+            'available_parts' => $available,
+            'completion_permille' => $permille,
+            'age_state' => $state,
+            'completion_met' => $met,
+            'action' => $state === 'too_young' ? 'wait' : ($met ? 'release' : ($state === 'eligible' ? 'wait' : 'discard')),
+        ];
+    }
+
+    /** @return array{total_parts: int, available_parts: int, completion_permille: int, age_state: string, completion_met: bool, action: string}|null */
+    public static function summarizeEligibilityWindowNative(int $totalParts, int $availableParts, int $ageSeconds, int $minAgeSeconds, int $maxAgeSeconds, int $minCompletionPermille = 950): ?array
+    {
+        $slots = self::w396Slots(1, 0, pack('q6', $totalParts, $availableParts, $ageSeconds, $minAgeSeconds, $maxAgeSeconds, $minCompletionPermille), 6);
+        if ($slots === null || $slots[0] < 0 || $slots[1] < 0 || $slots[1] > $slots[0] || $slots[2] < 0 || $slots[2] > 1000
+            || ! isset(self::W396_AGE_STATES[$slots[3]], self::W396_ACTIONS[$slots[5]]) || ($slots[4] & ~1) !== 0) {
+            return null;
+        }
+
+        return [
+            'total_parts' => $slots[0],
+            'available_parts' => $slots[1],
+            'completion_permille' => $slots[2],
+            'age_state' => self::W396_AGE_STATES[$slots[3]],
+            'completion_met' => $slots[4] === 1,
+            'action' => self::W396_ACTIONS[$slots[5]],
+        ];
+    }
+
+    /** floor($part * 1000 / $whole) for 0 <= $part <= $whole, exact even where $part * 1000 would overflow. */
+    private static function w396Permille(int $part, int $whole): int
+    {
+        if ($whole <= 0) {
+            return 0;
+        }
+        if ($whole <= intdiv(PHP_INT_MAX, 1000)) {
+            return intdiv($part * 1000, $whole);
+        }
+        // Shift-and-add over 1000 = 0b1111101000, keeping quotient * whole + remainder = part * multiplier.
+        $quotient = 0;
+        $remainder = 0;
+        foreach ([1, 1, 1, 1, 1, 0, 1, 0, 0, 0] as $bit) {
+            $quotient *= 2;
+            if ($remainder >= $whole - $remainder) {
+                $remainder -= $whole - $remainder;
+                $quotient++;
+            } else {
+                $remainder *= 2;
+            }
+            if ($bit === 1) {
+                if ($remainder >= $whole - $part) {
+                    $remainder -= $whole - $part;
+                    $quotient++;
+                } else {
+                    $remainder += $part;
+                }
+            }
+        }
+
+        return $quotient;
+    }
+
+    /**
+     * Calls the Wave 39.6 export shared by the verification helpers and decodes its fixed i64 slots.
+     * Every output fits the initial scratch buffer, so any negative or unexpected size falls back to PHP.
+     *
+     * @internal
+     *
+     * @return list<int>|null
+     */
+    public static function w396Slots(int $operation, int $flags, string $input, int $slots): ?array
+    {
+        if (\strlen($input) > self::W396_RUST_MAX_INPUT) {
+            return null;
+        }
+        try {
+            self::$w396Ffi ??= RustPipelineLibrary::resolveDomain('verification_w396', self::W396_FFI_CDEF) ?? false;
+            if (self::$w396Ffi === false) {
+                return null;
+            }
+            $ffi = self::$w396Ffi;
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, $slots * 8, $capacity);
+            if ($buffer === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w396_verification_store_prelock_manifest_reset($operation, $flags, $input, \strlen($input), $buffer, min($capacity, self::W396_RUST_MAX_INPUT));
+            if ($written !== $slots * 8) {
+                return null;
+            }
+            $values = unpack('q*', FFI::string($buffer, $written));
+
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }

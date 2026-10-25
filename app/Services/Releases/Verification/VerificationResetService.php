@@ -21,6 +21,14 @@ final class VerificationResetService
 
     private static ?bool $useRustFfi = null;
 
+    /** Wave 39.6 paired benchmarks decide this default; see RustVerificationStorePrelockManifestResetW39ParityTest. */
+    public const bool W396_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $w396UseRustFfi = null;
+
+    /** Reset classes: 0 eligible (failed or stuck), 1 in flight, 2 already verified; anything else is 3. */
+    private const array W396_RESET_CLASSES = ['dirty' => 0, 'stale' => 0, 'expired' => 0, 'unknown' => 0, 'verifying' => 1, 'ready' => 2];
+
     public static function setUseRustFfi(?bool $use): void
     {
         self::$useRustFfi = $use;
@@ -258,5 +266,84 @@ final class VerificationResetService
     private function lock(?VerificationLock $lock): VerificationLock
     {
         return $lock ?? throw new RuntimeException('Verification worker, admission or reset is active; retry reset later.');
+    }
+
+    public static function useW396RustFfi(?bool $enabled): void
+    {
+        self::$w396UseRustFfi = $enabled;
+    }
+
+    public static function usesW396RustFfi(): bool
+    {
+        return self::$w396UseRustFfi ?? self::W396_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW396RustFfi(): void
+    {
+        self::$w396UseRustFfi = null;
+    }
+
+    /**
+     * Plan which candidates a verification reset re-queues. Failed or stuck statuses (dirty, stale, expired,
+     * unknown) are eligible, as is verifying when $includeInFlight; otherwise verifying is skipped in flight,
+     * ready is skipped as already verified, and any other value (including non-strings) is skipped as other.
+     * Statuses match exactly. Eligible candidates are planned in chunks of max(1, $chunkSize).
+     *
+     * @param  array<array-key, mixed>  $candidateStates
+     * @return array{inspected: int, eligible: int, skipped_in_flight: int, skipped_verified: int, skipped_other: int, chunks: int}
+     */
+    public static function summarizeResetScopePlan(array $candidateStates, bool $includeInFlight = false, int $chunkSize = 500): array
+    {
+        return (self::usesW396RustFfi() ? self::summarizeResetScopePlanNative($candidateStates, $includeInFlight, $chunkSize) : null)
+            ?? self::summarizeResetScopePlanPhp($candidateStates, $includeInFlight, $chunkSize);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $candidateStates
+     * @return array{inspected: int, eligible: int, skipped_in_flight: int, skipped_verified: int, skipped_other: int, chunks: int}
+     */
+    public static function summarizeResetScopePlanPhp(array $candidateStates, bool $includeInFlight = false, int $chunkSize = 500): array
+    {
+        $counts = [0, 0, 0, 0];
+        foreach ($candidateStates as $state) {
+            $class = \is_string($state) ? (self::W396_RESET_CLASSES[$state] ?? 3) : 3;
+            $counts[$class === 1 && $includeInFlight ? 0 : $class]++;
+        }
+        $chunk = max(1, $chunkSize);
+
+        return [
+            'inspected' => \count($candidateStates),
+            'eligible' => $counts[0],
+            'skipped_in_flight' => $counts[1],
+            'skipped_verified' => $counts[2],
+            'skipped_other' => $counts[3],
+            'chunks' => intdiv($counts[0], $chunk) + ($counts[0] % $chunk === 0 ? 0 : 1),
+        ];
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $candidateStates
+     * @return array{inspected: int, eligible: int, skipped_in_flight: int, skipped_verified: int, skipped_other: int, chunks: int}|null
+     */
+    public static function summarizeResetScopePlanNative(array $candidateStates, bool $includeInFlight = false, int $chunkSize = 500): ?array
+    {
+        $input = pack('qV', $chunkSize, \count($candidateStates));
+        foreach ($candidateStates as $state) {
+            $input .= \is_string($state) ? pack('V', \strlen($state)).$state : "\0\0\0\0";
+        }
+        $slots = CollectionReleasePolicy::w396Slots(5, (int) $includeInFlight, $input, 6);
+        if ($slots === null || $slots[0] !== \count($candidateStates) || min($slots) < 0 || $slots[0] !== $slots[1] + $slots[2] + $slots[3] + $slots[4]
+            || $slots[5] > $slots[1] || ($slots[1] > 0) !== ($slots[5] > 0)) {
+            return null;
+        }
+
+        return [
+            'inspected' => $slots[0],
+            'eligible' => $slots[1],
+            'skipped_in_flight' => $slots[2],
+            'skipped_verified' => $slots[3],
+            'skipped_other' => $slots[4],
+            'chunks' => $slots[5],
+        ];
     }
 }

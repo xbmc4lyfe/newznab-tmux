@@ -25,6 +25,11 @@ final class PublicationPrelock
 
     private static ?bool $useRustFfi = null;
 
+    /** Wave 39.6 paired benchmarks decide this default; see RustVerificationStorePrelockManifestResetW39ParityTest. */
+    public const bool W396_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $w396UseRustFfi = null;
+
     /**
      * @param  array<string, mixed>|null  $archived  The candidate's archived manifest, read from $archivedPath.
      * @param  bool  $policyKnown  Whether $policyRejection holds an evaluated collection-policy verdict.
@@ -117,5 +122,68 @@ final class PublicationPrelock
         }
 
         return self::summarizePrelockStatePhp($size, $archivedPath, $policyKnown, $policyRejection, $coverageKnown, $coverageCount);
+    }
+
+    public static function useW396RustFfi(?bool $enabled): void
+    {
+        self::$w396UseRustFfi = $enabled;
+    }
+
+    public static function usesW396RustFfi(): bool
+    {
+        return self::$w396UseRustFfi ?? self::W396_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW396RustFfi(): void
+    {
+        self::$w396UseRustFfi = null;
+    }
+
+    /**
+     * Evaluate a prelock lease. It expires at $acquiredAtMs + max(0, $ttlMs) (saturating at PHP_INT_MAX) and
+     * is expired once $nowMs reaches that instant. remaining_ms is 0 when expired and saturates at
+     * PHP_INT_MAX; a live lease needs renewal within max(0, $renewMarginMs), and is valid only when it is
+     * live and not acquired in the future.
+     *
+     * @return array{expires_at_ms: int, remaining_ms: int, expired: bool, needs_renewal: bool, valid: bool}
+     */
+    public static function planPrelockLeaseWindow(int $acquiredAtMs, int $ttlMs, int $nowMs, int $renewMarginMs = 5000): array
+    {
+        return (self::usesW396RustFfi() ? self::planPrelockLeaseWindowNative($acquiredAtMs, $ttlMs, $nowMs, $renewMarginMs) : null)
+            ?? self::planPrelockLeaseWindowPhp($acquiredAtMs, $ttlMs, $nowMs, $renewMarginMs);
+    }
+
+    /** @return array{expires_at_ms: int, remaining_ms: int, expired: bool, needs_renewal: bool, valid: bool} */
+    public static function planPrelockLeaseWindowPhp(int $acquiredAtMs, int $ttlMs, int $nowMs, int $renewMarginMs = 5000): array
+    {
+        $ttl = max(0, $ttlMs);
+        $expires = $acquiredAtMs > PHP_INT_MAX - $ttl ? PHP_INT_MAX : $acquiredAtMs + $ttl;
+        $expired = $nowMs >= $expires;
+        $remaining = $expired ? 0 : ($nowMs < 0 && $expires > PHP_INT_MAX + $nowMs ? PHP_INT_MAX : $expires - $nowMs);
+
+        return [
+            'expires_at_ms' => $expires,
+            'remaining_ms' => $remaining,
+            'expired' => $expired,
+            'needs_renewal' => ! $expired && $remaining <= max(0, $renewMarginMs),
+            'valid' => ! $expired && $nowMs >= $acquiredAtMs,
+        ];
+    }
+
+    /** @return array{expires_at_ms: int, remaining_ms: int, expired: bool, needs_renewal: bool, valid: bool}|null */
+    public static function planPrelockLeaseWindowNative(int $acquiredAtMs, int $ttlMs, int $nowMs, int $renewMarginMs = 5000): ?array
+    {
+        $slots = CollectionReleasePolicy::w396Slots(4, 0, pack('q4', $acquiredAtMs, $ttlMs, $nowMs, $renewMarginMs), 5);
+        if ($slots === null || $slots[1] < 0 || ($slots[2] & ~1) !== 0 || ($slots[3] & ~1) !== 0 || ($slots[4] & ~1) !== 0) {
+            return null;
+        }
+
+        return [
+            'expires_at_ms' => $slots[0],
+            'remaining_ms' => $slots[1],
+            'expired' => $slots[2] === 1,
+            'needs_renewal' => $slots[3] === 1,
+            'valid' => $slots[4] === 1,
+        ];
     }
 }
