@@ -13,9 +13,13 @@ use Throwable;
  */
 final class MediaByteBudget
 {
+    public const bool W45_RUST_FFI_DEFAULT = false;
+
     public const string FFI_CDEF = <<<'C'
         int32_t nntmux_budget_eval(uint32_t op, int64_t limit, int64_t spent, int64_t bytes, int64_t *out);
         double nntmux_budget_utilization(int64_t limit, int64_t spent, int32_t *status);
+        int32_t nntmux_w45_budget_eval(uint32_t op, int64_t limit, int64_t spent, int64_t bytes, int64_t *out);
+        double nntmux_w45_budget_utilization(int64_t limit, int64_t spent, int32_t *status);
         C;
 
     private const int OP_ALLOWS = 0;
@@ -29,11 +33,21 @@ final class MediaByteBudget
     private const int OP_CLAMP = 4;
 
     // PHP remains the production default: FFI marshaling stays below the 1.5x gate.
-    private static bool $useRustFfi = false;
+    private static bool $useRustFfi = self::W45_RUST_FFI_DEFAULT;
 
     private static FFI|false|null $ffi = null;
 
     private int $spent = 0;
+
+    public static function useW45RustFfi(?bool $enabled): void
+    {
+        self::$useRustFfi = $enabled ?? self::W45_RUST_FFI_DEFAULT;
+    }
+
+    public static function usesW45RustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
 
     public function __construct(public readonly int $limit) {}
 
@@ -164,7 +178,7 @@ final class MediaByteBudget
         try {
             $status = $ffi->new('int32_t');
             // @phpstan-ignore method.notFound
-            $value = $ffi->nntmux_budget_utilization($this->limit, $this->spent, FFI::addr($status));
+            $value = $ffi->nntmux_w45_budget_utilization($this->limit, $this->spent, FFI::addr($status));
             // @phpstan-ignore property.notFound
             $code = (int) $status->cdata;
         } catch (Throwable) {
@@ -186,7 +200,7 @@ final class MediaByteBudget
         try {
             $out = $ffi->new('int64_t');
             // @phpstan-ignore method.notFound
-            $code = $ffi->nntmux_budget_eval($op, $this->limit, $this->spent, $bytes, FFI::addr($out));
+            $code = $ffi->nntmux_w45_budget_eval($op, $this->limit, $this->spent, $bytes, FFI::addr($out));
             // @phpstan-ignore property.notFound
             $value = (int) $out->cdata;
         } catch (Throwable) {

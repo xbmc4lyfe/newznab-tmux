@@ -30118,3 +30118,443 @@ mod wave44_dto_media_tests {
         );
     }
 }
+
+/// Wave 45.6 thumbnail text detection, preserving the shared byte-prefix behavior.
+///
+/// # Safety
+/// `ptr` must be valid for reads of `len` bytes when `len` is nonzero.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w45_thumbnail_looks_like_text(ptr: *const u8, len: usize) -> i32 {
+    // SAFETY: The caller supplies the same pointer contract as the shared helper.
+    unsafe { crate::media::nntmux_thumbnail_looks_like_text(ptr, len) }
+}
+
+/// Wave 45.6 thumbnail window, with PHP's three-decimal half-up rounding.
+/// Returns 1 on success or -1 without writing outputs for unsupported input.
+///
+/// # Safety
+/// Non-null output pointers must each be writable for one `double`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w45_thumbnail_window(
+    position_is_mid: u32,
+    duration: f64,
+    has_duration: u32,
+    bit_rate: i64,
+    has_bit_rate: u32,
+    available_bytes: i64,
+    total_bytes: i64,
+    has_hints: u32,
+    attempts: i32,
+    out_from: *mut f64,
+    out_spacing: *mut f64,
+) -> i32 {
+    std::panic::catch_unwind(|| {
+        if out_from.is_null() || out_spacing.is_null() || attempts <= 0 {
+            return -1;
+        }
+        let values = if position_is_mid != 0 {
+            (0.0, 0.0)
+        } else {
+            if (has_duration != 0 && !duration.is_finite()) || (has_bit_rate != 0 && bit_rate == 0)
+            {
+                return -1;
+            }
+            let fraction = if has_hints == 2 {
+                Some(1.0)
+            } else if has_hints != 0 && total_bytes > 0 && available_bytes > 0 {
+                w15_php_int_div(available_bytes, total_bytes).map(|fraction| fraction.min(1.0))
+            } else {
+                None
+            };
+            let playable = if has_duration != 0
+                && let Some(fraction) = fraction
+            {
+                duration * fraction * if fraction < 1.0 { 0.85 } else { 1.0 }
+            } else if has_hints != 0 && has_bit_rate != 0 && available_bytes > 0 {
+                // PHP multiplies integers before division, widening only on overflow.
+                let seconds = match available_bytes.checked_mul(8) {
+                    Some(bits) => w15_php_int_div(bits, bit_rate).unwrap_or(f64::NAN),
+                    None => available_bytes as f64 * 8.0 / bit_rate as f64,
+                };
+                seconds * 0.85
+            } else if has_duration != 0 {
+                duration
+            } else {
+                0.0
+            };
+            if !playable.is_finite() {
+                return -1;
+            }
+            use crate::cleaning::wave31_benchmark_binaries_cbp_reset_commands::php_round;
+            let from = php_round(playable * 0.25, 3);
+            let spacing = php_round((playable - from) / f64::from(attempts), 3);
+            if !from.is_finite() || !spacing.is_finite() {
+                return -1;
+            }
+            (from, spacing)
+        };
+        // SAFETY: Both pointers are non-null and the caller promises writable outputs.
+        unsafe {
+            out_from.write_unaligned(values.0);
+            out_spacing.write_unaligned(values.1);
+        }
+        1
+    })
+    .unwrap_or(-1)
+}
+
+/// First segment inspected by a fetch loop, or -1 for a negative segment count.
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_w45_fetcher_segment_start(count: i64, from: i64, max_bytes: i64) -> i64 {
+    if count < 0 {
+        -1
+    } else if max_bytes > 0 {
+        from.max(0)
+    } else {
+        count
+    }
+}
+
+/// PHP `substr` chunk length; negative data lengths produce an empty chunk.
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_w45_fetcher_chunk_length(data_len: i64, length: i64) -> i64 {
+    w16_chunk_length(data_len, length).unwrap_or(0)
+}
+
+/// Whether source processing has enabled time, no blocking state, and a source.
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_w45_source_has_work(
+    enabled: i32,
+    seconds: i64,
+    found: i32,
+    password: i32,
+    unavailable: i32,
+    archived: i32,
+    main: i32,
+) -> i32 {
+    i32::from(
+        enabled != 0
+            && seconds > 0
+            && found == 0
+            && password == 0
+            && unavailable == 0
+            && (archived != 0 || main != 0),
+    )
+}
+
+/// Wave 45.6 driver mask (bit 0 ffmpeg, bit 1 ffprobe).
+#[unsafe(no_mangle)]
+pub extern "C" fn nntmux_w45_tool_driver_mask(
+    ffmpeg_is_string: i32,
+    ffmpeg_len: usize,
+    ffprobe_is_string: i32,
+    ffprobe_len: usize,
+) -> i32 {
+    nntmux_mtf_driver_mask(ffmpeg_is_string, ffmpeg_len, ffprobe_is_string, ffprobe_len)
+}
+
+/// Wave 45.6 byte-budget operation, retaining shared overflow/fallback statuses.
+///
+/// # Safety
+/// `out` must be null or writable for one `int64_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w45_budget_eval(
+    op: u32,
+    limit: i64,
+    spent: i64,
+    bytes: i64,
+    out: *mut i64,
+) -> i32 {
+    // SAFETY: The caller supplies the shared helper's output pointer contract.
+    unsafe { nntmux_budget_eval(op, limit, spent, bytes, out) }
+}
+
+/// Wave 45.6 byte-budget utilization and status.
+///
+/// # Safety
+/// `status` must be null or writable for one `int32_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nntmux_w45_budget_utilization(
+    limit: i64,
+    spent: i64,
+    status: *mut i32,
+) -> f64 {
+    // SAFETY: The caller supplies the shared helper's status pointer contract.
+    unsafe { nntmux_budget_utilization(limit, spent, status) }
+}
+
+#[cfg(test)]
+mod wave45_thumbnail_fetcher_stage_tool_budget_tests {
+    use super::*;
+
+    #[test]
+    fn additional_w45_text_prefixes_preserve_php_byte_trim_and_null_contract() {
+        for (head, expected) in [
+            (&b"\xef\xbb\xbf \r\n#eXtM3u\n"[..], 1),
+            (&b"\xbf\xeffFConCat version 1.0"[..], 1),
+            (&b"\0#EXTM3U"[..], 0),
+            (&b"\x0bffconcat"[..], 0),
+            (&b"#EXTM3"[..], 0),
+            (&b"binary"[..], 0),
+        ] {
+            assert_eq!(
+                unsafe { nntmux_w45_thumbnail_looks_like_text(head.as_ptr(), head.len()) },
+                expected
+            );
+        }
+        assert_eq!(
+            unsafe { nntmux_w45_thumbnail_looks_like_text(std::ptr::null(), 0) },
+            0
+        );
+        assert_eq!(
+            unsafe { nntmux_w45_thumbnail_looks_like_text(std::ptr::null(), 1) },
+            -1
+        );
+    }
+
+    #[test]
+    fn additional_w45_window_preserves_php_decimal_ties_and_playable_paths() {
+        for (duration, expected_from, expected_spacing) in [
+            (4.002_f64, 1.001_f64, 1.0_f64),
+            (4.018, 1.005, 1.004),
+            (-4.002, -1.001, -1.0),
+            (0.002, 0.001, 0.0),
+            (-0.002, -0.001, -0.0),
+            (123.458, 30.865, 30.864),
+        ] {
+            let (mut from, mut spacing) = (99.0_f64, 99.0_f64);
+            assert_eq!(
+                unsafe {
+                    nntmux_w45_thumbnail_window(
+                        0,
+                        duration,
+                        1,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        3,
+                        &mut from,
+                        &mut spacing,
+                    )
+                },
+                1
+            );
+            assert_eq!((from, spacing), (expected_from, expected_spacing));
+            assert_eq!(
+                spacing.is_sign_negative(),
+                expected_spacing.is_sign_negative()
+            );
+        }
+        for (duration, has_duration, bit_rate, has_bit_rate, available, total, hints, expected) in [
+            (100.0, 1, 0, 0, 50, 100, 1, (10.625, 10.625)),
+            (100.0, 1, 0, 0, 50, 100, 2, (25.0, 25.0)),
+            (0.0, 0, 8, 1, 100, 0, 1, (21.25, 21.25)),
+            (0.0, 0, 0, 0, 0, 0, 0, (0.0, 0.0)),
+        ] {
+            let (mut from, mut spacing) = (99.0, 99.0);
+            assert_eq!(
+                unsafe {
+                    nntmux_w45_thumbnail_window(
+                        0,
+                        duration,
+                        has_duration,
+                        bit_rate,
+                        has_bit_rate,
+                        available,
+                        total,
+                        hints,
+                        3,
+                        &mut from,
+                        &mut spacing,
+                    )
+                },
+                1
+            );
+            assert_eq!((from, spacing), expected);
+        }
+        let (mut from, mut spacing) = (99.0, 99.0);
+        assert_eq!(
+            unsafe {
+                nntmux_w45_thumbnail_window(1, 0.0, 0, 0, 0, 0, 0, 1, 3, &mut from, &mut spacing)
+            },
+            1
+        );
+        assert_eq!((from, spacing), (0.0, 0.0));
+    }
+
+    #[test]
+    fn additional_w45_window_rejects_invalid_inputs_without_output_writes() {
+        for (duration, has_duration, bit_rate, has_bit_rate, attempts) in [
+            (f64::NAN, 1, 0, 0, 3),
+            (f64::INFINITY, 1, 0, 0, 3),
+            (0.0, 0, 0, 1, 3),
+            (10.0, 1, 0, 0, 0),
+            (10.0, 1, 0, 0, -1),
+        ] {
+            let (mut from, mut spacing) = (99.0, 98.0);
+            assert_eq!(
+                unsafe {
+                    nntmux_w45_thumbnail_window(
+                        0,
+                        duration,
+                        has_duration,
+                        bit_rate,
+                        has_bit_rate,
+                        0,
+                        0,
+                        0,
+                        attempts,
+                        &mut from,
+                        &mut spacing,
+                    )
+                },
+                -1
+            );
+            assert_eq!((from, spacing), (99.0, 98.0));
+        }
+        let mut value = 99.0;
+        assert_eq!(
+            unsafe {
+                nntmux_w45_thumbnail_window(
+                    0,
+                    10.0,
+                    1,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    3,
+                    std::ptr::null_mut(),
+                    &mut value,
+                )
+            },
+            -1
+        );
+        assert_eq!(value, 99.0);
+        assert_eq!(
+            unsafe {
+                nntmux_w45_thumbnail_window(
+                    0,
+                    10.0,
+                    1,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    3,
+                    &mut value,
+                    std::ptr::null_mut(),
+                )
+            },
+            -1
+        );
+        assert_eq!(value, 99.0);
+    }
+
+    #[test]
+    fn additional_w45_fetcher_indexes_and_chunk_lengths_keep_integer_boundaries() {
+        for (count, from, bytes, expected) in [
+            (3, -2, 1, 0),
+            (3, 5, 1, 5),
+            (0, i64::MAX, 1, i64::MAX),
+            (3, 1, 0, 3),
+            (3, 1, i64::MIN, 3),
+            (-1, 0, 1, -1),
+        ] {
+            assert_eq!(
+                nntmux_w45_fetcher_segment_start(count, from, bytes),
+                expected
+            );
+        }
+        for (data, length, expected) in [
+            (-1, i64::MAX, 0),
+            (5, 0, 0),
+            (5, 9, 5),
+            (5, 3, 3),
+            (5, -2, 3),
+            (5, -9, 0),
+            (i64::MAX, -1, i64::MAX - 1),
+            (i64::MAX, i64::MIN, 0),
+            (0, i64::MIN, 0),
+        ] {
+            assert_eq!(nntmux_w45_fetcher_chunk_length(data, length), expected);
+        }
+    }
+
+    #[test]
+    fn additional_w45_source_and_tool_masks_use_php_boolean_truthiness() {
+        assert_eq!(nntmux_w45_source_has_work(1, 1, 0, 0, 0, 1, 0), 1);
+        assert_eq!(nntmux_w45_source_has_work(-1, i64::MAX, 0, 0, 0, 0, -1), 1);
+        for flags in [
+            (0, 1, 0, 0, 0, 1, 1),
+            (1, 0, 0, 0, 0, 1, 1),
+            (1, -1, 0, 0, 0, 1, 1),
+            (1, 1, 1, 0, 0, 1, 1),
+            (1, 1, 0, -1, 0, 1, 1),
+            (1, 1, 0, 0, 1, 1, 1),
+            (1, 1, 0, 0, 0, 0, 0),
+        ] {
+            assert_eq!(
+                nntmux_w45_source_has_work(
+                    flags.0, flags.1, flags.2, flags.3, flags.4, flags.5, flags.6
+                ),
+                0
+            );
+        }
+        assert_eq!(nntmux_w45_tool_driver_mask(0, 5, 0, 5), 0);
+        assert_eq!(nntmux_w45_tool_driver_mask(1, 0, 1, 0), 0);
+        assert_eq!(nntmux_w45_tool_driver_mask(-1, 1, 0, 1), 1);
+        assert_eq!(nntmux_w45_tool_driver_mask(0, 1, 1, usize::MAX), 2);
+        assert_eq!(nntmux_w45_tool_driver_mask(1, 1, 1, 1), 3);
+    }
+
+    #[test]
+    fn additional_w45_budget_preserves_status_overflow_and_null_contracts() {
+        for (op, limit, spent, bytes, expected) in [
+            (0, 10, 4, 6, 1),
+            (0, 10, 4, 7, 0),
+            (1, 0, 4, -3, 4),
+            (2, 10, 14, 0, 0),
+            (3, 10, 10, 0, 1),
+            (4, 10, 4, 100, 6),
+        ] {
+            let mut out = 99;
+            assert_eq!(
+                unsafe { nntmux_w45_budget_eval(op, limit, spent, bytes, &mut out) },
+                1
+            );
+            assert_eq!(out, expected);
+        }
+        let mut out = 99;
+        assert_eq!(
+            unsafe { nntmux_w45_budget_eval(1, 0, i64::MAX, 1, &mut out) },
+            0
+        );
+        assert_eq!(out, 99);
+        assert_eq!(unsafe { nntmux_w45_budget_eval(99, 0, 0, 0, &mut out) }, -1);
+        assert_eq!(out, 99);
+        assert_eq!(
+            unsafe { nntmux_w45_budget_eval(0, 0, 0, 0, std::ptr::null_mut()) },
+            -1
+        );
+        for (limit, spent, expected) in [
+            (0, 9, 1.0),
+            (-1, 9, 1.0),
+            (10, 4, 0.4),
+            (10, 14, 1.0),
+            (10, -5, -0.5),
+        ] {
+            let mut status = 99;
+            assert_eq!(
+                unsafe { nntmux_w45_budget_utilization(limit, spent, &mut status) },
+                expected
+            );
+            assert_eq!(status, 1);
+        }
+        assert!(unsafe { nntmux_w45_budget_utilization(10, 4, std::ptr::null_mut()) }.is_nan());
+    }
+}

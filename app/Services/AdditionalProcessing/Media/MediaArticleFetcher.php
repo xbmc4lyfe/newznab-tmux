@@ -22,15 +22,29 @@ use Throwable;
  */
 class MediaArticleFetcher
 {
+    public const bool W45_RUST_FFI_DEFAULT = false;
+
     public const string FFI_CDEF = <<<'C'
         int32_t nntmux_fetcher_safe_witness_name(const char *ptr, size_t len);
         int64_t nntmux_fetcher_chunk_length(int64_t data_len, int64_t length);
+        int64_t nntmux_w45_fetcher_chunk_length(int64_t data_len, int64_t length);
+        int64_t nntmux_w45_fetcher_segment_start(int64_t count, int64_t from, int64_t max_bytes);
         C;
 
     // PHP remains the production default: FFI marshaling stays below the 1.5x gate.
-    private static bool $useRustFfi = false;
+    private static bool $useRustFfi = self::W45_RUST_FFI_DEFAULT;
 
     private static FFI|false|null $ffi = null;
+
+    public static function useW45RustFfi(?bool $enabled): void
+    {
+        self::$useRustFfi = $enabled ?? self::W45_RUST_FFI_DEFAULT;
+    }
+
+    public static function usesW45RustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
 
     public function __construct(private readonly UsenetDownloadService $downloadService) {}
 
@@ -63,7 +77,7 @@ class MediaArticleFetcher
     ): int {
         $written = 0;
 
-        for ($index = max(0, $fromSegment); $index < count($segments) && $written < $maxBytes; $index++) {
+        for ($index = self::segmentStart(count($segments), $fromSegment, $maxBytes); $index < count($segments) && $written < $maxBytes; $index++) {
 
             if ($context->groupUnavailable || $budget->exhausted() || hrtime(true) / 1e9 >= $deadline || ! $budget->allows($articleEstimate)) {
                 break;
@@ -168,18 +182,50 @@ class MediaArticleFetcher
 
     public static function chunkLengthNative(int $dataLength, int $length): ?int
     {
+        // Preserve the existing Native API's unsupported-length sentinel.
+        if ($dataLength < 0) {
+            return null;
+        }
         $ffi = self::ffi();
         if ($ffi === null) {
             return null;
         }
         try {
             // @phpstan-ignore method.notFound
-            $value = (int) $ffi->nntmux_fetcher_chunk_length($dataLength, $length);
+            $value = (int) $ffi->nntmux_w45_fetcher_chunk_length($dataLength, $length);
         } catch (Throwable) {
             return null;
         }
 
         return $value >= 0 ? $value : null;
+    }
+
+    /** First segment to inspect; a non-positive byte request does no work. */
+    public static function segmentStart(int $count, int $from, int $maxBytes): int
+    {
+        return (self::$useRustFfi ? self::segmentStartNative($count, $from, $maxBytes) : null)
+            ?? self::segmentStartPhp($count, $from, $maxBytes);
+    }
+
+    public static function segmentStartPhp(int $count, int $from, int $maxBytes): int
+    {
+        return $maxBytes > 0 ? max(0, $from) : $count;
+    }
+
+    public static function segmentStartNative(int $count, int $from, int $maxBytes): ?int
+    {
+        $ffi = self::ffi();
+        if ($ffi === null || $count < 0) {
+            return null;
+        }
+        try {
+            // @phpstan-ignore method.notFound
+            $start = $ffi->nntmux_w45_fetcher_segment_start($count, $from, $maxBytes);
+        } catch (Throwable) {
+            return null;
+        }
+
+        return is_int($start) && $start >= 0 ? $start : null;
     }
 
     private static function ffi(): ?FFI

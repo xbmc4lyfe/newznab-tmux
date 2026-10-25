@@ -10,6 +10,7 @@ use FFI;
 use FFMpeg\FFMpeg;
 use FFMpeg\FFProbe;
 use Symfony\Component\Cache\Adapter\ArrayAdapter;
+use Throwable;
 
 /**
  * Builds the ffmpeg and ffprobe clients from the configured binaries.
@@ -19,12 +20,15 @@ use Symfony\Component\Cache\Adapter\ArrayAdapter;
  */
 class MediaToolFactory
 {
+    public const bool W45_RUST_FFI_DEFAULT = false;
+
     public const string FFI_CDEF = <<<'C'
         int32_t nntmux_mtf_driver_mask(int32_t ffmpeg_is_string, size_t ffmpeg_len, int32_t ffprobe_is_string, size_t ffprobe_len);
+        int32_t nntmux_w45_tool_driver_mask(int32_t ffmpeg_is_string, size_t ffmpeg_len, int32_t ffprobe_is_string, size_t ffprobe_len);
         C;
 
     // PHP remains the production default until benchmarks qualify Rust.
-    public static bool $useRustFfi = false;
+    public static bool $useRustFfi = self::W45_RUST_FFI_DEFAULT;
 
     private static FFI|false|null $ffi = null;
 
@@ -33,6 +37,16 @@ class MediaToolFactory
     private ?FFProbe $ffprobe = null;
 
     private ?FFMpeg $ffmpeg = null;
+
+    public static function useW45RustFfi(?bool $enabled): void
+    {
+        self::$useRustFfi = $enabled ?? self::W45_RUST_FFI_DEFAULT;
+    }
+
+    public static function usesW45RustFfi(): bool
+    {
+        return self::$useRustFfi;
+    }
 
     public function __construct(private readonly ProcessingConfiguration $config) {}
 
@@ -113,13 +127,17 @@ class MediaToolFactory
             return self::driverConfigurationPhp($timeout, $ffmpegPath, $ffprobePath);
         }
 
-        // @phpstan-ignore method.notFound
-        $mask = $ffi->nntmux_mtf_driver_mask(
-            is_string($ffmpegPath) ? 1 : 0,
-            is_string($ffmpegPath) ? strlen($ffmpegPath) : 0,
-            is_string($ffprobePath) ? 1 : 0,
-            is_string($ffprobePath) ? strlen($ffprobePath) : 0,
-        );
+        try {
+            // @phpstan-ignore method.notFound
+            $mask = $ffi->nntmux_w45_tool_driver_mask(
+                is_string($ffmpegPath) ? 1 : 0,
+                is_string($ffmpegPath) ? strlen($ffmpegPath) : 0,
+                is_string($ffprobePath) ? 1 : 0,
+                is_string($ffprobePath) ? strlen($ffprobePath) : 0,
+            );
+        } catch (Throwable) {
+            return self::driverConfigurationPhp($timeout, $ffmpegPath, $ffprobePath);
+        }
         if (! is_int($mask) || $mask < 0 || $mask > 3) {
             return self::driverConfigurationPhp($timeout, $ffmpegPath, $ffprobePath);
         }
