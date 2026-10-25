@@ -1093,4 +1093,248 @@ class IGDBService
     {
         Log::info('IGDBService: Cache clear requested');
     }
+
+    /** Enabled: seven paired runs cleared 1.5x on every gate (min common mean 2.74x, p99 2.27x; uncommon mean 2.60x, p99 2.49x; see the W47 parity test). */
+    public const bool W47_CANDIDATE_SCORE_RUST_FFI_DEFAULT = true;
+
+    public const string W47_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w47_igdb_candidate_score_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private const array W47_CANDIDATE_SCORE_KEYS = ['total_candidates', 'empty_title_count', 'exact_title_count', 'matched_count', 'platform_match_count', 'platform_mismatch_count', 'known_genre_count', 'score_sum', 'best_score', 'best_index', 'partial_match_count', 'title_score_sum'];
+
+    private const array W47_STOPWORDS = ['a', 'an', 'and', 'complete', 'definitive', 'deluxe', 'edition', 'goty', 'hd', 'of', 'remastered', 'the', 'ultimate'];
+
+    /** isKnownGenre() list as a lookup. */
+    private const array W47_KNOWN_GENRES = [
+        'Action' => true, 'Adventure' => true, 'Arcade' => true, 'Board Games' => true, 'Cards' => true, 'Casino' => true,
+        'Flying' => true, 'Puzzle' => true, 'Racing' => true, 'Rhythm' => true, 'Role-Playing' => true, 'RPG' => true,
+        'Simulation' => true, 'Sports' => true, 'Strategy' => true, 'Trivia' => true, 'Shooter' => true, 'FPS' => true,
+        'Horror' => true, 'Survival' => true, 'Sandbox' => true, 'Open World' => true, 'Platformer' => true, 'Fighting' => true,
+        'Stealth' => true, 'MMO' => true, 'MMORPG' => true, 'Battle Royale' => true, 'Roguelike' => true, 'Roguelite' => true,
+        'Metroidvania' => true, 'Visual Novel' => true, 'Point & Click' => true, 'Management' => true,
+        'City Builder' => true, 'Tower Defense' => true, 'Turn-Based' => true, 'Real-Time' => true,
+        'Educational' => true, 'Music' => true, 'Party' => true, 'Indie' => true, 'Hack and Slash' => true,
+        'Souls-like' => true, 'JRPG' => true, 'ARPG' => true, 'Tactical' => true,
+    ];
+
+    private static ?bool $w47UseRustFfi = null;
+
+    private static FFI|false|null $w47Ffi = null;
+
+    /** Null restores the benchmark-qualified default. */
+    public static function useW47CandidateScoreRustFfi(?bool $enable = true): void
+    {
+        self::$w47UseRustFfi = $enable;
+    }
+
+    public static function usesW47CandidateScoreRustFfi(): bool
+    {
+        return self::$w47UseRustFfi ?? self::W47_CANDIDATE_SCORE_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW47CandidateScoreRustFfi(): void
+    {
+        self::$w47UseRustFfi = null;
+        self::$w47Ffi = null;
+    }
+
+    /**
+     * Score and rank IGDB search candidates. Titles become strtolower()
+     * tokens split on [^a-z0-9]+ without edition stopwords; identical token
+     * lists score 100, otherwise 100 * shared / union unique tokens
+     * (integer), plus 10 (capped at 100) when one list is a proper prefix of
+     * the other. A non-empty normalizePlatformHint() adds 15 when any comma
+     * separated candidate platform normalizes to it and subtracts 10
+     * otherwise; the final score is floored at zero. Also counts rows whose
+     * comma separated genres hold a matchGenre() known genre, MATCH_THRESHOLD
+     * (85) and 50 point matches, and reports the first best-scoring row
+     * (-1 for an empty batch). Rows are ['query', 'name', 'platform',
+     * 'platforms', 'genres']; list fields hold strings or ['name' => ...].
+     *
+     * @param  array<array-key, mixed>  $candidates
+     * @return array<string, int>
+     */
+    public static function scoreCandidateBatch(array $candidates): array
+    {
+        return self::usesW47CandidateScoreRustFfi()
+            ? self::scoreCandidateBatchNative($candidates)
+            : self::scoreCandidateBatchPhp($candidates);
+    }
+
+    /**
+     * Rust summary; falls back to PHP when the library or input frame is unusable.
+     *
+     * @param  array<array-key, mixed>  $candidates
+     * @return array<string, int>
+     */
+    public static function scoreCandidateBatchNative(array $candidates): array
+    {
+        $fields = self::w47Fields($candidates);
+
+        return self::w47Call($fields) ?? self::w47Summary($fields);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $candidates
+     * @return array<string, int>
+     */
+    public static function scoreCandidateBatchPhp(array $candidates): array
+    {
+        return self::w47Summary(self::w47Fields($candidates));
+    }
+
+    /** Strings, integers, and comma-joined string/integer or ['name' => ...] list entries; objects are never cast. */
+    private static function w47Join(mixed $value): string
+    {
+        if (! is_array($value)) {
+            return is_string($value) ? $value : (is_int($value) ? (string) $value : '');
+        }
+        $names = [];
+        foreach ($value as $v) {
+            if (is_array($v)) {
+                $v = $v['name'] ?? null;
+            }
+            $names[] = is_string($v) ? $v : (is_int($v) ? (string) $v : '');
+        }
+
+        return implode(',', $names);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $candidates
+     * @return list<string>
+     */
+    private static function w47Fields(array $candidates): array
+    {
+        $fields = [];
+        foreach ($candidates as $row) {
+            if (! is_array($row)) {
+                $fields[] = is_string($row) ? $row : (is_int($row) ? (string) $row : '');
+                array_push($fields, '', '', '', '');
+
+                continue;
+            }
+            $v = $row['query'] ?? null;
+            $fields[] = is_string($v) ? $v : (is_int($v) ? (string) $v : '');
+            $v = $row['name'] ?? null;
+            $fields[] = is_string($v) ? $v : (is_int($v) ? (string) $v : '');
+            $v = $row['platform'] ?? null;
+            $fields[] = is_string($v) ? $v : (is_int($v) ? (string) $v : '');
+            $fields[] = self::w47Join($row['platforms'] ?? null);
+            $fields[] = self::w47Join($row['genres'] ?? null);
+        }
+
+        return $fields;
+    }
+
+    /** @return list<string> */
+    private static function w47Tokens(string $title): array
+    {
+        return array_values(array_diff(preg_split('/[^a-z0-9]+/', strtolower($title), -1, PREG_SPLIT_NO_EMPTY) ?: [], self::W47_STOPWORDS));
+    }
+
+    private static function w47Platform(string $platform): string
+    {
+        $platform = strtolower(trim($platform));
+
+        return self::PLATFORM_ALIASES[$platform] ?? $platform;
+    }
+
+    /**
+     * @param  list<string>  $fields
+     * @return array<string, int>
+     */
+    private static function w47Summary(array $fields): array
+    {
+        $summary = array_fill_keys(self::W47_CANDIDATE_SCORE_KEYS, 0);
+        $summary['best_score'] = $summary['best_index'] = -1;
+        for ($i = 0, $row = 0, $n = count($fields); $i < $n; $i += 5, $row++) {
+            $summary['total_candidates']++;
+            $query = self::w47Tokens($fields[$i]);
+            $candidate = self::w47Tokens($fields[$i + 1]);
+            if ($query === [] || $candidate === []) {
+                $summary['empty_title_count']++;
+                $title = 0;
+            } elseif ($query === $candidate) {
+                $title = 100;
+            } else {
+                $unique = array_flip($query);
+                $other = array_flip($candidate);
+                $shared = count(array_intersect_key($unique, $other));
+                $title = intdiv(100 * $shared, count($unique) + count($other) - $shared);
+                [$short, $long] = count($query) < count($candidate) ? [$query, $candidate] : [$candidate, $query];
+                if (count($short) < count($long) && array_slice($long, 0, count($short)) === $short) {
+                    $title = min(100, $title + 10);
+                }
+            }
+            $summary['exact_title_count'] += (int) ($title === 100);
+            $adjust = 0;
+            $hint = self::w47Platform($fields[$i + 2]);
+            if ($hint !== '') {
+                $matched = false;
+                foreach (explode(',', $fields[$i + 3]) as $platform) {
+                    $platform = self::w47Platform($platform);
+                    if ($platform !== '' && $platform === $hint) {
+                        $matched = true;
+                        break;
+                    }
+                }
+                $summary['platform_match_count'] += (int) $matched;
+                $summary['platform_mismatch_count'] += (int) ! $matched;
+                $adjust = $matched ? 15 : -10;
+            }
+            foreach (explode(',', str_replace('-', ' ', $fields[$i + 4])) as $genre) {
+                if (isset(self::W47_KNOWN_GENRES[ucwords(trim($genre))])) {
+                    $summary['known_genre_count']++;
+                    break;
+                }
+            }
+            $score = max(0, $title + $adjust);
+            $summary['matched_count'] += (int) ($score >= self::MATCH_THRESHOLD);
+            $summary['score_sum'] += $score;
+            if ($score > $summary['best_score']) {
+                $summary['best_score'] = $score;
+                $summary['best_index'] = $row;
+            }
+            $summary['partial_match_count'] += (int) ($score >= 50);
+            $summary['title_score_sum'] += $title;
+        }
+
+        return $summary;
+    }
+
+    /**
+     * @param  list<string>  $fields
+     * @return array<string, int>|null
+     */
+    private static function w47Call(array $fields): ?array
+    {
+        try {
+            $input = serialize($fields);
+            if (strlen($input) > 16777216) {
+                return null;
+            }
+            self::$w47Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w47', self::W47_FFI_CDEF) ?? false;
+            $ffi = self::$w47Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            // obtainScratch() returns at least the 96 bytes requested.
+            $out = RustPipelineLibrary::obtainScratch($ffi, 96);
+            // @phpstan-ignore method.notFound (Declared by W47_FFI_CDEF.)
+            if ($out === null || $ffi->nntmux_w47_igdb_candidate_score_batch($input, strlen($input), $out, 96) !== 96) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('P*', FFI::string($out, 96));
+            if ($values === false || count($values) !== 12 || count($fields) !== $values[1] * 5) {
+                return null;
+            }
+
+            return array_combine(self::W47_CANDIDATE_SCORE_KEYS, $values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
 }
