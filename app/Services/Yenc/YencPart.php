@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Yenc;
 
+use App\Services\RegexService;
 use App\Support\RustPipelineLibrary;
 use FFI;
 
@@ -214,5 +215,103 @@ final readonly class YencPart
         $value = self::computeNative(6, [$this->name, $this->size, $this->part, $this->begin, $this->end])['value'] ?? null;
 
         return is_array($value) ? $value : null;
+    }
+
+    /** Enabled: paired common/uncommon mean and p99 gains reach 1.5x in all five runs (min 1.75x; see the W46 parity test). */
+    public const bool W461_RUST_FFI_DEFAULT = true;
+
+    public const string W461_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w461_yenc_crc_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private const array W461_SUMMARY_KEYS = ['total_crcs', 'empty_crc_count', 'valid_count', 'padded_count', 'uppercase_count', 'zero_count', 'too_long_count', 'non_hex_count'];
+
+    /**
+     * Readonly classes cannot declare static properties, so the toggle and cached handle live here.
+     *
+     * @return array{use: ?bool, ffi: FFI|false|null}
+     */
+    private static function &w461State(): array
+    {
+        /** @var array{use: ?bool, ffi: FFI|false|null} $state */
+        static $state = ['use' => null, 'ffi' => null];
+
+        return $state;
+    }
+
+    /** Null restores the benchmark default. */
+    public static function useW461RustFfi(?bool $enable = true): void
+    {
+        $state = &self::w461State();
+        $state['use'] = $enable;
+    }
+
+    public static function usesW461RustFfi(): bool
+    {
+        return self::w461State()['use'] ?? self::W461_RUST_FFI_DEFAULT;
+    }
+
+    /** Restores the benchmark default and drops the cached library handle; setUseRustFfi() is untouched. */
+    public static function resetW461RustFfi(): void
+    {
+        $state = &self::w461State();
+        $state = ['use' => null, 'ffi' => null];
+    }
+
+    /**
+     * Summarizes yEnc CRC32 values with normalizeCrc32Php(): valid ones (padded, holding an uppercase digit,
+     * or normalizing to zero) and those too long or not hexadecimal.
+     * Entries come from strings, integers, or the first non-null crc32, pcrc32 array field; other values
+     * (including objects) count as empty entries.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeCrcBatch(array $rows): array
+    {
+        return self::usesW461RustFfi() ? self::summarizeCrcBatchNative($rows) : self::summarizeCrcBatchPhp($rows);
+    }
+
+    /**
+     * Rust summary; falls back to PHP when the library or input frame is unusable.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeCrcBatchNative(array $rows): array
+    {
+        $state = &self::w461State();
+        $values = RegexService::w461Invoke($state['ffi'], self::W461_FFI_CDEF, 'nntmux_w461_yenc_crc_batch', $rows, ['crc32', 'pcrc32'], \count(self::W461_SUMMARY_KEYS));
+
+        return $values === null ? self::summarizeCrcBatchPhp($rows) : array_combine(self::W461_SUMMARY_KEYS, $values);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeCrcBatchPhp(array $rows): array
+    {
+        $summary = array_fill_keys(self::W461_SUMMARY_KEYS, 0);
+        foreach (RegexService::w461Entries($rows, ['crc32', 'pcrc32']) as $crc) {
+            $summary['total_crcs']++;
+            if ($crc === '') {
+                $summary['empty_crc_count']++;
+
+                continue;
+            }
+            $normalized = self::normalizeCrc32Php($crc);
+            if ($normalized === null) {
+                $summary[strlen($crc) > 8 ? 'too_long_count' : 'non_hex_count']++;
+
+                continue;
+            }
+            $summary['valid_count']++;
+            $summary['padded_count'] += (int) (strlen($crc) < 8);
+            $summary['uppercase_count'] += (int) (strpbrk($crc, 'ABCDEF') !== false);
+            $summary['zero_count'] += (int) ($normalized === '00000000');
+        }
+
+        return $summary;
     }
 }
