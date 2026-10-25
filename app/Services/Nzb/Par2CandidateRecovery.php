@@ -363,4 +363,108 @@ final class Par2CandidateRecovery
 
         return ['name_base64' => base64_encode($part->name), 'size' => $part->size, 'part' => $part->part];
     }
+
+    /**
+     * Default for the Wave 42.2 toggle only; it stays false because the paired benchmark in
+     * tests/Unit/RustNzbSourceGuardInstallStagingXmlPar2W42ParityTest.php is below 1.5x.
+     */
+    public const bool W422_RUST_FFI_DEFAULT = false;
+
+    private static ?bool $useW422RustFfi = null;
+
+    public static function useW422RustFfi(bool $enable = true): void
+    {
+        self::$useW422RustFfi = $enable;
+    }
+
+    public static function usesW422RustFfi(): bool
+    {
+        return self::$useW422RustFfi ?? self::W422_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW422RustFfi(): void
+    {
+        self::$useW422RustFfi = null;
+    }
+
+    /**
+     * Walk yEnc part offsets (`begin`, `end`) from decoded offset zero, as validatePartPhp() checks multipart continuity:
+     * invalid unless both are integers, out_of_range unless 1 <= begin <= end <= $size, overlap when begin is at or before
+     * the offset, contiguous (advancing the offset to end) when begin is the next byte, otherwise gap. `missing_bytes` is
+     * max(0, $size) minus the final offset.
+     *
+     * @param  array<array-key, mixed>  $parts
+     * @return array{parts: int, invalid: int, contiguous: int, gaps: int, overlaps: int, out_of_range: int, decoded_offset: int, missing_bytes: int}
+     */
+    public static function summarizePartOffsets(array $parts, int $size): array
+    {
+        return (self::usesW422RustFfi() ? self::summarizePartOffsetsNative($parts, $size) : null)
+            ?? self::summarizePartOffsetsPhp($parts, $size);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $parts
+     * @return array{parts: int, invalid: int, contiguous: int, gaps: int, overlaps: int, out_of_range: int, decoded_offset: int, missing_bytes: int}
+     */
+    public static function summarizePartOffsetsPhp(array $parts, int $size): array
+    {
+        $invalid = $contiguous = $gaps = $overlaps = $outOfRange = $offset = 0;
+        foreach ($parts as $part) {
+            [$valid, $begin, $end] = self::partOffsetFields($part);
+            if ($valid === 0) {
+                $invalid++;
+            } elseif ($begin < 1 || $end < $begin || $end > $size) {
+                $outOfRange++;
+            } elseif ($begin <= $offset) {
+                $overlaps++;
+            } elseif ($begin === $offset + 1) {
+                $contiguous++;
+                $offset = $end;
+            } else {
+                $gaps++;
+            }
+        }
+
+        return ['parts' => \count($parts), 'invalid' => $invalid, 'contiguous' => $contiguous, 'gaps' => $gaps, 'overlaps' => $overlaps,
+            'out_of_range' => $outOfRange, 'decoded_offset' => $offset, 'missing_bytes' => max(0, $size) - $offset];
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $parts
+     * @return array{parts: int, invalid: int, contiguous: int, gaps: int, overlaps: int, out_of_range: int, decoded_offset: int, missing_bytes: int}|null
+     */
+    public static function summarizePartOffsetsNative(array $parts, int $size): ?array
+    {
+        if (\count($parts) * 3 + 1 > NzbSourceGuard::W422_MAX_INPUT / 8) {
+            return null;
+        }
+        $words = [$size];
+        foreach ($parts as $part) {
+            array_push($words, ...self::partOffsetFields($part));
+        }
+        $slots = NzbSourceGuard::evaluateW422Native(4, pack('q*', ...$words), 8);
+        if ($slots === null) {
+            return null;
+        }
+        [$count, $invalid, $contiguous, $gaps, $overlaps, $outOfRange, $offset, $missing] = $slots;
+        if ($count !== \count($parts) || min($slots) < 0 || $invalid + $contiguous + $gaps + $overlaps + $outOfRange !== $count
+            || $offset > max(0, $size) || $missing !== max(0, $size) - $offset) {
+            return null;
+        }
+
+        return ['parts' => $count, 'invalid' => $invalid, 'contiguous' => $contiguous, 'gaps' => $gaps, 'overlaps' => $overlaps,
+            'out_of_range' => $outOfRange, 'decoded_offset' => $offset, 'missing_bytes' => $missing];
+    }
+
+    /** @return array{0|1, int, int} whether begin and end are both integers, then begin and end */
+    private static function partOffsetFields(mixed $part): array
+    {
+        if (! \is_array($part)) {
+            return [0, 0, 0];
+        }
+        $begin = $part['begin'] ?? null;
+        $end = $part['end'] ?? null;
+
+        return \is_int($begin) && \is_int($end) ? [1, $begin, $end] : [0, 0, 0];
+    }
 }
