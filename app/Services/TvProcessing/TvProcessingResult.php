@@ -176,4 +176,180 @@ class TvProcessingResult
     {
         return $status === self::STATUS_MATCHED;
     }
+
+    /**
+     * Wave 47.3 batch outcome aggregation. Stays on PHP: the paired benchmark measured about
+     * 1.2-1.4x, short of the 1.5x gate; useW47ResultRustFfi(true) keeps Rust available for parity.
+     */
+    public const bool W47_RESULT_RUST_FFI_DEFAULT = false;
+
+    public const string W47_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w47_tv_result_aggregate_batch(const char *blob, size_t blob_len, const char *ints, size_t ints_len, size_t count, char *out, size_t out_cap);
+        C;
+
+    /** Status codes reported by w47AggregateBatch(); any other status reports 0. */
+    public const array W47_STATUS_CODES = [
+        self::STATUS_MATCHED => 1,
+        self::STATUS_SEASON_PACK => 2,
+        self::STATUS_EPISODE_MISSING => 3,
+        self::STATUS_NOT_FOUND => 4,
+        self::STATUS_PARSE_FAILED => 5,
+        self::STATUS_TRANSIENT => 6,
+        self::STATUS_SKIPPED => 7,
+        self::STATUS_PENDING => 8,
+    ];
+
+    /** Retry-after values are clamped to [0, 2^31] before aggregation. */
+    public const int W47_MAX_RETRY_AFTER = 1 << 31;
+
+    /** Values written per result, followed by nine status counts and five summary metrics. */
+    public const int W47_FIELDS_PER_RESULT = 2;
+
+    private static ?bool $w47RustFfiOverride = null;
+
+    private static FFI|false|null $w47RustFfiHandle = null;
+
+    /** Null restores W47_RESULT_RUST_FFI_DEFAULT. */
+    public static function useW47ResultRustFfi(?bool $enable = true): void
+    {
+        self::$w47RustFfiOverride = $enable;
+        if ($enable === null) {
+            self::$w47RustFfiHandle = null;
+        }
+    }
+
+    public static function usesW47ResultRustFfi(): bool
+    {
+        return self::$w47RustFfiOverride ?? self::W47_RESULT_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Two values per result: its W47_STATUS_CODES code and the FNV-1a 32 digest of
+     * `status \x1F provider \x1F video id \x1F episode id` (nulls as ''). Then the count of each
+     * code 0-8, matched results with a show, distinct show ids, transient results, and the max
+     * (-1 when none) and sum of the clamped retry-after values.
+     *
+     * @param  list<self>  $results
+     * @return list<int>
+     */
+    public static function w47AggregateBatch(array $results): array
+    {
+        return self::usesW47ResultRustFfi()
+            ? self::w47AggregateBatchNative($results)
+            : self::w47AggregateBatchPhp($results);
+    }
+
+    /**
+     * @param  list<self>  $results
+     * @return list<int>
+     */
+    public static function w47AggregateBatchNative(array $results): array
+    {
+        if (($ffi = self::w47RustFfi()) === null) {
+            return self::w47AggregateBatchPhp($results);
+        }
+        $count = \count($results);
+        $blob = $count === 0 ? '' : implode("\0", array_column($results, 'status'))
+            ."\0".implode("\0", array_column($results, 'providerName'));
+        if ($count > 0 && substr_count($blob, "\0") !== 2 * $count - 1) {
+            return self::w47AggregateBatchPhp($results);
+        }
+        try {
+            $videos = array_column($results, 'videoId');
+            $episodes = array_column($results, 'episodeId');
+            $retries = array_column($results, 'retryAfter');
+            $noVideo = array_keys($videos, null, true);
+            $noEpisode = array_keys($episodes, null, true);
+            $noRetry = array_keys($retries, null, true);
+            $packed = pack(
+                'q*',
+                \count($noVideo),
+                \count($noEpisode),
+                \count($noRetry),
+                ...$videos,
+                ...$episodes,
+                ...$retries,
+                ...array_column($results, 'transient'),
+                ...$noVideo,
+                ...$noEpisode,
+                ...$noRetry,
+            );
+            $bytes = ($count * self::W47_FIELDS_PER_RESULT + 14) * 8;
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, $bytes, $capacity);
+            if ($buffer === null) {
+                return self::w47AggregateBatchPhp($results);
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w47_tv_result_aggregate_batch($blob, \strlen($blob), $packed, \strlen($packed), $count, $buffer, $capacity);
+            if ($written !== $bytes) {
+                return self::w47AggregateBatchPhp($results);
+            }
+            $values = unpack('P*', FFI::string($buffer, $bytes));
+            if ($values === false) {
+                return self::w47AggregateBatchPhp($results);
+            }
+
+            /** @var list<int> */
+            return array_values($values);
+        } catch (Throwable) {
+            return self::w47AggregateBatchPhp($results);
+        }
+    }
+
+    /**
+     * @param  list<self>  $results
+     * @return list<int>
+     */
+    public static function w47AggregateBatchPhp(array $results): array
+    {
+        $out = [];
+        $codes = array_fill(0, 9, 0);
+        $matchedWithShow = 0;
+        $shows = [];
+        $transient = 0;
+        $maxRetry = -1;
+        $retrySum = 0;
+        foreach ($results as $result) {
+            $code = self::W47_STATUS_CODES[$result->status] ?? 0;
+            $codes[$code]++;
+            if ($result->videoId !== null && $result->videoId > 0) {
+                if ($code === 1) {
+                    $matchedWithShow++;
+                }
+                $shows[$result->videoId] = true;
+            }
+            if ($result->transient) {
+                $transient++;
+            }
+            if ($result->retryAfter !== null) {
+                $retry = max(0, min(self::W47_MAX_RETRY_AFTER, $result->retryAfter));
+                $maxRetry = max($maxRetry, $retry);
+                $retrySum += $retry;
+            }
+            $out[] = $code;
+            $out[] = self::w47Fnv($result->status."\x1F".$result->providerName."\x1F".$result->videoId."\x1F".$result->episodeId);
+        }
+        array_push($out, ...$codes);
+        array_push($out, $matchedWithShow, \count($shows), $transient, $maxRetry, $retrySum);
+
+        return $out;
+    }
+
+    private static function w47Fnv(string $bytes): int
+    {
+        /** @var array{1: int} $digest */
+        $digest = unpack('N', hash('fnv1a32', $bytes, true));
+
+        return $digest[1];
+    }
+
+    private static function w47RustFfi(): ?FFI
+    {
+        if (self::$w47RustFfiHandle === null) {
+            self::$w47RustFfiHandle = RustPipelineLibrary::resolveDomain('categorize_w47', self::W47_FFI_CDEF) ?? false;
+        }
+
+        return self::$w47RustFfiHandle === false ? null : self::$w47RustFfiHandle;
+    }
 }
