@@ -7,6 +7,7 @@ namespace App\Services\Predb\Irc;
 use App\Support\RustPipelineLibrary;
 use FFI;
 use InvalidArgumentException;
+use Throwable;
 
 /**
  * Resolves the pre IRC networks in `irc_settings.networks` into connection profiles.
@@ -561,6 +562,201 @@ final class IrcNetworks
             'tls_verify_peer_name' => $tlsVerifyPeerName,
             'channels' => $channels,
             'url' => ($flags & 16) !== 0 ? $segs[5] : null,
+        ];
+    }
+
+    /** Enabled: paired common/uncommon mean and p99 gains clear 1.5x (see the W47 parity test). */
+    public const bool W47_ENDPOINT_RUST_FFI_DEFAULT = true;
+
+    public const string W47_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w47_irc_endpoint_route_batch(const char *input, size_t len, size_t count, char *out, size_t cap);
+        C;
+
+    private const string W47_HOSTNAME = '/^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/D';
+
+    private static ?bool $w47EndpointRustFfi = null;
+
+    private static FFI|false|null $w47Ffi = null;
+
+    /** Null restores the benchmark default; setUseRustFfi() is untouched. */
+    public static function useW47EndpointRustFfi(?bool $enabled = true): void
+    {
+        self::$w47EndpointRustFfi = $enabled;
+    }
+
+    public static function usesW47EndpointRustFfi(): bool
+    {
+        return self::$w47EndpointRustFfi ?? self::W47_ENDPOINT_RUST_FFI_DEFAULT;
+    }
+
+    /** Restores the benchmark default and drops the cached library handle. */
+    public static function resetW47EndpointRustFfi(): void
+    {
+        self::$w47EndpointRustFfi = null;
+        self::$w47Ffi = null;
+    }
+
+    /**
+     * Routes `[irc[s]://]host[:[+]port][/#chan,...]` endpoint specs, two ints per spec: a negative
+     * reason (-1 empty, -2 host, -3 port, -4 bracketed IPv6) and 0, or
+     * `1 | tls << 1 | kind << 2 | port << 8 | valid channels << 24 | invalid channels << 32`
+     * (kind 1 hostname, 2 IPv4, 3 IPv6; counts capped at 255) and the CRC32 of
+     * `strtolower(host).':'.port`. A `+` port prefix or `ircs://` selects TLS (default port 6697).
+     *
+     * @param  list<string>  $endpoints
+     * @return list<int>
+     */
+    public static function routeEndpoints(array $endpoints): array
+    {
+        return self::usesW47EndpointRustFfi() ? self::routeEndpointsNative($endpoints) : self::routeEndpointsPhp($endpoints);
+    }
+
+    /**
+     * @param  list<string>  $endpoints
+     * @return list<int>
+     */
+    public static function routeEndpointsPhp(array $endpoints): array
+    {
+        $out = [];
+        foreach ($endpoints as $spec) {
+            [$out[], $out[]] = self::w47RouteEndpoint($spec);
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rust batch; falls back to PHP when the library is missing or a spec holds a NUL byte.
+     *
+     * @param  list<string>  $endpoints
+     * @return list<int>
+     */
+    public static function routeEndpointsNative(array $endpoints): array
+    {
+        $count = \count($endpoints);
+        if ($count === 0) {
+            return [];
+        }
+        $ffi = self::$w47Ffi instanceof FFI ? self::$w47Ffi : self::w47Ffi();
+        $joined = implode("\0", $endpoints);
+        if ($ffi === null || substr_count($joined, "\0") !== $count - 1) {
+            return self::routeEndpointsPhp($endpoints);
+        }
+        $bytes = $count * 16;
+        try {
+            $cap = 0;
+            $scratch = RustPipelineLibrary::obtainScratch($ffi, $bytes, $cap);
+            if ($scratch === null) {
+                return self::routeEndpointsPhp($endpoints);
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w47_irc_endpoint_route_batch($joined, \strlen($joined), $count, $scratch, $cap);
+            $words = $written === $bytes ? unpack('P*', FFI::string($scratch, $bytes)) : false;
+        } catch (Throwable) {
+            $words = false;
+        }
+
+        /** @var list<int>|null $values */
+        $values = \is_array($words) ? array_values($words) : null;
+
+        return $values ?? self::routeEndpointsPhp($endpoints);
+    }
+
+    private static function w47Ffi(): ?FFI
+    {
+        self::$w47Ffi ??= RustPipelineLibrary::resolveDomain('cleaning_w47', self::W47_FFI_CDEF) ?? false;
+
+        return self::$w47Ffi === false ? null : self::$w47Ffi;
+    }
+
+    /**
+     * @return array{int, int}
+     */
+    private static function w47RouteEndpoint(string $spec): array
+    {
+        $spec = trim($spec);
+        if ($spec === '') {
+            return [-1, 0];
+        }
+        $tls = false;
+        if (strncasecmp($spec, 'ircs://', 7) === 0) {
+            $tls = true;
+            $spec = substr($spec, 7);
+        } elseif (strncasecmp($spec, 'irc://', 6) === 0) {
+            $spec = substr($spec, 6);
+        }
+        $slash = strpos($spec, '/');
+        $authority = $slash === false ? $spec : substr($spec, 0, $slash);
+        $path = $slash === false ? '' : substr($spec, $slash + 1);
+        if ($authority !== '' && $authority[0] === '[') {
+            $close = strpos($authority, ']');
+            if ($close === false) {
+                return [-4, 0];
+            }
+            $host = substr($authority, 1, $close - 1);
+            if (filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6) === false) {
+                return [-4, 0];
+            }
+            $rest = substr($authority, $close + 1);
+            if ($rest === '') {
+                $portText = null;
+            } elseif ($rest[0] === ':') {
+                $portText = substr($rest, 1);
+            } else {
+                return [-3, 0];
+            }
+            $kind = 3;
+        } else {
+            $colon = strpos($authority, ':');
+            $host = $colon === false ? $authority : substr($authority, 0, $colon);
+            $portText = $colon === false ? null : substr($authority, $colon + 1);
+            if ($host === '') {
+                return [-2, 0];
+            }
+            if (strspn($host, '0123456789.') === \strlen($host)) {
+                if (filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) === false) {
+                    return [-2, 0];
+                }
+                $kind = 2;
+            } elseif (preg_match(self::W47_HOSTNAME, $host) === 1) {
+                $kind = 1;
+            } else {
+                return [-2, 0];
+            }
+        }
+        if ($portText === null) {
+            $port = $tls ? 6697 : 6667;
+        } else {
+            if ($portText !== '' && $portText[0] === '+') {
+                $tls = true;
+                $portText = substr($portText, 1);
+            }
+            if ($portText === '' || \strlen($portText) > 5 || ! ctype_digit($portText)) {
+                return [-3, 0];
+            }
+            $port = (int) $portText;
+            if ($port < 1 || $port > 65535) {
+                return [-3, 0];
+            }
+        }
+        $valid = $invalid = 0;
+        if ($path !== '') {
+            foreach (explode(',', $path) as $channel) {
+                if ($channel === '') {
+                    continue;
+                }
+                $length = \strlen($channel);
+                if (($channel[0] === '#' || $channel[0] === '&') && $length >= 2 && $length <= 50 && strcspn($channel, " \x07\r\n\t") === $length) {
+                    $valid++;
+                } else {
+                    $invalid++;
+                }
+            }
+        }
+
+        return [
+            1 | ($tls ? 2 : 0) | $kind << 2 | $port << 8 | min($valid, 255) << 24 | min($invalid, 255) << 32,
+            crc32(strtolower($host).':'.$port),
         ];
     }
 }
