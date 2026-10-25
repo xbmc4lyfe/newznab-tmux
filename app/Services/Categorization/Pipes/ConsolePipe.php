@@ -10,6 +10,7 @@ use App\Services\Categorization\Categorizers\ConsoleCategorizer;
 use App\Services\Categorization\ReleaseContext;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 /**
@@ -415,5 +416,208 @@ class ConsolePipe extends AbstractCategorizationPipe
         }
 
         return self::$w403RustFfiHandle === false ? null : self::$w403RustFfiHandle;
+    }
+
+    /** Wave 54.3 paired benchmarks decide this default; see RustCategorizationPipesConsoleGroupMiscMusicPcW54ParityTest. */
+    private const bool W54_RUST_FFI_DEFAULT = true;
+
+    public const string W54_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w543_console_platform_flag_batch(const char *blob, size_t blob_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Per uppercased token: 2 | category << 16 for a platform, 4 | GAME_OTHER << 16 for a retro platform, 8 region and 32 PC store or OS. */
+    private const array W54_CONSOLE_TOKENS = [
+        'PS4' => 2 | Category::GAME_PS4 << 16, 'PS3' => 2 | Category::GAME_PS3 << 16,
+        'PSVITA' => 2 | Category::GAME_PSVITA << 16, 'VITA' => 2 | Category::GAME_PSVITA << 16,
+        'PSV' => 2 | Category::GAME_PSVITA << 16, 'PSP' => 2 | Category::GAME_PSP << 16,
+        'XBOXONE' => 2 | Category::GAME_XBOXONE << 16, 'XONE' => 2 | Category::GAME_XBOXONE << 16,
+        'XBONE' => 2 | Category::GAME_XBOXONE << 16, 'X360' => 2 | Category::GAME_XBOX360 << 16,
+        'XBOX360' => 2 | Category::GAME_XBOX360 << 16, 'XBOX' => 2 | Category::GAME_XBOX << 16,
+        'WIIU' => 2 | Category::GAME_WIIU << 16, 'WII' => 2 | Category::GAME_WII << 16,
+        '3DS' => 2 | Category::GAME_3DS << 16, 'NDS' => 2 | Category::GAME_NDS << 16,
+        'SWITCH' => 2 | Category::GAME_OTHER << 16, 'NSW' => 2 | Category::GAME_OTHER << 16,
+        'PS5' => 2 | Category::GAME_OTHER << 16, 'SNES' => 4 | Category::GAME_OTHER << 16,
+        'NES' => 4 | Category::GAME_OTHER << 16, 'N64' => 4 | Category::GAME_OTHER << 16,
+        'GBA' => 4 | Category::GAME_OTHER << 16, 'GBC' => 4 | Category::GAME_OTHER << 16,
+        'NGC' => 4 | Category::GAME_OTHER << 16, 'GAMECUBE' => 4 | Category::GAME_OTHER << 16,
+        'PSX' => 4 | Category::GAME_OTHER << 16, 'PS1' => 4 | Category::GAME_OTHER << 16,
+        'PS2' => 4 | Category::GAME_OTHER << 16, 'GENESIS' => 4 | Category::GAME_OTHER << 16,
+        'MEGADRIVE' => 4 | Category::GAME_OTHER << 16,
+        'DREAMCAST' => 4 | Category::GAME_OTHER << 16, 'SATURN' => 4 | Category::GAME_OTHER << 16,
+        'USA' => 8, 'EUR' => 8, 'PAL' => 8, 'NTSC' => 8, 'JPN' => 8, 'JAP' => 8, 'ASIA' => 8,
+        'KOR' => 8, 'REGIONFREE' => 8, 'GOG' => 32, 'STEAM' => 32, 'WIN' => 32, 'WIN32' => 32,
+        'WIN64' => 32, 'WINDOWS' => 32, 'X64' => 32, 'X86' => 32, 'PC' => 32,
+    ];
+
+    public static function usesW54RustFfi(): bool
+    {
+        $override = self::w54RustFfiState();
+
+        return \is_bool($override) ? $override : self::W54_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the Wave 54 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW54RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w54RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w54RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 54.3 console platform flags. Per name `flags | category << 16`, with flags 1 empty (after
+     * trim()), 2 platform, 4 retro platform, 8 region, 16 TV season/episode token (`S\d{1,3}` with an
+     * optional `E\d{1,4}`) and 32 PC store or OS token, and `category` the first platform token's
+     * Category id (0 without one); then the six flag counts and the number of distinct categories.
+     * Tokens are maximal ASCII alphanumeric runs compared case-insensitively.
+     *
+     * @param  array<array-key, string>  $names
+     * @return list<int>
+     */
+    public static function w54ConsolePlatformFlagBatch(array $names): array
+    {
+        return self::usesW54RustFfi() ? self::w54ConsolePlatformFlagBatchNative($names) : self::w54ConsolePlatformFlagBatchPhp($names);
+    }
+
+    /**
+     * @param  array<array-key, string>  $names
+     * @return list<int>
+     */
+    public static function w54ConsolePlatformFlagBatchNative(array $names): array
+    {
+        return self::w54Invoke($names, \count($names) + 7) ?? self::w54ConsolePlatformFlagBatchPhp($names);
+    }
+
+    /**
+     * @param  array<array-key, string>  $names
+     * @return list<int>
+     */
+    public static function w54ConsolePlatformFlagBatchPhp(array $names): array
+    {
+        $out = [];
+        $totals = [0, 0, 0, 0, 0, 0];
+        $seen = [];
+        foreach ($names as $name) {
+            $name = trim((string) $name);
+            if ($name === '') {
+                $word = 1;
+            } else {
+                $flags = 0;
+                $category = 0;
+                foreach (preg_split('/[^A-Za-z0-9]+/', strtoupper($name), -1, PREG_SPLIT_NO_EMPTY) ?: [] as $token) {
+                    $found = self::W54_CONSOLE_TOKENS[$token] ?? 0;
+                    if ($token[0] === 'S' && preg_match('/\AS\d{1,3}(?:E\d{1,4})?\z/', $token) === 1) {
+                        $flags |= 16;
+                    }
+                    $flags |= $found & 0xFFFF;
+                    if ($category === 0) {
+                        $category = $found >> 16;
+                    }
+                }
+                if ($category !== 0) {
+                    $seen[$category] = true;
+                }
+                $word = $flags | ($category << 16);
+            }
+            $totals[0] += $word & 1;
+            $totals[1] += ($word >> 1) & 1;
+            $totals[2] += ($word >> 2) & 1;
+            $totals[3] += ($word >> 3) & 1;
+            $totals[4] += ($word >> 4) & 1;
+            $totals[5] += ($word >> 5) & 1;
+            $out[] = $word;
+        }
+        array_push($out, ...$totals);
+        $out[] = \count($seen);
+
+        return $out;
+    }
+
+    /**
+     * Wave 54 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out'
+     * returns an `int64_t` output buffer of at least $val words.
+     */
+    private static function w54RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('categorize_w54', self::W54_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w54RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 54.3 export with the NUL-joined $items. Null when the library is missing, the
+     * call declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>|null
+     */
+    private static function w54Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w54RustFfiState('ffi');
+            $out = self::w54RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $blob = implode("\0", $items);
+            if (substr_count($blob, "\0") !== max(0, \count($items) - 1)) {
+                // An item holds a NUL byte: substitute a space, which classifies identically (trim() strips both bytes and both split tokens).
+                $blob = implode("\0", str_replace("\0", ' ', $items));
+            }
+            // @phpstan-ignore method.notFound (Declared by W54_FFI_CDEF.)
+            $written = $ffi->nntmux_w543_console_platform_flag_batch($blob, \strlen($blob), \count($items), $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }

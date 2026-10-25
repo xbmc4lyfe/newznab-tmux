@@ -10,6 +10,7 @@ use App\Services\Categorization\Categorizers\MusicCategorizer;
 use App\Services\Categorization\ReleaseContext;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Throwable;
 
 /**
@@ -398,5 +399,195 @@ class MusicPipe extends AbstractCategorizationPipe
         }
 
         return self::$w413RustFfiHandle === false ? null : self::$w413RustFfiHandle;
+    }
+
+    /** Wave 54.3 paired benchmarks decide this default; see RustCategorizationPipesConsoleGroupMiscMusicPcW54ParityTest. */
+    private const bool W54_RUST_FFI_DEFAULT = true;
+
+    public const string W54_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w543_music_audio_flag_batch(const char *blob, size_t blob_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    /** Per uppercased token: 2 lossless, 4 lossy, 8 bitrate/quality, 16 hi-res, 32 compilation and 64 source. */
+    private const array W54_AUDIO_TOKENS = [
+        'FLAC' => 2, 'ALAC' => 2, 'WAV' => 2, 'APE' => 2, 'WV' => 2, 'AIFF' => 2, 'LOSSLESS' => 2,
+        'DSD' => 2 | 16, 'DSF' => 2 | 16, 'MP3' => 4, 'AAC' => 4, 'OGG' => 4, 'OPUS' => 4,
+        'M4A' => 4, 'WMA' => 4, 'VORBIS' => 4, 'CBR' => 8, 'VBR' => 8, 'V0' => 8, 'V1' => 8,
+        'V2' => 8, 'APS' => 8, 'APX' => 8, '24BIT' => 16, '32BIT' => 16, 'HIRES' => 16,
+        '88KHZ' => 16, '96KHZ' => 16, '176KHZ' => 16, '192KHZ' => 16, 'SACD' => 16, 'DSD64' => 16,
+        'DSD128' => 16, 'DISCOGRAPHY' => 32, 'COMPILATION' => 32, 'VA' => 32, 'OST' => 32,
+        'SOUNDTRACK' => 32, 'ANTHOLOGY' => 32, 'COLLECTION' => 32, 'BOXSET' => 32, 'WEB' => 64,
+        'CD' => 64, 'CDDA' => 64, 'CDM' => 64, 'CDS' => 64, 'CDR' => 64, 'VINYL' => 64, 'LP' => 64,
+        'EP' => 64, 'SINGLE' => 64, 'BOOTLEG' => 64, 'VLS' => 64, 'TAPE' => 64, 'CASSETTE' => 64,
+    ];
+
+    public static function usesW54RustFfi(): bool
+    {
+        $override = self::w54RustFfiState();
+
+        return \is_bool($override) ? $override : self::W54_RUST_FFI_DEFAULT;
+    }
+
+    /**
+     * Runs $callback with the Wave 54 Rust path forced on or off, then restores the previous setting.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $callback
+     * @return T
+     */
+    public static function withW54RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::w54RustFfiState('set', $enabled);
+        try {
+            return $callback();
+        } finally {
+            self::w54RustFfiState('set', $previous);
+        }
+    }
+
+    /**
+     * Wave 54.3 audio token flags. Per name `flags | year << 8`, with flags 1 empty (after trim()), 2
+     * lossless, 4 lossy, 8 bitrate/quality (also `\d{2,3}` followed by K, KBPS or KBIT), 16 hi-res,
+     * 32 compilation and 64 source, and `year` the first 19xx/20xx token (0 without one); then the
+     * seven flag counts and the year-tagged count. Tokens are maximal ASCII alphanumeric runs compared
+     * case-insensitively.
+     *
+     * @param  array<array-key, string>  $names
+     * @return list<int>
+     */
+    public static function w54AudioTokenFlagBatch(array $names): array
+    {
+        return self::usesW54RustFfi() ? self::w54AudioTokenFlagBatchNative($names) : self::w54AudioTokenFlagBatchPhp($names);
+    }
+
+    /**
+     * @param  array<array-key, string>  $names
+     * @return list<int>
+     */
+    public static function w54AudioTokenFlagBatchNative(array $names): array
+    {
+        return self::w54Invoke($names, \count($names) + 8) ?? self::w54AudioTokenFlagBatchPhp($names);
+    }
+
+    /**
+     * @param  array<array-key, string>  $names
+     * @return list<int>
+     */
+    public static function w54AudioTokenFlagBatchPhp(array $names): array
+    {
+        $out = [];
+        $totals = [0, 0, 0, 0, 0, 0, 0];
+        $years = 0;
+        foreach ($names as $name) {
+            $name = trim((string) $name);
+            if ($name === '') {
+                $word = 1;
+            } else {
+                $flags = 0;
+                $year = 0;
+                foreach (preg_split('/[^A-Za-z0-9]+/', strtoupper($name), -1, PREG_SPLIT_NO_EMPTY) ?: [] as $token) {
+                    $flags |= self::W54_AUDIO_TOKENS[$token] ?? 0;
+                    if (ctype_digit($token[0]) && preg_match('/\A\d{2,3}(?:K|KBPS|KBIT)\z/', $token) === 1) {
+                        $flags |= 8;
+                    }
+                    if ($year === 0 && \strlen($token) === 4 && ctype_digit($token) && $token >= '1900' && $token < '2100') {
+                        $year = (int) $token;
+                    }
+                }
+                $years += (int) ($year !== 0);
+                $word = $flags | ($year << 8);
+            }
+            $totals[0] += $word & 1;
+            $totals[1] += ($word >> 1) & 1;
+            $totals[2] += ($word >> 2) & 1;
+            $totals[3] += ($word >> 3) & 1;
+            $totals[4] += ($word >> 4) & 1;
+            $totals[5] += ($word >> 5) & 1;
+            $totals[6] += ($word >> 6) & 1;
+            $out[] = $word;
+        }
+        array_push($out, ...$totals);
+        $out[] = $years;
+
+        return $out;
+    }
+
+    /**
+     * Wave 54 state: no $op reads the toggle override, 'set' stores $val (non-bool clears it) and
+     * returns the previous override, 'ffi' resolves the library (null when unavailable) and 'out'
+     * returns an `int64_t` output buffer of at least $val words.
+     */
+    private static function w54RustFfiState(?string $op = null, mixed $val = null): mixed
+    {
+        /** @var bool|null $override */
+        static $override = null;
+        /** @var FFI|false|null $ffi */
+        static $ffi = null;
+        /** @var CData|null $out */
+        static $out = null;
+        /** @var int $outCap */
+        static $outCap = 0;
+
+        if ($op === 'set') {
+            $previous = $override;
+            $override = \is_bool($val) ? $val : null;
+
+            return $previous;
+        }
+        if ($op === 'ffi') {
+            $ffi ??= RustPipelineLibrary::resolveDomain('categorize_w54', self::W54_FFI_CDEF) ?? false;
+
+            return $ffi === false ? null : $ffi;
+        }
+        if ($op === 'out') {
+            $words = \is_int($val) ? $val : 0;
+            if ($out === null || $outCap < $words) {
+                $handle = self::w54RustFfiState('ffi');
+                if (! $handle instanceof FFI) {
+                    return null;
+                }
+                $outCap = max(1024, $words * 2);
+                $out = $handle->new('int64_t['.$outCap.']');
+            }
+
+            return $out;
+        }
+
+        return $override;
+    }
+
+    /**
+     * Calls the Wave 54.3 export with the NUL-joined $items. Null when the library is missing, the
+     * call declines or it writes other than $words words, so the caller falls back to PHP.
+     *
+     * @param  array<array-key, string>  $items
+     * @return list<int>|null
+     */
+    private static function w54Invoke(array $items, int $words): ?array
+    {
+        try {
+            $ffi = self::w54RustFfiState('ffi');
+            $out = self::w54RustFfiState('out', $words);
+            if (! $ffi instanceof FFI || ! $out instanceof CData) {
+                return null;
+            }
+            $blob = implode("\0", $items);
+            if (substr_count($blob, "\0") !== max(0, \count($items) - 1)) {
+                // An item holds a NUL byte: substitute a space, which classifies identically (trim() strips both bytes and both split tokens).
+                $blob = implode("\0", str_replace("\0", ' ', $items));
+            }
+            // @phpstan-ignore method.notFound (Declared by W54_FFI_CDEF.)
+            $written = $ffi->nntmux_w543_music_audio_flag_batch($blob, \strlen($blob), \count($items), $out, $words);
+            if ($written !== $words) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string($out, $words * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }
