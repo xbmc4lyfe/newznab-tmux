@@ -4,6 +4,10 @@ declare(strict_types=1);
 
 namespace App\Services\Binaries;
 
+use App\Support\RustPipelineLibrary;
+use FFI;
+use Throwable;
+
 /**
  * Decides, from a sample of a header range, whether {@see NativePerArticleObfuscation} should mark
  * it or the PHP rule in {@see HeaderParser::markPerArticleObfuscated()} should. Loaded only for
@@ -11,6 +15,24 @@ namespace App\Services\Binaries;
  */
 final class PerArticleObfuscationRouter
 {
+    public const string FFI_CDEF = <<<'C'
+        ssize_t nntmux_w381_obfuscation_gate_router_admin_names(uint32_t operation, uint32_t flags, const char *input, size_t input_len, char *out_buf, size_t out_cap);
+        C;
+
+    /**
+     * Rust is the default for summarizeSampleCosts(): the paired benchmark in
+     * tests/Unit/RustObfuscationGateRouterAdminNamesParityTest.php measured 2.10-2.13x common mean,
+     * 1.79-2.13x common p99 and 10.4-11.1x uncommon p99, above the 1.5x rule. The routing decision in
+     * worthNativeMarking() stays on PHP, so a range routed to PHP still never loads the library.
+     */
+    public const bool RUST_FFI_DEFAULT = true;
+
+    private const int RUST_MAX_INPUT = 16_777_216;
+
+    private static ?bool $useRustFfi = null;
+
+    private static FFI|false|null $ffi = null;
+
     /** Headers sampled to decide whether a range is worth marshalling to Rust: one in 128, 32 to 128. */
     private const int SAMPLE_MIN = 32;
 
@@ -138,5 +160,136 @@ final class PerArticleObfuscationRouter
         }
 
         return false;
+    }
+
+    /**
+     * Prices sampled subjects the way {@see worthNativeMarking()} does: per-class counts, the
+     * summed PHP and Rust cost predictions from COSTS, the longest subject, whether the prediction
+     * reaches PREDICTED_SPEEDUP_PERCENT and whether every subject is within MAX_SUBJECT_LENGTH.
+     *
+     * @param  array<array-key, mixed>  $subjects
+     * @return array{no_part_count: int, part_count: int, candidates: int, php_ns: int, rust_ns: int, max_length: int, predicts_speedup: bool, within_subject_limit: bool}
+     */
+    public static function summarizeSampleCosts(array $subjects): array
+    {
+        return (self::usesRustFfi() ? self::summarizeSampleCostsNative($subjects) : null) ?? self::summarizeSampleCostsPhp($subjects);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $subjects
+     * @return array{no_part_count: int, part_count: int, candidates: int, php_ns: int, rust_ns: int, max_length: int, predicts_speedup: bool, within_subject_limit: bool}
+     */
+    private static function summarizeSampleCostsPhp(array $subjects): array
+    {
+        $classes = [0, 0, 0];
+        $php = $rust = $maxLength = 0;
+        foreach ($subjects as $subject) {
+            $class = self::classifySample($subject);
+            $bytes = is_string($subject) ? strlen($subject) : 0;
+            [$phpBase, $phpPerByte, $rustBase, $rustPerByte] = self::COSTS[$class];
+            $classes[$class]++;
+            $php += $phpBase + intdiv($phpPerByte * $bytes, 10);
+            $rust += $rustBase + intdiv($rustPerByte * $bytes, 10);
+            $maxLength = max($maxLength, $bytes);
+        }
+
+        return ['no_part_count' => $classes[0], 'part_count' => $classes[1], 'candidates' => $classes[2], 'php_ns' => $php, 'rust_ns' => $rust,
+            'max_length' => $maxLength, 'predicts_speedup' => $php * 100 >= $rust * self::PREDICTED_SPEEDUP_PERCENT,
+            'within_subject_limit' => $maxLength <= self::MAX_SUBJECT_LENGTH];
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $subjects
+     * @return array{no_part_count: int, part_count: int, candidates: int, php_ns: int, rust_ns: int, max_length: int, predicts_speedup: bool, within_subject_limit: bool}|null
+     */
+    private static function summarizeSampleCostsNative(array $subjects): ?array
+    {
+        $input = pack('q', count($subjects));
+        foreach ($subjects as $subject) {
+            $input .= is_string($subject) ? self::packRustString($subject) : pack('q', -1);
+        }
+        $fields = self::unpackRustInts(self::callRustFfi(2, 0, $input), 8);
+        if ($fields === null || ($fields[6] | $fields[7]) & ~1) {
+            return null;
+        }
+
+        return ['no_part_count' => $fields[0], 'part_count' => $fields[1], 'candidates' => $fields[2], 'php_ns' => $fields[3], 'rust_ns' => $fields[4],
+            'max_length' => $fields[5], 'predicts_speedup' => $fields[6] === 1, 'within_subject_limit' => $fields[7] === 1];
+    }
+
+    public static function useRustFfi(?bool $enabled): void
+    {
+        self::$useRustFfi = $enabled;
+    }
+
+    public static function usesRustFfi(): bool
+    {
+        return self::$useRustFfi ?? self::RUST_FFI_DEFAULT;
+    }
+
+    public static function resetRustFfi(): void
+    {
+        self::$useRustFfi = null;
+        self::$ffi = null;
+    }
+
+    private static function packRustString(string $value): string
+    {
+        return pack('q', strlen($value)).$value;
+    }
+
+    /**
+     * @return list<int>|null
+     */
+    private static function unpackRustInts(?string $bytes, int $count): ?array
+    {
+        if ($bytes === null || strlen($bytes) !== $count * 8) {
+            return null;
+        }
+        $values = unpack('q*', $bytes);
+
+        return $values === false ? null : array_values($values);
+    }
+
+    /**
+     * Calls the Wave 38.1 export, retrying once with a larger scratch buffer when it reports `-required`.
+     */
+    private static function callRustFfi(int $operation, int $flags, string $input): ?string
+    {
+        if (strlen($input) > self::RUST_MAX_INPUT) {
+            return null;
+        }
+        try {
+            self::$ffi ??= RustPipelineLibrary::resolveDomain('cleaning_w381', self::FFI_CDEF) ?? false;
+            if (self::$ffi === false) {
+                return null;
+            }
+            $ffi = self::$ffi;
+            $capacity = 0;
+            $buffer = RustPipelineLibrary::obtainScratch($ffi, strlen($input) + 256, $capacity);
+            if ($buffer === null) {
+                return null;
+            }
+            // @phpstan-ignore method.notFound
+            $written = $ffi->nntmux_w381_obfuscation_gate_router_admin_names($operation, $flags, $input, strlen($input), $buffer, $capacity);
+            if (is_int($written) && $written < -1) {
+                if (-$written <= $capacity || -$written > self::RUST_MAX_INPUT) {
+                    return null;
+                }
+                $buffer = RustPipelineLibrary::obtainScratch($ffi, -$written, $capacity);
+                if ($buffer === null) {
+                    return null;
+                }
+                // @phpstan-ignore method.notFound
+                $written = $ffi->nntmux_w381_obfuscation_gate_router_admin_names($operation, $flags, $input, strlen($input), $buffer, $capacity);
+            }
+            if (! is_int($written) || $written < 0 || $written > $capacity) {
+                return null;
+            }
+
+            return FFI::string($buffer, $written);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }
