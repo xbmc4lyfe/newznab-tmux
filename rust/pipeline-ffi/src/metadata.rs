@@ -46453,3 +46453,876 @@ mod w47_tests {
         }
     }
 }
+/// Wave 48.4: IGDB model attribute, company role, game quality, platform family and
+/// movie browse facet batch summaries.
+///
+/// Every export reads one PHP `serialize(list<string|int>)` frame holding a fixed number
+/// of fields per row and writes twelve little-endian `int64_t` values.
+pub mod w484_metadata {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const MAX_INPUT: usize = 16 * 1024 * 1024;
+
+    pub const COUNTS: usize = 12;
+
+    pub const OUTPUT_BYTES: usize = COUNTS * 8;
+
+    type Counts = [i64; COUNTS];
+
+    unsafe fn dispatch(
+        input: *const u8,
+        len: usize,
+        out: *mut u8,
+        cap: usize,
+        summarize: fn(&[u8]) -> Option<Counts>,
+    ) -> isize {
+        catch_unwind(AssertUnwindSafe(|| {
+            if input.is_null()
+                || out.is_null()
+                || len > MAX_INPUT
+                || len > isize::MAX as usize
+                || cap > isize::MAX as usize
+            {
+                return -1;
+            }
+            let Some(input_end) = (input as usize).checked_add(len) else {
+                return -1;
+            };
+            let Some(out_end) = (out as usize).checked_add(cap) else {
+                return -1;
+            };
+            if len != 0 && cap != 0 && (input as usize) < out_end && (out as usize) < input_end {
+                return -1;
+            }
+            // Both spans and their overlap are checked before borrowing caller memory.
+            let input = unsafe { std::slice::from_raw_parts(input, len) };
+            let Some(counts) = summarize(input) else {
+                return -1;
+            };
+            if cap < OUTPUT_BYTES {
+                return -(OUTPUT_BYTES as isize);
+            }
+            let mut bytes = [0u8; OUTPUT_BYTES];
+            for (chunk, count) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(counts) {
+                chunk.copy_from_slice(&count.to_le_bytes());
+            }
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, OUTPUT_BYTES) };
+            OUTPUT_BYTES as isize
+        }))
+        .unwrap_or(-1)
+    }
+
+    /// Canonical decimal (`0` or no leading zero) of at most 18 digits, then `term`.
+    fn number(input: &[u8], at: &mut usize, term: u8) -> Option<usize> {
+        let digits = input
+            .get(*at..)?
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        if digits == 0 || digits > 18 || (digits > 1 && input[*at] == b'0') {
+            return None;
+        }
+        let value = input[*at..*at + digits]
+            .iter()
+            .fold(0usize, |n, b| n * 10 + usize::from(b - b'0'));
+        *at += digits;
+        (input.get(*at) == Some(&term)).then(|| *at += 1)?;
+        Some(value)
+    }
+
+    fn literal(input: &[u8], at: &mut usize, lit: &[u8]) -> Option<()> {
+        (input.get(*at..*at + lit.len())? == lit).then(|| *at += lit.len())
+    }
+
+    /// Canonical PHP integer text (`0`, or an optional `-` and up to 19 digits without a
+    /// leading zero) ending at `;`; returns the text, which is what `(string)` yields.
+    fn integer<'a>(input: &'a [u8], at: &mut usize) -> Option<&'a [u8]> {
+        let start = *at;
+        let sign = usize::from(input.get(start) == Some(&b'-'));
+        let digits = input
+            .get(start + sign..)?
+            .iter()
+            .take_while(|b| b.is_ascii_digit())
+            .count();
+        let first = *input.get(start + sign)?;
+        if digits == 0 || digits > 19 || (first == b'0' && (digits > 1 || sign == 1)) {
+            return None;
+        }
+        let end = start + sign + digits;
+        (input.get(end) == Some(&b';')).then(|| *at = end + 1)?;
+        Some(&input[start..end])
+    }
+
+    /// Streams PHP `serialize(list<string|int>)` and hands every `STRIDE` consecutive
+    /// entries to `row`; slot 0 counts rows. Integer entries arrive as their decimal
+    /// text, so PHP need not cast them first.
+    fn summarize<'a, const STRIDE: usize, S>(
+        input: &'a [u8],
+        init: Counts,
+        state: &mut S,
+        row: fn(&[&'a [u8]; STRIDE], &mut Counts, &mut S),
+    ) -> Option<Counts> {
+        let mut at = 0;
+        literal(input, &mut at, b"a:")?;
+        let entries = number(input, &mut at, b':')?;
+        literal(input, &mut at, b"{")?;
+        // Every entry needs at least `i:K;i:0;` (8 bytes).
+        if entries > input.len() / 8 || entries % STRIDE != 0 {
+            return None;
+        }
+        let mut counts = init;
+        let mut fields: [&'a [u8]; STRIDE] = [b""; STRIDE];
+        for index in 0..entries {
+            literal(input, &mut at, b"i:")?;
+            if number(input, &mut at, b';')? != index {
+                return None;
+            }
+            let entry = if input.get(at..at + 2) == Some(b"i:") {
+                at += 2;
+                integer(input, &mut at)?
+            } else {
+                literal(input, &mut at, b"s:")?;
+                let len = number(input, &mut at, b':')?;
+                literal(input, &mut at, b"\"")?;
+                let entry = input.get(at..at.checked_add(len)?)?;
+                at += len;
+                literal(input, &mut at, b"\";")?;
+                entry
+            };
+            fields[index % STRIDE] = entry;
+            if index % STRIDE == STRIDE - 1 {
+                counts[0] += 1;
+                row(&fields, &mut counts, state);
+            }
+        }
+        literal(input, &mut at, b"}")?;
+        (at == input.len()).then_some(counts)
+    }
+
+    /// PHP trim() default set: space, tab, LF, CR, NUL and vertical tab.
+    #[inline(always)]
+    fn is_trim(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b)
+    }
+
+    /// The default set plus form feed, as the IGDB model record helpers trim.
+    #[inline(always)]
+    fn is_space(b: u8) -> bool {
+        is_trim(b) || b == 0x0c
+    }
+
+    fn trim_by(value: &[u8], strip: fn(u8) -> bool) -> &[u8] {
+        let start = value.iter().position(|b| !strip(*b)).unwrap_or(value.len());
+        let end = value
+            .iter()
+            .rposition(|b| !strip(*b))
+            .map_or(start, |i| i + 1);
+        &value[start..end]
+    }
+
+    #[inline(always)]
+    fn mark(counts: &mut Counts, slot: usize, matched: bool) {
+        counts[slot] += i64::from(matched);
+    }
+
+    /// `strlen in 1..=max_digits && ctype_digit()`, as an integer.
+    fn digits(value: &[u8], max_digits: usize) -> Option<i64> {
+        if value.is_empty() || value.len() > max_digits || !value.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        Some(value.iter().fold(0i64, |n, b| n * 10 + i64::from(b - b'0')))
+    }
+
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
+        for b in bytes {
+            hash ^= u64::from(*b);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash
+    }
+
+    /// Appends `bytes` and a newline to the digest held in `slot`.
+    fn digest(counts: &mut Counts, slot: usize, bytes: &[u8]) {
+        counts[slot] = fnv1a(fnv1a(counts[slot] as u64, bytes), b"\n") as i64;
+    }
+
+    /// Splits on `sep`, trims every token with `strip` and skips empty tokens.
+    fn tokens(
+        value: &[u8],
+        sep: fn(&u8) -> bool,
+        strip: fn(u8) -> bool,
+    ) -> impl Iterator<Item = &[u8]> {
+        value
+            .split(sep)
+            .map(move |token| trim_by(token, strip))
+            .filter(|token| !token.is_empty())
+    }
+
+    // BaseModel: [attribute key, value type tag, value text] triples.
+
+    /// BaseModel::normalizeAttributeKeyPhp(): separators collapse to one `_`, an upper
+    /// case byte after a lower case byte or digit (or starting a capitalized word after
+    /// an upper case run) opens a new word, and trailing `_` are dropped.
+    fn normalize_key(key: &[u8], out: &mut Vec<u8>) {
+        out.clear();
+        let key = trim_by(key, is_trim);
+        for (i, &ch) in key.iter().enumerate() {
+            if matches!(ch, b'_' | b'-' | b'.' | b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b) {
+                if out.last().is_some_and(|b| *b != b'_') {
+                    out.push(b'_');
+                }
+                continue;
+            }
+            if ch.is_ascii_uppercase() {
+                let prev = i.checked_sub(1).map(|p| key[p]);
+                let after_lower = prev.is_some_and(|p| p.is_ascii_lowercase() || p.is_ascii_digit());
+                let word_start = prev.is_some_and(|p| p.is_ascii_uppercase())
+                    && key.get(i + 1).is_some_and(u8::is_ascii_lowercase);
+                if (after_lower || word_start) && out.last().is_some_and(|b| *b != b'_') {
+                    out.push(b'_');
+                }
+                out.push(ch.to_ascii_lowercase());
+            } else {
+                out.push(ch);
+            }
+        }
+        while out.last() == Some(&b'_') {
+            out.pop();
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Kind {
+        Date,
+        Relation,
+        Text,
+        Number,
+    }
+
+    fn attribute_kind(key: &[u8]) -> Option<Kind> {
+        Some(match key {
+            b"created_at" | b"updated_at" | b"change_date" | b"start_date" | b"published_at"
+            | b"first_release_date" => Kind::Date,
+            b"cover" | b"platforms" | b"platform" | b"genres" | b"themes" | b"game_modes"
+            | b"involved_companies" | b"company" | b"game" | b"franchises" | b"collection"
+            | b"artworks" | b"screenshots" | b"similar_games" | b"websites" | b"age_ratings"
+            | b"alternative_names" | b"release_dates" | b"parent_game" | b"developed"
+            | b"published" | b"logo" | b"platform_family" | b"versions" => Kind::Relation,
+            b"name" | b"slug" | b"summary" | b"storyline" | b"url" | b"checksum"
+            | b"abbreviation" | b"alternative_name" | b"description" | b"image_id" => Kind::Text,
+            b"id" | b"rating" | b"aggregated_rating" | b"total_rating" | b"rating_count"
+            | b"category" | b"status" | b"generation" | b"country" | b"popularity" => {
+                Kind::Number
+            }
+            _ => return None,
+        })
+    }
+
+    /// Optional `+`, then 1-12 digits with a positive value.
+    fn relation_id(token: &[u8]) -> Option<i64> {
+        let token = trim_by(token, is_trim);
+        let token = token.strip_prefix(b"+").unwrap_or(token);
+        digits(token, 12).filter(|id| *id > 0)
+    }
+
+    #[derive(Default)]
+    struct Attributes {
+        key: Vec<u8>,
+        ids: Vec<i64>,
+    }
+
+    fn model_attribute(f: &[&[u8]; 3], c: &mut Counts, s: &mut Attributes) {
+        normalize_key(f[0], &mut s.key);
+        let key = s.key.as_slice();
+        if key.is_empty() {
+            c[1] += 1;
+            return;
+        }
+        mark(c, 2, key != f[0]);
+        digest(c, 10, key);
+        let (tag, text) = (f[1], f[2]);
+        // extractIdentifierPhp()-style coercion: an int, or a signed 1-18 digit string.
+        let coercible = match tag {
+            b"i" => true,
+            b"s" => {
+                let t = trim_by(text, is_trim);
+                let t = t.strip_prefix(b"+").or_else(|| t.strip_prefix(b"-")).unwrap_or(t);
+                digits(t, 18).is_some()
+            }
+            _ => false,
+        };
+        mark(c, 5, coercible);
+        let Some(kind) = attribute_kind(key) else {
+            return;
+        };
+        if let [t] = tag
+            && b"ifsbnlmo".contains(t)
+        {
+            let accepted: &[u8] = match kind {
+                Kind::Date => b"i",
+                Kind::Relation => b"ilm",
+                Kind::Text => b"s",
+                Kind::Number => b"if",
+            };
+            mark(c, 9, !accepted.contains(t));
+        }
+        match kind {
+            Kind::Date => {
+                c[3] += 1;
+                let castable = matches!(tag, b"i" | b"s") && digits(text, 10).is_some_and(|v| v > 0);
+                mark(c, 4, castable);
+            }
+            Kind::Relation => {
+                c[6] += 1;
+                s.ids.clear();
+                match tag {
+                    b"i" | b"s" | b"m" => s.ids.extend(relation_id(text)),
+                    b"l" => s.ids.extend(text.split(|b| *b == b',').filter_map(relation_id)),
+                    _ => {}
+                }
+                s.ids.sort_unstable();
+                s.ids.dedup();
+                let unique = s.ids.len() as i64;
+                c[7] += unique;
+                c[8] += s.ids.iter().sum::<i64>();
+                c[11] = c[11].max(unique);
+            }
+            _ => {}
+        }
+    }
+
+    fn model_attribute_batch(input: &[u8]) -> Option<Counts> {
+        let mut init = [0; COUNTS];
+        init[10] = FNV_OFFSET as i64;
+        summarize::<3, _>(input, init, &mut Attributes::default(), model_attribute)
+    }
+
+    // Company: [name, slug, role bits, country] rows.
+
+    /// trim() with form feed, then whitespace runs collapsed to one space.
+    fn collapse(value: &[u8], out: &mut Vec<u8>) {
+        out.clear();
+        let mut space = false;
+        for &b in trim_by(value, is_space) {
+            if is_space(b) {
+                space = true;
+            } else {
+                if space {
+                    out.push(b' ');
+                    space = false;
+                }
+                out.push(b);
+            }
+        }
+    }
+
+    /// `trim(preg_replace('/[^a-z0-9]+/', '-', strtolower($value)), '-')`.
+    fn slugify(value: &[u8], out: &mut Vec<u8>) {
+        out.clear();
+        let mut dash = false;
+        for &b in value {
+            let b = b.to_ascii_lowercase();
+            if b.is_ascii_lowercase() || b.is_ascii_digit() {
+                if dash && !out.is_empty() {
+                    out.push(b'-');
+                }
+                dash = false;
+                out.push(b);
+            } else {
+                dash = true;
+            }
+        }
+    }
+
+    const COMPANY_SUFFIXES: [&[u8]; 16] = [
+        b"ab", b"ag", b"bv", b"co", b"corp", b"corporation", b"gmbh", b"inc", b"kk", b"limited",
+        b"llc", b"ltd", b"oy", b"plc", b"sa", b"srl",
+    ];
+
+    const KNOWN_PUBLISHERS: [&[u8]; 16] = [
+        b"activision",
+        b"bandai-namco",
+        b"bethesda",
+        b"capcom",
+        b"devolver",
+        b"electronic-arts",
+        b"konami",
+        b"microsoft",
+        b"nintendo",
+        b"sega",
+        b"sony",
+        b"square-enix",
+        b"take-two",
+        b"thq",
+        b"ubisoft",
+        b"warner-bros",
+    ];
+
+    #[derive(Default)]
+    struct Company {
+        name: Vec<u8>,
+        slug: Vec<u8>,
+    }
+
+    fn company_role(f: &[&[u8]; 4], c: &mut Counts, s: &mut Company) {
+        collapse(f[0], &mut s.name);
+        if s.name.is_empty() {
+            c[1] += 1;
+        } else {
+            slugify(&s.name, &mut s.slug);
+            let given = trim_by(f[1], is_space);
+            mark(c, 7, !given.is_empty() && given.eq_ignore_ascii_case(&s.slug));
+            // Drop trailing corporate suffix segments while another segment remains.
+            let mut canonical = s.slug.as_slice();
+            let mut stripped = false;
+            while let Some(dash) = canonical.iter().rposition(|b| *b == b'-') {
+                if !COMPANY_SUFFIXES.contains(&&canonical[dash + 1..]) {
+                    break;
+                }
+                canonical = &canonical[..dash];
+                stripped = true;
+            }
+            mark(c, 8, stripped);
+            mark(
+                c,
+                9,
+                KNOWN_PUBLISHERS.iter().any(|k| {
+                    canonical.starts_with(k)
+                        && (canonical.len() == k.len() || canonical[k.len()] == b'-')
+                }),
+            );
+            if !canonical.is_empty() {
+                digest(c, 11, canonical);
+            }
+        }
+        let roles = digits(f[2], 2).unwrap_or(0) & 15;
+        mark(c, 2, roles & 1 != 0);
+        mark(c, 3, roles & 2 != 0);
+        mark(c, 4, roles & 3 == 3);
+        mark(c, 5, roles & 3 == 0 && roles & 12 != 0);
+        mark(c, 6, roles == 0);
+        mark(c, 10, digits(f[3], 3).is_some_and(|v| v >= 1));
+    }
+
+    fn company_role_batch(input: &[u8]) -> Option<Counts> {
+        let mut init = [0; COUNTS];
+        init[11] = FNV_OFFSET as i64;
+        summarize::<4, _>(input, init, &mut Company::default(), company_role)
+    }
+
+    // Game: [name, summary, storyline, rating x100, release timestamp, genres,
+    // platforms, rating count] rows.
+
+    fn words(value: &[u8]) -> i64 {
+        value
+            .split(|b| is_space(*b))
+            .filter(|w| !w.is_empty())
+            .count() as i64
+    }
+
+    /// Unique comma-separated tokens after trim() with form feed, ignoring ASCII case.
+    fn unique_tokens<'a>(value: &'a [u8], seen: &mut Vec<&'a [u8]>) -> i64 {
+        seen.clear();
+        for token in tokens(value, |b| *b == b',', is_space) {
+            if !seen.iter().any(|t| t.eq_ignore_ascii_case(token)) {
+                seen.push(token);
+            }
+        }
+        seen.len() as i64
+    }
+
+    /// Proleptic Gregorian year of a non-negative Unix timestamp.
+    fn year_of(timestamp: i64) -> i64 {
+        let z = timestamp / 86_400 + 719_468;
+        let era = z / 146_097;
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        yoe + era * 400 + i64::from(mp >= 10)
+    }
+
+    fn game_quality<'a>(f: &[&'a [u8]; 8], c: &mut Counts, seen: &mut Vec<&'a [u8]>) {
+        let named = !trim_by(f[0], is_space).is_empty();
+        mark(c, 1, !named);
+        let summary_words = words(f[1]);
+        let story_words = words(f[2]);
+        mark(c, 2, summary_words > 0);
+        mark(c, 3, story_words > 0);
+        let html = f[1]
+            .windows(2)
+            .any(|w| w[0] == b'<' && (w[1].is_ascii_alphabetic() || matches!(w[1], b'/' | b'!')));
+        mark(c, 4, html);
+        let rating = {
+            let r = f[3];
+            let (negative, body) = r.strip_prefix(b"-").map_or((false, r), |b| (true, b));
+            digits(body, 7)
+                .map(|v| if negative { -v } else { v })
+                .filter(|v| (0..=10_000).contains(v))
+        };
+        mark(c, 5, rating.is_some());
+        let year = digits(f[4], 10)
+            .filter(|t| *t <= 4_102_444_799)
+            .map(year_of);
+        mark(c, 6, year.is_some());
+        let genres = unique_tokens(f[5], seen);
+        let platforms = unique_tokens(f[6], seen);
+        c[7] += genres;
+        c[8] += platforms;
+        let rating_count = digits(f[7], 9).unwrap_or(0);
+        let quality = if named { 10 } else { 0 }
+            + summary_words.min(200) / 10
+            + if story_words > 0 { 10 } else { 0 }
+            + rating.map_or(0, |r| r / 500)
+            + if year.is_some() { 10 } else { 0 }
+            + genres.min(4) * 5
+            + platforms.min(5) * 4
+            + if rating_count >= 10 { 5 } else { 0 }
+            - if html { 5 } else { 0 };
+        c[9] += quality;
+        c[10] = c[10].max(quality);
+        c[11] += year.unwrap_or(0);
+    }
+
+    fn game_quality_batch(input: &[u8]) -> Option<Counts> {
+        let mut init = [0; COUNTS];
+        init[10] = -1;
+        summarize::<8, _>(input, init, &mut Vec::new(), game_quality)
+    }
+
+    // Platform: [name, abbreviation, alternative name, category, generation] rows.
+
+    const FAMILY_SONY: i64 = 1;
+    const FAMILY_MICROSOFT: i64 = 2;
+    const FAMILY_NINTENDO: i64 = 3;
+    const FAMILY_SEGA: i64 = 4;
+    const FAMILY_PC: i64 = 5;
+    const FAMILY_MOBILE: i64 = 6;
+
+    /// Lower case `[a-z0-9]` alias key -> (family, generation, handheld).
+    fn platform_alias(key: &[u8]) -> Option<(i64, i64, bool)> {
+        Some(match key {
+            b"ps1" | b"psx" | b"playstation" => (FAMILY_SONY, 5, false),
+            b"ps2" | b"playstation2" => (FAMILY_SONY, 6, false),
+            b"ps3" | b"playstation3" => (FAMILY_SONY, 7, false),
+            b"ps4" | b"playstation4" => (FAMILY_SONY, 8, false),
+            b"ps5" | b"playstation5" => (FAMILY_SONY, 9, false),
+            b"psp" | b"playstationportable" => (FAMILY_SONY, 7, true),
+            b"vita" | b"psvita" | b"playstationvita" => (FAMILY_SONY, 8, true),
+            b"xbox" => (FAMILY_MICROSOFT, 6, false),
+            b"x360" | b"xbox360" => (FAMILY_MICROSOFT, 7, false),
+            b"xone" | b"xboxone" | b"xb1" => (FAMILY_MICROSOFT, 8, false),
+            b"xsx" | b"xboxseriesx" | b"xboxseriesxs" => (FAMILY_MICROSOFT, 9, false),
+            b"nes" | b"famicom" | b"nintendoentertainmentsystem" => (FAMILY_NINTENDO, 3, false),
+            b"snes" | b"supernintendo" | b"supernintendoentertainmentsystem" | b"superfamicom" => {
+                (FAMILY_NINTENDO, 4, false)
+            }
+            b"n64" | b"nintendo64" => (FAMILY_NINTENDO, 5, false),
+            b"gc" | b"ngc" | b"gamecube" | b"nintendogamecube" => (FAMILY_NINTENDO, 6, false),
+            b"wii" => (FAMILY_NINTENDO, 7, false),
+            b"wiiu" => (FAMILY_NINTENDO, 8, false),
+            b"switch" | b"nintendoswitch" | b"ns" => (FAMILY_NINTENDO, 8, true),
+            b"gb" | b"gameboy" => (FAMILY_NINTENDO, 4, true),
+            b"gba" | b"gameboyadvance" => (FAMILY_NINTENDO, 6, true),
+            b"ds" | b"nds" | b"nintendods" => (FAMILY_NINTENDO, 7, true),
+            b"3ds" | b"nintendo3ds" => (FAMILY_NINTENDO, 8, true),
+            b"sms" | b"mastersystem" | b"segamastersystem" => (FAMILY_SEGA, 3, false),
+            b"md" | b"genesis" | b"megadrive" | b"segagenesis" | b"segamegadrive" => {
+                (FAMILY_SEGA, 4, false)
+            }
+            b"saturn" | b"segasaturn" => (FAMILY_SEGA, 5, false),
+            b"dc" | b"dreamcast" | b"segadreamcast" => (FAMILY_SEGA, 6, false),
+            b"gg" | b"gamegear" | b"segagamegear" => (FAMILY_SEGA, 4, true),
+            b"pc" | b"win" | b"windows" | b"pcmicrosoftwindows" | b"mac" | b"macos" | b"linux"
+            | b"dos" => (FAMILY_PC, 0, false),
+            b"ios" | b"android" | b"iphone" | b"ipad" => (FAMILY_MOBILE, 0, true),
+            _ => return None,
+        })
+    }
+
+    /// Longest alias key; longer normalized keys cannot match.
+    const ALIAS_KEY_MAX: usize = 32;
+
+    /// `preg_replace('/[^a-z0-9]+/', '', strtolower($value))`, looked up in the alias table.
+    fn alias_of(value: &[u8]) -> Option<(i64, i64, bool)> {
+        let mut key = [0u8; ALIAS_KEY_MAX];
+        let mut len = 0;
+        for &b in value {
+            let b = b.to_ascii_lowercase();
+            if b.is_ascii_lowercase() || b.is_ascii_digit() {
+                if len == ALIAS_KEY_MAX {
+                    return None;
+                }
+                key[len] = b;
+                len += 1;
+            }
+        }
+        platform_alias(&key[..len])
+    }
+
+    fn platform_family(f: &[&[u8]; 5], c: &mut Counts, _s: &mut ()) {
+        let alias = alias_of(f[1])
+            .or_else(|| alias_of(f[0]))
+            .or_else(|| alias_of(f[2]));
+        match alias {
+            Some((family, _, _)) => c[family as usize] += 1,
+            None => c[7] += 1,
+        }
+        let category = digits(f[3], 2).unwrap_or(0);
+        mark(c, 8, category == 5 || alias.is_some_and(|a| a.2));
+        let generation = digits(f[4], 2).unwrap_or(0);
+        if let Some((_, derived, _)) = alias {
+            if derived > 0 && generation > 0 {
+                mark(c, 9, derived == generation);
+                mark(c, 10, derived != generation);
+            }
+            c[11] += derived;
+        }
+    }
+
+    fn platform_family_batch(input: &[u8]) -> Option<Counts> {
+        summarize::<5, _>(input, [0; COUNTS], &mut (), platform_family)
+    }
+
+    // MovieBrowseService: [imdbid, tmdbid, title, year, rating, genre] rows.
+
+    /// MovieBrowseService::getGenres(), lower-cased; bit i of a genre mask.
+    const MOVIE_GENRES: [&[u8]; 26] = [
+        b"action",
+        b"adventure",
+        b"animation",
+        b"biography",
+        b"comedy",
+        b"crime",
+        b"documentary",
+        b"drama",
+        b"family",
+        b"fantasy",
+        b"film-noir",
+        b"game-show",
+        b"history",
+        b"horror",
+        b"music",
+        b"musical",
+        b"mystery",
+        b"news",
+        b"reality-tv",
+        b"romance",
+        b"sci-fi",
+        b"sport",
+        b"talk-show",
+        b"thriller",
+        b"war",
+        b"western",
+    ];
+
+    /// `D`, `DD`, `D.D` or `DD.D` as tenths, at most 10.0.
+    fn rating_tenths(value: &[u8]) -> Option<i64> {
+        let (whole, tenth) = match value.iter().position(|b| *b == b'.') {
+            Some(dot) => (&value[..dot], digits(&value[dot + 1..], 1)?),
+            None => (value, 0),
+        };
+        Some(digits(whole, 2)? * 10 + tenth).filter(|r| *r <= 100)
+    }
+
+    #[derive(Default)]
+    struct Movie {
+        title: Vec<u8>,
+    }
+
+    fn movie_facet(f: &[&[u8]; 6], c: &mut Counts, s: &mut Movie) {
+        let imdb = trim_by(f[0], is_trim);
+        let imdb = match imdb {
+            [a, b, rest @ ..] if a.eq_ignore_ascii_case(&b't') && b.eq_ignore_ascii_case(&b't') => {
+                rest
+            }
+            _ => imdb,
+        };
+        let imdb_valid = imdb.len() >= 7 && digits(imdb, 8).is_some();
+        mark(c, 1, imdb_valid);
+        let tmdb_valid = digits(trim_by(f[1], is_trim), 9).is_some_and(|v| v > 0);
+        mark(c, 2, tmdb_valid);
+        let year = (f[3].len() == 4 && (f[3].starts_with(b"19") || f[3].starts_with(b"20")))
+            .then(|| digits(f[3], 4))
+            .flatten();
+        mark(c, 3, year.is_some());
+        let rating = rating_tenths(trim_by(f[4], is_trim));
+        mark(c, 4, rating.is_some());
+        c[5] += rating.unwrap_or(0);
+        let mut mask = 0i64;
+        for token in tokens(f[5], |b| matches!(b, b',' | b'|' | b'/'), is_trim) {
+            match MOVIE_GENRES
+                .iter()
+                .position(|g| g.eq_ignore_ascii_case(token))
+            {
+                Some(bit) => mask |= 1 << bit,
+                None => c[7] += 1,
+            }
+        }
+        let known = i64::from(mask.count_ones());
+        c[6] += known;
+        c[8] |= mask;
+        let score = rating.unwrap_or(0)
+            + if year.is_some() { 10 } else { 0 }
+            + known * 5
+            + if imdb_valid { 5 } else { 0 }
+            + if tmdb_valid { 5 } else { 0 };
+        c[9] += score;
+        let key = rating.unwrap_or(0) * 100_000_000 + year.unwrap_or(0) * 10_000 + score.min(9999);
+        c[10] = c[10].max(key);
+        // Title sort key: lower case, one leading article dropped, non-alphanumeric runs
+        // collapsed to single spaces and trimmed.
+        let title = trim_by(f[2], is_trim);
+        let lower_starts = |p: &[u8]| title.len() >= p.len() && title[..p.len()].eq_ignore_ascii_case(p);
+        let title = if lower_starts(b"the ") {
+            &title[4..]
+        } else if lower_starts(b"a ") {
+            &title[2..]
+        } else if lower_starts(b"an ") {
+            &title[3..]
+        } else {
+            title
+        };
+        slug_spaced(title, &mut s.title);
+        if !s.title.is_empty() {
+            digest(c, 11, &s.title);
+        }
+    }
+
+    /// `trim(preg_replace('/[^a-z0-9]+/', ' ', strtolower($value)))`.
+    fn slug_spaced(value: &[u8], out: &mut Vec<u8>) {
+        out.clear();
+        let mut gap = false;
+        for &b in value {
+            let b = b.to_ascii_lowercase();
+            if b.is_ascii_lowercase() || b.is_ascii_digit() {
+                if gap && !out.is_empty() {
+                    out.push(b' ');
+                }
+                gap = false;
+                out.push(b);
+            } else {
+                gap = true;
+            }
+        }
+    }
+
+    fn movie_facet_batch(input: &[u8]) -> Option<Counts> {
+        let mut init = [0; COUNTS];
+        init[10] = -1;
+        init[11] = FNV_OFFSET as i64;
+        summarize::<6, _>(input, init, &mut Movie::default(), movie_facet)
+    }
+
+    macro_rules! export {
+        ($name:ident, $summarize:ident) => {
+            /// # Safety
+            ///
+            /// `input` must point to `len` readable bytes and `out` to `cap` writable bytes
+            /// that do not overlap; returns 96, `-96` when `cap` is too small, or `-1`.
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                input: *const u8,
+                len: usize,
+                out: *mut u8,
+                cap: usize,
+            ) -> isize {
+                unsafe { dispatch(input, len, out, cap, $summarize) }
+            }
+        };
+    }
+
+    export!(nntmux_w48_igdb_model_attribute_batch, model_attribute_batch);
+    export!(nntmux_w48_igdb_company_role_batch, company_role_batch);
+    export!(nntmux_w48_igdb_game_quality_batch, game_quality_batch);
+    export!(nntmux_w48_igdb_platform_family_batch, platform_family_batch);
+    export!(nntmux_w48_movie_browse_facet_batch, movie_facet_batch);
+}
+
+#[cfg(test)]
+mod w484_tests {
+    use super::w484_metadata::*;
+
+    type Export = unsafe extern "C" fn(*const u8, usize, *mut u8, usize) -> isize;
+    const EXPORTS: [(Export, usize); 5] = [
+        (nntmux_w48_igdb_model_attribute_batch, 3),
+        (nntmux_w48_igdb_company_role_batch, 4),
+        (nntmux_w48_igdb_game_quality_batch, 8),
+        (nntmux_w48_igdb_platform_family_batch, 5),
+        (nntmux_w48_movie_browse_facet_batch, 6),
+    ];
+
+    /// PHP `serialize(list<string>)`.
+    fn frame(entries: &[&[u8]]) -> Vec<u8> {
+        let mut wire = format!("a:{}:{{", entries.len()).into_bytes();
+        for (i, entry) in entries.iter().enumerate() {
+            wire.extend_from_slice(format!("i:{i};s:{}:\"", entry.len()).as_bytes());
+            wire.extend_from_slice(entry);
+            wire.extend_from_slice(b"\";");
+        }
+        wire.push(b'}');
+        wire
+    }
+
+    fn call(export: Export, input: &[u8], out: &mut [u8]) -> isize {
+        unsafe { export(input.as_ptr(), input.len(), out.as_mut_ptr(), out.len()) }
+    }
+
+    fn counts(export: Export, entries: &[&[u8]]) -> [i64; COUNTS] {
+        let mut out = [b'Z'; 256];
+        assert_eq!(call(export, &frame(entries), &mut out), OUTPUT_BYTES as isize);
+        assert!(out[OUTPUT_BYTES..].iter().all(|b| *b == b'Z'));
+        let mut result = [0i64; COUNTS];
+        for (value, chunk) in result.iter_mut().zip(out.as_chunks::<8>().0) {
+            *value = i64::from_le_bytes(*chunk);
+        }
+        result
+    }
+
+    #[test]
+    fn w484_platform_family_counts() {
+        let rows: [&[u8]; 35] = [
+            b"PlayStation 4", b"PS4", b"", b"1", b"8",
+            b"Nintendo Switch", b"Switch", b"", b"5", b"9",
+            b"PC (Microsoft Windows)", b"Win", b"", b"", b"",
+            b"Sega Mega Drive/Genesis", b"", b"Genesis", b"", b"",
+            b"Ouya", b"", b"", b"5", b"",
+            b"Android", b"", b"", b"", b"",
+            b"Xbox 360", b"X360", b"", b"", b"07",
+        ];
+        assert_eq!(
+            counts(nntmux_w48_igdb_platform_family_batch, &rows),
+            [7, 1, 1, 1, 1, 1, 1, 1, 3, 2, 1, 27]
+        );
+    }
+
+    #[test]
+    fn w484_movie_facet_ratings_and_years() {
+        let rows: [&[u8]; 12] = [
+            b"tt0111161", b"278", b"The Shawshank Redemption", b"1994", b"9.3", b"Drama|Crime",
+            b"", b"", b"", b"1899", b"10", b"",
+        ];
+        let c = counts(nntmux_w48_movie_browse_facet_batch, &rows);
+        assert_eq!(&c[..11], &[2, 1, 1, 1, 2, 193, 2, 0, 160, 223, 10_000_000_100]);
+    }
+
+    #[test]
+    fn w484_frames_are_validated_before_writing() {
+        for (export, stride) in EXPORTS {
+            let mut out = [b'Z'; 256];
+            for wire in [&b""[..], b"N;", b"a:1:{i:0;s:0:\"\";}", b"a:0:{}x"] {
+                assert_eq!(call(export, wire, &mut out), -1);
+            }
+            assert_eq!(call(export, &frame(&vec![&b"x"[..]; stride + 1]), &mut out), -1);
+            assert!(out.iter().all(|b| *b == b'Z'));
+            let wire = frame(&vec![&b"entry"[..]; stride]);
+            assert_eq!(call(export, &wire, &mut out[..95]), -(OUTPUT_BYTES as isize));
+            assert!(out.iter().all(|b| *b == b'Z'));
+            assert_eq!(counts(export, &vec![&b"entry"[..]; stride])[0], 1);
+            assert_eq!(counts(export, &[])[0], 0);
+        }
+    }
+}

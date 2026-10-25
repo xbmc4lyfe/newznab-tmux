@@ -374,6 +374,285 @@ abstract class BaseModel extends DataNode
         return $result;
     }
 
+    /** Enabled: seven paired runs cleared 1.5x on every gate (min common mean 3.21x, p99 2.35x; uncommon mean 9.13x, p99 6.11x; see the W48 parity test). */
+    public const bool W48_ATTRIBUTE_RUST_FFI_DEFAULT = true;
+
+    public const string W48_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w48_igdb_model_attribute_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private const array W48_ATTRIBUTE_KEYS = ['total_attributes', 'empty_key_count', 'renamed_key_count', 'date_field_count', 'date_castable_count', 'int_coercible_count', 'relation_field_count', 'relation_id_count', 'relation_id_sum', 'type_mismatch_count', 'key_digest', 'max_relation_ids'];
+
+    /** Normalized key => [kind, accepted type tags]; kinds: d date, r relation, s text, n number. */
+    private const array W48_ATTRIBUTE_SCHEMA = [
+        'created_at' => ['d', 'i'], 'updated_at' => ['d', 'i'], 'change_date' => ['d', 'i'], 'start_date' => ['d', 'i'], 'published_at' => ['d', 'i'], 'first_release_date' => ['d', 'i'],
+        'cover' => ['r', 'ilm'], 'platforms' => ['r', 'ilm'], 'platform' => ['r', 'ilm'], 'genres' => ['r', 'ilm'], 'themes' => ['r', 'ilm'], 'game_modes' => ['r', 'ilm'],
+        'involved_companies' => ['r', 'ilm'], 'company' => ['r', 'ilm'], 'game' => ['r', 'ilm'], 'franchises' => ['r', 'ilm'], 'collection' => ['r', 'ilm'], 'artworks' => ['r', 'ilm'],
+        'screenshots' => ['r', 'ilm'], 'similar_games' => ['r', 'ilm'], 'websites' => ['r', 'ilm'], 'age_ratings' => ['r', 'ilm'], 'alternative_names' => ['r', 'ilm'], 'release_dates' => ['r', 'ilm'],
+        'parent_game' => ['r', 'ilm'], 'developed' => ['r', 'ilm'], 'published' => ['r', 'ilm'], 'logo' => ['r', 'ilm'], 'platform_family' => ['r', 'ilm'], 'versions' => ['r', 'ilm'],
+        'name' => ['s', 's'], 'slug' => ['s', 's'], 'summary' => ['s', 's'], 'storyline' => ['s', 's'], 'url' => ['s', 's'], 'checksum' => ['s', 's'], 'abbreviation' => ['s', 's'],
+        'alternative_name' => ['s', 's'], 'description' => ['s', 's'], 'image_id' => ['s', 's'],
+        'id' => ['n', 'if'], 'rating' => ['n', 'if'], 'aggregated_rating' => ['n', 'if'], 'total_rating' => ['n', 'if'], 'rating_count' => ['n', 'if'], 'category' => ['n', 'if'],
+        'status' => ['n', 'if'], 'generation' => ['n', 'if'], 'country' => ['n', 'if'], 'popularity' => ['n', 'if'],
+    ];
+
+    private static ?bool $w48UseRustFfi = null;
+
+    private static FFI|false|null $w48Ffi = null;
+
+    /** Null restores the benchmark-qualified default. */
+    public static function useW48AttributeRustFfi(?bool $enable = true): void
+    {
+        self::$w48UseRustFfi = $enable;
+    }
+
+    public static function usesW48AttributeRustFfi(): bool
+    {
+        return self::$w48UseRustFfi ?? self::W48_ATTRIBUTE_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW48AttributeRustFfi(): void
+    {
+        self::$w48UseRustFfi = null;
+        self::$w48Ffi = null;
+    }
+
+    /**
+     * Summarize raw IGDB attributes before hydration: keys normalized as
+     * normalizeAttributeKeyPhp() does in the C locale (empty and renamed keys plus an FNV-1a
+     * digest of the normalized keys), extractIdentifierPhp()-style integer
+     * coercion, date fields and those holding a positive 1-10 digit
+     * timestamp, relation fields with their unique positive 1-12 digit IDs
+     * (count, sum, per-row maximum) and schema type mismatches. Rows are
+     * ['key' => string, 'value' => mixed] or bare keys (untyped).
+     *
+     * @param  array<array-key, mixed>  $attributes
+     * @return array<string, int>
+     */
+    public static function summarizeAttributeBatch(array $attributes): array
+    {
+        return self::usesW48AttributeRustFfi()
+            ? self::summarizeAttributeBatchNative($attributes)
+            : self::summarizeAttributeBatchPhp($attributes);
+    }
+
+    /**
+     * Rust summary; falls back to PHP when the library or input frame is unusable.
+     *
+     * @param  array<array-key, mixed>  $attributes
+     * @return array<string, int>
+     */
+    public static function summarizeAttributeBatchNative(array $attributes): array
+    {
+        $fields = self::w48Fields($attributes);
+
+        return self::w48Call($fields) ?? self::w48Summary($fields);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $attributes
+     * @return array<string, int>
+     */
+    public static function summarizeAttributeBatchPhp(array $attributes): array
+    {
+        return self::w48Summary(self::w48Fields($attributes));
+    }
+
+    /**
+     * [key, type tag, value text]; lists join element IDs with commas and maps keep their id.
+     *
+     * @param  array<array-key, mixed>  $attributes
+     * @return list<string>
+     */
+    private static function w48Fields(array $attributes): array
+    {
+        $fields = [];
+        foreach ($attributes as $row) {
+            if (! is_array($row)) {
+                $fields[] = is_string($row) ? $row : (is_int($row) ? (string) $row : '');
+                $fields[] = '';
+                $fields[] = '';
+
+                continue;
+            }
+            $key = $row['key'] ?? null;
+            $fields[] = is_string($key) ? $key : (is_int($key) ? (string) $key : '');
+            if (! array_key_exists('value', $row)) {
+                $fields[] = '';
+                $fields[] = '';
+
+                continue;
+            }
+            $value = $row['value'];
+            if (is_int($value)) {
+                $fields[] = 'i';
+                $fields[] = (string) $value;
+            } elseif (is_string($value)) {
+                $fields[] = 's';
+                $fields[] = $value;
+            } elseif (is_array($value)) {
+                if (array_is_list($value)) {
+                    $ids = [];
+                    foreach ($value as $item) {
+                        if (is_array($item)) {
+                            $item = $item['id'] ?? null;
+                        }
+                        $ids[] = is_string($item) ? $item : (is_int($item) ? (string) $item : '');
+                    }
+                    $fields[] = 'l';
+                    $fields[] = implode(',', $ids);
+                } else {
+                    $id = $value['id'] ?? null;
+                    $fields[] = 'm';
+                    $fields[] = is_string($id) ? $id : (is_int($id) ? (string) $id : '');
+                }
+            } else {
+                $fields[] = match (true) {
+                    is_float($value) => 'f',
+                    is_bool($value) => 'b',
+                    $value === null => 'n',
+                    default => 'o',
+                };
+                $fields[] = '';
+            }
+        }
+
+        return $fields;
+    }
+
+    /**
+     * @param  list<string>  $fields
+     * @return array<string, int>
+     */
+    private static function w48Summary(array $fields): array
+    {
+        $summary = array_fill_keys(self::W48_ATTRIBUTE_KEYS, 0);
+        $digest = hash_init('fnv1a64');
+        for ($i = 0, $n = count($fields); $i < $n; $i += 3) {
+            $summary['total_attributes']++;
+            $key = self::w48NormalizeKey($fields[$i]);
+            if ($key === '') {
+                $summary['empty_key_count']++;
+
+                continue;
+            }
+            $summary['renamed_key_count'] += (int) ($key !== $fields[$i]);
+            hash_update($digest, $key."\n");
+            $tag = $fields[$i + 1];
+            $text = $fields[$i + 2];
+            if ($tag === 'i') {
+                $summary['int_coercible_count']++;
+            } elseif ($tag === 's') {
+                $summary['int_coercible_count'] += (int) (preg_match('/^[+-]?\d{1,18}$/D', trim($text)) === 1);
+            }
+            if (! isset(self::W48_ATTRIBUTE_SCHEMA[$key])) {
+                continue;
+            }
+            [$kind, $accepted] = self::W48_ATTRIBUTE_SCHEMA[$key];
+            if (strlen($tag) === 1 && str_contains('ifsbnlmo', $tag)) {
+                $summary['type_mismatch_count'] += (int) ! str_contains($accepted, $tag);
+            }
+            if ($kind === 'd') {
+                $summary['date_field_count']++;
+                $summary['date_castable_count'] += (int) (($tag === 'i' || $tag === 's') && $text !== '' && strlen($text) <= 10 && ctype_digit($text) && (int) $text > 0);
+            } elseif ($kind === 'r') {
+                $summary['relation_field_count']++;
+                $tokens = match ($tag) {
+                    'i', 's', 'm' => [$text],
+                    'l' => explode(',', $text),
+                    default => [],
+                };
+                $ids = [];
+                foreach ($tokens as $token) {
+                    $token = trim($token);
+                    if (($token[0] ?? '') === '+') {
+                        $token = substr($token, 1);
+                    }
+                    if ($token !== '' && strlen($token) <= 12 && ctype_digit($token) && (int) $token > 0) {
+                        $ids[(int) $token] = true;
+                    }
+                }
+                $unique = count($ids);
+                $summary['relation_id_count'] += $unique;
+                $summary['relation_id_sum'] += array_sum(array_keys($ids));
+                $summary['max_relation_ids'] = max($summary['max_relation_ids'], $unique);
+            }
+        }
+        $value = unpack('J', hash_final($digest, true));
+        $summary['key_digest'] = is_array($value) ? (int) $value[1] : 0;
+
+        return $summary;
+    }
+
+    /**
+     * normalizeAttributeKeyPhp() with ASCII byte classes: libc ctype under macOS
+     * C.UTF-8 also classifies Latin-1 bytes, so ctype_*() would make the
+     * summary depend on the host locale.
+     */
+    private static function w48NormalizeKey(string $key): string
+    {
+        $trimmed = trim($key);
+        $out = '';
+        for ($i = 0, $len = \strlen($trimmed); $i < $len; $i++) {
+            $ch = $trimmed[$i];
+            if (str_contains("_-. \t\n\r\0\x0B", $ch)) {
+                if ($out !== '' && ! str_ends_with($out, '_')) {
+                    $out .= '_';
+                }
+
+                continue;
+            }
+            if ($ch >= 'A' && $ch <= 'Z') {
+                $prev = $i > 0 ? $trimmed[$i - 1] : '';
+                $next = $trimmed[$i + 1] ?? '';
+                $split = ($prev >= 'a' && $prev <= 'z') || ($prev >= '0' && $prev <= '9')
+                    || ($prev >= 'A' && $prev <= 'Z' && $next >= 'a' && $next <= 'z');
+                if ($split && $out !== '' && ! str_ends_with($out, '_')) {
+                    $out .= '_';
+                }
+                $out .= strtolower($ch);
+            } else {
+                $out .= $ch;
+            }
+        }
+
+        return rtrim($out, '_');
+    }
+
+    /**
+     * @param  list<string>  $fields
+     * @return array<string, int>|null
+     */
+    private static function w48Call(array $fields): ?array
+    {
+        try {
+            $input = serialize($fields);
+            if (strlen($input) > 16777216) {
+                return null;
+            }
+            self::$w48Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w48', self::W48_FFI_CDEF) ?? false;
+            $ffi = self::$w48Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            // obtainScratch() returns at least the 96 bytes requested.
+            $out = RustPipelineLibrary::obtainScratch($ffi, 96);
+            // @phpstan-ignore method.notFound (Declared by W48_FFI_CDEF.)
+            if ($out === null || $ffi->nntmux_w48_igdb_model_attribute_batch($input, strlen($input), $out, 96) !== 96) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('P*', FFI::string($out, 96));
+            if ($values === false || count($values) !== 12 || count($fields) !== $values[1] * 3) {
+                return null;
+            }
+
+            return array_combine(self::W48_ATTRIBUTE_KEYS, $values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
     public static function __callStatic(string $method, array $parameters): mixed
     {
         return static::query()->{$method}(...$parameters);

@@ -459,6 +459,221 @@ class MovieBrowseService
         return ['applied' => true, 'operator' => 'LIKE', 'column' => 'm.'.$field, 'value' => '%'.$value.'%'];
     }
 
+    /** Enabled: seven paired runs cleared 1.5x on every gate (min common mean 2.52x, p99 2.04x; uncommon mean 2.57x, p99 2.23x; see the W48 parity test). */
+    public const bool W48_MOVIE_FACET_RUST_FFI_DEFAULT = true;
+
+    public const string W48_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w48_movie_browse_facet_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private const array W48_MOVIE_FACET_KEYS = ['total_movies', 'valid_imdb_count', 'valid_tmdb_count', 'valid_year_count', 'rated_count', 'rating_tenths_sum', 'known_genre_sum', 'unknown_genre_sum', 'genre_mask', 'facet_score_sum', 'max_sort_key', 'title_digest'];
+
+    /** getGenres(), lower-cased => bit in the genre mask. */
+    private const array W48_GENRE_BITS = ['action' => 0, 'adventure' => 1, 'animation' => 2, 'biography' => 3, 'comedy' => 4, 'crime' => 5, 'documentary' => 6, 'drama' => 7, 'family' => 8, 'fantasy' => 9, 'film-noir' => 10, 'game-show' => 11, 'history' => 12, 'horror' => 13, 'music' => 14, 'musical' => 15, 'mystery' => 16, 'news' => 17, 'reality-tv' => 18, 'romance' => 19, 'sci-fi' => 20, 'sport' => 21, 'talk-show' => 22, 'thriller' => 23, 'war' => 24, 'western' => 25];
+
+    /** Row keys flattened in order. */
+    private const array W48_MOVIE_FIELDS = ['imdbid', 'tmdbid', 'title', 'year', 'rating', 'genre'];
+
+    private static ?bool $w48UseRustFfi = null;
+
+    private static FFI|false|null $w48Ffi = null;
+
+    /** Null restores the benchmark-qualified default. */
+    public static function useW48MovieFacetRustFfi(?bool $enable = true): void
+    {
+        self::$w48UseRustFfi = $enable;
+    }
+
+    public static function usesW48MovieFacetRustFfi(): bool
+    {
+        return self::$w48UseRustFfi ?? self::W48_MOVIE_FACET_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW48MovieFacetRustFfi(): void
+    {
+        self::$w48UseRustFfi = null;
+        self::$w48Ffi = null;
+    }
+
+    /**
+     * Summarize movieinfo rows for browse facets: IMDB ids (optional tt and
+     * 7-8 digits), positive TMDB ids, 19xx/20xx years as getBrowseBy()
+     * accepts them, ratings as tenths (D, DD, D.D or DD.D up to 10.0), known
+     * and unknown getGenres() entries in comma/pipe/slash lists with the
+     * union genre mask, a per-row facet score, the largest
+     * rating/year/score sort key (-1 when empty) and an FNV-1a digest of
+     * article-stripped title sort keys. Rows are movieinfo maps or bare
+     * IMDB ids.
+     *
+     * @param  array<array-key, mixed>  $movies
+     * @return array<string, int>
+     */
+    public static function scoreMovieFacetBatch(array $movies): array
+    {
+        return self::usesW48MovieFacetRustFfi()
+            ? self::scoreMovieFacetBatchNative($movies)
+            : self::scoreMovieFacetBatchPhp($movies);
+    }
+
+    /**
+     * Rust summary; falls back to PHP when the library or input frame is unusable.
+     *
+     * @param  array<array-key, mixed>  $movies
+     * @return array<string, int>
+     */
+    public static function scoreMovieFacetBatchNative(array $movies): array
+    {
+        $fields = self::w48Fields($movies);
+
+        return self::w48Call($fields) ?? self::w48Summary($fields);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $movies
+     * @return array<string, int>
+     */
+    public static function scoreMovieFacetBatchPhp(array $movies): array
+    {
+        return self::w48Summary(self::w48Fields($movies));
+    }
+
+    /**
+     * [imdbid, tmdbid, title, year, rating, genre]; float ratings use PHP's string form.
+     *
+     * @param  array<array-key, mixed>  $movies
+     * @return list<string>
+     */
+    private static function w48Fields(array $movies): array
+    {
+        $fields = [];
+        foreach ($movies as $row) {
+            if (! is_array($row)) {
+                array_push($fields, is_string($row) ? $row : (is_int($row) ? (string) $row : ''), '', '', '', '', '');
+
+                continue;
+            }
+            foreach (self::W48_MOVIE_FIELDS as $key) {
+                $value = $row[$key] ?? null;
+                $fields[] = is_string($value) ? $value : (is_int($value) || is_float($value) ? (string) $value : '');
+            }
+        }
+
+        return $fields;
+    }
+
+    /**
+     * @param  list<string>  $fields
+     * @return array<string, int>
+     */
+    private static function w48Summary(array $fields): array
+    {
+        $summary = array_fill_keys(self::W48_MOVIE_FACET_KEYS, 0);
+        $summary['max_sort_key'] = -1;
+        $digest = hash_init('fnv1a64');
+        for ($i = 0, $n = count($fields); $i < $n; $i += 6) {
+            $summary['total_movies']++;
+            $imdb = trim($fields[$i]);
+            if (strncasecmp($imdb, 'tt', 2) === 0) {
+                $imdb = substr($imdb, 2);
+            }
+            $imdbValid = strlen($imdb) >= 7 && strlen($imdb) <= 8 && ctype_digit($imdb);
+            $summary['valid_imdb_count'] += (int) $imdbValid;
+            $tmdb = trim($fields[$i + 1]);
+            $tmdbValid = $tmdb !== '' && strlen($tmdb) <= 9 && ctype_digit($tmdb) && (int) $tmdb > 0;
+            $summary['valid_tmdb_count'] += (int) $tmdbValid;
+            $text = $fields[$i + 3];
+            $year = strlen($text) === 4 && ctype_digit($text) && (str_starts_with($text, '19') || str_starts_with($text, '20')) ? (int) $text : 0;
+            $summary['valid_year_count'] += (int) ($year > 0);
+            $rating = self::w48RatingTenths(trim($fields[$i + 4]));
+            $summary['rated_count'] += (int) ($rating !== null);
+            $rating ??= 0;
+            $summary['rating_tenths_sum'] += $rating;
+            $mask = 0;
+            $known = 0;
+            foreach (explode(',', strtr($fields[$i + 5], '|/', ',,')) as $token) {
+                $token = trim($token);
+                if ($token === '') {
+                    continue;
+                }
+                $bit = self::W48_GENRE_BITS[strtolower($token)] ?? null;
+                if ($bit === null) {
+                    $summary['unknown_genre_sum']++;
+                } elseif (($mask & (1 << $bit)) === 0) {
+                    $mask |= 1 << $bit;
+                    $known++;
+                }
+            }
+            $summary['known_genre_sum'] += $known;
+            $summary['genre_mask'] |= $mask;
+            $score = $rating + ($year > 0 ? 10 : 0) + $known * 5 + ($imdbValid ? 5 : 0) + ($tmdbValid ? 5 : 0);
+            $summary['facet_score_sum'] += $score;
+            $summary['max_sort_key'] = max($summary['max_sort_key'], $rating * 100000000 + $year * 10000 + min($score, 9999));
+            $title = trim($fields[$i + 2]);
+            foreach (['the ', 'a ', 'an '] as $article) {
+                if (strncasecmp($title, $article, strlen($article)) === 0) {
+                    $title = substr($title, strlen($article));
+                    break;
+                }
+            }
+            $key = trim(preg_replace('/[^a-z0-9]+/', ' ', strtolower($title)) ?? '');
+            if ($key !== '') {
+                hash_update($digest, $key."\n");
+            }
+        }
+        $value = unpack('J', hash_final($digest, true));
+        $summary['title_digest'] = is_array($value) ? (int) $value[1] : 0;
+
+        return $summary;
+    }
+
+    /** D, DD, D.D or DD.D as tenths, at most 10.0. */
+    private static function w48RatingTenths(string $rating): ?int
+    {
+        $dot = strpos($rating, '.');
+        $whole = $dot === false ? $rating : substr($rating, 0, $dot);
+        $tenth = $dot === false ? '0' : substr($rating, $dot + 1);
+        if ($whole === '' || strlen($whole) > 2 || ! ctype_digit($whole) || strlen($tenth) !== 1 || ! ctype_digit($tenth)) {
+            return null;
+        }
+        $value = (int) $whole * 10 + (int) $tenth;
+
+        return $value <= 100 ? $value : null;
+    }
+
+    /**
+     * @param  list<string>  $fields
+     * @return array<string, int>|null
+     */
+    private static function w48Call(array $fields): ?array
+    {
+        try {
+            $input = serialize($fields);
+            if (strlen($input) > 16777216) {
+                return null;
+            }
+            self::$w48Ffi ??= RustPipelineLibrary::resolveDomain('metadata_w48', self::W48_FFI_CDEF) ?? false;
+            $ffi = self::$w48Ffi;
+            if ($ffi === false) {
+                return null;
+            }
+            // obtainScratch() returns at least the 96 bytes requested.
+            $out = RustPipelineLibrary::obtainScratch($ffi, 96);
+            // @phpstan-ignore method.notFound (Declared by W48_FFI_CDEF.)
+            if ($out === null || $ffi->nntmux_w48_movie_browse_facet_batch($input, strlen($input), $out, 96) !== 96) {
+                return null;
+            }
+            /** @var array<int, int>|false $values */
+            $values = unpack('P*', FFI::string($out, 96));
+            if ($values === false || count($values) !== 12 || count($fields) !== $values[1] * 6) {
+                return null;
+            }
+
+            return array_combine(self::W48_MOVIE_FACET_KEYS, $values);
+        } catch (Throwable) {
+            return null;
+        }
+    }
+
     /**
      * @param  list<int|string>  $args
      */
