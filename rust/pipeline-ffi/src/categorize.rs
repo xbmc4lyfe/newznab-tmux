@@ -40726,7 +40726,7 @@ pub mod tv_book_service_books_consoles_games_w533 {
     /// Upper bound on `count`, so a corrupt count never drives a huge allocation.
     const MAX_COUNT: usize = 1 << 24;
 
-    type Batch = fn(&[&[u8]]) -> Vec<i64>;
+    pub(super) type Batch = fn(&[&[u8]]) -> Vec<i64>;
 
     /// Splits `blob` on NUL into exactly `count` pieces (an empty blob holds no pieces).
     fn split_exact(blob: &[u8], count: usize) -> Option<Vec<&[u8]>> {
@@ -40744,7 +40744,7 @@ pub mod tv_book_service_books_consoles_games_w533 {
     }
 
     /// PHP `trim()`: space, tab, LF, CR, NUL and vertical tab (not form feed).
-    fn trim(value: &[u8]) -> &[u8] {
+    pub(super) fn trim(value: &[u8]) -> &[u8] {
         let is_trim = |b: &u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b);
         let start = value
             .iter()
@@ -40758,14 +40758,14 @@ pub mod tv_book_service_books_consoles_games_w533 {
     }
 
     /// `preg_split('/[^A-Za-z0-9]+/', ..., PREG_SPLIT_NO_EMPTY)`.
-    fn tokens(value: &[u8]) -> impl Iterator<Item = &[u8]> {
+    pub(super) fn tokens(value: &[u8]) -> impl Iterator<Item = &[u8]> {
         value
             .split(|b| !b.is_ascii_alphanumeric())
             .filter(|s| !s.is_empty())
     }
 
     /// ASCII-uppercases tokens of up to 16 bytes; longer tokens match no keyword.
-    fn upper<'b>(token: &[u8], buf: &'b mut [u8; 16]) -> &'b [u8] {
+    pub(super) fn upper<'b>(token: &[u8], buf: &'b mut [u8; 16]) -> &'b [u8] {
         if token.len() > buf.len() {
             return &[];
         }
@@ -40781,7 +40781,7 @@ pub mod tv_book_service_books_consoles_games_w533 {
     }
 
     /// `^(?:19|20)\d\d$`, returning the year or 0.
-    fn year(token: &[u8]) -> i64 {
+    pub(super) fn year(token: &[u8]) -> i64 {
         if token.len() == 4
             && (token.starts_with(b"19") || token.starts_with(b"20"))
             && token.iter().all(u8::is_ascii_digit)
@@ -40862,7 +40862,7 @@ pub mod tv_book_service_books_consoles_games_w533 {
     }
 
     /// Adds each set flag bit `1 << k` (k < N) of `word` to `totals[k]`.
-    fn tally<const N: usize>(totals: &mut [i64; N], word: i64) {
+    pub(super) fn tally<const N: usize>(totals: &mut [i64; N], word: i64) {
         for (k, total) in totals.iter_mut().enumerate() {
             *total += (word >> k) & 1;
         }
@@ -41041,7 +41041,7 @@ pub mod tv_book_service_books_consoles_games_w533 {
     ///
     /// # Safety
     /// Non-null pointers must be valid for their lengths (`out` for `out_cap` `i64`s).
-    unsafe fn run(
+    pub(super) unsafe fn run(
         blob: *const u8,
         blob_len: usize,
         count: usize,
@@ -41360,6 +41360,616 @@ pub mod tv_book_service_books_consoles_games_w533 {
                     nntmux_w533_book_subject_isbn_batch(b"x".as_ptr(), 1, 1, o, 4),
                     -5
                 );
+            }
+        }
+    }
+}
+
+/// Wave 54.3 token flag batches for the Console, GroupName, Misc, Music and PC categorization
+/// pipes. Each export takes `count` NUL-joined items and writes one `i64` word per item, then
+/// that helper's trailer counts, through the Wave 53.3 buffer guard. Items are trimmed like PHP
+/// `trim()` (an empty item is word 1) and split into maximal ASCII alphanumeric runs compared
+/// case-insensitively.
+pub mod categorization_pipes_console_group_misc_music_pc_w543 {
+    use super::tv_book_service_books_consoles_games_w533::{run, tally, tokens, trim, upper, year};
+
+    /// Category ids from `App\Models\Category`.
+    const GAME_NDS: i64 = 1010;
+    const GAME_PSP: i64 = 1020;
+    const GAME_WII: i64 = 1030;
+    const GAME_XBOX: i64 = 1040;
+    const GAME_XBOX360: i64 = 1050;
+    const GAME_PS3: i64 = 1080;
+    const GAME_3DS: i64 = 1110;
+    const GAME_PSVITA: i64 = 1120;
+    const GAME_WIIU: i64 = 1130;
+    const GAME_XBOXONE: i64 = 1140;
+    const GAME_PS4: i64 = 1180;
+    const GAME_OTHER: i64 = 1999;
+
+    /// Runs `row` on each trimmed, non-empty item (an empty item is word 1) and returns the
+    /// words, with room for `N + extra` trailer words, and the counts of flag bits `0..N`.
+    fn flag_rows<const N: usize>(
+        items: &[&[u8]],
+        extra: usize,
+        row: impl Fn(&[u8]) -> i64,
+    ) -> (Vec<i64>, [i64; N]) {
+        let mut out = Vec::with_capacity(items.len() + N + extra);
+        let mut totals = [0i64; N];
+        for item in items {
+            let item = trim(item);
+            let word = if item.is_empty() { 1 } else { row(item) };
+            tally(&mut totals, word);
+            out.push(word);
+        }
+        (out, totals)
+    }
+
+    /// True when every byte is an ASCII digit (an empty slice qualifies).
+    fn digits(value: &[u8]) -> bool {
+        value.iter().all(u8::is_ascii_digit)
+    }
+
+    /// `ConsolePipe::W54_CONSOLE_TOKENS`: `flags | category << 16`.
+    fn console_token(token: &[u8]) -> i64 {
+        let platform = |category: i64| 2 | (category << 16);
+        match token {
+            b"PS4" => platform(GAME_PS4),
+            b"PS3" => platform(GAME_PS3),
+            b"PSVITA" | b"VITA" | b"PSV" => platform(GAME_PSVITA),
+            b"PSP" => platform(GAME_PSP),
+            b"XBOXONE" | b"XONE" | b"XBONE" => platform(GAME_XBOXONE),
+            b"X360" | b"XBOX360" => platform(GAME_XBOX360),
+            b"XBOX" => platform(GAME_XBOX),
+            b"WIIU" => platform(GAME_WIIU),
+            b"WII" => platform(GAME_WII),
+            b"3DS" => platform(GAME_3DS),
+            b"NDS" => platform(GAME_NDS),
+            b"SWITCH" | b"NSW" | b"PS5" => platform(GAME_OTHER),
+            b"SNES" | b"NES" | b"N64" | b"GBA" | b"GBC" | b"NGC" | b"GAMECUBE" | b"PSX"
+            | b"PS1" | b"PS2" | b"GENESIS" | b"MEGADRIVE" | b"DREAMCAST" | b"SATURN" => {
+                4 | (GAME_OTHER << 16)
+            }
+            b"USA" | b"EUR" | b"PAL" | b"NTSC" | b"JPN" | b"JAP" | b"ASIA" | b"KOR"
+            | b"REGIONFREE" => 8,
+            b"GOG" | b"STEAM" | b"WIN" | b"WIN32" | b"WIN64" | b"WINDOWS" | b"X64" | b"X86"
+            | b"PC" => 32,
+            _ => 0,
+        }
+    }
+
+    /// `^S\d{1,3}(?:E\d{1,4})?$`, case-insensitive.
+    fn season_token(token: &[u8]) -> bool {
+        let Some((first, rest)) = token.split_first() else {
+            return false;
+        };
+        let season = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+        if !first.eq_ignore_ascii_case(&b'S') || !(1..=3).contains(&season) {
+            return false;
+        }
+        match &rest[season..] {
+            [] => true,
+            [e, episode @ ..] => {
+                e.eq_ignore_ascii_case(&b'E') && (1..=4).contains(&episode.len()) && digits(episode)
+            }
+        }
+    }
+
+    /// `ConsolePipe::w54ConsolePlatformFlagBatchPhp()`: per name `flags | category << 16` with
+    /// flags 1 empty, 2 platform, 4 retro platform, 8 region, 16 TV season/episode token and 32
+    /// PC-store token, and the first platform token's category id; then the six flag counts and
+    /// the number of distinct non-zero categories.
+    fn console_platforms(names: &[&[u8]]) -> Vec<i64> {
+        let (mut out, totals) = flag_rows::<6>(names, 1, |name| {
+            let (mut flags, mut category, mut buf) = (0i64, 0i64, [0u8; 16]);
+            for token in tokens(name) {
+                let found = console_token(upper(token, &mut buf));
+                flags |= (found & 0xffff) | if season_token(token) { 16 } else { 0 };
+                if category == 0 {
+                    category = found >> 16;
+                }
+            }
+            flags | (category << 16)
+        });
+        let mut seen: Vec<i64> = Vec::new();
+        for word in &out {
+            let category = word >> 16;
+            if category != 0 && !seen.contains(&category) {
+                seen.push(category);
+            }
+        }
+        out.extend(totals);
+        out.push(seen.len() as i64);
+        out
+    }
+
+    /// `GroupNamePipe::W54_GROUP_TOKENS`.
+    fn group_token(token: &[u8]) -> i64 {
+        match token {
+            b"BINARIES" | b"BINARY" => 2,
+            b"TV" | b"TEEVEE" | b"HDTV" | b"SERIES" | b"TELEVISION" => 4,
+            b"MOVIES" | b"MOOVEE" | b"DVD" | b"DVDR" | b"BLURAY" | b"DIVX" | b"XVID" | b"X264"
+            | b"X265" | b"HD" => 8,
+            b"SOUNDS" | b"MP3" | b"MUSIC" | b"FLAC" | b"LOSSLESS" | b"AUDIO" => 16,
+            b"GAMES" | b"GAME" | b"CONSOLE" | b"CONSOLES" | b"XBOX" | b"XBOX360" | b"NINTENDO"
+            | b"PLAYSTATION" | b"WII" | b"PS3" | b"PS4" | b"PSP" | b"NDS" => 32,
+            b"EBOOK" | b"EBOOKS" | b"BOOKS" | b"AUDIOBOOKS" | b"COMICS" | b"MAGAZINES" => 64,
+            b"EROTICA" | b"XXX" | b"PORN" | b"SEX" | b"ADULT" => 128,
+            b"APPS" | b"WAREZ" | b"SOFTWARE" | b"PC" | b"MAC" | b"LINUX" => 256,
+            b"ANIME" | b"MANGA" | b"CARTOONS" => 512,
+            _ => 0,
+        }
+    }
+
+    /// `GroupNamePipe::w54GroupNameRouteFlagBatchPhp()`: per group `flags | tokens << 16` with
+    /// flags 1 empty, 2 binaries, 4 TV, 8 movies, 16 audio, 32 games, 64 books, 128 adult, 256
+    /// PC and 512 anime, and the token count; then the ten flag counts.
+    fn group_routes(groups: &[&[u8]]) -> Vec<i64> {
+        let (mut out, totals) = flag_rows::<10>(groups, 0, |group| {
+            let (mut flags, mut count, mut buf) = (0i64, 0i64, [0u8; 16]);
+            for token in tokens(group) {
+                flags |= group_token(upper(token, &mut buf));
+                count += 1;
+            }
+            flags | (count << 16)
+        });
+        out.extend(totals);
+        out
+    }
+
+    /// `R\d\d`, `PART\d{1,4}` or a `MiscPipe::W54_ARCHIVE_TOKENS` keyword (uppercased token).
+    fn archive_token(token: &[u8]) -> bool {
+        matches!(
+            token,
+            b"RAR" | b"ZIP" | b"7Z" | b"PAR2" | b"PAR" | b"SFV" | b"NZB"
+        ) || (token.len() == 3 && token[0] == b'R' && digits(&token[1..]))
+            || ((5..=8).contains(&token.len()) && token.starts_with(b"PART") && digits(&token[4..]))
+    }
+
+    /// `MiscPipe::w54MiscSubjectShapeBatchPhp()`: per subject
+    /// `flags | min(longest token, 0xFFFFFF) << 8 | tokens << 32` with flags 1 empty, 2 hex hash
+    /// token (16+ hex digits, not all decimal), 4 long mixed token (16+ bytes with letters and
+    /// digits, not hex), 8 archive token, 16 all tokens decimal (at least one) and 32 yEnc; then
+    /// the six flag counts.
+    fn misc_subjects(subjects: &[&[u8]]) -> Vec<i64> {
+        let (mut out, totals) = flag_rows::<6>(subjects, 0, |subject| {
+            let (mut flags, mut longest, mut count, mut numeric) = (0i64, 0usize, 0i64, true);
+            let mut buf = [0u8; 16];
+            for token in tokens(subject) {
+                count += 1;
+                longest = longest.max(token.len());
+                let decimal = digits(token);
+                numeric &= decimal;
+                if token.len() >= 16 && !decimal {
+                    flags |= if token.iter().all(u8::is_ascii_hexdigit) {
+                        2
+                    } else if token.iter().all(u8::is_ascii_alphabetic) {
+                        0
+                    } else {
+                        4
+                    };
+                }
+                let upper = upper(token, &mut buf);
+                flags |= if archive_token(upper) { 8 } else { 0 }
+                    | if upper == b"YENC" { 32 } else { 0 };
+            }
+            if count > 0 && numeric {
+                flags |= 16;
+            }
+            flags | ((longest.min(0xff_ffff) as i64) << 8) | (count << 32)
+        });
+        out.extend(totals);
+        out
+    }
+
+    /// `MusicPipe::W54_AUDIO_TOKENS`.
+    fn music_token(token: &[u8]) -> i64 {
+        match token {
+            b"FLAC" | b"ALAC" | b"WAV" | b"APE" | b"WV" | b"AIFF" | b"LOSSLESS" => 2,
+            b"DSD" | b"DSF" => 2 | 16,
+            b"MP3" | b"AAC" | b"OGG" | b"OPUS" | b"M4A" | b"WMA" | b"VORBIS" => 4,
+            b"CBR" | b"VBR" | b"V0" | b"V1" | b"V2" | b"APS" | b"APX" => 8,
+            b"24BIT" | b"32BIT" | b"HIRES" | b"88KHZ" | b"96KHZ" | b"176KHZ" | b"192KHZ"
+            | b"SACD" | b"DSD64" | b"DSD128" => 16,
+            b"DISCOGRAPHY" | b"COMPILATION" | b"VA" | b"OST" | b"SOUNDTRACK" | b"ANTHOLOGY"
+            | b"COLLECTION" | b"BOXSET" => 32,
+            b"WEB" | b"CD" | b"CDDA" | b"CDM" | b"CDS" | b"CDR" | b"VINYL" | b"LP" | b"EP"
+            | b"SINGLE" | b"BOOTLEG" | b"VLS" | b"TAPE" | b"CASSETTE" => 64,
+            _ => 0,
+        }
+    }
+
+    /// `^\d{2,3}(?:K|KBPS|KBIT)$` (uppercased token).
+    fn bitrate_token(token: &[u8]) -> bool {
+        let lead = token.iter().take_while(|b| b.is_ascii_digit()).count();
+        (2..=3).contains(&lead) && matches!(&token[lead..], b"K" | b"KBPS" | b"KBIT")
+    }
+
+    /// `MusicPipe::w54AudioTokenFlagBatchPhp()`: per name `flags | year << 8` with flags 1
+    /// empty, 2 lossless, 4 lossy, 8 bitrate/quality, 16 hi-res, 32 compilation and 64 source,
+    /// and the first 19xx/20xx token as `year`; then the seven flag counts and the year-tagged
+    /// count.
+    fn audio_tokens(names: &[&[u8]]) -> Vec<i64> {
+        let (mut out, totals) = flag_rows::<7>(names, 1, |name| {
+            let (mut flags, mut first_year, mut buf) = (0i64, 0i64, [0u8; 16]);
+            for token in tokens(name) {
+                let upper = upper(token, &mut buf);
+                flags |= music_token(upper) | if bitrate_token(upper) { 8 } else { 0 };
+                if first_year == 0 {
+                    first_year = year(token);
+                }
+            }
+            flags | (first_year << 8)
+        });
+        let years = out.iter().filter(|&&word| word >> 8 != 0).count() as i64;
+        out.extend(totals);
+        out.push(years);
+        out
+    }
+
+    /// `PcPipe::W54_PC_TOKENS`: `flags | platform << 16`.
+    fn pc_token(token: &[u8]) -> i64 {
+        match token {
+            b"WIN" | b"WINDOWS" | b"WIN32" | b"WIN64" | b"WINALL" | b"X64" | b"X86" => {
+                2 | (1 << 16)
+            }
+            b"MAC" | b"MACOS" | b"MACOSX" | b"OSX" | b"DMG" => 4 | (2 << 16),
+            b"LINUX" | b"UBUNTU" | b"DEB" | b"RPM" => 8 | (3 << 16),
+            b"ANDROID" | b"APK" | b"IOS" | b"IPA" | b"IPHONE" | b"IPAD" => 16 | (4 << 16),
+            b"CRACK" | b"CRACKED" | b"KEYGEN" | b"PATCH" | b"SERIAL" | b"KEYMAKER"
+            | b"ACTIVATOR" | b"LOADER" | b"REGGED" | b"KEYFILE" => 32,
+            b"ISO" | b"IMG" | b"BIN" | b"CUE" | b"SETUP" | b"INSTALLER" | b"MSI" | b"EXE"
+            | b"PORTABLE" => 64,
+            b"BUILD" => 128,
+            _ => 0,
+        }
+    }
+
+    /// `PcPipe::w54PcPlatformFlagBatchPhp()`: per name `flags | platform << 16` with flags 1
+    /// empty, 2 Windows, 4 macOS, 8 Linux, 16 mobile, 32 crack, 64 installer/disc image and 128
+    /// `V<n>`/BUILD version, and the first platform token's family (1 Windows, 2 macOS, 3 Linux,
+    /// 4 mobile); then the eight flag counts.
+    fn pc_platforms(names: &[&[u8]]) -> Vec<i64> {
+        let (mut out, totals) = flag_rows::<8>(names, 0, |name| {
+            let (mut flags, mut platform, mut buf) = (0i64, 0i64, [0u8; 16]);
+            for token in tokens(name) {
+                let found = pc_token(upper(token, &mut buf));
+                let version =
+                    token.len() > 1 && token[0].eq_ignore_ascii_case(&b'V') && digits(&token[1..]);
+                flags |= (found & 0xffff) | if version { 128 } else { 0 };
+                if platform == 0 {
+                    platform = found >> 16;
+                }
+            }
+            flags | (platform << 16)
+        });
+        out.extend(totals);
+        out
+    }
+
+    macro_rules! w543_export {
+        ($(#[$doc:meta])* $name:ident => $body:ident) => {
+            $(#[$doc])*
+            ///
+            /// Returns the word count, `-needed` when `out_cap` is too small, or `-1` when it
+            /// declines (null `out`, null `blob` with a length, or `count` other than the number
+            /// of NUL-separated items).
+            ///
+            /// # Safety
+            /// Non-null pointers must be valid for their lengths (`out` for `out_cap` `i64`s).
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn $name(
+                blob: *const u8,
+                blob_len: usize,
+                count: usize,
+                out: *mut i64,
+                out_cap: usize,
+            ) -> isize {
+                unsafe { run(blob, blob_len, count, out, out_cap, $body) }
+            }
+        };
+    }
+
+    w543_export!(
+        /// `ConsolePipe::w54ConsolePlatformFlagBatch()`.
+        nntmux_w543_console_platform_flag_batch => console_platforms
+    );
+    w543_export!(
+        /// `GroupNamePipe::w54GroupNameRouteFlagBatch()`.
+        nntmux_w543_group_name_route_flag_batch => group_routes
+    );
+    w543_export!(
+        /// `MiscPipe::w54MiscSubjectShapeBatch()`.
+        nntmux_w543_misc_subject_shape_batch => misc_subjects
+    );
+    w543_export!(
+        /// `MusicPipe::w54AudioTokenFlagBatch()`.
+        nntmux_w543_music_audio_flag_batch => audio_tokens
+    );
+    w543_export!(
+        /// `PcPipe::w54PcPlatformFlagBatch()`.
+        nntmux_w543_pc_platform_flag_batch => pc_platforms
+    );
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::tv_book_service_books_consoles_games_w533::DECLINE;
+        use super::*;
+        use std::ptr;
+
+        type Export = unsafe extern "C" fn(*const u8, usize, usize, *mut i64, usize) -> isize;
+
+        /// Each export with its trailer word count.
+        const EXPORTS: [(Export, isize); 5] = [
+            (nntmux_w543_console_platform_flag_batch, 7),
+            (nntmux_w543_group_name_route_flag_batch, 10),
+            (nntmux_w543_misc_subject_shape_batch, 6),
+            (nntmux_w543_music_audio_flag_batch, 8),
+            (nntmux_w543_pc_platform_flag_batch, 8),
+        ];
+
+        fn call(f: Export, items: &[&[u8]]) -> Vec<i64> {
+            let blob = items.join(&0u8);
+            let mut out = vec![0i64; 4096];
+            let written = unsafe {
+                f(
+                    blob.as_ptr(),
+                    blob.len(),
+                    items.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert!(written >= 0, "export declined: {written}");
+            out.truncate(written as usize);
+            out
+        }
+
+        #[test]
+        fn w543_season_and_bitrate_and_archive_tokens() {
+            for yes in [&b"S01"[..], b"s1e2", b"S999E9999", b"S12E0001"] {
+                assert!(season_token(yes), "{yes:?}");
+            }
+            for no in [
+                &b"S"[..],
+                b"S1234",
+                b"S01E",
+                b"S01E12345",
+                b"SE01",
+                b"X01E01",
+                b"S01X",
+            ] {
+                assert!(!season_token(no), "{no:?}");
+            }
+            assert!(
+                bitrate_token(b"320KBPS") && bitrate_token(b"96K") && bitrate_token(b"128KBIT")
+            );
+            assert!(
+                !bitrate_token(b"1K")
+                    && !bitrate_token(b"1000K")
+                    && !bitrate_token(b"320")
+                    && !bitrate_token(b"320KB")
+            );
+            assert!(
+                archive_token(b"R00")
+                    && archive_token(b"PART1")
+                    && archive_token(b"PART0001")
+                    && archive_token(b"PAR2")
+            );
+            assert!(
+                !archive_token(b"R0")
+                    && !archive_token(b"PART")
+                    && !archive_token(b"PART12345")
+                    && !archive_token(b"RXX")
+            );
+        }
+
+        #[test]
+        fn w543_console_platforms_flag_tokens_and_categories() {
+            let out = call(
+                nntmux_w543_console_platform_flag_batch,
+                &[
+                    b"Game.USA.PS4.Switch-GRP",
+                    b"Show.S01E02.Xbox360",
+                    b" ",
+                    b"Retro.SNES.PAL.ps3",
+                    b"Game.GOG.Win64",
+                    b"game.ps4",
+                ],
+            );
+            assert_eq!(
+                out,
+                [
+                    2 | 8 | GAME_PS4 << 16,
+                    2 | 16 | GAME_XBOX360 << 16,
+                    1,
+                    2 | 4 | 8 | GAME_OTHER << 16,
+                    32,
+                    2 | GAME_PS4 << 16,
+                    1,
+                    4,
+                    1,
+                    2,
+                    1,
+                    1,
+                    3
+                ]
+            );
+        }
+
+        #[test]
+        fn w543_group_routes_flag_families_and_token_counts() {
+            let out = call(
+                nntmux_w543_group_name_route_flag_batch,
+                &[
+                    b"alt.binaries.sounds.mp3",
+                    b"alt.binaries.hdtv.x264",
+                    b"",
+                    b"alt.binaries.erotica",
+                    b"a.b.ebook.anime",
+                    b"alt.binaries.apps.mac",
+                    b"comp.lang.c",
+                ],
+            );
+            assert_eq!(
+                out,
+                [
+                    2 | 16 | 4 << 16,
+                    2 | 4 | 8 | 4 << 16,
+                    1,
+                    2 | 128 | 3 << 16,
+                    64 | 512 | 4 << 16,
+                    2 | 256 | 4 << 16,
+                    3 << 16,
+                    1,
+                    4,
+                    1,
+                    1,
+                    1,
+                    0,
+                    1,
+                    1,
+                    1,
+                    1
+                ]
+            );
+        }
+
+        #[test]
+        fn w543_misc_subjects_flag_shapes_and_lengths() {
+            let out = call(
+                nntmux_w543_misc_subject_shape_batch,
+                &[
+                    b"a3f9c2d1e8b7a6f5c4d3e2f1a0b9c8d7.rar",
+                    b"[01/10] - \"Abc123Def456Ghi789\" yEnc (1/1)",
+                    b"1234567890123456789",
+                    b"\t",
+                    b"Some.Title.part01.r00",
+                    b"abcdefghijklmnopqrstuvwxyz",
+                    b"---",
+                ],
+            );
+            assert_eq!(
+                out,
+                [
+                    2 | 8 | 32 << 8 | 2 << 32,
+                    4 | 32 | 18 << 8 | 6 << 32,
+                    16 | 19 << 8 | 1 << 32,
+                    1,
+                    8 | 6 << 8 | 4 << 32,
+                    26 << 8 | 1 << 32,
+                    0,
+                    1,
+                    1,
+                    1,
+                    2,
+                    1,
+                    1
+                ]
+            );
+        }
+
+        #[test]
+        fn w543_audio_tokens_flag_formats_and_first_year() {
+            let out = call(
+                nntmux_w543_music_audio_flag_batch,
+                &[
+                    b"Artist-Album-2019-WEB-FLAC-24BIT",
+                    b"VA - Hits 1999 (320kbps MP3)",
+                    b"Artist.Discography.DSD.Vinyl",
+                    b"",
+                    b"Song.V0.CBR",
+                ],
+            );
+            assert_eq!(
+                out,
+                [
+                    2 | 16 | 64 | 2019 << 8,
+                    4 | 8 | 32 | 1999 << 8,
+                    2 | 16 | 32 | 64,
+                    1,
+                    8,
+                    1,
+                    2,
+                    1,
+                    2,
+                    2,
+                    2,
+                    2,
+                    2
+                ]
+            );
+        }
+
+        #[test]
+        fn w543_pc_platforms_flag_families_and_first_platform() {
+            let out = call(
+                nntmux_w543_pc_platform_flag_batch,
+                &[
+                    b"App.v2.1.x64.Incl.Keygen-GRP",
+                    b"App.MacOS.Linux.DMG",
+                    b"Game.Android.APK.Build.12",
+                    b"Tool.Setup.ISO.Win32",
+                    b"\t",
+                    b"Vx.V",
+                ],
+            );
+            assert_eq!(
+                out,
+                [
+                    2 | 32 | 128 | 1 << 16,
+                    4 | 8 | 2 << 16,
+                    16 | 128 | 4 << 16,
+                    2 | 64 | 1 << 16,
+                    1,
+                    0,
+                    1,
+                    2,
+                    1,
+                    1,
+                    1,
+                    1,
+                    1,
+                    2
+                ]
+            );
+        }
+
+        #[test]
+        fn w543_long_tokens_match_no_keyword() {
+            let long = b"PLAYSTATIONPLAYSTATION.XBOXXBOXXBOXXBOXX";
+            assert_eq!(call(nntmux_w543_console_platform_flag_batch, &[long])[0], 0);
+            assert_eq!(
+                call(nntmux_w543_group_name_route_flag_batch, &[long])[0],
+                2 << 16
+            );
+            assert_eq!(
+                call(
+                    nntmux_w543_pc_platform_flag_batch,
+                    &[b"V123456789012345678901"]
+                )[0],
+                128
+            );
+        }
+
+        #[test]
+        fn w543_exports_guard_pointers_and_capacity() {
+            let mut out = [0i64; 64];
+            let o = out.as_mut_ptr();
+            for (f, trailer) in EXPORTS {
+                unsafe {
+                    assert_eq!(f(b"x".as_ptr(), 1, 1, ptr::null_mut(), 64), DECLINE);
+                    assert_eq!(f(ptr::null(), 1, 1, o, 64), DECLINE);
+                    assert_eq!(f(ptr::null(), 0, (1 << 24) + 1, o, 64), DECLINE);
+                    assert_eq!(f(b"x".as_ptr(), 1, 1, o, usize::MAX), DECLINE);
+                    assert_eq!(f(b"a\0b".as_ptr(), 3, 1, o, 64), DECLINE);
+                    assert_eq!(f(b"a".as_ptr(), 1, 2, o, 64), DECLINE);
+                    assert_eq!(f(b"x".as_ptr(), 1, 0, o, 64), DECLINE);
+                    assert_eq!(f(ptr::null(), 0, 0, o, 64), trailer);
+                    assert_eq!(f(ptr::null(), 0, 1, o, 64), trailer + 1);
+                    assert_eq!(out[0], 1);
+                    assert_eq!(f(b"x".as_ptr(), 1, 1, o, 1), -(trailer + 1));
+                }
             }
         }
     }
