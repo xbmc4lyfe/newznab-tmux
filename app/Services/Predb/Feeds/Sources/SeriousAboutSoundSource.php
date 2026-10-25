@@ -23,6 +23,18 @@ final class SeriousAboutSoundSource extends BoundedHttpFeedSource
         int32_t nntmux_predb_html_validate_listing_scope(const char *html, size_t len, uint32_t mode);
         C;
 
+    /**
+     * Wave 45.2 production default for summarizeHeadingBatch() is Rust: the paired benchmark in
+     * tests/Unit/RustPredbFeedsNzedbPredatabaseRssSceneArchiveSasW45ParityTest.php measures 2.67-2.79x mean and
+     * 2.05-3.00x p99 on common pages and 6.79-7.56x mean and 5.00-7.83x p99 on uncommon listings. PHP stays the
+     * fallback when the library is unavailable or a heading is not ASCII.
+     */
+    public const bool W452_RUST_FFI_DEFAULT = true;
+
+    private static ?bool $w452RustFfiOverride = null;
+
+    private static FFI|false|null $w452RustFfiHandle = null;
+
     private static FFI|false|null $native = null;
 
     private const ATTRIBUTE_REDEFINED = 42;
@@ -142,11 +154,8 @@ final class SeriousAboutSoundSource extends BoundedHttpFeedSource
                 throw new RuntimeException('SERIOUSABOUTSOUND returned editorial heading markup.');
             }
             $title = trim($link->textContent);
-            if (trim($heading->textContent) !== $title || mb_strlen($title, 'UTF-8') > 255
-                || preg_match('/[\s\p{Z}\p{C}]/u', $title) !== 0
-                || str_contains($title, '...') || str_contains($title, '…')
-                || preg_match("/^[\p{L}\p{N}_][\p{L}\p{M}\p{N}_.()&'+,-]*-[\p{L}\p{N}_]+$/uD", $title) !== 1
-                || ! preg_match('/[._]/', $title) || isset($titles[mb_strtolower($title, 'UTF-8')])) {
+            if (trim($heading->textContent) !== $title || self::headingRejection($title) !== null
+                || isset($titles[mb_strtolower($title, 'UTF-8')])) {
                 throw new RuntimeException('SERIOUSABOUTSOUND returned a malformed or duplicate literal heading.');
             }
             $titles[mb_strtolower($title, 'UTF-8')] = true;
@@ -256,5 +265,112 @@ final class SeriousAboutSoundSource extends BoundedHttpFeedSource
     private function classToken(string $class): string
     {
         return 'contains(concat(" ", normalize-space(@class), " "), " '.$class.' ")';
+    }
+
+    /** Why a trimmed heading is not a literal release title, or null when it is one. */
+    private static function headingRejection(string $title): ?string
+    {
+        return match (true) {
+            mb_strlen($title, 'UTF-8') > 255 => 'overlength',
+            preg_match('/[\s\p{Z}\p{C}]/u', $title) !== 0 => 'control',
+            str_contains($title, '...') || str_contains($title, '…') => 'elided',
+            preg_match("/^[\p{L}\p{N}_][\p{L}\p{M}\p{N}_.()&'+,-]*-[\p{L}\p{N}_]+$/uD", $title) !== 1,
+            ! preg_match('/[._]/', $title) => 'noncanonical',
+            default => null,
+        };
+    }
+
+    /** Force the Wave 45.2 helper onto Rust (true) or PHP (false); null restores W452_RUST_FFI_DEFAULT. */
+    public static function useW452RustFfi(?bool $enable = true): void
+    {
+        self::$w452RustFfiOverride = $enable;
+    }
+
+    public static function usesW452RustFfi(): bool
+    {
+        return self::$w452RustFfiOverride ?? self::W452_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW452RustFfi(): void
+    {
+        self::$w452RustFfiOverride = null;
+        self::$w452RustFfiHandle = null;
+    }
+
+    /**
+     * Summarize heading texts as parseHtml() admits them: non-strings and invalid UTF-8 are invalid; trimmed
+     * headings are then empty, rejected by headingRejection(), mb_strtolower() duplicates or accepted.
+     *
+     * @param  array<array-key, mixed>  $titles
+     * @return array{total: int, invalid: int, empty: int, overlength: int, control: int, elided: int, noncanonical: int, duplicate: int, accepted: int}
+     */
+    public static function summarizeHeadingBatch(array $titles): array
+    {
+        return (self::usesW452RustFfi() ? self::summarizeHeadingBatchNative($titles) : null)
+            ?? self::summarizeHeadingBatchPhp($titles);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $titles
+     * @return array{total: int, invalid: int, empty: int, overlength: int, control: int, elided: int, noncanonical: int, duplicate: int, accepted: int}
+     */
+    public static function summarizeHeadingBatchPhp(array $titles): array
+    {
+        $summary = ['total' => \count($titles), 'invalid' => 0, 'empty' => 0, 'overlength' => 0, 'control' => 0, 'elided' => 0,
+            'noncanonical' => 0, 'duplicate' => 0, 'accepted' => 0];
+        $seen = [];
+        foreach ($titles as $text) {
+            if (! \is_string($text) || ! mb_check_encoding($text, 'UTF-8')) {
+                $summary['invalid']++;
+
+                continue;
+            }
+            $title = trim($text);
+            $reason = $title === '' ? 'empty' : self::headingRejection($title);
+            if ($reason === null) {
+                $identity = mb_strtolower($title, 'UTF-8');
+                if (! isset($seen[$identity])) {
+                    $seen[$identity] = true;
+                    $summary['accepted']++;
+
+                    continue;
+                }
+                $reason = 'duplicate';
+            }
+            $summary[$reason]++;
+        }
+
+        return $summary;
+    }
+
+    /**
+     * Null when the library is missing or a valid UTF-8 heading is not ASCII (Unicode classes stay in PHP).
+     *
+     * @param  array<array-key, mixed>  $titles
+     * @return array{total: int, invalid: int, empty: int, overlength: int, control: int, elided: int, noncanonical: int, duplicate: int, accepted: int}|null
+     */
+    public static function summarizeHeadingBatchNative(array $titles): ?array
+    {
+        $packed = PredatabaseSource::packW452Items($titles);
+        $values = $packed === null ? null : PredatabaseSource::callW452Native(self::w452RustFfi(), 4 | $packed[2], 0, $packed[0], $packed[1], 9);
+        if ($values === null) {
+            return null;
+        }
+        [$total, $invalid, $empty, $overlength, $control, $elided, $noncanonical, $duplicate, $accepted] = $values;
+        if ($total !== \count($titles) || min($values) < 0
+            || $invalid + $empty + $overlength + $control + $elided + $noncanonical + $duplicate + $accepted !== $total
+            || ($duplicate > 0 && $accepted === 0)) {
+            return null;
+        }
+
+        return ['total' => $total, 'invalid' => $invalid, 'empty' => $empty, 'overlength' => $overlength, 'control' => $control,
+            'elided' => $elided, 'noncanonical' => $noncanonical, 'duplicate' => $duplicate, 'accepted' => $accepted];
+    }
+
+    private static function w452RustFfi(): ?FFI
+    {
+        self::$w452RustFfiHandle ??= RustPipelineLibrary::resolveDomain(PredatabaseSource::W452_FFI_DOMAIN, PredatabaseSource::W452_FFI_CDEF) ?? false;
+
+        return self::$w452RustFfiHandle === false ? null : self::$w452RustFfiHandle;
     }
 }

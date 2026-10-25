@@ -30663,3 +30663,1031 @@ pub unsafe extern "C" fn nntmux_w442_par2_packet_metadata_proof_payload_sanitize
     }))
     .unwrap_or(-1)
 }
+/// Wave 45.2: batch title summaries for the nZEDb archive, predataba.se, RSS, scene SQL archive
+/// and SeriousAboutSound PreDB sources. Each op reads one concatenated byte blob plus a
+/// little-endian `u32` length per item and writes fixed native-endian `i64` counters.
+mod wave45_predb_feed_source_batch {
+    use super::{memchr, nfo_abi_range, yenc_ranges_overlap};
+    use std::collections::HashSet;
+    use std::hash::{BuildHasherDefault, Hasher};
+    use std::slice;
+
+    pub(super) const MAX_INPUT: usize = 16 * 1024 * 1024;
+
+    /// Length sentinel for a null or non-string item.
+    const NULL: u32 = u32::MAX;
+    /// Length sentinel for a non-array scene SQL row (both of its slots).
+    const INVALID: u32 = u32::MAX - 1;
+
+    /// Operation bit: the blob holds the items separated by NUL bytes and `lens` is empty.
+    pub(super) const DELIMITED: u32 = 0x100;
+
+    /// Most counters any op answers.
+    const MAX_SLOTS: usize = 9;
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Item<'a> {
+        Text(&'a [u8]),
+        Null,
+        Invalid,
+    }
+
+    /// Folded-multiply hasher over 16-byte blocks. The sets only hold one bounded batch, so
+    /// SipHash's flooding resistance buys nothing here; equal hashes still compare in full.
+    #[derive(Default)]
+    struct Fold(u64);
+
+    const SEEDS: [u64; 4] = [
+        0x243f_6a88_85a3_08d3,
+        0x1319_8a2e_0370_7344,
+        0xa409_3822_299f_31d0,
+        0x082e_fa98_ec4e_6c89,
+    ];
+
+    #[inline]
+    fn fold_mul(a: u64, b: u64) -> u64 {
+        let product = u128::from(a) * u128::from(b);
+        (product as u64) ^ ((product >> 64) as u64)
+    }
+
+    impl Hasher for Fold {
+        fn write(&mut self, bytes: &[u8]) {
+            let len = bytes.len();
+            let word = |at: usize| {
+                let mut chunk = [0u8; 8];
+                chunk.copy_from_slice(&bytes[at..at + 8]);
+                u64::from_le_bytes(chunk)
+            };
+            let mut acc = self.0 ^ (len as u64).wrapping_mul(SEEDS[0]);
+            if len >= 16 {
+                // Each block's product is independent of the accumulator, so blocks pipeline.
+                for block in bytes.as_chunks::<16>().0 {
+                    let (a, b) = block.split_at(8);
+                    let a = u64::from_le_bytes(a.try_into().unwrap_or_default());
+                    let b = u64::from_le_bytes(b.try_into().unwrap_or_default());
+                    acc = acc
+                        .rotate_left(29)
+                        .wrapping_add(fold_mul(a ^ SEEDS[1], b ^ SEEDS[2]));
+                }
+                acc = acc.rotate_left(29).wrapping_add(fold_mul(
+                    word(len - 16) ^ SEEDS[2],
+                    word(len - 8) ^ SEEDS[3],
+                ));
+            } else if len >= 8 {
+                acc = fold_mul(acc ^ word(0) ^ SEEDS[1], word(len - 8) ^ SEEDS[2]);
+            } else if len > 0 {
+                let mut tail = [0u8; 8];
+                tail[..len].copy_from_slice(bytes);
+                acc = fold_mul(acc ^ u64::from_le_bytes(tail) ^ SEEDS[1], SEEDS[2]);
+            }
+            self.0 = acc;
+        }
+
+        fn write_usize(&mut self, value: usize) {
+            // The slice length prefix; write() mixes the length in as well.
+            self.0 ^= value as u64;
+        }
+
+        fn finish(&self) -> u64 {
+            fold_mul(self.0 ^ SEEDS[3], SEEDS[0])
+        }
+    }
+
+    type FoldSet<'a> = HashSet<&'a [u8], BuildHasherDefault<Fold>>;
+
+    fn set_with<'a>(capacity: usize) -> FoldSet<'a> {
+        HashSet::with_capacity_and_hasher(capacity, BuildHasherDefault::default())
+    }
+
+    /// The blob split by its `u32` lengths; the lengths must cover the blob exactly.
+    fn items<'a>(blob: &'a [u8], lens: &[u8]) -> Option<Vec<Item<'a>>> {
+        let (words, rest) = lens.as_chunks::<4>();
+        if !rest.is_empty() {
+            return None;
+        }
+        let mut offset = 0usize;
+        let mut out = Vec::with_capacity(words.len());
+        for word in words {
+            out.push(match u32::from_le_bytes(*word) {
+                NULL => Item::Null,
+                INVALID => Item::Invalid,
+                length => {
+                    let end = offset.checked_add(length as usize)?;
+                    let text = blob.get(offset..end)?;
+                    offset = end;
+                    Item::Text(text)
+                }
+            });
+        }
+        (offset == blob.len()).then_some(out)
+    }
+
+    /// The blob split at every NUL byte: one more item than separators.
+    fn delimited(blob: &[u8]) -> Vec<Item<'_>> {
+        let mut out = Vec::with_capacity(64);
+        let mut start = 0usize;
+        loop {
+            let rest = &blob[start..];
+            // SAFETY: `rest` is a live slice; memchr reads at most `rest.len()` bytes.
+            let found = unsafe { memchr(rest.as_ptr(), 0, rest.len()) };
+            if found.is_null() {
+                out.push(Item::Text(rest));
+                return out;
+            }
+            let at = found as usize - rest.as_ptr() as usize;
+            out.push(Item::Text(&rest[..at]));
+            start += at + 1;
+        }
+    }
+
+    /// PHP `trim()` with its default character list.
+    fn php_trim(text: &[u8]) -> &[u8] {
+        let keep = |b: &u8| !matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0 | 0x0b);
+        let start = text.iter().position(keep).unwrap_or(text.len());
+        let end = text.iter().rposition(keep).map_or(start, |end| end + 1);
+        &text[start..end]
+    }
+
+    /// PCRE `\s` without UCP: ASCII space, tab, LF, VT, FF and CR.
+    #[inline]
+    fn pcre_space(b: u8) -> bool {
+        (b == b' ') | (b.wrapping_sub(b'\t') < 5)
+    }
+
+    /// `[A-Za-z0-9_]`, branch-free so the folds below vectorize.
+    #[inline]
+    fn word_byte(b: u8) -> bool {
+        ((b | 0x20).wrapping_sub(b'a') < 26) | (b.wrapping_sub(b'0') < 10) | (b == b'_')
+    }
+
+    /// `[A-Za-z0-9_.()&'+,-]`.
+    #[inline]
+    fn body_byte(b: u8) -> bool {
+        // `&'()+,-.` is 0x26..=0x2e without `*` (0x2a).
+        word_byte(b) | ((b.wrapping_sub(b'&') < 9) & (b != b'*'))
+    }
+
+    /// A byte no scan below matches: a body and word byte that is not a space, control or dot.
+    const NEUTRAL: u8 = b'a';
+
+    /// Whether any byte matches. Each 32-byte block ORs into lane accumulators that are reduced
+    /// once, so the compiler vectorizes the scan; the tail is the overlapping last block, or a
+    /// NEUTRAL-padded copy for texts under 32 bytes.
+    #[inline]
+    fn any_byte(text: &[u8], matches: impl Fn(u8) -> bool) -> bool {
+        let mut lanes = [0u8; 32];
+        let mut add = |block: &[u8; 32]| {
+            for (lane, &b) in lanes.iter_mut().zip(block) {
+                *lane |= u8::from(matches(b));
+            }
+        };
+        let (blocks, rest) = text.as_chunks::<32>();
+        for block in blocks {
+            add(block);
+        }
+        if !rest.is_empty() {
+            match text.last_chunk::<32>() {
+                Some(last) => add(last),
+                None => {
+                    let mut last = [NEUTRAL; 32];
+                    last[..rest.len()].copy_from_slice(rest);
+                    add(&last);
+                }
+            }
+        }
+        lanes.iter().fold(0u8, |seen, &lane| seen | lane) != 0
+    }
+
+    /// Any C0 control or DEL: `[\x00-\x1f\x7f]`.
+    fn has_c0_or_del(text: &[u8]) -> bool {
+        any_byte(text, |b| (b < 0x20) | (b == 0x7f))
+    }
+
+    /// `...` anywhere in the text: 16 start positions per block of 18 bytes, ORed into lane
+    /// accumulators; the final positions read a NEUTRAL-padded copy.
+    fn has_ellipsis(text: &[u8]) -> bool {
+        let mut lanes = [0u8; 16];
+        let mut add = |window: &[u8; 18]| {
+            for (i, lane) in lanes.iter_mut().enumerate() {
+                *lane |= u8::from(
+                    (window[i] == b'.') & (window[i + 1] == b'.') & (window[i + 2] == b'.'),
+                );
+            }
+        };
+        let mut start = 0usize;
+        while let Some(window) = text.get(start..).and_then(|rest| rest.first_chunk::<18>()) {
+            add(window);
+            start += 16;
+        }
+        if start + 2 < text.len() {
+            let rest = &text[start..];
+            let mut window = [NEUTRAL; 18];
+            window[..rest.len()].copy_from_slice(rest);
+            add(&window);
+        }
+        lanes.iter().fold(0u8, |seen, &lane| seen | lane) != 0
+    }
+
+    /// `^[A-Za-z0-9_.()&'+,-]+-[A-Za-z0-9_]+$` (the last dash splits the group).
+    fn dashed_group(text: &[u8]) -> bool {
+        let Some(dash) = text.iter().rposition(|&b| b == b'-') else {
+            return false;
+        };
+        dash > 0
+            && dash + 1 < text.len()
+            && !any_byte(&text[..dash], |b| !body_byte(b))
+            && !any_byte(&text[dash + 1..], |b| !word_byte(b))
+    }
+
+    /// The batch's ASCII-lowercased candidates, deduplicated through one arena.
+    struct Folded {
+        arena: Vec<u8>,
+        ranges: Vec<(usize, usize)>,
+    }
+
+    impl Folded {
+        fn new(capacity: usize) -> Self {
+            Self {
+                arena: Vec::with_capacity(capacity),
+                ranges: Vec::new(),
+            }
+        }
+
+        fn push(&mut self, text: &[u8]) {
+            let start = self.arena.len();
+            self.arena.extend_from_slice(text);
+            self.arena[start..].make_ascii_lowercase();
+            self.ranges.push((start, self.arena.len()));
+        }
+
+        fn distinct(&self) -> i64 {
+            let mut set = set_with(self.ranges.len());
+            for &(start, end) in &self.ranges {
+                set.insert(&self.arena[start..end]);
+            }
+            set.len() as i64
+        }
+    }
+
+    /// Op 0: `NzedbArchiveSource::summarizeTitleBatch`: non-strings are empty, invalid UTF-8 is
+    /// invalid, then `titleRejection()` and `mb_strtolower()` duplicates. Declines (None) when a
+    /// title reaching the duplicate check is not ASCII, because full Unicode case folding stays in
+    /// PHP.
+    fn nzedb_titles(rows: &[Item<'_>], arena: usize) -> Option<Vec<i64>> {
+        // empty, invalid, outer_whitespace, overlength, control
+        let mut counts = [0i64; 5];
+        let mut folded = Folded::new(arena);
+        for row in rows {
+            let title = match *row {
+                Item::Text(title) => title,
+                Item::Null => {
+                    counts[0] += 1;
+                    continue;
+                }
+                Item::Invalid => return None,
+            };
+            let ascii = title.is_ascii();
+            if !ascii && std::str::from_utf8(title).is_err() {
+                counts[1] += 1;
+                continue;
+            }
+            let trimmed = php_trim(title);
+            let characters = if ascii {
+                title.len()
+            } else {
+                title.iter().filter(|&&b| b & 0xc0 != 0x80).count()
+            };
+            let slot = if trimmed.is_empty() {
+                0
+            } else if trimmed.len() != title.len() {
+                2
+            } else if characters > 255 {
+                3
+            } else if has_c0_or_del(title)
+                || (!ascii
+                    && title
+                        .windows(2)
+                        .any(|w| w[0] == 0xc2 && (0x80..=0x9f).contains(&w[1])))
+            {
+                4
+            } else if !ascii {
+                return None;
+            } else {
+                folded.push(title);
+                continue;
+            };
+            counts[slot] += 1;
+        }
+        let candidates = folded.ranges.len() as i64;
+        let distinct = folded.distinct();
+        let mut out = Vec::with_capacity(8);
+        out.extend_from_slice(&[rows.len() as i64, distinct]);
+        out.extend_from_slice(&counts);
+        out.push(candidates - distinct);
+        Some(out)
+    }
+
+    /// Op 1: `PredatabaseSource::summarizeRlsnameBatch`: non-strings are invalid, then names
+    /// that trim to nothing are empty; the rest are accepted, counting those trim() changed and
+    /// the distinct trimmed names.
+    fn predatabase_names(rows: &[Item<'_>]) -> Option<Vec<i64>> {
+        let (mut invalid, mut empty, mut trimmed) = (0i64, 0i64, 0i64);
+        let mut names = set_with(rows.len());
+        for row in rows {
+            let name = match *row {
+                Item::Text(name) => name,
+                Item::Null => {
+                    invalid += 1;
+                    continue;
+                }
+                Item::Invalid => return None,
+            };
+            let title = php_trim(name);
+            if title.is_empty() {
+                empty += 1;
+                continue;
+            }
+            if title.len() != name.len() {
+                trimmed += 1;
+            }
+            names.insert(title);
+        }
+        let accepted = rows.len() as i64 - invalid - empty;
+        Some(vec![
+            rows.len() as i64,
+            invalid,
+            empty,
+            accepted,
+            trimmed,
+            names.len() as i64,
+        ])
+    }
+
+    /// Where `/ \x{2013} [0-9]+(?:\.[0-9]+)? (?:MB|GB)$/u` would cut a (trimmed) title.
+    fn size_suffix(title: &[u8]) -> Option<usize> {
+        let unit = title.len().checked_sub(3)?;
+        if !matches!(&title[unit..], b" MB" | b" GB") {
+            return None;
+        }
+        let digits = |end: usize| {
+            title[..end]
+                .iter()
+                .rev()
+                .take_while(|b| b.is_ascii_digit())
+                .count()
+        };
+        let fraction = digits(unit);
+        if fraction == 0 {
+            return None;
+        }
+        let mut start = unit - fraction;
+        if start > 0 && title[start - 1] == b'.' {
+            let whole = digits(start - 1);
+            if whole == 0 {
+                return None;
+            }
+            start -= 1 + whole;
+        }
+        let cut = start.checked_sub(5)?;
+        (&title[cut..start] == b" \xe2\x80\x93 ").then_some(cut)
+    }
+
+    /// Op 2: `RssFeedSource::summarizeItemTitleBatch`; flag 1 is `$spacedTitles` and flag 2
+    /// `$stripDisplaySizeSuffix`.
+    fn rss_titles(rows: &[Item<'_>], flags: u32) -> Option<Vec<i64>> {
+        if flags & !3 != 0 {
+            return None;
+        }
+        let (spaced, strip) = (flags & 1 != 0, flags & 2 != 0);
+        // invalid, stripped, eztv, empty, spaced, accepted, changed
+        let mut counts = [0i64; 7];
+        let mut dotted = Vec::with_capacity(256);
+        for row in rows {
+            let text = match *row {
+                Item::Text(text) => text,
+                Item::Null => {
+                    counts[0] += 1;
+                    continue;
+                }
+                Item::Invalid => return None,
+            };
+            let mut title = php_trim(text);
+            if strip
+                && std::str::from_utf8(title).is_ok()
+                && let Some(cut) = size_suffix(title)
+            {
+                title = &title[..cut];
+                counts[1] += 1;
+            }
+            if spaced {
+                let mut base = php_trim(title);
+                let len = base.len();
+                if len > 4
+                    && base[len - 4..].eq_ignore_ascii_case(b"eztv")
+                    && pcre_space(base[len - 5])
+                {
+                    let mut start = len - 5;
+                    while start > 0 && pcre_space(base[start - 1]) {
+                        start -= 1;
+                    }
+                    base = &base[..start];
+                    counts[2] += 1;
+                }
+                if any_byte(base, pcre_space) {
+                    dotted.clear();
+                    let mut in_space = false;
+                    for &b in base {
+                        if !pcre_space(b) {
+                            dotted.push(b);
+                        } else if !in_space {
+                            dotted.push(b'.');
+                        }
+                        in_space = pcre_space(b);
+                    }
+                    title = &dotted;
+                } else {
+                    title = base;
+                }
+            }
+            let slot = if title.is_empty() {
+                3
+            } else if any_byte(title, |b| b == b' ') {
+                4
+            } else {
+                if title != text {
+                    counts[6] += 1;
+                }
+                5
+            };
+            counts[slot] += 1;
+        }
+        let mut out = Vec::with_capacity(8);
+        out.push(rows.len() as i64);
+        out.extend_from_slice(&counts);
+        Some(out)
+    }
+
+    /// Op 3: `SceneArchiveSqlSource::summarizeEligibilityBatch` over `[title, group]` length pairs:
+    /// both INVALID marks a non-array row or a non-string, non-null field; NULL is a null field.
+    /// Then `eligibilityReason()`, with eligible titles deduplicated through `strtolower()`.
+    fn scene_rows(rows: &[Item<'_>], arena: usize) -> Option<Vec<i64>> {
+        if !rows.len().is_multiple_of(2) {
+            return None;
+        }
+        // invalid, noncanonical, group_conflict
+        let mut counts = [0i64; 3];
+        let mut folded = Folded::new(arena);
+        for pair in rows.as_chunks::<2>().0 {
+            let (title, group) = match *pair {
+                [Item::Invalid, Item::Invalid] => {
+                    counts[0] += 1;
+                    continue;
+                }
+                [Item::Invalid, _] | [_, Item::Invalid] => return None,
+                [title, group] => (title, group),
+            };
+            let title: &[u8] = match title {
+                Item::Text(title) => title,
+                _ => b"",
+            };
+            let group: &[u8] = match group {
+                Item::Text(group) => group,
+                _ => b"",
+            };
+            if !dashed_group(title) {
+                counts[1] += 1;
+                continue;
+            }
+            let tail = title.len().checked_sub(group.len() + 1);
+            let conflict = match tail {
+                _ if group.is_empty() => true,
+                None => true,
+                Some(at) => title[at] != b'-' || !title[at + 1..].eq_ignore_ascii_case(group),
+            };
+            if conflict {
+                counts[2] += 1;
+                continue;
+            }
+            folded.push(title);
+        }
+        let total = (rows.len() / 2) as i64;
+        let eligible = folded.ranges.len() as i64;
+        let mut out = Vec::with_capacity(6);
+        out.push(total);
+        out.extend_from_slice(&counts);
+        out.extend_from_slice(&[eligible, folded.distinct()]);
+        Some(out)
+    }
+
+    /// Op 4: `SeriousAboutSoundSource::summarizeHeadingBatch`: non-strings and invalid UTF-8 are
+    /// invalid; trimmed headings are then empty, overlength, whitespace/control, elided,
+    /// noncanonical, duplicate or accepted as `headingRejection()` orders them. Declines (None)
+    /// for a non-ASCII heading, whose Unicode property classes stay in PHP.
+    fn sas_headings(rows: &[Item<'_>], arena: usize) -> Option<Vec<i64>> {
+        // invalid, empty, overlength, control, elided, noncanonical
+        let mut counts = [0i64; 6];
+        let mut folded = Folded::new(arena);
+        for row in rows {
+            let text = match *row {
+                Item::Text(text) => text,
+                Item::Null => {
+                    counts[0] += 1;
+                    continue;
+                }
+                Item::Invalid => return None,
+            };
+            if !text.is_ascii() {
+                if std::str::from_utf8(text).is_err() {
+                    counts[0] += 1;
+                    continue;
+                }
+                return None;
+            }
+            let title = php_trim(text);
+            let slot = if title.is_empty() {
+                1
+            } else if title.len() > 255 {
+                2
+            } else if any_byte(title, |b| (b <= b' ') | (b == 0x7f)) {
+                3
+            } else if has_ellipsis(title) {
+                4
+            } else if !word_byte(title[0])
+                || !dashed_group(title)
+                || !any_byte(title, |b| (b == b'.') | (b == b'_'))
+            {
+                5
+            } else {
+                folded.push(title);
+                continue;
+            };
+            counts[slot] += 1;
+        }
+        let candidates = folded.ranges.len() as i64;
+        let distinct = folded.distinct();
+        let mut out = Vec::with_capacity(9);
+        out.push(rows.len() as i64);
+        out.extend_from_slice(&counts);
+        out.extend_from_slice(&[candidates - distinct, distinct]);
+        Some(out)
+    }
+
+    fn compute(operation: u32, flags: u32, blob: &[u8], lens: &[u8]) -> Option<Vec<i64>> {
+        let rows = if operation & DELIMITED != 0 {
+            if !lens.is_empty() {
+                return None;
+            }
+            delimited(blob)
+        } else {
+            items(blob, lens)?
+        };
+        let operation = operation & !DELIMITED;
+        if operation != 2 && flags != 0 {
+            return None;
+        }
+        match operation {
+            0 => nzedb_titles(&rows, blob.len()),
+            1 => predatabase_names(&rows),
+            2 => rss_titles(&rows, flags),
+            3 => scene_rows(&rows, blob.len()),
+            4 => sas_headings(&rows, blob.len()),
+            _ => None,
+        }
+    }
+
+    /// # Safety
+    /// See [`super::nntmux_w452_predb_feed_source_batch`].
+    #[allow(clippy::too_many_arguments)]
+    pub(super) unsafe fn evaluate(
+        operation: u32,
+        flags: u32,
+        blob: *const u8,
+        blob_len: usize,
+        lens: *const u8,
+        lens_len: usize,
+        output: *mut u8,
+        capacity: usize,
+    ) -> isize {
+        if !nfo_abi_range(blob, blob_len, false)
+            || !nfo_abi_range(lens, lens_len, false)
+            || !nfo_abi_range(output, capacity, false)
+            || blob_len > MAX_INPUT
+            || lens_len > MAX_INPUT
+            || yenc_ranges_overlap(blob as usize, blob_len, output as usize, capacity)
+            || yenc_ranges_overlap(lens as usize, lens_len, output as usize, capacity)
+        {
+            return -1;
+        }
+        let blob = unsafe { slice::from_raw_parts(blob, blob_len) };
+        let lens = unsafe { slice::from_raw_parts(lens, lens_len) };
+        let Some(result) = compute(operation, flags, blob, lens) else {
+            return -1;
+        };
+        debug_assert!(result.len() <= MAX_SLOTS);
+        let needed = result.len() * 8;
+        if needed > capacity {
+            return -(needed as isize);
+        }
+        let out = unsafe { slice::from_raw_parts_mut(output, needed) };
+        for (chunk, value) in out.as_chunks_mut::<8>().0.iter_mut().zip(&result) {
+            chunk.copy_from_slice(&value.to_ne_bytes());
+        }
+        needed as isize
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn pack(items: &[Option<&[u8]>]) -> (Vec<u8>, Vec<u8>) {
+            let mut blob = vec![];
+            let mut lens = vec![];
+            for item in items {
+                let length = match item {
+                    Some(text) => {
+                        blob.extend_from_slice(text);
+                        text.len() as u32
+                    }
+                    None => NULL,
+                };
+                lens.extend_from_slice(&length.to_le_bytes());
+            }
+            (blob, lens)
+        }
+
+        fn call_raw(operation: u32, flags: u32, blob: &[u8], lens: &[u8]) -> Option<Vec<i64>> {
+            let mut out = vec![0xa5u8; 128];
+            let written = unsafe {
+                evaluate(
+                    operation,
+                    flags,
+                    blob.as_ptr(),
+                    blob.len(),
+                    lens.as_ptr(),
+                    lens.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            if written < 0 {
+                assert_eq!(written, -1);
+                return None;
+            }
+            Some(
+                out[..written as usize]
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|c| i64::from_ne_bytes(*c))
+                    .collect(),
+            )
+        }
+
+        fn call(operation: u32, flags: u32, items: &[Option<&[u8]>]) -> Option<Vec<i64>> {
+            let (blob, lens) = pack(items);
+            call_raw(operation, flags, &blob, &lens)
+        }
+
+        #[test]
+        fn w45_2_nzedb_titles() {
+            let long = [b'a'; 256];
+            let max = [b'a'; 255];
+            // 255 two-byte characters stay within the character limit.
+            let wide = "\u{e9}".repeat(255);
+            let items: [Option<&[u8]>; 13] = [
+                Some(b"Movie.2024.1080p-GRP"),
+                Some(b"movie.2024.1080P-grp"),
+                Some(b"Other-GRP"),
+                None,
+                Some(b" \t\0"),
+                Some(b" Lead-GRP"),
+                Some(&long),
+                Some(&max),
+                Some(b"Ctl\x7f-GRP"),
+                Some(b"C1\xc2\x85-GRP"),
+                Some(b"bad\xff"),
+                Some(b"\x0cForm-GRP"),
+                Some(b""),
+            ];
+            // total, accepted, empty, invalid, outer, overlength, control, duplicate
+            assert_eq!(call(0, 0, &items), Some(vec![13, 3, 3, 1, 1, 1, 3, 1]));
+            assert_eq!(call(0, 0, &[Some(wide.as_bytes())]), None);
+            let wide = "\u{e9}".repeat(256);
+            assert_eq!(
+                call(0, 0, &[Some(wide.as_bytes())]),
+                Some(vec![1, 0, 0, 0, 0, 1, 0, 0])
+            );
+            assert_eq!(call(0, 0, &[]), Some(vec![0; 8]));
+        }
+
+        #[test]
+        fn w45_2_predatabase_names() {
+            let items: [Option<&[u8]>; 7] = [
+                Some(b"Movie-GRP"),
+                Some(b" Movie-GRP\n"),
+                Some(b"movie-grp"),
+                Some(b"\x0b\0 "),
+                Some(b""),
+                None,
+                Some(b"\x0cX"),
+            ];
+            assert_eq!(call(1, 0, &items), Some(vec![7, 1, 2, 4, 1, 3]));
+            assert_eq!(call(1, 0, &[]), Some(vec![0; 6]));
+            assert_eq!(call(1, 1, &[]), None);
+        }
+
+        #[test]
+        fn w45_2_rss_titles() {
+            assert_eq!(size_suffix(b"Album \xe2\x80\x93 12.5 MB"), Some(5));
+            assert_eq!(size_suffix(b"Album \xe2\x80\x93 700 GB"), Some(5));
+            assert_eq!(size_suffix(b"Album \xe2\x80\x93 .5 MB"), None);
+            assert_eq!(size_suffix(b"Album \xe2\x80\x93 1.2.3 MB"), None);
+            assert_eq!(size_suffix(b"Album - 12 MB"), None);
+            assert_eq!(size_suffix(b"\xe2\x80\x93 1 MB"), None);
+            assert_eq!(size_suffix(b" \xe2\x80\x93 1 MB"), Some(0));
+            assert_eq!(size_suffix(b"x \xe2\x80\x93 1 mb"), None);
+            let items: [Option<&[u8]>; 8] = [
+                Some(b"Show S01E01 720p WEB h264-GRP EZTV"),
+                Some(b" Album-GRP \xe2\x80\x93 12.5 MB "),
+                Some(b"Show.Name-GRP"),
+                Some(b"Spaced Title"),
+                Some(b"  "),
+                None,
+                Some(b"bad\xff \xe2\x80\x93 1 MB"),
+                Some(b"a \t b\x0cc"),
+            ];
+            // total, invalid, stripped, eztv, empty, spaced, accepted, changed
+            assert_eq!(call(2, 0, &items), Some(vec![8, 1, 0, 0, 1, 5, 1, 0]));
+            assert_eq!(call(2, 2, &items), Some(vec![8, 1, 1, 0, 1, 4, 2, 1]));
+            assert_eq!(call(2, 1, &items), Some(vec![8, 1, 0, 1, 1, 0, 6, 5]));
+            assert_eq!(call(2, 3, &items), Some(vec![8, 1, 1, 1, 1, 0, 6, 5]));
+            assert_eq!(
+                call(2, 1, &[Some(b"EZTV"), Some(b" eztv")]),
+                Some(vec![2, 0, 0, 0, 0, 0, 2, 1])
+            );
+            assert_eq!(call(2, 4, &items), None);
+        }
+
+        #[test]
+        fn w45_2_scene_rows() {
+            let invalid = INVALID.to_le_bytes();
+            let mut blob = vec![];
+            let mut lens = vec![];
+            for (title, group) in [
+                (Some(&b"Movie.2007-GRP"[..]), Some(&b"grp"[..])),
+                (Some(b"movie.2007-grp"), Some(b"GRP")),
+                (Some(b"Other(2007)&Co-X_1"), Some(b"x_1")),
+                (Some(b"Bad Title-GRP"), Some(b"GRP")),
+                (Some(b"Title-GRP"), Some(b"OTHER")),
+                (Some(b"Title-GRP"), None),
+                (Some(b"Title-GRP"), Some(b"")),
+                (None, Some(b"GRP")),
+                (Some(b"A-B-C"), Some(b"b-c")),
+            ] {
+                for part in [title, group] {
+                    match part {
+                        Some(text) => {
+                            blob.extend_from_slice(text);
+                            lens.extend_from_slice(&(text.len() as u32).to_le_bytes());
+                        }
+                        None => lens.extend_from_slice(&NULL.to_le_bytes()),
+                    }
+                }
+            }
+            lens.extend_from_slice(&invalid);
+            lens.extend_from_slice(&invalid);
+            // total, invalid, noncanonical, group_conflict, eligible, distinct
+            assert_eq!(call_raw(3, 0, &blob, &lens), Some(vec![10, 1, 2, 3, 4, 3]));
+            assert_eq!(call_raw(3, 0, b"", &invalid), None);
+            let mut half = invalid.to_vec();
+            half.extend_from_slice(&NULL.to_le_bytes());
+            assert_eq!(call_raw(3, 0, b"", &half), None);
+            assert_eq!(call_raw(3, 0, b"", b""), Some(vec![0; 6]));
+        }
+
+        #[test]
+        fn w45_2_sas_headings() {
+            let long = [b'a'; 256];
+            let items: [Option<&[u8]>; 12] = [
+                Some(b"Artist-Album.WEB-2024-GRP"),
+                Some(b" artist-album.web-2024-grp "),
+                Some(b"Artist_Album-GRP"),
+                Some(b"Artist Album-GRP"),
+                Some(b"Artist...Album-GRP"),
+                Some(b"NoSeparator-GRP"),
+                Some(b"-Lead.Dash-GRP"),
+                Some(b"Trail.Dash-"),
+                Some(b"bad\xff"),
+                None,
+                Some(b" \0"),
+                Some(&long),
+            ];
+            // total, invalid, empty, overlength, control, elided, noncanonical, duplicate, accepted
+            assert_eq!(call(4, 0, &items), Some(vec![12, 2, 1, 1, 1, 1, 3, 1, 2]));
+            assert_eq!(call(4, 0, &[Some("Caf\u{e9}.Album-GRP".as_bytes())]), None);
+            assert_eq!(call(4, 0, &[]), Some(vec![0; 9]));
+        }
+
+        #[test]
+        fn w45_2_delimited_batches() {
+            let names: [&[u8]; 5] = [b"Movie-GRP", b" Movie-GRP\n", b"", b"movie-grp", b"\x0cX"];
+            let joined = names.join(&0u8);
+            let listed: Vec<Option<&[u8]>> = names.iter().map(|n| Some(*n)).collect();
+            for op in 0..5u32 {
+                let (blob, lens) = if op == 3 {
+                    pack(&listed[..4])
+                } else {
+                    pack(&listed)
+                };
+                let joined = if op == 3 {
+                    names[..4].join(&0u8)
+                } else {
+                    joined.clone()
+                };
+                assert_eq!(
+                    call_raw(op | DELIMITED, 0, &joined, b""),
+                    call_raw(op, 0, &blob, &lens),
+                    "op {op}"
+                );
+            }
+            // One item per separator plus one; lengths are not accepted alongside.
+            assert_eq!(
+                call_raw(1 | DELIMITED, 0, b"", b""),
+                Some(vec![1, 0, 1, 0, 0, 0])
+            );
+            assert_eq!(
+                call_raw(1 | DELIMITED, 0, b"\0", b""),
+                Some(vec![2, 0, 2, 0, 0, 0])
+            );
+            assert_eq!(call_raw(1 | DELIMITED, 0, b"a", &1u32.to_le_bytes()), None);
+            assert_eq!(
+                call_raw(2 | DELIMITED, 3, b"a b EZTV", b""),
+                Some(vec![1, 0, 0, 1, 0, 0, 1, 1])
+            );
+            assert_eq!(call_raw(3 | DELIMITED, 0, b"a", b""), None);
+            assert_eq!(call_raw(5 | DELIMITED, 0, b"a", b""), None);
+            assert_eq!(call_raw(1 | DELIMITED | 0x200, 0, b"a", b""), None);
+        }
+
+        #[test]
+        fn w45_2_byte_classes_and_hash() {
+            for b in 0..=255u8 {
+                assert_eq!(word_byte(b), b.is_ascii_alphanumeric() || b == b'_', "{b}");
+                assert_eq!(
+                    body_byte(b),
+                    word_byte(b) || b".()&'+,-".contains(&b),
+                    "{b}"
+                );
+                assert_eq!(
+                    pcre_space(b),
+                    matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r'),
+                    "{b}"
+                );
+            }
+            assert!(
+                has_ellipsis(b"a...b")
+                    && has_ellipsis(b"...")
+                    && !has_ellipsis(b"a..b.")
+                    && !has_ellipsis(b"..")
+            );
+            let hash = |bytes: &[u8]| {
+                let mut h = Fold::default();
+                h.write(bytes);
+                h.finish()
+            };
+            let long = [b'x'; 40];
+            let mut other = long;
+            other[20] = b'y';
+            assert_ne!(hash(&long), hash(&other));
+            assert_ne!(hash(b"abcdefgh"), hash(b"abcdefgi"));
+            assert_ne!(hash(b""), hash(b"\0"));
+            let distinct: HashSet<u64> = (0..5000)
+                .map(|i| hash(format!("Mirror.Release.Part{i}-GRP").as_bytes()))
+                .collect();
+            assert_eq!(distinct.len(), 5000);
+        }
+
+        #[test]
+        fn w45_2_abi_sentinels() {
+            let (blob, lens) = pack(&[Some(b"Movie-GRP")]);
+            for op in [5, u32::MAX] {
+                assert_eq!(call_raw(op, 0, &blob, &lens), None);
+            }
+            assert_eq!(call_raw(1, 0, &blob, &lens[..3]), None);
+            assert_eq!(call_raw(1, 0, b"Movie-GRPx", &lens), None);
+            assert_eq!(call_raw(1, 0, b"Movie", &lens), None);
+            assert_eq!(call_raw(1, 0, b"", &INVALID.to_le_bytes()), None);
+            let mut out = [0x5au8; 64];
+            let run = |b: *const u8, bl: usize, l: *const u8, ll: usize, o: *mut u8, cap: usize| unsafe {
+                evaluate(1, 0, b, bl, l, ll, o, cap)
+            };
+            let o = out.as_mut_ptr();
+            assert_eq!(run(std::ptr::null(), 0, lens.as_ptr(), 4, o, 64), -1);
+            assert_eq!(
+                run(blob.as_ptr(), blob.len(), std::ptr::null(), 0, o, 64),
+                -1
+            );
+            assert_eq!(
+                run(
+                    blob.as_ptr(),
+                    blob.len(),
+                    lens.as_ptr(),
+                    4,
+                    std::ptr::null_mut(),
+                    0
+                ),
+                -1
+            );
+            assert_eq!(
+                run(blob.as_ptr(), MAX_INPUT + 1, lens.as_ptr(), 4, o, 64),
+                -1
+            );
+            assert_eq!(
+                run(blob.as_ptr(), blob.len(), lens.as_ptr(), 4, o, usize::MAX),
+                -1
+            );
+            for cap in [0, 1, 47] {
+                assert_eq!(
+                    run(blob.as_ptr(), blob.len(), lens.as_ptr(), 4, o, cap),
+                    -48
+                );
+            }
+            assert!(out.iter().all(|b| *b == 0x5a));
+            assert_eq!(
+                run(
+                    blob.as_ptr(),
+                    blob.len(),
+                    lens.as_ptr(),
+                    4,
+                    out.as_mut_ptr(),
+                    48
+                ),
+                48
+            );
+            assert!(out[48..].iter().all(|b| *b == 0x5a));
+            let mut shared = [0u8; 96];
+            shared[..9].copy_from_slice(&blob);
+            shared[9..13].copy_from_slice(&lens);
+            let p = shared.as_mut_ptr();
+            assert_eq!(
+                run(p, 9, unsafe { p.add(9) }, 4, unsafe { p.add(4) }, 48),
+                -1
+            );
+            assert_eq!(
+                run(p, 9, unsafe { p.add(9) }, 4, unsafe { p.add(12) }, 48),
+                -1
+            );
+            assert_eq!(
+                run(p, 9, unsafe { p.add(9) }, 4, unsafe { p.add(16) }, 48),
+                48
+            );
+            let export = |op: u32, flags: u32, out: &mut [u8]| unsafe {
+                super::super::nntmux_w452_predb_feed_source_batch(
+                    op,
+                    flags,
+                    blob.as_ptr(),
+                    blob.len(),
+                    lens.as_ptr(),
+                    lens.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert_eq!(export(1, 0, &mut out), 48);
+            assert_eq!(export(1, 1, &mut out), -1);
+            assert_eq!(export(2, 3, &mut out), 64);
+        }
+    }
+}
+
+/// Evaluate one Wave 45.2 PreDB feed-source summary over `blob`, the concatenated item bytes, and
+/// `lens`, one little-endian `u32` length per item (`u32::MAX` marks a null or non-string item,
+/// `u32::MAX - 1` both slots of an invalid scene SQL row). Op 0 summarizes nZEDb archive titles,
+/// op 1 predataba.se release names, op 2 RSS item titles (`flags` bit 0 spaced titles, bit 1
+/// display-size suffix stripping), op 3 scene SQL `[title, group]` pairs and op 4
+/// SeriousAboutSound headings; other ops need zero `flags`. Writes native-endian `i64`
+/// counters and returns the byte count, the negated required capacity when `out_cap` is too
+/// small (nothing written), or -1 for malformed input or a batch the op leaves to PHP.
+///
+/// # Safety
+/// All three ranges must be live allocations of the given lengths, and the output must not
+/// overlap either input. Pointers must be non-null even for zero lengths.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nntmux_w452_predb_feed_source_batch(
+    operation: u32,
+    flags: u32,
+    blob: *const u8,
+    blob_len: usize,
+    lens: *const u8,
+    lens_len: usize,
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> isize {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        wave45_predb_feed_source_batch::evaluate(
+            operation, flags, blob, blob_len, lens, lens_len, out_buf, out_cap,
+        )
+    }))
+    .unwrap_or(-1)
+}
