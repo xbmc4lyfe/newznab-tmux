@@ -32383,3 +32383,769 @@ mod wave45_5_api_capabilities_canonicalizer_query_cache_usage {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wave 46.5: ApiV1Presenter, ReleaseItemPayloadBuilder, ReleaseRows,
+// XmlResponseContext and ApiV2Presenter batch helpers.
+// ---------------------------------------------------------------------------
+mod wave46_5_api_v1_v2_presenter_payload_rows_xml_context {
+    use std::collections::HashSet;
+    use std::hash::{BuildHasherDefault, Hasher};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    const DECLINE: i64 = -1;
+    const MAX_INPUT: usize = 64 * 1024 * 1024;
+    /// Bytes of one `DATE_RSS` string with a four-digit year and `+0000`.
+    const RSS_LEN: usize = 31;
+    /// `ApiV1Presenter` JSON summary options: `JSON_UNESCAPED_SLASHES |
+    /// JSON_UNESCAPED_UNICODE`. Extra output per byte: 1 for two-character
+    /// escapes and 5 for `\u00XX`; U+2028/U+2029 are counted separately.
+    static JSON_EXTRA: [u8; 256] = {
+        let mut table = [0u8; 256];
+        let mut byte = 0;
+        while byte < 0x20 {
+            table[byte] = match byte {
+                0x08 | 0x09 | 0x0A | 0x0C | 0x0D => 1,
+                _ => 5,
+            };
+            byte += 1;
+        }
+        table[b'"' as usize] = 1;
+        table[b'\\' as usize] = 1;
+        table
+    };
+    const WEEKDAYS: [&[u8; 3]; 7] = [b"Sun", b"Mon", b"Tue", b"Wed", b"Thu", b"Fri", b"Sat"];
+    const MONTHS: [&[u8; 3]; 12] = [
+        b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov",
+        b"Dec",
+    ];
+    /// Whitespace PHP's numeric-string parser skips on both sides.
+    fn php_space(byte: u8) -> bool {
+        matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0B | 0x0C)
+    }
+
+    /// Word-at-a-time FNV-style hasher; each distinct set lives for one call.
+    #[derive(Default)]
+    struct WordHasher(u64);
+
+    impl Hasher for WordHasher {
+        fn write(&mut self, bytes: &[u8]) {
+            const PRIME: u64 = 0x0000_0100_0000_01B3;
+            let (words, tail) = bytes.as_chunks::<8>();
+            let mut hash = self.0 ^ 0xCBF2_9CE4_8422_2325;
+            for word in words {
+                hash = (hash ^ u64::from_le_bytes(*word)).wrapping_mul(PRIME);
+            }
+            let mut last = [0u8; 8];
+            last[..tail.len()].copy_from_slice(tail);
+            hash = (hash ^ u64::from_le_bytes(last)).wrapping_mul(PRIME);
+            self.0 = (hash ^ (hash >> 29)).wrapping_mul(PRIME) ^ (bytes.len() as u64);
+        }
+
+        fn write_u64(&mut self, value: u64) {
+            self.0 = (self.0 ^ value).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+
+        fn write_i64(&mut self, value: i64) {
+            self.write_u64(value as u64);
+        }
+
+        fn write_usize(&mut self, value: usize) {
+            self.write_u64(value as u64);
+        }
+
+        fn finish(&self) -> u64 {
+            self.0 ^ (self.0 >> 32)
+        }
+    }
+
+    type Distinct<T> = HashSet<T, BuildHasherDefault<WordHasher>>;
+
+    fn distinct<T>(capacity: usize) -> Distinct<T> {
+        HashSet::with_capacity_and_hasher(capacity.min(4096), Default::default())
+    }
+
+    /// Splits `[u32 count][NUL-joined parts]` (native endian). A part holding
+    /// a NUL makes the counts disagree and declines the batch; a zero count
+    /// needs an empty body.
+    fn joined(input: &[u8]) -> Option<(usize, impl Iterator<Item = &[u8]>)> {
+        let count = u32::from_ne_bytes(input.get(..4)?.try_into().ok()?) as usize;
+        let body = &input[4..];
+        let pieces = if count == 0 {
+            if !body.is_empty() {
+                return None;
+            }
+            0
+        } else {
+            body.iter().filter(|byte| **byte == 0).count() + 1
+        };
+        (pieces == count).then(|| {
+            let mut rest = Some(body);
+            let parts = std::iter::from_fn(move || {
+                let current = rest?;
+                match find_nul(current) {
+                    Some(index) => {
+                        rest = Some(&current[index + 1..]);
+                        Some(&current[..index])
+                    }
+                    None => {
+                        rest = None;
+                        Some(current)
+                    }
+                }
+            });
+            (count, parts.take(count))
+        })
+    }
+
+    /// First NUL in `bytes`, a word at a time: the lowest flagged byte of
+    /// `(w - 0x01..) & !w & 0x80..` is always a real zero byte.
+    fn find_nul(bytes: &[u8]) -> Option<usize> {
+        const LOW: u64 = 0x0101_0101_0101_0101;
+        const HIGH: u64 = 0x8080_8080_8080_8080;
+        let (words, tail) = bytes.as_chunks::<8>();
+        for (index, word) in words.iter().enumerate() {
+            let word = u64::from_le_bytes(*word);
+            let zero = word.wrapping_sub(LOW) & !word & HIGH;
+            if zero != 0 {
+                return Some(index * 8 + (zero.trailing_zeros() / 8) as usize);
+            }
+        }
+        let offset = words.len() * 8;
+        tail.iter()
+            .position(|byte| *byte == 0)
+            .map(|index| offset + index)
+    }
+
+    fn counts(values: &[i64]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect()
+    }
+
+    fn signed(value: usize) -> Option<i64> {
+        i64::try_from(value).ok()
+    }
+
+    // ---- Mode 1: ApiV1Presenter JSON string encoding ----------------------
+
+    /// Extra bytes `json_encode()` adds to valid UTF-8 beyond the quotes.
+    fn json_extra(value: &[u8]) -> usize {
+        // Branch-free pre-check the compiler vectorizes; most titles need no escapes.
+        let plain = value.iter().fold(true, |plain, byte| {
+            plain & (*byte >= 0x20) & (*byte != b'"') & (*byte != b'\\') & (*byte != 0xE2)
+        });
+        if plain {
+            return 0;
+        }
+        let mut extra: usize = value
+            .iter()
+            .map(|byte| usize::from(JSON_EXTRA[usize::from(*byte)]))
+            .sum();
+        if value.contains(&0xE2) {
+            // U+2028 and U+2029 stay escaped (`\u2028`) without
+            // JSON_UNESCAPED_LINE_TERMINATORS.
+            extra += 3 * value
+                .windows(3)
+                .filter(|window| window[0] == 0xE2 && window[1] == 0x80 && window[2] & 0xFE == 0xA8)
+                .count();
+        }
+        extra
+    }
+
+    /// Fields: invalid_utf8, escaped, encoded_bytes, max_encoded_bytes,
+    /// distinct_strings (among encodable strings).
+    fn json_strings(input: &[u8]) -> Option<Vec<u8>> {
+        let (count, parts) = joined(input)?;
+        let mut totals = [0usize; 4];
+        let mut seen: Distinct<&[u8]> = distinct(count);
+        for value in parts {
+            if !value.is_ascii() && std::str::from_utf8(value).is_err() {
+                totals[0] += 1;
+                continue;
+            }
+            let extra = json_extra(value);
+            let encoded = value.len() + 2 + extra;
+            totals[1] += usize::from(extra != 0);
+            totals[2] += encoded;
+            totals[3] = totals[3].max(encoded);
+            seen.insert(value);
+        }
+        let mut out: Vec<i64> = totals
+            .iter()
+            .map(|value| signed(*value))
+            .collect::<Option<_>>()?;
+        out.push(signed(seen.len())?);
+        Some(counts(&out))
+    }
+
+    // ---- RSS date formatting (modes 2 and 5) ------------------------------
+
+    /// Days since 1970-01-01 of a proleptic Gregorian date.
+    fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+        let year = if month <= 2 { year - 1 } else { year };
+        let era = year.div_euclid(400);
+        let yoe = year - era * 400;
+        let mp = (month + 9) % 12;
+        let doy = (153 * mp + 2) / 5 + day - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146_097 + doe - 719_468
+    }
+
+    fn civil_from_days(days: i64) -> (i64, i64, i64) {
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = doy - (153 * mp + 2) / 5 + 1;
+        let month = if mp < 10 { mp + 3 } else { mp - 9 };
+        (yoe + era * 400 + i64::from(month <= 2), month, day)
+    }
+
+    fn two(out: &mut [u8], value: i64) {
+        out[0] = b'0' + (value / 10) as u8;
+        out[1] = b'0' + (value % 10) as u8;
+    }
+
+    /// `date(DATE_RSS, $timestamp)` in UTC for years 1000-9999, else `false`
+    /// with `out` untouched.
+    fn rss(timestamp: i64, out: &mut [u8; RSS_LEN]) -> bool {
+        let days = timestamp.div_euclid(86_400);
+        let seconds = timestamp.rem_euclid(86_400);
+        let (year, month, day) = civil_from_days(days);
+        if !(1000..=9999).contains(&year) {
+            return false;
+        }
+        out.copy_from_slice(b"Sun, 00 Jan 0000 00:00:00 +0000");
+        out[..3].copy_from_slice(WEEKDAYS[(days + 4).rem_euclid(7) as usize]);
+        two(&mut out[5..7], day);
+        out[8..11].copy_from_slice(MONTHS[(month - 1) as usize]);
+        two(&mut out[12..14], year / 100);
+        two(&mut out[14..16], year % 100);
+        two(&mut out[17..19], seconds / 3600);
+        two(&mut out[20..22], seconds / 60 % 60);
+        two(&mut out[23..25], seconds % 60);
+        true
+    }
+
+    /// Input: native-endian i64 timestamps. Output: one [`RSS_LEN`] slot each;
+    /// slots PHP must format (years outside 1000-9999) stay NUL.
+    fn timestamps(input: &[u8]) -> Option<Vec<u8>> {
+        let (stamps, tail) = input.as_chunks::<8>();
+        if !tail.is_empty() {
+            return None;
+        }
+        let mut out = vec![0u8; stamps.len().checked_mul(RSS_LEN)?];
+        for (stamp, slot) in stamps.iter().zip(out.as_chunks_mut::<RSS_LEN>().0) {
+            rss(i64::from_ne_bytes(*stamp), slot);
+        }
+        Some(out)
+    }
+
+    fn digits<const N: usize>(bytes: &[u8]) -> Option<i64> {
+        let bytes: &[u8; N] = bytes.try_into().ok()?;
+        bytes.iter().try_fold(0i64, |value, byte| {
+            byte.is_ascii_digit()
+                .then(|| value * 10 + i64::from(byte - b'0'))
+        })
+    }
+
+    /// Strict `Y-m-d H:i:s` or `Y-m-d` (midnight) as a UTC timestamp; `None`
+    /// for anything Carbon must parse itself (other formats, rollover dates,
+    /// years below 1000).
+    fn strict_datetime(value: &[u8]) -> Option<i64> {
+        if value.len() != 10 && value.len() != 19 {
+            return None;
+        }
+        if value[4] != b'-' || value[7] != b'-' {
+            return None;
+        }
+        let year = digits::<4>(&value[..4])?;
+        let month = digits::<2>(&value[5..7])?;
+        let day = digits::<2>(&value[8..10])?;
+        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+        let month_days = match month {
+            2 => 28 + i64::from(leap),
+            4 | 6 | 9 | 11 => 30,
+            1..=12 => 31,
+            _ => return None,
+        };
+        if year < 1000 || day < 1 || day > month_days {
+            return None;
+        }
+        let mut seconds = 0;
+        if value.len() == 19 {
+            if value[10] != b' ' || value[13] != b':' || value[16] != b':' {
+                return None;
+            }
+            let hour = digits::<2>(&value[11..13])?;
+            let minute = digits::<2>(&value[14..16])?;
+            let second = digits::<2>(&value[17..19])?;
+            if hour > 23 || minute > 59 || second > 59 {
+                return None;
+            }
+            seconds = hour * 3600 + minute * 60 + second;
+        }
+        Some(days_from_civil(year, month, day) * 86_400 + seconds)
+    }
+
+    /// Input: NUL-joined date strings. Output as in [`timestamps`]; slots for
+    /// strings outside [`strict_datetime`] stay NUL.
+    fn datetimes(input: &[u8]) -> Option<Vec<u8>> {
+        let (count, parts) = joined(input)?;
+        let mut out = vec![0u8; count.checked_mul(RSS_LEN)?];
+        for (value, slot) in parts.zip(out.as_chunks_mut::<RSS_LEN>().0) {
+            if let Some(timestamp) = strict_datetime(value) {
+                rss(timestamp, slot);
+            }
+        }
+        Some(out)
+    }
+
+    // ---- Mode 3: ReleaseRows `_totalrows` (int) casts ---------------------
+
+    /// PHP `(int) $string` and `is_numeric($string)` for integer forms;
+    /// `None` for float forms (`.`/`e`/`E` after the digits or a leading
+    /// `.`) and integer overflow, which PHP parses as doubles.
+    fn php_int(bytes: &[u8]) -> Option<(i64, bool)> {
+        let mut index = bytes.iter().take_while(|byte| php_space(**byte)).count();
+        let negative = bytes.get(index) == Some(&b'-');
+        if negative || bytes.get(index) == Some(&b'+') {
+            index += 1;
+        }
+        if bytes.get(index) == Some(&b'.') {
+            return None;
+        }
+        let start = index;
+        let mut value = 0i64;
+        while let Some(byte) = bytes.get(index).filter(|byte| byte.is_ascii_digit()) {
+            let digit = i64::from(byte - b'0');
+            value = value.checked_mul(10)?;
+            value = if negative {
+                value.checked_sub(digit)?
+            } else {
+                value.checked_add(digit)?
+            };
+            index += 1;
+        }
+        if index == start {
+            return Some((0, false));
+        }
+        if matches!(bytes.get(index), Some(b'.' | b'e' | b'E')) {
+            return None;
+        }
+        Some((value, bytes[index..].iter().all(|byte| php_space(*byte))))
+    }
+
+    /// Fields: numeric, zero, negative, max_total, min_total, distinct_totals
+    /// (max/min are 0 for an empty batch).
+    fn totals(input: &[u8]) -> Option<Vec<u8>> {
+        let (count, parts) = joined(input)?;
+        let mut tallies = [0usize; 3];
+        let (mut max, mut min) = (i64::MIN, i64::MAX);
+        let mut seen: Distinct<i64> = distinct(count);
+        for value in parts {
+            let (total, numeric) = php_int(value)?;
+            tallies[0] += usize::from(numeric);
+            tallies[1] += usize::from(total == 0);
+            tallies[2] += usize::from(total < 0);
+            max = max.max(total);
+            min = min.min(total);
+            seen.insert(total);
+        }
+        if count == 0 {
+            (max, min) = (0, 0);
+        }
+        let mut out: Vec<i64> = tallies
+            .iter()
+            .map(|value| signed(*value))
+            .collect::<Option<_>>()?;
+        out.extend([max, min, signed(seen.len())?]);
+        Some(counts(&out))
+    }
+
+    // ---- Mode 4: XmlResponseContext legacy option shapes ------------------
+
+    /// Input: native-endian u16 shapes, two bits per slot (Parameters, Data,
+    /// Server, Offset, Type): 0 missing, 1 null, 2 array, 3 other. Fields:
+    /// provided, nulls, arrays, others, coerced (Parameters/Server present
+    /// but not an array), complete, distinct_shapes.
+    fn shapes(input: &[u8]) -> Option<Vec<u8>> {
+        let (words, tail) = input.as_chunks::<2>();
+        if !tail.is_empty() {
+            return None;
+        }
+        let mut tags = [0usize; 4];
+        let (mut coerced, mut complete) = (0usize, 0usize);
+        let mut seen = [0u64; 16];
+        for word in words {
+            let shape = u16::from_ne_bytes(*word);
+            if shape >= 1 << 10 {
+                return None;
+            }
+            let mut present = 0;
+            for slot in 0..5 {
+                let tag = usize::from((shape >> (2 * slot)) & 3);
+                tags[tag] += 1;
+                present += usize::from(tag != 0);
+                coerced += usize::from((slot == 0 || slot == 2) && (tag == 1 || tag == 3));
+            }
+            complete += usize::from(present == 5);
+            seen[usize::from(shape >> 6)] |= 1 << (shape & 63);
+        }
+        let distinct: u32 = seen.iter().map(|bits| bits.count_ones()).sum();
+        let provided = tags[1] + tags[2] + tags[3];
+        let fields = [
+            provided,
+            tags[1],
+            tags[2],
+            tags[3],
+            coerced,
+            complete,
+            distinct as usize,
+        ];
+        let out: Vec<i64> = fields
+            .iter()
+            .map(|value| signed(*value))
+            .collect::<Option<_>>()?;
+        Some(counts(&out))
+    }
+
+    fn transform(mode: u32, input: &[u8]) -> Option<Vec<u8>> {
+        match mode {
+            1 => json_strings(input),
+            2 => timestamps(input),
+            3 => totals(input),
+            4 => shapes(input),
+            5 => datetimes(input),
+            _ => None,
+        }
+    }
+
+    fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> Option<bool> {
+        if a_len == 0 || b_len == 0 {
+            return Some(false);
+        }
+        let a_end = a.checked_add(a_len)?;
+        let b_end = b.checked_add(b_len)?;
+        Some(a < b_end && b < a_end)
+    }
+
+    /// Runs one Wave 46.5 batch mode: 1 JSON string summary, 2 unix
+    /// timestamps to `DATE_RSS`, 3 `_totalrows` summary, 4 legacy option
+    /// shape summary, 5 `Y-m-d[ H:i:s]` strings to `DATE_RSS`. Counter modes
+    /// write native-endian i64 values; date modes write 31 bytes per item,
+    /// left NUL where PHP must format the item. Returns the bytes written,
+    /// `-needed` when `cap` is too small (never -1: outputs are multiples of
+    /// 8 or 31 bytes), or `-1` for invalid input, mode, overlapping buffers
+    /// or a declined batch. Failure never writes to `out`.
+    ///
+    /// # Safety
+    /// Non-null pointers must refer to a readable allocation of `input_len`
+    /// bytes and a writable allocation of `cap` bytes. Null pointers require
+    /// zero length/capacity. Input and output must not overlap.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn nntmux_w465_api_v1_v2_presenter_payload_rows_xml_context(
+        mode: u32,
+        input: *const u8,
+        input_len: usize,
+        out: *mut u8,
+        cap: usize,
+    ) -> i64 {
+        catch_unwind(AssertUnwindSafe(|| {
+            if input_len > MAX_INPUT
+                || cap > isize::MAX as usize
+                || (input.is_null() && input_len != 0)
+                || (out.is_null() && cap != 0)
+            {
+                return DECLINE;
+            }
+            match overlaps(input as usize, input_len, out as usize, cap) {
+                Some(false) => {}
+                _ => return DECLINE,
+            }
+            let input = if input_len == 0 {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(input, input_len) }
+            };
+            let Some(result) = transform(mode, input) else {
+                return DECLINE;
+            };
+            let Ok(needed) = i64::try_from(result.len()) else {
+                return DECLINE;
+            };
+            if cap < result.len() {
+                return -needed;
+            }
+            if !result.is_empty() {
+                unsafe { std::ptr::copy_nonoverlapping(result.as_ptr(), out, result.len()) };
+            }
+            needed
+        }))
+        .unwrap_or(DECLINE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn packet(parts: &[&[u8]]) -> Vec<u8> {
+            let mut out = (parts.len() as u32).to_ne_bytes().to_vec();
+            out.extend_from_slice(&parts.join(&0u8));
+            out
+        }
+
+        fn raw(mode: u32, input: &[u8], out: &mut [u8]) -> i64 {
+            unsafe {
+                nntmux_w465_api_v1_v2_presenter_payload_rows_xml_context(
+                    mode,
+                    input.as_ptr(),
+                    input.len(),
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            }
+        }
+
+        fn call(mode: u32, input: &[u8]) -> Option<Vec<u8>> {
+            let mut out = vec![0u8; 1 << 16];
+            let written = raw(mode, input, &mut out);
+            if written < 0 {
+                return None;
+            }
+            out.truncate(written as usize);
+            Some(out)
+        }
+
+        fn fields(mode: u32, input: &[u8]) -> Option<Vec<i64>> {
+            let out = call(mode, input)?;
+            Some(
+                out.as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|chunk| i64::from_ne_bytes(*chunk))
+                    .collect(),
+            )
+        }
+
+        fn dates(mode: u32, input: &[u8]) -> Option<Vec<String>> {
+            let out = call(mode, input)?;
+            Some(
+                out.as_chunks::<RSS_LEN>()
+                    .0
+                    .iter()
+                    .map(|slot| String::from_utf8_lossy(slot).into_owned())
+                    .collect(),
+            )
+        }
+
+        fn stamps(values: &[i64]) -> Vec<u8> {
+            values
+                .iter()
+                .flat_map(|value| value.to_ne_bytes())
+                .collect()
+        }
+
+        #[test]
+        fn w465_json_strings_follow_json_encode_lengths() {
+            let parts: [&[u8]; 8] = [
+                b"Show.Name.S01E01.1080p",
+                b"a/b \"q\" \\",
+                b"tab\there\x01",
+                "Ünïcödé €".as_bytes(),
+                "line\u{2028}sep\u{2029}".as_bytes(),
+                b"\xff\xfe",
+                b"",
+                b"Show.Name.S01E01.1080p",
+            ];
+            // 24 + 14 + 17 + 17 + 21 + 2 + 24 encoded bytes, as json_encode().
+            assert_eq!(fields(1, &packet(&parts)), Some(vec![1, 3, 119, 24, 6]));
+            assert_eq!(json_extra("\u{2027}\u{202A}".as_bytes()), 0);
+            assert_eq!(json_extra(b"\x7f/<>&'"), 0);
+            // Surrogates and overlong forms are invalid UTF-8, as in PHP.
+            assert_eq!(
+                fields(1, &packet(&[b"\xed\xa0\x80", b"\xc0\xaf"])),
+                Some(vec![2, 0, 0, 0, 0])
+            );
+            assert_eq!(fields(1, &packet(&[])), Some(vec![0; 5]));
+            // A NUL inside a part makes the counts disagree.
+            let mut nul = packet(&[b"a"]);
+            nul.extend_from_slice(b"\0b");
+            assert_eq!(fields(1, &nul), None);
+            assert_eq!(fields(1, b"\x00\x00\x00\x00x"), None);
+            for length in 0..24 {
+                let mut bytes = vec![b'a'; length];
+                assert_eq!(find_nul(&bytes), None);
+                for index in 0..length {
+                    bytes[index] = 0;
+                    assert_eq!(find_nul(&bytes), Some(index));
+                    bytes[length - 1] = 0;
+                    assert_eq!(find_nul(&bytes), Some(index));
+                    bytes[index] = 0x80;
+                    bytes[length - 1] = b'a';
+                }
+            }
+            assert_eq!(find_nul(b"\x01\x80\x00"), Some(2));
+        }
+
+        #[test]
+        fn w465_timestamps_format_date_rss() {
+            assert_eq!(
+                dates(
+                    2,
+                    &stamps(&[0, 1_761_393_600, -1, 951_782_400, 4_107_542_399])
+                ),
+                Some(vec![
+                    "Thu, 01 Jan 1970 00:00:00 +0000".into(),
+                    "Sat, 25 Oct 2025 12:00:00 +0000".into(),
+                    "Wed, 31 Dec 1969 23:59:59 +0000".into(),
+                    "Tue, 29 Feb 2000 00:00:00 +0000".into(),
+                    "Sun, 28 Feb 2100 23:59:59 +0000".into(),
+                ])
+            );
+            let first = days_from_civil(1000, 1, 1) * 86_400;
+            let last = days_from_civil(10_000, 1, 1) * 86_400 - 1;
+            let out = dates(
+                2,
+                &stamps(&[first, first - 1, last, last + 1, i64::MIN, i64::MAX]),
+            )
+            .unwrap();
+            assert_eq!(out[0], "Wed, 01 Jan 1000 00:00:00 +0000");
+            assert_eq!(out[2], "Fri, 31 Dec 9999 23:59:59 +0000");
+            for index in [1, 3, 4, 5] {
+                assert_eq!(out[index], "\0".repeat(RSS_LEN));
+            }
+            assert_eq!(dates(2, &[]), Some(vec![]));
+            assert_eq!(dates(2, &[0; 9]), None);
+            for days in [-400_000, -1, 0, 1, 59, 60, 400_000, 2_000_000] {
+                let (year, month, day) = civil_from_days(days);
+                assert_eq!(days_from_civil(year, month, day), days);
+            }
+        }
+
+        #[test]
+        fn w465_datetimes_accept_only_strict_forms() {
+            let parts: [&[u8]; 9] = [
+                b"2026-10-25 12:34:56",
+                b"2024-02-29",
+                b"2023-02-29 00:00:00",
+                b"2026-10-25T12:34:56",
+                b"0999-12-31 00:00:00",
+                b"2026-13-01",
+                b"2026-10-25 24:00:00",
+                b" 2026-10-25",
+                b"",
+            ];
+            let out = dates(5, &packet(&parts)).unwrap();
+            assert_eq!(out[0], "Sun, 25 Oct 2026 12:34:56 +0000");
+            assert_eq!(out[1], "Thu, 29 Feb 2024 00:00:00 +0000");
+            for slot in &out[2..] {
+                assert_eq!(slot, &"\0".repeat(RSS_LEN));
+            }
+            assert_eq!(strict_datetime(b"1970-01-01 00:00:01"), Some(1));
+            assert_eq!(strict_datetime(b"2026-1-025 00:00:0"), None);
+            assert_eq!(strict_datetime(b"2026-10-+5"), None);
+            assert_eq!(dates(5, &packet(&[])), Some(vec![]));
+        }
+
+        #[test]
+        fn w465_totals_mirror_php_int_cast_and_is_numeric() {
+            assert_eq!(php_int(b"123"), Some((123, true)));
+            assert_eq!(php_int(b" \t\n-42 \x0c"), Some((-42, true)));
+            assert_eq!(php_int(b"+7"), Some((7, true)));
+            assert_eq!(php_int(b"12abc"), Some((12, false)));
+            assert_eq!(php_int(b"12\0"), Some((12, false)));
+            assert_eq!(php_int(b"abc"), Some((0, false)));
+            assert_eq!(php_int(b""), Some((0, false)));
+            assert_eq!(php_int(b"-"), Some((0, false)));
+            assert_eq!(php_int(b"0x1A"), Some((0, false)));
+            assert_eq!(php_int(b"-0"), Some((0, true)));
+            assert_eq!(php_int(b"9223372036854775807"), Some((i64::MAX, true)));
+            assert_eq!(php_int(b"-9223372036854775808"), Some((i64::MIN, true)));
+            assert_eq!(php_int(b"00000000000000000000001"), Some((1, true)));
+            for float in [
+                &b"1.5"[..],
+                b"1e3",
+                b"12E",
+                b".5",
+                b"-.5",
+                b"9223372036854775808",
+            ] {
+                assert_eq!(php_int(float), None);
+            }
+            assert_eq!(
+                fields(3, &packet(&[b"120", b" 120 ", b"-3", b"x", b"9z"])),
+                Some(vec![3, 1, 1, 120, -3, 4])
+            );
+            assert_eq!(fields(3, &packet(&[b"1", b"2.0"])), None);
+            assert_eq!(fields(3, &packet(&[])), Some(vec![0; 6]));
+        }
+
+        #[test]
+        fn w465_shapes_count_slot_tags() {
+            let words: Vec<u8> = [0b10_11_10_01_10u16, 0, 0b11_11_11_11_11, 0b10_11_10_01_10]
+                .iter()
+                .flat_map(|word| word.to_ne_bytes())
+                .collect();
+            assert_eq!(fields(4, &words), Some(vec![15, 2, 6, 7, 2, 3, 3]));
+            assert_eq!(fields(4, &[]), Some(vec![0; 7]));
+            assert_eq!(fields(4, &(1u16 << 10).to_ne_bytes()), None);
+            assert_eq!(fields(4, &[0]), None);
+        }
+
+        #[test]
+        fn w465_abi_declines_invalid_input_and_reports_capacity() {
+            let input = packet(&[b"a"]);
+            let mut small = [0u8; 8];
+            assert_eq!(raw(1, &input, &mut small), -40);
+            assert_eq!(small, [0; 8]);
+            let mut out = [0u8; 64];
+            for mode in [0, 6, 99] {
+                assert_eq!(raw(mode, &input, &mut out), DECLINE);
+            }
+            assert_eq!(raw(1, b"", &mut out), DECLINE);
+            assert_eq!(raw(1, b"\x01\x00\x00", &mut out), DECLINE);
+            assert_eq!(raw(2, b"", &mut out), 0);
+            let null = unsafe {
+                nntmux_w465_api_v1_v2_presenter_payload_rows_xml_context(
+                    1,
+                    input.as_ptr(),
+                    input.len(),
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!(null, -40);
+            let bad = unsafe {
+                nntmux_w465_api_v1_v2_presenter_payload_rows_xml_context(
+                    1,
+                    std::ptr::null(),
+                    4,
+                    out.as_mut_ptr(),
+                    out.len(),
+                )
+            };
+            assert_eq!(bad, DECLINE);
+            let mut shared = packet(&[b"a"]);
+            shared.resize(64, 0);
+            let pointer = shared.as_mut_ptr();
+            let overlap = unsafe {
+                nntmux_w465_api_v1_v2_presenter_payload_rows_xml_context(
+                    1,
+                    pointer,
+                    5,
+                    pointer.add(4),
+                    40,
+                )
+            };
+            assert_eq!(overlap, DECLINE);
+            assert_eq!(overlaps(10, 5, 14, 1), Some(true));
+            assert_eq!(overlaps(10, 5, 15, 1), Some(false));
+            assert_eq!(overlaps(usize::MAX - 1, 4, 0, 1), None);
+        }
+    }
+}

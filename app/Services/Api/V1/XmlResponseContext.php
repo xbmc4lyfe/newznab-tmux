@@ -15,6 +15,13 @@ final readonly class XmlResponseContext
     private const array SLOTS = ['Parameters', 'Data', 'Server', 'Offset', 'Type'];
 
     /**
+     * The Wave 46.5 legacy option shape summary keeps PHP: computing the slot tags in PHP is most of the
+     * work, so Rust stayed below 1.5x (min 1.25/1.20/1.45/1.36x); see
+     * tests/Unit/RustApiV1V2PresenterPayloadRowsXmlContextW46ParityTest.php.
+     */
+    public const bool W465_RUST_FFI_DEFAULT = false;
+
+    /**
      * @param  array<string, mixed>  $parameters
      * @param  array<string, mixed>  $server
      */
@@ -95,5 +102,115 @@ final readonly class XmlResponseContext
             offset: ($mask & 8) !== 0 ? $options['Offset'] : null,
             type: ($mask & 16) !== 0 ? $options['Type'] : null,
         );
+    }
+
+    /** @return array{enabled: ?bool} */
+    private static function &w465State(): array
+    {
+        // Readonly classes cannot declare static properties; a static local keeps the toggle.
+        static $state = ['enabled' => null];
+
+        return $state;
+    }
+
+    /** Pass null to restore {@see W465_RUST_FFI_DEFAULT}. */
+    public static function useW465RustFfi(?bool $enable = true): void
+    {
+        $state = &self::w465State();
+        $state['enabled'] = $enable;
+    }
+
+    public static function usesW465RustFfi(): bool
+    {
+        return self::w465State()['enabled'] ?? self::W465_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW465RustFfi(): void
+    {
+        $state = &self::w465State();
+        $state['enabled'] = null;
+    }
+
+    /**
+     * Summarizes the slots {@see fromLegacyOptionsPhp()} sees per option array: `provided` slots split
+     * into `nulls`, `arrays` and `others`, `coerced` Parameters/Server values that are not arrays and
+     * become [], `complete` sets with all five slots and `distinct_shapes`. Non-array sets are invalid.
+     *
+     * @param  array<array-key, mixed>  $optionSets
+     * @return array{sets: int, invalid: int, provided: int, nulls: int, arrays: int, others: int, coerced: int, complete: int, distinct_shapes: int}
+     */
+    public static function summarizeLegacyOptionsBatch(array $optionSets): array
+    {
+        return self::usesW465RustFfi() ? self::summarizeLegacyOptionsBatchNative($optionSets) : self::summarizeLegacyOptionsBatchPhp($optionSets);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $optionSets
+     * @return array{sets: int, invalid: int, provided: int, nulls: int, arrays: int, others: int, coerced: int, complete: int, distinct_shapes: int}
+     */
+    public static function summarizeLegacyOptionsBatchPhp(array $optionSets): array
+    {
+        $summary = ['sets' => \count($optionSets), 'invalid' => 0, 'provided' => 0, 'nulls' => 0, 'arrays' => 0, 'others' => 0, 'coerced' => 0, 'complete' => 0, 'distinct_shapes' => 0];
+        $shapes = [];
+        foreach ($optionSets as $options) {
+            if (! \is_array($options)) {
+                $summary['invalid']++;
+
+                continue;
+            }
+            $shape = 0;
+            $present = 0;
+            foreach (self::SLOTS as $slot => $key) {
+                if (! \array_key_exists($key, $options)) {
+                    continue;
+                }
+                $present++;
+                $value = $options[$key];
+                if (\is_array($value)) {
+                    $summary['arrays']++;
+                    $shape |= 2 << (2 * $slot);
+
+                    continue;
+                }
+                $summary[$value === null ? 'nulls' : 'others']++;
+                $summary['coerced'] += (int) ($slot === 0 || $slot === 2);
+                $shape |= ($value === null ? 1 : 3) << (2 * $slot);
+            }
+            $summary['provided'] += $present;
+            $summary['complete'] += (int) ($present === 5);
+            $shapes[$shape] = true;
+        }
+        $summary['distinct_shapes'] = \count($shapes);
+
+        return $summary;
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $optionSets
+     * @return array{sets: int, invalid: int, provided: int, nulls: int, arrays: int, others: int, coerced: int, complete: int, distinct_shapes: int}
+     */
+    public static function summarizeLegacyOptionsBatchNative(array $optionSets): array
+    {
+        $shapes = [];
+        foreach ($optionSets as $options) {
+            if (! \is_array($options)) {
+                continue;
+            }
+            $shape = 0;
+            foreach (self::SLOTS as $slot => $key) {
+                if (\array_key_exists($key, $options)) {
+                    $value = $options[$key];
+                    $shape |= ($value === null ? 1 : (\is_array($value) ? 2 : 3)) << (2 * $slot);
+                }
+            }
+            $shapes[] = $shape;
+        }
+        $fields = ApiV1Presenter::evaluateW465Counters(4, $shapes === [] ? '' : pack('S*', ...$shapes), 7);
+        if ($fields === null) {
+            return self::summarizeLegacyOptionsBatchPhp($optionSets);
+        }
+
+        return ['sets' => \count($optionSets), 'invalid' => \count($optionSets) - \count($shapes)]
+            + array_combine(['provided', 'nulls', 'arrays', 'others', 'coerced', 'complete', 'distinct_shapes'], $fields);
     }
 }

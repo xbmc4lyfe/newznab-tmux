@@ -8,6 +8,7 @@ use App\Data\Api\DetailsData;
 use App\Data\Api\ReleaseData;
 use App\Models\Release;
 use App\Models\User;
+use App\Services\Api\V1\ApiV1Presenter;
 use App\Services\Api\V1\ReleaseRows;
 use FFI\CData;
 use Illuminate\Http\JsonResponse;
@@ -18,7 +19,19 @@ final class ApiV2Presenter
     // JSON_HEX_TAG would turn category separators such as ">" into "\u003E".
     private const JSON_ENCODING_OPTIONS = JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE;
 
+    /**
+     * The Wave 46.5 RSS date string batch defaults to Rust: every common and uncommon mean and p99 ratio
+     * cleared 1.5x (min 18.62/14.00/12.47/6.86x); see
+     * tests/Unit/RustApiV1V2PresenterPayloadRowsXmlContextW46ParityTest.php.
+     */
+    public const bool W465_RUST_FFI_DEFAULT = true;
+
+    /** Bytes of one `DATE_RSS` string with a four-digit year in UTC. */
+    private const int W465_RSS_LENGTH = 31;
+
     private static ?bool $useRustFfi = null;
+
+    private static ?bool $useW465RustFfi = null;
 
     private static ?CData $rssBuf = null;
 
@@ -322,5 +335,76 @@ final class ApiV2Presenter
             Carbon::parse($d2)->toRssString(),
             Carbon::parse($d3)->toRssString(),
         ];
+    }
+
+    /** Pass null to restore {@see W465_RUST_FFI_DEFAULT}. */
+    public static function useW465RustFfi(?bool $enable = true): void
+    {
+        self::$useW465RustFfi = $enable;
+    }
+
+    public static function usesW465RustFfi(): bool
+    {
+        return self::$useW465RustFfi ?? self::W465_RUST_FFI_DEFAULT;
+    }
+
+    public static function resetW465RustFfi(): void
+    {
+        self::$useW465RustFfi = null;
+    }
+
+    /**
+     * {@see formatRssDatesPhp()} over a batch of date strings, in order; Carbon exceptions propagate.
+     *
+     * @param  list<string>  $dates
+     * @return list<string>
+     */
+    public static function formatRssDateBatch(array $dates): array
+    {
+        return self::usesW465RustFfi() ? self::formatRssDateBatchNative($dates) : self::formatRssDateBatchPhp($dates);
+    }
+
+    /**
+     * @param  list<string>  $dates
+     * @return list<string>
+     */
+    public static function formatRssDateBatchPhp(array $dates): array
+    {
+        $formatted = [];
+        foreach ($dates as $date) {
+            $formatted[] = Carbon::parse($date)->toRssString();
+        }
+
+        return $formatted;
+    }
+
+    /**
+     * Rust formats strict `Y-m-d H:i:s` and `Y-m-d` strings (years 1000-9999, no rollover) in UTC and
+     * leaves NUL slots for Carbon; other time zones, strings holding a NUL and an unavailable library
+     * use PHP for the whole batch.
+     *
+     * @param  list<string>  $dates
+     * @return list<string>
+     */
+    public static function formatRssDateBatchNative(array $dates): array
+    {
+        $count = \count($dates);
+        if ($count === 0 || date_default_timezone_get() !== 'UTC') {
+            return self::formatRssDateBatchPhp($dates);
+        }
+        $raw = ApiV1Presenter::evaluateW465Native(5, ApiV1Presenter::w465Joined($dates), $count * self::W465_RSS_LENGTH);
+        if ($raw === null) {
+            return self::formatRssDateBatchPhp($dates);
+        }
+        $formatted = str_split($raw, self::W465_RSS_LENGTH);
+        if (str_contains($raw, "\0")) {
+            foreach ($formatted as $index => $date) {
+                if ($date[0] === "\0") {
+                    $formatted[$index] = Carbon::parse($dates[$index])->toRssString();
+                }
+            }
+        }
+
+        return $formatted;
     }
 }
