@@ -9,6 +9,7 @@ use App\Models\Release;
 use App\Services\Releases\ReleaseBrowseService;
 use App\Support\RustPipelineLibrary;
 use FFI;
+use FFI\CData;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Collection as EloquentCollection;
 use Illuminate\Support\Collection;
@@ -548,5 +549,154 @@ class SeriesReleaseService
     public static function normalizeCategoryIdsPhp(?array $categories): array
     {
         return $categories === null ? [] : array_values(array_map('intval', $categories));
+    }
+
+    /** Enabled: three paired runs cleared every 1.5x gate (common mean 2.12-2.37x, p99 2.11-2.56x; uncommon mean 2.30-2.44x, p99 1.95-2.11x); see RustSystemTempUserInactivityStatsSeriesW51ParityTest. */
+    private const bool W51_RUST_FFI_DEFAULT = true;
+
+    public const string W51_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w513_series_fallback_season_batch(const char *blob, size_t blob_len, const char *ints, size_t ints_len, size_t count, int64_t *out, size_t out_cap);
+        C;
+
+    private static ?bool $useW51RustFfi = null;
+
+    private static FFI|false|null $w51Ffi = null;
+
+    private static ?CData $w51Out = null;
+
+    private static int $w51OutCap = 0;
+
+    public static function usesW51RustFfi(): bool
+    {
+        return self::$useW51RustFfi ?? self::W51_RUST_FFI_DEFAULT;
+    }
+
+    /** Runs $callback with the Wave 51 Rust path forced on or off, then restores the previous setting. */
+    public static function withW51RustFfi(bool $enabled, callable $callback): mixed
+    {
+        $previous = self::$useW51RustFfi;
+        self::$useW51RustFfi = $enabled;
+        try {
+            return $callback();
+        } finally {
+            self::$useW51RustFfi = $previous;
+        }
+    }
+
+    /**
+     * Runs the fallback-candidate filter and season grouping of fallbackCandidates(),
+     * fallbackSeasonCounts() and fallbackReleasesForSeason() over the hydrated `series` and
+     * `episode` columns (row i is the i-th value of each list; a missing episode reads as null).
+     * A row is valid per hasValidFallbackEpisodePhp() and groups under `(int) series`. Words: a
+     * valid-row bitmap and a $season-match bitmap (64 rows per word, row i at bit `i % 64` of word
+     * `i / 64`), the distinct season count, ascending (season, count) pairs, the $season count and
+     * the invalid count. Values hold int, string or null, as hydration leaves them; the Rust path
+     * declines to PHP when a valid row's series is not a plain integer string.
+     *
+     * @param  array<int, int|string|null>  $series
+     * @param  array<int, int|string|null>  $episodes
+     * @return list<int>
+     */
+    public static function w51FallbackSeasonBatch(array $series, array $episodes, int $season): array
+    {
+        return self::usesW51RustFfi()
+            ? self::w51FallbackSeasonBatchNative($series, $episodes, $season)
+            : self::w51FallbackSeasonBatchPhp($series, $episodes, $season);
+    }
+
+    /**
+     * @param  array<int, int|string|null>  $series
+     * @param  array<int, int|string|null>  $episodes
+     * @return list<int>
+     */
+    public static function w51FallbackSeasonBatchNative(array $series, array $episodes, int $season): array
+    {
+        $count = \count($series);
+        if ($count === 0 || \count($episodes) !== $count) {
+            return self::w51FallbackSeasonBatchPhp($series, $episodes, $season);
+        }
+
+        return self::w51Invoke(
+            implode("\0", $series)."\0".implode("\0", $episodes),
+            pack('q', $season),
+            $count,
+            intdiv($count + 63, 64) * 2 + $count * 2 + 3,
+        )
+            ?? self::w51FallbackSeasonBatchPhp($series, $episodes, $season);
+    }
+
+    /**
+     * @param  array<int, int|string|null>  $series
+     * @param  array<int, int|string|null>  $episodes
+     * @return list<int>
+     */
+    public static function w51FallbackSeasonBatchPhp(array $series, array $episodes, int $season): array
+    {
+        $episodes = array_values($episodes);
+        $words = intdiv(\count($series) + 63, 64);
+        $valid = array_fill(0, $words, 0);
+        $match = $valid;
+        $counts = [];
+        $matched = 0;
+        $invalid = 0;
+        $row = 0;
+        foreach ($series as $value) {
+            if (! self::hasValidFallbackEpisodePhp($value, $episodes[$row] ?? null)) {
+                $invalid++;
+                $row++;
+
+                continue;
+            }
+            $bit = 1 << ($row & 63);
+            $valid[$row >> 6] |= $bit;
+            $key = (int) $value;
+            if ($key === $season) {
+                $match[$row >> 6] |= $bit;
+                $matched++;
+            }
+            $counts[$key] = ($counts[$key] ?? 0) + 1;
+            $row++;
+        }
+        ksort($counts);
+        $out = [...$valid, ...$match, \count($counts)];
+        foreach ($counts as $key => $n) {
+            array_push($out, $key, $n);
+        }
+        array_push($out, $matched, $invalid);
+
+        return $out;
+    }
+
+    /**
+     * Calls the Wave 51 export with NUL-joined strings and packed `i64` integers. Null when the
+     * library is missing, the call declines (for example a string holding a NUL byte) or it writes
+     * more than $cap words, so the caller falls back to PHP.
+     *
+     * @return list<int>|null
+     */
+    private static function w51Invoke(string $blob, string $ints, int $count, int $cap): ?array
+    {
+        self::$w51Ffi ??= RustPipelineLibrary::resolveDomain('categorize_w51', self::W51_FFI_CDEF) ?? false;
+        $ffi = self::$w51Ffi;
+        if ($ffi === false) {
+            return null;
+        }
+        try {
+            if (self::$w51Out === null || self::$w51OutCap < $cap) {
+                self::$w51OutCap = max(1024, $cap * 2);
+                self::$w51Out = $ffi->new('int64_t['.self::$w51OutCap.']');
+            }
+            // @phpstan-ignore method.notFound (Declared by W51_FFI_CDEF.)
+            $written = $ffi->nntmux_w513_series_fallback_season_batch($blob, \strlen($blob), $ints, \strlen($ints), $count, self::$w51Out, self::$w51OutCap);
+            if (! \is_int($written) || $written <= 0 || $written > $cap) {
+                return null;
+            }
+            $values = unpack('P*', FFI::string(self::$w51Out, $written * 8));
+
+            /** @var list<int>|null */
+            return $values === false ? null : array_values($values);
+        } catch (Throwable) {
+            return null;
+        }
     }
 }
