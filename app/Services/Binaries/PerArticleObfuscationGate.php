@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Binaries;
 
+use App\Support\IrcChannelList;
 use App\Support\RustPipelineLibrary;
 use FFI;
 use Random\Engine\Xoshiro256StarStar;
@@ -207,5 +208,87 @@ final class PerArticleObfuscationGate
         } catch (Throwable) {
             return null;
         }
+    }
+
+    /**
+     * Disabled: one str_contains() per subject costs about what marshaling it does, so five paired runs
+     * measured only 1.04-1.14x common mean, 0.87-1.03x common p99, 1.33-1.37x uncommon mean and
+     * 1.19-1.36x uncommon p99 (see the W45 parity test), below the 1.5x rule.
+     */
+    public const bool W451_RUST_FFI_DEFAULT = false;
+
+    public const string W451_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w451_obfuscation_gate_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private const array W451_SUMMARY_KEYS = ['total_subjects', 'empty_subject_count', 'part_marker_count'];
+
+    private static ?bool $w451UseRustFfi = null;
+
+    private static FFI|false|null $w451Ffi = null;
+
+    /** Null restores the benchmark default. */
+    public static function useW451RustFfi(?bool $enable = true): void
+    {
+        self::$w451UseRustFfi = $enable;
+    }
+
+    public static function usesW451RustFfi(): bool
+    {
+        return self::$w451UseRustFfi ?? self::W451_RUST_FFI_DEFAULT;
+    }
+
+    /** Restores the benchmark default and drops the cached library handle; earlier toggles are untouched. */
+    public static function resetW451RustFfi(): void
+    {
+        self::$w451UseRustFfi = null;
+        self::$w451Ffi = null;
+    }
+
+    /**
+     * Summarizes subjects the way {@see mayCarryPartCounts()} scores each sample: subjects holding
+     * ` (`, which every yEnc part count needs.
+     * Entries come from strings, integers, or the first non-null Subject, subject array field; other
+     * values (including objects) count as empty entries.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeGateSubjectBatch(array $rows): array
+    {
+        return self::usesW451RustFfi() ? self::summarizeGateSubjectBatchNative($rows) : self::summarizeGateSubjectBatchPhp($rows);
+    }
+
+    /**
+     * Rust summary; falls back to PHP when the library or input frame is unusable.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeGateSubjectBatchNative(array $rows): array
+    {
+        $values = IrcChannelList::w451Invoke(self::$w451Ffi, self::W451_FFI_CDEF, 'nntmux_w451_obfuscation_gate_batch', $rows, ['Subject', 'subject'], \count(self::W451_SUMMARY_KEYS));
+
+        return $values === null ? self::summarizeGateSubjectBatchPhp($rows) : array_combine(self::W451_SUMMARY_KEYS, $values);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeGateSubjectBatchPhp(array $rows): array
+    {
+        $summary = array_fill_keys(self::W451_SUMMARY_KEYS, 0);
+        foreach (IrcChannelList::w451Entries($rows, ['Subject', 'subject']) as $entry) {
+            $summary['total_subjects']++;
+            if ($entry === '') {
+                $summary['empty_subject_count']++;
+
+                continue;
+            }
+            $summary['part_marker_count'] += (int) str_contains($entry, ' (');
+        }
+
+        return $summary;
     }
 }

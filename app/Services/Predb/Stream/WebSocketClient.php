@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Services\Predb\Stream;
 
+use App\Support\IrcChannelList;
 use App\Support\RustPipelineLibrary;
 use FFI;
 use FFI\CData;
@@ -439,5 +440,102 @@ class WebSocketClient
             $this->close();
             throw new RuntimeException('WebSocket write failed.');
         }
+    }
+
+    /** Enabled: paired common/uncommon mean and p99 gains reach 1.5x in all five runs (min 1.67x; see the W45 parity test). */
+    public const bool W451_RUST_FFI_DEFAULT = true;
+
+    public const string W451_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w451_websocket_frame_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private const array W451_SUMMARY_KEYS = ['total_frames', 'empty_frame_count', 'incomplete_count', 'complete_count', 'final_count', 'masked_count', 'data_count', 'control_count', 'reserved_opcode_count', 'rejected_count'];
+
+    private static ?bool $w451UseRustFfi = null;
+
+    private static FFI|false|null $w451Ffi = null;
+
+    /** Null restores the benchmark default. */
+    public static function useW451RustFfi(?bool $enable = true): void
+    {
+        self::$w451UseRustFfi = $enable;
+    }
+
+    public static function usesW451RustFfi(): bool
+    {
+        return self::$w451UseRustFfi ?? self::W451_RUST_FFI_DEFAULT;
+    }
+
+    /** Restores the benchmark default and drops the cached library handle; earlier toggles are untouched. */
+    public static function resetW451RustFfi(): void
+    {
+        self::$w451UseRustFfi = null;
+        self::$w451Ffi = null;
+    }
+
+    /**
+     * Summarizes buffers with decodeFramePhp(): incomplete first frames, complete ones (final, masked,
+     * data, control or reserved opcode), and frames it rejects (a reserved length bit or over the limit).
+     * Entries come from strings, integers, or the first non-null frame, bytes array field; other values
+     * (including objects) count as empty entries.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeFrameBatch(array $rows): array
+    {
+        return self::usesW451RustFfi() ? self::summarizeFrameBatchNative($rows) : self::summarizeFrameBatchPhp($rows);
+    }
+
+    /**
+     * Rust summary; falls back to PHP when the library or input frame is unusable.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeFrameBatchNative(array $rows): array
+    {
+        $values = IrcChannelList::w451Invoke(self::$w451Ffi, self::W451_FFI_CDEF, 'nntmux_w451_websocket_frame_batch', $rows, ['frame', 'bytes'], \count(self::W451_SUMMARY_KEYS));
+
+        return $values === null ? self::summarizeFrameBatchPhp($rows) : array_combine(self::W451_SUMMARY_KEYS, $values);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public static function summarizeFrameBatchPhp(array $rows): array
+    {
+        $summary = array_fill_keys(self::W451_SUMMARY_KEYS, 0);
+        foreach (IrcChannelList::w451Entries($rows, ['frame', 'bytes']) as $entry) {
+            $summary['total_frames']++;
+            if ($entry === '') {
+                $summary['empty_frame_count']++;
+
+                continue;
+            }
+            try {
+                $frame = self::decodeFramePhp($entry);
+            } catch (RuntimeException) {
+                $summary['rejected_count']++;
+
+                continue;
+            }
+            if ($frame === null) {
+                $summary['incomplete_count']++;
+
+                continue;
+            }
+            $summary['complete_count']++;
+            $summary['final_count'] += (int) $frame[0];
+            $summary['masked_count'] += (int) ((ord($entry[1]) & 0x80) !== 0);
+            $summary[match ($frame[1]) {
+                self::OP_CONTINUATION, self::OP_TEXT, self::OP_BINARY => 'data_count',
+                self::OP_CLOSE, self::OP_PING, self::OP_PONG => 'control_count',
+                default => 'reserved_opcode_count',
+            }]++;
+        }
+
+        return $summary;
     }
 }

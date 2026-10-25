@@ -6,6 +6,7 @@ namespace App\Services\Predb\Irc;
 
 use App\Models\Predb;
 use App\Services\Predb\Feeds\PredbFeedEntry;
+use App\Support\IrcChannelList;
 use App\Support\RustPipelineLibrary;
 use Carbon\CarbonImmutable;
 use FFI;
@@ -349,5 +350,96 @@ final class PreAnnounceParser
     private static function isReleaseName(string $title): bool
     {
         return strlen($title) <= 255 && preg_match('/^[\w.()&\'+,-]+-[\w]+\z/u', $title) === 1;
+    }
+
+    /** Enabled: paired common/uncommon mean and p99 gains reach 1.5x in all five runs (min 2.97x; see the W45 parity test). */
+    public const bool W451_RUST_FFI_DEFAULT = true;
+
+    public const string W451_FFI_CDEF = <<<'C'
+        ssize_t nntmux_w451_pre_announce_batch(const char *input, size_t len, char *out, size_t cap);
+        C;
+
+    private const array W451_SUMMARY_KEYS = ['total_messages', 'empty_message_count', 'entry_count', 'pre_count', 'info_count', 'nuke_count', 'section_count', 'reason_count'];
+
+    private static ?bool $w451UseRustFfi = null;
+
+    private static FFI|false|null $w451Ffi = null;
+
+    /** Null restores the benchmark default. */
+    public static function useW451RustFfi(?bool $enable = true): void
+    {
+        self::$w451UseRustFfi = $enable;
+    }
+
+    public static function usesW451RustFfi(): bool
+    {
+        return self::$w451UseRustFfi ?? self::W451_RUST_FFI_DEFAULT;
+    }
+
+    /** Restores the benchmark default and drops the cached library handle; earlier toggles are untouched. */
+    public static function resetW451RustFfi(): void
+    {
+        self::$w451UseRustFfi = null;
+        self::$w451Ffi = null;
+    }
+
+    /**
+     * Summarizes messages in this parser's format with parsePhp(): entries, PRE/P2P lines (timed at
+     * receipt or, on the relay, listed), INFO lines, nuke-family lines, entries with a section and
+     * nukes with a reason.
+     * Entries come from strings, integers, or the first non-null message, line array field; other values
+     * (including objects) count as empty entries.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public function summarizeAnnounceBatch(array $rows): array
+    {
+        return self::usesW451RustFfi() ? $this->summarizeAnnounceBatchNative($rows) : $this->summarizeAnnounceBatchPhp($rows);
+    }
+
+    /**
+     * Rust summary; falls back to PHP when the library or input frame is unusable, or Rust declines a
+     * NUL byte or non-ASCII title.
+     *
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public function summarizeAnnounceBatchNative(array $rows): array
+    {
+        $values = IrcChannelList::w451Invoke(self::$w451Ffi, self::W451_FFI_CDEF, 'nntmux_w451_pre_announce_batch', $rows, ['message', 'line'], \count(self::W451_SUMMARY_KEYS), pack('V', $this->nativeFormat));
+
+        return $values === null ? $this->summarizeAnnounceBatchPhp($rows) : array_combine(self::W451_SUMMARY_KEYS, $values);
+    }
+
+    /**
+     * @param  array<array-key, mixed>  $rows
+     * @return array<string, int>
+     */
+    public function summarizeAnnounceBatchPhp(array $rows): array
+    {
+        $summary = array_fill_keys(self::W451_SUMMARY_KEYS, 0);
+        // A fixed receipt time keeps the clock out of the summary.
+        $receivedAt = CarbonImmutable::createFromTimestampUTC(0);
+        foreach (IrcChannelList::w451Entries($rows, ['message', 'line']) as $message) {
+            $summary['total_messages']++;
+            if ($message === '') {
+                $summary['empty_message_count']++;
+
+                continue;
+            }
+            $entry = $this->parsePhp($message, $receivedAt);
+            if ($entry === null) {
+                continue;
+            }
+            $summary['entry_count']++;
+            $summary['pre_count'] += (int) ($entry->pagingTime() !== null);
+            $summary['info_count'] += (int) $entry->enrichOnly;
+            $summary['nuke_count'] += (int) ($entry->nuked !== Predb::PRE_NONUKE);
+            $summary['section_count'] += (int) ($entry->category !== null);
+            $summary['reason_count'] += (int) ($entry->nukeReason !== null);
+        }
+
+        return $summary;
     }
 }
